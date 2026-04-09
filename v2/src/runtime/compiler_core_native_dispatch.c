@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../../../src/runtime/native/system_helpers.h"
 #include "../../bootstrap/cheng_v2c_tooling.h"
 #include "compiler_core_native_dispatch.h"
 
@@ -14,12 +15,14 @@ void cheng_v2_native_print_usage(void) {
     cheng_v2_native_print_line("");
     cheng_v2_native_print_line("commands:");
     cheng_v2_native_print_line("  help                         show this message");
-    cheng_v2_native_print_line("  status                       print the current dev-track contract");
+    cheng_v2_native_print_line("  status                       print the current tooling-track contract");
     cheng_v2_native_print_line("  <tooling-command>            forward to cheng_tooling_v2");
     cheng_v2_native_print_line("");
     cheng_v2_native_print_line("tooling commands:");
     cheng_v2_native_print_line("  stage-selfhost-host          build stage1 -> stage2 -> stage3 native closure");
     cheng_v2_native_print_line("  tooling-selfhost-host        run the native tooling selfhost orchestration");
+    cheng_v2_native_print_line("  tooling-selfhost-check       verify tooling stage0 -> stage1 -> stage2 fixed-point closure");
+    cheng_v2_native_print_line("  program-selfhost-check       verify ordinary programs are built and run by a Cheng-produced compiler");
     cheng_v2_native_print_line("  release-compile              emit a deterministic release artifact spec");
     cheng_v2_native_print_line("  lsmr-address                 emit a deterministic LSMR address");
     cheng_v2_native_print_line("  lsmr-route-plan              emit a deterministic canonical LSMR route plan");
@@ -37,9 +40,9 @@ void cheng_v2_native_print_usage(void) {
 }
 
 int cheng_v2_native_print_status(void) {
-    cheng_v2_native_print_line("cheng_v2: dev-only entry");
-    cheng_v2_native_print_line("track=dev");
-    cheng_v2_native_print_line("execution=direct_exe");
+    cheng_v2_native_print_line("cheng_v2: tooling entry");
+    cheng_v2_native_print_line("track=tooling");
+    cheng_v2_native_print_line("execution=native_tooling_argv_bridge");
     cheng_v2_native_print_line("tooling_forwarded=1");
     cheng_v2_native_print_line("tooling_entry=tooling/cheng_tooling_v2");
     cheng_v2_native_print_line("parallel=function_task");
@@ -48,7 +51,7 @@ int cheng_v2_native_print_status(void) {
     return 0;
 }
 
-int cheng_v2_native_argv_entry(int argc, char **argv) {
+int cheng_v2_native_tooling_argv_entry(int argc, char **argv) {
     const char *cmd;
     if (argc <= 1) {
         cheng_v2_native_print_usage();
@@ -63,4 +66,8 @@ int cheng_v2_native_argv_entry(int argc, char **argv) {
         return cheng_v2_native_print_status();
     }
     return cheng_v2c_tooling_handle(argc, argv);
+}
+
+int cheng_v2_native_program_argv_entry(int argc, char **argv) {
+    return driver_c_compiler_core_program_argv_bridge((int32_t)argc, (const char **)argv);
 }

@@ -15,6 +15,8 @@ import compiler/frontend/string_surface_lowering_v2 as flower
 import compiler/low_uir/string_lowering_v2 as slowlower
 import compiler/driver/string_pipeline_v2 as spipe
 import compiler/driver/compiler_core_pipeline_v2 as cpipe
+import compiler/semantic_facts/compiler_core_facts_v2 as cffacts
+import compiler/semantic_facts/no_pointer_surface_v2 as npfacts
 import runtime/strings_v2 as srun
 import compiler/frontend/unimaker_surface_contract as ufront
 import compiler/frontend/unimaker_surface_ir_v2 as uir
@@ -80,6 +82,16 @@ type
     TaijiDocument =
         text: str
         cid: str
+    ZrpcProbeSpec =
+        sampleId: str
+        sourcePath: str
+        expectPass: bool
+    V2PackageClosureSpec =
+        sampleId: str
+        sourcePath: str
+    CycleSurfaceSpec =
+        label: str
+        topLevelKind: str
 
 @importc("driver_c_write_text_file_bridge")
 fn writeTextFileBridge(path: str, text: str)
@@ -135,6 +147,12 @@ fn runStageSelfhostHostBridge(): int32
 @importc("driver_c_run_tooling_selfhost_host_bridge")
 fn runToolingSelfhostHostBridge(): int32
 
+@importc("driver_c_run_tooling_selfhost_check_bridge")
+fn runToolingSelfhostCheckBridge(): int32
+
+@importc("driver_c_run_program_selfhost_check_bridge")
+fn runProgramSelfhostCheckBridge(): int32
+
 fn taijiJsonEscape(text: str): str =
     var out: str = ""
     for i in 0..<len(text):
@@ -188,6 +206,233 @@ fn absolutePath(path: str): str =
 
 fn currentWorkingDir(): str =
     return currentWorkingDirBridge()
+
+fn zrpcProbeSpec(sampleId: str, sourcePath: str, expectPass: bool): ZrpcProbeSpec =
+    var out: ZrpcProbeSpec
+    out.sampleId = sampleId
+    out.sourcePath = sourcePath
+    out.expectPass = expectPass
+    return out
+
+fn v2PackageClosureSpec(sampleId: str, sourcePath: str): V2PackageClosureSpec =
+    var out: V2PackageClosureSpec
+    out.sampleId = sampleId
+    out.sourcePath = sourcePath
+    return out
+
+fn cycleSurfaceSpec(label: str, topLevelKind: str): CycleSurfaceSpec =
+    var out: CycleSurfaceSpec
+    out.label = label
+    out.topLevelKind = topLevelKind
+    return out
+
+fn compilerCoreZrpcProbeSpecs(): ZrpcProbeSpec[] =
+    var out: ZrpcProbeSpec[] = []
+    add(out, zrpcProbeSpec("plain", "v2/tests/contracts/compiler_core_plain_probe.cheng", true))
+    add(out, zrpcProbeSpec("importc_noptr", "v2/tests/contracts/compiler_core_importc_noptr_probe.cheng", true))
+    add(out, zrpcProbeSpec("dot_return", "v2/tests/contracts/compiler_core_dot_return_probe.cheng", true))
+    add(out, zrpcProbeSpec("dot_let", "v2/tests/contracts/compiler_core_dot_let_probe.cheng", true))
+    add(out, zrpcProbeSpec("name_return", "v2/tests/contracts/compiler_core_name_return_probe.cheng", true))
+    add(out, zrpcProbeSpec("backtick", "v2/tests/contracts/compiler_core_backtick_probe.cheng", true))
+    add(out, zrpcProbeSpec("backtick_index", "v2/tests/contracts/compiler_core_backtick_index_probe.cheng", true))
+    add(out, zrpcProbeSpec("sizeof", "v2/tests/contracts/compiler_core_sizeof_probe.cheng", true))
+    add(out, zrpcProbeSpec("sizeof_generic", "v2/tests/contracts/compiler_core_sizeof_generic_probe.cheng", true))
+    add(out, zrpcProbeSpec("std_system", "v2/tests/contracts/compiler_core_std_system_probe.cheng", true))
+    add(out, zrpcProbeSpec("system_prefix", "v2/tests/contracts/compiler_core_system_prefix_probe.cheng", true))
+    add(out, zrpcProbeSpec("result_array", "v2/tests/contracts/compiler_core_result_array_probe.cheng", true))
+    add(out, zrpcProbeSpec("addr_of", "v2/tests/contracts/compiler_core_addr_of_probe.cheng", false))
+    add(out, zrpcProbeSpec("alloc_ptr", "v2/tests/contracts/compiler_core_alloc_ptr_probe.cheng", false))
+    add(out, zrpcProbeSpec("arrow_field", "v2/tests/contracts/compiler_core_arrow_field_probe.cheng", false))
+    add(out, zrpcProbeSpec("arrow_param", "v2/tests/contracts/compiler_core_arrow_param_probe.cheng", false))
+    add(out, zrpcProbeSpec("arrow_return", "v2/tests/contracts/compiler_core_arrow_return_probe.cheng", false))
+    add(out, zrpcProbeSpec("arrow_type", "v2/tests/contracts/compiler_core_arrow_type_probe.cheng", false))
+    add(out, zrpcProbeSpec("dot_ptr_return", "v2/tests/contracts/compiler_core_dot_ptr_return_probe.cheng", false))
+    add(out, zrpcProbeSpec("generic_store", "v2/tests/contracts/compiler_core_generic_store_probe.cheng", false))
+    add(out, zrpcProbeSpec("importc_ptr", "v2/tests/contracts/compiler_core_importc_probe.cheng", false))
+    add(out, zrpcProbeSpec("importc_ptr_index", "v2/tests/contracts/compiler_core_importc_ptr_probe.cheng", false))
+    add(out, zrpcProbeSpec("ptr_alias", "v2/tests/contracts/compiler_core_ptr_alias_probe.cheng", false))
+    add(out, zrpcProbeSpec("ptr_cast", "v2/tests/contracts/compiler_core_ptr_cast_probe.cheng", false))
+    add(out, zrpcProbeSpec("seqs_prefix", "v2/tests/contracts/compiler_core_seqs_prefix_probe.cheng", false))
+    return out
+
+fn v2NoPointerSurfaceProbeSpecs(): ZrpcProbeSpec[] =
+    var out: ZrpcProbeSpec[] = []
+    add(out, zrpcProbeSpec("compiler_core_pass", "v2/tests/contracts/compiler_core_plain_probe.cheng", true))
+    add(out, zrpcProbeSpec("compiler_core_fail", "v2/tests/contracts/compiler_core_importc_ptr_probe.cheng", false))
+    add(out, zrpcProbeSpec("unimaker_pass", "v2/tests/contracts/unimaker_surface_plain_probe.cheng", true))
+    add(out, zrpcProbeSpec("unimaker_fail", "v2/tests/contracts/unimaker_surface_ptr_probe.cheng", false))
+    add(out, zrpcProbeSpec("topology_pass", "v2/tests/contracts/topology_surface_plain_probe.cheng", true))
+    add(out, zrpcProbeSpec("topology_fail", "v2/tests/contracts/topology_surface_ptr_probe.cheng", false))
+    add(out, zrpcProbeSpec("network_pass", "v2/tests/contracts/network_surface_plain_probe.cheng", true))
+    add(out, zrpcProbeSpec("network_fail", "v2/tests/contracts/network_surface_rawmem_probe.cheng", false))
+    return out
+
+fn v2NoPointerPackageClosureSpecs(): V2PackageClosureSpec[] =
+    var out: V2PackageClosureSpec[] = []
+    add(out, v2PackageClosureSpec("unimaker_entry", "v2/examples/unimaker_robot_node.cheng"))
+    add(out, v2PackageClosureSpec("network_entry", "v2/examples/network_distribution_module.cheng"))
+    add(out, v2PackageClosureSpec("topology_entry", "v2/examples/topology_code_sync.cheng"))
+    return out
+
+fn compilerCoreZrpcAbsolutePath(rootPath: str, sourcePath: str): str =
+    return joinPath2(absolutePath(rootPath), sourcePath)
+
+fn compilerCoreNormalizeProbeSourcePaths(program: var ccore.CompilerCoreProgram,
+                                         normalizedSourcePath: str) =
+    for i in 0..<program.topLevelSourcePaths.len:
+        program.topLevelSourcePaths[i] = normalizedSourcePath
+
+fn compilerCoreProbeFirstNoPointerViolation(rootPath: str, sourcePath: str): str =
+    let absoluteSourcePath = compilerCoreZrpcAbsolutePath(rootPath, sourcePath)
+    var parsed = parser.parseV2SourceFileStrict(absoluteSourcePath)
+    if parsed.compilerCoreProgram.topLevelKinds.len <= 0:
+        system.panic("zrpc: probe is not compiler_core source " + sourcePath)
+    compilerCoreNormalizeProbeSourcePaths(parsed.compilerCoreProgram, sourcePath)
+    return cffacts.compilerCoreFirstNoPointerViolation(parsed.compilerCoreProgram)
+
+fn compilerCoreCycleFixtureEntryPath(rootPath: str): str =
+    return joinPath2(absolutePath(rootPath),
+                     "v2/tests/contracts/compiler_core_cycle_surface_fixture/src/cycle/main.cheng")
+
+fn compilerCoreNoPointerClosureRoots(): str[] =
+    var out: str[] = []
+    add(out, "v2/src")
+    add(out, "v2/examples")
+    add(out, "v2/cheng-quic/src")
+    add(out, "v2/cheng-quic/tests")
+    return out
+
+fn parsedHasSurfaceKind(parsed: parser.ParsedV2Source, kind: str): bool =
+    for i in 0..<parsed.surfaceKinds.len:
+        if parsed.surfaceKinds[i] == kind:
+            return true
+    return false
+
+fn firstNoPointerViolationForParsedSource(sourcePath: str,
+                                          sourceText: str,
+                                          parsed: var parser.ParsedV2Source): str =
+    if parsedHasSurfaceKind(parsed, "compiler_core"):
+        compilerCoreNormalizeProbeSourcePaths(parsed.compilerCoreProgram, sourcePath)
+    return npfacts.firstV2NoPointerViolation(sourcePath, sourceText, parsed)
+
+fn v2ProbeFirstNoPointerViolation(rootPath: str, sourcePath: str): str =
+    let absoluteSourcePath = compilerCoreZrpcAbsolutePath(rootPath, sourcePath)
+    let sourceText = os.readFile(absoluteSourcePath)
+    var parsed = parser.parseV2SourceTextStrict(absoluteSourcePath, sourceText)
+    return firstNoPointerViolationForParsedSource(sourcePath, sourceText, parsed)
+
+fn sortTextList(values: var str[]) =
+    var i: int32 = 1
+    while i < values.len:
+        var j: int32 = i
+        while j > 0 && cmp(values[j], values[j - 1]) < 0:
+            let swap = values[j - 1]
+            values[j - 1] = values[j]
+            values[j] = swap
+            j = j - 1
+        i = i + 1
+
+fn compilerCoreNoPointerClosureFiles(rootPath: str): str[] =
+    let repoRoot = absolutePath(rootPath)
+    let roots = compilerCoreNoPointerClosureRoots()
+    var out: str[] = []
+    for i in 0..<roots.len:
+        let absRoot = joinPath2(repoRoot, roots[i])
+        if !os.dirExists(absRoot):
+            system.panic("verify-compiler-core-no-pointer-closure: missing root " + roots[i])
+        let files = os.walkDirRec(absRoot)
+        for j in 0..<files.len:
+            if strings.hasSuffix(files[j], ".cheng"):
+                add(out, os.relativePath(files[j], repoRoot))
+    sortTextList(out)
+    return out
+
+fn resolveV2NoPointerPackageClosureManifest(rootPath: str,
+                                            sourcePath: str): mresolve.SourceManifestBundle =
+    let absoluteSourcePath = compilerCoreZrpcAbsolutePath(rootPath, sourcePath)
+    let parsed = parser.parseV2SourceFileStrict(absoluteSourcePath)
+    if parsedHasSurfaceKind(parsed, "compiler_core"):
+        return mresolve.resolveCompilerCoreSourceManifest(absoluteSourcePath)
+    let packageRoot = mresolve.findNearestPackageRoot(absoluteSourcePath)
+    if len(packageRoot) <= 0:
+        system.panic("verify-v2-no-pointer-package-closures: missing package root for " + sourcePath)
+    let packageManifestPath = os.joinPath(packageRoot, "cheng-package.toml")
+    var fullPaths: str[] = []
+    if os.fileExists(packageManifestPath):
+        ident.appendUnique(fullPaths, packageManifestPath)
+    ident.appendUnique(fullPaths, absoluteSourcePath)
+    return mresolve.buildSourceManifestFromPaths(".", mresolve.parsePackageId(packageRoot), fullPaths)
+
+fn hasManifestClosurePath(bundle: mresolve.SourceManifestBundle, path: str): bool =
+    for i in 0..<bundle.filePaths.len:
+        if bundle.filePaths[i] == path:
+            return true
+    return false
+
+fn findHighGraphItemIndex(graph: cgraph.HighUirCompilerCoreGraph,
+                          topLevelKind: str,
+                          label: str): int32 =
+    for i in 0..<graph.labels.len:
+        if graph.topLevelKinds[i] == topLevelKind && graph.labels[i] == label:
+            return i
+    return -1
+
+fn graphItemExprReferenceCount(graph: cgraph.HighUirCompilerCoreGraph,
+                               itemIdx: int32,
+                               referenceKind: str): int32 =
+    if itemIdx < 0:
+        return -1
+    let exprStart = graph.itemExprStarts[itemIdx]
+    let exprCount = graph.exprCounts[itemIdx]
+    var count: int32 = 0
+    for i in 0..<exprCount:
+        if graph.exprReferenceKinds[exprStart + i] == referenceKind:
+            count = count + 1
+    return count
+
+fn graphItemParamTypeText(graph: cgraph.HighUirCompilerCoreGraph,
+                          itemIdx: int32,
+                          paramIdx: int32): str =
+    if itemIdx < 0 || paramIdx < 0 || paramIdx >= graph.paramCounts[itemIdx]:
+        return ""
+    return graph.paramTypeTexts[graph.itemParamStarts[itemIdx] + paramIdx]
+
+fn findProgramRoutineIndex(program: ccore.CompilerCoreProgram, label: str): int32 =
+    for i in 0..<program.routines.len:
+        if program.routines[i].name == label:
+            return i
+    return -1
+
+fn findFactsItemIndex(facts: cffacts.CompilerCoreSemanticFacts,
+                      topLevelKind: str,
+                      label: str): int32 =
+    for i in 0..<facts.itemIds.len:
+        if facts.topLevelKinds[i] == topLevelKind && facts.topLevelLabels[i] == label:
+            return i
+    return -1
+
+fn programRoutineExprReferenceCount(program: ccore.CompilerCoreProgram,
+                                    facts: cffacts.CompilerCoreSemanticFacts,
+                                    routineIdx: int32,
+                                    referenceKind: str): int32 =
+    if routineIdx < 0:
+        return -1
+    let decl = program.routines[routineIdx]
+    var count: int32 = 0
+    for i in 0..<decl.exprCount:
+        if facts.exprReferenceKinds[decl.exprStart + i] == referenceKind:
+            count = count + 1
+    return count
+
+fn programRoutineParamTypeText(program: ccore.CompilerCoreProgram,
+                               routineIdx: int32,
+                               paramIdx: int32): str =
+    if routineIdx < 0:
+        return ""
+    let decl = program.routines[routineIdx]
+    if paramIdx < 0 || paramIdx >= decl.paramCount:
+        return ""
+    return program.routineParams[decl.paramStart + paramIdx].typeText
 
 fn compareTextFiles(leftPath: str, rightPath: str): bool =
     return compareTextFilesBridge(leftPath, rightPath)
@@ -429,7 +674,7 @@ fn jsonDocFieldRaw(text: str, key: str): str =
             if startsWithText(line, prefix):
                 return trimTrailingComma(srun.sliceView(line, len(prefix), len(line)))
             lineStart = i + 1
-    panic("taiji: missing json field " + key)
+    system.panic("taiji: missing json field " + key)
 
 fn stripOuterArray(raw: str): str =
     if len(raw) >= 2 && raw[0] == '[' && raw[len(raw) - 1] == ']':
@@ -553,19 +798,19 @@ fn topLevelArrayParts(raw: str): str[] =
 fn parseDecimalInt32(text: str): int32 =
     let raw = trimAsciiWhitespace(text)
     if len(raw) <= 0:
-        panic("taiji: empty int32 text")
+        system.panic("taiji: empty int32 text")
     var start: int32 = 0
     var sign: int32 = 1
     if raw[0] == '-':
         sign = -1
         start = 1
     if start >= len(raw):
-        panic("taiji: malformed int32 text " + raw)
+        system.panic("taiji: malformed int32 text " + raw)
     var value: int32 = 0
     for i in start..<len(raw):
         let ch = raw[i]
         if ch < '0' || ch > '9':
-            panic("taiji: non-decimal int32 text " + raw)
+            system.panic("taiji: non-decimal int32 text " + raw)
         value = value * 10 + int32(ch) - int32('0')
     return value * sign
 
@@ -584,7 +829,7 @@ fn jsonArrayStringValues(raw: str): str[] =
     for i in 0..<parts.len:
         let text = trimAsciiWhitespace(parts[i])
         if len(text) < 2 || text[0] != '"' || text[len(text) - 1] != '"':
-            panic("taiji: malformed json string array item " + text)
+            system.panic("taiji: malformed json string array item " + text)
         add(out, srun.sliceView(text, 1, len(text) - 1))
     return out
 
@@ -603,7 +848,7 @@ fn jsonCountObjectValue(raw: str, key: str): int32 =
                 stop = stop + 1
             return parseDecimalInt32(trimAsciiWhitespace(srun.sliceView(raw, start, stop)))
         i = i + 1
-    panic("taiji: missing json count key " + key)
+    system.panic("taiji: missing json count key " + key)
 
 fn jsonCountObjectValues(raw: str, keys: str[]): int32[] =
     var out: int32[]
@@ -627,19 +872,73 @@ fn planePairOrder(planeOrder: str[]): str[] =
     return out
 
 fn semanticEdgeKindOrder(): str[] =
-    return ["lowers_to",
+    return ["lowers_to/compiler_core/compiler_module_decl",
+            "lowers_to/compiler_core/compiler_type_block",
+            "lowers_to/compiler_core/compiler_const_decl",
+            "lowers_to/compiler_core/compiler_var_decl",
+            "lowers_to/compiler_core/compiler_fn_exec",
+            "lowers_to/compiler_core/compiler_fn_outline",
+            "lowers_to/compiler_core/compiler_import_bind",
+            "lowers_to/compiler_core/compiler_importc_fn_decl",
+            "lowers_to/unimaker/asset_contract_def",
+            "lowers_to/unimaker/actor_def",
+            "lowers_to/unimaker/ganzhi_state_def",
+            "lowers_to/unimaker/hardware_callback_def",
+            "lowers_to/unimaker/evolve_site_def",
+            "lowers_to/network_distribution/publish_source_manifest",
+            "lowers_to/network_distribution/publish_rule_pack",
+            "lowers_to/network_distribution/publish_compiler_rule_pack",
+            "lowers_to/network_distribution/route_lsmr_tree",
+            "lowers_to/network_distribution/disperse_ida_fragments",
+            "lowers_to/network_distribution/exchange_anti_entropy_signature",
+            "lowers_to/network_distribution/repair_from_signature_gap",
             "gates/effect/string",
-            "gates/effect/compiler_core",
-            "gates/effect/unimaker",
-            "gates/effect/network_distribution",
+            "gates/effect/compiler_core/compiler_module_decl",
+            "gates/effect/compiler_core/compiler_import_bind",
+            "gates/effect/compiler_core/compiler_importc_fn_decl",
+            "gates/effect/compiler_core/compiler_type_block",
+            "gates/effect/compiler_core/compiler_const_decl",
+            "gates/effect/compiler_core/compiler_var_decl",
+            "gates/effect/compiler_core/compiler_fn_outline",
+            "gates/effect/compiler_core/compiler_fn_exec",
+            "gates/effect/unimaker/verify_asset_contract",
+            "gates/effect/unimaker/spawn_actor",
+            "gates/effect/unimaker/register_ganzhi_state",
+            "gates/effect/unimaker/bind_nfc_callback",
+            "gates/effect/unimaker/register_evolve_site",
+            "gates/effect/network_distribution/publish_source_manifest",
+            "gates/effect/network_distribution/publish_rule_pack",
+            "gates/effect/network_distribution/publish_compiler_rule_pack",
+            "gates/effect/network_distribution/route_lsmr_tree",
+            "gates/effect/network_distribution/disperse_ida_fragments",
+            "gates/effect/network_distribution/exchange_anti_entropy_signature",
+            "gates/effect/network_distribution/repair_from_signature_gap",
             "gates/alias",
             "gates/bounds/compiler_core",
-            "gates/layout/compiler_core",
-            "gates/layout/network_distribution",
+            "gates/layout/compiler_core/compiler_module_decl",
+            "gates/layout/compiler_core/compiler_import_bind",
+            "gates/layout/compiler_core/compiler_importc_fn_decl",
+            "gates/layout/compiler_core/compiler_type_block",
+            "gates/layout/compiler_core/compiler_const_decl",
+            "gates/layout/compiler_core/compiler_var_decl",
+            "gates/layout/compiler_core/compiler_fn_outline",
+            "gates/layout/compiler_core/compiler_fn_exec",
+            "gates/layout/network_distribution/publish_source_manifest",
+            "gates/layout/network_distribution/publish_rule_pack",
+            "gates/layout/network_distribution/publish_compiler_rule_pack",
+            "gates/layout/network_distribution/route_lsmr_tree",
+            "gates/layout/network_distribution/disperse_ida_fragments",
+            "gates/layout/network_distribution/exchange_anti_entropy_signature",
+            "gates/layout/network_distribution/repair_from_signature_gap",
             "gates/ownership/string",
             "gates/ownership/compiler_core",
-            "gates/ownership/unimaker",
-            "gates/ownership/network_distribution"]
+            "gates/ownership/unimaker/asset_contract_def",
+            "gates/ownership/unimaker/actor_def",
+            "gates/ownership/unimaker/ganzhi_state_def",
+            "gates/ownership/unimaker/hardware_callback_def",
+            "gates/ownership/unimaker/evolve_site_def",
+            "gates/ownership/network_distribution/exchange_anti_entropy_signature",
+            "gates/ownership/network_distribution/repair_from_signature_gap"]
 
 fn edgeKindIndex(edgeKindOrder: str[], edgeKind: str): int32 =
     for i in 0..<edgeKindOrder.len:
@@ -657,9 +956,9 @@ fn edgePlanePairCounts(lowNodeIdsRaw: str,
     let edgeNodeIds = jsonArrayIntValues(edgeNodeIdsRaw)
     let targetPlanes = jsonArrayStringValues(targetPlanesRaw)
     if lowNodeIds.len != lowPlanes.len:
-        panic("taiji: low_uir plane map length mismatch")
+        system.panic("taiji: low_uir plane map length mismatch")
     if edgeNodeIds.len != targetPlanes.len:
-        panic("taiji: validated edge plane length mismatch")
+        system.panic("taiji: validated edge plane length mismatch")
     var out: int32[]
     out = []
     for i in 0..<planeOrder.len * planeOrder.len:
@@ -671,11 +970,11 @@ fn edgePlanePairCounts(lowNodeIdsRaw: str,
                 sourcePlane = lowPlanes[j]
                 break
         if len(sourcePlane) <= 0:
-            panic("taiji: missing low_uir plane for edge node " + intToStr(edgeNodeIds[i]))
+            system.panic("taiji: missing low_uir plane for edge node " + intToStr(edgeNodeIds[i]))
         let leftIdx = planeIndex(planeOrder, sourcePlane)
         let rightIdx = planeIndex(planeOrder, targetPlanes[i])
         if leftIdx < 0 || rightIdx < 0:
-            panic("taiji: unknown plane pair " + sourcePlane + " -> " + targetPlanes[i])
+            system.panic("taiji: unknown plane pair " + sourcePlane + " -> " + targetPlanes[i])
         out[leftIdx * planeOrder.len + rightIdx] = out[leftIdx * planeOrder.len + rightIdx] + 1
     return out
 
@@ -687,9 +986,9 @@ fn semanticEdgeFamilyCounts(lowNodeIds: int32[],
                             edgeKindOrder: str[],
                             planeOrder: str[]): int32[] =
     if lowNodeIds.len != lowPlanes.len:
-        panic("taiji: low_uir plane map length mismatch")
+        system.panic("taiji: low_uir plane map length mismatch")
     if edgeNodeIds.len != targetPlanes.len || edgeNodeIds.len != edgeKinds.len:
-        panic("taiji: semantic edge family length mismatch")
+        system.panic("taiji: semantic edge family length mismatch")
     let planePairCount = planeOrder.len * planeOrder.len
     var out: int32[]
     out = []
@@ -698,12 +997,12 @@ fn semanticEdgeFamilyCounts(lowNodeIds: int32[],
     for i in 0..<edgeNodeIds.len:
         let nodeIdx = baguaAnnotationIndexForNode(lowNodeIds, edgeNodeIds[i])
         if nodeIdx < 0:
-            panic("taiji: missing low_uir plane for semantic edge node " + intToStr(edgeNodeIds[i]))
+            system.panic("taiji: missing low_uir plane for semantic edge node " + intToStr(edgeNodeIds[i]))
         let edgeKindIdx = edgeKindIndex(edgeKindOrder, edgeKinds[i])
         let leftIdx = planeIndex(planeOrder, lowPlanes[nodeIdx])
         let rightIdx = planeIndex(planeOrder, targetPlanes[i])
         if edgeKindIdx < 0 || leftIdx < 0 || rightIdx < 0:
-            panic("taiji: unknown semantic edge family " + edgeKinds[i] + "|" + lowPlanes[nodeIdx] + "->" + targetPlanes[i])
+            system.panic("taiji: unknown semantic edge family " + edgeKinds[i] + "|" + lowPlanes[nodeIdx] + "->" + targetPlanes[i])
         let familyIdx = edgeKindIdx * planePairCount + leftIdx * planeOrder.len + rightIdx
         out[familyIdx] = out[familyIdx] + 1
     return out
@@ -722,27 +1021,76 @@ fn prefixStringArray(values: str[], prefix: str): str[] =
         add(out, prefix + values[i])
     return out
 
-fn semanticProofEdgeKind(proofKind: str, sourceKind: str): str =
+fn semanticProofFamilyPrefix(assumption: str): str =
+    for i in 0..<len(assumption):
+        if assumption[i] == '|':
+            return srun.sliceView(assumption, 0, i)
+    system.panic("taiji: missing semantic proof family prefix in assumption " + assumption)
+
+fn semanticProofFamilyLastDotSegment(assumption: str): str =
+    var lastDot = -1
+    for i in 0..<len(assumption):
+        if assumption[i] == '.':
+            lastDot = i
+    if lastDot < 0 || lastDot + 1 >= len(assumption):
+        system.panic("taiji: missing semantic proof family tail in assumption " + assumption)
+    return srun.sliceView(assumption, lastDot + 1, len(assumption))
+
+fn semanticPhaseEdgeKind(sourceKind: str, reason: str): str =
+    if sourceKind == "string":
+        return "lowers_to"
+    if sourceKind == "compiler_core":
+        return "lowers_to/compiler_core/" + semanticProofFamilyPrefix(reason)
+    if sourceKind == "unimaker":
+        return "lowers_to/unimaker/" + semanticProofFamilyPrefix(reason)
+    if sourceKind == "network_distribution":
+        return "lowers_to/network_distribution/" + semanticProofFamilyPrefix(reason)
+    system.panic("taiji: unsupported semantic phase source kind " + sourceKind)
+
+fn semanticPhaseEdgeKinds(reasons: str[], sourceKind: str): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<reasons.len:
+        add(out, semanticPhaseEdgeKind(sourceKind, reasons[i]))
+    return out
+
+fn semanticProofEdgeKind(proofKind: str, sourceKind: str, assumption: str): str =
+    if proofKind == "effect" && sourceKind == "compiler_core":
+        return "gates/effect/compiler_core/" + semanticProofFamilyPrefix(assumption)
+    if proofKind == "effect" && sourceKind == "unimaker":
+        return "gates/effect/unimaker/" + semanticProofFamilyLastDotSegment(assumption)
+    if proofKind == "effect" && sourceKind == "network_distribution":
+        return "gates/effect/network_distribution/" + semanticProofFamilyLastDotSegment(assumption)
     if proofKind == "effect":
         return "gates/effect/" + sourceKind
+    if proofKind == "layout" && sourceKind == "compiler_core":
+        return "gates/layout/compiler_core/" + semanticProofFamilyPrefix(assumption)
+    if proofKind == "layout" && sourceKind == "network_distribution":
+        return "gates/layout/network_distribution/" + semanticProofFamilyPrefix(assumption)
     if proofKind == "layout":
         return "gates/layout/" + sourceKind
     if proofKind == "bounds":
         return "gates/bounds/" + sourceKind
+    if proofKind == "ownership" && sourceKind == "unimaker":
+        return "gates/ownership/unimaker/" + assumption
+    if proofKind == "ownership" && sourceKind == "network_distribution":
+        return "gates/ownership/network_distribution/" + assumption
     if proofKind == "ownership":
         return "gates/ownership/" + sourceKind
     return "gates/" + proofKind
 
-fn semanticProofEdgeKinds(proofKinds: str[], sourceKind: str): str[] =
+fn semanticProofEdgeKinds(proofKinds: str[], assumptions: str[], sourceKind: str): str[] =
+    if proofKinds.len != assumptions.len:
+        system.panic("taiji: semantic proof edge kind length mismatch")
     var out: str[]
     out = []
     for i in 0..<proofKinds.len:
-        add(out, semanticProofEdgeKind(proofKinds[i], sourceKind))
+        add(out, semanticProofEdgeKind(proofKinds[i], sourceKind, assumptions[i]))
     return out
 
 fn addCountVectors(left: int32[], right: int32[]): int32[] =
     if left.len != right.len:
-        panic("taiji: count vector length mismatch")
+        system.panic("taiji: count vector length mismatch")
     var out: int32[]
     out = []
     for i in 0..<left.len:
@@ -969,7 +1317,7 @@ fn baguaAnnotationIndexForNode(nodeIds: int32[], targetNodeId: int32): int32 =
 fn requireBaguaAllowedEdge(kind: str, leftPlane: str, rightPlane: str, context: str) =
     if !bcore.allowEdge(kind, leftPlane, rightPlane):
         let familyId = bcore.edgeFamilyId(kind, leftPlane, rightPlane)
-        panic("taiji: bpi edge violation kind=" + kind +
+        system.panic("taiji: bpi edge violation kind=" + kind +
               " left=" + leftPlane +
               " right=" + rightPlane +
               " family=" + familyId +
@@ -978,24 +1326,27 @@ fn requireBaguaAllowedEdge(kind: str, leftPlane: str, rightPlane: str, context: 
 fn validateBaguaPhaseLowering(nodeIds: int32[],
                               annotations: bcore.BaguaAnnotation[],
                               lowNodeId: int32,
+                              sourceKind: str,
+                              reason: str,
                               phasePlane: str,
                               context: str) =
     let idx = baguaAnnotationIndexForNode(nodeIds, lowNodeId)
     if idx < 0:
-        panic("taiji: missing bpi phase node for " + context)
-    requireBaguaAllowedEdge("lowers_to", annotations[idx].plane, phasePlane, context)
+        system.panic("taiji: missing bpi phase node for " + context)
+    requireBaguaAllowedEdge(semanticPhaseEdgeKind(sourceKind, reason), annotations[idx].plane, phasePlane, context)
 
 fn validateBaguaProofGate(nodeIds: int32[],
                           annotations: bcore.BaguaAnnotation[],
                           lowNodeId: int32,
                           proofKind: str,
                           sourceKind: str,
+                          assumption: str,
                           gatePlane: str,
                           context: str) =
     let idx = baguaAnnotationIndexForNode(nodeIds, lowNodeId)
     if idx < 0:
-        panic("taiji: missing bpi proof node for " + context)
-    requireBaguaAllowedEdge(semanticProofEdgeKind(proofKind, sourceKind), annotations[idx].plane, gatePlane, context)
+        system.panic("taiji: missing bpi proof node for " + context)
+    requireBaguaAllowedEdge(semanticProofEdgeKind(proofKind, sourceKind, assumption), annotations[idx].plane, gatePlane, context)
 
 fn sourceKindForPathOrSample(sourcePath: str, builtInSample: str): str =
     if builtInSample == "string":
@@ -1007,12 +1358,12 @@ fn sourceKindForPathOrSample(sourcePath: str, builtInSample: str): str =
         return "compiler_core"
     if parsed.unimakerProgram.decls.len > 0:
         return "unimaker"
-    panic("taiji: unsupported source surface for " + sourcePath)
+    system.panic("taiji: unsupported source surface for " + sourcePath)
 
 fn taijiRequireSourcePath(): str =
     let sourcePath = readFlagDefault("--in", "")
     if len(sourcePath) <= 0:
-        panic("taiji: missing --in")
+        system.panic("taiji: missing --in")
     return sourcePath
 
 fn taijiSampleName(): str =
@@ -1749,6 +2100,8 @@ fn taijiStringPhaseTraceDocument(sourcePath: str,
         validateBaguaPhaseLowering(bundle.lowPlan.exprIds,
                                    baguaAnnotations,
                                    bundle.lowPlan.exprIds[i],
+                                   "string",
+                                   tag.reason,
                                    phasePlaneForTag(tag),
                                    "string_phase|" + bundle.lowPlan.canonicalOps[i])
         add(events,
@@ -1786,9 +2139,12 @@ fn taijiUnimakerPhaseTraceDocument(sourcePath: str,
                                                         bundle.lowPlan.runtimeTargets)
     for i in 0..<bundle.lowPlan.declIds.len:
         let tag = unimakerBaguaTag(bundle.lowPlan.canonicalOps[i])
+        let reason = bundle.lowPlan.canonicalOps[i] + "|" + bundle.lowPlan.networkModes[i]
         validateBaguaPhaseLowering(bundle.lowPlan.declIds,
                                    baguaAnnotations,
                                    bundle.lowPlan.declIds[i],
+                                   "unimaker",
+                                   reason,
                                    phasePlaneForTag(tag),
                                    "unimaker_phase|" + bundle.lowPlan.canonicalOps[i])
         add(events,
@@ -1801,7 +2157,7 @@ fn taijiUnimakerPhaseTraceDocument(sourcePath: str,
                               jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
                               jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.declIds[i])),
                               jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.declIds[i])),
-                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+                              jsonInlineFieldRaw("reason", jsonQuote(reason))]))
     add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
     add(fields, jsonFieldRaw("source_kind", jsonQuote("unimaker")))
     add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
@@ -1830,9 +2186,12 @@ fn taijiNetworkPhaseTraceDocument(sourcePath: str,
                                                         bundle.lowPlan.runtimeTargets)
     for i in 0..<bundle.lowPlan.opIds.len:
         let tag = networkBaguaTag(bundle.lowPlan.canonicalOps[i])
+        let reason = bundle.lowPlan.canonicalOps[i] + "|" + bundle.lowPlan.proofDomains[i]
         validateBaguaPhaseLowering(bundle.lowPlan.opIds,
                                    baguaAnnotations,
                                    bundle.lowPlan.opIds[i],
+                                   "network_distribution",
+                                   reason,
                                    phasePlaneForTag(tag),
                                    "network_phase|" + bundle.lowPlan.canonicalOps[i])
         add(events,
@@ -1845,7 +2204,7 @@ fn taijiNetworkPhaseTraceDocument(sourcePath: str,
                               jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
                               jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.opIds[i])),
                               jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.opIds[i])),
-                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+                              jsonInlineFieldRaw("reason", jsonQuote(reason))]))
     add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
     add(fields, jsonFieldRaw("source_kind", jsonQuote("network_distribution")))
     add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
@@ -1870,9 +2229,12 @@ fn taijiCompilerCorePhaseTraceDocument(sourcePath: str,
                                                         bundle.lowPlan.runtimeTargets)
     for i in 0..<bundle.lowPlan.itemIds.len:
         let tag = compilerCoreBaguaTag(bundle.lowPlan.canonicalOps[i])
+        let reason = bundle.lowPlan.canonicalOps[i] + "|" + bundle.lowPlan.topLevelKinds[i]
         validateBaguaPhaseLowering(bundle.lowPlan.itemIds,
                                    baguaAnnotations,
                                    bundle.lowPlan.itemIds[i],
+                                   "compiler_core",
+                                   reason,
                                    phasePlaneForTag(tag),
                                    "compiler_core_phase|" + bundle.lowPlan.canonicalOps[i])
         add(events,
@@ -1885,7 +2247,7 @@ fn taijiCompilerCorePhaseTraceDocument(sourcePath: str,
                               jsonInlineFieldRaw("cell_col", intToStr(phaseCellColForTag(tag))),
                               jsonInlineFieldRaw("source_node_id", intToStr(bundle.lowPlan.itemIds[i])),
                               jsonInlineFieldRaw("low_uir_node_id", intToStr(bundle.lowPlan.itemIds[i])),
-                              jsonInlineFieldRaw("reason", jsonQuote(tag.reason))]))
+                              jsonInlineFieldRaw("reason", jsonQuote(reason))]))
     add(fields, jsonFieldRaw("version", jsonQuote("taiji.phase_space_trace.v0")))
     add(fields, jsonFieldRaw("source_kind", jsonQuote("compiler_core")))
     add(fields, jsonFieldRaw("source_path", jsonQuote(sourcePath)))
@@ -1923,6 +2285,7 @@ fn taijiStringProofDocument(sourcePath: str,
                                bundle.lowPlan.exprIds[i],
                                "effect",
                                "string",
+                               "runtime_target 与 effect_class 必须和 canonical op 一致",
                                gatePlane,
                                "string_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
         allPass = allPass && effectPass
@@ -1945,6 +2308,7 @@ fn taijiStringProofDocument(sourcePath: str,
                                bundle.lowPlan.exprIds[i],
                                "alias",
                                "string",
+                               "zero_copy=1 时只能保持无分配或借用视图",
                                gatePlane,
                                "string_proof|" + bundle.lowPlan.canonicalOps[i] + "|alias")
         allPass = allPass && aliasPass
@@ -1995,6 +2359,7 @@ fn taijiUnimakerProofDocument(sourcePath: str,
                                bundle.lowPlan.declIds[i],
                                "effect",
                                "unimaker",
+                               "runtime/effect/proof 必须和 canonical op 一致",
                                gatePlane,
                                "unimaker_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
         allPass = allPass && effectPass
@@ -2019,6 +2384,7 @@ fn taijiUnimakerProofDocument(sourcePath: str,
                                bundle.lowPlan.declIds[i],
                                "ownership",
                                "unimaker",
+                               "能力类型必须与声明形状对应",
                                gatePlane,
                                "unimaker_proof|" + bundle.lowPlan.canonicalOps[i] + "|ownership")
         allPass = allPass && capabilityPass
@@ -2069,6 +2435,7 @@ fn taijiNetworkProofDocument(sourcePath: str,
                                bundle.lowPlan.opIds[i],
                                "effect",
                                "network_distribution",
+                               "runtime/proof 必须和 canonical op 一致",
                                gatePlane,
                                "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
         allPass = allPass && effectPass
@@ -2091,6 +2458,7 @@ fn taijiNetworkProofDocument(sourcePath: str,
                                bundle.lowPlan.opIds[i],
                                "layout",
                                "network_distribution",
+                               bundle.lowPlan.canonicalOps[i] + "|" + bundle.lowPlan.addressingModes[i],
                                gatePlane,
                                "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|layout")
         allPass = allPass && layoutPass
@@ -2113,6 +2481,7 @@ fn taijiNetworkProofDocument(sourcePath: str,
                                bundle.lowPlan.opIds[i],
                                "ownership",
                                "network_distribution",
+                               bundle.lowPlan.canonicalOps[i],
                                gatePlane,
                                "network_proof|" + bundle.lowPlan.canonicalOps[i] + "|ownership")
         allPass = allPass && ownershipPass
@@ -2155,6 +2524,28 @@ fn taijiCompilerCoreProofDocument(sourcePath: str,
         let contractOp = contract.canonicalOps[opIdx]
         let gatePlane = baguaAnnotations[i].plane
         let gateCell = proofGateCell(baguaAnnotations[i])
+        let layoutAssumption = bundle.lowPlan.canonicalOps[i] + "|" + bundle.lowPlan.topLevelKinds[i]
+        let effectAssumption = bundle.lowPlan.canonicalOps[i] + "|" + contractOp.proofDomain
+        let layoutPass = bundle.lowPlan.bindingScopes[i] != ""
+        validateBaguaProofGate(bundle.lowPlan.itemIds,
+                               baguaAnnotations,
+                               bundle.lowPlan.itemIds[i],
+                               "layout",
+                               "compiler_core",
+                               layoutAssumption,
+                               gatePlane,
+                               "compiler_core_proof|" + bundle.lowPlan.canonicalOps[i] + "|layout")
+        allPass = allPass && layoutPass
+        add(tasks,
+            jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
+                              jsonInlineFieldRaw("kind", jsonQuote("layout")),
+                              jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.itemIds[i])),
+                              jsonInlineFieldRaw("assumptions", jsonQuote(layoutAssumption)),
+                              jsonInlineFieldRaw("expected_invariant", jsonQuote("binding_scope_non_empty")),
+                              jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
+                              jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
+                              jsonInlineFieldRaw("checker_result", jsonQuote(if layoutPass: "pass" else: "fail"))]))
+        taskId = taskId + 1
         let effectPass = bundle.lowPlan.runtimeTargets[i] == contractOp.runtimeTarget &&
                          bundle.lowPlan.effectClasses[i] == contractOp.effectClass &&
                          bundle.lowPlan.proofDomains[i] == contractOp.proofDomain &&
@@ -2164,6 +2555,7 @@ fn taijiCompilerCoreProofDocument(sourcePath: str,
                                bundle.lowPlan.itemIds[i],
                                "effect",
                                "compiler_core",
+                               effectAssumption,
                                gatePlane,
                                "compiler_core_proof|" + bundle.lowPlan.canonicalOps[i] + "|effect")
         allPass = allPass && effectPass
@@ -2171,7 +2563,7 @@ fn taijiCompilerCoreProofDocument(sourcePath: str,
             jsonInlineObject([jsonInlineFieldRaw("task_id", intToStr(taskId)),
                               jsonInlineFieldRaw("kind", jsonQuote("effect")),
                               jsonInlineFieldRaw("target_node", intToStr(bundle.lowPlan.itemIds[i])),
-                              jsonInlineFieldRaw("assumptions", jsonQuote("runtime/effect/proof/binding 必须和 canonical op 一致")),
+                              jsonInlineFieldRaw("assumptions", jsonQuote(effectAssumption)),
                               jsonInlineFieldRaw("expected_invariant", jsonQuote("binding_scope=" + contractOp.bindingScope)),
                               jsonInlineFieldRaw("bagua_gate_plane", jsonQuote(gatePlane)),
                               jsonInlineFieldRaw("bagua_gate_cell", jsonQuote(gateCell)),
@@ -2184,6 +2576,7 @@ fn taijiCompilerCoreProofDocument(sourcePath: str,
                                bundle.lowPlan.itemIds[i],
                                "bounds",
                                "compiler_core",
+                               "executable_ast_ready",
                                gatePlane,
                                "compiler_core_proof|" + bundle.lowPlan.canonicalOps[i] + "|bounds")
         allPass = allPass && boundsPass
@@ -2216,7 +2609,7 @@ fn taijiAstDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDo
                                             cpipe.compileCompilerCoreSourceClosure(sourcePath).program)
     if parsed.unimakerProgram.decls.len > 0:
         return taijiUnimakerAstDocument(sourcePath, sourceLabel, parsed.unimakerProgram)
-    panic("taiji: unsupported ast export source")
+    system.panic("taiji: unsupported ast export source")
 
 fn taijiLowUirDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDocument =
     if sampleName == "string":
@@ -2234,7 +2627,7 @@ fn taijiLowUirDocument(sourcePath: str, sourceLabel: str, sampleName: str): Taij
         return taijiUnimakerLowUirDocument(sourcePath,
                                            sourceLabel,
                                            upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
-    panic("taiji: unsupported low_uir export source")
+    system.panic("taiji: unsupported low_uir export source")
 
 fn taijiPhaseTraceDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiDocument =
     if sampleName == "string":
@@ -2252,7 +2645,7 @@ fn taijiPhaseTraceDocument(sourcePath: str, sourceLabel: str, sampleName: str): 
         return taijiUnimakerPhaseTraceDocument(sourcePath,
                                                sourceLabel,
                                                upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
-    panic("taiji: unsupported phase trace source")
+    system.panic("taiji: unsupported phase trace source")
 
 fn taijiProofDocument(sourcePath: str, sourceLabel: str, sampleName: str): TaijiProofArtifact =
     if sampleName == "string":
@@ -2270,7 +2663,28 @@ fn taijiProofDocument(sourcePath: str, sourceLabel: str, sampleName: str): Taiji
         return taijiUnimakerProofDocument(sourcePath,
                                           sourceLabel,
                                           upipe.compileUnimakerSurfaceProgram(parsed.unimakerProgram))
-    panic("taiji: unsupported proof source")
+    system.panic("taiji: unsupported proof source")
+
+fn taijiExecPlanDocument(sourcePath: str, label: str, sampleName: str): TaijiDocument =
+    if sampleName == "string":
+        system.panic("taiji: dump-exec-plan only supports compiler_core source")
+    let parsed = parser.parseV2SourceFileStrict(sourcePath)
+    if parsed.compilerCoreProgram.topLevelKinds.len <= 0:
+        system.panic("taiji: dump-exec-plan only supports compiler_core source")
+    let bundle = cpipe.compileCompilerCoreSourceClosure(sourcePath)
+    var itemIdx: int32 = -1
+    for i in 0..<bundle.lowPlan.labels.len:
+        if bundle.lowPlan.labels[i] == label:
+            itemIdx = i
+            break
+    if itemIdx < 0:
+        system.panic("taiji: missing compiler_core exec label " + label)
+    if !bundle.lowPlan.executableAstReady[itemIdx]:
+        system.panic("taiji: label is not executable " + label)
+    return taijiDocument("source_path=" + sourcePath + "\n" +
+                         "label=" + label + "\n" +
+                         "item_id=" + intToStr(bundle.lowPlan.itemIds[itemIdx]) + "\n" +
+                         mpipeline.compilerCoreRoutineExecPlanText(bundle.lowPlan, itemIdx))
 
 fn runDumpAst(): int32 =
     let sampleName = taijiSampleName()
@@ -2288,6 +2702,18 @@ fn runDumpLowUir(): int32 =
     let sourceLabel = taijiResolveSourceLabel(sourcePath, sampleName)
     let outPath = taijiOutputPathOrEmpty()
     let doc = taijiLowUirDocument(sourcePath, sourceLabel, sampleName)
+    writeOptionalTextFile(outPath, doc.text)
+    writeText(doc.text + "\n")
+    return 0
+
+fn runDumpExecPlan(): int32 =
+    let sampleName = taijiSampleName()
+    let sourcePath = taijiResolveSourcePath(sampleName)
+    let label = readFlagDefault("--label", "")
+    if len(label) <= 0:
+        system.panic("taiji: missing --label")
+    let outPath = taijiOutputPathOrEmpty()
+    let doc = taijiExecPlanDocument(sourcePath, label, sampleName)
     writeOptionalTextFile(outPath, doc.text)
     writeText(doc.text + "\n")
     return 0
@@ -2335,7 +2761,7 @@ fn updateSemanticEdgeFamilyCounts(familyTotalCounts: var int32[],
                                   familyCounts: int32[],
                                   sampleCount: int32) =
     if familyTotalCounts.len != familyCounts.len || familySampleCounts.len != familyCounts.len:
-        panic("taiji: semantic edge family total length mismatch")
+        system.panic("taiji: semantic edge family total length mismatch")
     for familyIdx in 0..<familyCounts.len:
         let count = familyCounts[familyIdx]
         if count <= 0:
@@ -2357,13 +2783,13 @@ fn taijiSemanticEdgeCatalogDocument(specs: TaijiSeedSpec[],
     let gateClassOrder = ["handwritten_core", "contract_sample", "compiler_observation"]
     let sourceKindOrder = ["string", "unimaker", "network_distribution", "compiler_core"]
     if sampleLabels.len != specs.len:
-        panic("taiji: semantic edge catalog sample label length mismatch")
+        system.panic("taiji: semantic edge catalog sample label length mismatch")
     let planePairCount = planePairKeys.len
     let familyCount = edgeKindOrder.len * planePairCount
     if familyTotalCounts.len != familyCount ||
        familySampleCounts.len != familyCount ||
        familySampleHits.len != familyCount * specs.len:
-        panic("taiji: semantic edge catalog family vector length mismatch")
+        system.panic("taiji: semantic edge catalog family vector length mismatch")
     var validatedEdgeCount: int32 = 0
     var nonzeroFamilyCount: int32 = 0
     var sampleRows: str[]
@@ -2401,7 +2827,7 @@ fn taijiSemanticEdgeCatalogDocument(specs: TaijiSeedSpec[],
                     let gateClassIdx = planeIndex(gateClassOrder, specs[sampleIdx].gateClass)
                     let sourceKindIdx = planeIndex(sourceKindOrder, specs[sampleIdx].sourceKind)
                     if gateClassIdx < 0 || sourceKindIdx < 0:
-                        panic("taiji: semantic edge catalog sample class mismatch")
+                        system.panic("taiji: semantic edge catalog sample class mismatch")
                     gateClassCounts[gateClassIdx] = gateClassCounts[gateClassIdx] + 1
                     sourceKindCounts[sourceKindIdx] = sourceKindCounts[sourceKindIdx] + 1
                 add(familyRows,
@@ -2481,7 +2907,7 @@ fn runTaijiSeedSet(): int32 =
         let traceDoc = taijiPhaseTraceDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
         let proof = taijiProofDocument(spec.sourcePath, spec.sourceLabel, spec.builtInSample)
         if !proof.allPass:
-            panic("taiji: proof obligations failed for " + spec.sampleId)
+            system.panic("taiji: proof obligations failed for " + spec.sampleId)
         let proofDoc = taijiDocument(proof.text)
         let profileDoc = taijiProfileDocument(spec.sourcePath,
                                               spec.sourceLabel,
@@ -2494,10 +2920,12 @@ fn runTaijiSeedSet(): int32 =
         let lowPlanes = jsonArrayStringValues(jsonDocFieldRaw(lowDoc.text, "bagua_plane"))
         let phaseEdgeNodeIds = jsonArrayIntValues(jsonDocFieldRaw(traceDoc.text, "low_uir_node_ids"))
         let phaseTargetPlanes = jsonArrayStringValues(jsonDocFieldRaw(traceDoc.text, "plane"))
-        let phaseEdgeKinds = repeatStringArray("lowers_to", phaseEdgeNodeIds.len)
+        let phaseEdgeKinds = semanticPhaseEdgeKinds(jsonArrayStringValues(jsonDocFieldRaw(traceDoc.text, "reasons")),
+                                                    spec.sourceKind)
         let proofEdgeNodeIds = jsonArrayIntValues(jsonDocFieldRaw(proofDoc.text, "targets"))
         let proofTargetPlanes = jsonArrayStringValues(jsonDocFieldRaw(proofDoc.text, "bagua_gate_plane"))
         let proofEdgeKinds = semanticProofEdgeKinds(jsonArrayStringValues(jsonDocFieldRaw(proofDoc.text, "kinds")),
+                                                    jsonArrayStringValues(jsonDocFieldRaw(proofDoc.text, "assumptions")),
                                                     spec.sourceKind)
         let phaseFamilyCounts = semanticEdgeFamilyCounts(lowNodeIds,
                                                          lowPlanes,
@@ -2646,6 +3074,8 @@ fn printUsage() =
     printLine("  selfhost                     print the subset selfhost bootstrap contract")
     printLine("  stage-selfhost-host          build stage1 -> stage2 -> stage3 native closure")
     printLine("  tooling-selfhost-host        run the native tooling selfhost orchestration")
+    printLine("  tooling-selfhost-check       verify tooling stage0 -> stage1 -> stage2 fixed-point closure")
+    printLine("  program-selfhost-check       verify ordinary programs are built and run by a Cheng-produced compiler")
     printLine("  lsmr-address                 emit a deterministic LSMR address from a content cid")
     printLine("  lsmr-route-plan             emit a deterministic canonical LSMR multipath route plan")
     printLine("  outline-parse                emit an outline parse for a compiler_core source")
@@ -2659,9 +3089,15 @@ fn printUsage() =
     printLine("  publish-rule-pack            emit a rule-pack artifact")
     printLine("  publish-compiler-rule-pack   emit a compiler rule-pack artifact")
     printLine("  verify-network-selfhost      verify manifest + topology + rule-pack closure")
+    printLine("  verify-compiler-core-zrpc-surface verify compiler_core no-pointer surface probes")
+    printLine("  verify-v2-no-pointer-surface verify v2 no-pointer probes across compiler_core/unimaker/topology/network")
+    printLine("  verify-v2-no-pointer-package-closures verify real v2 package entry closures stay zero-rawptr")
+    printLine("  verify-compiler-core-no-pointer-closure verify v2 production closure stays zero-rawptr")
+    printLine("  verify-compiler-core-cycle-surface verify compiler_core cyclic import and zero-forward-decl surface")
     printLine("  release-compile              emit a deterministic release artifact spec")
     printLine("  dump-ast                     emit a Taiji-UIR AST graph json")
     printLine("  dump-low-uir                 emit a Taiji-UIR typed low_uir graph json")
+    printLine("  dump-exec-plan               emit compiler_core Low-UIR exec ops for one label")
     printLine("  trace-phase-space            emit a Taiji-UIR bagua phase-space trace json")
     printLine("  emit-proof-obligations       emit Taiji-UIR proof obligation tasks json")
     printLine("  taiji-seed-set               materialize the phase-1 Taiji-UIR seed dataset")
@@ -2856,8 +3292,10 @@ fn buildCompilerCoreOutlineText(sourcePath: str): str =
         add(lines, "routine." + intToStr(i) + ".name=" + program.routines[i].name)
         add(lines, "routine." + intToStr(i) + ".signature=" + program.routines[i].signatureText)
         add(lines, "routine." + intToStr(i) + ".body_line_count=" + intToStr(program.routines[i].bodyLines.len))
-        add(lines, "routine." + intToStr(i) + ".first_body_line=" +
-                   if program.routines[i].bodyLines.len > 0: program.routines[i].bodyLines[0] else: "")
+        var firstBodyLine: str = ""
+        if program.routines[i].bodyLines.len > 0:
+            firstBodyLine = program.routines[i].bodyLines[0]
+        add(lines, "routine." + intToStr(i) + ".first_body_line=" + firstBodyLine)
     return mresolve.joinLines(lines)
 
 fn buildSourceManifestArtifactText(bundle: mresolve.SourceManifestBundle): str =
@@ -2973,6 +3411,12 @@ fn runStageSelfhostHost(): int32 =
 
 fn runToolingSelfhostHost(): int32 =
     return runToolingSelfhostHostBridge()
+
+fn runToolingSelfhostCheck(): int32 =
+    return runToolingSelfhostCheckBridge()
+
+fn runProgramSelfhostCheck(): int32 =
+    return runProgramSelfhostCheckBridge()
 
 fn isEmptyText(text: str): bool =
     return len(text) == 0
@@ -3249,6 +3693,336 @@ fn runVerifyNetworkSelfhost(): int32 =
     printLine("random_gossip_fallback_present=0")
     return 0
 
+fn runVerifyCompilerCoreZrpcSurface(): int32 =
+    let rootPath = readFlagDefault("--root", ".")
+    let outPath = readFlagDefault("--out", "")
+    let specs = compilerCoreZrpcProbeSpecs()
+    var lines: str[] = []
+    var ok: bool = true
+    var passCount: int32 = 0
+    var failCount: int32 = 0
+    var mismatchCount: int32 = 0
+    add(lines, "zrpc_surface_version=v1")
+    add(lines, "sample_count=" + intToStr(specs.len))
+    for i in 0..<specs.len:
+        let violation = compilerCoreProbeFirstNoPointerViolation(rootPath, specs[i].sourcePath)
+        let actualPass = len(violation) <= 0
+        let sampleOk = actualPass == specs[i].expectPass
+        if actualPass:
+            passCount = passCount + 1
+        else:
+            failCount = failCount + 1
+        if !sampleOk:
+            mismatchCount = mismatchCount + 1
+            ok = false
+        add(lines, "sample." + intToStr(i) + ".id=" + specs[i].sampleId)
+        add(lines, "sample." + intToStr(i) + ".path=" + specs[i].sourcePath)
+        add(lines, "sample." + intToStr(i) + ".expected=" + if specs[i].expectPass: "pass" else: "fail")
+        add(lines, "sample." + intToStr(i) + ".actual=" + if actualPass: "pass" else: "fail")
+        add(lines, "sample." + intToStr(i) + ".ok=" + if sampleOk: "1" else: "0")
+        add(lines, "sample." + intToStr(i) + ".reason=" + if actualPass: "" else: violation)
+    add(lines, "pass_count=" + intToStr(passCount))
+    add(lines, "fail_count=" + intToStr(failCount))
+    add(lines, "mismatch_count=" + intToStr(mismatchCount))
+    add(lines, "zrpc_surface_ok=" + if ok: "1" else: "0")
+    let text = mresolve.joinLines(lines)
+    writeOptionalTextFile(outPath, text)
+    writeText(text + "\n")
+    return if ok: 0 else: 1
+
+fn runVerifyV2NoPointerSurface(): int32 =
+    let rootPath = readFlagDefault("--root", ".")
+    let outPath = readFlagDefault("--out", "")
+    let specs = v2NoPointerSurfaceProbeSpecs()
+    var lines: str[] = []
+    var ok: bool = true
+    var passCount: int32 = 0
+    var failCount: int32 = 0
+    var mismatchCount: int32 = 0
+    add(lines, "v2_no_pointer_surface_version=v1")
+    add(lines, "sample_count=" + intToStr(specs.len))
+    for i in 0..<specs.len:
+        let violation = v2ProbeFirstNoPointerViolation(rootPath, specs[i].sourcePath)
+        let actualPass = len(violation) <= 0
+        let sampleOk = actualPass == specs[i].expectPass
+        if actualPass:
+            passCount = passCount + 1
+        else:
+            failCount = failCount + 1
+        if !sampleOk:
+            mismatchCount = mismatchCount + 1
+            ok = false
+        add(lines, "sample." + intToStr(i) + ".id=" + specs[i].sampleId)
+        add(lines, "sample." + intToStr(i) + ".path=" + specs[i].sourcePath)
+        add(lines, "sample." + intToStr(i) + ".expected=" + if specs[i].expectPass: "pass" else: "fail")
+        add(lines, "sample." + intToStr(i) + ".actual=" + if actualPass: "pass" else: "fail")
+        add(lines, "sample." + intToStr(i) + ".ok=" + if sampleOk: "1" else: "0")
+        add(lines, "sample." + intToStr(i) + ".reason=" + if actualPass: "" else: violation)
+    add(lines, "pass_count=" + intToStr(passCount))
+    add(lines, "fail_count=" + intToStr(failCount))
+    add(lines, "mismatch_count=" + intToStr(mismatchCount))
+    add(lines, "v2_no_pointer_surface_ok=" + if ok: "1" else: "0")
+    let text = mresolve.joinLines(lines)
+    writeOptionalTextFile(outPath, text)
+    writeText(text + "\n")
+    return if ok: 0 else: 1
+
+fn runVerifyCompilerCoreNoPointerClosure(): int32 =
+    let rootPath = readFlagDefault("--root", ".")
+    let outPath = readFlagDefault("--out", "")
+    let roots = compilerCoreNoPointerClosureRoots()
+    let sourcePaths = compilerCoreNoPointerClosureFiles(rootPath)
+    var checkedPaths: str[] = []
+    var checkedCompilerCoreCount: int32 = 0
+    var checkedLineSurfaceCount: int32 = 0
+    var violationCount: int32 = 0
+    var firstViolationPath: str = ""
+    var firstViolationReason: str = ""
+    for i in 0..<sourcePaths.len:
+        let absoluteSourcePath = compilerCoreZrpcAbsolutePath(rootPath, sourcePaths[i])
+        let sourceText = os.readFile(absoluteSourcePath)
+        var parsed: parser.ParsedV2Source
+        if !parser.tryParseV2SourceText(absoluteSourcePath, sourceText, parsed):
+            add(checkedPaths, sourcePaths[i])
+            violationCount = violationCount + 1
+            if len(firstViolationPath) <= 0:
+                firstViolationPath = sourcePaths[i]
+                firstViolationReason = "v2 no-pointer closure: unsupported mixed surface in " + sourcePaths[i]
+            continue
+        if !parser.sourceHasRecognizedSurface(parsed):
+            add(checkedPaths, sourcePaths[i])
+            violationCount = violationCount + 1
+            if len(firstViolationPath) <= 0:
+                firstViolationPath = sourcePaths[i]
+                firstViolationReason = "v2 no-pointer closure: no v2 surface recognized in " + sourcePaths[i]
+            continue
+        if parsedHasSurfaceKind(parsed, "compiler_core"):
+            checkedCompilerCoreCount = checkedCompilerCoreCount + 1
+        else:
+            checkedLineSurfaceCount = checkedLineSurfaceCount + 1
+        add(checkedPaths, sourcePaths[i])
+        let violation = firstNoPointerViolationForParsedSource(sourcePaths[i], sourceText, parsed)
+        if len(violation) > 0:
+            violationCount = violationCount + 1
+            if len(firstViolationPath) <= 0:
+                firstViolationPath = sourcePaths[i]
+                firstViolationReason = violation
+    if checkedPaths.len <= 0 && len(firstViolationReason) <= 0:
+        firstViolationReason = "no v2 files checked"
+    let manifestText = joinTextList(checkedPaths, "\n")
+    let ok = checkedPaths.len > 0 && violationCount == 0
+    var lines: str[] = []
+    add(lines, "compiler_core_no_pointer_closure_version=v2")
+    add(lines, "root_count=" + intToStr(roots.len))
+    for i in 0..<roots.len:
+        add(lines, "root." + intToStr(i) + "=" + roots[i])
+    add(lines, "closure_file_count=" + intToStr(sourcePaths.len))
+    add(lines, "checked_file_count=" + intToStr(checkedPaths.len))
+    add(lines, "checked_compiler_core_file_count=" + intToStr(checkedCompilerCoreCount))
+    add(lines, "checked_compiler_core_surface_file_count=" + intToStr(checkedCompilerCoreCount))
+    add(lines, "checked_line_surface_file_count=" + intToStr(checkedLineSurfaceCount))
+    add(lines, "closure_manifest_cid=" + ident.sha256HexText(manifestText))
+    add(lines, "violation_count=" + intToStr(violationCount))
+    add(lines, "first_violation_path=" + firstViolationPath)
+    add(lines, "first_violation_reason=" + firstViolationReason)
+    add(lines, "no_pointer_closure_ok=" + if ok: "1" else: "0")
+    let text = mresolve.joinLines(lines)
+    writeOptionalTextFile(outPath, text)
+    writeText(text + "\n")
+    return if ok: 0 else: 1
+
+fn runVerifyV2NoPointerPackageClosures(): int32 =
+    let rootPath = readFlagDefault("--root", ".")
+    let outPath = readFlagDefault("--out", "")
+    let repoRoot = absolutePath(rootPath)
+    let specs = v2NoPointerPackageClosureSpecs()
+    var lines: str[] = []
+    var okCount: int32 = 0
+    add(lines, "v2_no_pointer_package_closures_version=v1")
+    add(lines, "case_count=" + intToStr(specs.len))
+    for i in 0..<specs.len:
+        let manifest = resolveV2NoPointerPackageClosureManifest(rootPath, specs[i].sourcePath)
+        let entryAbsolutePath = compilerCoreZrpcAbsolutePath(rootPath, specs[i].sourcePath)
+        let packageRoot = mresolve.findNearestPackageRoot(entryAbsolutePath)
+        let packageManifestAbsolutePath = os.joinPath(packageRoot, "cheng-package.toml")
+        let packageManifestPath =
+            os.fileExists(packageManifestAbsolutePath)
+            ? os.relativePath(packageManifestAbsolutePath, repoRoot)
+            : ""
+        var checkedFileCount: int32 = 0
+        var checkedCompilerCoreCount: int32 = 0
+        var checkedLineSurfaceCount: int32 = 0
+        var violationCount: int32 = 0
+        var firstViolationPath: str = ""
+        var firstViolationReason: str = ""
+        for pathIdx in 0..<manifest.filePaths.len:
+            if !strings.hasSuffix(manifest.filePaths[pathIdx], ".cheng"):
+                continue
+            let absolutePath = compilerCoreZrpcAbsolutePath(rootPath, manifest.filePaths[pathIdx])
+            let sourceText = os.readFile(absolutePath)
+            var parsed: parser.ParsedV2Source
+            if !parser.tryParseV2SourceText(absolutePath, sourceText, parsed):
+                checkedFileCount = checkedFileCount + 1
+                violationCount = violationCount + 1
+                if len(firstViolationPath) <= 0:
+                    firstViolationPath = manifest.filePaths[pathIdx]
+                    firstViolationReason = "v2 no-pointer package closure: unsupported mixed surface in " +
+                                           manifest.filePaths[pathIdx]
+                continue
+            if !parser.sourceHasRecognizedSurface(parsed):
+                checkedFileCount = checkedFileCount + 1
+                violationCount = violationCount + 1
+                if len(firstViolationPath) <= 0:
+                    firstViolationPath = manifest.filePaths[pathIdx]
+                    firstViolationReason = "v2 no-pointer package closure: no v2 surface recognized in " +
+                                           manifest.filePaths[pathIdx]
+                continue
+            checkedFileCount = checkedFileCount + 1
+            if parsedHasSurfaceKind(parsed, "compiler_core"):
+                checkedCompilerCoreCount = checkedCompilerCoreCount + 1
+            else:
+                checkedLineSurfaceCount = checkedLineSurfaceCount + 1
+            let violation = firstNoPointerViolationForParsedSource(manifest.filePaths[pathIdx], sourceText, parsed)
+            if len(violation) > 0:
+                violationCount = violationCount + 1
+                if len(firstViolationPath) <= 0:
+                    firstViolationPath = manifest.filePaths[pathIdx]
+                    firstViolationReason = violation
+        let hasPackageManifest = len(packageManifestPath) > 0 && hasManifestClosurePath(manifest, packageManifestPath)
+        let hasEntrySource = hasManifestClosurePath(manifest, specs[i].sourcePath)
+        let caseOk = checkedFileCount > 0 && hasPackageManifest && hasEntrySource && violationCount == 0
+        if caseOk:
+            okCount = okCount + 1
+        add(lines, "case." + intToStr(i) + ".id=" + specs[i].sampleId)
+        add(lines, "case." + intToStr(i) + ".path=" + specs[i].sourcePath)
+        add(lines, "case." + intToStr(i) + ".closure_file_count=" + intToStr(manifest.filePaths.len))
+        add(lines, "case." + intToStr(i) + ".checked_file_count=" + intToStr(checkedFileCount))
+        add(lines, "case." + intToStr(i) + ".checked_compiler_core_surface_file_count=" + intToStr(checkedCompilerCoreCount))
+        add(lines, "case." + intToStr(i) + ".checked_line_surface_file_count=" + intToStr(checkedLineSurfaceCount))
+        add(lines, "case." + intToStr(i) + ".closure_manifest_cid=" + manifest.manifestCid)
+        add(lines, "case." + intToStr(i) + ".package_manifest_path=" + packageManifestPath)
+        add(lines, "case." + intToStr(i) + ".package_manifest_present=" + if hasPackageManifest: "1" else: "0")
+        add(lines, "case." + intToStr(i) + ".entry_source_present=" + if hasEntrySource: "1" else: "0")
+        add(lines, "case." + intToStr(i) + ".violation_count=" + intToStr(violationCount))
+        add(lines, "case." + intToStr(i) + ".first_violation_path=" + firstViolationPath)
+        add(lines, "case." + intToStr(i) + ".first_violation_reason=" + firstViolationReason)
+        add(lines, "case." + intToStr(i) + ".ok=" + if caseOk: "1" else: "0")
+    let ok = okCount == specs.len
+    add(lines, "ok_count=" + intToStr(okCount))
+    add(lines, "v2_no_pointer_package_closures_ok=" + if ok: "1" else: "0")
+    let text = mresolve.joinLines(lines)
+    writeOptionalTextFile(outPath, text)
+    writeText(text + "\n")
+    return if ok: 0 else: 1
+
+fn runVerifyCompilerCoreCycleSurface(): int32 =
+    let rootPath = readFlagDefault("--root", ".")
+    let outPath = readFlagDefault("--out", "")
+    let entryPath = compilerCoreCycleFixtureEntryPath(rootPath)
+    let manifest = mresolve.resolveCompilerCoreSourceManifest(entryPath)
+    let bundle = cpipe.compileCompilerCoreSourceClosure(entryPath)
+    let entryIdx = findProgramRoutineIndex(bundle.program, "entry")
+    let makeAIdx = findProgramRoutineIndex(bundle.program, "makeA")
+    let takeAIdx = findProgramRoutineIndex(bundle.program, "takeA")
+    let roundTripIdx = findProgramRoutineIndex(bundle.program, "roundTrip")
+    let makeBIdx = findProgramRoutineIndex(bundle.program, "makeB")
+    let takeBIdx = findProgramRoutineIndex(bundle.program, "takeB")
+    let entryItemIdx = findFactsItemIndex(bundle.facts, "fn", "entry")
+    let makeAItemIdx = findFactsItemIndex(bundle.facts, "fn", "makeA")
+    let roundTripItemIdx = findFactsItemIndex(bundle.facts, "fn", "roundTrip")
+    var lines: str[] = []
+    var ok: bool = true
+    var hasPackage: bool = false
+    var hasMain: bool = false
+    var hasA: bool = false
+    var hasB: bool = false
+    var hasNoise: bool = false
+    var entryAstReadyText: str = "0"
+    var makeAAstReadyText: str = "0"
+    var roundTripAstReadyText: str = "0"
+    var makeAReturnText: str = ""
+    var hasPackageText: str = "0"
+    var hasMainText: str = "0"
+    var hasAText: str = "0"
+    var hasBText: str = "0"
+    var hasNoiseText: str = "0"
+    var okText: str = "1"
+    hasPackage = hasManifestClosurePath(manifest,
+                                        "v2/tests/contracts/compiler_core_cycle_surface_fixture/cheng-package.toml")
+    hasMain = hasManifestClosurePath(manifest,
+                                     "v2/tests/contracts/compiler_core_cycle_surface_fixture/src/cycle/main.cheng")
+    hasA = hasManifestClosurePath(manifest,
+                                  "v2/tests/contracts/compiler_core_cycle_surface_fixture/src/cycle/a.cheng")
+    hasB = hasManifestClosurePath(manifest,
+                                  "v2/tests/contracts/compiler_core_cycle_surface_fixture/src/cycle/b.cheng")
+    hasNoise = hasManifestClosurePath(manifest,
+                                      "v2/tests/contracts/compiler_core_cycle_surface_fixture/src/cycle/noise.cheng")
+    if entryIdx >= 0 && bundle.program.routines[entryIdx].executableAstReady:
+        entryAstReadyText = "1"
+    if makeAIdx >= 0 && bundle.program.routines[makeAIdx].executableAstReady:
+        makeAAstReadyText = "1"
+    if roundTripIdx >= 0 && bundle.program.routines[roundTripIdx].executableAstReady:
+        roundTripAstReadyText = "1"
+    if makeAItemIdx >= 0:
+        makeAReturnText = bundle.facts.returnTypeTexts[makeAItemIdx]
+    if hasPackage:
+        hasPackageText = "1"
+    if hasMain:
+        hasMainText = "1"
+    if hasA:
+        hasAText = "1"
+    if hasB:
+        hasBText = "1"
+    if hasNoise:
+        hasNoiseText = "1"
+    add(lines, "cycle_surface_version=v1")
+    add(lines, "manifest_file_count=" + intToStr(manifest.filePaths.len))
+    add(lines, "manifest.has.package=" + hasPackageText)
+    add(lines, "manifest.has.main=" + hasMainText)
+    add(lines, "manifest.has.a=" + hasAText)
+    add(lines, "manifest.has.b=" + hasBText)
+    add(lines, "manifest.has.noise=" + hasNoiseText)
+    add(lines, "routine_count=" + intToStr(bundle.program.routines.len))
+    add(lines, "entry.ast_ready=" + entryAstReadyText)
+    add(lines, "makeA.ast_ready=" + makeAAstReadyText)
+    add(lines, "roundTrip.ast_ready=" + roundTripAstReadyText)
+    add(lines, "makeA.param0=" + programRoutineParamTypeText(bundle.program, makeAIdx, 0))
+    add(lines, "makeA.return=" + makeAReturnText)
+    add(lines, "roundTrip.param0=" + programRoutineParamTypeText(bundle.program, roundTripIdx, 0))
+    add(lines, "entry.import_field_routine_refs=" +
+        intToStr(programRoutineExprReferenceCount(bundle.program, bundle.facts, entryIdx, "import_field_routine")))
+    add(lines, "takeA.import_field_routine_refs=" +
+        intToStr(programRoutineExprReferenceCount(bundle.program, bundle.facts, takeAIdx, "import_field_routine")))
+    add(lines, "roundTrip.import_field_routine_refs=" +
+        intToStr(programRoutineExprReferenceCount(bundle.program, bundle.facts, roundTripIdx, "import_field_routine")))
+    if manifest.filePaths.len != 4 ||
+       !hasPackage ||
+       !hasMain ||
+       !hasA ||
+       !hasB ||
+       hasNoise ||
+       entryIdx < 0 || makeAIdx < 0 || takeAIdx < 0 || roundTripIdx < 0 ||
+       makeBIdx < 0 || takeBIdx < 0 || entryItemIdx < 0 || makeAItemIdx < 0 || roundTripItemIdx < 0 ||
+       !bundle.program.routines[entryIdx].executableAstReady ||
+       !bundle.program.routines[makeAIdx].executableAstReady ||
+       !bundle.program.routines[roundTripIdx].executableAstReady ||
+       programRoutineParamTypeText(bundle.program, makeAIdx, 0) != "b.BBox" ||
+       bundle.facts.returnTypeTexts[makeAItemIdx] != "ABox" ||
+       programRoutineParamTypeText(bundle.program, roundTripIdx, 0) != "a.ABox" ||
+       programRoutineExprReferenceCount(bundle.program, bundle.facts, entryIdx, "import_field_routine") != 3 ||
+       programRoutineExprReferenceCount(bundle.program, bundle.facts, takeAIdx, "import_field_routine") != 1 ||
+       programRoutineExprReferenceCount(bundle.program, bundle.facts, roundTripIdx, "import_field_routine") != 1:
+        ok = false
+    if !ok:
+        okText = "0"
+    add(lines, "cycle_surface_ok=" + okText)
+    let text = mresolve.joinLines(lines)
+    writeOptionalTextFile(outPath, text)
+    writeText(text + "\n")
+    if ok:
+        return 0
+    return 1
+
 fn defaultReleaseOut(sourcePath: str, emitKind: str): str =
     let parts = os.splitFile(sourcePath)
     return os.joinPath("v2/artifacts/release", parts.name + "." + emitKind + ".artifact.txt")
@@ -3327,6 +4101,12 @@ fn cmdIsStageSelfhostHost(): bool =
 fn cmdIsToolingSelfhostHost(): bool =
     return cmdline.cliParam1Eq("tooling-selfhost-host")
 
+fn cmdIsToolingSelfhostCheck(): bool =
+    return cmdline.cliParam1Eq("tooling-selfhost-check")
+
+fn cmdIsProgramSelfhostCheck(): bool =
+    return cmdline.cliParam1Eq("program-selfhost-check")
+
 fn cmdIsLsmrAddress(): bool =
     return cmdline.cliParam1Eq("lsmr-address")
 
@@ -3366,6 +4146,21 @@ fn cmdIsPublishCompilerRulePack(): bool =
 fn cmdIsVerifyNetworkSelfhost(): bool =
     return cmdline.cliParam1Eq("verify-network-selfhost")
 
+fn cmdIsVerifyCompilerCoreZrpcSurface(): bool =
+    return cmdline.cliParam1Eq("verify-compiler-core-zrpc-surface")
+
+fn cmdIsVerifyV2NoPointerSurface(): bool =
+    return cmdline.cliParam1Eq("verify-v2-no-pointer-surface")
+
+fn cmdIsVerifyV2NoPointerPackageClosures(): bool =
+    return cmdline.cliParam1Eq("verify-v2-no-pointer-package-closures")
+
+fn cmdIsVerifyCompilerCoreNoPointerClosure(): bool =
+    return cmdline.cliParam1Eq("verify-compiler-core-no-pointer-closure")
+
+fn cmdIsVerifyCompilerCoreCycleSurface(): bool =
+    return cmdline.cliParam1Eq("verify-compiler-core-cycle-surface")
+
 fn cmdIsReleaseCompile(): bool =
     return cmdline.cliParam1Eq("release-compile")
 
@@ -3374,6 +4169,9 @@ fn cmdIsDumpAst(): bool =
 
 fn cmdIsDumpLowUir(): bool =
     return cmdline.cliParam1Eq("dump-low-uir")
+
+fn cmdIsDumpExecPlan(): bool =
+    return cmdline.cliParam1Eq("dump-exec-plan")
 
 fn cmdIsTracePhaseSpace(): bool =
     return cmdline.cliParam1Eq("trace-phase-space")
@@ -3465,6 +4263,10 @@ fn dispatchCommandLegacy(cmd: str): int32 =
         return runStageSelfhostHost()
     if cmd == "tooling-selfhost-host":
         return runToolingSelfhostHost()
+    if cmd == "tooling-selfhost-check":
+        return runToolingSelfhostCheck()
+    if cmd == "program-selfhost-check":
+        return runProgramSelfhostCheck()
     if cmd == "lsmr-address":
         return runLsmrAddress()
     if cmd == "lsmr-route-plan":
@@ -3491,12 +4293,24 @@ fn dispatchCommandLegacy(cmd: str): int32 =
         return runPublishCompilerRulePack()
     if cmd == "verify-network-selfhost":
         return runVerifyNetworkSelfhost()
+    if cmd == "verify-compiler-core-zrpc-surface":
+        return runVerifyCompilerCoreZrpcSurface()
+    if cmd == "verify-v2-no-pointer-surface":
+        return runVerifyV2NoPointerSurface()
+    if cmd == "verify-v2-no-pointer-package-closures":
+        return runVerifyV2NoPointerPackageClosures()
+    if cmd == "verify-compiler-core-no-pointer-closure":
+        return runVerifyCompilerCoreNoPointerClosure()
+    if cmd == "verify-compiler-core-cycle-surface":
+        return runVerifyCompilerCoreCycleSurface()
     if cmd == "release-compile":
         return runReleaseCompile()
     if cmd == "dump-ast":
         return runDumpAst()
     if cmd == "dump-low-uir":
         return runDumpLowUir()
+    if cmd == "dump-exec-plan":
+        return runDumpExecPlan()
     if cmd == "trace-phase-space":
         return runTracePhaseSpace()
     if cmd == "emit-proof-obligations":
@@ -3564,6 +4378,12 @@ fn dispatchCommandAfterStageSelfhostHost(): int32 =
         return dispatchCommandAfterToolingSelfhostHost()
 
 fn dispatchCommandAfterToolingSelfhostHost(): int32 =
+    if cmdIsToolingSelfhostCheck():
+        return runToolingSelfhostCheck()
+    else:
+        return dispatchCommandAfterToolingSelfhostCheck()
+
+fn dispatchCommandAfterToolingSelfhostCheck(): int32 =
     if cmdIsLsmrAddress():
         return runLsmrAddress()
     else:
@@ -3642,6 +4462,18 @@ fn dispatchCommandAfterPublishCompilerRulePack(): int32 =
         return dispatchCommandAfterVerifyNetworkSelfhost()
 
 fn dispatchCommandAfterVerifyNetworkSelfhost(): int32 =
+    if cmdIsVerifyCompilerCoreZrpcSurface():
+        return runVerifyCompilerCoreZrpcSurface()
+    else:
+        return dispatchCommandAfterVerifyCompilerCoreZrpcSurface()
+
+fn dispatchCommandAfterVerifyCompilerCoreZrpcSurface(): int32 =
+    if cmdIsVerifyCompilerCoreCycleSurface():
+        return runVerifyCompilerCoreCycleSurface()
+    else:
+        return dispatchCommandAfterVerifyCompilerCoreCycleSurface()
+
+fn dispatchCommandAfterVerifyCompilerCoreCycleSurface(): int32 =
     if cmdIsReleaseCompile():
         return runReleaseCompile()
     else:
@@ -3660,6 +4492,12 @@ fn dispatchCommandAfterDumpAst(): int32 =
         return dispatchCommandAfterDumpLowUir()
 
 fn dispatchCommandAfterDumpLowUir(): int32 =
+    if cmdIsDumpExecPlan():
+        return runDumpExecPlan()
+    else:
+        return dispatchCommandAfterDumpExecPlan()
+
+fn dispatchCommandAfterDumpExecPlan(): int32 =
     if cmdIsTracePhaseSpace():
         return runTracePhaseSpace()
     else:

@@ -1,0 +1,255 @@
+import std/result
+import std/strings
+import std/seqs as seqops
+import cheng/quic/chain/types
+import cheng/quic/chain/log
+import cheng/quic/chain/codec
+import cheng/quic/chain/lsmr
+import cheng/quic/chain/anti_entropy
+import cheng/quic/chain/consensus
+
+fn chainStateSyncSmokeMintEvent(account: str,
+                                assetId: str,
+                                amount: int64,
+                                parentCid: str,
+                                epoch: int32,
+                                ganzhiIndex: int32): ChainEvent =
+    var ev = emptyChainEvent()
+    ev.kind = "mint"
+    ev.assetId = assetId
+    ev.toAccount = account
+    ev.amount = amount
+    ev.authorPeer = "node-root"
+    ev.counterpartyPeer = "node-root"
+    ev.toParentCid = parentCid
+    ev.epoch = epoch
+    ev.ganzhiIndex = ganzhiIndex
+    ev.stem = ganzhiIndex % 10
+    ev.branch = ganzhiIndex % 12
+    ev.spaceSlot = chainSpaceSlot(account, account)
+    ev.tick = chainClockValue(epoch, ganzhiIndex)
+    ev.bodyCid = chainBodyCidText(ev)
+    return ev
+
+fn chainStateSyncRemoteEventPos(eventCids: str[], eventCid: str): int32 =
+    for i in 0..<eventCids.len:
+        if eventCids[i] == eventCid:
+            return i
+    return -1
+
+fn chainStateSyncRemoteEventText(eventCids: str[], eventTexts: str[], eventCid: str): str =
+    let pos = chainStateSyncRemoteEventPos(eventCids, eventCid)
+    if pos < 0:
+        return ""
+    return eventTexts[pos]
+
+fn chainStateSyncApplyLocal(index: var ChainIndex,
+                            ev: ChainEvent,
+                            eventCid: str,
+                            logOffset: int32,
+                            lsmrDepth: int32): Result[bool] =
+    let applyRes = chainApplyEvent(index, ev, eventCid, logOffset)
+    if IsErr(applyRes):
+        return Err[bool](ErrorText(applyRes))
+    chainRebuildStateTree(index, lsmrDepth)
+    return applyRes
+
+fn chainStateSyncPullRemoteHead(remoteIndex: ChainIndex,
+                                remoteEventCids: str[],
+                                remoteEventTexts: str[],
+                                localIndex: var ChainIndex,
+                                key: str,
+                                remoteHeadCid: str,
+                                lsmrDepth: int32): Result[int32] =
+    if strings.len(remoteHeadCid) == 0:
+        return Ok[int32](0)
+    let localHeadCid = chainAccountHead(localIndex, key)
+    if localHeadCid == remoteHeadCid:
+        return Ok[int32](0)
+    var stack: str[]
+    var expanded: bool[]
+    var cachedEventCids: str[]
+    var cachedEventTexts: str[]
+    stack = []
+    expanded = []
+    cachedEventCids = []
+    cachedEventTexts = []
+    seqops.add(stack, remoteHeadCid)
+    seqops.add(expanded, false)
+    var synced: int32 = 0
+    while stack.len > 0:
+        let top = stack.len - 1
+        let eventCid = stack[top]
+        if strings.len(eventCid) == 0 ||
+           eventCid == localHeadCid ||
+           chainEventPos(localIndex, eventCid) >= 0:
+            seqops.setLen(stack, top)
+            seqops.setLen(expanded, top)
+            continue
+        let cachedPos = chainAntiEntropyTextPos(cachedEventCids, eventCid)
+        if cachedPos < 0:
+            let eventText = chainStateSyncRemoteEventText(remoteEventCids, remoteEventTexts, eventCid)
+            if strings.len(eventText) == 0:
+                return Err[int32]("chain state tree sync smoke: missing remote event text")
+            seqops.add(cachedEventCids, eventCid)
+            seqops.add(cachedEventTexts, eventText)
+        let eventPos = chainAntiEntropyTextPos(cachedEventCids, eventCid)
+        let eventRes = chainEventFromText(cachedEventTexts[eventPos])
+        if IsErr(eventRes):
+            return Err[int32](ErrorText(eventRes))
+        let ev = Value(eventRes)
+        if ! expanded[top]:
+            expanded[top] = true
+            if strings.len(ev.toParentCid) > 0 &&
+               ev.toParentCid != localHeadCid &&
+               ev.toParentCid != eventCid &&
+               chainEventPos(localIndex, ev.toParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.toParentCid) < 0:
+                seqops.add(stack, ev.toParentCid)
+                seqops.add(expanded, false)
+            if strings.len(ev.fromParentCid) > 0 &&
+               ev.fromParentCid != localHeadCid &&
+               ev.fromParentCid != eventCid &&
+               ev.fromParentCid != ev.toParentCid &&
+               chainEventPos(localIndex, ev.fromParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.fromParentCid) < 0:
+                seqops.add(stack, ev.fromParentCid)
+                seqops.add(expanded, false)
+            continue
+        let applyRes = chainStateSyncApplyLocal(localIndex, ev, eventCid, localIndex.eventCids.len, lsmrDepth)
+        if IsErr(applyRes):
+            return Err[int32](ErrorText(applyRes))
+        if Value(applyRes):
+            synced = synced + 1
+        seqops.setLen(stack, top)
+        seqops.setLen(expanded, top)
+    return Ok[int32](synced)
+
+fn chainStateSyncConvergeRemoteSubtree(remoteIndex: ChainIndex,
+                                       remoteEventCids: str[],
+                                       remoteEventTexts: str[],
+                                       localIndex: var ChainIndex,
+                                       refText: str,
+                                       lsmrDepth: int32): Result[int32] =
+    let subtreePayloadRes = chainAntiEntropyStateSubtreePayload(
+        remoteIndex,
+        chainAntiEntropyStateSubtreeRefLayer(refText),
+        chainAntiEntropyStateSubtreeRefBagua(refText),
+        chainAntiEntropyStateSubtreeRefPrefix(refText))
+    if IsErr(subtreePayloadRes):
+        return Err[int32](ErrorText(subtreePayloadRes))
+    let subtreeRes = chainAntiEntropyStateSubtreeFromPayload(Value(subtreePayloadRes))
+    if IsErr(subtreeRes):
+        return Err[int32](ErrorText(subtreeRes))
+    let subtree = Value(subtreeRes)
+    let localTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(localIndex), subtree.layer)
+    let localNodePos = chainLsmrBaguaTreeNodePos(localTree, subtree.bagua, subtree.prefixText)
+    let localNodeCid = localNodePos >= 0 ? localTree.nodeCids[localNodePos] : ""
+    let localDesc = localNodePos >= 0 ? localTree.nodeEntryDescCounts[localNodePos] : 0
+    if localNodeCid == subtree.nodeCid && localDesc == subtree.entryDescCount:
+        return Ok[int32](0)
+    var synced: int32 = 0
+    let nextRefs = chainAntiEntropyStateSubtreeWantChildRefs(localIndex, subtree)
+    for i in 0..<nextRefs.len:
+        let childRes = chainStateSyncConvergeRemoteSubtree(remoteIndex,
+                                                           remoteEventCids,
+                                                           remoteEventTexts,
+                                                           localIndex,
+                                                           nextRefs[i],
+                                                           lsmrDepth)
+        if IsErr(childRes):
+            return Err[int32](ErrorText(childRes))
+        synced = synced + Value(childRes)
+    for i in 0..<subtree.entryKeys.len:
+        if chainAntiEntropyStateSubtreeEntryConflicts(localIndex, subtree, i):
+            return Err[int32]("chain state tree sync smoke: equal-clock conflict")
+        if subtree.entryDiverged[i]:
+            return Err[int32]("chain state tree sync smoke: diverged repair missing")
+        if ! chainAntiEntropyStateSubtreeEntryNeedsSync(localIndex, subtree, i):
+            continue
+        let syncRes = chainStateSyncPullRemoteHead(remoteIndex,
+                                                  remoteEventCids,
+                                                  remoteEventTexts,
+                                                  localIndex,
+                                                  subtree.entryKeys[i],
+                                                  subtree.entryHeadCids[i],
+                                                  lsmrDepth)
+        if IsErr(syncRes):
+            return Err[int32](ErrorText(syncRes))
+        synced = synced + Value(syncRes)
+    let refreshedTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(localIndex), subtree.layer)
+    let refreshedNodePos = chainLsmrBaguaTreeNodePos(refreshedTree, subtree.bagua, subtree.prefixText)
+    let refreshedNodeCid = refreshedNodePos >= 0 ? refreshedTree.nodeCids[refreshedNodePos] : ""
+    let refreshedDesc = refreshedNodePos >= 0 ? refreshedTree.nodeEntryDescCounts[refreshedNodePos] : 0
+    if refreshedNodeCid != subtree.nodeCid || refreshedDesc != subtree.entryDescCount:
+        return Err[int32]("chain state tree sync smoke: subtree not converged ref=" +
+                          refText +
+                          " local_cid=" + refreshedNodeCid +
+                          " remote_cid=" + subtree.nodeCid +
+                          " local_desc=" + intToStr(refreshedDesc) +
+                          " remote_desc=" + intToStr(subtree.entryDescCount))
+    return Ok[int32](synced)
+
+fn runChainStateTreeSyncSmoke(): Result[bool] =
+    let depth: int32 = 4
+    var serverIndex = newChainIndex()
+    var clientIndex = newChainIndex()
+    var remoteEventCids: str[] = ["", ""]
+    var remoteEventTexts: str[] = ["", ""]
+
+    let ev0 = chainStateSyncSmokeMintEvent("alice", "cheng", 11, "", 0, 1)
+    let cid0 = chainEventCid(ev0)
+    let apply0Res = chainStateSyncApplyLocal(serverIndex, ev0, cid0, 0, depth)
+    if IsErr(apply0Res):
+        return Err[bool](ErrorText(apply0Res))
+    remoteEventCids[0] = cid0
+    remoteEventTexts[0] = chainEventCanonicalText(ev0)
+
+    let ev1 = chainStateSyncSmokeMintEvent("alice", "cheng", 12, cid0, 0, 2)
+    let cid1 = chainEventCid(ev1)
+    let apply1Res = chainStateSyncApplyLocal(serverIndex, ev1, cid1, 1, depth)
+    if IsErr(apply1Res):
+        return Err[bool](ErrorText(apply1Res))
+    remoteEventCids[1] = cid1
+    remoteEventTexts[1] = chainEventCanonicalText(ev1)
+
+    let remotePayload = chainAntiEntropyAdvertisePayload(serverIndex)
+    let planRes = chainAntiEntropyPlan(clientIndex, remotePayload)
+    if IsErr(planRes):
+        return Err[bool](ErrorText(planRes))
+    if Value(planRes).signaturesEqual || Value(planRes).wantStateSubtrees.len != 1:
+        return Err[bool]("chain state tree sync smoke: subtree root plan mismatch")
+    if chainAntiEntropyStateSubtreeRefLayer(Value(planRes).wantStateSubtrees[0]) != "regional":
+        return Err[bool]("chain state tree sync smoke: expected regional subtree plan")
+
+    var synced: int32 = 0
+    let convergeRes = chainStateSyncConvergeRemoteSubtree(serverIndex,
+                                                          remoteEventCids,
+                                                          remoteEventTexts,
+                                                          clientIndex,
+                                                          Value(planRes).wantStateSubtrees[0],
+                                                          depth)
+    if IsErr(convergeRes):
+        return Err[bool](ErrorText(convergeRes))
+    synced = Value(convergeRes)
+    if synced != 2:
+        return Err[bool]("chain state tree sync smoke: synced count mismatch")
+
+    let serverSig = chainAntiEntropySignature(serverIndex)
+    let clientSig = chainAntiEntropySignature(clientIndex)
+    if serverSig.stateForestCid != clientSig.stateForestCid:
+        return Err[bool]("chain state tree sync smoke: state forest cid mismatch")
+    if chainAccountBalance(clientIndex, chainAccountKey("alice", "cheng")) != 23:
+        return Err[bool]("chain state tree sync smoke: balance mismatch")
+
+    echo("chain_state_tree_sync_smoke_synced=" + intToStr(synced))
+    echo("chain_state_tree_sync_smoke_forest_cid=" + chainAntiEntropyStateForest(clientIndex).forestCid)
+    echo("chain state tree sync smoke ok")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res = runChainStateTreeSyncSmoke()
+    if IsErr(res):
+        echo("chain_state_tree_sync_smoke=fail " + ErrorText(res))
+        return 1
+    return 0

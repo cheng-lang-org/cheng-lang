@@ -7,8 +7,9 @@ import cheng/quic/core/connection_model
 import cheng/quic/core/flow_control_model
 import cheng/quic/core/frame_model
 import cheng/quic/core/packet_model
-import cheng/quic/core/packet_builder_impl
 import cheng/quic/core/perf_tuning
+import cheng/quic/core/quic_varint
+import cheng/quic/congestion/common as congcommon
 import cheng/quic/congestion/controller
 import cheng/quic/congestion/loss_detection_model
 
@@ -148,6 +149,45 @@ fn msquicConnImplQueueFrame(impl: var MsQuicConnImpl, frame: MsQuicFrame): Resul
     impl.queuedCount = impl.queuedCount + 1
     return Ok[bool](true)
 
+fn msquicConnImplFrameBudget(impl: MsQuicConnImpl): int32 =
+    let budget: int32 = impl.maxPacketSize - 16
+    if budget <= 0:
+        return 0
+    return budget
+
+fn msquicConnImplMaxDataChunkLen(impl: MsQuicConnImpl, streamId: int64, offset: int64): int32 =
+    let budget: int32 = msquicConnImplFrameBudget(impl)
+    if budget <= 0:
+        return 0
+    let fixedLen: int32 =
+        quicVarIntEncodedLen(int64(FrameData)) +
+        quicVarIntEncodedLen(streamId) +
+        quicVarIntEncodedLen(offset) +
+        quicVarIntEncodedLen(0)
+    if fixedLen <= 0:
+        return 0
+    var payloadLen: int32 = budget - fixedLen - 1
+    while payloadLen > 0:
+        let dataLenLen: int32 = quicVarIntEncodedLen(int64(payloadLen))
+        if dataLenLen > 0 && fixedLen + dataLenLen + payloadLen <= budget:
+            return payloadLen
+        payloadLen = payloadLen - 1
+    return 0
+
+fn msquicConnImplMaxQueuedDataLen(impl: MsQuicConnImpl, streamId: int64, offset: int64): int32 =
+    let queueFree: int32 = msQuicMaxQueuedFrames - impl.queuedCount
+    if queueFree <= 0:
+        return 0
+    var total: int32 = 0
+    var nextOffset: int64 = offset
+    for _ in 0..<queueFree:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, nextOffset)
+        if chunkCap <= 0:
+            break
+        total = total + chunkCap
+        nextOffset = nextOffset + int64(chunkCap)
+    return total
+
 fn msquicConnImplQueueData(
     impl: var MsQuicConnImpl,
     streamId: int64,
@@ -155,14 +195,47 @@ fn msquicConnImplQueueData(
     data: Bytes
 ): Result[bool] =
     let count: int64 = int64(bytesLen(data))
+    if count <= 0:
+        return Ok[bool](false)
+    let queueFree: int32 = msQuicMaxQueuedFrames - impl.queuedCount
+    if queueFree <= 0:
+        return Err[bool]("msquic core: frame queue full")
+    var framesNeeded: int32 = 0
+    var nextOffset: int64 = offset
+    var remainingForCount: int32 = bytesLen(data)
+    while remainingForCount > 0:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, nextOffset)
+        if chunkCap <= 0:
+            return Err[bool]("msquic core: data frame budget <= 0")
+        let chunkLen: int32 = if remainingForCount < chunkCap: remainingForCount else: chunkCap
+        framesNeeded = framesNeeded + 1
+        if framesNeeded > queueFree:
+            return Err[bool]("msquic core: frame queue full")
+        nextOffset = nextOffset + int64(chunkLen)
+        remainingForCount = remainingForCount - chunkLen
     let fcRes: Result[bool] = msquicFlowControlConsumeConn(impl.flow, count)
     if IsErr(fcRes):
-        return Err[bool](Error(fcRes))
+        return Err[bool](ErrorText(fcRes))
     let fsRes: Result[bool] = msquicFlowControlConsumeStream(impl.flow, count)
     if IsErr(fsRes):
-        return Err[bool](Error(fsRes))
-    let frame: MsQuicFrame = msquicFrameData(streamId, offset, data)
-    return msquicConnImplQueueFrame(impl, frame)
+        return Err[bool](ErrorText(fsRes))
+    var queuedOffset: int64 = offset
+    var cursor: int32 = 0
+    var remaining: int32 = bytesLen(data)
+    while remaining > 0:
+        let chunkCap: int32 = msquicConnImplMaxDataChunkLen(impl, streamId, queuedOffset)
+        if chunkCap <= 0:
+            return Err[bool]("msquic core: data frame budget <= 0")
+        let chunkLen: int32 = if remaining < chunkCap: remaining else: chunkCap
+        let chunk: Bytes = bytesSlice(data, cursor, chunkLen)
+        let frame: MsQuicFrame = msquicFrameData(streamId, queuedOffset, chunk)
+        let qRes: Result[bool] = msquicConnImplQueueFrame(impl, frame)
+        if IsErr(qRes):
+            return Err[bool](ErrorText(qRes))
+        cursor = cursor + chunkLen
+        queuedOffset = queuedOffset + int64(chunkLen)
+        remaining = remaining - chunkLen
+    return Ok[bool](true)
 
 fn msquicConnImplQueuePing(impl: var MsQuicConnImpl): Result[bool] =
     return msquicConnImplQueueFrame(impl, msquicFramePing())
@@ -176,25 +249,36 @@ fn msquicConnImplNextPacketNumber(impl: var MsQuicConnImpl): int64 =
     return num
 
 fn msquicConnImplBuildPacket(impl: var MsQuicConnImpl): Result[MsQuicPacket] =
+    var out: MsQuicPacket
+    let buildRes: Result[bool] = msquicConnImplBuildPacketInto(out, impl)
+    if IsErr(buildRes):
+        return Err[MsQuicPacket](ErrorText(buildRes))
+    return Ok[MsQuicPacket](out)
+
+fn msquicConnImplBuildPacketInto(out: var MsQuicPacket, impl: var MsQuicConnImpl): Result[bool] =
     if impl.queuedCount <= 0:
-        return Err[MsQuicPacket]("msquic core: no frames queued")
+        return Err[bool]("msquic core: no frames queued")
     let number: int64 = msquicConnImplNextPacketNumber(impl)
-    var builder: MsQuicPacketBuilder = initMsQuicPacketBuilder(number, impl.maxPacketSize)
+    msquicPacketReset(out, number)
     var used: int32 = 0
     for i in 0..<impl.queuedCount:
         let idx: int32 = (impl.queuedHead + i) % msQuicMaxQueuedFrames
-        let addRes: Result[bool] = msquicPacketBuilderAddFrame(builder, impl.queuedFrames[idx])
+        let sizeNow: int32 = msquicPacketSize(out)
+        let nextSize: int32 = sizeNow + msquicFrameSize(impl.queuedFrames[idx])
+        if nextSize > impl.maxPacketSize:
+            break
+        let addRes: Result[bool] = msquicPacketAddFrame(out, impl.queuedFrames[idx])
         if IsErr(addRes):
             break
         used = used + 1
     if used <= 0:
-        return Err[MsQuicPacket]("msquic core: packet too small")
+        return Err[bool]("msquic core: packet too small")
     impl.queuedHead = (impl.queuedHead + used) % msQuicMaxQueuedFrames
     impl.queuedCount = impl.queuedCount - used
     impl.lastPacketMs = msquicCoreNowMs()
-    return Ok[MsQuicPacket](msquicPacketBuilderFinalize(builder))
+    return Ok[bool](true)
 
-fn msquicConnImplRecordSent(impl: var MsQuicConnImpl, pkt: MsQuicPacket, data: Bytes): Result[bool] =
+fn msquicConnImplRecordSent(impl: var MsQuicConnImpl, pkt: var MsQuicPacket, data: Bytes): Result[bool] =
     if ! msquicPacketAckEliciting(pkt):
         return Ok[bool](false)
     let size: int64 = int64(bytesLen(data))
@@ -202,7 +286,7 @@ fn msquicConnImplRecordSent(impl: var MsQuicConnImpl, pkt: MsQuicPacket, data: B
     congestionControllerOnPacketSent(impl.congestion, size, true, false, nowUs)
     let record: PacketRecord = PacketRecord(
         packetNumber: pkt.number,
-        encryptEpoch: ceOneRtt,
+        encryptEpoch: congcommon.ceOneRtt,
         sentTimeUs: nowUs,
         ackEliciting: true,
         packetLength: int32(size)

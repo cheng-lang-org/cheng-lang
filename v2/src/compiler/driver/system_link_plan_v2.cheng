@@ -1,3 +1,4 @@
+import std/os
 import std/seqs
 import std/strings as strings
 import compiler/driver/identity_v2 as ident
@@ -25,6 +26,11 @@ type
         emitKind: str
         targetTriple: str
         objFormat: str
+        manifestFileCount: int32
+        noPointerCheckedFileCount: int32
+        noPointerCheckedCompilerCoreSurfaceFileCount: int32
+        noPointerCheckedLineSurfaceFileCount: int32
+        noPointerClosureOk: bool
         linkerFlavor: str
         outputKind: str
         outputName: str
@@ -61,9 +67,11 @@ fn systemLinkerFlavor(targetTriple: str, emitKind: str): str =
     return objFormat == "macho" ? "ld64" else: "lld"
 
 fn systemLinkOutputKind(emitKind: str): str =
-    return emitKind == "exe" ? "executable" :
-           emitKind == "shared" ? "shared_library" :
-           "static_archive"
+    if emitKind == "exe":
+        return "executable"
+    if emitKind == "shared":
+        return "shared_library"
+    return "static_archive"
 
 fn systemLinkOutputSuffix(targetTriple: str, emitKind: str): str =
     let objFormat = mtarget.machineTargetObjFormat(targetTriple)
@@ -78,6 +86,154 @@ fn systemLinkOutputName(moduleKind: str, emitKind: str): str =
     if emitKind == "exe":
         return "cheng_v2_" + stem
     return "libcheng_v2_" + stem
+
+fn compilerCoreExecutionTrack(sourcePath: str): str =
+    let abs = os.absolutePath(sourcePath)
+    return strings.hasSuffix(abs, "/v2/src/tooling/cheng_v2.cheng") ? "tooling" else: "program"
+
+fn compilerCoreProgramLocalPayloadFunctionCount(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] == "runtime/compiler_core.program_local_payload_entry":
+            count = count + 1
+    return count
+
+fn compilerCoreProgramLocalPayloadExecutableFunctionCount(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        if mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "ast_ready") == "1":
+            count = count + 1
+    return count
+
+fn compilerCoreProgramLocalPayloadExecPlanFunctionCount(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        if machineBundle.metadataOperandModes[i] == "exec_plan_payload":
+            count = count + 1
+    return count
+
+fn compilerCoreProgramLocalPayloadSurfaceExecFunctionCount(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        if machineBundle.metadataOperandModes[i] == "surface_exec_payload":
+            count = count + 1
+    return count
+
+fn compilerCoreProgramLocalPayloadMissingExecPlanFunctionCount(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var count: int32 = 0
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        if mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "ast_ready") != "1":
+            continue
+        if machineBundle.metadataOperandModes[i] != "exec_plan_payload":
+            count = count + 1
+    return count
+
+fn compilerCoreProgramLocalPayloadLabelSamples(machineBundle: mpipeline.MachineModuleBundle): str[] =
+    var out: str[]
+    out = []
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        let label = mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "label")
+        if len(label) <= 0:
+            continue
+        ident.appendUnique(out, label)
+        if out.len >= 8:
+            return out
+    return out
+
+fn compilerCoreProgramRegistryPresent(machineBundle: mpipeline.MachineModuleBundle): bool =
+    let symbolName = mpipeline.compilerCoreProgramRegistrySymbolName(machineBundle.targetTriple)
+    for i in 0..<machineBundle.dataSymbolNames.len:
+        if machineBundle.dataSymbolNames[i] == symbolName:
+            return true
+    return false
+
+fn compilerCoreProgramEntryFunctionIndex(machineBundle: mpipeline.MachineModuleBundle): int32 =
+    var entryLabel: str = ""
+    var entryKind: str = ""
+    for i in 0..<machineBundle.bindingSummaries.len:
+        if machineBundle.bindingSummaries[i].len >= len("entry_bridge=1|") &&
+           strings.sliceBytes(machineBundle.bindingSummaries[i], 0, len("entry_bridge=1|")) == "entry_bridge=1|":
+            let entryItemId = machineBundle.itemIds[i] - 1000000000
+            let entryIdx = mpipeline.machineFunctionIndexByItemId(machineBundle, entryItemId)
+            if entryIdx >= 0:
+                return entryIdx
+            entryLabel = mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "entry_label")
+            entryKind = mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "entry_kind")
+            break
+    if len(entryLabel) > 0:
+        let prefix = "top_level=" + (len(entryKind) > 0 ? entryKind else: "fn") + "|label=" + entryLabel + "|"
+        for i in 0..<machineBundle.bindingSummaries.len:
+            if machineBundle.bindingSummaries[i].len >= prefix.len &&
+               strings.sliceBytes(machineBundle.bindingSummaries[i], 0, prefix.len) == prefix:
+                return i
+    let fallbackPrefix = "top_level=fn|label=main|"
+    for i in 0..<machineBundle.bindingSummaries.len:
+        if machineBundle.bindingSummaries[i].len >= fallbackPrefix.len &&
+           strings.sliceBytes(machineBundle.bindingSummaries[i], 0, fallbackPrefix.len) == fallbackPrefix:
+            return i
+    return -1
+
+fn compilerCoreProgramEntryExecPlanPresent(machineBundle: mpipeline.MachineModuleBundle): bool =
+    let entryIdx = compilerCoreProgramEntryFunctionIndex(machineBundle)
+    if entryIdx < 0 || entryIdx >= machineBundle.metadataOperandModes.len:
+        return false
+    return machineBundle.metadataOperandModes[entryIdx] == "exec_plan_payload"
+
+fn appendCompilerCoreProgramLocalPayloadTopLabelLines(lines: var str[],
+                                                      machineBundle: mpipeline.MachineModuleBundle,
+                                                      limit: int32) =
+    var labels: str[]
+    var counts: int32[]
+    var used: int32[]
+    labels = []
+    counts = []
+    used = []
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] != "runtime/compiler_core.program_local_payload_entry":
+            continue
+        let label = mpipeline.bindingSummaryFieldValue(machineBundle.bindingSummaries[i], "label")
+        if len(label) <= 0:
+            continue
+        var found: int32 = -1
+        for j in 0..<labels.len:
+            if labels[j] == label:
+                found = j
+                break
+        if found >= 0:
+            counts[found] = counts[found] + 1
+        else:
+            seqs.add(labels, label)
+            seqs.add(counts, 1)
+            seqs.add(used, 0)
+    let outCount = labels.len < limit ? labels.len else: limit
+    seqs.add(lines, "compiler_core_program_local_payload_unique_label_count=" + intToStr(labels.len))
+    seqs.add(lines, "compiler_core_program_local_payload_top_label_count=" + intToStr(outCount))
+    for rank in 0..<outCount:
+        var best: int32 = -1
+        for i in 0..<labels.len:
+            if used[i] != 0:
+                continue
+            if best < 0 || counts[i] > counts[best]:
+                best = i
+        if best < 0:
+            break
+        used[best] = 1
+        seqs.add(lines,
+            "compiler_core_program_local_payload_top_label." + intToStr(rank) + ".name=" +
+            labels[best])
+        seqs.add(lines,
+            "compiler_core_program_local_payload_top_label." + intToStr(rank) + ".count=" +
+            intToStr(counts[best]))
 
 fn resolveEntrySymbol(machineBundle: mpipeline.MachineModuleBundle,
                       emitKind: str,
@@ -107,6 +263,11 @@ fn resolveEntrySymbol(machineBundle: mpipeline.MachineModuleBundle,
 fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
                        objFile: ofile.ObjFileBundle,
                        emitKind: str,
+                       manifestFileCount: int32,
+                       noPointerCheckedFileCount: int32,
+                       noPointerCheckedCompilerCoreSurfaceFileCount: int32,
+                       noPointerCheckedLineSurfaceFileCount: int32,
+                       noPointerClosureOk: bool,
                        providerModules: str[],
                        itemIds: int32[],
                        labels: str[],
@@ -118,6 +279,11 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
     out.emitKind = emitKind
     out.targetTriple = machineBundle.targetTriple
     out.objFormat = machineBundle.objFormat
+    out.manifestFileCount = manifestFileCount
+    out.noPointerCheckedFileCount = noPointerCheckedFileCount
+    out.noPointerCheckedCompilerCoreSurfaceFileCount = noPointerCheckedCompilerCoreSurfaceFileCount
+    out.noPointerCheckedLineSurfaceFileCount = noPointerCheckedLineSurfaceFileCount
+    out.noPointerClosureOk = noPointerClosureOk
     out.linkerFlavor = systemLinkerFlavor(machineBundle.targetTriple, emitKind)
     out.outputKind = systemLinkOutputKind(emitKind)
     out.outputName = systemLinkOutputName(machineBundle.moduleKind, emitKind)
@@ -140,7 +306,7 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
         provider.runtimeSymbols = providerObjects[i].runtimeSymbols
         provider.objFileCid = providerObjects[i].objFileCid
         provider.objFileByteCount = providerObjects[i].objFileByteCount
-        add(out.providers, provider)
+        seqs.add(out.providers, provider)
     out.entryRequired = emitKind == "exe"
     out.entrySymbol = resolveEntrySymbol(machineBundle,
                                          emitKind,
@@ -148,46 +314,114 @@ fn buildSystemLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
                                          labels)
     out.entryPresent = len(out.entrySymbol) > 0
     out.missingReasons = []
+    var compilerCoreTrack: str = ""
+    if machineBundle.moduleKind == "compiler_core":
+        compilerCoreTrack = compilerCoreExecutionTrack(programSourcePath)
+    var localPayloadExecCount: int32 = 0
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        localPayloadExecCount = compilerCoreProgramLocalPayloadExecutableFunctionCount(machineBundle)
+    var localPayloadExecPlanCount: int32 = 0
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        localPayloadExecPlanCount = compilerCoreProgramLocalPayloadExecPlanFunctionCount(machineBundle)
+    var localPayloadSurfaceExecCount: int32 = 0
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        localPayloadSurfaceExecCount = compilerCoreProgramLocalPayloadSurfaceExecFunctionCount(machineBundle)
+    var localPayloadMissingExecPlanCount: int32 = 0
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        localPayloadMissingExecPlanCount = compilerCoreProgramLocalPayloadMissingExecPlanFunctionCount(machineBundle)
+    var programRegistryPresent: bool = false
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        programRegistryPresent = compilerCoreProgramRegistryPresent(machineBundle)
+    var programEntryExecPlanPresent: bool = false
+    if machineBundle.moduleKind == "compiler_core" && compilerCoreTrack == "program":
+        programEntryExecPlanPresent = compilerCoreProgramEntryExecPlanPresent(machineBundle)
     if out.entryRequired && !out.entryPresent:
-        add(out.missingReasons, "program_entry_symbol_missing")
-    add(out.missingReasons, "system_link_execution_missing")
+        seqs.add(out.missingReasons, "program_entry_symbol_missing")
+    if out.entryRequired &&
+       machineBundle.moduleKind == "compiler_core" &&
+       compilerCoreTrack == "program" &&
+       localPayloadExecCount > 0:
+        if !programRegistryPresent:
+            seqs.add(out.missingReasons, "program_exec_registry_missing")
+        if !programEntryExecPlanPresent:
+            seqs.add(out.missingReasons, "program_entry_exec_plan_missing")
+        if localPayloadMissingExecPlanCount > 0:
+            seqs.add(out.missingReasons, "program_local_payload_exec_plan_missing")
     var lines: str[]
     lines = []
-    add(lines, "system_link_plan_version=" + out.version)
-    add(lines, "module_kind=" + out.moduleKind)
-    add(lines, "emit=" + out.emitKind)
-    add(lines, "target=" + out.targetTriple)
-    add(lines, "obj_format=" + out.objFormat)
-    add(lines, "linker_flavor=" + out.linkerFlavor)
-    add(lines, "output_kind=" + out.outputKind)
-    add(lines, "output_name=" + out.outputName)
-    add(lines, "output_suffix=" + out.outputSuffix)
-    add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
-    add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
-    add(lines, "provider_module_count=" + intToStr(out.providers.len))
+    seqs.add(lines, "system_link_plan_version=" + out.version)
+    seqs.add(lines, "module_kind=" + out.moduleKind)
+    seqs.add(lines, "emit=" + out.emitKind)
+    seqs.add(lines, "target=" + out.targetTriple)
+    seqs.add(lines, "obj_format=" + out.objFormat)
+    seqs.add(lines, "manifest_file_count=" + intToStr(out.manifestFileCount))
+    seqs.add(lines, "no_pointer_checked_file_count=" + intToStr(out.noPointerCheckedFileCount))
+    seqs.add(lines,
+             "no_pointer_checked_compiler_core_surface_file_count=" +
+             intToStr(out.noPointerCheckedCompilerCoreSurfaceFileCount))
+    seqs.add(lines,
+             "no_pointer_checked_line_surface_file_count=" +
+             intToStr(out.noPointerCheckedLineSurfaceFileCount))
+    seqs.add(lines, "no_pointer_closure_ok=" + (out.noPointerClosureOk ? "1" : "0"))
+    if machineBundle.moduleKind == "compiler_core":
+        seqs.add(lines, "compiler_core_execution_track=" + compilerCoreTrack)
+        if compilerCoreTrack == "program":
+            let localPayloadCount = compilerCoreProgramLocalPayloadFunctionCount(machineBundle)
+            let localPayloadLabelSamples = compilerCoreProgramLocalPayloadLabelSamples(machineBundle)
+            seqs.add(lines, "compiler_core_program_local_payload_function_count=" + intToStr(localPayloadCount))
+            seqs.add(lines, "compiler_core_program_local_payload_executable_function_count=" + intToStr(localPayloadExecCount))
+            seqs.add(lines, "compiler_core_program_local_payload_exec_plan_function_count=" + intToStr(localPayloadExecPlanCount))
+            seqs.add(lines, "compiler_core_program_local_payload_surface_exec_function_count=" + intToStr(localPayloadSurfaceExecCount))
+            seqs.add(lines, "compiler_core_program_local_payload_missing_exec_plan_function_count=" + intToStr(localPayloadMissingExecPlanCount))
+            var registryPresentText: str = "0"
+            if programRegistryPresent:
+                registryPresentText = "1"
+            seqs.add(lines, "compiler_core_program_registry_present=" + registryPresentText)
+            seqs.add(lines, "compiler_core_program_local_payload_label_sample_count=" + intToStr(localPayloadLabelSamples.len))
+            for i in 0..<localPayloadLabelSamples.len:
+                seqs.add(lines,
+                    "compiler_core_program_local_payload_label_sample." + intToStr(i) + "=" +
+                    localPayloadLabelSamples[i])
+            appendCompilerCoreProgramLocalPayloadTopLabelLines(lines, machineBundle, 8)
+    seqs.add(lines, "linker_flavor=" + out.linkerFlavor)
+    seqs.add(lines, "output_kind=" + out.outputKind)
+    seqs.add(lines, "output_name=" + out.outputName)
+    seqs.add(lines, "output_suffix=" + out.outputSuffix)
+    seqs.add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
+    seqs.add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
+    seqs.add(lines, "provider_module_count=" + intToStr(out.providers.len))
     for i in 0..<out.providers.len:
-        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providers[i].modulePath)
-        add(lines, "provider_module." + intToStr(i) + ".source_path=" + out.providers[i].sourcePath)
-        add(lines, "provider_module." + intToStr(i) + ".source_kind=" + out.providers[i].sourceKind)
-        add(lines, "provider_module." + intToStr(i) + ".compile_mode=" + out.providers[i].compileMode)
-        add(lines, "provider_module." + intToStr(i) + ".manifest_cid=" + out.providers[i].manifestCid)
-        add(lines, "provider_module." + intToStr(i) + ".execution_model=" + out.providers[i].executionModel)
-        add(lines, "provider_module." + intToStr(i) + ".trace_symbol=" + out.providers[i].traceSymbol)
-        add(lines, "provider_module." + intToStr(i) + ".provider_symbol_count=" + intToStr(out.providers[i].runtimeSymbols.len))
+        seqs.add(lines, "provider_module." + intToStr(i) + ".name=" + out.providers[i].modulePath)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".source_path=" + out.providers[i].sourcePath)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".source_kind=" + out.providers[i].sourceKind)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".compile_mode=" + out.providers[i].compileMode)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".manifest_cid=" + out.providers[i].manifestCid)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".execution_model=" + out.providers[i].executionModel)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".trace_symbol=" + out.providers[i].traceSymbol)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".provider_symbol_count=" + intToStr(out.providers[i].runtimeSymbols.len))
         for j in 0..<out.providers[i].runtimeSymbols.len:
-            add(lines,
+            seqs.add(lines,
                 "provider_module." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
                 out.providers[i].runtimeSymbols[j])
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providers[i].objFileCid)
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providers[i].objFileByteCount))
-        add(lines, "provider_module." + intToStr(i) + ".object_materialized=1")
-    add(lines, "entry_required=" + if out.entryRequired: "1" else: "0")
-    add(lines, "entry_symbol=" + out.entrySymbol)
-    add(lines, "entry_present=" + if out.entryPresent: "1" else: "0")
-    add(lines, "missing_reason_count=" + intToStr(out.missingReasons.len))
+        seqs.add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providers[i].objFileCid)
+        seqs.add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providers[i].objFileByteCount))
+        seqs.add(lines, "provider_module." + intToStr(i) + ".object_materialized=1")
+    var entryRequiredText: str = "0"
+    if out.entryRequired:
+        entryRequiredText = "1"
+    seqs.add(lines, "entry_required=" + entryRequiredText)
+    seqs.add(lines, "entry_symbol=" + out.entrySymbol)
+    var entryPresentText: str = "0"
+    if out.entryPresent:
+        entryPresentText = "1"
+    seqs.add(lines, "entry_present=" + entryPresentText)
+    seqs.add(lines, "missing_reason_count=" + intToStr(out.missingReasons.len))
     for i in 0..<out.missingReasons.len:
-        add(lines, "missing_reason." + intToStr(i) + "=" + out.missingReasons[i])
-    add(lines, "system_link_ready=" + if out.missingReasons.len == 0: "1" else: "0")
+        seqs.add(lines, "missing_reason." + intToStr(i) + "=" + out.missingReasons[i])
+    var systemLinkReadyText: str = "0"
+    if out.missingReasons.len == 0:
+        systemLinkReadyText = "1"
+    seqs.add(lines, "system_link_ready=" + systemLinkReadyText)
     out.planText = manifest.joinLines(lines)
     out.planCid = ident.sha256HexText(out.planText)
     return out

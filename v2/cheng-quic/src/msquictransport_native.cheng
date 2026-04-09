@@ -29,6 +29,15 @@ fn initMsQuicTransport(): MsQuicTransport =
         lastError: ""
     )
 
+fn initMsQuicTransportInto(out: var MsQuicTransport) =
+    out.running = false
+    out.listenerId = -1
+    out.settings = initMsQuicSettings()
+    out.tlsPolicy = initMsQuicTlsPolicy()
+    out.listenAddr = MultiAddress(raw: "", data: emptyBytes())
+    out.addr = MultiAddress(raw: "", data: emptyBytes())
+    out.lastError = ""
+
 fn msquicTransportSettings(t: MsQuicTransport): MsQuicSettings =
     return t.settings
 
@@ -36,7 +45,7 @@ fn setMsQuicTransportSettings(t: var MsQuicTransport, settings: MsQuicSettings):
     var next: MsQuicSettings = settings
     let validRes: Result[bool] = validateMsQuicSettings(next)
     if IsErr(validRes):
-        return Err[bool](Error(validRes))
+        return Err[bool](ErrorText(validRes))
     t.settings = next
     return Ok[bool](true)
 
@@ -60,13 +69,14 @@ fn start(t: var MsQuicTransport, addr: MultiAddress) =
     t.lastError = ""
     let startRes: Result[int32] = msquicNativeStartListener(addr, t.settings, t.tlsPolicy)
     if IsErr(startRes):
-        t.lastError = Error(startRes)
+        t.lastError = ErrorText(startRes)
         return
     t.listenerId = Value(startRes)
     t.running = true
 
 fn stop(t: var MsQuicTransport) =
-    msquicNativeStopListener()
+    if t.running:
+        msquicNativeStopListener()
     t.running = false
     t.listenerId = -1
     t.lastError = ""
@@ -78,44 +88,46 @@ fn accept(t: var MsQuicTransport): Result[Connection] =
     t.lastError = ""
     let acceptRes: Result[int32] = msquicNativeAccept()
     if IsErr(acceptRes):
-        t.lastError = Error(acceptRes)
-        return Err[Connection](Error(acceptRes))
-    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(t.listenAddr, t.listenAddr, t.listenAddr, t.listenAddr)
+        t.lastError = ErrorText(acceptRes)
+        return Err[Connection](ErrorText(acceptRes))
+    let localAddr: MultiAddress = msquicNativeListenerBoundAddr()
+    let remoteAddr: MultiAddress = msquicNativePeerDialAddr()
+    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(localAddr, remoteAddr, localAddr, remoteAddr)
     if IsErr(pairRes):
-        t.lastError = Error(pairRes)
-        return Err[Connection](Error(pairRes))
+        t.lastError = ErrorText(pairRes)
+        return Err[Connection](ErrorText(pairRes))
     return Ok[Connection](Value(pairRes).inbound)
 
 fn dial(t: var MsQuicTransport, addr: MultiAddress): Result[Connection] =
     if ! handles(t, addr):
         t.lastError = "msquic: unsupported address"
         return Err[Connection]("msquic: unsupported address")
-    if ! t.running:
-        t.lastError = "msquic: no listener"
-        return Err[Connection]("msquic: no listener")
     t.lastError = ""
-    let dialRes: Result[int32] = msquicNativeDial(addr)
+    let dialRes: Result[int32] = msquicNativeDial(t.settings, t.tlsPolicy, addr)
     if IsErr(dialRes):
-        t.lastError = Error(dialRes)
-        return Err[Connection](Error(dialRes))
-    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(addr, addr, t.listenAddr, addr)
+        t.lastError = ErrorText(dialRes)
+        return Err[Connection](ErrorText(dialRes))
+    echo("msquic_transport_dial_stage=native_ok")
+    let clientAddr: MultiAddress = msquicNativeClientBoundAddr()
+    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(clientAddr, addr, addr, clientAddr)
     if IsErr(pairRes):
-        t.lastError = Error(pairRes)
-        return Err[Connection](Error(pairRes))
+        t.lastError = ErrorText(pairRes)
+        return Err[Connection](ErrorText(pairRes))
+    echo("msquic_transport_dial_stage=pair_ok")
     return Ok[Connection](Value(pairRes).outbound)
 
 fn msquicTransportWrite(t: var MsQuicTransport, conn: var Connection, data: Bytes): Result[int32] =
     t.lastError = ""
     let writeRes: Result[int32] = quicConnWrite(conn, data)
     if IsErr(writeRes):
-        t.lastError = Error(writeRes)
+        t.lastError = ErrorText(writeRes)
     return writeRes
 
 fn msquicTransportRead(t: var MsQuicTransport, conn: var Connection, count: int32): Result[Bytes] =
     t.lastError = ""
     let readRes: Result[Bytes] = quicConnRead(conn, count)
     if IsErr(readRes):
-        t.lastError = Error(readRes)
+        t.lastError = ErrorText(readRes)
     return readRes
 
 fn dropMsQuicPendingByPipe(t: MsQuicTransport, addr: MultiAddress, pipeIdx: int32): Result[bool] =
@@ -144,7 +156,7 @@ fn msquicTransportDatagramWrite(t: var MsQuicTransport, conn: var Connection, da
         return Err[int32](t.lastError)
     let writeRes: Result[int32] = msquicNativeDatagramWrite(conn.pipeIdx, conn.pipeSide, data)
     if IsErr(writeRes):
-        t.lastError = Error(writeRes)
+        t.lastError = ErrorText(writeRes)
     return writeRes
 
 fn msquicTransportDatagramRead(t: var MsQuicTransport, conn: var Connection): Result[Bytes] =
@@ -154,5 +166,5 @@ fn msquicTransportDatagramRead(t: var MsQuicTransport, conn: var Connection): Re
         return Err[Bytes](t.lastError)
     let readRes: Result[Bytes] = msquicNativeDatagramRead(conn.pipeIdx, conn.pipeSide)
     if IsErr(readRes):
-        t.lastError = Error(readRes)
+        t.lastError = ErrorText(readRes)
     return readRes

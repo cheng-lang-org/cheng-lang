@@ -66,24 +66,6 @@ fn copyBytesRange(src: Bytes, start: int32, count: int32): Bytes =
         bytesSet(out, i, bytesGet(src, start + i))
     return out
 
-fn copyBytesRange(src: var Bytes, start: int32, count: int32): Bytes =
-    if count <= 0:
-        return emptyBytes()
-    let srcLen: int32 = src.len
-    if srcLen <= 0:
-        return emptyBytes()
-    if start < 0 || start >= srcLen:
-        return emptyBytes()
-    var take: int32 = count
-    if start + take > srcLen:
-        take = srcLen - start
-    if take <= 0:
-        return emptyBytes()
-    let out: Bytes = bytesAlloc(take)
-    for i in 0..<take:
-        bytesSet(out, i, bytesGet(src, start + i))
-    return out
-
 fn bytesAppend(dst: var Bytes, extra: Bytes) =
     let oldLen: int32 = dst.len
     let addLen: int32 = bytesLen(extra)
@@ -228,7 +210,7 @@ fn newConnection(localAddr: MultiAddress, remoteAddr: MultiAddress, dir: Directi
 fn newConnectionPair(outLocal: MultiAddress, outRemote: MultiAddress, inLocal: MultiAddress, inRemote: MultiAddress): Result[ConnectionPair] =
     let pipeRes: Result[int32] = allocPipe()
     if IsErr(pipeRes):
-        return Err[ConnectionPair](Error(pipeRes))
+        return Err[ConnectionPair](ErrorText(pipeRes))
     let idx: int32 = Value(pipeRes)
     let outbound: Connection = Connection(
         localAddr: outLocal,
@@ -347,8 +329,24 @@ fn quicConnWrite(c: var Connection, data: Bytes): Result[int32] =
 fn quicConnRead(c: var Connection, count: int32): Result[Bytes] =
     if ! c.open:
         return Err[Bytes]("connection: closed")
+    if count <= 0:
+        return Ok[Bytes](emptyBytes())
     if c.pipeIdx >= 0:
-        return pipeRead(c.pipeIdx, c.pipeSide, count)
+        for i in 0..<256:
+            if bytesLen(c.stream) >= count:
+                break
+            let readRes: Result[Bytes] = pipeRead(c.pipeIdx, c.pipeSide, count - bytesLen(c.stream))
+            if IsErr(readRes):
+                if ErrorText(readRes) == "msquic udp: queue empty":
+                    break
+                return Err[Bytes](ErrorText(readRes))
+            let chunk: Bytes = Value(readRes)
+            if bytesLen(chunk) <= 0:
+                break
+            bytesAppend(c.stream, chunk)
+        let taken: Bytes = bytesTakePrefix(c.stream, count)
+        let owned: Bytes = copyBytesRange(taken, 0, bytesLen(taken))
+        return Ok[Bytes](owned)
     let taken: Bytes = bytesTakePrefix(c.stream, count)
     let owned: Bytes = copyBytesRange(taken, 0, bytesLen(taken))
     return Ok[Bytes](owned)

@@ -3,154 +3,172 @@
 import std/result
 import std/rawbytes
 import cheng/quic/multiaddress
+import cheng/quic/multiaddress as qma
 import cheng/quic/connection
+import cheng/quic/connection as qconn
 import cheng/quic/msquictransport
+import cheng/quic/msquictransport as qtransport
 import cheng/quic/tls/test_pki
+import cheng/quic/tls/test_pki as testpki
 import cheng/quic/dm_demo
+import cheng/quic/dm_demo as dmdemo
 import cheng/quic/tests/protocol_validation_test
+import cheng/quic/tests/protocol_validation_test as protocoltest
 import cheng/quic/tests/congestion_validation_test
+import cheng/quic/tests/congestion_validation_test as congestiontest
 import cheng/quic/tests/test_tls_params
+import cheng/quic/tests/test_tls_params as tlstest
 import cheng/quic/tests/test_packet_header
+import cheng/quic/tests/test_packet_header as headertest
 import cheng/quic/tests/tls13_aead_test
+import cheng/quic/tests/tls13_aead_test as aeadtest
 import cheng/quic/tests/tls13_handshake_flow_test
+import cheng/quic/tests/tls13_handshake_flow_test as flowtest
+import cheng/quic/tests/msquic_chain_smoke
+import cheng/quic/tests/msquic_chain_smoke as chaintest
 
 fn runApiSurfaceSmoke(): Result[bool] =
-    var t: MsQuicTransport = initMsQuicTransport()
-    var settings: MsQuicSettings = msquicTransportSettings(t)
+    var t: MsQuicTransport = qtransport.initMsQuicTransport()
+    var settings: MsQuicSettings = qtransport.msquicTransportSettings(t)
     settings.allowDatagram = true
     settings.maxDatagram = 96
-    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    let setRes: Result[bool] = qtransport.setMsQuicTransportSettings(t, settings)
     if IsErr(setRes):
-        return Err[bool]("api: transport settings: " + Error(setRes))
-    let applied: MsQuicSettings = msquicTransportSettings(t)
+        return Err[bool]("api: transport settings: " + ErrorText(setRes))
+    let applied: MsQuicSettings = qtransport.msquicTransportSettings(t)
     if ! applied.allowDatagram:
         return Err[bool]("api: allowDatagram not applied")
     if applied.maxDatagram != 96:
         return Err[bool]("api: maxDatagram not applied")
-    let policyRes = msquicMakeLocalhostTlsPolicy()
+    let policyRes = testpki.msquicMakeLocalhostTlsPolicy()
     if IsErr(policyRes):
-        return Err[bool]("api: tls policy: " + Error(policyRes))
-    let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
+        return Err[bool]("api: tls policy: " + ErrorText(policyRes))
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(t, Value(policyRes))
     if IsErr(tlsRes):
-        return Err[bool]("api: tls apply: " + Error(tlsRes))
-    if msquicTransportTlsPolicy(t).serverName != "localhost":
+        return Err[bool]("api: tls apply: " + ErrorText(tlsRes))
+    if qtransport.msquicTransportTlsPolicy(t).serverName != "localhost":
         return Err[bool]("api: tls policy not applied")
     return Ok[bool](true)
 
 fn runMsQuicTransportSmoke(): Result[bool] =
-    let addrRes: Result[MultiAddress] = parseMultiAddress("/ip4/127.0.0.1/udp/0/quic-v1")
+    let addrRes: Result[MultiAddress] = qma.parseMultiAddress("/ip4/127.0.0.1/udp/0/quic-v1")
     if IsErr(addrRes):
-        return Err[bool]("transport: parse addr: " + Error(addrRes))
+        return Err[bool]("transport: parse addr: " + ErrorText(addrRes))
     let addr: MultiAddress = Value(addrRes)
 
-    var t: MsQuicTransport = initMsQuicTransport()
-    var settings: MsQuicSettings = msquicTransportSettings(t)
+    var t: MsQuicTransport = qtransport.initMsQuicTransport()
+    var settings: MsQuicSettings = qtransport.msquicTransportSettings(t)
     settings.allowDatagram = true
     settings.maxDatagram = 128
-    let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
+    let setRes: Result[bool] = qtransport.setMsQuicTransportSettings(t, settings)
     if IsErr(setRes):
-        return Err[bool]("transport: settings: " + Error(setRes))
-    let policyRes = msquicMakeLocalhostTlsPolicy()
+        return Err[bool]("transport: settings: " + ErrorText(setRes))
+    let policyRes = testpki.msquicMakeLocalhostTlsPolicy()
     if IsErr(policyRes):
-        return Err[bool]("transport: tls policy: " + Error(policyRes))
-    let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
+        return Err[bool]("transport: tls policy: " + ErrorText(policyRes))
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(t, Value(policyRes))
     if IsErr(tlsRes):
-        return Err[bool]("transport: tls apply: " + Error(tlsRes))
+        return Err[bool]("transport: tls apply: " + ErrorText(tlsRes))
 
-    if ! handles(t, addr):
+    if ! qtransport.handles(t, addr):
         return Err[bool]("transport: handle mismatch")
-    start(t, addr)
+    qtransport.start(t, addr)
     if ! t.running:
         return Err[bool]("transport: start failed")
 
-    let dialRes: Result[Connection] = dial(t, addr)
+    let dialRes: Result[Connection] = qtransport.dial(t, addr)
     if IsErr(dialRes):
-        return Err[bool]("transport: dial: " + Error(dialRes))
-    let acceptRes: Result[Connection] = accept(t)
+        return Err[bool]("transport: dial: " + ErrorText(dialRes))
+    let acceptRes: Result[Connection] = qtransport.accept(t)
     if IsErr(acceptRes):
-        return Err[bool]("transport: accept: " + Error(acceptRes))
+        return Err[bool]("transport: accept: " + ErrorText(acceptRes))
     var outConn: Connection = Value(dialRes)
     var inConn: Connection = Value(acceptRes)
 
     if outConn.pipeIdx != inConn.pipeIdx:
         return Err[bool]("transport: native handle mismatch")
     let payload: Bytes = bytesFromString("transport")
-    let writeRes: Result[int32] = quicConnWrite(outConn, payload)
+    let writeRes: Result[int32] = qconn.quicConnWrite(outConn, payload)
     if IsErr(writeRes):
-        return Err[bool]("transport: write: " + Error(writeRes))
-    let readRes: Result[Bytes] = quicConnRead(inConn, bytesLen(payload))
+        return Err[bool]("transport: write: " + ErrorText(writeRes))
+    let readRes: Result[Bytes] = qconn.quicConnRead(inConn, bytesLen(payload))
     if IsErr(readRes):
-        return Err[bool]("transport: read: " + Error(readRes))
+        return Err[bool]("transport: read: " + ErrorText(readRes))
     if ! bytesEqual(Value(readRes), payload):
         return Err[bool]("transport: payload mismatch")
 
-    dropMsQuicConnectionsByPipe(outConn.pipeIdx)
-    let closedRes: Result[int32] = quicConnWrite(outConn, bytesFromString("x"))
+    qtransport.dropMsQuicConnectionsByPipe(outConn.pipeIdx)
+    let closedRes: Result[int32] = qconn.quicConnWrite(outConn, bytesFromString("x"))
     if IsOk(closedRes):
         return Err[bool]("transport: close boundary missing")
-    stop(t)
+    qtransport.stop(t)
     return Ok[bool](true)
 
 fn runAndTag(name: str, res: Result[bool]): Result[bool] =
     if IsErr(res):
-        return Err[bool](name + ": " + Error(res))
+        return Err[bool](name + ": " + ErrorText(res))
     echo("msquic_verify: " + name + "=ok")
     return Ok[bool](true)
 
 fn main(): int32 =
     let apiRes: Result[bool] = runAndTag("api", runApiSurfaceSmoke())
     if IsErr(apiRes):
-        echo("msquic verify failed: " + Error(apiRes))
+        echo("msquic verify failed: " + ErrorText(apiRes))
         return 1
 
-    let varintRes: Result[bool] = runAndTag("packet_varint", runQuicVarIntTest())
+    let varintRes: Result[bool] = runAndTag("packet_varint", headertest.runQuicVarIntTest())
     if IsErr(varintRes):
-        echo("msquic verify failed: " + Error(varintRes))
+        echo("msquic verify failed: " + ErrorText(varintRes))
         return 1
 
-    let headerRes: Result[bool] = runAndTag("packet_header", runQuicPacketHeaderTest())
+    let headerRes: Result[bool] = runAndTag("packet_header", headertest.runQuicPacketHeaderTest())
     if IsErr(headerRes):
-        echo("msquic verify failed: " + Error(headerRes))
+        echo("msquic verify failed: " + ErrorText(headerRes))
         return 1
 
-    let aeadRes: Result[bool] = runAndTag("tls13_aead", runTls13AeadTest())
+    let aeadRes: Result[bool] = runAndTag("tls13_aead", aeadtest.runTls13AeadTest())
     if IsErr(aeadRes):
-        echo("msquic verify failed: " + Error(aeadRes))
+        echo("msquic verify failed: " + ErrorText(aeadRes))
         return 1
 
-    let hsRes: Result[bool] = runAndTag("tls13_flow", runTls13HandshakeFlowTest())
+    let hsRes: Result[bool] = runAndTag("tls13_flow", flowtest.runTls13HandshakeFlowTest())
     if IsErr(hsRes):
-        echo("msquic verify failed: " + Error(hsRes))
+        echo("msquic verify failed: " + ErrorText(hsRes))
         return 1
 
-    let protocolRes: Result[bool] = runAndTag("protocol", runProtocolValidationTest())
+    let protocolRes: Result[bool] = runAndTag("protocol", protocoltest.runProtocolValidationTest())
     if IsErr(protocolRes):
-        echo("msquic verify failed: " + Error(protocolRes))
+        echo("msquic verify failed: " + ErrorText(protocolRes))
         return 1
 
-    let congestionRes: Result[bool] = runAndTag("congestion", runCongestionValidationTest())
+    let congestionRes: Result[bool] = runAndTag("congestion", congestiontest.runCongestionValidationTest())
     if IsErr(congestionRes):
-        echo("msquic verify failed: " + Error(congestionRes))
+        echo("msquic verify failed: " + ErrorText(congestionRes))
         return 1
 
-    let tlsRes: Result[bool] = runAndTag("tls", runTlsParamTest())
+    let tlsRes: Result[bool] = runAndTag("tls", tlstest.runTlsParamTest())
     if IsErr(tlsRes):
-        echo("msquic verify failed: " + Error(tlsRes))
+        echo("msquic verify failed: " + ErrorText(tlsRes))
         return 1
 
     let transportRes: Result[bool] = runAndTag("transport", runMsQuicTransportSmoke())
     if IsErr(transportRes):
-        echo("msquic verify failed: " + Error(transportRes))
+        echo("msquic verify failed: " + ErrorText(transportRes))
         return 1
 
-    let dmStreamRes: Result[bool] = runAndTag("dm_stream", runStreamDmDemo())
+    let dmStreamRes: Result[bool] = runAndTag("dm_stream", dmdemo.runStreamDmDemo())
     if IsErr(dmStreamRes):
-        echo("msquic verify failed: " + Error(dmStreamRes))
+        echo("msquic verify failed: " + ErrorText(dmStreamRes))
         return 1
 
-    let dmDatagramRes: Result[bool] = runAndTag("dm_datagram", runDatagramDmDemo())
+    let dmDatagramRes: Result[bool] = runAndTag("dm_datagram", dmdemo.runDatagramDmDemo())
     if IsErr(dmDatagramRes):
-        echo("msquic verify failed: " + Error(dmDatagramRes))
+        echo("msquic verify failed: " + ErrorText(dmDatagramRes))
+        return 1
+
+    let chainRes: Result[bool] = runAndTag("chain", chaintest.runMsQuicChainSmoke())
+    if IsErr(chainRes):
+        echo("msquic verify failed: " + ErrorText(chainRes))
         return 1
 
     echo("msquic verify ok")

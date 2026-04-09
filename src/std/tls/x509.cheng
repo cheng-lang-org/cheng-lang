@@ -168,15 +168,17 @@ fn initX509Certificate(): X509Certificate =
     )
 
 fn initX509CertList(): X509CertList =
-    X509CertList(count: 0)
+    var out: X509CertList
+    out.count = 0
+    return out
 
 fn initX509Crl(): X509Crl =
-    X509Crl(
-        issuer: emptyBytes(),
-        thisUpdate: 0,
-        nextUpdate: 0,
-        revokedCount: 0
-    )
+    var out: X509Crl
+    out.issuer = emptyBytes()
+    out.thisUpdate = 0
+    out.nextUpdate = 0
+    out.revokedCount = 0
+    return out
 
 fn x509CertListAdd(list: var X509CertList, cert: X509Certificate): Result[bool] =
     if list.count >= x509MaxChain:
@@ -1032,7 +1034,10 @@ fn x509VerifySignature(cert: X509Certificate, issuer: X509Certificate): Result[b
         let sigRes: Result[Bytes] = x509DecodeEcdsaSignature(cert.signature)
         if IsErr(sigRes):
             return Err[bool](Error(sigRes))
-        let ok: bool = ecdsaVerifyBytes(ecdsaPublicKeyToBytes(issuer.publicKey.ecdsa), cert.tbs, Value(sigRes))
+        let sigObjRes: Result[EcSignature] = ecdsaSignatureFromBytes(Value(sigRes))
+        if IsErr(sigObjRes):
+            return Err[bool](Error(sigObjRes))
+        let ok: bool = ecdsaVerifyTrustedPublicKey(issuer.publicKey.ecdsa, cert.tbs, Value(sigObjRes))
         return Ok[bool](ok)
     if cert.sigAlg == X509SigEcdsaSha384:
         return Err[bool]("x509: ecdsa sha384 unsupported")
@@ -1095,9 +1100,18 @@ fn x509VerifyChain(leaf: X509Certificate, intermediates: X509CertList, roots: X5
             let anchorIdx: int32 = x509CertListFindBySubjectIndex(roots, current.subject)
             if anchorIdx < 0:
                 return Err[bool]("x509: self-signed ! trusted")
-            let selfRes: Result[bool] = x509VerifySelfSigned(current)
-            if IsErr(selfRes):
-                return Err[bool]("x509: self-signed signature: " + Error(selfRes))
+            let anchorPtr: X509Certificate = roots.items[anchorIdx]
+            let caRes: Result[bool] = x509VerifyCaConstraints(anchorPtr)
+            if IsErr(caRes):
+                return Err[bool](Error(caRes))
+            let caTimeRes: Result[bool] = x509VerifyValidity(anchorPtr, now)
+            if IsErr(caTimeRes):
+                return Err[bool](Error(caTimeRes))
+            let sigRes: Result[bool] = x509VerifySignature(current, anchorPtr)
+            if IsErr(sigRes):
+                return Err[bool]("x509: trust anchor signature: " + Error(sigRes))
+            if ! Value(sigRes):
+                return Err[bool]("x509: trust anchor signature invalid")
             return Ok[bool](true)
         let issuerIdx: int32 = x509CertListFindBySubjectIndex(intermediates, current.issuer)
         if issuerIdx >= 0:
@@ -1162,9 +1176,6 @@ fn x509VerifyChain(leaf: X509Certificate, intermediates: X509CertList, roots: X5
                     if IsErr(diagRes):
                         return Err[bool]("x509: signature invalid: " + Error(diagRes))
                 return Err[bool]("x509: signature invalid")
-            let selfRes: Result[bool] = x509VerifySelfSigned(rootPtr)
-            if IsErr(selfRes):
-                return Err[bool]("x509: root self-signed: " + Error(selfRes))
             return Ok[bool](true)
         return Err[bool]("x509: issuer ! found")
     return Err[bool]("x509: chain too deep")
@@ -1285,7 +1296,10 @@ fn x509VerifySignatureBytes(
         let sigRes: Result[Bytes] = x509DecodeEcdsaSignature(sig)
         if IsErr(sigRes):
             return Err[bool](Error(sigRes))
-        return Ok[bool](ecdsaVerifyBytes(ecdsaPublicKeyToBytes(issuer.publicKey.ecdsa), msg, Value(sigRes)))
+        let sigObjRes: Result[EcSignature] = ecdsaSignatureFromBytes(Value(sigRes))
+        if IsErr(sigObjRes):
+            return Err[bool](Error(sigObjRes))
+        return Ok[bool](ecdsaVerifyTrustedPublicKey(issuer.publicKey.ecdsa, msg, Value(sigObjRes)))
     if sigAlg == X509SigEcdsaSha384:
         return Err[bool]("x509: ecdsa sha384 unsupported")
     return Err[bool]("x509: unsupported signature algorithm kind=" + x509IntToString(int64(sigAlg)))

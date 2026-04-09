@@ -1969,6 +1969,46 @@ ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStr
   return default_value;
 }
 
+int32_t driver_c_read_flag_value_bridge(ChengStrBridge key, ChengStrBridge *out_value) {
+  int32_t argc = 0;
+  int32_t i = 0;
+  if (out_value == NULL) return 0;
+  *out_value = cheng_str_bridge_empty();
+  if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+    argc = cheng_saved_argc;
+  } else {
+    argc = __cheng_rt_paramCount();
+  }
+  if (argc <= 1) return 0;
+  for (i = 1; i < argc; ++i) {
+    const char *raw = NULL;
+    const char *inline_value = NULL;
+    if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+      raw = cheng_saved_argv[i];
+    } else {
+      raw = __cheng_rt_paramStr(i);
+    }
+    if (raw == NULL) continue;
+    if (driver_c_flag_inline_value(raw, key, &inline_value)) {
+      *out_value = cheng_str_bridge_from_ptr_flags(inline_value, 0);
+      return 1;
+    }
+    if (driver_c_flag_key_matches(raw, key)) {
+      const char *next_raw = "";
+      if (i + 1 >= argc) return 0;
+      if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+        next_raw = cheng_saved_argv[i + 1];
+      } else {
+        next_raw = __cheng_rt_paramStr(i + 1);
+      }
+      if (next_raw == NULL) next_raw = "";
+      *out_value = cheng_str_bridge_from_ptr_flags(next_raw, 0);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value) {
   ChengStrBridge raw = driver_c_read_flag_or_default_bridge(key, cheng_str_bridge_empty());
   char *end = NULL;

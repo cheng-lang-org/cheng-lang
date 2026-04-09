@@ -2,6 +2,7 @@ import std/seqs
 import std/strings as strings
 import std/system
 import compiler/frontend/compiler_core_surface_ir_v2 as ccore
+import compiler/frontend/compiler_core_surface_lowering_v2 as cfront
 import compiler/frontend/v2_source_parser as parser
 import compiler/driver/manifest_resolver_v2 as mresolve
 import compiler/semantic_facts/compiler_core_facts_v2 as cfacts
@@ -19,62 +20,13 @@ type
 fn compilerCorePipelineVersion(): str =
     return "v2.driver.compiler_core_pipeline.v1"
 
-fn lowerCompilerCoreProgramToHighUir(program: ccore.CompilerCoreProgram,
-                                     facts: cfacts.CompilerCoreSemanticFacts): cgraph.HighUirCompilerCoreGraph =
-    var out: cgraph.HighUirCompilerCoreGraph = cgraph.newHighUirCompilerCoreGraph()
-    var moduleIdx: int32 = 0
-    var typeIdx: int32 = 0
-    var constIdx: int32 = 0
-    var varIdx: int32 = 0
-    var routineIdx: int32 = 0
-    for i in 0..<facts.itemIds.len:
-        var signatureText: str = ""
-        if facts.topLevelKinds[i] == "module":
-            signatureText = program.modules[moduleIdx].headerText
-            moduleIdx = moduleIdx + 1
-        elif facts.topLevelKinds[i] == "type":
-            signatureText = program.typeBlocks[typeIdx].headerText
-            typeIdx = typeIdx + 1
-        elif facts.topLevelKinds[i] == "const":
-            signatureText = program.constDecls[constIdx].headerText
-            constIdx = constIdx + 1
-        elif facts.topLevelKinds[i] == "var":
-            signatureText = program.varDecls[varIdx].headerText
-            varIdx = varIdx + 1
-        elif facts.topLevelKinds[i] != "import":
-            signatureText = program.routines[routineIdx].signatureText
-            routineIdx = routineIdx + 1
-        cgraph.appendHighUirCompilerCoreItem(out,
-                                             facts.itemIds[i],
-                                             facts.highOps[i],
-                                             facts.proofDomains[i],
-                                             facts.effectClasses[i],
-                                             facts.bindingScopes[i],
-                                             facts.importPaths[i],
-                                             facts.importAliases[i],
-                                             facts.importCategories[i],
-                                             signatureText,
-                                             facts.signatureHashes[i],
-                                             facts.bodyLineCounts[i],
-                                             facts.bodyHashes[i],
-                                             facts.executableAstReady[i],
-                                             facts.returnTypeTexts[i],
-                                             facts.paramCounts[i],
-                                             facts.localCounts[i],
-                                             facts.stmtCounts[i],
-                                             facts.exprCounts[i],
-                                             facts.topLevelKinds[i],
-                                             facts.topLevelLabels[i],
-                                             facts.importcSymbolTexts[i])
-    return out
-
 fn compileCompilerCoreProgram(program: ccore.CompilerCoreProgram): CompilerCorePipelineBundle =
     var out: CompilerCorePipelineBundle
     out.version = compilerCorePipelineVersion()
     out.program = program
     out.facts = cfacts.buildCompilerCoreSemanticFacts(program)
-    out.highGraph = lowerCompilerCoreProgramToHighUir(program, out.facts)
-    out.lowPlan = clow.lowerHighUirCompilerCoreGraphToLowUir(out.program, out.highGraph)
+    out.highGraph = cfront.lowerCompilerCoreProgramToHighUir(program, out.facts)
+    out.lowPlan = clow.lowerHighUirCompilerCoreGraphToLowUir(out.highGraph)
     return out
 
 fn compileCompilerCoreSourceClosure(entryPath: str): CompilerCorePipelineBundle =
@@ -125,6 +77,10 @@ fn compilerCorePipelineLines(bundle: CompilerCorePipelineBundle): str[] =
                  " | locals=" + intToStr(bundle.lowPlan.localCounts[i]) +
                  " | stmts=" + intToStr(bundle.lowPlan.stmtCounts[i]) +
                  " | exprs=" + intToStr(bundle.lowPlan.exprCounts[i]) +
+                 " | stmt_kinds=" + bundle.lowPlan.stmtKindSets[i] +
+                 " | expr_kinds=" + bundle.lowPlan.exprKindSets[i] +
+                 " | stmt_semantics=" + bundle.lowPlan.stmtSemanticSets[i] +
+                 " | expr_semantics=" + bundle.lowPlan.exprSemanticSets[i] +
                  " | exec_ops=" + intToStr(bundle.lowPlan.routineOpCounts[i]) +
                  " | exec_hash=" + bundle.lowPlan.routineOpHashes[i])
     return out

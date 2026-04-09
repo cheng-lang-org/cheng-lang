@@ -5,9 +5,11 @@ import std/rawbytes
 import std/bytes as bytes
 import std/buffer as buffer
 import compiler/frontend/v2_source_parser as parser
+import compiler/frontend/compiler_core_surface_ir_v2 as ccore
 import compiler/driver/compiler_core_pipeline_v2 as cpipe
 import compiler/driver/manifest_resolver_v2 as mresolve
 import compiler/semantic_facts/compiler_core_facts_v2 as cfacts
+import compiler/high_uir/compiler_core_graph_v2 as cgraph
 import compiler/low_uir/compiler_core_lowering_v2 as clow
 import compiler/machine/machine_pipeline_v2 as mpipeline
 import compiler/machine/target_contract as mtarget
@@ -33,6 +35,113 @@ fn hasExecOpKind(plan: clow.LowUirCompilerCorePlan, startIdx: int32, endIdx: int
 fn findLabelIndex(labels: str[], label: str): int32 =
     for i in 0..<labels.len:
         if labels[i] == label:
+            return i
+    return -1
+
+fn parseCompilerCoreProgramTextStrict(sourcePath: str, text: str): ccore.CompilerCoreProgram =
+    var parsed: parser.ParsedV2Source
+    if !parser.tryParseV2SourceText(sourcePath, text, parsed):
+        panic("v2 compiler core pipeline surface: failed to parse " + sourcePath)
+    return parsed.compilerCoreProgram
+
+fn buildCompilerCoreReferenceFixture(): cpipe.CompilerCorePipelineBundle =
+    let depText =
+        "module dep\n" +
+        "const buildVersion = \"dep\"\n" +
+        "type\n" +
+        "    ErrorCode = enum\n" +
+        "        Ok = 0\n" +
+        "        Fail = 1\n" +
+        "fn helper(text: str): str =\n" +
+        "    return text\n"
+    let mainText =
+        "module main\n" +
+        "import fixture/dep as dep\n" +
+        "const localVersion = \"main\"\n" +
+        "type\n" +
+        "    Pair = object\n" +
+        "        left: str\n" +
+        "fn readGlobal(): str =\n" +
+        "    return localVersion\n" +
+        "fn readField(pair: Pair): str =\n" +
+        "    return pair.left\n" +
+        "fn useRefs(argc: int32, values: str[]): str =\n" +
+        "    let local = argc\n" +
+        "    dep.helper(values[0])\n" +
+        "    local = local\n" +
+        "    if dep.Ok == 0:\n" +
+        "        pair.left\n" +
+        "    return dep.buildVersion\n"
+    var merged = ccore.newCompilerCoreProgram()
+    ccore.appendCompilerCoreProgram(merged,
+                                    parseCompilerCoreProgramTextStrict("src/fixture/dep.cheng", depText))
+    ccore.appendCompilerCoreProgram(merged,
+                                    parseCompilerCoreProgramTextStrict("src/fixture/main.cheng", mainText))
+    return cpipe.compileCompilerCoreProgram(merged)
+
+fn buildCompilerCoreRecordFixture(): cpipe.CompilerCorePipelineBundle =
+    let text =
+        "module record\n" +
+        "type\n" +
+        "    Pair = object\n" +
+        "        left: str\n" +
+        "        right: int32\n" +
+        "fn makePair(text: str): Pair =\n" +
+        "    return Pair(left: text, right: 7)\n" +
+        "fn clearPair(): Pair =\n" +
+        "    var out: Pair\n" +
+        "    out.left = \"x\"\n" +
+        "    return out\n" +
+        "fn readLeft(pair: Pair): str =\n" +
+        "    return pair.left\n"
+    return cpipe.compileCompilerCoreProgram(parseCompilerCoreProgramTextStrict("src/fixture/record.cheng", text))
+
+fn buildCompilerCoreGenericRecordFixture(): cpipe.CompilerCorePipelineBundle =
+    let text =
+        "module generic_record\n" +
+        "type\n" +
+        "    Maybe[T] = object\n" +
+        "        has: bool\n" +
+        "        value: T\n" +
+        "fn makeMaybe(value: int32): Maybe[int32] =\n" +
+        "    return Maybe[int32](has: true, value: value)\n"
+    return cpipe.compileCompilerCoreProgram(parseCompilerCoreProgramTextStrict("src/fixture/generic_record.cheng", text))
+
+fn findExprReferenceIndex(graph: cgraph.HighUirCompilerCoreGraph,
+                          exprKind: str,
+                          primaryText: str,
+                          referenceKind: str): int32 =
+    for i in 0..<graph.exprKinds.len:
+        if graph.exprKinds[i] == exprKind &&
+           graph.exprPrimaryTexts[i] == primaryText &&
+           graph.exprReferenceKinds[i] == referenceKind:
+            return i
+    return -1
+
+fn graphTypeConstructorText(graph: cgraph.HighUirCompilerCoreGraph, exprId: int32): str =
+    if exprId < 0:
+        return ""
+    if graph.exprKinds[exprId] == "name_ref" &&
+       graph.exprReferenceKinds[exprId] == "name" &&
+       (graph.exprReferenceTargetKinds[exprId] == "type" ||
+        graph.exprReferenceTargetKinds[exprId] == "type_param"):
+        return graph.exprPrimaryTexts[exprId]
+    if graph.exprKinds[exprId] == "index" && graph.exprChildCounts[exprId] == 2:
+        let baseExprId = graph.exprChildIds[graph.exprChildStarts[exprId]]
+        let argExprId = graph.exprChildIds[graph.exprChildStarts[exprId] + 1]
+        let baseText = graphTypeConstructorText(graph, baseExprId)
+        let argText = graphTypeConstructorText(graph, argExprId)
+        if len(baseText) <= 0 || len(argText) <= 0:
+            return ""
+        return baseText + "[" + argText + "]"
+    return ""
+
+fn findTypeConstructorCallExpr(graph: cgraph.HighUirCompilerCoreGraph, typeName: str): int32 =
+    for i in 0..<graph.exprKinds.len:
+        if graph.exprKinds[i] != "call" || graph.exprChildCounts[i] <= 0:
+            continue
+        let calleeExprId = graph.exprChildIds[graph.exprChildStarts[i]]
+        if graphTypeConstructorText(graph, calleeExprId) == typeName:
             return i
     return -1
 
@@ -87,22 +196,6 @@ fn directExternAbs(x: int32): int32
 fn directExternAbsWrap(x: int32): int32 =
     return directExternAbs(x)
 
-@importc("cheng_fread")
-fn directExternFread4(ptrArg: ptr, size: int64, count: int64, stream: ptr): int32
-
-fn directExternFread4Wrap(ptrArg: ptr, size: int64, count: int64, stream: ptr): int32 =
-    return directExternFread4(ptrArg, size, count, stream)
-
-@importc("free")
-fn directExternFree(p: ptr): void
-
-fn directExternFreeWrap(p: ptr): void =
-    directExternFree(p)
-
-fn directAliasVoidCallPtr(p: ptr): void =
-    let q = p
-    directExternFree(q)
-
 fn directVoid3(a: int32, b: int32, c: int32): void =
     return
 
@@ -121,10 +214,6 @@ fn directVoid2(a: int32, b: int32): void =
 
 fn directNestedVoidSecondArg(y: int32): void =
     directVoid2(directIdentityI32(7), y)
-
-fn directDropOnlyVoid(argc: int32, argv: ptr): void =
-    argc
-    argv
 
 fn directZeroBytesLocal(): Bytes =
     var out: Bytes
@@ -194,18 +283,6 @@ fn directNestedReadFileText(path: str): str =
 fn directNestedFileExists(path: str): bool =
     return directProbeFileExistsRaw(system.strToCStringTemp(path)) != 0
 
-fn directFallbackPrimary4(a: ptr, b: int32, c: int32, d: int32): ptr =
-    return nil
-
-fn directFallbackSecondary4(a: ptr, b: int32, c: int32, d: int32): ptr =
-    return a
-
-fn directFallbackPtr4(a: ptr, b: int32, c: int32, d: int32): ptr =
-    let found = directFallbackPrimary4(a, b, c, d)
-    if found != nil:
-        return found
-    return directFallbackSecondary4(a, b, c, d)
-
 fn directGetCurrentDirWrap(): str =
     return system.getCurrentDir()
 
@@ -231,6 +308,9 @@ fn main(): int32 =
     let image = oimg.writeObjImage(machine)
     let objFile = ofile.buildObjFile(machine)
     let artifact = rart.buildReleaseArtifact(sourcePath, "exe", target)
+    let refFixture = buildCompilerCoreReferenceFixture()
+    let recordFixture = buildCompilerCoreRecordFixture()
+    let genericRecordFixture = buildCompilerCoreGenericRecordFixture()
     assert(bundle.version == "v2.driver.compiler_core_pipeline.v1", "v2 compiler core pipeline version")
     assert(parsed.compilerCoreProgram.topLevelKinds.len > 0, "v2 compiler core entry parse count")
     assert(bundle.program.modules.len <= 1, "v2 compiler core module count bounded")
@@ -248,6 +328,23 @@ fn main(): int32 =
     assert(bundle.lowPlan.canonicalOps[bundle.lowPlan.labels.len - 1] == "compiler_fn_exec", "v2 compiler core main executable op")
     assert(bundle.lowPlan.returnTypeTexts[bundle.lowPlan.labels.len - 1] == "int32", "v2 compiler core main return type")
     assert(bundle.lowPlan.paramCounts[bundle.lowPlan.labels.len - 1] == 1, "v2 compiler core main param count")
+    assert(bundle.facts.stmtKindSets[bundle.facts.itemIds.len - 1] != "", "v2 compiler core main stmt kind set")
+    assert(bundle.facts.exprKindSets[bundle.facts.itemIds.len - 1] != "", "v2 compiler core main expr kind set")
+    assert(bundle.facts.stmtSemanticSets[bundle.facts.itemIds.len - 1] != "", "v2 compiler core main stmt semantic set")
+    assert(bundle.facts.exprSemanticSets[bundle.facts.itemIds.len - 1] != "", "v2 compiler core main expr semantic set")
+    assert(bundle.highGraph.paramNames.len == bundle.program.routineParams.len, "v2 compiler core high_uir param soa count")
+    assert(bundle.highGraph.localNames.len == bundle.program.locals.len, "v2 compiler core high_uir local soa count")
+    assert(bundle.highGraph.stmtKinds.len == bundle.program.stmts.len, "v2 compiler core high_uir stmt soa count")
+    assert(bundle.highGraph.exprKinds.len == bundle.program.exprs.len, "v2 compiler core high_uir expr soa count")
+    assert(bundle.highGraph.stmtDetailTexts.len == bundle.program.stmts.len, "v2 compiler core high_uir stmt detail count")
+    assert(bundle.highGraph.exprDetailTexts.len == bundle.program.exprs.len, "v2 compiler core high_uir expr detail count")
+    assert(bundle.highGraph.exprReferenceKinds.len == bundle.program.exprs.len, "v2 compiler core high_uir expr reference count")
+    assert(bundle.highGraph.exprChildArgNames.len == bundle.program.exprChildIds.len, "v2 compiler core high_uir expr child arg name count")
+    assert(bundle.lowPlan.stmtKindSets[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main low_uir stmt kind set")
+    assert(bundle.lowPlan.exprKindSets[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main low_uir expr kind set")
+    assert(bundle.lowPlan.stmtSemanticSets[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main low_uir stmt semantic set")
+    assert(bundle.lowPlan.exprSemanticSets[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main low_uir expr semantic set")
+    assert(bundle.lowPlan.exprReferenceKinds.len == bundle.program.exprs.len, "v2 compiler core main low_uir expr reference count")
     assert(bundle.lowPlan.routineOpCounts[bundle.lowPlan.labels.len - 1] > 0, "v2 compiler core main exec op count")
     assert(bundle.lowPlan.routineOpHashes[bundle.lowPlan.labels.len - 1] != "", "v2 compiler core main exec op hash")
     let mainOpStart = bundle.lowPlan.routineOpStarts[bundle.lowPlan.labels.len - 1]
@@ -258,6 +355,66 @@ fn main(): int32 =
     assert(cfacts.compilerCoreExecutableParamCount(bundle.facts) >= 1, "v2 compiler core executable param count")
     assert(cfacts.compilerCoreExecutableStmtCount(bundle.facts) >= 14, "v2 compiler core executable stmt count")
     assert(cfacts.compilerCoreExecutableExprCount(bundle.facts) >= 26, "v2 compiler core executable expr count")
+    assert(refFixture.facts.exprReferenceKinds.len == refFixture.program.exprs.len, "v2 compiler core fixture facts expr reference count")
+    assert(refFixture.highGraph.exprReferenceKinds.len == refFixture.program.exprs.len, "v2 compiler core fixture high expr reference count")
+    assert(refFixture.lowPlan.exprReferenceKinds.len == refFixture.program.exprs.len, "v2 compiler core fixture low expr reference count")
+    assert(recordFixture.highGraph.exprChildArgNames.len == recordFixture.program.exprChildIds.len, "v2 compiler core record fixture high arg name count")
+    let paramExprIdx = findExprReferenceIndex(refFixture.highGraph, "name_ref", "argc", "param")
+    assert(paramExprIdx >= 0, "v2 compiler core fixture param reference")
+    assert(refFixture.lowPlan.exprReferenceKinds[paramExprIdx] == "param", "v2 compiler core fixture low param reference")
+    let localExprIdx = findExprReferenceIndex(refFixture.highGraph, "name_ref", "local", "local")
+    assert(localExprIdx >= 0, "v2 compiler core fixture local reference")
+    let globalExprIdx = findExprReferenceIndex(refFixture.highGraph, "name_ref", "localVersion", "global")
+    assert(globalExprIdx >= 0, "v2 compiler core fixture global reference")
+    let importExprIdx = findExprReferenceIndex(refFixture.highGraph, "name_ref", "dep", "import_visible")
+    assert(importExprIdx >= 0, "v2 compiler core fixture import visible reference")
+    let importRoutineExprIdx = findExprReferenceIndex(refFixture.highGraph, "field", "helper", "import_field_routine")
+    assert(importRoutineExprIdx >= 0, "v2 compiler core fixture import field routine reference")
+    assert(refFixture.lowPlan.exprReferenceTexts[importRoutineExprIdx] == "dep.helper", "v2 compiler core fixture low import field routine text")
+    let importGlobalExprIdx = findExprReferenceIndex(refFixture.highGraph, "field", "buildVersion", "import_field_global")
+    assert(importGlobalExprIdx >= 0, "v2 compiler core fixture import field global reference")
+    let importEnumExprIdx = findExprReferenceIndex(refFixture.highGraph, "field", "Ok", "import_field_enum")
+    assert(importEnumExprIdx >= 0, "v2 compiler core fixture import field enum reference")
+    let fieldAccessExprIdx = findExprReferenceIndex(refFixture.highGraph, "field", "left", "field_access")
+    assert(fieldAccessExprIdx >= 0, "v2 compiler core fixture field access reference")
+    let indexExprIdx = findExprReferenceIndex(refFixture.highGraph, "index", "", "index_access")
+    assert(indexExprIdx >= 0, "v2 compiler core fixture index reference")
+    let callExprIdx = findExprReferenceIndex(refFixture.highGraph, "call", "", "call")
+    assert(callExprIdx >= 0, "v2 compiler core fixture call reference")
+    let useRefsIdx = findLabelIndex(refFixture.lowPlan.labels, "useRefs")
+    assert(useRefsIdx >= 0, "v2 compiler core fixture useRefs index")
+    assert(parser.findText(refFixture.lowPlan.exprSemanticSets[useRefsIdx], "field:import_field_routine") >= 0, "v2 compiler core fixture expr semantic import routine")
+    assert(parser.findText(refFixture.lowPlan.exprSemanticSets[useRefsIdx], "field:import_field_enum") >= 0, "v2 compiler core fixture expr semantic import enum")
+    assert(parser.findText(refFixture.lowPlan.exprSemanticSets[useRefsIdx], "index:index_access") >= 0, "v2 compiler core fixture expr semantic index")
+    let recordCtorExprIdx = findTypeConstructorCallExpr(recordFixture.highGraph, "Pair")
+    assert(recordCtorExprIdx >= 0, "v2 compiler core record fixture type constructor expr")
+    assert(recordFixture.highGraph.exprChildArgNames[recordFixture.highGraph.exprChildStarts[recordCtorExprIdx] + 1] == "left", "v2 compiler core record fixture first arg name")
+    assert(recordFixture.highGraph.exprChildArgNames[recordFixture.highGraph.exprChildStarts[recordCtorExprIdx] + 2] == "right", "v2 compiler core record fixture second arg name")
+    let makePairIdx = findLabelIndex(recordFixture.lowPlan.labels, "makePair")
+    assert(makePairIdx >= 0, "v2 compiler core record fixture makePair index")
+    let makePairOpStart = recordFixture.lowPlan.routineOpStarts[makePairIdx]
+    let makePairOpEnd = makePairOpStart + recordFixture.lowPlan.routineOpCounts[makePairIdx]
+    assert(hasExecOpKind(recordFixture.lowPlan, makePairOpStart, makePairOpEnd, "make_record"), "v2 compiler core record fixture make_record op")
+    let clearPairIdx = findLabelIndex(recordFixture.lowPlan.labels, "clearPair")
+    assert(clearPairIdx >= 0, "v2 compiler core record fixture clearPair index")
+    let clearPairOpStart = recordFixture.lowPlan.routineOpStarts[clearPairIdx]
+    let clearPairOpEnd = clearPairOpStart + recordFixture.lowPlan.routineOpCounts[clearPairIdx]
+    assert(hasExecOpKind(recordFixture.lowPlan, clearPairOpStart, clearPairOpEnd, "store_local_field"), "v2 compiler core record fixture store_local_field op")
+    let readLeftIdx = findLabelIndex(recordFixture.lowPlan.labels, "readLeft")
+    assert(readLeftIdx >= 0, "v2 compiler core record fixture readLeft index")
+    let readLeftOpStart = recordFixture.lowPlan.routineOpStarts[readLeftIdx]
+    let readLeftOpEnd = readLeftOpStart + recordFixture.lowPlan.routineOpCounts[readLeftIdx]
+    assert(hasExecOpKind(recordFixture.lowPlan, readLeftOpStart, readLeftOpEnd, "load_field"), "v2 compiler core record fixture load_field op")
+    let genericCtorExprIdx = findTypeConstructorCallExpr(genericRecordFixture.highGraph, "Maybe[int32]")
+    assert(genericCtorExprIdx >= 0, "v2 compiler core generic record fixture type constructor expr")
+    let genericTypeParamExprIdx = findExprReferenceIndex(genericRecordFixture.highGraph, "name_ref", "T", "name")
+    assert(genericTypeParamExprIdx >= 0, "v2 compiler core generic record fixture type param expr")
+    assert(genericRecordFixture.highGraph.exprReferenceTargetKinds[genericTypeParamExprIdx] == "type_param", "v2 compiler core generic record fixture type param target kind")
+    let makeMaybeIdx = findLabelIndex(genericRecordFixture.lowPlan.labels, "makeMaybe")
+    assert(makeMaybeIdx >= 0, "v2 compiler core generic record fixture makeMaybe index")
+    let makeMaybeOpStart = genericRecordFixture.lowPlan.routineOpStarts[makeMaybeIdx]
+    let makeMaybeOpEnd = makeMaybeOpStart + genericRecordFixture.lowPlan.routineOpCounts[makeMaybeIdx]
+    assert(hasExecOpKind(genericRecordFixture.lowPlan, makeMaybeOpStart, makeMaybeOpEnd, "make_record"), "v2 compiler core generic record fixture make_record op")
     assert(manifest.packageId == "pkg://cheng/v2", "v2 compiler core manifest package id")
     assert(manifest.filePaths.len > 0, "v2 compiler core manifest file count")
     assert(hasManifestPath(manifest, "v2/cheng-package.toml"), "v2 compiler core manifest package root")
@@ -344,21 +501,6 @@ fn main(): int32 =
     assert(machine.metadataOperandModes[directExternAbsMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern abs payload mode")
     assert(machine.callSymbolNames[directExternAbsMachineIdx] == mpipeline.machineLibcSymbolName(target, "abs"), "v2 compiler core machine direct extern abs call symbol")
     assert(machine.instructionWordHex[directExternAbsMachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern abs words")
-    let directExternFread4MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directExternFread4Wrap")
-    assert(directExternFread4MachineIdx >= 0, "v2 compiler core machine direct extern fread4 index")
-    assert(machine.metadataOperandModes[directExternFread4MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern fread4 payload mode")
-    assert(machine.callSymbolNames[directExternFread4MachineIdx] == mpipeline.machineLibcSymbolName(target, "cheng_fread"), "v2 compiler core machine direct extern fread4 call symbol")
-    assert(machine.instructionWordHex[directExternFread4MachineIdx] == "a9bf7bfd;910003fd;94000000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern fread4 words")
-    let directExternFreeMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directExternFreeWrap")
-    assert(directExternFreeMachineIdx >= 0, "v2 compiler core machine direct extern free index")
-    assert(machine.metadataOperandModes[directExternFreeMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct extern free payload mode")
-    assert(machine.callSymbolNames[directExternFreeMachineIdx] == mpipeline.machineLibcSymbolName(target, "free"), "v2 compiler core machine direct extern free call symbol")
-    assert(machine.instructionWordHex[directExternFreeMachineIdx] == "a9bf7bfd;910003fd;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct extern free words")
-    let directAliasVoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directAliasVoidCallPtr")
-    assert(directAliasVoidMachineIdx >= 0, "v2 compiler core machine direct alias void call index")
-    assert(machine.metadataOperandModes[directAliasVoidMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct alias void call payload mode")
-    assert(machine.callSymbolNames[directAliasVoidMachineIdx] == mpipeline.machineLibcSymbolName(target, "free"), "v2 compiler core machine direct alias void call symbol")
-    assert(machine.instructionWordHex[directAliasVoidMachineIdx] == "a9bf7bfd;910003fd;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct alias void call words")
     let directCall3VoidMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directCall3VoidMixed")
     assert(directCall3VoidMachineIdx >= 0, "v2 compiler core machine direct call3 void index")
     assert(machine.metadataOperandModes[directCall3VoidMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct call3 void payload mode")
@@ -375,9 +517,6 @@ fn main(): int32 =
     assert(parser.findText(machine.callSymbolNames[directNestedVoidSecondArgMachineIdx], ";") >= 0, "v2 compiler core machine direct nested void second arg call symbols present")
     assert(machine.functionRelocCounts[directNestedVoidSecondArgMachineIdx] == 2, "v2 compiler core machine direct nested void second arg reloc count")
     assert(machine.instructionWordHex[directNestedVoidSecondArgMachineIdx] == "a9bf7bfd;910003fd;d10043ff;aa0003e1;f90003e1;528000e0;94000000;f94003e1;910043ff;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct nested void second arg words")
-    let dropOnlyMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directDropOnlyVoid")
-    assert(dropOnlyMachineIdx >= 0, "v2 compiler core machine direct drop only index")
-    assert(machine.metadataOperandModes[dropOnlyMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct drop only payload mode")
     let nestedReadMachineIdx = findLabelIndex(bundle.lowPlan.labels, "directNestedReadFileText")
     assert(nestedReadMachineIdx >= 0, "v2 compiler core machine direct nested read text index")
     assert(machine.metadataOperandModes[nestedReadMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct nested read text payload mode")
@@ -509,10 +648,6 @@ fn main(): int32 =
     assert(machine.localPayloadTexts[directLiteralStrVoidMachineIdx] == "v2.literal.arg", "v2 compiler core machine direct literal str void payload text")
     assert(machine.functionRelocCounts[directLiteralStrVoidMachineIdx] == 3, "v2 compiler core machine direct literal str void reloc count")
     assert(machine.instructionWordHex[directLiteralStrVoidMachineIdx] == "a9bf7bfd;910003fd;90000000;91000000;528001c1;94000000;52800000;a8c17bfd;d65f03c0", "v2 compiler core machine direct literal str void words")
-    let directFallbackPtr4MachineIdx = findLabelIndex(bundle.lowPlan.labels, "directFallbackPtr4")
-    assert(directFallbackPtr4MachineIdx >= 0, "v2 compiler core machine direct fallback ptr4 index")
-    assert(machine.metadataOperandModes[directFallbackPtr4MachineIdx] == "direct_exec_no_payload", "v2 compiler core machine direct fallback ptr4 payload mode")
-    assert(strings.contains(machine.callSymbolNames[directFallbackPtr4MachineIdx], "_cheng_v2_compiler_core_compiler_fn_exec_"), "v2 compiler core machine direct fallback ptr4 call symbols present")
     let argCountMachineIdx = findLabelIndex(bundle.lowPlan.labels, "argCount")
     assert(argCountMachineIdx >= 0, "v2 compiler core machine argCount index")
     assert(machine.metadataOperandModes[argCountMachineIdx] == "direct_exec_no_payload", "v2 compiler core machine argCount payload mode")
@@ -570,12 +705,13 @@ fn main(): int32 =
     assert(artifact.runtimeUnresolvedCount == 0, "v2 compiler core runtime unresolved count")
     assert(artifact.nativeLinkClosureOk, "v2 compiler core native link closure")
     assert(!artifact.systemLinkReady, "v2 compiler core system link honest blocker")
-    assert(artifact.systemLinkMissingReasonCount == 1, "v2 compiler core system link missing reasons")
+    assert(artifact.systemLinkMissingReasonCount == 2, "v2 compiler core system link missing reasons")
     assert(hasCompileKeyLine(artifact, "obj_file_version=v2.obj_file.v1"), "v2 compiler core compile key obj file version")
     assert(hasCompileKeyLine(artifact, "system_link_plan_version=v2.system_link_plan.v1"), "v2 compiler core compile key system link version")
     assert(hasCompileKeyLine(artifact, "system_link.provider.0.module=runtime/compiler_core_runtime_v2"), "v2 compiler core compile key compiler provider")
     assert(hasCompileKeyLine(artifact, "system_link.provider.1.module=runtime/core_runtime_v2"), "v2 compiler core compile key core provider")
-    assert(hasCompileKeyLine(artifact, "system_link.missing_reason.0=system_link_execution_missing"), "v2 compiler core compile key system link blocker")
+    assert(hasCompileKeyLine(artifact, "system_link.missing_reason.0=program_entry_exec_plan_missing"), "v2 compiler core compile key entry exec blocker")
+    assert(hasCompileKeyLine(artifact, "system_link.missing_reason.1=program_local_payload_exec_plan_missing"), "v2 compiler core compile key local payload exec blocker")
     assert(hasCompileKeyLine(artifact, "native_link.provider.0=runtime/compiler_core_runtime_v2"), "v2 compiler core compile key compiler runtime provider")
     assert(hasCompileKeyLine(artifact, "native_link_runtime_target_count=" + intToStr(artifact.runtimeTargetCount)), "v2 compiler core compile key runtime target count")
     assert(hasCompileKeyLine(artifact, "compiler_core.item." + intToStr(bundle.lowPlan.labels.len - 1) + ".op=compiler_fn_exec"), "v2 compiler core compile key executable op")

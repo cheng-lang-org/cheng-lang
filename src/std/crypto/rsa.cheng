@@ -320,12 +320,14 @@ fn rsaBigPublicKeyFromBytes(data: Bytes): Result[RsaBigPublicKey] =
         return Err[RsaBigPublicKey]("rsa: exponent out of range")
     return Ok[RsaBigPublicKey](RsaBigPublicKey(n: nBig, e: eBig, modBits: modBits, modLen: modLen))
 
-fn rsaBigPrivateKeyFromBytes(data: Bytes): Result[RsaBigPrivateKey] =
-    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
-    if IsErr(seqRes):
-        return Err[RsaBigPrivateKey](Error(seqRes))
+fn rsaIsRsaEncryptionOid(oidValue: Bytes): bool =
+    let expectRes: Result[Bytes] = rsaHexDecode("2a864886f70d010101")
+    if IsErr(expectRes):
+        return false
+    return bytesEqual(oidValue, Value(expectRes))
+
+fn rsaBigPrivateKeyFromPkcs1Value(seqValue: Bytes): Result[RsaBigPrivateKey] =
     var offset: int32 = 0
-    let seqValue: Bytes = Value(seqRes).value
     let vRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
     if IsErr(vRes):
         return Err[RsaBigPrivateKey](Error(vRes))
@@ -370,6 +372,56 @@ fn rsaBigPrivateKeyFromBytes(data: Bytes): Result[RsaBigPrivateKey] =
     if bigCmp(dBig, one) <= 0:
         return Err[RsaBigPrivateKey]("rsa: invalid private exponent")
     return Ok[RsaBigPrivateKey](RsaBigPrivateKey(n: nBig, d: dBig, modBits: modBits, modLen: modLen))
+
+fn rsaBigPrivateKeyFromPkcs8Value(seqValue: Bytes): Result[RsaBigPrivateKey] =
+    var offset: int32 = 0
+    let vRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, offset)
+    if IsErr(vRes):
+        return Err[RsaBigPrivateKey](Error(vRes))
+    let vIntRes: Result[int64] = bytesToInt64(Value(vRes).value)
+    if IsErr(vIntRes) || (Value(vIntRes) != 0 && Value(vIntRes) != 1):
+        return Err[RsaBigPrivateKey]("rsa: invalid pkcs8 version")
+    offset = Value(vRes).next
+    let algRes: Result[Asn1ValueNext] = asn1DecodeSequence(seqValue, offset)
+    if IsErr(algRes):
+        return Err[RsaBigPrivateKey](Error(algRes))
+    let algValue: Bytes = Value(algRes).value
+    let oidTlvRes: Result[Asn1TagValueNext] = asn1DecodeTlv(algValue, 0)
+    if IsErr(oidTlvRes):
+        return Err[RsaBigPrivateKey](Error(oidTlvRes))
+    let oidTlv = Value(oidTlvRes)
+    if oidTlv.tag != asn1TagOid || ! rsaIsRsaEncryptionOid(oidTlv.value):
+        return Err[RsaBigPrivateKey]("rsa: unsupported pkcs8 algorithm")
+    if oidTlv.next < bytesLen(algValue):
+        let paramRes: Result[Asn1TagValueNext] = asn1DecodeTlv(algValue, oidTlv.next)
+        if IsErr(paramRes):
+            return Err[RsaBigPrivateKey](Error(paramRes))
+        if Value(paramRes).tag != asn1TagNull:
+            return Err[RsaBigPrivateKey]("rsa: unsupported pkcs8 params")
+    offset = Value(algRes).next
+    let keyRes: Result[Asn1TagValueNext] = asn1DecodeTlv(seqValue, offset)
+    if IsErr(keyRes):
+        return Err[RsaBigPrivateKey](Error(keyRes))
+    if Value(keyRes).tag != asn1TagOctetString:
+        return Err[RsaBigPrivateKey]("rsa: pkcs8 private key ! octet string")
+    return rsaBigPrivateKeyFromBytes(Value(keyRes).value)
+
+fn rsaBigPrivateKeyFromBytes(data: Bytes): Result[RsaBigPrivateKey] =
+    let seqRes: Result[Asn1ValueNext] = asn1DecodeSequence(data, 0)
+    if IsErr(seqRes):
+        return Err[RsaBigPrivateKey](Error(seqRes))
+    let seqValue: Bytes = Value(seqRes).value
+    let vRes: Result[Asn1ValueNext] = asn1DecodeInteger(seqValue, 0)
+    if IsErr(vRes):
+        return Err[RsaBigPrivateKey](Error(vRes))
+    let nextRes: Result[Asn1TagValueNext] = asn1DecodeTlv(seqValue, Value(vRes).next)
+    if IsErr(nextRes):
+        return Err[RsaBigPrivateKey](Error(nextRes))
+    if Value(nextRes).tag == asn1TagInteger:
+        return rsaBigPrivateKeyFromPkcs1Value(seqValue)
+    if Value(nextRes).tag == asn1TagSequence:
+        return rsaBigPrivateKeyFromPkcs8Value(seqValue)
+    return Err[RsaBigPrivateKey]("rsa: unsupported private key format")
 
 fn rsaBigDecrypt(pub: RsaBigPublicKey, sig: Bytes): Result[Bytes] =
     if bytesLen(sig) <= 0:

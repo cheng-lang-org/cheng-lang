@@ -164,8 +164,22 @@ fn cheng_errno(): int32
 fn cheng_strerror(err: int32): cstring
 @importc("close")
 fn cheng_close_fd(fd: int32): int32
+@importc("socket")
+fn cheng_socket_fd(domain: int32, typ: int32, protocol: int32): int32
 @importc("fcntl")
 fn cheng_fcntl(fd: int32, cmd: int32, arg: int32): int32
+@importc("bind")
+fn cheng_bind_fd(fd: int32, addr: ptr, addrLen: int32): int32
+@importc("sendto")
+fn cheng_sendto_fd(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: int32): int32
+@importc("recvfrom")
+fn cheng_recvfrom_fd(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: ptr): int32
+@importc("cheng_recvfrom_fd_ex")
+fn cheng_recvfrom_fd_ex(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: ptr, outErr: var int32): int32
+@importc("cheng_recvfrom_fd_ex")
+fn cheng_recvfrom_fd_addr_ex(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: var int32, outErr: var int32): int32
+@importc("setsockopt")
+fn cheng_setsockopt_fd(fd: int32, level: int32, optName: int32, optValue: ptr, optLen: int32): int32
 @importc("inet_pton")
 fn cheng_inet_pton(family: int32, src: cstring, dst: ptr): int32
 @importc("inet_ntop")
@@ -182,11 +196,14 @@ fn udpErrText(errCode: int32): str =
 fn udpCloseFd(fd: int32): int32 =
     return cheng_close_fd(fd)
 
+fn udpOpenSocket(domain: int32, typ: int32, protocol: int32): int32 =
+    return cheng_socket_fd(domain, typ, protocol)
+
 fn udpFcntl(fd: int32, cmd: int32, arg: int32): int32 =
     return cheng_fcntl(fd, cmd, arg)
 
 fn udpInetPton(family: int32, src: str, dst: Bytes): int32 =
-    if len(src) <= 0 || bytesLen(dst) <= 0:
+    if strings.len(src) <= 0 || bytesLen(dst) <= 0:
         return 0
     return cheng_inet_pton(family, strToCStringTemp(src), dst.data)
 
@@ -205,17 +222,36 @@ fn udpInetNtop(family: int32, src: Bytes): str =
 fn udpBindFd(fd: int32, addr: Bytes, addrLen: int32): int32 =
     if fd < 0 || addrLen <= 0:
         return -1
-    return bind(fd, addr.data, addrLen)
+    return cheng_bind_fd(fd, addr.data, addrLen)
 
 fn udpSendToFd(fd: int32, payload: Bytes, flags: int32, addr: Bytes, addrLen: int32): int32 =
     if fd < 0 || addrLen <= 0 || bytesLen(payload) <= 0:
         return -1
-    return sendto(fd, payload.data, bytesLen(payload), flags, addr.data, addrLen)
+    return cheng_sendto_fd(fd, payload.data, bytesLen(payload), flags, addr.data, addrLen)
+
+fn udpRecvFromFd(fd: int32, payload: Bytes, flags: int32): int32 =
+    if fd < 0 || bytesLen(payload) <= 0:
+        return -1
+    return cheng_recvfrom_fd(fd, payload.data, bytesLen(payload), flags, nil, nil)
+
+fn udpRecvFromFdEx(fd: int32, payload: Bytes, flags: int32, outErr: var int32): int32 =
+    outErr = 0
+    if fd < 0 || bytesLen(payload) <= 0:
+        return -1
+    return cheng_recvfrom_fd_ex(fd, payload.data, bytesLen(payload), flags, nil, nil, outErr)
+
+fn udpRecvFromFdAddrEx(fd: int32, payload: Bytes, flags: int32, outAddr: Bytes, outAddrLen: var int32, outErr: var int32): int32 =
+    outErr = 0
+    if fd < 0 || bytesLen(payload) <= 0 || bytesLen(outAddr) <= 0:
+        outAddrLen = 0
+        return -1
+    outAddrLen = bytesLen(outAddr)
+    return cheng_recvfrom_fd_addr_ex(fd, payload.data, bytesLen(payload), flags, outAddr.data, outAddrLen, outErr)
 
 fn udpSetSockOptIntFd(fd: int32, level: int32, optName: int32, optBytes: Bytes): int32 =
     if fd < 0 || bytesLen(optBytes) <= 0:
         return -1
-    return setsockopt(fd, level, optName, optBytes.data, bytesLen(optBytes))
+    return cheng_setsockopt_fd(fd, level, optName, optBytes.data, bytesLen(optBytes))
 
 fn setIoMeterHook(hook: IoMeterHook) =
     ioMeterHasHook = (hook != nil)
@@ -282,13 +318,11 @@ fn readAllInto(f: File, out: var str): bool =
             buffer.appendBytes(outBuf, bytesSlice(chunk, 0, got))
         ioMeterReport(ioRead, int64(got))
     let outText: str = bytesToString(buffer.toBytes(outBuf))
-    let finalLen: int32 = len(outText)
+    let finalLen: int32 = strings.len(outText)
     osDebugFileReadKV("final.lenRead", finalLen)
-    osDebugFileReadKV("final.outLen", len(outText))
-    if finalLen > 0:
-        osDebugFileReadKV("final.out0", ord(outText[0]))
-    if len(outText) > 0:
-        memScopeEscape(outText)
+    osDebugFileReadKV("final.outLen", strings.len(outText))
+    if strings.len(outText) > 0:
+        memScopeEscape(strDataPtr(outText))
     osSetStr(out, outText)
     return true
 
@@ -299,7 +333,7 @@ fn readAll(f: File): str =
     return out
 
 fn write(f: File, s: str) =
-    let wrote: int32 = c_fwrite(strDataPtr(s), 1, len(s), f)
+    let wrote: int32 = c_fwrite(strDataPtr(s), 1, strings.len(s), f)
     ioMeterReport(ioWrite, int64(wrote))
 
 fn writeLine(f: File, s: str) =
@@ -331,11 +365,11 @@ fn os_newSeq_WalkDirEntry(len: int32, cap: int32): seq_WalkDirEntry =
         seqs.reserve(out, cap)
     if len > 0:
         seqs.setLen(out, len)
-    return seq_WalkDirEntry(len: out.len, cap: out.cap, buffer: out.buffer)
-fn os_get_WalkDirEntry(seqInst: seq_WalkDirEntry, i: int32): WalkDirEntry =
+    return out
+fn os_get_WalkDirEntry(seqInst: str[], i: int32): WalkDirEntry =
     return seqInst[i]
 fn walkDirEntryKind(entry: str): PathComponent =
-    if len(entry) <= 0:
+    if strings.len(entry) <= 0:
         return PathComponent(4)
     let code: char = entry[0]
     if code == '0':
@@ -348,15 +382,15 @@ fn walkDirEntryKind(entry: str): PathComponent =
         return PathComponent(3)
     return PathComponent(4)
 fn walkDirEntryPath(entry: str): str =
-    if len(entry) < 2:
+    if strings.len(entry) < 2:
         return ""
     if entry[1] != '|':
         return ""
-    return strings.sliceBytes(entry, 2, len(entry) - 2)
+    return strings.sliceBytes(entry, 2, strings.len(entry) - 2)
 fn pathComponentDir(): PathComponent =
     return PathComponent(1)
-fn os_addPtr_WalkDirEntry(seqInst: var seq_WalkDirEntry, val: WalkDirEntry) =
-    seqs.add(seqInst, val)
+fn os_addPtr_WalkDirEntry(seqInst: var str[], val: WalkDirEntry) =
+    add(seqInst, val)
 
 fn fileExists(path: str): bool =
     cheng_file_exists(strToCStringTemp(path)) != 0
@@ -379,7 +413,7 @@ fn removeFile(path: str): bool =
 fn renameFile(oldPath: str, newPath: str): bool =
     c_rename(strToCStringTemp(oldPath), strToCStringTemp(newPath)) == 0
 fn removeDir(path: str) =
-    if len(path) > 0:
+    if strings.len(path) > 0:
         let _ = c_rmdir(strToCStringTemp(path))
 fn getEnvImpl(key: str, defaultValue: str): str =
     let v: cstring = c_getenv(strToCStringTemp(key))
@@ -402,36 +436,31 @@ fn commandLineParams(): str[] =
             i = i + 1
     return osReturnStrSeq(out)
 fn quoteShell(value: str): str =
-    if len(value) == 0 || value[0] == char(0):
+    if strings.len(value) == 0 || value[0] == char(0):
         return "''"
     return "'" + value + "'"
 
-fn osJoinPathRaw(a: str, b: str, sep: char): str =
-    if sep == char(0):
-        return a + b
-    return a + charToStr(sep) + b
-
 fn joinPath(a: str, b: str): str =
-    if len(a) == 0 || a[0] == char(0):
+    if strings.len(a) == 0 || a[0] == char(0):
         return b
-    if len(b) == 0 || b[0] == char(0):
+    if strings.len(b) == 0 || b[0] == char(0):
         return a
-    let aLen: int32 = len a
+    let aLen: int32 = strings.len(a)
     let last: char = a[aLen - 1]
     if last == '/' || last == '\\':
-        return osJoinPathRaw(a, b, char(0))
-    return osJoinPathRaw(a, b, '/')
+        return a + b
+    return a + "/" + b
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
 fn osSliceStr(text: str, start: int32, stop: int32): str =
-    if len(text) == 0:
+    if strings.len(text) == 0:
         return ""
     var s: int32 = start
     var e: int32 = stop
     if s < 0:
         s = 0
-    let n: int32 = len text
+    let n: int32 = strings.len(text)
     if e < s || s >= n:
         return ""
     if e >= n:
@@ -439,7 +468,7 @@ fn osSliceStr(text: str, start: int32, stop: int32): str =
     let count: int32 = e - s + 1
     return strings.sliceBytes(text, s, count)
 fn absolutePath(path: str): str =
-    if len(path) == 0 || path[0] == char(0):
+    if strings.len(path) == 0 || path[0] == char(0):
         return getCurrentDir()
     let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
@@ -448,7 +477,7 @@ fn absolutePath(path: str): str =
         return path
     return joinPath(getCurrentDir(), path)
 fn isAbsolute(path: str): bool =
-    if len(path) == 0 || path[0] == char(0):
+    if strings.len(path) == 0 || path[0] == char(0):
         return false
     let c0: char = path[0]
     if c0 == '/' || c0 == '\\':
@@ -460,10 +489,10 @@ fn parentDir(path: str): str =
     let parts: SplitFileResult = splitFile path
     return parts.dir
 fn relativePath(path: str, base: str): str =
-    if len(base) == 0 || base[0] == char(0):
+    if strings.len(base) == 0 || base[0] == char(0):
         return path
-    let baseLen: int32 = len base
-    let pathLen: int32 = len path
+    let baseLen: int32 = strings.len(base)
+    let pathLen: int32 = strings.len(path)
     if pathLen >= baseLen && osSliceStr(path, 0, baseLen - 1) == base:
         var idx: int32 = baseLen
         if idx < pathLen && (path[idx] == '/' || path[idx] == '\\'):
@@ -478,7 +507,7 @@ fn splitFile(path: str): SplitFileResult =
     osSetEmpty(dir0)
     osSetEmpty(name0)
     osSetEmpty(ext0)
-    let pathLen: int32 = len path
+    let pathLen: int32 = strings.len(path)
     if pathLen == 0:
         return SplitFileResult(dir: dir0, name: name0, ext: ext0)
     var lastSep: int32 = -1
@@ -530,15 +559,15 @@ fn copyDir(src: str, dest: str) =
     src
     dest
 fn makeWalkDirEntry(kind: PathComponent, path: str): str =
-    return charToStr(char(48 + int32(kind))) + "|" + path
-fn walkDir(path: str): seq_WalkDirEntry =
-    var out: seq_WalkDirEntry = os_newSeq_WalkDirEntry(0, 0)
-    if len(path) == 0 || path[0] == char(0) || ! dirExists path:
+    return intToStr(int32(kind)) + "|" + path
+fn walkDir(path: str): str[] =
+    var out: str[]
+    if strings.len(path) == 0 || path[0] == char(0) || ! dirExists path:
         return out
     let listText: str = strFromCStringBorrow(cheng_list_dir_raw(strToCStringTemp(path)))
-    if len(listText) == 0 || listText[0] == char(0):
+    if strings.len(listText) == 0 || listText[0] == char(0):
         return out
-    let total: int32 = len listText
+    let total: int32 = strings.len(listText)
     var start: int32 = 0
     for i in 0..total:
         var endHit: bool = false
@@ -552,14 +581,15 @@ fn walkDir(path: str): seq_WalkDirEntry =
                 endIdx = endIdx - 1
             if endIdx >= start:
                 let name: str = osSliceStr(listText, start, endIdx)
-                if len(name) > 0 && name[0] != char(0):
+                if strings.len(name) > 0 && name[0] != char(0):
                     let fullPath: str = joinPath(path, name)
                     var kind: PathComponent = PathComponent(4)
                     if dirExists fullPath:
                         kind = PathComponent(1)
                     elif fileExists fullPath:
                         kind = PathComponent(0)
-                    os_addPtr_WalkDirEntry(out, makeWalkDirEntry(kind, fullPath))
+                    var entryOwned: str = makeWalkDirEntry(kind, fullPath)
+                    add(out, entryOwned)
             start = i + 1
     return out
 
@@ -576,13 +606,13 @@ fn walkDirRecImpl(path: str, out: var str[]) =
             add(out, pathOwned)
 fn walkDirRec(path: str): str[] =
     var out: str[]
-    if len path == 0 || ! dirExists path:
+    if strings.len(path) == 0 || ! dirExists path:
         return osReturnStrSeq(out)
     walkDirRecImpl(path, out)
     return osReturnStrSeq(out)
 fn extractFilename(path: str): str =
     let parts: SplitFileResult = splitFile path
-    if len parts.ext > 0:
+    if strings.len(parts.ext) > 0:
         let name0: str = parts.name
         let ext0: str = parts.ext
         return name0 + ext0
@@ -597,7 +627,7 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
     var output0: str
     osSetEmpty(output0)
     var exitCode0: int32 = -1
-    if len command == 0:
+    if strings.len(command) == 0:
         return ExecCmdResult(output: output0, exitCode: exitCode0)
     var merge: int32 = 0
     let mask: uint64 = processOptionMask(poStdErrToStdOut)
@@ -617,7 +647,7 @@ fn execFileCapture(filePath: str, argv: str[], envOverrides: str[],
     var output0: str
     osSetEmpty(output0)
     var exitCode0: int32 = -1
-    if len filePath == 0:
+    if strings.len(filePath) == 0:
         return ExecCmdResult(output: output0, exitCode: exitCode0)
     var merge: int32 = 0
     if mergeStderr:
@@ -633,7 +663,7 @@ fn execFileCapture(filePath: str, argv: str[], envOverrides: str[],
 
 fn execFileStatus(filePath: str, argv: str[], envOverrides: str[],
                   workingDir: str, timeoutSec: int32): int32 =
-    if len filePath == 0:
+    if strings.len(filePath) == 0:
         return -1
     let rc64: int64 = cheng_exec_file_status_raw(strToCStringTemp(filePath), ptr(argv), ptr(envOverrides),
                                                  strToCStringTemp(workingDir), timeoutSec)
@@ -668,7 +698,7 @@ fn fdReadWait(fd: int32, maxBytes: int32, timeoutMs: int32): tuple[str, bool] =
     let text: str = strFromCStringBorrow(cheng_fd_read_wait_raw(fd, maxBytes, timeoutMs, eofCode))
     return (text, eofCode != 0)
 fn ptyWrite(fd: int32, data: str): int32 =
-    return cheng_pty_write(fd, strToCStringTemp(data), len data)
+    return cheng_pty_write(fd, strToCStringTemp(data), strings.len(data))
 fn ptyClose(fd: int32) =
     cheng_pty_close fd
 fn ptyWait(pid: int64): tuple[int32, int32] =
@@ -699,20 +729,19 @@ fn readFileSizedInto(path: str, size: int32, out: var str): bool =
         osSetEmpty(out)
         return true
     let outText: str = bytesToString(raw)
-    if len(outText) > 0:
-        memScopeEscape(outText)
+    if strings.len(outText) > 0:
+        memScopeEscape(strDataPtr(outText))
     osSetStr(out, outText)
     return true
 
 fn readFileInto(path: str, out: var str): bool =
     if osDebugFileReadEnabled():
         osDebugFileRead("readFileInto path=" + path)
-    var fastText: str
-    driver_c_read_file_all_bridge_into(strToCStringTemp(path), fastText)
-    if len(fastText) > 0:
-        memScopeEscape(strDataPtr(fastText))
-        osSetStr(out, fastText)
-        return true
+    let knownSize64: int64 = fileSize(path)
+    if knownSize64 >= 0 && knownSize64 <= int64(0x7fffffff):
+        let sizedOk: bool = readFileSizedInto(path, int32(knownSize64), out)
+        if sizedOk:
+            return true
     let f: File = openRead(path)
     if f == nil:
         if osDebugFileReadEnabled():
@@ -724,23 +753,59 @@ fn readFileInto(path: str, out: var str): bool =
     return ok
 
 fn readFile(path: str): str =
-    var out: str
-    osSetEmpty(out)
-    let _ok: bool = readFileInto(path, out)
-    return out
+    let knownSize64: int64 = fileSize(path)
+    if knownSize64 >= 0 && knownSize64 <= int64(0x7fffffff):
+        let f: File = openRead(path)
+        if f == nil:
+            return ""
+        let size: int32 = int32(knownSize64)
+        let raw: Bytes = bytesAlloc(size)
+        if bytesLen(raw) != size:
+            c_fclose f
+            return ""
+        let size64: int64 = int64(size)
+        var totalGot64: int64 = 0
+        while totalGot64 < size64:
+            let want: int32 = int32(size64 - totalGot64)
+            let dst: Bytes = bytesSliceView(raw, int32(totalGot64), want)
+            let got: int32 = c_fread(dst.data, 1, want, f)
+            if got <= 0:
+                break
+            totalGot64 = totalGot64 + int64(got)
+            ioMeterReport(ioRead, int64(got))
+        c_fclose f
+        if int32(totalGot64) != size:
+            return ""
+        return bytesToString(raw)
+    let f: File = openRead(path)
+    if f == nil:
+        return ""
+    var total: Bytes = emptyBytes()
+    while true:
+        let chunk: Bytes = bytesAlloc(256)
+        let got: int32 = c_fread(chunk.data, 1, bytesLen(chunk), f)
+        if got <= 0:
+            break
+        if got >= bytesLen(chunk):
+            total = bytesConcat(total, chunk)
+        else:
+            total = bytesConcat(total, bytesSlice(chunk, 0, got))
+        ioMeterReport(ioRead, int64(got))
+    c_fclose f
+    return bytesToString(total)
 fn writeFile(path: str, content: str) =
-    if len(path) > 0:
+    if strings.len(path) > 0:
         let filePath: cstring = strToCStringTemp(path)
         if filePath != nil:
             let f: File = c_fopen(filePath, "wb")
             if f != nil:
-                if len(content) > 0:
-                    let wrote: int32 = c_fwrite(strDataPtr(content), 1, len(content), f)
+                if strings.len(content) > 0:
+                    let wrote: int32 = c_fwrite(strDataPtr(content), 1, strings.len(content), f)
                     ioMeterReport(ioWrite, int64(wrote))
                 c_fclose(f)
 
 fn writeFileBytes(path: str, bytes: uint8[]) =
-    if len(path) > 0:
+    if strings.len(path) > 0:
         let filePath: cstring = strToCStringTemp(path)
         if filePath != nil:
             let f: File = c_fopen(filePath, "wb")

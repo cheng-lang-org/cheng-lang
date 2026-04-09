@@ -224,6 +224,42 @@ ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStr
   return default_value;
 }
 
+int32_t driver_c_read_flag_value_bridge(ChengStrBridge key, ChengStrBridge *out_value) {
+  int32_t argc = __cheng_rt_paramCount();
+  int32_t i = 0;
+  if (out_value == NULL) {
+    return 0;
+  }
+  *out_value = (ChengStrBridge){0};
+  if (argc <= 1) {
+    return 0;
+  }
+  for (i = 1; i < argc; ++i) {
+    const char *raw = __cheng_rt_paramStr(i);
+    const char *inline_value = NULL;
+    if (raw == NULL) {
+      continue;
+    }
+    if (driver_c_flag_inline_value(raw, key, &inline_value)) {
+      *out_value = cheng_str_bridge_from_ptr_flags_local(inline_value, 0);
+      return 1;
+    }
+    if (driver_c_flag_key_matches(raw, key)) {
+      const char *next_raw = "";
+      if (i + 1 >= argc) {
+        return 0;
+      }
+      next_raw = __cheng_rt_paramStr(i + 1);
+      if (next_raw == NULL) {
+        next_raw = "";
+      }
+      *out_value = cheng_str_bridge_from_ptr_flags_local(next_raw, 0);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value) {
   ChengStrBridge raw = driver_c_read_flag_or_default_bridge(key, (ChengStrBridge){0});
   char *end = NULL;

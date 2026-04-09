@@ -1,0 +1,45 @@
+import std/result
+import std/os
+import std/rawbytes as rawbytes
+import std/crypto/sha256 as sha256
+import cheng/quic/chain/types
+
+fn chainStoreCreateDirAll(path: str) =
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        chainStoreCreateDirAll(parent)
+    if ! os.dirExists(path):
+        os.createDir(path)
+
+fn initChainStore(root: str): ChainStoreConfig =
+    let rootAbs = os.absolutePath(root)
+    let blocksDir = os.joinPath(rootAbs, "blocks")
+    chainStoreCreateDirAll(rootAbs)
+    chainStoreCreateDirAll(blocksDir)
+    return ChainStoreConfig(root: rootAbs, blocksDir: blocksDir)
+
+fn chainCidFromText(text: str): str =
+    return rawbytes.bytesToHex(sha256.sha256Digest(rawbytes.bytesFromString(text)))
+
+fn chainStoreBlockPath(store: ChainStoreConfig, cidText: str): str =
+    return os.joinPath(store.blocksDir, cidText)
+
+fn chainStorePutText(store: ChainStoreConfig, text: str): Result[str] =
+    let cidText = chainCidFromText(text)
+    if len(cidText) == 0:
+        return Err[str]("chain store: empty cid")
+    chainStoreCreateDirAll(store.blocksDir)
+    let outPath = chainStoreBlockPath(store, cidText)
+    if ! os.fileExists(outPath):
+        os.writeFile(outPath, text)
+        if ! os.fileExists(outPath):
+            return Err[str]("chain store: write failed")
+    return Ok[str](cidText)
+
+fn chainStoreGetText(store: ChainStoreConfig, cidText: str): str =
+    let blockPath = chainStoreBlockPath(store, cidText)
+    if ! os.fileExists(blockPath):
+        return ""
+    return os.readFile(blockPath)

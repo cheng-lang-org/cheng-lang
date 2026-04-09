@@ -28,13 +28,18 @@ fn initMsQuicPacket(number: int64): MsQuicPacket =
     out.framesCount = 0
     return out
 
-fn msquicPacketSize(p: MsQuicPacket): int32 =
+fn msquicPacketReset(out: var MsQuicPacket, number: int64) =
+    out.number = number
+    out.ackEliciting = false
+    out.framesCount = 0
+
+fn msquicPacketSize(p: var MsQuicPacket): int32 =
     var size: int32 = 16
     for i in 0..<p.framesCount:
         size = size + msquicFrameSize(p.frames[i])
     return size
 
-fn msquicPacketAckEliciting(p: MsQuicPacket): bool =
+fn msquicPacketAckEliciting(p: var MsQuicPacket): bool =
     return p.ackEliciting
 
 fn msquicPacketAddFrame(p: var MsQuicPacket, frame: MsQuicFrame): Result[bool] =
@@ -52,27 +57,27 @@ fn msquicPacketAddFrame(p: var MsQuicPacket, frame: MsQuicFrame): Result[bool] =
 fn msquicFrameDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecoded] =
     let kindRes: Result[VarintDecoded] = decodeUVarint(data, offset)
     if IsErr(kindRes):
-        return Err[MsQuicFrameDecoded](Error(kindRes))
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes))
     let kindDec: VarintDecoded = Value(kindRes)
 
     let streamRes: Result[VarintDecoded] = decodeUVarint(data, kindDec.next)
     if IsErr(streamRes):
-        return Err[MsQuicFrameDecoded](Error(streamRes))
+        return Err[MsQuicFrameDecoded](ErrorText(streamRes))
     let streamDec: VarintDecoded = Value(streamRes)
 
     let offRes: Result[VarintDecoded] = decodeUVarint(data, streamDec.next)
     if IsErr(offRes):
-        return Err[MsQuicFrameDecoded](Error(offRes))
+        return Err[MsQuicFrameDecoded](ErrorText(offRes))
     let offDec: VarintDecoded = Value(offRes)
 
     let valRes: Result[VarintDecoded] = decodeUVarint(data, offDec.next)
     if IsErr(valRes):
-        return Err[MsQuicFrameDecoded](Error(valRes))
+        return Err[MsQuicFrameDecoded](ErrorText(valRes))
     let valDec: VarintDecoded = Value(valRes)
 
     let lenRes: Result[VarintDecoded] = decodeUVarint(data, valDec.next)
     if IsErr(lenRes):
-        return Err[MsQuicFrameDecoded](Error(lenRes))
+        return Err[MsQuicFrameDecoded](ErrorText(lenRes))
     let lenDec: VarintDecoded = Value(lenRes)
 
     let dataLen: int32 = int32(lenDec.value)
@@ -96,12 +101,12 @@ fn msquicFrameDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecoded] =
 fn msquicPacketDecode(data: Bytes): Result[MsQuicPacket] =
     let numRes: Result[VarintDecoded] = decodeUVarint(data, 0)
     if IsErr(numRes):
-        return Err[MsQuicPacket](Error(numRes))
+        return Err[MsQuicPacket](ErrorText(numRes))
     let numDec: VarintDecoded = Value(numRes)
 
     let countRes: Result[VarintDecoded] = decodeUVarint(data, numDec.next)
     if IsErr(countRes):
-        return Err[MsQuicPacket](Error(countRes))
+        return Err[MsQuicPacket](ErrorText(countRes))
     let countDec: VarintDecoded = Value(countRes)
 
     let count: int32 = int32(countDec.value)
@@ -113,58 +118,67 @@ fn msquicPacketDecode(data: Bytes): Result[MsQuicPacket] =
     for i in 0..<count:
         let frameRes: Result[MsQuicFrameDecoded] = msquicFrameDecode(data, offset)
         if IsErr(frameRes):
-            return Err[MsQuicPacket](Error(frameRes))
+            return Err[MsQuicPacket](ErrorText(frameRes))
         let decoded: MsQuicFrameDecoded = Value(frameRes)
         let addRes: Result[bool] = msquicPacketAddFrame(pkt, decoded.frame)
         if IsErr(addRes):
-            return Err[MsQuicPacket](Error(addRes))
+            return Err[MsQuicPacket](ErrorText(addRes))
         offset = decoded.next
     return Ok[MsQuicPacket](pkt)
 
 fn msquicFrameEncode(frame: MsQuicFrame): Bytes =
     var buf: ByteBuffer = newByteBuffer()
-    appendBytes(buf, encodeUVarint(int64(frame.kind)))
-    appendBytes(buf, encodeUVarint(frame.streamId))
-    appendBytes(buf, encodeUVarint(frame.offset))
-    appendBytes(buf, encodeUVarint(frame.value))
+    let kindBytes: Bytes = encodeUVarint(int64(frame.kind))
+    appendBytes(buf, kindBytes)
+    let streamIdBytes: Bytes = encodeUVarint(frame.streamId)
+    appendBytes(buf, streamIdBytes)
+    let offsetBytes: Bytes = encodeUVarint(frame.offset)
+    appendBytes(buf, offsetBytes)
+    let valueBytes: Bytes = encodeUVarint(frame.value)
+    appendBytes(buf, valueBytes)
     let dataLen: int64 = int64(bytesLen(frame.data))
-    appendBytes(buf, encodeUVarint(dataLen))
+    let dataLenBytes: Bytes = encodeUVarint(dataLen)
+    appendBytes(buf, dataLenBytes)
     if dataLen > 0:
-        appendBytes(buf, frame.data)
+        let frameData: Bytes = frame.data
+        appendBytes(buf, frameData)
     return toBytes(buf)
 
 fn msquicPacketEncode(p: MsQuicPacket): Bytes =
     var buf: ByteBuffer = newByteBuffer()
-    appendBytes(buf, encodeUVarint(p.number))
-    appendBytes(buf, encodeUVarint(int64(p.framesCount)))
+    let packetNumberBytes: Bytes = encodeUVarint(p.number)
+    appendBytes(buf, packetNumberBytes)
+    let frameCountBytes: Bytes = encodeUVarint(int64(p.framesCount))
+    appendBytes(buf, frameCountBytes)
     for i in 0..<p.framesCount:
-        appendBytes(buf, msquicFrameEncode(p.frames[i]))
+        let frameBytes: Bytes = msquicFrameEncode(p.frames[i])
+        appendBytes(buf, frameBytes)
     return toBytes(buf)
 
 fn msquicFramePayloadDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecoded] =
     let kindRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, offset)
     if IsErr(kindRes):
-        return Err[MsQuicFrameDecoded](Error(kindRes))
+        return Err[MsQuicFrameDecoded](ErrorText(kindRes))
     let kindDec: QuicVarIntDecoded = Value(kindRes)
 
     let streamRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, kindDec.next)
     if IsErr(streamRes):
-        return Err[MsQuicFrameDecoded](Error(streamRes))
+        return Err[MsQuicFrameDecoded](ErrorText(streamRes))
     let streamDec: QuicVarIntDecoded = Value(streamRes)
 
     let offRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, streamDec.next)
     if IsErr(offRes):
-        return Err[MsQuicFrameDecoded](Error(offRes))
+        return Err[MsQuicFrameDecoded](ErrorText(offRes))
     let offDec: QuicVarIntDecoded = Value(offRes)
 
     let valRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, offDec.next)
     if IsErr(valRes):
-        return Err[MsQuicFrameDecoded](Error(valRes))
+        return Err[MsQuicFrameDecoded](ErrorText(valRes))
     let valDec: QuicVarIntDecoded = Value(valRes)
 
     let lenRes: Result[QuicVarIntDecoded] = quicVarIntDecode(data, valDec.next)
     if IsErr(lenRes):
-        return Err[MsQuicFrameDecoded](Error(lenRes))
+        return Err[MsQuicFrameDecoded](ErrorText(lenRes))
     let lenDec: QuicVarIntDecoded = Value(lenRes)
 
     let dataLen: int32 = int32(lenDec.value)
@@ -188,22 +202,29 @@ fn msquicFramePayloadDecode(data: Bytes, offset: int32): Result[MsQuicFrameDecod
     return Ok[MsQuicFrameDecoded](MsQuicFrameDecoded(frame: frame, next: endPos))
 
 fn msquicPacketPayloadDecode(payload: Bytes, packetNumber: int64): Result[MsQuicPacket] =
+    var out: MsQuicPacket
+    let decodeRes: Result[bool] = msquicPacketPayloadDecodeInto(out, payload, packetNumber)
+    if IsErr(decodeRes):
+        return Err[MsQuicPacket](ErrorText(decodeRes))
+    return Ok[MsQuicPacket](out)
+
+fn msquicPacketPayloadDecodeInto(out: var MsQuicPacket, payload: Bytes, packetNumber: int64): Result[bool] =
     if packetNumber < 0:
-        return Err[MsQuicPacket]("msquic payload: negative packet number")
-    var pkt: MsQuicPacket = initMsQuicPacket(packetNumber)
+        return Err[bool]("msquic payload: negative packet number")
+    msquicPacketReset(out, packetNumber)
     var offset: int32 = 0
     while offset < bytesLen(payload):
         let frameRes: Result[MsQuicFrameDecoded] = msquicFramePayloadDecode(payload, offset)
         if IsErr(frameRes):
-            return Err[MsQuicPacket](Error(frameRes))
+            return Err[bool](ErrorText(frameRes))
         let decoded: MsQuicFrameDecoded = Value(frameRes)
-        let addRes: Result[bool] = msquicPacketAddFrame(pkt, decoded.frame)
+        let addRes: Result[bool] = msquicPacketAddFrame(out, decoded.frame)
         if IsErr(addRes):
-            return Err[MsQuicPacket](Error(addRes))
+            return Err[bool](ErrorText(addRes))
         offset = decoded.next
-    return Ok[MsQuicPacket](pkt)
+    return Ok[bool](true)
 
-fn msquicPacketPayloadEncode(p: MsQuicPacket): Bytes =
+fn msquicPacketPayloadEncode(p: var MsQuicPacket): Bytes =
     var buf: ByteBuffer = newByteBuffer()
     for i in 0..<p.framesCount:
         quicVarIntAppend(buf, int64(p.frames[i].kind))
@@ -212,5 +233,6 @@ fn msquicPacketPayloadEncode(p: MsQuicPacket): Bytes =
         quicVarIntAppend(buf, p.frames[i].value)
         quicVarIntAppend(buf, int64(bytesLen(p.frames[i].data)))
         if bytesLen(p.frames[i].data) > 0:
-            appendBytes(buf, p.frames[i].data)
+            let frameData: Bytes = p.frames[i].data
+            appendBytes(buf, frameData)
     return toBytes(buf)

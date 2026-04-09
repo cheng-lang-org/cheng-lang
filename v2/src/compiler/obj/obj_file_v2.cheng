@@ -54,24 +54,24 @@ fn alignTo(value: int32, alignPow2: int32): int32 =
     return rem == 0 ? value : value + (align - rem)
 
 fn appendByte(out: var int32[], value: int32) =
-    add(out, value & 255)
+    seqs.add(out, value & 255)
 
 fn appendZeroes(out: var int32[], count: int32) =
     for _ in 0..<count:
-        add(out, 0)
+        seqs.add(out, 0)
 
 fn appendAscii(out: var int32[], text: str) =
     for i in 0..<len(text):
-        add(out, int32(text[i]))
+        seqs.add(out, int32(text[i]))
 
 fn appendAsciiZ(out: var int32[], text: str) =
     appendAscii(out, text)
-    add(out, 0)
+    seqs.add(out, 0)
 
 fn appendFixedAscii(out: var int32[], text: str, width: int32) =
     let n = len(text) < width ? len(text) else: width
     for i in 0..<n:
-        add(out, int32(text[i]))
+        seqs.add(out, int32(text[i]))
     appendZeroes(out, width - n)
 
 fn appendLe16(out: var int32[], value: int32) =
@@ -122,7 +122,7 @@ fn bytesToUint8Seq(bytes: int32[]): uint8[] =
     var out: uint8[]
     out = []
     for i in 0..<bytes.len:
-        add(out, uint8(bytes[i] & 255))
+        seqs.add(out, uint8(bytes[i] & 255))
     return out
 
 fn appendWordHexLe(out: var int32[], wordHex: str) =
@@ -162,7 +162,7 @@ fn buildCStringBytes(image: oimg.ObjImageBundle): int32[] =
 fn buildStrtabBytes(image: oimg.ObjImageBundle): int32[] =
     var out: int32[]
     out = []
-    add(out, 0)
+    seqs.add(out, 0)
     for i in 0..<image.symbolNames.len:
         appendAsciiZ(out, image.symbolNames[i])
     return out
@@ -171,9 +171,9 @@ fn buildStrtabBytesForOrder(image: oimg.ObjImageBundle, order: int32[]): StringT
     var out: StringTableBundle
     out.bytes = []
     out.offsets = []
-    add(out.bytes, 0)
+    seqs.add(out.bytes, 0)
     for i in 0..<order.len:
-        add(out.offsets, out.bytes.len)
+        seqs.add(out.offsets, out.bytes.len)
         appendAsciiZ(out.bytes, image.symbolNames[order[i]])
     return out
 
@@ -185,15 +185,15 @@ fn buildMachOSymbolOrder(image: oimg.ObjImageBundle): MachOSymbolOrder =
     out.externCount = 0
     for i in 0..<image.symbolNames.len:
         if image.symbolBindings[i] == "local":
-            add(out.order, i)
+            seqs.add(out.order, i)
             out.localCount = out.localCount + 1
     for i in 0..<image.symbolNames.len:
         if image.symbolBindings[i] == "global":
-            add(out.order, i)
+            seqs.add(out.order, i)
             out.globalCount = out.globalCount + 1
     for i in 0..<image.symbolNames.len:
         if image.symbolBindings[i] == "extern":
-            add(out.order, i)
+            seqs.add(out.order, i)
             out.externCount = out.externCount + 1
     return out
 
@@ -202,7 +202,7 @@ fn stringTableOffsets(image: oimg.ObjImageBundle): int32[] =
     out = []
     var offset: int32 = 1
     for i in 0..<image.symbolNames.len:
-        add(out, offset)
+        seqs.add(out, offset)
         offset = offset + len(image.symbolNames[i]) + 1
     return out
 
@@ -240,7 +240,7 @@ fn machoRelocType(kind: str): int32 =
         return 3
     if kind == "ARM64_RELOC_PAGEOFF12":
         return 4
-    panic("v2 obj file: unsupported macho relocation kind " + kind)
+    system.panicStr("v2 obj file: unsupported macho relocation kind " + kind)
 
 fn machoRelocPcrel(kind: str): bool =
     return kind == "ARM64_RELOC_BRANCH26" || kind == "ARM64_RELOC_PAGE21"
@@ -251,7 +251,7 @@ fn buildMachORelocBytes(image: oimg.ObjImageBundle, order: int32[]): int32[] =
     for i in 0..<image.relocationOffsets.len:
         let symbolIndex = machOSymbolIndex(order, image, image.relocationSymbols[i])
         if symbolIndex < 0:
-            panic("v2 obj file: missing macho relocation symbol " + image.relocationSymbols[i])
+            system.panicStr("v2 obj file: missing macho relocation symbol " + image.relocationSymbols[i])
         appendLe32(out, image.relocationOffsets[i])
         let packed = int64(symbolIndex) |
                      (int64(if machoRelocPcrel(image.relocationKinds[i]): 1 else: 0) << 24) |
@@ -287,22 +287,22 @@ fn buildElfRelocBytes(image: oimg.ObjImageBundle): int32[] =
                 symbolIndex = j + 1
                 break
         if symbolIndex < 0:
-            panic("v2 obj file: missing elf relocation symbol " + image.relocationSymbols[i])
+            system.panicStr("v2 obj file: missing elf relocation symbol " + image.relocationSymbols[i])
         let relocType = image.relocationKinds[i] == "R_AARCH64_CALL26" ? 283 :
                         image.relocationKinds[i] == "R_AARCH64_ADR_PREL_PG_HI21" ? 275 :
                         image.relocationKinds[i] == "R_AARCH64_ADD_ABS_LO12_NC" ? 277 :
-                        panic("v2 obj file: unsupported elf relocation kind " + image.relocationKinds[i])
+                        system.panicStr("v2 obj file: unsupported elf relocation kind " + image.relocationKinds[i])
         appendLe64(out, image.relocationOffsets[i])
         appendLe64(out, (int64(symbolIndex) << 32) | relocType)
         appendLe64(out, 0)
     return out
 
 fn addRegion(out: var ObjFileBundle, name: str, offset: int32, data: int32[], alignPow2: int32) =
-    add(out.regionNames, name)
-    add(out.regionOffsets, offset)
-    add(out.regionSizes, data.len)
-    add(out.regionAlignPow2, alignPow2)
-    add(out.regionDataCids, bytesCid(data))
+    seqs.add(out.regionNames, name)
+    seqs.add(out.regionOffsets, offset)
+    seqs.add(out.regionSizes, data.len)
+    seqs.add(out.regionAlignPow2, alignPow2)
+    seqs.add(out.regionDataCids, bytesCid(data))
 
 fn appendMachOSection64(out: var int32[],
                         sectname: str,
@@ -422,14 +422,16 @@ fn buildObjFile(bundle: mpipeline.MachineModuleBundle): ObjFileBundle =
     let machoStrtab = buildStrtabBytesForOrder(image, machoOrder.order)
     let stringOffsets = stringTableOffsets(image)
     let strtabBytes = if image.format == "macho": machoStrtab.bytes else: buildStrtabBytes(image)
-    let symtabBytes = if image.format == "macho":
-        buildMachOSymtabBytes(image, machoOrder.order, machoStrtab.offsets)
+    var symtabBytes: int32[]
+    if image.format == "macho":
+        symtabBytes = buildMachOSymtabBytes(image, machoOrder.order, machoStrtab.offsets)
     else:
-        buildElfSymtabBytes(image, stringOffsets)
-    let relocBytes = if image.format == "macho":
-        buildMachORelocBytes(image, machoOrder.order)
+        symtabBytes = buildElfSymtabBytes(image, stringOffsets)
+    var relocBytes: int32[]
+    if image.format == "macho":
+        relocBytes = buildMachORelocBytes(image, machoOrder.order)
     else:
-        buildElfRelocBytes(image)
+        relocBytes = buildElfRelocBytes(image)
     var out: ObjFileBundle
     out.version = objFileVersion()
     out.moduleKind = image.moduleKind
@@ -440,30 +442,32 @@ fn buildObjFile(bundle: mpipeline.MachineModuleBundle): ObjFileBundle =
     out.regionSizes = []
     out.regionAlignPow2 = []
     out.regionDataCids = []
-    let textOffset = image.format == "macho" ?
-        (32 + (72 + (cstringBytes.len > 0 ? 2 else: 1) * 80) + 24 + 24 + 80) :
-        64
+    var textOffset: int32 = 64
+    if image.format == "macho":
+        let cstringSections = cstringBytes.len > 0 ? 2 else: 1
+        textOffset = 32 + (72 + cstringSections * 80) + 24 + 24 + 80
     let cstringOffset = alignTo(textOffset + textBytes.len, 0)
     let relocOffset = alignTo(cstringOffset + cstringBytes.len, 3)
     let symtabOffset = alignTo(relocOffset + relocBytes.len, 3)
     let strtabOffset = alignTo(symtabOffset + symtabBytes.len, 0)
-    let headerBytes = if image.format == "macho":
-        buildMachOHeaderBytes(bundle.targetTriple,
-                              textOffset,
-                              cstringOffset,
-                              relocOffset,
-                              symtabOffset,
-                              strtabOffset,
-                              textBytes.len,
-                              cstringBytes.len,
-                              image.relocationOffsets.len,
-                              image.symbolNames.len,
-                              strtabBytes.len,
-                              machoOrder.localCount,
-                              machoOrder.globalCount,
-                              machoOrder.externCount)
+    var headerBytes: int32[]
+    if image.format == "macho":
+        headerBytes = buildMachOHeaderBytes(bundle.targetTriple,
+                                            textOffset,
+                                            cstringOffset,
+                                            relocOffset,
+                                            symtabOffset,
+                                            strtabOffset,
+                                            textBytes.len,
+                                            cstringBytes.len,
+                                            image.relocationOffsets.len,
+                                            image.symbolNames.len,
+                                            strtabBytes.len,
+                                            machoOrder.localCount,
+                                            machoOrder.globalCount,
+                                            machoOrder.externCount)
     else:
-        []
+        headerBytes = []
     out.headerByteCount = image.format == "macho" ? headerBytes.len else: 64
     addRegion(out, "header", 0, image.format == "macho" ? headerBytes else: [], 3)
     addRegion(out, "text", textOffset, textBytes, 2)
@@ -475,45 +479,45 @@ fn buildObjFile(bundle: mpipeline.MachineModuleBundle): ObjFileBundle =
     fullBytes = []
     if image.format == "macho":
         for i in 0..<headerBytes.len:
-            add(fullBytes, headerBytes[i])
+            seqs.add(fullBytes, headerBytes[i])
     else:
         appendZeroes(fullBytes, out.headerByteCount)
     appendAlign(fullBytes, 2)
     for i in 0..<textBytes.len:
-        add(fullBytes, textBytes[i])
+        seqs.add(fullBytes, textBytes[i])
     appendAlign(fullBytes, 0)
     for i in 0..<cstringBytes.len:
-        add(fullBytes, cstringBytes[i])
+        seqs.add(fullBytes, cstringBytes[i])
     appendAlign(fullBytes, 3)
     for i in 0..<relocBytes.len:
-        add(fullBytes, relocBytes[i])
+        seqs.add(fullBytes, relocBytes[i])
     appendAlign(fullBytes, 3)
     for i in 0..<symtabBytes.len:
-        add(fullBytes, symtabBytes[i])
+        seqs.add(fullBytes, symtabBytes[i])
     appendAlign(fullBytes, 0)
     for i in 0..<strtabBytes.len:
-        add(fullBytes, strtabBytes[i])
+        seqs.add(fullBytes, strtabBytes[i])
     out.fileByteCount = fullBytes.len
     out.filePrefixHex = bytesPrefixHex(fullBytes, 32)
     out.fileBytes = bytesToUint8Seq(fullBytes)
     out.fileCid = bytesCid(fullBytes)
     var lines: str[]
     lines = []
-    add(lines, "obj_file_version=" + out.version)
-    add(lines, "module_kind=" + out.moduleKind)
-    add(lines, "target=" + out.targetTriple)
-    add(lines, "format=" + out.format)
-    add(lines, "header_byte_count=" + intToStr(out.headerByteCount))
-    add(lines, "region_count=" + intToStr(out.regionNames.len))
+    seqs.add(lines, "obj_file_version=" + out.version)
+    seqs.add(lines, "module_kind=" + out.moduleKind)
+    seqs.add(lines, "target=" + out.targetTriple)
+    seqs.add(lines, "format=" + out.format)
+    seqs.add(lines, "header_byte_count=" + intToStr(out.headerByteCount))
+    seqs.add(lines, "region_count=" + intToStr(out.regionNames.len))
     for i in 0..<out.regionNames.len:
-        add(lines, "region." + intToStr(i) + ".name=" + out.regionNames[i])
-        add(lines, "region." + intToStr(i) + ".offset=" + intToStr(out.regionOffsets[i]))
-        add(lines, "region." + intToStr(i) + ".size=" + intToStr(out.regionSizes[i]))
-        add(lines, "region." + intToStr(i) + ".align_pow2=" + intToStr(out.regionAlignPow2[i]))
-        add(lines, "region." + intToStr(i) + ".cid=" + out.regionDataCids[i])
-    add(lines, "file_byte_count=" + intToStr(out.fileByteCount))
-    add(lines, "file_prefix_hex=" + out.filePrefixHex)
-    add(lines, "file_cid=" + out.fileCid)
+        seqs.add(lines, "region." + intToStr(i) + ".name=" + out.regionNames[i])
+        seqs.add(lines, "region." + intToStr(i) + ".offset=" + intToStr(out.regionOffsets[i]))
+        seqs.add(lines, "region." + intToStr(i) + ".size=" + intToStr(out.regionSizes[i]))
+        seqs.add(lines, "region." + intToStr(i) + ".align_pow2=" + intToStr(out.regionAlignPow2[i]))
+        seqs.add(lines, "region." + intToStr(i) + ".cid=" + out.regionDataCids[i])
+    seqs.add(lines, "file_byte_count=" + intToStr(out.fileByteCount))
+    seqs.add(lines, "file_prefix_hex=" + out.filePrefixHex)
+    seqs.add(lines, "file_cid=" + out.fileCid)
     out.fileText = oimg.joinWithSep(lines, "\n")
     return out
 

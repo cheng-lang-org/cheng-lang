@@ -6,10 +6,13 @@ import std/crypto/rand
 import std/crypto/sha256
 import std/crypto/hkdf
 import std/crypto/bigint
+import std/crypto/p256_fixed as pfix
 const
     p256ScalarSize: int32 = 32
     p256PublicSize: int32 = 65
     p256SignatureSize: int32 = 64
+    p256GeneratorComb6Width: int32 = 6
+    p256GeneratorComb6Depth: int32 = 43
     p256HexP = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
     p256HexN = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
     p256HexB = "5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b"
@@ -21,6 +24,24 @@ type
         x: BigInt
         y: BigInt
         inf: bool
+
+    EcPointJacobian =
+        x: BigInt
+        y: BigInt
+        z: BigInt
+        inf: bool
+
+    EcPointFixed =
+        x: pfix.P256Fixed
+        y: pfix.P256Fixed
+        inf: bool
+
+    EcPointJacobianFixed =
+        x: pfix.P256Fixed
+        y: pfix.P256Fixed
+        z: pfix.P256Fixed
+        inf: bool
+
 
     EcPublicKey =
         point: EcPoint
@@ -46,6 +67,502 @@ var
     p256PMinus2: BigInt
     p256NMinus2: BigInt
     p256NHalf: BigInt
+    p256PCtxFixed: pfix.P256FixedMontgomeryContext
+    p256NCtxFixed: pfix.P256FixedMontgomeryContext
+    p256PMinus2Fixed: pfix.P256Fixed
+    p256NMinus2Fixed: pfix.P256Fixed
+    p256GWindow4: EcPointFixed[16]
+    p256GWindow4Neg: EcPointFixed[16]
+    p256GWindow4J: EcPointJacobianFixed[16]
+    p256GWindow4NegJ: EcPointJacobianFixed[16]
+    p256GComb6: EcPointFixed[64]
+    p256GComb6J: EcPointJacobianFixed[64]
+
+fn p256ConstBig8(count: int32,
+                 l0: int32,
+                 l1: int32,
+                 l2: int32,
+                 l3: int32,
+                 l4: int32,
+                 l5: int32,
+                 l6: int32,
+                 l7: int32): BigInt =
+    var out: BigInt
+    out.count = count
+    out.limbs[0] = l0
+    out.limbs[1] = l1
+    out.limbs[2] = l2
+    out.limbs[3] = l3
+    out.limbs[4] = l4
+    out.limbs[5] = l5
+    out.limbs[6] = l6
+    out.limbs[7] = l7
+    return out
+
+fn p256ConstFixed8(l0: int32,
+                   l1: int32,
+                   l2: int32,
+                   l3: int32,
+                   l4: int32,
+                   l5: int32,
+                   l6: int32,
+                   l7: int32): pfix.P256Fixed =
+    var out: pfix.P256Fixed
+    out.limbs[0] = l0
+    out.limbs[1] = l1
+    out.limbs[2] = l2
+    out.limbs[3] = l3
+    out.limbs[4] = l4
+    out.limbs[5] = l5
+    out.limbs[6] = l6
+    out.limbs[7] = l7
+    return out
+
+fn p256ConstP(): BigInt =
+    return p256ConstBig8(8, -1, -1, -1, 0, 0, 0, 1, -1)
+
+fn p256ConstN(): BigInt =
+    return p256ConstBig8(8, -60611247, -205927742, -1491624316, -1125713235, -1, -1, 0, -1)
+
+fn p256ConstB(): BigInt =
+    return p256ConstBig8(8, 668098635, 1003371582, -866930442, 1696401072, 1989707452, -1276396203, -1439001625, 1522939352)
+
+fn p256ConstGx(): BigInt =
+    return p256ConstBig8(8, -661077354, -190760635, 770388896, 1996717441, 1671708914, -121837851, -517193145, 1796723186)
+
+fn p256ConstGy(): BigInt =
+    return p256ConstBig8(8, 935285237, -877248408, 1798397646, 734933847, 2081398294, -1897403574, -31817829, 1340293858)
+
+fn p256InitGeneratorWindow4Table() =
+    p256GWindow4[0] = pointInfinityFixed()
+    p256GWindow4[1] = EcPointFixed(
+        x: p256ConstFixed8(413733948, 2045194452, 1609414145, 1975162364, 2002920720, 2046522155, -1523100218, 412114806),
+        y: p256ConstFixed8(-829073910, -571321513, -1172708260, -1958037276, -584977627, -756513144, 629693829, -2056126696),
+        inf: false)
+    p256GWindow4[2] = EcPointFixed(
+        x: p256ConstFixed8(282973773, -2063579436, -1540128131, -1435835455, -1928032039, 1931609347, 1036991035, -155503900),
+        y: p256ConstFixed8(1639899557, 792086739, -349999112, 355260363, -1845219906, 430504718, 173771323, 2026207057),
+        inf: false)
+    p256GWindow4[3] = EcPointFixed(
+        x: p256ConstFixed8(1324073255, -5488752, 142443003, -1339557814, -2016691048, 1722644445, -1224772482, 647195199),
+        y: p256ConstFixed8(-914118677, -1337172961, 140639770, 1480476589, 439282062, 2021787697, -444085241, -705664471),
+        inf: false)
+    p256GWindow4[4] = EcPointFixed(
+        x: p256ConstFixed8(1183944140, 1957737741, -970735245, 1179690733, -401601806, 215657644, 1102059371, 1467179765),
+        y: p256ConstFixed8(-456414298, 764867148, -86576057, 392332401, -438447570, 1802254046, 1281013859, -2068755399),
+        inf: false)
+    p256GWindow4[5] = EcPointFixed(
+        x: p256ConstFixed8(-1000578571, -1105491282, -1799793795, -1863555942, -797523444, -1810057814, -1996151864, -922249723),
+        y: p256ConstFixed8(-407220464, -349136054, -437549013, 1942317295, 2121932648, 893430151, 768731414, 1939895995),
+        inf: false)
+    p256GWindow4[6] = EcPointFixed(
+        x: p256ConstFixed8(1048012362, 1077495607, 879554110, 1437496399, 1528275885, -720726502, 1411462771, 319245145),
+        y: p256ConstFixed8(-747117493, -1814863328, -1375791947, 698100563, -278683887, -198912948, 1242036063, -1530293907),
+        inf: false)
+    p256GWindow4[7] = EcPointFixed(
+        x: p256ConstFixed8(-1609090225, 122041678, -767819529, 735183379, 203668232, -197219659, -1022214653, 330977561),
+        y: p256ConstFixed8(1062968653, 675794992, 1571191773, 1732440818, 2009678229, -275563556, 1847855207, -353511147),
+        inf: false)
+    p256GWindow4[8] = EcPointFixed(
+        x: p256ConstFixed8(-1801869425, 670125265, 1872442453, 1177204165, -265487253, -1886326742, -1301994739, -1218213602),
+        y: p256ConstFixed8(1395476855, -174218327, -811681259, 568537725, -1100956688, 305953668, 1996939126, 1458311922),
+        inf: false)
+    p256GWindow4[9] = EcPointFixed(
+        x: p256ConstFixed8(642654440, 1976135311, 1504159809, -1410940947, 1154018048, 750820356, -255532693, -530894720),
+        y: p256ConstFixed8(-1537264876, 515340154, -832748061, 1454341101, -2001653990, 728629658, -41721957, 140925389),
+        inf: false)
+    p256GWindow4[10] = EcPointFixed(
+        x: p256ConstFixed8(-1648222520, 739826641, 265257273, -1728477558, 1210387273, 1937583318, 615727759, -866006713),
+        y: p256ConstFixed8(-2132959626, 204161144, 943701512, -1002796655, 2006705618, 1602039141, -348435787, 2020710996),
+        inf: false)
+    p256GWindow4[11] = EcPointFixed(
+        x: p256ConstFixed8(1648747524, -360897014, 1853874144, -1646000235, -1918100811, 536060949, 1687982195, 1047564529),
+        y: p256ConstFixed8(731139720, 443975009, -444636728, 621777822, 514679869, 202222217, -517621618, 1754464291),
+        inf: false)
+    p256GWindow4[12] = EcPointFixed(
+        x: p256ConstFixed8(-764840088, 79108775, -902538701, -1411457291, -298370978, 604623517, -880549546, 1323425655),
+        y: p256ConstFixed8(482040643, 212603609, -896969161, 386847478, -1965134490, 673352954, 1394838218, 2146794645),
+        inf: false)
+    p256GWindow4[13] = EcPointFixed(
+        x: p256ConstFixed8(1261360905, -859560605, -2056269043, 238380905, 1436456977, -1128475585, 1402320729, 1938061228),
+        y: p256ConstFixed8(-1072766593, 896871312, 1949225699, 1752466320, -1122018367, 2094031906, -907561065, -71268503),
+        inf: false)
+    p256GWindow4[14] = EcPointFixed(
+        x: p256ConstFixed8(-1328585142, -1572691109, 2140604387, 309217527, -964483488, 387432276, -49101010, -89230542),
+        y: p256ConstFixed8(-1721935765, 666185143, -2094909502, -1104587106, 711321563, -387704514, 782900155, 354879196),
+        inf: false)
+    p256GWindow4[15] = EcPointFixed(
+        x: p256ConstFixed8(-1134557861, 1924978871, 1457684043, 63710190, -461270160, -298617820, 181656073, -492171709),
+        y: p256ConstFixed8(1669579869, 1085821519, 1118051109, -681167532, 2005550999, 1693427422, 1887022580, 541202186),
+        inf: false)
+
+fn p256InitGeneratorWindow4NegTable() =
+    p256GWindow4Neg[0] = pointInfinityFixed()
+    let zero: pfix.P256Fixed = p256FieldFixedZero()
+    for i in 1..<16:
+        let yNeg: pfix.P256Fixed = p256FieldFixedSubCrash(zero, p256GWindow4[i].y)
+        p256GWindow4Neg[i] = EcPointFixed(x: p256GWindow4[i].x, y: yNeg, inf: false)
+
+fn p256InitGeneratorWindow4JacobianTable() =
+    for i in 0..<16:
+        p256GWindow4J[i] = pointJacobianFromAffineFixed(p256GWindow4[i])
+        p256GWindow4NegJ[i] = pointJacobianFromAffineFixed(p256GWindow4Neg[i])
+
+fn p256InitGeneratorComb6Table() =
+    p256GComb6[0] = pointInfinityFixed()
+    p256GComb6[1] = EcPointFixed(
+        x: p256ConstFixed8(413733948, 2045194452, 1609414145, 1975162364, 2002920720, 2046522155, -1523100218, 412114806),
+        y: p256ConstFixed8(-829073910, -571321513, -1172708260, -1958037276, -584977627, -756513144, 629693829, -2056126696),
+        inf: false)
+    p256GComb6[2] = EcPointFixed(
+        x: p256ConstFixed8(56646713, -1995419527, -1589458580, -259768930, 378680964, -210482892, -99997549, 1932306991),
+        y: p256ConstFixed8(1628832112, -1293368720, 1132444323, -1020819252, -1494375508, 969769358, -1641337337, -488029639),
+        inf: false)
+    p256GComb6[3] = EcPointFixed(
+        x: p256ConstFixed8(-1413226096, -1178545546, -883574326, 1628323149, 1461777674, -781337342, -1509433724, -789744676),
+        y: p256ConstFixed8(1226940341, 1002300863, 1467422787, 1770918592, 1665600094, -614438249, -2060044843, 1640438133),
+        inf: false)
+    p256GComb6[4] = EcPointFixed(
+        x: p256ConstFixed8(-327176545, -346170186, -273256870, -1721817324, 1766088018, -555131506, 165836320, 460074310),
+        y: p256ConstFixed8(-2127964394, 845290545, 156811690, -1338439183, 452243299, -1941532935, -73019914, 371999391),
+        inf: false)
+    p256GComb6[5] = EcPointFixed(
+        x: p256ConstFixed8(-1042784494, 1175836946, -504044798, 520650928, 1864354323, 862702729, -955388484, -631657203),
+        y: p256ConstFixed8(-1326043442, 949481390, -191296259, -1158839859, 1613896635, -1548631310, -574075015, 720361818),
+        inf: false)
+    p256GComb6[6] = EcPointFixed(
+        x: p256ConstFixed8(-291597594, 759332412, 1132455465, 1137970592, 1790389041, 451808, 1868336642, 567081908),
+        y: p256ConstFixed8(1407721964, 1403187623, -502671983, 1567805953, 1172876609, -41639324, 1079626862, -2031219096),
+        inf: false)
+    p256GComb6[7] = EcPointFixed(
+        x: p256ConstFixed8(-1840710430, 1031946960, 2135552829, 852803458, 701767633, 2021686251, -118136117, -52130919),
+        y: p256ConstFixed8(-1623658345, 1923601540, -1552918099, 457714704, 1194221267, -1045790076, -282859063, -975768645),
+        inf: false)
+    p256GComb6[8] = EcPointFixed(
+        x: p256ConstFixed8(-1197323744, 603539966, -181623489, 401342161, -1124382637, -1687610434, 1652072541, 1444413291),
+        y: p256ConstFixed8(-473325891, 605762757, 394532202, -60546002, 1767729119, 1107707951, -299384815, -1184379378),
+        inf: false)
+    p256GComb6[9] = EcPointFixed(
+        x: p256ConstFixed8(-1614553319, 1452977375, -1018400846, 208110279, -991131843, -1151362894, -1612061579, 1433944891),
+        y: p256ConstFixed8(-1666693087, -99290234, 962106625, -1192270451, 118651790, 1076020366, 1409477138, -876290077),
+        inf: false)
+    p256GComb6[10] = EcPointFixed(
+        x: p256ConstFixed8(718538915, 154073450, -809744989, -236870460, -269562386, -1771362698, 979506885, -1595750799),
+        y: p256ConstFixed8(-1832599711, -848420190, -667885625, 1457101329, 631104839, -1194978627, -383807497, 1032755826),
+        inf: false)
+    p256GComb6[11] = EcPointFixed(
+        x: p256ConstFixed8(592622847, 193486486, -1504422042, 1810047186, -1180328334, -1121803196, -859480707, 791491286),
+        y: p256ConstFixed8(-573651189, -663860148, 2049296692, 432910569, -1666613720, 1412095494, 1952782327, 1489343100),
+        inf: false)
+    p256GComb6[12] = EcPointFixed(
+        x: p256ConstFixed8(-1928826735, 615231728, 1370347742, 1789051631, -869654220, -1008612532, -1789357550, 895684904),
+        y: p256ConstFixed8(2038707275, 1005681962, -123649332, -1128859726, 149721702, -704283254, 676479066, 1975603410),
+        inf: false)
+    p256GComb6[13] = EcPointFixed(
+        x: p256ConstFixed8(-1442912450, -1460105547, 1466868635, 1923629428, -496423299, 1730125997, -1770610786, 626403461),
+        y: p256ConstFixed8(-397367632, 625157052, -604006, 1958091800, -810670448, 779900479, 374012687, 754209975),
+        inf: false)
+    p256GComb6[14] = EcPointFixed(
+        x: p256ConstFixed8(-1894714333, -485317279, -222798348, 1503785471, 1103397154, 1455790361, -1371728033, 1955937310),
+        y: p256ConstFixed8(-2007423924, 1299611591, 1905937601, -997803008, -551807097, -584570491, -1366046951, 289615898),
+        inf: false)
+    p256GComb6[15] = EcPointFixed(
+        x: p256ConstFixed8(531332465, 1912709590, 852213480, 1704140628, -592214034, 539579859, -999848910, -1526441051),
+        y: p256ConstFixed8(-592945162, -810160505, -538177689, -584734778, 896174022, -18583191, -1009259287, 547942745),
+        inf: false)
+    p256GComb6[16] = EcPointFixed(
+        x: p256ConstFixed8(118307499, -458454221, -1708337691, 641951531, 486314355, 1391458203, -1868054209, 1717347483),
+        y: p256ConstFixed8(-1276135016, 1519245913, 86971201, -1973710291, 1022993712, -1365328981, -177363753, 899182203),
+        inf: false)
+    p256GComb6[17] = EcPointFixed(
+        x: p256ConstFixed8(-1140166464, 568360858, -1734737534, -318917726, -468811483, 906396352, 797146930, 1940273045),
+        y: p256ConstFixed8(-1676856725, -185889553, -336279643, -273055764, -1354932866, -113958621, 887237297, -1222707985),
+        inf: false)
+    p256GComb6[18] = EcPointFixed(
+        x: p256ConstFixed8(222855218, -692253311, 1911601454, 376889241, -1227745876, -1481843460, -854591175, -2109335002),
+        y: p256ConstFixed8(-1237986587, -2106488384, -1456531934, 418625245, 97448741, 282540202, 968559270, 314745151),
+        inf: false)
+    p256GComb6[19] = EcPointFixed(
+        x: p256ConstFixed8(-1257550206, 1603590366, 884839401, -1126624178, 130057763, 1640184097, 2117986542, -303262594),
+        y: p256ConstFixed8(790737410, -1657952995, -1771492727, -1060600371, -1511575396, 1247884386, 254336742, 578259029),
+        inf: false)
+    p256GComb6[20] = EcPointFixed(
+        x: p256ConstFixed8(1989493882, 535870802, 1118709287, 1666402890, -791934478, -647302950, 1093484058, -1247894203),
+        y: p256ConstFixed8(1786089586, -788195121, 273112573, -1129604, -1303344700, -1396954676, 565630190, -1086456699),
+        inf: false)
+    p256GComb6[21] = EcPointFixed(
+        x: p256ConstFixed8(1228442005, -1892766466, -2078545427, 1034452, 1767228048, 785909850, 1838028655, 422170464),
+        y: p256ConstFixed8(-48625189, 788342437, 1823876813, 1490511789, -1301516795, 329784213, -1889434837, 1761501447),
+        inf: false)
+    p256GComb6[22] = EcPointFixed(
+        x: p256ConstFixed8(763740918, 1255661102, 1359020449, -850055221, 44882623, 1670189611, 1354750241, 292692456),
+        y: p256ConstFixed8(-1716940503, 139927265, -1171323991, -338671919, -1493655167, 56547258, 830981875, -1968440947),
+        inf: false)
+    p256GComb6[23] = EcPointFixed(
+        x: p256ConstFixed8(-475308210, -1349622326, 1969333916, -1962177655, -1317265818, 937966240, -120058148, -392898484),
+        y: p256ConstFixed8(-833532382, -236689945, -1490861841, -939904436, -415824269, 136937418, -1323717026, 1333368450),
+        inf: false)
+    p256GComb6[24] = EcPointFixed(
+        x: p256ConstFixed8(-243207674, 21851096, 2058637141, 1449397387, -1812355656, -1707514355, -1784977167, -893359639),
+        y: p256ConstFixed8(546150680, 737588830, 1066676881, -1209770501, -734410990, -1386778384, 1985271813, -20564511),
+        inf: false)
+    p256GComb6[25] = EcPointFixed(
+        x: p256ConstFixed8(1057168008, 924982481, 190142676, -455787217, -620998195, 786337423, -1465351190, -1249433524),
+        y: p256ConstFixed8(1157255761, -97032384, 1549677864, 1583225081, 1846589784, -1963647060, 742562608, 163477763),
+        inf: false)
+    p256GComb6[26] = EcPointFixed(
+        x: p256ConstFixed8(2133431149, 2051443620, 2096857462, -1396972699, 1304022365, -393035510, -1582637429, -886101545),
+        y: p256ConstFixed8(-268449004, 814214900, 721325870, -1834486804, 326052306, 429754808, -1266457053, 825319502),
+        inf: false)
+    p256GComb6[27] = EcPointFixed(
+        x: p256ConstFixed8(834002806, -171137574, 1990503360, -1808715386, 410503111, 1572398839, 1613868185, 1021572601),
+        y: p256ConstFixed8(2122116992, 1482252752, -735776406, 1591142465, 1454467657, 405314768, 777482490, -2146906053),
+        inf: false)
+    p256GComb6[28] = EcPointFixed(
+        x: p256ConstFixed8(625883614, -926765212, -2055055588, 2017258099, -1494361743, 791631345, -932449526, 2113981586),
+        y: p256ConstFixed8(1205291295, -1596230828, -1515117984, -1276414692, 696234548, 1002674723, -1196113948, -785183712),
+        inf: false)
+    p256GComb6[29] = EcPointFixed(
+        x: p256ConstFixed8(2015679802, -76059920, 1110305333, 74485910, 1609317063, 1866992491, -495002204, -617931934),
+        y: p256ConstFixed8(-629623660, 196776012, -1851701257, 938432950, 648311562, -125808265, -1465174386, -322316390),
+        inf: false)
+    p256GComb6[30] = EcPointFixed(
+        x: p256ConstFixed8(-2052801266, 1653474753, 14828776, -336087432, -1961398549, -163212165, 373402421, -919865296),
+        y: p256ConstFixed8(566131311, 2047056922, 802471314, 300168525, -2005937628, 1112876066, -1001591497, -604825268),
+        inf: false)
+    p256GComb6[31] = EcPointFixed(
+        x: p256ConstFixed8(-982553852, -2094159485, -1896834898, 2057995499, -1499064670, 1613643503, -1212737629, -1031647780),
+        y: p256ConstFixed8(-575626519, 435487524, 1542323133, 72694312, -1441075702, 938117906, -1806083679, -1048293767),
+        inf: false)
+    p256GComb6[32] = EcPointFixed(
+        x: p256ConstFixed8(-521002302, 1346625191, 1927696706, 815612588, -1843999440, -1795252771, 260570860, -699163523),
+        y: p256ConstFixed8(1126877143, 63284604, 847239696, 1919495408, 671520990, -332871585, 2126676913, 590478150),
+        inf: false)
+    p256GComb6[33] = EcPointFixed(
+        x: p256ConstFixed8(1126469223, 1696398827, -296346136, 742224590, 1144892555, -1534357709, 2039609734, -424656130),
+        y: p256ConstFixed8(-401556270, -795778195, -1452009769, -65104210, 680683853, 727746507, -1719294424, 260751941),
+        inf: false)
+    p256GComb6[34] = EcPointFixed(
+        x: p256ConstFixed8(2133010082, 1424558196, -90304207, -834413244, -741156536, 1261204492, -1469150457, -1693773206),
+        y: p256ConstFixed8(-1216390414, 579793696, -905484772, 352094721, -749790662, 494031006, 702089326, -781647081),
+        inf: false)
+    p256GComb6[35] = EcPointFixed(
+        x: p256ConstFixed8(63307315, 333728460, 17152966, 334772046, -884715080, 213536792, -97934111, -1583116726),
+        y: p256ConstFixed8(-197117673, 104839592, -1720801294, 2063470735, -113631353, -333110429, 2118329865, -1071003631),
+        inf: false)
+    p256GComb6[36] = EcPointFixed(
+        x: p256ConstFixed8(1215190158, 621284393, 2020125490, -626781902, -702735814, 1183388945, 1056739244, -931184813),
+        y: p256ConstFixed8(-203222125, -1739628225, 1984493010, 280696310, -553999296, -459731157, -581844195, -832274685),
+        inf: false)
+    p256GComb6[37] = EcPointFixed(
+        x: p256ConstFixed8(-1674835265, 828500957, -191377611, 1220013691, -1797415785, -1842093283, -976054129, 1257216610),
+        y: p256ConstFixed8(-1606523818, -1985658527, -1041224889, -1658462205, -1048217726, -2021339713, 35828892, 2032716541),
+        inf: false)
+    p256GComb6[38] = EcPointFixed(
+        x: p256ConstFixed8(-319493597, 1515788989, -2135057526, -1301127542, 704590987, -177641569, 1864520554, -1568578605),
+        y: p256ConstFixed8(566507889, -1981306634, -996108953, 1623975073, 1495838781, 1090808975, -277567142, 1685056935),
+        inf: false)
+    p256GComb6[39] = EcPointFixed(
+        x: p256ConstFixed8(1568002832, 988769216, -2109247908, -202903492, -2078689120, -1647362736, -353337593, 572143749),
+        y: p256ConstFixed8(935185277, 383071219, -1152822003, -679999893, 918708236, -151759863, -1043982583, 1967405423),
+        inf: false)
+    p256GComb6[40] = EcPointFixed(
+        x: p256ConstFixed8(-569848510, -140552849, -516117048, 2097855006, -724033553, -2078433802, 1613570115, -1887772174),
+        y: p256ConstFixed8(-1249975935, -1794355740, -983763824, -28188603, 519950504, -614419094, -1089493865, 661376179),
+        inf: false)
+    p256GComb6[41] = EcPointFixed(
+        x: p256ConstFixed8(434480643, 2032558683, -507547349, -239497581, -482689332, -1824601262, -131702373, -1631599354),
+        y: p256ConstFixed8(-1586942894, -761897113, -61893276, -1966866131, 1731850243, -1464903933, -1133421037, 2110924845),
+        inf: false)
+    p256GComb6[42] = EcPointFixed(
+        x: p256ConstFixed8(-819219312, 1052775815, 1058972712, 1397098540, 1731847430, -221873694, -1827919644, -357101354),
+        y: p256ConstFixed8(-532470630, -376143880, -1386958618, 1667499640, 408218287, -1931591079, 1797635534, -234951956),
+        inf: false)
+    p256GComb6[43] = EcPointFixed(
+        x: p256ConstFixed8(467479202, 1240983705, 887343849, -1996675275, -2100560222, 1522553089, 1291339128, 843881793),
+        y: p256ConstFixed8(435236961, -1572720361, 1597741362, 1775664369, -572334163, 854383420, -1189677146, 796187029),
+        inf: false)
+    p256GComb6[44] = EcPointFixed(
+        x: p256ConstFixed8(1024769128, 905440578, 1163349905, 854997508, 1585971687, -801044429, 479990882, 1672933692),
+        y: p256ConstFixed8(-1647894497, 403557325, 906186975, -1602528468, 1110898124, 629322359, -1481963847, -1877591772),
+        inf: false)
+    p256GComb6[45] = EcPointFixed(
+        x: p256ConstFixed8(124243442, 904352181, -1651627976, -2138869018, 1684608215, -877827280, 1820015787, 1324265950),
+        y: p256ConstFixed8(-1936306172, 1056157590, -763260405, -782096113, 404717851, 1176945427, -1100882668, 1604595535),
+        inf: false)
+    p256GComb6[46] = EcPointFixed(
+        x: p256ConstFixed8(-1585059442, 526031955, -358710333, 331514487, -1231838682, -1251547968, 22232734, 782496192),
+        y: p256ConstFixed8(1645584927, -1260663757, -884041488, 2113276099, -1260546595, 1736309032, -286447308, 1276997954),
+        inf: false)
+    p256GComb6[47] = EcPointFixed(
+        x: p256ConstFixed8(-2036142574, 817832812, 99398848, 1960157479, 369216681, -1628161265, -1404186110, -1105519623),
+        y: p256ConstFixed8(397867323, -2070659513, -850258765, 1870174039, 2133933562, 1577955753, -320817365, 85323692),
+        inf: false)
+    p256GComb6[48] = EcPointFixed(
+        x: p256ConstFixed8(-1483980917, 1127901052, -210327103, 541761514, 1153100511, -1228947804, 726180852, 1514392317),
+        y: p256ConstFixed8(1741804070, -497386229, -159155835, -1307486140, -662951032, -1935881666, -1991806239, -321602445),
+        inf: false)
+    p256GComb6[49] = EcPointFixed(
+        x: p256ConstFixed8(2016710887, 915062470, -651836583, -227694403, -386201991, -105495579, -1252667019, 2058879961),
+        y: p256ConstFixed8(1320871317, 457202073, -1170113975, 133938981, -971532934, 47697692, 1448878011, 2030505637),
+        inf: false)
+    p256GComb6[50] = EcPointFixed(
+        x: p256ConstFixed8(-642766598, 1880704514, -1611634848, -1672898915, 1792179010, -1085612671, -2041490866, 2099192429),
+        y: p256ConstFixed8(-288524508, -1334338752, 1704167175, -749336718, -799753981, -475652123, 862262123, -688544957),
+        inf: false)
+    p256GComb6[51] = EcPointFixed(
+        x: p256ConstFixed8(-761851953, 633896054, 1297434280, 2090819744, -1915175028, 2108360495, -385900760, 1024495740),
+        y: p256ConstFixed8(884681257, -1332908786, -1006830161, 1576880391, 1192377254, -459090767, 1121873293, 1855909643),
+        inf: false)
+    p256GComb6[52] = EcPointFixed(
+        x: p256ConstFixed8(-877305955, -2128258315, 1395184542, 1470048005, 1046144611, -1480603369, -1591447998, -373990057),
+        y: p256ConstFixed8(1969394056, 604949908, 1165743040, -2025270633, 926692892, 1356994031, 415852473, -1348629882),
+        inf: false)
+    p256GComb6[53] = EcPointFixed(
+        x: p256ConstFixed8(168039487, 2040545540, -956250602, 66535695, -1861186394, -386751502, -173250662, -1569888280),
+        y: p256ConstFixed8(-1203782246, -1587691541, 973821319, -240456750, -837898940, 1671075805, 1909534432, -229396468),
+        inf: false)
+    p256GComb6[54] = EcPointFixed(
+        x: p256ConstFixed8(-1640635012, 2075053900, 1736893349, 1378756257, -1963447902, 1611355019, 745399370, 435847351),
+        y: p256ConstFixed8(-1427046574, -1255971600, 1729386623, 776716826, -1035626883, 1075017635, -1573063701, 1696040806),
+        inf: false)
+    p256GComb6[55] = EcPointFixed(
+        x: p256ConstFixed8(-1841643520, -1043851208, -995376914, 1107435266, 1192438304, -840713062, -962636293, 1867688036),
+        y: p256ConstFixed8(-544604310, 199218148, -930359474, 608998459, 638753163, 1688079187, -750699190, -832443453),
+        inf: false)
+    p256GComb6[56] = EcPointFixed(
+        x: p256ConstFixed8(750410384, -485086972, -613670322, -1490612050, -662813477, 1367544720, 1224617715, -1501045608),
+        y: p256ConstFixed8(379722921, -2055301035, -911754222, -482177650, 313541794, 382975184, -396400892, -419820439),
+        inf: false)
+    p256GComb6[57] = EcPointFixed(
+        x: p256ConstFixed8(-1881921902, -456350901, -513852721, -932361818, -1498315886, -1075711389, -590190858, 107268403),
+        y: p256ConstFixed8(423206280, -2039247627, 1956439740, 482134211, -948717436, 672604027, 28111262, 812632407),
+        inf: false)
+    p256GComb6[58] = EcPointFixed(
+        x: p256ConstFixed8(-1346984935, 229091127, 425704512, 1669317226, -1671108377, 264829046, 546047526, 711481243),
+        y: p256ConstFixed8(-2044154941, -2098715888, -1423724908, -455044333, -451584783, 1723833051, -391979764, 395353964),
+        inf: false)
+    p256GComb6[59] = EcPointFixed(
+        x: p256ConstFixed8(1138208049, 1987851670, 1238167394, 2074321322, 37928794, 1382138646, -1632096773, -2047585767),
+        y: p256ConstFixed8(934555207, 1431090050, 1291215155, -914940223, 356058531, -563060358, -1134481043, 749414140),
+        inf: false)
+    p256GComb6[60] = EcPointFixed(
+        x: p256ConstFixed8(1975583509, 2108402621, -1534200242, -1701855608, -507971310, 721907685, -860008228, 441650409),
+        y: p256ConstFixed8(1715982885, 1194728119, 1298360853, -129076290, 1493476090, -711996753, 944912921, 1937014091),
+        inf: false)
+    p256GComb6[61] = EcPointFixed(
+        x: p256ConstFixed8(-1232712512, 1852510136, -1422171588, 1569325095, -1709376356, 1583768888, 1377718259, -2123687458),
+        y: p256ConstFixed8(197412856, 1450220240, -1894488873, 491178780, -1454799043, 1238300704, -640424353, 41961106),
+        inf: false)
+    p256GComb6[62] = EcPointFixed(
+        x: p256ConstFixed8(-1383376522, 450947624, -2037098245, 1318769806, -1764758024, -381452599, 721056985, -1527176030),
+        y: p256ConstFixed8(-1426614336, -883222459, -1167108737, -438903538, -1847841156, -1589022746, -1944608825, -1389236820),
+        inf: false)
+    p256GComb6[63] = EcPointFixed(
+        x: p256ConstFixed8(1152413399, -104470050, 1247375705, 1827128567, -2093298507, -802241471, 1654057212, -217971303),
+        y: p256ConstFixed8(-1028669946, 2113324486, -1669031159, -12411430, -170034986, 1108803942, -2096351093, 604236321),
+        inf: false)
+
+fn p256InitGeneratorComb6JacobianTable() =
+    for i in 0..<64:
+        p256GComb6J[i] = pointJacobianFromAffineFixed(p256GComb6[i])
+
+fn p256ScalarFixedIsZero(a: pfix.P256Fixed): bool =
+    var aa: pfix.P256Fixed = a
+    return pfix.p256FixedIsZero(aa)
+
+fn p256ScalarFixedIsOdd(a: pfix.P256Fixed): bool =
+    return (pfix.p256FixedWordToBitsU64(a.limbs[0]) & uint64(1)) != uint64(0)
+
+fn p256ScalarFixedLow5(a: pfix.P256Fixed): int32 =
+    return int32(pfix.p256FixedWordToBitsU64(a.limbs[0]) & uint64(31))
+
+fn p256ScalarFixedAddSmall(a: pfix.P256Fixed, delta: int32): pfix.P256Fixed =
+    var out: pfix.P256Fixed = a
+    var carry: uint64 = uint64(delta)
+    var i: int32 = 0
+    while carry != uint64(0) && i < pfix.p256FixedLimbCount:
+        let av: uint64 = pfix.p256FixedWordToBitsU64(out.limbs[i])
+        let sum: uint64 = av + carry
+        out.limbs[i] = pfix.p256FixedWordFromBitsU64(sum)
+        carry = sum >> uint64(pfix.p256FixedWordBits)
+        i = i + 1
+    return out
+
+fn p256ScalarFixedSubSmall(a: pfix.P256Fixed, delta: int32): pfix.P256Fixed =
+    var out: pfix.P256Fixed = a
+    var borrow: uint64 = uint64(delta)
+    var i: int32 = 0
+    let wordBase: uint64 = uint64(1) << uint64(pfix.p256FixedWordBits)
+    while borrow != uint64(0) && i < pfix.p256FixedLimbCount:
+        let av: uint64 = pfix.p256FixedWordToBitsU64(out.limbs[i])
+        if av >= borrow:
+            out.limbs[i] = pfix.p256FixedWordFromBitsU64(av - borrow)
+            borrow = uint64(0)
+        else:
+            out.limbs[i] = pfix.p256FixedWordFromBitsU64(wordBase + av - borrow)
+            borrow = uint64(1)
+        i = i + 1
+    return out
+
+fn p256ScalarFixedShiftRight1(a: pfix.P256Fixed): pfix.P256Fixed =
+    var out: pfix.P256Fixed
+    var carry: uint64 = uint64(0)
+    let __for_start_i = pfix.p256FixedLimbCount - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let limb: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[i])
+        let shifted: uint64 = (limb >> uint64(1)) | (carry << uint64(pfix.p256FixedWordBits - 1))
+        out.limbs[i] = pfix.p256FixedWordFromBitsU64(shifted)
+        carry = limb & uint64(1)
+    return out
+
+fn p256ScalarFixedComb8Digit(a: pfix.P256Fixed, row: int32): int32 =
+    var digit: int32 = 0
+    var i: int32 = 0
+    while i < 8:
+        let bitIdx: int32 = row + (32 * i)
+        digit = digit | (pfix.p256FixedGetBit(a, bitIdx) << i)
+        i = i + 1
+    return digit
+
+fn p256ScalarFixedComb6Digit(a: pfix.P256Fixed, row: int32): int32 =
+    let w0: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[0])
+    let w1: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[1])
+    let w2: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[2])
+    let w3: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[3])
+    let w4: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[4])
+    let w5: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[5])
+    let w6: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[6])
+    let w7: uint64 = pfix.p256FixedWordToBitsU64(a.limbs[7])
+    var digit: int32 = 0
+    if row < 32:
+        digit = digit | int32((w0 >> uint64(row)) & uint64(1))
+    else:
+        digit = digit | int32((w1 >> uint64(row - 32)) & uint64(1))
+    if row < 21:
+        digit = digit | (int32((w1 >> uint64(row + 11)) & uint64(1)) << 1)
+    else:
+        digit = digit | (int32((w2 >> uint64(row - 21)) & uint64(1)) << 1)
+    if row < 10:
+        digit = digit | (int32((w2 >> uint64(row + 22)) & uint64(1)) << 2)
+    elif row < 42:
+        digit = digit | (int32((w3 >> uint64(row - 10)) & uint64(1)) << 2)
+    else:
+        digit = digit | (int32(w4 & uint64(1)) << 2)
+    if row < 31:
+        digit = digit | (int32((w4 >> uint64(row + 1)) & uint64(1)) << 3)
+    else:
+        digit = digit | (int32((w5 >> uint64(row - 31)) & uint64(1)) << 3)
+    if row < 20:
+        digit = digit | (int32((w5 >> uint64(row + 12)) & uint64(1)) << 4)
+    else:
+        digit = digit | (int32((w6 >> uint64(row - 20)) & uint64(1)) << 4)
+    if row < 9:
+        digit = digit | (int32((w6 >> uint64(row + 23)) & uint64(1)) << 5)
+    elif row < 41:
+        digit = digit | (int32((w7 >> uint64(row - 9)) & uint64(1)) << 5)
+    return digit
 
 fn ecnistHexValue(c: char): int32 =
     if c >= '0' && c <= '9':
@@ -101,40 +618,10 @@ fn bigShiftRight1(a: BigInt): BigInt =
 fn p256EnsureInit(): Result[bool] =
     if p256InitDone:
         return Ok[bool](true)
-    let pRes: Result[Bytes] = hexDecode(p256HexP)
-    if IsErr(pRes):
-        return Err[bool](Error(pRes))
-    let nRes: Result[Bytes] = hexDecode(p256HexN)
-    if IsErr(nRes):
-        return Err[bool](Error(nRes))
-    let bRes: Result[Bytes] = hexDecode(p256HexB)
-    if IsErr(bRes):
-        return Err[bool](Error(bRes))
-    let gxRes: Result[Bytes] = hexDecode(p256HexGx)
-    if IsErr(gxRes):
-        return Err[bool](Error(gxRes))
-    let gyRes: Result[Bytes] = hexDecode(p256HexGy)
-    if IsErr(gyRes):
-        return Err[bool](Error(gyRes))
-    let pBigRes: Result[BigInt] = bigFromBytes(Value(pRes))
-    if IsErr(pBigRes):
-        return Err[bool](Error(pBigRes))
-    let nBigRes: Result[BigInt] = bigFromBytes(Value(nRes))
-    if IsErr(nBigRes):
-        return Err[bool](Error(nBigRes))
-    let bBigRes: Result[BigInt] = bigFromBytes(Value(bRes))
-    if IsErr(bBigRes):
-        return Err[bool](Error(bBigRes))
-    let gxBigRes: Result[BigInt] = bigFromBytes(Value(gxRes))
-    if IsErr(gxBigRes):
-        return Err[bool](Error(gxBigRes))
-    let gyBigRes: Result[BigInt] = bigFromBytes(Value(gyRes))
-    if IsErr(gyBigRes):
-        return Err[bool](Error(gyBigRes))
-    p256P = Value(pBigRes)
-    p256N = Value(nBigRes)
-    p256B = Value(bBigRes)
-    p256G = EcPoint(x: Value(gxBigRes), y: Value(gyBigRes), inf: false)
+    p256P = p256ConstP()
+    p256N = p256ConstN()
+    p256B = p256ConstB()
+    p256G = EcPoint(x: p256ConstGx(), y: p256ConstGy(), inf: false)
     let three: BigInt = bigFromInt(3)
     let aRes: Result[BigInt] = bigSub(p256P, three)
     if IsErr(aRes):
@@ -150,6 +637,21 @@ fn p256EnsureInit(): Result[bool] =
     p256PMinus2 = Value(pMinus2Res)
     p256NMinus2 = Value(nMinus2Res)
     p256NHalf = bigShiftRight1(p256N)
+    p256PCtxFixed = pfix.p256FieldMontgomeryContext()
+    p256NCtxFixed = pfix.p256ScalarMontgomeryContext()
+    let pMinus2FixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(p256PMinus2)
+    if IsErr(pMinus2FixedRes):
+        return Err[bool](Error(pMinus2FixedRes))
+    let nMinus2FixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(p256NMinus2)
+    if IsErr(nMinus2FixedRes):
+        return Err[bool](Error(nMinus2FixedRes))
+    p256PMinus2Fixed = Value(pMinus2FixedRes)
+    p256NMinus2Fixed = Value(nMinus2FixedRes)
+    p256InitGeneratorWindow4Table()
+    p256InitGeneratorWindow4NegTable()
+    p256InitGeneratorWindow4JacobianTable()
+    p256InitGeneratorComb6Table()
+    p256InitGeneratorComb6JacobianTable()
     p256InitDone = true
     return Ok[bool](true)
 
@@ -173,8 +675,21 @@ fn bigModSub(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =
 fn p256Mod(a: BigInt): Result[BigInt] =
     return bigMod(a, p256P)
 
+fn p256FixedToBigResult(value: pfix.P256Fixed): Result[BigInt] =
+    return Ok[BigInt](pfix.p256FixedToBigInt(value))
+
 fn p256ModMul(a: BigInt, b: BigInt): Result[BigInt] =
-    return bigModMul(a, b, p256P)
+    let aFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(a)
+    if IsErr(aFixedRes):
+        return Err[BigInt](Error(aFixedRes))
+    let bFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(b)
+    if IsErr(bFixedRes):
+        return Err[BigInt](Error(bFixedRes))
+    var aFixed: pfix.P256Fixed = Value(aFixedRes)
+    var bFixed: pfix.P256Fixed = Value(bFixedRes)
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    let mul: pfix.P256Fixed = pfix.p256FixedModMulWithContextTrusted(aFixed, bFixed, ctx)
+    return p256FixedToBigResult(mul)
 
 fn p256ModAdd(a: BigInt, b: BigInt): Result[BigInt] =
     return bigModAdd(a, b, p256P)
@@ -185,13 +700,30 @@ fn p256ModSub(a: BigInt, b: BigInt): Result[BigInt] =
 fn p256ModInv(a: BigInt): Result[BigInt] =
     if bigIsZero(a):
         return Err[BigInt]("ecdsa: inverse of zero")
-    return bigModExp(a, p256PMinus2, p256P)
+    let aFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(a)
+    if IsErr(aFixedRes):
+        return Err[BigInt](Error(aFixedRes))
+    var aFixed: pfix.P256Fixed = Value(aFixedRes)
+    var expFixed: pfix.P256Fixed = p256PMinus2Fixed
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    let inv: pfix.P256Fixed = pfix.p256FixedModExpWithContextTrusted(aFixed, expFixed, ctx)
+    return p256FixedToBigResult(inv)
 
 fn nMod(a: BigInt): Result[BigInt] =
     return bigMod(a, p256N)
 
 fn nModMul(a: BigInt, b: BigInt): Result[BigInt] =
-    return bigModMul(a, b, p256N)
+    let aFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(a)
+    if IsErr(aFixedRes):
+        return Err[BigInt](Error(aFixedRes))
+    let bFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(b)
+    if IsErr(bFixedRes):
+        return Err[BigInt](Error(bFixedRes))
+    var aFixed: pfix.P256Fixed = Value(aFixedRes)
+    var bFixed: pfix.P256Fixed = Value(bFixedRes)
+    var ctx: pfix.P256FixedMontgomeryContext = p256NCtxFixed
+    let mul: pfix.P256Fixed = pfix.p256FixedModMulWithContextTrusted(aFixed, bFixed, ctx)
+    return p256FixedToBigResult(mul)
 
 fn nModAdd(a: BigInt, b: BigInt): Result[BigInt] =
     return bigModAdd(a, b, p256N)
@@ -199,13 +731,876 @@ fn nModAdd(a: BigInt, b: BigInt): Result[BigInt] =
 fn nModInv(a: BigInt): Result[BigInt] =
     if bigIsZero(a):
         return Err[BigInt]("ecdsa: inverse of zero")
-    return bigModExp(a, p256NMinus2, p256N)
+    let aFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(a)
+    if IsErr(aFixedRes):
+        return Err[BigInt](Error(aFixedRes))
+    var aFixed: pfix.P256Fixed = Value(aFixedRes)
+    var expFixed: pfix.P256Fixed = p256NMinus2Fixed
+    var ctx: pfix.P256FixedMontgomeryContext = p256NCtxFixed
+    let inv: pfix.P256Fixed = pfix.p256FixedModExpWithContextTrusted(aFixed, expFixed, ctx)
+    return p256FixedToBigResult(inv)
+
+fn p256FieldFixedZero(): pfix.P256Fixed =
+    return pfix.p256FixedZero()
+
+fn p256FieldFixedOne(): pfix.P256Fixed =
+    return p256PCtxFixed.oneMont
+
+fn p256FieldFixedToMont(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var aa: pfix.P256Fixed = a
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var r2: pfix.P256Fixed = ctx.r2
+    return pfix.p256FixedMontgomeryMulCore(aa, r2, ctx)
+
+fn p256FieldFixedFromMont(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var aa: pfix.P256Fixed = a
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var one: pfix.P256Fixed = pfix.p256FixedOne()
+    return pfix.p256FixedMontgomeryMulCore(aa, one, ctx)
+
+fn p256FieldFixedAdd(a: pfix.P256Fixed, b: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var aa: pfix.P256Fixed = a
+    var bb: pfix.P256Fixed = b
+    var modulus: pfix.P256Fixed = ctx.modulus
+    return pfix.p256FixedModAdd(aa, bb, modulus)
+
+fn p256FieldFixedSub(a: pfix.P256Fixed, b: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var aa: pfix.P256Fixed = a
+    var bb: pfix.P256Fixed = b
+    var modulus: pfix.P256Fixed = ctx.modulus
+    return pfix.p256FixedModSub(aa, bb, modulus)
+
+fn p256FieldFixedMul(a: pfix.P256Fixed, b: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var aa: pfix.P256Fixed = a
+    var bb: pfix.P256Fixed = b
+    return pfix.p256FixedMontgomeryMulCore(aa, bb, ctx)
+
+fn p256FieldFixedSquare(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var aa: pfix.P256Fixed = a
+    return pfix.p256FixedMontgomerySquareCore(aa, ctx)
+
+fn p256FieldFixedInv(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    if pfix.p256FixedIsZero(a):
+        return Err[pfix.P256Fixed]("ecdsa: inverse of zero")
+    let aNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(a)
+    if IsErr(aNormRes):
+        return Err[pfix.P256Fixed](Error(aNormRes))
+    var aa: pfix.P256Fixed = Value(aNormRes)
+    var exp: pfix.P256Fixed = p256PMinus2Fixed
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    let invNorm: pfix.P256Fixed = pfix.p256FixedModExpWithContextTrusted(aa, exp, ctx)
+    return p256FieldFixedToMont(invNorm)
+
+fn p256FieldFixedDouble(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    return p256FieldFixedAdd(a, a)
+
+fn p256FieldFixedTriple(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    let dblRes: Result[pfix.P256Fixed] = p256FieldFixedDouble(a)
+    if IsErr(dblRes):
+        return Err[pfix.P256Fixed](Error(dblRes))
+    return p256FieldFixedAdd(Value(dblRes), a)
+
+fn p256FieldFixedQuad(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    let dblRes: Result[pfix.P256Fixed] = p256FieldFixedDouble(a)
+    if IsErr(dblRes):
+        return Err[pfix.P256Fixed](Error(dblRes))
+    return p256FieldFixedDouble(Value(dblRes))
+
+fn p256FieldFixedEight(a: pfix.P256Fixed): Result[pfix.P256Fixed] =
+    let quadRes: Result[pfix.P256Fixed] = p256FieldFixedQuad(a)
+    if IsErr(quadRes):
+        return Err[pfix.P256Fixed](Error(quadRes))
+    return p256FieldFixedDouble(Value(quadRes))
+
+fn p256FieldFixedIsOne(a: pfix.P256Fixed): bool =
+    var aa: pfix.P256Fixed = a
+    var one: pfix.P256Fixed = p256FieldFixedOne()
+    return pfix.p256FixedCmp(aa, one) == 0
+
+fn p256FieldFixedAddCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
+    let res: Result[pfix.P256Fixed] = p256FieldFixedAdd(a, b)
+    if IsErr(res):
+        crash("ecdsa: fixed add failed " + Error(res))
+    return Value(res)
+
+fn p256FieldFixedSubCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
+    let res: Result[pfix.P256Fixed] = p256FieldFixedSub(a, b)
+    if IsErr(res):
+        crash("ecdsa: fixed sub failed " + Error(res))
+    return Value(res)
+
+fn p256FieldFixedMulCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
+    let res: Result[pfix.P256Fixed] = p256FieldFixedMul(a, b)
+    if IsErr(res):
+        crash("ecdsa: fixed mul failed " + Error(res))
+    return Value(res)
+
+fn p256FieldFixedSquareCrash(a: pfix.P256Fixed): pfix.P256Fixed =
+    let res: Result[pfix.P256Fixed] = p256FieldFixedSquare(a)
+    if IsErr(res):
+        crash("ecdsa: fixed square failed " + Error(res))
+    return Value(res)
+
+fn p256FieldFixedDoubleCrash(a: pfix.P256Fixed): pfix.P256Fixed =
+    return p256FieldFixedAddCrash(a, a)
+
+fn p256FieldFixedTripleCrash(a: pfix.P256Fixed): pfix.P256Fixed =
+    return p256FieldFixedAddCrash(p256FieldFixedDoubleCrash(a), a)
+
+fn p256FieldFixedQuadCrash(a: pfix.P256Fixed): pfix.P256Fixed =
+    return p256FieldFixedDoubleCrash(p256FieldFixedDoubleCrash(a))
+
+fn p256FieldFixedEightCrash(a: pfix.P256Fixed): pfix.P256Fixed =
+    return p256FieldFixedDoubleCrash(p256FieldFixedQuadCrash(a))
+
+fn pointInfinityFixed(): EcPointFixed =
+    EcPointFixed(x: p256FieldFixedZero(), y: p256FieldFixedZero(), inf: true)
+
+fn pointJacobianInfinityFixed(): EcPointJacobianFixed =
+    EcPointJacobianFixed(x: p256FieldFixedZero(), y: p256FieldFixedZero(), z: p256FieldFixedZero(), inf: true)
+
+fn pointJacobianSetInfinityFixed(p: var EcPointJacobianFixed) =
+    p.x = p256FieldFixedZero()
+    p.y = p256FieldFixedZero()
+    p.z = p256FieldFixedZero()
+    p.inf = true
+
+fn pointJacobianSetFromAffineFixed(p: var EcPointJacobianFixed, q: EcPointFixed) =
+    if q.inf:
+        pointJacobianSetInfinityFixed(p)
+        return
+    p.x = q.x
+    p.y = q.y
+    p.z = p256FieldFixedOne()
+    p.inf = false
+
+fn pointFixedFromBig(p: EcPoint): Result[EcPointFixed] =
+    if p.inf:
+        return Ok[EcPointFixed](pointInfinityFixed())
+    let xRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(p.x)
+    if IsErr(xRes):
+        return Err[EcPointFixed](Error(xRes))
+    let yRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(p.y)
+    if IsErr(yRes):
+        return Err[EcPointFixed](Error(yRes))
+    let xMontRes: Result[pfix.P256Fixed] = p256FieldFixedToMont(Value(xRes))
+    if IsErr(xMontRes):
+        return Err[EcPointFixed](Error(xMontRes))
+    let yMontRes: Result[pfix.P256Fixed] = p256FieldFixedToMont(Value(yRes))
+    if IsErr(yMontRes):
+        return Err[EcPointFixed](Error(yMontRes))
+    return Ok[EcPointFixed](EcPointFixed(x: Value(xMontRes), y: Value(yMontRes), inf: false))
+
+fn pointBigFromFixed(p: EcPointFixed): EcPoint =
+    if p.inf:
+        return pointInfinity()
+    let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.x)
+    if IsErr(xNormRes):
+        crash("ecdsa: pointBigFromFixed x fromMont failed")
+    let yNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.y)
+    if IsErr(yNormRes):
+        crash("ecdsa: pointBigFromFixed y fromMont failed")
+    var x: pfix.P256Fixed = Value(xNormRes)
+    var y: pfix.P256Fixed = Value(yNormRes)
+    return EcPoint(x: pfix.p256FixedToBigInt(x), y: pfix.p256FixedToBigInt(y), inf: false)
+
+fn pointJacobianFromAffineFixed(p: EcPointFixed): EcPointJacobianFixed =
+    if p.inf:
+        return pointJacobianInfinityFixed()
+    return EcPointJacobianFixed(x: p.x, y: p.y, z: p256FieldFixedOne(), inf: false)
+
+fn pointJacobianCopyFixed(p: EcPointJacobianFixed): EcPointJacobianFixed =
+    var out: EcPointJacobianFixed
+    out.x = p.x
+    out.y = p.y
+    out.z = p.z
+    out.inf = p.inf
+    return out
+
+fn pointJacobianToAffineFixed(p: EcPointJacobianFixed): Result[EcPointFixed] =
+    if p.inf || pfix.p256FixedIsZero(p.z):
+        return Ok[EcPointFixed](pointInfinityFixed())
+    if p256FieldFixedIsOne(p.z):
+        return Ok[EcPointFixed](EcPointFixed(x: p.x, y: p.y, inf: false))
+    let zInvRes: Result[pfix.P256Fixed] = p256FieldFixedInv(p.z)
+    if IsErr(zInvRes):
+        return Err[EcPointFixed](Error(zInvRes))
+    let zInv: pfix.P256Fixed = Value(zInvRes)
+    let zInv2: pfix.P256Fixed = p256FieldFixedSquareCrash(zInv)
+    let zInv3: pfix.P256Fixed = p256FieldFixedMulCrash(zInv2, zInv)
+    let x: pfix.P256Fixed = p256FieldFixedMulCrash(p.x, zInv2)
+    let y: pfix.P256Fixed = p256FieldFixedMulCrash(p.y, zInv3)
+    return Ok[EcPointFixed](EcPointFixed(x: x, y: y, inf: false))
+
+fn pointJacobianXToScalarBigInt(p: EcPointJacobianFixed): Result[BigInt] =
+    var reduced: pfix.P256Fixed = pointJacobianXToScalarFixedCrash(p)
+    return Ok[BigInt](pfix.p256FixedToBigInt(reduced))
+
+fn pointJacobianXToScalarFixedCrash(p: EcPointJacobianFixed): pfix.P256Fixed =
+    if p.inf || pfix.p256FixedIsZero(p.z):
+        crash("ecdsa: jacobian point at infinity")
+    var xNorm: pfix.P256Fixed
+    if p256FieldFixedIsOne(p.z):
+        let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.x)
+        if IsErr(xNormRes):
+            crash("ecdsa: x fromMont failed " + Error(xNormRes))
+        xNorm = Value(xNormRes)
+    else:
+        let zInvRes: Result[pfix.P256Fixed] = p256FieldFixedInv(p.z)
+        if IsErr(zInvRes):
+            crash("ecdsa: z inverse failed " + Error(zInvRes))
+        let zInv2: pfix.P256Fixed = p256FieldFixedSquareCrash(Value(zInvRes))
+        let xMont: pfix.P256Fixed = p256FieldFixedMulCrash(p.x, zInv2)
+        let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(xMont)
+        if IsErr(xNormRes):
+            crash("ecdsa: x normalize failed " + Error(xNormRes))
+        xNorm = Value(xNormRes)
+    return p256FieldFixedXReduceToScalarFixed(xNorm)
+
+fn p256FieldFixedXReduceToScalarBigInt(xNorm: pfix.P256Fixed): BigInt =
+    var reduced: pfix.P256Fixed = p256FieldFixedXReduceToScalarFixed(xNorm)
+    return pfix.p256FixedToBigInt(reduced)
+
+fn p256FieldFixedXReduceToScalarFixed(xNorm: pfix.P256Fixed): pfix.P256Fixed =
+    var reduced: pfix.P256Fixed = xNorm
+    var nModulus: pfix.P256Fixed = p256NCtxFixed.modulus
+    if pfix.p256FixedCmp(reduced, nModulus) >= 0:
+        reduced = pfix.p256FixedModSubTrusted(reduced, nModulus, nModulus)
+    return reduced
+
+fn pointJacobianDoubleFixed(p: EcPointJacobianFixed): EcPointJacobianFixed =
+    if p.inf || pfix.p256FixedIsZero(p.y):
+        return pointJacobianInfinityFixed()
+    let delta: pfix.P256Fixed = p256FieldFixedSquareCrash(p.z)
+    let gamma: pfix.P256Fixed = p256FieldFixedSquareCrash(p.y)
+    let beta: pfix.P256Fixed = p256FieldFixedMulCrash(p.x, gamma)
+    let xMinusDelta: pfix.P256Fixed = p256FieldFixedSubCrash(p.x, delta)
+    let xPlusDelta: pfix.P256Fixed = p256FieldFixedAddCrash(p.x, delta)
+    let alphaBase: pfix.P256Fixed = p256FieldFixedMulCrash(xMinusDelta, xPlusDelta)
+    let alpha: pfix.P256Fixed = p256FieldFixedTripleCrash(alphaBase)
+    let alpha2: pfix.P256Fixed = p256FieldFixedSquareCrash(alpha)
+    let beta4: pfix.P256Fixed = p256FieldFixedQuadCrash(beta)
+    let beta8: pfix.P256Fixed = p256FieldFixedDoubleCrash(beta4)
+    let x3: pfix.P256Fixed = p256FieldFixedSubCrash(alpha2, beta8)
+    let yPlusZ: pfix.P256Fixed = p256FieldFixedAddCrash(p.y, p.z)
+    let yPlusZ2: pfix.P256Fixed = p256FieldFixedSquareCrash(yPlusZ)
+    let z3a: pfix.P256Fixed = p256FieldFixedSubCrash(yPlusZ2, gamma)
+    let z3: pfix.P256Fixed = p256FieldFixedSubCrash(z3a, delta)
+    let gamma2: pfix.P256Fixed = p256FieldFixedSquareCrash(gamma)
+    let gamma8: pfix.P256Fixed = p256FieldFixedEightCrash(gamma2)
+    let beta4MinusX3: pfix.P256Fixed = p256FieldFixedSubCrash(beta4, x3)
+    let y3a: pfix.P256Fixed = p256FieldFixedMulCrash(alpha, beta4MinusX3)
+    let y3: pfix.P256Fixed = p256FieldFixedSubCrash(y3a, gamma8)
+    return EcPointJacobianFixed(x: x3, y: y3, z: z3, inf: false)
+
+fn pointJacobianDoubleFixedInPlace(p: var EcPointJacobianFixed) =
+    if p.inf || pfix.p256FixedIsZero(p.y):
+        pointJacobianSetInfinityFixed(p)
+        return
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var modulus: pfix.P256Fixed = ctx.modulus
+    var scratch: pfix.P256FixedMontgomeryScratch
+    var delta: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(delta, p.z, ctx, scratch)
+    var gamma: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(gamma, p.y, ctx, scratch)
+    var beta: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(beta, p.x, gamma, ctx, scratch)
+    var xMinusDelta: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(xMinusDelta, p.x, delta, modulus)
+    var xPlusDelta: pfix.P256Fixed
+    pfix.p256FixedModAddTrustedInto(xPlusDelta, p.x, delta, modulus)
+    var alphaBase: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(alphaBase, xMinusDelta, xPlusDelta, ctx, scratch)
+    let alpha: pfix.P256Fixed = p256FieldFixedTripleCrash(alphaBase)
+    var alpha2: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(alpha2, alpha, ctx, scratch)
+    let beta4: pfix.P256Fixed = p256FieldFixedQuadCrash(beta)
+    let beta8: pfix.P256Fixed = p256FieldFixedDoubleCrash(beta4)
+    var x3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(x3, alpha2, beta8, modulus)
+    var yPlusZ: pfix.P256Fixed
+    pfix.p256FixedModAddTrustedInto(yPlusZ, p.y, p.z, modulus)
+    var yPlusZ2: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(yPlusZ2, yPlusZ, ctx, scratch)
+    var z3a: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(z3a, yPlusZ2, gamma, modulus)
+    var z3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(z3, z3a, delta, modulus)
+    var gamma2: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(gamma2, gamma, ctx, scratch)
+    let gamma8: pfix.P256Fixed = p256FieldFixedEightCrash(gamma2)
+    var beta4MinusX3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(beta4MinusX3, beta4, x3, modulus)
+    var y3a: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(y3a, alpha, beta4MinusX3, ctx, scratch)
+    var y3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(y3, y3a, gamma8, modulus)
+    p.x = x3
+    p.y = y3
+    p.z = z3
+    p.inf = false
+
+fn pointJacobianAddFixed(p1: EcPointJacobianFixed, p2: EcPointJacobianFixed): EcPointJacobianFixed =
+    if p1.inf || pfix.p256FixedIsZero(p1.z):
+        return p2
+    if p2.inf || pfix.p256FixedIsZero(p2.z):
+        return p1
+    let z1z1: pfix.P256Fixed = p256FieldFixedSquareCrash(p1.z)
+    let z2z2: pfix.P256Fixed = p256FieldFixedSquareCrash(p2.z)
+    let u1: pfix.P256Fixed = p256FieldFixedMulCrash(p1.x, z2z2)
+    let u2: pfix.P256Fixed = p256FieldFixedMulCrash(p2.x, z1z1)
+    let z1Cubed: pfix.P256Fixed = p256FieldFixedMulCrash(p1.z, z1z1)
+    let z2Cubed: pfix.P256Fixed = p256FieldFixedMulCrash(p2.z, z2z2)
+    let s1: pfix.P256Fixed = p256FieldFixedMulCrash(p1.y, z2Cubed)
+    let s2: pfix.P256Fixed = p256FieldFixedMulCrash(p2.y, z1Cubed)
+    if pfix.p256FixedCmp(u1, u2) == 0:
+        if pfix.p256FixedCmp(s1, s2) != 0:
+            return pointJacobianInfinityFixed()
+        return pointJacobianDoubleFixed(p1)
+    let h: pfix.P256Fixed = p256FieldFixedSubCrash(u2, u1)
+    let twoH: pfix.P256Fixed = p256FieldFixedDoubleCrash(h)
+    let i: pfix.P256Fixed = p256FieldFixedSquareCrash(twoH)
+    let j: pfix.P256Fixed = p256FieldFixedMulCrash(h, i)
+    let sDiff: pfix.P256Fixed = p256FieldFixedSubCrash(s2, s1)
+    let r: pfix.P256Fixed = p256FieldFixedDoubleCrash(sDiff)
+    let v: pfix.P256Fixed = p256FieldFixedMulCrash(u1, i)
+    let r2: pfix.P256Fixed = p256FieldFixedSquareCrash(r)
+    let twoV: pfix.P256Fixed = p256FieldFixedDoubleCrash(v)
+    let x3a: pfix.P256Fixed = p256FieldFixedSubCrash(r2, j)
+    let x3: pfix.P256Fixed = p256FieldFixedSubCrash(x3a, twoV)
+    let vMinusX3: pfix.P256Fixed = p256FieldFixedSubCrash(v, x3)
+    let s1j: pfix.P256Fixed = p256FieldFixedMulCrash(s1, j)
+    let twoS1J: pfix.P256Fixed = p256FieldFixedDoubleCrash(s1j)
+    let y3a: pfix.P256Fixed = p256FieldFixedMulCrash(r, vMinusX3)
+    let y3: pfix.P256Fixed = p256FieldFixedSubCrash(y3a, twoS1J)
+    let z1PlusZ2: pfix.P256Fixed = p256FieldFixedAddCrash(p1.z, p2.z)
+    let z1PlusZ2Sq: pfix.P256Fixed = p256FieldFixedSquareCrash(z1PlusZ2)
+    let z3a: pfix.P256Fixed = p256FieldFixedSubCrash(z1PlusZ2Sq, z1z1)
+    let z3b: pfix.P256Fixed = p256FieldFixedSubCrash(z3a, z2z2)
+    let z3: pfix.P256Fixed = p256FieldFixedMulCrash(z3b, h)
+    return EcPointJacobianFixed(x: x3, y: y3, z: z3, inf: false)
+
+fn pointJacobianAddAffineFixed(p1: EcPointJacobianFixed, p2: EcPointFixed): EcPointJacobianFixed =
+    if p2.inf:
+        return p1
+    if p1.inf || pfix.p256FixedIsZero(p1.z):
+        return pointJacobianFromAffineFixed(p2)
+    let z1z1: pfix.P256Fixed = p256FieldFixedSquareCrash(p1.z)
+    let u2: pfix.P256Fixed = p256FieldFixedMulCrash(p2.x, z1z1)
+    let z1Cubed: pfix.P256Fixed = p256FieldFixedMulCrash(p1.z, z1z1)
+    let s2: pfix.P256Fixed = p256FieldFixedMulCrash(p2.y, z1Cubed)
+    if pfix.p256FixedCmp(p1.x, u2) == 0:
+        if pfix.p256FixedCmp(p1.y, s2) != 0:
+            return pointJacobianInfinityFixed()
+        return pointJacobianDoubleFixed(p1)
+    let h: pfix.P256Fixed = p256FieldFixedSubCrash(u2, p1.x)
+    let hh: pfix.P256Fixed = p256FieldFixedSquareCrash(h)
+    let i: pfix.P256Fixed = p256FieldFixedQuadCrash(hh)
+    let j: pfix.P256Fixed = p256FieldFixedMulCrash(h, i)
+    let yDiff: pfix.P256Fixed = p256FieldFixedSubCrash(s2, p1.y)
+    let r: pfix.P256Fixed = p256FieldFixedDoubleCrash(yDiff)
+    let v: pfix.P256Fixed = p256FieldFixedMulCrash(p1.x, i)
+    let r2: pfix.P256Fixed = p256FieldFixedSquareCrash(r)
+    let twoV: pfix.P256Fixed = p256FieldFixedDoubleCrash(v)
+    let x3a: pfix.P256Fixed = p256FieldFixedSubCrash(r2, j)
+    let x3: pfix.P256Fixed = p256FieldFixedSubCrash(x3a, twoV)
+    let vMinusX3: pfix.P256Fixed = p256FieldFixedSubCrash(v, x3)
+    let y1j: pfix.P256Fixed = p256FieldFixedMulCrash(p1.y, j)
+    let twoY1J: pfix.P256Fixed = p256FieldFixedDoubleCrash(y1j)
+    let y3a: pfix.P256Fixed = p256FieldFixedMulCrash(r, vMinusX3)
+    let y3: pfix.P256Fixed = p256FieldFixedSubCrash(y3a, twoY1J)
+    let z1PlusH: pfix.P256Fixed = p256FieldFixedAddCrash(p1.z, h)
+    let z1PlusHSq: pfix.P256Fixed = p256FieldFixedSquareCrash(z1PlusH)
+    let z3a: pfix.P256Fixed = p256FieldFixedSubCrash(z1PlusHSq, z1z1)
+    let z3: pfix.P256Fixed = p256FieldFixedSubCrash(z3a, hh)
+    return EcPointJacobianFixed(x: x3, y: y3, z: z3, inf: false)
+
+fn pointJacobianAddAffineFixedInPlace(p1: var EcPointJacobianFixed, p2: EcPointFixed) =
+    if p2.inf:
+        return
+    if p1.inf || pfix.p256FixedIsZero(p1.z):
+        pointJacobianSetFromAffineFixed(p1, p2)
+        return
+    var ctx: pfix.P256FixedMontgomeryContext = p256PCtxFixed
+    var modulus: pfix.P256Fixed = ctx.modulus
+    var scratch: pfix.P256FixedMontgomeryScratch
+    var z1z1: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(z1z1, p1.z, ctx, scratch)
+    var u2: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(u2, p2.x, z1z1, ctx, scratch)
+    var z1Cubed: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(z1Cubed, p1.z, z1z1, ctx, scratch)
+    var s2: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(s2, p2.y, z1Cubed, ctx, scratch)
+    if pfix.p256FixedCmp(p1.x, u2) == 0:
+        if pfix.p256FixedCmp(p1.y, s2) != 0:
+            pointJacobianSetInfinityFixed(p1)
+            return
+        pointJacobianDoubleFixedInPlace(p1)
+        return
+    var h: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(h, u2, p1.x, modulus)
+    var hh: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(hh, h, ctx, scratch)
+    let i: pfix.P256Fixed = p256FieldFixedQuadCrash(hh)
+    var j: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(j, h, i, ctx, scratch)
+    let yDiff: pfix.P256Fixed = p256FieldFixedSubCrash(s2, p1.y)
+    let r: pfix.P256Fixed = p256FieldFixedDoubleCrash(yDiff)
+    var v: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(v, p1.x, i, ctx, scratch)
+    var r2: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(r2, r, ctx, scratch)
+    let twoV: pfix.P256Fixed = p256FieldFixedDoubleCrash(v)
+    var x3a: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(x3a, r2, j, modulus)
+    var x3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(x3, x3a, twoV, modulus)
+    var vMinusX3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(vMinusX3, v, x3, modulus)
+    var y1j: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(y1j, p1.y, j, ctx, scratch)
+    let twoY1J: pfix.P256Fixed = p256FieldFixedDoubleCrash(y1j)
+    var y3a: pfix.P256Fixed
+    pfix.p256FixedMontgomeryMulCoreTrustedScratchInto(y3a, r, vMinusX3, ctx, scratch)
+    var y3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(y3, y3a, twoY1J, modulus)
+    var z1PlusH: pfix.P256Fixed
+    pfix.p256FixedModAddTrustedInto(z1PlusH, p1.z, h, modulus)
+    var z1PlusHSq: pfix.P256Fixed
+    pfix.p256FixedMontgomerySquareCoreTrustedScratchInto(z1PlusHSq, z1PlusH, ctx, scratch)
+    var z3a: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(z3a, z1PlusHSq, z1z1, modulus)
+    var z3: pfix.P256Fixed
+    pfix.p256FixedModSubTrustedInto(z3, z3a, hh, modulus)
+    p1.x = x3
+    p1.y = y3
+    p1.z = z3
+    p1.inf = false
+
+fn p256FixedWindowNibble(scalar: pfix.P256Fixed, baseBit: int32): int32 =
+    var out: int32 = 0
+    var shift: int32 = 0
+    while shift < 4:
+        out = out | (pfix.p256FixedGetBit(scalar, baseBit + shift) << shift)
+        shift = shift + 1
+    return out
+
+fn pointJacobianBatchToAffineWindow16Into(table: EcPointJacobianFixed[16],
+                                         outTable: var EcPointFixed[16]): Result[bool] =
+    var prefixes: pfix.P256Fixed[16]
+    prefixes[0] = p256FieldFixedOne()
+    prefixes[1] = table[1].z
+    var i: int32 = 2
+    while i < 16:
+        let prefixRes: Result[pfix.P256Fixed] = p256FieldFixedMul(prefixes[i - 1], table[i].z)
+        if IsErr(prefixRes):
+            return Err[bool](Error(prefixRes))
+        prefixes[i] = Value(prefixRes)
+        i = i + 1
+    let invRes: Result[pfix.P256Fixed] = p256FieldFixedInv(prefixes[15])
+    if IsErr(invRes):
+        return Err[bool](Error(invRes))
+    var suffixInv: pfix.P256Fixed = Value(invRes)
+    i = 15
+    while i >= 2:
+        let ziInvRes: Result[pfix.P256Fixed] = p256FieldFixedMul(prefixes[i - 1], suffixInv)
+        if IsErr(ziInvRes):
+            return Err[bool](Error(ziInvRes))
+        let ziInv: pfix.P256Fixed = Value(ziInvRes)
+        let ziInv2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(ziInv)
+        if IsErr(ziInv2Res):
+            return Err[bool](Error(ziInv2Res))
+        let ziInv3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(Value(ziInv2Res), ziInv)
+        if IsErr(ziInv3Res):
+            return Err[bool](Error(ziInv3Res))
+        let xRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].x, Value(ziInv2Res))
+        if IsErr(xRes):
+            return Err[bool](Error(xRes))
+        let yRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].y, Value(ziInv3Res))
+        if IsErr(yRes):
+            return Err[bool](Error(yRes))
+        outTable[i] = EcPointFixed(x: Value(xRes), y: Value(yRes), inf: false)
+        let nextSuffixRes: Result[pfix.P256Fixed] = p256FieldFixedMul(suffixInv, table[i].z)
+        if IsErr(nextSuffixRes):
+            return Err[bool](Error(nextSuffixRes))
+        suffixInv = Value(nextSuffixRes)
+        i = i - 1
+    let ziInv: pfix.P256Fixed = suffixInv
+    let ziInv2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(ziInv)
+    if IsErr(ziInv2Res):
+        return Err[bool](Error(ziInv2Res))
+    let ziInv3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(Value(ziInv2Res), ziInv)
+    if IsErr(ziInv3Res):
+        return Err[bool](Error(ziInv3Res))
+    let xRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[1].x, Value(ziInv2Res))
+    if IsErr(xRes):
+        return Err[bool](Error(xRes))
+    let yRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[1].y, Value(ziInv3Res))
+    if IsErr(yRes):
+        return Err[bool](Error(yRes))
+    outTable[1] = EcPointFixed(x: Value(xRes), y: Value(yRes), inf: false)
+    outTable[0] = pointInfinityFixed()
+    return Ok[bool](true)
+
+fn pointJacobianBatchToAffineWindow16(table: EcPointJacobianFixed[16]): Result[bool] =
+    return pointJacobianBatchToAffineWindow16Into(table, p256GWindow4)
+
+fn pointMulFixedWindowed(scalar: pfix.P256Fixed, p: EcPointFixed): Result[EcPointFixed] =
+    var table: EcPointJacobianFixed[16]
+    var affineTable: EcPointFixed[16]
+    var tableIdx: int32 = 2
+    var windowBase: int32 = (8 * 32) - 4
+    var nibble: int32 = 0
+    table[0] = pointJacobianInfinityFixed()
+    table[1] = pointJacobianFromAffineFixed(p)
+    while tableIdx < 16:
+        table[tableIdx] = pointJacobianAddFixed(table[tableIdx - 1], table[1])
+        tableIdx = tableIdx + 1
+    let affineRes: Result[bool] = pointJacobianBatchToAffineWindow16Into(table, affineTable)
+    if IsErr(affineRes):
+        return Err[EcPointFixed](Error(affineRes))
+    var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
+    while windowBase >= 0:
+        var dblCount: int32 = 0
+        while dblCount < 4:
+            pointJacobianDoubleFixedInPlace(result)
+            dblCount = dblCount + 1
+        nibble = p256FixedWindowNibble(scalar, windowBase)
+        if nibble != 0:
+            pointJacobianAddAffineFixedInPlace(result, affineTable[nibble])
+        windowBase = windowBase - 4
+    return pointJacobianToAffineFixed(result)
+
+fn pointMulGeneratorAndFixedShamir(u1: pfix.P256Fixed, u2: pfix.P256Fixed, p: EcPointFixed): Result[EcPointJacobianFixed] =
+    var table: EcPointJacobianFixed[16]
+    var affineTable: EcPointFixed[16]
+    var tableIdx: int32 = 2
+    var windowBase: int32 = (8 * 32) - 4
+    table[0] = pointJacobianInfinityFixed()
+    table[1] = pointJacobianFromAffineFixed(p)
+    while tableIdx < 16:
+        table[tableIdx] = pointJacobianAddFixed(table[tableIdx - 1], table[1])
+        tableIdx = tableIdx + 1
+    let affineRes: Result[bool] = pointJacobianBatchToAffineWindow16Into(table, affineTable)
+    if IsErr(affineRes):
+        return Err[EcPointJacobianFixed](Error(affineRes))
+    var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
+    while windowBase >= 0:
+        var dblCount: int32 = 0
+        while dblCount < 4:
+            pointJacobianDoubleFixedInPlace(result)
+            dblCount = dblCount + 1
+        let nibble1: int32 = p256FixedWindowNibble(u1, windowBase)
+        let nibble2: int32 = p256FixedWindowNibble(u2, windowBase)
+        if nibble1 != 0:
+            pointJacobianAddAffineFixedInPlace(result, p256GWindow4[nibble1])
+        if nibble2 != 0:
+            pointJacobianAddAffineFixedInPlace(result, affineTable[nibble2])
+        windowBase = windowBase - 4
+    return Ok[EcPointJacobianFixed](result)
+
+fn pointAffineNegateFixed(p: EcPointFixed): Result[EcPointFixed] =
+    if p.inf:
+        return Ok[EcPointFixed](p)
+    let yNegRes: Result[pfix.P256Fixed] = p256FieldFixedSub(p256FieldFixedZero(), p.y)
+    if IsErr(yNegRes):
+        return Err[EcPointFixed](Error(yNegRes))
+    return Ok[EcPointFixed](EcPointFixed(x: p.x, y: Value(yNegRes), inf: false))
+
+fn pointMulGeneratorWnaf(k: BigInt): Result[EcPointFixed] =
+    let scalarRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(k)
+    if IsErr(scalarRes):
+        return Err[EcPointFixed](Error(scalarRes))
+    return pointMulGeneratorWnafFixed(Value(scalarRes))
+
+fn pointMulGeneratorJacobianWnafFixed(k: pfix.P256Fixed): EcPointJacobianFixed =
+    var digits: int32[260]
+    var digitCount: int32 = 0
+    var work: pfix.P256Fixed = k
+    while ! p256ScalarFixedIsZero(work):
+        var digit: int32 = 0
+        if p256ScalarFixedIsOdd(work):
+            digit = p256ScalarFixedLow5(work)
+            if digit > 16:
+                digit = digit - 32
+            if digit > 0:
+                work = p256ScalarFixedSubSmall(work, digit)
+            else:
+                work = p256ScalarFixedAddSmall(work, -digit)
+        digits[digitCount] = digit
+        digitCount = digitCount + 1
+        work = p256ScalarFixedShiftRight1(work)
+    var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
+    let __for_start_i = digitCount - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        pointJacobianDoubleFixedInPlace(result)
+        let digit: int32 = digits[i]
+        if digit > 0:
+            pointJacobianAddAffineFixedInPlace(result, p256GWindow4[digit])
+        elif digit < 0:
+            pointJacobianAddAffineFixedInPlace(result, p256GWindow4Neg[-digit])
+    return result
+
+fn pointMulGeneratorJacobianComb6FixedInto(result: var EcPointJacobianFixed, k: pfix.P256Fixed) =
+    pointJacobianSetInfinityFixed(result)
+    var started: bool = false
+    let __for_start_row = p256GeneratorComb6Depth - 1
+    for __for_rev_row in 0..(__for_start_row - (0)):
+        let row = __for_start_row - __for_rev_row
+        let digit: int32 = p256ScalarFixedComb6Digit(k, row)
+        if ! started:
+            if digit == 0:
+                continue
+            pointJacobianSetFromAffineFixed(result, p256GComb6[digit])
+            started = true
+            continue
+        pointJacobianDoubleFixedInPlace(result)
+        if digit != 0:
+            pointJacobianAddAffineFixedInPlace(result, p256GComb6[digit])
+
+fn pointMulGeneratorWnafFixed(k: pfix.P256Fixed): Result[EcPointFixed] =
+    var result: EcPointJacobianFixed
+    pointMulGeneratorJacobianComb6FixedInto(result, k)
+    return pointJacobianToAffineFixed(result)
+
+fn pointMulGeneratorR(k: BigInt): Result[BigInt] =
+    let scalarRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(k)
+    if IsErr(scalarRes):
+        return Err[BigInt](Error(scalarRes))
+    var scalar: pfix.P256Fixed = Value(scalarRes)
+    var reduced: pfix.P256Fixed = pointMulGeneratorRFixedCrash(scalar)
+    return Ok[BigInt](pfix.p256FixedToBigInt(reduced))
+
+fn pointMulGeneratorRFixedCrash(k: pfix.P256Fixed): pfix.P256Fixed =
+    var result: EcPointJacobianFixed
+    pointMulGeneratorJacobianComb6FixedInto(result, k)
+    return pointJacobianXToScalarFixedCrash(result)
 
 fn isInfinity(p: EcPoint): bool =
     return p.inf
 
 fn pointInfinity(): EcPoint =
     EcPoint(x: bigZero(), y: bigZero(), inf: true)
+
+fn pointJacobianInfinity(): EcPointJacobian =
+    EcPointJacobian(x: bigZero(), y: bigZero(), z: bigZero(), inf: true)
+
+fn pointJacobianFromAffine(p: EcPoint): EcPointJacobian =
+    if p.inf:
+        return pointJacobianInfinity()
+    return EcPointJacobian(x: p.x, y: p.y, z: bigFromInt(1), inf: false)
+
+fn pointJacobianToAffine(p: EcPointJacobian): Result[EcPoint] =
+    if p.inf || bigIsZero(p.z):
+        return Ok[EcPoint](pointInfinity())
+    let zInvRes: Result[BigInt] = p256ModInv(p.z)
+    if IsErr(zInvRes):
+        return Err[EcPoint](Error(zInvRes))
+    let zInv: BigInt = Value(zInvRes)
+    let zInv2Res: Result[BigInt] = p256ModMul(zInv, zInv)
+    if IsErr(zInv2Res):
+        return Err[EcPoint](Error(zInv2Res))
+    let zInv3Res: Result[BigInt] = p256ModMul(Value(zInv2Res), zInv)
+    if IsErr(zInv3Res):
+        return Err[EcPoint](Error(zInv3Res))
+    let xRes: Result[BigInt] = p256ModMul(p.x, Value(zInv2Res))
+    if IsErr(xRes):
+        return Err[EcPoint](Error(xRes))
+    let yRes: Result[BigInt] = p256ModMul(p.y, Value(zInv3Res))
+    if IsErr(yRes):
+        return Err[EcPoint](Error(yRes))
+    return Ok[EcPoint](EcPoint(x: Value(xRes), y: Value(yRes), inf: false))
+
+fn p256ModDouble(a: BigInt): Result[BigInt] =
+    return p256ModAdd(a, a)
+
+fn p256ModTriple(a: BigInt): Result[BigInt] =
+    let dblRes: Result[BigInt] = p256ModDouble(a)
+    if IsErr(dblRes):
+        return Err[BigInt](Error(dblRes))
+    return p256ModAdd(Value(dblRes), a)
+
+fn p256ModQuad(a: BigInt): Result[BigInt] =
+    let dblRes: Result[BigInt] = p256ModDouble(a)
+    if IsErr(dblRes):
+        return Err[BigInt](Error(dblRes))
+    return p256ModDouble(Value(dblRes))
+
+fn p256ModEight(a: BigInt): Result[BigInt] =
+    let quadRes: Result[BigInt] = p256ModQuad(a)
+    if IsErr(quadRes):
+        return Err[BigInt](Error(quadRes))
+    return p256ModDouble(Value(quadRes))
+
+fn pointJacobianDouble(p: EcPointJacobian): Result[EcPointJacobian] =
+    if p.inf || bigIsZero(p.y):
+        return Ok[EcPointJacobian](pointJacobianInfinity())
+    let deltaRes: Result[BigInt] = p256ModMul(p.z, p.z)
+    if IsErr(deltaRes):
+        return Err[EcPointJacobian](Error(deltaRes))
+    let gammaRes: Result[BigInt] = p256ModMul(p.y, p.y)
+    if IsErr(gammaRes):
+        return Err[EcPointJacobian](Error(gammaRes))
+    let betaRes: Result[BigInt] = p256ModMul(p.x, Value(gammaRes))
+    if IsErr(betaRes):
+        return Err[EcPointJacobian](Error(betaRes))
+    let xMinusDeltaRes: Result[BigInt] = p256ModSub(p.x, Value(deltaRes))
+    if IsErr(xMinusDeltaRes):
+        return Err[EcPointJacobian](Error(xMinusDeltaRes))
+    let xPlusDeltaRes: Result[BigInt] = p256ModAdd(p.x, Value(deltaRes))
+    if IsErr(xPlusDeltaRes):
+        return Err[EcPointJacobian](Error(xPlusDeltaRes))
+    let alphaBaseRes: Result[BigInt] = p256ModMul(Value(xMinusDeltaRes), Value(xPlusDeltaRes))
+    if IsErr(alphaBaseRes):
+        return Err[EcPointJacobian](Error(alphaBaseRes))
+    let alphaRes: Result[BigInt] = p256ModTriple(Value(alphaBaseRes))
+    if IsErr(alphaRes):
+        return Err[EcPointJacobian](Error(alphaRes))
+    let alpha2Res: Result[BigInt] = p256ModMul(Value(alphaRes), Value(alphaRes))
+    if IsErr(alpha2Res):
+        return Err[EcPointJacobian](Error(alpha2Res))
+    let beta4Res: Result[BigInt] = p256ModQuad(Value(betaRes))
+    if IsErr(beta4Res):
+        return Err[EcPointJacobian](Error(beta4Res))
+    let beta8Res: Result[BigInt] = p256ModDouble(Value(beta4Res))
+    if IsErr(beta8Res):
+        return Err[EcPointJacobian](Error(beta8Res))
+    let x3Res: Result[BigInt] = p256ModSub(Value(alpha2Res), Value(beta8Res))
+    if IsErr(x3Res):
+        return Err[EcPointJacobian](Error(x3Res))
+    let yPlusZRes: Result[BigInt] = p256ModAdd(p.y, p.z)
+    if IsErr(yPlusZRes):
+        return Err[EcPointJacobian](Error(yPlusZRes))
+    let yPlusZ2Res: Result[BigInt] = p256ModMul(Value(yPlusZRes), Value(yPlusZRes))
+    if IsErr(yPlusZ2Res):
+        return Err[EcPointJacobian](Error(yPlusZ2Res))
+    let z3aRes: Result[BigInt] = p256ModSub(Value(yPlusZ2Res), Value(gammaRes))
+    if IsErr(z3aRes):
+        return Err[EcPointJacobian](Error(z3aRes))
+    let z3Res: Result[BigInt] = p256ModSub(Value(z3aRes), Value(deltaRes))
+    if IsErr(z3Res):
+        return Err[EcPointJacobian](Error(z3Res))
+    let gamma2Res: Result[BigInt] = p256ModMul(Value(gammaRes), Value(gammaRes))
+    if IsErr(gamma2Res):
+        return Err[EcPointJacobian](Error(gamma2Res))
+    let gamma8Res: Result[BigInt] = p256ModEight(Value(gamma2Res))
+    if IsErr(gamma8Res):
+        return Err[EcPointJacobian](Error(gamma8Res))
+    let beta4MinusX3Res: Result[BigInt] = p256ModSub(Value(beta4Res), Value(x3Res))
+    if IsErr(beta4MinusX3Res):
+        return Err[EcPointJacobian](Error(beta4MinusX3Res))
+    let y3aRes: Result[BigInt] = p256ModMul(Value(alphaRes), Value(beta4MinusX3Res))
+    if IsErr(y3aRes):
+        return Err[EcPointJacobian](Error(y3aRes))
+    let y3Res: Result[BigInt] = p256ModSub(Value(y3aRes), Value(gamma8Res))
+    if IsErr(y3Res):
+        return Err[EcPointJacobian](Error(y3Res))
+    return Ok[EcPointJacobian](EcPointJacobian(x: Value(x3Res), y: Value(y3Res), z: Value(z3Res), inf: false))
+
+fn pointJacobianAdd(p1: EcPointJacobian, p2: EcPointJacobian): Result[EcPointJacobian] =
+    if p1.inf || bigIsZero(p1.z):
+        return Ok[EcPointJacobian](p2)
+    if p2.inf || bigIsZero(p2.z):
+        return Ok[EcPointJacobian](p1)
+    let z1z1Res: Result[BigInt] = p256ModMul(p1.z, p1.z)
+    if IsErr(z1z1Res):
+        return Err[EcPointJacobian](Error(z1z1Res))
+    let z2z2Res: Result[BigInt] = p256ModMul(p2.z, p2.z)
+    if IsErr(z2z2Res):
+        return Err[EcPointJacobian](Error(z2z2Res))
+    let u1Res: Result[BigInt] = p256ModMul(p1.x, Value(z2z2Res))
+    if IsErr(u1Res):
+        return Err[EcPointJacobian](Error(u1Res))
+    let u2Res: Result[BigInt] = p256ModMul(p2.x, Value(z1z1Res))
+    if IsErr(u2Res):
+        return Err[EcPointJacobian](Error(u2Res))
+    let z1CubedRes: Result[BigInt] = p256ModMul(p1.z, Value(z1z1Res))
+    if IsErr(z1CubedRes):
+        return Err[EcPointJacobian](Error(z1CubedRes))
+    let z2CubedRes: Result[BigInt] = p256ModMul(p2.z, Value(z2z2Res))
+    if IsErr(z2CubedRes):
+        return Err[EcPointJacobian](Error(z2CubedRes))
+    let s1Res: Result[BigInt] = p256ModMul(p1.y, Value(z2CubedRes))
+    if IsErr(s1Res):
+        return Err[EcPointJacobian](Error(s1Res))
+    let s2Res: Result[BigInt] = p256ModMul(p2.y, Value(z1CubedRes))
+    if IsErr(s2Res):
+        return Err[EcPointJacobian](Error(s2Res))
+    if bigCmp(Value(u1Res), Value(u2Res)) == 0:
+        if bigCmp(Value(s1Res), Value(s2Res)) != 0:
+            return Ok[EcPointJacobian](pointJacobianInfinity())
+        return pointJacobianDouble(p1)
+    let hRes: Result[BigInt] = p256ModSub(Value(u2Res), Value(u1Res))
+    if IsErr(hRes):
+        return Err[EcPointJacobian](Error(hRes))
+    let twoHRes: Result[BigInt] = p256ModDouble(Value(hRes))
+    if IsErr(twoHRes):
+        return Err[EcPointJacobian](Error(twoHRes))
+    let iRes: Result[BigInt] = p256ModMul(Value(twoHRes), Value(twoHRes))
+    if IsErr(iRes):
+        return Err[EcPointJacobian](Error(iRes))
+    let jRes: Result[BigInt] = p256ModMul(Value(hRes), Value(iRes))
+    if IsErr(jRes):
+        return Err[EcPointJacobian](Error(jRes))
+    let sDiffRes: Result[BigInt] = p256ModSub(Value(s2Res), Value(s1Res))
+    if IsErr(sDiffRes):
+        return Err[EcPointJacobian](Error(sDiffRes))
+    let rRes: Result[BigInt] = p256ModDouble(Value(sDiffRes))
+    if IsErr(rRes):
+        return Err[EcPointJacobian](Error(rRes))
+    let vRes: Result[BigInt] = p256ModMul(Value(u1Res), Value(iRes))
+    if IsErr(vRes):
+        return Err[EcPointJacobian](Error(vRes))
+    let r2Res: Result[BigInt] = p256ModMul(Value(rRes), Value(rRes))
+    if IsErr(r2Res):
+        return Err[EcPointJacobian](Error(r2Res))
+    let twoVRes: Result[BigInt] = p256ModDouble(Value(vRes))
+    if IsErr(twoVRes):
+        return Err[EcPointJacobian](Error(twoVRes))
+    let x3aRes: Result[BigInt] = p256ModSub(Value(r2Res), Value(jRes))
+    if IsErr(x3aRes):
+        return Err[EcPointJacobian](Error(x3aRes))
+    let x3Res: Result[BigInt] = p256ModSub(Value(x3aRes), Value(twoVRes))
+    if IsErr(x3Res):
+        return Err[EcPointJacobian](Error(x3Res))
+    let vMinusX3Res: Result[BigInt] = p256ModSub(Value(vRes), Value(x3Res))
+    if IsErr(vMinusX3Res):
+        return Err[EcPointJacobian](Error(vMinusX3Res))
+    let s1jRes: Result[BigInt] = p256ModMul(Value(s1Res), Value(jRes))
+    if IsErr(s1jRes):
+        return Err[EcPointJacobian](Error(s1jRes))
+    let twoS1JRes: Result[BigInt] = p256ModDouble(Value(s1jRes))
+    if IsErr(twoS1JRes):
+        return Err[EcPointJacobian](Error(twoS1JRes))
+    let y3aRes: Result[BigInt] = p256ModMul(Value(rRes), Value(vMinusX3Res))
+    if IsErr(y3aRes):
+        return Err[EcPointJacobian](Error(y3aRes))
+    let y3Res: Result[BigInt] = p256ModSub(Value(y3aRes), Value(twoS1JRes))
+    if IsErr(y3Res):
+        return Err[EcPointJacobian](Error(y3Res))
+    let z1PlusZ2Res: Result[BigInt] = p256ModAdd(p1.z, p2.z)
+    if IsErr(z1PlusZ2Res):
+        return Err[EcPointJacobian](Error(z1PlusZ2Res))
+    let z1PlusZ2SqRes: Result[BigInt] = p256ModMul(Value(z1PlusZ2Res), Value(z1PlusZ2Res))
+    if IsErr(z1PlusZ2SqRes):
+        return Err[EcPointJacobian](Error(z1PlusZ2SqRes))
+    let z3aRes: Result[BigInt] = p256ModSub(Value(z1PlusZ2SqRes), Value(z1z1Res))
+    if IsErr(z3aRes):
+        return Err[EcPointJacobian](Error(z3aRes))
+    let z3bRes: Result[BigInt] = p256ModSub(Value(z3aRes), Value(z2z2Res))
+    if IsErr(z3bRes):
+        return Err[EcPointJacobian](Error(z3bRes))
+    let z3Res: Result[BigInt] = p256ModMul(Value(z3bRes), Value(hRes))
+    if IsErr(z3Res):
+        return Err[EcPointJacobian](Error(z3Res))
+    return Ok[EcPointJacobian](EcPointJacobian(x: Value(x3Res), y: Value(y3Res), z: Value(z3Res), inf: false))
 
 fn pointIsOnCurve(p: EcPoint): Result[bool] =
     if p.inf:
@@ -335,20 +1730,36 @@ fn pointMul(k: BigInt, p: EcPoint): Result[EcPoint] =
         return Ok[EcPoint](p)
     if bigIsZero(k):
         return Ok[EcPoint](pointInfinity())
-    var result: EcPoint = pointInfinity()
-    var addend: EcPoint = p
-    let bits: int32 = bigBitLen(k)
-    for i in 0..<bits:
-        if bigGetBit(k, i) != 0:
-            let addRes: Result[EcPoint] = pointAdd(result, addend)
-            if IsErr(addRes):
-                return Err[EcPoint](Error(addRes))
-            result = Value(addRes)
-        let dblRes: Result[EcPoint] = pointDouble(addend)
-        if IsErr(dblRes):
-            return Err[EcPoint](Error(dblRes))
-        addend = Value(dblRes)
-    return Ok[EcPoint](result)
+    let kFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(k)
+    if IsErr(kFixedRes):
+        return Err[EcPoint](Error(kFixedRes))
+    let pFixedRes: Result[EcPointFixed] = pointFixedFromBig(p)
+    if IsErr(pFixedRes):
+        return Err[EcPoint](Error(pFixedRes))
+    var scalar: pfix.P256Fixed = Value(kFixedRes)
+    let affineRes: Result[EcPointFixed] = pointMulFixedWindowed(scalar, Value(pFixedRes))
+    if IsErr(affineRes):
+        return Err[EcPoint](Error(affineRes))
+    return Ok[EcPoint](pointBigFromFixed(Value(affineRes)))
+
+fn pointMulGenerator(k: BigInt): Result[EcPoint] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcPoint](Error(initRes))
+    if bigIsZero(k):
+        return Ok[EcPoint](pointInfinity())
+    let affineRes: Result[EcPointFixed] = pointMulGeneratorWnaf(k)
+    if IsErr(affineRes):
+        return Err[EcPoint](Error(affineRes))
+    return Ok[EcPoint](pointBigFromFixed(Value(affineRes)))
+
+fn pointMulGeneratorFixed(k: BigInt): Result[EcPointFixed] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[EcPointFixed](Error(initRes))
+    if bigIsZero(k):
+        return Ok[EcPointFixed](pointInfinityFixed())
+    return pointMulGeneratorWnaf(k)
 
 fn p256Hash(msg: Bytes): Result[BigInt] =
     let digest: Bytes = sha256Digest(msg)
@@ -385,7 +1796,7 @@ fn publicKeyFromPrivateKey(priv: EcPrivateKey): Result[EcPublicKey] =
     let initRes: Result[bool] = p256EnsureInit()
     if IsErr(initRes):
         return Err[EcPublicKey](Error(initRes))
-    let pRes: Result[EcPoint] = pointMul(priv.d, p256G)
+    let pRes: Result[EcPoint] = pointMulGenerator(priv.d)
     if IsErr(pRes):
         return Err[EcPublicKey](Error(pRes))
     let p: EcPoint = Value(pRes)
@@ -435,10 +1846,7 @@ fn ecdsaSign(priv: EcPrivateKey, msg: Bytes): Result[EcSignature] =
     if IsErr(kRes):
         return Err[EcSignature](Error(kRes))
     let k: BigInt = Value(kRes)
-    let pRes: Result[EcPoint] = pointMul(k, p256G)
-    if IsErr(pRes):
-        return Err[EcSignature](Error(pRes))
-    let rRes: Result[BigInt] = nMod(Value(pRes).x)
+    let rRes: Result[BigInt] = pointMulGeneratorR(k)
     if IsErr(rRes):
         return Err[EcSignature](Error(rRes))
     let r: BigInt = Value(rRes)
@@ -483,6 +1891,12 @@ fn ecdsaVerify(pub: EcPublicKey, msg: Bytes, sig: EcSignature): bool =
     let eModRes: Result[BigInt] = nMod(Value(eRes))
     if IsErr(eModRes):
         return false
+    let pubFixedRes = pointFixedFromBig(pub.point)
+    if IsErr(pubFixedRes):
+        return false
+    let rFixedRes = pfix.p256FixedFromBigInt(sig.r)
+    if IsErr(rFixedRes):
+        return false
     let wRes: Result[BigInt] = nModInv(sig.s)
     if IsErr(wRes):
         return false
@@ -492,22 +1906,66 @@ fn ecdsaVerify(pub: EcPublicKey, msg: Bytes, sig: EcSignature): bool =
     let u2Res: Result[BigInt] = nModMul(sig.r, Value(wRes))
     if IsErr(u2Res):
         return false
-    let p1Res: Result[EcPoint] = pointMul(Value(u1Res), p256G)
-    if IsErr(p1Res):
+    let u1FixedRes = pfix.p256FixedFromBigInt(Value(u1Res))
+    if IsErr(u1FixedRes):
         return false
-    let p2Res: Result[EcPoint] = pointMul(Value(u2Res), pub.point)
-    if IsErr(p2Res):
+    let u2FixedRes = pfix.p256FixedFromBigInt(Value(u2Res))
+    if IsErr(u2FixedRes):
         return false
-    let sumRes: Result[EcPoint] = pointAdd(Value(p1Res), Value(p2Res))
-    if IsErr(sumRes):
+    let sumPointRes = pointMulGeneratorAndFixedShamir(Value(u1FixedRes), Value(u2FixedRes), Value(pubFixedRes))
+    if IsErr(sumPointRes):
         return false
-    let sumPoint: EcPoint = Value(sumRes)
+    var sumPoint = Value(sumPointRes)
     if sumPoint.inf:
         return false
-    let vRes: Result[BigInt] = nMod(sumPoint.x)
-    if IsErr(vRes):
+    var vFixed = pointJacobianXToScalarFixedCrash(sumPoint)
+    var rFixed = Value(rFixedRes)
+    return pfix.p256FixedCmp(vFixed, rFixed) == 0
+
+fn ecdsaVerifyTrustedPublicKey(pub: EcPublicKey, msg: Bytes, sig: EcSignature): bool =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
         return false
-    return bigCmp(Value(vRes), sig.r) == 0
+    if bigIsZero(sig.r) || bigIsZero(sig.s):
+        return false
+    if bigCmp(sig.r, p256N) >= 0 || bigCmp(sig.s, p256N) >= 0:
+        return false
+    let eRes: Result[BigInt] = p256Hash(msg)
+    if IsErr(eRes):
+        return false
+    let eModRes: Result[BigInt] = nMod(Value(eRes))
+    if IsErr(eModRes):
+        return false
+    let pubFixedRes = pointFixedFromBig(pub.point)
+    if IsErr(pubFixedRes):
+        return false
+    let rFixedRes = pfix.p256FixedFromBigInt(sig.r)
+    if IsErr(rFixedRes):
+        return false
+    let wRes: Result[BigInt] = nModInv(sig.s)
+    if IsErr(wRes):
+        return false
+    let u1Res: Result[BigInt] = nModMul(Value(eModRes), Value(wRes))
+    if IsErr(u1Res):
+        return false
+    let u2Res: Result[BigInt] = nModMul(sig.r, Value(wRes))
+    if IsErr(u2Res):
+        return false
+    let u1FixedRes = pfix.p256FixedFromBigInt(Value(u1Res))
+    if IsErr(u1FixedRes):
+        return false
+    let u2FixedRes = pfix.p256FixedFromBigInt(Value(u2Res))
+    if IsErr(u2FixedRes):
+        return false
+    let sumPointRes = pointMulGeneratorAndFixedShamir(Value(u1FixedRes), Value(u2FixedRes), Value(pubFixedRes))
+    if IsErr(sumPointRes):
+        return false
+    var sumPoint = Value(sumPointRes)
+    if sumPoint.inf:
+        return false
+    var vFixed = pointJacobianXToScalarFixedCrash(sumPoint)
+    var rFixed = Value(rFixedRes)
+    return pfix.p256FixedCmp(vFixed, rFixed) == 0
 
 fn ecdsaPublicKeyToBytes(pub: EcPublicKey): Bytes =
     let out: Bytes = bytesAlloc(p256PublicSize)

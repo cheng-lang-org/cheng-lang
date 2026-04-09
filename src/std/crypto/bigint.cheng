@@ -10,14 +10,28 @@ import std/rawbytes
 const
     bigIntWordBits = 32
     maxBigIntLimbs = 256
+    maxBigIntHalfDigits = maxBigIntLimbs * 2
     bigIntWordBase: int64 = int64(1) << 32
     bigIntWordMask: int64 = (int64(1) << 32) - 1
+    bigIntWordMaskU64: uint64 = uint64(0xffffffff)
 
 type
     BigInt =
         count: int32
         # Little-endian 32-bit limbs (stored as int32, interpreted unsigned).
         limbs: int32[maxBigIntLimbs]
+
+    BigMontgomeryContext =
+        modulus: BigInt
+        modulusCount: int32
+        n0Inv: uint64
+        r2: BigInt
+        oneMont: BigInt
+
+    BigMontgomeryScratch =
+        low: BigInt
+        high: BigInt
+        top: int32
 
 fn bigWordToU64(w: int32): int64 =
     var v: int64 = int64(w)
@@ -29,11 +43,20 @@ fn bigWordFromU64(v: int64): int32 =
     # Keep the low 32 bits; caller ensures v is non-negative.
     return int32(v & bigIntWordMask)
 
+fn bigWordToBitsU64(w: int32): uint64 =
+    return uint64(uint32(w))
+
+fn bigWordFromBitsU64(v: uint64): int32 =
+    return int32(uint32(v & bigIntWordMaskU64))
+
 fn bigZero(): BigInt =
     BigInt(count: 0)
 
 fn bigIsZero(a: BigInt): bool =
     return a.count <= 0
+
+fn bigIsOdd(a: BigInt): bool =
+    return a.count > 0 && (bigWordToU64(a.limbs[0]) & 1) != 0
 
 fn bigNormalize(a: var BigInt) =
     var i: int32 = a.count - 1
@@ -156,6 +179,20 @@ fn bigShiftLeft1(a: BigInt): Result[BigInt] =
         out.count = out.count + 1
     return Ok[BigInt](out)
 
+fn bigShiftRight1(a: BigInt): BigInt =
+    var out: BigInt
+    out.count = a.count
+    var carry: int64 = 0
+    let __for_start_i = a.count - 1
+    for __for_rev_i in 0..(__for_start_i - (0)):
+        let i = __for_start_i - __for_rev_i
+        let limb: int64 = bigWordToU64(a.limbs[i])
+        let shifted: int64 = (limb >> 1) | (carry << (bigIntWordBits - 1))
+        out.limbs[i] = bigWordFromU64(shifted)
+        carry = limb & 1
+    bigNormalize(out)
+    return out
+
 fn bigBitLen(a: BigInt): int32 =
     if a.count <= 0:
         return 0
@@ -219,6 +256,265 @@ fn bigToBytes(a: BigInt, minLen: int32): Bytes =
         bytesSet(out, byteIdx, int32(v & 0xff))
     return out
 
+fn bigHalfDigitCount(a: BigInt): int32 =
+    if a.count <= 0:
+        return 0
+    let top: uint64 = bigWordToBitsU64(a.limbs[a.count - 1])
+    return (a.count - 1) * 2 + (if (top >> uint64(16)) != uint64(0): 2 else: 1)
+
+fn bigGetHalfDigit(a: BigInt, idx: int32): uint64 =
+    if idx < 0:
+        return uint64(0)
+    let limbIdx: int32 = idx / 2
+    if limbIdx < 0 || limbIdx >= a.count:
+        return uint64(0)
+    let word: uint64 = bigWordToBitsU64(a.limbs[limbIdx])
+    if (idx & 1) == 0:
+        return word & uint64(0xffff)
+    return (word >> uint64(16)) & uint64(0xffff)
+
+fn bigHalfDigitScratchGet(digits: Bytes, idx: int32): uint64 =
+    let offset: int32 = idx * 2
+    let lo: uint64 = uint64(bytesGet(digits, offset))
+    let hi: uint64 = uint64(bytesGet(digits, offset + 1))
+    return lo | (hi << uint64(8))
+
+fn bigHalfDigitScratchSet(digits: Bytes, idx: int32, value: uint64) =
+    let offset: int32 = idx * 2
+    bytesSet(digits, offset, int32(value & uint64(0xff)))
+    bytesSet(digits, offset + 1, int32((value >> uint64(8)) & uint64(0xff)))
+
+fn bigMontgomeryScratchGet(scratch: BigMontgomeryScratch, idx: int32): uint64 =
+    if idx < maxBigIntLimbs:
+        return bigWordToBitsU64(scratch.low.limbs[idx])
+    if idx < maxBigIntLimbs * 2:
+        return bigWordToBitsU64(scratch.high.limbs[idx - maxBigIntLimbs])
+    return bigWordToBitsU64(scratch.top)
+
+fn bigMontgomeryScratchSet(scratch: var BigMontgomeryScratch, idx: int32, value: uint64) =
+    let word: int32 = bigWordFromBitsU64(value & bigIntWordMaskU64)
+    if idx < maxBigIntLimbs:
+        scratch.low.limbs[idx] = word
+        return
+    if idx < maxBigIntLimbs * 2:
+        scratch.high.limbs[idx - maxBigIntLimbs] = word
+        return
+    scratch.top = word
+
+fn bigMontgomeryAddMulAt(scratch: var BigMontgomeryScratch,
+                         offset: int32,
+                         mulWord: uint64,
+                         multiplicand: var BigInt,
+                         limbCount: int32) =
+    if mulWord == uint64(0):
+        return
+    var carry: uint64 = uint64(0)
+    for j in 0..<limbCount:
+        let bv: uint64 = if j < multiplicand.count: bigWordToBitsU64(multiplicand.limbs[j]) else: uint64(0)
+        let cur: uint64 = bigMontgomeryScratchGet(scratch, offset + j)
+        let prod: uint64 = mulWord * bv
+        let prodLo: uint64 = prod & bigIntWordMaskU64
+        let prodHi: uint64 = prod >> uint64(bigIntWordBits)
+        let sumLo: uint64 = cur + prodLo + carry
+        bigMontgomeryScratchSet(scratch, offset + j, sumLo)
+        carry = prodHi + (sumLo >> uint64(bigIntWordBits))
+    var carryIdx: int32 = offset + limbCount
+    while carry != uint64(0):
+        let cur: uint64 = bigMontgomeryScratchGet(scratch, carryIdx)
+        let sum: uint64 = cur + carry
+        bigMontgomeryScratchSet(scratch, carryIdx, sum)
+        carry = sum >> uint64(bigIntWordBits)
+        carryIdx = carryIdx + 1
+
+fn bigBuildMontgomeryN0Inv(modulus: BigInt): Result[uint64] =
+    if modulus.count <= 0:
+        return Err[uint64]("bigint: montgomery modulus zero")
+    let n0: uint64 = bigWordToBitsU64(modulus.limbs[0])
+    if (n0 & uint64(1)) == uint64(0):
+        return Err[uint64]("bigint: montgomery requires odd modulus")
+    var x: uint64 = uint64(1)
+    for _ in 0..<5:
+        x = (x * (uint64(2) - ((n0 * x) & bigIntWordMaskU64))) & bigIntWordMaskU64
+    return Ok[uint64]((uint64(0) - x) & bigIntWordMaskU64)
+
+fn bigComputePow2Mod(modulus: BigInt, bitCount: int32): Result[BigInt] =
+    var out: BigInt = bigFromInt(1)
+    for _ in 0..<bitCount:
+        let dblRes: Result[BigInt] = bigModAdd(out, out, modulus)
+        if IsErr(dblRes):
+            return Err[BigInt](Error(dblRes))
+        out = Value(dblRes)
+    return Ok[BigInt](out)
+
+fn bigMontgomeryMulCore(a: var BigInt, b: var BigInt, ctx: var BigMontgomeryContext): Result[BigInt] =
+    let limbCount: int32 = ctx.modulusCount
+    if limbCount <= 0:
+        return Err[BigInt]("bigint: montgomery limb count zero")
+    if limbCount * 2 > maxBigIntLimbs * 2:
+        return Err[BigInt]("bigint: montgomery scratch overflow")
+    var scratch: BigMontgomeryScratch
+    for i in 0..<limbCount:
+        let bi: uint64 = if i < b.count: bigWordToBitsU64(b.limbs[i]) else: uint64(0)
+        bigMontgomeryAddMulAt(scratch, i, bi, a, limbCount)
+        let mWord: uint64 = (bigMontgomeryScratchGet(scratch, i) * ctx.n0Inv) & bigIntWordMaskU64
+        bigMontgomeryAddMulAt(scratch, i, mWord, ctx.modulus, limbCount)
+    var out: BigInt
+    out.count = limbCount
+    for i in 0..<limbCount:
+        out.limbs[i] = bigWordFromBitsU64(bigMontgomeryScratchGet(scratch, i + limbCount))
+    let highWord: uint64 = bigMontgomeryScratchGet(scratch, limbCount * 2)
+    if highWord != uint64(0):
+        if limbCount >= maxBigIntLimbs:
+            return Err[BigInt]("bigint: montgomery high carry overflow")
+        out.limbs[limbCount] = bigWordFromBitsU64(highWord)
+        out.count = limbCount + 1
+    bigNormalize(out)
+    if bigCmp(out, ctx.modulus) >= 0:
+        let subRes: Result[BigInt] = bigSub(out, ctx.modulus)
+        if IsErr(subRes):
+            return Err[BigInt](Error(subRes))
+        out = Value(subRes)
+    return Ok[BigInt](out)
+
+fn bigBuildMontgomeryContext(modulus: BigInt): Result[BigMontgomeryContext] =
+    if modulus.count <= 0:
+        return Err[BigMontgomeryContext]("bigint: montgomery modulus zero")
+    if !bigIsOdd(modulus):
+        return Err[BigMontgomeryContext]("bigint: montgomery requires odd modulus")
+    let invRes: Result[uint64] = bigBuildMontgomeryN0Inv(modulus)
+    if IsErr(invRes):
+        return Err[BigMontgomeryContext](Error(invRes))
+    let r2Res: Result[BigInt] = bigComputePow2Mod(modulus, modulus.count * 64)
+    if IsErr(r2Res):
+        return Err[BigMontgomeryContext](Error(r2Res))
+    var ctx: BigMontgomeryContext
+    ctx.modulus = modulus
+    ctx.modulusCount = modulus.count
+    ctx.n0Inv = Value(invRes)
+    ctx.r2 = Value(r2Res)
+    var one: BigInt = bigFromInt(1)
+    var r2Local: BigInt = ctx.r2
+    let oneMontRes: Result[BigInt] = bigMontgomeryMulCore(one, r2Local, ctx)
+    if IsErr(oneMontRes):
+        return Err[BigMontgomeryContext](Error(oneMontRes))
+    ctx.oneMont = Value(oneMontRes)
+    return Ok[BigMontgomeryContext](ctx)
+
+fn bigModMulWithContext(a: var BigInt, b: var BigInt, ctx: var BigMontgomeryContext): Result[BigInt] =
+    var aNorm: BigInt = a
+    if bigCmp(aNorm, ctx.modulus) >= 0:
+        let modRes: Result[BigInt] = bigMod(aNorm, ctx.modulus)
+        if IsErr(modRes):
+            return Err[BigInt](Error(modRes))
+        aNorm = Value(modRes)
+    var bNorm: BigInt = b
+    if bigCmp(bNorm, ctx.modulus) >= 0:
+        let modRes: Result[BigInt] = bigMod(bNorm, ctx.modulus)
+        if IsErr(modRes):
+            return Err[BigInt](Error(modRes))
+        bNorm = Value(modRes)
+    var r2LocalA: BigInt = ctx.r2
+    let aMontRes: Result[BigInt] = bigMontgomeryMulCore(aNorm, r2LocalA, ctx)
+    if IsErr(aMontRes):
+        return Err[BigInt](Error(aMontRes))
+    var r2LocalB: BigInt = ctx.r2
+    let bMontRes: Result[BigInt] = bigMontgomeryMulCore(bNorm, r2LocalB, ctx)
+    if IsErr(bMontRes):
+        return Err[BigInt](Error(bMontRes))
+    var aMont: BigInt = Value(aMontRes)
+    var bMont: BigInt = Value(bMontRes)
+    let prodMontRes: Result[BigInt] = bigMontgomeryMulCore(aMont, bMont, ctx)
+    if IsErr(prodMontRes):
+        return Err[BigInt](Error(prodMontRes))
+    var prodMont: BigInt = Value(prodMontRes)
+    var one: BigInt = bigFromInt(1)
+    return bigMontgomeryMulCore(prodMont, one, ctx)
+
+fn bigModExpWithContext(base: var BigInt, exp: var BigInt, ctx: var BigMontgomeryContext): Result[BigInt] =
+    if bigIsZero(ctx.modulus):
+        return Err[BigInt]("bigint: modexp modulus zero")
+    var baseNorm: BigInt = base
+    if bigCmp(baseNorm, ctx.modulus) >= 0:
+        let baseModRes: Result[BigInt] = bigMod(baseNorm, ctx.modulus)
+        if IsErr(baseModRes):
+            return Err[BigInt](Error(baseModRes))
+        baseNorm = Value(baseModRes)
+    var resultMont: BigInt = ctx.oneMont
+    var r2Local: BigInt = ctx.r2
+    let powMontRes: Result[BigInt] = bigMontgomeryMulCore(baseNorm, r2Local, ctx)
+    if IsErr(powMontRes):
+        return Err[BigInt](Error(powMontRes))
+    var powMont: BigInt = Value(powMontRes)
+    let bits: int32 = bigBitLen(exp)
+    for i in 0..<bits:
+        if bigGetBit(exp, i) != 0:
+            let mulRes: Result[BigInt] = bigMontgomeryMulCore(resultMont, powMont, ctx)
+            if IsErr(mulRes):
+                return Err[BigInt](Error(mulRes))
+            resultMont = Value(mulRes)
+        let sqRes: Result[BigInt] = bigMontgomeryMulCore(powMont, powMont, ctx)
+        if IsErr(sqRes):
+            return Err[BigInt](Error(sqRes))
+        powMont = Value(sqRes)
+    var one: BigInt = bigFromInt(1)
+    return bigMontgomeryMulCore(resultMont, one, ctx)
+
+fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
+    if a.count <= 0 || b.count <= 0:
+        return Ok[BigInt](bigZero())
+    let outMax: int32 = a.count + b.count
+    if outMax > maxBigIntLimbs:
+        let text: str =
+            "bigint: mul overflow out_max=" + intToStr(outMax) +
+            " a_count=" + intToStr(a.count) +
+            " b_count=" + intToStr(b.count)
+        return Err[BigInt](text)
+    let aHalfCount: int32 = bigHalfDigitCount(a)
+    let bHalfCount: int32 = bigHalfDigitCount(b)
+    if aHalfCount + bHalfCount > maxBigIntHalfDigits:
+        let text: str =
+            "bigint: mul half-digit overflow a_half=" + intToStr(aHalfCount) +
+            " b_half=" + intToStr(bHalfCount)
+        return Err[BigInt](text)
+    let outHalfMax: int32 = aHalfCount + bHalfCount
+    let outHalfDigits: Bytes = bytesAlloc(outHalfMax * 2)
+    var out: BigInt
+    for i in 0..<aHalfCount:
+        let av: uint64 = bigGetHalfDigit(a, i)
+        var carry: uint64 = uint64(0)
+        for j in 0..<bHalfCount:
+            let idx: int32 = i + j
+            let bv: uint64 = bigGetHalfDigit(b, j)
+            let cur: uint64 = bigHalfDigitScratchGet(outHalfDigits, idx)
+            let prod: uint64 = av * bv
+            let sum: uint64 = prod + cur + carry
+            bigHalfDigitScratchSet(outHalfDigits, idx, sum & uint64(0xffff))
+            carry = sum >> uint64(16)
+        var carryIdx: int32 = i + bHalfCount
+        while carry != uint64(0):
+            if carryIdx >= outHalfMax:
+                let text: str =
+                    "bigint: mul carry overflow carry_idx=" + intToStr(carryIdx) +
+                    " out_half_max=" + intToStr(outHalfMax) +
+                    " a_half=" + intToStr(aHalfCount) +
+                    " b_half=" + intToStr(bHalfCount)
+                return Err[BigInt](text)
+            let cur: uint64 = bigHalfDigitScratchGet(outHalfDigits, carryIdx)
+            let sum: uint64 = cur + carry
+            bigHalfDigitScratchSet(outHalfDigits, carryIdx, sum & uint64(0xffff))
+            carry = sum >> uint64(16)
+            carryIdx = carryIdx + 1
+    out.count = (outHalfMax + 1) / 2
+    for i in 0..<out.count:
+        let lo: uint64 = bigHalfDigitScratchGet(outHalfDigits, i * 2)
+        let hiIdx: int32 = i * 2 + 1
+        var hi: uint64 = uint64(0)
+        if hiIdx < outHalfMax:
+            hi = bigHalfDigitScratchGet(outHalfDigits, hiIdx)
+        out.limbs[i] = bigWordFromBitsU64(lo | (hi << uint64(16)))
+    bigNormalize(out)
+    return Ok[BigInt](out)
+
 fn bigMod(a: BigInt, m: BigInt): Result[BigInt] =
     if bigIsZero(m):
         return Err[BigInt]("bigint: % by zero")
@@ -255,28 +551,106 @@ fn bigModAdd(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =
         sum = Value(subRes)
     return Ok[BigInt](sum)
 
+fn bigModSub(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =
+    if bigCmp(a, b) >= 0:
+        return bigSub(a, b)
+    let diffRes: Result[BigInt] = bigSub(m, b)
+    if IsErr(diffRes):
+        return Err[BigInt](Error(diffRes))
+    let sumRes: Result[BigInt] = bigAdd(a, Value(diffRes))
+    if IsErr(sumRes):
+        return Err[BigInt](Error(sumRes))
+    var sum: BigInt = Value(sumRes)
+    if bigCmp(sum, m) >= 0:
+        let subRes: Result[BigInt] = bigSub(sum, m)
+        if IsErr(subRes):
+            return Err[BigInt](Error(subRes))
+        sum = Value(subRes)
+    return Ok[BigInt](sum)
+
+fn bigHalfModOdd(a: BigInt, m: BigInt): Result[BigInt] =
+    if bigIsOdd(a):
+        let sumRes: Result[BigInt] = bigAdd(a, m)
+        if IsErr(sumRes):
+            return Err[BigInt](Error(sumRes))
+        return Ok[BigInt](bigShiftRight1(Value(sumRes)))
+    return Ok[BigInt](bigShiftRight1(a))
+
+fn bigModInvOddBinary(a: BigInt, m: BigInt): Result[BigInt] =
+    if bigIsZero(m) || ! bigIsOdd(m):
+        return Err[BigInt]("bigint: inverse requires odd modulus")
+    let aModRes: Result[BigInt] = bigMod(a, m)
+    if IsErr(aModRes):
+        return Err[BigInt](Error(aModRes))
+    var u: BigInt = Value(aModRes)
+    if bigIsZero(u):
+        return Err[BigInt]("bigint: inverse of zero")
+    let one: BigInt = bigFromInt(1)
+    if bigCmp(u, one) == 0:
+        return Ok[BigInt](one)
+    var v: BigInt = m
+    var x1: BigInt = one
+    var x2: BigInt = bigZero()
+    while true:
+        while ! bigIsZero(u) && ! bigIsOdd(u):
+            u = bigShiftRight1(u)
+            let halfRes: Result[BigInt] = bigHalfModOdd(x1, m)
+            if IsErr(halfRes):
+                return Err[BigInt](Error(halfRes))
+            x1 = Value(halfRes)
+        while ! bigIsZero(v) && ! bigIsOdd(v):
+            v = bigShiftRight1(v)
+            let halfRes: Result[BigInt] = bigHalfModOdd(x2, m)
+            if IsErr(halfRes):
+                return Err[BigInt](Error(halfRes))
+            x2 = Value(halfRes)
+        if bigCmp(u, one) == 0:
+            return Ok[BigInt](x1)
+        if bigCmp(v, one) == 0:
+            return Ok[BigInt](x2)
+        if bigCmp(u, v) >= 0:
+            let subRes: Result[BigInt] = bigSub(u, v)
+            if IsErr(subRes):
+                return Err[BigInt](Error(subRes))
+            u = Value(subRes)
+            let diffRes: Result[BigInt] = bigModSub(x1, x2, m)
+            if IsErr(diffRes):
+                return Err[BigInt](Error(diffRes))
+            x1 = Value(diffRes)
+        else:
+            let subRes: Result[BigInt] = bigSub(v, u)
+            if IsErr(subRes):
+                return Err[BigInt](Error(subRes))
+            v = Value(subRes)
+            let diffRes: Result[BigInt] = bigModSub(x2, x1, m)
+            if IsErr(diffRes):
+                return Err[BigInt](Error(diffRes))
+            x2 = Value(diffRes)
+    return Err[BigInt]("bigint: inverse failed")
+
 fn bigModMul(a: BigInt, b: BigInt, m: BigInt): Result[BigInt] =
-    var result: BigInt = bigZero()
-    let modRes: Result[BigInt] = bigMod(a, m)
-    if IsErr(modRes):
-        return Err[BigInt](Error(modRes))
-    var base: BigInt = Value(modRes)
-    let bits: int32 = bigBitLen(b)
-    for i in 0..<bits:
-        if bigGetBit(b, i) != 0:
-            let addRes: Result[BigInt] = bigModAdd(result, base, m)
-            if IsErr(addRes):
-                return Err[BigInt](Error(addRes))
-            result = Value(addRes)
-        let dblRes: Result[BigInt] = bigModAdd(base, base, m)
-        if IsErr(dblRes):
-            return Err[BigInt](Error(dblRes))
-        base = Value(dblRes)
-    return Ok[BigInt](result)
+    if bigIsOdd(m):
+        let ctxRes: Result[BigMontgomeryContext] = bigBuildMontgomeryContext(m)
+        if !IsErr(ctxRes):
+            var ctx: BigMontgomeryContext = Value(ctxRes)
+            var left: BigInt = a
+            var right: BigInt = b
+            return bigModMulWithContext(left, right, ctx)
+    let mulRes: Result[BigInt] = bigMul(a, b)
+    if IsErr(mulRes):
+        return Err[BigInt](Error(mulRes))
+    return bigMod(Value(mulRes), m)
 
 fn bigModExp(base: BigInt, exp: BigInt, m: BigInt): Result[BigInt] =
     if bigIsZero(m):
         return Err[BigInt]("bigint: modexp modulus zero")
+    if bigIsOdd(m):
+        let ctxRes: Result[BigMontgomeryContext] = bigBuildMontgomeryContext(m)
+        if !IsErr(ctxRes):
+            var ctx: BigMontgomeryContext = Value(ctxRes)
+            var baseLocal: BigInt = base
+            var expLocal: BigInt = exp
+            return bigModExpWithContext(baseLocal, expLocal, ctx)
     var result: BigInt = bigFromInt(1)
     let baseModRes: Result[BigInt] = bigMod(base, m)
     if IsErr(baseModRes):

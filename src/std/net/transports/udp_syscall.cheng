@@ -81,9 +81,18 @@ fn udpSocketEnableNonblock(fd: int32) =
     let flags: int32 = os.udpFcntl(fd, udpFcntlGetFl, 0)
     if flags < 0:
         return
-    if os.udpFcntl(fd, udpFcntlSetFl, flags | udpONonblockLinux) == 0:
-        return
-    let _ = os.udpFcntl(fd, udpFcntlSetFl, flags | udpONonblockBsd)
+    let bsdTry: int32 = flags | udpONonblockBsd
+    let _ = os.udpFcntl(fd, udpFcntlSetFl, bsdTry)
+    let bsdFlags: int32 = os.udpFcntl(fd, udpFcntlGetFl, 0)
+    if bsdFlags >= 0:
+        if (bsdFlags & udpONonblockBsd) != 0:
+            return
+    let linuxTry: int32 = flags | udpONonblockLinux
+    let _ = os.udpFcntl(fd, udpFcntlSetFl, linuxTry)
+    let linuxFlags: int32 = os.udpFcntl(fd, udpFcntlGetFl, 0)
+    if linuxFlags >= 0:
+        if (linuxFlags & udpONonblockLinux) != 0:
+            return
 
 fn udpSocketOpenDgram(isV6: bool): Result[UdpSocketHandle] =
     if !isV6:
@@ -279,10 +288,13 @@ fn udpRecvFromNonblock(fd: int32, maxBytes: int32): Result[UdpRecvResult] =
 
     let dataBuf: Bytes = bytesAlloc(maxBytes)
     let rawAddr: Bytes = bytesAlloc(128)
-    var rawLen: int32 = bytesLen(rawAddr)
-    let recvLenRaw: int32 = sys.recvfrom(fd, dataBuf.data, maxBytes, udpMsgDontWait, rawAddr.data, &rawLen)
+    var rawLen: int32 = 0
+    var recvErr: int32 = 0
+    let recvLenRaw: int32 = os.udpRecvFromFdAddrEx(fd, dataBuf, udpMsgDontWait, rawAddr, rawLen, recvErr)
     if recvLenRaw < 0:
-        let errCode: int32 = udpErrno()
+        var errCode: int32 = recvErr
+        if errCode == 0:
+            errCode = udpErrno()
         if udpErrWouldBlockOrIntr(errCode):
             return Err[UdpRecvResult]("udp syscall: queue empty")
         return Err[UdpRecvResult]("udp syscall: recvfrom failed: " + udpErrText(errCode) + " (" + intToStr(errCode) + ")")
@@ -293,11 +305,41 @@ fn udpRecvFromNonblock(fd: int32, maxBytes: int32): Result[UdpRecvResult] =
         rawLen = bytesLen(rawAddr)
     if rawLen <= 0:
         return Err[UdpRecvResult]("udp syscall: recvfrom missing peer sockaddr")
-    let payload: Bytes =
-        if recvLen <= 0:
-            emptyBytes()
-        else:
-            bytesSlice(dataBuf, 0, recvLen)
+    var payload: Bytes = emptyBytes()
+    if recvLen > 0:
+        payload = bytesSlice(dataBuf, 0, recvLen)
+
+    let fromRes: Result[UdpSockAddr] = udpSockAddrDecode(rawAddr, rawLen)
+    if IsErr(fromRes):
+        return Err[UdpRecvResult](Error(fromRes))
+    return Ok[UdpRecvResult](UdpRecvResult(data: payload, fromAddr: Value(fromRes)))
+
+fn udpRecvFromBlocking(fd: int32, maxBytes: int32): Result[UdpRecvResult] =
+    if fd < 0:
+        return Err[UdpRecvResult]("udp syscall: invalid socket")
+    if maxBytes <= 0:
+        return Err[UdpRecvResult]("udp syscall: invalid recv size")
+
+    let dataBuf: Bytes = bytesAlloc(maxBytes)
+    let rawAddr: Bytes = bytesAlloc(128)
+    var rawLen: int32 = 0
+    var recvErr: int32 = 0
+    let recvLenRaw: int32 = os.udpRecvFromFdAddrEx(fd, dataBuf, 0, rawAddr, rawLen, recvErr)
+    if recvLenRaw < 0:
+        var errCode: int32 = recvErr
+        if errCode == 0:
+            errCode = udpErrno()
+        return Err[UdpRecvResult]("udp syscall: recvfrom failed: " + udpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    var recvLen: int32 = recvLenRaw
+    if recvLen > bytesLen(dataBuf):
+        recvLen = bytesLen(dataBuf)
+    if rawLen > bytesLen(rawAddr):
+        rawLen = bytesLen(rawAddr)
+    if rawLen <= 0:
+        return Err[UdpRecvResult]("udp syscall: recvfrom missing peer sockaddr")
+    var payload: Bytes = emptyBytes()
+    if recvLen > 0:
+        payload = bytesSlice(dataBuf, 0, recvLen)
 
     let fromRes: Result[UdpSockAddr] = udpSockAddrDecode(rawAddr, rawLen)
     if IsErr(fromRes):

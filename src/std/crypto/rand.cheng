@@ -5,6 +5,10 @@ import std/rawbytes
 import std/crypto/sha512
 import std/crypto/chacha20poly1305
 import std/os as bos
+
+@importc("cheng_system_entropy_fill")
+fn chengSystemEntropyFill(dst: ptr, len: int32): int32
+
 type
     KeyNonceCounter =
         key: Bytes
@@ -18,10 +22,10 @@ const
 var rngSeeded: bool = false
 var rngSystemAttempted: bool = false
 var rngUrandomAvailable: int32 = -1
-var rngKey: Bytes = Bytes(data: nil, len: 0)
-var rngNonce: Bytes = Bytes(data: nil, len: 0)
+var rngKey: Bytes
+var rngNonce: Bytes
 var rngCounter: int32 = 0
-var rngBlock: Bytes = Bytes(data: nil, len: 0)
+var rngBlock: Bytes
 var rngBlockOffset: int32 = 0
 
 fn deriveKeyNonce(seed: Bytes): Result[KeyNonceCounter] =
@@ -90,6 +94,11 @@ fn randomFillWindows(out: Bytes): bool =
     let _unused: int32 = bytesLen(out)
     return false
 
+fn randomFillNative(out: Bytes): bool =
+    if out.data == nil || out.len <= 0:
+        return false
+    return chengSystemEntropyFill(out.data, out.len) != 0
+
 fn randomFillUrandom(out: Bytes): bool =
     if bytesLen(out) <= 0:
         return false
@@ -118,7 +127,11 @@ fn systemRandomBytes(length: int32): Result[Bytes] =
     if length <= 0:
         return Ok[Bytes](Bytes(data: nil, len: 0))
     let out: Bytes = bytesAlloc(length)
-    if randomFillWindows(out) || randomFillUrandom(out):
+    if randomFillNative(out):
+        return Ok[Bytes](out)
+    if randomFillWindows(out):
+        return Ok[Bytes](out)
+    if randomFillUrandom(out):
         return Ok[Bytes](out)
     return Err[Bytes]("rand: system entropy unavailable(windows/urandom)")
 

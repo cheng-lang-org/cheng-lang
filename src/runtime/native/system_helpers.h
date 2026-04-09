@@ -272,9 +272,12 @@ int32_t cheng_atomic_load_i32(int32_t* p);
 ChengStrBridge driver_c_str_from_utf8_copy_bridge(const char* raw, int32_t n);
 ChengStrBridge driver_c_str_clone_bridge(const char* s);
 ChengStrBridge driver_c_str_slice_bridge(const char* s, int32_t start, int32_t count);
+ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge b);
+ChengStrBridge driver_c_char_to_str_bridge(int32_t value);
 int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b);
 int32_t driver_c_str_eq_raw_bridge(ChengStrBridge actual, const char* expected_ptr, int32_t expected_len);
 int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix);
+int32_t driver_c_str_has_suffix_bridge(ChengStrBridge s, ChengStrBridge suffix);
 int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value);
 int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub);
 int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected);
@@ -289,6 +292,7 @@ void driver_c_compare_text_files_or_panic_bridge(ChengStrBridge left_path,
                                                  ChengStrBridge right_path,
                                                  ChengStrBridge label);
 ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStrBridge default_value);
+int32_t driver_c_read_flag_value_bridge(ChengStrBridge key, ChengStrBridge* out_value);
 int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value);
 ChengStrBridge driver_c_absolute_path_bridge(ChengStrBridge path);
 ChengStrBridge driver_c_program_absolute_path_bridge(void);
@@ -308,6 +312,11 @@ ChengStrBridge driver_c_compiler_core_provider_source_kind_bridge(ChengStrBridge
 ChengStrBridge driver_c_compiler_core_provider_compile_mode_bridge(ChengStrBridge plan_text);
 int32_t driver_c_run_stage_selfhost_host_bridge(void);
 int32_t driver_c_run_tooling_selfhost_host_bridge(void);
+int32_t driver_c_run_tooling_selfhost_check_bridge(void);
+int32_t driver_c_run_program_selfhost_check_bridge(void);
+int32_t driver_c_compiler_core_tooling_local_payload_bridge(const char* payload);
+int32_t driver_c_compiler_core_program_local_payload_bridge(const char* payload);
+int32_t driver_c_compiler_core_program_argv_bridge(int32_t argc, const char** argv);
 int32_t driver_c_compiler_core_local_payload_bridge(const char* payload);
 ChengStrBridge driver_c_machine_target_architecture_bridge(ChengStrBridge target);
 ChengStrBridge driver_c_machine_target_obj_format_bridge(ChengStrBridge target);
@@ -378,5 +387,6 @@ int32_t cheng_pty_wait(int64_t pid, int32_t* outExitCode);
 int32_t cheng_tcp_listener(int32_t port, int32_t* outPort);
 int32_t cheng_errno(void);
 const char* cheng_strerror(int32_t err);
+int32_t cheng_recvfrom_fd_ex(int32_t fd, void* buf, int32_t len, int32_t flags, void* addr, void* addrlen, int32_t* outErr);
 
 #endif

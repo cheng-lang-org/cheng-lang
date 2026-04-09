@@ -1,0 +1,333 @@
+## 进度
+
+| 记录口径 | 内容 |
+|---|---|
+| 规则 | 从 `2026-04-09` 起，`progress.md` 只写开始时间；完成时间不在这里记录，由用户统计真实时间。历史条目不追改。 |
+
+| 步骤 | 开始时间 | 状态 | 备注 |
+|---|---|---|---|
+| `field ordinal + record slot` 三层收口 | `2026-04-09 22:35 CST` | 已完成 | `stmtAssignTargetFieldOrdinals` 已接进 stage0 facts/high_uir/low_uir mirror，`addr_of_field/load_field/store_*field` 不再只靠字段名；runtime 侧 `driver_c_prog_record_slot_at(...)` 已成正式 slot 入口，`infer_type_arg_from_record_fields/make_record` 两处已知 decl 顺序也改成按 ordinal 直达。完整前台 gate 已在这轮 fixed point 上收口到 `manifest_fnv1a64=29cea01991c4689b`，`program-selfhost/full-selfhost` 继续通过。 |
+| `program runtime` aggregate 自拷贝与 shape clone 收口 | `2026-04-09 20:40 CST` | 已完成 | `driver_c_prog_assign_slot` 现在会跳过“同一 array/record 写回原 slot”的纯自拷贝；`driver_c_prog_clone_value_deep` 也已收成保留 `array cap / record cap / record lookup shape` 后再递归 clone 值。前台 3 次中位数更新为 `pubkey=1.1700s`、`sign=1.6700s`、`mul_xonly=1.3400s`、`kinv=0.7200s`；完整前台 gate 已重新收口到 `manifest_fnv1a64=0f4abbf4fb95ca60`。 |
+| `program runtime` root-only ephemeral clear 收口 | `2026-04-09 20:12 CST` | 已完成 | `driver_c_prog_value_clear_ephemeral_flag_root` 已通过 `p256_fixed_core_probe`、完整前台 gate、`program-selfhost`、`full-selfhost` 验证并保留。前台 3 次中位数更新为 `pubkey=1.1700s`、`sign=1.6800s`、`mul_xonly=1.3500s`、`kinv=0.7300s`；当前单次 `maximum resident set size` 约 `125MB/262MB`，`peak memory footprint` 约 `116MB/254MB`。`compiler-core-system-link-exec/program-selfhost/full-selfhost` 已重新收口到 `manifest_fnv1a64=4cb2f42ef1d06835`。 |
+| `program runtime` nested `ZERO_PLAN` eager materialize 清理 | `2026-04-09 19:45 CST` | 已完成 | `driver_c_prog_clone_value_deep` 和 `driver_c_prog_value_clear_ephemeral_flags_deep` 现在只解 `REF`，不再把 nested `ZERO_PLAN` 提前整棵物化成真实 aggregate。前台 3 次中位数更新为 `pubkey=1.1900s`、`sign=1.7100s`、`mul_xonly=1.3600s`、`kinv=0.7300s`；当前单次 `maximum resident set size` 约 `125MB/262MB`，`peak memory footprint` 约 `116MB/254MB`。`compiler-core-system-link-exec/program-selfhost/full-selfhost` 已重新收口到 `manifest_fnv1a64=7da955d0c0bacad4`。 |
+| `program runtime` lazy zero-plan 与 slot 写回修复 | `2026-04-09 17:35 CST` | 已完成 | typed `param/local_decl` 默认零值已改成 lazy `ZERO_PLAN`，ref load 改成 slot 级原地 materialize，`assign_slot` 会按 zero plan refine。顺手修掉 nested field store 在 `ZERO_PLAN` 下先物化临时值但不写回 slot 的丢写入 bug，`program-selfhost/full-selfhost` 继续通过。前台 3 次中位数更新为 `pubkey=0.9900s`、`sign=1.4100s`、`mul_xonly=1.1500s`、`kinv=0.6200s`；单次前台 RSS 约 `148MB/332MB`。 |
+| `program runtime` 小 aggregate 内联与 zero-plan 预解码 | `2026-04-09 17:03 CST` | 已完成 | `DriverCProgArray/DriverCProgRecord` 现在都有小容量内联存储，`clone/zero plan` 不再走 `record_slot(...)` 搭壳，`DriverCProgFrame` 还缓存了 `param/local zero plans`。前台 3 次中位数更新为 `pubkey=1.0700s`、`sign=1.5300s`、`mul_xonly=1.2300s`、`kinv=0.6800s`；单次前台 RSS 约 `148MB/332MB`。 |
+| `program runtime` 帧清理与小帧内联 | `2026-04-09 16:40 CST` | 已完成 | `eval_item` 现在会清理 `params/locals/stack/labels/loops`，小帧改成内联存储；`MAKE_ARRAY/MAKE_RECORD/STORE_* / NEW_REF` 也收成临时 aggregate move。前台 3 次中位数更新为 `pubkey=1.2500s`、`sign=1.7700s`，峰值 RSS 约 `147.9MB/331.6MB`。 |
+| `double/triple/quad/eight -> TrustedInto` 试刀撤回 | `2026-04-09 15:25 CST` | 已完成 | `double/add/comb/repr` 对拍都继续全绿，但 `pubkey/sign` 单次前台样本回到 `1.50s/2.22s`，比稳定基线更差，所以整刀撤回，不留在 active 热链。 |
+| 主线改成“现有闭合主链上重建关键热层” | `2026-04-09 15:15 CST` | 已完成 | 已把“不整仓重建，只重建 `program` 执行热层和纯 Cheng 热核接口”写进 `v2/docs/自举和性能.md`、`task_plan.md`、`findings.md`。 |
+| 进度记录口径改为只写开始时间 | `2026-04-09 15:15 CST` | 已完成 | 已同步 `lessons.md`、`task_plan.md`、`progress.md`、`findings.md`；后续新条目按这套口径写。 |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| 自举与性能原则文档化 | 已完成 | `v2/docs/自举和性能.md` 已新增“从第一天就保证自举后仍有 C 级性能”和“当前仓库离这个目标还差什么”，正式写死：静态系统语义、AOT-only 程序轨、固定宽度专核、同机 C `1:1` benchmark 不能后补 |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| `p256_fixed` 低层真原地输出 | 已完成 | `p256FixedModAddTrustedInto`、`p256FixedModSubTrustedInto`、raw add/sub 和条件减模都已改成真原地输出，不再先返回整块 `P256Fixed` 再赋值 |
+| `double cmp` correctness | 已完成 | `_tmp_p256_mul_double_cmp_probe_bin=ok` |
+| `add cmp` correctness | 已完成 | `_tmp_p256_mul_add_cmp_probe_bin=ok` |
+| `comb6` 生产路径 correctness | 已完成 | `_tmp_p256_comb_cmp_probe_bin=ok`，`_tmp_p256_repr_sign_r_cmp_probe_bin=repr_r_eq=1` |
+| 新性能中位数 | 已完成 | 前台 3 次中位数：`pubkey=1.2830s`、`sign=1.8210s`、`mul=1.4628s`、`kinv=0.7521s` |
+| 本轮主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=5ff3e0484c3bfc43` |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| `wnaf/python` 外部真值对拍 | 已完成 | 重新前台编译 `_tmp_p256_comb_external_cmp_probe` 后，`wnaf` 与 Python `cryptography` 的 P-256 公钥字节一致；之前“comb 也一致”的结论来自旧二进制，已作废 |
+| `comb6` 最小双比特定位 | 已完成 | `_tmp_p256_comb_two_bit_probe_bin` 现在已经把边界钉死：`single_col0` 和 `cross_row_same_col` 都塌成 `04 + 0...0`，`single_col1` 和 `top_row_cols01` 正常，`same_row_cols01` 退化成 `digit=2` 的结果 |
+| `comb6` 表常量/索引排除 | 已完成 | `_tmp_p256_comb_table_entry_probe_bin` 和 `_tmp_p256_comb_digit_lookup_probe_bin` 证明 `p256GComb6[1/2/3]` 常量本身正确，直接和可变索引读取也正确 |
+| `comb6` 小函数形状验证 | 已完成 | `_tmp_p256_comb_first_digit_probe_bin` 证明同样的 `find first nonzero row -> setFromAffine -> toAffine` 在小函数里是对的，说明根已经收缩到完整函数形状/代码生成，不是数学和表 |
+| 生产路径保护 | 已完成 | 尝试把 `publicKeyFromPrivateKey` 切到新的 `comb6` 入口后，双比特 probe 仍失败，所以这条接线已经撤回，生产树保持稳定 |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| `EcPointJacobianFixed` 值流老根复验 | 已完成 | `_tmp_p256_jacobian_valueflow_probe_bin` 现在 `local_copy/local_return/imported_return/imported_copy_then_var_assign` 全部 `=1`，这条老根已经不活了 |
+| `comb6` 固定基点 `x-only` 对拍 | 已完成 | `_tmp_p256_sign_r_comb_cmp_probe_bin` 继续前台 `ok`，说明这条局部性质存在，但还不能当整链 active 依据 |
+| `comb6` 完整 affine 对拍 | 已完成 | `_tmp_p256_comb_cmp_probe_bin` 当前稳定报 `neq`，而 `_tmp_p256_repr_sign_r_cmp_probe_bin` 也继续不等价，说明完整 affine `comb6` 仍未闭合 |
+| unsafe `comb6` active 接线回滚 | 已完成 | 上一轮临时把签名 `R` 路切到 `comb6` 的改动已经撤回，生产路径恢复安全 `wnaf` |
+| 回滚后安全 `pubkey/sign` 前台基线 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 最新前台样本 `4.47s`；`_tmp_ecdsa_sign_probe_bin` 最新前台样本 `6.98s` |
+| 回滚后拆段基线 | 已完成 | `_tmp_ecdsa_mul_probe_bin` 最新前台真跑 `3.67s`；`_tmp_ecdsa_kinv_probe_bin` 最新前台真跑 `0.95s`；当前约占整签名 `52.58%` 和 `13.61%` |
+| 本轮主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=1660bb3be59d7e85` |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| `msquicNativeDial` outline 真根 | 已完成 | `native_runtime.cheng` 已把会掉出 exec subset 的 `if-expr` body 改回显式 `var + if`，`msquicNativeDial` 已从 `compiler_fn_outline/local_payload/ast_ready=0` 收回 `compiler_fn_exec/exec_plan_payload/ast_ready=1` |
+| `chain frame: short read` 真根 | 已完成 | `connection.cheng` 已把 pipe 读收成带缓存流读取，`native_runtime.cheng` 已把 `msquicNativePipeRead` 收成按 side 的阻塞收包，不再把“暂时没到齐”误判成短读 |
+| 真实多进程 `chain_node` 联网 | 已完成 | 前台真跑 `serve-once/sync-once` 已稳定得到 `synced=1` 和 `balance=11`；当前生产证明已经从单进程 `msquic_chain_smoke` 切到 `chain_node_process_smoke` |
+
+| 步骤 | 状态 | 备注 |
+|---|---|---|
+| app stream `offset` 重组 | 已完成 | `native_runtime.cheng` 已把应用层 `FrameData` 收包从“必须连续 append”改成复用 `MsQuicCryptoStream` 的 `offset` 重组，`stream reassembly gap` 这条运行时假根已消失 |
+| `msquic_chain_smoke` 真联网 smoke | 已完成 | 前台运行 `v2/artifacts/bootstrap/msquic_chain_smoke_test` 已稳定输出 `hello_ok/sync_ok/transfer_ok/replay_ok/msquic_chain_smoke=ok`，说明 LSMR 链路已真正穿过 QUIC/TLS 双节点运行面 |
+| `lsmr-contracts` 运行面扩充 | 进行中 | 这轮把 `chain_state_tree_sync_smoke` 和 `msquic_chain_smoke` 的 stdout 固定成新的 contract，并接进 `v2/bootstrap/Makefile` 的 `lsmr-contracts` |
+| `LSH 双重寻址` | 已完成 | `v2/cheng-quic/src/chain/types.cheng` 和 `v2/cheng-quic/src/chain/lsmr.cheng` 已新增 `LsmrLocalityCid/LsmrStateCell`，正文现在可以同时拿到 `contentCid + localityHash + bagua/prefix/resolution/layer` |
+| `edge/regional/global` 三层状态快照 | 已完成 | `LsmrStateLayerForest` 已落地，能把同一批 state cell 投影成三棵独立前缀树，并导出 `localOpCount/regionalBatchCount/globalAnchorCount` |
+| `ChainIndex -> 三层快照` | 已完成 | `chainLsmrIndexStateCells/chainLsmrBuildIndexStateLayerForest` 已落地，账户状态不再只能派生一棵全量状态树 |
+| `lsmr_locality_storage_smoke` | 已完成 | 前台真编过并真运行通过，输出 `forest_cid=da324ef9bc25f637347795ba8cb7edbb0e4441406b5c0792c8006ce12fbbc600`、`index_forest_cid=89f0a4df7842c1b165886cbeb0d59fdabc2190c3734b715846d982939f18fc92` |
+| `EcPointJacobianFixed` 最小值流复现 | 已完成 | 新增 `_tmp_p256_jacobian_valueflow_probe_bin`。前台真跑结果已经钉死：`inline/local_nocopy/local_return_nocopy/imported/imported_return` 都通过；只有 `local_copy/local_return` 稳定变成 `inf=1 z=[0..]`。这说明 `comb` 数学和普通 return 都不是根，真根是“非 owner 模块里，把 imported 函数返回的 `EcPointJacobianFixed` 直接赋给本地变量”这条值流。 |
+| `comb6` 手工内联复核 | 已完成 | `_tmp_p256_generator_comb6_step_probe_bin` 前台继续 `ok`，`k1/k3` 都保持 `inf=0` 和稳定 `z`；所以这轮没有把半坏 `comb` 接回 active 热链。 |
+| `double/add in-place` correctness 对拍 | 已完成 | 新增 `_tmp_p256_mul_double_cmp_probe_bin` 和 `_tmp_p256_mul_add_cmp_probe_bin`，前台真跑都已 `ok`；确认这轮之前的 `double/add in-place` 与纯函数实现不一致，当前已收回到同构实现 |
+| `double` 子路径基线 | 已完成 | `_tmp_p256_mul_double_probe_bin` 前台真跑 `1.14s / 16 doubles`，平均每次 `double` 约 `0.0713s` |
+| `addAffine` 子路径基线 | 已完成 | `_tmp_p256_mul_add_probe_bin` 前台真跑 `16.54s / 64 adds`，平均每次 `addAffine` 约 `0.2584s`，约为 `double` 的 `3.63x` |
+| correctness 回收后的真基线 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `7.84s`，`_tmp_ecdsa_sign_probe_bin` 前台真跑 `10.29s`，`_tmp_ecdsa_mul_probe_bin` 前台真跑 `7.65s`，`_tmp_ecdsa_kinv_probe_bin` 前台真跑 `2.65s`；旧的 `7.18s/9.41s` 口径已作废 |
+| 本轮主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| 本轮主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| `double/add` Montgomery scratch 调用层复用 | 已完成 | `p256FixedMontgomery{Mul,Square}CoreTrustedScratchInto` 已接进 `pointJacobianDoubleFixedInPlace/pointJacobianAddAffineFixedInPlace`，内层不再每次新建一份 scratch record |
+| 固定宽度标量签名链试刀 | 已撤回 | 把 `r/rd/sum/kinv/s` 强行留在 fixed record 链里会回退，而且 `Result[pfix.P256Fixed]` 会撞普通 program runtime 边界；已整块撤回，不留 active 路径 |
+| 本轮常规 `pubkey` 热核复测 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `7.21s / 7.17s / 7.18s`，中位数压到 `7.18s` |
+| 本轮 `ecdsaSignBytes` 热核复测 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑 `9.82s / 9.41s / 9.37s`，中位数压到 `9.41s` |
+| 本轮外部拆段计时复测 | 已完成 | `_tmp_ecdsa_mul_probe_bin` 前台真跑 `7.77s / 7.29s / 7.32s`，`_tmp_ecdsa_kinv_probe_bin` 前台真跑 `2.07s / 2.04s / 2.04s`，当前中位数分别是 `7.32s` 和 `2.04s` |
+| 本轮主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| `Into` 热路径真原地输出 | 已完成 | `p256FixedMontgomery{Mul,Square}CoreTrustedInto`、`p256FixedMod{Add,Sub}TrustedInto` 不再先返回整块 `P256Fixed` 再赋值；`double/add` 主链的 record 回拷贝又少一层 |
+| 本轮常规 `pubkey` 热核复测 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `7.39s / 7.37s / 7.38s`，中位数压到 `7.38s` |
+| 本轮 `ecdsaSignBytes` 热核复测 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑 `9.60s / 9.52s / 9.54s`，中位数压到 `9.54s` |
+| 本轮外部拆段计时复测 | 已完成 | `_tmp_ecdsa_mul_probe_bin` 前台真跑 `8.74s / 7.41s / 7.46s`，`_tmp_ecdsa_kinv_probe_bin` 前台真跑 `3.44s / 2.08s / 2.10s`，当前中位数分别是 `7.46s` 和 `2.10s` |
+| `Jacobian -> x-only -> 单次减 n` 签名主链 | 已完成 | `ecdsaSign()` 不再走“完整仿射点 + 通用 `nMod(BigInt)`”；现在直接从 Jacobian 只拉 `x`，并在固定宽度上做一次比较/减 `n` |
+| 外部拆段计时 | 已完成 | 不再信 `epochTimeNs()`；改成前台独立探针 `_tmp_ecdsa_mul_probe_bin/_tmp_ecdsa_kinv_probe_bin`，量得中位数 `mul_xonly=16.2622s`、`kinv=2.3078s` |
+| 本轮常规 `pubkey` 热核复测 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `15.6564s / 15.8525s / 15.9512s`，中位数压到 `15.8525s` |
+| 本轮 `ecdsaSignBytes` 热核复测 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑 `18.6038s / 18.6960s / 18.2833s`，中位数压到 `18.6038s` |
+| 本轮核心探针 | 已完成 | `p256_fixed_core_probe_bin` 前台真跑 `probe=ok p_mul=1 n_mul=1 p_square=1 n_square=1` |
+| trusted 固定宽度 `modmul/modexp` | 已完成 | `p256_fixed` 已新增 `p256FixedModMulWithContextTrusted/p256FixedModExpWithContextTrusted`，`ecnist` 的 `p256ModMul/p256ModInv/nModMul/nModInv/p256FieldFixedInv` 已切到 trusted 路 |
+| 本轮常规 `pubkey` 热核复测 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `21.7294s / 15.5675s / 15.9608s`，中位数已压到 `15.9608s` |
+| 本轮 `ecdsaSignBytes` 热核复测 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑 `19.0723s / 18.0080s / 24.0553s`，中位数已压到 `19.0723s` |
+| 本轮主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| trusted 无 `Result` 固定域内核 | 已完成 | `pointJacobianDoubleFixedInPlace/pointJacobianAddAffineFixedInPlace` 已直接切到 `p256FixedMontgomery{Mul,Square}CoreTrusted` 和 `p256FixedMod{Add,Sub}Trusted`，热点里不再层层建 `Result` |
+| 本轮常规 `pubkey` 复测 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `16.8481s / 19.2838s`，较上轮 active 基线 `21.0261s` 继续下降 |
+| 本轮 `ecdsaSignBytes` 复测 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑 `19.8186s / 21.5582s`，较上轮 active 基线 `25.1703s` 继续下降 |
+| 本轮主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| `Ref helper` 试刀 | 已撤回 | 给固定域热算子再包一层 `...Ref` 调用后，常规 `pubkey` 退到 `23.4243s`、整签名退到 `27.6701s`，已整块撤回 |
+| 原地写回 `result` | 已完成 | 只保留 `pointJacobianDoubleFixedInPlace/pointJacobianAddAffineFixedInPlace` 后，常规 `pubkey` 压到 `21.0261s`，整签名压到 `25.1703s` |
+| 当前 active 性能基线 | 已完成 | `_tmp_p256_pubkey_scalar_probe_bin` 前台真跑 `21.0261s`；`_tmp_ecdsa_sign_probe_bin` 前台真跑 `25.1703s` |
+| 本轮主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| 固定逆元加法链试刀 | 已撤回 | 跑通但更慢；常规 `pubkey` 退到 `23.1760s`，整签名退到 `27.4899s`，已整块撤回，不留 active 路径 |
+| `x-only` 签名收尾试刀 | 已撤回 | 直接返回 `Result[pfix.P256Fixed]` 会碰 `program runtime` 的 imported fixed record 返回面；包回本地记录后也没有净收益，已撤回 |
+| 读 `lessons.md` | 已完成 | 继续只用前台 `cheng_v2c` 和前台 `make` |
+| `EcPointFixed` 常驻 Montgomery 域 | 已完成 | `pointFixedFromBig/pointBigFromFixed` 现在只在边界做一次 `toMont/fromMont`，`pointJacobian*Fixed` 内部不再每次字段乘法都重复进出域 |
+| 固定点热点去 `Result` | 已完成 | `pointJacobianToAffineFixed/DoubleFixed/AddFixed/AddAffineFixed` 已改成内部 crash 版本字段运算，热点里不再层层建 `Result` 盒子 |
+| 生成元 `4-bit fixed window` 试刀 | 已撤回 | `pubkey` 从 `12.76s` 变更差，已撤回 |
+| 生成元 `comb` 试刀 | 已撤回 | 初始化直接拖爆到 `stage=priv`，已撤回 |
+| 当前 `pubkey` probe | 已完成 | `_tmp_p256_pubkey_probe_bin` 前台真跑 `7.55s`，优于这轮开始前的 `8.61s` |
+| 当前 `sign` stage probe | 已完成 | `_tmp_ecdsa_sign_stage_probe_bin` 前台 `20s` 限时仍卡 `stage=mul`，说明热根继续收敛在固定点点乘，不在 `deterministicK/nModInv` |
+| 主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64=c3b367ba02d2c029` 未漂 |
+| `bigint` 热核主根重定位 | 已完成 | 真正最坏点不是旧 `bigMul`，而是 `bigModMul/bigModExp` 还在走 `bigMul -> bigMod(bit-by-bit)` |
+| `BigMontgomeryContext` 落地 | 已完成 | `src/std/crypto/bigint.cheng` 已新增 `Montgomery n0Inv/r2/oneMont` 和 limb 级 `bigMontgomeryMulCore` |
+| `ECDSA` 上下文复用 | 已完成 | `src/std/crypto/ecnist.cheng` 现在会在 `p256EnsureInit()` 里一次性构建 `P/N` 的 Montgomery 上下文，`p256ModMul/p256ModInv/nModMul/nModInv` 不再走旧路径 |
+| `program runtime` 固定数组根因定位 | 已完成 | 当前 `T[N]` 本地 scratch 的真坑不是数组本身，而是 runtime 只会把长度解析成字面量/顶层 `const int32`；复杂长度表达式会误掉进 `type item` 路径 |
+| 前台探针验收 | 已完成 | `_tmp_ecdsa_sign_probe` 已真编译并进入新路径；不再秒崩，但中断时仍有重内存和长耗时，说明真瓶颈已经收缩到普通程序执行面的“大对象值传递/热路径拷贝” |
+| 主根重定位 | 已完成 | 现在的根不是单个 overload case，而是 `compiler_core` 名字解析靠全局扫，不尊重模块可见域 |
+| `cheng-quic` 裸指针面扫描 | 已完成 | 当前活口集中在 `v2/cheng-quic/tests/msquic_transport_smoke.cheng` |
+| 任务文件收口 | 已完成 | 已改成语言主线，不再停在旧的 `&` 小口子 |
+| 模块可见域解析改造 | 进行中 | 先改 source/stage0 的 `type/global/routine` 可见域查找和 call 解析 |
+| 显式模块函数迁移 | 进行中 | 已把 `v2_source_parser`、`release_artifact`、`manifest_resolver`、`obj_file`、`cheng_tooling`、`compiler_core_lowering` 里的裸 `panic/add/len` 收成显式模块调用，`semantic_facts` 正在继续清理 |
+| `compiler_core` 链接底座补齐 | 已完成 | `system-link-exec` 和 runtime provider 现在走最小 selflink 闭包：`system_helpers_selflink_cmdline_bridge.c + system_helpers_selflink_str_eq_bridge.c`，不再拖 `min_runtime` |
+| `compiler_core-system-link-exec` | 已完成 | 前台 `cheng_v2c system-link-exec` 已真实跑通；`status/release-compile/lsmr-address` smoke、`trace-phase-space`、`emit-proof-obligations` 都已前台跑通 |
+| `stage0` 语义镜像收口 | 已完成 | `cheng_v2c_tooling.c` 剩余的 type alias/type lookup/indexed element/routine return/type match helper 已切到 `header-arena + visibility` 口径，不再留旧的全局扫描尾巴 |
+| fixed-point 刷新 | 已完成 | `release/system-link-plan/system-link-exec/tooling-selfhost/selfhost/full-selfhost` 已前台跑绿并全部对齐 |
+| 裸指针语法清理 | 进行中 | `compiler_core_pipeline_surface.cheng` 顶层 `ptr`/裸 extern/地址样本已整块删掉，`taiji-seed-set` 的 stage0/stage3 对拍已重新闭合 |
+| ZRPC surface gate | 已完成 | 新增 `verify-compiler-core-zrpc-surface`，24 个 probe 固化成正式 contract，直接挂进 `compiler-core-release` |
+| cycle/import surface gate | 已完成 | 新增 `verify-compiler-core-cycle-surface`，真实 fixture 验证 `循环 import + 零前置声明 + import_field_routine` 已挂进 `compiler-core-release` |
+| `cheng-quic` 裸指针现状复核 | 已完成 | `v2/cheng-quic/**/*.cheng` 当前真实裸指针表面为 0，不再误追 `msquic_transport_smoke` |
+| enum 成员头表化 | 已完成 | `compiler_core` 的 enum member 解析已改成 `EnumMemberHeaderArena`，不再每次扫整份 `program.topLevelKinds/typeBlocks` |
+| `field` 的 type body 索引 | 已完成 | 剩余那处 `for i in 0..<typeItemId` 数 `type` 的顺序假设已切回 `typeBodyIdx` |
+| source/stage0 enum 语义镜像 | 已完成 | `compiler_core_facts_v2.cheng` 和 `cheng_v2c_tooling.c` 现在同构携带 `enumArena` 参数线 |
+| 主 gate fixed-point 刷新 | 已完成 | `release/system-link-plan/system-link-exec/full-selfhost` 已刷新到新 facts 版本，整条前台 gate 重新跑绿 |
+| `import/type/value/routine` 可见桶 | 已完成 | `compiler_core_facts_v2.cheng` 已加入 `ImportHeaderIndex / TypeHeaderIndex / ValueHeaderIndex / RoutineHeaderIndex`，名字解析不再扫整份 header arena |
+| cycle/noise 负例 | 已完成 | `compiler_core_cycle_surface` fixture 新增未导入同名噪音模块，`manifest.has.noise=0` 已进正式 contract |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_cycle_surface.expected`、`compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已对齐，完整主 gate 前台跑绿 |
+| `module path -> id` 索引 | 已完成 | `VisibilityIndex` 已补排序查表，source 侧不再线性扫 `modulePaths[]` |
+| `type itemId -> bodyIdx` 索引 | 已完成 | `TypeHeaderArena` 已补 `itemIdToTypeBodyIdx[]` 稠密表，透明 alias 和 call/type 推导不再回扫 `typeArena.itemIds[]` |
+| `enum member` 索引 | 已完成 | `EnumMemberHeaderArena` 已补排序查表，source 侧不再线性扫 `ownerModulePaths/memberNames` |
+| `stage0` residual lookup mirror | 已完成 | `cheng_v2c_tooling.c` 现在同构带 `lookupPaths/lookupIds`、`itemIdToTypeBodyIdx`、`enum lookup`，三处旧线性扫描已删掉 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已对齐，完整主 gate 前台跑绿 |
+| `routine itemId -> declIdx` 索引 | 已完成 | `source + stage0` 都已补 `itemIdToRoutineDeclIdxs` 稠密表，routine 返回类型和后续 call/type 推导不再扫 `program.topLevelKinds/routineArena.itemIds` |
+| 新一轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已对齐，完整主 gate 前台跑绿 |
+| `compiler_core` 合法源码根集合 | 已完成 | `manifest_resolver_v2.cheng` 和 `cheng_v2c_tooling.c` 现在统一接受 `package/src`、`package/tests/contracts`、`package/examples`、`workspace/src` |
+| closure 图驱动收集 | 已完成 | `collectCompilerCoreClosurePaths` 和 stage0 mirror 继续保持 `ModuleGraph + SCC` 出序，不再把 `tests/contracts` 样本当越界路径 |
+| `taiji-seed-set` 尾部闭合 | 已完成 | `cheng_v2c taiji-seed-set`、native `taiji-seed-set`、stage0/stage3 seed 对拍都已前台跑通 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`tooling_release_artifact.expected`、`network_selfhost.expected`、`tooling_selfhost.expected`、`full_selfhost.expected` 已对齐，完整主 gate 前台跑绿 |
+| `compiler_core` no-pointer closure gate | 已完成 | 新增 `verify-compiler-core-no-pointer-closure`，正式检查 `v2/src` 生产 closure，固定输出 `closure_manifest_cid + violation_count + first_violation_*` |
+| no-pointer 生产范围 | 已完成 | `compilerCoreSourcePathNeedsNoPointerPolicy` 已补到 `v2/examples`，但正式 `compiler_core` closure gate 只扫真正的 `compiler_core` 生产根 `v2/src` |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 no-pointer closure gate 重新对齐，完整主 gate 前台跑绿 |
+| closure graph `module_path -> module_id` 索引 | 已完成 | `manifest_resolver_v2` 和 `cheng_v2c_tooling.c` 的 closure graph 已补 `lookupModulePaths/lookupModuleIds` 排序索引，闭包边构造不再线性扫 `modulePaths[]` |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 closure graph 索引重新对齐，完整主 gate 前台跑绿 |
+| `topLevelOwnerModules` 语义钉死 | 已完成 | `compiler_core` 的 top-level owner module 不再允许回退到 `sourcePath -> modulePath` 猜测；缺 owner 直接 crash |
+| module graph 归属来源收口 | 已完成 | `buildCompilerCoreModuleGraph` 现在只吃 `topLevelOwnerModules + import module paths`，不再把 `topLevelSourcePaths` 当模块归属来源 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 owner-module 语义重新对齐，完整主 gate 前台跑绿 |
+| routine 语义链 `ownerModulePath` 前移 | 已完成 | source 侧 `expr/type/call/assign` 主链现在从 `buildCompilerCoreSemanticFacts` 一次拿到 `ownerModulePath`，不再在主解析链里局部现推 `sourcePath -> modulePath` |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 routine 语义链重新对齐，完整主 gate 前台跑绿 |
+| `owner_source_path` 尾巴清理 | 已完成 | source 侧死掉的 `compilerCoreFindTypeItemIdInSourcePath/FindVisibleTypeItemId` 已删除；stage0 侧死掉的 `visible type cache + source_path wrapper` 已整块删掉 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 stage0/source 收缩重新对齐，完整主 gate 前台跑绿 |
+| closure/import 图重建 | 已完成 | `manifest_resolver_v2` 和 `cheng_v2c_tooling.c` 现在用 `DeclaredModuleIndex + ModuleGraph + SCC` 按模块路径惰性装配闭包，不再预扫整个 `workspace/src` |
+| closure alias 崩溃点修复 | 已完成 | stage0 单 owner alias 分支的 canonical module path 已修成先查表再释放，已消除释放后读取脏指针 |
+| closure 顺序去路径化 | 已完成 | owner modules/imports 保留解析顺序；ready SCC 改成首次发现顺序；SCC 内 source 发射按图插入顺序，不再按 `modulePath` 排序 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 closure/import 图重新对齐，完整主 gate 前台跑绿 |
+| import 目标 owner 模块映射 | 已完成 | `semantic_facts -> high_uir -> low_uir -> machine` 已新增 `importTargetModulePaths`，统一保存 `declared import path -> owner module path` 结果 |
+| stage0 import owner mirror | 已完成 | `cheng_v2c_tooling.c` 已拆出独立 `DeclaredOwnerModuleIndex`，不再把 manifest 的 `module->source` 索引和 semantic-facts 的 `declared->owner` 索引混成一套 |
+| `compiler_core-system-link-exec` smoke 修通 | 已完成 | `status` 路径里的 `cmdline.cliParam1Eq(...)` 已恢复成可识别的 qualified import call，完整主 gate 前台跑绿 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 import-owner 语义重新对齐，完整主 gate 前台跑绿 |
+| stage0 same-module owner 匹配 | 已完成 | `compiler_core_plan_item_matches_owner_scope` 已改成直接比较 `low_plan.owner_modules`，不再把 `source_path -> modulePath` 当 same-module 依据 |
+| source/stage0 死 wrapper 清理 | 已完成 | 已删除 source 侧 4 个和 stage0 侧 4 个只做 `owner_source_path -> owner_module_path` 转发的无调用薄 wrapper |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 owner-scope 与 wrapper 收缩重新对齐，完整主 gate 前台跑绿 |
+| `Call/AssignTargetFacts` 外壳清理 | 已完成 | source 侧 `compilerCoreCallTargetFacts/AssignTargetFacts` 已删除，主链只保留 `...InModule` 真接口，不再保留 `ownerSourcePath -> modulePath` 转发层 |
+| stage0 `visible_top_level` 外壳清理 | 已完成 | stage0 侧 `compiler_core_program_find_visible_top_level_{item_id,kind}` 已删除，名字解析只走 `_in_module` 真接口 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 wrapper 收缩重新对齐，完整主 gate 前台跑绿 |
+| `DeclaredModuleIndex` import 索引化 | 已完成 | source 侧 `CompilerCoreDeclaredModuleIndex` 已补 `importTargetModulePaths/start/count`，owner/import 现在一次 parse 一次入索引 |
+| closure 图去重复 parse | 已完成 | `manifest_resolver_v2.cheng` 的 closure 构造不再每轮拿 `ownerSourcePath` 重 parse imports，改成 `declaredModuleImportTargetPaths(...)` 查表 |
+| stage0 declared/import mirror | 已完成 | `cheng_v2c_tooling.c` 已同构补齐 declared-module import target 索引，closure graph 后半段只查索引 |
+| parser 默认 owner 结论 | 已完成 | 已确认仓内真实源码仍依赖 parser 末尾默认 owner 回填维持 `topLevelOwnerModules` 非空；这刀不误砍 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 declared/import 索引重新对齐，完整主 gate 前台跑绿 |
+| `declared module path` 语义钉死 | 已完成 | source `semantic_facts` 和 stage0 owner-index 都把旧 `sourcePath -> modulePath` helper 改名成显式 `declared module path for source path`，不再伪装成 owner 语义 |
+| dead `enum/sourcePath` 外壳清理 | 已完成 | source `semantic_facts`、source `low_uir`、stage0 facts 里的 `ResolveEnumMemberOrdinalInSourcePath` 都已删除 |
+| stage0 未限定 enum owner 解析 | 已完成 | `cheng_v2c_tooling.c` 里活着的 enum literal 解析已从 `low_plan.source_paths[current]` 改成 `low_plan.owner_modules[current]` |
+| 全局 no-pointer gate 试接 | 已完成 | 已验证直接把 `v2/examples/cheng-quic` 并进当前 gate 不闭合；根因是统一 parser 还没覆盖非 `compiler_core` surface，不是 no-pointer 策略本身 |
+| 本轮 fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已按新 owner/enum 收缩重新对齐，完整主 gate 前台跑绿 |
+| source multiline `if-expr` parser | 已完成 | `v2_source_parser` 现在能稳定解析 `return/let/var/assign` 的 block `if-expr`，joined header 和缩进分支都闭合了 |
+| stage0 multiline `if-expr` mirror | 已完成 | `cheng_v2c_tooling.c` 已补 `collect_compiler_if_expr_tail_text(...)` 和 inline `elif`，source/stage0 不再在 `if-expr` 上分叉 |
+| `break/continue` parser 支持 | 已完成 | source/stage0 都已正式识别，不再把它们误落成普通表达式行 |
+| line-surface no-pointer helper | 已完成 | 已新增 `no_pointer_surface_v2.cheng`，统一承载非 `compiler_core` surface 的 token 级 no-pointer 检查 |
+| no-pointer closure gate 扩面 | 已完成 | `verify-compiler-core-no-pointer-closure` 已从旧 `v1/root=v2/src` 升到 `v2/root_count=4`，正式覆盖 `v2/src`、`v2/examples`、`v2/cheng-quic/src`、`v2/cheng-quic/tests` |
+| package root 模块解析 | 已完成 | `compilerPackageSourceRoots` 和 stage0 mirror 已补 package root 自身，`quic/tests/*`、`quic/project/*` 不再误报 unresolved import |
+| `cheng-quic` 旧 `$()` 语法迁移 | 已完成 | `tls_x509_test.cheng` 已改成显式 `intToStr(...)`，不再要求 parser 回头兼容旧插值表面 |
+| no-pointer `->` 误报修正 | 已完成 | line-surface 检查已去掉把函数返回箭头误判成 pointer 的错误规则，`Result[...]` 返回签名不再误炸 |
+| 新 no-pointer contract 收口 | 已完成 | `compiler_core_no_pointer_closure.expected` 已切到真实 `v2` 口径，完整主 gate 前台跑绿 |
+| no-pointer 产线硬 gate | 已完成 | `release_artifact_v2.cheng` 和 `cheng_v2c_tooling.c` 现在都会在真实 `release-compile/system-link-plan/system-link-exec` 入口先 parse，再直接执行 `requireV2NoPointerSurfaceFree(...)`，no-pointer 不再只是 verifier 才知道 |
+| 全局 v2 no-pointer probe contract | 已完成 | 新增 `verify-v2-no-pointer-surface`，正式覆盖 `compiler_core/unimaker/topology/network_distribution` 四类 surface 的 8 个正反样本，`pass_count=4`、`fail_count=4`、`mismatch_count=0` |
+| no-pointer 诊断文案同构 | 已完成 | stage0 `v2_surface_first_no_pointer_violation(...)` 已改成和 source helper 同一口径：`v2 semantic facts surface: ZRPC no-pointer policy forbids ...` |
+| 本轮 fixed-point 刷新 | 已完成 | `v2_no_pointer_surface.expected`、`compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected` 已重新对齐，完整主 gate 前台跑绿 |
+| no-pointer 真实编译负例 contract | 已完成 | `compiler-core-release` 现在会前台跑 3 个坏样本的 `cheng_v2c release-compile`，并把稳定报错文案和 `rc=1` 固定到 `v2_no_pointer_compile_failures.expected` |
+| 本轮 gate 验收 | 已完成 | 新负例 contract 已挂进 `compiler-core-release`，完整 `v2/bootstrap` 主 gate 前台跑绿，且没有新增孤儿进程 |
+| no-pointer 真实 package 入口 contract | 已完成 | `compiler-core-release` 现在会前台跑 `unimaker_robot_node`、`network_distribution_module`、`topology_code_sync` 三个真实 package 入口的 `cheng_v2c release-compile`，并把关键成功字段固定到 `v2_no_pointer_package_entries.expected` |
+| package 入口选择 | 已完成 | 这轮只纳入 `v2/examples` 的 3 个真入口，不把 `v2/cheng-quic/src/project/*` 混进来，避免把 no-pointer gate 和 `program` runtime 缺口搅在一起 |
+| no-pointer 真实 package 闭包 contract | 已完成 | `compiler-core-release` 现在会前台跑 `verify-v2-no-pointer-package-closures`，固定验证 `v2/examples` 下 3 个真实 package 入口的 manifest 闭包都零裸指针，并固化到 `v2_no_pointer_package_closures.expected` |
+| package closure gate 产线化 | 已完成 | 旧的 `v2_no_pointer_package_entries.expected` 已退场；source/stage0 新命令、Makefile gate、fixed-point contract 已全部收口，完整主 gate 前台跑绿 |
+| no-pointer compile-closure 硬 gate | 已完成 | `release_artifact_v2.cheng` 和 `cheng_v2c_tooling.c` 现在都会对真实 manifest 闭包执行 `requireV2NoPointerManifestFree(...)`，`release-compile/system-link-plan/system-link-exec` 入口不再只检查单文件 surface |
+| no-pointer 真实编译负例 fixture 隔离 | 已完成 | 3 个 compile-failure probe 已搬进各自独立的 fixture 根，避免 `release-compile` 把整个 `v2/tests/contracts` 目录装进闭包后被别的历史 fixture 抢先打死 |
+| no-pointer 真实 package compile-closure contract | 已完成 | 新增 `v2_no_pointer_package_compile_closures.expected`，`compiler-core-release` 现在会前台跑 3 个 `v2/examples` 真实入口的 `release-compile`，并固定 `manifest_file_count/no_pointer_checked_*` 成功字段 |
+| compile-path fixed-point 刷新 | 已完成 | `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`compiler_core_system_link_exec_smoke.expected`、`tooling_release_artifact.expected`、`full_selfhost.expected` 已按 compile-closure no-pointer 字段重新对齐，完整主 gate 前台跑绿 |
+| no-pointer 真实 package shared compile-closure contract | 已完成 | 复用既有 `tooling/topology/selfhost` 的 `system-link-exec --emit shared` contract，固定 `manifest_file_count=3`、`no_pointer_checked_file_count=3`、`no_pointer_checked_line_surface_file_count=3`、`no_pointer_closure_ok=1` |
+| shared-path fixed-point 刷新 | 已完成 | `tooling_system_link_exec_shared.expected`、`topology_system_link_exec_shared.expected`、`selfhost_system_link_exec_shared.expected` 以及下游 fixed-point 已对齐，完整主 gate 前台跑绿 |
+| shared plan no-pointer compile-closure contract | 已完成 | `system-link-plan --emit shared` 现在也正式携带 `manifest_file_count/no_pointer_checked_*/no_pointer_closure_ok`，并收进 `tooling/topology/selfhost` 三条真实 shared plan contract |
+| stage0 `manifest_file_count` 活 bug | 已完成 | `cheng_v2c_tooling.c` 里 `build_system_link_plan(...)` 之前误传了未初始化的 `out.manifest_file_count`；现已改成直接传 `manifest.file_paths.len` |
+| 本轮 fixed-point 刷新 | 已完成 | 新增 `tooling_system_link_plan_shared.expected`、`topology_system_link_plan_shared.expected`、`selfhost_system_link_plan_shared.expected`，并刷新 `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`compiler_core_system_link_exec_smoke.expected`、`tooling_release_artifact.expected`、`full_selfhost.expected`，完整主 gate 前台跑绿 |
+| program low_uir `break/continue` lowering | 已完成 | source `compiler_core_lowering_v2.cheng` 已把 `break/continue` 正规 lower 成现有 `jump`，`for_range` 额外补了 `step` label，`while/for_range` 都显式维护 loop label 栈 |
+| stage0 `routine_op_count=0` 吞错回退 | 已完成 | `cheng_v2c_tooling.c` 已删掉低层 lowering 失败就 truncate exec ops 然后写 `routine_op_count=0` 的旧回退，改成和 source 一样直接失败 |
+| `chain_node` exec-plan 缺口 | 已完成 | `./v2/artifacts/bootstrap/cheng_v2c system-link-plan --in ./v2/cheng-quic/src/project/chain_node.cheng --emit exe --target arm64-apple-darwin` 现在稳定输出 `compiler_core_program_local_payload_exec_plan_function_count=1418`、`compiler_core_program_local_payload_missing_exec_plan_function_count=0`、`system_link_ready=1` |
+| `chain_node` 可执行产物 | 已完成 | `./v2/artifacts/bootstrap/cheng_v2c system-link-exec --in ./v2/cheng-quic/src/project/chain_node.cheng --emit exe --target arm64-apple-darwin --out ./v2/artifacts/bootstrap/chain_node_test` 已真生成可执行文件 |
+| `pointMulGenerator` 固定基点路径 | 已完成 | `ecnist` 已从普通窗口乘法收成 `16` 项仿射表、一次 batch inverse、`pointJacobianAddAffineFixed(...)` 和 `pointMulGeneratorWnaf(...)`，不再在热路径里做通用 Jacobian-Jacobian 加法 |
+| 证伪路径 | 已完成 | `256` 项运行时生成元大表已验证不是最短路：冷启动 `pubkey` 直接退化到 `20s timeout`；`bigModInvOddBinary` 替换现有逆元也已验证更慢，已全部撤回 |
+| 当前性能口径 | 已完成 | 前台单测 `./v2/artifacts/bootstrap/_tmp_p256_pubkey_probe_bin` 冷启动降到 `11.63s`；`./v2/artifacts/bootstrap/_tmp_ecdsa_sign_probe_bin` 在 `40.05s` 仍未完成，说明 `sign` 剩余主热根已经不在固定基点乘法本身 |
+| 本轮主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，当前 `manifest_fnv1a64=c3b367ba02d2c029` |
+
+| 本轮 fixed-point 刷新 | 已完成 | 已刷新 `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected`，完整主 gate 前台跑绿 |
+| Cheng-Chain 非 VM 数据面 | 已完成 | `v2/cheng-quic/src/chain/*` 已落下洛书多播树、信息分散、被动反熵、batch 共识 |
+| `msquic_chain_smoke` 算法验收 | 已完成 | smoke 已固定验证 multicast tree、fragment recover、anti-entropy causal order、consensus batch ordering |
+| `tooling-selfhost-check` source/runtime/native 收口 | 已完成 | source 命令、native bridge、runtime usage 已对齐，`full-selfhost` 不再卡 stage2 tooling check 退出码 |
+| stage2 `tooling-selfhost-check` 直验 | 已完成 | `/Users/lbcheng/cheng-lang/v2/artifacts/full_selfhost/stages/cheng_v2.stage2/cheng_v2 tooling-selfhost-check ...` 现在稳定 `rc=0` |
+| `chain_node_test` 运行阻塞定位 | 已完成 | 当前不是链算法错，而是普通程序运行时仍报 `driver_c compiler_core program local payload bridge: exec-plan interpreter missing label=main ... exec_op_count=298` |
+| 本轮 fixed-point 刷新 | 已完成 | 已刷新 `compiler_core_release_artifact.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected`，完整主 gate 前台跑绿 |
+| 洛书-八卦多维前缀树 | 已完成 | `v2/cheng-quic/src/chain/types.cheng` 和 `v2/cheng-quic/src/chain/lsmr.cheng` 已新增 `LsmrBaguaPrefixEntry/LsmrBaguaPrefixTree`，按 `bagua + luoshu prefix + value cid` 构建稳定 SoA 前缀树，节点 cid 和树 cid 都走 canonical text |
+| 前缀树专用 smoke | 已完成 | 新增 `v2/cheng-quic/src/tests/lsmr_bagua_prefix_tree_smoke.cheng`，前台编译运行稳定输出 `nodes=9`、`entries=4`、固定 `treeCid`，并验证输入重排不漂 |
+| `msquic_chain_smoke` 前缀树覆盖 | 已完成 | `src/tests` 和包外 `tests` 两份 chain smoke 都已把多维前缀树纳入固定算法验收，不再只测多播树/分片/反熵/共识 |
+| 本轮 fixed-point 刷新 | 已完成 | 已刷新 `compiler_core_release_artifact.expected`、`compiler_core_no_pointer_closure.expected`、`compiler_core_system_link_plan.expected`、`compiler_core_system_link_exec.expected`、`full_selfhost.expected`，完整主 gate 前台跑绿 |
+| `ChainIndex` 状态树化 | 已完成 | `types/log/codec/lsmr/consensus` 现在把账户状态 canonical 化成 `state cid`，并把 `ChainIndex` 正式派生为洛书-八卦多维前缀树 |
+| 反熵状态树摘要 | 已完成 | `anti_entropy` 的 `signature/hello/advertise` 现在都携带 `state_tree_cid/state_tree_node_count/state_tree_entry_count`，advertise 还会带各 bagua root 摘要 |
+| 状态树 dirty 机制 | 已完成 | 共识层只标记 `stateTreeDirty`，真正读签名时才按需精确重建，不再把树更新和共识写路径搅在一起 |
+| 链 smoke 状态树验收 | 已完成 | `msquic_chain_smoke` 现在固定验证 mint 后 state tree 存在、sync 后两端 `stateTreeCid` 相等、transfer 后 entry 数为 2、replay 后树根不漂 |
+| 前台验收 | 已完成 | `lsmr_bagua_prefix_tree_smoke_test` 前台运行通过；`msquic_verify_runner_test` 继续暴露旧的 `quic/msquictransport.initMsQuicTransport` 运行时老根，但这次前缀树改动没有放大它；完整 `v2/bootstrap` 主 gate 继续前台跑绿 |
+| 反熵子树差分协议 | 已完成 | `anti_entropy` 已新增 `wantStateSubtrees`、`state subtree payload`、`state subtree diff`，同步不再主走全量 `event_cid` 差集，而是先按 `state_root -> bagua/prefix` 下钻 |
+| `chain_node` 树差分同步 | 已完成 | `node.cheng` 已新增 `WANT_STATE_SUBTREE/PUSH_STATE_SUBTREE` 和按账户 `headCid` 追事件祖先链的同步路径，先定位状态差异，再补事件 DAG |
+| 本地节点命令运行 | 已完成 | `chain_node_test` 前台已真实跑通 `balance=0` 与 `mint -> balance=11`，说明不含 QUIC 的节点日志、索引、状态树路径已经闭合 |
+| 子树同步 smoke | 已完成 | 新增 `chain_state_tree_sync_smoke.cheng`，源码面固定验证 `state_root -> subtree -> headCid ancestor chain`；当前 `system-link-exec` 真链接，但运行仍暴露普通程序 runtime 对 `anti_entropy` label 的老根 |
+| no-pointer closure contract 刷新 | 已完成 | 因新增链 smoke，`compiler_core_no_pointer_closure.expected` 已同步从 `291/288` 刷到 `292/289`；完整 `v2/bootstrap` 主 gate 前台跑绿 |
+| 子树同步后序遍历修正 | 已完成 | `chainNodePullStateDiff(...)` 和 `chain_state_tree_sync_smoke` 都改成先下钻 child subtree、再同步 leaf head、最后校验 parent subtree 的后序遍历，不再先验父节点 |
+| `chain_state_tree_sync_smoke` 真运行 | 已完成 | 前台运行 `v2/cheng-quic/artifacts/chain_state_tree_sync_smoke_test` 已稳定输出 `chain_state_tree_sync_smoke_synced=2` 和固定 `tree_cid=48b8d3153a70958c7c7b61d4c427b9b7c068f98264fe815a43c47ce8ed1b1d5a` |
+| 本轮前台验收 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 已完整通过，`manifest_fnv1a64=ad181b63dba7a714` |
+| `P-256 8x32` 专用内核骨架 | 已完成 | 新增 `src/std/crypto/p256_fixed.cheng`，把 `modulus/r2/oneMont/n0Inv` 固化成专用 `8x32` 数据面，去掉初始化阶段对 `bigBuildMontgomeryContext(...)` 的依赖 |
+| 固定宽度 probe | 已完成 | 新增 `v2/tests/contracts/p256_fixed_core_probe.cheng`，前台 `cheng_v2c system-link-exec` 真编过，运行时已把问题压缩到 `p_a_mont` 第一次 Montgomery 乘法 |
+| 新内核当前断点 | 已完成 | `p256_fixed_core_probe` 当前稳定报 `probe=fail p_a_mont p256_fixed: montgomery carry overflow idx=32`，说明问题已从“通用 BigInt 太慢”收缩到“固定宽度 Montgomery carry 传播实现与 Python 参考不一致” |
+| `p256_fixed` 最小 stage probe | 已完成 | 临时最小 probe 已把断点继续压缩：`a * R^2` 第一拍的 `word0/mWord` 都对，真正炸点是同一拍的 `+ mWord * modulus`，稳定报 `mul reduce i=0 / carry overflow offset=0 idx=17` |
+| `p256_fixed` active 接线 | 已撤回 | 试接 `ecnist` 后发现专用核还没闭合；已把 `p256ModMul/p256ModInv/nModMul/nModInv` 恢复成稳定的 Jacobian + generic Montgomery 路径，不留半坏状态 |
+| 本轮结论 | 已完成 | 真根已经从“ECDSA 数学公式”收缩到“普通 program 轨的 64 位热算子/固定宽度 Montgomery 语义”；下一刀该直接查 program 轨 `uint64` 乘法与移位，不再盲接 `p256_fixed` |
+| program runtime `u32/u64` 值语义 | 已完成 | `src/runtime/native/system_helpers_stdio_bridge.c` 已新增真实 `U32/U64` value kind，`cast/zero-init/binary_op/bitwise/shift/k512/uint64ToStr*` 都不再把 unsigned 值偷降成 signed |
+| `uint64 >>` 最小前台 probe | 已完成 | `_tmp_p256_runtime_probe` 现已恢复 `mul_hi_ok=1`、`mul_hi_bit32=0`、`mul_hi_bit63=0`，说明普通 program 轨的 `uint64` 右移符号扩展 bug 已被收掉 |
+| `p256_fixed` Montgomery 末尾减模 | 已完成 | `src/std/crypto/p256_fixed.cheng` 已从“高字非零直接报溢出”改成“带高字条件减模”，`n` 模数路径不再把合法结果误判成 `montgomery high carry overflow` |
+| `p256_fixed_core_probe` | 已完成 | 前台真跑现在稳定输出 `probe=ok p_mul=1 n_mul=1`，说明 `P/N` 两条固定宽度 Montgomery 路已经闭合 |
+| 本轮 fixed-point 刷新 | 已完成 | 已刷新 `compiler_core_system_link_exec.expected` 和 `full_selfhost.expected`，完整主 gate 前台重新跑绿 |
+| 泛型零初始化双作用域解析 | 已完成 | `system_helpers_stdio_bridge.c` 已把 `zero_value_from_type` 收成“声明模块作用域 + 实例化模块作用域”，`Result[pfix.P256Fixed]` 不再拿 `std/result` 去解 `pfix.P256Fixed` |
+| `ecdsaSignBytes` 类型解析活根 | 已完成 | `_tmp_ecdsa_sign_probe` 不再报 `missing type item for zero init type=pfix.P256Fixed`，现在会真实跑进签名热核 |
+| `pointMul` 热点复核 | 已完成 | 打点 probe 证明当前超时卡在 `stage=mul`，不是 `nonce/hash/modinv`，真正热点已经收敛到 `pointMul` 路径 |
+| `G` 基点窗口表预计算 | 已完成 | `ecnist.cheng` 已把 `p256GWindow4` 收进 `p256EnsureInit()`，`ecdsaSign/publicKeyFromPrivateKey` 改走生成元专用窗口表，不再每次临时重建 `G` 的 16 项窗口 |
+| 本轮 fixed-point 刷新 | 已完成 | 已刷新 `compiler_core_system_link_exec.expected` 和 `full_selfhost.expected`，完整主 gate 前台通过，当前 `manifest_fnv1a64=c3b367ba02d2c029` |
+| `P/N/B/G` 与 `1..15*G` 静态常量化 | 已完成 | `ecnist.cheng` 已把主常量和生成器 `Montgomery` 窗口表直接固化到源码，`p256EnsureInit()` 不再跑 `hexDecode + bigFromBytes + Jacobian 建表` |
+| `z==1` affine 快路 | 已完成 | `pointJacobianToAffineFixed()` 现在遇到 `z == oneMont` 直接返回，不再白做一次模逆；`k=1` 的生成元点乘不再被尾部 affine 逆元拖死 |
+| 签名只取 `x` 坐标 | 已完成 | `ecdsaSign()` 已改走 `pointMulGeneratorFixed()`，并只把 `x` 从 `Montgomery` 域转回 `BigInt` 做 `r`，不再把没用的 `y` 坐标也转回去 |
+| `pubkey` 单探针 | 已完成 | `_tmp_p256_pubkey_probe_bin` 前台真跑从 `7.55s` 压到 `1.32s` |
+| `ecdsaSignBytes` 单探针 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑已从“20s 内只到 `stage=mul`”推进到真实完成，当前 `rc=0 real=29.73 stdout=ecdsa_sign_probe=ok` |
+| 主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 继续前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| 生成器固定标量重编码 | 已完成 | `pointMulGeneratorWnaf()` 已改成固定 `8x32` 标量原地 `odd/low5/+small/-small/>>1`，不再走 `BigInt` 的 `bigAdd/bigSub/bigShiftRight1` |
+| 负点表预计算 | 已完成 | `p256GWindow4Neg` 已在 init 时一次性建好，主循环不再现算 `-digit * G` |
+| `pubkey` 单探针第二刀 | 已完成 | `_tmp_p256_pubkey_probe_bin` 前台真跑从 `1.32s` 继续压到 `0.44s` |
+| `ecdsaSignBytes` 单探针第二刀 | 已完成 | `_tmp_ecdsa_sign_probe_bin` 前台真跑从 `29.73s` 继续压到 `26.81s` |
+| 主 gate 第二次复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 继续前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| `p256_fixed` 专用 square 核 | 已完成 | `src/std/crypto/p256_fixed.cheng` 已新增固定 `8x32` Comba square + Montgomery reduction，并补了 `p_square/n_square` 对拍到 `p256_fixed_core_probe` |
+| 退化 square 实现 | 已撤回 | 第一版“逐项积累 + 可变 carry 链”的 square 虽然正确，但会把 `stage=mul` 拉慢到 `31.84s`，已整块撤回，不留在 active 路径 |
+| field 自乘接线 | 已完成 | `ecnist.cheng` 里 `pointJacobianDoubleFixed/pointJacobianAddFixed/pointJacobianAddAffineFixed` 和 `modexp` 的真自乘位点已改走 `p256FieldFixedSquare` |
+| 本轮性能收益 | 已完成 | `p256_fixed_core_probe` 前台真跑 `p_mul=1 n_mul=1 p_square=1 n_square=1`；`_tmp_p256_pubkey_probe_bin` 前台真跑恢复到 `0.30s/0.13s`；`_tmp_ecdsa_sign_stage_probe_bin` 前台真跑 `stage=mul -> stage=r` 压到 `21.84s`，总时长 `24.59s`；`_tmp_ecdsa_sign_probe_bin` 前台真跑稳定到 `25.94s/24.32s` |
+| 本轮 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| 第一梯队理论值 | 已完成 | 同机 `openssl speed -seconds 3 ecdsap256 ecdhp256` 已测得 `sign=11.9109us/op`、`ecdh/pubkey=24.4003us/op`；后续全部按 `1:1` 口径记，不再用 `2x` |
+| benchmark 口径修正 | 已完成 | 已新增 `_tmp_p256_pubkey_scalar_probe_bin`，固定非平凡私钥前台真跑 `23.4166s/20.9950s/21.7849s`；`_tmp_p256_pubkey_probe_bin` 的 `priv=1` 现在只保留作回归 probe |
+| 总体工程进度 | 已完成 | 已按 `普通程序执行面 35% + 纯 Cheng 性能内核 35% + 自举扩链路 15% + 非 VM 链主线 15%` 量化，总体约 `32.05%`，口径已写进 `v2/docs/自举和性能.md` |
+| trusted `add/sub Into` 根修复 | 已完成 | `src/std/crypto/p256_fixed.cheng` 里的 `p256FixedModAddTrustedInto/p256FixedModSubTrustedInto` 已收成和 value-return 同构；逐拍 `addAffine` probe 已不再卡 `h/i/yDiff/r` 这些基础量 |
+| `addAffine` 逐拍 probe | 已完成 | 新增 `_tmp_p256_mul_add_stage_cmp_probe.cheng`，前台真跑已把 trusted 路第一处错位稳定推进到 `x3` |
+| 核心回归 | 已完成 | `p256_fixed_core_probe_bin` 继续 `probe=ok p_mul=1 n_mul=1 p_square=1 n_square=1`，`_tmp_p256_mul_add_cmp_probe_bin` 继续 `p256_mul_add_cmp_probe=ok` |
+| 主 gate 复验 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| `comb6 digits[]` 预计算 | 已撤回 | 这轮 correctness probe 全绿，但 3 次中位数是 `pubkey=1.3587s`、`sign=2.0194s`、`mul=1.5392s`、`kinv=0.7741s`、`comb=1.1910s`。虽然 `comb` 局部比稳定版更快，但和稳定基线 `pubkey=1.2830s`、`sign=1.8210s`、`mul=1.4628s`、`kinv=0.7521s` 相比，总链路明确回归，所以已整块撤回，生产路径回到稳定版。 |
+| 撤回后 correctness 复核 | 已完成 | 前台重新编译并运行 `_tmp_p256_mul_double_cmp_probe/_tmp_p256_mul_add_cmp_probe/_tmp_p256_comb_cmp_probe/_tmp_p256_repr_sign_r_cmp_probe`，结果继续 `ok/ok/ok/repr_r_eq=1`，没有留下坏状态。 |
+
+| `addAffine` stage probe 全绿 | 已完成 | 这轮把 `z3a/z3` 也拆成 `value/into` 后，`_tmp_p256_mul_add_stage_cmp_probe_bin` 已稳定 `ok`，说明 `pfix` 底层已经闭合 |
+| probe 假包装清理 | 已完成 | `fieldAdd/Sub/Double/QuadTrustedInto` 这一组 dead wrapper 已从 `_tmp_p256_mul_add_stage_cmp_probe.cheng` 删除，probe 只保留直接 `pfix` 调用 |
+| `addAffine` 全 trusted active 接线 | 已撤回 | 把 `pointJacobianAddAffineFixedInPlace` 整段切到 trusted `Into` 路后，`pubkey` 会回归到 `19.88/19.49/19.47s`，`sign` 回归到 `23.20s`；已整块撤回 |
+| `Crash -> trusted` 直连 | 已撤回 | 把 `p256FieldFixed{Add,Sub,Mul,Square}Crash` 直接连到 trusted 核会更差，`pubkey` 单样本直接变成 `30.73s`；已整块撤回 |
+| 本轮保留内容 | 已完成 | 当前只保留 stage probe 和诊断收口，active `ecnist` 热路径没有留下回归接线；完整主 gate 继续前台通过，`manifest_fnv1a64=c3b367ba02d2c029` |
+| `addAffine` 7 次 `mul -> helper shared scratch` | 已撤回 | 这轮只换 `pointJacobianAddAffineFixedInPlace` 里的 7 次乘法，`_tmp_p256_mul_add_cmp_probe` 和 `_tmp_p256_mul_add_stage_cmp_probe` 都能过，但三次前台基准把 `pubkey/sign` 拉回到约 `19.50s/22.38s`，已整块撤回 |
+| `double` 3 次 `mul -> inline trusted scratch` | 已撤回 | 把 `pointJacobianDoubleFixedInPlace` 的 3 次乘法直接内联到 `pfix.p256FixedMontgomeryMulCoreTrustedScratchInto` 后，`_tmp_p256_mul_double_cmp_probe` 直接崩；已整块撤回 |
+| `addAffine` 7 次 `mul -> inline trusted scratch` | 已撤回 | 继续把 helper 边界也砍掉后，`_tmp_p256_mul_add_cmp_probe` 和 stage probe 仍然能过，但 `_tmp_p256_mul_add_probe_bin` 单样本升到 `26.71s`，说明 helper 不是主根，这条路本身就错；已整块撤回 |
+| 当前回归确认 | 已完成 | 撤回后 `_tmp_p256_mul_add_cmp_probe_bin`、`_tmp_p256_mul_double_cmp_probe_bin` 继续 `ok`，完整主 gate 继续前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| pure `out-parameter` 热路 | 已撤回 | 这轮试了 `p256_fixed/ecnist` 的 pure `Into` 路，想直接砍掉 `Result[P256Fixed]` 返回值搬运。结果字段级 direct `add/sub/mul/square` 虽能对拍，但组合层 `double/quad/eight` 一接进 `pointJacobianDoubleFixedInPlace/pointJacobianAddAffineFixedInPlace` 就出现 `step=0` 偏差，补完自别名拆解后还会直接崩；生产代码已整块撤回 |
+| 本轮 gate 复验 | 已完成 | 撤回 pure `out-parameter` 后，`_tmp_p256_mul_double_cmp_probe_bin`、`_tmp_p256_mul_add_cmp_probe_bin` 重新回到 `ok`，完整主 gate 前台通过，`manifest_fnv1a64` 仍为 `c3b367ba02d2c029` |
+| `copyBytesRange` 重载歧义 | 已完成 | `v2/cheng-quic/src/connection.cheng` 里只读 `copyBytesRange` 已删掉 `var Bytes` 假重载；在正确 `var` 语义下不再因为 `Bytes/var Bytes` 双候选导致 `bytesTakePrefix` unresolved overload |
+| 链入口重新编通 | 已完成 | `chain_node.cheng` 和 `chain_state_tree_sync_smoke.cheng` 现在都能前台 `system-link-exec --emit exe` 真链过；`chain_state_tree_sync_smoke_bin` 输出 `output_file_cid=413c5208cb226273112c15b7f1ad4b709d6deb821d59e5bbfd4551a4054769a9`，`chain_node_test` 输出 `output_file_cid=07cbd4070a856dbf821497d3c625b29c946eb0bce5e981a681e35446e7cbdb07` |
+| 真实节点命令 | 已完成 | `chain_node_test balance --root ... --account alice --asset cheng` 已真跑出 `balance=0`；`mint --amount 11` 后再 `balance` 已真跑出 `balance=11` |
+| 状态树 smoke 运行面 | 已定位 | `chain_state_tree_sync_smoke_bin` 运行不再是编译错误，而是长时间挂在 `runtime_compiler_core_program_local_payload_entry -> driver_c_prog_eval_item`；这说明当前真根已经从链算法表层收缩到普通 `program` 运行面 |
+| 本轮主 gate | 已完成 | 修掉 `copyBytesRange` 后，`make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 继续前台通过，没有新增孤儿进程 |
+| `program` runtime 可见项查找 | 已完成 | `system_helpers_stdio_bridge.c` 这轮把 `top_level_tag`、authoritative lookup cache 和 `op.kind_tag` 都接进 hot path，`chain_state_tree_sync_smoke.cheng` 和 `chain_node_test balance` 继续前台通过 |
+| `builtin` 分发预解码 | 已完成 | 新增 `builtin_tag` 数据面，`driver_c_prog_execute_call()` 现在只让 `builtin/importc` 进入 `driver_c_prog_try_builtin`；普通 Cheng 函数不再白扫整串 builtin label |
+| `system_link_exec` fixed-point | 已完成 | 这轮只有 `compiler_core_system_link_exec.expected` 漂移，已按新 support object/runtime 对齐；完整主 gate 重新前台通过 |
+| `msquic` 握手重传去重 | 已完成 | `v2/cheng-quic/src/native_runtime.cheng` 已把 `Initial/Handshake` 的 `FrameCrypto` 输入改成 `MsQuicCryptoStream` 按 `offset` 重组后再喂 TLS，不再把重传包里的重复 `frame.data` 直接塞进 `msquicTls13HandshakeFeed` |
+| 311GB 内存根定位 | 已完成 | 已静态确认真根是“重传包重复喂 TLS -> transcript 重复追加 -> `appendBytes/toBytes` 整块复制放大”，不是递归；这轮按用户要求没有再编译或跑 smoke |
+| TLS 握手 fail-fast 上限 | 已完成 | `v2/cheng-quic/src/tls/handshake13.cheng` 已新增 transcript/buffer 硬上限；后续再有重复输入只会直接报 `transcript overflow` / `handshake buffer overflow`，不再把机器内存拖爆 |
+| `var arg not ref` stage0 真根 | 已完成 | 已静态确认 `chain_state_tree_sync_smoke` 当前不是链算法错，而是 `v2/bootstrap/cheng_v2c_tooling.c` 在 lowering `call` 时按“半成品 `low_plan`”反查 callee 参数签名；callee 若还没生成，`var_param` 会丢失，最终把本地数组按值降。现已改成按完整 `program/itemId` 查真实 routine 参数签名。 |
+| 本轮执行方式 | 已完成 | 只做静态修根和代码 review，没有编译，没有跑 smoke，避免再触发大内存路径。 |
+| `chain_state_tree_sync_smoke` 真运行 | 已完成 | 这轮把 `anti_entropy` 和 smoke 里的字符串场景裸 `len(...)` 全改成显式 `strings.len(...)` 后，`chain_state_tree_sync_smoke_test` 已前台真跑 `rc=0`，输出 `chain_state_tree_sync_smoke_synced=2` 和 `chain state tree sync smoke ok`；20 秒内已完成，峰值 RSS 约 `11.8GB`，不再卡在旧的 `len` 歧义根。 |
+| `msquic_chain_smoke` 新最小根因 | 已完成 | `msquic_chain_smoke_test` 已前台真链接，并在 20 秒受控执行里稳定输出 `lsmr_ok/dispersal_ok/broadcast_ok/anti_entropy_ok/consensus_ok`，随后死在 `driver_c program runtime: index access on non-array label=add base_kind=record`。这说明链算法层已经越过，新的真根是 `v2/cheng-quic/src/chain/lsmr.cheng` 里整批裸 `add(...)` 仍停在 `load_name|add`，不是 QUIC/TLS/共识算法本身。 |
+| `LSMR.md` 状态同步 | 已完成 | [LSMR.md](/Users/lbcheng/cheng-lang/v2/docs/LSMR.md) 顶部已补成正式状态表，明确写出“已完成/部分完成/未完成/代码落点/验证”，不再让愿景和现状混在一起。 |
+| `LSMR` 剩余三块技术面 | 已完成 | `大衍流转 PubSub`、`CSG 子图载荷与网络层过滤`、`去中心化空间证明` 已分别落在 `v2/cheng-quic/src/chain/pubsub.cheng`、`v2/cheng-quic/src/chain/csg.cheng`、`v2/cheng-quic/src/chain/location_proof.cheng`，共用 `types.cheng` 新增正式数据结构。 |
+| 新 smoke | 已完成 | `v2/cheng-quic/src/tests/lsmr_advanced_features_smoke.cheng` 已前台真编真跑通过，固定输出 `topic/plan/safe_graph/safe_delta/location_proof` 五个 cid，最后 `lsmr_advanced_features_smoke=ok`。 |
+| 新 gate | 已完成 | `v2/bootstrap/Makefile` 的 `lsmr-contracts` 已接入 `lsmr_advanced_features_smoke`；前台执行 `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap lsmr-contracts` 已通过，当前 `manifest_fnv1a64=868e9aef9383a872`。 |
+| 文档同步 | 已完成 | [LSMR.md](/Users/lbcheng/cheng-lang/v2/docs/LSMR.md) 和 [cheng-chain-mvp.md](/Users/lbcheng/cheng-lang/v2/docs/cheng-chain-mvp.md) 已同步成“技术面闭合、真实联网面仍部分完成”的正式口径。 |
+| `FrameData` 真实编码长度 | 已完成 | `v2/cheng-quic/src/core/frame_model.cheng` 现在按 `kind/streamId/offset/value/dataLen/data` 的真实 QUIC varint 编码长度计算 `msquicFrameSize(...)`，不再把 `FrameData/Crypto/Datagram` 只按裸 payload 估长。 |
+| `connection_impl` 精确切片 | 已完成 | `v2/cheng-quic/src/core/connection_impl.cheng` 已新增 `msquicConnImplFrameBudget(...)`、`msquicConnImplMaxDataChunkLen(...)`、`msquicConnImplMaxQueuedDataLen(...)`；`msquicConnImplQueueData(...)` 现在会先精确预估需要多少 frame，再按包预算切成多个 `FrameData`，不再让首帧大于 MTU 时整包一个都塞不进去。 |
+| `pipeWrite` 分批 flush | 已完成 | `v2/cheng-quic/src/native_runtime.cheng` 的 `msquicNativePipeWrite(...)` 已改成按“当前队列还能装下的理论最大字节数”分批 `queueData`，每批立刻 `flushShortPackets + pump`，避免一次大写入先撞单帧上限，再撞 `128` 帧队列上限。 |
+| 本轮执行方式 | 已完成 | 这轮按用户要求没有编译、没有跑 smoke，只做静态修根和记录同步，避免再次触发大内存路径。 |
+| `system.panic` 老根收口 | 已完成 | `src/std/system.cheng` 已新增非重载 `panicStr`，`v2/src/compiler` 下全部 `system.panic(...)` 已切到 `system.panicStr(...)`。`compiler-core-release` 已不再死在 stage0 的 imported-field overload 解析上。 |
+| `compiler-core` 主链恢复 | 已完成 | `compiler-core-release`、`compiler-core-system-link`、`compiler-core-system-link-exec`、native smoke 都已经重新前台跑绿；`compiler_core_system_link_exec_smoke` 也已按新 fixed-point 收口。 |
+| `tooling/selfhost/full-selfhost` 收口 | 已完成 | `tooling_release_artifact`、`tooling_system_link_plan_shared`、`topology_system_link_plan_shared`、`network_selfhost`、`tooling_selfhost`、`selfhost_system_link_plan_shared`、`full_selfhost` 都已刷新并重新前台验过。 |
+| LSMR runtime smoke 正式进 gate | 已完成 | `chain_state_tree_sync_smoke.expected` 和 `msquic_chain_smoke.expected` 已 checked-in，`lsmr-contracts` 现在不只验算法层，也真跑两条 runtime smoke。 |
+| 本轮总验收 | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 已前台通过，当前 `manifest_fnv1a64=7d152e8db0302b97`。 |
+| 开始时间 | `2026-04-09 16:07 +0800` | `program-selfhost` 正式 gate 收口开始。 |
+| `program-selfhost` 正式 gate | 已完成 | source/runtime/native/stage0 四层已经同构补齐 `program-selfhost-check`，`Makefile` 已新增正式 `program-selfhost` 目标并纳入 `full-selfhost`；当前固定要求 stage2 编译器真编真跑 `lsmr_advanced_features_smoke`、`chain_state_tree_sync_smoke` 和 `chain_node balance/mint/balance`，同时 stage2/stage3 的 release-plan-exec-binary 持续相等。 |
+| 外部 C provider 收口 | 已完成 | `program-selfhost` 现在会正式检查 `compiler_core` 运行面不再依赖外部 C provider；stage1/stage2/stage3 当前都固定为 `external_cc_provider_count=0`，并已写入 `program_selfhost.expected`。 |
+| 新主 gate | 已完成 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap program-selfhost` 已前台通过；完整 `compiler-core-release -> full-selfhost` 也已继续前台通过，当前 `manifest_fnv1a64=01628c9c884af1a8`。 |
+| 开始时间 | `2026-04-09 22:14 +0800` | 继续把 `program` 热路径里的 typed `record` 固定布局 lookup 接到 runtime，并重新量 `pubkey/sign/mul/kinv`。 |
+| typed `record` 共享 lookup | 已完成 | `system_helpers_stdio_bridge.c` 已给 `TypeDecl/ZeroPlan` 加共享 `field_lookup`，`zero_value_from_plan()` 和 `zero_record_shell_from_plan()` 直接复用，不再每次 rebuild typed record lookup。 |
+| 新 fixed point | 已完成 | `compiler_core_system_link_exec/program_selfhost/full_selfhost` 已在 `manifest_fnv1a64=e4aa17192dd2cde3` 下重新前台收口，完整主 gate 已通过。 |
+| 新性能口径 | 已完成 | 前台重编 probe 后，3 次中位数更新为 `pubkey=1.1427s`、`sign=1.6491s`、`mul_xonly=1.3204s`、`kinv=0.7149s`；单次 RSS 口径是 `pubkey≈125MB/116MB`、`sign≈262MB/254MB`。 |

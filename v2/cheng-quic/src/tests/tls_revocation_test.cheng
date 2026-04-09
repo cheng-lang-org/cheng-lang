@@ -64,13 +64,13 @@ fn oidReadInt(text: str, start: int32): Result[OidValueNext] =
 fn oidEncode(text: str): Result[Bytes] =
     let arc0Res: Result[OidValueNext] = oidReadInt(text, 0)
     if IsErr(arc0Res):
-        return Err[Bytes](Error(arc0Res))
+        return Err[Bytes](ErrorText(arc0Res))
     let sep0: int32 = Value(arc0Res).next
     if sep0 >= len(text) || text[sep0] != '.':
         return Err[Bytes]("revocation: oid missing dot")
     let arc1Res: Result[OidValueNext] = oidReadInt(text, sep0 + 1)
     if IsErr(arc1Res):
-        return Err[Bytes](Error(arc1Res))
+        return Err[Bytes](ErrorText(arc1Res))
     let arc0: int64 = Value(arc0Res).value
     let arc1: int64 = Value(arc1Res).value
     if arc0 < 0 || arc0 > 2:
@@ -85,7 +85,7 @@ fn oidEncode(text: str): Result[Bytes] =
             return Err[Bytes]("revocation: oid separator invalid")
         let arcRes: Result[OidValueNext] = oidReadInt(text, idx + 1)
         if IsErr(arcRes):
-            return Err[Bytes](Error(arcRes))
+            return Err[Bytes](ErrorText(arcRes))
         var v: int64 = Value(arcRes).value
         if v < 0:
             return Err[Bytes]("revocation: oid arc negative")
@@ -111,7 +111,7 @@ fn oidEncode(text: str): Result[Bytes] =
 fn encodeAlgId(oid: str): Result[Bytes] =
     let oidRes: Result[Bytes] = oidEncode(oid)
     if IsErr(oidRes):
-        return Err[Bytes](Error(oidRes))
+        return Err[Bytes](ErrorText(oidRes))
     let oidTlv: Bytes = asn1EncodeOid(Value(oidRes))
     let nulTlv: Bytes = asn1EncodeNull()
     return Ok[Bytes](asn1EncodeSequence(bytesConcat(oidTlv, nulTlv)))
@@ -125,7 +125,7 @@ fn encodeGeneralizedTime(text: str): Bytes =
 fn buildName(commonName: str): Result[Bytes] =
     let oidRes: Result[Bytes] = oidEncode("2.5.4.3")
     if IsErr(oidRes):
-        return Err[Bytes](Error(oidRes))
+        return Err[Bytes](ErrorText(oidRes))
     let oidTlv: Bytes = asn1EncodeOid(Value(oidRes))
     let nameTlv: Bytes = asn1EncodeTlv(0x0c, bytesFromString(commonName))
     let atv: Bytes = asn1EncodeSequence(bytesConcat(oidTlv, nameTlv))
@@ -143,10 +143,10 @@ fn buildOcspResponse(
     
     let sigAlgRes: Result[Bytes] = encodeAlgId(oidSha256WithRsa)
     if IsErr(sigAlgRes):
-        return Err[Bytes](Error(sigAlgRes))
+        return Err[Bytes](ErrorText(sigAlgRes))
     let hashAlgRes: Result[Bytes] = encodeAlgId(oidSha256)
     if IsErr(hashAlgRes):
-        return Err[Bytes](Error(hashAlgRes))
+        return Err[Bytes](ErrorText(hashAlgRes))
     let nameHash: Bytes = sha256Digest(issuerName)
     let keyHash: Bytes = sha256Digest(issuerKeyDer)
     let certId: Bytes = asn1EncodeSequence(
@@ -170,11 +170,11 @@ fn buildOcspResponse(
     let responseData: Bytes = asn1EncodeSequence(bytesConcat(bytesConcat(responderId, producedAt), responses))
     let sigRes: Result[Bytes] = rsaBigSignPkcs1(priv, responseData, false)
     if IsErr(sigRes):
-        return Err[Bytes](Error(sigRes))
+        return Err[Bytes](ErrorText(sigRes))
     let basic: Bytes = asn1EncodeSequence(bytesConcat(bytesConcat(responseData, Value(sigAlgRes)), asn1EncodeBitString(Value(sigRes))))
     let rbTypeRes: Result[Bytes] = oidEncode(oidOcspBasic)
     if IsErr(rbTypeRes):
-        return Err[Bytes](Error(rbTypeRes))
+        return Err[Bytes](ErrorText(rbTypeRes))
     let rbSeq: Bytes = asn1EncodeSequence(bytesConcat(asn1EncodeOid(Value(rbTypeRes)), asn1EncodeOctetString(basic)))
     let responseBytes: Bytes = asn1EncodeTlv(0xa0, rbSeq)
     let status: Bytes = encodeEnumerated(0)
@@ -190,7 +190,7 @@ fn buildCrl(
     
     let sigAlgRes: Result[Bytes] = encodeAlgId(oidSha256WithRsa)
     if IsErr(sigAlgRes):
-        return Err[Bytes](Error(sigAlgRes))
+        return Err[Bytes](ErrorText(sigAlgRes))
     let revokedEntry: Bytes = asn1EncodeSequence(
         bytesConcat(asn1EncodeInteger(leafSerial), encodeGeneralizedTime(thisTime))
     )
@@ -203,26 +203,26 @@ fn buildCrl(
     )
     let sigRes: Result[Bytes] = rsaBigSignPkcs1(priv, tbs, false)
     if IsErr(sigRes):
-        return Err[Bytes](Error(sigRes))
+        return Err[Bytes](ErrorText(sigRes))
     let sig: Bytes = asn1EncodeBitString(Value(sigRes))
     return Ok[Bytes](asn1EncodeSequence(bytesConcat(bytesConcat(tbs, Value(sigAlgRes)), sig)))
 
 fn runTlsRevocationTest(): Result[bool] =
     let privRes: Result[Bytes] = hexDecode(rsaPrivDerHex)
     if IsErr(privRes):
-        return Err[bool](Error(privRes))
+        return Err[bool](ErrorText(privRes))
     let pubRes: Result[Bytes] = hexDecode(rsaPubDerHex)
     if IsErr(pubRes):
-        return Err[bool](Error(pubRes))
+        return Err[bool](ErrorText(pubRes))
     let privKeyRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(Value(privRes))
     if IsErr(privKeyRes):
-        return Err[bool](Error(privKeyRes))
+        return Err[bool](ErrorText(privKeyRes))
     let pubKeyRes: Result[RsaBigPublicKey] = rsaBigPublicKeyFromBytes(Value(pubRes))
     if IsErr(pubKeyRes):
-        return Err[bool](Error(pubKeyRes))
+        return Err[bool](ErrorText(pubKeyRes))
     let nameRes: Result[Bytes] = buildName("cheng-ocsp-ca")
     if IsErr(nameRes):
-        return Err[bool](Error(nameRes))
+        return Err[bool](ErrorText(nameRes))
     let issuerName: Bytes = Value(nameRes)
     var issuer: X509Certificate = initX509Certificate()
     issuer.subject = issuerName
@@ -232,7 +232,7 @@ fn runTlsRevocationTest(): Result[bool] =
     leaf.issuer = issuerName
     let serialRes: Result[Bytes] = hexDecode("010203")
     if IsErr(serialRes):
-        return Err[bool](Error(serialRes))
+        return Err[bool](ErrorText(serialRes))
     let serial: Bytes = Value(serialRes)
     leaf.serial = serial
     var roots: X509CertList = initX509CertList()
@@ -242,15 +242,15 @@ fn runTlsRevocationTest(): Result[bool] =
     var privKey: RsaBigPrivateKey = Value(privKeyRes)
     let ocspRes: Result[Bytes] = buildOcspResponse(issuerName, Value(pubRes), serial, privKey, "20260101000000Z", "20270101000000Z")
     if IsErr(ocspRes):
-        return Err[bool](Error(ocspRes))
+        return Err[bool](ErrorText(ocspRes))
     let ocspCheck: Result[X509RevocationStatus] = x509VerifyOcspResponse(Value(ocspRes), leaf, issuer, now)
     if IsErr(ocspCheck):
-        return Err[bool](Error(ocspCheck))
+        return Err[bool](ErrorText(ocspCheck))
     if Value(ocspCheck) != X509RevocationGood:
         return Err[bool]("revocation: ocsp status ! good")
     let crlRes: Result[Bytes] = buildCrl(issuerName, serial, privKey, "20260101000000Z", "20270101000000Z")
     if IsErr(crlRes):
-        return Err[bool](Error(crlRes))
+        return Err[bool](ErrorText(crlRes))
     var crls: Bytes[x509MaxCrls]
     crls[0] = Value(crlRes)
     let revRes: Result[bool] = x509VerifyRevocation(leaf, inters, roots, emptyBytes(), crls, 1, now, X509RevocationStrict)

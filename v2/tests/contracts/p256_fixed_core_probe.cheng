@@ -1,0 +1,175 @@
+import std/result
+import std/rawbytes
+import std/strings
+import std/crypto/bigint
+import std/crypto/p256_fixed
+
+const
+    probeHexP = "ffffffff00000001000000000000000000000000ffffffffffffffffffffffff"
+    probeHexN = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+    probeHexA = "c9af22f4f52f91c22d4b0f9a9e8ac6d7112233445566778899aabbccddeeff00"
+    probeHexB = "5d4a1f3c2298be77f00d1234567890abcdeffedcba0987654321123456789abc"
+    probeHexPMul = "323adea625e70da4045349065346ce52d55cd691697f7cde292ea6399c138dae"
+    probeHexNMul = "ca2861ce855b6521e75d7aa704f22620f83a93540edf15e0354acc2d911cae54"
+    probeHexPSquare = "631f9764214a72222fbe1370566f38cadac5c47caab17dddb9ee610213a4291e"
+    probeHexNSquare = "8333153be46c67bf13d7e0cec06e6f894bebfc5c6318b25e4bb7a2ce879654af"
+fn probeHexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn probeHexDecode(text: str): Result[Bytes] =
+    if len(text) % 2 != 0:
+        return Err[Bytes]("probe: odd hex")
+    let out: Bytes = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = probeHexValue(text[i])
+        let lo: int32 = probeHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("probe: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn probeBigFromHex(text: str): Result[BigInt] =
+    let bytesRes: Result[Bytes] = probeHexDecode(text)
+    if IsErr(bytesRes):
+        return Err[BigInt](Error(bytesRes))
+    return bigFromBytes(Value(bytesRes))
+
+fn probeFixedFromHex(text: str): Result[P256Fixed] =
+    let bigRes: Result[BigInt] = probeBigFromHex(text)
+    if IsErr(bigRes):
+        return Err[P256Fixed](Error(bigRes))
+    return p256FixedFromBigInt(Value(bigRes))
+
+fn main(): int32 =
+    let pMulExpectedRes: Result[BigInt] = probeBigFromHex(probeHexPMul)
+    if IsErr(pMulExpectedRes):
+        echo("probe=fail p_mul_expected " + ErrorText(pMulExpectedRes))
+        return 1
+    let nMulExpectedRes: Result[BigInt] = probeBigFromHex(probeHexNMul)
+    if IsErr(nMulExpectedRes):
+        echo("probe=fail n_mul_expected " + ErrorText(nMulExpectedRes))
+        return 1
+    let pSquareExpectedRes: Result[BigInt] = probeBigFromHex(probeHexPSquare)
+    if IsErr(pSquareExpectedRes):
+        echo("probe=fail p_square_expected " + ErrorText(pSquareExpectedRes))
+        return 1
+    let nSquareExpectedRes: Result[BigInt] = probeBigFromHex(probeHexNSquare)
+    if IsErr(nSquareExpectedRes):
+        echo("probe=fail n_square_expected " + ErrorText(nSquareExpectedRes))
+        return 1
+    let aFixedRes: Result[P256Fixed] = probeFixedFromHex(probeHexA)
+    if IsErr(aFixedRes):
+        echo("probe=fail a_fixed " + ErrorText(aFixedRes))
+        return 1
+    let bFixedRes: Result[P256Fixed] = probeFixedFromHex(probeHexB)
+    if IsErr(bFixedRes):
+        echo("probe=fail b_fixed " + ErrorText(bFixedRes))
+        return 1
+    let pCtx: P256FixedMontgomeryContext = p256FieldMontgomeryContext()
+    let nCtx: P256FixedMontgomeryContext = p256ScalarMontgomeryContext()
+    echo("probe=stage contexts")
+    var aFixed: P256Fixed = Value(aFixedRes)
+    var bFixed: P256Fixed = Value(bFixedRes)
+    var pCtxLocal: P256FixedMontgomeryContext = pCtx
+    var pR2A: P256Fixed = pCtxLocal.r2
+    let pAMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(aFixed, pR2A, pCtxLocal)
+    if IsErr(pAMontRes):
+        echo("probe=fail p_a_mont " + ErrorText(pAMontRes))
+        return 1
+    echo("probe=stage p_a_mont")
+    var pR2B: P256Fixed = pCtxLocal.r2
+    let pBMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(bFixed, pR2B, pCtxLocal)
+    if IsErr(pBMontRes):
+        echo("probe=fail p_b_mont " + ErrorText(pBMontRes))
+        return 1
+    echo("probe=stage p_b_mont")
+    var pAMont: P256Fixed = Value(pAMontRes)
+    var pBMont: P256Fixed = Value(pBMontRes)
+    let pProdMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(pAMont, pBMont, pCtxLocal)
+    if IsErr(pProdMontRes):
+        echo("probe=fail p_prod_mont " + ErrorText(pProdMontRes))
+        return 1
+    echo("probe=stage p_prod_mont")
+    var pProdMont: P256Fixed = Value(pProdMontRes)
+    var pOne: P256Fixed = p256FixedOne()
+    let pMulFixedRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(pProdMont, pOne, pCtxLocal)
+    if IsErr(pMulFixedRes):
+        echo("probe=fail p_mul_fixed " + ErrorText(pMulFixedRes))
+        return 1
+    echo("probe=stage p_done")
+    let pSquareMontRes: Result[P256Fixed] = p256FixedMontgomerySquareCore(pAMont, pCtxLocal)
+    if IsErr(pSquareMontRes):
+        echo("probe=fail p_square_mont " + ErrorText(pSquareMontRes))
+        return 1
+    var pSquareMont: P256Fixed = Value(pSquareMontRes)
+    let pSquareFixedRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(pSquareMont, pOne, pCtxLocal)
+    if IsErr(pSquareFixedRes):
+        echo("probe=fail p_square_fixed " + ErrorText(pSquareFixedRes))
+        return 1
+    echo("probe=stage p_square_done")
+    var nCtxLocal: P256FixedMontgomeryContext = nCtx
+    var nR2A: P256Fixed = nCtxLocal.r2
+    let nAMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(aFixed, nR2A, nCtxLocal)
+    if IsErr(nAMontRes):
+        echo("probe=fail n_a_mont " + ErrorText(nAMontRes))
+        return 1
+    echo("probe=stage n_a_mont")
+    var nR2B: P256Fixed = nCtxLocal.r2
+    let nBMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(bFixed, nR2B, nCtxLocal)
+    if IsErr(nBMontRes):
+        echo("probe=fail n_b_mont " + ErrorText(nBMontRes))
+        return 1
+    echo("probe=stage n_b_mont")
+    var nAMont: P256Fixed = Value(nAMontRes)
+    var nBMont: P256Fixed = Value(nBMontRes)
+    let nProdMontRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(nAMont, nBMont, nCtxLocal)
+    if IsErr(nProdMontRes):
+        echo("probe=fail n_prod_mont " + ErrorText(nProdMontRes))
+        return 1
+    echo("probe=stage n_prod_mont")
+    var nProdMont: P256Fixed = Value(nProdMontRes)
+    var nOne: P256Fixed = p256FixedOne()
+    let nMulFixedRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(nProdMont, nOne, nCtxLocal)
+    if IsErr(nMulFixedRes):
+        echo("probe=fail n_mul_fixed " + ErrorText(nMulFixedRes))
+        return 1
+    echo("probe=stage n_done")
+    let nSquareMontRes: Result[P256Fixed] = p256FixedMontgomerySquareCore(nAMont, nCtxLocal)
+    if IsErr(nSquareMontRes):
+        echo("probe=fail n_square_mont " + ErrorText(nSquareMontRes))
+        return 1
+    var nSquareMont: P256Fixed = Value(nSquareMontRes)
+    let nSquareFixedRes: Result[P256Fixed] = p256FixedMontgomeryMulCore(nSquareMont, nOne, nCtxLocal)
+    if IsErr(nSquareFixedRes):
+        echo("probe=fail n_square_fixed " + ErrorText(nSquareFixedRes))
+        return 1
+    echo("probe=stage n_square_done")
+    var pMulFixed: P256Fixed = Value(pMulFixedRes)
+    var nMulFixed: P256Fixed = Value(nMulFixedRes)
+    var pSquareFixed: P256Fixed = Value(pSquareFixedRes)
+    var nSquareFixed: P256Fixed = Value(nSquareFixedRes)
+    var pMulActual: BigInt = p256FixedToBigInt(pMulFixed)
+    var nMulActual: BigInt = p256FixedToBigInt(nMulFixed)
+    var pSquareActual: BigInt = p256FixedToBigInt(pSquareFixed)
+    var nSquareActual: BigInt = p256FixedToBigInt(nSquareFixed)
+    var pMulExpected: BigInt = Value(pMulExpectedRes)
+    var nMulExpected: BigInt = Value(nMulExpectedRes)
+    var pSquareExpected: BigInt = Value(pSquareExpectedRes)
+    var nSquareExpected: BigInt = Value(nSquareExpectedRes)
+    let pMulSame: bool = bigCmp(pMulActual, pMulExpected) == 0
+    let nMulSame: bool = bigCmp(nMulActual, nMulExpected) == 0
+    let pSquareSame: bool = bigCmp(pSquareActual, pSquareExpected) == 0
+    let nSquareSame: bool = bigCmp(nSquareActual, nSquareExpected) == 0
+    if !pMulSame || !nMulSame || !pSquareSame || !nSquareSame:
+        echo("probe=fail mismatch p_mul=" + boolToStr(pMulSame) + " n_mul=" + boolToStr(nMulSame) + " p_square=" + boolToStr(pSquareSame) + " n_square=" + boolToStr(nSquareSame))
+        return 1
+    echo("probe=ok p_mul=1 n_mul=1 p_square=1 n_square=1")
+    return 0

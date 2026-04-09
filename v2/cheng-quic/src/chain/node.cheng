@@ -1,0 +1,748 @@
+import std/result
+import std/os
+import std/rawbytes
+import std/seqs as seqops
+import std/strings
+import std/strutils as strutils
+import std/cmdline as cmdline
+import cheng/quic/multiaddress
+import cheng/quic/multiaddress as multiaddress
+import cheng/quic/connection
+import cheng/quic/connection as qconn
+import cheng/quic/msquicruntime
+import cheng/quic/msquictransport_native
+import cheng/quic/msquictransport_native as msquic
+import cheng/quic/tls/policy
+import cheng/quic/tls/test_pki as testpki
+import cheng/quic/chain/types
+import cheng/quic/chain/codec
+import cheng/quic/chain/log
+import cheng/quic/chain/content_address
+import cheng/quic/chain/lsmr
+import cheng/quic/chain/anti_entropy
+
+fn chainInitTransport(): Result[MsQuicTransport] =
+    var out: MsQuicTransport
+    let initRes = chainInitTransportInto(out)
+    if IsErr(initRes):
+        return Err[MsQuicTransport](ErrorText(initRes))
+    return Ok[MsQuicTransport](out)
+
+fn chainInitTransportInto(out: var MsQuicTransport): Result[bool] =
+    msquic.initMsQuicTransportInto(out)
+    var settings: MsQuicSettings = initMsQuicSettings()
+    settings.maxPending = 64
+    settings.allowDatagram = false
+    settings.maxDatagram = 0
+    let setRes = msquic.setMsQuicTransportSettings(out, settings)
+    if IsErr(setRes):
+        let detail = ErrorText(setRes)
+        if detail == "":
+            return Err[bool]("chain transport: set settings failed")
+        return Err[bool]("chain transport: set settings failed " + detail)
+    var policy: MsQuicTlsPolicy
+    let policyRes = testpki.msquicMakeLocalhostTlsPolicyInto(policy)
+    if IsErr(policyRes):
+        let detail = ErrorText(policyRes)
+        if detail == "":
+            return Err[bool]("chain transport: build tls policy failed")
+        return Err[bool]("chain transport: build tls policy failed " + detail)
+    let tlsRes = msquic.setMsQuicTransportTlsPolicy(out, policy)
+    if IsErr(tlsRes):
+        let detail = ErrorText(tlsRes)
+        if detail == "":
+            return Err[bool]("chain transport: apply tls policy failed")
+        return Err[bool]("chain transport: apply tls policy failed " + detail)
+    return Ok[bool](true)
+
+fn chainSeenStamp(node: ChainNode): GanzhiStamp =
+    return chainStampFromValue(chainSeenClockValue(node.index))
+
+fn chainNodeRefreshSeen(node: var ChainNode) =
+    let stamp = chainSeenStamp(node)
+    node.seenEpoch = stamp.epoch
+    node.seenGanzhi = stamp.ganzhiIndex
+
+fn chainNodeConfigResolved(cfg: ChainNodeConfig): ChainNodeConfig =
+    var out = cfg
+    if out.rootDir == "":
+        out.rootDir = defaultChainNodeConfig().rootDir
+    if out.nodeId == "":
+        out.nodeId = defaultChainNodeConfig().nodeId
+    if out.listenAddrText == "":
+        out.listenAddrText = chainDefaultListenAddrText()
+    if out.maxFrameBytes <= 0:
+        out.maxFrameBytes = defaultChainNodeConfig().maxFrameBytes
+    if out.lsmrDepth <= 0:
+        out.lsmrDepth = defaultChainNodeConfig().lsmrDepth
+    return out
+
+fn initChainNode(cfg: ChainNodeConfig): Result[ChainNode] =
+    var out: ChainNode
+    let initRes = initChainNodeInto(out, cfg)
+    if IsErr(initRes):
+        return Err[ChainNode](ErrorText(initRes))
+    return Ok[ChainNode](out)
+
+fn initChainNodeInto(out: var ChainNode, cfg: ChainNodeConfig): Result[bool] =
+    let resolved = chainNodeConfigResolved(cfg)
+    let rootAbs = os.absolutePath(resolved.rootDir)
+    var replayed: ChainIndex
+    let replayRes = chainReplayAtDepthInto(replayed, rootAbs, resolved.lsmrDepth)
+    if IsErr(replayRes):
+        let detail = ErrorText(replayRes)
+        if detail == "":
+            return Err[bool]("chain init: replay failed")
+        return Err[bool]("chain init: replay failed " + detail)
+    out.cfg = resolved
+    out.cfg.rootDir = rootAbs
+    out.store = initChainStore(rootAbs)
+    out.logPath = chainEventLogPath(rootAbs)
+    out.index = replayed
+    out.lsmrAddress = chainLsmrAddressFromSeed(out.cfg.nodeId, out.cfg.lsmrDepth)
+    msquic.initMsQuicTransportInto(out.transport)
+    out.listenAddr = out.transport.addr
+    out.transportReady = false
+    out.running = false
+    out.seenEpoch = 0
+    out.seenGanzhi = 0
+    chainNodeRefreshSeen(out)
+    return Ok[bool](true)
+
+fn chainNodeEnsureDialReady(node: var ChainNode): Result[bool] =
+    if node.transportReady:
+        return Ok[bool](true)
+    var transport: MsQuicTransport
+    let transportRes = chainInitTransportInto(transport)
+    if IsErr(transportRes):
+        let detail = ErrorText(transportRes)
+        if detail == "":
+            return Err[bool]("chain init: transport failed")
+        return Err[bool]("chain init: transport failed " + detail)
+    node.transport = transport
+    node.transportReady = true
+    return Ok[bool](true)
+
+fn chainNodeEnsureStarted(node: var ChainNode): Result[bool] =
+    let readyRes = chainNodeEnsureDialReady(node)
+    if IsErr(readyRes):
+        return readyRes
+    if node.running && node.transport.running:
+        return Ok[bool](true)
+    let listenRes = multiaddress.parseMultiAddress(node.cfg.listenAddrText)
+    if IsErr(listenRes):
+        return Err[bool](ErrorText(listenRes))
+    node.listenAddr = Value(listenRes)
+    msquic.start(node.transport, node.listenAddr)
+    if ! node.transport.running:
+        if node.transport.lastError != "":
+            return Err[bool](node.transport.lastError)
+        return Err[bool]("chain node: transport start failed")
+    node.running = true
+    node.transportReady = true
+    node.listenAddr = node.transport.addr
+    return Ok[bool](true)
+
+fn chainHelloFrame(node: ChainNode): ChainFrame =
+    let stamp = chainSeenStamp(node)
+    let sig = chainAntiEntropySignature(node.index)
+    var frame = emptyChainFrame("HELLO")
+    frame.nodeId = node.cfg.nodeId
+    frame.peerId = node.cfg.nodeId
+    frame.epoch = stamp.epoch
+    frame.ganzhiIndex = stamp.ganzhiIndex
+    frame.payloadText = "listen=" + node.listenAddr.raw + "\n" +
+                        "lsmr_address=" + node.lsmrAddress.text + "\n" +
+                        chainAntiEntropyHelloText(sig)
+    return frame
+
+fn chainWriteHello(node: ChainNode, conn: var Connection): Result[int32] =
+    return chainWriteFrame(conn, chainHelloFrame(node))
+
+fn chainReadHello(conn: var Connection): Result[ChainFrame] =
+    let frameRes = chainReadFrame(conn)
+    if IsErr(frameRes):
+        return Err[ChainFrame](ErrorText(frameRes))
+    if Value(frameRes).kind != "HELLO":
+        return Err[ChainFrame]("chain hello: expected HELLO")
+    return frameRes
+
+fn chainAppendEvent(node: var ChainNode, ev: ChainEvent, sourcePeer: str): Result[str] =
+    let persistRes = chainAppendPersistedEvent(node.store, node.logPath, node.index, ev, sourcePeer, node.cfg.lsmrDepth)
+    if IsErr(persistRes):
+        return persistRes
+    chainNodeRefreshSeen(node)
+    return persistRes
+
+fn chainMintEvent(node: ChainNode, account: str, assetId: str, amount: int64): ChainEvent =
+    let key = chainAccountKey(account, assetId)
+    let parentCid = chainAccountHead(node.index, key)
+    let stamp = chainNextStamp(chainClockValue(node.seenEpoch, node.seenGanzhi), 0, 0, chainAccountClockValue(node.index, key))
+    var ev = emptyChainEvent()
+    ev.kind = "mint"
+    ev.assetId = assetId
+    ev.toAccount = account
+    ev.amount = amount
+    ev.authorPeer = node.cfg.nodeId
+    ev.counterpartyPeer = node.cfg.nodeId
+    ev.toParentCid = parentCid
+    ev.epoch = stamp.epoch
+    ev.ganzhiIndex = stamp.ganzhiIndex
+    ev.stem = stamp.stem
+    ev.branch = stamp.branch
+    ev.spaceSlot = chainSpaceSlot(account, account)
+    ev.tick = chainStampValue(stamp)
+    ev.bodyCid = chainBodyCidText(ev)
+    return ev
+
+fn chainBuildTransferCommit(node: ChainNode,
+                            proposal: ChainFrame,
+                            remotePeerId: str,
+                            acceptStamp: GanzhiStamp): ChainEvent =
+    let fromKey = chainAccountKey(proposal.fromAccount, proposal.assetId)
+    let toKey = chainAccountKey(proposal.toAccount, proposal.assetId)
+    let fromParentValue = chainAccountClockValue(node.index, fromKey)
+    let toParentValue = chainAccountClockValue(node.index, toKey)
+    let proposeValue = chainClockValue(proposal.epoch, proposal.ganzhiIndex)
+    let commitStamp = chainNextStamp(chainClockValue(node.seenEpoch, node.seenGanzhi),
+                                     chainStampValue(acceptStamp),
+                                     proposeValue > fromParentValue ? proposeValue : fromParentValue,
+                                     toParentValue)
+    var ev = emptyChainEvent()
+    ev.kind = "transfer_commit"
+    ev.assetId = proposal.assetId
+    ev.fromAccount = proposal.fromAccount
+    ev.toAccount = proposal.toAccount
+    ev.amount = proposal.amount
+    ev.authorPeer = proposal.nodeId
+    ev.counterpartyPeer = remotePeerId
+    ev.fromParentCid = proposal.fromParentCid
+    ev.toParentCid = proposal.toParentCid
+    ev.epoch = commitStamp.epoch
+    ev.ganzhiIndex = commitStamp.ganzhiIndex
+    ev.stem = commitStamp.stem
+    ev.branch = commitStamp.branch
+    ev.spaceSlot = chainSpaceSlot(proposal.fromAccount, proposal.toAccount)
+    ev.tick = chainStampValue(commitStamp)
+    ev.bodyCid = chainBodyCidText(ev)
+    return ev
+
+fn chainLocalTransferAllowed(node: ChainNode, fromAccount: str, toAccount: str, assetId: str, amount: int64): Result[bool] =
+    if amount <= 0:
+        return Err[bool]("chain transfer: amount must be positive")
+    if fromAccount == "" || toAccount == "":
+        return Err[bool]("chain transfer: missing account")
+    if fromAccount == toAccount:
+        return Err[bool]("chain transfer: same account")
+    let fromKey = chainAccountKey(fromAccount, assetId)
+    let toKey = chainAccountKey(toAccount, assetId)
+    if chainAccountDiverged(node.index, fromKey) || chainAccountDiverged(node.index, toKey):
+        return Err[bool]("chain transfer: account diverged")
+    if chainAccountBalance(node.index, fromKey) < amount:
+        return Err[bool]("chain transfer: insufficient balance")
+    return Ok[bool](true)
+
+fn chainTransferProposeFrame(node: ChainNode, fromAccount: str, toAccount: str, assetId: str, amount: int64): ChainFrame =
+    let fromKey = chainAccountKey(fromAccount, assetId)
+    let toKey = chainAccountKey(toAccount, assetId)
+    let stamp = chainNextStamp(chainClockValue(node.seenEpoch, node.seenGanzhi), 0,
+                               chainAccountClockValue(node.index, fromKey),
+                               chainAccountClockValue(node.index, toKey))
+    var frame = emptyChainFrame("TRANSFER_PROPOSE")
+    frame.nodeId = node.cfg.nodeId
+    frame.assetId = assetId
+    frame.fromAccount = fromAccount
+    frame.toAccount = toAccount
+    frame.amount = amount
+    frame.fromParentCid = chainAccountHead(node.index, fromKey)
+    frame.toParentCid = chainAccountHead(node.index, toKey)
+    frame.epoch = stamp.epoch
+    frame.ganzhiIndex = stamp.ganzhiIndex
+    frame.spaceSlot = chainSpaceSlot(fromAccount, toAccount)
+    frame.tick = chainStampValue(stamp)
+    return frame
+
+fn chainApplyRemoteCommit(node: var ChainNode, eventText: str, sourcePeer: str): Result[str] =
+    let eventRes = chainEventFromText(eventText)
+    if IsErr(eventRes):
+        return Err[str](ErrorText(eventRes))
+    return chainAppendEvent(node, Value(eventRes), sourcePeer)
+
+fn chainNodeMint(node: var ChainNode, account: str, assetId: str, amount: int64): Result[str] =
+    if account == "" || assetId == "":
+        return Err[str]("chain mint: missing account or asset")
+    if chainAccountDiverged(node.index, chainAccountKey(account, assetId)):
+        return Err[str]("chain mint: account diverged")
+    let ev = chainMintEvent(node, account, assetId, amount)
+    return chainAppendEvent(node, ev, node.cfg.nodeId)
+
+fn chainNodeBalance(node: ChainNode, account: str, assetId: str): Result[int64] =
+    if account == "" || assetId == "":
+        return Err[int64]("chain balance: missing account or asset")
+    return Ok[int64](chainAccountBalance(node.index, chainAccountKey(account, assetId)))
+
+fn chainNodeHandleAdvertiseHeads(node: ChainNode, conn: var Connection): Result[bool] =
+    let frame = emptyChainFrame("ADVERTISE_HEADS")
+    var response = frame
+    response.nodeId = node.cfg.nodeId
+    response.peerId = node.cfg.nodeId
+    response.epoch = node.seenEpoch
+    response.ganzhiIndex = node.seenGanzhi
+    response.payloadText = chainAdvertisePayload(node.index)
+    let writeRes = chainWriteFrame(conn, response)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    return Ok[bool](true)
+
+fn chainNodeHandleWantEvent(node: ChainNode, conn: var Connection, frame: ChainFrame): Result[bool] =
+    let eventText = chainStoreGetText(node.store, frame.eventCid)
+    if eventText == "":
+        return Err[bool]("chain want: missing event")
+    var response = emptyChainFrame("PUSH_EVENT")
+    response.nodeId = node.cfg.nodeId
+    response.peerId = node.cfg.nodeId
+    response.eventCid = frame.eventCid
+    response.payloadText = eventText
+    let writeRes = chainWriteFrame(conn, response)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    return Ok[bool](true)
+
+fn chainNodeHandleWantStateSubtree(node: ChainNode, conn: var Connection, frame: ChainFrame): Result[bool] =
+    let layer = chainHeaderField(frame.payloadText, "layer")
+    let bagua = chainHeaderField(frame.payloadText, "bagua")
+    let prefixText = chainHeaderField(frame.payloadText, "prefix")
+    let payloadRes = chainAntiEntropyStateSubtreePayload(node.index, layer, bagua, prefixText)
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    var response = emptyChainFrame("PUSH_STATE_SUBTREE")
+    response.nodeId = node.cfg.nodeId
+    response.peerId = node.cfg.nodeId
+    response.payloadText = Value(payloadRes)
+    let writeRes = chainWriteFrame(conn, response)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    return Ok[bool](true)
+
+fn chainNodeWantEventAndReadPush(node: ChainNode,
+                                 conn: var Connection,
+                                 remotePeerId: str,
+                                 eventCid: str): Result[ChainFrame] =
+    var want = emptyChainFrame("WANT_EVENT")
+    want.nodeId = node.cfg.nodeId
+    want.peerId = remotePeerId
+    want.eventCid = eventCid
+    let wantWriteRes = chainWriteFrame(conn, want)
+    if IsErr(wantWriteRes):
+        return Err[ChainFrame](ErrorText(wantWriteRes))
+    let pushRes = chainReadFrame(conn)
+    if IsErr(pushRes):
+        return Err[ChainFrame](ErrorText(pushRes))
+    if Value(pushRes).kind != "PUSH_EVENT":
+        return Err[ChainFrame]("chain sync: expected PUSH_EVENT")
+    return pushRes
+
+fn chainNodeFetchRemoteEventText(node: ChainNode,
+                                 conn: var Connection,
+                                 remotePeerId: str,
+                                 cachedEventCids: var str[],
+                                 cachedEventTexts: var str[],
+                                 eventCid: str): Result[str] =
+    let cachedPos = chainAntiEntropyTextPos(cachedEventCids, eventCid)
+    if cachedPos >= 0:
+        return Ok[str](cachedEventTexts[cachedPos])
+    let pushRes = chainNodeWantEventAndReadPush(node, conn, remotePeerId, eventCid)
+    if IsErr(pushRes):
+        return Err[str](ErrorText(pushRes))
+    seqops.add(cachedEventCids, eventCid)
+    seqops.add(cachedEventTexts, Value(pushRes).payloadText)
+    return Ok[str](Value(pushRes).payloadText)
+
+fn chainNodeWantStateSubtree(node: ChainNode,
+                             conn: var Connection,
+                             remotePeerId: str,
+                             refText: str): Result[ChainAntiEntropyStateSubtree] =
+    var want = emptyChainFrame("WANT_STATE_SUBTREE")
+    want.nodeId = node.cfg.nodeId
+    want.peerId = remotePeerId
+    want.payloadText = chainAntiEntropyStateSubtreeRequestText(
+        chainAntiEntropyStateSubtreeRefLayer(refText),
+        chainAntiEntropyStateSubtreeRefBagua(refText),
+        chainAntiEntropyStateSubtreeRefPrefix(refText))
+    let wantWriteRes = chainWriteFrame(conn, want)
+    if IsErr(wantWriteRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(wantWriteRes))
+    let pushRes = chainReadFrame(conn)
+    if IsErr(pushRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(pushRes))
+    if Value(pushRes).kind != "PUSH_STATE_SUBTREE":
+        return Err[ChainAntiEntropyStateSubtree]("chain sync: expected PUSH_STATE_SUBTREE")
+    return chainAntiEntropyStateSubtreeFromPayload(Value(pushRes).payloadText)
+
+fn chainNodeSyncRemoteAccountHead(node: var ChainNode,
+                                  conn: var Connection,
+                                  remotePeerId: str,
+                                  key: str,
+                                  remoteHeadCid: str): Result[int32] =
+    if remoteHeadCid == "":
+        return Ok[int32](0)
+    let localHeadCid = chainAccountHead(node.index, key)
+    if localHeadCid == remoteHeadCid:
+        return Ok[int32](0)
+    var stack: str[]
+    var expanded: bool[]
+    var cachedEventCids: str[]
+    var cachedEventTexts: str[]
+    stack = []
+    expanded = []
+    cachedEventCids = []
+    cachedEventTexts = []
+    seqops.add(stack, remoteHeadCid)
+    seqops.add(expanded, false)
+    var synced: int32 = 0
+    while stack.len > 0:
+        let top = stack.len - 1
+        let eventCid = stack[top]
+        if eventCid == "" ||
+           eventCid == localHeadCid ||
+           chainEventPos(node.index, eventCid) >= 0:
+            seqops.setLen(stack, top)
+            seqops.setLen(expanded, top)
+            continue
+        let eventTextRes = chainNodeFetchRemoteEventText(node,
+                                                         conn,
+                                                         remotePeerId,
+                                                         cachedEventCids,
+                                                         cachedEventTexts,
+                                                         eventCid)
+        if IsErr(eventTextRes):
+            return Err[int32](ErrorText(eventTextRes))
+        let eventRes = chainEventFromText(Value(eventTextRes))
+        if IsErr(eventRes):
+            return Err[int32](ErrorText(eventRes))
+        let ev = Value(eventRes)
+        if ! expanded[top]:
+            expanded[top] = true
+            if ev.toParentCid != "" &&
+               ev.toParentCid != localHeadCid &&
+               ev.toParentCid != eventCid &&
+               chainEventPos(node.index, ev.toParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.toParentCid) < 0:
+                seqops.add(stack, ev.toParentCid)
+                seqops.add(expanded, false)
+            if ev.fromParentCid != "" &&
+               ev.fromParentCid != localHeadCid &&
+               ev.fromParentCid != eventCid &&
+               ev.fromParentCid != ev.toParentCid &&
+               chainEventPos(node.index, ev.fromParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.fromParentCid) < 0:
+                seqops.add(stack, ev.fromParentCid)
+                seqops.add(expanded, false)
+            continue
+        let appendRes = chainAppendEvent(node, ev, remotePeerId)
+        if IsErr(appendRes):
+            return Err[int32](ErrorText(appendRes))
+        if Value(appendRes) != eventCid:
+            return Err[int32]("chain sync: pushed event cid mismatch")
+        synced = synced + 1
+        seqops.setLen(stack, top)
+        seqops.setLen(expanded, top)
+    return Ok[int32](synced)
+
+fn chainNodeConvergeStateSubtree(node: var ChainNode,
+                                 conn: var Connection,
+                                 remotePeerId: str,
+                                 refText: str): Result[int32] =
+    let subtreeRes = chainNodeWantStateSubtree(node, conn, remotePeerId, refText)
+    if IsErr(subtreeRes):
+        return Err[int32](ErrorText(subtreeRes))
+    let subtree = Value(subtreeRes)
+    let localTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(node.index), subtree.layer)
+    let localNodePos = chainLsmrBaguaTreeNodePos(localTree, subtree.bagua, subtree.prefixText)
+    let localNodeCid = localNodePos >= 0 ? localTree.nodeCids[localNodePos] : ""
+    let localEntryDescCount = localNodePos >= 0 ? localTree.nodeEntryDescCounts[localNodePos] : 0
+    if localNodeCid == subtree.nodeCid && localEntryDescCount == subtree.entryDescCount:
+        return Ok[int32](0)
+    var synced: int32 = 0
+    let nextRefs = chainAntiEntropyStateSubtreeWantChildRefs(node.index, subtree)
+    for i in 0..<nextRefs.len:
+        let childRes = chainNodeConvergeStateSubtree(node, conn, remotePeerId, nextRefs[i])
+        if IsErr(childRes):
+            return Err[int32](ErrorText(childRes))
+        synced = synced + Value(childRes)
+    for i in 0..<subtree.entryKeys.len:
+        if chainAntiEntropyStateSubtreeEntryConflicts(node.index, subtree, i):
+            return Err[int32]("chain sync: equal-clock state subtree conflict")
+        if subtree.entryDiverged[i]:
+            return Err[int32]("chain sync: diverged account subtree repair missing")
+        if ! chainAntiEntropyStateSubtreeEntryNeedsSync(node.index, subtree, i):
+            continue
+        let syncRes = chainNodeSyncRemoteAccountHead(node, conn, remotePeerId, subtree.entryKeys[i], subtree.entryHeadCids[i])
+        if IsErr(syncRes):
+            return Err[int32](ErrorText(syncRes))
+        synced = synced + Value(syncRes)
+    let refreshedTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(node.index), subtree.layer)
+    let refreshedNodePos = chainLsmrBaguaTreeNodePos(refreshedTree, subtree.bagua, subtree.prefixText)
+    let refreshedNodeCid = refreshedNodePos >= 0 ? refreshedTree.nodeCids[refreshedNodePos] : ""
+    let refreshedEntryDescCount = refreshedNodePos >= 0 ? refreshedTree.nodeEntryDescCounts[refreshedNodePos] : 0
+    if refreshedNodeCid != subtree.nodeCid || refreshedEntryDescCount != subtree.entryDescCount:
+        return Err[int32]("chain sync: state subtree not converged ref=" +
+                          refText +
+                          " local_cid=" + refreshedNodeCid +
+                          " remote_cid=" + subtree.nodeCid +
+                          " local_desc=" + intToStr(refreshedEntryDescCount) +
+                          " remote_desc=" + intToStr(subtree.entryDescCount))
+    return Ok[int32](synced)
+
+fn chainNodePullStateDiff(node: var ChainNode,
+                          conn: var Connection,
+                          remotePeerId: str,
+                          remotePayload: str): Result[int32] =
+    let antiEntropyRes = chainAntiEntropyPlan(node.index, remotePayload)
+    if IsErr(antiEntropyRes):
+        return Err[int32](ErrorText(antiEntropyRes))
+    let plan = Value(antiEntropyRes)
+    if plan.signaturesEqual:
+        return Ok[int32](0)
+    var synced: int32 = 0
+    for i in 0..<plan.wantStateSubtrees.len:
+        let convergeRes = chainNodeConvergeStateSubtree(node, conn, remotePeerId, plan.wantStateSubtrees[i])
+        if IsErr(convergeRes):
+            return Err[int32](ErrorText(convergeRes))
+        synced = synced + Value(convergeRes)
+    let finalSig = chainAntiEntropySignature(node.index)
+    let remoteSigRes = chainAntiEntropySignatureFromPayload(remotePayload)
+    if IsErr(remoteSigRes):
+        return Err[int32](ErrorText(remoteSigRes))
+    if synced > 0 && finalSig.stateForestCid != Value(remoteSigRes).stateForestCid:
+        return Err[int32]("chain sync: state forest cid mismatch after subtree repair")
+    return Ok[int32](synced)
+
+fn chainNodeHandleTransferPropose(node: var ChainNode,
+                                  conn: var Connection,
+                                  proposal: ChainFrame,
+                                  remotePeerId: str): Result[bool] =
+    let allowedRes = chainLocalTransferAllowed(node, proposal.fromAccount, proposal.toAccount, proposal.assetId, proposal.amount)
+    if IsErr(allowedRes):
+        return Err[bool](ErrorText(allowedRes))
+    let fromKey = chainAccountKey(proposal.fromAccount, proposal.assetId)
+    let toKey = chainAccountKey(proposal.toAccount, proposal.assetId)
+    if chainAccountHead(node.index, fromKey) != proposal.fromParentCid ||
+       chainAccountHead(node.index, toKey) != proposal.toParentCid:
+        return Err[bool]("chain transfer: parent mismatch")
+    let acceptStamp = chainNextStamp(chainClockValue(node.seenEpoch, node.seenGanzhi),
+                                     chainClockValue(proposal.epoch, proposal.ganzhiIndex),
+                                     chainAccountClockValue(node.index, fromKey),
+                                     chainAccountClockValue(node.index, toKey))
+    var accept = emptyChainFrame("TRANSFER_ACCEPT")
+    accept.nodeId = node.cfg.nodeId
+    accept.peerId = remotePeerId
+    accept.assetId = proposal.assetId
+    accept.fromAccount = proposal.fromAccount
+    accept.toAccount = proposal.toAccount
+    accept.amount = proposal.amount
+    accept.fromParentCid = proposal.fromParentCid
+    accept.toParentCid = proposal.toParentCid
+    accept.epoch = acceptStamp.epoch
+    accept.ganzhiIndex = acceptStamp.ganzhiIndex
+    accept.spaceSlot = chainSpaceSlot(proposal.fromAccount, proposal.toAccount)
+    accept.tick = chainStampValue(acceptStamp)
+    let acceptWriteRes = chainWriteFrame(conn, accept)
+    if IsErr(acceptWriteRes):
+        return Err[bool](ErrorText(acceptWriteRes))
+    let ev = chainBuildTransferCommit(node, proposal, remotePeerId, acceptStamp)
+    let appendRes = chainAppendEvent(node, ev, remotePeerId)
+    if IsErr(appendRes):
+        return Err[bool](ErrorText(appendRes))
+    var commit = emptyChainFrame("TRANSFER_COMMIT")
+    commit.nodeId = node.cfg.nodeId
+    commit.peerId = remotePeerId
+    commit.eventCid = Value(appendRes)
+    commit.payloadText = chainEventCanonicalText(ev)
+    commit.epoch = ev.epoch
+    commit.ganzhiIndex = ev.ganzhiIndex
+    commit.spaceSlot = ev.spaceSlot
+    commit.tick = ev.tick
+    let commitWriteRes = chainWriteFrame(conn, commit)
+    if IsErr(commitWriteRes):
+        return Err[bool](ErrorText(commitWriteRes))
+    return Ok[bool](true)
+
+fn chainNodeHandleFrame(node: var ChainNode,
+                        conn: var Connection,
+                        frame: ChainFrame,
+                        remotePeerId: var str): Result[bool] =
+    if frame.kind == "HELLO":
+        if frame.nodeId != "":
+            remotePeerId = frame.nodeId
+        let helloRes = chainWriteHello(node, conn)
+        if IsErr(helloRes):
+            return Err[bool](ErrorText(helloRes))
+        return Ok[bool](true)
+    if frame.kind == "ADVERTISE_HEADS":
+        return chainNodeHandleAdvertiseHeads(node, conn)
+    if frame.kind == "WANT_EVENT":
+        return chainNodeHandleWantEvent(node, conn, frame)
+    if frame.kind == "WANT_STATE_SUBTREE":
+        return chainNodeHandleWantStateSubtree(node, conn, frame)
+    if frame.kind == "TRANSFER_PROPOSE":
+        return chainNodeHandleTransferPropose(node, conn, frame, remotePeerId)
+    if frame.kind == "PUSH_EVENT":
+        let appendRes = chainApplyRemoteCommit(node, frame.payloadText, remotePeerId)
+        if IsErr(appendRes):
+            return Err[bool](ErrorText(appendRes))
+        return Ok[bool](true)
+    return Err[bool]("chain serve: unsupported frame " + frame.kind)
+
+fn chainServeConnection(node: var ChainNode, conn: var Connection): Result[bool] =
+    var remotePeerId: str = ""
+    for i in 0..<256:
+        if ! qconn.quicConnIsOpen(conn):
+            return Ok[bool](true)
+        let frameRes = chainReadFrame(conn)
+        if IsErr(frameRes):
+            if strContains(ErrorText(frameRes), "short read") || strContains(ErrorText(frameRes), "closed"):
+                return Ok[bool](true)
+            return Err[bool](ErrorText(frameRes))
+        let handleRes = chainNodeHandleFrame(node, conn, Value(frameRes), remotePeerId)
+        if IsErr(handleRes):
+            return handleRes
+    return Ok[bool](true)
+
+fn chainNodeServe(node: var ChainNode): Result[bool] =
+    let startRes = chainNodeEnsureStarted(node)
+    if IsErr(startRes):
+        return startRes
+    while true:
+        var transport = node.transport
+        let acceptRes = msquic.accept(transport)
+        node.transport = transport
+        if IsErr(acceptRes):
+            return Err[bool](ErrorText(acceptRes))
+        var conn = Value(acceptRes)
+        let serveRes = chainServeConnection(node, conn)
+        qconn.quicConnClose(conn)
+        if IsErr(serveRes):
+            return serveRes
+    return Ok[bool](true)
+
+fn chainNodeServeOnce(node: var ChainNode): Result[bool] =
+    let startRes = chainNodeEnsureStarted(node)
+    if IsErr(startRes):
+        return startRes
+    var transport = node.transport
+    let acceptRes = msquic.accept(transport)
+    node.transport = transport
+    if IsErr(acceptRes):
+        return Err[bool](ErrorText(acceptRes))
+    var conn = Value(acceptRes)
+    let serveRes = chainServeConnection(node, conn)
+    qconn.quicConnClose(conn)
+    return serveRes
+
+fn chainNodeTransfer(node: var ChainNode,
+                     fromAccount: str,
+                     toAccount: str,
+                     assetId: str,
+                     amount: int64,
+                     peerAddr: str): Result[str] =
+    let allowedRes = chainLocalTransferAllowed(node, fromAccount, toAccount, assetId, amount)
+    if IsErr(allowedRes):
+        return Err[str](ErrorText(allowedRes))
+    let startRes = chainNodeEnsureDialReady(node)
+    if IsErr(startRes):
+        return Err[str](ErrorText(startRes))
+    let peerRes = multiaddress.parseMultiAddress(peerAddr)
+    if IsErr(peerRes):
+        return Err[str](ErrorText(peerRes))
+    var transport = node.transport
+    let dialRes = msquic.dial(transport, Value(peerRes))
+    node.transport = transport
+    if IsErr(dialRes):
+        return Err[str](ErrorText(dialRes))
+    var conn: Connection = Value(dialRes)
+    let helloWriteRes = chainWriteHello(node, conn)
+    if IsErr(helloWriteRes):
+        qconn.quicConnClose(conn)
+        return Err[str](ErrorText(helloWriteRes))
+    let helloReadRes = chainReadHello(conn)
+    if IsErr(helloReadRes):
+        qconn.quicConnClose(conn)
+        return Err[str](ErrorText(helloReadRes))
+    let remotePeerId = Value(helloReadRes).nodeId != "" ? Value(helloReadRes).nodeId : Value(helloReadRes).peerId
+    let proposal = chainTransferProposeFrame(node, fromAccount, toAccount, assetId, amount)
+    let propWriteRes = chainWriteFrame(conn, proposal)
+    if IsErr(propWriteRes):
+        qconn.quicConnClose(conn)
+        return Err[str](ErrorText(propWriteRes))
+    let acceptRes = chainReadFrame(conn)
+    if IsErr(acceptRes):
+        qconn.quicConnClose(conn)
+        return Err[str](ErrorText(acceptRes))
+    if Value(acceptRes).kind != "TRANSFER_ACCEPT":
+        qconn.quicConnClose(conn)
+        return Err[str]("chain transfer: expected TRANSFER_ACCEPT")
+    let commitRes = chainReadFrame(conn)
+    qconn.quicConnClose(conn)
+    if IsErr(commitRes):
+        return Err[str](ErrorText(commitRes))
+    if Value(commitRes).kind != "TRANSFER_COMMIT":
+        return Err[str]("chain transfer: expected TRANSFER_COMMIT")
+    let expected = chainBuildTransferCommit(node, proposal, remotePeerId, chainStampFromFrame(Value(acceptRes)))
+    let expectedText = chainEventCanonicalText(expected)
+    if Value(commitRes).payloadText != expectedText:
+        return Err[str]("chain transfer: commit payload mismatch")
+    return chainApplyRemoteCommit(node, Value(commitRes).payloadText, remotePeerId)
+
+fn chainNodeSyncOnce(node: var ChainNode, peerAddr: str): Result[int32] =
+    let startRes = chainNodeEnsureDialReady(node)
+    if IsErr(startRes):
+        return Err[int32](ErrorText(startRes))
+    let peerRes = multiaddress.parseMultiAddress(peerAddr)
+    if IsErr(peerRes):
+        return Err[int32](ErrorText(peerRes))
+    var transport = node.transport
+    let dialRes = msquic.dial(transport, Value(peerRes))
+    node.transport = transport
+    if IsErr(dialRes):
+        return Err[int32](ErrorText(dialRes))
+    var conn: Connection = Value(dialRes)
+    let helloWriteRes = chainWriteHello(node, conn)
+    if IsErr(helloWriteRes):
+        qconn.quicConnClose(conn)
+        return Err[int32](ErrorText(helloWriteRes))
+    let helloReadRes = chainReadHello(conn)
+    if IsErr(helloReadRes):
+        qconn.quicConnClose(conn)
+        return Err[int32](ErrorText(helloReadRes))
+    let passiveSyncRes = chainPassiveAntiEntropySyncRequired(node.index, Value(helloReadRes).payloadText)
+    if IsErr(passiveSyncRes):
+        qconn.quicConnClose(conn)
+        return Err[int32](ErrorText(passiveSyncRes))
+    if ! Value(passiveSyncRes):
+        qconn.quicConnClose(conn)
+        return Ok[int32](0)
+    let remotePeerId = Value(helloReadRes).nodeId != "" ? Value(helloReadRes).nodeId : Value(helloReadRes).peerId
+    var advertise = emptyChainFrame("ADVERTISE_HEADS")
+    advertise.nodeId = node.cfg.nodeId
+    advertise.peerId = remotePeerId
+    advertise.epoch = node.seenEpoch
+    advertise.ganzhiIndex = node.seenGanzhi
+    advertise.payloadText = chainAdvertisePayload(node.index)
+    let advWriteRes = chainWriteFrame(conn, advertise)
+    if IsErr(advWriteRes):
+        qconn.quicConnClose(conn)
+        return Err[int32](ErrorText(advWriteRes))
+    let remoteAdvRes = chainReadFrame(conn)
+    if IsErr(remoteAdvRes):
+        qconn.quicConnClose(conn)
+        return Err[int32](ErrorText(remoteAdvRes))
+    if Value(remoteAdvRes).kind != "ADVERTISE_HEADS":
+        qconn.quicConnClose(conn)
+        return Err[int32]("chain sync: expected ADVERTISE_HEADS")
+    let syncRes = chainNodePullStateDiff(node, conn, remotePeerId, Value(remoteAdvRes).payloadText)
+    if IsErr(syncRes):
+        qconn.quicConnClose(conn)
+        return syncRes
+    qconn.quicConnClose(conn)
+    return syncRes

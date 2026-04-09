@@ -1,0 +1,209 @@
+import std/result
+import std/seqs as seqops
+import std/strings
+import cheng/quic/chain/types
+import cheng/quic/chain/codec
+
+fn chainConsensusAccountKey(account: str, assetId: str): str =
+    return assetId + "|" + account
+
+fn chainConsensusEventPos(index: ChainIndex, eventCid: str): int32 =
+    for i in 0..<index.eventCids.len:
+        if index.eventCids[i] == eventCid:
+            return i
+    return -1
+
+fn chainConsensusAccountPos(index: ChainIndex, key: str): int32 =
+    for i in 0..<index.accountKeys.len:
+        if index.accountKeys[i] == key:
+            return i
+    return -1
+
+fn chainConsensusEnsureAccount(index: var ChainIndex, key: str): int32 =
+    let existing = chainConsensusAccountPos(index, key)
+    if existing >= 0:
+        return existing
+    seqops.add(index.accountKeys, key)
+    seqops.add(index.accountHeads, "")
+    seqops.add(index.balances, int64(0))
+    seqops.add(index.clockEpochs, 0)
+    seqops.add(index.clockGanzhi, 0)
+    seqops.add(index.diverged, false)
+    return index.accountKeys.len - 1
+
+fn chainConsensusOrderKey(ev: ChainEvent, eventCid: str): str =
+    return intToStr(ev.epoch) + "|" +
+           intToStr(ev.ganzhiIndex) + "|" +
+           intToStr(ev.spaceSlot) + "|" +
+           int64ToStr(ev.tick) + "|" +
+           eventCid
+
+fn chainConsensusReferences(ev: ChainEvent, parentCid: str): bool =
+    return ev.fromParentCid == parentCid || ev.toParentCid == parentCid
+
+fn chainConsensusLess(aCid: str, aEvent: ChainEvent, bCid: str, bEvent: ChainEvent): bool =
+    if chainConsensusReferences(bEvent, aCid):
+        return true
+    if chainConsensusReferences(aEvent, bCid):
+        return false
+    if aEvent.epoch != bEvent.epoch:
+        return aEvent.epoch < bEvent.epoch
+    if aEvent.ganzhiIndex != bEvent.ganzhiIndex:
+        return aEvent.ganzhiIndex < bEvent.ganzhiIndex
+    if aEvent.spaceSlot != bEvent.spaceSlot:
+        return aEvent.spaceSlot < bEvent.spaceSlot
+    if aEvent.tick != bEvent.tick:
+        return aEvent.tick < bEvent.tick
+    return chainLexLess(aCid, bCid)
+
+fn chainConsensusRecordEventMeta(index: var ChainIndex, eventCid: str, kind: str, logOffset: int32) =
+    seqops.add(index.eventCids, eventCid)
+    seqops.add(index.eventKinds, kind)
+    seqops.add(index.logOffsets, logOffset)
+    index.stateTreeDirty = true
+
+fn chainConsensusApplyMint(index: var ChainIndex,
+                           ev: ChainEvent,
+                           eventCid: str,
+                           logOffset: int32,
+                           decision: var ChainConsensusDecision) =
+    let toKey = chainConsensusAccountKey(ev.toAccount, ev.assetId)
+    let pos = chainConsensusEnsureAccount(index, toKey)
+    decision.toKey = toKey
+    if index.diverged[pos]:
+        decision.reason = "diverged_target"
+        decision.accepted = false
+        return
+    if index.accountHeads[pos] != ev.toParentCid:
+        index.diverged[pos] = true
+        index.stateTreeDirty = true
+        decision.reason = "fork_parent_mismatch"
+        decision.accepted = false
+        return
+    index.balances[pos] = index.balances[pos] + ev.amount
+    index.accountHeads[pos] = eventCid
+    index.clockEpochs[pos] = ev.epoch
+    index.clockGanzhi[pos] = ev.ganzhiIndex
+    chainConsensusRecordEventMeta(index, eventCid, ev.kind, logOffset)
+    index.stateTreeDirty = true
+    decision.accepted = true
+    decision.applied = true
+    decision.reason = "mint_applied"
+
+fn chainConsensusApplyTransfer(index: var ChainIndex,
+                               ev: ChainEvent,
+                               eventCid: str,
+                               logOffset: int32,
+                               decision: var ChainConsensusDecision) =
+    let fromKey = chainConsensusAccountKey(ev.fromAccount, ev.assetId)
+    let toKey = chainConsensusAccountKey(ev.toAccount, ev.assetId)
+    let fromPos = chainConsensusEnsureAccount(index, fromKey)
+    let toPos = chainConsensusEnsureAccount(index, toKey)
+    decision.fromKey = fromKey
+    decision.toKey = toKey
+    if index.diverged[fromPos] || index.diverged[toPos]:
+        index.diverged[fromPos] = true
+        index.diverged[toPos] = true
+        index.stateTreeDirty = true
+        decision.reason = "diverged_account"
+        decision.accepted = false
+        return
+    if index.accountHeads[fromPos] != ev.fromParentCid || index.accountHeads[toPos] != ev.toParentCid:
+        index.diverged[fromPos] = true
+        index.diverged[toPos] = true
+        index.stateTreeDirty = true
+        decision.reason = "fork_parent_mismatch"
+        decision.accepted = false
+        return
+    if index.balances[fromPos] < ev.amount:
+        index.diverged[fromPos] = true
+        index.diverged[toPos] = true
+        index.stateTreeDirty = true
+        decision.reason = "insufficient_balance"
+        decision.accepted = false
+        return
+    index.balances[fromPos] = index.balances[fromPos] - ev.amount
+    index.balances[toPos] = index.balances[toPos] + ev.amount
+    index.accountHeads[fromPos] = eventCid
+    index.accountHeads[toPos] = eventCid
+    index.clockEpochs[fromPos] = ev.epoch
+    index.clockEpochs[toPos] = ev.epoch
+    index.clockGanzhi[fromPos] = ev.ganzhiIndex
+    index.clockGanzhi[toPos] = ev.ganzhiIndex
+    chainConsensusRecordEventMeta(index, eventCid, ev.kind, logOffset)
+    index.stateTreeDirty = true
+    decision.accepted = true
+    decision.applied = true
+    decision.reason = "transfer_applied"
+
+fn chainConsensusApply(index: var ChainIndex,
+                       ev: ChainEvent,
+                       eventCid: str,
+                       logOffset: int32): Result[ChainConsensusDecision] =
+    var out = emptyChainConsensusDecision()
+    out.eventCid = eventCid
+    out.orderKey = chainConsensusOrderKey(ev, eventCid)
+    if strings.len(eventCid) == 0:
+        return Err[ChainConsensusDecision]("chain consensus: empty cid")
+    if eventCid != chainEventCid(ev):
+        return Err[ChainConsensusDecision]("chain consensus: cid mismatch")
+    if ev.bodyCid != chainBodyCidText(ev):
+        return Err[ChainConsensusDecision]("chain consensus: body cid mismatch")
+    if chainConsensusEventPos(index, eventCid) >= 0:
+        out.accepted = true
+        out.applied = false
+        out.reason = "duplicate"
+        return Ok[ChainConsensusDecision](out)
+    if ev.kind != "mint" && ev.kind != "transfer_commit":
+        return Err[ChainConsensusDecision]("chain consensus: unsupported kind")
+    if ev.amount <= 0:
+        return Err[ChainConsensusDecision]("chain consensus: amount must be positive")
+    if ev.stem != ev.ganzhiIndex % 10 || ev.branch != ev.ganzhiIndex % 12:
+        return Err[ChainConsensusDecision]("chain consensus: ganzhi decomposition mismatch")
+    if ev.kind == "mint":
+        if strings.len(ev.toAccount) == 0 || strings.len(ev.assetId) == 0:
+            return Err[ChainConsensusDecision]("chain consensus: invalid mint target")
+        chainConsensusApplyMint(index, ev, eventCid, logOffset, out)
+        return Ok[ChainConsensusDecision](out)
+    if strings.len(ev.fromAccount) == 0 || strings.len(ev.toAccount) == 0 || ev.fromAccount == ev.toAccount:
+        return Err[ChainConsensusDecision]("chain consensus: invalid transfer accounts")
+    chainConsensusApplyTransfer(index, ev, eventCid, logOffset, out)
+    return Ok[ChainConsensusDecision](out)
+
+fn chainConsensusSortedEventOrder(eventCids: str[], events: ChainEvent[]): Result[int32[]] =
+    if eventCids.len != events.len:
+        return Err("chain consensus: event batch length mismatch")
+    var out: int32[]
+    out = []
+    for i in 0..<eventCids.len:
+        seqops.add(out, i)
+    for i in 1..<out.len:
+        let idxValue = out[i]
+        let cidValue = eventCids[idxValue]
+        let evValue = events[idxValue]
+        var j = i - 1
+        while j >= 0 && chainConsensusLess(cidValue, evValue, eventCids[out[j]], events[out[j]]):
+            out[j + 1] = out[j]
+            j = j - 1
+        out[j + 1] = idxValue
+    return Ok(out)
+
+fn chainConsensusApplyBatch(index: var ChainIndex,
+                            eventCids: str[],
+                            events: ChainEvent[],
+                            logOffsetBase: int32): Result[ChainConsensusDecision[]] =
+    let orderRes = chainConsensusSortedEventOrder(eventCids, events)
+    if IsErr(orderRes):
+        return Err(ErrorText(orderRes))
+    let order = Value(orderRes)
+    var out: ChainConsensusDecision[]
+    out = []
+    for i in 0..<order.len:
+        let applyRes = chainConsensusApply(index,
+                                           events[order[i]],
+                                           eventCids[order[i]],
+                                           logOffsetBase + i)
+        if IsErr(applyRes):
+            return Err(ErrorText(applyRes))
+        seqops.add(out, Value(applyRes))
+    return Ok(out)

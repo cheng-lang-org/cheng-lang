@@ -1,0 +1,170 @@
+import std/strings as strings
+import std/strutils as strutils
+import std/os
+import compiler/frontend/v2_source_parser as parser
+import compiler/semantic_facts/compiler_core_facts_v2 as cffacts
+import compiler/driver/manifest_resolver_v2 as mresolve
+
+type
+    V2NoPointerManifestReport =
+        checkedFileCount: int32
+        checkedCompilerCoreSurfaceFileCount: int32
+        checkedLineSurfaceFileCount: int32
+        firstViolationPath: str
+        firstViolationReason: str
+
+fn noPointerIsNameStart(ch: char): bool =
+    return (ch >= 'a' && ch <= 'z') ||
+           (ch >= 'A' && ch <= 'Z') ||
+           ch == '_'
+
+fn noPointerIsNameContinue(ch: char): bool =
+    return noPointerIsNameStart(ch) || (ch >= '0' && ch <= '9')
+
+fn noPointerTextHasNameToken(text: str, token: str): bool =
+    if strings.len(token) <= 0:
+        return false
+    var i: int32 = 0
+    while i < strings.len(text):
+        if !noPointerIsNameStart(text[i]):
+            i = i + 1
+            continue
+        let start = i
+        i = i + 1
+        while i < strings.len(text) && noPointerIsNameContinue(text[i]):
+            i = i + 1
+        if strings.sliceBytes(text, start, i - start) == token:
+            return true
+    return false
+
+fn trimSurfaceInlineComment(rawLine: str): str =
+    let slashIdx = strings.find(rawLine, "//")
+    if slashIdx >= 0:
+        return strutils.strip(strings.sliceBytes(rawLine, 0, slashIdx))
+    let hashIdx = strings.find(rawLine, "#")
+    if hashIdx >= 0:
+        return strutils.strip(strings.sliceBytes(rawLine, 0, hashIdx))
+    return strutils.strip(rawLine)
+
+fn noPointerLineViolationReason(line: str): str =
+    if strings.len(line) <= 0:
+        return ""
+    if strings.find(line, "*") >= 0:
+        return "pointer_star_token"
+    if noPointerTextHasNameToken(line, "ptr"):
+        return "ptr_token"
+    if noPointerTextHasNameToken(line, "ref"):
+        return "ref_token"
+    if noPointerTextHasNameToken(line, "alloc") || noPointerTextHasNameToken(line, "dealloc"):
+        return "raw_allocator"
+    if noPointerTextHasNameToken(line, "ptr_add") ||
+       noPointerTextHasNameToken(line, "strDataPtr") ||
+       noPointerTextHasNameToken(line, "rawmemAsVoid") ||
+       noPointerTextHasNameToken(line, "copyMem") ||
+       noPointerTextHasNameToken(line, "setMem") ||
+       noPointerTextHasNameToken(line, "zeroMem") ||
+       noPointerTextHasNameToken(line, "load_ptr") ||
+       noPointerTextHasNameToken(line, "store_ptr") ||
+       noPointerTextHasNameToken(line, "rawmem_support"):
+        return "raw_pointer_helper"
+    var i: int32 = 0
+    while i < strings.len(line):
+        if !noPointerIsNameStart(line[i]):
+            i = i + 1
+            continue
+        let start = i
+        i = i + 1
+        while i < strings.len(line) && noPointerIsNameContinue(line[i]):
+            i = i + 1
+        if strings.startsWith(strings.sliceBytes(line, start, i - start), "rawmem"):
+            return "rawmem_token"
+    return ""
+
+fn lineSurfaceFirstNoPointerViolation(text: str): str =
+    let lines = strutils.split(text, '\n')
+    for i in 0..<lines.len:
+        let line = trimSurfaceInlineComment(lines[i])
+        if strings.len(line) <= 0:
+            continue
+        let reason = noPointerLineViolationReason(line)
+        if strings.len(reason) > 0:
+            return "line " + intToStr(i + 1) + ": " + reason
+    return ""
+
+fn parsedHasSurfaceKind(parsed: parser.ParsedV2Source, kind: str): bool =
+    for i in 0..<parsed.surfaceKinds.len:
+        if parsed.surfaceKinds[i] == kind:
+            return true
+    return false
+
+fn firstV2NoPointerViolation(sourcePath: str,
+                             sourceText: str,
+                             parsed: parser.ParsedV2Source): str =
+    if !cffacts.compilerCoreSourcePathNeedsNoPointerPolicy(sourcePath):
+        return ""
+    if parsedHasSurfaceKind(parsed, "compiler_core"):
+        if parsed.compilerCoreProgram.topLevelKinds.len <= 0:
+            return "v2 no-pointer surface: compiler_core surface missing structured AST in " + sourcePath
+        return cffacts.compilerCoreFirstNoPointerViolation(parsed.compilerCoreProgram)
+    if parsedHasSurfaceKind(parsed, "unimaker") ||
+       parsedHasSurfaceKind(parsed, "topology") ||
+       parsedHasSurfaceKind(parsed, "network_distribution"):
+        let reason = lineSurfaceFirstNoPointerViolation(sourceText)
+        if strings.len(reason) > 0:
+            return "v2 semantic facts surface: ZRPC no-pointer policy forbids " +
+                   reason + " in " + sourcePath
+        return ""
+    return "v2 no-pointer surface: no supported v2 surface recognized in " + sourcePath
+
+fn requireV2NoPointerSurfaceFree(sourcePath: str,
+                                 sourceText: str,
+                                 parsed: parser.ParsedV2Source) =
+    let reason = firstV2NoPointerViolation(sourcePath, sourceText, parsed)
+    if strings.len(reason) > 0:
+        panic(reason)
+
+fn inspectV2NoPointerManifest(rootPath: str,
+                              manifestBundle: mresolve.SourceManifestBundle): V2NoPointerManifestReport =
+    var out: V2NoPointerManifestReport
+    out.checkedFileCount = 0
+    out.checkedCompilerCoreSurfaceFileCount = 0
+    out.checkedLineSurfaceFileCount = 0
+    out.firstViolationPath = ""
+    out.firstViolationReason = ""
+    let closureRoot = os.absolutePath(rootPath)
+    for i in 0..<manifestBundle.filePaths.len:
+        if !strings.hasSuffix(manifestBundle.filePaths[i], ".cheng"):
+            continue
+        let sourcePath =
+            rootPath == "."
+            ? manifestBundle.filePaths[i]
+            : os.joinPath(rootPath, manifestBundle.filePaths[i])
+        let sourceText = os.readFile(os.joinPath(closureRoot, manifestBundle.filePaths[i]))
+        var parsed: parser.ParsedV2Source
+        out.checkedFileCount = out.checkedFileCount + 1
+        if !parser.tryParseV2SourceText(os.joinPath(closureRoot, sourcePath), sourceText, parsed):
+            if strings.len(out.firstViolationReason) <= 0:
+                out.firstViolationPath = sourcePath
+                out.firstViolationReason = "v2 no-pointer manifest closure: unsupported mixed surface in " + sourcePath
+            continue
+        if !parser.sourceHasRecognizedSurface(parsed):
+            if strings.len(out.firstViolationReason) <= 0:
+                out.firstViolationPath = sourcePath
+                out.firstViolationReason = "v2 no-pointer manifest closure: no v2 surface recognized in " + sourcePath
+            continue
+        if parsedHasSurfaceKind(parsed, "compiler_core"):
+            out.checkedCompilerCoreSurfaceFileCount = out.checkedCompilerCoreSurfaceFileCount + 1
+        else:
+            out.checkedLineSurfaceFileCount = out.checkedLineSurfaceFileCount + 1
+        let reason = firstV2NoPointerViolation(sourcePath, sourceText, parsed)
+        if strings.len(reason) > 0 && strings.len(out.firstViolationReason) <= 0:
+            out.firstViolationPath = sourcePath
+            out.firstViolationReason = reason
+    return out
+
+fn requireV2NoPointerManifestFree(rootPath: str,
+                                  manifestBundle: mresolve.SourceManifestBundle): V2NoPointerManifestReport =
+    let report = inspectV2NoPointerManifest(rootPath, manifestBundle)
+    if strings.len(report.firstViolationReason) > 0:
+        panic(report.firstViolationReason)
+    return report

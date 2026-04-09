@@ -26,6 +26,11 @@ type
         emitKind: str
         targetTriple: str
         moduleKind: str
+        manifestFileCount: int32
+        noPointerCheckedFileCount: int32
+        noPointerCheckedCompilerCoreSurfaceFileCount: int32
+        noPointerCheckedLineSurfaceFileCount: int32
+        noPointerClosureOk: bool
         linkerFlavor: str
         linkerPath: str
         sdkName: str
@@ -125,21 +130,30 @@ fn systemLinkerPath(linkerFlavor: str, emitKind: str): str =
         return "/usr/bin/libtool"
     panic("v2 system link exec: unsupported linker flavor " + linkerFlavor)
 
-fn compilerCoreNativeSupportSources(emitKind: str): str[] =
+fn compilerCoreExecutionTrack(sourcePath: str): str =
+    let abs = os.absolutePath(sourcePath)
+    return strings.hasSuffix(abs, "/v2/src/tooling/cheng_v2.cheng") ? "tooling" else: "program"
+
+fn compilerCoreNativeSupportSources(emitKind: str, sourcePath: str): str[] =
     var out: str[]
     out = []
-    add(out, "src/runtime/native/system_helpers_char_seq_compat_bridge.c")
-    add(out, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c")
-    add(out, "src/runtime/native/system_helpers_seq_free_bridge.c")
-    add(out, "src/runtime/native/system_helpers_str_repr_bridge.c")
-    add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
-    add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
-    add(out, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c")
-    add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
-    add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
-    add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+    seqs.add(out, "src/runtime/native/system_helpers_char_seq_compat_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_seq_free_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_str_repr_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers.c")
+    seqs.add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_selflink_str_eq_bridge.c")
+    seqs.add(out, "v2/bootstrap/cheng_v2c_tooling.c")
     if emitKind == "exe":
-        add(out, "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c")
+        var entryBridgePath: str = "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c"
+        if compilerCoreExecutionTrack(sourcePath) == "program":
+            entryBridgePath = "src/runtime/native/system_helpers_selflink_program_exe_entry_bridge.c"
+        seqs.add(out, entryBridgePath)
     return out
 
 fn compileNativeSupportObject(sourcePath: str,
@@ -147,23 +161,26 @@ fn compileNativeSupportObject(sourcePath: str,
                               objPath: str): NativeSupportObjectBundle =
     ensureParentDir(objPath)
     let ccPath = os.getEnvDefault("CC", "")
-    let compilerFile = len(ccPath) > 0 && !slink.containsSlash(ccPath) ? "/usr/bin/env" :
-                       len(ccPath) > 0 ? ccPath : "/usr/bin/cc"
+    var compilerFile: str = "/usr/bin/cc"
+    if len(ccPath) > 0 && !slink.containsSlash(ccPath):
+        compilerFile = "/usr/bin/env"
+    elif len(ccPath) > 0:
+        compilerFile = ccPath
     var argv: str[]
     argv = []
     if len(ccPath) > 0 && !slink.containsSlash(ccPath):
-        add(argv, ccPath)
-    add(argv, "-std=c11")
-    add(argv, "-O2")
-    add(argv, "-Wall")
-    add(argv, "-Wextra")
-    add(argv, "-pedantic")
+        seqs.add(argv, ccPath)
+    seqs.add(argv, "-std=c11")
+    seqs.add(argv, "-O2")
+    seqs.add(argv, "-Wall")
+    seqs.add(argv, "-Wextra")
+    seqs.add(argv, "-pedantic")
     if targetTriple == "arm64-apple-darwin":
-        add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
-    add(argv, "-c")
-    add(argv, sourcePath)
-    add(argv, "-o")
-    add(argv, objPath)
+        seqs.add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+    seqs.add(argv, "-c")
+    seqs.add(argv, sourcePath)
+    seqs.add(argv, "-o")
+    seqs.add(argv, objPath)
     var envOverrides: str[]
     let res = os.execFileCapture(compilerFile,
                                  argv,
@@ -193,54 +210,54 @@ fn buildSystemLinkExecArgv(targetTriple: str,
     var argv: str[]
     argv = []
     if linkerFlavor == "ld64" && emitKind == "exe":
-        add(argv, "-arch")
-        add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
-        add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+        seqs.add(argv, "-arch")
+        seqs.add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
+        seqs.add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
         if len(syslibrootPath) > 0:
-            add(argv, "-isysroot")
-            add(argv, syslibrootPath)
-        add(argv, "-o")
-        add(argv, outputPath)
-        add(argv, primaryObjPath)
+            seqs.add(argv, "-isysroot")
+            seqs.add(argv, syslibrootPath)
+        seqs.add(argv, "-o")
+        seqs.add(argv, outputPath)
+        seqs.add(argv, primaryObjPath)
         for i in 0..<providerObjPaths.len:
-            add(argv, providerObjPaths[i])
+            seqs.add(argv, providerObjPaths[i])
         for i in 0..<supportObjPaths.len:
-            add(argv, supportObjPaths[i])
+            seqs.add(argv, supportObjPaths[i])
         return argv
     if linkerFlavor == "ld64":
-        add(argv, "-arch")
-        add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
-        add(argv, "-platform_version")
-        add(argv, mtarget.machineTargetDarwinPlatformName(targetTriple))
-        add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
-        add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
-        add(argv, "-no_uuid")
+        seqs.add(argv, "-arch")
+        seqs.add(argv, mtarget.machineTargetDarwinArchName(targetTriple))
+        seqs.add(argv, "-platform_version")
+        seqs.add(argv, mtarget.machineTargetDarwinPlatformName(targetTriple))
+        seqs.add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
+        seqs.add(argv, mtarget.machineTargetDarwinMinosText(targetTriple))
+        seqs.add(argv, "-no_uuid")
         if emitKind != "static" && len(syslibrootPath) > 0:
-            add(argv, "-syslibroot")
-            add(argv, syslibrootPath)
-            add(argv, "-lSystem")
+            seqs.add(argv, "-syslibroot")
+            seqs.add(argv, syslibrootPath)
+            seqs.add(argv, "-lSystem")
         if emitKind == "shared":
-            add(argv, "-dylib")
+            seqs.add(argv, "-dylib")
         if entryRequired:
-            add(argv, "-e")
-            add(argv, entrySymbol)
-        add(argv, "-o")
-        add(argv, outputPath)
-        add(argv, primaryObjPath)
+            seqs.add(argv, "-e")
+            seqs.add(argv, entrySymbol)
+        seqs.add(argv, "-o")
+        seqs.add(argv, outputPath)
+        seqs.add(argv, primaryObjPath)
         for i in 0..<providerObjPaths.len:
-            add(argv, providerObjPaths[i])
+            seqs.add(argv, providerObjPaths[i])
         for i in 0..<supportObjPaths.len:
-            add(argv, supportObjPaths[i])
+            seqs.add(argv, supportObjPaths[i])
         return argv
     if linkerFlavor == "libtool":
-        add(argv, "-static")
-        add(argv, "-o")
-        add(argv, outputPath)
-        add(argv, primaryObjPath)
+        seqs.add(argv, "-static")
+        seqs.add(argv, "-o")
+        seqs.add(argv, outputPath)
+        seqs.add(argv, primaryObjPath)
         for i in 0..<providerObjPaths.len:
-            add(argv, providerObjPaths[i])
+            seqs.add(argv, providerObjPaths[i])
         for i in 0..<supportObjPaths.len:
-            add(argv, supportObjPaths[i])
+            seqs.add(argv, supportObjPaths[i])
         return argv
     panic("v2 system link exec: unsupported linker flavor " + linkerFlavor)
 
@@ -255,13 +272,27 @@ fn buildSystemLinkExec(sourcePath: str,
                        outputPath: str): SystemLinkExecBundle =
     let artifact = rart.buildReleaseArtifact(sourcePath, emitKind, targetTriple)
     let missingReason0 = extractLineValue(artifact.systemLinkPlanText, "missing_reason.0")
-    if artifact.systemLinkReady ||
-       artifact.systemLinkMissingReasonCount != 1 ||
-       missingReason0 != "system_link_execution_missing":
-        panic("v2 system link exec: plan is not ready for execution")
-    let actualOutputPath = len(outputPath) > 0 ?
-        outputPath :
-        defaultSystemLinkOutput(artifact.moduleKind, emitKind, targetTriple)
+    let localPayloadCount = extractLineValue(artifact.systemLinkPlanText,
+                                             "compiler_core_program_local_payload_function_count")
+    let localPayloadExecCount = extractLineValue(artifact.systemLinkPlanText,
+                                                 "compiler_core_program_local_payload_executable_function_count")
+    let localPayloadExecPlanCount = extractLineValue(artifact.systemLinkPlanText,
+                                                     "compiler_core_program_local_payload_exec_plan_function_count")
+    let localPayloadMissingExecPlanCount = extractLineValue(artifact.systemLinkPlanText,
+                                                            "compiler_core_program_local_payload_missing_exec_plan_function_count")
+    let localPayloadLabel0 = extractLineValue(artifact.systemLinkPlanText,
+                                              "compiler_core_program_local_payload_label_sample.0")
+    if !artifact.systemLinkReady:
+        panic("v2 system link exec: plan is not ready for execution" +
+              (len(missingReason0) > 0 ? " reason=" + missingReason0 else: "") +
+              (len(localPayloadCount) > 0 ? " local_payload_count=" + localPayloadCount else: "") +
+              (len(localPayloadExecCount) > 0 ? " local_payload_exec_count=" + localPayloadExecCount else: "") +
+              (len(localPayloadExecPlanCount) > 0 ? " local_payload_exec_plan_count=" + localPayloadExecPlanCount else: "") +
+              (len(localPayloadMissingExecPlanCount) > 0 ? " local_payload_missing_exec_plan_count=" + localPayloadMissingExecPlanCount else: "") +
+              (len(localPayloadLabel0) > 0 ? " local_payload_label0=" + localPayloadLabel0 else: ""))
+    var actualOutputPath: str = defaultSystemLinkOutput(artifact.moduleKind, emitKind, targetTriple)
+    if len(outputPath) > 0:
+        actualOutputPath = outputPath
     ensureParentDir(actualOutputPath)
     let primaryObjPath = actualOutputPath + ".primary.o"
     let machineBundle = buildMachineBundleFromSource(sourcePath, targetTriple)
@@ -289,20 +320,20 @@ fn buildSystemLinkExec(sourcePath: str,
                                                                         machineBundle)
         let providerObjPath = actualOutputPath + ".provider." + intToStr(i) + ".o"
         os.writeFileBytes(providerObjPath, provider.objFileBytes)
-        add(providerModules, nativeLink.providerModules[i])
-        add(providerObjPaths, providerObjPath)
-        add(providerObjFileCids, provider.objFileCid)
-        add(providerObjFileByteCounts, provider.objFileByteCount)
+        seqs.add(providerModules, nativeLink.providerModules[i])
+        seqs.add(providerObjPaths, providerObjPath)
+        seqs.add(providerObjFileCids, provider.objFileCid)
+        seqs.add(providerObjFileByteCounts, provider.objFileByteCount)
     if artifact.moduleKind == "compiler_core":
-        let supportSources = compilerCoreNativeSupportSources(emitKind)
+        let supportSources = compilerCoreNativeSupportSources(emitKind, sourcePath)
         for i in 0..<supportSources.len:
             let supportObjPath = actualOutputPath + ".support." + intToStr(i) + ".o"
             let supportObj = compileNativeSupportObject(supportSources[i],
                                                         targetTriple,
                                                         supportObjPath)
-            add(supportObjPaths, supportObjPath)
-            add(supportObjFileCids, supportObj.fileCid)
-            add(supportObjFileByteCounts, supportObj.fileByteCount)
+            seqs.add(supportObjPaths, supportObjPath)
+            seqs.add(supportObjFileCids, supportObj.fileCid)
+            seqs.add(supportObjFileByteCounts, supportObj.fileByteCount)
     let linkerFlavor = slink.systemLinkerFlavor(targetTriple, emitKind)
     let linkerPath = systemLinkerPath(linkerFlavor, emitKind)
     var sdkName: str = ""
@@ -313,9 +344,9 @@ fn buildSystemLinkExec(sourcePath: str,
         sdkName = mtarget.machineTargetDarwinSdkName(targetTriple)
         var sdkArgv: str[]
         sdkArgv = []
-        add(sdkArgv, "--sdk")
-        add(sdkArgv, sdkName)
-        add(sdkArgv, "--show-sdk-path")
+        seqs.add(sdkArgv, "--sdk")
+        seqs.add(sdkArgv, sdkName)
+        seqs.add(sdkArgv, "--show-sdk-path")
         var envOverrides: str[]
         let sdkRes = os.execFileCapture("/usr/bin/xcrun",
                                         sdkArgv,
@@ -328,7 +359,7 @@ fn buildSystemLinkExec(sourcePath: str,
         sdkPath = trimTrailingNewlines(os.execCmdResultOutput(sdkRes))
         if len(sdkPath) == 0:
             panic("v2 system link exec: empty darwin sdk path")
-        add(systemLibraries, "System")
+        seqs.add(systemLibraries, "System")
     let entrySymbol = extractLineValue(artifact.systemLinkPlanText, "entry_symbol")
     let entryRequired = emitKind == "exe"
     let argv = buildSystemLinkExecArgv(targetTriple,
@@ -357,12 +388,17 @@ fn buildSystemLinkExec(sourcePath: str,
     out.emitKind = emitKind
     out.targetTriple = targetTriple
     out.moduleKind = artifact.moduleKind
+    out.manifestFileCount = artifact.manifestFileCount
+    out.noPointerCheckedFileCount = artifact.noPointerCheckedFileCount
+    out.noPointerCheckedCompilerCoreSurfaceFileCount = artifact.noPointerCheckedCompilerCoreSurfaceFileCount
+    out.noPointerCheckedLineSurfaceFileCount = artifact.noPointerCheckedLineSurfaceFileCount
+    out.noPointerClosureOk = artifact.noPointerClosureOk
     out.linkerFlavor = linkerFlavor
     out.linkerPath = linkerPath
     out.sdkName = sdkName
     out.systemLibraries = []
     for i in 0..<systemLibraries.len:
-        add(out.systemLibraries, systemLibraries[i])
+        seqs.add(out.systemLibraries, systemLibraries[i])
     out.outputPath = normalizePathForReport(actualOutputPath)
     out.primaryObjPath = normalizePathForReport(primaryObjPath)
     out.primaryObjFileCid = primaryObj.fileCid
@@ -375,14 +411,14 @@ fn buildSystemLinkExec(sourcePath: str,
     out.supportObjFileCids = []
     out.supportObjFileByteCounts = []
     for i in 0..<providerModules.len:
-        add(out.providerModules, providerModules[i])
-        add(out.providerObjPaths, normalizePathForReport(providerObjPaths[i]))
-        add(out.providerObjFileCids, providerObjFileCids[i])
-        add(out.providerObjFileByteCounts, providerObjFileByteCounts[i])
+        seqs.add(out.providerModules, providerModules[i])
+        seqs.add(out.providerObjPaths, normalizePathForReport(providerObjPaths[i]))
+        seqs.add(out.providerObjFileCids, providerObjFileCids[i])
+        seqs.add(out.providerObjFileByteCounts, providerObjFileByteCounts[i])
     for i in 0..<supportObjPaths.len:
-        add(out.supportObjPaths, normalizePathForReport(supportObjPaths[i]))
-        add(out.supportObjFileCids, supportObjFileCids[i])
-        add(out.supportObjFileByteCounts, supportObjFileByteCounts[i])
+        seqs.add(out.supportObjPaths, normalizePathForReport(supportObjPaths[i]))
+        seqs.add(out.supportObjFileCids, supportObjFileCids[i])
+        seqs.add(out.supportObjFileByteCounts, supportObjFileByteCounts[i])
     out.entryRequired = entryRequired
     out.entrySymbol = entrySymbol
     out.exitCode = os.execCmdResultExitCode(linkRes)
@@ -392,42 +428,56 @@ fn buildSystemLinkExec(sourcePath: str,
     out.linkOutput = trimTrailingNewlines(os.execCmdResultOutput(linkRes))
     var lines: str[]
     lines = []
-    add(lines, "system_link_exec_version=" + out.version)
-    add(lines, "source=" + out.sourcePath)
-    add(lines, "emit=" + out.emitKind)
-    add(lines, "target=" + out.targetTriple)
-    add(lines, "module_kind=" + out.moduleKind)
-    add(lines, "linker_flavor=" + out.linkerFlavor)
-    add(lines, "linker_path=" + out.linkerPath)
+    seqs.add(lines, "system_link_exec_version=" + out.version)
+    seqs.add(lines, "source=" + out.sourcePath)
+    seqs.add(lines, "emit=" + out.emitKind)
+    seqs.add(lines, "target=" + out.targetTriple)
+    seqs.add(lines, "module_kind=" + out.moduleKind)
+    seqs.add(lines, "manifest_file_count=" + intToStr(out.manifestFileCount))
+    seqs.add(lines, "no_pointer_checked_file_count=" + intToStr(out.noPointerCheckedFileCount))
+    seqs.add(lines, "no_pointer_checked_compiler_core_surface_file_count=" + intToStr(out.noPointerCheckedCompilerCoreSurfaceFileCount))
+    seqs.add(lines, "no_pointer_checked_line_surface_file_count=" + intToStr(out.noPointerCheckedLineSurfaceFileCount))
+    seqs.add(lines, "no_pointer_closure_ok=" + (out.noPointerClosureOk ? "1" : "0"))
+    seqs.add(lines, "linker_flavor=" + out.linkerFlavor)
+    seqs.add(lines, "linker_path=" + out.linkerPath)
     if len(out.sdkName) > 0:
-        add(lines, "sdk_name=" + out.sdkName)
-        add(lines, "system_library_count=" + intToStr(out.systemLibraries.len))
+        seqs.add(lines, "sdk_name=" + out.sdkName)
+        seqs.add(lines, "system_library_count=" + intToStr(out.systemLibraries.len))
         for i in 0..<out.systemLibraries.len:
-            add(lines, "system_library." + intToStr(i) + "=" + out.systemLibraries[i])
-    add(lines, "output_path=" + out.outputPath)
-    add(lines, "primary_obj_path=" + out.primaryObjPath)
-    add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
-    add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
-    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
+            seqs.add(lines, "system_library." + intToStr(i) + "=" + out.systemLibraries[i])
+    seqs.add(lines, "output_path=" + out.outputPath)
+    seqs.add(lines, "primary_obj_path=" + out.primaryObjPath)
+    seqs.add(lines, "primary_obj_file_cid=" + out.primaryObjFileCid)
+    seqs.add(lines, "primary_obj_file_byte_count=" + intToStr(out.primaryObjFileByteCount))
+    seqs.add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
     for i in 0..<out.providerModules.len:
-        add(lines, "provider_module." + intToStr(i) + ".name=" + out.providerModules[i])
-        add(lines, "provider_module." + intToStr(i) + ".obj_path=" + out.providerObjPaths[i])
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providerObjFileCids[i])
-        add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providerObjFileByteCounts[i]))
-    add(lines, "support_object_count=" + intToStr(out.supportObjPaths.len))
+        seqs.add(lines, "provider_module." + intToStr(i) + ".name=" + out.providerModules[i])
+        seqs.add(lines, "provider_module." + intToStr(i) + ".obj_path=" + out.providerObjPaths[i])
+        seqs.add(lines, "provider_module." + intToStr(i) + ".obj_file_cid=" + out.providerObjFileCids[i])
+        seqs.add(lines, "provider_module." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.providerObjFileByteCounts[i]))
+    seqs.add(lines, "support_object_count=" + intToStr(out.supportObjPaths.len))
     for i in 0..<out.supportObjPaths.len:
-        add(lines, "support_object." + intToStr(i) + ".obj_path=" + out.supportObjPaths[i])
-        add(lines, "support_object." + intToStr(i) + ".obj_file_cid=" + out.supportObjFileCids[i])
-        add(lines, "support_object." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.supportObjFileByteCounts[i]))
-    add(lines, "entry_required=" + if out.entryRequired: "1" else: "0")
-    add(lines, "entry_symbol=" + out.entrySymbol)
-    add(lines, "exit_code=" + intToStr(out.exitCode))
-    add(lines, "output_present=" + if out.outputPresent: "1" else: "0")
-    add(lines, "output_byte_count=" + intToStr(out.outputByteCount))
-    add(lines, "output_file_cid=" + out.outputFileCid)
-    add(lines, "link_ok=" + if out.exitCode == 0 && out.outputPresent: "1" else: "0")
+        seqs.add(lines, "support_object." + intToStr(i) + ".obj_path=" + out.supportObjPaths[i])
+        seqs.add(lines, "support_object." + intToStr(i) + ".obj_file_cid=" + out.supportObjFileCids[i])
+        seqs.add(lines, "support_object." + intToStr(i) + ".obj_file_byte_count=" + intToStr(out.supportObjFileByteCounts[i]))
+    var entryRequiredText: str = "0"
+    if out.entryRequired:
+        entryRequiredText = "1"
+    seqs.add(lines, "entry_required=" + entryRequiredText)
+    seqs.add(lines, "entry_symbol=" + out.entrySymbol)
+    seqs.add(lines, "exit_code=" + intToStr(out.exitCode))
+    var outputPresentText: str = "0"
+    if out.outputPresent:
+        outputPresentText = "1"
+    seqs.add(lines, "output_present=" + outputPresentText)
+    seqs.add(lines, "output_byte_count=" + intToStr(out.outputByteCount))
+    seqs.add(lines, "output_file_cid=" + out.outputFileCid)
+    var linkOkText: str = "0"
+    if out.exitCode == 0 && out.outputPresent:
+        linkOkText = "1"
+    seqs.add(lines, "link_ok=" + linkOkText)
     if len(out.linkOutput) > 0:
-        add(lines, "link_output=" + out.linkOutput)
+        seqs.add(lines, "link_output=" + out.linkOutput)
     out.reportText = mresolve.joinLines(lines)
     return out
 

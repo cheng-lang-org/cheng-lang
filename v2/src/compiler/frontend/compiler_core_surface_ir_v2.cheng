@@ -12,6 +12,11 @@ type
         label: str
         headerText: str
         bodyLines: str[]
+        stmtStart: int32
+        stmtCount: int32
+        exprStart: int32
+        exprCount: int32
+        executableAstReady: bool
     CompilerCoreTypeBlock =
         headerText: str
         bodyLines: str[]
@@ -42,6 +47,7 @@ type
     CompilerCoreStmtNode =
         kind: str
         primaryText: str
+        detailText: str
         primaryExprId: int32
         secondaryExprId: int32
         childStart: int32
@@ -51,6 +57,7 @@ type
     CompilerCoreExprNode =
         kind: str
         primaryText: str
+        detailText: str
         childStart: int32
         childCount: int32
     CompilerCoreProgram =
@@ -67,10 +74,15 @@ type
         stmtChildIds: int32[]
         exprs: CompilerCoreExprNode[]
         exprChildIds: int32[]
+        exprChildArgNames: str[]
         topLevelKinds: str[]
         topLevelLabels: str[]
+        topLevelImportDeclIdxs: int32[]
         topLevelOwnerModules: str[]
         topLevelSourcePaths: str[]
+
+fn compilerCoreSurfaceIrPanic(msg: str) =
+    system.panicStr(msg)
 
 fn compilerCoreModuleDecl(name: str, headerText: str): CompilerCoreModuleDecl =
     var out: CompilerCoreModuleDecl
@@ -89,6 +101,20 @@ fn compilerCoreValueDecl(label: str, headerText: str, bodyLines: str[]): Compile
     out.label = label
     out.headerText = headerText
     out.bodyLines = bodyLines
+    out.stmtStart = 0
+    out.stmtCount = 0
+    out.exprStart = 0
+    out.exprCount = 0
+    out.executableAstReady = false
+    return out
+
+fn compilerCoreValueDeclAsRoutineDecl(decl: CompilerCoreValueDecl): CompilerCoreRoutineDecl =
+    var out = compilerCoreRoutineDecl("value", decl.label, decl.headerText, decl.bodyLines)
+    out.stmtStart = decl.stmtStart
+    out.stmtCount = decl.stmtCount
+    out.exprStart = decl.exprStart
+    out.exprCount = decl.exprCount
+    out.executableAstReady = decl.executableAstReady
     return out
 
 fn compilerCoreTypeBlock(headerText: str, bodyLines: str[]): CompilerCoreTypeBlock =
@@ -138,6 +164,7 @@ fn compilerCoreLocalDecl(name: str,
 
 fn compilerCoreStmtNode(kind: str,
                         primaryText: str,
+                        detailText: str,
                         primaryExprId: int32,
                         secondaryExprId: int32,
                         childStart: int32,
@@ -147,6 +174,7 @@ fn compilerCoreStmtNode(kind: str,
     var out: CompilerCoreStmtNode
     out.kind = kind
     out.primaryText = primaryText
+    out.detailText = detailText
     out.primaryExprId = primaryExprId
     out.secondaryExprId = secondaryExprId
     out.childStart = childStart
@@ -157,11 +185,13 @@ fn compilerCoreStmtNode(kind: str,
 
 fn compilerCoreExprNode(kind: str,
                         primaryText: str,
+                        detailText: str,
                         childStart: int32,
                         childCount: int32): CompilerCoreExprNode =
     var out: CompilerCoreExprNode
     out.kind = kind
     out.primaryText = primaryText
+    out.detailText = detailText
     out.childStart = childStart
     out.childCount = childCount
     return out
@@ -181,8 +211,10 @@ fn newCompilerCoreProgram(): CompilerCoreProgram =
     out.stmtChildIds = []
     out.exprs = []
     out.exprChildIds = []
+    out.exprChildArgNames = []
     out.topLevelKinds = []
     out.topLevelLabels = []
+    out.topLevelImportDeclIdxs = []
     out.topLevelOwnerModules = []
     out.topLevelSourcePaths = []
     return out
@@ -207,13 +239,16 @@ fn appendCompilerCoreModule(program: var CompilerCoreProgram, decl: CompilerCore
     add(program.modules, decl)
     add(program.topLevelKinds, "module")
     add(program.topLevelLabels, decl.name)
+    add(program.topLevelImportDeclIdxs, -1)
     add(program.topLevelOwnerModules, decl.name)
     add(program.topLevelSourcePaths, "")
 
 fn appendCompilerCoreImport(program: var CompilerCoreProgram, decl: CompilerCoreImportDecl) =
+    let importDeclIdx = program.imports.len
     add(program.imports, decl)
     add(program.topLevelKinds, "import")
     add(program.topLevelLabels, decl.modulePath)
+    add(program.topLevelImportDeclIdxs, importDeclIdx)
     add(program.topLevelOwnerModules, compilerCoreCurrentOwnerModule(program))
     add(program.topLevelSourcePaths, "")
 
@@ -221,6 +256,7 @@ fn appendCompilerCoreTypeBlock(program: var CompilerCoreProgram, block: Compiler
     add(program.typeBlocks, block)
     add(program.topLevelKinds, "type")
     add(program.topLevelLabels, block.headerText)
+    add(program.topLevelImportDeclIdxs, -1)
     add(program.topLevelOwnerModules, compilerCoreCurrentOwnerModule(program))
     add(program.topLevelSourcePaths, "")
 
@@ -228,6 +264,7 @@ fn appendCompilerCoreConstDecl(program: var CompilerCoreProgram, decl: CompilerC
     add(program.constDecls, decl)
     add(program.topLevelKinds, "const")
     add(program.topLevelLabels, decl.label)
+    add(program.topLevelImportDeclIdxs, -1)
     add(program.topLevelOwnerModules, compilerCoreCurrentOwnerModule(program))
     add(program.topLevelSourcePaths, "")
 
@@ -235,6 +272,7 @@ fn appendCompilerCoreVarDecl(program: var CompilerCoreProgram, decl: CompilerCor
     add(program.varDecls, decl)
     add(program.topLevelKinds, "var")
     add(program.topLevelLabels, decl.label)
+    add(program.topLevelImportDeclIdxs, -1)
     add(program.topLevelOwnerModules, compilerCoreCurrentOwnerModule(program))
     add(program.topLevelSourcePaths, "")
 
@@ -242,6 +280,7 @@ fn appendCompilerCoreRoutine(program: var CompilerCoreProgram, decl: CompilerCor
     add(program.routines, decl)
     add(program.topLevelKinds, decl.kind)
     add(program.topLevelLabels, decl.name)
+    add(program.topLevelImportDeclIdxs, -1)
     add(program.topLevelOwnerModules, compilerCoreCurrentOwnerModule(program))
     add(program.topLevelSourcePaths, "")
 
@@ -255,24 +294,38 @@ fn appendCompilerCoreLocal(program: var CompilerCoreProgram, decl: CompilerCoreL
     add(program.locals, decl)
     return idx
 
-fn appendCompilerCoreExpr(program: var CompilerCoreProgram,
-                          kind: str,
-                          primaryText: str,
-                          childIds: int32[]): int32 =
+fn appendCompilerCoreExprWithArgNames(program: var CompilerCoreProgram,
+                                      kind: str,
+                                      primaryText: str,
+                                      detailText: str,
+                                      childIds: int32[],
+                                      childArgNames: str[]): int32 =
+    if childArgNames.len > 0 && childArgNames.len != childIds.len:
+        compilerCoreSurfaceIrPanic("v2 frontend compiler_core surface ir: expr child arg name count mismatch")
     let childStart = program.exprChildIds.len
     for i in 0..<childIds.len:
         add(program.exprChildIds, childIds[i])
+        add(program.exprChildArgNames, if childArgNames.len > 0: childArgNames[i] else: "")
     let idx = program.exprs.len
     add(program.exprs,
         compilerCoreExprNode(kind,
                              primaryText,
+                             detailText,
                              childStart,
                              childIds.len))
     return idx
 
+fn appendCompilerCoreExpr(program: var CompilerCoreProgram,
+                          kind: str,
+                          primaryText: str,
+                          detailText: str,
+                          childIds: int32[]): int32 =
+    return appendCompilerCoreExprWithArgNames(program, kind, primaryText, detailText, childIds, [])
+
 fn appendCompilerCoreStmt(program: var CompilerCoreProgram,
                           kind: str,
                           primaryText: str,
+                          detailText: str,
                           primaryExprId: int32,
                           secondaryExprId: int32,
                           childStmtIds: int32[],
@@ -287,6 +340,7 @@ fn appendCompilerCoreStmt(program: var CompilerCoreProgram,
     add(program.stmts,
         compilerCoreStmtNode(kind,
                              primaryText,
+                             detailText,
                              primaryExprId,
                              secondaryExprId,
                              childStart,
@@ -308,13 +362,13 @@ fn truncateCompilerCoreProgramAst(program: var CompilerCoreProgram,
     seqs.setLen(program.stmtChildIds, stmtChildLen)
     seqs.setLen(program.exprs, exprLen)
     seqs.setLen(program.exprChildIds, exprChildLen)
+    seqs.setLen(program.exprChildArgNames, exprChildLen)
 
 fn compilerCoreTopLevelCount(program: CompilerCoreProgram): int32 =
     return program.topLevelKinds.len
 
 fn appendCompilerCoreProgram(outProgram: var CompilerCoreProgram, program: CompilerCoreProgram) =
     var moduleIdx: int32 = 0
-    var importIdx: int32 = 0
     var typeIdx: int32 = 0
     var constIdx: int32 = 0
     var varIdx: int32 = 0
@@ -339,11 +393,13 @@ fn appendCompilerCoreProgram(outProgram: var CompilerCoreProgram, program: Compi
         add(outProgram.stmtChildIds, program.stmtChildIds[i] + stmtBase)
     for i in 0..<program.exprChildIds.len:
         add(outProgram.exprChildIds, program.exprChildIds[i] + exprBase)
+        add(outProgram.exprChildArgNames, program.exprChildArgNames[i])
     for i in 0..<program.exprs.len:
         let expr = program.exprs[i]
         add(outProgram.exprs,
             compilerCoreExprNode(expr.kind,
                                  expr.primaryText,
+                                 expr.detailText,
                                  expr.childStart + exprChildBase,
                                  expr.childCount))
     for i in 0..<program.stmts.len:
@@ -353,6 +409,7 @@ fn appendCompilerCoreProgram(outProgram: var CompilerCoreProgram, program: Compi
         add(outProgram.stmts,
             compilerCoreStmtNode(stmt.kind,
                                  stmt.primaryText,
+                                 stmt.detailText,
                                  primaryExprId,
                                  secondaryExprId,
                                  stmt.childStart + stmtChildBase,
@@ -369,12 +426,22 @@ fn appendCompilerCoreProgram(outProgram: var CompilerCoreProgram, program: Compi
                 outProgram.topLevelSourcePaths[len(outProgram.topLevelSourcePaths) - 1] = program.topLevelSourcePaths[i]
             moduleIdx = moduleIdx + 1
         elif kind == "import":
-            appendCompilerCoreImport(outProgram, program.imports[importIdx])
+            if i >= len(program.topLevelImportDeclIdxs):
+                var missingImportMsg = "v2 frontend compiler_core surface ir: missing topLevelImportDeclIdx for item "
+                missingImportMsg = missingImportMsg + intToStr(i)
+                compilerCoreSurfaceIrPanic(missingImportMsg)
+            let importDeclIdx = program.topLevelImportDeclIdxs[i]
+            if importDeclIdx < 0 || importDeclIdx >= len(program.imports):
+                var invalidImportMsg = "v2 frontend compiler_core surface ir: invalid topLevelImportDeclIdx "
+                invalidImportMsg = invalidImportMsg + intToStr(importDeclIdx)
+                invalidImportMsg = invalidImportMsg + " for item "
+                invalidImportMsg = invalidImportMsg + intToStr(i)
+                compilerCoreSurfaceIrPanic(invalidImportMsg)
+            appendCompilerCoreImport(outProgram, program.imports[importDeclIdx])
             if i < len(program.topLevelOwnerModules):
                 outProgram.topLevelOwnerModules[len(outProgram.topLevelOwnerModules) - 1] = program.topLevelOwnerModules[i]
             if i < len(program.topLevelSourcePaths):
                 outProgram.topLevelSourcePaths[len(outProgram.topLevelSourcePaths) - 1] = program.topLevelSourcePaths[i]
-            importIdx = importIdx + 1
         elif kind == "type":
             appendCompilerCoreTypeBlock(outProgram, program.typeBlocks[typeIdx])
             if i < len(program.topLevelOwnerModules):
@@ -383,14 +450,20 @@ fn appendCompilerCoreProgram(outProgram: var CompilerCoreProgram, program: Compi
                 outProgram.topLevelSourcePaths[len(outProgram.topLevelSourcePaths) - 1] = program.topLevelSourcePaths[i]
             typeIdx = typeIdx + 1
         elif kind == "const":
-            appendCompilerCoreConstDecl(outProgram, program.constDecls[constIdx])
+            var decl = program.constDecls[constIdx]
+            decl.stmtStart = decl.stmtStart + stmtBase
+            decl.exprStart = decl.exprStart + exprBase
+            appendCompilerCoreConstDecl(outProgram, decl)
             if i < len(program.topLevelOwnerModules):
                 outProgram.topLevelOwnerModules[len(outProgram.topLevelOwnerModules) - 1] = program.topLevelOwnerModules[i]
             if i < len(program.topLevelSourcePaths):
                 outProgram.topLevelSourcePaths[len(outProgram.topLevelSourcePaths) - 1] = program.topLevelSourcePaths[i]
             constIdx = constIdx + 1
         elif kind == "var":
-            appendCompilerCoreVarDecl(outProgram, program.varDecls[varIdx])
+            var decl = program.varDecls[varIdx]
+            decl.stmtStart = decl.stmtStart + stmtBase
+            decl.exprStart = decl.exprStart + exprBase
+            appendCompilerCoreVarDecl(outProgram, decl)
             if i < len(program.topLevelOwnerModules):
                 outProgram.topLevelOwnerModules[len(outProgram.topLevelOwnerModules) - 1] = program.topLevelOwnerModules[i]
             if i < len(program.topLevelSourcePaths):

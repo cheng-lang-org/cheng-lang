@@ -28,13 +28,13 @@ fn dmNewTransport(maxDatagram: int32): Result[MsQuicTransport] =
     settings.maxDatagram = maxDatagram
     let setRes: Result[bool] = setMsQuicTransportSettings(t, settings)
     if IsErr(setRes):
-        return Err[MsQuicTransport](Error(setRes))
+        return Err[MsQuicTransport](ErrorText(setRes))
     let policyRes = msquicMakeLocalhostTlsPolicy()
     if IsErr(policyRes):
-        return Err[MsQuicTransport](Error(policyRes))
+        return Err[MsQuicTransport](ErrorText(policyRes))
     let tlsRes: Result[bool] = setMsQuicTransportTlsPolicy(t, Value(policyRes))
     if IsErr(tlsRes):
-        return Err[MsQuicTransport](Error(tlsRes))
+        return Err[MsQuicTransport](ErrorText(tlsRes))
     return Ok[MsQuicTransport](t)
 
 fn dmReadExact(conn: var Connection, need: int32): Result[Bytes] =
@@ -44,7 +44,7 @@ fn dmReadExact(conn: var Connection, need: int32): Result[Bytes] =
             return Ok[Bytes](out)
         let readRes: Result[Bytes] = quicConnRead(conn, need - bytesLen(out))
         if IsErr(readRes):
-            return Err[Bytes](Error(readRes))
+            return Err[Bytes](ErrorText(readRes))
         dmBytesAppend(out, Value(readRes))
     return Err[Bytes]("dm stream: short read")
 
@@ -63,7 +63,7 @@ fn dmEncodeFrame(text: str): Bytes =
 fn dmReadFrame(conn: var Connection): Result[str] =
     let hdrRes: Result[Bytes] = dmReadExact(conn, 4)
     if IsErr(hdrRes):
-        return Err[str](Error(hdrRes))
+        return Err[str](ErrorText(hdrRes))
     let hdr: Bytes = Value(hdrRes)
     let size: int32 =
         (bytesGet(hdr, 0) << 24) |
@@ -74,7 +74,7 @@ fn dmReadFrame(conn: var Connection): Result[str] =
         return Err[str]("dm stream: invalid frame size")
     let bodyRes: Result[Bytes] = dmReadExact(conn, size)
     if IsErr(bodyRes):
-        return Err[str](Error(bodyRes))
+        return Err[str](ErrorText(bodyRes))
     return Ok[str](bytesToString(Value(bodyRes)))
 
 fn dmDatagramReadRetry(t: var MsQuicTransport, conn: var Connection): Result[Bytes] =
@@ -82,7 +82,7 @@ fn dmDatagramReadRetry(t: var MsQuicTransport, conn: var Connection): Result[Byt
         let readRes: Result[Bytes] = msquicTransportDatagramRead(t, conn)
         if IsOk(readRes):
             return readRes
-        if ! strContains(Error(readRes), "queue empty"):
+        if ! strContains(ErrorText(readRes), "queue empty"):
             return readRes
     return Err[Bytes]("msquic udp: queue empty")
 
@@ -92,10 +92,10 @@ fn dmAddr(): Result[MultiAddress] =
 fn runStreamDmDemo(): Result[bool] =
     let addrRes: Result[MultiAddress] = dmAddr()
     if IsErr(addrRes):
-        return Err[bool](Error(addrRes))
+        return Err[bool](ErrorText(addrRes))
     let transportRes: Result[MsQuicTransport] = dmNewTransport(96)
     if IsErr(transportRes):
-        return Err[bool](Error(transportRes))
+        return Err[bool](ErrorText(transportRes))
     var t: MsQuicTransport = Value(transportRes)
     let addr: MultiAddress = Value(addrRes)
     start(t, addr)
@@ -103,42 +103,42 @@ fn runStreamDmDemo(): Result[bool] =
         return Err[bool]("dm stream: start failed")
     let dialRes: Result[Connection] = dial(t, addr)
     if IsErr(dialRes):
-        return Err[bool]("dm stream: dial: " + Error(dialRes))
+        return Err[bool]("dm stream: dial: " + ErrorText(dialRes))
     let acceptRes: Result[Connection] = accept(t)
     if IsErr(acceptRes):
-        return Err[bool]("dm stream: accept: " + Error(acceptRes))
+        return Err[bool]("dm stream: accept: " + ErrorText(acceptRes))
     var client: Connection = Value(dialRes)
     var server: Connection = Value(acceptRes)
 
     let hello: Bytes = dmEncodeFrame("dm-st:hello")
     let writeRes: Result[int32] = quicConnWrite(client, hello)
     if IsErr(writeRes):
-        return Err[bool]("dm stream: write hello: " + Error(writeRes))
+        return Err[bool]("dm stream: write hello: " + ErrorText(writeRes))
     let serverMsgRes: Result[str] = dmReadFrame(server)
     if IsErr(serverMsgRes):
-        return Err[bool]("dm stream: server read: " + Error(serverMsgRes))
+        return Err[bool]("dm stream: server read: " + ErrorText(serverMsgRes))
     if Value(serverMsgRes) != "dm-st:hello":
         return Err[bool]("dm stream: hello mismatch")
 
     let ackWriteRes: Result[int32] = quicConnWrite(server, dmEncodeFrame("dm-st:ack"))
     if IsErr(ackWriteRes):
-        return Err[bool]("dm stream: write ack: " + Error(ackWriteRes))
+        return Err[bool]("dm stream: write ack: " + ErrorText(ackWriteRes))
     let clientMsgRes: Result[str] = dmReadFrame(client)
     if IsErr(clientMsgRes):
-        return Err[bool]("dm stream: client read: " + Error(clientMsgRes))
+        return Err[bool]("dm stream: client read: " + ErrorText(clientMsgRes))
     if Value(clientMsgRes) != "dm-st:ack":
         return Err[bool]("dm stream: ack mismatch")
 
     msquicNativeTestDropNextAppPacket()
     let rtxWriteRes: Result[int32] = quicConnWrite(client, dmEncodeFrame("dm-st:rtx"))
     if IsErr(rtxWriteRes):
-        return Err[bool]("dm stream: retransmit write: " + Error(rtxWriteRes))
+        return Err[bool]("dm stream: retransmit write: " + ErrorText(rtxWriteRes))
     let forceRes: Result[bool] = msquicNativeTestForceRetransmit(client.pipeIdx)
     if IsErr(forceRes):
-        return Err[bool]("dm stream: force retransmit: " + Error(forceRes))
+        return Err[bool]("dm stream: force retransmit: " + ErrorText(forceRes))
     let rtxMsgRes: Result[str] = dmReadFrame(server)
     if IsErr(rtxMsgRes):
-        return Err[bool]("dm stream: retransmit read: " + Error(rtxMsgRes))
+        return Err[bool]("dm stream: retransmit read: " + ErrorText(rtxMsgRes))
     if Value(rtxMsgRes) != "dm-st:rtx":
         return Err[bool]("dm stream: retransmit mismatch")
 
@@ -152,10 +152,10 @@ fn runStreamDmDemo(): Result[bool] =
 fn runDatagramDmDemo(): Result[bool] =
     let addrRes: Result[MultiAddress] = dmAddr()
     if IsErr(addrRes):
-        return Err[bool](Error(addrRes))
+        return Err[bool](ErrorText(addrRes))
     let transportRes: Result[MsQuicTransport] = dmNewTransport(32)
     if IsErr(transportRes):
-        return Err[bool](Error(transportRes))
+        return Err[bool](ErrorText(transportRes))
     var t: MsQuicTransport = Value(transportRes)
     let addr: MultiAddress = Value(addrRes)
     start(t, addr)
@@ -163,29 +163,29 @@ fn runDatagramDmDemo(): Result[bool] =
         return Err[bool]("dm datagram: start failed")
     let dialRes: Result[Connection] = dial(t, addr)
     if IsErr(dialRes):
-        return Err[bool]("dm datagram: dial: " + Error(dialRes))
+        return Err[bool]("dm datagram: dial: " + ErrorText(dialRes))
     let acceptRes: Result[Connection] = accept(t)
     if IsErr(acceptRes):
-        return Err[bool]("dm datagram: accept: " + Error(acceptRes))
+        return Err[bool]("dm datagram: accept: " + ErrorText(acceptRes))
     var client: Connection = Value(dialRes)
     var server: Connection = Value(acceptRes)
 
     let hello: Bytes = bytesFromString("dm-dg:hello")
     let writeRes: Result[int32] = msquicTransportDatagramWrite(t, client, hello)
     if IsErr(writeRes):
-        return Err[bool]("dm datagram: write hello: " + Error(writeRes))
+        return Err[bool]("dm datagram: write hello: " + ErrorText(writeRes))
     let serverReadRes: Result[Bytes] = dmDatagramReadRetry(t, server)
     if IsErr(serverReadRes):
-        return Err[bool]("dm datagram: server read: " + Error(serverReadRes))
+        return Err[bool]("dm datagram: server read: " + ErrorText(serverReadRes))
     if bytesToString(Value(serverReadRes)) != "dm-dg:hello":
         return Err[bool]("dm datagram: hello mismatch")
 
     let ackWriteRes: Result[int32] = msquicTransportDatagramWrite(t, server, bytesFromString("dm-dg:ack"))
     if IsErr(ackWriteRes):
-        return Err[bool]("dm datagram: write ack: " + Error(ackWriteRes))
+        return Err[bool]("dm datagram: write ack: " + ErrorText(ackWriteRes))
     let clientReadRes: Result[Bytes] = dmDatagramReadRetry(t, client)
     if IsErr(clientReadRes):
-        return Err[bool]("dm datagram: client read: " + Error(clientReadRes))
+        return Err[bool]("dm datagram: client read: " + ErrorText(clientReadRes))
     if bytesToString(Value(clientReadRes)) != "dm-dg:ack":
         return Err[bool]("dm datagram: ack mismatch")
 

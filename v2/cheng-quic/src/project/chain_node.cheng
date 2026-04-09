@@ -1,0 +1,100 @@
+import std/result
+import std/cmdline as cmdline
+import std/parseutils
+import std/strings
+import cheng/quic/chain/types
+import cheng/quic/chain/node
+
+fn chainNodeReadFlag(key: str, defaultValue: str): str =
+    var out: str = defaultValue
+    if cmdline.readFlagValue(key, out):
+        return out
+    return defaultValue
+
+fn chainNodeReadInt64Flag(key: str, defaultValue: int64): int64 =
+    var raw: str = ""
+    if ! cmdline.readFlagValue(key, raw):
+        return defaultValue
+    var out: int64 = 0
+    if parseutils.parseInt64(raw, out) <= 0:
+        return defaultValue
+    return out
+
+fn chainNodeBuildConfig(): ChainNodeConfig =
+    var cfg = defaultChainNodeConfig()
+    cfg.rootDir = chainNodeReadFlag("--root", cfg.rootDir)
+    cfg.nodeId = chainNodeReadFlag("--node-id", cfg.nodeId)
+    cfg.listenAddrText = chainNodeReadFlag("--listen", cfg.listenAddrText)
+    cfg.lsmrDepth = int32(chainNodeReadInt64Flag("--lsmr-depth", int64(cfg.lsmrDepth)))
+    return cfg
+
+fn chainNodeUsage(): int32 =
+    echo("usage: chain_node serve|serve-once|mint|transfer|balance|sync-once [flags]")
+    echo("--root <dir> --node-id <id> --listen <multiaddr> --lsmr-depth <n>")
+    echo("--account <id> --asset <asset> --amount <n> --from <id> --to <id> --peer <multiaddr>")
+    return 2
+
+fn main(): int32 =
+    if cmdline.argCount() < 2:
+        return chainNodeUsage()
+    let cmd = cmdline.argStr(1)
+    let cfg = chainNodeBuildConfig()
+    var n: ChainNode
+    let nodeRes = initChainNodeInto(n, cfg)
+    if IsErr(nodeRes):
+        echo("chain_node=fail " + ErrorText(nodeRes))
+        return 1
+    if cmd == "serve":
+        let serveRes = chainNodeServe(n)
+        if IsErr(serveRes):
+            echo("chain_node=fail " + ErrorText(serveRes))
+            return 1
+        echo("chain_node=ok serve")
+        return 0
+    if cmd == "serve-once":
+        let serveRes = chainNodeServeOnce(n)
+        if IsErr(serveRes):
+            echo("chain_node=fail " + ErrorText(serveRes))
+            return 1
+        echo("chain_node=ok serve-once")
+        return 0
+    if cmd == "mint":
+        let account = chainNodeReadFlag("--account", "")
+        let asset = chainNodeReadFlag("--asset", "cheng")
+        let amount = chainNodeReadInt64Flag("--amount", 0)
+        let mintRes = chainNodeMint(n, account, asset, amount)
+        if IsErr(mintRes):
+            echo("chain_node=fail " + ErrorText(mintRes))
+            return 1
+        echo("event_cid=" + Value(mintRes))
+        return 0
+    if cmd == "transfer":
+        let fromAccount = chainNodeReadFlag("--from", "")
+        let toAccount = chainNodeReadFlag("--to", "")
+        let asset = chainNodeReadFlag("--asset", "cheng")
+        let amount = chainNodeReadInt64Flag("--amount", 0)
+        let peer = chainNodeReadFlag("--peer", "")
+        let transferRes = chainNodeTransfer(n, fromAccount, toAccount, asset, amount, peer)
+        if IsErr(transferRes):
+            echo("chain_node=fail " + ErrorText(transferRes))
+            return 1
+        echo("event_cid=" + Value(transferRes))
+        return 0
+    if cmd == "balance":
+        let account = chainNodeReadFlag("--account", "")
+        let asset = chainNodeReadFlag("--asset", "cheng")
+        let balanceRes = chainNodeBalance(n, account, asset)
+        if IsErr(balanceRes):
+            echo("chain_node=fail " + ErrorText(balanceRes))
+            return 1
+        echo("balance=" + int64ToStr(Value(balanceRes)))
+        return 0
+    if cmd == "sync-once":
+        let peer = chainNodeReadFlag("--peer", "")
+        let syncRes = chainNodeSyncOnce(n, peer)
+        if IsErr(syncRes):
+            echo("chain_node=fail " + ErrorText(syncRes))
+            return 1
+        echo("synced=" + intToStr(Value(syncRes)))
+        return 0
+    return chainNodeUsage()

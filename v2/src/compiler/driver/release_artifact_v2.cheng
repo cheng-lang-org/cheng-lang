@@ -7,6 +7,7 @@ import compiler/frontend/network_distribution_surface_ir_v2 as nsurf
 import compiler/driver/manifest_resolver_v2 as manifest
 import compiler/driver/identity_v2 as ident
 import compiler/driver/network_distribution_identity_v2 as ndident
+import compiler/semantic_facts/no_pointer_surface_v2 as npfacts
 import compiler/driver/compiler_core_pipeline_v2 as cpipe
 import compiler/driver/unimaker_pipeline_v2 as upipe
 import compiler/driver/network_distribution_pipeline_v2 as npipe
@@ -51,6 +52,11 @@ type
         objFileVersion: str
         objFormat: str
         manifestCid: str
+        manifestFileCount: int32
+        noPointerCheckedFileCount: int32
+        noPointerCheckedCompilerCoreSurfaceFileCount: int32
+        noPointerCheckedLineSurfaceFileCount: int32
+        noPointerClosureOk: bool
         compileKey: str
         compileKeyText: str
         objImageCid: str
@@ -80,20 +86,13 @@ fn releaseArtifactVersion(): str =
 fn nativeLinkPlanVersion(): str =
     return "v2.native_link_plan.v1"
 
-fn compilerCoreEntrySymbol(bundle: cpipe.CompilerCorePipelineBundle, targetTriple: str): str =
-    return slink.resolveEntrySymbol(targetTriple,
-                                    "compiler_core",
-                                    bundle.lowPlan.itemIds,
-                                    bundle.lowPlan.canonicalOps,
-                                    bundle.lowPlan.labels)
-
 fn objFormatForTarget(target: str): str =
     mtarget.requireMachineTarget(target)
     return mtarget.machineTargetObjFormat(target)
 
 fn requireEmitKind(emitKind: str) =
     if emitKind != "exe" && emitKind != "shared" && emitKind != "static":
-        panic("v2 release artifact: unsupported emit kind " + emitKind)
+        system.panicStr("v2 release artifact: unsupported emit kind " + emitKind)
 
 fn sanitizeSymbolPart(text: str): str =
     var out: str = ""
@@ -112,22 +111,22 @@ fn runtimeTargetSymbolName(targetTriple: str, runtimeTarget: str): str =
 
 fn appendSystemLinkProviderReportLines(lines: var str[],
                                        systemLink: slink.SystemLinkPlanBundle) =
-    add(lines, "system_link_provider_count=" + intToStr(systemLink.providers.len))
+    seqs.add(lines, "system_link_provider_count=" + intToStr(systemLink.providers.len))
     for i in 0..<systemLink.providers.len:
-        add(lines, "system_link.provider." + intToStr(i) + ".module=" + systemLink.providers[i].modulePath)
-        add(lines, "system_link.provider." + intToStr(i) + ".source_path=" + systemLink.providers[i].sourcePath)
-        add(lines, "system_link.provider." + intToStr(i) + ".source_kind=" + systemLink.providers[i].sourceKind)
-        add(lines, "system_link.provider." + intToStr(i) + ".compile_mode=" + systemLink.providers[i].compileMode)
-        add(lines, "system_link.provider." + intToStr(i) + ".manifest_cid=" + systemLink.providers[i].manifestCid)
-        add(lines, "system_link.provider." + intToStr(i) + ".execution_model=" + systemLink.providers[i].executionModel)
-        add(lines, "system_link.provider." + intToStr(i) + ".trace_symbol=" + systemLink.providers[i].traceSymbol)
-        add(lines, "system_link.provider." + intToStr(i) + ".provider_symbol_count=" + intToStr(systemLink.providers[i].runtimeSymbols.len))
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".module=" + systemLink.providers[i].modulePath)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".source_path=" + systemLink.providers[i].sourcePath)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".source_kind=" + systemLink.providers[i].sourceKind)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".compile_mode=" + systemLink.providers[i].compileMode)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".manifest_cid=" + systemLink.providers[i].manifestCid)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".execution_model=" + systemLink.providers[i].executionModel)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".trace_symbol=" + systemLink.providers[i].traceSymbol)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".provider_symbol_count=" + intToStr(systemLink.providers[i].runtimeSymbols.len))
         for j in 0..<systemLink.providers[i].runtimeSymbols.len:
-            add(lines,
-                "system_link.provider." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
-                systemLink.providers[i].runtimeSymbols[j])
-        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_cid=" + systemLink.providers[i].objFileCid)
-        add(lines, "system_link.provider." + intToStr(i) + ".obj_file_byte_count=" + intToStr(systemLink.providers[i].objFileByteCount))
+            seqs.add(lines,
+                     "system_link.provider." + intToStr(i) + ".provider_symbol." + intToStr(j) + "=" +
+                     systemLink.providers[i].runtimeSymbols[j])
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".obj_file_cid=" + systemLink.providers[i].objFileCid)
+        seqs.add(lines, "system_link.provider." + intToStr(i) + ".obj_file_byte_count=" + intToStr(systemLink.providers[i].objFileByteCount))
 
 fn runtimeTargetsForModuleKind(moduleKind: str): str[] =
     var out: str[]
@@ -152,26 +151,46 @@ fn runtimeTargetsForModuleKind(moduleKind: str): str[] =
         for i in 0..<targets.len:
             ident.appendUnique(out, targets[i])
     else:
-        panic("v2 native link plan: unsupported module kind " + moduleKind)
+        system.panicStr("v2 native link plan: unsupported module kind " + moduleKind)
+    ident.sortStrings(out)
+    return out
+
+fn compilerCoreProvidedTargetsForMachine(machineBundle: mpipeline.MachineModuleBundle): str[] =
+    var out: str[]
+    out = corun.coreRuntimeTargets()
+    var compilerTargets = crun.compilerCoreRuntimeTargetsForTrack("tooling")
+    for i in 0..<machineBundle.runtimeTargets.len:
+        if machineBundle.runtimeTargets[i] == crun.compilerCoreProgramArgvRuntimeTarget() ||
+           machineBundle.runtimeTargets[i] == crun.compilerCoreProgramLocalPayloadRuntimeTarget():
+            compilerTargets = crun.compilerCoreRuntimeTargetsForTrack("program")
+            break
+    for i in 0..<compilerTargets.len:
+        ident.appendUnique(out, compilerTargets[i])
     ident.sortStrings(out)
     return out
 
 fn runtimeProviderModulesForModuleKind(moduleKind: str): str[] =
     var out: str[]
     out = []
-    add(out, "runtime/core_runtime_v2")
+    seqs.add(out, "runtime/core_runtime_v2")
     if moduleKind == "string":
-        add(out, "runtime/strings_v2")
+        seqs.add(out, "runtime/strings_v2")
     elif moduleKind == "compiler_core":
-        add(out, "runtime/compiler_core_runtime_v2")
+        seqs.add(out, "runtime/compiler_core_runtime_v2")
     elif moduleKind == "unimaker":
-        add(out, "runtime/unimaker_runtime_contract_v2")
+        seqs.add(out, "runtime/unimaker_runtime_contract_v2")
     elif moduleKind == "network_distribution" || moduleKind == "topology":
-        add(out, "runtime/network_distribution_runtime_v2")
+        seqs.add(out, "runtime/network_distribution_runtime_v2")
     else:
-        panic("v2 native link plan: unsupported provider module kind " + moduleKind)
+        system.panicStr("v2 native link plan: unsupported provider module kind " + moduleKind)
     ident.sortStrings(out)
     return out
+
+fn compilerCoreExecutionTrack(sourcePath: str): str =
+    let abs = os.absolutePath(sourcePath)
+    if strings.hasSuffix(abs, "/v2/src/tooling/cheng_v2.cheng"):
+        return "tooling"
+    return "program"
 
 fn buildNativeLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
                        emitKind: str,
@@ -184,7 +203,10 @@ fn buildNativeLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
     out.objFormat = machineBundle.objFormat
     out.runtimeTargets = []
     out.runtimeSymbols = []
-    out.providedTargets = runtimeTargetsForModuleKind(machineBundle.moduleKind)
+    if machineBundle.moduleKind == "compiler_core":
+        out.providedTargets = compilerCoreProvidedTargetsForMachine(machineBundle)
+    else:
+        out.providedTargets = runtimeTargetsForModuleKind(machineBundle.moduleKind)
     out.providedSymbols = []
     out.unresolvedTargets = []
     out.unresolvedSymbols = []
@@ -193,9 +215,9 @@ fn buildNativeLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
         ident.appendUnique(out.runtimeTargets, machineBundle.runtimeTargets[i])
     ident.sortStrings(out.runtimeTargets)
     for i in 0..<out.runtimeTargets.len:
-        add(out.runtimeSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
+        seqs.add(out.runtimeSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
     for i in 0..<out.providedTargets.len:
-        add(out.providedSymbols, runtimeTargetSymbolName(targetTriple, out.providedTargets[i]))
+        seqs.add(out.providedSymbols, runtimeTargetSymbolName(targetTriple, out.providedTargets[i]))
     for i in 0..<out.runtimeTargets.len:
         var matched: bool = false
         for j in 0..<out.providedTargets.len:
@@ -203,30 +225,30 @@ fn buildNativeLinkPlan(machineBundle: mpipeline.MachineModuleBundle,
                 matched = true
                 break
         if !matched:
-            add(out.unresolvedTargets, out.runtimeTargets[i])
-            add(out.unresolvedSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
+            seqs.add(out.unresolvedTargets, out.runtimeTargets[i])
+            seqs.add(out.unresolvedSymbols, runtimeTargetSymbolName(targetTriple, out.runtimeTargets[i]))
     var lines: str[]
     lines = []
-    add(lines, "native_link_plan_version=" + out.version)
-    add(lines, "module_kind=" + out.moduleKind)
-    add(lines, "emit=" + out.emitKind)
-    add(lines, "target=" + out.targetTriple)
-    add(lines, "obj_format=" + out.objFormat)
-    add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
+    seqs.add(lines, "native_link_plan_version=" + out.version)
+    seqs.add(lines, "module_kind=" + out.moduleKind)
+    seqs.add(lines, "emit=" + out.emitKind)
+    seqs.add(lines, "target=" + out.targetTriple)
+    seqs.add(lines, "obj_format=" + out.objFormat)
+    seqs.add(lines, "provider_module_count=" + intToStr(out.providerModules.len))
     for i in 0..<out.providerModules.len:
-        add(lines, "provider_module." + intToStr(i) + "=" + out.providerModules[i])
-    add(lines, "runtime_target_count=" + intToStr(out.runtimeTargets.len))
+        seqs.add(lines, "provider_module." + intToStr(i) + "=" + out.providerModules[i])
+    seqs.add(lines, "runtime_target_count=" + intToStr(out.runtimeTargets.len))
     for i in 0..<out.runtimeTargets.len:
-        add(lines, "runtime_target." + intToStr(i) + ".name=" + out.runtimeTargets[i])
-        add(lines, "runtime_target." + intToStr(i) + ".symbol=" + out.runtimeSymbols[i])
-    add(lines, "provided_target_count=" + intToStr(out.providedTargets.len))
+        seqs.add(lines, "runtime_target." + intToStr(i) + ".name=" + out.runtimeTargets[i])
+        seqs.add(lines, "runtime_target." + intToStr(i) + ".symbol=" + out.runtimeSymbols[i])
+    seqs.add(lines, "provided_target_count=" + intToStr(out.providedTargets.len))
     for i in 0..<out.providedTargets.len:
-        add(lines, "provided_target." + intToStr(i) + ".name=" + out.providedTargets[i])
-        add(lines, "provided_target." + intToStr(i) + ".symbol=" + out.providedSymbols[i])
-    add(lines, "unresolved_target_count=" + intToStr(out.unresolvedTargets.len))
+        seqs.add(lines, "provided_target." + intToStr(i) + ".name=" + out.providedTargets[i])
+        seqs.add(lines, "provided_target." + intToStr(i) + ".symbol=" + out.providedSymbols[i])
+    seqs.add(lines, "unresolved_target_count=" + intToStr(out.unresolvedTargets.len))
     for i in 0..<out.unresolvedTargets.len:
-        add(lines, "unresolved_target." + intToStr(i) + ".name=" + out.unresolvedTargets[i])
-        add(lines, "unresolved_target." + intToStr(i) + ".symbol=" + out.unresolvedSymbols[i])
+        seqs.add(lines, "unresolved_target." + intToStr(i) + ".name=" + out.unresolvedTargets[i])
+        seqs.add(lines, "unresolved_target." + intToStr(i) + ".symbol=" + out.unresolvedSymbols[i])
     out.planText = manifest.joinLines(lines)
     out.planCid = ident.sha256HexText(out.planText)
     return out
@@ -243,54 +265,57 @@ fn buildUnimakerCompileKeyText(bundle: upipe.UnimakerPipelineBundle,
                                objFormat: str): str =
     var lines: str[]
     lines = []
-    add(lines, "emit=" + emitKind)
-    add(lines, "target=" + targetTriple)
-    add(lines, "module_kind=unimaker")
-    add(lines, "pipeline_version=" + bundle.version)
-    add(lines, "manifest_cid=" + manifestCid)
-    add(lines, "obj_format=" + objFormat)
-    add(lines, "machine_pipeline_version=" + machineBundle.version)
-    add(lines, "obj_image_version=" + objBundle.version)
-    add(lines, "obj_file_version=" + objFile.version)
-    add(lines, "native_link_plan_version=" + linkPlan.version)
-    add(lines, "system_link_plan_version=" + systemLink.version)
-    add(lines, "machine_architecture=" + machineBundle.architecture)
-    add(lines, "machine_text_section=" + machineBundle.textSectionName)
-    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
-    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
-    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
-    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
-    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
-    add(lines, "system_link_output_kind=" + systemLink.outputKind)
-    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
-    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
-    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    seqs.add(lines, "emit=" + emitKind)
+    seqs.add(lines, "target=" + targetTriple)
+    seqs.add(lines, "module_kind=unimaker")
+    seqs.add(lines, "pipeline_version=" + bundle.version)
+    seqs.add(lines, "manifest_cid=" + manifestCid)
+    seqs.add(lines, "obj_format=" + objFormat)
+    seqs.add(lines, "machine_pipeline_version=" + machineBundle.version)
+    seqs.add(lines, "obj_image_version=" + objBundle.version)
+    seqs.add(lines, "obj_file_version=" + objFile.version)
+    seqs.add(lines, "native_link_plan_version=" + linkPlan.version)
+    seqs.add(lines, "system_link_plan_version=" + systemLink.version)
+    seqs.add(lines, "machine_architecture=" + machineBundle.architecture)
+    seqs.add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    seqs.add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    seqs.add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    seqs.add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    seqs.add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    seqs.add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    seqs.add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    seqs.add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    var systemLinkEntryRequiredText: str = "0"
+    if systemLink.entryRequired:
+        systemLinkEntryRequiredText = "1"
+    seqs.add(lines, "system_link_entry_required=" + systemLinkEntryRequiredText)
+    seqs.add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
     appendSystemLinkProviderReportLines(lines, systemLink)
-    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    seqs.add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
     for i in 0..<systemLink.missingReasons.len:
-        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
-    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
-    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+        seqs.add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    seqs.add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    seqs.add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
     for i in 0..<linkPlan.providerModules.len:
-        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+        seqs.add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
     for i in 0..<linkPlan.runtimeTargets.len:
-        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
-    add(lines, "unimaker_entry_count=" + intToStr(bundle.lowPlan.declIds.len))
+        seqs.add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    seqs.add(lines, "unimaker_entry_count=" + intToStr(bundle.lowPlan.declIds.len))
     for i in 0..<bundle.lowPlan.declIds.len:
-        add(lines, "unimaker.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".network_mode=" + bundle.lowPlan.networkModes[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".capability=" + bundle.lowPlan.capabilityKinds[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".domain=" + bundle.lowPlan.networkDomains[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".topology_ref=" + bundle.lowPlan.topologyRefs[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
-        add(lines, "unimaker.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".network_mode=" + bundle.lowPlan.networkModes[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".capability=" + bundle.lowPlan.capabilityKinds[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".domain=" + bundle.lowPlan.networkDomains[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".topology_ref=" + bundle.lowPlan.topologyRefs[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
+        seqs.add(lines, "unimaker.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
     return manifest.joinLines(lines)
 
 fn buildNetworkCompileKeyText(bundle: npipe.NetworkDistributionPipelineBundle,
@@ -306,77 +331,80 @@ fn buildNetworkCompileKeyText(bundle: npipe.NetworkDistributionPipelineBundle,
                               objFormat: str): str =
     var lines: str[]
     lines = []
-    add(lines, "emit=" + emitKind)
-    add(lines, "target=" + targetTriple)
-    add(lines, "module_kind=" + moduleKind)
-    add(lines, "pipeline_version=" + bundle.version)
-    add(lines, "manifest_cid=" + manifestCid)
-    add(lines, "obj_format=" + objFormat)
-    add(lines, "machine_pipeline_version=" + machineBundle.version)
-    add(lines, "obj_image_version=" + objBundle.version)
-    add(lines, "obj_file_version=" + objFile.version)
-    add(lines, "native_link_plan_version=" + linkPlan.version)
-    add(lines, "system_link_plan_version=" + systemLink.version)
-    add(lines, "machine_architecture=" + machineBundle.architecture)
-    add(lines, "machine_text_section=" + machineBundle.textSectionName)
-    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
-    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
-    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
-    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
-    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
-    add(lines, "system_link_output_kind=" + systemLink.outputKind)
-    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
-    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
-    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    seqs.add(lines, "emit=" + emitKind)
+    seqs.add(lines, "target=" + targetTriple)
+    seqs.add(lines, "module_kind=" + moduleKind)
+    seqs.add(lines, "pipeline_version=" + bundle.version)
+    seqs.add(lines, "manifest_cid=" + manifestCid)
+    seqs.add(lines, "obj_format=" + objFormat)
+    seqs.add(lines, "machine_pipeline_version=" + machineBundle.version)
+    seqs.add(lines, "obj_image_version=" + objBundle.version)
+    seqs.add(lines, "obj_file_version=" + objFile.version)
+    seqs.add(lines, "native_link_plan_version=" + linkPlan.version)
+    seqs.add(lines, "system_link_plan_version=" + systemLink.version)
+    seqs.add(lines, "machine_architecture=" + machineBundle.architecture)
+    seqs.add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    seqs.add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    seqs.add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    seqs.add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    seqs.add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    seqs.add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    seqs.add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    seqs.add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    var systemLinkEntryRequiredText: str = "0"
+    if systemLink.entryRequired:
+        systemLinkEntryRequiredText = "1"
+    seqs.add(lines, "system_link_entry_required=" + systemLinkEntryRequiredText)
+    seqs.add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
     appendSystemLinkProviderReportLines(lines, systemLink)
-    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    seqs.add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
     for i in 0..<systemLink.missingReasons.len:
-        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
-    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
-    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+        seqs.add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    seqs.add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    seqs.add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
     for i in 0..<linkPlan.providerModules.len:
-        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+        seqs.add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
     for i in 0..<linkPlan.runtimeTargets.len:
-        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
-    add(lines, "network_topology_count=" + intToStr(bundle.program.topologies.len))
+        seqs.add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    seqs.add(lines, "network_topology_count=" + intToStr(bundle.program.topologies.len))
     for i in 0..<bundle.program.topologies.len:
-        add(lines, "network.topology." + intToStr(i) + "=" + nsurf.topologyCanonicalForm(bundle.program.topologies[i]))
-    add(lines, "network_entry_count=" + intToStr(bundle.lowPlan.opIds.len))
+        seqs.add(lines, "network.topology." + intToStr(i) + "=" + nsurf.topologyCanonicalForm(bundle.program.topologies[i]))
+    seqs.add(lines, "network_entry_count=" + intToStr(bundle.lowPlan.opIds.len))
     for i in 0..<bundle.lowPlan.opIds.len:
         let binding = ndident.bindNetworkOpToLsmr(bundle, manifestCid, i)
-        add(lines, "network.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
-        add(lines, "network.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
-        add(lines, "network.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
-        add(lines, "network.entry." + intToStr(i) + ".domain=" + bundle.facts.networkDomains[i])
-        add(lines, "network.entry." + intToStr(i) + ".topology_ref=" + bundle.facts.topologyRefs[i])
-        add(lines, "network.entry." + intToStr(i) + ".topology=" + bundle.lowPlan.topologyCanonicalForms[i])
-        add(lines, "network.entry." + intToStr(i) + ".addressing=" + bundle.lowPlan.addressingModes[i])
-        add(lines, "network.entry." + intToStr(i) + ".depth=" + intToStr(bundle.lowPlan.topologyDepths[i]))
-        add(lines, "network.entry." + intToStr(i) + ".address_binding=" + bundle.lowPlan.addressBindings[i])
-        add(lines, "network.entry." + intToStr(i) + ".distance_metric=" + bundle.lowPlan.distanceMetrics[i])
-        add(lines, "network.entry." + intToStr(i) + ".route_plan_model=" + bundle.lowPlan.routePlanModels[i])
-        add(lines, "network.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
-        add(lines, "network.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
-        add(lines, "network.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
-        add(lines, "network.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
-        add(lines, "network.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
-        add(lines, "network.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
-        add(lines, "network.entry." + intToStr(i) + ".content_cid=" + binding.contentCid)
-        add(lines, "network.entry." + intToStr(i) + ".source_address=" + binding.sourceAddressText)
-        add(lines, "network.entry." + intToStr(i) + ".target_address=" + binding.targetAddressText)
-        add(lines, "network.entry." + intToStr(i) + ".route_plan_cid=" + binding.routePlanCid)
-        add(lines, "network.entry." + intToStr(i) + ".route_path_count=" + intToStr(binding.routePathCount))
-        add(lines, "network.entry." + intToStr(i) + ".total_distance=" + intToStr(binding.totalDistance))
+        seqs.add(lines, "network.entry." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".domain=" + bundle.facts.networkDomains[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".topology_ref=" + bundle.facts.topologyRefs[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".topology=" + bundle.lowPlan.topologyCanonicalForms[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".addressing=" + bundle.lowPlan.addressingModes[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".depth=" + intToStr(bundle.lowPlan.topologyDepths[i]))
+        seqs.add(lines, "network.entry." + intToStr(i) + ".address_binding=" + bundle.lowPlan.addressBindings[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".distance_metric=" + bundle.lowPlan.distanceMetrics[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".route_plan_model=" + bundle.lowPlan.routePlanModels[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".transport=" + bundle.lowPlan.transportModes[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".repair=" + bundle.lowPlan.repairModes[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".dispersal=" + bundle.lowPlan.dispersalModes[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".priority=" + bundle.lowPlan.priorityClasses[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".identity=" + bundle.lowPlan.identityScopes[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".signature=" + bundle.lowPlan.antiEntropySignatureKinds[i])
+        seqs.add(lines, "network.entry." + intToStr(i) + ".content_cid=" + binding.contentCid)
+        seqs.add(lines, "network.entry." + intToStr(i) + ".source_address=" + binding.sourceAddressText)
+        seqs.add(lines, "network.entry." + intToStr(i) + ".target_address=" + binding.targetAddressText)
+        seqs.add(lines, "network.entry." + intToStr(i) + ".route_plan_cid=" + binding.routePlanCid)
+        seqs.add(lines, "network.entry." + intToStr(i) + ".route_path_count=" + intToStr(binding.routePathCount))
+        seqs.add(lines, "network.entry." + intToStr(i) + ".total_distance=" + intToStr(binding.totalDistance))
         for j in 0..<binding.routePathCount:
             let pattern = "path." + intToStr(j) + "="
             let start = parser.findText(binding.routePlanText, pattern)
             if start < 0:
-                panic("v2 release artifact: missing lsmr route path")
+                system.panicStr("v2 release artifact: missing lsmr route path")
             var stop: int32 = start
             while stop < len(binding.routePlanText) && binding.routePlanText[stop] != '\n':
                 stop = stop + 1
             let rawLine = strings.sliceBytes(binding.routePlanText, start, stop - start)
-            add(lines, "network.entry." + intToStr(i) + ".route." + intToStr(j) + "=" +
+            seqs.add(lines, "network.entry." + intToStr(i) + ".route." + intToStr(j) + "=" +
                        strings.sliceBytes(rawLine, len(pattern), len(rawLine) - len(pattern)))
     return manifest.joinLines(lines)
 
@@ -392,67 +420,78 @@ fn buildCompilerCoreCompileKeyText(bundle: cpipe.CompilerCorePipelineBundle,
                                    objFormat: str): str =
     var lines: str[]
     lines = []
-    add(lines, "emit=" + emitKind)
-    add(lines, "target=" + targetTriple)
-    add(lines, "module_kind=compiler_core")
-    add(lines, "pipeline_version=" + bundle.version)
-    add(lines, "manifest_cid=" + manifestCid)
-    add(lines, "obj_format=" + objFormat)
-    add(lines, "machine_pipeline_version=" + machineBundle.version)
-    add(lines, "obj_image_version=" + objBundle.version)
-    add(lines, "obj_file_version=" + objFile.version)
-    add(lines, "native_link_plan_version=" + linkPlan.version)
-    add(lines, "system_link_plan_version=" + systemLink.version)
-    add(lines, "machine_architecture=" + machineBundle.architecture)
-    add(lines, "machine_text_section=" + machineBundle.textSectionName)
-    add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
-    add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
-    add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
-    add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
-    add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
-    add(lines, "system_link_output_kind=" + systemLink.outputKind)
-    add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
-    add(lines, "system_link_entry_required=" + if systemLink.entryRequired: "1" else: "0")
-    add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
+    seqs.add(lines, "emit=" + emitKind)
+    seqs.add(lines, "target=" + targetTriple)
+    seqs.add(lines, "module_kind=compiler_core")
+    seqs.add(lines, "compiler_core_execution_track=" + compilerCoreExecutionTrack(bundle.sourcePath))
+    seqs.add(lines, "pipeline_version=" + bundle.version)
+    seqs.add(lines, "manifest_cid=" + manifestCid)
+    seqs.add(lines, "obj_format=" + objFormat)
+    seqs.add(lines, "machine_pipeline_version=" + machineBundle.version)
+    seqs.add(lines, "obj_image_version=" + objBundle.version)
+    seqs.add(lines, "obj_file_version=" + objFile.version)
+    seqs.add(lines, "native_link_plan_version=" + linkPlan.version)
+    seqs.add(lines, "system_link_plan_version=" + systemLink.version)
+    seqs.add(lines, "machine_architecture=" + machineBundle.architecture)
+    seqs.add(lines, "machine_text_section=" + machineBundle.textSectionName)
+    seqs.add(lines, "machine_call_relocation=" + machineBundle.callRelocationKind)
+    seqs.add(lines, "machine_metadata_page_relocation=" + machineBundle.metadataPageRelocationKind)
+    seqs.add(lines, "machine_metadata_pageoff_relocation=" + machineBundle.metadataPageoffRelocationKind)
+    seqs.add(lines, "machine_stack_align=" + intToStr(machineBundle.stackAlignBytes))
+    seqs.add(lines, "system_link_linker_flavor=" + systemLink.linkerFlavor)
+    seqs.add(lines, "system_link_output_kind=" + systemLink.outputKind)
+    seqs.add(lines, "system_link_output_suffix=" + systemLink.outputSuffix)
+    var systemLinkEntryRequiredText: str = "0"
+    if systemLink.entryRequired:
+        systemLinkEntryRequiredText = "1"
+    seqs.add(lines, "system_link_entry_required=" + systemLinkEntryRequiredText)
+    seqs.add(lines, "system_link_entry_symbol=" + systemLink.entrySymbol)
     appendSystemLinkProviderReportLines(lines, systemLink)
-    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    seqs.add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
     for i in 0..<systemLink.missingReasons.len:
-        add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
-    add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
-    add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+        seqs.add(lines, "system_link.missing_reason." + intToStr(i) + "=" + systemLink.missingReasons[i])
+    seqs.add(lines, "native_link_provider_count=" + intToStr(linkPlan.providerModules.len))
+    seqs.add(lines, "native_link_runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
     for i in 0..<linkPlan.providerModules.len:
-        add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
+        seqs.add(lines, "native_link.provider." + intToStr(i) + "=" + linkPlan.providerModules[i])
     for i in 0..<linkPlan.runtimeTargets.len:
-        add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
-    add(lines, "compiler_core_top_level_count=" + intToStr(bundle.program.topLevelKinds.len))
-    add(lines, "compiler_core_module_count=" + intToStr(bundle.program.modules.len))
-    add(lines, "compiler_core_import_count=" + intToStr(bundle.program.imports.len))
-    add(lines, "compiler_core_type_block_count=" + intToStr(bundle.program.typeBlocks.len))
-    add(lines, "compiler_core_const_count=" + intToStr(bundle.program.constDecls.len))
-    add(lines, "compiler_core_var_count=" + intToStr(bundle.program.varDecls.len))
-    add(lines, "compiler_core_routine_count=" + intToStr(bundle.program.routines.len))
+        seqs.add(lines, "native_link.required." + intToStr(i) + "=" + linkPlan.runtimeTargets[i])
+    seqs.add(lines, "compiler_core_top_level_count=" + intToStr(bundle.program.topLevelKinds.len))
+    seqs.add(lines, "compiler_core_module_count=" + intToStr(bundle.program.modules.len))
+    seqs.add(lines, "compiler_core_import_count=" + intToStr(bundle.program.imports.len))
+    seqs.add(lines, "compiler_core_type_block_count=" + intToStr(bundle.program.typeBlocks.len))
+    seqs.add(lines, "compiler_core_const_count=" + intToStr(bundle.program.constDecls.len))
+    seqs.add(lines, "compiler_core_var_count=" + intToStr(bundle.program.varDecls.len))
+    seqs.add(lines, "compiler_core_routine_count=" + intToStr(bundle.program.routines.len))
     for i in 0..<bundle.lowPlan.itemIds.len:
-        add(lines, "compiler_core.item." + intToStr(i) + ".kind=" + bundle.lowPlan.topLevelKinds[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".label=" + bundle.lowPlan.labels[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".binding_scope=" + bundle.lowPlan.bindingScopes[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".import_path=" + bundle.lowPlan.importPaths[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".import_alias=" + bundle.lowPlan.importAliases[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".import_category=" + bundle.lowPlan.importCategories[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".body_line_count=" + intToStr(bundle.lowPlan.bodyLineCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".ast_ready=" + if bundle.lowPlan.executableAstReady[i]: "1" else: "0")
-        add(lines, "compiler_core.item." + intToStr(i) + ".return_type=" + bundle.lowPlan.returnTypeTexts[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".param_count=" + intToStr(bundle.lowPlan.paramCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".local_count=" + intToStr(bundle.lowPlan.localCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".stmt_count=" + intToStr(bundle.lowPlan.stmtCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".expr_count=" + intToStr(bundle.lowPlan.exprCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_count=" + intToStr(bundle.lowPlan.routineOpCounts[i]))
-        add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_hash=" + bundle.lowPlan.routineOpHashes[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".signature_hash=" + bundle.lowPlan.signatureHashes[i])
-        add(lines, "compiler_core.item." + intToStr(i) + ".body_hash=" + bundle.lowPlan.bodyHashes[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".kind=" + bundle.lowPlan.topLevelKinds[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".label=" + bundle.lowPlan.labels[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".op=" + bundle.lowPlan.canonicalOps[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".runtime=" + bundle.lowPlan.runtimeTargets[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".proof=" + bundle.lowPlan.proofDomains[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".effect=" + bundle.lowPlan.effectClasses[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".binding_scope=" + bundle.lowPlan.bindingScopes[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".import_path=" + bundle.lowPlan.importPaths[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".import_alias=" + bundle.lowPlan.importAliases[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".import_category=" + bundle.lowPlan.importCategories[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".body_line_count=" + intToStr(bundle.lowPlan.bodyLineCounts[i]))
+        var astReadyText: str = "0"
+        if bundle.lowPlan.executableAstReady[i]:
+            astReadyText = "1"
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".ast_ready=" + astReadyText)
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".return_type=" + bundle.lowPlan.returnTypeTexts[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".param_count=" + intToStr(bundle.lowPlan.paramCounts[i]))
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".local_count=" + intToStr(bundle.lowPlan.localCounts[i]))
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".stmt_count=" + intToStr(bundle.lowPlan.stmtCounts[i]))
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".expr_count=" + intToStr(bundle.lowPlan.exprCounts[i]))
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".stmt_kind_set=" + bundle.lowPlan.stmtKindSets[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".expr_kind_set=" + bundle.lowPlan.exprKindSets[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".stmt_semantic_set=" + bundle.lowPlan.stmtSemanticSets[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".expr_semantic_set=" + bundle.lowPlan.exprSemanticSets[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_count=" + intToStr(bundle.lowPlan.routineOpCounts[i]))
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".exec_op_hash=" + bundle.lowPlan.routineOpHashes[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".signature_hash=" + bundle.lowPlan.signatureHashes[i])
+        seqs.add(lines, "compiler_core.item." + intToStr(i) + ".body_hash=" + bundle.lowPlan.bodyHashes[i])
     return manifest.joinLines(lines)
 
 fn releaseArtifactCompileKeyHasLine(bundle: ReleaseArtifactBundle, line: str): bool =
@@ -468,11 +507,18 @@ fn releaseArtifactManifestRoot(sourcePath: str): str =
 
 fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): ReleaseArtifactBundle =
     requireEmitKind(emitKind)
-    let parsed = parser.parseV2SourceFileStrict(sourcePath)
-    let manifestBundle = if parsed.compilerCoreProgram.topLevelKinds.len > 0:
-        manifest.resolveCompilerCoreSourceManifest(sourcePath)
+    let sourceText = os.readFile(sourcePath)
+    let parsed = parser.parseV2SourceTextStrict(sourcePath, sourceText)
+    var manifestBundle: manifest.SourceManifestBundle
+    var noPointerRootPath: str = ""
+    var noPointerReport: npfacts.V2NoPointerManifestReport
+    if parsed.compilerCoreProgram.topLevelKinds.len > 0:
+        manifestBundle = manifest.resolveCompilerCoreSourceManifest(sourcePath)
+        noPointerRootPath = manifest.findWorkspaceRoot(sourcePath)
     else:
-        manifest.resolveSourceManifest(releaseArtifactManifestRoot(sourcePath))
+        noPointerRootPath = releaseArtifactManifestRoot(sourcePath)
+        manifestBundle = manifest.resolveSourceManifest(noPointerRootPath)
+    noPointerReport = npfacts.requireV2NoPointerManifestFree(noPointerRootPath, manifestBundle)
     let machine = mtarget.machineTargetContract()
     let writer = owriter.objWriterContract()
     let objFormat = objFormatForTarget(targetTriple)
@@ -490,7 +536,10 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
     var systemLink: slink.SystemLinkPlanBundle
     if parsed.networkProgram.topologies.len > 0 || parsed.networkProgram.ops.len > 0:
         let bundle = npipe.compileNetworkDistributionProgram(parsed.networkProgram)
-        moduleKind = if parsed.networkProgram.ops.len > 0: "network_distribution" else: "topology"
+        if parsed.networkProgram.ops.len > 0:
+            moduleKind = "network_distribution"
+        else:
+            moduleKind = "topology"
         pipelineVersion = bundle.version
         surfaceCount = bundle.program.topologies.len + bundle.program.ops.len
         topologyCount = bundle.program.topologies.len
@@ -500,10 +549,15 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
         objFile = ofile.buildObjFile(machineBundle)
         linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
         if linkPlan.unresolvedTargets.len > 0:
-            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+            system.panicStr("v2 release artifact: unresolved native link closure for " + moduleKind)
         systemLink = slink.buildSystemLinkPlan(machineBundle,
                                                objFile,
                                                emitKind,
+                                               manifestBundle.filePaths.len,
+                                               noPointerReport.checkedFileCount,
+                                               noPointerReport.checkedCompilerCoreSurfaceFileCount,
+                                               noPointerReport.checkedLineSurfaceFileCount,
+                                               true,
                                                linkPlan.providerModules,
                                                [],
                                                [],
@@ -529,10 +583,15 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
         objFile = ofile.buildObjFile(machineBundle)
         linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
         if linkPlan.unresolvedTargets.len > 0:
-            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+            system.panicStr("v2 release artifact: unresolved native link closure for " + moduleKind)
         systemLink = slink.buildSystemLinkPlan(machineBundle,
                                                objFile,
                                                emitKind,
+                                               manifestBundle.filePaths.len,
+                                               noPointerReport.checkedFileCount,
+                                               noPointerReport.checkedCompilerCoreSurfaceFileCount,
+                                               noPointerReport.checkedLineSurfaceFileCount,
+                                               true,
                                                linkPlan.providerModules,
                                                [],
                                                [],
@@ -558,10 +617,15 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
         objFile = ofile.buildObjFile(machineBundle)
         linkPlan = buildNativeLinkPlan(machineBundle, emitKind, targetTriple)
         if linkPlan.unresolvedTargets.len > 0:
-            panic("v2 release artifact: unresolved native link closure for " + moduleKind)
+            system.panicStr("v2 release artifact: unresolved native link closure for " + moduleKind)
         systemLink = slink.buildSystemLinkPlan(machineBundle,
                                                objFile,
                                                emitKind,
+                                               manifestBundle.filePaths.len,
+                                               noPointerReport.checkedFileCount,
+                                               noPointerReport.checkedCompilerCoreSurfaceFileCount,
+                                               noPointerReport.checkedLineSurfaceFileCount,
+                                               true,
                                                linkPlan.providerModules,
                                                bundle.lowPlan.itemIds,
                                                bundle.lowPlan.labels,
@@ -577,47 +641,64 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
                                                          manifestBundle.manifestCid,
                                                          objFormat)
     else:
-        panic("v2 release artifact: no supported surface in " + sourcePath)
+        system.panicStr("v2 release artifact: no supported surface in " + sourcePath)
     let compileKey = ident.sha256HexText(compileKeyText)
     var lines: str[]
     lines = []
-    add(lines, "artifact_version=" + releaseArtifactVersion())
-    add(lines, "source=" + sourcePath)
-    add(lines, "emit=" + emitKind)
-    add(lines, "target=" + targetTriple)
-    add(lines, "module_kind=" + moduleKind)
-    add(lines, "pipeline_version=" + pipelineVersion)
-    add(lines, "surface_count=" + intToStr(surfaceCount))
-    add(lines, "machine_version=" + machine.version)
-    add(lines, "machine_pipeline_version=" + machineBundle.version)
-    add(lines, "obj_writer_version=" + writer.version)
-    add(lines, "obj_image_version=" + objBundle.version)
-    add(lines, "obj_file_version=" + objFile.version)
-    add(lines, "obj_format=" + objFormat)
-    add(lines, "manifest_cid=" + manifestBundle.manifestCid)
-    add(lines, "compile_key=" + compileKey)
-    add(lines, "obj_image_cid=" + objBundle.imageCid)
-    add(lines, "obj_file_cid=" + objFile.fileCid)
-    add(lines, "obj_file_byte_count=" + intToStr(objFile.fileByteCount))
-    add(lines, "obj_section_count=" + intToStr(objBundle.sectionNames.len))
-    add(lines, "obj_symbol_count=" + intToStr(objBundle.symbolNames.len))
-    add(lines, "obj_reloc_count=" + intToStr(objBundle.relocationOffsets.len))
-    add(lines, "link_plan_version=" + linkPlan.version)
-    add(lines, "link_plan_cid=" + linkPlan.planCid)
-    add(lines, "system_link_plan_version=" + systemLink.version)
-    add(lines, "system_link_plan_cid=" + systemLink.planCid)
-    add(lines, "runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
-    add(lines, "runtime_unresolved_count=" + intToStr(linkPlan.unresolvedTargets.len))
-    add(lines, "native_link_closure_ok=" + if linkPlan.unresolvedTargets.len == 0: "1" else: "0")
-    add(lines, "system_link_ready=" + if systemLink.missingReasons.len == 0: "1" else: "0")
-    add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
+    seqs.add(lines, "artifact_version=" + releaseArtifactVersion())
+    seqs.add(lines, "source=" + sourcePath)
+    seqs.add(lines, "emit=" + emitKind)
+    seqs.add(lines, "target=" + targetTriple)
+    seqs.add(lines, "module_kind=" + moduleKind)
+    if moduleKind == "compiler_core":
+        seqs.add(lines, "compiler_core_execution_track=" + compilerCoreExecutionTrack(sourcePath))
+    seqs.add(lines, "pipeline_version=" + pipelineVersion)
+    seqs.add(lines, "surface_count=" + intToStr(surfaceCount))
+    seqs.add(lines, "machine_version=" + machine.version)
+    seqs.add(lines, "machine_pipeline_version=" + machineBundle.version)
+    seqs.add(lines, "obj_writer_version=" + writer.version)
+    seqs.add(lines, "obj_image_version=" + objBundle.version)
+    seqs.add(lines, "obj_file_version=" + objFile.version)
+    seqs.add(lines, "obj_format=" + objFormat)
+    seqs.add(lines, "manifest_cid=" + manifestBundle.manifestCid)
+    seqs.add(lines, "manifest_file_count=" + intToStr(manifestBundle.filePaths.len))
+    seqs.add(lines, "no_pointer_checked_file_count=" + intToStr(noPointerReport.checkedFileCount))
+    seqs.add(lines,
+             "no_pointer_checked_compiler_core_surface_file_count=" +
+             intToStr(noPointerReport.checkedCompilerCoreSurfaceFileCount))
+    seqs.add(lines,
+             "no_pointer_checked_line_surface_file_count=" +
+             intToStr(noPointerReport.checkedLineSurfaceFileCount))
+    seqs.add(lines, "no_pointer_closure_ok=1")
+    seqs.add(lines, "compile_key=" + compileKey)
+    seqs.add(lines, "obj_image_cid=" + objBundle.imageCid)
+    seqs.add(lines, "obj_file_cid=" + objFile.fileCid)
+    seqs.add(lines, "obj_file_byte_count=" + intToStr(objFile.fileByteCount))
+    seqs.add(lines, "obj_section_count=" + intToStr(objBundle.sectionNames.len))
+    seqs.add(lines, "obj_symbol_count=" + intToStr(objBundle.symbolNames.len))
+    seqs.add(lines, "obj_reloc_count=" + intToStr(objBundle.relocationOffsets.len))
+    seqs.add(lines, "link_plan_version=" + linkPlan.version)
+    seqs.add(lines, "link_plan_cid=" + linkPlan.planCid)
+    seqs.add(lines, "system_link_plan_version=" + systemLink.version)
+    seqs.add(lines, "system_link_plan_cid=" + systemLink.planCid)
+    seqs.add(lines, "runtime_target_count=" + intToStr(linkPlan.runtimeTargets.len))
+    seqs.add(lines, "runtime_unresolved_count=" + intToStr(linkPlan.unresolvedTargets.len))
+    var nativeLinkClosureOkText: str = "0"
+    if linkPlan.unresolvedTargets.len == 0:
+        nativeLinkClosureOkText = "1"
+    var systemLinkReadyText: str = "0"
+    if systemLink.missingReasons.len == 0:
+        systemLinkReadyText = "1"
+    seqs.add(lines, "native_link_closure_ok=" + nativeLinkClosureOkText)
+    seqs.add(lines, "system_link_ready=" + systemLinkReadyText)
+    seqs.add(lines, "system_link_missing_reason_count=" + intToStr(systemLink.missingReasons.len))
     if moduleKind == "network_distribution" || moduleKind == "topology":
-        add(lines, "topology_count=" + intToStr(topologyCount))
-        add(lines, "network_entry_count=" + intToStr(networkEntryCount))
+        seqs.add(lines, "topology_count=" + intToStr(topologyCount))
+        seqs.add(lines, "network_entry_count=" + intToStr(networkEntryCount))
     elif moduleKind == "compiler_core":
-        add(lines, "compiler_core_entry_count=" + intToStr(compilerCoreEntryCount))
+        seqs.add(lines, "compiler_core_entry_count=" + intToStr(compilerCoreEntryCount))
     else:
-        add(lines, "unimaker_entry_count=" + intToStr(surfaceCount))
+        seqs.add(lines, "unimaker_entry_count=" + intToStr(surfaceCount))
     var out: ReleaseArtifactBundle
     out.version = releaseArtifactVersion()
     out.sourcePath = sourcePath
@@ -631,6 +712,11 @@ fn buildReleaseArtifact(sourcePath: str, emitKind: str, targetTriple: str): Rele
     out.objFileVersion = objFile.version
     out.objFormat = objFormat
     out.manifestCid = manifestBundle.manifestCid
+    out.manifestFileCount = manifestBundle.filePaths.len
+    out.noPointerCheckedFileCount = noPointerReport.checkedFileCount
+    out.noPointerCheckedCompilerCoreSurfaceFileCount = noPointerReport.checkedCompilerCoreSurfaceFileCount
+    out.noPointerCheckedLineSurfaceFileCount = noPointerReport.checkedLineSurfaceFileCount
+    out.noPointerClosureOk = true
     out.compileKey = compileKey
     out.compileKeyText = compileKeyText
     out.objImageCid = objBundle.imageCid

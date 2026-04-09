@@ -1,0 +1,164 @@
+import std/result
+import std/seqs as seqops
+import cheng/quic/chain/types
+import cheng/quic/chain/content_address
+import cheng/quic/chain/lsmr
+import cheng/quic/chain/dispersal
+
+fn chainBroadcastPushUniqueAddress(values: var LsmrAddress[], value: LsmrAddress) =
+    for i in 0..<values.len:
+        if values[i].text == value.text:
+            return
+    seqops.add(values, value)
+
+fn chainBroadcastPlanCanonicalText(plan: ChainBroadcastPlan): str =
+    var out: str = ""
+    out = out + "version=" + plan.version + "\n"
+    out = out + "root=" + plan.rootAddressText + "\n"
+    out = out + "depth=" + intToStr(plan.depth) + "\n"
+    out = out + "target_count=" + intToStr(plan.targetCount) + "\n"
+    out = out + "payload_cid=" + plan.payloadCid + "\n"
+    out = out + "payload_len=" + intToStr(plan.payloadLen) + "\n"
+    out = out + "data_shard_count=" + intToStr(plan.dataShardCount) + "\n"
+    out = out + "total_shard_count=" + intToStr(plan.totalShardCount) + "\n"
+    out = out + "tree_cid=" + plan.treeCid + "\n"
+    out = out + "dispersal_cid=" + plan.dispersalCid + "\n"
+    out = out + "branch_count=" + intToStr(plan.branchDigits.len) + "\n"
+    for i in 0..<plan.branchDigits.len:
+        out = out + "branch." + intToStr(i) + ".digit=" + intToStr(plan.branchDigits[i]) + "\n"
+        out = out + "branch." + intToStr(i) + ".target_count=" + intToStr(plan.branchTargetCounts[i]) + "\n"
+        out = out + "branch." + intToStr(i) + ".targets=" + plan.branchTargetTexts[i] + "\n"
+        out = out + "branch." + intToStr(i) + ".paths=" + plan.branchPathTexts[i] + "\n"
+        out = out + "branch." + intToStr(i) + ".fragment_start=" + intToStr(plan.branchFragmentStarts[i]) + "\n"
+        out = out + "branch." + intToStr(i) + ".fragment_count=" + intToStr(plan.branchFragmentCounts[i]) + "\n"
+    for i in 0..<plan.fragmentDigits.len:
+        out = out + "fragment." + intToStr(i) + ".digit=" + intToStr(plan.fragmentDigits[i]) + "\n"
+        out = out + "fragment." + intToStr(i) + ".x=" + intToStr(plan.fragmentXValues[i]) + "\n"
+        out = out + "fragment." + intToStr(i) + ".values=" + plan.fragmentValueTexts[i] + "\n"
+    return out
+
+fn chainBroadcastBranchPos(plan: ChainBroadcastPlan, digit: int32): int32 =
+    for i in 0..<plan.branchDigits.len:
+        if plan.branchDigits[i] == digit:
+            return i
+    return -1
+
+fn chainBroadcastAssignFragmentOwners(tree: LsmrMulticastTree, plan: ChainDispersalPlan): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<plan.fragmentDigits.len:
+        seqops.add(out, -1)
+    for branchPos in 0..<tree.branchDigits.len:
+        let fragmentPos = chainDispersalFragmentPos(plan, tree.branchDigits[branchPos])
+        if fragmentPos >= 0 && out[fragmentPos] < 0:
+            out[fragmentPos] = branchPos
+    if tree.branchDigits.len <= 0:
+        return out
+    var nextBranch: int32 = 0
+    for fragmentPos in 0..<out.len:
+        if out[fragmentPos] >= 0:
+            continue
+        out[fragmentPos] = nextBranch
+        nextBranch = nextBranch + 1
+        if nextBranch >= tree.branchDigits.len:
+            nextBranch = 0
+    return out
+
+fn chainBuildBroadcastPlanFromAddresses(rootAddress: LsmrAddress,
+                                        targetAddresses: LsmrAddress[],
+                                        payloadText: str,
+                                        dataShardCount: int32,
+                                        totalShardCount: int32): Result[ChainBroadcastPlan] =
+    let dispersalRes = chainDisperseText(payloadText, dataShardCount, totalShardCount)
+    if IsErr(dispersalRes):
+        return Err[ChainBroadcastPlan](ErrorText(dispersalRes))
+    let dispersalPlan = Value(dispersalRes)
+    let tree = chainLsmrBuildMulticastTreeFromAddresses(rootAddress, targetAddresses)
+    let owners = chainBroadcastAssignFragmentOwners(tree, dispersalPlan)
+    var out = emptyChainBroadcastPlan()
+    out.rootAddressText = tree.rootAddressText
+    out.depth = tree.depth
+    out.targetCount = tree.targetCount
+    out.payloadCid = dispersalPlan.payloadCid
+    out.payloadLen = dispersalPlan.payloadLen
+    out.dataShardCount = dispersalPlan.dataShardCount
+    out.totalShardCount = dispersalPlan.totalShardCount
+    out.treeCid = tree.routeCid
+    out.dispersalCid = chainDispersalPlanCid(dispersalPlan)
+    for branchPos in 0..<tree.branchDigits.len:
+        seqops.add(out.branchDigits, tree.branchDigits[branchPos])
+        seqops.add(out.branchTargetCounts, tree.branchTargetCounts[branchPos])
+        seqops.add(out.branchTargetTexts, tree.branchTargetTexts[branchPos])
+        seqops.add(out.branchPathTexts, tree.branchPathTexts[branchPos])
+        seqops.add(out.branchFragmentStarts, out.fragmentDigits.len)
+        var count: int32 = 0
+        for fragmentPos in 0..<owners.len:
+            if owners[fragmentPos] != branchPos:
+                continue
+            seqops.add(out.fragmentDigits, dispersalPlan.fragmentDigits[fragmentPos])
+            seqops.add(out.fragmentXValues, dispersalPlan.fragmentXValues[fragmentPos])
+            seqops.add(out.fragmentValueTexts, dispersalPlan.fragmentValueTexts[fragmentPos])
+            count = count + 1
+        seqops.add(out.branchFragmentCounts, count)
+    out.planCid = chainCidFromText(chainBroadcastPlanCanonicalText(out))
+    return Ok[ChainBroadcastPlan](out)
+
+fn chainBuildBroadcastPlan(rootSeed: str,
+                           targetSeeds: str[],
+                           payloadText: str,
+                           depth: int32,
+                           dataShardCount: int32,
+                           totalShardCount: int32): Result[ChainBroadcastPlan] =
+    let rootAddress = chainLsmrAddressFromSeed(rootSeed, depth)
+    var targetAddresses: LsmrAddress[]
+    targetAddresses = []
+    for i in 0..<targetSeeds.len:
+        chainBroadcastPushUniqueAddress(targetAddresses, chainLsmrAddressFromSeed(targetSeeds[i], depth))
+    return chainBuildBroadcastPlanFromAddresses(rootAddress,
+                                                targetAddresses,
+                                                payloadText,
+                                                dataShardCount,
+                                                totalShardCount)
+
+fn chainBroadcastBranchDispersalPlan(plan: ChainBroadcastPlan, branchDigit: int32): ChainDispersalPlan =
+    var out = emptyChainDispersalPlan()
+    out.payloadCid = plan.payloadCid
+    out.payloadLen = plan.payloadLen
+    out.dataShardCount = plan.dataShardCount
+    let branchPos = chainBroadcastBranchPos(plan, branchDigit)
+    if branchPos < 0:
+        out.totalShardCount = 0
+        return out
+    let start = plan.branchFragmentStarts[branchPos]
+    let count = plan.branchFragmentCounts[branchPos]
+    out.totalShardCount = count
+    for i in 0..<count:
+        let fragmentPos = start + i
+        seqops.add(out.fragmentDigits, plan.fragmentDigits[fragmentPos])
+        seqops.add(out.fragmentXValues, plan.fragmentXValues[fragmentPos])
+        seqops.add(out.fragmentValueTexts, plan.fragmentValueTexts[fragmentPos])
+    return out
+
+fn chainBroadcastRecoverText(plan: ChainBroadcastPlan, branchDigits: int32[]): Result[str] =
+    var subset = emptyChainDispersalPlan()
+    subset.payloadCid = plan.payloadCid
+    subset.payloadLen = plan.payloadLen
+    subset.dataShardCount = plan.dataShardCount
+    var usedDigits: int32[]
+    usedDigits = []
+    for i in 0..<branchDigits.len:
+        var duplicate = false
+        for j in 0..<usedDigits.len:
+            if usedDigits[j] == branchDigits[i]:
+                duplicate = true
+                break
+        if duplicate:
+            continue
+        seqops.add(usedDigits, branchDigits[i])
+        let branchPlan = chainBroadcastBranchDispersalPlan(plan, branchDigits[i])
+        for j in 0..<branchPlan.fragmentDigits.len:
+            seqops.add(subset.fragmentDigits, branchPlan.fragmentDigits[j])
+            seqops.add(subset.fragmentXValues, branchPlan.fragmentXValues[j])
+            seqops.add(subset.fragmentValueTexts, branchPlan.fragmentValueTexts[j])
+        subset.totalShardCount = subset.fragmentDigits.len
+    return chainRecoverText(subset)

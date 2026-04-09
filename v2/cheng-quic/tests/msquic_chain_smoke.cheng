@@ -1,0 +1,757 @@
+import std/result
+import std/os
+import std/seqs as seqops
+import std/strings
+import cheng/quic/connection
+import cheng/quic/chain/types
+import cheng/quic/chain/node
+import cheng/quic/chain/log
+import cheng/quic/chain/codec
+import cheng/quic/chain/content_address
+import cheng/quic/chain/lsmr
+import cheng/quic/chain/dispersal
+import cheng/quic/chain/broadcast
+import cheng/quic/chain/anti_entropy
+import cheng/quic/chain/consensus
+
+fn chainSmokeRoot(name: str): str =
+    return os.joinPath("/Users/lbcheng/cheng-lang/v2/cheng-quic/artifacts", name)
+
+fn chainSmokeRemovePathRec(path: str): bool =
+    if path == "":
+        return true
+    if os.fileExists(path):
+        return os.removeFile(path)
+    return ! os.dirExists(path)
+
+fn chainSmokeResetRoot(root: str): bool =
+    if root == "":
+        return true
+    let blocksDir = os.joinPath(root, "blocks")
+    if os.dirExists(blocksDir):
+        let blockItems = os.walkDir(blocksDir)
+        for i in 0..<blockItems.len:
+            let blockEntry = os.os_get_WalkDirEntry(blockItems, i)
+            let blockPath = os.walkDirEntryPath(blockEntry)
+            if os.fileExists(blockPath) && ! os.removeFile(blockPath):
+                return false
+        os.removeDir(blocksDir)
+        if os.dirExists(blocksDir):
+            return false
+    let chainDir = os.joinPath(root, "chain")
+    if os.dirExists(chainDir):
+        let chainItems = os.walkDir(chainDir)
+        for i in 0..<chainItems.len:
+            let chainEntry = os.os_get_WalkDirEntry(chainItems, i)
+            let chainPath = os.walkDirEntryPath(chainEntry)
+            if os.fileExists(chainPath) && ! os.removeFile(chainPath):
+                return false
+        os.removeDir(chainDir)
+        if os.dirExists(chainDir):
+            return false
+    if os.dirExists(root):
+        os.removeDir(root)
+    return ! os.dirExists(root)
+
+fn chainSmokeConfig(rootName: str, nodeId: str): ChainNodeConfig =
+    var cfg = defaultChainNodeConfig()
+    cfg.rootDir = chainSmokeRoot(rootName)
+    cfg.nodeId = nodeId
+    cfg.listenAddrText = "/ip4/127.0.0.1/udp/0/quic-v1"
+    return cfg
+
+fn chainSmokeStart(node: var ChainNode): Result[bool] =
+    return chainNodeEnsureStarted(node)
+
+fn chainSmokeHello(client: ChainNode, clientConn: var Connection,
+                   server: var ChainNode, serverConn: var Connection): Result[str] =
+    let writeRes = chainWriteHello(client, clientConn)
+    if IsErr(writeRes):
+        return Err[str](ErrorText(writeRes))
+    let serverFrameRes = chainReadFrame(serverConn)
+    if IsErr(serverFrameRes):
+        return Err[str](ErrorText(serverFrameRes))
+    var remotePeer: str = ""
+    let handleRes = chainNodeHandleFrame(server, serverConn, Value(serverFrameRes), remotePeer)
+    if IsErr(handleRes):
+        return Err[str](ErrorText(handleRes))
+    let helloRes = chainReadHello(clientConn)
+    if IsErr(helloRes):
+        return Err[str](ErrorText(helloRes))
+    return Ok[str](Value(helloRes).nodeId)
+
+fn chainSmokeWantStateSubtree(client: ChainNode,
+                              clientConn: var Connection,
+                              server: var ChainNode,
+                              serverConn: var Connection,
+                              remotePeer: str,
+                              refText: str): Result[ChainAntiEntropyStateSubtree] =
+    var wantSubtree = emptyChainFrame("WANT_STATE_SUBTREE")
+    wantSubtree.nodeId = client.cfg.nodeId
+    wantSubtree.peerId = remotePeer
+    wantSubtree.payloadText = chainAntiEntropyStateSubtreeRequestText(
+        chainAntiEntropyStateSubtreeRefLayer(refText),
+        chainAntiEntropyStateSubtreeRefBagua(refText),
+        chainAntiEntropyStateSubtreeRefPrefix(refText))
+    let wantSubtreeWriteRes = chainWriteFrame(clientConn, wantSubtree)
+    if IsErr(wantSubtreeWriteRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(wantSubtreeWriteRes))
+    let serverSubtreeWantRes = chainReadFrame(serverConn)
+    if IsErr(serverSubtreeWantRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(serverSubtreeWantRes))
+    var serverPeer: str = remotePeer
+    let subtreeHandleRes = chainNodeHandleFrame(server, serverConn, Value(serverSubtreeWantRes), serverPeer)
+    if IsErr(subtreeHandleRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(subtreeHandleRes))
+    let subtreePushRes = chainReadFrame(clientConn)
+    if IsErr(subtreePushRes):
+        return Err[ChainAntiEntropyStateSubtree](ErrorText(subtreePushRes))
+    if Value(subtreePushRes).kind != "PUSH_STATE_SUBTREE":
+        return Err[ChainAntiEntropyStateSubtree]("chain smoke: missing PUSH_STATE_SUBTREE")
+    return chainAntiEntropyStateSubtreeFromPayload(Value(subtreePushRes).payloadText)
+
+fn chainSmokeFetchRemoteEventText(client: ChainNode,
+                                  clientConn: var Connection,
+                                  server: var ChainNode,
+                                  serverConn: var Connection,
+                                  remotePeer: str,
+                                  cachedEventCids: var str[],
+                                  cachedEventTexts: var str[],
+                                  eventCid: str): Result[str] =
+    let cachedPos = chainAntiEntropyTextPos(cachedEventCids, eventCid)
+    if cachedPos >= 0:
+        return Ok[str](cachedEventTexts[cachedPos])
+    var want = emptyChainFrame("WANT_EVENT")
+    want.nodeId = client.cfg.nodeId
+    want.peerId = remotePeer
+    want.eventCid = eventCid
+    let wantWriteRes = chainWriteFrame(clientConn, want)
+    if IsErr(wantWriteRes):
+        return Err[str](ErrorText(wantWriteRes))
+    let serverWantRes = chainReadFrame(serverConn)
+    if IsErr(serverWantRes):
+        return Err[str](ErrorText(serverWantRes))
+    var serverPeer: str = remotePeer
+    let wantHandleRes = chainNodeHandleFrame(server, serverConn, Value(serverWantRes), serverPeer)
+    if IsErr(wantHandleRes):
+        return Err[str](ErrorText(wantHandleRes))
+    let pushRes = chainReadFrame(clientConn)
+    if IsErr(pushRes):
+        return Err[str](ErrorText(pushRes))
+    if Value(pushRes).kind != "PUSH_EVENT":
+        return Err[str]("chain smoke: missing PUSH_EVENT")
+    seqops.add(cachedEventCids, eventCid)
+    seqops.add(cachedEventTexts, Value(pushRes).payloadText)
+    return Ok[str](Value(pushRes).payloadText)
+
+fn chainSmokeSyncRemoteHead(client: var ChainNode,
+                            clientConn: var Connection,
+                            server: var ChainNode,
+                            serverConn: var Connection,
+                            remotePeer: str,
+                            key: str,
+                            remoteHeadCid: str): Result[int32] =
+    if remoteHeadCid == "":
+        return Ok[int32](0)
+    let localHeadCid = chainAccountHead(client.index, key)
+    if localHeadCid == remoteHeadCid:
+        return Ok[int32](0)
+    var stack: str[]
+    var expanded: bool[]
+    var cachedEventCids: str[]
+    var cachedEventTexts: str[]
+    stack = []
+    expanded = []
+    cachedEventCids = []
+    cachedEventTexts = []
+    seqops.add(stack, remoteHeadCid)
+    seqops.add(expanded, false)
+    var synced: int32 = 0
+    while stack.len > 0:
+        let top = stack.len - 1
+        let eventCid = stack[top]
+        if eventCid == "" ||
+           eventCid == localHeadCid ||
+           chainEventPos(client.index, eventCid) >= 0:
+            seqops.setLen(stack, top)
+            seqops.setLen(expanded, top)
+            continue
+        let eventTextRes = chainSmokeFetchRemoteEventText(client,
+                                                          clientConn,
+                                                          server,
+                                                          serverConn,
+                                                          remotePeer,
+                                                          cachedEventCids,
+                                                          cachedEventTexts,
+                                                          eventCid)
+        if IsErr(eventTextRes):
+            return Err[int32](ErrorText(eventTextRes))
+        let eventRes = chainEventFromText(Value(eventTextRes))
+        if IsErr(eventRes):
+            return Err[int32](ErrorText(eventRes))
+        let ev = Value(eventRes)
+        if ! expanded[top]:
+            expanded[top] = true
+            if ev.toParentCid != "" &&
+               ev.toParentCid != localHeadCid &&
+               ev.toParentCid != eventCid &&
+               chainEventPos(client.index, ev.toParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.toParentCid) < 0:
+                seqops.add(stack, ev.toParentCid)
+                seqops.add(expanded, false)
+            if ev.fromParentCid != "" &&
+               ev.fromParentCid != localHeadCid &&
+               ev.fromParentCid != eventCid &&
+               ev.fromParentCid != ev.toParentCid &&
+               chainEventPos(client.index, ev.fromParentCid) < 0 &&
+               chainAntiEntropyTextPos(stack, ev.fromParentCid) < 0:
+                seqops.add(stack, ev.fromParentCid)
+                seqops.add(expanded, false)
+            continue
+        let appendRes = chainAppendEvent(client, ev, remotePeer)
+        if IsErr(appendRes):
+            return Err[int32](ErrorText(appendRes))
+        if Value(appendRes) != eventCid:
+            return Err[int32]("chain smoke: pushed event cid mismatch")
+        synced = synced + 1
+        seqops.setLen(stack, top)
+        seqops.setLen(expanded, top)
+    return Ok[int32](synced)
+
+fn chainSmokeConvergeRemoteSubtree(client: var ChainNode,
+                                   clientConn: var Connection,
+                                   server: var ChainNode,
+                                   serverConn: var Connection,
+                                   remotePeer: str,
+                                   refText: str): Result[int32] =
+    let subtreeRes = chainSmokeWantStateSubtree(client, clientConn, server, serverConn, remotePeer, refText)
+    if IsErr(subtreeRes):
+        return Err[int32](ErrorText(subtreeRes))
+    let subtree = Value(subtreeRes)
+    let localTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(client.index), subtree.layer)
+    let localNodePos = chainLsmrBaguaTreeNodePos(localTree, subtree.bagua, subtree.prefixText)
+    let localNodeCid = localNodePos >= 0 ? localTree.nodeCids[localNodePos] : ""
+    let localDesc = localNodePos >= 0 ? localTree.nodeEntryDescCounts[localNodePos] : 0
+    if localNodeCid == subtree.nodeCid && localDesc == subtree.entryDescCount:
+        return Ok[int32](0)
+    var synced: int32 = 0
+    let nextRefs = chainAntiEntropyStateSubtreeWantChildRefs(client.index, subtree)
+    for i in 0..<nextRefs.len:
+        let childRes = chainSmokeConvergeRemoteSubtree(client,
+                                                       clientConn,
+                                                       server,
+                                                       serverConn,
+                                                       remotePeer,
+                                                       nextRefs[i])
+        if IsErr(childRes):
+            return Err[int32](ErrorText(childRes))
+        synced = synced + Value(childRes)
+    for i in 0..<subtree.entryKeys.len:
+        if chainAntiEntropyStateSubtreeEntryConflicts(client.index, subtree, i):
+            return Err[int32]("chain smoke: equal-clock state subtree conflict")
+        if subtree.entryDiverged[i]:
+            return Err[int32]("chain smoke: diverged subtree repair missing")
+        if ! chainAntiEntropyStateSubtreeEntryNeedsSync(client.index, subtree, i):
+            continue
+        let syncRes = chainSmokeSyncRemoteHead(client,
+                                               clientConn,
+                                               server,
+                                               serverConn,
+                                               remotePeer,
+                                               subtree.entryKeys[i],
+                                               subtree.entryHeadCids[i])
+        if IsErr(syncRes):
+            return Err[int32](ErrorText(syncRes))
+        synced = synced + Value(syncRes)
+    let refreshedTree = chainAntiEntropyStateLayerTree(chainAntiEntropyStateForest(client.index), subtree.layer)
+    let refreshedNodePos = chainLsmrBaguaTreeNodePos(refreshedTree, subtree.bagua, subtree.prefixText)
+    let refreshedNodeCid = refreshedNodePos >= 0 ? refreshedTree.nodeCids[refreshedNodePos] : ""
+    let refreshedDesc = refreshedNodePos >= 0 ? refreshedTree.nodeEntryDescCounts[refreshedNodePos] : 0
+    if refreshedNodeCid != subtree.nodeCid || refreshedDesc != subtree.entryDescCount:
+        return Err[int32]("chain smoke: subtree not converged ref=" +
+                          refText +
+                          " local_cid=" + refreshedNodeCid +
+                          " remote_cid=" + subtree.nodeCid +
+                          " local_desc=" + intToStr(refreshedDesc) +
+                          " remote_desc=" + intToStr(subtree.entryDescCount))
+    return Ok[int32](synced)
+
+fn chainSmokeSync(client: var ChainNode, clientConn: var Connection,
+                  server: var ChainNode, serverConn: var Connection, remotePeer: str): Result[int32] =
+    var advertise = emptyChainFrame("ADVERTISE_HEADS")
+    advertise.nodeId = client.cfg.nodeId
+    advertise.peerId = remotePeer
+    advertise.payloadText = chainAdvertisePayload(client.index)
+    let advWriteRes = chainWriteFrame(clientConn, advertise)
+    if IsErr(advWriteRes):
+        return Err[int32](ErrorText(advWriteRes))
+    let serverReqRes = chainReadFrame(serverConn)
+    if IsErr(serverReqRes):
+        return Err[int32](ErrorText(serverReqRes))
+    var serverPeer: str = remotePeer
+    let serverHandleRes = chainNodeHandleFrame(server, serverConn, Value(serverReqRes), serverPeer)
+    if IsErr(serverHandleRes):
+        return Err[int32](ErrorText(serverHandleRes))
+    let advReadRes = chainReadFrame(clientConn)
+    if IsErr(advReadRes):
+        return Err[int32](ErrorText(advReadRes))
+    let firstFrame = Value(advReadRes)
+    if firstFrame.kind != "ADVERTISE_HEADS":
+        return Err[int32]("chain smoke: missing remote ADVERTISE_HEADS")
+    let planRes = chainAntiEntropyPlan(client.index, firstFrame.payloadText)
+    if IsErr(planRes):
+        return Err[int32](ErrorText(planRes))
+    var synced: int32 = 0
+    if Value(planRes).wantStateSubtrees.len != 1:
+        return Err[int32]("chain smoke: expected single root subtree diff")
+    if chainAntiEntropyStateSubtreeRefLayer(Value(planRes).wantStateSubtrees[0]) != "regional":
+        return Err[int32]("chain smoke: expected regional subtree diff")
+    for i in 0..<Value(planRes).wantStateSubtrees.len:
+        let subtreeSyncRes = chainSmokeConvergeRemoteSubtree(client,
+                                                             clientConn,
+                                                             server,
+                                                             serverConn,
+                                                             remotePeer,
+                                                             Value(planRes).wantStateSubtrees[i])
+        if IsErr(subtreeSyncRes):
+            return Err[int32](ErrorText(subtreeSyncRes))
+        synced = synced + Value(subtreeSyncRes)
+    let sigAfterSyncServer = chainAntiEntropySignature(server.index)
+    let sigAfterSyncClient = chainAntiEntropySignature(client.index)
+    if sigAfterSyncServer.stateForestCid != sigAfterSyncClient.stateForestCid:
+        return Err[int32]("chain smoke: state forest mismatch after sync")
+    if sigAfterSyncServer.regionalTreeEntryCount != sigAfterSyncClient.regionalTreeEntryCount:
+        return Err[int32]("chain smoke: regional tree entry count mismatch after sync")
+    return Ok[int32](synced)
+
+fn chainSmokeTransfer(client: var ChainNode, clientConn: var Connection,
+                      server: var ChainNode, serverConn: var Connection, remotePeer: str): Result[str] =
+    let proposal = chainTransferProposeFrame(client, "alice", "bob", "cheng", 25)
+    let propWriteRes = chainWriteFrame(clientConn, proposal)
+    if IsErr(propWriteRes):
+        return Err[str](ErrorText(propWriteRes))
+    let serverPropRes = chainReadFrame(serverConn)
+    if IsErr(serverPropRes):
+        return Err[str](ErrorText(serverPropRes))
+    var serverPeer: str = remotePeer
+    let propHandleRes = chainNodeHandleFrame(server, serverConn, Value(serverPropRes), serverPeer)
+    if IsErr(propHandleRes):
+        return Err[str](ErrorText(propHandleRes))
+    let acceptRes = chainReadFrame(clientConn)
+    if IsErr(acceptRes):
+        return Err[str](ErrorText(acceptRes))
+    if Value(acceptRes).kind != "TRANSFER_ACCEPT":
+        return Err[str]("chain smoke: missing TRANSFER_ACCEPT")
+    let commitRes = chainReadFrame(clientConn)
+    if IsErr(commitRes):
+        return Err[str](ErrorText(commitRes))
+    if Value(commitRes).kind != "TRANSFER_COMMIT":
+        return Err[str]("chain smoke: missing TRANSFER_COMMIT")
+    let expected = chainBuildTransferCommit(client, proposal, remotePeer, chainStampFromFrame(Value(acceptRes)))
+    if Value(commitRes).payloadText != chainEventCanonicalText(expected):
+        return Err[str]("chain smoke: commit payload mismatch")
+    return chainApplyRemoteCommit(client, Value(commitRes).payloadText, remotePeer)
+
+fn chainSmokeMintEvent(account: str,
+                       assetId: str,
+                       amount: int64,
+                       parentCid: str,
+                       epoch: int32,
+                       ganzhiIndex: int32): ChainEvent =
+    var ev = emptyChainEvent()
+    ev.kind = "mint"
+    ev.assetId = assetId
+    ev.toAccount = account
+    ev.amount = amount
+    ev.authorPeer = "node-root"
+    ev.counterpartyPeer = "node-root"
+    ev.toParentCid = parentCid
+    ev.epoch = epoch
+    ev.ganzhiIndex = ganzhiIndex
+    ev.stem = ganzhiIndex % 10
+    ev.branch = ganzhiIndex % 12
+    ev.spaceSlot = chainSpaceSlot(account, account)
+    ev.tick = chainClockValue(epoch, ganzhiIndex)
+    ev.bodyCid = chainBodyCidText(ev)
+    return ev
+
+fn chainSmokeAlgorithms(): Result[bool] =
+    let shortest = chainLsmrShortestPathTexts(8, 2)
+    if shortest.len != 6:
+        return Err[bool]("chain smoke: lsmr shortest path count mismatch")
+    let routePlan = chainLsmrRoutePlan("node-root", "node-target", 4)
+    if routePlan.pathTexts.len <= 0 || strings.len(routePlan.routeCid) == 0:
+        return Err[bool]("chain smoke: lsmr route plan missing")
+    var rootDigits: int32[]
+    rootDigits = []
+    seqops.add(rootDigits, 8)
+    var targetDigitsA: int32[]
+    targetDigitsA = []
+    seqops.add(targetDigitsA, 2)
+    var targetDigitsB: int32[]
+    targetDigitsB = []
+    seqops.add(targetDigitsB, 1)
+    var multicastTargets: LsmrAddress[]
+    multicastTargets = []
+    seqops.add(multicastTargets, chainLsmrAddressFromDigits(targetDigitsA))
+    seqops.add(multicastTargets, chainLsmrAddressFromDigits(targetDigitsB))
+    let tree = chainLsmrBuildMulticastTreeFromAddresses(chainLsmrAddressFromDigits(rootDigits), multicastTargets)
+    if tree.branchDigits.len <= 0 || strings.len(tree.routeCid) == 0:
+        return Err[bool]("chain smoke: lsmr multicast tree missing")
+    if tree.targetCount != 2:
+        return Err[bool]("chain smoke: lsmr multicast tree target count mismatch")
+    var branchTargetCountSum: int32 = 0
+    for i in 0..<tree.branchTargetCounts.len:
+        branchTargetCountSum = branchTargetCountSum + tree.branchTargetCounts[i]
+    if branchTargetCountSum != tree.targetCount:
+        return Err[bool]("chain smoke: lsmr multicast tree duplicated targets")
+    if chainLsmrTreeBranchPos(tree, 1) < 0:
+        return Err[bool]("chain smoke: lsmr multicast tree canonical branch missing")
+    var prefixEntries: LsmrBaguaPrefixEntry[]
+    prefixEntries = []
+    seqops.add(prefixEntries,
+        chainLsmrBaguaPrefixEntryFromText("edge.sensor.alpha",
+                                          chainLsmrAddressFromDigits([5, 8, 1]),
+                                          "zhen",
+                                          2,
+                                          "temp=21"))
+    seqops.add(prefixEntries,
+        chainLsmrBaguaPrefixEntryFromText("edge.sensor.beta",
+                                          chainLsmrAddressFromDigits([5, 8, 6]),
+                                          "zhen",
+                                          2,
+                                          "temp=22"))
+    seqops.add(prefixEntries,
+        chainLsmrBaguaPrefixEntryFromText("fog.route.alpha",
+                                          chainLsmrAddressFromDigits([5, 1, 6]),
+                                          "kan",
+                                          3,
+                                          "route=a"))
+    seqops.add(prefixEntries,
+        chainLsmrBaguaPrefixEntryFromText("archive.asset.alpha",
+                                          chainLsmrAddressFromDigits([5, 9, 2]),
+                                          "kun",
+                                          1,
+                                          "asset=cheng"))
+    let prefixTree = chainLsmrBuildBaguaPrefixTree(prefixEntries)
+    if prefixTree.entryCount != 4 || prefixTree.nodeCount <= 0 || strings.len(prefixTree.treeCid) == 0:
+        return Err[bool]("chain smoke: lsmr bagua prefix tree missing")
+    let zhenRootPos = chainLsmrBaguaTreeNodePos(prefixTree, "zhen", "")
+    if zhenRootPos < 0 || prefixTree.nodeEntryDescCounts[zhenRootPos] != 2:
+        return Err[bool]("chain smoke: lsmr bagua root coverage mismatch")
+    let zhenPrefixPos = chainLsmrBaguaTreeNodePos(prefixTree, "zhen", "5/8")
+    if zhenPrefixPos < 0 || prefixTree.nodeEntryCounts[zhenPrefixPos] != 2:
+        return Err[bool]("chain smoke: lsmr bagua leaf coverage mismatch")
+    let zhenRootChildren = chainLsmrBaguaTreeNodeChildDigits(prefixTree, "zhen", "")
+    if zhenRootChildren.len != 1 || zhenRootChildren[0] != 5:
+        return Err[bool]("chain smoke: lsmr bagua root child mismatch")
+    let zhenMidChildren = chainLsmrBaguaTreeNodeChildDigits(prefixTree, "zhen", "5")
+    if zhenMidChildren.len != 1 || zhenMidChildren[0] != 8:
+        return Err[bool]("chain smoke: lsmr bagua prefix child mismatch")
+    let zhenLeafEntries = chainLsmrBaguaTreeNodeEntryCids(prefixTree, "zhen", "5/8")
+    if zhenLeafEntries.len != 2 || zhenLeafEntries[0] == zhenLeafEntries[1]:
+        return Err[bool]("chain smoke: lsmr bagua leaf entry mismatch")
+    let kanLeafPos = chainLsmrBaguaTreeNodePos(prefixTree, "kan", "5/1/6")
+    if kanLeafPos < 0 || prefixTree.nodeEntryCounts[kanLeafPos] != 1:
+        return Err[bool]("chain smoke: lsmr bagua fog leaf missing")
+    let kunRootPos = chainLsmrBaguaTreeNodePos(prefixTree, "kun", "")
+    if kunRootPos < 0 || prefixTree.nodeEntryDescCounts[kunRootPos] != 1:
+        return Err[bool]("chain smoke: lsmr bagua archive root mismatch")
+    var prefixEntriesReordered: LsmrBaguaPrefixEntry[]
+    prefixEntriesReordered = []
+    seqops.add(prefixEntriesReordered, prefixEntries[3])
+    seqops.add(prefixEntriesReordered, prefixEntries[1])
+    seqops.add(prefixEntriesReordered, prefixEntries[0])
+    seqops.add(prefixEntriesReordered, prefixEntries[2])
+    let reorderedTree = chainLsmrBuildBaguaPrefixTree(prefixEntriesReordered)
+    if reorderedTree.treeCid != prefixTree.treeCid:
+        return Err[bool]("chain smoke: lsmr bagua canonical cid mismatch")
+    let dispersalRes = chainDisperseText("lsmr-chain-proof", 5, 9)
+    if IsErr(dispersalRes):
+        return Err[bool]("chain smoke: dispersal build failed " + ErrorText(dispersalRes))
+    var wantDigits: int32[]
+    wantDigits = []
+    seqops.add(wantDigits, 8)
+    seqops.add(wantDigits, 1)
+    seqops.add(wantDigits, 6)
+    seqops.add(wantDigits, 3)
+    seqops.add(wantDigits, 5)
+    let subset = chainDispersalSubset(Value(dispersalRes), wantDigits)
+    let recoverRes = chainRecoverText(subset)
+    if IsErr(recoverRes):
+        return Err[bool]("chain smoke: dispersal recover failed " + ErrorText(recoverRes))
+    if Value(recoverRes) != "lsmr-chain-proof":
+        return Err[bool]("chain smoke: dispersal recover mismatch")
+    var brokenPlan = Value(dispersalRes)
+    brokenPlan.payloadCid = chainCidFromText("tampered")
+    let brokenMismatchRes = chainRecoverText(brokenPlan)
+    if ! IsErr(brokenMismatchRes):
+        return Err[bool]("chain smoke: dispersal payload cid mismatch missing")
+    let broadcastRes = chainBuildBroadcastPlanFromAddresses(
+        chainLsmrAddressFromDigits([5]),
+        [chainLsmrAddressFromDigits([8]),
+         chainLsmrAddressFromDigits([1]),
+         chainLsmrAddressFromDigits([6])],
+        "lsmr-chain-proof",
+        5,
+        9)
+    if IsErr(broadcastRes):
+        return Err[bool]("chain smoke: broadcast build failed " + ErrorText(broadcastRes))
+    let broadcastPlan = Value(broadcastRes)
+    if broadcastPlan.branchDigits.len <= 0 || strings.len(broadcastPlan.planCid) == 0:
+        return Err[bool]("chain smoke: broadcast plan missing")
+    var branchFragmentSum: int32 = 0
+    for i in 0..<broadcastPlan.branchFragmentCounts.len:
+        branchFragmentSum = branchFragmentSum + broadcastPlan.branchFragmentCounts[i]
+    if branchFragmentSum != broadcastPlan.totalShardCount:
+        return Err[bool]("chain smoke: broadcast fragment coverage mismatch")
+    if broadcastPlan.branchDigits.len < 2:
+        return Err[bool]("chain smoke: broadcast branch fanout too small")
+    var recoverBranchDigits: int32[]
+    recoverBranchDigits = []
+    seqops.add(recoverBranchDigits, broadcastPlan.branchDigits[0])
+    seqops.add(recoverBranchDigits, broadcastPlan.branchDigits[1])
+    let broadcastRecoverRes = chainBroadcastRecoverText(broadcastPlan, recoverBranchDigits)
+    if IsErr(broadcastRecoverRes):
+        return Err[bool]("chain smoke: broadcast recover failed " + ErrorText(broadcastRecoverRes))
+    if Value(broadcastRecoverRes) != "lsmr-chain-proof":
+        return Err[bool]("chain smoke: broadcast recover mismatch")
+    var orderedIdx = newChainIndex()
+    let orderedEv0 = chainSmokeMintEvent("alice", "cheng", 10, "", 0, 1)
+    let orderedCid0 = chainEventCid(orderedEv0)
+    let orderedApply0 = chainConsensusApply(orderedIdx, orderedEv0, orderedCid0, 0)
+    if IsErr(orderedApply0) || ! Value(orderedApply0).applied:
+        return Err[bool]("chain smoke: anti-entropy first event apply failed")
+    let orderedEv1 = chainSmokeMintEvent("alice", "cheng", 5, orderedCid0, 0, 2)
+    let orderedCid1 = chainEventCid(orderedEv1)
+    let orderedApply1 = chainConsensusApply(orderedIdx, orderedEv1, orderedCid1, 1)
+    if IsErr(orderedApply1) || ! Value(orderedApply1).applied:
+        return Err[bool]("chain smoke: anti-entropy second event apply failed")
+    let orderedTree = chainLsmrEffectiveIndexStateTree(orderedIdx)
+    if orderedTree.entryCount != 1 || strings.len(orderedTree.treeCid) == 0:
+        return Err[bool]("chain smoke: account state prefix tree missing")
+    let antiPayload = chainAntiEntropyAdvertisePayload(orderedIdx)
+    let orderedSig = chainAntiEntropySignature(orderedIdx)
+    if orderedSig.globalTreeEntryCount != 1 || chainHeaderField(antiPayload, "state_forest_cid") != orderedSig.stateForestCid:
+        return Err[bool]("chain smoke: anti-entropy state forest summary mismatch")
+    let emptyIdx = newChainIndex()
+    let helloSyncSameRes = chainPassiveAntiEntropySyncRequired(orderedIdx,
+                                                               chainAntiEntropyHelloText(chainAntiEntropySignature(orderedIdx)))
+    if IsErr(helloSyncSameRes) || Value(helloSyncSameRes):
+        return Err[bool]("chain smoke: passive anti-entropy same-signature mismatch")
+    let helloSyncNeedRes = chainPassiveAntiEntropySyncRequired(emptyIdx,
+                                                               chainAntiEntropyHelloText(chainAntiEntropySignature(orderedIdx)))
+    if IsErr(helloSyncNeedRes) || ! Value(helloSyncNeedRes):
+        return Err[bool]("chain smoke: passive anti-entropy missing")
+    let antiPlanRes = chainAntiEntropyPlan(emptyIdx, antiPayload)
+    if IsErr(antiPlanRes):
+        return Err[bool]("chain smoke: anti-entropy plan failed " + ErrorText(antiPlanRes))
+    let wantStateSubtrees = Value(antiPlanRes).wantStateSubtrees
+    if wantStateSubtrees.len != 1:
+        return Err[bool]("chain smoke: anti-entropy subtree want count mismatch")
+    if chainAntiEntropyStateSubtreeRefLayer(wantStateSubtrees[0]) != "regional":
+        return Err[bool]("chain smoke: anti-entropy expected regional subtree")
+    let orderedKey = chainAccountKey("alice", "cheng")
+    let orderedDepth = chainLsmrIndexStateTreeDepth(orderedIdx)
+    let orderedBagua = chainLsmrBaguaFromSeed(orderedKey, orderedDepth)
+    let orderedPrefix = chainLsmrPrefixTextFromDigits(chainLsmrAddressFromSeed(orderedKey, orderedDepth).digits, orderedDepth)
+    let subtreePayloadRes = chainAntiEntropyStateSubtreePayload(orderedIdx, "regional", orderedBagua, "")
+    if IsErr(subtreePayloadRes):
+        return Err[bool]("chain smoke: subtree payload failed " + ErrorText(subtreePayloadRes))
+    let subtreeRes = chainAntiEntropyStateSubtreeFromPayload(Value(subtreePayloadRes))
+    if IsErr(subtreeRes):
+        return Err[bool]("chain smoke: subtree parse failed " + ErrorText(subtreeRes))
+    if chainAntiEntropyStateSubtreeWantChildRefs(emptyIdx, Value(subtreeRes)).len <= 0:
+        return Err[bool]("chain smoke: anti-entropy subtree child diff missing")
+    let regionalPrefix = chainLsmrPrefixTextFromDigits(chainLsmrAddressFromSeed(orderedKey, orderedDepth).digits, 2)
+    let leafSubtreePayloadRes = chainAntiEntropyStateSubtreePayload(orderedIdx, "regional", orderedBagua, regionalPrefix)
+    if IsErr(leafSubtreePayloadRes):
+        return Err[bool]("chain smoke: leaf subtree payload failed " + ErrorText(leafSubtreePayloadRes))
+    let leafSubtreeRes = chainAntiEntropyStateSubtreeFromPayload(Value(leafSubtreePayloadRes))
+    if IsErr(leafSubtreeRes):
+        return Err[bool]("chain smoke: leaf subtree parse failed " + ErrorText(leafSubtreeRes))
+    if Value(leafSubtreeRes).entryKeys.len != 1:
+        return Err[bool]("chain smoke: anti-entropy leaf subtree entry missing")
+    if ! chainAntiEntropyStateSubtreeEntryNeedsSync(emptyIdx, Value(leafSubtreeRes), 0):
+        return Err[bool]("chain smoke: anti-entropy subtree entry diff missing")
+    let reverseEmptyIdx = newChainIndex()
+    let reversePayload = chainAntiEntropyAdvertisePayload(reverseEmptyIdx)
+    let reversePlanRes = chainAntiEntropyPlan(orderedIdx, reversePayload)
+    if IsErr(reversePlanRes):
+        return Err[bool]("chain smoke: reverse anti-entropy plan failed " + ErrorText(reversePlanRes))
+    if Value(reversePlanRes).wantStateSubtrees.len != 0:
+        return Err[bool]("chain smoke: anti-entropy reverse subtree mismatch")
+    var idx = newChainIndex()
+    var ev0 = chainSmokeMintEvent("alice", "cheng", 10, "", 0, 1)
+    let apply0 = chainConsensusApply(idx, ev0, chainEventCid(ev0), 0)
+    if IsErr(apply0) || ! Value(apply0).applied:
+        return Err[bool]("chain smoke: consensus first mint failed")
+    var ev1 = chainSmokeMintEvent("alice", "cheng", 20, "", 0, 2)
+    ev1.bodyCid = chainBodyCidText(ev1)
+    let apply1 = chainConsensusApply(idx, ev1, chainEventCid(ev1), 1)
+    if IsErr(apply1):
+        return Err[bool]("chain smoke: consensus second mint failed " + ErrorText(apply1))
+    if Value(apply1).accepted || ! chainAccountDiverged(idx, chainAccountKey("alice", "cheng")):
+        return Err[bool]("chain smoke: consensus fork must diverge")
+    var batchIdx = newChainIndex()
+    let batchParent = chainSmokeMintEvent("alice", "cheng", 10, "", 0, 1)
+    let batchParentCid = chainEventCid(batchParent)
+    let batchChild = chainSmokeMintEvent("alice", "cheng", 5, batchParentCid, 0, 2)
+    let batchApplyRes = chainConsensusApplyBatch(batchIdx,
+                                                 [chainEventCid(batchChild), batchParentCid],
+                                                 [batchChild, batchParent],
+                                                 0)
+    if IsErr(batchApplyRes):
+        return Err[bool]("chain smoke: consensus batch apply failed " + ErrorText(batchApplyRes))
+    if Value(batchApplyRes).len != 2:
+        return Err[bool]("chain smoke: consensus batch result count mismatch")
+    if chainAccountBalance(batchIdx, chainAccountKey("alice", "cheng")) != 15:
+        return Err[bool]("chain smoke: consensus batch ordering mismatch")
+    let badRoot = chainSmokeRoot("chain_smoke_bad_append")
+    let _ = chainSmokeResetRoot(badRoot)
+    var badNode: ChainNode
+    let badNodeRes = initChainNodeInto(badNode, chainSmokeConfig("chain_smoke_bad_append", "node-bad"))
+    if IsErr(badNodeRes):
+        return Err[bool]("chain smoke: bad node init failed " + ErrorText(badNodeRes))
+    let goodAppendRes = chainNodeMint(badNode, "alice", "cheng", 9)
+    if IsErr(goodAppendRes):
+        return Err[bool]("chain smoke: bad node good append failed " + ErrorText(goodAppendRes))
+    var invalidEvent = chainSmokeMintEvent("alice", "cheng", 1, chainAccountHead(badNode.index, chainAccountKey("alice", "cheng")), 0, 2)
+    invalidEvent.kind = "bad_kind"
+    invalidEvent.bodyCid = chainBodyCidText(invalidEvent)
+    let invalidAppendRes = chainAppendEvent(badNode, invalidEvent, "node-bad")
+    if ! IsErr(invalidAppendRes):
+        return Err[bool]("chain smoke: invalid event append must fail")
+    var wrongParentEvent = chainSmokeMintEvent("alice", "cheng", 2, "", 0, 3)
+    wrongParentEvent.bodyCid = chainBodyCidText(wrongParentEvent)
+    let wrongParentAppendRes = chainAppendEvent(badNode, wrongParentEvent, "node-bad")
+    if ! IsErr(wrongParentAppendRes):
+        return Err[bool]("chain smoke: wrong parent append must fail")
+    var badReplay: ChainIndex
+    let badReplayRes = chainReplayAtDepthInto(badReplay, badNode.cfg.rootDir, badNode.cfg.lsmrDepth)
+    if IsErr(badReplayRes):
+        return Err[bool]("chain smoke: bad node replay failed " + ErrorText(badReplayRes))
+    if badReplay.eventCids.len != 1:
+        return Err[bool]("chain smoke: invalid event polluted journal")
+    return Ok[bool](true)
+
+fn runMsQuicChainSmoke(): Result[bool] =
+    let algoRes = chainSmokeAlgorithms()
+    if IsErr(algoRes):
+        return algoRes
+    let _ = chainSmokeResetRoot(chainSmokeRoot("chain_smoke_server"))
+    let _ = chainSmokeResetRoot(chainSmokeRoot("chain_smoke_client"))
+    echo("msquic_chain_smoke_stage=init_server_begin")
+    var server: ChainNode
+    let serverRes = initChainNodeInto(server, chainSmokeConfig("chain_smoke_server", "node-server"))
+    if IsErr(serverRes):
+        echo("msquic_chain_smoke_stage=init_server_err")
+        echo("msquic_chain_smoke_stage_detail=" + serverRes.err.msg)
+        return Err[bool](ErrorText(serverRes))
+    echo("msquic_chain_smoke_stage=init_server_ok")
+    echo("msquic_chain_smoke_stage=init_client_begin")
+    var client: ChainNode
+    let clientRes = initChainNodeInto(client, chainSmokeConfig("chain_smoke_client", "node-client"))
+    if IsErr(clientRes):
+        echo("msquic_chain_smoke_stage=init_client_err")
+        echo("msquic_chain_smoke_stage_detail=" + clientRes.err.msg)
+        return Err[bool](ErrorText(clientRes))
+    echo("msquic_chain_smoke_stage=init_ok")
+    let serverStartRes = chainSmokeStart(server)
+    if IsErr(serverStartRes):
+        echo("msquic_chain_smoke_stage=start_server_err")
+        echo("msquic_chain_smoke_stage_detail=" + serverStartRes.err.msg)
+        return Err[bool](ErrorText(serverStartRes))
+    let clientStartRes = chainSmokeStart(client)
+    if IsErr(clientStartRes):
+        echo("msquic_chain_smoke_stage=start_client_err")
+        echo("msquic_chain_smoke_stage_detail=" + clientStartRes.err.msg)
+        return Err[bool](ErrorText(clientStartRes))
+    let mintRes = chainNodeMint(server, "alice", "cheng", 100)
+    if IsErr(mintRes):
+        return Err[bool](ErrorText(mintRes))
+    if server.index.stateTree.entryCount != 1 || strings.len(server.index.stateTree.treeCid) == 0:
+        return Err[bool]("chain smoke: server state tree missing after mint")
+    let sigBeforeServer = chainAntiEntropySignature(server.index)
+    let sigBeforeClient = chainAntiEntropySignature(client.index)
+    if sigBeforeServer.signatureCid == sigBeforeClient.signatureCid:
+        return Err[bool]("chain smoke: anti-entropy mismatch missing before sync")
+    let dialRes = dial(client.transport, server.listenAddr)
+    if IsErr(dialRes):
+        return Err[bool](ErrorText(dialRes))
+    let acceptRes = accept(server.transport)
+    if IsErr(acceptRes):
+        return Err[bool](ErrorText(acceptRes))
+    var clientConn = Value(dialRes)
+    var serverConn = Value(acceptRes)
+    let helloRes = chainSmokeHello(client, clientConn, server, serverConn)
+    if IsErr(helloRes):
+        return Err[bool](ErrorText(helloRes))
+    let remotePeer = Value(helloRes)
+    if remotePeer != "node-server":
+        return Err[bool]("chain smoke: hello peer mismatch")
+    let syncRes = chainSmokeSync(client, clientConn, server, serverConn, remotePeer)
+    if IsErr(syncRes):
+        return Err[bool](ErrorText(syncRes))
+    if Value(syncRes) != 1:
+        return Err[bool]("chain smoke: expected sync count 1")
+    let sigAfterSyncServer = chainAntiEntropySignature(server.index)
+    let sigAfterSyncClient = chainAntiEntropySignature(client.index)
+    if sigAfterSyncServer.signatureCid != sigAfterSyncClient.signatureCid:
+        return Err[bool]("chain smoke: anti-entropy mismatch after sync")
+    if sigAfterSyncServer.stateForestCid != sigAfterSyncClient.stateForestCid:
+        return Err[bool]("chain smoke: state forest mismatch after sync")
+    let aliceBeforeRes = chainNodeBalance(client, "alice", "cheng")
+    if IsErr(aliceBeforeRes):
+        return Err[bool](ErrorText(aliceBeforeRes))
+    if Value(aliceBeforeRes) != 100:
+        return Err[bool]("chain smoke: alice pre-transfer balance mismatch")
+    let transferRes = chainSmokeTransfer(client, clientConn, server, serverConn, remotePeer)
+    if IsErr(transferRes):
+        return Err[bool](ErrorText(transferRes))
+    let aliceClientRes = chainNodeBalance(client, "alice", "cheng")
+    if IsErr(aliceClientRes):
+        return Err[bool](ErrorText(aliceClientRes))
+    let bobClientRes = chainNodeBalance(client, "bob", "cheng")
+    if IsErr(bobClientRes):
+        return Err[bool](ErrorText(bobClientRes))
+    let aliceServerRes = chainNodeBalance(server, "alice", "cheng")
+    if IsErr(aliceServerRes):
+        return Err[bool](ErrorText(aliceServerRes))
+    let bobServerRes = chainNodeBalance(server, "bob", "cheng")
+    if IsErr(bobServerRes):
+        return Err[bool](ErrorText(bobServerRes))
+    if Value(aliceClientRes) != 75 || Value(bobClientRes) != 25:
+        return Err[bool]("chain smoke: client balances mismatch")
+    if Value(aliceServerRes) != 75 || Value(bobServerRes) != 25:
+        return Err[bool]("chain smoke: server balances mismatch")
+    let sigAfterTransferServer = chainAntiEntropySignature(server.index)
+    let sigAfterTransferClient = chainAntiEntropySignature(client.index)
+    if sigAfterTransferServer.signatureCid != sigAfterTransferClient.signatureCid:
+        return Err[bool]("chain smoke: anti-entropy mismatch after transfer")
+    if sigAfterTransferServer.stateForestCid != sigAfterTransferClient.stateForestCid ||
+       sigAfterTransferServer.globalTreeEntryCount != 2:
+        return Err[bool]("chain smoke: state forest mismatch after transfer")
+    var replayed: ChainIndex
+    let replayRes = chainReplayAtDepthInto(replayed, client.cfg.rootDir, client.cfg.lsmrDepth)
+    if IsErr(replayRes):
+        return Err[bool](ErrorText(replayRes))
+    let replayAlice = chainAccountState(replayed, "alice", "cheng")
+    let replayBob = chainAccountState(replayed, "bob", "cheng")
+    if replayAlice.balance != 75 || replayBob.balance != 25:
+        return Err[bool]("chain smoke: replay balances mismatch")
+    if replayed.stateTree.treeCid != client.index.stateTree.treeCid:
+        return Err[bool]("chain smoke: replay state tree mismatch")
+    quicConnClose(clientConn)
+    quicConnClose(serverConn)
+    stop(client.transport)
+    stop(server.transport)
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res = runMsQuicChainSmoke()
+    if IsErr(res):
+        echo("msquic_chain_smoke=fail " + ErrorText(res))
+        return 1
+    echo("msquic_chain_smoke=ok")
+    return 0

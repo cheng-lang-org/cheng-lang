@@ -1,0 +1,79 @@
+import std/result
+import std/seqs as seqops
+import std/strings
+import cheng/quic/chain/types
+import cheng/quic/chain/lsmr
+
+fn runLsmrBaguaPrefixTreeSmoke(): Result[bool] =
+    var entries: LsmrBaguaPrefixEntry[]
+    entries = []
+    seqops.add(entries,
+        chainLsmrBaguaPrefixEntryFromText("edge.sensor.alpha",
+                                          chainLsmrAddressFromDigits([5, 8, 1]),
+                                          "zhen",
+                                          2,
+                                          "temp=21"))
+    seqops.add(entries,
+        chainLsmrBaguaPrefixEntryFromText("edge.sensor.beta",
+                                          chainLsmrAddressFromDigits([5, 8, 6]),
+                                          "zhen",
+                                          2,
+                                          "temp=22"))
+    seqops.add(entries,
+        chainLsmrBaguaPrefixEntryFromText("fog.route.alpha",
+                                          chainLsmrAddressFromDigits([5, 1, 6]),
+                                          "kan",
+                                          3,
+                                          "route=a"))
+    seqops.add(entries,
+        chainLsmrBaguaPrefixEntryFromText("archive.asset.alpha",
+                                          chainLsmrAddressFromDigits([5, 9, 2]),
+                                          "kun",
+                                          1,
+                                          "asset=cheng"))
+    let tree = chainLsmrBuildBaguaPrefixTree(entries)
+    if tree.entryCount != 4 || tree.nodeCount <= 0 || strings.len(tree.treeCid) == 0:
+        return Err[bool]("lsmr bagua prefix tree: missing tree")
+    let zhenRootPos = chainLsmrBaguaTreeNodePos(tree, "zhen", "")
+    if zhenRootPos < 0 || tree.nodeEntryDescCounts[zhenRootPos] != 2:
+        return Err[bool]("lsmr bagua prefix tree: zhen root coverage mismatch")
+    let zhenLeafPos = chainLsmrBaguaTreeNodePos(tree, "zhen", "5/8")
+    if zhenLeafPos < 0 || tree.nodeEntryCounts[zhenLeafPos] != 2:
+        return Err[bool]("lsmr bagua prefix tree: zhen leaf coverage mismatch")
+    let kanLeafPos = chainLsmrBaguaTreeNodePos(tree, "kan", "5/1/6")
+    if kanLeafPos < 0 || tree.nodeEntryCounts[kanLeafPos] != 1:
+        return Err[bool]("lsmr bagua prefix tree: kan leaf missing")
+    let kunRootPos = chainLsmrBaguaTreeNodePos(tree, "kun", "")
+    if kunRootPos < 0 || tree.nodeEntryDescCounts[kunRootPos] != 1:
+        return Err[bool]("lsmr bagua prefix tree: kun root coverage mismatch")
+    let zhenRootChildren = chainLsmrBaguaTreeNodeChildDigits(tree, "zhen", "")
+    if zhenRootChildren.len != 1 || zhenRootChildren[0] != 5:
+        return Err[bool]("lsmr bagua prefix tree: zhen root child mismatch")
+    let zhenMidChildren = chainLsmrBaguaTreeNodeChildDigits(tree, "zhen", "5")
+    if zhenMidChildren.len != 1 || zhenMidChildren[0] != 8:
+        return Err[bool]("lsmr bagua prefix tree: zhen middle child mismatch")
+    let zhenEntryCids = chainLsmrBaguaTreeNodeEntryCids(tree, "zhen", "5/8")
+    if zhenEntryCids.len != 2 || zhenEntryCids[0] == zhenEntryCids[1]:
+        return Err[bool]("lsmr bagua prefix tree: zhen leaf entry mismatch")
+    var reorderedEntries: LsmrBaguaPrefixEntry[]
+    reorderedEntries = []
+    seqops.add(reorderedEntries, entries[3])
+    seqops.add(reorderedEntries, entries[1])
+    seqops.add(reorderedEntries, entries[0])
+    seqops.add(reorderedEntries, entries[2])
+    let reorderedTree = chainLsmrBuildBaguaPrefixTree(reorderedEntries)
+    if reorderedTree.treeCid != tree.treeCid:
+        return Err[bool]("lsmr bagua prefix tree: canonical cid mismatch")
+    echo("lsmr_bagua_prefix_tree_cid=" + tree.treeCid)
+    echo("lsmr_bagua_prefix_tree_nodes=" + intToStr(tree.nodeCount))
+    echo("lsmr_bagua_prefix_tree_entries=" + intToStr(tree.entryCount))
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let res = runLsmrBaguaPrefixTreeSmoke()
+    if IsErr(res):
+        echo("lsmr bagua prefix tree smoke failed")
+        echo(ErrorText(res))
+        return 1
+    echo("lsmr bagua prefix tree smoke ok")
+    return 0

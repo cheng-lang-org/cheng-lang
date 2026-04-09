@@ -543,6 +543,8 @@ typedef struct ChengStrBridge {
     int32_t flags;
 } ChengStrBridge;
 
+int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b);
+
 typedef struct ChengErrorInfoBridgeCompat {
     int32_t code;
     ChengStrBridge msg;
@@ -2044,6 +2046,56 @@ WEAK ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, Che
         }
     }
     return default_value;
+}
+
+WEAK int32_t driver_c_read_flag_value_bridge(ChengStrBridge key, ChengStrBridge* out_value) {
+    int32_t argc = 0;
+    int32_t i;
+    if (out_value == NULL) {
+        return 0;
+    }
+    *out_value = cheng_str_bridge_empty();
+    if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+        argc = cheng_saved_argc;
+    } else if (__cheng_rt_paramCount != NULL) {
+        argc = __cheng_rt_paramCount();
+    }
+    if (argc <= 1) {
+        return 0;
+    }
+    for (i = 1; i < argc; ++i) {
+        const char* raw = NULL;
+        const char* inline_value = NULL;
+        if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+            raw = cheng_saved_argv[i];
+        } else if (__cheng_rt_paramStr != NULL) {
+            raw = __cheng_rt_paramStr(i);
+        }
+        if (raw == NULL) {
+            continue;
+        }
+        if (driver_c_flag_inline_value(raw, key, &inline_value)) {
+            *out_value = cheng_str_bridge_from_ptr_flags(inline_value, 0);
+            return 1;
+        }
+        if (driver_c_flag_key_matches(raw, key)) {
+            const char* next_raw = "";
+            if (i + 1 >= argc) {
+                return 0;
+            }
+            if (cheng_saved_argc > 0 && cheng_saved_argv != NULL) {
+                next_raw = cheng_saved_argv[i + 1];
+            } else if (__cheng_rt_paramStr != NULL) {
+                next_raw = __cheng_rt_paramStr(i + 1);
+            }
+            if (next_raw == NULL) {
+                next_raw = "";
+            }
+            *out_value = cheng_str_bridge_from_ptr_flags(next_raw, 0);
+            return 1;
+        }
+    }
+    return 0;
 }
 
 WEAK int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value) {
@@ -5404,11 +5456,41 @@ WEAK char* driver_c_char_to_str(int32_t value) {
     unsigned char ch = (unsigned char)(value & 0xff);
     return cheng_copy_string_bytes((const char*)&ch, 1u);
 }
+WEAK ChengStrBridge driver_c_char_to_str_bridge(int32_t value) {
+    return cheng_str_bridge_from_owned(driver_c_char_to_str(value));
+}
 WEAK ChengStrBridge driver_c_str_from_utf8_copy_bridge(const char* raw, int32_t n) {
     if (raw == NULL || n <= 0) {
         return cheng_str_bridge_from_owned(cheng_copy_string_bytes("", 0u));
     }
     return cheng_str_bridge_from_owned(cheng_copy_string_bytes(raw, (size_t)n));
+}
+WEAK ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge b) {
+    const char* sa = "";
+    const char* sb = "";
+    size_t la = 0;
+    size_t lb = 0;
+    char* out = NULL;
+    if (!cheng_safe_cstr_view(a.ptr, &sa, &la)) {
+        sa = "";
+        la = 0;
+    }
+    if (!cheng_safe_cstr_view(b.ptr, &sb, &lb)) {
+        sb = "";
+        lb = 0;
+    }
+    out = (char*)malloc(la + lb + 1u);
+    if (out == NULL) {
+        return cheng_str_bridge_from_owned(cheng_copy_string_bytes("", 0u));
+    }
+    if (la > 0) {
+        memcpy(out, sa, la);
+    }
+    if (lb > 0) {
+        memcpy(out + la, sb, lb);
+    }
+    out[la + lb] = '\0';
+    return cheng_str_bridge_from_owned(out);
 }
 WEAK int32_t driver_c_str_get_at(const char* s, int32_t idx) {
     const char* safe = "";
@@ -5475,6 +5557,9 @@ WEAK int32_t driver_c_str_has_suffix(const char* s, const char* suffix) {
 }
 WEAK int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix) {
     return driver_c_str_has_prefix(s.ptr, prefix.ptr);
+}
+WEAK int32_t driver_c_str_has_suffix_bridge(ChengStrBridge s, ChengStrBridge suffix) {
+    return driver_c_str_has_suffix(s.ptr, suffix.ptr);
 }
 WEAK int32_t driver_c_str_contains_char(const char* s, int32_t value) {
     const char* safe = "";

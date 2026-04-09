@@ -1,0 +1,190 @@
+import std/result
+import std/seqs as seqops
+import std/strings
+import cheng/quic/chain/types
+import cheng/quic/chain/codec
+import cheng/quic/chain/content_address
+import cheng/quic/chain/lsmr
+
+fn chainLsmrLocationSharedPrefixDepth(left: LsmrAddress, right: LsmrAddress): int32 =
+    if left.depth != right.depth:
+        panic("chain location proof: depth mismatch")
+    var out: int32 = 0
+    for i in 0..<left.depth:
+        if left.digits[i] != right.digits[i]:
+            return out
+        out = out + 1
+    return out
+
+fn chainLsmrLocationWitnessCanonicalText(witness: LsmrLocationWitness): str =
+    return "version=" + witness.version + "\n" +
+           "claimant_node_id=" + witness.claimantNodeId + "\n" +
+           "claimant_address=" + witness.claimantAddressText + "\n" +
+           "witness_node_id=" + witness.witnessNodeId + "\n" +
+           "witness_address=" + witness.witnessAddressText + "\n" +
+           "route_cid=" + witness.routeCid + "\n" +
+           "route_hop_count=" + intToStr(witness.routeHopCount) + "\n" +
+           "sector_digit=" + intToStr(witness.sectorDigit) + "\n" +
+           "shared_prefix_depth=" + intToStr(witness.sharedPrefixDepth) + "\n" +
+           "rtt_bucket=" + intToStr(witness.rttBucket) + "\n"
+
+fn chainLsmrLocationSectorDigit(claimantAddress: LsmrAddress,
+                                witnessAddress: LsmrAddress): int32 =
+    let sharedDepth = chainLsmrLocationSharedPrefixDepth(claimantAddress, witnessAddress)
+    if sharedDepth >= witnessAddress.depth:
+        return 5
+    return witnessAddress.digits[sharedDepth]
+
+fn chainLsmrLocationWitness(claimantNodeId: str,
+                            claimantAddress: LsmrAddress,
+                            witnessNodeId: str,
+                            witnessAddress: LsmrAddress,
+                            rttBucket: int32): LsmrLocationWitness =
+    let route = chainLsmrRoutePlanFromAddresses(witnessAddress, claimantAddress)
+    var out = emptyLsmrLocationWitness()
+    out.claimantNodeId = claimantNodeId
+    out.claimantAddressText = claimantAddress.text
+    out.witnessNodeId = witnessNodeId
+    out.witnessAddressText = witnessAddress.text
+    out.routeCid = route.routeCid
+    out.routeHopCount = route.hopCount
+    out.sharedPrefixDepth = chainLsmrLocationSharedPrefixDepth(witnessAddress, claimantAddress)
+    out.sectorDigit = chainLsmrLocationSectorDigit(claimantAddress, witnessAddress)
+    out.rttBucket = rttBucket
+    out.witnessCid = chainCidFromText(chainLsmrLocationWitnessCanonicalText(out))
+    return out
+
+fn chainLsmrLocationWitnessLess(aNodeId: str, aAddress: str, bNodeId: str, bAddress: str): bool =
+    if aNodeId != bNodeId:
+        return chainLexLess(aNodeId, bNodeId)
+    return chainLexLess(aAddress, bAddress)
+
+fn chainLsmrSortLocationWitnesses(witnesses: var LsmrLocationWitness[]) =
+    for i in 1..<witnesses.len:
+        let witness = witnesses[i]
+        var j = i - 1
+        while j >= 0 &&
+              chainLsmrLocationWitnessLess(witness.witnessNodeId,
+                                           witness.witnessAddressText,
+                                           witnesses[j].witnessNodeId,
+                                           witnesses[j].witnessAddressText):
+            witnesses[j + 1] = witnesses[j]
+            j = j - 1
+        witnesses[j + 1] = witness
+
+fn chainLsmrLocationProofCanonicalText(proof: LsmrLocationProof): str =
+    var out: str = ""
+    out = out + "version=" + proof.version + "\n"
+    out = out + "claimant_node_id=" + proof.claimantNodeId + "\n"
+    out = out + "claimant_address=" + proof.claimantAddressText + "\n"
+    out = out + "depth=" + intToStr(proof.depth) + "\n"
+    out = out + "epoch=" + intToStr(proof.epoch) + "\n"
+    out = out + "nonce=" + proof.nonce + "\n"
+    out = out + "witness_count=" + intToStr(proof.witnessNodeIds.len) + "\n"
+    for i in 0..<proof.witnessNodeIds.len:
+        out = out + "witness." + intToStr(i) + ".node_id=" + proof.witnessNodeIds[i] + "\n"
+        out = out + "witness." + intToStr(i) + ".address=" + proof.witnessAddressTexts[i] + "\n"
+        out = out + "witness." + intToStr(i) + ".route_cid=" + proof.witnessRouteCids[i] + "\n"
+        out = out + "witness." + intToStr(i) + ".hop_count=" + intToStr(proof.witnessHopCounts[i]) + "\n"
+        out = out + "witness." + intToStr(i) + ".sector_digit=" + intToStr(proof.witnessSectorDigits[i]) + "\n"
+        out = out + "witness." + intToStr(i) + ".shared_prefix_depth=" + intToStr(proof.witnessSharedPrefixDepths[i]) + "\n"
+        out = out + "witness." + intToStr(i) + ".rtt_bucket=" + intToStr(proof.witnessRttBuckets[i]) + "\n"
+    return out
+
+fn chainLsmrBuildLocationProof(claimantNodeId: str,
+                               claimantAddress: LsmrAddress,
+                               epoch: int32,
+                               nonce: str,
+                               witnesses: LsmrLocationWitness[]): Result[LsmrLocationProof] =
+    if strings.len(claimantNodeId) == 0 || strings.len(nonce) == 0:
+        return Err[LsmrLocationProof]("chain location proof: missing claimant or nonce")
+    var sortedWitnesses = witnesses
+    chainLsmrSortLocationWitnesses(sortedWitnesses)
+    var out = emptyLsmrLocationProof()
+    out.claimantNodeId = claimantNodeId
+    out.claimantAddressText = claimantAddress.text
+    out.depth = claimantAddress.depth
+    out.epoch = epoch
+    out.nonce = nonce
+    for i in 0..<sortedWitnesses.len:
+        if sortedWitnesses[i].claimantNodeId != claimantNodeId ||
+           sortedWitnesses[i].claimantAddressText != claimantAddress.text:
+            return Err[LsmrLocationProof]("chain location proof: witness claimant mismatch")
+        seqops.add(out.witnessNodeIds, sortedWitnesses[i].witnessNodeId)
+        seqops.add(out.witnessAddressTexts, sortedWitnesses[i].witnessAddressText)
+        seqops.add(out.witnessRouteCids, sortedWitnesses[i].routeCid)
+        seqops.add(out.witnessHopCounts, sortedWitnesses[i].routeHopCount)
+        seqops.add(out.witnessSectorDigits, sortedWitnesses[i].sectorDigit)
+        seqops.add(out.witnessSharedPrefixDepths, sortedWitnesses[i].sharedPrefixDepth)
+        seqops.add(out.witnessRttBuckets, sortedWitnesses[i].rttBucket)
+    out.proofCid = chainCidFromText(chainLsmrLocationProofCanonicalText(out))
+    return Ok[LsmrLocationProof](out)
+
+fn chainLsmrLocationCountDistinctTexts(values: str[]): int32 =
+    var distinct: str[]
+    distinct = []
+    for i in 0..<values.len:
+        var found: bool = false
+        for j in 0..<distinct.len:
+            if distinct[j] == values[i]:
+                found = true
+                break
+        if ! found:
+            seqops.add(distinct, values[i])
+    return distinct.len
+
+fn chainLsmrLocationCountDistinctDigits(values: int32[]): int32 =
+    var distinct: int32[]
+    distinct = []
+    for i in 0..<values.len:
+        var found: bool = false
+        for j in 0..<distinct.len:
+            if distinct[j] == values[i]:
+                found = true
+                break
+        if ! found:
+            seqops.add(distinct, values[i])
+    return distinct.len
+
+fn chainLsmrVerifyLocationProof(proof: LsmrLocationProof): LsmrLocationProofDecision =
+    var out = emptyLsmrLocationProofDecision()
+    out.accepted = false
+    out.reason = "invalid"
+    let claimantAddress = chainLsmrAddressFromText(proof.claimantAddressText)
+    if claimantAddress.depth != proof.depth:
+        out.reason = "claimant depth mismatch"
+        out.decisionCid = chainCidFromText("location-proof-depth-mismatch")
+        return out
+    out.distinctWitnessCount = chainLsmrLocationCountDistinctTexts(proof.witnessNodeIds)
+    out.distinctSectorCount = chainLsmrLocationCountDistinctDigits(proof.witnessSectorDigits)
+    if out.distinctWitnessCount < 3:
+        out.reason = "witness quorum too small"
+        out.decisionCid = chainCidFromText("location-proof-quorum-small")
+        return out
+    if out.distinctSectorCount < 3:
+        out.reason = "sector coverage too small"
+        out.decisionCid = chainCidFromText("location-proof-sector-small")
+        return out
+    for i in 0..<proof.witnessNodeIds.len:
+        let witnessAddress = chainLsmrAddressFromText(proof.witnessAddressTexts[i])
+        let rebuilt = chainLsmrLocationWitness(proof.claimantNodeId,
+                                               claimantAddress,
+                                               proof.witnessNodeIds[i],
+                                               witnessAddress,
+                                               proof.witnessRttBuckets[i])
+        if rebuilt.routeCid != proof.witnessRouteCids[i] ||
+           rebuilt.routeHopCount != proof.witnessHopCounts[i] ||
+           rebuilt.sectorDigit != proof.witnessSectorDigits[i] ||
+           rebuilt.sharedPrefixDepth != proof.witnessSharedPrefixDepths[i]:
+            out.reason = "witness route mismatch"
+            out.decisionCid = chainCidFromText("location-proof-route-mismatch")
+            return out
+        let expectedBucketCeil = rebuilt.routeHopCount + (proof.depth - rebuilt.sharedPrefixDepth) + 1
+        if proof.witnessRttBuckets[i] > expectedBucketCeil:
+            out.reason = "witness rtt bucket too high"
+            out.decisionCid = chainCidFromText("location-proof-rtt-mismatch")
+            return out
+    out.accepted = true
+    out.reason = "ok"
+    out.decisionCid = chainCidFromText("location-proof-ok|" + proof.proofCid)
+    return out
