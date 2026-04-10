@@ -1,0 +1,263 @@
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+
+type
+    V3ParsedSourceKind = enum
+        v3ParsedOrdinarySource
+
+    V3ImportEdge =
+        ownerModulePath: str
+        targetModulePath: str
+        targetSourcePath: str
+        resolved: bool
+
+    V3ParsedSourceStub =
+        workspaceRoot: str
+        packageRoot: str
+        packageId: str
+        entrySourcePath: str
+        sourcePath: str
+        moduleStem: str
+        syntaxTag: str
+        sourceKind: V3ParsedSourceKind
+        ownerModulePaths: str[]
+        importEdges: V3ImportEdge[]
+        orderedClosureSourcePaths: str[]
+        hasCompilerTopLevel: bool
+        mainFunctionPresent: bool
+        unresolvedImportCount: int32
+
+fn v3ParsedSourceKindText(kind: V3ParsedSourceKind): str =
+    if kind == v3ParsedOrdinarySource:
+        return "ordinary_cheng_source"
+    return "unknown"
+
+fn v3ParserNormalizePath(pathRaw: str): str =
+    var path = strutil.strip(pathRaw)
+    while len(path) > 1:
+        let last = path[len(path) - 1]
+        if last != '/' && last != '\\':
+            break
+        path = strings.sliceBytes(path, 0, len(path) - 1)
+    return path
+
+fn v3ParserBaseName(pathRaw: str): str =
+    let path = v3ParserNormalizePath(pathRaw)
+    if len(path) <= 0:
+        return ""
+    var start: int32 = 0
+    for i in 0..<len(path):
+        if path[i] == '/' || path[i] == '\\':
+            start = i + 1
+    return strings.sliceBytes(path, start, len(path) - start)
+
+fn v3ParserWorkspaceRoot(packageRootRaw: str): str =
+    let packageRoot = v3ParserNormalizePath(packageRootRaw)
+    let info = os.splitFile(packageRoot)
+    if v3ParserBaseName(packageRoot) == "v3" && len(info.dir) > 0:
+        return info.dir
+    return packageRoot
+
+fn v3ParserPackageId(packageRootRaw: str): str =
+    let name = v3ParserBaseName(packageRootRaw)
+    if name == "v3":
+        return "cheng/v3"
+    if len(name) <= 0:
+        return ""
+    return "cheng/" + name
+
+fn v3ParserSourceExists(path: str): bool =
+    return len(path) > 0 && os.fileExists(path) && os.fileSize(path) > int64(0)
+
+fn v3ParserStringSeqContains(items: str[], targetRaw: str): bool =
+    let target = strutil.strip(targetRaw)
+    for i in 0..<items.len:
+        if items[i] == target:
+            return true
+    return false
+
+fn v3ParserFirstToken(textRaw: str): str =
+    let parts = strutil.split(strutil.strip(textRaw), ' ')
+    for i in 0..<parts.len:
+        let token = strutil.strip(parts[i])
+        if len(token) > 0:
+            return token
+    return ""
+
+fn v3ParserModulePathTail(modulePath: str, skipCount: int32): str =
+    let parts = strutil.split(strutil.strip(modulePath), '/')
+    var out: str[] = []
+    for i in skipCount..<parts.len:
+        let piece = strutil.strip(parts[i])
+        if len(piece) > 0:
+            add(out, piece)
+    return strutil.join(out, "/")
+
+fn v3ParserModulePathTailWithPrefix(modulePathRaw: str, prefixRaw: str): str =
+    let modulePath = strutil.strip(modulePathRaw)
+    let prefix = strutil.strip(prefixRaw)
+    if len(modulePath) <= 0 || len(prefix) <= 0:
+        return ""
+    if modulePath == prefix:
+        return ""
+    let fullPrefix = prefix + "/"
+    if !strutil.startsWith(modulePath, fullPrefix):
+        return ""
+    return strings.sliceBytes(modulePath, len(fullPrefix), len(modulePath) - len(fullPrefix))
+
+fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
+    let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
+    let packageRoot = v3ParserNormalizePath(packageRootRaw)
+    let modulePath = strutil.strip(modulePathRaw)
+    if len(modulePath) <= 0:
+        return ""
+    let stdTail = v3ParserModulePathTailWithPrefix(modulePath, "std")
+    if len(stdTail) > 0:
+        return os.joinPath(workspaceRoot, os.joinPath("src/std", stdTail + ".cheng"))
+    let packageId = v3ParserPackageId(packageRoot)
+    let packageTail = v3ParserModulePathTailWithPrefix(modulePath, packageId)
+    if len(packageTail) > 0:
+        return os.joinPath(packageRoot, os.joinPath("src", packageTail + ".cheng"))
+    return ""
+
+fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sourcePathRaw: str): str =
+    let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
+    let packageRoot = v3ParserNormalizePath(packageRootRaw)
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    let packageSrcPrefix = os.joinPath(packageRoot, "src") + "/"
+    if strutil.startsWith(sourcePath, packageSrcPrefix):
+        let rel = strings.sliceBytes(sourcePath,
+                                     len(packageSrcPrefix),
+                                     len(sourcePath) - len(packageSrcPrefix))
+        let info = os.splitFile(rel)
+        if len(info.dir) > 0:
+            return v3ParserPackageId(packageRoot) + "/" + info.dir + "/" + info.name
+        return v3ParserPackageId(packageRoot) + "/" + info.name
+    let stdPrefix = os.joinPath(workspaceRoot, "src/std") + "/"
+    if strutil.startsWith(sourcePath, stdPrefix):
+        let rel = strings.sliceBytes(sourcePath,
+                                     len(stdPrefix),
+                                     len(sourcePath) - len(stdPrefix))
+        let info = os.splitFile(rel)
+        if len(info.dir) > 0:
+            return "std/" + info.dir + "/" + info.name
+        return "std/" + info.name
+    let info = os.splitFile(sourcePath)
+    return info.name
+
+fn v3ParserHasCompilerTopLevel(textRaw: str): bool =
+    let lines = strutil.split(textRaw, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if strutil.startsWith(line, "import ") ||
+           strutil.startsWith(line, "type") ||
+           strutil.startsWith(line, "fn ") ||
+           strutil.startsWith(line, "iterator ") ||
+           strutil.startsWith(line, "const ") ||
+           strutil.startsWith(line, "let ") ||
+           strutil.startsWith(line, "var "):
+            return true
+    return false
+
+fn v3ParserMainFunctionPresent(textRaw: str): bool =
+    let lines = strutil.split(textRaw, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if strutil.startsWith(line, "fn main("):
+            return true
+    return false
+
+fn v3ParserReadImportEdges(workspaceRoot: str,
+                           packageRoot: str,
+                           ownerModulePath: str,
+                           textRaw: str): Result[V3ImportEdge[]] =
+    let lines = strutil.split(textRaw, '\n')
+    var edges: V3ImportEdge[] = []
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if !strutil.startsWith(line, "import "):
+            continue
+        let modulePath = v3ParserFirstToken(strings.sliceBytes(line, len("import "), len(line)))
+        if len(modulePath) <= 0:
+            return Err[V3ImportEdge[]]("v3 parser: malformed import at line " + intToStr(i + 1))
+        let sourcePath = v3ParserModulePathToSourcePath(workspaceRoot, packageRoot, modulePath)
+        add(edges, V3ImportEdge(
+            ownerModulePath: ownerModulePath,
+            targetModulePath: modulePath,
+            targetSourcePath: sourcePath,
+            resolved: v3ParserSourceExists(sourcePath)
+        ))
+    return Ok[V3ImportEdge[]](edges)
+
+fn v3ParserCollectClosure(workspaceRoot: str,
+                          packageRoot: str,
+                          sourcePathRaw: str,
+                          seen: var str[],
+                          ordered: var str[],
+                          unresolved: var int32): Result[bool] =
+    let sourcePath = strutil.strip(sourcePathRaw)
+    if len(sourcePath) <= 0:
+        return Err[bool]("v3 parser: missing closure source path")
+    if v3ParserStringSeqContains(seen, sourcePath):
+        return Ok[bool](true)
+    if !v3ParserSourceExists(sourcePath):
+        return Err[bool]("v3 parser: missing source: " + sourcePath)
+    add(seen, sourcePath)
+    add(ordered, sourcePath)
+    let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    let edgesRes = v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, os.readFile(sourcePath))
+    if IsErr(edgesRes):
+        return Err[bool](Error(edgesRes))
+    let edges = Value(edgesRes)
+    for i in 0..<edges.len:
+        if !edges[i].resolved:
+            unresolved = unresolved + 1
+            continue
+        let childRes = v3ParserCollectClosure(workspaceRoot,
+                                              packageRoot,
+                                              edges[i].targetSourcePath,
+                                              seen,
+                                              ordered,
+                                              unresolved)
+        if IsErr(childRes):
+            return Err[bool](Error(childRes))
+    return Ok[bool](true)
+
+fn v3ParseOrdinarySourceStub(packageRootRaw: str, sourcePathRaw: str): Result[V3ParsedSourceStub] =
+    let packageRoot = strutil.strip(packageRootRaw)
+    let workspaceRoot = v3ParserWorkspaceRoot(packageRoot)
+    let sourcePath = strutil.strip(sourcePathRaw)
+    if len(sourcePath) <= 0:
+        return Err[V3ParsedSourceStub]("v3 parser: missing source path")
+    if !v3ParserSourceExists(sourcePath):
+        return Err[V3ParsedSourceStub]("v3 parser: source file missing: " + sourcePath)
+    let text = os.readFile(sourcePath)
+    let parts = os.splitFile(sourcePath)
+    let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    let edgesRes = v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, text)
+    if IsErr(edgesRes):
+        return Err[V3ParsedSourceStub](Error(edgesRes))
+    var ordered: str[] = []
+    var seen: str[] = []
+    var unresolved: int32 = 0
+    let closureRes = v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, unresolved)
+    if IsErr(closureRes):
+        return Err[V3ParsedSourceStub](Error(closureRes))
+    return Ok[V3ParsedSourceStub](V3ParsedSourceStub(
+        workspaceRoot: workspaceRoot,
+        packageRoot: packageRoot,
+        packageId: v3ParserPackageId(packageRoot),
+        entrySourcePath: sourcePath,
+        sourcePath: sourcePath,
+        moduleStem: parts.name,
+        syntaxTag: "v3_source_stub_v1",
+        sourceKind: v3ParsedOrdinarySource,
+        ownerModulePaths: [ownerModulePath],
+        importEdges: Value(edgesRes),
+        orderedClosureSourcePaths: ordered,
+        hasCompilerTopLevel: v3ParserHasCompilerTopLevel(text),
+        mainFunctionPresent: v3ParserMainFunctionPresent(text),
+        unresolvedImportCount: unresolved
+    ))

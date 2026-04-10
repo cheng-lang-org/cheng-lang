@@ -1,0 +1,317 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/lsmr
+import cheng/v3/chain/csg
+
+const
+    v3PubSubPayloadKindCsgDelta: int32 = 1
+    v3PubSubPayloadKindStateDelta: int32 = 2
+
+type
+    V3PubSubTopic =
+        version: int32
+        centerAddress: types.V3LsmrAddress
+        depth: int32
+        resolutionLevel: int32
+        layerId: int32
+        baguaMode: int32
+        scopeDepth: int32
+        semanticFingerprint: layout.FixedBytes32
+        topicCid: layout.FixedBytes32
+
+    V3PubSubSubscription =
+        version: int32
+        nodeId: int32
+        address: types.V3LsmrAddress
+        baguaId: int32
+        barrierMode: int32
+        topicCid: layout.FixedBytes32
+
+    V3PubSubEnvelope =
+        version: int32
+        topicCid: layout.FixedBytes32
+        payloadKind: int32
+        payloadCid: layout.FixedBytes32
+        payloadSummaryCid: layout.FixedBytes32
+        envelopeCid: layout.FixedBytes32
+
+    V3PubSubPlan =
+        version: int32
+        topicCid: layout.FixedBytes32
+        envelopeCid: layout.FixedBytes32
+        subscriberCount: int32
+        branchCount: int32
+        branchDigits: int32[]
+        branchNodeCounts: int32[]
+        branchPrimaryNodeIds: int32[]
+        branchPrimaryAddresses: types.V3LsmrAddress[]
+        branchDeliveryPhases: int32[]
+        branchRouteCids: layout.FixedBytes32[]
+        planCid: layout.FixedBytes32
+
+fn v3PubSubTopicZero(): V3PubSubTopic =
+    return V3PubSubTopic(
+        version: 1,
+        centerAddress: types.v3LsmrAddressZero(),
+        depth: 0,
+        resolutionLevel: 0,
+        layerId: 0,
+        baguaMode: 0,
+        scopeDepth: 0,
+        semanticFingerprint: layout.fixedBytes32Zero(),
+        topicCid: layout.fixedBytes32Zero()
+    )
+
+fn v3PubSubSubscriptionZero(): V3PubSubSubscription =
+    return V3PubSubSubscription(
+        version: 1,
+        nodeId: 0,
+        address: types.v3LsmrAddressZero(),
+        baguaId: 0,
+        barrierMode: 0,
+        topicCid: layout.fixedBytes32Zero()
+    )
+
+fn v3PubSubEnvelopeZero(): V3PubSubEnvelope =
+    return V3PubSubEnvelope(
+        version: 1,
+        topicCid: layout.fixedBytes32Zero(),
+        payloadKind: 0,
+        payloadCid: layout.fixedBytes32Zero(),
+        payloadSummaryCid: layout.fixedBytes32Zero(),
+        envelopeCid: layout.fixedBytes32Zero()
+    )
+
+fn v3PubSubPlanZero(): V3PubSubPlan =
+    return V3PubSubPlan(
+        version: 1,
+        topicCid: layout.fixedBytes32Zero(),
+        envelopeCid: layout.fixedBytes32Zero(),
+        subscriberCount: 0,
+        branchCount: 0,
+        branchDigits: [],
+        branchNodeCounts: [],
+        branchPrimaryNodeIds: [],
+        branchPrimaryAddresses: [],
+        branchDeliveryPhases: [],
+        branchRouteCids: [],
+        planCid: layout.fixedBytes32Zero()
+    )
+
+fn v3PubSubSemanticFingerprint(ids: int32[]): layout.FixedBytes32 =
+    return lt.v3HashInts("v3.pubsub.semantic", ids)
+
+fn v3PubSubScopeDepth(layerId: int32, depth: int32): int32 =
+    if layerId == lt.v3LayerGlobal:
+        return 0
+    if layerId == lt.v3LayerRegional:
+        return 1
+    if depth <= 1:
+        return 1
+    return depth - 1
+
+fn v3PubSubAddressLess(left: types.V3LsmrAddress, right: types.V3LsmrAddress): bool =
+    if left.depth != right.depth:
+        return left.depth < right.depth
+    for i in 0..<types.v3LsmrMaxDepth:
+        if left.digits[i] != right.digits[i]:
+            return left.digits[i] < right.digits[i]
+    return false
+
+fn v3PubSubTopicFromAddress(centerAddress: types.V3LsmrAddress,
+                            resolutionLevel: int32,
+                            baguaMode: int32,
+                            semanticFingerprint: layout.FixedBytes32): Result[V3PubSubTopic] =
+    if !lt.v3PubSubModeValid(baguaMode):
+        return Err[V3PubSubTopic]("v3 pubsub: invalid bagua mode")
+    if resolutionLevel <= 0 || resolutionLevel > centerAddress.depth:
+        return Err[V3PubSubTopic]("v3 pubsub: invalid resolution level")
+    var out: V3PubSubTopic = v3PubSubTopicZero()
+    out.centerAddress = centerAddress
+    out.depth = centerAddress.depth
+    out.resolutionLevel = resolutionLevel
+    out.layerId = lsmr.v3LsmrStateLayerForResolution(resolutionLevel)
+    out.baguaMode = baguaMode
+    out.scopeDepth = v3PubSubScopeDepth(out.layerId, out.depth)
+    out.semanticFingerprint = semanticFingerprint
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.pubsub.topic"))
+    lt.v3AppendAddress(buf, centerAddress)
+    lt.v3AppendU32BE(buf, resolutionLevel)
+    lt.v3AppendU32BE(buf, out.layerId)
+    lt.v3AppendU32BE(buf, baguaMode)
+    lt.v3AppendU32BE(buf, out.scopeDepth)
+    for i in 0..<out.scopeDepth:
+        lt.v3AppendU32BE(buf, centerAddress.digits[i])
+    lt.v3AppendFixed32(buf, semanticFingerprint)
+    out.topicCid = lt.v3FixedCidFromBuf(buf)
+    return Ok[V3PubSubTopic](out)
+
+fn v3PubSubSubscriptionMake(nodeId: int32,
+                            address: types.V3LsmrAddress,
+                            barrierMode: int32,
+                            topicCid: layout.FixedBytes32): V3PubSubSubscription =
+    var out: V3PubSubSubscription = v3PubSubSubscriptionZero()
+    out.nodeId = nodeId
+    out.address = address
+    out.baguaId = lsmr.v3LsmrAddressBagua(address, intToStr(nodeId))
+    out.barrierMode = barrierMode
+    out.topicCid = topicCid
+    return out
+
+fn v3PubSubEnvelopeMake(topicCid: layout.FixedBytes32,
+                        payloadKind: int32,
+                        payloadCid: layout.FixedBytes32,
+                        payloadSummaryCid: layout.FixedBytes32): V3PubSubEnvelope =
+    var out: V3PubSubEnvelope = v3PubSubEnvelopeZero()
+    out.topicCid = topicCid
+    out.payloadKind = payloadKind
+    out.payloadCid = payloadCid
+    out.payloadSummaryCid = payloadSummaryCid
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.pubsub.envelope"))
+    lt.v3AppendFixed32(buf, topicCid)
+    lt.v3AppendU32BE(buf, payloadKind)
+    lt.v3AppendFixed32(buf, payloadCid)
+    lt.v3AppendFixed32(buf, payloadSummaryCid)
+    out.envelopeCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3PubSubEligible(topic: V3PubSubTopic, subscriberAddress: types.V3LsmrAddress): bool =
+    if subscriberAddress.depth != topic.centerAddress.depth:
+        return false
+    for i in 0..<topic.scopeDepth:
+        if subscriberAddress.digits[i] != topic.centerAddress.digits[i]:
+            return false
+    return true
+
+fn v3PubSubDeliveryPhase(topic: V3PubSubTopic,
+                         subscriberAddress: types.V3LsmrAddress): int32 =
+    if types.v3LsmrAddressEqual(topic.centerAddress, subscriberAddress):
+        return lt.v3RouteDeliveryKun
+    if topic.layerId == lt.v3LayerGlobal:
+        return lt.v3RouteDeliveryLi
+    return lt.v3RouteDeliveryDui
+
+fn v3PubSubPlanBranchPos(plan: V3PubSubPlan, digit: int32): int32 =
+    for i in 0..<plan.branchDigits.len:
+        if plan.branchDigits[i] == digit:
+            return i
+    return -1
+
+fn v3PubSubEnsureBranch(plan: var V3PubSubPlan, digit: int32): int32 =
+    let pos = v3PubSubPlanBranchPos(plan, digit)
+    if pos >= 0:
+        return pos
+    add(plan.branchDigits, digit)
+    add(plan.branchNodeCounts, 0)
+    add(plan.branchPrimaryNodeIds, 0)
+    add(plan.branchPrimaryAddresses, types.v3LsmrAddressZero())
+    add(plan.branchDeliveryPhases, 0)
+    add(plan.branchRouteCids, layout.fixedBytes32Zero())
+    return plan.branchDigits.len - 1
+
+fn v3PubSubSortBranches(plan: var V3PubSubPlan) =
+    for i in 1..<plan.branchDigits.len:
+        let digit = plan.branchDigits[i]
+        let nodeCount = plan.branchNodeCounts[i]
+        let nodeId = plan.branchPrimaryNodeIds[i]
+        let address = plan.branchPrimaryAddresses[i]
+        let phase = plan.branchDeliveryPhases[i]
+        let routeCid = plan.branchRouteCids[i]
+        var j = i - 1
+        while j >= 0 && plan.branchDigits[j] > digit:
+            plan.branchDigits[j + 1] = plan.branchDigits[j]
+            plan.branchNodeCounts[j + 1] = plan.branchNodeCounts[j]
+            plan.branchPrimaryNodeIds[j + 1] = plan.branchPrimaryNodeIds[j]
+            plan.branchPrimaryAddresses[j + 1] = plan.branchPrimaryAddresses[j]
+            plan.branchDeliveryPhases[j + 1] = plan.branchDeliveryPhases[j]
+            plan.branchRouteCids[j + 1] = plan.branchRouteCids[j]
+            j = j - 1
+        plan.branchDigits[j + 1] = digit
+        plan.branchNodeCounts[j + 1] = nodeCount
+        plan.branchPrimaryNodeIds[j + 1] = nodeId
+        plan.branchPrimaryAddresses[j + 1] = address
+        plan.branchDeliveryPhases[j + 1] = phase
+        plan.branchRouteCids[j + 1] = routeCid
+
+fn v3PubSubBuildPlan(topic: V3PubSubTopic,
+                     envelope: V3PubSubEnvelope,
+                     subscriptions: V3PubSubSubscription[]): Result[V3PubSubPlan] =
+    if !layout.fixedBytes32Equal(envelope.topicCid, topic.topicCid):
+        return Err[V3PubSubPlan]("v3 pubsub: envelope topic mismatch")
+    var out: V3PubSubPlan = v3PubSubPlanZero()
+    out.topicCid = topic.topicCid
+    out.envelopeCid = envelope.envelopeCid
+    var branchBestHops: int32[]
+    branchBestHops = []
+    for i in 0..<subscriptions.len:
+        if !layout.fixedBytes32Equal(subscriptions[i].topicCid, topic.topicCid):
+            continue
+        if !v3PubSubEligible(topic, subscriptions[i].address):
+            continue
+        let routeRes = lsmr.v3LsmrRoutePlanFromAddresses(topic.centerAddress, subscriptions[i].address)
+        if IsErr(routeRes):
+            return Err[V3PubSubPlan](Error(routeRes))
+        let route = Value(routeRes)
+        let branchDigit = lsmr.v3LsmrMulticastBranchDigit(topic.centerAddress, subscriptions[i].address)
+        let branchPos = v3PubSubEnsureBranch(out, branchDigit)
+        while branchBestHops.len < out.branchDigits.len:
+            add(branchBestHops, -1)
+        let phase = v3PubSubDeliveryPhase(topic, subscriptions[i].address)
+        if topic.baguaMode == lt.v3PubSubModeXun:
+            let bestHop = branchBestHops[branchPos]
+            if bestHop >= 0 && route.hopCount > bestHop:
+                continue
+            if bestHop >= 0 && route.hopCount == bestHop &&
+               !v3PubSubAddressLess(subscriptions[i].address, out.branchPrimaryAddresses[branchPos]):
+                continue
+            branchBestHops[branchPos] = route.hopCount
+            if out.branchNodeCounts[branchPos] == 0:
+                out.subscriberCount = out.subscriberCount + 1
+            
+            out.branchNodeCounts[branchPos] = 1
+            out.branchPrimaryNodeIds[branchPos] = subscriptions[i].nodeId
+            out.branchPrimaryAddresses[branchPos] = subscriptions[i].address
+            out.branchDeliveryPhases[branchPos] = phase
+            out.branchRouteCids[branchPos] = route.routeCid
+            continue
+        if out.branchNodeCounts[branchPos] == 0 ||
+           route.hopCount < branchBestHops[branchPos] ||
+           branchBestHops[branchPos] < 0 ||
+           (route.hopCount == branchBestHops[branchPos] &&
+            v3PubSubAddressLess(subscriptions[i].address, out.branchPrimaryAddresses[branchPos])):
+            out.branchPrimaryNodeIds[branchPos] = subscriptions[i].nodeId
+            out.branchPrimaryAddresses[branchPos] = subscriptions[i].address
+            out.branchDeliveryPhases[branchPos] = phase
+            out.branchRouteCids[branchPos] = route.routeCid
+            branchBestHops[branchPos] = route.hopCount
+        
+        out.branchNodeCounts[branchPos] = out.branchNodeCounts[branchPos] + 1
+        out.subscriberCount = out.subscriberCount + 1
+    out.branchCount = out.branchDigits.len
+    v3PubSubSortBranches(out)
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.pubsub.plan"))
+    lt.v3AppendFixed32(buf, out.topicCid)
+    lt.v3AppendFixed32(buf, out.envelopeCid)
+    lt.v3AppendU32BE(buf, out.subscriberCount)
+    lt.v3AppendU32BE(buf, out.branchCount)
+    for i in 0..<out.branchDigits.len:
+        lt.v3AppendU32BE(buf, out.branchDigits[i])
+        lt.v3AppendU32BE(buf, out.branchNodeCounts[i])
+        lt.v3AppendU32BE(buf, out.branchPrimaryNodeIds[i])
+        lt.v3AppendAddress(buf, out.branchPrimaryAddresses[i])
+        lt.v3AppendU32BE(buf, out.branchDeliveryPhases[i])
+        lt.v3AppendFixed32(buf, out.branchRouteCids[i])
+    out.planCid = lt.v3FixedCidFromBuf(buf)
+    return Ok[V3PubSubPlan](out)
+
+fn v3PubSubCsgDecision(topic: V3PubSubTopic,
+                       subscription: V3PubSubSubscription,
+                       subgraph: csg.V3CsgSubgraph): csg.V3CsgFilterDecision =
+    let barrierMode = subscription.barrierMode > 0 ? subscription.barrierMode : csg.v3CsgBarrierModeGen
+    let filter = csg.v3DefaultCsgBarrierFilter(topic.layerId, barrierMode)
+    return csg.v3ApplyCsgBarrierFilter(filter, subgraph)

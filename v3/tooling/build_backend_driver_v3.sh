@@ -8,6 +8,8 @@ out_path="$out_dir/cheng"
 log_path="$out_dir/build_backend_driver_v3.log"
 report_path="$out_dir/build_backend_driver_v3.report.txt"
 contract_log="$out_dir/build_backend_driver_v3.contract.txt"
+status_log="$out_dir/build_backend_driver_v3.status.txt"
+plan_log="$out_dir/build_backend_driver_v3.plan.txt"
 
 mkdir -p "$out_dir"
 
@@ -54,6 +56,18 @@ if ! "$out_path" print-contract --in:"$V3_BOOTSTRAP_STAGE1_SOURCE" >"$contract_l
   exit 1
 fi
 
+if ! "$out_path" status >"$status_log" 2>&1; then
+  echo "v3 backend driver: built output is still bootstrap-only, missing ordinary status command: $out_path" >&2
+  tail -n 80 "$status_log" >&2 || true
+  exit 1
+fi
+
+if ! "$out_path" print-build-plan >"$plan_log" 2>&1; then
+  echo "v3 backend driver: built output is still bootstrap-only, missing ordinary build-plan command: $out_path" >&2
+  tail -n 80 "$plan_log" >&2 || true
+  exit 1
+fi
+
 if [ -x "${V3_BOOTSTRAP_STAGE3:-}" ] && ! "$V3_BOOTSTRAP_STAGE3" print-contract --in:"$V3_BOOTSTRAP_STAGE1_SOURCE" \
   >"$out_dir/reference_stage3.contract.txt" 2>&1; then
   echo "v3 backend driver: stage3 print-contract failed" >&2
@@ -69,14 +83,20 @@ fi
 cat >"$report_path" <<EOF
 target=${V3_TARGET:-arm64-apple-darwin}
 bootstrap_kind=${V3_BOOTSTRAP_KIND:-v3_seed}
-compiler_class=bootstrap_subset
+compiler_class=ordinary_compiler
 stage0_compiler=${V3_BOOTSTRAP_STAGE0:-}
 stage1_compiler=${V3_BOOTSTRAP_STAGE1:-}
 stage2_compiler=$V3_BOOTSTRAP_STAGE2
 stage3_compiler=${V3_BOOTSTRAP_STAGE3:-}
-source=$V3_BOOTSTRAP_STAGE1_SOURCE
+bootstrap_contract_source=$V3_BOOTSTRAP_STAGE1_SOURCE
+planned_entry_source=${V3_COMPILER_ENTRY_SOURCE:-}
+planned_runtime_source=${V3_COMPILER_RUNTIME_SOURCE:-}
+planned_request_source=${V3_COMPILER_REQUEST_SOURCE:-}
+materialized_source=$V3_BOOTSTRAP_STAGE1_SOURCE
 output=$out_path
 contract_log=$contract_log
+status_log=$status_log
+plan_log=$plan_log
 log=$log_path
 EOF
 

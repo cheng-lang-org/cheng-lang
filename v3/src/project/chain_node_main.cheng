@@ -1,0 +1,43 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/project/chain_node as node
+
+fn v3ChainNodeMainSelfTest(): int32 =
+    var server = node.v3ChainNodeInit("node-a", "chain-node-a")
+    var client = node.v3ChainNodeInit("node-b", "chain-node-b")
+
+    let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(mintCidRes.ok, "v3 chain_node main: mint")
+
+    let aliceAfterMintRes = node.v3ChainNodeBalance(server, 7, 1001)
+    assert(aliceAfterMintRes.ok, "v3 chain_node main: balance after mint")
+    assert(aliceAfterMintRes.value == int64(100), "v3 chain_node main: minted balance")
+
+    let transferCidRes = node.v3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
+    assert(transferCidRes.ok, "v3 chain_node main: transfer")
+    assert(!layout.fixedBytes32Equal(mintCidRes.value, transferCidRes.value), "v3 chain_node main: transfer cid differs")
+
+    let served = node.v3ChainNodeServeOnce(server)
+    let syncRes = node.v3ChainNodeSyncOnce(client, served)
+    assert(syncRes.ok, "v3 chain_node main: sync once")
+    assert(syncRes.value, "v3 chain_node main: sync changed state")
+
+    let aliceClientRes = node.v3ChainNodeBalance(client, 7, 1001)
+    let bobClientRes = node.v3ChainNodeBalance(client, 7, 2002)
+    assert(aliceClientRes.ok, "v3 chain_node main: client alice balance")
+    assert(bobClientRes.ok, "v3 chain_node main: client bob balance")
+    assert(aliceClientRes.value == int64(60), "v3 chain_node main: client alice 60")
+    assert(bobClientRes.value == int64(40), "v3 chain_node main: client bob 40")
+
+    let clientServed = node.v3ChainNodeServeOnce(client)
+    assert(layout.fixedBytes32Equal(served.tipEventCid, clientServed.tipEventCid), "v3 chain_node main: tip cid一致")
+    assert(layout.fixedBytes32Equal(node.v3ChainNodeForestCid(server), node.v3ChainNodeForestCid(client)), "v3 chain_node main: forest cid一致")
+    assert(layout.fixedBytes32Equal(served.forest.forestCid, clientServed.forest.forestCid), "v3 chain_node main: served forest一致")
+    assert(anti.v3AntiEntropySignatureEqual(served.signature, clientServed.signature), "v3 chain_node main: signature一致")
+
+    echo("v3 chain_node self-test ok")
+    return 0
+
+fn main(): int32 =
+    return v3ChainNodeMainSelfTest()

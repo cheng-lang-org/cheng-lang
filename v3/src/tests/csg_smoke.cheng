@@ -1,0 +1,52 @@
+import std/system
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/csg
+
+fn main(): int32 =
+    let payload0 = lt.v3HashInts("v3.test.payload", [1, 10])
+    let payload1 = lt.v3HashInts("v3.test.payload", [2, 20])
+    let payload2 = lt.v3HashInts("v3.test.payload", [3, 30])
+
+    let safeGraphRes = csg.v3BuildCsgSubgraph(
+        101,
+        [10, 20, 30],
+        [csg.v3CsgNodeKindSource, csg.v3CsgNodeKindRewrite, csg.v3CsgNodeKindSink],
+        [csg.v3CsgCapabilityRead, csg.v3CsgCapabilityRegionalBatch, csg.v3CsgCapabilityEmit],
+        [payload0, payload1, payload2],
+        [10, 20],
+        [20, 30],
+        [csg.v3CsgEdgeKindData, csg.v3CsgEdgeKindEmit]
+    )
+    assert(IsOk(safeGraphRes), "v3 csg smoke: build safe graph")
+    let safeGraph = Value(safeGraphRes)
+    let filter = csg.v3DefaultCsgBarrierFilter(lt.v3LayerRegional, csg.v3CsgBarrierModeGen)
+    let safeDecision = csg.v3ApplyCsgBarrierFilter(filter, safeGraph)
+    assert(safeDecision.accepted, "v3 csg smoke: safe graph accepted")
+    assert(safeDecision.deniedNodeIds.len == 0, "v3 csg smoke: no denied nodes")
+
+    let delta = csg.v3CsgDeltaFromSubgraph(layout.fixedBytes32Zero(), safeGraph)
+    assert(delta.nodeCount == 3, "v3 csg smoke: delta node count")
+    assert(delta.edgeCount == 2, "v3 csg smoke: delta edge count")
+
+    let unsafeGraphRes = csg.v3BuildCsgSubgraph(
+        102,
+        [1, 2],
+        [csg.v3CsgNodeKindSource, csg.v3CsgNodeKindRewrite],
+        [csg.v3CsgCapabilityRead, csg.v3CsgCapabilityRawmemWrite],
+        [payload0, payload1],
+        [1],
+        [2],
+        [csg.v3CsgEdgeKindUnsafeWrite]
+    )
+    assert(IsOk(unsafeGraphRes), "v3 csg smoke: build unsafe graph")
+    let unsafeDecision = csg.v3ApplyCsgBarrierFilter(filter, Value(unsafeGraphRes))
+    assert(!unsafeDecision.accepted, "v3 csg smoke: unsafe graph rejected")
+    assert(unsafeDecision.deniedNodeIds.len == 2, "v3 csg smoke: two denied nodes")
+    assert((unsafeDecision.deniedNodeIds[0] == 1 && unsafeDecision.deniedNodeIds[1] == 2) ||
+           (unsafeDecision.deniedNodeIds[0] == 2 && unsafeDecision.deniedNodeIds[1] == 1),
+           "v3 csg smoke: denied source and rewrite nodes")
+
+    echo("v3 csg_smoke ok")
+    return 0

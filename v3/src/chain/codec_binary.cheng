@@ -1,8 +1,118 @@
 import std/result
 import std/rawbytes
-import ../std/bytes_layout as layout
-import ../std/crypto/fixed256 as fixed256
-import binary_types as types
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/fixed256 as fixed256
+import cheng/v3/chain/binary_types as types
+
+const
+    v3CodecLsmrMaxDepth: int32 = 32
+
+type
+    V3DecodedFrameHeader =
+        kind: types.V3FrameKind
+        payloadLen: int32
+        epoch: int32
+        ganzhiIndex: int32
+        sourcePeerId: layout.FixedBytes32
+        bodyCid: layout.FixedBytes32
+
+    V3DecodedStateRootSummary =
+        stateForestCid: layout.FixedBytes32
+        eventRootCid: layout.FixedBytes32
+        accountRootCid: layout.FixedBytes32
+
+    V3DecodedHelloPayload =
+        peerId: layout.FixedBytes32
+        address: types.V3LsmrAddress
+        tipEventCid: layout.FixedBytes32
+        summary: V3DecodedStateRootSummary
+
+    V3DecodedAdvertisePayload =
+        peerId: layout.FixedBytes32
+        stateForestCid: layout.FixedBytes32
+        eventCid: layout.FixedBytes32
+        accountCount: int32
+        eventCount: int32
+        maxStampEpoch: int32
+        maxStampGanzhi: int32
+
+    V3DecodedWantStatePayload =
+        peerId: layout.FixedBytes32
+        stateForestCid: layout.FixedBytes32
+        targetBaguaId: int32
+        prefixDepth: int32
+        prefixDigits: int32[v3CodecLsmrMaxDepth]
+
+fn v3DecodedFrameHeaderMake(kind: types.V3FrameKind,
+                            payloadLen: int32,
+                            epoch: int32,
+                            ganzhiIndex: int32,
+                            sourcePeerId: layout.FixedBytes32,
+                            bodyCid: layout.FixedBytes32): V3DecodedFrameHeader =
+    return V3DecodedFrameHeader(
+        kind: kind,
+        payloadLen: payloadLen,
+        epoch: epoch,
+        ganzhiIndex: ganzhiIndex,
+        sourcePeerId: sourcePeerId,
+        bodyCid: bodyCid
+    )
+
+fn v3DecodedStateRootSummaryMake(stateForestCid: layout.FixedBytes32,
+                                 eventRootCid: layout.FixedBytes32,
+                                 accountRootCid: layout.FixedBytes32): V3DecodedStateRootSummary =
+    return V3DecodedStateRootSummary(
+        stateForestCid: stateForestCid,
+        eventRootCid: eventRootCid,
+        accountRootCid: accountRootCid
+    )
+
+fn v3DecodedHelloPayloadMake(peerId: layout.FixedBytes32,
+                             address: types.V3LsmrAddress,
+                             tipEventCid: layout.FixedBytes32,
+                             summary: V3DecodedStateRootSummary): V3DecodedHelloPayload =
+    return V3DecodedHelloPayload(
+        peerId: peerId,
+        address: address,
+        tipEventCid: tipEventCid,
+        summary: summary
+    )
+
+fn v3DecodedAdvertisePayloadMake(peerId: layout.FixedBytes32,
+                                 stateForestCid: layout.FixedBytes32,
+                                 eventCid: layout.FixedBytes32,
+                                 accountCount: int32,
+                                 eventCount: int32,
+                                 maxStampEpoch: int32,
+                                 maxStampGanzhi: int32): V3DecodedAdvertisePayload =
+    return V3DecodedAdvertisePayload(
+        peerId: peerId,
+        stateForestCid: stateForestCid,
+        eventCid: eventCid,
+        accountCount: accountCount,
+        eventCount: eventCount,
+        maxStampEpoch: maxStampEpoch,
+        maxStampGanzhi: maxStampGanzhi
+    )
+
+fn v3DecodedWantStatePayloadMake(peerId: layout.FixedBytes32,
+                                 stateForestCid: layout.FixedBytes32,
+                                 targetBaguaId: int32,
+                                 prefixDigitsRaw: int32[]): Result[V3DecodedWantStatePayload] =
+    if !types.v3LsmrDigitOk(targetBaguaId):
+        return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE bagua digit")
+    if prefixDigitsRaw.len > types.v3LsmrMaxDepth:
+        return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE depth")
+    var out: V3DecodedWantStatePayload
+    out.peerId = peerId
+    out.stateForestCid = stateForestCid
+    out.targetBaguaId = targetBaguaId
+    out.prefixDepth = prefixDigitsRaw.len
+    for i in 0..<prefixDigitsRaw.len:
+        if !types.v3LsmrDigitOk(prefixDigitsRaw[i]):
+            return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE digit")
+        out.prefixDigits[i] = prefixDigitsRaw[i]
+    return Ok[V3DecodedWantStatePayload](out)
 
 fn v3BufAppendU32BE(buf: var layout.ByteBuf, value: int64) =
     layout.byteBufAppendByte(buf, int32((value >> 24) & 255))
@@ -41,16 +151,20 @@ fn v3ReadAddress(span: layout.ByteSpan, offset: int32): Result[types.V3LsmrAddre
     let depth: int32 = int32(Value(depthRes))
     if depth < 0 || depth > types.v3LsmrMaxDepth:
         return Err[types.V3LsmrAddress]("v3 chain codec: invalid address depth")
-    var out: types.V3LsmrAddress = types.v3LsmrAddressZero()
-    out.depth = depth
-    for i in 0..<types.v3LsmrMaxDepth:
+    var digits: int32[] = []
+    for i in 0..<depth:
         let digit: int32 = layout.byteSpanAt(span, offset + 4 + i)
-        if i < depth && !types.v3LsmrDigitOk(digit):
+        if !types.v3LsmrDigitOk(digit):
             return Err[types.V3LsmrAddress]("v3 chain codec: invalid address digit")
-        out.digits[i] = digit
-    return Ok[types.V3LsmrAddress](out)
+        add(digits, digit)
+    return types.v3LsmrAddressFromDigits(digits)
 
 fn v3BufAppendStateSummary(buf: var layout.ByteBuf, summary: types.V3StateRootSummary) =
+    v3BufAppendFixed32(buf, summary.stateForestCid)
+    v3BufAppendFixed32(buf, summary.eventRootCid)
+    v3BufAppendFixed32(buf, summary.accountRootCid)
+
+fn v3BufAppendStateSummaryRaw(buf: var layout.ByteBuf, summary: V3DecodedStateRootSummary) =
     v3BufAppendFixed32(buf, summary.stateForestCid)
     v3BufAppendFixed32(buf, summary.eventRootCid)
     v3BufAppendFixed32(buf, summary.accountRootCid)
@@ -65,77 +179,97 @@ fn v3ReadStateSummary(span: layout.ByteSpan, offset: int32): Result[types.V3Stat
     let accountRes = v3ReadFixed32(span, offset + 64)
     if IsErr(accountRes):
         return Err[types.V3StateRootSummary](Error(accountRes))
-    return Ok[types.V3StateRootSummary](types.V3StateRootSummary(
-        stateForestCid: Value(stateRes),
-        eventRootCid: Value(eventRes),
-        accountRootCid: Value(accountRes)
+    return Ok[types.V3StateRootSummary](types.v3StateRootSummaryMake(
+        Value(stateRes),
+        Value(eventRes),
+        Value(accountRes)
+    ))
+
+fn v3ReadStateSummaryRaw(span: layout.ByteSpan, offset: int32): Result[V3DecodedStateRootSummary] =
+    let stateRes = v3ReadFixed32(span, offset)
+    if IsErr(stateRes):
+        return Err[V3DecodedStateRootSummary](Error(stateRes))
+    let eventRes = v3ReadFixed32(span, offset + 32)
+    if IsErr(eventRes):
+        return Err[V3DecodedStateRootSummary](Error(eventRes))
+    let accountRes = v3ReadFixed32(span, offset + 64)
+    if IsErr(accountRes):
+        return Err[V3DecodedStateRootSummary](Error(accountRes))
+    return Ok[V3DecodedStateRootSummary](v3DecodedStateRootSummaryMake(
+        Value(stateRes),
+        Value(eventRes),
+        Value(accountRes)
     ))
 
 fn v3FrameBodyCid(payload: Bytes): layout.FixedBytes32 =
     return fixed256.sha256Fixed(layout.byteSpanFromBytes(payload))
 
-fn v3EncodeFrameHeader(header: types.V3FrameHeader): Bytes =
+fn v3EncodeFrameHeaderRaw(kind: types.V3FrameKind,
+                          payloadLen: int32,
+                          epoch: int32,
+                          ganzhiIndex: int32,
+                          sourcePeerId: layout.FixedBytes32,
+                          bodyCid: layout.FixedBytes32): Bytes =
     var buf: layout.ByteBuf = layout.byteBufInit(types.v3FrameHeaderSize)
-    v3BufAppendU32BE(buf, header.magic)
-    v3BufAppendU32BE(buf, header.version)
-    v3BufAppendU32BE(buf, header.kind)
-    v3BufAppendU32BE(buf, header.flags)
-    v3BufAppendU32BE(buf, header.payloadLen)
-    v3BufAppendU32BE(buf, header.epoch)
-    v3BufAppendU32BE(buf, header.ganzhiIndex)
-    v3BufAppendU32BE(buf, header.reserved0)
-    v3BufAppendFixed32(buf, header.sourcePeerId)
-    v3BufAppendFixed32(buf, header.bodyCid)
+    v3BufAppendU32BE(buf, types.v3FrameMagic)
+    v3BufAppendU32BE(buf, types.v3ChainCodecVersion)
+    v3BufAppendU32BE(buf, kind)
+    v3BufAppendU32BE(buf, 0)
+    v3BufAppendU32BE(buf, payloadLen)
+    v3BufAppendU32BE(buf, epoch)
+    v3BufAppendU32BE(buf, ganzhiIndex)
+    v3BufAppendU32BE(buf, 0)
+    v3BufAppendFixed32(buf, sourcePeerId)
+    v3BufAppendFixed32(buf, bodyCid)
     return layout.byteBufToBytes(buf)
 
-fn v3DecodeFrameHeader(data: layout.ByteSpan): Result[types.V3FrameHeader] =
+fn v3DecodeFrameHeader(data: layout.ByteSpan): Result[V3DecodedFrameHeader] =
     if layout.byteSpanLen(data) < types.v3FrameHeaderSize:
-        return Err[types.V3FrameHeader]("v3 chain codec: short frame header")
+        return Err[V3DecodedFrameHeader]("v3 chain codec: short frame header")
     let magicRes = v3ReadU32BE(data, 0)
     if IsErr(magicRes):
-        return Err[types.V3FrameHeader](Error(magicRes))
+        return Err[V3DecodedFrameHeader](Error(magicRes))
     let versionRes = v3ReadU32BE(data, 4)
     if IsErr(versionRes):
-        return Err[types.V3FrameHeader](Error(versionRes))
+        return Err[V3DecodedFrameHeader](Error(versionRes))
     let kindRes = v3ReadU32BE(data, 8)
     if IsErr(kindRes):
-        return Err[types.V3FrameHeader](Error(kindRes))
+        return Err[V3DecodedFrameHeader](Error(kindRes))
     let flagsRes = v3ReadU32BE(data, 12)
     if IsErr(flagsRes):
-        return Err[types.V3FrameHeader](Error(flagsRes))
+        return Err[V3DecodedFrameHeader](Error(flagsRes))
     let payloadLenRes = v3ReadU32BE(data, 16)
     if IsErr(payloadLenRes):
-        return Err[types.V3FrameHeader](Error(payloadLenRes))
+        return Err[V3DecodedFrameHeader](Error(payloadLenRes))
     let epochRes = v3ReadU32BE(data, 20)
     if IsErr(epochRes):
-        return Err[types.V3FrameHeader](Error(epochRes))
+        return Err[V3DecodedFrameHeader](Error(epochRes))
     let ganzhiRes = v3ReadU32BE(data, 24)
     if IsErr(ganzhiRes):
-        return Err[types.V3FrameHeader](Error(ganzhiRes))
+        return Err[V3DecodedFrameHeader](Error(ganzhiRes))
     let reservedRes = v3ReadU32BE(data, 28)
     if IsErr(reservedRes):
-        return Err[types.V3FrameHeader](Error(reservedRes))
+        return Err[V3DecodedFrameHeader](Error(reservedRes))
     let peerRes = v3ReadFixed32(data, 32)
     if IsErr(peerRes):
-        return Err[types.V3FrameHeader](Error(peerRes))
+        return Err[V3DecodedFrameHeader](Error(peerRes))
     let bodyCidRes = v3ReadFixed32(data, 64)
     if IsErr(bodyCidRes):
-        return Err[types.V3FrameHeader](Error(bodyCidRes))
+        return Err[V3DecodedFrameHeader](Error(bodyCidRes))
     if int32(Value(magicRes)) != types.v3FrameMagic:
-        return Err[types.V3FrameHeader]("v3 chain codec: bad frame magic")
+        return Err[V3DecodedFrameHeader]("v3 chain codec: bad frame magic")
     if int32(Value(versionRes)) != types.v3ChainCodecVersion:
-        return Err[types.V3FrameHeader]("v3 chain codec: bad frame version")
-    return Ok[types.V3FrameHeader](types.V3FrameHeader(
-        magic: int32(Value(magicRes)),
-        version: int32(Value(versionRes)),
-        kind: int32(Value(kindRes)),
-        flags: int32(Value(flagsRes)),
-        payloadLen: int32(Value(payloadLenRes)),
-        epoch: int32(Value(epochRes)),
-        ganzhiIndex: int32(Value(ganzhiRes)),
-        reserved0: int32(Value(reservedRes)),
-        sourcePeerId: Value(peerRes),
-        bodyCid: Value(bodyCidRes)
+        return Err[V3DecodedFrameHeader]("v3 chain codec: bad frame version")
+    let flags = int32(Value(flagsRes))
+    if flags != 0 || int32(Value(reservedRes)) != 0:
+        return Err[V3DecodedFrameHeader]("v3 chain codec: reserved header bits must be zero")
+    return Ok[V3DecodedFrameHeader](v3DecodedFrameHeaderMake(
+        int32(Value(kindRes)),
+        int32(Value(payloadLenRes)),
+        int32(Value(epochRes)),
+        int32(Value(ganzhiRes)),
+        Value(peerRes),
+        Value(bodyCidRes)
     ))
 
 fn v3EncodeHelloPayload(payload: types.V3HelloPayload): Bytes =
@@ -144,6 +278,17 @@ fn v3EncodeHelloPayload(payload: types.V3HelloPayload): Bytes =
     v3BufAppendAddress(buf, payload.address)
     v3BufAppendFixed32(buf, payload.tipEventCid)
     v3BufAppendStateSummary(buf, payload.summary)
+    return layout.byteBufToBytes(buf)
+
+fn v3EncodeHelloPayloadRaw(peerId: layout.FixedBytes32,
+                           address: types.V3LsmrAddress,
+                           tipEventCid: layout.FixedBytes32,
+                           summary: V3DecodedStateRootSummary): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(196)
+    v3BufAppendFixed32(buf, peerId)
+    v3BufAppendAddress(buf, address)
+    v3BufAppendFixed32(buf, tipEventCid)
+    v3BufAppendStateSummaryRaw(buf, summary)
     return layout.byteBufToBytes(buf)
 
 fn v3DecodeHelloPayload(data: layout.ByteSpan): Result[types.V3HelloPayload] =
@@ -161,11 +306,33 @@ fn v3DecodeHelloPayload(data: layout.ByteSpan): Result[types.V3HelloPayload] =
     let summaryRes = v3ReadStateSummary(data, 100)
     if IsErr(summaryRes):
         return Err[types.V3HelloPayload](Error(summaryRes))
-    return Ok[types.V3HelloPayload](types.V3HelloPayload(
-        peerId: Value(peerRes),
-        address: Value(addrRes),
-        tipEventCid: Value(tipRes),
-        summary: Value(summaryRes)
+    return Ok[types.V3HelloPayload](types.v3HelloPayloadMake(
+        Value(peerRes),
+        Value(addrRes),
+        Value(tipRes),
+        Value(summaryRes)
+    ))
+
+fn v3DecodeHelloPayloadRaw(data: layout.ByteSpan): Result[V3DecodedHelloPayload] =
+    if layout.byteSpanLen(data) != 196:
+        return Err[V3DecodedHelloPayload]("v3 chain codec: invalid HELLO payload size")
+    let peerRes = v3ReadFixed32(data, 0)
+    if IsErr(peerRes):
+        return Err[V3DecodedHelloPayload](Error(peerRes))
+    let addrRes = v3ReadAddress(data, 32)
+    if IsErr(addrRes):
+        return Err[V3DecodedHelloPayload](Error(addrRes))
+    let tipRes = v3ReadFixed32(data, 68)
+    if IsErr(tipRes):
+        return Err[V3DecodedHelloPayload](Error(tipRes))
+    let summaryRes = v3ReadStateSummaryRaw(data, 100)
+    if IsErr(summaryRes):
+        return Err[V3DecodedHelloPayload](Error(summaryRes))
+    return Ok[V3DecodedHelloPayload](v3DecodedHelloPayloadMake(
+        Value(peerRes),
+        Value(addrRes),
+        Value(tipRes),
+        Value(summaryRes)
     ))
 
 fn v3EncodeAdvertisePayload(payload: types.V3AdvertisePayload): Bytes =
@@ -177,6 +344,23 @@ fn v3EncodeAdvertisePayload(payload: types.V3AdvertisePayload): Bytes =
     v3BufAppendU32BE(buf, payload.eventCount)
     v3BufAppendU32BE(buf, payload.maxStampEpoch)
     v3BufAppendU32BE(buf, payload.maxStampGanzhi)
+    return layout.byteBufToBytes(buf)
+
+fn v3EncodeAdvertisePayloadRaw(peerId: layout.FixedBytes32,
+                               stateForestCid: layout.FixedBytes32,
+                               eventCid: layout.FixedBytes32,
+                               accountCount: int32,
+                               eventCount: int32,
+                               maxStampEpoch: int32,
+                               maxStampGanzhi: int32): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(112)
+    v3BufAppendFixed32(buf, peerId)
+    v3BufAppendFixed32(buf, stateForestCid)
+    v3BufAppendFixed32(buf, eventCid)
+    v3BufAppendU32BE(buf, accountCount)
+    v3BufAppendU32BE(buf, eventCount)
+    v3BufAppendU32BE(buf, maxStampEpoch)
+    v3BufAppendU32BE(buf, maxStampGanzhi)
     return layout.byteBufToBytes(buf)
 
 fn v3DecodeAdvertisePayload(data: layout.ByteSpan): Result[types.V3AdvertisePayload] =
@@ -203,14 +387,48 @@ fn v3DecodeAdvertisePayload(data: layout.ByteSpan): Result[types.V3AdvertisePayl
     let ganzhiRes = v3ReadU32BE(data, 108)
     if IsErr(ganzhiRes):
         return Err[types.V3AdvertisePayload](Error(ganzhiRes))
-    return Ok[types.V3AdvertisePayload](types.V3AdvertisePayload(
-        peerId: Value(peerRes),
-        stateForestCid: Value(stateRes),
-        eventCid: Value(eventCidRes),
-        accountCount: int32(Value(accountRes)),
-        eventCount: int32(Value(eventCountRes)),
-        maxStampEpoch: int32(Value(epochRes)),
-        maxStampGanzhi: int32(Value(ganzhiRes))
+    return Ok[types.V3AdvertisePayload](types.v3AdvertisePayloadMake(
+        Value(peerRes),
+        Value(stateRes),
+        Value(eventCidRes),
+        int32(Value(accountRes)),
+        int32(Value(eventCountRes)),
+        int32(Value(epochRes)),
+        int32(Value(ganzhiRes))
+    ))
+
+fn v3DecodeAdvertisePayloadRaw(data: layout.ByteSpan): Result[V3DecodedAdvertisePayload] =
+    if layout.byteSpanLen(data) != 112:
+        return Err[V3DecodedAdvertisePayload]("v3 chain codec: invalid ADVERTISE payload size")
+    let peerRes = v3ReadFixed32(data, 0)
+    if IsErr(peerRes):
+        return Err[V3DecodedAdvertisePayload](Error(peerRes))
+    let stateRes = v3ReadFixed32(data, 32)
+    if IsErr(stateRes):
+        return Err[V3DecodedAdvertisePayload](Error(stateRes))
+    let eventCidRes = v3ReadFixed32(data, 64)
+    if IsErr(eventCidRes):
+        return Err[V3DecodedAdvertisePayload](Error(eventCidRes))
+    let accountRes = v3ReadU32BE(data, 96)
+    if IsErr(accountRes):
+        return Err[V3DecodedAdvertisePayload](Error(accountRes))
+    let eventCountRes = v3ReadU32BE(data, 100)
+    if IsErr(eventCountRes):
+        return Err[V3DecodedAdvertisePayload](Error(eventCountRes))
+    let epochRes = v3ReadU32BE(data, 104)
+    if IsErr(epochRes):
+        return Err[V3DecodedAdvertisePayload](Error(epochRes))
+    let ganzhiRes = v3ReadU32BE(data, 108)
+    if IsErr(ganzhiRes):
+        return Err[V3DecodedAdvertisePayload](Error(ganzhiRes))
+    return Ok[V3DecodedAdvertisePayload](v3DecodedAdvertisePayloadMake(
+        Value(peerRes),
+        Value(stateRes),
+        Value(eventCidRes),
+        int32(Value(accountRes)),
+        int32(Value(eventCountRes)),
+        int32(Value(epochRes)),
+        int32(Value(ganzhiRes))
     ))
 
 fn v3EncodeWantStatePayload(payload: types.V3WantStatePayload): Bytes =
@@ -222,6 +440,23 @@ fn v3EncodeWantStatePayload(payload: types.V3WantStatePayload): Bytes =
     for i in 0..<types.v3LsmrMaxDepth:
         layout.byteBufAppendByte(buf, payload.prefixDigits[i] & 255)
     return layout.byteBufToBytes(buf)
+
+fn v3EncodeWantStatePayloadRaw(peerId: layout.FixedBytes32,
+                               stateForestCid: layout.FixedBytes32,
+                               targetBaguaId: int32,
+                               prefixDigitsRaw: int32[]): Result[Bytes] =
+    let decodedRes = v3DecodedWantStatePayloadMake(peerId, stateForestCid, targetBaguaId, prefixDigitsRaw)
+    if IsErr(decodedRes):
+        return Err[Bytes](Error(decodedRes))
+    let decoded = Value(decodedRes)
+    var buf: layout.ByteBuf = layout.byteBufInit(104)
+    v3BufAppendFixed32(buf, decoded.peerId)
+    v3BufAppendFixed32(buf, decoded.stateForestCid)
+    v3BufAppendU32BE(buf, decoded.targetBaguaId)
+    v3BufAppendU32BE(buf, decoded.prefixDepth)
+    for i in 0..<types.v3LsmrMaxDepth:
+        layout.byteBufAppendByte(buf, decoded.prefixDigits[i] & 255)
+    return Ok[Bytes](layout.byteBufToBytes(buf))
 
 fn v3DecodeWantStatePayload(data: layout.ByteSpan): Result[types.V3WantStatePayload] =
     if layout.byteSpanLen(data) != 104:
@@ -244,17 +479,39 @@ fn v3DecodeWantStatePayload(data: layout.ByteSpan): Result[types.V3WantStatePayl
     let prefixDepth: int32 = int32(Value(depthRes))
     if prefixDepth < 0 || prefixDepth > types.v3LsmrMaxDepth:
         return Err[types.V3WantStatePayload]("v3 chain codec: invalid WANT_STATE depth")
-    var out: types.V3WantStatePayload
-    out.peerId = Value(peerRes)
-    out.stateForestCid = Value(stateRes)
-    out.targetBaguaId = targetBaguaId
-    out.prefixDepth = prefixDepth
-    for i in 0..<types.v3LsmrMaxDepth:
+    var digits: int32[] = []
+    for i in 0..<prefixDepth:
         let digit: int32 = layout.byteSpanAt(data, 72 + i)
-        if i < prefixDepth && !types.v3LsmrDigitOk(digit):
+        if !types.v3LsmrDigitOk(digit):
             return Err[types.V3WantStatePayload]("v3 chain codec: invalid WANT_STATE digit")
-        out.prefixDigits[i] = digit
-    return Ok[types.V3WantStatePayload](out)
+        add(digits, digit)
+    return types.v3WantStatePayloadFromDigits(Value(peerRes), Value(stateRes), targetBaguaId, digits)
+
+fn v3DecodeWantStatePayloadRaw(data: layout.ByteSpan): Result[V3DecodedWantStatePayload] =
+    if layout.byteSpanLen(data) != 104:
+        return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE payload size")
+    let peerRes = v3ReadFixed32(data, 0)
+    if IsErr(peerRes):
+        return Err[V3DecodedWantStatePayload](Error(peerRes))
+    let stateRes = v3ReadFixed32(data, 32)
+    if IsErr(stateRes):
+        return Err[V3DecodedWantStatePayload](Error(stateRes))
+    let baguaRes = v3ReadU32BE(data, 64)
+    if IsErr(baguaRes):
+        return Err[V3DecodedWantStatePayload](Error(baguaRes))
+    let prefixDepthRes = v3ReadU32BE(data, 68)
+    if IsErr(prefixDepthRes):
+        return Err[V3DecodedWantStatePayload](Error(prefixDepthRes))
+    let prefixDepth = int32(Value(prefixDepthRes))
+    if prefixDepth < 0 || prefixDepth > types.v3LsmrMaxDepth:
+        return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE depth")
+    var digits: int32[] = []
+    for i in 0..<prefixDepth:
+        let digit: int32 = layout.byteSpanAt(data, 72 + i)
+        if !types.v3LsmrDigitOk(digit):
+            return Err[V3DecodedWantStatePayload]("v3 chain codec: invalid WANT_STATE digit")
+        add(digits, digit)
+    return v3DecodedWantStatePayloadMake(Value(peerRes), Value(stateRes), int32(Value(baguaRes)), digits)
 
 fn v3EncodeStateChunkPayload(payload: types.V3StateChunkPayload): Bytes =
     var buf: layout.ByteBuf = layout.byteBufInit(104)
@@ -283,12 +540,12 @@ fn v3DecodeStateChunkPayload(data: layout.ByteSpan): Result[types.V3StateChunkPa
     let nodeRes = v3ReadU32BE(data, 100)
     if IsErr(nodeRes):
         return Err[types.V3StateChunkPayload](Error(nodeRes))
-    return Ok[types.V3StateChunkPayload](types.V3StateChunkPayload(
-        peerId: Value(peerRes),
-        stateForestCid: Value(stateRes),
-        subtreeCid: Value(subtreeRes),
-        entryCount: int32(Value(entryRes)),
-        nodeCount: int32(Value(nodeRes))
+    return Ok[types.V3StateChunkPayload](types.v3StateChunkPayloadMake(
+        Value(peerRes),
+        Value(stateRes),
+        Value(subtreeRes),
+        int32(Value(entryRes)),
+        int32(Value(nodeRes))
     ))
 
 fn v3WrapFrame(kind: types.V3FrameKind,
@@ -296,67 +553,114 @@ fn v3WrapFrame(kind: types.V3FrameKind,
                ganzhiIndex: int32,
                sourcePeerId: layout.FixedBytes32,
                payload: Bytes): Result[Bytes] =
-    var header: types.V3FrameHeader = types.v3FrameHeaderZero()
-    header.kind = kind
-    header.payloadLen = bytesLen(payload)
-    header.epoch = epoch
-    header.ganzhiIndex = ganzhiIndex
-    header.sourcePeerId = sourcePeerId
-    header.bodyCid = v3FrameBodyCid(payload)
-    let headerBytes: Bytes = v3EncodeFrameHeader(header)
+    let headerBytes: Bytes = v3EncodeFrameHeaderRaw(
+        kind,
+        bytesLen(payload),
+        epoch,
+        ganzhiIndex,
+        sourcePeerId,
+        v3FrameBodyCid(payload)
+    )
     var out: layout.ByteBuf = layout.byteBufInit(types.v3FrameHeaderSize + bytesLen(payload))
     layout.byteBufAppendBytes(out, headerBytes)
     layout.byteBufAppendBytes(out, payload)
     return Ok[Bytes](layout.byteBufToBytes(out))
 
-fn v3UnwrapFrame(frameBytes: Bytes): Result[types.V3Frame] =
+fn v3UnwrapExpectedPayload(frameBytes: Bytes, expectedKind: types.V3FrameKind): Result[Bytes] =
     if bytesLen(frameBytes) < types.v3FrameHeaderSize:
-        return Err[types.V3Frame]("v3 chain codec: short frame")
+        return Err[Bytes]("v3 chain codec: short frame")
     let span: layout.ByteSpan = layout.byteSpanFromBytes(frameBytes)
-    let headerRes: Result[types.V3FrameHeader] = v3DecodeFrameHeader(layout.byteSpanSlice(span, 0, types.v3FrameHeaderSize))
+    let headerRes: Result[V3DecodedFrameHeader] = v3DecodeFrameHeader(layout.byteSpanSlice(span, 0, types.v3FrameHeaderSize))
     if IsErr(headerRes):
-        return Err[types.V3Frame](Error(headerRes))
-    let header: types.V3FrameHeader = Value(headerRes)
+        return Err[Bytes](Error(headerRes))
+    let header: V3DecodedFrameHeader = Value(headerRes)
     if header.payloadLen < 0 || header.payloadLen != (bytesLen(frameBytes) - types.v3FrameHeaderSize):
-        return Err[types.V3Frame]("v3 chain codec: payload length mismatch")
+        return Err[Bytes]("v3 chain codec: payload length mismatch")
+    if header.kind != expectedKind:
+        return Err[Bytes]("v3 chain codec: unexpected frame kind")
     let payload: Bytes = bytesSlice(frameBytes, types.v3FrameHeaderSize, header.payloadLen)
     let bodyCid: layout.FixedBytes32 = v3FrameBodyCid(payload)
     if ! layout.fixedBytes32Equal(bodyCid, header.bodyCid):
-        return Err[types.V3Frame]("v3 chain codec: payload cid mismatch")
-    return Ok[types.V3Frame](types.V3Frame(header: header, payload: payload))
+        return Err[Bytes]("v3 chain codec: payload cid mismatch")
+    return Ok[Bytes](payload)
 
 fn v3EncodeHelloFrame(payload: types.V3HelloPayload, epoch: int32, ganzhiIndex: int32): Result[Bytes] =
     return v3WrapFrame(types.v3FrameKindHello, epoch, ganzhiIndex, payload.peerId, v3EncodeHelloPayload(payload))
 
+fn v3EncodeHelloFrameRaw(peerId: layout.FixedBytes32,
+                         address: types.V3LsmrAddress,
+                         tipEventCid: layout.FixedBytes32,
+                         summary: V3DecodedStateRootSummary,
+                         epoch: int32,
+                         ganzhiIndex: int32): Result[Bytes] =
+    return v3WrapFrame(types.v3FrameKindHello, epoch, ganzhiIndex, peerId, v3EncodeHelloPayloadRaw(peerId, address, tipEventCid, summary))
+
 fn v3DecodeHelloFrame(frameBytes: Bytes): Result[types.V3HelloPayload] =
-    let frameRes: Result[types.V3Frame] = v3UnwrapFrame(frameBytes)
-    if IsErr(frameRes):
-        return Err[types.V3HelloPayload](Error(frameRes))
-    let frame: types.V3Frame = Value(frameRes)
-    if frame.header.kind != types.v3FrameKindHello:
-        return Err[types.V3HelloPayload]("v3 chain codec: expected HELLO frame")
-    return v3DecodeHelloPayload(layout.byteSpanFromBytes(frame.payload))
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindHello)
+    if IsErr(payloadRes):
+        return Err[types.V3HelloPayload](Error(payloadRes))
+    return v3DecodeHelloPayload(layout.byteSpanFromBytes(Value(payloadRes)))
+
+fn v3DecodeHelloFrameRaw(frameBytes: Bytes): Result[V3DecodedHelloPayload] =
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindHello)
+    if IsErr(payloadRes):
+        return Err[V3DecodedHelloPayload](Error(payloadRes))
+    return v3DecodeHelloPayloadRaw(layout.byteSpanFromBytes(Value(payloadRes)))
 
 fn v3EncodeAdvertiseFrame(payload: types.V3AdvertisePayload, epoch: int32, ganzhiIndex: int32): Result[Bytes] =
     return v3WrapFrame(types.v3FrameKindAdvertise, epoch, ganzhiIndex, payload.peerId, v3EncodeAdvertisePayload(payload))
 
+fn v3EncodeAdvertiseFrameRaw(peerId: layout.FixedBytes32,
+                             stateForestCid: layout.FixedBytes32,
+                             eventCid: layout.FixedBytes32,
+                             accountCount: int32,
+                             eventCount: int32,
+                             maxStampEpoch: int32,
+                             maxStampGanzhi: int32,
+                             epoch: int32,
+                             ganzhiIndex: int32): Result[Bytes] =
+    return v3WrapFrame(
+        types.v3FrameKindAdvertise,
+        epoch,
+        ganzhiIndex,
+        peerId,
+        v3EncodeAdvertisePayloadRaw(peerId, stateForestCid, eventCid, accountCount, eventCount, maxStampEpoch, maxStampGanzhi)
+    )
+
 fn v3DecodeAdvertiseFrame(frameBytes: Bytes): Result[types.V3AdvertisePayload] =
-    let frameRes: Result[types.V3Frame] = v3UnwrapFrame(frameBytes)
-    if IsErr(frameRes):
-        return Err[types.V3AdvertisePayload](Error(frameRes))
-    let frame: types.V3Frame = Value(frameRes)
-    if frame.header.kind != types.v3FrameKindAdvertise:
-        return Err[types.V3AdvertisePayload]("v3 chain codec: expected ADVERTISE frame")
-    return v3DecodeAdvertisePayload(layout.byteSpanFromBytes(frame.payload))
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindAdvertise)
+    if IsErr(payloadRes):
+        return Err[types.V3AdvertisePayload](Error(payloadRes))
+    return v3DecodeAdvertisePayload(layout.byteSpanFromBytes(Value(payloadRes)))
+
+fn v3DecodeAdvertiseFrameRaw(frameBytes: Bytes): Result[V3DecodedAdvertisePayload] =
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindAdvertise)
+    if IsErr(payloadRes):
+        return Err[V3DecodedAdvertisePayload](Error(payloadRes))
+    return v3DecodeAdvertisePayloadRaw(layout.byteSpanFromBytes(Value(payloadRes)))
 
 fn v3EncodeWantStateFrame(payload: types.V3WantStatePayload, epoch: int32, ganzhiIndex: int32): Result[Bytes] =
     return v3WrapFrame(types.v3FrameKindWantState, epoch, ganzhiIndex, payload.peerId, v3EncodeWantStatePayload(payload))
 
+fn v3EncodeWantStateFrameRaw(peerId: layout.FixedBytes32,
+                             stateForestCid: layout.FixedBytes32,
+                             targetBaguaId: int32,
+                             prefixDigitsRaw: int32[],
+                             epoch: int32,
+                             ganzhiIndex: int32): Result[Bytes] =
+    let payloadRes = v3EncodeWantStatePayloadRaw(peerId, stateForestCid, targetBaguaId, prefixDigitsRaw)
+    if IsErr(payloadRes):
+        return Err[Bytes](Error(payloadRes))
+    return v3WrapFrame(types.v3FrameKindWantState, epoch, ganzhiIndex, peerId, Value(payloadRes))
+
 fn v3DecodeWantStateFrame(frameBytes: Bytes): Result[types.V3WantStatePayload] =
-    let frameRes: Result[types.V3Frame] = v3UnwrapFrame(frameBytes)
-    if IsErr(frameRes):
-        return Err[types.V3WantStatePayload](Error(frameRes))
-    let frame: types.V3Frame = Value(frameRes)
-    if frame.header.kind != types.v3FrameKindWantState:
-        return Err[types.V3WantStatePayload]("v3 chain codec: expected WANT_STATE frame")
-    return v3DecodeWantStatePayload(layout.byteSpanFromBytes(frame.payload))
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindWantState)
+    if IsErr(payloadRes):
+        return Err[types.V3WantStatePayload](Error(payloadRes))
+    return v3DecodeWantStatePayload(layout.byteSpanFromBytes(Value(payloadRes)))
+
+fn v3DecodeWantStateFrameRaw(frameBytes: Bytes): Result[V3DecodedWantStatePayload] =
+    let payloadRes: Result[Bytes] = v3UnwrapExpectedPayload(frameBytes, types.v3FrameKindWantState)
+    if IsErr(payloadRes):
+        return Err[V3DecodedWantStatePayload](Error(payloadRes))
+    return v3DecodeWantStatePayloadRaw(layout.byteSpanFromBytes(Value(payloadRes)))

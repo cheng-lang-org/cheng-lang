@@ -1,0 +1,75 @@
+import std/os
+import std/system
+import std/strings
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/backend/object_plan as objplan
+import cheng/v3/backend/native_link_plan as nplan
+
+fn main(): int32 =
+    let workspaceRoot = os.getCurrentDir()
+    let outputPath = os.joinPath(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+    let primaryObjectPath = outputPath + ".primary.o"
+    let providerModules = [
+        "runtime/compiler_runtime_v3",
+        "runtime/core_runtime_v3",
+        "runtime/program_support_v3"
+    ]
+    let providerObjectPaths = [
+        outputPath + ".provider.runtime_compiler_runtime_v3.o",
+        outputPath + ".provider.runtime_core_runtime_v3.o",
+        outputPath + ".provider.runtime_program_support_v3.o"
+    ]
+    let linkInputs = [
+        primaryObjectPath,
+        providerObjectPaths[0],
+        providerObjectPaths[1],
+        providerObjectPaths[2]
+    ]
+    var objectPlan: objplan.V3ObjectPlanStub
+    objectPlan.workspaceRoot = workspaceRoot
+    objectPlan.packageRoot = os.joinPath(workspaceRoot, "v3")
+    objectPlan.packageId = "cheng/v3"
+    objectPlan.entryPath = os.joinPath(workspaceRoot, "v3/src/tests/program_selfhost_smoke.cheng")
+    objectPlan.outputPath = outputPath
+    objectPlan.targetTriple = "arm64-apple-darwin"
+    objectPlan.primaryObjectPath = primaryObjectPath
+    objectPlan.providerModules = providerModules
+    objectPlan.providerSourcePaths = [
+        os.joinPath(workspaceRoot, "v3/runtime/native/v3_program_argv_native.c"),
+        os.joinPath(workspaceRoot, "v3/runtime/native/v3_core_runtime_stub.c"),
+        os.joinPath(workspaceRoot, "src/runtime/native/system_helpers.c")
+    ]
+    objectPlan.providerObjectPaths = providerObjectPaths
+    objectPlan.linkInputPaths = linkInputs
+    objectPlan.loweredFunctionSymbols = ["cheng/v3/tests/program_selfhost_smoke::main"]
+    objectPlan.entrySymbol = "main"
+    objectPlan.missingReasons = []
+    objectPlan.pipelineStage = "lowering_plan_to_object_plan_stub"
+    var nativePlan: nplan.V3NativeLinkPlanStub
+    nativePlan.targetTriple = "arm64-apple-darwin"
+    nativePlan.emitKind = creq.v3EmitExe
+    nativePlan.outputPath = outputPath
+    nativePlan.linkerProgram = "cc"
+    nativePlan.linkerFlavor = "ld64"
+    nativePlan.outputKind = nplan.v3NativeOutputExecutable
+    nativePlan.entrySymbol = "main"
+    nativePlan.primaryObjectPath = objectPlan.primaryObjectPath
+    nativePlan.linkInputPaths = objectPlan.linkInputPaths
+    nativePlan.missingReasons = []
+    nativePlan.pipelineStage = "object_plan_to_native_link_plan_stub"
+    assert(strings.sliceBytes(objectPlan.primaryObjectPath,
+                              len(objectPlan.primaryObjectPath) - len(".primary.o"),
+                              len(".primary.o")) == ".primary.o",
+           "v3 object plan: primary object suffix")
+    assert(objectPlan.providerObjectPaths.len == 3, "v3 object plan: provider count")
+    assert(objectPlan.providerSourcePaths.len == 3, "v3 object plan: provider sources")
+    assert(nativePlan.linkInputPaths.len == 4, "v3 native link plan: link input count")
+    assert(nativePlan.linkerProgram == "cc", "v3 native link plan: linker program")
+    assert(nativePlan.linkerFlavor == "ld64", "v3 native link plan: linker flavor")
+    assert(nativePlan.outputKind == nplan.v3NativeOutputExecutable, "v3 native link plan: output kind")
+    assert(strings.sliceBytes(nativePlan.primaryObjectPath,
+                              len(nativePlan.primaryObjectPath) - len(".primary.o"),
+                              len(".primary.o")) == ".primary.o",
+           "v3 native link plan: primary object suffix")
+    echo("v3 object_native_link_plan_smoke ok")
+    return 0

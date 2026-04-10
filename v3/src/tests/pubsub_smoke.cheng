@@ -1,0 +1,49 @@
+import std/system
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/csg
+import cheng/v3/chain/pubsub
+
+fn main(): int32 =
+    let centerRes = types.v3LsmrAddressFromDigits([5, 5, 5])
+    assert(IsOk(centerRes), "v3 pubsub smoke: center address")
+    let center = Value(centerRes)
+    let topicRes = pubsub.v3PubSubTopicFromAddress(center,
+                                                   2,
+                                                   lt.v3PubSubModeXun,
+                                                   pubsub.v3PubSubSemanticFingerprint([11, 22, 33]))
+    assert(IsOk(topicRes), "v3 pubsub smoke: topic")
+    let topic = Value(topicRes)
+    assert(topic.layerId == lt.v3LayerRegional, "v3 pubsub smoke: regional layer")
+    assert(topic.scopeDepth == 1, "v3 pubsub smoke: scope depth")
+
+    let payloadCid = lt.v3HashInts("v3.test.delta", [9, 8, 7])
+    let payloadSummaryCid = lt.v3HashInts("v3.test.delta.summary", [1, 2])
+    let envelope = pubsub.v3PubSubEnvelopeMake(topic.topicCid,
+                                               pubsub.v3PubSubPayloadKindCsgDelta,
+                                               payloadCid,
+                                               payloadSummaryCid)
+
+    var subscriptions: pubsub.V3PubSubSubscription[]
+    subscriptions = []
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(1, center, csg.v3CsgBarrierModeGen, topic.topicCid))
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(2, Value(types.v3LsmrAddressFromDigits([5, 8, 1])), csg.v3CsgBarrierModeGen, topic.topicCid))
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(3, Value(types.v3LsmrAddressFromDigits([5, 8, 6])), csg.v3CsgBarrierModeGen, topic.topicCid))
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(4, Value(types.v3LsmrAddressFromDigits([5, 1, 6])), csg.v3CsgBarrierModeGen, topic.topicCid))
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(5, Value(types.v3LsmrAddressFromDigits([5, 3, 4])), csg.v3CsgBarrierModeGen, topic.topicCid))
+    add(subscriptions, pubsub.v3PubSubSubscriptionMake(6, Value(types.v3LsmrAddressFromDigits([8, 1, 6])), csg.v3CsgBarrierModeGen, topic.topicCid))
+
+    let planRes = pubsub.v3PubSubBuildPlan(topic, envelope, subscriptions)
+    assert(IsOk(planRes), "v3 pubsub smoke: plan")
+    let plan = Value(planRes)
+    assert(plan.subscriberCount == 4, "v3 pubsub smoke: xun selected four branches")
+    assert(plan.branchCount == 4, "v3 pubsub smoke: four branches")
+    let eastBranch = pubsub.v3PubSubPlanBranchPos(plan, 8)
+    assert(eastBranch >= 0, "v3 pubsub smoke: east branch exists")
+    assert(plan.branchNodeCounts[eastBranch] == 1, "v3 pubsub smoke: east branch minimized")
+    assert(types.v3LsmrAddressText(plan.branchPrimaryAddresses[eastBranch]) == "5.8.1", "v3 pubsub smoke: nearest east branch kept")
+
+    echo("v3 pubsub_smoke ok")
+    return 0

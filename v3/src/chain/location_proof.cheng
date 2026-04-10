@@ -1,0 +1,268 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/lsmr
+
+const
+    v3LocationReasonOk: int32 = 1
+    v3LocationReasonClaimantDepthMismatch: int32 = 2
+    v3LocationReasonWitnessQuorumTooSmall: int32 = 3
+    v3LocationReasonSectorCoverageTooSmall: int32 = 4
+    v3LocationReasonWitnessRouteMismatch: int32 = 5
+    v3LocationReasonWitnessRttTooHigh: int32 = 6
+
+type
+    V3LocationWitness =
+        version: int32
+        claimantNodeId: int32
+        claimantAddress: types.V3LsmrAddress
+        witnessNodeId: int32
+        witnessAddress: types.V3LsmrAddress
+        routeCid: layout.FixedBytes32
+        routeHopCount: int32
+        sectorDigit: int32
+        sharedPrefixDepth: int32
+        rttBucket: int32
+        witnessCid: layout.FixedBytes32
+
+    V3LocationProof =
+        version: int32
+        claimantNodeId: int32
+        claimantAddress: types.V3LsmrAddress
+        depth: int32
+        epoch: int32
+        nonceCid: layout.FixedBytes32
+        witnessNodeIds: int32[]
+        witnessAddresses: types.V3LsmrAddress[]
+        witnessRouteCids: layout.FixedBytes32[]
+        witnessHopCounts: int32[]
+        witnessSectorDigits: int32[]
+        witnessSharedPrefixDepths: int32[]
+        witnessRttBuckets: int32[]
+        proofCid: layout.FixedBytes32
+
+    V3LocationProofDecision =
+        version: int32
+        accepted: bool
+        reasonCode: int32
+        distinctWitnessCount: int32
+        distinctSectorCount: int32
+        decisionCid: layout.FixedBytes32
+
+fn v3LocationWitnessZero(): V3LocationWitness =
+    var out: V3LocationWitness
+    out.version = 1
+    out.routeCid = layout.fixedBytes32Zero()
+    out.witnessCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3LocationProofZero(): V3LocationProof =
+    var out: V3LocationProof
+    out.version = 1
+    out.nonceCid = layout.fixedBytes32Zero()
+    out.witnessNodeIds = []
+    out.witnessAddresses = []
+    out.witnessRouteCids = []
+    out.witnessHopCounts = []
+    out.witnessSectorDigits = []
+    out.witnessSharedPrefixDepths = []
+    out.witnessRttBuckets = []
+    out.proofCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3LocationProofDecisionZero(): V3LocationProofDecision =
+    var out: V3LocationProofDecision
+    out.version = 1
+    out.accepted = false
+    out.reasonCode = v3LocationReasonClaimantDepthMismatch
+    out.decisionCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3LocationSharedPrefixDepth(left: types.V3LsmrAddress, right: types.V3LsmrAddress): int32 =
+    return lsmr.v3LsmrSharedPrefixDepth(left, right)
+
+fn v3LocationSectorDigit(claimantAddress: types.V3LsmrAddress,
+                         witnessAddress: types.V3LsmrAddress): int32 =
+    let sharedDepth = v3LocationSharedPrefixDepth(claimantAddress, witnessAddress)
+    if sharedDepth >= witnessAddress.depth:
+        return types.v3LsmrDigitCenter
+    return witnessAddress.digits[sharedDepth]
+
+fn v3LocationWitnessLess(aNodeId: int32, aAddress: types.V3LsmrAddress,
+                         bNodeId: int32, bAddress: types.V3LsmrAddress): bool =
+    if aNodeId != bNodeId:
+        return aNodeId < bNodeId
+    if aAddress.depth != bAddress.depth:
+        return aAddress.depth < bAddress.depth
+    for i in 0..<types.v3LsmrMaxDepth:
+        if aAddress.digits[i] != bAddress.digits[i]:
+            return aAddress.digits[i] < bAddress.digits[i]
+    return false
+
+fn v3SortLocationWitnesses(witnesses: var V3LocationWitness[]) =
+    for i in 1..<witnesses.len:
+        let witness = witnesses[i]
+        var j = i - 1
+        while j >= 0 &&
+              v3LocationWitnessLess(witness.witnessNodeId,
+                                    witness.witnessAddress,
+                                    witnesses[j].witnessNodeId,
+                                    witnesses[j].witnessAddress):
+            witnesses[j + 1] = witnesses[j]
+            j = j - 1
+        witnesses[j + 1] = witness
+
+fn v3LocationWitnessMake(claimantNodeId: int32,
+                         claimantAddress: types.V3LsmrAddress,
+                         witnessNodeId: int32,
+                         witnessAddress: types.V3LsmrAddress,
+                         rttBucket: int32): Result[V3LocationWitness] =
+    let routeRes = lsmr.v3LsmrRoutePlanFromAddresses(witnessAddress, claimantAddress)
+    if IsErr(routeRes):
+        return Err[V3LocationWitness](Error(routeRes))
+    let route = Value(routeRes)
+    var out: V3LocationWitness = v3LocationWitnessZero()
+    out.claimantNodeId = claimantNodeId
+    out.claimantAddress = claimantAddress
+    out.witnessNodeId = witnessNodeId
+    out.witnessAddress = witnessAddress
+    out.routeCid = route.routeCid
+    out.routeHopCount = route.hopCount
+    out.sharedPrefixDepth = v3LocationSharedPrefixDepth(witnessAddress, claimantAddress)
+    out.sectorDigit = v3LocationSectorDigit(claimantAddress, witnessAddress)
+    out.rttBucket = rttBucket
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.location.witness"))
+    lt.v3AppendU32BE(buf, claimantNodeId)
+    lt.v3AppendAddress(buf, claimantAddress)
+    lt.v3AppendU32BE(buf, witnessNodeId)
+    lt.v3AppendAddress(buf, witnessAddress)
+    lt.v3AppendFixed32(buf, route.routeCid)
+    lt.v3AppendU32BE(buf, route.hopCount)
+    lt.v3AppendU32BE(buf, out.sectorDigit)
+    lt.v3AppendU32BE(buf, out.sharedPrefixDepth)
+    lt.v3AppendU32BE(buf, rttBucket)
+    out.witnessCid = lt.v3FixedCidFromBuf(buf)
+    return Ok[V3LocationWitness](out)
+
+fn v3LocationNonceCid(value: int32): layout.FixedBytes32 =
+    return lt.v3HashInts("v3.location.nonce", [value])
+
+fn v3BuildLocationProof(claimantNodeId: int32,
+                        claimantAddress: types.V3LsmrAddress,
+                        epoch: int32,
+                        nonceCid: layout.FixedBytes32,
+                        witnessesRaw: V3LocationWitness[]): Result[V3LocationProof] =
+    if claimantNodeId <= 0:
+        return Err[V3LocationProof]("v3 location proof: missing claimant")
+    var witnesses: V3LocationWitness[]
+    witnesses = witnessesRaw
+    v3SortLocationWitnesses(witnesses)
+    var out: V3LocationProof = v3LocationProofZero()
+    out.claimantNodeId = claimantNodeId
+    out.claimantAddress = claimantAddress
+    out.depth = claimantAddress.depth
+    out.epoch = epoch
+    out.nonceCid = nonceCid
+    for i in 0..<witnesses.len:
+        if witnesses[i].claimantNodeId != claimantNodeId ||
+           !types.v3LsmrAddressEqual(witnesses[i].claimantAddress, claimantAddress):
+            return Err[V3LocationProof]("v3 location proof: witness claimant mismatch")
+        add(out.witnessNodeIds, witnesses[i].witnessNodeId)
+        add(out.witnessAddresses, witnesses[i].witnessAddress)
+        add(out.witnessRouteCids, witnesses[i].routeCid)
+        add(out.witnessHopCounts, witnesses[i].routeHopCount)
+        add(out.witnessSectorDigits, witnesses[i].sectorDigit)
+        add(out.witnessSharedPrefixDepths, witnesses[i].sharedPrefixDepth)
+        add(out.witnessRttBuckets, witnesses[i].rttBucket)
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.location.proof"))
+    lt.v3AppendU32BE(buf, claimantNodeId)
+    lt.v3AppendAddress(buf, claimantAddress)
+    lt.v3AppendU32BE(buf, out.depth)
+    lt.v3AppendU32BE(buf, epoch)
+    lt.v3AppendFixed32(buf, nonceCid)
+    lt.v3AppendU32BE(buf, out.witnessNodeIds.len)
+    for i in 0..<out.witnessNodeIds.len:
+        lt.v3AppendU32BE(buf, out.witnessNodeIds[i])
+        lt.v3AppendAddress(buf, out.witnessAddresses[i])
+        lt.v3AppendFixed32(buf, out.witnessRouteCids[i])
+        lt.v3AppendU32BE(buf, out.witnessHopCounts[i])
+        lt.v3AppendU32BE(buf, out.witnessSectorDigits[i])
+        lt.v3AppendU32BE(buf, out.witnessSharedPrefixDepths[i])
+        lt.v3AppendU32BE(buf, out.witnessRttBuckets[i])
+    out.proofCid = lt.v3FixedCidFromBuf(buf)
+    return Ok[V3LocationProof](out)
+
+fn v3CountDistinctWitnessIds(values: int32[]): int32 =
+    var distinct: int32[]
+    distinct = []
+    for i in 0..<values.len:
+        var found: bool = false
+        for j in 0..<distinct.len:
+            if distinct[j] == values[i]:
+                found = true
+                break
+        if !found:
+            add(distinct, values[i])
+    return distinct.len
+
+fn v3CountDistinctDigits(values: int32[]): int32 =
+    var distinct: int32[]
+    distinct = []
+    for i in 0..<values.len:
+        var found: bool = false
+        for j in 0..<distinct.len:
+            if distinct[j] == values[i]:
+                found = true
+                break
+        if !found:
+            add(distinct, values[i])
+    return distinct.len
+
+fn v3VerifyLocationProof(proof: V3LocationProof): V3LocationProofDecision =
+    var out: V3LocationProofDecision = v3LocationProofDecisionZero()
+    out.reasonCode = v3LocationReasonOk
+    if proof.claimantAddress.depth != proof.depth:
+        out.reasonCode = v3LocationReasonClaimantDepthMismatch
+    else:
+        out.distinctWitnessCount = v3CountDistinctWitnessIds(proof.witnessNodeIds)
+        out.distinctSectorCount = v3CountDistinctDigits(proof.witnessSectorDigits)
+        if out.distinctWitnessCount < 3:
+            out.reasonCode = v3LocationReasonWitnessQuorumTooSmall
+        elif out.distinctSectorCount < 3:
+            out.reasonCode = v3LocationReasonSectorCoverageTooSmall
+        else:
+            for i in 0..<proof.witnessNodeIds.len:
+                let rebuiltRes = v3LocationWitnessMake(proof.claimantNodeId,
+                                                       proof.claimantAddress,
+                                                       proof.witnessNodeIds[i],
+                                                       proof.witnessAddresses[i],
+                                                       proof.witnessRttBuckets[i])
+                if IsErr(rebuiltRes):
+                    out.reasonCode = v3LocationReasonWitnessRouteMismatch
+                    break
+                let rebuilt = Value(rebuiltRes)
+                if !layout.fixedBytes32Equal(rebuilt.routeCid, proof.witnessRouteCids[i]) ||
+                   rebuilt.routeHopCount != proof.witnessHopCounts[i] ||
+                   rebuilt.sectorDigit != proof.witnessSectorDigits[i] ||
+                   rebuilt.sharedPrefixDepth != proof.witnessSharedPrefixDepths[i]:
+                    out.reasonCode = v3LocationReasonWitnessRouteMismatch
+                    break
+                let expectedBucketCeil = rebuilt.routeHopCount + (proof.depth - rebuilt.sharedPrefixDepth) + 1
+                if proof.witnessRttBuckets[i] > expectedBucketCeil:
+                    out.reasonCode = v3LocationReasonWitnessRttTooHigh
+                    break
+            if out.reasonCode == v3LocationReasonOk:
+                out.accepted = true
+            
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.location.decision"))
+    lt.v3AppendFixed32(buf, proof.proofCid)
+    lt.v3AppendU32BE(buf, out.accepted ? 1 : 0)
+    lt.v3AppendU32BE(buf, out.reasonCode)
+    lt.v3AppendU32BE(buf, out.distinctWitnessCount)
+    lt.v3AppendU32BE(buf, out.distinctSectorCount)
+    out.decisionCid = lt.v3FixedCidFromBuf(buf)
+    return out

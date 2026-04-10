@@ -1,11 +1,11 @@
 import std/system
 import std/result
 import std/rawbytes
-import ../std/bytes_layout as layout
-import ../chain/binary_types as types
-import ../chain/codec_binary as codec
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/codec_binary as codec
 
-fn main() =
+fn main(): int32 =
     let peerRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff")
     assert(IsOk(peerRes), "v3 chain codec: peer id")
@@ -25,73 +25,65 @@ fn main() =
         "5555555555555555555555555555555555555555555555555555555555555555")
     assert(IsOk(eventCidRes), "v3 chain codec: event cid")
 
-    var digits: int32[]
-    add(digits, 1)
-    add(digits, 3)
-    add(digits, 5)
-    add(digits, 7)
-    add(digits, 9)
-    add(digits, 2)
-    let addrRes: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits(digits)
+    let addrRes: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits([1, 3, 5, 7, 9, 2])
     assert(IsOk(addrRes), "v3 chain codec: address")
     assert(Value(addrRes).digits[2] == types.v3LsmrDigitCenter, "v3 chain codec: center digit")
 
-    var badDigits: int32[]
-    add(badDigits, 0)
-    let badAddrRes: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits(badDigits)
+    let badAddrRes: Result[types.V3LsmrAddress] = types.v3LsmrAddressFromDigits([0])
     assert(IsErr(badAddrRes), "v3 chain codec: digit zero rejected")
 
-    let summary = types.V3StateRootSummary(
-        stateForestCid: Value(forestRes),
-        eventRootCid: Value(eventRootRes),
-        accountRootCid: Value(accountRootRes)
+    let summary = codec.v3DecodedStateRootSummaryMake(
+        Value(forestRes),
+        Value(eventRootRes),
+        Value(accountRootRes)
     )
 
-    let hello = types.V3HelloPayload(
-        peerId: Value(peerRes),
-        address: Value(addrRes),
-        tipEventCid: Value(tipRes),
-        summary: summary
+    let helloFrameRes: Result[Bytes] = codec.v3EncodeHelloFrameRaw(
+        Value(peerRes),
+        Value(addrRes),
+        Value(tipRes),
+        summary,
+        7,
+        19
     )
-    let helloFrameRes: Result[Bytes] = codec.v3EncodeHelloFrame(hello, 7, 19)
     assert(IsOk(helloFrameRes), "v3 chain codec: encode HELLO frame")
-    let helloDecodedRes: Result[types.V3HelloPayload] = codec.v3DecodeHelloFrame(Value(helloFrameRes))
+    let helloDecodedRes: Result[codec.V3DecodedHelloPayload] = codec.v3DecodeHelloFrameRaw(Value(helloFrameRes))
     assert(IsOk(helloDecodedRes), "v3 chain codec: decode HELLO frame")
-    assert(types.v3LsmrAddressEqual(Value(helloDecodedRes).address, hello.address), "v3 chain codec: HELLO address")
-    assert(layout.fixedBytes32Equal(Value(helloDecodedRes).summary.stateForestCid, hello.summary.stateForestCid), "v3 chain codec: HELLO summary")
+    assert(types.v3LsmrAddressEqual(Value(helloDecodedRes).address, Value(addrRes)), "v3 chain codec: HELLO address")
+    assert(layout.fixedBytes32Equal(Value(helloDecodedRes).summary.stateForestCid, summary.stateForestCid), "v3 chain codec: HELLO summary")
 
-    let advertise = types.V3AdvertisePayload(
-        peerId: Value(peerRes),
-        stateForestCid: Value(forestRes),
-        eventCid: Value(eventCidRes),
-        accountCount: 3,
-        eventCount: 9,
-        maxStampEpoch: 17,
-        maxStampGanzhi: 41
+    let advertiseFrameRes: Result[Bytes] = codec.v3EncodeAdvertiseFrameRaw(
+        Value(peerRes),
+        Value(forestRes),
+        Value(eventCidRes),
+        3,
+        9,
+        17,
+        41,
+        17,
+        41
     )
-    let advertiseFrameRes: Result[Bytes] = codec.v3EncodeAdvertiseFrame(advertise, 17, 41)
     assert(IsOk(advertiseFrameRes), "v3 chain codec: encode ADVERTISE frame")
-    let advertiseDecodedRes: Result[types.V3AdvertisePayload] = codec.v3DecodeAdvertiseFrame(Value(advertiseFrameRes))
+    let advertiseDecodedRes: Result[codec.V3DecodedAdvertisePayload] = codec.v3DecodeAdvertiseFrameRaw(Value(advertiseFrameRes))
     assert(IsOk(advertiseDecodedRes), "v3 chain codec: decode ADVERTISE frame")
-    assert(Value(advertiseDecodedRes).eventCount == advertise.eventCount, "v3 chain codec: ADVERTISE event count")
-    assert(layout.fixedBytes32Equal(Value(advertiseDecodedRes).eventCid, advertise.eventCid), "v3 chain codec: ADVERTISE event cid")
+    assert(Value(advertiseDecodedRes).eventCount == 9, "v3 chain codec: ADVERTISE event count")
+    assert(layout.fixedBytes32Equal(Value(advertiseDecodedRes).eventCid, Value(eventCidRes)), "v3 chain codec: ADVERTISE event cid")
 
-    var want: types.V3WantStatePayload
-    want.peerId = Value(peerRes)
-    want.stateForestCid = Value(forestRes)
-    want.targetBaguaId = 5
-    want.prefixDepth = 4
-    want.prefixDigits[0] = 7
-    want.prefixDigits[1] = 1
-    want.prefixDigits[2] = 6
-    want.prefixDigits[3] = 5
-    let wantFrameRes: Result[Bytes] = codec.v3EncodeWantStateFrame(want, 23, 11)
+    let wantFrameRes: Result[Bytes] = codec.v3EncodeWantStateFrameRaw(
+        Value(peerRes),
+        Value(forestRes),
+        5,
+        [7, 1, 6, 5],
+        23,
+        11
+    )
     assert(IsOk(wantFrameRes), "v3 chain codec: encode WANT_STATE frame")
-    let wantDecodedRes: Result[types.V3WantStatePayload] = codec.v3DecodeWantStateFrame(Value(wantFrameRes))
+    let wantDecodedRes: Result[codec.V3DecodedWantStatePayload] = codec.v3DecodeWantStateFrameRaw(Value(wantFrameRes))
     assert(IsOk(wantDecodedRes), "v3 chain codec: decode WANT_STATE frame")
     assert(Value(wantDecodedRes).targetBaguaId == types.v3LsmrDigitCenter, "v3 chain codec: WANT_STATE bagua digit")
-    assert(Value(wantDecodedRes).prefixDepth == want.prefixDepth, "v3 chain codec: WANT_STATE depth")
-    assert(Value(wantDecodedRes).prefixDigits[2] == want.prefixDigits[2], "v3 chain codec: WANT_STATE digits")
+    assert(Value(wantDecodedRes).prefixDepth == 4, "v3 chain codec: WANT_STATE depth")
+    assert(Value(wantDecodedRes).prefixDigits[2] == 6, "v3 chain codec: WANT_STATE digits")
     assert(Value(wantDecodedRes).prefixDigits[3] == types.v3LsmrDigitCenter, "v3 chain codec: WANT_STATE center digit")
 
     echo("v3 chain_codec_binary_smoke ok")
+    return 0

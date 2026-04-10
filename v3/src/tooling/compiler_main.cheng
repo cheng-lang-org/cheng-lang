@@ -1,0 +1,81 @@
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/path as v3path
+import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/backend/build_plan as buildplan
+
+fn v3CompilerPrintLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn v3CompilerPrintErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn v3CompilerRoot(): str =
+    return os.getEnvDefault("CHENG_V3_ROOT", os.getCurrentDir())
+
+fn v3CompilerUsage(rootDir: str) =
+    let lines = crun.v3CompilerUsageLines(rootDir)
+    for i in 0..<lines.len:
+        v3CompilerPrintLine(lines[i])
+
+fn v3CompilerStatus(rootDir: str) =
+    let contract = crun.v3CompilerRuntimeContract(rootDir)
+    v3CompilerPrintLine("cheng_v3c")
+    v3CompilerPrintLine("version=" + contract.version)
+    v3CompilerPrintLine("execution=" + contract.executionModel)
+    v3CompilerPrintLine("bootstrap_mode=" + contract.bootstrapMode)
+    v3CompilerPrintLine("compiler_entry=" + contract.compilerEntry)
+    v3CompilerPrintLine("ordinary_command=" + contract.ordinaryCommand)
+    v3CompilerPrintLine("ordinary_pipeline=" + contract.ordinaryPipelineState)
+
+fn v3CompilerPrintBuildPlan(rootDir: str) =
+    let plan = buildplan.v3BackendBuildPlanDefault(rootDir)
+    v3CompilerPrintLine(strutil.strip(buildplan.v3BackendBuildPlanReport(plan)))
+
+fn main(): int32 =
+    let rootDir = v3CompilerRoot()
+    if cmdline.paramCount() <= 0:
+        v3CompilerUsage(rootDir)
+        return 0
+    let cmd = cmdline.paramStr(1)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3CompilerUsage(rootDir)
+        return 0
+    if cmd == "status":
+        v3CompilerStatus(rootDir)
+        return 0
+    if cmd == "print-build-plan":
+        v3CompilerPrintBuildPlan(rootDir)
+        return 0
+    if cmd == "system-link-exec":
+        let reqRes: Result[creq.V3CompilerRequest] = creq.v3CompilerRequestFromCmdline(rootDir)
+        if IsErr(reqRes):
+            v3CompilerPrintErr(Error(reqRes))
+            return 2
+        let req = Value(reqRes)
+        let planRes: Result[sexec.V3SystemLinkExecPlan] = sexec.v3BuildSystemLinkExecPlan(rootDir, req)
+        if IsErr(planRes):
+            v3CompilerPrintErr(Error(planRes))
+            return 2
+        let plan = Value(planRes)
+        let report = sexec.v3SystemLinkExecPlanReport(plan)
+        if len(req.reportPath) > 0:
+            if !v3path.v3WriteTextFile(req.rootDir, req.reportPath, report + "\n"):
+                v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+                return 2
+        if sexec.v3SystemLinkExecPlanReady(plan):
+            v3CompilerPrintErr("v3 compiler: final native link not implemented")
+        elif plan.primaryObjectPlan.missingReasons.len > 0:
+            v3CompilerPrintErr("v3 compiler: primary object machine code not emitted")
+        else
+            v3CompilerPrintErr("v3 compiler: ordinary pipeline blocked")
+        v3CompilerPrintErr(report)
+        return 2
+    v3CompilerPrintErr("v3 compiler: unknown command: " + cmd)
+    v3CompilerUsage(rootDir)
+    return 2

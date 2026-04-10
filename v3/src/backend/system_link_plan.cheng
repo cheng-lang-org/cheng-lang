@@ -1,0 +1,165 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/lang/parser as parser
+import cheng/v3/backend/build_plan as buildplan
+
+type
+    V3SystemModuleKind = enum
+        v3SystemOrdinaryProgram
+        v3SystemCompilerControlPlane
+
+    V3SystemLinkPlanStub =
+        entryPath: str
+        outputPath: str
+        targetTriple: str
+        emitKind: creq.V3CompilerEmit
+        packageRoot: str
+        workspaceRoot: str
+        packageId: str
+        moduleStem: str
+        moduleKind: V3SystemModuleKind
+        sourceClosurePaths: str[]
+        ownerModulePaths: str[]
+        importEdgeCount: int32
+        unresolvedImportCount: int32
+        hasCompilerTopLevel: bool
+        mainFunctionPresent: bool
+        runtimeTargets: str[]
+        providerModules: str[]
+        entrySymbol: str
+        missingReasons: str[]
+        parserSyntaxTag: str
+        parserSourceKind: parser.V3ParsedSourceKind
+        buildEntryPath: str
+        buildSourceUnitCount: int32
+        linkMode: str
+        pipelineStage: str
+
+fn v3SystemModuleKindText(kind: V3SystemModuleKind): str =
+    if kind == v3SystemCompilerControlPlane:
+        return "compiler_control_plane"
+    return "ordinary_program"
+
+fn v3SystemLinkPlanListText(items: str[]): str =
+    if items.len <= 0:
+        return "-"
+    var out = ""
+    for i in 0..<items.len:
+        if len(out) > 0:
+            out = out + ","
+        out = out + items[i]
+    return out
+
+fn v3SystemLinkPlanAppendLine(out: var str, key: str, value: str) =
+    if len(out) > 0:
+        out = out + "\n"
+    out = out + key + "=" + value
+
+fn v3SystemLinkPlanDeriveModuleKind(parsed: parser.V3ParsedSourceStub): V3SystemModuleKind =
+    for i in 0..<parsed.ownerModulePaths.len:
+        if parsed.ownerModulePaths[i] == "cheng/v3/tooling/compiler_main":
+            return v3SystemCompilerControlPlane
+    return v3SystemOrdinaryProgram
+
+fn v3SystemLinkPlanDeriveEntrySymbol(parsed: parser.V3ParsedSourceStub, emitKind: creq.V3CompilerEmit): str =
+    if emitKind == creq.v3EmitExe && parsed.mainFunctionPresent:
+        return "main"
+    return ""
+
+fn v3SystemLinkPlanDeriveExecutionTrack(moduleKind: V3SystemModuleKind): crun.V3CompilerExecutionTrack =
+    if moduleKind == v3SystemCompilerControlPlane:
+        return crun.v3CompilerTrackTooling
+    return crun.v3CompilerTrackProgram
+
+fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
+                                  emitKind: creq.V3CompilerEmit,
+                                  runtimeTargets: str[],
+                                  providerModules: str[],
+                                  entrySymbol: str): str[] =
+    var missing: str[] = []
+    if parsed.orderedClosureSourcePaths.len <= 0:
+        add(missing, "source_closure_missing")
+    if parsed.unresolvedImportCount > 0:
+        add(missing, "source_closure_unresolved_imports")
+    if !parsed.hasCompilerTopLevel:
+        add(missing, "compiler_top_level_missing")
+    if emitKind == creq.v3EmitExe && len(entrySymbol) <= 0:
+        add(missing, "program_entry_symbol_missing")
+    if emitKind == creq.v3EmitExe && runtimeTargets.len <= 0:
+        add(missing, "runtime_targets_not_lowered")
+    if emitKind == creq.v3EmitExe && providerModules.len <= 0:
+        add(missing, "runtime_provider_modules_not_selected")
+    return missing
+
+fn v3BuildSystemLinkPlanStub(rootDir: str, req: creq.V3CompilerRequest): Result[V3SystemLinkPlanStub] =
+    let parsedRes = parser.v3ParseOrdinarySourceStub(req.rootDir, req.sourcePath)
+    if IsErr(parsedRes):
+        return Err[V3SystemLinkPlanStub](Error(parsedRes))
+    let parsed = Value(parsedRes)
+    let build = buildplan.v3BackendBuildPlanDefault(parsed.workspaceRoot)
+    let moduleKind = v3SystemLinkPlanDeriveModuleKind(parsed)
+    let track = v3SystemLinkPlanDeriveExecutionTrack(moduleKind)
+    let runtimeTargets = crun.v3CompilerRuntimeTargetsForTrack(track)
+    let providerModules = crun.v3RuntimeProviderModulesForTrack(track)
+    let entrySymbol = v3SystemLinkPlanDeriveEntrySymbol(parsed, req.emitKind)
+    let missing = v3SystemLinkPlanMissingReasons(parsed, req.emitKind, runtimeTargets, providerModules, entrySymbol)
+    return Ok[V3SystemLinkPlanStub](V3SystemLinkPlanStub(
+        entryPath: req.sourcePath,
+        outputPath: req.outputPath,
+        targetTriple: req.targetTriple,
+        emitKind: req.emitKind,
+        packageRoot: parsed.packageRoot,
+        workspaceRoot: parsed.workspaceRoot,
+        packageId: parsed.packageId,
+        moduleStem: parsed.moduleStem,
+        moduleKind: moduleKind,
+        sourceClosurePaths: parsed.orderedClosureSourcePaths,
+        ownerModulePaths: parsed.ownerModulePaths,
+        importEdgeCount: parsed.importEdges.len,
+        unresolvedImportCount: parsed.unresolvedImportCount,
+        hasCompilerTopLevel: parsed.hasCompilerTopLevel,
+        mainFunctionPresent: parsed.mainFunctionPresent,
+        runtimeTargets: runtimeTargets,
+        providerModules: providerModules,
+        entrySymbol: entrySymbol,
+        missingReasons: missing,
+        parserSyntaxTag: parsed.syntaxTag,
+        parserSourceKind: parsed.sourceKind,
+        buildEntryPath: build.entryPath,
+        buildSourceUnitCount: build.sourceUnits.len,
+        linkMode: buildplan.v3BackendLinkerText(build.linker),
+        pipelineStage: "parser_stub_to_system_link_plan_stub"
+    ))
+
+fn v3SystemLinkPlanStubReport(plan: V3SystemLinkPlanStub): str =
+    var out = ""
+    v3SystemLinkPlanAppendLine(out, "entry", plan.entryPath)
+    v3SystemLinkPlanAppendLine(out, "output", plan.outputPath)
+    v3SystemLinkPlanAppendLine(out, "target", plan.targetTriple)
+    v3SystemLinkPlanAppendLine(out, "emit", creq.v3CompilerEmitText(plan.emitKind))
+    v3SystemLinkPlanAppendLine(out, "workspace_root", plan.workspaceRoot)
+    v3SystemLinkPlanAppendLine(out, "package_root", plan.packageRoot)
+    v3SystemLinkPlanAppendLine(out, "package_id", plan.packageId)
+    v3SystemLinkPlanAppendLine(out, "module_stem", plan.moduleStem)
+    v3SystemLinkPlanAppendLine(out, "module_kind", v3SystemModuleKindText(plan.moduleKind))
+    v3SystemLinkPlanAppendLine(out, "source_closure_count", intToStr(plan.sourceClosurePaths.len))
+    v3SystemLinkPlanAppendLine(out, "source_closure_paths", v3SystemLinkPlanListText(plan.sourceClosurePaths))
+    v3SystemLinkPlanAppendLine(out, "owner_modules", v3SystemLinkPlanListText(plan.ownerModulePaths))
+    v3SystemLinkPlanAppendLine(out, "import_edge_count", intToStr(plan.importEdgeCount))
+    v3SystemLinkPlanAppendLine(out, "unresolved_import_count", intToStr(plan.unresolvedImportCount))
+    v3SystemLinkPlanAppendLine(out, "has_compiler_top_level", plan.hasCompilerTopLevel ? "1" : "0")
+    v3SystemLinkPlanAppendLine(out, "main_function_present", plan.mainFunctionPresent ? "1" : "0")
+    v3SystemLinkPlanAppendLine(out, "runtime_targets", v3SystemLinkPlanListText(plan.runtimeTargets))
+    v3SystemLinkPlanAppendLine(out, "provider_modules", v3SystemLinkPlanListText(plan.providerModules))
+    v3SystemLinkPlanAppendLine(out, "entry_symbol", len(plan.entrySymbol) > 0 ? plan.entrySymbol : "-")
+    v3SystemLinkPlanAppendLine(out, "missing_reasons", v3SystemLinkPlanListText(plan.missingReasons))
+    v3SystemLinkPlanAppendLine(out, "parser_syntax", plan.parserSyntaxTag)
+    v3SystemLinkPlanAppendLine(out, "parser_source_kind", parser.v3ParsedSourceKindText(plan.parserSourceKind))
+    v3SystemLinkPlanAppendLine(out, "build_entry", plan.buildEntryPath)
+    v3SystemLinkPlanAppendLine(out, "build_source_unit_count", intToStr(plan.buildSourceUnitCount))
+    v3SystemLinkPlanAppendLine(out, "link_mode", plan.linkMode)
+    v3SystemLinkPlanAppendLine(out, "pipeline_stage", plan.pipelineStage)
+    return out

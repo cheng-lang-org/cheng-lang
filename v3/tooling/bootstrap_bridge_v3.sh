@@ -5,6 +5,9 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 out_dir="$root/artifacts/v3_bootstrap"
 seed_source="$root/v3/bootstrap/cheng_v3_seed.c"
 stage1_source="$root/v3/bootstrap/stage1_bootstrap.cheng"
+compiler_entry_source="$root/v3/src/tooling/compiler_main.cheng"
+compiler_runtime_source="$root/v3/src/tooling/compiler_runtime.cheng"
+compiler_request_source="$root/v3/src/tooling/compiler_request.cheng"
 stage0="$out_dir/cheng.stage0"
 stage1="$out_dir/cheng.stage1"
 stage2="$out_dir/cheng.stage2"
@@ -38,6 +41,21 @@ fi
 
 if [ ! -f "$stage1_source" ]; then
   echo "v3 bootstrap bridge: missing stage1 source: $stage1_source" >&2
+  exit 1
+fi
+
+if [ ! -f "$compiler_entry_source" ]; then
+  echo "v3 bootstrap bridge: missing compiler entry source: $compiler_entry_source" >&2
+  exit 1
+fi
+
+if [ ! -f "$compiler_runtime_source" ]; then
+  echo "v3 bootstrap bridge: missing compiler runtime source: $compiler_runtime_source" >&2
+  exit 1
+fi
+
+if [ ! -f "$compiler_request_source" ]; then
+  echo "v3 bootstrap bridge: missing compiler request source: $compiler_request_source" >&2
   exit 1
 fi
 
@@ -121,6 +139,9 @@ V3_TARGET=$target
 V3_BOOTSTRAP_KIND=v3_seed
 V3_BOOTSTRAP_SEED_SOURCE=$seed_source
 V3_BOOTSTRAP_STAGE1_SOURCE=$stage1_source
+V3_COMPILER_ENTRY_SOURCE=$compiler_entry_source
+V3_COMPILER_RUNTIME_SOURCE=$compiler_runtime_source
+V3_COMPILER_REQUEST_SOURCE=$compiler_request_source
 V3_BOOTSTRAP_STAGE0=$stage0
 V3_BOOTSTRAP_STAGE1=$stage1
 V3_BOOTSTRAP_STAGE2=$stage2
@@ -137,6 +158,9 @@ target=$target
 bootstrap_kind=v3_seed
 seed_source=$seed_source
 stage1_source=$stage1_source
+compiler_entry_source=$compiler_entry_source
+compiler_runtime_source=$compiler_runtime_source
+compiler_request_source=$compiler_request_source
 stage0=$stage0
 stage1=$stage1
 stage2=$stage2

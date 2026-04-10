@@ -2,6 +2,70 @@
 
 | 项目 | 内容 |
 |---|---|
+| 目标 | 把 `v3` linkerless dev 轨从“只有文档边界”推进到“ordinary compile 真产出源码 line-map，panic/assert/bounds 真能反查回 `.cheng` 文件和行号”。 |
+| 主线 | 这轮直接在 `v3/bootstrap/cheng_v3_seed.c` 里给 lowered function 补 `signature/body span`，并在成功链接后写出 `<out>.v3.map` sidecar；运行时侧不新造 provider 模块，而是复用已经在 ordinary compile 里链接的 `src/runtime/native/system_helpers.c`，让 `v3/runtime/native/{v3_program_argv_native.c,v3_tooling_argv_native.c}` 启动时自动注册 line-map。随后把 `panic/assert` 从裸 `puts + _exit` 收成统一走 `cheng_v3_panic_cstring_and_exit`，并补 `ordinary_panic_fixture + build_panic_trace_v3.sh` 做真验收。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `src/runtime/native/system_helpers.c` `v3/runtime/native/v3_program_argv_native.c` `v3/runtime/native/v3_tooling_argv_native.c` `v3/src/tests/ordinary_panic_fixture.cheng` `v3/tooling/build_panic_trace_v3.sh` `v3/tooling/build_zero_exit_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不去碰 `DWARF/dSYM` 那条外部符号轨；不在 signal handler 里塞不安全的全量符号反查；不借这轮顺手扩 `chain_node` ordinary 语义子集；不回滚 `v3/bootstrap/cheng_v3_seed.c` 里已有的用户改动。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须通过；`build_backend_driver_v3.sh`、`build_zero_exit_v3.sh`、`build_call_chain_v3.sh`、`build_panic_trace_v3.sh` 必须前台通过；`panic` fixture 的 stderr 必须出现 `ordinary_panic_fixture.cheng:2-3`。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` 文档总口径收正成可执行硬边界，直接给后续实现让路：`LSMR` 不再把稳定地址绑死绝对地理，`FFI` 句柄明确锁成 `generation:index`，debug 收成“外部符号 + linkerless 内嵌行号表”双轨，`RWAD/UniMaker` 锁死“finalized reserve 才能进 NAV、商户标价与 RWAD 结算强制解耦”。 |
+| 主线 | 这轮不碰 `v3/bootstrap` 和 ordinary compile 活根，只收正 `v3/docs/LSMR.md` 与 `v3/docs/cheng语言特性矩阵和开发计划.md` 的硬边界，同时把 `task_plan/progress/findings` 同步成新口径。重点不是再加愿景，而是删掉“物理上必然接近”“未 Allocated 也能折价进 NAV”“dev 轨只靠裸地址 backtrace”这类会误导后续实现的错口径。 |
+| 文件 | `v3/docs/LSMR.md` `v3/docs/cheng语言特性矩阵和开发计划.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不改 `bagua/BPI` sidecar-only 边界；不碰 `v3` 编译器代码；不把热点前缀扩容写成“重写顶层地址”；不把 `DWARF/dSYM` 和 linkerless panic 反查做成二选一。 |
+| 验收 | `LSMR.md` 必须明确写出“稳定前缀 + 动态延迟坐标 + 桶上限”口径；总览文档必须把 `FFI/debug/RWAD/UniMaker` 的硬规则写成正式矩阵；任务记录必须同步这轮收正规则。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` seed ordinary compile 从“标量/指针子集”推进到 `chain_node` 真主链，这一刀先补无注解 `let/var` 的类型反推和局部槽位 `type_text`，为后面的复合 ABI 铺路。 |
+| 主线 | 这轮已经在 `v3/bootstrap/cheng_v3_seed.c` 接上 `expr -> type/abi` 反推：字符串字面量、标量字面量、top-level const、本地槽位、单参 cast、普通函数调用返回类型、首字母大写的 record 构造现在都能反推出 `type_text/abi_class`；`V3AsmLocalSlot` 也开始显式记录 `type_text`，无注解 `let/var` 不再一上来就要求源码显式标类型。前台验收上，`cc -std=c11 -O0 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c`、`build_backend_driver_v3.sh`、`build_program_selfhost_v3.sh` 继续通过，`chain_node` 首个 blocker 仍稳定是 `v3ChainNodeMainSelfTest` 的 `var server = node.v3ChainNodeInit(...)`。这说明“类型反推”这层已经补上了，下一刀该直接做固定布局表和复合 ABI，而不是再在 `let/var` 注解面打转。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/src/project/chain_node_main.cheng` `v3/src/project/chain_node.cheng` `src/std/system.cheng` `src/std/result.cheng` `src/std/rawbytes.cheng` `src/std/seqs.cheng` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把“无注解绑定”再退回必须手写类型；不拿 `program_selfhost` 继续通过来伪装 `chain_node` 已经接通；不把当前真阻塞改写成别的名字。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c` 必须通过；`build_backend_driver_v3.sh`、`build_program_selfhost_v3.sh` 必须继续通过；`build_chain_node_v3.sh` 必须继续稳定卡在 `v3ChainNodeMainSelfTest stmt_var`，证明类型反推已补上但复合 ABI 还没做。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` seed ordinary compile 从“标量/指针子集”推进到 `chain_node` 真主链，同时先清掉会误导判断的假 blocker。 |
+| 主线 | 这轮已经在 `v3/bootstrap/cheng_v3_seed.c` 接上 top-level `const` 收集与标量常量解析，`v3LsmrDigitOk`、`v3BaguaValid` 这类 `return_expr/if` 假阻塞已从 `chain_node` 的 unsupported 列表里消失；与此同时，name-only 重载解析也已收紧成“单候选才放行”，不再允许 `rawmemAsVoid` 这类重载静默错绑到第一条函数体。当前 `build_backend_driver_v3.sh`、`scan_forbidden_hotpath.sh` 继续通过，`chain_node` 的首个真实阻塞没有再漂，仍然稳定是 `chain_node_main::v3ChainNodeMainSelfTest` 的 `var server = node.v3ChainNodeInit(...)`。这说明下一刀必须正面补 `复合 ABI + 无注解 let/var + 字段读写`，而不是继续在标量叶子、常量名或重载假点上打转。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/src/project/chain_node_main.cheng` `v3/src/project/chain_node.cheng` `v3/src/chain/binary_types.cheng` `v3/src/chain/lsmr_types.cheng` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 `rawmemAsVoid` 的 name-only 错绑继续留着；不回头补旧 proof/sidecar；不把 `chain_node` 的主阻塞伪装成“还是 bool/const 叶子没通”。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c` 必须通过；`build_backend_driver_v3.sh` 必须通过；`scan_forbidden_hotpath.sh` 必须通过；`chain_node.compile.log` 里 `v3LsmrDigitOk`、`v3BaguaValid` 不能再出现在 `primary_object_unsupported_functions`；首个 blocker 必须继续稳定停在 `v3ChainNodeMainSelfTest stmt_var`，证明真根已经收窄到复合值 ABI。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` seed ordinary compile 从“只有 typed plan”推进到“最小 ordinary 子集真发 `primary .o`、真编 provider `.o`、真链接并真跑”，同时把 `program-selfhost` 和 `chain_node` 的阻塞收正成单一函数体语义缺口。 |
+| 主线 | 这轮已经在 `v3/bootstrap/cheng_v3_seed.c` 里补上 strict body-kind 识别、arm64 汇编 primary object 物化、provider `.o` 编译和真实 native link。普通 program 入口 ABI 也已经和 `v3/runtime/native/v3_program_argv_native.c` 对齐，不再错导出 `_main`。结果是 `build_backend_driver_v3.sh`、`run_v3_host_smokes.sh`、`build_zero_exit_v3.sh` 全部前台通过；`build_program_selfhost_v3.sh` 和 `build_chain_node_v3.sh` 现在统一稳定报 `v3 compiler: primary object body semantics missing`。这说明 `.o` 和链接链路已经是真的，剩下只该扩 ordinary body 语义子集。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/runtime/native/v3_program_argv_native.c` `v3/runtime/native/v3_tooling_argv_native.c` `v3/runtime/native/v3_core_runtime_stub.c` `v3/tooling/build_zero_exit_v3.sh` `v3/tooling/build_program_selfhost_v3.sh` `v3/tooling/build_chain_node_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/src/tests/ordinary_zero_exit_fixture.cheng` `v3/src/tests/primary_object_codegen_smoke.cheng` `v3/docs/cheng语言特性矩阵和开发计划.md` `v3/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不回退到 bootstrap-only 壳；不把 `zero-exit` 的真通过伪装成 `program-selfhost/chain_node` 已闭合；不再回头修已经切掉的 argv/contract/report/linker 假阻塞。 |
+| 验收 | `build_backend_driver_v3.sh` 必须通过；`run_v3_host_smokes.sh` 必须全绿；`build_zero_exit_v3.sh` 必须真通过；`build_program_selfhost_v3.sh` 与 `build_chain_node_v3.sh` 必须统一稳定报 `v3 compiler: primary object body semantics missing`；文档必须明确写出当前 object/link 已接通，下一刀只扩 ordinary body 语义子集。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` bootstrap seed 的 ordinary command 面彻底收口到“真实 typed plan + 诚实阻塞”，继续拆掉 `argv/contract/report/stack` 这些假崩点，让 `program-selfhost` 和 `chain_node` 都稳定停在同一个语义缺口上。 |
+| 主线 | 这轮已经把 `v3/bootstrap/cheng_v3_seed.c` 的 ordinary 命令面真正接通：`status/print-build-plan/system-link-exec` 现在都走内嵌 runtime contract，不再把普通源码 `--in` 误当 bootstrap contract；CLI 也已经同时接受 `--flag value`、`--flag:value`、`--flag=value` 三种写法，和 `v3/tooling/*.sh`、`v2/bootstrap/Makefile` 一致。随后又把 `v3_system_link_plan_report` 的固定缓冲区 `strcat` 改成动态拼接，并把 `v3_collect_source_closure` 里每层递归都压栈的 `V3PlanImportEdge[256]` 大 scratch 改成 heap scratch，`chain_node` 的段错误已经被切掉。现在 `build_backend_driver_v3.sh` 已稳定产出带 `status/print-build-plan/system-link-exec` 的 canonical backend driver，`program-selfhost` 和 `chain_node` 也都会稳定走到同一个 typed plan 阻塞：`runtime_targets_not_lowered` 与 `runtime_provider_modules_not_selected`。`run_v3_host_smokes.sh` 已继续全绿，`run_slice_gate.sh` 的唯一真失败位也已经收敛到 `program-selfhost`。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/build_program_selfhost_v3.sh` `v3/tooling/build_chain_node_v3.sh` `v3/tooling/run_slice_gate.sh` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不回退到旧 proof/sidecar；不把 `runtime_targets/provider_modules` 为空伪装成“lowering 已开始”；不再让普通编译死在 `argv`、contract 装载或 report 栈溢出这种假根上。 |
+| 验收 | `build_backend_driver_v3.sh` 必须继续通过；`artifacts/v3_backend_driver/cheng status/print-build-plan/system-link-exec` 必须都可调用；`build_program_selfhost_v3.sh` 和 `build_chain_node_v3.sh` 必须统一报 `runtime_targets_not_lowered/runtime_provider_modules_not_selected`，不能再出现 `missing --in`、`invalid bootstrap line` 或段错误；`run_v3_host_smokes.sh` 必须继续全绿；`run_slice_gate.sh` 必须稳定停在 `program-selfhost` 这一处真阻塞。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` ordinary compile 的最小 typed plan 真落地到 `parser -> system_link_plan -> compiler_main`，并把 gate 收严成“`build_backend_driver_v3.sh` 必须产出带 `status/print-build-plan/system-link-exec` 的 ordinary compiler”，不再把 bootstrap 壳误报成 canonical backend driver。 |
+| 主线 | 这轮已经把 `v3/src/lang/parser.cheng` 扩成真实 package/workspace root、owner module、import edge、closure path、entry symbol、`missing_reasons` 的 typed parser stub；`v3/src/backend/system_link_plan.cheng` 也已改成 typed `emit/module kind/source kind`、typed closure/report、typed missing reasons，`compiler_request.cheng` 还接上了 `--root` 的 package-root 语义。`run_v3_host_smokes.sh` 现已固定在仓库根执行，`compiler_runtime_smoke`、`compiler_pipeline_stub_smoke` 和整套 host smokes 全绿。与此同时，`build_backend_driver_v3.sh` 已被收严成必须验证 built artifact 真的支持 `status` 和 `print-build-plan`；因此 `run_slice_gate.sh` 现在会更早、更诚实地死在真正主根：`artifacts/v3_backend_driver/cheng` 仍然只是 `cheng_v3_seed`/`compile-bootstrap` 壳。 |
+| 文件 | `v3/src/tooling/compiler_request.cheng` `v3/src/tooling/compiler_runtime.cheng` `v3/src/tooling/compiler_main.cheng` `v3/src/lang/parser.cheng` `v3/src/backend/system_link_plan.cheng` `v3/src/backend/system_link_exec.cheng` `v3/src/tests/compiler_runtime_smoke.cheng` `v3/src/tests/compiler_pipeline_stub_smoke.cheng` `v3/tooling/run_v3_host_smokes.sh` `v3/tooling/build_backend_driver_v3.sh` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再把 `build_backend_driver_v3.sh` 的“构建成功”当成 ordinary compiler 已经存在；不继续拿 `program-selfhost` 之后的报错掩盖更早的 `backend driver 仍是 bootstrap 壳`；不回退 `typed plan` 到字符串壳。 |
+| 验收 | `scan_forbidden_hotpath.sh` 必须继续通过；`run_v3_host_smokes.sh` 必须全绿；`run_slice_gate.sh` 必须在 `canonical bootstrap compiler` 这一步直接暴露 `built output is still bootstrap-only, missing ordinary status command`，不再假装 `build_backend_driver_v3.sh` 已闭合。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` 的正式 gate 从“看 backend driver 帮助面”收严成“backend driver 真编 ordinary program 和 chain_node artifact”，并把当前真阻塞明文钉死为“`v3` 还没有自己的普通编译入口源码”。 |
+| 主线 | 这轮已经新增 `v3/src/project/chain_node_main.cheng`、`v3/tooling/build_program_selfhost_v3.sh`、`v3/tooling/build_chain_node_v3.sh`，并把 `v3/tooling/run_slice_gate.sh` 改成直接调用这两条真实构建脚本。随后又把 `v3/src/tooling/{compiler_main,compiler_runtime,compiler_request}.cheng`、`v3/src/lang/parser.cheng`、`v3/src/backend/system_link_exec.cheng` 落库，`build_plan.cheng` 也已经把 `entryPath` 切到 `compiler_main.cheng`；host compiler 现已能真编这个新入口，`help/status` 正常，`system-link-exec` 也会稳定经过 `parser stub -> backend system_link_exec stub` 再报 `v3 compiler: ordinary pipeline not implemented`。当前 main root 仍然是 `build_backend_driver_v3.sh` 继续 materialize `stage1_bootstrap.cheng`。 |
+| 文件 | `v3/src/project/chain_node_main.cheng` `v3/src/tooling/compiler_main.cheng` `v3/src/tooling/compiler_runtime.cheng` `v3/src/tooling/compiler_request.cheng` `v3/src/lang/parser.cheng` `v3/src/backend/system_link_exec.cheng` `v3/tooling/build_program_selfhost_v3.sh` `v3/tooling/build_chain_node_v3.sh` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/docs/cheng语言特性矩阵和开发计划.md` `v3/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再拿 `--help` 或 `supported_commands` 冒充 `program-selfhost` 已接通；不把 `stage1_bootstrap.cheng` 这种合同文件误认成普通编译器实现；不回去补旧 proof/sidecar 链。 |
+| 验收 | `run_slice_gate.sh` 必须在 `program-selfhost` 阶段直接调用真实 ordinary program 构建脚本，在 `chain_node` 阶段直接调用真实 artifact 构建脚本；`compiler_main` 必须能被 host compiler 真编并稳定给出 `help/status/not implemented`；文档必须明确写出当前真阻塞是“backend driver 还在吃 bootstrap manifest，而不是 compiler_main”。 |
+
+| 项目 | 内容 |
+|---|---|
 | 目标 | 承认 `src/tooling/cheng_tooling.cheng` 属于旧链后，把 `v3` 的主控、bootstrap 合同、backend build plan、性能 gate 全部落回 `v3` 目录；`run_slice_gate.sh` 只认 `v3/tooling` 的 bridge/build 入口，不再把旧总控当 `v3` 主链。 |
 | 主线 | 这轮已经开始把 `v3/src/tooling/{path,host_ops,bootstrap_contracts,hotpath_scan,perf_gate,gate_main}.cheng`、`v3/src/backend/build_plan.cheng`、`v3/src/tests/{bootstrap_contracts_smoke,perf_gate_smoke}.cheng` 全部落库，并新增 `v3/tooling/{cheng_v3,bootstrap_bridge_v3,build_backend_driver_v3}.sh`。`bootstrap_bridge_v3.sh` 仍只把旧脚本当 bootstrap bring-up 外根，`build_backend_driver_v3.sh` 直接用 bootstrap driver + `chengc.sh` 编 `src/backend/tooling/backend_driver.cheng`，不再走旧总控子命令。当前还没跑通纯 Cheng `gate_main`，因为仓库现有 backend driver compile 仍会在更早位置炸掉。 |
 | 文件 | `v3/src/tooling/path.cheng` `v3/src/tooling/host_ops.cheng` `v3/src/tooling/bootstrap_contracts.cheng` `v3/src/tooling/hotpath_scan.cheng` `v3/src/tooling/perf_gate.cheng` `v3/src/tooling/gate_main.cheng` `v3/src/backend/build_plan.cheng` `v3/src/tests/bootstrap_contracts_smoke.cheng` `v3/src/tests/perf_gate_smoke.cheng` `v3/tooling/cheng_v3.sh` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
@@ -423,3 +487,99 @@
 | 文件 | `v3/src/tooling/gate_main.cheng` `v3/bootstrap/cheng_v3_seed.c` `v3/bootstrap/stage1_bootstrap.cheng` `v3/README.md` `v3/tooling/README.md` `v3/bootstrap/README.md` `task_plan.md` `progress.md` `findings.md` |
 | 不做 | 不回头恢复任何旧 proof/path 兼容描述；不把 README 写成与实际 gate 不一致的“假入口”；不再让 `v3` 活入口偷偷保留旧 `tooling_cmd` 回退 |
 | 验收 | `rg -n \"probe_currentsrc_proof|stage2_proof|stage3_witness|currentsrc_proof|tooling_cmd/cheng_tooling|cheng_stage0_currentsrc\\.proof|sidecar contract\" /Users/lbcheng/cheng-lang/v3 -S` 必须零命中；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh run-smokes`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须全部前台通过。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 按 `v3/docs/cheng语言特性矩阵和开发计划.md` 并行推进当前执行顺序 `1-5`，把 `v3` 链语义固定布局主线和正式 host smoke gate 一次性接起来 |
+| 主线 | 这轮已经把 `v3/src/chain` 扩成固定布局语义核：`lsmr_types/lsmr/anti_entropy/csg/pubsub/location_proof/consensus` 全部落地；同时新增 `lsmr_types_smoke/lsmr_locality_storage_smoke/lsmr_bagua_prefix_tree_smoke/anti_entropy_smoke/csg_smoke/pubsub_smoke/location_proof_smoke/consensus_smoke`，再用 `v3/tooling/run_v3_host_smokes.sh` 收成统一 host smoke 入口，并把 `run_slice_gate.sh` 正式接上这条链。当前 `fixed_surface/csg/consensus/pubsub/location_proof` 已经 host-run 通过，`chain_codec_binary_smoke` 则稳定把真阻塞暴露成 `driver_c program runtime: missing type decl for zero init type=int32 inst_owner=v3/tests/chain_codec_binary_smoke`；`anti_entropy` 和 `lsmr_*` 也都已经真编过，下一刀只该收这个宿主 runtime 缺口，不再回头修旧 proof/sidecar 或字符串壳。 |
+| 文件 | `v3/cheng-package.toml` `v3/src/chain/binary_types.cheng` `v3/src/chain/codec_binary.cheng` `v3/src/chain/lsmr_types.cheng` `v3/src/chain/lsmr.cheng` `v3/src/chain/anti_entropy.cheng` `v3/src/chain/csg.cheng` `v3/src/chain/pubsub.cheng` `v3/src/chain/location_proof.cheng` `v3/src/chain/consensus.cheng` `v3/src/tests/chain_codec_binary_smoke.cheng` `v3/src/tests/fixed_surface_smoke.cheng` `v3/src/tests/lsmr_types_smoke.cheng` `v3/src/tests/lsmr_locality_storage_smoke.cheng` `v3/src/tests/lsmr_bagua_prefix_tree_smoke.cheng` `v3/src/tests/anti_entropy_smoke.cheng` `v3/src/tests/csg_smoke.cheng` `v3/src/tests/pubsub_smoke.cheng` `v3/src/tests/location_proof_smoke.cheng` `v3/src/tests/consensus_smoke.cheng` `v3/tooling/run_v3_host_smokes.sh` `v3/tooling/run_slice_gate.sh` `v3/README.md` `v3/tooling/README.md` `v3/docs/cheng语言特性矩阵和开发计划.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 host smoke 失败包装成通过；不把 compile-only 伪装成运行通过；不把 `ir_core` 这条无关老坑放到链 gate 前面抢失败位；不把 `v2` 文本链壳、`payloadText`、`BigInt/Bytes/Seq` 热链拉回 `v3` |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 必须先稳定跑过 `fixed_surface/csg/consensus/pubsub/location_proof`，再把 `chain_codec_binary_smoke` 的真失败点固定暴露；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 也必须前台复现同一个失败位，而不是再回到旧 bridge/tooling 黑盒。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` ordinary compile 从 `lowering` 再推进两层到 `object/native-link`，同时守住 `scan + host smokes + bootstrap + backend driver` 全绿 |
+| 主线 | 这轮已经在 `v3` 新主线上补了 `backend/object_plan.cheng`、`backend/native_link_plan.cheng`，把 `system_link_exec` 从只导出 `source closure + runtime targets/provider + lowering inventory` 推进到同时导出 `primary_object/provider_object_paths/object_link_inputs/native_link_inputs`。`stage1_bootstrap`、`bootstrap_contracts`、`build_plan`、seed C 也已同步加入 `backend_object_plan_source/backend_native_link_plan_source`，并把 `ordinary_pipeline_state` 收正到 `native_link_plan_stub_missing_codegen`。当前 `bootstrap_bridge_v3.sh`、`build_backend_driver_v3.sh`、`scan_forbidden_hotpath.sh`、`run_v3_host_smokes.sh` 全部前台通过；`build_program_selfhost_v3.sh` 和 `build_chain_node_v3.sh` 现在统一稳定失败在 `v3 compiler: object and native link plans ready, machine code emission and final link not implemented`，说明真阻塞已经从 lowering 推进到机器码和最终链接。 |
+| 文件 | `v3/src/backend/system_link_exec.cheng` `v3/src/backend/object_plan.cheng` `v3/src/backend/native_link_plan.cheng` `v3/src/backend/build_plan.cheng` `v3/src/tooling/bootstrap_contracts.cheng` `v3/src/tooling/compiler_runtime.cheng` `v3/src/tooling/compiler_main.cheng` `v3/bootstrap/stage1_bootstrap.cheng` `v3/bootstrap/cheng_v3_seed.c` `v3/src/tests/lowering_plan_smoke.cheng` `v3/src/tests/object_native_link_plan_smoke.cheng` `v3/src/tests/compiler_runtime_smoke.cheng` `v3/tooling/run_v3_host_smokes.sh` `v3/docs/cheng语言特性矩阵和开发计划.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不伪造 `.o` 或可执行产物；不把新 `outputKind` 再写回 `kind: str`；不回头修旧 proof/tooling；不把 `provider/native-link` 重新做成字符串命令壳；不把 host runtime 的限制误当成 `v3` 语义设计错误 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/scan_forbidden_hotpath.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh` 与 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须稳定报同一条 `object and native link plans ready...`；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须在 `program-selfhost` 处复现同一失败位。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` ordinary compile 从“能发 `.o` 和最小可执行”推进到真正的函数体语义子集，并先把 ordinary 入口桥的运行时自旋真根收掉 |
+| 主线 | 这轮已经在 `v3/bootstrap/cheng_v3_seed.c` 里把 ordinary entry bridge 和 `return_call_noarg_i32` 从 `bl callee; ret` 改成直接 `b callee`，因为旧写法会覆盖 `LR`，最后在入口桥上自旋。随后重新清空 `artifacts/v3_bootstrap`、`artifacts/v3_backend_driver`、`artifacts/v3_zero_exit`、`artifacts/v3_call_chain` 并从零重编；`build_zero_exit_v3.sh` 和新加的 `build_call_chain_v3.sh` 已经真编、真链、真跑通过，`run_v3_host_smokes.sh` 也重新前台全绿。现在 `build_program_selfhost_v3.sh` 仍稳定报 `v3 compiler: primary object body semantics missing`；`build_chain_node_v3.sh` 也稳定报同一个大类错误，并额外带多处 `primary_object_call_target_missing`。这说明 `.o/link/argv bridge` 已经收完，下一刀只该扩 ordinary body 语义，不回头再修入口壳。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/src/tests/ordinary_call_chain_fixture.cheng` `v3/tooling/build_call_chain_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/README.md` `v3/tooling/README.md` `v3/docs/cheng语言特性矩阵和开发计划.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把尾调用再写回 `bl ...; ret`；不把 host smoke 通过误报成 ordinary compile 已完成；不回头再查 `.o/link/argv/contract` 假阻塞 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/build_zero_exit_v3.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_call_chain_v3.sh` 必须前台通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 必须前台全绿；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须继续稳定暴露 `primary object body semantics missing` 这一类真实下一层语义缺口。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` ordinary compile 的真缺口收窄到最小可达函数集合，避免 `program_selfhost/chain_node` 再被整包导入噪音淹没 |
+| 主线 | 这轮已经在 `v3/bootstrap/cheng_v3_seed.c` 里补了 `import alias` 解析、调用边采集和 entry-reachable 函数裁剪。结果是 `build_program_selfhost_v3.sh` 的 lowering 集合已经从 `598` 个函数压到 `16` 个，只剩 `program_selfhost_smoke -> bootstrap_contracts -> path` 这条最短链；`build_chain_node_v3.sh` 也从 `1120` 个函数压到 `112` 个，直接暴露出 `chain_node_main -> chain_node -> consensus/lsmr/anti_entropy/fixed256` 这条可达主链。`build_backend_driver_v3.sh`、`build_zero_exit_v3.sh`、`build_call_chain_v3.sh`、`run_v3_host_smokes.sh`、`scan_forbidden_hotpath.sh` 都已重新前台通过；当前普通编译仍统一停在 `primary object body semantics missing`，但现在已经只剩真实语义缺口。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/docs/cheng语言特性矩阵和开发计划.md` `v3/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 reachability 裁剪退回整包 lowering；不把 `std/os`、`std/strutils` 这些 helper 再当成必须整体真编的噪音入口；不把还未实现的 body semantics 伪装成“gate 通过” |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_zero_exit_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_call_chain_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/scan_forbidden_hotpath.sh` 必须前台通过；`build_program_selfhost_v3.sh` 的 `lowering_function_count` 必须稳定是 `16`；`build_chain_node_v3.sh` 的 `lowering_function_count` 必须稳定是 `112`。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` ordinary compile 从“最小 tail-call 子集”推进到 `program_selfhost` 真编真跑，并把 `chain_node` 的失败位收敛成纯函数体语义缺口 |
+| 主线 | 这轮先在 `v3/bootstrap/cheng_v3_seed.c` 收掉 consteval 的栈爆和源码缓冲所有权，再把 multi-line signature 的解析边界收正成“完整读文件后第二遍匹配”，并跳过 `importc fn` 这类无函数体声明。随后修掉 consteval 生成汇编里 `bl _puts` 覆盖 `LR/x30` 的活 bug，最终让 `build_program_selfhost_v3.sh` 真编、真链、真跑通过。并行还把 no-arg tail-call 的 callee 解析从“同模块裸名字匹配”改成复用 lowering 已采集的完整 `callee_symbols[0]`，于是 `build_chain_node_v3.sh` 和 `run_slice_gate.sh` 里的 `primary_object_call_target_missing` 已消失，统一只剩 `primary_object_body_semantics_missing`。当前整条 gate 真实状态是：`scan_forbidden_hotpath.sh` 通过，`build_backend_driver_v3.sh` 通过，`build_zero_exit_v3.sh` 和 `build_call_chain_v3.sh` 通过，`build_program_selfhost_v3.sh` 通过，`run_v3_host_smokes.sh` 前台全绿，`run_slice_gate.sh` 稳定只死在 `chain_node 未接通`。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 consteval 死循环伪装成脚本卡住；不再用同模块裸函数名猜 tail-call callee；不回头修已收掉的 `.o/link/argv` 假阻塞；不把 `chain_node` 现在的纯函数体缺口包装成 runtime 或 call graph 问题 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh` 必须前台输出 `v3 program_selfhost_smoke ok`；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须不再出现 `primary_object_call_target_missing`；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须稳定只在 `chain_node` 阶段失败，并把失败位固定成 `primary_object_body_semantics_missing`。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` seed 的 ordinary reachable 图修正成真实依赖图，停止让 bare import 调用漏边，并把 `chain_node` 的 unsupported 前沿从截断的 8 条假主根放大成完整可执行主根。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 里做了两件硬修正：一是把 `CHENG_V3_MAX_UNSUPPORTED_DETAILS` 从 `8` 放大到 `64`；二是把 lowering 的调用边收集改成“两阶段”，先收函数，再按完整 lowering 库重新解析每个函数体里的调用。新的 bare call 解析规则不再默认把 `bytesAlloc/bytesLen/bytesSet/intToStr/rawmemCopy` 这类裸调用错判成当前模块，而是优先同模块精确命中，否则在当前 import 集里按“唯一已收集符号”解析到真实模块。结果是 `build_chain_node_v3.sh` 的 `lowering_function_count` 从 `110` 升到 `126`，新暴露出的真实 reachable 集已经包含 `std/rawbytes::*`、`std/rawmem_support::*`、`std/strings::intToStr`、`std/system::str*` 这些此前被漏掉的依赖。当前 `chain_node` 的真实失败不再是“最前 8 个函数”，而是普通函数体子集整体还没接上；日志前 64 个 unsupported 已明确覆盖 `std/system`、`rawbytes`、`bytes_layout`、`anti_entropy`、`lsmr`、`sha256` 这几层。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再拿被漏边裁瘦的 reachable 集做决策；不再把 bare import 调用当成当前模块函数；不再让 unsupported 明细只露 8 条就开始补语义；不回头修已经通过的 `build_backend_driver_v3.sh`、`run_v3_host_smokes.sh`、`scan_forbidden_hotpath.sh`。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须无 warning 通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须仍稳定失败在 `primary_object_body_semantics_missing`，但 `lowering_function_count` 必须扩大到 `126`，`primary_object_unsupported_function_count` 必须扩大到 `64`；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/scan_forbidden_hotpath.sh` 必须继续通过。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 让新的 reachable 修正和句型分类真正进入 `stage2/stage3` 自举链，并把 `chain_node` 的 ordinary 主根从“函数名单”推进成“句型族名单”。 |
+| 主线 | 这轮已经先重跑 [bootstrap_bridge_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh) 刷新 `cheng.stage0~3`，再重跑 [build_backend_driver_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh) 刷新 [artifacts/v3_backend_driver/cheng](/Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/cheng)。刷新后 [chain_node.compile.log](/Users/lbcheng/cheng-lang/artifacts/v3_chain_node/chain_node.compile.log) 已经不再把前 64 项都标成 `unsupported`，而是分裂成 `stmt_call`、`stmt_var`、`stmt_let`、`stmt_if`、`stmt_for`、`return_expr`。这一步把下一刀从“继续猜 blocker 函数”收成了“按句型族补 ordinary body semantics”。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再修改 seed 后直接跳过 bootstrap 链刷新；不再把 compile log 里的 `body_kind` 全部当成一类；不再围着旧的 `print/panic/byteBuf*` 8 项做点状修补。 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 的 `first unsupported function` 必须仍指向 `v3ChainNodeMainPrint`，但 `body_kind` 必须变成 `stmt_call`，且 `primary_object_unsupported_body_kinds` 必须出现 `stmt_call/stmt_var/stmt_let/stmt_if/stmt_for/return_expr` 这些真实句型。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `chain_node` 的 ordinary blocker 再往前推一层，并把“缺哪种 ABI 形态”直接写进 compile log，停止只看函数名和句型。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 给 lowering 补了参数名、参数类型、返回类型和 ABI 分类，并把 `primary_object_unsupported_abi` 一起写进 `chain_node.compile.log`。随后重跑 `bootstrap_bridge_v3.sh` 和 `build_backend_driver_v3.sh`，新的 `build_chain_node_v3.sh` 已能直接报出 `first unsupported function=... abi=...`。同时顺手把 [chain_node_main.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_main.cheng) 里的 `v3ChainNodeMainPrint` 空包装删掉，并把 [fixed256.cheng](/Users/lbcheng/cheng-lang/v3/src/std/crypto/fixed256.cheng) 里的 `panicStr` 收成 `panic`，让 blocker 直接前移到 `v3ChainNodeMainSelfTest`。当前真实前沿已经明确：`chain_node` 现在先卡 `stmt_var` 主体，ABI 主要先卡 `str/record/Bytes/ByteBuf/array` 这类 composite 形态；`program_selfhost` 继续通过，`run_v3_host_smokes.sh` 和 `scan_forbidden_hotpath.sh` 继续全绿。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/src/project/chain_node_main.cheng` `v3/src/std/crypto/fixed256.cheng` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再围着 `v3ChainNodeMainPrint` 这个 `str` 包装函数原地打转；不在 ABI 未定的情况下先碰 `Bytes/ByteSpan/ByteBuf/FixedBytes32/V3LsmrAddress` 的按值 wrapper；不把 host smoke 绿灯误当成 `chain_node` ordinary 已通。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须无 warning；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 的首个 blocker 必须前移到 `v3ChainNodeMainSelfTest`，并打印 `abi=ret=int32/i32 params=-`；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/scan_forbidden_hotpath.sh` 必须继续通过。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `chain_node` 的 ordinary blocker 从“复合返回值错归属 + composite param 总拒绝”继续推进到真正的复合 ABI/body semantics 主层，同时守住 `bootstrap/backend_driver/program_selfhost/host_smokes` 全绿。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 先把 internal callee 的 `param_types/return_type` 改成按 callee 自己模块和 import alias 归一化，收掉了 `V3ChainNode -> chain_node_main::V3ChainNode` 的错归属；随后继续补了两层最小 ordinary 语义：一是 `composite` 参数槽位允许按地址进入函数体，不再在 emitter 入口直接拒绝；二是本地复合值的单层标量字段读取 `base.field` 已接通到类型推断和标量 codegen。现在 `build_chain_node_v3.sh` 已不再报 `V3ChainNode` layout/local slot 失败，也不再整批死在 `emit reject composite param`，新的最前沿已经收敛成 `std/crypto/sha256::getU32BE` 里的 `let b0: int64 = int64(bytesGet(data, offset))`。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再按 `Bytes/str/FixedBytes32` 各自发明一套 ABI；不回头修已经收掉的 `V3ChainNode` 错模块归一化；不把 host smoke 绿灯误当成 `chain_node` ordinary 已通。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须无 warning；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 必须前台通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须稳定只暴露新的 `getU32BE -> bytesGet(data, offset)` 真阻塞。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `assert/echo` 和“复合临时实参无地址”这两个 ordinary 真根直接收掉，并把 `chain_node` 的失败位推进到下一层真实语义缺口。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 做了三件硬改动：一是 ordinary 里的 bare `assert/echo` 不再走普通调用解析，而是直接做语句级 builtin lowering；`assert(cond, "msg")` 现在会先算布尔条件，失败时输出确定性字符串再 `_exit(1)`，`echo("msg")` 直接发 `_puts`。二是普通调用和 `call_into_slot` 都改成“先按 call-depth 把参数落到调用暂存区，再统一装入 `x0..x7` 调用”，不再让 nested call 冲掉前一个参数。三是给复合实参加了显式临时槽规划和 materialize 路径，`v3AntiEntropySignatureCid(local)`、`layout.fixedBytes32ToBytes(value)` 这类复合临时表达式现在会先落到可取址 slot 再传地址。结果是：`build_program_selfhost_v3.sh` 继续通过，`run_v3_host_smokes.sh` 继续全绿，`build_chain_node_v3.sh` 已经不再出现 `scalar call resolve failed ... callee=assert`，也不再出现 `scalar call composite-arg local missing ...`。当前 `chain_node` 的真实主根已经前移到更大一层：大量 `composite return function` 和 `composite field projection` 还没进 ordinary emitter，典型暴露面是 compile log 里仍然成片的 `ret=.../composite` 函数和 `mintCidRes.value`、`served.tipEventCid` 这类复合字段路径。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 `assert/echo` 从 intrinsic 名单里删掉去碰重载解析；不再让普通调用边走边塞寄存器；不再让复合临时实参靠字符串精确命中 local 名字。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh` 必须前台通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 的 compile log 里必须不再出现 `callee=assert` 和 `composite-arg local missing`。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `sret/x8`、复合本地槽位零初始化、赋值语句、复合 return 和字段路径读写接进 ordinary 主链，把 `chain_node` 的真阻塞从复合 ABI 前移到控制流。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 收了五层硬语义：一是复合返回统一改成 `x8 sret`，callee 进函数就把 `x8` spill 到隐藏本地槽位，不再把隐藏返回地址塞进 `x0` 冲掉用户参数；二是新增 `var/let` 无初始化声明解析和零初始化发码，复合本地槽位会按固定布局清零；三是新增普通赋值语句解析，已经支持 `local = expr`、`local.field = expr`，其中复合值会直接走 address materialize，不再只能走 call wrapper；四是补了 `Result[T]` 字段布局、`store_id` 字段别名和多层字段路径解析，`mintCidRes.ok/value`、`served.tipEventCid` 这类读取已经有统一数据面；五是复合表达式 materialize 现在支持 `local`、`local.field`、字符串字面量、复合调用、构造器和 `[]` 空序列。结果是：`bootstrap_bridge_v3.sh`、`build_backend_driver_v3.sh`、`build_program_selfhost_v3.sh`、`run_v3_host_smokes.sh`、`scan_forbidden_hotpath.sh` 全部继续通过；`build_chain_node_v3.sh` 的首个 blocker 已经稳定前移到 `std/system::strViewWithFlags` 的 `stmt_if`，说明 `chain_node` 当前第一堵墙已经不是复合 ABI，而是真控制流。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不回退到 `x0` 伪隐藏参数；不再用裸字符串猜字段类型；不把复合 return 继续强塞进 `v3_codegen_expr_scalar`；不把 `if/for/while` 和复合 ABI 混成一个问题。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_program_selfhost_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/scan_forbidden_hotpath.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 必须稳定把 `first unsupported function` 收敛到 `stmt_if`。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `chain_node` 的 ordinary 真阻塞从“索引读写/索引复合返回”继续前移到复合临时实参、非空序列字面量和 `add(seq,val)`。 |
+| 主线 | 这轮在 `v3/bootstrap/cheng_v3_seed.c` 新增了 `v3_parse_index_access_expr(...)` 和 `v3_emit_index_access_address(...)`，并把它们接进 `v3_prepare_expr_call_state(...)`、`v3_infer_expr_type(...)`、`v3_codegen_expr_scalar(...)`、`v3_materialize_composite_expr_into_address(...)`，同时给 indexed lvalue 赋值补了写回路径。前台重跑 `cc -std=c11 -O0 -Wall -Wextra -pedantic`、`bootstrap_bridge_v3.sh`、`build_backend_driver_v3.sh`、`build_chain_node_v3.sh` 后，[chain_node.compile.log](/Users/lbcheng/cheng-lang/artifacts/v3_chain_node/chain_node.compile.log) 已经不再出现 `index.accountHeads[pos]`、`index.balances[pos]`、`lt.v3AppendFixed32(buf, index.accountHeads[pos])` 这些索引错误，新的第一批明确失败已经前移成三组：`bytesFromString(...)` 作为 `layout.byteBufAppendBytes(...)` 的复合临时实参、`lt.v3HashInts(\"...\", [assetId, accountId])` 的非空序列字面量、以及 bare `add(seq,val)` 与 `std/seqs::{add,setLen}` 自身 ordinary 语义。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `artifacts/v3_chain_node/chain_node.compile.log` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再把索引访问当主阻塞；不回头再改刚收住的 `x8/sret`；不为过当前日志写特判绕开 `bytesFromString/[...]/add` 的真实语义。 |
+| 验收 | `cc -std=c11 -O0 -Wall -Wextra -pedantic /Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed_check` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 和 `sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh` 的 compile log 必须不再出现 `index.accountHeads[pos]`、`index.balances[pos]`、`lt.v3AppendFixed32(buf, index.accountHeads[pos])`。 |

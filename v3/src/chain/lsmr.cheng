@@ -1,0 +1,520 @@
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/fixed256 as fixed256
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/lsmr_types as lt
+
+type
+    V3RoutePlan =
+        sourceAddress: types.V3LsmrAddress
+        targetAddress: types.V3LsmrAddress
+        hopCount: int32
+        pathDigits: int32[]
+        firstHopDigits: int32[]
+        routeCid: layout.FixedBytes32
+
+    V3MulticastTree =
+        rootAddress: types.V3LsmrAddress
+        targetCount: int32
+        branchCount: int32
+        branchDigits: int32[]
+        branchTargetCounts: int32[]
+        branchRouteCids: layout.FixedBytes32[]
+        treeCid: layout.FixedBytes32
+
+fn v3LsmrIntAbs(value: int32): int32 =
+    if value < 0:
+        return 0 - value
+    return value
+
+fn v3LsmrDigitX(digit: int32): int32 =
+    if digit == 8 || digit == 3 || digit == 4:
+        return -1
+    if digit == 1 || digit == 5 || digit == 9:
+        return 0
+    if digit == 6 || digit == 7 || digit == 2:
+        return 1
+    panic("v3 lsmr: invalid digit")
+
+fn v3LsmrDigitY(digit: int32): int32 =
+    if digit == 8 || digit == 1 || digit == 6:
+        return -1
+    if digit == 3 || digit == 5 || digit == 7:
+        return 0
+    if digit == 4 || digit == 9 || digit == 2:
+        return 1
+    panic("v3 lsmr: invalid digit")
+
+fn v3LsmrDigitDistance(fromDigit: int32, toDigit: int32): int32 =
+    return v3LsmrIntAbs(v3LsmrDigitX(fromDigit) - v3LsmrDigitX(toDigit)) +
+           v3LsmrIntAbs(v3LsmrDigitY(fromDigit) - v3LsmrDigitY(toDigit))
+
+fn v3LsmrSharedPrefixDepth(left: types.V3LsmrAddress, right: types.V3LsmrAddress): int32 =
+    let maxDepth = left.depth < right.depth ? left.depth : right.depth
+    var out: int32 = 0
+    for i in 0..<maxDepth:
+        if left.digits[i] != right.digits[i]:
+            return out
+        out = out + 1
+    return out
+
+fn v3LsmrBaguaFromDigit(digit: int32): int32 =
+    case digit
+    of 6: return lt.v3BaguaQian
+    of 7: return lt.v3BaguaDui
+    of 9: return lt.v3BaguaLi
+    of 3: return lt.v3BaguaZhen
+    of 4: return lt.v3BaguaXun
+    of 1: return lt.v3BaguaKan
+    of 8: return lt.v3BaguaGen
+    of 2: return lt.v3BaguaKun
+    else: panic("v3 lsmr: center digit has no bagua")
+
+fn v3LsmrStateLayerForResolution(resolutionLevel: int32): int32 =
+    if resolutionLevel <= 0:
+        panic("v3 lsmr: invalid resolution")
+    if resolutionLevel <= 1:
+        return lt.v3LayerGlobal
+    if resolutionLevel == 2:
+        return lt.v3LayerRegional
+    return lt.v3LayerEdge
+
+fn v3LsmrAddressFromSeed(seedText: str, depth: int32): Result[types.V3LsmrAddress] =
+    if depth <= 0 || depth > types.v3LsmrMaxDepth:
+        return Err[types.V3LsmrAddress]("v3 lsmr: invalid address depth")
+    let digest: layout.FixedBytes32 = fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(seedText)))
+    var digits: int32[]
+    digits = []
+    for i in 0..<depth:
+        add(digits, types.v3LsmrDigitMin + (digest.data[i] % 9))
+    return types.v3LsmrAddressFromDigits(digits)
+
+fn v3LsmrAddressBagua(address: types.V3LsmrAddress, seedText: str): int32 =
+    for i in 0..<address.depth:
+        if address.digits[i] != types.v3LsmrDigitCenter:
+            return v3LsmrBaguaFromDigit(address.digits[i])
+    let fallbackRes = v3LsmrAddressFromSeed("bagua|" + seedText, 1)
+    if IsErr(fallbackRes):
+        panic(Error(fallbackRes))
+    let fallback = Value(fallbackRes)
+    for i in 0..<fallback.depth:
+        if fallback.digits[i] != types.v3LsmrDigitCenter:
+            return v3LsmrBaguaFromDigit(fallback.digits[i])
+    return lt.v3BaguaKan
+
+fn v3LsmrLocalityHashText(text: str): layout.FixedBytes32 =
+    var tokenHashes: int32[]
+    tokenHashes = []
+    var tokenHash: int32 = 17
+    var tokenLen: int32 = 0
+    let textLen = strings.len(text)
+    for i in 0..textLen:
+        let ch = i < textLen ? text[i] : ' '
+        var lower = ch
+        if lower >= 'A' && lower <= 'Z':
+            lower = char(int32(lower) + 32)
+        let alpha = (lower >= 'a' && lower <= 'z')
+        let digit = (lower >= '0' && lower <= '9')
+        if alpha || digit:
+            tokenHash = (tokenHash * 131 + int32(lower)) % 2147483629
+            tokenLen = tokenLen + 1
+        elif tokenLen > 0:
+            add(tokenHashes, tokenHash)
+            tokenHash = 17
+            tokenLen = 0
+    for i in 1..<tokenHashes.len:
+        let value = tokenHashes[i]
+        var j = i - 1
+        while j >= 0 && tokenHashes[j] > value:
+            tokenHashes[j + 1] = tokenHashes[j]
+            j = j - 1
+        tokenHashes[j + 1] = value
+    return lt.v3HashInts("v3.locality", tokenHashes)
+
+fn v3LsmrLocalityCidMake(keyId: int32,
+                         address: types.V3LsmrAddress,
+                         resolutionLevel: int32,
+                         contentCid: layout.FixedBytes32,
+                         localityHash: layout.FixedBytes32): Result[lt.V3LocalityCid] =
+    if resolutionLevel <= 0 || resolutionLevel > address.depth:
+        return Err[lt.V3LocalityCid]("v3 lsmr: invalid locality resolution")
+    var prefixDigits: int32[]
+    prefixDigits = []
+    for i in 0..<resolutionLevel:
+        add(prefixDigits, address.digits[i])
+    let baguaId = v3LsmrAddressBagua(address, intToStr(keyId))
+    let prefixRes = lt.v3PrefixRefFromDigits(baguaId, prefixDigits)
+    if IsErr(prefixRes):
+        return Err[lt.V3LocalityCid](Error(prefixRes))
+    let layerId = v3LsmrStateLayerForResolution(resolutionLevel)
+    let prefix = Value(prefixRes)
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.locality_cid"))
+    lt.v3AppendU32BE(buf, keyId)
+    lt.v3AppendU32BE(buf, baguaId)
+    lt.v3AppendU32BE(buf, resolutionLevel)
+    lt.v3AppendU32BE(buf, layerId)
+    lt.v3AppendAddress(buf, address)
+    lt.v3AppendPrefix(buf, prefix)
+    lt.v3AppendFixed32(buf, localityHash)
+    lt.v3AppendFixed32(buf, contentCid)
+    return Ok[lt.V3LocalityCid](lt.v3LocalityCidMake(
+        keyId,
+        baguaId,
+        resolutionLevel,
+        layerId,
+        address,
+        prefix,
+        localityHash,
+        contentCid,
+        lt.v3FixedCidFromBuf(buf)
+    ))
+
+fn v3LsmrStateCellMake(keyId: int32,
+                       address: types.V3LsmrAddress,
+                       resolutionLevel: int32,
+                       contentCid: layout.FixedBytes32,
+                       localityHash: layout.FixedBytes32): Result[lt.V3StateCell] =
+    let localityRes = v3LsmrLocalityCidMake(keyId, address, resolutionLevel, contentCid, localityHash)
+    if IsErr(localityRes):
+        return Err[lt.V3StateCell](Error(localityRes))
+    let locality = Value(localityRes)
+    return Ok[lt.V3StateCell](lt.v3StateCellMake(
+        keyId,
+        locality.baguaId,
+        resolutionLevel,
+        locality.layerId,
+        address,
+        locality.prefix,
+        contentCid,
+        localityHash,
+        locality.cid
+    ))
+
+fn v3LsmrStateCellFromText(keyId: int32,
+                           address: types.V3LsmrAddress,
+                           resolutionLevel: int32,
+                           contentText: str): Result[lt.V3StateCell] =
+    let contentCid = fixed256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(contentText)))
+    let localityHash = v3LsmrLocalityHashText(contentText)
+    return v3LsmrStateCellMake(keyId, address, resolutionLevel, contentCid, localityHash)
+
+fn v3RoutePlanZero(): V3RoutePlan =
+    var out: V3RoutePlan
+    out.pathDigits = []
+    out.firstHopDigits = []
+    out.routeCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3LsmrRoutePlanFromAddresses(sourceAddress: types.V3LsmrAddress,
+                                targetAddress: types.V3LsmrAddress): Result[V3RoutePlan] =
+    if sourceAddress.depth != targetAddress.depth:
+        return Err[V3RoutePlan]("v3 lsmr: route depth mismatch")
+    var out: V3RoutePlan = v3RoutePlanZero()
+    out.sourceAddress = sourceAddress
+    out.targetAddress = targetAddress
+    let shared = v3LsmrSharedPrefixDepth(sourceAddress, targetAddress)
+    for i in shared..<sourceAddress.depth:
+        out.hopCount = out.hopCount + v3LsmrDigitDistance(sourceAddress.digits[i], targetAddress.digits[i])
+        add(out.pathDigits, targetAddress.digits[i])
+    if shared < targetAddress.depth:
+        add(out.firstHopDigits, targetAddress.digits[shared])
+    var cidInts: int32[]
+    cidInts = []
+    add(cidInts, sourceAddress.depth)
+    add(cidInts, targetAddress.depth)
+    add(cidInts, out.hopCount)
+    for i in 0..<out.pathDigits.len:
+        add(cidInts, out.pathDigits[i])
+    out.routeCid = lt.v3HashInts("v3.route_plan", cidInts)
+    return Ok[V3RoutePlan](out)
+
+fn v3LsmrMulticastBranchDigit(rootAddress: types.V3LsmrAddress, targetAddress: types.V3LsmrAddress): int32 =
+    let shared = v3LsmrSharedPrefixDepth(rootAddress, targetAddress)
+    if shared >= targetAddress.depth:
+        return types.v3LsmrDigitCenter
+    return targetAddress.digits[shared]
+
+fn v3MulticastTreeZero(): V3MulticastTree =
+    var out: V3MulticastTree
+    out.branchDigits = []
+    out.branchTargetCounts = []
+    out.branchRouteCids = []
+    out.treeCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3EnsureBranch(tree: var V3MulticastTree, digit: int32): int32 =
+    for i in 0..<tree.branchDigits.len:
+        if tree.branchDigits[i] == digit:
+            return i
+    add(tree.branchDigits, digit)
+    add(tree.branchTargetCounts, 0)
+    add(tree.branchRouteCids, layout.fixedBytes32Zero())
+    return tree.branchDigits.len - 1
+
+fn v3LsmrBuildMulticastTree(rootAddress: types.V3LsmrAddress,
+                            targets: types.V3LsmrAddress[]): Result[V3MulticastTree] =
+    var out: V3MulticastTree = v3MulticastTreeZero()
+    out.rootAddress = rootAddress
+    out.targetCount = targets.len
+    for i in 0..<targets.len:
+        let routeRes = v3LsmrRoutePlanFromAddresses(rootAddress, targets[i])
+        if IsErr(routeRes):
+            return Err[V3MulticastTree](Error(routeRes))
+        let digit = v3LsmrMulticastBranchDigit(rootAddress, targets[i])
+        let branchPos = v3EnsureBranch(out, digit)
+        out.branchTargetCounts[branchPos] = out.branchTargetCounts[branchPos] + 1
+        out.branchRouteCids[branchPos] = Value(routeRes).routeCid
+    out.branchCount = out.branchDigits.len
+    var cidInts: int32[]
+    cidInts = []
+    add(cidInts, out.targetCount)
+    add(cidInts, out.branchCount)
+    for i in 0..<out.branchDigits.len:
+        add(cidInts, out.branchDigits[i])
+        add(cidInts, out.branchTargetCounts[i])
+    out.treeCid = lt.v3HashInts("v3.multicast_tree", cidInts)
+    return Ok[V3MulticastTree](out)
+
+fn v3StateCellLess(left: lt.V3StateCell, right: lt.V3StateCell): bool =
+    if left.baguaId != right.baguaId:
+        return left.baguaId < right.baguaId
+    if left.prefix.prefixDepth != right.prefix.prefixDepth:
+        return left.prefix.prefixDepth < right.prefix.prefixDepth
+    for i in 0..<types.v3LsmrMaxDepth:
+        if left.prefix.prefixDigits[i] != right.prefix.prefixDigits[i]:
+            return left.prefix.prefixDigits[i] < right.prefix.prefixDigits[i]
+    if left.keyId != right.keyId:
+        return left.keyId < right.keyId
+    return lt.v3FixedBytes32Less(left.contentCid, right.contentCid)
+
+fn v3SortStateCells(cells: var lt.V3StateCell[]) =
+    for i in 1..<cells.len:
+        let value = cells[i]
+        var j = i - 1
+        while j >= 0 && v3StateCellLess(value, cells[j]):
+            cells[j + 1] = cells[j]
+            j = j - 1
+        cells[j + 1] = value
+
+fn v3NodeKeyLess(left: lt.V3PrefixRef, right: lt.V3PrefixRef): bool =
+    if left.baguaId != right.baguaId:
+        return left.baguaId < right.baguaId
+    if left.prefixDepth != right.prefixDepth:
+        return left.prefixDepth < right.prefixDepth
+    for i in 0..<types.v3LsmrMaxDepth:
+        if left.prefixDigits[i] != right.prefixDigits[i]:
+            return left.prefixDigits[i] < right.prefixDigits[i]
+    return false
+
+fn v3SortNodeKeys(keys: var lt.V3PrefixRef[]) =
+    for i in 1..<keys.len:
+        let value = keys[i]
+        var j = i - 1
+        while j >= 0 && v3NodeKeyLess(value, keys[j]):
+            keys[j + 1] = keys[j]
+            j = j - 1
+        keys[j + 1] = value
+
+fn v3PushNodeKey(keys: var lt.V3PrefixRef[], key: lt.V3PrefixRef) =
+    for i in 0..<keys.len:
+        if lt.v3PrefixRefEqual(keys[i], key):
+            return
+    add(keys, key)
+
+fn v3TreeNodePos(tree: lt.V3BaguaPrefixTree,
+                 baguaId: int32,
+                 prefixDepth: int32,
+                 prefixDigits: int32[]): int32 =
+    for i in 0..<tree.nodeCount:
+        if tree.nodeBaguaIds[i] != baguaId || tree.nodePrefixDepths[i] != prefixDepth:
+            continue
+        var ok: bool = true
+        for j in 0..<prefixDepth:
+            if tree.nodePrefixDigits[i * types.v3LsmrMaxDepth + j] != prefixDigits[j]:
+                ok = false
+                break
+        if ok:
+            return i
+    return -1
+
+fn v3AppendDigitsFlat(out: var int32[], digits: int32[], depth: int32) =
+    for i in 0..<types.v3LsmrMaxDepth:
+        add(out, i < depth ? digits[i] : 0)
+
+fn v3NodeChildCount(keys: lt.V3PrefixRef[], parentPos: int32): int32 =
+    var count: int32 = 0
+    let parent = keys[parentPos]
+    for i in 0..<keys.len:
+        if i == parentPos:
+            continue
+        if keys[i].baguaId != parent.baguaId:
+            continue
+        if keys[i].prefixDepth != parent.prefixDepth + 1:
+            continue
+        if lt.v3PrefixRefContains(parent, keys[i]):
+            count = count + 1
+    return count
+
+fn v3NodeChildStart(keys: lt.V3PrefixRef[], parentPos: int32): int32 =
+    let parent = keys[parentPos]
+    for i in 0..<keys.len:
+        if i == parentPos:
+            continue
+        if keys[i].baguaId != parent.baguaId:
+            continue
+        if keys[i].prefixDepth != parent.prefixDepth + 1:
+            continue
+        if lt.v3PrefixRefContains(parent, keys[i]):
+            return i
+    return -1
+
+fn v3NodeEntryCount(cells: lt.V3StateCell[], node: lt.V3PrefixRef): int32 =
+    var out: int32 = 0
+    for i in 0..<cells.len:
+        if lt.v3PrefixRefEqual(cells[i].prefix, node):
+            out = out + 1
+    return out
+
+fn v3NodeEntryStart(cells: lt.V3StateCell[], node: lt.V3PrefixRef): int32 =
+    for i in 0..<cells.len:
+        if lt.v3PrefixRefEqual(cells[i].prefix, node):
+            return i
+    return -1
+
+fn v3NodeEntryDescCount(cells: lt.V3StateCell[], node: lt.V3PrefixRef): int32 =
+    var out: int32 = 0
+    for i in 0..<cells.len:
+        if lt.v3PrefixRefContains(node, cells[i].prefix):
+            out = out + 1
+    return out
+
+fn v3BuildBaguaPrefixTree(cellsRaw: lt.V3StateCell[]): lt.V3BaguaPrefixTree =
+    var cells: lt.V3StateCell[]
+    cells = cellsRaw
+    v3SortStateCells(cells)
+    var nodeKeys: lt.V3PrefixRef[]
+    nodeKeys = []
+    for i in 0..<cells.len:
+        let rootRes = lt.v3PrefixRefFromDigits(cells[i].baguaId, [])
+        if IsErr(rootRes):
+            panic(Error(rootRes))
+        v3PushNodeKey(nodeKeys, Value(rootRes))
+        var prefixDigits: int32[]
+        prefixDigits = []
+        for depth in 0..<cells[i].prefix.prefixDepth:
+            add(prefixDigits, cells[i].prefix.prefixDigits[depth])
+            let prefixRes = lt.v3PrefixRefFromDigits(cells[i].baguaId, prefixDigits)
+            if IsErr(prefixRes):
+                panic(Error(prefixRes))
+            v3PushNodeKey(nodeKeys, Value(prefixRes))
+    v3SortNodeKeys(nodeKeys)
+
+    var tree: lt.V3BaguaPrefixTree = lt.v3BaguaPrefixTreeZero()
+    tree.entryCount = cells.len
+    tree.nodeCount = nodeKeys.len
+
+    for i in 0..<cells.len:
+        add(tree.entryKeyIds, cells[i].keyId)
+        add(tree.entryBaguaIds, cells[i].baguaId)
+        add(tree.entryResolutionLevels, cells[i].resolutionLevel)
+        add(tree.entryLayerIds, cells[i].layerId)
+        add(tree.entryPrefixDepths, cells[i].prefix.prefixDepth)
+        v3AppendDigitsFlat(tree.entryPrefixDigits, cells[i].prefix.prefixDigits, cells[i].prefix.prefixDepth)
+        add(tree.entryAddressDepths, cells[i].address.depth)
+        v3AppendDigitsFlat(tree.entryAddressDigits, cells[i].address.digits, cells[i].address.depth)
+        add(tree.entryContentCids, cells[i].contentCid)
+        add(tree.entryLocalityHashes, cells[i].localityHash)
+        add(tree.entryLocalityCids, cells[i].localityCid)
+        add(tree.entryCids, lt.v3HashCell("v3.entry", cells[i]))
+    for i in 0..<nodeKeys.len:
+        add(tree.nodeBaguaIds, nodeKeys[i].baguaId)
+        add(tree.nodePrefixDepths, nodeKeys[i].prefixDepth)
+        v3AppendDigitsFlat(tree.nodePrefixDigits, nodeKeys[i].prefixDigits, nodeKeys[i].prefixDepth)
+        add(tree.nodeChildStarts, v3NodeChildStart(nodeKeys, i))
+        add(tree.nodeChildCounts, v3NodeChildCount(nodeKeys, i))
+        add(tree.nodeEntryStarts, v3NodeEntryStart(cells, nodeKeys[i]))
+        add(tree.nodeEntryCounts, v3NodeEntryCount(cells, nodeKeys[i]))
+        add(tree.nodeEntryDescCounts, v3NodeEntryDescCount(cells, nodeKeys[i]))
+        add(tree.nodeCids, layout.fixedBytes32Zero())
+    var i = nodeKeys.len - 1
+    while i >= 0:
+        var buf: layout.ByteBuf = layout.byteBufInit(256)
+        layout.byteBufAppendBytes(buf, bytesFromString("v3.node"))
+        lt.v3AppendPrefix(buf, nodeKeys[i])
+        lt.v3AppendU32BE(buf, tree.nodeChildCounts[i])
+        lt.v3AppendU32BE(buf, tree.nodeEntryCounts[i])
+        lt.v3AppendU32BE(buf, tree.nodeEntryDescCounts[i])
+        let childStart = tree.nodeChildStarts[i]
+        let childCount = tree.nodeChildCounts[i]
+        if childStart >= 0:
+            for childPos in childStart..<(childStart + childCount):
+                lt.v3AppendFixed32(buf, tree.nodeCids[childPos])
+        let entryStart = tree.nodeEntryStarts[i]
+        let entryCount = tree.nodeEntryCounts[i]
+        if entryStart >= 0:
+            for entryPos in entryStart..<(entryStart + entryCount):
+                lt.v3AppendFixed32(buf, tree.entryCids[entryPos])
+        tree.nodeCids[i] = lt.v3FixedCidFromBuf(buf)
+        i = i - 1
+    var treeBuf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(treeBuf, bytesFromString("v3.tree"))
+    lt.v3AppendU32BE(treeBuf, tree.entryCount)
+    lt.v3AppendU32BE(treeBuf, tree.nodeCount)
+    for i in 0..<tree.nodeCount:
+        if tree.nodePrefixDepths[i] == 0:
+            lt.v3AppendFixed32(treeBuf, tree.nodeCids[i])
+    tree.treeCid = lt.v3FixedCidFromBuf(treeBuf)
+    return tree
+
+fn v3BuildStateLayerForest(cells: lt.V3StateCell[]): lt.V3StateLayerForest =
+    var globalCells: lt.V3StateCell[]
+    var regionalCells: lt.V3StateCell[]
+    var edgeCells: lt.V3StateCell[]
+    globalCells = []
+    regionalCells = []
+    edgeCells = []
+    for i in 0..<cells.len:
+        if cells[i].layerId == lt.v3LayerGlobal:
+            add(globalCells, cells[i])
+        elif cells[i].layerId == lt.v3LayerRegional:
+            add(regionalCells, cells[i])
+        else:
+            add(edgeCells, cells[i])
+    var out: lt.V3StateLayerForest = lt.v3StateLayerForestZero()
+    out.globalTree = v3BuildBaguaPrefixTree(globalCells)
+    out.regionalTree = v3BuildBaguaPrefixTree(regionalCells)
+    out.edgeTree = v3BuildBaguaPrefixTree(edgeCells)
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.forest"))
+    lt.v3AppendFixed32(buf, out.globalTree.treeCid)
+    lt.v3AppendFixed32(buf, out.regionalTree.treeCid)
+    lt.v3AppendFixed32(buf, out.edgeTree.treeCid)
+    out.forestCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3StateLayerSummaryFromTree(layerId: int32, tree: lt.V3BaguaPrefixTree): lt.V3StateLayerSummary =
+    return lt.v3StateLayerSummaryMake(layerId, tree.treeCid, tree.nodeCount, tree.entryCount)
+
+fn v3StateLayerSummaryFromForest(forest: lt.V3StateLayerForest, layerId: int32): lt.V3StateLayerSummary =
+    if layerId == lt.v3LayerGlobal:
+        return v3StateLayerSummaryFromTree(layerId, forest.globalTree)
+    if layerId == lt.v3LayerRegional:
+        return v3StateLayerSummaryFromTree(layerId, forest.regionalTree)
+    return v3StateLayerSummaryFromTree(layerId, forest.edgeTree)
+
+fn v3BaguaRootSummaryFromTree(layerId: int32,
+                              tree: lt.V3BaguaPrefixTree,
+                              baguaId: int32): Result[lt.V3BaguaRootSummary] =
+    let nodePos = v3TreeNodePos(tree, baguaId, 0, [])
+    if nodePos < 0:
+        return Err[lt.V3BaguaRootSummary]("v3 lsmr: missing bagua root")
+    return Ok[lt.V3BaguaRootSummary](lt.v3BaguaRootSummaryMake(
+        layerId,
+        baguaId,
+        tree.nodeCids[nodePos],
+        tree.nodeEntryDescCounts[nodePos]
+    ))

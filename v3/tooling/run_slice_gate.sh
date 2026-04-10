@@ -41,6 +41,54 @@ if ! sh "$root/v3/tooling/build_backend_driver_v3.sh" \
   exit 1
 fi
 
+echo "[v3 gate] v3 host smokes"
+if ! sh "$root/v3/tooling/run_v3_host_smokes.sh" \
+  >"$out_dir/run_v3_host_smokes.log" 2>&1; then
+  echo "v3 gate: run_v3_host_smokes failed" >&2
+  tail -n 80 "$out_dir/run_v3_host_smokes.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] zero-exit ordinary compile"
+if ! sh "$root/v3/tooling/build_zero_exit_v3.sh" \
+  >"$out_dir/build_zero_exit_v3.log" 2>&1; then
+  echo "v3 gate: zero-exit ordinary compile 未接通" >&2
+  tail -n 80 "$out_dir/build_zero_exit_v3.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] panic-trace ordinary compile"
+if ! sh "$root/v3/tooling/build_panic_trace_v3.sh" \
+  >"$out_dir/build_panic_trace_v3.log" 2>&1; then
+  echo "v3 gate: panic-trace ordinary compile 未接通" >&2
+  tail -n 80 "$out_dir/build_panic_trace_v3.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] call-chain ordinary compile"
+if ! sh "$root/v3/tooling/build_call_chain_v3.sh" \
+  >"$out_dir/build_call_chain_v3.log" 2>&1; then
+  echo "v3 gate: call-chain ordinary compile 未接通" >&2
+  tail -n 80 "$out_dir/build_call_chain_v3.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] program-selfhost"
+if ! sh "$root/v3/tooling/build_program_selfhost_v3.sh" \
+  >"$out_dir/build_program_selfhost_v3.log" 2>&1; then
+  echo "v3 gate: program-selfhost 未接通" >&2
+  tail -n 80 "$out_dir/build_program_selfhost_v3.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] chain_node"
+if ! sh "$root/v3/tooling/build_chain_node_v3.sh" \
+  >"$out_dir/build_chain_node_v3.log" 2>&1; then
+  echo "v3 gate: chain_node 未接通" >&2
+  tail -n 80 "$out_dir/build_chain_node_v3.log" >&2 || true
+  exit 1
+fi
+
 echo "[v3 gate] bootstrap subset self-checks"
 for bin in \
   "$V3_BOOTSTRAP_STAGE0" \

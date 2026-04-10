@@ -84,6 +84,8 @@ char* driver_c_i32_to_str(int32_t value);
 char* driver_c_i64_to_str(int64_t value);
 char* driver_c_bool_to_str(bool value);
 static char* cheng_copy_string_bytes(const char* src, size_t len);
+static int driver_c_runtime_resolve_self_path(char* out, size_t out_cap);
+void cheng_dump_backtrace_if_enabled(void);
 
 static bool cheng_probably_valid_ptr(const void* p) {
     uintptr_t raw = (uintptr_t)p;
@@ -823,6 +825,239 @@ static void cheng_crash_trace_dump_now(const char* reason) {
     cheng_crash_trace_dump_async(reason, 0);
 }
 
+typedef struct ChengV3LineMapEntry {
+    char* symbol;
+    char* function_name;
+    char* source_path;
+    int32_t signature_line;
+    int32_t body_first_line;
+    int32_t body_last_line;
+} ChengV3LineMapEntry;
+
+static ChengV3LineMapEntry* cheng_v3_line_map_entries = NULL;
+static int32_t cheng_v3_line_map_len = 0;
+static int32_t cheng_v3_line_map_cap = 0;
+static int32_t cheng_v3_line_map_registered = 0;
+static char cheng_v3_line_map_loaded_path[PATH_MAX];
+
+static const char* cheng_v3_symbol_normalize(const char* text) {
+    if (text == NULL) return "";
+    while (*text == '_') {
+        text++;
+    }
+    return text;
+}
+
+static int cheng_v3_line_map_symbol_eq(const char* lhs, const char* rhs) {
+    if (lhs == NULL || rhs == NULL) return 0;
+    if (strcmp(lhs, rhs) == 0) return 1;
+    return strcmp(cheng_v3_symbol_normalize(lhs), cheng_v3_symbol_normalize(rhs)) == 0;
+}
+
+static int32_t cheng_v3_parse_i32(const char* text) {
+    char* end = NULL;
+    long value;
+    if (text == NULL || text[0] == '\0') return 0;
+    value = strtol(text, &end, 10);
+    if (end == text) return 0;
+    return (int32_t)value;
+}
+
+static int cheng_v3_line_map_add_entry(const char* symbol,
+                                       const char* function_name,
+                                       const char* source_path,
+                                       int32_t signature_line,
+                                       int32_t body_first_line,
+                                       int32_t body_last_line) {
+    ChengV3LineMapEntry* grown = NULL;
+    if (symbol == NULL || symbol[0] == '\0' || source_path == NULL || source_path[0] == '\0') {
+        return 0;
+    }
+    if (cheng_v3_line_map_len >= cheng_v3_line_map_cap) {
+        int32_t next_cap = cheng_v3_line_map_cap > 0 ? cheng_v3_line_map_cap * 2 : 32;
+        grown = (ChengV3LineMapEntry*)realloc(
+            cheng_v3_line_map_entries,
+            (size_t)next_cap * sizeof(ChengV3LineMapEntry)
+        );
+        if (grown == NULL) {
+            return 0;
+        }
+        cheng_v3_line_map_entries = grown;
+        cheng_v3_line_map_cap = next_cap;
+    }
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].symbol =
+        cheng_copy_string_bytes(symbol, strlen(symbol));
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].function_name =
+        cheng_copy_string_bytes(function_name != NULL ? function_name : "",
+                                strlen(function_name != NULL ? function_name : ""));
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].source_path =
+        cheng_copy_string_bytes(source_path, strlen(source_path));
+    if (cheng_v3_line_map_entries[cheng_v3_line_map_len].symbol == NULL ||
+        cheng_v3_line_map_entries[cheng_v3_line_map_len].function_name == NULL ||
+        cheng_v3_line_map_entries[cheng_v3_line_map_len].source_path == NULL) {
+        return 0;
+    }
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].signature_line = signature_line;
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].body_first_line = body_first_line;
+    cheng_v3_line_map_entries[cheng_v3_line_map_len].body_last_line = body_last_line;
+    cheng_v3_line_map_len += 1;
+    return 1;
+}
+
+static int cheng_v3_line_map_load_path(const char* path) {
+    FILE* file = NULL;
+    char* owned = NULL;
+    char* cursor = NULL;
+    char* line = NULL;
+    long size = 0;
+    int ok = 0;
+    if (path == NULL || path[0] == '\0') return 0;
+    file = fopen(path, "rb");
+    if (file == NULL) return 0;
+    if (fseek(file, 0, SEEK_END) != 0) goto cleanup;
+    size = ftell(file);
+    if (size < 0) goto cleanup;
+    if (fseek(file, 0, SEEK_SET) != 0) goto cleanup;
+    owned = (char*)malloc((size_t)size + 1u);
+    if (owned == NULL) goto cleanup;
+    if (size > 0 && fread(owned, 1, (size_t)size, file) != (size_t)size) goto cleanup;
+    owned[size] = '\0';
+    cursor = owned;
+    line = strsep(&cursor, "\n");
+    if (line == NULL || strcmp(line, "v3_line_map_v1") != 0) {
+        goto cleanup;
+    }
+    while ((line = strsep(&cursor, "\n")) != NULL) {
+        char* fields[7];
+        size_t field_count = 0U;
+        char* field_cursor = NULL;
+        char* tab = NULL;
+        if (strncmp(line, "entry\t", 6) != 0) {
+            continue;
+        }
+        field_cursor = line + 6;
+        fields[field_count++] = field_cursor;
+        while (field_count < 7U && (tab = strchr(field_cursor, '\t')) != NULL) {
+            *tab = '\0';
+            field_cursor = tab + 1;
+            fields[field_count++] = field_cursor;
+        }
+        if (field_count != 6U) {
+            goto cleanup;
+        }
+        if (!cheng_v3_line_map_add_entry(fields[0],
+                                         fields[1],
+                                         fields[2],
+                                         cheng_v3_parse_i32(fields[3]),
+                                         cheng_v3_parse_i32(fields[4]),
+                                         cheng_v3_parse_i32(fields[5]))) {
+            goto cleanup;
+        }
+    }
+    snprintf(cheng_v3_line_map_loaded_path,
+             sizeof(cheng_v3_line_map_loaded_path),
+             "%s",
+             path);
+    ok = cheng_v3_line_map_len > 0 ? 1 : 0;
+cleanup:
+    if (file != NULL) fclose(file);
+    if (!ok) {
+        cheng_v3_line_map_len = 0;
+        cheng_v3_line_map_loaded_path[0] = '\0';
+    }
+    free(owned);
+    return ok;
+}
+
+static const ChengV3LineMapEntry* cheng_v3_line_map_find(const char* symbol) {
+    int32_t i;
+    for (i = 0; i < cheng_v3_line_map_len; ++i) {
+        if (cheng_v3_line_map_symbol_eq(cheng_v3_line_map_entries[i].symbol, symbol)) {
+            return &cheng_v3_line_map_entries[i];
+        }
+    }
+    return NULL;
+}
+
+static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
+    int mapped = 0;
+    if (cheng_v3_line_map_len <= 0) return;
+#if CHENG_HAS_EXECINFO
+    {
+        void* frames[48];
+        int count = backtrace(frames, 48);
+        int i;
+        fprintf(stderr,
+                "[cheng-v3] source-trace reason=%s map=%s\n",
+                reason != NULL ? reason : "?",
+                cheng_v3_line_map_loaded_path[0] != '\0' ? cheng_v3_line_map_loaded_path : "?");
+        for (i = 0; i < count; ++i) {
+            Dl_info info;
+            const ChengV3LineMapEntry* entry;
+            uintptr_t pc;
+            uintptr_t symbol_pc;
+            uintptr_t offset;
+            int32_t line_start;
+            int32_t line_end;
+            if (dladdr(frames[i], &info) == 0 || info.dli_sname == NULL) {
+                continue;
+            }
+            entry = cheng_v3_line_map_find(info.dli_sname);
+            if (entry == NULL) {
+                continue;
+            }
+            pc = (uintptr_t)frames[i];
+            symbol_pc = (uintptr_t)info.dli_saddr;
+            offset = (symbol_pc != 0 && pc >= symbol_pc) ? (pc - symbol_pc) : 0u;
+            line_start = entry->body_first_line > 0 ? entry->body_first_line : entry->signature_line;
+            line_end = entry->body_last_line > 0 ? entry->body_last_line : line_start;
+            fprintf(stderr,
+                    "[cheng-v3] #%d %s %s:%d",
+                    i,
+                    entry->function_name != NULL && entry->function_name[0] != '\0' ?
+                        entry->function_name :
+                        (info.dli_sname != NULL ? info.dli_sname : "?"),
+                    entry->source_path != NULL ? entry->source_path : "?",
+                    line_start);
+            if (line_end > line_start) {
+                fprintf(stderr, "-%d", line_end);
+            }
+            fprintf(stderr, " +0x%zx\n", (size_t)offset);
+            mapped += 1;
+        }
+        if (mapped <= 0) {
+            fprintf(stderr, "[cheng-v3] source-trace mapped_frames=0\n");
+        }
+        fflush(stderr);
+    }
+#else
+    fprintf(stderr, "[cheng-v3] source-trace unavailable\n");
+    fflush(stderr);
+#endif
+}
+
+WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
+    char exe_path[PATH_MAX];
+    char map_path[PATH_MAX];
+    if (cheng_v3_line_map_registered) {
+        return;
+    }
+    cheng_v3_line_map_registered = 1;
+    if (!driver_c_runtime_resolve_self_path(exe_path, sizeof(exe_path))) {
+        if (argv0 == NULL || argv0[0] == '\0') {
+            return;
+        }
+        if (realpath(argv0, exe_path) == NULL) {
+            snprintf(exe_path, sizeof(exe_path), "%s", argv0);
+        }
+    }
+    snprintf(map_path, sizeof(map_path), "%s.v3.map", exe_path);
+    if (!cheng_v3_line_map_load_path(map_path)) {
+        return;
+    }
+    cheng_crash_trace_install_handlers();
+}
+
 static ChengSidecarBundleCache cheng_sidecar_cache = {0};
 static CHENG_THREAD_LOCAL int32_t driver_c_build_emit_obj_dispatch_depth = 0;
 static CHENG_THREAD_LOCAL int32_t driver_c_build_module_dispatch_depth = 0;
@@ -869,6 +1104,7 @@ static int cheng_backtrace_enabled(void) {
 
 void cheng_dump_backtrace_if_enabled(void) {
     cheng_crash_trace_dump_now("panic");
+    cheng_v3_dump_source_backtrace_if_available("panic");
     if (!cheng_backtrace_enabled()) return;
 #if CHENG_HAS_EXECINFO
     void* frames[48];
@@ -3848,9 +4084,16 @@ int32_t div_0(int32_t a, int32_t b) { return a / b; }
 bool not_0(bool a) { return !a; }
 int32_t cheng_puts(const char* text) { return puts(text ? text : ""); }
 void cheng_exit(int32_t code) { exit(code); }
+WEAK void cheng_v3_panic_cstring_and_exit(const char* text) {
+    fprintf(stderr, "%s\n", (text != NULL && text[0] != '\0') ? text : "panic");
+    fflush(stderr);
+    cheng_dump_backtrace_if_enabled();
+    cheng_exit(1);
+}
 void cheng_bounds_check(int32_t len, int32_t idx) {
     if (idx < 0 || idx >= len) {
         fprintf(stderr, "[cheng] bounds check failed: idx=%d len=%d\n", idx, len);
+        cheng_v3_dump_source_backtrace_if_available("bounds");
         const char* trace = getenv("BOUNDS_TRACE");
         if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
             void* caller = __builtin_return_address(0);

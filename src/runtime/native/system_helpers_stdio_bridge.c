@@ -10952,6 +10952,7 @@ static DriverCProgValue driver_c_prog_resolve_module_field_value(DriverCProgRegi
                                                                  const char *field_name) {
   DriverCProgValue materialized = driver_c_prog_materialize(module_value);
   DriverCProgItem *item = NULL;
+  DriverCProgTypeDecl *type_decl = NULL;
   const char *target_module = NULL;
   if (materialized.kind != DRIVER_C_PROG_VALUE_MODULE) {
     driver_c_die("driver_c program runtime: module field access on non-module");
@@ -10962,6 +10963,10 @@ static DriverCProgValue driver_c_prog_resolve_module_field_value(DriverCProgRegi
   }
   item = driver_c_prog_resolve_visible_item(registry, target_module, field_name);
   if (item == NULL) {
+    type_decl = driver_c_prog_lookup_type_decl(registry, target_module, field_name);
+    if (type_decl != NULL) {
+      return driver_c_prog_value_type_token(type_decl->decl_name);
+    }
     char message[512];
     snprintf(message,
              sizeof(message),

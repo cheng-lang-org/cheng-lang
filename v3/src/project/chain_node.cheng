@@ -1,0 +1,306 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as types
+import cheng/v3/chain/consensus as consensus
+import cheng/v3/chain/lsmr as lsmr
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/anti_entropy as anti
+
+type
+    V3ChainNodeStamp =
+        epoch: int32
+        ganzhi: int32
+
+    V3ChainNode =
+        nodeId: str
+        address: types.V3LsmrAddress
+        nextEpoch: int32
+        nextGanzhi: int32
+        nextTick: int64
+        servedCount: int32
+        index: consensus.V3ChainIndex
+        eventCids: layout.FixedBytes32[]
+        events: consensus.V3ChainEvent[]
+        forest: lt.V3StateLayerForest
+        signature: lt.V3AntiEntropySignature
+        tipEventCid: layout.FixedBytes32
+
+    V3ChainNodeServeSnapshot =
+        nodeId: str
+        address: types.V3LsmrAddress
+        serveCount: int32
+        tipEventCid: layout.FixedBytes32
+        eventCids: layout.FixedBytes32[]
+        events: consensus.V3ChainEvent[]
+        forest: lt.V3StateLayerForest
+        signature: lt.V3AntiEntropySignature
+
+fn v3ChainNodeZero(nodeId: str, address: types.V3LsmrAddress): V3ChainNode =
+    var eventCids: layout.FixedBytes32[]
+    var events: consensus.V3ChainEvent[]
+    eventCids = []
+    events = []
+    return V3ChainNode(
+        nodeId: nodeId,
+        address: address,
+        nextEpoch: 1,
+        nextGanzhi: 1,
+        nextTick: int64(1),
+        servedCount: 0,
+        index: consensus.v3ChainIndexZero(),
+        eventCids: eventCids,
+        events: events,
+        forest: lt.v3StateLayerForestZero(),
+        signature: lt.v3AntiEntropySignatureZero(),
+        tipEventCid: layout.fixedBytes32Zero()
+    )
+
+fn v3ChainNodeStampLess(left: V3ChainNodeStamp, right: V3ChainNodeStamp): bool =
+    if left.epoch != right.epoch:
+        return left.epoch < right.epoch
+    return left.ganzhi < right.ganzhi
+
+fn v3ChainNodeMaxStamp(index: consensus.V3ChainIndex): V3ChainNodeStamp =
+    var out = V3ChainNodeStamp(epoch: 1, ganzhi: 0)
+    for i in 0..<index.clockEpochs.len:
+        let candidate = V3ChainNodeStamp(epoch: index.clockEpochs[i], ganzhi: index.clockGanzhi[i])
+        if v3ChainNodeStampLess(out, candidate):
+            out = candidate
+    return out
+
+fn v3ChainNodeSpaceSlot(fromAccount: int32, toAccount: int32): int32 =
+    let mixed = fromAccount * 131 + toAccount * 17
+    let slot = mixed % 9
+    return slot < 0 ? slot + 9 : slot
+
+fn v3ChainNodeReasonText(reasonCode: int32): str =
+    if reasonCode == consensus.v3ConsensusReasonOk:
+        return "ok"
+    if reasonCode == consensus.v3ConsensusReasonDuplicate:
+        return "duplicate"
+    if reasonCode == consensus.v3ConsensusReasonMintApplied:
+        return "mint_applied"
+    if reasonCode == consensus.v3ConsensusReasonTransferApplied:
+        return "transfer_applied"
+    if reasonCode == consensus.v3ConsensusReasonDivergedTarget:
+        return "diverged_target"
+    if reasonCode == consensus.v3ConsensusReasonForkParentMismatch:
+        return "fork_parent_mismatch"
+    if reasonCode == consensus.v3ConsensusReasonDivergedAccount:
+        return "diverged_account"
+    if reasonCode == consensus.v3ConsensusReasonInsufficientBalance:
+        return "insufficient_balance"
+    return "unknown"
+
+fn v3ChainNodeAccountPos(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): int32 =
+    return consensus.v3ConsensusAccountPos(index, assetId, accountId)
+
+fn v3ChainNodeAccountHead(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): layout.FixedBytes32 =
+    let pos = v3ChainNodeAccountPos(index, assetId, accountId)
+    if pos < 0:
+        return layout.fixedBytes32Zero()
+    return index.accountHeads[pos]
+
+fn v3ChainNodeBalanceValue(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): int64 =
+    let pos = v3ChainNodeAccountPos(index, assetId, accountId)
+    if pos < 0:
+        return int64(0)
+    return index.balances[pos]
+
+fn v3ChainNodeKeyId(assetId: int32, accountId: int32): int32 =
+    let key = assetId * 65537 + accountId
+    return key > 0 ? key : 0 - key
+
+fn v3ChainNodeAccountAddress(assetId: int32, accountId: int32): types.V3LsmrAddress =
+    let seed = "asset/" + intToStr(assetId) + "/account/" + intToStr(accountId)
+    let addrRes = lsmr.v3LsmrAddressFromSeed(seed, 3)
+    if IsErr(addrRes):
+        panic(Error(addrRes))
+    return Value(addrRes)
+
+fn v3ChainNodeAccountLocalityHash(assetId: int32, accountId: int32): layout.FixedBytes32 =
+    return lt.v3HashInts("v3.chain_node.locality", [assetId, accountId])
+
+fn v3ChainNodeAccountContentCid(index: consensus.V3ChainIndex, pos: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.chain_node.account"))
+    lt.v3AppendU32BE(buf, index.accountAssetIds[pos])
+    lt.v3AppendU32BE(buf, index.accountIds[pos])
+    lt.v3AppendU32BE(buf, int32(index.balances[pos] >> 32))
+    lt.v3AppendU32BE(buf, int32(index.balances[pos] & int64(0xffffffff)))
+    lt.v3AppendFixed32(buf, index.accountHeads[pos])
+    lt.v3AppendU32BE(buf, index.clockEpochs[pos])
+    lt.v3AppendU32BE(buf, index.clockGanzhi[pos])
+    lt.v3AppendU32BE(buf, index.diverged[pos] ? 1 : 0)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ChainNodeStateCells(index: consensus.V3ChainIndex): lt.V3StateCell[] =
+    var out: lt.V3StateCell[]
+    out = []
+    for i in 0..<index.accountIds.len:
+        let address = v3ChainNodeAccountAddress(index.accountAssetIds[i], index.accountIds[i])
+        let localityHash = v3ChainNodeAccountLocalityHash(index.accountAssetIds[i], index.accountIds[i])
+        let contentCid = v3ChainNodeAccountContentCid(index, i)
+        let cellRes = lsmr.v3LsmrStateCellMake(
+            v3ChainNodeKeyId(index.accountAssetIds[i], index.accountIds[i]),
+            address,
+            3,
+            contentCid,
+            localityHash
+        )
+        if IsErr(cellRes):
+            panic(Error(cellRes))
+        add(out, Value(cellRes))
+    return out
+
+fn v3ChainNodeRebuildDerived(node: var V3ChainNode) =
+    let cells = v3ChainNodeStateCells(node.index)
+    node.forest = lsmr.v3BuildStateLayerForest(cells)
+    let stamp = v3ChainNodeMaxStamp(node.index)
+    node.signature = anti.v3AntiEntropySignatureFromForest(
+        stamp.epoch,
+        stamp.ganzhi,
+        node.eventCids.len,
+        node.index.accountIds.len,
+        node.forest
+    )
+    node.tipEventCid = node.eventCids.len > 0 ? node.eventCids[node.eventCids.len - 1] : layout.fixedBytes32Zero()
+    node.nextEpoch = stamp.epoch
+    node.nextGanzhi = stamp.ganzhi + 1
+    if node.nextGanzhi <= 0:
+        node.nextGanzhi = 1
+    node.nextTick = int64(node.eventCids.len + 1)
+
+fn v3ChainNodeInit(nodeId: str, addressSeed: str): V3ChainNode =
+    let addrRes = lsmr.v3LsmrAddressFromSeed(addressSeed, 3)
+    if IsErr(addrRes):
+        panic(Error(addrRes))
+    var out = v3ChainNodeZero(nodeId, Value(addrRes))
+    v3ChainNodeRebuildDerived(out)
+    return out
+
+fn v3ChainNodeApplyEvent(node: var V3ChainNode, event: consensus.V3ChainEvent): Result[layout.FixedBytes32] =
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = node.index
+    let applyRes = consensus.v3ConsensusApply(nextIndex, event, eventCid, node.eventCids.len)
+    if IsErr(applyRes):
+        return Err[layout.FixedBytes32](Error(applyRes))
+    node.index = nextIndex
+    let decision = Value(applyRes)
+    if !decision.accepted:
+        return Err[layout.FixedBytes32]("v3 chain_node: consensus rejected " + v3ChainNodeReasonText(decision.reasonCode))
+    if decision.applied:
+        add(node.eventCids, eventCid)
+        add(node.events, event)
+        v3ChainNodeRebuildDerived(node)
+    return Ok[layout.FixedBytes32](eventCid)
+
+fn v3ChainNodeMint(node: var V3ChainNode,
+                   assetId: int32,
+                   toAccount: int32,
+                   amount: int64): Result[layout.FixedBytes32] =
+    if assetId <= 0 || toAccount <= 0:
+        return Err[layout.FixedBytes32]("v3 chain_node: invalid mint target")
+    if amount <= int64(0):
+        return Err[layout.FixedBytes32]("v3 chain_node: mint amount must be positive")
+    let parentCid = v3ChainNodeAccountHead(node.index, assetId, toAccount)
+    let event = consensus.v3ChainEventMint(
+        assetId,
+        toAccount,
+        parentCid,
+        amount,
+        node.nextEpoch,
+        node.nextGanzhi,
+        v3ChainNodeSpaceSlot(toAccount, toAccount),
+        node.nextTick
+    )
+    return v3ChainNodeApplyEvent(node, event)
+
+fn v3ChainNodeTransfer(node: var V3ChainNode,
+                       assetId: int32,
+                       fromAccount: int32,
+                       toAccount: int32,
+                       amount: int64): Result[layout.FixedBytes32] =
+    if assetId <= 0 || fromAccount <= 0 || toAccount <= 0:
+        return Err[layout.FixedBytes32]("v3 chain_node: invalid transfer accounts")
+    if fromAccount == toAccount:
+        return Err[layout.FixedBytes32]("v3 chain_node: same account transfer")
+    if amount <= int64(0):
+        return Err[layout.FixedBytes32]("v3 chain_node: transfer amount must be positive")
+    let fromParentCid = v3ChainNodeAccountHead(node.index, assetId, fromAccount)
+    let toParentCid = v3ChainNodeAccountHead(node.index, assetId, toAccount)
+    let event = consensus.v3ChainEventTransferCommit(
+        assetId,
+        fromAccount,
+        toAccount,
+        fromParentCid,
+        toParentCid,
+        amount,
+        node.nextEpoch,
+        node.nextGanzhi,
+        v3ChainNodeSpaceSlot(fromAccount, toAccount),
+        node.nextTick
+    )
+    return v3ChainNodeApplyEvent(node, event)
+
+fn v3ChainNodeBalance(node: V3ChainNode, assetId: int32, accountId: int32): Result[int64] =
+    if assetId <= 0 || accountId <= 0:
+        return Err[int64]("v3 chain_node: invalid balance target")
+    return Ok[int64](v3ChainNodeBalanceValue(node.index, assetId, accountId))
+
+fn v3ChainNodeServeOnce(node: var V3ChainNode): V3ChainNodeServeSnapshot =
+    v3ChainNodeRebuildDerived(node)
+    node.servedCount = node.servedCount + 1
+    return V3ChainNodeServeSnapshot(
+        nodeId: node.nodeId,
+        address: node.address,
+        serveCount: node.servedCount,
+        tipEventCid: node.tipEventCid,
+        eventCids: node.eventCids,
+        events: node.events,
+        forest: node.forest,
+        signature: node.signature
+    )
+
+fn v3ChainNodeReplayFromSnapshot(nodeId: str,
+                                 address: types.V3LsmrAddress,
+                                 snapshot: V3ChainNodeServeSnapshot): Result[V3ChainNode] =
+    if snapshot.eventCids.len != snapshot.events.len:
+        return Err[V3ChainNode]("v3 chain_node: snapshot length mismatch")
+    var rebuilt = v3ChainNodeZero(nodeId, address)
+    for i in 0..<snapshot.events.len:
+        let applyRes = v3ChainNodeApplyEvent(rebuilt, snapshot.events[i])
+        if IsErr(applyRes):
+            return Err[V3ChainNode](Error(applyRes))
+        if !layout.fixedBytes32Equal(Value(applyRes), snapshot.eventCids[i]):
+            return Err[V3ChainNode]("v3 chain_node: snapshot cid mismatch")
+    if !layout.fixedBytes32Equal(rebuilt.forest.forestCid, snapshot.forest.forestCid):
+        return Err[V3ChainNode]("v3 chain_node: snapshot forest mismatch")
+    if !anti.v3AntiEntropySignatureEqual(rebuilt.signature, snapshot.signature):
+        return Err[V3ChainNode]("v3 chain_node: snapshot signature mismatch")
+    rebuilt.servedCount = 0
+    return Ok[V3ChainNode](rebuilt)
+
+fn v3ChainNodeSyncOnce(node: var V3ChainNode, remote: V3ChainNodeServeSnapshot): Result[bool] =
+    v3ChainNodeRebuildDerived(node)
+    if !anti.v3PassiveAntiEntropySyncRequired(node.signature, remote.signature):
+        return Ok[bool](false)
+    if remote.eventCids.len < node.eventCids.len:
+        return Err[bool]("v3 chain_node: remote snapshot not newer")
+    let rebuiltRes = v3ChainNodeReplayFromSnapshot(node.nodeId, node.address, remote)
+    if IsErr(rebuiltRes):
+        return Err[bool](Error(rebuiltRes))
+    let rebuilt = Value(rebuiltRes)
+    node.nextEpoch = rebuilt.nextEpoch
+    node.nextGanzhi = rebuilt.nextGanzhi
+    node.nextTick = rebuilt.nextTick
+    node.index = rebuilt.index
+    node.eventCids = rebuilt.eventCids
+    node.events = rebuilt.events
+    node.forest = rebuilt.forest
+    node.signature = rebuilt.signature
+    node.tipEventCid = rebuilt.tipEventCid
+    return Ok[bool](true)
+
+fn v3ChainNodeForestCid(node: V3ChainNode): layout.FixedBytes32 =
+    return node.forest.forestCid

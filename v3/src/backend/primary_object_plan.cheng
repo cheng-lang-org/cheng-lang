@@ -1,0 +1,105 @@
+import std/strings
+import std/strutils as strutil
+import std/result
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/backend/lowering_plan as lower
+
+type
+    V3PrimaryObjectPlan =
+        targetTriple: str
+        objectFormat: str
+        outputPath: str
+        entryPath: str
+        entrySymbol: str
+        itemIds: int32[]
+        symbolNames: str[]
+        functionWordOffsets: int32[]
+        functionWordCounts: int32[]
+        instructionWords: int32[]
+        dataLabels: str[]
+        dataPayloadTexts: str[]
+        relocSourceItemIds: int32[]
+        relocWordOffsets: int32[]
+        relocTargetSymbols: str[]
+        missingReasons: str[]
+        pipelineStage: str
+
+fn v3PrimaryObjectFormat(targetTriple: str): str =
+    return targetTriple == "arm64-apple-darwin" ? "macho" : "unknown"
+
+fn v3PrimarySymbolName(ownerModulePath: str, functionName: str): str =
+    let raw = ownerModulePath + "__" + functionName
+    var out = ""
+    for i in 0..<len(raw):
+        let ch = raw[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        out = out + ((digit || upper || lower || ch == '_') ? strings.sliceBytes(raw, i, 1) : "_")
+    return out
+
+fn v3PrimaryObjectMissingReasons(linkPlan: slplan.V3SystemLinkPlanStub,
+                                 lowering: lower.V3LoweringPlanStub,
+                                 itemIds: int32[],
+                                 instructionWords: int32[]): str[] =
+    var missing: str[] = []
+    if linkPlan.missingReasons.len > 0:
+        add(missing, "system_link_plan_not_ready_for_primary_object")
+    if lowering.missingReasons.len > 0:
+        add(missing, "lowering_plan_not_ready_for_primary_object")
+    if itemIds.len <= 0:
+        add(missing, "primary_object_items_missing")
+    if instructionWords.len <= 0:
+        add(missing, "primary_object_machine_words_missing")
+    if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) <= 0:
+        add(missing, "primary_object_entry_symbol_missing")
+    return missing
+
+fn v3BuildPrimaryObjectPlan(linkPlan: slplan.V3SystemLinkPlanStub,
+                            lowering: lower.V3LoweringPlanStub): Result[V3PrimaryObjectPlan] =
+    var itemIds: int32[]
+    var symbolNames: str[]
+    var functionWordOffsets: int32[]
+    var functionWordCounts: int32[]
+    itemIds = []
+    symbolNames = []
+    functionWordOffsets = []
+    functionWordCounts = []
+    for i in 0..<lowering.functionNames.len:
+        add(itemIds, int32(100000 + i))
+        add(symbolNames, v3PrimarySymbolName(lowering.functionOwnerModulePaths[i], lowering.functionNames[i]))
+        add(functionWordOffsets, 0)
+        add(functionWordCounts, 0)
+    let outputPath = linkPlan.outputPath + ".primary.o"
+    return Ok[V3PrimaryObjectPlan](V3PrimaryObjectPlan(
+        targetTriple: linkPlan.targetTriple,
+        objectFormat: v3PrimaryObjectFormat(linkPlan.targetTriple),
+        outputPath: outputPath,
+        entryPath: linkPlan.entryPath,
+        entrySymbol: linkPlan.entrySymbol,
+        itemIds: itemIds,
+        symbolNames: symbolNames,
+        functionWordOffsets: functionWordOffsets,
+        functionWordCounts: functionWordCounts,
+        instructionWords: [],
+        dataLabels: [],
+        dataPayloadTexts: [],
+        relocSourceItemIds: [],
+        relocWordOffsets: [],
+        relocTargetSymbols: [],
+        missingReasons: v3PrimaryObjectMissingReasons(linkPlan, lowering, itemIds, []),
+        pipelineStage: "lowering_plan_to_primary_object_plan"
+    ))
+
+fn v3PrimaryObjectPlanReport(plan: V3PrimaryObjectPlan): str =
+    return (
+        "primary_object_format=" + plan.objectFormat + "\n" +
+        "primary_object_item_count=" + intToStr(plan.itemIds.len) + "\n" +
+        "primary_object_symbols=" + (plan.symbolNames.len > 0 ? strutil.join(plan.symbolNames, ",") : "-") + "\n" +
+        "primary_object_instruction_word_count=" + intToStr(plan.instructionWords.len) + "\n" +
+        "primary_object_data_label_count=" + intToStr(plan.dataLabels.len) + "\n" +
+        "primary_object_reloc_count=" + intToStr(plan.relocSourceItemIds.len) + "\n" +
+        "primary_object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.missingReasons) + "\n" +
+        "primary_object_pipeline_stage=" + plan.pipelineStage
+    )
