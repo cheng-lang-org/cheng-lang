@@ -50,6 +50,16 @@ strict_stage0_lineage_dir() {
   printf '%s\n' "${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof"
 }
 
+strict_stage0_bootstrap_surface() {
+  driver_path="$(canonical_path "$1")"
+  case "$driver_path" in
+    "$(strict_stage0_lineage_dir)"/cheng_stage0_currentsrc.proof)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 strict_published_stage0_surface() {
   driver_path="$(canonical_path "$1")"
   case "$driver_path" in
@@ -62,8 +72,32 @@ strict_published_stage0_surface() {
   return 1
 }
 
-strict_direct_export_surface() {
+strict_stage0_meta_field() {
+  meta_path="$1"
+  key="$2"
+  if [ ! -f "$meta_path" ]; then
+    printf '\n'
+    return 0
+  fi
+  sed -n "s/^${key}=//p" "$meta_path" | head -n 1
+}
+
+strict_direct_export_driver_path() {
   driver_path="$(canonical_path "$1")"
+  case "$driver_path" in
+    *.proof)
+      outer_driver="$(strict_stage0_meta_field "${driver_path}.meta" "outer_driver")"
+      if [ "$outer_driver" != "" ]; then
+        canonical_path "$outer_driver"
+        return 0
+      fi
+      ;;
+  esac
+  printf '%s\n' "$driver_path"
+}
+
+strict_direct_export_surface() {
+  driver_path="$(strict_direct_export_driver_path "$1")"
   if [ "$driver_path" = "" ] || [ ! -x "$driver_path" ]; then
     return 1
   fi
@@ -111,7 +145,9 @@ if [ "$real_driver" = "" ] || [ ! -x "$real_driver" ]; then
   echo "[backend_driver_currentsrc_sidecar_wrapper] missing real sidecar driver contract: ${real_driver:-<unset>}" 1>&2
   exit 1
 fi
-if ! strict_published_stage0_surface "$real_driver" && ! strict_direct_export_surface "$real_driver"; then
+if ! strict_published_stage0_surface "$real_driver" && \
+   ! strict_stage0_bootstrap_surface "$real_driver" && \
+   ! strict_direct_export_surface "$real_driver"; then
   echo "[backend_driver_currentsrc_sidecar_wrapper] real sidecar driver missing strict direct-export surface: ${real_driver:-<unset>}" 1>&2
   exit 1
 fi
@@ -446,6 +482,29 @@ if [ "$emit_mode" = "obj" ]; then
 fi
 
 wrapper_preserve_sidecar="${BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR:-0}"
+if [ "$wrapper_preserve_sidecar" != "1" ]; then
+  if [ "${BACKEND_UIR_SIDECAR_MODE:-}" != "" ] || [ "$env_sidecar_mode" != "" ] || [ "$sidecar_mode" != "" ] || \
+     [ "${BACKEND_UIR_SIDECAR_BUNDLE:-}" != "" ] || [ "$env_sidecar_bundle" != "" ] || [ "$sidecar_bundle" != "" ] || \
+     [ "${BACKEND_UIR_SIDECAR_COMPILER:-}" != "" ] || [ "$env_sidecar_compiler" != "" ] || [ "$sidecar_compiler" != "" ]; then
+    wrapper_preserve_sidecar="1"
+  fi
+fi
+
+if [ "$wrapper_preserve_sidecar" = "1" ] && strict_stage0_bootstrap_surface "$real_driver"; then
+  bootstrap_meta="${real_driver}.meta"
+  if [ "$sidecar_mode" = "" ]; then
+    sidecar_mode="$(strict_stage0_meta_field "$bootstrap_meta" "sidecar_mode")"
+  fi
+  if [ "$sidecar_bundle" = "" ]; then
+    sidecar_bundle="$(strict_stage0_meta_field "$bootstrap_meta" "sidecar_bundle")"
+  fi
+  if [ "$sidecar_compiler" = "" ]; then
+    sidecar_compiler="$(strict_stage0_meta_field "$bootstrap_meta" "sidecar_compiler")"
+  fi
+  if [ "$sidecar_child_mode" = "" ]; then
+    sidecar_child_mode="$(strict_stage0_meta_field "$bootstrap_meta" "sidecar_child_mode")"
+  fi
+fi
 
 if [ "$wrapper_preserve_sidecar" = "1" ]; then
   if [ "$sidecar_mode" = "" ]; then

@@ -48,18 +48,6 @@ is_darwin_only_bootstrap_reject() {
   rg -q "uir_codegen: bootstrap path only supports darwin target|host-only expects aarch64/arm64" "$log"
 }
 
-is_silent_rc223() {
-  status="$1"
-  log="$2"
-  if [ "$status" -ne 223 ]; then
-    return 1
-  fi
-  if [ ! -s "$log" ]; then
-    return 0
-  fi
-  ! grep -v -e '^target=' -e '^[[:space:]]*$' "$log" >/dev/null 2>&1
-}
-
 magic_hex() {
   # Prints first 4 bytes as lowercase hex.
   od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n'
@@ -100,7 +88,7 @@ else
   darwin_x64_status="$?"
 fi
 if [ "$darwin_x64_status" -ne 0 ]; then
-  if is_darwin_only_bootstrap_reject "$darwin_x64_log" || is_silent_rc223 "$darwin_x64_status" "$darwin_x64_log"; then
+  if is_darwin_only_bootstrap_reject "$darwin_x64_log"; then
     darwin_x64_supported="0"
     echo "[verify_backend_targets] skip darwin x86_64 target: host-only path" 1>&2
   else

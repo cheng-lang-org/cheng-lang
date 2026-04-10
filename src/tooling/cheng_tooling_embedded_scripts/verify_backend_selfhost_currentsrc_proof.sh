@@ -205,21 +205,10 @@ proof_strict_sidecar_compiler_path() {
   printf '%s\n' "$root/chengcache/backend_driver_sidecar/backend_driver_currentsrc_sidecar_wrapper.$target.sh"
 }
 
-proof_strict_sidecar_driver_path() {
-  target="$1"
-  printf '%s\n' "$root/chengcache/backend_driver_sidecar/backend_driver_sidecar_outer.$target"
-}
-
 proof_resolve_sidecar_driver() {
   resolved="$(sh "$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh" --root:"$root" --field:driver 2>/dev/null || true)"
   if [ "$resolved" != "" ] && [ -x "$resolved" ]; then
     printf '%s\n' "$resolved"
-    return 0
-  fi
-  target="$(proof_detect_host_target)"
-  stable_driver="$(proof_strict_sidecar_driver_path "$target")"
-  if [ -x "$stable_driver" ]; then
-    printf '%s\n' "$stable_driver"
     return 0
   fi
   printf '\n'
@@ -423,9 +412,16 @@ sidecar_compiler="\${BACKEND_UIR_SIDECAR_COMPILER:-\$env_default}"
 sidecar_child_mode="\${BACKEND_UIR_SIDECAR_CHILD_MODE:-\$default_child_mode}"
 sidecar_mode="\${BACKEND_UIR_SIDECAR_MODE:-\$env_default_mode}"
 sidecar_bundle="\${BACKEND_UIR_SIDECAR_BUNDLE:-\$env_default_bundle}"
+sidecar_disable="\${BACKEND_UIR_SIDECAR_DISABLE:-0}"
 input_path="\${BACKEND_INPUT:-}"
 output_path="\${BACKEND_OUTPUT:-}"
 primary_timeout="\${BACKEND_PROOF_PRIMARY_TIMEOUT:-20}"
+if [ "\$sidecar_disable" = "1" ]; then
+  sidecar_compiler=""
+  sidecar_child_mode=""
+  sidecar_mode=""
+  sidecar_bundle=""
+fi
 proof_launcher_run_capture() {
   timeout_s="\$1"
   log_path="\$2"

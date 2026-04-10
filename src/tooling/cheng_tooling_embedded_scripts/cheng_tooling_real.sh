@@ -277,6 +277,23 @@ run_one() {
   env TOOLING_SELF_BIN="$bin" "$bin" "$@"
 }
 
+tooling_rc_reason() {
+  case "${1:-}" in
+    126) printf '%s\n' "not_executable" ;;
+    127) printf '%s\n' "missing_executable" ;;
+    139) printf '%s\n' "segfault" ;;
+    223) printf '%s\n' "deterministic_exit_223" ;;
+    *) printf '%s\n' "rc_${1:-unknown}" ;;
+  esac
+}
+
+tooling_print_rc_hint() {
+  rc="${1:-}"
+  if [ "$rc" = "223" ]; then
+    printf '%s\n' "[cheng_tooling.real] deterministic_exit_223: child exited 223 directly (non-POSIX signal)" 1>&2
+  fi
+}
+
 run_with_fallback() {
   first="$1"
   second="$2"
@@ -293,13 +310,14 @@ run_with_fallback() {
   run_one "$first" "$@"
   rc=$?
   set -e
+  tooling_print_rc_hint "$rc"
   case "$rc" in
     0)
       return 0
       ;;
-    126|127|139|223)
+    126|127|139)
       if [ -x "$second" ]; then
-        printf '%s\n' "[cheng_tooling.real] fallback: $first -> $second (rc=$rc)" 1>&2
+        printf '%s\n' "[cheng_tooling.real] fallback: $first -> $second (rc=$rc reason=$(tooling_rc_reason "$rc"))" 1>&2
         run_one "$second" "$@"
         return $?
       fi

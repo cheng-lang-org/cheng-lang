@@ -1,0 +1,189 @@
+import std/result
+import std/rawbytes
+import std/rawmem_support
+
+const
+    fixedBytes32Size: int32 = 32
+    fixedBytes64Size: int32 = 64
+
+type
+    ByteSpan =
+        data: Bytes
+
+    ByteBuf =
+        storage: Bytes
+        len: int32
+        cap: int32
+
+    FixedBytes32 =
+        data: int32[fixedBytes32Size]
+
+    FixedBytes64 =
+        data: int32[fixedBytes64Size]
+
+fn byteSpanEmpty(): ByteSpan =
+    return ByteSpan(data: emptyBytes())
+
+fn byteSpanFromBytes(data: Bytes): ByteSpan =
+    return ByteSpan(data: bytesSliceView(data, 0, bytesLen(data)))
+
+fn byteSpanLen(span: ByteSpan): int32 =
+    return bytesLen(span.data)
+
+fn byteSpanAt(span: ByteSpan, idx: int32): int32 =
+    return bytesGet(span.data, idx)
+
+fn byteSpanSlice(span: ByteSpan, start: int32, count: int32): ByteSpan =
+    return ByteSpan(data: bytesSliceView(span.data, start, count))
+
+fn byteSpanToBytes(span: ByteSpan): Bytes =
+    return bytesSlice(span.data, 0, bytesLen(span.data))
+
+fn byteBufInit(cap0: int32 = 0): ByteBuf =
+    var cap: int32 = cap0
+    if cap < 64:
+        cap = 64
+    var out: ByteBuf
+    out.storage = bytesAlloc(cap)
+    out.len = 0
+    out.cap = cap
+    return out
+
+fn byteBufLen(buf: ByteBuf): int32 =
+    return buf.len
+
+fn byteBufCap(buf: ByteBuf): int32 =
+    return buf.cap
+
+fn byteBufClear(buf: var ByteBuf) =
+    buf.len = 0
+
+fn byteBufEnsure(buf: var ByteBuf, extra: int32) =
+    if extra <= 0:
+        return
+    let need: int32 = buf.len + extra
+    if need <= buf.cap:
+        return
+    var nextCap: int32 = buf.cap
+    if nextCap < 64:
+        nextCap = 64
+    while nextCap < need:
+        nextCap = nextCap * 2
+    let nextStorage: Bytes = bytesAlloc(nextCap)
+    if buf.len > 0:
+        rawmem_support.rawmemCopy(nextStorage.data, buf.storage.data, buf.len)
+    buf.storage = nextStorage
+    buf.cap = nextCap
+
+fn byteBufAppendByte(buf: var ByteBuf, value: int32) =
+    byteBufEnsure(buf, 1)
+    bytesSet(buf.storage, buf.len, value & 255)
+    buf.len = buf.len + 1
+
+fn byteBufAppendBytes(buf: var ByteBuf, data: Bytes) =
+    let addLen: int32 = bytesLen(data)
+    if addLen <= 0:
+        return
+    byteBufEnsure(buf, addLen)
+    rawmem_support.rawmemCopy(rawmem_support.rawmemPtrAdd(buf.storage.data, buf.len), data.data, addLen)
+    buf.len = buf.len + addLen
+
+fn byteBufAppendSpan(buf: var ByteBuf, span: ByteSpan) =
+    byteBufAppendBytes(buf, span.data)
+
+fn byteBufView(buf: ByteBuf): ByteSpan =
+    return ByteSpan(data: bytesSliceView(buf.storage, 0, buf.len))
+
+fn byteBufToBytes(buf: ByteBuf): Bytes =
+    return bytesSlice(buf.storage, 0, buf.len)
+
+fn fixedBytes32Zero(): FixedBytes32 =
+    var out: FixedBytes32
+    return out
+
+fn fixedBytes64Zero(): FixedBytes64 =
+    var out: FixedBytes64
+    return out
+
+fn fixedBytes32Equal(a: FixedBytes32, b: FixedBytes32): bool =
+    for i in 0..<fixedBytes32Size:
+        if a.data[i] != b.data[i]:
+            return false
+    return true
+
+fn fixedBytes64Equal(a: FixedBytes64, b: FixedBytes64): bool =
+    for i in 0..<fixedBytes64Size:
+        if a.data[i] != b.data[i]:
+            return false
+    return true
+
+fn fixedBytes32FromBytes(data: Bytes): Result[FixedBytes32] =
+    if bytesLen(data) != fixedBytes32Size:
+        return Err[FixedBytes32]("v3 bytes_layout: need 32 bytes")
+    var out: FixedBytes32
+    for i in 0..<fixedBytes32Size:
+        out.data[i] = bytesGet(data, i)
+    return Ok[FixedBytes32](out)
+
+fn fixedBytes64FromBytes(data: Bytes): Result[FixedBytes64] =
+    if bytesLen(data) != fixedBytes64Size:
+        return Err[FixedBytes64]("v3 bytes_layout: need 64 bytes")
+    var out: FixedBytes64
+    for i in 0..<fixedBytes64Size:
+        out.data[i] = bytesGet(data, i)
+    return Ok[FixedBytes64](out)
+
+fn fixedBytes32ToBytes(value: FixedBytes32): Bytes =
+    let out: Bytes = bytesAlloc(fixedBytes32Size)
+    for i in 0..<fixedBytes32Size:
+        bytesSet(out, i, value.data[i] & 255)
+    return out
+
+fn fixedBytes64ToBytes(value: FixedBytes64): Bytes =
+    let out: Bytes = bytesAlloc(fixedBytes64Size)
+    for i in 0..<fixedBytes64Size:
+        bytesSet(out, i, value.data[i] & 255)
+    return out
+
+fn fixedBytesHexValue(c: char): int32 =
+    if c >= '0' && c <= '9':
+        return int32(c) - int32('0')
+    if c >= 'a' && c <= 'f':
+        return 10 + int32(c) - int32('a')
+    if c >= 'A' && c <= 'F':
+        return 10 + int32(c) - int32('A')
+    return -1
+
+fn fixedBytes32FromHex(text: str): Result[FixedBytes32] =
+    if len(text) != fixedBytes32Size * 2:
+        return Err[FixedBytes32]("v3 bytes_layout: invalid fixed32 hex length")
+    let outBytes: Bytes = bytesAlloc(fixedBytes32Size)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = fixedBytesHexValue(text[i])
+        let lo: int32 = fixedBytesHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[FixedBytes32]("v3 bytes_layout: invalid fixed32 hex")
+        bytesSet(outBytes, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return fixedBytes32FromBytes(outBytes)
+
+fn fixedBytes64FromHex(text: str): Result[FixedBytes64] =
+    if len(text) != fixedBytes64Size * 2:
+        return Err[FixedBytes64]("v3 bytes_layout: invalid fixed64 hex length")
+    let outBytes: Bytes = bytesAlloc(fixedBytes64Size)
+    var i: int32 = 0
+    while i < len(text):
+        let hi: int32 = fixedBytesHexValue(text[i])
+        let lo: int32 = fixedBytesHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[FixedBytes64]("v3 bytes_layout: invalid fixed64 hex")
+        bytesSet(outBytes, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return fixedBytes64FromBytes(outBytes)
+
+fn fixedBytes32Hex(value: FixedBytes32): str =
+    return bytesToHex(fixedBytes32ToBytes(value))
+
+fn fixedBytes64Hex(value: FixedBytes64): str =
+    return bytesToHex(fixedBytes64ToBytes(value))

@@ -70,18 +70,6 @@ nm_has_symbol() {
   nm -g "$file" | awk -v pat="$pattern" 'index($0, pat) { found = 1 } END { exit found ? 0 : 1 }'
 }
 
-is_silent_rc223() {
-  status="$1"
-  log="$2"
-  if [ "$status" -ne 223 ]; then
-    return 1
-  fi
-  if [ ! -s "$log" ]; then
-    return 0
-  fi
-  ! grep -v -e '^target=' -e '^[[:space:]]*$' "$log" >/dev/null 2>&1
-}
-
 run_driver_compile_exe() {
   validate="$1"
   fixture_path="$2"
@@ -185,10 +173,6 @@ build_and_check_dsym() {
   status="$?"
   set -e
   if [ "$status" -ne 0 ]; then
-    if [ "$target" = "x86_64-apple-darwin" ] && is_silent_rc223 "$status" "$compile_log"; then
-      echo "verify_backend_debug skip: host-only driver does not support x86_64 debug target" 1>&2
-      exit 2
-    fi
     tail -n 200 "$compile_log" 1>&2 || true
     exit "$status"
   fi

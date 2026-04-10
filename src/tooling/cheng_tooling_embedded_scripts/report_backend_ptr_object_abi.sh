@@ -78,7 +78,7 @@ probe_fixture() {
   elif [ "$compile_rc" -eq 139 ]; then
     status="compile_sigsegv"
   elif [ "$compile_rc" -eq 223 ]; then
-    status="compile_rc223"
+    status="compile_deterministic_exit_223"
   elif [ "$compile_rc" -eq 0 ]; then
     status="runtime_fail"
   fi

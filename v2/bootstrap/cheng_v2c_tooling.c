@@ -49724,6 +49724,67 @@ static char *run_binary_capture_or_die(const char *binary_path,
     return stdout_text;
 }
 
+static char *run_chain_node_process_smoke_capture_or_die(const char *repo_root,
+                                                         const char *chain_node_binary,
+                                                         const char *programs_dir,
+                                                         const char *label) {
+    char server_root[PATH_MAX];
+    char client_root[PATH_MAX];
+    char server_log[PATH_MAX];
+    char sync_log[PATH_MAX];
+    StringList argv;
+    char *script;
+    char *stdout_text;
+    memset(&argv, 0, sizeof(argv));
+    if (snprintf(server_root, sizeof(server_root), "%s/chain_node_process_server_root", programs_dir) >=
+            (int)sizeof(server_root) ||
+        snprintf(client_root, sizeof(client_root), "%s/chain_node_process_client_root", programs_dir) >=
+            (int)sizeof(client_root) ||
+        snprintf(server_log, sizeof(server_log), "%s/chain_node_process_server.stdout", programs_dir) >=
+            (int)sizeof(server_log) ||
+        snprintf(sync_log, sizeof(sync_log), "%s/chain_node_process_client_sync.stdout", programs_dir) >=
+            (int)sizeof(sync_log)) {
+        die("program selfhost: chain node process smoke path too long");
+    }
+    script = xformat("set -eu\n"
+                     "port=$((20000 + ($$ %% 20000)))\n"
+                     "listen=\"/ip4/127.0.0.1/udp/$port/quic-v1\"\n"
+                     "server_root='%s'\n"
+                     "client_root='%s'\n"
+                     "server_log='%s'\n"
+                     "sync_log='%s'\n"
+                     "rm -rf \"$server_root\" \"$client_root\" \"$server_log\" \"$sync_log\"\n"
+                     "'%s' mint --root \"$server_root\" --node-id server --account alice --asset cheng --amount 11 > /dev/null\n"
+                     "printf 'chain_node_process_smoke_stage=mint_ok\\n'\n"
+                     "(timeout 60s '%s' serve-once --root \"$server_root\" --node-id server --listen \"$listen\" > \"$server_log\") &\n"
+                     "server_pid=$!\n"
+                     "sleep 1\n"
+                     "timeout 90s '%s' sync-once --root \"$client_root\" --node-id client --peer \"$listen\" > \"$sync_log\" || { wait $server_pid || true; exit 1; }\n"
+                     "sync_out=$(tail -n 1 \"$sync_log\")\n"
+                     "printf 'chain_node_process_smoke_stage=sync_ok\\n'\n"
+                     "balance_out=$(timeout 10s '%s' balance --root \"$client_root\" --node-id client --account alice --asset cheng) || { wait $server_pid || true; exit 1; }\n"
+                     "printf 'chain_node_process_smoke_stage=balance_ok\\n'\n"
+                     "wait $server_pid || exit 1\n"
+                     "server_out=$(tail -n 1 \"$server_log\")\n"
+                     "printf 'sync_output=%%s\\n' \"$sync_out\"\n"
+                     "printf 'balance_output=%%s\\n' \"$balance_out\"\n"
+                     "printf 'server_output=%%s\\n' \"$server_out\"\n"
+                     "printf 'chain_node_process_smoke=ok\\n'\n",
+                     server_root,
+                     client_root,
+                     server_log,
+                     sync_log,
+                     chain_node_binary,
+                     chain_node_binary,
+                     chain_node_binary,
+                     chain_node_binary);
+    string_list_push_copy(&argv, "-lc");
+    string_list_push_take(&argv, script);
+    stdout_text = run_command_capture_or_die("/bin/sh", &argv, repo_root, label);
+    string_list_free(&argv);
+    return stdout_text;
+}
+
 static int cmd_tooling_selfhost_host(const char *repo_root, int argc, char **argv) {
     char out_dir[PATH_MAX];
     char compiler_abs[PATH_MAX];
@@ -50115,6 +50176,7 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     char chain_node_binary[PATH_MAX];
     char chain_node_zero_root[PATH_MAX];
     char chain_node_mint_root[PATH_MAX];
+    char chain_node_process_stdout_path[PATH_MAX];
     NativeStageArtifacts stage1;
     NativeStageArtifacts stage2;
     NativeStageArtifacts stage3;
@@ -50123,9 +50185,13 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     char *chain_node_zero_balance_stdout = NULL;
     char *chain_node_mint_stdout = NULL;
     char *chain_node_after_mint_balance_stdout = NULL;
+    char *chain_node_process_stdout = NULL;
     char *chain_node_zero_balance = NULL;
     char *chain_node_mint_event_cid = NULL;
     char *chain_node_after_mint_balance = NULL;
+    char *chain_node_process_sync_output = NULL;
+    char *chain_node_process_balance_output = NULL;
+    char *chain_node_process_server_output = NULL;
     int release_equal = 0;
     int plan_equal = 0;
     int exec_equal = 0;
@@ -50138,6 +50204,7 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     int chain_node_zero_balance_ok = 0;
     int chain_node_mint_ok = 0;
     int chain_node_after_mint_balance_ok = 0;
+    int chain_node_process_ok = 0;
     int ok = 0;
     const char *compiler_raw = try_flag_value(argc, argv, "--compiler", argv[0]);
     const char *out_raw = try_flag_value(argc, argv, "--out-dir", "v2/artifacts/full_selfhost/program_selfhost");
@@ -50175,9 +50242,14 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
         snprintf(chain_node_zero_root, sizeof(chain_node_zero_root), "%s/chain_node_zero_root", programs_dir) >=
             (int)sizeof(chain_node_zero_root) ||
         snprintf(chain_node_mint_root, sizeof(chain_node_mint_root), "%s/chain_node_mint_root", programs_dir) >=
-            (int)sizeof(chain_node_mint_root)) {
+            (int)sizeof(chain_node_mint_root) ||
+        snprintf(chain_node_process_stdout_path,
+                 sizeof(chain_node_process_stdout_path),
+                 "%s/chain_node_process_smoke.stdout",
+                 programs_dir) >= (int)sizeof(chain_node_process_stdout_path)) {
         die("program selfhost path too long");
     }
+    remove_tree_or_die(out_dir);
     create_dir_all(stage1_dir);
     create_dir_all(stage2_dir);
     create_dir_all(stage3_dir);
@@ -50298,6 +50370,27 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
         die("program selfhost: chain node minted balance mismatch");
     }
 
+    chain_node_process_stdout =
+        run_chain_node_process_smoke_capture_or_die(repo_root,
+                                                    chain_node_binary,
+                                                    programs_dir,
+                                                    "program selfhost: chain node process smoke failed");
+    write_text_file(chain_node_process_stdout_path, chain_node_process_stdout);
+    compare_expected_text_or_die(repo_root,
+                                 "v2/tests/contracts/chain_node_process_smoke.expected",
+                                 chain_node_process_stdout_path,
+                                 "program selfhost: chain node process smoke mismatch");
+    chain_node_process_sync_output = extract_line_value(chain_node_process_stdout, "sync_output");
+    chain_node_process_balance_output = extract_line_value(chain_node_process_stdout, "balance_output");
+    chain_node_process_server_output = extract_line_value(chain_node_process_stdout, "server_output");
+    chain_node_process_ok =
+        chain_node_process_sync_output[0] != '\0' &&
+        chain_node_process_balance_output[0] != '\0' &&
+        chain_node_process_server_output[0] != '\0';
+    if (!chain_node_process_ok) {
+        die("program selfhost: chain node process smoke output missing required line");
+    }
+
     ok = release_equal &&
          plan_equal &&
          exec_equal &&
@@ -50309,7 +50402,8 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
          chain_node_build_ok &&
          chain_node_zero_balance_ok &&
          chain_node_mint_ok &&
-         chain_node_after_mint_balance_ok;
+         chain_node_after_mint_balance_ok &&
+         chain_node_process_ok;
     printf("program_selfhost_ok=%d\n", ok ? 1 : 0);
     printf("compiler=%s\n", compiler_norm);
     printf("stage1_binary_cid=%s\n", stage1.binary_cid);
@@ -50331,15 +50425,23 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     printf("stage2_chain_node_zero_balance=%s\n", chain_node_zero_balance);
     printf("stage2_chain_node_mint_event_cid_present=%d\n", chain_node_mint_ok ? 1 : 0);
     printf("stage2_chain_node_balance_after_mint=%s\n", chain_node_after_mint_balance);
+    printf("stage2_chain_node_process_smoke_ok=%d\n", chain_node_process_ok);
+    printf("stage2_chain_node_sync_once_output=%s\n", chain_node_process_sync_output);
+    printf("stage2_chain_node_sync_balance_output=%s\n", chain_node_process_balance_output);
+    printf("stage2_chain_node_serve_once_output=%s\n", chain_node_process_server_output);
 
     free(lsmr_advanced_stdout);
     free(chain_state_stdout);
     free(chain_node_zero_balance_stdout);
     free(chain_node_mint_stdout);
     free(chain_node_after_mint_balance_stdout);
+    free(chain_node_process_stdout);
     free(chain_node_zero_balance);
     free(chain_node_mint_event_cid);
     free(chain_node_after_mint_balance);
+    free(chain_node_process_sync_output);
+    free(chain_node_process_balance_output);
+    free(chain_node_process_server_output);
     free_stage_artifacts(&stage1);
     free_stage_artifacts(&stage2);
     free_stage_artifacts(&stage3);

@@ -1,0 +1,217 @@
+import cmdline
+import std/os
+import std/strings
+import std/strutils as strutil
+import ../lang/intern as langintern
+import ./path as v3path
+import ./host_ops as hostops
+import ./hotpath_scan as hotscan
+import ./perf_gate as perfgate
+import ./bootstrap_contracts as contracts
+import ../backend/build_plan as buildplan
+
+fn v3GatePrintLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn v3GatePrintErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn v3GateRoot(): str =
+    return os.getEnvDefault("CHENG_V3_ROOT", os.getCurrentDir())
+
+fn v3GateBootstrapBin(root: str, name: str): str =
+    return v3path.v3PathAbsolute(root, "artifacts/v3_bootstrap/" + name)
+
+fn v3GateArtifactsDir(root: str): str =
+    return v3path.v3PathAbsolute(root, "artifacts/v3_gate")
+
+fn v3GateEnsureArtifactsDir(root: str): bool =
+    return v3path.v3MkdirP(root, v3GateArtifactsDir(root))
+
+fn v3GateUsage() =
+    v3GatePrintLine("usage: cheng_v3 <command> [args]")
+    v3GatePrintLine("")
+    v3GatePrintLine("commands:")
+    v3GatePrintLine("  scan-hotpath")
+    v3GatePrintLine("  c-ref")
+    v3GatePrintLine("  compare-bench --baseline:<file> --candidate:<file> [--max-ratio-milli:<N>]")
+    v3GatePrintLine("  bootstrap-bridge")
+    v3GatePrintLine("  build-backend-driver")
+    v3GatePrintLine("  run-smokes")
+    v3GatePrintLine("  print-bootstrap")
+    v3GatePrintLine("  print-build-plan")
+    v3GatePrintLine("  slice-gate")
+
+fn v3GateReadFlag(args: str[], key: str, defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.startsWith(arg, key + ":"):
+            return strings.dropPrefix(arg, key + ":")
+        if strutil.startsWith(arg, key + "="):
+            return strings.dropPrefix(arg, key + "=")
+    return defaultValue
+
+fn v3GateCollectArgsFrom(startIndex: int32, count: int32): str[] =
+    var out: str[] = []
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        out.add(cmdline.paramStr(i))
+    return out
+
+fn v3GateScanHotpath(root: str): int32 =
+    let hits: hotscan.V3ForbiddenHit[] = hotscan.v3ScanForbiddenSourceDir(root, "v3/src")
+    let report: str = hotscan.v3ForbiddenHitReport(hits)
+    v3GatePrintLine(strutil.strip(report))
+    if hotscan.v3ForbiddenHitsOk(hits):
+        return 0
+    return 1
+
+fn v3GateRunCRef(root: str): int32 =
+    if !v3GateEnsureArtifactsDir(root):
+        v3GatePrintErr("v3 gate: failed to create artifacts dir")
+        return 1
+    let outPath: str = v3path.v3PathAbsolute(root, "artifacts/v3_gate/c_ref_latest.txt")
+    var args: str[] = []
+    args.add("-C")
+    args.add(v3path.v3PathAbsolute(root, "v3/bench/c_ref"))
+    args.add("clean")
+    args.add("run")
+    let run: hostops.V3LoggedRun = hostops.v3RunProgramLogged(root, "c_ref", "make", args, [], root, 0, outPath)
+    if len(strutil.strip(run.output)) > 0:
+        v3GatePrintLine(strutil.strip(run.output))
+    if !hostops.v3LoggedRunOk(run):
+        v3GatePrintErr(hostops.v3LoggedRunSummary(run))
+        return run.exitCode
+    return 0
+
+fn v3GateCompareBench(root: str, baselinePath: str, candidatePath: str, maxRatioMilli: int64): int32 =
+    let pool: langintern.V3InternPool = langintern.v3InternPoolNew()
+    let base: perfgate.V3BenchDataset = perfgate.v3BenchDatasetLoadFile(pool, baselinePath)
+    let candidate: perfgate.V3BenchDataset = perfgate.v3BenchDatasetLoadFile(pool, candidatePath)
+    let compare: perfgate.V3BenchCompare = perfgate.v3BenchCompare(base, candidate, maxRatioMilli)
+    let report: str = perfgate.v3BenchCompareReport(pool, compare)
+    v3GatePrintLine(strutil.strip(report))
+    if compare.ok:
+        return 0
+    return 1
+
+fn v3GateRunScript(root: str, label: str, scriptRel: str, logRel: str): int32 =
+    if !v3GateEnsureArtifactsDir(root):
+        v3GatePrintErr("v3 gate: failed to create artifacts dir")
+        return 1
+    let scriptPath: str = v3path.v3PathAbsolute(root, scriptRel)
+    let logPath: str = v3path.v3PathAbsolute(root, logRel)
+    var args: str[] = []
+    args.add(scriptPath)
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root, label, "/bin/sh", args, [], root, 0, logPath)
+    if !hostops.v3LoggedRunOk(run):
+        v3GatePrintErr(hostops.v3LoggedRunSummary(run))
+        if len(strutil.strip(run.output)) > 0:
+            v3GatePrintErr(strutil.strip(run.output))
+        return run.exitCode
+    if len(strutil.strip(run.output)) > 0:
+        v3GatePrintLine(strutil.strip(run.output))
+    return 0
+
+fn v3GateRunSmokes(root: str): int32 =
+    if !v3GateEnsureArtifactsDir(root):
+        v3GatePrintErr("v3 gate: failed to create artifacts dir")
+        return 1
+    if v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
+                       "artifacts/v3_gate/bootstrap_bridge_v3.log") != 0:
+        return 1
+    let stage1Source: str = v3path.v3PathAbsolute(root, "v3/bootstrap/stage1_bootstrap.cheng")
+    var bins: str[] = []
+    bins.add(v3GateBootstrapBin(root, "cheng.stage0"))
+    bins.add(v3GateBootstrapBin(root, "cheng.stage1"))
+    bins.add(v3GateBootstrapBin(root, "cheng.stage2"))
+    bins.add(v3GateBootstrapBin(root, "cheng.stage3"))
+    for i in 0..<bins.len:
+        let binPath: str = bins[i]
+        if !os.fileExists(binPath):
+            v3GatePrintErr("v3 gate: missing bootstrap compiler: " + binPath)
+            return 1
+        let binParts: os.SplitFileResult = os.splitFile(binPath)
+        let logPath: str = v3path.v3PathAbsolute(root, "artifacts/v3_gate/" + binParts.name + ".self-check.log")
+        var args: str[] = []
+        args.add("self-check")
+        args.add("--in:" + stage1Source)
+        let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root, binParts.name, binPath, args, [], root, 0, logPath)
+        if len(strutil.strip(run.output)) > 0:
+            v3GatePrintLine(strutil.strip(run.output))
+        if !hostops.v3LoggedRunOk(run):
+            v3GatePrintErr(hostops.v3LoggedRunSummary(run))
+            return run.exitCode
+    return 0
+
+fn v3GateSlice(root: str): int32 =
+    v3GatePrintLine("[v3 gate] hot-path forbidden scan")
+    if v3GateScanHotpath(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] same-machine C baseline")
+    if v3GateRunCRef(root) != 0:
+        return 1
+    let baselinePath: str = v3path.v3PathAbsolute(root, "v3/bench/c_ref/baseline_arm64_apple_darwin.txt")
+    let candidatePath: str = v3path.v3PathAbsolute(root, "artifacts/v3_gate/c_ref_latest.txt")
+    if os.fileExists(baselinePath):
+        v3GatePrintLine("[v3 gate] frozen-vs-latest C baseline")
+        if v3GateCompareBench(root, baselinePath, candidatePath, int64(0)) != 0:
+            return 1
+    v3GatePrintLine("[v3 gate] bootstrap bridge")
+    if v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
+                       "artifacts/v3_gate/bootstrap_bridge_v3.log") != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] canonical backend driver")
+    if v3GateRunScript(root, "build_backend_driver_v3", "v3/tooling/build_backend_driver_v3.sh",
+                       "artifacts/v3_gate/build_backend_driver_v3.log") != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] v3 Cheng smokes")
+    if v3GateRunSmokes(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] ok")
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let count: int32 = cmdline.paramCount()
+    if count <= 0:
+        v3GateUsage()
+        return 1
+    let root: str = v3GateRoot()
+    let cmd: str = cmdline.paramStr(1)
+    let args: str[] = v3GateCollectArgsFrom(2, count)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3GateUsage()
+        return 0
+    if cmd == "scan-hotpath":
+        return v3GateScanHotpath(root)
+    if cmd == "c-ref":
+        return v3GateRunCRef(root)
+    if cmd == "compare-bench":
+        let baselinePath: str = v3GateReadFlag(args, "--baseline", "")
+        let candidatePath: str = v3GateReadFlag(args, "--candidate", "")
+        let maxRatioText: str = v3GateReadFlag(args, "--max-ratio-milli", "0")
+        return v3GateCompareBench(root, baselinePath, candidatePath, int64(strutil.parseInt(maxRatioText)))
+    if cmd == "bootstrap-bridge":
+        return v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
+                               "artifacts/v3_gate/bootstrap_bridge_v3.log")
+    if cmd == "build-backend-driver":
+        return v3GateRunScript(root, "build_backend_driver_v3", "v3/tooling/build_backend_driver_v3.sh",
+                               "artifacts/v3_gate/build_backend_driver_v3.log")
+    if cmd == "run-smokes":
+        return v3GateRunSmokes(root)
+    if cmd == "print-bootstrap":
+        let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+        v3GatePrintLine(strutil.strip(contracts.v3BootstrapSnapshotReport(snapshot)))
+        return 0
+    if cmd == "print-build-plan":
+        let plan: buildplan.V3BackendBuildPlan = buildplan.v3BackendBuildPlanDefault(root)
+        v3GatePrintLine(strutil.strip(buildplan.v3BackendBuildPlanReport(plan)))
+        return 0
+    if cmd == "slice-gate":
+        return v3GateSlice(root)
+    v3GateUsage()
+    return 1

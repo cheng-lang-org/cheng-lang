@@ -133,11 +133,23 @@ tooling_selfhost_stage0_for_source() {
   src_path_raw="$1"
   case "$src_path_raw" in
     src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
-      cand="${CHENG_TOOLING_SELFHOST_STAGE0:-$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2}"
-      if [ -x "$cand" ]; then
-        printf '%s\n' "$cand"
-        return 0
+      if [ "${CHENG_TOOLING_SELFHOST_STAGE0:-}" != "" ]; then
+        cand="${CHENG_TOOLING_SELFHOST_STAGE0:-}"
+        if [ -x "$cand" ]; then
+          printf '%s\n' "$cand"
+          return 0
+        fi
       fi
+      for cand in \
+        "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" \
+        "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
+        "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof"
+      do
+        if [ -x "$cand" ]; then
+          printf '%s\n' "$cand"
+          return 0
+        fi
+      done
       ;;
   esac
   return 1

@@ -255,7 +255,7 @@ struct DriverCProgValue {
 struct DriverCProgArray {
   int32_t len;
   int32_t cap;
-  char *elem_type_text;
+  const char *elem_type_text;
   DriverCProgValue *items;
   struct DriverCProgArray *next_registered;
   DriverCProgValue inline_items[DRIVER_C_PROG_ARRAY_INLINE_CAP];
@@ -264,11 +264,13 @@ struct DriverCProgArray {
 struct DriverCProgRecord {
   int32_t len;
   int32_t cap;
-  char *type_text;
+  const char *type_text;
   char **names;
   DriverCProgValue *values;
   int32_t *lookup_indices;
   int32_t lookup_cap;
+  int32_t names_shared;
+  int32_t lookup_shared;
   char *inline_names[DRIVER_C_PROG_RECORD_INLINE_CAP];
   DriverCProgValue inline_values[DRIVER_C_PROG_RECORD_INLINE_CAP];
   int32_t inline_lookup_indices[DRIVER_C_PROG_RECORD_LOOKUP_INLINE_CAP];
@@ -646,6 +648,72 @@ static uint64_t driver_c_prog_hash_text(const char *text) {
     cursor = cursor + 1;
   }
   return hash;
+}
+
+static void *driver_c_prog_xcalloc(size_t count, size_t size);
+static char *driver_c_dup_cstring(const char *text);
+static int driver_c_prog_text_eq(const char *a, const char *b);
+
+typedef struct DriverCProgInternedTextTable {
+  int32_t count;
+  int32_t cap;
+  char **slots;
+} DriverCProgInternedTextTable;
+
+static DriverCProgInternedTextTable driver_c_prog_interned_texts = {0};
+
+static void driver_c_prog_interned_text_table_grow(int32_t need_cap) {
+  DriverCProgInternedTextTable next = {0};
+  int32_t cap = 64;
+  int32_t i = 0;
+  if (need_cap < 64) {
+    need_cap = 64;
+  }
+  while (cap < need_cap) {
+    cap = cap * 2;
+  }
+  next.cap = cap;
+  next.slots = (char **)driver_c_prog_xcalloc((size_t)cap, sizeof(char *));
+  for (i = 0; i < driver_c_prog_interned_texts.cap; ++i) {
+    char *text = driver_c_prog_interned_texts.slots != NULL ? driver_c_prog_interned_texts.slots[i] : NULL;
+    if (text != NULL) {
+      uint64_t hash = driver_c_prog_hash_text(text);
+      int32_t slot = (int32_t)(hash & (uint64_t)(next.cap - 1));
+      while (next.slots[slot] != NULL) {
+        slot = (slot + 1) & (next.cap - 1);
+      }
+      next.slots[slot] = text;
+      next.count = next.count + 1;
+    }
+  }
+  free(driver_c_prog_interned_texts.slots);
+  driver_c_prog_interned_texts = next;
+}
+
+static const char *driver_c_prog_intern_text(const char *text) {
+  uint64_t hash = 0;
+  int32_t slot = 0;
+  const char *next_text = text != NULL ? text : "";
+  if (next_text[0] == '\0') {
+    return "";
+  }
+  if (driver_c_prog_interned_texts.cap <= 0 ||
+      driver_c_prog_interned_texts.count * 10 >= driver_c_prog_interned_texts.cap * 7) {
+    int32_t need_cap =
+        driver_c_prog_interned_texts.cap > 0 ? driver_c_prog_interned_texts.cap * 2 : 64;
+    driver_c_prog_interned_text_table_grow(need_cap);
+  }
+  hash = driver_c_prog_hash_text(next_text);
+  slot = (int32_t)(hash & (uint64_t)(driver_c_prog_interned_texts.cap - 1));
+  while (driver_c_prog_interned_texts.slots[slot] != NULL) {
+    if (driver_c_prog_text_eq(driver_c_prog_interned_texts.slots[slot], next_text)) {
+      return driver_c_prog_interned_texts.slots[slot];
+    }
+    slot = (slot + 1) & (driver_c_prog_interned_texts.cap - 1);
+  }
+  driver_c_prog_interned_texts.slots[slot] = driver_c_dup_cstring(next_text);
+  driver_c_prog_interned_texts.count = driver_c_prog_interned_texts.count + 1;
+  return driver_c_prog_interned_texts.slots[slot];
 }
 
 static uint64_t driver_c_prog_hash_visible_item_key(const char *owner_module,
@@ -1456,7 +1524,7 @@ static DriverCProgArray *driver_c_prog_registered_arrays = NULL;
 
 static DriverCProgArray *driver_c_prog_array_new_with_elem(const char *elem_type_text) {
   DriverCProgArray *out = (DriverCProgArray *)driver_c_prog_xcalloc(1u, sizeof(*out));
-  out->elem_type_text = driver_c_dup_cstring(elem_type_text != NULL ? elem_type_text : "");
+  out->elem_type_text = driver_c_prog_intern_text(elem_type_text);
   out->items = out->inline_items;
   out->cap = DRIVER_C_PROG_ARRAY_INLINE_CAP;
   out->next_registered = driver_c_prog_registered_arrays;
@@ -1481,8 +1549,7 @@ static DriverCProgArray *driver_c_prog_array_new_with_elem_and_len_uninit(const 
 
 static void driver_c_prog_array_set_elem_type(DriverCProgArray *array, const char *elem_type_text) {
   if (array == NULL) return;
-  free(array->elem_type_text);
-  array->elem_type_text = driver_c_dup_cstring(elem_type_text != NULL ? elem_type_text : "");
+  array->elem_type_text = driver_c_prog_intern_text(elem_type_text);
 }
 
 static DriverCProgArray *driver_c_prog_array_from_buffer_ptr(void *buffer) {
@@ -1500,7 +1567,7 @@ static DriverCProgArray *driver_c_prog_array_from_buffer_ptr(void *buffer) {
 static DriverCProgRecord *driver_c_prog_record_new_with_type(const char *type_text) {
   DriverCProgRecord *out = (DriverCProgRecord *)driver_c_prog_xcalloc(1u, sizeof(*out));
   int32_t i = 0;
-  out->type_text = driver_c_dup_cstring(type_text != NULL ? type_text : "");
+  out->type_text = driver_c_prog_intern_text(type_text);
   out->names = out->inline_names;
   out->values = out->inline_values;
   out->lookup_indices = out->inline_lookup_indices;
@@ -1518,8 +1585,83 @@ static DriverCProgRecord *driver_c_prog_record_new(void) {
 
 static void driver_c_prog_record_set_type(DriverCProgRecord *record, const char *type_text) {
   if (record == NULL) return;
-  free(record->type_text);
-  record->type_text = driver_c_dup_cstring(type_text != NULL ? type_text : "");
+  record->type_text = driver_c_prog_intern_text(type_text);
+}
+
+static void driver_c_prog_field_lookup_reset(int32_t *lookup_indices,
+                                             int32_t lookup_cap);
+
+static void driver_c_prog_record_detach_names(DriverCProgRecord *record, int32_t need_cap) {
+  char **next_names = NULL;
+  int32_t cap = 0;
+  if (record == NULL || !record->names_shared) {
+    return;
+  }
+  cap = record->cap > 0 ? record->cap : DRIVER_C_PROG_RECORD_INLINE_CAP;
+  if (need_cap > cap) {
+    cap = need_cap;
+  }
+  next_names = (char **)driver_c_prog_xcalloc((size_t)cap, sizeof(char *));
+  if (record->names != NULL && record->len > 0) {
+    memcpy(next_names, record->names, sizeof(char *) * (size_t)record->len);
+  }
+  record->names = next_names;
+  record->names_shared = 0;
+}
+
+static void driver_c_prog_record_detach_lookup(DriverCProgRecord *record,
+                                               int32_t need_cap,
+                                               int copy_existing) {
+  int32_t cap = 0;
+  int32_t *next_lookup = NULL;
+  if (record == NULL || !record->lookup_shared) {
+    return;
+  }
+  cap = record->lookup_cap > 0 ? record->lookup_cap : DRIVER_C_PROG_RECORD_LOOKUP_INLINE_CAP;
+  if (need_cap > cap) {
+    cap = need_cap;
+  }
+  if (cap <= DRIVER_C_PROG_RECORD_LOOKUP_INLINE_CAP) {
+    next_lookup = record->inline_lookup_indices;
+  } else {
+    next_lookup = (int32_t *)driver_c_prog_xcalloc((size_t)cap, sizeof(int32_t));
+  }
+  driver_c_prog_field_lookup_reset(next_lookup, cap);
+  if (copy_existing && record->lookup_indices != NULL && record->lookup_cap > 0) {
+    memcpy(next_lookup, record->lookup_indices, sizeof(int32_t) * (size_t)record->lookup_cap);
+  }
+  record->lookup_indices = next_lookup;
+  record->lookup_cap = cap;
+  record->lookup_shared = 0;
+}
+
+static void driver_c_prog_record_set_shared_names(DriverCProgRecord *record, char **shared_names) {
+  if (record == NULL) {
+    return;
+  }
+  if (!record->names_shared &&
+      record->names != NULL &&
+      record->names != record->inline_names) {
+    free(record->names);
+  }
+  record->names = shared_names;
+  record->names_shared = 1;
+}
+
+static void driver_c_prog_record_set_shared_lookup(DriverCProgRecord *record,
+                                                   int32_t *shared_lookup,
+                                                   int32_t shared_lookup_cap) {
+  if (record == NULL) {
+    return;
+  }
+  if (!record->lookup_shared &&
+      record->lookup_indices != NULL &&
+      record->lookup_indices != record->inline_lookup_indices) {
+    free(record->lookup_indices);
+  }
+  record->lookup_indices = shared_lookup;
+  record->lookup_cap = shared_lookup_cap;
+  record->lookup_shared = 1;
 }
 
 static int32_t driver_c_prog_record_lookup_cap_for_count(int32_t count) {
@@ -1540,6 +1682,9 @@ static void driver_c_prog_record_lookup_reset(DriverCProgRecord *record, int32_t
     return;
   }
   need_cap = driver_c_prog_record_lookup_cap_for_count(field_count);
+  if (record->lookup_shared) {
+    driver_c_prog_record_detach_lookup(record, need_cap, 0);
+  }
   if (record->lookup_indices == NULL) {
     record->lookup_indices = record->inline_lookup_indices;
     record->lookup_cap = DRIVER_C_PROG_RECORD_LOOKUP_INLINE_CAP;
@@ -1564,6 +1709,9 @@ static void driver_c_prog_record_lookup_ensure_cap_exact(DriverCProgRecord *reco
   if (record == NULL || need_cap <= 0) {
     return;
   }
+  if (record->lookup_shared) {
+    driver_c_prog_record_detach_lookup(record, need_cap, 1);
+  }
   if (record->lookup_indices == NULL) {
     record->lookup_indices = record->inline_lookup_indices;
     record->lookup_cap = DRIVER_C_PROG_RECORD_LOOKUP_INLINE_CAP;
@@ -1586,6 +1734,9 @@ static void driver_c_prog_record_lookup_insert(DriverCProgRecord *record, int32_
   uint64_t hash = 0;
   int32_t start = 0;
   int32_t slot = 0;
+  if (record != NULL && record->lookup_shared) {
+    driver_c_prog_record_detach_lookup(record, record->lookup_cap, 1);
+  }
   if (record == NULL ||
       field_index < 0 ||
       field_index >= record->len ||
@@ -2074,6 +2225,8 @@ static int driver_c_prog_value_is_ephemeral_aggregate(DriverCProgValue value) {
          (value.flags & DRIVER_C_PROG_VALUE_FLAG_EPHEMERAL_AGGREGATE) != 0;
 }
 
+static DriverCProgValue driver_c_prog_clone_value_deep(DriverCProgValue value);
+
 static void driver_c_prog_value_clear_ephemeral_flag_root(DriverCProgValue *value) {
   if (value == NULL) {
     return;
@@ -2085,12 +2238,26 @@ static void driver_c_prog_value_clear_ephemeral_flag_root(DriverCProgValue *valu
   value->flags &= ~((uint32_t)DRIVER_C_PROG_VALUE_FLAG_EPHEMERAL_AGGREGATE);
 }
 
+static DriverCProgValue driver_c_prog_prepare_fresh_slot_value(DriverCProgValue value) {
+  DriverCProgValue next = driver_c_prog_materialize(value);
+  if (next.kind == DRIVER_C_PROG_VALUE_ARRAY || next.kind == DRIVER_C_PROG_VALUE_RECORD) {
+    if (!driver_c_prog_value_is_ephemeral_aggregate(next)) {
+      next = driver_c_prog_clone_value_deep(next);
+    }
+    driver_c_prog_value_clear_ephemeral_flag_root(&next);
+  } else {
+    next.flags = 0;
+  }
+  return next;
+}
+
 static DriverCProgValue *driver_c_prog_record_slot(DriverCProgRecord *record,
                                                    const char *name,
                                                    int create_if_missing);
 static DriverCProgValue *driver_c_prog_record_slot_at(DriverCProgRecord *record,
                                                       int32_t field_index,
                                                       const char *field_name);
+static void driver_c_prog_record_ensure_value_cap(DriverCProgRecord *record, int32_t need);
 static void driver_c_prog_record_ensure_cap(DriverCProgRecord *record, int32_t need);
 static void driver_c_prog_array_set_len(DriverCProgArray *array, int32_t new_len);
 
@@ -2121,14 +2288,24 @@ static DriverCProgValue driver_c_prog_clone_value_deep(DriverCProgValue value) {
       return driver_c_prog_value_record(driver_c_prog_record_new());
     }
     dst = driver_c_prog_record_new_with_type(src->type_text);
-    driver_c_prog_record_ensure_cap(dst, src->cap);
+    driver_c_prog_record_ensure_value_cap(dst, src->cap);
     for (i = 0; i < src->len; ++i) {
-      dst->names[i] = src->names[i];
       dst->values[i] = driver_c_prog_clone_value_deep(src->values[i]);
     }
+    if (src->names_shared) {
+      driver_c_prog_record_set_shared_names(dst, src->names);
+    } else {
+      for (i = 0; i < src->len; ++i) {
+        dst->names[i] = src->names[i];
+      }
+    }
     dst->len = src->len;
-    driver_c_prog_record_lookup_ensure_cap_exact(dst, src->lookup_cap);
-    memcpy(dst->lookup_indices, src->lookup_indices, sizeof(int32_t) * (size_t)src->lookup_cap);
+    if (src->lookup_shared) {
+      driver_c_prog_record_set_shared_lookup(dst, src->lookup_indices, src->lookup_cap);
+    } else {
+      driver_c_prog_record_lookup_ensure_cap_exact(dst, src->lookup_cap);
+      memcpy(dst->lookup_indices, src->lookup_indices, sizeof(int32_t) * (size_t)src->lookup_cap);
+    }
     return driver_c_prog_value_record(dst);
   }
   return value;
@@ -2144,6 +2321,10 @@ int32_t cheng_recvfrom_fd_ex(int32_t fd, void *buf, int32_t len, int32_t flags, 
 static const char *driver_c_prog_value_cstring_borrow(DriverCProgValue value);
 static DriverCProgValue *driver_c_prog_slot_from_refish(DriverCProgValue value);
 static void driver_c_prog_assign_slot(DriverCProgValue *slot, DriverCProgValue value);
+static void driver_c_prog_record_detach_names(DriverCProgRecord *record, int32_t need_cap);
+static void driver_c_prog_record_detach_lookup(DriverCProgRecord *record,
+                                               int32_t need_cap,
+                                               int copy_existing);
 static DriverCProgValue driver_c_prog_zero_value_from_type(struct DriverCProgRegistry *registry,
                                                            const char *owner_module,
                                                            const char *inst_owner_module,
@@ -2194,7 +2375,7 @@ static DriverCProgValue driver_c_prog_cast_to_type(const char *type_text, Driver
   return materialized;
 }
 
-static void driver_c_prog_record_ensure_cap(DriverCProgRecord *record, int32_t need) {
+static void driver_c_prog_record_ensure_value_cap(DriverCProgRecord *record, int32_t need) {
   int32_t next_cap = 0;
   if (record == NULL) return;
   if (need <= record->cap) return;
@@ -2202,26 +2383,38 @@ static void driver_c_prog_record_ensure_cap(DriverCProgRecord *record, int32_t n
   while (next_cap < need) {
     next_cap = next_cap * 2;
   }
-  if (record->names == record->inline_names) {
-    char **next_names = (char **)driver_c_prog_xcalloc((size_t)next_cap, sizeof(char *));
+  if (record->values == record->inline_values) {
     DriverCProgValue *next_values =
         (DriverCProgValue *)driver_c_prog_xcalloc((size_t)next_cap, sizeof(DriverCProgValue));
-    memcpy(next_names, record->inline_names, sizeof(char *) * (size_t)record->len);
     memcpy(next_values, record->inline_values, sizeof(DriverCProgValue) * (size_t)record->len);
-    record->names = next_names;
     record->values = next_values;
   } else {
-    record->names =
-        (char **)driver_c_prog_xrealloc(record->names, sizeof(char *) * (size_t)next_cap);
     record->values =
         (DriverCProgValue *)driver_c_prog_xrealloc(record->values,
                                                    sizeof(DriverCProgValue) * (size_t)next_cap);
-    memset(record->names + record->cap, 0, sizeof(char *) * (size_t)(next_cap - record->cap));
     memset(record->values + record->cap,
            0,
            sizeof(DriverCProgValue) * (size_t)(next_cap - record->cap));
   }
   record->cap = next_cap;
+}
+
+static void driver_c_prog_record_ensure_cap(DriverCProgRecord *record, int32_t need) {
+  if (record == NULL) return;
+  if (need <= record->cap) return;
+  driver_c_prog_record_ensure_value_cap(record, need);
+  if (record->names_shared) {
+    return;
+  }
+  if (record->names == record->inline_names) {
+    char **next_names = (char **)driver_c_prog_xcalloc((size_t)record->cap, sizeof(char *));
+    memcpy(next_names, record->inline_names, sizeof(char *) * (size_t)record->len);
+    record->names = next_names;
+    return;
+  }
+  record->names =
+      (char **)driver_c_prog_xrealloc(record->names, sizeof(char *) * (size_t)record->cap);
+  memset(record->names + record->len, 0, sizeof(char *) * (size_t)(record->cap - record->len));
 }
 
 static DriverCProgValue *driver_c_prog_record_slot(DriverCProgRecord *record,
@@ -2244,6 +2437,14 @@ static DriverCProgValue *driver_c_prog_record_slot(DriverCProgRecord *record,
   }
   if (!create_if_missing) {
     return NULL;
+  }
+  if (record->names_shared) {
+    driver_c_prog_record_detach_names(record, record->len + 1);
+  }
+  if (record->lookup_shared) {
+    driver_c_prog_record_detach_lookup(record,
+                                       driver_c_prog_record_lookup_cap_for_count(record->len + 1),
+                                       1);
   }
   driver_c_prog_record_ensure_cap(record, record->len + 1);
   record->names[record->len] = driver_c_dup_cstring(name);
@@ -2288,7 +2489,7 @@ static void driver_c_prog_array_set_len(DriverCProgArray *array, int32_t new_len
 static void driver_c_prog_array_push(DriverCProgArray *array, DriverCProgValue value) {
   if (array == NULL) return;
   driver_c_prog_array_set_len(array, array->len + 1);
-  driver_c_prog_assign_slot(&array->items[array->len - 1], value);
+  array->items[array->len - 1] = driver_c_prog_prepare_fresh_slot_value(value);
 }
 
 static DriverCProgArray *driver_c_prog_array_from_refish(DriverCProgValue value, int create_if_nil) {
@@ -2299,7 +2500,7 @@ static DriverCProgArray *driver_c_prog_array_from_refish(DriverCProgValue value,
     return materialized.as.array;
   }
   if (slot != NULL && create_if_nil && materialized.kind == DRIVER_C_PROG_VALUE_NIL) {
-    driver_c_prog_assign_slot(slot, driver_c_prog_value_array(driver_c_prog_array_new()));
+    driver_c_prog_assign_slot(slot, driver_c_prog_value_array_temp(driver_c_prog_array_new()));
     materialized = driver_c_prog_materialize(*slot);
     if (materialized.kind == DRIVER_C_PROG_VALUE_ARRAY) {
       return materialized.as.array;
@@ -4310,6 +4511,26 @@ static int32_t driver_c_prog_type_decl_field_index(DriverCProgTypeDecl *decl,
                                          field_name);
 }
 
+static void driver_c_prog_record_init_from_decl(DriverCProgRecord *record,
+                                                DriverCProgTypeDecl *decl) {
+  int32_t i = 0;
+  if (record == NULL || decl == NULL || decl->field_count <= 0) {
+    return;
+  }
+  driver_c_prog_type_decl_ensure_field_lookup(decl);
+  driver_c_prog_record_ensure_value_cap(record, decl->field_count);
+  driver_c_prog_record_set_shared_names(record, decl->field_names);
+  for (i = 0; i < decl->field_count; ++i) {
+    record->values[i] = driver_c_prog_value_nil();
+  }
+  record->len = decl->field_count;
+  if (decl->field_lookup_indices != NULL && decl->field_lookup_cap > 0) {
+    driver_c_prog_record_set_shared_lookup(record, decl->field_lookup_indices, decl->field_lookup_cap);
+  } else {
+    driver_c_prog_record_lookup_rebuild(record);
+  }
+}
+
 static int driver_c_prog_parse_first_enum_ordinal_from_text(const char *text,
                                                             int32_t *out_ordinal) {
   char **parts = NULL;
@@ -5705,18 +5926,14 @@ static DriverCProgValue driver_c_prog_zero_value_from_plan(const DriverCProgZero
     }
     case DRIVER_C_PROG_ZERO_PLAN_RECORD: {
       DriverCProgRecord *record = driver_c_prog_record_new_with_type(plan->type_text);
-      driver_c_prog_record_ensure_cap(record, plan->field_count);
+      driver_c_prog_record_ensure_value_cap(record, plan->field_count);
+      driver_c_prog_record_set_shared_names(record, plan->field_names);
       for (i = 0; i < plan->field_count; ++i) {
-        record->names[i] = plan->field_names[i];
         record->values[i] = driver_c_prog_zero_value_from_plan(plan->field_plans[i]);
       }
       record->len = plan->field_count;
       if (plan->field_lookup_indices != NULL && plan->field_lookup_cap > 0) {
-        driver_c_prog_record_lookup_ensure_cap_exact(record, plan->field_lookup_cap);
-        memcpy(record->lookup_indices,
-               plan->field_lookup_indices,
-               sizeof(int32_t) * (size_t)plan->field_lookup_cap);
-        record->lookup_cap = plan->field_lookup_cap;
+        driver_c_prog_record_set_shared_lookup(record, plan->field_lookup_indices, plan->field_lookup_cap);
       } else {
         driver_c_prog_record_lookup_rebuild(record);
       }
@@ -8043,18 +8260,14 @@ static DriverCProgValue driver_c_prog_zero_record_shell_from_plan(const DriverCP
     return driver_c_prog_value_record(driver_c_prog_record_new());
   }
   record = driver_c_prog_record_new_with_type(plan->type_text);
-  driver_c_prog_record_ensure_cap(record, plan->field_count);
+  driver_c_prog_record_ensure_value_cap(record, plan->field_count);
+  driver_c_prog_record_set_shared_names(record, plan->field_names);
   for (i = 0; i < plan->field_count; ++i) {
-    record->names[i] = plan->field_names[i];
     record->values[i] = driver_c_prog_value_zero_plan(plan->field_plans[i]);
   }
   record->len = plan->field_count;
   if (plan->field_lookup_indices != NULL && plan->field_lookup_cap > 0) {
-    driver_c_prog_record_lookup_ensure_cap_exact(record, plan->field_lookup_cap);
-    memcpy(record->lookup_indices,
-           plan->field_lookup_indices,
-           sizeof(int32_t) * (size_t)plan->field_lookup_cap);
-    record->lookup_cap = plan->field_lookup_cap;
+    driver_c_prog_record_set_shared_lookup(record, plan->field_lookup_indices, plan->field_lookup_cap);
   } else {
     driver_c_prog_record_lookup_rebuild(record);
   }
@@ -8190,7 +8403,7 @@ static DriverCProgValue *driver_c_prog_ref_record_field_for_store(DriverCProgVal
                field_name != NULL ? field_name : "");
       driver_c_die(message);
     }
-    driver_c_prog_assign_slot(base_slot, driver_c_prog_value_record(driver_c_prog_record_new()));
+    driver_c_prog_assign_slot(base_slot, driver_c_prog_value_record_temp(driver_c_prog_record_new()));
     materialized = driver_c_prog_materialize_slot(base_slot);
   }
   if (materialized.kind != DRIVER_C_PROG_VALUE_RECORD || materialized.as.record == NULL) {
@@ -8327,7 +8540,7 @@ static int driver_c_prog_try_store_array_field(DriverCProgValue base_value,
       (driver_c_prog_text_eq(field_name, "len") ||
        driver_c_prog_text_eq(field_name, "cap") ||
        driver_c_prog_text_eq(field_name, "buffer"))) {
-    driver_c_prog_assign_slot(base_slot, driver_c_prog_value_array(driver_c_prog_array_new()));
+    driver_c_prog_assign_slot(base_slot, driver_c_prog_value_array_temp(driver_c_prog_array_new()));
     materialized = driver_c_prog_materialize_slot(base_slot);
   }
   if (materialized.kind != DRIVER_C_PROG_VALUE_ARRAY || materialized.as.array == NULL) {
@@ -9291,7 +9504,7 @@ static int driver_c_prog_try_builtin(DriverCProgRegistry *registry,
     DriverCProgValue value = slot != NULL ? driver_c_prog_materialize(*slot) : driver_c_prog_materialize(args[0]);
     int32_t new_len = driver_c_prog_value_to_i32(args[1]);
     if (value.kind != DRIVER_C_PROG_VALUE_ARRAY) {
-      value = driver_c_prog_value_array(driver_c_prog_array_new());
+      value = driver_c_prog_value_array_temp(driver_c_prog_array_new());
     }
     driver_c_prog_array_set_len(value.as.array, new_len);
     if (slot != NULL) {
@@ -9305,7 +9518,7 @@ static int driver_c_prog_try_builtin(DriverCProgRegistry *registry,
     DriverCProgValue value = slot != NULL ? driver_c_prog_materialize(*slot) : driver_c_prog_materialize(args[0]);
     int32_t need = driver_c_prog_value_to_i32(args[1]);
     if (value.kind != DRIVER_C_PROG_VALUE_ARRAY) {
-      value = driver_c_prog_value_array(driver_c_prog_array_new());
+      value = driver_c_prog_value_array_temp(driver_c_prog_array_new());
     }
     driver_c_prog_array_ensure_cap(value.as.array, need);
     if (slot != NULL) {
@@ -9318,7 +9531,7 @@ static int driver_c_prog_try_builtin(DriverCProgRegistry *registry,
     DriverCProgValue *slot = driver_c_prog_slot_from_refish(args[0]);
     DriverCProgValue value = slot != NULL ? driver_c_prog_materialize(*slot) : driver_c_prog_materialize(args[0]);
     if (value.kind != DRIVER_C_PROG_VALUE_ARRAY) {
-      value = driver_c_prog_value_array(driver_c_prog_array_new());
+      value = driver_c_prog_value_array_temp(driver_c_prog_array_new());
     }
     driver_c_prog_array_push(value.as.array, args[1]);
     if (slot != NULL) {
@@ -11339,7 +11552,7 @@ static DriverCProgValue driver_c_prog_eval_item(DriverCProgRegistry *registry,
         if (i == 0) break;
       }
       for (i = 0; i < count; ++i) {
-        driver_c_prog_assign_slot(&array->items[i], tmp[i]);
+        array->items[i] = driver_c_prog_prepare_fresh_slot_value(tmp[i]);
       }
       if (tmp != inline_tmp) {
         free(tmp);
@@ -11458,26 +11671,36 @@ static DriverCProgValue driver_c_prog_eval_item(DriverCProgRegistry *registry,
         DriverCProgRecord *record = driver_c_prog_record_new_with_type(record_type);
         DriverCProgTypeDecl *record_decl =
             driver_c_prog_make_record_decl_cached(registry, item, op, record_type);
+        int fields_in_decl_order = 0;
         if (record_decl != NULL && record_decl->field_count > 0) {
-          driver_c_prog_record_ensure_cap(record, record_decl->field_count);
-          for (i = 0; i < record_decl->field_count; ++i) {
-            record->names[i] = record_decl->field_names[i];
-            record->values[i] = driver_c_prog_value_nil();
+          driver_c_prog_record_init_from_decl(record, record_decl);
+          fields_in_decl_order = record_decl->field_count == count ? 1 : 0;
+          if (fields_in_decl_order) {
+            for (i = 0; i < count; ++i) {
+              if (!driver_c_prog_text_eq(record_decl->field_names[i], field_names[i])) {
+                fields_in_decl_order = 0;
+                break;
+              }
+            }
           }
-          record->len = record_decl->field_count;
-          driver_c_prog_record_lookup_rebuild(record);
         }
-        for (i = 0; i < count; ++i) {
-          const char *name = field_names[i];
-          DriverCProgValue *slot = NULL;
-          int32_t field_index =
-              record_decl != NULL ? driver_c_prog_type_decl_field_index(record_decl, name) : -1;
-          if (field_index >= 0) {
-            slot = driver_c_prog_record_slot_at(record, field_index, name);
-          } else {
-            slot = driver_c_prog_record_slot(record, name, 1);
+        if (fields_in_decl_order) {
+          for (i = 0; i < count; ++i) {
+            record->values[i] = driver_c_prog_prepare_fresh_slot_value(tmp[i]);
           }
-          driver_c_prog_assign_slot(slot, tmp[i]);
+        } else {
+          for (i = 0; i < count; ++i) {
+            const char *name = field_names[i];
+            DriverCProgValue *slot = NULL;
+            int32_t field_index =
+                record_decl != NULL ? driver_c_prog_type_decl_field_index(record_decl, name) : -1;
+            if (field_index >= 0) {
+              slot = driver_c_prog_record_slot_at(record, field_index, name);
+            } else {
+              slot = driver_c_prog_record_slot(record, name, 1);
+            }
+            *slot = driver_c_prog_prepare_fresh_slot_value(tmp[i]);
+          }
         }
         if (tmp != inline_tmp) {
           free(tmp);

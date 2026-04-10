@@ -106,9 +106,6 @@ if [ "$seed_label" = "currentsrc.proof.bootstrap" ]; then
   exit 2
 fi
 case "$seed_label" in
-  currentsrc.proof.bootstrap)
-    seed_lineage_name="cheng_stage0_currentsrc.proof"
-    ;;
   stage1)
     seed_lineage_name="cheng.stage1"
     ;;
@@ -130,55 +127,6 @@ if [ "$seed_lineage_name" != "" ]; then
   fi
   if [ -f "$seed_stamp" ]; then
     cp "$seed_stamp" "${seed_lineage_surface}.compile_stamp.txt"
-  fi
-  if [ "$seed_label" = "currentsrc.proof.bootstrap" ]; then
-    seed_src_dir="$(dirname -- "$seed")"
-    seed_outer_src="$seed_src_dir/cheng_stage0_currentsrc.outer"
-    seed_sidecar_src="$seed_src_dir/cheng_stage0_currentsrc.sidecar.sh"
-    seed_sidecar_meta_src="${seed_sidecar_src}.meta"
-    seed_stage1_stamp_src=""
-    for cand in \
-      "$seed_src_dir/stage1.native.after.compile_stamp.txt" \
-      "$seed_src_dir/stage1.native.compile_stamp.txt" \
-      "$seed_src_dir/stage1.native.serial.compile_stamp.txt"
-    do
-      if [ -f "$cand" ]; then
-        seed_stage1_stamp_src="$cand"
-        break
-      fi
-    done
-    if [ -f "$seed_outer_src" ]; then
-      cp "$seed_outer_src" "$seed_lineage_dir/cheng_stage0_currentsrc.outer"
-      chmod +x "$seed_lineage_dir/cheng_stage0_currentsrc.outer" 2>/dev/null || true
-    fi
-    if [ -f "$seed_sidecar_src" ]; then
-      cp "$seed_sidecar_src" "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh"
-      chmod +x "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh" 2>/dev/null || true
-    fi
-    if [ -f "$seed_sidecar_meta_src" ]; then
-      cp "$seed_sidecar_meta_src" "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta"
-      if [ -f "$seed_lineage_dir/cheng_stage0_currentsrc.outer" ]; then
-        awk -v outer="$seed_lineage_dir/cheng_stage0_currentsrc.outer" '
-          /^sidecar_real_driver=/ { print "sidecar_real_driver=" outer; next }
-          { print }
-        ' "$seed_sidecar_meta_src" > "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta.tmp.$$"
-        mv "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta.tmp.$$" \
-          "$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh.meta"
-      fi
-    fi
-    if [ "$seed_stage1_stamp_src" != "" ]; then
-      cp "$seed_stage1_stamp_src" "$seed_lineage_dir/stage1.native.after.compile_stamp.txt"
-    fi
-    if [ -f "${seed_lineage_surface}.meta" ]; then
-      awk \
-        -v outer="$seed_lineage_dir/cheng_stage0_currentsrc.outer" \
-        -v sidecar="$seed_lineage_dir/cheng_stage0_currentsrc.sidecar.sh" '
-        /^outer_driver=/ { print "outer_driver=" outer; next }
-        /^sidecar_compiler=/ { print "sidecar_compiler=" sidecar; next }
-        { print }
-      ' "${seed_lineage_surface}.meta" > "${seed_lineage_surface}.meta.tmp.$$"
-      mv "${seed_lineage_surface}.meta.tmp.$$" "${seed_lineage_surface}.meta"
-    fi
   fi
 fi
 

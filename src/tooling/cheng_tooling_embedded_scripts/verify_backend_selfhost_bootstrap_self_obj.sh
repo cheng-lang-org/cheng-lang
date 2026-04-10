@@ -4473,9 +4473,16 @@ sidecar_compiler="\${BACKEND_UIR_SIDECAR_COMPILER:-\$env_default}"
 sidecar_child_mode="\${BACKEND_UIR_SIDECAR_CHILD_MODE:-\$default_child_mode}"
 sidecar_mode="\${BACKEND_UIR_SIDECAR_MODE:-\$env_default_mode}"
 sidecar_bundle="\${BACKEND_UIR_SIDECAR_BUNDLE:-\$env_default_bundle}"
+sidecar_disable="\${BACKEND_UIR_SIDECAR_DISABLE:-0}"
 input_path="\${BACKEND_INPUT:-}"
 output_path="\${BACKEND_OUTPUT:-}"
 primary_timeout="\${BACKEND_PROOF_PRIMARY_TIMEOUT:-20}"
+if [ "\$sidecar_disable" = "1" ]; then
+  sidecar_compiler=""
+  sidecar_child_mode=""
+  sidecar_mode=""
+  sidecar_bundle=""
+fi
 proof_launcher_run_capture() {
   timeout_s="\$1"
   log_path="\$2"

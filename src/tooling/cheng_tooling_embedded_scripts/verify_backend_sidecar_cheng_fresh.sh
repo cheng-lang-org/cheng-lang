@@ -74,6 +74,52 @@ run_timeout_capture_sample() {
   return "$rc"
 }
 
+strict_sidecar_exit_kind() {
+  rc="$1"
+  case "$rc" in
+    124)
+      printf '%s\n' "timeout"
+      ;;
+    126)
+      printf '%s\n' "not_executable"
+      ;;
+    127)
+      printf '%s\n' "missing_executable"
+      ;;
+    223)
+      printf '%s\n' "deterministic_exit_223"
+      ;;
+    *)
+      if [ "$rc" -ge 129 ] 2>/dev/null && [ "$rc" -le 192 ] 2>/dev/null; then
+        printf '%s\n' "signal"
+      else
+        printf '%s\n' "exit"
+      fi
+      ;;
+  esac
+}
+
+strict_sidecar_exit_hint() {
+  rc="$1"
+  case "$rc" in
+    124)
+      printf '%s\n' "wrapper_source_build_timed_out_waiting_for_bootstrap_proof_driver"
+      ;;
+    126)
+      printf '%s\n' "wrapper_source_compiler_not_executable"
+      ;;
+    127)
+      printf '%s\n' "wrapper_source_compiler_missing"
+      ;;
+    223)
+      printf '%s\n' "child_exited_223_directly_non_posix_signal"
+      ;;
+    *)
+      printf '\n'
+      ;;
+  esac
+}
+
 root="${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}"
 cd "$root"
 
@@ -97,6 +143,15 @@ strict_published_stage2_driver_path() {
     return 0
   fi
   printf '%s\n' "$published_driver"
+}
+
+strict_runtime_real_driver_path() {
+  published_driver="$(strict_published_stage2_driver_path)"
+  if [ -x "$published_driver" ] && [ -f "${published_driver}.meta" ]; then
+    printf '%s\n' "$published_driver"
+    return 0
+  fi
+  printf '%s\n' "$(currentsrc_proof_real_driver_path)"
 }
 
 strict_stage0_meta_field() {
@@ -307,8 +362,8 @@ assert_strict_fresh_bootstrap_driver() {
       exit 1
       ;;
   esac
-  if ! strict_stage0_published_surface "$bootstrap_driver_path"; then
-    echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver must be a published strict stage0 surface: $bootstrap_driver_path" 1>&2
+  if ! strict_stage0_published_surface "$bootstrap_driver_path" && ! strict_stage0_bootstrap_surface "$bootstrap_driver_path"; then
+    echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver must be a current-source proof surface: $bootstrap_driver_path" 1>&2
     exit 1
   fi
   if ! strict_stage0_meta_ok "$bootstrap_driver_path"; then
@@ -332,7 +387,7 @@ strict_fresh_bootstrap_driver_ok() {
     "$root"/*) ;;
     *) return 1 ;;
   esac
-  strict_stage0_published_surface "$bootstrap_driver_path" || return 1
+  strict_stage0_published_surface "$bootstrap_driver_path" || strict_stage0_bootstrap_surface "$bootstrap_driver_path" || return 1
   strict_stage0_meta_ok "$bootstrap_driver_path" || return 1
   strict_stage0_current_enough "$bootstrap_driver_path" || return 1
   return 0
@@ -360,8 +415,8 @@ assert_strict_fresh_real_driver() {
       exit 1
       ;;
   esac
-  if ! strict_stage0_published_surface "$real_driver_path"; then
-    echo "[verify_backend_sidecar_cheng_fresh] strict real sidecar driver must be a published strict stage0 surface: $real_driver_path" 1>&2
+  if ! strict_stage0_published_surface "$real_driver_path" && ! strict_stage0_bootstrap_surface "$real_driver_path"; then
+    echo "[verify_backend_sidecar_cheng_fresh] strict real sidecar driver must be a current-source proof surface: $real_driver_path" 1>&2
     exit 1
   fi
   if ! strict_stage0_meta_ok "$real_driver_path"; then
@@ -460,7 +515,12 @@ strict_bootstrap_driver_path() {
     esac
     return 0
   fi
-  strict_published_stage2_driver_path
+  published_driver="$(strict_published_stage2_driver_path)"
+  if strict_fresh_bootstrap_driver_ok "$published_driver"; then
+    printf '%s\n' "$published_driver"
+    return 0
+  fi
+  printf '%s\n' "$(currentsrc_proof_real_driver_path)"
 }
 
 resolve_strict_bootstrap_driver() {
@@ -474,9 +534,25 @@ resolve_strict_bootstrap_driver() {
   return 0
 }
 
-bootstrap_driver="$(resolve_strict_bootstrap_driver)"
+refresh_bootstrap_sidecar_compiler_contract() {
+  bootstrap_driver_path="$1"
+  case "$bootstrap_driver_path" in
+    "$(currentsrc_proof_real_driver_path)")
+      bootstrap_compiler="$(strict_stage0_meta_field "${bootstrap_driver_path}.meta" "sidecar_compiler")"
+      if [ "$bootstrap_compiler" = "" ]; then
+        echo "[verify_backend_sidecar_cheng_fresh] bootstrap sidecar compiler contract missing in meta: $bootstrap_driver_path" 1>&2
+        exit 1
+      fi
+      cp "$compiler_template" "$bootstrap_compiler"
+      chmod +x "$bootstrap_compiler"
+      ;;
+  esac
+}
 
-real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-$(strict_published_stage2_driver_path)}"
+bootstrap_driver="$(resolve_strict_bootstrap_driver)"
+refresh_bootstrap_sidecar_compiler_contract "$bootstrap_driver"
+
+real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-$(strict_runtime_real_driver_path)}"
 case "$real_driver" in
   /*)
     ;;
@@ -526,6 +602,7 @@ run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" 
   MM=orc \
   CACHE=0 \
   BACKEND_BUILD_TRACK=dev \
+  BACKEND_PROOF_PRIMARY_TIMEOUT="$compile_timeout_budget" \
   BACKEND_CURRENTSRC_WRAPPER_PRESERVE_SIDECAR=0 \
   BACKEND_UIR_SIDECAR_DISABLE=1 \
   BACKEND_UIR_PREFER_SIDECAR=0 \
@@ -552,11 +629,20 @@ run_timeout_capture_sample "$compile_timeout_budget" 1 "$wrapper_sample_prefix" 
 wrapper_rc="$?"
 set -e
 [ "$wrapper_rc" = "0" ] || {
-  echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver failed wrapper-source build: $bootstrap_driver" 1>&2
+  wrapper_kind="$(strict_sidecar_exit_kind "$wrapper_rc")"
+  wrapper_hint="$(strict_sidecar_exit_hint "$wrapper_rc")"
+  echo "[verify_backend_sidecar_cheng_fresh] strict bootstrap sidecar driver failed wrapper-source build: $bootstrap_driver rc=$wrapper_rc kind=$wrapper_kind log=$wrapper_compile_log" 1>&2
+  if [ "$wrapper_hint" != "" ]; then
+    echo "[verify_backend_sidecar_cheng_fresh] hint=$wrapper_hint" 1>&2
+  fi
   if [ "$wrapper_rc" = "124" ] && [ -f "${wrapper_sample_prefix}.parent.sample.txt" ]; then
     echo "[verify_backend_sidecar_cheng_fresh] timeout sample: ${wrapper_sample_prefix}.parent.sample.txt" 1>&2
   fi
-  sed -n '1,120p' "$wrapper_compile_log" 1>&2 || true
+  if [ -s "$wrapper_compile_log" ]; then
+    sed -n '1,120p' "$wrapper_compile_log" 1>&2 || true
+  else
+    echo "[verify_backend_sidecar_cheng_fresh] wrapper-source build produced no stderr/stdout before exit" 1>&2
+  fi
   exit 1
 }
 [ -s "$obj_path" ] || {

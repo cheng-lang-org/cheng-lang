@@ -1,0 +1,192 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/result
+import ../lang/intern as langintern
+
+type
+    V3BenchSample =
+        benchId: langintern.V3InternId
+        nsPerOpMilli: int64
+
+    V3BenchDataset =
+        samples: V3BenchSample[]
+
+    V3BenchCompareRow =
+        benchId: langintern.V3InternId
+        baseNsPerOpMilli: int64
+        candidateNsPerOpMilli: int64
+        ratioMilli: int64
+        missingCandidate: bool
+        missingBaseline: bool
+        tooSlow: bool
+
+    V3BenchCompare =
+        rows: V3BenchCompareRow[]
+        ok: bool
+
+fn v3BenchIsSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+
+fn v3BenchFirstField(line: str): str =
+    let n: int32 = len(line)
+    var stop: int32 = 0
+    while stop < n && !v3BenchIsSpace(line[stop]):
+        stop = stop + 1
+    if stop <= 0:
+        return ""
+    return strings.sliceBytes(line, 0, stop)
+
+fn v3BenchFindValue(line: str, key: str): str =
+    let n: int32 = len(line)
+    let keyLen: int32 = len(key)
+    if n <= 0 || keyLen <= 0 || keyLen > n:
+        return ""
+    var i: int32 = 0
+    while i <= n - keyLen:
+        if strings.sliceBytes(line, i, keyLen) == key:
+            let start: int32 = i + keyLen
+            var stop: int32 = start
+            while stop < n:
+                let ch: char = line[stop]
+                if (ch >= '0' && ch <= '9') || ch == '.':
+                    stop = stop + 1
+                else:
+                    break
+            if stop > start:
+                return strings.sliceBytes(line, start, stop - start)
+            return ""
+        i = i + 1
+    return ""
+
+fn v3BenchParseDecimalMilli(raw: str): int64 =
+    if len(raw) <= 0:
+        return -1
+    var whole: int64 = 0
+    var frac: int64 = 0
+    var fracDigits: int32 = 0
+    var seenDot: bool = false
+    for i in 0..<len(raw):
+        let ch: char = raw[i]
+        if ch == '.':
+            if seenDot:
+                return -1
+            seenDot = true
+        elif ch >= '0' && ch <= '9':
+            let digit: int64 = int64(int32(ch) - int32('0'))
+            if !seenDot:
+                whole = whole * int64(10) + digit
+            elif fracDigits < 3:
+                frac = frac * int64(10) + digit
+                fracDigits = fracDigits + 1
+        else:
+            return -1
+    while fracDigits < 3:
+        frac = frac * int64(10)
+        fracDigits = fracDigits + 1
+    return whole * int64(1000) + frac
+
+fn v3BenchDatasetLookup(dataset: V3BenchDataset, benchId: langintern.V3InternId): int64 =
+    for i in 0..<dataset.samples.len:
+        let sample: V3BenchSample = dataset.samples[i]
+        if sample.benchId == benchId:
+            return sample.nsPerOpMilli
+    return -1
+
+fn v3BenchDatasetLoadText(pool: langintern.V3InternPool, text: str): V3BenchDataset =
+    var out: V3BenchDataset
+    out.samples = []
+    let lines: str[] = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let line: str = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if strutil.startsWith(line, "sink="):
+            continue
+        let name: str = v3BenchFirstField(line)
+        let nsText: str = v3BenchFindValue(line, "ns_per_op=")
+        let nsMilli: int64 = v3BenchParseDecimalMilli(nsText)
+        if len(name) <= 0 || nsMilli < int64(0):
+            continue
+        let benchId: langintern.V3InternId = langintern.v3Intern(pool, name)
+        out.samples.add(V3BenchSample(benchId: benchId, nsPerOpMilli: nsMilli))
+    return out
+
+fn v3BenchDatasetLoadFile(pool: langintern.V3InternPool, path: str): V3BenchDataset =
+    if !os.fileExists(path):
+        return V3BenchDataset(samples: [])
+    return v3BenchDatasetLoadText(pool, os.readFile(path))
+
+fn v3BenchCompare(base: V3BenchDataset, candidate: V3BenchDataset, maxRatioMilli: int64): V3BenchCompare =
+    var rows: V3BenchCompareRow[] = []
+    var ok: bool = true
+    for i in 0..<base.samples.len:
+        let sample: V3BenchSample = base.samples[i]
+        let candidateMilli: int64 = v3BenchDatasetLookup(candidate, sample.benchId)
+        var row: V3BenchCompareRow
+        row.benchId = sample.benchId
+        row.baseNsPerOpMilli = sample.nsPerOpMilli
+        row.candidateNsPerOpMilli = candidateMilli
+        row.ratioMilli = -1
+        row.missingCandidate = candidateMilli < int64(0)
+        row.missingBaseline = false
+        row.tooSlow = false
+        if row.missingCandidate:
+            ok = false
+        else:
+            row.ratioMilli = (candidateMilli * int64(1000)) div sample.nsPerOpMilli
+            if maxRatioMilli > int64(0) && row.ratioMilli > maxRatioMilli:
+                row.tooSlow = true
+                ok = false
+        rows.add(row)
+    for i in 0..<candidate.samples.len:
+        let sample: V3BenchSample = candidate.samples[i]
+        if v3BenchDatasetLookup(base, sample.benchId) >= int64(0):
+            continue
+        rows.add(V3BenchCompareRow(
+            benchId: sample.benchId,
+            baseNsPerOpMilli: -1,
+            candidateNsPerOpMilli: sample.nsPerOpMilli,
+            ratioMilli: -1,
+            missingCandidate: false,
+            missingBaseline: true,
+            tooSlow: false
+        ))
+        ok = false
+    return V3BenchCompare(rows: rows, ok: ok)
+
+fn v3BenchMilliText(value: int64): str =
+    if value < int64(0):
+        return "missing"
+    let whole: int64 = value div int64(1000)
+    let frac: int64 = value mod int64(1000)
+    var fracText: str = intToStr(int32(frac))
+    if frac < int64(10):
+        fracText = "00" + fracText
+    elif frac < int64(100):
+        fracText = "0" + fracText
+    return intToStr(int32(whole)) + "." + fracText
+
+fn v3BenchCompareReport(pool: langintern.V3InternPool, compare: V3BenchCompare): str =
+    var rows: str[] = []
+    rows.add("bench base_ns cand_ns ratio")
+    for i in 0..<compare.rows.len:
+        let row: V3BenchCompareRow = compare.rows[i]
+        let benchNameRes = langintern.v3LookupIntern(pool, row.benchId)
+        var benchName: str = "unknown"
+        if IsOk(benchNameRes):
+            benchName = Value(benchNameRes)
+        var ratioText: str = "NA"
+        if row.ratioMilli >= int64(0):
+            ratioText = v3BenchMilliText(row.ratioMilli)
+        rows.add(
+            benchName + " " +
+            v3BenchMilliText(row.baseNsPerOpMilli) + " " +
+            v3BenchMilliText(row.candidateNsPerOpMilli) + " " +
+            ratioText
+        )
+    if compare.ok:
+        rows.add("v3 compare: ok")
+    else:
+        rows.add("v3 compare: failed")
+    return strutil.join(rows, "\n") + "\n"

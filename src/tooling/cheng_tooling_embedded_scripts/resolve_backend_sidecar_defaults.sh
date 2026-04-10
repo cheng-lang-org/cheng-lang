@@ -434,7 +434,7 @@ if [ -f "$snapshot" ]; then
      repo_stable_exec_ok "$snapshot_compiler" &&
      repo_stable_exec_ok "$snapshot_driver" &&
      repo_stable_exec_ok "$snapshot_real_driver" &&
-     strict_stage0_published_surface "$snapshot_real_driver" &&
+     (strict_stage0_published_surface "$snapshot_real_driver" || strict_stage0_bootstrap_surface "$snapshot_real_driver") &&
      strict_stage0_meta_ok "$snapshot_real_driver" &&
      strict_stage0_current_enough "$snapshot_real_driver" &&
      [ "$snapshot_bundle" != "" ] &&

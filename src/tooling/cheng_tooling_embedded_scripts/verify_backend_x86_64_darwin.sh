@@ -44,18 +44,6 @@ run_driver_compile() {
       --output:"$output"
 }
 
-is_silent_rc223() {
-  status="$1"
-  log="$2"
-  if [ "$status" -ne 223 ]; then
-    return 1
-  fi
-  if [ ! -s "$log" ]; then
-    return 0
-  fi
-  ! grep -v -e '^target=' -e '^[[:space:]]*$' "$log" >/dev/null 2>&1
-}
-
 nm_has_symbol() {
   file="$1"
   pattern="$2"
@@ -76,7 +64,7 @@ set +e
 run_driver_compile 0 system "$probe_fixture" "$probe_out" >"$probe_log" 2>&1
 probe_status="$?"
 set -e
-if [ "$probe_status" -ne 0 ] && { rg -q "host-only expects aarch64/arm64" "$probe_log" || is_silent_rc223 "$probe_status" "$probe_log"; }; then
+if [ "$probe_status" -ne 0 ] && rg -q "host-only expects aarch64/arm64" "$probe_log"; then
   echo "verify_backend_x86_64_darwin skip: host-only driver does not support x86_64 target" 1>&2
   exit 2
 fi

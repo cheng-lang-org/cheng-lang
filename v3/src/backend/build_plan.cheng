@@ -1,0 +1,67 @@
+import ../tooling/bootstrap_contracts as contracts
+import ../tooling/path as v3path
+import std/strutils as strutil
+
+type
+    V3BackendTarget = enum
+        v3BackendArm64AppleDarwin
+
+    V3BackendLinker = enum
+        v3BackendLinkerBootstrapMaterialize
+
+    V3BackendSourceRole = enum
+        v3BackendBootstrapSource
+        v3BackendSeedSource
+        v3BackendToolingSource
+
+    V3BackendSourceUnit =
+        role: V3BackendSourceRole
+        path: str
+
+    V3BackendBuildPlan =
+        target: V3BackendTarget
+        targetTriple: str
+        linker: V3BackendLinker
+        entryPath: str
+        outputPath: str
+        stage2CompilerPath: str
+        sourceUnits: V3BackendSourceUnit[]
+
+fn v3BackendBuildPlanAdd(dst: var V3BackendSourceUnit[], role: V3BackendSourceRole, path: str) =
+    dst.add(V3BackendSourceUnit(role: role, path: path))
+
+fn v3BackendBuildPlanDefault(rootDir: str): V3BackendBuildPlan =
+    var units: V3BackendSourceUnit[] = []
+    v3BackendBuildPlanAdd(units, v3BackendBootstrapSource, contracts.v3BootstrapStage1SourcePath(rootDir))
+    v3BackendBuildPlanAdd(units, v3BackendSeedSource, contracts.v3BootstrapSeedSourcePath(rootDir))
+    v3BackendBuildPlanAdd(units, v3BackendToolingSource, v3path.v3PathAbsolute(rootDir, "v3/src/tooling/bootstrap_contracts.cheng"))
+    v3BackendBuildPlanAdd(units, v3BackendToolingSource, v3path.v3PathAbsolute(rootDir, "v3/src/backend/build_plan.cheng"))
+    v3BackendBuildPlanAdd(units, v3BackendToolingSource, v3path.v3PathAbsolute(rootDir, "v3/tooling/build_backend_driver_v3.sh"))
+    return V3BackendBuildPlan(
+        target: v3BackendArm64AppleDarwin,
+        targetTriple: contracts.v3BootstrapDefaultTarget(),
+        linker: v3BackendLinkerBootstrapMaterialize,
+        entryPath: contracts.v3BootstrapStage1SourcePath(rootDir),
+        outputPath: contracts.v3BootstrapBackendDriverOutPath(rootDir),
+        stage2CompilerPath: contracts.v3BootstrapStage2Path(rootDir),
+        sourceUnits: units
+    )
+
+fn v3BackendSourceRoleText(role: V3BackendSourceRole): str =
+    if role == v3BackendBootstrapSource:
+        return "bootstrap_source"
+    if role == v3BackendSeedSource:
+        return "seed_source"
+    return "tooling_source"
+
+fn v3BackendBuildPlanReport(plan: V3BackendBuildPlan): str =
+    var rows: str[] = []
+    rows.add("target=" + plan.targetTriple)
+    rows.add("linker=bootstrap_materialize")
+    rows.add("stage2_compiler=" + plan.stage2CompilerPath)
+    rows.add("entry=" + plan.entryPath)
+    rows.add("output=" + plan.outputPath)
+    for i in 0..<plan.sourceUnits.len:
+        let unit: V3BackendSourceUnit = plan.sourceUnits[i]
+        rows.add("source[" + intToStr(i) + "]=" + v3BackendSourceRoleText(unit.role) + ":" + unit.path)
+    return strutil.join(rows, "\n") + "\n"

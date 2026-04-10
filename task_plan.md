@@ -2,6 +2,62 @@
 
 | 项目 | 内容 |
 |---|---|
+| 目标 | 承认 `src/tooling/cheng_tooling.cheng` 属于旧链后，把 `v3` 的主控、bootstrap 合同、backend build plan、性能 gate 全部落回 `v3` 目录；`run_slice_gate.sh` 只认 `v3/tooling` 的 bridge/build 入口，不再把旧总控当 `v3` 主链。 |
+| 主线 | 这轮已经开始把 `v3/src/tooling/{path,host_ops,bootstrap_contracts,hotpath_scan,perf_gate,gate_main}.cheng`、`v3/src/backend/build_plan.cheng`、`v3/src/tests/{bootstrap_contracts_smoke,perf_gate_smoke}.cheng` 全部落库，并新增 `v3/tooling/{cheng_v3,bootstrap_bridge_v3,build_backend_driver_v3}.sh`。`bootstrap_bridge_v3.sh` 仍只把旧脚本当 bootstrap bring-up 外根，`build_backend_driver_v3.sh` 直接用 bootstrap driver + `chengc.sh` 编 `src/backend/tooling/backend_driver.cheng`，不再走旧总控子命令。当前还没跑通纯 Cheng `gate_main`，因为仓库现有 backend driver compile 仍会在更早位置炸掉。 |
+| 文件 | `v3/src/tooling/path.cheng` `v3/src/tooling/host_ops.cheng` `v3/src/tooling/bootstrap_contracts.cheng` `v3/src/tooling/hotpath_scan.cheng` `v3/src/tooling/perf_gate.cheng` `v3/src/tooling/gate_main.cheng` `v3/src/backend/build_plan.cheng` `v3/src/tests/bootstrap_contracts_smoke.cheng` `v3/src/tests/perf_gate_smoke.cheng` `v3/tooling/cheng_v3.sh` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再把 `src/tooling/cheng_tooling.cheng` 视为 `v3` 入口；不把旧 sidecar wrapper/outer driver 整包搬进 `v3`；不把 seed binary 误说成 `v3` 源码主控。 |
+| 验收 | `run_slice_gate.sh` 必须改成走 `v3/tooling/bootstrap_bridge_v3.sh` 和 `v3/tooling/build_backend_driver_v3.sh`；`v3/src/tooling` 必须出现真类型化合同和真 perf gate 代码；当前失败点必须继续暴露真实 backend/bootstrap 阻塞，而不是回退到旧命令分发层。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 清掉 `src/tooling` 和 `src/backend/tooling` 里已经确认无引用的 sidecar 死残片，同时把 `v3` 编译工具链入口改成“源码 launcher + strict bootstrap bridge”，不再默认绑死旧 binary 和缺失的 `cheng.stage2{,.proof}`。 |
+| 主线 | 这轮已经做了三件事：一是删掉 32 个已跟踪的 `src/tooling/cheng_sidecar_rewrite_*.cheng`、`src/tooling/cheng_tooling_embedded_stable.cheng`、`src/backend/tooling/backend_driver_uir_sidecar_direct_build.cheng`，并清掉源码树里残留的未跟踪 sidecar 重写文件和 `.o/.DS_Store`；二是把 `src/tooling/cheng_tooling.cheng`、`verify_backend_sidecar_cheng_fresh.sh`、`resolve_backend_sidecar_defaults.sh`、`backend_driver_currentsrc_sidecar_wrapper.sh`、`cheng_tooling.sh` 一起改成接受 `probe_currentsrc_proof/cheng_stage0_currentsrc.proof` 作为严格 bootstrap bridge；三是把 `v3/tooling/run_slice_gate.sh` 默认工具切到源码 launcher，并先跑 fresh sidecar bridge 再跑 `build-backend-driver`。当前 fresh gate 已经不再卡“published strict stage0 surface / real sidecar driver missing strict direct-export surface / missing strict sidecar mode contract”这些旧死点，但 wrapper-source build 还没闭合，日志目前为空。 |
+| 文件 | `src/tooling/cheng_tooling.cheng` `src/tooling/cheng_tooling_embedded_scripts/backend_driver_currentsrc_sidecar_wrapper.sh` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_sidecar_cheng_fresh.sh` `src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh` `src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh` `v3/tooling/run_slice_gate.sh` `v3/tooling/README.md` `v3/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 bootstrap bridge 包装成最终主链；不回退去改 `backend_driver_symbol_bridge.c` 热路径；不再保留 sidecar 随机重写残片污染源码树。 |
+| 验收 | `src/tooling` 顶层不再残留任何 `cheng_sidecar_rewrite_*.cheng`；`v3/tooling/run_slice_gate.sh` 默认必须走源码 launcher；fresh sidecar gate 必须至少前进到 wrapper-source 真编译阶段，不再死在旧合同识别上。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续打穿 `build-backend-driver` 真阻塞，把 `stage0 capability` source list 和 `system/seqs` 导入环一起收口，不再让旧 launcher/旧 sidecar 编译器把 `v3` gate 卡死在假缺项上。 |
+| 主线 | 这轮已经做了三件硬事：`src/std/system.cheng` 删掉无效 `import std/seqs`；`src/tooling/cheng_tooling.cheng` 的 `tooling_stage0CapabilitySourceList()` 改成“固定主链 + 运行时扫描 `uir_core_builder*.cheng` + 静态名单回落”；同时确认 `cheng_tooling.cheng` 默认输出是 launcher，只有 `TOOLING_EMIT_SELFHOST_LAUNCHER=0` 才会尝试直出 native。本轮还没把 canonical tooling native binary 真重编成功，当前强制 native compile 仍在 `artifacts/backend_driver/cheng` 上 `rc=223`，而且旧执行面继续把假 source-list 缺项带出来。 |
+| 文件 | `src/std/system.cheng` `src/tooling/cheng_tooling.cheng` `src/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 `TOOLING_STAGE0_CAPABILITY_PREFLIGHT=0` 当最终方案；不把 launcher 壳误算成当前源码 native binary；不回退 `v3` 的固定布局/二进制接口。 |
+| 验收 | `system/seqs` 导入环必须从源码面消失；`tooling_stage0CapabilitySourceList()` 必须改成 builder 文件运行时扫描优先；记录必须明确写出“`cheng_tooling.cheng` 默认产物是 launcher，强制 native compile 仍未闭合，当前 canonical tooling 执行面仍旧”。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 在 `v3` 把冷路径字符串 interner、`HIR/MIR/LIR` 固定 ID 骨架、冻结 C 基线和脚本化验收入口一起落库，让“不能退回字符串热路径”从口头约束变成文件和命令。 |
+| 主线 | 这轮不碰仓库现有 backend driver 活根，也不把它误算成 `v3` 代码问题；先把 `v3/src/lang/intern.cheng`、`v3/src/ir/core_types.cheng`、`v3/src/tests/ir_core_smoke.cheng`、`v3/tooling/{scan_forbidden_hotpath,compare_bench,run_slice_gate}.sh`、`v3/bench/c_ref/baseline_arm64_apple_darwin.txt` 落库，再用 `run_slice_gate.sh` 证明 `scan + c_ref` 已闭合、当前真实阻塞继续在仓库全局 `build-backend-driver`。 |
+| 文件 | `v3/src/lang/intern.cheng` `v3/src/ir/core_types.cheng` `v3/src/tests/ir_core_smoke.cheng` `v3/tooling/scan_forbidden_hotpath.sh` `v3/tooling/compare_bench.sh` `v3/tooling/run_slice_gate.sh` `v3/bench/c_ref/baseline_arm64_apple_darwin.txt` `v3/README.md` `v3/lang/README.md` `v3/ir/README.md` `v3/tooling/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不去改当前 backend driver/source-list/import-cycle 老根；不把脚本写成只会报喜不报错的壳；不把 `v3` 名字、类型、IR 再退回 `str` 驱动。 |
+| 验收 | `v3/tooling/scan_forbidden_hotpath.sh` 必须直接执行通过；`v3/tooling/compare_bench.sh` 必须能对拍冻结基线和最新 C 结果；`v3/tooling/run_slice_gate.sh` 必须稳定先过 `scan + c_ref + frozen-vs-latest`，再在现有 `build-backend-driver` 真故障点失败并留下日志。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 在 `v3` 先落固定布局字节面、固定 256 位 crypto 接口、二进制链帧和同机 C 基线，先把“性能地基”和“文本协议切除”真正变成文件与命令。 |
+| 主线 | 这轮不碰 `v2` 活体热链，也不假装一口气做完整自举；先把 `v3/cheng-package.toml`、`v3/src/std/...`、`v3/src/chain/...`、`v3/bench/c_ref/*` 落库。当前 Cheng smoke 不是 `v3` 单点错误，而是仓库现有 canonical backend driver 全局 `rc=223`；`build-backend-driver` 继续向下暴露的是现有 `src/std/system.cheng -> src/std/seqs.cheng -> src/std/system.cheng` 导入环。 |
+| 文件 | `v3/cheng-package.toml` `v3/README.md` `v3/src/std/bytes_layout.cheng` `v3/src/std/crypto/fixed256.cheng` `v3/src/chain/binary_types.cheng` `v3/src/chain/codec_binary.cheng` `v3/src/tests/fixed_surface_smoke.cheng` `v3/src/tests/chain_codec_binary_smoke.cheng` `v3/bench/c_ref/bench_ref.c` `v3/bench/c_ref/Makefile` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把当前坏 driver 当成 `v3` 代码问题乱改；不把 `v3` 再塞回 `v2` 文本帧；不做 package import 兜底壳。 |
+| 验收 | `v3/bench/c_ref` 必须真编真跑；`v3` 下固定布局类型、固定 256 位 crypto 接口、二进制链帧和 smoke 文件全部落库；记录必须明确写出“当前 Cheng smoke 被现有 driver 全局故障挡住，不是 `v3` 单点语义错误”。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续推进 `program` 热路径和值表示，但这轮已经先把 runtime 的 `array/record type_text` 收成全局 intern 稳定指针，并把 `program-selfhost` 扩成真实多进程 `chain_node serve-once/sync-once` gate。下一刀直接打固定布局 `slot/shape` 和 aggregate `field/index update copy`。 |
+| 主线 | `system_helpers_stdio_bridge.c` 现在不再对每个 `array.elem_type_text / record.type_text` 做重复 `dup/free`，而是统一走全局 intern 表；`cheng_v2c_tooling.c` 的 `program-selfhost-check` 也已经正式加入 `chain_node_process_smoke`，固定要求 stage2 编译器真编真跑多进程 `mint -> serve-once -> sync-once -> balance`。完整前台 gate 已重新收口到 `manifest_fnv1a64=b55b66018e18ab44`。当前真主根没变，还是固定布局 `slot/shape` 和 aggregate `field/index update copy`。 |
+| 文件 | `src/runtime/native/system_helpers_stdio_bridge.c` `v2/bootstrap/cheng_v2c_tooling.c` `v2/tests/contracts/compiler_core_system_link_exec.expected` `v2/tests/contracts/program_selfhost.expected` `v2/tests/contracts/full_selfhost.expected` `v2/docs/自举和性能.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把这轮说成热层已完成；不回头碰已经闭合的 `fresh slot/nil slot/shared-shape/field ordinal`；不再把单进程 `msquic_chain_smoke` 当生产 gate |
+| 验收 | 完整前台 gate `compiler-core-release -> full-selfhost` 必须继续通过；`program-selfhost` 必须继续真跑多进程 `chain_node_process_smoke`；记录必须明确写出“type_text intern 和真实多进程 gate 已收口，当前真根仍是固定布局 `slot/shape` 和 aggregate `field/index update copy`”。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续推进 `program` 热路径和值表示，但这轮先把 `fresh slot` 直写和 `nil slot` 新建 aggregate 的 temp 所有权收进 runtime，再继续打固定布局 `slot/shape` 和 aggregate field/index update copy。 |
+| 主线 | 这轮已经把 `MAKE_ARRAY/MAKE_RECORD/array_push/add/setLen/reserve/field-index create_if_nil` 收成新槽位直写：新建 aggregate 不再先走通用 `assign_slot` 再深拷一次，`nil slot` 也不再白白 clone 一个刚创建的空 `array/record`。`compiler_core_system_link_exec/program-selfhost/full-selfhost` 已重新收口到 `manifest_fnv1a64=b8a740987bf39861`。前台 3 次中位数当前是 `pubkey=1.1300s`、`sign=1.6300s`、`mul_xonly=1.3200s`、`kinv=0.7000s`。下一刀不回头补这条已闭合路径，直接打固定布局 `slot/shape` 和 aggregate field/index update copy。 |
+| 文件 | `src/runtime/native/system_helpers_stdio_bridge.c` `v2/tests/contracts/compiler_core_system_link_exec.expected` `v2/tests/contracts/program_selfhost.expected` `v2/tests/contracts/full_selfhost.expected` `v2/docs/自举和性能.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把这轮说成热层已完成；不回头碰已收口的 `field ordinal + record slot`；不回到 probe 式乱试 `TrustedInto` 直连 |
+| 验收 | `p256_fixed_core_probe` 必须继续 `probe=ok p_mul=1 n_mul=1 p_square=1 n_square=1`；`compiler_core_system_link_exec/program-selfhost/full-selfhost` 必须继续通过；记录必须明确写出“fresh slot/nil slot aggregate 白 clone 已切掉，当前真根仍是固定布局 `slot/shape` 和 aggregate field/index update copy”。 |
+
+| 项目 | 内容 |
+|---|---|
 | 目标 | 继续推进 `program` 热路径和值表示，但这轮先把 `field ordinal + record slot` 这条固定布局主链在 source/stage0/runtime 三层收齐，再继续打固定布局 `slot/shape` 和 aggregate field/index update copy。 |
 | 主线 | 这轮已经把 source 的 `stmtAssignTargetFieldOrdinals` 正式接进 stage0 facts/high_uir/low_uir mirror，`addr_of_field/load_field/store_*field` 不再只靠字段名；runtime 侧也把 `driver_c_prog_record_slot_at(...)` 收成正式 slot 入口，并把两处“已知 decl 顺序还按字段名找 slot”的路径改成按 ordinal 直达。完整前台 gate 已在这轮 fixed point 上收口到 `manifest_fnv1a64=29cea01991c4689b`，`program-selfhost/full-selfhost` 继续通过。下一刀不回头补这条已闭合路径，直接打固定布局 `slot/shape` 和 aggregate field/index update copy。 |
 | 文件 | `v2/bootstrap/cheng_v2c_tooling.c` `src/runtime/native/system_helpers_stdio_bridge.c` `v2/tests/contracts/compiler_core_release_artifact.expected` `v2/tests/contracts/compiler_core_system_link_plan.expected` `v2/tests/contracts/compiler_core_system_link_exec.expected` `v2/tests/contracts/program_selfhost.expected` `v2/tests/contracts/full_selfhost.expected` `v2/docs/自举和性能.md` `task_plan.md` `progress.md` `findings.md` |
@@ -315,7 +371,55 @@
 | 项目 | 内容 |
 |---|---|
 | 目标 | 继续完成 `program` 热路径和值表示，先把 typed `record` 的固定布局 lookup 从声明面一路接到运行面 |
-| 主线 | 这轮已经在 `src/runtime/native/system_helpers_stdio_bridge.c` 里给 `TypeDecl/ZeroPlan` 增加共享 `field_lookup`，并让 `zero_value_from_plan()/zero_record_shell_from_plan()` 直接复用，不再为 typed record 每次重建 field lookup。随后 `compiler_core_system_link_exec/program_selfhost/full_selfhost` 全部在新 fixed point `manifest_fnv1a64=e4aa17192dd2cde3` 下前台重新收口。下一刀不再碰这条已闭合链，直接打固定布局 `slot/shape` 和 aggregate `field/index update copy`。 |
+| 主线 | 这轮已经在 `src/runtime/native/system_helpers_stdio_bridge.c` 里把 typed `record` 的固定布局初始化继续接到 runtime：`TypeDecl/ZeroPlan` 共享 `field_lookup` 会被 `zero_value_from_plan()/zero_record_shell_from_plan()` 直接复用，`MAKE_RECORD` 也会直接按 decl shape 初始化并在顺序一致时跳过字段名查找。随后 `compiler_core_system_link_exec/program_selfhost/full_selfhost` 已在当前 tree manifest `manifest_fnv1a64=fee6dad00582e08f` 下前台重新收口。下一刀不再碰这条已闭合链，直接打固定布局 `slot/shape` 和 aggregate `field/index update copy`。 |
 | 文件 | `src/runtime/native/system_helpers_stdio_bridge.c` `v2/tests/contracts/compiler_core_system_link_exec.expected` `v2/tests/contracts/program_selfhost.expected` `v2/tests/contracts/full_selfhost.expected` `v2/docs/自举和性能.md` `task_plan.md` `progress.md` `findings.md` |
 | 不做 | 不回头再做 `field name lookup` 兜底；不继续 rebuild typed record lookup；不把已过的 `program-selfhost/full-selfhost` 再当成当前主根 |
 | 验收 | `make -j1 -C /Users/lbcheng/cheng-lang/v2/bootstrap compiler-core-release compiler-core-system-link compiler-core-system-link-exec tooling-selfhost lsmr-contracts selfhost full-selfhost` 必须前台通过；`pubkey/sign/mul/kinv` probe 必须以前台重编后的二进制重新量到真实中位数。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 继续把 `v3` 自举入口和 fresh bootstrap bridge 变成可诊断、可收敛的真工具链，不再允许 `rc=223` 和 `wrapper-source build` 失败变成黑盒 |
+| 主线 | 这轮先把 [cheng_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh) 的外层日志从 seed 内层 `out.compile.log` 同名冲突里拆出来，再把 [verify_backend_sidecar_cheng_fresh.sh](/Users/lbcheng/cheng-lang/src/tooling/cheng_tooling_embedded_scripts/verify_backend_sidecar_cheng_fresh.sh) 的 `wrapper-source build` 失败显式打印成 `rc/kind/hint/log`。随后继续顺着 fresh bridge 拆根：proof launcher 现在会尊重 `BACKEND_UIR_SIDECAR_DISABLE=1`，`backend_driver_currentsrc_sidecar_wrapper.sh` 也不再对 bootstrap proof surface 偷开 `wrapper_preserve_sidecar=1`。结果是 `v3` gate 已从“静默 timeout”推进成确定性的 `rc=223 kind=deterministic_exit_223`，并稳定暴露下一处真阻塞 `backend_driver sidecar: missing strict sidecar mode contract`。 |
+| 文件 | `v3/tooling/cheng_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/README.md` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_sidecar_cheng_fresh.sh` `src/tooling/cheng_tooling_embedded_scripts/backend_driver_currentsrc_sidecar_wrapper.sh` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_currentsrc_proof.sh` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_bootstrap_self_obj.sh` `artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 `223` 继续伪装成 `signal`；不再让 bootstrap bridge 用 timeout 吞掉真实错误；不回退到旧 `src/tooling/cheng_tooling.cheng` 当 `v3` 主入口 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh print-bootstrap` 必须直接打印 `rc=223 kind=deterministic_exit_223` 和 seed 原始日志；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 与 `sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须稳定打印 `rc=223 kind=deterministic_exit_223` 和 `missing strict sidecar mode contract`，不再只报 timeout 黑盒。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v2` 已经踩过的性能坑和自举坑正式写进 `v3/docs`，并收成 `v3` 当前开发计划的硬约束 |
+| 主线 | 这轮已新增 [v3/docs/README.md](/Users/lbcheng/cheng-lang/v3/docs/README.md)、[v3/docs/v2已踩性能和自举坑.md](/Users/lbcheng/cheng-lang/v3/docs/v2已踩性能和自举坑.md)、[v3/docs/自举和性能开发计划.md](/Users/lbcheng/cheng-lang/v3/docs/自举和性能开发计划.md)，把 `v2/docs/自举和性能.md`、`v2/docs/baguaCSG.md`、`v2/docs/LSMR.md`、当前 `findings.md` 和现有实现里的坑统一收成 `v3` 硬禁令和里程碑；[v3/README.md](/Users/lbcheng/cheng-lang/v3/README.md) 也已接上文档入口。 |
+| 文件 | `v3/docs/README.md` `v3/docs/v2已踩性能和自举坑.md` `v3/docs/自举和性能开发计划.md` `v3/README.md` `lessons.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把长篇计划继续塞进 `v3/README.md` 或 `v3/tooling/README.md`；不再用 `v3/doc` 这种错误目录名 |
+| 验收 | `v3/docs` 目录必须存在且三份文档都能直接打开；计划文档必须显式写出 `stage2/stage3`、同机 C `1:1`、AOT-only、bagua/BPI sidecar-only 和 `program-selfhost + chain_node` 这些约束。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 按用户要求把 `v3` 之前的编译产物和旧编译工具链全部移除，然后只靠干净 seed 重新拉起 `v3` 的自举入口和性能基线 |
+| 主线 | 这轮已经删除根目录 `artifacts/chengcache/build/dist`、根旧二进制 `backend_closedloop_fullspec`，并把 `v2/artifacts` 也整目录清空后重编。干净环境下，`make -C /Users/lbcheng/cheng-lang/v2/bootstrap all` 已重新产出 `v2/artifacts/bootstrap/cheng_v2_bootstrap` 和 `v2/artifacts/bootstrap/cheng_v2c`；`make -C /Users/lbcheng/cheng-lang/v3/bench/c_ref clean run` 和 `v3/tooling/scan_forbidden_hotpath.sh` 也已从零重跑通过。现在 `v3/tooling/bootstrap_bridge_v3.sh` 在纯净环境下直接失败为 `missing executable bridge driver: artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng_stage0_currentsrc.proof`，同时干净 `v2` seed 再跑 `tooling-selfhost-host` 仍然稳定卡 `release stdout mismatch`，手拆 `tooling_stage1_bootstrap` 继续会撞上 `program_entry_exec_plan_missing local_payload_*`。这说明旧产物之前确实遮住了真根，而真根正是 `v2` 老 bootstrap 里那条 `local_payload/exec_plan` 路。 |
+| 文件 | `src/tooling/cheng_tooling_embedded_scripts/backend_seed_pure.sh` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_currentsrc_proof.sh` `src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_bootstrap_self_obj.sh` `v3/src/tooling/bootstrap_contracts.cheng` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不恢复任何旧 `artifacts` 或 `chengcache`；不拿旧 `probe_currentsrc_proof` 产物蒙混过关；不对 `tooling-selfhost-host` 的 `release stdout mismatch` 和 `local_payload` 断点做兜底跳过 |
+| 验收 | `v2/artifacts/bootstrap/cheng_v2_bootstrap` 和 `v2/artifacts/bootstrap/cheng_v2c` 必须从零重编；`v3` C 基线必须从零重跑；`v3` bootstrap 必须在纯净环境下给出真实缺口，而不是继续吃旧 bridge driver。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3/docs/cheng-plan-full.md`、`v3/docs/LSMR.md`、`v3/docs/baguaCSG.md`、`v3/docs/自举和性能.md` 收成一份统一的 `cheng v3` 特性矩阵和开发计划 |
+| 主线 | 新总览必须把四份文档的边界彻底收正：`HIR/MIR/LIR` 才是权威语义，`bagua/BPI` 只做 sidecar；`LSMR/CSG/反熵/共识` 直接迁语义和 smoke，不直接搬 `v2` 的字符串实现壳；`自举/性能` 只认 `stage2/stage3 + 同机 C 1:1 + AOT-only + program-selfhost + chain_node`。同时把当前发现的结构冲突明写出来，尤其是 `v3` 现有链地址 digit 还写成 `0..7`，和洛书 `1..9` 语义不一致。 |
+| 文件 | `v3/docs/cheng语言特性矩阵和开发计划.md` `v3/docs/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不删除原始四份文档；不把 `bagua/BPI` 重新提升成新 IR；不把 `v2` 的 canonical text、`payloadText`、`topicCid/payloadSummary` 文本壳带进 `v3` 计划 |
+| 验收 | `v3/docs/cheng语言特性矩阵和开发计划.md` 必须明确写出特性矩阵、统一边界、阶段计划、正式 gate、禁止回流项，并被 `v3/docs/README.md` 收进索引。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` bootstrap/tooling 主线彻底切到 `v3/bootstrap` 极小 seed，并让整条 `v3` slice gate 在不依赖旧 `probe_currentsrc_proof/sidecar/tooling_cmd` 的前提下真跑通过 |
+| 主线 | 这轮已经把 `v3/tooling/{bootstrap_bridge_v3,build_backend_driver_v3,run_slice_gate,cheng_v3}.sh`、`v3/src/tooling/bootstrap_contracts.cheng`、`v3/src/backend/build_plan.cheng`、`v3/src/tests/bootstrap_contracts_smoke.cheng` 全部切到新主线。当前真实链路是：`cc` 先编 `v3/bootstrap/cheng_v3_seed.c` 得到 `cheng.stage0`，再由 `stage0 -> stage1 -> stage2 -> stage3` 连续 `compile-bootstrap`；`build_backend_driver_v3.sh` 直接用 `stage2` 物化 `artifacts/v3_backend_driver/cheng`；`run_slice_gate.sh` 只认 `scan + C baseline + bootstrap bridge + backend driver + bootstrap subset self-check + contract equivalence`，不再回落到旧 `tooling_cmd/cheng_tooling`。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/tooling/cheng_v3.sh` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `v3/tooling/run_slice_gate.sh` `v3/src/tooling/bootstrap_contracts.cheng` `v3/src/backend/build_plan.cheng` `v3/src/tests/bootstrap_contracts_smoke.cheng` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再依赖 `probe_currentsrc_proof/cheng_stage0_currentsrc.proof`；不再调用旧 `verify_backend_sidecar_cheng_fresh.sh`；不再用旧 `tooling_cmd/cheng_tooling` 跑 `v3` 主 gate；不把 Mach-O 可执行字节硬比当 Darwin 下的 fixed-point 唯一口径 |
+| 验收 | `sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须通过；`sh /Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh print-bootstrap` 和 `print-build-plan` 必须直接输出新 `v3/bootstrap` 路径，不再出现旧 proof 术语。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` 里最后残留的旧 bootstrap/tooling 引用彻底清零，并让入口代码、bootstrap 合同、README、实际 gate 三者完全一致 |
+| 主线 | 这轮已经把 `v3/src/tooling/gate_main.cheng` 的 `run-smokes` 改成只认 `artifacts/v3_bootstrap/cheng.stage0~3` 的 `self-check`，删掉旧 `artifacts/tooling_cmd/cheng_tooling` 默认值；同时把 `v3/bootstrap/cheng_v3_seed.c` 和 `v3/bootstrap/stage1_bootstrap.cheng` 里的旧 proof 禁词改成泛化的 `legacy_proof_surface/legacy_sidecar_mode`，并把 `v3/README.md`、`v3/tooling/README.md`、`v3/bootstrap/README.md` 全部收正到 `seed -> stage0 -> stage1 -> stage2 -> stage3` 主线。随后 `rg` 扫描 `v3` 已确认零命中旧 proof/tooling 词，`bootstrap_bridge_v3.sh`、`build_backend_driver_v3.sh`、`cheng_v3.sh run-smokes`、`run_slice_gate.sh` 也都前台通过。 |
+| 文件 | `v3/src/tooling/gate_main.cheng` `v3/bootstrap/cheng_v3_seed.c` `v3/bootstrap/stage1_bootstrap.cheng` `v3/README.md` `v3/tooling/README.md` `v3/bootstrap/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不回头恢复任何旧 proof/path 兼容描述；不把 README 写成与实际 gate 不一致的“假入口”；不再让 `v3` 活入口偷偷保留旧 `tooling_cmd` 回退 |
+| 验收 | `rg -n \"probe_currentsrc_proof|stage2_proof|stage3_witness|currentsrc_proof|tooling_cmd/cheng_tooling|cheng_stage0_currentsrc\\.proof|sidecar contract\" /Users/lbcheng/cheng-lang/v3 -S` 必须零命中；`sh /Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh`、`sh /Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh run-smokes`、`sh /Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh` 必须全部前台通过。 |

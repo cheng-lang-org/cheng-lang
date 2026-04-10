@@ -1,0 +1,73 @@
+import std/os
+import std/strutils as strutil
+import ./path as v3path
+
+type
+    V3LoggedRun =
+        label: str
+        filePath: str
+        logPath: str
+        exitCode: int32
+        output: str
+
+fn v3ExecFileDirect(filePath: str, argv: str[], envOverrides: str[],
+                    workingDir: str, timeoutSec: int32,
+                    capturePreferred: bool): os.ExecCmdResult =
+    if capturePreferred:
+        return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+    let directRc: int32 = os.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
+    if directRc == 0 || directRc == 124:
+        return os.ExecCmdResult(output: "", exitCode: directRc)
+    return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+
+fn v3ResolveProgram(root: str, nameRaw: str): str =
+    let name: str = strutil.strip(nameRaw)
+    if len(name) <= 0:
+        return ""
+    if strutil.contains(name, "/"):
+        let absolute: str = v3path.v3PathAbsolute(root, name)
+        if v3path.v3FileExistsNonEmpty(root, absolute):
+            return absolute
+        return ""
+    let probe: os.ExecCmdResult = os.execCmdEx("command -v " + os.quoteShell(name) + " 2>/dev/null", uint64(7), root)
+    if os.execCmdResultExitCode(probe) != 0:
+        return ""
+    return strutil.strip(os.execCmdResultOutput(probe))
+
+fn v3RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOverrides: str[],
+                   workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
+    let filePath: str = v3path.v3PathAbsolute(root, filePathRaw)
+    var workingDir: str = v3path.v3PathAbsolute(root, workingDirRaw)
+    if !v3path.v3PathNonEmpty(workingDirRaw):
+        workingDir = root
+    let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
+    let res: os.ExecCmdResult = v3ExecFileDirect(filePath, argv, envOverrides, workingDir, timeoutSec, true)
+    let _logged: bool = v3path.v3WriteTextFile(root, logPath, os.execCmdResultOutput(res))
+    return V3LoggedRun(
+        label: label,
+        filePath: filePath,
+        logPath: logPath,
+        exitCode: os.execCmdResultExitCode(res),
+        output: os.execCmdResultOutput(res)
+    )
+
+fn v3RunProgramLogged(root: str, label: str, programName: str, argv: str[], envOverrides: str[],
+                      workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
+    let programPath: str = v3ResolveProgram(root, programName)
+    if !v3path.v3PathNonEmpty(programPath):
+        let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
+        let _logged: bool = v3path.v3WriteTextFile(root, logPath, "missing executable: " + programName + "\n")
+        return V3LoggedRun(
+            label: label,
+            filePath: programName,
+            logPath: logPath,
+            exitCode: 127,
+            output: "missing executable: " + programName + "\n"
+        )
+    return v3RunFileLogged(root, label, programPath, argv, envOverrides, workingDirRaw, timeoutSec, logPathRaw)
+
+fn v3LoggedRunOk(run: V3LoggedRun): bool =
+    return run.exitCode == 0
+
+fn v3LoggedRunSummary(run: V3LoggedRun): str =
+    return run.label + " rc=" + intToStr(run.exitCode) + " log=" + run.logPath
