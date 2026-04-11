@@ -1,0 +1,125 @@
+import std/result
+import std/rawbytes
+import cheng/v3/libp2p/core/multistream
+import cheng/v3/libp2p/core/types
+import cheng/v3/quic/multiaddress as qaddr
+import cheng/v3/quic/connection as qconn
+import cheng/v3/quic/msquictransport_native as qtransport
+import cheng/v3/quic/tls/policy as qpolicy
+import cheng/v3/quic/tls/test_pki as testpki
+
+type
+    V3Libp2pQuicTransportConfig =
+        secure: types.V3Libp2pSecureKind
+        nativeStreams: bool
+
+    V3Libp2pQuicLoopbackPair =
+        listener: qtransport.MsQuicTransport
+        client: qtransport.MsQuicTransport
+        listenAddr: qaddr.MultiAddress
+        outbound: qconn.Connection
+        inbound: qconn.Connection
+
+fn v3Libp2pQuicTransportConfigDefault(): V3Libp2pQuicTransportConfig =
+    return V3Libp2pQuicTransportConfig(
+        secure: types.v3Libp2pSecureTls,
+        nativeStreams: true
+    )
+
+fn v3Libp2pQuicTransportSupportsAddr(addr: types.V3Libp2pMultiaddr): bool =
+    if addr.transport != types.v3Libp2pTransportQuic:
+        return false
+    if addr.secure != types.v3Libp2pSecureTls:
+        return false
+    if addr.mux != types.v3Libp2pMuxNone:
+        return false
+    return true
+
+fn v3Libp2pQuicTransportText(): str =
+    return "quic(tls)->native_stream"
+
+fn v3Libp2pQuicAddrText(addr: types.V3Libp2pMultiaddr): str =
+    if len(addr.raw) > 0:
+        return addr.raw
+    var out: str = "/ip4/"
+    out = out + addr.host
+    out = out + "/udp/"
+    out = out + intToStr(addr.port)
+    out = out + "/quic-v1"
+    return out
+
+fn v3Libp2pQuicParseAddr(addr: types.V3Libp2pMultiaddr): Result[qaddr.MultiAddress] =
+    if !v3Libp2pQuicTransportSupportsAddr(addr):
+        return Err[qaddr.MultiAddress]("v3 libp2p quic: unsupported multiaddr")
+    return qaddr.parseMultiAddress(v3Libp2pQuicAddrText(addr))
+
+fn v3Libp2pQuicConfigureTls(t: var qtransport.MsQuicTransport): Result[bool] =
+    var policy: qpolicy.MsQuicTlsPolicy
+    testpki.msquicMakeLocalhostTlsPolicyInto(policy)
+    return qtransport.setMsQuicTransportTlsPolicy(t, policy)
+
+fn v3Libp2pQuicLoopbackOpenInto(out: var V3Libp2pQuicLoopbackPair,
+                                addr: types.V3Libp2pMultiaddr): Result[bool] =
+    let parsedRes = v3Libp2pQuicParseAddr(addr)
+    if IsErr(parsedRes):
+        return Err[bool](ErrorText(parsedRes))
+    out.listener = qtransport.initMsQuicTransport()
+    out.client = qtransport.initMsQuicTransport()
+    let listenerTlsRes = v3Libp2pQuicConfigureTls(out.listener)
+    if IsErr(listenerTlsRes):
+        return Err[bool](ErrorText(listenerTlsRes))
+    let clientTlsRes = v3Libp2pQuicConfigureTls(out.client)
+    if IsErr(clientTlsRes):
+        return Err[bool](ErrorText(clientTlsRes))
+    out.listenAddr = Value(parsedRes)
+    qtransport.start(out.listener, out.listenAddr)
+    if !out.listener.running:
+        if out.listener.lastError != "":
+            return Err[bool](out.listener.lastError)
+        return Err[bool]("v3 libp2p quic: listener start failed")
+    let dialRes = qtransport.dial(out.client, out.listenAddr)
+    if IsErr(dialRes):
+        qtransport.stop(out.listener)
+        return Err[bool](ErrorText(dialRes))
+    out.outbound = Value(dialRes)
+    let acceptRes = qtransport.accept(out.listener)
+    if IsErr(acceptRes):
+        qconn.connClose(out.outbound)
+        qtransport.stop(out.listener)
+        return Err[bool](ErrorText(acceptRes))
+    out.inbound = Value(acceptRes)
+    return Ok[bool](true)
+
+fn v3Libp2pQuicLoopbackClose(pair: var V3Libp2pQuicLoopbackPair) =
+    qconn.connClose(pair.outbound)
+    qconn.connClose(pair.inbound)
+    qtransport.stop(pair.listener)
+
+fn v3Libp2pQuicLoopbackWriteClient(pair: var V3Libp2pQuicLoopbackPair,
+                                   payload: Bytes): Result[int32] =
+    return qtransport.msquicTransportWrite(pair.client, pair.outbound, payload)
+
+fn v3Libp2pQuicLoopbackReadClient(pair: var V3Libp2pQuicLoopbackPair,
+                                  count: int32): Result[Bytes] =
+    return qtransport.msquicTransportRead(pair.client, pair.outbound, count)
+
+fn v3Libp2pQuicLoopbackWriteServer(pair: var V3Libp2pQuicLoopbackPair,
+                                   payload: Bytes): Result[int32] =
+    return qtransport.msquicTransportWrite(pair.listener, pair.inbound, payload)
+
+fn v3Libp2pQuicLoopbackReadServer(pair: var V3Libp2pQuicLoopbackPair,
+                                  count: int32): Result[Bytes] =
+    return qtransport.msquicTransportRead(pair.listener, pair.inbound, count)
+
+fn v3Libp2pQuicLoopbackSelectProtocol(pair: var V3Libp2pQuicLoopbackPair,
+                                      protocol: types.V3Libp2pProtocolId): Result[bool] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    let writeRes = v3Libp2pQuicLoopbackWriteClient(pair, selectBytes)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    let readRes = v3Libp2pQuicLoopbackReadServer(pair, bytesLen(selectBytes))
+    if IsErr(readRes):
+        return Err[bool](ErrorText(readRes))
+    if !multistream.v3Libp2pMultistreamAccepts(Value(readRes), protocol):
+        return Err[bool]("v3 libp2p quic: multistream select mismatch")
+    return Ok[bool](true)

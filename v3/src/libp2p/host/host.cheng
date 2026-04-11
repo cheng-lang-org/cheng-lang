@@ -1,0 +1,227 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/core/peerstore as ps
+import cheng/v3/libp2p/discovery/kad
+import cheng/v3/libp2p/protocols/gossipsub as gossip
+import cheng/v3/libp2p/protocols/store_sync as store_sync
+import cheng/v3/libp2p/transports/tcp_transport
+
+type
+    V3Libp2pHostSnapshot =
+        selfPeerId: types.V3Libp2pPeerId
+        listenCount: int32
+        peerCount: int32
+        bootstrapCount: int32
+        handlerCount: int32
+        subscriptionCount: int32
+        streamCount: int32
+        syncRequestCount: int32
+        syncServeCount: int32
+
+    V3Libp2pHost =
+        selfPeerId: types.V3Libp2pPeerId
+        listenAddrs: types.V3Libp2pMultiaddr[]
+        peers: ps.V3Libp2pPeerstore
+        kadState: kad.V3Libp2pKadState
+        supportedProtocols: types.V3Libp2pProtocolId[]
+        subscriptions: types.V3Libp2pTopicId[]
+        publishLog: gossip.V3Libp2pPubRecord[]
+        storeEntries: store_sync.V3Libp2pStoreEntry[]
+        openStreamPeers: types.V3Libp2pPeerId[]
+        openStreamProtocols: types.V3Libp2pProtocolId[]
+        bootstrapCount: int32
+        syncRequestCount: int32
+        syncServeCount: int32
+
+fn v3Libp2pHostInit(seed: str): V3Libp2pHost =
+    var selfPeer: types.V3Libp2pPeerId
+    peer_id.v3Libp2pPeerIdFillFromSeed(selfPeer, seed)
+    var bootstrapCount = 0
+    var out: V3Libp2pHost
+    out.selfPeerId = selfPeer
+    out.listenAddrs = []
+    out.peers.peers = []
+    out.kadState.providers = []
+    out.supportedProtocols = []
+    out.subscriptions = []
+    out.publishLog = []
+    out.storeEntries = []
+    out.openStreamPeers = []
+    out.openStreamProtocols = []
+    out.bootstrapCount = bootstrapCount
+    out.syncRequestCount = 0
+    out.syncServeCount = 0
+    return out
+
+fn v3Libp2pProtocolRegistered(host: V3Libp2pHost,
+                              protocol: types.V3Libp2pProtocolId): bool =
+    for i in 0..<host.supportedProtocols.len:
+        if host.supportedProtocols[i] == protocol:
+            return true
+    return false
+
+fn v3Libp2pListen(host: var V3Libp2pHost,
+                  addr: types.V3Libp2pMultiaddr): Result[bool] =
+    if addr.transport == types.v3Libp2pTransportNone:
+        return Err[bool]("v3 libp2p host: invalid listen transport")
+    add(host.listenAddrs, addr)
+    return Ok[bool](true)
+
+fn v3Libp2pRegisterHandler(host: var V3Libp2pHost,
+                           protocol: types.V3Libp2pProtocolId) =
+    if v3Libp2pProtocolRegistered(host, protocol):
+        return
+    add(host.supportedProtocols, protocol)
+
+fn v3Libp2pAddBootstrapPeer(host: var V3Libp2pHost,
+                            record: ps.V3Libp2pPeerRecord) =
+    var marked = record
+    if !marked.bootstrap:
+        marked.bootstrap = true
+    ps.v3Libp2pPeerstoreUpsert(host.peers, marked)
+    host.bootstrapCount = host.bootstrapCount + 1
+
+fn v3Libp2pDial(host: var V3Libp2pHost,
+                peerId: types.V3Libp2pPeerId,
+                addr: types.V3Libp2pMultiaddr,
+                routingRole: int32): Result[bool] =
+    var trustPermille = 800
+    var record: ps.V3Libp2pPeerRecord
+    record.peerId = peerId
+    record.addr = addr
+    record.routingRole = routingRole
+    record.connected = true
+    record.rttEwmaMicros = 1000
+    record.trustPermille = trustPermille
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[bool](true)
+
+fn v3Libp2pOpenStream(host: var V3Libp2pHost,
+                      peerId: types.V3Libp2pPeerId,
+                      protocol: types.V3Libp2pProtocolId): Result[types.V3Libp2pStreamId] =
+    if !v3Libp2pProtocolRegistered(host, protocol):
+        return Err[types.V3Libp2pStreamId]("v3 libp2p host: protocol handler missing")
+    let peers = host.peers
+    let pos = ps.v3Libp2pPeerstorePos(peers, peerId)
+    if pos < 0:
+        return Err[types.V3Libp2pStreamId]("v3 libp2p host: peer missing")
+    add(host.openStreamPeers, peerId)
+    add(host.openStreamProtocols, protocol)
+    return Ok[types.V3Libp2pStreamId](host.openStreamPeers.len)
+
+fn v3Libp2pSubscribe(host: var V3Libp2pHost,
+                     topicId: types.V3Libp2pTopicId) =
+    for i in 0..<host.subscriptions.len:
+        if types.v3Libp2pTopicIdEqual(host.subscriptions[i], topicId):
+            return
+    add(host.subscriptions, topicId)
+
+fn v3Libp2pPublish(host: var V3Libp2pHost,
+                   entry: gossip.V3Libp2pPubRecord) =
+    add(host.publishLog, entry)
+
+fn v3Libp2pStorePut(host: var V3Libp2pHost,
+                    ingress: overlay.V3IngressEnvelope) =
+    store_sync.v3Libp2pStorePut(host.storeEntries, ingress)
+
+fn v3Libp2pStoreQueryCount(host: V3Libp2pHost,
+                           query: overlay.V3StoreQuery): int32 =
+    return store_sync.v3Libp2pStoreQueryCount(host.storeEntries, query)
+
+fn v3Libp2pStoreQueryFirst(host: V3Libp2pHost,
+                           query: overlay.V3StoreQuery,
+                           out: var overlay.V3IngressEnvelope): bool =
+    return store_sync.v3Libp2pStoreQueryFirst(host.storeEntries, query, out)
+
+fn v3Libp2pStoreQuery(host: V3Libp2pHost,
+                      query: overlay.V3StoreQuery): overlay.V3IngressEnvelope[] =
+    let entries = host.storeEntries
+    var out: overlay.V3IngressEnvelope[]
+    out = store_sync.v3Libp2pStoreQuery(entries, query)
+    return out
+
+fn v3Libp2pSyncDigest(host: V3Libp2pHost,
+                      scope: overlay.V3OverlayTopicScope,
+                      stateForestCid: layout.FixedBytes32,
+                      tipEventCid: layout.FixedBytes32,
+                      stampEpoch: int32,
+                      stampGanzhi: int32): overlay.V3SyncDigest =
+    var out: overlay.V3SyncDigest
+    let selfPeerId = host.selfPeerId
+    let entries = host.storeEntries
+    store_sync.v3Libp2pSyncDigestFillFromEntries(out,
+                                                 selfPeerId,
+                                                 scope,
+                                                 stateForestCid,
+                                                 tipEventCid,
+                                                 stampEpoch,
+                                                 stampGanzhi,
+                                                 entries)
+    return out
+
+fn v3Libp2pSyncRequest(host: var V3Libp2pHost,
+                       remoteHost: var V3Libp2pHost,
+                       remotePeerId: types.V3Libp2pPeerId,
+                       query: overlay.V3StoreQuery): Result[overlay.V3IngressEnvelope[]] =
+    if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: sync peer mismatch")
+    if !v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolSync):
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: remote sync handler missing")
+    let streamRes = v3Libp2pOpenStream(host, remotePeerId, types.v3Libp2pProtocolSync)
+    if IsErr(streamRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(streamRes))
+    host.syncRequestCount = host.syncRequestCount + 1
+    let requestPayload = store_sync.v3Libp2pStoreQueryEncode(query)
+    let peers = host.peers
+    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
+    if pos < 0:
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: peer missing")
+    let remoteAddr = peers.peers[pos].addr
+    if remoteAddr.transport == types.v3Libp2pTransportQuic:
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: quic sync requires host_quic")
+    let servePayloadRes = v3Libp2pSyncServePayload(remoteHost, requestPayload)
+    if IsErr(servePayloadRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(servePayloadRes))
+    let responsePayloadRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponse(types.v3Libp2pProtocolSync,
+                                                                              requestPayload,
+                                                                              Value(servePayloadRes))
+    if IsErr(responsePayloadRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(responsePayloadRes))
+    return store_sync.v3Libp2pStoreEntriesDecode(Value(responsePayloadRes))
+
+fn v3Libp2pSyncServePayload(host: var V3Libp2pHost,
+                            requestPayload: Bytes): Result[Bytes] =
+    if !v3Libp2pProtocolRegistered(host, types.v3Libp2pProtocolSync):
+        return Err[Bytes]("v3 libp2p host: local sync handler missing")
+    host.syncServeCount = host.syncServeCount + 1
+    return store_sync.v3Libp2pSyncServePayload(host.storeEntries, requestPayload)
+
+fn v3Libp2pKadProvide(host: var V3Libp2pHost,
+                      keyCid: layout.FixedBytes32) =
+    kad.v3Libp2pKadProvide(host.kadState, keyCid, host.selfPeerId)
+
+fn v3Libp2pFindPeers(host: V3Libp2pHost,
+                     target: types.V3Libp2pPeerId,
+                     limit: int32): ps.V3Libp2pPeerRecord[] =
+    let peers = host.peers
+    let closest = kad.v3Libp2pKadFindClosest(peers, target, limit)
+    return closest
+
+fn v3Libp2pPeerSnapshot(host: V3Libp2pHost): V3Libp2pHostSnapshot =
+    let peers = host.peers
+    let peerCount = ps.v3Libp2pPeerstoreCount(peers)
+    var out: V3Libp2pHostSnapshot
+    out.selfPeerId = host.selfPeerId
+    out.listenCount = host.listenAddrs.len
+    out.peerCount = peerCount
+    out.bootstrapCount = host.bootstrapCount
+    out.handlerCount = host.supportedProtocols.len
+    out.subscriptionCount = host.subscriptions.len
+    out.streamCount = host.openStreamPeers.len
+    out.syncRequestCount = host.syncRequestCount
+    out.syncServeCount = host.syncServeCount
+    return out

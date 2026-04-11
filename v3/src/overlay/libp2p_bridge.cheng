@@ -1,0 +1,41 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as binary
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types as core
+import cheng/v3/libp2p/host/host
+import cheng/v3/libp2p/protocols/gossipsub as gossip
+
+fn v3Libp2pScoreNeighbor(candidate: overlay.V3NeighborCandidate): int64 =
+    let scoreInput = candidate.scoreInput
+    return overlay.v3OverlayTrustScore(scoreInput)
+
+fn v3Libp2pSelectNextHop(candidates: overlay.V3NeighborCandidate[]): Result[core.V3Libp2pPeerId] =
+    var bestScore: int64 = int64(0)
+    var found = false
+    var bestPeerValue: layout.FixedBytes32
+    for i in 0..<candidates.len:
+        let candidate = candidates[i]
+        if !overlay.v3OverlayNeighborEligible(candidate):
+            continue
+        let score = v3Libp2pScoreNeighbor(candidate)
+        if !found || score < bestScore:
+            found = true
+            bestScore = score
+            bestPeerValue = candidate.peerId
+    if !found:
+        return Err[core.V3Libp2pPeerId]("v3 overlay libp2p: no eligible next hop")
+    let bestPeer = core.V3Libp2pPeerId(value: bestPeerValue)
+    return Ok[core.V3Libp2pPeerId](bestPeer)
+
+fn v3Libp2pRelayPublish(hostState: var host.V3Libp2pHost,
+                        ingress: overlay.V3IngressEnvelope) =
+    let sourcePeerId = hostState.selfPeerId
+    var pubEntry: gossip.V3Libp2pPubRecord
+    gossip.v3Libp2pPubRecordFillFromIngress(pubEntry, sourcePeerId, ingress)
+    host.v3Libp2pPublish(hostState, pubEntry)
+    host.v3Libp2pStorePut(hostState, ingress)
+
+fn v3Libp2pTopicId(scope: overlay.V3OverlayTopicScope,
+                   address: binary.V3LsmrAddress): core.V3Libp2pTopicId =
+    return gossip.v3Libp2pTopicForScope(scope, address)

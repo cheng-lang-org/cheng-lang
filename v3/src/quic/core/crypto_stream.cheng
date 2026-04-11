@@ -1,0 +1,124 @@
+# MsQuic CRYPTO stream reassembly(pure Cheng).
+
+import std/result
+import std/rawbytes
+import std/buffer
+const
+    msQuicCryptoMaxChunks = 64
+
+type
+    MsQuicCryptoChunk =
+        used: bool
+        offset: int64
+        data: Bytes
+
+    MsQuicCryptoStream =
+        nextOffset: int64
+        pendingCount: int32
+        chunks: MsQuicCryptoChunk[msQuicCryptoMaxChunks]
+        ready: ByteBuffer
+
+fn initMsQuicCryptoStreamInto(out: var MsQuicCryptoStream) =
+    out.nextOffset = 0
+    out.pendingCount = 0
+    out.ready = newByteBuffer()
+    for i in 0..<msQuicCryptoMaxChunks:
+        out.chunks[i].used = false
+        out.chunks[i].offset = 0
+        out.chunks[i].data = emptyBytes()
+
+fn initMsQuicCryptoStream(): MsQuicCryptoStream =
+    var out: MsQuicCryptoStream
+    initMsQuicCryptoStreamInto(out)
+    return out
+
+fn msquicCryptoStreamReset(stream: var MsQuicCryptoStream) =
+    stream.nextOffset = 0
+    stream.pendingCount = 0
+    stream.ready = newByteBuffer()
+    for i in 0..<msQuicCryptoMaxChunks:
+        stream.chunks[i].used = false
+        stream.chunks[i].offset = 0
+        stream.chunks[i].data = emptyBytes()
+
+fn msquicCryptoStreamAvailable(stream: MsQuicCryptoStream): int32 =
+    return bytesLen(stream.ready.data)
+
+fn msquicCryptoStreamConsume(stream: var MsQuicCryptoStream, length: int32): Bytes =
+    if length <= 0:
+        return emptyBytes()
+    let avail: int32 = bytesLen(stream.ready.data)
+    if avail <= 0:
+        return emptyBytes()
+    let take: int32 = if length < avail: length else: avail
+    let out: Bytes = bytesSlice(stream.ready.data, 0, take)
+    let remain: int32 = avail - take
+    if remain > 0:
+        stream.ready.data = bytesSlice(stream.ready.data, take, remain)
+    else:
+        stream.ready.data = emptyBytes()
+    return out
+
+fn msquicCryptoStreamNormalize(stream: var MsQuicCryptoStream) =
+    for i in 0..<msQuicCryptoMaxChunks:
+        if stream.chunks[i].used && stream.chunks[i].offset < stream.nextOffset:
+            let trim64: int64 = stream.nextOffset - stream.chunks[i].offset
+            if trim64 >= int64(bytesLen(stream.chunks[i].data)):
+                stream.chunks[i].used = false
+                stream.chunks[i].data = emptyBytes()
+                stream.pendingCount = stream.pendingCount - 1
+            else:
+                let trim: int32 = int32(trim64)
+                stream.chunks[i].data = bytesSlice(stream.chunks[i].data, trim, bytesLen(stream.chunks[i].data) - trim)
+                stream.chunks[i].offset = stream.nextOffset
+
+fn msquicCryptoStreamDrain(stream: var MsQuicCryptoStream) =
+    var advanced: bool = true
+    while advanced:
+        advanced = false
+        msquicCryptoStreamNormalize(stream)
+        for i in 0..<msQuicCryptoMaxChunks:
+            if stream.chunks[i].used && stream.chunks[i].offset == stream.nextOffset:
+                let data: Bytes = stream.chunks[i].data
+                var ready: ByteBuffer = stream.ready
+                appendBytes(ready, data)
+                stream.ready = ready
+                stream.nextOffset = stream.nextOffset + int64(bytesLen(data))
+                stream.chunks[i].used = false
+                stream.chunks[i].data = emptyBytes()
+                stream.pendingCount = stream.pendingCount - 1
+                advanced = true
+                break
+
+fn msquicCryptoStreamAdd(stream: var MsQuicCryptoStream, offset: int64, data: Bytes): Result[bool] =
+    if offset < 0:
+        return Err[bool]("msquic crypto: negative offset")
+    if bytesLen(data) <= 0:
+        return Ok[bool](true)
+    var off: int64 = offset
+    var payload: Bytes = data
+    if off < stream.nextOffset:
+        let trim64: int64 = stream.nextOffset - off
+        if trim64 >= int64(bytesLen(payload)):
+            return Ok[bool](true)
+        let trim: int32 = int32(trim64)
+        payload = bytesSlice(payload, trim, bytesLen(payload) - trim)
+        off = stream.nextOffset
+    var freeIdx: int32 = -1
+    for i in 0..<msQuicCryptoMaxChunks:
+        if stream.chunks[i].used:
+            if stream.chunks[i].offset == off:
+                if bytesLen(stream.chunks[i].data) >= bytesLen(payload):
+                    return Ok[bool](true)
+                stream.chunks[i].data = payload
+                msquicCryptoStreamDrain(stream)
+                return Ok[bool](true)
+        else:
+            if freeIdx < 0:
+                freeIdx = i
+    if freeIdx < 0:
+        return Err[bool]("msquic crypto: chunk list full")
+    stream.chunks[freeIdx] = MsQuicCryptoChunk(used: true, offset: off, data: payload)
+    stream.pendingCount = stream.pendingCount + 1
+    msquicCryptoStreamDrain(stream)
+    return Ok[bool](true)

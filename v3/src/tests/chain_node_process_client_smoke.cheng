@@ -1,0 +1,38 @@
+import std/system
+import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+
+fn main(): int32 =
+    let port = driver_c_read_int32_flag_or_default_bridge("--port", -1)
+    assert(port > 0, "v3 chain_node process client: invalid port")
+
+    var client = node.v3ChainNodeInit("process.client", "process.loopback")
+    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce("127.0.0.1",
+                                                              port,
+                                                              types.v3Libp2pProtocolSync)
+    assert(payloadRes.ok, "v3 chain_node process client: recv payload")
+
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(payloadRes.value)
+    assert(snapshotRes.ok, "v3 chain_node process client: decode snapshot")
+
+    let syncRes = node.v3ChainNodeSyncOnce(client, snapshotRes.value)
+    assert(syncRes.ok, "v3 chain_node process client: sync")
+    assert(syncRes.value, "v3 chain_node process client: sync changed")
+
+    let aliceRes = node.v3ChainNodeBalance(client, 11, 1001)
+    let bobRes = node.v3ChainNodeBalance(client, 11, 2002)
+    assert(aliceRes.ok, "v3 chain_node process client: alice balance")
+    assert(bobRes.ok, "v3 chain_node process client: bob balance")
+    assert(aliceRes.value == int64(55), "v3 chain_node process client: alice 55")
+    assert(bobRes.value == int64(33), "v3 chain_node process client: bob 33")
+
+    let clientSnapshot = node.v3ChainNodeServeOnce(client)
+    assert(anti.v3AntiEntropySignatureEqual(snapshotRes.value.signature, clientSnapshot.signature),
+        "v3 chain_node process client: signature")
+    echo("v3 chain_node_process_client_smoke ok")
+    return 0

@@ -1,0 +1,163 @@
+# MsQuic transport full path -> native UDP + QUIC runtime.
+
+import std/result
+import std/rawbytes
+import cheng/v3/quic/multiaddress
+import cheng/v3/quic/connection
+import cheng/v3/quic/msquicruntime
+import cheng/v3/quic/tls/policy
+import cheng/v3/quic/native_runtime
+
+type
+    MsQuicTransport =
+        running: bool
+        listenerId: int32
+        settings: MsQuicSettings
+        tlsPolicy: MsQuicTlsPolicy
+        listenAddr: MultiAddress
+        addr: MultiAddress
+        lastError: str
+
+fn initMsQuicTransport(): MsQuicTransport =
+    var out: MsQuicTransport
+    initMsQuicTransportInto(out)
+    return out
+
+fn initMsQuicTransportInto(out: var MsQuicTransport) =
+    out.running = false
+    out.listenerId = -1
+    out.settings = initMsQuicSettings()
+    out.tlsPolicy = initMsQuicTlsPolicy()
+    out.listenAddr = MultiAddress(raw: "", data: emptyBytes())
+    out.addr = MultiAddress(raw: "", data: emptyBytes())
+    out.lastError = ""
+
+fn msquicTransportSettings(t: MsQuicTransport): MsQuicSettings =
+    return t.settings
+
+fn setMsQuicTransportSettings(t: var MsQuicTransport, settings: MsQuicSettings): Result[bool] =
+    var next: MsQuicSettings = settings
+    let validRes: Result[bool] = validateMsQuicSettings(next)
+    if IsErr(validRes):
+        return Err[bool](ErrorText(validRes))
+    t.settings = next
+    return Ok[bool](true)
+
+fn msquicTransportTlsPolicy(t: MsQuicTransport): MsQuicTlsPolicy =
+    return t.tlsPolicy
+
+fn setMsQuicTransportTlsPolicy(t: var MsQuicTransport, policy: MsQuicTlsPolicy): Result[bool] =
+    t.tlsPolicy = policy
+    return Ok[bool](true)
+
+fn handles(t: MsQuicTransport, addr: MultiAddress): bool =
+    let kind: int32 = quicMultiAddressKind(addr)
+    return kind == quicAddrKindMsQuic || kind == quicAddrKindQuic || kind == quicAddrKindQuicTls
+
+fn start(t: var MsQuicTransport, addr: MultiAddress) =
+    t.running = false
+    t.listenerId = -1
+    t.listenAddr = addr
+    t.addr = addr
+    t.lastError = ""
+    let startRes: Result[int32] = msquicNativeStartListener(addr, t.settings, t.tlsPolicy)
+    if IsErr(startRes):
+        t.lastError = ErrorText(startRes)
+        return
+    t.listenerId = Value(startRes)
+    t.running = true
+
+fn stop(t: var MsQuicTransport) =
+    if t.running:
+        msquicNativeStopListener()
+    t.running = false
+    t.listenerId = -1
+    t.lastError = ""
+
+fn accept(t: var MsQuicTransport): Result[Connection] =
+    if ! t.running:
+        t.lastError = "msquic: ! running"
+        return Err[Connection]("msquic: ! running")
+    t.lastError = ""
+    let acceptRes: Result[int32] = msquicNativeAccept()
+    if IsErr(acceptRes):
+        t.lastError = ErrorText(acceptRes)
+        return Err[Connection](ErrorText(acceptRes))
+    let localAddr: MultiAddress = msquicNativeListenerBoundAddr()
+    let remoteAddr: MultiAddress = msquicNativePeerDialAddr()
+    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(localAddr, remoteAddr, localAddr, remoteAddr)
+    if IsErr(pairRes):
+        t.lastError = ErrorText(pairRes)
+        return Err[Connection](ErrorText(pairRes))
+    return Ok[Connection](Value(pairRes).inbound)
+
+fn dial(t: var MsQuicTransport, addr: MultiAddress): Result[Connection] =
+    if ! handles(t, addr):
+        t.lastError = "msquic: unsupported address"
+        return Err[Connection]("msquic: unsupported address")
+    t.lastError = ""
+    let dialRes: Result[int32] = msquicNativeDial(t.settings, t.tlsPolicy, addr)
+    if IsErr(dialRes):
+        t.lastError = ErrorText(dialRes)
+        return Err[Connection](ErrorText(dialRes))
+    echo("msquic_transport_dial_stage=native_ok")
+    let clientAddr: MultiAddress = msquicNativeClientBoundAddr()
+    let pairRes: Result[ConnectionPair] = newNativeConnectionPair(clientAddr, addr, addr, clientAddr)
+    if IsErr(pairRes):
+        t.lastError = ErrorText(pairRes)
+        return Err[Connection](ErrorText(pairRes))
+    echo("msquic_transport_dial_stage=pair_ok")
+    return Ok[Connection](Value(pairRes).outbound)
+
+fn msquicTransportWrite(t: var MsQuicTransport, conn: var Connection, data: Bytes): Result[int32] =
+    t.lastError = ""
+    let writeRes: Result[int32] = quicConnWrite(conn, data)
+    if IsErr(writeRes):
+        t.lastError = ErrorText(writeRes)
+    return writeRes
+
+fn msquicTransportRead(t: var MsQuicTransport, conn: var Connection, count: int32): Result[Bytes] =
+    t.lastError = ""
+    let readRes: Result[Bytes] = quicConnRead(conn, count)
+    if IsErr(readRes):
+        t.lastError = ErrorText(readRes)
+    return readRes
+
+fn dropMsQuicPendingByPipe(t: MsQuicTransport, addr: MultiAddress, pipeIdx: int32): Result[bool] =
+    t
+    addr
+    if ! msquicNativeIsPipeIdx(pipeIdx):
+        return Ok[bool](false)
+    dropMsQuicConnectionsByPipe(pipeIdx)
+    return Ok[bool](true)
+
+fn dropMsQuicConnectionsByPipe(pipeIdx: int32) =
+    if ! msquicNativeIsPipeIdx(pipeIdx):
+        return
+    msquicNativePipeClose(pipeIdx)
+
+fn msquicTransportDatagramWrite(t: var MsQuicTransport, conn: var Connection, data: Bytes): Result[int32] =
+    t.lastError = ""
+    if ! t.settings.allowDatagram:
+        t.lastError = "msquic: datagram disabled"
+        return Err[int32](t.lastError)
+    if t.settings.maxDatagram > 0 && bytesLen(data) > t.settings.maxDatagram:
+        t.lastError = "msquic: datagram too large"
+        return Err[int32](t.lastError)
+    if ! conn.open:
+        t.lastError = "msquic: connection closed"
+        return Err[int32](t.lastError)
+    let writeRes: Result[int32] = msquicNativeDatagramWrite(conn.pipeIdx, conn.pipeSide, data)
+    if IsErr(writeRes):
+        t.lastError = ErrorText(writeRes)
+    return writeRes
+
+fn msquicTransportDatagramRead(t: var MsQuicTransport, conn: var Connection): Result[Bytes] =
+    t.lastError = ""
+    if ! conn.open:
+        t.lastError = "msquic: connection closed"
+        return Err[Bytes](t.lastError)
+    let readRes: Result[Bytes] = msquicNativeDatagramRead(conn.pipeIdx, conn.pipeSide)
+    if IsErr(readRes):
+        t.lastError = ErrorText(readRes)
+    return readRes

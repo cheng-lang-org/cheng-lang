@@ -1,0 +1,106 @@
+# MsQuic stream(pure Cheng, in-process).
+
+import std/result
+import std/rawbytes
+import std/net/stream/bufferstream
+import cheng/v3/quic/msquicruntime
+type
+    MsQuicStream =
+        id: int64
+        bidi: bool
+        open: bool
+        buffer: BufferStream
+        createdAtMs: int64
+        lastActiveMs: int64
+        priority: int32
+        idealSendBufferSize: int64
+        zeroRttLength: int64
+        reliableOffset: int64
+
+fn initMsQuicStream(id: int64, bidi: bool): MsQuicStream =
+    let now: int64 = msquicNowMs()
+    MsQuicStream(
+        id: id,
+        bidi: bidi,
+        open: true,
+        buffer: newBufferStream(),
+        createdAtMs: now,
+        lastActiveMs: now,
+        priority: 0x7FFF,
+        idealSendBufferSize: 0,
+        zeroRttLength: 0,
+        reliableOffset: 0
+    )
+
+fn msquicStreamId(s: MsQuicStream): int64 =
+    s.id
+
+fn msquicStreamIsBidi(s: MsQuicStream): bool =
+    s.bidi
+
+fn msquicStreamIsOpen(s: MsQuicStream): bool =
+    if ! s.open:
+        return false
+    return ! isClosed(s.buffer)
+
+fn msquicStreamPriority(s: MsQuicStream): int32 =
+    s.priority
+
+fn msquicStreamSetPriority(s: var MsQuicStream, value: int32): Result[bool] =
+    if value < 0 || value > 0xFFFF:
+        return Err[bool]("msquicstream: priority out of range")
+    s.priority = value
+    return Ok[bool](true)
+
+fn msquicStreamIdealSendBufferSize(s: MsQuicStream): int64 =
+    s.idealSendBufferSize
+
+fn msquicStreamSetIdealSendBufferSize(s: var MsQuicStream, value: int64): Result[bool] =
+    if value < 0:
+        return Err[bool]("msquicstream: ideal send buffer must be non-negative")
+    s.idealSendBufferSize = value
+    return Ok[bool](true)
+
+fn msquicStreamZeroRttLength(s: MsQuicStream): int64 =
+    s.zeroRttLength
+
+fn msquicStreamSetZeroRttLength(s: var MsQuicStream, value: int64): Result[bool] =
+    if value < 0:
+        return Err[bool]("msquicstream: 0rtt length must be non-negative")
+    s.zeroRttLength = value
+    return Ok[bool](true)
+
+fn msquicStreamReliableOffset(s: MsQuicStream): int64 =
+    s.reliableOffset
+
+fn msquicStreamSetReliableOffset(s: var MsQuicStream, value: int64): Result[bool] =
+    if value < 0:
+        return Err[bool]("msquicstream: reliable offset must be non-negative")
+    s.reliableOffset = value
+    return Ok[bool](true)
+
+fn msquicStreamTouch(s: var MsQuicStream) =
+    s.lastActiveMs = msquicNowMs()
+
+fn msquicStreamRead(s: var MsQuicStream, count: int32): Result[Bytes] =
+    if ! msquicStreamIsOpen(s):
+        return Err[Bytes]("msquicstream: closed")
+    let res: Result[Bytes] = read(s.buffer, count)
+    if ! IsErr(res):
+        msquicStreamTouch(s)
+    return res
+
+fn msquicStreamWrite(s: var MsQuicStream, data: Bytes): Result[int32] =
+    if ! msquicStreamIsOpen(s):
+        return Err[int32]("msquicstream: closed")
+    let res: Result[int32] = write(s.buffer, data)
+    if ! IsErr(res):
+        msquicStreamTouch(s)
+    return res
+
+fn msquicStreamIdleMs(s: MsQuicStream): int64 =
+    msquicNowMs() - s.lastActiveMs
+
+fn msquicStreamClose(s: var MsQuicStream) =
+    s.open = false
+    closeBufferStream(s.buffer)

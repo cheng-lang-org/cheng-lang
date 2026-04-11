@@ -498,6 +498,7 @@ typedef struct DriverCProgFrame {
   const char *current_op_kind;
   const char *current_op_primary;
   const char *current_op_secondary;
+  struct DriverCProgFrame *caller_frame;
   DriverCProgValue inline_params[DRIVER_C_PROG_FRAME_INLINE_PARAM_CAP];
   DriverCProgZeroPlan *inline_param_zero_plans[DRIVER_C_PROG_FRAME_INLINE_PARAM_CAP];
   DriverCProgValue inline_locals[DRIVER_C_PROG_FRAME_INLINE_LOCAL_CAP];
@@ -508,6 +509,8 @@ typedef struct DriverCProgFrame {
   char *inline_label_names[DRIVER_C_PROG_FRAME_INLINE_LABEL_CAP];
   int32_t inline_label_pcs[DRIVER_C_PROG_FRAME_INLINE_LABEL_CAP];
 } DriverCProgFrame;
+
+static DriverCProgFrame *driver_c_prog_current_frame = NULL;
 
 static const uint32_t driver_c_sha256_table[64] = {
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU,
@@ -4549,12 +4552,14 @@ static int driver_c_prog_parse_first_enum_ordinal_from_text(const char *text,
     char *eq = strchr(part, '=');
     if (eq != NULL) {
       if (!driver_c_prog_parse_i32_text_strict(eq + 1, &ordinal)) {
-        fprintf(stderr,
-                "driver_c program runtime: unsupported enum ordinal part=%s\n",
-                eq + 1);
+        char message[256];
+        snprintf(message,
+                 sizeof(message),
+                 "driver_c program runtime: unsupported enum ordinal part=%s",
+                 eq + 1);
         free(part);
         driver_c_prog_free_string_array(parts, part_count);
-        exit(1);
+        driver_c_die(message);
       }
     }
     free(part);
@@ -5510,10 +5515,12 @@ static int driver_c_prog_first_enum_ordinal_in_type_body(const char *body_text,
             int32_t field_ordinal = next_ordinal;
             if (eq != NULL) {
               if (!driver_c_prog_parse_i32_text_strict(eq + 1, &field_ordinal)) {
-                fprintf(stderr,
-                        "driver_c program runtime: unsupported enum ordinal type=%s part=%s\n",
-                        type_name != NULL ? type_name : "",
-                        eq + 1);
+                char message[512];
+                snprintf(message,
+                         sizeof(message),
+                         "driver_c program runtime: unsupported enum ordinal type=%s part=%s",
+                         type_name != NULL ? type_name : "",
+                         eq + 1);
                 free(part);
                 driver_c_prog_free_string_array(parts, part_count);
                 free(suffix);
@@ -5521,7 +5528,7 @@ static int driver_c_prog_first_enum_ordinal_in_type_body(const char *body_text,
                 free(decl_name);
                 free(line);
                 driver_c_prog_free_string_array(lines, line_count);
-                exit(1);
+                driver_c_die(message);
               }
             }
             if (out_ordinal != NULL) *out_ordinal = field_ordinal;
@@ -5553,15 +5560,17 @@ static int driver_c_prog_first_enum_ordinal_in_type_body(const char *body_text,
         int32_t field_ordinal = next_ordinal;
         if (eq != NULL) {
           if (!driver_c_prog_parse_i32_text_strict(eq + 1, &field_ordinal)) {
-            fprintf(stderr,
-                    "driver_c program runtime: unsupported enum ordinal type=%s part=%s\n",
-                    type_name != NULL ? type_name : "",
-                    eq + 1);
+            char message[512];
+            snprintf(message,
+                     sizeof(message),
+                     "driver_c program runtime: unsupported enum ordinal type=%s part=%s",
+                     type_name != NULL ? type_name : "",
+                     eq + 1);
             free(part);
             driver_c_prog_free_string_array(parts, part_count);
             free(line);
             driver_c_prog_free_string_array(lines, line_count);
-            exit(1);
+            driver_c_die(message);
           }
         }
         if (out_ordinal != NULL) *out_ordinal = field_ordinal;
@@ -5616,11 +5625,13 @@ static DriverCProgZeroPlan *driver_c_prog_zero_plan_from_type_decl(DriverCProgRe
   char *type_name = NULL;
   int32_t i = 0;
   if (type_decl == NULL || type_decl->item == NULL) {
-    fprintf(stderr,
-            "driver_c program runtime: missing type decl for zero init type=%s inst_owner=%s\n",
-            resolved_type_text != NULL ? resolved_type_text : "",
-            inst_owner_module != NULL ? inst_owner_module : "");
-    exit(1);
+    char message[512];
+    snprintf(message,
+             sizeof(message),
+             "driver_c program runtime: missing type decl for zero init type=%s inst_owner=%s",
+             resolved_type_text != NULL ? resolved_type_text : "",
+             inst_owner_module != NULL ? inst_owner_module : "");
+    driver_c_die(message);
   }
   type_name = driver_c_prog_type_terminal_name_dup(resolved_type_text != NULL ? resolved_type_text : "");
   if (driver_c_prog_text_eq(type_decl->owner_module, "std/rawbytes") &&
@@ -5698,12 +5709,16 @@ static DriverCProgZeroPlan *driver_c_prog_zero_plan_from_type_decl(DriverCProgRe
     free(type_name);
     return plan;
   }
-  fprintf(stderr,
-          "driver_c program runtime: unsupported zero-init type decl owner=%s type=%s decl=%s\n",
-          type_decl->owner_module != NULL ? type_decl->owner_module : "",
-          resolved_type_text != NULL ? resolved_type_text : "",
-          type_decl->decl_name != NULL ? type_decl->decl_name : "");
-  exit(1);
+  {
+    char message[768];
+    snprintf(message,
+             sizeof(message),
+             "driver_c program runtime: unsupported zero-init type decl owner=%s type=%s decl=%s",
+             type_decl->owner_module != NULL ? type_decl->owner_module : "",
+             resolved_type_text != NULL ? resolved_type_text : "",
+             type_decl->decl_name != NULL ? type_decl->decl_name : "");
+    driver_c_die(message);
+  }
   return NULL;
 }
 
@@ -6491,29 +6506,40 @@ static char *driver_c_join_path2_dup(const char *left, const char *right) {
 }
 
 static void driver_c_die(const char *message) {
+  const DriverCProgFrame *frame = driver_c_prog_current_frame;
+  int32_t depth = 0;
   fputs(message != NULL ? message : "driver_c fatal", stderr);
   fputc('\n', stderr);
+  while (frame != NULL) {
+    const DriverCProgItem *item = frame->item;
+    fprintf(stderr,
+            "[driver_c stack] #%d module=%s label=%s source=%s pc=%d op=%s\n",
+            depth,
+            item != NULL && item->owner_module != NULL ? item->owner_module : "",
+            item != NULL && item->label != NULL ? item->label : "",
+            item != NULL && item->source_path != NULL ? item->source_path : "",
+            frame->current_pc,
+            frame->current_op_kind != NULL ? frame->current_op_kind : "");
+    frame = frame->caller_frame;
+    depth += 1;
+  }
+  cheng_dump_backtrace_if_enabled();
   fflush(stderr);
   exit(1);
 }
 
 static void driver_c_die_errno(const char *message, const char *path) {
-  if (message != NULL && message[0] != '\0') {
-    fputs(message, stderr);
-  } else {
-    fputs("driver_c errno", stderr);
-  }
-  if (path != NULL && path[0] != '\0') {
-    fputs(": ", stderr);
-    fputs(path, stderr);
-  }
-  if (errno != 0) {
-    fputs(": ", stderr);
-    fputs(strerror(errno), stderr);
-  }
-  fputc('\n', stderr);
-  fflush(stderr);
-  exit(1);
+  int saved_errno = errno;
+  char buffer[1024];
+  snprintf(buffer,
+           sizeof(buffer),
+           "%s%s%s%s%s",
+           message != NULL && message[0] != '\0' ? message : "driver_c errno",
+           path != NULL && path[0] != '\0' ? ": " : "",
+           path != NULL && path[0] != '\0' ? path : "",
+           saved_errno != 0 ? ": " : "",
+           saved_errno != 0 ? strerror(saved_errno) : "");
+  driver_c_die(buffer);
 }
 
 __attribute__((weak)) int32_t driver_c_compiler_core_print_usage_bridge(void) {
@@ -7161,6 +7187,8 @@ static int32_t driver_c_compare_files_bytes_impl(const char *left_path, const ch
 }
 
 static void driver_c_abort_with_label_output(const char *label, const char *output) {
+  const DriverCProgFrame *frame = driver_c_prog_current_frame;
+  int32_t depth = 0;
   if (label != NULL && label[0] != '\0') {
     fputs(label, stderr);
   } else {
@@ -7171,6 +7199,20 @@ static void driver_c_abort_with_label_output(const char *label, const char *outp
     fputs(output, stderr);
   }
   fputc('\n', stderr);
+  while (frame != NULL) {
+    const DriverCProgItem *item = frame->item;
+    fprintf(stderr,
+            "[driver_c stack] #%d module=%s label=%s source=%s pc=%d op=%s\n",
+            depth,
+            item != NULL && item->owner_module != NULL ? item->owner_module : "",
+            item != NULL && item->label != NULL ? item->label : "",
+            item != NULL && item->source_path != NULL ? item->source_path : "",
+            frame->current_pc,
+            frame->current_op_kind != NULL ? frame->current_op_kind : "");
+    frame = frame->caller_frame;
+    depth += 1;
+  }
+  cheng_dump_backtrace_if_enabled();
   fflush(stderr);
   exit(1);
 }
@@ -9012,6 +9054,20 @@ static int driver_c_prog_is_builtin_module_field(const char *module_name, const 
          driver_c_prog_text_eq(field_name, "strip");
 }
 
+static void driver_c_prog_write_i32_out_arg(DriverCProgValue arg, int32_t value) {
+  DriverCProgValue *slot = driver_c_prog_slot_from_refish(arg);
+  if (slot != NULL) {
+    driver_c_prog_assign_slot(slot, driver_c_prog_value_i32(value));
+    return;
+  }
+  {
+    int32_t *ptr = (int32_t *)driver_c_prog_value_to_void_ptr(arg);
+    if (ptr != NULL) {
+      *ptr = value;
+    }
+  }
+}
+
 static int driver_c_prog_try_builtin(DriverCProgRegistry *registry,
                                      int32_t builtin_tag,
                                      const char *label,
@@ -9763,6 +9819,72 @@ try_builtin_symbols:
   if (driver_c_prog_text_eq(symbol, "exit")) {
     exit(driver_c_prog_value_to_i32(args[0]));
   }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_register_ptr")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_handle_register_ptr argc mismatch");
+    *out = driver_c_prog_value_u64(cheng_ffi_handle_register_ptr(driver_c_prog_value_to_void_ptr(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_resolve_ptr")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_handle_resolve_ptr argc mismatch");
+    *out = driver_c_prog_value_ptr(cheng_ffi_handle_resolve_ptr(driver_c_prog_value_to_u64(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_invalidate")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_handle_invalidate argc mismatch");
+    *out = driver_c_prog_value_i32(cheng_ffi_handle_invalidate(driver_c_prog_value_to_u64(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_new_i32")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_handle_new_i32 argc mismatch");
+    *out = driver_c_prog_value_u64(cheng_ffi_handle_new_i32(driver_c_prog_value_to_i32(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_get_i32")) {
+    int32_t value = 0;
+    int32_t rc = 0;
+    if (argc != 2) driver_c_die("driver_c program runtime: cheng_ffi_handle_get_i32 argc mismatch");
+    rc = cheng_ffi_handle_get_i32(driver_c_prog_value_to_u64(args[0]), &value);
+    driver_c_prog_write_i32_out_arg(args[1], value);
+    *out = driver_c_prog_value_i32(rc);
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_add_i32")) {
+    int32_t value = 0;
+    int32_t rc = 0;
+    if (argc != 3) driver_c_die("driver_c program runtime: cheng_ffi_handle_add_i32 argc mismatch");
+    rc = cheng_ffi_handle_add_i32(driver_c_prog_value_to_u64(args[0]),
+                                  driver_c_prog_value_to_i32(args[1]),
+                                  &value);
+    driver_c_prog_write_i32_out_arg(args[2], value);
+    *out = driver_c_prog_value_i32(rc);
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_handle_release_i32")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_handle_release_i32 argc mismatch");
+    *out = driver_c_prog_value_i32(cheng_ffi_handle_release_i32(driver_c_prog_value_to_u64(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_raw_new_i32")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_raw_new_i32 argc mismatch");
+    *out = driver_c_prog_value_ptr(cheng_ffi_raw_new_i32(driver_c_prog_value_to_i32(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_raw_get_i32")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_raw_get_i32 argc mismatch");
+    *out = driver_c_prog_value_i32(cheng_ffi_raw_get_i32(driver_c_prog_value_to_void_ptr(args[0])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_raw_add_i32")) {
+    if (argc != 2) driver_c_die("driver_c program runtime: cheng_ffi_raw_add_i32 argc mismatch");
+    *out = driver_c_prog_value_i32(cheng_ffi_raw_add_i32(driver_c_prog_value_to_void_ptr(args[0]),
+                                                         driver_c_prog_value_to_i32(args[1])));
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_ffi_raw_release_i32")) {
+    if (argc != 1) driver_c_die("driver_c program runtime: cheng_ffi_raw_release_i32 argc mismatch");
+    *out = driver_c_prog_value_i32(cheng_ffi_raw_release_i32(driver_c_prog_value_to_void_ptr(args[0])));
+    return 1;
+  }
   if (driver_c_prog_text_eq(symbol, "__cheng_rt_paramStrCopyBridgeInto")) {
     DriverCProgValue *slot = driver_c_prog_slot_from_refish(args[1]);
     if (slot == NULL) driver_c_die("driver_c program runtime: paramStrCopyInto out must be ref");
@@ -9781,6 +9903,11 @@ try_builtin_symbols:
     return 1;
   }
   if (driver_c_prog_text_eq(symbol, "cheng_str_param_to_cstring_compat")) {
+    char *text = driver_c_prog_value_to_cstring_dup(args[0]);
+    *out = driver_c_prog_value_ptr(text);
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_str_to_cstring_temp_bridge")) {
     char *text = driver_c_prog_value_to_cstring_dup(args[0]);
     *out = driver_c_prog_value_ptr(text);
     return 1;
@@ -10151,6 +10278,10 @@ try_builtin_symbols:
   }
   if (driver_c_prog_text_eq(symbol, "cheng_epoch_time")) {
     *out = driver_c_prog_value_f64(cheng_epoch_time());
+    return 1;
+  }
+  if (driver_c_prog_text_eq(symbol, "cheng_epoch_time_seconds")) {
+    *out = driver_c_prog_value_i64(cheng_epoch_time_seconds());
     return 1;
   }
   if (driver_c_prog_text_eq(symbol, "cheng_getcwd")) {
@@ -10997,11 +11128,15 @@ static DriverCProgValue driver_c_prog_eval_item(DriverCProgRegistry *registry,
                                                 int32_t argc,
                                                 const DriverCProgRoutine *routine_ctx) {
   DriverCProgFrame frame;
+  DriverCProgFrame *prev_frame = driver_c_prog_current_frame;
   int32_t pc = 0;
   int trace_enabled = driver_c_prog_trace_any_enabled();
   DriverCProgValue return_value = driver_c_prog_value_nil();
   int has_return_value = 0;
+  memset(&frame, 0, sizeof(frame));
+  driver_c_prog_current_frame = &frame;
   driver_c_prog_frame_init(&frame, registry, item, args, argc, routine_ctx);
+  frame.caller_frame = prev_frame;
   while (pc < item->exec_op_count) {
     DriverCProgOp *op = &item->ops[pc];
     frame.current_pc = pc;
@@ -11895,6 +12030,7 @@ static DriverCProgValue driver_c_prog_eval_item(DriverCProgRegistry *registry,
   }
 driver_c_prog_eval_item_done:
   return_value = has_return_value ? driver_c_prog_materialize(return_value) : driver_c_prog_value_nil();
+  driver_c_prog_current_frame = prev_frame;
   driver_c_prog_frame_cleanup(&frame);
   return return_value;
 }

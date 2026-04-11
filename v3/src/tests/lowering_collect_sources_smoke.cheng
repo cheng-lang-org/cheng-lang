@@ -1,0 +1,37 @@
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/lang/parser
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/backend/lowering_plan as lower
+
+fn main(): int32 =
+    let workspaceRoot = v3path.v3PathCurrentDir()
+    let packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    let sourcePath = v3path.v3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(packageRoot, req, linkPlan, err), "v3 lowering collect sources: build link plan")
+    let sourceClosurePaths = slplan.v3SystemLinkPlanSourceClosurePaths(linkPlan)
+    for sourceIndex in 0..<sourceClosurePaths.len:
+        let currentSource = sourceClosurePaths[sourceIndex]
+        echo(currentSource)
+        let ownerModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSource)
+        let text = v3path.v3ReadTextFile("", currentSource)
+        let lines = parser.v3ParserSplitChar(text, '\n')
+        for lineIndex in 0..<lines.len:
+            let line = lines[lineIndex]
+            let functionName = lower.v3LoweringFunctionNameFromLine(line)
+            if functionName != "":
+                let symbolText = lower.v3LoweringFunctionSymbolText(ownerModulePath, functionName)
+                assert(symbolText != "", "v3 lowering collect sources: symbol text")
+    echo("v3 lowering_collect_sources_smoke ok")
+    return 0

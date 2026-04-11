@@ -2,10 +2,261 @@
 
 | 项目 | 结论 |
 |---|---|
+| 新发现 | `MsQuicTlsPolicy` 这轮已经不再是 `quic_native_listener_smoke` 的第一现场。把 `policy` 数组壳拆平、`test_pki` 切成标量 decode 入口、`ensureInit()` 去掉 eager session reset、`initMsQuicSettings()` 改成逐字段赋值以后，fresh host/stage2 unsupported 列表里 `initMsQuicSettings` 和 `msquicTlsPolicyHasServerInputs` 都已经掉出第一现场。 |
+| 新发现 | `quic_tls_policy_smoke` 现在露出来的是 ordinary smoke 形状本身，不再是 QUIC/TLS 专属逻辑根。当前它会先卡 `main` 的 `stmt_call/stmt_let` 形状和 `assert`/module const/call 组合，不值得再用它指导 `native_runtime` 修复。 |
+| 新发现 | `quic_native_listener_smoke` 当前真正该打的点已经收窄成五个：`native_runtime::msquicNativeTaggedAddr(...)`、`native_runtime::msquicNativeStartListenerServerInputs(...)`、`platform/datapath_runtime::initMsQuicDatapathRuntime()`、`platform/datapath_udp::msquic_udp_close(...)`、`platform/datapath_udp::udpParseAddr(...)`。这说明下一刀应该继续收 `listener/datapath`，不是回去碰 `Policy` 复合布局。 |
+| 新发现 | `strToCStringTemp` 这轮已经不是 `QUIC/TLS` 真 blocker。把 [src/std/system.cheng](/Users/lbcheng/cheng-lang/src/std/system.cheng) 的 `strToCStringTemp(s: str)` 收成 `cheng_str_to_cstring_temp_bridge(...)` 后，新补的 [udp_importc_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/udp_importc_smoke.cheng) 已在 host、`stage2`、`stage3` 三条线上真编真跑通过；说明 `str + cstring` 这层现在已经闭合。 |
+| 新发现 | `std/os + udp_syscall` 之前确实是 `QUIC/TLS` 的一层真前置，但现在也已经闭合：`src/std/os.cheng` 已切到 `importc fn + libc_*` 宿主桥，`src/std/net/transports/udp_syscall.cheng` 也不再依赖 `std/system` 的 backend 幻影 `socket/getsockname`。这条线现在已经正式挂进 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh)，host 全量重新前台通过。 |
+| 新发现 | full [libp2p_quic_tls_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_quic_tls_smoke.cheng) 的 `rc=139 + 0 字节日志` 不是新的修补把编译器打坏了，而是 `quic_transport` 一口气把 `test_pki/x509/rsa/bigint` 和 `msquictransport_native/native_runtime` 两个大闭包同时拖进来，导致 ordinary/seed 在大栈帧上直接炸。把它拆成 [quic_tls_policy_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/quic_tls_policy_smoke.cheng) 和 [quic_native_listener_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/quic_native_listener_smoke.cheng) 之后，host 和 `stage2` 都已经不再空日志段错，而是稳定给出 ordinary unsupported 列表。 |
+| 新发现 | split smoke 现在把 `QUIC/TLS` 的真缺口分得很清楚：`quic_tls_policy_smoke` 第一现场已经固定到 `cheng/v3/quic/tls/test_pki::msquicMakeLocalhostTlsPolicyInto` 和 `cheng/v3/quic/tls/policy::initMsQuicTlsPolicy` 的 `stmt_call/stmt_var + composite return`；`quic_native_listener_smoke` 则固定暴露 `msquictransport_native/native_runtime`、`MsQuicTransport/MsQuicTlsPolicy/MsQuicNativeSession` 这批大复合布局和 ABI 子集。下一刀该打的是这两层 fixed-layout/ordinary 子集，不该再回头碰 UDP 或 `strToCStringTemp`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v2/cheng-quic` 不是“没东西可用”，而是已经把一批真 Cheng 源码迁进 `v3` 以后，当前新的真实瓶颈变成了 `v3` 编译器自己。`strToCStringTemp/charToStr` 和 `congestion` 链这几层压平之后，fresh [libp2p_quic_tls_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_quic_tls_smoke.cheng) 现在最先死在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 `v3_resolve_call_target(...)` 栈炸，不再是缺模块。 |
+| 新发现 | [connection_impl.cheng](/Users/lbcheng/cheng-lang/v3/src/quic/core/connection_impl.cheng) 里原本那整条 `congestion/bbr/cubic/loss_detection` 对当前 `libp2p_quic_tls_smoke` 是纯拖累，不是主路径必需。把它收成最小可靠发送状态机后，编译阻塞列表里那批 `congestion/*` 已经整段消失，说明继续缩依赖面是对的。 |
+| 新发现 | [msquicconnection.cheng](/Users/lbcheng/cheng-lang/v3/src/quic/msquicconnection.cheng) 原先那坨 `msquic_types` 大对象外部几乎没人真用；当前主线只依赖 `init/isOpen/touch/openStream/close` 这小撮接口。把它收成最小连接态后，`MsQuicConnection` 已不再是当前第一现场。 |
+| 新发现 | `v3_resolve_bare_call_symbol(...)` 和 `v3_const_resolve_call_symbol(...)` 原来会直接把坏 alias / callee 指针喂给 `snprintf`，host compiler 会先在 libc 里炸掉，连 Cheng 侧诊断都来不及打印。现在前一层坏指针崩溃已经收成安全失败，剩下的活根前移到了更深的 `v3_resolve_call_target(...)` 递归。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | fresh `run_slice_gate.sh` 这次露出来的真问题，不是 `msquicconnection.cheng:78` 这一行写错了，而是 base [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 无条件 import 了 [quic_transport.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/quic_transport.cheng)。这样一来，哪怕 `chain_node_libp2p_smoke` 只走 TCP，也会被 fresh `backend_driver` 强行拖进整条 `msquic` 闭包。 |
+| 新发现 | 正确修法不是改 `destCidUpdateCount`、也不是继续让 host 假装“同时内建所有 transport”。这轮已经把 `host` 收回 base/TCP 语义，并新增 [host_quic.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host_quic.cheng) 单独承接 QUIC 同步路径；结果是 fresh `artifacts/v3_backend_driver/cheng` 现在又能真编 [chain_node_libp2p_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_libp2p_smoke.cheng)，`run_v3_host_smokes.sh` 也重新全绿。 |
+| 新发现 | 当前 `stage2/stage3` 已闭合的 libp2p 主线是 `core/host/tcp/overlay/protocols/chain_node_libp2p + tcp twoproc/process`，不是完整 `QUIC/TLS` 闭包。`libp2p_quic_tls_smoke` 继续保留，但当前不该放在 mandatory [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 里冒充“已经闭合的主线”；这轮已经把 gate 口径收正。 |
+| 新发现 | `v3` 目录里之前真正会误导人的，不是代码，而是文档：两份 README 和两份状态文档还在写旧 `chain_node` 入口和未闭合的 CLI/QUIC 能力面。现在这几处都已经收回当前真状态：`v3/src/project/chain_node_main.cheng` 只是 `self-test` 入口，真实跨进程链路验收靠 `chain_node_process_smoke`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 的 `FFI handle` 这条现在已经有世代索引，`ABA` 真根不在“槽位复用会指到新对象”，而在失效句柄语义还太软：released / stale handle 之前只是返回 `-1`，调用方一旦漏判，逻辑就会继续往下跑。真正符合 `Let it crash` 的收法是 runtime 自己立刻打栈退出。 |
+| 新发现 | `chain_node_libp2p_smoke` 这次 host driver 编译期爆栈，真根不在 `chain_node/libp2p` 逻辑，而在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 `v3_call_expr_string_literal_count(...)` 会在某些表达式分解上原地自递归，最后把 seed 自己栈打穿。只要把递归条件收成“子表达式必须更短且和原文不同”，这条编译期 crash 就会消失。 |
+| 新发现 | `libp2p_tcp_twoproc` 这条真正脆的不是 socket，而是 ready 同步。server 端只要没把端口稳定写进 `ready-path`，脚本层就会看起来像“TCP 没连上”；把 [run_v3_tcp_twoproc_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_tcp_twoproc_smoke.sh) 收回统一 ready 文件口径后，host 和 `stage2` 的两进程 smoke 都稳定闭合。 |
+| 新发现 | `chain_node_process_client_smoke` 那条假失败也不是 snapshot/网络错，而是它自己把 `--port` 先读成字符串再走 `parseutils`，把问题重新拖回 ordinary lowering。直接改成 `driver_c_read_int32_flag_or_default_bridge(...)` 后，客户端接收和签名校验立刻恢复正常。 |
+| 新发现 | 这轮之后真正可以拿来当总验收的是 [run_slice_gate.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_slice_gate.sh)，不是单点 targeted。`build_chain_node_v3`、`host smokes`、`stage23 libp2p smokes`、`ffi_handle` trap 现在都已经被它串进同一条前台 gate。 |
+| 新发现 | `stage2/stage3 libp2p` 这轮新冒出来的 `libp2p_host_smoke -> unresolved_import_count=1` 不是源码真缺口，而是 incremental/module-cache 把 `QUIC` 闭包脏带进了 `TCP host` smoke。把 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 收成 `BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0` 之后，`libp2p_host_smoke` 和 `libp2p_protocols_smoke` 都重新回到干净闭包。 |
+| 新发现 | 缓存假红消掉以后，当前真正还没闭合的就是 `QUIC/TLS` ordinary compile 本体：`libp2p_quic_tls_smoke` 现在第一时间撞到 `std/system::strToCStringTemp`，后面还连着 `native_runtime/x509/msquic` 这一整串 `stmt_let + cstring + TLS` 子集。这条线已经不是脚本噪音，可以直接当下一主线推进。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `libp2p sync` 之前真正没过网的地方，不在 `tcp payload bridge`，而在请求侧自己：只要 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 还直接拿 `remoteHost.storeEntries` 组结果，就不能算 `request-response`。这轮把它改成 `query bytes encode -> 真 TCP RR -> entries decode` 后，`libp2p_protocols_smoke` 才第一次对上真正的协议面。 |
+| 新发现 | 当前 ordinary 子集还不适合拿 `std/os` 的 `pipeSpawn/fdReadWait/main(argc, argv)` 去硬写单文件两进程 smoke；那条线会重新把问题拖回元组返回和命令行 lowering。更短更稳的收法是拆成独立 [libp2p_tcp_twoproc_server_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_tcp_twoproc_server_smoke.cheng) / [libp2p_tcp_twoproc_client_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_tcp_twoproc_client_smoke.cheng)，再用 shell 编排。 |
+| 新发现 | 两进程同步最稳的不是 stdout `READY`，而是 `ready-path` 文件写端口。统一改成 native listener 写文件后，[run_v3_tcp_twoproc_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_tcp_twoproc_smoke.sh) 和 [run_v3_chain_node_process_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_chain_node_process_smoke.sh) 已经在 host、`stage2`、`stage3` 三条线上都稳定闭合。 |
+| 新发现 | 这轮之后 `v3` 的 libp2p 正式 gate 已经不只是在单进程里做状态搬运：`stage2/stage3` 的 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 现在真包含 `tcp twoproc`、`protocols sync rr`、`chain_node_libp2p` 和 `chain_node_process` 的跨进程验证，并且 fresh 全绿。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 当前真正“接上真 TCP”的地方，之前只有 C 里的 `multistream` loopback 探针；[host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 仍然只是 `listenAddrs/peerstore/publishLog/storeEntries` 的内存状态机，不能再把它口头说成真实 underlay。 |
+| 新发现 | 这轮正确推进方式不是硬把 `host` 重写成 socket host，也不是把 `std/net/tcp_syscall` 生吞进 `stage2/stage3` 主链。当前 host 编译器还吃不稳那条 ABI，直接走会把问题重新拖回 `std/net`。更短更稳的收法是沿 [system_helpers.c](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c) 现有真 socket 骨架，扩一个带 raw payload 的 `cheng_v3_tcp_loopback_payload_bridge(...)`。 |
+| 新发现 | [libp2p_tcp_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_tcp_smoke.cheng) 现在已经不是“空 multistream 握手成功”这种薄 smoke，而是真跑 `chain_node mint/transfer -> snapshot encode -> 真 TCP 二进制往返 -> snapshot decode -> syncOnce -> balance/signature`。这条线说明 `v3` 现在至少已经有一条不经过内存 `host` 的真实 underlay 二进制链。 |
+| 新发现 | 当前最该保持清醒的边界是：`tcp underlay` 已经开始真实化，但 `libp2p host/overlay/store/sync` 仍主要是进程内状态面。下一刀该去做真实两进程 one-shot，而不是把现在的 host 描述成已经完成的 libp2p daemon。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `chain_node_libp2p` 这次的真根不在 `store`，也不在 `V3IngressEnvelope.payload` 的 `Bytes` 搬运链。把 [chain_node_libp2p_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_libp2p_smoke.cheng) 补上 `payloadLen/payloadCid/raw payload` 校验后，这些断言全部照样通过，说明 snapshot 字节在入库和取回前后一致。 |
+| 新发现 | 活根其实在 [chain_node_libp2p.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_libp2p.cheng) 这段私有 codec 自己：`DecodeSignature/DecodeEvent` 原来是 `Result[bool] + var nextOffset`，把关键偏移推进藏在副作用里；只要 ordinary lowering 或寄存器搬运对这个形状不稳，后面的 event decode 就会整段错位，表面上只剩 `decode snapshot`。把它们改成直接返回 `Result[int32]` 新偏移后，snapshot 立刻恢复闭合。 |
+| 新发现 | `v3ChainNodeLibp2pReadI64BE(...)` 也不能继续保留那条宽松口径。对齐到已经真跑通的 `rwad_bft` 实现后，`chain_node_libp2p` 的 `amount/tick` 重组和其它固定宽度冷轨实现终于统一，不再靠“当前输入刚好都是小正数”碰运气。 |
+| 新发现 | `chain_node_libp2p_smoke` 现在已经不只是手工 targeted 通过，而是正式升进了两条 gate：[run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 和 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh)。`stage2`、`stage3` 和 host 三条线上都已经真编真跑输出 `v3 chain_node_libp2p_smoke ok`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `run_v3_stage23_libp2p_smokes.sh` 这次冒出来的 `libp2p_protocols_smoke -> stmt_var` 不是源码真退化，而是 [artifacts/v3_bootstrap](/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap) 里的 `cheng.stage2/cheng.stage3` 还停在旧自举产物。拿当前 host driver 单独编同一 smoke 会直接通过；fresh 重跑 `bootstrap_bridge_v3.sh` 后，`stage2/stage3` 五个 libp2p smoke 立刻一起转绿。 |
+| 新发现 | `kind: str` 这类热点形状只要回流进 [system_link_plan.cheng](/Users/lbcheng/cheng-lang/v3/src/backend/system_link_plan.cheng)，`run_slice_gate.sh` 第一关就会立刻打死。这次正确收法不是继续保留 `parserSourceKind: str`，而是热面只存整型 kind，真正要给人看的字符串延后到 report 层再生成。 |
+| 新发现 | 之前看起来还悬着的 `chain_node` 签名断言现在已经闭合。把 [chain_node_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_smoke.cheng) 的 `anti.v3AntiEntropySignatureEqual(served.signature, clientServed.signature)` 恢复回正式 smoke 后，fresh `run_v3_host_smokes.sh`、`build_chain_node_v3.sh` 以及最终的 `run_slice_gate.sh` 都已真过；这条线不用再当成未完成事项挂着。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 只把 `payloadCid/payloadLen` 放进 `IngressEnvelope` 还不够，后面的 `chain_node` 根本没有真实载荷面可以挂。把 `overlay.V3IngressEnvelope` 补成 `sourcePeerId/topicScope/address/payload/payloadCid/payloadLen/stamp*` 后，`libp2p` 这条线终于能承载真正的 bytes，不再只是 metadata 壳。 |
+| 新发现 | `libp2p_protocols_smoke` 这轮已经把最小协议载荷面钉死：同一个 ingress 经 `bridge.v3Libp2pRelayPublish(...)` 之后，`topicId`、`publishLog`、`storeEntries`、`payloadLen`、`payloadCid` 和 raw payload 字节头都保持一致，而且这条线已在 `stage2/stage3` 双编双跑真过。 |
+| 新发现 | 现在 `run_v3_stage23_libp2p_smokes.sh` 已不再只是 `core/host/tcp/overlay` 四件套，而是正式扩成五个 smoke：`libp2p_core`、`libp2p_host`、`libp2p_tcp`、`libp2p_overlay`、`libp2p_protocols`。这说明下一刀可以直接去做 `chain_node <-> libp2p` 适配层，不用再先补“payload bytes 是否能过 stage23”这种前置壳。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `libp2p_overlay_smoke` 这轮真正的真根不是 `LSMR overlay` 算法，也不是 `store/sync` 语义，而是 ordinary 当前对“复合 zero helper + wrapper helper + nested helper call”这层壳非常不稳。只要把 `overlay` 真实数据面包进 `v3OverlayIngressEnvelopeZero()`、`v3Libp2pStoreQueryCount()`、`main -> smokeOverlayRun()` 这种壳里，就会不断把失败伪装成 `stmt_var/stmt_let/prepare expr call state failed`。 |
+| 新发现 | 正确修法不是继续补更多 helper，而是反过来把 helper 壳拔掉：`libp2p_overlay_smoke` 现在直接检查 `node.storeEntries` 这条真实 host 状态，`host` 和 `core/types` 只保留必要字段写回；`src/std/rawbytes.cheng` 和 `src/std/crypto/sha256.cheng` 也同步拆平，把 `Bytes`/`u32` 这类热 helper 收成 ordinary 已验证过的局部写回形状。 |
+| 新发现 | 这刀落下后，`libp2p_overlay_smoke` 已经不再单独需要人工 targeted compile；正式脚本 `run_v3_stage23_libp2p_smokes.sh` 现在会完整跑过 `libp2p_core_smoke`、`libp2p_host_smoke`、`libp2p_tcp_smoke`、`libp2p_overlay_smoke` 的 `stage2/stage3` 双编双跑，并稳定输出 `v3 stage2/stage3 libp2p: ok`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 这轮 `sha256/fixed256` 真根不是算法，也不是 `while` 本身，而是 seed 对零参调用的临时文本缓冲区没做初始化。像 `emptyBytes()` 这种 `parse_call_text(...)` 成功但没有参数的调用，会把旧栈里的脏字节误当成 `prefix single arg` 的实参文本。 |
+| 新发现 | 这条脏读会把 `std/rawbytes::bytesFromString/bytesAlloc` 先伪装成 `stmt_if/body semantics missing`，再把 `sha256_runtime/fixed256_sha256/compiler_pipeline` 一起拖坏。把 `v3/bootstrap/cheng_v3_seed.c` 里的 `arg_text/result_arg_text` 和 `V3ExprPrepScratch` 全部收成确定初始化后，fresh `sha256_inline/runtime/core/schedule/round`、`fixed256_sha256`、`compiler_pipeline_stub` 已全部重新真过。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `compiler_runtime_smoke` 这次真崩点不是 `build_plan` 算法，也不是 runtime bridge，而是 seed 自己在 `v3_prepare_expr_call_state_impl(...)` 里把 `V3ExprPrepScratch` 的定长数组先退化成 `char*`，后面又拿 `sizeof(expr)` 之类当容量。结果所有 prepare 输入都会被截成 7 字节，`max_call_depth` 被错误算成 `0`，后面字符串 scratch 直接写进保存的 `x29/x30`。 |
+| 新发现 | `prepare` 里还有第二个结构性错误：`V3BackendBuildPlan(...)`、`V3CompilerRuntimeContract(...)`、`V3BackendSourceUnit(...)` 这种构造器根本不是 runtime call，但旧逻辑仍强行走 `resolve_call_target + composite arg temp`。这会让 prepare 在第一层字段上就提前失败，后面的嵌套 `v3BackendRootPath(...)` 根本来不及被统计进调用深度。 |
+| 新发现 | 现在这两处已经一起收掉：prepare 改回按真实数组容量递归，构造器只递归字段表达式、不再走 runtime call 准备；同时保留 `frame layout` 硬校验，直接阻断 `string temp` 和保存寄存器重叠。fresh 结果已经固定成真通过：`compiler_runtime_smoke`、`compiler_pipeline_stub_smoke`、`v3 twoway search smoke` 全绿。 |
+| 新发现 | 修完后 `v3BackendBuildPlanDefault` 的真机器布局已经回到安全区：旧坏帧是 `sub sp, sp, #464` 且把字符串 scratch 放到 `sp+456`，直接踩 `sp+448` 的 `FP/LR`；现在新帧是 `sub sp, sp, #1616`，字符串 scratch 在 `sp+1384`，保存寄存器在 `sp+1600`。这条线已经从“运行时跳进 `.cstring`”收成“编译期布局和 prepare 事实一致”。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 这轮 `libp2p` 真主根先后换了两次，但现在已经钉死：`peer_id` 的崩点不是 SHA 算法，而是 ordinary 对“`str -> FixedBytes32` 复合返回”不稳。改成 native `sha256 word bridge` 再直接写 `out.value.data[0..31]` 后，`libp2p_peer_id_smoke` 已在 `stage2/stage3` 真过。 |
+| 新发现 | `multiaddr` 当前不能再拿 parser 路径当 stage2/stage3 主线。`v3Libp2pMultiaddrParse/ParseBytes` 一旦进入 `Result[Multiaddr]` 或更复杂的 parser 控制流，不是直接跳进 `__TEXT,__cstring`，就是回到 `primary_object_body_semantics_missing`。这不是网络语义错，而是 ordinary 对这类复合 `str/Bytes` 地址对象还没稳。 |
+| 新发现 | 先用 `v3Libp2pMultiaddrFillTcp/FillQuic` 直接构造真实地址对象后，`libp2p_core_smoke`、`libp2p_host_smoke`、`libp2p_tcp_smoke` 已在 `stage2/stage3` 全绿；说明当前 `libp2p` 主线可以继续往下推进，不该再被 `multiaddr parser` 这条假根拖住。 |
+| 新发现 | `libp2p_overlay_smoke` 现在暴露出来的才是下一层真 blocker：`byteBufView`、`v3HashInts`、`gossipsub`、`store_sync`、`host store/sync` 这一串还带大量 `composite-arg local missing / return_expr / stmt_var / stmt_for` ordinary 缺口。后续该继续打的是这条 overlay/store/sync 复合输出链，不是再回头折腾 `peer_id/core/host/tcp`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 当前真正拖慢字符串搜索的，不是 `str` 布局本身，而是 bridge 入口先把 `ptr+len` 退化回裸 `char*`，随后 `contains` 再走朴素 `for + memcmp`。这会把固定布局 `str` 的长度信息白白丢掉。 |
+| 新发现 | 现在 `Two-way` 搜索核已经直接落到 `v3/runtime/native/v3_str_twoway_search.h`，`system_helpers.c`、`system_helpers_selflink_min_runtime.c`、`system_helpers_selflink_shim.c` 都统一接了同一套 bytes-aware 搜索逻辑；`driver_c_str_contains_str_bridge` 也改成优先吃 `str.len`。 |
+| 新发现 | 这刀中途抓到一个真边角：`SIZE_MAX` 形式的 `maximal suffix = -1` 不能拿来直接做无符号大小比较，否则像 `"aaaaab"` 搜 `"aaab"` 这种 case 会漏报。现在已修成带 sentinel 语义的比较，native 穷举 smoke 全绿。 |
+| 新发现 | `system_helpers_selflink_shim.c` 这轮顺手收掉了两个一直潜伏的前置声明缺口：`driver_c_str_eq_bridge` 和 `__cheng_rt_paramStrCopyBridge`。不补这两个，单独 fresh 编 `selflink_shim` 时会直接掉进隐式声明错误。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 之前的源码 trace 其实只完成了一半：`signal` 链虽然能靠内嵌 line map 回到 `.cheng` 行号，但 `mapped_frames=0` 时就只剩原生 backtrace；`panic/bounds` 则还是主要靠 `.v3.map + symbol`。这还不是机器级真相源。 |
+| 新发现 | 现在 `src/runtime/native/system_helpers.c` 已把这层补成真合同：`signal` 直接从 `ucontext` 取 `pc/fp/sp/lr`，沿 FP 链打印结构化 `m#` 机器帧；`panic/bounds` 走真实 `backtrace pc`，优先按内嵌 `PC range -> source span` 表映射，`.v3.map` 只退作 symbol fallback。 |
+| 新发现 | 这刀最直接的收益已经在真 blocker 上出现了。`compiler_runtime_smoke` 以前只报 `source-signal mapped_frames=0`，现在会先打印 `[cheng-v3] machine-trace ...` 和原始 `m#0/m#1` 机器帧，把“真实崩在一个没映射到 Cheng 源码的机器地址上”这件事直接暴露出来，不用先上 `lldb` 才能知道第一现场。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `src/runtime/native/system_helpers.c` 里这条 parser native bridge 之前确实有混合堆所有权 bug。`cheng_v3_parser_import_source_paths_bridge(...)` 和 `cheng_v3_parser_source_to_module_bridge(...)` 的正常返回大多是 `malloc`，但空串/错误分支却走 `driver_c_str_from_utf8_copy_bridge(...)`，把 `cheng_malloc` 指针也塞进同一个 `ChengStrBridge(OWNED)`。后面 `cheng_v3_bridge_release_owned(...)` 再统一释放时，就会在 generated exe 里撞到非法 `free()`。 |
+| 新发现 | 把这几条 bridge 的空串/错误返回统一成 `cheng_v3_bridge_owned_str(...)` 之后，`compiler_pipeline_stub_smoke` 已重新真编真跑通过；说明这次崩点不是 parser 算法，而是桥接层自己把所有权做乱了。 |
+| 新发现 | `panic`、`bounds`、`signal` 三条异常面现在都已经默认打印源码栈和 native 栈。真验收已经过了：`build_panic_trace_v3.sh`、`build_bounds_trace_v3.sh`、`build_signal_trace_v3.sh` 全绿，输出里都能直接回到 `.cheng` 行号。 |
+| 新发现 | `lowering_plan_smoke` 现在虽然还会崩，但已经不再是“只看到异常名”。默认输出已经把第一现场钉在 `v3/src/backend/lowering_plan.cheng:75` 的 `v3LoweringFunctionSymbolText(...)`，后面继续修的是 lowering 逻辑，不是异常堆栈系统。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3/src/backend/system_link_plan.cheng` 的 `v3SystemLinkPlanStubReport(...)` 这轮已经不再是活根了。把所有 `plan.xxx` 和派生文本先落局部变量后，`compiler_pipeline_stub_smoke` 已重新回到 `COMPILE_RC:0`；当前不该再回头怀疑 report 编译面。 |
+| 新发现 | generated exe 上真正会把 parser 主链打坏的，不只是 seed 里的“复合参数不是 local”这一类 compile blocker，还包括 `v3` 源码里若干复合返回/嵌套字符串链本身。`v3PathSplitFile(...)` 一进 `v3ParseOrdinarySourceStub(...)` 就会把返回链炸掉；parser 内部在归一化源码路径上继续调用 `v3PathJoin(...)` 也会把 `ownerModulePath` 这条路径桥打坏。把这些点改成显式扫描和 `v3ParserJoinSlash(...)` 后，generated exe 才能继续往前跑。 |
+| 新发现 | `compiler_pipeline_stub_smoke` 当前新的真根已经缩到 `v3ParserReadImportEdges(...)` 里处理 `std/...` 导入时再次调用 `v3ParserModulePathToSourcePath(...)` 的 `std` 分支返回链。顶层 `packageId`、`contractsPath`、`sourceExists` 都已经在 generated exe 里跑过，`v3ParseOrdinarySourceStub(...)` 也已稳定跑到 `parse5`；说明 parser 的 package/source 主路径已经比之前硬很多，剩下的是 `std` import 这条字符串返回链还没彻底闭合。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `lowering_plan_smoke` 这轮已经不再卡在 `stmt_let/stmt_var/stmt_if` 这些 surface 级 ordinary 形状上了。把 `v3/src/backend/lowering_plan.cheng` 和 `v3/src/tests/lowering_plan_smoke.cheng` 再压平后，seed 现在暴露出来的真 blocker 已经前移到更底层的 `composite call-arg lowering`。 |
+| 新发现 | `v3/bootstrap/cheng_v3_seed.c` 里的 `v3_prepare_expr_call_state(...)` 之前是实打实的栈爆根。它每层递归都在栈上摆十几块 `4KB/8KB` scratch，`lowering_plan` 这种长调用一进来就会在 Darwin 直接撞 `___chkstk_darwin`。现在已经改成每层递归独立堆分配 scratch，这条崩栈路径已消失。 |
+| 新发现 | 当前 seed 的新主根不是 `lowering_plan` 自己，而是“复合参数表达式没有稳定物化成临时局部”。代表症状已经固定成 `scalar/composite call composite-arg local missing`，典型例子是 `cheng_v3_os_is_absolute_bridge(v3PathTrim(raw))`、`parser.v3ParseOrdinarySourceStub(req.rootDir, req.sourcePath)`、`parser.v3ParserSplitChar(v3path.v3ReadTextFile("", sourcePath), '\n')`。只要 `str/result/seq` 参数不是现成局部变量，emit 阶段就会掉坑。 |
+| 新发现 | 这说明下一刀不该继续挤压 Cheng 源码外形了。真正该补的是 seed 统一的 call lowering：要么 prepare 阶段稳定生成 composite arg temp，要么 emit 阶段允许按类型直接物化复合参数，而不是假定它已经是现成 local。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `RWAD` 原子级模型在 `v3` 里当前最短真落点不是先硬上 `accumulator/zk prover`，而是先把 `interval note + nullifier + deterministic root` 做成冷轨正式状态机。这样先把“1 个输入 note 切成 1 到 3 个输出 note、同一 note 不得重复花费、commit 必须给稳定摘要”这条硬语义钉死，再往上接成员证明和 batch proof 才不会空转。 |
+| 新发现 | 真正能把“100 万 RWAD 转账不等于 100 万个对象”先落地的是“消费一个连续区间 note，再按花费窗口切出左找零、支付、右找零”这条规则。`v3/src/project/rwad_serial_state_machine.cheng` 现在已经把这条规则收成固定布局实现：`noteId` 保证 note 身份唯一，`spent nullifier` 负责双花拒绝，`ownerRoot/serialRoot/nullifierRoot/appHash` 负责冷轨摘要。 |
+| 新发现 | 这轮没有把 `accumulator/zk` 写成已实现。文档和代码都已经明确：今天真落的是区间账本和确定性摘要，不是假证明；后续如果接 `accumulator/zk`，只能建立在这条 note/nullifier 状态机已经稳定闭合的前提上。 |
+| 新发现 | 把 `rwad_serial_state_machine_smoke` 接进 `v3/tooling/run_v3_host_smokes.sh` 之后，整条 host smoke 现在已经能真跑到它并输出 `v3 rwad_serial_state_machine_smoke ok`；但后面的老 blocker 还在，而且这次真实失败栈已经落到 `v3PathTrim -> v3ParserFirstToken -> v3ParserReadImportEdges -> v3BuildSystemLinkPlanStub`，说明 `compiler_pipeline_stub_smoke` 这条线并没有彻底关掉，只是失败面更具体了。 |
+| 新发现 | 原子级 `RWAD` 继续往冷轨接口推进时，真正该先补的不是字节编解码，而是“块内多 tx 顺序”。如果底层状态机只认单个 `height` 单调，就会把 `finalizeBlock` 偷偷退化成“每块最多一个 tx”。现在 `v3/src/project/rwad_serial_state_machine.cheng` 已把 `lastApplyOrderKey` 分出来，`height + txIndex` 能稳定派生确定性 order key。 |
+| 新发现 | `v3/src/project/rwad_bft_state_machine.cheng` 现在已经把原子级 note/nullifier 账本包成了真正的冷轨适配层：`checkTx/finalizeBlock/queryOwner/queryAppHash` 都走固定布局对象，不再需要把原子账本塞回旧余额账本壳里。`rwad_bft_state_machine_smoke` 和 `build_rwad_bft_state_machine_v3.sh` 都已经 fresh 真编真跑通过。 |
+| 新发现 | `RWAD-BFT` 这轮已经不只是 Cheng 内部对象接口，还补上了固定宽度二进制边界：`v3RwadBftEncodeTx/DecodeTx/checkTxBytes/finalizeBlockBytesSummary` 都已经由 fresh smoke 真跑通过。这样原子级账本已经能以二进制 tx 形式对齐冷轨接口，不再只是“对象 API 先能跑”。 |
+| 新发现 | 把 `rwad_bft_state_machine_smoke` 接进 `run_v3_host_smokes.sh` 之后，整条 host smoke 当前已经稳定先跑过 `compiler_runtime -> rwad_serial -> rwad_bft -> parser_path -> compiler_pipeline_stub`，新的第一处真 blocker 已前移到 `lowering_plan_smoke`。而且这次真根不是 `RWAD`，是 seed ordinary body 子集还吃不下 `v3/src/backend/lowering_plan.cheng` 里的 `stmt_let / return_expr / composite call`。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `type X = ref` 这条旧 blocker 已经不是活根了。`v3/bootstrap/cheng_v3_seed.c` 现在把 `ref` 和 `object` 一样视作 record header，所以 `v3/src/lang/intern.cheng`、`v3/src/ir/core_types.cheng` 这类 `= ref` 类型块已经能被 seed 正常读进来。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `compiler_pipeline_stub_smoke` 这轮已经把 source 侧假根清干净了：测试主入口里的嵌套 `if + echo`、`parser` 的 token 扫描、`Result[V3ParsedSourceStub]` 和 `Result[V3SystemLinkPlanStub]` 的 source 形状都已经压成当前 ordinary 能吃的最小写法。 |
+| 新发现 | 当前唯一剩下的真 blocker 已经收窄到 `cheng/v3/backend/system_link_plan::v3BuildSystemLinkPlanStub`。fresh 日志 `/tmp/compiler_pipeline_stub_smoke.debug.log` 现在不再出现 `v3ParserFirstToken(...)`、`v3ParseOrdinarySourceStub(...)`、`v3SystemLinkPlanStubReport(...)` 这批旧错误，只剩这一个 `system_link_plan` lowering 缺口。 |
+| 新发现 | `system_link_plan` 这条线暴露的不是业务逻辑错误，而是 seed ordinary lowering 对“`Result[composite]` 里组 `plan`”这类 shape 仍不稳定。把 build-plan 读取改成标量 helper、把 `moduleKind/track` 逻辑拆平后，阻塞仍回落到同一函数，说明下一刀应该直接修 seed，而不是继续改 Cheng 源码外形。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `parser_path_smoke` 这轮真正的主根不是 parser 逻辑，而是 ordinary host 对 `str` 的两条底层链都还带真 bug：一条是 `v3/bootstrap/cheng_v3_seed.c` 里 `str == str` 把 `str` slot 地址直接拿去比较；另一条是 composite-return call 和字符串字面量 scratch 共用同一层 `string_temp` 起点，导致短字符串 helper 很容易互相踩。 |
+| 新发现 | `driver_c_str_slice_bridge(...)` 里用通用 `cheng_str_bridge_from_owned(...)` 包短字符串返回值并不稳；`"std/strutils" -> "strutils"` 这类短结果会把返回 bridge 的 `ptr/len` 搅坏。直接手工组 `ChengStrBridge` 后，这条 bridge 已稳定。 |
+| 新发现 | `parser_path_smoke` 现在已经 fresh 真编真跑输出 `v3 parser_path_smoke ok`，说明 `v3` 自己的新 `path/parser` 子集已经闭合。继续往前跑整套 host smokes 后，新的第一处真 blocker 已前移到 `compiler_pipeline_stub_smoke`，当前不该再回头怀疑 parser/runtime bridge。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `overlay_contracts_smoke` 已经 fresh 真编真跑通过，说明冷热双轨这轮新加的 `L0 overlay` 边界类型、角色约束、复合评分公式和 `host smoke` 接入口径已经打通。当前不需要再怀疑 `overlay contracts` 这条线。 |
+| 新发现 | `BFT-SMI` 现在已经不是“编不过”或“provider object 炸了”，而是卡在真实运行断言 `block1 appliedCount`。这说明新的第一处真 blocker 已经前移到冷轨状态机本体。 |
+| 新发现 | 当前 `BFT` 的真根不是账本规则本身，而是状态机把权威索引 `index` 包在 `V3BftStateMachine` 的嵌套复合字段里。`consensus.v3ConsensusApplyChecked(...)` 单独跑是好的，但一旦通过 `machine.index` 这类嵌套 `var` 路径去改，ordinary 产物就不稳定；下一步必须把冷轨状态收成更硬的 flat state / out-param 形状，不能继续依赖嵌套 record 更新。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 冷热双轨这轮新增的 `overlay_contracts_smoke` 和 `bft_state_machine_smoke` 还没来得及暴露各自业务面的 ordinary 缺口，就先被同一个更前面的宿主壳错误拦住了：`src/runtime/native/system_helpers.c` 在 `cheng_v3_os_dir_exists_bridge(...)` 里调用了 `cheng_dir_exists(...)`，但文件顶部手写原型列表没同步声明，导致 fresh provider object 直接编译失败。 |
+| 新发现 | 这个拦路点说明当前 `overlay/BFT` 两条新 smoke 还没有真正开始竞争资源或互相污染；它们共享的是同一层 runtime provider object。要继续定位 `BFT-SMI` 的复合输出缺口，必须先把这个宿主编译错误消掉。 |
+| 新发现 | `LSMR` 文档里原先那段“LSMR 区块链共识”风险分析现在只能当历史设计归档，不能再和 `v3` 默认主线并排摆成现状。当前默认主线已经明确改成 `libp2p underlay + LSMR overlay + BFT-SMI cold track`，因此文档必须把旧共识叙述降格成背景材料。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3BftStateMachineCheckTx(...)` 里 `var probe = machine` 这种写法在当前实现里只是浅拷贝；一旦沿着 `v3BftApplyTx -> v3ConsensusApplyChecked` 预演，底层切片就会把原 `machine` 一起污染。`CheckTx` 这层必须改成 clone-index 纯预演，不能再拿共享状态直接试跑。 |
+| 新发现 | `Cheng <-> BFT` 这条新链已经暴露出一个比业务逻辑更底层的 ordinary 限制：fresh driver 对这层“复合 tx 结果输出面”还不稳。现在标量摘要能写回，但逐 tx 结果一旦继续走复合返回/复合输出 shape，就会在 fresh compile 或 fresh runtime 上暴露 ordinary lowering 缺口；后续要么继续把接口压进更硬的 out-param/fixed-layout 子集，要么直接补 lowering。 |
+| 新发现 | `Cheng <-> BFT` 这层不能直接把 `chain_node` 暴露成外部共识接口。`chain_node/LSMR` 现在还带着网络拓扑、反熵和本地推进时钟；强一致性结算面应该只复用 `consensus` 里的账本规则，单独形成固定布局状态机。 |
+| 新发现 | `BFT` 状态机里最该先钉死的不是具体 `Tendermint/CometBFT` 宿主细节，而是“块高和交易序如何派生确定性账本元数据”。现在这层已经改成由 `block height + tx index` 派生 `epoch/ganzhi/tick`，这样同一块输入在所有节点上都会落成同一批事件顺序和同一 `appHash`。 |
+| 新发现 | `BFT` 边界的字节面必须先独立出来，否则后面很容易把内部 `record/str` 形态重新漏给外部共识壳。新增的 `V3BftTx` 已固定成 `32` 字节 wire format，`checkTxBytes/finalizeBlockBytes` 直接吃这层，不再让文本接口回流。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `fixed_surface_smoke` 现在不该再作为唯一热核入口来读日志了。把它拆成 `fixed256_sha256_smoke`、`ref10_ashr_smoke`、`fixed256_curve25519_smoke` 之后，已经确认 `sha256` 固定布局热链和 `fixed_surface` 组合面都能 fresh 真编真跑通过。 |
+| 新发现 | `curve25519` 这次真正的真根不是 `ref10` 算法文本本身，而是 ordinary codegen 把所有 `>>` 都错发成了 `lsrv`。`ref10_ashr_smoke` 第一条 `ashr64(-1, 1) == -1` 一开始就炸，说明 signed right shift 语义从后端就坏了。 |
+| 新发现 | 正确修法落在 `v3/bootstrap/cheng_v3_seed.c`：`>>` 现在已经按 `signed/unsigned + i32/i64` 正式分流成 `asrv/lsrv`，并给 signed `i32` 路补了 `sxtw`。这刀落下后，`fixed256_curve25519_smoke` 打出来的错误公钥 `de2f913413e4be337fd0dd513b48c97184d5e5dedb0074478ed360dbd2181d06` 直接回正为 RFC 向量 `de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f`。 |
+| 新发现 | `src/std/crypto/ed25519/ref10.cheng` 里的 `ashr64/ashr32` 不能在没有单独 probe 的前提下乱改。把它们改成手搓算术右移，只会把更前面的 `sha256` 路也一起带坏；正确做法是先用 `ref10_ashr_smoke` 钉死机器码语义，再改后端，不直接手改算法层。 |
+| 新发现 | `LSMR` 文档之前把很多安全边界写在大段愿景和风险分析里，但没有升成默认约束。现在 `v3/docs/LSMR.md` 和 `v3/docs/cheng语言特性矩阵和开发计划.md` 已明确写死：洛书前缀不是绝对地理、反熵不等于金融即时最终性、空间证明和 `CSG` 过滤不是完整抗作恶方案、`RWAD` 只认 `global finalized`，并把坏 proof / 冲突 proof / 超预算载荷 / 单区域失活切路这些要求抬进正式 gate 口径。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3BuildBaguaPrefixTreeFill(...)` 之前的 `SIGSEGV` 真根不是 `LSMR` 算法，也不是 `state forest` 数据结构本身，而是 seed 对 `add(seq, complex rhs)` 的 lowering 错了：`cheng_seq_set_grow` 返回的新元素槽位没有先 spill，后面的右值求值把 `x0` 冲掉，最后把元素写到了地址 `0x2`。 |
+| 新发现 | 正确修法不是改 tree 算法，而是在 `v3/bootstrap/cheng_v3_seed.c` 里把 `add(...)` 收成“先 spill 新槽位地址，再用更深一层 `call_depth` 计算右值，最后 reload 地址写回”。新增 `seq_add_member_index_rhs_smoke` 后，这条 bug 已被最小用例正式钉死。 |
+| 新发现 | `bagua_prefix_tree_fill_smoke` 现在已经 fresh 真编真跑输出 `v3 bagua_prefix_tree_fill_smoke ok`。这说明 prefix-tree 构建的运行时段错已经闭合，当前不能再把旧 crash 继续归到 `LSMR` 算法上。 |
+| 新发现 | `chain_node` 新阶段暴露出来的不是共识算法错，而是 `v3ChainNodeTransfer(...)` 里“原地逐字段拼 transfer event”这个 source shape 在当前 ordinary lowering 下不稳；同样语义一旦抽成 `v3ChainNodeBuildTransferEvent(...)` 再 apply，就能稳定通过 `chain_node_transfer_wrapper_forms_smoke`、`chain_node_smoke` 和正式 `chain_node_main` 自测。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `lsmr_types_smoke` 这次真正缺的不是 `Result[V3PrefixRef] + [6]`，而是 ordinary lowering 里 `str/composite` 参与 `==` 时还被硬塞进 `i64` compare。把比较分支改成“先物化 `str`，再转 C string 走 `cheng_strcmp`”以后，`lt.v3PrefixRefText(Value(childRes)) == "6/1/5"` 已经能编过去。 |
+| 新发现 | `str` 这条链还藏着一个更底层的真 bug：ordinary 生成的 compare 和 `out = out + ...` 拼接都把 `x15/x14` 当成跨 `bl` 还活着的地址寄存器在用。实际一旦进了 `cheng_str_param_to_cstring_compat / __cheng_str_concat / intToStr`，这些 caller-saved 寄存器就会被改写，随后直接把 `str` 地址写坏并在运行时 `SIGSEGV`。 |
+| 新发现 | 正确修法不是给 smoke 改写法，而是在 seed 里把这两类路径统一收成“调用后重取地址”。现在 compare 分支会在每次字符串物化后重新取 scratch slot 地址，拼接分支也会先 spill `dest`、调用后再 reload，然后再落 `data/len/store_id/flags`。 |
+| 新发现 | 这条修完以后，`lsmr_types_smoke` 已经 fresh 真编真跑输出 `v3 lsmr_types_smoke ok`。host smokes 的新第一处真实阻塞因此前移到 `fixed_surface_smoke`，当前暴露的是大 crypto ordinary 子集缺口：`if-expr` 标量化、`uint32/uint64` cast、若干复合类型 layout/alias 解析，以及反向 `for` range 还没接全。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 现在顶层 `artifacts` 里只剩 fresh `v3_bootstrap`、`v3_backend_driver`、`v3_hostrun`、`v3_chain_node` 等 `v3` 产物；`rg -n 'cheng_v2|v2/' artifacts` 已为空，说明旧 `v2` 编译残渣已经清空。 |
+| 新发现 | `v3` 里最后一条活的 `v2` 依赖其实就是 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 默认绑死 `v2/artifacts/bootstrap/cheng_v2c`。把它改成只认 `artifacts/v3_backend_driver/cheng` 并在缺 driver 时自动 fresh 构建后，`rg '\\bv2/' v3` 已经清零，`v2` 可以物理删除。 |
+| 新发现 | 物理删除 `v2`、`artifacts`、`chengcache`、`.cheng-cache` 再 fresh 重建以后，`bootstrap_bridge_v3.sh` 和 `build_backend_driver_v3.sh` 都还能前台通过，说明当前 `v3` 自举根已经不再偷吃旧目录。 |
+| 新发现 | clean rebuild 同时也把一批被旧产物遮住的真 bug 直接掀出来了。`fixed_surface_smoke` 现在诚实停在 `ordinary body semantics missing`，而 `bagua_prefix_tree_fill_smoke/chain_node` 则把真根收窄到 `v3BuildBaguaPrefixTreeFill(...)` 的 ordinary ABI/值表示问题。 |
+| 新发现 | `v3SortStateCells(...)` 里的 `while j >= 0 && v3StateCellLess(...)` 不能假设 short-circuit 一定守住索引安全；当前 ordinary 产物会先读右侧，直接踩到 `cells[-1]`。拆成“先判 `j >= 0`，再单独比较”的两段式之后，这个越界读已经消失。 |
+| 新发现 | `v3BuildBaguaPrefixTreeFill(...)` 里 `cells = cellsRaw` 这种 seq 头整体拷贝在当前 ordinary ABI 下是不稳的。改成逐元素复制后，prefix-tree 构建已经越过了最早那层坏 header 崩溃，说明后续 crash 才是真正剩下的前段活根。 |
+| 新发现 | 这轮为了绕 clean rebuild 暴露出来的固定布局 ABI 噪音，`v3LsmrAddressFromSeed(...)` 已先收成纯 seed-bytes 的确定性寻址，`v3ChainNodeAccountAddress(...)` 也已收成整型确定性映射；这两条都只承担“稳定可复算地址”，不承担密码学语义。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `FixedBytes32[]` 那个断言失败的真根，不在 `bytes_layout` 算法，而在 ordinary seed 的复合索引复制链。`v3_emit_index_access_address(...)` 之前把 `base` 写进了和外层 `dest_addr` 同一个 spill 槽，导致 `_copyMem` 最后不是把 `xs[0]` 拷到 `loaded`，而是拷回了序列头。 |
+| 新发现 | 正确修法不是改 smoke，也不是改 `fixedBytes32Equal`，而是把 `dest_addr`、`base`、`index` 三者彻底分槽。现在 `v3/bootstrap/cheng_v3_seed.c` 已把 `seq[index]` 内部 spill 扩到独立地址槽和独立 index 槽，`fixedbytes32_seq_index_smoke` fresh 真编真跑已经输出 `v3 fixedbytes32_seq_index_smoke ok`。 |
+| 新发现 | `v3/src/chain/lsmr.cheng` 之前真的缺了 `v3LsmrAddressBagua(...)` 顶层函数，几个 smoke 只是一直没 fresh 撞到而已。补回这个 helper 以后，`lsmr_locality_storage_smoke` 里那条 `unresolved module field module=v3/chain/lsmr field=v3LsmrAddressBagua` 已经消失。 |
+| 新发现 | `v3LsmrLocalityHashText(...)` 之前只哈原始文本，和 smoke 期待的“大小写/空白规范化后再哈”不一致。现在收成 `splitWhitespace -> join(\" \") -> toLowerAscii` 后，`"Hangzhou West Lake"` 和 `"hangzhou west lake"` 已经能落到同一个 CID。 |
+| 新发现 | `run_v3_host_smokes.sh` 不能继续复用旧输出路径上的旧产物，否则会把源码真缺口藏掉。现在脚本每个 smoke 开始前都会先删掉旧 `bin/bin.*/*.log`，host smoke 终于能诚实暴露新的第一处真 blocker。 |
+| 新发现 | 继续 fresh 跑下去后，当前新的第一处普通编译真缺口已经很清楚：`lsmr_types_smoke` 不是 `lsmr` 模块丢字段，而是 ordinary lowering 还不会吃 `Result[V3PrefixRef]` 这种复合返回、非空列表字面量参数，以及 `lt.v3PrefixRefText(...) == \"6/1/5\"` 这类 `str` 复合返回比较。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 之前说 `bounds` 这条“源码栈已接通”只对 runtime 半边成立，对 ordinary compile 还不成立：`v3/bootstrap/cheng_v3_seed.c` 的 `v3_emit_index_access_address(...)` 在取 `[]` 地址时根本没发 `cheng_bounds_check`，所以越界会直接静默读错地址，连异常都没有。 |
+| 新发现 | 正确修法不是只改 runtime 打印，而是两层一起收：runtime 侧把 `cheng_bounds_check` 收进统一异常栈入口，seed 侧则必须在 ordinary `[]` 地址计算里先做 `cheng_bounds_check(len, idx)`，再取元素地址。 |
+| 新发现 | `[]` 越界检查一旦变成真实函数调用，`base/index` 寄存器就会被 clobber。真正稳的写法是：base 地址先 spill，索引表达式求完后 reload；发 `cheng_bounds_check` 前再把 `base/index` 各自 spill 一次，返回后再 reload，再继续做元素地址计算。 |
+| 新发现 | `build_bounds_trace_v3.sh` 现在已经把这条链路钉死：fixture 会先验证 `xs[0] == 7` 仍正常，再故意读 `xs[1]`；前台输出已真包含 `[cheng] bounds check failed: idx=1 len=1`、`[cheng-crash-trace] reason=bounds`、`ordinary_bounds_trace_fixture.cheng:4-10` 和 native backtrace。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 这轮看起来像 seed 回归的 `consensus_*wrapper*_smoke`，真根不是 `precall + var index + 多复合参数` lowering，而是测试自己把 `accountIds.cap == 1` 写成了硬规则。 |
+| 新发现 | `src/runtime/native/system_helpers.c` 里的 `cheng_seq_set_grow()` 首次扩容会把 `cap` 至少提到 `4`，这是 runtime 增长策略，不是 Cheng 语义。所以 gate 只能断言“`cap >= 1` 或 `cap >= len`”，不能把“第一次刚好等于 1”当 correctness。 |
+| 新发现 | 新补的 `member_index_call_smoke` 和 `bytes_param_helper_smoke` 已经把这轮真正担心的两条线钉死：`member[index(call)]` 现在能稳定通过，`Bytes, Bytes` 复合参数 helper 也能稳定通过。当前没有证据表明 seed 在这两条表达式 lowering 上重新回退。 |
+| 新发现 | 这类假红如果不及时收掉，会把后续人错误地引回 `v3/bootstrap/cheng_v3_seed.c`。正确做法是先核对 runtime 不变量，再决定是不是编译器 bug，避免围着实现细节做无意义 ABI 猜测。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3` 这轮的真根不是 `sha256` 算法，而是 seed 编译器自己的二元表达式 lowering。左值寄存器在右子树函数调用里会被冲掉，补成 spill 以后，又暴露出第二层真根：嵌套二元表达式和保存的 `x29/x30` 共用了栈顶区域，`getU32BE` 会把返回地址直接写成垃圾。 |
+| 新发现 | 正确修法不是改 Cheng 算法源码，而是同时收两条硬规则：一是每层二元表达式都要把左值落到专用 spill，再算右子树；二是 spill 区和保存的 `x29/x30` 之间必须有独立 guard，不能共享 frame 顶部。 |
+| 新发现 | 这两条修完以后，fresh `stage2/backend driver` 已重新打通 `sha256_core_smoke`、`get_u32be_smoke`、`sha256_distinct_smoke`、`consensus_init_smoke`、`consensus_transfer_apply_smoke`。说明当前 `v3` 已经不再卡在 `sha256/getU32BE/consensus transfer` 这条前缀链上。 |
+| 新发现 | 还有一类表达式 lowering 没完全收口：像 `index.balances[v3ConsensusAccountPos(...)]` 和带用户自定义 `Bytes, Bytes` 复合参数的 helper，仍然比拆步写法更脆。当前最稳口径是先用已通过的 smoke 继续推进主链，再单独给这类“嵌套 index/call、多复合参数”补专门回归和 lowering 修复。 |
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 当前可用的 program runtime 还跑不了 `importc_fn`。不只是 `v3 host smoke`，连这轮拿来编 backend fixture 的现成 driver 路径也会在运行时直接报 `unsupported callee ... top=importc_fn`，所以 `@ffi_handle` 这边现在只能先收成 compile gate，不能伪装成 runtime gate。 |
+| 新发现 | `tests/cheng/backend` 之前没有正式 `cheng-package.toml`，stage0 一走 source manifest 就会直接报 `missing package root`。给 fixture 目录补正式包根后，这批 backend fixture 才能稳定参与 system-link-exec 验收。 |
+| 新发现 | linkerless signal 这层不能把 handler 安装绑死在 `.v3.map` 读成功上。embedded line-map 本来就不依赖 sidecar，所以 `cheng_v3_register_line_map_from_argv0` 必须先装 handler，再尽力加载 sidecar。 |
+| 新发现 | host compiler 产物不会自带 `_cheng_v3_embedded_line_map_*`，但 runtime 仍然可能链接 `system_helpers.c`。正确口径不是让链接炸掉，而是在安全时机用 `dlsym` 缓存 getter；有就走源码栈，没有就安静跳过。 |
+| 新发现 | Darwin 上不能把源码映射表放进 `__TEXT,__const`。只要内嵌表里有函数/字符串地址引用，`ld64` 就会直接报 `Illegal text-relocations`；正确段位必须是 `__DATA_CONST,__const`。 |
+| 新发现 | linkerless dev 轨的 signal 源码栈现在已经能走严谨口径：seed 直接导出内嵌 line-map getter，runtime 的 `SA_SIGINFO` handler 只拿 `PC + frame pointer` 扫内嵌表，再用 `write(2,...)` 打印 Cheng 栈，不需要 `DWARF/dSYM`，也不碰 `backtrace/dladdr`。 |
+| 新发现 | 做 signal smoke 时，不能依赖重定向 stdout 里的 `ready` 文本做同步。`puts` 在文件重定向下会被缓冲，脚本看不到即时输出；稳定做法是确认进程还活着、留一点时间让它进入 Cheng 循环，再外部注入 `SIGSEGV`。 |
+| 新发现 | 当前 `v3` ordinary 子集还没把任意 `importc` 调用接成稳定验收面。最开始那条 `@importc -> SIGSEGV` 测试会卡在 `stmt_call/call target missing`，所以 signal 回归必须改成“不依赖 importc lowering”的外部注入路径。 |
+
+| 项目 | 结论 |
+|---|---|
 | 新发现 | `v3/bootstrap/cheng_v3_seed.c` 这轮已经把函数级源码 span 收成真数据面：lowered function 现在会记录 `signature_line_number / body_first_line_number / body_last_line_number`，ordinary 成功链接后会在可执行旁边真写 `<out>.v3.map`。 |
 | 新发现 | `system_helpers.c` 已经足够承接这条 dev 轨，不需要再发明新 provider 模块。普通 `v3` 可执行本来就会链接 `runtime/program_support_v3 -> system_helpers.c`，所以只要在 `v3_program_argv_native.c / v3_tooling_argv_native.c` 启动时注册 line-map，`panic/assert/bounds` 就能直接反查源码。 |
 | 新发现 | `panic` 这层以前只是 `puts + _exit`，所以哪怕旁边有 sidecar 也完全不会用。现在已经统一改成走 `cheng_v3_panic_cstring_and_exit`，运行时会先打印消息，再打印函数级 source-trace；`ordinary_panic_fixture` 已真跑出 `ordinary_panic_fixture.cheng:2-3`。 |
-| 新发现 | 这轮没有把 signal handler 里的源码反查也一起硬塞进去。原因不是做不到，而是当前 `SIGSEGV` handler 走的是 async-safe crash trace；把 `backtrace + dladdr + fprintf` 直接塞进 signal path 会把严谨性打穿。所以这次先把 `panic/assert/bounds` 这条同步 fatal 路径收实，后面如果要接 `SIGSEGV`，得单独做安全口径。 |
+| 新发现 | `signal` 这条线不能直接照搬同步 `panic` 方案；真正可落地的口径只能是“内嵌 line-map + async-safe handler”。现在这条安全口径已经补上，`SIGSEGV` 会直接回 `.cheng` 行号。 |
 
 | 项目 | 结论 |
 |---|---|
@@ -492,3 +743,37 @@
 - 这轮把 `base[index]` 正式接进 seed 之后，`chain_node` compile log 里已经不再出现 `index.accountHeads[pos]`、`index.balances[pos]`、`lt.v3AppendFixed32(buf, index.accountHeads[pos])` 这类索引读值/复合返回错误。说明当前 `Bytes/str/T[]/T[N]` 的索引读值、复合取址和 indexed lvalue 写回已经进入 `stage2/stage3` 主链。 |
 - `chain_node` 现在新的第一批真阻塞已经很清楚：`bytesFromString(...)` 作为 `layout.byteBufAppendBytes(...)` 的复合临时实参仍然没有稳定临时槽位；`lt.v3HashInts("...", [assetId, accountId])` 说明非空序列字面量还没进入 ordinary emitter；`add(seq,val)` 则已经不是“只有 resolver 错”，因为 `std/seqs::{add,setLen}` 自己也还在 unsupported 列表里。 |
 - 这意味着下一刀不该再回头补索引或字段路径，而该正面补三件事：复合临时实参的严格数据面、非空序列字面量、以及 `std/seqs` 自身 ordinary 语义。谁先收，谁就会继续把 `chain_node` 从 `bytes_layout/lsmr_types/consensus` 这层往后推。 |
+- 只把 `driver_c` fatal 接到原生 `backtrace()` 还不够。解释执行时 C 栈只会看到 `driver_c_prog_eval_item + offset`，看不到是哪一个 `.cheng` 函数炸了；所以必须把 `DriverCProgFrame` 串成 caller 链，在 `driver_c_die(...)` 里先打 `[driver_c stack] module/label/source/pc/op`，再补原生栈。现在 `ffi_importc_handle_annotated_i32.cheng` 的 `unsupported callee` 已经能直接给出 `main -> call pc=4`。 |
+- 当前 Darwin 环境里 `ordinary_signal_trace_fixture` 会进入 `UE` 状态，`build_signal_trace_v3.sh` 卡在 `wait`，连外部 `kill -SEGV/-KILL` 都不立即收掉进程。这条和“默认出栈”不是一回事；`panic` 已经证明默认 trace/bt 正常，`signal` 这条要单独按 fixture/宿主进程状态拆。 |
+- `signal` 用例之前查不到 Cheng 源码帧，不是行号树失效，而是 fixture 写成了尾调用：`return cheng_force_segv()` 会发 `b _cheng_force_segv`，直接把 `main` 栈帧吃掉。把它改成普通调用 `let rc = cheng_force_segv(); return rc` 以后，signal handler 的 frame-pointer unwind 立刻能反查到 `ordinary_signal_trace_fixture.cheng:4-5`。 |
+- ordinary `importc fn` 不能只补到通用 `v3_resolve_call_target(...)`。`return_call_noarg_i32` 这条快路径会绕开通用 resolver，所以同文件 `importc fn cheng_force_segv(): int32` 依旧会报 `primary object call target missing`。正确修法就是把尾调用快路径也接回统一 resolver，而不是继续堆特判。 |
+- `stage2` 之前的 external `var` 实参有一处硬错：地址先按 `ptr` spill，回装寄存器时却按 `target.param_abi_classes[i]` reload。对 `var int32` 这种 C out-param，会把 64 位地址按 `i32` 截断，真机直接在 callee 里 `SIGSEGV`。正确修法不是改 wrapper，而是 call-lowering 在 `param_is_var` 上统一按 `ptr` reload。 |
+- ordinary caller 之前允许 `target.return_abi_class=i32` 喂给 `expected_abi=i64`，但收返回值时只做了 `mov xN, x0`，没做 `sxtw`。结果所有负错误码都会从 `-1` 变成 `4294967295`，最典型就是 generational handle stale get/release 在 `v3` 里永远比不过 `invalidCode()`。这必须在 call-lowering 层修，而不是在测试里绕。 |
+- `v3` 目前直接跨模块调用 `importc fn` 还不是标准面，因为 ordinary resolver 只会在“当前源码文件”里扫描 `importc fn` 声明。要让其他模块稳定用 FFI，必须像这轮一样提供同模块 wrapper `fn`，再由 wrapper 去命中同文件 `importc fn`。 |
+- `BFT-SMI` 这轮已经把“是不是 `consensus` 算法坏了”彻底排除掉了：`/Users/lbcheng/cheng-lang/artifacts/v3_tmp_bft_apply_single_smoke` 和 `/Users/lbcheng/cheng-lang/artifacts/v3_tmp_bft_apply_to_index_smoke` 都稳定输出 `ok`。这说明 `mint -> consensusApplyChecked -> index/event log` 主链是通的。 |
+- `BFT` 现在真正的根在 `CheckTx` 预演链。`/Users/lbcheng/cheng-lang/artifacts/v3_tmp_bft_finalize_summary_smoke` 只要补上和 self-test 一样的 `CheckTx` 前导，就会稳定失败在 `v3 bft finalize summary: applied count`；而不补前导时，症状更接近后续 `machine` 写回口径。说明真正被污染的是“预演之后的后续 finalize 视图”，不是单次 authoritative apply。 |
+- 这也解释了为什么 `/Users/lbcheng/cheng-lang/artifacts/v3_tmp_bft_state_machine_smoke` 一直停在 `v3 bft self-test: block1 applied count`：`block1` 之前唯一新增的高风险动作就是 `v3BftStateMachineCheckTx(...)` 和 `v3BftStateMachineCheckTxBytes(...)`。继续围着 `FinalizeBatchSummary` 自身打补丁，收益已经明显变低。 |
+- `bytesFromString(\"...\")` 直接塞给复合参数调用在当前 seed 里还会触发 `direct str-arg scratch overflow`。把它改成 `let prefix = bytesFromString(\"...\"); byteBufAppendBytes(buf, prefix)` 之后，`bft_finalize_summary_smoke` 才重新回到可 fresh 编译状态。这不是测试偶发现象，而是 ordinary lowering 目前对“直接字符串字面量 -> 复合值 -> 复合参数”这条链还不稳。 |
+- `run_v3_host_smokes.sh` 这轮的首个 host blocker 已经不在 crypto/BFT 这边，而是稳定前移到 `parser_path_smoke`。这说明热核和当前 `BFT` bring-up 的前置宿主面已经基本够用了，后面该并行盯 `parser path` 与 `CheckTx` 预演链。 |
+- `lowering_plan_smoke` 这次真正的崩点不是 `@importc` 过滤本身，也不是 `v3LoweringFunctionSymbolText` 这一个函数名；根在 seed 里 `str +` 的 lowering 走了“裸 `char*` 拼接 + 手写回 `str`”这套脆弱路径。只要碰上嵌套拼接、slice 出来的局部字符串或更深的 call-depth，`str` 布局和 ABI 就很容易被写坏。把它收正成 `driver_c_str_concat_bridge(ChengStrBridge, ChengStrBridge) -> ChengStrBridge` 之后，`lowering_plan_smoke`、`lowering_line_local_smoke`、`compiler_pipeline_stub_smoke` 全部重新稳定通过。 |
+- `v3PassiveAntiEntropySyncRequired(...)` 这种“只包一层 `!signatureEqual(...)`”的布尔包装在当前 ordinary/host 主线里不值得信任。把它改成显式 `if equal -> false else -> true` 之后，`chain_node` 的“second sync idle”假失败才被剥掉，说明这种一层 negation wrapper 以后要尽量少留在热路径判断里。 |
+- `chain_node` 二次同步真正的机器级坏点不是反熵语义，而是 `LSMR` 树构建里对嵌套 `seq` 字段原地 grow。LLDB 已经把崩溃钉到 [lsmr.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/lsmr.cheng) 的 `entryKeyIds` grow 上；所以后续凡是类似 `tree/forest/index` 这种大复合结构，优先用“局部值构建 -> 一次性赋回”，不要在 `var out.fieldSeq` 上边 grow 边写。 |
+- `anti_entropy`、`lsmr_locality_storage`、`lsmr_bagua_prefix_tree` 这几条 smoke 之前失败，不是算法错，而是测试自己把 `AddressFromSeed/LocalityHashText/StateCellFromText` 的文本壳带进了 ordinary 主线。现在改成 fixed hash、直接 digits、直接 `StateCellFill` 以后全部通过，说明 `v3` host smoke 以后要坚持“只测 fixed-layout 数据面，不顺带测文本兼容层”。 |
+- `chain_node_libp2p_smoke` 现在的剩余问题已经不是 ordinary compile。最新 targeted 结果说明它已经能完整编译和链接，真正失败点前移到运行期 `decodeSnapshot`。也就是说，下一刀该查的是 [chain_node_libp2p.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_libp2p.cheng) 里的快照编解码一致性，不要再把它误判成 host compiler 句型缺口。 |
+- `v3_parse_fixed_array_type(...)` 之前把 `int32[]` 误判成了 `int32[0]`。这个 bug 平时不容易一眼看出来，因为 `var xs: int32[]` 默认零初始化还能过，但一旦把 `[1,2,3]` 物化到推导出来的 `int32[]`，lowering 就会先走 fixed-array 分支，再被“长度必须等于 0”卡死。`var zs = [1,2,3]` 这条假失败的真根就在这里。 |
+- `list literal -> T[N]` 真闭环不能只验声明初始化，参数和返回也要一起验。现在 [default_init_literals_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/default_init_literals_smoke.cheng) 已经把 `sumFixed([1,2,3])` 和 `return [7,8,9]` 都钉进去，能直接防住“声明能过、参数或返回又掉回去”的回归。 |
+- `if/ternary` 的 fixed-array 假失败，根也不在 list literal 物化本体，而在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 `v3_materialize_composite_expr_into_address(...)` 入口预判：它先拿无上下文 `v3_infer_expr_type(...)` 比较两边分支是否“类型完全相等”，而 `[1,2,3]` 在无上下文下永远只会被看成 `T[]`。所以 `var xs: T[N] = if ...` 和 `return if ...` 之前会被挡在真正 materialize 之前。 |
+- `if/ternary` 的参数面还有第二层坑：即使绑定/返回已经能按目标类型落地，`sumFixed(if ... )` 这类调用如果先让 `v3_prepare_composite_call_arg_temp(...)` 自己推导临时槽类型，还是会把槽位开成 `T[]`，运行期再把错布局的值按 `T[N]` 传进去，表面上就只剩断言失败。正确修法就是在“目标参数类型已知且是 composite”时，让 `if/ternary` 实参的临时槽直接按目标类型开。 |
+- `chain_node_libp2p_smoke` 这条并行核对到的当前状态已经是绿的：host、`stage2`、`stage3` 三条线现在都直接输出 `v3 chain_node_libp2p_smoke ok`。所以旧的 `decodeSnapshot` 失败结论要当历史故障看，不能再把它当作当前 blocker。 |
+- 模块级 `var g: T[N] = ...` 这条之前缺的不是 fixed-array 物化，而是“全局初始化执行阶段”本身。`v3_append_module_global_storage(...)` 只会分配 `.space`，入口桥也只 `b entry`；只要这两点不改，`[...]`、`if ...`、`cond ? ... : ...` 放在顶层 `var` 上都会掉成零内存。正确修法就是补 `__v3_module_init` 真执行表达式，再在 exe bridge 里先 `bl module_init`，不能用“字面量静态写 `.word`、分支初始化另算”这种分裂语义的做法。 |
+- 给 entry bridge 增加 `bl module_init` 时，不能直接在原来的 `b entry` 前插调用。桥本来靠保留调用者传下来的 `x30`，让 `entry` 的 `ret` 直接回 runtime；一旦先 `bl` 而不保存恢复 `x30`，`entry` 返回地址就会被改写到桥内部，运行期会跳回错误位置。正确形态必须是“桥先保存 `x30`，调完所有 module init 后恢复，再 `b entry`”。 |
+- 模块 init 接上以后，还要把“顶层 `var` 初始化表达式里的函数调用”接进 reachable/lowering。否则像 `std/crypto/ed25519/ref10::initCurveOrder()` 这种只被全局初始化引用、从 `main` 本身不可达的函数，虽然源码存在，`module_init` 真发码时还是会因为找不到 callee 而失败。正确修法不是给 `module_init` 特判裸名字，而是让顶层 `var` 初始化表达式也参与 reachable seed。 |
+- `Wrap(xs: if ... )` 现在暴露的是另一条独立洞：同模块 record 类型布局/复合返回链还没稳，不属于这轮模块初始化根因。把它和模块级 global init 混在一个 smoke 里，只会让验收结果失真。 |
+- `libp2p_quic_tls_smoke` 这轮并行核对后，`unresolved_import_count=1` 的唯一真名已经坐实是 `core/option`，不是文件缺失。根在 `v3` 普通编译的模块解析没把 `core/` 前缀映射到 `<workspace>/src/core/*.cheng`；补上以后，这条假红会直接消失。
+- `std/system::strToCStringTemp` 的第一层真阻塞不是函数逻辑本身，而是 `v3_codegen_compare_expr_scalar(...)` 把 `strDataPtr(s) == nil` 两侧错按 `i64` 发射。把 `ptr == nil` 收成按 `ptr/x` 比较以后，QUIC/TLS 定向编译已经能越过这层，首个真缺口前移到 `bitandCompat(s.flags, chengStrFlagOwned) != 0`。
+- 继续把“窄标量比较”也改成按 `w` 路发射时，fresh `stage1/2/3` 在 `libp2p_quic_tls_smoke` 上会直接崩进 `libsystem_c::__vfprintf`。这说明当前 self-host compiler 还存在更深一层“unsupported/诊断打印链”稳定性问题；在没把这条栈钉死前，不能再盲推 compare lowering。
+- 同一份 fresh `cheng.stage2` 仍能稳定编过 `libp2p_host_smoke`，所以当前崩溃不是整条自举链都坏了，而是 QUIC/TLS 深闭包特有的 compile-time 崩点。下一刀该直接查 self-host compiler 在大 unsupported 集合上的诊断字符串/明细收集，而不是再回头查 `core/option` 或 `ptr == nil`。 
+- `libp2p_quic_tls_smoke` 这轮继续前推后，`std/os` 真 blocker 已经被清空。`openImpl*` 的 `str mode` 局部绑定和 `udpRecvFromFdAddrEx(...)` 的 `addrLen`/指针混合路径确实会卡 ordinary；压平成 `pathText + literal mode` 和显式 `payloadPtr/addrPtr` 以后，首个 unsupported 已经不再落在 `std/os`。 |
+- `std/times` 这里真正需要的是“整数秒”而不是 seed 里还没打通的 `float64 -> int64` cast。当前 runtime 本身就是 `time(NULL)` 秒级，所以补 `cheng_epoch_time_seconds()` 是把真实宿主能力显式化，不是兜底。补完以后，`std/times::epochTimeSeconds` 已从 `libp2p_quic_tls_smoke` 的第一处 unsupported 消失。 |
+- seed 的 prepare 阶段之前把 builtin cast 当普通调用，也会把 `var` 复合参数误当“需要先 materialize 的值参数”。这两条都已经在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 收掉；它们不是 QUIC 特例，而是 ordinary prepare 面的通用缺口。 |
+- 现在 `libp2p_quic_tls_smoke` 的真前沿已经正式进入 [native_runtime.cheng](/Users/lbcheng/cheng-lang/v3/src/quic/native_runtime.cheng)。最新日志显示最前面的 prepare 失败集中在 `msquicTls13BuildClientHello(...)` 和 `msquicTls13BuildEncryptedExtensions(...)`，也就是 `native_runtime + tls/crypto` 主体，不再是 `std/os/std/times` 入口层。 |

@@ -1,17 +1,14 @@
-import std/os
-import std/system
 import std/result
-import std/strutils as strutil
 import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
-import cheng/v3/ir/core_types as ir
 
 fn main(): int32 =
-    let workspaceRoot = os.getCurrentDir()
-    let packageRoot = os.joinPath(workspaceRoot, "v3")
-    let sourcePath = os.joinPath(packageRoot, "src/tests/program_selfhost_smoke.cheng")
-    let outputPath = os.joinPath(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+    let workspaceRoot = v3path.v3PathCurrentDir()
+    let packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    let sourcePath = v3path.v3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
     let req = creq.v3CompilerRequestNew(
         packageRoot,
         sourcePath,
@@ -20,31 +17,28 @@ fn main(): int32 =
         creq.v3EmitExe,
         ""
     )
-    let linkPlanRes: Result[slplan.V3SystemLinkPlanStub] = slplan.v3BuildSystemLinkPlanStub(packageRoot, req)
-    if IsErr(linkPlanRes):
-        echo("v3 lowering_plan_smoke link err: " + Error(linkPlanRes))
-        return 1
-    let loweringRes: Result[lower.V3LoweringPlanStub] = lower.v3BuildLoweringPlanStub(Value(linkPlanRes))
-    if IsErr(loweringRes):
-        echo("v3 lowering_plan_smoke lowering err: " + Error(loweringRes))
-        return 1
-    let linkPlan = Value(linkPlanRes)
-    let plan = Value(loweringRes)
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(packageRoot, req, linkPlan, err), "v3 lowering plan: build link plan")
     assert(linkPlan.missingReasons.len == 0, "v3 lowering plan: link plan ready")
+    var plan: lower.V3LoweringPlanStub
+    assert(lower.v3BuildLoweringPlanStub(linkPlan, plan, err), "v3 lowering plan: build lowering plan")
     assert(plan.functionNames.len >= 1, "v3 lowering plan: function count")
     assert(plan.functionNameIds[0] >= 0, "v3 lowering plan: intern id")
-    assert(plan.functionCallConvs[0] == int32(ir.v3CallInternal), "v3 lowering plan: callconv")
+    assert(plan.functionCallConvs[0] == lower.v3LoweringCallConvInternal(), "v3 lowering plan: callconv")
     var sawMain = false
     for i in 0..<plan.functionNames.len:
+        assert(!(plan.functionOwnerModulePaths[i] == "std/system" && plan.functionNames[i] == "mulCompat"),
+               "v3 lowering plan: skip importc decl")
         if plan.functionEntryFlags[i] != 0:
             sawMain = true
             assert(plan.functionNames[i] == "main", "v3 lowering plan: entry name")
-            assert(plan.functionResultLayoutKinds[i] == int32(ir.v3LayoutI32), "v3 lowering plan: entry layout")
+            assert(plan.functionResultLayoutKinds[i] == lower.v3LoweringLayoutKindI32(), "v3 lowering plan: entry layout")
     assert(sawMain, "v3 lowering plan: saw entry")
     let report = lower.v3LoweringPlanStubReport(plan)
-    assert(strutil.contains(report, "lowering_function_count="), "v3 lowering plan: report function count")
-    assert(strutil.contains(report, "lowering_missing_reasons=-"), "v3 lowering plan: no lowering blockers")
-    assert(strutil.contains(report, "exec_pipeline_stage=system_link_plan_to_lowering_plan_stub"),
+    assert(v3path.v3TextContains(report, "lowering_function_count="), "v3 lowering plan: report function count")
+    assert(v3path.v3TextContains(report, "lowering_missing_reasons=-"), "v3 lowering plan: no lowering blockers")
+    assert(v3path.v3TextContains(report, "exec_pipeline_stage=system_link_plan_to_lowering_plan_stub"),
            "v3 lowering plan: report stage")
     echo("v3 lowering_plan_smoke ok")
     return 0

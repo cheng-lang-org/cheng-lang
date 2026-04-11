@@ -1,0 +1,33 @@
+import std/system
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/host/host
+import cheng/v3/libp2p/transports/tcp_transport
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
+
+fn main(): int32 =
+    let port = driver_c_read_int32_flag_or_default_bridge("--port", 0)
+    var ready_path: str = ""
+    let has_ready = driver_c_read_flag_value_bridge("--ready-path", ready_path)
+    let ready_path_value = if has_ready: ready_path else: ""
+    var server = node.v3ChainNodeInit("tcp.twoproc.server", "tcp.twoproc")
+    var serverHost = host.v3Libp2pHostInit("tcp.twoproc.server")
+    let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
+    assert(mintRes.ok, "v3 libp2p tcp twoproc: server mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 9, 1001, 2002, int64(33))
+    assert(transferRes.ok, "v3 libp2p tcp twoproc: server transfer")
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(serveRes.ok, "v3 libp2p tcp twoproc: server serve once")
+    let latestRes = net.v3ChainNodeLibp2pLatestSnapshot(serverHost, server.address)
+    assert(latestRes.ok, "v3 libp2p tcp twoproc: server latest snapshot")
+    let tcpServeRes = tcp_transport.v3Libp2pTcpServePayloadOnce("127.0.0.1",
+                                                                port,
+                                                                types.v3Libp2pProtocolSync,
+                                                                latestRes.value.payload,
+                                                                ready_path_value)
+    assert(tcpServeRes.ok, "v3 libp2p tcp twoproc: server tcp serve")
+    echo("v3 libp2p_tcp_twoproc_server ok")
+    return 0

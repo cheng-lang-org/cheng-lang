@@ -11,6 +11,11 @@
 #include <unistd.h>
 #include <signal.h>
 #if !defined(_WIN32)
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#endif
+#if !defined(_WIN32)
 #include <spawn.h>
 #if defined(__APPLE__)
 #include <sys/event.h>
@@ -33,12 +38,14 @@
 #define CHENG_HAS_EXECINFO 0
 #endif
 #if defined(__APPLE__)
+#include <sys/ucontext.h>
 #include <mach-o/dyld.h>
 #include <crt_externs.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #endif
 #include "cheng_sidecar_loader.h"
+#include "../../../v3/runtime/native/v3_str_twoway_search.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
@@ -47,6 +54,12 @@
 #define WEAK __attribute__((weak))
 #else
 #define WEAK
+#endif
+
+#if defined(__APPLE__)
+#define CHENG_WEAK_IMPORT __attribute__((weak_import))
+#else
+#define CHENG_WEAK_IMPORT WEAK
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -68,6 +81,11 @@ typedef struct ChengErrorInfoCompat {
     char* msg;
 } ChengErrorInfoCompat;
 
+typedef struct ChengBytesBridge {
+    void* data;
+    int32_t len;
+} ChengBytesBridge;
+
 void* cheng_malloc(int32_t size);
 int32_t cheng_strlen(char* s);
 void cheng_mem_retain(void* p);
@@ -86,6 +104,9 @@ char* driver_c_bool_to_str(bool value);
 static char* cheng_copy_string_bytes(const char* src, size_t len);
 static int driver_c_runtime_resolve_self_path(char* out, size_t out_cap);
 void cheng_dump_backtrace_if_enabled(void);
+static int cheng_backtrace_enabled(void);
+static void cheng_dump_native_backtrace_if_enabled(void);
+static void cheng_dump_backtrace_now(const char* reason);
 
 static bool cheng_probably_valid_ptr(const void* p) {
     uintptr_t raw = (uintptr_t)p;
@@ -483,6 +504,16 @@ void cheng_rawmem_write_char(void* dst, int32_t idx, int32_t value) {
     ((uint8_t*)dst)[idx] = (uint8_t)value;
 }
 
+int32_t cheng_force_segv(void) {
+#if defined(_WIN32)
+    volatile int* p = (volatile int*)0;
+    *p = 1;
+#else
+    raise(SIGSEGV);
+#endif
+    return 0;
+}
+
 void* cheng_seq_slice_alloc(void* buffer, int32_t len, int32_t start_pos, int32_t stop_pos,
                             int32_t exclusive, int32_t elem_size,
                             int32_t* out_len, int32_t* out_cap) {
@@ -558,11 +589,13 @@ enum {
 };
 
 static bool cheng_probably_valid_str_bridge(const ChengStrBridge* s) {
+    uintptr_t raw_ptr = 0;
     if (s == NULL) return false;
     if (s->len < 0 || s->len > (1 << 28)) return false;
     if ((s->flags & ~CHENG_STR_BRIDGE_FLAG_OWNED) != 0) return false;
     if (s->ptr == NULL) return s->len == 0;
-    return cheng_probably_valid_ptr(s->ptr);
+    raw_ptr = (uintptr_t)s->ptr;
+    return raw_ptr >= (uintptr_t)65536;
 }
 
 char* cheng_str_param_to_cstring_compat(void* raw) {
@@ -572,6 +605,190 @@ char* cheng_str_param_to_cstring_compat(void* raw) {
     if ((raw_addr & (uintptr_t)(sizeof(void*) - 1)) != 0) return (char*)raw;
     if (!cheng_probably_valid_str_bridge((const ChengStrBridge*)raw)) return (char*)raw;
     return NULL;
+}
+
+char* driver_c_new_string(int32_t n);
+char* driver_c_new_string_copy_n(void* raw, int32_t n);
+
+WEAK char* cheng_str_to_cstring_temp_bridge(ChengStrBridge s) {
+    char* compat = cheng_str_param_to_cstring_compat((void*)s.ptr);
+    if (compat != NULL) return compat;
+    if (s.len <= 0 || s.ptr == NULL) return driver_c_new_string(0);
+    if (s.flags != 0) return (char*)s.ptr;
+    compat = driver_c_new_string_copy_n((void*)s.ptr, s.len);
+    if (compat != NULL) return compat;
+    return driver_c_new_string(0);
+}
+
+WEAK int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
+                                                int32_t port,
+                                                int32_t isV6,
+                                                int32_t* outFd,
+                                                int32_t* outPort,
+                                                int32_t* outFamily,
+                                                int32_t* outUseLenField) {
+    const char* host_text = cheng_str_to_cstring_temp_bridge(host);
+    int fd = -1;
+    int rc = -1;
+    if (outFd == NULL || outPort == NULL || outFamily == NULL || outUseLenField == NULL) {
+        return EINVAL;
+    }
+    *outFd = -1;
+    *outPort = 0;
+    *outFamily = 0;
+    *outUseLenField = 0;
+    if (port < 0 || port > 65535) {
+        return EINVAL;
+    }
+    if (isV6 != 0) {
+        struct sockaddr_in6 addr6;
+        memset(&addr6, 0, sizeof(addr6));
+        fd = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            return errno;
+        }
+#if defined(__APPLE__)
+        addr6.sin6_len = (uint8_t)sizeof(addr6);
+        *outUseLenField = 1;
+#endif
+        addr6.sin6_family = AF_INET6;
+        addr6.sin6_port = htons((uint16_t)port);
+        if (host_text == NULL || host_text[0] == 0 || strcmp(host_text, "localhost") == 0) {
+            addr6.sin6_addr = in6addr_loopback;
+        } else if (inet_pton(AF_INET6, host_text, &addr6.sin6_addr) != 1) {
+            close(fd);
+            return EINVAL;
+        }
+        rc = bind(fd, (const struct sockaddr*)&addr6, (socklen_t)sizeof(addr6));
+        if (rc != 0) {
+            int err = errno;
+            close(fd);
+            return err;
+        }
+        if (port == 0) {
+            socklen_t len = (socklen_t)sizeof(addr6);
+            if (getsockname(fd, (struct sockaddr*)&addr6, &len) != 0) {
+                int err = errno;
+                close(fd);
+                return err;
+            }
+        }
+        *outFd = fd;
+        *outPort = (int32_t)ntohs(addr6.sin6_port);
+        *outFamily = AF_INET6;
+        return 0;
+    }
+    {
+        struct sockaddr_in addr4;
+        memset(&addr4, 0, sizeof(addr4));
+        fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (fd < 0) {
+            return errno;
+        }
+#if defined(__APPLE__)
+        addr4.sin_len = (uint8_t)sizeof(addr4);
+        *outUseLenField = 1;
+#endif
+        addr4.sin_family = AF_INET;
+        addr4.sin_port = htons((uint16_t)port);
+        if (host_text == NULL || host_text[0] == 0 || strcmp(host_text, "localhost") == 0) {
+            addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        } else if (inet_pton(AF_INET, host_text, &addr4.sin_addr) != 1) {
+            close(fd);
+            return EINVAL;
+        }
+        rc = bind(fd, (const struct sockaddr*)&addr4, (socklen_t)sizeof(addr4));
+        if (rc != 0) {
+            int err = errno;
+            close(fd);
+            return err;
+        }
+        if (port == 0) {
+            socklen_t len = (socklen_t)sizeof(addr4);
+            if (getsockname(fd, (struct sockaddr*)&addr4, &len) != 0) {
+                int err = errno;
+                close(fd);
+                return err;
+            }
+        }
+        *outFd = fd;
+        *outPort = (int32_t)ntohs(addr4.sin_port);
+        *outFamily = AF_INET;
+        return 0;
+    }
+}
+
+static int32_t cheng_v3_hex_value_ascii(char c) {
+    if (c >= '0' && c <= '9') {
+        return (int32_t)(c - '0');
+    }
+    if (c >= 'a' && c <= 'f') {
+        return 10 + (int32_t)(c - 'a');
+    }
+    if (c >= 'A' && c <= 'F') {
+        return 10 + (int32_t)(c - 'A');
+    }
+    return -1;
+}
+
+void cheng_v3_test_pki_hex_decode_into_bridge(ChengStrBridge text, ChengBytesBridge* out) {
+    if (out == NULL) {
+        return;
+    }
+    out->data = NULL;
+    out->len = 0;
+    char* raw = cheng_str_to_cstring_temp_bridge(text);
+    if (raw == NULL) {
+        return;
+    }
+    int32_t text_len = cheng_strlen(raw);
+    if (text_len <= 0) {
+        return;
+    }
+    if ((text_len & 1) != 0) {
+        abort();
+    }
+    int32_t pair_count = text_len / 2;
+    uint8_t* decoded = (uint8_t*)cheng_malloc(pair_count);
+    if (decoded == NULL) {
+        abort();
+    }
+    for (int32_t i = 0; i < pair_count; ++i) {
+        int32_t src = i * 2;
+        int32_t hi = cheng_v3_hex_value_ascii(raw[src]);
+        int32_t lo = cheng_v3_hex_value_ascii(raw[src + 1]);
+        if (hi < 0 || lo < 0) {
+            abort();
+        }
+        decoded[i] = (uint8_t)((hi << 4) | lo);
+    }
+    out->data = decoded;
+    out->len = pair_count;
+}
+
+ChengBytesBridge cheng_v3_test_pki_hex_decode_bridge(ChengStrBridge text) {
+    ChengBytesBridge out;
+    out.data = NULL;
+    out.len = 0;
+    cheng_v3_test_pki_hex_decode_into_bridge(text, &out);
+    return out;
+}
+
+void* cheng_v3_test_pki_hex_decode_ptr_bridge(ChengStrBridge text) {
+    ChengBytesBridge out = cheng_v3_test_pki_hex_decode_bridge(text);
+    return out.data;
+}
+
+int32_t cheng_v3_test_pki_hex_decode_len_bridge(ChengStrBridge text) {
+    char* raw = cheng_str_to_cstring_temp_bridge(text);
+    if (raw == NULL) {
+        return 0;
+    }
+    int32_t text_len = cheng_strlen(raw);
+    if (text_len <= 0 || (text_len & 1) != 0) {
+        return 0;
+    }
+    return text_len / 2;
 }
 
 static ChengStrBridge cheng_str_bridge_empty(void);
@@ -693,10 +910,13 @@ static int cheng_flag_enabled(const char* raw) {
 }
 
 static int cheng_crash_trace_env_enabled(void) {
-    if (cheng_flag_enabled(getenv("CHENG_CRASH_TRACE"))) return 1;
-    if (cheng_flag_enabled(getenv("BACKEND_CRASH_TRACE"))) return 1;
-    if (cheng_flag_enabled(getenv("STAGE1_CRASH_TRACE"))) return 1;
-    return 0;
+    const char* raw = getenv("CHENG_CRASH_TRACE");
+    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+    raw = getenv("BACKEND_CRASH_TRACE");
+    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+    raw = getenv("STAGE1_CRASH_TRACE");
+    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+    return 1;
 }
 
 static size_t cheng_crash_trace_cstrnlen(const char* s, size_t limit) {
@@ -740,6 +960,21 @@ static void cheng_crash_trace_write_i32(int32_t value) {
     cheng_crash_trace_write_cstr(out);
 }
 
+static void cheng_crash_trace_write_hex_uintptr(uintptr_t value) {
+    static const char hex[] = "0123456789abcdef";
+    char buf[2 + sizeof(uintptr_t) * 2 + 1];
+    size_t digits = sizeof(uintptr_t) * 2U;
+    size_t i;
+    buf[0] = '0';
+    buf[1] = 'x';
+    for (i = 0; i < digits; ++i) {
+        unsigned shift = (unsigned)((digits - 1U - i) * 4U);
+        buf[2 + i] = hex[(value >> shift) & 0xfU];
+    }
+    buf[2 + digits] = '\0';
+    cheng_crash_trace_write_buf(buf, 2U + digits);
+}
+
 static void cheng_crash_trace_dump_async(const char* reason, int32_t sig) {
     cheng_crash_trace_write_cstr("[cheng-crash-trace] reason=");
     cheng_crash_trace_write_cstr(reason);
@@ -773,24 +1008,422 @@ static void cheng_crash_trace_dump_async(const char* reason, int32_t sig) {
     }
 }
 
-static void cheng_crash_trace_signal_handler(int sig) {
+typedef struct ChengV3EmbeddedLineMapEntry {
+    const void* start_pc;
+    const void* end_pc;
+    const char* function_name;
+    const char* source_path;
+    int32_t signature_line;
+    int32_t body_first_line;
+    int32_t body_last_line;
+    int32_t reserved;
+} ChengV3EmbeddedLineMapEntry;
+
+typedef const ChengV3EmbeddedLineMapEntry* (*ChengV3EmbeddedLineMapEntriesGetter)(void);
+typedef uint64_t (*ChengV3EmbeddedLineMapCountGetter)(void);
+
+static ChengV3EmbeddedLineMapEntriesGetter cheng_v3_embedded_line_map_entries_getter = NULL;
+static ChengV3EmbeddedLineMapCountGetter cheng_v3_embedded_line_map_count_getter = NULL;
+static volatile int32_t cheng_v3_embedded_line_map_getters_resolved = 0;
+
+static void cheng_v3_try_resolve_embedded_line_map_getters(void) {
+    if (__sync_lock_test_and_set(&cheng_v3_embedded_line_map_getters_resolved, 1) != 0) {
+        return;
+    }
+    dlerror();
+    cheng_v3_embedded_line_map_entries_getter =
+        (ChengV3EmbeddedLineMapEntriesGetter)dlsym(RTLD_DEFAULT, "cheng_v3_embedded_line_map_entries_get");
+    dlerror();
+    cheng_v3_embedded_line_map_count_getter =
+        (ChengV3EmbeddedLineMapCountGetter)dlsym(RTLD_DEFAULT, "cheng_v3_embedded_line_map_count_get");
+}
+
+static const ChengV3EmbeddedLineMapEntry* cheng_v3_embedded_line_map_find_pc_in_entries(
+    const ChengV3EmbeddedLineMapEntry* entries,
+    uint64_t count,
+    uintptr_t pc
+) {
+    uint64_t i;
+    if (entries == NULL || count == 0U || pc == 0U) {
+        return NULL;
+    }
+    for (i = 0; i < count; ++i) {
+        uintptr_t start = (uintptr_t)entries[i].start_pc;
+        uintptr_t end = (uintptr_t)entries[i].end_pc;
+        if (start == 0U) {
+            continue;
+        }
+        if (pc < start) {
+            continue;
+        }
+        if (end != 0U && pc >= end) {
+            continue;
+        }
+        return &entries[i];
+    }
+    return NULL;
+}
+
+static void cheng_v3_async_write_line_span(const ChengV3EmbeddedLineMapEntry* entry) {
+    int32_t line_start = 0;
+    int32_t line_end = 0;
+    if (entry == NULL) {
+        return;
+    }
+    line_start = entry->body_first_line > 0 ? entry->body_first_line : entry->signature_line;
+    line_end = entry->body_last_line > 0 ? entry->body_last_line : line_start;
+    cheng_crash_trace_write_i32(line_start);
+    if (line_end > line_start) {
+        cheng_crash_trace_write_cstr("-");
+        cheng_crash_trace_write_i32(line_end);
+    }
+}
+
+static void cheng_v3_async_write_source_frame(int32_t frame_index,
+                                              const ChengV3EmbeddedLineMapEntry* entry,
+                                              uintptr_t pc) {
+    if (entry == NULL) {
+        return;
+    }
+    cheng_crash_trace_write_cstr("[cheng-v3] #");
+    cheng_crash_trace_write_i32(frame_index);
+    cheng_crash_trace_write_cstr(" ");
+    cheng_crash_trace_write_cstr(
+        entry->function_name != NULL && entry->function_name[0] != '\0' ? entry->function_name : "?"
+    );
+    cheng_crash_trace_write_cstr(" ");
+    cheng_crash_trace_write_cstr(
+        entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?"
+    );
+    cheng_crash_trace_write_cstr(":");
+    cheng_v3_async_write_line_span(entry);
+    cheng_crash_trace_write_cstr(" pc=");
+    cheng_crash_trace_write_hex_uintptr(pc);
+    cheng_crash_trace_write_cstr("\n");
+}
+
+static void cheng_v3_async_write_machine_frame(int32_t frame_index,
+                                               uintptr_t pc,
+                                               uintptr_t fp,
+                                               uintptr_t sp,
+                                               uintptr_t lr,
+                                               const ChengV3EmbeddedLineMapEntry* entry) {
+    uintptr_t offset = 0U;
+    if (entry != NULL && entry->start_pc != NULL && pc >= (uintptr_t)entry->start_pc) {
+        offset = pc - (uintptr_t)entry->start_pc;
+    }
+    cheng_crash_trace_write_cstr("[cheng-v3] m#");
+    cheng_crash_trace_write_i32(frame_index);
+    cheng_crash_trace_write_cstr(" pc=");
+    cheng_crash_trace_write_hex_uintptr(pc);
+    cheng_crash_trace_write_cstr(" fp=");
+    cheng_crash_trace_write_hex_uintptr(fp);
+    cheng_crash_trace_write_cstr(" sp=");
+    if (sp != 0U) {
+        cheng_crash_trace_write_hex_uintptr(sp);
+    } else {
+        cheng_crash_trace_write_cstr("?");
+    }
+    cheng_crash_trace_write_cstr(" lr=");
+    if (lr != 0U) {
+        cheng_crash_trace_write_hex_uintptr(lr);
+    } else {
+        cheng_crash_trace_write_cstr("?");
+    }
+    cheng_crash_trace_write_cstr(" off=");
+    cheng_crash_trace_write_hex_uintptr(offset);
+    if (entry != NULL) {
+        cheng_crash_trace_write_cstr(" fn=");
+        cheng_crash_trace_write_cstr(
+            entry->function_name != NULL && entry->function_name[0] != '\0' ? entry->function_name : "?"
+        );
+        cheng_crash_trace_write_cstr(" src=");
+        cheng_crash_trace_write_cstr(
+            entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?"
+        );
+        cheng_crash_trace_write_cstr(":");
+        cheng_v3_async_write_line_span(entry);
+    }
+    cheng_crash_trace_write_cstr("\n");
+}
+
+static uintptr_t cheng_v3_signal_context_pc(void* signal_context) {
+#if defined(__APPLE__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL || context->uc_mcontext == NULL) {
+        return 0U;
+    }
+#if defined(__arm64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_pc(context->uc_mcontext->__ss);
+#elif defined(__x86_64__)
+    return (uintptr_t)context->uc_mcontext->__ss.__rip;
+#elif defined(__i386__)
+    return (uintptr_t)context->uc_mcontext->__ss.__eip;
+#else
+    return 0U;
+#endif
+#else
+    (void)signal_context;
+    return 0U;
+#endif
+}
+
+static uintptr_t cheng_v3_signal_context_fp(void* signal_context) {
+#if defined(__APPLE__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL || context->uc_mcontext == NULL) {
+        return 0U;
+    }
+#if defined(__arm64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss);
+#elif defined(__x86_64__)
+    return (uintptr_t)context->uc_mcontext->__ss.__rbp;
+#elif defined(__i386__)
+    return (uintptr_t)context->uc_mcontext->__ss.__ebp;
+#else
+    return 0U;
+#endif
+#else
+    (void)signal_context;
+    return 0U;
+#endif
+}
+
+static uintptr_t cheng_v3_signal_context_sp(void* signal_context) {
+#if defined(__APPLE__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL || context->uc_mcontext == NULL) {
+        return 0U;
+    }
+#if defined(__arm64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_sp(context->uc_mcontext->__ss);
+#elif defined(__x86_64__)
+    return (uintptr_t)context->uc_mcontext->__ss.__rsp;
+#elif defined(__i386__)
+    return (uintptr_t)context->uc_mcontext->__ss.__esp;
+#else
+    return 0U;
+#endif
+#else
+    (void)signal_context;
+    return 0U;
+#endif
+}
+
+static uintptr_t cheng_v3_signal_context_lr(void* signal_context) {
+#if defined(__APPLE__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL || context->uc_mcontext == NULL) {
+        return 0U;
+    }
+#if defined(__arm64__)
+    return (uintptr_t)__darwin_arm_thread_state64_get_lr(context->uc_mcontext->__ss);
+#elif defined(__x86_64__) || defined(__i386__)
+    return 0U;
+#else
+    return 0U;
+#endif
+#else
+    (void)signal_context;
+    return 0U;
+#endif
+}
+
+static int32_t cheng_v3_dump_machine_signal_frames(const ChengV3EmbeddedLineMapEntry* entries,
+                                                   uint64_t count,
+                                                   uintptr_t pc,
+                                                   uintptr_t fp,
+                                                   uintptr_t sp,
+                                                   uintptr_t lr) {
+    int32_t depth = 0;
+    int32_t emitted = 0;
+    uintptr_t current_pc = pc;
+    uintptr_t current_fp = fp;
+    uintptr_t current_sp = sp;
+    uintptr_t current_lr = lr;
+    while (current_pc != 0U && depth < 48) {
+        const ChengV3EmbeddedLineMapEntry* entry =
+            cheng_v3_embedded_line_map_find_pc_in_entries(entries, count, current_pc);
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+        if (depth > 0 &&
+            cheng_probably_valid_ptr((const void*)current_fp) &&
+            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) == 0U) {
+            const uintptr_t* current_frame = (const uintptr_t*)current_fp;
+            current_lr = current_frame[1];
+        }
+#endif
+        cheng_v3_async_write_machine_frame(depth,
+                                           current_pc,
+                                           current_fp,
+                                           current_sp,
+                                           current_lr,
+                                           entry);
+        emitted += 1;
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
+            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
+            break;
+        }
+        {
+            const uintptr_t* frame = (const uintptr_t*)current_fp;
+            uintptr_t next_fp = frame[0];
+            uintptr_t return_pc = frame[1];
+            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
+                break;
+            }
+            if (return_pc == 0U) {
+                break;
+            }
+#if defined(__arm64__)
+            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
+#else
+            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
+#endif
+            current_fp = next_fp;
+            current_sp = 0U;
+            current_lr = 0U;
+        }
+        depth += 1;
+#else
+        break;
+#endif
+    }
+    return emitted;
+}
+
+static int32_t cheng_v3_dump_source_signal_frames(const ChengV3EmbeddedLineMapEntry* entries,
+                                                  uint64_t count,
+                                                  uintptr_t pc,
+                                                  uintptr_t fp) {
+    int32_t depth = 0;
+    int32_t mapped = 0;
+    uintptr_t current_pc = pc;
+    uintptr_t current_fp = fp;
+    while (current_pc != 0U && depth < 48) {
+        const ChengV3EmbeddedLineMapEntry* entry =
+            cheng_v3_embedded_line_map_find_pc_in_entries(entries, count, current_pc);
+        if (entry != NULL) {
+            cheng_v3_async_write_source_frame(depth, entry, current_pc);
+            mapped += 1;
+        }
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
+            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
+            break;
+        }
+        {
+            const uintptr_t* frame = (const uintptr_t*)current_fp;
+            uintptr_t next_fp = frame[0];
+            uintptr_t return_pc = frame[1];
+            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
+                break;
+            }
+            if (return_pc == 0U) {
+                break;
+            }
+#if defined(__arm64__)
+            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
+#else
+            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
+#endif
+            current_fp = next_fp;
+        }
+        depth += 1;
+#else
+        break;
+#endif
+    }
+    return mapped;
+}
+
+static void cheng_v3_dump_source_signal_trace_if_available(const char* reason,
+                                                           int32_t sig,
+                                                           const siginfo_t* info,
+                                                           void* signal_context) {
+    const ChengV3EmbeddedLineMapEntry* entries = NULL;
+    uint64_t count = 0U;
+    uintptr_t pc = 0U;
+    uintptr_t fp = 0U;
+    uintptr_t sp = 0U;
+    uintptr_t lr = 0U;
+    int32_t mapped = 0;
+    if (cheng_v3_embedded_line_map_entries_getter == NULL || cheng_v3_embedded_line_map_count_getter == NULL) {
+        return;
+    }
+    entries = cheng_v3_embedded_line_map_entries_getter();
+    count = cheng_v3_embedded_line_map_count_getter();
+    if (entries == NULL || count == 0U) {
+        return;
+    }
+    pc = cheng_v3_signal_context_pc(signal_context);
+    if (pc == 0U) {
+        return;
+    }
+    fp = cheng_v3_signal_context_fp(signal_context);
+    sp = cheng_v3_signal_context_sp(signal_context);
+    lr = cheng_v3_signal_context_lr(signal_context);
+    cheng_crash_trace_write_cstr("[cheng-v3] machine-trace reason=");
+    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
+    cheng_crash_trace_write_cstr(" mode=signal sig=");
+    cheng_crash_trace_write_i32(sig);
+    cheng_crash_trace_write_cstr(" pc=");
+    cheng_crash_trace_write_hex_uintptr(pc);
+    cheng_crash_trace_write_cstr(" fp=");
+    cheng_crash_trace_write_hex_uintptr(fp);
+    cheng_crash_trace_write_cstr(" sp=");
+    cheng_crash_trace_write_hex_uintptr(sp);
+    cheng_crash_trace_write_cstr(" lr=");
+    cheng_crash_trace_write_hex_uintptr(lr);
+    if (info != NULL && info->si_addr != NULL) {
+        cheng_crash_trace_write_cstr(" fault=");
+        cheng_crash_trace_write_hex_uintptr((uintptr_t)info->si_addr);
+    }
+    cheng_crash_trace_write_cstr("\n");
+    cheng_v3_dump_machine_signal_frames(entries, count, pc, fp, sp, lr);
+    cheng_crash_trace_write_cstr("[cheng-v3] source-signal reason=");
+    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
+    cheng_crash_trace_write_cstr(" sig=");
+    cheng_crash_trace_write_i32(sig);
+    cheng_crash_trace_write_cstr(" pc=");
+    cheng_crash_trace_write_hex_uintptr(pc);
+    if (info != NULL && info->si_addr != NULL) {
+        cheng_crash_trace_write_cstr(" fault=");
+        cheng_crash_trace_write_hex_uintptr((uintptr_t)info->si_addr);
+    }
+    cheng_crash_trace_write_cstr("\n");
+    mapped = cheng_v3_dump_source_signal_frames(entries, count, pc, fp);
+    if (mapped <= 0) {
+        cheng_crash_trace_write_cstr("[cheng-v3] source-signal mapped_frames=0\n");
+    }
+}
+
+static void cheng_crash_trace_signal_handler(int sig, siginfo_t* info, void* signal_context) {
     if (cheng_crash_trace_handling) _exit(128 + sig);
     cheng_crash_trace_handling = 1;
+    cheng_v3_dump_source_signal_trace_if_available("signal", sig, info, signal_context);
     cheng_crash_trace_dump_async("signal", sig);
+    cheng_dump_native_backtrace_if_enabled();
     _exit(128 + sig);
 }
 
 static void cheng_crash_trace_install_handlers(void) {
     if (__sync_lock_test_and_set(&cheng_crash_trace_installed, 1) != 0) return;
+    cheng_v3_try_resolve_embedded_line_map_getters();
 #if !defined(_WIN32)
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = cheng_crash_trace_signal_handler;
+    sa.sa_sigaction = cheng_crash_trace_signal_handler;
+    sa.sa_flags = SA_SIGINFO;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGABRT, &sa, NULL);
     sigaction(SIGILL, &sa, NULL);
+    sigaction(SIGTRAP, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+#if defined(SIGSYS)
+    sigaction(SIGSYS, &sa, NULL);
+#endif
 #endif
 }
 
@@ -979,6 +1612,93 @@ static const ChengV3LineMapEntry* cheng_v3_line_map_find(const char* symbol) {
     return NULL;
 }
 
+static int32_t cheng_v3_line_span_start(int32_t signature_line,
+                                        int32_t body_first_line) {
+    return body_first_line > 0 ? body_first_line : signature_line;
+}
+
+static int32_t cheng_v3_line_span_end(int32_t line_start,
+                                      int32_t body_last_line) {
+    return body_last_line > 0 ? body_last_line : line_start;
+}
+
+static void cheng_v3_dump_machine_backtrace_if_available(const char* reason) {
+#if CHENG_HAS_EXECINFO
+    void* frames[48];
+    int count = backtrace(frames, 48);
+    int i;
+    const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
+    uint64_t embedded_count = 0U;
+    cheng_v3_try_resolve_embedded_line_map_getters();
+    if (cheng_v3_embedded_line_map_entries_getter != NULL &&
+        cheng_v3_embedded_line_map_count_getter != NULL) {
+        embedded_entries = cheng_v3_embedded_line_map_entries_getter();
+        embedded_count = cheng_v3_embedded_line_map_count_getter();
+    }
+    fprintf(stderr,
+            "[cheng-v3] machine-trace reason=%s mode=backtrace\n",
+            reason != NULL ? reason : "?");
+    for (i = 0; i < count; ++i) {
+        uintptr_t pc = (uintptr_t)frames[i];
+        uintptr_t symbol_pc = 0U;
+        uintptr_t offset = 0U;
+        const char* symbol_name = "?";
+        const char* source_path = NULL;
+        const char* function_name = NULL;
+        int32_t line_start = 0;
+        int32_t line_end = 0;
+        const ChengV3EmbeddedLineMapEntry* embedded_entry =
+            cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
+        const ChengV3LineMapEntry* file_entry = NULL;
+        Dl_info info;
+        memset(&info, 0, sizeof(info));
+        if (dladdr(frames[i], &info) != 0 && info.dli_sname != NULL) {
+            symbol_name = info.dli_sname;
+            symbol_pc = (uintptr_t)info.dli_saddr;
+        }
+        if (embedded_entry != NULL) {
+            symbol_pc = (uintptr_t)embedded_entry->start_pc;
+            function_name = embedded_entry->function_name;
+            source_path = embedded_entry->source_path;
+            line_start = cheng_v3_line_span_start(embedded_entry->signature_line,
+                                                  embedded_entry->body_first_line);
+            line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
+        } else if (symbol_name != NULL && symbol_name[0] != '\0') {
+            file_entry = cheng_v3_line_map_find(symbol_name);
+            if (file_entry != NULL) {
+                function_name = file_entry->function_name;
+                source_path = file_entry->source_path;
+                line_start = cheng_v3_line_span_start(file_entry->signature_line,
+                                                      file_entry->body_first_line);
+                line_end = cheng_v3_line_span_end(line_start, file_entry->body_last_line);
+            }
+        }
+        if (symbol_pc != 0U && pc >= symbol_pc) {
+            offset = pc - symbol_pc;
+        }
+        fprintf(stderr,
+                "[cheng-v3] m#%d pc=0x%zx symbol=%s off=0x%zx",
+                i,
+                (size_t)pc,
+                symbol_name != NULL && symbol_name[0] != '\0' ? symbol_name : "?",
+                (size_t)offset);
+        if (function_name != NULL && function_name[0] != '\0') {
+            fprintf(stderr, " fn=%s", function_name);
+        }
+        if (source_path != NULL && source_path[0] != '\0') {
+            fprintf(stderr, " src=%s:%d", source_path, line_start);
+            if (line_end > line_start) {
+                fprintf(stderr, "-%d", line_end);
+            }
+        }
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+#else
+    (void)reason;
+#endif
+}
+
 static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
     int mapped = 0;
     if (cheng_v3_line_map_len <= 0) return;
@@ -987,37 +1707,68 @@ static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
         void* frames[48];
         int count = backtrace(frames, 48);
         int i;
+        const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
+        uint64_t embedded_count = 0U;
+        cheng_v3_try_resolve_embedded_line_map_getters();
+        if (cheng_v3_embedded_line_map_entries_getter != NULL &&
+            cheng_v3_embedded_line_map_count_getter != NULL) {
+            embedded_entries = cheng_v3_embedded_line_map_entries_getter();
+            embedded_count = cheng_v3_embedded_line_map_count_getter();
+        }
         fprintf(stderr,
                 "[cheng-v3] source-trace reason=%s map=%s\n",
                 reason != NULL ? reason : "?",
                 cheng_v3_line_map_loaded_path[0] != '\0' ? cheng_v3_line_map_loaded_path : "?");
         for (i = 0; i < count; ++i) {
             Dl_info info;
+            const ChengV3EmbeddedLineMapEntry* embedded_entry;
             const ChengV3LineMapEntry* entry;
+            const char* function_name = NULL;
+            const char* source_path = NULL;
             uintptr_t pc;
             uintptr_t symbol_pc;
             uintptr_t offset;
             int32_t line_start;
             int32_t line_end;
-            if (dladdr(frames[i], &info) == 0 || info.dli_sname == NULL) {
-                continue;
-            }
-            entry = cheng_v3_line_map_find(info.dli_sname);
-            if (entry == NULL) {
-                continue;
-            }
             pc = (uintptr_t)frames[i];
-            symbol_pc = (uintptr_t)info.dli_saddr;
-            offset = (symbol_pc != 0 && pc >= symbol_pc) ? (pc - symbol_pc) : 0u;
-            line_start = entry->body_first_line > 0 ? entry->body_first_line : entry->signature_line;
-            line_end = entry->body_last_line > 0 ? entry->body_last_line : line_start;
+            symbol_pc = 0U;
+            offset = 0U;
+            memset(&info, 0, sizeof(info));
+            if (dladdr(frames[i], &info) != 0 && info.dli_sname != NULL) {
+                symbol_pc = (uintptr_t)info.dli_saddr;
+            }
+            embedded_entry =
+                cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
+            entry = NULL;
+            if (embedded_entry != NULL) {
+                symbol_pc = (uintptr_t)embedded_entry->start_pc;
+                function_name = embedded_entry->function_name;
+                source_path = embedded_entry->source_path;
+                line_start = cheng_v3_line_span_start(embedded_entry->signature_line,
+                                                      embedded_entry->body_first_line);
+                line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
+            } else {
+                if (info.dli_sname == NULL) {
+                    continue;
+                }
+                entry = cheng_v3_line_map_find(info.dli_sname);
+                if (entry == NULL) {
+                    continue;
+                }
+                function_name = entry->function_name;
+                source_path = entry->source_path;
+                line_start = cheng_v3_line_span_start(entry->signature_line,
+                                                      entry->body_first_line);
+                line_end = cheng_v3_line_span_end(line_start, entry->body_last_line);
+            }
+            offset = (symbol_pc != 0U && pc >= symbol_pc) ? (pc - symbol_pc) : 0U;
             fprintf(stderr,
                     "[cheng-v3] #%d %s %s:%d",
                     i,
-                    entry->function_name != NULL && entry->function_name[0] != '\0' ?
-                        entry->function_name :
+                    function_name != NULL && function_name[0] != '\0' ?
+                        function_name :
                         (info.dli_sname != NULL ? info.dli_sname : "?"),
-                    entry->source_path != NULL ? entry->source_path : "?",
+                    source_path != NULL ? source_path : "?",
                     line_start);
             if (line_end > line_start) {
                 fprintf(stderr, "-%d", line_end);
@@ -1045,6 +1796,7 @@ WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
     cheng_v3_line_map_registered = 1;
     if (!driver_c_runtime_resolve_self_path(exe_path, sizeof(exe_path))) {
         if (argv0 == NULL || argv0[0] == '\0') {
+            cheng_crash_trace_install_handlers();
             return;
         }
         if (realpath(argv0, exe_path) == NULL) {
@@ -1052,9 +1804,7 @@ WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
         }
     }
     snprintf(map_path, sizeof(map_path), "%s.v3.map", exe_path);
-    if (!cheng_v3_line_map_load_path(map_path)) {
-        return;
-    }
+    cheng_v3_line_map_load_path(map_path);
     cheng_crash_trace_install_handlers();
 }
 
@@ -1097,25 +1847,36 @@ static int cheng_backtrace_enabled(void) {
     if (raw == NULL || raw[0] == '\0') {
         raw = getenv("BACKEND_DEBUG_BACKTRACE");
     }
-    if (raw == NULL || raw[0] == '\0') return 0;
+    if (raw == NULL || raw[0] == '\0') return 1;
     if (raw[0] == '0' && raw[1] == '\0') return 0;
     return 1;
 }
 
-void cheng_dump_backtrace_if_enabled(void) {
-    cheng_crash_trace_dump_now("panic");
-    cheng_v3_dump_source_backtrace_if_available("panic");
+static void cheng_dump_native_backtrace_if_enabled(void) {
     if (!cheng_backtrace_enabled()) return;
 #if CHENG_HAS_EXECINFO
-    void* frames[48];
-    int count = backtrace(frames, 48);
-    if (count > 0) {
-        backtrace_symbols_fd(frames, count, 2);
-        return;
+    {
+        void* frames[48];
+        int count = backtrace(frames, 48);
+        if (count > 0) {
+            backtrace_symbols_fd(frames, count, 2);
+            return;
+        }
     }
 #endif
-    fprintf(stderr, "[cheng] backtrace unavailable\n");
-    fflush(stderr);
+    cheng_crash_trace_write_cstr("[cheng] backtrace unavailable\n");
+}
+
+static void cheng_dump_backtrace_now(const char* reason) {
+    const char* actual_reason = reason != NULL && reason[0] != '\0' ? reason : "panic";
+    cheng_crash_trace_dump_now(actual_reason);
+    cheng_v3_dump_machine_backtrace_if_available(actual_reason);
+    cheng_v3_dump_source_backtrace_if_available(actual_reason);
+    cheng_dump_native_backtrace_if_enabled();
+}
+
+void cheng_dump_backtrace_if_enabled(void) {
+    cheng_dump_backtrace_now("panic");
 }
 
 static int cheng_arg_is_help(const char* arg) {
@@ -1200,7 +1961,10 @@ int32_t cheng_strlen(char* s);
 void* cheng_malloc(int32_t size);
 void cheng_free(void* p);
 int32_t cheng_file_exists(const char* path);
+int32_t cheng_dir_exists(const char* path);
 int64_t cheng_file_size(const char* path);
+int32_t cheng_mkdir1(const char* path);
+char* cheng_getcwd(void);
 int32_t cheng_open_w_trunc(const char* path);
 int32_t cheng_fd_write(int32_t fd, const char* data, int32_t len);
 int32_t libc_close(int32_t fd);
@@ -3269,6 +4033,7 @@ WEAK int32_t c_strcmp(char* a, char* b) {
 }
 
 static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* out_len);
+static bool cheng_safe_raw_cstr_view(const char* s, const char** out_ptr, size_t* out_len);
 
 WEAK int32_t __cheng_str_eq(const char* a, const char* b) {
     const char* sa = "";
@@ -3408,6 +4173,52 @@ WEAK int32_t libc_close(int32_t fd) {
         return -1;
     }
     return close(fd);
+}
+
+WEAK int32_t libc_socket(int32_t domain, int32_t typ, int32_t protocol) {
+    return socket(domain, typ, protocol);
+}
+
+WEAK int32_t libc_fcntl(int32_t fd, int32_t cmd, int32_t arg) {
+    return fcntl(fd, cmd, arg);
+}
+
+WEAK int32_t libc_bind(int32_t fd, void* addr, int32_t len) {
+    return bind(fd, (const struct sockaddr*)addr, (socklen_t)len);
+}
+
+WEAK int32_t libc_sendto(int32_t fd, void* buf, int32_t len, int32_t flags, void* addr, int32_t addrlen) {
+    return (int32_t)sendto(fd, buf, (size_t)len, flags, (const struct sockaddr*)addr, (socklen_t)addrlen);
+}
+
+WEAK int32_t libc_recvfrom(int32_t fd, void* buf, int32_t len, int32_t flags, void* addr, int32_t* addrlen) {
+    socklen_t raw_len = (addrlen != NULL && *addrlen > 0) ? (socklen_t)(*addrlen) : (socklen_t)0;
+    int32_t rc = (int32_t)recvfrom(fd, buf, (size_t)len, flags, (struct sockaddr*)addr, addrlen != NULL ? &raw_len : NULL);
+    if (addrlen != NULL) {
+        *addrlen = (int32_t)raw_len;
+    }
+    return rc;
+}
+
+WEAK int32_t libc_getsockname(int32_t fd, void* addr, int32_t* addrlen) {
+    socklen_t raw_len = (addrlen != NULL && *addrlen > 0) ? (socklen_t)(*addrlen) : (socklen_t)0;
+    int32_t rc = getsockname(fd, (struct sockaddr*)addr, addrlen != NULL ? &raw_len : NULL);
+    if (addrlen != NULL) {
+        *addrlen = (int32_t)raw_len;
+    }
+    return rc;
+}
+
+WEAK int32_t libc_setsockopt(int32_t fd, int32_t level, int32_t optname, void* optval, int32_t optlen) {
+    return setsockopt(fd, level, optname, optval, (socklen_t)optlen);
+}
+
+WEAK int32_t libc_inet_pton(int32_t family, const char* src, void* dst) {
+    return inet_pton(family, src, dst);
+}
+
+WEAK char* libc_inet_ntop(int32_t family, void* src, char* dst, int32_t size) {
+    return (char*)inet_ntop(family, src, dst, (socklen_t)size);
 }
 
 WEAK int64_t libc_write(int32_t fd, void* data, int64_t n) {
@@ -4090,37 +4901,12 @@ WEAK void cheng_v3_panic_cstring_and_exit(const char* text) {
     cheng_dump_backtrace_if_enabled();
     cheng_exit(1);
 }
+
 void cheng_bounds_check(int32_t len, int32_t idx) {
     if (idx < 0 || idx >= len) {
         fprintf(stderr, "[cheng] bounds check failed: idx=%d len=%d\n", idx, len);
-        cheng_v3_dump_source_backtrace_if_available("bounds");
-        const char* trace = getenv("BOUNDS_TRACE");
-        if (trace != NULL && trace[0] != '\0' && trace[0] != '0') {
-            void* caller = __builtin_return_address(0);
-            Dl_info info;
-            if (dladdr(caller, &info) != 0) {
-                uintptr_t pc = (uintptr_t)caller;
-                uintptr_t base = (uintptr_t)info.dli_fbase;
-                uintptr_t off = pc >= base ? (pc - base) : 0;
-                fprintf(
-                    stderr,
-                    "[cheng] bounds caller=%p module=%s symbol=%s offset=0x%zx\n",
-                    caller,
-                    info.dli_fname ? info.dli_fname : "?",
-                    info.dli_sname ? info.dli_sname : "?",
-                    (size_t)off
-                );
-            } else {
-                fprintf(stderr, "[cheng] bounds caller=%p module=? symbol=? offset=0x0\n", caller);
-            }
-#if CHENG_HAS_EXECINFO
-            void* frames[24];
-            int count = backtrace(frames, 24);
-            if (count > 0) {
-                backtrace_symbols_fd(frames, count, 2);
-            }
-#endif
-        }
+        fflush(stderr);
+        cheng_dump_backtrace_now("bounds");
 #if defined(__ANDROID__)
         __android_log_print(
             ANDROID_LOG_ERROR,
@@ -5442,14 +6228,14 @@ static void cheng_store_cached_region(uintptr_t raw, mach_vm_address_t addr, mac
 }
 #endif
 
-static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* out_len) {
+static bool cheng_safe_cstr_view_impl(const char* s, bool allow_bridge, const char** out_ptr, size_t* out_len) {
     if (out_ptr != NULL) *out_ptr = "";
     if (out_len != NULL) *out_len = 0u;
     if (s == NULL) {
         return true;
     }
     uintptr_t raw = (uintptr_t)s;
-    if (cheng_probably_valid_ptr(s)) {
+    if (allow_bridge && cheng_probably_valid_ptr(s)) {
         const ChengStrBridge* bridge = (const ChengStrBridge*)s;
         if (cheng_probably_valid_str_bridge(bridge)) {
             if (out_ptr != NULL) *out_ptr = bridge->ptr != NULL ? bridge->ptr : "";
@@ -5535,6 +6321,14 @@ static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* ou
     return true;
 }
 
+static bool cheng_safe_cstr_view(const char* s, const char** out_ptr, size_t* out_len) {
+    return cheng_safe_cstr_view_impl(s, true, out_ptr, out_len);
+}
+
+static bool cheng_safe_raw_cstr_view(const char* s, const char** out_ptr, size_t* out_len) {
+    return cheng_safe_cstr_view_impl(s, false, out_ptr, out_len);
+}
+
 static ChengStrBridge cheng_str_bridge_empty(void) {
     ChengStrBridge out;
     out.ptr = "";
@@ -5548,7 +6342,7 @@ static ChengStrBridge cheng_str_bridge_from_ptr_flags(const char* ptr, int32_t f
     ChengStrBridge out = cheng_str_bridge_empty();
     const char* safe = "";
     size_t n = 0;
-    if (!cheng_safe_cstr_view(ptr, &safe, &n)) {
+    if (!cheng_safe_raw_cstr_view(ptr, &safe, &n)) {
         return out;
     }
     out.ptr = safe;
@@ -5559,6 +6353,17 @@ static ChengStrBridge cheng_str_bridge_from_ptr_flags(const char* ptr, int32_t f
 
 static ChengStrBridge cheng_str_bridge_from_owned(char* ptr) {
     return cheng_str_bridge_from_ptr_flags((const char*)ptr, CHENG_STR_BRIDGE_FLAG_OWNED);
+}
+
+static bool cheng_str_bridge_view(ChengStrBridge bridge, const char** out_ptr, size_t* out_len) {
+    if (out_ptr != NULL) *out_ptr = "";
+    if (out_len != NULL) *out_len = 0u;
+    if (cheng_probably_valid_str_bridge(&bridge)) {
+        if (out_ptr != NULL) *out_ptr = bridge.ptr != NULL ? bridge.ptr : "";
+        if (out_len != NULL) *out_len = bridge.ptr != NULL ? (size_t)bridge.len : 0u;
+        return true;
+    }
+    return cheng_safe_raw_cstr_view(bridge.ptr, out_ptr, out_len);
 }
 
 static const char* cheng_safe_cstr(const char* s) {
@@ -5663,7 +6468,7 @@ WEAK char* __cheng_sym_2b(char* a, char* b) { return cheng_str_concat(a, b); }
 WEAK char* driver_c_str_clone(const char* s) {
     const char* safe = "";
     size_t n = 0;
-    if (!cheng_safe_cstr_view(s, &safe, &n)) {
+    if (!cheng_safe_raw_cstr_view(s, &safe, &n)) {
         safe = "";
         n = 0;
     }
@@ -5675,7 +6480,7 @@ WEAK ChengStrBridge driver_c_str_clone_bridge(const char* s) {
 WEAK char* driver_c_str_slice(const char* s, int32_t start, int32_t count) {
     const char* safe = "";
     size_t n = 0;
-    if (!cheng_safe_cstr_view(s, &safe, &n)) {
+    if (!cheng_safe_raw_cstr_view(s, &safe, &n)) {
         safe = "";
         n = 0;
     }
@@ -5692,8 +6497,15 @@ WEAK char* driver_c_str_slice(const char* s, int32_t start, int32_t count) {
     }
     return cheng_copy_string_bytes(safe + s0, need);
 }
-WEAK ChengStrBridge driver_c_str_slice_bridge(const char* s, int32_t start, int32_t count) {
-    return cheng_str_bridge_from_owned(driver_c_str_slice(s, start, count));
+WEAK ChengStrBridge driver_c_str_slice_bridge(ChengStrBridge s, int32_t start, int32_t count) {
+    char* raw_out;
+    ChengStrBridge out;
+    raw_out = driver_c_str_slice(s.ptr, start, count);
+    out.ptr = raw_out != NULL ? raw_out : "";
+    out.len = raw_out != NULL ? cheng_strlen(raw_out) : 0;
+    out.store_id = 0;
+    out.flags = raw_out != NULL ? CHENG_STR_BRIDGE_FLAG_OWNED : CHENG_STR_BRIDGE_FLAG_NONE;
+    return out;
 }
 WEAK char* driver_c_char_to_str(int32_t value) {
     unsigned char ch = (unsigned char)(value & 0xff);
@@ -5714,11 +6526,11 @@ WEAK ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge 
     size_t la = 0;
     size_t lb = 0;
     char* out = NULL;
-    if (!cheng_safe_cstr_view(a.ptr, &sa, &la)) {
+    if (!cheng_safe_raw_cstr_view(a.ptr, &sa, &la)) {
         sa = "";
         la = 0;
     }
-    if (!cheng_safe_cstr_view(b.ptr, &sb, &lb)) {
+    if (!cheng_safe_raw_cstr_view(b.ptr, &sb, &lb)) {
         sb = "";
         lb = 0;
     }
@@ -5735,10 +6547,2177 @@ WEAK ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge 
     out[la + lb] = '\0';
     return cheng_str_bridge_from_owned(out);
 }
+static int cheng_v3_ascii_space_char(unsigned char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
+}
+WEAK ChengStrBridge cheng_v3_str_strip_bridge(ChengStrBridge s) {
+    const char* safe = "";
+    size_t n = 0u;
+    size_t start = 0u;
+    size_t end = 0u;
+    if (!cheng_safe_raw_cstr_view(s.ptr, &safe, &n) || n == 0u) {
+        return driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    end = n;
+    while (start < n && cheng_v3_ascii_space_char((unsigned char)safe[start])) {
+        start += 1u;
+    }
+    while (end > start && cheng_v3_ascii_space_char((unsigned char)safe[end - 1u])) {
+        end -= 1u;
+    }
+    return driver_c_str_from_utf8_copy_bridge(safe + start, (int32_t)(end - start));
+}
+WEAK int32_t cheng_v3_os_is_absolute_bridge(ChengStrBridge path) {
+    const char* safe = "";
+    size_t n = 0u;
+    if (!cheng_safe_raw_cstr_view(path.ptr, &safe, &n) || n == 0u) {
+        return 0;
+    }
+    if (safe[0] == '/' || safe[0] == '\\') {
+        return 1;
+    }
+    if (n >= 2u && safe[1] == ':') {
+        return 1;
+    }
+    return 0;
+}
+WEAK ChengStrBridge cheng_v3_os_join_path_bridge(ChengStrBridge left, ChengStrBridge right) {
+    const char* left_ptr = "";
+    const char* right_ptr = "";
+    size_t left_len = 0u;
+    size_t right_len = 0u;
+    size_t total = 0u;
+    int need_sep = 0;
+    char* out = NULL;
+    if (!cheng_safe_raw_cstr_view(left.ptr, &left_ptr, &left_len)) {
+        left_ptr = "";
+        left_len = 0u;
+    }
+    if (!cheng_safe_raw_cstr_view(right.ptr, &right_ptr, &right_len)) {
+        right_ptr = "";
+        right_len = 0u;
+    }
+    if (left_len == 0u) {
+        return driver_c_str_from_utf8_copy_bridge(right_ptr, (int32_t)right_len);
+    }
+    if (right_len == 0u) {
+        return driver_c_str_from_utf8_copy_bridge(left_ptr, (int32_t)left_len);
+    }
+    need_sep = left_ptr[left_len - 1u] != '/' &&
+               left_ptr[left_len - 1u] != '\\' &&
+               right_ptr[0] != '/' &&
+               right_ptr[0] != '\\';
+    total = left_len + right_len + (size_t)(need_sep ? 1 : 0);
+    out = (char*)malloc(total + 1u);
+    if (out == NULL) {
+        return driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    memcpy(out, left_ptr, left_len);
+    if (need_sep) {
+        out[left_len] = '/';
+    }
+    memcpy(out + left_len + (size_t)(need_sep ? 1 : 0), right_ptr, right_len);
+    out[total] = '\0';
+    return cheng_str_bridge_from_owned(out);
+}
+static int cheng_v3_path_is_sep(char ch) {
+    return ch == '/' || ch == '\\';
+}
+static void cheng_v3_mkdir_if_needed(const char* path) {
+    if (path == NULL || path[0] == '\0' || cheng_dir_exists(path)) {
+        return;
+    }
+    if (cheng_mkdir1(path) == 0) {
+        return;
+    }
+    if (!cheng_dir_exists(path)) {
+        fprintf(stderr, "[cheng] mkdir failed: %s\n", path);
+        abort();
+    }
+}
+static void cheng_v3_mkdir_all_raw(const char* path, int include_leaf) {
+    size_t len = 0u;
+    char* scratch = NULL;
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    len = strlen(path);
+    scratch = (char*)malloc(len + 1u);
+    if (scratch == NULL) {
+        fprintf(stderr, "[cheng] mkdir scratch alloc failed\n");
+        abort();
+    }
+    memcpy(scratch, path, len + 1u);
+    for (size_t i = 0u; i < len; ++i) {
+        char ch = scratch[i];
+        if (!cheng_v3_path_is_sep(ch)) {
+            continue;
+        }
+        if (i == 0u) {
+            continue;
+        }
+#if defined(_WIN32)
+        if (i == 2u && scratch[1] == ':') {
+            continue;
+        }
+#endif
+        scratch[i] = '\0';
+        cheng_v3_mkdir_if_needed(scratch);
+        scratch[i] = ch;
+    }
+    if (include_leaf) {
+        cheng_v3_mkdir_if_needed(scratch);
+    }
+    free(scratch);
+}
+static char* cheng_v3_bridge_copy_cstring(ChengStrBridge text) {
+    const char* safe = "";
+    size_t n = 0u;
+    char* out = NULL;
+    if (!cheng_safe_raw_cstr_view(text.ptr, &safe, &n)) {
+        safe = "";
+        n = 0u;
+    }
+    out = (char*)malloc(n + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (n > 0u) {
+        memcpy(out, safe, n);
+    }
+    out[n] = '\0';
+    return out;
+}
+
+typedef struct ChengV3Sha256Ctx {
+    uint8_t data[64];
+    uint32_t datalen;
+    uint64_t bitlen;
+    uint32_t state[8];
+} ChengV3Sha256Ctx;
+
+static const uint32_t cheng_v3_sha256_table[64] = {
+    0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U, 0x3956c25bU,
+    0x59f111f1U, 0x923f82a4U, 0xab1c5ed5U, 0xd807aa98U, 0x12835b01U,
+    0x243185beU, 0x550c7dc3U, 0x72be5d74U, 0x80deb1feU, 0x9bdc06a7U,
+    0xc19bf174U, 0xe49b69c1U, 0xefbe4786U, 0x0fc19dc6U, 0x240ca1ccU,
+    0x2de92c6fU, 0x4a7484aaU, 0x5cb0a9dcU, 0x76f988daU, 0x983e5152U,
+    0xa831c66dU, 0xb00327c8U, 0xbf597fc7U, 0xc6e00bf3U, 0xd5a79147U,
+    0x06ca6351U, 0x14292967U, 0x27b70a85U, 0x2e1b2138U, 0x4d2c6dfcU,
+    0x53380d13U, 0x650a7354U, 0x766a0abbU, 0x81c2c92eU, 0x92722c85U,
+    0xa2bfe8a1U, 0xa81a664bU, 0xc24b8b70U, 0xc76c51a3U, 0xd192e819U,
+    0xd6990624U, 0xf40e3585U, 0x106aa070U, 0x19a4c116U, 0x1e376c08U,
+    0x2748774cU, 0x34b0bcb5U, 0x391c0cb3U, 0x4ed8aa4aU, 0x5b9cca4fU,
+    0x682e6ff3U, 0x748f82eeU, 0x78a5636fU, 0x84c87814U, 0x8cc70208U,
+    0x90befffaU, 0xa4506cebU, 0xbef9a3f7U, 0xc67178f2U
+};
+
+#define CHENG_V3_SHA256_ROTR(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+#define CHENG_V3_SHA256_CH(x, y, z) (((x) & (y)) ^ (~(x) & (z)))
+#define CHENG_V3_SHA256_MAJ(x, y, z) (((x) & (y)) ^ ((x) & (z)) ^ ((y) & (z)))
+#define CHENG_V3_SHA256_EP0(x) (CHENG_V3_SHA256_ROTR((x), 2) ^ CHENG_V3_SHA256_ROTR((x), 13) ^ CHENG_V3_SHA256_ROTR((x), 22))
+#define CHENG_V3_SHA256_EP1(x) (CHENG_V3_SHA256_ROTR((x), 6) ^ CHENG_V3_SHA256_ROTR((x), 11) ^ CHENG_V3_SHA256_ROTR((x), 25))
+#define CHENG_V3_SHA256_SIG0(x) (CHENG_V3_SHA256_ROTR((x), 7) ^ CHENG_V3_SHA256_ROTR((x), 18) ^ ((x) >> 3))
+#define CHENG_V3_SHA256_SIG1(x) (CHENG_V3_SHA256_ROTR((x), 17) ^ CHENG_V3_SHA256_ROTR((x), 19) ^ ((x) >> 10))
+
+static void cheng_v3_sha256_init(ChengV3Sha256Ctx* ctx) {
+    ctx->datalen = 0;
+    ctx->bitlen = 0;
+    ctx->state[0] = 0x6a09e667U;
+    ctx->state[1] = 0xbb67ae85U;
+    ctx->state[2] = 0x3c6ef372U;
+    ctx->state[3] = 0xa54ff53aU;
+    ctx->state[4] = 0x510e527fU;
+    ctx->state[5] = 0x9b05688cU;
+    ctx->state[6] = 0x1f83d9abU;
+    ctx->state[7] = 0x5be0cd19U;
+}
+
+static void cheng_v3_sha256_transform(ChengV3Sha256Ctx* ctx, const uint8_t data[64]) {
+    uint32_t a = 0U;
+    uint32_t b = 0U;
+    uint32_t c = 0U;
+    uint32_t d = 0U;
+    uint32_t e = 0U;
+    uint32_t f = 0U;
+    uint32_t g = 0U;
+    uint32_t h = 0U;
+    uint32_t m[64];
+    uint32_t t1 = 0U;
+    uint32_t t2 = 0U;
+    size_t i = 0u;
+    for (i = 0u; i < 16u; ++i) {
+        m[i] = ((uint32_t)data[i * 4u] << 24) |
+               ((uint32_t)data[i * 4u + 1u] << 16) |
+               ((uint32_t)data[i * 4u + 2u] << 8) |
+               ((uint32_t)data[i * 4u + 3u]);
+    }
+    for (i = 16u; i < 64u; ++i) {
+        m[i] = CHENG_V3_SHA256_SIG1(m[i - 2u]) + m[i - 7u] +
+               CHENG_V3_SHA256_SIG0(m[i - 15u]) + m[i - 16u];
+    }
+    a = ctx->state[0];
+    b = ctx->state[1];
+    c = ctx->state[2];
+    d = ctx->state[3];
+    e = ctx->state[4];
+    f = ctx->state[5];
+    g = ctx->state[6];
+    h = ctx->state[7];
+    for (i = 0u; i < 64u; ++i) {
+        t1 = h + CHENG_V3_SHA256_EP1(e) + CHENG_V3_SHA256_CH(e, f, g) +
+             cheng_v3_sha256_table[i] + m[i];
+        t2 = CHENG_V3_SHA256_EP0(a) + CHENG_V3_SHA256_MAJ(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + t1;
+        d = c;
+        c = b;
+        b = a;
+        a = t1 + t2;
+    }
+    ctx->state[0] += a;
+    ctx->state[1] += b;
+    ctx->state[2] += c;
+    ctx->state[3] += d;
+    ctx->state[4] += e;
+    ctx->state[5] += f;
+    ctx->state[6] += g;
+    ctx->state[7] += h;
+}
+
+static void cheng_v3_sha256_update(ChengV3Sha256Ctx* ctx, const uint8_t* data, size_t len) {
+    size_t i = 0u;
+    for (i = 0u; i < len; ++i) {
+        ctx->data[ctx->datalen++] = data[i];
+        if (ctx->datalen == 64u) {
+            cheng_v3_sha256_transform(ctx, ctx->data);
+            ctx->bitlen += 512u;
+            ctx->datalen = 0u;
+        }
+    }
+}
+
+static void cheng_v3_sha256_final(ChengV3Sha256Ctx* ctx, uint8_t hash[32]) {
+    size_t i = (size_t)ctx->datalen;
+    if (ctx->datalen < 56u) {
+        ctx->data[i++] = 0x80u;
+        while (i < 56u) {
+            ctx->data[i++] = 0x00u;
+        }
+    } else {
+        ctx->data[i++] = 0x80u;
+        while (i < 64u) {
+            ctx->data[i++] = 0x00u;
+        }
+        cheng_v3_sha256_transform(ctx, ctx->data);
+        memset(ctx->data, 0, 56u);
+    }
+    ctx->bitlen += (uint64_t)ctx->datalen * 8u;
+    ctx->data[63] = (uint8_t)(ctx->bitlen);
+    ctx->data[62] = (uint8_t)(ctx->bitlen >> 8);
+    ctx->data[61] = (uint8_t)(ctx->bitlen >> 16);
+    ctx->data[60] = (uint8_t)(ctx->bitlen >> 24);
+    ctx->data[59] = (uint8_t)(ctx->bitlen >> 32);
+    ctx->data[58] = (uint8_t)(ctx->bitlen >> 40);
+    ctx->data[57] = (uint8_t)(ctx->bitlen >> 48);
+    ctx->data[56] = (uint8_t)(ctx->bitlen >> 56);
+    cheng_v3_sha256_transform(ctx, ctx->data);
+    for (i = 0u; i < 4u; ++i) {
+        hash[i] = (uint8_t)((ctx->state[0] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 4u] = (uint8_t)((ctx->state[1] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 8u] = (uint8_t)((ctx->state[2] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 12u] = (uint8_t)((ctx->state[3] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 16u] = (uint8_t)((ctx->state[4] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 20u] = (uint8_t)((ctx->state[5] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 24u] = (uint8_t)((ctx->state[6] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+        hash[i + 28u] = (uint8_t)((ctx->state[7] >> (24u - (uint32_t)i * 8u)) & 0xffu);
+    }
+}
+
+WEAK ChengStrBridge cheng_v3_sha256_hex_bridge(ChengStrBridge text) {
+    static const char digits[] = "0123456789abcdef";
+    ChengV3Sha256Ctx ctx;
+    uint8_t digest[32];
+    char hex[64];
+    int32_t i = 0;
+    cheng_v3_sha256_init(&ctx);
+    if (text.ptr != NULL && text.len > 0) {
+        cheng_v3_sha256_update(&ctx, (const uint8_t*)text.ptr, (size_t)text.len);
+    }
+    cheng_v3_sha256_final(&ctx, digest);
+    for (i = 0; i < 32; ++i) {
+        uint8_t value = digest[i];
+        hex[i * 2] = digits[(value >> 4) & 0x0fU];
+        hex[i * 2 + 1] = digits[value & 0x0fU];
+    }
+    return driver_c_str_from_utf8_copy_bridge(hex, 64);
+}
+
+WEAK int64_t cheng_v3_sha256_word_bridge(ChengStrBridge text, int32_t word_index) {
+    ChengV3Sha256Ctx ctx;
+    uint8_t digest[32];
+    uint64_t out = 0u;
+    int32_t base = 0;
+    int32_t i = 0;
+    if (word_index < 0 || word_index >= 4) {
+        return 0;
+    }
+    cheng_v3_sha256_init(&ctx);
+    if (text.ptr != NULL && text.len > 0) {
+        cheng_v3_sha256_update(&ctx, (const uint8_t*)text.ptr, (size_t)text.len);
+    }
+    cheng_v3_sha256_final(&ctx, digest);
+    base = word_index * 8;
+    for (i = 0; i < 8; ++i) {
+        out = (out << 8) | (uint64_t)digest[base + i];
+    }
+    return (int64_t)out;
+}
+static char* cheng_v3_bridge_dup_cstring(const char* raw) {
+    size_t n = 0u;
+    char* out = NULL;
+    if (raw == NULL) {
+        raw = "";
+    }
+    n = strlen(raw);
+    out = (char*)malloc(n + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (n > 0u) {
+        memcpy(out, raw, n);
+    }
+    out[n] = '\0';
+    return out;
+}
+static int cheng_v3_bridge_starts_with(const char* text, const char* prefix) {
+    size_t text_len = 0u;
+    size_t prefix_len = 0u;
+    if (text == NULL || prefix == NULL) {
+        return 0;
+    }
+    text_len = strlen(text);
+    prefix_len = strlen(prefix);
+    if (prefix_len > text_len) {
+        return 0;
+    }
+    return memcmp(text, prefix, prefix_len) == 0 ? 1 : 0;
+}
+static char* cheng_v3_bridge_concat2(const char* a, const char* b) {
+    size_t na = 0u;
+    size_t nb = 0u;
+    char* out = NULL;
+    if (a == NULL) {
+        a = "";
+    }
+    if (b == NULL) {
+        b = "";
+    }
+    na = strlen(a);
+    nb = strlen(b);
+    out = (char*)malloc(na + nb + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (na > 0u) {
+        memcpy(out, a, na);
+    }
+    if (nb > 0u) {
+        memcpy(out + na, b, nb);
+    }
+    out[na + nb] = '\0';
+    return out;
+}
+static char* cheng_v3_bridge_concat3(const char* a, const char* b, const char* c) {
+    char* ab = cheng_v3_bridge_concat2(a, b);
+    char* out = NULL;
+    if (ab == NULL) {
+        return NULL;
+    }
+    out = cheng_v3_bridge_concat2(ab, c);
+    free(ab);
+    return out;
+}
+static char* cheng_v3_bridge_concat4(const char* a, const char* b, const char* c, const char* d) {
+    char* abc = cheng_v3_bridge_concat3(a, b, c);
+    char* out = NULL;
+    if (abc == NULL) {
+        return NULL;
+    }
+    out = cheng_v3_bridge_concat2(abc, d);
+    free(abc);
+    return out;
+}
+static const char* cheng_v3_bridge_last_path_name(const char* path) {
+    const char* last = path;
+    if (path == NULL) {
+        return "";
+    }
+    for (const char* cur = path; *cur != '\0'; ++cur) {
+        if (*cur == '/' || *cur == '\\') {
+            last = cur + 1;
+        }
+    }
+    return last;
+}
+static char* cheng_v3_bridge_file_stem_dup(const char* path) {
+    const char* base = cheng_v3_bridge_last_path_name(path);
+    size_t len = strlen(base);
+    size_t dot = len;
+    char* out = NULL;
+    for (size_t i = 0u; i < len; ++i) {
+        if (base[i] == '.') {
+            dot = i;
+        }
+    }
+    if (dot == 0u || dot == len) {
+        return cheng_v3_bridge_dup_cstring(base);
+    }
+    out = (char*)malloc(dot + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (dot > 0u) {
+        memcpy(out, base, dot);
+    }
+    out[dot] = '\0';
+    return out;
+}
+static char* cheng_v3_bridge_rel_without_ext_dup(const char* path) {
+    size_t len = 0u;
+    char* out = NULL;
+    if (path == NULL) {
+        return cheng_v3_bridge_dup_cstring("");
+    }
+    len = strlen(path);
+    out = cheng_v3_bridge_dup_cstring(path);
+    if (out == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0u; i < len; ++i) {
+        if (out[i] == '\\') {
+            out[i] = '/';
+        }
+    }
+    if (len >= 6u && memcmp(out + len - 6u, ".cheng", 6u) == 0) {
+        out[len - 6u] = '\0';
+    }
+    return out;
+}
+static char* cheng_v3_bridge_package_id_dup(const char* package_root) {
+    const char* name = cheng_v3_bridge_last_path_name(package_root);
+    if (name[0] == '\0') {
+        return cheng_v3_bridge_dup_cstring("");
+    }
+    if (strcmp(name, "v3") == 0) {
+        return cheng_v3_bridge_dup_cstring("cheng/v3");
+    }
+    return cheng_v3_bridge_concat2("cheng/", name);
+}
+static char* cheng_v3_bridge_module_to_source_dup(const char* workspace,
+                                                  const char* package,
+                                                  const char* module) {
+    char* out = NULL;
+    if (workspace == NULL || package == NULL || module == NULL) {
+        return NULL;
+    }
+    if (module[0] == '\0') {
+        return cheng_v3_bridge_dup_cstring("");
+    }
+    if (cheng_v3_bridge_starts_with(module, "std/") && strlen(module) > 4u) {
+        return cheng_v3_bridge_concat4(workspace, "/src/std/", module + 4, ".cheng");
+    }
+    {
+        char* package_id = cheng_v3_bridge_package_id_dup(package);
+        size_t package_id_len = package_id != NULL ? strlen(package_id) : 0u;
+        if (package_id != NULL &&
+            package_id_len < strlen(module) &&
+            memcmp(module, package_id, package_id_len) == 0 &&
+            module[package_id_len] == '/') {
+            out = cheng_v3_bridge_concat4(package, "/src/", module + package_id_len + 1u, ".cheng");
+        }
+        free(package_id);
+    }
+    if (out != NULL) {
+        return out;
+    }
+    return cheng_v3_bridge_dup_cstring("");
+}
+static int cheng_v3_bridge_buf_append_n(char** buf,
+                                        size_t* len,
+                                        size_t* cap,
+                                        const char* text,
+                                        size_t n) {
+    char* grown = NULL;
+    size_t need = 0u;
+    size_t next = 0u;
+    if (buf == NULL || len == NULL || cap == NULL) {
+        return 0;
+    }
+    if (text == NULL) {
+        text = "";
+        n = 0u;
+    }
+    need = *len + n + 1u;
+    if (need > *cap) {
+        next = *cap > 0u ? *cap : 64u;
+        while (next < need) {
+            next *= 2u;
+        }
+        grown = (char*)realloc(*buf, next);
+        if (grown == NULL) {
+            return 0;
+        }
+        *buf = grown;
+        *cap = next;
+    }
+    if (n > 0u) {
+        memcpy(*buf + *len, text, n);
+        *len += n;
+    }
+    (*buf)[*len] = '\0';
+    return 1;
+}
+static int cheng_v3_bridge_buf_append(char** buf,
+                                      size_t* len,
+                                      size_t* cap,
+                                      const char* text) {
+    size_t n = text != NULL ? strlen(text) : 0u;
+    return cheng_v3_bridge_buf_append_n(buf, len, cap, text, n);
+}
+static int cheng_v3_bridge_is_inline_space(char ch) {
+    return ch == ' ' || ch == '\t' || ch == '\r';
+}
+static void cheng_v3_bridge_release_owned_ptr(const char* ptr) {
+    if (ptr == NULL) {
+        return;
+    }
+    if (cheng_mem_find_block_any((void*)ptr) != NULL) {
+        cheng_free((void*)ptr);
+        return;
+    }
+    free((void*)ptr);
+}
+static void cheng_v3_bridge_release_owned(ChengStrBridge value) {
+    if ((value.flags & CHENG_STR_BRIDGE_FLAG_OWNED) != 0 && value.ptr != NULL) {
+        cheng_v3_bridge_release_owned_ptr(value.ptr);
+    }
+}
+static int cheng_v3_file_nonempty_exists_raw(const char* path) {
+    FILE* f = NULL;
+    long size = 0;
+    if (path == NULL || path[0] == '\0') {
+        return 0;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+    size = ftell(f);
+    fclose(f);
+    return size > 0 ? 1 : 0;
+}
+static char* cheng_v3_read_text_file_raw_dup(const char* path) {
+    FILE* f = NULL;
+    long size = 0;
+    size_t got = 0u;
+    char* out = NULL;
+    if (path == NULL || path[0] == '\0') {
+        return NULL;
+    }
+    f = fopen(path, "rb");
+    if (f == NULL) {
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    out = (char*)malloc((size_t)size + 1u);
+    if (out == NULL) {
+        fclose(f);
+        return NULL;
+    }
+    if (size > 0) {
+        got = fread(out, 1u, (size_t)size, f);
+        if (got != (size_t)size) {
+            free(out);
+            fclose(f);
+            return NULL;
+        }
+    }
+    out[size] = '\0';
+    fclose(f);
+    return out;
+}
+static char* cheng_v3_bridge_trim_dup(const char* raw) {
+    const char* start = raw != NULL ? raw : "";
+    const char* end = NULL;
+    char* out = NULL;
+    size_t len = 0u;
+    while (*start == ' ' || *start == '\t' || *start == '\r' || *start == '\n') {
+        start++;
+    }
+    end = start + strlen(start);
+    while (end > start) {
+        char ch = end[-1];
+        if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+            break;
+        }
+        end--;
+    }
+    len = (size_t)(end - start);
+    out = (char*)malloc(len + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (len > 0u) {
+        memcpy(out, start, len);
+    }
+    out[len] = '\0';
+    return out;
+}
+static char* cheng_v3_bridge_normalize_path_dup(const char* raw) {
+    char* out = cheng_v3_bridge_trim_dup(raw);
+    size_t len = 0u;
+    if (out == NULL) {
+        return NULL;
+    }
+    len = strlen(out);
+    while (len > 1u) {
+        char last = out[len - 1u];
+        if (last != '/' && last != '\\') {
+            break;
+        }
+        out[len - 1u] = '\0';
+        len -= 1u;
+    }
+    return out;
+}
+static char* cheng_v3_bridge_workspace_root_dup(const char* package_root) {
+    char* normalized = cheng_v3_bridge_normalize_path_dup(package_root);
+    const char* base = NULL;
+    char* out = NULL;
+    if (normalized == NULL) {
+        return NULL;
+    }
+    base = cheng_v3_bridge_last_path_name(normalized);
+    if (strcmp(base, "v3") == 0) {
+        const char* last = base - 1;
+        if (last > normalized) {
+            size_t parent_len = (size_t)(last - normalized);
+            out = (char*)malloc(parent_len + 1u);
+            if (out == NULL) {
+                free(normalized);
+                return NULL;
+            }
+            memcpy(out, normalized, parent_len);
+            out[parent_len] = '\0';
+            free(normalized);
+            return out;
+        }
+    }
+    return normalized;
+}
+static ChengStrBridge cheng_v3_bridge_owned_str(const char* raw) {
+    char* dup = cheng_v3_bridge_dup_cstring(raw);
+    if (dup == NULL) {
+        return cheng_str_bridge_empty();
+    }
+    return cheng_str_bridge_from_owned(dup);
+}
+static int cheng_v3_seq_add_elem(ChengSeqHeader* seq, const void* elem, int32_t elem_size) {
+    void* slot = NULL;
+    if (seq == NULL || elem == NULL || elem_size <= 0) {
+        return 0;
+    }
+    slot = cheng_seq_set_grow(seq, seq->len, elem_size);
+    if (slot == NULL) {
+        return 0;
+    }
+    memcpy(slot, elem, (size_t)elem_size);
+    return 1;
+}
+static int cheng_v3_str_bridge_eq_cstr(const ChengStrBridge* value, const char* raw) {
+    size_t len = 0u;
+    if (value == NULL) {
+        return 0;
+    }
+    if (raw == NULL) {
+        raw = "";
+    }
+    len = strlen(raw);
+    if (value->len != (int32_t)len) {
+        return 0;
+    }
+    if (len == 0u) {
+        return 1;
+    }
+    return value->ptr != NULL && memcmp(value->ptr, raw, len) == 0 ? 1 : 0;
+}
+static int cheng_v3_str_seq_contains_cstr(const ChengSeqHeader* seq, const char* raw) {
+    const ChengStrBridge* items = NULL;
+    int32_t i = 0;
+    if (seq == NULL || seq->buffer == NULL) {
+        return 0;
+    }
+    items = (const ChengStrBridge*)seq->buffer;
+    for (i = 0; i < seq->len; ++i) {
+        if (cheng_v3_str_bridge_eq_cstr(items + i, raw)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+WEAK ChengStrBridge cheng_v3_parser_source_to_module_bridge(ChengStrBridge workspace_root,
+                                                            ChengStrBridge package_root,
+                                                            ChengStrBridge source_path);
+WEAK ChengStrBridge cheng_v3_parser_module_to_source_bridge(ChengStrBridge workspace_root,
+                                                            ChengStrBridge package_root,
+                                                            ChengStrBridge module_path) {
+    char* workspace = cheng_v3_bridge_copy_cstring(workspace_root);
+    char* package = cheng_v3_bridge_copy_cstring(package_root);
+    char* module = cheng_v3_bridge_copy_cstring(module_path);
+    char* out = NULL;
+    if (workspace == NULL || package == NULL || module == NULL) {
+        free(workspace);
+        free(package);
+        free(module);
+        return cheng_v3_bridge_owned_str("");
+    }
+    if (module[0] == '\0') {
+        free(workspace);
+        free(package);
+        free(module);
+        return cheng_v3_bridge_owned_str("");
+    }
+    out = cheng_v3_bridge_module_to_source_dup(workspace, package, module);
+    free(workspace);
+    free(package);
+    free(module);
+    if (out == NULL) {
+        return cheng_v3_bridge_owned_str("");
+    }
+    return cheng_str_bridge_from_owned(out);
+}
+WEAK ChengStrBridge cheng_v3_parser_import_source_paths_bridge(ChengStrBridge workspace_root,
+                                                               ChengStrBridge package_root,
+                                                               ChengStrBridge text_bridge) {
+    char* workspace = cheng_v3_bridge_copy_cstring(workspace_root);
+    char* package = cheng_v3_bridge_copy_cstring(package_root);
+    char* text = cheng_v3_bridge_copy_cstring(text_bridge);
+    char* out = NULL;
+    size_t out_len = 0u;
+    size_t out_cap = 0u;
+    int line_no = 1;
+    if (workspace == NULL || package == NULL || text == NULL) {
+        free(workspace);
+        free(package);
+        free(text);
+        return cheng_v3_bridge_owned_str("");
+    }
+    {
+        const char* cur = text;
+        while (*cur != '\0') {
+            const char* line_start = cur;
+            const char* line_end = cur;
+            const char* token_start = NULL;
+            const char* token_end = NULL;
+            while (*line_end != '\0' && *line_end != '\n') {
+                line_end++;
+            }
+            while (line_start < line_end && cheng_v3_bridge_is_inline_space(*line_start)) {
+                line_start++;
+            }
+            if ((size_t)(line_end - line_start) >= 7u && memcmp(line_start, "import ", 7u) == 0) {
+                token_start = line_start + 7;
+                while (token_start < line_end && cheng_v3_bridge_is_inline_space(*token_start)) {
+                    token_start++;
+                }
+                token_end = token_start;
+                while (token_end < line_end && !cheng_v3_bridge_is_inline_space(*token_end)) {
+                    token_end++;
+                }
+                if (token_start == token_end) {
+                    char errbuf[96];
+                    snprintf(errbuf, sizeof(errbuf), "!error:v3 parser: malformed import at line %d", line_no);
+                    free(out);
+                    free(workspace);
+                    free(package);
+                    free(text);
+                    return cheng_v3_bridge_owned_str(errbuf);
+                }
+                {
+                    size_t token_len = (size_t)(token_end - token_start);
+                    char* module = (char*)malloc(token_len + 1u);
+                    char* source = NULL;
+                    const char* emit = "-";
+                    if (module == NULL) {
+                        free(out);
+                        free(workspace);
+                        free(package);
+                        free(text);
+                        return cheng_v3_bridge_owned_str("");
+                    }
+                    memcpy(module, token_start, token_len);
+                    module[token_len] = '\0';
+                    source = cheng_v3_bridge_module_to_source_dup(workspace, package, module);
+                    if (source != NULL && source[0] != '\0' && cheng_v3_file_nonempty_exists_raw(source)) {
+                        emit = source;
+                    }
+                    if (!cheng_v3_bridge_buf_append(&out, &out_len, &out_cap, emit) ||
+                        !cheng_v3_bridge_buf_append_n(&out, &out_len, &out_cap, "\n", 1u)) {
+                        free(module);
+                        free(source);
+                        free(out);
+                        free(workspace);
+                        free(package);
+                        free(text);
+                        return cheng_v3_bridge_owned_str("");
+                    }
+                    free(module);
+                    free(source);
+                }
+            }
+            if (*line_end == '\n') {
+                cur = line_end + 1;
+                line_no += 1;
+            } else {
+                cur = line_end;
+            }
+        }
+    }
+    free(workspace);
+    free(package);
+    free(text);
+    if (out == NULL) {
+        return cheng_v3_bridge_owned_str("");
+    }
+    return cheng_str_bridge_from_owned(out);
+}
+typedef struct ChengV3ImportEdgeCompat {
+    ChengStrBridge ownerModulePath;
+    ChengStrBridge targetModulePath;
+    ChengStrBridge targetSourcePath;
+    uint8_t resolved;
+    uint8_t _pad[7];
+} ChengV3ImportEdgeCompat;
+
+typedef struct ChengV3ParsedSourceStubCompat {
+    ChengStrBridge workspaceRoot;
+    ChengStrBridge packageRoot;
+    ChengStrBridge packageId;
+    ChengStrBridge entrySourcePath;
+    ChengStrBridge sourcePath;
+    ChengStrBridge moduleStem;
+    ChengStrBridge syntaxTag;
+    int32_t sourceKind;
+    int32_t _pad0;
+    ChengSeqHeader ownerModulePaths;
+    ChengSeqHeader importEdges;
+    ChengSeqHeader orderedClosureSourcePaths;
+    uint8_t hasCompilerTopLevel;
+    uint8_t mainFunctionPresent;
+    uint8_t _pad1[2];
+    int32_t unresolvedImportCount;
+} ChengV3ParsedSourceStubCompat;
+
+static void cheng_v3_parser_scan_feature_flags(const char* text,
+                                               int* has_compiler_top_level,
+                                               int* main_function_present) {
+    const char* cur = text != NULL ? text : "";
+    if (has_compiler_top_level != NULL) {
+        *has_compiler_top_level = 0;
+    }
+    if (main_function_present != NULL) {
+        *main_function_present = 0;
+    }
+    while (*cur != '\0') {
+        const char* line_start = cur;
+        const char* line_end = cur;
+        while (*line_end != '\0' && *line_end != '\n') {
+            line_end++;
+        }
+        while (line_start < line_end && cheng_v3_bridge_is_inline_space(*line_start)) {
+            line_start++;
+        }
+        if (has_compiler_top_level != NULL) {
+            if ((size_t)(line_end - line_start) >= 7u && memcmp(line_start, "import ", 7u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 4u && memcmp(line_start, "type", 4u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 3u && memcmp(line_start, "fn ", 3u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 9u && memcmp(line_start, "iterator ", 9u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 6u && memcmp(line_start, "const ", 6u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 4u && memcmp(line_start, "let ", 4u) == 0) {
+                *has_compiler_top_level = 1;
+            } else if ((size_t)(line_end - line_start) >= 4u && memcmp(line_start, "var ", 4u) == 0) {
+                *has_compiler_top_level = 1;
+            }
+        }
+        if (main_function_present != NULL &&
+            (size_t)(line_end - line_start) >= 8u &&
+            memcmp(line_start, "fn main(", 8u) == 0) {
+            *main_function_present = 1;
+        }
+        if (*line_end == '\n') {
+            cur = line_end + 1;
+        } else {
+            cur = line_end;
+        }
+    }
+}
+
+static int cheng_v3_parser_collect_closure_stub(const char* workspace_root,
+                                                const char* package_root,
+                                                const char* source_path,
+                                                const char* owner_module_path,
+                                                ChengSeqHeader* ordered_out,
+                                                ChengSeqHeader* import_edges_out,
+                                                int32_t* unresolved_out,
+                                                ChengStrBridge* err_out) {
+    int32_t scan_pos = 0;
+    if (ordered_out == NULL || import_edges_out == NULL || unresolved_out == NULL || err_out == NULL) {
+        return 0;
+    }
+    ordered_out->len = 0;
+    ordered_out->cap = 0;
+    ordered_out->buffer = NULL;
+    import_edges_out->len = 0;
+    import_edges_out->cap = 0;
+    import_edges_out->buffer = NULL;
+    *unresolved_out = 0;
+    *err_out = cheng_str_bridge_empty();
+    if (!cheng_v3_seq_add_elem(ordered_out,
+                               &(ChengStrBridge){ .ptr = NULL, .len = 0, .store_id = 0, .flags = 0 },
+                               (int32_t)sizeof(ChengStrBridge))) {
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: native closure alloc failed");
+        return 0;
+    }
+    ((ChengStrBridge*)ordered_out->buffer)[0] = cheng_v3_bridge_owned_str(source_path);
+    while (scan_pos < ordered_out->len) {
+        ChengStrBridge current = ((ChengStrBridge*)ordered_out->buffer)[scan_pos];
+        char* text = NULL;
+        ChengStrBridge import_text_bridge;
+        char* import_text = NULL;
+        const char* cur = NULL;
+        int is_root = scan_pos == 0 ? 1 : 0;
+        scan_pos += 1;
+        text = cheng_v3_read_text_file_raw_dup(current.ptr);
+        if (text == NULL || text[0] == '\0') {
+            free(text);
+            *err_out = cheng_v3_bridge_owned_str("v3 parser: missing source");
+            return 0;
+        }
+        import_text_bridge = cheng_v3_parser_import_source_paths_bridge(
+            cheng_str_bridge_from_ptr_flags(workspace_root, CHENG_STR_BRIDGE_FLAG_NONE),
+            cheng_str_bridge_from_ptr_flags(package_root, CHENG_STR_BRIDGE_FLAG_NONE),
+            cheng_str_bridge_from_ptr_flags(text, CHENG_STR_BRIDGE_FLAG_NONE));
+        free(text);
+        import_text = cheng_v3_bridge_copy_cstring(import_text_bridge);
+        cheng_v3_bridge_release_owned(import_text_bridge);
+        if (import_text == NULL) {
+            *err_out = cheng_v3_bridge_owned_str("v3 parser: import scan alloc failed");
+            return 0;
+        }
+        if (cheng_v3_bridge_starts_with(import_text, "!error:")) {
+            *err_out = cheng_v3_bridge_owned_str(import_text + 7);
+            free(import_text);
+            return 0;
+        }
+        cur = import_text;
+        while (*cur != '\0') {
+            const char* line_start = cur;
+            const char* line_end = cur;
+            size_t line_len = 0u;
+            while (*line_end != '\0' && *line_end != '\n') {
+                line_end++;
+            }
+            line_len = (size_t)(line_end - line_start);
+            if (line_len > 0u) {
+                char* line = (char*)malloc(line_len + 1u);
+                int resolved = 0;
+                if (line == NULL) {
+                    free(import_text);
+                    *err_out = cheng_v3_bridge_owned_str("v3 parser: import line alloc failed");
+                    return 0;
+                }
+                memcpy(line, line_start, line_len);
+                line[line_len] = '\0';
+                resolved = strcmp(line, "-") != 0;
+                if (!resolved) {
+                    *unresolved_out += 1;
+                }
+                if (is_root) {
+                    ChengV3ImportEdgeCompat edge;
+                    memset(&edge, 0, sizeof(edge));
+                    edge.ownerModulePath = cheng_v3_bridge_owned_str(owner_module_path);
+                    edge.targetModulePath = cheng_str_bridge_empty();
+                    edge.targetSourcePath = resolved ? cheng_v3_bridge_owned_str(line) : cheng_str_bridge_empty();
+                    edge.resolved = resolved ? 1u : 0u;
+                    if (!cheng_v3_seq_add_elem(import_edges_out, &edge, (int32_t)sizeof(edge))) {
+                        free(line);
+                        free(import_text);
+                        *err_out = cheng_v3_bridge_owned_str("v3 parser: import edge alloc failed");
+                        return 0;
+                    }
+                }
+                if (resolved && !cheng_v3_str_seq_contains_cstr(ordered_out, line)) {
+                    ChengStrBridge next = cheng_v3_bridge_owned_str(line);
+                    if (!cheng_v3_seq_add_elem(ordered_out, &next, (int32_t)sizeof(next))) {
+                        free(line);
+                        free(import_text);
+                        *err_out = cheng_v3_bridge_owned_str("v3 parser: closure path alloc failed");
+                        return 0;
+                    }
+                }
+                free(line);
+            }
+            if (*line_end == '\n') {
+                cur = line_end + 1;
+            } else {
+                cur = line_end;
+            }
+        }
+        free(import_text);
+    }
+    return 1;
+}
+
+WEAK int32_t cheng_v3_parser_parse_source_stub_bridge(ChengStrBridge package_root_bridge,
+                                                      ChengStrBridge source_path_bridge,
+                                                      void* parsed_out_raw,
+                                                      ChengStrBridge* err_out) {
+    ChengV3ParsedSourceStubCompat* parsed = (ChengV3ParsedSourceStubCompat*)parsed_out_raw;
+    char* package_root_raw = NULL;
+    char* source_path_raw = NULL;
+    char* package_root = NULL;
+    char* source_path = NULL;
+    char* workspace_root = NULL;
+    char* module_stem = NULL;
+    char* package_id = NULL;
+    char* root_text = NULL;
+    ChengStrBridge owner_module_bridge;
+    char* owner_module_path = NULL;
+    int has_compiler_top_level = 0;
+    int main_function_present = 0;
+    ChengSeqHeader owner_modules;
+    ChengSeqHeader import_edges;
+    ChengSeqHeader ordered;
+    ChengStrBridge closure_err = cheng_str_bridge_empty();
+    int32_t unresolved = 0;
+    memset(&owner_modules, 0, sizeof(owner_modules));
+    memset(&import_edges, 0, sizeof(import_edges));
+    memset(&ordered, 0, sizeof(ordered));
+    owner_module_bridge = cheng_str_bridge_empty();
+    if (parsed == NULL || err_out == NULL) {
+        return 0;
+    }
+    memset(parsed, 0, sizeof(*parsed));
+    *err_out = cheng_str_bridge_empty();
+    package_root_raw = cheng_v3_bridge_copy_cstring(package_root_bridge);
+    source_path_raw = cheng_v3_bridge_copy_cstring(source_path_bridge);
+    if (package_root_raw == NULL || source_path_raw == NULL) {
+        free(package_root_raw);
+        free(source_path_raw);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: native path copy failed");
+        return 0;
+    }
+    package_root = cheng_v3_bridge_normalize_path_dup(package_root_raw);
+    source_path = cheng_v3_bridge_normalize_path_dup(source_path_raw);
+    free(package_root_raw);
+    free(source_path_raw);
+    if (package_root == NULL) {
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: native package root alloc failed");
+        return 0;
+    }
+    if (source_path == NULL) {
+        free(package_root);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: native source path alloc failed");
+        return 0;
+    }
+    if (source_path[0] == '\0') {
+        free(package_root);
+        free(source_path);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: missing source path");
+        return 0;
+    }
+    if (!cheng_v3_file_nonempty_exists_raw(source_path)) {
+        char* msg = cheng_v3_bridge_concat2("v3 parser: source file missing: ", source_path);
+        free(package_root);
+        free(source_path);
+        *err_out = cheng_str_bridge_from_owned(msg != NULL ? msg : cheng_v3_bridge_dup_cstring("v3 parser: source file missing"));
+        return 0;
+    }
+    workspace_root = cheng_v3_bridge_workspace_root_dup(package_root);
+    module_stem = cheng_v3_bridge_file_stem_dup(source_path);
+    package_id = cheng_v3_bridge_package_id_dup(package_root);
+    root_text = cheng_v3_read_text_file_raw_dup(source_path);
+    if (workspace_root == NULL || module_stem == NULL || package_id == NULL || root_text == NULL) {
+        free(package_root);
+        free(source_path);
+        free(workspace_root);
+        free(module_stem);
+        free(package_id);
+        free(root_text);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: native parse alloc failed");
+        return 0;
+    }
+    owner_module_bridge = cheng_v3_parser_source_to_module_bridge(
+        cheng_str_bridge_from_ptr_flags(workspace_root, CHENG_STR_BRIDGE_FLAG_NONE),
+        cheng_str_bridge_from_ptr_flags(package_root, CHENG_STR_BRIDGE_FLAG_NONE),
+        cheng_str_bridge_from_ptr_flags(source_path, CHENG_STR_BRIDGE_FLAG_NONE));
+    owner_module_path = cheng_v3_bridge_copy_cstring(owner_module_bridge);
+    cheng_v3_bridge_release_owned(owner_module_bridge);
+    if (owner_module_path == NULL) {
+        free(package_root);
+        free(source_path);
+        free(workspace_root);
+        free(module_stem);
+        free(package_id);
+        free(root_text);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: owner module alloc failed");
+        return 0;
+    }
+    cheng_v3_parser_scan_feature_flags(root_text, &has_compiler_top_level, &main_function_present);
+    if (!cheng_v3_seq_add_elem(&owner_modules,
+                               &(ChengStrBridge){ .ptr = NULL, .len = 0, .store_id = 0, .flags = 0 },
+                               (int32_t)sizeof(ChengStrBridge))) {
+        free(package_root);
+        free(source_path);
+        free(workspace_root);
+        free(module_stem);
+        free(package_id);
+        free(root_text);
+        free(owner_module_path);
+        *err_out = cheng_v3_bridge_owned_str("v3 parser: owner module seq alloc failed");
+        return 0;
+    }
+    ((ChengStrBridge*)owner_modules.buffer)[0] = cheng_v3_bridge_owned_str(owner_module_path);
+    if (!cheng_v3_parser_collect_closure_stub(workspace_root,
+                                              package_root,
+                                              source_path,
+                                              owner_module_path,
+                                              &ordered,
+                                              &import_edges,
+                                              &unresolved,
+                                              &closure_err)) {
+        free(package_root);
+        free(source_path);
+        free(workspace_root);
+        free(module_stem);
+        free(package_id);
+        free(root_text);
+        free(owner_module_path);
+        *err_out = closure_err;
+        return 0;
+    }
+    parsed->workspaceRoot = cheng_v3_bridge_owned_str(workspace_root);
+    parsed->packageRoot = cheng_v3_bridge_owned_str(package_root);
+    parsed->packageId = cheng_v3_bridge_owned_str(package_id);
+    parsed->entrySourcePath = cheng_v3_bridge_owned_str(source_path);
+    parsed->sourcePath = cheng_v3_bridge_owned_str(source_path);
+    parsed->moduleStem = cheng_v3_bridge_owned_str(module_stem);
+    parsed->syntaxTag = cheng_v3_bridge_owned_str("v3_source_stub_v1");
+    parsed->sourceKind = 0;
+    parsed->ownerModulePaths = owner_modules;
+    parsed->importEdges = import_edges;
+    parsed->orderedClosureSourcePaths = ordered;
+    parsed->hasCompilerTopLevel = has_compiler_top_level ? 1u : 0u;
+    parsed->mainFunctionPresent = main_function_present ? 1u : 0u;
+    parsed->unresolvedImportCount = unresolved;
+    free(package_root);
+    free(source_path);
+    free(workspace_root);
+    free(module_stem);
+    free(package_id);
+    free(root_text);
+    free(owner_module_path);
+    *err_out = cheng_str_bridge_empty();
+    return 1;
+}
+WEAK ChengStrBridge cheng_v3_parser_source_to_module_bridge(ChengStrBridge workspace_root,
+                                                            ChengStrBridge package_root,
+                                                            ChengStrBridge source_path) {
+    char* workspace = cheng_v3_bridge_copy_cstring(workspace_root);
+    char* package = cheng_v3_bridge_copy_cstring(package_root);
+    char* source = cheng_v3_bridge_copy_cstring(source_path);
+    char* out = NULL;
+    if (workspace == NULL || package == NULL || source == NULL) {
+        free(workspace);
+        free(package);
+        free(source);
+        return cheng_v3_bridge_owned_str("");
+    }
+    {
+        char* package_prefix = cheng_v3_bridge_concat2(package, "/src/");
+        if (package_prefix != NULL && cheng_v3_bridge_starts_with(source, package_prefix)) {
+            char* rel = cheng_v3_bridge_rel_without_ext_dup(source + strlen(package_prefix));
+            char* package_id = cheng_v3_bridge_package_id_dup(package);
+            if (rel != NULL && package_id != NULL) {
+                out = cheng_v3_bridge_concat3(package_id, "/", rel);
+            }
+            free(rel);
+            free(package_id);
+        }
+        free(package_prefix);
+    }
+    if (out == NULL) {
+        char* std_prefix = cheng_v3_bridge_concat2(workspace, "/src/std/");
+        if (std_prefix != NULL && cheng_v3_bridge_starts_with(source, std_prefix)) {
+            char* rel = cheng_v3_bridge_rel_without_ext_dup(source + strlen(std_prefix));
+            if (rel != NULL) {
+                out = cheng_v3_bridge_concat2("std/", rel);
+            }
+            free(rel);
+        }
+        free(std_prefix);
+    }
+    if (out == NULL) {
+        out = cheng_v3_bridge_file_stem_dup(source);
+    }
+    free(workspace);
+    free(package);
+    free(source);
+    if (out == NULL) {
+        return cheng_v3_bridge_owned_str("");
+    }
+    return cheng_str_bridge_from_owned(out);
+}
+WEAK int32_t cheng_v3_os_file_exists_bridge(ChengStrBridge path) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    int32_t out = 0;
+    if (raw == NULL) {
+        return 0;
+    }
+    out = cheng_file_exists(raw) != 0 ? 1 : 0;
+    free(raw);
+    return out;
+}
+WEAK int32_t cheng_v3_os_dir_exists_bridge(ChengStrBridge path) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    int32_t out = 0;
+    if (raw == NULL) {
+        return 0;
+    }
+    out = cheng_dir_exists(raw) != 0 ? 1 : 0;
+    free(raw);
+    return out;
+}
+WEAK int64_t cheng_v3_os_file_size_bridge(ChengStrBridge path) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    int64_t out = 0;
+    if (raw == NULL) {
+        return 0;
+    }
+    out = cheng_file_size(raw);
+    free(raw);
+    return out;
+}
+WEAK ChengStrBridge cheng_v3_read_file_bridge(ChengStrBridge path) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    ChengStrBridge out = driver_c_str_from_utf8_copy_bridge("", 0);
+    if (raw == NULL) {
+        return out;
+    }
+    out = driver_c_read_file_all_bridge(raw);
+    free(raw);
+    return out;
+}
+static ChengStrBridge cheng_v3_tcp_bridge_error_result(const char* prefix) {
+    char buffer[256];
+    const char* safe_prefix = prefix != NULL ? prefix : "v3 libp2p tcp";
+    const char* safe_text = strerror(errno);
+    if (safe_text == NULL) {
+        safe_text = "unknown";
+    }
+    snprintf(buffer, sizeof(buffer), "%s: %s (%d)", safe_prefix, safe_text, errno);
+    return driver_c_str_from_utf8_copy_bridge(buffer, (int32_t)strlen(buffer));
+}
+static int cheng_v3_tcp_send_all_raw(int fd, const char* data, size_t len) {
+    size_t sent = 0u;
+    while (sent < len) {
+        ssize_t rc = send(fd, data + sent, len - sent, 0);
+        if (rc <= 0) {
+            return 0;
+        }
+        sent += (size_t)rc;
+    }
+    return 1;
+}
+static int cheng_v3_tcp_recv_exact_raw(int fd, char* data, size_t len) {
+    size_t got = 0u;
+    while (got < len) {
+        ssize_t rc = recv(fd, data + got, len - got, 0);
+        if (rc <= 0) {
+            return 0;
+        }
+        got += (size_t)rc;
+    }
+    return 1;
+}
+static void cheng_v3_tcp_write_u32be(unsigned char out[4], uint32_t value) {
+    out[0] = (unsigned char)((value >> 24) & 0xffu);
+    out[1] = (unsigned char)((value >> 16) & 0xffu);
+    out[2] = (unsigned char)((value >> 8) & 0xffu);
+    out[3] = (unsigned char)(value & 0xffu);
+}
+static uint32_t cheng_v3_tcp_read_u32be(const unsigned char in[4]) {
+    return ((uint32_t)in[0] << 24) |
+           ((uint32_t)in[1] << 16) |
+           ((uint32_t)in[2] << 8) |
+           (uint32_t)in[3];
+}
+static int cheng_v3_tcp_parse_ipv4_host_raw(const char* raw, uint32_t* out_addr_be) {
+    struct in_addr addr;
+    if (out_addr_be == NULL) {
+        return 0;
+    }
+    if (raw == NULL || raw[0] == '\0' || strcmp(raw, "127.0.0.1") == 0 || strcmp(raw, "localhost") == 0) {
+        *out_addr_be = htonl(INADDR_LOOPBACK);
+        return 1;
+    }
+    if (inet_pton(AF_INET, raw, &addr) != 1) {
+        return 0;
+    }
+    *out_addr_be = addr.s_addr;
+    return 1;
+}
+static int cheng_v3_tcp_write_ready_port_raw(const char* ready_path, uint16_t port, ChengStrBridge* err_out) {
+    FILE* f = NULL;
+    char port_text[32];
+    size_t want = 0u;
+    size_t wrote = 0u;
+    if (ready_path == NULL || ready_path[0] == '\0') {
+        return 1;
+    }
+    f = fopen(ready_path, "wb");
+    if (f == NULL) {
+        if (err_out != NULL) {
+            *err_out = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: open ready path");
+        }
+        return 0;
+    }
+    snprintf(port_text, sizeof(port_text), "%u\n", (unsigned)port);
+    want = strlen(port_text);
+    wrote = fwrite(port_text, 1u, want, f);
+    if (wrote != want || fflush(f) != 0) {
+        if (err_out != NULL) {
+            *err_out = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: write ready path");
+        }
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    return 1;
+}
+WEAK int32_t cheng_v3_tcp_loopback_payload_bridge(ChengStrBridge protocol_text,
+                                                  ChengStrBridge payload_text,
+                                                  ChengStrBridge* response_text,
+                                                  ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p tcp: win32 loopback payload bridge not implemented";
+    if (response_text != NULL) {
+        *response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)protocol_text;
+    (void)payload_text;
+    return 0;
+#else
+    const char* alloc_failed = "v3 libp2p tcp: alloc failed";
+    const char* request_mismatch = "v3 libp2p tcp: multistream request mismatch";
+    const char* response_mismatch = "v3 libp2p tcp: multistream response mismatch";
+    const char* protocol = "";
+    const char* payload = "";
+    size_t protocol_len = 0u;
+    size_t payload_len = 0u;
+    char* server_protocol = NULL;
+    char* client_protocol = NULL;
+    char* server_payload = NULL;
+    char* client_payload = NULL;
+    int listener_fd = -1;
+    int client_fd = -1;
+    int server_fd = -1;
+    struct sockaddr_in listener_addr;
+    struct sockaddr_in client_addr;
+    socklen_t listener_len = (socklen_t)sizeof(listener_addr);
+    unsigned char frame_len_buf[4];
+    uint32_t frame_len = 0u;
+    ChengStrBridge ok = cheng_str_bridge_empty();
+    ChengStrBridge err = ok;
+    ChengStrBridge response = ok;
+    if (response_text != NULL) {
+        *response_text = ok;
+    }
+    if (err_text != NULL) {
+        *err_text = ok;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(payload_text, &payload, &payload_len)) {
+        payload = "";
+        payload_len = 0u;
+    }
+    memset(&listener_addr, 0, sizeof(listener_addr));
+    listener_addr.sin_family = AF_INET;
+    listener_addr.sin_port = htons(0);
+    listener_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: socket");
+        goto cleanup;
+    }
+    {
+        int reuse = 1;
+        (void)setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, (socklen_t)sizeof(reuse));
+    }
+    if (bind(listener_fd, (const struct sockaddr*)&listener_addr, (socklen_t)sizeof(listener_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: bind");
+        goto cleanup;
+    }
+    if (listen(listener_fd, 8) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: listen");
+        goto cleanup;
+    }
+    if (getsockname(listener_fd, (struct sockaddr*)&listener_addr, &listener_len) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: getsockname");
+        goto cleanup;
+    }
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_port = listener_addr.sin_port;
+    client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: client socket");
+        goto cleanup;
+    }
+    if (connect(client_fd, (const struct sockaddr*)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: connect");
+        goto cleanup;
+    }
+    server_fd = accept(listener_fd, NULL, NULL);
+    if (server_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: accept");
+        goto cleanup;
+    }
+    if (protocol_len > 0u) {
+        server_protocol = (char*)malloc(protocol_len);
+        client_protocol = (char*)malloc(protocol_len);
+        if (server_protocol == NULL || client_protocol == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(client_fd, protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send request");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(server_fd, server_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv request");
+            goto cleanup;
+        }
+        if (memcmp(server_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_mismatch, (int32_t)strlen(request_mismatch));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(server_fd, server_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send response");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, client_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv response");
+            goto cleanup;
+        }
+        if (memcmp(client_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(response_mismatch, (int32_t)strlen(response_mismatch));
+            goto cleanup;
+        }
+    }
+    if (payload_len > 0xffffffffu) {
+        const char* too_large = "v3 libp2p tcp: payload too large";
+        err = driver_c_str_from_utf8_copy_bridge(too_large, (int32_t)strlen(too_large));
+        goto cleanup;
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)payload_len);
+    if (!cheng_v3_tcp_send_all_raw(client_fd, (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send frame len");
+        goto cleanup;
+    }
+    if (payload_len > 0u && !cheng_v3_tcp_send_all_raw(client_fd, payload, payload_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(server_fd, (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv frame len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len != (uint32_t)payload_len) {
+        const char* length_mismatch = "v3 libp2p tcp: payload length mismatch";
+        err = driver_c_str_from_utf8_copy_bridge(length_mismatch, (int32_t)strlen(length_mismatch));
+        goto cleanup;
+    }
+    if (frame_len > 0u) {
+        server_payload = (char*)malloc((size_t)frame_len);
+        client_payload = (char*)malloc((size_t)frame_len);
+        if (server_payload == NULL || client_payload == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(server_fd, server_payload, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv payload");
+            goto cleanup;
+        }
+        if (memcmp(server_payload, payload, (size_t)frame_len) != 0) {
+            const char* payload_mismatch = "v3 libp2p tcp: payload mismatch";
+            err = driver_c_str_from_utf8_copy_bridge(payload_mismatch, (int32_t)strlen(payload_mismatch));
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, frame_len);
+    if (!cheng_v3_tcp_send_all_raw(server_fd, (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send echo len");
+        goto cleanup;
+    }
+    if (frame_len > 0u && !cheng_v3_tcp_send_all_raw(server_fd, server_payload, (size_t)frame_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send echo payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(client_fd, (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv echo len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len > 0u) {
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, client_payload, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv echo payload");
+            goto cleanup;
+        }
+        if (memcmp(client_payload, payload, (size_t)frame_len) != 0) {
+            const char* echo_payload_mismatch = "v3 libp2p tcp: echo payload mismatch";
+            err = driver_c_str_from_utf8_copy_bridge(echo_payload_mismatch, (int32_t)strlen(echo_payload_mismatch));
+            goto cleanup;
+        }
+    }
+    response = driver_c_str_from_utf8_copy_bridge(client_payload != NULL ? client_payload : "", (int32_t)frame_len);
+cleanup:
+    if (response_text != NULL) {
+        *response_text = response;
+    } else {
+        cheng_v3_bridge_release_owned(response);
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (server_fd >= 0) {
+        close(server_fd);
+    }
+    if (client_fd >= 0) {
+        close(client_fd);
+    }
+    if (listener_fd >= 0) {
+        close(listener_fd);
+    }
+    free(server_protocol);
+    free(client_protocol);
+    free(server_payload);
+    free(client_payload);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
+WEAK int32_t cheng_v3_tcp_loopback_request_response_bridge(ChengStrBridge protocol_text,
+                                                           ChengStrBridge request_text,
+                                                           ChengStrBridge response_text,
+                                                           ChengStrBridge* client_response_text,
+                                                           ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p tcp: win32 loopback request-response bridge not implemented";
+    if (client_response_text != NULL) {
+        *client_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)protocol_text;
+    (void)request_text;
+    (void)response_text;
+    return 0;
+#else
+    const char* alloc_failed = "v3 libp2p tcp: alloc failed";
+    const char* request_mismatch = "v3 libp2p tcp: multistream request mismatch";
+    const char* response_mismatch = "v3 libp2p tcp: multistream response mismatch";
+    const char* request_payload_mismatch = "v3 libp2p tcp: request payload mismatch";
+    const char* request_length_mismatch = "v3 libp2p tcp: request payload length mismatch";
+    const char* response_too_large = "v3 libp2p tcp: response payload too large";
+    const char* protocol = "";
+    const char* request = "";
+    const char* response_payload = "";
+    size_t protocol_len = 0u;
+    size_t request_len = 0u;
+    size_t response_len = 0u;
+    char* server_protocol = NULL;
+    char* client_protocol = NULL;
+    char* server_request = NULL;
+    char* client_response = NULL;
+    int listener_fd = -1;
+    int client_fd = -1;
+    int server_fd = -1;
+    struct sockaddr_in listener_addr;
+    struct sockaddr_in client_addr;
+    socklen_t listener_len = (socklen_t)sizeof(listener_addr);
+    unsigned char frame_len_buf[4];
+    uint32_t frame_len = 0u;
+    ChengStrBridge err = cheng_str_bridge_empty();
+    ChengStrBridge response = cheng_str_bridge_empty();
+    if (client_response_text != NULL) {
+        *client_response_text = response;
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(request_text, &request, &request_len)) {
+        request = "";
+        request_len = 0u;
+    }
+    if (!cheng_str_bridge_view(response_text, &response_payload, &response_len)) {
+        response_payload = "";
+        response_len = 0u;
+    }
+    if (response_len > 0xffffffffu) {
+        err = driver_c_str_from_utf8_copy_bridge(response_too_large, (int32_t)strlen(response_too_large));
+        goto cleanup;
+    }
+    memset(&listener_addr, 0, sizeof(listener_addr));
+    listener_addr.sin_family = AF_INET;
+    listener_addr.sin_port = htons(0);
+    listener_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: socket");
+        goto cleanup;
+    }
+    {
+        int reuse = 1;
+        (void)setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, (socklen_t)sizeof(reuse));
+    }
+    if (bind(listener_fd, (const struct sockaddr*)&listener_addr, (socklen_t)sizeof(listener_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: bind");
+        goto cleanup;
+    }
+    if (listen(listener_fd, 8) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: listen");
+        goto cleanup;
+    }
+    if (getsockname(listener_fd, (struct sockaddr*)&listener_addr, &listener_len) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: getsockname");
+        goto cleanup;
+    }
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_port = listener_addr.sin_port;
+    client_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: client socket");
+        goto cleanup;
+    }
+    if (connect(client_fd, (const struct sockaddr*)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: connect");
+        goto cleanup;
+    }
+    server_fd = accept(listener_fd, NULL, NULL);
+    if (server_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: accept");
+        goto cleanup;
+    }
+    if (protocol_len > 0u) {
+        server_protocol = (char*)malloc(protocol_len);
+        client_protocol = (char*)malloc(protocol_len);
+        if (server_protocol == NULL || client_protocol == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(client_fd, protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send request");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(server_fd, server_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv request");
+            goto cleanup;
+        }
+        if (memcmp(server_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_mismatch, (int32_t)strlen(request_mismatch));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(server_fd, protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send response");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, client_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv response");
+            goto cleanup;
+        }
+        if (memcmp(client_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(response_mismatch, (int32_t)strlen(response_mismatch));
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)request_len);
+    if (!cheng_v3_tcp_send_all_raw(client_fd, (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send request len");
+        goto cleanup;
+    }
+    if (request_len > 0u && !cheng_v3_tcp_send_all_raw(client_fd, request, request_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send request payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(server_fd, (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv request len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len != (uint32_t)request_len) {
+        err = driver_c_str_from_utf8_copy_bridge(request_length_mismatch, (int32_t)strlen(request_length_mismatch));
+        goto cleanup;
+    }
+    if (frame_len > 0u) {
+        server_request = (char*)malloc((size_t)frame_len);
+        if (server_request == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(server_fd, server_request, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv request payload");
+            goto cleanup;
+        }
+        if (memcmp(server_request, request, (size_t)frame_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_payload_mismatch, (int32_t)strlen(request_payload_mismatch));
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)response_len);
+    if (!cheng_v3_tcp_send_all_raw(server_fd, (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send response len");
+        goto cleanup;
+    }
+    if (response_len > 0u && !cheng_v3_tcp_send_all_raw(server_fd, response_payload, response_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send response payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(client_fd, (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv response len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len > 0u) {
+        client_response = (char*)malloc((size_t)frame_len);
+        if (client_response == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, client_response, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv response payload");
+            goto cleanup;
+        }
+    }
+    response = driver_c_str_from_utf8_copy_bridge(client_response != NULL ? client_response : "",
+                                                  (int32_t)frame_len);
+cleanup:
+    if (client_response_text != NULL) {
+        *client_response_text = response;
+    } else {
+        cheng_v3_bridge_release_owned(response);
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (server_fd >= 0) {
+        close(server_fd);
+    }
+    if (client_fd >= 0) {
+        close(client_fd);
+    }
+    if (listener_fd >= 0) {
+        close(listener_fd);
+    }
+    free(server_protocol);
+    free(client_protocol);
+    free(server_request);
+    free(client_response);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
+WEAK int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
+                                                    int32_t port,
+                                                    ChengStrBridge protocol_text,
+                                                    ChengStrBridge payload_text,
+                                                    ChengStrBridge ready_path_text,
+                                                    ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p tcp: win32 serve payload bridge not implemented";
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)host_text;
+    (void)port;
+    (void)protocol_text;
+    (void)payload_text;
+    (void)ready_path_text;
+    return 0;
+#else
+    const char* alloc_failed = "v3 libp2p tcp: alloc failed";
+    const char* request_mismatch = "v3 libp2p tcp: multistream request mismatch";
+    const char* bad_host = "v3 libp2p tcp: invalid host";
+    const char* bad_port = "v3 libp2p tcp: invalid port";
+    const char* payload_too_large = "v3 libp2p tcp: payload too large";
+    const char* protocol = "";
+    const char* payload = "";
+    size_t protocol_len = 0u;
+    size_t payload_len = 0u;
+    char* bind_host = NULL;
+    char* ready_path = NULL;
+    char* server_protocol = NULL;
+    int listener_fd = -1;
+    int server_fd = -1;
+    struct sockaddr_in listener_addr;
+    socklen_t listener_len = (socklen_t)sizeof(listener_addr);
+    unsigned char frame_len_buf[4];
+    ChengStrBridge err = cheng_str_bridge_empty();
+    if (err_text != NULL) {
+        *err_text = err;
+    }
+    bind_host = cheng_v3_bridge_copy_cstring(host_text);
+    ready_path = cheng_v3_bridge_copy_cstring(ready_path_text);
+    if (bind_host == NULL || ready_path == NULL) {
+        err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+        goto cleanup;
+    }
+    if (port < 0 || port > 65535) {
+        err = driver_c_str_from_utf8_copy_bridge(bad_port, (int32_t)strlen(bad_port));
+        goto cleanup;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(payload_text, &payload, &payload_len)) {
+        payload = "";
+        payload_len = 0u;
+    }
+    if (payload_len > 0xffffffffu) {
+        err = driver_c_str_from_utf8_copy_bridge(payload_too_large, (int32_t)strlen(payload_too_large));
+        goto cleanup;
+    }
+    memset(&listener_addr, 0, sizeof(listener_addr));
+    listener_addr.sin_family = AF_INET;
+    listener_addr.sin_port = htons((uint16_t)port);
+    if (!cheng_v3_tcp_parse_ipv4_host_raw(bind_host, &listener_addr.sin_addr.s_addr)) {
+        err = driver_c_str_from_utf8_copy_bridge(bad_host, (int32_t)strlen(bad_host));
+        goto cleanup;
+    }
+    listener_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: socket");
+        goto cleanup;
+    }
+    {
+        int reuse = 1;
+        (void)setsockopt(listener_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, (socklen_t)sizeof(reuse));
+    }
+    if (bind(listener_fd, (const struct sockaddr*)&listener_addr, (socklen_t)sizeof(listener_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: bind");
+        goto cleanup;
+    }
+    if (listen(listener_fd, 8) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: listen");
+        goto cleanup;
+    }
+    if (getsockname(listener_fd, (struct sockaddr*)&listener_addr, &listener_len) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: getsockname");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_write_ready_port_raw(ready_path,
+                                           ntohs(listener_addr.sin_port),
+                                           &err)) {
+        goto cleanup;
+    }
+    fflush(stdout);
+    server_fd = accept(listener_fd, NULL, NULL);
+    if (server_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: accept");
+        goto cleanup;
+    }
+    if (protocol_len > 0u) {
+        server_protocol = (char*)malloc(protocol_len);
+        if (server_protocol == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(server_fd, server_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv request");
+            goto cleanup;
+        }
+        if (memcmp(server_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_mismatch, (int32_t)strlen(request_mismatch));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(server_fd, protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send response");
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)payload_len);
+    if (!cheng_v3_tcp_send_all_raw(server_fd, (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send frame len");
+        goto cleanup;
+    }
+    if (payload_len > 0u && !cheng_v3_tcp_send_all_raw(server_fd, payload, payload_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send payload");
+        goto cleanup;
+    }
+cleanup:
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (server_fd >= 0) {
+        close(server_fd);
+    }
+    if (listener_fd >= 0) {
+        close(listener_fd);
+    }
+    free(bind_host);
+    free(ready_path);
+    free(server_protocol);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
+WEAK int32_t cheng_v3_tcp_recv_payload_once_bridge(ChengStrBridge host_text,
+                                                   int32_t port,
+                                                   ChengStrBridge protocol_text,
+                                                   ChengStrBridge* response_text,
+                                                   ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p tcp: win32 recv payload bridge not implemented";
+    if (response_text != NULL) {
+        *response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)host_text;
+    (void)port;
+    (void)protocol_text;
+    return 0;
+#else
+    const char* alloc_failed = "v3 libp2p tcp: alloc failed";
+    const char* response_mismatch = "v3 libp2p tcp: multistream response mismatch";
+    const char* bad_host = "v3 libp2p tcp: invalid host";
+    const char* bad_port = "v3 libp2p tcp: invalid port";
+    const char* protocol = "";
+    size_t protocol_len = 0u;
+    char* connect_host = NULL;
+    char* client_protocol = NULL;
+    char* payload = NULL;
+    int client_fd = -1;
+    struct sockaddr_in client_addr;
+    unsigned char frame_len_buf[4];
+    uint32_t frame_len = 0u;
+    ChengStrBridge err = cheng_str_bridge_empty();
+    ChengStrBridge response = cheng_str_bridge_empty();
+    if (response_text != NULL) {
+        *response_text = response;
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    }
+    connect_host = cheng_v3_bridge_copy_cstring(host_text);
+    if (connect_host == NULL) {
+        err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+        goto cleanup;
+    }
+    if (port < 0 || port > 65535) {
+        err = driver_c_str_from_utf8_copy_bridge(bad_port, (int32_t)strlen(bad_port));
+        goto cleanup;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    memset(&client_addr, 0, sizeof(client_addr));
+    client_addr.sin_family = AF_INET;
+    client_addr.sin_port = htons((uint16_t)port);
+    if (!cheng_v3_tcp_parse_ipv4_host_raw(connect_host, &client_addr.sin_addr.s_addr)) {
+        err = driver_c_str_from_utf8_copy_bridge(bad_host, (int32_t)strlen(bad_host));
+        goto cleanup;
+    }
+    client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (client_fd < 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: client socket");
+        goto cleanup;
+    }
+    if (connect(client_fd, (const struct sockaddr*)&client_addr, (socklen_t)sizeof(client_addr)) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: connect");
+        goto cleanup;
+    }
+    if (protocol_len > 0u) {
+        client_protocol = (char*)malloc(protocol_len);
+        if (client_protocol == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(client_fd, protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: send request");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, client_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv response");
+            goto cleanup;
+        }
+        if (memcmp(client_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(response_mismatch, (int32_t)strlen(response_mismatch));
+            goto cleanup;
+        }
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(client_fd, (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv frame len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len > 0u) {
+        payload = (char*)malloc((size_t)frame_len);
+        if (payload == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(client_fd, payload, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p tcp: recv payload");
+            goto cleanup;
+        }
+    }
+    response = driver_c_str_from_utf8_copy_bridge(payload != NULL ? payload : "", (int32_t)frame_len);
+cleanup:
+    if (response_text != NULL) {
+        *response_text = response;
+    } else {
+        cheng_v3_bridge_release_owned(response);
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (client_fd >= 0) {
+        close(client_fd);
+    }
+    free(connect_host);
+    free(client_protocol);
+    free(payload);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
+WEAK ChengStrBridge cheng_v3_tcp_loopback_multistream_bridge(ChengStrBridge protocol_text) {
+    ChengStrBridge ok = cheng_str_bridge_empty();
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p tcp: win32 loopback bridge not implemented";
+    (void)protocol_text;
+    return driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+#else
+    ChengStrBridge response = ok;
+    ChengStrBridge err = ok;
+    ChengStrBridge payload = ok;
+    int32_t bridge_ok = cheng_v3_tcp_loopback_payload_bridge(protocol_text, payload, &response, &err);
+    cheng_v3_bridge_release_owned(response);
+    if (bridge_ok) {
+        return ok;
+    }
+    return err;
+#endif
+}
+WEAK ChengStrBridge driver_c_get_current_dir_bridge(void) {
+    const char* cwd = cheng_getcwd();
+    if (cwd == NULL) {
+        return driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    return driver_c_str_from_utf8_copy_bridge(cwd, (int32_t)strlen(cwd));
+}
+WEAK ChengStrBridge driver_c_join_path2_bridge(ChengStrBridge left, ChengStrBridge right) {
+    return cheng_v3_os_join_path_bridge(left, right);
+}
+WEAK void driver_c_create_dir_all_bridge(ChengStrBridge path) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    if (raw == NULL) {
+        fprintf(stderr, "[cheng] create_dir_all bridge alloc failed\n");
+        abort();
+    }
+    cheng_v3_mkdir_all_raw(raw, 1);
+    free(raw);
+}
+WEAK void driver_c_write_text_file_bridge(ChengStrBridge path, ChengStrBridge content) {
+    char* raw = cheng_v3_bridge_copy_cstring(path);
+    FILE* f = NULL;
+    if (raw == NULL) {
+        fprintf(stderr, "[cheng] write_text_file bridge alloc failed\n");
+        abort();
+    }
+    if (raw[0] == '\0') {
+        free(raw);
+        return;
+    }
+    cheng_v3_mkdir_all_raw(raw, 0);
+    f = fopen(raw, "wb");
+    if (f == NULL) {
+        fprintf(stderr, "[cheng] open failed: %s\n", raw);
+        free(raw);
+        abort();
+    }
+    if (content.ptr != NULL && content.len > 0) {
+        if (fwrite(content.ptr, 1, (size_t)content.len, f) != (size_t)content.len) {
+            fprintf(stderr, "[cheng] write failed: %s\n", raw);
+            fclose(f);
+            free(raw);
+            abort();
+        }
+    }
+    fclose(f);
+    free(raw);
+}
 WEAK int32_t driver_c_str_get_at(const char* s, int32_t idx) {
     const char* safe = "";
     size_t n = 0;
-    if (!cheng_safe_cstr_view(s, &safe, &n)) {
+    if (!cheng_safe_raw_cstr_view(s, &safe, &n)) {
         return 0;
     }
     if (idx < 0 || (size_t)idx >= n) {
@@ -5751,7 +8730,7 @@ WEAK int32_t driver_c_str_get_at_bridge(ChengStrBridge s, int32_t idx) {
 }
 WEAK void driver_c_str_set_at(char* s, int32_t idx, int32_t value) {
     size_t n = 0;
-    if (!cheng_safe_cstr_view((const char*)s, NULL, &n)) {
+    if (!cheng_safe_raw_cstr_view((const char*)s, NULL, &n)) {
         return;
     }
     if (idx < 0 || (size_t)idx >= n) {
@@ -5769,11 +8748,11 @@ WEAK int32_t driver_c_str_has_prefix(const char* s, const char* prefix) {
     const char* sb = "";
     size_t la = 0;
     size_t lb = 0;
-    if (!cheng_safe_cstr_view(s, &sa, &la)) {
+    if (!cheng_safe_raw_cstr_view(s, &sa, &la)) {
         sa = "";
         la = 0;
     }
-    if (!cheng_safe_cstr_view(prefix, &sb, &lb)) {
+    if (!cheng_safe_raw_cstr_view(prefix, &sb, &lb)) {
         sb = "";
         lb = 0;
     }
@@ -5786,11 +8765,11 @@ WEAK int32_t driver_c_str_has_suffix(const char* s, const char* suffix) {
     const char* sb = "";
     size_t la = 0;
     size_t lb = 0;
-    if (!cheng_safe_cstr_view(s, &sa, &la)) {
+    if (!cheng_safe_raw_cstr_view(s, &sa, &la)) {
         sa = "";
         la = 0;
     }
-    if (!cheng_safe_cstr_view(suffix, &sb, &lb)) {
+    if (!cheng_safe_raw_cstr_view(suffix, &sb, &lb)) {
         sb = "";
         lb = 0;
     }
@@ -5808,7 +8787,7 @@ WEAK int32_t driver_c_str_contains_char(const char* s, int32_t value) {
     const char* safe = "";
     size_t n = 0;
     unsigned char target = (unsigned char)(value & 0xff);
-    if (!cheng_safe_cstr_view(s, &safe, &n)) {
+    if (!cheng_safe_raw_cstr_view(s, &safe, &n)) {
         return 0;
     }
     for (size_t i = 0; i < n; ++i) {
@@ -5838,30 +8817,52 @@ WEAK bool driver_c_bool_identity(bool value) {
     return value;
 }
 WEAK int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value) {
-    return driver_c_str_contains_char(s.ptr, value);
+    const char* safe = "";
+    size_t n = 0;
+    unsigned char target = (unsigned char)(value & 0xff);
+    if (!cheng_str_bridge_view(s, &safe, &n)) {
+        return 0;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if ((unsigned char)safe[i] == target) return 1;
+    }
+    return 0;
 }
 WEAK int32_t driver_c_str_contains_str(const char* s, const char* sub) {
     const char* sa = "";
     const char* sb = "";
     size_t la = 0;
     size_t lb = 0;
-    if (!cheng_safe_cstr_view(s, &sa, &la)) {
+    if (!cheng_safe_raw_cstr_view(s, &sa, &la)) {
         sa = "";
         la = 0;
     }
-    if (!cheng_safe_cstr_view(sub, &sb, &lb)) {
+    if (!cheng_safe_raw_cstr_view(sub, &sb, &lb)) {
         sb = "";
         lb = 0;
     }
-    if (lb == 0) return 1;
-    if (lb > la) return 0;
-    for (size_t i = 0; i + lb <= la; ++i) {
-        if (memcmp(sa + i, sb, lb) == 0) return 1;
-    }
-    return 0;
+    return cheng_v3_twoway_contains_bytes((const unsigned char*)sa,
+                                          la,
+                                          (const unsigned char*)sb,
+                                          lb);
 }
 WEAK int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub) {
-    return driver_c_str_contains_str(s.ptr, sub.ptr);
+    const char* sa = "";
+    const char* sb = "";
+    size_t la = 0;
+    size_t lb = 0;
+    if (!cheng_str_bridge_view(s, &sa, &la)) {
+        sa = "";
+        la = 0;
+    }
+    if (!cheng_str_bridge_view(sub, &sb, &lb)) {
+        sb = "";
+        lb = 0;
+    }
+    return cheng_v3_twoway_contains_bytes((const unsigned char*)sa,
+                                          la,
+                                          (const unsigned char*)sb,
+                                          lb);
 }
 WEAK int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b) {
     if (a.len != b.len) return 0;
@@ -6247,6 +9248,10 @@ char* cheng_getcwd(void) {
 
 double cheng_epoch_time(void) {
     return (double)time(NULL);
+}
+
+int64_t cheng_epoch_time_seconds(void) {
+    return (int64_t)time(NULL);
 }
 
 int64_t cheng_monotime_ns(void) {
@@ -7463,7 +10468,19 @@ typedef struct ChengFfiHandleSlot {
 static ChengFfiHandleSlot* cheng_ffi_handle_slots = NULL;
 static uint32_t cheng_ffi_handle_slots_len = 0;
 static uint32_t cheng_ffi_handle_slots_cap = 0;
-static const int32_t cheng_ffi_handle_err_invalid = -1;
+
+static void cheng_ffi_handle_abort_invalid(const char* op, uint64_t handle, const char* detail) {
+    const char* actual_op = (op != NULL && op[0] != '\0') ? op : "?";
+    const char* actual_detail = (detail != NULL && detail[0] != '\0') ? detail : "invalid";
+    fprintf(stderr,
+            "[cheng] ffi handle invalid: op=%s detail=%s handle=%llu\n",
+            actual_op,
+            actual_detail,
+            (unsigned long long)handle);
+    cheng_dump_backtrace_now("ffi_handle");
+    fflush(stderr);
+    _Exit(86);
+}
 
 static int cheng_ffi_handle_ensure_capacity(uint32_t min_cap) {
     if (cheng_ffi_handle_slots_cap >= min_cap) {
@@ -7549,11 +10566,14 @@ void* cheng_ffi_handle_resolve_ptr(uint64_t handle) {
     uint32_t idx = 0;
     uint32_t generation = 0;
     if (!cheng_ffi_handle_decode(handle, &idx, &generation)) {
-        return NULL;
+        cheng_ffi_handle_abort_invalid("resolve_ptr", handle, "decode");
     }
     ChengFfiHandleSlot* slot = &cheng_ffi_handle_slots[idx];
-    if (slot->ptr == NULL || slot->generation != generation) {
-        return NULL;
+    if (slot->ptr == NULL) {
+        cheng_ffi_handle_abort_invalid("resolve_ptr", handle, "released");
+    }
+    if (slot->generation != generation) {
+        cheng_ffi_handle_abort_invalid("resolve_ptr", handle, "stale");
     }
     return slot->ptr;
 }
@@ -7562,11 +10582,14 @@ int32_t cheng_ffi_handle_invalidate(uint64_t handle) {
     uint32_t idx = 0;
     uint32_t generation = 0;
     if (!cheng_ffi_handle_decode(handle, &idx, &generation)) {
-        return cheng_ffi_handle_err_invalid;
+        cheng_ffi_handle_abort_invalid("invalidate", handle, "decode");
     }
     ChengFfiHandleSlot* slot = &cheng_ffi_handle_slots[idx];
-    if (slot->ptr == NULL || slot->generation != generation) {
-        return cheng_ffi_handle_err_invalid;
+    if (slot->ptr == NULL) {
+        cheng_ffi_handle_abort_invalid("invalidate", handle, "released");
+    }
+    if (slot->generation != generation) {
+        cheng_ffi_handle_abort_invalid("invalidate", handle, "stale");
     }
     slot->ptr = NULL;
     if (slot->generation == UINT32_MAX) {
@@ -7592,24 +10615,18 @@ uint64_t cheng_ffi_handle_new_i32(int32_t value) {
 
 int32_t cheng_ffi_handle_get_i32(uint64_t handle, int32_t* out_value) {
     if (out_value == NULL) {
-        return cheng_ffi_handle_err_invalid;
+        cheng_ffi_handle_abort_invalid("get_i32", handle, "null-out");
     }
     int32_t* cell = (int32_t*)cheng_ffi_handle_resolve_ptr(handle);
-    if (cell == NULL) {
-        return cheng_ffi_handle_err_invalid;
-    }
     *out_value = *cell;
     return 0;
 }
 
 int32_t cheng_ffi_handle_add_i32(uint64_t handle, int32_t delta, int32_t* out_value) {
     if (out_value == NULL) {
-        return cheng_ffi_handle_err_invalid;
+        cheng_ffi_handle_abort_invalid("add_i32", handle, "null-out");
     }
     int32_t* cell = (int32_t*)cheng_ffi_handle_resolve_ptr(handle);
-    if (cell == NULL) {
-        return cheng_ffi_handle_err_invalid;
-    }
     *cell += delta;
     *out_value = *cell;
     return 0;
@@ -7617,11 +10634,8 @@ int32_t cheng_ffi_handle_add_i32(uint64_t handle, int32_t delta, int32_t* out_va
 
 int32_t cheng_ffi_handle_release_i32(uint64_t handle) {
     int32_t* cell = (int32_t*)cheng_ffi_handle_resolve_ptr(handle);
-    if (cell == NULL) {
-        return cheng_ffi_handle_err_invalid;
-    }
     if (cheng_ffi_handle_invalidate(handle) != 0) {
-        return cheng_ffi_handle_err_invalid;
+        cheng_ffi_handle_abort_invalid("release_i32", handle, "invalidate");
     }
     free(cell);
     return 0;

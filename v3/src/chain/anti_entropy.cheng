@@ -5,15 +5,21 @@ import cheng/v3/chain/lsmr_types as lt
 
 fn v3AntiEntropyStateLayerSummaryEqual(local: lt.V3StateLayerSummary,
                                        remote: lt.V3StateLayerSummary): bool =
-    return local.layerId == remote.layerId &&
-           layout.fixedBytes32Equal(local.treeCid, remote.treeCid) &&
-           local.nodeCount == remote.nodeCount &&
-           local.entryCount == remote.entryCount
+    if local.layerId != remote.layerId:
+        return false
+    if !layout.fixedBytes32Equal(local.treeCid, remote.treeCid):
+        return false
+    if local.nodeCount != remote.nodeCount:
+        return false
+    if local.entryCount != remote.entryCount:
+        return false
+    return true
 
 fn v3AntiEntropyRootSummaryPos(sig: lt.V3AntiEntropySignature, layerId: int32, baguaId: int32): int32 =
     for i in 0..<sig.rootCount:
-        if sig.rootSummaries[i].layerId == layerId && sig.rootSummaries[i].baguaId == baguaId:
-            return i
+        if sig.rootSummaries[i].layerId == layerId:
+            if sig.rootSummaries[i].baguaId == baguaId:
+                return i
     return -1
 
 fn v3AntiEntropyLayerSummaryPos(sig: lt.V3AntiEntropySignature, layerId: int32): int32 =
@@ -31,22 +37,21 @@ fn v3AntiEntropyLayerSummary(sig: lt.V3AntiEntropySignature, layerId: int32): Re
 fn v3AntiEntropyAppendTreeRoots(out: var lt.V3AntiEntropySignature,
                                 layerId: int32,
                                 tree: lt.V3BaguaPrefixTree) =
-    var baguaId: int32 = lt.v3BaguaQian
-    while baguaId <= lt.v3BaguaKun:
+    for baguaStep in 0..<8:
+        let baguaId = baguaStep + 1
         let rootRes = lsmr.v3BaguaRootSummaryFromTree(layerId, tree, baguaId)
         if rootRes.ok:
-            if out.rootCount >= lt.v3BaguaRootSummaryMax:
+            if out.rootCount >= 24:
                 panic("v3 anti_entropy: root summary overflow")
             out.rootSummaries[out.rootCount] = rootRes.value
             out.rootCount = out.rootCount + 1
-        baguaId = baguaId + 1
 
 fn v3AntiEntropySignatureFromForest(stampEpoch: int32,
                                     stampGanzhi: int32,
                                     eventCount: int32,
                                     accountCount: int32,
                                     forest: lt.V3StateLayerForest): lt.V3AntiEntropySignature =
-    var out: lt.V3AntiEntropySignature = lt.v3AntiEntropySignatureZero()
+    var out: lt.V3AntiEntropySignature
     out.stampEpoch = stampEpoch
     out.stampGanzhi = stampGanzhi
     out.eventCount = eventCount
@@ -87,7 +92,9 @@ fn v3AntiEntropySignatureEqual(local: lt.V3AntiEntropySignature, remote: lt.V3An
     return layout.fixedBytes32Equal(v3AntiEntropySignatureCid(local), v3AntiEntropySignatureCid(remote))
 
 fn v3PassiveAntiEntropySyncRequired(local: lt.V3AntiEntropySignature, remote: lt.V3AntiEntropySignature): bool =
-    return !v3AntiEntropySignatureEqual(local, remote)
+    if v3AntiEntropySignatureEqual(local, remote):
+        return false
+    return true
 
 fn v3AntiEntropyStampCompare(local: lt.V3AntiEntropySignature, remote: lt.V3AntiEntropySignature): int32 =
     if local.stampEpoch < remote.stampEpoch:
@@ -102,10 +109,10 @@ fn v3AntiEntropyStampCompare(local: lt.V3AntiEntropySignature, remote: lt.V3Anti
 
 fn v3AntiEntropyAppendRequest(plan: var lt.V3AntiEntropyPlan, request: lt.V3StateSubtreeRef) =
     for i in 0..<plan.requestCount:
-        if plan.requests[i].layerId == request.layerId &&
-           lt.v3PrefixRefEqual(plan.requests[i].prefix, request.prefix):
-            return
-    if plan.requestCount >= lt.v3BaguaRootSummaryMax:
+        if plan.requests[i].layerId == request.layerId:
+            if lt.v3PrefixRefEqual(plan.requests[i].prefix, request.prefix):
+                return
+    if plan.requestCount >= 24:
         panic("v3 anti_entropy: request overflow")
     plan.requests[plan.requestCount] = request
     plan.requestCount = plan.requestCount + 1
@@ -115,12 +122,16 @@ fn v3AntiEntropyWantLayer(remote: lt.V3AntiEntropySignature, compareLayer: int32
         let regionalRes = v3AntiEntropyLayerSummary(remote, lt.v3LayerRegional)
         if !regionalRes.ok:
             return Err[int32](regionalRes.err.msg)
-        return Ok[int32](regionalRes.value.entryCount > 0 ? lt.v3LayerRegional : lt.v3LayerGlobal)
+        if regionalRes.value.entryCount > 0:
+            return Ok[int32](lt.v3LayerRegional)
+        return Ok[int32](lt.v3LayerGlobal)
     if compareLayer == lt.v3LayerRegional:
         let edgeRes = v3AntiEntropyLayerSummary(remote, lt.v3LayerEdge)
         if !edgeRes.ok:
             return Err[int32](edgeRes.err.msg)
-        return Ok[int32](edgeRes.value.entryCount > 0 ? lt.v3LayerEdge : lt.v3LayerRegional)
+        if edgeRes.value.entryCount > 0:
+            return Ok[int32](lt.v3LayerEdge)
+        return Ok[int32](lt.v3LayerRegional)
     return Ok[int32](lt.v3LayerEdge)
 
 fn v3AntiEntropyAppendRootMismatchRequests(plan: var lt.V3AntiEntropyPlan,
@@ -130,25 +141,34 @@ fn v3AntiEntropyAppendRootMismatchRequests(plan: var lt.V3AntiEntropyPlan,
                                            requestLayer: int32): Result[bool] =
     for i in 0..<remote.rootCount:
         let remoteRoot = remote.rootSummaries[i]
-        if remoteRoot.layerId != compareLayer:
-            continue
-        let localPos = v3AntiEntropyRootSummaryPos(local, compareLayer, remoteRoot.baguaId)
-        let localMissing = localPos < 0
-        let cidMismatch = !localMissing &&
-                          !layout.fixedBytes32Equal(local.rootSummaries[localPos].nodeCid, remoteRoot.nodeCid)
-        let countMismatch = !localMissing &&
-                            local.rootSummaries[localPos].entryDescCount != remoteRoot.entryDescCount
-        if localMissing || cidMismatch || countMismatch:
-            let prefixRes = lt.v3PrefixRefFromDigits(remoteRoot.baguaId, [])
-            if !prefixRes.ok:
-                return Err[bool](prefixRes.err.msg)
-            let request = lt.v3StateSubtreeRefMake(
-                requestLayer,
-                prefixRes.value,
-                remoteRoot.nodeCid,
-                remoteRoot.entryDescCount
-            )
-            v3AntiEntropyAppendRequest(plan, request)
+        if remoteRoot.layerId == compareLayer:
+            let localPos = v3AntiEntropyRootSummaryPos(local, compareLayer, remoteRoot.baguaId)
+            let localMissing = localPos < 0
+            var cidMismatch = false
+            var countMismatch = false
+            if !localMissing:
+                if !layout.fixedBytes32Equal(local.rootSummaries[localPos].nodeCid, remoteRoot.nodeCid):
+                    cidMismatch = true
+                if local.rootSummaries[localPos].entryDescCount != remoteRoot.entryDescCount:
+                    countMismatch = true
+            if localMissing:
+                let prefixRes = lt.v3PrefixRefFromDigits(remoteRoot.baguaId, [])
+                if !prefixRes.ok:
+                    return Err[bool](prefixRes.err.msg)
+                let request = lt.v3StateSubtreeRefMake(requestLayer, prefixRes.value, remoteRoot.nodeCid, remoteRoot.entryDescCount)
+                v3AntiEntropyAppendRequest(plan, request)
+            elif cidMismatch:
+                let prefixRes = lt.v3PrefixRefFromDigits(remoteRoot.baguaId, [])
+                if !prefixRes.ok:
+                    return Err[bool](prefixRes.err.msg)
+                let request = lt.v3StateSubtreeRefMake(requestLayer, prefixRes.value, remoteRoot.nodeCid, remoteRoot.entryDescCount)
+                v3AntiEntropyAppendRequest(plan, request)
+            elif countMismatch:
+                let prefixRes = lt.v3PrefixRefFromDigits(remoteRoot.baguaId, [])
+                if !prefixRes.ok:
+                    return Err[bool](prefixRes.err.msg)
+                let request = lt.v3StateSubtreeRefMake(requestLayer, prefixRes.value, remoteRoot.nodeCid, remoteRoot.entryDescCount)
+                v3AntiEntropyAppendRequest(plan, request)
     return Ok[bool](true)
 
 fn v3AntiEntropyPlan(local: lt.V3AntiEntropySignature,
@@ -180,8 +200,9 @@ fn v3AntiEntropyPlan(local: lt.V3AntiEntropySignature,
     out.remoteNewer = stampCmp < 0
     if stampCmp == 0:
         out.conflictCount = 1
-    if !out.remoteNewer && out.conflictCount == 0:
-        return Ok[lt.V3AntiEntropyPlan](out)
+    if !out.remoteNewer:
+        if out.conflictCount == 0:
+            return Ok[lt.V3AntiEntropyPlan](out)
 
     if !v3AntiEntropyStateLayerSummaryEqual(localGlobalRes.value, remoteGlobalRes.value):
         let wantLayerRes = v3AntiEntropyWantLayer(remote, lt.v3LayerGlobal)

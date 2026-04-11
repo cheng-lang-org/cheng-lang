@@ -1,0 +1,124 @@
+# Congestion control controller(BBR/CUBIC).
+
+import cheng/v3/quic/congestion/common
+import cheng/v3/quic/congestion/bbr_model
+import cheng/v3/quic/congestion/cubic_model
+import cheng/v3/quic/congestion/pacing_scheduler
+type
+    CongestionController =
+        algorithm: CongestionAlgorithm
+        datagramPayloadBytes: int32
+        initialWindowPackets: int32
+        cubic: CubicModel
+        bbr: BbrModel
+        pacing: PacingState
+        deliveryRateBps: int64
+
+fn congestionControllerInit(
+    algorithm: CongestionAlgorithm,
+    datagramPayloadBytes: int32,
+    initialWindowPackets: int32
+): CongestionController =
+    var controller: CongestionController
+    controller.datagramPayloadBytes = datagramPayloadBytes
+    controller.initialWindowPackets = initialWindowPackets
+    controller.cubic = cubicInit(initialWindowPackets, datagramPayloadBytes, 0)
+    controller.bbr = bbrInit(initialWindowPackets, datagramPayloadBytes)
+    controller.algorithm = algorithm
+    controller.pacing = pacingInit(true)
+    controller.deliveryRateBps = 0
+    return controller
+
+fn congestionControllerSwitchAlgorithm(
+    controller: var CongestionController,
+    algorithm: CongestionAlgorithm
+) =
+    if controller.algorithm == algorithm:
+        return
+    controller.algorithm = algorithm
+    if algorithm == caCubic:
+        controller.cubic = cubicInit(controller.initialWindowPackets, controller.datagramPayloadBytes, 0)
+    else:
+        controller.bbr = bbrInit(controller.initialWindowPackets, controller.datagramPayloadBytes)
+    pacingReset(controller.pacing)
+    controller.deliveryRateBps = 0
+
+fn congestionControllerOnPacketSent(
+    controller: var CongestionController,
+    bytes: int64,
+    ackEliciting: bool,
+    appLimited: bool,
+    sendTimeUs: int64
+) =
+    if controller.algorithm == caCubic:
+        cubicOnPacketSent(controller.cubic, bytes, ackEliciting)
+    else:
+        bbrOnPacketSent(controller.bbr, bytes, appLimited)
+        if sendTimeUs != 0 && ackEliciting:
+            pacingCommitSend(controller.pacing, sendTimeUs, bytes)
+
+fn congestionControllerOnAcked(
+    controller: var CongestionController,
+    ack: AckEventSnapshot
+) =
+    if controller.algorithm == caCubic:
+        cubicOnDataAcked(controller.cubic, ack)
+        controller.deliveryRateBps = congestionControllerEstimateDeliveryRate(ack)
+    else:
+        let ackHeight: int64 = bbrOnDataAcked(controller.bbr, ack)
+        if ackHeight > 0:
+            pacingRecordAckHeight(controller.pacing, ackHeight)
+        controller.deliveryRateBps = controller.bbr.deliveryRateBps
+
+fn congestionControllerOnLost(
+    controller: var CongestionController,
+    loss: LossEventSnapshot
+) =
+    if controller.algorithm == caCubic:
+        cubicOnDataLost(controller.cubic, loss)
+    else:
+        bbrOnDataLost(controller.bbr, loss)
+        pacingOnLoss(controller.pacing)
+
+fn congestionControllerCanSend(controller: CongestionController): bool =
+    if controller.algorithm == caCubic:
+        return cubicCanSend(controller.cubic)
+    return bbrCanSend(controller.bbr)
+
+fn congestionControllerSendAllowance(
+    controller: var CongestionController,
+    nowUs: int64
+): int64 =
+    if controller.algorithm == caCubic:
+        return cubicSendAllowance(controller.cubic)
+    return pacingAllowance(controller.pacing, controller.bbr, nowUs)
+
+fn congestionControllerWindowBytes(controller: CongestionController): int64 =
+    if controller.algorithm == caCubic:
+        return controller.cubic.congestionWindow
+    return controller.bbr.congestionWindow
+
+fn congestionControllerBytesInFlight(controller: CongestionController): int64 =
+    if controller.algorithm == caCubic:
+        return cubicBytesInFlight(controller.cubic)
+    return bbrBytesInFlight(controller.bbr)
+
+fn congestionControllerBandwidthBytesPerSec(controller: CongestionController): int64 =
+    if controller.algorithm == caCubic:
+        return controller.deliveryRateBps
+    let rate: int64 = bbrCurrentBandwidth(controller.bbr)
+    return bbrBytesPerSecondFromBandwidth(rate)
+
+fn congestionControllerDeliveryRateBytesPerSec(controller: CongestionController): int64 =
+    return controller.deliveryRateBps
+
+fn congestionControllerEstimateDeliveryRate(ack: AckEventSnapshot): int64 =
+    let acked: int64 = ack.ackedRetransmittableBytes
+    if acked <= 0:
+        return 0
+    var sampleRtt: int64 = ack.smoothedRtt
+    if sampleRtt == 0:
+        sampleRtt = ack.minRtt
+    if sampleRtt <= 0:
+        return 0
+    return (acked * microSecsInSec) / sampleRtt

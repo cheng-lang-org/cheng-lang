@@ -12,6 +12,14 @@ __attribute__((weak)) double cheng_epoch_time(void) {
     return (double)time(NULL);
 }
 
+__attribute__((weak)) int64_t cheng_epoch_time_seconds(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+        return (int64_t)ts.tv_sec;
+    }
+    return (int64_t)time(NULL);
+}
+
 __attribute__((weak)) int32_t cheng_errno(void) {
     return (int32_t)errno;
 }

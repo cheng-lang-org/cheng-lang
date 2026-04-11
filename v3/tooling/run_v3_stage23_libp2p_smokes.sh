@@ -1,0 +1,81 @@
+#!/usr/bin/env sh
+set -eu
+
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+out_dir="$root/artifacts/v3_stage23_libp2p"
+stage2="$root/artifacts/v3_bootstrap/cheng.stage2"
+stage3="$root/artifacts/v3_bootstrap/cheng.stage3"
+mkdir -p "$out_dir"
+cd "$root"
+
+for compiler in "$stage2" "$stage3"
+do
+  if [ ! -x "$compiler" ]; then
+    echo "v3 stage2/stage3 libp2p: missing compiler: $compiler" >&2
+    exit 1
+  fi
+done
+
+run_stage_smoke() {
+  compiler="$1"
+  stage_name="$2"
+  smoke_name="$3"
+  src="$root/v3/src/tests/$smoke_name.cheng"
+  bin="$out_dir/$smoke_name.$stage_name"
+  compile_log="$out_dir/$smoke_name.$stage_name.compile.log"
+  run_log="$out_dir/$smoke_name.$stage_name.run.log"
+  rm -f "$bin" "$bin".* "$compile_log" "$run_log"
+  echo "[v3 stage2/stage3 libp2p] compile $stage_name $smoke_name"
+  if ! BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 DIAG_CONTEXT=1 "$compiler" system-link-exec \
+    --root "$root/v3" \
+    --in "$src" \
+    --emit exe \
+    --target arm64-apple-darwin \
+    --out "$bin" >"$compile_log" 2>&1; then
+    echo "v3 stage2/stage3 libp2p: compile failed: $stage_name $smoke_name" >&2
+    tail -n 80 "$compile_log" >&2 || true
+    exit 1
+  fi
+  echo "[v3 stage2/stage3 libp2p] run $stage_name $smoke_name"
+  if ! "$bin" >"$run_log" 2>&1; then
+    echo "v3 stage2/stage3 libp2p: run failed: $stage_name $smoke_name" >&2
+    tail -n 80 "$run_log" >&2 || true
+    exit 1
+  fi
+  cat "$run_log"
+}
+
+run_twoproc_smoke() {
+  compiler="$1"
+  stage_name="$2"
+  BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 \
+    sh "$root/v3/tooling/run_v3_tcp_twoproc_smoke.sh" "$compiler" "$stage_name"
+}
+
+tests="
+libp2p_core_smoke
+libp2p_host_smoke
+libp2p_tcp_smoke
+libp2p_overlay_smoke
+libp2p_protocols_smoke
+chain_node_libp2p_smoke
+"
+
+for smoke_name in $tests
+do
+  run_stage_smoke "$stage2" stage2 "$smoke_name"
+  if [ "$smoke_name" = "libp2p_tcp_smoke" ]; then
+    run_twoproc_smoke "$stage2" stage2
+  fi
+  run_stage_smoke "$stage3" stage3 "$smoke_name"
+  if [ "$smoke_name" = "libp2p_tcp_smoke" ]; then
+    run_twoproc_smoke "$stage3" stage3
+  fi
+done
+
+BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 \
+  sh "$root/v3/tooling/run_v3_chain_node_process_smoke.sh" "$stage2" stage2
+BACKEND_INCREMENTAL=0 BACKEND_MULTI_MODULE_CACHE=0 \
+  sh "$root/v3/tooling/run_v3_chain_node_process_smoke.sh" "$stage3" stage3
+
+echo "v3 stage2/stage3 libp2p: ok"

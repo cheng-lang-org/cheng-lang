@@ -1,0 +1,97 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as binary
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/overlay/libp2p_bridge as bridge
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/host/host
+
+fn main(): int32 =
+    let overlayDepth = 3
+
+    var node: host.V3Libp2pHost
+    var selfPeer: types.V3Libp2pPeerId
+    peer_id.v3Libp2pPeerIdFillFromSeed(selfPeer, "overlay.alpha")
+    node.selfPeerId = selfPeer
+    var ingress: overlay.V3IngressEnvelope
+    let sourcePeer = peer_id.v3Libp2pPeerIdFromSeed("source")
+    ingress.sourcePeerId = sourcePeer.value
+    ingress.topicScope = overlay.v3OverlayScopeRegion
+    ingress.address.depth = overlayDepth
+    ingress.address.digits[0] = 5
+    ingress.address.digits[1] = 8
+    ingress.address.digits[2] = 1
+    var payloadInts: int32[]
+    payloadInts = []
+    add(payloadInts, 1)
+    add(payloadInts, 2)
+    add(payloadInts, 3)
+    let payloadCid = lt.v3HashInts("v3.libp2p.overlay.payload", payloadInts)
+    ingress.payloadCid = payloadCid
+    ingress.payloadLen = 96
+    ingress.stampEpoch = 7
+    ingress.stampGanzhi = 19
+    bridge.v3Libp2pRelayPublish(node, ingress)
+
+    assert(node.storeEntries.len == 1, "v3 libp2p overlay: store query count")
+    let queriedFirst = node.storeEntries[0].ingress
+    assert(layout.fixedBytes32Equal(queriedFirst.payloadCid, ingress.payloadCid),
+        "v3 libp2p overlay: stored payload")
+
+    var better: overlay.V3NeighborCandidate
+    let betterPeer = peer_id.v3Libp2pPeerIdFromSeed("better")
+    better.peerId = betterPeer.value
+    better.role = overlay.v3OverlayRoleRegionalRouter
+    better.coordHint.address.depth = overlayDepth
+    better.coordHint.address.digits[0] = 5
+    better.coordHint.address.digits[1] = 8
+    better.coordHint.address.digits[2] = 1
+    better.coordHint.confidencePermille = 900
+    better.scoreInput.lsmrDistance = 1
+    better.scoreInput.rttEwmaMicros = 800
+    better.scoreInput.lossPermille = 1
+    better.scoreInput.loadPermille = 1
+    better.scoreInput.trustPermille = 900
+
+    var worse: overlay.V3NeighborCandidate
+    let worsePeer = peer_id.v3Libp2pPeerIdFromSeed("worse")
+    worse.peerId = worsePeer.value
+    worse.role = overlay.v3OverlayRoleRegionalRouter
+    worse.coordHint.address.depth = overlayDepth
+    worse.coordHint.address.digits[0] = 5
+    worse.coordHint.address.digits[1] = 8
+    worse.coordHint.address.digits[2] = 1
+    worse.coordHint.confidencePermille = 900
+    worse.scoreInput.lsmrDistance = 1
+    worse.scoreInput.rttEwmaMicros = 4000
+    worse.scoreInput.lossPermille = 10
+    worse.scoreInput.loadPermille = 10
+    worse.scoreInput.trustPermille = 100
+
+    var candidates: overlay.V3NeighborCandidate[]
+    candidates = []
+    add(candidates, worse)
+    add(candidates, better)
+    let nextRes = bridge.v3Libp2pSelectNextHop(candidates)
+    assert(nextRes.ok, "v3 libp2p overlay: next hop")
+    let selectedPeer = nextRes.value
+    let expectedPeer = types.V3Libp2pPeerId(value: better.peerId)
+    assert(types.v3Libp2pPeerIdEqual(selectedPeer, expectedPeer),
+        "v3 libp2p overlay: score prefers better")
+
+    var forestInts: int32[]
+    forestInts = []
+    add(forestInts, 9)
+    let forestCid = lt.v3HashInts("v3.libp2p.overlay.forest", forestInts)
+    let digest = host.v3Libp2pSyncDigest(node,
+                                         overlay.v3OverlayScopeRegion,
+                                         forestCid,
+                                         ingress.payloadCid,
+                                         ingress.stampEpoch,
+                                         ingress.stampGanzhi)
+    assert(digest.eventCount == 1, "v3 libp2p overlay: digest event count")
+    assert(digest.accountCount == 1, "v3 libp2p overlay: digest account count")
+    echo("v3 libp2p_overlay_smoke ok")
+    return 0

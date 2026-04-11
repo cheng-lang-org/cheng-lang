@@ -1,7 +1,8 @@
 import std/result
 import std/rawbytes
+import std/system
 import cheng/v3/std/bytes_layout as layout
-import cheng/v3/std/crypto/fixed256 as fixed256
+import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/binary_types as types
 
 const
@@ -132,13 +133,27 @@ type
         requests: V3StateSubtreeRef[v3BaguaRootSummaryMax]
 
 fn v3BaguaValid(baguaId: int32): bool =
-    return baguaId >= v3BaguaQian && baguaId <= v3BaguaKun
+    if baguaId < v3BaguaQian:
+        return false
+    if baguaId > v3BaguaKun:
+        return false
+    return true
 
 fn v3LayerValid(layerId: int32): bool =
-    return layerId == v3LayerGlobal || layerId == v3LayerRegional || layerId == v3LayerEdge
+    if layerId == v3LayerGlobal:
+        return true
+    if layerId == v3LayerRegional:
+        return true
+    if layerId == v3LayerEdge:
+        return true
+    return false
 
 fn v3PubSubModeValid(modeId: int32): bool =
-    return modeId >= v3PubSubModeZhen && modeId <= v3PubSubModeKun
+    if modeId < v3PubSubModeZhen:
+        return false
+    if modeId > v3PubSubModeKun:
+        return false
+    return true
 
 fn v3PrefixRefZero(): V3PrefixRef =
     var out: V3PrefixRef
@@ -169,7 +184,9 @@ fn v3PrefixRefContains(parent: V3PrefixRef, child: V3PrefixRef): bool =
     return true
 
 fn v3PrefixRefEqual(a: V3PrefixRef, b: V3PrefixRef): bool =
-    if a.baguaId != b.baguaId || a.prefixDepth != b.prefixDepth:
+    if a.baguaId != b.baguaId:
+        return false
+    if a.prefixDepth != b.prefixDepth:
         return false
     for i in 0..<v3LsmrMaxDepth:
         if a.prefixDigits[i] != b.prefixDigits[i]:
@@ -197,7 +214,8 @@ fn v3AppendU32BE(buf: var layout.ByteBuf, value: int64) =
     layout.byteBufAppendByte(buf, int32(value & 255))
 
 fn v3AppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
-    layout.byteBufAppendBytes(buf, layout.fixedBytes32ToBytes(value))
+    for i in 0..<layout.fixedBytes32Size:
+        layout.byteBufAppendByte(buf, int32(value.data[i]) & 255)
 
 fn v3AppendAddress(buf: var layout.ByteBuf, address: types.V3LsmrAddress) =
     v3AppendU32BE(buf, address.depth)
@@ -210,70 +228,56 @@ fn v3AppendPrefix(buf: var layout.ByteBuf, prefix: V3PrefixRef) =
     for i in 0..<types.v3LsmrMaxDepth:
         layout.byteBufAppendByte(buf, prefix.prefixDigits[i] & 255)
 
+fn v3BytesFromText(text: str): Bytes =
+    var out: Bytes
+    out.data = strDataPtr(text)
+    out.len = len(text)
+    return out
+
 fn v3FixedCidFromBuf(buf: layout.ByteBuf): layout.FixedBytes32 =
-    return fixed256.sha256Fixed(layout.byteBufView(buf))
+    var span: layout.ByteSpan
+    span = layout.byteBufView(buf)
+    var out: layout.FixedBytes32
+    out = hash256.sha256Fixed(span)
+    return out
 
 fn v3HashInts(tag: str, values: int32[]): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(64)
-    layout.byteBufAppendBytes(buf, bytesFromString(tag))
+    var buf: layout.ByteBuf
+    buf = layout.byteBufInit(64)
+    var tagBytes: Bytes
+    tagBytes = v3BytesFromText(tag)
+    layout.byteBufAppendBytes(buf, tagBytes)
     v3AppendU32BE(buf, values.len)
     for i in 0..<values.len:
         v3AppendU32BE(buf, values[i])
-    return v3FixedCidFromBuf(buf)
+    var out: layout.FixedBytes32
+    out = v3FixedCidFromBuf(buf)
+    return out
 
 fn v3HashPrefix(tag: str, prefix: V3PrefixRef): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(64)
-    layout.byteBufAppendBytes(buf, bytesFromString(tag))
+    var buf: layout.ByteBuf
+    buf = layout.byteBufInit(64)
+    var tagBytes: Bytes
+    tagBytes = v3BytesFromText(tag)
+    layout.byteBufAppendBytes(buf, tagBytes)
     v3AppendPrefix(buf, prefix)
-    return v3FixedCidFromBuf(buf)
-
-fn v3HashCell(tag: str, cell: V3StateCell): layout.FixedBytes32 =
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
-    layout.byteBufAppendBytes(buf, bytesFromString(tag))
-    v3AppendU32BE(buf, cell.keyId)
-    v3AppendU32BE(buf, cell.baguaId)
-    v3AppendU32BE(buf, cell.resolutionLevel)
-    v3AppendU32BE(buf, cell.layerId)
-    v3AppendAddress(buf, cell.address)
-    v3AppendPrefix(buf, cell.prefix)
-    v3AppendFixed32(buf, cell.contentCid)
-    v3AppendFixed32(buf, cell.localityHash)
-    v3AppendFixed32(buf, cell.localityCid)
-    return v3FixedCidFromBuf(buf)
+    var out: layout.FixedBytes32
+    out = v3FixedCidFromBuf(buf)
+    return out
 
 fn v3BaguaPrefixTreeZero(): V3BaguaPrefixTree =
+    var treeCid: layout.FixedBytes32
     var out: V3BaguaPrefixTree
-    out.nodeBaguaIds = []
-    out.nodePrefixDepths = []
-    out.nodePrefixDigits = []
-    out.nodeChildStarts = []
-    out.nodeChildCounts = []
-    out.nodeEntryStarts = []
-    out.nodeEntryCounts = []
-    out.nodeEntryDescCounts = []
-    out.nodeCids = []
-    out.entryKeyIds = []
-    out.entryBaguaIds = []
-    out.entryResolutionLevels = []
-    out.entryLayerIds = []
-    out.entryPrefixDepths = []
-    out.entryPrefixDigits = []
-    out.entryAddressDepths = []
-    out.entryAddressDigits = []
-    out.entryContentCids = []
-    out.entryLocalityHashes = []
-    out.entryLocalityCids = []
-    out.entryCids = []
-    out.treeCid = layout.fixedBytes32Zero()
+    treeCid = layout.fixedBytes32Zero()
+    out.treeCid = treeCid
     return out
 
 fn v3StateLayerForestZero(): V3StateLayerForest =
-    return V3StateLayerForest(
-        edgeTree: v3BaguaPrefixTreeZero(),
-        regionalTree: v3BaguaPrefixTreeZero(),
-        globalTree: v3BaguaPrefixTreeZero(),
-        forestCid: layout.fixedBytes32Zero()
-    )
+    var forestCid: layout.FixedBytes32
+    var out: V3StateLayerForest
+    forestCid = layout.fixedBytes32Zero()
+    out.forestCid = forestCid
+    return out
 
 fn v3StateLayerSummaryMake(layerId: int32,
                            treeCid: layout.FixedBytes32,
@@ -315,45 +319,3 @@ fn v3AntiEntropySignatureZero(): V3AntiEntropySignature =
 fn v3AntiEntropyPlanZero(): V3AntiEntropyPlan =
     var out: V3AntiEntropyPlan
     return out
-
-fn v3LocalityCidMake(keyId: int32,
-                     baguaId: int32,
-                     resolutionLevel: int32,
-                     layerId: int32,
-                     address: types.V3LsmrAddress,
-                     prefix: V3PrefixRef,
-                     localityHash: layout.FixedBytes32,
-                     contentCid: layout.FixedBytes32,
-                     cid: layout.FixedBytes32): V3LocalityCid =
-    return V3LocalityCid(
-        keyId: keyId,
-        baguaId: baguaId,
-        resolutionLevel: resolutionLevel,
-        layerId: layerId,
-        address: address,
-        prefix: prefix,
-        localityHash: localityHash,
-        contentCid: contentCid,
-        cid: cid
-    )
-
-fn v3StateCellMake(keyId: int32,
-                   baguaId: int32,
-                   resolutionLevel: int32,
-                   layerId: int32,
-                   address: types.V3LsmrAddress,
-                   prefix: V3PrefixRef,
-                   contentCid: layout.FixedBytes32,
-                   localityHash: layout.FixedBytes32,
-                   localityCid: layout.FixedBytes32): V3StateCell =
-    return V3StateCell(
-        keyId: keyId,
-        baguaId: baguaId,
-        resolutionLevel: resolutionLevel,
-        layerId: layerId,
-        address: address,
-        prefix: prefix,
-        contentCid: contentCid,
-        localityHash: localityHash,
-        localityCid: localityCid
-    )

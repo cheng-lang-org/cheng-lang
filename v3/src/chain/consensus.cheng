@@ -72,14 +72,15 @@ fn v3ChainIndexZero(): V3ChainIndex =
     return out
 
 fn v3ConsensusDecisionZero(): V3ConsensusDecision =
+    var reasonCode = v3ConsensusReasonOk
     var out: V3ConsensusDecision
-    out.eventCid = layout.fixedBytes32Zero()
-    out.reasonCode = v3ConsensusReasonOk
+    out.reasonCode = reasonCode
     return out
 
 fn v3ChainEventBodyCid(event: V3ChainEvent): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(256)
-    layout.byteBufAppendBytes(buf, bytesFromString("v3.consensus.body"))
+    let prefix = bytesFromString("v3.consensus.body")
+    layout.byteBufAppendBytes(buf, prefix)
     lt.v3AppendU32BE(buf, event.kind)
     lt.v3AppendU32BE(buf, event.assetId)
     lt.v3AppendU32BE(buf, event.fromAccount)
@@ -97,7 +98,8 @@ fn v3ChainEventBodyCid(event: V3ChainEvent): layout.FixedBytes32 =
 
 fn v3ChainEventCid(event: V3ChainEvent): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(128)
-    layout.byteBufAppendBytes(buf, bytesFromString("v3.consensus.event"))
+    let prefix = bytesFromString("v3.consensus.event")
+    layout.byteBufAppendBytes(buf, prefix)
     lt.v3AppendFixed32(buf, v3ChainEventBodyCid(event))
     lt.v3AppendU32BE(buf, event.stem)
     lt.v3AppendU32BE(buf, event.branch)
@@ -127,34 +129,6 @@ fn v3ChainEventMint(assetId: int32,
     out.bodyCid = v3ChainEventBodyCid(out)
     return out
 
-fn v3ChainEventTransferCommit(assetId: int32,
-                              fromAccount: int32,
-                              toAccount: int32,
-                              fromParentCid: layout.FixedBytes32,
-                              toParentCid: layout.FixedBytes32,
-                              amount: int64,
-                              epoch: int32,
-                              ganzhiIndex: int32,
-                              spaceSlot: int32,
-                              tick: int64): V3ChainEvent =
-    var out: V3ChainEvent
-    out.version = 1
-    out.kind = v3ConsensusKindTransferCommit
-    out.assetId = assetId
-    out.fromAccount = fromAccount
-    out.toAccount = toAccount
-    out.fromParentCid = fromParentCid
-    out.toParentCid = toParentCid
-    out.amount = amount
-    out.epoch = epoch
-    out.ganzhiIndex = ganzhiIndex
-    out.spaceSlot = spaceSlot
-    out.tick = tick
-    out.stem = ganzhiIndex % 10
-    out.branch = ganzhiIndex % 12
-    out.bodyCid = v3ChainEventBodyCid(out)
-    return out
-
 fn v3ConsensusEventPos(index: V3ChainIndex, eventCid: layout.FixedBytes32): int32 =
     for i in 0..<index.eventCids.len:
         if layout.fixedBytes32Equal(index.eventCids[i], eventCid):
@@ -163,17 +137,21 @@ fn v3ConsensusEventPos(index: V3ChainIndex, eventCid: layout.FixedBytes32): int3
 
 fn v3ConsensusAccountPos(index: V3ChainIndex, assetId: int32, accountId: int32): int32 =
     for i in 0..<index.accountIds.len:
-        if index.accountAssetIds[i] == assetId && index.accountIds[i] == accountId:
-            return i
+        if index.accountAssetIds[i] == assetId:
+            if index.accountIds[i] == accountId:
+                return i
     return -1
 
 fn v3ConsensusEnsureAccount(index: var V3ChainIndex, assetId: int32, accountId: int32): int32 =
-    let existing = v3ConsensusAccountPos(index, assetId, accountId)
-    if existing >= 0:
-        return existing
+    var accountCount = index.accountIds.len
+    for i in 0..<accountCount:
+        if index.accountAssetIds[i] == assetId:
+            if index.accountIds[i] == accountId:
+                return i
+    var zeroCid: layout.FixedBytes32
     add(index.accountAssetIds, assetId)
     add(index.accountIds, accountId)
-    add(index.accountHeads, layout.fixedBytes32Zero())
+    add(index.accountHeads, zeroCid)
     add(index.balances, int64(0))
     add(index.clockEpochs, 0)
     add(index.clockGanzhi, 0)
@@ -181,8 +159,11 @@ fn v3ConsensusEnsureAccount(index: var V3ChainIndex, assetId: int32, accountId: 
     return index.accountIds.len - 1
 
 fn v3ConsensusReferences(event: V3ChainEvent, parentCid: layout.FixedBytes32): bool =
-    return layout.fixedBytes32Equal(event.fromParentCid, parentCid) ||
-           layout.fixedBytes32Equal(event.toParentCid, parentCid)
+    if layout.fixedBytes32Equal(event.fromParentCid, parentCid):
+        return true
+    if layout.fixedBytes32Equal(event.toParentCid, parentCid):
+        return true
+    return false
 
 fn v3ConsensusLess(aCid: layout.FixedBytes32, aEvent: V3ChainEvent,
                    bCid: layout.FixedBytes32, bEvent: V3ChainEvent): bool =
@@ -207,7 +188,7 @@ fn v3ConsensusRecordEventMeta(index: var V3ChainIndex, eventCid: layout.FixedByt
     index.stateTreeDirty = true
 
 fn v3ConsensusApplyMint(index: var V3ChainIndex,
-                        event: V3ChainEvent,
+                        event: var V3ChainEvent,
                         eventCid: layout.FixedBytes32,
                         logOffset: int32,
                         decision: var V3ConsensusDecision) =
@@ -234,7 +215,7 @@ fn v3ConsensusApplyMint(index: var V3ChainIndex,
     decision.reasonCode = v3ConsensusReasonMintApplied
 
 fn v3ConsensusApplyTransfer(index: var V3ChainIndex,
-                            event: V3ChainEvent,
+                            event: var V3ChainEvent,
                             eventCid: layout.FixedBytes32,
                             logOffset: int32,
                             decision: var V3ConsensusDecision) =
@@ -244,15 +225,28 @@ fn v3ConsensusApplyTransfer(index: var V3ChainIndex,
     decision.fromAccountId = event.fromAccount
     decision.toAssetId = event.assetId
     decision.toAccountId = event.toAccount
-    if index.diverged[fromPos] || index.diverged[toPos]:
+    if index.diverged[fromPos]:
         index.diverged[fromPos] = true
         index.diverged[toPos] = true
         index.stateTreeDirty = true
         decision.reasonCode = v3ConsensusReasonDivergedAccount
         decision.accepted = false
         return
-    if !layout.fixedBytes32Equal(index.accountHeads[fromPos], event.fromParentCid) ||
-       !layout.fixedBytes32Equal(index.accountHeads[toPos], event.toParentCid):
+    if index.diverged[toPos]:
+        index.diverged[fromPos] = true
+        index.diverged[toPos] = true
+        index.stateTreeDirty = true
+        decision.reasonCode = v3ConsensusReasonDivergedAccount
+        decision.accepted = false
+        return
+    if !layout.fixedBytes32Equal(index.accountHeads[fromPos], event.fromParentCid):
+        index.diverged[fromPos] = true
+        index.diverged[toPos] = true
+        index.stateTreeDirty = true
+        decision.reasonCode = v3ConsensusReasonForkParentMismatch
+        decision.accepted = false
+        return
+    if !layout.fixedBytes32Equal(index.accountHeads[toPos], event.toParentCid):
         index.diverged[fromPos] = true
         index.diverged[toPos] = true
         index.stateTreeDirty = true
@@ -280,68 +274,57 @@ fn v3ConsensusApplyTransfer(index: var V3ChainIndex,
     decision.reasonCode = v3ConsensusReasonTransferApplied
 
 fn v3ConsensusApply(index: var V3ChainIndex,
-                    event: V3ChainEvent,
+                    event: var V3ChainEvent,
                     eventCid: layout.FixedBytes32,
                     logOffset: int32): Result[V3ConsensusDecision] =
-    var out: V3ConsensusDecision = v3ConsensusDecisionZero()
-    out.eventCid = eventCid
-    if !layout.fixedBytes32Equal(eventCid, v3ChainEventCid(event)):
-        return Err[V3ConsensusDecision]("v3 consensus: cid mismatch")
-    if !layout.fixedBytes32Equal(event.bodyCid, v3ChainEventBodyCid(event)):
-        return Err[V3ConsensusDecision]("v3 consensus: body cid mismatch")
-    if v3ConsensusEventPos(index, eventCid) >= 0:
-        out.accepted = true
-        out.applied = false
-        out.reasonCode = v3ConsensusReasonDuplicate
-        return Ok[V3ConsensusDecision](out)
-    if event.kind != v3ConsensusKindMint && event.kind != v3ConsensusKindTransferCommit:
-        return Err[V3ConsensusDecision]("v3 consensus: unsupported kind")
-    if event.amount <= int64(0):
-        return Err[V3ConsensusDecision]("v3 consensus: amount must be positive")
-    if event.stem != event.ganzhiIndex % 10 || event.branch != event.ganzhiIndex % 12:
-        return Err[V3ConsensusDecision]("v3 consensus: ganzhi decomposition mismatch")
-    if event.kind == v3ConsensusKindMint:
-        if event.toAccount <= 0 || event.assetId <= 0:
-            return Err[V3ConsensusDecision]("v3 consensus: invalid mint target")
-        v3ConsensusApplyMint(index, event, eventCid, logOffset, out)
-        return Ok[V3ConsensusDecision](out)
-    if event.fromAccount <= 0 || event.toAccount <= 0 || event.fromAccount == event.toAccount:
-        return Err[V3ConsensusDecision]("v3 consensus: invalid transfer accounts")
-    v3ConsensusApplyTransfer(index, event, eventCid, logOffset, out)
+    var out: V3ConsensusDecision
+    v3ConsensusApplyChecked(index, event, eventCid, logOffset, out)
     return Ok[V3ConsensusDecision](out)
 
-fn v3ConsensusSortedEventOrder(eventCids: layout.FixedBytes32[],
-                               events: V3ChainEvent[]): int32[] =
-    if eventCids.len != events.len:
-        panic("v3 consensus: event batch length mismatch")
-    var out: int32[]
-    out = []
-    for i in 0..<eventCids.len:
-        add(out, i)
-    for i in 1..<out.len:
-        let idxValue = out[i]
-        let cidValue = eventCids[idxValue]
-        let eventValue = events[idxValue]
-        var j = i - 1
-        while j >= 0 && v3ConsensusLess(cidValue, eventValue, eventCids[out[j]], events[out[j]]):
-            out[j + 1] = out[j]
-            j = j - 1
-        out[j + 1] = idxValue
-    return out
-
-fn v3ConsensusApplyBatch(index: var V3ChainIndex,
-                         eventCids: layout.FixedBytes32[],
-                         events: V3ChainEvent[],
-                         logOffsetBase: int32): V3ConsensusDecision[] =
-    let order = v3ConsensusSortedEventOrder(eventCids, events)
-    var out: V3ConsensusDecision[]
-    out = []
-    for i in 0..<order.len:
-        let applyRes = v3ConsensusApply(index,
-                                        events[order[i]],
-                                        eventCids[order[i]],
-                                        logOffsetBase + i)
-        if IsErr(applyRes):
-            panic(Error(applyRes))
-        add(out, Value(applyRes))
-    return out
+fn v3ConsensusApplyChecked(index: var V3ChainIndex,
+                           event: var V3ChainEvent,
+                           eventCid: layout.FixedBytes32,
+                           logOffset: int32,
+                           out: var V3ConsensusDecision) =
+    out.eventCid = eventCid
+    out.accepted = false
+    out.applied = false
+    out.reasonCode = v3ConsensusReasonOk
+    out.fromAssetId = 0
+    out.fromAccountId = 0
+    out.toAssetId = 0
+    out.toAccountId = 0
+    if !layout.fixedBytes32Equal(eventCid, v3ChainEventCid(event)):
+        panic("v3 consensus: cid mismatch")
+    if !layout.fixedBytes32Equal(event.bodyCid, v3ChainEventBodyCid(event)):
+        panic("v3 consensus: body cid mismatch")
+    for i in 0..<index.eventCids.len:
+        if layout.fixedBytes32Equal(index.eventCids[i], eventCid):
+            out.accepted = true
+            out.applied = false
+            out.reasonCode = v3ConsensusReasonDuplicate
+            return
+    if event.kind != v3ConsensusKindMint:
+        if event.kind != v3ConsensusKindTransferCommit:
+            panic("v3 consensus: unsupported kind")
+    if event.amount <= int64(0):
+        panic("v3 consensus: amount must be positive")
+    if event.stem != event.ganzhiIndex % 10:
+        panic("v3 consensus: ganzhi decomposition mismatch")
+    if event.branch != event.ganzhiIndex % 12:
+        panic("v3 consensus: ganzhi decomposition mismatch")
+    if event.kind == v3ConsensusKindMint:
+        if event.toAccount <= 0:
+            panic("v3 consensus: invalid mint target")
+        if event.assetId <= 0:
+            panic("v3 consensus: invalid mint target")
+        v3ConsensusApplyMint(index, event, eventCid, logOffset, out)
+        return
+    if event.fromAccount <= 0:
+        panic("v3 consensus: invalid transfer accounts")
+    if event.toAccount <= 0:
+        panic("v3 consensus: invalid transfer accounts")
+    if event.fromAccount == event.toAccount:
+        panic("v3 consensus: invalid transfer accounts")
+    v3ConsensusApplyTransfer(index, event, eventCid, logOffset, out)
+    return

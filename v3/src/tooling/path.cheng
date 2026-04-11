@@ -1,57 +1,158 @@
-import std/os
-import std/strutils as strutil
+type
+    V3PathSplitFileResult =
+        dir: str
+        name: str
+        ext: str
+
+importc fn cheng_v3_str_strip_bridge(s: str): str
+importc fn cheng_v3_os_is_absolute_bridge(path: str): int32
+importc fn cheng_v3_os_join_path_bridge(left: str, right: str): str
+importc fn cheng_v3_os_file_exists_bridge(path: str): int32
+importc fn cheng_v3_os_dir_exists_bridge(path: str): int32
+importc fn cheng_v3_os_file_size_bridge(path: str): int64
+importc fn cheng_v3_read_file_bridge(path: str): str
+importc fn driver_c_get_current_dir_bridge(): str
+importc fn driver_c_str_slice_bridge(s: str, start: int32, count: int32): str
+importc fn driver_c_str_has_prefix_bridge(s: str, prefix: str): int32
+importc fn driver_c_str_contains_str_bridge(s: str, sub: str): int32
+importc fn driver_c_create_dir_all_bridge(path: str)
+importc fn driver_c_write_text_file_bridge(path: str, content: str)
 
 fn v3PathTrim(raw: str): str =
-    return strutil.strip(raw)
+    return cheng_v3_str_strip_bridge(raw)
 
 fn v3PathNonEmpty(raw: str): bool =
-    return len(v3PathTrim(raw)) > 0
+    return v3PathTrim(raw) != ""
+
+fn v3TextSlice(text: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    return driver_c_str_slice_bridge(text, start, count)
+
+fn v3TextStartsWith(text: str, prefix: str): bool =
+    return driver_c_str_has_prefix_bridge(text, prefix) != 0
+
+fn v3TextContains(text: str, sub: str): bool =
+    return driver_c_str_contains_str_bridge(text, sub) != 0
+
+fn v3PathCurrentDir(): str =
+    return driver_c_get_current_dir_bridge()
+
+fn v3PathIsAbsolute(raw: str): bool =
+    let path = v3PathTrim(raw)
+    return cheng_v3_os_is_absolute_bridge(path) != 0
+
+fn v3PathJoin(left: str, right: str): str =
+    let leftPath = v3PathTrim(left)
+    let rightPath = v3PathTrim(right)
+    return cheng_v3_os_join_path_bridge(leftPath, rightPath)
 
 fn v3PathAbsolute(root: str, raw: str): str =
     let text: str = v3PathTrim(raw)
     if !v3PathNonEmpty(text):
         return ""
-    if os.isAbsolute(text):
+    if v3PathIsAbsolute(text):
         return text
-    return os.joinPath(root, text)
+    return v3PathJoin(root, text)
+
+fn v3PathFileExists(pathRaw: str): bool =
+    let path = v3PathTrim(pathRaw)
+    if !v3PathNonEmpty(path):
+        return false
+    return cheng_v3_os_file_exists_bridge(path) != 0
+
+fn v3PathDirExists(pathRaw: str): bool =
+    let path = v3PathTrim(pathRaw)
+    if !v3PathNonEmpty(path):
+        return false
+    return cheng_v3_os_dir_exists_bridge(path) != 0
+
+fn v3PathFileSize(pathRaw: str): int64 =
+    let path = v3PathTrim(pathRaw)
+    if !v3PathNonEmpty(path):
+        return int64(0)
+    return cheng_v3_os_file_size_bridge(path)
 
 fn v3PathExists(root: str, raw: str): bool =
     let path: str = v3PathAbsolute(root, raw)
     if !v3PathNonEmpty(path):
         return false
-    return os.fileExists(path) || os.dirExists(path)
+    return v3PathFileExists(path) || v3PathDirExists(path)
 
 fn v3FileExistsNonEmpty(root: str, raw: str): bool =
     let path: str = v3PathAbsolute(root, raw)
-    if !v3PathNonEmpty(path) || !os.fileExists(path):
+    if !v3PathFileExists(path):
         return false
-    return os.fileSize(path) > int64(0)
+    return v3PathFileSize(path) > int64(0)
+
+fn v3PathLastSep(path: str): int32 =
+    var last: int32 = -1
+    for i in 0..<path.len:
+        if path[i] == '/' || path[i] == '\\':
+            last = i
+    return last
+
+fn v3PathLastDot(name: str): int32 =
+    var last: int32 = -1
+    for i in 0..<name.len:
+        if name[i] == '.':
+            last = i
+    return last
+
+fn v3PathBaseName(pathRaw: str): str =
+    let path = v3PathTrim(pathRaw)
+    if !v3PathNonEmpty(path):
+        return ""
+    let lastSep = v3PathLastSep(path)
+    if lastSep < 0:
+        return path
+    return v3TextSlice(path, lastSep + 1, path.len - (lastSep + 1))
+
+fn v3PathParentDir(pathRaw: str): str =
+    let path = v3PathTrim(pathRaw)
+    if !v3PathNonEmpty(path):
+        return ""
+    let lastSep = v3PathLastSep(path)
+    if lastSep < 0:
+        return ""
+    if lastSep == 0:
+        return ""
+    return v3TextSlice(path, 0, lastSep)
+
+fn v3PathSplitFile(pathRaw: str): V3PathSplitFileResult =
+    let path = v3PathTrim(pathRaw)
+    let base = v3PathBaseName(path)
+    let dir = v3PathParentDir(path)
+    if !v3PathNonEmpty(base):
+        return V3PathSplitFileResult(dir: dir, name: "", ext: "")
+    let lastDot = v3PathLastDot(base)
+    if lastDot <= 0:
+        return V3PathSplitFileResult(dir: dir, name: base, ext: "")
+    return V3PathSplitFileResult(
+        dir: dir,
+        name: v3TextSlice(base, 0, lastDot),
+        ext: v3TextSlice(base, lastDot, base.len - lastDot)
+    )
 
 fn v3MkdirP(root: str, raw: str): bool =
     let path: str = v3PathAbsolute(root, raw)
     if !v3PathNonEmpty(path):
         return false
-    if os.dirExists(path):
-        return true
-    let parent: str = os.parentDir(path)
-    if v3PathNonEmpty(parent) && parent != path && !os.dirExists(parent):
-        if !v3MkdirP(root, parent):
-            return false
-    os.createDir(path)
-    return os.dirExists(path)
+    driver_c_create_dir_all_bridge(path)
+    return v3PathDirExists(path)
 
 fn v3WriteTextFile(root: str, raw: str, text: str): bool =
     let path: str = v3PathAbsolute(root, raw)
     if !v3PathNonEmpty(path):
         return false
-    let parent: str = os.parentDir(path)
-    if v3PathNonEmpty(parent) && !v3MkdirP(root, parent):
-        return false
-    os.writeFile(path, text)
-    return os.fileExists(path)
+    let parent: str = v3PathParentDir(path)
+    if v3PathNonEmpty(parent):
+        driver_c_create_dir_all_bridge(parent)
+    driver_c_write_text_file_bridge(path, text)
+    return v3PathFileExists(path)
 
 fn v3ReadTextFile(root: str, raw: str): str =
     let path: str = v3PathAbsolute(root, raw)
-    if !v3PathNonEmpty(path) || !os.fileExists(path):
+    if !v3PathFileExists(path):
         return ""
-    return os.readFile(path)
+    return cheng_v3_read_file_bridge(path)

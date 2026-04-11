@@ -1,0 +1,58 @@
+import std/result
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peerstore as ps
+import cheng/v3/libp2p/protocols/store_sync
+import cheng/v3/libp2p/transports/quic_transport
+import cheng/v3/libp2p/host/host as host_base
+
+fn v3Libp2pSyncRequest(localHost: var host_base.V3Libp2pHost,
+                       remoteHost: var host_base.V3Libp2pHost,
+                       remotePeerId: types.V3Libp2pPeerId,
+                       query: overlay.V3StoreQuery): Result[overlay.V3IngressEnvelope[]] =
+    if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: sync peer mismatch")
+    if !host_base.v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolSync):
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: remote sync handler missing")
+    let streamRes = host_base.v3Libp2pOpenStream(localHost, remotePeerId, types.v3Libp2pProtocolSync)
+    if IsErr(streamRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(streamRes))
+    localHost.syncRequestCount = localHost.syncRequestCount + 1
+    let requestPayload = store_sync.v3Libp2pStoreQueryEncode(query)
+    let peers = localHost.peers
+    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
+    if pos < 0:
+        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: peer missing")
+    let remoteAddr = peers.peers[pos].addr
+    if remoteAddr.transport != types.v3Libp2pTransportQuic:
+        return host_base.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query)
+    var pair: quic_transport.V3Libp2pQuicLoopbackPair
+    let openRes = quic_transport.v3Libp2pQuicLoopbackOpenInto(pair, remoteAddr)
+    if IsErr(openRes):
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(openRes))
+    let selectRes = quic_transport.v3Libp2pQuicLoopbackSelectProtocol(pair, types.v3Libp2pProtocolSync)
+    if IsErr(selectRes):
+        quic_transport.v3Libp2pQuicLoopbackClose(pair)
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(selectRes))
+    let requestWriteRes = quic_transport.v3Libp2pQuicLoopbackWriteClient(pair, requestPayload)
+    if IsErr(requestWriteRes):
+        quic_transport.v3Libp2pQuicLoopbackClose(pair)
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(requestWriteRes))
+    let requestReadRes = quic_transport.v3Libp2pQuicLoopbackReadServer(pair, bytesLen(requestPayload))
+    if IsErr(requestReadRes):
+        quic_transport.v3Libp2pQuicLoopbackClose(pair)
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(requestReadRes))
+    let servePayloadRes = host_base.v3Libp2pSyncServePayload(remoteHost, Value(requestReadRes))
+    if IsErr(servePayloadRes):
+        quic_transport.v3Libp2pQuicLoopbackClose(pair)
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(servePayloadRes))
+    let responsePayload = Value(servePayloadRes)
+    let responseWriteRes = quic_transport.v3Libp2pQuicLoopbackWriteServer(pair, responsePayload)
+    if IsErr(responseWriteRes):
+        quic_transport.v3Libp2pQuicLoopbackClose(pair)
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(responseWriteRes))
+    let responseReadRes = quic_transport.v3Libp2pQuicLoopbackReadClient(pair, bytesLen(responsePayload))
+    quic_transport.v3Libp2pQuicLoopbackClose(pair)
+    if IsErr(responseReadRes):
+        return Err[overlay.V3IngressEnvelope[]](ErrorText(responseReadRes))
+    return store_sync.v3Libp2pStoreEntriesDecode(Value(responseReadRes))

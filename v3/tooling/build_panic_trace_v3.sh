@@ -80,6 +80,18 @@ if ! rg -q '^v3 panic fixture$' "$run_log"; then
   exit 1
 fi
 
+if ! rg -q '^\[cheng-v3\] machine-trace reason=panic mode=backtrace$' "$run_log"; then
+  echo "v3 panic-trace: machine trace header missing: $run_log" >&2
+  cat "$run_log" >&2 || true
+  exit 1
+fi
+
+if ! rg -q '^\[cheng-v3\] m#[0-9]+ .*ordinary_panic_fixture\.cheng:[0-9]+' "$run_log"; then
+  echo "v3 panic-trace: machine trace missing fixture line info: $run_log" >&2
+  cat "$run_log" >&2 || true
+  exit 1
+fi
+
 if ! rg -q 'ordinary_panic_fixture\.cheng:[0-9]+' "$run_log"; then
   echo "v3 panic-trace: source trace missing fixture line info: $run_log" >&2
   cat "$run_log" >&2 || true

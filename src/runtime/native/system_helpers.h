@@ -10,6 +10,11 @@ typedef struct ChengStrBridge {
     int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengBytesBridge {
+    void* data;
+    int32_t len;
+} ChengBytesBridge;
+
 typedef struct ChengErrorInfoBridgeCompat {
     int32_t code;
     ChengStrBridge msg;
@@ -46,6 +51,14 @@ int32_t cheng_memcmp(void* a, void* b, int64_t n);
 int32_t cheng_strlen(char* s);
 int32_t cheng_strcmp(const char* a, const char* b);
 char* cheng_str_param_to_cstring_compat(void* raw);
+char* cheng_str_to_cstring_temp_bridge(ChengStrBridge s);
+int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
+                                           int32_t port,
+                                           int32_t isV6,
+                                           int32_t* outFd,
+                                           int32_t* outPort,
+                                           int32_t* outFamily,
+                                           int32_t* outUseLenField);
 int32_t __cheng_str_eq(const char* a, const char* b);
 bool cheng_str_is_empty(const char* s);
 bool cheng_str_nonempty(const char* s);
@@ -129,8 +142,13 @@ char* cheng_seq_string_get_compat(ChengSeqHeader seq, int32_t at);
 void cheng_seq_string_add_compat(void* seq_ptr, const char* value);
 int32_t cheng_rawbytes_get_at(void* base, int32_t idx);
 void cheng_rawbytes_set_at(void* base, int32_t idx, int32_t value);
+ChengBytesBridge cheng_v3_test_pki_hex_decode_bridge(ChengStrBridge text);
+void cheng_v3_test_pki_hex_decode_into_bridge(ChengStrBridge text, ChengBytesBridge* out);
+void* cheng_v3_test_pki_hex_decode_ptr_bridge(ChengStrBridge text);
+int32_t cheng_v3_test_pki_hex_decode_len_bridge(ChengStrBridge text);
 void cheng_rawmem_write_i8(void* dst, int32_t idx, int8_t value);
 void cheng_rawmem_write_char(void* dst, int32_t idx, int32_t value);
+int32_t cheng_force_segv(void);
 void cheng_func_ptr_shadow_remember(void* p);
 void* cheng_func_ptr_shadow_recover(uint64_t p);
 void* cheng_machine_inst_new(int32_t op, int32_t rd, int32_t rn, int32_t rm,
@@ -254,6 +272,7 @@ int32_t cheng_ffi_raw_release_i32(void* p);
 int32_t cheng_crash_trace_enabled(void);
 void cheng_crash_trace_set_phase(const char* phase);
 void cheng_crash_trace_mark(const char* tag, int32_t a, int32_t b, int32_t c, int32_t d);
+void cheng_dump_backtrace_if_enabled(void);
 
 void* cheng_mem_scope_push(void);
 void cheng_mem_scope_pop(void);
@@ -271,7 +290,7 @@ int32_t cheng_atomic_load_i32(int32_t* p);
 
 ChengStrBridge driver_c_str_from_utf8_copy_bridge(const char* raw, int32_t n);
 ChengStrBridge driver_c_str_clone_bridge(const char* s);
-ChengStrBridge driver_c_str_slice_bridge(const char* s, int32_t start, int32_t count);
+ChengStrBridge driver_c_str_slice_bridge(ChengStrBridge s, int32_t start, int32_t count);
 ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge b);
 ChengStrBridge driver_c_char_to_str_bridge(int32_t value);
 int32_t driver_c_str_eq_bridge(ChengStrBridge a, ChengStrBridge b);
@@ -280,6 +299,36 @@ int32_t driver_c_str_has_prefix_bridge(ChengStrBridge s, ChengStrBridge prefix);
 int32_t driver_c_str_has_suffix_bridge(ChengStrBridge s, ChengStrBridge suffix);
 int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value);
 int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub);
+ChengStrBridge cheng_v3_str_strip_bridge(ChengStrBridge s);
+int32_t cheng_v3_os_is_absolute_bridge(ChengStrBridge path);
+ChengStrBridge cheng_v3_os_join_path_bridge(ChengStrBridge left, ChengStrBridge right);
+int32_t cheng_v3_os_file_exists_bridge(ChengStrBridge path);
+int32_t cheng_v3_os_dir_exists_bridge(ChengStrBridge path);
+int64_t cheng_v3_os_file_size_bridge(ChengStrBridge path);
+ChengStrBridge cheng_v3_read_file_bridge(ChengStrBridge path);
+int32_t cheng_v3_tcp_loopback_payload_bridge(ChengStrBridge protocol_text,
+                                             ChengStrBridge payload_text,
+                                             ChengStrBridge* response_text,
+                                             ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_loopback_request_response_bridge(ChengStrBridge protocol_text,
+                                                      ChengStrBridge request_text,
+                                                      ChengStrBridge response_text,
+                                                      ChengStrBridge* client_response_text,
+                                                      ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
+                                               int32_t port,
+                                               ChengStrBridge protocol_text,
+                                               ChengStrBridge payload_text,
+                                               ChengStrBridge ready_path_text,
+                                               ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_recv_payload_once_bridge(ChengStrBridge host_text,
+                                              int32_t port,
+                                              ChengStrBridge protocol_text,
+                                              ChengStrBridge* response_text,
+                                              ChengStrBridge* err_text);
+ChengStrBridge cheng_v3_tcp_loopback_multistream_bridge(ChengStrBridge protocol_text);
+ChengStrBridge cheng_v3_sha256_hex_bridge(ChengStrBridge text);
+int64_t cheng_v3_sha256_word_bridge(ChengStrBridge text, int32_t word_index);
 int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected);
 int32_t driver_c_cli_param1_eq_raw_bridge(const char* expected_ptr, int32_t expected_len);
 int32_t driver_c_compiler_core_print_usage_bridge(void);
@@ -363,6 +412,7 @@ int64_t cheng_file_size(const char* path);
 int32_t cheng_mkdir1(const char* path);
 char* cheng_getcwd(void);
 double cheng_epoch_time(void);
+int64_t cheng_epoch_time_seconds(void);
 int64_t cheng_monotime_ns(void);
 char* cheng_list_dir(const char* path);
 char* cheng_read_file(const char* path);

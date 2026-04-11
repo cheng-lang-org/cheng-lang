@@ -74,13 +74,13 @@ fn strLenFast(s: str): int32 =
     return s.len
 
 fn strViewWithFlags(data: ptr, len: int32, storeId: int32, flags: int32): str =
-    if data == nil || len <= 0:
-        return strEmpty()
     var out: str
-    out.data = data
-    out.len = len
-    out.store_id = storeId
-    out.flags = flags
+    if data != nil:
+        if len > 0:
+            out.data = data
+            out.len = len
+            out.store_id = storeId
+            out.flags = flags
     return out
 
 fn strViewUnsafe(data: ptr, len: int32): str =
@@ -88,17 +88,17 @@ fn strViewUnsafe(data: ptr, len: int32): str =
 
 fn strSubView(s: str, start: int32, count: int32): str =
     let n: int32 = strLenFast(s)
-    if count <= 0 || n <= 0:
-        return strEmpty()
+    var out: str
     var start0: int32 = start
-    if start0 < 0:
-        start0 = 0
-    if start0 >= n:
-        return strEmpty()
-    var kept: int32 = count
-    if start0 + kept > n:
-        kept = n - start0
-    return strViewWithFlags(system_ptr_add(strDataPtr(s), start0), kept, s.store_id, 0)
+    if count > 0 && n > 0:
+        if start0 < 0:
+            start0 = 0
+        if start0 < n:
+            var kept: int32 = count
+            if start0 + kept > n:
+                kept = n - start0
+            out = strViewWithFlags(system_ptr_add(strDataPtr(s), start0), kept, s.store_id, 0)
+    return out
 
 fn echo(msg: cstring) =
     puts(msg)
@@ -215,6 +215,7 @@ fn heapFreeLegacy(p: ptr)
 fn c_strlen(s: cstring): int32
 @importc("cheng_str_param_to_cstring_compat")
 fn cheng_str_param_to_cstring_compat(s: str): cstring
+importc fn cheng_str_to_cstring_temp_bridge(s: str): cstring
 @importc("cheng_seq_string_elem_bytes_compat")
 fn cheng_seq_string_elem_bytes_compat_system(): int32
 importc fn cheng_ptr_size(): int32
@@ -307,10 +308,9 @@ fn `[]=`(seqInst: var ChengSeqHeader, i: int32, val: ptr) =
     set_ptr(seqInst, i, val)
 
 fn chengStrLoadCompat(slot: ptr): str =
-    if slot == nil:
-        return strEmpty()
     var out: str
-    chengStrBridgeLoadCompatInto(&out, slot)
+    if slot != nil:
+        chengStrBridgeLoadCompatInto(&out, slot)
     return out
 
 fn chengStrStoreCompat(slot: ptr, val: str) =
@@ -548,54 +548,43 @@ fn setHas(s: set[T], value: T): bool =
     out = (bits & mask) != 0
     return out
 fn newString(len: int32): str =
-    if len <= 0:
-        return strEmpty()
-    return strOwnedAlloc(len)
+    var out: str
+    if len > 0:
+        out = strOwnedAlloc(len)
+    return out
 
 fn strOwnedAlloc(len: int32): str =
-    if len <= 0:
-        return strEmpty()
-    let raw: cstring = driver_c_new_string(len)
-    if raw == nil:
-        return strEmpty()
-    return strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+    var out: str
+    if len > 0:
+        let raw: cstring = driver_c_new_string(len)
+        if raw != nil:
+            out = strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+    return out
 
 fn strFromBytesCopy(src: ptr, len: int32): str =
-    if src == nil || len <= 0:
-        return strEmpty()
-    let raw: cstring = driver_c_new_string_copy_n(src, len)
-    if raw == nil:
-        return strEmpty()
-    return strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+    var out: str
+    if src != nil && len > 0:
+        let raw: cstring = driver_c_new_string_copy_n(src, len)
+        if raw != nil:
+            out = strViewWithFlags(ptr(raw), len, 0, chengStrFlagOwned)
+    return out
 
 fn strFromCStringBorrow(raw: cstring): str =
-    if raw == nil:
-        return strEmpty()
-    let n: int32 = c_strlen(raw)
-    return strViewUnsafe(ptr(raw), n)
+    var out: str
+    if raw != nil:
+        let n: int32 = c_strlen(raw)
+        out = strViewUnsafe(ptr(raw), n)
+    return out
 
 fn strFromCStringCopy(raw: cstring): str =
-    if raw == nil:
-        return strEmpty()
-    let n: int32 = c_strlen(raw)
-    return strFromBytesCopy(ptr(raw), n)
+    var out: str
+    if raw != nil:
+        let n: int32 = c_strlen(raw)
+        out = strFromBytesCopy(ptr(raw), n)
+    return out
 
 fn strToCStringTemp(s: str): cstring =
-    let compatRaw: cstring = cheng_str_param_to_cstring_compat(s)
-    let compatPtr: ptr = ptr(compatRaw)
-    if compatPtr != nil:
-        return compatRaw
-    if strLenFast(s) == 0:
-        return driver_c_new_string(0)
-    if strDataPtr(s) == nil:
-        return driver_c_new_string(0)
-    if bitandCompat(s.flags, chengStrFlagOwned) != 0:
-        return cstring(strDataPtr(s))
-    let copied: str = strFromBytesCopy(strDataPtr(s), strLenFast(s))
-    if strDataPtr(copied) == nil:
-        return driver_c_new_string(0)
-    memScopeEscape(strDataPtr(copied))
-    return cstring(strDataPtr(copied))
+    return cheng_str_to_cstring_temp_bridge(s)
 fn strToCStringTemp(s: ptr): cstring =
     if s == nil:
         return driver_c_new_string(0)

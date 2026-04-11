@@ -1,6 +1,5 @@
 # UDP syscall helpers (BSD socket wrapper + errno mapping).
 
-import std/system as sys
 import std/result
 import std/rawbytes
 import std/os as os
@@ -96,20 +95,20 @@ fn udpSocketEnableNonblock(fd: int32) =
 
 fn udpSocketOpenDgram(isV6: bool): Result[UdpSocketHandle] =
     if !isV6:
-        let fd: int32 = sys.socket(udpAfInet, udpSockDgram, 0)
+        let fd: int32 = os.udpOpenSocket(udpAfInet, udpSockDgram, 0)
         if fd < 0:
             let errCode: int32 = udpErrno()
             return Err[UdpSocketHandle]("udp syscall: socket failed: " + udpErrText(errCode) + " (" + intToStr(errCode) + ")")
         udpSocketEnableNonblock(fd)
         return Ok[UdpSocketHandle](UdpSocketHandle(fd: fd, family: udpAfInet, isV6: false))
 
-    let fdLinux: int32 = sys.socket(udpAfInet6Linux, udpSockDgram, 0)
+    let fdLinux: int32 = os.udpOpenSocket(udpAfInet6Linux, udpSockDgram, 0)
     if fdLinux >= 0:
         udpSocketEnableNonblock(fdLinux)
         return Ok[UdpSocketHandle](UdpSocketHandle(fd: fdLinux, family: udpAfInet6Linux, isV6: true))
     let errLinux: int32 = udpErrno()
 
-    let fdBsd: int32 = sys.socket(udpAfInet6Bsd, udpSockDgram, 0)
+    let fdBsd: int32 = os.udpOpenSocket(udpAfInet6Bsd, udpSockDgram, 0)
     if fdBsd >= 0:
         udpSocketEnableNonblock(fdBsd)
         return Ok[UdpSocketHandle](UdpSocketHandle(fd: fdBsd, family: udpAfInet6Bsd, isV6: true))
@@ -177,16 +176,19 @@ fn udpSockAddrFromHostPort(host: str, port: int32, isV6: bool, family: int32, us
         for i in 0..<ipSize:
             bytesSet(raw, ipOffset + i, bytesGet(ipBytes, i))
 
-    return Ok[UdpSockAddr](
-        UdpSockAddr(
-            data: raw,
-            len: addrSize,
-            family: resolvedFamily,
-            isV6: isV6,
-            host: if len(normalizedHost) > 0: normalizedHost else: (if isV6: "::" else: "0.0.0.0"),
-            port: port
-        )
-    )
+    var out: UdpSockAddr
+    out.data = raw
+    out.len = addrSize
+    out.family = resolvedFamily
+    out.isV6 = isV6
+    if len(normalizedHost) > 0:
+        out.host = normalizedHost
+    elif isV6:
+        out.host = "::"
+    else:
+        out.host = "0.0.0.0"
+    out.port = port
+    return Ok[UdpSockAddr](out)
 
 fn udpSockAddrDecode(raw: Bytes, rawLen: int32): Result[UdpSockAddr] =
     if rawLen <= 0:
@@ -261,7 +263,7 @@ fn udpGetSockName(fd: int32): Result[UdpSockAddr] =
         return Err[UdpSockAddr]("udp syscall: invalid socket")
     let rawAddr: Bytes = bytesAlloc(128)
     var rawLen: int32 = bytesLen(rawAddr)
-    let rc: int32 = sys.getsockname(fd, rawAddr.data, &rawLen)
+    let rc: int32 = os.udpGetSockNameFd(fd, rawAddr, rawLen)
     if rc != 0 || rawLen <= 0:
         let errCode: int32 = udpErrno()
         return Err[UdpSockAddr]("udp syscall: getsockname failed: " + udpErrText(errCode) + " (" + intToStr(errCode) + ")")

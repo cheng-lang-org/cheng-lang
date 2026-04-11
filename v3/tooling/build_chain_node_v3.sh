@@ -47,7 +47,7 @@ if [ ! -x "$out_bin" ]; then
   exit 1
 fi
 
-if ! "$out_bin" >"$run_log" 2>&1; then
+if ! "$out_bin" self-test >"$run_log" 2>&1; then
   echo "v3 chain_node: self-test failed log=$run_log" >&2
   tail -n 80 "$run_log" >&2 || true
   exit 1

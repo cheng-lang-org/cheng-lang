@@ -1,0 +1,36 @@
+import std/system
+import std/rawbytes
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+
+fn main(): int32 =
+    var server = node.v3ChainNodeInit("tcp.server", "tcp.loopback")
+    var client = node.v3ChainNodeInit("tcp.client", "tcp.loopback")
+    let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
+    assert(mintRes.ok, "v3 libp2p tcp: mint")
+    let transferRes = node.v3ChainNodeTransfer(server, 9, 1001, 2002, int64(33))
+    assert(transferRes.ok, "v3 libp2p tcp: transfer")
+    let snapshot = node.v3ChainNodeServeOnce(server)
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    let roundtripRes = tcp_transport.v3Libp2pTcpLoopbackRoundtrip(types.v3Libp2pProtocolSync, payload)
+    assert(roundtripRes.ok, "v3 libp2p tcp: loopback roundtrip")
+    assert(bytesEqual(roundtripRes.value, payload), "v3 libp2p tcp: payload equal")
+    let decodedRes = net.v3ChainNodeLibp2pDecodeSnapshot(roundtripRes.value)
+    assert(decodedRes.ok, "v3 libp2p tcp: decode snapshot")
+    let syncRes = node.v3ChainNodeSyncOnce(client, decodedRes.value)
+    assert(syncRes.ok, "v3 libp2p tcp: sync once")
+    assert(syncRes.value, "v3 libp2p tcp: sync changed")
+    let aliceRes = node.v3ChainNodeBalance(client, 9, 1001)
+    let bobRes = node.v3ChainNodeBalance(client, 9, 2002)
+    assert(aliceRes.ok, "v3 libp2p tcp: alice balance")
+    assert(bobRes.ok, "v3 libp2p tcp: bob balance")
+    assert(aliceRes.value == int64(55), "v3 libp2p tcp: alice 55")
+    assert(bobRes.value == int64(33), "v3 libp2p tcp: bob 33")
+    let clientSnapshot = node.v3ChainNodeServeOnce(client)
+    assert(anti.v3AntiEntropySignatureEqual(snapshot.signature, clientSnapshot.signature),
+        "v3 libp2p tcp: signature")
+    echo("v3 libp2p_tcp_smoke ok")
+    return 0

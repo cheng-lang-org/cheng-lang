@@ -29,6 +29,7 @@
 #include <mach-o/dyld.h>
 #endif
 #include "cheng_sidecar_loader.h"
+#include "../../../v3/runtime/native/v3_str_twoway_search.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CHENG_MINRT_WEAK __attribute__((weak))
@@ -544,6 +545,11 @@ typedef struct ChengStrBridge {
   int32_t flags;
 } ChengStrBridge;
 
+typedef struct ChengBytesBridge {
+  void *data;
+  int32_t len;
+} ChengBytesBridge;
+
 typedef struct ChengErrorInfoBridgeCompat {
   int32_t code;
   ChengStrBridge msg;
@@ -569,6 +575,182 @@ char *cheng_str_param_to_cstring_compat(void *raw) {
   if ((raw_addr & (uintptr_t)(sizeof(void *) - 1)) != 0) return (char *)raw;
   if (!cheng_probably_valid_str_bridge((const ChengStrBridge *)raw)) return (char *)raw;
   return NULL;
+}
+
+char *driver_c_new_string(int32_t n);
+char *driver_c_new_string_copy_n(void *raw, int32_t n);
+
+char *cheng_str_to_cstring_temp_bridge(ChengStrBridge s) {
+  char *compat = cheng_str_param_to_cstring_compat((void *)s.ptr);
+  if (compat != NULL) return compat;
+  if (s.len <= 0 || s.ptr == NULL) return driver_c_new_string(0);
+  if (s.flags != 0) return (char *)s.ptr;
+  compat = driver_c_new_string_copy_n((void *)s.ptr, s.len);
+  if (compat != NULL) return compat;
+  return driver_c_new_string(0);
+}
+
+int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
+                                           int32_t port,
+                                           int32_t isV6,
+                                           int32_t *outFd,
+                                           int32_t *outPort,
+                                           int32_t *outFamily,
+                                           int32_t *outUseLenField) {
+  const char *host_text = cheng_str_to_cstring_temp_bridge(host);
+  int fd = -1;
+  int rc = -1;
+  if (outFd == NULL || outPort == NULL || outFamily == NULL || outUseLenField == NULL) return EINVAL;
+  *outFd = -1;
+  *outPort = 0;
+  *outFamily = 0;
+  *outUseLenField = 0;
+  if (port < 0 || port > 65535) return EINVAL;
+  if (isV6 != 0) {
+    struct sockaddr_in6 addr6;
+    memset(&addr6, 0, sizeof(addr6));
+    fd = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (fd < 0) return errno;
+#if defined(__APPLE__)
+    addr6.sin6_len = (uint8_t)sizeof(addr6);
+    *outUseLenField = 1;
+#endif
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_port = htons((uint16_t)port);
+    if (host_text == NULL || host_text[0] == 0 || strcmp(host_text, "localhost") == 0) {
+      addr6.sin6_addr = in6addr_loopback;
+    } else if (inet_pton(AF_INET6, host_text, &addr6.sin6_addr) != 1) {
+      close(fd);
+      return EINVAL;
+    }
+    rc = bind(fd, (const struct sockaddr *)&addr6, (socklen_t)sizeof(addr6));
+    if (rc != 0) {
+      int err = errno;
+      close(fd);
+      return err;
+    }
+    if (port == 0) {
+      socklen_t len = (socklen_t)sizeof(addr6);
+      if (getsockname(fd, (struct sockaddr *)&addr6, &len) != 0) {
+        int err = errno;
+        close(fd);
+        return err;
+      }
+    }
+    *outFd = fd;
+    *outPort = (int32_t)ntohs(addr6.sin6_port);
+    *outFamily = AF_INET6;
+    return 0;
+  }
+  {
+    struct sockaddr_in addr4;
+    memset(&addr4, 0, sizeof(addr4));
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return errno;
+#if defined(__APPLE__)
+    addr4.sin_len = (uint8_t)sizeof(addr4);
+    *outUseLenField = 1;
+#endif
+    addr4.sin_family = AF_INET;
+    addr4.sin_port = htons((uint16_t)port);
+    if (host_text == NULL || host_text[0] == 0 || strcmp(host_text, "localhost") == 0) {
+      addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (inet_pton(AF_INET, host_text, &addr4.sin_addr) != 1) {
+      close(fd);
+      return EINVAL;
+    }
+    rc = bind(fd, (const struct sockaddr *)&addr4, (socklen_t)sizeof(addr4));
+    if (rc != 0) {
+      int err = errno;
+      close(fd);
+      return err;
+    }
+    if (port == 0) {
+      socklen_t len = (socklen_t)sizeof(addr4);
+      if (getsockname(fd, (struct sockaddr *)&addr4, &len) != 0) {
+        int err = errno;
+        close(fd);
+        return err;
+      }
+    }
+    *outFd = fd;
+    *outPort = (int32_t)ntohs(addr4.sin_port);
+    *outFamily = AF_INET;
+    return 0;
+  }
+}
+
+static int32_t cheng_v3_hex_value_ascii(char c) {
+  if (c >= '0' && c <= '9') {
+    return (int32_t)(c - '0');
+  }
+  if (c >= 'a' && c <= 'f') {
+    return 10 + (int32_t)(c - 'a');
+  }
+  if (c >= 'A' && c <= 'F') {
+    return 10 + (int32_t)(c - 'A');
+  }
+  return -1;
+}
+
+void cheng_v3_test_pki_hex_decode_into_bridge(ChengStrBridge text, ChengBytesBridge *out) {
+  if (out == NULL) {
+    return;
+  }
+  out->data = NULL;
+  out->len = 0;
+  char *raw = cheng_str_to_cstring_temp_bridge(text);
+  if (raw == NULL) {
+    return;
+  }
+  int32_t text_len = cheng_strlen(raw);
+  if (text_len <= 0) {
+    return;
+  }
+  if ((text_len & 1) != 0) {
+    abort();
+  }
+  int32_t pair_count = text_len / 2;
+  uint8_t *decoded = (uint8_t *)cheng_malloc(pair_count);
+  if (decoded == NULL) {
+    abort();
+  }
+  for (int32_t i = 0; i < pair_count; ++i) {
+    int32_t src = i * 2;
+    int32_t hi = cheng_v3_hex_value_ascii(raw[src]);
+    int32_t lo = cheng_v3_hex_value_ascii(raw[src + 1]);
+    if (hi < 0 || lo < 0) {
+      abort();
+    }
+    decoded[i] = (uint8_t)((hi << 4) | lo);
+  }
+  out->data = decoded;
+  out->len = pair_count;
+}
+
+ChengBytesBridge cheng_v3_test_pki_hex_decode_bridge(ChengStrBridge text) {
+  ChengBytesBridge out;
+  out.data = NULL;
+  out.len = 0;
+  cheng_v3_test_pki_hex_decode_into_bridge(text, &out);
+  return out;
+}
+
+void *cheng_v3_test_pki_hex_decode_ptr_bridge(ChengStrBridge text) {
+  ChengBytesBridge out = cheng_v3_test_pki_hex_decode_bridge(text);
+  return out.data;
+}
+
+int32_t cheng_v3_test_pki_hex_decode_len_bridge(ChengStrBridge text) {
+  char *raw = cheng_str_to_cstring_temp_bridge(text);
+  if (raw == NULL) {
+    return 0;
+  }
+  int32_t text_len = cheng_strlen(raw);
+  if (text_len <= 0 || (text_len & 1) != 0) {
+    return 0;
+  }
+  return text_len / 2;
 }
 
 extern void uirEmitObjFromModuleOrPanic(ChengSeqHeader *out, void *module, int32_t optLevel,
@@ -723,10 +905,13 @@ static int cheng_flag_enabled(const char *raw) {
 }
 
 static int cheng_crash_trace_env_enabled(void) {
-  if (cheng_flag_enabled(getenv("CHENG_CRASH_TRACE"))) return 1;
-  if (cheng_flag_enabled(getenv("BACKEND_CRASH_TRACE"))) return 1;
-  if (cheng_flag_enabled(getenv("STAGE1_CRASH_TRACE"))) return 1;
-  return 0;
+  const char *raw = getenv("CHENG_CRASH_TRACE");
+  if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+  raw = getenv("BACKEND_CRASH_TRACE");
+  if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+  raw = getenv("STAGE1_CRASH_TRACE");
+  if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
+  return 1;
 }
 
 static size_t cheng_crash_trace_cstrnlen(const char *s, size_t limit) {
@@ -803,10 +988,14 @@ static void cheng_crash_trace_dump_async(const char *reason, int32_t sig) {
   }
 }
 
+static int cheng_backtrace_enabled(void);
+static void cheng_dump_native_backtrace_if_enabled(void);
+
 static void cheng_crash_trace_signal_handler(int sig) {
   if (cheng_crash_trace_handling) _exit(128 + sig);
   cheng_crash_trace_handling = 1;
   cheng_crash_trace_dump_async("signal", sig);
+  cheng_dump_native_backtrace_if_enabled();
   _exit(128 + sig);
 }
 
@@ -1076,13 +1265,12 @@ static void driver_c_diagf(const char *fmt, ...) {
 static int cheng_backtrace_enabled(void) {
   const char *raw = getenv("CHENG_PANIC_BACKTRACE");
   if (raw == NULL || raw[0] == '\0') raw = getenv("BACKEND_DEBUG_BACKTRACE");
-  if (raw == NULL || raw[0] == '\0') return 0;
+  if (raw == NULL || raw[0] == '\0') return 1;
   if (raw[0] == '0' && raw[1] == '\0') return 0;
   return 1;
 }
 
-void cheng_dump_backtrace_if_enabled(void) {
-  cheng_crash_trace_dump_now("panic");
+static void cheng_dump_native_backtrace_if_enabled(void) {
   if (!cheng_backtrace_enabled()) return;
 #if CHENG_HAS_EXECINFO
   void *frames[48];
@@ -1092,8 +1280,12 @@ void cheng_dump_backtrace_if_enabled(void) {
     return;
   }
 #endif
-  fprintf(stderr, "[cheng] backtrace unavailable\n");
-  fflush(stderr);
+  cheng_crash_trace_write_cstr("[cheng] backtrace unavailable\n");
+}
+
+void cheng_dump_backtrace_if_enabled(void) {
+  cheng_crash_trace_dump_now("panic");
+  cheng_dump_native_backtrace_if_enabled();
 }
 
 /* Forward declarations used before definitions in this minimal runtime TU. */
@@ -1313,6 +1505,22 @@ static ChengStrBridge cheng_str_bridge_from_ptr_flags(const char *ptr, int32_t f
 
 static ChengStrBridge cheng_str_bridge_from_owned(char *ptr) {
   return cheng_str_bridge_from_ptr_flags((const char *)ptr, CHENG_STR_BRIDGE_FLAG_OWNED);
+}
+
+static bool cheng_str_bridge_view(ChengStrBridge bridge, const char **out_ptr, size_t *out_len) {
+  if (out_ptr != NULL) *out_ptr = "";
+  if (out_len != NULL) *out_len = 0u;
+  if (cheng_probably_valid_str_bridge(&bridge)) {
+    if (out_ptr != NULL) *out_ptr = bridge.ptr != NULL ? bridge.ptr : "";
+    if (out_len != NULL) *out_len = bridge.ptr != NULL ? (size_t)bridge.len : 0u;
+    return true;
+  }
+  {
+    const char *safe = cheng_safe_cstr(bridge.ptr);
+    if (out_ptr != NULL) *out_ptr = safe;
+    if (out_len != NULL) *out_len = strlen(safe);
+  }
+  return true;
 }
 
 static int driver_c_arg_is_help(const char *arg) {
@@ -3156,8 +3364,8 @@ char *driver_c_str_slice(const char *s, int32_t start, int32_t count) {
   if (s0 + need > n) need = n - s0;
   return cheng_copy_string_bytes(safe + s0, need);
 }
-CHENG_MINRT_WEAK ChengStrBridge driver_c_str_slice_bridge(const char *s, int32_t start, int32_t count) {
-  return cheng_str_bridge_from_owned(driver_c_str_slice(s, start, count));
+CHENG_MINRT_WEAK ChengStrBridge driver_c_str_slice_bridge(ChengStrBridge s, int32_t start, int32_t count) {
+  return cheng_str_bridge_from_owned(driver_c_str_slice(s.ptr, start, count));
 }
 char *driver_c_char_to_str(int32_t value) {
   unsigned char ch = (unsigned char)(value & 0xff);
@@ -3230,22 +3438,36 @@ int32_t driver_c_ord_char_compat(int32_t value) {
   return driver_c_ord_char(value);
 }
 CHENG_MINRT_WEAK int32_t driver_c_str_contains_char_bridge(ChengStrBridge s, int32_t value) {
-  return driver_c_str_contains_char(s.ptr, value);
+  const char *safe = "";
+  size_t n = 0u;
+  unsigned char target = (unsigned char)(value & 0xff);
+  if (!cheng_str_bridge_view(s, &safe, &n)) return 0;
+  for (size_t i = 0; i < n; ++i) {
+    if ((unsigned char)safe[i] == target) return 1;
+  }
+  return 0;
 }
 int32_t driver_c_str_contains_str(const char *s, const char *sub) {
   const char *sa = cheng_safe_cstr((const char *)s);
   const char *sb = cheng_safe_cstr((const char *)sub);
   size_t la = strlen(sa);
   size_t lb = strlen(sb);
-  if (lb == 0) return 1;
-  if (lb > la) return 0;
-  for (size_t i = 0; i + lb <= la; ++i) {
-    if (memcmp(sa + i, sb, lb) == 0) return 1;
-  }
-  return 0;
+  return cheng_v3_twoway_contains_bytes((const unsigned char *)sa,
+                                        la,
+                                        (const unsigned char *)sb,
+                                        lb);
 }
 CHENG_MINRT_WEAK int32_t driver_c_str_contains_str_bridge(ChengStrBridge s, ChengStrBridge sub) {
-  return driver_c_str_contains_str(s.ptr, sub.ptr);
+  const char *sa = "";
+  const char *sb = "";
+  size_t la = 0u;
+  size_t lb = 0u;
+  if (!cheng_str_bridge_view(s, &sa, &la)) return 0;
+  if (!cheng_str_bridge_view(sub, &sb, &lb)) return 0;
+  return cheng_v3_twoway_contains_bytes((const unsigned char *)sa,
+                                        la,
+                                        (const unsigned char *)sb,
+                                        lb);
 }
 CHENG_MINRT_WEAK bool cheng_str_is_empty(const char *s) {
   return cheng_strlen((char *)s) == 0;
@@ -3580,6 +3802,48 @@ int32_t cheng_open_w_trunc(const char *path) {
 int32_t libc_close(int32_t fd) {
   if (fd < 0) return -1;
   return close(fd);
+}
+
+int32_t libc_socket(int32_t domain, int32_t typ, int32_t protocol) {
+  return socket(domain, typ, protocol);
+}
+
+int32_t libc_fcntl(int32_t fd, int32_t cmd, int32_t arg) {
+  return fcntl(fd, cmd, arg);
+}
+
+int32_t libc_bind(int32_t fd, void *addr, int32_t len) {
+  return bind(fd, (const struct sockaddr *)addr, (socklen_t)len);
+}
+
+int32_t libc_sendto(int32_t fd, void *buf, int32_t len, int32_t flags, void *addr, int32_t addrlen) {
+  return (int32_t)sendto(fd, buf, (size_t)len, flags, (const struct sockaddr *)addr, (socklen_t)addrlen);
+}
+
+int32_t libc_recvfrom(int32_t fd, void *buf, int32_t len, int32_t flags, void *addr, int32_t *addrlen) {
+  socklen_t raw_len = (addrlen != NULL && *addrlen > 0) ? (socklen_t)(*addrlen) : (socklen_t)0;
+  int32_t rc = (int32_t)recvfrom(fd, buf, (size_t)len, flags, (struct sockaddr *)addr, addrlen != NULL ? &raw_len : NULL);
+  if (addrlen != NULL) *addrlen = (int32_t)raw_len;
+  return rc;
+}
+
+int32_t libc_getsockname(int32_t fd, void *addr, int32_t *addrlen) {
+  socklen_t raw_len = (addrlen != NULL && *addrlen > 0) ? (socklen_t)(*addrlen) : (socklen_t)0;
+  int32_t rc = getsockname(fd, (struct sockaddr *)addr, addrlen != NULL ? &raw_len : NULL);
+  if (addrlen != NULL) *addrlen = (int32_t)raw_len;
+  return rc;
+}
+
+int32_t libc_setsockopt(int32_t fd, int32_t level, int32_t optname, void *optval, int32_t optlen) {
+  return setsockopt(fd, level, optname, optval, (socklen_t)optlen);
+}
+
+int32_t libc_inet_pton(int32_t family, const char *src, void *dst) {
+  return inet_pton(family, src, dst);
+}
+
+char *libc_inet_ntop(int32_t family, void *src, char *dst, int32_t size) {
+  return (char *)inet_ntop(family, src, dst, (socklen_t)size);
 }
 
 int64_t libc_write(int32_t fd, void *data, int64_t n) {

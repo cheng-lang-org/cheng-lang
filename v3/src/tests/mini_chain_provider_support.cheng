@@ -1,0 +1,58 @@
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/consensus
+
+type
+    MiniNode =
+        index: consensus.V3ChainIndex
+        eventCids: layout.FixedBytes32[]
+        events: consensus.V3ChainEvent[]
+        tipEventCid: layout.FixedBytes32
+        nextTick: int64
+
+fn miniNodeZero(): MiniNode =
+    var eventCids: layout.FixedBytes32[]
+    var events: consensus.V3ChainEvent[]
+    eventCids = []
+    events = []
+    return MiniNode(
+        index: consensus.v3ChainIndexZero(),
+        eventCids: eventCids,
+        events: events,
+        tipEventCid: layout.fixedBytes32Zero(),
+        nextTick: int64(1)
+    )
+
+fn miniRebuild(node: var MiniNode) =
+    node.tipEventCid = node.eventCids.len > 0 ? node.eventCids[node.eventCids.len - 1] : layout.fixedBytes32Zero()
+    node.nextTick = int64(node.eventCids.len + 1)
+
+fn miniApplyEvent(node: var MiniNode, event: var consensus.V3ChainEvent): Result[layout.FixedBytes32] =
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = node.index
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, node.eventCids.len, decision)
+    node.index = nextIndex
+    if !decision.accepted:
+        return Err[layout.FixedBytes32]("mini provider apply rejected")
+    if decision.applied:
+        add(node.eventCids, eventCid)
+        add(node.events, event)
+        miniRebuild(node)
+    return Ok[layout.FixedBytes32](eventCid)
+
+fn miniMint(node: var MiniNode, assetId: int32, toAccount: int32, amount: int64): Result[layout.FixedBytes32] =
+    if assetId <= 0 || toAccount <= 0:
+        return Err[layout.FixedBytes32]("mini provider invalid mint target")
+    if amount <= int64(0):
+        return Err[layout.FixedBytes32]("mini provider mint amount must be positive")
+    var event = consensus.v3ChainEventMint(
+        assetId,
+        toAccount,
+        layout.fixedBytes32Zero(),
+        amount,
+        1,
+        1,
+        1,
+        node.nextTick
+    )
+    return miniApplyEvent(node, event)

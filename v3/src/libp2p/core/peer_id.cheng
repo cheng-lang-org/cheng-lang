@@ -1,0 +1,100 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/libp2p/core/types
+
+importc fn cheng_v3_sha256_word_bridge(text: str, wordIndex: int32): int64
+
+fn v3Libp2pWriteDigestWords(out: var types.V3Libp2pPeerId,
+                            word0: int64,
+                            word1: int64,
+                            word2: int64,
+                            word3: int64) =
+    out.value.data[0] = uint8(int32((word0 >> 56) & int64(255)))
+    out.value.data[1] = uint8(int32((word0 >> 48) & int64(255)))
+    out.value.data[2] = uint8(int32((word0 >> 40) & int64(255)))
+    out.value.data[3] = uint8(int32((word0 >> 32) & int64(255)))
+    out.value.data[4] = uint8(int32((word0 >> 24) & int64(255)))
+    out.value.data[5] = uint8(int32((word0 >> 16) & int64(255)))
+    out.value.data[6] = uint8(int32((word0 >> 8) & int64(255)))
+    out.value.data[7] = uint8(int32(word0 & int64(255)))
+    out.value.data[8] = uint8(int32((word1 >> 56) & int64(255)))
+    out.value.data[9] = uint8(int32((word1 >> 48) & int64(255)))
+    out.value.data[10] = uint8(int32((word1 >> 40) & int64(255)))
+    out.value.data[11] = uint8(int32((word1 >> 32) & int64(255)))
+    out.value.data[12] = uint8(int32((word1 >> 24) & int64(255)))
+    out.value.data[13] = uint8(int32((word1 >> 16) & int64(255)))
+    out.value.data[14] = uint8(int32((word1 >> 8) & int64(255)))
+    out.value.data[15] = uint8(int32(word1 & int64(255)))
+    out.value.data[16] = uint8(int32((word2 >> 56) & int64(255)))
+    out.value.data[17] = uint8(int32((word2 >> 48) & int64(255)))
+    out.value.data[18] = uint8(int32((word2 >> 40) & int64(255)))
+    out.value.data[19] = uint8(int32((word2 >> 32) & int64(255)))
+    out.value.data[20] = uint8(int32((word2 >> 24) & int64(255)))
+    out.value.data[21] = uint8(int32((word2 >> 16) & int64(255)))
+    out.value.data[22] = uint8(int32((word2 >> 8) & int64(255)))
+    out.value.data[23] = uint8(int32(word2 & int64(255)))
+    out.value.data[24] = uint8(int32((word3 >> 56) & int64(255)))
+    out.value.data[25] = uint8(int32((word3 >> 48) & int64(255)))
+    out.value.data[26] = uint8(int32((word3 >> 40) & int64(255)))
+    out.value.data[27] = uint8(int32((word3 >> 32) & int64(255)))
+    out.value.data[28] = uint8(int32((word3 >> 24) & int64(255)))
+    out.value.data[29] = uint8(int32((word3 >> 16) & int64(255)))
+    out.value.data[30] = uint8(int32((word3 >> 8) & int64(255)))
+    out.value.data[31] = uint8(int32(word3 & int64(255)))
+
+fn v3Libp2pPeerIdFillFromSeed(out: var types.V3Libp2pPeerId, seed: str) =
+    let tagged = "v3.libp2p.peer|" + seed
+    let word0 = cheng_v3_sha256_word_bridge(tagged, 0)
+    let word1 = cheng_v3_sha256_word_bridge(tagged, 1)
+    let word2 = cheng_v3_sha256_word_bridge(tagged, 2)
+    let word3 = cheng_v3_sha256_word_bridge(tagged, 3)
+    v3Libp2pWriteDigestWords(out, word0, word1, word2, word3)
+
+fn v3Libp2pPeerIdFillFromText(out: var types.V3Libp2pPeerId, text: str): Result[bool] =
+    if len(text) <= 0:
+        return Err[bool]("v3 libp2p peer: empty peer text")
+    let tagged = "v3.libp2p.peer.text|" + text
+    let word0 = cheng_v3_sha256_word_bridge(tagged, 0)
+    let word1 = cheng_v3_sha256_word_bridge(tagged, 1)
+    let word2 = cheng_v3_sha256_word_bridge(tagged, 2)
+    let word3 = cheng_v3_sha256_word_bridge(tagged, 3)
+    v3Libp2pWriteDigestWords(out, word0, word1, word2, word3)
+    return Ok[bool](true)
+
+fn v3Libp2pPeerIdFromBytes(data: Bytes): types.V3Libp2pPeerId =
+    var out = types.v3Libp2pPeerIdZero()
+    let dataLen = bytesLen(data)
+    if dataLen <= 0:
+        out.value.data[0] = 1
+        return out
+    for i in 0..<dataLen:
+        let pos = i % 32
+        let prev = int32(out.value.data[pos]) & 255
+        let next = (prev + bytesGet(data, i) + ((i * 17) & 255) + pos) & 255
+        out.value.data[pos] = uint8(next)
+    return out
+
+fn v3Libp2pPeerIdFromSeed(seed: str): types.V3Libp2pPeerId =
+    var out: types.V3Libp2pPeerId
+    v3Libp2pPeerIdFillFromSeed(out, seed)
+    return out
+
+fn v3Libp2pPeerIdFromText(text: str): Result[types.V3Libp2pPeerId] =
+    var out = types.v3Libp2pPeerIdZero()
+    let fillRes = v3Libp2pPeerIdFillFromText(out, text)
+    if IsErr(fillRes):
+        return Err[types.V3Libp2pPeerId](Error(fillRes))
+    return Ok[types.V3Libp2pPeerId](out)
+
+fn v3Libp2pPeerIdText(peerId: types.V3Libp2pPeerId): str =
+    return layout.fixedBytes32Hex(peerId.value)
+
+fn v3Libp2pPeerIdDistance(left: types.V3Libp2pPeerId,
+                          right: types.V3Libp2pPeerId): int64 =
+    var out: int64 = int64(0)
+    for i in 0..<4:
+        let lv = int32(left.value.data[i]) & 255
+        let rv = int32(right.value.data[i]) & 255
+        out = (out << 8) | int64(lv ^ rv)
+    return out

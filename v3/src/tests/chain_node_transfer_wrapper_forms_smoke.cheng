@@ -1,0 +1,93 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/consensus as consensus
+import cheng/v3/project/chain_node as node
+
+fn buildTransferEvent(chain: node.V3ChainNode,
+                      assetId: int32,
+                      fromAccount: int32,
+                      toAccount: int32,
+                      amount: int64): consensus.V3ChainEvent =
+    let fromParentCid = node.v3ChainNodeAccountHead(chain.index, assetId, fromAccount)
+    let toParentCid = node.v3ChainNodeAccountHead(chain.index, assetId, toAccount)
+    var event: consensus.V3ChainEvent
+    event.version = 1
+    event.kind = consensus.v3ConsensusKindTransferCommit
+    event.assetId = assetId
+    event.fromAccount = fromAccount
+    event.toAccount = toAccount
+    event.fromParentCid = fromParentCid
+    event.toParentCid = toParentCid
+    event.amount = amount
+    event.epoch = chain.nextEpoch
+    event.ganzhiIndex = chain.nextGanzhi
+    event.spaceSlot = node.v3ChainNodeSpaceSlot(fromAccount, toAccount)
+    event.tick = chain.nextTick
+    event.stem = event.ganzhiIndex % 10
+    event.branch = event.ganzhiIndex % 12
+    event.bodyCid = consensus.v3ChainEventBodyCid(event)
+    return event
+
+fn localTransferDirect(chain: var node.V3ChainNode,
+                       assetId: int32,
+                       fromAccount: int32,
+                       toAccount: int32,
+                       amount: int64): Result[layout.FixedBytes32] =
+    var event = buildTransferEvent(chain, assetId, fromAccount, toAccount, amount)
+    return node.v3ChainNodeApplyEvent(chain, event)
+
+fn localTransferStore(chain: var node.V3ChainNode,
+                      assetId: int32,
+                      fromAccount: int32,
+                      toAccount: int32,
+                      amount: int64): Result[layout.FixedBytes32] =
+    var event = buildTransferEvent(chain, assetId, fromAccount, toAccount, amount)
+    let out = node.v3ChainNodeApplyEvent(chain, event)
+    return out
+
+fn localTransferGuarded(chain: var node.V3ChainNode,
+                        assetId: int32,
+                        fromAccount: int32,
+                        toAccount: int32,
+                        amount: int64): Result[layout.FixedBytes32] =
+    if assetId <= 0:
+        return Err[layout.FixedBytes32]("local guarded: invalid transfer accounts")
+    if fromAccount <= 0:
+        return Err[layout.FixedBytes32]("local guarded: invalid transfer accounts")
+    if toAccount <= 0:
+        return Err[layout.FixedBytes32]("local guarded: invalid transfer accounts")
+    if fromAccount == toAccount:
+        return Err[layout.FixedBytes32]("local guarded: same account transfer")
+    if amount <= int64(0):
+        return Err[layout.FixedBytes32]("local guarded: transfer amount must be positive")
+    var event = buildTransferEvent(chain, assetId, fromAccount, toAccount, amount)
+    return node.v3ChainNodeApplyEvent(chain, event)
+
+fn main(): int32 =
+    var builtinNode = node.v3ChainNodeInit("node-a", "chain-node-a")
+    let builtinMintRes = node.v3ChainNodeMint(builtinNode, 7, 1001, int64(100))
+    assert(builtinMintRes.ok, "v3 chain_node transfer wrapper forms: builtin mint")
+    let builtinTransferRes = node.v3ChainNodeTransfer(builtinNode, 7, 1001, 2002, int64(40))
+
+    var directNode = node.v3ChainNodeInit("node-b", "chain-node-b")
+    let directMintRes = node.v3ChainNodeMint(directNode, 7, 1001, int64(100))
+    assert(directMintRes.ok, "v3 chain_node transfer wrapper forms: direct mint")
+    let directTransferRes = localTransferDirect(directNode, 7, 1001, 2002, int64(40))
+
+    var storeNode = node.v3ChainNodeInit("node-c", "chain-node-c")
+    let storeMintRes = node.v3ChainNodeMint(storeNode, 7, 1001, int64(100))
+    assert(storeMintRes.ok, "v3 chain_node transfer wrapper forms: store mint")
+    let storeTransferRes = localTransferStore(storeNode, 7, 1001, 2002, int64(40))
+
+    var guardedNode = node.v3ChainNodeInit("node-d", "chain-node-d")
+    let guardedMintRes = node.v3ChainNodeMint(guardedNode, 7, 1001, int64(100))
+    assert(guardedMintRes.ok, "v3 chain_node transfer wrapper forms: guarded mint")
+    let guardedTransferRes = localTransferGuarded(guardedNode, 7, 1001, 2002, int64(40))
+
+    assert(directTransferRes.ok, "v3 chain_node transfer wrapper forms: direct wrapper")
+    assert(storeTransferRes.ok, "v3 chain_node transfer wrapper forms: store wrapper")
+    assert(guardedTransferRes.ok, "v3 chain_node transfer wrapper forms: guarded wrapper")
+    assert(builtinTransferRes.ok, "v3 chain_node transfer wrapper forms: builtin transfer")
+
+    echo("v3 chain_node_transfer_wrapper_forms_smoke ok")
+    return 0

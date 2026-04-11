@@ -1,0 +1,1319 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/consensus as consensus
+import cheng/v3/chain/lsmr_types as lt
+
+const
+    v3BftTxVersion: int32 = 1
+    v3BftTxKindMint: int32 = 1
+    v3BftTxKindTransfer: int32 = 2
+
+    v3BftCodeOk: int32 = 0
+    v3BftCodeBadVersion: int32 = 1
+    v3BftCodeBadKind: int32 = 2
+    v3BftCodeBadTarget: int32 = 3
+    v3BftCodeBadAmount: int32 = 4
+    v3BftCodeDecodeError: int32 = 5
+    v3BftCodeStateRejected: int32 = 6
+    v3BftCodeBadHeight: int32 = 7
+
+    v3BftTxWireSize: int32 = 32
+
+type
+    V3BftTx =
+        version: int32
+        kind: int32
+        assetId: int32
+        fromAccount: int32
+        toAccount: int32
+        amount: int64
+        reserved0: int32
+
+    V3BftTxHeader =
+        version: int32
+        kind: int32
+        assetId: int32
+
+    V3BftTxBody =
+        fromAccount: int32
+        toAccount: int32
+        amount: int64
+        reserved0: int32
+
+    V3BftBlockContext =
+        height: int64
+        txIndex: int32
+        timeHint: int64
+        proposerHint: layout.FixedBytes32
+
+    V3BftTxCheckResult =
+        code: int32
+        accepted: bool
+        applied: bool
+        eventCid: layout.FixedBytes32
+        appHash: layout.FixedBytes32
+        nextHeight: int64
+
+    V3BftTxBatch =
+        versions: int32[]
+        kinds: int32[]
+        assetIds: int32[]
+        fromAccounts: int32[]
+        toAccounts: int32[]
+        amounts: int64[]
+        reserved0s: int32[]
+
+    V3BftExecResult =
+        code: int32
+        accepted: bool
+        applied: bool
+        eventCid: layout.FixedBytes32
+
+    V3BftBlockSummary =
+        height: int64
+        txCount: int32
+        appliedCount: int32
+        rejectedCount: int32
+        appHash: layout.FixedBytes32
+        tipEventCid: layout.FixedBytes32
+
+    V3BftTxOutcomes =
+        codes: int32[]
+        accepted: bool[]
+        applied: bool[]
+        eventCids: layout.FixedBytes32[]
+
+    V3BftBlockResult =
+        height: int64
+        txCount: int32
+        appliedCount: int32
+        rejectedCount: int32
+        appHash: layout.FixedBytes32
+        tipEventCid: layout.FixedBytes32
+        txCodes: int32[]
+        txAccepted: bool[]
+        txApplied: bool[]
+        txEventCids: layout.FixedBytes32[]
+
+    V3BftCommitResult =
+        height: int64
+        appHash: layout.FixedBytes32
+        tipEventCid: layout.FixedBytes32
+        eventCount: int32
+        accountCount: int32
+
+    V3BftBalanceQueryResult =
+        code: int32
+        balance: int64
+        height: int64
+        appHash: layout.FixedBytes32
+
+    V3BftStateMachine =
+        appId: str
+        index: consensus.V3ChainIndex
+        eventCids: layout.FixedBytes32[]
+        events: consensus.V3ChainEvent[]
+        lastFinalizedHeight: int64
+        lastCommitAppHash: layout.FixedBytes32
+        lastCommitTipEventCid: layout.FixedBytes32
+
+fn v3BftTxMint(assetId: int32, toAccount: int32, amount: int64): V3BftTx =
+    var out: V3BftTx
+    out.version = v3BftTxVersion
+    out.kind = v3BftTxKindMint
+    out.assetId = assetId
+    out.fromAccount = 0
+    out.toAccount = toAccount
+    out.amount = amount
+    out.reserved0 = 0
+    return out
+
+fn v3BftTxTransfer(assetId: int32, fromAccount: int32, toAccount: int32, amount: int64): V3BftTx =
+    var out: V3BftTx
+    out.version = v3BftTxVersion
+    out.kind = v3BftTxKindTransfer
+    out.assetId = assetId
+    out.fromAccount = fromAccount
+    out.toAccount = toAccount
+    out.amount = amount
+    out.reserved0 = 0
+    return out
+
+fn v3BftExecResultZero(): V3BftExecResult =
+    var out: V3BftExecResult
+    out.code = v3BftCodeOk
+    out.accepted = false
+    out.applied = false
+    out.eventCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3BftTxHeaderFromTx(tx: V3BftTx): V3BftTxHeader =
+    var out: V3BftTxHeader
+    out.version = tx.version
+    out.kind = tx.kind
+    out.assetId = tx.assetId
+    return out
+
+fn v3BftTxBodyFromTx(tx: V3BftTx): V3BftTxBody =
+    var out: V3BftTxBody
+    out.fromAccount = tx.fromAccount
+    out.toAccount = tx.toAccount
+    out.amount = tx.amount
+    out.reserved0 = tx.reserved0
+    return out
+
+fn v3BftTxFromParts(header: V3BftTxHeader, body: V3BftTxBody): V3BftTx =
+    var out: V3BftTx
+    out.version = header.version
+    out.kind = header.kind
+    out.assetId = header.assetId
+    out.fromAccount = body.fromAccount
+    out.toAccount = body.toAccount
+    out.amount = body.amount
+    out.reserved0 = body.reserved0
+    return out
+
+fn v3BftBlockContextZero(): V3BftBlockContext =
+    var out: V3BftBlockContext
+    out.height = int64(0)
+    out.txIndex = 0
+    out.timeHint = int64(0)
+    out.proposerHint = layout.fixedBytes32Zero()
+    return out
+
+fn v3BftBlockContextMake(height: int64,
+                         txIndex: int32,
+                         timeHint: int64,
+                         proposerHint: layout.FixedBytes32): V3BftBlockContext =
+    var out: V3BftBlockContext
+    out.height = height
+    out.txIndex = txIndex
+    out.timeHint = timeHint
+    out.proposerHint = proposerHint
+    return out
+
+fn v3BftTxCheckResultZero(): V3BftTxCheckResult =
+    var out: V3BftTxCheckResult
+    out.code = v3BftCodeOk
+    out.accepted = false
+    out.applied = false
+    out.eventCid = layout.fixedBytes32Zero()
+    out.appHash = layout.fixedBytes32Zero()
+    out.nextHeight = int64(0)
+    return out
+
+fn v3BftBlockSummaryZero(height: int64): V3BftBlockSummary =
+    var out: V3BftBlockSummary
+    out.height = height
+    out.txCount = 0
+    out.appliedCount = 0
+    out.rejectedCount = 0
+    out.appHash = layout.fixedBytes32Zero()
+    out.tipEventCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3BftTxOutcomesZero(): V3BftTxOutcomes =
+    var out: V3BftTxOutcomes
+    out.codes = []
+    out.accepted = []
+    out.applied = []
+    out.eventCids = []
+    return out
+
+fn v3BftTxOutcomesAdd(outcomes: var V3BftTxOutcomes, exec: V3BftExecResult) =
+    add(outcomes.codes, exec.code)
+    add(outcomes.accepted, exec.accepted)
+    add(outcomes.applied, exec.applied)
+    add(outcomes.eventCids, exec.eventCid)
+
+fn v3BftBlockResultZero(height: int64): V3BftBlockResult =
+    var out: V3BftBlockResult
+    out.height = height
+    out.txCount = 0
+    out.appliedCount = 0
+    out.rejectedCount = 0
+    out.appHash = layout.fixedBytes32Zero()
+    out.tipEventCid = layout.fixedBytes32Zero()
+    out.txCodes = []
+    out.txAccepted = []
+    out.txApplied = []
+    out.txEventCids = []
+    return out
+
+fn v3BftCommitResultZero(): V3BftCommitResult =
+    var out: V3BftCommitResult
+    out.height = int64(0)
+    out.appHash = layout.fixedBytes32Zero()
+    out.tipEventCid = layout.fixedBytes32Zero()
+    out.eventCount = 0
+    out.accountCount = 0
+    return out
+
+fn v3BftBalanceQueryResultZero(): V3BftBalanceQueryResult =
+    var out: V3BftBalanceQueryResult
+    out.code = v3BftCodeOk
+    out.balance = int64(0)
+    out.height = int64(0)
+    out.appHash = layout.fixedBytes32Zero()
+    return out
+
+fn v3BftTxBatchZero(): V3BftTxBatch =
+    var out: V3BftTxBatch
+    out.versions = []
+    out.kinds = []
+    out.assetIds = []
+    out.fromAccounts = []
+    out.toAccounts = []
+    out.amounts = []
+    out.reserved0s = []
+    return out
+
+fn v3BftTxBatchAdd(batch: var V3BftTxBatch, tx: V3BftTx) =
+    add(batch.versions, tx.version)
+    add(batch.kinds, tx.kind)
+    add(batch.assetIds, tx.assetId)
+    add(batch.fromAccounts, tx.fromAccount)
+    add(batch.toAccounts, tx.toAccount)
+    add(batch.amounts, tx.amount)
+    add(batch.reserved0s, tx.reserved0)
+
+fn v3BftTxBatchLen(batch: V3BftTxBatch): int32 =
+    return batch.kinds.len
+
+fn v3BftTxBatchGet(batch: V3BftTxBatch, idx: int32): V3BftTx =
+    var out: V3BftTx
+    out.version = batch.versions[idx]
+    out.kind = batch.kinds[idx]
+    out.assetId = batch.assetIds[idx]
+    out.fromAccount = batch.fromAccounts[idx]
+    out.toAccount = batch.toAccounts[idx]
+    out.amount = batch.amounts[idx]
+    out.reserved0 = batch.reserved0s[idx]
+    return out
+
+fn v3BftTxBatchAddDecoded(batch: var V3BftTxBatch, rawTx: Bytes): Result[bool] =
+    let txRes = v3BftDecodeTx(layout.byteSpanFromBytes(rawTx))
+    if IsErr(txRes):
+        return Err[bool](Error(txRes))
+    v3BftTxBatchAdd(batch, Value(txRes))
+    return Ok[bool](true)
+
+fn v3BftStateMachineInit(appId: str): V3BftStateMachine =
+    var eventCids: layout.FixedBytes32[]
+    var events: consensus.V3ChainEvent[]
+    eventCids = []
+    events = []
+    var out: V3BftStateMachine
+    out.appId = appId
+    out.index = consensus.v3ChainIndexZero()
+    out.eventCids = eventCids
+    out.events = events
+    out.lastFinalizedHeight = int64(0)
+    out.lastCommitAppHash = layout.fixedBytes32Zero()
+    out.lastCommitTipEventCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3BftCodeText(code: int32): str =
+    if code == v3BftCodeOk:
+        return "ok"
+    if code == v3BftCodeBadVersion:
+        return "bad_version"
+    if code == v3BftCodeBadKind:
+        return "bad_kind"
+    if code == v3BftCodeBadTarget:
+        return "bad_target"
+    if code == v3BftCodeBadAmount:
+        return "bad_amount"
+    if code == v3BftCodeDecodeError:
+        return "decode_error"
+    if code == v3BftCodeStateRejected:
+        return "state_rejected"
+    if code == v3BftCodeBadHeight:
+        return "bad_height"
+    return "unknown"
+
+fn v3BftAppendU32BE(buf: var layout.ByteBuf, value: int64) =
+    lt.v3AppendU32BE(buf, value)
+
+fn v3BftReadU32BE(span: layout.ByteSpan, offset: int32): Result[int64] =
+    if offset < 0 || offset + 4 > layout.byteSpanLen(span):
+        return Err[int64]("v3 bft: short u32")
+    let b0: int64 = int64(layout.byteSpanAt(span, offset))
+    let b1: int64 = int64(layout.byteSpanAt(span, offset + 1))
+    let b2: int64 = int64(layout.byteSpanAt(span, offset + 2))
+    let b3: int64 = int64(layout.byteSpanAt(span, offset + 3))
+    return Ok[int64]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3BftEncodeTx(tx: V3BftTx): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(v3BftTxWireSize)
+    v3BftAppendU32BE(buf, tx.version)
+    v3BftAppendU32BE(buf, tx.kind)
+    v3BftAppendU32BE(buf, tx.assetId)
+    v3BftAppendU32BE(buf, tx.fromAccount)
+    v3BftAppendU32BE(buf, tx.toAccount)
+    v3BftAppendU32BE(buf, int32(tx.amount >> 32))
+    v3BftAppendU32BE(buf, int32(tx.amount & int64(0xffffffff)))
+    v3BftAppendU32BE(buf, tx.reserved0)
+    return layout.byteBufToBytes(buf)
+
+fn v3BftDecodeTx(data: layout.ByteSpan): Result[V3BftTx] =
+    if layout.byteSpanLen(data) != v3BftTxWireSize:
+        return Err[V3BftTx]("v3 bft: bad tx size")
+    let versionRes = v3BftReadU32BE(data, 0)
+    if IsErr(versionRes):
+        return Err[V3BftTx](Error(versionRes))
+    let kindRes = v3BftReadU32BE(data, 4)
+    if IsErr(kindRes):
+        return Err[V3BftTx](Error(kindRes))
+    let assetRes = v3BftReadU32BE(data, 8)
+    if IsErr(assetRes):
+        return Err[V3BftTx](Error(assetRes))
+    let fromRes = v3BftReadU32BE(data, 12)
+    if IsErr(fromRes):
+        return Err[V3BftTx](Error(fromRes))
+    let toRes = v3BftReadU32BE(data, 16)
+    if IsErr(toRes):
+        return Err[V3BftTx](Error(toRes))
+    let amountHiRes = v3BftReadU32BE(data, 20)
+    if IsErr(amountHiRes):
+        return Err[V3BftTx](Error(amountHiRes))
+    let amountLoRes = v3BftReadU32BE(data, 24)
+    if IsErr(amountLoRes):
+        return Err[V3BftTx](Error(amountLoRes))
+    let reservedRes = v3BftReadU32BE(data, 28)
+    if IsErr(reservedRes):
+        return Err[V3BftTx](Error(reservedRes))
+    let amountHi = int32(Value(amountHiRes))
+    let amountLo = Value(amountLoRes)
+    let amount = (int64(amountHi) << 32) | (amountLo & int64(0xffffffff))
+    return Ok[V3BftTx](V3BftTx(
+        version: int32(Value(versionRes)),
+        kind: int32(Value(kindRes)),
+        assetId: int32(Value(assetRes)),
+        fromAccount: int32(Value(fromRes)),
+        toAccount: int32(Value(toRes)),
+        amount: amount,
+        reserved0: int32(Value(reservedRes))
+    ))
+
+fn v3BftTxShapeCode(tx: V3BftTx): int32 =
+    if tx.version != v3BftTxVersion:
+        return v3BftCodeBadVersion
+    if tx.kind != v3BftTxKindMint:
+        if tx.kind != v3BftTxKindTransfer:
+            return v3BftCodeBadKind
+    if tx.assetId <= 0:
+        return v3BftCodeBadTarget
+    if tx.amount <= int64(0):
+        return v3BftCodeBadAmount
+    if tx.kind == v3BftTxKindMint:
+        if tx.fromAccount != 0:
+            return v3BftCodeBadTarget
+        if tx.toAccount <= 0:
+            return v3BftCodeBadTarget
+        return v3BftCodeOk
+    if tx.fromAccount <= 0:
+        return v3BftCodeBadTarget
+    if tx.toAccount <= 0:
+        return v3BftCodeBadTarget
+    if tx.fromAccount == tx.toAccount:
+        return v3BftCodeBadTarget
+    return v3BftCodeOk
+
+fn v3BftTxShapeCodeFields(version: int32,
+                          kind: int32,
+                          assetId: int32,
+                          fromAccount: int32,
+                          toAccount: int32,
+                          amount: int64): int32 =
+    var tx: V3BftTx
+    tx.version = version
+    tx.kind = kind
+    tx.assetId = assetId
+    tx.fromAccount = fromAccount
+    tx.toAccount = toAccount
+    tx.amount = amount
+    tx.reserved0 = 0
+    return v3BftTxShapeCode(tx)
+
+fn v3BftTxBatchShapeCodeAt(batch: V3BftTxBatch, idx: int32): int32 =
+    return v3BftTxShapeCodeFields(batch.versions[idx],
+                                  batch.kinds[idx],
+                                  batch.assetIds[idx],
+                                  batch.fromAccounts[idx],
+                                  batch.toAccounts[idx],
+                                  batch.amounts[idx])
+
+fn v3BftHeightOk(height: int64): bool =
+    if height <= int64(0):
+        return false
+    if height > int64(2147483647):
+        return false
+    return true
+
+fn v3BftEpoch(height: int64): int32 =
+    return int32(height)
+
+fn v3BftGanzhiIndex(height: int64, txIndex: int32): int32 =
+    let offset = ((height - int64(1)) * int64(60)) + int64(txIndex)
+    let whole = int32(offset % int64(60))
+    return whole + 1
+
+fn v3BftTick(height: int64, txIndex: int32): int64 =
+    return (height << 32) | int64(txIndex + 1)
+
+fn v3BftAccountPos(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): int32 =
+    return consensus.v3ConsensusAccountPos(index, assetId, accountId)
+
+fn v3BftAccountHead(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): layout.FixedBytes32 =
+    let pos = v3BftAccountPos(index, assetId, accountId)
+    if pos < 0:
+        return layout.fixedBytes32Zero()
+    return index.accountHeads[pos]
+
+fn v3BftBalanceValue(index: consensus.V3ChainIndex, assetId: int32, accountId: int32): int64 =
+    let pos = v3BftAccountPos(index, assetId, accountId)
+    if pos < 0:
+        return int64(0)
+    return index.balances[pos]
+
+fn v3BftTipEventCidIndex(index: consensus.V3ChainIndex): layout.FixedBytes32 =
+    if index.eventCids.len <= 0:
+        return layout.fixedBytes32Zero()
+    return index.eventCids[index.eventCids.len - 1]
+
+fn v3BftTipEventCid(machine: V3BftStateMachine): layout.FixedBytes32 =
+    return v3BftTipEventCidIndex(machine.index)
+
+fn v3BftBuildMintEvent(index: consensus.V3ChainIndex, tx: V3BftTx, height: int64, txIndex: int32): consensus.V3ChainEvent =
+    let parentCid = v3BftAccountHead(index, tx.assetId, tx.toAccount)
+    return consensus.v3ChainEventMint(
+        tx.assetId,
+        tx.toAccount,
+        parentCid,
+        tx.amount,
+        v3BftEpoch(height),
+        v3BftGanzhiIndex(height, txIndex),
+        v3BftSpaceSlot(tx.toAccount, tx.toAccount),
+        v3BftTick(height, txIndex)
+    )
+
+fn v3BftSpaceSlot(fromAccount: int32, toAccount: int32): int32 =
+    let mixed = fromAccount * 131 + toAccount * 17
+    let slot = mixed % 9
+    if slot < 0:
+        return slot + 9
+    return slot
+
+fn v3BftBuildTransferEvent(index: consensus.V3ChainIndex, tx: V3BftTx, height: int64, txIndex: int32): consensus.V3ChainEvent =
+    let fromParentCid = v3BftAccountHead(index, tx.assetId, tx.fromAccount)
+    let toParentCid = v3BftAccountHead(index, tx.assetId, tx.toAccount)
+    var event: consensus.V3ChainEvent
+    event.version = v3BftTxVersion
+    event.kind = consensus.v3ConsensusKindTransferCommit
+    event.assetId = tx.assetId
+    event.fromAccount = tx.fromAccount
+    event.toAccount = tx.toAccount
+    event.fromParentCid = fromParentCid
+    event.toParentCid = toParentCid
+    event.amount = tx.amount
+    event.epoch = v3BftEpoch(height)
+    event.ganzhiIndex = v3BftGanzhiIndex(height, txIndex)
+    event.spaceSlot = v3BftSpaceSlot(tx.fromAccount, tx.toAccount)
+    event.tick = v3BftTick(height, txIndex)
+    event.stem = event.ganzhiIndex % 10
+    event.branch = event.ganzhiIndex % 12
+    event.bodyCid = consensus.v3ChainEventBodyCid(event)
+    return event
+
+fn v3BftApplyEvent(machine: var V3BftStateMachine, event: var consensus.V3ChainEvent): V3BftExecResult =
+    return v3BftApplyEventToIndex(machine.index, event)
+
+fn v3BftApplyEventToIndex(index: var consensus.V3ChainIndex, event: var consensus.V3ChainEvent): V3BftExecResult =
+    var out = v3BftExecResultZero()
+    let eventCid = consensus.v3ChainEventCid(event)
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(index, event, eventCid, index.eventCids.len, decision)
+    out.eventCid = eventCid
+    out.accepted = decision.accepted
+    out.applied = decision.applied
+    if !decision.accepted:
+        out.code = v3BftCodeStateRejected
+        return out
+    out.code = v3BftCodeOk
+    return out
+
+fn v3BftCloneFixedBytes32Seq(xs: layout.FixedBytes32[]): layout.FixedBytes32[] =
+    var out: layout.FixedBytes32[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3BftCloneInt32Seq(xs: int32[]): int32[] =
+    var out: int32[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3BftCloneInt64Seq(xs: int64[]): int64[] =
+    var out: int64[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3BftCloneBoolSeq(xs: bool[]): bool[] =
+    var out: bool[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3BftCloneChainIndex(index: consensus.V3ChainIndex): consensus.V3ChainIndex =
+    var out: consensus.V3ChainIndex
+    out.eventCids = v3BftCloneFixedBytes32Seq(index.eventCids)
+    out.eventKinds = v3BftCloneInt32Seq(index.eventKinds)
+    out.logOffsets = v3BftCloneInt32Seq(index.logOffsets)
+    out.accountAssetIds = v3BftCloneInt32Seq(index.accountAssetIds)
+    out.accountIds = v3BftCloneInt32Seq(index.accountIds)
+    out.accountHeads = v3BftCloneFixedBytes32Seq(index.accountHeads)
+    out.balances = v3BftCloneInt64Seq(index.balances)
+    out.clockEpochs = v3BftCloneInt32Seq(index.clockEpochs)
+    out.clockGanzhi = v3BftCloneInt32Seq(index.clockGanzhi)
+    out.diverged = v3BftCloneBoolSeq(index.diverged)
+    out.stateTreeDirty = index.stateTreeDirty
+    return out
+
+fn v3BftPreviewEvent(machine: var V3BftStateMachine, event: var consensus.V3ChainEvent): V3BftExecResult =
+    var out = v3BftExecResultZero()
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, machine.index.eventCids.len, decision)
+    out.eventCid = eventCid
+    out.accepted = decision.accepted
+    out.applied = decision.applied
+    if decision.accepted:
+        out.code = v3BftCodeOk
+    else:
+        out.code = v3BftCodeStateRejected
+    return out
+
+fn v3BftApplyTx(machine: var V3BftStateMachine, tx: V3BftTx, height: int64, txIndex: int32): V3BftExecResult =
+    return v3BftApplyTxToIndex(machine.index, tx, height, txIndex)
+
+fn v3BftApplyTxToIndexInto(index: var consensus.V3ChainIndex,
+                           tx: V3BftTx,
+                           height: int64,
+                           txIndex: int32,
+                           out: var V3BftExecResult) =
+    let exec = v3BftApplyTxToIndex(index, tx, height, txIndex)
+    out.code = exec.code
+    out.accepted = exec.accepted
+    out.applied = exec.applied
+    out.eventCid = exec.eventCid
+    return
+
+fn v3BftApplyTxToIndex(index: var consensus.V3ChainIndex, tx: V3BftTx, height: int64, txIndex: int32): V3BftExecResult =
+    var out = v3BftExecResultZero()
+    let code = v3BftTxShapeCode(tx)
+    out.code = code
+    if code != v3BftCodeOk:
+        return out
+    var event: consensus.V3ChainEvent
+    if tx.kind == v3BftTxKindMint:
+        event = v3BftBuildMintEvent(index, tx, height, txIndex)
+    else:
+        event = v3BftBuildTransferEvent(index, tx, height, txIndex)
+    let eventCid = consensus.v3ChainEventCid(event)
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(index, event, eventCid, index.eventCids.len, decision)
+    out.eventCid = eventCid
+    out.accepted = decision.accepted
+    out.applied = decision.applied
+    if !decision.accepted:
+        out.code = v3BftCodeStateRejected
+        return out
+    out.code = v3BftCodeOk
+    return out
+
+fn v3BftStateMachineCheckTx(machine: var V3BftStateMachine, tx: V3BftTx): V3BftExecResult =
+    let nextHeight = machine.lastFinalizedHeight + int64(1)
+    if !v3BftHeightOk(nextHeight):
+        var out = v3BftExecResultZero()
+        out.code = v3BftCodeBadHeight
+        return out
+    var out = v3BftExecResultZero()
+    let code = v3BftTxShapeCode(tx)
+    out.code = code
+    if code != v3BftCodeOk:
+        return out
+    var event: consensus.V3ChainEvent
+    if tx.kind == v3BftTxKindMint:
+        event = v3BftBuildMintEvent(machine.index, tx, nextHeight, 0)
+    else:
+        event = v3BftBuildTransferEvent(machine.index, tx, nextHeight, 0)
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, machine.index.eventCids.len, decision)
+    out.eventCid = eventCid
+    out.accepted = decision.accepted
+    out.applied = decision.applied
+    if decision.accepted:
+        out.code = v3BftCodeOk
+    else:
+        out.code = v3BftCodeStateRejected
+    return out
+
+fn v3BftStateMachineCheckTxWithContext(machine: var V3BftStateMachine,
+                                       context: V3BftBlockContext,
+                                       header: V3BftTxHeader,
+                                       body: V3BftTxBody): V3BftTxCheckResult =
+    var out = v3BftTxCheckResultZero()
+    out.appHash = v3BftStateMachineAppHash(machine)
+    out.nextHeight = context.height
+    if !v3BftHeightOk(context.height):
+        out.code = v3BftCodeBadHeight
+        return out
+    if context.height <= machine.lastFinalizedHeight:
+        out.code = v3BftCodeBadHeight
+        return out
+    let tx = v3BftTxFromParts(header, body)
+    let code = v3BftTxShapeCode(tx)
+    out.code = code
+    if code != v3BftCodeOk:
+        return out
+    var event: consensus.V3ChainEvent
+    if tx.kind == v3BftTxKindMint:
+        event = v3BftBuildMintEvent(machine.index, tx, context.height, context.txIndex)
+    else:
+        event = v3BftBuildTransferEvent(machine.index, tx, context.height, context.txIndex)
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, machine.index.eventCids.len, decision)
+    out.eventCid = eventCid
+    out.accepted = decision.accepted
+    out.applied = decision.applied
+    if decision.accepted:
+        out.code = v3BftCodeOk
+    else:
+        out.code = v3BftCodeStateRejected
+    return out
+
+fn v3BftStateMachineCheckTxBytesWithContext(machine: var V3BftStateMachine,
+                                            context: V3BftBlockContext,
+                                            rawTx: Bytes): V3BftTxCheckResult =
+    let txRes = v3BftDecodeTx(layout.byteSpanFromBytes(rawTx))
+    if IsErr(txRes):
+        var out = v3BftTxCheckResultZero()
+        out.code = v3BftCodeDecodeError
+        out.appHash = v3BftStateMachineAppHash(machine)
+        out.nextHeight = context.height
+        return out
+    let tx = Value(txRes)
+    return v3BftStateMachineCheckTxWithContext(machine, context, v3BftTxHeaderFromTx(tx), v3BftTxBodyFromTx(tx))
+
+fn v3BftStateMachineCheckTxBytes(machine: var V3BftStateMachine, rawTx: Bytes): V3BftExecResult =
+    let txRes = v3BftDecodeTx(layout.byteSpanFromBytes(rawTx))
+    if IsErr(txRes):
+        var out = v3BftExecResultZero()
+        out.code = v3BftCodeDecodeError
+        return out
+    return v3BftStateMachineCheckTx(machine, Value(txRes))
+
+fn v3BftStateMachineFinalizeBlock(machine: var V3BftStateMachine, height: int64, txs: V3BftTx[]): V3BftBlockResult =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<txs.len:
+        v3BftTxBatchAdd(batch, txs[i])
+    var out = v3BftBlockResultZero(height)
+    v3BftStateMachineFinalizeBatchInto(machine, height, batch, out)
+    return out
+
+fn v3BftStateMachineFinalizeBatchSummary(machine: var V3BftStateMachine,
+                                         height: int64,
+                                         batch: V3BftTxBatch,
+                                         summary: var V3BftBlockSummary) =
+    var batchCount = 0
+    batchCount = v3BftTxBatchLen(batch)
+    summary.height = height
+    summary.txCount = batchCount
+    summary.appliedCount = 0
+    summary.rejectedCount = 0
+    summary.appHash = layout.fixedBytes32Zero()
+    summary.tipEventCid = layout.fixedBytes32Zero()
+    if !v3BftHeightOk(height):
+        summary.rejectedCount = summary.txCount
+        summary.appHash = machine.lastCommitAppHash
+        summary.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    if height <= machine.lastFinalizedHeight:
+        summary.rejectedCount = summary.txCount
+        summary.appHash = machine.lastCommitAppHash
+        summary.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var appliedCount = 0
+    var rejectedCount = 0
+    for i in 0..<batchCount:
+        let version = batch.versions[i]
+        let kind = batch.kinds[i]
+        let assetId = batch.assetIds[i]
+        let fromAccount = batch.fromAccounts[i]
+        let toAccount = batch.toAccounts[i]
+        let amount = batch.amounts[i]
+        let code = v3BftTxShapeCodeFields(version, kind, assetId, fromAccount, toAccount, amount)
+        if code != v3BftCodeOk:
+            rejectedCount = rejectedCount + 1
+            continue
+        if kind == v3BftTxKindMint:
+            let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxMint(assetId, toAccount, amount), height, i)
+            if exec.applied:
+                appliedCount = appliedCount + 1
+            else:
+                rejectedCount = rejectedCount + 1
+            continue
+        let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxTransfer(assetId, fromAccount, toAccount, amount), height, i)
+        if exec.applied:
+            appliedCount = appliedCount + 1
+        else:
+            rejectedCount = rejectedCount + 1
+    summary.appliedCount = appliedCount
+    summary.rejectedCount = rejectedCount
+    summary.appHash = v3BftChainIndexAppHash(machine.appId, nextIndex)
+    summary.tipEventCid = v3BftTipEventCidIndex(nextIndex)
+    machine.index = nextIndex
+    machine.lastFinalizedHeight = height
+    return
+
+fn v3BftStateMachineFinalizeBlockSummary(machine: var V3BftStateMachine,
+                                         height: int64,
+                                         txs: V3BftTx[],
+                                         summary: var V3BftBlockSummary) =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<txs.len:
+        v3BftTxBatchAdd(batch, txs[i])
+    v3BftStateMachineFinalizeBatchSummary(machine, height, batch, summary)
+
+fn v3BftStateMachineFinalizeBlockBytesSummary(machine: var V3BftStateMachine,
+                                              height: int64,
+                                              rawTxs: Bytes[],
+                                              summary: var V3BftBlockSummary) =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<rawTxs.len:
+        let addRes = v3BftTxBatchAddDecoded(batch, rawTxs[i])
+        if IsErr(addRes):
+            summary.height = height
+            summary.txCount = rawTxs.len
+            summary.appliedCount = 0
+            summary.rejectedCount = rawTxs.len
+            summary.appHash = v3BftStateMachineAppHash(machine)
+            summary.tipEventCid = v3BftTipEventCid(machine)
+            return
+    v3BftStateMachineFinalizeBatchSummary(machine, height, batch, summary)
+
+fn v3BftStateMachineFinalizeBatchSoA(machine: var V3BftStateMachine,
+                                     height: int64,
+                                     batch: V3BftTxBatch,
+                                     summary: var V3BftBlockSummary,
+                                     txCodes: var int32[],
+                                     txAccepted: var bool[],
+                                     txApplied: var bool[],
+                                     txEventCids: var layout.FixedBytes32[]) =
+    var batchCount = 0
+    batchCount = v3BftTxBatchLen(batch)
+    summary.height = height
+    summary.txCount = 0
+    summary.appliedCount = 0
+    summary.rejectedCount = 0
+    summary.appHash = layout.fixedBytes32Zero()
+    summary.tipEventCid = layout.fixedBytes32Zero()
+    txCodes = []
+    txAccepted = []
+    txApplied = []
+    txEventCids = []
+    summary.txCount = batchCount
+    if !v3BftHeightOk(height):
+        for i in 0..<batchCount:
+            add(txCodes, v3BftCodeBadHeight)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            summary.rejectedCount = summary.rejectedCount + 1
+        summary.appHash = machine.lastCommitAppHash
+        summary.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    if height <= machine.lastFinalizedHeight:
+        for i in 0..<batchCount:
+            add(txCodes, v3BftCodeBadHeight)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            summary.rejectedCount = summary.rejectedCount + 1
+        summary.appHash = machine.lastCommitAppHash
+        summary.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var appliedCount = 0
+    var rejectedCount = 0
+    for i in 0..<batchCount:
+        let version = batch.versions[i]
+        let kind = batch.kinds[i]
+        let assetId = batch.assetIds[i]
+        let fromAccount = batch.fromAccounts[i]
+        let toAccount = batch.toAccounts[i]
+        let amount = batch.amounts[i]
+        let code = v3BftTxShapeCodeFields(version, kind, assetId, fromAccount, toAccount, amount)
+        if code != v3BftCodeOk:
+            add(txCodes, code)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            rejectedCount = rejectedCount + 1
+            continue
+        if kind == v3BftTxKindMint:
+            let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxMint(assetId, toAccount, amount), height, i)
+            add(txCodes, exec.code)
+            add(txAccepted, exec.accepted)
+            add(txApplied, exec.applied)
+            add(txEventCids, exec.eventCid)
+            if exec.applied:
+                appliedCount = appliedCount + 1
+            else:
+                rejectedCount = rejectedCount + 1
+            continue
+        let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxTransfer(assetId, fromAccount, toAccount, amount), height, i)
+        add(txCodes, exec.code)
+        add(txAccepted, exec.accepted)
+        add(txApplied, exec.applied)
+        add(txEventCids, exec.eventCid)
+        if exec.applied:
+            appliedCount = appliedCount + 1
+        else:
+            rejectedCount = rejectedCount + 1
+    summary.appliedCount = appliedCount
+    summary.rejectedCount = rejectedCount
+    summary.appHash = v3BftChainIndexAppHash(machine.appId, nextIndex)
+    summary.tipEventCid = v3BftTipEventCidIndex(nextIndex)
+    machine.index = nextIndex
+    machine.lastFinalizedHeight = height
+    return
+
+fn v3BftStateMachineFinalizeBlockSoA(machine: var V3BftStateMachine,
+                                     height: int64,
+                                     txs: V3BftTx[],
+                                     summary: var V3BftBlockSummary,
+                                     txCodes: var int32[],
+                                     txAccepted: var bool[],
+                                     txApplied: var bool[],
+                                     txEventCids: var layout.FixedBytes32[]) =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<txs.len:
+        v3BftTxBatchAdd(batch, txs[i])
+    v3BftStateMachineFinalizeBatchSoA(machine, height, batch, summary, txCodes, txAccepted, txApplied, txEventCids)
+
+fn v3BftStateMachineFinalizeBlockBytesSoA(machine: var V3BftStateMachine,
+                                          height: int64,
+                                          rawTxs: Bytes[],
+                                          summary: var V3BftBlockSummary,
+                                          txCodes: var int32[],
+                                          txAccepted: var bool[],
+                                          txApplied: var bool[],
+                                          txEventCids: var layout.FixedBytes32[]) =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<rawTxs.len:
+        let addRes = v3BftTxBatchAddDecoded(batch, rawTxs[i])
+        if IsErr(addRes):
+            summary.height = height
+            summary.txCount = 0
+            summary.appliedCount = 0
+            summary.rejectedCount = 0
+            summary.appHash = layout.fixedBytes32Zero()
+            summary.tipEventCid = layout.fixedBytes32Zero()
+            txCodes = []
+            txAccepted = []
+            txApplied = []
+            txEventCids = []
+            summary.txCount = rawTxs.len
+            for j in 0..<rawTxs.len:
+                add(txCodes, v3BftCodeDecodeError)
+                add(txAccepted, false)
+                add(txApplied, false)
+                add(txEventCids, layout.fixedBytes32Zero())
+                summary.rejectedCount = summary.rejectedCount + 1
+            summary.appHash = v3BftStateMachineAppHash(machine)
+            summary.tipEventCid = v3BftTipEventCid(machine)
+            return
+    v3BftStateMachineFinalizeBatchSoA(machine, height, batch, summary, txCodes, txAccepted, txApplied, txEventCids)
+
+fn v3BftStateMachineFinalizeBatchInto(machine: var V3BftStateMachine,
+                                      height: int64,
+                                      batch: V3BftTxBatch,
+                                      out: var V3BftBlockResult) =
+    var batchCount = 0
+    batchCount = v3BftTxBatchLen(batch)
+    out = v3BftBlockResultZero(height)
+    var txCodes: int32[]
+    var txAccepted: bool[]
+    var txApplied: bool[]
+    var txEventCids: layout.FixedBytes32[]
+    txCodes = []
+    txAccepted = []
+    txApplied = []
+    txEventCids = []
+    out.txCount = batchCount
+    if !v3BftHeightOk(height):
+        for i in 0..<batchCount:
+            add(txCodes, v3BftCodeBadHeight)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            out.rejectedCount = out.rejectedCount + 1
+        out.txCodes = txCodes
+        out.txAccepted = txAccepted
+        out.txApplied = txApplied
+        out.txEventCids = txEventCids
+        out.appHash = machine.lastCommitAppHash
+        out.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    if height <= machine.lastFinalizedHeight:
+        for i in 0..<batchCount:
+            add(txCodes, v3BftCodeBadHeight)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            out.rejectedCount = out.rejectedCount + 1
+        out.txCodes = txCodes
+        out.txAccepted = txAccepted
+        out.txApplied = txApplied
+        out.txEventCids = txEventCids
+        out.appHash = machine.lastCommitAppHash
+        out.tipEventCid = v3BftTipEventCidIndex(machine.index)
+        return
+    var nextIndex = v3BftCloneChainIndex(machine.index)
+    var appliedCount = 0
+    var rejectedCount = 0
+    for i in 0..<batchCount:
+        let version = batch.versions[i]
+        let kind = batch.kinds[i]
+        let assetId = batch.assetIds[i]
+        let fromAccount = batch.fromAccounts[i]
+        let toAccount = batch.toAccounts[i]
+        let amount = batch.amounts[i]
+        let code = v3BftTxShapeCodeFields(version, kind, assetId, fromAccount, toAccount, amount)
+        if code != v3BftCodeOk:
+            add(txCodes, code)
+            add(txAccepted, false)
+            add(txApplied, false)
+            add(txEventCids, layout.fixedBytes32Zero())
+            rejectedCount = rejectedCount + 1
+            continue
+        if kind == v3BftTxKindMint:
+            let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxMint(assetId, toAccount, amount), height, i)
+            add(txCodes, exec.code)
+            add(txAccepted, exec.accepted)
+            add(txApplied, exec.applied)
+            add(txEventCids, exec.eventCid)
+            if exec.applied:
+                appliedCount = appliedCount + 1
+            else:
+                rejectedCount = rejectedCount + 1
+            continue
+        let exec = v3BftApplyTxToIndex(nextIndex, v3BftTxTransfer(assetId, fromAccount, toAccount, amount), height, i)
+        add(txCodes, exec.code)
+        add(txAccepted, exec.accepted)
+        add(txApplied, exec.applied)
+        add(txEventCids, exec.eventCid)
+        if exec.applied:
+            appliedCount = appliedCount + 1
+        else:
+            rejectedCount = rejectedCount + 1
+    out.txCodes = txCodes
+    out.txAccepted = txAccepted
+    out.txApplied = txApplied
+    out.txEventCids = txEventCids
+    out.appliedCount = appliedCount
+    out.rejectedCount = rejectedCount
+    out.appHash = v3BftChainIndexAppHash(machine.appId, nextIndex)
+    out.tipEventCid = v3BftTipEventCidIndex(nextIndex)
+    machine.index = nextIndex
+    machine.lastFinalizedHeight = height
+    return
+
+fn v3BftStateMachineFinalizeBatch(machine: var V3BftStateMachine, height: int64, batch: V3BftTxBatch): V3BftBlockResult =
+    var out = v3BftBlockResultZero(height)
+    v3BftStateMachineFinalizeBatchInto(machine, height, batch, out)
+    return out
+
+fn v3BftStateMachineFinalizeBlockBytes(machine: var V3BftStateMachine, height: int64, rawTxs: Bytes[]): V3BftBlockResult =
+    var batch = v3BftTxBatchZero()
+    for i in 0..<rawTxs.len:
+        let addRes = v3BftTxBatchAddDecoded(batch, rawTxs[i])
+        if IsErr(addRes):
+            var out = v3BftBlockResultZero(height)
+            out.txCount = rawTxs.len
+            for j in 0..<rawTxs.len:
+                add(out.txCodes, v3BftCodeDecodeError)
+                add(out.txAccepted, false)
+                add(out.txApplied, false)
+                add(out.txEventCids, layout.fixedBytes32Zero())
+                out.rejectedCount = out.rejectedCount + 1
+            out.appHash = v3BftStateMachineAppHash(machine)
+            out.tipEventCid = v3BftTipEventCid(machine)
+            return out
+    var out = v3BftBlockResultZero(height)
+    v3BftStateMachineFinalizeBatchInto(machine, height, batch, out)
+    return out
+
+fn v3BftChainIndexAppHash(appId: str, index: consensus.V3ChainIndex): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    let prefix = bytesFromString("v3.bft.app_hash")
+    let appIdBytes = bytesFromString(appId)
+    layout.byteBufAppendBytes(buf, prefix)
+    layout.byteBufAppendBytes(buf, appIdBytes)
+    lt.v3AppendU32BE(buf, index.eventCids.len)
+    lt.v3AppendU32BE(buf, index.accountIds.len)
+    for i in 0..<index.eventCids.len:
+        lt.v3AppendFixed32(buf, index.eventCids[i])
+    for i in 0..<index.accountIds.len:
+        lt.v3AppendU32BE(buf, index.accountAssetIds[i])
+        lt.v3AppendU32BE(buf, index.accountIds[i])
+        lt.v3AppendU32BE(buf, int32(index.balances[i] >> 32))
+        lt.v3AppendU32BE(buf, int32(index.balances[i] & int64(0xffffffff)))
+        lt.v3AppendFixed32(buf, index.accountHeads[i])
+        lt.v3AppendU32BE(buf, index.clockEpochs[i])
+        lt.v3AppendU32BE(buf, index.clockGanzhi[i])
+        if index.diverged[i]:
+            lt.v3AppendU32BE(buf, 1)
+        else:
+            lt.v3AppendU32BE(buf, 0)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3BftStateMachineAppHash(machine: V3BftStateMachine): layout.FixedBytes32 =
+    return v3BftChainIndexAppHash(machine.appId, machine.index)
+
+fn v3BftStateMachineCommit(machine: var V3BftStateMachine): V3BftCommitResult =
+    var out = v3BftCommitResultZero()
+    out.height = machine.lastFinalizedHeight
+    out.appHash = v3BftStateMachineAppHash(machine)
+    out.tipEventCid = v3BftTipEventCid(machine)
+    out.eventCount = machine.index.eventCids.len
+    out.accountCount = machine.index.accountIds.len
+    machine.lastCommitAppHash = out.appHash
+    machine.lastCommitTipEventCid = out.tipEventCid
+    return out
+
+fn v3BftStateMachineQueryAppHash(machine: V3BftStateMachine): layout.FixedBytes32 =
+    return v3BftStateMachineAppHash(machine)
+
+fn v3BftStateMachineQueryBalance(machine: V3BftStateMachine, assetId: int32, accountId: int32): V3BftBalanceQueryResult =
+    var out = v3BftBalanceQueryResultZero()
+    out.height = machine.lastFinalizedHeight
+    out.appHash = v3BftStateMachineAppHash(machine)
+    if assetId <= 0:
+        out.code = v3BftCodeBadTarget
+        return out
+    if accountId <= 0:
+        out.code = v3BftCodeBadTarget
+        return out
+    out.balance = v3BftBalanceValue(machine.index, assetId, accountId)
+    return out
+
+fn v3BftTxSeq1(a: V3BftTx): V3BftTx[] =
+    var out: V3BftTx[]
+    out = []
+    add(out, a)
+    return out
+
+fn v3BftTxSeq2(a: V3BftTx, b: V3BftTx): V3BftTx[] =
+    var out: V3BftTx[]
+    out = []
+    add(out, a)
+    add(out, b)
+    return out
+
+fn v3BftBytesSeq1(a: Bytes): Bytes[] =
+    var out: Bytes[]
+    out = []
+    add(out, a)
+    return out
+
+fn v3BftSelfTest(): int32 =
+    var machine = v3BftStateMachineInit("bft-self-test")
+    let badRaw = bytesFromString("bad")
+    let badCheck = v3BftStateMachineCheckTxBytes(machine, badRaw)
+    if badCheck.code != v3BftCodeDecodeError:
+        echo("v3 bft self-test: decode error check failed")
+        return 1
+
+    let mint = v3BftTxMint(7, 1001, int64(100))
+    let mintRaw = v3BftEncodeTx(mint)
+    let mintRoundtripRes = v3BftDecodeTx(layout.byteSpanFromBytes(mintRaw))
+    if !mintRoundtripRes.ok:
+        echo("v3 bft self-test: mint decode failed")
+        return 1
+    if mintRoundtripRes.value.kind != v3BftTxKindMint:
+        echo("v3 bft self-test: mint kind mismatch")
+        return 1
+
+    let mintCheck = v3BftStateMachineCheckTx(machine, mint)
+    if mintCheck.code != v3BftCodeOk:
+        echo("v3 bft self-test: mint check failed")
+        return 1
+    if machine.index.eventCids.len != 0:
+        echo("v3 bft self-test: checktx mutated event log")
+        return 1
+    if machine.index.accountIds.len != 0:
+        echo("v3 bft self-test: checktx mutated state")
+        return 1
+
+    let badTransfer = v3BftTxTransfer(7, 1001, 1001, int64(1))
+    let badTransferCheck = v3BftStateMachineCheckTx(machine, badTransfer)
+    if badTransferCheck.code != v3BftCodeBadTarget:
+        echo("v3 bft self-test: bad transfer not rejected")
+        return 1
+    if machine.index.eventCids.len != 0:
+        echo("v3 bft self-test: bad transfer check mutated event log")
+        return 1
+
+    var block1Batch = v3BftTxBatchZero()
+    v3BftTxBatchAdd(block1Batch, mint)
+    v3BftTxBatchAdd(block1Batch, badTransfer)
+    let block1BadCode = v3BftTxBatchShapeCodeAt(block1Batch, 1)
+    if block1BadCode != v3BftCodeBadTarget:
+        echo("v3 bft self-test: block1 seq bad transfer shape")
+        return 1
+    if block1Batch.versions[0] != v3BftTxVersion:
+        echo("v3 bft self-test: block1 batch version")
+        return 1
+    if block1Batch.kinds[0] != v3BftTxKindMint:
+        echo("v3 bft self-test: block1 batch mint kind")
+        return 1
+    if block1Batch.assetIds[0] != 7:
+        echo("v3 bft self-test: block1 batch asset")
+        return 1
+    if block1Batch.toAccounts[0] != 1001:
+        echo("v3 bft self-test: block1 batch target")
+        return 1
+    if block1Batch.amounts[0] != int64(100):
+        echo("v3 bft self-test: block1 batch amount")
+        return 1
+    let block1MintBatchCode = v3BftTxBatchShapeCodeAt(block1Batch, 0)
+    if block1MintBatchCode != v3BftCodeOk:
+        echo("v3 bft self-test: block1 batch mint shape")
+        return 1
+    var block1ProbeIndex = v3BftCloneChainIndex(machine.index)
+    let block1MintExec = v3BftApplyTxToIndex(block1ProbeIndex, mint, int64(1), 0)
+    if block1MintExec.code != v3BftCodeOk:
+        echo("v3 bft self-test: block1 mint exec code")
+        return 1
+    if !block1MintExec.accepted:
+        echo("v3 bft self-test: block1 mint exec accepted")
+        return 1
+    if !block1MintExec.applied:
+        echo("v3 bft self-test: block1 mint exec applied")
+        return 1
+    let block1BadExec = v3BftApplyTxToIndex(block1ProbeIndex, badTransfer, int64(1), 1)
+    if block1BadExec.code != v3BftCodeBadTarget:
+        echo("v3 bft self-test: block1 bad exec code")
+        return 1
+    if block1BadExec.accepted:
+        echo("v3 bft self-test: block1 bad exec accepted")
+        return 1
+    if block1BadExec.applied:
+        echo("v3 bft self-test: block1 bad exec applied")
+        return 1
+    var block1MachineValue = v3BftStateMachineInit("bft-self-test-value")
+    let block1Value = v3BftStateMachineFinalizeBatch(block1MachineValue, int64(1), block1Batch)
+    if block1Value.txCount != 2:
+        echo("v3 bft self-test: block1 value tx count")
+        return 1
+    if block1Value.appliedCount != 1:
+        if block1Value.appliedCount == 0:
+            if block1Value.rejectedCount == 0:
+                echo("v3 bft self-test: block1 value applied zero rejected zero")
+            elif block1Value.rejectedCount == 1:
+                echo("v3 bft self-test: block1 value applied zero rejected one")
+            elif block1Value.rejectedCount == 2:
+                echo("v3 bft self-test: block1 value applied zero rejected two")
+            else:
+                echo("v3 bft self-test: block1 value applied zero rejected other")
+        elif block1Value.appliedCount == 2:
+            echo("v3 bft self-test: block1 value applied count two")
+        else:
+            echo("v3 bft self-test: block1 value applied count other")
+        return 1
+    if block1Value.rejectedCount != 1:
+        echo("v3 bft self-test: block1 value rejected count")
+        return 1
+    var block1Summary = v3BftBlockSummaryZero(int64(0))
+    v3BftStateMachineFinalizeBatchSummary(machine, int64(1), block1Batch, block1Summary)
+    if block1Summary.txCount != 2:
+        echo("v3 bft self-test: block1 tx count")
+        return 1
+    if block1Summary.appliedCount != 1:
+        echo("v3 bft self-test: block1 applied count")
+        return 1
+    if block1Summary.rejectedCount != 1:
+        echo("v3 bft self-test: block1 rejected count")
+        return 1
+
+    let transfer = v3BftTxTransfer(7, 1001, 2002, int64(40))
+    let transferRaw = v3BftEncodeTx(transfer)
+    var block2Batch = v3BftTxBatchZero()
+    let block2AddRes = v3BftTxBatchAddDecoded(block2Batch, transferRaw)
+    if IsErr(block2AddRes):
+        echo("v3 bft self-test: block2 decode")
+        return 1
+    var block2Summary = v3BftBlockSummaryZero(int64(0))
+    v3BftStateMachineFinalizeBatchSummary(machine, int64(2), block2Batch, block2Summary)
+    if block2Summary.appliedCount != 1:
+        echo("v3 bft self-test: block2 applied count")
+        return 1
+    if !layout.fixedBytes32Equal(block2Summary.tipEventCid, v3BftTipEventCid(machine)):
+        echo("v3 bft self-test: block2 tip mismatch")
+        return 1
+
+    let commit = v3BftStateMachineCommit(machine)
+    if commit.height != int64(2):
+        echo("v3 bft self-test: commit height")
+        return 1
+    if commit.eventCount != 2:
+        echo("v3 bft self-test: commit event count")
+        return 1
+    if commit.accountCount != 2:
+        echo("v3 bft self-test: commit account count")
+        return 1
+
+    let alice = v3BftStateMachineQueryBalance(machine, 7, 1001)
+    let bob = v3BftStateMachineQueryBalance(machine, 7, 2002)
+    if alice.code != v3BftCodeOk:
+        echo("v3 bft self-test: alice query")
+        return 1
+    if bob.code != v3BftCodeOk:
+        echo("v3 bft self-test: bob query")
+        return 1
+    if alice.balance != int64(60):
+        echo("v3 bft self-test: alice balance")
+        return 1
+    if bob.balance != int64(40):
+        echo("v3 bft self-test: bob balance")
+        return 1
+    if !layout.fixedBytes32Equal(commit.appHash, bob.appHash):
+        echo("v3 bft self-test: app hash mismatch")
+        return 1
+
+    var staleBatch = v3BftTxBatchZero()
+    v3BftTxBatchAdd(staleBatch, transfer)
+    var staleSummary = v3BftBlockSummaryZero(int64(0))
+    v3BftStateMachineFinalizeBatchSummary(machine, int64(2), staleBatch, staleSummary)
+    if staleSummary.rejectedCount != 1:
+        echo("v3 bft self-test: stale height")
+        return 1
+
+    echo("v3 bft_state_machine ok")
+    return 0

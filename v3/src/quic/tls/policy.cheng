@@ -1,0 +1,175 @@
+# MsQuic TLS policy for native transport demos/tests.
+
+import std/result
+import std/rawbytes
+import std/tls/x509
+
+const
+    msQuicTlsMaxCerts = 4
+
+type
+    MsQuicTlsPolicy =
+        serverName: str
+        allowInsecure: bool
+        revocationMode: X509RevocationMode
+        crlCount: int32
+        crl0: Bytes
+        crl1: Bytes
+        crl2: Bytes
+        crl3: Bytes
+        certChainCount: int32
+        certChain0: Bytes
+        certChain1: Bytes
+        certChain2: Bytes
+        certChain3: Bytes
+        certPrivateKey: Bytes
+        certLeafKeyKind: X509PublicKeyKind
+        trustRootsCount: int32
+        trustRoot0: Bytes
+        trustRoot1: Bytes
+        trustRoot2: Bytes
+        trustRoot3: Bytes
+
+fn initMsQuicTlsPolicy(): MsQuicTlsPolicy =
+    var out: MsQuicTlsPolicy
+    out.serverName = ""
+    out.allowInsecure = false
+    out.revocationMode = X509RevocationOff
+    out.crlCount = 0
+    out.crl0 = emptyBytes()
+    out.crl1 = emptyBytes()
+    out.crl2 = emptyBytes()
+    out.crl3 = emptyBytes()
+    out.certChainCount = 0
+    out.certChain0 = emptyBytes()
+    out.certChain1 = emptyBytes()
+    out.certChain2 = emptyBytes()
+    out.certChain3 = emptyBytes()
+    out.certPrivateKey = emptyBytes()
+    out.certLeafKeyKind = X509KeyUnknown
+    out.trustRootsCount = 0
+    out.trustRoot0 = emptyBytes()
+    out.trustRoot1 = emptyBytes()
+    out.trustRoot2 = emptyBytes()
+    out.trustRoot3 = emptyBytes()
+    return out
+
+fn msquicTlsPolicyHasServerInputs(serverName: str, certDer: Bytes, keyKind: X509PublicKeyKind, keyDer: Bytes): bool =
+    return len(serverName) > 0 && bytesLen(certDer) > 0 && bytesLen(keyDer) > 0 && keyKind != X509KeyUnknown
+
+fn msquicTlsPolicyHasClientInputs(serverName: str, allowInsecure: bool, trustRootDer: Bytes): bool =
+    return allowInsecure || (len(serverName) > 0 && bytesLen(trustRootDer) > 0)
+
+fn msquicTlsPolicyCertAt(policy: MsQuicTlsPolicy, idx: int32): Bytes =
+    if idx == 0:
+        return policy.certChain0
+    if idx == 1:
+        return policy.certChain1
+    if idx == 2:
+        return policy.certChain2
+    if idx == 3:
+        return policy.certChain3
+    return emptyBytes()
+
+fn msquicTlsPolicySetCertAt(policy: var MsQuicTlsPolicy, idx: int32, der: Bytes): bool =
+    if idx == 0:
+        policy.certChain0 = der
+        return true
+    if idx == 1:
+        policy.certChain1 = der
+        return true
+    if idx == 2:
+        policy.certChain2 = der
+        return true
+    if idx == 3:
+        policy.certChain3 = der
+        return true
+    return false
+
+fn msquicTlsPolicyTrustRootAt(policy: MsQuicTlsPolicy, idx: int32): Bytes =
+    if idx == 0:
+        return policy.trustRoot0
+    if idx == 1:
+        return policy.trustRoot1
+    if idx == 2:
+        return policy.trustRoot2
+    if idx == 3:
+        return policy.trustRoot3
+    return emptyBytes()
+
+fn msquicTlsPolicySetTrustRootAt(policy: var MsQuicTlsPolicy, idx: int32, der: Bytes): bool =
+    if idx == 0:
+        policy.trustRoot0 = der
+        return true
+    if idx == 1:
+        policy.trustRoot1 = der
+        return true
+    if idx == 2:
+        policy.trustRoot2 = der
+        return true
+    if idx == 3:
+        policy.trustRoot3 = der
+        return true
+    return false
+
+fn msquicTlsPolicySetServerName(policy: var MsQuicTlsPolicy, serverName: str) =
+    policy.serverName = serverName
+
+fn msquicTlsPolicySetAllowInsecure(policy: var MsQuicTlsPolicy, allow: bool) =
+    policy.allowInsecure = allow
+
+fn msquicTlsPolicyAddCert(policy: var MsQuicTlsPolicy, der: Bytes): Result[bool] =
+    if bytesLen(der) <= 0:
+        return Err[bool]("msquic tls policy: empty certificate")
+    if policy.certChainCount >= msQuicTlsMaxCerts:
+        return Err[bool]("msquic tls policy: certificate chain full")
+    let setOk: bool = msquicTlsPolicySetCertAt(policy, policy.certChainCount, der)
+    if ! setOk:
+        return Err[bool]("msquic tls policy: invalid certificate slot")
+    policy.certChainCount = policy.certChainCount + 1
+    return Ok[bool](true)
+
+fn msquicTlsPolicyAddTrustRoot(policy: var MsQuicTlsPolicy, der: Bytes): Result[bool] =
+    if bytesLen(der) <= 0:
+        return Err[bool]("msquic tls policy: empty trust root")
+    if policy.trustRootsCount >= msQuicTlsMaxCerts:
+        return Err[bool]("msquic tls policy: trust root list full")
+    let setOk: bool = msquicTlsPolicySetTrustRootAt(policy, policy.trustRootsCount, der)
+    if ! setOk:
+        return Err[bool]("msquic tls policy: invalid trust root slot")
+    policy.trustRootsCount = policy.trustRootsCount + 1
+    return Ok[bool](true)
+
+fn msquicTlsPolicyLeafDer(policy: MsQuicTlsPolicy): Result[Bytes] =
+    if policy.certChainCount <= 0 || bytesLen(policy.certChain0) <= 0:
+        return Err[Bytes]("msquic tls policy: leaf certificate missing")
+    return Ok[Bytes](policy.certChain0)
+
+fn msquicTlsPolicyTrustRoots(policy: MsQuicTlsPolicy): Result[X509CertList] =
+    var list: X509CertList = initX509CertList()
+    for i in 0..<policy.trustRootsCount:
+        let addRes: Result[bool] = x509CertListAddDer(list, msquicTlsPolicyTrustRootAt(policy, i))
+        if IsErr(addRes):
+            return Err[X509CertList](ErrorText(addRes))
+    return Ok[X509CertList](list)
+
+fn msquicTlsPolicyValidateForServer(policy: MsQuicTlsPolicy): Result[bool] =
+    if len(policy.serverName) <= 0:
+        return Err[bool]("msquic tls policy: serverName missing")
+    let leafRes: Result[Bytes] = msquicTlsPolicyLeafDer(policy)
+    if IsErr(leafRes):
+        return Err[bool](ErrorText(leafRes))
+    if bytesLen(policy.certPrivateKey) <= 0:
+        return Err[bool]("msquic tls policy: private key missing")
+    if policy.certLeafKeyKind == X509KeyUnknown:
+        return Err[bool]("msquic tls policy: leaf key kind missing")
+    return Ok[bool](true)
+
+fn msquicTlsPolicyValidateForClient(policy: MsQuicTlsPolicy): Result[bool] =
+    if policy.allowInsecure:
+        return Ok[bool](true)
+    if len(policy.serverName) <= 0:
+        return Err[bool]("msquic tls policy: serverName missing")
+    if policy.trustRootsCount <= 0:
+        return Err[bool]("msquic tls policy: trust roots missing")
+    return Ok[bool](true)

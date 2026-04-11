@@ -1,10 +1,7 @@
-import std/os
 import std/result
-import std/strings
-import std/strutils as strutil
+import cheng/v3/tooling/path as v3path
 import cheng/v3/lang/intern as langintern
 import cheng/v3/lang/parser
-import cheng/v3/ir/core_types as ir
 import cheng/v3/backend/system_link_plan as slplan
 
 type
@@ -25,28 +22,68 @@ type
         missingReasons: str[]
         pipelineStage: str
 
-fn v3LoweringFunctionNameFromLine(lineRaw: str): str =
-    let line = strutil.strip(lineRaw)
-    if !strutil.startsWith(line, "fn "):
-        return ""
-    let rest = strings.sliceBytes(line, len("fn "), len(line) - len("fn "))
+fn v3LoweringCallConvInternal(): int32 =
+    return 1
+
+fn v3LoweringLayoutKindInvalid(): int32 =
+    return 0
+
+fn v3LoweringLayoutKindI32(): int32 =
+    return 5
+
+fn v3LoweringAppendLine(out: var str, key: str, value: str) =
+    if len(out) > 0:
+        out = out + "\n"
+    out = out + key + "=" + value
+
+fn v3LoweringListText(items: str[]): str =
+    if items.len <= 0:
+        return "-"
+    var out = ""
+    for i in 0..<items.len:
+        if len(out) > 0:
+            out = out + ","
+        out = out + items[i]
+    return out
+
+fn v3LoweringIdentPrefix(text: str): str =
     var stop: int32 = 0
-    while stop < len(rest):
-        let ch = rest[stop]
-        if ch == '(' || ch == ' ' || ch == '\t':
+    for i in 0..<text.len:
+        let ch = text[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower || ch == '_':
+            stop = i + 1
+        else:
             break
-        stop = stop + 1
     if stop <= 0:
         return ""
-    return strings.sliceBytes(rest, 0, stop)
+    return v3path.v3TextSlice(text, 0, stop)
+
+fn v3LoweringFunctionNameFromLine(lineRaw: str): str =
+    let line = v3path.v3PathTrim(lineRaw)
+    if !v3path.v3TextStartsWith(line, "fn "):
+        return ""
+    let prefixLen = len("fn ")
+    let tailCount = len(line) - prefixLen
+    let tail = v3path.v3TextSlice(line, prefixLen, tailCount)
+    let firstToken = parser.v3ParserFirstToken(tail)
+    return v3LoweringIdentPrefix(firstToken)
 
 fn v3LoweringFunctionSymbolText(ownerModulePath: str, functionName: str): str =
     return ownerModulePath + "::" + functionName
 
-fn v3LoweringFunctionResultLayout(functionName: str): ir.V3TypeLayout =
+fn v3LoweringIsImportcAnnotation(lineRaw: str): bool =
+    let line = v3path.v3PathTrim(lineRaw)
+    if line == "":
+        return false
+    return v3path.v3TextStartsWith(line, "@importc")
+
+fn v3LoweringFunctionResultLayoutKind(functionName: str): int32 =
     if functionName == "main":
-        return ir.v3TypeLayoutScalar(ir.v3LayoutI32, 4, 4)
-    return ir.v3TypeLayoutInvalid()
+        return v3LoweringLayoutKindI32()
+    return v3LoweringLayoutKindInvalid()
 
 fn v3LoweringInternIdForSymbol(functionSymbolTexts: str[], functionNameIds: langintern.V3InternId[], symbolText: str): langintern.V3InternId =
     for i in 0..<functionNameIds.len:
@@ -59,39 +96,45 @@ fn v3LoweringCollectFunctionsFromSource(workspaceRoot: str,
                                         entryPath: str,
                                         entrySymbol: str,
                                         sourcePath: str,
-                                        functionSourcePaths: var str[],
-                                        functionOwnerModulePaths: var str[],
-                                        functionNames: var str[],
-                                        functionSymbolTexts: var str[],
-                                        functionNameIds: var langintern.V3InternId[],
-                                        functionEntryFlags: var int32[],
-                                        functionCallConvs: var int32[],
-                                        functionResultLayoutKinds: var int32[]): Result[bool] =
+                                        plan: var V3LoweringPlanStub): bool =
     if !parser.v3ParserSourceExists(sourcePath):
-        return Err[bool]("v3 lowering: source file missing: " + sourcePath)
+        return false
     let ownerModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
-    let lines = strutil.split(os.readFile(sourcePath), '\n')
+    let text = v3path.v3ReadTextFile("", sourcePath)
+    let lines = parser.v3ParserSplitChar(text, '\n')
+    var pendingImportc = false
     for i in 0..<lines.len:
-        let functionName = v3LoweringFunctionNameFromLine(lines[i])
+        let line = lines[i]
+        let trimmed = v3path.v3PathTrim(line)
+        if trimmed == "":
+            continue
+        if v3LoweringIsImportcAnnotation(trimmed):
+            pendingImportc = true
+            continue
+        let functionName = v3LoweringFunctionNameFromLine(line)
         if len(functionName) <= 0:
+            pendingImportc = false
+            continue
+        if pendingImportc:
+            pendingImportc = false
             continue
         let symbolText = v3LoweringFunctionSymbolText(ownerModulePath, functionName)
-        let layout = v3LoweringFunctionResultLayout(functionName)
-        let nameId = v3LoweringInternIdForSymbol(functionSymbolTexts, functionNameIds, symbolText)
-        add(functionSourcePaths, sourcePath)
-        add(functionOwnerModulePaths, ownerModulePath)
-        add(functionNames, functionName)
-        add(functionSymbolTexts, symbolText)
-        add(functionNameIds, nameId)
-        add(functionEntryFlags, sourcePath == entryPath && functionName == entrySymbol ? 1 : 0)
-        add(functionCallConvs, int32(ir.v3CallInternal))
-        add(functionResultLayoutKinds, int32(layout.kind))
-    return Ok[bool](true)
+        var entryFlag: int32 = 0
+        let callConv = v3LoweringCallConvInternal()
+        let resultLayoutKind = v3LoweringFunctionResultLayoutKind(functionName)
+        if sourcePath == entryPath && functionName == entrySymbol:
+            entryFlag = 1
+        add(plan.functionSourcePaths, sourcePath)
+        add(plan.functionOwnerModulePaths, ownerModulePath)
+        add(plan.functionNames, functionName)
+        add(plan.functionSymbolTexts, symbolText)
+        add(plan.functionEntryFlags, entryFlag)
+        add(plan.functionCallConvs, callConv)
+        add(plan.functionResultLayoutKinds, resultLayoutKind)
+    return true
 
 fn v3LoweringFunctionListText(functionSymbolTexts: str[]): str =
-    if functionSymbolTexts.len <= 0:
-        return "-"
-    return strutil.join(functionSymbolTexts, ",")
+    return v3LoweringListText(functionSymbolTexts)
 
 fn v3LoweringMissingReasons(functionNames: str[], functionEntryFlags: int32[], entrySymbol: str): str[] =
     var missing: str[] = []
@@ -107,62 +150,91 @@ fn v3LoweringMissingReasons(functionNames: str[], functionEntryFlags: int32[], e
             add(missing, "lowering_entry_function_missing")
     return missing
 
-fn v3BuildLoweringPlanStub(linkPlan: slplan.V3SystemLinkPlanStub): Result[V3LoweringPlanStub] =
-    var functionSourcePaths: str[]
-    var functionOwnerModulePaths: str[]
-    var functionNames: str[]
-    var functionSymbolTexts: str[]
-    var functionNameIds: langintern.V3InternId[]
-    var functionEntryFlags: int32[]
-    var functionCallConvs: int32[]
-    var functionResultLayoutKinds: int32[]
-    functionSourcePaths = []
-    functionOwnerModulePaths = []
-    functionNames = []
-    functionSymbolTexts = []
-    functionNameIds = []
-    functionEntryFlags = []
-    functionCallConvs = []
-    functionResultLayoutKinds = []
-    for i in 0..<linkPlan.sourceClosurePaths.len:
-        let collectRes = v3LoweringCollectFunctionsFromSource(linkPlan.workspaceRoot,
-                                                              linkPlan.packageRoot,
-                                                              linkPlan.entryPath,
-                                                              linkPlan.entrySymbol,
-                                                              linkPlan.sourceClosurePaths[i],
-                                                              functionSourcePaths,
-                                                              functionOwnerModulePaths,
-                                                              functionNames,
-                                                              functionSymbolTexts,
-                                                              functionNameIds,
-                                                              functionEntryFlags,
-                                                              functionCallConvs,
-                                                              functionResultLayoutKinds)
-        if IsErr(collectRes):
-            return Err[V3LoweringPlanStub](Error(collectRes))
-    return Ok[V3LoweringPlanStub](V3LoweringPlanStub(
-        workspaceRoot: linkPlan.workspaceRoot,
-        packageRoot: linkPlan.packageRoot,
-        packageId: linkPlan.packageId,
-        entryPath: linkPlan.entryPath,
-        entrySymbol: linkPlan.entrySymbol,
-        functionSourcePaths: functionSourcePaths,
-        functionOwnerModulePaths: functionOwnerModulePaths,
-        functionNames: functionNames,
-        functionSymbolTexts: functionSymbolTexts,
-        functionNameIds: functionNameIds,
-        functionEntryFlags: functionEntryFlags,
-        functionCallConvs: functionCallConvs,
-        functionResultLayoutKinds: functionResultLayoutKinds,
-        missingReasons: v3LoweringMissingReasons(functionNames, functionEntryFlags, linkPlan.entrySymbol),
-        pipelineStage: "system_link_plan_to_lowering_plan_stub"
-    ))
+fn v3LoweringSequentialNameIds(count: int32): langintern.V3InternId[] =
+    var out: langintern.V3InternId[]
+    out = []
+    for i in 0..<count:
+        add(out, i)
+    return out
+
+fn v3LoweringPlanFunctionSymbolTexts(plan: V3LoweringPlanStub): str[] =
+    return plan.functionSymbolTexts
+
+fn v3LoweringPlanFunctionNameIds(plan: V3LoweringPlanStub): langintern.V3InternId[] =
+    return plan.functionNameIds
+
+fn v3LoweringPlanFunctionNamesField(plan: V3LoweringPlanStub): str[] =
+    return plan.functionNames
+
+fn v3LoweringPlanFunctionEntryFlagsField(plan: V3LoweringPlanStub): int32[] =
+    return plan.functionEntryFlags
+
+fn v3LoweringPlanMissingReasonsField(plan: V3LoweringPlanStub): str[] =
+    return plan.missingReasons
+
+fn v3LoweringPlanPipelineStage(plan: V3LoweringPlanStub): str =
+    return plan.pipelineStage
+
+fn v3BuildLoweringPlanStub(linkPlan: slplan.V3SystemLinkPlanStub,
+                           plan: var V3LoweringPlanStub,
+                           err: var str): bool =
+    plan.functionSourcePaths = []
+    plan.functionOwnerModulePaths = []
+    plan.functionNames = []
+    plan.functionSymbolTexts = []
+    plan.functionNameIds = []
+    plan.functionEntryFlags = []
+    plan.functionCallConvs = []
+    plan.functionResultLayoutKinds = []
+    let workspaceRoot = slplan.v3SystemLinkPlanWorkspaceRoot(linkPlan)
+    let packageRoot = slplan.v3SystemLinkPlanPackageRoot(linkPlan)
+    let packageId = slplan.v3SystemLinkPlanPackageId(linkPlan)
+    let entryPath = slplan.v3SystemLinkPlanEntryPath(linkPlan)
+    let entrySymbol = slplan.v3SystemLinkPlanEntrySymbol(linkPlan)
+    let sourceClosurePaths = slplan.v3SystemLinkPlanSourceClosurePaths(linkPlan)
+    let sourceClosureCount = sourceClosurePaths.len
+    var i: int32 = 0
+    while i < sourceClosureCount:
+        let sourcePath = sourceClosurePaths[i]
+        if !v3LoweringCollectFunctionsFromSource(workspaceRoot,
+                                                 packageRoot,
+                                                 entryPath,
+                                                 entrySymbol,
+                                                 sourcePath,
+                                                 plan):
+            err = "v3 lowering: source file missing"
+            return false
+        i = i + 1
+    let functionSymbolTexts = v3LoweringPlanFunctionSymbolTexts(plan)
+    let functionNameIds = v3LoweringSequentialNameIds(functionSymbolTexts.len)
+    plan.functionNameIds = functionNameIds
+    let functionNames = v3LoweringPlanFunctionNamesField(plan)
+    let functionEntryFlags = v3LoweringPlanFunctionEntryFlagsField(plan)
+    let missingReasons = v3LoweringMissingReasons(functionNames, functionEntryFlags, entrySymbol)
+    plan.workspaceRoot = workspaceRoot
+    plan.packageRoot = packageRoot
+    plan.packageId = packageId
+    plan.entryPath = entryPath
+    plan.entrySymbol = entrySymbol
+    plan.missingReasons = missingReasons
+    plan.pipelineStage = "system_link_plan_to_lowering_plan_stub"
+    err = ""
+    return true
 
 fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
-    return (
-        "lowering_function_count=" + intToStr(plan.functionNames.len) + "\n" +
-        "lowering_functions=" + v3LoweringFunctionListText(plan.functionSymbolTexts) + "\n" +
-        "lowering_entry_function=" + (len(plan.entrySymbol) > 0 ? plan.entrySymbol : "-") + "\n" +
-        "lowering_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.missingReasons) + "\n" +
-        "exec_pipeline_stage=" + plan.pipelineStage
-    )
+    var out: str = ""
+    var entryFunction = plan.entrySymbol
+    let functionCount = intToStr(plan.functionNames.len)
+    let functionTexts = v3LoweringPlanFunctionSymbolTexts(plan)
+    let functionList = v3LoweringFunctionListText(functionTexts)
+    let missingField = v3LoweringPlanMissingReasonsField(plan)
+    let missingReasons = slplan.v3SystemLinkPlanListText(missingField)
+    let pipelineStage = v3LoweringPlanPipelineStage(plan)
+    if len(entryFunction) <= 0:
+        entryFunction = "-"
+    v3LoweringAppendLine(out, "lowering_function_count", functionCount)
+    v3LoweringAppendLine(out, "lowering_functions", functionList)
+    v3LoweringAppendLine(out, "lowering_entry_function", entryFunction)
+    v3LoweringAppendLine(out, "lowering_missing_reasons", missingReasons)
+    v3LoweringAppendLine(out, "exec_pipeline_stage", pipelineStage)
+    return out

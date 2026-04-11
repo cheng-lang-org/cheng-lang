@@ -1,5 +1,4 @@
 import std/system
-import std/result
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/consensus
 
@@ -7,23 +6,43 @@ fn main(): int32 =
     var index = consensus.v3ChainIndexZero()
     let zeroCid = layout.fixedBytes32Zero()
 
-    let mint = consensus.v3ChainEventMint(7, 1001, zeroCid, int64(100), 1, 13, 1, int64(10))
+    var mint = consensus.v3ChainEventMint(7, 1001, zeroCid, int64(100), 1, 13, 1, int64(10))
     let mintCid = consensus.v3ChainEventCid(mint)
-    let transfer = consensus.v3ChainEventTransferCommit(7, 1001, 2002, mintCid, zeroCid, int64(40), 1, 14, 1, int64(11))
+    var transfer: consensus.V3ChainEvent
+    transfer.version = 1
+    transfer.kind = consensus.v3ConsensusKindTransferCommit
+    transfer.assetId = 7
+    transfer.fromAccount = 1001
+    transfer.toAccount = 2002
+    transfer.fromParentCid = mintCid
+    transfer.toParentCid = zeroCid
+    transfer.amount = int64(40)
+    transfer.epoch = 1
+    transfer.ganzhiIndex = 14
+    transfer.spaceSlot = 1
+    transfer.tick = int64(11)
+    transfer.stem = transfer.ganzhiIndex % 10
+    transfer.branch = transfer.ganzhiIndex % 12
+    transfer.bodyCid = consensus.v3ChainEventBodyCid(transfer)
     let transferCid = consensus.v3ChainEventCid(transfer)
 
-    let decisions = consensus.v3ConsensusApplyBatch(index,
-                                                    [transferCid, mintCid],
-                                                    [transfer, mint],
-                                                    0)
-    assert(decisions.len == 2, "v3 consensus smoke: two decisions")
+    var mintDecision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(index, mint, mintCid, 0, mintDecision)
+    assert(mintDecision.accepted, "v3 consensus smoke: mint accepted")
+    assert(mintDecision.applied, "v3 consensus smoke: mint applied")
+    assert(index.accountIds.len == 1, "v3 consensus smoke: mint created one account")
+    var transferDecision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(index, transfer, transferCid, 1, transferDecision)
+    assert(transferDecision.accepted, "v3 consensus smoke: transfer accepted")
+    assert(transferDecision.applied, "v3 consensus smoke: transfer applied")
+    assert(transferDecision.fromAccountId == 1001, "v3 consensus smoke: decision sender")
+    assert(transferDecision.toAccountId == 2002, "v3 consensus smoke: decision receiver")
     assert(index.accountIds.len == 2, "v3 consensus smoke: two accounts")
     assert(index.balances[consensus.v3ConsensusAccountPos(index, 7, 1001)] == int64(60), "v3 consensus smoke: sender balance")
     assert(index.balances[consensus.v3ConsensusAccountPos(index, 7, 2002)] == int64(40), "v3 consensus smoke: receiver balance")
 
-    let duplicateRes = consensus.v3ConsensusApply(index, mint, mintCid, 10)
-    assert(IsOk(duplicateRes), "v3 consensus smoke: duplicate apply")
-    let duplicate = Value(duplicateRes)
+    var duplicate = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(index, mint, mintCid, 10, duplicate)
     assert(duplicate.accepted, "v3 consensus smoke: duplicate accepted")
     assert(!duplicate.applied, "v3 consensus smoke: duplicate not applied")
 

@@ -1,0 +1,81 @@
+import std/system
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+import cheng/v3/chain/binary_types as binary
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/overlay/libp2p_bridge as bridge
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/host/host
+import cheng/v3/libp2p/host/host_quic
+import cheng/v3/libp2p/transports/quic_transport
+
+fn smokeQuicAddress(): binary.V3LsmrAddress =
+    var out: binary.V3LsmrAddress
+    out.depth = 2
+    out.digits[0] = 2
+    out.digits[1] = 6
+    return out
+
+fn smokeQuicBytes(text: str): Bytes =
+    var out: Bytes
+    out.data = strDataPtr(text)
+    out.len = len(text)
+    return out
+
+fn main(): int32 =
+    var server = host.v3Libp2pHostInit("quic.server")
+    var client = host.v3Libp2pHostInit("quic.client")
+    let address = smokeQuicAddress()
+    let payload = smokeQuicBytes("v3.libp2p.quic.payload")
+    let payloadCid = hash256.sha256Fixed(layout.byteSpanFromBytes(payload))
+    let sourcePeer = peer_id.v3Libp2pPeerIdFromSeed("quic.source")
+
+    var ingress: overlay.V3IngressEnvelope
+    ingress.sourcePeerId = sourcePeer.value
+    ingress.topicScope = overlay.v3OverlayScopeRegion
+    ingress.address = address
+    ingress.payload = payload
+    ingress.payloadCid = payloadCid
+    ingress.payloadLen = bytesLen(payload)
+    ingress.stampEpoch = 17
+    ingress.stampGanzhi = 33
+    bridge.v3Libp2pRelayPublish(server, ingress)
+
+    var listenAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillQuic(listenAddr, "127.0.0.1", 6208)
+    assert(quic_transport.v3Libp2pQuicTransportSupportsAddr(listenAddr),
+        "v3 libp2p quic tls: supports addr")
+    let listenRes = host.v3Libp2pListen(server, listenAddr)
+    assert(listenRes.ok, "v3 libp2p quic tls: listen")
+    host.v3Libp2pRegisterHandler(server, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(client, types.v3Libp2pProtocolSync)
+    let dialRes = host.v3Libp2pDial(client,
+                                    server.selfPeerId,
+                                    listenAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 libp2p quic tls: dial")
+
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.topicScope = overlay.v3OverlayScopeRegion
+    query.address = address
+    query.rangeLimit = 4
+    let syncRes = host_quic.v3Libp2pSyncRequest(client, server, server.selfPeerId, query)
+    assert(syncRes.ok, "v3 libp2p quic tls: sync request")
+    assert(syncRes.value.len == 1, "v3 libp2p quic tls: sync count")
+    let synced = syncRes.value[0]
+    assert(layout.fixedBytes32Equal(synced.payloadCid, payloadCid),
+        "v3 libp2p quic tls: payload cid")
+    assert(synced.payloadLen == bytesLen(payload),
+        "v3 libp2p quic tls: payload len")
+    assert(bytesLen(synced.payload) == bytesLen(payload),
+        "v3 libp2p quic tls: raw payload len")
+    assert(bytesGet(synced.payload, 0) == int32('v'),
+        "v3 libp2p quic tls: raw payload head")
+    assert(client.syncRequestCount == 1, "v3 libp2p quic tls: request count")
+    assert(server.syncServeCount == 1, "v3 libp2p quic tls: serve count")
+
+    echo("v3 libp2p_quic_tls_smoke ok")
+    return 0

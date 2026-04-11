@@ -1,0 +1,87 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/consensus
+
+type
+    MiniNode =
+        index: consensus.V3ChainIndex
+        eventCids: layout.FixedBytes32[]
+        events: consensus.V3ChainEvent[]
+
+fn miniNodeZero(): MiniNode =
+    var eventCids: layout.FixedBytes32[]
+    var events: consensus.V3ChainEvent[]
+    eventCids = []
+    events = []
+    return MiniNode(
+        index: consensus.v3ChainIndexZero(),
+        eventCids: eventCids,
+        events: events
+    )
+
+fn miniMintEvent(): consensus.V3ChainEvent =
+    return consensus.v3ChainEventMint(
+        7,
+        1001,
+        layout.fixedBytes32Zero(),
+        int64(100),
+        1,
+        1,
+        1,
+        int64(1)
+    )
+
+fn miniApplyValue(node: var MiniNode, event: consensus.V3ChainEvent): Result[layout.FixedBytes32] =
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = node.index
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, node.eventCids.len, decision)
+    node.index = nextIndex
+    if !decision.accepted:
+        return Err[layout.FixedBytes32]("mini apply value rejected")
+    if decision.applied:
+        add(node.eventCids, eventCid)
+        add(node.events, event)
+    return Ok[layout.FixedBytes32](eventCid)
+
+fn miniApplyVar(node: var MiniNode, event: var consensus.V3ChainEvent): Result[layout.FixedBytes32] =
+    let eventCid = consensus.v3ChainEventCid(event)
+    var nextIndex = node.index
+    var decision = consensus.v3ConsensusDecisionZero()
+    consensus.v3ConsensusApplyChecked(nextIndex, event, eventCid, node.eventCids.len, decision)
+    node.index = nextIndex
+    if !decision.accepted:
+        return Err[layout.FixedBytes32]("mini apply var rejected")
+    if decision.applied:
+        add(node.eventCids, eventCid)
+        add(node.events, event)
+    return Ok[layout.FixedBytes32](eventCid)
+
+fn miniMintWrapperValue(node: var MiniNode): Result[layout.FixedBytes32] =
+    let event = miniMintEvent()
+    return miniApplyValue(node, event)
+
+fn miniMintWrapperVar(node: var MiniNode): Result[layout.FixedBytes32] =
+    var event = miniMintEvent()
+    return miniApplyVar(node, event)
+
+fn miniMintWrapperVarStore(node: var MiniNode): Result[layout.FixedBytes32] =
+    var event = miniMintEvent()
+    let out = miniApplyVar(node, event)
+    return out
+
+fn main(): int32 =
+    var wrapperVarStore: MiniNode
+    wrapperVarStore = miniNodeZero()
+    let wrapperVarStoreRes = miniMintWrapperVarStore(wrapperVarStore)
+    assert(wrapperVarStoreRes.ok, "wrapper result forward varparam: ok")
+    assert(wrapperVarStore.eventCids.len == 1, "wrapper result forward varparam: cid len")
+    assert(wrapperVarStore.events.len == 1, "wrapper result forward varparam: event len")
+    assert(wrapperVarStore.index.accountIds.len == 1, "wrapper result forward varparam: account len")
+    assert(wrapperVarStore.index.balances.len == 1, "wrapper result forward varparam: balance len")
+    assert(wrapperVarStore.events[0].kind == consensus.v3ConsensusKindMint,
+           "wrapper result forward varparam: event kind")
+    assert(layout.fixedBytes32Equal(wrapperVarStore.eventCids[0], wrapperVarStoreRes.value),
+           "wrapper result forward varparam: event cid")
+    echo("v3 wrapper_result_forward_varparam_smoke ok")
+    return 0

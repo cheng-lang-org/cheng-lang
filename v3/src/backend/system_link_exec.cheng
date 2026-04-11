@@ -8,6 +8,7 @@ import cheng/v3/backend/object_plan as objplan
 import cheng/v3/backend/native_link_plan as nplan
 import cheng/v3/runtime/core_runtime_v3 as corun
 import cheng/v3/runtime/compiler_runtime_v3 as comprun
+import cheng/v3/runtime/program_support_v3 as prosup
 
 type
     V3SystemLinkExecPlan =
@@ -34,21 +35,26 @@ fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub)
             let contract = comprun.v3CompilerRuntimeContract(rootDir, track)
             for j in 0..<contract.providerNativeSources.len:
                 add(out, contract.providerNativeSources[j])
+        elif modulePath == "runtime/program_support_v3":
+            let contract = prosup.v3ProgramSupportContract(rootDir)
+            for j in 0..<contract.providerNativeSources.len:
+                add(out, contract.providerNativeSources[j])
         else
             return Err[str[]]("v3 provider source: unsupported module " + modulePath)
     return Ok[str[]](out)
 
 fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[V3SystemLinkExecPlan] =
-    let linkPlanRes = slplan.v3BuildSystemLinkPlanStub(rootDir, req)
-    if IsErr(linkPlanRes):
-        return Err[V3SystemLinkExecPlan](Error(linkPlanRes))
-    let loweringRes = lower.v3BuildLoweringPlanStub(Value(linkPlanRes))
-    if IsErr(loweringRes):
-        return Err[V3SystemLinkExecPlan](Error(loweringRes))
-    let primaryRes = pobj.v3BuildPrimaryObjectPlan(Value(linkPlanRes), Value(loweringRes))
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
+        return Err[V3SystemLinkExecPlan](err)
+    var loweringPlan: lower.V3LoweringPlanStub
+    if !lower.v3BuildLoweringPlanStub(linkPlan, loweringPlan, err):
+        return Err[V3SystemLinkExecPlan](err)
+    let primaryRes = pobj.v3BuildPrimaryObjectPlan(linkPlan, loweringPlan)
     if IsErr(primaryRes):
         return Err[V3SystemLinkExecPlan](Error(primaryRes))
-    let providerSourcesRes = v3ProviderSourcesForPlan(rootDir, Value(linkPlanRes))
+    let providerSourcesRes = v3ProviderSourcesForPlan(rootDir, linkPlan)
     if IsErr(providerSourcesRes):
         return Err[V3SystemLinkExecPlan](Error(providerSourcesRes))
     var providerObjectPaths: str[]
@@ -61,8 +67,6 @@ fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[
     objectMissing = []
     nativeMissing = []
     providerSourcePaths = []
-    let linkPlan = Value(linkPlanRes)
-    let loweringPlan = Value(loweringRes)
     let primaryPlan = Value(primaryRes)
     providerSourcePaths = Value(providerSourcesRes)
     let primaryObjectPath = primaryPlan.outputPath

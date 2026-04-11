@@ -1,0 +1,74 @@
+# MsQuic core flow control model(pure Cheng, in-process).
+
+import std/result
+import cheng/v3/quic/core/common
+type
+    MsQuicFlowControl =
+        maxData: int64
+        usedData: int64
+        maxStreamData: int64
+        usedStreamData: int64
+        blocked: bool
+
+fn initMsQuicFlowControlInto(out: var MsQuicFlowControl, maxData: int64, maxStreamData: int64) =
+    let md: int64 = if maxData < 0: 0 else: maxData
+    let msd: int64 = if maxStreamData < 0: 0 else: maxStreamData
+    out.maxData = md
+    out.usedData = 0
+    out.maxStreamData = msd
+    out.usedStreamData = 0
+    out.blocked = false
+
+fn initMsQuicFlowControl(maxData: int64, maxStreamData: int64): MsQuicFlowControl =
+    var out: MsQuicFlowControl
+    initMsQuicFlowControlInto(out, maxData, maxStreamData)
+    return out
+
+fn msquicFlowControlConnAvailable(fc: MsQuicFlowControl): int64 =
+    let avail: int64 = fc.maxData - fc.usedData
+    if avail < 0:
+        return 0
+    return avail
+
+fn msquicFlowControlStreamAvailable(fc: MsQuicFlowControl): int64 =
+    let avail: int64 = fc.maxStreamData - fc.usedStreamData
+    if avail < 0:
+        return 0
+    return avail
+
+fn msquicFlowControlConsumeConn(fc: var MsQuicFlowControl, count: int64): Result[bool] =
+    if count <= 0:
+        return Ok[bool](false)
+    let avail: int64 = msquicFlowControlConnAvailable(fc)
+    if count > avail:
+        fc.blocked = true
+        return Err[bool]("msquic flow: connection window exceeded")
+    fc.usedData = fc.usedData + count
+    fc.blocked = false
+    return Ok[bool](true)
+
+fn msquicFlowControlConsumeStream(fc: var MsQuicFlowControl, count: int64): Result[bool] =
+    if count <= 0:
+        return Ok[bool](false)
+    let avail: int64 = msquicFlowControlStreamAvailable(fc)
+    if count > avail:
+        fc.blocked = true
+        return Err[bool]("msquic flow: stream window exceeded")
+    fc.usedStreamData = fc.usedStreamData + count
+    fc.blocked = false
+    return Ok[bool](true)
+
+fn msquicFlowControlCreditConn(fc: var MsQuicFlowControl, credit: int64) =
+    if credit <= 0:
+        return
+    fc.maxData = fc.maxData + credit
+    fc.blocked = false
+
+fn msquicFlowControlCreditStream(fc: var MsQuicFlowControl, credit: int64) =
+    if credit <= 0:
+        return
+    fc.maxStreamData = fc.maxStreamData + credit
+    fc.blocked = false
+
+fn msquicFlowControlBlocked(fc: MsQuicFlowControl): bool =
+    return fc.blocked

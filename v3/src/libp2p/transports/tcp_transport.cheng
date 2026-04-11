@@ -1,0 +1,101 @@
+import std/result
+import std/rawbytes
+import cheng/v3/libp2p/core/multistream
+import cheng/v3/libp2p/core/types
+
+importc fn cheng_v3_tcp_loopback_payload_bridge(protocolText: str, payloadWire: str, responseWire: var str, errWire: var str): int32
+importc fn cheng_v3_tcp_loopback_request_response_bridge(protocolText: str, requestWire: str, responseWire: str, clientResponseWire: var str, errWire: var str): int32
+importc fn cheng_v3_tcp_serve_payload_once_bridge(hostText: str, port: int32, protocolText: str, payloadWire: str, readyPath: str, errWire: var str): int32
+importc fn cheng_v3_tcp_recv_payload_once_bridge(hostText: str, port: int32, protocolText: str, responseWire: var str, errWire: var str): int32
+
+type
+    V3Libp2pTcpTransportConfig =
+        secure: types.V3Libp2pSecureKind
+        mux: types.V3Libp2pMuxKind
+
+fn v3Libp2pTcpTransportConfigDefault(): V3Libp2pTcpTransportConfig =
+    return V3Libp2pTcpTransportConfig(
+        secure: types.v3Libp2pSecureNoise,
+        mux: types.v3Libp2pMuxYamux
+    )
+
+fn v3Libp2pTcpTransportSupportsAddr(addr: types.V3Libp2pMultiaddr): bool =
+    return addr.transport == types.v3Libp2pTransportTcp &&
+        addr.secure == types.v3Libp2pSecureNoise &&
+        addr.mux == types.v3Libp2pMuxYamux
+
+fn v3Libp2pTcpLoopbackRoundtrip(protocol: types.V3Libp2pProtocolId,
+                                payload: Bytes): Result[Bytes] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    var responseWire = ""
+    var errWire = ""
+    let ok: int32 = cheng_v3_tcp_loopback_payload_bridge(bytesToString(selectBytes),
+                                                         bytesToString(payload),
+                                                         responseWire,
+                                                         errWire)
+    if ok == 0:
+        if errWire == "":
+            return Err[Bytes]("v3 libp2p tcp: loopback payload bridge failed")
+        return Err[Bytes](errWire)
+    return Ok[Bytes](bytesFromString(responseWire))
+
+fn v3Libp2pTcpLoopbackMultistream(protocol: types.V3Libp2pProtocolId): Result[bool] =
+    let roundtripRes = v3Libp2pTcpLoopbackRoundtrip(protocol, emptyBytes())
+    if IsErr(roundtripRes):
+        return Err[bool](Error(roundtripRes))
+    if bytesLen(Value(roundtripRes)) != 0:
+        return Err[bool]("v3 libp2p tcp: unexpected loopback payload")
+    return Ok[bool](true)
+
+fn v3Libp2pTcpLoopbackRequestResponse(protocol: types.V3Libp2pProtocolId,
+                                      requestPayload: Bytes,
+                                      responsePayload: Bytes): Result[Bytes] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    var clientResponseWire = ""
+    var errWire = ""
+    let ok: int32 = cheng_v3_tcp_loopback_request_response_bridge(bytesToString(selectBytes),
+                                                                  bytesToString(requestPayload),
+                                                                  bytesToString(responsePayload),
+                                                                  clientResponseWire,
+                                                                  errWire)
+    if ok == 0:
+        if errWire == "":
+            return Err[Bytes]("v3 libp2p tcp: loopback request-response bridge failed")
+        return Err[Bytes](errWire)
+    return Ok[Bytes](bytesFromString(clientResponseWire))
+
+fn v3Libp2pTcpServePayloadOnce(host: str,
+                               port: int32,
+                               protocol: types.V3Libp2pProtocolId,
+                               payload: Bytes,
+                               readyPath: str): Result[bool] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    var errWire = ""
+    let ok: int32 = cheng_v3_tcp_serve_payload_once_bridge(host,
+                                                           port,
+                                                           bytesToString(selectBytes),
+                                                           bytesToString(payload),
+                                                           readyPath,
+                                                           errWire)
+    if ok == 0:
+        if errWire == "":
+            return Err[bool]("v3 libp2p tcp: serve payload bridge failed")
+        return Err[bool](errWire)
+    return Ok[bool](true)
+
+fn v3Libp2pTcpRecvPayloadOnce(host: str,
+                              port: int32,
+                              protocol: types.V3Libp2pProtocolId): Result[Bytes] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    var responseWire = ""
+    var errWire = ""
+    let ok: int32 = cheng_v3_tcp_recv_payload_once_bridge(host,
+                                                          port,
+                                                          bytesToString(selectBytes),
+                                                          responseWire,
+                                                          errWire)
+    if ok == 0:
+        if errWire == "":
+            return Err[Bytes]("v3 libp2p tcp: recv payload bridge failed")
+        return Err[Bytes](errWire)
+    return Ok[Bytes](bytesFromString(responseWire))

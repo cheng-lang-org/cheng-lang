@@ -1,0 +1,97 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/std/crypto/hash256
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/host/host
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+
+fn main(): int32 =
+    let listenPort = 6201
+    var server = node.v3ChainNodeInit("node-a", "chain-node-a")
+    var client = node.v3ChainNodeInit("node-b", "chain-node-a")
+    var serverHost = host.v3Libp2pHostInit("chain.server")
+    var clientHost = host.v3Libp2pHostInit("chain.client")
+    var serverAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(serverAddr, "127.0.0.1", listenPort)
+    let listenRes = host.v3Libp2pListen(serverHost, serverAddr)
+    assert(listenRes.ok, "v3 chain_node libp2p: listen")
+
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolGossipsub)
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolStore)
+    host.v3Libp2pRegisterHandler(serverHost, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolGossipsub)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolStore)
+    host.v3Libp2pRegisterHandler(clientHost, types.v3Libp2pProtocolSync)
+
+    let dialRes = host.v3Libp2pDial(clientHost,
+                                    serverHost.selfPeerId,
+                                    serverAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(dialRes.ok, "v3 chain_node libp2p: dial")
+
+    let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
+    assert(mintCidRes.ok, "v3 chain_node libp2p: mint")
+    let transferCidRes = node.v3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
+    assert(transferCidRes.ok, "v3 chain_node libp2p: transfer")
+    assert(!layout.fixedBytes32Equal(mintCidRes.value, transferCidRes.value),
+        "v3 chain_node libp2p: distinct cids")
+
+    let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
+    assert(serveRes.ok, "v3 chain_node libp2p: serve once")
+    assert(serveRes.value, "v3 chain_node libp2p: serve active")
+    assert(serverHost.publishLog.len == 1, "v3 chain_node libp2p: advertise published")
+    assert(serverHost.storeEntries.len == 2, "v3 chain_node libp2p: advertise plus snapshot stored")
+
+    let latestSnapshotRes = net.v3ChainNodeLibp2pLatestSnapshot(serverHost, client.address)
+    assert(latestSnapshotRes.ok, "v3 chain_node libp2p: latest snapshot")
+    assert(latestSnapshotRes.value.payloadLen == bytesLen(latestSnapshotRes.value.payload),
+        "v3 chain_node libp2p: snapshot payload len")
+    assert(layout.fixedBytes32Equal(latestSnapshotRes.value.payloadCid,
+                                    hash256.sha256Fixed(layout.byteSpanFromBytes(latestSnapshotRes.value.payload))),
+        "v3 chain_node libp2p: snapshot payload cid")
+    assert(bytesLen(latestSnapshotRes.value.payload) >= 33,
+        "v3 chain_node libp2p: snapshot raw payload len")
+    assert(bytesGet(latestSnapshotRes.value.payload, 0) == int32('v'),
+        "v3 chain_node libp2p: snapshot raw payload head")
+    let decodedSnapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(latestSnapshotRes.value.payload)
+    assert(decodedSnapshotRes.ok, "v3 chain_node libp2p: decode snapshot")
+    let dryRunSyncRes = node.v3ChainNodeSyncOnce(client, decodedSnapshotRes.value)
+    assert(dryRunSyncRes.ok, "v3 chain_node libp2p: dry sync")
+    assert(dryRunSyncRes.value, "v3 chain_node libp2p: dry sync changed")
+
+    client = node.v3ChainNodeInit("node-b", "chain-node-a")
+    let syncRes = net.v3ChainNodeLibp2pSyncOnce(client, clientHost, serverHost, serverHost.selfPeerId)
+    assert(syncRes.ok, "v3 chain_node libp2p: sync once")
+    assert(syncRes.value, "v3 chain_node libp2p: sync changed")
+    assert(clientHost.openStreamPeers.len == 1, "v3 chain_node libp2p: opened sync stream")
+    assert(clientHost.syncRequestCount == 1, "v3 chain_node libp2p: sync request count")
+    assert(serverHost.syncServeCount == 1, "v3 chain_node libp2p: sync serve count")
+
+    let aliceRes = node.v3ChainNodeBalance(client, 7, 1001)
+    let bobRes = node.v3ChainNodeBalance(client, 7, 2002)
+    assert(aliceRes.ok, "v3 chain_node libp2p: alice balance")
+    assert(bobRes.ok, "v3 chain_node libp2p: bob balance")
+    assert(aliceRes.value == int64(60), "v3 chain_node libp2p: alice 60")
+    assert(bobRes.value == int64(40), "v3 chain_node libp2p: bob 40")
+
+    let serverServed = node.v3ChainNodeServeOnce(server)
+    let clientServed = node.v3ChainNodeServeOnce(client)
+    assert(layout.fixedBytes32Equal(serverServed.tipEventCid, clientServed.tipEventCid),
+        "v3 chain_node libp2p: tip cid")
+    assert(layout.fixedBytes32Equal(serverServed.forest.forestCid, clientServed.forest.forestCid),
+        "v3 chain_node libp2p: forest cid")
+    assert(anti.v3AntiEntropySignatureEqual(serverServed.signature, clientServed.signature),
+        "v3 chain_node libp2p: signature")
+
+    let syncAgainRes = net.v3ChainNodeLibp2pSyncOnce(client, clientHost, serverHost, serverHost.selfPeerId)
+    assert(syncAgainRes.ok, "v3 chain_node libp2p: sync again")
+    assert(!syncAgainRes.value, "v3 chain_node libp2p: second sync idle")
+    assert(clientHost.syncRequestCount == 2, "v3 chain_node libp2p: second sync request count")
+    assert(serverHost.syncServeCount == 2, "v3 chain_node libp2p: second sync serve count")
+
+    echo("v3 chain_node_libp2p_smoke ok")
+    return 0

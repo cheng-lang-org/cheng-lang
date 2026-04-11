@@ -1,0 +1,497 @@
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+
+const
+    v3RwadSerialVersion: int32 = 1
+    v3RwadSerialCodeOk: int32 = 0
+    v3RwadSerialCodeBadHeight: int32 = 1
+    v3RwadSerialCodeBadOwner: int32 = 2
+    v3RwadSerialCodeBadAmount: int32 = 3
+    v3RwadSerialCodeBadNote: int32 = 4
+    v3RwadSerialCodeBadRange: int32 = 5
+    v3RwadSerialCodeAlreadySpent: int32 = 6
+    v3RwadSerialCodeOwnerMismatch: int32 = 7
+    v3RwadSerialCodeBadTarget: int32 = 8
+    v3RwadSerialCodeSerialOverflow: int32 = 9
+    v3RwadSerialMaxValue: int64 = 9223372036854775807
+
+type
+    V3RwadIntervalNote =
+        noteId: int64
+        startSerial: int64
+        endSerial: int64
+        ownerId: layout.FixedBytes32
+        createdHeight: int64
+        live: bool
+
+    V3RwadNullifier =
+        noteId: int64
+        nullifierCid: layout.FixedBytes32
+        spendHeight: int64
+
+    V3RwadMintTx =
+        ownerId: layout.FixedBytes32
+        amount: int64
+
+    V3RwadTransferTx =
+        inputNoteId: int64
+        fromOwner: layout.FixedBytes32
+        toOwner: layout.FixedBytes32
+        spendStart: int64
+        spendEnd: int64
+
+    V3RwadApplyResult =
+        code: int32
+        accepted: bool
+        applied: bool
+        spentNullifier: layout.FixedBytes32
+        primaryNoteId: int64
+        secondaryNoteId: int64
+        tertiaryNoteId: int64
+        appHash: layout.FixedBytes32
+
+    V3RwadOwnerQueryResult =
+        code: int32
+        balance: int64
+        liveNoteCount: int32
+        ownerRoot: layout.FixedBytes32
+        appHash: layout.FixedBytes32
+        height: int64
+
+    V3RwadCommitSummary =
+        height: int64
+        nextSerial: int64
+        nextNoteId: int64
+        liveNoteCount: int32
+        nullifierCount: int32
+        serialRoot: layout.FixedBytes32
+        nullifierRoot: layout.FixedBytes32
+        appHash: layout.FixedBytes32
+
+    V3RwadStateMachine =
+        appId: str
+        nextSerial: int64
+        nextNoteId: int64
+        lastFinalizedHeight: int64
+        lastApplyOrderKey: int64
+        notes: V3RwadIntervalNote[]
+        nullifiers: V3RwadNullifier[]
+        lastCommitAppHash: layout.FixedBytes32
+
+fn v3RwadOwnerIdFromText(text: str): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.owner"))
+    layout.byteBufAppendBytes(buf, bytesFromString(text))
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadApplyResultZero(): V3RwadApplyResult =
+    var out: V3RwadApplyResult
+    out.code = v3RwadSerialCodeOk
+    out.accepted = false
+    out.applied = false
+    out.spentNullifier = layout.fixedBytes32Zero()
+    out.primaryNoteId = int64(0)
+    out.secondaryNoteId = int64(0)
+    out.tertiaryNoteId = int64(0)
+    out.appHash = layout.fixedBytes32Zero()
+    return out
+
+fn v3RwadOwnerQueryResultZero(): V3RwadOwnerQueryResult =
+    var out: V3RwadOwnerQueryResult
+    out.code = v3RwadSerialCodeOk
+    out.balance = int64(0)
+    out.liveNoteCount = 0
+    out.ownerRoot = layout.fixedBytes32Zero()
+    out.appHash = layout.fixedBytes32Zero()
+    out.height = int64(0)
+    return out
+
+fn v3RwadCommitSummaryZero(): V3RwadCommitSummary =
+    var out: V3RwadCommitSummary
+    out.height = int64(0)
+    out.nextSerial = int64(1)
+    out.nextNoteId = int64(1)
+    out.liveNoteCount = 0
+    out.nullifierCount = 0
+    out.serialRoot = layout.fixedBytes32Zero()
+    out.nullifierRoot = layout.fixedBytes32Zero()
+    out.appHash = layout.fixedBytes32Zero()
+    return out
+
+fn v3RwadMintTxMake(ownerId: layout.FixedBytes32, amount: int64): V3RwadMintTx =
+    var out: V3RwadMintTx
+    out.ownerId = ownerId
+    out.amount = amount
+    return out
+
+fn v3RwadTransferTxMake(inputNoteId: int64,
+                        fromOwner: layout.FixedBytes32,
+                        toOwner: layout.FixedBytes32,
+                        spendStart: int64,
+                        spendEnd: int64): V3RwadTransferTx =
+    var out: V3RwadTransferTx
+    out.inputNoteId = inputNoteId
+    out.fromOwner = fromOwner
+    out.toOwner = toOwner
+    out.spendStart = spendStart
+    out.spendEnd = spendEnd
+    return out
+
+fn v3RwadStateMachineInit(appId: str): V3RwadStateMachine =
+    var notes: V3RwadIntervalNote[]
+    var nullifiers: V3RwadNullifier[]
+    notes = []
+    nullifiers = []
+    var out: V3RwadStateMachine
+    out.appId = appId
+    out.nextSerial = int64(1)
+    out.nextNoteId = int64(1)
+    out.lastFinalizedHeight = int64(0)
+    out.lastApplyOrderKey = int64(0)
+    out.notes = notes
+    out.nullifiers = nullifiers
+    out.lastCommitAppHash = layout.fixedBytes32Zero()
+    return out
+
+fn v3RwadCodeText(code: int32): str =
+    if code == v3RwadSerialCodeOk:
+        return "ok"
+    if code == v3RwadSerialCodeBadHeight:
+        return "bad_height"
+    if code == v3RwadSerialCodeBadOwner:
+        return "bad_owner"
+    if code == v3RwadSerialCodeBadAmount:
+        return "bad_amount"
+    if code == v3RwadSerialCodeBadNote:
+        return "bad_note"
+    if code == v3RwadSerialCodeBadRange:
+        return "bad_range"
+    if code == v3RwadSerialCodeAlreadySpent:
+        return "already_spent"
+    if code == v3RwadSerialCodeOwnerMismatch:
+        return "owner_mismatch"
+    if code == v3RwadSerialCodeBadTarget:
+        return "bad_target"
+    if code == v3RwadSerialCodeSerialOverflow:
+        return "serial_overflow"
+    return "unknown"
+
+fn v3RwadOwnerZero(ownerId: layout.FixedBytes32): bool =
+    return layout.fixedBytes32Equal(ownerId, layout.fixedBytes32Zero())
+
+fn v3RwadOrderKey(height: int64, txIndex: int32): int64 =
+    let indexPart = int64(txIndex + 1)
+    return (height << 32) | (indexPart & int64(0xffffffff))
+
+fn v3RwadOrderOk(machine: V3RwadStateMachine, finalizeHeight: int64, orderKey: int64): bool =
+    if finalizeHeight <= int64(0):
+        return false
+    if orderKey <= machine.lastApplyOrderKey:
+        return false
+    return true
+
+fn v3RwadNoteAmount(note: V3RwadIntervalNote): int64 =
+    return (note.endSerial - note.startSerial) + int64(1)
+
+fn v3RwadAppendI64BE(buf: var layout.ByteBuf, value: int64) =
+    lt.v3AppendU32BE(buf, int32((value >> 32) & int64(0xffffffff)))
+    lt.v3AppendU32BE(buf, int32(value & int64(0xffffffff)))
+
+fn v3RwadNoteCid(note: V3RwadIntervalNote): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(160)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.note"))
+    v3RwadAppendI64BE(buf, note.noteId)
+    v3RwadAppendI64BE(buf, note.startSerial)
+    v3RwadAppendI64BE(buf, note.endSerial)
+    lt.v3AppendFixed32(buf, note.ownerId)
+    v3RwadAppendI64BE(buf, note.createdHeight)
+    if note.live:
+        lt.v3AppendU32BE(buf, 1)
+    else:
+        lt.v3AppendU32BE(buf, 0)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadNullifierCid(note: V3RwadIntervalNote): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(96)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.nullifier"))
+    lt.v3AppendFixed32(buf, v3RwadNoteCid(note))
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadNotePos(machine: V3RwadStateMachine, noteId: int64): int32 =
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].noteId == noteId:
+            return i
+    return -1
+
+fn v3RwadSerialRoot(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.serial_root"))
+    layout.byteBufAppendBytes(buf, bytesFromString(machine.appId))
+    v3RwadAppendI64BE(buf, machine.lastFinalizedHeight)
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live:
+            lt.v3AppendFixed32(buf, v3RwadNoteCid(machine.notes[i]))
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadNullifierRoot(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.nullifier_root"))
+    layout.byteBufAppendBytes(buf, bytesFromString(machine.appId))
+    for i in 0..<machine.nullifiers.len:
+        lt.v3AppendFixed32(buf, machine.nullifiers[i].nullifierCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadOwnerRoot(machine: V3RwadStateMachine, ownerId: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.owner_root"))
+    lt.v3AppendFixed32(buf, ownerId)
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live && layout.fixedBytes32Equal(machine.notes[i].ownerId, ownerId):
+            lt.v3AppendFixed32(buf, v3RwadNoteCid(machine.notes[i]))
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadAppHash(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.rwad.app_hash"))
+    layout.byteBufAppendBytes(buf, bytesFromString(machine.appId))
+    v3RwadAppendI64BE(buf, machine.lastFinalizedHeight)
+    v3RwadAppendI64BE(buf, machine.nextSerial)
+    v3RwadAppendI64BE(buf, machine.nextNoteId)
+    lt.v3AppendFixed32(buf, v3RwadSerialRoot(machine))
+    lt.v3AppendFixed32(buf, v3RwadNullifierRoot(machine))
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadLiveNoteCount(machine: V3RwadStateMachine): int32 =
+    var count: int32 = 0
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live:
+            count = count + 1
+    return count
+
+fn v3RwadOwnerBalance(machine: V3RwadStateMachine, ownerId: layout.FixedBytes32): int64 =
+    var balance: int64 = int64(0)
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live && layout.fixedBytes32Equal(machine.notes[i].ownerId, ownerId):
+            balance = balance + v3RwadNoteAmount(machine.notes[i])
+    return balance
+
+fn v3RwadOwnerNoteCount(machine: V3RwadStateMachine, ownerId: layout.FixedBytes32): int32 =
+    var count: int32 = 0
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live && layout.fixedBytes32Equal(machine.notes[i].ownerId, ownerId):
+            count = count + 1
+    return count
+
+fn v3RwadCloneNotes(xs: V3RwadIntervalNote[]): V3RwadIntervalNote[] =
+    var out: V3RwadIntervalNote[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3RwadCloneNullifiers(xs: V3RwadNullifier[]): V3RwadNullifier[] =
+    var out: V3RwadNullifier[]
+    out = []
+    for i in 0..<xs.len:
+        add(out, xs[i])
+    return out
+
+fn v3RwadCloneState(machine: V3RwadStateMachine): V3RwadStateMachine =
+    var out: V3RwadStateMachine
+    out.appId = machine.appId
+    out.nextSerial = machine.nextSerial
+    out.nextNoteId = machine.nextNoteId
+    out.lastFinalizedHeight = machine.lastFinalizedHeight
+    out.lastApplyOrderKey = machine.lastApplyOrderKey
+    out.notes = v3RwadCloneNotes(machine.notes)
+    out.nullifiers = v3RwadCloneNullifiers(machine.nullifiers)
+    out.lastCommitAppHash = machine.lastCommitAppHash
+    return out
+
+fn v3RwadAppendNote(machine: var V3RwadStateMachine,
+                    ownerId: layout.FixedBytes32,
+                    startSerial: int64,
+                    endSerial: int64,
+                    height: int64): int64 =
+    var note: V3RwadIntervalNote
+    note.noteId = machine.nextNoteId
+    note.startSerial = startSerial
+    note.endSerial = endSerial
+    note.ownerId = ownerId
+    note.createdHeight = height
+    note.live = true
+    add(machine.notes, note)
+    machine.nextNoteId = machine.nextNoteId + int64(1)
+    return note.noteId
+
+fn v3RwadStateMachineApplyMintOrdered(machine: var V3RwadStateMachine,
+                                      finalizeHeight: int64,
+                                      orderKey: int64,
+                                      tx: V3RwadMintTx): V3RwadApplyResult =
+    var out = v3RwadApplyResultZero()
+    if !v3RwadOrderOk(machine, finalizeHeight, orderKey):
+        out.code = v3RwadSerialCodeBadHeight
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if v3RwadOwnerZero(tx.ownerId):
+        out.code = v3RwadSerialCodeBadOwner
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.amount <= int64(0):
+        out.code = v3RwadSerialCodeBadAmount
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.amount > (v3RwadSerialMaxValue - machine.nextSerial + int64(1)):
+        out.code = v3RwadSerialCodeSerialOverflow
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    let startSerial = machine.nextSerial
+    let endSerial = startSerial + tx.amount - int64(1)
+    let noteId = v3RwadAppendNote(machine, tx.ownerId, startSerial, endSerial, finalizeHeight)
+    machine.nextSerial = endSerial + int64(1)
+    machine.lastFinalizedHeight = finalizeHeight
+    machine.lastApplyOrderKey = orderKey
+    out.code = v3RwadSerialCodeOk
+    out.accepted = true
+    out.applied = true
+    out.primaryNoteId = noteId
+    out.appHash = v3RwadAppHash(machine)
+    return out
+
+fn v3RwadStateMachineCheckMint(machine: V3RwadStateMachine,
+                               height: int64,
+                               tx: V3RwadMintTx): V3RwadApplyResult =
+    var preview = v3RwadCloneState(machine)
+    return v3RwadStateMachineApplyMint(preview, height, tx)
+
+fn v3RwadStateMachineApplyMint(machine: var V3RwadStateMachine,
+                               height: int64,
+                               tx: V3RwadMintTx): V3RwadApplyResult =
+    return v3RwadStateMachineApplyMintOrdered(machine, height, v3RwadOrderKey(height, 0), tx)
+
+fn v3RwadStateMachineCheckTransfer(machine: V3RwadStateMachine,
+                                   height: int64,
+                                   tx: V3RwadTransferTx): V3RwadApplyResult =
+    var preview = v3RwadCloneState(machine)
+    return v3RwadStateMachineApplyTransfer(preview, height, tx)
+
+fn v3RwadStateMachineApplyTransferOrdered(machine: var V3RwadStateMachine,
+                                          finalizeHeight: int64,
+                                          orderKey: int64,
+                                          tx: V3RwadTransferTx): V3RwadApplyResult =
+    var out = v3RwadApplyResultZero()
+    if !v3RwadOrderOk(machine, finalizeHeight, orderKey):
+        out.code = v3RwadSerialCodeBadHeight
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.inputNoteId <= int64(0):
+        out.code = v3RwadSerialCodeBadNote
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if v3RwadOwnerZero(tx.fromOwner):
+        out.code = v3RwadSerialCodeBadOwner
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if v3RwadOwnerZero(tx.toOwner):
+        out.code = v3RwadSerialCodeBadTarget
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if layout.fixedBytes32Equal(tx.fromOwner, tx.toOwner):
+        out.code = v3RwadSerialCodeBadTarget
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    let pos = v3RwadNotePos(machine, tx.inputNoteId)
+    if pos < 0:
+        out.code = v3RwadSerialCodeBadNote
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    let inputNote = machine.notes[pos]
+    if !inputNote.live:
+        out.code = v3RwadSerialCodeAlreadySpent
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if !layout.fixedBytes32Equal(inputNote.ownerId, tx.fromOwner):
+        out.code = v3RwadSerialCodeOwnerMismatch
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.spendStart < inputNote.startSerial:
+        out.code = v3RwadSerialCodeBadRange
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.spendEnd > inputNote.endSerial:
+        out.code = v3RwadSerialCodeBadRange
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    if tx.spendStart > tx.spendEnd:
+        out.code = v3RwadSerialCodeBadRange
+        out.appHash = v3RwadAppHash(machine)
+        return out
+    machine.notes[pos].live = false
+    var nullifier: V3RwadNullifier
+    nullifier.noteId = inputNote.noteId
+    nullifier.nullifierCid = v3RwadNullifierCid(inputNote)
+    nullifier.spendHeight = finalizeHeight
+    add(machine.nullifiers, nullifier)
+    out.spentNullifier = nullifier.nullifierCid
+    if tx.spendStart > inputNote.startSerial:
+        out.primaryNoteId = v3RwadAppendNote(machine,
+                                             tx.fromOwner,
+                                             inputNote.startSerial,
+                                             tx.spendStart - int64(1),
+                                             finalizeHeight)
+    let paymentNoteId = v3RwadAppendNote(machine, tx.toOwner, tx.spendStart, tx.spendEnd, finalizeHeight)
+    if out.primaryNoteId == int64(0):
+        out.primaryNoteId = paymentNoteId
+    else:
+        out.secondaryNoteId = paymentNoteId
+    if tx.spendEnd < inputNote.endSerial:
+        let rightNoteId = v3RwadAppendNote(machine,
+                                           tx.fromOwner,
+                                           tx.spendEnd + int64(1),
+                                           inputNote.endSerial,
+                                           finalizeHeight)
+        if out.secondaryNoteId == int64(0):
+            out.secondaryNoteId = rightNoteId
+        else:
+            out.tertiaryNoteId = rightNoteId
+    machine.lastFinalizedHeight = finalizeHeight
+    machine.lastApplyOrderKey = orderKey
+    out.code = v3RwadSerialCodeOk
+    out.accepted = true
+    out.applied = true
+    out.appHash = v3RwadAppHash(machine)
+    return out
+
+fn v3RwadStateMachineApplyTransfer(machine: var V3RwadStateMachine,
+                                   height: int64,
+                                   tx: V3RwadTransferTx): V3RwadApplyResult =
+    return v3RwadStateMachineApplyTransferOrdered(machine, height, v3RwadOrderKey(height, 0), tx)
+
+fn v3RwadStateMachineQueryOwner(machine: V3RwadStateMachine,
+                                ownerId: layout.FixedBytes32): V3RwadOwnerQueryResult =
+    var out = v3RwadOwnerQueryResultZero()
+    out.height = machine.lastFinalizedHeight
+    out.appHash = v3RwadAppHash(machine)
+    if v3RwadOwnerZero(ownerId):
+        out.code = v3RwadSerialCodeBadOwner
+        return out
+    out.balance = v3RwadOwnerBalance(machine, ownerId)
+    out.liveNoteCount = v3RwadOwnerNoteCount(machine, ownerId)
+    out.ownerRoot = v3RwadOwnerRoot(machine, ownerId)
+    return out
+
+fn v3RwadStateMachineQueryAppHash(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    return v3RwadAppHash(machine)
+
+fn v3RwadStateMachineCommit(machine: var V3RwadStateMachine): V3RwadCommitSummary =
+    var out = v3RwadCommitSummaryZero()
+    out.height = machine.lastFinalizedHeight
+    out.nextSerial = machine.nextSerial
+    out.nextNoteId = machine.nextNoteId
+    out.liveNoteCount = v3RwadLiveNoteCount(machine)
+    out.nullifierCount = machine.nullifiers.len
+    out.serialRoot = v3RwadSerialRoot(machine)
+    out.nullifierRoot = v3RwadNullifierRoot(machine)
+    out.appHash = v3RwadAppHash(machine)
+    machine.lastCommitAppHash = out.appHash
+    return out
