@@ -1,0 +1,75 @@
+import std/system
+import std/rawbytes
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/webrtc_transport
+import cheng/v3/libp2p/protocols/webrtc_signal as signal
+
+fn main(): int32 =
+    var addr = types.v3Libp2pMultiaddrZero()
+    addr.host = "203.0.113.91"
+    addr.port = 9443
+    addr.transport = types.v3Libp2pTransportWebrtc
+    addr.networkDomain = types.v3Libp2pNetworkDomainBrowserWebrtc
+    addr.visibility = types.v3Libp2pVisibilityPublic
+
+    var cfg = webrtc_transport.v3Libp2pWebrtcTransportConfigZero()
+    cfg.stunUrls = ["stun:browser.example.net"]
+    let turnInsert = signal.v3Libp2pWebrtcTurnServerZero()
+    add(cfg.turnServers, turnInsert)
+    cfg.turnServers[0].url = "turn:relay.example.net"
+    cfg.turnServers[0].username = "webrtc-user"
+    cfg.turnServers[0].credential = "pw"
+
+    var pair = webrtc_transport.v3Libp2pWebrtcLoopbackPairZero()
+    let openRes = webrtc_transport.v3Libp2pWebrtcLoopbackOpenInto(pair, cfg, addr)
+    assert(IsOk(openRes), "v3 webrtc signal session: open")
+    assert(pair.signalSession.offerSeen, "v3 webrtc signal session: offer")
+    assert(pair.signalSession.answerSeen, "v3 webrtc signal session: answer")
+    assert(pair.signalSession.policySeen, "v3 webrtc signal session: policy")
+    assert(pair.signalSession.ready, "v3 webrtc signal session: ready")
+    assert(pair.signalSession.candidateTexts.len == 2, "v3 webrtc signal session: candidates")
+    assert(pair.signalSession.turnServers.len == 1, "v3 webrtc signal session: turn servers")
+    assert(webrtc_transport.v3Libp2pWebrtcLoopbackSignalCount(pair) == 5,
+        "v3 webrtc signal session: transcript count")
+    assert(pair.signalTranscript[0].kind == signal.v3Libp2pWebrtcSignalTurnPolicy,
+        "v3 webrtc signal session: transcript order policy")
+    assert(pair.signalTranscript[1].kind == signal.v3Libp2pWebrtcSignalOffer,
+        "v3 webrtc signal session: transcript order offer")
+    assert(pair.signalTranscript[2].kind == signal.v3Libp2pWebrtcSignalAnswer,
+        "v3 webrtc signal session: transcript order answer")
+    assert(pair.signalTranscript[3].candidateText == "candidate:1 1 udp 2130706431 203.0.113.91 9443 typ host generation 0 ufrag client",
+        "v3 webrtc signal session: client candidate ufrag")
+    assert(pair.signalTranscript[4].candidateText == "candidate:1 1 udp 2130706431 203.0.113.91 9443 typ host generation 0 ufrag server",
+        "v3 webrtc signal session: server candidate ufrag")
+    assert(pair.selectedProtocol == 0, "v3 webrtc signal session: protocol initially unset")
+
+    let selectRes = webrtc_transport.v3Libp2pWebrtcLoopbackSelectProtocol(pair, types.v3Libp2pProtocolContent)
+    assert(IsOk(selectRes), "v3 webrtc signal session: select protocol")
+    assert(pair.selectedProtocol == types.v3Libp2pProtocolContent,
+        "v3 webrtc signal session: selected protocol")
+    let payload = bytesFromString("webrtc-session-payload")
+    let writeRes = webrtc_transport.v3Libp2pWebrtcLoopbackWriteClient(pair, payload)
+    assert(IsOk(writeRes), "v3 webrtc signal session: write")
+    let readRes = webrtc_transport.v3Libp2pWebrtcLoopbackReadServer(pair, bytesLen(payload))
+    assert(IsOk(readRes), "v3 webrtc signal session: read")
+    assert(bytesEqual(Value(readRes), payload), "v3 webrtc signal session: payload")
+
+    webrtc_transport.v3Libp2pWebrtcTransportResetStats()
+    let signalWire = webrtc_transport.v3Libp2pWebrtcLoopbackSignalTranscriptPayload(pair)
+    var clientResponse: Bytes
+    let nativeRes = webrtc_transport.v3Libp2pWebrtcNativeRequestResponse(types.v3Libp2pProtocolContent,
+                                                                         signalWire,
+                                                                         payload,
+                                                                         payload,
+                                                                         clientResponse)
+    assert(IsOk(nativeRes), "v3 webrtc signal session: native bridge")
+    assert(webrtc_transport.v3Libp2pWebrtcNativeDatachannelOpenCountNow() == 1,
+        "v3 webrtc signal session: native open count")
+    assert(webrtc_transport.v3Libp2pWebrtcNativeDatachannelRequestCountNow() == 1,
+        "v3 webrtc signal session: native request count")
+    assert(webrtc_transport.v3Libp2pWebrtcLoopbackRequestResponseCountNow() == 0,
+        "v3 webrtc signal session: loopback request-response count")
+    assert(bytesEqual(clientResponse, payload), "v3 webrtc signal session: native payload")
+
+    echo("v3 webrtc_signal_session_smoke ok")
+    return 0

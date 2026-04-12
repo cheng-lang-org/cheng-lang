@@ -319,6 +319,12 @@ int32_t cheng_v3_tcp_loopback_request_response_bridge(ChengStrBridge protocol_te
                                                       ChengStrBridge response_text,
                                                       ChengStrBridge* client_response_text,
                                                       ChengStrBridge* err_text);
+int32_t cheng_v3_webrtc_datachannel_request_response_bridge(ChengStrBridge protocol_text,
+                                                            ChengStrBridge signal_text,
+                                                            ChengStrBridge request_text,
+                                                            ChengStrBridge response_text,
+                                                            ChengStrBridge* client_response_text,
+                                                            ChengStrBridge* err_text);
 int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
                                                int32_t port,
                                                ChengStrBridge protocol_text,

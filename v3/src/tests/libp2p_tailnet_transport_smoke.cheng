@@ -1,0 +1,103 @@
+import std/system
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
+
+fn main(): int32 =
+    var cfg = tsnet.v3Libp2pTailnetTransportConfigZero()
+    cfg.controlEndpoint = "https://control.example"
+    cfg.relayEndpoint = "derp-sfo"
+    cfg.syntheticIPv4 = "100.64.0.44"
+    cfg.syntheticIPv6 = "fd7a:115c:a1e0::44"
+    cfg.localPeerId = "tailnet-transport-smoke"
+    cfg.exactRouting = true
+
+    var transport = tsnet.v3Libp2pTailnetTransportInit(cfg)
+    tsnet.v3Libp2pTailnetSetProviderReady(transport, true, "control-ready")
+    tsnet.v3Libp2pTailnetSetProxyListenersReady(transport, true, "proxy-ready")
+
+    var rawTcp = types.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(rawTcp, "127.0.0.1", 7101)
+    var rawQuic = types.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillQuic(rawQuic, "127.0.0.1", 7102)
+
+    let tcpRes = tsnet.v3Libp2pTailnetListen(transport, rawTcp)
+    assert(IsOk(tcpRes), "v3 libp2p tailnet transport: tcp listen")
+    let quicRes = tsnet.v3Libp2pTailnetListen(transport, rawQuic)
+    assert(IsOk(quicRes), "v3 libp2p tailnet transport: quic listen")
+
+    let published = tsnet.v3Libp2pTailnetPublishedAddrs(transport)
+    assert(published.len == 2, "v3 libp2p tailnet transport: published count")
+    assert(published[0].networkDomain == types.v3Libp2pNetworkDomainTailnet,
+        "v3 libp2p tailnet transport: published domain")
+    assert(published[0].visibility == types.v3Libp2pVisibilityTrustedOnly,
+        "v3 libp2p tailnet transport: published visibility")
+    assert(published[0].host == "100.64.0.44",
+        "v3 libp2p tailnet transport: synthetic host")
+    assert(published[1].transport == types.v3Libp2pTransportQuic,
+        "v3 libp2p tailnet transport: quic preserved")
+
+    var rawLookup = types.v3Libp2pMultiaddrZero()
+    assert(tsnet.v3Libp2pTailnetResolvePublishedToRaw(transport, published[0], rawLookup),
+        "v3 libp2p tailnet transport: published to raw")
+    assert(rawLookup.host == "127.0.0.1", "v3 libp2p tailnet transport: raw host lookup")
+    var publishedLookup = types.v3Libp2pMultiaddrZero()
+    assert(tsnet.v3Libp2pTailnetResolveRawToPublished(transport, rawQuic, publishedLookup),
+        "v3 libp2p tailnet transport: raw to published")
+    assert(publishedLookup.host == "100.64.0.44", "v3 libp2p tailnet transport: published host lookup")
+
+    var directSession = tsnet.v3Libp2pTailnetPeerSessionZero()
+    directSession.peerId = "peer-direct"
+    directSession.remoteTailnetIp = "100.64.0.88"
+    directSession.directReachable = true
+    directSession.relayAllowed = true
+    directSession.derpRegionCode = "sfo"
+    directSession.signedPreface = "preface-ok"
+    directSession.boundAddrText = tsnet.v3Libp2pTailnetAddrText(rawTcp)
+    tsnet.v3Libp2pTailnetUpsertPeerSession(transport, directSession)
+    var directPlan = tsnet.v3Libp2pTailnetDialPlanZero()
+    let directPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(directPlan,
+                                                          transport,
+                                                          "peer-direct",
+                                                          published[0],
+                                                          false,
+                                                          false)
+    assert(IsOk(directPlanRes), "v3 libp2p tailnet transport: direct plan")
+    assert(directPlan.pathKind == tsnet.v3Libp2pTailnetPathDirect,
+        "v3 libp2p tailnet transport: direct path")
+    assert(directPlan.reachability == types.v3Libp2pReachabilityDirect,
+        "v3 libp2p tailnet transport: direct reachability")
+    assert(directPlan.routeText == tsnet.v3Libp2pTailnetAddrText(rawTcp),
+        "v3 libp2p tailnet transport: exact route text")
+
+    tsnet.v3Libp2pTailnetSetListenerNeedsRepair(transport, true, "repair-needed")
+    var repairPlan = tsnet.v3Libp2pTailnetDialPlanZero()
+    let repairPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(repairPlan,
+                                                          transport,
+                                                          "peer-direct",
+                                                          published[0],
+                                                          false,
+                                                          true)
+    assert(IsErr(repairPlanRes), "v3 libp2p tailnet transport: repair blocks direct")
+    assert(repairPlan.pathKind == tsnet.v3Libp2pTailnetPathRepair,
+        "v3 libp2p tailnet transport: repair path")
+    tsnet.v3Libp2pTailnetSetListenerNeedsRepair(transport, false, "proxy-ready")
+
+    var status: tsnet.V3Libp2pTailnetStatusSnapshot
+    tsnet.v3Libp2pTailnetStatusFill(status, transport)
+    assert(status.providerKind == "synthetic", "v3 libp2p tailnet transport: provider")
+    assert(status.controlPlane == "synthetic", "v3 libp2p tailnet transport: control plane")
+    assert(status.providerReady, "v3 libp2p tailnet transport: provider ready")
+    assert(status.proxyListenersReady, "v3 libp2p tailnet transport: proxy ready")
+    assert(status.exactRouting, "v3 libp2p tailnet transport: exact routing")
+    assert(status.tailnetPath == "direct", "v3 libp2p tailnet transport: status path")
+    assert(status.tailnetIPs.len == 2, "v3 libp2p tailnet transport: status ips")
+    assert(status.publishedCount == 2, "v3 libp2p tailnet transport: published count status")
+    assert(status.sessionCount == 1, "v3 libp2p tailnet transport: session count status")
+    assert(status.tailnetRelay == "derp-sfo", "v3 libp2p tailnet transport: relay")
+    assert(status.tailnetDerpMapSummary == "https://control.example",
+        "v3 libp2p tailnet transport: control")
+    assert(status.startupStage == "proxy-ready", "v3 libp2p tailnet transport: startup stage")
+
+    echo("v3 libp2p_tailnet_transport_smoke ok")
+    return 0

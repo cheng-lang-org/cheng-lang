@@ -1,0 +1,176 @@
+import std/system
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/dag_mempool as dag
+import cheng/v3/chain/erasure_swarm as swarm
+import cheng/v3/chain/pin_plane as pin
+import cheng/v3/chain/pin_runtime as runtime
+
+fn pinSchedulerSmokeBlob(parts: Bytes[]): Bytes =
+    var total = 0
+    for i in 0..<parts.len:
+        total = total + bytesLen(parts[i])
+    var buf: layout.ByteBuf = layout.byteBufInit(total)
+    for i in 0..<parts.len:
+        layout.byteBufAppendBytes(buf, parts[i])
+    return layout.byteBufToBytes(buf)
+
+fn pinSchedulerSmokeBuildResponses(out: var swarm.V3ErasureShardPullResponse[],
+                                   manifest: swarm.V3ErasureShardManifest,
+                                   shardPayloads: Bytes[]) =
+    out = []
+    for i in 0..<manifest.shardCount:
+        let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, manifest.shardIndices[i])
+        assert(IsOk(requestRes), "v3 pin scheduler smoke: request")
+        var response = swarm.v3ErasureShardPullResponseZero()
+        let responseFillRes = swarm.v3ErasureShardPullResponseFill(response,
+                                                                   Value(requestRes),
+                                                                   shardPayloads[i])
+        assert(IsOk(responseFillRes), "v3 pin scheduler smoke: response")
+        add(out, response)
+
+fn main(): int32 =
+    let shard0 = bytesFromString("sched-a")
+    let shard1 = bytesFromString("sched-b")
+    let shard2 = bytesFromString("sched-c")
+    var shardPayloads: Bytes[]
+    shardPayloads = []
+    add(shardPayloads, shard0)
+    add(shardPayloads, shard1)
+    add(shardPayloads, shard2)
+    let blob = pinSchedulerSmokeBlob(shardPayloads)
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, 6)
+    assert(IsOk(summaryRes), "v3 pin scheduler smoke: summary")
+    let summary = Value(summaryRes)
+    let paramsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 3, 0, 6)
+    assert(IsOk(paramsRes), "v3 pin scheduler smoke: params")
+    let params = Value(paramsRes)
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    for i in 0..<shardPayloads.len:
+        add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shardPayloads[i]))
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    assert(IsOk(manifestRes), "v3 pin scheduler smoke: manifest")
+    let manifest = Value(manifestRes)
+    let bundleCid = lt.v3HashInts("v3.pin.scheduler.bundle", [71, 72, 73])
+    let offerRes = pin.v3PinOfferMake(bundleCid,
+                                      summary.summaryCid,
+                                      summary.blobCid,
+                                      manifest.manifestCid,
+                                      160,
+                                      2,
+                                      30,
+                                      17)
+    assert(IsOk(offerRes), "v3 pin scheduler smoke: offer")
+    let offer = Value(offerRes)
+    let providerPeerId = lt.v3HashInts("v3.pin.scheduler.provider", [9, 8, 7])
+    let acceptRes = pin.v3PinAcceptMake(offer, providerPeerId, 170)
+    assert(IsOk(acceptRes), "v3 pin scheduler smoke: accept")
+    let accept = Value(acceptRes)
+
+    var challenger = runtime.v3PinRuntimeInit()
+    var provider = runtime.v3PinRuntimeInit()
+    let challengerStateRes = runtime.v3PinRuntimeStoreChallengerState(challenger,
+                                                                      offer,
+                                                                      accept,
+                                                                      manifest,
+                                                                      params,
+                                                                      100,
+                                                                      2,
+                                                                      1)
+    assert(IsOk(challengerStateRes), "v3 pin scheduler smoke: challenger state")
+    let providerStateRes = runtime.v3PinRuntimeStoreAcceptedState(provider,
+                                                                  offer,
+                                                                  accept,
+                                                                  manifest,
+                                                                  params,
+                                                                  [])
+    assert(IsOk(providerStateRes), "v3 pin scheduler smoke: provider accepted state empty")
+    let challenge1Res = runtime.v3PinRuntimeOpenChallenge(challenger, accept.acceptCid, 100)
+    assert(IsOk(challenge1Res), "v3 pin scheduler smoke: open challenge1")
+    let challenge1 = Value(challenge1Res)
+    let retryStepRes = runtime.v3PinRuntimeNoteChallengeFailure(challenger, accept.acceptCid, 100)
+    assert(IsOk(retryStepRes), "v3 pin scheduler smoke: retry step")
+    let retryStep = Value(retryStepRes)
+    assert(retryStep.outcomeKind == runtime.v3PinRuntimeStepKindRetry,
+        "v3 pin scheduler smoke: retry outcome")
+    assert(retryStep.retryCount == 1, "v3 pin scheduler smoke: retry count")
+
+    var responses: swarm.V3ErasureShardPullResponse[]
+    pinSchedulerSmokeBuildResponses(responses, manifest, shardPayloads)
+    let providerStateWithShardsRes = runtime.v3PinRuntimeStoreAcceptedState(provider,
+                                                                            offer,
+                                                                            accept,
+                                                                            manifest,
+                                                                            params,
+                                                                            responses)
+    assert(IsOk(providerStateWithShardsRes), "v3 pin scheduler smoke: provider shard state")
+    let reopenedChallengeRes = runtime.v3PinRuntimeOpenChallenge(challenger, accept.acceptCid, 101)
+    assert(IsOk(reopenedChallengeRes), "v3 pin scheduler smoke: reopen challenge1")
+    let reopenedChallenge = Value(reopenedChallengeRes)
+    assert(layout.fixedBytes32Equal(reopenedChallenge.challengeCid, challenge1.challengeCid),
+        "v3 pin scheduler smoke: reopen same challenge")
+    let proof1Res = runtime.v3PinRuntimeBuildProof(provider, reopenedChallenge)
+    assert(IsOk(proof1Res), "v3 pin scheduler smoke: proof1")
+    let rewardStep1Res = runtime.v3PinRuntimeCompleteChallenge(challenger,
+                                                               accept.acceptCid,
+                                                               Value(proof1Res),
+                                                               101)
+    assert(IsOk(rewardStep1Res), "v3 pin scheduler smoke: reward step1")
+    let rewardStep1 = Value(rewardStep1Res)
+    assert(rewardStep1.outcomeKind == runtime.v3PinRuntimeStepKindReward,
+        "v3 pin scheduler smoke: reward outcome1")
+    assert(rewardStep1.nextChallengeEpoch == 102, "v3 pin scheduler smoke: next epoch1")
+
+    let challenge2Res = runtime.v3PinRuntimeOpenChallenge(challenger, accept.acceptCid, 102)
+    assert(IsOk(challenge2Res), "v3 pin scheduler smoke: open challenge2")
+    let challenge2 = Value(challenge2Res)
+    let proof2Res = runtime.v3PinRuntimeBuildProof(provider, challenge2)
+    assert(IsOk(proof2Res), "v3 pin scheduler smoke: proof2")
+    let rewardStep2Res = runtime.v3PinRuntimeCompleteChallenge(challenger,
+                                                               accept.acceptCid,
+                                                               Value(proof2Res),
+                                                               102)
+    assert(IsOk(rewardStep2Res), "v3 pin scheduler smoke: reward step2")
+    let rewardStep2 = Value(rewardStep2Res)
+    assert(rewardStep2.outcomeKind == runtime.v3PinRuntimeStepKindReward,
+        "v3 pin scheduler smoke: reward outcome2")
+    assert(rewardStep2.nextChallengeEpoch == 103, "v3 pin scheduler smoke: next epoch2")
+
+    var slasher = runtime.v3PinRuntimeInit()
+    let slashStateRes = runtime.v3PinRuntimeStoreChallengerState(slasher,
+                                                                 offer,
+                                                                 accept,
+                                                                 manifest,
+                                                                 params,
+                                                                 120,
+                                                                 1,
+                                                                 1)
+    assert(IsOk(slashStateRes), "v3 pin scheduler smoke: slash state")
+    let slashChallengeRes = runtime.v3PinRuntimeOpenChallenge(slasher, accept.acceptCid, 120)
+    assert(IsOk(slashChallengeRes), "v3 pin scheduler smoke: slash challenge")
+    let slashChallenge = Value(slashChallengeRes)
+    let slashRetryRes = runtime.v3PinRuntimeNoteChallengeFailure(slasher, accept.acceptCid, 120)
+    assert(IsOk(slashRetryRes), "v3 pin scheduler smoke: slash retry")
+    let slashRetry = Value(slashRetryRes)
+    assert(slashRetry.outcomeKind == runtime.v3PinRuntimeStepKindRetry,
+        "v3 pin scheduler smoke: slash retry outcome")
+    let slashStepRes = runtime.v3PinRuntimeNoteChallengeFailure(slasher, accept.acceptCid, 121)
+    assert(IsOk(slashStepRes), "v3 pin scheduler smoke: slash step")
+    let slashStep = Value(slashStepRes)
+    assert(slashStep.outcomeKind == runtime.v3PinRuntimeStepKindSlash,
+        "v3 pin scheduler smoke: slash outcome")
+    assert(slashStep.closed, "v3 pin scheduler smoke: slash closed")
+    assert(layout.fixedBytes32Equal(slashStep.challengeCid, slashChallenge.challengeCid),
+        "v3 pin scheduler smoke: slash challenge cid")
+    let slashSettlementRes = runtime.v3PinRuntimeFindSettlement(slasher, slashStep.settlementCid)
+    assert(IsOk(slashSettlementRes), "v3 pin scheduler smoke: slash settlement")
+    assert(Value(slashSettlementRes).status == pin.v3PinSettlementStatusSlash,
+        "v3 pin scheduler smoke: slash status")
+
+    echo("v3 pin_scheduler_smoke ok")
+    return 0

@@ -1,0 +1,692 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/pin_plane as pin
+import cheng/v3/chain/erasure_swarm as swarm
+
+const
+    v3PinRuntimeStepKindRetry: int32 = 1
+    v3PinRuntimeStepKindReward: int32 = 2
+    v3PinRuntimeStepKindSlash: int32 = 3
+
+type
+    V3PinRuntimeShardEntry =
+        manifestCid: layout.FixedBytes32
+        shardIndex: int32
+        shardCid: layout.FixedBytes32
+        payloadLen: int32
+        payload: Bytes
+
+    V3PinRuntimeSchedule =
+        offerCid: layout.FixedBytes32
+        acceptCid: layout.FixedBytes32
+        manifestCid: layout.FixedBytes32
+        nextChallengeEpoch: int32
+        challengeTimeoutEpochs: int32
+        maxRetryCount: int32
+        retryCount: int32
+        pendingChallengeCid: layout.FixedBytes32
+        pendingChallengeEpoch: int32
+        pendingDeadlineEpoch: int32
+        lastChallengeCid: layout.FixedBytes32
+        lastProofCid: layout.FixedBytes32
+        lastSettlementCid: layout.FixedBytes32
+        lastSettledEpoch: int32
+        lastStatus: int32
+        closed: bool
+
+    V3PinRuntimeStepResult =
+        acceptCid: layout.FixedBytes32
+        challengeCid: layout.FixedBytes32
+        proofCid: layout.FixedBytes32
+        settlementCid: layout.FixedBytes32
+        outcomeKind: int32
+        retryCount: int32
+        nextChallengeEpoch: int32
+        closed: bool
+
+    V3PinRuntime =
+        offers: pin.V3PinOffer[]
+        accepts: pin.V3PinAccept[]
+        manifests: swarm.V3ErasureShardManifest[]
+        shards: V3PinRuntimeShardEntry[]
+        schedules: V3PinRuntimeSchedule[]
+        challenges: pin.V3PinChallenge[]
+        proofs: pin.V3PinProof[]
+        settlements: pin.V3PinSettlement[]
+
+fn v3PinRuntimeShardEntryZero(): V3PinRuntimeShardEntry =
+    return V3PinRuntimeShardEntry(
+        manifestCid: layout.fixedBytes32Zero(),
+        shardIndex: 0,
+        shardCid: layout.fixedBytes32Zero(),
+        payloadLen: 0,
+        payload: emptyBytes()
+    )
+
+fn v3PinRuntimeScheduleZero(): V3PinRuntimeSchedule =
+    var out: V3PinRuntimeSchedule
+    out.offerCid = layout.fixedBytes32Zero()
+    out.acceptCid = layout.fixedBytes32Zero()
+    out.manifestCid = layout.fixedBytes32Zero()
+    out.nextChallengeEpoch = 0
+    out.challengeTimeoutEpochs = 0
+    out.maxRetryCount = 0
+    out.retryCount = 0
+    out.pendingChallengeCid = layout.fixedBytes32Zero()
+    out.pendingChallengeEpoch = 0
+    out.pendingDeadlineEpoch = 0
+    out.lastChallengeCid = layout.fixedBytes32Zero()
+    out.lastProofCid = layout.fixedBytes32Zero()
+    out.lastSettlementCid = layout.fixedBytes32Zero()
+    out.lastSettledEpoch = -1
+    out.lastStatus = 0
+    out.closed = false
+    return out
+
+fn v3PinRuntimeStepResultZero(): V3PinRuntimeStepResult =
+    var out: V3PinRuntimeStepResult
+    out.acceptCid = layout.fixedBytes32Zero()
+    out.challengeCid = layout.fixedBytes32Zero()
+    out.proofCid = layout.fixedBytes32Zero()
+    out.settlementCid = layout.fixedBytes32Zero()
+    out.outcomeKind = 0
+    out.retryCount = 0
+    out.nextChallengeEpoch = 0
+    out.closed = false
+    return out
+
+fn v3PinRuntimeSchedulePending(schedule: V3PinRuntimeSchedule): bool =
+    return !layout.fixedBytes32Equal(schedule.pendingChallengeCid, layout.fixedBytes32Zero())
+
+fn v3PinRuntimeInit(): V3PinRuntime =
+    var out: V3PinRuntime
+    out.offers = []
+    out.accepts = []
+    out.manifests = []
+    out.shards = []
+    out.schedules = []
+    out.challenges = []
+    out.proofs = []
+    out.settlements = []
+    return out
+
+fn v3PinRuntimeOfferPos(runtime: V3PinRuntime,
+                        offerCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.offers.len:
+        if layout.fixedBytes32Equal(runtime.offers[i].offerCid, offerCid):
+            return i
+    return -1
+
+fn v3PinRuntimeAcceptPos(runtime: V3PinRuntime,
+                         acceptCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.accepts.len:
+        if layout.fixedBytes32Equal(runtime.accepts[i].acceptCid, acceptCid):
+            return i
+    return -1
+
+fn v3PinRuntimeManifestPos(runtime: V3PinRuntime,
+                           manifestCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.manifests.len:
+        if layout.fixedBytes32Equal(runtime.manifests[i].manifestCid, manifestCid):
+            return i
+    return -1
+
+fn v3PinRuntimeShardPos(runtime: V3PinRuntime,
+                        manifestCid: layout.FixedBytes32,
+                        shardIndex: int32,
+                        shardCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.shards.len:
+        let entry = runtime.shards[i]
+        if !layout.fixedBytes32Equal(entry.manifestCid, manifestCid):
+            continue
+        if entry.shardIndex != shardIndex:
+            continue
+        if !layout.fixedBytes32Equal(entry.shardCid, shardCid):
+            continue
+        return i
+    return -1
+
+fn v3PinRuntimeChallengePos(runtime: V3PinRuntime,
+                            challengeCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.challenges.len:
+        if layout.fixedBytes32Equal(runtime.challenges[i].challengeCid, challengeCid):
+            return i
+    return -1
+
+fn v3PinRuntimeSchedulePos(runtime: V3PinRuntime,
+                           acceptCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.schedules.len:
+        if layout.fixedBytes32Equal(runtime.schedules[i].acceptCid, acceptCid):
+            return i
+    return -1
+
+fn v3PinRuntimeProofPos(runtime: V3PinRuntime,
+                        proofCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.proofs.len:
+        if layout.fixedBytes32Equal(runtime.proofs[i].proofCid, proofCid):
+            return i
+    return -1
+
+fn v3PinRuntimeSettlementPos(runtime: V3PinRuntime,
+                             settlementCid: layout.FixedBytes32): int32 =
+    for i in 0..<runtime.settlements.len:
+        if layout.fixedBytes32Equal(runtime.settlements[i].settlementCid, settlementCid):
+            return i
+    return -1
+
+fn v3PinRuntimeStoreOffer(runtime: var V3PinRuntime,
+                          offer: pin.V3PinOffer): Result[bool] =
+    let offerOk = pin.v3PinOfferValidate(offer)
+    if IsErr(offerOk):
+        return Err[bool](Error(offerOk))
+    let pos = v3PinRuntimeOfferPos(runtime, offer.offerCid)
+    if pos >= 0:
+        runtime.offers[pos] = offer
+    else:
+        add(runtime.offers, offer)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreAccept(runtime: var V3PinRuntime,
+                           offer: pin.V3PinOffer,
+                           accept: pin.V3PinAccept): Result[bool] =
+    let acceptOk = pin.v3PinAcceptValidateAgainstOffer(accept, offer)
+    if IsErr(acceptOk):
+        return Err[bool](Error(acceptOk))
+    let offerStoreRes = v3PinRuntimeStoreOffer(runtime, offer)
+    if IsErr(offerStoreRes):
+        return Err[bool](Error(offerStoreRes))
+    let pos = v3PinRuntimeAcceptPos(runtime, accept.acceptCid)
+    if pos >= 0:
+        runtime.accepts[pos] = accept
+    else:
+        add(runtime.accepts, accept)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreManifest(runtime: var V3PinRuntime,
+                             manifest: swarm.V3ErasureShardManifest,
+                             params: swarm.V3ErasureEncodingParams): Result[bool] =
+    let manifestOk = swarm.v3ErasureManifestValidate(manifest, params)
+    if IsErr(manifestOk):
+        return Err[bool](Error(manifestOk))
+    let pos = v3PinRuntimeManifestPos(runtime, manifest.manifestCid)
+    if pos >= 0:
+        runtime.manifests[pos] = manifest
+    else:
+        add(runtime.manifests, manifest)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreShardResponse(runtime: var V3PinRuntime,
+                                  response: swarm.V3ErasureShardPullResponse): Result[bool] =
+    if response.version != 1:
+        return Err[bool]("v3 pin runtime: unsupported shard response version")
+    if response.payloadLen != bytesLen(response.payload):
+        return Err[bool]("v3 pin runtime: shard response payload length mismatch")
+    if !layout.fixedBytes32Equal(swarm.v3ErasureShardPayloadCid(response.payload), response.shardCid):
+        return Err[bool]("v3 pin runtime: shard response cid mismatch")
+    let pos = v3PinRuntimeShardPos(runtime,
+                                   response.manifestCid,
+                                   response.shardIndex,
+                                   response.shardCid)
+    var entry = v3PinRuntimeShardEntryZero()
+    entry.manifestCid = response.manifestCid
+    entry.shardIndex = response.shardIndex
+    entry.shardCid = response.shardCid
+    entry.payloadLen = response.payloadLen
+    entry.payload = response.payload
+    if pos >= 0:
+        runtime.shards[pos] = entry
+    else:
+        add(runtime.shards, entry)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreChallenge(runtime: var V3PinRuntime,
+                              challenge: pin.V3PinChallenge,
+                              offer: pin.V3PinOffer,
+                              accept: pin.V3PinAccept,
+                              manifest: swarm.V3ErasureShardManifest): Result[bool] =
+    let challengeOk = pin.v3PinChallengeValidateAgainstInputs(challenge,
+                                                              offer,
+                                                              accept,
+                                                              manifest)
+    if IsErr(challengeOk):
+        return Err[bool](Error(challengeOk))
+    let pos = v3PinRuntimeChallengePos(runtime, challenge.challengeCid)
+    if pos >= 0:
+        runtime.challenges[pos] = challenge
+    else:
+        add(runtime.challenges, challenge)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreProof(runtime: var V3PinRuntime,
+                          proof: pin.V3PinProof,
+                          challenge: pin.V3PinChallenge,
+                          accept: pin.V3PinAccept,
+                          manifest: swarm.V3ErasureShardManifest): Result[bool] =
+    let proofOk = pin.v3PinProofValidateAgainstInputs(proof,
+                                                      challenge,
+                                                      accept,
+                                                      manifest)
+    if IsErr(proofOk):
+        return Err[bool](Error(proofOk))
+    let pos = v3PinRuntimeProofPos(runtime, proof.proofCid)
+    if pos >= 0:
+        runtime.proofs[pos] = proof
+    else:
+        add(runtime.proofs, proof)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreProofObject(runtime: var V3PinRuntime,
+                                proof: pin.V3PinProof): Result[bool] =
+    let proofOk = pin.v3PinProofValidate(proof)
+    if IsErr(proofOk):
+        return Err[bool](Error(proofOk))
+    let pos = v3PinRuntimeProofPos(runtime, proof.proofCid)
+    if pos >= 0:
+        runtime.proofs[pos] = proof
+    else:
+        add(runtime.proofs, proof)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreSettlement(runtime: var V3PinRuntime,
+                               settlement: pin.V3PinSettlement,
+                               offer: pin.V3PinOffer,
+                               accept: pin.V3PinAccept,
+                               challenge: pin.V3PinChallenge,
+                               manifest: swarm.V3ErasureShardManifest,
+                               proof: pin.V3PinProof): Result[bool] =
+    let settlementOk = pin.v3PinSettlementValidateAgainstInputs(settlement,
+                                                                offer,
+                                                                accept,
+                                                                challenge,
+                                                                manifest,
+                                                                proof)
+    if IsErr(settlementOk):
+        return Err[bool](Error(settlementOk))
+    let pos = v3PinRuntimeSettlementPos(runtime, settlement.settlementCid)
+    if pos >= 0:
+        runtime.settlements[pos] = settlement
+    else:
+        add(runtime.settlements, settlement)
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreAcceptedState(runtime: var V3PinRuntime,
+                                  offer: pin.V3PinOffer,
+                                  accept: pin.V3PinAccept,
+                                  manifest: swarm.V3ErasureShardManifest,
+                                  params: swarm.V3ErasureEncodingParams,
+                                  responses: swarm.V3ErasureShardPullResponse[]): Result[bool] =
+    let acceptStoreRes = v3PinRuntimeStoreAccept(runtime, offer, accept)
+    if IsErr(acceptStoreRes):
+        return Err[bool](Error(acceptStoreRes))
+    let manifestStoreRes = v3PinRuntimeStoreManifest(runtime, manifest, params)
+    if IsErr(manifestStoreRes):
+        return Err[bool](Error(manifestStoreRes))
+    for i in 0..<responses.len:
+        let shardStoreRes = v3PinRuntimeStoreShardResponse(runtime, responses[i])
+        if IsErr(shardStoreRes):
+            return Err[bool](Error(shardStoreRes))
+    return Ok[bool](true)
+
+fn v3PinRuntimeStoreChallengerState(runtime: var V3PinRuntime,
+                                    offer: pin.V3PinOffer,
+                                    accept: pin.V3PinAccept,
+                                    manifest: swarm.V3ErasureShardManifest,
+                                    params: swarm.V3ErasureEncodingParams,
+                                    firstChallengeEpoch: int32,
+                                    challengeTimeoutEpochs: int32,
+                                    maxRetryCount: int32): Result[bool] =
+    if firstChallengeEpoch < 0:
+        return Err[bool]("v3 pin runtime: invalid first challenge epoch")
+    if challengeTimeoutEpochs <= 0:
+        return Err[bool]("v3 pin runtime: invalid challenge timeout")
+    if maxRetryCount < 0:
+        return Err[bool]("v3 pin runtime: invalid retry count")
+    let acceptStoreRes = v3PinRuntimeStoreAccept(runtime, offer, accept)
+    if IsErr(acceptStoreRes):
+        return Err[bool](Error(acceptStoreRes))
+    let manifestStoreRes = v3PinRuntimeStoreManifest(runtime, manifest, params)
+    if IsErr(manifestStoreRes):
+        return Err[bool](Error(manifestStoreRes))
+    if firstChallengeEpoch > accept.retainedUntilEpoch:
+        return Err[bool]("v3 pin runtime: first challenge after retained epoch")
+    let pos = v3PinRuntimeSchedulePos(runtime, accept.acceptCid)
+    var schedule = v3PinRuntimeScheduleZero()
+    schedule.offerCid = offer.offerCid
+    schedule.acceptCid = accept.acceptCid
+    schedule.manifestCid = manifest.manifestCid
+    schedule.nextChallengeEpoch = firstChallengeEpoch
+    schedule.challengeTimeoutEpochs = challengeTimeoutEpochs
+    schedule.maxRetryCount = maxRetryCount
+    if pos >= 0:
+        runtime.schedules[pos] = schedule
+    else:
+        add(runtime.schedules, schedule)
+    return Ok[bool](true)
+
+fn v3PinRuntimeFindOffer(runtime: V3PinRuntime,
+                         offerCid: layout.FixedBytes32): Result[pin.V3PinOffer] =
+    let pos = v3PinRuntimeOfferPos(runtime, offerCid)
+    if pos < 0:
+        return Err[pin.V3PinOffer]("v3 pin runtime: offer missing")
+    return Ok[pin.V3PinOffer](runtime.offers[pos])
+
+fn v3PinRuntimeFindAccept(runtime: V3PinRuntime,
+                          acceptCid: layout.FixedBytes32): Result[pin.V3PinAccept] =
+    let pos = v3PinRuntimeAcceptPos(runtime, acceptCid)
+    if pos < 0:
+        return Err[pin.V3PinAccept]("v3 pin runtime: accept missing")
+    return Ok[pin.V3PinAccept](runtime.accepts[pos])
+
+fn v3PinRuntimeFindManifest(runtime: V3PinRuntime,
+                            manifestCid: layout.FixedBytes32): Result[swarm.V3ErasureShardManifest] =
+    let pos = v3PinRuntimeManifestPos(runtime, manifestCid)
+    if pos < 0:
+        return Err[swarm.V3ErasureShardManifest]("v3 pin runtime: manifest missing")
+    return Ok[swarm.V3ErasureShardManifest](runtime.manifests[pos])
+
+fn v3PinRuntimeFindSettlement(runtime: V3PinRuntime,
+                              settlementCid: layout.FixedBytes32): Result[pin.V3PinSettlement] =
+    let pos = v3PinRuntimeSettlementPos(runtime, settlementCid)
+    if pos < 0:
+        return Err[pin.V3PinSettlement]("v3 pin runtime: settlement missing")
+    return Ok[pin.V3PinSettlement](runtime.settlements[pos])
+
+fn v3PinRuntimeFindChallenge(runtime: V3PinRuntime,
+                             challengeCid: layout.FixedBytes32): Result[pin.V3PinChallenge] =
+    let pos = v3PinRuntimeChallengePos(runtime, challengeCid)
+    if pos < 0:
+        return Err[pin.V3PinChallenge]("v3 pin runtime: challenge missing")
+    return Ok[pin.V3PinChallenge](runtime.challenges[pos])
+
+fn v3PinRuntimeFindSchedule(runtime: V3PinRuntime,
+                            acceptCid: layout.FixedBytes32): Result[V3PinRuntimeSchedule] =
+    let pos = v3PinRuntimeSchedulePos(runtime, acceptCid)
+    if pos < 0:
+        return Err[V3PinRuntimeSchedule]("v3 pin runtime: schedule missing")
+    return Ok[V3PinRuntimeSchedule](runtime.schedules[pos])
+
+fn v3PinRuntimeShardPayload(runtime: V3PinRuntime,
+                            manifestCid: layout.FixedBytes32,
+                            shardIndex: int32,
+                            shardCid: layout.FixedBytes32): Result[Bytes] =
+    let pos = v3PinRuntimeShardPos(runtime, manifestCid, shardIndex, shardCid)
+    if pos < 0:
+        return Err[Bytes]("v3 pin runtime: shard missing")
+    return Ok[Bytes](runtime.shards[pos].payload)
+
+fn v3PinRuntimeTimeoutProof(challenge: pin.V3PinChallenge): pin.V3PinProof =
+    var proof = pin.v3PinProofZero()
+    proof.challengeCid = challenge.challengeCid
+    proof.acceptCid = challenge.acceptCid
+    proof.manifestCid = challenge.manifestCid
+    proof.shardCount = challenge.shardCount
+    proof.shardIndices = challenge.shardIndices
+    var lens: int32[]
+    lens = []
+    for i in 0..<challenge.shardCount:
+        add(lens, 0)
+    proof.shardPayloadLens = lens
+    proof.payloadConcat = emptyBytes()
+    proof.payloadConcatLen = 0
+    proof.proofCid = pin.v3PinProofCid(proof.challengeCid,
+                                       proof.acceptCid,
+                                       proof.manifestCid,
+                                       proof.shardIndices,
+                                       proof.shardPayloadLens,
+                                       proof.payloadConcat)
+    return proof
+
+fn v3PinRuntimeOpenChallenge(runtime: var V3PinRuntime,
+                             acceptCid: layout.FixedBytes32,
+                             nowEpoch: int32): Result[pin.V3PinChallenge] =
+    let schedulePos = v3PinRuntimeSchedulePos(runtime, acceptCid)
+    if schedulePos < 0:
+        return Err[pin.V3PinChallenge]("v3 pin runtime: schedule missing")
+    var schedule = runtime.schedules[schedulePos]
+    if schedule.closed:
+        return Err[pin.V3PinChallenge]("v3 pin runtime: schedule closed")
+    if v3PinRuntimeSchedulePending(schedule):
+        let pendingRes = v3PinRuntimeFindChallenge(runtime, schedule.pendingChallengeCid)
+        if IsErr(pendingRes):
+            return Err[pin.V3PinChallenge](Error(pendingRes))
+        return pendingRes
+    if nowEpoch < schedule.nextChallengeEpoch:
+        return Err[pin.V3PinChallenge]("v3 pin runtime: challenge not due")
+    let offerRes = v3PinRuntimeFindOffer(runtime, schedule.offerCid)
+    if IsErr(offerRes):
+        return Err[pin.V3PinChallenge](Error(offerRes))
+    let offer = Value(offerRes)
+    let acceptRes = v3PinRuntimeFindAccept(runtime, acceptCid)
+    if IsErr(acceptRes):
+        return Err[pin.V3PinChallenge](Error(acceptRes))
+    let accept = Value(acceptRes)
+    let manifestRes = v3PinRuntimeFindManifest(runtime, schedule.manifestCid)
+    if IsErr(manifestRes):
+        return Err[pin.V3PinChallenge](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    if schedule.nextChallengeEpoch > accept.retainedUntilEpoch:
+        return Err[pin.V3PinChallenge]("v3 pin runtime: retained window exhausted")
+    let challengeRes = pin.v3PinBuildChallenge(offer, accept, manifest, schedule.nextChallengeEpoch)
+    if IsErr(challengeRes):
+        return Err[pin.V3PinChallenge](Error(challengeRes))
+    let challenge = Value(challengeRes)
+    let challengeStoreRes = v3PinRuntimeStoreChallenge(runtime, challenge, offer, accept, manifest)
+    if IsErr(challengeStoreRes):
+        return Err[pin.V3PinChallenge](Error(challengeStoreRes))
+    schedule.pendingChallengeCid = challenge.challengeCid
+    schedule.pendingChallengeEpoch = challenge.challengeEpoch
+    schedule.pendingDeadlineEpoch = challenge.challengeEpoch + schedule.challengeTimeoutEpochs
+    schedule.retryCount = 0
+    schedule.lastChallengeCid = challenge.challengeCid
+    runtime.schedules[schedulePos] = schedule
+    return Ok[pin.V3PinChallenge](challenge)
+
+fn v3PinRuntimeCompleteChallenge(runtime: var V3PinRuntime,
+                                 acceptCid: layout.FixedBytes32,
+                                 proof: pin.V3PinProof,
+                                 settledEpoch: int32): Result[V3PinRuntimeStepResult] =
+    let schedulePos = v3PinRuntimeSchedulePos(runtime, acceptCid)
+    if schedulePos < 0:
+        return Err[V3PinRuntimeStepResult]("v3 pin runtime: schedule missing")
+    var schedule = runtime.schedules[schedulePos]
+    if !v3PinRuntimeSchedulePending(schedule):
+        return Err[V3PinRuntimeStepResult]("v3 pin runtime: no pending challenge")
+    let challengeRes = v3PinRuntimeFindChallenge(runtime, schedule.pendingChallengeCid)
+    if IsErr(challengeRes):
+        return Err[V3PinRuntimeStepResult](Error(challengeRes))
+    let challenge = Value(challengeRes)
+    let offerRes = v3PinRuntimeFindOffer(runtime, schedule.offerCid)
+    if IsErr(offerRes):
+        return Err[V3PinRuntimeStepResult](Error(offerRes))
+    let offer = Value(offerRes)
+    let acceptRes = v3PinRuntimeFindAccept(runtime, acceptCid)
+    if IsErr(acceptRes):
+        return Err[V3PinRuntimeStepResult](Error(acceptRes))
+    let accept = Value(acceptRes)
+    let manifestRes = v3PinRuntimeFindManifest(runtime, schedule.manifestCid)
+    if IsErr(manifestRes):
+        return Err[V3PinRuntimeStepResult](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let proofStoreRes = v3PinRuntimeStoreProof(runtime, proof, challenge, accept, manifest)
+    if IsErr(proofStoreRes):
+        return Err[V3PinRuntimeStepResult](Error(proofStoreRes))
+    let settlementRes = pin.v3PinBuildSettlement(offer, accept, challenge, manifest, proof, settledEpoch)
+    if IsErr(settlementRes):
+        return Err[V3PinRuntimeStepResult](Error(settlementRes))
+    let settlement = Value(settlementRes)
+    let settlementStoreRes = v3PinRuntimeStoreSettlement(runtime,
+                                                         settlement,
+                                                         offer,
+                                                         accept,
+                                                         challenge,
+                                                         manifest,
+                                                         proof)
+    if IsErr(settlementStoreRes):
+        return Err[V3PinRuntimeStepResult](Error(settlementStoreRes))
+    schedule.pendingChallengeCid = layout.fixedBytes32Zero()
+    schedule.pendingChallengeEpoch = 0
+    schedule.pendingDeadlineEpoch = 0
+    schedule.retryCount = 0
+    schedule.lastProofCid = proof.proofCid
+    schedule.lastSettlementCid = settlement.settlementCid
+    schedule.lastSettledEpoch = settledEpoch
+    schedule.lastStatus = settlement.status
+    if settlement.status == pin.v3PinSettlementStatusSlash:
+        schedule.closed = true
+    else:
+        schedule.nextChallengeEpoch = settledEpoch + 1
+        if schedule.nextChallengeEpoch > accept.retainedUntilEpoch:
+            schedule.closed = true
+    runtime.schedules[schedulePos] = schedule
+    var out = v3PinRuntimeStepResultZero()
+    out.acceptCid = acceptCid
+    out.challengeCid = challenge.challengeCid
+    out.proofCid = proof.proofCid
+    out.settlementCid = settlement.settlementCid
+    out.retryCount = schedule.retryCount
+    out.nextChallengeEpoch = schedule.nextChallengeEpoch
+    out.closed = schedule.closed
+    if settlement.status == pin.v3PinSettlementStatusReward:
+        out.outcomeKind = v3PinRuntimeStepKindReward
+    else:
+        out.outcomeKind = v3PinRuntimeStepKindSlash
+    return Ok[V3PinRuntimeStepResult](out)
+
+fn v3PinRuntimeNoteChallengeFailure(runtime: var V3PinRuntime,
+                                    acceptCid: layout.FixedBytes32,
+                                    nowEpoch: int32): Result[V3PinRuntimeStepResult] =
+    let schedulePos = v3PinRuntimeSchedulePos(runtime, acceptCid)
+    if schedulePos < 0:
+        return Err[V3PinRuntimeStepResult]("v3 pin runtime: schedule missing")
+    var schedule = runtime.schedules[schedulePos]
+    if !v3PinRuntimeSchedulePending(schedule):
+        return Err[V3PinRuntimeStepResult]("v3 pin runtime: no pending challenge")
+    let challengeRes = v3PinRuntimeFindChallenge(runtime, schedule.pendingChallengeCid)
+    if IsErr(challengeRes):
+        return Err[V3PinRuntimeStepResult](Error(challengeRes))
+    let challenge = Value(challengeRes)
+    let offerRes = v3PinRuntimeFindOffer(runtime, schedule.offerCid)
+    if IsErr(offerRes):
+        return Err[V3PinRuntimeStepResult](Error(offerRes))
+    let offer = Value(offerRes)
+    let acceptRes = v3PinRuntimeFindAccept(runtime, acceptCid)
+    if IsErr(acceptRes):
+        return Err[V3PinRuntimeStepResult](Error(acceptRes))
+    let accept = Value(acceptRes)
+    let manifestRes = v3PinRuntimeFindManifest(runtime, schedule.manifestCid)
+    if IsErr(manifestRes):
+        return Err[V3PinRuntimeStepResult](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    schedule.retryCount = schedule.retryCount + 1
+    if schedule.retryCount <= schedule.maxRetryCount && nowEpoch < schedule.pendingDeadlineEpoch:
+        runtime.schedules[schedulePos] = schedule
+        var retry = v3PinRuntimeStepResultZero()
+        retry.acceptCid = acceptCid
+        retry.challengeCid = challenge.challengeCid
+        retry.retryCount = schedule.retryCount
+        retry.nextChallengeEpoch = schedule.nextChallengeEpoch
+        retry.closed = false
+        retry.outcomeKind = v3PinRuntimeStepKindRetry
+        return Ok[V3PinRuntimeStepResult](retry)
+    let timeoutProof = v3PinRuntimeTimeoutProof(challenge)
+    let proofStoreRes = v3PinRuntimeStoreProofObject(runtime, timeoutProof)
+    if IsErr(proofStoreRes):
+        return Err[V3PinRuntimeStepResult](Error(proofStoreRes))
+    let settlementRes = pin.v3PinBuildSettlement(offer,
+                                                 accept,
+                                                 challenge,
+                                                 manifest,
+                                                 timeoutProof,
+                                                 nowEpoch)
+    if IsErr(settlementRes):
+        return Err[V3PinRuntimeStepResult](Error(settlementRes))
+    let settlement = Value(settlementRes)
+    let settlementStoreRes = v3PinRuntimeStoreSettlement(runtime,
+                                                         settlement,
+                                                         offer,
+                                                         accept,
+                                                         challenge,
+                                                         manifest,
+                                                         timeoutProof)
+    if IsErr(settlementStoreRes):
+        return Err[V3PinRuntimeStepResult](Error(settlementStoreRes))
+    schedule.pendingChallengeCid = layout.fixedBytes32Zero()
+    schedule.pendingChallengeEpoch = 0
+    schedule.pendingDeadlineEpoch = 0
+    schedule.lastProofCid = timeoutProof.proofCid
+    schedule.lastSettlementCid = settlement.settlementCid
+    schedule.lastSettledEpoch = nowEpoch
+    schedule.lastStatus = settlement.status
+    schedule.closed = true
+    runtime.schedules[schedulePos] = schedule
+    var out = v3PinRuntimeStepResultZero()
+    out.acceptCid = acceptCid
+    out.challengeCid = challenge.challengeCid
+    out.proofCid = timeoutProof.proofCid
+    out.settlementCid = settlement.settlementCid
+    out.outcomeKind = v3PinRuntimeStepKindSlash
+    out.retryCount = schedule.retryCount
+    out.nextChallengeEpoch = schedule.nextChallengeEpoch
+    out.closed = true
+    return Ok[V3PinRuntimeStepResult](out)
+
+fn v3PinRuntimeBuildProof(runtime: var V3PinRuntime,
+                          challenge: pin.V3PinChallenge): Result[pin.V3PinProof] =
+    let challengeOk = pin.v3PinChallengeValidate(challenge)
+    if IsErr(challengeOk):
+        return Err[pin.V3PinProof](Error(challengeOk))
+    let offerRes = v3PinRuntimeFindOffer(runtime, challenge.offerCid)
+    if IsErr(offerRes):
+        return Err[pin.V3PinProof](Error(offerRes))
+    let offer = Value(offerRes)
+    let acceptRes = v3PinRuntimeFindAccept(runtime, challenge.acceptCid)
+    if IsErr(acceptRes):
+        return Err[pin.V3PinProof](Error(acceptRes))
+    let accept = Value(acceptRes)
+    let manifestRes = v3PinRuntimeFindManifest(runtime, challenge.manifestCid)
+    if IsErr(manifestRes):
+        return Err[pin.V3PinProof](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let challengeInputsOk = pin.v3PinChallengeValidateAgainstInputs(challenge,
+                                                                    offer,
+                                                                    accept,
+                                                                    manifest)
+    if IsErr(challengeInputsOk):
+        return Err[pin.V3PinProof](Error(challengeInputsOk))
+    var payloads: Bytes[]
+    payloads = []
+    for i in 0..<challenge.shardCount:
+        let payloadRes = v3PinRuntimeShardPayload(runtime,
+                                                  challenge.manifestCid,
+                                                  challenge.shardIndices[i],
+                                                  challenge.shardCids[i])
+        if IsErr(payloadRes):
+            return Err[pin.V3PinProof](Error(payloadRes))
+        add(payloads, Value(payloadRes))
+    let challengeStoreRes = v3PinRuntimeStoreChallenge(runtime, challenge, offer, accept, manifest)
+    if IsErr(challengeStoreRes):
+        return Err[pin.V3PinProof](Error(challengeStoreRes))
+    let proofRes = pin.v3PinProofMake(challenge, manifest, payloads)
+    if IsErr(proofRes):
+        return Err[pin.V3PinProof](Error(proofRes))
+    let proof = Value(proofRes)
+    let proofStoreRes = v3PinRuntimeStoreProof(runtime, proof, challenge, accept, manifest)
+    if IsErr(proofStoreRes):
+        return Err[pin.V3PinProof](Error(proofStoreRes))
+    return Ok[pin.V3PinProof](proof)
+
+fn v3PinRuntimeServeChallengePayload(runtime: var V3PinRuntime,
+                                     requestPayload: Bytes): Result[Bytes] =
+    let challengeRes = pin.v3PinChallengeDecode(requestPayload)
+    if IsErr(challengeRes):
+        return Err[Bytes](Error(challengeRes))
+    let challenge = Value(challengeRes)
+    let challengePayloadOk = pin.v3PinChallengeValidatePayload(requestPayload, challenge.challengeCid)
+    if IsErr(challengePayloadOk):
+        return Err[Bytes](Error(challengePayloadOk))
+    let proofRes = v3PinRuntimeBuildProof(runtime, challenge)
+    if IsErr(proofRes):
+        return Err[Bytes](Error(proofRes))
+    let proof = Value(proofRes)
+    return Ok[Bytes](pin.v3PinProofEncode(proof))

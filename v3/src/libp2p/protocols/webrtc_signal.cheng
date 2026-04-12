@@ -1,0 +1,425 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+
+const
+    v3Libp2pWebrtcSignalOffer: int32 = 1
+    v3Libp2pWebrtcSignalAnswer: int32 = 2
+    v3Libp2pWebrtcSignalIceCandidate: int32 = 3
+    v3Libp2pWebrtcSignalTurnPolicy: int32 = 4
+
+type
+    V3Libp2pWebrtcTurnServer =
+        url: str
+        username: str
+        credential: str
+
+    V3Libp2pWebrtcSignalMessage =
+        kind: int32
+        sessionId: layout.FixedBytes32
+        sdp: str
+        candidateMid: str
+        candidateMLineIndex: int32
+        candidateText: str
+        relayOnly: bool
+        stunUrls: str[]
+        turnServers: V3Libp2pWebrtcTurnServer[]
+
+    V3Libp2pWebrtcSignalSession =
+        sessionId: layout.FixedBytes32
+        offerSeen: bool
+        answerSeen: bool
+        policySeen: bool
+        ready: bool
+        relayOnly: bool
+        offerSdp: str
+        answerSdp: str
+        candidateMids: str[]
+        candidateTexts: str[]
+        stunUrls: str[]
+        turnServers: V3Libp2pWebrtcTurnServer[]
+
+fn v3Libp2pWebrtcTurnServerZero(): V3Libp2pWebrtcTurnServer =
+    var out: V3Libp2pWebrtcTurnServer
+    return out
+
+fn v3Libp2pWebrtcSignalMessageZero(): V3Libp2pWebrtcSignalMessage =
+    var out: V3Libp2pWebrtcSignalMessage
+    out.sessionId = layout.fixedBytes32Zero()
+    out.candidateMLineIndex = 0
+    out.relayOnly = false
+    out.stunUrls = []
+    out.turnServers = []
+    return out
+
+fn v3Libp2pWebrtcSignalSessionZero(): V3Libp2pWebrtcSignalSession =
+    var out: V3Libp2pWebrtcSignalSession
+    out.sessionId = layout.fixedBytes32Zero()
+    out.offerSeen = false
+    out.answerSeen = false
+    out.policySeen = false
+    out.ready = false
+    out.relayOnly = false
+    out.offerSdp = ""
+    out.answerSdp = ""
+    out.candidateMids = []
+    out.candidateTexts = []
+    out.stunUrls = []
+    out.turnServers = []
+    return out
+
+fn v3Libp2pWebrtcSignalMessageClone(msg: V3Libp2pWebrtcSignalMessage): V3Libp2pWebrtcSignalMessage =
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    out.kind = msg.kind
+    out.sessionId = msg.sessionId
+    out.sdp = msg.sdp
+    out.candidateMid = msg.candidateMid
+    out.candidateMLineIndex = msg.candidateMLineIndex
+    out.candidateText = msg.candidateText
+    out.relayOnly = msg.relayOnly
+    out.stunUrls = []
+    for i in 0..<msg.stunUrls.len:
+        add(out.stunUrls, msg.stunUrls[i])
+    out.turnServers = []
+    for i in 0..<msg.turnServers.len:
+        let insert = v3Libp2pWebrtcTurnServerZero()
+        add(out.turnServers, insert)
+        let idx = out.turnServers.len - 1
+        out.turnServers[idx].url = msg.turnServers[i].url
+        out.turnServers[idx].username = msg.turnServers[i].username
+        out.turnServers[idx].credential = msg.turnServers[i].credential
+    return out
+
+fn v3Libp2pWebrtcSignalSessionReady(session: V3Libp2pWebrtcSignalSession): bool =
+    if !session.offerSeen:
+        return false
+    if !session.answerSeen:
+        return false
+    if !session.policySeen:
+        return false
+    if session.candidateTexts.len < 2:
+        return false
+    return true
+
+fn v3Libp2pWebrtcSignalSessionSetTurnPolicy(session: var V3Libp2pWebrtcSignalSession,
+                                            relayOnly: bool,
+                                            stunUrls: str[],
+                                            turnServers: V3Libp2pWebrtcTurnServer[]) =
+    session.policySeen = true
+    session.relayOnly = relayOnly
+    session.stunUrls = []
+    for i in 0..<stunUrls.len:
+        add(session.stunUrls, stunUrls[i])
+    session.turnServers = []
+    for i in 0..<turnServers.len:
+        let insert = v3Libp2pWebrtcTurnServerZero()
+        add(session.turnServers, insert)
+        let idx = session.turnServers.len - 1
+        session.turnServers[idx].url = turnServers[i].url
+        session.turnServers[idx].username = turnServers[i].username
+        session.turnServers[idx].credential = turnServers[i].credential
+
+fn v3Libp2pWebrtcSignalMakeOffer(sessionId: layout.FixedBytes32,
+                                 sdp: str): V3Libp2pWebrtcSignalMessage =
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    out.kind = v3Libp2pWebrtcSignalOffer
+    out.sessionId = sessionId
+    out.sdp = sdp
+    return out
+
+fn v3Libp2pWebrtcSignalMakeAnswer(sessionId: layout.FixedBytes32,
+                                  sdp: str): V3Libp2pWebrtcSignalMessage =
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    out.kind = v3Libp2pWebrtcSignalAnswer
+    out.sessionId = sessionId
+    out.sdp = sdp
+    return out
+
+fn v3Libp2pWebrtcSignalMakeCandidate(sessionId: layout.FixedBytes32,
+                                     candidateMid: str,
+                                     candidateMLineIndex: int32,
+                                     candidateText: str): V3Libp2pWebrtcSignalMessage =
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    out.kind = v3Libp2pWebrtcSignalIceCandidate
+    out.sessionId = sessionId
+    out.candidateMid = candidateMid
+    out.candidateMLineIndex = candidateMLineIndex
+    out.candidateText = candidateText
+    return out
+
+fn v3Libp2pWebrtcSignalMakeTurnPolicy(sessionId: layout.FixedBytes32,
+                                      relayOnly: bool,
+                                      stunUrls: str[],
+                                      turnServers: V3Libp2pWebrtcTurnServer[]): V3Libp2pWebrtcSignalMessage =
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    out.kind = v3Libp2pWebrtcSignalTurnPolicy
+    out.sessionId = sessionId
+    out.relayOnly = relayOnly
+    out.stunUrls = []
+    for i in 0..<stunUrls.len:
+        add(out.stunUrls, stunUrls[i])
+    out.turnServers = []
+    for i in 0..<turnServers.len:
+        let insert = v3Libp2pWebrtcTurnServerZero()
+        add(out.turnServers, insert)
+        let idx = out.turnServers.len - 1
+        out.turnServers[idx].url = turnServers[i].url
+        out.turnServers[idx].username = turnServers[i].username
+        out.turnServers[idx].credential = turnServers[i].credential
+    return out
+
+fn v3Libp2pWebrtcSignalSessionApply(session: var V3Libp2pWebrtcSignalSession,
+                                    msg: V3Libp2pWebrtcSignalMessage): Result[bool] =
+    if layout.fixedBytes32Equal(msg.sessionId, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 libp2p webrtc signal: missing session id")
+    if layout.fixedBytes32Equal(session.sessionId, layout.fixedBytes32Zero()):
+        session.sessionId = msg.sessionId
+    elif !layout.fixedBytes32Equal(session.sessionId, msg.sessionId):
+        return Err[bool]("v3 libp2p webrtc signal: session id mismatch")
+    if msg.kind == v3Libp2pWebrtcSignalOffer:
+        if len(msg.sdp) == 0:
+            return Err[bool]("v3 libp2p webrtc signal: empty offer")
+        session.offerSeen = true
+        session.offerSdp = msg.sdp
+    elif msg.kind == v3Libp2pWebrtcSignalAnswer:
+        if len(msg.sdp) == 0:
+            return Err[bool]("v3 libp2p webrtc signal: empty answer")
+        session.answerSeen = true
+        session.answerSdp = msg.sdp
+    elif msg.kind == v3Libp2pWebrtcSignalIceCandidate:
+        if len(msg.candidateText) == 0:
+            return Err[bool]("v3 libp2p webrtc signal: empty candidate")
+        add(session.candidateMids, msg.candidateMid)
+        add(session.candidateTexts, msg.candidateText)
+    elif msg.kind == v3Libp2pWebrtcSignalTurnPolicy:
+        v3Libp2pWebrtcSignalSessionSetTurnPolicy(session,
+                                                 msg.relayOnly,
+                                                 msg.stunUrls,
+                                                 msg.turnServers)
+    else:
+        return Err[bool]("v3 libp2p webrtc signal: unsupported message kind")
+    session.ready = v3Libp2pWebrtcSignalSessionReady(session)
+    return Ok[bool](true)
+
+fn v3WebrtcSignalAppendU32(buf: var layout.ByteBuf, value: int32) =
+    layout.byteBufAppendByte(buf, (value >> 24) & 255)
+    layout.byteBufAppendByte(buf, (value >> 16) & 255)
+    layout.byteBufAppendByte(buf, (value >> 8) & 255)
+    layout.byteBufAppendByte(buf, value & 255)
+
+fn v3WebrtcSignalReadU32(span: layout.ByteSpan, offset: int32): Result[int32] =
+    if offset < 0 || offset + 4 > layout.byteSpanLen(span):
+        return Err[int32]("v3 libp2p webrtc signal: short u32")
+    let b0 = layout.byteSpanAt(span, offset)
+    let b1 = layout.byteSpanAt(span, offset + 1)
+    let b2 = layout.byteSpanAt(span, offset + 2)
+    let b3 = layout.byteSpanAt(span, offset + 3)
+    return Ok[int32]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3WebrtcSignalAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    for i in 0..<layout.fixedBytes32Size:
+        layout.byteBufAppendByte(buf, int32(value.data[i]) & 255)
+
+fn v3WebrtcSignalReadFixed32(span: layout.ByteSpan, offset: int32): Result[layout.FixedBytes32] =
+    if offset < 0 || offset + layout.fixedBytes32Size > layout.byteSpanLen(span):
+        return Err[layout.FixedBytes32]("v3 libp2p webrtc signal: short fixed32")
+    return layout.fixedBytes32FromBytes(layout.byteSpanToBytes(layout.byteSpanSlice(span,
+                                                                                   offset,
+                                                                                   layout.fixedBytes32Size)))
+
+fn v3WebrtcSignalAppendStr(buf: var layout.ByteBuf, text: str) =
+    let data = bytesFromString(text)
+    v3WebrtcSignalAppendU32(buf, bytesLen(data))
+    layout.byteBufAppendBytes(buf, data)
+
+fn v3WebrtcSignalReadStr(span: layout.ByteSpan, offset: int32): Result[str] =
+    let lenRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(lenRes):
+        return Err[str](Error(lenRes))
+    let size = Value(lenRes)
+    let start = offset + 4
+    if size < 0 || start + size > layout.byteSpanLen(span):
+        return Err[str]("v3 libp2p webrtc signal: short string")
+    let data = layout.byteSpanToBytes(layout.byteSpanSlice(span, start, size))
+    return Ok[str](bytesToString(data))
+
+fn v3WebrtcSignalStrNext(span: layout.ByteSpan, offset: int32): Result[int32] =
+    let lenRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(lenRes):
+        return Err[int32](Error(lenRes))
+    return Ok[int32](offset + 4 + Value(lenRes))
+
+fn v3Libp2pWebrtcSignalEncode(msg: V3Libp2pWebrtcSignalMessage): Bytes =
+    var buf = layout.byteBufInit(256)
+    v3WebrtcSignalAppendU32(buf, msg.kind)
+    v3WebrtcSignalAppendFixed32(buf, msg.sessionId)
+    v3WebrtcSignalAppendStr(buf, msg.sdp)
+    v3WebrtcSignalAppendStr(buf, msg.candidateMid)
+    v3WebrtcSignalAppendU32(buf, msg.candidateMLineIndex)
+    v3WebrtcSignalAppendStr(buf, msg.candidateText)
+    v3WebrtcSignalAppendU32(buf, int32(msg.relayOnly))
+    v3WebrtcSignalAppendU32(buf, msg.stunUrls.len)
+    for i in 0..<msg.stunUrls.len:
+        v3WebrtcSignalAppendStr(buf, msg.stunUrls[i])
+    v3WebrtcSignalAppendU32(buf, msg.turnServers.len)
+    for i in 0..<msg.turnServers.len:
+        let server = msg.turnServers[i]
+        v3WebrtcSignalAppendStr(buf, server.url)
+        v3WebrtcSignalAppendStr(buf, server.username)
+        v3WebrtcSignalAppendStr(buf, server.credential)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pWebrtcSignalDecode(payload: Bytes): Result[V3Libp2pWebrtcSignalMessage] =
+    let span = layout.byteSpanFromBytes(payload)
+    if layout.byteSpanLen(span) < 4 + layout.fixedBytes32Size:
+        return Err[V3Libp2pWebrtcSignalMessage]("v3 libp2p webrtc signal: short payload")
+    var out = v3Libp2pWebrtcSignalMessageZero()
+    let kindRes = v3WebrtcSignalReadU32(span, 0)
+    if IsErr(kindRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(kindRes))
+    out.kind = Value(kindRes)
+    let sessionRes = v3WebrtcSignalReadFixed32(span, 4)
+    if IsErr(sessionRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(sessionRes))
+    out.sessionId = Value(sessionRes)
+    var offset = 4 + layout.fixedBytes32Size
+    let sdpRes = v3WebrtcSignalReadStr(span, offset)
+    if IsErr(sdpRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(sdpRes))
+    out.sdp = Value(sdpRes)
+    let sdpNextRes = v3WebrtcSignalStrNext(span, offset)
+    if IsErr(sdpNextRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(sdpNextRes))
+    offset = Value(sdpNextRes)
+    let midRes = v3WebrtcSignalReadStr(span, offset)
+    if IsErr(midRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(midRes))
+    out.candidateMid = Value(midRes)
+    let midNextRes = v3WebrtcSignalStrNext(span, offset)
+    if IsErr(midNextRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(midNextRes))
+    offset = Value(midNextRes)
+    let lineRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(lineRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(lineRes))
+    out.candidateMLineIndex = Value(lineRes)
+    offset = offset + 4
+    let candidateRes = v3WebrtcSignalReadStr(span, offset)
+    if IsErr(candidateRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(candidateRes))
+    out.candidateText = Value(candidateRes)
+    let candidateNextRes = v3WebrtcSignalStrNext(span, offset)
+    if IsErr(candidateNextRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(candidateNextRes))
+    offset = Value(candidateNextRes)
+    let relayRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(relayRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(relayRes))
+    out.relayOnly = Value(relayRes) != 0
+    offset = offset + 4
+    let stunCountRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(stunCountRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(stunCountRes))
+    let stunCount = Value(stunCountRes)
+    offset = offset + 4
+    out.stunUrls = []
+    for i in 0..<stunCount:
+        let stunRes = v3WebrtcSignalReadStr(span, offset)
+        if IsErr(stunRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(stunRes))
+        add(out.stunUrls, Value(stunRes))
+        let stunNextRes = v3WebrtcSignalStrNext(span, offset)
+        if IsErr(stunNextRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(stunNextRes))
+        offset = Value(stunNextRes)
+    let turnCountRes = v3WebrtcSignalReadU32(span, offset)
+    if IsErr(turnCountRes):
+        return Err[V3Libp2pWebrtcSignalMessage](Error(turnCountRes))
+    let turnCount = Value(turnCountRes)
+    offset = offset + 4
+    out.turnServers = []
+    for i in 0..<turnCount:
+        let urlRes = v3WebrtcSignalReadStr(span, offset)
+        if IsErr(urlRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(urlRes))
+        let urlNextRes = v3WebrtcSignalStrNext(span, offset)
+        if IsErr(urlNextRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(urlNextRes))
+        offset = Value(urlNextRes)
+        let usernameRes = v3WebrtcSignalReadStr(span, offset)
+        if IsErr(usernameRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(usernameRes))
+        let usernameNextRes = v3WebrtcSignalStrNext(span, offset)
+        if IsErr(usernameNextRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(usernameNextRes))
+        offset = Value(usernameNextRes)
+        let credentialRes = v3WebrtcSignalReadStr(span, offset)
+        if IsErr(credentialRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(credentialRes))
+        let credentialNextRes = v3WebrtcSignalStrNext(span, offset)
+        if IsErr(credentialNextRes):
+            return Err[V3Libp2pWebrtcSignalMessage](Error(credentialNextRes))
+        offset = Value(credentialNextRes)
+        let insert = v3Libp2pWebrtcTurnServerZero()
+        add(out.turnServers, insert)
+        let idx = out.turnServers.len - 1
+        out.turnServers[idx].url = Value(urlRes)
+        out.turnServers[idx].username = Value(usernameRes)
+        out.turnServers[idx].credential = Value(credentialRes)
+    if offset != layout.byteSpanLen(span):
+        return Err[V3Libp2pWebrtcSignalMessage]("v3 libp2p webrtc signal: trailing bytes")
+    return Ok[V3Libp2pWebrtcSignalMessage](out)
+
+fn v3Libp2pWebrtcSignalTranscriptEncode(messages: V3Libp2pWebrtcSignalMessage[]): Bytes =
+    var buf = layout.byteBufInit(256)
+    v3WebrtcSignalAppendU32(buf, messages.len)
+    for i in 0..<messages.len:
+        let messageBytes = v3Libp2pWebrtcSignalEncode(messages[i])
+        v3WebrtcSignalAppendU32(buf, bytesLen(messageBytes))
+        layout.byteBufAppendBytes(buf, messageBytes)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pWebrtcSignalTranscriptCount(payload: Bytes): Result[int32] =
+    let span = layout.byteSpanFromBytes(payload)
+    if layout.byteSpanLen(span) < 4:
+        return Err[int32]("v3 libp2p webrtc signal: short transcript")
+    return v3WebrtcSignalReadU32(span, 0)
+
+fn v3Libp2pWebrtcSignalTranscriptDecodeFill(out: var V3Libp2pWebrtcSignalMessage[],
+                                            payload: Bytes): Result[bool] =
+    let span = layout.byteSpanFromBytes(payload)
+    let countRes = v3Libp2pWebrtcSignalTranscriptCount(payload)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    let count = Value(countRes)
+    var offset = 4
+    out = []
+    for i in 0..<count:
+        let sizeRes = v3WebrtcSignalReadU32(span, offset)
+        if IsErr(sizeRes):
+            return Err[bool](Error(sizeRes))
+        let size = Value(sizeRes)
+        offset = offset + 4
+        if size < 0 || offset + size > layout.byteSpanLen(span):
+            return Err[bool]("v3 libp2p webrtc signal: short transcript message")
+        let messageBytes = layout.byteSpanToBytes(layout.byteSpanSlice(span, offset, size))
+        let messageRes = v3Libp2pWebrtcSignalDecode(messageBytes)
+        if IsErr(messageRes):
+            return Err[bool](Error(messageRes))
+        add(out, v3Libp2pWebrtcSignalMessageClone(Value(messageRes)))
+        offset = offset + size
+    if offset != layout.byteSpanLen(span):
+        return Err[bool]("v3 libp2p webrtc signal: transcript trailing bytes")
+    return Ok[bool](true)
+
+fn v3Libp2pWebrtcSignalTranscriptApply(session: var V3Libp2pWebrtcSignalSession,
+                                       payload: Bytes): Result[bool] =
+    var messages: V3Libp2pWebrtcSignalMessage[]
+    let decodeRes = v3Libp2pWebrtcSignalTranscriptDecodeFill(messages, payload)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    for i in 0..<messages.len:
+        let applyRes = v3Libp2pWebrtcSignalSessionApply(session, messages[i])
+        if IsErr(applyRes):
+            return Err[bool](Error(applyRes))
+    return Ok[bool](true)

@@ -8477,6 +8477,262 @@ cleanup:
     return err.ptr == NULL || err.len == 0 ? 1 : 0;
 #endif
 }
+WEAK int32_t cheng_v3_webrtc_datachannel_request_response_bridge(ChengStrBridge protocol_text,
+                                                                 ChengStrBridge signal_text,
+                                                                 ChengStrBridge request_text,
+                                                                 ChengStrBridge response_text,
+                                                                 ChengStrBridge* client_response_text,
+                                                                 ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p webrtc: win32 datachannel bridge not implemented";
+    if (client_response_text != NULL) {
+        *client_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)protocol_text;
+    (void)signal_text;
+    (void)request_text;
+    (void)response_text;
+    return 0;
+#else
+    const char* alloc_failed = "v3 libp2p webrtc: alloc failed";
+    const char* signal_missing = "v3 libp2p webrtc: signal transcript missing";
+    const char* signal_length_mismatch = "v3 libp2p webrtc: signal transcript length mismatch";
+    const char* signal_payload_mismatch = "v3 libp2p webrtc: signal transcript mismatch";
+    const char* signal_ack_failed = "v3 libp2p webrtc: signal ack mismatch";
+    const char* request_mismatch = "v3 libp2p webrtc: multistream request mismatch";
+    const char* response_mismatch = "v3 libp2p webrtc: multistream response mismatch";
+    const char* request_payload_mismatch = "v3 libp2p webrtc: request payload mismatch";
+    const char* request_length_mismatch = "v3 libp2p webrtc: request payload length mismatch";
+    const char* response_too_large = "v3 libp2p webrtc: response payload too large";
+    const char* protocol = "";
+    const char* signal_payload = "";
+    const char* request = "";
+    const char* response_payload = "";
+    size_t protocol_len = 0u;
+    size_t signal_len = 0u;
+    size_t request_len = 0u;
+    size_t response_len = 0u;
+    char* server_protocol = NULL;
+    char* client_protocol = NULL;
+    char* server_signal = NULL;
+    char* server_request = NULL;
+    char* client_response = NULL;
+    int control_fds[2] = {-1, -1};
+    int data_fds[2] = {-1, -1};
+    unsigned char frame_len_buf[4];
+    uint32_t frame_len = 0u;
+    char signal_ack = 0;
+    ChengStrBridge err = cheng_str_bridge_empty();
+    ChengStrBridge response = cheng_str_bridge_empty();
+    if (client_response_text != NULL) {
+        *client_response_text = response;
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(signal_text, &signal_payload, &signal_len)) {
+        signal_payload = "";
+        signal_len = 0u;
+    }
+    if (!cheng_str_bridge_view(request_text, &request, &request_len)) {
+        request = "";
+        request_len = 0u;
+    }
+    if (!cheng_str_bridge_view(response_text, &response_payload, &response_len)) {
+        response_payload = "";
+        response_len = 0u;
+    }
+    if (signal_len == 0u) {
+        err = driver_c_str_from_utf8_copy_bridge(signal_missing, (int32_t)strlen(signal_missing));
+        goto cleanup;
+    }
+    if (response_len > 0xffffffffu) {
+        err = driver_c_str_from_utf8_copy_bridge(response_too_large, (int32_t)strlen(response_too_large));
+        goto cleanup;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, control_fds) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: control socketpair");
+        goto cleanup;
+    }
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, data_fds) != 0) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: data socketpair");
+        goto cleanup;
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)signal_len);
+    if (!cheng_v3_tcp_send_all_raw(control_fds[0], (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send signal len");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_send_all_raw(control_fds[0], signal_payload, signal_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send signal payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(control_fds[1], (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv signal len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len != (uint32_t)signal_len) {
+        err = driver_c_str_from_utf8_copy_bridge(signal_length_mismatch, (int32_t)strlen(signal_length_mismatch));
+        goto cleanup;
+    }
+    server_signal = (char*)malloc(signal_len);
+    if (server_signal == NULL) {
+        err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(control_fds[1], server_signal, signal_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv signal payload");
+        goto cleanup;
+    }
+    if (memcmp(server_signal, signal_payload, signal_len) != 0) {
+        err = driver_c_str_from_utf8_copy_bridge(signal_payload_mismatch, (int32_t)strlen(signal_payload_mismatch));
+        goto cleanup;
+    }
+    signal_ack = 1;
+    if (!cheng_v3_tcp_send_all_raw(control_fds[1], &signal_ack, 1u)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send signal ack");
+        goto cleanup;
+    }
+    signal_ack = 0;
+    if (!cheng_v3_tcp_recv_exact_raw(control_fds[0], &signal_ack, 1u)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv signal ack");
+        goto cleanup;
+    }
+    if (signal_ack != 1) {
+        err = driver_c_str_from_utf8_copy_bridge(signal_ack_failed, (int32_t)strlen(signal_ack_failed));
+        goto cleanup;
+    }
+    if (protocol_len > 0u) {
+        server_protocol = (char*)malloc(protocol_len);
+        client_protocol = (char*)malloc(protocol_len);
+        if (server_protocol == NULL || client_protocol == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(data_fds[0], protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send request");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(data_fds[1], server_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv request");
+            goto cleanup;
+        }
+        if (memcmp(server_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_mismatch, (int32_t)strlen(request_mismatch));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_send_all_raw(data_fds[1], protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send response");
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(data_fds[0], client_protocol, protocol_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv response");
+            goto cleanup;
+        }
+        if (memcmp(client_protocol, protocol, protocol_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(response_mismatch, (int32_t)strlen(response_mismatch));
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)request_len);
+    if (!cheng_v3_tcp_send_all_raw(data_fds[0], (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send request len");
+        goto cleanup;
+    }
+    if (request_len > 0u && !cheng_v3_tcp_send_all_raw(data_fds[0], request, request_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send request payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(data_fds[1], (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv request len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len != (uint32_t)request_len) {
+        err = driver_c_str_from_utf8_copy_bridge(request_length_mismatch, (int32_t)strlen(request_length_mismatch));
+        goto cleanup;
+    }
+    if (frame_len > 0u) {
+        server_request = (char*)malloc((size_t)frame_len);
+        if (server_request == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(data_fds[1], server_request, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv request payload");
+            goto cleanup;
+        }
+        if (memcmp(server_request, request, (size_t)frame_len) != 0) {
+            err = driver_c_str_from_utf8_copy_bridge(request_payload_mismatch, (int32_t)strlen(request_payload_mismatch));
+            goto cleanup;
+        }
+    }
+    cheng_v3_tcp_write_u32be(frame_len_buf, (uint32_t)response_len);
+    if (!cheng_v3_tcp_send_all_raw(data_fds[1], (const char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send response len");
+        goto cleanup;
+    }
+    if (response_len > 0u && !cheng_v3_tcp_send_all_raw(data_fds[1], response_payload, response_len)) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: send response payload");
+        goto cleanup;
+    }
+    if (!cheng_v3_tcp_recv_exact_raw(data_fds[0], (char*)frame_len_buf, sizeof(frame_len_buf))) {
+        err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv response len");
+        goto cleanup;
+    }
+    frame_len = cheng_v3_tcp_read_u32be(frame_len_buf);
+    if (frame_len > 0u) {
+        client_response = (char*)malloc((size_t)frame_len);
+        if (client_response == NULL) {
+            err = driver_c_str_from_utf8_copy_bridge(alloc_failed, (int32_t)strlen(alloc_failed));
+            goto cleanup;
+        }
+        if (!cheng_v3_tcp_recv_exact_raw(data_fds[0], client_response, (size_t)frame_len)) {
+            err = cheng_v3_tcp_bridge_error_result("v3 libp2p webrtc: recv response payload");
+            goto cleanup;
+        }
+    }
+    response = driver_c_str_from_utf8_copy_bridge(client_response != NULL ? client_response : "",
+                                                  (int32_t)frame_len);
+cleanup:
+    if (client_response_text != NULL) {
+        *client_response_text = response;
+    } else {
+        cheng_v3_bridge_release_owned(response);
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (control_fds[0] >= 0) {
+        close(control_fds[0]);
+    }
+    if (control_fds[1] >= 0) {
+        close(control_fds[1]);
+    }
+    if (data_fds[0] >= 0) {
+        close(data_fds[0]);
+    }
+    if (data_fds[1] >= 0) {
+        close(data_fds[1]);
+    }
+    free(server_protocol);
+    free(client_protocol);
+    free(server_signal);
+    free(server_request);
+    free(client_response);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
 WEAK int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
                                                     int32_t port,
                                                     ChengStrBridge protocol_text,

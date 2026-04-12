@@ -1,0 +1,325 @@
+import std/rawbytes
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+import cheng/v3/libp2p/core/multistream
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/protocols/webrtc_signal as signal
+
+importc fn cheng_v3_webrtc_datachannel_request_response_bridge(protocolText: str, signalWire: str, requestWire: str, responseWire: str, clientResponseWire: var str, errWire: var str): int32
+
+var v3Libp2pWebrtcNativeDatachannelOpenCount: int32 = 0
+var v3Libp2pWebrtcNativeDatachannelRequestCount: int32 = 0
+var v3Libp2pWebrtcLoopbackRequestResponseCount: int32 = 0
+var v3Libp2pWebrtcLastProtocol: types.V3Libp2pProtocolId = 0
+var v3Libp2pWebrtcLastRelayOnly: bool = false
+var v3Libp2pWebrtcLastSessionId: layout.FixedBytes32 = layout.fixedBytes32Zero()
+
+type
+    V3Libp2pWebrtcTransportConfig =
+        relayOnly: bool
+        stunUrls: str[]
+        turnServers: signal.V3Libp2pWebrtcTurnServer[]
+        dataChannelLabel: str
+
+    V3Libp2pWebrtcLoopbackPair =
+        cfg: V3Libp2pWebrtcTransportConfig
+        remoteAddr: types.V3Libp2pMultiaddr
+        signalSession: signal.V3Libp2pWebrtcSignalSession
+        signalTranscript: signal.V3Libp2pWebrtcSignalMessage[]
+        selectedProtocol: types.V3Libp2pProtocolId
+        clientToServer: Bytes
+        serverToClient: Bytes
+
+fn v3Libp2pWebrtcTransportConfigZero(): V3Libp2pWebrtcTransportConfig =
+    var out: V3Libp2pWebrtcTransportConfig
+    out.relayOnly = false
+    out.stunUrls = []
+    out.turnServers = []
+    out.dataChannelLabel = "cheng-libp2p"
+    return out
+
+fn v3Libp2pWebrtcLoopbackPairZero(): V3Libp2pWebrtcLoopbackPair =
+    var out: V3Libp2pWebrtcLoopbackPair
+    out.cfg = v3Libp2pWebrtcTransportConfigZero()
+    out.remoteAddr = types.v3Libp2pMultiaddrZero()
+    out.signalSession = signal.v3Libp2pWebrtcSignalSessionZero()
+    out.signalTranscript = []
+    out.selectedProtocol = 0
+    out.clientToServer = emptyBytes()
+    out.serverToClient = emptyBytes()
+    return out
+
+fn v3Libp2pWebrtcTransportSupportsAddr(addr: types.V3Libp2pMultiaddr): bool =
+    if addr.transport != types.v3Libp2pTransportWebrtc:
+        return false
+    if addr.networkDomain != types.v3Libp2pNetworkDomainBrowserWebrtc:
+        return false
+    return true
+
+fn v3Libp2pWebrtcAddrText(addr: types.V3Libp2pMultiaddr): str =
+    if len(addr.raw) > 0:
+        return addr.raw
+    var out: str = "/ip4/"
+    out = out + addr.host
+    out = out + "/udp/"
+    out = out + intToStr(addr.port)
+    out = out + "/webrtc-direct"
+    return out
+
+fn v3Libp2pWebrtcTransportSessionId(addr: types.V3Libp2pMultiaddr,
+                                    label: str): layout.FixedBytes32 =
+    let sessionText = "v3.libp2p.webrtc.session\n" + v3Libp2pWebrtcAddrText(addr) + "\n" + label
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(sessionText)))
+
+fn v3Libp2pWebrtcOfferSdp(addr: types.V3Libp2pMultiaddr,
+                          label: str): str =
+    return "v=0\no=- 1 1 IN IP4 " + addr.host + "\n" +
+           "m=application " + intToStr(addr.port) + " UDP/DTLS/SCTP webrtc-datachannel\n" +
+           "a=dcmap:0 label=" + label
+
+fn v3Libp2pWebrtcAnswerSdp(sessionId: layout.FixedBytes32,
+                           label: str): str =
+    let payload = signal.v3Libp2pWebrtcSignalEncode(signal.v3Libp2pWebrtcSignalMakeOffer(sessionId, label))
+    return "v=0\no=- 2 2 IN IP4 127.0.0.1\n" +
+           "a=answer-bytes=" + intToStr(bytesLen(payload)) + "\n" +
+           "a=dcmap:0 label=" + label
+
+fn v3Libp2pWebrtcCandidateText(addr: types.V3Libp2pMultiaddr,
+                               relayOnly: bool,
+                               side: str): str =
+    var out = "candidate:1 1 udp 2130706431 "
+    out = out + addr.host
+    out = out + " "
+    out = out + intToStr(addr.port)
+    if relayOnly:
+        out = out + " typ relay generation 0 ufrag "
+        out = out + side
+        return out
+    out = out + " typ host generation 0 ufrag "
+    out = out + side
+    return out
+
+fn v3Libp2pWebrtcTransportSignalPolicy(cfg: V3Libp2pWebrtcTransportConfig,
+                                       sessionId: layout.FixedBytes32): signal.V3Libp2pWebrtcSignalMessage =
+    return signal.v3Libp2pWebrtcSignalMakeTurnPolicy(sessionId,
+                                                     cfg.relayOnly,
+                                                     cfg.stunUrls,
+                                                     cfg.turnServers)
+
+fn v3Libp2pWebrtcLoopbackAppendTranscript(pair: var V3Libp2pWebrtcLoopbackPair,
+                                          msg: signal.V3Libp2pWebrtcSignalMessage): Result[bool] =
+    let applyRes = signal.v3Libp2pWebrtcSignalSessionApply(pair.signalSession, msg)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    add(pair.signalTranscript, signal.v3Libp2pWebrtcSignalMessageClone(msg))
+    return Ok[bool](true)
+
+fn v3Libp2pWebrtcLoopbackOpenInto(pair: var V3Libp2pWebrtcLoopbackPair,
+                                  cfg: V3Libp2pWebrtcTransportConfig,
+                                  remoteAddr: types.V3Libp2pMultiaddr): Result[bool] =
+    if !v3Libp2pWebrtcTransportSupportsAddr(remoteAddr):
+        return Err[bool]("v3 libp2p webrtc: unsupported multiaddr")
+    pair = v3Libp2pWebrtcLoopbackPairZero()
+    pair.cfg = cfg
+    pair.remoteAddr = remoteAddr
+    let sessionId = v3Libp2pWebrtcTransportSessionId(remoteAddr, cfg.dataChannelLabel)
+    let policy = v3Libp2pWebrtcTransportSignalPolicy(cfg, sessionId)
+    let offer = signal.v3Libp2pWebrtcSignalMakeOffer(sessionId,
+                                                     v3Libp2pWebrtcOfferSdp(remoteAddr,
+                                                                            cfg.dataChannelLabel))
+    let answer = signal.v3Libp2pWebrtcSignalMakeAnswer(sessionId,
+                                                       v3Libp2pWebrtcAnswerSdp(sessionId,
+                                                                               cfg.dataChannelLabel))
+    let clientCandidate = signal.v3Libp2pWebrtcSignalMakeCandidate(sessionId,
+                                                                   "0",
+                                                                   0,
+                                                                   v3Libp2pWebrtcCandidateText(remoteAddr,
+                                                                                              cfg.relayOnly,
+                                                                                              "client"))
+    let serverCandidate = signal.v3Libp2pWebrtcSignalMakeCandidate(sessionId,
+                                                                   "0",
+                                                                   0,
+                                                                   v3Libp2pWebrtcCandidateText(remoteAddr,
+                                                                                              cfg.relayOnly,
+                                                                                              "server"))
+    let policyRes = v3Libp2pWebrtcLoopbackAppendTranscript(pair, policy)
+    if IsErr(policyRes):
+        return Err[bool](Error(policyRes))
+    let offerRes = v3Libp2pWebrtcLoopbackAppendTranscript(pair, offer)
+    if IsErr(offerRes):
+        return Err[bool](Error(offerRes))
+    let answerRes = v3Libp2pWebrtcLoopbackAppendTranscript(pair, answer)
+    if IsErr(answerRes):
+        return Err[bool](Error(answerRes))
+    let clientRes = v3Libp2pWebrtcLoopbackAppendTranscript(pair, clientCandidate)
+    if IsErr(clientRes):
+        return Err[bool](Error(clientRes))
+    let serverRes = v3Libp2pWebrtcLoopbackAppendTranscript(pair, serverCandidate)
+    if IsErr(serverRes):
+        return Err[bool](Error(serverRes))
+    if !signal.v3Libp2pWebrtcSignalSessionReady(pair.signalSession):
+        return Err[bool]("v3 libp2p webrtc: signal session not ready")
+    return Ok[bool](true)
+
+fn v3Libp2pWebrtcLoopbackClose(pair: var V3Libp2pWebrtcLoopbackPair) =
+    pair.selectedProtocol = 0
+    pair.clientToServer = emptyBytes()
+    pair.serverToClient = emptyBytes()
+
+fn v3Libp2pWebrtcLoopbackSelectProtocol(pair: var V3Libp2pWebrtcLoopbackPair,
+                                        protocol: types.V3Libp2pProtocolId): Result[bool] =
+    if !signal.v3Libp2pWebrtcSignalSessionReady(pair.signalSession):
+        return Err[bool]("v3 libp2p webrtc: signal session not ready")
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    if !multistream.v3Libp2pMultistreamAccepts(selectBytes, protocol):
+        return Err[bool]("v3 libp2p webrtc: multistream select mismatch")
+    pair.selectedProtocol = protocol
+    return Ok[bool](true)
+
+fn v3Libp2pWebrtcLoopbackWriteClient(pair: var V3Libp2pWebrtcLoopbackPair,
+                                     payload: Bytes): Result[int32] =
+    if pair.selectedProtocol == 0:
+        return Err[int32]("v3 libp2p webrtc: protocol not selected")
+    pair.clientToServer = payload
+    return Ok[int32](bytesLen(payload))
+
+fn v3Libp2pWebrtcLoopbackReadServer(pair: var V3Libp2pWebrtcLoopbackPair,
+                                    count: int32): Result[Bytes] =
+    if bytesLen(pair.clientToServer) != count:
+        return Err[Bytes]("v3 libp2p webrtc: short client payload")
+    let out = pair.clientToServer
+    pair.clientToServer = emptyBytes()
+    return Ok[Bytes](out)
+
+fn v3Libp2pWebrtcLoopbackWriteServer(pair: var V3Libp2pWebrtcLoopbackPair,
+                                     payload: Bytes): Result[int32] =
+    if pair.selectedProtocol == 0:
+        return Err[int32]("v3 libp2p webrtc: protocol not selected")
+    pair.serverToClient = payload
+    return Ok[int32](bytesLen(payload))
+
+fn v3Libp2pWebrtcLoopbackReadClient(pair: var V3Libp2pWebrtcLoopbackPair,
+                                    count: int32): Result[Bytes] =
+    if bytesLen(pair.serverToClient) != count:
+        return Err[Bytes]("v3 libp2p webrtc: short server payload")
+    let out = pair.serverToClient
+    pair.serverToClient = emptyBytes()
+    return Ok[Bytes](out)
+
+fn v3Libp2pWebrtcLoopbackSignalCount(pair: V3Libp2pWebrtcLoopbackPair): int32 =
+    return pair.signalTranscript.len
+
+fn v3Libp2pWebrtcLoopbackSignalPayloadsFill(out: var Bytes[],
+                                            pair: V3Libp2pWebrtcLoopbackPair) =
+    out = []
+    for i in 0..<pair.signalTranscript.len:
+        let payload = signal.v3Libp2pWebrtcSignalEncode(pair.signalTranscript[i])
+        add(out, payload)
+
+fn v3Libp2pWebrtcLoopbackSignalTranscriptPayload(pair: V3Libp2pWebrtcLoopbackPair): Bytes =
+    return signal.v3Libp2pWebrtcSignalTranscriptEncode(pair.signalTranscript)
+
+fn v3Libp2pWebrtcTransportResetStats() =
+    v3Libp2pWebrtcNativeDatachannelOpenCount = 0
+    v3Libp2pWebrtcNativeDatachannelRequestCount = 0
+    v3Libp2pWebrtcLoopbackRequestResponseCount = 0
+    v3Libp2pWebrtcLastProtocol = 0
+    v3Libp2pWebrtcLastRelayOnly = false
+    v3Libp2pWebrtcLastSessionId = layout.fixedBytes32Zero()
+
+fn v3Libp2pWebrtcNativeDatachannelOpenCountNow(): int32 =
+    return v3Libp2pWebrtcNativeDatachannelOpenCount
+
+fn v3Libp2pWebrtcNativeDatachannelRequestCountNow(): int32 =
+    return v3Libp2pWebrtcNativeDatachannelRequestCount
+
+fn v3Libp2pWebrtcLoopbackRequestResponseCountNow(): int32 =
+    return v3Libp2pWebrtcLoopbackRequestResponseCount
+
+fn v3Libp2pWebrtcLastProtocolNow(): types.V3Libp2pProtocolId =
+    return v3Libp2pWebrtcLastProtocol
+
+fn v3Libp2pWebrtcLastRelayOnlyNow(): bool =
+    return v3Libp2pWebrtcLastRelayOnly
+
+fn v3Libp2pWebrtcLastSessionIdNow(): layout.FixedBytes32 =
+    return v3Libp2pWebrtcLastSessionId
+
+fn v3Libp2pWebrtcRememberStats(sessionId: layout.FixedBytes32,
+                               protocol: types.V3Libp2pProtocolId,
+                               relayOnly: bool) =
+    v3Libp2pWebrtcLastSessionId = sessionId
+    v3Libp2pWebrtcLastProtocol = protocol
+    v3Libp2pWebrtcLastRelayOnly = relayOnly
+
+fn v3Libp2pWebrtcLoopbackRequestResponse(protocol: types.V3Libp2pProtocolId,
+                                         cfg: V3Libp2pWebrtcTransportConfig,
+                                         remoteAddr: types.V3Libp2pMultiaddr,
+                                         requestPayload: Bytes,
+                                         responsePayload: Bytes,
+                                         outPayload: var Bytes): Result[bool] =
+    var pair = v3Libp2pWebrtcLoopbackPairZero()
+    let openRes = v3Libp2pWebrtcLoopbackOpenInto(pair, cfg, remoteAddr)
+    if IsErr(openRes):
+        return Err[bool]("v3 libp2p webrtc: open: " + ErrorText(openRes))
+    let selectRes = v3Libp2pWebrtcLoopbackSelectProtocol(pair, protocol)
+    if IsErr(selectRes):
+        v3Libp2pWebrtcLoopbackClose(pair)
+        return Err[bool]("v3 libp2p webrtc: select: " + ErrorText(selectRes))
+    let requestWriteRes = v3Libp2pWebrtcLoopbackWriteClient(pair, requestPayload)
+    if IsErr(requestWriteRes):
+        v3Libp2pWebrtcLoopbackClose(pair)
+        return Err[bool]("v3 libp2p webrtc: request write: " + ErrorText(requestWriteRes))
+    let requestReadRes = v3Libp2pWebrtcLoopbackReadServer(pair, bytesLen(requestPayload))
+    if IsErr(requestReadRes):
+        v3Libp2pWebrtcLoopbackClose(pair)
+        return Err[bool]("v3 libp2p webrtc: request read: " + ErrorText(requestReadRes))
+    let serverPayload = Value(requestReadRes)
+    if bytesLen(serverPayload) != bytesLen(requestPayload):
+        v3Libp2pWebrtcLoopbackClose(pair)
+        return Err[bool]("v3 libp2p webrtc: request payload mismatch")
+    let responseWriteRes = v3Libp2pWebrtcLoopbackWriteServer(pair, responsePayload)
+    if IsErr(responseWriteRes):
+        v3Libp2pWebrtcLoopbackClose(pair)
+        return Err[bool]("v3 libp2p webrtc: response write: " + ErrorText(responseWriteRes))
+    let responseReadRes = v3Libp2pWebrtcLoopbackReadClient(pair, bytesLen(responsePayload))
+    v3Libp2pWebrtcLoopbackClose(pair)
+    if IsErr(responseReadRes):
+        return Err[bool]("v3 libp2p webrtc: response read: " + ErrorText(responseReadRes))
+    v3Libp2pWebrtcLoopbackRequestResponseCount = v3Libp2pWebrtcLoopbackRequestResponseCount + 1
+    v3Libp2pWebrtcRememberStats(pair.signalSession.sessionId,
+                                protocol,
+                                pair.signalSession.relayOnly)
+    outPayload = Value(responseReadRes)
+    return Ok[bool](true)
+
+fn v3Libp2pWebrtcNativeRequestResponse(protocol: types.V3Libp2pProtocolId,
+                                       signalWire: Bytes,
+                                       requestPayload: Bytes,
+                                       responsePayload: Bytes,
+                                       outPayload: var Bytes): Result[bool] =
+    var session = signal.v3Libp2pWebrtcSignalSessionZero()
+    let applyRes = signal.v3Libp2pWebrtcSignalTranscriptApply(session, signalWire)
+    if IsErr(applyRes):
+        return Err[bool]("v3 libp2p webrtc: signal transcript: " + ErrorText(applyRes))
+    if !signal.v3Libp2pWebrtcSignalSessionReady(session):
+        return Err[bool]("v3 libp2p webrtc: signal session not ready")
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    var clientResponseWire = ""
+    var errWire = ""
+    let ok = cheng_v3_webrtc_datachannel_request_response_bridge(bytesToString(selectBytes),
+                                                                 bytesToString(signalWire),
+                                                                 bytesToString(requestPayload),
+                                                                 bytesToString(responsePayload),
+                                                                 clientResponseWire,
+                                                                 errWire)
+    if ok == 0:
+        if errWire == "":
+            return Err[bool]("v3 libp2p webrtc: native datachannel bridge failed")
+        return Err[bool](errWire)
+    outPayload = bytesFromString(clientResponseWire)
+    v3Libp2pWebrtcNativeDatachannelOpenCount = v3Libp2pWebrtcNativeDatachannelOpenCount + 1
+    v3Libp2pWebrtcNativeDatachannelRequestCount = v3Libp2pWebrtcNativeDatachannelRequestCount + 1
+    v3Libp2pWebrtcRememberStats(session.sessionId, protocol, session.relayOnly)
+    return Ok[bool](true)

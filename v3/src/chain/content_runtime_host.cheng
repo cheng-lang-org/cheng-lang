@@ -26,11 +26,11 @@ fn v3ContentRuntimeSelectSyncRequest(localHost: var host_base.V3Libp2pHost,
                                      remotePeerId: core.V3Libp2pPeerId,
                                      query: overlay.V3StoreQuery,
                                      out: var overlay.V3IngressEnvelope[]): Result[bool] =
-    let peers = localHost.peers
-    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
-    if pos < 0:
-        return Err[bool]("v3 content runtime host: peer missing")
-    let remoteAddr = peers.peers[pos].addr
+    var endpoint = ps.v3Libp2pPeerEndpointZero()
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    let remoteAddr = endpoint.addr
     if remoteAddr.transport == core.v3Libp2pTransportQuic:
         return Err[bool]("v3 content runtime host: quic sync requires content_runtime_host_quic")
     return host_base.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
@@ -170,6 +170,29 @@ fn v3ContentRuntimeRequestShardPull(localHost: var host_base.V3Libp2pHost,
         return Err[swarm.V3ErasureShardPullResponse](Error(responseFillRes))
     return Ok[swarm.V3ErasureShardPullResponse](response)
 
+fn v3ContentRuntimeDecodeFetchPayload(payload: Bytes,
+                                      request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
+    let responseRes = fetch.v3ContentFetchResponseDecode(payload)
+    if IsErr(responseRes):
+        return Err[fetch.V3ContentFetchResponse](Error(responseRes))
+    let response = Value(responseRes)
+    let responseOk = fetch.v3ContentFetchResponseValidate(response, request)
+    if IsErr(responseOk):
+        return Err[fetch.V3ContentFetchResponse](Error(responseOk))
+    return Ok[fetch.V3ContentFetchResponse](response)
+
+fn v3ContentRuntimeRequestFetchTcp(requestPayload: Bytes,
+                                   servePayload: Bytes,
+                                   request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
+    let responsePayloadRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponse(core.v3Libp2pProtocolContent,
+                                                                              requestPayload,
+                                                                              servePayload)
+    if IsErr(responsePayloadRes):
+        return Err[fetch.V3ContentFetchResponse](Error(responsePayloadRes))
+    var responsePayload: Bytes
+    responsePayload = Value(responsePayloadRes)
+    return v3ContentRuntimeDecodeFetchPayload(responsePayload, request)
+
 fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
                                 remoteHost: var host_base.V3Libp2pHost,
                                 remotePeerId: core.V3Libp2pPeerId,
@@ -183,28 +206,18 @@ fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
     if IsErr(streamRes):
         return Err[fetch.V3ContentFetchResponse](Error(streamRes))
     let requestPayload = fetch.v3ContentFetchRequestEncode(request)
-    let peers = localHost.peers
-    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
-    if pos < 0:
-        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: peer missing")
-    let remoteAddr = peers.peers[pos].addr
+    var endpoint = ps.v3Libp2pPeerEndpointZero()
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[fetch.V3ContentFetchResponse](Error(endpointRes))
+    let remoteAddr = endpoint.addr
     let servePayloadRes = runtime.v3ContentRuntimeServeFetchPayload(remoteRuntime, requestPayload)
     if IsErr(servePayloadRes):
         return Err[fetch.V3ContentFetchResponse](Error(servePayloadRes))
-    let servePayload = Value(servePayloadRes)
+    var servePayload: Bytes
+    servePayload = Value(servePayloadRes)
     if remoteAddr.transport == core.v3Libp2pTransportQuic:
         return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: quic content requires content_runtime_host_quic")
-    let responsePayloadRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponse(core.v3Libp2pProtocolContent,
-                                                                              requestPayload,
-                                                                              servePayload)
-    if IsErr(responsePayloadRes):
-        return Err[fetch.V3ContentFetchResponse](Error(responsePayloadRes))
-    let responsePayload = Value(responsePayloadRes)
-    let responseRes = fetch.v3ContentFetchResponseDecode(responsePayload)
-    if IsErr(responseRes):
-        return Err[fetch.V3ContentFetchResponse](Error(responseRes))
-    let response = Value(responseRes)
-    let responseOk = fetch.v3ContentFetchResponseValidate(response, request)
-    if IsErr(responseOk):
-        return Err[fetch.V3ContentFetchResponse](Error(responseOk))
-    return Ok[fetch.V3ContentFetchResponse](response)
+    if remoteAddr.transport == core.v3Libp2pTransportWebrtc:
+        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host: webrtc content requires content_runtime_host_webrtc")
+    return v3ContentRuntimeRequestFetchTcp(requestPayload, servePayload, request)

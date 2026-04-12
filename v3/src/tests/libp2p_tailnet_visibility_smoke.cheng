@@ -1,0 +1,79 @@
+import std/system
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/core/peerstore as ps
+import cheng/v3/libp2p/host/host
+
+fn main(): int32 =
+    var node: host.V3Libp2pHost
+    node = host.v3Libp2pHostInit("tailnet.visibility.node")
+    host.v3Libp2pHostSetTrustedInfra(node, true)
+
+    var publicListen = types.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(publicListen, "203.0.113.8", 5501)
+    var tailnetListen = types.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillQuic(tailnetListen, "100.64.0.8", 5502)
+    multiaddr.v3Libp2pMultiaddrSetRoutingMeta(tailnetListen,
+                                              types.v3Libp2pNetworkDomainTailnet,
+                                              types.v3Libp2pVisibilityTrustedOnly,
+                                              900)
+    let publicListenRes = host.v3Libp2pListen(node, publicListen)
+    assert(publicListenRes.ok, "v3 libp2p tailnet visibility: public listen")
+    let tailnetListenRes = host.v3Libp2pListen(node, tailnetListen)
+    assert(tailnetListenRes.ok, "v3 libp2p tailnet visibility: tailnet listen")
+
+    let trustedViewer = peer_id.v3Libp2pPeerIdFromSeed("tailnet.visibility.trusted.viewer")
+    var trustedViewerRecord = ps.v3Libp2pPeerRecordZero()
+    trustedViewerRecord.peerId = trustedViewer
+    trustedViewerRecord.routingRole = overlay.v3OverlayRoleRegionalRouter
+    trustedViewerRecord.trustedInfra = true
+    ps.v3Libp2pPeerstoreUpsert(node.peers, trustedViewerRecord)
+
+    let publicViewer = peer_id.v3Libp2pPeerIdFromSeed("tailnet.visibility.public.viewer")
+    var publicViewerRecord = ps.v3Libp2pPeerRecordZero()
+    publicViewerRecord.peerId = publicViewer
+    publicViewerRecord.routingRole = overlay.v3OverlayRoleEdgeRelayStore
+    publicViewerRecord.trustedInfra = false
+    ps.v3Libp2pPeerstoreUpsert(node.peers, publicViewerRecord)
+
+    var publicListenView: types.V3Libp2pMultiaddr[]
+    publicListenView = host.v3Libp2pIdentifyListenAddrsForPeer(node, publicViewer)
+    assert(publicListenView.len == 1, "v3 libp2p tailnet visibility: public listen export count")
+    assert(publicListenView[0].networkDomain == types.v3Libp2pNetworkDomainPublic,
+        "v3 libp2p tailnet visibility: public listen export domain")
+
+    var trustedListenView: types.V3Libp2pMultiaddr[]
+    trustedListenView = host.v3Libp2pIdentifyListenAddrsForPeer(node, trustedViewer)
+    assert(trustedListenView.len == 2, "v3 libp2p tailnet visibility: trusted listen export count")
+
+    let servicePeer = peer_id.v3Libp2pPeerIdFromSeed("tailnet.visibility.service")
+    var serviceRecord = ps.v3Libp2pPeerRecordZero()
+    serviceRecord.peerId = servicePeer
+    serviceRecord.routingRole = overlay.v3OverlayRoleRegionalRouter
+    serviceRecord.trustedInfra = true
+    ps.v3Libp2pPeerRecordPutEndpoint(serviceRecord,
+                                     publicListen,
+                                     false,
+                                     types.v3Libp2pReachabilityDirect,
+                                     publicListen.priority)
+    ps.v3Libp2pPeerRecordPutEndpoint(serviceRecord,
+                                     tailnetListen,
+                                     false,
+                                     types.v3Libp2pReachabilityDirect,
+                                     tailnetListen.priority)
+    ps.v3Libp2pPeerstoreUpsert(node.peers, serviceRecord)
+
+    var publicPeerView: types.V3Libp2pMultiaddr[]
+    publicPeerView = host.v3Libp2pPeerVisibleAddrs(node, servicePeer, false)
+    assert(publicPeerView.len == 1, "v3 libp2p tailnet visibility: public peer export count")
+    assert(publicPeerView[0].networkDomain == types.v3Libp2pNetworkDomainPublic,
+        "v3 libp2p tailnet visibility: public peer export domain")
+
+    var trustedPeerView: types.V3Libp2pMultiaddr[]
+    trustedPeerView = host.v3Libp2pPeerVisibleAddrs(node, servicePeer, true)
+    assert(trustedPeerView.len == 2, "v3 libp2p tailnet visibility: trusted peer export count")
+
+    echo("v3 libp2p_tailnet_visibility_smoke ok")
+    return 0

@@ -1,0 +1,211 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as binary
+import cheng/v3/chain/pubsub
+import cheng/v3/chain/pin_plane as pin
+import cheng/v3/chain/pin_runtime as runtime
+import cheng/v3/chain/pin_runtime_host as runtime_host
+import cheng/v3/chain/erasure_swarm as swarm
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types as core
+import cheng/v3/libp2p/core/peerstore as ps
+import cheng/v3/libp2p/host/host as host_base
+import cheng/v3/libp2p/host/host_quic
+
+fn v3PinRuntimeSelectSyncRequest(localHost: var host_base.V3Libp2pHost,
+                                 remoteHost: var host_base.V3Libp2pHost,
+                                 remotePeerId: core.V3Libp2pPeerId,
+                                 query: overlay.V3StoreQuery,
+                                 out: var overlay.V3IngressEnvelope[]): Result[bool] =
+    var endpoint = ps.v3Libp2pPeerEndpointZero()
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    if endpoint.addr.transport == core.v3Libp2pTransportQuic:
+        return host_quic.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
+    return host_base.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
+
+fn v3PinRuntimeFetchOffer(localHost: var host_base.V3Libp2pHost,
+                          remoteHost: var host_base.V3Libp2pHost,
+                          remotePeerId: core.V3Libp2pPeerId,
+                          scope: overlay.V3OverlayTopicScope,
+                          address: binary.V3LsmrAddress,
+                          offerCid: layout.FixedBytes32): Result[pin.V3PinOffer] =
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = offerCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3PinRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[pin.V3PinOffer](Error(entriesRes))
+    let ingressRes = runtime_host.v3PinRuntimeFindIngress(entries,
+                                                          offerCid,
+                                                          pubsub.v3PubSubPayloadKindPinOffer)
+    if IsErr(ingressRes):
+        return Err[pin.V3PinOffer](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = pin.v3PinOfferValidatePayload(ingress.payload, offerCid)
+    if IsErr(payloadOk):
+        return Err[pin.V3PinOffer](Error(payloadOk))
+    return pin.v3PinOfferDecode(ingress.payload)
+
+fn v3PinRuntimeFetchAccept(localHost: var host_base.V3Libp2pHost,
+                           remoteHost: var host_base.V3Libp2pHost,
+                           remotePeerId: core.V3Libp2pPeerId,
+                           scope: overlay.V3OverlayTopicScope,
+                           address: binary.V3LsmrAddress,
+                           acceptCid: layout.FixedBytes32): Result[pin.V3PinAccept] =
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = acceptCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3PinRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[pin.V3PinAccept](Error(entriesRes))
+    let ingressRes = runtime_host.v3PinRuntimeFindIngress(entries,
+                                                          acceptCid,
+                                                          pubsub.v3PubSubPayloadKindPinAccept)
+    if IsErr(ingressRes):
+        return Err[pin.V3PinAccept](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = pin.v3PinAcceptValidatePayload(ingress.payload, acceptCid)
+    if IsErr(payloadOk):
+        return Err[pin.V3PinAccept](Error(payloadOk))
+    return pin.v3PinAcceptDecode(ingress.payload)
+
+fn v3PinRuntimeFetchSettlement(localHost: var host_base.V3Libp2pHost,
+                               remoteHost: var host_base.V3Libp2pHost,
+                               remotePeerId: core.V3Libp2pPeerId,
+                               scope: overlay.V3OverlayTopicScope,
+                               address: binary.V3LsmrAddress,
+                               settlementCid: layout.FixedBytes32): Result[pin.V3PinSettlement] =
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.topicScope = scope
+    query.address = address
+    query.wantEventCid = settlementCid
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = v3PinRuntimeSelectSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(entriesRes):
+        return Err[pin.V3PinSettlement](Error(entriesRes))
+    let ingressRes = runtime_host.v3PinRuntimeFindIngress(entries,
+                                                          settlementCid,
+                                                          pubsub.v3PubSubPayloadKindPinSettlement)
+    if IsErr(ingressRes):
+        return Err[pin.V3PinSettlement](Error(ingressRes))
+    let ingress = Value(ingressRes)
+    let payloadOk = pin.v3PinSettlementValidatePayload(ingress.payload, settlementCid)
+    if IsErr(payloadOk):
+        return Err[pin.V3PinSettlement](Error(payloadOk))
+    return pin.v3PinSettlementDecode(ingress.payload)
+
+fn v3PinRuntimeRequestProof(localHost: var host_base.V3Libp2pHost,
+                            remoteHost: var host_base.V3Libp2pHost,
+                            remotePeerId: core.V3Libp2pPeerId,
+                            challenge: pin.V3PinChallenge,
+                            offer: pin.V3PinOffer,
+                            accept: pin.V3PinAccept,
+                            manifest: swarm.V3ErasureShardManifest): Result[pin.V3PinProof] =
+    let challengeOk = pin.v3PinChallengeValidateAgainstInputs(challenge,
+                                                              offer,
+                                                              accept,
+                                                              manifest)
+    if IsErr(challengeOk):
+        return Err[pin.V3PinProof](Error(challengeOk))
+    let requestPayload = pin.v3PinChallengeEncode(challenge)
+    var proofPayload: Bytes
+    let proofPayloadRes = host_quic.v3Libp2pRequestResponse(localHost,
+                                                            remoteHost,
+                                                            remotePeerId,
+                                                            core.v3Libp2pProtocolPin,
+                                                            requestPayload,
+                                                            proofPayload)
+    if IsErr(proofPayloadRes):
+        return Err[pin.V3PinProof](Error(proofPayloadRes))
+    let proofRes = pin.v3PinProofDecode(proofPayload)
+    if IsErr(proofRes):
+        return Err[pin.V3PinProof](Error(proofRes))
+    let proof = Value(proofRes)
+    let payloadOk = pin.v3PinProofValidatePayload(proofPayload, proof.proofCid)
+    if IsErr(payloadOk):
+        return Err[pin.V3PinProof](Error(payloadOk))
+    let proofOk = pin.v3PinProofValidateAgainstInputs(proof, challenge, accept, manifest)
+    if IsErr(proofOk):
+        return Err[pin.V3PinProof](Error(proofOk))
+    return Ok[pin.V3PinProof](proof)
+
+fn v3PinRuntimeRunScheduledRound(localHost: var host_base.V3Libp2pHost,
+                                 remoteHost: var host_base.V3Libp2pHost,
+                                 remotePeerId: core.V3Libp2pPeerId,
+                                 acceptCid: layout.FixedBytes32,
+                                 scope: overlay.V3OverlayTopicScope,
+                                 address: binary.V3LsmrAddress,
+                                 nowEpoch: int32,
+                                 stampEpoch: int32,
+                                 stampGanzhi: int32,
+                                 out: var runtime.V3PinRuntimeStepResult): Result[bool] =
+    if !localHost.pinRuntimeAttached:
+        return Err[bool]("v3 pin runtime quic: local pin runtime missing")
+    let challengeRes = runtime.v3PinRuntimeOpenChallenge(localHost.pinRuntime, acceptCid, nowEpoch)
+    if IsErr(challengeRes):
+        return Err[bool](Error(challengeRes))
+    let challenge = Value(challengeRes)
+    let offerRes = runtime.v3PinRuntimeFindOffer(localHost.pinRuntime, challenge.offerCid)
+    if IsErr(offerRes):
+        return Err[bool](Error(offerRes))
+    let offer = Value(offerRes)
+    let acceptRes = runtime.v3PinRuntimeFindAccept(localHost.pinRuntime, acceptCid)
+    if IsErr(acceptRes):
+        return Err[bool](Error(acceptRes))
+    let accept = Value(acceptRes)
+    let manifestRes = runtime.v3PinRuntimeFindManifest(localHost.pinRuntime, challenge.manifestCid)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let proofRes = v3PinRuntimeRequestProof(localHost,
+                                            remoteHost,
+                                            remotePeerId,
+                                            challenge,
+                                            offer,
+                                            accept,
+                                            manifest)
+    if IsErr(proofRes):
+        let stepRes = runtime.v3PinRuntimeNoteChallengeFailure(localHost.pinRuntime, acceptCid, nowEpoch)
+        if IsErr(stepRes):
+            return Err[bool](Error(stepRes))
+        let step = Value(stepRes)
+        if step.outcomeKind == runtime.v3PinRuntimeStepKindSlash:
+            let settlementRes = runtime.v3PinRuntimeFindSettlement(localHost.pinRuntime, step.settlementCid)
+            if IsErr(settlementRes):
+                return Err[bool](Error(settlementRes))
+            let publishRes = runtime_host.v3PinRuntimePublishSettlement(localHost,
+                                                                        scope,
+                                                                        address,
+                                                                        Value(settlementRes),
+                                                                        stampEpoch,
+                                                                        stampGanzhi)
+            if IsErr(publishRes):
+                return Err[bool](Error(publishRes))
+        out = step
+        return Ok[bool](true)
+    let stepRes = runtime.v3PinRuntimeCompleteChallenge(localHost.pinRuntime,
+                                                        acceptCid,
+                                                        Value(proofRes),
+                                                        nowEpoch)
+    if IsErr(stepRes):
+        return Err[bool](Error(stepRes))
+    let step = Value(stepRes)
+    let settlementRes = runtime.v3PinRuntimeFindSettlement(localHost.pinRuntime, step.settlementCid)
+    if IsErr(settlementRes):
+        return Err[bool](Error(settlementRes))
+    let publishRes = runtime_host.v3PinRuntimePublishSettlement(localHost,
+                                                                scope,
+                                                                address,
+                                                                Value(settlementRes),
+                                                                stampEpoch,
+                                                                stampGanzhi)
+    if IsErr(publishRes):
+        return Err[bool](Error(publishRes))
+    out = step
+    return Ok[bool](true)

@@ -63,6 +63,14 @@ program_selfhost_smoke
 libp2p_core_smoke
 libp2p_multiaddr_parse_boundary_smoke
 libp2p_host_smoke
+libp2p_tailnet_policy_smoke
+libp2p_tailnet_visibility_smoke
+libp2p_tailnet_transport_smoke
+libp2p_tailnet_derp_smoke
+webrtc_signal_codec_smoke
+webrtc_signal_session_smoke
+webrtc_turn_fallback_smoke
+libp2p_webrtc_sync_smoke
 native_initial_crypto_frame_smoke
 native_client_hello_wire_smoke
 tls_client_hello_parse_smoke
@@ -84,10 +92,14 @@ pubsub_smoke
 dag_mempool_smoke
 plumtree_smoke
 erasure_swarm_smoke
+pin_plane_smoke
+pin_scheduler_smoke
+pin_runtime_quic_smoke
 content_codec_smoke
 content_runtime_smoke
 content_stub_smoke
 content_quic_smoke
+chain_node_tailnet_smoke
 chain_node_libp2p_smoke
 "
 

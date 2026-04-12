@@ -19,11 +19,11 @@ fn v3ContentRuntimeSelectSyncRequest(localHost: var host_base.V3Libp2pHost,
                                      remotePeerId: core.V3Libp2pPeerId,
                                      query: overlay.V3StoreQuery,
                                      out: var overlay.V3IngressEnvelope[]): Result[bool] =
-    let peers = localHost.peers
-    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
-    if pos < 0:
-        return Err[bool]("v3 content runtime host quic: peer missing")
-    let remoteAddr = peers.peers[pos].addr
+    var endpoint = ps.v3Libp2pPeerEndpointZero()
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    let remoteAddr = endpoint.addr
     if remoteAddr.transport == core.v3Libp2pTransportQuic:
         return host_quic.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
     return host_base.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, out)
@@ -156,11 +156,11 @@ fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
                                 remotePeerId: core.V3Libp2pPeerId,
                                 remoteRuntime: var runtime.V3ContentRuntime,
                                 request: fetch.V3ContentFetchRequest): Result[fetch.V3ContentFetchResponse] =
-    let peers = localHost.peers
-    let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
-    if pos < 0:
-        return Err[fetch.V3ContentFetchResponse]("v3 content runtime host quic: peer missing")
-    let remoteAddr = peers.peers[pos].addr
+    var endpoint = ps.v3Libp2pPeerEndpointZero()
+    let endpointRes = host_base.v3Libp2pSelectPeerEndpoint(localHost, remotePeerId, endpoint)
+    if IsErr(endpointRes):
+        return Err[fetch.V3ContentFetchResponse](Error(endpointRes))
+    let remoteAddr = endpoint.addr
     if remoteAddr.transport != core.v3Libp2pTransportQuic:
         return runtime_host.v3ContentRuntimeRequestFetch(localHost,
                                                          remoteHost,
@@ -178,6 +178,8 @@ fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
     let servePayloadRes = runtime.v3ContentRuntimeServeFetchPayload(remoteRuntime, requestPayload)
     if IsErr(servePayloadRes):
         return Err[fetch.V3ContentFetchResponse](Error(servePayloadRes))
+    var servePayload: Bytes
+    servePayload = Value(servePayloadRes)
     var pair: quic_transport.V3Libp2pQuicLoopbackPair
     let openRes = quic_transport.v3Libp2pQuicLoopbackOpenInto(pair, remoteAddr)
     if IsErr(openRes):
@@ -194,16 +196,16 @@ fn v3ContentRuntimeRequestFetch(localHost: var host_base.V3Libp2pHost,
     if IsErr(requestReadRes):
         quic_transport.v3Libp2pQuicLoopbackClose(pair)
         return Err[fetch.V3ContentFetchResponse]("v3 content runtime host quic: request read: " + ErrorText(requestReadRes))
-    let responsePayload = Value(servePayloadRes)
-    let responseWriteRes = quic_transport.v3Libp2pQuicLoopbackWriteServer(pair, responsePayload)
+    let responseWriteRes = quic_transport.v3Libp2pQuicLoopbackWriteServer(pair, servePayload)
     if IsErr(responseWriteRes):
         quic_transport.v3Libp2pQuicLoopbackClose(pair)
         return Err[fetch.V3ContentFetchResponse]("v3 content runtime host quic: response write: " + ErrorText(responseWriteRes))
-    let responseReadRes = quic_transport.v3Libp2pQuicLoopbackReadClient(pair, bytesLen(responsePayload))
+    let responseReadRes = quic_transport.v3Libp2pQuicLoopbackReadClient(pair, bytesLen(servePayload))
     quic_transport.v3Libp2pQuicLoopbackClose(pair)
     if IsErr(responseReadRes):
         return Err[fetch.V3ContentFetchResponse]("v3 content runtime host quic: response read: " + ErrorText(responseReadRes))
-    let responseBytes = Value(responseReadRes)
+    var responseBytes: Bytes
+    responseBytes = Value(responseReadRes)
     let responseRes = fetch.v3ContentFetchResponseDecode(responseBytes)
     if IsErr(responseRes):
         return Err[fetch.V3ContentFetchResponse](Error(responseRes))

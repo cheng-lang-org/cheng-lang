@@ -2,12 +2,19 @@ import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
 
 type
+    V3Libp2pPeerEndpoint =
+        addr: types.V3Libp2pMultiaddr
+        lastDialOk: bool
+        reachability: types.V3Libp2pReachabilityKind
+        priority: int32
+
     V3Libp2pPeerRecord =
         peerId: types.V3Libp2pPeerId
-        addr: types.V3Libp2pMultiaddr
+        endpoints: V3Libp2pPeerEndpoint[]
         routingRole: int32
         connected: bool
         bootstrap: bool
+        trustedInfra: bool
         rttEwmaMicros: int32
         lossPermille: int32
         loadPermille: int32
@@ -16,12 +23,30 @@ type
     V3Libp2pPeerstore =
         peers: V3Libp2pPeerRecord[]
 
+fn v3Libp2pPeerEndpointZero(): V3Libp2pPeerEndpoint =
+    var out: V3Libp2pPeerEndpoint
+    out.addr = types.v3Libp2pMultiaddrZero()
+    out.lastDialOk = false
+    out.reachability = types.v3Libp2pReachabilityUnknown
+    out.priority = 100
+    return out
+
+fn v3Libp2pPeerEndpointClone(endpoint: V3Libp2pPeerEndpoint): V3Libp2pPeerEndpoint =
+    var out = v3Libp2pPeerEndpointZero()
+    out.addr = multiaddr.v3Libp2pMultiaddrClone(endpoint.addr)
+    out.lastDialOk = endpoint.lastDialOk
+    out.reachability = endpoint.reachability
+    out.priority = endpoint.priority
+    return out
+
 fn v3Libp2pPeerRecordZero(): V3Libp2pPeerRecord =
     var routingRole = 0
     var out: V3Libp2pPeerRecord
     out.routingRole = routingRole
     out.connected = false
     out.bootstrap = false
+    out.trustedInfra = false
+    out.endpoints = []
     out.rttEwmaMicros = 0
     out.lossPermille = 0
     out.loadPermille = 0
@@ -41,14 +66,122 @@ fn v3Libp2pPeerstorePos(store: V3Libp2pPeerstore,
             return i
     return -1
 
+fn v3Libp2pPeerRecordEndpointPos(record: V3Libp2pPeerRecord,
+                                 addr: types.V3Libp2pMultiaddr): int32 =
+    for i in 0..<record.endpoints.len:
+        if multiaddr.v3Libp2pMultiaddrEqual(record.endpoints[i].addr, addr):
+            return i
+    return -1
+
+fn v3Libp2pPeerRecordResetLastDialOk(record: var V3Libp2pPeerRecord) =
+    for i in 0..<record.endpoints.len:
+        record.endpoints[i].lastDialOk = false
+
+fn v3Libp2pPeerRecordPutEndpoint(record: var V3Libp2pPeerRecord,
+                                 addr: types.V3Libp2pMultiaddr,
+                                 lastDialOk: bool,
+                                 reachability: types.V3Libp2pReachabilityKind,
+                                 priority: int32) =
+    let pos = v3Libp2pPeerRecordEndpointPos(record, addr)
+    if pos >= 0:
+        record.endpoints[pos].addr = multiaddr.v3Libp2pMultiaddrClone(addr)
+        record.endpoints[pos].lastDialOk = lastDialOk
+        record.endpoints[pos].reachability = reachability
+        record.endpoints[pos].priority = priority
+        return
+    let insert = v3Libp2pPeerEndpointZero()
+    add(record.endpoints, insert)
+    let idx = record.endpoints.len - 1
+    record.endpoints[idx].addr = multiaddr.v3Libp2pMultiaddrClone(addr)
+    record.endpoints[idx].lastDialOk = lastDialOk
+    record.endpoints[idx].reachability = reachability
+    record.endpoints[idx].priority = priority
+
+fn v3Libp2pPeerRecordVisibleAddrs(record: V3Libp2pPeerRecord,
+                                  trustedView: bool): types.V3Libp2pMultiaddr[] =
+    var out: types.V3Libp2pMultiaddr[]
+    out = []
+    for i in 0..<record.endpoints.len:
+        let endpoint = record.endpoints[i]
+        if !multiaddr.v3Libp2pMultiaddrVisible(endpoint.addr, trustedView):
+            continue
+        add(out, multiaddr.v3Libp2pMultiaddrClone(endpoint.addr))
+    return out
+
+fn v3Libp2pPeerEndpointRank(record: V3Libp2pPeerRecord,
+                            endpoint: V3Libp2pPeerEndpoint,
+                            trustedView: bool): int32 =
+    let addr = endpoint.addr
+    if !multiaddr.v3Libp2pMultiaddrVisible(addr, trustedView):
+        return 100000
+    var relayPenalty = 0
+    if endpoint.reachability == types.v3Libp2pReachabilityRelayed:
+        relayPenalty = 100
+    if record.connected && endpoint.lastDialOk:
+        return 0
+    if addr.networkDomain == types.v3Libp2pNetworkDomainTailnet:
+        if addr.transport == types.v3Libp2pTransportQuic:
+            return 10 + relayPenalty
+        if addr.transport == types.v3Libp2pTransportTcp:
+            return 20 + relayPenalty
+        return 30 + relayPenalty
+    if addr.networkDomain == types.v3Libp2pNetworkDomainLan:
+        if addr.transport == types.v3Libp2pTransportQuic:
+            return 40 + relayPenalty
+        if addr.transport == types.v3Libp2pTransportTcp:
+            return 50 + relayPenalty
+        return 60 + relayPenalty
+    if addr.networkDomain == types.v3Libp2pNetworkDomainBrowserWebrtc:
+        if addr.transport == types.v3Libp2pTransportWebrtc:
+            return 65 + relayPenalty
+        return 66 + relayPenalty
+    if addr.networkDomain == types.v3Libp2pNetworkDomainPublic:
+        if addr.transport == types.v3Libp2pTransportQuic:
+            return 70 + relayPenalty
+        if addr.transport == types.v3Libp2pTransportTcp:
+            return 80 + relayPenalty
+        return 90 + relayPenalty
+    return 200 + relayPenalty
+
+fn v3Libp2pPeerRecordSelectEndpoint(record: V3Libp2pPeerRecord,
+                                    trustedView: bool,
+                                    out: var V3Libp2pPeerEndpoint): bool =
+    var bestRank = 100000
+    var bestPriority = -2147483647
+    var found = false
+    for i in 0..<record.endpoints.len:
+        let endpoint = record.endpoints[i]
+        let rank = v3Libp2pPeerEndpointRank(record, endpoint, trustedView)
+        if rank >= 100000:
+            continue
+        let priority = endpoint.priority
+        if !found || rank < bestRank || (rank == bestRank && priority > bestPriority):
+            out = v3Libp2pPeerEndpointClone(endpoint)
+            bestRank = rank
+            bestPriority = priority
+            found = true
+    return found
+
+fn v3Libp2pPeerstoreSelectEndpoint(store: V3Libp2pPeerstore,
+                                   peerId: types.V3Libp2pPeerId,
+                                   trustedView: bool,
+                                   out: var V3Libp2pPeerEndpoint): bool =
+    let pos = v3Libp2pPeerstorePos(store, peerId)
+    if pos < 0:
+        return false
+    return v3Libp2pPeerRecordSelectEndpoint(store.peers[pos], trustedView, out)
+
 fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
                            record: V3Libp2pPeerRecord) =
     var next = v3Libp2pPeerRecordZero()
     next.peerId = record.peerId
-    next.addr = multiaddr.v3Libp2pMultiaddrClone(record.addr)
+    next.endpoints = []
+    for i in 0..<record.endpoints.len:
+        add(next.endpoints, v3Libp2pPeerEndpointClone(record.endpoints[i]))
     next.routingRole = record.routingRole
     next.connected = record.connected
     next.bootstrap = record.bootstrap
+    next.trustedInfra = record.trustedInfra
     next.rttEwmaMicros = record.rttEwmaMicros
     next.lossPermille = record.lossPermille
     next.loadPermille = record.loadPermille
@@ -57,10 +190,13 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     let pos = v3Libp2pPeerstorePos(store, targetPeerId)
     if pos >= 0:
         store.peers[pos].peerId = next.peerId
-        store.peers[pos].addr = next.addr
+        store.peers[pos].endpoints = []
+        for i in 0..<next.endpoints.len:
+            add(store.peers[pos].endpoints, v3Libp2pPeerEndpointClone(next.endpoints[i]))
         store.peers[pos].routingRole = next.routingRole
         store.peers[pos].connected = next.connected
         store.peers[pos].bootstrap = next.bootstrap
+        store.peers[pos].trustedInfra = next.trustedInfra
         store.peers[pos].rttEwmaMicros = next.rttEwmaMicros
         store.peers[pos].lossPermille = next.lossPermille
         store.peers[pos].loadPermille = next.loadPermille
@@ -70,10 +206,13 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     add(store.peers, insert)
     let idx = store.peers.len - 1
     store.peers[idx].peerId = next.peerId
-    store.peers[idx].addr = next.addr
+    store.peers[idx].endpoints = []
+    for i in 0..<next.endpoints.len:
+        add(store.peers[idx].endpoints, v3Libp2pPeerEndpointClone(next.endpoints[i]))
     store.peers[idx].routingRole = next.routingRole
     store.peers[idx].connected = next.connected
     store.peers[idx].bootstrap = next.bootstrap
+    store.peers[idx].trustedInfra = next.trustedInfra
     store.peers[idx].rttEwmaMicros = next.rttEwmaMicros
     store.peers[idx].lossPermille = next.lossPermille
     store.peers[idx].loadPermille = next.loadPermille

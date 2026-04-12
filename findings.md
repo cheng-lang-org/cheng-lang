@@ -2,6 +2,52 @@
 
 | 项目 | 结论 |
 |---|---|
+| 新发现 | 这轮 host 总 gate 的真 blocker 不是 `Pin scheduler` 协议逻辑，而是 [tailnet_transport.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/tailnet_transport.cheng) 的 [v3Libp2pTailnetUpsertPeerSession(...)](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/tailnet_transport.cheng) ABI 形状。第一次试着在函数开头加 `echo(...)` 也完全打不出来，说明段错发生在“多 `str` 实参 + 复合调用边界”之前，不在函数体逻辑里；把它收成“只吃一个 `V3Libp2pTailnetPeerSession` record”后，[libp2p_tailnet_transport_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_tailnet_transport_smoke.cheng)、[libp2p_tailnet_derp_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_tailnet_derp_smoke.cheng)、[chain_node_tailnet_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_tailnet_smoke.cheng) 都重新前台 `ok`。 |
+| 新发现 | `tailnet` 的 `peerSessions` 不该继续用字符串回编解码做内存态存储。当前最稳形状是直接把它留成 `V3Libp2pTailnetPeerSession[]`，查找、状态填充和 status 输出都直接读 record，不再在 transport 内部自己序列化再反序列化。这样最短，也最不容易再踩 `str/split` 这类 ABI 旧坑。 |
+| 新发现 | [strutils.cheng](/Users/lbcheng/cheng-lang/src/std/strutils.cheng) 这轮暴露出来的 `chengStrStoreCompat/strutilsAppendStr` 编译缺口，也说明 `strutils` 不该再保留那层自造兼容包装。把 `strutilsAppendStr(...)` 直接收成 `add(seqInst, val)` 以后，host gate 的前置编译缺口立刻消失，而且完整 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 与 no-cache [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 这轮都已重新前台 `ok`。 |
+| 新发现 | WebRTC 这轮最终稳定边界已经坐实：原生 datachannel 内容桥是宿主专属路径，不该继续留在 [content_runtime_host.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host.cheng) 这种公共内容宿主层里。现在公共层只保留 TCP 主链，新增 [content_runtime_host_webrtc.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host_webrtc.cheng) 专门承接 host-native WebRTC 内容拉取；[webrtc_datachannel_content_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/webrtc_datachannel_content_smoke.cheng) 因此应留在 host gate，不该继续塞进 `stage23`。 |
+| 新发现 | 这轮 WebRTC 收口已经不是局部烟绿。定向 5 条 WebRTC smoke、完整 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 和 no-cache [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 都重新前台 `ok`，说明“signal transcript 过网 + native datachannel request-response”这条新边界没有把 QUIC/content/chain_node 后链拖坏。 |
+| 新发现 | WebRTC 这条线之前真正假的地方已经坐实：在 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 和 [content_runtime_host.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host.cheng) 里，虽然先开了 `ProtocolWebrtcSignal` stream，但后面立刻掉 [v3Libp2pWebrtcLoopbackRequestResponse(...)](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/webrtc_transport.cheng)。这轮把它收成“先准备 signal transcript bytes，再走 native datachannel request-response”以后，host 定向 5 条 WebRTC smoke 都重新前台 `ok`。 |
+| 新发现 | 当前 seed 对 `importc fn` 解析还有一个硬边界：声明行必须单行。新加的 `cheng_v3_webrtc_datachannel_request_response_bridge(...)` 一开始写成多行 `importc fn`，fresh host 直接报 `scalar call resolve failed`；改成单行声明后，外部符号解析立刻恢复。这不是 WebRTC 逻辑问题，是 seed 的 importc 解析形状限制。 |
+| 新发现 | WebRTC 这轮最值的可观测量已经定死：signal 不能只看 `openStreamProtocols`，必须同时看 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 里的 `webrtcSignalIngressPayloads/webrtcSignalEgressPayloads`，再看 [webrtc_transport.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/webrtc_transport.cheng) 里的 `nativeDatachannel*Count` 和 `loopbackRequestResponseCount`。只看业务 payload 对不对，假闭环还会混过去。 |
+| 新发现 | 这轮 native bridge 不该再走“单通道模糊转发”。[system_helpers.c](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c) 里现在明确分成 control socketpair 和 data socketpair：signal transcript 先过控制面并做 ack，再走 multistream + request/response 数据面。这条形状才和“signal + datachannel”两层边界对齐。 |
+| 新发现 | 这轮把整套 no-cache `stage23` 真重跑以后，新的真 blocker 不是 `tailnet/headscale/DERP/WebRTC` 逻辑，而是 [host_quic.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host_quic.cheng) 的 [v3Libp2pQuicExchange(...)](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host_quic.cheng) 里直接绑定 `quic_transport.v3Libp2pQuicLoopbackSelectProtocol(...)` 的 `Result[bool]`。把它改成原地 `multistream select bytes -> write -> read -> accepts` 以后，`stage3 libp2p_quic_tls_smoke` 和完整 `stage23` 都重新全绿，说明这次卡的是 ordinary 句型，不是 QUIC 协议语义。 |
+| 新发现 | [pin_runtime_quic_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/pin_runtime_quic_smoke.cheng) 现在已经不再是“旁支旧洞”。这轮完整 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 和 no-cache [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 都真跑到了它，并在 host、`stage2`、`stage3` 下全部输出 `ok`。 |
+| 新发现 | `Pin` 这条线真正该补的不是动态注册表，而是 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 和 [host_quic.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host_quic.cheng) 自己的正式协议分发表。最终稳定形状不是让 `sync` 和 `pin` 强行共用整条主链，而是只让 `Pin` 走内建 `ServePayload/RequestResponse`，`sync` 继续保留已经验证过的直通路径。 |
+| 新发现 | `host_quic` 的通用分发不能先 `openStream` 再决定要不要委托给 `host_base`。这样非 QUIC 路径会重复记流、重复记 `syncRequestCount`，属于隐形状态污染。正确顺序是先看 endpoint transport，再决定走 `host_quic` 还是委托给 `host_base`。 |
+| 新发现 | 当前 `Pin` 可以正式写成“host/host_quic 内建协议分发表已落地”，但仍然不能写成“动态可插拔 handler 注册表已落地”。现在落地的是宿主内建协议分发，不是独立插件式回调系统；`sync` 也没有被改成同一套通用 handler。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | 这轮真正把 `content_runtime_smoke` 炸掉的不是 `manifest` 语义，也不是 `fetch decode` 本身，而是 [content_runtime_host.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host.cheng) 和 [content_runtime_host_quic.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host_quic.cheng) 里 `Result[Bytes]` 直接跨 transport 走。只修服务端一半不够，客户端收包后的 `responsePayload/responseBytes` 也必须先落成本地 `Bytes`，不然就会在 [v3ContentFetchResponseDecode(...)](/Users/lbcheng/cheng-lang/v3/src/chain/content_fetch.cheng) 里以 `bytesSlice` 段错的形式爆出来。 |
+| 新发现 | `Pin` 这条线当前最稳的宿主形状还是 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 直接带 `pinRuntime`。我试过单独旁挂 registry，但它既没接主线，也会把口径写乱；最短真修法就是删掉未接主线的 [pin_registry.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/pin_registry.cheng)，保留现有宿主附着式 handler。 |
+| 新发现 | 只要把 `content fetch` 的 `Bytes` ABI 收正，之前受连坐的 [chain_node_tailnet_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_tailnet_smoke.cheng) 也会继续稳定前台 `ok`。这说明这轮活根是共享 transport/ABI 边界，不是 `chain_node` 或 `Pin` 协议逻辑本身。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `Pin` 这层现在最稳的最小网络切法已经再往前收了一刀：`offer/accept/settlement` 走 `ingress + store put + sync fetch`，`challenge/proof` 走独立 `/cheng/pin/1.0.0` request-response，而且 proof 已经改成远端 `host.pinRuntime` 直接处理，不再让测试手喂 `remoteRuntime`。 |
+| 新发现 | `host` 这层最小真改法不是抽象成通用回调注册表，而是明确加 `pinRuntimeAttached + pinRuntime + v3Libp2pPinServePayload(...)`。这样 `Pin` 先拥有真的宿主附着式 handler，代码短，边界也不飘。 |
+| 新发现 | 当前 `Pin` 网络面现在可以写成“宿主附着式远端 handler 已落地”，但还不能写成“完整 Pin 网络已上线”。因为挑战调度器、随机信标、奖励账本和独立 handler 注册表都还没做。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
+| 新发现 | `v3PinProofValidateAgainstInputs(...)` 不能只信任传进来的 `challenge`。这轮已把它收成“先跑 `v3PinChallengeValidate(...)`，再继续对 `accept/manifest/proof` 做交叉校验”，这样函数单独复用时也不会接受结构已经坏掉的 challenge。 |
+| 新发现 | `Pin` 这层最稳的第一刀不是去改 `PubSub` 或 `overlay contracts`，而是先把独立 `pin_plane` 做实。只要 `offer/accept/challenge/proof/settlement` 五个对象、payload 校验和 reward/slash settlement 先闭环，后面再接 `store/sync` 或独立协议流时就不会把托管语义和内容分发语义混在一起。 |
+| 新发现 | `v3PinOfferFromArtifacts(...)` 不该强依赖整套 `content publish artifacts` 全量校验。Pin 只需要 `bundleCid + blobSummary + manifest + erasureParams` 这几个真实锚点；继续要求 `pubsub/plumtree/recoveryPlan` 全齐，只会把 Pin 绑死在内容发布主链上。 |
+| 新发现 | 当前 `Pin` challenge 最稳的实现是“按 `offerCid + acceptCid + manifestCid + challengeEpoch` 派生起点，再对 `manifest` 做确定性轮转抽样”。这不是经济级随机信标，但它已经足够把 challenge/proof/settlement 的对象边界和 shard 校验链打通。文档必须直接写明它不是完整随机挑战系统。 |
+| 新发现 | `proof` 最稳的载荷面不是再造一层新 chunk 对象，而是直接复用 `manifest` 和 `V3ErasureShardPullResponse`：`proof` 只带被抽中的 shard payload，逐片回算 `shardCid`，同时对齐 `challenge.shardCids` 和 `manifest.shardPayloadCids`。这条线最短，也最不容易和 `content fetch` 口径打架。 |
+| 新发现 | `content runtime cache` 不能再被文档误写成长期托管。现在 `preview/blob/shard cache` 只是命中层；真正的长期条款、挑战和 reward/slash 已经独立进 [pin_plane.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/pin_plane.cheng)。 |
+
+## Findings
+
+| 项目 | 结论 |
+|---|---|
 | 新发现 | 这次 [content_stub_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_stub_smoke.cheng) 真炸的点，不在 `content runtime store manifest` 本身，而在 smoke helper 之前那层口径：服务端 runtime cache 如果继续拿一份脱离发布面的对象去重编码，就可能和节点里已经发布出去的 manifest payload 脱节。最短真修法是直接让 helper 吃 `node.storeEntries[2].ingress.payload` 这份已经发布出去的 manifest payload，再走后续 `request manifest / shard pull / rebuild`。 |
 | 新发现 | 发布边界现在必须钉成“编码后立刻校验再入库”。这轮 [libp2p_bridge.cheng](/Users/lbcheng/cheng-lang/v3/src/overlay/libp2p_bridge.cheng) 已把 `manifest/recovery plan` 两条链都收成 `Encode -> ValidatePayload -> StorePut`。这样 payload 只要一脏，就会在发布当场直接暴露，不会拖到后面的内容 smoke 才炸。 |
 | 新发现 | `v3ContentRuntimeStoreManifestPayload(...)` 不是通病。独立 [content_runtime_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_runtime_smoke.cheng) 和 [content_quic_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_quic_smoke.cheng) 继续能直接吃 manifest 并前台 `ok`，说明这次问题是“喂进去的 payload 口径”而不是 runtime cache API 本身。 |
@@ -1070,3 +1116,17 @@
 - compiler/tooling smoke 这轮证明了另一件事：`stage23` 的价值不该只停在“协议主链跑通”，还要前置一层编译器自检。把 [compiler_runtime_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/compiler_runtime_smoke.cheng)、[compiler_pipeline_stub_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/compiler_pipeline_stub_smoke.cheng)、[lowering_plan_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/lowering_plan_smoke.cheng)、[primary_object_plan_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/primary_object_plan_smoke.cheng)、[object_native_link_plan_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/object_native_link_plan_smoke.cheng)、[program_selfhost_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/program_selfhost_smoke.cheng) 纳进以后，很多“协议 smoke 顺带暴露”的编译器漂移能更早、更短链地炸出来。 |
 - [handshake13.cheng](/Users/lbcheng/cheng-lang/v3/src/quic/tls/handshake13.cheng) 这次被新 runner 再次钉实：`PeerVerifySetOcspResponse` 这种看起来很小的 helper，只要还活着，就足够把 `stage2/stage3` ordinary 重新拖回去。这里的经验不是“这个 helper 特别坏”，而是 TLS 这类重闭包文件里不能允许任何单字段 setter 残留。 |
 - 现在 `stage23` 的正确分层已经很清楚：最前面是 compiler/tooling 预检层，中间是 QUIC/TLS + libp2p 协议层，后面才是 LSMR + overlay/pubsub/dag/plumtree/erasure/content/chain_node 业务主链。后面再扩 smoke，应该优先补这三层里仍然空着的洞，而不是随便往后段堆业务测试。 |
+2026-04-12 18:09
+- `headscale/DERP` 这层最稳的 Cheng 建模，不是新造一个 `tailscale transport` 或 `derp transport`，而是继续保留 `TCP/QUIC` 作为真实传输，把 `headscale` 放进 `provider/config/status`，把 `DERP` 放进 `reachability = relayed`。这样选路、地址可见性和上层协议都不会被带歪。
+- `DERP` 和 `WebRTC TURN` 不能混成一个东西。`DERP` 是 tailnet underlay 的 relay，`TURN` 是 WebRTC 数据面的 relay；这轮代码里两层已经分开：`headscale/DERP` 只在 [tailnet_transport.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/tailnet_transport.cheng)，[webrtc_signal.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/protocols/webrtc_signal.cheng) 里的 `turnServers` 继续只表达 WebRTC policy。
+- 只要把 `relayed` 固定排到 direct 后面，`tailnet` 和公网主线就能共存而不互相抢路。现在 [peerstore.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/core/peerstore.cheng) 已经把这条规则钉死：trusted 节点遇到 `tailnet relayed + public direct` 时会选 public direct；只有没有 direct 路时，才退回 `DERP`。 |
+2026-04-12 18:42
+- WebRTC 这轮最值钱的不是先碰浏览器 native bridge，而是先把 Cheng 源码层的会话模型补齐：`offer/answer/candidate/turn-policy` 的 codec、session 状态、transport policy、stream 选路，都已经能在不引入假的 `tailscale transport` 的前提下落到 [webrtc_signal.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/protocols/webrtc_signal.cheng) 和 [webrtc_transport.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/transports/webrtc_transport.cheng)。
+- 这轮也再次钉死了一个更硬的 ordinary 经验：`Result[Bytes]` 不能跨 transport 分支悬着用。只要像 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 之前那样，把 `servePayloadRes` 留到 TCP/WebRTC 分支里再 `Value(...)`，通用 `sync` 主线就会被一并带坏。最稳形状就是先本地物化 `servePayload`，再交给 transport helper。
+- 运输层一复杂，应该直接拆叶子 helper，不要继续把所有 transport 分支塞在一个大函数里和编译器较劲。[host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 这轮把 `v3Libp2pSyncRequest(...)` 拆成 `SyncDecodePayload/SyncRequestTcp/SyncRequestWebrtc` 之后，[libp2p_protocols_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_protocols_smoke.cheng)、[chain_node_libp2p_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_libp2p_smoke.cheng)、[chain_node_tailnet_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_tailnet_smoke.cheng) 一起恢复，说明这条才是正路。
+- `pin runtime` 这轮顺手证明了另一条类似边界：把 runtime 附件放进全局复合表 [pin_registry.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/pin_registry.cheng) 很容易踩全局复合状态的 lowering/初始化坑；直接收回 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng) 自身字段更稳，也更符合状态归属。
+- 当时 [pin_runtime_quic_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/pin_runtime_quic_smoke.cheng) 的确停到过 `std_crypto_bigint__bigSub`，但后续沿宿主正式协议分发表、`servePayload` 本地物化和 QUIC 宿主边界继续收口后，这条烟已经在 host 与 no-cache `stage2/stage3` 正式 gate 下全部重新真跑 `ok`。 |
+2026-04-12 19:08
+- [content_runtime_host.cheng](/Users/lbcheng/cheng-lang/v3/src/chain/content_runtime_host.cheng) 这轮又复现了和 `host sync` 一样的规律：当 `endpoint 选路 + serve payload + transport 分支 + response decode/validate` 全塞在一个函数里时，host 也许还绿，`stage2` 运行期却会直接在 `bytesSlice` 这种底层地方炸。最短正解不是补断言，而是拆成 `Tcp/Webrtc/Decode` 三个叶子 helper，让大函数只做 transport 分发。
+- `content` 这条再次证明，光把 `servePayload = Value(servePayloadRes)` 提前还不够；一旦 `response decode` 还和 transport 分支搅在一起，`stage2` 仍可能在 runtime 上坏掉。把 decode/validate 本身也抽成单独 helper 以后，`content_runtime_smoke.stage2` 才重新稳定。
+- 现在混合网络这条主线已经有了很清楚的结构经验：host/content 这类共享 I/O 边界函数，只要同时承载多个 transport，就应该第一时间拆成“边界校验 + transport-specific helper + decode helper”，不要等到 runner 段错以后再被动拆。 |
