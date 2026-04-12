@@ -1,0 +1,102 @@
+import std/system
+import std/result
+import std/rawbytes
+import cheng/v3/quic/tls/handshake13 as handshake13
+import cheng/v3/quic/core/frame_model
+import cheng/v3/quic/core/packet_model
+import cheng/v3/quic/core/packet_header_model
+import cheng/v3/quic/platform/datapath_runtime
+import cheng/v3/quic/platform/datapath_udp
+
+fn main(): int32 =
+    handshake13.msquicTls13ResetClientDefault(true)
+    let genRes: Result[bool] = handshake13.msquicTls13ClientGenerateX25519()
+    if IsErr(genRes):
+        panic(ErrorText(genRes))
+
+    let randomSeed: Bytes = bytesAlloc(32)
+    for i in 0..<32:
+        bytesSet(randomSeed, i, (0x21 + i) & 0xff)
+
+    let helloRes: Result[Bytes] = handshake13.msquicTls13ClientBuildClientHello(
+        randomSeed,
+        "dm",
+        "localhost",
+        emptyBytes()
+    )
+    if IsErr(helloRes):
+        panic(ErrorText(helloRes))
+    let hello: Bytes = Value(helloRes)
+
+    var pkt: packet_model.MsQuicPacket = packet_model.initMsQuicPacket(1)
+    let addRes: Result[bool] = packet_model.msquicPacketAddFrame(pkt, frame_model.msquicFrameCrypto(0, hello))
+    if IsErr(addRes):
+        panic(ErrorText(addRes))
+    let payloadRes: Result[Bytes] = packet_model.msquicPacketPayloadEncode(pkt)
+    if IsErr(payloadRes):
+        panic(ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+
+    let cid: Bytes = bytesAlloc(8)
+    for i in 0..<8:
+        bytesSet(cid, i, (0x31 + i) & 0xff)
+
+    var header: packet_header_model.QuicPacketHeader
+    header.longHeader = true
+    header.packetType = packet_header_model.QuicPacketInitial
+    header.version = 1
+    header.dcid = cid
+    header.scid = cid
+    header.token = emptyBytes()
+    header.payloadLength = int64(bytesLen(payload) + 2)
+    header.packetNumber = 1
+    header.packetNumberLen = 2
+    header.spinBit = false
+    header.keyPhase = false
+
+    let headerRes: Result[Bytes] = packet_header_model.quicPacketHeaderEncode(header)
+    if IsErr(headerRes):
+        panic(ErrorText(headerRes))
+    let wire: Bytes = bytesConcat3(Value(headerRes), payload, emptyBytes())
+
+    var rt: datapath_runtime.MsQuicDatapathRuntime
+    datapath_runtime.initMsQuicDatapathRuntimeInto(rt)
+
+    let receiverIdRes: Result[int32] = datapath_runtime.msquicDatapathAdd(rt, 0)
+    if IsErr(receiverIdRes):
+        panic(ErrorText(receiverIdRes))
+    let senderIdRes: Result[int32] = datapath_runtime.msquicDatapathAdd(rt, 0)
+    if IsErr(senderIdRes):
+        panic(ErrorText(senderIdRes))
+    let receiverId: int32 = Value(receiverIdRes)
+    let senderId: int32 = Value(senderIdRes)
+
+    let startRecvRes: Result[bool] = datapath_runtime.msquicDatapathStart(rt, receiverId)
+    if IsErr(startRecvRes):
+        panic(ErrorText(startRecvRes))
+    let startSendRes: Result[bool] = datapath_runtime.msquicDatapathStart(rt, senderId)
+    if IsErr(startSendRes):
+        panic(ErrorText(startSendRes))
+
+    let bindRecvRes = datapath_runtime.msquicDatapathBindUdp(rt, receiverId, "/ip4/127.0.0.1/udp/0/quic-v1")
+    if IsErr(bindRecvRes):
+        panic(ErrorText(bindRecvRes))
+    let bindSendRes = datapath_runtime.msquicDatapathBindUdp(rt, senderId, "/ip4/127.0.0.1/udp/0/quic-v1")
+    if IsErr(bindSendRes):
+        panic(ErrorText(bindSendRes))
+
+    let receiverAddr: str = datapath_runtime.msquicDatapathUdpAddr(rt, receiverId)
+    assert(len(receiverAddr) > 0, "v3 udp datapath wire roundtrip: receiver addr")
+
+    let sendRes: Result[bool] = datapath_runtime.msquicDatapathSendUdp(rt, senderId, receiverAddr, wire, -1)
+    if IsErr(sendRes):
+        panic(ErrorText(sendRes))
+
+    let recvRes = datapath_runtime.msquicDatapathRecvUdpBlocking(rt, receiverId)
+    if IsErr(recvRes):
+        panic(ErrorText(recvRes))
+
+    let datagram: datapath_udp.MsQuicUdpDatagram = Value(recvRes)
+    assert(bytesEqual(datagram.data, wire), "v3 udp datapath wire roundtrip: wire bytes")
+    echo("v3 udp_datapath_wire_roundtrip_smoke ok")
+    return 0

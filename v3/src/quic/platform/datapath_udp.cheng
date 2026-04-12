@@ -2,6 +2,7 @@
 
 import std/result
 import std/rawbytes
+import std/system
 import std/os as os
 import cheng/v3/quic/platform/common
 import std/net/transports/udp_syscall as udp
@@ -224,7 +225,7 @@ fn udpNormalizeHost(host: str, isV6: bool): str =
         return if isV6: "::1" else: "127.0.0.1"
     if host == "localhost":
         return if isV6: "::1" else: "127.0.0.1"
-    return host
+    return strFromBytesCopy(strDataPtr(host), len(host))
 
 fn udpBuildSockAddr(parsed: MsQuicUdpParsedAddr, family: int32, useLenField: bool): Result[SockAddrBuf] =
     let size: int32 = if parsed.isV6: 28 else: 16
@@ -290,31 +291,49 @@ fn udpEnableNonblock(fd: int32) =
         if (linuxFlags & udpONonblockLinux) != 0:
             return
 
-fn msquicUdpBind(addr: str): Result[MsQuicUdpBound] =
+fn msquicUdpBindInto(out: var MsQuicUdpBound, addr: str): Result[bool] =
+    out.fd = -1
+    out.addr = ""
+    out.isV6 = false
+    out.useLenField = false
     let parsedRes: Result[MsQuicUdpParsedAddr] = udpParseAddr(addr)
     if IsErr(parsedRes):
-        return Err[MsQuicUdpBound](ErrorText(parsedRes))
+        return Err[bool](ErrorText(parsedRes))
     let parsedBase: MsQuicUdpParsedAddr = Value(parsedRes)
 
     let slot: int32 = udpAllocSlot()
     if slot < 0:
-        return Err[MsQuicUdpBound]("msquic udp: socket table full")
+        return Err[bool]("msquic udp: socket table full")
 
     let hostText: str = udpNormalizeHost(parsedBase.host, parsedBase.isV6)
     let isV6Flag: int32 = if parsedBase.isV6: 1 else: 0
-    var fd: int32 = -1
-    var boundPort: int32 = 0
-    var family: int32 = if parsedBase.isV6: udpAfInet6Bsd else: udpAfInet
-    var useLenFieldInt: int32 = 0
-    let bindRc: int32 = os.udpBindHostPortBridge(hostText, parsedBase.port, isV6Flag, fd, boundPort, family, useLenFieldInt)
-    if bindRc != 0:
-        msquicUdpLastBindErrCode = bindRc
-        return Err[MsQuicUdpBound]("msquic udp: bind failed: " + os.udpErrText(bindRc) + " (" + intToStr(bindRc) + ")")
+    let fd: int32 = os.udpBindFdBridge(hostText, parsedBase.port, isV6Flag)
+    if fd < 0:
+        let bindErr: int32 = 0 - fd
+        msquicUdpLastBindErrCode = bindErr
+        return Err[bool]("msquic udp: bind failed: " + os.udpErrText(bindErr) + " (" + intToStr(bindErr) + ")")
+    var boundPort: int32 = parsedBase.port
+    if boundPort == 0:
+        let boundPortRes: int32 = os.udpBoundPortBridge(fd, isV6Flag)
+        if boundPortRes <= 0:
+            let portErr: int32 = 0 - boundPortRes
+            msquicUdpLastBindErrCode = portErr
+            let _ = os.udpCloseFd(fd)
+            return Err[bool]("msquic udp: getsockname failed: " + os.udpErrText(portErr) + " (" + intToStr(portErr) + ")")
+        boundPort = boundPortRes
+    let family: int32 = if parsedBase.isV6: udpAfInet6Bsd else: udpAfInet
     msquicUdpLastBindErrCode = 0
-    let useLenField: bool = useLenFieldInt != 0
-    var canonical: str = "udp://" + hostText + ":" + msquicPlatformIntToString(boundPort)
+    let useLenField: bool = os.udpPlatformUseLenFieldBridge() != 0
+    let boundPortText: str = msquicPlatformIntToString(boundPort)
+    var canonical: str = "udp://"
+    canonical = canonical + hostText
+    canonical = canonical + ":"
+    canonical = canonical + boundPortText
     if parsedBase.isV6:
-        canonical = "udp://[" + hostText + "]:" + msquicPlatformIntToString(boundPort)
+        canonical = "udp://["
+        canonical = canonical + hostText
+        canonical = canonical + "]:"
+        canonical = canonical + boundPortText
 
     msquicUdpSlotActive[slot] = true
     msquicUdpSlotFd[slot] = fd
@@ -323,7 +342,11 @@ fn msquicUdpBind(addr: str): Result[MsQuicUdpBound] =
     msquicUdpSlotFamily[slot] = family
     msquicUdpSlotUseLenField[slot] = useLenField
 
-    return Ok[MsQuicUdpBound](MsQuicUdpBound(fd: fd, addr: canonical, isV6: parsedBase.isV6, useLenField: useLenField))
+    out.fd = fd
+    out.addr = canonical
+    out.isV6 = parsedBase.isV6
+    out.useLenField = useLenField
+    return Ok[bool](true)
 
 fn msquicUdpLastBindErrorCode(): int32 =
     return msquicUdpLastBindErrCode
@@ -371,7 +394,7 @@ fn msquicUdpSend(
 
     let parsedRes: Result[MsQuicUdpParsedAddr] = udpParseAddr(toAddr)
     if IsErr(parsedRes):
-        return Err[bool](ErrorText(parsedRes))
+        panic("msquic udp send: parse")
     let parsed: MsQuicUdpParsedAddr = Value(parsedRes)
 
     if dscp >= 0:
@@ -386,33 +409,61 @@ fn msquicUdpSend(
             lastTos = tos
             lastTosIsV6 = parsed.isV6
 
-    let addrResA: Result[SockAddrBuf] = udpBuildSockAddr(parsed, msquicUdpSlotFamily[idx], true)
-    if IsOk(addrResA):
-        let addrA: SockAddrBuf = Value(addrResA)
-        let rcA: int32 = os.udpSendToFd(fd, data, 0, addrA.data, addrA.len)
-        if rcA == bytesLen(data):
-            msquicUdpSlotUseLenField[idx] = true
-            return Ok[bool](true)
+    var triedPreferred: bool = false
+    var triedFallback: bool = false
+    var lastErrCode: int32 = 0
 
-    let addrResB: Result[SockAddrBuf] = udpBuildSockAddr(parsed, msquicUdpSlotFamily[idx], false)
-    if IsOk(addrResB):
-        let addrB: SockAddrBuf = Value(addrResB)
-        let rcB: int32 = os.udpSendToFd(fd, data, 0, addrB.data, addrB.len)
-        if rcB == bytesLen(data):
-            msquicUdpSlotUseLenField[idx] = false
+    let preferredRes: Result[SockAddrBuf] = udpBuildSockAddr(parsed, msquicUdpSlotFamily[idx], useLenField)
+    if IsOk(preferredRes):
+        triedPreferred = true
+        let preferred: SockAddrBuf = Value(preferredRes)
+        let preferredRc: int32 = os.udpSendToFd(fd, data, 0, preferred.data, preferred.len)
+        if preferredRc == bytesLen(data):
+            msquicUdpSlotUseLenField[idx] = useLenField
             return Ok[bool](true)
+        lastErrCode = os.udpErrno()
+    let fallbackUseLenField: bool = ! useLenField
+    let fallbackRes: Result[SockAddrBuf] = udpBuildSockAddr(parsed, msquicUdpSlotFamily[idx], fallbackUseLenField)
+    if IsOk(fallbackRes):
+        triedFallback = true
+        let fallback: SockAddrBuf = Value(fallbackRes)
+        let fallbackRc: int32 = os.udpSendToFd(fd, data, 0, fallback.data, fallback.len)
+        if fallbackRc == bytesLen(data):
+            msquicUdpSlotUseLenField[idx] = fallbackUseLenField
+            return Ok[bool](true)
+        lastErrCode = os.udpErrno()
 
-    let errCode: int32 = os.udpErrno()
-    return Err[bool]("msquic udp: sendto failed: " + os.udpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    if ! triedPreferred && ! triedFallback:
+        let lenFieldText: str = if useLenField: "1" else: "0"
+        var msg: str = "msquic udp send: build failed: to="
+        msg = msg + toAddr
+        msg = msg + " host="
+        msg = msg + parsed.host
+        msg = msg + " family="
+        msg = msg + msquicPlatformIntToString(msquicUdpSlotFamily[idx])
+        msg = msg + " lenField="
+        msg = msg + lenFieldText
+        return Err[bool](msg)
+    if lastErrCode == 0:
+        lastErrCode = os.udpErrno()
+    return Err[bool](
+        "msquic udp send: sendto failed: " +
+        os.udpErrText(lastErrCode) +
+        " (" +
+        msquicPlatformIntToString(lastErrCode) +
+        ")" +
+        " to=" +
+        toAddr
+    )
 
 fn msquicUdpRecv(fd: int32): Result[MsQuicUdpDatagram] =
     let idx: int32 = udpFindByFd(fd)
     if idx < 0:
         return Err[MsQuicUdpDatagram]("msquic udp: invalid socket")
-    let recvRes: Result[udp.UdpRecvResult] = udp.udpRecvFromNonblock(fd, maxMsQuicUdpPayloadBytes)
+    var recv: udp.UdpRecvResult
+    let recvRes: Result[bool] = udp.udpRecvFromNonblock(fd, maxMsQuicUdpPayloadBytes, recv)
     if IsErr(recvRes):
         return Err[MsQuicUdpDatagram]("msquic udp: recv failed: " + ErrorText(recvRes))
-    let recv: udp.UdpRecvResult = Value(recvRes)
     return Ok[MsQuicUdpDatagram](
         MsQuicUdpDatagram(
             fromAddr: udp.udpSockAddrCanonical(recv.fromAddr),
@@ -424,10 +475,10 @@ fn msquicUdpRecvBlocking(fd: int32): Result[MsQuicUdpDatagram] =
     let idx: int32 = udpFindByFd(fd)
     if idx < 0:
         return Err[MsQuicUdpDatagram]("msquic udp: invalid socket")
-    let recvRes: Result[udp.UdpRecvResult] = udp.udpRecvFromBlocking(fd, maxMsQuicUdpPayloadBytes)
+    var recv: udp.UdpRecvResult
+    let recvRes: Result[bool] = udp.udpRecvFromBlocking(fd, maxMsQuicUdpPayloadBytes, recv)
     if IsErr(recvRes):
         return Err[MsQuicUdpDatagram]("msquic udp: recv failed: " + ErrorText(recvRes))
-    let recv: udp.UdpRecvResult = Value(recvRes)
     return Ok[MsQuicUdpDatagram](
         MsQuicUdpDatagram(
             fromAddr: udp.udpSockAddrCanonical(recv.fromAddr),

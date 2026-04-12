@@ -12,8 +12,6 @@ const
     maxBigIntLimbs = 256
     maxBigIntHalfDigits = maxBigIntLimbs * 2
     bigIntWordBase: int64 = int64(1) << 32
-    bigIntWordMask: int64 = (int64(1) << 32) - 1
-    bigIntWordMaskU64: uint64 = uint64(0xffffffff)
 
 type
     BigInt =
@@ -34,20 +32,27 @@ type
         top: int32
 
 fn bigWordToU64(w: int32): int64 =
-    var v: int64 = int64(w)
-    if v < 0:
-        v = v + bigIntWordBase
-    return v
+    return int64(uint32(w))
 
 fn bigWordFromU64(v: int64): int32 =
-    # Keep the low 32 bits; caller ensures v is non-negative.
-    return int32(v & bigIntWordMask)
+    return int32(uint32(v))
 
 fn bigWordToBitsU64(w: int32): uint64 =
     return uint64(uint32(w))
 
 fn bigWordFromBitsU64(v: uint64): int32 =
-    return int32(uint32(v & bigIntWordMaskU64))
+    return int32(uint32(v))
+
+fn bigLowHalfBitsU64(v: uint64): uint64 =
+    let hi: uint64 = v >> uint64(16)
+    return v - (hi << uint64(16))
+
+fn bigLowByte(v: uint64): int32 =
+    let hi: uint64 = v >> uint64(8)
+    return int32(uint32(v - (hi << uint64(8))))
+
+fn bigBorrowFromWide(wide: int64): int64 =
+    return int64(1) - (wide >> bigIntWordBits)
 
 fn bigZero(): BigInt =
     BigInt(count: 0)
@@ -71,14 +76,13 @@ fn bigFromInt(value: int64): BigInt =
     if value <= 0:
         return bigZero()
     var out: BigInt
-    let lo: int64 = value & bigIntWordMask
-    out.limbs[0] = bigWordFromU64(lo)
-    let hi: int64 = (value >> 32) & bigIntWordMask
-    if hi != 0:
-        out.limbs[1] = bigWordFromU64(hi)
-        out.count = 2
-    else:
+    out.limbs[0] = bigWordFromU64(value)
+    let hi: int64 = value >> 32
+    if hi == 0:
         out.count = 1
+        return out
+    out.limbs[1] = bigWordFromU64(hi)
+    out.count = 2
     return out
 
 fn bigCopy(a: BigInt): BigInt =
@@ -124,7 +128,8 @@ fn bigAdd(a: BigInt, b: BigInt): Result[BigInt] =
     return Ok[BigInt](out)
 
 fn bigSub(a: BigInt, b: BigInt): Result[BigInt] =
-    if bigCmp(a, b) < 0:
+    let cmp: int32 = bigCmp(a, b)
+    if cmp < 0:
         return Err[BigInt]("bigint: negative result")
     var out: BigInt
     out.count = a.count
@@ -132,15 +137,12 @@ fn bigSub(a: BigInt, b: BigInt): Result[BigInt] =
     for i in 0..<a.count:
         let av: int64 = bigWordToU64(a.limbs[i])
         let bv: int64 = if i < b.count: bigWordToU64(b.limbs[i]) else: 0
-        let sub: int64 = bv + borrow
-        var diff: int64 = 0
-        if av >= sub:
-            diff = av - sub
-            borrow = 0
-        else:
-            diff = (av + bigIntWordBase) - sub
+        let wide: int64 = av - bv - borrow
+        out.limbs[i] = bigWordFromU64(wide)
+        if wide < 0:
             borrow = 1
-        out.limbs[i] = bigWordFromU64(diff)
+        else:
+            borrow = 0
     bigNormalize(out)
     return Ok[BigInt](out)
 
@@ -281,8 +283,8 @@ fn bigHalfDigitScratchGet(digits: Bytes, idx: int32): uint64 =
 
 fn bigHalfDigitScratchSet(digits: Bytes, idx: int32, value: uint64) =
     let offset: int32 = idx * 2
-    bytesSet(digits, offset, int32(value & uint64(0xff)))
-    bytesSet(digits, offset + 1, int32((value >> uint64(8)) & uint64(0xff)))
+    bytesSet(digits, offset, bigLowByte(value))
+    bytesSet(digits, offset + 1, bigLowByte(value >> uint64(8)))
 
 fn bigMontgomeryScratchGet(scratch: BigMontgomeryScratch, idx: int32): uint64 =
     if idx < maxBigIntLimbs:
@@ -292,7 +294,7 @@ fn bigMontgomeryScratchGet(scratch: BigMontgomeryScratch, idx: int32): uint64 =
     return bigWordToBitsU64(scratch.top)
 
 fn bigMontgomeryScratchSet(scratch: var BigMontgomeryScratch, idx: int32, value: uint64) =
-    let word: int32 = bigWordFromBitsU64(value & bigIntWordMaskU64)
+    let word: int32 = bigWordFromBitsU64(value)
     if idx < maxBigIntLimbs:
         scratch.low.limbs[idx] = word
         return
@@ -313,7 +315,7 @@ fn bigMontgomeryAddMulAt(scratch: var BigMontgomeryScratch,
         let bv: uint64 = if j < multiplicand.count: bigWordToBitsU64(multiplicand.limbs[j]) else: uint64(0)
         let cur: uint64 = bigMontgomeryScratchGet(scratch, offset + j)
         let prod: uint64 = mulWord * bv
-        let prodLo: uint64 = prod & bigIntWordMaskU64
+        let prodLo: uint64 = uint64(uint32(prod))
         let prodHi: uint64 = prod >> uint64(bigIntWordBits)
         let sumLo: uint64 = cur + prodLo + carry
         bigMontgomeryScratchSet(scratch, offset + j, sumLo)
@@ -334,8 +336,9 @@ fn bigBuildMontgomeryN0Inv(modulus: BigInt): Result[uint64] =
         return Err[uint64]("bigint: montgomery requires odd modulus")
     var x: uint64 = uint64(1)
     for _ in 0..<5:
-        x = (x * (uint64(2) - ((n0 * x) & bigIntWordMaskU64))) & bigIntWordMaskU64
-    return Ok[uint64]((uint64(0) - x) & bigIntWordMaskU64)
+        let step: uint64 = uint64(2) - uint64(uint32(n0 * x))
+        x = uint64(uint32(x * step))
+    return Ok[uint64](uint64(uint32(uint64(0) - x)))
 
 fn bigComputePow2Mod(modulus: BigInt, bitCount: int32): Result[BigInt] =
     var out: BigInt = bigFromInt(1)
@@ -356,7 +359,7 @@ fn bigMontgomeryMulCore(a: var BigInt, b: var BigInt, ctx: var BigMontgomeryCont
     for i in 0..<limbCount:
         let bi: uint64 = if i < b.count: bigWordToBitsU64(b.limbs[i]) else: uint64(0)
         bigMontgomeryAddMulAt(scratch, i, bi, a, limbCount)
-        let mWord: uint64 = (bigMontgomeryScratchGet(scratch, i) * ctx.n0Inv) & bigIntWordMaskU64
+        let mWord: uint64 = uint64(uint32(bigMontgomeryScratchGet(scratch, i) * ctx.n0Inv))
         bigMontgomeryAddMulAt(scratch, i, mWord, ctx.modulus, limbCount)
     var out: BigInt
     out.count = limbCount
@@ -460,23 +463,18 @@ fn bigModExpWithContext(base: var BigInt, exp: var BigInt, ctx: var BigMontgomer
     return bigMontgomeryMulCore(resultMont, one, ctx)
 
 fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
-    if a.count <= 0 || b.count <= 0:
+    if a.count <= 0:
+        return Ok[BigInt](bigZero())
+    if b.count <= 0:
         return Ok[BigInt](bigZero())
     let outMax: int32 = a.count + b.count
     if outMax > maxBigIntLimbs:
-        let text: str =
-            "bigint: mul overflow out_max=" + intToStr(outMax) +
-            " a_count=" + intToStr(a.count) +
-            " b_count=" + intToStr(b.count)
-        return Err[BigInt](text)
+        return Err[BigInt]("bigint: mul overflow")
     let aHalfCount: int32 = bigHalfDigitCount(a)
     let bHalfCount: int32 = bigHalfDigitCount(b)
-    if aHalfCount + bHalfCount > maxBigIntHalfDigits:
-        let text: str =
-            "bigint: mul half-digit overflow a_half=" + intToStr(aHalfCount) +
-            " b_half=" + intToStr(bHalfCount)
-        return Err[BigInt](text)
     let outHalfMax: int32 = aHalfCount + bHalfCount
+    if outHalfMax > 512:
+        return Err[BigInt]("bigint: mul half-digit overflow")
     let outHalfDigits: Bytes = bytesAlloc(outHalfMax * 2)
     var out: BigInt
     for i in 0..<aHalfCount:
@@ -488,20 +486,15 @@ fn bigMul(a: BigInt, b: BigInt): Result[BigInt] =
             let cur: uint64 = bigHalfDigitScratchGet(outHalfDigits, idx)
             let prod: uint64 = av * bv
             let sum: uint64 = prod + cur + carry
-            bigHalfDigitScratchSet(outHalfDigits, idx, sum & uint64(0xffff))
+            bigHalfDigitScratchSet(outHalfDigits, idx, bigLowHalfBitsU64(sum))
             carry = sum >> uint64(16)
         var carryIdx: int32 = i + bHalfCount
         while carry != uint64(0):
             if carryIdx >= outHalfMax:
-                let text: str =
-                    "bigint: mul carry overflow carry_idx=" + intToStr(carryIdx) +
-                    " out_half_max=" + intToStr(outHalfMax) +
-                    " a_half=" + intToStr(aHalfCount) +
-                    " b_half=" + intToStr(bHalfCount)
-                return Err[BigInt](text)
+                return Err[BigInt]("bigint: mul carry overflow")
             let cur: uint64 = bigHalfDigitScratchGet(outHalfDigits, carryIdx)
             let sum: uint64 = cur + carry
-            bigHalfDigitScratchSet(outHalfDigits, carryIdx, sum & uint64(0xffff))
+            bigHalfDigitScratchSet(outHalfDigits, carryIdx, bigLowHalfBitsU64(sum))
             carry = sum >> uint64(16)
             carryIdx = carryIdx + 1
     out.count = (outHalfMax + 1) / 2

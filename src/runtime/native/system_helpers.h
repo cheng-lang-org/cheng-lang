@@ -43,6 +43,7 @@ void* cheng_memcpy(void* dest, void* src, int64_t n);
 void* cheng_memset(void* dest, int32_t val, int64_t n);
 void* cheng_memcpy_ffi(void* dest, void* src, int64_t n);
 void* cheng_memset_ffi(void* dest, int32_t val, int64_t n);
+int32_t cheng_system_entropy_fill(void* dst, int32_t len);
 void* alloc(int32_t size);
 void copyMem(void* dest, void* src, int32_t size);
 void setMem(void* dest, int32_t val, int32_t size);
@@ -59,6 +60,9 @@ int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
                                            int32_t* outPort,
                                            int32_t* outFamily,
                                            int32_t* outUseLenField);
+int32_t cheng_v3_udp_bind_fd_bridge(ChengStrBridge host, int32_t port, int32_t isV6);
+int32_t cheng_v3_udp_bound_port_bridge(int32_t fd, int32_t isV6);
+int32_t cheng_v3_udp_platform_use_len_field_bridge(void);
 int32_t __cheng_str_eq(const char* a, const char* b);
 bool cheng_str_is_empty(const char* s);
 bool cheng_str_nonempty(const char* s);
@@ -221,9 +225,9 @@ struct ChengChanI32* cheng_chan_i32_new(int32_t cap);
 int32_t cheng_chan_i32_send(struct ChengChanI32* ch, int32_t value);
 int32_t cheng_chan_i32_recv(struct ChengChanI32* ch, int32_t* out);
 
-void* get_stdin();
-void* get_stdout();
-void* get_stderr();
+void* get_stdin(void);
+void* get_stdout(void);
+void* get_stderr(void);
 int32_t cheng_fseek(void* stream, int64_t offset, int32_t whence);
 int64_t cheng_ftell(void* stream);
 #define addr_0(x) (&(x))
@@ -438,5 +442,6 @@ int32_t cheng_tcp_listener(int32_t port, int32_t* outPort);
 int32_t cheng_errno(void);
 const char* cheng_strerror(int32_t err);
 int32_t cheng_recvfrom_fd_ex(int32_t fd, void* buf, int32_t len, int32_t flags, void* addr, void* addrlen, int32_t* outErr);
+int32_t cheng_v3_udp_recvfrom_addr_bridge(int32_t fd, void* buf, int32_t len, int32_t flags, void* addr, int32_t addrCap, int32_t* outAddrLen, int32_t* outErr);
 
 #endif

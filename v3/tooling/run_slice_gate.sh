@@ -41,6 +41,22 @@ if ! sh "$root/v3/tooling/build_backend_driver_v3.sh" \
   exit 1
 fi
 
+echo "[v3 gate] host fixed256 sha256 smoke"
+if ! sh "$root/v3/tooling/run_v3_host_smokes.sh" fixed256_sha256_smoke \
+  >"$out_dir/run_v3_host_smokes.fixed256_sha256.log" 2>&1; then
+  echo "v3 gate: fixed256_sha256_smoke failed" >&2
+  tail -n 80 "$out_dir/run_v3_host_smokes.fixed256_sha256.log" >&2 || true
+  exit 1
+fi
+
+echo "[v3 gate] host default-init literals smoke"
+if ! sh "$root/v3/tooling/run_v3_host_smokes.sh" default_init_literals_smoke \
+  >"$out_dir/run_v3_host_smokes.default_init_literals.log" 2>&1; then
+  echo "v3 gate: default_init_literals_smoke failed" >&2
+  tail -n 80 "$out_dir/run_v3_host_smokes.default_init_literals.log" >&2 || true
+  exit 1
+fi
+
 echo "[v3 gate] stage2/stage3 libp2p smokes"
 if ! sh "$root/v3/tooling/run_v3_stage23_libp2p_smokes.sh" \
   >"$out_dir/run_v3_stage23_libp2p_smokes.log" 2>&1; then

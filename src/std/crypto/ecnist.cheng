@@ -2,6 +2,7 @@
 
 import std/result
 import std/rawbytes
+import std/system
 import std/crypto/rand
 import std/crypto/sha256
 import std/crypto/hkdf
@@ -123,6 +124,9 @@ fn p256ConstP(): BigInt =
 
 fn p256ConstN(): BigInt =
     return p256ConstBig8(8, -60611247, -205927742, -1491624316, -1125713235, -1, -1, 0, -1)
+
+fn p256ConstNHalf(): BigInt =
+    return p256ConstBig8(8, 2117178024, 2044519777, -745812158, -562856618, -1, 2147483647, -2147483648, 2147483647)
 
 fn p256ConstB(): BigInt =
     return p256ConstBig8(8, 668098635, 1003371582, -866930442, 1696401072, 1989707452, -1276396203, -1439001625, 1522939352)
@@ -593,7 +597,7 @@ fn bytesFromByte(value: int32): Bytes =
     return out
 
 fn hmacSha256(key: Bytes, data: Bytes): Bytes =
-    return hmacDigest(key, data, sha256BlockSize, sha256Size, ecnistSha256DigestFn)
+    return hmacDigestSha256(key, data)
 
 fn ecnistSha256DigestFn(data: Bytes): Bytes =
     return sha256Digest(data)
@@ -636,7 +640,7 @@ fn p256EnsureInit(): Result[bool] =
         return Err[bool](Error(nMinus2Res))
     p256PMinus2 = Value(pMinus2Res)
     p256NMinus2 = Value(nMinus2Res)
-    p256NHalf = bigShiftRight1(p256N)
+    p256NHalf = p256ConstNHalf()
     p256PCtxFixed = pfix.p256FieldMontgomeryContext()
     p256NCtxFixed = pfix.p256ScalarMontgomeryContext()
     let pMinus2FixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(p256PMinus2)
@@ -823,26 +827,22 @@ fn p256FieldFixedIsOne(a: pfix.P256Fixed): bool =
 
 fn p256FieldFixedAddCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
     let res: Result[pfix.P256Fixed] = p256FieldFixedAdd(a, b)
-    if IsErr(res):
-        crash("ecdsa: fixed add failed " + Error(res))
+    assert(!IsErr(res), "ecdsa: fixed add failed")
     return Value(res)
 
 fn p256FieldFixedSubCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
     let res: Result[pfix.P256Fixed] = p256FieldFixedSub(a, b)
-    if IsErr(res):
-        crash("ecdsa: fixed sub failed " + Error(res))
+    assert(!IsErr(res), "ecdsa: fixed sub failed")
     return Value(res)
 
 fn p256FieldFixedMulCrash(a: pfix.P256Fixed, b: pfix.P256Fixed): pfix.P256Fixed =
     let res: Result[pfix.P256Fixed] = p256FieldFixedMul(a, b)
-    if IsErr(res):
-        crash("ecdsa: fixed mul failed " + Error(res))
+    assert(!IsErr(res), "ecdsa: fixed mul failed")
     return Value(res)
 
 fn p256FieldFixedSquareCrash(a: pfix.P256Fixed): pfix.P256Fixed =
     let res: Result[pfix.P256Fixed] = p256FieldFixedSquare(a)
-    if IsErr(res):
-        crash("ecdsa: fixed square failed " + Error(res))
+    assert(!IsErr(res), "ecdsa: fixed square failed")
     return Value(res)
 
 fn p256FieldFixedDoubleCrash(a: pfix.P256Fixed): pfix.P256Fixed =
@@ -900,10 +900,10 @@ fn pointBigFromFixed(p: EcPointFixed): EcPoint =
         return pointInfinity()
     let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.x)
     if IsErr(xNormRes):
-        crash("ecdsa: pointBigFromFixed x fromMont failed")
+        panic("ecdsa: pointBigFromFixed x fromMont failed")
     let yNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.y)
     if IsErr(yNormRes):
-        crash("ecdsa: pointBigFromFixed y fromMont failed")
+        panic("ecdsa: pointBigFromFixed y fromMont failed")
     var x: pfix.P256Fixed = Value(xNormRes)
     var y: pfix.P256Fixed = Value(yNormRes)
     return EcPoint(x: pfix.p256FixedToBigInt(x), y: pfix.p256FixedToBigInt(y), inf: false)
@@ -941,23 +941,19 @@ fn pointJacobianXToScalarBigInt(p: EcPointJacobianFixed): Result[BigInt] =
     return Ok[BigInt](pfix.p256FixedToBigInt(reduced))
 
 fn pointJacobianXToScalarFixedCrash(p: EcPointJacobianFixed): pfix.P256Fixed =
-    if p.inf || pfix.p256FixedIsZero(p.z):
-        crash("ecdsa: jacobian point at infinity")
+    assert(!(p.inf || pfix.p256FixedIsZero(p.z)), "ecdsa: jacobian point at infinity")
     var xNorm: pfix.P256Fixed
     if p256FieldFixedIsOne(p.z):
         let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(p.x)
-        if IsErr(xNormRes):
-            crash("ecdsa: x fromMont failed " + Error(xNormRes))
+        assert(!IsErr(xNormRes), "ecdsa: x fromMont failed")
         xNorm = Value(xNormRes)
     else:
         let zInvRes: Result[pfix.P256Fixed] = p256FieldFixedInv(p.z)
-        if IsErr(zInvRes):
-            crash("ecdsa: z inverse failed " + Error(zInvRes))
+        assert(!IsErr(zInvRes), "ecdsa: z inverse failed")
         let zInv2: pfix.P256Fixed = p256FieldFixedSquareCrash(Value(zInvRes))
         let xMont: pfix.P256Fixed = p256FieldFixedMulCrash(p.x, zInv2)
         let xNormRes: Result[pfix.P256Fixed] = p256FieldFixedFromMont(xMont)
-        if IsErr(xNormRes):
-            crash("ecdsa: x normalize failed " + Error(xNormRes))
+        assert(!IsErr(xNormRes), "ecdsa: x normalize failed")
         xNorm = Value(xNormRes)
     return p256FieldFixedXReduceToScalarFixed(xNorm)
 
@@ -1765,20 +1761,42 @@ fn p256Hash(msg: Bytes): Result[BigInt] =
     let digest: Bytes = sha256Digest(msg)
     return bigFromBytes(digest)
 
+fn p256DeterministicConcat4(a: Bytes, b: Bytes, c: Bytes, d: Bytes): Bytes =
+    let total: int32 = bytesLen(a) + bytesLen(b) + bytesLen(c) + bytesLen(d)
+    let out: Bytes = bytesAlloc(total)
+    var offset: int32 = 0
+    for i in 0..<bytesLen(a):
+        bytesSet(out, offset + i, bytesGet(a, i))
+    offset = offset + bytesLen(a)
+    for i in 0..<bytesLen(b):
+        bytesSet(out, offset + i, bytesGet(b, i))
+    offset = offset + bytesLen(b)
+    for i in 0..<bytesLen(c):
+        bytesSet(out, offset + i, bytesGet(c, i))
+    offset = offset + bytesLen(c)
+    for i in 0..<bytesLen(d):
+        bytesSet(out, offset + i, bytesGet(d, i))
+    return out
+
+fn p256DeterministicFilledBytes(fill: int32): Bytes =
+    let out: Bytes = bytesAlloc(sha256Size)
+    for i in 0..<sha256Size:
+        bytesSet(out, i, fill)
+    return out
+
 fn p256DeterministicK(priv: BigInt, msg: Bytes): Result[BigInt] =
     let xBytes: Bytes = bigToBytes(priv, p256ScalarSize)
     let h1: Bytes = sha256Digest(msg)
-    var v: Bytes = bytesAlloc(sha256Size)
-    var k: Bytes = bytesAlloc(sha256Size)
-    for i in 0..<sha256Size:
-        bytesSet(v, i, 0x01)
-        bytesSet(k, i, 0x00)
+    var v: Bytes = p256DeterministicFilledBytes(0x01)
+    var k: Bytes = p256DeterministicFilledBytes(0x00)
     let zero: Bytes = bytesFromByte(0x00)
     let one: Bytes = bytesFromByte(0x01)
-    let k1: Bytes = hmacSha256(k, bytesConcat(bytesConcat3(v, zero, xBytes), h1))
+    let seed0: Bytes = p256DeterministicConcat4(v, zero, xBytes, h1)
+    let k1: Bytes = hmacSha256(k, seed0)
     k = k1
     v = hmacSha256(k, v)
-    k = hmacSha256(k, bytesConcat(bytesConcat3(v, one, xBytes), h1))
+    let seed1: Bytes = p256DeterministicConcat4(v, one, xBytes, h1)
+    k = hmacSha256(k, seed1)
     v = hmacSha256(k, v)
     for attempt in 0..<64:
         v = hmacSha256(k, v)
@@ -1788,7 +1806,8 @@ fn p256DeterministicK(priv: BigInt, msg: Bytes): Result[BigInt] =
         let candidate: BigInt = Value(tRes)
         if ! bigIsZero(candidate) && bigCmp(candidate, p256N) < 0:
             return Ok[BigInt](candidate)
-        k = hmacSha256(k, bytesConcat(v, zero))
+        let retrySeed: Bytes = bytesConcat(v, zero)
+        k = hmacSha256(k, retrySeed)
         v = hmacSha256(k, v)
     return Err[BigInt]("ecdsa: failed to derive nonce")
 
@@ -1966,6 +1985,16 @@ fn ecdsaVerifyTrustedPublicKey(pub: EcPublicKey, msg: Bytes, sig: EcSignature): 
     var vFixed = pointJacobianXToScalarFixedCrash(sumPoint)
     var rFixed = Value(rFixedRes)
     return pfix.p256FixedCmp(vFixed, rFixed) == 0
+
+fn ecdsaVerifyTrustedPublicKeyBytes(pubBytes: Bytes, msg: Bytes, sig: EcSignature): Result[bool] =
+    let pubRes: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(pubBytes)
+    if IsErr(pubRes):
+        return Err[bool](Error(pubRes))
+    return Ok[bool](ecdsaVerifyTrustedPublicKey(Value(pubRes), msg, sig))
+
+fn ecdsaPublicKeyBytesValid(pubBytes: Bytes): bool =
+    let pubRes: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(pubBytes)
+    return IsOk(pubRes)
 
 fn ecdsaPublicKeyToBytes(pub: EcPublicKey): Bytes =
     let out: Bytes = bytesAlloc(p256PublicSize)

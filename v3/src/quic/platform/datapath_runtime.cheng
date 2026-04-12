@@ -52,7 +52,7 @@ fn initMsQuicDatapathRuntime(): MsQuicDatapathRuntime =
     initMsQuicDatapathRuntimeInto(out)
     return out
 
-fn msquicDatapathFind(rt: MsQuicDatapathRuntime, id: int32): int32 =
+fn msquicDatapathFind(rt: var MsQuicDatapathRuntime, id: int32): int32 =
     for i in 0..<rt.count:
         if rt.ids[i] == id:
             return i
@@ -117,7 +117,7 @@ fn msquicDatapathRecordRecv(rt: var MsQuicDatapathRuntime, id: int32, bytes: int
         rt.bytesRecv[idx] = rt.bytesRecv[idx] + bytes
     return Ok[bool](true)
 
-fn msquicDatapathSummary(rt: MsQuicDatapathRuntime, id: int32): str =
+fn msquicDatapathSummary(rt: var MsQuicDatapathRuntime, id: int32): str =
     let idx: int32 = msquicDatapathFind(rt, id)
     if idx < 0:
         return ""
@@ -133,10 +133,10 @@ fn msquicDatapathBindUdp(rt: var MsQuicDatapathRuntime, id: int32, addrText: str
         return Err[bool]("msquic datapath: ! found")
     if rt.udpSocketId[idx] >= 0:
         return Ok[bool](true)
-    let sockRes: Result[MsQuicUdpBound] = msquicUdpBind(addrText)
+    var bound: MsQuicUdpBound
+    let sockRes: Result[bool] = msquicUdpBindInto(bound, addrText)
     if IsErr(sockRes):
         return Err[bool](ErrorText(sockRes))
-    let bound: MsQuicUdpBound = Value(sockRes)
     rt.udpSocketId[idx] = bound.fd
     rt.udpUseLenField[idx] = bound.useLenField
     rt.udpLastTos[idx] = -1
@@ -144,11 +144,17 @@ fn msquicDatapathBindUdp(rt: var MsQuicDatapathRuntime, id: int32, addrText: str
     rt.udpAddr[idx] = bound.addr
     return Ok[bool](true)
 
-fn msquicDatapathUdpAddr(rt: MsQuicDatapathRuntime, id: int32): str =
+fn msquicDatapathUdpAddr(rt: var MsQuicDatapathRuntime, id: int32): str =
     let idx: int32 = msquicDatapathFind(rt, id)
     if idx < 0:
         return ""
     return rt.udpAddr[idx]
+
+fn msquicDatapathUdpBound(rt: var MsQuicDatapathRuntime, id: int32): bool =
+    let idx: int32 = msquicDatapathFind(rt, id)
+    if idx < 0:
+        return false
+    return rt.udpSocketId[idx] >= 0
 
 fn msquicDatapathUnbindUdp(rt: var MsQuicDatapathRuntime, id: int32) =
     let idx: int32 = msquicDatapathFindMut(rt, id)
@@ -171,11 +177,11 @@ fn msquicDatapathSendUdp(
 ): Result[bool] =
     let idx: int32 = msquicDatapathFindMut(rt, id)
     if idx < 0:
-        return Err[bool]("msquic datapath: ! found")
+        return Err[bool]("msquic datapath send: !found")
     if ! rt.active[idx]:
-        return Err[bool]("msquic datapath: closed")
+        return Err[bool]("msquic datapath send: closed")
     if rt.udpSocketId[idx] < 0:
-        return Err[bool]("msquic datapath: udp ! bound")
+        return Err[bool]("msquic datapath send: !bound")
     var lastTos: int32 = rt.udpLastTos[idx]
     var lastTosIsV6: bool = rt.udpLastTosIsV6[idx]
     let sendRes: Result[bool] = msquicUdpSend(
@@ -191,7 +197,9 @@ fn msquicDatapathSendUdp(
     rt.udpLastTosIsV6[idx] = lastTosIsV6
     if IsErr(sendRes):
         return Err[bool](ErrorText(sendRes))
-    msquicDatapathRecordSend(rt, id, int64(bytesLen(data)))
+    let recordSendRes: Result[bool] = msquicDatapathRecordSend(rt, id, int64(bytesLen(data)))
+    if IsErr(recordSendRes):
+        return Err[bool](ErrorText(recordSendRes))
     return Ok[bool](true)
 
 fn msquicDatapathRecvUdp(rt: var MsQuicDatapathRuntime, id: int32): Result[MsQuicUdpDatagram] =
@@ -205,7 +213,10 @@ fn msquicDatapathRecvUdp(rt: var MsQuicDatapathRuntime, id: int32): Result[MsQui
     let recvRes: Result[MsQuicUdpDatagram] = msquicUdpRecv(rt.udpSocketId[idx])
     if IsErr(recvRes):
         return Err[MsQuicUdpDatagram](ErrorText(recvRes))
-    msquicDatapathRecordRecv(rt, id, int64(bytesLen(Value(recvRes).data)))
+    let recvBytes: int64 = int64(bytesLen(Value(recvRes).data))
+    let recordRecvRes: Result[bool] = msquicDatapathRecordRecv(rt, id, recvBytes)
+    if IsErr(recordRecvRes):
+        return Err[MsQuicUdpDatagram](ErrorText(recordRecvRes))
     return recvRes
 
 fn msquicDatapathRecvUdpBlocking(rt: var MsQuicDatapathRuntime, id: int32): Result[MsQuicUdpDatagram] =
@@ -219,5 +230,8 @@ fn msquicDatapathRecvUdpBlocking(rt: var MsQuicDatapathRuntime, id: int32): Resu
     let recvRes: Result[MsQuicUdpDatagram] = msquicUdpRecvBlocking(rt.udpSocketId[idx])
     if IsErr(recvRes):
         return Err[MsQuicUdpDatagram](ErrorText(recvRes))
-    msquicDatapathRecordRecv(rt, id, int64(bytesLen(Value(recvRes).data)))
+    let recvBytes: int64 = int64(bytesLen(Value(recvRes).data))
+    let recordRecvRes: Result[bool] = msquicDatapathRecordRecv(rt, id, recvBytes)
+    if IsErr(recordRecvRes):
+        return Err[MsQuicUdpDatagram](ErrorText(recordRecvRes))
     return recvRes

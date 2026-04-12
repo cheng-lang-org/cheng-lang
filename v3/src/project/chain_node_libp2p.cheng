@@ -147,6 +147,7 @@ fn v3ChainNodeLibp2pFillIngress(out: var overlay.V3IngressEnvelope,
     out.sourcePeerId = sourcePeerId.value
     out.topicScope = overlay.v3OverlayScopeCell
     out.address = address
+    out.payloadKind = 0
     out.payload = payload
     out.payloadCid = v3ChainNodeLibp2pPayloadCid(payload)
     out.payloadLen = bytesLen(payload)
@@ -397,43 +398,44 @@ fn v3ChainNodeLibp2pEncodeSnapshot(snapshot: chain_node.V3ChainNodeServeSnapshot
 fn v3ChainNodeLibp2pPayloadIsSnapshot(payload: Bytes): bool =
     return v3ChainNodeLibp2pPayloadHasSnapshotMagic(payload)
 
-fn v3ChainNodeLibp2pDecodeSnapshot(payload: Bytes): Result[chain_node.V3ChainNodeServeSnapshot] =
+fn v3ChainNodeLibp2pDecodeSnapshotFill(payload: Bytes,
+                                       out: var chain_node.V3ChainNodeServeSnapshot): Result[bool] =
     if bytesLen(payload) < v3ChainNodeLibp2pSnapshotWireMinLen:
-        return Err[chain_node.V3ChainNodeServeSnapshot]("v3 chain_node libp2p: short snapshot payload")
+        return Err[bool]("v3 chain_node libp2p: short snapshot payload")
     if !v3ChainNodeLibp2pPayloadHasSnapshotMagic(payload):
-        return Err[chain_node.V3ChainNodeServeSnapshot]("v3 chain_node libp2p: bad snapshot magic")
+        return Err[bool]("v3 chain_node libp2p: bad snapshot magic")
     let span = layout.byteSpanFromBytes(payload)
     var offset = v3ChainNodeLibp2pSnapshotMagicLen
     let versionRes = codec.v3ReadU32BE(span, offset)
     if IsErr(versionRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(versionRes))
+        return Err[bool](Error(versionRes))
     offset = offset + 4
     if int32(Value(versionRes)) != v3ChainNodeLibp2pSnapshotVersion:
-        return Err[chain_node.V3ChainNodeServeSnapshot]("v3 chain_node libp2p: bad snapshot version")
+        return Err[bool]("v3 chain_node libp2p: bad snapshot version")
     let addressRes = codec.v3ReadAddress(span, offset)
     if IsErr(addressRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(addressRes))
+        return Err[bool](Error(addressRes))
     offset = offset + 36
     let serveCountRes = codec.v3ReadU32BE(span, offset)
     if IsErr(serveCountRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(serveCountRes))
+        return Err[bool](Error(serveCountRes))
     offset = offset + 4
     let tipEventCidRes = codec.v3ReadFixed32(span, offset)
     if IsErr(tipEventCidRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(tipEventCidRes))
+        return Err[bool](Error(tipEventCidRes))
     offset = offset + 32
     var signature: lt.V3AntiEntropySignature
     let signatureNextOffsetRes = v3ChainNodeLibp2pDecodeSignature(span, offset, signature)
     if IsErr(signatureNextOffsetRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(signatureNextOffsetRes))
+        return Err[bool](Error(signatureNextOffsetRes))
     offset = int32(Value(signatureNextOffsetRes))
     let eventCountRes = codec.v3ReadU32BE(span, offset)
     if IsErr(eventCountRes):
-        return Err[chain_node.V3ChainNodeServeSnapshot](Error(eventCountRes))
+        return Err[bool](Error(eventCountRes))
     offset = offset + 4
     let eventCount = int32(Value(eventCountRes))
     if eventCount < 0:
-        return Err[chain_node.V3ChainNodeServeSnapshot]("v3 chain_node libp2p: invalid event count")
+        return Err[bool]("v3 chain_node libp2p: invalid event count")
     var eventCids: layout.FixedBytes32[]
     var events: consensus.V3ChainEvent[]
     eventCids = []
@@ -443,13 +445,12 @@ fn v3ChainNodeLibp2pDecodeSnapshot(payload: Bytes): Result[chain_node.V3ChainNod
         var event: consensus.V3ChainEvent
         let eventNextOffsetRes = v3ChainNodeLibp2pDecodeEvent(span, offset, eventCid, event)
         if IsErr(eventNextOffsetRes):
-            return Err[chain_node.V3ChainNodeServeSnapshot](Error(eventNextOffsetRes))
+            return Err[bool](Error(eventNextOffsetRes))
         offset = int32(Value(eventNextOffsetRes))
         add(eventCids, eventCid)
         add(events, event)
     var forest: lt.V3StateLayerForest
     forest.forestCid = signature.stateForestCid
-    var out: chain_node.V3ChainNodeServeSnapshot
     out.nodeId = ""
     out.address = Value(addressRes)
     out.serveCount = int32(Value(serveCountRes))
@@ -458,6 +459,13 @@ fn v3ChainNodeLibp2pDecodeSnapshot(payload: Bytes): Result[chain_node.V3ChainNod
     out.events = events
     out.forest = forest
     out.signature = signature
+    return Ok[bool](true)
+
+fn v3ChainNodeLibp2pDecodeSnapshot(payload: Bytes): Result[chain_node.V3ChainNodeServeSnapshot] =
+    var out: chain_node.V3ChainNodeServeSnapshot
+    let fillRes = v3ChainNodeLibp2pDecodeSnapshotFill(payload, out)
+    if IsErr(fillRes):
+        return Err[chain_node.V3ChainNodeServeSnapshot](Error(fillRes))
     return Ok[chain_node.V3ChainNodeServeSnapshot](out)
 
 fn v3ChainNodeLibp2pSnapshotIngress(hostState: host.V3Libp2pHost,
@@ -552,18 +560,44 @@ fn v3ChainNodeLibp2pLatestSnapshot(remoteHost: host.V3Libp2pHost,
     let entries = host.v3Libp2pStoreQuery(remoteHost, query)
     return v3ChainNodeLibp2pLatestSnapshotFromIngresses(entries, address)
 
+fn v3ChainNodeLibp2pDecodeLatestSnapshotFill(entries: overlay.V3IngressEnvelope[],
+                                             address: binary.V3LsmrAddress,
+                                             out: var chain_node.V3ChainNodeServeSnapshot): Result[bool] =
+    var bestIndex = -1
+    for i in 0..<entries.len:
+        let ingress = entries[i]
+        if ingress.topicScope != overlay.v3OverlayScopeCell:
+            continue
+        if !binary.v3LsmrAddressEqual(ingress.address, address):
+            continue
+        if !v3ChainNodeLibp2pPayloadIsSnapshot(ingress.payload):
+            continue
+        if bestIndex < 0:
+            bestIndex = i
+            continue
+        if v3ChainNodeLibp2pStampLess(entries[bestIndex].stampEpoch,
+                                      entries[bestIndex].stampGanzhi,
+                                      ingress.stampEpoch,
+                                      ingress.stampGanzhi):
+            bestIndex = i
+    if bestIndex < 0:
+        return Err[bool]("v3 chain_node libp2p: snapshot missing")
+    return v3ChainNodeLibp2pDecodeSnapshotFill(entries[bestIndex].payload, out)
+
 fn v3ChainNodeLibp2pSyncOnce(nodeState: var chain_node.V3ChainNode,
                              hostState: var host.V3Libp2pHost,
                              remoteHost: var host.V3Libp2pHost,
                              remotePeerId: core.V3Libp2pPeerId): Result[bool] =
     let query = v3ChainNodeLibp2pSnapshotQuery(nodeState.address)
-    let entriesRes = host.v3Libp2pSyncRequest(hostState, remoteHost, remotePeerId, query)
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = host.v3Libp2pSyncRequest(hostState, remoteHost, remotePeerId, query, entries)
     if IsErr(entriesRes):
         return Err[bool](Error(entriesRes))
-    let ingressRes = v3ChainNodeLibp2pLatestSnapshotFromIngresses(Value(entriesRes), nodeState.address)
-    if IsErr(ingressRes):
-        return Err[bool](Error(ingressRes))
-    let snapshotRes = v3ChainNodeLibp2pDecodeSnapshot(Value(ingressRes).payload)
+    var snapshot: chain_node.V3ChainNodeServeSnapshot
+    let snapshotRes = v3ChainNodeLibp2pDecodeLatestSnapshotFill(entries, nodeState.address, snapshot)
     if IsErr(snapshotRes):
         return Err[bool](Error(snapshotRes))
-    return chain_node.v3ChainNodeSyncOnce(nodeState, Value(snapshotRes))
+    let syncRes = chain_node.v3ChainNodeSyncOnce(nodeState, snapshot)
+    if IsErr(syncRes):
+        return Err[bool](Error(syncRes))
+    return Ok[bool](Value(syncRes))

@@ -1,0 +1,530 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+import cheng/v3/chain/codec_binary as codec
+import cheng/v3/chain/lsmr_types as lt
+
+const
+    v3DagBlobCodecRaw: int32 = 1
+    v3DagPublishAdvertMagic: str = "v3.dag.publish_advert"
+
+type
+    V3DagBlobSummary =
+        version: int32
+        blobCodec: int32
+        blobCid: layout.FixedBytes32
+        payloadLen: int32
+        chunkSize: int32
+        chunkCount: int32
+        summaryCid: layout.FixedBytes32
+
+    V3DagAvailabilityProof =
+        version: int32
+        blobSummaryCid: layout.FixedBytes32
+        providerPeerId: layout.FixedBytes32
+        availableBytes: int32
+        retainedUntilEpoch: int32
+        proofCid: layout.FixedBytes32
+
+    V3DagAvailabilityCert =
+        version: int32
+        blobSummaryCid: layout.FixedBytes32
+        proofCount: int32
+        providerPeerIds: layout.FixedBytes32[]
+        proofCids: layout.FixedBytes32[]
+        retainedUntilEpochs: int32[]
+        minRetainedUntilEpoch: int32
+        certCid: layout.FixedBytes32
+
+    V3DagPublishAdvert =
+        version: int32
+        topicCid: layout.FixedBytes32
+        publisherPeerId: layout.FixedBytes32
+        blobSummaryCid: layout.FixedBytes32
+        availabilityCertCid: layout.FixedBytes32
+        stampEpoch: int32
+        stampGanzhi: int32
+        advertCid: layout.FixedBytes32
+
+fn v3DagBlobSummaryZero(): V3DagBlobSummary =
+    return V3DagBlobSummary(
+        version: 1,
+        blobCodec: 0,
+        blobCid: layout.fixedBytes32Zero(),
+        payloadLen: 0,
+        chunkSize: 0,
+        chunkCount: 0,
+        summaryCid: layout.fixedBytes32Zero()
+    )
+
+fn v3DagAvailabilityProofZero(): V3DagAvailabilityProof =
+    return V3DagAvailabilityProof(
+        version: 1,
+        blobSummaryCid: layout.fixedBytes32Zero(),
+        providerPeerId: layout.fixedBytes32Zero(),
+        availableBytes: 0,
+        retainedUntilEpoch: 0,
+        proofCid: layout.fixedBytes32Zero()
+    )
+
+fn v3DagAvailabilityCertZero(): V3DagAvailabilityCert =
+    return V3DagAvailabilityCert(
+        version: 1,
+        blobSummaryCid: layout.fixedBytes32Zero(),
+        proofCount: 0,
+        providerPeerIds: [],
+        proofCids: [],
+        retainedUntilEpochs: [],
+        minRetainedUntilEpoch: 0,
+        certCid: layout.fixedBytes32Zero()
+    )
+
+fn v3DagPublishAdvertZero(): V3DagPublishAdvert =
+    return V3DagPublishAdvert(
+        version: 1,
+        topicCid: layout.fixedBytes32Zero(),
+        publisherPeerId: layout.fixedBytes32Zero(),
+        blobSummaryCid: layout.fixedBytes32Zero(),
+        availabilityCertCid: layout.fixedBytes32Zero(),
+        stampEpoch: 0,
+        stampGanzhi: 0,
+        advertCid: layout.fixedBytes32Zero()
+    )
+
+fn v3DagCidSet(value: layout.FixedBytes32): bool =
+    return !layout.fixedBytes32Equal(value, layout.fixedBytes32Zero())
+
+fn v3DagBlobChunkCount(payloadLen: int32, chunkSize: int32): Result[int32] =
+    if payloadLen <= 0:
+        return Err[int32]("v3 dag mempool: invalid payload length")
+    if chunkSize <= 0:
+        return Err[int32]("v3 dag mempool: invalid chunk size")
+    return Ok[int32]((payloadLen + chunkSize - 1) / chunkSize)
+
+fn v3DagBlobCidFromBytes(blob: Bytes): layout.FixedBytes32 =
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(blob))
+
+fn v3DagBlobSummaryCid(blobCodec: int32,
+                       blobCid: layout.FixedBytes32,
+                       payloadLen: int32,
+                       chunkSize: int32,
+                       chunkCount: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.dag_mempool.blob_summary"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendU32BE(buf, blobCodec)
+    lt.v3AppendFixed32(buf, blobCid)
+    lt.v3AppendU32BE(buf, payloadLen)
+    lt.v3AppendU32BE(buf, chunkSize)
+    lt.v3AppendU32BE(buf, chunkCount)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3DagBlobSummaryMake(blobCid: layout.FixedBytes32,
+                        payloadLen: int32,
+                        chunkSize: int32): Result[V3DagBlobSummary] =
+    if !v3DagCidSet(blobCid):
+        return Err[V3DagBlobSummary]("v3 dag mempool: missing blob cid")
+    let chunkCountRes = v3DagBlobChunkCount(payloadLen, chunkSize)
+    if IsErr(chunkCountRes):
+        return Err[V3DagBlobSummary](Error(chunkCountRes))
+    var out: V3DagBlobSummary = v3DagBlobSummaryZero()
+    out.blobCodec = v3DagBlobCodecRaw
+    out.blobCid = blobCid
+    out.payloadLen = payloadLen
+    out.chunkSize = chunkSize
+    out.chunkCount = Value(chunkCountRes)
+    out.summaryCid = v3DagBlobSummaryCid(out.blobCodec,
+                                         out.blobCid,
+                                         out.payloadLen,
+                                         out.chunkSize,
+                                         out.chunkCount)
+    return Ok[V3DagBlobSummary](out)
+
+fn v3DagBlobSummaryFromBytes(blob: Bytes, chunkSize: int32): Result[V3DagBlobSummary] =
+    let blobCid = v3DagBlobCidFromBytes(blob)
+    return v3DagBlobSummaryMake(blobCid, bytesLen(blob), chunkSize)
+
+fn v3DagBlobSummaryValidate(summary: V3DagBlobSummary): Result[bool] =
+    if summary.version != 1:
+        return Err[bool]("v3 dag mempool: unsupported blob summary version")
+    if summary.blobCodec != v3DagBlobCodecRaw:
+        return Err[bool]("v3 dag mempool: unsupported blob codec")
+    if !v3DagCidSet(summary.blobCid):
+        return Err[bool]("v3 dag mempool: missing blob cid")
+    let chunkCountRes = v3DagBlobChunkCount(summary.payloadLen, summary.chunkSize)
+    if IsErr(chunkCountRes):
+        return Err[bool](Error(chunkCountRes))
+    if summary.chunkCount != Value(chunkCountRes):
+        return Err[bool]("v3 dag mempool: invalid chunk count")
+    let expectedCid = v3DagBlobSummaryCid(summary.blobCodec,
+                                          summary.blobCid,
+                                          summary.payloadLen,
+                                          summary.chunkSize,
+                                          summary.chunkCount)
+    if !layout.fixedBytes32Equal(summary.summaryCid, expectedCid):
+        return Err[bool]("v3 dag mempool: blob summary cid mismatch")
+    return Ok[bool](true)
+
+fn v3DagAvailabilityProofCid(blobSummaryCid: layout.FixedBytes32,
+                             providerPeerId: layout.FixedBytes32,
+                             availableBytes: int32,
+                             retainedUntilEpoch: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.dag_mempool.availability_proof"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, blobSummaryCid)
+    lt.v3AppendFixed32(buf, providerPeerId)
+    lt.v3AppendU32BE(buf, availableBytes)
+    lt.v3AppendU32BE(buf, retainedUntilEpoch)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3DagAvailabilityProofMake(summary: V3DagBlobSummary,
+                              providerPeerId: layout.FixedBytes32,
+                              retainedUntilEpoch: int32): Result[V3DagAvailabilityProof] =
+    let summaryOk = v3DagBlobSummaryValidate(summary)
+    if IsErr(summaryOk):
+        return Err[V3DagAvailabilityProof](Error(summaryOk))
+    if !v3DagCidSet(providerPeerId):
+        return Err[V3DagAvailabilityProof]("v3 dag mempool: missing provider peer id")
+    if retainedUntilEpoch <= 0:
+        return Err[V3DagAvailabilityProof]("v3 dag mempool: invalid retained epoch")
+    var out: V3DagAvailabilityProof = v3DagAvailabilityProofZero()
+    out.blobSummaryCid = summary.summaryCid
+    out.providerPeerId = providerPeerId
+    out.availableBytes = summary.payloadLen
+    out.retainedUntilEpoch = retainedUntilEpoch
+    out.proofCid = v3DagAvailabilityProofCid(out.blobSummaryCid,
+                                             out.providerPeerId,
+                                             out.availableBytes,
+                                             out.retainedUntilEpoch)
+    return Ok[V3DagAvailabilityProof](out)
+
+fn v3DagAvailabilityProofValidate(proof: V3DagAvailabilityProof,
+                                  summary: V3DagBlobSummary): Result[bool] =
+    let summaryOk = v3DagBlobSummaryValidate(summary)
+    if IsErr(summaryOk):
+        return Err[bool](Error(summaryOk))
+    if proof.version != 1:
+        return Err[bool]("v3 dag mempool: unsupported availability proof version")
+    if !layout.fixedBytes32Equal(proof.blobSummaryCid, summary.summaryCid):
+        return Err[bool]("v3 dag mempool: availability proof summary mismatch")
+    if !v3DagCidSet(proof.providerPeerId):
+        return Err[bool]("v3 dag mempool: missing provider peer id")
+    if proof.availableBytes != summary.payloadLen:
+        return Err[bool]("v3 dag mempool: availability proof byte count mismatch")
+    if proof.retainedUntilEpoch <= 0:
+        return Err[bool]("v3 dag mempool: invalid retained epoch")
+    let expectedCid = v3DagAvailabilityProofCid(proof.blobSummaryCid,
+                                                proof.providerPeerId,
+                                                proof.availableBytes,
+                                                proof.retainedUntilEpoch)
+    if !layout.fixedBytes32Equal(proof.proofCid, expectedCid):
+        return Err[bool]("v3 dag mempool: availability proof cid mismatch")
+    return Ok[bool](true)
+
+fn v3DagAvailabilityProofLess(left: V3DagAvailabilityProof,
+                              right: V3DagAvailabilityProof): bool =
+    if !layout.fixedBytes32Equal(left.providerPeerId, right.providerPeerId):
+        return lt.v3FixedBytes32Less(left.providerPeerId, right.providerPeerId)
+    return lt.v3FixedBytes32Less(left.proofCid, right.proofCid)
+
+fn v3DagSortAvailabilityProofs(proofs: var V3DagAvailabilityProof[]) =
+    for i in 1..<proofs.len:
+        let proof = proofs[i]
+        var j = i - 1
+        while j >= 0:
+            if !v3DagAvailabilityProofLess(proof, proofs[j]):
+                break
+            proofs[j + 1] = proofs[j]
+            j = j - 1
+        proofs[j + 1] = proof
+
+fn v3DagAvailabilityCertCid(blobSummaryCid: layout.FixedBytes32,
+                            proofCount: int32,
+                            providerPeerIds: layout.FixedBytes32[],
+                            proofCids: layout.FixedBytes32[],
+                            retainedUntilEpochs: int32[],
+                            minRetainedUntilEpoch: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.dag_mempool.availability_cert"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, blobSummaryCid)
+    lt.v3AppendU32BE(buf, proofCount)
+    for i in 0..<proofCount:
+        lt.v3AppendFixed32(buf, providerPeerIds[i])
+        lt.v3AppendFixed32(buf, proofCids[i])
+        lt.v3AppendU32BE(buf, retainedUntilEpochs[i])
+    lt.v3AppendU32BE(buf, minRetainedUntilEpoch)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3DagAvailabilityCertValidateShape(cert: V3DagAvailabilityCert): Result[bool] =
+    if cert.version != 1:
+        return Err[bool]("v3 dag mempool: unsupported availability cert version")
+    if !v3DagCidSet(cert.blobSummaryCid):
+        return Err[bool]("v3 dag mempool: missing availability cert summary cid")
+    if cert.proofCount <= 0:
+        return Err[bool]("v3 dag mempool: empty availability cert")
+    if cert.proofCount != cert.providerPeerIds.len:
+        return Err[bool]("v3 dag mempool: availability cert provider count mismatch")
+    if cert.proofCount != cert.proofCids.len:
+        return Err[bool]("v3 dag mempool: availability cert proof cid count mismatch")
+    if cert.proofCount != cert.retainedUntilEpochs.len:
+        return Err[bool]("v3 dag mempool: availability cert retained count mismatch")
+    var minRetained = cert.retainedUntilEpochs[0]
+    for i in 0..<cert.proofCount:
+        if !v3DagCidSet(cert.providerPeerIds[i]):
+            return Err[bool]("v3 dag mempool: missing provider in availability cert")
+        if !v3DagCidSet(cert.proofCids[i]):
+            return Err[bool]("v3 dag mempool: missing proof cid in availability cert")
+        if cert.retainedUntilEpochs[i] <= 0:
+            return Err[bool]("v3 dag mempool: invalid retained epoch in availability cert")
+        if cert.retainedUntilEpochs[i] < minRetained:
+            minRetained = cert.retainedUntilEpochs[i]
+        if i > 0:
+            if !lt.v3FixedBytes32Less(cert.providerPeerIds[i - 1], cert.providerPeerIds[i]):
+                return Err[bool]("v3 dag mempool: availability cert provider ordering mismatch")
+    if cert.minRetainedUntilEpoch != minRetained:
+        return Err[bool]("v3 dag mempool: availability cert min retained mismatch")
+    let expectedCid = v3DagAvailabilityCertCid(cert.blobSummaryCid,
+                                               cert.proofCount,
+                                               cert.providerPeerIds,
+                                               cert.proofCids,
+                                               cert.retainedUntilEpochs,
+                                               cert.minRetainedUntilEpoch)
+    if !layout.fixedBytes32Equal(cert.certCid, expectedCid):
+        return Err[bool]("v3 dag mempool: availability cert cid mismatch")
+    return Ok[bool](true)
+
+fn v3DagAvailabilityCertMake(summary: V3DagBlobSummary,
+                             proofsRaw: V3DagAvailabilityProof[]): Result[V3DagAvailabilityCert] =
+    let summaryOk = v3DagBlobSummaryValidate(summary)
+    if IsErr(summaryOk):
+        return Err[V3DagAvailabilityCert](Error(summaryOk))
+    if proofsRaw.len <= 0:
+        return Err[V3DagAvailabilityCert]("v3 dag mempool: empty availability cert")
+    var proofs: V3DagAvailabilityProof[]
+    proofs = proofsRaw
+    v3DagSortAvailabilityProofs(proofs)
+    var out: V3DagAvailabilityCert = v3DagAvailabilityCertZero()
+    out.blobSummaryCid = summary.summaryCid
+    out.minRetainedUntilEpoch = proofs[0].retainedUntilEpoch
+    var providerPeerIds: layout.FixedBytes32[]
+    providerPeerIds = []
+    var proofCids: layout.FixedBytes32[]
+    proofCids = []
+    var retainedUntilEpochs: int32[]
+    retainedUntilEpochs = []
+    for i in 0..<proofs.len:
+        let proofOk = v3DagAvailabilityProofValidate(proofs[i], summary)
+        if IsErr(proofOk):
+            return Err[V3DagAvailabilityCert](Error(proofOk))
+        if i > 0:
+            if layout.fixedBytes32Equal(proofs[i - 1].providerPeerId, proofs[i].providerPeerId):
+                return Err[V3DagAvailabilityCert]("v3 dag mempool: duplicate provider in availability cert")
+        add(providerPeerIds, proofs[i].providerPeerId)
+        add(proofCids, proofs[i].proofCid)
+        add(retainedUntilEpochs, proofs[i].retainedUntilEpoch)
+        if proofs[i].retainedUntilEpoch < out.minRetainedUntilEpoch:
+            out.minRetainedUntilEpoch = proofs[i].retainedUntilEpoch
+    out.proofCount = proofs.len
+    out.providerPeerIds = providerPeerIds
+    out.proofCids = proofCids
+    out.retainedUntilEpochs = retainedUntilEpochs
+    out.certCid = v3DagAvailabilityCertCid(out.blobSummaryCid,
+                                           out.proofCount,
+                                           out.providerPeerIds,
+                                           out.proofCids,
+                                           out.retainedUntilEpochs,
+                                           out.minRetainedUntilEpoch)
+    return Ok[V3DagAvailabilityCert](out)
+
+fn v3DagAvailabilityCertValidate(cert: V3DagAvailabilityCert,
+                                 summary: V3DagBlobSummary,
+                                 proofsRaw: V3DagAvailabilityProof[]): Result[bool] =
+    let certShapeOk = v3DagAvailabilityCertValidateShape(cert)
+    if IsErr(certShapeOk):
+        return Err[bool](Error(certShapeOk))
+    let rebuiltRes = v3DagAvailabilityCertMake(summary, proofsRaw)
+    if IsErr(rebuiltRes):
+        return Err[bool](Error(rebuiltRes))
+    let rebuilt = Value(rebuiltRes)
+    if cert.proofCount != rebuilt.proofCount:
+        return Err[bool]("v3 dag mempool: availability cert proof count mismatch")
+    if cert.minRetainedUntilEpoch != rebuilt.minRetainedUntilEpoch:
+        return Err[bool]("v3 dag mempool: availability cert min retained mismatch")
+    if !layout.fixedBytes32Equal(cert.blobSummaryCid, rebuilt.blobSummaryCid):
+        return Err[bool]("v3 dag mempool: availability cert summary mismatch")
+    if !layout.fixedBytes32Equal(cert.certCid, rebuilt.certCid):
+        return Err[bool]("v3 dag mempool: availability cert cid mismatch")
+    for i in 0..<rebuilt.proofCount:
+        if !layout.fixedBytes32Equal(cert.providerPeerIds[i], rebuilt.providerPeerIds[i]):
+            return Err[bool]("v3 dag mempool: availability cert provider ordering mismatch")
+        if !layout.fixedBytes32Equal(cert.proofCids[i], rebuilt.proofCids[i]):
+            return Err[bool]("v3 dag mempool: availability cert proof cid mismatch")
+        if cert.retainedUntilEpochs[i] != rebuilt.retainedUntilEpochs[i]:
+            return Err[bool]("v3 dag mempool: availability cert retained epoch mismatch")
+    return Ok[bool](true)
+
+fn v3DagPublishAdvertCid(topicCid: layout.FixedBytes32,
+                         publisherPeerId: layout.FixedBytes32,
+                         blobSummaryCid: layout.FixedBytes32,
+                         availabilityCertCid: layout.FixedBytes32,
+                         stampEpoch: int32,
+                         stampGanzhi: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.dag_mempool.publish_advert"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, topicCid)
+    lt.v3AppendFixed32(buf, publisherPeerId)
+    lt.v3AppendFixed32(buf, blobSummaryCid)
+    lt.v3AppendFixed32(buf, availabilityCertCid)
+    lt.v3AppendU32BE(buf, stampEpoch)
+    lt.v3AppendU32BE(buf, stampGanzhi)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3DagPublishAdvertMake(topicCid: layout.FixedBytes32,
+                          publisherPeerId: layout.FixedBytes32,
+                          summary: V3DagBlobSummary,
+                          cert: V3DagAvailabilityCert,
+                          stampEpoch: int32,
+                          stampGanzhi: int32): Result[V3DagPublishAdvert] =
+    let summaryOk = v3DagBlobSummaryValidate(summary)
+    if IsErr(summaryOk):
+        return Err[V3DagPublishAdvert](Error(summaryOk))
+    let certShapeOk = v3DagAvailabilityCertValidateShape(cert)
+    if IsErr(certShapeOk):
+        return Err[V3DagPublishAdvert](Error(certShapeOk))
+    if !v3DagCidSet(topicCid):
+        return Err[V3DagPublishAdvert]("v3 dag mempool: missing topic cid")
+    if !v3DagCidSet(publisherPeerId):
+        return Err[V3DagPublishAdvert]("v3 dag mempool: missing publisher peer id")
+    if !layout.fixedBytes32Equal(cert.blobSummaryCid, summary.summaryCid):
+        return Err[V3DagPublishAdvert]("v3 dag mempool: advert summary/cert mismatch")
+    if !v3DagCidSet(cert.certCid):
+        return Err[V3DagPublishAdvert]("v3 dag mempool: missing availability cert cid")
+    if stampEpoch < 0:
+        return Err[V3DagPublishAdvert]("v3 dag mempool: invalid advert epoch")
+    if stampGanzhi < 0:
+        return Err[V3DagPublishAdvert]("v3 dag mempool: invalid advert ganzhi")
+    var out: V3DagPublishAdvert = v3DagPublishAdvertZero()
+    out.topicCid = topicCid
+    out.publisherPeerId = publisherPeerId
+    out.blobSummaryCid = summary.summaryCid
+    out.availabilityCertCid = cert.certCid
+    out.stampEpoch = stampEpoch
+    out.stampGanzhi = stampGanzhi
+    out.advertCid = v3DagPublishAdvertCid(out.topicCid,
+                                          out.publisherPeerId,
+                                          out.blobSummaryCid,
+                                          out.availabilityCertCid,
+                                          out.stampEpoch,
+                                          out.stampGanzhi)
+    return Ok[V3DagPublishAdvert](out)
+
+fn v3DagPublishAdvertValidate(advert: V3DagPublishAdvert,
+                              summary: V3DagBlobSummary,
+                              cert: V3DagAvailabilityCert): Result[bool] =
+    let summaryOk = v3DagBlobSummaryValidate(summary)
+    if IsErr(summaryOk):
+        return Err[bool](Error(summaryOk))
+    let certShapeOk = v3DagAvailabilityCertValidateShape(cert)
+    if IsErr(certShapeOk):
+        return Err[bool](Error(certShapeOk))
+    if advert.version != 1:
+        return Err[bool]("v3 dag mempool: unsupported publish advert version")
+    if !v3DagCidSet(advert.topicCid):
+        return Err[bool]("v3 dag mempool: missing topic cid")
+    if !v3DagCidSet(advert.publisherPeerId):
+        return Err[bool]("v3 dag mempool: missing publisher peer id")
+    if !layout.fixedBytes32Equal(advert.blobSummaryCid, summary.summaryCid):
+        return Err[bool]("v3 dag mempool: advert summary mismatch")
+    if !layout.fixedBytes32Equal(advert.availabilityCertCid, cert.certCid):
+        return Err[bool]("v3 dag mempool: advert cert mismatch")
+    if advert.stampEpoch < 0:
+        return Err[bool]("v3 dag mempool: invalid advert epoch")
+    if advert.stampGanzhi < 0:
+        return Err[bool]("v3 dag mempool: invalid advert ganzhi")
+    let expectedCid = v3DagPublishAdvertCid(advert.topicCid,
+                                            advert.publisherPeerId,
+                                            advert.blobSummaryCid,
+                                            advert.availabilityCertCid,
+                                            advert.stampEpoch,
+                                            advert.stampGanzhi)
+    if !layout.fixedBytes32Equal(advert.advertCid, expectedCid):
+        return Err[bool]("v3 dag mempool: advert cid mismatch")
+    return Ok[bool](true)
+
+fn v3DagPayloadHasMagic(payload: Bytes, magic: str): bool =
+    let magicBytes = bytesFromString(magic)
+    if bytesLen(payload) < bytesLen(magicBytes):
+        return false
+    for i in 0..<bytesLen(magicBytes):
+        if bytesGet(payload, i) != bytesGet(magicBytes, i):
+            return false
+    return true
+
+fn v3DagPublishAdvertEncode(advert: V3DagPublishAdvert): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(160)
+    layout.byteBufAppendBytes(buf, bytesFromString(v3DagPublishAdvertMagic))
+    lt.v3AppendU32BE(buf, advert.version)
+    lt.v3AppendFixed32(buf, advert.topicCid)
+    lt.v3AppendFixed32(buf, advert.publisherPeerId)
+    lt.v3AppendFixed32(buf, advert.blobSummaryCid)
+    lt.v3AppendFixed32(buf, advert.availabilityCertCid)
+    lt.v3AppendU32BE(buf, advert.stampEpoch)
+    lt.v3AppendU32BE(buf, advert.stampGanzhi)
+    return layout.byteBufToBytes(buf)
+
+fn v3DagPublishAdvertDecode(payload: Bytes): Result[V3DagPublishAdvert] =
+    if !v3DagPayloadHasMagic(payload, v3DagPublishAdvertMagic):
+        return Err[V3DagPublishAdvert]("v3 dag mempool: invalid publish advert magic")
+    let magicLen = bytesLen(bytesFromString(v3DagPublishAdvertMagic))
+    let span = layout.byteSpanFromBytes(payload)
+    let versionRes = codec.v3ReadU32BE(span, magicLen)
+    if IsErr(versionRes):
+        return Err[V3DagPublishAdvert](Error(versionRes))
+    let topicCidRes = codec.v3ReadFixed32(span, magicLen + 4)
+    if IsErr(topicCidRes):
+        return Err[V3DagPublishAdvert](Error(topicCidRes))
+    let publisherPeerRes = codec.v3ReadFixed32(span, magicLen + 36)
+    if IsErr(publisherPeerRes):
+        return Err[V3DagPublishAdvert](Error(publisherPeerRes))
+    let summaryCidRes = codec.v3ReadFixed32(span, magicLen + 68)
+    if IsErr(summaryCidRes):
+        return Err[V3DagPublishAdvert](Error(summaryCidRes))
+    let certCidRes = codec.v3ReadFixed32(span, magicLen + 100)
+    if IsErr(certCidRes):
+        return Err[V3DagPublishAdvert](Error(certCidRes))
+    let stampEpochRes = codec.v3ReadU32BE(span, magicLen + 132)
+    if IsErr(stampEpochRes):
+        return Err[V3DagPublishAdvert](Error(stampEpochRes))
+    let stampGanzhiRes = codec.v3ReadU32BE(span, magicLen + 136)
+    if IsErr(stampGanzhiRes):
+        return Err[V3DagPublishAdvert](Error(stampGanzhiRes))
+    var out: V3DagPublishAdvert = v3DagPublishAdvertZero()
+    out.version = int32(Value(versionRes))
+    out.topicCid = Value(topicCidRes)
+    out.publisherPeerId = Value(publisherPeerRes)
+    out.blobSummaryCid = Value(summaryCidRes)
+    out.availabilityCertCid = Value(certCidRes)
+    out.stampEpoch = int32(Value(stampEpochRes))
+    out.stampGanzhi = int32(Value(stampGanzhiRes))
+    out.advertCid = v3DagPublishAdvertCid(out.topicCid,
+                                          out.publisherPeerId,
+                                          out.blobSummaryCid,
+                                          out.availabilityCertCid,
+                                          out.stampEpoch,
+                                          out.stampGanzhi)
+    if out.version != 1:
+        return Err[V3DagPublishAdvert]("v3 dag mempool: unsupported publish advert version")
+    return Ok[V3DagPublishAdvert](out)
+
+fn v3DagPublishAdvertValidatePayload(payload: Bytes,
+                                     expectedCid: layout.FixedBytes32): Result[bool] =
+    let advertRes = v3DagPublishAdvertDecode(payload)
+    if IsErr(advertRes):
+        return Err[bool](Error(advertRes))
+    if !layout.fixedBytes32Equal(Value(advertRes).advertCid, expectedCid):
+        return Err[bool]("v3 dag mempool: publish advert payload cid mismatch")
+    return Ok[bool](true)

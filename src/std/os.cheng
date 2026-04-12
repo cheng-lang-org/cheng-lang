@@ -52,13 +52,9 @@ const osOpenCreate: int32 = 0x0200
 const osOpenTrunc: int32 = 0x0400
 const osFileMode0644: int32 = 420
 importc fn cheng_fopen(filename, mode: cstring): File
-importc fn libc_fopen(filename, mode: cstring): File
-fn c_fopen(filename: cstring, mode: str): File =
-    let modeRaw: cstring = strToCStringTemp(mode)
-    let f: File = cheng_fopen(filename, modeRaw)
-    if f != nil:
-        return f
-    return libc_fopen(filename, modeRaw)
+fn c_fopen(filename, mode: cstring): File =
+    let f: File = cheng_fopen(filename, mode)
+    return f
 importc fn cheng_fclose(f: File): int32
 fn c_fclose(f: File): int32 =
     return cheng_fclose(f)
@@ -77,9 +73,8 @@ fn c_fgetc(stream: File): int32 =
 importc fn get_stdin(): File
 importc fn get_stdout(): File
 importc fn get_stderr(): File
-fn c_iometer_call(hook: IoMeterHook, op: IoMeterOp, bytes: int64) =
-    if hook != nil:
-        hook(op, bytes)
+@importc("c_iometer_call")
+fn c_iometer_call(hook: IoMeterHook, op: IoMeterOp, bytes: int64)
 @importc("cheng_file_exists")
 fn cheng_file_exists(path: cstring): int32
 @importc("cheng_dir_exists")
@@ -153,11 +148,15 @@ importc fn libc_bind(fd: int32, addr: ptr, addrLen: int32): int32
 importc fn libc_sendto(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: int32): int32
 importc fn libc_recvfrom(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: var int32): int32
 importc fn cheng_recvfrom_fd_ex(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrLen: ptr, outErr: var int32): int32
+importc fn cheng_v3_udp_recvfrom_addr_bridge(fd: int32, payload: ptr, payloadLen: int32, flags: int32, addr: ptr, addrCap: int32, outAddrLen: var int32, outErr: var int32): int32
 importc fn libc_setsockopt(fd: int32, level: int32, optName: int32, optValue: ptr, optLen: int32): int32
 importc fn libc_inet_pton(family: int32, src: cstring, dst: ptr): int32
 importc fn libc_inet_ntop(family: int32, src: ptr, dst: cstring, size: int32): cstring
 importc fn libc_getsockname(fd: int32, addr: ptr, addrLen: var int32): int32
 importc fn cheng_v3_udp_bind_host_port_bridge(host: str, port: int32, isV6: int32, outFd: var int32, outPort: var int32, outFamily: var int32, outUseLenField: var int32): int32
+importc fn cheng_v3_udp_bind_fd_bridge(host: str, port: int32, isV6: int32): int32
+importc fn cheng_v3_udp_bound_port_bridge(fd: int32, isV6: int32): int32
+importc fn cheng_v3_udp_platform_use_len_field_bridge(): int32
 fn udpErrno(): int32 =
     return cheng_errno()
 
@@ -225,10 +224,7 @@ fn udpRecvFromFdAddrEx(fd: int32, payload: Bytes, flags: int32, outAddr: Bytes, 
     outAddrLen = addrCap
     let payloadPtr: ptr = payload.data
     let addrPtr: ptr = outAddr.data
-    let recvRes: int32 = libc_recvfrom(fd, payloadPtr, payloadLen, flags, addrPtr, outAddrLen)
-    if recvRes < 0:
-        outErr = udpErrno()
-    return recvRes
+    return cheng_v3_udp_recvfrom_addr_bridge(fd, payloadPtr, payloadLen, flags, addrPtr, addrCap, outAddrLen, outErr)
 
 fn udpSetSockOptIntFd(fd: int32, level: int32, optName: int32, optBytes: Bytes): int32 =
     if fd < 0 || bytesLen(optBytes) <= 0:
@@ -245,20 +241,29 @@ fn udpGetSockNameFd(fd: int32, addr: Bytes, addrLen: var int32): int32 =
 fn udpBindHostPortBridge(host: str, port: int32, isV6: int32, outFd: var int32, outPort: var int32, outFamily: var int32, outUseLenField: var int32): int32 =
     return cheng_v3_udp_bind_host_port_bridge(host, port, isV6, outFd, outPort, outFamily, outUseLenField)
 
+fn udpBindFdBridge(host: str, port: int32, isV6: int32): int32 =
+    return cheng_v3_udp_bind_fd_bridge(host, port, isV6)
+
+fn udpBoundPortBridge(fd: int32, isV6: int32): int32 =
+    return cheng_v3_udp_bound_port_bridge(fd, isV6)
+
+fn udpPlatformUseLenFieldBridge(): int32 =
+    return cheng_v3_udp_platform_use_len_field_bridge()
+
 fn openImplRead(filename: str): File =
     let pathText: cstring = strToCStringTemp(filename)
-    let f: File = c_fopen(pathText, "rb")
-    return f
+    let modeText: cstring = strToCStringTemp("rb")
+    return c_fopen(pathText, modeText)
 
 fn openImplWrite(filename: str): File =
     let pathText: cstring = strToCStringTemp(filename)
-    let f: File = c_fopen(pathText, "wb")
-    return f
+    let modeText: cstring = strToCStringTemp("wb")
+    return c_fopen(pathText, modeText)
 
 fn openImplReadWrite(filename: str): File =
     let pathText: cstring = strToCStringTemp(filename)
-    let f: File = c_fopen(pathText, "rb+")
-    return f
+    let modeText: cstring = strToCStringTemp("rb+")
+    return c_fopen(pathText, modeText)
 
 fn setIoMeterHook(hook: IoMeterHook) =
     ioMeterHasHook = (hook != nil)
@@ -711,13 +716,13 @@ fn ptyClose(fd: int32) =
 fn ptyWait(pid: int64): tuple[int32, int32] =
     return cheng_pty_wait(pid)
 fn readFileSizedInto(path: str, size: int32, out: var str): bool =
-    let f: File = openRead(path)
+    var f: File = openRead(path)
     if f == nil:
         osSetEmpty(out)
         return true
     let raw: Bytes = bytesAlloc(size)
     if bytesLen(raw) != size:
-        c_fclose f
+        c_fclose(f)
         osSetEmpty(out)
         return true
     let size64: int64 = int64(size)
@@ -730,7 +735,7 @@ fn readFileSizedInto(path: str, size: int32, out: var str): bool =
             break
         totalGot64 = totalGot64 + int64(got)
         ioMeterReport(ioRead, int64(got))
-    c_fclose f
+    c_fclose(f)
     let totalGot: int32 = int32(totalGot64)
     if totalGot != size:
         osSetEmpty(out)

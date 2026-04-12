@@ -53,11 +53,9 @@ run_host_twoproc_smoke() {
 }
 
 tests="
-fixed256_sha256_smoke
 ref10_ashr_smoke
 fixed256_curve25519_smoke
 fixedbytes32_seq_index_smoke
-default_init_literals_smoke
 compiler_runtime_smoke
 rwad_serial_state_machine_smoke
 rwad_bft_state_machine_smoke
@@ -76,14 +74,33 @@ bft_finalize_summary_smoke
 bft_state_machine_smoke
 overlay_contracts_smoke
 pubsub_smoke
+dag_mempool_smoke
+plumtree_smoke
+erasure_swarm_smoke
+content_codec_smoke
+content_runtime_smoke
+native_initial_crypto_frame_smoke
+native_client_hello_wire_smoke
+quic_transport_loopback_smoke
+libp2p_quic_tls_smoke
+content_quic_smoke
+content_stub_smoke
+libp2p_protocols_smoke
 location_proof_smoke
 chain_codec_binary_smoke
 anti_entropy_smoke
+anti_entropy_signature_fields_smoke
 lsmr_types_smoke
 lsmr_locality_storage_smoke
 lsmr_bagua_prefix_tree_smoke
 udp_importc_smoke
 "
+
+run_tail_process_smoke=1
+if [ "$#" -gt 0 ]; then
+  tests="$*"
+  run_tail_process_smoke=0
+fi
 
 for name in $tests
 do
@@ -93,6 +110,8 @@ do
   fi
 done
 
-sh "$root/v3/tooling/run_v3_chain_node_process_smoke.sh" "$hostc" host
+if [ "$run_tail_process_smoke" = "1" ]; then
+  sh "$root/v3/tooling/run_v3_chain_node_process_smoke.sh" "$hostc" host
+fi
 
 echo "v3 host smokes: ok"

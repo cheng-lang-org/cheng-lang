@@ -5,6 +5,7 @@ import std/rawbytes
 import std/buffer
 import std/strings
 import std/stringlist
+import std/system
 import std/times
 import std/crypto/hkdf
 import std/crypto/sha256
@@ -52,11 +53,19 @@ const
     msQuicTls13MaxTranscriptBytes = 262144
     msQuicTls13MaxBufferedHandshakeBytes = 262144
     msQuicTls13MaxRevocationCrls = 8
+    msQuicTls13MaxTrustRoots = 4
+    msQuicTls13SideClient = 0
+    msQuicTls13SideServer = 1
 
 type
     MsQuicTls13HandshakeRole = enum
         TlsRoleClient = 0
         TlsRoleServer = 1
+
+    MsQuicTls13ExtensionsContext = enum
+        TlsExtensionsClientHello = 0
+        TlsExtensionsServerHello = 1
+        TlsExtensionsEncryptedExtensions = 2
 
     MsQuicTls13HandshakeMessage =
         kind: int32
@@ -67,14 +76,30 @@ type
         count: int32
         items: MsQuicTls13HandshakeMessage[msQuicTls13MaxMessages]
 
+    MsQuicTls13PeerVerifyState =
+        peerLeaf: X509Certificate
+        trustRootsCount: int32
+        trustRootDer: Bytes[msQuicTls13MaxTrustRoots]
+        peerCertVerified: bool
+        certVerifyOk: bool
+        finishedOk: bool
+        peerOcspResponse: Bytes
+        revocationMode: X509RevocationMode
+        revocationCrlCount: int32
+        revocationCrls: Bytes[msQuicTls13MaxRevocationCrls]
+
+    MsQuicTls13WireState =
+        buffer: ByteBuffer
+        transcript: ByteBuffer
+        messages: MsQuicTls13HandshakeMessages
+        clientHelloRaw: Bytes
+        lastError: str
+
     MsQuicTls13HandshakeState =
         role: MsQuicTls13HandshakeRole
         requireCert: bool
         serverName: str
         peerServerName: str
-        buffer: ByteBuffer
-        transcript: ByteBuffer
-        messages: MsQuicTls13HandshakeMessages
         cipherSuiteId: int32
         cipher: MsQuicCipherSuite
         selectedVersion: int32
@@ -107,20 +132,10 @@ type
         pskAccepted: bool
         psk: Bytes
         pskCipher: MsQuicCipherSuite
-        clientHelloRaw: Bytes
-        peerAlpnList: StringList
+        peerAlpnCount: int32
         negotiatedAlpn: str
-        peerLeaf: X509Certificate
-        peerChain: X509CertList
-        trustRoots: X509CertList
-        peerCertVerified: bool
-        certVerifyOk: bool
-        finishedOk: bool
-        peerOcspResponse: Bytes
-        revocationMode: X509RevocationMode
-        revocationCrlCount: int32
-        revocationCrls: Bytes[msQuicTls13MaxRevocationCrls]
-        lastError: str
+        peer: MsQuicTls13PeerVerifyState
+        wire: MsQuicTls13WireState
 
     TlsInt32Next =
         value: int32
@@ -134,13 +149,66 @@ type
         value: Bytes
         next: int32
 
+    TlsExtensionNext =
+        extType: int32
+        extLen: int32
+        extData: Bytes
+        next: int32
+
+    MsQuicTls13CertificateEntryNext =
+        certDer: Bytes
+        extData: Bytes
+        next: int32
+
+    TlsSignatureInput =
+        scheme: int32
+        sig: Bytes
+
     TlsOffsetLength =
         offset: int32
         length: int32
 
+var
+    msquicTls13ClientState: MsQuicTls13HandshakeState
+    msquicTls13ServerState: MsQuicTls13HandshakeState
+
+fn msquicTls13RoleFromSideCode(side: int32): MsQuicTls13HandshakeRole =
+    var out: MsQuicTls13HandshakeRole
+    if side == msQuicTls13SideServer:
+        return TlsRoleServer
+    return out
+
+fn initMsQuicTls13HandshakeMessagesInto(out: var MsQuicTls13HandshakeMessages) =
+    out.count = 0
+
 fn initMsQuicTls13HandshakeMessages(): MsQuicTls13HandshakeMessages =
     var out: MsQuicTls13HandshakeMessages
-    out.count = 0
+    initMsQuicTls13HandshakeMessagesInto(out)
+    return out
+
+fn initMsQuicTls13WireStateInto(out: var MsQuicTls13WireState) =
+    out.buffer = newByteBuffer()
+    out.transcript = newByteBuffer()
+    initMsQuicTls13HandshakeMessagesInto(out.messages)
+    out.clientHelloRaw = emptyBytes()
+    out.lastError = ""
+
+fn initMsQuicTls13WireState(): MsQuicTls13WireState =
+    var out: MsQuicTls13WireState
+    initMsQuicTls13WireStateInto(out)
+    return out
+
+fn initMsQuicTls13SecretsInto(out: var MsQuicTls13Secrets) =
+    out.clientHandshakeTrafficSecret = emptyBytes()
+    out.serverHandshakeTrafficSecret = emptyBytes()
+    out.clientTrafficSecret0 = emptyBytes()
+    out.serverTrafficSecret0 = emptyBytes()
+    out.masterSecret = emptyBytes()
+    out.resumptionMasterSecret = emptyBytes()
+
+fn initMsQuicTls13Secrets(): MsQuicTls13Secrets =
+    var out: MsQuicTls13Secrets
+    initMsQuicTls13SecretsInto(out)
     return out
 
 fn msquicTls13HandshakeMessagesAdd(
@@ -153,14 +221,78 @@ fn msquicTls13HandshakeMessagesAdd(
     messages.count = messages.count + 1
     return Ok[bool](true)
 
+fn msquicTls13PeerVerifyClearTrustRoots(out: var MsQuicTls13PeerVerifyState) =
+    out.trustRootsCount = 0
+    for i in 0..<msQuicTls13MaxTrustRoots:
+        out.trustRootDer[i] = emptyBytes()
+
+fn msquicTls13PeerVerifyAddTrustRoot(out: var MsQuicTls13PeerVerifyState, der: Bytes): Result[bool] =
+    if bytesLen(der) <= 0:
+        return Err[bool]("tls13: empty trust root")
+    let count: int32 = out.trustRootsCount
+    if count >= msQuicTls13MaxTrustRoots:
+        return Err[bool]("tls13: trust root list full")
+    out.trustRootDer[count] = der
+    out.trustRootsCount = count + 1
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyClearRevocationCrls(out: var MsQuicTls13PeerVerifyState) =
+    out.revocationCrlCount = 0
+    for i in 0..<msQuicTls13MaxRevocationCrls:
+        out.revocationCrls[i] = emptyBytes()
+
+fn msquicTls13PeerVerifyResetConfig(out: var MsQuicTls13PeerVerifyState) =
+    msquicTls13PeerVerifyClearTrustRoots(out)
+    msquicTls13PeerVerifySetRevocationMode(out, X509RevocationOff)
+    msquicTls13PeerVerifyClearRevocationCrls(out)
+
+fn msquicTls13PeerVerifyResetRuntime(out: var MsQuicTls13PeerVerifyState) =
+    initX509CertificateInto(out.peerLeaf)
+    out.peerCertVerified = false
+    out.certVerifyOk = false
+    out.finishedOk = false
+    out.peerOcspResponse = emptyBytes()
+
+fn msquicTls13PeerVerifySetChainVerified(peer: var MsQuicTls13PeerVerifyState, ok: bool) =
+    peer.peerCertVerified = ok
+
+fn msquicTls13PeerVerifySetCertVerifyOk(peer: var MsQuicTls13PeerVerifyState, ok: bool) =
+    peer.certVerifyOk = ok
+
+fn msquicTls13PeerVerifySetFinishedOk(peer: var MsQuicTls13PeerVerifyState, ok: bool) =
+    peer.finishedOk = ok
+
+fn msquicTls13PeerVerifySetRevocationMode(peer: var MsQuicTls13PeerVerifyState, mode: X509RevocationMode) =
+    peer.revocationMode = mode
+
+fn msquicTls13PeerVerifySetOcspResponse(peerOcspResponse: var Bytes, ocsp: Bytes) =
+    if bytesLen(ocsp) <= 0:
+        return
+    peerOcspResponse = ocsp
+
+fn msquicTls13PeerVerifyLoadRevocationCrls(
+    peer: var MsQuicTls13PeerVerifyState,
+    crls: Bytes[msQuicTls13MaxRevocationCrls],
+    count: int32
+) =
+    msquicTls13PeerVerifyClearRevocationCrls(peer)
+    if count <= 0:
+        return
+    var j: int32 = 0
+    while j < count && j < msQuicTls13MaxRevocationCrls:
+        peer.revocationCrls[j] = crls[j]
+        j = j + 1
+    peer.revocationCrlCount = j
+
+fn initMsQuicTls13PeerVerifyStateInto(out: var MsQuicTls13PeerVerifyState) =
+    msquicTls13PeerVerifyResetRuntime(out)
+    msquicTls13PeerVerifyResetConfig(out)
+
 fn initMsQuicTls13HandshakeStateInto(out: var MsQuicTls13HandshakeState, role: MsQuicTls13HandshakeRole) =
     out.role = role
     out.requireCert = true
     out.serverName = ""
     out.peerServerName = ""
-    out.buffer = newByteBuffer()
-    out.transcript = newByteBuffer()
-    out.messages = initMsQuicTls13HandshakeMessages()
     out.cipherSuiteId = 0
     out.cipher = MsQuicCipherChacha20Poly1305
     out.selectedVersion = 0
@@ -174,12 +306,6 @@ fn initMsQuicTls13HandshakeStateInto(out: var MsQuicTls13HandshakeState, role: M
     out.localKeySharePriv = emptyBytes()
     out.localKeySharePub = emptyBytes()
     out.handshakeSecretsReady = false
-    out.handshakeSecrets.clientHandshakeTrafficSecret = emptyBytes()
-    out.handshakeSecrets.serverHandshakeTrafficSecret = emptyBytes()
-    out.handshakeSecrets.clientTrafficSecret0 = emptyBytes()
-    out.handshakeSecrets.serverTrafficSecret0 = emptyBytes()
-    out.handshakeSecrets.masterSecret = emptyBytes()
-    out.handshakeSecrets.resumptionMasterSecret = emptyBytes()
     out.applicationSecretsReady = false
     out.peerTransportParams = emptyBytes()
     out.peerTransportParamsSet = false
@@ -198,21 +324,11 @@ fn initMsQuicTls13HandshakeStateInto(out: var MsQuicTls13HandshakeState, role: M
     out.pskAccepted = false
     out.psk = emptyBytes()
     out.pskCipher = MsQuicCipherAes128Gcm
-    out.clientHelloRaw = emptyBytes()
-    out.peerAlpnList = initStringList()
+    out.peerAlpnCount = 0
     out.negotiatedAlpn = ""
-    out.peerLeaf = initX509Certificate()
-    out.peerChain = initX509CertList()
-    out.trustRoots = initX509CertList()
-    out.peerCertVerified = false
-    out.certVerifyOk = false
-    out.finishedOk = false
-    out.peerOcspResponse = emptyBytes()
-    out.revocationMode = X509RevocationOff
-    out.revocationCrlCount = 0
-    for i in 0..<msQuicTls13MaxRevocationCrls:
-        out.revocationCrls[i] = emptyBytes()
-    out.lastError = ""
+    initMsQuicTls13WireStateInto(out.wire)
+    initMsQuicTls13SecretsInto(out.handshakeSecrets)
+    initMsQuicTls13PeerVerifyStateInto(out.peer)
 
 fn initMsQuicTls13HandshakeState(role: MsQuicTls13HandshakeRole): MsQuicTls13HandshakeState =
     var out: MsQuicTls13HandshakeState
@@ -225,27 +341,11 @@ fn msquicTls13HandshakeSetRequireCert(state: var MsQuicTls13HandshakeState, requ
 fn msquicTls13HandshakeSetServerName(state: var MsQuicTls13HandshakeState, serverName: str) =
     state.serverName = serverName
 
-fn msquicTls13HandshakeSetTrustRoots(state: var MsQuicTls13HandshakeState, roots: X509CertList) =
-    state.trustRoots = roots
+fn msquicTls13HandshakeClearTrustRoots(state: var MsQuicTls13HandshakeState) =
+    msquicTls13PeerVerifyClearTrustRoots(state.peer)
 
-fn msquicTls13HandshakeSetRevocationMode(state: var MsQuicTls13HandshakeState, mode: X509RevocationMode) =
-    state.revocationMode = mode
-
-fn msquicTls13HandshakeSetRevocationCrls(
-    state: var MsQuicTls13HandshakeState,
-    crls: Bytes[msQuicTls13MaxRevocationCrls],
-    count: int32
-) =
-    for i in 0..<msQuicTls13MaxRevocationCrls:
-        state.revocationCrls[i] = emptyBytes()
-    state.revocationCrlCount = 0
-    if count <= 0:
-        return
-    var j: int32 = 0
-    while j < count && j < msQuicTls13MaxRevocationCrls:
-        state.revocationCrls[j] = crls[j]
-        j = j + 1
-    state.revocationCrlCount = j
+fn msquicTls13HandshakeAddTrustRoot(state: var MsQuicTls13HandshakeState, der: Bytes): Result[bool] =
+    return msquicTls13PeerVerifyAddTrustRoot(state.peer, der)
 
 fn msquicTls13HandshakeSetLocalKeyShare(
     state: var MsQuicTls13HandshakeState,
@@ -258,14 +358,289 @@ fn msquicTls13HandshakeSetLocalKeyShare(
     state.localKeySharePub = pub
 
 fn msquicTls13HandshakeGenerateX25519(state: var MsQuicTls13HandshakeState): Result[bool] =
-    let kpRes: Result[Curve25519KeyPair] = generateCurve25519KeyPair()
-    if IsErr(kpRes):
-        return Err[bool](ErrorText(kpRes))
-    let kp: Curve25519KeyPair = Value(kpRes)
-    state.localKeyShareGroup = tlsGroupX25519
-    state.localKeySharePriv = kp.priv
-    state.localKeySharePub = kp.pub
+    var priv: Bytes = emptyBytes()
+    var pub: Bytes = emptyBytes()
+    let genRes: Result[bool] = generateCurve25519KeyPairInto(priv, pub)
+    if IsErr(genRes):
+        return Err[bool](ErrorText(genRes))
+    msquicTls13HandshakeSetLocalKeyShare(state, tlsGroupX25519, priv, pub)
     return Ok[bool](true)
+
+fn msquicTls13ResetClientWireState() =
+    msquicTls13ClientState.wire.buffer = newByteBuffer()
+    msquicTls13ClientState.wire.transcript = newByteBuffer()
+    msquicTls13ClientState.wire.messages.count = 0
+    msquicTls13ClientState.wire.clientHelloRaw = emptyBytes()
+    msquicTls13ClientState.wire.lastError = ""
+
+fn msquicTls13ResetServerWireState() =
+    msquicTls13ServerState.wire.buffer = newByteBuffer()
+    msquicTls13ServerState.wire.transcript = newByteBuffer()
+    msquicTls13ServerState.wire.messages.count = 0
+    msquicTls13ServerState.wire.clientHelloRaw = emptyBytes()
+    msquicTls13ServerState.wire.lastError = ""
+
+fn msquicTls13ResetClientState(role: MsQuicTls13HandshakeRole, requireCert: bool) =
+    initMsQuicTls13HandshakeStateInto(msquicTls13ClientState, role)
+    msquicTls13ClientState.requireCert = requireCert
+
+fn msquicTls13ResetServerState(role: MsQuicTls13HandshakeRole, requireCert: bool) =
+    initMsQuicTls13HandshakeStateInto(msquicTls13ServerState, role)
+    msquicTls13ServerState.requireCert = requireCert
+
+fn msquicTls13ResetClientDefault(requireCert: bool) =
+    msquicTls13ResetClientState(TlsRoleClient, requireCert)
+
+fn msquicTls13ResetServerDefault(requireCert: bool) =
+    msquicTls13ResetServerState(TlsRoleServer, requireCert)
+
+fn msquicTls13ClientSetServerName(serverName: str) =
+    msquicTls13ClientState.serverName = serverName
+
+fn msquicTls13ServerSetServerName(serverName: str) =
+    msquicTls13ServerState.serverName = serverName
+
+fn msquicTls13ClientGenerateX25519(): Result[bool] =
+    return msquicTls13HandshakeGenerateX25519(msquicTls13ClientState)
+
+fn msquicTls13ServerGenerateX25519(): Result[bool] =
+    return msquicTls13HandshakeGenerateX25519(msquicTls13ServerState)
+
+fn msquicTls13ClientClearTrustRoots() =
+    msquicTls13PeerVerifyClearTrustRoots(msquicTls13ClientState.peer)
+
+fn msquicTls13ServerClearTrustRoots() =
+    msquicTls13PeerVerifyClearTrustRoots(msquicTls13ServerState.peer)
+
+fn msquicTls13ClientAddTrustRoot(der: Bytes): Result[bool] =
+    return msquicTls13PeerVerifyAddTrustRoot(msquicTls13ClientState.peer, der)
+
+fn msquicTls13ServerAddTrustRoot(der: Bytes): Result[bool] =
+    return msquicTls13PeerVerifyAddTrustRoot(msquicTls13ServerState.peer, der)
+
+fn msquicTls13BuildTrustRoots(
+    trustRootsCount: int32,
+    trustRoot0: Bytes,
+    trustRoot1: Bytes,
+    trustRoot2: Bytes,
+    trustRoot3: Bytes,
+    out: var X509CertList
+): Result[bool] =
+    out.count = 0
+    if trustRootsCount > 0:
+        let addRes: Result[bool] = x509CertListAddDer(out, trustRoot0)
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+    if trustRootsCount > 1:
+        let addRes: Result[bool] = x509CertListAddDer(out, trustRoot1)
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+    if trustRootsCount > 2:
+        let addRes: Result[bool] = x509CertListAddDer(out, trustRoot2)
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+    if trustRootsCount > 3:
+        let addRes: Result[bool] = x509CertListAddDer(out, trustRoot3)
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyBuildTrustRoots(peer: MsQuicTls13PeerVerifyState, out: var X509CertList): Result[bool] =
+    return msquicTls13BuildTrustRoots(
+        peer.trustRootsCount,
+        peer.trustRootDer[0],
+        peer.trustRootDer[1],
+        peer.trustRootDer[2],
+        peer.trustRootDer[3],
+        out
+    )
+
+fn msquicTls13ClientBuildClientHello(
+    randomSeed: Bytes,
+    alpn: str,
+    serverName: str,
+    quicTransportParams: Bytes
+): Result[Bytes] =
+    return msquicTls13BuildClientHello(msquicTls13ClientState, randomSeed, alpn, serverName, quicTransportParams)
+
+fn msquicTls13ServerBuildClientHello(
+    randomSeed: Bytes,
+    alpn: str,
+    serverName: str,
+    quicTransportParams: Bytes
+): Result[Bytes] =
+    return msquicTls13BuildClientHello(msquicTls13ServerState, randomSeed, alpn, serverName, quicTransportParams)
+
+fn msquicTls13ClientBuildServerHello(randomSeed: Bytes, acceptPsk: bool): Result[Bytes] =
+    return msquicTls13BuildServerHello(msquicTls13ClientState, randomSeed, acceptPsk)
+
+fn msquicTls13ServerBuildServerHello(randomSeed: Bytes, acceptPsk: bool): Result[Bytes] =
+    return msquicTls13BuildServerHello(msquicTls13ServerState, randomSeed, acceptPsk)
+
+fn msquicTls13ClientBuildCertificateVerify(
+    leafKeyKind: X509PublicKeyKind,
+    privateKeyData: Bytes,
+    forServer: bool
+): Result[Bytes] =
+    let transcript: Bytes = toBytes(msquicTls13ClientState.wire.transcript)
+    return msquicTls13BuildCertificateVerify(
+        msquicTls13ClientState.cipher,
+        transcript,
+        leafKeyKind,
+        privateKeyData,
+        forServer
+    )
+
+fn msquicTls13ServerBuildCertificateVerify(
+    leafKeyKind: X509PublicKeyKind,
+    privateKeyData: Bytes,
+    forServer: bool
+): Result[Bytes] =
+    let transcript: Bytes = toBytes(msquicTls13ServerState.wire.transcript)
+    return msquicTls13BuildCertificateVerify(
+        msquicTls13ServerState.cipher,
+        transcript,
+        leafKeyKind,
+        privateKeyData,
+        forServer
+    )
+
+fn msquicTls13ClientBuildFinished(forServer: bool): Result[Bytes] =
+    let transcript: Bytes = toBytes(msquicTls13ClientState.wire.transcript)
+    return msquicTls13BuildFinished(
+        msquicTls13ClientState.cipher,
+        transcript,
+        msquicTls13ClientState.handshakeSecretsReady,
+        msquicTls13ClientState.handshakeSecrets.clientHandshakeTrafficSecret,
+        msquicTls13ClientState.handshakeSecrets.serverHandshakeTrafficSecret,
+        forServer
+    )
+
+fn msquicTls13ServerBuildFinished(forServer: bool): Result[Bytes] =
+    let transcript: Bytes = toBytes(msquicTls13ServerState.wire.transcript)
+    return msquicTls13BuildFinished(
+        msquicTls13ServerState.cipher,
+        transcript,
+        msquicTls13ServerState.handshakeSecretsReady,
+        msquicTls13ServerState.handshakeSecrets.clientHandshakeTrafficSecret,
+        msquicTls13ServerState.handshakeSecrets.serverHandshakeTrafficSecret,
+        forServer
+    )
+
+fn msquicTls13ClientAppendTranscript(raw: Bytes) =
+    if bytesLen(msquicTls13ClientState.wire.transcript.data) + bytesLen(raw) > msQuicTls13MaxTranscriptBytes:
+        panic("tls13: transcript overflow")
+    var transcript: ByteBuffer = msquicTls13ClientState.wire.transcript
+    appendBytes(transcript, raw)
+    msquicTls13ClientState.wire.transcript = transcript
+
+fn msquicTls13ServerAppendTranscript(raw: Bytes) =
+    if bytesLen(msquicTls13ServerState.wire.transcript.data) + bytesLen(raw) > msQuicTls13MaxTranscriptBytes:
+        panic("tls13: transcript overflow")
+    var transcript: ByteBuffer = msquicTls13ServerState.wire.transcript
+    appendBytes(transcript, raw)
+    msquicTls13ServerState.wire.transcript = transcript
+
+fn msquicTls13ClientFinishedOk(): bool =
+    return msquicTls13ClientState.peer.finishedOk
+
+fn msquicTls13ServerFinishedOk(): bool =
+    return msquicTls13ServerState.peer.finishedOk
+
+fn msquicTls13SideReset(side: int32, role: MsQuicTls13HandshakeRole, requireCert: bool) =
+    if side == msQuicTls13SideClient:
+        msquicTls13ResetClientState(role, requireCert)
+        return
+    msquicTls13ResetServerState(role, requireCert)
+
+fn msquicTls13SideSetServerName(side: int32, serverName: str) =
+    if side == msQuicTls13SideClient:
+        msquicTls13HandshakeSetServerName(msquicTls13ClientState, serverName)
+        return
+    msquicTls13HandshakeSetServerName(msquicTls13ServerState, serverName)
+
+fn msquicTls13SideClearTrustRoots(side: int32) =
+    if side == msQuicTls13SideClient:
+        msquicTls13ClientClearTrustRoots()
+        return
+    msquicTls13ServerClearTrustRoots()
+
+fn msquicTls13SideAddTrustRoot(side: int32, der: Bytes): Result[bool] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13ClientAddTrustRoot(der)
+    return msquicTls13ServerAddTrustRoot(der)
+
+fn msquicTls13SideGenerateX25519(side: int32): Result[bool] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13HandshakeGenerateX25519(msquicTls13ClientState)
+    return msquicTls13HandshakeGenerateX25519(msquicTls13ServerState)
+
+fn msquicTls13SideBuildClientHello(
+    side: int32,
+    randomSeed: Bytes,
+    alpn: str,
+    serverName: str,
+    quicTransportParams: Bytes
+): Result[Bytes] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13BuildClientHello(msquicTls13ClientState, randomSeed, alpn, serverName, quicTransportParams)
+    return msquicTls13BuildClientHello(msquicTls13ServerState, randomSeed, alpn, serverName, quicTransportParams)
+
+fn msquicTls13SideBuildServerHello(side: int32, randomSeed: Bytes, acceptPsk: bool): Result[Bytes] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13BuildServerHello(msquicTls13ClientState, randomSeed, acceptPsk)
+    return msquicTls13BuildServerHello(msquicTls13ServerState, randomSeed, acceptPsk)
+
+fn msquicTls13SideBuildCertificateVerify(
+    side: int32,
+    leafKeyKind: X509PublicKeyKind,
+    privateKeyData: Bytes,
+    forServer: bool
+): Result[Bytes] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13ClientBuildCertificateVerify(leafKeyKind, privateKeyData, forServer)
+    return msquicTls13ServerBuildCertificateVerify(leafKeyKind, privateKeyData, forServer)
+
+fn msquicTls13SideBuildFinished(side: int32, forServer: bool): Result[Bytes] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13ClientBuildFinished(forServer)
+    return msquicTls13ServerBuildFinished(forServer)
+
+fn msquicTls13SideAppendTranscript(side: int32, raw: Bytes) =
+    if side == msQuicTls13SideClient:
+        msquicTls13HandshakeAppendTranscript(msquicTls13ClientState, raw)
+        return
+    msquicTls13HandshakeAppendTranscript(msquicTls13ServerState, raw)
+
+fn msquicTls13SideComputeHandshakeSecrets(side: int32): Result[bool] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13ComputeHandshakeSecrets(msquicTls13ClientState)
+    return msquicTls13ComputeHandshakeSecrets(msquicTls13ServerState)
+
+fn msquicTls13SideFeed(side: int32, data: Bytes): Result[int32] =
+    if side == msQuicTls13SideClient:
+        return msquicTls13HandshakeFeed(msquicTls13ClientState, data)
+    return msquicTls13HandshakeFeed(msquicTls13ServerState, data)
+
+fn msquicTls13SideFinishedOk(side: int32): bool =
+    if side == msQuicTls13SideClient:
+        return msquicTls13ClientState.peer.finishedOk
+    return msquicTls13ServerState.peer.finishedOk
+
+fn msquicTls13ServerClientKeyShareGroup(): int32 =
+    return msquicTls13ServerState.clientKeyShareGroup
+
+fn msquicTls13ServerLocalKeyShareGroup(): int32 =
+    return msquicTls13ServerState.localKeyShareGroup
+
+fn msquicTls13ServerHandshakeMessageCount(): int32 =
+    return msquicTls13ServerState.wire.messages.count
+
+fn msquicTls13ServerBufferedHandshakeBytes(): int32 =
+    return bytesLen(msquicTls13ServerState.wire.buffer.data)
+
+fn msquicTls13ServerLastErrorText(): str =
+    return msquicTls13ServerState.wire.lastError
 
 fn tlsReadUint8(data: Bytes, offset: int32): Result[TlsInt32Next] =
     if offset < 0 || offset >= bytesLen(data):
@@ -340,15 +715,18 @@ fn msquicTls13CipherHashKind(cipher: MsQuicCipherSuite): X509HashKind =
     return X509HashSha256
 
 fn msquicTls13TranscriptHash(state: var MsQuicTls13HandshakeState, hashKind: X509HashKind): Bytes =
-    let data: Bytes = toBytes(state.transcript)
+    let data: Bytes = toBytes(state.wire.transcript)
+    return msquicTls13TranscriptHashBytes(data, hashKind)
+
+fn msquicTls13TranscriptHashBytes(data: Bytes, hashKind: X509HashKind): Bytes =
     if hashKind == X509HashSha384:
         return sha384Digest(data)
     return sha256Digest(data)
 
 fn msquicTls13FinishedVerifyData(finishedKey: Bytes, transcriptHash: Bytes, hashKind: X509HashKind): Bytes =
     if hashKind == X509HashSha384:
-        return hmacDigest(finishedKey, transcriptHash, sha384BlockSize, sha384Size, sha384Digest)
-    return hmacDigest(finishedKey, transcriptHash, sha256BlockSize, sha256Size, sha256Digest)
+        return hmacDigestSha384(finishedKey, transcriptHash)
+    return hmacDigestSha256(finishedKey, transcriptHash)
 
 fn msquicTls13ComputeSharedSecret(state: var MsQuicTls13HandshakeState): Result[Bytes] =
     var peerGroup: int32 = state.serverKeyShareGroup
@@ -399,15 +777,33 @@ fn msquicTls13ComputeHandshakeSecrets(state: var MsQuicTls13HandshakeState): Res
     return Ok[bool](true)
 
 fn msquicTls13FinishedData(state: var MsQuicTls13HandshakeState, forServer: bool): Result[Bytes] =
-    if ! state.handshakeSecretsReady:
+    let transcript: Bytes = toBytes(state.wire.transcript)
+    return msquicTls13FinishedDataParts(
+        state.cipher,
+        transcript,
+        state.handshakeSecretsReady,
+        state.handshakeSecrets.clientHandshakeTrafficSecret,
+        state.handshakeSecrets.serverHandshakeTrafficSecret,
+        forServer
+    )
+
+fn msquicTls13FinishedDataParts(
+    cipher: MsQuicCipherSuite,
+    transcript: Bytes,
+    handshakeSecretsReady: bool,
+    clientHandshakeTrafficSecret: Bytes,
+    serverHandshakeTrafficSecret: Bytes,
+    forServer: bool
+): Result[Bytes] =
+    if ! handshakeSecretsReady:
         return Err[Bytes]("tls13: handshake secrets ! ready")
-    let hashKind: X509HashKind = msquicTls13CipherHashKind(state.cipher)
-    let thash: Bytes = msquicTls13TranscriptHash(state, hashKind)
+    let hashKind: X509HashKind = msquicTls13CipherHashKind(cipher)
+    let thash: Bytes = msquicTls13TranscriptHashBytes(transcript, hashKind)
     let hashLen: int32 = x509HashLen(hashKind)
-    var baseSecret: Bytes = state.handshakeSecrets.clientHandshakeTrafficSecret
+    var baseSecret: Bytes = clientHandshakeTrafficSecret
     if forServer:
-        baseSecret = state.handshakeSecrets.serverHandshakeTrafficSecret
-    let keyRes: Result[Bytes] = msquicTls13ExpandLabel(baseSecret, "finished", emptyBytes(), hashLen, state.cipher)
+        baseSecret = serverHandshakeTrafficSecret
+    let keyRes: Result[Bytes] = msquicTls13ExpandLabel(baseSecret, "finished", emptyBytes(), hashLen, cipher)
     if IsErr(keyRes):
         return Err[Bytes](ErrorText(keyRes))
     return Ok[Bytes](msquicTls13FinishedVerifyData(Value(keyRes), thash, hashKind))
@@ -627,9 +1023,9 @@ fn msquicTls13ComputePskBinder(
     if IsErr(keyRes):
         return Err[Bytes](ErrorText(keyRes))
     let key: Bytes = Value(keyRes)
-    var binder: Bytes = hmacDigest(key, hash, sha256BlockSize, sha256Size, sha256Digest)
+    var binder: Bytes = hmacDigestSha256(key, hash)
     if cipher == MsQuicCipherAes256Gcm:
-        binder = hmacDigest(key, hash, sha384BlockSize, sha384Size, sha384Digest)
+        binder = hmacDigestSha384(key, hash)
     return Ok[Bytes](binder)
 
 fn msquicTls13BuildClientHelloWithPsk(
@@ -854,7 +1250,8 @@ fn msquicTls13BuildCertificate(leafDer: Bytes): Result[Bytes] =
     return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeCertificate, toBytes(body)))
 
 fn msquicTls13BuildCertificateVerify(
-    state: MsQuicTls13HandshakeState,
+    cipher: MsQuicCipherSuite,
+    transcript: Bytes,
     leafKeyKind: X509PublicKeyKind,
     privateKeyData: Bytes,
     forServer: bool
@@ -862,18 +1259,14 @@ fn msquicTls13BuildCertificateVerify(
     
     if bytesLen(privateKeyData) <= 0:
         return Err[Bytes]("tls13: private key missing")
-    let hashKind: X509HashKind = msquicTls13CipherHashKind(state.cipher)
-    let transcriptHash: Bytes = msquicTls13TranscriptHash(state, hashKind)
-    echo("msquic_tls13_cert_verify_stage=transcript_hash_ok")
+    let hashKind: X509HashKind = msquicTls13CipherHashKind(cipher)
+    let transcriptHash: Bytes = msquicTls13TranscriptHashBytes(transcript, hashKind)
     let msg: Bytes = msquicTls13CertVerifyMessage(transcriptHash, forServer)
     let useSha384: bool = hashKind == X509HashSha384
     var scheme: int32 = 0
     var signature: Bytes = emptyBytes()
     if leafKeyKind == X509KeyRsa:
-        let privRes: Result[RsaBigPrivateKey] = rsaBigPrivateKeyFromBytes(privateKeyData)
-        if IsErr(privRes):
-            return Err[Bytes](ErrorText(privRes))
-        let sigRes: Result[Bytes] = rsaBigSignPss(Value(privRes), msg, useSha384)
+        let sigRes: Result[Bytes] = rsaBigSignPssBytes(privateKeyData, msg, useSha384)
         if IsErr(sigRes):
             return Err[Bytes](ErrorText(sigRes))
         scheme = if useSha384: tlsSigRsaPssRsaeSha384 else: tlsSigRsaPssRsaeSha256
@@ -886,7 +1279,6 @@ fn msquicTls13BuildCertificateVerify(
             return Err[Bytes](ErrorText(sigRes))
         scheme = tlsSigEcdsaSecp256r1Sha256
         signature = Value(sigRes)
-        echo("msquic_tls13_cert_verify_stage=ecdsa_sign_ok")
     else:
         return Err[Bytes]("tls13: unsupported certificate key kind")
 
@@ -896,8 +1288,22 @@ fn msquicTls13BuildCertificateVerify(
     appendBytes(body, signature)
     return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeCertificateVerify, toBytes(body)))
 
-fn msquicTls13BuildFinished(state: MsQuicTls13HandshakeState, forServer: bool): Result[Bytes] =
-    let finRes: Result[Bytes] = msquicTls13FinishedData(state, forServer)
+fn msquicTls13BuildFinished(
+    cipher: MsQuicCipherSuite,
+    transcript: Bytes,
+    handshakeSecretsReady: bool,
+    clientHandshakeTrafficSecret: Bytes,
+    serverHandshakeTrafficSecret: Bytes,
+    forServer: bool
+): Result[Bytes] =
+    let finRes: Result[Bytes] = msquicTls13FinishedDataParts(
+        cipher,
+        transcript,
+        handshakeSecretsReady,
+        clientHandshakeTrafficSecret,
+        serverHandshakeTrafficSecret,
+        forServer
+    )
     if IsErr(finRes):
         return Err[Bytes](ErrorText(finRes))
     return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeFinished, Value(finRes)))
@@ -998,173 +1404,355 @@ fn msquicTls13ParseServerNameList(data: Bytes): Result[str] =
             break
     return Ok[str](name)
 
+fn msquicTls13ExtensionsRecordsTransportParams(ctx: MsQuicTls13ExtensionsContext): bool =
+    return ctx != TlsExtensionsServerHello
+
+fn msquicTls13ParseClientKeyShareList(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes
+): Result[bool] =
+    let listLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
+    if IsErr(listLenRes):
+        return Err[bool](ErrorText(listLenRes))
+    let listLen: int32 = Value(listLenRes).value
+    let ksOff: int32 = Value(listLenRes).next
+    if listLen <= 0:
+        return Err[bool]("tls13: key share list empty")
+    let groupRes: Result[TlsInt32Next] = tlsReadUint16(extData, ksOff)
+    if IsErr(groupRes):
+        return Err[bool](ErrorText(groupRes))
+    let group: int32 = Value(groupRes).value
+    let keyLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, Value(groupRes).next)
+    if IsErr(keyLenRes):
+        return Err[bool](ErrorText(keyLenRes))
+    let keyLen: int32 = Value(keyLenRes).value
+    let clientKeyRes: Result[TlsBytesNext] = tlsReadBytes(extData, Value(keyLenRes).next, keyLen)
+    if IsErr(clientKeyRes):
+        return Err[bool](ErrorText(clientKeyRes))
+    state.clientKeyShareGroup = group
+    state.clientKeyShare = Value(clientKeyRes).value
+    return Ok[bool](true)
+
+fn msquicTls13ParseServerKeyShare(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    extLen: int32
+): Result[bool] =
+    if extLen < 4:
+        return Err[bool]("tls13: key share too short")
+    let groupRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
+    if IsErr(groupRes):
+        return Err[bool](ErrorText(groupRes))
+    let group: int32 = Value(groupRes).value
+    let keyLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, Value(groupRes).next)
+    if IsErr(keyLenRes):
+        return Err[bool](ErrorText(keyLenRes))
+    let keyLen: int32 = Value(keyLenRes).value
+    let serverKeyRes: Result[TlsBytesNext] = tlsReadBytes(extData, Value(keyLenRes).next, keyLen)
+    if IsErr(serverKeyRes):
+        return Err[bool](ErrorText(serverKeyRes))
+    state.serverKeyShareGroup = group
+    state.serverKeyShare = Value(serverKeyRes).value
+    return Ok[bool](true)
+
+fn msquicTls13ParseKeyShareExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    extLen: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if ctx == TlsExtensionsClientHello:
+        return msquicTls13ParseClientKeyShareList(state, extData)
+    if ctx == TlsExtensionsServerHello:
+        return msquicTls13ParseServerKeyShare(state, extData, extLen)
+    return Err[bool]("tls13: key share unexpected")
+
+fn msquicTls13ParseAlpnExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if state.role == TlsRoleServer:
+        if ctx == TlsExtensionsClientHello:
+            let listRes: Result[StringList] = msquicTls13ParseAlpnList(extData)
+            if IsErr(listRes):
+                return Err[bool](ErrorText(listRes))
+            state.peerAlpnCount = Value(listRes).count
+        return Ok[bool](true)
+    if state.role == TlsRoleClient:
+        if ctx == TlsExtensionsEncryptedExtensions:
+            let listRes: Result[StringList] = msquicTls13ParseAlpnList(extData)
+            if IsErr(listRes):
+                return Err[bool](ErrorText(listRes))
+            let list: StringList = Value(listRes)
+            if list.count != 1:
+                return Err[bool]("tls13: negotiated alpn invalid")
+            state.negotiatedAlpn = list.items[0]
+    return Ok[bool](true)
+
+fn msquicTls13ParseServerNameExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if state.role == TlsRoleServer:
+        if ctx == TlsExtensionsClientHello:
+            let nameRes: Result[str] = msquicTls13ParseServerNameList(extData)
+            if IsErr(nameRes):
+                return Err[bool](ErrorText(nameRes))
+            state.peerServerName = Value(nameRes)
+    return Ok[bool](true)
+
+fn msquicTls13ParsePskSelectedExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    extLen: int32
+): Result[bool] =
+    if extLen < 2:
+        return Err[bool]("tls13: psk selected identity missing")
+    let selRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
+    if IsErr(selRes):
+        return Err[bool](ErrorText(selRes))
+    if Value(selRes).value == 0 && state.pskOffered:
+        state.pskAccepted = true
+    return Ok[bool](true)
+
+fn msquicTls13ParsePskOfferedExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes
+): Result[bool] =
+    var off: int32 = 0
+    let idsLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
+    if IsErr(idsLenRes):
+        return Err[bool](ErrorText(idsLenRes))
+    let idsLen: int32 = Value(idsLenRes).value
+    off = Value(idsLenRes).next
+    let idsEnd: int32 = off + idsLen
+    if idsLen <= 0 || idsEnd > bytesLen(extData):
+        return Err[bool]("tls13: psk identities empty")
+    let idLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
+    if IsErr(idLenRes):
+        return Err[bool](ErrorText(idLenRes))
+    let idLen: int32 = Value(idLenRes).value
+    off = Value(idLenRes).next
+    let idRes: Result[TlsBytesNext] = tlsReadBytes(extData, off, idLen)
+    if IsErr(idRes):
+        return Err[bool](ErrorText(idRes))
+    let identity: Bytes = Value(idRes).value
+    off = Value(idRes).next
+    let ageRes: Result[TlsInt64Next] = tlsReadUint32(extData, off)
+    if IsErr(ageRes):
+        return Err[bool](ErrorText(ageRes))
+    let obfuscatedAge: int64 = Value(ageRes).value
+    off = Value(ageRes).next
+    if off < idsEnd:
+        off = idsEnd
+    let bindersLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
+    if IsErr(bindersLenRes):
+        return Err[bool](ErrorText(bindersLenRes))
+    let bindersLen: int32 = Value(bindersLenRes).value
+    off = Value(bindersLenRes).next
+    if bindersLen <= 0 || off + bindersLen > bytesLen(extData):
+        return Err[bool]("tls13: psk binders empty")
+    let binderLenRes: Result[TlsInt32Next] = tlsReadUint8(extData, off)
+    if IsErr(binderLenRes):
+        return Err[bool](ErrorText(binderLenRes))
+    let binderLen: int32 = Value(binderLenRes).value
+    off = Value(binderLenRes).next
+    let binderRes: Result[TlsBytesNext] = tlsReadBytes(extData, off, binderLen)
+    if IsErr(binderRes):
+        return Err[bool](ErrorText(binderRes))
+    state.pskIdentity = identity
+    state.pskObfuscatedAge = obfuscatedAge
+    state.pskBinder = Value(binderRes).value
+    state.pskOffered = true
+    return Ok[bool](true)
+
+fn msquicTls13ParsePskExtension(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    extLen: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if ctx == TlsExtensionsServerHello:
+        return msquicTls13ParsePskSelectedExtension(state, extData, extLen)
+    if ctx == TlsExtensionsClientHello:
+        return msquicTls13ParsePskOfferedExtension(state, extData)
+    return Err[bool]("tls13: psk unexpected")
+
+fn msquicTls13ValidateExtensions(
+    state: var MsQuicTls13HandshakeState,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if ctx == TlsExtensionsClientHello:
+        if state.role == TlsRoleServer:
+            if state.peerAlpnCount <= 0:
+                return Err[bool]("tls13: alpn missing")
+    if ctx == TlsExtensionsEncryptedExtensions:
+        if state.role == TlsRoleClient:
+            if len(state.negotiatedAlpn) <= 0:
+                return Err[bool]("tls13: alpn missing")
+    return Ok[bool](true)
+
+fn msquicTls13ReadNextExtension(data: Bytes, offset: int32): Result[TlsExtensionNext] =
+    let typeRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
+    if IsErr(typeRes):
+        return Err[TlsExtensionNext](ErrorText(typeRes))
+    let extType: int32 = Value(typeRes).value
+    let lenRes: Result[TlsInt32Next] = tlsReadUint16(data, Value(typeRes).next)
+    if IsErr(lenRes):
+        return Err[TlsExtensionNext](ErrorText(lenRes))
+    let extLen: int32 = Value(lenRes).value
+    let extRes: Result[TlsBytesNext] = tlsReadBytes(data, Value(lenRes).next, extLen)
+    if IsErr(extRes):
+        return Err[TlsExtensionNext](ErrorText(extRes))
+    var out: TlsExtensionNext
+    out.extType = extType
+    out.extLen = extLen
+    out.extData = Value(extRes).value
+    out.next = Value(extRes).next
+    return Ok[TlsExtensionNext](out)
+
+fn msquicTls13DispatchSupportedVersions(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    extLen: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if ctx == TlsExtensionsServerHello:
+        if extLen != 2:
+            return Err[bool]("tls13: selected version invalid")
+        let verRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
+        if IsErr(verRes):
+            return Err[bool](ErrorText(verRes))
+        state.selectedVersion = Value(verRes).value
+        return Ok[bool](true)
+    if ctx != TlsExtensionsClientHello:
+        return Err[bool]("tls13: supported versions unexpected")
+    if extLen < 1:
+        return Err[bool]("tls13: supported versions empty")
+    return Ok[bool](true)
+
+fn msquicTls13DispatchTransportParams(
+    state: var MsQuicTls13HandshakeState,
+    extData: Bytes,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if msquicTls13ExtensionsRecordsTransportParams(ctx):
+        state.peerTransportParams = extData
+        state.peerTransportParamsSet = true
+        return Ok[bool](true)
+    return Err[bool]("tls13: transport params unexpected")
+
+fn msquicTls13DispatchNegotiationExtension(
+    state: var MsQuicTls13HandshakeState,
+    extType: int32,
+    extData: Bytes,
+    extLen: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if extType == tlsExtSupportedVersions:
+        let versionRes: Result[bool] = msquicTls13DispatchSupportedVersions(state, extData, extLen, ctx)
+        if IsErr(versionRes):
+            return Err[bool](ErrorText(versionRes))
+        return Ok[bool](true)
+    if extType == tlsExtKeyShare:
+        let keyShareRes: Result[bool] = msquicTls13ParseKeyShareExtension(state, extData, extLen, ctx)
+        if IsErr(keyShareRes):
+            return Err[bool](ErrorText(keyShareRes))
+        return Ok[bool](true)
+    if extType == tlsExtPreSharedKey:
+        let pskRes: Result[bool] = msquicTls13ParsePskExtension(state, extData, extLen, ctx)
+        if IsErr(pskRes):
+            return Err[bool](ErrorText(pskRes))
+        return Ok[bool](true)
+    return Ok[bool](false)
+
+fn msquicTls13DispatchMetadataExtension(
+    state: var MsQuicTls13HandshakeState,
+    extType: int32,
+    extData: Bytes,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    if extType == tlsExtAlpn:
+        let alpnRes: Result[bool] = msquicTls13ParseAlpnExtension(state, extData, ctx)
+        if IsErr(alpnRes):
+            return Err[bool](ErrorText(alpnRes))
+        return Ok[bool](true)
+    if extType == tlsExtServerName:
+        let nameRes: Result[bool] = msquicTls13ParseServerNameExtension(state, extData, ctx)
+        if IsErr(nameRes):
+            return Err[bool](ErrorText(nameRes))
+        return Ok[bool](true)
+    if extType == tlsExtQuicTransport:
+        let transportRes: Result[bool] = msquicTls13DispatchTransportParams(state, extData, ctx)
+        if IsErr(transportRes):
+            return Err[bool](ErrorText(transportRes))
+        return Ok[bool](true)
+    return Ok[bool](false)
+
+fn msquicTls13DispatchExtension(
+    state: var MsQuicTls13HandshakeState,
+    extType: int32,
+    extData: Bytes,
+    extLen: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    let negotiationRes: Result[bool] = msquicTls13DispatchNegotiationExtension(
+        state,
+        extType,
+        extData,
+        extLen,
+        ctx
+    )
+    if IsErr(negotiationRes):
+        return Err[bool](ErrorText(negotiationRes))
+    if Value(negotiationRes):
+        return Ok[bool](true)
+    let metadataRes: Result[bool] = msquicTls13DispatchMetadataExtension(state, extType, extData, ctx)
+    if IsErr(metadataRes):
+        return Err[bool](ErrorText(metadataRes))
+    return Ok[bool](true)
+
+fn msquicTls13ParseOneExtension(
+    state: var MsQuicTls13HandshakeState,
+    data: Bytes,
+    offset: int32,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[int32] =
+    let extNextRes: Result[TlsExtensionNext] = msquicTls13ReadNextExtension(data, offset)
+    if IsErr(extNextRes):
+        return Err[int32](ErrorText(extNextRes))
+    let extNext: TlsExtensionNext = Value(extNextRes)
+    let dispatchRes: Result[bool] = msquicTls13DispatchExtension(
+        state,
+        extNext.extType,
+        extNext.extData,
+        extNext.extLen,
+        ctx
+    )
+    if IsErr(dispatchRes):
+        return Err[int32](ErrorText(dispatchRes))
+    return Ok[int32](extNext.next)
+
+fn msquicTls13FinalizeExtensions(
+    state: var MsQuicTls13HandshakeState,
+    ctx: MsQuicTls13ExtensionsContext
+): Result[bool] =
+    return msquicTls13ValidateExtensions(state, ctx)
+
 fn msquicTls13ParseExtensions(
     state: var MsQuicTls13HandshakeState,
     data: Bytes,
-    keyShareIsList: bool,
-    recordTransportParams: bool,
-    pskServerSelected: bool
+    ctx: MsQuicTls13ExtensionsContext
 ): Result[bool] =
-    
-    let isClientHello: bool = state.role == TlsRoleServer && keyShareIsList
-    let isEncryptedExtensions: bool = state.role == TlsRoleClient && ! keyShareIsList && recordTransportParams
     var offset: int32 = 0
     while offset < bytesLen(data):
-        let typeRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
-        if IsErr(typeRes):
-            return Err[bool](ErrorText(typeRes))
-        let extType: int32 = Value(typeRes).value
-        offset = Value(typeRes).next
-        let lenRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
-        if IsErr(lenRes):
-            return Err[bool](ErrorText(lenRes))
-        let extLen: int32 = Value(lenRes).value
-        offset = Value(lenRes).next
-        let extRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, extLen)
-        if IsErr(extRes):
-            return Err[bool](ErrorText(extRes))
-        let extData: Bytes = Value(extRes).value
-        offset = Value(extRes).next
-        if extType == tlsExtSupportedVersions:
-            if extLen == 2:
-                let verRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
-                if IsErr(verRes):
-                    return Err[bool](ErrorText(verRes))
-                state.selectedVersion = Value(verRes).value
-            else:
-                if extLen < 1:
-                    return Err[bool]("tls13: supported versions empty")
-        elif extType == tlsExtKeyShare:
-            if keyShareIsList:
-                let listLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
-                if IsErr(listLenRes):
-                    return Err[bool](ErrorText(listLenRes))
-                let listLen: int32 = Value(listLenRes).value
-                var ksOff: int32 = Value(listLenRes).next
-                let listEnd: int32 = ksOff + listLen
-                if listLen <= 0:
-                    return Err[bool]("tls13: key share list empty")
-                let groupRes: Result[TlsInt32Next] = tlsReadUint16(extData, ksOff)
-                if IsErr(groupRes):
-                    return Err[bool](ErrorText(groupRes))
-                let group: int32 = Value(groupRes).value
-                let keyLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, Value(groupRes).next)
-                if IsErr(keyLenRes):
-                    return Err[bool](ErrorText(keyLenRes))
-                let keyLen: int32 = Value(keyLenRes).value
-                let clientKeyRes: Result[TlsBytesNext] = tlsReadBytes(extData, Value(keyLenRes).next, keyLen)
-                if IsErr(clientKeyRes):
-                    return Err[bool](ErrorText(clientKeyRes))
-                state.clientKeyShareGroup = group
-                state.clientKeyShare = Value(clientKeyRes).value
-                if Value(clientKeyRes).next < listEnd:
-                    listEnd
-            else:
-                if extLen < 4:
-                    return Err[bool]("tls13: key share too short")
-                let groupRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
-                if IsErr(groupRes):
-                    return Err[bool](ErrorText(groupRes))
-                let group: int32 = Value(groupRes).value
-                let keyLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, Value(groupRes).next)
-                if IsErr(keyLenRes):
-                    return Err[bool](ErrorText(keyLenRes))
-                let keyLen: int32 = Value(keyLenRes).value
-                let serverKeyRes: Result[TlsBytesNext] = tlsReadBytes(extData, Value(keyLenRes).next, keyLen)
-                if IsErr(serverKeyRes):
-                    return Err[bool](ErrorText(serverKeyRes))
-                state.serverKeyShareGroup = group
-                state.serverKeyShare = Value(serverKeyRes).value
-        elif extType == tlsExtAlpn:
-            if isClientHello:
-                let listRes: Result[StringList] = msquicTls13ParseAlpnList(extData)
-                if IsErr(listRes):
-                    return Err[bool](ErrorText(listRes))
-                state.peerAlpnList = Value(listRes)
-            elif isEncryptedExtensions:
-                let listRes: Result[StringList] = msquicTls13ParseAlpnList(extData)
-                if IsErr(listRes):
-                    return Err[bool](ErrorText(listRes))
-                let list: StringList = Value(listRes)
-                if list.count != 1:
-                    return Err[bool]("tls13: negotiated alpn invalid")
-                state.negotiatedAlpn = list.items[0]
-            else:
-                extData
-        elif extType == tlsExtServerName:
-            if isClientHello:
-                let nameRes: Result[str] = msquicTls13ParseServerNameList(extData)
-                if IsErr(nameRes):
-                    return Err[bool](ErrorText(nameRes))
-                state.peerServerName = Value(nameRes)
-            else:
-                extData
-        elif extType == tlsExtSignatureAlgorithms:
-            extData
-        elif extType == tlsExtQuicTransport:
-            if recordTransportParams:
-                state.peerTransportParams = extData
-                state.peerTransportParamsSet = true
-        elif extType == tlsExtPreSharedKey:
-            if pskServerSelected:
-                if extLen < 2:
-                    return Err[bool]("tls13: psk selected identity missing")
-                let selRes: Result[TlsInt32Next] = tlsReadUint16(extData, 0)
-                if IsErr(selRes):
-                    return Err[bool](ErrorText(selRes))
-                if Value(selRes).value == 0 && state.pskOffered:
-                    state.pskAccepted = true
-            else:
-                var off: int32 = 0
-                let idsLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
-                if IsErr(idsLenRes):
-                    return Err[bool](ErrorText(idsLenRes))
-                let idsLen: int32 = Value(idsLenRes).value
-                off = Value(idsLenRes).next
-                let idsEnd: int32 = off + idsLen
-                if idsLen <= 0 || idsEnd > bytesLen(extData):
-                    return Err[bool]("tls13: psk identities empty")
-                let idLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
-                if IsErr(idLenRes):
-                    return Err[bool](ErrorText(idLenRes))
-                let idLen: int32 = Value(idLenRes).value
-                off = Value(idLenRes).next
-                let idRes: Result[TlsBytesNext] = tlsReadBytes(extData, off, idLen)
-                if IsErr(idRes):
-                    return Err[bool](ErrorText(idRes))
-                let identity: Bytes = Value(idRes).value
-                off = Value(idRes).next
-                let ageRes: Result[TlsInt64Next] = tlsReadUint32(extData, off)
-                if IsErr(ageRes):
-                    return Err[bool](ErrorText(ageRes))
-                let obfuscatedAge: int64 = Value(ageRes).value
-                off = Value(ageRes).next
-                if off < idsEnd:
-                    off = idsEnd
-                let bindersLenRes: Result[TlsInt32Next] = tlsReadUint16(extData, off)
-                if IsErr(bindersLenRes):
-                    return Err[bool](ErrorText(bindersLenRes))
-                let bindersLen: int32 = Value(bindersLenRes).value
-                off = Value(bindersLenRes).next
-                if bindersLen <= 0 || off + bindersLen > bytesLen(extData):
-                    return Err[bool]("tls13: psk binders empty")
-                let binderLenRes: Result[TlsInt32Next] = tlsReadUint8(extData, off)
-                if IsErr(binderLenRes):
-                    return Err[bool](ErrorText(binderLenRes))
-                let binderLen: int32 = Value(binderLenRes).value
-                off = Value(binderLenRes).next
-                let binderRes: Result[TlsBytesNext] = tlsReadBytes(extData, off, binderLen)
-                if IsErr(binderRes):
-                    return Err[bool](ErrorText(binderRes))
-                state.pskIdentity = identity
-                state.pskObfuscatedAge = obfuscatedAge
-                state.pskBinder = Value(binderRes).value
-                state.pskOffered = true
-    if isClientHello && state.peerAlpnList.count <= 0:
-        return Err[bool]("tls13: alpn missing")
-    if isEncryptedExtensions && len(state.negotiatedAlpn) <= 0:
-        return Err[bool]("tls13: alpn missing")
-    return Ok[bool](true)
+        let stepRes: Result[int32] = msquicTls13ParseOneExtension(state, data, offset, ctx)
+        if IsErr(stepRes):
+            return Err[bool](ErrorText(stepRes))
+        offset = Value(stepRes)
+    return msquicTls13FinalizeExtensions(state, ctx)
 
 fn msquicTls13ParseClientHello(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
     var offset: int32 = 0
@@ -1218,7 +1806,7 @@ fn msquicTls13ParseClientHello(state: var MsQuicTls13HandshakeState, data: Bytes
     let extRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, extLen)
     if IsErr(extRes):
         return Err[bool](ErrorText(extRes))
-    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, true, true, false)
+    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, TlsExtensionsClientHello)
     if IsErr(extParseRes):
         return Err[bool](ErrorText(extParseRes))
     return Ok[bool](true)
@@ -1264,7 +1852,7 @@ fn msquicTls13ParseServerHello(state: var MsQuicTls13HandshakeState, data: Bytes
     let extRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, extLen)
     if IsErr(extRes):
         return Err[bool](ErrorText(extRes))
-    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, false, false, true)
+    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, TlsExtensionsServerHello)
     if IsErr(extParseRes):
         return Err[bool](ErrorText(extParseRes))
     return Ok[bool](true)
@@ -1282,7 +1870,7 @@ fn msquicTls13ParseEncryptedExtensions(state: var MsQuicTls13HandshakeState, dat
     offset = Value(extRes).next
     if offset != bytesLen(data):
         return Err[bool]("tls13: encrypted extensions trailing bytes")
-    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, false, true, false)
+    let extParseRes: Result[bool] = msquicTls13ParseExtensions(state, Value(extRes).value, TlsExtensionsEncryptedExtensions)
     if IsErr(extParseRes):
         return Err[bool](ErrorText(extParseRes))
     return Ok[bool](true)
@@ -1307,44 +1895,236 @@ fn msquicTls13ParseOcspStatus(extData: Bytes): Result[Bytes] =
         return Err[Bytes]("tls13: ocsp response trailing bytes")
     return Ok[Bytes](bytesSlice(extData, offset, respLen))
 
+fn msquicTls13CertificateEntryReadHeader(extData: Bytes, offset: int32): Result[TlsExtensionNext] =
+    return msquicTls13ReadNextExtension(extData, offset)
+
+fn msquicTls13CertificateEntryReadOcsp(extData: Bytes): Result[Bytes] =
+    return msquicTls13ParseOcspStatus(extData)
+
+fn msquicTls13PeerVerifyRunRevocation(
+    peerLeaf: X509Certificate,
+    peerChain: X509CertList,
+    trustRoots: X509CertList,
+    peerOcspResponse: Bytes,
+    revocationCrls: Bytes[msQuicTls13MaxRevocationCrls],
+    revocationCrlCount: int32,
+    now: int64,
+    revocationMode: X509RevocationMode
+): Result[bool] =
+    return x509VerifyRevocation(
+        peerLeaf,
+        peerChain,
+        trustRoots,
+        peerOcspResponse,
+        revocationCrls,
+        revocationCrlCount,
+        now,
+        revocationMode
+    )
+
+fn msquicTls13PeerVerifyRunChain(
+    peerLeaf: X509Certificate,
+    peerChain: X509CertList,
+    trustRoots: X509CertList,
+    now: int64
+): Result[bool] =
+    return x509VerifyChain(peerLeaf, peerChain, trustRoots, now)
+
+fn msquicTls13ApplyCertificateEntryExtension(
+    peerOcspResponse: var Bytes,
+    ext: TlsExtensionNext,
+    isLeaf: bool
+): Result[bool] =
+    if ext.extType == tlsExtStatusRequest && isLeaf:
+        let ocspRes: Result[Bytes] = msquicTls13CertificateEntryReadOcsp(ext.extData)
+        if IsErr(ocspRes):
+            return Err[bool](ErrorText(ocspRes))
+        let ocsp: Bytes = Value(ocspRes)
+        msquicTls13PeerVerifySetOcspResponse(peerOcspResponse, ocsp)
+    return Ok[bool](true)
+
 fn msquicTls13ParseCertificateEntryExtensions(
-    state: var MsQuicTls13HandshakeState,
+    peerOcspResponse: var Bytes,
     extData: Bytes,
     isLeaf: bool
 ): Result[bool] =
-    
     var offset: int32 = 0
     while offset + 4 <= bytesLen(extData):
-        let typeRes: Result[TlsInt32Next] = tlsReadUint16(extData, offset)
-        if IsErr(typeRes):
-            return Err[bool](ErrorText(typeRes))
-        let extType: int32 = Value(typeRes).value
-        let lenRes: Result[TlsInt32Next] = tlsReadUint16(extData, Value(typeRes).next)
-        if IsErr(lenRes):
-            return Err[bool](ErrorText(lenRes))
-        let extLen: int32 = Value(lenRes).value
-        let extStart: int32 = Value(lenRes).next
-        let extEnd: int32 = extStart + extLen
-        if extLen < 0 || extEnd > bytesLen(extData):
-            return Err[bool]("tls13: certificate extension truncated")
-        if extType == tlsExtStatusRequest && isLeaf:
-            let ocspRes: Result[Bytes] = msquicTls13ParseOcspStatus(bytesSlice(extData, extStart, extLen))
-            if IsErr(ocspRes):
-                return Err[bool](ErrorText(ocspRes))
-            if bytesLen(Value(ocspRes)) > 0:
-                state.peerOcspResponse = Value(ocspRes)
-        offset = extEnd
+        let extRes: Result[TlsExtensionNext] = msquicTls13CertificateEntryReadHeader(extData, offset)
+        if IsErr(extRes):
+            return Err[bool](ErrorText(extRes))
+        let ext: TlsExtensionNext = Value(extRes)
+        let applyRes: Result[bool] = msquicTls13ApplyCertificateEntryExtension(peerOcspResponse, ext, isLeaf)
+        if IsErr(applyRes):
+            return Err[bool](ErrorText(applyRes))
+        offset = ext.next
     if offset != bytesLen(extData):
         return Err[bool]("tls13: certificate extension trailing bytes")
     return Ok[bool](true)
 
+fn msquicTls13ReadCertificateEntry(data: Bytes, offset: int32): Result[MsQuicTls13CertificateEntryNext] =
+    let certLenRes: Result[TlsInt32Next] = tlsReadUint24(data, offset)
+    if IsErr(certLenRes):
+        return Err[MsQuicTls13CertificateEntryNext](ErrorText(certLenRes))
+    let certLen: int32 = Value(certLenRes).value
+    let certRes: Result[TlsBytesNext] = tlsReadBytes(data, Value(certLenRes).next, certLen)
+    if IsErr(certRes):
+        return Err[MsQuicTls13CertificateEntryNext](ErrorText(certRes))
+    let extLenRes: Result[TlsInt32Next] = tlsReadUint16(data, Value(certRes).next)
+    if IsErr(extLenRes):
+        return Err[MsQuicTls13CertificateEntryNext](ErrorText(extLenRes))
+    let extLen: int32 = Value(extLenRes).value
+    let extRes: Result[TlsBytesNext] = tlsReadBytes(data, Value(extLenRes).next, extLen)
+    if IsErr(extRes):
+        return Err[MsQuicTls13CertificateEntryNext](ErrorText(extRes))
+    var out: MsQuicTls13CertificateEntryNext
+    out.certDer = Value(certRes).value
+    out.extData = Value(extRes).value
+    out.next = Value(extRes).next
+    return Ok[MsQuicTls13CertificateEntryNext](out)
+
+fn msquicTls13PeerVerifyInstallLeaf(
+    state: var MsQuicTls13HandshakeState,
+    certDer: Bytes,
+    extData: Bytes
+): Result[bool] =
+    let extParseRes: Result[bool] = msquicTls13ParseCertificateEntryExtensions(state.peer.peerOcspResponse,
+                                                                               extData,
+                                                                               true)
+    if IsErr(extParseRes):
+        return Err[bool](ErrorText(extParseRes))
+    let parseRes: Result[bool] = x509ParseCertificateInto(state.peer.peerLeaf, certDer)
+    if IsErr(parseRes):
+        return Err[bool](ErrorText(parseRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyAddChainCert(
+    state: var MsQuicTls13HandshakeState,
+    peerChain: var X509CertList,
+    certDer: Bytes,
+    extData: Bytes
+): Result[bool] =
+    let extParseRes: Result[bool] = msquicTls13ParseCertificateEntryExtensions(state.peer.peerOcspResponse,
+                                                                               extData,
+                                                                               false)
+    if IsErr(extParseRes):
+        return Err[bool](ErrorText(extParseRes))
+    let addRes: Result[bool] = x509CertListAddDer(peerChain, certDer)
+    if IsErr(addRes):
+        return Err[bool](ErrorText(addRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyEnsureTrustRoots(
+    state: var MsQuicTls13HandshakeState,
+    trustRoots: var X509CertList
+): Result[bool] =
+    if state.peer.trustRootsCount <= 0 || trustRoots.count > 0:
+        return Ok[bool](true)
+    let rootsBuildRes: Result[bool] = msquicTls13BuildTrustRoots(
+        state.peer.trustRootsCount,
+        state.peer.trustRootDer[0],
+        state.peer.trustRootDer[1],
+        state.peer.trustRootDer[2],
+        state.peer.trustRootDer[3],
+        trustRoots
+    )
+    if IsErr(rootsBuildRes):
+        return Err[bool](ErrorText(rootsBuildRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyValidateChain(
+    state: var MsQuicTls13HandshakeState,
+    peerChain: X509CertList,
+    trustRoots: var X509CertList
+): Result[bool] =
+    if state.peer.trustRootsCount <= 0:
+        return Ok[bool](true)
+    let rootsRes: Result[bool] = msquicTls13PeerVerifyEnsureTrustRoots(state, trustRoots)
+    if IsErr(rootsRes):
+        return Err[bool](ErrorText(rootsRes))
+    let now: int64 = epochTimeSeconds()
+    let verifyRes: Result[bool] = msquicTls13PeerVerifyRunChain(state.peer.peerLeaf, peerChain, trustRoots, now)
+    if IsErr(verifyRes):
+        if state.requireCert:
+            return Err[bool](ErrorText(verifyRes))
+        return Ok[bool](true)
+    msquicTls13PeerVerifySetChainVerified(state.peer, Value(verifyRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyRunHostname(peerLeaf: X509Certificate, serverName: str): bool =
+    return x509VerifyHostname(peerLeaf, serverName)
+
+fn msquicTls13PeerVerifyValidateHostname(state: var MsQuicTls13HandshakeState): Result[bool] =
+    if state.requireCert && state.role == TlsRoleClient && len(state.serverName) > 0:
+        if ! msquicTls13PeerVerifyRunHostname(state.peer.peerLeaf, state.serverName):
+            return Err[bool]("tls13: hostname mismatch")
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyValidateRevocation(
+    state: var MsQuicTls13HandshakeState,
+    peerChain: X509CertList,
+    trustRoots: var X509CertList
+): Result[bool] =
+    if !state.requireCert || state.peer.revocationMode == X509RevocationOff || state.peer.trustRootsCount <= 0:
+        return Ok[bool](true)
+    let rootsRes: Result[bool] = msquicTls13PeerVerifyEnsureTrustRoots(state, trustRoots)
+    if IsErr(rootsRes):
+        return Err[bool](ErrorText(rootsRes))
+    if trustRoots.count <= 0:
+        return Ok[bool](true)
+    let now: int64 = epochTimeSeconds()
+    let revRes: Result[bool] = msquicTls13PeerVerifyRunRevocation(
+        state.peer.peerLeaf,
+        peerChain,
+        trustRoots,
+        state.peer.peerOcspResponse,
+        state.peer.revocationCrls,
+        state.peer.revocationCrlCount,
+        now,
+        state.peer.revocationMode
+    )
+    if IsErr(revRes):
+        return Err[bool](ErrorText(revRes))
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyCommitCertificateVerify(
+    state: var MsQuicTls13HandshakeState,
+    input: TlsSignatureInput
+): Result[bool] =
+    let verifyRes: Result[bool] = msquicTls13PeerVerifyCheckCertificateSignature(
+        state,
+        input.scheme,
+        input.sig
+    )
+    if IsErr(verifyRes):
+        return Err[bool](ErrorText(verifyRes))
+    let ok: bool = Value(verifyRes)
+    msquicTls13PeerVerifySetCertVerifyOk(state.peer, ok)
+    if ! ok:
+        return Err[bool]("tls13: certificate verify failed")
+    return Ok[bool](true)
+
+fn msquicTls13PeerVerifyFinalizeCertificate(
+    state: var MsQuicTls13HandshakeState,
+    peerChain: X509CertList,
+    trustRoots: var X509CertList
+): Result[bool] =
+    let chainRes: Result[bool] = msquicTls13PeerVerifyValidateChain(state, peerChain, trustRoots)
+    if IsErr(chainRes):
+        return Err[bool](ErrorText(chainRes))
+    let hostRes: Result[bool] = msquicTls13PeerVerifyValidateHostname(state)
+    if IsErr(hostRes):
+        return Err[bool](ErrorText(hostRes))
+    let revocationRes: Result[bool] = msquicTls13PeerVerifyValidateRevocation(state, peerChain, trustRoots)
+    if IsErr(revocationRes):
+        return Err[bool](ErrorText(revocationRes))
+    return Ok[bool](true)
+
 fn msquicTls13ParseCertificate(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
+    var peerChain: X509CertList = initX509CertList()
+    var trustRoots: X509CertList = initX509CertList()
+    msquicTls13PeerVerifyResetRuntime(state.peer)
     var offset: int32 = 0
-    echo("msquic_tls13_parse_stage=certificate_begin")
-    state.peerOcspResponse = emptyBytes()
-    state.peerCertVerified = false
-    state.peerLeaf = initX509Certificate()
-    state.peerChain = initX509CertList()
     let ctxLenRes: Result[TlsInt32Next] = tlsReadUint8(data, offset)
     if IsErr(ctxLenRes):
         return Err[bool](ErrorText(ctxLenRes))
@@ -1355,77 +2135,30 @@ fn msquicTls13ParseCertificate(state: var MsQuicTls13HandshakeState, data: Bytes
         return Err[bool](ErrorText(listLenRes))
     let listLen: int32 = Value(listLenRes).value
     offset = Value(listLenRes).next
+    let listEnd: int32 = offset + listLen
     if listLen <= 0 && state.requireCert:
         return Err[bool]("tls13: certificate empty")
-    let listEnd: int32 = offset + listLen
     var hasLeaf: bool = false
     while offset < listEnd:
-        let certLenRes: Result[TlsInt32Next] = tlsReadUint24(data, offset)
-        if IsErr(certLenRes):
-            return Err[bool](ErrorText(certLenRes))
-        let certLen: int32 = Value(certLenRes).value
-        offset = Value(certLenRes).next
-        let certRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, certLen)
-        if IsErr(certRes):
-            return Err[bool](ErrorText(certRes))
-        let certDer: Bytes = Value(certRes).value
-        offset = Value(certRes).next
-        let extLenRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
-        if IsErr(extLenRes):
-            return Err[bool](ErrorText(extLenRes))
-        let extLen: int32 = Value(extLenRes).value
-        offset = Value(extLenRes).next
-        let extRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, extLen)
-        if IsErr(extRes):
-            return Err[bool](ErrorText(extRes))
-        let extData: Bytes = Value(extRes).value
-        offset = Value(extRes).next
+        let entryRes: Result[MsQuicTls13CertificateEntryNext] = msquicTls13ReadCertificateEntry(data, offset)
+        if IsErr(entryRes):
+            return Err[bool](ErrorText(entryRes))
+        let entry: MsQuicTls13CertificateEntryNext = Value(entryRes)
+        offset = entry.next
         if ! hasLeaf:
-            let extParseRes: Result[bool] = msquicTls13ParseCertificateEntryExtensions(state, extData, true)
-            if IsErr(extParseRes):
-                return Err[bool](ErrorText(extParseRes))
-            let parseRes: Result[bool] = x509ParseCertificateInto(state.peerLeaf, certDer)
-            if IsErr(parseRes):
-                return Err[bool](ErrorText(parseRes))
-            echo("msquic_tls13_parse_stage=certificate_leaf_ok")
+            let leafRes: Result[bool] = msquicTls13PeerVerifyInstallLeaf(state, entry.certDer, entry.extData)
+            if IsErr(leafRes):
+                return Err[bool](ErrorText(leafRes))
             hasLeaf = true
         else:
-            let extParseRes: Result[bool] = msquicTls13ParseCertificateEntryExtensions(state, extData, false)
-            if IsErr(extParseRes):
-                return Err[bool](ErrorText(extParseRes))
-            let addRes: Result[bool] = x509CertListAddDer(state.peerChain, certDer)
-            if IsErr(addRes):
-                return Err[bool](ErrorText(addRes))
+            let chainRes: Result[bool] = msquicTls13PeerVerifyAddChainCert(state, peerChain, entry.certDer, entry.extData)
+            if IsErr(chainRes):
+                return Err[bool](ErrorText(chainRes))
     if state.requireCert && ! hasLeaf:
         return Err[bool]("tls13: certificate missing")
-    if state.trustRoots.count > 0:
-        let now: int64 = epochTimeSeconds()
-        let verifyRes: Result[bool] = x509VerifyChain(state.peerLeaf, state.peerChain, state.trustRoots, now)
-        if IsErr(verifyRes):
-            if state.requireCert:
-                return Err[bool](ErrorText(verifyRes))
-        else:
-            state.peerCertVerified = Value(verifyRes)
-            echo("msquic_tls13_parse_stage=certificate_chain_ok")
-    if state.requireCert && state.role == TlsRoleClient && len(state.serverName) > 0:
-        if ! x509VerifyHostname(state.peerLeaf, state.serverName):
-            return Err[bool]("tls13: hostname mismatch")
-    if state.requireCert && state.revocationMode != X509RevocationOff && state.trustRoots.count > 0:
-        let now: int64 = epochTimeSeconds()
-        let revRes: Result[bool] = x509VerifyRevocation(
-                state.peerLeaf,
-                state.peerChain,
-                state.trustRoots,
-                state.peerOcspResponse,
-                state.revocationCrls,
-                state.revocationCrlCount,
-                now,
-                state.revocationMode
-            )
-        if IsErr(revRes):
-            return Err[bool](ErrorText(revRes))
-        echo("msquic_tls13_parse_stage=certificate_revocation_ok")
-    echo("msquic_tls13_parse_stage=certificate_ok")
+    let finalizeRes: Result[bool] = msquicTls13PeerVerifyFinalizeCertificate(state, peerChain, trustRoots)
+    if IsErr(finalizeRes):
+        return Err[bool](ErrorText(finalizeRes))
     return Ok[bool](true)
 
 fn msquicTls13CertVerifyMessage(transcriptHash: Bytes, forServer: bool): Bytes =
@@ -1437,66 +2170,96 @@ fn msquicTls13CertVerifyMessage(transcriptHash: Bytes, forServer: bool): Bytes =
     bytesSet(zero, 0, 0x00)
     return bytesConcat3(bytesConcat3(prefix, bytesFromString(context), zero), transcriptHash, emptyBytes())
 
+fn msquicTls13VerifyCertificateSignatureRsaPssSha256(
+    state: var MsQuicTls13HandshakeState,
+    hashKind: X509HashKind,
+    msg: Bytes,
+    sig: Bytes
+): Result[bool] =
+    if hashKind != X509HashSha256:
+        return Err[bool]("tls13: sig hash mismatch")
+    if state.peer.peerLeaf.publicKey.kind != X509KeyRsa:
+        return Err[bool]("tls13: rsa cert required")
+    return rsaVerifyPssBytes(state.peer.peerLeaf.publicKey.rsaN, state.peer.peerLeaf.publicKey.rsaE, msg, sig, false)
+
+fn msquicTls13VerifyCertificateSignatureRsaPssSha384(
+    state: var MsQuicTls13HandshakeState,
+    hashKind: X509HashKind,
+    msg: Bytes,
+    sig: Bytes
+): Result[bool] =
+    if hashKind != X509HashSha384:
+        return Err[bool]("tls13: sig hash mismatch")
+    if state.peer.peerLeaf.publicKey.kind != X509KeyRsa:
+        return Err[bool]("tls13: rsa cert required")
+    return rsaVerifyPssBytes(state.peer.peerLeaf.publicKey.rsaN, state.peer.peerLeaf.publicKey.rsaE, msg, sig, true)
+
+fn msquicTls13VerifyCertificateSignatureEcdsaP256Sha256(
+    state: var MsQuicTls13HandshakeState,
+    hashKind: X509HashKind,
+    msg: Bytes,
+    sig: Bytes
+): Result[bool] =
+    if hashKind != X509HashSha256:
+        return Err[bool]("tls13: sig hash mismatch")
+    if state.peer.peerLeaf.publicKey.kind != X509KeyEcdsaP256:
+        return Err[bool]("tls13: ecdsa cert required")
+    let sigObjRes: Result[EcSignature] = ecdsaSignatureFromBytes(sig)
+    if IsErr(sigObjRes):
+        return Err[bool](ErrorText(sigObjRes))
+    return ecdsaVerifyTrustedPublicKeyBytes(state.peer.peerLeaf.publicKey.ecdsaBytes, msg, Value(sigObjRes))
+
+fn msquicTls13VerifyCertificateSignature(
+    state: var MsQuicTls13HandshakeState,
+    scheme: int32,
+    hashKind: X509HashKind,
+    msg: Bytes,
+    sig: Bytes
+): Result[bool] =
+    var verifyRes: Result[bool] = Err[bool]("tls13: unsupported signature scheme")
+    if scheme == tlsSigRsaPssRsaeSha256:
+        verifyRes = msquicTls13VerifyCertificateSignatureRsaPssSha256(state, hashKind, msg, sig)
+    if scheme == tlsSigRsaPssRsaeSha384:
+        verifyRes = msquicTls13VerifyCertificateSignatureRsaPssSha384(state, hashKind, msg, sig)
+    if scheme == tlsSigEcdsaSecp256r1Sha256:
+        verifyRes = msquicTls13VerifyCertificateSignatureEcdsaP256Sha256(state, hashKind, msg, sig)
+    return verifyRes
+
 fn msquicTls13ParseCertificateVerify(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
-    var offset: int32 = 0
-    echo("msquic_tls13_parse_stage=certificate_verify_begin")
-    let schemeRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
+    let inputRes: Result[TlsSignatureInput] = msquicTls13ReadCertificateVerify(data)
+    if IsErr(inputRes):
+        return Err[bool](ErrorText(inputRes))
+    let commitRes: Result[bool] = msquicTls13PeerVerifyCommitCertificateVerify(state, Value(inputRes))
+    if IsErr(commitRes):
+        return Err[bool](ErrorText(commitRes))
+    return Ok[bool](true)
+
+fn msquicTls13ReadCertificateVerify(data: Bytes): Result[TlsSignatureInput] =
+    let schemeRes: Result[TlsInt32Next] = tlsReadUint16(data, 0)
     if IsErr(schemeRes):
-        return Err[bool](ErrorText(schemeRes))
+        return Err[TlsSignatureInput](ErrorText(schemeRes))
     let scheme: int32 = Value(schemeRes).value
-    offset = Value(schemeRes).next
-    let sigLenRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
+    let sigLenRes: Result[TlsInt32Next] = tlsReadUint16(data, Value(schemeRes).next)
     if IsErr(sigLenRes):
-        return Err[bool](ErrorText(sigLenRes))
+        return Err[TlsSignatureInput](ErrorText(sigLenRes))
     let sigLen: int32 = Value(sigLenRes).value
-    offset = Value(sigLenRes).next
-    let sigRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, sigLen)
+    let sigRes: Result[TlsBytesNext] = tlsReadBytes(data, Value(sigLenRes).next, sigLen)
     if IsErr(sigRes):
-        return Err[bool](ErrorText(sigRes))
+        return Err[TlsSignatureInput](ErrorText(sigRes))
+    var out: TlsSignatureInput
+    out.scheme = scheme
+    out.sig = Value(sigRes).value
+    return Ok[TlsSignatureInput](out)
+
+fn msquicTls13PeerVerifyCheckCertificateSignature(
+    state: var MsQuicTls13HandshakeState,
+    scheme: int32,
+    sig: Bytes
+): Result[bool] =
     let hashKind: X509HashKind = msquicTls13CipherHashKind(state.cipher)
     let transcriptHash: Bytes = msquicTls13TranscriptHash(state, hashKind)
     let msg: Bytes = msquicTls13CertVerifyMessage(transcriptHash, state.role == TlsRoleClient)
-    var ok: bool = false
-    if scheme == tlsSigRsaPssRsaeSha256:
-        if hashKind != X509HashSha256:
-            return Err[bool]("tls13: sig hash mismatch")
-        if state.peerLeaf.publicKey.kind != X509KeyRsa:
-            return Err[bool]("tls13: rsa cert required")
-        var pub: RsaBigPublicKey = RsaBigPublicKey(
-            n: state.peerLeaf.publicKey.rsa.n,
-            e: state.peerLeaf.publicKey.rsa.e,
-            modBits: state.peerLeaf.publicKey.rsa.modBits,
-            modLen: state.peerLeaf.publicKey.rsa.modLen
-        )
-        ok = rsaVerifyPss(pub, msg, Value(sigRes).value, false)
-    elif scheme == tlsSigRsaPssRsaeSha384:
-        if hashKind != X509HashSha384:
-            return Err[bool]("tls13: sig hash mismatch")
-        if state.peerLeaf.publicKey.kind != X509KeyRsa:
-            return Err[bool]("tls13: rsa cert required")
-        var pub: RsaBigPublicKey = RsaBigPublicKey(
-            n: state.peerLeaf.publicKey.rsa.n,
-            e: state.peerLeaf.publicKey.rsa.e,
-            modBits: state.peerLeaf.publicKey.rsa.modBits,
-            modLen: state.peerLeaf.publicKey.rsa.modLen
-        )
-        ok = rsaVerifyPss(pub, msg, Value(sigRes).value, true)
-    elif scheme == tlsSigEcdsaSecp256r1Sha256:
-        if hashKind != X509HashSha256:
-            return Err[bool]("tls13: sig hash mismatch")
-        if state.peerLeaf.publicKey.kind != X509KeyEcdsaP256:
-            return Err[bool]("tls13: ecdsa cert required")
-        let sigObjRes: Result[EcSignature] = ecdsaSignatureFromBytes(Value(sigRes).value)
-        if IsErr(sigObjRes):
-            return Err[bool](ErrorText(sigObjRes))
-        ok = ecdsaVerifyTrustedPublicKey(state.peerLeaf.publicKey.ecdsa, msg, Value(sigObjRes))
-    else:
-        return Err[bool]("tls13: unsupported signature scheme")
-    state.certVerifyOk = ok
-    if ! ok:
-        return Err[bool]("tls13: certificate verify failed")
-    echo("msquic_tls13_parse_stage=certificate_verify_ok")
-    return Ok[bool](true)
+    return msquicTls13VerifyCertificateSignature(state, scheme, hashKind, msg, sig)
 
 fn msquicTls13ParseFinished(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
     let verifyRes: Result[Bytes] = msquicTls13FinishedData(state, state.role == TlsRoleClient)
@@ -1504,7 +2267,7 @@ fn msquicTls13ParseFinished(state: var MsQuicTls13HandshakeState, data: Bytes): 
         return Err[bool](ErrorText(verifyRes))
     if ! bytesEqual(Value(verifyRes), data):
         return Err[bool]("tls13: finished verify mismatch")
-    state.finishedOk = true
+    msquicTls13PeerVerifySetFinishedOk(state.peer, true)
     return Ok[bool](true)
 
 fn msquicTls13ParseNewSessionTicket(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
@@ -1568,11 +2331,11 @@ fn msquicTls13ParseNewSessionTicket(state: var MsQuicTls13HandshakeState, data: 
     return Ok[bool](true)
 
 fn msquicTls13HandshakeAppendTranscript(state: var MsQuicTls13HandshakeState, raw: Bytes) =
-    if bytesLen(state.transcript.data) + bytesLen(raw) > msQuicTls13MaxTranscriptBytes:
-        crash("tls13: transcript overflow")
-    var transcript: ByteBuffer = state.transcript
+    if bytesLen(state.wire.transcript.data) + bytesLen(raw) > msQuicTls13MaxTranscriptBytes:
+        panic("tls13: transcript overflow")
+    var transcript: ByteBuffer = state.wire.transcript
     appendBytes(transcript, raw)
-    state.transcript = transcript
+    state.wire.transcript = transcript
 
 fn msquicTls13HandshakeKindText(kind: int32): str =
     if kind == tlsHandshakeClientHello:
@@ -1602,7 +2365,7 @@ fn msquicTls13HandshakeHandleMessage(
         let res: Result[bool] = msquicTls13ParseClientHello(state, body)
         if IsErr(res):
             return Err[bool]("tls13 " + msquicTls13HandshakeKindText(kind) + ": " + ErrorText(res))
-        state.clientHelloRaw = raw
+        state.wire.clientHelloRaw = raw
         msquicTls13HandshakeAppendTranscript(state, raw)
         return Ok[bool](true)
     if kind == tlsHandshakeServerHello:
@@ -1627,9 +2390,9 @@ fn msquicTls13HandshakeHandleMessage(
         msquicTls13HandshakeAppendTranscript(state, raw)
         return Ok[bool](true)
     if kind == tlsHandshakeCertificateVerify:
-        if state.requireCert && state.peerLeaf.publicKey.kind == X509KeyUnknown:
+        if state.requireCert && state.peer.peerLeaf.publicKey.kind == X509KeyUnknown:
             return Err[bool]("tls13: certificate missing")
-        if state.requireCert && state.trustRoots.count > 0 && ! state.peerCertVerified:
+        if state.requireCert && state.peer.trustRootsCount > 0 && ! state.peer.peerCertVerified:
             return Err[bool]("tls13: certificate chain unverified")
         let res: Result[bool] = msquicTls13ParseCertificateVerify(state, body)
         if IsErr(res):
@@ -1637,7 +2400,7 @@ fn msquicTls13HandshakeHandleMessage(
         msquicTls13HandshakeAppendTranscript(state, raw)
         return Ok[bool](true)
     if kind == tlsHandshakeFinished:
-        if state.requireCert && ! state.certVerifyOk:
+        if state.requireCert && ! state.peer.certVerifyOk:
             return Err[bool]("tls13: certificate verify missing")
         let res: Result[bool] = msquicTls13ParseFinished(state, body)
         if IsErr(res):
@@ -1657,35 +2420,35 @@ fn msquicTls13HandshakeHandleMessage(
 
 fn msquicTls13HandshakeFeed(state: var MsQuicTls13HandshakeState, data: Bytes): Result[int32] =
     if bytesLen(data) > 0:
-        if bytesLen(state.buffer.data) + bytesLen(data) > msQuicTls13MaxBufferedHandshakeBytes:
+        if bytesLen(state.wire.buffer.data) + bytesLen(data) > msQuicTls13MaxBufferedHandshakeBytes:
             return Err[int32]("tls13: handshake buffer overflow")
-        var buffer: ByteBuffer = state.buffer
+        var buffer: ByteBuffer = state.wire.buffer
         appendBytes(buffer, data)
-        state.buffer = buffer
+        state.wire.buffer = buffer
     var count: int32 = 0
-    while bytesLen(state.buffer.data) >= 4:
-        let kind: int32 = bytesGet(state.buffer.data, 0)
-        let lenRes: Result[TlsInt32Next] = tlsReadUint24(state.buffer.data, 1)
+    while bytesLen(state.wire.buffer.data) >= 4:
+        let kind: int32 = bytesGet(state.wire.buffer.data, 0)
+        let lenRes: Result[TlsInt32Next] = tlsReadUint24(state.wire.buffer.data, 1)
         if IsErr(lenRes):
             return Err[int32](ErrorText(lenRes))
         let bodyLen: int32 = Value(lenRes).value
         let totalLen: int32 = 4 + bodyLen
-        if bytesLen(state.buffer.data) < totalLen:
+        if bytesLen(state.wire.buffer.data) < totalLen:
             break
-        let raw: Bytes = bytesSlice(state.buffer.data, 0, totalLen)
-        let body: Bytes = bytesSlice(state.buffer.data, 4, bodyLen)
-        let remaining: int32 = bytesLen(state.buffer.data) - totalLen
+        let raw: Bytes = bytesSlice(state.wire.buffer.data, 0, totalLen)
+        let body: Bytes = bytesSlice(state.wire.buffer.data, 4, bodyLen)
+        let remaining: int32 = bytesLen(state.wire.buffer.data) - totalLen
         if remaining > 0:
-            state.buffer.data = bytesSlice(state.buffer.data, totalLen, remaining)
+            state.wire.buffer.data = bytesSlice(state.wire.buffer.data, totalLen, remaining)
         else:
-            state.buffer.data = emptyBytes()
+            state.wire.buffer.data = emptyBytes()
         let msg: MsQuicTls13HandshakeMessage = MsQuicTls13HandshakeMessage(kind: kind, body: body, raw: raw)
-        let addRes: Result[bool] = msquicTls13HandshakeMessagesAdd(state.messages, msg)
+        let addRes: Result[bool] = msquicTls13HandshakeMessagesAdd(state.wire.messages, msg)
         if IsErr(addRes):
             return Err[int32](ErrorText(addRes))
         let handleRes: Result[bool] = msquicTls13HandshakeHandleMessage(state, kind, body, raw)
         if IsErr(handleRes):
-            state.lastError = ErrorText(handleRes)
-            return Err[int32](state.lastError)
+            state.wire.lastError = ErrorText(handleRes)
+            return Err[int32](state.wire.lastError)
         count = count + 1
     return Ok[int32](count)

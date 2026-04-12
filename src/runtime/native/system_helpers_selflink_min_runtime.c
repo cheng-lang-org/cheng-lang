@@ -5,8 +5,12 @@
 #include <string.h>
 #include <stdio.h>
 #include <limits.h>
+#include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/syscall.h>
@@ -33,8 +37,10 @@
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CHENG_MINRT_WEAK __attribute__((weak))
+#define CHENG_MINRT_MAYBE_UNUSED __attribute__((unused))
 #else
 #define CHENG_MINRT_WEAK
+#define CHENG_MINRT_MAYBE_UNUSED
 #endif
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -581,10 +587,17 @@ char *driver_c_new_string(int32_t n);
 char *driver_c_new_string_copy_n(void *raw, int32_t n);
 
 char *cheng_str_to_cstring_temp_bridge(ChengStrBridge s) {
-  char *compat = cheng_str_param_to_cstring_compat((void *)s.ptr);
+  char *compat = NULL;
+  if (cheng_probably_valid_str_bridge(&s)) {
+    if (s.len <= 0 || s.ptr == NULL) return driver_c_new_string(0);
+    if ((s.flags & CHENG_STR_BRIDGE_FLAG_OWNED) != 0) return (char *)s.ptr;
+    compat = driver_c_new_string_copy_n((void *)s.ptr, s.len);
+    if (compat != NULL) return compat;
+    return driver_c_new_string(0);
+  }
+  compat = cheng_str_param_to_cstring_compat((void *)s.ptr);
   if (compat != NULL) return compat;
   if (s.len <= 0 || s.ptr == NULL) return driver_c_new_string(0);
-  if (s.flags != 0) return (char *)s.ptr;
   compat = driver_c_new_string_copy_n((void *)s.ptr, s.len);
   if (compat != NULL) return compat;
   return driver_c_new_string(0);
@@ -678,6 +691,68 @@ int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
     *outFamily = AF_INET;
     return 0;
   }
+}
+
+int32_t cheng_v3_udp_bind_fd_bridge(ChengStrBridge host, int32_t port, int32_t isV6) {
+  int32_t fd = -1;
+  int32_t boundPort = 0;
+  int32_t family = 0;
+  int32_t useLenField = 0;
+  int32_t rc = cheng_v3_udp_bind_host_port_bridge(host, port, isV6, &fd, &boundPort, &family, &useLenField);
+  if (rc != 0) return -rc;
+  return fd;
+}
+
+int32_t cheng_v3_udp_bound_port_bridge(int32_t fd, int32_t isV6) {
+  if (fd < 0) return -EINVAL;
+  if (isV6 != 0) {
+    struct sockaddr_in6 addr6;
+    socklen_t len = (socklen_t)sizeof(addr6);
+    memset(&addr6, 0, sizeof(addr6));
+    if (getsockname(fd, (struct sockaddr *)&addr6, &len) != 0) return -errno;
+    return (int32_t)ntohs(addr6.sin6_port);
+  }
+  {
+    struct sockaddr_in addr4;
+    socklen_t len = (socklen_t)sizeof(addr4);
+    memset(&addr4, 0, sizeof(addr4));
+    if (getsockname(fd, (struct sockaddr *)&addr4, &len) != 0) return -errno;
+    return (int32_t)ntohs(addr4.sin_port);
+  }
+}
+
+int32_t cheng_v3_udp_recvfrom_addr_bridge(int32_t fd,
+                                          void *buf,
+                                          int32_t len,
+                                          int32_t flags,
+                                          void *addr,
+                                          int32_t addrCap,
+                                          int32_t *outAddrLen,
+                                          int32_t *outErr) {
+  socklen_t raw_len = 0;
+  int32_t rc = 0;
+  errno = 0;
+  if (outAddrLen == NULL || outErr == NULL) return -1;
+  *outAddrLen = 0;
+  *outErr = 0;
+  if (fd < 0 || buf == NULL || len <= 0 || addr == NULL || addrCap <= 0) return -1;
+  raw_len = (socklen_t)addrCap;
+  rc = (int32_t)recvfrom(fd, buf, (size_t)len, flags, (struct sockaddr *)addr, &raw_len);
+  if (rc < 0) {
+    *outErr = errno;
+    *outAddrLen = 0;
+    return rc;
+  }
+  *outAddrLen = (int32_t)raw_len;
+  return rc;
+}
+
+int32_t cheng_v3_udp_platform_use_len_field_bridge(void) {
+#if defined(__APPLE__)
+  return 1;
+#else
+  return 0;
+#endif
 }
 
 static int32_t cheng_v3_hex_value_ascii(char c) {
@@ -812,6 +887,10 @@ typedef void (*cheng_global_init_fn)(void);
 static int32_t driver_c_self_global_init_state = 0;
 
 #if defined(__APPLE__)
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
 static void *driver_c_lookup_symbol_macho_self(const char *symbol) {
   char symbol_buf[256];
   NSSymbol ns_symbol = NULL;
@@ -835,6 +914,9 @@ static void *driver_c_lookup_symbol_macho_self(const char *symbol) {
   }
   return NULL;
 }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 #endif
 
 static void *driver_c_lookup_runtime_symbol(const char *symbol, const char *diag_tag) {
@@ -1523,7 +1605,7 @@ static bool cheng_str_bridge_view(ChengStrBridge bridge, const char **out_ptr, s
   return true;
 }
 
-static int driver_c_arg_is_help(const char *arg) {
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_arg_is_help(const char *arg) {
   if (arg == NULL) return 0;
   return strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0;
 }
@@ -2770,11 +2852,11 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_system(const char *output_path, c
 
 typedef int32_t (*cheng_driver_bool_dummy_fn)(int32_t);
 
-static int driver_c_runtime_path_contains(const char *path, const char *needle) {
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_path_contains(const char *path, const char *needle) {
   return path != NULL && needle != NULL && strstr(path, needle) != NULL;
 }
 
-static int driver_c_runtime_resolve_self_path(char *out, size_t out_cap) {
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_self_path(char *out, size_t out_cap) {
   char raw[PATH_MAX];
   char *resolved = NULL;
   if (out == NULL || out_cap == 0) return 0;

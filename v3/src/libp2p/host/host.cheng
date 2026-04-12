@@ -4,6 +4,7 @@ import cheng/v3/std/bytes_layout as layout
 import cheng/v3/overlay/contracts as overlay
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/core/multiaddr
 import cheng/v3/libp2p/core/peerstore as ps
 import cheng/v3/libp2p/discovery/kad
 import cheng/v3/libp2p/protocols/gossipsub as gossip
@@ -68,7 +69,7 @@ fn v3Libp2pListen(host: var V3Libp2pHost,
                   addr: types.V3Libp2pMultiaddr): Result[bool] =
     if addr.transport == types.v3Libp2pTransportNone:
         return Err[bool]("v3 libp2p host: invalid listen transport")
-    add(host.listenAddrs, addr)
+    add(host.listenAddrs, multiaddr.v3Libp2pMultiaddrClone(addr))
     return Ok[bool](true)
 
 fn v3Libp2pRegisterHandler(host: var V3Libp2pHost,
@@ -92,7 +93,7 @@ fn v3Libp2pDial(host: var V3Libp2pHost,
     var trustPermille = 800
     var record: ps.V3Libp2pPeerRecord
     record.peerId = peerId
-    record.addr = addr
+    record.addr = multiaddr.v3Libp2pMultiaddrClone(addr)
     record.routingRole = routingRole
     record.connected = true
     record.rttEwmaMicros = 1000
@@ -166,32 +167,37 @@ fn v3Libp2pSyncDigest(host: V3Libp2pHost,
 fn v3Libp2pSyncRequest(host: var V3Libp2pHost,
                        remoteHost: var V3Libp2pHost,
                        remotePeerId: types.V3Libp2pPeerId,
-                       query: overlay.V3StoreQuery): Result[overlay.V3IngressEnvelope[]] =
+                       query: overlay.V3StoreQuery,
+                       out: var overlay.V3IngressEnvelope[]): Result[bool] =
     if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: sync peer mismatch")
+        return Err[bool]("v3 libp2p host: sync peer mismatch")
     if !v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolSync):
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: remote sync handler missing")
+        return Err[bool]("v3 libp2p host: remote sync handler missing")
     let streamRes = v3Libp2pOpenStream(host, remotePeerId, types.v3Libp2pProtocolSync)
     if IsErr(streamRes):
-        return Err[overlay.V3IngressEnvelope[]](Error(streamRes))
+        return Err[bool](Error(streamRes))
     host.syncRequestCount = host.syncRequestCount + 1
     let requestPayload = store_sync.v3Libp2pStoreQueryEncode(query)
     let peers = host.peers
     let pos = ps.v3Libp2pPeerstorePos(peers, remotePeerId)
     if pos < 0:
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: peer missing")
-    let remoteAddr = peers.peers[pos].addr
+        return Err[bool]("v3 libp2p host: peer missing")
+    let remoteAddr = multiaddr.v3Libp2pMultiaddrClone(peers.peers[pos].addr)
     if remoteAddr.transport == types.v3Libp2pTransportQuic:
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p host: quic sync requires host_quic")
+        return Err[bool]("v3 libp2p host: quic sync requires host_quic")
     let servePayloadRes = v3Libp2pSyncServePayload(remoteHost, requestPayload)
     if IsErr(servePayloadRes):
-        return Err[overlay.V3IngressEnvelope[]](Error(servePayloadRes))
+        return Err[bool](Error(servePayloadRes))
     let responsePayloadRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponse(types.v3Libp2pProtocolSync,
                                                                               requestPayload,
                                                                               Value(servePayloadRes))
     if IsErr(responsePayloadRes):
-        return Err[overlay.V3IngressEnvelope[]](Error(responsePayloadRes))
-    return store_sync.v3Libp2pStoreEntriesDecode(Value(responsePayloadRes))
+        return Err[bool](Error(responsePayloadRes))
+    out = []
+    let decodeRes = store_sync.v3Libp2pStoreEntriesDecodeFill(Value(responsePayloadRes), out)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    return Ok[bool](true)
 
 fn v3Libp2pSyncServePayload(host: var V3Libp2pHost,
                             requestPayload: Bytes): Result[Bytes] =

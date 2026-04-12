@@ -60,40 +60,41 @@ fn tcpSocketOpenStream(isV6: bool): Result[int32] =
         tcpErrText(errBsd) + " (" + intToStr(errBsd) + ")"
     )
 
-fn tcpSockAddrFromHostPort(host: str, port: int32, isV6: bool = false): Result[TcpSockAddr] =
-    return udp.udpSockAddrFromHostPort(host, port, isV6, 0, false)
+fn tcpSockAddrFromHostPort(host: str, port: int32, out: var TcpSockAddr, isV6: bool = false): Result[bool] =
+    return udp.udpSockAddrFromHostPort(host, port, isV6, 0, false, out)
 
-fn tcpSockAddrDecode(raw: Bytes, rawLen: int32): Result[TcpSockAddr] =
-    return udp.udpSockAddrDecode(raw, rawLen)
+fn tcpSockAddrDecode(raw: Bytes, rawLen: int32, out: var TcpSockAddr): Result[bool] =
+    return udp.udpSockAddrDecode(raw, rawLen, out)
 
 fn tcpSockAddrCanonical(addr: TcpSockAddr): str =
     if addr.isV6:
         return "tcp://[" + addr.host + "]:" + intToStr(addr.port)
     return "tcp://" + addr.host + ":" + intToStr(addr.port)
 
-fn tcpGetSockName(fd: int32): Result[TcpSockAddr] =
+fn tcpGetSockName(fd: int32, out: var TcpSockAddr): Result[bool] =
     if fd < 0:
-        return Err[TcpSockAddr]("tcp syscall: invalid socket")
+        return Err[bool]("tcp syscall: invalid socket")
     let rawAddr: Bytes = bytesAlloc(128)
     var rawLen: int32 = bytesLen(rawAddr)
     let rc: int32 = sys.getsockname(fd, rawAddr.data, &rawLen)
     if rc != 0 || rawLen <= 0:
         let errCode: int32 = tcpErrno()
-        return Err[TcpSockAddr]("tcp syscall: getsockname failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+        return Err[bool]("tcp syscall: getsockname failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
     if rawLen > bytesLen(rawAddr):
         rawLen = bytesLen(rawAddr)
-    return tcpSockAddrDecode(rawAddr, rawLen)
+    return tcpSockAddrDecode(rawAddr, rawLen, out)
 
 fn tcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHandle] =
     let openRes: Result[int32] = tcpSocketOpenStream(isV6)
     if IsErr(openRes):
         return Err[TcpListenerHandle](Error(openRes))
     let fd: int32 = Value(openRes)
-    let addrRes: Result[TcpSockAddr] = tcpSockAddrFromHostPort(host, port, isV6)
+    var addr: TcpSockAddr
+    let addrRes: Result[bool] = tcpSockAddrFromHostPort(host, port, addr, isV6)
     if IsErr(addrRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpListenerHandle](Error(addrRes))
-    let bindRes: int32 = sys.bind(fd, Value(addrRes).data, Value(addrRes).len)
+    let bindRes: int32 = sys.bind(fd, addr.data, addr.len)
     if bindRes != 0:
         let errCode: int32 = tcpErrno()
         let _ = os.udpCloseFd(fd)
@@ -103,11 +104,12 @@ fn tcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHand
         let errCode: int32 = tcpErrno()
         let _ = os.udpCloseFd(fd)
         return Err[TcpListenerHandle]("tcp syscall: listen failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
-    let localRes: Result[TcpSockAddr] = tcpGetSockName(fd)
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
     if IsErr(localRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpListenerHandle](Error(localRes))
-    return Ok[TcpListenerHandle](TcpListenerHandle(fd: fd, addr: Value(localRes)))
+    return Ok[TcpListenerHandle](TcpListenerHandle(fd: fd, addr: localAddr))
 
 fn tcpListenerClose(listener: var TcpListenerHandle) =
     if listener.fd >= 0:
@@ -125,19 +127,21 @@ fn tcpAccept(listener: TcpListenerHandle): Result[TcpConnectionHandle] =
         return Err[TcpConnectionHandle]("tcp syscall: accept failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
     if rawLen > bytesLen(rawAddr):
         rawLen = bytesLen(rawAddr)
-    let remoteRes: Result[TcpSockAddr] = tcpSockAddrDecode(rawAddr, rawLen)
+    var remoteAddr: TcpSockAddr
+    let remoteRes: Result[bool] = tcpSockAddrDecode(rawAddr, rawLen, remoteAddr)
     if IsErr(remoteRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpConnectionHandle](Error(remoteRes))
-    let localRes: Result[TcpSockAddr] = tcpGetSockName(fd)
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
     if IsErr(localRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpConnectionHandle](Error(localRes))
     return Ok[TcpConnectionHandle](
         TcpConnectionHandle(
             fd: fd,
-            localAddr: Value(localRes),
-            remoteAddr: Value(remoteRes),
+            localAddr: localAddr,
+            remoteAddr: remoteAddr,
             open: true
         )
     )
@@ -147,24 +151,26 @@ fn tcpConnect(host: str, port: int32, isV6: bool = false): Result[TcpConnectionH
     if IsErr(openRes):
         return Err[TcpConnectionHandle](Error(openRes))
     let fd: int32 = Value(openRes)
-    let remoteRes: Result[TcpSockAddr] = tcpSockAddrFromHostPort(host, port, isV6)
+    var remoteAddr: TcpSockAddr
+    let remoteRes: Result[bool] = tcpSockAddrFromHostPort(host, port, remoteAddr, isV6)
     if IsErr(remoteRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpConnectionHandle](Error(remoteRes))
-    let connectRes: int32 = sys.connect(fd, Value(remoteRes).data, Value(remoteRes).len)
+    let connectRes: int32 = sys.connect(fd, remoteAddr.data, remoteAddr.len)
     if connectRes != 0:
         let errCode: int32 = tcpErrno()
         let _ = os.udpCloseFd(fd)
         return Err[TcpConnectionHandle]("tcp syscall: connect failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
-    let localRes: Result[TcpSockAddr] = tcpGetSockName(fd)
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
     if IsErr(localRes):
         let _ = os.udpCloseFd(fd)
         return Err[TcpConnectionHandle](Error(localRes))
     return Ok[TcpConnectionHandle](
         TcpConnectionHandle(
             fd: fd,
-            localAddr: Value(localRes),
-            remoteAddr: Value(remoteRes),
+            localAddr: localAddr,
+            remoteAddr: remoteAddr,
             open: true
         )
     )

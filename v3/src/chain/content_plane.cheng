@@ -1,0 +1,528 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/codec_binary as codec
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/pubsub
+import cheng/v3/chain/dag_mempool as dag
+import cheng/v3/chain/plumtree
+import cheng/v3/chain/erasure_swarm as swarm
+
+const
+    v3ContentStubMagic: str = "v3.content.stub"
+
+type
+    V3ContentStub =
+        version: int32
+        topicCid: layout.FixedBytes32
+        bundleCid: layout.FixedBytes32
+        blobSummaryCid: layout.FixedBytes32
+        advertCid: layout.FixedBytes32
+        manifestCid: layout.FixedBytes32
+        recoveryPlanCid: layout.FixedBytes32
+        payloadLen: int32
+        stubCid: layout.FixedBytes32
+
+    V3ContentPublishArtifacts =
+        version: int32
+        topic: pubsub.V3PubSubTopic
+        root: pubsub.V3PubSubSubscription
+        subscriptionCount: int32
+        subscriptions: pubsub.V3PubSubSubscription[]
+        blobSummary: dag.V3DagBlobSummary
+        availabilityProofCount: int32
+        availabilityProofs: dag.V3DagAvailabilityProof[]
+        availabilityCert: dag.V3DagAvailabilityCert
+        publishAdvert: dag.V3DagPublishAdvert
+        envelope: pubsub.V3PubSubEnvelope
+        pubsubPlan: pubsub.V3PubSubPlan
+        plumtreePlan: plumtree.V3PlumtreePlan
+        erasureParams: swarm.V3ErasureEncodingParams
+        erasureManifest: swarm.V3ErasureShardManifest
+        peerAdvertCount: int32
+        peerAdverts: swarm.V3ErasurePeerAdvert[]
+        recoveryPlan: swarm.V3ErasureRecoveryPlan
+        bundleCid: layout.FixedBytes32
+
+fn v3ContentStubZero(): V3ContentStub =
+    return V3ContentStub(
+        version: 1,
+        topicCid: layout.fixedBytes32Zero(),
+        bundleCid: layout.fixedBytes32Zero(),
+        blobSummaryCid: layout.fixedBytes32Zero(),
+        advertCid: layout.fixedBytes32Zero(),
+        manifestCid: layout.fixedBytes32Zero(),
+        recoveryPlanCid: layout.fixedBytes32Zero(),
+        payloadLen: 0,
+        stubCid: layout.fixedBytes32Zero()
+    )
+
+fn v3ContentPublishArtifactsZero(): V3ContentPublishArtifacts =
+    var out: V3ContentPublishArtifacts
+    out.version = 1
+    out.topic = pubsub.v3PubSubTopicZero()
+    out.root = pubsub.v3PubSubSubscriptionZero()
+    out.subscriptionCount = 0
+    out.subscriptions = []
+    out.blobSummary = dag.v3DagBlobSummaryZero()
+    out.availabilityProofCount = 0
+    out.availabilityProofs = []
+    out.availabilityCert = dag.v3DagAvailabilityCertZero()
+    out.publishAdvert = dag.v3DagPublishAdvertZero()
+    out.envelope = pubsub.v3PubSubEnvelopeZero()
+    out.pubsubPlan = pubsub.v3PubSubPlanZero()
+    out.plumtreePlan = plumtree.v3PlumtreePlanZero()
+    out.erasureParams = swarm.v3ErasureEncodingParamsZero()
+    out.erasureManifest = swarm.v3ErasureShardManifestZero()
+    out.peerAdvertCount = 0
+    out.peerAdverts = []
+    out.recoveryPlan = swarm.v3ErasureRecoveryPlanZero()
+    out.bundleCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3ContentCidSet(value: layout.FixedBytes32): bool =
+    return !layout.fixedBytes32Equal(value, layout.fixedBytes32Zero())
+
+fn v3ContentStubCid(topicCid: layout.FixedBytes32,
+                    bundleCid: layout.FixedBytes32,
+                    blobSummaryCid: layout.FixedBytes32,
+                    advertCid: layout.FixedBytes32,
+                    manifestCid: layout.FixedBytes32,
+                    recoveryPlanCid: layout.FixedBytes32,
+                    payloadLen: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.content.stub.cid"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, topicCid)
+    lt.v3AppendFixed32(buf, bundleCid)
+    lt.v3AppendFixed32(buf, blobSummaryCid)
+    lt.v3AppendFixed32(buf, advertCid)
+    lt.v3AppendFixed32(buf, manifestCid)
+    lt.v3AppendFixed32(buf, recoveryPlanCid)
+    lt.v3AppendU32BE(buf, payloadLen)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ContentStubMake(topicCid: layout.FixedBytes32,
+                     bundleCid: layout.FixedBytes32,
+                     blobSummaryCid: layout.FixedBytes32,
+                     advertCid: layout.FixedBytes32,
+                     manifestCid: layout.FixedBytes32,
+                     recoveryPlanCid: layout.FixedBytes32,
+                     payloadLen: int32): Result[V3ContentStub] =
+    if !v3ContentCidSet(topicCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub topic cid")
+    if !v3ContentCidSet(bundleCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub bundle cid")
+    if !v3ContentCidSet(blobSummaryCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub blob summary cid")
+    if !v3ContentCidSet(advertCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub advert cid")
+    if !v3ContentCidSet(manifestCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub manifest cid")
+    if !v3ContentCidSet(recoveryPlanCid):
+        return Err[V3ContentStub]("v3 content plane: missing stub recovery plan cid")
+    if payloadLen < 0:
+        return Err[V3ContentStub]("v3 content plane: invalid stub payload length")
+    var out = v3ContentStubZero()
+    out.topicCid = topicCid
+    out.bundleCid = bundleCid
+    out.blobSummaryCid = blobSummaryCid
+    out.advertCid = advertCid
+    out.manifestCid = manifestCid
+    out.recoveryPlanCid = recoveryPlanCid
+    out.payloadLen = payloadLen
+    out.stubCid = v3ContentStubCid(out.topicCid,
+                                   out.bundleCid,
+                                   out.blobSummaryCid,
+                                   out.advertCid,
+                                   out.manifestCid,
+                                   out.recoveryPlanCid,
+                                   out.payloadLen)
+    return Ok[V3ContentStub](out)
+
+fn v3ContentStubFromArtifacts(artifacts: V3ContentPublishArtifacts): Result[V3ContentStub] =
+    let artifactsOk = v3ContentPublishArtifactsValidate(artifacts)
+    if IsErr(artifactsOk):
+        return Err[V3ContentStub](Error(artifactsOk))
+    return v3ContentStubMake(artifacts.topic.topicCid,
+                             artifacts.bundleCid,
+                             artifacts.blobSummary.summaryCid,
+                             artifacts.publishAdvert.advertCid,
+                             artifacts.erasureManifest.manifestCid,
+                             artifacts.recoveryPlan.planCid,
+                             artifacts.blobSummary.payloadLen)
+
+fn v3ContentStubValidate(stub: V3ContentStub): Result[bool] =
+    if stub.version != 1:
+        return Err[bool]("v3 content plane: unsupported stub version")
+    if !v3ContentCidSet(stub.topicCid):
+        return Err[bool]("v3 content plane: missing stub topic cid")
+    if !v3ContentCidSet(stub.bundleCid):
+        return Err[bool]("v3 content plane: missing stub bundle cid")
+    if !v3ContentCidSet(stub.blobSummaryCid):
+        return Err[bool]("v3 content plane: missing stub blob summary cid")
+    if !v3ContentCidSet(stub.advertCid):
+        return Err[bool]("v3 content plane: missing stub advert cid")
+    if !v3ContentCidSet(stub.manifestCid):
+        return Err[bool]("v3 content plane: missing stub manifest cid")
+    if !v3ContentCidSet(stub.recoveryPlanCid):
+        return Err[bool]("v3 content plane: missing stub recovery plan cid")
+    if stub.payloadLen < 0:
+        return Err[bool]("v3 content plane: invalid stub payload length")
+    let expectedCid = v3ContentStubCid(stub.topicCid,
+                                       stub.bundleCid,
+                                       stub.blobSummaryCid,
+                                       stub.advertCid,
+                                       stub.manifestCid,
+                                       stub.recoveryPlanCid,
+                                       stub.payloadLen)
+    if !layout.fixedBytes32Equal(stub.stubCid, expectedCid):
+        return Err[bool]("v3 content plane: stub cid mismatch")
+    return Ok[bool](true)
+
+fn v3ContentPayloadHasMagic(payload: Bytes, magic: str): bool =
+    let magicBytes = bytesFromString(magic)
+    if bytesLen(payload) < bytesLen(magicBytes):
+        return false
+    for i in 0..<bytesLen(magicBytes):
+        if bytesGet(payload, i) != bytesGet(magicBytes, i):
+            return false
+    return true
+
+fn v3ContentStubEncode(stub: V3ContentStub): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString(v3ContentStubMagic))
+    lt.v3AppendU32BE(buf, stub.version)
+    lt.v3AppendFixed32(buf, stub.topicCid)
+    lt.v3AppendFixed32(buf, stub.bundleCid)
+    lt.v3AppendFixed32(buf, stub.blobSummaryCid)
+    lt.v3AppendFixed32(buf, stub.advertCid)
+    lt.v3AppendFixed32(buf, stub.manifestCid)
+    lt.v3AppendFixed32(buf, stub.recoveryPlanCid)
+    lt.v3AppendU32BE(buf, stub.payloadLen)
+    lt.v3AppendFixed32(buf, stub.stubCid)
+    return layout.byteBufToBytes(buf)
+
+fn v3ContentStubDecode(payload: Bytes): Result[V3ContentStub] =
+    if !v3ContentPayloadHasMagic(payload, v3ContentStubMagic):
+        return Err[V3ContentStub]("v3 content plane: invalid stub magic")
+    let magicLen = bytesLen(bytesFromString(v3ContentStubMagic))
+    let span = layout.byteSpanFromBytes(payload)
+    let versionRes = codec.v3ReadU32BE(span, magicLen)
+    if IsErr(versionRes):
+        return Err[V3ContentStub](Error(versionRes))
+    let topicCidRes = codec.v3ReadFixed32(span, magicLen + 4)
+    if IsErr(topicCidRes):
+        return Err[V3ContentStub](Error(topicCidRes))
+    let bundleCidRes = codec.v3ReadFixed32(span, magicLen + 36)
+    if IsErr(bundleCidRes):
+        return Err[V3ContentStub](Error(bundleCidRes))
+    let blobSummaryCidRes = codec.v3ReadFixed32(span, magicLen + 68)
+    if IsErr(blobSummaryCidRes):
+        return Err[V3ContentStub](Error(blobSummaryCidRes))
+    let advertCidRes = codec.v3ReadFixed32(span, magicLen + 100)
+    if IsErr(advertCidRes):
+        return Err[V3ContentStub](Error(advertCidRes))
+    let manifestCidRes = codec.v3ReadFixed32(span, magicLen + 132)
+    if IsErr(manifestCidRes):
+        return Err[V3ContentStub](Error(manifestCidRes))
+    let recoveryPlanCidRes = codec.v3ReadFixed32(span, magicLen + 164)
+    if IsErr(recoveryPlanCidRes):
+        return Err[V3ContentStub](Error(recoveryPlanCidRes))
+    let payloadLenRes = codec.v3ReadU32BE(span, magicLen + 196)
+    if IsErr(payloadLenRes):
+        return Err[V3ContentStub](Error(payloadLenRes))
+    let stubCidRes = codec.v3ReadFixed32(span, magicLen + 200)
+    if IsErr(stubCidRes):
+        return Err[V3ContentStub](Error(stubCidRes))
+    var out = v3ContentStubZero()
+    out.version = int32(Value(versionRes))
+    out.topicCid = Value(topicCidRes)
+    out.bundleCid = Value(bundleCidRes)
+    out.blobSummaryCid = Value(blobSummaryCidRes)
+    out.advertCid = Value(advertCidRes)
+    out.manifestCid = Value(manifestCidRes)
+    out.recoveryPlanCid = Value(recoveryPlanCidRes)
+    out.payloadLen = int32(Value(payloadLenRes))
+    out.stubCid = Value(stubCidRes)
+    let stubOk = v3ContentStubValidate(out)
+    if IsErr(stubOk):
+        return Err[V3ContentStub](Error(stubOk))
+    return Ok[V3ContentStub](out)
+
+fn v3ContentPublishArtifactsCid(topicCid: layout.FixedBytes32,
+                                envelopeCid: layout.FixedBytes32,
+                                advertCid: layout.FixedBytes32,
+                                pubsubPlanCid: layout.FixedBytes32,
+                                plumtreePlanCid: layout.FixedBytes32,
+                                manifestCid: layout.FixedBytes32,
+                                recoveryPlanCid: layout.FixedBytes32,
+                                subscriptionCount: int32,
+                                proofCount: int32,
+                                peerAdvertCount: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.content.publish"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, topicCid)
+    lt.v3AppendFixed32(buf, envelopeCid)
+    lt.v3AppendFixed32(buf, advertCid)
+    lt.v3AppendFixed32(buf, pubsubPlanCid)
+    lt.v3AppendFixed32(buf, plumtreePlanCid)
+    lt.v3AppendFixed32(buf, manifestCid)
+    lt.v3AppendFixed32(buf, recoveryPlanCid)
+    lt.v3AppendU32BE(buf, subscriptionCount)
+    lt.v3AppendU32BE(buf, proofCount)
+    lt.v3AppendU32BE(buf, peerAdvertCount)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ContentPublishArtifactsExpectedBundleCid(artifacts: V3ContentPublishArtifacts): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.content.publish"))
+    lt.v3AppendU32BE(buf, 1)
+    lt.v3AppendFixed32(buf, artifacts.topic.topicCid)
+    lt.v3AppendFixed32(buf, artifacts.envelope.envelopeCid)
+    lt.v3AppendFixed32(buf, artifacts.publishAdvert.advertCid)
+    lt.v3AppendFixed32(buf, artifacts.pubsubPlan.planCid)
+    lt.v3AppendFixed32(buf, artifacts.plumtreePlan.planCid)
+    lt.v3AppendFixed32(buf, artifacts.erasureManifest.manifestCid)
+    lt.v3AppendFixed32(buf, artifacts.recoveryPlan.planCid)
+    lt.v3AppendU32BE(buf, artifacts.subscriptionCount)
+    lt.v3AppendU32BE(buf, artifacts.availabilityProofCount)
+    lt.v3AppendU32BE(buf, artifacts.peerAdvertCount)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ContentBuildAvailabilityProofs(summary: dag.V3DagBlobSummary,
+                                    providerPeerIds: layout.FixedBytes32[],
+                                    retainedUntilEpochs: int32[]): Result[dag.V3DagAvailabilityProof[]] =
+    if providerPeerIds.len <= 0:
+        return Err[dag.V3DagAvailabilityProof[]]("v3 content plane: empty availability providers")
+    if providerPeerIds.len != retainedUntilEpochs.len:
+        return Err[dag.V3DagAvailabilityProof[]]("v3 content plane: provider/retained count mismatch")
+    var out: dag.V3DagAvailabilityProof[]
+    out = []
+    for i in 0..<providerPeerIds.len:
+        let proofRes = dag.v3DagAvailabilityProofMake(summary, providerPeerIds[i], retainedUntilEpochs[i])
+        if IsErr(proofRes):
+            return Err[dag.V3DagAvailabilityProof[]](Error(proofRes))
+        add(out, Value(proofRes))
+    return Ok[dag.V3DagAvailabilityProof[]](out)
+
+fn v3ContentPublishArtifactsFill(out: var V3ContentPublishArtifacts,
+                                 topic: pubsub.V3PubSubTopic,
+                                 root: pubsub.V3PubSubSubscription,
+                                 subscriptions: pubsub.V3PubSubSubscription[],
+                                 publisherPeerId: layout.FixedBytes32,
+                                 blob: Bytes,
+                                 dagChunkSize: int32,
+                                 providerPeerIds: layout.FixedBytes32[],
+                                 retainedUntilEpochs: int32[],
+                                 stampEpoch: int32,
+                                 stampGanzhi: int32,
+                                 erasureDataShardCount: int32,
+                                 erasureParityShardCount: int32,
+                                 erasureShardPayloadBytes: int32,
+                                 shardPayloadCids: layout.FixedBytes32[],
+                                 peerAdverts: swarm.V3ErasurePeerAdvert[]): Result[bool] =
+    if !layout.fixedBytes32Equal(root.topicCid, topic.topicCid):
+        return Err[bool]("v3 content plane: root topic mismatch")
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, dagChunkSize)
+    if IsErr(summaryRes):
+        return Err[bool](Error(summaryRes))
+    let summary = Value(summaryRes)
+    let proofsRes = v3ContentBuildAvailabilityProofs(summary, providerPeerIds, retainedUntilEpochs)
+    if IsErr(proofsRes):
+        return Err[bool](Error(proofsRes))
+    let proofs = Value(proofsRes)
+    let certRes = dag.v3DagAvailabilityCertMake(summary, proofs)
+    if IsErr(certRes):
+        return Err[bool](Error(certRes))
+    let cert = Value(certRes)
+    let advertRes = dag.v3DagPublishAdvertMake(topic.topicCid,
+                                               publisherPeerId,
+                                               summary,
+                                               cert,
+                                               stampEpoch,
+                                               stampGanzhi)
+    if IsErr(advertRes):
+        return Err[bool](Error(advertRes))
+    let advert = Value(advertRes)
+    let envelope = pubsub.v3PubSubEnvelopeMake(topic.topicCid,
+                                               pubsub.v3PubSubPayloadKindDagAdvert,
+                                               advert.advertCid,
+                                               summary.summaryCid)
+    let pubsubPlanRes = pubsub.v3PubSubBuildPlan(topic, envelope, subscriptions)
+    if IsErr(pubsubPlanRes):
+        return Err[bool](Error(pubsubPlanRes))
+    let pubsubPlan = Value(pubsubPlanRes)
+    let plumtreePlanRes = plumtree.v3PlumtreeBuildPlan(topic, root, pubsubPlan, subscriptions)
+    if IsErr(plumtreePlanRes):
+        return Err[bool](Error(plumtreePlanRes))
+    let plumtreePlan = Value(plumtreePlanRes)
+    let erasureParamsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic,
+                                                             erasureDataShardCount,
+                                                             erasureParityShardCount,
+                                                             erasureShardPayloadBytes)
+    if IsErr(erasureParamsRes):
+        return Err[bool](Error(erasureParamsRes))
+    let erasureParams = Value(erasureParamsRes)
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       erasureParams,
+                                                       shardPayloadCids)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let recoveryPlanRes = swarm.v3ErasureBuildRecoveryPlan(manifest, erasureParams, peerAdverts)
+    if IsErr(recoveryPlanRes):
+        return Err[bool](Error(recoveryPlanRes))
+    let recoveryPlan = Value(recoveryPlanRes)
+
+    out = v3ContentPublishArtifactsZero()
+    out.topic = topic
+    out.root = root
+    out.subscriptionCount = subscriptions.len
+    out.subscriptions = subscriptions
+    out.blobSummary = summary
+    out.availabilityProofCount = proofs.len
+    out.availabilityProofs = proofs
+    out.availabilityCert = cert
+    out.publishAdvert = advert
+    out.envelope = envelope
+    out.pubsubPlan = pubsubPlan
+    out.plumtreePlan = plumtreePlan
+    out.erasureParams = erasureParams
+    out.erasureManifest = manifest
+    out.peerAdvertCount = peerAdverts.len
+    out.peerAdverts = peerAdverts
+    out.recoveryPlan = recoveryPlan
+    out.bundleCid = v3ContentPublishArtifactsExpectedBundleCid(out)
+    return Ok[bool](true)
+
+fn v3ContentPublishArtifactsMake(topic: pubsub.V3PubSubTopic,
+                                 root: pubsub.V3PubSubSubscription,
+                                 subscriptions: pubsub.V3PubSubSubscription[],
+                                 publisherPeerId: layout.FixedBytes32,
+                                 blob: Bytes,
+                                 dagChunkSize: int32,
+                                 providerPeerIds: layout.FixedBytes32[],
+                                 retainedUntilEpochs: int32[],
+                                 stampEpoch: int32,
+                                 stampGanzhi: int32,
+                                 erasureDataShardCount: int32,
+                                 erasureParityShardCount: int32,
+                                 erasureShardPayloadBytes: int32,
+                                 shardPayloadCids: layout.FixedBytes32[],
+                                 peerAdverts: swarm.V3ErasurePeerAdvert[]): Result[V3ContentPublishArtifacts] =
+    var out = v3ContentPublishArtifactsZero()
+    let fillRes = v3ContentPublishArtifactsFill(out,
+                                                topic,
+                                                root,
+                                                subscriptions,
+                                                publisherPeerId,
+                                                blob,
+                                                dagChunkSize,
+                                                providerPeerIds,
+                                                retainedUntilEpochs,
+                                                stampEpoch,
+                                                stampGanzhi,
+                                                erasureDataShardCount,
+                                                erasureParityShardCount,
+                                                erasureShardPayloadBytes,
+                                                shardPayloadCids,
+                                                peerAdverts)
+    if IsErr(fillRes):
+        return Err[V3ContentPublishArtifacts](Error(fillRes))
+    return Ok[V3ContentPublishArtifacts](out)
+
+fn v3ContentPublishArtifactsValidate(artifacts: V3ContentPublishArtifacts): Result[bool] =
+    if artifacts.version != 1:
+        return Err[bool]("v3 content plane: unsupported artifacts version")
+    if artifacts.subscriptionCount != artifacts.subscriptions.len:
+        return Err[bool]("v3 content plane: subscription count mismatch")
+    if artifacts.availabilityProofCount != artifacts.availabilityProofs.len:
+        return Err[bool]("v3 content plane: proof count mismatch")
+    if artifacts.peerAdvertCount != artifacts.peerAdverts.len:
+        return Err[bool]("v3 content plane: peer advert count mismatch")
+    if !layout.fixedBytes32Equal(artifacts.root.topicCid, artifacts.topic.topicCid):
+        return Err[bool]("v3 content plane: root topic mismatch")
+
+    let summaryOk = dag.v3DagBlobSummaryValidate(artifacts.blobSummary)
+    if IsErr(summaryOk):
+        return Err[bool](Error(summaryOk))
+    let certOk = dag.v3DagAvailabilityCertValidate(artifacts.availabilityCert,
+                                                   artifacts.blobSummary,
+                                                   artifacts.availabilityProofs)
+    if IsErr(certOk):
+        return Err[bool](Error(certOk))
+    let advertOk = dag.v3DagPublishAdvertValidate(artifacts.publishAdvert,
+                                                  artifacts.blobSummary,
+                                                  artifacts.availabilityCert)
+    if IsErr(advertOk):
+        return Err[bool](Error(advertOk))
+    if !layout.fixedBytes32Equal(artifacts.envelope.topicCid, artifacts.topic.topicCid):
+        return Err[bool]("v3 content plane: envelope topic mismatch")
+    if artifacts.envelope.payloadKind != pubsub.v3PubSubPayloadKindDagAdvert:
+        return Err[bool]("v3 content plane: envelope payload kind mismatch")
+    if !layout.fixedBytes32Equal(artifacts.envelope.payloadCid, artifacts.publishAdvert.advertCid):
+        return Err[bool]("v3 content plane: envelope advert cid mismatch")
+    if !layout.fixedBytes32Equal(artifacts.envelope.payloadSummaryCid, artifacts.blobSummary.summaryCid):
+        return Err[bool]("v3 content plane: envelope summary cid mismatch")
+
+    let pubsubPlanRes = pubsub.v3PubSubBuildPlan(artifacts.topic,
+                                                 artifacts.envelope,
+                                                 artifacts.subscriptions)
+    if IsErr(pubsubPlanRes):
+        return Err[bool](Error(pubsubPlanRes))
+    let rebuiltPubsubPlan = Value(pubsubPlanRes)
+    if !layout.fixedBytes32Equal(artifacts.pubsubPlan.planCid, rebuiltPubsubPlan.planCid):
+        return Err[bool]("v3 content plane: pubsub plan cid mismatch")
+    if artifacts.pubsubPlan.branchCount != rebuiltPubsubPlan.branchCount:
+        return Err[bool]("v3 content plane: pubsub branch count mismatch")
+
+    let plumtreePlanRes = plumtree.v3PlumtreeBuildPlan(artifacts.topic,
+                                                       artifacts.root,
+                                                       artifacts.pubsubPlan,
+                                                       artifacts.subscriptions)
+    if IsErr(plumtreePlanRes):
+        return Err[bool](Error(plumtreePlanRes))
+    let rebuiltPlumtreePlan = Value(plumtreePlanRes)
+    if !layout.fixedBytes32Equal(artifacts.plumtreePlan.planCid, rebuiltPlumtreePlan.planCid):
+        return Err[bool]("v3 content plane: plumtree plan cid mismatch")
+    if artifacts.plumtreePlan.eagerEdgeCount != rebuiltPlumtreePlan.eagerEdgeCount:
+        return Err[bool]("v3 content plane: plumtree eager edge count mismatch")
+    if artifacts.plumtreePlan.lazyPeerCount != rebuiltPlumtreePlan.lazyPeerCount:
+        return Err[bool]("v3 content plane: plumtree lazy peer count mismatch")
+
+    let paramsRes = swarm.v3ErasureEncodingParamsValidate(artifacts.erasureParams)
+    if IsErr(paramsRes):
+        return Err[bool](Error(paramsRes))
+    let manifestRes = swarm.v3ErasureManifestValidate(artifacts.erasureManifest,
+                                                      artifacts.erasureParams)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    if !layout.fixedBytes32Equal(artifacts.erasureManifest.blobCid, artifacts.blobSummary.blobCid):
+        return Err[bool]("v3 content plane: erasure manifest blob cid mismatch")
+    if artifacts.erasureManifest.blobByteLen != artifacts.blobSummary.payloadLen:
+        return Err[bool]("v3 content plane: erasure manifest payload length mismatch")
+    let rebuiltRecoveryPlanRes = swarm.v3ErasureBuildRecoveryPlan(artifacts.erasureManifest,
+                                                                  artifacts.erasureParams,
+                                                                  artifacts.peerAdverts)
+    if IsErr(rebuiltRecoveryPlanRes):
+        return Err[bool](Error(rebuiltRecoveryPlanRes))
+    let rebuiltRecoveryPlan = Value(rebuiltRecoveryPlanRes)
+    let recoveryPlanOk = swarm.v3ErasureRecoveryPlanValidate(artifacts.recoveryPlan,
+                                                             artifacts.erasureManifest,
+                                                             artifacts.erasureParams)
+    if IsErr(recoveryPlanOk):
+        return Err[bool](Error(recoveryPlanOk))
+    if !layout.fixedBytes32Equal(artifacts.recoveryPlan.planCid, rebuiltRecoveryPlan.planCid):
+        return Err[bool]("v3 content plane: erasure recovery plan cid mismatch")
+    if artifacts.recoveryPlan.requestCount != rebuiltRecoveryPlan.requestCount:
+        return Err[bool]("v3 content plane: erasure recovery request count mismatch")
+    if artifacts.recoveryPlan.minShardCount != swarm.v3ErasureRecoveryThreshold(artifacts.erasureParams):
+        return Err[bool]("v3 content plane: erasure recovery threshold mismatch")
+
+    let expectedBundleCid = v3ContentPublishArtifactsExpectedBundleCid(artifacts)
+    if !layout.fixedBytes32Equal(artifacts.bundleCid, expectedBundleCid):
+        return Err[bool]("v3 content plane: bundle cid mismatch")
+    return Ok[bool](true)

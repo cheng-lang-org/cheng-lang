@@ -806,6 +806,8 @@ typedef struct {
     char const_name[128];
     char type_text[128];
     char abi_class[32];
+    char str_value[8192];
+    bool has_str_value;
     int64_t i64_value;
     bool bool_value;
 } V3TopLevelConstStub;
@@ -2122,6 +2124,133 @@ static int32_t v3_find_top_level_const_index_by_symbol(const V3LoweringPlanStub 
     return -1;
 }
 
+static bool v3_parse_string_literal_text(const char *expr_text,
+                                         char *literal_out,
+                                         size_t literal_cap);
+static bool v3_parse_int_literal_text(const char *expr_text, int64_t *value_out);
+static int32_t v3_find_top_level_binary_op_last(const char *text, const char *op);
+
+static bool v3_try_resolve_i64_top_level_const_expr(const char *expr_text,
+                                                    const V3LoweringPlanStub *lowering,
+                                                    const char *owner_module_path,
+                                                    const V3ImportAlias *aliases,
+                                                    size_t alias_count,
+                                                    int64_t *value_out) {
+    char expr[4096];
+    int32_t literal = 0;
+    int32_t shl_index = -1;
+    int32_t plus_index = -1;
+    int32_t minus_index = -1;
+    int64_t lhs = 0;
+    int64_t rhs = 0;
+    char left[4096];
+    char right[4096];
+    char symbol_text[PATH_MAX];
+    int32_t index = -1;
+    const V3TopLevelConstStub *existing = NULL;
+    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    if (expr[0] == '\0') {
+        return false;
+    }
+    if (v3_parse_int_literal_text(expr, &literal)) {
+        *value_out = (int64_t)literal;
+        return true;
+    }
+    shl_index = v3_find_top_level_binary_op_last(expr, "<<");
+    if (shl_index > 0) {
+        snprintf(left, sizeof(left), "%.*s", shl_index, expr);
+        snprintf(right, sizeof(right), "%s", expr + shl_index + 2);
+        v3_trim_copy_text(left, left, sizeof(left));
+        v3_trim_copy_text(right, right, sizeof(right));
+        return v3_try_resolve_i64_top_level_const_expr(left,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &lhs) &&
+               v3_try_resolve_i64_top_level_const_expr(right,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &rhs) &&
+               rhs >= 0 &&
+               rhs < 63 &&
+               ((*value_out = (int64_t)((uint64_t)lhs << (uint32_t)rhs)), true);
+    }
+    plus_index = v3_find_top_level_binary_op_last(expr, "+");
+    if (plus_index > 0) {
+        snprintf(left, sizeof(left), "%.*s", plus_index, expr);
+        snprintf(right, sizeof(right), "%s", expr + plus_index + 1);
+        v3_trim_copy_text(left, left, sizeof(left));
+        v3_trim_copy_text(right, right, sizeof(right));
+        return v3_try_resolve_i64_top_level_const_expr(left,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &lhs) &&
+               v3_try_resolve_i64_top_level_const_expr(right,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &rhs) &&
+               ((*value_out = lhs + rhs), true);
+    }
+    minus_index = v3_find_top_level_binary_op_last(expr, "-");
+    if (minus_index > 0) {
+        snprintf(left, sizeof(left), "%.*s", minus_index, expr);
+        snprintf(right, sizeof(right), "%s", expr + minus_index + 1);
+        v3_trim_copy_text(left, left, sizeof(left));
+        v3_trim_copy_text(right, right, sizeof(right));
+        return v3_try_resolve_i64_top_level_const_expr(left,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &lhs) &&
+               v3_try_resolve_i64_top_level_const_expr(right,
+                                                       lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       &rhs) &&
+               ((*value_out = lhs - rhs), true);
+    }
+    if (strchr(expr, '.') != NULL) {
+        char alias_text[128];
+        char const_name[128];
+        char expr_copy[4096];
+        char *dot;
+        const char *module_path;
+        snprintf(expr_copy, sizeof(expr_copy), "%s", expr);
+        dot = strchr(expr_copy, '.');
+        *dot = '\0';
+        snprintf(alias_text, sizeof(alias_text), "%s", expr_copy);
+        snprintf(const_name, sizeof(const_name), "%s", dot + 1);
+        module_path = v3_alias_module_path(aliases, alias_count, alias_text);
+        if (!module_path) {
+            return false;
+        }
+        snprintf(symbol_text, sizeof(symbol_text), "%s::%s", module_path, const_name);
+    } else {
+        snprintf(symbol_text, sizeof(symbol_text), "%s::%s", owner_module_path, expr);
+    }
+    index = v3_find_top_level_const_index_by_symbol(lowering, symbol_text);
+    if (index < 0) {
+        return false;
+    }
+    existing = &lowering->consts[index];
+    if (strcmp(existing->abi_class, "i32") != 0 &&
+        strcmp(existing->abi_class, "i64") != 0 &&
+        strcmp(existing->abi_class, "bool") != 0) {
+        return false;
+    }
+    *value_out = existing->i64_value;
+    return true;
+}
+
 static bool v3_try_parse_scalar_const_literal(const char *expr_text,
                                               const char *declared_type,
                                               const V3LoweringPlanStub *lowering,
@@ -2130,8 +2259,10 @@ static bool v3_try_parse_scalar_const_literal(const char *expr_text,
                                               size_t alias_count,
                                               V3TopLevelConstStub *out) {
     char expr[4096];
+    char literal[8192];
     char *end = NULL;
     const char *declared_abi = v3_type_abi_class(declared_type);
+    int64_t resolved_i64 = 0;
     v3_trim_copy_text(expr_text, expr, sizeof(expr));
     if (expr[0] == '\0') {
         return false;
@@ -2154,6 +2285,36 @@ static bool v3_try_parse_scalar_const_literal(const char *expr_text,
             out->i64_value = (int64_t)value;
             return true;
         }
+    }
+    if ((declared_type[0] == '\0' ||
+         strcmp(declared_abi, "i32") == 0 ||
+         strcmp(declared_abi, "i64") == 0 ||
+         strcmp(declared_abi, "bool") == 0) &&
+        v3_try_resolve_i64_top_level_const_expr(expr,
+                                                lowering,
+                                                owner_module_path,
+                                                aliases,
+                                                alias_count,
+                                                &resolved_i64)) {
+        snprintf(out->abi_class,
+                 sizeof(out->abi_class),
+                 "%s",
+                 strcmp(declared_abi, "i64") == 0 ? "i64" :
+                 (strcmp(declared_abi, "bool") == 0 ? "bool" : "i32"));
+        out->i64_value = resolved_i64;
+        out->bool_value = resolved_i64 != 0;
+        return true;
+    }
+    if (v3_parse_string_literal_text(expr, literal, sizeof(literal))) {
+        if (declared_type[0] != '\0' &&
+            strcmp(declared_type, "str") != 0 &&
+            strcmp(declared_type, "cstring") != 0) {
+            return false;
+        }
+        snprintf(out->abi_class, sizeof(out->abi_class), "%s", "composite");
+        snprintf(out->str_value, sizeof(out->str_value), "%s", literal);
+        out->has_str_value = true;
+        return true;
     }
     if (strchr(expr, '(') == NULL && strchr(expr, '[') == NULL && strchr(expr, ' ') == NULL) {
         char symbol_text[PATH_MAX];
@@ -2185,12 +2346,20 @@ static bool v3_try_parse_scalar_const_literal(const char *expr_text,
             existing = &lowering->consts[index];
         }
         snprintf(out->abi_class, sizeof(out->abi_class), "%s", existing->abi_class);
+        snprintf(out->str_value, sizeof(out->str_value), "%s", existing->str_value);
+        out->has_str_value = existing->has_str_value;
         out->i64_value = existing->i64_value;
         out->bool_value = existing->bool_value;
         if (strcmp(declared_abi, "i64") == 0 && strcmp(out->abi_class, "i32") == 0) {
             snprintf(out->abi_class, sizeof(out->abi_class), "%s", "i64");
         }
-        return v3_abi_class_scalar_or_ptr(out->abi_class);
+        if (declared_type[0] != '\0' &&
+            strcmp(out->abi_class, "composite") == 0 &&
+            strcmp(declared_type, "str") != 0 &&
+            strcmp(declared_type, "cstring") != 0) {
+            return false;
+        }
+        return out->abi_class[0] != '\0';
     }
     return false;
 }
@@ -2290,6 +2459,11 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
                      sizeof(lowering->consts[lowering->const_count].abi_class),
                      "%s",
                      value.abi_class);
+            snprintf(lowering->consts[lowering->const_count].str_value,
+                     sizeof(lowering->consts[lowering->const_count].str_value),
+                     "%s",
+                     value.str_value);
+            lowering->consts[lowering->const_count].has_str_value = value.has_str_value;
             lowering->consts[lowering->const_count].i64_value = value.i64_value;
             lowering->consts[lowering->const_count].bool_value = value.bool_value;
             lowering->const_count += 1U;
@@ -2345,12 +2519,18 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
                  sizeof(lowering->consts[lowering->const_count].type_text),
                  "%s",
                  type_text[0] != '\0' ? type_text :
+                 (strcmp(value.abi_class, "composite") == 0 && value.has_str_value ? "str" :
                  (strcmp(value.abi_class, "i64") == 0 ? "int64" :
-                  (strcmp(value.abi_class, "bool") == 0 ? "bool" : "int32")));
+                  (strcmp(value.abi_class, "bool") == 0 ? "bool" : "int32"))));
         snprintf(lowering->consts[lowering->const_count].abi_class,
                  sizeof(lowering->consts[lowering->const_count].abi_class),
                  "%s",
                  value.abi_class);
+        snprintf(lowering->consts[lowering->const_count].str_value,
+                 sizeof(lowering->consts[lowering->const_count].str_value),
+                 "%s",
+                 value.str_value);
+        lowering->consts[lowering->const_count].has_str_value = value.has_str_value;
         lowering->consts[lowering->const_count].i64_value = value.i64_value;
         lowering->consts[lowering->const_count].bool_value = value.bool_value;
         lowering->const_count += 1U;
@@ -2408,6 +2588,22 @@ static const V3TopLevelConstStub *v3_find_expr_top_level_const(const V3LoweringP
                 return NULL;
             }
             match = &lowering->consts[index];
+        }
+        if (match != NULL) {
+            return match;
+        }
+    }
+    {
+        const V3TopLevelConstStub *match = NULL;
+        size_t i;
+        for (i = 0; i < lowering->const_count; ++i) {
+            if (strcmp(lowering->consts[i].const_name, expr) != 0) {
+                continue;
+            }
+            if (match != NULL) {
+                return NULL;
+            }
+            match = &lowering->consts[i];
         }
         return match;
     }
@@ -7815,6 +8011,15 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                                             &list_item_count,
                                             CHENG_V3_MAX_CALL_ARGS) ||
                 (int32_t)list_item_count != fixed_len) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] prepare composite arg fixed-list mismatch caller=%s callee=%s arg_index=%zu expr=%s preferred_type=%s list_items=%zu fixed_len=%d\n",
+                        current_function->symbol_text,
+                        callee,
+                        arg_index,
+                        arg_expr,
+                        preferred_type,
+                        list_item_count,
+                        fixed_len);
                 return false;
             }
             snprintf(inferred_type, sizeof(inferred_type), "%s", preferred_type);
@@ -7831,6 +8036,14 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                                        sizeof(inferred_type),
                                        inferred_abi,
                                        sizeof(inferred_abi))) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] prepare composite arg infer failed caller=%s callee=%s arg_index=%zu expr=%s preferred_type=%s preferred_abi=%s\n",
+                    current_function->symbol_text,
+                    callee,
+                    arg_index,
+                    arg_expr,
+                    preferred_type,
+                    preferred_abi);
             return false;
         }
     } else if (!v3_infer_expr_type(plan,
@@ -7845,23 +8058,42 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                                    sizeof(inferred_type),
                                    inferred_abi,
                                    sizeof(inferred_abi))) {
+        fprintf(stderr,
+                "[cheng_v3_seed] prepare composite arg infer failed caller=%s callee=%s arg_index=%zu expr=%s preferred_type=%s preferred_abi=%s\n",
+                current_function->symbol_text,
+                callee,
+                arg_index,
+                arg_expr,
+                preferred_type ? preferred_type : "",
+                preferred_abi ? preferred_abi : "");
         return false;
     }
     if (v3_abi_class_scalar_or_ptr(inferred_abi)) {
         return true;
     }
-    return v3_add_local_slot_for_type(lowering,
-                                      current_function->owner_module_path,
-                                      aliases,
-                                      alias_count,
-                                      locals,
-                                      local_count,
-                                      local_cap,
-                                      temp_name,
-                                      inferred_type,
-                                      inferred_abi,
-                                      false,
-                                      next_offset_io);
+    if (!v3_add_local_slot_for_type(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    locals,
+                                    local_count,
+                                    local_cap,
+                                    temp_name,
+                                    inferred_type,
+                                    inferred_abi,
+                                    false,
+                                    next_offset_io)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] prepare composite arg add-local failed caller=%s callee=%s arg_index=%zu expr=%s inferred_type=%s inferred_abi=%s\n",
+                current_function->symbol_text,
+                callee,
+                arg_index,
+                arg_expr,
+                inferred_type,
+                inferred_abi);
+        return false;
+    }
+    return true;
 }
 
 static bool v3_prepare_composite_expr_temp(const V3SystemLinkPlanStub *plan,
@@ -8159,7 +8391,9 @@ static bool v3_external_call_signature(const char *name, V3AsmCallTarget *target
         {"driver_c_u64_to_cstring", "driver_c_u64_to_str", "ptr", 1U, {"i64"}},
         {"intToStrRaw", "driver_c_i32_to_str", "ptr", 1U, {"i32"}},
         {"int64ToStrRaw", "driver_c_i64_to_str", "ptr", 1U, {"i64"}},
-        {"uint64ToStrRaw", "driver_c_u64_to_str", "ptr", 1U, {"i64"}}
+        {"uint64ToStrRaw", "driver_c_u64_to_str", "ptr", 1U, {"i64"}},
+        {"cheng_epoch_time_seconds", "cheng_epoch_time_seconds", "i64", 0U, {0}},
+        {"chengSystemEntropyFill", "cheng_system_entropy_fill", "i32", 2U, {"ptr", "i32"}}
     };
     const char *lookup = name;
     const char *dot = strrchr(name, '.');
@@ -8489,7 +8723,7 @@ static bool v3_emit_cstring_literal_label(const V3LoweredFunctionStub *current_f
     char *escaped;
     int32_t label_id = 0;
     const char *label_prefix = "L_v3_strlit";
-    v3_sanitize_path_part(current_function->function_name, safe_name, sizeof(safe_name));
+    v3_sanitize_path_part(current_function->symbol_text, safe_name, sizeof(safe_name));
     if (string_label_index_io) {
         label_id = *string_label_index_io;
         *string_label_index_io += 1;
@@ -8601,6 +8835,7 @@ static bool v3_emit_add_address_offset(char *out,
                                        int dst_reg,
                                        int src_reg,
                                        int32_t offset);
+static bool v3_emit_mov_imm(char *out, size_t cap, int reg_index, int64_t value);
 static bool v3_emit_sp_store_reg(char *out,
                                  size_t cap,
                                  int32_t offset,
@@ -8618,15 +8853,31 @@ static bool v3_emit_zero_address_range(char *out,
                                        int32_t size) {
     int32_t offset = 0;
     while (offset + 8 <= size) {
-        v3_text_appendf(out, cap, "  str xzr, [x%d, #%d]\n", addr_reg, offset);
-        offset += 8;
+        int32_t chunk_base = offset;
+        int32_t chunk_limit = size;
+        if (chunk_limit - chunk_base > 32760) {
+            chunk_limit = chunk_base + 32760;
+        }
+        if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, chunk_base)) {
+            return false;
+        }
+        while (offset + 8 <= chunk_limit) {
+            v3_text_appendf(out, cap, "  str xzr, [x14, #%d]\n", offset - chunk_base);
+            offset += 8;
+        }
     }
     if (offset + 4 <= size) {
-        v3_text_appendf(out, cap, "  str wzr, [x%d, #%d]\n", addr_reg, offset);
+        if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, offset)) {
+            return false;
+        }
+        v3_text_appendf(out, cap, "  str wzr, [x14, #0]\n");
         offset += 4;
     }
     while (offset < size) {
-        v3_text_appendf(out, cap, "  strb wzr, [x%d, #%d]\n", addr_reg, offset);
+        if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, offset)) {
+            return false;
+        }
+        v3_text_appendf(out, cap, "  strb wzr, [x14, #0]\n");
         offset += 1;
     }
     return true;
@@ -8695,12 +8946,13 @@ static bool v3_emit_copy_address_to_address(char *out,
     }
     v3_text_appendf(out, cap,
                     "  mov x0, x%d\n"
-                    "  mov x1, x%d\n"
-                    "  mov w2, #%d\n"
-                    "  bl _copyMem\n",
+                    "  mov x1, x%d\n",
                     dst_reg,
-                    src_reg,
-                    size);
+                    src_reg);
+    if (!v3_emit_mov_imm(out, cap, 2, size)) {
+        return false;
+    }
+    v3_text_appendf(out, cap, "  bl _copyMem\n");
     return true;
 }
 
@@ -10361,6 +10613,12 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                             args[i],
                                             next_call_depth,
                                             max_call_depth_io)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] prepare call arg state failed caller=%s callee=%s arg_index=%zu expr=%s\n",
+                        current_function->symbol_text,
+                        callee,
+                        i,
+                        args[i]);
                 return false;
             }
             if (is_constructor_call) {
@@ -10394,6 +10652,13 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                     has_target && i < target.param_count
                                                         ? target.param_abi_classes[i]
                                                         : "")) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] prepare composite call arg temp failed caller=%s callee=%s arg_index=%zu expr=%s has_target=%d\n",
+                        current_function->symbol_text,
+                        callee,
+                        i,
+                        args[i],
+                        has_target ? 1 : 0);
                 return false;
             }
         }
@@ -12530,6 +12795,7 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
     char normalized_left_type[256];
     char normalized_right_type[256];
     const char *compare_abi = "i64";
+    bool compare_wide = true;
     const char *cond = NULL;
     if (op_index < 0) {
         return false;
@@ -12675,6 +12941,13 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
     }
     if (strcmp(left_abi, "ptr") == 0 && strcmp(right_abi, "ptr") == 0) {
         compare_abi = "ptr";
+        compare_wide = true;
+    } else if (strcmp(left_abi, "i64") == 0 || strcmp(right_abi, "i64") == 0) {
+        compare_abi = "i64";
+        compare_wide = true;
+    } else {
+        compare_abi = "i32";
+        compare_wide = false;
     }
     if (!v3_codegen_expr_scalar(plan,
                                 lowering,
@@ -12739,13 +13012,23 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
     } else {
         return false;
     }
-    v3_text_appendf(out, cap,
-                    "  cmp x%d, x%d\n"
-                    "  cset w%d, %s\n",
-                    target_reg,
-                    target_reg + 1,
-                    target_reg,
-                    cond);
+    if (compare_wide) {
+        v3_text_appendf(out, cap,
+                        "  cmp x%d, x%d\n"
+                        "  cset w%d, %s\n",
+                        target_reg,
+                        target_reg + 1,
+                        target_reg,
+                        cond);
+    } else {
+        v3_text_appendf(out, cap,
+                        "  cmp w%d, w%d\n"
+                        "  cset w%d, %s\n",
+                        target_reg,
+                        target_reg + 1,
+                        target_reg,
+                        cond);
+    }
     return true;
 }
 
@@ -15111,6 +15394,28 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         return v3_emit_copy_slot_to_address(lowering, out, cap, &locals[local_index], dest_addr_reg);
     }
     {
+        const V3TopLevelConstStub *top_level_const =
+            v3_find_expr_top_level_const(lowering,
+                                         current_function->owner_module_path,
+                                         aliases,
+                                         alias_count,
+                                         expr);
+        if (top_level_const) {
+            if (strcmp(top_level_const->type_text, "str") == 0 &&
+                strcmp(top_level_const->abi_class, "composite") == 0 &&
+                top_level_const->has_str_value) {
+                return strcmp(normalized_dest_type, "str") == 0 &&
+                       v3_emit_str_literal_into_address(current_function,
+                                                       top_level_const->str_value,
+                                                       dest_addr_reg,
+                                                       string_label_index_io,
+                                                       out,
+                                                       cap);
+            }
+            return false;
+        }
+    }
+    {
         char global_type[256];
         char global_abi[32];
         int src_addr_reg = dest_addr_reg == 14 ? 15 : 14;
@@ -15578,13 +15883,8 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
         char label[128];
         char arg_type[256];
         char arg_abi[32];
-        char inner_callee[PATH_MAX];
-        char inner_arg[4096] = {0};
-        char inner_args[CHENG_V3_MAX_CALL_ARGS][4096];
-        size_t inner_arg_count = 0U;
         char field_type[256];
         char field_abi[32];
-        int32_t field_offset = 0;
         int32_t local_index = -1;
         *handled_out = true;
         if (v3_parse_string_literal_text(args[0], literal, sizeof(literal))) {
@@ -15603,60 +15903,6 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                             "  bl _cheng_v3_panic_cstring_and_exit\n",
                             label,
                             label);
-            return true;
-        }
-        if (((v3_parse_call_text(args[0],
-                                 inner_callee,
-                                 sizeof(inner_callee),
-                                 inner_args,
-                                 &inner_arg_count,
-                                 CHENG_V3_MAX_CALL_ARGS) &&
-              inner_arg_count == 1U &&
-              (snprintf(inner_arg, sizeof(inner_arg), "%s", inner_args[0]), true)) ||
-             v3_parse_prefix_single_arg_call(args[0], inner_callee, sizeof(inner_callee), inner_arg, sizeof(inner_arg))) &&
-            (strcmp(inner_callee, "Error") == 0 || strcmp(inner_callee, "ErrorText") == 0)) {
-            if (!v3_emit_result_field_address(plan,
-                                              lowering,
-                                              current_function,
-                                              aliases,
-                                              alias_count,
-                                              locals,
-                                              local_count,
-                                              inner_arg,
-                                              "err",
-                                              15,
-                                              call_arg_base,
-                                              string_temp_base,
-                                              string_temp_stride,
-                                              string_label_index_io,
-                                              0,
-                                              out,
-                                              cap,
-                                              field_type,
-                                              sizeof(field_type),
-                                              field_abi,
-                                              sizeof(field_abi)) ||
-                !v3_resolve_field_meta(lowering,
-                                       field_type,
-                                       "msg",
-                                       field_type,
-                                       sizeof(field_type),
-                                       field_abi,
-                                       sizeof(field_abi),
-                                       &field_offset) ||
-                strcmp(field_type, "str") != 0 ||
-                strcmp(field_abi, "composite") != 0) {
-                return false;
-            }
-            if (field_offset != 0) {
-                if (!v3_emit_add_address_offset(out, cap, 15, 15, field_offset)) {
-                    return false;
-                }
-            }
-            v3_text_appendf(out, cap,
-                            "  mov x0, x15\n"
-                            "  bl _driver_c_str_clone\n"
-                            "  bl _cheng_v3_panic_cstring_and_exit\n");
             return true;
         }
         if (!v3_infer_expr_type(plan,
@@ -15731,16 +15977,51 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                 args[0],
                                                 field_type,
                                                 sizeof(field_type),
-                                                field_abi,
-                                                sizeof(field_abi),
-                                                15)) ||
+                                                   field_abi,
+                                                   sizeof(field_abi),
+                                                   15)) ||
                    strcmp(field_type, "str") != 0 ||
                    strcmp(field_abi, "composite") != 0) {
-            return false;
+            V3AsmLocalSlot temp_slot;
+            if (string_temp_stride < 24) {
+                return false;
+            }
+            memset(&temp_slot, 0, sizeof(temp_slot));
+            snprintf(temp_slot.name, sizeof(temp_slot.name), "%s", "__v3_panic_str_tmp");
+            snprintf(temp_slot.type_text, sizeof(temp_slot.type_text), "%s", "str");
+            snprintf(temp_slot.abi_class, sizeof(temp_slot.abi_class), "%s", "composite");
+            temp_slot.stack_offset = string_temp_base;
+            temp_slot.stack_size = 24;
+            temp_slot.stack_align = 8;
+            if (!v3_emit_slot_address(out, cap, &temp_slot, 15) ||
+                !v3_materialize_composite_expr_into_address(plan,
+                                                            lowering,
+                                                            current_function,
+                                                            aliases,
+                                                            alias_count,
+                                                            locals,
+                                                            local_count,
+                                                            args[0],
+                                                            "str",
+                                                            15,
+                                                            call_arg_base,
+                                                            string_temp_base,
+                                                            string_temp_stride,
+                                                            string_label_index_io,
+                                                            1,
+                                                            out,
+                                                            cap)) {
+                return false;
+            }
+        } else {
+            if (strcmp(field_type, "str") != 0 ||
+                strcmp(field_abi, "composite") != 0) {
+                return false;
+            }
         }
         v3_text_appendf(out, cap,
                         "  mov x0, x15\n"
-                        "  bl _driver_c_str_clone\n"
+                        "  bl _cheng_str_to_cstring_temp_bridge\n"
                         "  bl _cheng_v3_panic_cstring_and_exit\n");
         return true;
     }

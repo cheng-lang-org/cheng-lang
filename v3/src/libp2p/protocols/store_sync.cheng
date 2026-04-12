@@ -299,6 +299,7 @@ fn v3StoreSyncAppendIngress(buf: var layout.ByteBuf,
     lt.v3AppendFixed32(buf, ingress.sourcePeerId)
     lt.v3AppendU32BE(buf, ingress.topicScope)
     lt.v3AppendAddress(buf, ingress.address)
+    lt.v3AppendU32BE(buf, ingress.payloadKind)
     lt.v3AppendFixed32(buf, ingress.payloadCid)
     lt.v3AppendU32BE(buf, ingress.payloadLen)
     lt.v3AppendU32BE(buf, ingress.stampEpoch)
@@ -361,6 +362,10 @@ fn v3StoreSyncReadIngress(payload: Bytes,
     if IsErr(addressNextRes):
         return Err[int32](Error(addressNextRes))
     next = Value(addressNextRes)
+    let payloadKindRes = codec.v3ReadU32BE(span, next)
+    if IsErr(payloadKindRes):
+        return Err[int32](Error(payloadKindRes))
+    next = next + 4
     let payloadCidRes = codec.v3ReadFixed32(span, next)
     if IsErr(payloadCidRes):
         return Err[int32](Error(payloadCidRes))
@@ -390,6 +395,7 @@ fn v3StoreSyncReadIngress(payload: Bytes,
     out.sourcePeerId = Value(sourcePeerRes)
     out.topicScope = int32(Value(scopeRes))
     out.address = address
+    out.payloadKind = int32(Value(payloadKindRes))
     out.payloadCid = Value(payloadCidRes)
     out.payloadLen = payloadLen
     out.stampEpoch = int32(Value(stampEpochRes))
@@ -478,33 +484,40 @@ fn v3Libp2pStoreEntriesEncode(entries: overlay.V3IngressEnvelope[]): Bytes =
         v3StoreSyncAppendIngress(buf, entries[i])
     return layout.byteBufToBytes(buf)
 
-fn v3Libp2pStoreEntriesDecode(payload: Bytes): Result[overlay.V3IngressEnvelope[]] =
+fn v3Libp2pStoreEntriesDecodeFill(payload: Bytes,
+                                  out: var overlay.V3IngressEnvelope[]): Result[bool] =
     if !v3Libp2pSyncPayloadHasResponseMagic(payload):
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p sync: invalid response magic")
+        return Err[bool]("v3 libp2p sync: invalid response magic")
     let magicLen = v3Libp2pSyncResponseMagicLen
     let span = layout.byteSpanFromBytes(payload)
     let versionRes = codec.v3ReadU32BE(span, magicLen)
     if IsErr(versionRes):
-        return Err[overlay.V3IngressEnvelope[]](Error(versionRes))
+        return Err[bool](Error(versionRes))
     if int32(Value(versionRes)) != v3Libp2pStoreSyncCodecVersion:
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p sync: unsupported response version")
+        return Err[bool]("v3 libp2p sync: unsupported response version")
     let countRes = codec.v3ReadU32BE(span, magicLen + 4)
     if IsErr(countRes):
-        return Err[overlay.V3IngressEnvelope[]](Error(countRes))
+        return Err[bool](Error(countRes))
     let count = int32(Value(countRes))
     if count < 0:
-        return Err[overlay.V3IngressEnvelope[]]("v3 libp2p sync: invalid response count")
+        return Err[bool]("v3 libp2p sync: invalid response count")
     var next = magicLen + 8
-    var out: overlay.V3IngressEnvelope[]
     out = []
     for i in 0..<count:
         var ingress: overlay.V3IngressEnvelope
         ingress = overlay.v3OverlayIngressEnvelopeZero()
         let nextRes = v3StoreSyncReadIngress(payload, next, ingress)
         if IsErr(nextRes):
-            return Err[overlay.V3IngressEnvelope[]](Error(nextRes))
+            return Err[bool](Error(nextRes))
         next = Value(nextRes)
         add(out, ingress)
+    return Ok[bool](true)
+
+fn v3Libp2pStoreEntriesDecode(payload: Bytes): Result[overlay.V3IngressEnvelope[]] =
+    var out: overlay.V3IngressEnvelope[]
+    let fillRes = v3Libp2pStoreEntriesDecodeFill(payload, out)
+    if IsErr(fillRes):
+        return Err[overlay.V3IngressEnvelope[]](Error(fillRes))
     return Ok[overlay.V3IngressEnvelope[]](out)
 
 fn v3Libp2pSyncServePayload(entries: V3Libp2pStoreEntry[],

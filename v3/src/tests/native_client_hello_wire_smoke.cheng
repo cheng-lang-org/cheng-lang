@@ -1,0 +1,43 @@
+import std/system
+import std/result
+import std/rawbytes
+import cheng/v3/quic/native_runtime as qnative
+import cheng/v3/quic/tls/test_pki as testpki
+import cheng/v3/quic/core/frame_model
+import cheng/v3/quic/core/packet_model
+import cheng/v3/quic/core/packet_header_model
+
+fn main(): int32 =
+    qnative.msquicNativeResetSession()
+    qnative.msquicNativeSetClientPolicyCache(testpki.msquicMakeLocalhostTlsPolicy())
+
+    let payloadRes: Result[Bytes] = qnative.msquicNativeDebugBuildClientHelloPayload()
+    if IsErr(payloadRes):
+        panic(ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+    assert(bytesLen(payload) > 0, "v3 native_client_hello_wire: payload bytes")
+    assert(bytesGet(payload, 0) == qnative.msquicNativeFrameCryptoCode,
+        "v3 native_client_hello_wire: payload first frame kind")
+
+    let wireRes: Result[Bytes] = qnative.msquicNativeDebugBuildClientHelloWire()
+    if IsErr(wireRes):
+        panic(ErrorText(wireRes))
+    let wire: Bytes = Value(wireRes)
+    let headerRes = packet_header_model.quicPacketHeaderDecode(wire, qnative.msquicNativeConnIdLen)
+    if IsErr(headerRes):
+        panic(ErrorText(headerRes))
+    let headerDec: packet_header_model.QuicPacketHeaderDecoded = Value(headerRes)
+    let payloadOffset: int32 = headerDec.next
+    let payloadLen: int32 = int32(headerDec.header.payloadLength) - headerDec.header.packetNumberLen
+    let decodedPayload: Bytes = bytesSlice(wire, payloadOffset, payloadLen)
+
+    var pkt: packet_model.MsQuicPacket
+    let pktRes = packet_model.msquicPacketPayloadDecodeInto(pkt, decodedPayload, headerDec.header.packetNumber)
+    if IsErr(pktRes):
+        panic(ErrorText(pktRes))
+    assert(pkt.framesCount == 1, "v3 native_client_hello_wire: one frame")
+    assert(pkt.frames[0].kind == frame_model.FrameCrypto, "v3 native_client_hello_wire: decoded crypto")
+    assert(bytesLen(pkt.frames[0].data) > 0, "v3 native_client_hello_wire: crypto data")
+
+    echo("v3 native_client_hello_wire_smoke ok")
+    return 0

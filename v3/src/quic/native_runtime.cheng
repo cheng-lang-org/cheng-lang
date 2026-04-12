@@ -8,17 +8,14 @@ import std/buffer
 import std/tls/x509
 import cheng/v3/quic/multiaddress
 import cheng/v3/quic/msquicruntime
-import cheng/v3/quic/msquicconnection
 import cheng/v3/quic/tls/policy
 import cheng/v3/quic/tls/handshake13
 import cheng/v3/quic/core/frame_model
 import cheng/v3/quic/core/crypto_stream
 import cheng/v3/quic/core/packet_model
 import cheng/v3/quic/core/packet_header_model
-import cheng/v3/quic/core/connection_model
 import cheng/v3/quic/core/connection_impl
 import cheng/v3/quic/core/flow_control_model
-import cheng/v3/quic/core/perf_tuning
 import cheng/v3/quic/platform/common
 import cheng/v3/quic/platform/datapath_model
 import cheng/v3/quic/platform/datapath_runtime
@@ -39,16 +36,27 @@ const
     msquicNativeStreamServer = 1
     msquicNativeAlpn = "dm"
     msquicNativePumpBudget = 32
+    msquicNativeDialReadyTimeoutMs = 5000
+    msquicNativePipeReadTimeoutMs = 5000
+    msquicNativePacketShortCode = 0
+    msquicNativePacketInitialCode = 1
+    msquicNativePacket0RttCode = 2
+    msquicNativePacketHandshakeCode = 3
+    msquicNativePacketRetryCode = 4
+    msquicNativeFramePingCode = 0x01
+    msquicNativeFrameAckCode = 0x02
+    msquicNativeFrameCryptoCode = 0x06
+    msquicNativeFrameDataCode = 0x0e
+    msquicNativeFrameMaxDataCode = 0x10
+    msquicNativeFrameMaxStreamDataCode = 0x11
+    msquicNativeFrameConnectionCloseCode = 0x1c
+    msquicNativeFrameConnectionCloseAppCode = 0x1d
+    msquicNativeFrameHandshakeDoneCode = 0x1e
+    msquicNativeFrameDatagramCode = 0x30
 
 type
     MsQuicNativeEndpoint =
-        handshake: MsQuicTls13HandshakeState
-        impl: MsQuicConnImpl
-        initialCrypto: MsQuicCryptoStream
-        handshakeCrypto: MsQuicCryptoStream
-        appRecv: MsQuicCryptoStream
         datagramCount: int32
-        datagrams: Bytes[msquicNativeDatagramQueue]
         sendOffset: int64
         ready: bool
         maxDataSent: bool
@@ -57,6 +65,7 @@ type
     MsQuicNativeSession =
         active: bool
         closed: bool
+        serverBound: bool
         serverFlightSent: bool
         clientFinishedSent: bool
         clientAddrText: str
@@ -89,6 +98,12 @@ fn msquicNativeEmptyAddr(): MultiAddress =
     out.raw = ""
     out.data = emptyBytes()
     return out
+
+fn msquicNativePacketTypeCode(packetType: QuicPacketType): int32 =
+    return int32(packetType)
+
+fn msquicNativeFrameTypeCode(frame: MsQuicFrame): int64 =
+    return msquicFrameTypeWireCode(frame.kind)
 
 fn msquicNativeCopyBytes(src: Bytes): Bytes =
     let srcLen: int32 = bytesLen(src)
@@ -131,140 +146,465 @@ fn msquicNativeBytesTakePrefix(buf: var Bytes, count: int32): Bytes =
     buf = rest
     return out
 
-fn msquicNativeEnqueueDatagram(endpoint: var MsQuicNativeEndpoint, data: Bytes): Result[bool] =
-    if endpoint.datagramCount >= msquicNativeDatagramQueue:
+fn msquicNativeClientDatagramGet(idx: int32): Bytes =
+    if idx == 0:
+        return msquicNativeClientDatagram0
+    if idx == 1:
+        return msquicNativeClientDatagram1
+    if idx == 2:
+        return msquicNativeClientDatagram2
+    if idx == 3:
+        return msquicNativeClientDatagram3
+    if idx == 4:
+        return msquicNativeClientDatagram4
+    if idx == 5:
+        return msquicNativeClientDatagram5
+    if idx == 6:
+        return msquicNativeClientDatagram6
+    if idx == 7:
+        return msquicNativeClientDatagram7
+    if idx == 8:
+        return msquicNativeClientDatagram8
+    if idx == 9:
+        return msquicNativeClientDatagram9
+    if idx == 10:
+        return msquicNativeClientDatagram10
+    if idx == 11:
+        return msquicNativeClientDatagram11
+    if idx == 12:
+        return msquicNativeClientDatagram12
+    if idx == 13:
+        return msquicNativeClientDatagram13
+    if idx == 14:
+        return msquicNativeClientDatagram14
+    if idx == 15:
+        return msquicNativeClientDatagram15
+    return emptyBytes()
+
+fn msquicNativeClientDatagramSet(idx: int32, data: Bytes) =
+    if idx == 0:
+        msquicNativeClientDatagram0 = data
+        return
+    if idx == 1:
+        msquicNativeClientDatagram1 = data
+        return
+    if idx == 2:
+        msquicNativeClientDatagram2 = data
+        return
+    if idx == 3:
+        msquicNativeClientDatagram3 = data
+        return
+    if idx == 4:
+        msquicNativeClientDatagram4 = data
+        return
+    if idx == 5:
+        msquicNativeClientDatagram5 = data
+        return
+    if idx == 6:
+        msquicNativeClientDatagram6 = data
+        return
+    if idx == 7:
+        msquicNativeClientDatagram7 = data
+        return
+    if idx == 8:
+        msquicNativeClientDatagram8 = data
+        return
+    if idx == 9:
+        msquicNativeClientDatagram9 = data
+        return
+    if idx == 10:
+        msquicNativeClientDatagram10 = data
+        return
+    if idx == 11:
+        msquicNativeClientDatagram11 = data
+        return
+    if idx == 12:
+        msquicNativeClientDatagram12 = data
+        return
+    if idx == 13:
+        msquicNativeClientDatagram13 = data
+        return
+    if idx == 14:
+        msquicNativeClientDatagram14 = data
+        return
+    if idx == 15:
+        msquicNativeClientDatagram15 = data
+        return
+
+fn msquicNativeServerDatagramGet(idx: int32): Bytes =
+    if idx == 0:
+        return msquicNativeServerDatagram0
+    if idx == 1:
+        return msquicNativeServerDatagram1
+    if idx == 2:
+        return msquicNativeServerDatagram2
+    if idx == 3:
+        return msquicNativeServerDatagram3
+    if idx == 4:
+        return msquicNativeServerDatagram4
+    if idx == 5:
+        return msquicNativeServerDatagram5
+    if idx == 6:
+        return msquicNativeServerDatagram6
+    if idx == 7:
+        return msquicNativeServerDatagram7
+    if idx == 8:
+        return msquicNativeServerDatagram8
+    if idx == 9:
+        return msquicNativeServerDatagram9
+    if idx == 10:
+        return msquicNativeServerDatagram10
+    if idx == 11:
+        return msquicNativeServerDatagram11
+    if idx == 12:
+        return msquicNativeServerDatagram12
+    if idx == 13:
+        return msquicNativeServerDatagram13
+    if idx == 14:
+        return msquicNativeServerDatagram14
+    if idx == 15:
+        return msquicNativeServerDatagram15
+    return emptyBytes()
+
+fn msquicNativeServerDatagramSet(idx: int32, data: Bytes) =
+    if idx == 0:
+        msquicNativeServerDatagram0 = data
+        return
+    if idx == 1:
+        msquicNativeServerDatagram1 = data
+        return
+    if idx == 2:
+        msquicNativeServerDatagram2 = data
+        return
+    if idx == 3:
+        msquicNativeServerDatagram3 = data
+        return
+    if idx == 4:
+        msquicNativeServerDatagram4 = data
+        return
+    if idx == 5:
+        msquicNativeServerDatagram5 = data
+        return
+    if idx == 6:
+        msquicNativeServerDatagram6 = data
+        return
+    if idx == 7:
+        msquicNativeServerDatagram7 = data
+        return
+    if idx == 8:
+        msquicNativeServerDatagram8 = data
+        return
+    if idx == 9:
+        msquicNativeServerDatagram9 = data
+        return
+    if idx == 10:
+        msquicNativeServerDatagram10 = data
+        return
+    if idx == 11:
+        msquicNativeServerDatagram11 = data
+        return
+    if idx == 12:
+        msquicNativeServerDatagram12 = data
+        return
+    if idx == 13:
+        msquicNativeServerDatagram13 = data
+        return
+    if idx == 14:
+        msquicNativeServerDatagram14 = data
+        return
+    if idx == 15:
+        msquicNativeServerDatagram15 = data
+        return
+
+fn msquicNativeEnqueueClientDatagram(data: Bytes): Result[bool] =
+    let count: int32 = msquicNativeClientDatagramCount
+    if count >= msquicNativeDatagramQueue:
         return Err[bool]("msquic native: datagram queue full")
-    endpoint.datagrams[endpoint.datagramCount] = msquicNativeCopyBytes(data)
-    endpoint.datagramCount = endpoint.datagramCount + 1
+    msquicNativeClientDatagramSet(count, msquicNativeCopyBytes(data))
+    msquicNativeClientDatagramCount = count + 1
     return Ok[bool](true)
 
-fn msquicNativeDequeueDatagram(endpoint: var MsQuicNativeEndpoint): Result[Bytes] =
-    if endpoint.datagramCount <= 0:
-        return Err[Bytes]("msquic udp: queue empty")
-    let out: Bytes = endpoint.datagrams[0]
-    for i in 1..<endpoint.datagramCount:
-        endpoint.datagrams[i - 1] = endpoint.datagrams[i]
-    endpoint.datagrams[endpoint.datagramCount - 1] = emptyBytes()
-    endpoint.datagramCount = endpoint.datagramCount - 1
-    return Ok[Bytes](out)
+fn msquicNativeEnqueueServerDatagram(data: Bytes): Result[bool] =
+    let count: int32 = msquicNativeServerDatagramCount
+    if count >= msquicNativeDatagramQueue:
+        return Err[bool]("msquic native: datagram queue full")
+    msquicNativeServerDatagramSet(count, msquicNativeCopyBytes(data))
+    msquicNativeServerDatagramCount = count + 1
+    return Ok[bool](true)
 
-fn msquicNativeResetEndpoint(
-    endpoint: var MsQuicNativeEndpoint,
-    role: MsQuicTls13HandshakeRole,
-    localAddr: MultiAddress,
-    remoteAddr: MultiAddress,
-    settings: MsQuicSettings,
-    connId: int64,
+fn msquicNativeEnqueueDatagram(side: int32, data: Bytes): Result[bool] =
+    if side == msquicNativeClientSide:
+        return msquicNativeEnqueueClientDatagram(data)
+    if side == msquicNativeServerSide:
+        return msquicNativeEnqueueServerDatagram(data)
+    return Err[bool]("msquic native: invalid side")
+
+fn msquicNativeDequeueDatagram(side: int32): Result[Bytes] =
+    if side == msquicNativeClientSide:
+        if msquicNativeClientDatagramCount <= 0:
+            return Err[Bytes]("msquic udp: queue empty")
+        let out: Bytes = msquicNativeClientDatagramGet(0)
+        for i in 1..<msquicNativeClientDatagramCount:
+            msquicNativeClientDatagramSet(i - 1, msquicNativeClientDatagramGet(i))
+        msquicNativeClientDatagramSet(msquicNativeClientDatagramCount - 1, emptyBytes())
+        msquicNativeClientDatagramCount = msquicNativeClientDatagramCount - 1
+        return Ok[Bytes](out)
+    if side == msquicNativeServerSide:
+        if msquicNativeServerDatagramCount <= 0:
+            return Err[Bytes]("msquic udp: queue empty")
+        let out: Bytes = msquicNativeServerDatagramGet(0)
+        for i in 1..<msquicNativeServerDatagramCount:
+            msquicNativeServerDatagramSet(i - 1, msquicNativeServerDatagramGet(i))
+        msquicNativeServerDatagramSet(msquicNativeServerDatagramCount - 1, emptyBytes())
+        msquicNativeServerDatagramCount = msquicNativeServerDatagramCount - 1
+        return Ok[Bytes](out)
+    return Err[Bytes]("msquic native: invalid side")
+
+fn msquicNativeConnWindow(settings: MsQuicSettings): int64 =
+    if settings.connFlowControlWindow > 0:
+        return int64(settings.connFlowControlWindow)
+    return 1048576
+
+fn msquicNativeStreamWindow(settings: MsQuicSettings): int64 =
+    if settings.streamRecvWindowDefault > 0:
+        return int64(settings.streamRecvWindowDefault)
+    if settings.streamRecvBufferDefault > 0:
+        return int64(settings.streamRecvBufferDefault)
+    return 1048576
+
+fn msquicNativePacketMtu(settings: MsQuicSettings): int32 =
+    if settings.minimumMtu >= 1200:
+        return settings.minimumMtu
+    return 1200
+
+fn msquicNativeInitialWindowPackets(settings: MsQuicSettings): int32 =
+    if settings.initialWindowPackets > 0:
+        return settings.initialWindowPackets
+    return 10
+
+fn msquicNativeResetClientDatagrams() =
+    msquicNativeClientDatagramCount = 0
+    for i in 0..<msquicNativeDatagramQueue:
+        msquicNativeClientDatagramSet(i, emptyBytes())
+
+fn msquicNativeResetServerDatagrams() =
+    msquicNativeServerDatagramCount = 0
+    for i in 0..<msquicNativeDatagramQueue:
+        msquicNativeServerDatagramSet(i, emptyBytes())
+
+fn msquicNativeResetClientEndpointState() =
+    msquicNativeClientSendOffset = 0
+    msquicNativeClientReady = false
+    msquicNativeClientMaxDataSent = false
+    msquicNativeClientMaxStreamDataSent = false
+
+fn msquicNativeResetServerEndpointState() =
+    msquicNativeServerSendOffset = 0
+    msquicNativeServerReady = false
+    msquicNativeServerMaxDataSent = false
+    msquicNativeServerMaxStreamDataSent = false
+
+fn msquicNativeResetClientEndpoint(
+    settings: var MsQuicSettings,
     requireCert: bool
 ) =
-    var handshake: MsQuicTls13HandshakeState
-    initMsQuicTls13HandshakeStateInto(handshake, role)
-    msquicTls13HandshakeSetRequireCert(handshake, requireCert)
-    endpoint.handshake = handshake
-    var connWindow: int64 = 1048576
-    if settings.connFlowControlWindow > 0:
-        connWindow = int64(settings.connFlowControlWindow)
-    var streamWindow: int64 = 1048576
-    if settings.streamRecvWindowDefault > 0:
-        streamWindow = int64(settings.streamRecvWindowDefault)
-    elif settings.streamRecvBufferDefault > 0:
-        streamWindow = int64(settings.streamRecvBufferDefault)
-    var mtu: int32 = 1200
-    if settings.minimumMtu >= 1200:
-        mtu = settings.minimumMtu
-    var initialWin: int32 = 10
-    if settings.initialWindowPackets > 0:
-        initialWin = settings.initialWindowPackets
-    var isClient: bool = false
-    if role == TlsRoleClient:
-        isClient = true
-    var conn: MsQuicConnection
-    initMsQuicConnectionInto(conn, connId, localAddr, remoteAddr, settings, isClient)
-    var state: MsQuicConnState
-    initMsQuicConnStateInto(state, conn)
-    var flow: MsQuicFlowControl
-    initMsQuicFlowControlInto(flow, connWindow, streamWindow)
-    var perf: MsQuicPerfConfig
-    initMsQuicPerfConfigInto(perf)
-    initMsQuicConnImpl(endpoint.impl, state, flow, perf, mtu, initialWin)
-    var initialCrypto: MsQuicCryptoStream
-    var handshakeCrypto: MsQuicCryptoStream
-    var appRecv: MsQuicCryptoStream
-    initMsQuicCryptoStreamInto(initialCrypto)
-    initMsQuicCryptoStreamInto(handshakeCrypto)
-    initMsQuicCryptoStreamInto(appRecv)
-    endpoint.initialCrypto = initialCrypto
-    endpoint.handshakeCrypto = handshakeCrypto
-    endpoint.appRecv = appRecv
-    endpoint.datagramCount = 0
-    for i in 0..<msquicNativeDatagramQueue:
-        endpoint.datagrams[i] = emptyBytes()
-    endpoint.sendOffset = 0
-    endpoint.ready = false
-    endpoint.maxDataSent = false
-    endpoint.maxStreamDataSent = false
+    msquicTls13ResetClientDefault(requireCert)
+    let clientMaxData: int64 = msquicNativeConnWindow(settings)
+    let clientMaxStreamData: int64 = msquicNativeStreamWindow(settings)
+    initMsQuicFlowControlInto(msquicNativeClientFlow, clientMaxData, clientMaxStreamData)
+    initMsQuicConnImpl(msquicNativeClientImpl,
+                       0,
+                       msquicNativeClientFlow,
+                       msquicNativePacketMtu(settings),
+                       msquicNativeInitialWindowPackets(settings))
+    msquicNativeClientInitialCrypto = initMsQuicCryptoStream()
+    msquicNativeClientHandshakeCrypto = initMsQuicCryptoStream()
+    msquicNativeClientAppRecv = initMsQuicCryptoStream()
+    msquicNativeResetClientDatagrams()
+    msquicNativeResetClientEndpointState()
 
-fn msquicNativeDrainCryptoStream(
-    stream: var MsQuicCryptoStream,
-    handshake: var MsQuicTls13HandshakeState
-): Result[bool] =
-    while msquicCryptoStreamAvailable(stream) > 0:
-        let chunk: Bytes = msquicCryptoStreamConsume(stream, msquicCryptoStreamAvailable(stream))
+fn msquicNativeResetServerEndpoint(
+    settings: var MsQuicSettings,
+    requireCert: bool
+) =
+    msquicTls13ResetServerDefault(requireCert)
+    let serverMaxData: int64 = msquicNativeConnWindow(settings)
+    let serverMaxStreamData: int64 = msquicNativeStreamWindow(settings)
+    initMsQuicFlowControlInto(msquicNativeServerFlow, serverMaxData, serverMaxStreamData)
+    initMsQuicConnImpl(msquicNativeServerImpl,
+                       1,
+                       msquicNativeServerFlow,
+                       msquicNativePacketMtu(settings),
+                       msquicNativeInitialWindowPackets(settings))
+    msquicNativeServerInitialCrypto = initMsQuicCryptoStream()
+    msquicNativeServerHandshakeCrypto = initMsQuicCryptoStream()
+    msquicNativeServerAppRecv = initMsQuicCryptoStream()
+    msquicNativeResetServerDatagrams()
+    msquicNativeResetServerEndpointState()
+
+fn msquicNativeCryptoStreamAvailableByCode(side: int32, packetTypeCode: int32): int32 =
+    if side == msquicNativeClientSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            return msquicCryptoStreamAvailable(msquicNativeClientInitialCrypto)
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            return msquicCryptoStreamAvailable(msquicNativeClientHandshakeCrypto)
+        return 0
+    if side == msquicNativeServerSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            return msquicCryptoStreamAvailable(msquicNativeServerInitialCrypto)
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            return msquicCryptoStreamAvailable(msquicNativeServerHandshakeCrypto)
+        return 0
+    return 0
+
+fn msquicNativeCryptoStreamConsumeByCode(side: int32, packetTypeCode: int32, length: int32): Bytes =
+    if side == msquicNativeClientSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            var stream = msquicNativeClientInitialCrypto
+            let out: Bytes = msquicCryptoStreamConsume(stream, length)
+            msquicNativeClientInitialCrypto = stream
+            return out
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            var stream = msquicNativeClientHandshakeCrypto
+            let out: Bytes = msquicCryptoStreamConsume(stream, length)
+            msquicNativeClientHandshakeCrypto = stream
+            return out
+        return emptyBytes()
+    if side == msquicNativeServerSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            var stream = msquicNativeServerInitialCrypto
+            let out: Bytes = msquicCryptoStreamConsume(stream, length)
+            msquicNativeServerInitialCrypto = stream
+            return out
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            var stream = msquicNativeServerHandshakeCrypto
+            let out: Bytes = msquicCryptoStreamConsume(stream, length)
+            msquicNativeServerHandshakeCrypto = stream
+            return out
+        return emptyBytes()
+    return emptyBytes()
+
+fn msquicNativeCryptoStreamAddByCode(side: int32, packetTypeCode: int32, offset: int64, data: Bytes): Result[bool] =
+    if side == msquicNativeClientSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            var stream = msquicNativeClientInitialCrypto
+            let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+            msquicNativeClientInitialCrypto = stream
+            return addRes
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            var stream = msquicNativeClientHandshakeCrypto
+            let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+            msquicNativeClientHandshakeCrypto = stream
+            return addRes
+        return Ok[bool](true)
+    if side == msquicNativeServerSide:
+        if packetTypeCode == msquicNativePacketInitialCode:
+            var stream = msquicNativeServerInitialCrypto
+            let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+            msquicNativeServerInitialCrypto = stream
+            return addRes
+        if packetTypeCode == msquicNativePacketHandshakeCode:
+            var stream = msquicNativeServerHandshakeCrypto
+            let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+            msquicNativeServerHandshakeCrypto = stream
+            return addRes
+        return Ok[bool](true)
+    return Err[bool]("msquic native: invalid side")
+
+fn msquicNativeAppRecvAvailable(side: int32): int32 =
+    if side == msquicNativeClientSide:
+        return msquicCryptoStreamAvailable(msquicNativeClientAppRecv)
+    if side == msquicNativeServerSide:
+        return msquicCryptoStreamAvailable(msquicNativeServerAppRecv)
+    return 0
+
+fn msquicNativeAppRecvConsume(side: int32, length: int32): Bytes =
+    if side == msquicNativeClientSide:
+        var stream = msquicNativeClientAppRecv
+        let out: Bytes = msquicCryptoStreamConsume(stream, length)
+        msquicNativeClientAppRecv = stream
+        return out
+    if side == msquicNativeServerSide:
+        var stream = msquicNativeServerAppRecv
+        let out: Bytes = msquicCryptoStreamConsume(stream, length)
+        msquicNativeServerAppRecv = stream
+        return out
+    return emptyBytes()
+
+fn msquicNativeAppRecvAdd(side: int32, offset: int64, data: Bytes): Result[bool] =
+    if side == msquicNativeClientSide:
+        var stream = msquicNativeClientAppRecv
+        let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+        msquicNativeClientAppRecv = stream
+        return addRes
+    if side == msquicNativeServerSide:
+        var stream = msquicNativeServerAppRecv
+        let addRes: Result[bool] = msquicCryptoStreamAdd(stream, offset, data)
+        msquicNativeServerAppRecv = stream
+        return addRes
+    return Err[bool]("msquic native: invalid side")
+
+fn msquicNativeDrainCryptoStream(side: int32, packetTypeCode: int32): Result[bool] =
+    var tlsSide: int32 = 0
+    if side == msquicNativeServerSide:
+        tlsSide = 1
+    elif side != msquicNativeClientSide:
+        return Err[bool]("msquic native: invalid side")
+    while msquicNativeCryptoStreamAvailableByCode(side, packetTypeCode) > 0:
+        let chunkLen: int32 = msquicNativeCryptoStreamAvailableByCode(side, packetTypeCode)
+        let chunk: Bytes = msquicNativeCryptoStreamConsumeByCode(side, packetTypeCode, chunkLen)
         if bytesLen(chunk) <= 0:
             break
-        let feedRes: Result[int32] = msquicTls13HandshakeFeed(handshake, chunk)
+        let feedRes: Result[int32] = msquicTls13SideFeed(tlsSide, chunk)
         if IsErr(feedRes):
             return Err[bool](ErrorText(feedRes))
     return Ok[bool](true)
 
-fn msquicNativeHandleCryptoFrame(
-    endpoint: var MsQuicNativeEndpoint,
-    packetType: QuicPacketType,
-    frame: MsQuicFrame
-): Result[bool] =
-    if frame.kind != FrameCrypto:
+fn msquicNativeHandleCryptoData(side: int32, packetTypeCode: int32, offset: int64, data: Bytes): Result[bool] =
+    let addRes: Result[bool] = msquicNativeCryptoStreamAddByCode(side, packetTypeCode, offset, data)
+    if IsErr(addRes):
+        return Err[bool](ErrorText(addRes))
+    return msquicNativeDrainCryptoStream(side, packetTypeCode)
+
+fn msquicNativeHandleCryptoFrame(side: int32, packetTypeCode: int32, frame: MsQuicFrame): Result[bool] =
+    let frameKind: int64 = msquicNativeFrameTypeCode(frame)
+    if frameKind != int64(msquicNativeFrameCryptoCode):
         return Ok[bool](true)
-    if packetType == QuicPacketInitial:
-        let addRes: Result[bool] = msquicCryptoStreamAdd(endpoint.initialCrypto, frame.offset, frame.data)
-        if IsErr(addRes):
-            return Err[bool](ErrorText(addRes))
-        return msquicNativeDrainCryptoStream(endpoint.initialCrypto, endpoint.handshake)
-    if packetType == QuicPacketHandshake:
-        let addRes: Result[bool] = msquicCryptoStreamAdd(endpoint.handshakeCrypto, frame.offset, frame.data)
-        if IsErr(addRes):
-            return Err[bool](ErrorText(addRes))
-        return msquicNativeDrainCryptoStream(endpoint.handshakeCrypto, endpoint.handshake)
+    let feedRes: Result[bool] = msquicNativeHandleCryptoData(side, packetTypeCode, frame.offset, frame.data)
+    if IsErr(feedRes):
+        return Err[bool](ErrorText(feedRes))
     return Ok[bool](true)
 
-fn msquicNativeResetSession(session: var MsQuicNativeSession) =
-    session.active = false
-    session.closed = false
-    session.serverFlightSent = false
-    session.clientFinishedSent = false
-    session.clientAddrText = ""
-    session.listenerAddrText = ""
-    session.clientDatapathId = 0
-    session.listenerDatapathId = 0
-    session.dialAddr = msquicNativeEmptyAddr()
-    session.listenAddr = msquicNativeEmptyAddr()
-    session.clientSettings = initMsQuicSettings()
-    session.serverSettings = initMsQuicSettings()
-    session.clientTlsPolicy = initMsQuicTlsPolicy()
-    session.serverTlsPolicy = initMsQuicTlsPolicy()
-    session.clientCid = emptyBytes()
-    session.serverCid = emptyBytes()
-    session.clientInitialNext = 1
-    session.serverInitialNext = 1
-    session.clientHandshakeNext = 1
-    session.serverHandshakeNext = 1
-    session.clientAppNext = 1
-    session.serverAppNext = 1
-    session.serverLargestInitialRecv = 0
-    session.clientLargestHandshakeRecv = 0
-    session.clientLargestAppRecv = 0
-    session.serverLargestAppRecv = 0
-    msquicNativeResetEndpoint(session.client, TlsRoleClient, msquicNativeEmptyAddr(), msquicNativeEmptyAddr(), session.clientSettings, 1, true)
-    msquicNativeResetEndpoint(session.server, TlsRoleServer, msquicNativeEmptyAddr(), msquicNativeEmptyAddr(), session.serverSettings, 2, false)
+fn msquicNativeResetSession() =
+    msquicNativeSession.active = false
+    msquicNativeSession.closed = false
+    msquicNativeSession.serverBound = false
+    msquicNativeSession.serverFlightSent = false
+    msquicNativeSession.clientFinishedSent = false
+    msquicNativeSession.clientAddrText = ""
+    msquicNativeSession.listenerAddrText = ""
+    msquicNativeSession.clientDatapathId = 0
+    msquicNativeSession.listenerDatapathId = 0
+    msquicNativeSession.dialAddr = msquicNativeEmptyAddr()
+    msquicNativeSession.listenAddr = msquicNativeEmptyAddr()
+    var clientSettings = initMsQuicSettings()
+    var serverSettings = initMsQuicSettings()
+    msquicNativeClientCidCache = emptyBytes()
+    msquicNativeServerCidCache = emptyBytes()
+    msquicNativeResetClientPolicyCache()
+    msquicNativeResetServerPolicyCache()
+    msquicNativeClientInitialNext = 1
+    msquicNativeServerInitialNext = 1
+    msquicNativeClientHandshakeNext = 1
+    msquicNativeServerHandshakeNext = 1
+    msquicNativeClientAppNext = 1
+    msquicNativeServerAppNext = 1
+    msquicNativeServerLargestInitialRecv = 0
+    msquicNativeClientLargestHandshakeRecv = 0
+    msquicNativeClientLargestAppRecv = 0
+    msquicNativeServerLargestAppRecv = 0
+    msquicNativeResetClientEndpoint(clientSettings, true)
+    msquicNativeResetServerEndpoint(serverSettings, false)
 
 fn msquicNativeStartsWith(text: str, prefix: str): bool =
     let tlen: int32 = len(text)
@@ -278,6 +618,24 @@ fn msquicNativeStartsWith(text: str, prefix: str): bool =
             return false
     return true
 
+fn msquicNativeAddrFromDatapathText(text: str, fallback: MultiAddress): MultiAddress =
+    let parsedRes: Result[MultiAddress] = parseMultiAddress(text)
+    if IsOk(parsedRes):
+        return Value(parsedRes)
+    let udpParsedRes: Result[datapath_udp.MsQuicUdpParsedAddr] = datapath_udp.udpParseAddr(text)
+    if IsErr(udpParsedRes):
+        return fallback
+    let udpParsed: datapath_udp.MsQuicUdpParsedAddr = Value(udpParsedRes)
+    var multiaddrText: str = if udpParsed.isV6: "/ip6/" else: "/ip4/"
+    multiaddrText = multiaddrText + udpParsed.host
+    multiaddrText = multiaddrText + "/udp/"
+    multiaddrText = multiaddrText + strings.intToStr(udpParsed.port)
+    multiaddrText = multiaddrText + "/quic-v1"
+    let multiaddrRes: Result[MultiAddress] = parseMultiAddress(multiaddrText)
+    if IsOk(multiaddrRes):
+        return Value(multiaddrRes)
+    return fallback
+
 fn msquicNativeTaggedAddr(addr: MultiAddress): bool =
     if bytesLen(addr.data) < 4:
         return false
@@ -287,11 +645,7 @@ fn msquicNativeTaggedAddr(addr: MultiAddress): bool =
         return false
     return true
 
-fn msquicNativeMultiAddressBindText(addr: MultiAddress): str =
-    if msquicNativeTaggedAddr(addr):
-        let port: int32 = quicMultiAddressPort(addr)
-        return "/ip4/127.0.0.1/udp/" + msquicPlatformIntToString(port) + "/quic-v1"
-    let text: str = quicMultiAddressToString(addr)
+fn msquicNativeMultiAddressBindTextFromText(text: str): str =
     if len(text) <= 0:
         return "/ip4/127.0.0.1/udp/0/quic-v1"
     if text[0] == '/':
@@ -300,8 +654,12 @@ fn msquicNativeMultiAddressBindText(addr: MultiAddress): str =
         return text
     return text
 
-fn msquicNativeDialBindText(listenerAddr: str): str =
-    return if strContains(listenerAddr, "/ip6/") || strContains(listenerAddr, "udp://["): "/ip6/::1/udp/0/quic-v1" else: "/ip4/127.0.0.1/udp/0/quic-v1"
+fn msquicNativeMultiAddressBindText(addr: MultiAddress): str =
+    if len(addr.raw) > 0:
+        return msquicNativeMultiAddressBindTextFromText(addr.raw)
+    if bytesLen(addr.data) > 0:
+        return msquicNativeMultiAddressBindTextFromText(bytesToString(addr.data))
+    return msquicNativeMultiAddressBindTextFromText("")
 
 var
     msquicNativeReady: bool = false
@@ -314,7 +672,119 @@ var
     msquicNativeListenerSettings: MsQuicSettings
     msquicNativeListenerTlsPolicy: MsQuicTlsPolicy
     msquicNativeListenAddr: MultiAddress
+    msquicNativeClientDatagramCount: int32 = 0
+    msquicNativeServerDatagramCount: int32 = 0
+    msquicNativeClientDatagram0: Bytes
+    msquicNativeClientDatagram1: Bytes
+    msquicNativeClientDatagram2: Bytes
+    msquicNativeClientDatagram3: Bytes
+    msquicNativeClientDatagram4: Bytes
+    msquicNativeClientDatagram5: Bytes
+    msquicNativeClientDatagram6: Bytes
+    msquicNativeClientDatagram7: Bytes
+    msquicNativeClientDatagram8: Bytes
+    msquicNativeClientDatagram9: Bytes
+    msquicNativeClientDatagram10: Bytes
+    msquicNativeClientDatagram11: Bytes
+    msquicNativeClientDatagram12: Bytes
+    msquicNativeClientDatagram13: Bytes
+    msquicNativeClientDatagram14: Bytes
+    msquicNativeClientDatagram15: Bytes
+    msquicNativeServerDatagram0: Bytes
+    msquicNativeServerDatagram1: Bytes
+    msquicNativeServerDatagram2: Bytes
+    msquicNativeServerDatagram3: Bytes
+    msquicNativeServerDatagram4: Bytes
+    msquicNativeServerDatagram5: Bytes
+    msquicNativeServerDatagram6: Bytes
+    msquicNativeServerDatagram7: Bytes
+    msquicNativeServerDatagram8: Bytes
+    msquicNativeServerDatagram9: Bytes
+    msquicNativeServerDatagram10: Bytes
+    msquicNativeServerDatagram11: Bytes
+    msquicNativeServerDatagram12: Bytes
+    msquicNativeServerDatagram13: Bytes
+    msquicNativeServerDatagram14: Bytes
+    msquicNativeServerDatagram15: Bytes
+    msquicNativeClientSendOffset: int64 = 0
+    msquicNativeServerSendOffset: int64 = 0
+    msquicNativeClientReady: bool = false
+    msquicNativeServerReady: bool = false
+    msquicNativeClientMaxDataSent: bool = false
+    msquicNativeServerMaxDataSent: bool = false
+    msquicNativeClientMaxStreamDataSent: bool = false
+    msquicNativeServerMaxStreamDataSent: bool = false
+    msquicNativeClientFlow: MsQuicFlowControl
+    msquicNativeServerFlow: MsQuicFlowControl
     msquicNativeSession: MsQuicNativeSession
+    msquicNativeClientImpl: MsQuicConnImpl
+    msquicNativeServerImpl: MsQuicConnImpl
+    msquicNativeClientInitialCrypto: MsQuicCryptoStream
+    msquicNativeServerInitialCrypto: MsQuicCryptoStream
+    msquicNativeClientHandshakeCrypto: MsQuicCryptoStream
+    msquicNativeServerHandshakeCrypto: MsQuicCryptoStream
+    msquicNativeClientAppRecv: MsQuicCryptoStream
+    msquicNativeServerAppRecv: MsQuicCryptoStream
+    msquicNativeClientCidCache: Bytes
+    msquicNativeServerCidCache: Bytes
+    msquicNativeClientServerNameCache: str = ""
+    msquicNativeClientTrustRootsCountCache: int32 = 0
+    msquicNativeClientTrustRoot0Cache: Bytes
+    msquicNativeClientTrustRoot1Cache: Bytes
+    msquicNativeClientTrustRoot2Cache: Bytes
+    msquicNativeClientTrustRoot3Cache: Bytes
+    msquicNativeServerLeafDerCache: Bytes
+    msquicNativeServerLeafKeyKindCache: X509PublicKeyKind
+    msquicNativeServerPrivateKeyCache: Bytes
+    msquicNativeClientInitialNext: int64 = 1
+    msquicNativeServerInitialNext: int64 = 1
+    msquicNativeClientHandshakeNext: int64 = 1
+    msquicNativeServerHandshakeNext: int64 = 1
+    msquicNativeClientAppNext: int64 = 1
+    msquicNativeServerAppNext: int64 = 1
+    msquicNativeServerLargestInitialRecv: int64 = 0
+    msquicNativeClientLargestHandshakeRecv: int64 = 0
+    msquicNativeClientLargestAppRecv: int64 = 0
+    msquicNativeServerLargestAppRecv: int64 = 0
+
+fn msquicNativeResetClientPolicyCache() =
+    msquicNativeClientServerNameCache = ""
+    msquicNativeClientTrustRootsCountCache = 0
+    msquicNativeClientTrustRoot0Cache = emptyBytes()
+    msquicNativeClientTrustRoot1Cache = emptyBytes()
+    msquicNativeClientTrustRoot2Cache = emptyBytes()
+    msquicNativeClientTrustRoot3Cache = emptyBytes()
+
+fn msquicNativeSetClientPolicyCache(policy: MsQuicTlsPolicy) =
+    msquicNativeClientServerNameCache = policy.serverName
+    msquicNativeClientTrustRootsCountCache = policy.trustRootsCount
+    msquicNativeClientTrustRoot0Cache = policy.trustRoot0
+    msquicNativeClientTrustRoot1Cache = policy.trustRoot1
+    msquicNativeClientTrustRoot2Cache = policy.trustRoot2
+    msquicNativeClientTrustRoot3Cache = policy.trustRoot3
+
+fn msquicNativeClientTrustRootAtCache(idx: int32): Bytes =
+    if idx == 0:
+        return msquicNativeClientTrustRoot0Cache
+    if idx == 1:
+        return msquicNativeClientTrustRoot1Cache
+    if idx == 2:
+        return msquicNativeClientTrustRoot2Cache
+    if idx == 3:
+        return msquicNativeClientTrustRoot3Cache
+    return emptyBytes()
+
+fn msquicNativeResetServerPolicyCache() =
+    msquicNativeServerLeafDerCache = emptyBytes()
+    msquicNativeServerPrivateKeyCache = emptyBytes()
+
+fn msquicNativeSetServerPolicyCache(policy: MsQuicTlsPolicy) =
+    msquicNativeServerLeafKeyKindCache = policy.certLeafKeyKind
+    msquicNativeServerPrivateKeyCache = policy.certPrivateKey
+    if policy.certChainCount > 0:
+        msquicNativeServerLeafDerCache = policy.certChain0
+        return
+    msquicNativeServerLeafDerCache = emptyBytes()
 
 fn msquicNativeSeededBytes(tag: int32): Bytes =
     let out: Bytes = bytesAlloc(32)
@@ -363,75 +833,159 @@ fn msquicNativeResetAll() =
     msquicNativeLocalRole = msquicNativeRoleNone
     msquicNativeListenerDatapathId = 0
     msquicNativeListenAddr = msquicNativeEmptyAddr()
-    msquicNativeResetSession(msquicNativeSession)
+    msquicNativeResetSession()
 
-fn msquicNativeNextPacketNumber(side: int32, packetType: QuicPacketType): int64 =
-    if side == msquicNativeClientSide:
-        if packetType == QuicPacketInitial:
-            let pn: int64 = msquicNativeSession.clientInitialNext
-            msquicNativeSession.clientInitialNext = pn + 1
-            return pn
-        if packetType == QuicPacketHandshake:
-            let pn: int64 = msquicNativeSession.clientHandshakeNext
-            msquicNativeSession.clientHandshakeNext = pn + 1
-            return pn
-        let pn: int64 = msquicNativeSession.clientAppNext
-        msquicNativeSession.clientAppNext = pn + 1
+fn msquicNativeClientNextPacketNumber(packetTypeCode: int32): int64 =
+    if packetTypeCode == msquicNativePacketInitialCode:
+        let pn: int64 = msquicNativeClientInitialNext
+        msquicNativeClientInitialNext = pn + 1
         return pn
-    if packetType == QuicPacketInitial:
-        let pn: int64 = msquicNativeSession.serverInitialNext
-        msquicNativeSession.serverInitialNext = pn + 1
+    if packetTypeCode == msquicNativePacketHandshakeCode:
+        let pn: int64 = msquicNativeClientHandshakeNext
+        msquicNativeClientHandshakeNext = pn + 1
         return pn
-    if packetType == QuicPacketHandshake:
-        let pn: int64 = msquicNativeSession.serverHandshakeNext
-        msquicNativeSession.serverHandshakeNext = pn + 1
-        return pn
-    let pn: int64 = msquicNativeSession.serverAppNext
-    msquicNativeSession.serverAppNext = pn + 1
+    let pn: int64 = msquicNativeClientAppNext
+    msquicNativeClientAppNext = pn + 1
     return pn
 
-fn msquicNativeBuildHeader(side: int32, packetType: QuicPacketType, packetNumber: int64, payloadLen: int32): QuicPacketHeader =
-    let pnLen: int32 = 2
-    var destCid: Bytes = msquicNativeSession.clientCid
-    var srcCid: Bytes = msquicNativeSession.serverCid
+fn msquicNativeServerNextPacketNumber(packetTypeCode: int32): int64 =
+    if packetTypeCode == msquicNativePacketInitialCode:
+        let pn: int64 = msquicNativeServerInitialNext
+        msquicNativeServerInitialNext = pn + 1
+        return pn
+    if packetTypeCode == msquicNativePacketHandshakeCode:
+        let pn: int64 = msquicNativeServerHandshakeNext
+        msquicNativeServerHandshakeNext = pn + 1
+        return pn
+    let pn: int64 = msquicNativeServerAppNext
+    msquicNativeServerAppNext = pn + 1
+    return pn
+
+fn msquicNativeNextPacketNumber(side: int32, packetTypeCode: int32): int64 =
     if side == msquicNativeClientSide:
-        destCid = msquicNativeSession.serverCid
-        srcCid = msquicNativeSession.clientCid
-    var out: QuicPacketHeader
-    if packetType == QuicPacketShort:
-        out.longHeader = false
-        out.packetType = packetType
+        return msquicNativeClientNextPacketNumber(packetTypeCode)
+    return msquicNativeServerNextPacketNumber(packetTypeCode)
+
+fn msquicNativeHeaderDestCid(side: int32): Bytes =
+    if side == msquicNativeClientSide:
+        return msquicNativeServerCidCache
+    return msquicNativeClientCidCache
+
+fn msquicNativeHeaderSrcCid(side: int32): Bytes =
+    if side == msquicNativeClientSide:
+        return msquicNativeClientCidCache
+    return msquicNativeServerCidCache
+
+fn msquicNativePacketTypeFromCode(packetTypeCode: int32): QuicPacketType =
+    var out: QuicPacketType
+    if packetTypeCode == msquicNativePacketInitialCode:
+        return quicPacketTypeFromBits(0)
+    if packetTypeCode == msquicNativePacket0RttCode:
+        return quicPacketTypeFromBits(1)
+    if packetTypeCode == msquicNativePacketHandshakeCode:
+        return quicPacketTypeFromBits(2)
+    if packetTypeCode == msquicNativePacketRetryCode:
+        return quicPacketTypeFromBits(3)
+    return out
+
+fn msquicNativeBuildHeaderCommon(
+    out: var QuicPacketHeader,
+    side: int32,
+    packetTypeCode: int32,
+    longHeader: bool,
+    packetNumber: int64,
+    payloadLen: int32
+) =
+    out.longHeader = longHeader
+    out.packetType = msquicNativePacketTypeFromCode(packetTypeCode)
+    if longHeader:
+        out.version = msquicNativeVersion
+        out.scid = msquicNativeHeaderSrcCid(side)
+        out.payloadLength = int64(payloadLen + 2)
+    else:
         out.version = 0
-        out.dcid = destCid
         out.scid = emptyBytes()
-        out.token = emptyBytes()
         out.payloadLength = 0
-        out.packetNumber = packetNumber
-        out.packetNumberLen = pnLen
-        out.spinBit = false
-        out.keyPhase = false
-        return out
-    out.longHeader = true
-    out.packetType = packetType
-    out.version = msquicNativeVersion
-    out.dcid = destCid
-    out.scid = srcCid
+    out.dcid = msquicNativeHeaderDestCid(side)
     out.token = emptyBytes()
-    out.payloadLength = int64(payloadLen + pnLen)
     out.packetNumber = packetNumber
-    out.packetNumberLen = pnLen
+    out.packetNumberLen = 2
     out.spinBit = false
     out.keyPhase = false
+
+fn msquicNativeBuildShortHeaderInto(out: var QuicPacketHeader, side: int32, packetNumber: int64) =
+    msquicNativeBuildHeaderCommon(out, side, msquicNativePacketShortCode, false, packetNumber, 0)
+
+fn msquicNativeBuildInitialHeaderInto(out: var QuicPacketHeader, side: int32, packetNumber: int64, payloadLen: int32) =
+    msquicNativeBuildHeaderCommon(out, side, msquicNativePacketInitialCode, true, packetNumber, payloadLen)
+
+fn msquicNativeBuildHandshakeHeaderInto(out: var QuicPacketHeader, side: int32, packetNumber: int64, payloadLen: int32) =
+    msquicNativeBuildHeaderCommon(out, side, msquicNativePacketHandshakeCode, true, packetNumber, payloadLen)
+
+fn msquicNativeBuildRetryHeaderInto(out: var QuicPacketHeader, side: int32, packetNumber: int64, payloadLen: int32) =
+    msquicNativeBuildHeaderCommon(out, side, msquicNativePacketRetryCode, true, packetNumber, payloadLen)
+
+fn msquicNativeBuild0RttHeaderInto(out: var QuicPacketHeader, side: int32, packetNumber: int64, payloadLen: int32) =
+    msquicNativeBuildHeaderCommon(out, side, msquicNativePacket0RttCode, true, packetNumber, payloadLen)
+
+fn msquicNativeBuildHeader(side: int32, packetTypeCode: int32, packetNumber: int64, payloadLen: int32): QuicPacketHeader =
+    var out: QuicPacketHeader
+    if packetTypeCode == msquicNativePacketShortCode:
+        msquicNativeBuildShortHeaderInto(out, side, packetNumber)
+        return out
+    if packetTypeCode == msquicNativePacketInitialCode:
+        msquicNativeBuildInitialHeaderInto(out, side, packetNumber, payloadLen)
+        return out
+    if packetTypeCode == msquicNativePacketHandshakeCode:
+        msquicNativeBuildHandshakeHeaderInto(out, side, packetNumber, payloadLen)
+        return out
+    if packetTypeCode == msquicNativePacketRetryCode:
+        msquicNativeBuildRetryHeaderInto(out, side, packetNumber, payloadLen)
+        return out
+    msquicNativeBuild0RttHeaderInto(out, side, packetNumber, payloadLen)
     return out
+
+fn msquicNativeFrameAckEliciting(frameCode: int64): bool =
+    if frameCode == int64(msquicNativeFrameAckCode):
+        return false
+    if frameCode == 0x00:
+        return false
+    if frameCode == int64(msquicNativeFrameConnectionCloseCode):
+        return false
+    if frameCode == int64(msquicNativeFrameConnectionCloseAppCode):
+        return false
+    return true
+
+fn msquicNativePacketAppendFrame(pkt: var MsQuicPacket, frame: MsQuicFrame): Result[bool] =
+    if pkt.framesCount >= 32:
+        return Err[bool]("msquic packet: frame list full")
+    pkt.frames[pkt.framesCount] = frame
+    pkt.framesCount = pkt.framesCount + 1
+    let frameCode: int64 = msquicNativeFrameTypeCode(frame)
+    if msquicNativeFrameAckEliciting(frameCode):
+        pkt.ackEliciting = true
+    return Ok[bool](true)
+
+fn msquicNativePacketAddCryptoFrame(pkt: var MsQuicPacket, offset: int64, data: Bytes): Result[bool] =
+    let frame: MsQuicFrame = msquicFrameCrypto(offset, data)
+    return msquicNativePacketAppendFrame(pkt, frame)
+
+fn msquicNativePacketAddAckFrame(pkt: var MsQuicPacket, number: int64): Result[bool] =
+    let frame: MsQuicFrame = msquicFrameAckNumber(number)
+    return msquicNativePacketAppendFrame(pkt, frame)
+
+fn msquicNativePacketAddConnectionCloseFrame(pkt: var MsQuicPacket, reason: Bytes): Result[bool] =
+    let frame: MsQuicFrame = msquicFrameConnectionClose(0, 0, reason)
+    return msquicNativePacketAppendFrame(pkt, frame)
 
 fn msquicNativeSendPayload(
     side: int32,
-    packetType: QuicPacketType,
+    packetTypeCode: int32,
     packetNumber: int64,
     payload: Bytes,
     ackEliciting: bool
 ): Result[bool] =
-    let header: QuicPacketHeader = msquicNativeBuildHeader(side, packetType, packetNumber, bytesLen(payload))
+    let header: QuicPacketHeader = msquicNativeBuildHeader(side, packetTypeCode, packetNumber, bytesLen(payload))
     let encRes: Result[Bytes] = quicPacketHeaderEncode(header)
     if IsErr(encRes):
         return Err[bool](ErrorText(encRes))
@@ -441,7 +995,11 @@ fn msquicNativeSendPayload(
     if side == msquicNativeClientSide:
         fromId = msquicNativeSession.clientDatapathId
         toAddr = msquicNativeSession.listenerAddrText
-    if packetType == QuicPacketShort && ackEliciting && msquicNativeDropNextAppSend:
+    if fromId <= 0:
+        panic("msquic native send: from id")
+    if len(toAddr) <= 0:
+        panic("msquic native send: to addr")
+    if packetTypeCode == msquicNativePacketShortCode && ackEliciting && msquicNativeDropNextAppSend:
         msquicNativeDropNextAppSend = false
         return Ok[bool](true)
     let sendRes: Result[bool] = datapath_runtime.msquicDatapathSendUdp(msquicNativeDatapathRt, fromId, toAddr, wire, -1)
@@ -449,157 +1007,232 @@ fn msquicNativeSendPayload(
         return Err[bool](ErrorText(sendRes))
     return Ok[bool](true)
 
-fn msquicNativeSendPacket(side: int32, packetType: QuicPacketType, pkt: var MsQuicPacket): Result[bool] =
-    let payload: Bytes = msquicPacketPayloadEncode(pkt)
-    return msquicNativeSendPayload(side, packetType, pkt.number, payload, msquicPacketAckEliciting(pkt))
-
-fn msquicNativeQueueTransportCredit(endpoint: var MsQuicNativeEndpoint, peerStreamId: int64): Result[bool] =
-    if endpoint.maxDataSent:
+fn msquicNativeQueueTransportCredit(side: int32, peerStreamId: int64): Result[bool] =
+    if side == msquicNativeClientSide:
+        if msquicNativeClientMaxDataSent:
+            return Ok[bool](true)
+        let maxDataRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeClientImpl, msquicFrameMaxData(msquicConnImplFlowMaxData(msquicNativeClientImpl)))
+        if IsErr(maxDataRes):
+            return Err[bool](ErrorText(maxDataRes))
+        let maxStreamRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeClientImpl, msquicFrameMaxStreamData(peerStreamId, msquicConnImplFlowMaxStreamData(msquicNativeClientImpl)))
+        if IsErr(maxStreamRes):
+            return Err[bool](ErrorText(maxStreamRes))
+        msquicNativeClientMaxDataSent = true
+        msquicNativeClientMaxStreamDataSent = true
         return Ok[bool](true)
-    let maxDataRes: Result[bool] = msquicConnImplQueueFrame(endpoint.impl, msquicFrameMaxData(endpoint.impl.flow.maxData))
-    if IsErr(maxDataRes):
-        return Err[bool](ErrorText(maxDataRes))
-    let maxStreamRes: Result[bool] = msquicConnImplQueueFrame(endpoint.impl, msquicFrameMaxStreamData(peerStreamId, endpoint.impl.flow.maxStreamData))
-    if IsErr(maxStreamRes):
-        return Err[bool](ErrorText(maxStreamRes))
-    endpoint.maxDataSent = true
-    endpoint.maxStreamDataSent = true
-    return Ok[bool](true)
+    if side == msquicNativeServerSide:
+        if msquicNativeServerMaxDataSent:
+            return Ok[bool](true)
+        let maxDataRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeServerImpl, msquicFrameMaxData(msquicConnImplFlowMaxData(msquicNativeServerImpl)))
+        if IsErr(maxDataRes):
+            return Err[bool](ErrorText(maxDataRes))
+        let maxStreamRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeServerImpl, msquicFrameMaxStreamData(peerStreamId, msquicConnImplFlowMaxStreamData(msquicNativeServerImpl)))
+        if IsErr(maxStreamRes):
+            return Err[bool](ErrorText(maxStreamRes))
+        msquicNativeServerMaxDataSent = true
+        msquicNativeServerMaxStreamDataSent = true
+        return Ok[bool](true)
+    return Err[bool]("msquic native: invalid side")
 
 fn msquicNativeFlushShortPackets(side: int32): Result[bool] =
     if ! msquicNativeSession.active || msquicNativeSession.closed:
         return Ok[bool](false)
-    if side == msquicNativeClientSide && ! msquicNativeSession.client.ready:
+    if side == msquicNativeClientSide && ! msquicNativeClientReady:
         return Ok[bool](false)
-    if side == msquicNativeServerSide && ! msquicNativeSession.server.ready:
+    if side == msquicNativeServerSide && ! msquicNativeServerReady:
         return Ok[bool](false)
 
     if side == msquicNativeClientSide:
-        let creditRes: Result[bool] = msquicNativeQueueTransportCredit(msquicNativeSession.client, msquicNativeStreamServer)
+        let creditRes: Result[bool] = msquicNativeQueueTransportCredit(msquicNativeClientSide, msquicNativeStreamServer)
         if IsErr(creditRes):
             return Err[bool](ErrorText(creditRes))
-        while msquicConnImplHasQueued(msquicNativeSession.client.impl):
-            if ! msquicConnImplCanSend(msquicNativeSession.client.impl) && ! msquicConnImplQueuedAckOnly(msquicNativeSession.client.impl):
+        while msquicConnImplHasQueued(msquicNativeClientImpl):
+            if ! msquicConnImplCanSend(msquicNativeClientImpl) && ! msquicConnImplQueuedAckOnly(msquicNativeClientImpl):
                 break
             var pkt: MsQuicPacket
-            let pktRes: Result[bool] = msquicConnImplBuildPacketInto(pkt, msquicNativeSession.client.impl)
+            let pktRes: Result[bool] = msquicConnImplBuildPacketInto(pkt, msquicNativeClientImpl)
             if IsErr(pktRes):
                 return Err[bool](ErrorText(pktRes))
-            let payload: Bytes = msquicPacketPayloadEncode(pkt)
-            let sendRes: Result[bool] = msquicNativeSendPayload(msquicNativeClientSide, QuicPacketShort, pkt.number, payload, msquicPacketAckEliciting(pkt))
+            let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+            if IsErr(payloadRes):
+                return Err[bool](ErrorText(payloadRes))
+            let payload: Bytes = Value(payloadRes)
+            let sendRes: Result[bool] = msquicNativeSendPayload(msquicNativeClientSide, msquicNativePacketShortCode, pkt.number, payload, msquicPacketAckEliciting(pkt))
             if IsErr(sendRes):
                 return Err[bool](ErrorText(sendRes))
-            let recRes: Result[bool] = msquicConnImplRecordSent(msquicNativeSession.client.impl, pkt, payload)
+            let recRes: Result[bool] = msquicConnImplRecordSent(msquicNativeClientImpl, pkt, payload)
             if IsErr(recRes):
                 return Err[bool](ErrorText(recRes))
         return Ok[bool](true)
 
-    let creditRes: Result[bool] = msquicNativeQueueTransportCredit(msquicNativeSession.server, msquicNativeStreamClient)
+    let creditRes: Result[bool] = msquicNativeQueueTransportCredit(msquicNativeServerSide, msquicNativeStreamClient)
     if IsErr(creditRes):
         return Err[bool](ErrorText(creditRes))
-    while msquicConnImplHasQueued(msquicNativeSession.server.impl):
-        if ! msquicConnImplCanSend(msquicNativeSession.server.impl) && ! msquicConnImplQueuedAckOnly(msquicNativeSession.server.impl):
+    while msquicConnImplHasQueued(msquicNativeServerImpl):
+        if ! msquicConnImplCanSend(msquicNativeServerImpl) && ! msquicConnImplQueuedAckOnly(msquicNativeServerImpl):
             break
         var pkt: MsQuicPacket
-        let pktRes: Result[bool] = msquicConnImplBuildPacketInto(pkt, msquicNativeSession.server.impl)
+        let pktRes: Result[bool] = msquicConnImplBuildPacketInto(pkt, msquicNativeServerImpl)
         if IsErr(pktRes):
             return Err[bool](ErrorText(pktRes))
-        let payload: Bytes = msquicPacketPayloadEncode(pkt)
-        let sendRes: Result[bool] = msquicNativeSendPayload(msquicNativeServerSide, QuicPacketShort, pkt.number, payload, msquicPacketAckEliciting(pkt))
+        let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+        if IsErr(payloadRes):
+            return Err[bool](ErrorText(payloadRes))
+        let payload: Bytes = Value(payloadRes)
+        let sendRes: Result[bool] = msquicNativeSendPayload(msquicNativeServerSide, msquicNativePacketShortCode, pkt.number, payload, msquicPacketAckEliciting(pkt))
         if IsErr(sendRes):
             return Err[bool](ErrorText(sendRes))
-        let recRes: Result[bool] = msquicConnImplRecordSent(msquicNativeSession.server.impl, pkt, payload)
+        let recRes: Result[bool] = msquicConnImplRecordSent(msquicNativeServerImpl, pkt, payload)
         if IsErr(recRes):
             return Err[bool](ErrorText(recRes))
     return Ok[bool](true)
 
 fn msquicNativeSendClientHello(): Result[bool] =
-    let genRes: Result[bool] = msquicTls13HandshakeGenerateX25519(msquicNativeSession.client.handshake)
+    let clientServerName: str = msquicNativeClientServerNameCache
+    let genRes: Result[bool] = msquicTls13ClientGenerateX25519()
     if IsErr(genRes):
-        return Err[bool](ErrorText(genRes))
-    msquicTls13HandshakeSetServerName(msquicNativeSession.client.handshake, msquicNativeSession.clientTlsPolicy.serverName)
+        panic("msquic native client hello: x25519")
+    msquicTls13ClientSetServerName(clientServerName)
     let randomSeed: Bytes = msquicNativeSeededBytes(17)
     let emptyContext: Bytes = emptyBytes()
-    let helloRes: Result[Bytes] = msquicTls13BuildClientHello(
-        msquicNativeSession.client.handshake,
+    let helloRes: Result[Bytes] = msquicTls13ClientBuildClientHello(
         randomSeed,
-        msquicNativeAlpn,
-        msquicNativeSession.clientTlsPolicy.serverName,
+        "dm",
+        clientServerName,
         emptyContext
     )
     if IsErr(helloRes):
-        return Err[bool](ErrorText(helloRes))
+        panic("msquic native client hello: build")
     let raw: Bytes = Value(helloRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.client.handshake, raw)
-    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, QuicPacketInitial))
-    let addRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameCrypto(0, raw))
+    msquicTls13ClientAppendTranscript(raw)
+    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, msquicNativePacketInitialCode))
+    let addRes: Result[bool] = msquicNativePacketAddCryptoFrame(pkt, 0, raw)
     if IsErr(addRes):
-        return Err[bool](ErrorText(addRes))
-    return msquicNativeSendPacket(msquicNativeClientSide, QuicPacketInitial, pkt)
+        panic("msquic native client hello: frame")
+    let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    return msquicNativeSendPayload(
+        msquicNativeClientSide,
+        msquicNativePacketInitialCode,
+        pkt.number,
+        Value(payloadRes),
+        msquicPacketAckEliciting(pkt)
+    )
+
+fn msquicNativeDebugBuildClientHelloPayload(): Result[Bytes] =
+    let clientServerName: str = msquicNativeClientServerNameCache
+    let genRes: Result[bool] = msquicTls13ClientGenerateX25519()
+    if IsErr(genRes):
+        return Err[Bytes](ErrorText(genRes))
+    msquicTls13ClientSetServerName(clientServerName)
+    let randomSeed: Bytes = msquicNativeSeededBytes(17)
+    let helloRes: Result[Bytes] = msquicTls13ClientBuildClientHello(
+        randomSeed,
+        "dm",
+        clientServerName,
+        emptyBytes()
+    )
+    if IsErr(helloRes):
+        return Err[Bytes](ErrorText(helloRes))
+    let raw: Bytes = Value(helloRes)
+    var pkt: MsQuicPacket = initMsQuicPacket(1)
+    let addRes: Result[bool] = msquicNativePacketAddCryptoFrame(pkt, 0, raw)
+    if IsErr(addRes):
+        return Err[Bytes](ErrorText(addRes))
+    return msquicPacketPayloadEncode(pkt)
+
+fn msquicNativeDebugBuildClientHelloWire(): Result[Bytes] =
+    if bytesLen(msquicNativeClientCidCache) <= 0:
+        msquicNativeClientCidCache = msquicNativeConnId(0x11111111)
+    if bytesLen(msquicNativeServerCidCache) <= 0:
+        msquicNativeServerCidCache = msquicNativeConnId(0x22222222)
+    let payloadRes: Result[Bytes] = msquicNativeDebugBuildClientHelloPayload()
+    if IsErr(payloadRes):
+        return Err[Bytes](ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+    let header: QuicPacketHeader = msquicNativeBuildHeader(
+        msquicNativeClientSide,
+        msquicNativePacketInitialCode,
+        1,
+        bytesLen(payload)
+    )
+    let headerRes: Result[Bytes] = quicPacketHeaderEncode(header)
+    if IsErr(headerRes):
+        return Err[Bytes](ErrorText(headerRes))
+    return Ok[Bytes](bytesConcat3(Value(headerRes), payload, emptyBytes()))
 
 fn msquicNativeSendServerFlight(): Result[bool] =
     if msquicNativeSession.serverFlightSent:
         return Ok[bool](true)
-    echo("msquic_native_server_flight_stage=begin")
-    let genRes: Result[bool] = msquicTls13HandshakeGenerateX25519(msquicNativeSession.server.handshake)
+    let genRes: Result[bool] = msquicTls13ServerGenerateX25519()
     if IsErr(genRes):
         return Err[bool](ErrorText(genRes))
+    let serverClientGroup: int32 = handshake13.msquicTls13ServerClientKeyShareGroup()
+    let serverLocalGroup: int32 = handshake13.msquicTls13ServerLocalKeyShareGroup()
+    if serverClientGroup <= 0:
+        return Err[bool]("msquic native: server client key share missing before flight")
+    if serverLocalGroup != serverClientGroup:
+        return Err[bool](
+            "msquic native: server key share diverged local=" +
+            intToStr(serverLocalGroup) +
+            " client=" +
+            intToStr(serverClientGroup)
+        )
 
-    var ackPkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, QuicPacketInitial))
-    let ackRes: Result[bool] = msquicPacketAddFrame(ackPkt, msquicFrameAckNumber(msquicNativeSession.serverLargestInitialRecv))
+    var ackPkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, msquicNativePacketInitialCode))
+    let ackRes: Result[bool] = msquicNativePacketAddAckFrame(ackPkt, msquicNativeServerLargestInitialRecv)
     if IsErr(ackRes):
         return Err[bool](ErrorText(ackRes))
-    let sendAckRes: Result[bool] = msquicNativeSendPacket(msquicNativeServerSide, QuicPacketInitial, ackPkt)
+    let ackPayloadRes: Result[Bytes] = msquicPacketPayloadEncode(ackPkt)
+    if IsErr(ackPayloadRes):
+        return Err[bool](ErrorText(ackPayloadRes))
+    let sendAckRes: Result[bool] = msquicNativeSendPayload(
+        msquicNativeServerSide,
+        msquicNativePacketInitialCode,
+        ackPkt.number,
+        Value(ackPayloadRes),
+        msquicPacketAckEliciting(ackPkt)
+    )
     if IsErr(sendAckRes):
         return Err[bool](ErrorText(sendAckRes))
 
     let serverRandomSeed: Bytes = msquicNativeSeededBytes(23)
-    let shRes: Result[Bytes] = msquicTls13BuildServerHello(msquicNativeSession.server.handshake, serverRandomSeed, false)
+    let shRes: Result[Bytes] = msquicTls13ServerBuildServerHello(serverRandomSeed, false)
     if IsErr(shRes):
         return Err[bool](ErrorText(shRes))
     let sh: Bytes = Value(shRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.server.handshake, sh)
-    echo("msquic_native_server_flight_stage=server_hello_ok")
-    let secRes: Result[bool] = msquicTls13ComputeHandshakeSecrets(msquicNativeSession.server.handshake)
+    msquicTls13ServerAppendTranscript(sh)
+    let secRes: Result[bool] = msquicTls13SideComputeHandshakeSecrets(1)
     if IsErr(secRes):
         return Err[bool](ErrorText(secRes))
-    echo("msquic_native_server_flight_stage=secrets_ok")
 
     let emptyExtensions: Bytes = emptyBytes()
-    let eeRes: Result[Bytes] = msquicTls13BuildEncryptedExtensions(msquicNativeAlpn, emptyExtensions)
+    let eeRes: Result[Bytes] = msquicTls13BuildEncryptedExtensions("dm", emptyExtensions)
     if IsErr(eeRes):
         return Err[bool](ErrorText(eeRes))
     let ee: Bytes = Value(eeRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.server.handshake, ee)
+    msquicTls13ServerAppendTranscript(ee)
 
-    let leafRes: Result[Bytes] = msquicTlsPolicyLeafDer(msquicNativeSession.serverTlsPolicy)
-    if IsErr(leafRes):
-        return Err[bool](ErrorText(leafRes))
-    let certRes: Result[Bytes] = msquicTls13BuildCertificate(Value(leafRes))
+    if bytesLen(msquicNativeServerLeafDerCache) <= 0:
+        return Err[bool]("msquic tls policy: leaf certificate missing")
+    let certRes: Result[Bytes] = msquicTls13BuildCertificate(msquicNativeServerLeafDerCache)
     if IsErr(certRes):
         return Err[bool](ErrorText(certRes))
     let cert: Bytes = Value(certRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.server.handshake, cert)
-    echo("msquic_native_server_flight_stage=certificate_ok")
+    msquicTls13ServerAppendTranscript(cert)
 
-    let cvRes: Result[Bytes] = msquicTls13BuildCertificateVerify(
-        msquicNativeSession.server.handshake,
-        msquicNativeSession.serverTlsPolicy.certLeafKeyKind,
-        msquicNativeSession.serverTlsPolicy.certPrivateKey,
-        true
-    )
+    let cvRes: Result[Bytes] = msquicTls13ServerBuildCertificateVerify(msquicNativeServerLeafKeyKindCache, msquicNativeServerPrivateKeyCache, true)
     if IsErr(cvRes):
         return Err[bool](ErrorText(cvRes))
     let cv: Bytes = Value(cvRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.server.handshake, cv)
-    echo("msquic_native_server_flight_stage=cert_verify_ok")
+    msquicTls13ServerAppendTranscript(cv)
 
-    let finRes: Result[Bytes] = msquicTls13BuildFinished(msquicNativeSession.server.handshake, true)
+    let finRes: Result[Bytes] = msquicTls13ServerBuildFinished(true)
     if IsErr(finRes):
         return Err[bool](ErrorText(finRes))
     let fin: Bytes = Value(finRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.server.handshake, fin)
-    echo("msquic_native_server_flight_stage=finished_ok")
+    msquicTls13ServerAppendTranscript(fin)
 
     var crypto: ByteBuffer = newByteBuffer()
     appendBytes(crypto, sh)
@@ -608,40 +1241,55 @@ fn msquicNativeSendServerFlight(): Result[bool] =
     appendBytes(crypto, cv)
     appendBytes(crypto, fin)
 
-    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, QuicPacketHandshake))
-    let addCryptoRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameCrypto(0, toBytes(crypto)))
+    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, msquicNativePacketHandshakeCode))
+    let addCryptoRes: Result[bool] = msquicNativePacketAddCryptoFrame(pkt, 0, toBytes(crypto))
     if IsErr(addCryptoRes):
         return Err[bool](ErrorText(addCryptoRes))
-    let sendRes: Result[bool] = msquicNativeSendPacket(msquicNativeServerSide, QuicPacketHandshake, pkt)
+    let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    let sendRes: Result[bool] = msquicNativeSendPayload(
+        msquicNativeServerSide,
+        msquicNativePacketHandshakeCode,
+        pkt.number,
+        Value(payloadRes),
+        msquicPacketAckEliciting(pkt)
+    )
     if IsErr(sendRes):
         return Err[bool](ErrorText(sendRes))
     msquicNativeSession.serverFlightSent = true
-    echo("msquic_native_server_flight_stage=sent")
     return Ok[bool](true)
 
 fn msquicNativeSendClientFinished(): Result[bool] =
     if msquicNativeSession.clientFinishedSent:
         return Ok[bool](true)
-    echo("msquic_native_client_finished_stage=begin")
-    let finRes: Result[Bytes] = msquicTls13BuildFinished(msquicNativeSession.client.handshake, false)
+    let finRes: Result[Bytes] = msquicTls13ClientBuildFinished(false)
     if IsErr(finRes):
         return Err[bool](ErrorText(finRes))
     let fin: Bytes = Value(finRes)
-    msquicTls13HandshakeAppendTranscript(msquicNativeSession.client.handshake, fin)
-    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, QuicPacketHandshake))
-    if msquicNativeSession.clientLargestHandshakeRecv > 0:
-        let ackRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameAckNumber(msquicNativeSession.clientLargestHandshakeRecv))
+    msquicTls13ClientAppendTranscript(fin)
+    var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, msquicNativePacketHandshakeCode))
+    if msquicNativeClientLargestHandshakeRecv > 0:
+        let ackRes: Result[bool] = msquicNativePacketAddAckFrame(pkt, msquicNativeClientLargestHandshakeRecv)
         if IsErr(ackRes):
             return Err[bool](ErrorText(ackRes))
-    let addRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameCrypto(0, fin))
+    let addRes: Result[bool] = msquicNativePacketAddCryptoFrame(pkt, 0, fin)
     if IsErr(addRes):
         return Err[bool](ErrorText(addRes))
-    let sendRes: Result[bool] = msquicNativeSendPacket(msquicNativeClientSide, QuicPacketHandshake, pkt)
+    let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    let sendRes: Result[bool] = msquicNativeSendPayload(
+        msquicNativeClientSide,
+        msquicNativePacketHandshakeCode,
+        pkt.number,
+        Value(payloadRes),
+        msquicPacketAckEliciting(pkt)
+    )
     if IsErr(sendRes):
         return Err[bool](ErrorText(sendRes))
-    msquicNativeSession.client.ready = true
+    msquicNativeClientReady = true
     msquicNativeSession.clientFinishedSent = true
-    echo("msquic_native_client_finished_stage=sent")
     return Ok[bool](true)
 
 fn msquicNativeSessionReady(): bool =
@@ -650,9 +1298,9 @@ fn msquicNativeSessionReady(): bool =
     if msquicNativeSession.closed:
         return false
     if msquicNativeLocalRole == msquicNativeRoleClient:
-        return msquicNativeSession.client.ready
+        return msquicNativeClientReady
     if msquicNativeLocalRole == msquicNativeRoleServer:
-        return msquicNativeSession.server.ready
+        return msquicNativeServerReady
     return false
 
 fn msquicNativeSideReady(side: int32): bool =
@@ -661,9 +1309,9 @@ fn msquicNativeSideReady(side: int32): bool =
     if msquicNativeSession.closed:
         return false
     if side == msquicNativeClientSide:
-        return msquicNativeSession.client.ready
+        return msquicNativeClientReady
     if side == msquicNativeServerSide:
-        return msquicNativeSession.server.ready
+        return msquicNativeServerReady
     return false
 
 fn msquicNativeQueueAcceptIfReady() =
@@ -673,74 +1321,65 @@ fn msquicNativeQueueAcceptIfReady() =
         return
     if msquicNativeSession.closed:
         return
-    if msquicNativeSession.server.ready:
+    if msquicNativeServerReady:
         msquicNativeAcceptPending = true
 
 fn msquicNativeInitServerSession(fromAddr: str, header: QuicPacketHeader): Result[bool] =
-    msquicNativeResetSession(msquicNativeSession)
+    if msquicNativeSession.clientDatapathId <= 0:
+        msquicNativeResetSession()
     msquicNativeSession.active = true
     msquicNativeSession.closed = false
-    msquicNativeLocalRole = msquicNativeRoleServer
+    if msquicNativeLocalRole == msquicNativeRoleNone:
+        msquicNativeLocalRole = msquicNativeRoleServer
     msquicNativeSession.listenAddr = msquicNativeListenAddr
     let peerAddrRes = parseMultiAddress(fromAddr)
     if IsOk(peerAddrRes):
         msquicNativeSession.dialAddr = Value(peerAddrRes)
     else:
         msquicNativeSession.dialAddr = msquicNativeEmptyAddr()
-    msquicNativeSession.serverSettings = msquicNativeListenerSettings
-    msquicNativeSession.serverTlsPolicy = msquicNativeListenerTlsPolicy
+    var serverSettingsLocal = msquicNativeListenerSettings
+    msquicNativeSetServerPolicyCache(msquicNativeListenerTlsPolicy)
     msquicNativeSession.listenerDatapathId = msquicNativeListenerDatapathId
     msquicNativeSession.listenerAddrText = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, msquicNativeListenerDatapathId)
     msquicNativeSession.clientAddrText = fromAddr
-    msquicNativeSession.clientCid = msquicNativeCopyBytes(header.scid)
-    msquicNativeSession.serverCid = msquicNativeCopyBytes(header.dcid)
-    msquicNativeResetEndpoint(msquicNativeSession.server,
-                              TlsRoleServer,
-                              msquicNativeListenAddr,
-                              msquicNativeSession.dialAddr,
-                              msquicNativeSession.serverSettings,
-                              102,
-                              false)
+    msquicNativeClientCidCache = msquicNativeCopyBytes(header.scid)
+    msquicNativeServerCidCache = msquicNativeCopyBytes(header.dcid)
+    msquicNativeResetServerEndpoint(serverSettingsLocal, false)
+    msquicNativeSession.serverBound = true
     return Ok[bool](true)
 
 fn msquicNativeHandleAppFrame(recvSide: int32, frame: MsQuicFrame): Result[bool] =
-    if frame.kind == FrameAck:
+    let frameKind: int64 = msquicNativeFrameTypeCode(frame)
+    if frameKind == int64(msquicNativeFrameAckCode):
         if recvSide == msquicNativeClientSide:
-            msquicConnImplAck(msquicNativeSession.client.impl, frame.value, 0)
+            msquicConnImplAck(msquicNativeClientImpl, frame.value, 0)
         else:
-            msquicConnImplAck(msquicNativeSession.server.impl, frame.value, 0)
+            msquicConnImplAck(msquicNativeServerImpl, frame.value, 0)
         return Ok[bool](true)
-    if frame.kind == FrameData:
+    if frameKind == int64(msquicNativeFrameDataCode):
+        let addRes: Result[bool] = msquicNativeAppRecvAdd(recvSide, frame.offset, frame.data)
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+        return Ok[bool](true)
+    if frameKind == int64(msquicNativeFrameDatagramCode):
         if recvSide == msquicNativeClientSide:
-            let addRes: Result[bool] = msquicCryptoStreamAdd(msquicNativeSession.client.appRecv, frame.offset, frame.data)
-            if IsErr(addRes):
-                return Err[bool](ErrorText(addRes))
+            return msquicNativeEnqueueDatagram(msquicNativeClientSide, frame.data)
+        return msquicNativeEnqueueDatagram(msquicNativeServerSide, frame.data)
+    if frameKind == int64(msquicNativeFrameMaxDataCode):
+        if recvSide == msquicNativeClientSide:
+            msquicConnImplUpdateMaxData(msquicNativeClientImpl, frame.value)
         else:
-            let addRes: Result[bool] = msquicCryptoStreamAdd(msquicNativeSession.server.appRecv, frame.offset, frame.data)
-            if IsErr(addRes):
-                return Err[bool](ErrorText(addRes))
+            msquicConnImplUpdateMaxData(msquicNativeServerImpl, frame.value)
         return Ok[bool](true)
-    if frame.kind == FrameDatagram:
+    if frameKind == int64(msquicNativeFrameMaxStreamDataCode):
         if recvSide == msquicNativeClientSide:
-            return msquicNativeEnqueueDatagram(msquicNativeSession.client, frame.data)
-        return msquicNativeEnqueueDatagram(msquicNativeSession.server, frame.data)
-    if frame.kind == FrameMaxData:
-        if recvSide == msquicNativeClientSide:
-            msquicConnImplUpdateMaxData(msquicNativeSession.client.impl, frame.value)
+            msquicConnImplRaiseMaxStreamData(msquicNativeClientImpl, frame.value)
         else:
-            msquicConnImplUpdateMaxData(msquicNativeSession.server.impl, frame.value)
+            msquicConnImplRaiseMaxStreamData(msquicNativeServerImpl, frame.value)
         return Ok[bool](true)
-    if frame.kind == FrameMaxStreamData:
-        if recvSide == msquicNativeClientSide:
-            if frame.value > msquicNativeSession.client.impl.flow.maxStreamData:
-                msquicNativeSession.client.impl.flow.maxStreamData = frame.value
-        else:
-            if frame.value > msquicNativeSession.server.impl.flow.maxStreamData:
-                msquicNativeSession.server.impl.flow.maxStreamData = frame.value
+    if frameKind == int64(msquicNativeFramePingCode) || frameKind == int64(msquicNativeFrameHandshakeDoneCode):
         return Ok[bool](true)
-    if frame.kind == FramePing || frame.kind == FrameHandshakeDone:
-        return Ok[bool](true)
-    if frame.kind == FrameConnectionClose || frame.kind == FrameConnectionCloseApp:
+    if frameKind == int64(msquicNativeFrameConnectionCloseCode) || frameKind == int64(msquicNativeFrameConnectionCloseAppCode):
         msquicNativeSession.closed = true
         return Ok[bool](true)
     return Ok[bool](true)
@@ -750,6 +1389,13 @@ fn msquicNativeProcessPacket(recvSide: int32, fromAddr: str, wire: Bytes): Resul
     if IsErr(headerRes):
         return Err[bool](ErrorText(headerRes))
     let headerDec: QuicPacketHeaderDecoded = Value(headerRes)
+    let packetTypeCode: int32 = msquicNativePacketTypeCode(headerDec.header.packetType)
+    if packetTypeCode == msquicNativePacketInitialCode &&
+       recvSide == msquicNativeServerSide &&
+       !msquicNativeSession.serverBound:
+        let initRes: Result[bool] = msquicNativeInitServerSession(fromAddr, headerDec.header)
+        if IsErr(initRes):
+            return initRes
     let payloadOffset: int32 = headerDec.next
     var payloadLen: int32 = bytesLen(wire) - payloadOffset
     if headerDec.header.longHeader:
@@ -765,53 +1411,81 @@ fn msquicNativeProcessPacket(recvSide: int32, fromAddr: str, wire: Bytes): Resul
     if IsErr(pktRes):
         return Err[bool](ErrorText(pktRes))
 
-    if headerDec.header.packetType == QuicPacketInitial:
+    if packetTypeCode == msquicNativePacketInitialCode:
         if recvSide != msquicNativeServerSide:
             return Ok[bool](true)
-        if ! msquicNativeSession.active:
-            let initRes: Result[bool] = msquicNativeInitServerSession(fromAddr, headerDec.header)
-            if IsErr(initRes):
-                return initRes
-        msquicNativeSession.serverLargestInitialRecv = headerDec.header.packetNumber
+        msquicNativeServerLargestInitialRecv = headerDec.header.packetNumber
+        var cryptoBytesSeen: int32 = 0
+        var firstFrameKind: int64 = -1
+        var firstFrameLen: int32 = -1
         for i in 0..<pkt.framesCount:
-            let frame: MsQuicFrame = pkt.frames[i]
-            if frame.kind == FrameCrypto:
-                let feedRes: Result[bool] = msquicNativeHandleCryptoFrame(msquicNativeSession.server, QuicPacketInitial, frame)
+            let frameKind: int64 = msquicNativeFrameTypeCode(pkt.frames[i])
+            if i == 0:
+                firstFrameKind = frameKind
+                firstFrameLen = bytesLen(pkt.frames[i].data)
+            if frameKind == int64(msquicNativeFrameCryptoCode):
+                cryptoBytesSeen = cryptoBytesSeen + bytesLen(pkt.frames[i].data)
+                let feedRes: Result[bool] = msquicNativeHandleCryptoData(
+                    msquicNativeServerSide,
+                    msquicNativePacketInitialCode,
+                    pkt.frames[i].offset,
+                    pkt.frames[i].data
+                )
                 if IsErr(feedRes):
                     return Err[bool](ErrorText(feedRes))
+        if handshake13.msquicTls13ServerClientKeyShareGroup() <= 0:
+            var err: str = "msquic native: server client key share missing after initial"
+            err = err + " crypto=" + intToStr(cryptoBytesSeen)
+            err = err + " frames=" + intToStr(pkt.framesCount)
+            err = err + " firstKind=" + int64ToStr(firstFrameKind)
+            err = err + " firstLen=" + intToStr(firstFrameLen)
+            err = err + " messages=" + intToStr(handshake13.msquicTls13ServerHandshakeMessageCount())
+            err = err + " buffered=" + intToStr(handshake13.msquicTls13ServerBufferedHandshakeBytes())
+            err = err + " last=" + handshake13.msquicTls13ServerLastErrorText()
+            return Err[bool](err)
         return msquicNativeSendServerFlight()
 
-    if headerDec.header.packetType == QuicPacketHandshake:
+    if packetTypeCode == msquicNativePacketHandshakeCode:
         if recvSide == msquicNativeClientSide:
-            msquicNativeSession.clientLargestHandshakeRecv = headerDec.header.packetNumber
+            msquicNativeClientLargestHandshakeRecv = headerDec.header.packetNumber
             for i in 0..<pkt.framesCount:
-                let frame: MsQuicFrame = pkt.frames[i]
-                if frame.kind == FrameCrypto:
-                    let feedRes: Result[bool] = msquicNativeHandleCryptoFrame(msquicNativeSession.client, QuicPacketHandshake, frame)
+                let frameKind: int64 = msquicNativeFrameTypeCode(pkt.frames[i])
+                if frameKind == int64(msquicNativeFrameCryptoCode):
+                    let feedRes: Result[bool] = msquicNativeHandleCryptoData(
+                        msquicNativeClientSide,
+                        msquicNativePacketHandshakeCode,
+                        pkt.frames[i].offset,
+                        pkt.frames[i].data
+                    )
                     if IsErr(feedRes):
                         return Err[bool](ErrorText(feedRes))
-            if msquicNativeSession.client.handshake.finishedOk:
+            if msquicTls13ClientFinishedOk():
                 return msquicNativeSendClientFinished()
             return Ok[bool](true)
 
         for i in 0..<pkt.framesCount:
-            let frame: MsQuicFrame = pkt.frames[i]
-            if frame.kind == FrameCrypto:
-                let feedRes: Result[bool] = msquicNativeHandleCryptoFrame(msquicNativeSession.server, QuicPacketHandshake, frame)
+            let frameKind: int64 = msquicNativeFrameTypeCode(pkt.frames[i])
+            if frameKind == int64(msquicNativeFrameCryptoCode):
+                let feedRes: Result[bool] = msquicNativeHandleCryptoData(
+                    msquicNativeServerSide,
+                    msquicNativePacketHandshakeCode,
+                    pkt.frames[i].offset,
+                    pkt.frames[i].data
+                )
                 if IsErr(feedRes):
                     return Err[bool](ErrorText(feedRes))
-        if msquicNativeSession.server.handshake.finishedOk:
-            msquicNativeSession.server.ready = true
+        if msquicTls13ServerFinishedOk():
+            msquicNativeServerReady = true
             msquicNativeQueueAcceptIfReady()
         return Ok[bool](true)
 
-    if headerDec.header.packetType != QuicPacketShort:
+    if packetTypeCode != msquicNativePacketShortCode:
         return Ok[bool](true)
 
     if recvSide == msquicNativeClientSide:
-        msquicNativeSession.clientLargestAppRecv = headerDec.header.packetNumber
+        msquicNativeClientLargestAppRecv = headerDec.header.packetNumber
     else:
-        msquicNativeSession.serverLargestAppRecv = headerDec.header.packetNumber
+        msquicNativeServerLargestAppRecv = headerDec.header.packetNumber
 
     for i in 0..<pkt.framesCount:
         let frameRes: Result[bool] = msquicNativeHandleAppFrame(recvSide, pkt.frames[i])
@@ -819,11 +1493,11 @@ fn msquicNativeProcessPacket(recvSide: int32, fromAddr: str, wire: Bytes): Resul
             return frameRes
     if pkt.ackEliciting && ! msquicNativeSession.closed:
         if recvSide == msquicNativeClientSide:
-            let ackRes: Result[bool] = msquicConnImplQueueAck(msquicNativeSession.client.impl, headerDec.header.packetNumber)
+            let ackRes: Result[bool] = msquicConnImplQueueAck(msquicNativeClientImpl, headerDec.header.packetNumber)
             if IsErr(ackRes):
                 return Err[bool](ErrorText(ackRes))
             return msquicNativeFlushShortPackets(msquicNativeClientSide)
-        let ackRes: Result[bool] = msquicConnImplQueueAck(msquicNativeSession.server.impl, headerDec.header.packetNumber)
+        let ackRes: Result[bool] = msquicConnImplQueueAck(msquicNativeServerImpl, headerDec.header.packetNumber)
         if IsErr(ackRes):
             return Err[bool](ErrorText(ackRes))
         return msquicNativeFlushShortPackets(msquicNativeServerSide)
@@ -838,18 +1512,21 @@ fn msquicNativePumpDatapath(id: int32, recvSide: int32): Result[bool] =
             return Ok[bool](false)
         return Err[bool](ErrorText(recvRes))
     let datagram: datapath_udp.MsQuicUdpDatagram = Value(recvRes)
-    return msquicNativeProcessPacket(recvSide, datagram.fromAddr, datagram.data)
+    let procRes: Result[bool] = msquicNativeProcessPacket(recvSide, datagram.fromAddr, datagram.data)
+    if IsErr(procRes):
+        return Err[bool](ErrorText(procRes))
+    return procRes
 
 fn msquicNativePumpRetransmit(side: int32): Result[bool] =
     let nowMs: int64 = msquicNowMs()
     if side == msquicNativeClientSide:
-        let rt: MsQuicRetransmitPacket = msquicConnImplNextRetransmit(msquicNativeSession.client.impl, nowMs)
+        let rt: MsQuicRetransmitPacket = msquicConnImplNextRetransmit(msquicNativeClientImpl, nowMs)
         if rt.number > 0 && bytesLen(rt.payload) > 0:
-            return msquicNativeSendPayload(msquicNativeClientSide, QuicPacketShort, rt.number, rt.payload, true)
+            return msquicNativeSendPayload(msquicNativeClientSide, msquicNativePacketShortCode, rt.number, rt.payload, true)
         return Ok[bool](false)
-    let rt: MsQuicRetransmitPacket = msquicConnImplNextRetransmit(msquicNativeSession.server.impl, nowMs)
+    let rt: MsQuicRetransmitPacket = msquicConnImplNextRetransmit(msquicNativeServerImpl, nowMs)
     if rt.number > 0 && bytesLen(rt.payload) > 0:
-        return msquicNativeSendPayload(msquicNativeServerSide, QuicPacketShort, rt.number, rt.payload, true)
+        return msquicNativeSendPayload(msquicNativeServerSide, msquicNativePacketShortCode, rt.number, rt.payload, true)
     return Ok[bool](false)
 
 fn msquicNativePump(count: int32): Result[bool] =
@@ -886,14 +1563,10 @@ fn msquicNativePumpClientBlocking(): Result[bool] =
     let procRes: Result[bool] = msquicNativeProcessPacket(msquicNativeClientSide, Value(recvRes).fromAddr, Value(recvRes).data)
     if IsErr(procRes):
         return procRes
-    return msquicNativePumpRetransmit(msquicNativeClientSide)
-
-fn msquicNativeAppRecvAvailable(side: int32): int32 =
-    if side == msquicNativeClientSide:
-        return msquicCryptoStreamAvailable(msquicNativeSession.client.appRecv)
-    if side == msquicNativeServerSide:
-        return msquicCryptoStreamAvailable(msquicNativeSession.server.appRecv)
-    return 0
+    let rtRes: Result[bool] = msquicNativePumpRetransmit(msquicNativeClientSide)
+    if IsErr(rtRes):
+        return rtRes
+    return rtRes
 
 fn msquicNativePumpSideBlocking(side: int32): Result[bool] =
     if side == msquicNativeClientSide:
@@ -907,7 +1580,10 @@ fn msquicNativePumpSideBlocking(side: int32): Result[bool] =
         let procRes: Result[bool] = msquicNativeProcessPacket(msquicNativeServerSide, Value(recvRes).fromAddr, Value(recvRes).data)
         if IsErr(procRes):
             return procRes
-        return msquicNativePumpRetransmit(msquicNativeServerSide)
+        let rtRes: Result[bool] = msquicNativePumpRetransmit(msquicNativeServerSide)
+        if IsErr(rtRes):
+            return rtRes
+        return rtRes
     return Err[bool]("msquic native: local role ! ready")
 
 fn msquicNativePumpHandshakeBlocking(): Result[bool] =
@@ -916,13 +1592,13 @@ fn msquicNativePumpHandshakeBlocking(): Result[bool] =
         return Err[bool](ErrorText(pumpRes))
     if msquicNativeSessionReady():
         return Ok[bool](true)
-    if ! msquicNativeSession.server.ready:
+    if ! msquicNativeServerReady:
         let serverRes: Result[bool] = msquicNativePumpSideBlocking(msquicNativeServerSide)
         if IsErr(serverRes):
             return Err[bool](ErrorText(serverRes))
         if msquicNativeSessionReady():
             return Ok[bool](true)
-    if ! msquicNativeSession.client.ready:
+    if ! msquicNativeClientReady:
         let clientRes: Result[bool] = msquicNativePumpSideBlocking(msquicNativeClientSide)
         if IsErr(clientRes):
             return Err[bool](ErrorText(clientRes))
@@ -941,7 +1617,11 @@ fn msquicNativeStartListener(addr: MultiAddress, settings: MsQuicSettings, tlsPo
     let startRes: Result[bool] = datapath_runtime.msquicDatapathStart(msquicNativeDatapathRt, id)
     if IsErr(startRes):
         return Err[int32](ErrorText(startRes))
-    let bindText: str = msquicNativeMultiAddressBindText(addr)
+    var bindText: str = "/ip4/127.0.0.1/udp/0/quic-v1"
+    if len(addr.raw) > 0:
+        bindText = addr.raw
+    elif bytesLen(addr.data) > 0:
+        bindText = bytesToString(addr.data)
     let bindRes: Result[bool] = datapath_runtime.msquicDatapathBindUdp(msquicNativeDatapathRt, id, bindText)
     if IsErr(bindRes):
         return Err[int32](ErrorText(bindRes))
@@ -949,7 +1629,8 @@ fn msquicNativeStartListener(addr: MultiAddress, settings: MsQuicSettings, tlsPo
     msquicNativeListenerRunning = true
     msquicNativeListenerSettings = settings
     msquicNativeListenerTlsPolicy = tlsPolicy
-    msquicNativeListenAddr = addr
+    let boundText: str = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, id)
+    msquicNativeListenAddr = msquicNativeAddrFromDatapathText(boundText, addr)
     return Ok[int32](id)
 
 fn msquicNativeStopListener() =
@@ -996,14 +1677,19 @@ fn msquicNativeStartListenerServerInputsCode(
     let startRes: Result[bool] = datapath_runtime.msquicDatapathStart(msquicNativeDatapathRt, id)
     if IsErr(startRes):
         return -5
-    let bindText: str = msquicNativeMultiAddressBindText(addr)
+    var bindText: str = "/ip4/127.0.0.1/udp/0/quic-v1"
+    if len(addr.raw) > 0:
+        bindText = addr.raw
+    elif bytesLen(addr.data) > 0:
+        bindText = bytesToString(addr.data)
     let bindRes: Result[bool] = datapath_runtime.msquicDatapathBindUdp(msquicNativeDatapathRt, id, bindText)
     if IsErr(bindRes):
         return -6
     msquicNativeListenerDatapathId = id
     msquicNativeListenerRunning = true
     msquicNativeListenerSettings = settings
-    msquicNativeListenAddr = addr
+    let boundText: str = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, id)
+    msquicNativeListenAddr = msquicNativeAddrFromDatapathText(boundText, addr)
     return id
 
 fn msquicNativeStartListenerServerInputs(
@@ -1030,6 +1716,78 @@ fn msquicNativeStartListenerServerInputsMust(
         panic(ErrorText(startRes))
     return Value(startRes)
 
+fn msquicNativeDialAllocClientDatapath(): Result[int32] =
+    let addRes: Result[int32] = datapath_runtime.msquicDatapathAdd(msquicNativeDatapathRt, 0)
+    if IsErr(addRes):
+        return Err[int32](ErrorText(addRes))
+    return Ok[int32](Value(addRes))
+
+fn msquicNativeDialStartClientDatapath(clientId: int32): Result[bool] =
+    let startRes: Result[bool] = datapath_runtime.msquicDatapathStart(msquicNativeDatapathRt, clientId)
+    if IsErr(startRes):
+        return Err[bool](ErrorText(startRes))
+    return Ok[bool](true)
+
+fn msquicNativeDialBindUdp(clientId: int32, bindText: str): Result[bool] =
+    let bindRes: Result[bool] = datapath_runtime.msquicDatapathBindUdp(msquicNativeDatapathRt, clientId, bindText)
+    if IsErr(bindRes):
+        return Err[bool](ErrorText(bindRes))
+    return Ok[bool](true)
+
+fn msquicNativeDialSetupSession(
+    clientId: int32,
+    clientSettings: MsQuicSettings,
+    clientTlsPolicy: MsQuicTlsPolicy,
+    addr: MultiAddress
+): Result[bool] =
+    var remoteAddrText: str = "/ip4/127.0.0.1/udp/0/quic-v1"
+    if len(addr.raw) > 0:
+        remoteAddrText = addr.raw
+    elif bytesLen(addr.data) > 0:
+        remoteAddrText = bytesToString(addr.data)
+    msquicNativeResetSession()
+    var clientSettingsLocal = clientSettings
+    msquicNativeLocalRole = msquicNativeRoleClient
+    msquicNativeSession.active = true
+    msquicNativeSession.listenAddr = msquicNativeListenAddr
+    msquicNativeSession.dialAddr = addr
+    msquicNativeSetClientPolicyCache(clientTlsPolicy)
+    msquicNativeResetServerPolicyCache()
+    msquicNativeSession.listenerDatapathId = 0
+    msquicNativeSession.clientDatapathId = clientId
+    msquicNativeSession.listenerAddrText = remoteAddrText
+    msquicNativeSession.clientAddrText = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, clientId)
+    msquicNativeClientCidCache = msquicNativeConnId(0x11111111)
+    msquicNativeServerCidCache = msquicNativeConnId(0x22222222)
+    let clientAddrRes = parseMultiAddress(msquicNativeSession.clientAddrText)
+    var clientAddr = msquicNativeEmptyAddr()
+    if IsOk(clientAddrRes):
+        clientAddr = Value(clientAddrRes)
+    if msquicNativeListenerRunning && msquicNativeListenerDatapathId > 0:
+        msquicNativeSession.listenerDatapathId = msquicNativeListenerDatapathId
+    msquicNativeResetClientEndpoint(clientSettingsLocal, true)
+    handshake13.msquicTls13ClientSetServerName(msquicNativeClientServerNameCache)
+    handshake13.msquicTls13ClientClearTrustRoots()
+    for i in 0..<msquicNativeClientTrustRootsCountCache:
+        let addRes: Result[bool] = handshake13.msquicTls13ClientAddTrustRoot(msquicNativeClientTrustRootAtCache(i))
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+    return Ok[bool](true)
+
+fn msquicNativeDialSendHello(): Result[bool] =
+    return msquicNativeSendClientHello()
+
+fn msquicNativeDialPumpReady(): Result[int32] =
+    let deadlineMs: int64 = msquicNowMs() + int64(msquicNativeDialReadyTimeoutMs)
+    while msquicNowMs() <= deadlineMs:
+        let pumpRes: Result[bool] = msquicNativePump(msquicNativePumpBudget)
+        if IsErr(pumpRes):
+            return Err[int32](ErrorText(pumpRes))
+        if msquicNativeSessionReady():
+            msquicNativeQueueAcceptIfReady()
+            return Ok[int32](1)
+    return Err[int32]("msquic native: handshake ! ready")
+
 fn msquicNativeDial(clientSettings: MsQuicSettings, clientTlsPolicy: MsQuicTlsPolicy, addr: MultiAddress): Result[int32] =
     msquicNativeEnsureInit()
     if msquicNativeSession.active && ! msquicNativeSession.closed:
@@ -1037,70 +1795,40 @@ fn msquicNativeDial(clientSettings: MsQuicSettings, clientTlsPolicy: MsQuicTlsPo
     let clientRes: Result[bool] = msquicTlsPolicyValidateForClient(clientTlsPolicy)
     if IsErr(clientRes):
         return Err[int32](ErrorText(clientRes))
-
-    let addRes: Result[int32] = datapath_runtime.msquicDatapathAdd(msquicNativeDatapathRt, 0)
-    if IsErr(addRes):
-        return Err[int32](ErrorText(addRes))
-    let clientId: int32 = Value(addRes)
-    let startRes: Result[bool] = datapath_runtime.msquicDatapathStart(msquicNativeDatapathRt, clientId)
+    let clientIdRes: Result[int32] = msquicNativeDialAllocClientDatapath()
+    if IsErr(clientIdRes):
+        return Err[int32](ErrorText(clientIdRes))
+    let clientId: int32 = Value(clientIdRes)
+    let startRes: Result[bool] = msquicNativeDialStartClientDatapath(clientId)
     if IsErr(startRes):
         return Err[int32](ErrorText(startRes))
-    let remoteAddrText: str = msquicNativeMultiAddressBindText(addr)
-    let bindText: str = msquicNativeDialBindText(remoteAddrText)
-    let bindRes: Result[bool] = datapath_runtime.msquicDatapathBindUdp(msquicNativeDatapathRt, clientId, bindText)
+    var remoteAddrText: str = "/ip4/127.0.0.1/udp/0/quic-v1"
+    if len(addr.raw) > 0:
+        remoteAddrText = addr.raw
+    elif bytesLen(addr.data) > 0:
+        remoteAddrText = bytesToString(addr.data)
+    var bindText: str = "/ip4/127.0.0.1/udp/0/quic-v1"
+    if msquicNativeStartsWith(remoteAddrText, "/ip6/"):
+        bindText = "/ip6/::1/udp/0/quic-v1"
+    elif msquicNativeStartsWith(remoteAddrText, "udp://["):
+        bindText = "/ip6/::1/udp/0/quic-v1"
+    let bindRes: Result[bool] = msquicNativeDialBindUdp(clientId, bindText)
     if IsErr(bindRes):
         return Err[int32](ErrorText(bindRes))
-
-    msquicNativeResetSession(msquicNativeSession)
-    msquicNativeLocalRole = msquicNativeRoleClient
-    msquicNativeSession.active = true
-    msquicNativeSession.listenAddr = msquicNativeListenAddr
-    msquicNativeSession.dialAddr = addr
-    msquicNativeSession.clientSettings = clientSettings
-    msquicNativeSession.serverSettings = initMsQuicSettings()
-    msquicNativeSession.clientTlsPolicy = clientTlsPolicy
-    msquicNativeSession.serverTlsPolicy = initMsQuicTlsPolicy()
-    msquicNativeSession.listenerDatapathId = 0
-    msquicNativeSession.clientDatapathId = clientId
-    msquicNativeSession.listenerAddrText = remoteAddrText
-    msquicNativeSession.clientAddrText = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, clientId)
-    msquicNativeSession.clientCid = msquicNativeConnId(0x11111111)
-    msquicNativeSession.serverCid = msquicNativeConnId(0x22222222)
-    let clientAddrRes = parseMultiAddress(msquicNativeSession.clientAddrText)
-    var clientAddr = msquicNativeEmptyAddr()
-    if IsOk(clientAddrRes):
-        clientAddr = Value(clientAddrRes)
-    if msquicNativeListenerRunning && msquicNativeListenerDatapathId > 0:
-        msquicNativeSession.serverSettings = msquicNativeListenerSettings
-        msquicNativeSession.serverTlsPolicy = msquicNativeListenerTlsPolicy
-        msquicNativeSession.listenerDatapathId = msquicNativeListenerDatapathId
-    msquicNativeResetEndpoint(msquicNativeSession.client, TlsRoleClient, clientAddr, addr, msquicNativeSession.clientSettings, 101, true)
-    msquicNativeResetEndpoint(msquicNativeSession.server, TlsRoleServer, msquicNativeListenAddr, clientAddr, msquicNativeSession.serverSettings, 102, false)
-    echo("msquic_native_dial_stage=session_ready")
-    msquicTls13HandshakeSetServerName(msquicNativeSession.client.handshake, msquicNativeSession.clientTlsPolicy.serverName)
-    let rootsRes: Result[X509CertList] = msquicTlsPolicyTrustRoots(msquicNativeSession.clientTlsPolicy)
-    if IsErr(rootsRes):
-        return Err[int32](ErrorText(rootsRes))
-    msquicTls13HandshakeSetTrustRoots(msquicNativeSession.client.handshake, Value(rootsRes))
-
-    let helloRes: Result[bool] = msquicNativeSendClientHello()
+    if !datapath_runtime.msquicDatapathUdpBound(msquicNativeDatapathRt, clientId):
+        panic("msquic native dial: bind lost")
+    let setupRes: Result[bool] = msquicNativeDialSetupSession(clientId, clientSettings, clientTlsPolicy, addr)
+    if IsErr(setupRes):
+        return Err[int32](ErrorText(setupRes))
+    if !datapath_runtime.msquicDatapathUdpBound(msquicNativeDatapathRt, clientId):
+        panic("msquic native dial: bind lost after setup")
+    let helloRes: Result[bool] = msquicNativeDialSendHello()
     if IsErr(helloRes):
         return Err[int32](ErrorText(helloRes))
-    echo("msquic_native_dial_stage=client_hello_ok")
-    for i in 0..<64:
-        var pumpRes: Result[bool]
-        if msquicNativeSession.listenerDatapathId > 0:
-            pumpRes = msquicNativePumpHandshakeBlocking()
-        else:
-            pumpRes = msquicNativePumpClientBlocking()
-        if IsErr(pumpRes):
-            return Err[int32](ErrorText(pumpRes))
-        if msquicNativeSessionReady():
-            echo("msquic_native_dial_stage=ready")
-            msquicNativeQueueAcceptIfReady()
-            return Ok[int32](1)
-    echo("msquic_native_dial_stage=not_ready")
-    return Err[int32]("msquic native: handshake ! ready")
+    let readyRes: Result[int32] = msquicNativeDialPumpReady()
+    if IsErr(readyRes):
+        return Err[int32](ErrorText(readyRes))
+    return readyRes
 
 fn msquicNativeAccept(): Result[int32] =
     if ! msquicNativeListenerRunning:
@@ -1124,10 +1852,7 @@ fn msquicNativeAccept(): Result[int32] =
 fn msquicNativeClientBoundAddr(): MultiAddress =
     if ! msquicNativeSession.active:
         return msquicNativeEmptyAddr()
-    let addrRes = parseMultiAddress(msquicNativeSession.clientAddrText)
-    if IsErr(addrRes):
-        return msquicNativeEmptyAddr()
-    return Value(addrRes)
+    return msquicNativeAddrFromDatapathText(msquicNativeSession.clientAddrText, msquicNativeEmptyAddr())
 
 fn msquicNativeListenerBoundAddr(): MultiAddress =
     if msquicNativeListenerRunning:
@@ -1136,9 +1861,10 @@ fn msquicNativeListenerBoundAddr(): MultiAddress =
 
 fn msquicNativePeerDialAddr(): MultiAddress =
     if strings.len(msquicNativeSession.clientAddrText) > 0:
-        let addrRes = parseMultiAddress(msquicNativeSession.clientAddrText)
-        if IsOk(addrRes):
-            return Value(addrRes)
+        let clientAddr: MultiAddress = msquicNativeAddrFromDatapathText(msquicNativeSession.clientAddrText,
+                                                                        msquicNativeEmptyAddr())
+        if len(clientAddr.raw) > 0 || bytesLen(clientAddr.data) > 0:
+            return clientAddr
     if msquicNativeSession.active:
         return msquicNativeSession.dialAddr
     return msquicNativeEmptyAddr()
@@ -1146,10 +1872,10 @@ fn msquicNativePeerDialAddr(): MultiAddress =
 fn msquicNativePipeIdxForSession(token: int32): int32 =
     if token <= 0:
         return -1
-    return msquicNativePipeToken
+    return 1000001
 
 fn msquicNativeIsPipeIdx(pipeIdx: int32): bool =
-    if pipeIdx == msquicNativePipeToken:
+    if pipeIdx == 1000001:
         return true
     return false
 
@@ -1173,28 +1899,28 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
     while remaining > 0:
         var batchLen: int32 = 0
         if side == msquicNativeClientSide:
-            let batchCap: int32 = msquicConnImplMaxQueuedDataLen(msquicNativeSession.client.impl, msquicNativeStreamClient, msquicNativeSession.client.sendOffset)
+            let batchCap: int32 = msquicConnImplMaxQueuedDataLen(msquicNativeClientImpl, msquicNativeStreamClient, msquicNativeClientSendOffset)
             if batchCap <= 0:
                 return Err[int32]("msquic native: send queue stalled")
             batchLen = if remaining < batchCap: remaining else: batchCap
             let chunk: Bytes = bytesSlice(data, cursor, batchLen)
-            let qRes: Result[bool] = msquicConnImplQueueData(msquicNativeSession.client.impl, msquicNativeStreamClient, msquicNativeSession.client.sendOffset, chunk)
+            let qRes: Result[bool] = msquicConnImplQueueData(msquicNativeClientImpl, msquicNativeStreamClient, msquicNativeClientSendOffset, chunk)
             if IsErr(qRes):
                 return Err[int32](ErrorText(qRes))
-            msquicNativeSession.client.sendOffset = msquicNativeSession.client.sendOffset + int64(batchLen)
+            msquicNativeClientSendOffset = msquicNativeClientSendOffset + int64(batchLen)
             let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeClientSide)
             if IsErr(flushRes):
                 return Err[int32](ErrorText(flushRes))
         elif side == msquicNativeServerSide:
-            let batchCap: int32 = msquicConnImplMaxQueuedDataLen(msquicNativeSession.server.impl, msquicNativeStreamServer, msquicNativeSession.server.sendOffset)
+            let batchCap: int32 = msquicConnImplMaxQueuedDataLen(msquicNativeServerImpl, msquicNativeStreamServer, msquicNativeServerSendOffset)
             if batchCap <= 0:
                 return Err[int32]("msquic native: send queue stalled")
             batchLen = if remaining < batchCap: remaining else: batchCap
             let chunk: Bytes = bytesSlice(data, cursor, batchLen)
-            let qRes: Result[bool] = msquicConnImplQueueData(msquicNativeSession.server.impl, msquicNativeStreamServer, msquicNativeSession.server.sendOffset, chunk)
+            let qRes: Result[bool] = msquicConnImplQueueData(msquicNativeServerImpl, msquicNativeStreamServer, msquicNativeServerSendOffset, chunk)
             if IsErr(qRes):
                 return Err[int32](ErrorText(qRes))
-            msquicNativeSession.server.sendOffset = msquicNativeSession.server.sendOffset + int64(batchLen)
+            msquicNativeServerSendOffset = msquicNativeServerSendOffset + int64(batchLen)
             let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeServerSide)
             if IsErr(flushRes):
                 return Err[int32](ErrorText(flushRes))
@@ -1217,50 +1943,54 @@ fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes
         return Err[Bytes]("msquic native: session ! active")
     if count <= 0:
         return Ok[Bytes](emptyBytes())
-    for i in 0..<64:
+    let deadlineMs: int64 = msquicNowMs() + int64(msquicNativePipeReadTimeoutMs)
+    while msquicNowMs() <= deadlineMs:
         let pumpRes: Result[bool] = msquicNativePump(msquicNativePumpBudget)
         if IsErr(pumpRes):
             return Err[Bytes](ErrorText(pumpRes))
         if msquicNativeSession.closed:
             return Err[Bytes]("msquic: pipe closed")
         if msquicNativeAppRecvAvailable(side) > 0:
-            if side == msquicNativeClientSide:
-                return Ok[Bytes](msquicCryptoStreamConsume(msquicNativeSession.client.appRecv, count))
-            if side == msquicNativeServerSide:
-                return Ok[Bytes](msquicCryptoStreamConsume(msquicNativeSession.server.appRecv, count))
-            return Err[Bytes]("msquic native: local role ! ready")
-        let blockRes: Result[bool] = msquicNativePumpSideBlocking(side)
-        if IsErr(blockRes):
-            return Err[Bytes](ErrorText(blockRes))
-        if msquicNativeSession.closed:
-            return Err[Bytes]("msquic: pipe closed")
-        if msquicNativeAppRecvAvailable(side) > 0:
-            if side == msquicNativeClientSide:
-                return Ok[Bytes](msquicCryptoStreamConsume(msquicNativeSession.client.appRecv, count))
-            if side == msquicNativeServerSide:
-                return Ok[Bytes](msquicCryptoStreamConsume(msquicNativeSession.server.appRecv, count))
-            return Err[Bytes]("msquic native: local role ! ready")
-    return Ok[Bytes](emptyBytes())
+            return Ok[Bytes](msquicNativeAppRecvConsume(side, count))
+    return Err[Bytes]("msquic native: pipe read timeout")
 
 fn msquicNativeSendConnectionClose(reason: str): Result[bool] =
     if ! msquicNativeSession.active || msquicNativeSession.closed:
         msquicNativeSession.closed = true
         return Ok[bool](true)
-    if msquicNativeLocalRole == msquicNativeRoleClient && msquicNativeSession.client.ready:
-        var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, QuicPacketShort))
-        let closeRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameConnectionClose(0, 0, bytesFromString(reason)))
+    if msquicNativeLocalRole == msquicNativeRoleClient && msquicNativeClientReady:
+        var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, msquicNativePacketShortCode))
+        let closeRes: Result[bool] = msquicNativePacketAddConnectionCloseFrame(pkt, bytesFromString(reason))
         if IsErr(closeRes):
             return Err[bool](ErrorText(closeRes))
-        let sendRes: Result[bool] = msquicNativeSendPacket(msquicNativeClientSide, QuicPacketShort, pkt)
+        let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+        if IsErr(payloadRes):
+            return Err[bool](ErrorText(payloadRes))
+        let sendRes: Result[bool] = msquicNativeSendPayload(
+            msquicNativeClientSide,
+            msquicNativePacketShortCode,
+            pkt.number,
+            Value(payloadRes),
+            msquicPacketAckEliciting(pkt)
+        )
         if IsErr(sendRes):
             return Err[bool](ErrorText(sendRes))
         let _ = msquicNativePump(msquicNativePumpBudget)
-    elif msquicNativeLocalRole == msquicNativeRoleServer && msquicNativeSession.server.ready:
-        var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, QuicPacketShort))
-        let closeRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameConnectionClose(0, 0, bytesFromString(reason)))
+    elif msquicNativeLocalRole == msquicNativeRoleServer && msquicNativeServerReady:
+        var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeServerSide, msquicNativePacketShortCode))
+        let closeRes: Result[bool] = msquicNativePacketAddConnectionCloseFrame(pkt, bytesFromString(reason))
         if IsErr(closeRes):
             return Err[bool](ErrorText(closeRes))
-        let sendRes: Result[bool] = msquicNativeSendPacket(msquicNativeServerSide, QuicPacketShort, pkt)
+        let payloadRes: Result[Bytes] = msquicPacketPayloadEncode(pkt)
+        if IsErr(payloadRes):
+            return Err[bool](ErrorText(payloadRes))
+        let sendRes: Result[bool] = msquicNativeSendPayload(
+            msquicNativeServerSide,
+            msquicNativePacketShortCode,
+            pkt.number,
+            Value(payloadRes),
+            msquicPacketAckEliciting(pkt)
+        )
         if IsErr(sendRes):
             return Err[bool](ErrorText(sendRes))
         let _ = msquicNativePump(msquicNativePumpBudget)
@@ -1278,14 +2008,14 @@ fn msquicNativeDatagramWrite(pipeIdx: int32, side: int32, data: Bytes): Result[i
     if ! msquicNativeSideReady(side):
         return Err[int32]("msquic native: session ! ready")
     if side == msquicNativeClientSide:
-        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeSession.client.impl, msquicFrameDatagram(data))
+        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeClientImpl, msquicFrameDatagram(data))
         if IsErr(qRes):
             return Err[int32](ErrorText(qRes))
         let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeClientSide)
         if IsErr(flushRes):
             return Err[int32](ErrorText(flushRes))
     elif side == msquicNativeServerSide:
-        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeSession.server.impl, msquicFrameDatagram(data))
+        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeServerImpl, msquicFrameDatagram(data))
         if IsErr(qRes):
             return Err[int32](ErrorText(qRes))
         let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeServerSide)
@@ -1307,9 +2037,9 @@ fn msquicNativeDatagramRead(pipeIdx: int32, side: int32): Result[Bytes] =
     if msquicNativeSession.closed:
         return Err[Bytes]("msquic: pipe closed")
     if side == msquicNativeClientSide:
-        return msquicNativeDequeueDatagram(msquicNativeSession.client)
+        return msquicNativeDequeueDatagram(msquicNativeClientSide)
     if side == msquicNativeServerSide:
-        return msquicNativeDequeueDatagram(msquicNativeSession.server)
+        return msquicNativeDequeueDatagram(msquicNativeServerSide)
     return Err[Bytes]("msquic native: local role ! ready")
 
 fn msquicNativeTestDropNextAppPacket() =
@@ -1320,11 +2050,9 @@ fn msquicNativeTestForceRetransmit(pipeIdx: int32): Result[bool] =
         return Err[bool]("msquic native: invalid pipe")
     let nowMs: int64 = msquicNowMs()
     if msquicNativeLocalRole == msquicNativeRoleClient:
-        for i in 0..<msquicNativeSession.client.impl.sentCount:
-            msquicNativeSession.client.impl.sentPackets[i].sentAtMs = nowMs - msquicNativeSession.client.impl.rtoMs - 1
+        msquicConnImplForceRetransmit(msquicNativeClientImpl, nowMs)
     elif msquicNativeLocalRole == msquicNativeRoleServer:
-        for i in 0..<msquicNativeSession.server.impl.sentCount:
-            msquicNativeSession.server.impl.sentPackets[i].sentAtMs = nowMs - msquicNativeSession.server.impl.rtoMs - 1
+        msquicConnImplForceRetransmit(msquicNativeServerImpl, nowMs)
     let pumpRes: Result[bool] = msquicNativePump(msquicNativePumpBudget)
     if IsErr(pumpRes):
         return Err[bool](ErrorText(pumpRes))

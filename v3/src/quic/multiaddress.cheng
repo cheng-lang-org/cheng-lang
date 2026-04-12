@@ -139,10 +139,15 @@ fn readSegment(text: str, start: int32): Result[SegmentRead] =
     if start >= len(text):
         return Err[SegmentRead]("multiaddress: trailing slash")
     var i: int32 = start
-    while i < len(text) && text[i] != '/':
+    while i < len(text):
+        if text[i] == '/':
+            break
         i = i + 1
     let seg: str = ustrings.sliceBytes(text, start, i - start)
-    let next: int32 = if i < len(text) && text[i] == '/': i + 1 else: i
+    var next: int32 = i
+    if i < len(text):
+        if text[i] == '/':
+            next = i + 1
     var out: SegmentRead
     out.seg = seg
     out.next = next
@@ -175,8 +180,8 @@ fn parseIPv4(text: str): Result[Bytes] =
     var out: Bytes = bytesAlloc(4)
     var start: int32 = 0
     var parts: int32 = 0
-    for i in 0..len(text):
-        if i == len(text) || text[i] == '.':
+    for i in 0..<len(text):
+        if text[i] == '.':
             let count: int32 = i - start
             let partRes: Result[int32] = parseUIntRange(text, start, count)
             if IsErr(partRes):
@@ -189,6 +194,17 @@ fn parseIPv4(text: str): Result[Bytes] =
             bytesSet(out, parts, value)
             parts = parts + 1
             start = i + 1
+    let tailCount: int32 = len(text) - start
+    let tailRes: Result[int32] = parseUIntRange(text, start, tailCount)
+    if IsErr(tailRes):
+        return Err[Bytes](ErrorText(tailRes))
+    let tailValue: int32 = Value(tailRes)
+    if tailValue < 0 || tailValue > 255:
+        return Err[Bytes]("multiaddress: ip4 out of range")
+    if parts >= 4:
+        return Err[Bytes]("multiaddress: ip4 parts")
+    bytesSet(out, parts, tailValue)
+    parts = parts + 1
     if parts != 4:
         return Err[Bytes]("multiaddress: ip4 parts")
     return Ok[Bytes](out)
@@ -232,9 +248,15 @@ fn splitHostPort(text: str): Result[HostPortPair] =
         return Err[HostPortPair]("multiaddress: empty host:port")
     if text[0] == '[':
         var close: int32 = 1
-        while close < len(text) && text[close] != ']':
+        while close < len(text):
+            if text[close] == ']':
+                break
             close = close + 1
-        if close >= len(text) || close + 1 >= len(text) || text[close + 1] != ':':
+        if close >= len(text):
+            return Err[HostPortPair]("multiaddress: invalid ipv6 host:port")
+        if close + 1 >= len(text):
+            return Err[HostPortPair]("multiaddress: invalid ipv6 host:port")
+        if text[close + 1] != ':':
             return Err[HostPortPair]("multiaddress: invalid ipv6 host:port")
         var out: HostPortPair
         out.host = ustrings.sliceBytes(text, 1, close - 1)
@@ -325,6 +347,9 @@ fn quicMultiAddressToString(addr: MultiAddress): str =
         return bytesToString(addr.data)
     return ""
 
+fn quicMultiAddressBindText(addr: MultiAddress): str =
+    return quicMultiAddressToString(addr)
+
 fn quicMultiAddressToBytes(addr: MultiAddress): Bytes =
     if bytesLen(addr.data) > 0:
         return addr.data
@@ -366,8 +391,9 @@ fn bytesContains(haystack: Bytes, needle: Bytes): bool =
     return false
 
 fn quicMultiAddressKind(addr: MultiAddress): int32 =
-    if bytesLen(addr.data) >= 2 && bytesGet(addr.data, 0) == quicAddrTagMagic:
-        return bytesGet(addr.data, 1)
+    if bytesLen(addr.data) >= 2:
+        if bytesGet(addr.data, 0) == quicAddrTagMagic:
+            return bytesGet(addr.data, 1)
     let data: Bytes = quicMultiAddressToBytes(addr)
     if bytesContains(data, bytesFromString("/quic-v1/tls")):
         return quicAddrKindQuicTls
@@ -378,6 +404,7 @@ fn quicMultiAddressKind(addr: MultiAddress): int32 =
     return quicAddrKindUnknown
 
 fn quicMultiAddressPort(addr: MultiAddress): int32 =
-    if bytesLen(addr.data) >= 4 && bytesGet(addr.data, 0) == quicAddrTagMagic:
-        return (bytesGet(addr.data, 2) << 8) | bytesGet(addr.data, 3)
+    if bytesLen(addr.data) >= 4:
+        if bytesGet(addr.data, 0) == quicAddrTagMagic:
+            return (bytesGet(addr.data, 2) << 8) | bytesGet(addr.data, 3)
     return 0

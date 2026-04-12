@@ -1,12 +1,12 @@
 import std/result
 import std/rawbytes
+import std/system
 import std/strings
 import std/crypto/bigint
 
 const
     p256FixedLimbCount: int32 = 8
     p256FixedWordBits: int32 = 32
-    p256FixedWordMaskU64: uint64 = uint64(0xffffffff)
 
 type
     P256Fixed =
@@ -33,6 +33,9 @@ fn p256FixedScratchZero(scratch: var P256FixedMontgomeryScratch) =
     for i in 0..<17:
         scratch.words[i] = 0
 
+fn p256FixedLowWordBitsU64(v: uint64): uint64 =
+    return uint64(uint32(v))
+
 fn p256FixedSquareAccumulate(c0: var uint64,
                              c1: var uint64,
                              c2: var uint64,
@@ -40,9 +43,9 @@ fn p256FixedSquareAccumulate(c0: var uint64,
                              hiWord: uint64) =
     c0 = c0 + loWord
     c1 = c1 + hiWord + (c0 >> uint64(p256FixedWordBits))
-    c0 = c0 & p256FixedWordMaskU64
+    c0 = p256FixedLowWordBitsU64(c0)
     c2 = c2 + (c1 >> uint64(p256FixedWordBits))
-    c1 = c1 & p256FixedWordMaskU64
+    c1 = p256FixedLowWordBitsU64(c1)
 
 fn p256FixedSquareBuildScratch(a: var P256Fixed): Result[P256FixedMontgomeryScratch] =
     var scratch: P256FixedMontgomeryScratch
@@ -69,12 +72,12 @@ fn p256FixedSquareBuildScratch(a: var P256Fixed): Result[P256FixedMontgomeryScra
                 p256FixedSquareAccumulate(c0,
                                           c1,
                                           c2,
-                                          prod & p256FixedWordMaskU64,
+                                          p256FixedLowWordBitsU64(prod),
                                           prod >> uint64(p256FixedWordBits))
             else:
-                let prodLo: uint64 = prod & p256FixedWordMaskU64
+                let prodLo: uint64 = p256FixedLowWordBitsU64(prod)
                 let prodHi: uint64 = prod >> uint64(p256FixedWordBits)
-                let dblLo: uint64 = (prodLo << uint64(1)) & p256FixedWordMaskU64
+                let dblLo: uint64 = p256FixedLowWordBitsU64(prodLo << uint64(1))
                 let dblHi: uint64 = (prodHi << uint64(1)) + (prodLo >> uint64(31))
                 p256FixedSquareAccumulate(c0, c1, c2, dblLo, dblHi)
             i = i + 1
@@ -87,16 +90,10 @@ fn p256FixedSquareBuildScratch(a: var P256Fixed): Result[P256FixedMontgomeryScra
     return Ok[P256FixedMontgomeryScratch](scratch)
 
 fn p256FixedWordToBitsU64(w: int32): uint64 =
-    var v: int64 = int64(w)
-    if v < 0:
-        v = v + (int64(1) << 32)
-    return uint64(v)
+    return uint64(uint32(w))
 
 fn p256FixedWordFromBitsU64(v: uint64): int32 =
-    var lo: int64 = int64(v & p256FixedWordMaskU64)
-    if lo >= (int64(1) << 31):
-        lo = lo - (int64(1) << 32)
-    return int32(lo)
+    return int32(uint32(v))
 
 fn p256FixedZero(): P256Fixed =
     var out: P256Fixed
@@ -286,7 +283,7 @@ fn p256FixedMontgomeryAddMulAt(scratch: var P256FixedMontgomeryScratch,
         let bv: uint64 = p256FixedWordToBitsU64(multiplicand.limbs[j])
         let cur: uint64 = p256FixedWordToBitsU64(scratch.words[offset + j])
         let prod: uint64 = mulWord * bv
-        let prodLo: uint64 = prod & p256FixedWordMaskU64
+        let prodLo: uint64 = p256FixedLowWordBitsU64(prod)
         let prodHi: uint64 = prod >> uint64(p256FixedWordBits)
         let sumLo: uint64 = cur + prodLo + carry
         scratch.words[offset + j] = p256FixedWordFromBitsU64(sumLo)
@@ -313,15 +310,14 @@ fn p256FixedMontgomeryAddMulAtTrusted(scratch: var P256FixedMontgomeryScratch,
         let bv: uint64 = p256FixedWordToBitsU64(multiplicand.limbs[j])
         let cur: uint64 = p256FixedWordToBitsU64(scratch.words[offset + j])
         let prod: uint64 = mulWord * bv
-        let prodLo: uint64 = prod & p256FixedWordMaskU64
+        let prodLo: uint64 = p256FixedLowWordBitsU64(prod)
         let prodHi: uint64 = prod >> uint64(p256FixedWordBits)
         let sumLo: uint64 = cur + prodLo + carry
         scratch.words[offset + j] = p256FixedWordFromBitsU64(sumLo)
         carry = prodHi + (sumLo >> uint64(p256FixedWordBits))
     var carryIdx: int32 = offset + p256FixedLimbCount
     while carry != uint64(0):
-        if carryIdx >= 17:
-            crash("p256_fixed: montgomery carry overflow offset=" + intToStr(offset) + " idx=" + intToStr(carryIdx))
+        assert(carryIdx < 17, "p256_fixed: montgomery carry overflow")
         let cur: uint64 = p256FixedWordToBitsU64(scratch.words[carryIdx])
         let sum: uint64 = cur + carry
         scratch.words[carryIdx] = p256FixedWordFromBitsU64(sum)
@@ -368,10 +364,9 @@ fn p256FixedSubtractModulusWithHighTrusted(value: var P256Fixed,
             out.limbs[i] = p256FixedWordFromBitsU64(wordBase + av - subWord)
             borrow = uint64(1)
     if highWord < borrow:
-        crash("p256_fixed: montgomery high borrow underflow")
+        panic("p256_fixed: montgomery high borrow underflow")
     let reducedHigh: uint64 = highWord - borrow
-    if reducedHigh != uint64(0):
-        crash("p256_fixed: montgomery reduced high overflow=" + uint64ToStr(reducedHigh))
+    assert(reducedHigh == uint64(0), "p256_fixed: montgomery reduced high overflow")
     return out
 
 fn p256FixedSubtractModulusWithHighTrustedInto(out: var P256Fixed,
@@ -391,10 +386,9 @@ fn p256FixedSubtractModulusWithHighTrustedInto(out: var P256Fixed,
             out.limbs[i] = p256FixedWordFromBitsU64(wordBase + av - subWord)
             borrow = uint64(1)
     if highWord < borrow:
-        crash("p256_fixed: montgomery high borrow underflow")
+        panic("p256_fixed: montgomery high borrow underflow")
     let reducedHigh: uint64 = highWord - borrow
-    if reducedHigh != uint64(0):
-        crash("p256_fixed: montgomery reduced high overflow=" + uint64ToStr(reducedHigh))
+    assert(reducedHigh == uint64(0), "p256_fixed: montgomery reduced high overflow")
 
 fn p256FixedMontgomeryMulCore(a: var P256Fixed,
                               b: var P256Fixed,
@@ -407,7 +401,7 @@ fn p256FixedMontgomeryMulCore(a: var P256Fixed,
         let addRes: Result[bool] = p256FixedMontgomeryAddMulAt(scratch, i, bi, a)
         if IsErr(addRes):
             return Err[P256Fixed]("p256_fixed: mul ab i=" + intToStr(i) + " " + Error(addRes))
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         let modAddRes: Result[bool] = p256FixedMontgomeryAddMulAt(scratch, i, mWord, modulusLocal)
         if IsErr(modAddRes):
             return Err[P256Fixed]("p256_fixed: mul reduce i=" + intToStr(i) + " " + Error(modAddRes))
@@ -449,7 +443,7 @@ fn p256FixedMontgomeryReduceScratch(scratch: var P256FixedMontgomeryScratch,
                                     ctx: var P256FixedMontgomeryContext): Result[P256Fixed] =
     var modulusLocal: P256Fixed = ctx.modulus
     for i in 0..<p256FixedLimbCount:
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         let modAddRes: Result[bool] = p256FixedMontgomeryAddMulAt(scratch, i, mWord, modulusLocal)
         if IsErr(modAddRes):
             return Err[P256Fixed]("p256_fixed: square reduce i=" + intToStr(i) + " " + Error(modAddRes))
@@ -459,7 +453,7 @@ fn p256FixedMontgomeryReduceScratchTrusted(scratch: var P256FixedMontgomeryScrat
                                            ctx: var P256FixedMontgomeryContext): P256Fixed =
     var modulusLocal: P256Fixed = ctx.modulus
     for i in 0..<p256FixedLimbCount:
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, mWord, modulusLocal)
     return p256FixedMontgomeryFinishScratchTrusted(scratch, modulusLocal)
 
@@ -468,7 +462,7 @@ fn p256FixedMontgomeryReduceScratchTrustedInto(out: var P256Fixed,
                                                ctx: var P256FixedMontgomeryContext) =
     var modulusLocal: P256Fixed = ctx.modulus
     for i in 0..<p256FixedLimbCount:
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, mWord, modulusLocal)
     p256FixedMontgomeryFinishScratchTrustedInto(out, scratch, modulusLocal)
 
@@ -510,12 +504,12 @@ fn p256FixedSquareBuildScratchTrustedInto(scratch: var P256FixedMontgomeryScratc
                 p256FixedSquareAccumulate(c0,
                                           c1,
                                           c2,
-                                          prod & p256FixedWordMaskU64,
+                                          p256FixedLowWordBitsU64(prod),
                                           prod >> uint64(p256FixedWordBits))
             else:
-                let prodLo: uint64 = prod & p256FixedWordMaskU64
+                let prodLo: uint64 = p256FixedLowWordBitsU64(prod)
                 let prodHi: uint64 = prod >> uint64(p256FixedWordBits)
-                let dblLo: uint64 = (prodLo << uint64(1)) & p256FixedWordMaskU64
+                let dblLo: uint64 = p256FixedLowWordBitsU64(prodLo << uint64(1))
                 let dblHi: uint64 = (prodHi << uint64(1)) + (prodLo >> uint64(31))
                 p256FixedSquareAccumulate(c0, c1, c2, dblLo, dblHi)
             i = i + 1
@@ -524,7 +518,7 @@ fn p256FixedSquareBuildScratchTrustedInto(scratch: var P256FixedMontgomeryScratc
         c1 = c2
         c2 = uint64(0)
     if c0 != uint64(0) || c1 != uint64(0):
-        crash("p256_fixed: square comba overflow")
+        panic("p256_fixed: square comba overflow")
 
 fn p256FixedMontgomeryMulCoreTrusted(a: var P256Fixed,
                                      b: var P256Fixed,
@@ -535,7 +529,7 @@ fn p256FixedMontgomeryMulCoreTrusted(a: var P256Fixed,
     for i in 0..<p256FixedLimbCount:
         let bi: uint64 = p256FixedWordToBitsU64(b.limbs[i])
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, bi, a)
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, mWord, modulusLocal)
     return p256FixedMontgomeryFinishScratchTrusted(scratch, modulusLocal)
 
@@ -549,7 +543,7 @@ fn p256FixedMontgomeryMulCoreTrustedInto(out: var P256Fixed,
     for i in 0..<p256FixedLimbCount:
         let bi: uint64 = p256FixedWordToBitsU64(b.limbs[i])
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, bi, a)
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, mWord, modulusLocal)
     p256FixedMontgomeryFinishScratchTrustedInto(out, scratch, modulusLocal)
 
@@ -563,7 +557,7 @@ fn p256FixedMontgomeryMulCoreTrustedScratchInto(out: var P256Fixed,
     for i in 0..<p256FixedLimbCount:
         let bi: uint64 = p256FixedWordToBitsU64(b.limbs[i])
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, bi, a)
-        let mWord: uint64 = (p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv) & p256FixedWordMaskU64
+        let mWord: uint64 = p256FixedLowWordBitsU64(p256FixedWordToBitsU64(scratch.words[i]) * ctx.n0Inv)
         p256FixedMontgomeryAddMulAtTrusted(scratch, i, mWord, modulusLocal)
     p256FixedMontgomeryFinishScratchTrustedInto(out, scratch, modulusLocal)
 
@@ -651,10 +645,10 @@ fn p256FixedModSubTrusted(a: var P256Fixed, b: var P256Fixed, modulus: var P256F
         return subRaw.value
     let diffRaw: P256FixedSubRawResult = p256FixedSubRaw(b, a)
     if diffRaw.borrow != uint64(0):
-        crash("p256_fixed: wrapped subtraction diff borrow")
+        panic("p256_fixed: wrapped subtraction diff borrow")
     let reduceRaw: P256FixedSubRawResult = p256FixedSubRaw(modulus, diffRaw.value)
     if reduceRaw.borrow != uint64(0):
-        crash("p256_fixed: modulus subtraction borrow")
+        panic("p256_fixed: modulus subtraction borrow")
     return reduceRaw.value
 
 fn p256FixedModSubTrustedInto(out: var P256Fixed,
@@ -669,11 +663,11 @@ fn p256FixedModSubTrustedInto(out: var P256Fixed,
     var diffBorrow: uint64 = uint64(0)
     p256FixedSubRawInto(diff, diffBorrow, b, a)
     if diffBorrow != uint64(0):
-        crash("p256_fixed: wrapped subtraction diff borrow")
+        panic("p256_fixed: wrapped subtraction diff borrow")
     var reduceBorrow: uint64 = uint64(0)
     p256FixedSubRawInto(out, reduceBorrow, modulus, diff)
     if reduceBorrow != uint64(0):
-        crash("p256_fixed: modulus subtraction borrow")
+        panic("p256_fixed: modulus subtraction borrow")
 
 fn p256FixedGetBit(a: var P256Fixed, idx: int32): int32 =
     if idx < 0:
@@ -686,7 +680,7 @@ fn p256FixedGetBit(a: var P256Fixed, idx: int32): int32 =
 
 fn p256FixedAssertNormalizedTrusted(value: var P256Fixed, modulus: var P256Fixed) =
     if p256FixedCmp(value, modulus) >= 0:
-        crash("p256_fixed: trusted path got non-normalized input")
+        panic("p256_fixed: trusted path got non-normalized input")
 
 fn p256FixedModMulWithContext(a: var P256Fixed,
                               b: var P256Fixed,
