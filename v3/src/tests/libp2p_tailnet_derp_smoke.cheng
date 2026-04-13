@@ -11,6 +11,8 @@ fn main(): int32 =
     cfg.controlUrl = "https://headscale.example"
     cfg.controlEndpoint = "https://headscale.example/control"
     cfg.relayEndpoint = "https://derp.sfo.example:443"
+    cfg.controlProbeEndpoint = "v3/testdata/tailnet/headscale_control_ready.json"
+    cfg.relayProbeEndpoint = "v3/testdata/tailnet/derp_ready.json"
     cfg.syntheticIPv4 = "100.64.1.9"
     cfg.syntheticIPv6 = "fd7a:115c:a1e0::109"
     cfg.localPeerId = "tailnet-derp-smoke"
@@ -43,14 +45,33 @@ fn main(): int32 =
     peerB.signedPreface = "preface-b"
     peerB.boundAddrText = "/ip4/10.0.0.22/udp/7203/quic-v1"
     tsnet.v3Libp2pTailnetUpsertPeerSession(transport, peerB)
-    tsnet.v3Libp2pTailnetSetProviderReady(transport, true, "control-ready")
-    tsnet.v3Libp2pTailnetSetProxyListenersReady(transport, true, "proxy-ready")
-    tsnet.v3Libp2pTailnetSetDerpHealthy(transport, true, "derp-ready")
+    tsnet.v3Libp2pTailnetProviderStart(transport)
+    tsnet.v3Libp2pTailnetProviderMarkProxyReady(transport)
+    tsnet.v3Libp2pTailnetProviderReconnectDerp(transport)
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeActiveCountNow() == 1,
+        "v3 libp2p tailnet derp: runtime active")
 
     var rawQuic = types.v3Libp2pMultiaddrZero()
     multiaddr.v3Libp2pMultiaddrFillQuic(rawQuic, "127.0.0.1", 7202)
     let listenRes = tsnet.v3Libp2pTailnetListen(transport, rawQuic)
     assert(IsOk(listenRes), "v3 libp2p tailnet derp: listen")
+
+    assert(!tsnet.v3Libp2pTailnetDerpAvailable(transport),
+        "v3 libp2p tailnet derp: reconnect clears derp")
+
+    var published = tsnet.v3Libp2pTailnetPublishedAddrs(transport)
+    var reconnectPlan = tsnet.v3Libp2pTailnetDialPlanZero()
+    let reconnectPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(reconnectPlan,
+                                                             transport,
+                                                             "peer-b",
+                                                             published[0],
+                                                             true,
+                                                             false)
+    assert(IsErr(reconnectPlanRes), "v3 libp2p tailnet derp: reconnect blocks relay-only peer")
+    assert(reconnectPlan.pathKind == tsnet.v3Libp2pTailnetPathIdle,
+        "v3 libp2p tailnet derp: reconnect idle path")
+
+    tsnet.v3Libp2pTailnetProviderDerpReady(transport)
 
     var status: tsnet.V3Libp2pTailnetStatusSnapshot
     tsnet.v3Libp2pTailnetStatusFill(status, transport)
@@ -61,17 +82,19 @@ fn main(): int32 =
     assert(status.derpRegionCode == "sfo", "v3 libp2p tailnet derp: region code")
     assert(status.derpHostname == "derp.sfo.example", "v3 libp2p tailnet derp: hostname")
     assert(status.tailnetPath == "direct+derp", "v3 libp2p tailnet derp: path")
+    assert(status.sessionCount == 2, "v3 libp2p tailnet derp: session count")
     assert(status.tailnetPeers.len == 2, "v3 libp2p tailnet derp: peer sessions")
     assert(status.proxyListenersReady, "v3 libp2p tailnet derp: proxy listeners ready")
     assert(status.publishedCount == 1, "v3 libp2p tailnet derp: published count")
-    assert(status.tailnetDerpMapSummary == "headscale/infra@https://headscale.example/control#sfo/derp.sfo.example",
+    assert(status.tailnetDerpMapSummary == "headscale/infra@https://headscale.example#sfo/derp.sfo.example",
         "v3 libp2p tailnet derp: derp summary")
     assert(tsnet.v3Libp2pTailnetProviderUsesExactRouting(transport),
         "v3 libp2p tailnet derp: exact routing helper")
     assert(tsnet.v3Libp2pTailnetDerpAvailable(transport),
         "v3 libp2p tailnet derp: derp available helper")
+    assert(status.startupStage == "derp-ready",
+        "v3 libp2p tailnet derp: startup stage")
 
-    var published = tsnet.v3Libp2pTailnetPublishedAddrs(transport)
     var derpPlan = tsnet.v3Libp2pTailnetDialPlanZero()
     let derpPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(derpPlan,
                                                         transport,
@@ -146,10 +169,12 @@ fn main(): int32 =
     assert(relayEndpoint.reachability == types.v3Libp2pReachabilityRelayed,
         "v3 libp2p tailnet derp: relay reachability")
 
-    tsnet.v3Libp2pTailnetSetListenerNeedsRepair(transport, true, "repair-needed")
+    tsnet.v3Libp2pTailnetProviderMarkListenerRepairNeeded(transport)
     var repairStatus: tsnet.V3Libp2pTailnetStatusSnapshot
     tsnet.v3Libp2pTailnetStatusFill(repairStatus, transport)
     assert(repairStatus.tailnetPath == "repair", "v3 libp2p tailnet derp: repair path")
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeCommandCountNow() == 5,
+        "v3 libp2p tailnet derp: runtime commands")
 
     echo("v3 libp2p_tailnet_derp_smoke ok")
     return 0

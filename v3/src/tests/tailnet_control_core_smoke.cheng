@@ -1,0 +1,188 @@
+import std/system
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
+import cheng/v3/project/tailnet_control_core as ctl
+
+fn main(): int32 =
+    var cfg = tsnet.v3Libp2pTailnetTransportConfigZero()
+    cfg.controlUrl = "https://headscale.example"
+    cfg.controlEndpoint = "https://headscale.example/control"
+    cfg.relayEndpoint = "https://derp.sfo.example:443"
+    cfg.controlProbeEndpoint = "v3/testdata/tailnet/headscale_control_ready.json"
+    cfg.relayProbeEndpoint = "v3/testdata/tailnet/derp_ready.json"
+    cfg.syntheticIPv4 = "100.64.9.11"
+    cfg.syntheticIPv6 = "fd7a:115c:a1e0::911"
+    cfg.localPeerId = "tailnet-control-core-smoke"
+    tsnet.v3Libp2pTailnetConfigSetHeadscale(cfg,
+                                            "infra",
+                                            "noise-pub-ctrl",
+                                            12,
+                                            "sfo",
+                                            "San Francisco",
+                                            "derp.sfo.example",
+                                            true)
+
+    var transport = tsnet.v3Libp2pTailnetTransportInit(cfg)
+    tsnet.v3Libp2pTailnetProviderStart(transport)
+    tsnet.v3Libp2pTailnetProviderMarkProxyReady(transport)
+    tsnet.v3Libp2pTailnetProviderDerpReady(transport)
+
+    var rawAddr = types.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(rawAddr, "127.0.0.1", 7101)
+    let listenRes = tsnet.v3Libp2pTailnetListen(transport, rawAddr)
+    assert(IsOk(listenRes), "v3 tailnet control core smoke: listen")
+
+    var session = tsnet.v3Libp2pTailnetPeerSessionZero()
+    session.peerId = "peer-direct"
+    session.remoteTailnetIp = "100.64.9.88"
+    session.directReachable = true
+    session.relayAllowed = true
+    session.derpRegionCode = "sfo"
+    session.signedPreface = "preface-control"
+    session.boundAddrText = tsnet.v3Libp2pTailnetAddrText(rawAddr)
+    session.lastPath = "direct"
+    session.lastError = ""
+    tsnet.v3Libp2pTailnetUpsertPeerSession(transport, session)
+
+    let wire = ctl.tailnetCtlEncodeStateWire(transport)
+    assert(len(wire) > 0, "v3 tailnet control core smoke: wire")
+    let lines = ctl.tailnetCtlSplitLines(wire)
+    let listenHostWire = ctl.tailnetCtlLineValue(lines, "listen.0.host")
+    let listenTransportWire = ctl.tailnetCtlLineValue(lines, "listen.0.transport")
+    let listenPortWire = ctl.tailnetCtlLineValue(lines, "listen.0.port")
+    assert(listenHostWire == "127.0.0.1", "v3 tailnet control core smoke: listen host wire")
+    assert(listenTransportWire == "tcp", "v3 tailnet control core smoke: listen transport wire")
+    assert(listenPortWire == "7101", "v3 tailnet control core smoke: listen port wire")
+
+    var restoredCfg = tsnet.v3Libp2pTailnetTransportConfigZero()
+    restoredCfg.controlUrl = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "controlUrl"))
+    restoredCfg.controlEndpoint = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "controlEndpoint"))
+    restoredCfg.relayEndpoint = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "relayEndpoint"))
+    restoredCfg.controlProbeEndpoint = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "controlProbeEndpoint"))
+    restoredCfg.relayProbeEndpoint = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "relayProbeEndpoint"))
+    restoredCfg.localPeerId = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "localPeerId"))
+    restoredCfg.syntheticIPv4 = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "syntheticIPv4"))
+    restoredCfg.syntheticIPv6 = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "syntheticIPv6"))
+    let restoredProviderKind = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "providerKind"))
+    let restoredExactRouting = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "exactRouting")))
+    if restoredProviderKind == "headscale":
+        tsnet.v3Libp2pTailnetConfigSetHeadscale(restoredCfg,
+                                                ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "headscaleNamespace")),
+                                                ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "headscaleNoisePublicKey")),
+                                                0,
+                                                ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpRegionCode")),
+                                                ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpRegionName")),
+                                                ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpHostname")),
+                                                restoredExactRouting)
+    else:
+        restoredCfg.exactRouting = restoredExactRouting
+        restoredCfg.headscaleNamespace = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "headscaleNamespace"))
+        restoredCfg.headscaleNoisePublicKey = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "headscaleNoisePublicKey"))
+        restoredCfg.derpRegionCode = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpRegionCode"))
+        restoredCfg.derpRegionName = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpRegionName"))
+        restoredCfg.derpHostname = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpHostname"))
+
+    var restored = tsnet.v3Libp2pTailnetTransportInit(restoredCfg)
+    let restoredProviderReady = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "providerReady")))
+    let restoredProxyReady = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "proxyListenersReady")))
+    let restoredDerpHealthy = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "derpHealthy")))
+    let restoredNeedsRepair = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "listenerNeedsRepair")))
+    let restoredStartupStage = ctl.tailnetCtlUnescape(ctl.tailnetCtlLineValue(lines, "startupStage"))
+    ctl.tailnetCtlRestoreProviderLifecycle(restored,
+                                           restoredProviderReady,
+                                           restoredProxyReady,
+                                           restoredDerpHealthy,
+                                           restoredNeedsRepair,
+                                           restoredStartupStage)
+    var restoredListenCount = ctl.tailnetCtlParseNonNegativeI32(ctl.tailnetCtlLineValue(lines, "listenCount"))
+    if restoredListenCount <= 0:
+        restoredListenCount = ctl.tailnetCtlCountIndexedKeys(lines, "listen.", ".raw")
+    var restoredListenIndex = 0
+    while restoredListenIndex < restoredListenCount:
+        let restoredRawText = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "listen.", restoredListenIndex, ".raw"))
+        let restoredHost = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "listen.", restoredListenIndex, ".host"))
+        let restoredPort = ctl.tailnetCtlParseNonNegativeI32(ctl.tailnetCtlIndexedLineValue(lines, "listen.", restoredListenIndex, ".port"))
+        let restoredTransportText = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "listen.", restoredListenIndex, ".transport"))
+        var restoredRawAddr = types.v3Libp2pMultiaddrZero()
+        if len(restoredHost) > 0 && restoredPort > 0 && restoredTransportText == "quic":
+            multiaddr.v3Libp2pMultiaddrFillQuic(restoredRawAddr, restoredHost, restoredPort)
+        elif len(restoredHost) > 0 && restoredPort > 0 && restoredTransportText == "tcp":
+            multiaddr.v3Libp2pMultiaddrFillTcp(restoredRawAddr, restoredHost, restoredPort)
+        else:
+            let restoredRawRes = multiaddr.v3Libp2pMultiaddrParse(restoredRawText)
+            assert(IsOk(restoredRawRes), "v3 tailnet control core smoke: parse restored listen")
+            restoredRawAddr = Value(restoredRawRes)
+        let restoredListenRes = tsnet.v3Libp2pTailnetListen(restored, restoredRawAddr)
+        assert(IsOk(restoredListenRes), "v3 tailnet control core smoke: restore listen")
+        restoredListenIndex = restoredListenIndex + 1
+    var restoredPeerCount = ctl.tailnetCtlParseNonNegativeI32(ctl.tailnetCtlLineValue(lines, "peerCount"))
+    if restoredPeerCount <= 0:
+        restoredPeerCount = ctl.tailnetCtlCountIndexedKeys(lines, "peer.", ".peerId")
+    var restoredPeerIndex = 0
+    while restoredPeerIndex < restoredPeerCount:
+        var restoredPeer = tsnet.v3Libp2pTailnetPeerSessionZero()
+        restoredPeer.peerId = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".peerId"))
+        restoredPeer.remoteTailnetIp = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".remoteTailnetIp"))
+        restoredPeer.directReachable = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".directReachable")))
+        restoredPeer.relayAllowed = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".relayAllowed")))
+        restoredPeer.relayOnly = ctl.tailnetCtlParseBool(ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".relayOnly")))
+        restoredPeer.derpRegionCode = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".derpRegionCode"))
+        restoredPeer.signedPreface = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".signedPreface"))
+        restoredPeer.boundAddrText = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".boundAddrText"))
+        restoredPeer.lastPath = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".lastPath"))
+        restoredPeer.lastError = ctl.tailnetCtlUnescape(ctl.tailnetCtlIndexedLineValue(lines, "peer.", restoredPeerIndex, ".lastError"))
+        tsnet.v3Libp2pTailnetUpsertPeerSession(restored, restoredPeer)
+        restoredPeerIndex = restoredPeerIndex + 1
+
+    var status: tsnet.V3Libp2pTailnetStatusSnapshot
+    tsnet.v3Libp2pTailnetStatusFill(status, restored)
+    assert(status.providerKind == "headscale", "v3 tailnet control core smoke: provider")
+    assert(status.controlPlane == "headscale", "v3 tailnet control core smoke: control plane")
+    assert(status.providerReady, "v3 tailnet control core smoke: provider ready")
+    assert(status.proxyListenersReady, "v3 tailnet control core smoke: proxy ready")
+    assert(status.relayHealthy, "v3 tailnet control core smoke: derp healthy")
+    assert(status.publishedCount == 1, "v3 tailnet control core smoke: published count")
+    assert(status.sessionCount == 1, "v3 tailnet control core smoke: session count")
+    assert(status.tailnetDerpMapSummary == "headscale/infra@https://headscale.example#sfo/derp.sfo.example",
+        "v3 tailnet control core smoke: derp summary")
+    assert(status.startupStage == "derp-ready", "v3 tailnet control core smoke: startup stage")
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeActiveCountNow() == 2,
+        "v3 tailnet control core smoke: runtime active after restore")
+
+    let published = tsnet.v3Libp2pTailnetPublishedAddrs(restored)
+    assert(published.len == 1, "v3 tailnet control core smoke: published len")
+    var rawLookup = types.v3Libp2pMultiaddrZero()
+    assert(tsnet.v3Libp2pTailnetResolvePublishedToRaw(restored, published[0], rawLookup),
+        "v3 tailnet control core smoke: raw lookup")
+    assert(rawLookup.host == "127.0.0.1", "v3 tailnet control core smoke: raw host")
+    assert(rawLookup.port == 7101, "v3 tailnet control core smoke: raw port")
+
+    var plan = tsnet.v3Libp2pTailnetDialPlanZero()
+    let planRes = tsnet.v3Libp2pTailnetDialPlanFill(plan,
+                                                    restored,
+                                                    "peer-direct",
+                                                    published[0],
+                                                    false,
+                                                    false)
+    assert(IsOk(planRes), "v3 tailnet control core smoke: direct plan")
+    assert(plan.pathKind == tsnet.v3Libp2pTailnetPathDirect,
+        "v3 tailnet control core smoke: direct path")
+    assert(plan.routeText == "/ip4/127.0.0.1/tcp/7101",
+        "v3 tailnet control core smoke: route text")
+
+    var restoredSession = tsnet.v3Libp2pTailnetPeerSessionZero()
+    assert(tsnet.v3Libp2pTailnetPeerSessionAtFill(restoredSession, restored, 0),
+        "v3 tailnet control core smoke: session at")
+    assert(restoredSession.lastPath == "direct",
+        "v3 tailnet control core smoke: last path restored")
+
+    assert(tsnet.v3Libp2pTailnetProviderClose(transport),
+        "v3 tailnet control core smoke: close original")
+    assert(tsnet.v3Libp2pTailnetProviderClose(restored),
+        "v3 tailnet control core smoke: close restored")
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeActiveCountNow() == 0,
+        "v3 tailnet control core smoke: runtime closed")
+
+    echo("v3 tailnet_control_core_smoke ok")
+    return 0

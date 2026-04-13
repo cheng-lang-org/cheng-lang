@@ -320,6 +320,8 @@ fn v3ErasureEncodeShardPayloads(blob: Bytes,
         return Err[Bytes[]](Error(generatorRes))
     var dataShards: Bytes[]
     dataShards = []
+    for shardIndex in 0..<dataCount:
+        add(dataShards, emptyBytes())
     var next = 0
     for shardIndex in 0..<dataCount:
         let shard = bytesAlloc(payloadBytes)
@@ -329,11 +331,13 @@ fn v3ErasureEncodeShardPayloads(blob: Bytes,
                 next = next + 1
             else:
                 bytesSet(shard, bytePos, 0)
-        add(dataShards, shard)
+        dataShards[shardIndex] = shard
     var out: Bytes[]
     out = []
+    for shardIndex in 0..<total:
+        add(out, emptyBytes())
     for shardIndex in 0..<dataCount:
-        add(out, dataShards[shardIndex])
+        out[shardIndex] = dataShards[shardIndex]
     for shardIndex in dataCount..<total:
         let shard = bytesAlloc(payloadBytes)
         for bytePos in 0..<payloadBytes:
@@ -342,7 +346,7 @@ fn v3ErasureEncodeShardPayloads(blob: Bytes,
                 let coef = generator[v3ErasureMatrixPos(dataCount, shardIndex, dataIndex)]
                 acc = acc ^ gf256.gf256Mul(bytesGet(dataShards[dataIndex], bytePos), coef)
             bytesSet(shard, bytePos, acc)
-        add(out, shard)
+        out[shardIndex] = shard
     return Ok[Bytes[]](out)
 
 fn v3ErasureRebuildBlob(manifest: V3ErasureShardManifest,
@@ -370,8 +374,13 @@ fn v3ErasureRebuildBlob(manifest: V3ErasureShardManifest,
         add(selected, false)
     var chosenIndices: int32[]
     chosenIndices = []
+    for i in 0..<threshold:
+        add(chosenIndices, 0)
     var chosenPayloads: Bytes[]
     chosenPayloads = []
+    for i in 0..<threshold:
+        add(chosenPayloads, emptyBytes())
+    var chosenCount = 0
     for i in 0..<shardIndices.len:
         let shardIndex = shardIndices[i]
         if shardIndex < 0 || shardIndex >= manifest.shardCount:
@@ -386,11 +395,12 @@ fn v3ErasureRebuildBlob(manifest: V3ErasureShardManifest,
         if !layout.fixedBytes32Equal(v3ErasureShardPayloadCid(shardPayloads[i]), manifest.shardPayloadCids[manifestPos]):
             return Err[Bytes]("v3 erasure swarm: shard payload cid mismatch")
         selected[shardIndex] = true
-        add(chosenIndices, shardIndex)
-        add(chosenPayloads, shardPayloads[i])
-        if chosenIndices.len >= threshold:
+        chosenIndices[chosenCount] = shardIndex
+        chosenPayloads[chosenCount] = shardPayloads[i]
+        chosenCount = chosenCount + 1
+        if chosenCount >= threshold:
             break
-    if chosenIndices.len < threshold:
+    if chosenCount < threshold:
         return Err[Bytes]("v3 erasure swarm: insufficient unique shards for rebuild")
     var chosenMatrix = v3ErasureMatrixInit(threshold, threshold)
     for row in 0..<threshold:
@@ -429,6 +439,9 @@ fn v3ErasureRebuildBlobFromResponses(manifest: V3ErasureShardManifest,
     var shardPayloads: Bytes[]
     shardPayloads = []
     for i in 0..<responses.len:
+        add(shardIndices, 0)
+        add(shardPayloads, emptyBytes())
+    for i in 0..<responses.len:
         let response = responses[i]
         if response.version != 1:
             return Err[Bytes]("v3 erasure swarm: unsupported shard pull response version")
@@ -443,8 +456,8 @@ fn v3ErasureRebuildBlobFromResponses(manifest: V3ErasureShardManifest,
             return Err[Bytes]("v3 erasure swarm: shard pull response index mismatch")
         if !layout.fixedBytes32Equal(response.shardCid, manifest.shardPayloadCids[manifestPos]):
             return Err[Bytes]("v3 erasure swarm: shard pull response cid mismatch")
-        add(shardIndices, response.shardIndex)
-        add(shardPayloads, response.payload)
+        shardIndices[i] = response.shardIndex
+        shardPayloads[i] = response.payload
     return v3ErasureRebuildBlob(manifest, params, shardIndices, shardPayloads)
 
 fn v3ErasureEncodingParamsValidate(params: V3ErasureEncodingParams): Result[int32] =
@@ -485,6 +498,13 @@ fn v3ErasureManifestShardPos(manifest: V3ErasureShardManifest, shardIndex: int32
             return i
     return -1
 
+fn v3ErasureShardIndexPos(shardIndices: int32[],
+                          shardIndex: int32): int32 =
+    for i in 0..<shardIndices.len:
+        if shardIndices[i] == shardIndex:
+            return i
+    return -1
+
 fn v3ErasureManifestValidate(manifest: V3ErasureShardManifest,
                              params: V3ErasureEncodingParams): Result[int32] =
     let totalRes = v3ErasureEncodingParamsValidate(params)
@@ -520,18 +540,20 @@ fn v3ErasureShardManifestMake(blobCid: layout.FixedBytes32,
     out.paramsCid = params.paramsCid
     out.shardCount = totalShards
     for i in 0..<totalShards:
-        let shardCid = shardPayloadCids[i]
-        add(out.shardIndices, i)
-        add(out.shardPayloadCids, shardCid)
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+        add(out.shardIndices, 0)
+        add(out.shardPayloadCids, layout.fixedBytes32Zero())
+    for i in 0..<totalShards:
+        out.shardIndices[i] = i
+        out.shardPayloadCids[i] = shardPayloadCids[i]
+    var buf: layout.ByteBuf = layout.byteBufInit(96 + totalShards * 36)
     layout.byteBufAppendBytes(buf, bytesFromString("v3.erasure.manifest"))
-    lt.v3AppendFixed32(buf, out.blobCid)
-    lt.v3AppendU32BE(buf, out.blobByteLen)
-    lt.v3AppendFixed32(buf, out.paramsCid)
-    lt.v3AppendU32BE(buf, out.shardCount)
-    for i in 0..<out.shardCount:
-        lt.v3AppendU32BE(buf, out.shardIndices[i])
-        lt.v3AppendFixed32(buf, out.shardPayloadCids[i])
+    lt.v3AppendFixed32(buf, blobCid)
+    lt.v3AppendU32BE(buf, blobByteLen)
+    lt.v3AppendFixed32(buf, params.paramsCid)
+    lt.v3AppendU32BE(buf, totalShards)
+    for i in 0..<totalShards:
+        lt.v3AppendU32BE(buf, i)
+        lt.v3AppendFixed32(buf, shardPayloadCids[i])
     out.manifestCid = lt.v3FixedCidFromBuf(buf)
     let validateRes = v3ErasureManifestValidate(out, params)
     if IsErr(validateRes):
@@ -575,6 +597,13 @@ fn v3ErasureShardManifestDecode(payload: Bytes): Result[V3ErasureShardManifest] 
     if shardCount < 0:
         return Err[V3ErasureShardManifest]("v3 erasure swarm: invalid manifest shard count")
     var next = magicLen + 76
+    var shardIndices: int32[]
+    shardIndices = []
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    for i in 0..<shardCount:
+        add(shardIndices, 0)
+        add(shardPayloadCids, layout.fixedBytes32Zero())
     var out = v3ErasureShardManifestZero()
     out.version = int32(Value(versionRes))
     out.blobCid = Value(blobCidRes)
@@ -590,20 +619,22 @@ fn v3ErasureShardManifestDecode(payload: Bytes): Result[V3ErasureShardManifest] 
         if IsErr(shardCidRes):
             return Err[V3ErasureShardManifest](Error(shardCidRes))
         next = next + 32
-        add(out.shardIndices, int32(Value(shardIndexRes)))
-        add(out.shardPayloadCids, Value(shardCidRes))
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+        shardIndices[i] = int32(Value(shardIndexRes))
+        shardPayloadCids[i] = Value(shardCidRes)
+    var buf: layout.ByteBuf = layout.byteBufInit(96 + shardCount * 36)
     layout.byteBufAppendBytes(buf, bytesFromString("v3.erasure.manifest"))
     lt.v3AppendFixed32(buf, out.blobCid)
     lt.v3AppendU32BE(buf, out.blobByteLen)
     lt.v3AppendFixed32(buf, out.paramsCid)
     lt.v3AppendU32BE(buf, out.shardCount)
-    for i in 0..<out.shardCount:
-        let shardIndex = out.shardIndices[i]
-        if shardIndex < 0 || shardIndex >= out.shardCount:
+    for i in 0..<shardCount:
+        let shardIndex = shardIndices[i]
+        if shardIndex < 0 || shardIndex >= shardCount:
             return Err[V3ErasureShardManifest]("v3 erasure swarm: manifest shard index out of range")
         lt.v3AppendU32BE(buf, shardIndex)
-        lt.v3AppendFixed32(buf, out.shardPayloadCids[i])
+        lt.v3AppendFixed32(buf, shardPayloadCids[i])
+    out.shardIndices = shardIndices
+    out.shardPayloadCids = shardPayloadCids
     out.manifestCid = lt.v3FixedCidFromBuf(buf)
     if out.version != 1:
         return Err[V3ErasureShardManifest]("v3 erasure swarm: unsupported manifest version")
@@ -673,14 +704,16 @@ fn v3ErasurePeerAdvertMake(peerId: layout.FixedBytes32,
     out.availabilityPermille = availabilityPermille
     out.maxConcurrentPulls = maxConcurrentPulls
     out.shardCount = shardIndices.len
+    for i in 0..<out.shardCount:
+        add(out.shardIndices, 0)
+        add(out.shardPayloadCids, layout.fixedBytes32Zero())
     for i in 0..<shardIndices.len:
         let manifestPos = v3ErasureManifestShardPos(manifest, shardIndices[i])
         if manifestPos < 0:
             return Err[V3ErasurePeerAdvert]("v3 erasure swarm: advert shard index out of range")
-        let shardCid = manifest.shardPayloadCids[manifestPos]
-        add(out.shardIndices, shardIndices[i])
-        add(out.shardPayloadCids, shardCid)
-    var buf: layout.ByteBuf = layout.byteBufInit(256)
+        out.shardIndices[i] = shardIndices[i]
+        out.shardPayloadCids[i] = manifest.shardPayloadCids[manifestPos]
+    var buf: layout.ByteBuf = layout.byteBufInit(128 + out.shardCount * 36)
     layout.byteBufAppendBytes(buf, bytesFromString("v3.erasure.advert"))
     lt.v3AppendFixed32(buf, out.peerId)
     lt.v3AppendFixed32(buf, out.blobCid)
@@ -793,6 +826,11 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
     requestShardCids = []
     var requestAdvertCids: layout.FixedBytes32[]
     requestAdvertCids = []
+    for i in 0..<threshold:
+        add(requestPeerIds, layout.fixedBytes32Zero())
+        add(requestShardIndices, 0)
+        add(requestShardCids, layout.fixedBytes32Zero())
+        add(requestAdvertCids, layout.fixedBytes32Zero())
     var requestCount = 0
     var selected: bool[]
     selected = []
@@ -848,10 +886,10 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
         let requestPeerId = adverts[bestAdvert].peerId
         let requestShardCid = manifest.shardPayloadCids[manifestPos]
         let requestAdvertCid = adverts[bestAdvert].advertCid
-        add(requestPeerIds, requestPeerId)
-        add(requestShardIndices, bestShard)
-        add(requestShardCids, requestShardCid)
-        add(requestAdvertCids, requestAdvertCid)
+        requestPeerIds[requestCount] = requestPeerId
+        requestShardIndices[requestCount] = bestShard
+        requestShardCids[requestCount] = requestShardCid
+        requestAdvertCids[requestCount] = requestAdvertCid
         requestCount = requestCount + 1
     out.requestCount = requestCount
     out.requestPeerIds = requestPeerIds
@@ -994,6 +1032,19 @@ fn v3ErasureRecoveryPlanDecode(payload: Bytes): Result[V3ErasureRecoveryPlan] =
     if planCidOffset + 32 > bytesLen(payload):
         return Err[V3ErasureRecoveryPlan]("v3 erasure swarm: truncated recovery plan payload")
     var next = magicLen + 84
+    var requestPeerIds: layout.FixedBytes32[]
+    requestPeerIds = []
+    var requestShardIndices: int32[]
+    requestShardIndices = []
+    var requestShardCids: layout.FixedBytes32[]
+    requestShardCids = []
+    var requestAdvertCids: layout.FixedBytes32[]
+    requestAdvertCids = []
+    for i in 0..<requestCount:
+        add(requestPeerIds, layout.fixedBytes32Zero())
+        add(requestShardIndices, 0)
+        add(requestShardCids, layout.fixedBytes32Zero())
+        add(requestAdvertCids, layout.fixedBytes32Zero())
     var out = v3ErasureRecoveryPlanZero()
     out.version = int32(Value(versionRes))
     out.blobCid = Value(blobCidRes)
@@ -1019,13 +1070,17 @@ fn v3ErasureRecoveryPlanDecode(payload: Bytes): Result[V3ErasureRecoveryPlan] =
         if IsErr(advertCidRes):
             return Err[V3ErasureRecoveryPlan](Error(advertCidRes))
         next = next + 32
-        add(out.requestPeerIds, Value(peerIdRes))
-        add(out.requestShardIndices, int32(Value(shardIndexRes)))
-        add(out.requestShardCids, Value(shardCidRes))
-        add(out.requestAdvertCids, Value(advertCidRes))
+        requestPeerIds[i] = Value(peerIdRes)
+        requestShardIndices[i] = int32(Value(shardIndexRes))
+        requestShardCids[i] = Value(shardCidRes)
+        requestAdvertCids[i] = Value(advertCidRes)
     let planCidRes = codec.v3ReadFixed32(span, planCidOffset)
     if IsErr(planCidRes):
         return Err[V3ErasureRecoveryPlan](Error(planCidRes))
+    out.requestPeerIds = requestPeerIds
+    out.requestShardIndices = requestShardIndices
+    out.requestShardCids = requestShardCids
+    out.requestAdvertCids = requestAdvertCids
     out.planCid = Value(planCidRes)
     if out.version != 1:
         return Err[V3ErasureRecoveryPlan]("v3 erasure swarm: unsupported recovery plan version")
@@ -1116,18 +1171,31 @@ fn v3ErasureShardPullRequestMake(manifest: V3ErasureShardManifest,
         return Err[V3ErasureShardPullRequest](Error(fillRes))
     return Ok[V3ErasureShardPullRequest](out)
 
-fn v3ErasureShardPullRequestFill(out: var V3ErasureShardPullRequest,
-                                 manifest: V3ErasureShardManifest,
-                                 shardIndex: int32): Result[bool] =
-    let pos = v3ErasureManifestShardPos(manifest, shardIndex)
+fn v3ErasureShardPullRequestFillFromFields(out: var V3ErasureShardPullRequest,
+                                           manifestCid: layout.FixedBytes32,
+                                           shardIndices: int32[],
+                                           shardPayloadCids: layout.FixedBytes32[],
+                                           shardIndex: int32): Result[bool] =
+    if shardIndices.len != shardPayloadCids.len:
+        return Err[bool]("v3 erasure swarm: shard pull arrays mismatch")
+    let pos = v3ErasureShardIndexPos(shardIndices, shardIndex)
     if pos < 0:
         return Err[bool]("v3 erasure swarm: shard pull index missing")
     out = v3ErasureShardPullRequestZero()
-    out.manifestCid = manifest.manifestCid
+    out.manifestCid = manifestCid
     out.shardIndex = shardIndex
-    out.shardCid = manifest.shardPayloadCids[pos]
+    out.shardCid = shardPayloadCids[pos]
     out.requestCid = v3ErasureShardPullRequestCid(out.manifestCid, out.shardIndex, out.shardCid)
     return Ok[bool](true)
+
+fn v3ErasureShardPullRequestFill(out: var V3ErasureShardPullRequest,
+                                 manifest: V3ErasureShardManifest,
+                                 shardIndex: int32): Result[bool] =
+    return v3ErasureShardPullRequestFillFromFields(out,
+                                                   manifest.manifestCid,
+                                                   manifest.shardIndices,
+                                                   manifest.shardPayloadCids,
+                                                   shardIndex)
 
 fn v3ErasureShardPullRequestValidate(request: V3ErasureShardPullRequest,
                                      manifest: V3ErasureShardManifest): Result[bool] =

@@ -1,0 +1,304 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/binary_types as btypes
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/pubsub
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types as core
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/host/host
+import cheng/v3/libp2p/protocols/gossipsub as gossip
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_exec as sexec
+
+fn v3CompilerWorldTopicScope(): overlay.V3OverlayTopicScope =
+    return overlay.v3OverlayScopeGlobal
+
+fn v3CompilerWorldAddress(): btypes.V3LsmrAddress =
+    return btypes.v3LsmrAddressZero()
+
+fn v3CompilerWorldQuery(sourcePeerId: core.V3Libp2pPeerId): overlay.V3StoreQuery =
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.sourcePeerId = sourcePeerId.value
+    query.topicScope = v3CompilerWorldTopicScope()
+    query.address = v3CompilerWorldAddress()
+    return query
+
+fn v3CompilerWorldPayloadCid(payload: Bytes): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(bytesLen(payload) + 32)
+    layout.byteBufAppendBytes(buf, payload)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldIngress(sourcePeerId: core.V3Libp2pPeerId,
+                          payloadKind: int32,
+                          payloadText: str,
+                          stampEpoch: int32,
+                          stampGanzhi: int32): overlay.V3IngressEnvelope =
+    let payload = cworld.v3CompilerWorldOwnedBytesFromText(payloadText)
+    var ingress = overlay.v3OverlayIngressEnvelopeZero()
+    ingress.sourcePeerId = sourcePeerId.value
+    ingress.topicScope = v3CompilerWorldTopicScope()
+    ingress.address = v3CompilerWorldAddress()
+    ingress.payloadKind = payloadKind
+    ingress.payload = payload
+    ingress.payloadCid = v3CompilerWorldPayloadCid(payload)
+    ingress.payloadLen = bytesLen(payload)
+    ingress.stampEpoch = stampEpoch
+    ingress.stampGanzhi = stampGanzhi
+    return ingress
+
+fn v3CompilerWorldRegister(hostRef: var host.V3Libp2pHost) =
+    host.v3Libp2pRegisterHandler(hostRef, core.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(hostRef, core.v3Libp2pProtocolIngress)
+
+fn v3CompilerWorldPublishEntry(hostRef: var host.V3Libp2pHost,
+                               ingress: overlay.V3IngressEnvelope,
+                               announceHead: bool) =
+    host.v3Libp2pStorePut(hostRef, ingress)
+    host.v3Libp2pKadProvide(hostRef, ingress.payloadCid)
+    if !announceHead:
+        return
+    let pubRecord = gossip.v3Libp2pPubRecordFromIngress(hostRef.selfPeerId, ingress)
+    host.v3Libp2pPublish(hostRef, pubRecord)
+
+fn v3CompilerWorldPublishUniverse(hostRef: var host.V3Libp2pHost,
+                                  universe: cworld.V3CompilerLocalUniverse,
+                                  compilerCsg: ccsg.V3CompilerCsg,
+                                  exportSurface: ccsg.V3CsgExportSurface,
+                                  receipt: ccsg.V3CompileReceipt) =
+    let stampEpoch = universe.worldHead.headEpoch
+    let stampGanzhi = 1
+    let worldIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                              pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                              cworld.v3CompilerWorldHeadReport(universe.worldHead),
+                                              stampEpoch,
+                                              stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, worldIngress, true)
+    let compilerIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                                 pubsub.v3PubSubPayloadKindCompilerPackageSnapshot,
+                                                 cworld.v3CompilerPackageSnapshotReport(universe.compilerSnapshot),
+                                                 stampEpoch,
+                                                 stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, compilerIngress, false)
+    let stdIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                            pubsub.v3PubSubPayloadKindCompilerPackageSnapshot,
+                                            cworld.v3CompilerPackageSnapshotReport(universe.stdSnapshot),
+                                            stampEpoch,
+                                            stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, stdIngress, false)
+    let runtimeIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.v3PubSubPayloadKindCompilerPackageSnapshot,
+                                                cworld.v3CompilerPackageSnapshotReport(universe.runtimeSnapshot),
+                                                stampEpoch,
+                                                stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, runtimeIngress, false)
+    let csgIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                            pubsub.v3PubSubPayloadKindCompilerCsg,
+                                            ccsg.v3CompilerCsgReport(compilerCsg),
+                                            stampEpoch,
+                                            stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, csgIngress, false)
+    let surfaceIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.v3PubSubPayloadKindCompilerExportSurface,
+                                                ccsg.v3CompilerExportSurfaceReport(exportSurface),
+                                                stampEpoch,
+                                                stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, surfaceIngress, false)
+    let receiptIngress = v3CompilerWorldIngress(hostRef.selfPeerId,
+                                                pubsub.v3PubSubPayloadKindCompilerCompileReceipt,
+                                                ccsg.v3CompileReceiptReport(receipt),
+                                                stampEpoch,
+                                                stampGanzhi)
+    v3CompilerWorldPublishEntry(hostRef, receiptIngress, false)
+
+fn v3CompilerWorldStoredEntryCount(hostRef: host.V3Libp2pHost): int32 =
+    let query = v3CompilerWorldQuery(hostRef.selfPeerId)
+    return host.v3Libp2pStoreQueryCount(hostRef, query)
+
+fn v3CompilerWorldPublishedHeadCount(hostRef: host.V3Libp2pHost): int32 =
+    var out = 0
+    for i in 0..<hostRef.publishLog.len:
+        if hostRef.publishLog[i].payloadKind == pubsub.v3PubSubPayloadKindCompilerWorldHead:
+            out = out + 1
+    return out
+
+fn v3CompilerWorldFirstPayloadTextByKind(hostRef: host.V3Libp2pHost,
+                                         payloadKind: int32,
+                                         outText: var str): bool =
+    for i in 0..<hostRef.storeEntries.len:
+        let ingress = hostRef.storeEntries[i].ingress
+        if ingress.payloadKind != payloadKind:
+            continue
+        outText = rawbytes.bytesToString(ingress.payload)
+        return true
+    outText = ""
+    return false
+
+fn v3CompilerWorldSync(localHost: var host.V3Libp2pHost,
+                       remoteHost: var host.V3Libp2pHost,
+                       remotePeerId: core.V3Libp2pPeerId): Result[int32] =
+    var entries: overlay.V3IngressEnvelope[]
+    let query = v3CompilerWorldQuery(localHost.selfPeerId)
+    let syncRes = host.v3Libp2pSyncRequest(localHost, remoteHost, remotePeerId, query, entries)
+    if IsErr(syncRes):
+        return Err[int32](Error(syncRes))
+    for i in 0..<entries.len:
+        host.v3Libp2pStorePut(localHost, entries[i])
+    return Ok[int32](entries.len)
+
+fn v3CompilerWorldSyncSmokeReport(rootDir: str,
+                                  sourcePath: str,
+                                  outputPath: str): Result[str] =
+    let packageRoot = v3path.v3PathJoin(rootDir, "v3")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    let planRes = sexec.v3BuildSystemLinkExecPlan(rootDir, req)
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    let plan = Value(planRes)
+    var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
+    var syncHost = host.v3Libp2pHostInit("compiler-world-sync")
+    v3CompilerWorldRegister(seedHost)
+    v3CompilerWorldRegister(syncHost)
+    var seedAddr = core.v3Libp2pMultiaddrZero()
+    var syncAddr = core.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6461)
+    multiaddr.v3Libp2pMultiaddrFillTcp(syncAddr, "127.0.0.1", 6462)
+    let seedListenRes = host.v3Libp2pListen(seedHost, seedAddr)
+    if IsErr(seedListenRes):
+        return Err[str](Error(seedListenRes))
+    let syncListenRes = host.v3Libp2pListen(syncHost, syncAddr)
+    if IsErr(syncListenRes):
+        return Err[str](Error(syncListenRes))
+    let dialSeedRes = host.v3Libp2pDial(syncHost, seedHost.selfPeerId, seedAddr, 1)
+    if IsErr(dialSeedRes):
+        return Err[str](Error(dialSeedRes))
+    let dialSyncRes = host.v3Libp2pDial(seedHost, syncHost.selfPeerId, syncAddr, 1)
+    if IsErr(dialSyncRes):
+        return Err[str](Error(dialSyncRes))
+    v3CompilerWorldPublishUniverse(seedHost,
+                                   plan.localUniverse,
+                                   plan.compilerCsg,
+                                   plan.exportSurface,
+                                   plan.compileReceipt)
+    let syncRes = v3CompilerWorldSync(syncHost, seedHost, seedHost.selfPeerId)
+    if IsErr(syncRes):
+        return Err[str](Error(syncRes))
+    var worldText = ""
+    if !v3CompilerWorldFirstPayloadTextByKind(syncHost,
+                                              pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                              worldText):
+        return Err[str]("v3 compiler world libp2p: missing synced world head")
+    var parsedHead: cworld.V3CompilerWorldHead
+    let parseHeadRes = cworld.v3CompilerWorldHeadFromReportText(worldText, parsedHead)
+    if IsErr(parseHeadRes):
+        return Err[str](Error(parseHeadRes))
+    if !layout.fixedBytes32Equal(parsedHead.headCid, plan.localUniverse.worldHead.headCid):
+        return Err[str]("v3 compiler world libp2p: synced head cid mismatch")
+    return Ok[str](
+        "seed_entries=" + intToStr(v3CompilerWorldStoredEntryCount(seedHost)) + "\n" +
+        "sync_entries=" + intToStr(v3CompilerWorldStoredEntryCount(syncHost)) + "\n" +
+        "published_heads=" + intToStr(v3CompilerWorldPublishedHeadCount(seedHost)) + "\n" +
+        "synced_entries=" + intToStr(Value(syncRes)) + "\n" +
+        "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n" +
+        "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid)
+    )
+
+fn v3CompilerWorldFreshNodeSelfhostReport(rootDir: str,
+                                          req: creq.V3CompilerRequest,
+                                          channelRaw: str,
+                                          localUniverse: cworld.V3CompilerLocalUniverse,
+                                          compilerCsg: ccsg.V3CompilerCsg,
+                                          exportSurface: ccsg.V3CsgExportSurface,
+                                          receipt: ccsg.V3CompileReceipt): Result[str] =
+    var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
+    var freshHost = host.v3Libp2pHostInit("compiler-world-fresh")
+    v3CompilerWorldRegister(seedHost)
+    v3CompilerWorldRegister(freshHost)
+    var seedAddr = core.v3Libp2pMultiaddrZero()
+    var freshAddr = core.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6463)
+    multiaddr.v3Libp2pMultiaddrFillTcp(freshAddr, "127.0.0.1", 6464)
+    let seedListenRes = host.v3Libp2pListen(seedHost, seedAddr)
+    if IsErr(seedListenRes):
+        return Err[str](Error(seedListenRes))
+    let freshListenRes = host.v3Libp2pListen(freshHost, freshAddr)
+    if IsErr(freshListenRes):
+        return Err[str](Error(freshListenRes))
+    let dialSeedRes = host.v3Libp2pDial(freshHost, seedHost.selfPeerId, seedAddr, 1)
+    if IsErr(dialSeedRes):
+        return Err[str](Error(dialSeedRes))
+    let dialFreshRes = host.v3Libp2pDial(seedHost, freshHost.selfPeerId, freshAddr, 1)
+    if IsErr(dialFreshRes):
+        return Err[str](Error(dialFreshRes))
+    v3CompilerWorldPublishUniverse(seedHost,
+                                   localUniverse,
+                                   compilerCsg,
+                                   exportSurface,
+                                   receipt)
+    let syncRes = v3CompilerWorldSync(freshHost, seedHost, seedHost.selfPeerId)
+    if IsErr(syncRes):
+        return Err[str](Error(syncRes))
+    var worldText = ""
+    if !v3CompilerWorldFirstPayloadTextByKind(freshHost,
+                                              pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                              worldText):
+        return Err[str]("v3 compiler world libp2p: missing fresh world head")
+    var receiptText = ""
+    if !v3CompilerWorldFirstPayloadTextByKind(freshHost,
+                                              pubsub.v3PubSubPayloadKindCompilerCompileReceipt,
+                                              receiptText):
+        return Err[str]("v3 compiler world libp2p: missing fresh receipt")
+    var syncedHead: cworld.V3CompilerWorldHead
+    let parseHeadRes = cworld.v3CompilerWorldHeadFromReportText(worldText, syncedHead)
+    if IsErr(parseHeadRes):
+        return Err[str](Error(parseHeadRes))
+    if !layout.fixedBytes32Equal(syncedHead.headCid, localUniverse.worldHead.headCid):
+        return Err[str]("v3 compiler world libp2p: fresh node head cid mismatch")
+    var syncedReceipt: ccsg.V3CompileReceipt
+    let parseReceiptRes = ccsg.v3CompileReceiptFromReportText(receiptText, syncedReceipt)
+    if IsErr(parseReceiptRes):
+        return Err[str](Error(parseReceiptRes))
+    if !ccsg.v3CompileReceiptEquivalent(receipt, syncedReceipt):
+        return Err[str]("v3 compiler world libp2p: synced receipt drift")
+    let freshReq = creq.v3CompilerRequestNew(req.rootDir,
+                                             req.sourcePath,
+                                             req.outputPath + ".fresh_node",
+                                             req.targetTriple,
+                                             req.emitKind,
+                                             "")
+    let freshPlanRes = sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                                          freshReq,
+                                                                          layout.fixedBytes32Hex(syncedHead.headCid),
+                                                                          "",
+                                                                          "",
+                                                                          channelRaw)
+    if IsErr(freshPlanRes):
+        return Err[str](Error(freshPlanRes))
+    let freshPlan = Value(freshPlanRes)
+    if !ccsg.v3CompileReceiptEquivalent(syncedReceipt, freshPlan.compileReceipt):
+        return Err[str]("v3 compiler world libp2p: fresh rebuild receipt drift")
+    if !layout.fixedBytes32Equal(syncedReceipt.receiptCid, freshPlan.compileReceipt.receiptCid):
+        return Err[str]("v3 compiler world libp2p: fresh rebuild receipt cid mismatch")
+    return Ok[str](
+        "seed_entries=" + intToStr(v3CompilerWorldStoredEntryCount(seedHost)) + "\n" +
+        "fresh_entries=" + intToStr(v3CompilerWorldStoredEntryCount(freshHost)) + "\n" +
+        "published_heads=" + intToStr(v3CompilerWorldPublishedHeadCount(seedHost)) + "\n" +
+        "synced_entries=" + intToStr(Value(syncRes)) + "\n" +
+        "world_head_cid=" + layout.fixedBytes32Hex(syncedHead.headCid) + "\n" +
+        "seed_receipt_cid=" + layout.fixedBytes32Hex(receipt.receiptCid) + "\n" +
+        "synced_receipt_cid=" + layout.fixedBytes32Hex(syncedReceipt.receiptCid) + "\n" +
+        "fresh_receipt_cid=" + layout.fixedBytes32Hex(freshPlan.compileReceipt.receiptCid) + "\n" +
+        "receipt_equivalent=1\n" +
+        "receipt_cid_match=1"
+    )

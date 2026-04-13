@@ -23,6 +23,7 @@ type
         moduleKind: V3SystemModuleKind
         sourceClosurePaths: str[]
         ownerModulePaths: str[]
+        importEdges: parser.V3ImportEdge[]
         importEdgeCount: int32
         unresolvedImportCount: int32
         hasCompilerTopLevel: bool
@@ -74,6 +75,9 @@ fn v3SystemLinkPlanDeriveExecutionTrack(moduleKind: V3SystemModuleKind): crun.V3
         return crun.v3CompilerTrackTooling
     return crun.v3CompilerTrackProgram
 
+fn v3SystemLinkPlanTargetNeedsNativeProviders(targetTriple: str): bool =
+    return targetTriple != "wasm32-unknown-unknown"
+
 fn v3SystemLinkPlanWorkspaceRoot(plan: V3SystemLinkPlanStub): str =
     return plan.workspaceRoot
 
@@ -103,6 +107,9 @@ fn v3SystemLinkPlanModuleKind(plan: V3SystemLinkPlanStub): V3SystemModuleKind =
 
 fn v3SystemLinkPlanOwnerModulePaths(plan: V3SystemLinkPlanStub): str[] =
     return plan.ownerModulePaths
+
+fn v3SystemLinkPlanImportEdges(plan: V3SystemLinkPlanStub): parser.V3ImportEdge[] =
+    return plan.importEdges
 
 fn v3SystemLinkPlanImportEdgeCount(plan: V3SystemLinkPlanStub): int32 =
     return plan.importEdgeCount
@@ -151,6 +158,7 @@ fn v3SystemLinkPlanPipelineStage(plan: V3SystemLinkPlanStub): str =
 
 fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
                                   emitKind: creq.V3CompilerEmit,
+                                  targetTriple: str,
                                   runtimeTargets: str[],
                                   providerModules: str[],
                                   entrySymbol: str): str[] =
@@ -165,7 +173,9 @@ fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
         add(missing, "program_entry_symbol_missing")
     if emitKind == creq.v3EmitExe && runtimeTargets.len <= 0:
         add(missing, "runtime_targets_not_lowered")
-    if emitKind == creq.v3EmitExe && providerModules.len <= 0:
+    if emitKind == creq.v3EmitExe &&
+       v3SystemLinkPlanTargetNeedsNativeProviders(targetTriple) &&
+       providerModules.len <= 0:
         add(missing, "runtime_provider_modules_not_selected")
     return missing
 
@@ -188,15 +198,23 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
             toolingTrack = true
     var runtimeTargets: str[] = []
     var providerModules: str[] = []
-    if toolingTrack:
+    if requestTargetTriple == "wasm32-unknown-unknown":
+        add(runtimeTargets, "runtime/compiler.program_wasm_entry")
+    elif toolingTrack:
         add(runtimeTargets, crun.v3CompilerToolingArgvRuntimeTarget())
     else:
         add(runtimeTargets, crun.v3CompilerProgramArgvRuntimeTarget())
-    add(providerModules, crun.v3CompilerRuntimeProviderModule())
-    add(providerModules, crun.v3CoreRuntimeProviderModule())
-    add(providerModules, crun.v3ProgramSupportProviderModule())
+    if v3SystemLinkPlanTargetNeedsNativeProviders(requestTargetTriple):
+        add(providerModules, crun.v3CompilerRuntimeProviderModule())
+        add(providerModules, crun.v3CoreRuntimeProviderModule())
+        add(providerModules, crun.v3ProgramSupportProviderModule())
     let entrySymbol = v3SystemLinkPlanDeriveEntrySymbol(parsed, requestEmitKind)
-    let missing = v3SystemLinkPlanMissingReasons(parsed, requestEmitKind, runtimeTargets, providerModules, entrySymbol)
+    let missing = v3SystemLinkPlanMissingReasons(parsed,
+                                                 requestEmitKind,
+                                                 requestTargetTriple,
+                                                 runtimeTargets,
+                                                 providerModules,
+                                                 entrySymbol)
     let linkMode = buildplan.v3BackendBuildPlanDefaultLinkMode()
     let buildSourceUnitCount = buildplan.v3BackendBuildPlanDefaultSourceUnitCount()
     let parsedWorkspaceRoot = parser.v3ParsedSourceWorkspaceRoot(parsed)
@@ -214,6 +232,7 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
         plan.moduleKind = v3SystemCompilerControlPlane
     plan.sourceClosurePaths = parsed.orderedClosureSourcePaths
     plan.ownerModulePaths = parsed.ownerModulePaths
+    plan.importEdges = parsed.importEdges
     plan.importEdgeCount = parsed.importEdges.len
     plan.unresolvedImportCount = parsed.unresolvedImportCount
     plan.hasCompilerTopLevel = parsed.hasCompilerTopLevel

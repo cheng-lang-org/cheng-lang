@@ -1,3 +1,19 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <errno.h>
 #include <stdio.h>
 #include <stdbool.h>
@@ -6,14 +22,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/wait.h>
 #if !defined(_WIN32)
+#include <poll.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/mount.h>
+#include <sys/statvfs.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #endif
 #if !defined(_WIN32)
 #include <spawn.h>
@@ -76,6 +101,14 @@
 #define CHENG_MAYBE_UNUSED
 #endif
 
+#if defined(__APPLE__) && !defined(INADDR_LOOPBACK)
+#define INADDR_LOOPBACK ((uint32_t)0x7f000001U)
+#endif
+
+#if defined(__APPLE__) && !defined(RTLD_DEFAULT)
+#define RTLD_DEFAULT ((void*)-2)
+#endif
+
 typedef struct ChengSeqHeader {
     int32_t len;
     int32_t cap;
@@ -113,6 +146,15 @@ void cheng_dump_backtrace_if_enabled(void);
 static int cheng_backtrace_enabled(void);
 static void cheng_dump_native_backtrace_if_enabled(void);
 static void cheng_dump_backtrace_now(const char* reason);
+static int64_t cheng_exec_wait_status(pid_t pid, int32_t timeoutSec);
+int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid);
+char* cheng_fd_read_wait(int32_t fd, int32_t maxBytes, int32_t timeoutMs, int32_t* outEof);
+uint64_t cheng_ffi_handle_register_ptr(void* ptr);
+void* cheng_ffi_handle_resolve_ptr(uint64_t handle);
+int32_t cheng_ffi_handle_invalidate(uint64_t handle);
+#if !defined(_WIN32)
+extern char** environ;
+#endif
 
 static bool cheng_probably_valid_ptr(const void* p) {
     uintptr_t raw = (uintptr_t)p;
@@ -1241,7 +1283,7 @@ static uintptr_t cheng_v3_signal_context_pc(void* signal_context) {
         return 0U;
     }
 #if defined(__arm64__)
-    return (uintptr_t)__darwin_arm_thread_state64_get_pc(context->uc_mcontext->__ss);
+    return (uintptr_t)context->uc_mcontext->__ss.__pc;
 #elif defined(__x86_64__)
     return (uintptr_t)context->uc_mcontext->__ss.__rip;
 #elif defined(__i386__)
@@ -1262,7 +1304,7 @@ static uintptr_t cheng_v3_signal_context_fp(void* signal_context) {
         return 0U;
     }
 #if defined(__arm64__)
-    return (uintptr_t)__darwin_arm_thread_state64_get_fp(context->uc_mcontext->__ss);
+    return (uintptr_t)context->uc_mcontext->__ss.__fp;
 #elif defined(__x86_64__)
     return (uintptr_t)context->uc_mcontext->__ss.__rbp;
 #elif defined(__i386__)
@@ -1283,7 +1325,7 @@ static uintptr_t cheng_v3_signal_context_sp(void* signal_context) {
         return 0U;
     }
 #if defined(__arm64__)
-    return (uintptr_t)__darwin_arm_thread_state64_get_sp(context->uc_mcontext->__ss);
+    return (uintptr_t)context->uc_mcontext->__ss.__sp;
 #elif defined(__x86_64__)
     return (uintptr_t)context->uc_mcontext->__ss.__rsp;
 #elif defined(__i386__)
@@ -1304,7 +1346,7 @@ static uintptr_t cheng_v3_signal_context_lr(void* signal_context) {
         return 0U;
     }
 #if defined(__arm64__)
-    return (uintptr_t)__darwin_arm_thread_state64_get_lr(context->uc_mcontext->__ss);
+    return (uintptr_t)context->uc_mcontext->__ss.__lr;
 #elif defined(__x86_64__) || defined(__i386__)
     return 0U;
 #else
@@ -8733,6 +8775,1520 @@ cleanup:
     return err.ptr == NULL || err.len == 0 ? 1 : 0;
 #endif
 }
+
+#if !defined(_WIN32)
+static int cheng_v3_browser_bridge_file_exists(const char* path) {
+    return path != NULL && access(path, F_OK) == 0;
+}
+
+static int cheng_v3_browser_bridge_write_file(const char* path, const char* data, size_t len) {
+    FILE* f = NULL;
+    size_t n = 0u;
+    if (path == NULL || path[0] == '\0') return 0;
+    f = fopen(path, "wb");
+    if (f == NULL) return 0;
+    if (len > 0u) {
+        n = fwrite(data, 1u, len, f);
+    }
+    fclose(f);
+    return n == len;
+}
+
+static int cheng_v3_browser_bridge_read_file(const char* path, char** out, size_t* out_len) {
+    FILE* f = NULL;
+    long size = 0;
+    char* buf = NULL;
+    size_t n = 0u;
+    if (out != NULL) *out = NULL;
+    if (out_len != NULL) *out_len = 0u;
+    if (path == NULL || path[0] == '\0') return 0;
+    f = fopen(path, "rb");
+    if (f == NULL) return 0;
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return 0;
+    }
+    size = ftell(f);
+    if (size < 0) {
+        fclose(f);
+        return 0;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        return 0;
+    }
+    if (size > 0) {
+        buf = (char*)malloc((size_t)size);
+        if (buf == NULL) {
+            fclose(f);
+            return 0;
+        }
+        n = fread(buf, 1u, (size_t)size, f);
+        if (n != (size_t)size) {
+            free(buf);
+            fclose(f);
+            return 0;
+        }
+    }
+    fclose(f);
+    if (out != NULL) *out = buf;
+    else free(buf);
+    if (out_len != NULL) *out_len = (size_t)size;
+    return 1;
+}
+
+static void cheng_v3_browser_bridge_cleanup_tmpdir(const char* tmp_dir) {
+    char path[PATH_MAX];
+    static const char* files[] = {
+        "protocol.bin",
+        "policy.bin",
+        "label.txt",
+        "request.bin",
+        "response.bin",
+        "signal.bin",
+        "client_response.bin",
+        "err.txt"
+    };
+    size_t i = 0u;
+    if (tmp_dir == NULL || tmp_dir[0] == '\0') return;
+    for (i = 0u; i < sizeof(files) / sizeof(files[0]); i += 1u) {
+        snprintf(path, sizeof(path), "%s/%s", tmp_dir, files[i]);
+        unlink(path);
+    }
+    rmdir(tmp_dir);
+}
+
+static int cheng_v3_browser_bridge_resolve_repo_root(char* out, size_t out_cap) {
+    char cwd[PATH_MAX];
+    char exe_path[PATH_MAX];
+    char script_path[PATH_MAX];
+    char* artifacts = NULL;
+    if (out == NULL || out_cap == 0u) return 0;
+    out[0] = '\0';
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        snprintf(script_path, sizeof(script_path), "%s/v3/tooling/browser_webrtc/run_browser_webrtc_bridge.mjs", cwd);
+        if (cheng_v3_browser_bridge_file_exists(script_path)) {
+            snprintf(out, out_cap, "%s", cwd);
+            return 1;
+        }
+    }
+    if (!driver_c_runtime_resolve_self_path(exe_path, sizeof(exe_path))) {
+        return 0;
+    }
+    artifacts = strstr(exe_path, "/artifacts/");
+    if (artifacts == NULL) {
+        return 0;
+    }
+    *artifacts = '\0';
+    snprintf(script_path, sizeof(script_path), "%s/v3/tooling/browser_webrtc/run_browser_webrtc_bridge.mjs", exe_path);
+    if (!cheng_v3_browser_bridge_file_exists(script_path)) {
+        return 0;
+    }
+    snprintf(out, out_cap, "%s", exe_path);
+    return 1;
+}
+
+static int64_t cheng_v3_browser_bridge_spawn_node(const char* script_path, const char* tmp_dir) {
+#if defined(__ANDROID__)
+    (void)script_path;
+    (void)tmp_dir;
+    return -1;
+#else
+    posix_spawn_file_actions_t actions;
+    pid_t pid = -1;
+    int spawn_rc = 0;
+    char* argv[4];
+    argv[0] = (char*)"node";
+    argv[1] = (char*)script_path;
+    argv[2] = (char*)tmp_dir;
+    argv[3] = NULL;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        return -1;
+    }
+    if (posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0) != 0 ||
+        posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return -1;
+    }
+    spawn_rc = posix_spawnp(&pid, "node", &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawn_rc != 0) {
+        return 127;
+    }
+    return cheng_exec_wait_status(pid, 30);
+#endif
+}
+
+typedef struct ChengV3BrowserSession {
+    int32_t read_fd;
+    int32_t write_fd;
+    int64_t pid;
+    char* pending;
+    size_t pending_len;
+} ChengV3BrowserSession;
+
+static int32_t cheng_v3_browser_session_active_count = 0;
+
+static char* cheng_v3_browser_bridge_hex_encode(const char* data, size_t len) {
+    static const char* hex = "0123456789abcdef";
+    char* out = (char*)malloc((len * 2u) + 1u);
+    size_t i = 0u;
+    if (out == NULL) return NULL;
+    for (i = 0u; i < len; i += 1u) {
+        unsigned char byte = (unsigned char)data[i];
+        out[i * 2u] = hex[(byte >> 4) & 0x0fu];
+        out[(i * 2u) + 1u] = hex[byte & 0x0fu];
+    }
+    out[len * 2u] = '\0';
+    return out;
+}
+
+static int cheng_v3_browser_bridge_hex_digit(char ch) {
+    if (ch >= '0' && ch <= '9') return (int)(ch - '0');
+    if (ch >= 'a' && ch <= 'f') return 10 + (int)(ch - 'a');
+    if (ch >= 'A' && ch <= 'F') return 10 + (int)(ch - 'A');
+    return -1;
+}
+
+static int cheng_v3_browser_bridge_hex_decode_dup(const char* hex_text,
+                                                  size_t hex_len,
+                                                  char** out,
+                                                  size_t* out_len) {
+    size_t i = 0u;
+    size_t bytes_len = 0u;
+    char* bytes = NULL;
+    if (out != NULL) *out = NULL;
+    if (out_len != NULL) *out_len = 0u;
+    if (hex_text == NULL) return 0;
+    if ((hex_len % 2u) != 0u) return 0;
+    bytes_len = hex_len / 2u;
+    if (bytes_len == 0u) {
+        if (out != NULL) *out = NULL;
+        if (out_len != NULL) *out_len = 0u;
+        return 1;
+    }
+    bytes = (char*)malloc(bytes_len);
+    if (bytes == NULL) return 0;
+    for (i = 0u; i < bytes_len; i += 1u) {
+        int hi = cheng_v3_browser_bridge_hex_digit(hex_text[i * 2u]);
+        int lo = cheng_v3_browser_bridge_hex_digit(hex_text[(i * 2u) + 1u]);
+        if (hi < 0 || lo < 0) {
+            free(bytes);
+            return 0;
+        }
+        bytes[i] = (char)((hi << 4) | lo);
+    }
+    if (out != NULL) *out = bytes;
+    else free(bytes);
+    if (out_len != NULL) *out_len = bytes_len;
+    return 1;
+}
+
+static int cheng_v3_browser_bridge_append_pending(ChengV3BrowserSession* session,
+                                                  const char* chunk,
+                                                  size_t chunk_len) {
+    char* grown = NULL;
+    if (session == NULL || chunk_len == 0u) return 1;
+    grown = (char*)realloc(session->pending, session->pending_len + chunk_len + 1u);
+    if (grown == NULL) return 0;
+    memcpy(grown + session->pending_len, chunk, chunk_len);
+    session->pending = grown;
+    session->pending_len += chunk_len;
+    session->pending[session->pending_len] = '\0';
+    return 1;
+}
+
+static int cheng_v3_browser_bridge_write_all_fd(int32_t fd, const char* data, size_t len) {
+    size_t off = 0u;
+    while (off < len) {
+        ssize_t rc = write(fd, data + off, len - off);
+        if (rc > 0) {
+            off += (size_t)rc;
+            continue;
+        }
+        if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            if (poll(&pfd, 1, 100) > 0) {
+                continue;
+            }
+        }
+        return 0;
+    }
+    return 1;
+}
+
+static int cheng_v3_browser_bridge_read_line(ChengV3BrowserSession* session,
+                                             char** out_line,
+                                             int timeout_ms) {
+    int waited = 0;
+    if (out_line != NULL) *out_line = NULL;
+    if (session == NULL || out_line == NULL) return 0;
+    while (waited <= timeout_ms) {
+        size_t i = 0u;
+        for (i = 0u; i < session->pending_len; i += 1u) {
+            if (session->pending[i] == '\n') {
+                char* line = (char*)malloc(i + 1u);
+                size_t remain = session->pending_len - (i + 1u);
+                if (line == NULL) return 0;
+                memcpy(line, session->pending, i);
+                line[i] = '\0';
+                if (remain > 0u) {
+                    memmove(session->pending, session->pending + i + 1u, remain);
+                }
+                session->pending_len = remain;
+                if (session->pending != NULL) {
+                    session->pending[session->pending_len] = '\0';
+                }
+                *out_line = line;
+                return 1;
+            }
+        }
+        {
+            int32_t eof = 0;
+            char* chunk = cheng_fd_read_wait(session->read_fd, 4096, 50, &eof);
+            size_t chunk_len = chunk != NULL ? strlen(chunk) : 0u;
+            if (chunk_len > 0u) {
+                int ok = cheng_v3_browser_bridge_append_pending(session, chunk, chunk_len);
+                cheng_free(chunk);
+                if (!ok) return 0;
+                continue;
+            }
+            cheng_free(chunk);
+            if (eof) return 0;
+        }
+        waited += 50;
+    }
+    return 0;
+}
+
+static int cheng_v3_browser_bridge_json_field_hex(const char* line,
+                                                  const char* key,
+                                                  char** out_hex) {
+    char needle[64];
+    const char* pos = NULL;
+    const char* start = NULL;
+    const char* end = NULL;
+    size_t len = 0u;
+    char* dup = NULL;
+    if (out_hex != NULL) *out_hex = NULL;
+    if (line == NULL || key == NULL || out_hex == NULL) return 0;
+    snprintf(needle, sizeof(needle), "\"%s\":\"", key);
+    pos = strstr(line, needle);
+    if (pos == NULL) return 0;
+    start = pos + strlen(needle);
+    end = strchr(start, '"');
+    if (end == NULL) return 0;
+    len = (size_t)(end - start);
+    dup = (char*)malloc(len + 1u);
+    if (dup == NULL) return 0;
+    memcpy(dup, start, len);
+    dup[len] = '\0';
+    *out_hex = dup;
+    return 1;
+}
+
+static int cheng_v3_browser_bridge_json_ok(const char* line, int* out_ok) {
+    const char* pos = NULL;
+    if (out_ok != NULL) *out_ok = 0;
+    if (line == NULL || out_ok == NULL) return 0;
+    pos = strstr(line, "\"ok\":");
+    if (pos == NULL) return 0;
+    pos += 5;
+    if (strncmp(pos, "true", 4) == 0) {
+        *out_ok = 1;
+        return 1;
+    }
+    if (strncmp(pos, "false", 5) == 0) {
+        *out_ok = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static void cheng_v3_browser_session_release(ChengV3BrowserSession* session) {
+    if (session == NULL) return;
+    if (session->write_fd >= 0) {
+        close(session->write_fd);
+        session->write_fd = -1;
+    }
+    if (session->read_fd >= 0) {
+        close(session->read_fd);
+        session->read_fd = -1;
+    }
+    if (session->pid > 0) {
+        int status = 0;
+        (void)waitpid((pid_t)session->pid, &status, 0);
+        session->pid = -1;
+    }
+    free(session->pending);
+    session->pending = NULL;
+    session->pending_len = 0u;
+    free(session);
+    if (cheng_v3_browser_session_active_count > 0) {
+        cheng_v3_browser_session_active_count -= 1;
+    }
+}
+
+static int cheng_v3_browser_session_send_command(ChengV3BrowserSession* session,
+                                                 const char* command_json,
+                                                 char** out_line) {
+    size_t json_len = 0u;
+    if (session == NULL || command_json == NULL) return 0;
+    json_len = strlen(command_json);
+    if (!cheng_v3_browser_bridge_write_all_fd(session->write_fd, command_json, json_len)) {
+        return 0;
+    }
+    if (!cheng_v3_browser_bridge_write_all_fd(session->write_fd, "\n", 1u)) {
+        return 0;
+    }
+    return cheng_v3_browser_bridge_read_line(session, out_line, 10000);
+}
+
+static int cheng_v3_browser_session_spawn_handle(const char* repo_root,
+                                                 ChengV3BrowserSession** out_session) {
+    char command[PATH_MAX * 2];
+    ChengV3BrowserSession* session = NULL;
+    if (out_session != NULL) *out_session = NULL;
+    if (repo_root == NULL || repo_root[0] == '\0') return 0;
+    session = (ChengV3BrowserSession*)calloc(1u, sizeof(ChengV3BrowserSession));
+    if (session == NULL) return 0;
+    session->read_fd = -1;
+    session->write_fd = -1;
+    session->pid = -1;
+    session->pending = NULL;
+    session->pending_len = 0u;
+    snprintf(command,
+             sizeof(command),
+             "node '%s/v3/tooling/browser_webrtc/run_browser_webrtc_bridge.mjs' --session",
+             repo_root);
+    if (!cheng_pipe_spawn(command, repo_root, &session->read_fd, &session->write_fd, &session->pid)) {
+        free(session);
+        return 0;
+    }
+    cheng_v3_browser_session_active_count += 1;
+    *out_session = session;
+    return 1;
+}
+
+static int cheng_v3_browser_session_send_open(ChengV3BrowserSession* session,
+                                              const char* policy,
+                                              size_t policy_len,
+                                              const char* label,
+                                              size_t label_len,
+                                              ChengStrBridge* signal_out,
+                                              ChengStrBridge* err_out) {
+    char* policy_hex = NULL;
+    char* label_hex = NULL;
+    char* command = NULL;
+    char* line = NULL;
+    char* signal_hex = NULL;
+    char* err_hex = NULL;
+    char* signal_buf = NULL;
+    size_t signal_len = 0u;
+    int ok = 0;
+    int rc = 0;
+    if (signal_out != NULL) *signal_out = cheng_str_bridge_empty();
+    if (err_out != NULL) *err_out = cheng_str_bridge_empty();
+    policy_hex = cheng_v3_browser_bridge_hex_encode(policy, policy_len);
+    label_hex = cheng_v3_browser_bridge_hex_encode(label, label_len);
+    if (policy_hex == NULL || label_hex == NULL) goto cleanup;
+    command = (char*)malloc(strlen(policy_hex) + strlen(label_hex) + 64u);
+    if (command == NULL) goto cleanup;
+    snprintf(command,
+             strlen(policy_hex) + strlen(label_hex) + 64u,
+             "{\"command\":\"open\",\"policyHex\":\"%s\",\"labelHex\":\"%s\"}",
+             policy_hex,
+             label_hex);
+    if (!cheng_v3_browser_session_send_command(session, command, &line)) goto cleanup;
+    if (!cheng_v3_browser_bridge_json_ok(line, &ok)) goto cleanup;
+    if (!ok) {
+        if (cheng_v3_browser_bridge_json_field_hex(line, "errHex", &err_hex) &&
+            cheng_v3_browser_bridge_hex_decode_dup(err_hex, strlen(err_hex), &signal_buf, &signal_len)) {
+            if (err_out != NULL) *err_out = driver_c_str_from_utf8_copy_bridge(signal_buf, (int32_t)signal_len);
+            rc = 0;
+            goto cleanup;
+        }
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_json_field_hex(line, "signalHex", &signal_hex)) goto cleanup;
+    if (!cheng_v3_browser_bridge_hex_decode_dup(signal_hex, strlen(signal_hex), &signal_buf, &signal_len)) goto cleanup;
+    if (signal_out != NULL) *signal_out = driver_c_str_from_utf8_copy_bridge(signal_buf != NULL ? signal_buf : "", (int32_t)signal_len);
+    rc = 1;
+cleanup:
+    free(policy_hex);
+    free(label_hex);
+    free(command);
+    free(line);
+    free(signal_hex);
+    free(err_hex);
+    free(signal_buf);
+    return rc;
+}
+
+static int cheng_v3_browser_session_send_exchange(ChengV3BrowserSession* session,
+                                                  const char* protocol,
+                                                  size_t protocol_len,
+                                                  const char* request,
+                                                  size_t request_len,
+                                                  const char* response_payload,
+                                                  size_t response_len,
+                                                  ChengStrBridge* response_out,
+                                                  ChengStrBridge* err_out) {
+    char* protocol_hex = NULL;
+    char* request_hex = NULL;
+    char* response_hex = NULL;
+    char* command = NULL;
+    char* line = NULL;
+    char* reply_hex = NULL;
+    char* err_hex = NULL;
+    char* reply_buf = NULL;
+    size_t reply_len = 0u;
+    int ok = 0;
+    int rc = 0;
+    if (response_out != NULL) *response_out = cheng_str_bridge_empty();
+    if (err_out != NULL) *err_out = cheng_str_bridge_empty();
+    protocol_hex = cheng_v3_browser_bridge_hex_encode(protocol, protocol_len);
+    request_hex = cheng_v3_browser_bridge_hex_encode(request, request_len);
+    response_hex = cheng_v3_browser_bridge_hex_encode(response_payload, response_len);
+    if (protocol_hex == NULL || request_hex == NULL || response_hex == NULL) goto cleanup;
+    command = (char*)malloc(strlen(protocol_hex) + strlen(request_hex) + strlen(response_hex) + 96u);
+    if (command == NULL) goto cleanup;
+    snprintf(command,
+             strlen(protocol_hex) + strlen(request_hex) + strlen(response_hex) + 96u,
+             "{\"command\":\"exchange\",\"protocolHex\":\"%s\",\"requestHex\":\"%s\",\"responseHex\":\"%s\"}",
+             protocol_hex,
+             request_hex,
+             response_hex);
+    if (!cheng_v3_browser_session_send_command(session, command, &line)) goto cleanup;
+    if (!cheng_v3_browser_bridge_json_ok(line, &ok)) goto cleanup;
+    if (!ok) {
+        if (cheng_v3_browser_bridge_json_field_hex(line, "errHex", &err_hex) &&
+            cheng_v3_browser_bridge_hex_decode_dup(err_hex, strlen(err_hex), &reply_buf, &reply_len)) {
+            if (err_out != NULL) *err_out = driver_c_str_from_utf8_copy_bridge(reply_buf, (int32_t)reply_len);
+            rc = 0;
+            goto cleanup;
+        }
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_json_field_hex(line, "responseHex", &reply_hex)) goto cleanup;
+    if (!cheng_v3_browser_bridge_hex_decode_dup(reply_hex, strlen(reply_hex), &reply_buf, &reply_len)) goto cleanup;
+    if (response_out != NULL) *response_out = driver_c_str_from_utf8_copy_bridge(reply_buf != NULL ? reply_buf : "", (int32_t)reply_len);
+    rc = 1;
+cleanup:
+    free(protocol_hex);
+    free(request_hex);
+    free(response_hex);
+    free(command);
+    free(line);
+    free(reply_hex);
+    free(err_hex);
+    free(reply_buf);
+    return rc;
+}
+
+static int cheng_v3_browser_session_send_close(ChengV3BrowserSession* session, ChengStrBridge* err_out) {
+    char* line = NULL;
+    char* err_hex = NULL;
+    char* err_buf = NULL;
+    size_t err_len = 0u;
+    int ok = 0;
+    if (err_out != NULL) *err_out = cheng_str_bridge_empty();
+    if (!cheng_v3_browser_session_send_command(session, "{\"command\":\"close\"}", &line)) {
+        return 0;
+    }
+    if (!cheng_v3_browser_bridge_json_ok(line, &ok)) {
+        free(line);
+        return 0;
+    }
+    if (!ok) {
+        if (cheng_v3_browser_bridge_json_field_hex(line, "errHex", &err_hex) &&
+            cheng_v3_browser_bridge_hex_decode_dup(err_hex, strlen(err_hex), &err_buf, &err_len)) {
+            if (err_out != NULL) *err_out = driver_c_str_from_utf8_copy_bridge(err_buf, (int32_t)err_len);
+        }
+        free(line);
+        free(err_hex);
+        free(err_buf);
+        return 0;
+    }
+    free(line);
+    free(err_hex);
+    free(err_buf);
+    return 1;
+}
+#endif
+
+WEAK uint64_t cheng_v3_webrtc_browser_session_open_bridge(ChengStrBridge policy_text,
+                                                          ChengStrBridge label_text,
+                                                          ChengStrBridge* signal_response_text,
+                                                          ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p webrtc browser: win32 session bridge not implemented";
+    if (signal_response_text != NULL) *signal_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    if (err_text != NULL) *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    (void)policy_text;
+    (void)label_text;
+    return 0;
+#else
+    const char* repo_root_missing = "v3 libp2p webrtc browser: repo root missing";
+    const char* policy_missing = "v3 libp2p webrtc browser: policy payload missing";
+    const char* spawn_failed = "v3 libp2p webrtc browser: session spawn failed";
+    const char* open_failed = "v3 libp2p webrtc browser: session open failed";
+    const char* policy = "";
+    const char* label = "";
+    size_t policy_len = 0u;
+    size_t label_len = 0u;
+    char repo_root[PATH_MAX];
+    ChengV3BrowserSession* session = NULL;
+    ChengStrBridge signal_out = cheng_str_bridge_empty();
+    ChengStrBridge err = cheng_str_bridge_empty();
+    if (signal_response_text != NULL) *signal_response_text = signal_out;
+    if (err_text != NULL) *err_text = err;
+    if (!cheng_str_bridge_view(policy_text, &policy, &policy_len)) {
+        policy = "";
+        policy_len = 0u;
+    }
+    if (!cheng_str_bridge_view(label_text, &label, &label_len)) {
+        label = "";
+        label_len = 0u;
+    }
+    if (policy_len == 0u) {
+        err = driver_c_str_from_utf8_copy_bridge(policy_missing, (int32_t)strlen(policy_missing));
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_resolve_repo_root(repo_root, sizeof(repo_root))) {
+        err = driver_c_str_from_utf8_copy_bridge(repo_root_missing, (int32_t)strlen(repo_root_missing));
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_session_spawn_handle(repo_root, &session)) {
+        err = driver_c_str_from_utf8_copy_bridge(spawn_failed, (int32_t)strlen(spawn_failed));
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_session_send_open(session, policy, policy_len, label, label_len, &signal_out, &err)) {
+        if (err.ptr == NULL || err.len == 0) {
+            err = driver_c_str_from_utf8_copy_bridge(open_failed, (int32_t)strlen(open_failed));
+        }
+        goto cleanup;
+    }
+    if (signal_response_text != NULL) *signal_response_text = signal_out;
+    if (err_text != NULL) *err_text = err;
+    return cheng_ffi_handle_register_ptr(session);
+cleanup:
+    if (session != NULL) {
+        cheng_v3_browser_session_release(session);
+        session = NULL;
+    }
+    if (signal_response_text != NULL) *signal_response_text = signal_out;
+    else cheng_v3_bridge_release_owned(signal_out);
+    if (err_text != NULL) *err_text = err;
+    else cheng_v3_bridge_release_owned(err);
+    return 0;
+#endif
+}
+
+WEAK int32_t cheng_v3_webrtc_browser_session_exchange_bridge(uint64_t handle,
+                                                             ChengStrBridge protocol_text,
+                                                             ChengStrBridge request_text,
+                                                             ChengStrBridge response_text,
+                                                             ChengStrBridge* client_response_text,
+                                                             ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p webrtc browser: win32 session exchange not implemented";
+    if (client_response_text != NULL) *client_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    if (err_text != NULL) *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    (void)handle;
+    (void)protocol_text;
+    (void)request_text;
+    (void)response_text;
+    return 0;
+#else
+    const char* exchange_failed = "v3 libp2p webrtc browser: session exchange failed";
+    const char* protocol = "";
+    const char* request = "";
+    const char* response_payload = "";
+    size_t protocol_len = 0u;
+    size_t request_len = 0u;
+    size_t response_len = 0u;
+    ChengV3BrowserSession* session = (ChengV3BrowserSession*)cheng_ffi_handle_resolve_ptr(handle);
+    ChengStrBridge response_out = cheng_str_bridge_empty();
+    ChengStrBridge err = cheng_str_bridge_empty();
+    if (client_response_text != NULL) *client_response_text = response_out;
+    if (err_text != NULL) *err_text = err;
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(request_text, &request, &request_len)) {
+        request = "";
+        request_len = 0u;
+    }
+    if (!cheng_str_bridge_view(response_text, &response_payload, &response_len)) {
+        response_payload = "";
+        response_len = 0u;
+    }
+    if (!cheng_v3_browser_session_send_exchange(session,
+                                                protocol,
+                                                protocol_len,
+                                                request,
+                                                request_len,
+                                                response_payload,
+                                                response_len,
+                                                &response_out,
+                                                &err)) {
+        if (err.ptr == NULL || err.len == 0) {
+            err = driver_c_str_from_utf8_copy_bridge(exchange_failed, (int32_t)strlen(exchange_failed));
+        }
+    }
+    if (client_response_text != NULL) *client_response_text = response_out;
+    else cheng_v3_bridge_release_owned(response_out);
+    if (err_text != NULL) *err_text = err;
+    else cheng_v3_bridge_release_owned(err);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
+
+WEAK int32_t cheng_v3_webrtc_browser_session_close_bridge(uint64_t handle,
+                                                          ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p webrtc browser: win32 session close not implemented";
+    if (err_text != NULL) *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    (void)handle;
+    return 0;
+#else
+    ChengV3BrowserSession* session = (ChengV3BrowserSession*)cheng_ffi_handle_resolve_ptr(handle);
+    ChengStrBridge err = cheng_str_bridge_empty();
+    int ok = cheng_v3_browser_session_send_close(session, &err);
+    if (cheng_ffi_handle_invalidate(handle) != 0) {
+        ok = 0;
+    }
+    cheng_v3_browser_session_release(session);
+    if (err_text != NULL) *err_text = err;
+    else cheng_v3_bridge_release_owned(err);
+    return ok && (err.ptr == NULL || err.len == 0) ? 1 : 0;
+#endif
+}
+
+WEAK int32_t cheng_v3_webrtc_browser_session_active_count_bridge(void) {
+    return cheng_v3_browser_session_active_count;
+}
+
+typedef struct ChengV3TailnetProviderRuntime {
+    int32_t provider_ready;
+    int32_t proxy_ready;
+    int32_t listener_needs_repair;
+    int32_t derp_healthy;
+    char startup_stage[64];
+    char provider_kind[32];
+    char control_endpoint[512];
+    char relay_endpoint[512];
+    char control_probe_endpoint[512];
+    char relay_probe_endpoint[512];
+    char derp_region_code[64];
+    char derp_hostname[128];
+    char last_error[256];
+} ChengV3TailnetProviderRuntime;
+
+static int32_t cheng_v3_tailnet_provider_active_count = 0;
+static int32_t cheng_v3_tailnet_provider_command_count = 0;
+
+static ChengV3TailnetProviderRuntime* cheng_v3_tailnet_provider_runtime_new(void) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)calloc(1u, sizeof(ChengV3TailnetProviderRuntime));
+    if (runtime == NULL) return NULL;
+    snprintf(runtime->startup_stage, sizeof(runtime->startup_stage), "init");
+    return runtime;
+}
+
+static void cheng_v3_tailnet_provider_copy_bridge_text(char* out,
+                                                       size_t out_cap,
+                                                       ChengStrBridge text) {
+    const char* safe = "";
+    size_t safe_len = 0u;
+    if (out == NULL || out_cap == 0u) {
+        return;
+    }
+    if (!cheng_str_bridge_view(text, &safe, &safe_len)) {
+        safe = "";
+        safe_len = 0u;
+    }
+    if (safe_len >= out_cap) {
+        safe_len = out_cap - 1u;
+    }
+    if (safe_len > 0u) {
+        memcpy(out, safe, safe_len);
+    }
+    out[safe_len] = '\0';
+}
+
+static void cheng_v3_tailnet_provider_set_stage(ChengV3TailnetProviderRuntime* runtime,
+                                                const char* stage) {
+    const char* safe = stage != NULL ? stage : "";
+    if (runtime == NULL) {
+        return;
+    }
+    snprintf(runtime->startup_stage, sizeof(runtime->startup_stage), "%s", safe);
+}
+
+static void cheng_v3_tailnet_provider_set_error(ChengV3TailnetProviderRuntime* runtime,
+                                                const char* err) {
+    const char* safe = err != NULL ? err : "";
+    if (runtime == NULL) {
+        return;
+    }
+    snprintf(runtime->last_error, sizeof(runtime->last_error), "%s", safe);
+}
+
+static int cheng_v3_tailnet_provider_has_prefix(const char* text,
+                                                const char* prefix) {
+    size_t text_len;
+    size_t prefix_len;
+    if (text == NULL || prefix == NULL) {
+        return 0;
+    }
+    text_len = strlen(text);
+    prefix_len = strlen(prefix);
+    if (text_len < prefix_len) {
+        return 0;
+    }
+    return memcmp(text, prefix, prefix_len) == 0 ? 1 : 0;
+}
+
+static char* cheng_v3_tailnet_provider_dup_range(const char* start,
+                                                 size_t len) {
+    char* out = (char*)malloc(len + 1u);
+    if (out == NULL) {
+        return NULL;
+    }
+    if (len > 0u) {
+        memcpy(out, start, len);
+    }
+    out[len] = '\0';
+    return out;
+}
+
+static int cheng_v3_tailnet_provider_http_split_url(const char* raw,
+                                                    char** host_out,
+                                                    char** port_out,
+                                                    char** path_out) {
+    const char* rest = NULL;
+    const char* slash = NULL;
+    const char* colon = NULL;
+    char* authority = NULL;
+    size_t authority_len = 0u;
+    char* host = NULL;
+    char* port = NULL;
+    char* path = NULL;
+    if (host_out == NULL || port_out == NULL || path_out == NULL) {
+        return 0;
+    }
+    *host_out = NULL;
+    *port_out = NULL;
+    *path_out = NULL;
+    if (raw == NULL || !cheng_v3_tailnet_provider_has_prefix(raw, "http://")) {
+        return 0;
+    }
+    rest = raw + 7;
+    if (rest[0] == '\0') {
+        return 0;
+    }
+    slash = strchr(rest, '/');
+    authority_len = slash != NULL ? (size_t)(slash - rest) : strlen(rest);
+    authority = cheng_v3_tailnet_provider_dup_range(rest, authority_len);
+    if (authority == NULL) {
+        return 0;
+    }
+    if (authority[0] == '\0') {
+        free(authority);
+        return 0;
+    }
+    if (authority[0] == '[') {
+        const char* close = strchr(authority, ']');
+        if (close == NULL) {
+            free(authority);
+            return 0;
+        }
+        host = cheng_v3_tailnet_provider_dup_range(authority + 1,
+                                                   (size_t)(close - authority - 1));
+        if (close[1] == ':' && close[2] != '\0') {
+            port = cheng_v3_bridge_dup_cstring(close + 2);
+        }
+    } else {
+        colon = strrchr(authority, ':');
+        if (colon != NULL && strchr(colon + 1, ':') == NULL) {
+            host = cheng_v3_tailnet_provider_dup_range(authority,
+                                                       (size_t)(colon - authority));
+            port = cheng_v3_bridge_dup_cstring(colon + 1);
+        } else {
+            host = cheng_v3_bridge_dup_cstring(authority);
+        }
+    }
+    if (host == NULL || host[0] == '\0') {
+        free(authority);
+        free(host);
+        free(port);
+        return 0;
+    }
+    if (port == NULL) {
+        port = cheng_v3_bridge_dup_cstring("80");
+    }
+    if (port == NULL || port[0] == '\0') {
+        free(authority);
+        free(host);
+        free(port);
+        return 0;
+    }
+    if (slash != NULL) {
+        path = cheng_v3_bridge_dup_cstring(slash);
+    } else {
+        path = cheng_v3_bridge_dup_cstring("/");
+    }
+    free(authority);
+    if (path == NULL) {
+        free(host);
+        free(port);
+        return 0;
+    }
+    *host_out = host;
+    *port_out = port;
+    *path_out = path;
+    return 1;
+}
+
+static char* cheng_v3_tailnet_provider_http_get_dup(const char* url) {
+    char* host = NULL;
+    char* port = NULL;
+    char* path = NULL;
+    struct addrinfo hints;
+    struct addrinfo* infos = NULL;
+    struct addrinfo* info = NULL;
+    int fd = -1;
+    int status = 0;
+    char request[1024];
+    size_t used = 0u;
+    size_t cap = 0u;
+    char* buffer = NULL;
+    char* body = NULL;
+    char* header_end = NULL;
+    memset(&hints, 0, sizeof(hints));
+    if (!cheng_v3_tailnet_provider_http_split_url(url, &host, &port, &path)) {
+        return NULL;
+    }
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &infos) != 0) {
+        free(host);
+        free(port);
+        free(path);
+        return NULL;
+    }
+    for (info = infos; info != NULL; info = info->ai_next) {
+        fd = socket(info->ai_family, info->ai_socktype, info->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        if (connect(fd, info->ai_addr, info->ai_addrlen) == 0) {
+            break;
+        }
+        close(fd);
+        fd = -1;
+    }
+    if (fd < 0) {
+        freeaddrinfo(infos);
+        free(host);
+        free(port);
+        free(path);
+        return NULL;
+    }
+    status = snprintf(request,
+                      sizeof(request),
+                      "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nAccept: application/json\r\n\r\n",
+                      path,
+                      host);
+    if (status < 0 || (size_t)status >= sizeof(request) ||
+        !cheng_v3_tcp_send_all_raw(fd, request, (size_t)status)) {
+        close(fd);
+        freeaddrinfo(infos);
+        free(host);
+        free(port);
+        free(path);
+        return NULL;
+    }
+    cap = 4096u;
+    buffer = (char*)malloc(cap);
+    if (buffer == NULL) {
+        close(fd);
+        freeaddrinfo(infos);
+        free(host);
+        free(port);
+        free(path);
+        return NULL;
+    }
+    while (1) {
+        ssize_t rc;
+        if (used + 2048u + 1u > cap) {
+            size_t next_cap = cap * 2u;
+            char* next = (char*)realloc(buffer, next_cap);
+            if (next == NULL) {
+                free(buffer);
+                close(fd);
+                freeaddrinfo(infos);
+                free(host);
+                free(port);
+                free(path);
+                return NULL;
+            }
+            buffer = next;
+            cap = next_cap;
+        }
+        rc = recv(fd, buffer + used, cap - used - 1u, 0);
+        if (rc < 0) {
+            free(buffer);
+            close(fd);
+            freeaddrinfo(infos);
+            free(host);
+            free(port);
+            free(path);
+            return NULL;
+        }
+        if (rc == 0) {
+            break;
+        }
+        used += (size_t)rc;
+    }
+    buffer[used] = '\0';
+    close(fd);
+    freeaddrinfo(infos);
+    free(host);
+    free(port);
+    free(path);
+    if (strncmp(buffer, "HTTP/", 5) != 0) {
+        free(buffer);
+        return NULL;
+    }
+    if (strstr(buffer, " 200 ") == NULL) {
+        free(buffer);
+        return NULL;
+    }
+    header_end = strstr(buffer, "\r\n\r\n");
+    if (header_end != NULL) {
+        header_end += 4;
+    } else {
+        header_end = strstr(buffer, "\n\n");
+        if (header_end != NULL) {
+            header_end += 2;
+        }
+    }
+    if (header_end == NULL) {
+        free(buffer);
+        return NULL;
+    }
+    body = cheng_v3_bridge_dup_cstring(header_end);
+    free(buffer);
+    return body;
+}
+
+static char* cheng_v3_tailnet_provider_load_endpoint_dup(const char* endpoint) {
+    char* clean = cheng_v3_bridge_trim_dup(endpoint);
+    char* payload = NULL;
+    if (clean == NULL || clean[0] == '\0') {
+        free(clean);
+        return NULL;
+    }
+    if (cheng_v3_tailnet_provider_has_prefix(clean, "file://")) {
+        payload = cheng_v3_read_text_file_raw_dup(clean + 7);
+    } else if (cheng_v3_tailnet_provider_has_prefix(clean, "http://")) {
+        payload = cheng_v3_tailnet_provider_http_get_dup(clean);
+    } else if (cheng_v3_tailnet_provider_has_prefix(clean, "https://")) {
+        payload = NULL;
+    } else {
+        payload = cheng_v3_read_text_file_raw_dup(clean);
+    }
+    free(clean);
+    return payload;
+}
+
+static const char* cheng_v3_tailnet_provider_json_value_after_key(const char* payload,
+                                                                  const char* key) {
+    char pattern[128];
+    const char* hit = NULL;
+    const char* value = NULL;
+    int status;
+    if (payload == NULL || key == NULL) {
+        return NULL;
+    }
+    status = snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    if (status < 0 || (size_t)status >= sizeof(pattern)) {
+        return NULL;
+    }
+    hit = strstr(payload, pattern);
+    if (hit == NULL) {
+        return NULL;
+    }
+    value = hit + (size_t)status;
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        value++;
+    }
+    if (*value != ':') {
+        return NULL;
+    }
+    value++;
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        value++;
+    }
+    return value;
+}
+
+static int cheng_v3_tailnet_provider_json_read_bool(const char* payload,
+                                                    const char* key,
+                                                    int32_t* out_value) {
+    const char* value = cheng_v3_tailnet_provider_json_value_after_key(payload, key);
+    if (value == NULL || out_value == NULL) {
+        return 0;
+    }
+    if (strncmp(value, "true", 4) == 0 &&
+        (value[4] == '\0' || value[4] == ',' || value[4] == '}' ||
+         value[4] == '\r' || value[4] == '\n' || value[4] == ' ' || value[4] == '\t')) {
+        *out_value = 1;
+        return 1;
+    }
+    if (strncmp(value, "false", 5) == 0 &&
+        (value[5] == '\0' || value[5] == ',' || value[5] == '}' ||
+         value[5] == '\r' || value[5] == '\n' || value[5] == ' ' || value[5] == '\t')) {
+        *out_value = 0;
+        return 1;
+    }
+    return 0;
+}
+
+static int cheng_v3_tailnet_provider_json_read_string(const char* payload,
+                                                      const char* key,
+                                                      char* out,
+                                                      size_t out_cap) {
+    const char* value = cheng_v3_tailnet_provider_json_value_after_key(payload, key);
+    size_t used = 0u;
+    if (value == NULL || out == NULL || out_cap == 0u || *value != '"') {
+        return 0;
+    }
+    value++;
+    while (*value != '\0' && *value != '"') {
+        char ch = *value++;
+        if (ch == '\\' && *value != '\0') {
+            ch = *value++;
+        }
+        if (used + 1u >= out_cap) {
+            return 0;
+        }
+        out[used++] = ch;
+    }
+    if (*value != '"') {
+        return 0;
+    }
+    out[used] = '\0';
+    return 1;
+}
+
+static int cheng_v3_tailnet_provider_is_headscale(const ChengV3TailnetProviderRuntime* runtime) {
+    if (runtime == NULL) {
+        return 0;
+    }
+    return strcmp(runtime->provider_kind, "headscale") == 0 ? 1 : 0;
+}
+
+static int cheng_v3_tailnet_provider_sync_control(ChengV3TailnetProviderRuntime* runtime) {
+    const char* endpoint = NULL;
+    char* payload = NULL;
+    int32_t provider_ready = 0;
+    int32_t proxy_ready = 0;
+    int32_t listener_needs_repair = 0;
+    char startup_stage[64];
+    memset(startup_stage, 0, sizeof(startup_stage));
+    if (runtime == NULL) {
+        return 0;
+    }
+    endpoint = runtime->control_probe_endpoint[0] != '\0'
+                   ? runtime->control_probe_endpoint
+                   : runtime->control_endpoint;
+    payload = cheng_v3_tailnet_provider_load_endpoint_dup(endpoint);
+    if (payload == NULL) {
+        cheng_v3_tailnet_provider_set_error(runtime, "tailnet provider: control probe load failed");
+        return 0;
+    }
+    if (!cheng_v3_tailnet_provider_json_read_bool(payload, "providerReady", &provider_ready) ||
+        !cheng_v3_tailnet_provider_json_read_bool(payload, "proxyListenersReady", &proxy_ready) ||
+        !cheng_v3_tailnet_provider_json_read_bool(payload, "listenerNeedsRepair", &listener_needs_repair) ||
+        !cheng_v3_tailnet_provider_json_read_string(payload, "startupStage", startup_stage, sizeof(startup_stage))) {
+        free(payload);
+        cheng_v3_tailnet_provider_set_error(runtime, "tailnet provider: control probe parse failed");
+        return 0;
+    }
+    free(payload);
+    runtime->provider_ready = provider_ready;
+    runtime->proxy_ready = proxy_ready;
+    runtime->listener_needs_repair = listener_needs_repair;
+    cheng_v3_tailnet_provider_set_stage(runtime, startup_stage);
+    cheng_v3_tailnet_provider_set_error(runtime, "");
+    return 1;
+}
+
+static int cheng_v3_tailnet_provider_sync_derp(ChengV3TailnetProviderRuntime* runtime) {
+    const char* endpoint = NULL;
+    char* payload = NULL;
+    int32_t derp_healthy = 0;
+    char startup_stage[64];
+    memset(startup_stage, 0, sizeof(startup_stage));
+    if (runtime == NULL) {
+        return 0;
+    }
+    endpoint = runtime->relay_probe_endpoint[0] != '\0'
+                   ? runtime->relay_probe_endpoint
+                   : runtime->relay_endpoint;
+    payload = cheng_v3_tailnet_provider_load_endpoint_dup(endpoint);
+    if (payload == NULL) {
+        cheng_v3_tailnet_provider_set_error(runtime, "tailnet provider: derp probe load failed");
+        return 0;
+    }
+    if (!cheng_v3_tailnet_provider_json_read_bool(payload, "derpHealthy", &derp_healthy) ||
+        !cheng_v3_tailnet_provider_json_read_string(payload, "startupStage", startup_stage, sizeof(startup_stage))) {
+        free(payload);
+        cheng_v3_tailnet_provider_set_error(runtime, "tailnet provider: derp probe parse failed");
+        return 0;
+    }
+    free(payload);
+    runtime->derp_healthy = derp_healthy;
+    cheng_v3_tailnet_provider_set_stage(runtime, startup_stage);
+    cheng_v3_tailnet_provider_set_error(runtime, "");
+    return 1;
+}
+
+WEAK uint64_t cheng_v3_tailnet_provider_open_bridge(ChengStrBridge provider_kind_text,
+                                                    ChengStrBridge control_endpoint_text,
+                                                    ChengStrBridge relay_endpoint_text,
+                                                    ChengStrBridge control_probe_endpoint_text,
+                                                    ChengStrBridge relay_probe_endpoint_text,
+                                                    ChengStrBridge derp_region_code_text,
+                                                    ChengStrBridge derp_hostname_text) {
+    ChengV3TailnetProviderRuntime* runtime = cheng_v3_tailnet_provider_runtime_new();
+    if (runtime == NULL) return 0;
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->provider_kind,
+                                               sizeof(runtime->provider_kind),
+                                               provider_kind_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->control_endpoint,
+                                               sizeof(runtime->control_endpoint),
+                                               control_endpoint_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->relay_endpoint,
+                                               sizeof(runtime->relay_endpoint),
+                                               relay_endpoint_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->control_probe_endpoint,
+                                               sizeof(runtime->control_probe_endpoint),
+                                               control_probe_endpoint_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->relay_probe_endpoint,
+                                               sizeof(runtime->relay_probe_endpoint),
+                                               relay_probe_endpoint_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->derp_region_code,
+                                               sizeof(runtime->derp_region_code),
+                                               derp_region_code_text);
+    cheng_v3_tailnet_provider_copy_bridge_text(runtime->derp_hostname,
+                                               sizeof(runtime->derp_hostname),
+                                               derp_hostname_text);
+    cheng_v3_tailnet_provider_active_count += 1;
+    return cheng_ffi_handle_register_ptr(runtime);
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_command_bridge(uint64_t handle,
+                                                      ChengStrBridge command_text) {
+    const char* command = "";
+    size_t command_len = 0u;
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return -1;
+    if (!cheng_str_bridge_view(command_text, &command, &command_len)) {
+        command = "";
+        command_len = 0u;
+    }
+    cheng_v3_tailnet_provider_command_count += 1;
+    if (command_len == 14u && memcmp(command, "provider-start", 14u) == 0) {
+        if (cheng_v3_tailnet_provider_is_headscale(runtime)) {
+            return cheng_v3_tailnet_provider_sync_control(runtime) ? 0 : -1;
+        }
+        runtime->provider_ready = 1;
+        runtime->proxy_ready = 0;
+        runtime->listener_needs_repair = 0;
+        cheng_v3_tailnet_provider_set_stage(runtime, "provider-started");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    if (command_len == 11u && memcmp(command, "proxy-ready", 11u) == 0) {
+        if (cheng_v3_tailnet_provider_is_headscale(runtime)) {
+            return cheng_v3_tailnet_provider_sync_control(runtime) ? 0 : -1;
+        }
+        runtime->provider_ready = 1;
+        runtime->proxy_ready = 1;
+        runtime->listener_needs_repair = 0;
+        cheng_v3_tailnet_provider_set_stage(runtime, "proxy-ready");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    if (command_len == 13u && memcmp(command, "repair-needed", 13u) == 0) {
+        runtime->provider_ready = 1;
+        runtime->proxy_ready = 0;
+        runtime->listener_needs_repair = 1;
+        cheng_v3_tailnet_provider_set_stage(runtime, "repair-needed");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    if (command_len == 16u && memcmp(command, "repair-listeners", 16u) == 0) {
+        if (cheng_v3_tailnet_provider_is_headscale(runtime)) {
+            return cheng_v3_tailnet_provider_sync_control(runtime) ? 0 : -1;
+        }
+        runtime->provider_ready = 1;
+        runtime->proxy_ready = 1;
+        runtime->listener_needs_repair = 0;
+        cheng_v3_tailnet_provider_set_stage(runtime, "repair-complete");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    if (command_len == 14u && memcmp(command, "derp-reconnect", 14u) == 0) {
+        runtime->derp_healthy = 0;
+        cheng_v3_tailnet_provider_set_stage(runtime, "derp-reconnect");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    if (command_len == 10u && memcmp(command, "derp-ready", 10u) == 0) {
+        if (cheng_v3_tailnet_provider_is_headscale(runtime)) {
+            return cheng_v3_tailnet_provider_sync_derp(runtime) ? 0 : -1;
+        }
+        runtime->derp_healthy = 1;
+        cheng_v3_tailnet_provider_set_stage(runtime, "derp-ready");
+        cheng_v3_tailnet_provider_set_error(runtime, "");
+        return 0;
+    }
+    (void)command;
+    (void)command_len;
+    return -1;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_close_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return -1;
+    if (cheng_ffi_handle_invalidate(handle) != 0) {
+        return -1;
+    }
+    free(runtime);
+    if (cheng_v3_tailnet_provider_active_count > 0) {
+        cheng_v3_tailnet_provider_active_count -= 1;
+    }
+    return 0;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_active_count_bridge(void) {
+    return cheng_v3_tailnet_provider_active_count;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_command_count_bridge(void) {
+    return cheng_v3_tailnet_provider_command_count;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_probe_provider_ready_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return 0;
+    return runtime->provider_ready != 0 ? 1 : 0;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_probe_proxy_ready_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return 0;
+    return runtime->proxy_ready != 0 ? 1 : 0;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_probe_listener_needs_repair_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return 0;
+    return runtime->listener_needs_repair != 0 ? 1 : 0;
+}
+
+WEAK int32_t cheng_v3_tailnet_provider_probe_derp_healthy_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return 0;
+    return runtime->derp_healthy != 0 ? 1 : 0;
+}
+
+WEAK ChengStrBridge cheng_v3_tailnet_provider_probe_startup_stage_bridge(uint64_t handle) {
+    ChengV3TailnetProviderRuntime* runtime = (ChengV3TailnetProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) {
+        return cheng_v3_bridge_owned_str("");
+    }
+    return cheng_v3_bridge_owned_str(runtime->startup_stage);
+}
+
+WEAK int32_t cheng_v3_webrtc_browser_request_response_bridge(ChengStrBridge protocol_text,
+                                                             ChengStrBridge policy_text,
+                                                             ChengStrBridge label_text,
+                                                             ChengStrBridge request_text,
+                                                             ChengStrBridge response_text,
+                                                             ChengStrBridge* signal_response_text,
+                                                             ChengStrBridge* client_response_text,
+                                                             ChengStrBridge* err_text) {
+#if defined(_WIN32)
+    const char* not_impl = "v3 libp2p webrtc browser: win32 bridge not implemented";
+    if (signal_response_text != NULL) {
+        *signal_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (client_response_text != NULL) {
+        *client_response_text = driver_c_str_from_utf8_copy_bridge("", 0);
+    }
+    if (err_text != NULL) {
+        *err_text = driver_c_str_from_utf8_copy_bridge(not_impl, (int32_t)strlen(not_impl));
+    }
+    (void)protocol_text;
+    (void)policy_text;
+    (void)label_text;
+    (void)request_text;
+    (void)response_text;
+    return 0;
+#else
+    const char* repo_root_missing = "v3 libp2p webrtc browser: repo root missing";
+    const char* policy_missing = "v3 libp2p webrtc browser: policy payload missing";
+    const char* tmpdir_failed = "v3 libp2p webrtc browser: mkdtemp failed";
+    const char* file_write_failed = "v3 libp2p webrtc browser: temp file write failed";
+    const char* signal_missing = "v3 libp2p webrtc browser: signal transcript missing";
+    const char* response_missing = "v3 libp2p webrtc browser: client response missing";
+    const char* child_failed = "v3 libp2p webrtc browser: node runner failed";
+    const char* protocol = "";
+    const char* policy = "";
+    const char* label = "";
+    const char* request = "";
+    const char* response_payload = "";
+    size_t protocol_len = 0u;
+    size_t policy_len = 0u;
+    size_t label_len = 0u;
+    size_t request_len = 0u;
+    size_t response_len = 0u;
+    char repo_root[PATH_MAX];
+    char script_path[PATH_MAX];
+    char tmp_template[] = "/tmp/cheng_v3_browser_webrtc.XXXXXX";
+    char protocol_path[PATH_MAX];
+    char policy_path[PATH_MAX];
+    char label_path[PATH_MAX];
+    char request_path[PATH_MAX];
+    char response_path[PATH_MAX];
+    char signal_path[PATH_MAX];
+    char client_response_path[PATH_MAX];
+    char err_path[PATH_MAX];
+    char* signal_buf = NULL;
+    char* client_response_buf = NULL;
+    char* child_err_buf = NULL;
+    size_t signal_len = 0u;
+    size_t client_response_len = 0u;
+    size_t child_err_len = 0u;
+    int64_t child_status = 0;
+    ChengStrBridge err = cheng_str_bridge_empty();
+    ChengStrBridge signal_out = cheng_str_bridge_empty();
+    ChengStrBridge response_out = cheng_str_bridge_empty();
+    if (signal_response_text != NULL) {
+        *signal_response_text = signal_out;
+    }
+    if (client_response_text != NULL) {
+        *client_response_text = response_out;
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    }
+    if (!cheng_str_bridge_view(protocol_text, &protocol, &protocol_len)) {
+        protocol = "";
+        protocol_len = 0u;
+    }
+    if (!cheng_str_bridge_view(policy_text, &policy, &policy_len)) {
+        policy = "";
+        policy_len = 0u;
+    }
+    if (!cheng_str_bridge_view(label_text, &label, &label_len)) {
+        label = "";
+        label_len = 0u;
+    }
+    if (!cheng_str_bridge_view(request_text, &request, &request_len)) {
+        request = "";
+        request_len = 0u;
+    }
+    if (!cheng_str_bridge_view(response_text, &response_payload, &response_len)) {
+        response_payload = "";
+        response_len = 0u;
+    }
+    if (policy_len == 0u) {
+        err = driver_c_str_from_utf8_copy_bridge(policy_missing, (int32_t)strlen(policy_missing));
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_resolve_repo_root(repo_root, sizeof(repo_root))) {
+        err = driver_c_str_from_utf8_copy_bridge(repo_root_missing, (int32_t)strlen(repo_root_missing));
+        goto cleanup;
+    }
+    snprintf(script_path, sizeof(script_path), "%s/v3/tooling/browser_webrtc/run_browser_webrtc_bridge.mjs", repo_root);
+    if (mkdtemp(tmp_template) == NULL) {
+        err = driver_c_str_from_utf8_copy_bridge(tmpdir_failed, (int32_t)strlen(tmpdir_failed));
+        goto cleanup;
+    }
+    snprintf(protocol_path, sizeof(protocol_path), "%s/protocol.bin", tmp_template);
+    snprintf(policy_path, sizeof(policy_path), "%s/policy.bin", tmp_template);
+    snprintf(label_path, sizeof(label_path), "%s/label.txt", tmp_template);
+    snprintf(request_path, sizeof(request_path), "%s/request.bin", tmp_template);
+    snprintf(response_path, sizeof(response_path), "%s/response.bin", tmp_template);
+    snprintf(signal_path, sizeof(signal_path), "%s/signal.bin", tmp_template);
+    snprintf(client_response_path, sizeof(client_response_path), "%s/client_response.bin", tmp_template);
+    snprintf(err_path, sizeof(err_path), "%s/err.txt", tmp_template);
+    if (!cheng_v3_browser_bridge_write_file(protocol_path, protocol, protocol_len) ||
+        !cheng_v3_browser_bridge_write_file(policy_path, policy, policy_len) ||
+        !cheng_v3_browser_bridge_write_file(label_path, label, label_len) ||
+        !cheng_v3_browser_bridge_write_file(request_path, request, request_len) ||
+        !cheng_v3_browser_bridge_write_file(response_path, response_payload, response_len)) {
+        err = driver_c_str_from_utf8_copy_bridge(file_write_failed, (int32_t)strlen(file_write_failed));
+        goto cleanup;
+    }
+    child_status = cheng_v3_browser_bridge_spawn_node(script_path, tmp_template);
+    (void)cheng_v3_browser_bridge_read_file(err_path, &child_err_buf, &child_err_len);
+    if (child_status != 0) {
+        if (child_err_buf != NULL && child_err_len > 0u) {
+            err = driver_c_str_from_utf8_copy_bridge(child_err_buf, (int32_t)child_err_len);
+        } else {
+            char status_buf[96];
+            snprintf(status_buf, sizeof(status_buf), "%s (%lld)", child_failed, (long long)child_status);
+            err = driver_c_str_from_utf8_copy_bridge(status_buf, (int32_t)strlen(status_buf));
+        }
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_read_file(signal_path, &signal_buf, &signal_len) || signal_len == 0u) {
+        err = driver_c_str_from_utf8_copy_bridge(signal_missing, (int32_t)strlen(signal_missing));
+        goto cleanup;
+    }
+    if (!cheng_v3_browser_bridge_read_file(client_response_path, &client_response_buf, &client_response_len)) {
+        err = driver_c_str_from_utf8_copy_bridge(response_missing, (int32_t)strlen(response_missing));
+        goto cleanup;
+    }
+    signal_out = driver_c_str_from_utf8_copy_bridge(signal_buf != NULL ? signal_buf : "", (int32_t)signal_len);
+    response_out = driver_c_str_from_utf8_copy_bridge(client_response_buf != NULL ? client_response_buf : "", (int32_t)client_response_len);
+cleanup:
+    if (signal_response_text != NULL) {
+        *signal_response_text = signal_out;
+    } else {
+        cheng_v3_bridge_release_owned(signal_out);
+    }
+    if (client_response_text != NULL) {
+        *client_response_text = response_out;
+    } else {
+        cheng_v3_bridge_release_owned(response_out);
+    }
+    if (err_text != NULL) {
+        *err_text = err;
+    } else {
+        cheng_v3_bridge_release_owned(err);
+    }
+    if (tmp_template[0] != '\0' && strchr(tmp_template, 'X') == NULL) {
+        cheng_v3_browser_bridge_cleanup_tmpdir(tmp_template);
+    }
+    free(signal_buf);
+    free(client_response_buf);
+    free(child_err_buf);
+    return err.ptr == NULL || err.len == 0 ? 1 : 0;
+#endif
+}
 WEAK int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
                                                     int32_t port,
                                                     ChengStrBridge protocol_text,
@@ -9459,6 +11015,31 @@ int32_t cheng_system_entropy_fill(void* dst, int32_t len) {
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(dst, (size_t)len);
     return 1;
+#elif defined(__ANDROID__)
+    uint8_t* cursor = (uint8_t*)dst;
+    int32_t remaining = len;
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return 0;
+    }
+    while (remaining > 0) {
+        ssize_t got = read(fd, cursor, (size_t)remaining);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return 0;
+        }
+        if (got == 0) {
+            close(fd);
+            return 0;
+        }
+        cursor += (size_t)got;
+        remaining -= (int32_t)got;
+    }
+    close(fd);
+    return 1;
 #elif defined(__linux__)
     uint8_t* cursor = (uint8_t*)dst;
     int32_t remaining = len;
@@ -9984,6 +11565,244 @@ char* cheng_exec_cmd_ex(const char* command, const char* workingDir, int32_t mer
     return out;
 }
 
+typedef struct ChengV3HardwareAccelCache {
+    int initialized;
+    int32_t gpu_device_count;
+    int32_t gpu_core_count;
+    int32_t npu_device_count;
+    int32_t npu_core_count;
+} ChengV3HardwareAccelCache;
+
+static ChengV3HardwareAccelCache cheng_v3_hardware_accel_cache = {0, 0, 0, 0, 0};
+
+static int32_t cheng_v3_text_count_key(const char* text, const char* key) {
+    int32_t count = 0;
+    const char* cur = text;
+    size_t key_len = (text && key) ? strlen(key) : 0u;
+    if (text == NULL || key == NULL || key_len == 0u) return 0;
+    while ((cur = strstr(cur, key)) != NULL) {
+        count += 1;
+        cur += key_len;
+    }
+    return count;
+}
+
+static int32_t cheng_v3_text_sum_json_int_string_field(const char* text, const char* key) {
+    int32_t total = 0;
+    const char* cur = text;
+    size_t key_len = (text && key) ? strlen(key) : 0u;
+    if (text == NULL || key == NULL || key_len == 0u) return 0;
+    while ((cur = strstr(cur, key)) != NULL) {
+        int32_t value = 0;
+        int found_digit = 0;
+        cur += key_len;
+        while (*cur != '\0' && *cur != ':') cur++;
+        if (*cur == ':') cur++;
+        while (*cur != '\0' && *cur != '"' && !isdigit((unsigned char)*cur) && *cur != '-') cur++;
+        if (*cur == '"') cur++;
+        while (*cur != '\0' && isdigit((unsigned char)*cur)) {
+            found_digit = 1;
+            value = value * 10 + (int32_t)(*cur - '0');
+            cur++;
+        }
+        if (found_digit) total += value;
+    }
+    return total;
+}
+
+static int32_t cheng_v3_system_profiler_gpu_device_count(void) {
+    int64_t exit_code = -1;
+    char* output = cheng_exec_cmd_ex("system_profiler SPDisplaysDataType -json -detailLevel mini",
+                                     NULL,
+                                     1,
+                                     &exit_code);
+    int32_t count = 0;
+    if (output != NULL && exit_code == 0) {
+        count = cheng_v3_text_count_key(output, "\"sppci_device_type\" : \"spdisplays_gpu\"");
+        if (count <= 0) {
+            count = cheng_v3_text_count_key(output, "\"sppci_cores\"");
+        }
+    }
+    if (output != NULL) cheng_free(output);
+    return count > 0 ? count : 0;
+}
+
+static int32_t cheng_v3_system_profiler_gpu_core_count(void) {
+    int64_t exit_code = -1;
+    char* output = cheng_exec_cmd_ex("system_profiler SPDisplaysDataType -json -detailLevel mini",
+                                     NULL,
+                                     1,
+                                     &exit_code);
+    int32_t count = 0;
+    if (output != NULL && exit_code == 0) {
+        count = cheng_v3_text_sum_json_int_string_field(output, "\"sppci_cores\"");
+    }
+    if (output != NULL) cheng_free(output);
+    return count > 0 ? count : 0;
+}
+
+static void cheng_v3_probe_coreml_accelerators(ChengV3HardwareAccelCache* cache) {
+#if defined(__APPLE__)
+    void* coreml = dlopen("/System/Library/Frameworks/CoreML.framework/CoreML", RTLD_LAZY | RTLD_LOCAL);
+    void* objc = dlopen("/usr/lib/libobjc.A.dylib", RTLD_LAZY | RTLD_LOCAL);
+    if (objc == NULL) objc = dlopen("/usr/lib/libobjc.dylib", RTLD_LAZY | RTLD_LOCAL);
+    if (coreml == NULL || objc == NULL) {
+        if (coreml != NULL) dlclose(coreml);
+        if (objc != NULL) dlclose(objc);
+        return;
+    }
+    typedef void* (*ChengMLAllComputeDevicesFn)(void);
+    typedef void* (*ChengObjcMsgSendObjU64Fn)(void*, void*, uint64_t);
+    typedef uint64_t (*ChengObjcMsgSendU64Fn)(void*, void*);
+    typedef int64_t (*ChengObjcMsgSendI64Fn)(void*, void*);
+    typedef const char* (*ChengObjectGetClassNameFn)(void*);
+    typedef void* (*ChengAutoreleasePoolPushFn)(void);
+    typedef void (*ChengAutoreleasePoolPopFn)(void*);
+    typedef void* (*ChengSelRegisterNameFn)(const char*);
+
+    ChengMLAllComputeDevicesFn all_devices =
+        (ChengMLAllComputeDevicesFn)dlsym(coreml, "MLAllComputeDevices");
+    ChengObjcMsgSendObjU64Fn msg_obj_u64 =
+        (ChengObjcMsgSendObjU64Fn)dlsym(objc, "objc_msgSend");
+    ChengObjcMsgSendU64Fn msg_u64 =
+        (ChengObjcMsgSendU64Fn)dlsym(objc, "objc_msgSend");
+    ChengObjcMsgSendI64Fn msg_i64 =
+        (ChengObjcMsgSendI64Fn)dlsym(objc, "objc_msgSend");
+    ChengObjectGetClassNameFn class_name =
+        (ChengObjectGetClassNameFn)dlsym(objc, "object_getClassName");
+    ChengAutoreleasePoolPushFn pool_push =
+        (ChengAutoreleasePoolPushFn)dlsym(objc, "objc_autoreleasePoolPush");
+    ChengAutoreleasePoolPopFn pool_pop =
+        (ChengAutoreleasePoolPopFn)dlsym(objc, "objc_autoreleasePoolPop");
+    ChengSelRegisterNameFn sel_register =
+        (ChengSelRegisterNameFn)dlsym(objc, "sel_registerName");
+    if (all_devices == NULL || msg_obj_u64 == NULL || msg_u64 == NULL ||
+        msg_i64 == NULL || class_name == NULL || sel_register == NULL) {
+        dlclose(coreml);
+        dlclose(objc);
+        return;
+    }
+    void* pool = pool_push ? pool_push() : NULL;
+    void* sel_count = sel_register("count");
+    void* sel_object_at_index = sel_register("objectAtIndex:");
+    void* sel_total_core_count = sel_register("totalCoreCount");
+    void* devices = all_devices();
+    if (devices != NULL) {
+        uint64_t device_count = msg_u64(devices, sel_count);
+        uint64_t i = 0;
+        for (i = 0; i < device_count; ++i) {
+            void* device = msg_obj_u64(devices, sel_object_at_index, i);
+            const char* name = device ? class_name(device) : NULL;
+            if (name == NULL) continue;
+            if (strcmp(name, "MLGPUComputeDevice") == 0) {
+                cache->gpu_device_count += 1;
+                continue;
+            }
+            if (strcmp(name, "MLNeuralEngineComputeDevice") == 0) {
+                int64_t cores = msg_i64(device, sel_total_core_count);
+                cache->npu_device_count += 1;
+                if (cores > 0 && cores <= INT32_MAX) {
+                    cache->npu_core_count += (int32_t)cores;
+                }
+            }
+        }
+    }
+    if (pool_pop != NULL && pool != NULL) pool_pop(pool);
+    dlclose(coreml);
+    dlclose(objc);
+#else
+    (void)cache;
+#endif
+}
+
+static void cheng_v3_probe_hardware_accel_once(void) {
+    if (cheng_v3_hardware_accel_cache.initialized) return;
+    cheng_v3_hardware_accel_cache.initialized = 1;
+    cheng_v3_hardware_accel_cache.gpu_device_count = cheng_v3_system_profiler_gpu_device_count();
+    cheng_v3_hardware_accel_cache.gpu_core_count = cheng_v3_system_profiler_gpu_core_count();
+    cheng_v3_probe_coreml_accelerators(&cheng_v3_hardware_accel_cache);
+}
+
+int32_t cheng_v3_system_cpu_logical_cores_bridge(void) {
+#if !defined(_WIN32) && !defined(__ANDROID__)
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    if (ncpu > 0 && ncpu <= INT32_MAX) return (int32_t)ncpu;
+#endif
+    return 0;
+}
+
+int64_t cheng_v3_system_memory_total_bytes_bridge(void) {
+#if defined(__APPLE__)
+    uint64_t mem = 0;
+    size_t size = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &size, NULL, 0) == 0) {
+        return (int64_t)mem;
+    }
+#endif
+    return 0;
+}
+
+int64_t cheng_v3_system_memory_available_bytes_bridge(void) {
+#if defined(__APPLE__)
+    vm_statistics64_data_t vmstat;
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS) return 0;
+    if (host_statistics64(mach_host_self(),
+                          HOST_VM_INFO64,
+                          (host_info64_t)&vmstat,
+                          &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    uint64_t pages = (uint64_t)vmstat.free_count +
+                     (uint64_t)vmstat.inactive_count +
+                     (uint64_t)vmstat.speculative_count;
+    return (int64_t)(pages * (uint64_t)page_size);
+#else
+    return 0;
+#endif
+}
+
+int64_t cheng_v3_system_disk_total_bytes_bridge(void) {
+#if !defined(_WIN32)
+    struct statvfs fsinfo;
+    if (statvfs("/", &fsinfo) == 0) {
+        return (int64_t)((uint64_t)fsinfo.f_blocks * (uint64_t)fsinfo.f_frsize);
+    }
+#endif
+    return 0;
+}
+
+int64_t cheng_v3_system_disk_available_bytes_bridge(void) {
+#if !defined(_WIN32)
+    struct statvfs fsinfo;
+    if (statvfs("/", &fsinfo) == 0) {
+        return (int64_t)((uint64_t)fsinfo.f_bavail * (uint64_t)fsinfo.f_frsize);
+    }
+#endif
+    return 0;
+}
+
+int32_t cheng_v3_system_gpu_device_count_bridge(void) {
+    cheng_v3_probe_hardware_accel_once();
+    return cheng_v3_hardware_accel_cache.gpu_device_count;
+}
+
+int32_t cheng_v3_system_gpu_core_count_bridge(void) {
+    cheng_v3_probe_hardware_accel_once();
+    return cheng_v3_hardware_accel_cache.gpu_core_count;
+}
+
+int32_t cheng_v3_system_npu_device_count_bridge(void) {
+    cheng_v3_probe_hardware_accel_once();
+    return cheng_v3_hardware_accel_cache.npu_device_count;
+}
+
+int32_t cheng_v3_system_npu_core_count_bridge(void) {
+    cheng_v3_probe_hardware_accel_once();
+    return cheng_v3_hardware_accel_cache.npu_core_count;
+}
+
 #if !defined(_WIN32)
 extern char** environ;
 #endif
@@ -10282,6 +12101,17 @@ int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* env
     (void)workingDir;
     (void)timeoutSec;
     return -1;
+#elif defined(__ANDROID__)
+    char** argv = NULL;
+    char** envp = NULL;
+    int64_t rc = -1;
+    if (!filePath || !filePath[0]) return -1;
+    if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
+        return -1;
+    }
+    rc = cheng_exec_file_status_fork(filePath, argv, envp, workingDir, timeoutSec);
+    cheng_exec_free_argv_env(argv, envp);
+    return rc;
 #else
     char** argv = NULL;
     char** envp = NULL;

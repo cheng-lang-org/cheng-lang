@@ -1,0 +1,1357 @@
+import std/result
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/lang/parser
+import cheng/v3/backend/system_link_plan as slplan
+
+const
+    v3CompilerCsgNodeKindPackage: int32 = 1
+    v3CompilerCsgNodeKindModule: int32 = 2
+    v3CompilerCsgNodeKindSymbol: int32 = 3
+    v3CompilerCsgNodeKindLayout: int32 = 4
+    v3CompilerCsgNodeKindEffect: int32 = 5
+    v3CompilerCsgNodeKindCapability: int32 = 6
+
+    v3CompilerCsgEdgeKindContains: int32 = 1
+    v3CompilerCsgEdgeKindImports: int32 = 2
+    v3CompilerCsgEdgeKindHasLayout: int32 = 3
+    v3CompilerCsgEdgeKindHasEffect: int32 = 4
+    v3CompilerCsgEdgeKindHasCapability: int32 = 5
+
+    v3CompilerCsgEffectPure: int32 = 1
+    v3CompilerCsgEffectProgramEntry: int32 = 2
+
+    v3CompilerCsgCapabilityInternal: int32 = 1
+    v3CompilerCsgCapabilityEntrypoint: int32 = 2
+
+type
+    V3CompilerCsgImportPair =
+        ownerModulePath: str
+        targetModulePath: str
+
+    V3CompilerCsgNode =
+        nodeId: int32
+        nodeKind: int32
+        ownerNodeId: int32
+        modulePath: str
+        symbolText: str
+        factText: str
+        resultLayoutKind: int32
+        effectKind: int32
+        capabilityKind: int32
+        callConv: int32
+        entryFlag: int32
+        factCid: layout.FixedBytes32
+
+    V3CompilerCsgEdge =
+        edgeId: int32
+        fromNodeId: int32
+        toNodeId: int32
+        edgeKind: int32
+        edgeCid: layout.FixedBytes32
+
+    V3CompilerCsg =
+        version: int32
+        packageId: str
+        sourceBundleCid: layout.FixedBytes32
+        nodeCount: int32
+        edgeCount: int32
+        nodes: V3CompilerCsgNode[]
+        edges: V3CompilerCsgEdge[]
+        canonicalGraphCid: layout.FixedBytes32
+        graphCid: layout.FixedBytes32
+
+    V3CsgExportSurface =
+        version: int32
+        packageId: str
+        exportedSymbolCount: int32
+        exportedSymbols: str[]
+        exportedLayouts: int32[]
+        exportedEffects: int32[]
+        exportedCapabilities: int32[]
+        surfaceCid: layout.FixedBytes32
+
+    V3CompileReceipt =
+        version: int32
+        worldHeadCid: layout.FixedBytes32
+        compilerCsgCid: layout.FixedBytes32
+        canonicalCompilerCsgCid: layout.FixedBytes32
+        targetTriple: str
+        outputDigest: layout.FixedBytes32
+        canonicalOutputDigest: layout.FixedBytes32
+        bootstrapStage: str
+        runtimeProviderSet: str[]
+        receiptCid: layout.FixedBytes32
+
+    V3CompilerCsgSourceText =
+        sourcePath: str
+        modulePath: str
+        text: str
+
+    V3CompilerLegacySourceUnit =
+        sourcePath: str
+        modulePath: str
+        legacyText: str
+        migratedText: str
+
+    V3CompilerLegacyMigration =
+        version: int32
+        packageId: str
+        entrySourcePath: str
+        entryModulePath: str
+        unitCount: int32
+        appliedRuleCount: int32
+        appliedRules: str[]
+        legacySourceBundleCid: layout.FixedBytes32
+        migratedSourceBundleCid: layout.FixedBytes32
+        compilerCsg: V3CompilerCsg
+        exportSurface: V3CsgExportSurface
+        migrationCid: layout.FixedBytes32
+
+fn v3CompilerCsgAppendText(buf: var layout.ByteBuf, text: str) =
+    lt.v3AppendU32BE(buf, len(text))
+    for i in 0..<len(text):
+        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn v3CompilerCsgHashNode(nodeKind: int32,
+                         ownerNodeId: int32,
+                         modulePath: str,
+                         symbolText: str,
+                         factText: str,
+                         resultLayoutKind: int32,
+                         effectKind: int32,
+                         capabilityKind: int32,
+                         callConv: int32,
+                         entryFlag: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(buf, "v3.compiler.csg.node")
+    lt.v3AppendU32BE(buf, nodeKind)
+    lt.v3AppendU32BE(buf, ownerNodeId)
+    v3CompilerCsgAppendText(buf, modulePath)
+    v3CompilerCsgAppendText(buf, symbolText)
+    v3CompilerCsgAppendText(buf, factText)
+    lt.v3AppendU32BE(buf, resultLayoutKind)
+    lt.v3AppendU32BE(buf, effectKind)
+    lt.v3AppendU32BE(buf, capabilityKind)
+    lt.v3AppendU32BE(buf, callConv)
+    lt.v3AppendU32BE(buf, entryFlag)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerCsgHashEdge(fromNodeId: int32,
+                         toNodeId: int32,
+                         edgeKind: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(96)
+    v3CompilerCsgAppendText(buf, "v3.compiler.csg.edge")
+    lt.v3AppendU32BE(buf, fromNodeId)
+    lt.v3AppendU32BE(buf, toNodeId)
+    lt.v3AppendU32BE(buf, edgeKind)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerCsgGraphCid(packageId: str,
+                         sourceBundleCid: layout.FixedBytes32,
+                         nodes: V3CompilerCsgNode[],
+                         edges: V3CompilerCsgEdge[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(512)
+    v3CompilerCsgAppendText(buf, "v3.compiler.csg.graph")
+    v3CompilerCsgAppendText(buf, packageId)
+    lt.v3AppendFixed32(buf, sourceBundleCid)
+    lt.v3AppendU32BE(buf, nodes.len)
+    for i in 0..<nodes.len:
+        let node = nodes[i]
+        lt.v3AppendU32BE(buf, node.nodeId)
+        lt.v3AppendU32BE(buf, node.nodeKind)
+        lt.v3AppendU32BE(buf, node.ownerNodeId)
+        v3CompilerCsgAppendText(buf, node.modulePath)
+        v3CompilerCsgAppendText(buf, node.symbolText)
+        v3CompilerCsgAppendText(buf, node.factText)
+        lt.v3AppendU32BE(buf, node.resultLayoutKind)
+        lt.v3AppendU32BE(buf, node.effectKind)
+        lt.v3AppendU32BE(buf, node.capabilityKind)
+        lt.v3AppendU32BE(buf, node.callConv)
+        lt.v3AppendU32BE(buf, node.entryFlag)
+        lt.v3AppendFixed32(buf, node.factCid)
+    lt.v3AppendU32BE(buf, edges.len)
+    for i in 0..<edges.len:
+        let edge = edges[i]
+        lt.v3AppendU32BE(buf, edge.edgeId)
+        lt.v3AppendU32BE(buf, edge.fromNodeId)
+        lt.v3AppendU32BE(buf, edge.toNodeId)
+        lt.v3AppendU32BE(buf, edge.edgeKind)
+        lt.v3AppendFixed32(buf, edge.edgeCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerCsgCanonicalGraphCid(packageId: str,
+                                  nodes: V3CompilerCsgNode[],
+                                  edges: V3CompilerCsgEdge[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(512)
+    v3CompilerCsgAppendText(buf, "v3.compiler.csg.canonical_graph")
+    v3CompilerCsgAppendText(buf, packageId)
+    lt.v3AppendU32BE(buf, nodes.len)
+    for i in 0..<nodes.len:
+        let node = nodes[i]
+        lt.v3AppendU32BE(buf, node.nodeId)
+        lt.v3AppendU32BE(buf, node.nodeKind)
+        lt.v3AppendU32BE(buf, node.ownerNodeId)
+        v3CompilerCsgAppendText(buf, node.modulePath)
+        v3CompilerCsgAppendText(buf, node.symbolText)
+        v3CompilerCsgAppendText(buf, node.factText)
+        lt.v3AppendU32BE(buf, node.resultLayoutKind)
+        lt.v3AppendU32BE(buf, node.effectKind)
+        lt.v3AppendU32BE(buf, node.capabilityKind)
+        lt.v3AppendU32BE(buf, node.callConv)
+        lt.v3AppendU32BE(buf, node.entryFlag)
+        lt.v3AppendFixed32(buf, node.factCid)
+    lt.v3AppendU32BE(buf, edges.len)
+    for i in 0..<edges.len:
+        let edge = edges[i]
+        lt.v3AppendU32BE(buf, edge.edgeId)
+        lt.v3AppendU32BE(buf, edge.fromNodeId)
+        lt.v3AppendU32BE(buf, edge.toNodeId)
+        lt.v3AppendU32BE(buf, edge.edgeKind)
+        lt.v3AppendFixed32(buf, edge.edgeCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerCsgAddUnique(items: var str[],
+                          text: str) =
+    for i in 0..<items.len:
+        if items[i] == text:
+            return
+    add(items, text)
+
+fn v3CompilerCsgStrLess(left: str,
+                        right: str): bool =
+    if left == right:
+        return false
+    let leftLen = len(left)
+    let rightLen = len(right)
+    let sharedLen = leftLen < rightLen ? leftLen : rightLen
+    for i in 0..<sharedLen:
+        if left[i] == right[i]:
+            continue
+        return left[i] < right[i]
+    return leftLen < rightLen
+
+fn v3CompilerCsgSortStrs(items: var str[]) =
+    if items.len <= 1:
+        return
+    var i = 1
+    while i < items.len:
+        let value = items[i]
+        var j = i
+        while j > 0:
+            if !v3CompilerCsgStrLess(value, items[j - 1]):
+                break
+            items[j] = items[j - 1]
+            j = j - 1
+        items[j] = value
+        i = i + 1
+
+fn v3CompilerCsgAddUniqueImportPair(pairs: var V3CompilerCsgImportPair[],
+                                    ownerModulePath: str,
+                                    targetModulePath: str) =
+    for i in 0..<pairs.len:
+        if pairs[i].ownerModulePath != ownerModulePath:
+            continue
+        if pairs[i].targetModulePath != targetModulePath:
+            continue
+        return
+    add(pairs, V3CompilerCsgImportPair(ownerModulePath: ownerModulePath,
+                                       targetModulePath: targetModulePath))
+
+fn v3CompilerCsgImportPairLess(left: V3CompilerCsgImportPair,
+                               right: V3CompilerCsgImportPair): bool =
+    if left.ownerModulePath != right.ownerModulePath:
+        return v3CompilerCsgStrLess(left.ownerModulePath, right.ownerModulePath)
+    return v3CompilerCsgStrLess(left.targetModulePath, right.targetModulePath)
+
+fn v3CompilerCsgSortImportPairs(pairs: var V3CompilerCsgImportPair[]) =
+    if pairs.len <= 1:
+        return
+    var i = 1
+    while i < pairs.len:
+        let value = pairs[i]
+        var j = i
+        while j > 0:
+            if !v3CompilerCsgImportPairLess(value, pairs[j - 1]):
+                break
+            pairs[j] = pairs[j - 1]
+            j = j - 1
+        pairs[j] = value
+        i = i + 1
+
+fn v3CompilerCsgFunctionNameFromLine(lineRaw: str): str =
+    let line = v3path.v3PathTrim(lineRaw)
+    if !v3path.v3TextStartsWith(line, "fn "):
+        return ""
+    let tail = v3path.v3TextSlice(line, len("fn "), len(line) - len("fn "))
+    let firstToken = parser.v3ParserFirstToken(tail)
+    var stop: int32 = 0
+    for i in 0..<len(firstToken):
+        let ch = firstToken[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower || ch == '_':
+            stop = i + 1
+        else:
+            break
+    if stop <= 0:
+        return ""
+    return v3path.v3TextSlice(firstToken, 0, stop)
+
+fn v3CompilerCsgIsImportcAnnotation(lineRaw: str): bool =
+    let line = v3path.v3PathTrim(lineRaw)
+    return v3path.v3TextStartsWith(line, "@importc")
+
+fn v3CompilerCsgModuleNodeId(nodes: V3CompilerCsgNode[],
+                             modulePath: str): int32 =
+    for i in 0..<nodes.len:
+        let node = nodes[i]
+        if node.nodeKind != v3CompilerCsgNodeKindModule:
+            continue
+        if node.modulePath == modulePath:
+            return node.nodeId
+    return -1
+
+fn v3CompilerCsgSymbolExported(functionName: str,
+                               entryFlag: int32): bool =
+    if entryFlag != 0:
+        return true
+    if len(functionName) <= 0:
+        return false
+    let ch = functionName[0]
+    return ch >= 'A' && ch <= 'Z'
+
+fn v3CompilerCsgSourceTextLookup(overrides: V3CompilerCsgSourceText[],
+                                 sourcePath: str,
+                                 out: var str): bool =
+    for i in 0..<overrides.len:
+        if overrides[i].sourcePath != sourcePath:
+            continue
+        out = overrides[i].text
+        return true
+    return false
+
+fn v3CompilerCsgSourceModulePath(workspaceRoot: str,
+                                 packageRoot: str,
+                                 overrides: V3CompilerCsgSourceText[],
+                                 sourcePath: str): str =
+    for i in 0..<overrides.len:
+        if overrides[i].sourcePath != sourcePath:
+            continue
+        if len(overrides[i].modulePath) > 0:
+            return overrides[i].modulePath
+    return parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+
+fn v3CompilerLegacyLineIndentAt(rawLine: str,
+                                stop: int32): str =
+    if stop >= len(rawLine):
+        return rawLine
+    let ch = rawLine[stop]
+    if ch != ' ' && ch != '\t':
+        return v3path.v3TextSlice(rawLine, 0, stop)
+    return v3CompilerLegacyLineIndentAt(rawLine, stop + 1)
+
+fn v3CompilerLegacyLineIndent(rawLine: str): str =
+    return v3CompilerLegacyLineIndentAt(rawLine, 0)
+
+fn v3CompilerLegacyFindMatchingBracket(text: str,
+                                       openIndex: int32): int32 =
+    return v3CompilerLegacyFindMatchingBracketStep(text, openIndex, 0)
+
+fn v3CompilerLegacyFindMatchingBracketStep(text: str,
+                                           index: int32,
+                                           depth: int32): int32 =
+    if index >= len(text):
+        return -1
+    let ch = text[index]
+    if ch == '[':
+        return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, depth + 1)
+    if ch == ']':
+        let nextDepth = depth - 1
+        if nextDepth == 0:
+            return index
+        return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, nextDepth)
+    return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, depth)
+
+fn v3CompilerLegacyTopLevelComma(text: str): int32 =
+    return v3CompilerLegacyTopLevelCommaStep(text, 0, 0)
+
+fn v3CompilerLegacyTopLevelCommaStep(text: str,
+                                     index: int32,
+                                     depth: int32): int32 =
+    if index >= len(text):
+        return -1
+    let ch = text[index]
+    if ch == '[':
+        return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth + 1)
+    if ch == ']':
+        return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth - 1)
+    if ch == ',':
+        if depth == 0:
+            return index
+    return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth)
+
+fn v3CompilerLegacyRewriteSeqTypes(textRaw: str,
+                                   outAppliedCount: var int32): str =
+    var text = textRaw
+    outAppliedCount = 0
+    var i = 0
+    while i < len(text):
+        if i + 4 > len(text):
+            break
+        if v3path.v3TextSlice(text, i, 4) != "seq[":
+            i = i + 1
+            continue
+        let closePos = v3CompilerLegacyFindMatchingBracket(text, i + 3)
+        if closePos <= i + 3:
+            i = i + 1
+            continue
+        let inner = v3path.v3TextSlice(text, i + 4, closePos - (i + 4))
+        let replacement = strutil.strip(inner) + "[]"
+        text = v3path.v3TextSlice(text, 0, i) +
+               replacement +
+               v3path.v3TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        outAppliedCount = outAppliedCount + 1
+        i = i + len(replacement)
+    return text
+
+fn v3CompilerLegacyRewriteArrayTypes(textRaw: str,
+                                     outAppliedCount: var int32): str =
+    var text = textRaw
+    outAppliedCount = 0
+    var i = 0
+    while i < len(text):
+        if i + 6 > len(text):
+            break
+        if v3path.v3TextSlice(text, i, 6) != "array[":
+            i = i + 1
+            continue
+        let closePos = v3CompilerLegacyFindMatchingBracket(text, i + 5)
+        if closePos <= i + 5:
+            i = i + 1
+            continue
+        let inner = v3path.v3TextSlice(text, i + 6, closePos - (i + 6))
+        let commaPos = v3CompilerLegacyTopLevelComma(inner)
+        if commaPos <= 0:
+            i = i + 1
+            continue
+        let elemText = strutil.strip(v3path.v3TextSlice(inner, 0, commaPos))
+        let lenText = strutil.strip(v3path.v3TextSlice(inner, commaPos + 1, len(inner) - (commaPos + 1)))
+        let replacement = elemText + "[" + lenText + "]"
+        text = v3path.v3TextSlice(text, 0, i) +
+               replacement +
+               v3path.v3TextSlice(text, closePos + 1, len(text) - (closePos + 1))
+        outAppliedCount = outAppliedCount + 1
+        i = i + len(replacement)
+    return text
+
+fn v3CompilerLegacyNormalizeText(textRaw: str,
+                                 outAppliedRules: var str[],
+                                 outAppliedCount: var int32): str =
+    outAppliedRules = []
+    outAppliedCount = 0
+    var text = textRaw
+    let elseIfText = strutil.replace(text, "else if", "elif")
+    if elseIfText != text:
+        v3CompilerCsgAddUnique(outAppliedRules, "else_if_to_elif")
+        outAppliedCount = outAppliedCount + 1
+        text = elseIfText
+    let atListText = strutil.replace(text, "@[]", "[]")
+    if atListText != text:
+        v3CompilerCsgAddUnique(outAppliedRules, "at_list_to_list")
+        outAppliedCount = outAppliedCount + 1
+        text = atListText
+    var seqApplied = 0
+    text = v3CompilerLegacyRewriteSeqTypes(text, seqApplied)
+    if seqApplied > 0:
+        v3CompilerCsgAddUnique(outAppliedRules, "seq_type_to_suffix")
+        outAppliedCount = outAppliedCount + seqApplied
+    var arrayApplied = 0
+    text = v3CompilerLegacyRewriteArrayTypes(text, arrayApplied)
+    if arrayApplied > 0:
+        v3CompilerCsgAddUnique(outAppliedRules, "array_type_to_suffix")
+        outAppliedCount = outAppliedCount + arrayApplied
+    let lines = parser.v3ParserSplitChar(text, '\n')
+    var out = ""
+    for i in 0..<lines.len:
+        var line = lines[i]
+        let trimmed = v3path.v3PathTrim(line)
+        let indent = v3CompilerLegacyLineIndent(line)
+        if v3path.v3TextStartsWith(trimmed, "proc "):
+            v3CompilerCsgAddUnique(outAppliedRules, "proc_to_fn")
+            outAppliedCount = outAppliedCount + 1
+            line = indent + "fn " + v3path.v3TextSlice(trimmed, len("proc "), len(trimmed) - len("proc "))
+        elif v3path.v3TextStartsWith(trimmed, "method "):
+            v3CompilerCsgAddUnique(outAppliedRules, "method_to_fn")
+            outAppliedCount = outAppliedCount + 1
+            line = indent + "fn " + v3path.v3TextSlice(trimmed, len("method "), len(trimmed) - len("method "))
+        elif v3path.v3TextStartsWith(trimmed, "converter "):
+            v3CompilerCsgAddUnique(outAppliedRules, "converter_to_fn")
+            outAppliedCount = outAppliedCount + 1
+            line = indent + "fn " + v3path.v3TextSlice(trimmed, len("converter "), len(trimmed) - len("converter "))
+        if i > 0:
+            out = out + "\n"
+        out = out + line
+    return out
+
+fn v3CompilerLegacyPackageId(modulePathRaw: str): str =
+    let parts = parser.v3ParserSplitChar(v3path.v3PathTrim(modulePathRaw), '/')
+    if parts.len >= 2:
+        return parts[0] + "/" + parts[1]
+    if parts.len == 1:
+        return parts[0]
+    return "legacy"
+
+fn v3CompilerCsgAddUniqueImportEdge(edges: var parser.V3ImportEdge[],
+                                    edge: parser.V3ImportEdge) =
+    for i in 0..<edges.len:
+        if edges[i].ownerModulePath != edge.ownerModulePath:
+            continue
+        if edges[i].targetModulePath != edge.targetModulePath:
+            continue
+        return
+    add(edges, edge)
+
+fn v3CompilerLegacyCollectClosure(workspaceRoot: str,
+                                  packageRoot: str,
+                                  sourcePathRaw: str,
+                                  entryModulePathOverride: str,
+                                  seen: var str[],
+                                  units: var V3CompilerLegacySourceUnit[],
+                                  ownerModulePaths: var str[],
+                                  importEdges: var parser.V3ImportEdge[],
+                                  outAppliedRules: var str[],
+                                  outAppliedCount: var int32,
+                                  unresolvedImportCount: var int32,
+                                  err: var str): bool =
+    let sourcePath = v3path.v3PathTrim(sourcePathRaw)
+    if sourcePath == "":
+        err = "v3 compiler migration: missing legacy source path"
+        return false
+    for i in 0..<seen.len:
+        if seen[i] == sourcePath:
+            err = ""
+            return true
+    if !v3path.v3PathFileExists(sourcePath):
+        err = "v3 compiler migration: missing legacy source: " + sourcePath
+        return false
+    add(seen, sourcePath)
+    let legacyText = v3path.v3ReadTextFile("", sourcePath)
+    var localRules: str[]
+    var localAppliedCount = 0
+    let migratedText = v3CompilerLegacyNormalizeText(legacyText, localRules, localAppliedCount)
+    var modulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    if len(entryModulePathOverride) > 0:
+        if sourcePath == seen[0]:
+            modulePath = entryModulePathOverride
+    var unit: V3CompilerLegacySourceUnit
+    unit.sourcePath = sourcePath
+    unit.modulePath = modulePath
+    unit.legacyText = legacyText
+    unit.migratedText = migratedText
+    add(units, unit)
+    v3CompilerCsgAddUnique(ownerModulePaths, modulePath)
+    for i in 0..<localRules.len:
+        v3CompilerCsgAddUnique(outAppliedRules, localRules[i])
+    outAppliedCount = outAppliedCount + localAppliedCount
+    var localEdges: parser.V3ImportEdge[]
+    if !parser.v3ParserReadImportEdges(workspaceRoot, packageRoot, modulePath, migratedText, localEdges, err):
+        return false
+    for i in 0..<localEdges.len:
+        let edge = localEdges[i]
+        v3CompilerCsgAddUniqueImportEdge(importEdges, edge)
+        if edge.resolved:
+            v3CompilerCsgAddUnique(ownerModulePaths, edge.targetModulePath)
+            if !v3CompilerLegacyCollectClosure(workspaceRoot,
+                                               packageRoot,
+                                               edge.targetSourcePath,
+                                               "",
+                                               seen,
+                                               units,
+                                               ownerModulePaths,
+                                               importEdges,
+                                               outAppliedRules,
+                                               outAppliedCount,
+                                               unresolvedImportCount,
+                                               err):
+                return false
+        else:
+            unresolvedImportCount = unresolvedImportCount + 1
+    err = ""
+    return true
+
+fn v3CompilerLegacyFindUnitText(units: V3CompilerLegacySourceUnit[],
+                                sourcePath: str,
+                                out: var str): bool =
+    for i in 0..<units.len:
+        if units[i].sourcePath != sourcePath:
+            continue
+        out = units[i].migratedText
+        return true
+    return false
+
+fn v3CompilerLegacyBuildPlan(workspaceRoot: str,
+                             packageRoot: str,
+                             entrySourcePath: str,
+                             packageId: str,
+                             units: V3CompilerLegacySourceUnit[],
+                             ownerModulePaths: str[],
+                             importEdges: parser.V3ImportEdge[],
+                             unresolvedImportCount: int32,
+                             out: var slplan.V3SystemLinkPlanStub): bool =
+    let entryModulePath = units.len > 0 ? units[0].modulePath : parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, entrySourcePath)
+    out.entryPath = entrySourcePath
+    out.outputPath = ""
+    out.targetTriple = "arm64-apple-darwin"
+    out.emitKind = creq.v3EmitExe
+    out.packageRoot = packageRoot
+    out.workspaceRoot = workspaceRoot
+    out.packageId = packageId
+    out.moduleStem = parser.v3ParserFileStem(entrySourcePath)
+    out.moduleKind = entryModulePath == "cheng/v3/tooling/compiler_main" ? slplan.v3SystemCompilerControlPlane : slplan.v3SystemOrdinaryProgram
+    out.sourceClosurePaths = []
+    for i in 0..<units.len:
+        add(out.sourceClosurePaths, units[i].sourcePath)
+    out.ownerModulePaths = ownerModulePaths
+    out.importEdges = importEdges
+    out.importEdgeCount = importEdges.len
+    out.unresolvedImportCount = unresolvedImportCount
+    out.hasCompilerTopLevel = true
+    var entryText = ""
+    let foundEntryText = v3CompilerLegacyFindUnitText(units, entrySourcePath, entryText)
+    out.mainFunctionPresent = foundEntryText && parser.v3ParserMainFunctionPresent(entryText)
+    if out.moduleKind == slplan.v3SystemCompilerControlPlane:
+        out.runtimeTargets = ["runtime/compiler.tooling_argv_entry"]
+    else:
+        out.runtimeTargets = ["runtime/compiler.program_argv_entry"]
+    out.providerModules = ["runtime/compiler_runtime_v3", "runtime/core_runtime_v3", "runtime/program_support_v3"]
+    out.entrySymbol = out.mainFunctionPresent ? "main" : ""
+    out.missingReasons = []
+    out.parserSyntaxTag = "v3.legacy_migrated_source"
+    out.parserSourceKind = 1
+    out.buildEntryPath = entrySourcePath
+    out.buildSourceUnitCount = units.len
+    out.linkMode = "system_link"
+    out.pipelineStage = "legacy_source_to_canonical_csg"
+    return true
+
+fn v3BuildCompilerLegacyMigration(workspaceRoot: str,
+                                  packageRoot: str,
+                                  entrySourcePath: str,
+                                  packageIdHint: str,
+                                  entryModulePathOverride: str): Result[V3CompilerLegacyMigration] =
+    var seen: str[] = []
+    var units: V3CompilerLegacySourceUnit[] = []
+    var ownerModulePaths: str[] = []
+    var importEdges: parser.V3ImportEdge[] = []
+    var appliedRules: str[] = []
+    var appliedCount = 0
+    var unresolvedImportCount = 0
+    var err = ""
+    if !v3CompilerLegacyCollectClosure(workspaceRoot,
+                                       packageRoot,
+                                       entrySourcePath,
+                                       entryModulePathOverride,
+                                       seen,
+                                       units,
+                                       ownerModulePaths,
+                                       importEdges,
+                                       appliedRules,
+                                       appliedCount,
+                                       unresolvedImportCount,
+                                       err):
+        return Err[V3CompilerLegacyMigration](err)
+    v3CompilerCsgSortStrs(ownerModulePaths)
+    var legacySourcePaths: str[] = []
+    var legacyTexts: str[] = []
+    var migratedSourcePaths: str[] = []
+    var migratedTexts: str[] = []
+    for i in 0..<units.len:
+        add(legacySourcePaths, units[i].sourcePath)
+        add(legacyTexts, units[i].legacyText)
+        add(migratedSourcePaths, units[i].sourcePath)
+        add(migratedTexts, units[i].migratedText)
+    let packageId = len(packageIdHint) > 0 ? packageIdHint : v3CompilerLegacyPackageId(units[0].modulePath)
+    let legacyBundleRes = cworld.v3CompilerWorldSourceBundleCidFromTexts(packageId, legacySourcePaths, legacyTexts)
+    if IsErr(legacyBundleRes):
+        return Err[V3CompilerLegacyMigration](Error(legacyBundleRes))
+    let migratedBundleRes = cworld.v3CompilerWorldSourceBundleCidFromTexts(packageId, migratedSourcePaths, migratedTexts)
+    if IsErr(migratedBundleRes):
+        return Err[V3CompilerLegacyMigration](Error(migratedBundleRes))
+    var plan: slplan.V3SystemLinkPlanStub
+    if !v3CompilerLegacyBuildPlan(workspaceRoot,
+                                  packageRoot,
+                                  entrySourcePath,
+                                  packageId,
+                                  units,
+                                  ownerModulePaths,
+                                  importEdges,
+                                  unresolvedImportCount,
+                                  plan):
+        return Err[V3CompilerLegacyMigration]("v3 compiler migration: failed to build legacy plan")
+    var overrides: V3CompilerCsgSourceText[] = []
+    for i in 0..<units.len:
+        var override: V3CompilerCsgSourceText
+        override.sourcePath = units[i].sourcePath
+        override.modulePath = units[i].modulePath
+        override.text = units[i].migratedText
+        add(overrides, override)
+    let csgRes = v3BuildCompilerCsgWithOverrides(plan, Value(migratedBundleRes), overrides)
+    if IsErr(csgRes):
+        return Err[V3CompilerLegacyMigration](Error(csgRes))
+    let csg = Value(csgRes)
+    let surface = v3CompilerExportSurfaceFromCsg(csg)
+    var migBuf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(migBuf, "v3.compiler.legacy_migration")
+    v3CompilerCsgAppendText(migBuf, packageId)
+    v3CompilerCsgAppendText(migBuf, entrySourcePath)
+    lt.v3AppendFixed32(migBuf, Value(legacyBundleRes))
+    lt.v3AppendFixed32(migBuf, Value(migratedBundleRes))
+    lt.v3AppendFixed32(migBuf, csg.canonicalGraphCid)
+    lt.v3AppendFixed32(migBuf, surface.surfaceCid)
+    lt.v3AppendU32BE(migBuf, appliedRules.len)
+    for i in 0..<appliedRules.len:
+        v3CompilerCsgAppendText(migBuf, appliedRules[i])
+    var out: V3CompilerLegacyMigration
+    out.version = 1
+    out.packageId = packageId
+    out.entrySourcePath = entrySourcePath
+    out.entryModulePath = units[0].modulePath
+    out.unitCount = units.len
+    out.appliedRuleCount = appliedCount
+    out.appliedRules = appliedRules
+    out.legacySourceBundleCid = Value(legacyBundleRes)
+    out.migratedSourceBundleCid = Value(migratedBundleRes)
+    out.compilerCsg = csg
+    out.exportSurface = surface
+    out.migrationCid = lt.v3FixedCidFromBuf(migBuf)
+    return Ok[V3CompilerLegacyMigration](out)
+
+fn v3CompilerLegacyMigrationReport(migration: V3CompilerLegacyMigration): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "package_id=" + migration.packageId + "\n"
+    out = out + "entry_source_path=" + migration.entrySourcePath + "\n"
+    out = out + "entry_module_path=" + migration.entryModulePath + "\n"
+    out = out + "unit_count=" + intToStr(migration.unitCount) + "\n"
+    out = out + "applied_rule_count=" + intToStr(migration.appliedRuleCount) + "\n"
+    out = out + "legacy_source_bundle_cid=" + layout.fixedBytes32Hex(migration.legacySourceBundleCid) + "\n"
+    out = out + "migrated_source_bundle_cid=" + layout.fixedBytes32Hex(migration.migratedSourceBundleCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(migration.compilerCsg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.fixedBytes32Hex(migration.compilerCsg.graphCid) + "\n"
+    out = out + "surface_cid=" + layout.fixedBytes32Hex(migration.exportSurface.surfaceCid) + "\n"
+    out = out + "migration_cid=" + layout.fixedBytes32Hex(migration.migrationCid)
+    for i in 0..<migration.appliedRules.len:
+        out = out + "\n" + "applied_rule[" + intToStr(i) + "]=" + migration.appliedRules[i]
+    return out
+
+fn v3CompilerCsgAddNode(nodes: var V3CompilerCsgNode[],
+                        nodeKind: int32,
+                        ownerNodeId: int32,
+                        modulePath: str,
+                        symbolText: str,
+                        factText: str,
+                        resultLayoutKind: int32,
+                        effectKind: int32,
+                        capabilityKind: int32,
+                        callConv: int32,
+                        entryFlag: int32): int32 =
+    var node: V3CompilerCsgNode
+    node.nodeId = nodes.len + 1
+    node.nodeKind = nodeKind
+    node.ownerNodeId = ownerNodeId
+    node.modulePath = modulePath
+    node.symbolText = symbolText
+    node.factText = factText
+    node.resultLayoutKind = resultLayoutKind
+    node.effectKind = effectKind
+    node.capabilityKind = capabilityKind
+    node.callConv = callConv
+    node.entryFlag = entryFlag
+    node.factCid = v3CompilerCsgHashNode(nodeKind,
+                                         ownerNodeId,
+                                         modulePath,
+                                         symbolText,
+                                         factText,
+                                         resultLayoutKind,
+                                         effectKind,
+                                         capabilityKind,
+                                         callConv,
+                                         entryFlag)
+    add(nodes, node)
+    return node.nodeId
+
+fn v3CompilerCsgAddEdge(edges: var V3CompilerCsgEdge[],
+                        fromNodeId: int32,
+                        toNodeId: int32,
+                        edgeKind: int32) =
+    var edge: V3CompilerCsgEdge
+    edge.edgeId = edges.len + 1
+    edge.fromNodeId = fromNodeId
+    edge.toNodeId = toNodeId
+    edge.edgeKind = edgeKind
+    edge.edgeCid = v3CompilerCsgHashEdge(fromNodeId, toNodeId, edgeKind)
+    add(edges, edge)
+
+fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
+                                   sourceBundleCid: layout.FixedBytes32,
+                                   sourceTextOverrides: V3CompilerCsgSourceText[]): Result[V3CompilerCsg] =
+    var modules: str[] = []
+    var importPairs: V3CompilerCsgImportPair[] = []
+    for i in 0..<linkPlan.ownerModulePaths.len:
+        v3CompilerCsgAddUnique(modules, linkPlan.ownerModulePaths[i])
+    for i in 0..<linkPlan.importEdges.len:
+        v3CompilerCsgAddUnique(modules, linkPlan.importEdges[i].ownerModulePath)
+        if linkPlan.importEdges[i].resolved:
+            v3CompilerCsgAddUnique(modules, linkPlan.importEdges[i].targetModulePath)
+            v3CompilerCsgAddUniqueImportPair(importPairs,
+                                             linkPlan.importEdges[i].ownerModulePath,
+                                             linkPlan.importEdges[i].targetModulePath)
+    v3CompilerCsgSortStrs(modules)
+    v3CompilerCsgSortImportPairs(importPairs)
+    var nodes: V3CompilerCsgNode[] = []
+    var edges: V3CompilerCsgEdge[] = []
+    var packageNode: V3CompilerCsgNode
+    packageNode.nodeId = nodes.len + 1
+    packageNode.nodeKind = v3CompilerCsgNodeKindPackage
+    packageNode.ownerNodeId = 0
+    packageNode.modulePath = ""
+    packageNode.symbolText = ""
+    packageNode.factText = linkPlan.packageId
+    packageNode.resultLayoutKind = 0
+    packageNode.effectKind = 0
+    packageNode.capabilityKind = 0
+    packageNode.callConv = 0
+    packageNode.entryFlag = 0
+    var packageBuf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(packageBuf, "v3.compiler.csg.node")
+    lt.v3AppendU32BE(packageBuf, packageNode.nodeKind)
+    lt.v3AppendU32BE(packageBuf, packageNode.ownerNodeId)
+    v3CompilerCsgAppendText(packageBuf, packageNode.modulePath)
+    v3CompilerCsgAppendText(packageBuf, packageNode.symbolText)
+    v3CompilerCsgAppendText(packageBuf, packageNode.factText)
+    lt.v3AppendU32BE(packageBuf, packageNode.resultLayoutKind)
+    lt.v3AppendU32BE(packageBuf, packageNode.effectKind)
+    lt.v3AppendU32BE(packageBuf, packageNode.capabilityKind)
+    lt.v3AppendU32BE(packageBuf, packageNode.callConv)
+    lt.v3AppendU32BE(packageBuf, packageNode.entryFlag)
+    packageNode.factCid = lt.v3FixedCidFromBuf(packageBuf)
+    add(nodes, packageNode)
+    let packageNodeId = packageNode.nodeId
+    for i in 0..<modules.len:
+        var moduleNode: V3CompilerCsgNode
+        moduleNode.nodeId = nodes.len + 1
+        moduleNode.nodeKind = v3CompilerCsgNodeKindModule
+        moduleNode.ownerNodeId = packageNodeId
+        moduleNode.modulePath = modules[i]
+        moduleNode.symbolText = ""
+        moduleNode.factText = modules[i]
+        moduleNode.resultLayoutKind = 0
+        moduleNode.effectKind = 0
+        moduleNode.capabilityKind = 0
+        moduleNode.callConv = 0
+        moduleNode.entryFlag = 0
+        var moduleBuf: layout.ByteBuf = layout.byteBufInit(256)
+        v3CompilerCsgAppendText(moduleBuf, "v3.compiler.csg.node")
+        lt.v3AppendU32BE(moduleBuf, moduleNode.nodeKind)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.ownerNodeId)
+        v3CompilerCsgAppendText(moduleBuf, moduleNode.modulePath)
+        v3CompilerCsgAppendText(moduleBuf, moduleNode.symbolText)
+        v3CompilerCsgAppendText(moduleBuf, moduleNode.factText)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.resultLayoutKind)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.effectKind)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.capabilityKind)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.callConv)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.entryFlag)
+        moduleNode.factCid = lt.v3FixedCidFromBuf(moduleBuf)
+        add(nodes, moduleNode)
+        let moduleNodeId = moduleNode.nodeId
+        v3CompilerCsgAddEdge(edges, packageNodeId, moduleNodeId, v3CompilerCsgEdgeKindContains)
+    for i in 0..<importPairs.len:
+        let pair = importPairs[i]
+        let fromNodeId = v3CompilerCsgModuleNodeId(nodes, pair.ownerModulePath)
+        let toNodeId = v3CompilerCsgModuleNodeId(nodes, pair.targetModulePath)
+        if fromNodeId <= 0 || toNodeId <= 0:
+            continue
+        v3CompilerCsgAddEdge(edges, fromNodeId, toNodeId, v3CompilerCsgEdgeKindImports)
+    var orderedSources: str[] = []
+    for i in 0..<linkPlan.sourceClosurePaths.len:
+        add(orderedSources, linkPlan.sourceClosurePaths[i])
+    v3CompilerCsgSortStrs(orderedSources)
+    for sourceIndex in 0..<orderedSources.len:
+        let sourcePath = orderedSources[sourceIndex]
+        let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
+                                                            linkPlan.packageRoot,
+                                                            sourceTextOverrides,
+                                                            sourcePath)
+        let ownerModuleNodeId = v3CompilerCsgModuleNodeId(nodes, ownerModulePath)
+        if ownerModuleNodeId <= 0:
+            continue
+        var text = ""
+        if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, text):
+            text = v3path.v3ReadTextFile("", sourcePath)
+        let lines = parser.v3ParserSplitChar(text, '\n')
+        var pendingImportc = false
+        for lineIndex in 0..<lines.len:
+            let line = lines[lineIndex]
+            if v3CompilerCsgIsImportcAnnotation(line):
+                pendingImportc = true
+                continue
+            let functionName = v3CompilerCsgFunctionNameFromLine(line)
+            if len(functionName) <= 0:
+                pendingImportc = false
+                continue
+            if pendingImportc:
+                pendingImportc = false
+                continue
+            let entryFlag = sourcePath == linkPlan.entryPath && functionName == linkPlan.entrySymbol ? 1 : 0
+            let resultLayoutKind = functionName == "main" ? 5 : 0
+            let effectKind = entryFlag != 0 ? v3CompilerCsgEffectProgramEntry : v3CompilerCsgEffectPure
+            let capabilityKind = entryFlag != 0 ? v3CompilerCsgCapabilityEntrypoint : v3CompilerCsgCapabilityInternal
+            let callConv = 1
+            let symbolText = ownerModulePath + "::" + functionName
+            var symbolNode: V3CompilerCsgNode
+            symbolNode.nodeId = nodes.len + 1
+            symbolNode.nodeKind = v3CompilerCsgNodeKindSymbol
+            symbolNode.ownerNodeId = ownerModuleNodeId
+            symbolNode.modulePath = ownerModulePath
+            symbolNode.symbolText = symbolText
+            symbolNode.factText = functionName
+            symbolNode.resultLayoutKind = resultLayoutKind
+            symbolNode.effectKind = effectKind
+            symbolNode.capabilityKind = capabilityKind
+            symbolNode.callConv = callConv
+            symbolNode.entryFlag = entryFlag
+            var symbolBuf: layout.ByteBuf = layout.byteBufInit(256)
+            v3CompilerCsgAppendText(symbolBuf, "v3.compiler.csg.node")
+            lt.v3AppendU32BE(symbolBuf, symbolNode.nodeKind)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.ownerNodeId)
+            v3CompilerCsgAppendText(symbolBuf, symbolNode.modulePath)
+            v3CompilerCsgAppendText(symbolBuf, symbolNode.symbolText)
+            v3CompilerCsgAppendText(symbolBuf, symbolNode.factText)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.resultLayoutKind)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.effectKind)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.capabilityKind)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.callConv)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.entryFlag)
+            symbolNode.factCid = lt.v3FixedCidFromBuf(symbolBuf)
+            add(nodes, symbolNode)
+            let symbolNodeId = symbolNode.nodeId
+            v3CompilerCsgAddEdge(edges, ownerModuleNodeId, symbolNodeId, v3CompilerCsgEdgeKindContains)
+            var layoutNode: V3CompilerCsgNode
+            layoutNode.nodeId = nodes.len + 1
+            layoutNode.nodeKind = v3CompilerCsgNodeKindLayout
+            layoutNode.ownerNodeId = symbolNodeId
+            layoutNode.modulePath = ownerModulePath
+            layoutNode.symbolText = symbolText
+            layoutNode.factText = "layout=" + intToStr(resultLayoutKind)
+            layoutNode.resultLayoutKind = resultLayoutKind
+            layoutNode.effectKind = 0
+            layoutNode.capabilityKind = 0
+            layoutNode.callConv = callConv
+            layoutNode.entryFlag = entryFlag
+            var layoutBuf: layout.ByteBuf = layout.byteBufInit(256)
+            v3CompilerCsgAppendText(layoutBuf, "v3.compiler.csg.node")
+            lt.v3AppendU32BE(layoutBuf, layoutNode.nodeKind)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.ownerNodeId)
+            v3CompilerCsgAppendText(layoutBuf, layoutNode.modulePath)
+            v3CompilerCsgAppendText(layoutBuf, layoutNode.symbolText)
+            v3CompilerCsgAppendText(layoutBuf, layoutNode.factText)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.resultLayoutKind)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.effectKind)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.capabilityKind)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.callConv)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.entryFlag)
+            layoutNode.factCid = lt.v3FixedCidFromBuf(layoutBuf)
+            add(nodes, layoutNode)
+            let layoutNodeId = layoutNode.nodeId
+            v3CompilerCsgAddEdge(edges, symbolNodeId, layoutNodeId, v3CompilerCsgEdgeKindHasLayout)
+            var effectNode: V3CompilerCsgNode
+            effectNode.nodeId = nodes.len + 1
+            effectNode.nodeKind = v3CompilerCsgNodeKindEffect
+            effectNode.ownerNodeId = symbolNodeId
+            effectNode.modulePath = ownerModulePath
+            effectNode.symbolText = symbolText
+            effectNode.factText = "effect=" + intToStr(effectKind)
+            effectNode.resultLayoutKind = resultLayoutKind
+            effectNode.effectKind = effectKind
+            effectNode.capabilityKind = 0
+            effectNode.callConv = callConv
+            effectNode.entryFlag = entryFlag
+            var effectBuf: layout.ByteBuf = layout.byteBufInit(256)
+            v3CompilerCsgAppendText(effectBuf, "v3.compiler.csg.node")
+            lt.v3AppendU32BE(effectBuf, effectNode.nodeKind)
+            lt.v3AppendU32BE(effectBuf, effectNode.ownerNodeId)
+            v3CompilerCsgAppendText(effectBuf, effectNode.modulePath)
+            v3CompilerCsgAppendText(effectBuf, effectNode.symbolText)
+            v3CompilerCsgAppendText(effectBuf, effectNode.factText)
+            lt.v3AppendU32BE(effectBuf, effectNode.resultLayoutKind)
+            lt.v3AppendU32BE(effectBuf, effectNode.effectKind)
+            lt.v3AppendU32BE(effectBuf, effectNode.capabilityKind)
+            lt.v3AppendU32BE(effectBuf, effectNode.callConv)
+            lt.v3AppendU32BE(effectBuf, effectNode.entryFlag)
+            effectNode.factCid = lt.v3FixedCidFromBuf(effectBuf)
+            add(nodes, effectNode)
+            let effectNodeId = effectNode.nodeId
+            v3CompilerCsgAddEdge(edges, symbolNodeId, effectNodeId, v3CompilerCsgEdgeKindHasEffect)
+            var capabilityNode: V3CompilerCsgNode
+            capabilityNode.nodeId = nodes.len + 1
+            capabilityNode.nodeKind = v3CompilerCsgNodeKindCapability
+            capabilityNode.ownerNodeId = symbolNodeId
+            capabilityNode.modulePath = ownerModulePath
+            capabilityNode.symbolText = symbolText
+            capabilityNode.factText = "capability=" + intToStr(capabilityKind)
+            capabilityNode.resultLayoutKind = resultLayoutKind
+            capabilityNode.effectKind = effectKind
+            capabilityNode.capabilityKind = capabilityKind
+            capabilityNode.callConv = callConv
+            capabilityNode.entryFlag = entryFlag
+            var capabilityBuf: layout.ByteBuf = layout.byteBufInit(256)
+            v3CompilerCsgAppendText(capabilityBuf, "v3.compiler.csg.node")
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.nodeKind)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.ownerNodeId)
+            v3CompilerCsgAppendText(capabilityBuf, capabilityNode.modulePath)
+            v3CompilerCsgAppendText(capabilityBuf, capabilityNode.symbolText)
+            v3CompilerCsgAppendText(capabilityBuf, capabilityNode.factText)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.resultLayoutKind)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.effectKind)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.capabilityKind)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.callConv)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.entryFlag)
+            capabilityNode.factCid = lt.v3FixedCidFromBuf(capabilityBuf)
+            add(nodes, capabilityNode)
+            let capabilityNodeId = capabilityNode.nodeId
+            v3CompilerCsgAddEdge(edges, symbolNodeId, capabilityNodeId, v3CompilerCsgEdgeKindHasCapability)
+        pendingImportc = false
+    var out: V3CompilerCsg
+    out.version = 1
+    out.packageId = linkPlan.packageId
+    out.sourceBundleCid = sourceBundleCid
+    out.nodes = nodes
+    out.edges = edges
+    out.nodeCount = nodes.len
+    out.edgeCount = edges.len
+    out.canonicalGraphCid = v3CompilerCsgCanonicalGraphCid(out.packageId, out.nodes, out.edges)
+    out.graphCid = v3CompilerCsgGraphCid(out.packageId, out.sourceBundleCid, out.nodes, out.edges)
+    return Ok[V3CompilerCsg](out)
+
+fn v3BuildCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
+                      sourceBundleCid: layout.FixedBytes32): Result[V3CompilerCsg] =
+    var sourceTextOverrides: V3CompilerCsgSourceText[]
+    sourceTextOverrides = []
+    return v3BuildCompilerCsgWithOverrides(linkPlan, sourceBundleCid, sourceTextOverrides)
+
+fn v3CompilerExportSurfaceFromCsg(csg: V3CompilerCsg): V3CsgExportSurface =
+    var out: V3CsgExportSurface
+    out.version = 1
+    out.packageId = csg.packageId
+    out.exportedSymbols = []
+    out.exportedLayouts = []
+    out.exportedEffects = []
+    out.exportedCapabilities = []
+    for i in 0..<csg.nodes.len:
+        let node = csg.nodes[i]
+        if node.nodeKind != v3CompilerCsgNodeKindSymbol:
+            continue
+        if !v3CompilerCsgSymbolExported(node.factText, node.entryFlag):
+            continue
+        add(out.exportedSymbols, node.symbolText)
+        add(out.exportedLayouts, node.resultLayoutKind)
+        add(out.exportedEffects, node.effectKind)
+        add(out.exportedCapabilities, node.capabilityKind)
+    out.exportedSymbolCount = out.exportedSymbols.len
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(buf, "v3.compiler.export_surface")
+    v3CompilerCsgAppendText(buf, out.packageId)
+    lt.v3AppendU32BE(buf, out.exportedSymbolCount)
+    for i in 0..<out.exportedSymbols.len:
+        v3CompilerCsgAppendText(buf, out.exportedSymbols[i])
+        lt.v3AppendU32BE(buf, out.exportedLayouts[i])
+        lt.v3AppendU32BE(buf, out.exportedEffects[i])
+        lt.v3AppendU32BE(buf, out.exportedCapabilities[i])
+    out.surfaceCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3CompilerExportSurfaceCompatible(base: V3CsgExportSurface,
+                                     next: V3CsgExportSurface): bool =
+    if base.packageId != next.packageId:
+        return false
+    if base.exportedSymbolCount != next.exportedSymbolCount:
+        return false
+    for i in 0..<base.exportedSymbolCount:
+        if base.exportedSymbols[i] != next.exportedSymbols[i]:
+            return false
+        if base.exportedLayouts[i] != next.exportedLayouts[i]:
+            return false
+        if base.exportedEffects[i] != next.exportedEffects[i]:
+            return false
+        if base.exportedCapabilities[i] != next.exportedCapabilities[i]:
+            return false
+    return true
+
+fn v3CompileReceiptMake(worldHeadCid: layout.FixedBytes32,
+                        compilerCsgCid: layout.FixedBytes32,
+                        canonicalCompilerCsgCid: layout.FixedBytes32,
+                        targetTriple: str,
+                        outputDigest: layout.FixedBytes32,
+                        canonicalOutputDigest: layout.FixedBytes32,
+                        bootstrapStage: str,
+                        runtimeProviderSet: str[]): V3CompileReceipt =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(buf, "v3.compiler.compile_receipt")
+    lt.v3AppendFixed32(buf, worldHeadCid)
+    lt.v3AppendFixed32(buf, compilerCsgCid)
+    lt.v3AppendFixed32(buf, canonicalCompilerCsgCid)
+    v3CompilerCsgAppendText(buf, targetTriple)
+    lt.v3AppendFixed32(buf, outputDigest)
+    lt.v3AppendFixed32(buf, canonicalOutputDigest)
+    v3CompilerCsgAppendText(buf, bootstrapStage)
+    lt.v3AppendU32BE(buf, runtimeProviderSet.len)
+    for i in 0..<runtimeProviderSet.len:
+        v3CompilerCsgAppendText(buf, runtimeProviderSet[i])
+    var out: V3CompileReceipt
+    out.version = 1
+    out.worldHeadCid = worldHeadCid
+    out.compilerCsgCid = compilerCsgCid
+    out.canonicalCompilerCsgCid = canonicalCompilerCsgCid
+    out.targetTriple = targetTriple
+    out.outputDigest = outputDigest
+    out.canonicalOutputDigest = canonicalOutputDigest
+    out.bootstrapStage = bootstrapStage
+    out.runtimeProviderSet = runtimeProviderSet
+    out.receiptCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3CompileOutputDigest(outputPath: str,
+                         targetTriple: str,
+                         providerModules: str[],
+                         csgCid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerCsgAppendText(buf, "v3.compiler.output_digest")
+    let _ = outputPath
+    v3CompilerCsgAppendText(buf, targetTriple)
+    lt.v3AppendFixed32(buf, csgCid)
+    lt.v3AppendU32BE(buf, providerModules.len)
+    for i in 0..<providerModules.len:
+        v3CompilerCsgAppendText(buf, providerModules[i])
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerCsgReport(csg: V3CompilerCsg): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "package_id=" + csg.packageId + "\n"
+    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(csg.sourceBundleCid) + "\n"
+    out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
+    out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
+    out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"
+    out = out + "edge_count=" + intToStr(csg.edgeCount)
+    for i in 0..<csg.nodes.len:
+        out = out + "\n" + v3CompilerCsgNodeReportLine(i, csg.nodes[i])
+    for i in 0..<csg.edges.len:
+        out = out + "\n" + v3CompilerCsgEdgeReportLine(i, csg.edges[i])
+    return out
+
+fn v3CompilerCsgNodeReportLine(index: int32,
+                               node: V3CompilerCsgNode): str =
+    var out = ""
+    out = out + "node[" + intToStr(index) + "]="
+    out = out + intToStr(node.nodeKind) + "|"
+    out = out + intToStr(node.ownerNodeId) + "|"
+    out = out + node.modulePath + "|"
+    out = out + node.symbolText + "|"
+    out = out + node.factText + "|"
+    out = out + intToStr(node.resultLayoutKind) + "|"
+    out = out + intToStr(node.effectKind) + "|"
+    out = out + intToStr(node.capabilityKind) + "|"
+    out = out + intToStr(node.callConv) + "|"
+    out = out + intToStr(node.entryFlag) + "|"
+    out = out + layout.fixedBytes32Hex(node.factCid)
+    return out
+
+fn v3CompilerCsgEdgeReportLine(index: int32,
+                               edge: V3CompilerCsgEdge): str =
+    var out = ""
+    out = out + "edge[" + intToStr(index) + "]="
+    out = out + intToStr(edge.edgeKind) + "|"
+    out = out + intToStr(edge.fromNodeId) + "|"
+    out = out + intToStr(edge.toNodeId) + "|"
+    out = out + layout.fixedBytes32Hex(edge.edgeCid)
+    return out
+
+fn v3CompilerExportSurfaceReport(surface: V3CsgExportSurface): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "package_id=" + surface.packageId + "\n"
+    out = out + "exported_count=" + intToStr(surface.exportedSymbolCount) + "\n"
+    out = out + "surface_cid=" + layout.fixedBytes32Hex(surface.surfaceCid)
+    for i in 0..<surface.exportedSymbolCount:
+        out = out + "\n" + v3CompilerExportSurfaceReportLine(surface, i)
+    return out
+
+fn v3CompilerExportSurfaceReportLine(surface: V3CsgExportSurface,
+                                     index: int32): str =
+    var out = ""
+    out = out + "export[" + intToStr(index) + "]="
+    out = out + surface.exportedSymbols[index] + "|"
+    out = out + intToStr(surface.exportedLayouts[index]) + "|"
+    out = out + intToStr(surface.exportedEffects[index]) + "|"
+    out = out + intToStr(surface.exportedCapabilities[index])
+    return out
+
+fn v3CompilerExportSurfaceFromReportText(text: str,
+                                         out: var V3CsgExportSurface): Result[bool] =
+    out.version = 1
+    out.packageId = v3CompilerWorldLineValue(text, "package_id")
+    let countText = v3CompilerWorldLineValue(text, "exported_count")
+    if len(countText) <= 0:
+        return Err[bool]("v3 compiler csg: exported_count missing")
+    out.exportedSymbolCount = int32(parseInt(countText))
+    out.exportedSymbols = []
+    out.exportedLayouts = []
+    out.exportedEffects = []
+    out.exportedCapabilities = []
+    let surfaceCidRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "surface_cid"))
+    if IsErr(surfaceCidRes):
+        return Err[bool]("v3 compiler csg: invalid surface cid")
+    out.surfaceCid = Value(surfaceCidRes)
+    let lines = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if !strutil.startsWith(line, "export["):
+            continue
+        let eqPosText = strutil.split(line, '=')
+        if eqPosText.len < 2:
+            continue
+        let parts = strutil.split(eqPosText[1], '|')
+        if parts.len != 4:
+            return Err[bool]("v3 compiler csg: malformed export row")
+        add(out.exportedSymbols, parts[0])
+        add(out.exportedLayouts, int32(parseInt(parts[1])))
+        add(out.exportedEffects, int32(parseInt(parts[2])))
+        add(out.exportedCapabilities, int32(parseInt(parts[3])))
+    if out.exportedSymbols.len != out.exportedSymbolCount:
+        return Err[bool]("v3 compiler csg: export count mismatch")
+    return Ok[bool](true)
+
+fn v3CompilerCsgGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
+    let raw = v3CompilerWorldLineValue(text, "graph_cid")
+    if len(raw) <= 0:
+        return Err[layout.FixedBytes32]("v3 compiler csg: graph_cid missing")
+    return layout.fixedBytes32FromHex(raw)
+
+fn v3CompilerCsgCanonicalGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
+    let raw = v3CompilerWorldLineValue(text, "canonical_graph_cid")
+    if len(raw) > 0:
+        return layout.fixedBytes32FromHex(raw)
+    return v3CompilerCsgGraphCidFromReportText(text)
+
+fn v3CompileReceiptReport(receipt: V3CompileReceipt): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(receipt.worldHeadCid) + "\n"
+    out = out + "compiler_csg_cid=" + layout.fixedBytes32Hex(receipt.compilerCsgCid) + "\n"
+    out = out + "canonical_compiler_csg_cid=" + layout.fixedBytes32Hex(receipt.canonicalCompilerCsgCid) + "\n"
+    out = out + "target=" + receipt.targetTriple + "\n"
+    out = out + "output_digest=" + layout.fixedBytes32Hex(receipt.outputDigest) + "\n"
+    out = out + "canonical_output_digest=" + layout.fixedBytes32Hex(receipt.canonicalOutputDigest) + "\n"
+    out = out + "bootstrap_stage=" + receipt.bootstrapStage + "\n"
+    out = out + "runtime_provider_count=" + intToStr(receipt.runtimeProviderSet.len) + "\n"
+    out = out + "receipt_cid=" + layout.fixedBytes32Hex(receipt.receiptCid)
+    for i in 0..<receipt.runtimeProviderSet.len:
+        out = out + "\n" + v3CompileReceiptProviderReportLine(receipt.runtimeProviderSet[i], i)
+    return out
+
+fn v3CompileReceiptProviderReportLine(provider: str,
+                                      index: int32): str =
+    var out = ""
+    out = out + "runtime_provider[" + intToStr(index) + "]="
+    out = out + provider
+    return out
+
+fn v3CompileReceiptFromReportText(text: str,
+                                  out: var V3CompileReceipt): Result[bool] =
+    let worldHeadRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "world_head_cid"))
+    if IsErr(worldHeadRes):
+        return Err[bool]("v3 compiler csg: invalid world_head_cid")
+    let csgRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "compiler_csg_cid"))
+    if IsErr(csgRes):
+        return Err[bool]("v3 compiler csg: invalid compiler_csg_cid")
+    let canonicalCsgRaw = v3CompilerWorldLineValue(text, "canonical_compiler_csg_cid")
+    let canonicalCsgRes = len(canonicalCsgRaw) > 0 ?
+        layout.fixedBytes32FromHex(canonicalCsgRaw) :
+        layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "compiler_csg_cid"))
+    if IsErr(canonicalCsgRes):
+        return Err[bool]("v3 compiler csg: invalid canonical_compiler_csg_cid")
+    let digestRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "output_digest"))
+    if IsErr(digestRes):
+        return Err[bool]("v3 compiler csg: invalid output_digest")
+    let canonicalDigestRaw = v3CompilerWorldLineValue(text, "canonical_output_digest")
+    let canonicalDigestRes = len(canonicalDigestRaw) > 0 ?
+        layout.fixedBytes32FromHex(canonicalDigestRaw) :
+        layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "output_digest"))
+    if IsErr(canonicalDigestRes):
+        return Err[bool]("v3 compiler csg: invalid canonical_output_digest")
+    let receiptCidRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "receipt_cid"))
+    if IsErr(receiptCidRes):
+        return Err[bool]("v3 compiler csg: invalid receipt_cid")
+    out.version = 1
+    out.worldHeadCid = Value(worldHeadRes)
+    out.compilerCsgCid = Value(csgRes)
+    out.canonicalCompilerCsgCid = Value(canonicalCsgRes)
+    out.targetTriple = v3CompilerWorldLineValue(text, "target")
+    out.outputDigest = Value(digestRes)
+    out.canonicalOutputDigest = Value(canonicalDigestRes)
+    out.bootstrapStage = v3CompilerWorldLineValue(text, "bootstrap_stage")
+    out.runtimeProviderSet = []
+    let lines = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if !strutil.startsWith(line, "runtime_provider["):
+            continue
+        let parts = strutil.split(line, '=')
+        if parts.len < 2:
+            continue
+        add(out.runtimeProviderSet, parts[1])
+    out.receiptCid = Value(receiptCidRes)
+    return Ok[bool](true)
+
+fn v3CompileReceiptRuntimeProviderSetEqual(left: str[],
+                                           right: str[]): bool =
+    if left.len != right.len:
+        return false
+    for i in 0..<left.len:
+        if left[i] != right[i]:
+            return false
+    return true
+
+fn v3CompileReceiptEquivalent(base: V3CompileReceipt,
+                              next: V3CompileReceipt): bool =
+    if !layout.fixedBytes32Equal(base.canonicalCompilerCsgCid, next.canonicalCompilerCsgCid):
+        return false
+    if base.targetTriple != next.targetTriple:
+        return false
+    if !layout.fixedBytes32Equal(base.canonicalOutputDigest, next.canonicalOutputDigest):
+        return false
+    if base.bootstrapStage != next.bootstrapStage:
+        return false
+    if !v3CompileReceiptRuntimeProviderSetEqual(base.runtimeProviderSet, next.runtimeProviderSet):
+        return false
+    return true
+
+fn v3CompilerWorldLineValue(text: str, key: str): str =
+    let lines = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        let parts = strutil.split(line, '=')
+        if parts.len < 2:
+            continue
+        if strutil.strip(parts[0]) != key:
+            continue
+        let value = strutil.strip(parts[1])
+        return value
+    return ""

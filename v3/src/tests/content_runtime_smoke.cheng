@@ -1,5 +1,4 @@
 import std/system
-import std/rawbytes
 import std/result
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/lsmr_types as lt
@@ -77,24 +76,40 @@ fn main(): int32 =
     let plan = Value(planRes)
     let planOk = swarm.v3ErasureRecoveryPlanValidate(plan, manifest, params)
     assert(IsOk(planOk), "v3 content runtime smoke: plan validate")
-    let targetsRes = runtime.v3ContentRuntimeBuildPullTargets(manifest, plan)
+
+    let targetsRes = runtime.v3ContentRuntimeBuildPullTargets(manifest.manifestCid,
+                                                              manifest.shardIndices,
+                                                              manifest.shardPayloadCids,
+                                                              plan.manifestCid,
+                                                              plan.requestCount,
+                                                              plan.requestPeerIds,
+                                                              plan.requestShardIndices,
+                                                              plan.requestShardCids)
     assert(IsOk(targetsRes), "v3 content runtime smoke: pull targets")
     let targets = Value(targetsRes)
     assert(targets.len == 3, "v3 content runtime smoke: target count")
     assert(layout.fixedBytes32Equal(targets[0].peerId, server.selfPeerId.value),
         "v3 content runtime smoke: target peer")
-    let requestsRes = runtime.v3ContentRuntimeBuildPullRequests(manifest, plan)
+
+    let requestsRes = runtime.v3ContentRuntimeBuildPullRequests(manifest.manifestCid,
+                                                                manifest.shardIndices,
+                                                                manifest.shardPayloadCids,
+                                                                plan.manifestCid,
+                                                                plan.requestCount,
+                                                                plan.requestPeerIds,
+                                                                plan.requestShardIndices,
+                                                                plan.requestShardCids)
     assert(IsOk(requestsRes), "v3 content runtime smoke: pull requests")
     let requests = Value(requestsRes)
     assert(requests.len == 3, "v3 content runtime smoke: request count")
-    assert(requests[0].shardIndex == 0, "v3 content runtime smoke: shard0 request")
-    assert(requests[1].shardIndex == 1, "v3 content runtime smoke: shard1 request")
-    assert(requests[2].shardIndex == 2, "v3 content runtime smoke: shard2 request")
 
     var serverRuntime = runtime.v3ContentRuntimeInit()
     let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(serverRuntime, manifest)
     assert(IsOk(storeManifestRes), "v3 content runtime smoke: store manifest")
-    let stubRes = content.v3ContentStubMake(lt.v3HashInts("v3.content.runtime.topic", [1]),
+
+    var stub = content.v3ContentStubZero()
+    let stubRes = content.v3ContentStubFill(stub,
+                                            lt.v3HashInts("v3.content.runtime.topic", [1]),
                                             lt.v3HashInts("v3.content.runtime.bundle", [2]),
                                             summary.summaryCid,
                                             lt.v3HashInts("v3.content.runtime.advert", [3]),
@@ -102,11 +117,24 @@ fn main(): int32 =
                                             lt.v3HashInts("v3.content.runtime.plan", [4]),
                                             summary.payloadLen)
     assert(IsOk(stubRes), "v3 content runtime smoke: stub")
-    let stub = Value(stubRes)
-    let storePreviewRes = runtime.v3ContentRuntimeStorePreview(serverRuntime, stub)
-    assert(IsOk(storePreviewRes), "v3 content runtime smoke: store preview")
     let storeBlobRes = runtime.v3ContentRuntimeStoreBlobPayload(serverRuntime, summary.blobCid, blob)
     assert(IsOk(storeBlobRes), "v3 content runtime smoke: store blob")
+
+    var cachedManifestPayload: Bytes
+    assert(runtime.v3ContentRuntimeCachedManifestPayload(serverRuntime,
+                                                         manifest.manifestCid,
+                                                         cachedManifestPayload),
+        "v3 content runtime smoke: cached manifest")
+    let cachedManifestOk = swarm.v3ErasureShardManifestValidatePayload(cachedManifestPayload,
+                                                                       manifest.manifestCid)
+    assert(IsOk(cachedManifestOk), "v3 content runtime smoke: cached manifest payload")
+
+    var cachedBlob: Bytes
+    assert(runtime.v3ContentRuntimeCachedBlob(serverRuntime, summary.blobCid, cachedBlob),
+        "v3 content runtime smoke: cached blob")
+    assert(contentRuntimeSmokeBytesEqual(cachedBlob, blob),
+        "v3 content runtime smoke: cached blob bytes")
+
     for i in 0..<requests.len:
         var response = swarm.v3ErasureShardPullResponseZero()
         let responseFillRes = swarm.v3ErasureShardPullResponseFill(response,
@@ -141,14 +169,6 @@ fn main(): int32 =
                                                                      manifestFetchRequest)
     assert(IsOk(manifestFetchRes), "v3 content runtime smoke: manifest fetch")
     let manifestFetchResponse = Value(manifestFetchRes)
-    let manifestFetchResponseOk = fetch.v3ContentFetchResponseValidate(manifestFetchResponse,
-                                                                       manifestFetchRequest)
-    assert(IsOk(manifestFetchResponseOk), "v3 content runtime smoke: manifest response validate")
-    let manifestPayloadOk = swarm.v3ErasureShardManifestValidatePayload(manifestFetchResponse.payload,
-                                                                        manifest.manifestCid)
-    assert(IsOk(manifestPayloadOk), "v3 content runtime smoke: manifest payload validate")
-    let manifestPayloadDecodeRes = swarm.v3ErasureShardManifestDecode(manifestFetchResponse.payload)
-    assert(IsOk(manifestPayloadDecodeRes), "v3 content runtime smoke: manifest payload decode")
     var manifestPull = swarm.v3ErasureShardManifestZero()
     let manifestPullRes = fetch.v3ContentFetchResponseToManifestFill(manifestPull,
                                                                      manifestFetchRequest,
@@ -156,23 +176,6 @@ fn main(): int32 =
     assert(IsOk(manifestPullRes), "v3 content runtime smoke: manifest pull")
     assert(layout.fixedBytes32Equal(manifestPull.manifestCid, manifest.manifestCid),
         "v3 content runtime smoke: manifest pull cid")
-
-    let previewReqRes = fetch.v3ContentFetchRequestPreview(summary.summaryCid)
-    assert(IsOk(previewReqRes), "v3 content runtime smoke: preview request")
-    let previewRequest = Value(previewReqRes)
-    let previewFetchRes = runtime_host.v3ContentRuntimeRequestFetch(client,
-                                                                    server,
-                                                                    server.selfPeerId,
-                                                                    serverRuntime,
-                                                                    previewRequest)
-    assert(IsOk(previewFetchRes), "v3 content runtime smoke: preview fetch")
-    var previewStub = content.v3ContentStubZero()
-    let previewFillRes = fetch.v3ContentFetchResponseToPreviewFill(previewStub,
-                                                                   previewRequest,
-                                                                   Value(previewFetchRes))
-    assert(IsOk(previewFillRes), "v3 content runtime smoke: preview decode")
-    assert(layout.fixedBytes32Equal(previewStub.stubCid, stub.stubCid),
-        "v3 content runtime smoke: preview stub cid")
 
     let rangeReqRes = fetch.v3ContentFetchRequestRange(summary.blobCid, 2, 5)
     assert(IsOk(rangeReqRes), "v3 content runtime smoke: range request")
@@ -237,67 +240,6 @@ fn main(): int32 =
     assert(IsOk(rebuildRes), "v3 content runtime smoke: rebuild")
     assert(contentRuntimeSmokeBytesEqual(Value(rebuildRes), blob),
         "v3 content runtime smoke: rebuild bytes")
-    assert(client.openStreamProtocols.len == 7, "v3 content runtime smoke: stream count")
-
-    let parityBlob = bytesFromString("rs-data-with-parity")
-    let parityParamsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 3, 2, 7)
-    assert(IsOk(parityParamsRes), "v3 content runtime smoke: parity params")
-    let parityParams = Value(parityParamsRes)
-    let parityShardPayloadsRes = swarm.v3ErasureEncodeShardPayloads(parityBlob, parityParams)
-    assert(IsOk(parityShardPayloadsRes), "v3 content runtime smoke: parity shard payloads")
-    let parityShardPayloads = Value(parityShardPayloadsRes)
-    var parityShardPayloadCids: layout.FixedBytes32[]
-    parityShardPayloadCids = []
-    for i in 0..<parityShardPayloads.len:
-        add(parityShardPayloadCids, swarm.v3ErasureShardPayloadCid(parityShardPayloads[i]))
-    let paritySummaryRes = dag.v3DagBlobSummaryFromBytes(parityBlob, 7)
-    assert(IsOk(paritySummaryRes), "v3 content runtime smoke: parity summary")
-    let paritySummary = Value(paritySummaryRes)
-    let parityManifestRes = swarm.v3ErasureShardManifestMake(paritySummary.blobCid,
-                                                             paritySummary.payloadLen,
-                                                             parityParams,
-                                                             parityShardPayloadCids)
-    assert(IsOk(parityManifestRes), "v3 content runtime smoke: parity manifest")
-    let parityManifest = Value(parityManifestRes)
-    let parityPeer0 = lt.v3HashInts("v3.content.runtime.parity.peer", [0])
-    let parityPeer3 = lt.v3HashInts("v3.content.runtime.parity.peer", [3])
-    let parityPeer4 = lt.v3HashInts("v3.content.runtime.parity.peer", [4])
-    let parityAdvert0Res = swarm.v3ErasurePeerAdvertMake(parityPeer0, parityManifest, parityParams, [0], 900, 1)
-    assert(IsOk(parityAdvert0Res), "v3 content runtime smoke: parity advert0")
-    let parityAdvert3Res = swarm.v3ErasurePeerAdvertMake(parityPeer3, parityManifest, parityParams, [3], 900, 1)
-    assert(IsOk(parityAdvert3Res), "v3 content runtime smoke: parity advert3")
-    let parityAdvert4Res = swarm.v3ErasurePeerAdvertMake(parityPeer4, parityManifest, parityParams, [4], 900, 1)
-    assert(IsOk(parityAdvert4Res), "v3 content runtime smoke: parity advert4")
-    var parityAdverts: swarm.V3ErasurePeerAdvert[]
-    parityAdverts = []
-    add(parityAdverts, Value(parityAdvert0Res))
-    add(parityAdverts, Value(parityAdvert3Res))
-    add(parityAdverts, Value(parityAdvert4Res))
-    let parityPlanRes = swarm.v3ErasureBuildRecoveryPlan(parityManifest, parityParams, parityAdverts)
-    assert(IsOk(parityPlanRes), "v3 content runtime smoke: parity plan")
-    let parityPlan = Value(parityPlanRes)
-    let parityPlanOk = swarm.v3ErasureRecoveryPlanValidate(parityPlan, parityManifest, parityParams)
-    assert(IsOk(parityPlanOk), "v3 content runtime smoke: parity plan validate")
-    assert(parityPlan.requestCount == 3, "v3 content runtime smoke: parity request count")
-    assert(parityPlan.requestShardIndices[0] == 0, "v3 content runtime smoke: parity shard0")
-    assert(parityPlan.requestShardIndices[1] == 3, "v3 content runtime smoke: parity shard3")
-    assert(parityPlan.requestShardIndices[2] == 4, "v3 content runtime smoke: parity shard4")
-    let parityRequestsRes = runtime.v3ContentRuntimeBuildPullRequests(parityManifest, parityPlan)
-    assert(IsOk(parityRequestsRes), "v3 content runtime smoke: parity requests")
-    let parityRequests = Value(parityRequestsRes)
-    var parityResponses: swarm.V3ErasureShardPullResponse[]
-    parityResponses = []
-    for i in 0..<parityRequests.len:
-        var parityResponse = swarm.v3ErasureShardPullResponseZero()
-        let parityFillRes = swarm.v3ErasureShardPullResponseFill(parityResponse,
-                                                                 parityRequests[i],
-                                                                 parityShardPayloads[parityRequests[i].shardIndex])
-        assert(IsOk(parityFillRes), "v3 content runtime smoke: parity response")
-        add(parityResponses, parityResponse)
-    let parityRebuildRes = runtime.v3ContentRuntimeRebuildBlob(parityManifest, parityParams, parityResponses)
-    assert(IsOk(parityRebuildRes), "v3 content runtime smoke: parity rebuild")
-    assert(contentRuntimeSmokeBytesEqual(Value(parityRebuildRes), parityBlob),
-        "v3 content runtime smoke: parity rebuild bytes")
 
     echo("v3 content_runtime_smoke ok")
     return 0

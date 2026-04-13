@@ -325,6 +325,53 @@ int32_t cheng_v3_webrtc_datachannel_request_response_bridge(ChengStrBridge proto
                                                             ChengStrBridge response_text,
                                                             ChengStrBridge* client_response_text,
                                                             ChengStrBridge* err_text);
+int32_t cheng_v3_webrtc_browser_request_response_bridge(ChengStrBridge protocol_text,
+                                                        ChengStrBridge policy_text,
+                                                        ChengStrBridge label_text,
+                                                        ChengStrBridge request_text,
+                                                        ChengStrBridge response_text,
+                                                        ChengStrBridge* signal_response_text,
+                                                        ChengStrBridge* client_response_text,
+                                                        ChengStrBridge* err_text);
+uint64_t cheng_v3_webrtc_browser_session_open_bridge(ChengStrBridge policy_text,
+                                                     ChengStrBridge label_text,
+                                                     ChengStrBridge* signal_response_text,
+                                                     ChengStrBridge* err_text);
+int32_t cheng_v3_webrtc_browser_session_exchange_bridge(uint64_t handle,
+                                                        ChengStrBridge protocol_text,
+                                                        ChengStrBridge request_text,
+                                                        ChengStrBridge response_text,
+                                                        ChengStrBridge* client_response_text,
+                                                        ChengStrBridge* err_text);
+int32_t cheng_v3_webrtc_browser_session_close_bridge(uint64_t handle,
+                                                     ChengStrBridge* err_text);
+int32_t cheng_v3_webrtc_browser_session_active_count_bridge(void);
+uint64_t cheng_v3_tailnet_provider_open_bridge(ChengStrBridge provider_kind_text,
+                                               ChengStrBridge control_endpoint_text,
+                                               ChengStrBridge relay_endpoint_text,
+                                               ChengStrBridge control_probe_endpoint_text,
+                                               ChengStrBridge relay_probe_endpoint_text,
+                                               ChengStrBridge derp_region_code_text,
+                                               ChengStrBridge derp_hostname_text);
+int32_t cheng_v3_tailnet_provider_command_bridge(uint64_t handle,
+                                                 ChengStrBridge command_text);
+int32_t cheng_v3_tailnet_provider_close_bridge(uint64_t handle);
+int32_t cheng_v3_tailnet_provider_active_count_bridge(void);
+int32_t cheng_v3_tailnet_provider_command_count_bridge(void);
+int32_t cheng_v3_tailnet_provider_probe_provider_ready_bridge(uint64_t handle);
+int32_t cheng_v3_tailnet_provider_probe_proxy_ready_bridge(uint64_t handle);
+int32_t cheng_v3_tailnet_provider_probe_listener_needs_repair_bridge(uint64_t handle);
+int32_t cheng_v3_tailnet_provider_probe_derp_healthy_bridge(uint64_t handle);
+ChengStrBridge cheng_v3_tailnet_provider_probe_startup_stage_bridge(uint64_t handle);
+int32_t cheng_v3_system_cpu_logical_cores_bridge(void);
+int64_t cheng_v3_system_memory_available_bytes_bridge(void);
+int64_t cheng_v3_system_memory_total_bytes_bridge(void);
+int64_t cheng_v3_system_disk_available_bytes_bridge(void);
+int64_t cheng_v3_system_disk_total_bytes_bridge(void);
+int32_t cheng_v3_system_gpu_device_count_bridge(void);
+int32_t cheng_v3_system_gpu_core_count_bridge(void);
+int32_t cheng_v3_system_npu_device_count_bridge(void);
+int32_t cheng_v3_system_npu_core_count_bridge(void);
 int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
                                                int32_t port,
                                                ChengStrBridge protocol_text,

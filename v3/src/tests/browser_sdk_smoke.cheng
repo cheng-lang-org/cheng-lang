@@ -1,0 +1,162 @@
+import std/system
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+import cheng/v3/chain/binary_types as binary
+import cheng/v3/chain/dag_mempool as dag
+import cheng/v3/chain/erasure_swarm as swarm
+import cheng/v3/chain/content_fetch as fetch
+import cheng/v3/chain/content_runtime as runtime
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/browser/browser_sdk as sdk
+
+fn browserSdkAddress(): binary.V3LsmrAddress =
+    var out: binary.V3LsmrAddress
+    out.depth = 2
+    out.digits[0] = 6
+    out.digits[1] = 4
+    return out
+
+fn browserSdkBytesEqual(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn main(): int32 =
+    sdk.v3BrowserSdkResetTransportStats()
+    var server = sdk.v3BrowserSdkInit("browser.sdk.server")
+    var client = sdk.v3BrowserSdkInit("browser.sdk.client")
+    sdk.v3BrowserSdkEnableLightNode(server)
+    sdk.v3BrowserSdkEnableLightNode(client)
+
+    var listenAddr = types.v3Libp2pMultiaddrZero()
+    let listenRes = sdk.v3BrowserSdkListenPublic(listenAddr, server, "203.0.113.146", 9456)
+    assert(IsOk(listenRes), "v3 browser sdk: listen")
+    let dialRes = sdk.v3BrowserSdkDialRemote(client, server, listenAddr)
+    assert(IsOk(dialRes), "v3 browser sdk: dial")
+
+    let address = browserSdkAddress()
+    let syncPayload = bytesFromString("browser-sdk-sync")
+    let syncCid = hash256.sha256Fixed(layout.byteSpanFromBytes(syncPayload))
+    var syncIngress = overlay.v3OverlayIngressEnvelopeZero()
+    syncIngress.sourcePeerId = server.host.selfPeerId.value
+    syncIngress.topicScope = overlay.v3OverlayScopeRegion
+    syncIngress.address = address
+    syncIngress.payloadKind = 0
+    syncIngress.payload = syncPayload
+    syncIngress.payloadCid = syncCid
+    syncIngress.payloadLen = bytesLen(syncPayload)
+    syncIngress.stampEpoch = 21
+    syncIngress.stampGanzhi = 42
+    sdk.v3BrowserSdkStorePut(server, syncIngress)
+
+    var query = overlay.v3OverlayStoreQueryZero()
+    query.topicScope = overlay.v3OverlayScopeRegion
+    query.address = address
+    query.rangeLimit = 4
+    var syncEntries: overlay.V3IngressEnvelope[]
+    let syncRes = sdk.v3BrowserSdkSync(client, server, query, syncEntries)
+    assert(IsOk(syncRes), "v3 browser sdk: sync")
+    assert(syncEntries.len == 1, "v3 browser sdk: sync count")
+    assert(layout.fixedBytes32Equal(syncEntries[0].payloadCid, syncCid),
+        "v3 browser sdk: sync cid")
+
+    let pushPayload = bytesFromString("browser-sdk-pubsub")
+    let pushCid = hash256.sha256Fixed(layout.byteSpanFromBytes(pushPayload))
+    var pushIngress = overlay.v3OverlayIngressEnvelopeZero()
+    pushIngress.sourcePeerId = client.host.selfPeerId.value
+    pushIngress.topicScope = overlay.v3OverlayScopeRegion
+    pushIngress.address = address
+    pushIngress.payloadKind = 0
+    pushIngress.payload = pushPayload
+    pushIngress.payloadCid = pushCid
+    pushIngress.payloadLen = bytesLen(pushPayload)
+    pushIngress.stampEpoch = 22
+    pushIngress.stampGanzhi = 44
+    var pushed: overlay.V3IngressEnvelope[]
+    pushed = []
+    add(pushed, pushIngress)
+    let pushRes = sdk.v3BrowserSdkIngressPush(client, server, pushed)
+    assert(IsOk(pushRes), "v3 browser sdk: push")
+
+    let shard = bytesFromString("browser-sdk-shard")
+    let blob = shard
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, bytesLen(shard))
+    assert(IsOk(summaryRes), "v3 browser sdk: summary")
+    let summary = Value(summaryRes)
+    let paramsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 1, 0, bytesLen(shard))
+    assert(IsOk(paramsRes), "v3 browser sdk: params")
+    let params = Value(paramsRes)
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    add(shardPayloadCids, swarm.v3ErasureShardPayloadCid(shard))
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    assert(IsOk(manifestRes), "v3 browser sdk: manifest")
+    let manifest = Value(manifestRes)
+    let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, 0)
+    assert(IsOk(requestRes), "v3 browser sdk: request")
+    let request = Value(requestRes)
+
+    var serverRuntime = runtime.v3ContentRuntimeInit()
+    assert(IsOk(runtime.v3ContentRuntimeStoreManifest(serverRuntime, manifest)),
+        "v3 browser sdk: store manifest")
+    assert(IsOk(runtime.v3ContentRuntimeStoreBlobPayload(serverRuntime, summary.blobCid, blob)),
+        "v3 browser sdk: store blob")
+    let seedResponseRes = swarm.v3ErasureShardPullResponseMake(request, shard)
+    assert(IsOk(seedResponseRes), "v3 browser sdk: seed response")
+    assert(IsOk(runtime.v3ContentRuntimeStoreShardResponse(serverRuntime, Value(seedResponseRes))),
+        "v3 browser sdk: store shard")
+
+    let manifestReqRes = fetch.v3ContentFetchRequestManifest(manifest.manifestCid)
+    assert(IsOk(manifestReqRes), "v3 browser sdk: manifest request")
+    var manifestResp = fetch.v3ContentFetchResponseZero()
+    let manifestFetchRes = sdk.v3BrowserSdkContentFetch(manifestResp,
+                                                        client,
+                                                        server,
+                                                        serverRuntime,
+                                                        Value(manifestReqRes))
+    assert(IsOk(manifestFetchRes), "v3 browser sdk: manifest fetch")
+    var pulledManifest = swarm.v3ErasureShardManifestZero()
+    assert(IsOk(fetch.v3ContentFetchResponseToManifestFill(pulledManifest,
+                                                           Value(manifestReqRes),
+                                                           manifestResp)),
+        "v3 browser sdk: manifest decode")
+    assert(layout.fixedBytes32Equal(pulledManifest.manifestCid, manifest.manifestCid),
+        "v3 browser sdk: manifest cid")
+
+    var shardResp = swarm.v3ErasureShardPullResponseZero()
+    let shardPullRes = sdk.v3BrowserSdkShardPull(shardResp,
+                                                 client,
+                                                 server,
+                                                 serverRuntime,
+                                                 request)
+    assert(IsOk(shardPullRes), "v3 browser sdk: shard pull")
+    assert(browserSdkBytesEqual(shardResp.payload, shard),
+        "v3 browser sdk: shard payload")
+
+    assert(sdk.v3BrowserSdkStreamCount(client) == 5,
+        "v3 browser sdk: stream count")
+    assert(sdk.v3BrowserSdkSignalEgressCount(client) == 5,
+        "v3 browser sdk: signal egress")
+    assert(sdk.v3BrowserSdkSignalIngressCount(server) == 5,
+        "v3 browser sdk: signal ingress")
+    assert(sdk.v3BrowserSdkStoreEntryCount(server) == 2,
+        "v3 browser sdk: store count")
+    assert(sdk.v3BrowserSdkPublishCount(server) == 1,
+        "v3 browser sdk: publish count")
+    assert(sdk.v3BrowserSdkBrowserOpenCountNow() == 1,
+        "v3 browser sdk: browser open")
+    assert(sdk.v3BrowserSdkBrowserRequestCountNow() == 4,
+        "v3 browser sdk: browser request count")
+    assert(sdk.v3BrowserSdkBrowserActiveSessionCountNow() == 1,
+        "v3 browser sdk: browser active session")
+
+    echo("v3 browser_sdk_smoke ok")
+    return 0

@@ -1,6 +1,7 @@
-import std/cmdline as cmdline
 import std/os
 import std/result
+import std/strings
+import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
 
 type
@@ -45,15 +46,16 @@ fn v3CompilerRequestTargetTriple(req: V3CompilerRequest): str =
 fn v3CompilerRequestEmitKind(req: V3CompilerRequest): V3CompilerEmit =
     return req.emitKind
 
-fn v3CompilerReadFlagOrDefault(key: str, defaultValue: str): str =
-    let count = cmdline.paramCount()
-    var out = defaultValue
-    var value: str
-    var nextIndex: int32 = 0
-    for i in 2..count:
-        if cmdline.readFlagValueAt(i, key, value, nextIndex):
-            out = value
-    return out
+fn v3CompilerReadFlagOrDefault(args: str[],
+                               key: str,
+                               defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.startsWith(arg, key + ":"):
+            return strings.dropPrefix(arg, key + ":")
+        if strutil.startsWith(arg, key + "="):
+            return strings.dropPrefix(arg, key + "=")
+    return defaultValue
 
 fn v3CompilerEmitText(kind: V3CompilerEmit): str =
     if kind == v3EmitExe:
@@ -63,19 +65,42 @@ fn v3CompilerEmitText(kind: V3CompilerEmit): str =
 fn v3CompilerDefaultPackageRoot(workspaceRoot: str): str =
     return os.joinPath(workspaceRoot, "v3")
 
-fn v3CompilerRequestFromCmdline(workspaceRoot: str): Result[V3CompilerRequest] =
-    let packageRoot = v3CompilerReadFlagOrDefault("--root", v3CompilerDefaultPackageRoot(workspaceRoot))
-    let sourcePath = v3CompilerReadFlagOrDefault("--in", "")
+fn v3CompilerWorldHeadFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--world-head", "")
+
+fn v3CompilerLockPathFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--lock", "")
+
+fn v3CompilerBaselineSurfacePathFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--baseline-surface", "")
+
+fn v3CompilerBaselineReceiptPathFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--baseline-receipt", "")
+
+fn v3CompilerBaselineCsgPathFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--baseline-csg", "")
+
+fn v3CompilerLegacyInPathFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--legacy-in", "")
+
+fn v3CompilerChannelFromArgs(args: str[]): str =
+    return v3CompilerReadFlagOrDefault(args, "--channel", "stable")
+
+fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
+                                       args: str[],
+                                       requireOutput: bool): Result[V3CompilerRequest] =
+    let packageRoot = v3CompilerReadFlagOrDefault(args, "--root", v3CompilerDefaultPackageRoot(workspaceRoot))
+    let sourcePath = v3CompilerReadFlagOrDefault(args, "--in", "")
     if len(sourcePath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --in")
-    let outputPath = v3CompilerReadFlagOrDefault("--out", "")
-    if len(outputPath) <= 0:
+    let outputPath = v3CompilerReadFlagOrDefault(args, "--out", "")
+    if requireOutput && len(outputPath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --out")
-    let targetTriple = v3CompilerReadFlagOrDefault("--target", contracts.v3BootstrapDefaultTarget())
-    let emitText = v3CompilerReadFlagOrDefault("--emit", "exe")
+    let targetTriple = v3CompilerReadFlagOrDefault(args, "--target", contracts.v3BootstrapDefaultTarget())
+    let emitText = v3CompilerReadFlagOrDefault(args, "--emit", "exe")
     if emitText != "exe":
         return Err[V3CompilerRequest]("v3 compiler: unsupported --emit: " + emitText)
-    let reportPath = v3CompilerReadFlagOrDefault("--report-out", "")
+    let reportPath = v3CompilerReadFlagOrDefault(args, "--report-out", "")
     return Ok[V3CompilerRequest](v3CompilerRequestNew(
         packageRoot,
         sourcePath,
@@ -83,4 +108,8 @@ fn v3CompilerRequestFromCmdline(workspaceRoot: str): Result[V3CompilerRequest] =
         targetTriple,
         v3EmitExe,
         reportPath
-    ))
+))
+
+fn v3CompilerRequestFromArgs(workspaceRoot: str,
+                             args: str[]): Result[V3CompilerRequest] =
+    return v3CompilerRequestFromArgsForCommand(workspaceRoot, args, true)

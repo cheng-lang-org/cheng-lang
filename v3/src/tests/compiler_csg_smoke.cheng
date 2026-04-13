@@ -1,0 +1,37 @@
+import std/result
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_plan as slplan
+
+fn main(): int32 =
+    let workspaceRoot = v3path.v3PathCurrentDir()
+    let packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    let sourcePath = v3path.v3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_compiler_csg/program_selfhost_smoke")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 compiler csg: link plan")
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(csgRes), "v3 compiler csg: build")
+    let csg = Value(csgRes)
+    assert(csg.nodeCount > 0, "v3 compiler csg: node count")
+    assert(csg.edgeCount > 0, "v3 compiler csg: edge count")
+    let surface = ccsg.v3CompilerExportSurfaceFromCsg(csg)
+    assert(surface.exportedSymbolCount > 0, "v3 compiler csg: export count")
+    let report = ccsg.v3CompilerCsgReport(csg)
+    assert(v3path.v3TextContains(report, "canonical_graph_cid="), "v3 compiler csg: canonical cid")
+    assert(v3path.v3TextContains(report, "graph_cid="), "v3 compiler csg: report cid")
+    assert(v3path.v3TextContains(report, "node_count="), "v3 compiler csg: report node count")
+    echo("v3 compiler_csg_smoke ok")
+    return 0

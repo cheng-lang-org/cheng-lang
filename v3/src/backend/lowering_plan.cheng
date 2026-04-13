@@ -1,5 +1,8 @@
 import std/result
+import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/lang/intern as langintern
 import cheng/v3/lang/parser
 import cheng/v3/backend/system_link_plan as slplan
@@ -11,6 +14,8 @@ type
         packageId: str
         entryPath: str
         entrySymbol: str
+        sourceBundleCid: layout.FixedBytes32
+        compilerCsgCid: layout.FixedBytes32
         functionSourcePaths: str[]
         functionOwnerModulePaths: str[]
         functionNames: str[]
@@ -157,6 +162,55 @@ fn v3LoweringSequentialNameIds(count: int32): langintern.V3InternId[] =
         add(out, i)
     return out
 
+fn v3BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
+                                          compilerCsg: ccsg.V3CompilerCsg,
+                                          plan: var V3LoweringPlanStub,
+                                          err: var str): bool =
+    plan.functionSourcePaths = []
+    plan.functionOwnerModulePaths = []
+    plan.functionNames = []
+    plan.functionSymbolTexts = []
+    plan.functionNameIds = []
+    plan.functionEntryFlags = []
+    plan.functionCallConvs = []
+    plan.functionResultLayoutKinds = []
+    let workspaceRoot = slplan.v3SystemLinkPlanWorkspaceRoot(linkPlan)
+    let packageRoot = slplan.v3SystemLinkPlanPackageRoot(linkPlan)
+    let packageId = slplan.v3SystemLinkPlanPackageId(linkPlan)
+    let entryPath = slplan.v3SystemLinkPlanEntryPath(linkPlan)
+    let entrySymbol = slplan.v3SystemLinkPlanEntrySymbol(linkPlan)
+    for i in 0..<compilerCsg.nodes.len:
+        let node = compilerCsg.nodes[i]
+        if node.nodeKind != ccsg.v3CompilerCsgNodeKindSymbol:
+            continue
+        let sourcePath = parser.v3ParserModulePathToSourcePath(workspaceRoot,
+                                                               packageRoot,
+                                                               node.modulePath)
+        add(plan.functionSourcePaths, sourcePath)
+        add(plan.functionOwnerModulePaths, node.modulePath)
+        add(plan.functionNames, node.factText)
+        add(plan.functionSymbolTexts, node.symbolText)
+        add(plan.functionEntryFlags, node.entryFlag)
+        add(plan.functionCallConvs, node.callConv)
+        add(plan.functionResultLayoutKinds, node.resultLayoutKind)
+    let functionSymbolTexts = v3LoweringPlanFunctionSymbolTexts(plan)
+    let functionNameIds = v3LoweringSequentialNameIds(functionSymbolTexts.len)
+    plan.functionNameIds = functionNameIds
+    let functionNames = v3LoweringPlanFunctionNamesField(plan)
+    let functionEntryFlags = v3LoweringPlanFunctionEntryFlagsField(plan)
+    let missingReasons = v3LoweringMissingReasons(functionNames, functionEntryFlags, entrySymbol)
+    plan.workspaceRoot = workspaceRoot
+    plan.packageRoot = packageRoot
+    plan.packageId = packageId
+    plan.entryPath = entryPath
+    plan.entrySymbol = entrySymbol
+    plan.sourceBundleCid = compilerCsg.sourceBundleCid
+    plan.compilerCsgCid = compilerCsg.graphCid
+    plan.missingReasons = missingReasons
+    plan.pipelineStage = "canonical_csg_to_lowering_plan_stub"
+    err = ""
+    return true
+
 fn v3LoweringPlanFunctionSymbolTexts(plan: V3LoweringPlanStub): str[] =
     return plan.functionSymbolTexts
 
@@ -178,48 +232,13 @@ fn v3LoweringPlanPipelineStage(plan: V3LoweringPlanStub): str =
 fn v3BuildLoweringPlanStub(linkPlan: slplan.V3SystemLinkPlanStub,
                            plan: var V3LoweringPlanStub,
                            err: var str): bool =
-    plan.functionSourcePaths = []
-    plan.functionOwnerModulePaths = []
-    plan.functionNames = []
-    plan.functionSymbolTexts = []
-    plan.functionNameIds = []
-    plan.functionEntryFlags = []
-    plan.functionCallConvs = []
-    plan.functionResultLayoutKinds = []
-    let workspaceRoot = slplan.v3SystemLinkPlanWorkspaceRoot(linkPlan)
-    let packageRoot = slplan.v3SystemLinkPlanPackageRoot(linkPlan)
-    let packageId = slplan.v3SystemLinkPlanPackageId(linkPlan)
-    let entryPath = slplan.v3SystemLinkPlanEntryPath(linkPlan)
-    let entrySymbol = slplan.v3SystemLinkPlanEntrySymbol(linkPlan)
     let sourceClosurePaths = slplan.v3SystemLinkPlanSourceClosurePaths(linkPlan)
-    let sourceClosureCount = sourceClosurePaths.len
-    var i: int32 = 0
-    while i < sourceClosureCount:
-        let sourcePath = sourceClosurePaths[i]
-        if !v3LoweringCollectFunctionsFromSource(workspaceRoot,
-                                                 packageRoot,
-                                                 entryPath,
-                                                 entrySymbol,
-                                                 sourcePath,
-                                                 plan):
-            err = "v3 lowering: source file missing"
-            return false
-        i = i + 1
-    let functionSymbolTexts = v3LoweringPlanFunctionSymbolTexts(plan)
-    let functionNameIds = v3LoweringSequentialNameIds(functionSymbolTexts.len)
-    plan.functionNameIds = functionNameIds
-    let functionNames = v3LoweringPlanFunctionNamesField(plan)
-    let functionEntryFlags = v3LoweringPlanFunctionEntryFlagsField(plan)
-    let missingReasons = v3LoweringMissingReasons(functionNames, functionEntryFlags, entrySymbol)
-    plan.workspaceRoot = workspaceRoot
-    plan.packageRoot = packageRoot
-    plan.packageId = packageId
-    plan.entryPath = entryPath
-    plan.entrySymbol = entrySymbol
-    plan.missingReasons = missingReasons
-    plan.pipelineStage = "system_link_plan_to_lowering_plan_stub"
-    err = ""
-    return true
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    if IsErr(csgRes):
+        err = Error(csgRes)
+        return false
+    return v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, Value(csgRes), plan, err)
 
 fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     var out: str = ""
@@ -235,6 +254,8 @@ fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     v3LoweringAppendLine(out, "lowering_function_count", functionCount)
     v3LoweringAppendLine(out, "lowering_functions", functionList)
     v3LoweringAppendLine(out, "lowering_entry_function", entryFunction)
+    v3LoweringAppendLine(out, "lowering_source_bundle_cid", layout.fixedBytes32Hex(plan.sourceBundleCid))
+    v3LoweringAppendLine(out, "lowering_compiler_csg_cid", layout.fixedBytes32Hex(plan.compilerCsgCid))
     v3LoweringAppendLine(out, "lowering_missing_reasons", missingReasons)
     v3LoweringAppendLine(out, "exec_pipeline_stage", pipelineStage)
     return out

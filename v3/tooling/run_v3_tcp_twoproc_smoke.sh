@@ -16,34 +16,28 @@ fi
 compile_one() {
   src="$1"
   bin="$2"
-  compile_log="$3"
-  rm -f "$bin" "$bin".* "$compile_log"
-  if ! DIAG_CONTEXT=1 "$compiler" system-link-exec \
-    --root "$root/v3" \
-    --in "$src" \
-    --emit exe \
-    --target arm64-apple-darwin \
-    --out "$bin" >"$compile_log" 2>&1; then
-    echo "v3 libp2p tcp twoproc: compile failed: $src" >&2
-    tail -n 80 "$compile_log" >&2 || true
-    exit 1
-  fi
+  label="$3"
+  zsh "$root/v3/tooling/run_v3_compile_exe.sh" \
+    "v3 libp2p tcp twoproc" \
+    "$stage_name $label" \
+    "$compiler" \
+    "$root/v3" \
+    "$src" \
+    "$bin"
 }
 
 server_src="$root/v3/src/tests/libp2p_tcp_twoproc_server_smoke.cheng"
 client_src="$root/v3/src/tests/libp2p_tcp_twoproc_client_smoke.cheng"
 server_bin="$out_dir/libp2p_tcp_twoproc_server.$stage_name"
 client_bin="$out_dir/libp2p_tcp_twoproc_client.$stage_name"
-server_compile_log="$out_dir/libp2p_tcp_twoproc_server.$stage_name.compile.log"
-client_compile_log="$out_dir/libp2p_tcp_twoproc_client.$stage_name.compile.log"
 server_run_log="$out_dir/libp2p_tcp_twoproc_server.$stage_name.run.log"
 client_run_log="$out_dir/libp2p_tcp_twoproc_client.$stage_name.run.log"
 ready_path="$out_dir/libp2p_tcp_twoproc_server.$stage_name.ready"
 
 echo "[v3 libp2p tcp twoproc] compile $stage_name server"
-compile_one "$server_src" "$server_bin" "$server_compile_log"
+compile_one "$server_src" "$server_bin" "server"
 echo "[v3 libp2p tcp twoproc] compile $stage_name client"
-compile_one "$client_src" "$client_bin" "$client_compile_log"
+compile_one "$client_src" "$client_bin" "client"
 
 rm -f "$server_run_log" "$client_run_log" "$ready_path"
 "$server_bin" "--port:0" "--ready-path:$ready_path" >"$server_run_log" 2>&1 &

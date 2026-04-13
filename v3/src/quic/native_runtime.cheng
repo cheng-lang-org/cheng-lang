@@ -14,6 +14,7 @@ import cheng/v3/quic/core/frame_model
 import cheng/v3/quic/core/crypto_stream
 import cheng/v3/quic/core/packet_model
 import cheng/v3/quic/core/packet_header_model
+import cheng/v3/quic/core/quic_varint
 import cheng/v3/quic/core/connection_impl
 import cheng/v3/quic/core/flow_control_model
 import cheng/v3/quic/platform/common
@@ -100,7 +101,15 @@ fn msquicNativeEmptyAddr(): MultiAddress =
     return out
 
 fn msquicNativePacketTypeCode(packetType: QuicPacketType): int32 =
-    return int32(packetType)
+    if packetType == QuicPacketInitial:
+        return msquicNativePacketInitialCode
+    if packetType == QuicPacket0Rtt:
+        return msquicNativePacket0RttCode
+    if packetType == QuicPacketHandshake:
+        return msquicNativePacketHandshakeCode
+    if packetType == QuicPacketRetry:
+        return msquicNativePacketRetryCode
+    return msquicNativePacketShortCode
 
 fn msquicNativeFrameTypeCode(frame: MsQuicFrame): int64 =
     return msquicFrameTypeWireCode(frame.kind)
@@ -574,6 +583,15 @@ fn msquicNativeHandleCryptoFrame(side: int32, packetTypeCode: int32, frame: MsQu
     if IsErr(feedRes):
         return Err[bool](ErrorText(feedRes))
     return Ok[bool](true)
+
+fn msquicNativeResetServerHandshake(requireCert: bool) =
+    handshake13.msquicTls13ResetServerDefault(requireCert)
+
+fn msquicNativeFeedServerHandshake(data: Bytes): Result[int32] =
+    return handshake13.msquicTls13SideFeed(1, data)
+
+fn msquicNativeServerClientKeyShareGroup(): int32 =
+    return handshake13.msquicTls13ServerClientKeyShareGroup()
 
 fn msquicNativeResetSession() =
     msquicNativeSession.active = false
@@ -1161,6 +1179,86 @@ fn msquicNativeDebugBuildClientHelloWire(): Result[Bytes] =
     if IsErr(headerRes):
         return Err[Bytes](ErrorText(headerRes))
     return Ok[Bytes](bytesConcat3(Value(headerRes), payload, emptyBytes()))
+
+fn msquicNativeDebugExtractFirstCryptoData(payload: Bytes): Result[Bytes] =
+    let kindRes: Result[QuicVarIntDecoded] = quicVarIntDecode(payload, 0)
+    if IsErr(kindRes):
+        return Err[Bytes](ErrorText(kindRes))
+    let kindDec: QuicVarIntDecoded = Value(kindRes)
+    if kindDec.value != int64(msquicNativeFrameCryptoCode):
+        return Err[Bytes]("msquic native: debug first frame ! crypto")
+    let streamRes: Result[QuicVarIntDecoded] = quicVarIntDecode(payload, kindDec.next)
+    if IsErr(streamRes):
+        return Err[Bytes](ErrorText(streamRes))
+    let streamDec: QuicVarIntDecoded = Value(streamRes)
+    let offsetRes: Result[QuicVarIntDecoded] = quicVarIntDecode(payload, streamDec.next)
+    if IsErr(offsetRes):
+        return Err[Bytes](ErrorText(offsetRes))
+    let offsetDec: QuicVarIntDecoded = Value(offsetRes)
+    let lenRes: Result[QuicVarIntDecoded] = quicVarIntDecode(payload, offsetDec.next)
+    if IsErr(lenRes):
+        return Err[Bytes](ErrorText(lenRes))
+    let lenDec: QuicVarIntDecoded = Value(lenRes)
+    let dataLen: int32 = int32(lenDec.value)
+    if dataLen <= 0:
+        return Err[Bytes]("msquic native: debug crypto payload empty")
+    let dataStart: int32 = lenDec.next
+    let dataEnd: int32 = dataStart + dataLen
+    if dataEnd > bytesLen(payload):
+        return Err[Bytes]("msquic native: debug crypto payload truncated")
+    let out: Bytes = bytesSlice(payload, dataStart, dataLen)
+    return Ok[Bytes](out)
+
+fn msquicNativeDebugFeedClientHelloPayload(): Result[bool] =
+    msquicNativeResetServerHandshake(false)
+    let payloadRes: Result[Bytes] = msquicNativeDebugBuildClientHelloPayload()
+    if IsErr(payloadRes):
+        return Err[bool](ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+    let helloRes: Result[Bytes] = msquicNativeDebugExtractFirstCryptoData(payload)
+    if IsErr(helloRes):
+        return Err[bool](ErrorText(helloRes))
+    let hello: Bytes = Value(helloRes)
+    let feedRes: Result[int32] = msquicNativeFeedServerHandshake(hello)
+    if IsErr(feedRes):
+        return Err[bool](ErrorText(feedRes))
+    let messageCount: int32 = Value(feedRes)
+    if messageCount != 1:
+        return Err[bool]("msquic native: debug initial expected one handshake message")
+    let keyShareGroup: int32 = msquicNativeServerClientKeyShareGroup()
+    if keyShareGroup <= 0:
+        return Err[bool]("msquic native: debug initial missing server client key share")
+    return Ok[bool](true)
+
+fn msquicNativeDebugRoundtripClientHelloInitial(): Result[bool] =
+    msquicNativeResetServerHandshake(false)
+    let wireRes: Result[Bytes] = msquicNativeDebugBuildClientHelloWire()
+    if IsErr(wireRes):
+        return Err[bool](ErrorText(wireRes))
+    let wire: Bytes = Value(wireRes)
+    let decodeHeaderRes: Result[QuicPacketHeaderDecoded] = quicPacketHeaderDecode(wire, msquicNativeConnIdLen)
+    if IsErr(decodeHeaderRes):
+        return Err[bool](ErrorText(decodeHeaderRes))
+    let headerDec: QuicPacketHeaderDecoded = Value(decodeHeaderRes)
+    let payloadOffset: int32 = headerDec.next
+    let payloadLen: int32 = int32(headerDec.header.payloadLength) - headerDec.header.packetNumberLen
+    if payloadLen <= 0:
+        return Err[bool]("msquic native: debug roundtrip payload empty")
+    let payload: Bytes = bytesSlice(wire, payloadOffset, payloadLen)
+    let helloRes: Result[Bytes] = msquicNativeDebugExtractFirstCryptoData(payload)
+    if IsErr(helloRes):
+        return Err[bool](ErrorText(helloRes))
+    let hello: Bytes = Value(helloRes)
+    let feedRes: Result[int32] = msquicNativeFeedServerHandshake(hello)
+    if IsErr(feedRes):
+        return Err[bool](ErrorText(feedRes))
+    let messageCount: int32 = Value(feedRes)
+    if messageCount != 1:
+        return Err[bool]("msquic native: debug roundtrip expected one handshake message")
+    let keyShareGroup: int32 = msquicNativeServerClientKeyShareGroup()
+    if keyShareGroup <= 0:
+        return Err[bool]("msquic native: debug roundtrip missing server client key share")
+    return Ok[bool](true)
 
 fn msquicNativeSendServerFlight(): Result[bool] =
     if msquicNativeSession.serverFlightSent:

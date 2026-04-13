@@ -1,0 +1,1940 @@
+import std/result
+import std/times
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/dag_mempool as dag
+import cheng/v3/chain/content_plane as content
+import cheng/v3/chain/erasure_swarm as swarm
+import cheng/v3/chain/content_runtime as runtime
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/core/peerstore as ps
+import cheng/v3/libp2p/core/scheduler
+
+const
+    v3TailnetTrainRoleLeader: int32 = 1
+    v3TailnetTrainRoleWorker: int32 = 2
+    v3TailnetTrainRoleCheckpoint: int32 = 3
+
+type
+    V3TailnetTrainWorkerRoleKind = int32
+
+    V3TailnetTrainRendezvous =
+        rendezvousCid: layout.FixedBytes32
+        jobBundleCid: layout.FixedBytes32
+        requestedWorkerCount: int32
+        workload: scheduler.V3Libp2pWorkloadRequest
+        openedAtEpochSeconds: int64
+        deadlineEpochSeconds: int64
+        closed: bool
+
+    V3TailnetTrainWorkerMember =
+        peerId: types.V3Libp2pPeerId
+        endpoint: ps.V3Libp2pPeerEndpoint
+        roleKind: V3TailnetTrainWorkerRoleKind
+        sampledAtEpochSeconds: int64
+        joinedAtEpochSeconds: int64
+
+    V3TailnetTrainWorkerGroup =
+        rendezvousCid: layout.FixedBytes32
+        leaderPeerId: types.V3Libp2pPeerId
+        memberCount: int32
+        members: V3TailnetTrainWorkerMember[]
+        sealed: bool
+
+    V3TailnetTrainWorkerLease =
+        rendezvousCid: layout.FixedBytes32
+        peerId: types.V3Libp2pPeerId
+        roleKind: V3TailnetTrainWorkerRoleKind
+        parentVersionCid: layout.FixedBytes32
+        globalStep: int32
+        leasedAtEpochSeconds: int64
+        expiresAtEpochSeconds: int64
+        active: bool
+
+    V3TailnetTrainStepBarrier =
+        rendezvousCid: layout.FixedBytes32
+        parentVersionCid: layout.FixedBytes32
+        globalStep: int32
+        expectedMemberCount: int32
+        arrivedCount: int32
+        arrivedPeerIds: types.V3Libp2pPeerId[]
+        sealed: bool
+
+    V3TailnetTrainMergeContribution =
+        peerId: types.V3Libp2pPeerId
+        parentVersionCid: layout.FixedBytes32
+        globalStep: int32
+        optimizerStateCid: layout.FixedBytes32
+        optimizerPayloadLen: int32
+        submittedAtEpochSeconds: int64
+
+    V3TailnetTrainMergeRound =
+        rendezvousCid: layout.FixedBytes32
+        parentVersionCid: layout.FixedBytes32
+        globalStep: int32
+        expectedMemberCount: int32
+        acceptedCount: int32
+        contributions: V3TailnetTrainMergeContribution[]
+        sealed: bool
+
+    V3TailnetCheckpointVersion =
+        versionCid: layout.FixedBytes32
+        versionEpochSeconds: int64
+        globalStep: int32
+        publisherPeerId: types.V3Libp2pPeerId
+        jobBundleCid: layout.FixedBytes32
+        stubCid: layout.FixedBytes32
+        blobSummaryCid: layout.FixedBytes32
+        payloadLen: int32
+        manifestCid: layout.FixedBytes32
+        blobCid: layout.FixedBytes32
+        paramsCid: layout.FixedBytes32
+        layoutKind: int32
+        dataShardCount: int32
+        parityShardCount: int32
+        shardPayloadBytes: int32
+        optimizerStateCid: layout.FixedBytes32
+        optimizerPayloadLen: int32
+        prevVersionCid: layout.FixedBytes32
+
+    V3TailnetCheckpointSurface =
+        jobBundleCid: layout.FixedBytes32
+        latestVersionCid: layout.FixedBytes32
+        versionCount: int32
+        latestVersion: V3TailnetCheckpointVersion
+        versions: V3TailnetCheckpointVersion[]
+
+    V3TailnetCheckpointDeltaChunk =
+        offset: int32
+        payloadLen: int32
+        payload: Bytes
+
+    V3TailnetCheckpointDelta =
+        baseVersionCid: layout.FixedBytes32
+        targetVersionCid: layout.FixedBytes32
+        targetBlobCid: layout.FixedBytes32
+        targetBlobSummaryCid: layout.FixedBytes32
+        targetPayloadLen: int32
+        targetShardPayloadBytes: int32
+        chunkSpanBytes: int32
+        chunkCount: int32
+        chunks: V3TailnetCheckpointDeltaChunk[]
+
+    V3TailnetCheckpointWriteback =
+        versionCid: layout.FixedBytes32
+        baseVersionCid: layout.FixedBytes32
+        manifestCid: layout.FixedBytes32
+        blobCid: layout.FixedBytes32
+        payloadLen: int32
+        shardCount: int32
+        deltaChunkCount: int32
+        writtenAtEpochSeconds: int64
+
+    V3TailnetTrainIsland =
+        islandId: layout.FixedBytes32
+        coordinatorPeerId: types.V3Libp2pPeerId
+        trustedOnly: bool
+        rendezvouses: V3TailnetTrainRendezvous[]
+        groups: V3TailnetTrainWorkerGroup[]
+        workerLeases: V3TailnetTrainWorkerLease[]
+        stepBarriers: V3TailnetTrainStepBarrier[]
+        mergeRounds: V3TailnetTrainMergeRound[]
+        checkpoints: V3TailnetCheckpointSurface[]
+        writebacks: V3TailnetCheckpointWriteback[]
+
+fn v3TailnetTrainRendezvousZero(): V3TailnetTrainRendezvous =
+    return V3TailnetTrainRendezvous(
+        rendezvousCid: layout.fixedBytes32Zero(),
+        jobBundleCid: layout.fixedBytes32Zero(),
+        requestedWorkerCount: 0,
+        workload: scheduler.v3Libp2pWorkloadRequestZero(),
+        openedAtEpochSeconds: int64(0),
+        deadlineEpochSeconds: int64(0),
+        closed: false
+    )
+
+fn v3TailnetTrainWorkerMemberZero(): V3TailnetTrainWorkerMember =
+    return V3TailnetTrainWorkerMember(
+        peerId: types.v3Libp2pPeerIdZero(),
+        endpoint: ps.v3Libp2pPeerEndpointZero(),
+        roleKind: v3TailnetTrainRoleWorker,
+        sampledAtEpochSeconds: int64(0),
+        joinedAtEpochSeconds: int64(0)
+    )
+
+fn v3TailnetTrainWorkerGroupZero(): V3TailnetTrainWorkerGroup =
+    return V3TailnetTrainWorkerGroup(
+        rendezvousCid: layout.fixedBytes32Zero(),
+        leaderPeerId: types.v3Libp2pPeerIdZero(),
+        memberCount: 0,
+        members: [],
+        sealed: false
+    )
+
+fn v3TailnetTrainWorkerLeaseZero(): V3TailnetTrainWorkerLease =
+    return V3TailnetTrainWorkerLease(
+        rendezvousCid: layout.fixedBytes32Zero(),
+        peerId: types.v3Libp2pPeerIdZero(),
+        roleKind: v3TailnetTrainRoleWorker,
+        parentVersionCid: layout.fixedBytes32Zero(),
+        globalStep: 0,
+        leasedAtEpochSeconds: int64(0),
+        expiresAtEpochSeconds: int64(0),
+        active: false
+    )
+
+fn v3TailnetTrainStepBarrierZero(): V3TailnetTrainStepBarrier =
+    return V3TailnetTrainStepBarrier(
+        rendezvousCid: layout.fixedBytes32Zero(),
+        parentVersionCid: layout.fixedBytes32Zero(),
+        globalStep: 0,
+        expectedMemberCount: 0,
+        arrivedCount: 0,
+        arrivedPeerIds: [],
+        sealed: false
+    )
+
+fn v3TailnetTrainMergeContributionZero(): V3TailnetTrainMergeContribution =
+    return V3TailnetTrainMergeContribution(
+        peerId: types.v3Libp2pPeerIdZero(),
+        parentVersionCid: layout.fixedBytes32Zero(),
+        globalStep: 0,
+        optimizerStateCid: layout.fixedBytes32Zero(),
+        optimizerPayloadLen: 0,
+        submittedAtEpochSeconds: int64(0)
+    )
+
+fn v3TailnetTrainMergeRoundZero(): V3TailnetTrainMergeRound =
+    return V3TailnetTrainMergeRound(
+        rendezvousCid: layout.fixedBytes32Zero(),
+        parentVersionCid: layout.fixedBytes32Zero(),
+        globalStep: 0,
+        expectedMemberCount: 0,
+        acceptedCount: 0,
+        contributions: [],
+        sealed: false
+    )
+
+fn v3TailnetCheckpointVersionZero(): V3TailnetCheckpointVersion =
+    var out: V3TailnetCheckpointVersion
+    out.versionCid = layout.fixedBytes32Zero()
+    out.versionEpochSeconds = int64(0)
+    out.globalStep = 0
+    out.publisherPeerId = types.v3Libp2pPeerIdZero()
+    out.jobBundleCid = layout.fixedBytes32Zero()
+    out.stubCid = layout.fixedBytes32Zero()
+    out.blobSummaryCid = layout.fixedBytes32Zero()
+    out.payloadLen = 0
+    out.manifestCid = layout.fixedBytes32Zero()
+    out.blobCid = layout.fixedBytes32Zero()
+    out.paramsCid = layout.fixedBytes32Zero()
+    out.layoutKind = 0
+    out.dataShardCount = 0
+    out.parityShardCount = 0
+    out.shardPayloadBytes = 0
+    out.optimizerStateCid = layout.fixedBytes32Zero()
+    out.optimizerPayloadLen = 0
+    out.prevVersionCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3TailnetCheckpointSurfaceZero(): V3TailnetCheckpointSurface =
+    var out: V3TailnetCheckpointSurface
+    out.jobBundleCid = layout.fixedBytes32Zero()
+    out.latestVersionCid = layout.fixedBytes32Zero()
+    out.versionCount = 0
+    out.latestVersion = v3TailnetCheckpointVersionZero()
+    out.versions = []
+    return out
+
+fn v3TailnetCheckpointDeltaChunkZero(): V3TailnetCheckpointDeltaChunk =
+    return V3TailnetCheckpointDeltaChunk(
+        offset: 0,
+        payloadLen: 0,
+        payload: emptyBytes()
+    )
+
+fn v3TailnetCheckpointDeltaZero(): V3TailnetCheckpointDelta =
+    var out: V3TailnetCheckpointDelta
+    out.baseVersionCid = layout.fixedBytes32Zero()
+    out.targetVersionCid = layout.fixedBytes32Zero()
+    out.targetBlobCid = layout.fixedBytes32Zero()
+    out.targetBlobSummaryCid = layout.fixedBytes32Zero()
+    out.targetPayloadLen = 0
+    out.targetShardPayloadBytes = 0
+    out.chunkSpanBytes = 0
+    out.chunkCount = 0
+    out.chunks = []
+    return out
+
+fn v3TailnetCheckpointWritebackZero(): V3TailnetCheckpointWriteback =
+    return V3TailnetCheckpointWriteback(
+        versionCid: layout.fixedBytes32Zero(),
+        baseVersionCid: layout.fixedBytes32Zero(),
+        manifestCid: layout.fixedBytes32Zero(),
+        blobCid: layout.fixedBytes32Zero(),
+        payloadLen: 0,
+        shardCount: 0,
+        deltaChunkCount: 0,
+        writtenAtEpochSeconds: int64(0)
+    )
+
+fn v3TailnetTrainIslandInit(seed: str): V3TailnetTrainIsland =
+    var coordinatorPeerId = types.v3Libp2pPeerIdZero()
+    peer_id.v3Libp2pPeerIdFillFromSeed(coordinatorPeerId, seed)
+    return V3TailnetTrainIsland(
+        islandId: coordinatorPeerId.value,
+        coordinatorPeerId: coordinatorPeerId,
+        trustedOnly: true,
+        rendezvouses: [],
+        groups: [],
+        workerLeases: [],
+        stepBarriers: [],
+        mergeRounds: [],
+        checkpoints: [],
+        writebacks: []
+    )
+
+fn v3TailnetTrainIslandRendezvousPos(island: var V3TailnetTrainIsland,
+                                     rendezvousCid: layout.FixedBytes32): int32 =
+    if island.rendezvouses.len <= 0:
+        return -1
+    for i in 0..<island.rendezvouses.len:
+        if layout.fixedBytes32Equal(island.rendezvouses[i].rendezvousCid, rendezvousCid):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandGroupPos(island: var V3TailnetTrainIsland,
+                                rendezvousCid: layout.FixedBytes32): int32 =
+    if island.groups.len <= 0:
+        return -1
+    for i in 0..<island.groups.len:
+        if layout.fixedBytes32Equal(island.groups[i].rendezvousCid, rendezvousCid):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandWorkerLeasePos(island: var V3TailnetTrainIsland,
+                                      rendezvousCid: layout.FixedBytes32,
+                                      peerId: types.V3Libp2pPeerId): int32 =
+    if island.workerLeases.len <= 0:
+        return -1
+    for i in 0..<island.workerLeases.len:
+        if !layout.fixedBytes32Equal(island.workerLeases[i].rendezvousCid, rendezvousCid):
+            continue
+        if types.v3Libp2pPeerIdEqual(island.workerLeases[i].peerId, peerId):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandStepBarrierPos(island: var V3TailnetTrainIsland,
+                                      rendezvousCid: layout.FixedBytes32,
+                                      parentVersionCid: layout.FixedBytes32,
+                                      globalStep: int32): int32 =
+    if island.stepBarriers.len <= 0:
+        return -1
+    for i in 0..<island.stepBarriers.len:
+        if !layout.fixedBytes32Equal(island.stepBarriers[i].rendezvousCid, rendezvousCid):
+            continue
+        if !layout.fixedBytes32Equal(island.stepBarriers[i].parentVersionCid, parentVersionCid):
+            continue
+        if island.stepBarriers[i].globalStep == globalStep:
+            return i
+    return -1
+
+fn v3TailnetTrainIslandMergeRoundPos(island: var V3TailnetTrainIsland,
+                                     rendezvousCid: layout.FixedBytes32,
+                                     parentVersionCid: layout.FixedBytes32,
+                                     globalStep: int32): int32 =
+    if island.mergeRounds.len <= 0:
+        return -1
+    for i in 0..<island.mergeRounds.len:
+        if !layout.fixedBytes32Equal(island.mergeRounds[i].rendezvousCid, rendezvousCid):
+            continue
+        if !layout.fixedBytes32Equal(island.mergeRounds[i].parentVersionCid, parentVersionCid):
+            continue
+        if island.mergeRounds[i].globalStep == globalStep:
+            return i
+    return -1
+
+fn v3TailnetTrainIslandCheckpointSurfacePos(island: var V3TailnetTrainIsland,
+                                            jobBundleCid: layout.FixedBytes32): int32 =
+    if island.checkpoints.len <= 0:
+        return -1
+    for i in 0..<island.checkpoints.len:
+        if layout.fixedBytes32Equal(island.checkpoints[i].jobBundleCid, jobBundleCid):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandCheckpointVersionPos(surface: V3TailnetCheckpointSurface,
+                                            versionCid: layout.FixedBytes32): int32 =
+    if surface.versions.len <= 0:
+        return -1
+    for i in 0..<surface.versions.len:
+        if layout.fixedBytes32Equal(surface.versions[i].versionCid, versionCid):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandCheckpointWritebackPos(island: var V3TailnetTrainIsland,
+                                              versionCid: layout.FixedBytes32): int32 =
+    if island.writebacks.len <= 0:
+        return -1
+    for i in 0..<island.writebacks.len:
+        if layout.fixedBytes32Equal(island.writebacks[i].versionCid, versionCid):
+            return i
+    return -1
+
+fn v3TailnetTrainIslandWorkerGroupContainsPeer(group: V3TailnetTrainWorkerGroup,
+                                               peerId: types.V3Libp2pPeerId): bool =
+    for i in 0..<group.members.len:
+        if types.v3Libp2pPeerIdEqual(group.members[i].peerId, peerId):
+            return true
+    return false
+
+fn v3TailnetTrainWorkerLeaseActiveAt(lease: V3TailnetTrainWorkerLease, now: int64): bool =
+    return lease.active && lease.expiresAtEpochSeconds > now
+
+fn v3TailnetTrainStepBarrierReady(barrier: V3TailnetTrainStepBarrier): bool =
+    return barrier.sealed && barrier.arrivedCount == barrier.expectedMemberCount
+
+fn v3TailnetTrainMergeContributionPos(round: V3TailnetTrainMergeRound,
+                                      peerId: types.V3Libp2pPeerId): int32 =
+    for i in 0..<round.contributions.len:
+        if types.v3Libp2pPeerIdEqual(round.contributions[i].peerId, peerId):
+            return i
+    return -1
+
+fn v3TailnetTrainMergeRoundReady(round: V3TailnetTrainMergeRound): bool =
+    return round.sealed && round.acceptedCount == round.expectedMemberCount
+
+fn v3TailnetTrainIslandWorkerGroupMemberFill(out: var V3TailnetTrainWorkerMember,
+                                             group: V3TailnetTrainWorkerGroup,
+                                             peerId: types.V3Libp2pPeerId): bool =
+    for i in 0..<group.members.len:
+        if !types.v3Libp2pPeerIdEqual(group.members[i].peerId, peerId):
+            continue
+        out = group.members[i]
+        return true
+    out = v3TailnetTrainWorkerMemberZero()
+    return false
+
+fn v3TailnetTrainStepBarrierHasPeer(barrier: V3TailnetTrainStepBarrier,
+                                    peerId: types.V3Libp2pPeerId): bool =
+    for i in 0..<barrier.arrivedPeerIds.len:
+        if types.v3Libp2pPeerIdEqual(barrier.arrivedPeerIds[i], peerId):
+            return true
+    return false
+
+fn v3TailnetTrainRendezvousCid(islandId: layout.FixedBytes32,
+                               jobBundleCid: layout.FixedBytes32,
+                               ordinal: int32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(128)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.tailnet.train.rendezvous"))
+    lt.v3AppendFixed32(buf, islandId)
+    lt.v3AppendFixed32(buf, jobBundleCid)
+    lt.v3AppendU32BE(buf, ordinal)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3TailnetCheckpointVersionCid(jobBundleCid: layout.FixedBytes32,
+                                 globalStep: int32,
+                                 publisherPeerId: types.V3Libp2pPeerId,
+                                 stubCid: layout.FixedBytes32,
+                                 manifestCid: layout.FixedBytes32,
+                                 blobCid: layout.FixedBytes32,
+                                 optimizerStateCid: layout.FixedBytes32,
+                                 prevVersionCid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.tailnet.train.checkpoint"))
+    lt.v3AppendFixed32(buf, jobBundleCid)
+    lt.v3AppendU32BE(buf, globalStep)
+    lt.v3AppendFixed32(buf, publisherPeerId.value)
+    lt.v3AppendFixed32(buf, stubCid)
+    lt.v3AppendFixed32(buf, manifestCid)
+    lt.v3AppendFixed32(buf, blobCid)
+    lt.v3AppendFixed32(buf, optimizerStateCid)
+    lt.v3AppendFixed32(buf, prevVersionCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3TailnetTrainIslandBytesRangeEqual(left: Bytes,
+                                       leftOffset: int32,
+                                       right: Bytes,
+                                       rightOffset: int32,
+                                       count: int32): bool =
+    if count < 0:
+        return false
+    if leftOffset < 0 || rightOffset < 0:
+        return false
+    if (leftOffset + count) > bytesLen(left):
+        return false
+    if (rightOffset + count) > bytesLen(right):
+        return false
+    for i in 0..<count:
+        if bytesGet(left, leftOffset + i) != bytesGet(right, rightOffset + i):
+            return false
+    return true
+
+fn v3TailnetTrainIslandCheckpointDeltaChunkValidate(chunk: V3TailnetCheckpointDeltaChunk,
+                                                    targetPayloadLen: int32): Result[bool] =
+    if chunk.offset < 0:
+        return Err[bool]("v3 tailnet train island: delta chunk offset")
+    if chunk.payloadLen <= 0:
+        return Err[bool]("v3 tailnet train island: delta chunk payload len")
+    if bytesLen(chunk.payload) != chunk.payloadLen:
+        return Err[bool]("v3 tailnet train island: delta chunk payload bytes")
+    if (chunk.offset + chunk.payloadLen) > targetPayloadLen:
+        return Err[bool]("v3 tailnet train island: delta chunk range")
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointDeltaValidate(delta: V3TailnetCheckpointDelta): Result[bool] =
+    if layout.fixedBytes32Equal(delta.targetVersionCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: delta target version missing")
+    if layout.fixedBytes32Equal(delta.targetBlobCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: delta target blob missing")
+    if layout.fixedBytes32Equal(delta.targetBlobSummaryCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: delta target summary missing")
+    if delta.targetPayloadLen < 0:
+        return Err[bool]("v3 tailnet train island: delta target payload len")
+    if delta.targetShardPayloadBytes <= 0:
+        return Err[bool]("v3 tailnet train island: delta shard payload bytes")
+    if delta.chunkSpanBytes <= 0:
+        return Err[bool]("v3 tailnet train island: delta chunk span")
+    if delta.chunkCount != delta.chunks.len:
+        return Err[bool]("v3 tailnet train island: delta chunk count")
+    var nextOffset = 0
+    for i in 0..<delta.chunks.len:
+        let chunkOk = v3TailnetTrainIslandCheckpointDeltaChunkValidate(delta.chunks[i],
+                                                                       delta.targetPayloadLen)
+        if IsErr(chunkOk):
+            return Err[bool](Error(chunkOk))
+        if delta.chunks[i].offset < nextOffset:
+            return Err[bool]("v3 tailnet train island: delta chunk order")
+        nextOffset = delta.chunks[i].offset + delta.chunks[i].payloadLen
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointWritebackFill(out: var V3TailnetCheckpointWriteback,
+                                               island: var V3TailnetTrainIsland,
+                                               versionCid: layout.FixedBytes32): bool =
+    let pos = v3TailnetTrainIslandCheckpointWritebackPos(island, versionCid)
+    if pos < 0 || pos >= island.writebacks.len:
+        out = v3TailnetCheckpointWritebackZero()
+        return false
+    out = island.writebacks[pos]
+    return true
+
+fn v3TailnetTrainIslandCheckpointVersionHasBase(version: V3TailnetCheckpointVersion): bool =
+    return !layout.fixedBytes32Equal(version.prevVersionCid, layout.fixedBytes32Zero())
+
+fn v3TailnetTrainIslandCheckpointDeltaHasBase(delta: V3TailnetCheckpointDelta): bool =
+    return !layout.fixedBytes32Equal(delta.baseVersionCid, layout.fixedBytes32Zero())
+
+fn v3TailnetTrainIslandWorkerLeaseFill(out: var V3TailnetTrainWorkerLease,
+                                       island: var V3TailnetTrainIsland,
+                                       rendezvousCid: layout.FixedBytes32,
+                                       peerId: types.V3Libp2pPeerId): bool =
+    let pos = v3TailnetTrainIslandWorkerLeasePos(island, rendezvousCid, peerId)
+    if pos < 0 || pos >= island.workerLeases.len:
+        out = v3TailnetTrainWorkerLeaseZero()
+        return false
+    out = island.workerLeases[pos]
+    return true
+
+fn v3TailnetTrainIslandStepBarrierFill(out: var V3TailnetTrainStepBarrier,
+                                       island: var V3TailnetTrainIsland,
+                                       rendezvousCid: layout.FixedBytes32,
+                                       parentVersionCid: layout.FixedBytes32,
+                                       globalStep: int32): bool =
+    let pos = v3TailnetTrainIslandStepBarrierPos(island,
+                                                 rendezvousCid,
+                                                 parentVersionCid,
+                                                 globalStep)
+    if pos < 0 || pos >= island.stepBarriers.len:
+        out = v3TailnetTrainStepBarrierZero()
+        return false
+    out = island.stepBarriers[pos]
+    return true
+
+fn v3TailnetTrainIslandMergeRoundFill(out: var V3TailnetTrainMergeRound,
+                                      island: var V3TailnetTrainIsland,
+                                      rendezvousCid: layout.FixedBytes32,
+                                      parentVersionCid: layout.FixedBytes32,
+                                      globalStep: int32): bool =
+    let pos = v3TailnetTrainIslandMergeRoundPos(island,
+                                                rendezvousCid,
+                                                parentVersionCid,
+                                                globalStep)
+    if pos < 0 || pos >= island.mergeRounds.len:
+        out = v3TailnetTrainMergeRoundZero()
+        return false
+    out = island.mergeRounds[pos]
+    return true
+
+fn v3TailnetTrainIslandCheckpointParentValidate(island: var V3TailnetTrainIsland,
+                                                group: V3TailnetTrainWorkerGroup,
+                                                parentVersionCid: layout.FixedBytes32,
+                                                globalStep: int32): Result[bool] =
+    let rendezvousPos = v3TailnetTrainIslandRendezvousPos(island, group.rendezvousCid)
+    if rendezvousPos < 0:
+        return Err[bool]("v3 tailnet train island: rendezvous missing")
+    if !group.sealed:
+        return Err[bool]("v3 tailnet train island: worker group not sealed")
+    let jobBundleCid = island.rendezvouses[rendezvousPos].jobBundleCid
+    if layout.fixedBytes32Equal(jobBundleCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: job bundle cid missing")
+    if layout.fixedBytes32Equal(parentVersionCid, layout.fixedBytes32Zero()):
+        if v3TailnetTrainIslandCheckpointSurfacePos(island, jobBundleCid) >= 0:
+            return Err[bool]("v3 tailnet train island: parent version missing")
+        if globalStep <= 0:
+            return Err[bool]("v3 tailnet train island: global step")
+        return Ok[bool](true)
+    var parentVersion = v3TailnetCheckpointVersionZero()
+    if !v3TailnetTrainIslandCheckpointVersionFill(parentVersion, island, parentVersionCid):
+        return Err[bool]("v3 tailnet train island: parent version missing")
+    if !layout.fixedBytes32Equal(parentVersion.jobBundleCid, jobBundleCid):
+        return Err[bool]("v3 tailnet train island: parent job bundle mismatch")
+    var latest = v3TailnetCheckpointVersionZero()
+    if !v3TailnetTrainIslandCheckpointLatestFill(latest, island, jobBundleCid):
+        return Err[bool]("v3 tailnet train island: parent latest missing")
+    if !layout.fixedBytes32Equal(latest.versionCid, parentVersionCid):
+        return Err[bool]("v3 tailnet train island: stale parent version")
+    if globalStep <= parentVersion.globalStep:
+        return Err[bool]("v3 tailnet train island: global step")
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandBarrierExpectedMembers(island: var V3TailnetTrainIsland,
+                                              group: V3TailnetTrainWorkerGroup,
+                                              parentVersionCid: layout.FixedBytes32,
+                                              globalStep: int32): int32 =
+    let now = times.epochTimeSeconds()
+    var count = 0
+    for i in 0..<group.members.len:
+        let leasePos = v3TailnetTrainIslandWorkerLeasePos(island,
+                                                          group.rendezvousCid,
+                                                          group.members[i].peerId)
+        if leasePos < 0:
+            continue
+        let lease = island.workerLeases[leasePos]
+        if !layout.fixedBytes32Equal(lease.parentVersionCid, parentVersionCid):
+            continue
+        if lease.globalStep != globalStep:
+            continue
+        if !v3TailnetTrainWorkerLeaseActiveAt(lease, now):
+            continue
+        count = count + 1
+    return count
+
+fn v3TailnetTrainIslandCheckpointVersionParams(version: V3TailnetCheckpointVersion): swarm.V3ErasureEncodingParams =
+    var params = swarm.v3ErasureEncodingParamsZero()
+    params.version = 1
+    params.layoutKind = version.layoutKind
+    params.dataShardCount = version.dataShardCount
+    params.parityShardCount = version.parityShardCount
+    params.shardPayloadBytes = version.shardPayloadBytes
+    params.paramsCid = version.paramsCid
+    return params
+
+fn v3TailnetTrainIslandCheckpointBlobCachedFill(out: var Bytes,
+                                                runtimeState: runtime.V3ContentRuntime,
+                                                version: V3TailnetCheckpointVersion): bool =
+    return runtime.v3ContentRuntimeCachedBlob(runtimeState, version.blobCid, out)
+
+fn v3TailnetTrainIslandOpenRendezvousFill(out: var V3TailnetTrainRendezvous,
+                                          island: var V3TailnetTrainIsland,
+                                          jobBundleCid: layout.FixedBytes32,
+                                          requestedWorkerCount: int32,
+                                          workload: scheduler.V3Libp2pWorkloadRequest,
+                                          deadlineEpochSeconds: int64): Result[bool] =
+    if requestedWorkerCount <= 0:
+        return Err[bool]("v3 tailnet train island: requested worker count")
+    if layout.fixedBytes32Equal(jobBundleCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: job bundle cid missing")
+    let now = times.epochTimeSeconds()
+    if deadlineEpochSeconds <= now:
+        return Err[bool]("v3 tailnet train island: deadline expired")
+    out = v3TailnetTrainRendezvousZero()
+    out.rendezvousCid = v3TailnetTrainRendezvousCid(island.islandId,
+                                                    jobBundleCid,
+                                                    island.rendezvouses.len + 1)
+    out.jobBundleCid = jobBundleCid
+    out.requestedWorkerCount = requestedWorkerCount
+    out.workload = workload
+    out.openedAtEpochSeconds = now
+    out.deadlineEpochSeconds = deadlineEpochSeconds
+    add(island.rendezvouses, out)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandSealWorkerGroup(island: var V3TailnetTrainIsland,
+                                       group: V3TailnetTrainWorkerGroup): Result[bool] =
+    let rendezvousPos = v3TailnetTrainIslandRendezvousPos(island, group.rendezvousCid)
+    if rendezvousPos < 0:
+        return Err[bool]("v3 tailnet train island: rendezvous missing")
+    if island.rendezvouses[rendezvousPos].closed:
+        return Err[bool]("v3 tailnet train island: rendezvous closed")
+    if group.memberCount <= 0 || group.members.len != group.memberCount:
+        return Err[bool]("v3 tailnet train island: invalid worker group")
+    if !v3TailnetTrainIslandWorkerGroupContainsPeer(group, group.leaderPeerId):
+        return Err[bool]("v3 tailnet train island: leader missing")
+    var sealedGroup = group
+    sealedGroup.sealed = true
+    let groupPos = v3TailnetTrainIslandGroupPos(island, group.rendezvousCid)
+    if groupPos >= 0:
+        island.groups[groupPos] = sealedGroup
+    else:
+        add(island.groups, sealedGroup)
+    island.rendezvouses[rendezvousPos].closed = true
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandGrantWorkerLeaseFill(out: var V3TailnetTrainWorkerLease,
+                                            island: var V3TailnetTrainIsland,
+                                            group: V3TailnetTrainWorkerGroup,
+                                            peerId: types.V3Libp2pPeerId,
+                                            parentVersionCid: layout.FixedBytes32,
+                                            globalStep: int32,
+                                            ttlSeconds: int64): Result[bool] =
+    if ttlSeconds <= 0:
+        return Err[bool]("v3 tailnet train island: lease ttl")
+    var groupPos = -1
+    for i in 0..<island.groups.len:
+        if layout.fixedBytes32Equal(island.groups[i].rendezvousCid, group.rendezvousCid):
+            groupPos = i
+            break
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    if !island.groups[groupPos].sealed:
+        return Err[bool]("v3 tailnet train island: worker group not sealed")
+    var member = v3TailnetTrainWorkerMemberZero()
+    if !v3TailnetTrainIslandWorkerGroupMemberFill(member, island.groups[groupPos], peerId):
+        return Err[bool]("v3 tailnet train island: worker peer missing")
+    let parentOk = v3TailnetTrainIslandCheckpointParentValidate(island,
+                                                                island.groups[groupPos],
+                                                                parentVersionCid,
+                                                                globalStep)
+    if IsErr(parentOk):
+        return Err[bool](Error(parentOk))
+    out = v3TailnetTrainWorkerLeaseZero()
+    out.rendezvousCid = island.groups[groupPos].rendezvousCid
+    out.peerId = peerId
+    out.roleKind = member.roleKind
+    out.parentVersionCid = parentVersionCid
+    out.globalStep = globalStep
+    out.leasedAtEpochSeconds = times.epochTimeSeconds()
+    out.expiresAtEpochSeconds = out.leasedAtEpochSeconds + ttlSeconds
+    out.active = true
+    let leasePos = v3TailnetTrainIslandWorkerLeasePos(island, out.rendezvousCid, peerId)
+    if leasePos >= 0:
+        island.workerLeases[leasePos] = out
+    else:
+        add(island.workerLeases, out)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandOpenStepBarrierFill(out: var V3TailnetTrainStepBarrier,
+                                           island: var V3TailnetTrainIsland,
+                                           rendezvousCid: layout.FixedBytes32,
+                                           parentVersionCid: layout.FixedBytes32,
+                                           globalStep: int32): Result[bool] =
+    let groupPos = v3TailnetTrainIslandGroupPos(island, rendezvousCid)
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    let parentOk = v3TailnetTrainIslandCheckpointParentValidate(island,
+                                                                island.groups[groupPos],
+                                                                parentVersionCid,
+                                                                globalStep)
+    if IsErr(parentOk):
+        return Err[bool](Error(parentOk))
+    if island.stepBarriers.len > 0:
+        if v3TailnetTrainIslandStepBarrierPos(island,
+                                              rendezvousCid,
+                                              parentVersionCid,
+                                              globalStep) >= 0:
+            return Err[bool]("v3 tailnet train island: step barrier duplicate")
+    let expectedMemberCount = v3TailnetTrainIslandBarrierExpectedMembers(island,
+                                                                         island.groups[groupPos],
+                                                                         parentVersionCid,
+                                                                         globalStep)
+    if expectedMemberCount <= 0:
+        return Err[bool]("v3 tailnet train island: step barrier lease missing")
+    out = v3TailnetTrainStepBarrierZero()
+    out.rendezvousCid = rendezvousCid
+    out.parentVersionCid = parentVersionCid
+    out.globalStep = globalStep
+    out.expectedMemberCount = expectedMemberCount
+    add(island.stepBarriers, out)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandOpenStepBarrier(out: var V3TailnetTrainStepBarrier,
+                                       island: var V3TailnetTrainIsland,
+                                       rendezvousCid: layout.FixedBytes32,
+                                       parentVersionCid: layout.FixedBytes32,
+                                       globalStep: int32): bool =
+    let res = v3TailnetTrainIslandOpenStepBarrierFill(out,
+                                                      island,
+                                                      rendezvousCid,
+                                                      parentVersionCid,
+                                                      globalStep)
+    return IsOk(res)
+
+fn v3TailnetTrainIslandOpenMergeRoundFill(out: var V3TailnetTrainMergeRound,
+                                          island: var V3TailnetTrainIsland,
+                                          rendezvousCid: layout.FixedBytes32,
+                                          parentVersionCid: layout.FixedBytes32,
+                                          globalStep: int32): Result[bool] =
+    let groupPos = v3TailnetTrainIslandGroupPos(island, rendezvousCid)
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    let parentOk = v3TailnetTrainIslandCheckpointParentValidate(island,
+                                                                island.groups[groupPos],
+                                                                parentVersionCid,
+                                                                globalStep)
+    if IsErr(parentOk):
+        return Err[bool](Error(parentOk))
+    let barrierPos = v3TailnetTrainIslandStepBarrierPos(island,
+                                                        rendezvousCid,
+                                                        parentVersionCid,
+                                                        globalStep)
+    if barrierPos < 0:
+        return Err[bool]("v3 tailnet train island: step barrier missing")
+    if !v3TailnetTrainStepBarrierReady(island.stepBarriers[barrierPos]):
+        return Err[bool]("v3 tailnet train island: step barrier not ready")
+    if island.mergeRounds.len > 0:
+        if v3TailnetTrainIslandMergeRoundPos(island,
+                                             rendezvousCid,
+                                             parentVersionCid,
+                                             globalStep) >= 0:
+            return Err[bool]("v3 tailnet train island: merge round duplicate")
+    out = v3TailnetTrainMergeRoundZero()
+    out.rendezvousCid = rendezvousCid
+    out.parentVersionCid = parentVersionCid
+    out.globalStep = globalStep
+    out.expectedMemberCount = island.stepBarriers[barrierPos].expectedMemberCount
+    add(island.mergeRounds, out)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandOpenMergeRound(out: var V3TailnetTrainMergeRound,
+                                      island: var V3TailnetTrainIsland,
+                                      rendezvousCid: layout.FixedBytes32,
+                                      parentVersionCid: layout.FixedBytes32,
+                                      globalStep: int32): bool =
+    let res = v3TailnetTrainIslandOpenMergeRoundFill(out,
+                                                     island,
+                                                     rendezvousCid,
+                                                     parentVersionCid,
+                                                     globalStep)
+    return IsOk(res)
+
+fn v3TailnetTrainIslandSubmitMergeContributionFill(out: var V3TailnetTrainMergeContribution,
+                                                   island: var V3TailnetTrainIsland,
+                                                   rendezvousCid: layout.FixedBytes32,
+                                                   peerId: types.V3Libp2pPeerId,
+                                                   parentVersionCid: layout.FixedBytes32,
+                                                   globalStep: int32,
+                                                   optimizerStateCid: layout.FixedBytes32,
+                                                   optimizerPayloadLen: int32): Result[bool] =
+    if layout.fixedBytes32Equal(optimizerStateCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: merge optimizer cid missing")
+    if optimizerPayloadLen <= 0:
+        return Err[bool]("v3 tailnet train island: merge optimizer payload len")
+    let groupPos = v3TailnetTrainIslandGroupPos(island, rendezvousCid)
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    if !island.groups[groupPos].sealed:
+        return Err[bool]("v3 tailnet train island: worker group not sealed")
+    if !v3TailnetTrainIslandWorkerGroupContainsPeer(island.groups[groupPos], peerId):
+        return Err[bool]("v3 tailnet train island: worker peer missing")
+    let barrierPos = v3TailnetTrainIslandStepBarrierPos(island,
+                                                        rendezvousCid,
+                                                        parentVersionCid,
+                                                        globalStep)
+    if barrierPos < 0:
+        return Err[bool]("v3 tailnet train island: step barrier missing")
+    if !v3TailnetTrainStepBarrierReady(island.stepBarriers[barrierPos]):
+        return Err[bool]("v3 tailnet train island: step barrier not ready")
+    let leasePos = v3TailnetTrainIslandWorkerLeasePos(island, rendezvousCid, peerId)
+    if leasePos < 0:
+        return Err[bool]("v3 tailnet train island: worker lease missing")
+    let lease = island.workerLeases[leasePos]
+    if !layout.fixedBytes32Equal(lease.parentVersionCid, parentVersionCid):
+        return Err[bool]("v3 tailnet train island: worker lease parent mismatch")
+    if lease.globalStep != globalStep:
+        return Err[bool]("v3 tailnet train island: worker lease step mismatch")
+    if !v3TailnetTrainWorkerLeaseActiveAt(lease, times.epochTimeSeconds()):
+        return Err[bool]("v3 tailnet train island: worker lease expired")
+    let roundPos = v3TailnetTrainIslandMergeRoundPos(island,
+                                                     rendezvousCid,
+                                                     parentVersionCid,
+                                                     globalStep)
+    if roundPos < 0:
+        return Err[bool]("v3 tailnet train island: merge round missing")
+    var round = island.mergeRounds[roundPos]
+    if round.sealed:
+        return Err[bool]("v3 tailnet train island: merge round sealed")
+    if v3TailnetTrainMergeContributionPos(round, peerId) >= 0:
+        return Err[bool]("v3 tailnet train island: merge duplicate peer")
+    out = v3TailnetTrainMergeContributionZero()
+    out.peerId = peerId
+    out.parentVersionCid = parentVersionCid
+    out.globalStep = globalStep
+    out.optimizerStateCid = optimizerStateCid
+    out.optimizerPayloadLen = optimizerPayloadLen
+    out.submittedAtEpochSeconds = times.epochTimeSeconds()
+    add(round.contributions, out)
+    round.acceptedCount = round.contributions.len
+    if round.acceptedCount == round.expectedMemberCount:
+        round.sealed = true
+    island.mergeRounds[roundPos] = round
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandSubmitMergeContribution(out: var V3TailnetTrainMergeContribution,
+                                               island: var V3TailnetTrainIsland,
+                                               rendezvousCid: layout.FixedBytes32,
+                                               peerId: types.V3Libp2pPeerId,
+                                               parentVersionCid: layout.FixedBytes32,
+                                               globalStep: int32,
+                                               optimizerStateCid: layout.FixedBytes32,
+                                               optimizerPayloadLen: int32): bool =
+    let res = v3TailnetTrainIslandSubmitMergeContributionFill(out,
+                                                              island,
+                                                              rendezvousCid,
+                                                              peerId,
+                                                              parentVersionCid,
+                                                              globalStep,
+                                                              optimizerStateCid,
+                                                              optimizerPayloadLen)
+    return IsOk(res)
+
+fn v3TailnetTrainIslandArriveStepBarrierFill(out: var V3TailnetTrainStepBarrier,
+                                             island: var V3TailnetTrainIsland,
+                                             rendezvousCid: layout.FixedBytes32,
+                                             peerId: types.V3Libp2pPeerId,
+                                             parentVersionCid: layout.FixedBytes32,
+                                             globalStep: int32): Result[bool] =
+    let groupPos = v3TailnetTrainIslandGroupPos(island, rendezvousCid)
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    if !v3TailnetTrainIslandWorkerGroupContainsPeer(island.groups[groupPos], peerId):
+        return Err[bool]("v3 tailnet train island: worker peer missing")
+    let barrierPos = v3TailnetTrainIslandStepBarrierPos(island,
+                                                        rendezvousCid,
+                                                        parentVersionCid,
+                                                        globalStep)
+    if barrierPos < 0:
+        return Err[bool]("v3 tailnet train island: step barrier missing")
+    var barrier = island.stepBarriers[barrierPos]
+    if barrier.sealed:
+        return Err[bool]("v3 tailnet train island: step barrier sealed")
+    let leasePos = v3TailnetTrainIslandWorkerLeasePos(island, rendezvousCid, peerId)
+    if leasePos < 0:
+        return Err[bool]("v3 tailnet train island: worker lease missing")
+    let lease = island.workerLeases[leasePos]
+    if !layout.fixedBytes32Equal(lease.parentVersionCid, parentVersionCid):
+        return Err[bool]("v3 tailnet train island: worker lease parent mismatch")
+    if lease.globalStep != globalStep:
+        return Err[bool]("v3 tailnet train island: worker lease step mismatch")
+    if !v3TailnetTrainWorkerLeaseActiveAt(lease, times.epochTimeSeconds()):
+        return Err[bool]("v3 tailnet train island: worker lease expired")
+    if v3TailnetTrainStepBarrierHasPeer(barrier, peerId):
+        return Err[bool]("v3 tailnet train island: barrier duplicate peer")
+    add(barrier.arrivedPeerIds, peerId)
+    barrier.arrivedCount = barrier.arrivedPeerIds.len
+    if barrier.arrivedCount == barrier.expectedMemberCount:
+        barrier.sealed = true
+    island.stepBarriers[barrierPos] = barrier
+    out = barrier
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandArriveStepBarrier(out: var V3TailnetTrainStepBarrier,
+                                         island: var V3TailnetTrainIsland,
+                                         rendezvousCid: layout.FixedBytes32,
+                                         peerId: types.V3Libp2pPeerId,
+                                         parentVersionCid: layout.FixedBytes32,
+                                         globalStep: int32): bool =
+    let res = v3TailnetTrainIslandArriveStepBarrierFill(out,
+                                                        island,
+                                                        rendezvousCid,
+                                                        peerId,
+                                                        parentVersionCid,
+                                                        globalStep)
+    return IsOk(res)
+
+fn v3TailnetTrainIslandStepBarrierAdvanceFill(out: var V3TailnetTrainStepBarrier,
+                                              island: var V3TailnetTrainIsland,
+                                              rendezvousCid: layout.FixedBytes32,
+                                              parentVersionCid: layout.FixedBytes32,
+                                              globalStep: int32,
+                                              peerIds: types.V3Libp2pPeerId[]): Result[bool] =
+    if peerIds.len <= 0:
+        return Err[bool]("v3 tailnet train island: step barrier peer ids missing")
+    let openRes = v3TailnetTrainIslandOpenStepBarrierFill(out,
+                                                          island,
+                                                          rendezvousCid,
+                                                          parentVersionCid,
+                                                          globalStep)
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    for i in 0..<peerIds.len:
+        let arriveRes = v3TailnetTrainIslandArriveStepBarrierFill(out,
+                                                                  island,
+                                                                  rendezvousCid,
+                                                                  peerIds[i],
+                                                                  parentVersionCid,
+                                                                  globalStep)
+        if IsErr(arriveRes):
+            return Err[bool](Error(arriveRes))
+    if !v3TailnetTrainStepBarrierReady(out):
+        return Err[bool]("v3 tailnet train island: step barrier not ready")
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandMergeRoundAdvanceFill(out: var V3TailnetTrainMergeRound,
+                                             island: var V3TailnetTrainIsland,
+                                             rendezvousCid: layout.FixedBytes32,
+                                             parentVersionCid: layout.FixedBytes32,
+                                             globalStep: int32,
+                                             peerIds: types.V3Libp2pPeerId[],
+                                             optimizerStateCids: layout.FixedBytes32[],
+                                             optimizerPayloadLens: int32[]): Result[bool] =
+    if peerIds.len <= 0:
+        return Err[bool]("v3 tailnet train island: merge round peer ids missing")
+    if peerIds.len != optimizerStateCids.len || peerIds.len != optimizerPayloadLens.len:
+        return Err[bool]("v3 tailnet train island: merge round contribution shape")
+    let openRes = v3TailnetTrainIslandOpenMergeRoundFill(out,
+                                                         island,
+                                                         rendezvousCid,
+                                                         parentVersionCid,
+                                                         globalStep)
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    var contribution = v3TailnetTrainMergeContributionZero()
+    for i in 0..<peerIds.len:
+        let contributeRes = v3TailnetTrainIslandSubmitMergeContributionFill(contribution,
+                                                                            island,
+                                                                            rendezvousCid,
+                                                                            peerIds[i],
+                                                                            parentVersionCid,
+                                                                            globalStep,
+                                                                            optimizerStateCids[i],
+                                                                            optimizerPayloadLens[i])
+        if IsErr(contributeRes):
+            return Err[bool](Error(contributeRes))
+    if !v3TailnetTrainMergeRoundReady(out):
+        if !v3TailnetTrainIslandMergeRoundFill(out,
+                                               island,
+                                               rendezvousCid,
+                                               parentVersionCid,
+                                               globalStep):
+            return Err[bool]("v3 tailnet train island: merge round fetch missing")
+        if !v3TailnetTrainMergeRoundReady(out):
+            return Err[bool]("v3 tailnet train island: merge round not ready")
+    else:
+        if !v3TailnetTrainIslandMergeRoundFill(out,
+                                               island,
+                                               rendezvousCid,
+                                               parentVersionCid,
+                                               globalStep):
+            return Err[bool]("v3 tailnet train island: merge round fetch missing")
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointLatestFill(out: var V3TailnetCheckpointVersion,
+                                            island: var V3TailnetTrainIsland,
+                                            jobBundleCid: layout.FixedBytes32): bool =
+    let surfacePos = v3TailnetTrainIslandCheckpointSurfacePos(island, jobBundleCid)
+    if surfacePos < 0 || surfacePos >= island.checkpoints.len:
+        out = v3TailnetCheckpointVersionZero()
+        return false
+    let surface = island.checkpoints[surfacePos]
+    if surface.versionCount > 0 && surface.versions.len == surface.versionCount:
+        out = surface.versions[surface.versions.len - 1]
+        return true
+    if surface.versionCount > 0 &&
+       layout.fixedBytes32Equal(surface.latestVersion.versionCid, surface.latestVersionCid):
+        out = surface.latestVersion
+        return true
+    if surface.versionCount > 0:
+        out = surface.latestVersion
+        return true
+    out = v3TailnetCheckpointVersionZero()
+    return false
+
+fn v3TailnetTrainIslandCheckpointVersionAppend(island: var V3TailnetTrainIsland,
+                                               version: V3TailnetCheckpointVersion): Result[bool] =
+    if layout.fixedBytes32Equal(version.versionCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: checkpoint version cid missing")
+    if layout.fixedBytes32Equal(version.jobBundleCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: checkpoint job bundle cid missing")
+    if layout.fixedBytes32Equal(version.optimizerStateCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: checkpoint optimizer cid missing")
+    if version.optimizerPayloadLen <= 0:
+        return Err[bool]("v3 tailnet train island: checkpoint optimizer payload len")
+    let surfacePos = v3TailnetTrainIslandCheckpointSurfacePos(island, version.jobBundleCid)
+    if surfacePos >= 0:
+        var surface = island.checkpoints[surfacePos]
+        if v3TailnetTrainIslandCheckpointVersionPos(surface, version.versionCid) >= 0:
+            return Err[bool]("v3 tailnet train island: checkpoint version duplicate")
+        if surface.versionCount > 0:
+            let latest = surface.versions[surface.versions.len - 1]
+            if !layout.fixedBytes32Equal(version.prevVersionCid, latest.versionCid):
+                return Err[bool]("v3 tailnet train island: checkpoint lineage mismatch")
+            if version.globalStep <= latest.globalStep:
+                return Err[bool]("v3 tailnet train island: checkpoint step not advancing")
+        elif !layout.fixedBytes32Equal(version.prevVersionCid, layout.fixedBytes32Zero()):
+            return Err[bool]("v3 tailnet train island: first checkpoint prev version set")
+        add(surface.versions, version)
+        surface.versionCount = surface.versions.len
+        surface.latestVersionCid = version.versionCid
+        surface.latestVersion = version
+        island.checkpoints[surfacePos] = surface
+        return Ok[bool](true)
+    if !layout.fixedBytes32Equal(version.prevVersionCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: first checkpoint prev version set")
+    var surface = v3TailnetCheckpointSurfaceZero()
+    surface.jobBundleCid = version.jobBundleCid
+    add(surface.versions, version)
+    surface.versionCount = 1
+    surface.latestVersionCid = version.versionCid
+    surface.latestVersion = version
+    add(island.checkpoints, surface)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointVersionFill(out: var V3TailnetCheckpointVersion,
+                                             island: var V3TailnetTrainIsland,
+                                             versionCid: layout.FixedBytes32): bool =
+    for i in 0..<island.checkpoints.len:
+        let pos = v3TailnetTrainIslandCheckpointVersionPos(island.checkpoints[i], versionCid)
+        if pos < 0 || pos >= island.checkpoints[i].versions.len:
+            continue
+        out = island.checkpoints[i].versions[pos]
+        return true
+    out = v3TailnetCheckpointVersionZero()
+    return false
+
+fn v3TailnetTrainIslandCheckpointHistoryFill(out: var V3TailnetCheckpointVersion[],
+                                             island: var V3TailnetTrainIsland,
+                                             jobBundleCid: layout.FixedBytes32): bool =
+    out = []
+    let surfacePos = v3TailnetTrainIslandCheckpointSurfacePos(island, jobBundleCid)
+    if surfacePos < 0 || surfacePos >= island.checkpoints.len:
+        return false
+    let surface = island.checkpoints[surfacePos]
+    for i in 0..<surface.versions.len:
+        add(out, surface.versions[i])
+    return out.len > 0
+
+fn v3TailnetTrainIslandCheckpointLineageFill(out: var V3TailnetCheckpointVersion[],
+                                             island: var V3TailnetTrainIsland,
+                                             versionCid: layout.FixedBytes32): Result[bool] =
+    out = []
+    var currentCid = versionCid
+    if layout.fixedBytes32Equal(currentCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: lineage version cid missing")
+    var remaining = 0
+    for i in 0..<island.checkpoints.len:
+        remaining = remaining + island.checkpoints[i].versionCount
+    while !layout.fixedBytes32Equal(currentCid, layout.fixedBytes32Zero()):
+        if remaining <= 0:
+            return Err[bool]("v3 tailnet train island: checkpoint lineage cycle")
+        var version = v3TailnetCheckpointVersionZero()
+        if !v3TailnetTrainIslandCheckpointVersionFill(version, island, currentCid):
+            return Err[bool]("v3 tailnet train island: checkpoint lineage missing version")
+        add(out, version)
+        currentCid = version.prevVersionCid
+        remaining = remaining - 1
+    return Ok[bool](out.len > 0)
+
+fn v3TailnetTrainIslandCheckpointLatestLineageFill(out: var V3TailnetCheckpointVersion[],
+                                                   island: var V3TailnetTrainIsland,
+                                                   jobBundleCid: layout.FixedBytes32): Result[bool] =
+    var latest = v3TailnetCheckpointVersionZero()
+    if !v3TailnetTrainIslandCheckpointLatestFill(latest, island, jobBundleCid):
+        out = []
+        return Err[bool]("v3 tailnet train island: checkpoint latest missing")
+    return v3TailnetTrainIslandCheckpointLineageFill(out, island, latest.versionCid)
+
+fn v3TailnetTrainIslandCheckpointDeltaFill(out: var V3TailnetCheckpointDelta,
+                                           baseVersionCid: layout.FixedBytes32,
+                                           targetVersion: V3TailnetCheckpointVersion,
+                                           baseBlob: Bytes,
+                                           targetBlob: Bytes,
+                                           chunkSpanBytes: int32): Result[bool] =
+    if chunkSpanBytes <= 0:
+        return Err[bool]("v3 tailnet train island: delta chunk span")
+    if layout.fixedBytes32Equal(targetVersion.versionCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: delta target version missing")
+    if targetVersion.payloadLen != bytesLen(targetBlob):
+        return Err[bool]("v3 tailnet train island: delta target payload len mismatch")
+    if targetVersion.shardPayloadBytes <= 0:
+        return Err[bool]("v3 tailnet train island: delta shard payload bytes")
+    if !layout.fixedBytes32Equal(baseVersionCid, layout.fixedBytes32Zero()) && bytesLen(baseBlob) <= 0:
+        return Err[bool]("v3 tailnet train island: delta base blob missing")
+    let targetSummaryRes = dag.v3DagBlobSummaryFromBytes(targetBlob, targetVersion.shardPayloadBytes)
+    if IsErr(targetSummaryRes):
+        return Err[bool](Error(targetSummaryRes))
+    let targetSummary = Value(targetSummaryRes)
+    if !layout.fixedBytes32Equal(targetSummary.blobCid, targetVersion.blobCid):
+        return Err[bool]("v3 tailnet train island: delta target blob cid mismatch")
+    if !layout.fixedBytes32Equal(targetSummary.summaryCid, targetVersion.blobSummaryCid):
+        return Err[bool]("v3 tailnet train island: delta target summary cid mismatch")
+    out = v3TailnetCheckpointDeltaZero()
+    out.baseVersionCid = baseVersionCid
+    out.targetVersionCid = targetVersion.versionCid
+    out.targetBlobCid = targetVersion.blobCid
+    out.targetBlobSummaryCid = targetVersion.blobSummaryCid
+    out.targetPayloadLen = targetVersion.payloadLen
+    out.targetShardPayloadBytes = targetVersion.shardPayloadBytes
+    out.chunkSpanBytes = chunkSpanBytes
+    var offset = 0
+    while offset < targetVersion.payloadLen:
+        var spanLen = chunkSpanBytes
+        if offset + spanLen > targetVersion.payloadLen:
+            spanLen = targetVersion.payloadLen - offset
+        var sameAsBase = false
+        if (offset + spanLen) <= bytesLen(baseBlob):
+            sameAsBase = v3TailnetTrainIslandBytesRangeEqual(baseBlob,
+                                                             offset,
+                                                             targetBlob,
+                                                             offset,
+                                                             spanLen)
+        if !sameAsBase:
+            var chunk = v3TailnetCheckpointDeltaChunkZero()
+            chunk.offset = offset
+            chunk.payload = bytesSlice(targetBlob, offset, spanLen)
+            chunk.payloadLen = bytesLen(chunk.payload)
+            add(out.chunks, chunk)
+        offset = offset + spanLen
+    out.chunkCount = out.chunks.len
+    return v3TailnetTrainIslandCheckpointDeltaValidate(out)
+
+fn v3TailnetTrainIslandCheckpointMergeDeltaFill(out: var Bytes,
+                                                delta: V3TailnetCheckpointDelta,
+                                                baseBlob: Bytes): Result[bool] =
+    let deltaOk = v3TailnetTrainIslandCheckpointDeltaValidate(delta)
+    if IsErr(deltaOk):
+        return Err[bool](Error(deltaOk))
+    if !layout.fixedBytes32Equal(delta.baseVersionCid, layout.fixedBytes32Zero()) && bytesLen(baseBlob) <= 0:
+        return Err[bool]("v3 tailnet train island: merge base blob missing")
+    out = bytesAlloc(delta.targetPayloadLen)
+    let baseCopyLen = if bytesLen(baseBlob) < delta.targetPayloadLen: bytesLen(baseBlob) else: delta.targetPayloadLen
+    for i in 0..<baseCopyLen:
+        bytesSet(out, i, bytesGet(baseBlob, i))
+    for i in 0..<delta.chunks.len:
+        let chunk = delta.chunks[i]
+        for j in 0..<chunk.payloadLen:
+            bytesSet(out, chunk.offset + j, bytesGet(chunk.payload, j))
+    if !layout.fixedBytes32Equal(dag.v3DagBlobCidFromBytes(out), delta.targetBlobCid):
+        return Err[bool]("v3 tailnet train island: merge blob cid mismatch")
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(out, delta.targetShardPayloadBytes)
+    if IsErr(summaryRes):
+        return Err[bool](Error(summaryRes))
+    let summary = Value(summaryRes)
+    if summary.payloadLen != delta.targetPayloadLen:
+        return Err[bool]("v3 tailnet train island: merge payload len mismatch")
+    if !layout.fixedBytes32Equal(summary.summaryCid, delta.targetBlobSummaryCid):
+        return Err[bool]("v3 tailnet train island: merge summary cid mismatch")
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointWritebackRecord(out: var V3TailnetCheckpointWriteback,
+                                                 island: var V3TailnetTrainIsland,
+                                                 delta: V3TailnetCheckpointDelta,
+                                                 version: V3TailnetCheckpointVersion,
+                                                 manifest: swarm.V3ErasureShardManifest): Result[bool] =
+    let deltaOk = v3TailnetTrainIslandCheckpointDeltaValidate(delta)
+    if IsErr(deltaOk):
+        return Err[bool](Error(deltaOk))
+    if !layout.fixedBytes32Equal(delta.targetVersionCid, version.versionCid):
+        return Err[bool]("v3 tailnet train island: writeback version mismatch")
+    if !layout.fixedBytes32Equal(delta.targetBlobCid, version.blobCid):
+        return Err[bool]("v3 tailnet train island: writeback blob mismatch")
+    if !layout.fixedBytes32Equal(manifest.manifestCid, version.manifestCid):
+        return Err[bool]("v3 tailnet train island: writeback manifest mismatch")
+    out = v3TailnetCheckpointWritebackZero()
+    out.versionCid = version.versionCid
+    out.baseVersionCid = delta.baseVersionCid
+    out.manifestCid = manifest.manifestCid
+    out.blobCid = manifest.blobCid
+    out.payloadLen = manifest.blobByteLen
+    out.shardCount = manifest.shardCount
+    out.deltaChunkCount = delta.chunkCount
+    out.writtenAtEpochSeconds = times.epochTimeSeconds()
+    let pos = v3TailnetTrainIslandCheckpointWritebackPos(island, out.versionCid)
+    if pos >= 0:
+        island.writebacks[pos] = out
+    else:
+        add(island.writebacks, out)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandCheckpointWritebackApplyFill(out: var V3TailnetCheckpointWriteback,
+                                                    mergedBlob: var Bytes,
+                                                    island: var V3TailnetTrainIsland,
+                                                    localRuntime: var runtime.V3ContentRuntime,
+                                                    delta: V3TailnetCheckpointDelta): Result[bool] =
+    let deltaOk = v3TailnetTrainIslandCheckpointDeltaValidate(delta)
+    if IsErr(deltaOk):
+        return Err[bool](Error(deltaOk))
+    var version = v3TailnetCheckpointVersionZero()
+    let versionFound = v3TailnetTrainIslandCheckpointVersionFill(version,
+                                                                 island,
+                                                                 delta.targetVersionCid)
+    if !versionFound:
+        return Err[bool]("v3 tailnet train island: writeback target version missing")
+    let deltaHasBase = v3TailnetTrainIslandCheckpointDeltaHasBase(delta)
+    let versionHasBase = v3TailnetTrainIslandCheckpointVersionHasBase(version)
+    if deltaHasBase != versionHasBase:
+        return Err[bool]("v3 tailnet train island: writeback base mismatch")
+    if deltaHasBase && !layout.fixedBytes32Equal(delta.baseVersionCid, version.prevVersionCid):
+        return Err[bool]("v3 tailnet train island: writeback parent mismatch")
+    var latest = v3TailnetCheckpointVersionZero()
+    let latestFound = v3TailnetTrainIslandCheckpointLatestFill(latest,
+                                                               island,
+                                                               version.jobBundleCid)
+    if !latestFound:
+        return Err[bool]("v3 tailnet train island: writeback latest missing")
+    if !layout.fixedBytes32Equal(latest.versionCid, version.versionCid):
+        return Err[bool]("v3 tailnet train island: writeback target stale")
+    var baseBlob = emptyBytes()
+    if deltaHasBase:
+        var baseVersion = v3TailnetCheckpointVersionZero()
+        let baseVersionFound = v3TailnetTrainIslandCheckpointVersionFill(baseVersion,
+                                                                         island,
+                                                                         delta.baseVersionCid)
+        if !baseVersionFound:
+            return Err[bool]("v3 tailnet train island: writeback base version missing")
+        let baseBlobFound = v3TailnetTrainIslandCheckpointBlobCachedFill(baseBlob,
+                                                                         localRuntime,
+                                                                         baseVersion)
+        if !baseBlobFound:
+            return Err[bool]("v3 tailnet train island: writeback base blob missing")
+    let mergeRes = v3TailnetTrainIslandCheckpointMergeDeltaFill(mergedBlob, delta, baseBlob)
+    if IsErr(mergeRes):
+        return Err[bool](Error(mergeRes))
+    let params = v3TailnetTrainIslandCheckpointVersionParams(version)
+    let paramsOk = swarm.v3ErasureEncodingParamsValidate(params)
+    if IsErr(paramsOk):
+        return Err[bool](Error(paramsOk))
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(mergedBlob, params.shardPayloadBytes)
+    if IsErr(summaryRes):
+        return Err[bool](Error(summaryRes))
+    let summary = Value(summaryRes)
+    if !layout.fixedBytes32Equal(summary.blobCid, version.blobCid):
+        return Err[bool]("v3 tailnet train island: writeback blob cid mismatch")
+    if !layout.fixedBytes32Equal(summary.summaryCid, version.blobSummaryCid):
+        return Err[bool]("v3 tailnet train island: writeback summary cid mismatch")
+    let shardPayloadsRes = swarm.v3ErasureEncodeShardPayloads(mergedBlob, params)
+    if IsErr(shardPayloadsRes):
+        return Err[bool](Error(shardPayloadsRes))
+    let shardPayloads = Value(shardPayloadsRes)
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    for i in 0..<shardPayloads.len:
+        add(shardPayloadCids, layout.fixedBytes32Zero())
+    for i in 0..<shardPayloads.len:
+        shardPayloadCids[i] = swarm.v3ErasureShardPayloadCid(shardPayloads[i])
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    if !layout.fixedBytes32Equal(manifest.manifestCid, version.manifestCid):
+        return Err[bool]("v3 tailnet train island: writeback manifest cid mismatch")
+    let storeBlobRes = runtime.v3ContentRuntimeStoreBlobPayload(localRuntime, summary.blobCid, mergedBlob)
+    if IsErr(storeBlobRes):
+        return Err[bool](Error(storeBlobRes))
+    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(localRuntime, manifest)
+    if IsErr(storeManifestRes):
+        return Err[bool](Error(storeManifestRes))
+    for i in 0..<manifest.shardCount:
+        let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, manifest.shardIndices[i])
+        if IsErr(requestRes):
+            return Err[bool](Error(requestRes))
+        let responseRes = swarm.v3ErasureShardPullResponseMake(Value(requestRes),
+                                                               shardPayloads[manifest.shardIndices[i]])
+        if IsErr(responseRes):
+            return Err[bool](Error(responseRes))
+        let storeShardRes = runtime.v3ContentRuntimeStoreShardResponse(localRuntime, Value(responseRes))
+        if IsErr(storeShardRes):
+            return Err[bool](Error(storeShardRes))
+    return v3TailnetTrainIslandCheckpointWritebackRecord(out,
+                                                         island,
+                                                         delta,
+                                                         version,
+                                                         manifest)
+
+fn v3TailnetTrainIslandCheckpointPublishFill(out: var V3TailnetCheckpointVersion,
+                                             island: var V3TailnetTrainIsland,
+                                             group: var V3TailnetTrainWorkerGroup,
+                                             globalStep: int32,
+                                             publisherPeerId: types.V3Libp2pPeerId,
+                                             stub: var content.V3ContentStub,
+                                             manifestCid: layout.FixedBytes32,
+                                             blobCid: layout.FixedBytes32,
+                                             params: swarm.V3ErasureEncodingParams,
+                                             optimizerStateCid: layout.FixedBytes32,
+                                             optimizerPayloadLen: int32): Result[bool] =
+    if globalStep < 0:
+        return Err[bool]("v3 tailnet train island: global step")
+    let jobBundleCid = stub.bundleCid
+    if layout.fixedBytes32Equal(jobBundleCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: job bundle cid missing")
+    if layout.fixedBytes32Equal(optimizerStateCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 tailnet train island: checkpoint optimizer cid missing")
+    if optimizerPayloadLen <= 0:
+        return Err[bool]("v3 tailnet train island: checkpoint optimizer payload len")
+    let groupPos = v3TailnetTrainIslandGroupPos(island, group.rendezvousCid)
+    if groupPos < 0:
+        return Err[bool]("v3 tailnet train island: worker group missing")
+    if !island.groups[groupPos].sealed:
+        return Err[bool]("v3 tailnet train island: worker group not sealed")
+    var publisherPeerFound = false
+    for i in 0..<island.groups[groupPos].members.len:
+        if types.v3Libp2pPeerIdEqual(island.groups[groupPos].members[i].peerId, publisherPeerId):
+            publisherPeerFound = true
+            break
+    if !publisherPeerFound:
+        return Err[bool]("v3 tailnet train island: publisher peer missing")
+    var prevVersionCid = layout.fixedBytes32Zero()
+    var surfacePos = -1
+    for i in 0..<island.checkpoints.len:
+        if layout.fixedBytes32Equal(island.checkpoints[i].jobBundleCid, jobBundleCid):
+            surfacePos = i
+            break
+    if surfacePos >= 0:
+        let latest = island.checkpoints[surfacePos].latestVersion
+        if !layout.fixedBytes32Equal(latest.versionCid, layout.fixedBytes32Zero()):
+            if globalStep <= latest.globalStep:
+                return Err[bool]("v3 tailnet train island: checkpoint step not advancing")
+            prevVersionCid = latest.versionCid
+        else:
+            prevVersionCid = island.checkpoints[surfacePos].latestVersionCid
+    if !layout.fixedBytes32Equal(prevVersionCid, layout.fixedBytes32Zero()):
+        if !types.v3Libp2pPeerIdEqual(island.groups[groupPos].leaderPeerId, publisherPeerId):
+            return Err[bool]("v3 tailnet train island: checkpoint publisher not leader")
+        var barrierPos = -1
+        for i in 0..<island.stepBarriers.len:
+            if !layout.fixedBytes32Equal(island.stepBarriers[i].rendezvousCid,
+                                         island.groups[groupPos].rendezvousCid):
+                continue
+            if !layout.fixedBytes32Equal(island.stepBarriers[i].parentVersionCid, prevVersionCid):
+                continue
+            if island.stepBarriers[i].globalStep == globalStep:
+                barrierPos = i
+                break
+        if barrierPos < 0:
+            return Err[bool]("v3 tailnet train island: checkpoint step barrier missing")
+        let barrier = island.stepBarriers[barrierPos]
+        if !(barrier.sealed && barrier.arrivedCount == barrier.expectedMemberCount):
+            return Err[bool]("v3 tailnet train island: checkpoint step barrier not ready")
+        var roundPos = -1
+        for i in 0..<island.mergeRounds.len:
+            if !layout.fixedBytes32Equal(island.mergeRounds[i].rendezvousCid,
+                                         island.groups[groupPos].rendezvousCid):
+                continue
+            if !layout.fixedBytes32Equal(island.mergeRounds[i].parentVersionCid, prevVersionCid):
+                continue
+            if island.mergeRounds[i].globalStep == globalStep:
+                roundPos = i
+                break
+        if roundPos < 0:
+            return Err[bool]("v3 tailnet train island: checkpoint merge round missing")
+        let round = island.mergeRounds[roundPos]
+        if !(round.sealed && round.acceptedCount == round.expectedMemberCount):
+            return Err[bool]("v3 tailnet train island: checkpoint merge round not ready")
+        var leaderContributionFound = false
+        for i in 0..<round.contributions.len:
+            if types.v3Libp2pPeerIdEqual(round.contributions[i].peerId, publisherPeerId):
+                leaderContributionFound = true
+                break
+        if !leaderContributionFound:
+            return Err[bool]("v3 tailnet train island: checkpoint leader contribution missing")
+    out.versionEpochSeconds = times.epochTimeSeconds()
+    out.globalStep = globalStep
+    out.publisherPeerId = publisherPeerId
+    out.jobBundleCid = jobBundleCid
+    out.stubCid = stub.stubCid
+    out.blobSummaryCid = stub.blobSummaryCid
+    out.payloadLen = stub.payloadLen
+    out.manifestCid = manifestCid
+    out.blobCid = blobCid
+    out.paramsCid = params.paramsCid
+    out.layoutKind = params.layoutKind
+    out.dataShardCount = params.dataShardCount
+    out.parityShardCount = params.parityShardCount
+    out.shardPayloadBytes = params.shardPayloadBytes
+    out.optimizerStateCid = optimizerStateCid
+    out.optimizerPayloadLen = optimizerPayloadLen
+    out.prevVersionCid = prevVersionCid
+    out.versionCid = v3TailnetCheckpointVersionCid(jobBundleCid,
+                                                   globalStep,
+                                                   publisherPeerId,
+                                                   out.stubCid,
+                                                   manifestCid,
+                                                   blobCid,
+                                                   optimizerStateCid,
+                                                   prevVersionCid)
+    return v3TailnetTrainIslandCheckpointVersionAppend(island, out)
+
+fn v3TailnetTrainIslandCheckpointPublish(out: var V3TailnetCheckpointVersion,
+                                         island: var V3TailnetTrainIsland,
+                                         group: var V3TailnetTrainWorkerGroup,
+                                         globalStep: int32,
+                                         publisherPeerId: types.V3Libp2pPeerId,
+                                         stub: var content.V3ContentStub,
+                                         manifestCid: layout.FixedBytes32,
+                                         blobCid: layout.FixedBytes32,
+                                         params: swarm.V3ErasureEncodingParams,
+                                         optimizerStateCid: layout.FixedBytes32,
+                                         optimizerPayloadLen: int32): bool =
+    let res = v3TailnetTrainIslandCheckpointPublishFill(out,
+                                                        island,
+                                                        group,
+                                                        globalStep,
+                                                        publisherPeerId,
+                                                        stub,
+                                                        manifestCid,
+                                                        blobCid,
+                                                        params,
+                                                        optimizerStateCid,
+                                                        optimizerPayloadLen)
+    return IsOk(res)
+
+fn v3TailnetTrainIslandCheckpointPublishRejected(out: var V3TailnetCheckpointVersion,
+                                                 island: var V3TailnetTrainIsland,
+                                                 group: var V3TailnetTrainWorkerGroup,
+                                                 globalStep: int32,
+                                                 publisherPeerId: types.V3Libp2pPeerId,
+                                                 stub: var content.V3ContentStub,
+                                                 manifestCid: layout.FixedBytes32,
+                                                 blobCid: layout.FixedBytes32,
+                                                 params: swarm.V3ErasureEncodingParams,
+                                                 optimizerStateCid: layout.FixedBytes32,
+                                                 optimizerPayloadLen: int32): bool =
+    let res = v3TailnetTrainIslandCheckpointPublishFill(out,
+                                                        island,
+                                                        group,
+                                                        globalStep,
+                                                        publisherPeerId,
+                                                        stub,
+                                                        manifestCid,
+                                                        blobCid,
+                                                        params,
+                                                        optimizerStateCid,
+                                                        optimizerPayloadLen)
+    return IsErr(res)
+
+fn v3TailnetTrainIslandSelfTestBlob(parts: Bytes[]): Bytes =
+    var total = 0
+    for i in 0..<parts.len:
+        total = total + bytesLen(parts[i])
+    var buf = layout.byteBufInit(total)
+    for i in 0..<parts.len:
+        layout.byteBufAppendBytes(buf, parts[i])
+    return layout.byteBufToBytes(buf)
+
+fn v3TailnetTrainIslandSelfTestSeedCheckpointVersionFill(out: var V3TailnetCheckpointVersion,
+                                                         runtimeState: var runtime.V3ContentRuntime,
+                                                         jobBundleCid: layout.FixedBytes32,
+                                                         publisherPeerId: types.V3Libp2pPeerId,
+                                                         globalStep: int32,
+                                                         prevVersionCid: layout.FixedBytes32,
+                                                         blob: Bytes,
+                                                         versionEpochSeconds: int64): Result[bool] =
+    let paramsRes = swarm.v3ErasureEncodingParamsMake(swarm.v3ErasureLayoutRsSystematic, 4, 0, 8)
+    if IsErr(paramsRes):
+        echo("v3 tailnet train island seed: params")
+        return Err[bool](Error(paramsRes))
+    let params = Value(paramsRes)
+    let summaryRes = dag.v3DagBlobSummaryFromBytes(blob, params.shardPayloadBytes)
+    if IsErr(summaryRes):
+        echo("v3 tailnet train island seed: summary")
+        return Err[bool](Error(summaryRes))
+    let summary = Value(summaryRes)
+    let shardPayloadsRes = swarm.v3ErasureEncodeShardPayloads(blob, params)
+    if IsErr(shardPayloadsRes):
+        echo("v3 tailnet train island seed: encode shards")
+        return Err[bool](Error(shardPayloadsRes))
+    let shardPayloads = Value(shardPayloadsRes)
+    var shardPayloadCids: layout.FixedBytes32[]
+    shardPayloadCids = []
+    for i in 0..<shardPayloads.len:
+        add(shardPayloadCids, layout.fixedBytes32Zero())
+    for i in 0..<shardPayloads.len:
+        shardPayloadCids[i] = swarm.v3ErasureShardPayloadCid(shardPayloads[i])
+    let manifestRes = swarm.v3ErasureShardManifestMake(summary.blobCid,
+                                                       summary.payloadLen,
+                                                       params,
+                                                       shardPayloadCids)
+    if IsErr(manifestRes):
+        echo("v3 tailnet train island seed: manifest")
+        return Err[bool](Error(manifestRes))
+    let manifest = Value(manifestRes)
+    let storeBlobRes = runtime.v3ContentRuntimeStoreBlobPayload(runtimeState, summary.blobCid, blob)
+    if IsErr(storeBlobRes):
+        echo("v3 tailnet train island seed: store blob")
+        return Err[bool](Error(storeBlobRes))
+    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(runtimeState, manifest)
+    if IsErr(storeManifestRes):
+        echo("v3 tailnet train island seed: store manifest")
+        return Err[bool](Error(storeManifestRes))
+    for i in 0..<manifest.shardCount:
+        let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, manifest.shardIndices[i])
+        if IsErr(requestRes):
+            echo("v3 tailnet train island seed: request")
+            return Err[bool](Error(requestRes))
+        let responseRes = swarm.v3ErasureShardPullResponseMake(Value(requestRes),
+                                                               shardPayloads[manifest.shardIndices[i]])
+        if IsErr(responseRes):
+            echo("v3 tailnet train island seed: response")
+            return Err[bool](Error(responseRes))
+        let storeShardRes = runtime.v3ContentRuntimeStoreShardResponse(runtimeState, Value(responseRes))
+        if IsErr(storeShardRes):
+            echo("v3 tailnet train island seed: store shard")
+            return Err[bool](Error(storeShardRes))
+    out = v3TailnetCheckpointVersionZero()
+    out.versionEpochSeconds = versionEpochSeconds
+    out.globalStep = globalStep
+    out.publisherPeerId = publisherPeerId
+    out.jobBundleCid = jobBundleCid
+    out.stubCid = lt.v3HashInts("v3.tailnet.train.stub", [globalStep, bytesLen(blob)])
+    out.blobSummaryCid = summary.summaryCid
+    out.payloadLen = summary.payloadLen
+    out.manifestCid = manifest.manifestCid
+    out.blobCid = summary.blobCid
+    out.paramsCid = params.paramsCid
+    out.layoutKind = params.layoutKind
+    out.dataShardCount = params.dataShardCount
+    out.parityShardCount = params.parityShardCount
+    out.shardPayloadBytes = params.shardPayloadBytes
+    out.prevVersionCid = prevVersionCid
+    out.versionCid = v3TailnetCheckpointVersionCid(jobBundleCid,
+                                                   globalStep,
+                                                   publisherPeerId,
+                                                   out.stubCid,
+                                                   out.manifestCid,
+                                                   out.blobCid,
+                                                   out.optimizerStateCid,
+                                                   prevVersionCid)
+    return Ok[bool](true)
+
+fn v3TailnetTrainIslandSelfTest(): int32 =
+    let now = times.epochTimeSeconds()
+    let jobBundleCid = lt.v3HashInts("v3.tailnet.train.job", [1])
+    var island = v3TailnetTrainIslandInit("tailnet.train.selftest")
+    var request = scheduler.v3Libp2pWorkloadRequestZero()
+    request.workloadKind = scheduler.v3Libp2pWorkloadTrain
+    var rendezvous = v3TailnetTrainRendezvousZero()
+    let rendezvousRes = v3TailnetTrainIslandOpenRendezvousFill(rendezvous,
+                                                               island,
+                                                               jobBundleCid,
+                                                               2,
+                                                               request,
+                                                               now + 600)
+    if IsErr(rendezvousRes):
+        echo("v3 tailnet train island self-test: rendezvous")
+        return 1
+    var leaderPeerId = types.v3Libp2pPeerIdZero()
+    peer_id.v3Libp2pPeerIdFillFromSeed(leaderPeerId, "tailnet.train.worker.a")
+    var workerPeerId = types.v3Libp2pPeerIdZero()
+    peer_id.v3Libp2pPeerIdFillFromSeed(workerPeerId, "tailnet.train.worker.b")
+    var group = v3TailnetTrainWorkerGroupZero()
+    group.rendezvousCid = rendezvous.rendezvousCid
+    group.leaderPeerId = leaderPeerId
+    var leaderMember = v3TailnetTrainWorkerMemberZero()
+    leaderMember.peerId = leaderPeerId
+    leaderMember.roleKind = v3TailnetTrainRoleLeader
+    leaderMember.joinedAtEpochSeconds = now
+    add(group.members, leaderMember)
+    var workerMember = v3TailnetTrainWorkerMemberZero()
+    workerMember.peerId = workerPeerId
+    workerMember.roleKind = v3TailnetTrainRoleWorker
+    workerMember.joinedAtEpochSeconds = now
+    add(group.members, workerMember)
+    group.memberCount = group.members.len
+    let sealRes = v3TailnetTrainIslandSealWorkerGroup(island, group)
+    if IsErr(sealRes):
+        echo("v3 tailnet train island self-test: seal group")
+        return 1
+    let sealedGroup = island.groups[0]
+    var leaderRuntime = runtime.v3ContentRuntimeInit()
+    var workerRuntime = runtime.v3ContentRuntimeInit()
+    let optim1 = bytesFromString("optim=1111")
+    let optim1Cid = dag.v3DagBlobCidFromBytes(optim1)
+    let optim1PayloadLen = bytesLen(optim1)
+    let blob1 = v3TailnetTrainIslandSelfTestBlob([bytesFromString("step-10|"),
+                                                  bytesFromString("weights=aaaa|"),
+                                                  optim1])
+    var version1 = v3TailnetCheckpointVersionZero()
+    let seed1Res = v3TailnetTrainIslandSelfTestSeedCheckpointVersionFill(version1,
+                                                                         leaderRuntime,
+                                                                         jobBundleCid,
+                                                                         leaderPeerId,
+                                                                         10,
+                                                                         layout.fixedBytes32Zero(),
+                                                                         blob1,
+                                                                         now)
+    if IsErr(seed1Res):
+        echo("v3 tailnet train island self-test: seed version1")
+        return 1
+    version1.optimizerStateCid = optim1Cid
+    version1.optimizerPayloadLen = optim1PayloadLen
+    version1.versionCid = v3TailnetCheckpointVersionCid(jobBundleCid,
+                                                        version1.globalStep,
+                                                        version1.publisherPeerId,
+                                                        version1.stubCid,
+                                                        version1.manifestCid,
+                                                        version1.blobCid,
+                                                        version1.optimizerStateCid,
+                                                        version1.prevVersionCid)
+    let append1Res = v3TailnetTrainIslandCheckpointVersionAppend(island, version1)
+    if IsErr(append1Res):
+        echo("v3 tailnet train island self-test: append version1")
+        return 1
+    var lease20Leader = v3TailnetTrainWorkerLeaseZero()
+    let lease20LeaderRes = v3TailnetTrainIslandGrantWorkerLeaseFill(lease20Leader,
+                                                                    island,
+                                                                    sealedGroup,
+                                                                    leaderPeerId,
+                                                                    version1.versionCid,
+                                                                    20,
+                                                                    120)
+    if IsErr(lease20LeaderRes):
+        echo("v3 tailnet train island self-test: lease20 leader")
+        return 1
+    var lease20Worker = v3TailnetTrainWorkerLeaseZero()
+    let lease20WorkerRes = v3TailnetTrainIslandGrantWorkerLeaseFill(lease20Worker,
+                                                                    island,
+                                                                    sealedGroup,
+                                                                    workerPeerId,
+                                                                    version1.versionCid,
+                                                                    20,
+                                                                    120)
+    if IsErr(lease20WorkerRes):
+        echo("v3 tailnet train island self-test: lease20 worker")
+        return 1
+    var roundPeerIds: types.V3Libp2pPeerId[]
+    roundPeerIds = [leaderPeerId, workerPeerId]
+    let barrier20GroupPos = v3TailnetTrainIslandGroupPos(island, sealedGroup.rendezvousCid)
+    if barrier20GroupPos < 0:
+        echo("v3 tailnet train island self-test: barrier20 group")
+        return 1
+    let barrier20ParentRes = v3TailnetTrainIslandCheckpointParentValidate(island,
+                                                                          sealedGroup,
+                                                                          version1.versionCid,
+                                                                          20)
+    if IsErr(barrier20ParentRes):
+        echo("v3 tailnet train island self-test: barrier20 parent")
+        return 1
+    if island.stepBarriers.len != 0:
+        echo("v3 tailnet train island self-test: barrier20 stepBarriers len")
+        return 1
+    if island.mergeRounds.len != 0:
+        echo("v3 tailnet train island self-test: barrier20 mergeRounds len")
+        return 1
+    if island.stepBarriers.len > 0:
+        if v3TailnetTrainIslandStepBarrierPos(island,
+                                              sealedGroup.rendezvousCid,
+                                              version1.versionCid,
+                                              20) >= 0:
+            echo("v3 tailnet train island self-test: barrier20 duplicate")
+            return 1
+    let barrier20Expected = v3TailnetTrainIslandBarrierExpectedMembers(island,
+                                                                       sealedGroup,
+                                                                       version1.versionCid,
+                                                                       20)
+    if barrier20Expected <= 0:
+        echo("v3 tailnet train island self-test: barrier20 lease missing")
+        return 1
+    var barrier20 = v3TailnetTrainStepBarrierZero()
+    let openBarrier20Res = v3TailnetTrainIslandOpenStepBarrierFill(barrier20,
+                                                                   island,
+                                                                   sealedGroup.rendezvousCid,
+                                                                   version1.versionCid,
+                                                                   20)
+    if IsErr(openBarrier20Res):
+        echo("v3 tailnet train island self-test: barrier20 open")
+        return 1
+    let arriveBarrier20LeaderRes = v3TailnetTrainIslandArriveStepBarrierFill(barrier20,
+                                                                              island,
+                                                                              sealedGroup.rendezvousCid,
+                                                                              leaderPeerId,
+                                                                              version1.versionCid,
+                                                                              20)
+    if IsErr(arriveBarrier20LeaderRes):
+        echo("v3 tailnet train island self-test: barrier20 leader")
+        return 1
+    let arriveBarrier20WorkerRes = v3TailnetTrainIslandArriveStepBarrierFill(barrier20,
+                                                                              island,
+                                                                              sealedGroup.rendezvousCid,
+                                                                              workerPeerId,
+                                                                              version1.versionCid,
+                                                                              20)
+    if IsErr(arriveBarrier20WorkerRes):
+        echo("v3 tailnet train island self-test: barrier20 worker")
+        return 1
+    if !v3TailnetTrainStepBarrierReady(barrier20):
+        echo("v3 tailnet train island self-test: barrier20 ready")
+        return 1
+    let round20LeaderOptim = bytesFromString("optim.workerA=2020")
+    let round20LeaderOptimCid = dag.v3DagBlobCidFromBytes(round20LeaderOptim)
+    let round20WorkerOptim = bytesFromString("optim.workerB=2020")
+    let round20WorkerOptimCid = dag.v3DagBlobCidFromBytes(round20WorkerOptim)
+    let optim2 = bytesFromString("optim=2222")
+    let optim2Cid = dag.v3DagBlobCidFromBytes(optim2)
+    let optim2PayloadLen = bytesLen(optim2)
+    let blob2 = v3TailnetTrainIslandSelfTestBlob([bytesFromString("step-20|"),
+                                                  bytesFromString("weights=aaZZ|"),
+                                                  optim2])
+    var version2 = v3TailnetCheckpointVersionZero()
+    let seed2Res = v3TailnetTrainIslandSelfTestSeedCheckpointVersionFill(version2,
+                                                                         leaderRuntime,
+                                                                         jobBundleCid,
+                                                                         leaderPeerId,
+                                                                         20,
+                                                                         version1.versionCid,
+                                                                         blob2,
+                                                                         now + 1)
+    if IsErr(seed2Res):
+        echo("v3 tailnet train island self-test: seed version2")
+        return 1
+    version2.optimizerStateCid = optim2Cid
+    version2.optimizerPayloadLen = optim2PayloadLen
+    version2.versionCid = v3TailnetCheckpointVersionCid(jobBundleCid,
+                                                        version2.globalStep,
+                                                        version2.publisherPeerId,
+                                                        version2.stubCid,
+                                                        version2.manifestCid,
+                                                        version2.blobCid,
+                                                        version2.optimizerStateCid,
+                                                        version2.prevVersionCid)
+    var merge20OptimizerCids: layout.FixedBytes32[]
+    merge20OptimizerCids = [round20LeaderOptimCid, round20WorkerOptimCid]
+    var merge20OptimizerLens: int32[]
+    merge20OptimizerLens = [bytesLen(round20LeaderOptim), bytesLen(round20WorkerOptim)]
+    var merge20 = v3TailnetTrainMergeRoundZero()
+    let merge20Res = v3TailnetTrainIslandMergeRoundAdvanceFill(merge20,
+                                                               island,
+                                                               sealedGroup.rendezvousCid,
+                                                               version1.versionCid,
+                                                               20,
+                                                               roundPeerIds,
+                                                               merge20OptimizerCids,
+                                                               merge20OptimizerLens)
+    if IsErr(merge20Res):
+        echo("v3 tailnet train island self-test: merge20")
+        return 1
+    if types.v3Libp2pPeerIdEqual(workerPeerId, sealedGroup.leaderPeerId):
+        echo("v3 tailnet train island self-test: non leader role")
+        return 1
+    let append2Res = v3TailnetTrainIslandCheckpointVersionAppend(island, version2)
+    if IsErr(append2Res):
+        echo("v3 tailnet train island self-test: append20")
+        return 1
+    var lease30Leader = v3TailnetTrainWorkerLeaseZero()
+    let lease30LeaderRes = v3TailnetTrainIslandGrantWorkerLeaseFill(lease30Leader,
+                                                                    island,
+                                                                    sealedGroup,
+                                                                    leaderPeerId,
+                                                                    version2.versionCid,
+                                                                    30,
+                                                                    120)
+    if IsErr(lease30LeaderRes):
+        echo("v3 tailnet train island self-test: lease30 leader")
+        return 1
+    var lease30Worker = v3TailnetTrainWorkerLeaseZero()
+    let lease30WorkerRes = v3TailnetTrainIslandGrantWorkerLeaseFill(lease30Worker,
+                                                                    island,
+                                                                    sealedGroup,
+                                                                    workerPeerId,
+                                                                    version2.versionCid,
+                                                                    30,
+                                                                    120)
+    if IsErr(lease30WorkerRes):
+        echo("v3 tailnet train island self-test: lease30 worker")
+        return 1
+    var barrier30 = v3TailnetTrainStepBarrierZero()
+    let barrier30Res = v3TailnetTrainIslandStepBarrierAdvanceFill(barrier30,
+                                                                  island,
+                                                                  sealedGroup.rendezvousCid,
+                                                                  version2.versionCid,
+                                                                  30,
+                                                                  roundPeerIds)
+    if IsErr(barrier30Res):
+        echo("v3 tailnet train island self-test: barrier30")
+        return 1
+    let round30LeaderOptim = bytesFromString("optim.workerA=3030")
+    let round30LeaderOptimCid = dag.v3DagBlobCidFromBytes(round30LeaderOptim)
+    let round30WorkerOptim = bytesFromString("optim.workerB=3030")
+    let round30WorkerOptimCid = dag.v3DagBlobCidFromBytes(round30WorkerOptim)
+    var merge30OptimizerCids: layout.FixedBytes32[]
+    merge30OptimizerCids = [round30LeaderOptimCid, round30WorkerOptimCid]
+    var merge30OptimizerLens: int32[]
+    merge30OptimizerLens = [bytesLen(round30LeaderOptim), bytesLen(round30WorkerOptim)]
+    var merge30 = v3TailnetTrainMergeRoundZero()
+    let merge30Res = v3TailnetTrainIslandMergeRoundAdvanceFill(merge30,
+                                                               island,
+                                                               sealedGroup.rendezvousCid,
+                                                               version2.versionCid,
+                                                               30,
+                                                               roundPeerIds,
+                                                               merge30OptimizerCids,
+                                                               merge30OptimizerLens)
+    if IsErr(merge30Res):
+        echo("v3 tailnet train island self-test: merge30")
+        return 1
+    let optim3 = bytesFromString("optim=3333")
+    let optim3Cid = dag.v3DagBlobCidFromBytes(optim3)
+    let optim3PayloadLen = bytesLen(optim3)
+    let blob3 = v3TailnetTrainIslandSelfTestBlob([bytesFromString("step-30|"),
+                                                  bytesFromString("weights=bbYY|"),
+                                                  optim3])
+    var version3 = v3TailnetCheckpointVersionZero()
+    let seed3Res = v3TailnetTrainIslandSelfTestSeedCheckpointVersionFill(version3,
+                                                                         workerRuntime,
+                                                                         jobBundleCid,
+                                                                         leaderPeerId,
+                                                                         30,
+                                                                         version2.versionCid,
+                                                                         blob3,
+                                                                         now + 2)
+    if IsErr(seed3Res):
+        echo("v3 tailnet train island self-test: seed version3")
+        return 1
+    version3.optimizerStateCid = optim3Cid
+    version3.optimizerPayloadLen = optim3PayloadLen
+    version3.versionCid = v3TailnetCheckpointVersionCid(jobBundleCid,
+                                                        version3.globalStep,
+                                                        version3.publisherPeerId,
+                                                        version3.stubCid,
+                                                        version3.manifestCid,
+                                                        version3.blobCid,
+                                                        version3.optimizerStateCid,
+                                                        version3.prevVersionCid)
+    let append3Res = v3TailnetTrainIslandCheckpointVersionAppend(island, version3)
+    if IsErr(append3Res):
+        echo("v3 tailnet train island self-test: append30")
+        return 1
+    var history: V3TailnetCheckpointVersion[]
+    if !v3TailnetTrainIslandCheckpointHistoryFill(history, island, jobBundleCid):
+        echo("v3 tailnet train island self-test: history")
+        return 1
+    if history.len != 3:
+        echo("v3 tailnet train island self-test: history len")
+        return 1
+    var latest = v3TailnetCheckpointVersionZero()
+    if !v3TailnetTrainIslandCheckpointLatestFill(latest, island, jobBundleCid):
+        echo("v3 tailnet train island self-test: latest")
+        return 1
+    if !layout.fixedBytes32Equal(latest.versionCid, version3.versionCid):
+        echo("v3 tailnet train island self-test: latest version")
+        return 1
+    var lineage: V3TailnetCheckpointVersion[]
+    let lineageRes = v3TailnetTrainIslandCheckpointLatestLineageFill(lineage, island, jobBundleCid)
+    if IsErr(lineageRes):
+        echo("v3 tailnet train island self-test: lineage")
+        return 1
+    if lineage.len != 3:
+        echo("v3 tailnet train island self-test: lineage len")
+        return 1
+    let staleParentRes = v3TailnetTrainIslandCheckpointParentValidate(island,
+                                                                      sealedGroup,
+                                                                      version1.versionCid,
+                                                                      40)
+    if !IsErr(staleParentRes):
+        echo("v3 tailnet train island self-test: stale parent")
+        return 1
+    echo("v3 tailnet_train_island_smoke ok")
+    return 0

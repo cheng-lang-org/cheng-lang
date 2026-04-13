@@ -16,10 +16,71 @@ import cheng/v3/libp2p/transports/tcp_transport
 
 fn v3ContentRuntimePublishStub(hostState: var host_base.V3Libp2pHost,
                                artifacts: content.V3ContentPublishArtifacts): Result[content.V3ContentStub] =
-    let publishRes = bridge.v3Libp2pRelayPublishContent(hostState, artifacts)
-    if IsErr(publishRes):
-        return Err[content.V3ContentStub](Error(publishRes))
-    return content.v3ContentStubFromArtifacts(artifacts)
+    let artifactsOk = content.v3ContentPublishArtifactsValidate(artifacts)
+    if IsErr(artifactsOk):
+        return Err[content.V3ContentStub](Error(artifactsOk))
+    let stubRes = content.v3ContentStubFromArtifacts(artifacts)
+    if IsErr(stubRes):
+        return Err[content.V3ContentStub](Error(stubRes))
+    let stub = Value(stubRes)
+    let scope = bridge.v3Libp2pScopeFromLayerId(artifacts.topic.layerId)
+    let address = artifacts.topic.centerAddress
+    let sourcePeerId = hostState.selfPeerId
+    let stampEpoch = artifacts.publishAdvert.stampEpoch
+    let stampGanzhi = artifacts.publishAdvert.stampGanzhi
+
+    let manifestPayload = swarm.v3ErasureShardManifestEncode(artifacts.erasureManifest)
+    let manifestPayloadOk = swarm.v3ErasureShardManifestValidatePayload(manifestPayload,
+                                                                        artifacts.erasureManifest.manifestCid)
+    if IsErr(manifestPayloadOk):
+        return Err[content.V3ContentStub](Error(manifestPayloadOk))
+    let recoveryPlanPayload = swarm.v3ErasureRecoveryPlanEncode(artifacts.recoveryPlan)
+    let recoveryPlanPayloadOk = swarm.v3ErasureRecoveryPlanValidatePayload(recoveryPlanPayload,
+                                                                           artifacts.recoveryPlan.planCid)
+    if IsErr(recoveryPlanPayloadOk):
+        return Err[content.V3ContentStub](Error(recoveryPlanPayloadOk))
+
+    let stubIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                 scope,
+                                                 address,
+                                                 pubsub.v3PubSubPayloadKindContentStub,
+                                                 stub.stubCid,
+                                                 content.v3ContentStubEncode(stub),
+                                                 stampEpoch,
+                                                 stampGanzhi)
+    let advertIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                   scope,
+                                                   address,
+                                                   pubsub.v3PubSubPayloadKindDagAdvert,
+                                                   artifacts.publishAdvert.advertCid,
+                                                   dag.v3DagPublishAdvertEncode(artifacts.publishAdvert),
+                                                   stampEpoch,
+                                                   stampGanzhi)
+    let manifestIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                     scope,
+                                                     address,
+                                                     pubsub.v3PubSubPayloadKindErasureManifest,
+                                                     artifacts.erasureManifest.manifestCid,
+                                                     manifestPayload,
+                                                     stampEpoch,
+                                                     stampGanzhi)
+    let recoveryPlanIngress = bridge.v3Libp2pIngressMake(sourcePeerId,
+                                                         scope,
+                                                         address,
+                                                         pubsub.v3PubSubPayloadKindErasureRecoveryPlan,
+                                                         artifacts.recoveryPlan.planCid,
+                                                         recoveryPlanPayload,
+                                                         stampEpoch,
+                                                         stampGanzhi)
+
+    bridge.v3Libp2pRelayPublish(hostState, stubIngress)
+    host_base.v3Libp2pStorePut(hostState, advertIngress)
+    host_base.v3Libp2pStorePut(hostState, manifestIngress)
+    host_base.v3Libp2pStorePut(hostState, recoveryPlanIngress)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.bundleCid)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.blobSummary.blobCid)
+    host_base.v3Libp2pKadProvide(hostState, artifacts.erasureManifest.manifestCid)
+    return Ok[content.V3ContentStub](stub)
 
 fn v3ContentRuntimeSelectSyncRequest(localHost: var host_base.V3Libp2pHost,
                                      remoteHost: var host_base.V3Libp2pHost,

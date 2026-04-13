@@ -13,8 +13,7 @@ fn main(): int32 =
     cfg.exactRouting = true
 
     var transport = tsnet.v3Libp2pTailnetTransportInit(cfg)
-    tsnet.v3Libp2pTailnetSetProviderReady(transport, true, "control-ready")
-    tsnet.v3Libp2pTailnetSetProxyListenersReady(transport, true, "proxy-ready")
+    tsnet.v3Libp2pTailnetProviderStart(transport)
 
     var rawTcp = types.v3Libp2pMultiaddrZero()
     multiaddr.v3Libp2pMultiaddrFillTcp(rawTcp, "127.0.0.1", 7101)
@@ -46,6 +45,17 @@ fn main(): int32 =
         "v3 libp2p tailnet transport: raw to published")
     assert(publishedLookup.host == "100.64.0.44", "v3 libp2p tailnet transport: published host lookup")
 
+    var pendingStatus: tsnet.V3Libp2pTailnetStatusSnapshot
+    tsnet.v3Libp2pTailnetStatusFill(pendingStatus, transport)
+    assert(pendingStatus.tailnetPath == "direct-pending",
+        "v3 libp2p tailnet transport: pending path")
+    assert(pendingStatus.startupStage == "provider-started",
+        "v3 libp2p tailnet transport: provider start stage")
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeActiveCountNow() == 1,
+        "v3 libp2p tailnet transport: runtime active")
+
+    tsnet.v3Libp2pTailnetProviderMarkProxyReady(transport)
+
     var directSession = tsnet.v3Libp2pTailnetPeerSessionZero()
     directSession.peerId = "peer-direct"
     directSession.remoteTailnetIp = "100.64.0.88"
@@ -55,6 +65,9 @@ fn main(): int32 =
     directSession.signedPreface = "preface-ok"
     directSession.boundAddrText = tsnet.v3Libp2pTailnetAddrText(rawTcp)
     tsnet.v3Libp2pTailnetUpsertPeerSession(transport, directSession)
+    var preStatus: tsnet.V3Libp2pTailnetStatusSnapshot
+    tsnet.v3Libp2pTailnetStatusFill(preStatus, transport)
+    assert(preStatus.sessionCount == 1, "v3 libp2p tailnet transport: session count")
     var directPlan = tsnet.v3Libp2pTailnetDialPlanZero()
     let directPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(directPlan,
                                                           transport,
@@ -70,7 +83,7 @@ fn main(): int32 =
     assert(directPlan.routeText == tsnet.v3Libp2pTailnetAddrText(rawTcp),
         "v3 libp2p tailnet transport: exact route text")
 
-    tsnet.v3Libp2pTailnetSetListenerNeedsRepair(transport, true, "repair-needed")
+    tsnet.v3Libp2pTailnetProviderMarkListenerRepairNeeded(transport)
     var repairPlan = tsnet.v3Libp2pTailnetDialPlanZero()
     let repairPlanRes = tsnet.v3Libp2pTailnetDialPlanFill(repairPlan,
                                                           transport,
@@ -81,7 +94,18 @@ fn main(): int32 =
     assert(IsErr(repairPlanRes), "v3 libp2p tailnet transport: repair blocks direct")
     assert(repairPlan.pathKind == tsnet.v3Libp2pTailnetPathRepair,
         "v3 libp2p tailnet transport: repair path")
-    tsnet.v3Libp2pTailnetSetListenerNeedsRepair(transport, false, "proxy-ready")
+    tsnet.v3Libp2pTailnetProviderRepairListeners(transport)
+
+    var directPlanAfterRepair = tsnet.v3Libp2pTailnetDialPlanZero()
+    let directPlanAfterRepairRes = tsnet.v3Libp2pTailnetDialPlanFill(directPlanAfterRepair,
+                                                                     transport,
+                                                                     "peer-direct",
+                                                                     published[0],
+                                                                     false,
+                                                                     false)
+    assert(IsOk(directPlanAfterRepairRes), "v3 libp2p tailnet transport: repair restores direct")
+    assert(directPlanAfterRepair.pathKind == tsnet.v3Libp2pTailnetPathDirect,
+        "v3 libp2p tailnet transport: repair direct path")
 
     var status: tsnet.V3Libp2pTailnetStatusSnapshot
     tsnet.v3Libp2pTailnetStatusFill(status, transport)
@@ -97,7 +121,9 @@ fn main(): int32 =
     assert(status.tailnetRelay == "derp-sfo", "v3 libp2p tailnet transport: relay")
     assert(status.tailnetDerpMapSummary == "https://control.example",
         "v3 libp2p tailnet transport: control")
-    assert(status.startupStage == "proxy-ready", "v3 libp2p tailnet transport: startup stage")
+    assert(status.startupStage == "repair-complete", "v3 libp2p tailnet transport: startup stage")
+    assert(tsnet.v3Libp2pTailnetProviderRuntimeCommandCountNow() == 4,
+        "v3 libp2p tailnet transport: runtime commands")
 
     echo("v3 libp2p_tailnet_transport_smoke ok")
     return 0

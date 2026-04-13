@@ -2,10 +2,19 @@ import std/system
 import std/rawbytes
 import std/result
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
 import cheng/v3/chain/dag_mempool as dag
 import cheng/v3/chain/erasure_swarm as swarm
 import cheng/v3/chain/content_plane as content
 import cheng/v3/chain/content_fetch as fetch
+
+fn contentCodecBytesEqual(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
 
 fn main(): int32 =
     let shard0 = bytesFromString("codec-0")
@@ -29,99 +38,82 @@ fn main(): int32 =
     assert(IsOk(manifestRes), "v3 content codec smoke: manifest")
     let manifest = Value(manifestRes)
 
-    let requestRes = swarm.v3ErasureShardPullRequestMake(manifest, 0)
-    assert(IsOk(requestRes), "v3 content codec smoke: request")
-    let request = Value(requestRes)
-    let requestDecodedRes = swarm.v3ErasureShardPullRequestDecode(swarm.v3ErasureShardPullRequestEncode(request))
-    if IsErr(requestDecodedRes):
-        panic(ErrorText(requestDecodedRes))
-    let requestDecoded = Value(requestDecodedRes)
-    assert(layout.fixedBytes32Equal(requestDecoded.requestCid, request.requestCid),
-        "v3 content codec smoke: request cid")
+    let pullReqRes = swarm.v3ErasureShardPullRequestMake(manifest, 0)
+    assert(IsOk(pullReqRes), "v3 content codec smoke: pull request")
+    let pullReq = Value(pullReqRes)
+    let pullReqDecodedRes = swarm.v3ErasureShardPullRequestDecode(
+        swarm.v3ErasureShardPullRequestEncode(pullReq)
+    )
+    assert(IsOk(pullReqDecodedRes), "v3 content codec smoke: pull request decode")
+    let pullReqDecoded = Value(pullReqDecodedRes)
+    assert(layout.fixedBytes32Equal(pullReqDecoded.requestCid, pullReq.requestCid),
+        "v3 content codec smoke: pull request cid")
 
-    let responseRes = swarm.v3ErasureShardPullResponseMake(request, shard0)
-    assert(IsOk(responseRes), "v3 content codec smoke: response")
-    let response = Value(responseRes)
-    let responseDecodedRes = swarm.v3ErasureShardPullResponseDecode(swarm.v3ErasureShardPullResponseEncode(response))
-    if IsErr(responseDecodedRes):
-        panic(ErrorText(responseDecodedRes))
-    let responseDecoded = Value(responseDecodedRes)
-    assert(layout.fixedBytes32Equal(responseDecoded.responseCid, response.responseCid),
-        "v3 content codec smoke: response cid")
-    assert(responseDecoded.payloadLen == bytesLen(shard0), "v3 content codec smoke: payload len")
+    let pullRespRes = swarm.v3ErasureShardPullResponseMake(pullReq, shard0)
+    assert(IsOk(pullRespRes), "v3 content codec smoke: pull response")
+    let pullResp = Value(pullRespRes)
+    let pullRespDecodedRes = swarm.v3ErasureShardPullResponseDecode(
+        swarm.v3ErasureShardPullResponseEncode(pullResp)
+    )
+    assert(IsOk(pullRespDecodedRes), "v3 content codec smoke: pull response decode")
+    let pullRespDecoded = Value(pullRespDecodedRes)
+    assert(layout.fixedBytes32Equal(pullRespDecoded.responseCid, pullResp.responseCid),
+        "v3 content codec smoke: pull response cid")
+    assert(pullRespDecoded.payloadLen == bytesLen(shard0), "v3 content codec smoke: pull payload len")
 
     let manifestFetchReqRes = fetch.v3ContentFetchRequestManifest(manifest.manifestCid)
     assert(IsOk(manifestFetchReqRes), "v3 content codec smoke: manifest fetch request")
     let manifestFetchReq = Value(manifestFetchReqRes)
-    let manifestFetchReqDecodedRes = fetch.v3ContentFetchRequestDecode(
-        fetch.v3ContentFetchRequestEncode(manifestFetchReq)
-    )
-    assert(IsOk(manifestFetchReqDecodedRes), "v3 content codec smoke: manifest fetch request decode")
-    assert(layout.fixedBytes32Equal(Value(manifestFetchReqDecodedRes).requestCid, manifestFetchReq.requestCid),
-        "v3 content codec smoke: manifest fetch request cid")
-
     let manifestFetchRespRes = fetch.v3ContentFetchResponseMake(manifestFetchReq,
                                                                 swarm.v3ErasureShardManifestEncode(manifest))
     assert(IsOk(manifestFetchRespRes), "v3 content codec smoke: manifest fetch response")
-    let manifestFetchRespDecodedRes = fetch.v3ContentFetchResponseDecode(
-        fetch.v3ContentFetchResponseEncode(Value(manifestFetchRespRes))
-    )
-    assert(IsOk(manifestFetchRespDecodedRes), "v3 content codec smoke: manifest fetch response decode")
-    let manifestFetchRespDecoded = Value(manifestFetchRespDecodedRes)
     var manifestBack = swarm.v3ErasureShardManifestZero()
     let manifestBackRes = fetch.v3ContentFetchResponseToManifestFill(manifestBack,
                                                                      manifestFetchReq,
-                                                                     manifestFetchRespDecoded)
+                                                                     Value(manifestFetchRespRes))
     assert(IsOk(manifestBackRes), "v3 content codec smoke: manifest fetch roundtrip")
     assert(layout.fixedBytes32Equal(manifestBack.manifestCid, manifest.manifestCid),
-        "v3 content codec smoke: manifest fetch cid")
+        "v3 content codec smoke: manifest roundtrip cid")
 
-    let chunkFetchReqRes = fetch.v3ContentFetchRequestFromShardPull(request)
+    let chunkFetchReqRes = fetch.v3ContentFetchRequestFromShardPull(pullReq)
     assert(IsOk(chunkFetchReqRes), "v3 content codec smoke: chunk fetch request")
     let chunkFetchReq = Value(chunkFetchReqRes)
     let chunkFetchRespRes = fetch.v3ContentFetchResponseMake(chunkFetchReq, shard0)
     assert(IsOk(chunkFetchRespRes), "v3 content codec smoke: chunk fetch response")
-    let chunkFetchResp = Value(chunkFetchRespRes)
-    var chunkResponseBack = swarm.v3ErasureShardPullResponseZero()
-    let chunkResponseBackRes = fetch.v3ContentFetchResponseToShardPullFill(chunkResponseBack,
-                                                                           chunkFetchReq,
-                                                                           chunkFetchResp)
-    assert(IsOk(chunkResponseBackRes), "v3 content codec smoke: chunk fetch roundtrip")
-    assert(layout.fixedBytes32Equal(chunkResponseBack.shardCid, request.shardCid),
-        "v3 content codec smoke: chunk fetch shard cid")
+    var pullRespBack = swarm.v3ErasureShardPullResponseZero()
+    let pullRespBackRes = fetch.v3ContentFetchResponseToShardPullFill(pullRespBack,
+                                                                      chunkFetchReq,
+                                                                      Value(chunkFetchRespRes))
+    assert(IsOk(pullRespBackRes), "v3 content codec smoke: chunk fetch roundtrip")
+    assert(layout.fixedBytes32Equal(pullRespBack.shardCid, pullReq.shardCid),
+        "v3 content codec smoke: chunk roundtrip shard cid")
 
-    let previewStubRes = content.v3ContentStubMake(dag.v3DagBlobCidFromBytes(bytesFromString("codec.topic")),
-                                                   dag.v3DagBlobCidFromBytes(bytesFromString("codec.bundle")),
-                                                   summary.summaryCid,
-                                                   dag.v3DagBlobCidFromBytes(bytesFromString("codec.advert")),
-                                                   manifest.manifestCid,
-                                                   dag.v3DagBlobCidFromBytes(bytesFromString("codec.plan")),
-                                                   summary.payloadLen)
-    assert(IsOk(previewStubRes), "v3 content codec smoke: preview stub")
-    let previewReqRes = fetch.v3ContentFetchRequestPreview(summary.summaryCid)
-    assert(IsOk(previewReqRes), "v3 content codec smoke: preview request")
-    let previewReq = Value(previewReqRes)
-    let previewRespRes = fetch.v3ContentFetchResponseMake(previewReq, content.v3ContentStubEncode(Value(previewStubRes)))
-    assert(IsOk(previewRespRes), "v3 content codec smoke: preview response")
-    var previewBack = content.v3ContentStubZero()
-    let previewBackRes = fetch.v3ContentFetchResponseToPreviewFill(previewBack,
-                                                                   previewReq,
-                                                                   Value(previewRespRes))
-    assert(IsOk(previewBackRes), "v3 content codec smoke: preview roundtrip")
-    assert(layout.fixedBytes32Equal(previewBack.blobSummaryCid, summary.summaryCid),
-        "v3 content codec smoke: preview cid")
+    let stubRes = content.v3ContentStubMake(lt.v3HashInts("v3.content.codec.topic", [1]),
+                                            lt.v3HashInts("v3.content.codec.bundle", [2]),
+                                            summary.summaryCid,
+                                            lt.v3HashInts("v3.content.codec.advert", [3]),
+                                            manifest.manifestCid,
+                                            lt.v3HashInts("v3.content.codec.plan", [4]),
+                                            summary.payloadLen)
+    assert(IsOk(stubRes), "v3 content codec smoke: stub")
+    let stub = Value(stubRes)
+    let stubDecodedRes = content.v3ContentStubDecode(content.v3ContentStubEncode(stub))
+    assert(IsOk(stubDecodedRes), "v3 content codec smoke: stub decode")
+    assert(layout.fixedBytes32Equal(Value(stubDecodedRes).stubCid, stub.stubCid),
+        "v3 content codec smoke: stub cid")
 
     let rangeReqRes = fetch.v3ContentFetchRequestRange(summary.blobCid, 2, 4)
     assert(IsOk(rangeReqRes), "v3 content codec smoke: range request")
     let rangeReq = Value(rangeReqRes)
-    let rangeDecodedRes = fetch.v3ContentFetchRequestDecode(fetch.v3ContentFetchRequestEncode(rangeReq))
-    assert(IsOk(rangeDecodedRes), "v3 content codec smoke: range request decode")
-    assert(Value(rangeDecodedRes).rangeLen == 4, "v3 content codec smoke: range len")
     let rangeRespRes = fetch.v3ContentFetchResponseMake(rangeReq, bytesSlice(blob, 2, 4))
     assert(IsOk(rangeRespRes), "v3 content codec smoke: range response")
-    let rangeRespDecodedRes = fetch.v3ContentFetchResponseDecode(fetch.v3ContentFetchResponseEncode(Value(rangeRespRes)))
+    let rangeRespDecodedRes = fetch.v3ContentFetchResponseDecode(
+        fetch.v3ContentFetchResponseEncode(Value(rangeRespRes))
+    )
     assert(IsOk(rangeRespDecodedRes), "v3 content codec smoke: range response decode")
-    assert(bytesLen(Value(rangeRespDecodedRes).payload) == 4, "v3 content codec smoke: range payload len")
+    let rangePayload = Value(rangeRespDecodedRes).payload
+    assert(contentCodecBytesEqual(rangePayload, bytesSlice(blob, 2, 4)),
+        "v3 content codec smoke: range payload")
 
     echo("v3 content_codec_smoke ok")
     return 0

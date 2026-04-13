@@ -1,0 +1,173 @@
+import std/result
+import cheng/v3/overlay/contracts as overlay
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/core/peer_id
+import cheng/v3/libp2p/host/host as host_base
+import cheng/v3/libp2p/transports/webrtc_transport
+import cheng/v3/chain/content_fetch as fetch
+import cheng/v3/chain/content_runtime as runtime
+import cheng/v3/chain/content_runtime_browser_webrtc as runtime_browser
+import cheng/v3/chain/erasure_swarm as swarm
+
+type
+    V3BrowserSdk =
+        host: host_base.V3Libp2pHost
+
+fn v3BrowserSdkInit(seed: str): V3BrowserSdk =
+    var out: V3BrowserSdk
+    out.host = host_base.v3Libp2pHostInit(seed)
+    return out
+
+fn v3BrowserSdkPeerIdText(sdk: V3BrowserSdk): str =
+    return peer_id.v3Libp2pPeerIdText(sdk.host.selfPeerId)
+
+fn v3BrowserSdkEnableSignal(sdk: var V3BrowserSdk) =
+    var hostInst = sdk.host
+    host_base.v3Libp2pRegisterHandler(hostInst, types.v3Libp2pProtocolWebrtcSignal)
+    sdk.host = hostInst
+
+fn v3BrowserSdkEnableSync(sdk: var V3BrowserSdk) =
+    var hostInst = sdk.host
+    host_base.v3Libp2pRegisterHandler(hostInst, types.v3Libp2pProtocolSync)
+    sdk.host = hostInst
+
+fn v3BrowserSdkEnableIngress(sdk: var V3BrowserSdk) =
+    var hostInst = sdk.host
+    host_base.v3Libp2pRegisterHandler(hostInst, types.v3Libp2pProtocolIngress)
+    sdk.host = hostInst
+
+fn v3BrowserSdkEnableContent(sdk: var V3BrowserSdk) =
+    var hostInst = sdk.host
+    host_base.v3Libp2pRegisterHandler(hostInst, types.v3Libp2pProtocolContent)
+    sdk.host = hostInst
+
+fn v3BrowserSdkEnableLightNode(sdk: var V3BrowserSdk) =
+    v3BrowserSdkEnableSignal(sdk)
+    v3BrowserSdkEnableSync(sdk)
+    v3BrowserSdkEnableIngress(sdk)
+    v3BrowserSdkEnableContent(sdk)
+
+fn v3BrowserSdkListenPublic(outAddr: var types.V3Libp2pMultiaddr,
+                            sdk: var V3BrowserSdk,
+                            hostText: str,
+                            port: int32): Result[bool] =
+    var hostInst = sdk.host
+    outAddr = types.v3Libp2pMultiaddrZero()
+    outAddr.host = hostText
+    outAddr.port = port
+    outAddr.transport = types.v3Libp2pTransportWebrtc
+    outAddr.networkDomain = types.v3Libp2pNetworkDomainBrowserWebrtc
+    outAddr.visibility = types.v3Libp2pVisibilityPublic
+    let res = host_base.v3Libp2pListen(hostInst, outAddr)
+    sdk.host = hostInst
+    return res
+
+fn v3BrowserSdkDialRemote(sdk: var V3BrowserSdk,
+                          remote: V3BrowserSdk,
+                          listenAddr: types.V3Libp2pMultiaddr): Result[bool] =
+    var hostInst = sdk.host
+    let res = host_base.v3Libp2pDial(hostInst,
+                                     remote.host.selfPeerId,
+                                     listenAddr,
+                                     overlay.v3OverlayRoleEdgeRelayStore)
+    sdk.host = hostInst
+    return res
+
+fn v3BrowserSdkStorePut(sdk: var V3BrowserSdk,
+                        ingress: overlay.V3IngressEnvelope) =
+    var hostInst = sdk.host
+    host_base.v3Libp2pStorePut(hostInst, ingress)
+    sdk.host = hostInst
+
+fn v3BrowserSdkSync(sdk: var V3BrowserSdk,
+                    remote: var V3BrowserSdk,
+                    query: overlay.V3StoreQuery,
+                    out: var overlay.V3IngressEnvelope[]): Result[bool] =
+    var localHost = sdk.host
+    var remoteHost = remote.host
+    let res = host_base.v3Libp2pSyncRequest(localHost,
+                                            remoteHost,
+                                            remoteHost.selfPeerId,
+                                            query,
+                                            out)
+    sdk.host = localHost
+    remote.host = remoteHost
+    return res
+
+fn v3BrowserSdkIngressPush(sdk: var V3BrowserSdk,
+                           remote: var V3BrowserSdk,
+                           entries: overlay.V3IngressEnvelope[]): Result[bool] =
+    var localHost = sdk.host
+    var remoteHost = remote.host
+    let res = host_base.v3Libp2pIngressPush(localHost,
+                                            remoteHost,
+                                            remoteHost.selfPeerId,
+                                            entries)
+    sdk.host = localHost
+    remote.host = remoteHost
+    return res
+
+fn v3BrowserSdkContentFetch(out: var fetch.V3ContentFetchResponse,
+                            sdk: var V3BrowserSdk,
+                            remote: var V3BrowserSdk,
+                            remoteRuntime: var runtime.V3ContentRuntime,
+                            request: fetch.V3ContentFetchRequest): Result[bool] =
+    var localHost = sdk.host
+    var remoteHost = remote.host
+    let res = runtime_browser.v3ContentRuntimeRequestFetch(localHost,
+                                                           remoteHost,
+                                                           remoteHost.selfPeerId,
+                                                           remoteRuntime,
+                                                           request)
+    sdk.host = localHost
+    remote.host = remoteHost
+    if IsErr(res):
+        return Err[bool](Error(res))
+    out = Value(res)
+    return Ok[bool](true)
+
+fn v3BrowserSdkShardPull(out: var swarm.V3ErasureShardPullResponse,
+                         sdk: var V3BrowserSdk,
+                         remote: var V3BrowserSdk,
+                         remoteRuntime: var runtime.V3ContentRuntime,
+                         request: swarm.V3ErasureShardPullRequest): Result[bool] =
+    var localHost = sdk.host
+    var remoteHost = remote.host
+    let res = runtime_browser.v3ContentRuntimeRequestShardPull(localHost,
+                                                               remoteHost,
+                                                               remoteHost.selfPeerId,
+                                                               remoteRuntime,
+                                                               request)
+    sdk.host = localHost
+    remote.host = remoteHost
+    if IsErr(res):
+        return Err[bool](Error(res))
+    out = Value(res)
+    return Ok[bool](true)
+
+fn v3BrowserSdkStreamCount(sdk: V3BrowserSdk): int32 =
+    return sdk.host.openStreamPeers.len
+
+fn v3BrowserSdkSignalIngressCount(sdk: V3BrowserSdk): int32 =
+    return host_base.v3Libp2pWebrtcSignalIngressCount(sdk.host)
+
+fn v3BrowserSdkSignalEgressCount(sdk: V3BrowserSdk): int32 =
+    return host_base.v3Libp2pWebrtcSignalEgressCount(sdk.host)
+
+fn v3BrowserSdkStoreEntryCount(sdk: V3BrowserSdk): int32 =
+    return sdk.host.storeEntries.len
+
+fn v3BrowserSdkPublishCount(sdk: V3BrowserSdk): int32 =
+    return sdk.host.publishLog.len
+
+fn v3BrowserSdkResetTransportStats() =
+    webrtc_transport.v3Libp2pWebrtcTransportResetStats()
+
+fn v3BrowserSdkBrowserOpenCountNow(): int32 =
+    return webrtc_transport.v3Libp2pWebrtcBrowserDatachannelOpenCountNow()
+
+fn v3BrowserSdkBrowserRequestCountNow(): int32 =
+    return webrtc_transport.v3Libp2pWebrtcBrowserDatachannelRequestCountNow()
+
+fn v3BrowserSdkBrowserActiveSessionCountNow(): int32 =
+    return webrtc_transport.v3Libp2pWebrtcBrowserSessionActiveCountNow()

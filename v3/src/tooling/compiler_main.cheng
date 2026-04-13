@@ -2,10 +2,17 @@ import std/cmdline as cmdline
 import std/os
 import std/result
 import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/bootstrap_contracts as contracts
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/tooling/compiler_equivalence as ceq
+import cheng/v3/tooling/compiler_world_libp2p as cwlp
 import cheng/v3/tooling/path as v3path
+import cheng/v3/lang/parser
+import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/system_link_exec as sexec
 import cheng/v3/backend/build_plan as buildplan
 
@@ -37,12 +44,732 @@ fn v3CompilerPrintBuildPlan(rootDir: str) =
     let plan = buildplan.v3BackendBuildPlanDefault(rootDir)
     v3CompilerPrintLine(strutil.strip(buildplan.v3BackendBuildPlanReport(plan)))
 
-fn main(): int32 =
+fn v3CompilerWriteOptionalReport(rootDir: str,
+                                 rawPath: str,
+                                 report: str): bool =
+    if len(rawPath) <= 0:
+        return true
+    return v3path.v3WriteTextFile(rootDir, rawPath, report + "\n")
+
+fn v3CompilerCollectArgsFrom(startIndex: int32,
+                             count: int32): str[] =
+    var out: str[] = []
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        out.add(cmdline.paramStr(i))
+    return out
+
+fn v3CompilerBuildSystemPlan(rootDir: str,
+                             req: creq.V3CompilerRequest,
+                             args: str[]): Result[sexec.V3SystemLinkExecPlan] =
+    return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                              req,
+                                                              creq.v3CompilerWorldHeadFromArgs(args),
+                                                              creq.v3CompilerLockPathFromArgs(args),
+                                                              creq.v3CompilerBaselineSurfacePathFromArgs(args),
+                                                              creq.v3CompilerChannelFromArgs(args))
+
+fn v3CompilerBuildSystemPlanForEquivalence(rootDir: str,
+                                           req: creq.V3CompilerRequest,
+                                           args: str[]): Result[sexec.V3SystemLinkExecPlan] =
+    return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                              req,
+                                                              creq.v3CompilerWorldHeadFromArgs(args),
+                                                              creq.v3CompilerLockPathFromArgs(args),
+                                                              "",
+                                                              creq.v3CompilerChannelFromArgs(args))
+
+fn v3CompilerEquivalenceInputsReady(args: str[],
+                                    required: bool): Result[bool] =
+    let baselineCsgPath = creq.v3CompilerBaselineCsgPathFromArgs(args)
+    let baselineSurfacePath = creq.v3CompilerBaselineSurfacePathFromArgs(args)
+    let baselineReceiptPath = creq.v3CompilerBaselineReceiptPathFromArgs(args)
+    let anyProvided = len(baselineCsgPath) > 0 ||
+                      len(baselineSurfacePath) > 0 ||
+                      len(baselineReceiptPath) > 0
+    let allProvided = len(baselineCsgPath) > 0 &&
+                      len(baselineSurfacePath) > 0 &&
+                      len(baselineReceiptPath) > 0
+    if anyProvided && !allProvided:
+        return Err[bool]("v3 compiler equivalence: require --baseline-csg --baseline-surface --baseline-receipt together")
+    if required && !allProvided:
+        return Err[bool]("v3 compiler equivalence: missing --baseline-csg/--baseline-surface/--baseline-receipt")
+    return Ok[bool](allProvided)
+
+fn v3CompilerEquivalenceProofFromArgs(rootDir: str,
+                                      args: str[],
+                                      plan: sexec.V3SystemLinkExecPlan,
+                                      out: var ceq.V3CompilerEquivalenceProof): Result[bool] =
+    let baselineCsgPath = v3path.v3PathAbsolute(rootDir, creq.v3CompilerBaselineCsgPathFromArgs(args))
+    if !v3path.v3PathFileExists(baselineCsgPath):
+        return Err[bool]("v3 compiler equivalence: missing baseline csg: " + baselineCsgPath)
+    let baselineSurfacePath = v3path.v3PathAbsolute(rootDir, creq.v3CompilerBaselineSurfacePathFromArgs(args))
+    if !v3path.v3PathFileExists(baselineSurfacePath):
+        return Err[bool]("v3 compiler equivalence: missing baseline surface: " + baselineSurfacePath)
+    let baselineReceiptPath = v3path.v3PathAbsolute(rootDir, creq.v3CompilerBaselineReceiptPathFromArgs(args))
+    if !v3path.v3PathFileExists(baselineReceiptPath):
+        return Err[bool]("v3 compiler equivalence: missing baseline receipt: " + baselineReceiptPath)
+    let baselineCsgText = v3path.v3ReadTextFile("", baselineCsgPath)
+    let baselineSurfaceText = v3path.v3ReadTextFile("", baselineSurfacePath)
+    let baselineReceiptText = v3path.v3ReadTextFile("", baselineReceiptPath)
+    let migratedCsgText = ccsg.v3CompilerCsgReport(plan.compilerCsg)
+    let migratedSurfaceText = ccsg.v3CompilerExportSurfaceReport(plan.exportSurface)
+    let migratedReceiptText = ccsg.v3CompileReceiptReport(plan.compileReceipt)
+    var baselineGraphCid = layout.fixedBytes32Zero()
+    var migratedGraphCid = layout.fixedBytes32Zero()
+    var graphEquivalent = 0
+    let graphRes = ceq.v3CompilerEquivalenceGraphCompareTexts(baselineCsgText,
+                                                              migratedCsgText,
+                                                              baselineGraphCid,
+                                                              migratedGraphCid,
+                                                              graphEquivalent)
+    if IsErr(graphRes):
+        return Err[bool](Error(graphRes))
+    var baselineSurfaceCid = layout.fixedBytes32Zero()
+    var migratedSurfaceCid = layout.fixedBytes32Zero()
+    var exportSurfaceCompatible = 0
+    let surfaceRes = ceq.v3CompilerEquivalenceSurfaceCompareTexts(baselineSurfaceText,
+                                                                  migratedSurfaceText,
+                                                                  baselineSurfaceCid,
+                                                                  migratedSurfaceCid,
+                                                                  exportSurfaceCompatible)
+    if IsErr(surfaceRes):
+        return Err[bool](Error(surfaceRes))
+    var baselineReceiptCid = layout.fixedBytes32Zero()
+    var migratedReceiptCid = layout.fixedBytes32Zero()
+    var targetTriple = ""
+    var compileReceiptEquivalent = 0
+    let receiptRes = ceq.v3CompilerEquivalenceReceiptCompareTexts(baselineReceiptText,
+                                                                  migratedReceiptText,
+                                                                  baselineReceiptCid,
+                                                                  migratedReceiptCid,
+                                                                  targetTriple,
+                                                                  compileReceiptEquivalent)
+    if IsErr(receiptRes):
+        return Err[bool](Error(receiptRes))
+    return ceq.v3CompilerEquivalenceProofMake(plan.systemLinkPlan.packageId,
+                                              plan.localUniverse.worldHead.channel,
+                                              baselineGraphCid,
+                                              migratedGraphCid,
+                                              baselineSurfaceCid,
+                                              migratedSurfaceCid,
+                                              baselineReceiptCid,
+                                              migratedReceiptCid,
+                                              targetTriple,
+                                              graphEquivalent,
+                                              exportSurfaceCompatible,
+                                              compileReceiptEquivalent,
+                                              out)
+
+fn v3CompilerPackageRootFromArgs(rootDir: str,
+                                 args: str[]): str =
+    return creq.v3CompilerReadFlagOrDefault(args,
+                                            "--root",
+                                            creq.v3CompilerDefaultPackageRoot(rootDir))
+
+fn v3CompilerLegacyMigrationBuild(rootDir: str,
+                                  packageRoot: str,
+                                  legacySourcePathRaw: str,
+                                  packageIdHint: str,
+                                  entryModulePath: str,
+                                  out: var ccsg.V3CompilerLegacyMigration): Result[bool] =
+    let legacySourcePath = v3path.v3PathAbsolute(rootDir, legacySourcePathRaw)
+    if len(legacySourcePath) <= 0:
+        return Err[bool]("v3 compiler migration: missing --legacy-in")
+    let migrationRes = ccsg.v3BuildCompilerLegacyMigration(rootDir,
+                                                           packageRoot,
+                                                           legacySourcePath,
+                                                           packageIdHint,
+                                                           entryModulePath)
+    if IsErr(migrationRes):
+        return Err[bool](Error(migrationRes))
+    out = Value(migrationRes)
+    return Ok[bool](true)
+
+fn v3CompilerMigrationReceipt(plan: sexec.V3SystemLinkExecPlan,
+                              migration: ccsg.V3CompilerLegacyMigration): ccsg.V3CompileReceipt =
+    let outputDigest = ccsg.v3CompileOutputDigest(plan.systemLinkPlan.outputPath,
+                                                  plan.systemLinkPlan.targetTriple,
+                                                  plan.systemLinkPlan.providerModules,
+                                                  migration.compilerCsg.graphCid)
+    let canonicalOutputDigest = ccsg.v3CompileOutputDigest(plan.systemLinkPlan.outputPath,
+                                                           plan.systemLinkPlan.targetTriple,
+                                                           plan.systemLinkPlan.providerModules,
+                                                           migration.compilerCsg.canonicalGraphCid)
+    return ccsg.v3CompileReceiptMake(plan.localUniverse.worldHead.headCid,
+                                     migration.compilerCsg.graphCid,
+                                     migration.compilerCsg.canonicalGraphCid,
+                                     plan.systemLinkPlan.targetTriple,
+                                     outputDigest,
+                                     canonicalOutputDigest,
+                                     plan.compileReceipt.bootstrapStage,
+                                     plan.systemLinkPlan.providerModules)
+
+fn v3CompilerMigrationProofFromArgs(rootDir: str,
+                                    args: str[],
+                                    req: creq.V3CompilerRequest,
+                                    plan: sexec.V3SystemLinkExecPlan,
+                                    outMigration: var ccsg.V3CompilerLegacyMigration,
+                                    out: var ceq.V3CompilerEquivalenceProof): Result[bool] =
+    let legacySourcePath = creq.v3CompilerLegacyInPathFromArgs(args)
+    if len(legacySourcePath) <= 0:
+        return Err[bool]("v3 compiler migration: missing --legacy-in")
+    let entryModulePath = parser.v3ParserSourcePathToModulePath(rootDir,
+                                                                req.packageRoot,
+                                                                req.sourcePath)
+    let migrationRes = v3CompilerLegacyMigrationBuild(rootDir,
+                                                      req.packageRoot,
+                                                      legacySourcePath,
+                                                      plan.systemLinkPlan.packageId,
+                                                      entryModulePath,
+                                                      outMigration)
+    if IsErr(migrationRes):
+        return Err[bool](Error(migrationRes))
+    let baselineCsgText = ccsg.v3CompilerCsgReport(plan.compilerCsg)
+    let migratedCsgText = ccsg.v3CompilerCsgReport(outMigration.compilerCsg)
+    let baselineSurfaceText = ccsg.v3CompilerExportSurfaceReport(plan.exportSurface)
+    let migratedSurfaceText = ccsg.v3CompilerExportSurfaceReport(outMigration.exportSurface)
+    let migratedReceipt = v3CompilerMigrationReceipt(plan, outMigration)
+    let baselineReceiptText = ccsg.v3CompileReceiptReport(plan.compileReceipt)
+    let migratedReceiptText = ccsg.v3CompileReceiptReport(migratedReceipt)
+    var baselineGraphCid = layout.fixedBytes32Zero()
+    var migratedGraphCid = layout.fixedBytes32Zero()
+    var graphEquivalent = 0
+    let graphRes = ceq.v3CompilerEquivalenceGraphCompareTexts(baselineCsgText,
+                                                              migratedCsgText,
+                                                              baselineGraphCid,
+                                                              migratedGraphCid,
+                                                              graphEquivalent)
+    if IsErr(graphRes):
+        return Err[bool](Error(graphRes))
+    var baselineSurfaceCid = layout.fixedBytes32Zero()
+    var migratedSurfaceCid = layout.fixedBytes32Zero()
+    var exportSurfaceCompatible = 0
+    let surfaceRes = ceq.v3CompilerEquivalenceSurfaceCompareTexts(baselineSurfaceText,
+                                                                  migratedSurfaceText,
+                                                                  baselineSurfaceCid,
+                                                                  migratedSurfaceCid,
+                                                                  exportSurfaceCompatible)
+    if IsErr(surfaceRes):
+        return Err[bool](Error(surfaceRes))
+    var baselineReceiptCid = layout.fixedBytes32Zero()
+    var migratedReceiptCid = layout.fixedBytes32Zero()
+    var targetTriple = ""
+    var compileReceiptEquivalent = 0
+    let receiptRes = ceq.v3CompilerEquivalenceReceiptCompareTexts(baselineReceiptText,
+                                                                  migratedReceiptText,
+                                                                  baselineReceiptCid,
+                                                                  migratedReceiptCid,
+                                                                  targetTriple,
+                                                                  compileReceiptEquivalent)
+    if IsErr(receiptRes):
+        return Err[bool](Error(receiptRes))
+    return ceq.v3CompilerEquivalenceProofMake(plan.systemLinkPlan.packageId,
+                                              plan.localUniverse.worldHead.channel,
+                                              baselineGraphCid,
+                                              migratedGraphCid,
+                                              baselineSurfaceCid,
+                                              migratedSurfaceCid,
+                                              baselineReceiptCid,
+                                              migratedReceiptCid,
+                                              targetTriple,
+                                              graphEquivalent,
+                                              exportSurfaceCompatible,
+                                              compileReceiptEquivalent,
+                                              out)
+
+fn v3CompilerProofModeFromArgs(args: str[],
+                               required: bool,
+                               outMode: var str): Result[bool] =
+    let equivalenceInputsRes = v3CompilerEquivalenceInputsReady(args, false)
+    if IsErr(equivalenceInputsRes):
+        return Err[bool](Error(equivalenceInputsRes))
+    let equivalenceEnabled = Value(equivalenceInputsRes)
+    let migrationEnabled = len(creq.v3CompilerLegacyInPathFromArgs(args)) > 0
+    if equivalenceEnabled && migrationEnabled:
+        return Err[bool]("v3 compiler proof: choose either --legacy-in or --baseline-csg/--baseline-surface/--baseline-receipt")
+    if required && !equivalenceEnabled && !migrationEnabled:
+        return Err[bool]("v3 compiler proof: stable requires --legacy-in or --baseline-csg/--baseline-surface/--baseline-receipt")
+    outMode = ""
+    if migrationEnabled:
+        outMode = "migration"
+    elif equivalenceEnabled:
+        outMode = "equivalence"
+    return Ok[bool](migrationEnabled || equivalenceEnabled)
+
+fn v3CompilerLegacyArtifactsWrite(rootDir: str,
+                                  prefix: str,
+                                  migration: ccsg.V3CompilerLegacyMigration,
+                                  receipt: ccsg.V3CompileReceipt): bool =
+    if len(prefix) <= 0:
+        return true
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".migration.txt", ccsg.v3CompilerLegacyMigrationReport(migration) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".migration.csg.txt", ccsg.v3CompilerCsgReport(migration.compilerCsg) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".migration.surface.txt", ccsg.v3CompilerExportSurfaceReport(migration.exportSurface) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".migration.receipt.txt", ccsg.v3CompileReceiptReport(receipt) + "\n"):
+        return false
+    return true
+
+fn v3CompilerPublishSummary(prefix: str,
+                            channel: str,
+                            plan: sexec.V3SystemLinkExecPlan,
+                            proofMode: str,
+                            equivalenceChecked: bool,
+                            decision: ceq.V3CompilerPublishDecision): str =
+    var checked = "0"
+    var passed = intToStr(decision.equivalencePassed)
+    if equivalenceChecked:
+        checked = "1"
+    var out = ""
+    out = out + "bundle_prefix=" + prefix + "\n"
+    out = out + "channel=" + channel + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "csg_root_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
+    out = out + "surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    out = out + "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    out = out + "proof_mode=" + (len(proofMode) > 0 ? proofMode : "-") + "\n"
+    out = out + "equivalence_checked=" + checked + "\n"
+    out = out + "equivalence_passed=" + passed + "\n"
+    out = out + "publish_allowed=" + intToStr(decision.publishAllowed) + "\n"
+    out = out + "proof_cid=" + layout.fixedBytes32Hex(decision.proofCid)
+    return out
+
+fn v3CompilerEmitCsg(rootDir: str,
+                     args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
+        v3CompilerPrintErr(err)
+        return 2
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId,
+                                                                linkPlan.sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    if IsErr(csgRes):
+        v3CompilerPrintErr(Error(csgRes))
+        return 2
+    let report = ccsg.v3CompilerCsgReport(Value(csgRes))
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerMigrateCsg(rootDir: str,
+                        args: str[]): int32 =
+    let packageRoot = v3CompilerPackageRootFromArgs(rootDir, args)
+    let legacySourcePath = creq.v3CompilerLegacyInPathFromArgs(args)
+    if len(legacySourcePath) <= 0:
+        v3CompilerPrintErr("v3 compiler migration: missing --legacy-in")
+        return 2
+    let currentSourcePath = creq.v3CompilerReadFlagOrDefault(args, "--in", "")
+    var entryModulePath = ""
+    if len(currentSourcePath) > 0:
+        entryModulePath = parser.v3ParserSourcePathToModulePath(rootDir,
+                                                                packageRoot,
+                                                                v3path.v3PathAbsolute(rootDir, currentSourcePath))
+    var migration: ccsg.V3CompilerLegacyMigration
+    let migrationRes = v3CompilerLegacyMigrationBuild(rootDir,
+                                                      packageRoot,
+                                                      legacySourcePath,
+                                                      parser.v3ParserPackageId(packageRoot),
+                                                      entryModulePath,
+                                                      migration)
+    if IsErr(migrationRes):
+        v3CompilerPrintErr(Error(migrationRes))
+        return 2
+    let prefix = creq.v3CompilerReadFlagOrDefault(args, "--out", "")
+    let receipt = ccsg.v3CompileReceiptMake(layout.fixedBytes32Zero(),
+                                            migration.compilerCsg.graphCid,
+                                            migration.compilerCsg.canonicalGraphCid,
+                                            contracts.v3BootstrapDefaultTarget(),
+                                            ccsg.v3CompileOutputDigest(prefix,
+                                                                      contracts.v3BootstrapDefaultTarget(),
+                                                                      ["runtime/compiler_runtime_v3", "runtime/core_runtime_v3", "runtime/program_support_v3"],
+                                                                      migration.compilerCsg.graphCid),
+                                            ccsg.v3CompileOutputDigest(prefix,
+                                                                      contracts.v3BootstrapDefaultTarget(),
+                                                                      ["runtime/compiler_runtime_v3", "runtime/core_runtime_v3", "runtime/program_support_v3"],
+                                                                      migration.compilerCsg.canonicalGraphCid),
+                                            "legacy_migration",
+                                            ["runtime/compiler_runtime_v3", "runtime/core_runtime_v3", "runtime/program_support_v3"])
+    if !v3CompilerLegacyArtifactsWrite(rootDir, prefix, migration, receipt):
+        v3CompilerPrintErr("v3 compiler migration: failed to write migration artifacts: " + prefix)
+        return 2
+    let report = ccsg.v3CompilerLegacyMigrationReport(migration)
+    let reportPath = creq.v3CompilerReadFlagOrDefault(args, "--report-out", "")
+    if !v3CompilerWriteOptionalReport(rootDir, reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerVerifyWorld(rootDir: str,
+                         args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlan(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let report = sexec.v3SystemLinkExecPlanReport(Value(planRes))
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerWorldSyncWriteBundle(rootDir: str,
+                                  prefix: str,
+                                  plan: sexec.V3SystemLinkExecPlan): bool =
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".world.txt", cworld.v3CompilerWorldHeadReport(plan.localUniverse.worldHead) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".compiler.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.compilerSnapshot) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".std.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.stdSnapshot) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".runtime.snapshot.txt", cworld.v3CompilerPackageSnapshotReport(plan.localUniverse.runtimeSnapshot) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".csg.txt", ccsg.v3CompilerCsgReport(plan.compilerCsg) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".surface.txt", ccsg.v3CompilerExportSurfaceReport(plan.exportSurface) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".receipt.txt", ccsg.v3CompileReceiptReport(plan.compileReceipt) + "\n"):
+        return false
+    if !v3path.v3WriteTextFile(rootDir, prefix + ".lock.toml", cworld.v3CompilerLockText(plan.localUniverse)):
+        return false
+    return true
+
+fn v3CompilerWorldSync(rootDir: str,
+                       args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlan(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
+        return 2
+    var report = ""
+    report = report + "bundle_prefix=" + req.outputPath + "\n"
+    report = report + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    report = report + "csg_root_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
+    report = report + "surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    report = report + "receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid)
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerProveEquivalence(rootDir: str,
+                              args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let proofInputsRes = v3CompilerEquivalenceInputsReady(args, true)
+    if IsErr(proofInputsRes):
+        v3CompilerPrintErr(Error(proofInputsRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalence(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    var proof: ceq.V3CompilerEquivalenceProof
+    let proofRes = v3CompilerEquivalenceProofFromArgs(rootDir, args, Value(planRes), proof)
+    if IsErr(proofRes):
+        v3CompilerPrintErr(Error(proofRes))
+        return 2
+    let report = ceq.v3CompilerEquivalenceProofReport(proof)
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerProveMigration(rootDir: str,
+                            args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgsForCommand(rootDir, args, false)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let legacySourcePath = creq.v3CompilerLegacyInPathFromArgs(args)
+    if len(legacySourcePath) <= 0:
+        v3CompilerPrintErr("v3 compiler migration: missing --legacy-in")
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalence(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    var migration: ccsg.V3CompilerLegacyMigration
+    var proof: ceq.V3CompilerEquivalenceProof
+    let proofRes = v3CompilerMigrationProofFromArgs(rootDir, args, req, plan, migration, proof)
+    if IsErr(proofRes):
+        v3CompilerPrintErr(Error(proofRes))
+        return 2
+    let migrationReceipt = v3CompilerMigrationReceipt(plan, migration)
+    let prefix = creq.v3CompilerReadFlagOrDefault(args, "--out", "")
+    if !v3CompilerLegacyArtifactsWrite(rootDir, prefix, migration, migrationReceipt):
+        v3CompilerPrintErr("v3 compiler migration: failed to write migration artifacts: " + prefix)
+        return 2
+    let proofReport = ceq.v3CompilerEquivalenceProofReport(proof)
+    if len(prefix) > 0:
+        if !v3path.v3WriteTextFile(rootDir, prefix + ".proof.txt", proofReport + "\n"):
+            v3CompilerPrintErr("v3 compiler: failed to write proof: " + prefix + ".proof.txt")
+            return 2
+    let report = ccsg.v3CompilerLegacyMigrationReport(migration) + "\n" + proofReport
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(report)
+    return 0
+
+fn v3CompilerPublishWorld(rootDir: str,
+                          args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalence(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    let channel = plan.localUniverse.worldHead.channel
+    var proofMode = ""
+    let proofModeRes = v3CompilerProofModeFromArgs(args, channel == "stable", proofMode)
+    if IsErr(proofModeRes):
+        v3CompilerPrintErr(Error(proofModeRes))
+        return 2
+    let proofEnabled = Value(proofModeRes)
+    var equivalenceChecked = false
+    var proof: ceq.V3CompilerEquivalenceProof
+    var proofReport = ""
+    var migrationReport = ""
+    var migrationReceipt: ccsg.V3CompileReceipt
+    if proofEnabled:
+        if proofMode == "migration":
+            var migration: ccsg.V3CompilerLegacyMigration
+            let proofRes = v3CompilerMigrationProofFromArgs(rootDir, args, req, plan, migration, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+            migrationReceipt = v3CompilerMigrationReceipt(plan, migration)
+            migrationReport = ccsg.v3CompilerLegacyMigrationReport(migration)
+            if !v3CompilerLegacyArtifactsWrite(rootDir, req.outputPath, migration, migrationReceipt):
+                v3CompilerPrintErr("v3 compiler migration: failed to write migration artifacts: " + req.outputPath)
+                return 2
+        else:
+            let proofRes = v3CompilerEquivalenceProofFromArgs(rootDir, args, plan, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+        proofReport = ceq.v3CompilerEquivalenceProofReport(proof)
+        equivalenceChecked = true
+    else:
+        proof.proofCid = layout.fixedBytes32Zero()
+    var decision: ceq.V3CompilerPublishDecision
+    let decisionRes = ceq.v3CompilerPublishDecisionMake(channel,
+                                                        plan.localUniverse.worldHead.headCid,
+                                                        equivalenceChecked,
+                                                        proof,
+                                                        decision)
+    if IsErr(decisionRes):
+        v3CompilerPrintErr(Error(decisionRes))
+        return 2
+    let decisionReport = ceq.v3CompilerPublishDecisionReport(decision)
+    if decision.publishAllowed == 0:
+        if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, decisionReport):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
+        v3CompilerPrintErr("v3 compiler: publish blocked by canonical equivalence gate")
+        v3CompilerPrintErr(decisionReport)
+        if equivalenceChecked:
+            if len(migrationReport) > 0:
+                v3CompilerPrintErr(migrationReport)
+            v3CompilerPrintErr(proofReport)
+        return 2
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
+        return 2
+    if equivalenceChecked:
+        if !v3path.v3WriteTextFile(rootDir, req.outputPath + ".proof.txt", proofReport + "\n"):
+            v3CompilerPrintErr("v3 compiler: failed to write proof: " + req.outputPath + ".proof.txt")
+            return 2
+    if !v3path.v3WriteTextFile(rootDir, req.outputPath + ".publish.txt", decisionReport + "\n"):
+        v3CompilerPrintErr("v3 compiler: failed to write publish gate report: " + req.outputPath + ".publish.txt")
+        return 2
+    let summary = v3CompilerPublishSummary(req.outputPath,
+                                           channel,
+                                           plan,
+                                           proofMode,
+                                           equivalenceChecked,
+                                           decision)
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(summary)
+    return 0
+
+fn v3CompilerFreshNodeSelfhost(rootDir: str,
+                               args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlanForEquivalence(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    let channel = plan.localUniverse.worldHead.channel
+    var proofMode = ""
+    let proofModeRes = v3CompilerProofModeFromArgs(args, channel == "stable", proofMode)
+    if IsErr(proofModeRes):
+        v3CompilerPrintErr(Error(proofModeRes))
+        return 2
+    let proofEnabled = Value(proofModeRes)
+    var equivalenceChecked = false
+    var proof: ceq.V3CompilerEquivalenceProof
+    var proofReport = ""
+    var migrationReport = ""
+    var migrationReceipt: ccsg.V3CompileReceipt
+    if proofEnabled:
+        if proofMode == "migration":
+            var migration: ccsg.V3CompilerLegacyMigration
+            let proofRes = v3CompilerMigrationProofFromArgs(rootDir, args, req, plan, migration, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+            migrationReceipt = v3CompilerMigrationReceipt(plan, migration)
+            migrationReport = ccsg.v3CompilerLegacyMigrationReport(migration)
+            if !v3CompilerLegacyArtifactsWrite(rootDir, req.outputPath, migration, migrationReceipt):
+                v3CompilerPrintErr("v3 compiler migration: failed to write migration artifacts: " + req.outputPath)
+                return 2
+        else:
+            let proofRes = v3CompilerEquivalenceProofFromArgs(rootDir, args, plan, proof)
+            if IsErr(proofRes):
+                v3CompilerPrintErr(Error(proofRes))
+                return 2
+        proofReport = ceq.v3CompilerEquivalenceProofReport(proof)
+        equivalenceChecked = true
+    else:
+        proof.proofCid = layout.fixedBytes32Zero()
+    var decision: ceq.V3CompilerPublishDecision
+    let decisionRes = ceq.v3CompilerPublishDecisionMake(channel,
+                                                        plan.localUniverse.worldHead.headCid,
+                                                        equivalenceChecked,
+                                                        proof,
+                                                        decision)
+    if IsErr(decisionRes):
+        v3CompilerPrintErr(Error(decisionRes))
+        return 2
+    let decisionReport = ceq.v3CompilerPublishDecisionReport(decision)
+    if decision.publishAllowed == 0:
+        if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, decisionReport):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
+        v3CompilerPrintErr("v3 compiler: publish blocked by canonical equivalence gate")
+        v3CompilerPrintErr(decisionReport)
+        if equivalenceChecked:
+            if len(migrationReport) > 0:
+                v3CompilerPrintErr(migrationReport)
+            v3CompilerPrintErr(proofReport)
+        return 2
+    if !v3CompilerWorldSyncWriteBundle(rootDir, req.outputPath, plan):
+        v3CompilerPrintErr("v3 compiler: failed to materialize world bundle: " + req.outputPath)
+        return 2
+    if equivalenceChecked:
+        if !v3path.v3WriteTextFile(rootDir, req.outputPath + ".proof.txt", proofReport + "\n"):
+            v3CompilerPrintErr("v3 compiler: failed to write proof: " + req.outputPath + ".proof.txt")
+            return 2
+    if !v3path.v3WriteTextFile(rootDir, req.outputPath + ".publish.txt", decisionReport + "\n"):
+        v3CompilerPrintErr("v3 compiler: failed to write publish gate report: " + req.outputPath + ".publish.txt")
+        return 2
+    let freshRes = cwlp.v3CompilerWorldFreshNodeSelfhostReport(rootDir,
+                                                               req,
+                                                               channel,
+                                                               plan.localUniverse,
+                                                               plan.compilerCsg,
+                                                               plan.exportSurface,
+                                                               plan.compileReceipt)
+    if IsErr(freshRes):
+        v3CompilerPrintErr(Error(freshRes))
+        return 2
+    let freshReport = Value(freshRes)
+    if !v3path.v3WriteTextFile(rootDir, req.outputPath + ".fresh.txt", freshReport + "\n"):
+        v3CompilerPrintErr("v3 compiler: failed to write fresh-node report: " + req.outputPath + ".fresh.txt")
+        return 2
+    let summary = v3CompilerPublishSummary(req.outputPath,
+                                           channel,
+                                           plan,
+                                           proofMode,
+                                           equivalenceChecked,
+                                           decision) + "\n" + freshReport
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    v3CompilerPrintLine(summary)
+    return 0
+
+fn v3CompilerSelfhostBuild(rootDir: str,
+                           args: str[]): int32 =
+    let reqRes = creq.v3CompilerRequestFromArgs(rootDir, args)
+    if IsErr(reqRes):
+        v3CompilerPrintErr(Error(reqRes))
+        return 2
+    let req = Value(reqRes)
+    let planRes = v3CompilerBuildSystemPlan(rootDir, req, args)
+    if IsErr(planRes):
+        v3CompilerPrintErr(Error(planRes))
+        return 2
+    let plan = Value(planRes)
+    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+        return 2
+    if sexec.v3SystemLinkExecPlanReady(plan):
+        v3CompilerPrintErr("v3 compiler: selfhost native link not implemented")
+    elif plan.primaryObjectPlan.missingReasons.len > 0:
+        v3CompilerPrintErr("v3 compiler: selfhost primary object machine code not emitted")
+    else:
+        v3CompilerPrintErr("v3 compiler: selfhost build blocked")
+    v3CompilerPrintErr(report)
+    return 2
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
     let rootDir = v3CompilerRoot()
-    if cmdline.paramCount() <= 0:
+    let count: int32 = cmdline.paramCount()
+    if count <= 0:
         v3CompilerUsage(rootDir)
         return 0
     let cmd = cmdline.paramStr(1)
+    let args = v3CompilerCollectArgsFrom(2, count)
     if cmd == "--help" || cmd == "-h" || cmd == "help":
         v3CompilerUsage(rootDir)
         return 0
@@ -52,27 +779,44 @@ fn main(): int32 =
     if cmd == "print-build-plan":
         v3CompilerPrintBuildPlan(rootDir)
         return 0
+    if cmd == "emit-csg":
+        return v3CompilerEmitCsg(rootDir, args)
+    if cmd == "migrate-csg":
+        return v3CompilerMigrateCsg(rootDir, args)
+    if cmd == "verify-world":
+        return v3CompilerVerifyWorld(rootDir, args)
+    if cmd == "world-sync":
+        return v3CompilerWorldSync(rootDir, args)
+    if cmd == "prove-equivalence":
+        return v3CompilerProveEquivalence(rootDir, args)
+    if cmd == "prove-migration":
+        return v3CompilerProveMigration(rootDir, args)
+    if cmd == "publish-world":
+        return v3CompilerPublishWorld(rootDir, args)
+    if cmd == "fresh-node-selfhost":
+        return v3CompilerFreshNodeSelfhost(rootDir, args)
+    if cmd == "selfhost-build":
+        return v3CompilerSelfhostBuild(rootDir, args)
     if cmd == "system-link-exec":
-        let reqRes: Result[creq.V3CompilerRequest] = creq.v3CompilerRequestFromCmdline(rootDir)
+        let reqRes: Result[creq.V3CompilerRequest] = creq.v3CompilerRequestFromArgs(rootDir, args)
         if IsErr(reqRes):
             v3CompilerPrintErr(Error(reqRes))
             return 2
         let req = Value(reqRes)
-        let planRes: Result[sexec.V3SystemLinkExecPlan] = sexec.v3BuildSystemLinkExecPlan(rootDir, req)
+        let planRes: Result[sexec.V3SystemLinkExecPlan] = v3CompilerBuildSystemPlan(rootDir, req, args)
         if IsErr(planRes):
             v3CompilerPrintErr(Error(planRes))
             return 2
         let plan = Value(planRes)
         let report = sexec.v3SystemLinkExecPlanReport(plan)
-        if len(req.reportPath) > 0:
-            if !v3path.v3WriteTextFile(req.rootDir, req.reportPath, report + "\n"):
-                v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
-                return 2
+        if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
+            v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
+            return 2
         if sexec.v3SystemLinkExecPlanReady(plan):
             v3CompilerPrintErr("v3 compiler: final native link not implemented")
         elif plan.primaryObjectPlan.missingReasons.len > 0:
             v3CompilerPrintErr("v3 compiler: primary object machine code not emitted")
-        else
+        else:
             v3CompilerPrintErr("v3 compiler: ordinary pipeline blocked")
         v3CompilerPrintErr(report)
         return 2

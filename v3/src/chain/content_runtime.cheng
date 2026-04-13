@@ -132,11 +132,14 @@ fn v3ContentRuntimePreviewCachePos(runtime: V3ContentRuntime,
 fn v3ContentRuntimeStorePreviewPayload(runtime: var V3ContentRuntime,
                                        previewCid: layout.FixedBytes32,
                                        payload: Bytes): Result[bool] =
-    let stubRes = content.v3ContentStubDecode(payload)
-    if IsErr(stubRes):
-        return Err[bool](Error(stubRes))
-    let stub = Value(stubRes)
-    if !layout.fixedBytes32Equal(stub.blobSummaryCid, previewCid):
+    let manifestOk = content.v3ContentManifestValidatePayload(payload, previewCid)
+    if IsErr(manifestOk):
+        return Err[bool](Error(manifestOk))
+    var manifest = content.v3ContentManifestZero()
+    let manifestRes = content.v3ContentManifestDecodeFill(manifest, payload)
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    if !layout.fixedBytes32Equal(manifest.previewCid, previewCid):
         return Err[bool]("v3 content runtime: preview cid mismatch")
     let pos = v3ContentRuntimePreviewCachePos(runtime, previewCid)
     var entry = v3ContentPreviewCacheEntryZero()
@@ -150,13 +153,13 @@ fn v3ContentRuntimeStorePreviewPayload(runtime: var V3ContentRuntime,
     return Ok[bool](true)
 
 fn v3ContentRuntimeStorePreview(runtime: var V3ContentRuntime,
-                                stub: content.V3ContentStub): Result[bool] =
-    let stubOk = content.v3ContentStubValidate(stub)
-    if IsErr(stubOk):
-        return Err[bool](Error(stubOk))
+                                manifest: content.V3ContentManifest): Result[bool] =
+    let manifestOk = content.v3ContentManifestValidate(manifest)
+    if IsErr(manifestOk):
+        return Err[bool](Error(manifestOk))
     return v3ContentRuntimeStorePreviewPayload(runtime,
-                                               stub.blobSummaryCid,
-                                               content.v3ContentStubEncode(stub))
+                                               manifest.previewCid,
+                                               content.v3ContentManifestEncode(manifest))
 
 fn v3ContentRuntimeCachedPreviewPayload(runtime: V3ContentRuntime,
                                         previewCid: layout.FixedBytes32,
@@ -322,36 +325,57 @@ fn v3ContentRuntimeServeFetchPayload(runtime: var V3ContentRuntime,
     let response = Value(responseRes)
     return Ok[Bytes](fetch.v3ContentFetchResponseEncode(response))
 
-fn v3ContentRuntimeBuildPullTargets(manifest: swarm.V3ErasureShardManifest,
-                                    plan: swarm.V3ErasureRecoveryPlan): Result[V3ContentPullTarget[]] =
-    if !layout.fixedBytes32Equal(manifest.manifestCid, plan.manifestCid):
+fn v3ContentRuntimeBuildPullTargets(manifestCid: layout.FixedBytes32,
+                                    manifestShardIndices: int32[],
+                                    manifestShardPayloadCids: layout.FixedBytes32[],
+                                    planManifestCid: layout.FixedBytes32,
+                                    requestCount: int32,
+                                    requestPeerIds: layout.FixedBytes32[],
+                                    requestShardIndices: int32[],
+                                    requestShardCids: layout.FixedBytes32[]): Result[V3ContentPullTarget[]] =
+    if !layout.fixedBytes32Equal(manifestCid, planManifestCid):
         return Err[V3ContentPullTarget[]]("v3 content runtime: recovery plan manifest mismatch")
-    if plan.requestCount != plan.requestPeerIds.len:
+    if requestCount != requestPeerIds.len:
         return Err[V3ContentPullTarget[]]("v3 content runtime: recovery plan peer count mismatch")
-    if plan.requestCount != plan.requestShardIndices.len:
+    if requestCount != requestShardIndices.len:
         return Err[V3ContentPullTarget[]]("v3 content runtime: recovery plan shard count mismatch")
-    if plan.requestCount != plan.requestShardCids.len:
+    if requestCount != requestShardCids.len:
         return Err[V3ContentPullTarget[]]("v3 content runtime: recovery plan shard cid count mismatch")
     var out: V3ContentPullTarget[]
     out = []
-    for i in 0..<plan.requestShardIndices.len:
+    for i in 0..<requestShardIndices.len:
         var request = swarm.v3ErasureShardPullRequestZero()
-        let requestFillRes = swarm.v3ErasureShardPullRequestFill(request,
-                                                                 manifest,
-                                                                 plan.requestShardIndices[i])
+        let requestFillRes = swarm.v3ErasureShardPullRequestFillFromFields(request,
+                                                                           manifestCid,
+                                                                           manifestShardIndices,
+                                                                           manifestShardPayloadCids,
+                                                                           requestShardIndices[i])
         if IsErr(requestFillRes):
             return Err[V3ContentPullTarget[]](Error(requestFillRes))
-        if !layout.fixedBytes32Equal(request.shardCid, plan.requestShardCids[i]):
+        if !layout.fixedBytes32Equal(request.shardCid, requestShardCids[i]):
             return Err[V3ContentPullTarget[]]("v3 content runtime: recovery plan shard cid mismatch")
         var target = v3ContentPullTargetZero()
-        target.peerId = plan.requestPeerIds[i]
+        target.peerId = requestPeerIds[i]
         target.request = request
         add(out, target)
     return Ok[V3ContentPullTarget[]](out)
 
-fn v3ContentRuntimeBuildPullRequests(manifest: swarm.V3ErasureShardManifest,
-                                     plan: swarm.V3ErasureRecoveryPlan): Result[swarm.V3ErasureShardPullRequest[]] =
-    let targetsRes = v3ContentRuntimeBuildPullTargets(manifest, plan)
+fn v3ContentRuntimeBuildPullRequests(manifestCid: layout.FixedBytes32,
+                                     manifestShardIndices: int32[],
+                                     manifestShardPayloadCids: layout.FixedBytes32[],
+                                     planManifestCid: layout.FixedBytes32,
+                                     requestCount: int32,
+                                     requestPeerIds: layout.FixedBytes32[],
+                                     requestShardIndices: int32[],
+                                     requestShardCids: layout.FixedBytes32[]): Result[swarm.V3ErasureShardPullRequest[]] =
+    let targetsRes = v3ContentRuntimeBuildPullTargets(manifestCid,
+                                                      manifestShardIndices,
+                                                      manifestShardPayloadCids,
+                                                      planManifestCid,
+                                                      requestCount,
+                                                      requestPeerIds,
+                                                      requestShardIndices,
+                                                      requestShardCids)
     if IsErr(targetsRes):
         return Err[swarm.V3ErasureShardPullRequest[]](Error(targetsRes))
     var out: swarm.V3ErasureShardPullRequest[]

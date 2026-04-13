@@ -10,8 +10,6 @@ client_src="$root/v3/src/tests/chain_node_process_client_smoke.cheng"
 out_dir="$root/artifacts/v3_chain_node_process/$label"
 server_bin="$out_dir/chain_node_process_server"
 client_bin="$out_dir/chain_node_process_client"
-server_compile_log="$out_dir/chain_node_process_server.compile.log"
-client_compile_log="$out_dir/chain_node_process_client.compile.log"
 
 mkdir -p "$out_dir"
 cd "$root"
@@ -30,27 +28,21 @@ if [ ! -f "$server_src" ] || [ ! -f "$client_src" ]; then
   exit 1
 fi
 
-if ! DIAG_CONTEXT=1 "$compiler" system-link-exec \
-  --root "$root/v3" \
-  --in "$server_src" \
-  --emit exe \
-  --target arm64-apple-darwin \
-  --out "$server_bin" >"$server_compile_log" 2>&1; then
-  echo "v3 chain_node process smoke: server compile failed label=$label" >&2
-  tail -n 80 "$server_compile_log" >&2 || true
-  exit 1
-fi
+zsh "$root/v3/tooling/run_v3_compile_exe.sh" \
+  "v3 chain_node process smoke" \
+  "$label server" \
+  "$compiler" \
+  "$root/v3" \
+  "$server_src" \
+  "$server_bin"
 
-if ! DIAG_CONTEXT=1 "$compiler" system-link-exec \
-  --root "$root/v3" \
-  --in "$client_src" \
-  --emit exe \
-  --target arm64-apple-darwin \
-  --out "$client_bin" >"$client_compile_log" 2>&1; then
-  echo "v3 chain_node process smoke: client compile failed label=$label" >&2
-  tail -n 80 "$client_compile_log" >&2 || true
-  exit 1
-fi
+zsh "$root/v3/tooling/run_v3_compile_exe.sh" \
+  "v3 chain_node process smoke" \
+  "$label client" \
+  "$compiler" \
+  "$root/v3" \
+  "$client_src" \
+  "$client_bin"
 
 tmpdir="$(mktemp -d "$out_dir/tmp.XXXXXX")"
 server_pid=""

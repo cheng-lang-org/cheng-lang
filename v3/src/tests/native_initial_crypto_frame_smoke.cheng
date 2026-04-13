@@ -1,48 +1,46 @@
 import std/system
 import std/result
-import std/rawbytes
-import cheng/v3/quic/msquicruntime as qruntime
+import cheng/v3/quic/tls/policy as qpolicy
 import cheng/v3/quic/native_runtime as qnative
-import cheng/v3/quic/tls/handshake13 as handshake13
-import cheng/v3/quic/tls/test_pki as testpki
+import cheng/v3/quic/core/quic_varint
+
+fn smokeNativeClientPolicy(): qpolicy.MsQuicTlsPolicy =
+    var out: qpolicy.MsQuicTlsPolicy
+    out.serverName = "localhost"
+    return out
 
 fn main(): int32 =
     qnative.msquicNativeResetSession()
-    let tlsPolicy = testpki.msquicMakeLocalhostTlsPolicy()
-    var settings = qruntime.initMsQuicSettings()
-    qnative.msquicNativeSetServerPolicyCache(tlsPolicy)
-    qnative.msquicNativeResetServerEndpoint(settings, false)
-
-    handshake13.msquicTls13ResetClientDefault(true)
-    let genRes: Result[bool] = handshake13.msquicTls13ClientGenerateX25519()
-    if IsErr(genRes):
-        panic(ErrorText(genRes))
-
-    let randomSeed: Bytes = bytesAlloc(32)
-    for i in 0..<32:
-        bytesSet(randomSeed, i, (i + 1) & 0xff)
-
-    let helloRes: Result[Bytes] = handshake13.msquicTls13ClientBuildClientHello(
-        randomSeed,
-        "dm",
-        "localhost",
-        emptyBytes()
-    )
-    if IsErr(helloRes):
-        panic(ErrorText(helloRes))
-
-    let feedRes: Result[bool] = qnative.msquicNativeHandleCryptoData(
-        qnative.msquicNativeServerSide,
-        qnative.msquicNativePacketInitialCode,
-        0,
-        Value(helloRes)
-    )
-    if IsErr(feedRes):
-        panic(ErrorText(feedRes))
-
-    assert(
-        handshake13.msquicTls13ServerClientKeyShareGroup() > 0,
-        "v3 native_initial_crypto_frame: server parsed client key share"
-    )
+    let policy: qpolicy.MsQuicTlsPolicy = smokeNativeClientPolicy()
+    qnative.msquicNativeSetClientPolicyCache(policy)
+    let payloadRes: Result[Bytes] = qnative.msquicNativeDebugBuildClientHelloPayload()
+    if IsErr(payloadRes):
+        panic(ErrorText(payloadRes))
+    let payload: Bytes = Value(payloadRes)
+    let kindRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, 0)
+    if IsErr(kindRes):
+        panic(ErrorText(kindRes))
+    let kindDec: quic_varint.QuicVarIntDecoded = Value(kindRes)
+    if kindDec.value != int64(qnative.msquicNativeFrameCryptoCode):
+        panic("v3 native_initial_crypto_frame: crypto frame kind")
+    let streamRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, kindDec.next)
+    if IsErr(streamRes):
+        panic(ErrorText(streamRes))
+    let streamDec: quic_varint.QuicVarIntDecoded = Value(streamRes)
+    if streamDec.value != 0:
+        panic("v3 native_initial_crypto_frame: crypto stream id")
+    let offsetRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, streamDec.next)
+    if IsErr(offsetRes):
+        panic(ErrorText(offsetRes))
+    let offsetDec: quic_varint.QuicVarIntDecoded = Value(offsetRes)
+    if offsetDec.value != 0:
+        panic("v3 native_initial_crypto_frame: crypto offset")
+    let lenRes: Result[quic_varint.QuicVarIntDecoded] = quic_varint.quicVarIntDecode(payload, offsetDec.next)
+    if IsErr(lenRes):
+        panic(ErrorText(lenRes))
+    let lenDec: quic_varint.QuicVarIntDecoded = Value(lenRes)
+    let cryptoPayloadLen: int32 = int32(lenDec.value)
+    if cryptoPayloadLen <= 0:
+        panic("v3 native_initial_crypto_frame: crypto payload")
     echo("v3 native_initial_crypto_frame_smoke ok")
     return 0

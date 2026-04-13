@@ -1,6 +1,10 @@
 import std/result
 import std/strings
+import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
 import cheng/v3/backend/primary_object_plan as pobj
@@ -8,12 +12,23 @@ import cheng/v3/backend/object_plan as objplan
 import cheng/v3/backend/native_link_plan as nplan
 import cheng/v3/runtime/core_runtime_v3 as corun
 import cheng/v3/runtime/compiler_runtime_v3 as comprun
-import cheng/v3/runtime/program_support_v3 as prosup
 
 type
     V3SystemLinkExecPlan =
         compilerEntrySource: str
+        sourceBundleCid: layout.FixedBytes32
         systemLinkPlan: slplan.V3SystemLinkPlanStub
+        compilerCsg: ccsg.V3CompilerCsg
+        exportSurface: ccsg.V3CsgExportSurface
+        localUniverse: cworld.V3CompilerLocalUniverse
+        compileReceipt: ccsg.V3CompileReceipt
+        worldHeadPinned: bool
+        lockCheckEnabled: bool
+        lockVerified: bool
+        baselineSurfaceChecked: bool
+        baselineSurfaceCompatible: bool
+        lockPath: str
+        baselineSurfacePath: str
         loweringPlan: lower.V3LoweringPlanStub
         primaryObjectPlan: pobj.V3PrimaryObjectPlan
         objectPlan: objplan.V3ObjectPlanStub
@@ -25,31 +40,73 @@ fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub)
     for i in 0..<linkPlan.providerModules.len:
         let modulePath = linkPlan.providerModules[i]
         if modulePath == "runtime/core_runtime_v3":
-            let contract = corun.v3CoreRuntimeContract(rootDir)
-            for j in 0..<contract.providerNativeSources.len:
-                add(out, contract.providerNativeSources[j])
+            add(out, corun.v3CoreRuntimePath(rootDir, "v3/runtime/native/v3_core_runtime_stub.c"))
         elif modulePath == "runtime/compiler_runtime_v3":
-            let track = linkPlan.moduleKind == slplan.v3SystemCompilerControlPlane ?
-                comprun.v3CompilerRuntimeTrackTooling :
-                comprun.v3CompilerRuntimeTrackProgram
-            let contract = comprun.v3CompilerRuntimeContract(rootDir, track)
-            for j in 0..<contract.providerNativeSources.len:
-                add(out, contract.providerNativeSources[j])
+            if linkPlan.moduleKind == slplan.v3SystemCompilerControlPlane:
+                add(out, comprun.v3CompilerRuntimeNativePath(rootDir, "v3/runtime/native/v3_tooling_argv_native.c"))
+            else:
+                add(out, comprun.v3CompilerRuntimeNativePath(rootDir, "v3/runtime/native/v3_program_argv_native.c"))
         elif modulePath == "runtime/program_support_v3":
-            let contract = prosup.v3ProgramSupportContract(rootDir)
-            for j in 0..<contract.providerNativeSources.len:
-                add(out, contract.providerNativeSources[j])
-        else
+            add(out, v3path.v3PathAbsolute(rootDir, "src/runtime/native/system_helpers.c"))
+        else:
             return Err[str[]]("v3 provider source: unsupported module " + modulePath)
     return Ok[str[]](out)
 
-fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[V3SystemLinkExecPlan] =
+fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
+                                                req: creq.V3CompilerRequest,
+                                                requestedWorldHead: str,
+                                                lockPath: str,
+                                                baselineSurfacePath: str,
+                                                channelRaw: str): Result[V3SystemLinkExecPlan] =
     var linkPlan: slplan.V3SystemLinkPlanStub
     var err = ""
     if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
         return Err[V3SystemLinkExecPlan](err)
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId,
+                                                                linkPlan.sourceClosurePaths)
+    let compilerCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    if IsErr(compilerCsgRes):
+        return Err[V3SystemLinkExecPlan](Error(compilerCsgRes))
+    let compilerCsg = Value(compilerCsgRes)
+    let exportSurface = ccsg.v3CompilerExportSurfaceFromCsg(compilerCsg)
+    let universeRes = cworld.v3CompilerLocalUniverseBuildForChannel(channelRaw,
+                                                                    sourceBundleCid,
+                                                                    compilerCsg.graphCid,
+                                                                    exportSurface.surfaceCid)
+    if IsErr(universeRes):
+        return Err[V3SystemLinkExecPlan](Error(universeRes))
+    let localUniverse = Value(universeRes)
+    let worldHeadPinned = len(requestedWorldHead) > 0
+    if worldHeadPinned:
+        let pinRes = cworld.v3CompilerWorldHeadMatchesHex(localUniverse.worldHead, requestedWorldHead)
+        if IsErr(pinRes):
+            return Err[V3SystemLinkExecPlan](Error(pinRes))
+    let lockCheckEnabled = len(lockPath) > 0
+    var lockVerified = false
+    if lockCheckEnabled:
+        let lockRes = cworld.v3CompilerLockSnapshotRead(rootDir, lockPath)
+        if IsErr(lockRes):
+            return Err[V3SystemLinkExecPlan](Error(lockRes))
+        let verifyLockRes = cworld.v3CompilerWorldVerifyLock(localUniverse, Value(lockRes))
+        if IsErr(verifyLockRes):
+            return Err[V3SystemLinkExecPlan](Error(verifyLockRes))
+        lockVerified = true
+    let baselineSurfaceChecked = len(baselineSurfacePath) > 0
+    var baselineSurfaceCompatible = false
+    if baselineSurfaceChecked:
+        let baselinePath = v3path.v3PathAbsolute(rootDir, baselineSurfacePath)
+        if !v3path.v3PathFileExists(baselinePath):
+            return Err[V3SystemLinkExecPlan]("v3 compiler world: missing baseline surface path: " + baselinePath)
+        let baselineText = v3path.v3ReadTextFile("", baselinePath)
+        var baselineSurface: ccsg.V3CsgExportSurface
+        let baselineRes = ccsg.v3CompilerExportSurfaceFromReportText(baselineText, baselineSurface)
+        if IsErr(baselineRes):
+            return Err[V3SystemLinkExecPlan](Error(baselineRes))
+        if !ccsg.v3CompilerExportSurfaceCompatible(baselineSurface, exportSurface):
+            return Err[V3SystemLinkExecPlan]("v3 compiler world: baseline export surface incompatible")
+        baselineSurfaceCompatible = true
     var loweringPlan: lower.V3LoweringPlanStub
-    if !lower.v3BuildLoweringPlanStub(linkPlan, loweringPlan, err):
+    if !lower.v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, compilerCsg, loweringPlan, err):
         return Err[V3SystemLinkExecPlan](err)
     let primaryRes = pobj.v3BuildPrimaryObjectPlan(linkPlan, loweringPlan)
     if IsErr(primaryRes):
@@ -73,15 +130,16 @@ fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[
     if len(primaryObjectPath) > 0:
         add(linkInputs, primaryObjectPath)
     for i in 0..<linkPlan.providerModules.len:
+        let providerModule = linkPlan.providerModules[i]
         var safe = ""
-        for j in 0..<len(linkPlan.providerModules[i]):
-            let ch = linkPlan.providerModules[i][j]
+        for j in 0..<len(providerModule):
+            let ch = providerModule[j]
             let digit = ch >= '0' && ch <= '9'
             let upper = ch >= 'A' && ch <= 'Z'
             let lower = ch >= 'a' && ch <= 'z'
             if digit || upper || lower:
-                safe = safe + strings.sliceBytes(linkPlan.providerModules[i], j, 1)
-            else
+                safe = safe + strings.sliceBytes(providerModule, j, 1)
+            else:
                 safe = safe + "_"
         let providerObjectPath = linkPlan.outputPath + ".provider." + safe + ".o"
         add(providerObjectPaths, providerObjectPath)
@@ -100,23 +158,22 @@ fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[
         add(objectMissing, "provider_object_paths_incomplete")
     if linkPlan.providerModules.len > 0 && providerSourcePaths.len != linkPlan.providerModules.len:
         add(objectMissing, "provider_source_paths_incomplete")
-    let objectPlan = objplan.V3ObjectPlanStub(
-        workspaceRoot: linkPlan.workspaceRoot,
-        packageRoot: linkPlan.packageRoot,
-        packageId: linkPlan.packageId,
-        entryPath: linkPlan.entryPath,
-        outputPath: linkPlan.outputPath,
-        targetTriple: linkPlan.targetTriple,
-        primaryObjectPath: primaryObjectPath,
-        providerModules: linkPlan.providerModules,
-        providerSourcePaths: providerSourcePaths,
-        providerObjectPaths: providerObjectPaths,
-        linkInputPaths: linkInputs,
-        loweredFunctionSymbols: loweringPlan.functionSymbolTexts,
-        entrySymbol: linkPlan.entrySymbol,
-        missingReasons: objectMissing,
-        pipelineStage: "lowering_plan_to_object_plan_stub"
-    )
+    var objectPlan: objplan.V3ObjectPlanStub
+    objectPlan.workspaceRoot = linkPlan.workspaceRoot
+    objectPlan.packageRoot = linkPlan.packageRoot
+    objectPlan.packageId = linkPlan.packageId
+    objectPlan.entryPath = linkPlan.entryPath
+    objectPlan.outputPath = linkPlan.outputPath
+    objectPlan.targetTriple = linkPlan.targetTriple
+    objectPlan.primaryObjectPath = primaryObjectPath
+    objectPlan.providerModules = linkPlan.providerModules
+    objectPlan.providerSourcePaths = providerSourcePaths
+    objectPlan.providerObjectPaths = providerObjectPaths
+    objectPlan.linkInputPaths = linkInputs
+    objectPlan.loweredFunctionSymbols = loweringPlan.functionSymbolTexts
+    objectPlan.entrySymbol = linkPlan.entrySymbol
+    objectPlan.missingReasons = objectMissing
+    objectPlan.pipelineStage = "lowering_plan_to_object_plan_stub"
     if linkPlan.missingReasons.len > 0:
         add(nativeMissing, "system_link_plan_not_ready_for_native_link")
     if objectPlan.missingReasons.len > 0:
@@ -127,27 +184,98 @@ fn v3BuildSystemLinkExecPlan(rootDir: str, req: creq.V3CompilerRequest): Result[
         add(nativeMissing, "native_link_output_missing")
     if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) <= 0:
         add(nativeMissing, "native_link_entry_symbol_missing")
-    let nativePlan = nplan.V3NativeLinkPlanStub(
-        targetTriple: linkPlan.targetTriple,
-        emitKind: linkPlan.emitKind,
-        outputPath: linkPlan.outputPath,
-        linkerProgram: "cc",
-        linkerFlavor: linkPlan.targetTriple == "arm64-apple-darwin" ? "ld64" : "system_linker",
-        outputKind: linkPlan.emitKind == creq.v3EmitExe ? nplan.v3NativeOutputExecutable : nplan.v3NativeOutputArtifact,
-        entrySymbol: linkPlan.entrySymbol,
-        primaryObjectPath: objectPlan.primaryObjectPath,
-        linkInputPaths: objectPlan.linkInputPaths,
-        missingReasons: nativeMissing,
-        pipelineStage: "object_plan_to_native_link_plan_stub"
-    )
-    return Ok[V3SystemLinkExecPlan](V3SystemLinkExecPlan(
-        compilerEntrySource: linkPlan.buildEntryPath,
-        systemLinkPlan: linkPlan,
-        loweringPlan: loweringPlan,
-        primaryObjectPlan: primaryPlan,
-        objectPlan: objectPlan,
-        nativeLinkPlan: nativePlan
-    ))
+    var linkerFlavor = "system_linker"
+    if linkPlan.targetTriple == "arm64-apple-darwin":
+        linkerFlavor = "ld64"
+    var outputKind = nplan.v3NativeOutputArtifact
+    if linkPlan.emitKind == creq.v3EmitExe:
+        outputKind = nplan.v3NativeOutputExecutable
+    var nativePlan: nplan.V3NativeLinkPlanStub
+    nativePlan.targetTriple = linkPlan.targetTriple
+    nativePlan.emitKind = linkPlan.emitKind
+    nativePlan.outputPath = linkPlan.outputPath
+    nativePlan.linkerProgram = "cc"
+    nativePlan.linkerFlavor = linkerFlavor
+    nativePlan.outputKind = outputKind
+    nativePlan.entrySymbol = linkPlan.entrySymbol
+    nativePlan.primaryObjectPath = objectPlan.primaryObjectPath
+    nativePlan.linkInputPaths = objectPlan.linkInputPaths
+    nativePlan.missingReasons = nativeMissing
+    nativePlan.pipelineStage = "object_plan_to_native_link_plan_stub"
+    let outputDigest = ccsg.v3CompileOutputDigest(linkPlan.outputPath,
+                                                  linkPlan.targetTriple,
+                                                  linkPlan.providerModules,
+                                                  compilerCsg.graphCid)
+    let canonicalOutputDigest = ccsg.v3CompileOutputDigest(linkPlan.outputPath,
+                                                           linkPlan.targetTriple,
+                                                           linkPlan.providerModules,
+                                                           compilerCsg.canonicalGraphCid)
+    let compileReceipt = ccsg.v3CompileReceiptMake(localUniverse.worldHead.headCid,
+                                                   compilerCsg.graphCid,
+                                                   compilerCsg.canonicalGraphCid,
+                                                   linkPlan.targetTriple,
+                                                   outputDigest,
+                                                   canonicalOutputDigest,
+                                                   "stage3_local",
+                                                   linkPlan.providerModules)
+    var execPlan: V3SystemLinkExecPlan
+    execPlan.compilerEntrySource = linkPlan.buildEntryPath
+    execPlan.sourceBundleCid = sourceBundleCid
+    execPlan.systemLinkPlan = linkPlan
+    execPlan.compilerCsg = compilerCsg
+    execPlan.exportSurface = exportSurface
+    execPlan.localUniverse = localUniverse
+    execPlan.compileReceipt = compileReceipt
+    execPlan.worldHeadPinned = worldHeadPinned
+    execPlan.lockCheckEnabled = lockCheckEnabled
+    execPlan.lockVerified = lockVerified
+    execPlan.baselineSurfaceChecked = baselineSurfaceChecked
+    execPlan.baselineSurfaceCompatible = baselineSurfaceCompatible
+    execPlan.lockPath = lockPath
+    execPlan.baselineSurfacePath = baselineSurfacePath
+    execPlan.loweringPlan = loweringPlan
+    execPlan.primaryObjectPlan = primaryPlan
+    execPlan.objectPlan = objectPlan
+    execPlan.nativeLinkPlan = nativePlan
+    return Ok[V3SystemLinkExecPlan](execPlan)
+
+fn v3BuildSystemLinkExecPlanWithWorld(rootDir: str,
+                                      req: creq.V3CompilerRequest,
+                                      requestedWorldHead: str,
+                                      lockPath: str,
+                                      baselineSurfacePath: str): Result[V3SystemLinkExecPlan] =
+    return v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
+                                                        req,
+                                                        requestedWorldHead,
+                                                        lockPath,
+                                                        baselineSurfacePath,
+                                                        cworld.v3CompilerWorldDefaultChannel())
+
+fn v3BuildSystemLinkExecPlan(rootDir: str,
+                             req: creq.V3CompilerRequest): Result[V3SystemLinkExecPlan] =
+    return v3BuildSystemLinkExecPlanWithWorld(rootDir,
+                                              req,
+                                              "",
+                                              "",
+                                              "")
+
+fn v3BuildSystemLinkExecReportWithWorld(rootDir: str,
+                                        req: creq.V3CompilerRequest,
+                                        requestedWorldHead: str,
+                                        lockPath: str,
+                                        baselineSurfacePath: str): Result[str] =
+    let planRes = v3BuildSystemLinkExecPlanWithWorld(rootDir,
+                                                     req,
+                                                     requestedWorldHead,
+                                                     lockPath,
+                                                     baselineSurfacePath)
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return Ok[str](v3SystemLinkExecPlanReport(Value(planRes)))
+
+fn v3BuildSystemLinkExecReport(rootDir: str,
+                               req: creq.V3CompilerRequest): Result[str] =
+    return v3BuildSystemLinkExecReportWithWorld(rootDir, req, "", "", "")
 
 fn v3SystemLinkExecPlanReady(plan: V3SystemLinkExecPlan): bool =
     return plan.systemLinkPlan.missingReasons.len <= 0 &&
@@ -157,27 +285,82 @@ fn v3SystemLinkExecPlanReady(plan: V3SystemLinkExecPlan): bool =
            plan.nativeLinkPlan.missingReasons.len <= 0
 
 fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
-    return (
-        "entry=" + plan.compilerEntrySource + "\n" +
-        slplan.v3SystemLinkPlanStubReport(plan.systemLinkPlan) + "\n" +
-        lower.v3LoweringPlanStubReport(plan.loweringPlan) + "\n" +
-        pobj.v3PrimaryObjectPlanReport(plan.primaryObjectPlan) + "\n" +
-        "primary_object_path=" + (len(plan.objectPlan.primaryObjectPath) > 0 ? plan.objectPlan.primaryObjectPath : "-") + "\n" +
-        "provider_object_count=" + intToStr(plan.objectPlan.providerObjectPaths.len) + "\n" +
-        "provider_source_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerSourcePaths) + "\n" +
-        "provider_object_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerObjectPaths) + "\n" +
-        "object_link_input_count=" + intToStr(plan.objectPlan.linkInputPaths.len) + "\n" +
-        "object_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.linkInputPaths) + "\n" +
-        "object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.missingReasons) + "\n" +
-        "object_pipeline_stage=" + plan.objectPlan.pipelineStage + "\n" +
-        "native_linker_program=" + plan.nativeLinkPlan.linkerProgram + "\n" +
-        "native_linker_flavor=" + plan.nativeLinkPlan.linkerFlavor + "\n" +
-        "native_output_kind=" + (plan.nativeLinkPlan.outputKind == nplan.v3NativeOutputExecutable ? "executable" : "artifact") + "\n" +
-        "native_primary_object=" + (len(plan.nativeLinkPlan.primaryObjectPath) > 0 ? plan.nativeLinkPlan.primaryObjectPath : "-") + "\n" +
-        "native_link_input_count=" + intToStr(plan.nativeLinkPlan.linkInputPaths.len) + "\n" +
-        "native_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.nativeLinkPlan.linkInputPaths) + "\n" +
-        "native_link_entry_symbol=" + (len(plan.nativeLinkPlan.entrySymbol) > 0 ? plan.nativeLinkPlan.entrySymbol : "-") + "\n" +
-        "native_link_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.nativeLinkPlan.missingReasons) + "\n" +
-        "native_link_pipeline_stage=" + plan.nativeLinkPlan.pipelineStage + "\n" +
-        "exec_pipeline_stage=primary_object_plan_to_native_link_plan"
-    )
+    var worldHeadPinned = "0"
+    var lockCheckEnabled = "0"
+    var lockVerified = "0"
+    var baselineSurfaceChecked = "0"
+    var baselineSurfaceCompatible = "0"
+    var lockPath = "-"
+    var baselineSurfacePath = "-"
+    var primaryObjectPath = "-"
+    var nativeOutputKind = "artifact"
+    var nativePrimaryObject = "-"
+    var nativeEntrySymbol = "-"
+    if plan.worldHeadPinned:
+        worldHeadPinned = "1"
+    if plan.lockCheckEnabled:
+        lockCheckEnabled = "1"
+    if plan.lockVerified:
+        lockVerified = "1"
+    if plan.baselineSurfaceChecked:
+        baselineSurfaceChecked = "1"
+    if plan.baselineSurfaceCompatible:
+        baselineSurfaceCompatible = "1"
+    if len(plan.lockPath) > 0:
+        lockPath = plan.lockPath
+    if len(plan.baselineSurfacePath) > 0:
+        baselineSurfacePath = plan.baselineSurfacePath
+    if len(plan.objectPlan.primaryObjectPath) > 0:
+        primaryObjectPath = plan.objectPlan.primaryObjectPath
+    if plan.nativeLinkPlan.outputKind == nplan.v3NativeOutputExecutable:
+        nativeOutputKind = "executable"
+    if len(plan.nativeLinkPlan.primaryObjectPath) > 0:
+        nativePrimaryObject = plan.nativeLinkPlan.primaryObjectPath
+    if len(plan.nativeLinkPlan.entrySymbol) > 0:
+        nativeEntrySymbol = plan.nativeLinkPlan.entrySymbol
+    var out = ""
+    out = out + "entry=" + plan.compilerEntrySource + "\n"
+    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(plan.sourceBundleCid) + "\n"
+    out = out + "canonical_compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.canonicalGraphCid) + "\n"
+    out = out + "compiler_csg_cid=" + layout.fixedBytes32Hex(plan.compilerCsg.graphCid) + "\n"
+    out = out + "compiler_csg_node_count=" + intToStr(plan.compilerCsg.nodeCount) + "\n"
+    out = out + "compiler_csg_edge_count=" + intToStr(plan.compilerCsg.edgeCount) + "\n"
+    out = out + "export_surface_cid=" + layout.fixedBytes32Hex(plan.exportSurface.surfaceCid) + "\n"
+    out = out + "export_surface_symbol_count=" + intToStr(plan.exportSurface.exportedSymbolCount) + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid) + "\n"
+    out = out + "compiler_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.compilerSnapshot.snapshotCid) + "\n"
+    out = out + "std_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.stdSnapshot.snapshotCid) + "\n"
+    out = out + "runtime_pkg_cid=" + layout.fixedBytes32Hex(plan.localUniverse.runtimeSnapshot.snapshotCid) + "\n"
+    out = out + "world_head_pinned=" + worldHeadPinned + "\n"
+    out = out + "lock_check_enabled=" + lockCheckEnabled + "\n"
+    out = out + "lock_verified=" + lockVerified + "\n"
+    out = out + "lock_path=" + lockPath + "\n"
+    out = out + "baseline_surface_checked=" + baselineSurfaceChecked + "\n"
+    out = out + "baseline_surface_compatible=" + baselineSurfaceCompatible + "\n"
+    out = out + "baseline_surface_path=" + baselineSurfacePath + "\n"
+    out = out + "compile_receipt_cid=" + layout.fixedBytes32Hex(plan.compileReceipt.receiptCid) + "\n"
+    out = out + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
+    out = out + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
+    out = out + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage + "\n"
+    out = out + slplan.v3SystemLinkPlanStubReport(plan.systemLinkPlan) + "\n"
+    out = out + lower.v3LoweringPlanStubReport(plan.loweringPlan) + "\n"
+    out = out + pobj.v3PrimaryObjectPlanReport(plan.primaryObjectPlan) + "\n"
+    out = out + "primary_object_path=" + primaryObjectPath + "\n"
+    out = out + "provider_object_count=" + intToStr(plan.objectPlan.providerObjectPaths.len) + "\n"
+    out = out + "provider_source_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerSourcePaths) + "\n"
+    out = out + "provider_object_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerObjectPaths) + "\n"
+    out = out + "object_link_input_count=" + intToStr(plan.objectPlan.linkInputPaths.len) + "\n"
+    out = out + "object_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.linkInputPaths) + "\n"
+    out = out + "object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.missingReasons) + "\n"
+    out = out + "object_pipeline_stage=" + plan.objectPlan.pipelineStage + "\n"
+    out = out + "native_linker_program=" + plan.nativeLinkPlan.linkerProgram + "\n"
+    out = out + "native_linker_flavor=" + plan.nativeLinkPlan.linkerFlavor + "\n"
+    out = out + "native_output_kind=" + nativeOutputKind + "\n"
+    out = out + "native_primary_object=" + nativePrimaryObject + "\n"
+    out = out + "native_link_input_count=" + intToStr(plan.nativeLinkPlan.linkInputPaths.len) + "\n"
+    out = out + "native_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.nativeLinkPlan.linkInputPaths) + "\n"
+    out = out + "native_link_entry_symbol=" + nativeEntrySymbol + "\n"
+    out = out + "native_link_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.nativeLinkPlan.missingReasons) + "\n"
+    out = out + "native_link_pipeline_stage=" + plan.nativeLinkPlan.pipelineStage + "\n"
+    out = out + "exec_pipeline_stage=primary_object_plan_to_native_link_plan"
+    return out

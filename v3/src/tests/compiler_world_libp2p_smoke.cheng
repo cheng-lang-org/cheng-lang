@@ -1,0 +1,64 @@
+import std/result
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_world_libp2p as cwlp
+import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/pubsub
+import cheng/v3/libp2p/core/types as core
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/host/host
+
+fn main(): int32 =
+    let workspaceRoot = v3path.v3PathCurrentDir()
+    let packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    let sourcePath = v3path.v3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_compiler_world_libp2p/program_selfhost_smoke")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    let planRes = sexec.v3BuildSystemLinkExecPlan(workspaceRoot, req)
+    assert(IsOk(planRes), "v3 compiler world libp2p: build plan")
+    let plan = Value(planRes)
+    var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
+    var syncHost = host.v3Libp2pHostInit("compiler-world-sync")
+    cwlp.v3CompilerWorldRegister(seedHost)
+    cwlp.v3CompilerWorldRegister(syncHost)
+    var seedAddr = core.v3Libp2pMultiaddrZero()
+    var syncAddr = core.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6461)
+    multiaddr.v3Libp2pMultiaddrFillTcp(syncAddr, "127.0.0.1", 6462)
+    let seedListenRes = host.v3Libp2pListen(seedHost, seedAddr)
+    assert(IsOk(seedListenRes), "v3 compiler world libp2p: seed listen")
+    let syncListenRes = host.v3Libp2pListen(syncHost, syncAddr)
+    assert(IsOk(syncListenRes), "v3 compiler world libp2p: sync listen")
+    let dialSeedRes = host.v3Libp2pDial(syncHost, seedHost.selfPeerId, seedAddr, 1)
+    assert(IsOk(dialSeedRes), "v3 compiler world libp2p: dial seed")
+    let dialSyncRes = host.v3Libp2pDial(seedHost, syncHost.selfPeerId, syncAddr, 1)
+    assert(IsOk(dialSyncRes), "v3 compiler world libp2p: dial sync")
+    cwlp.v3CompilerWorldPublishUniverse(seedHost,
+                                        plan.localUniverse,
+                                        plan.compilerCsg,
+                                        plan.exportSurface,
+                                        plan.compileReceipt)
+    let syncRes = cwlp.v3CompilerWorldSync(syncHost, seedHost, seedHost.selfPeerId)
+    assert(IsOk(syncRes), "v3 compiler world libp2p: sync")
+    assert(cwlp.v3CompilerWorldStoredEntryCount(seedHost) == 7, "v3 compiler world libp2p: seed count")
+    assert(cwlp.v3CompilerWorldStoredEntryCount(syncHost) == 7, "v3 compiler world libp2p: sync count")
+    assert(cwlp.v3CompilerWorldPublishedHeadCount(seedHost) == 1, "v3 compiler world libp2p: published head")
+    assert(Value(syncRes) == 7, "v3 compiler world libp2p: synced entries")
+    var worldText = ""
+    assert(cwlp.v3CompilerWorldFirstPayloadTextByKind(syncHost,
+                                                      pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                                      worldText),
+           "v3 compiler world libp2p: synced head text")
+    assert(v3path.v3TextContains(worldText, "head_cid="), "v3 compiler world libp2p: head field")
+    assert(v3path.v3TextContains(worldText, layout.fixedBytes32Hex(plan.localUniverse.worldHead.headCid)),
+           "v3 compiler world libp2p: synced head cid")
+    echo("v3 compiler_world_libp2p_smoke ok")
+    return 0

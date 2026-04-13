@@ -1,0 +1,487 @@
+import std/result
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/tooling/path as v3path
+
+type
+    V3CompilerPackageSnapshot =
+        version: int32
+        packageId: str
+        channel: str
+        sourceBundleCid: layout.FixedBytes32
+        csgRootCid: layout.FixedBytes32
+        exportSurfaceCid: layout.FixedBytes32
+        signature: str
+        snapshotCid: layout.FixedBytes32
+
+    V3CompilerWorldHead =
+        version: int32
+        universeId: str
+        channel: str
+        headEpoch: int32
+        prevHeadCid: layout.FixedBytes32
+        manifestRootCid: layout.FixedBytes32
+        csgRootCid: layout.FixedBytes32
+        compilerPkgCid: layout.FixedBytes32
+        stdPkgCid: layout.FixedBytes32
+        runtimePkgCid: layout.FixedBytes32
+        signature: str
+        headCid: layout.FixedBytes32
+
+    V3CompilerLockSnapshot =
+        version: int32
+        worldHeadCid: layout.FixedBytes32
+        compilerPkgCid: layout.FixedBytes32
+        stdPkgCid: layout.FixedBytes32
+        runtimePkgCid: layout.FixedBytes32
+        lockPath: str
+
+    V3CompilerLocalUniverse =
+        compilerSnapshot: V3CompilerPackageSnapshot
+        stdSnapshot: V3CompilerPackageSnapshot
+        runtimeSnapshot: V3CompilerPackageSnapshot
+        worldHead: V3CompilerWorldHead
+
+fn v3CompilerWorldUniverseId(): str =
+    return "cheng/v3/compiler_universe"
+
+fn v3CompilerWorldDefaultChannel(): str =
+    return "stable"
+
+fn v3CompilerWorldNormalizeChannel(raw: str): Result[str] =
+    let channel = strutil.strip(raw)
+    if len(channel) <= 0:
+        return Ok[str](v3CompilerWorldDefaultChannel())
+    if channel != "stable":
+        if channel != "edge":
+            return Err[str]("v3 compiler world: unsupported channel: " + channel)
+    return Ok[str](channel)
+
+fn v3CompilerWorldAppendText(buf: var layout.ByteBuf, text: str) =
+    lt.v3AppendU32BE(buf, len(text))
+    for i in 0..<len(text):
+        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn v3CompilerWorldAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    lt.v3AppendFixed32(buf, value)
+
+fn v3CompilerWorldStrLess(left: str,
+                          right: str): bool =
+    if left == right:
+        return false
+    let leftLen = len(left)
+    let rightLen = len(right)
+    let sharedLen = leftLen < rightLen ? leftLen : rightLen
+    for i in 0..<sharedLen:
+        if left[i] == right[i]:
+            continue
+        return left[i] < right[i]
+    return leftLen < rightLen
+
+fn v3CompilerWorldSortPaths(items: var str[]) =
+    if items.len <= 1:
+        return
+    var i = 1
+    while i < items.len:
+        let value = items[i]
+        var j = i
+        while j > 0:
+            if !v3CompilerWorldStrLess(value, items[j - 1]):
+                break
+            items[j] = items[j - 1]
+            j = j - 1
+        items[j] = value
+        i = i + 1
+
+fn v3CompilerWorldHashText(tag: str, values: str[]): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, tag)
+    lt.v3AppendU32BE(buf, values.len)
+    for i in 0..<values.len:
+        v3CompilerWorldAppendText(buf, values[i])
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldHashPackageSnapshot(packageId: str,
+                                      channel: str,
+                                      sourceBundleCid: layout.FixedBytes32,
+                                      csgRootCid: layout.FixedBytes32,
+                                      exportSurfaceCid: layout.FixedBytes32,
+                                      signature: str): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.package_snapshot")
+    v3CompilerWorldAppendText(buf, packageId)
+    v3CompilerWorldAppendText(buf, channel)
+    v3CompilerWorldAppendFixed32(buf, sourceBundleCid)
+    v3CompilerWorldAppendFixed32(buf, csgRootCid)
+    v3CompilerWorldAppendFixed32(buf, exportSurfaceCid)
+    v3CompilerWorldAppendText(buf, signature)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldManifestRootCid(compilerPkgCid: layout.FixedBytes32,
+                                  stdPkgCid: layout.FixedBytes32,
+                                  runtimePkgCid: layout.FixedBytes32): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(192)
+    v3CompilerWorldAppendText(buf, "v3.compiler.manifest_root")
+    v3CompilerWorldAppendFixed32(buf, compilerPkgCid)
+    v3CompilerWorldAppendFixed32(buf, stdPkgCid)
+    v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldHashHead(universeId: str,
+                           channel: str,
+                           headEpoch: int32,
+                           prevHeadCid: layout.FixedBytes32,
+                           manifestRootCid: layout.FixedBytes32,
+                           csgRootCid: layout.FixedBytes32,
+                           compilerPkgCid: layout.FixedBytes32,
+                           stdPkgCid: layout.FixedBytes32,
+                           runtimePkgCid: layout.FixedBytes32,
+                           signature: str): layout.FixedBytes32 =
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.world_head")
+    v3CompilerWorldAppendText(buf, universeId)
+    v3CompilerWorldAppendText(buf, channel)
+    lt.v3AppendU32BE(buf, headEpoch)
+    v3CompilerWorldAppendFixed32(buf, prevHeadCid)
+    v3CompilerWorldAppendFixed32(buf, manifestRootCid)
+    v3CompilerWorldAppendFixed32(buf, csgRootCid)
+    v3CompilerWorldAppendFixed32(buf, compilerPkgCid)
+    v3CompilerWorldAppendFixed32(buf, stdPkgCid)
+    v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
+    v3CompilerWorldAppendText(buf, signature)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldOwnedBytesFromText(text: str): Bytes =
+    var buf: layout.ByteBuf = layout.byteBufInit(len(text) + 16)
+    for i in 0..<len(text):
+        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+    return layout.byteBufToBytes(buf)
+
+fn v3CompilerWorldSourceBundleCid(packageId: str,
+                                  sourcePaths: str[]): layout.FixedBytes32 =
+    var orderedPaths: str[] = []
+    for i in 0..<sourcePaths.len:
+        add(orderedPaths, sourcePaths[i])
+    v3CompilerWorldSortPaths(orderedPaths)
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.source_bundle")
+    v3CompilerWorldAppendText(buf, packageId)
+    lt.v3AppendU32BE(buf, orderedPaths.len)
+    for i in 0..<orderedPaths.len:
+        let sourcePath = orderedPaths[i]
+        v3CompilerWorldAppendText(buf, sourcePath)
+        let text = v3path.v3ReadTextFile("", sourcePath)
+        v3CompilerWorldAppendText(buf, text)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3CompilerWorldSourceBundleCidFromTexts(packageId: str,
+                                           sourcePaths: str[],
+                                           sourceTexts: str[]): Result[layout.FixedBytes32] =
+    if sourcePaths.len != sourceTexts.len:
+        return Err[layout.FixedBytes32]("v3 compiler world: source bundle path/text count mismatch")
+    var orderedPaths: str[] = []
+    var orderedTexts: str[] = []
+    for i in 0..<sourcePaths.len:
+        add(orderedPaths, sourcePaths[i])
+        add(orderedTexts, sourceTexts[i])
+    if orderedPaths.len > 1:
+        var i = 1
+        while i < orderedPaths.len:
+            let valuePath = orderedPaths[i]
+            let valueText = orderedTexts[i]
+            var j = i
+            while j > 0:
+                if !v3CompilerWorldStrLess(valuePath, orderedPaths[j - 1]):
+                    break
+                orderedPaths[j] = orderedPaths[j - 1]
+                orderedTexts[j] = orderedTexts[j - 1]
+                j = j - 1
+            orderedPaths[j] = valuePath
+            orderedTexts[j] = valueText
+            i = i + 1
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.source_bundle")
+    v3CompilerWorldAppendText(buf, packageId)
+    lt.v3AppendU32BE(buf, orderedPaths.len)
+    for i in 0..<orderedPaths.len:
+        v3CompilerWorldAppendText(buf, orderedPaths[i])
+        v3CompilerWorldAppendText(buf, orderedTexts[i])
+    return Ok[layout.FixedBytes32](lt.v3FixedCidFromBuf(buf))
+
+fn v3CompilerPackageSnapshotMake(packageId: str,
+                                 channel: str,
+                                 sourceBundleCid: layout.FixedBytes32,
+                                 csgRootCid: layout.FixedBytes32,
+                                 exportSurfaceCid: layout.FixedBytes32,
+                                 signature: str): V3CompilerPackageSnapshot =
+    var out: V3CompilerPackageSnapshot
+    out.version = 1
+    out.packageId = packageId
+    out.channel = channel
+    out.sourceBundleCid = sourceBundleCid
+    out.csgRootCid = csgRootCid
+    out.exportSurfaceCid = exportSurfaceCid
+    out.signature = signature
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.package_snapshot")
+    v3CompilerWorldAppendText(buf, packageId)
+    v3CompilerWorldAppendText(buf, channel)
+    v3CompilerWorldAppendFixed32(buf, sourceBundleCid)
+    v3CompilerWorldAppendFixed32(buf, csgRootCid)
+    v3CompilerWorldAppendFixed32(buf, exportSurfaceCid)
+    v3CompilerWorldAppendText(buf, signature)
+    out.snapshotCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3CompilerWorldHeadMake(channel: str,
+                           headEpoch: int32,
+                           prevHeadCid: layout.FixedBytes32,
+                           csgRootCid: layout.FixedBytes32,
+                           compilerPkgCid: layout.FixedBytes32,
+                           stdPkgCid: layout.FixedBytes32,
+                           runtimePkgCid: layout.FixedBytes32,
+                           signature: str): V3CompilerWorldHead =
+    let universeId = v3CompilerWorldUniverseId()
+    let manifestRootCid = v3CompilerWorldManifestRootCid(compilerPkgCid, stdPkgCid, runtimePkgCid)
+    var out: V3CompilerWorldHead
+    out.version = 1
+    out.universeId = universeId
+    out.channel = channel
+    out.headEpoch = headEpoch
+    out.prevHeadCid = prevHeadCid
+    out.manifestRootCid = manifestRootCid
+    out.csgRootCid = csgRootCid
+    out.compilerPkgCid = compilerPkgCid
+    out.stdPkgCid = stdPkgCid
+    out.runtimePkgCid = runtimePkgCid
+    out.signature = signature
+    var buf: layout.ByteBuf = layout.byteBufInit(256)
+    v3CompilerWorldAppendText(buf, "v3.compiler.world_head")
+    v3CompilerWorldAppendText(buf, universeId)
+    v3CompilerWorldAppendText(buf, channel)
+    lt.v3AppendU32BE(buf, headEpoch)
+    v3CompilerWorldAppendFixed32(buf, prevHeadCid)
+    v3CompilerWorldAppendFixed32(buf, manifestRootCid)
+    v3CompilerWorldAppendFixed32(buf, csgRootCid)
+    v3CompilerWorldAppendFixed32(buf, compilerPkgCid)
+    v3CompilerWorldAppendFixed32(buf, stdPkgCid)
+    v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
+    v3CompilerWorldAppendText(buf, signature)
+    out.headCid = lt.v3FixedCidFromBuf(buf)
+    return out
+
+fn v3CompilerLocalUniverseBuildForChannel(channelRaw: str,
+                                          sourceBundleCid: layout.FixedBytes32,
+                                          csgRootCid: layout.FixedBytes32,
+                                          exportSurfaceCid: layout.FixedBytes32): Result[V3CompilerLocalUniverse] =
+    let channelRes = v3CompilerWorldNormalizeChannel(channelRaw)
+    if IsErr(channelRes):
+        return Err[V3CompilerLocalUniverse](Error(channelRes))
+    let channel = Value(channelRes)
+    let compilerSnapshot = v3CompilerPackageSnapshotMake("cheng/v3/compiler",
+                                                         channel,
+                                                         sourceBundleCid,
+                                                         csgRootCid,
+                                                         exportSurfaceCid,
+                                                         "local:compiler")
+    let stdSnapshot = v3CompilerPackageSnapshotMake("cheng/v3/std",
+                                                    channel,
+                                                    sourceBundleCid,
+                                                    csgRootCid,
+                                                    exportSurfaceCid,
+                                                    "local:std")
+    let runtimeSnapshot = v3CompilerPackageSnapshotMake("cheng/v3/runtime",
+                                                        channel,
+                                                        sourceBundleCid,
+                                                        csgRootCid,
+                                                        exportSurfaceCid,
+                                                        "local:runtime")
+    let worldHead = v3CompilerWorldHeadMake(channel,
+                                            1,
+                                            layout.fixedBytes32Zero(),
+                                            csgRootCid,
+                                            compilerSnapshot.snapshotCid,
+                                            stdSnapshot.snapshotCid,
+                                            runtimeSnapshot.snapshotCid,
+                                            "local:world_head")
+    var out: V3CompilerLocalUniverse
+    out.compilerSnapshot = compilerSnapshot
+    out.stdSnapshot = stdSnapshot
+    out.runtimeSnapshot = runtimeSnapshot
+    out.worldHead = worldHead
+    return Ok[V3CompilerLocalUniverse](out)
+
+fn v3CompilerLocalUniverseBuild(sourceBundleCid: layout.FixedBytes32,
+                                csgRootCid: layout.FixedBytes32,
+                                exportSurfaceCid: layout.FixedBytes32): V3CompilerLocalUniverse =
+    let universeRes = v3CompilerLocalUniverseBuildForChannel(v3CompilerWorldDefaultChannel(),
+                                                             sourceBundleCid,
+                                                             csgRootCid,
+                                                             exportSurfaceCid)
+    return Value(universeRes)
+
+fn v3CompilerWorldQuotedValue(text: str): str =
+    let value = strutil.strip(text)
+    if len(value) < 2:
+        return value
+    return v3path.v3TextSlice(value, 1, len(value) - 2)
+
+fn v3CompilerWorldLineValue(text: str, key: str): str =
+    let lines = strutil.split(text, '\n')
+    let plainPrefix = key + "="
+    let quotedPrefix = key + " = "
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if strutil.startsWith(line, plainPrefix):
+            let rawValue = v3path.v3TextSlice(line, len(plainPrefix), len(line) - len(plainPrefix))
+            return strutil.strip(rawValue)
+        if strutil.startsWith(line, quotedPrefix):
+            let rawValue = v3path.v3TextSlice(line, len(quotedPrefix), len(line) - len(quotedPrefix))
+            return v3CompilerWorldQuotedValue(rawValue)
+    return ""
+
+fn v3CompilerWorldFixed32Value(text: str, key: str): Result[layout.FixedBytes32] =
+    let value = v3CompilerWorldLineValue(text, key)
+    if len(value) <= 0:
+        return Err[layout.FixedBytes32]("v3 compiler world: missing key: " + key)
+    return layout.fixedBytes32FromHex(value)
+
+fn v3CompilerLockSnapshotFromText(text: str,
+                                  lockPath: str): Result[V3CompilerLockSnapshot] =
+    let worldHeadRes = v3CompilerWorldFixed32Value(text, "world_head_cid")
+    if IsErr(worldHeadRes):
+        return Err[V3CompilerLockSnapshot](Error(worldHeadRes))
+    let compilerRes = v3CompilerWorldFixed32Value(text, "compiler_pkg_cid")
+    if IsErr(compilerRes):
+        return Err[V3CompilerLockSnapshot](Error(compilerRes))
+    let stdRes = v3CompilerWorldFixed32Value(text, "std_pkg_cid")
+    if IsErr(stdRes):
+        return Err[V3CompilerLockSnapshot](Error(stdRes))
+    let runtimeRes = v3CompilerWorldFixed32Value(text, "runtime_pkg_cid")
+    if IsErr(runtimeRes):
+        return Err[V3CompilerLockSnapshot](Error(runtimeRes))
+    var out: V3CompilerLockSnapshot
+    out.version = 1
+    out.worldHeadCid = Value(worldHeadRes)
+    out.compilerPkgCid = Value(compilerRes)
+    out.stdPkgCid = Value(stdRes)
+    out.runtimePkgCid = Value(runtimeRes)
+    out.lockPath = lockPath
+    return Ok[V3CompilerLockSnapshot](out)
+
+fn v3CompilerLockSnapshotRead(rootDir: str,
+                              rawPath: str): Result[V3CompilerLockSnapshot] =
+    let path = v3path.v3PathAbsolute(rootDir, rawPath)
+    if !v3path.v3PathFileExists(path):
+        return Err[V3CompilerLockSnapshot]("v3 compiler world: missing lock path: " + path)
+    let text = v3path.v3ReadTextFile("", path)
+    return v3CompilerLockSnapshotFromText(text, path)
+
+fn v3CompilerWorldVerifyLock(universe: V3CompilerLocalUniverse,
+                             lock: V3CompilerLockSnapshot): Result[bool] =
+    if !layout.fixedBytes32Equal(universe.worldHead.headCid, lock.worldHeadCid):
+        return Err[bool]("v3 compiler world: lock world head mismatch")
+    if !layout.fixedBytes32Equal(universe.compilerSnapshot.snapshotCid, lock.compilerPkgCid):
+        return Err[bool]("v3 compiler world: lock compiler snapshot mismatch")
+    if !layout.fixedBytes32Equal(universe.stdSnapshot.snapshotCid, lock.stdPkgCid):
+        return Err[bool]("v3 compiler world: lock std snapshot mismatch")
+    if !layout.fixedBytes32Equal(universe.runtimeSnapshot.snapshotCid, lock.runtimePkgCid):
+        return Err[bool]("v3 compiler world: lock runtime snapshot mismatch")
+    return Ok[bool](true)
+
+fn v3CompilerWorldHeadMatchesHex(head: V3CompilerWorldHead,
+                                 rawHex: str): Result[bool] =
+    let value = strutil.strip(rawHex)
+    if len(value) <= 0:
+        return Ok[bool](true)
+    let headRes = layout.fixedBytes32FromHex(value)
+    if IsErr(headRes):
+        return Err[bool]("v3 compiler world: invalid world head hex")
+    if !layout.fixedBytes32Equal(head.headCid, Value(headRes)):
+        return Err[bool]("v3 compiler world: requested world head mismatch")
+    return Ok[bool](true)
+
+fn v3CompilerPackageSnapshotReport(snapshot: V3CompilerPackageSnapshot): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "package_id=" + snapshot.packageId + "\n"
+    out = out + "channel=" + snapshot.channel + "\n"
+    out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(snapshot.sourceBundleCid) + "\n"
+    out = out + "csg_root_cid=" + layout.fixedBytes32Hex(snapshot.csgRootCid) + "\n"
+    out = out + "export_surface_cid=" + layout.fixedBytes32Hex(snapshot.exportSurfaceCid) + "\n"
+    out = out + "signature=" + snapshot.signature + "\n"
+    out = out + "snapshot_cid=" + layout.fixedBytes32Hex(snapshot.snapshotCid)
+    return out
+
+fn v3CompilerWorldHeadReport(head: V3CompilerWorldHead): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "universe_id=" + head.universeId + "\n"
+    out = out + "channel=" + head.channel + "\n"
+    out = out + "head_epoch=" + intToStr(head.headEpoch) + "\n"
+    out = out + "prev_head_cid=" + layout.fixedBytes32Hex(head.prevHeadCid) + "\n"
+    out = out + "manifest_root_cid=" + layout.fixedBytes32Hex(head.manifestRootCid) + "\n"
+    out = out + "csg_root_cid=" + layout.fixedBytes32Hex(head.csgRootCid) + "\n"
+    out = out + "compiler_pkg_cid=" + layout.fixedBytes32Hex(head.compilerPkgCid) + "\n"
+    out = out + "std_pkg_cid=" + layout.fixedBytes32Hex(head.stdPkgCid) + "\n"
+    out = out + "runtime_pkg_cid=" + layout.fixedBytes32Hex(head.runtimePkgCid) + "\n"
+    out = out + "signature=" + head.signature + "\n"
+    out = out + "head_cid=" + layout.fixedBytes32Hex(head.headCid)
+    return out
+
+fn v3CompilerWorldHeadFromReportText(text: str,
+                                     out: var V3CompilerWorldHead): Result[bool] =
+    let headEpochText = v3CompilerWorldLineValue(text, "head_epoch")
+    if len(headEpochText) <= 0:
+        return Err[bool]("v3 compiler world: report head_epoch missing")
+    let prevHeadRes = v3CompilerWorldFixed32Value(text, "prev_head_cid")
+    if IsErr(prevHeadRes):
+        return Err[bool](Error(prevHeadRes))
+    let manifestRes = v3CompilerWorldFixed32Value(text, "manifest_root_cid")
+    if IsErr(manifestRes):
+        return Err[bool](Error(manifestRes))
+    let csgRes = v3CompilerWorldFixed32Value(text, "csg_root_cid")
+    if IsErr(csgRes):
+        return Err[bool](Error(csgRes))
+    let compilerRes = v3CompilerWorldFixed32Value(text, "compiler_pkg_cid")
+    if IsErr(compilerRes):
+        return Err[bool](Error(compilerRes))
+    let stdRes = v3CompilerWorldFixed32Value(text, "std_pkg_cid")
+    if IsErr(stdRes):
+        return Err[bool](Error(stdRes))
+    let runtimeRes = v3CompilerWorldFixed32Value(text, "runtime_pkg_cid")
+    if IsErr(runtimeRes):
+        return Err[bool](Error(runtimeRes))
+    let headCidRes = v3CompilerWorldFixed32Value(text, "head_cid")
+    if IsErr(headCidRes):
+        return Err[bool](Error(headCidRes))
+    out.version = 1
+    out.universeId = v3CompilerWorldLineValue(text, "universe_id")
+    out.channel = v3CompilerWorldLineValue(text, "channel")
+    out.headEpoch = int32(parseInt(headEpochText))
+    out.prevHeadCid = Value(prevHeadRes)
+    out.manifestRootCid = Value(manifestRes)
+    out.csgRootCid = Value(csgRes)
+    out.compilerPkgCid = Value(compilerRes)
+    out.stdPkgCid = Value(stdRes)
+    out.runtimePkgCid = Value(runtimeRes)
+    out.signature = v3CompilerWorldLineValue(text, "signature")
+    out.headCid = Value(headCidRes)
+    return Ok[bool](true)
+
+fn v3CompilerLockText(universe: V3CompilerLocalUniverse): str =
+    var out = ""
+    out = out + "world_head_cid = \"" + layout.fixedBytes32Hex(universe.worldHead.headCid) + "\"\n"
+    out = out + "compiler_pkg_cid = \"" + layout.fixedBytes32Hex(universe.compilerSnapshot.snapshotCid) + "\"\n"
+    out = out + "std_pkg_cid = \"" + layout.fixedBytes32Hex(universe.stdSnapshot.snapshotCid) + "\"\n"
+    out = out + "runtime_pkg_cid = \"" + layout.fixedBytes32Hex(universe.runtimeSnapshot.snapshotCid) + "\"\n"
+    return out
+
+fn v3CompilerWorldSummaryReport(universe: V3CompilerLocalUniverse): str =
+    var out = ""
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(universe.worldHead.headCid) + "\n"
+    out = out + "compiler_pkg_cid=" + layout.fixedBytes32Hex(universe.compilerSnapshot.snapshotCid) + "\n"
+    out = out + "std_pkg_cid=" + layout.fixedBytes32Hex(universe.stdSnapshot.snapshotCid) + "\n"
+    out = out + "runtime_pkg_cid=" + layout.fixedBytes32Hex(universe.runtimeSnapshot.snapshotCid)
+    return out

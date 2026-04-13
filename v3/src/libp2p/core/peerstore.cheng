@@ -1,7 +1,18 @@
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/core/resources
+
+const
+    v3Libp2pPeerCacheEntryCap: int32 = 8
 
 type
+    V3Libp2pPeerCacheEntry =
+        cacheKey: str
+        lastHitEpochSeconds: int64
+        hitCount: int32
+        admittedAtEpochSeconds: int64
+        residentBytes: int64
+
     V3Libp2pPeerEndpoint =
         addr: types.V3Libp2pMultiaddr
         lastDialOk: bool
@@ -15,13 +26,63 @@ type
         connected: bool
         bootstrap: bool
         trustedInfra: bool
+        placementGroup: str
+        replicaWithdrawn: bool
         rttEwmaMicros: int32
         lossPermille: int32
         loadPermille: int32
         trustPermille: int32
+        resources: types.V3Libp2pNodeResource
+        cacheEntries: V3Libp2pPeerCacheEntry[]
 
     V3Libp2pPeerstore =
         peers: V3Libp2pPeerRecord[]
+
+fn v3Libp2pPeerCacheEntryZero(): V3Libp2pPeerCacheEntry =
+    let zero64 = int64(0)
+    var out: V3Libp2pPeerCacheEntry
+    out.cacheKey = ""
+    out.lastHitEpochSeconds = zero64
+    out.hitCount = 0
+    out.admittedAtEpochSeconds = zero64
+    out.residentBytes = zero64
+    return out
+
+fn v3Libp2pPeerCacheEntryClone(entry: V3Libp2pPeerCacheEntry): V3Libp2pPeerCacheEntry =
+    var out = v3Libp2pPeerCacheEntryZero()
+    out.cacheKey = entry.cacheKey
+    out.lastHitEpochSeconds = entry.lastHitEpochSeconds
+    out.hitCount = entry.hitCount
+    out.admittedAtEpochSeconds = entry.admittedAtEpochSeconds
+    out.residentBytes = entry.residentBytes
+    return out
+
+fn v3Libp2pPeerCacheEntryBetter(left: V3Libp2pPeerCacheEntry,
+                                right: V3Libp2pPeerCacheEntry): bool =
+    if left.hitCount > right.hitCount:
+        return true
+    if left.hitCount < right.hitCount:
+        return false
+    if left.lastHitEpochSeconds > right.lastHitEpochSeconds:
+        return true
+    if left.lastHitEpochSeconds < right.lastHitEpochSeconds:
+        return false
+    if left.admittedAtEpochSeconds > right.admittedAtEpochSeconds:
+        return true
+    if left.admittedAtEpochSeconds < right.admittedAtEpochSeconds:
+        return false
+    if left.residentBytes < right.residentBytes:
+        return true
+    if left.residentBytes > right.residentBytes:
+        return false
+    return left.cacheKey < right.cacheKey
+
+fn v3Libp2pPeerCacheResidentBytes(record: V3Libp2pPeerRecord): int64 =
+    var total = int64(0)
+    for i in 0..<record.cacheEntries.len:
+        if record.cacheEntries[i].residentBytes > int64(0):
+            total = total + record.cacheEntries[i].residentBytes
+    return total
 
 fn v3Libp2pPeerEndpointZero(): V3Libp2pPeerEndpoint =
     var out: V3Libp2pPeerEndpoint
@@ -46,11 +107,15 @@ fn v3Libp2pPeerRecordZero(): V3Libp2pPeerRecord =
     out.connected = false
     out.bootstrap = false
     out.trustedInfra = false
+    out.placementGroup = ""
+    out.replicaWithdrawn = false
     out.endpoints = []
     out.rttEwmaMicros = 0
     out.lossPermille = 0
     out.loadPermille = 0
     out.trustPermille = 0
+    out.resources = types.v3Libp2pNodeResourceZero()
+    out.cacheEntries = []
     return out
 
 fn v3Libp2pPeerstoreZero(): V3Libp2pPeerstore =
@@ -72,6 +137,151 @@ fn v3Libp2pPeerRecordEndpointPos(record: V3Libp2pPeerRecord,
         if multiaddr.v3Libp2pMultiaddrEqual(record.endpoints[i].addr, addr):
             return i
     return -1
+
+fn v3Libp2pPeerRecordCacheEntryPos(record: V3Libp2pPeerRecord,
+                                   cacheKey: str): int32 =
+    for i in 0..<record.cacheEntries.len:
+        if record.cacheEntries[i].cacheKey == cacheKey:
+            return i
+    return -1
+
+fn v3Libp2pPeerRecordWorstCacheEntryPos(record: V3Libp2pPeerRecord): int32 =
+    if record.cacheEntries.len <= 0:
+        return -1
+    var worstPos = 0
+    for i in 1..<record.cacheEntries.len:
+        if v3Libp2pPeerCacheEntryBetter(record.cacheEntries[worstPos], record.cacheEntries[i]):
+            worstPos = i
+    return worstPos
+
+fn v3Libp2pPeerRecordCacheRemovePos(record: var V3Libp2pPeerRecord,
+                                    pos: int32) =
+    if pos < 0 || pos >= record.cacheEntries.len:
+        return
+    var next: V3Libp2pPeerCacheEntry[]
+    next = []
+    for i in 0..<record.cacheEntries.len:
+        if i == pos:
+            continue
+        add(next, v3Libp2pPeerCacheEntryClone(record.cacheEntries[i]))
+    record.cacheEntries = next
+
+fn v3Libp2pPeerRecordEvictCache(record: var V3Libp2pPeerRecord,
+                                cacheKey: str): bool =
+    let pos = v3Libp2pPeerRecordCacheEntryPos(record, cacheKey)
+    if pos < 0:
+        return false
+    v3Libp2pPeerRecordCacheRemovePos(record, pos)
+    return true
+
+fn v3Libp2pPeerRecordObserveCache(record: var V3Libp2pPeerRecord,
+                                  cacheKey: str,
+                                  observedAtEpochSeconds: int64) =
+    if len(cacheKey) <= 0:
+        return
+    let pos = v3Libp2pPeerRecordCacheEntryPos(record, cacheKey)
+    if pos >= 0:
+        if observedAtEpochSeconds > record.cacheEntries[pos].lastHitEpochSeconds:
+            record.cacheEntries[pos].lastHitEpochSeconds = observedAtEpochSeconds
+        record.cacheEntries[pos].hitCount = record.cacheEntries[pos].hitCount + 1
+        if record.cacheEntries[pos].admittedAtEpochSeconds <= int64(0):
+            record.cacheEntries[pos].admittedAtEpochSeconds = observedAtEpochSeconds
+        if record.cacheEntries[pos].residentBytes <= int64(0):
+            record.cacheEntries[pos].residentBytes = int64(1)
+        return
+    var insert = v3Libp2pPeerCacheEntryZero()
+    insert.cacheKey = cacheKey
+    insert.lastHitEpochSeconds = observedAtEpochSeconds
+    insert.hitCount = 1
+    insert.admittedAtEpochSeconds = observedAtEpochSeconds
+    insert.residentBytes = int64(1)
+    if record.cacheEntries.len < v3Libp2pPeerCacheEntryCap:
+        add(record.cacheEntries, insert)
+        return
+    let worstPos = v3Libp2pPeerRecordWorstCacheEntryPos(record)
+    if worstPos < 0:
+        return
+    if !v3Libp2pPeerCacheEntryBetter(insert, record.cacheEntries[worstPos]):
+        return
+    record.cacheEntries[worstPos] = insert
+
+fn v3Libp2pPeerRecordAdmitCache(record: var V3Libp2pPeerRecord,
+                                cacheKey: str,
+                                observedAtEpochSeconds: int64,
+                                residentBytes: int64,
+                                maxEntryCount: int32,
+                                maxResidentBytes: int64): bool =
+    if len(cacheKey) <= 0:
+        return false
+    if residentBytes <= int64(0):
+        return false
+    if maxEntryCount <= 0 || maxResidentBytes <= int64(0):
+        return false
+    if residentBytes > maxResidentBytes:
+        return false
+    let pos = v3Libp2pPeerRecordCacheEntryPos(record, cacheKey)
+    if pos >= 0:
+        record.cacheEntries[pos].residentBytes = residentBytes
+        if observedAtEpochSeconds > record.cacheEntries[pos].admittedAtEpochSeconds:
+            record.cacheEntries[pos].admittedAtEpochSeconds = observedAtEpochSeconds
+        elif record.cacheEntries[pos].admittedAtEpochSeconds <= int64(0):
+            record.cacheEntries[pos].admittedAtEpochSeconds = observedAtEpochSeconds
+    else:
+        var insert = v3Libp2pPeerCacheEntryZero()
+        insert.cacheKey = cacheKey
+        insert.lastHitEpochSeconds = int64(0)
+        insert.hitCount = 0
+        insert.admittedAtEpochSeconds = observedAtEpochSeconds
+        insert.residentBytes = residentBytes
+        if record.cacheEntries.len < v3Libp2pPeerCacheEntryCap:
+            add(record.cacheEntries, insert)
+        else:
+            let worstPos = v3Libp2pPeerRecordWorstCacheEntryPos(record)
+            if worstPos < 0:
+                return false
+            if !v3Libp2pPeerCacheEntryBetter(insert, record.cacheEntries[worstPos]):
+                return false
+            record.cacheEntries[worstPos] = insert
+    while record.cacheEntries.len > maxEntryCount ||
+      v3Libp2pPeerCacheResidentBytes(record) > maxResidentBytes:
+        let worstPos = v3Libp2pPeerRecordWorstCacheEntryPos(record)
+        if worstPos < 0:
+            break
+        let evictedKey = record.cacheEntries[worstPos].cacheKey
+        v3Libp2pPeerRecordCacheRemovePos(record, worstPos)
+        if evictedKey == cacheKey:
+            return false
+    return v3Libp2pPeerRecordCacheEntryPos(record, cacheKey) >= 0
+
+fn v3Libp2pPeerRecordCacheHitFill(record: V3Libp2pPeerRecord,
+                                  cacheKey: str,
+                                  outLastHitEpochSeconds: var int64,
+                                  outHitCount: var int32): bool =
+    outLastHitEpochSeconds = int64(0)
+    outHitCount = 0
+    if len(cacheKey) <= 0:
+        return false
+    let pos = v3Libp2pPeerRecordCacheEntryPos(record, cacheKey)
+    if pos < 0:
+        return false
+    outLastHitEpochSeconds = record.cacheEntries[pos].lastHitEpochSeconds
+    outHitCount = record.cacheEntries[pos].hitCount
+    return true
+
+fn v3Libp2pPeerRecordCacheResidencyFill(record: V3Libp2pPeerRecord,
+                                        cacheKey: str,
+                                        outResidentBytes: var int64,
+                                        outAdmittedAtEpochSeconds: var int64): bool =
+    outResidentBytes = int64(0)
+    outAdmittedAtEpochSeconds = int64(0)
+    if len(cacheKey) <= 0:
+        return false
+    let pos = v3Libp2pPeerRecordCacheEntryPos(record, cacheKey)
+    if pos < 0:
+        return false
+    outResidentBytes = record.cacheEntries[pos].residentBytes
+    outAdmittedAtEpochSeconds = record.cacheEntries[pos].admittedAtEpochSeconds
+    return true
 
 fn v3Libp2pPeerRecordResetLastDialOk(record: var V3Libp2pPeerRecord) =
     for i in 0..<record.endpoints.len:
@@ -182,10 +392,16 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     next.connected = record.connected
     next.bootstrap = record.bootstrap
     next.trustedInfra = record.trustedInfra
+    next.placementGroup = record.placementGroup
+    next.replicaWithdrawn = record.replicaWithdrawn
     next.rttEwmaMicros = record.rttEwmaMicros
     next.lossPermille = record.lossPermille
     next.loadPermille = record.loadPermille
     next.trustPermille = record.trustPermille
+    next.resources = resources.v3Libp2pNodeResourceClone(record.resources)
+    next.cacheEntries = []
+    for i in 0..<record.cacheEntries.len:
+        add(next.cacheEntries, v3Libp2pPeerCacheEntryClone(record.cacheEntries[i]))
     let targetPeerId = record.peerId
     let pos = v3Libp2pPeerstorePos(store, targetPeerId)
     if pos >= 0:
@@ -197,10 +413,16 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
         store.peers[pos].connected = next.connected
         store.peers[pos].bootstrap = next.bootstrap
         store.peers[pos].trustedInfra = next.trustedInfra
+        store.peers[pos].placementGroup = next.placementGroup
+        store.peers[pos].replicaWithdrawn = next.replicaWithdrawn
         store.peers[pos].rttEwmaMicros = next.rttEwmaMicros
         store.peers[pos].lossPermille = next.lossPermille
         store.peers[pos].loadPermille = next.loadPermille
         store.peers[pos].trustPermille = next.trustPermille
+        store.peers[pos].resources = resources.v3Libp2pNodeResourceClone(next.resources)
+        store.peers[pos].cacheEntries = []
+        for i in 0..<next.cacheEntries.len:
+            add(store.peers[pos].cacheEntries, v3Libp2pPeerCacheEntryClone(next.cacheEntries[i]))
         return
     let insert = v3Libp2pPeerRecordZero()
     add(store.peers, insert)
@@ -213,10 +435,16 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     store.peers[idx].connected = next.connected
     store.peers[idx].bootstrap = next.bootstrap
     store.peers[idx].trustedInfra = next.trustedInfra
+    store.peers[idx].placementGroup = next.placementGroup
+    store.peers[idx].replicaWithdrawn = next.replicaWithdrawn
     store.peers[idx].rttEwmaMicros = next.rttEwmaMicros
     store.peers[idx].lossPermille = next.lossPermille
     store.peers[idx].loadPermille = next.loadPermille
     store.peers[idx].trustPermille = next.trustPermille
+    store.peers[idx].resources = resources.v3Libp2pNodeResourceClone(next.resources)
+    store.peers[idx].cacheEntries = []
+    for i in 0..<next.cacheEntries.len:
+        add(store.peers[idx].cacheEntries, v3Libp2pPeerCacheEntryClone(next.cacheEntries[i]))
 
 fn v3Libp2pPeerstoreCount(store: V3Libp2pPeerstore): int32 =
     return store.peers.len

@@ -3,6 +3,17 @@ import std/strutils as strutil
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
 
+importc fn cheng_v3_tailnet_provider_open_bridge(providerKindText: str, controlEndpointText: str, relayEndpointText: str, controlProbeEndpointText: str, relayProbeEndpointText: str, derpRegionCodeText: str, derpHostnameText: str): uint64
+importc fn cheng_v3_tailnet_provider_command_bridge(handle: uint64, commandText: str): int32
+importc fn cheng_v3_tailnet_provider_close_bridge(handle: uint64): int32
+importc fn cheng_v3_tailnet_provider_active_count_bridge(): int32
+importc fn cheng_v3_tailnet_provider_command_count_bridge(): int32
+importc fn cheng_v3_tailnet_provider_probe_provider_ready_bridge(handle: uint64): int32
+importc fn cheng_v3_tailnet_provider_probe_proxy_ready_bridge(handle: uint64): int32
+importc fn cheng_v3_tailnet_provider_probe_listener_needs_repair_bridge(handle: uint64): int32
+importc fn cheng_v3_tailnet_provider_probe_derp_healthy_bridge(handle: uint64): int32
+importc fn cheng_v3_tailnet_provider_probe_startup_stage_bridge(handle: uint64): str
+
 const
     v3Libp2pTailnetProviderSynthetic: int32 = 0
     v3Libp2pTailnetProviderHeadscale: int32 = 1
@@ -43,6 +54,8 @@ type
         controlProtocol: str
         controlEndpoint: str
         relayEndpoint: str
+        controlProbeEndpoint: str
+        relayProbeEndpoint: str
         authKey: str
         hostname: str
         stateDir: str
@@ -97,6 +110,7 @@ type
 
     V3Libp2pTailnetTransport =
         cfg: V3Libp2pTailnetTransportConfig
+        runtimeHandle: uint64
         providerReady: bool
         derpHealthy: bool
         proxyListenersReady: bool
@@ -124,6 +138,8 @@ fn v3Libp2pTailnetPathKindText(kind: V3Libp2pTailnetPathKind): str =
 fn v3Libp2pTailnetTransportConfigZero(): V3Libp2pTailnetTransportConfig =
     var out: V3Libp2pTailnetTransportConfig
     out.providerKind = v3Libp2pTailnetProviderSynthetic
+    out.controlProbeEndpoint = ""
+    out.relayProbeEndpoint = ""
     out.localListenAddrs = []
     out.headscaleNamespace = ""
     out.headscaleNoisePublicKey = ""
@@ -225,6 +241,22 @@ fn v3Libp2pTailnetPeerSessionDecodeFill(out: var V3Libp2pTailnetPeerSession,
     out.lastError = parts[9]
     return true
 
+fn v3Libp2pTailnetPeerSessionHintsFill(payload: str,
+                                       remoteTailnetIp: var str,
+                                       directReachable: var bool,
+                                       relayAllowed: var bool,
+                                       relayOnly: var bool,
+                                       boundAddrText: var str): bool =
+    let parts = strutil.split(payload, '\n')
+    if parts.len < 8:
+        return false
+    remoteTailnetIp = parts[1]
+    directReachable = v3Libp2pTailnetSessionBoolParse(parts[2])
+    relayAllowed = v3Libp2pTailnetSessionBoolParse(parts[3])
+    relayOnly = v3Libp2pTailnetSessionBoolParse(parts[4])
+    boundAddrText = parts[7]
+    return true
+
 fn v3Libp2pTailnetDialPlanZero(): V3Libp2pTailnetDialPlan =
     var out: V3Libp2pTailnetDialPlan
     out.requestedAddr = types.v3Libp2pMultiaddrZero()
@@ -243,6 +275,7 @@ fn v3Libp2pTailnetDialPlanZero(): V3Libp2pTailnetDialPlan =
 fn v3Libp2pTailnetTransportInit(cfg: V3Libp2pTailnetTransportConfig): V3Libp2pTailnetTransport =
     var out: V3Libp2pTailnetTransport
     out.cfg = cfg
+    out.runtimeHandle = uint64(0)
     out.providerReady = false
     out.derpHealthy = false
     out.proxyListenersReady = false
@@ -289,6 +322,12 @@ fn v3Libp2pTailnetConfigSetHeadscale(cfg: var V3Libp2pTailnetTransportConfig,
     cfg.derpHostname = hostname
     cfg.exactRouting = exactRouting
 
+fn v3Libp2pTailnetConfigSetProbeEndpoints(cfg: var V3Libp2pTailnetTransportConfig,
+                                          controlProbeEndpoint: str,
+                                          relayProbeEndpoint: str) =
+    cfg.controlProbeEndpoint = controlProbeEndpoint
+    cfg.relayProbeEndpoint = relayProbeEndpoint
+
 fn v3Libp2pTailnetProviderUsesExactRouting(transport: V3Libp2pTailnetTransport): bool =
     return transport.cfg.exactRouting
 
@@ -297,6 +336,123 @@ fn v3Libp2pTailnetSetDerpHealthy(transport: var V3Libp2pTailnetTransport,
                                  startupStage: str) =
     transport.derpHealthy = healthy
     transport.startupStage = startupStage
+
+fn v3Libp2pTailnetProviderRuntimeEnsure(transport: var V3Libp2pTailnetTransport) =
+    if transport.runtimeHandle != uint64(0):
+        return
+    transport.runtimeHandle = cheng_v3_tailnet_provider_open_bridge(v3Libp2pTailnetProviderKindText(transport.cfg.providerKind),
+                                                                    transport.cfg.controlEndpoint,
+                                                                    transport.cfg.relayEndpoint,
+                                                                    transport.cfg.controlProbeEndpoint,
+                                                                    transport.cfg.relayProbeEndpoint,
+                                                                    transport.cfg.derpRegionCode,
+                                                                    transport.cfg.derpHostname)
+
+fn v3Libp2pTailnetProviderRuntimeCommand(transport: var V3Libp2pTailnetTransport,
+                                         command: str) =
+    v3Libp2pTailnetProviderRuntimeEnsure(transport)
+    if transport.runtimeHandle == uint64(0):
+        return
+    cheng_v3_tailnet_provider_command_bridge(transport.runtimeHandle, command)
+
+fn v3Libp2pTailnetProviderApplyRuntimeState(transport: var V3Libp2pTailnetTransport) =
+    transport.providerReady = v3Libp2pTailnetProviderRuntimeReadyNow(transport)
+    transport.proxyListenersReady = v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport)
+    transport.listenerNeedsRepair = v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport)
+    transport.derpHealthy = v3Libp2pTailnetProviderRuntimeDerpHealthyNow(transport)
+    transport.startupStage = v3Libp2pTailnetProviderRuntimeStartupStageNow(transport)
+
+fn v3Libp2pTailnetProviderStart(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "provider-start")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderMarkProxyReady(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "proxy-ready")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderMarkListenerRepairNeeded(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "repair-needed")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderRepairListeners(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "repair-listeners")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderReconnectDerp(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "derp-reconnect")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderDerpReady(transport: var V3Libp2pTailnetTransport) =
+    v3Libp2pTailnetProviderRuntimeCommand(transport, "derp-ready")
+    v3Libp2pTailnetProviderApplyRuntimeState(transport)
+
+fn v3Libp2pTailnetProviderRuntimeActiveCountNow(): int32 =
+    return cheng_v3_tailnet_provider_active_count_bridge()
+
+fn v3Libp2pTailnetProviderRuntimeCommandCountNow(): int32 =
+    return cheng_v3_tailnet_provider_command_count_bridge()
+
+fn v3Libp2pTailnetProviderRuntimeReadyNow(transport: V3Libp2pTailnetTransport): bool =
+    if transport.runtimeHandle == uint64(0):
+        return transport.providerReady
+    return cheng_v3_tailnet_provider_probe_provider_ready_bridge(transport.runtimeHandle) != 0
+
+fn v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport: V3Libp2pTailnetTransport): bool =
+    if transport.runtimeHandle == uint64(0):
+        return transport.proxyListenersReady
+    return cheng_v3_tailnet_provider_probe_proxy_ready_bridge(transport.runtimeHandle) != 0
+
+fn v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport: V3Libp2pTailnetTransport): bool =
+    if transport.runtimeHandle == uint64(0):
+        return transport.listenerNeedsRepair
+    return cheng_v3_tailnet_provider_probe_listener_needs_repair_bridge(transport.runtimeHandle) != 0
+
+fn v3Libp2pTailnetProviderRuntimeDerpHealthyNow(transport: V3Libp2pTailnetTransport): bool =
+    if transport.runtimeHandle == uint64(0):
+        return transport.derpHealthy
+    return cheng_v3_tailnet_provider_probe_derp_healthy_bridge(transport.runtimeHandle) != 0
+
+fn v3Libp2pTailnetProviderRuntimeStartupStageNow(transport: V3Libp2pTailnetTransport): str =
+    if transport.runtimeHandle == uint64(0):
+        return transport.startupStage
+    let stage = cheng_v3_tailnet_provider_probe_startup_stage_bridge(transport.runtimeHandle)
+    if len(stage) > 0:
+        return stage
+    return transport.startupStage
+
+fn v3Libp2pTailnetProviderClose(transport: var V3Libp2pTailnetTransport): bool =
+    if transport.runtimeHandle == uint64(0):
+        transport.providerReady = false
+        transport.proxyListenersReady = false
+        transport.derpHealthy = false
+        transport.listenerNeedsRepair = false
+        transport.startupStage = "closed"
+        return true
+    if cheng_v3_tailnet_provider_close_bridge(transport.runtimeHandle) != 0:
+        return false
+    transport.runtimeHandle = uint64(0)
+    transport.providerReady = false
+    transport.proxyListenersReady = false
+    transport.derpHealthy = false
+    transport.listenerNeedsRepair = false
+    transport.startupStage = "closed"
+    return true
+
+fn v3Libp2pTailnetPeerSessionAtFill(out: var V3Libp2pTailnetPeerSession,
+                                    transport: V3Libp2pTailnetTransport,
+                                    pos: int32): bool =
+    if pos < 0 || pos >= transport.peerSessions.len:
+        return false
+    out = v3Libp2pTailnetPeerSessionClone(transport.peerSessions[pos])
+    return true
+
+fn v3Libp2pTailnetPeerSessionPeerIdText(payload: str): str =
+    for i in 0..<len(payload):
+        if payload[i] == '\n':
+            if i <= 0:
+                return ""
+            return strutil.sliceStr(payload, 0, i - 1)
+    return payload
 
 fn v3Libp2pTailnetPeerSessionPos(transport: V3Libp2pTailnetTransport,
                                  peerId: str): int32 =
@@ -320,11 +476,13 @@ fn v3Libp2pTailnetUpsertPeerSession(transport: var V3Libp2pTailnetTransport,
         next.lastPath = "idle"
     if len(session.lastError) > 0:
         next.lastPath = "error"
-    let stored = v3Libp2pTailnetPeerSessionClone(next)
+    var sessions = transport.peerSessions
     if pos >= 0:
-        transport.peerSessions[pos] = stored
+        sessions[pos] = next
+        transport.peerSessions = sessions
         return
-    add(transport.peerSessions, stored)
+    add(sessions, next)
+    transport.peerSessions = sessions
 
 fn v3Libp2pTailnetRegisterPeerSession(transport: var V3Libp2pTailnetTransport,
                                       peerId: str) =
@@ -334,7 +492,7 @@ fn v3Libp2pTailnetRegisterPeerSession(transport: var V3Libp2pTailnetTransport,
     v3Libp2pTailnetUpsertPeerSession(transport, session)
 
 fn v3Libp2pTailnetDerpAvailable(transport: V3Libp2pTailnetTransport): bool =
-    if !transport.derpHealthy:
+    if !v3Libp2pTailnetProviderRuntimeDerpHealthyNow(transport):
         return false
     return len(transport.cfg.relayEndpoint) > 0
 
@@ -344,7 +502,10 @@ fn v3Libp2pTailnetDerpMapSummary(transport: V3Libp2pTailnetTransport): str =
         if len(transport.cfg.headscaleNamespace) > 0:
             out = out + "/"
             out = out + transport.cfg.headscaleNamespace
-        if len(transport.cfg.controlEndpoint) > 0:
+        if len(transport.cfg.controlUrl) > 0:
+            out = out + "@"
+            out = out + transport.cfg.controlUrl
+        elif len(transport.cfg.controlEndpoint) > 0:
             out = out + "@"
             out = out + transport.cfg.controlEndpoint
         if len(transport.cfg.derpRegionCode) > 0:
@@ -476,21 +637,21 @@ fn v3Libp2pTailnetResolveRawToPublished(transport: V3Libp2pTailnetTransport,
     return true
 
 fn v3Libp2pTailnetProviderFullyReady(transport: V3Libp2pTailnetTransport): bool =
-    if !transport.providerReady:
+    if !v3Libp2pTailnetProviderRuntimeReadyNow(transport):
         return false
-    if !transport.proxyListenersReady:
+    if !v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport):
         return false
-    return !transport.listenerNeedsRepair
+    return !v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport)
 
 fn v3Libp2pTailnetStatusPathKind(transport: V3Libp2pTailnetTransport): V3Libp2pTailnetPathKind =
-    if transport.listenerNeedsRepair:
+    if v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport):
         return v3Libp2pTailnetPathRepair
     if v3Libp2pTailnetProviderFullyReady(transport):
         if transport.listenerMappings.len > 0 && v3Libp2pTailnetDerpAvailable(transport):
             return v3Libp2pTailnetPathDirect
         if transport.listenerMappings.len > 0:
             return v3Libp2pTailnetPathDirect
-    if transport.providerReady && transport.listenerMappings.len > 0:
+    if v3Libp2pTailnetProviderRuntimeReadyNow(transport) && transport.listenerMappings.len > 0:
         return v3Libp2pTailnetPathDirectPending
     if v3Libp2pTailnetDerpAvailable(transport):
         return v3Libp2pTailnetPathDerp
@@ -514,9 +675,13 @@ fn v3Libp2pTailnetDialPlanFill(out: var V3Libp2pTailnetDialPlan,
     out.relayOnly = relayOnly
     out.directOnly = directOnly
     out.directAllowed = !relayOnly
-    out.relayAllowed = v3Libp2pTailnetDerpAvailable(transport) && !directOnly
-    out.needsRepair = transport.providerReady &&
-                      (!transport.proxyListenersReady || transport.listenerNeedsRepair)
+    let providerReady = v3Libp2pTailnetProviderRuntimeReadyNow(transport)
+    let proxyListenersReady = v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport)
+    let listenerNeedsRepair = v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport)
+    let derpAvailable = v3Libp2pTailnetDerpAvailable(transport)
+    let exactRouting = transport.cfg.exactRouting
+    out.relayAllowed = derpAvailable && !directOnly
+    out.needsRepair = providerReady && (!proxyListenersReady || listenerNeedsRepair)
 
     var mappedRaw = types.v3Libp2pMultiaddrZero()
     if v3Libp2pTailnetResolvePublishedToRaw(transport, requestedAddr, mappedRaw):
@@ -525,37 +690,37 @@ fn v3Libp2pTailnetDialPlanFill(out: var V3Libp2pTailnetDialPlan,
     let sessionPos = v3Libp2pTailnetPeerSessionPos(transport, peerId)
     if sessionPos >= 0:
         let session = transport.peerSessions[sessionPos]
+        if session.relayOnly:
+            out.directAllowed = false
         if len(session.remoteTailnetIp) > 0:
             out.publishedAddr.host = session.remoteTailnetIp
         if session.relayOnly:
             out.directAllowed = false
         if session.relayAllowed || session.relayOnly:
-            out.relayAllowed = v3Libp2pTailnetDerpAvailable(transport) && !directOnly
-        if transport.cfg.exactRouting && len(session.boundAddrText) > 0:
+            out.relayAllowed = derpAvailable && !directOnly
+        if exactRouting && len(session.boundAddrText) > 0:
             out.routeText = session.boundAddrText
-        if out.directAllowed &&
-           transport.providerReady &&
-           transport.proxyListenersReady &&
-           !transport.listenerNeedsRepair &&
-           session.directReachable:
-            out.pathKind = v3Libp2pTailnetPathDirect
-            out.reachability = types.v3Libp2pReachabilityDirect
-            if len(out.routeText) == 0:
-                if transport.cfg.exactRouting:
-                    out.routeText = v3Libp2pTailnetAddrText(out.rawAddr)
-                else:
-                    out.routeText = v3Libp2pTailnetAddrText(out.publishedAddr)
-            return Ok[bool](true)
-    elif out.directAllowed &&
-         transport.providerReady &&
-         transport.proxyListenersReady &&
-         !transport.listenerNeedsRepair:
+    elif out.directAllowed && providerReady && proxyListenersReady && !listenerNeedsRepair:
         out.pathKind = v3Libp2pTailnetPathDirect
         out.reachability = types.v3Libp2pReachabilityDirect
-        if transport.cfg.exactRouting:
+        if exactRouting:
             out.routeText = v3Libp2pTailnetAddrText(out.rawAddr)
         else:
             out.routeText = v3Libp2pTailnetAddrText(out.publishedAddr)
+        return Ok[bool](true)
+
+    let directPossible = out.directAllowed &&
+                         providerReady &&
+                         proxyListenersReady &&
+                         !listenerNeedsRepair
+    if directPossible:
+        out.pathKind = v3Libp2pTailnetPathDirect
+        out.reachability = types.v3Libp2pReachabilityDirect
+        if len(out.routeText) == 0:
+            if exactRouting:
+                out.routeText = v3Libp2pTailnetAddrText(out.rawAddr)
+            else:
+                out.routeText = v3Libp2pTailnetAddrText(out.publishedAddr)
         return Ok[bool](true)
 
     if out.relayAllowed:
@@ -569,7 +734,7 @@ fn v3Libp2pTailnetDialPlanFill(out: var V3Libp2pTailnetDialPlan,
         out.routeText = "repair"
         return Err[bool]("v3 libp2p tailnet: listener repair required")
 
-    if transport.providerReady && !transport.proxyListenersReady:
+    if providerReady && !proxyListenersReady:
         out.pathKind = v3Libp2pTailnetPathDirectPending
         out.routeText = "direct-pending"
         return Err[bool]("v3 libp2p tailnet: proxy listeners pending")
@@ -586,20 +751,20 @@ fn v3Libp2pTailnetStatusFill(out: var V3Libp2pTailnetStatusSnapshot,
         out.controlPlane = "headscale"
     out.exactRouting = v3Libp2pTailnetProviderUsesExactRouting(transport)
     out.relayHealthy = v3Libp2pTailnetDerpAvailable(transport)
-    out.providerReady = transport.providerReady
-    out.proxyListenersReady = transport.proxyListenersReady
-    out.listenerNeedsRepair = transport.listenerNeedsRepair
-    out.startupStage = transport.startupStage
+    out.providerReady = v3Libp2pTailnetProviderRuntimeReadyNow(transport)
+    out.proxyListenersReady = v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport)
+    out.listenerNeedsRepair = v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport)
+    out.startupStage = v3Libp2pTailnetProviderRuntimeStartupStageNow(transport)
     out.publishedCount = 0
     out.sessionCount = v3Libp2pTailnetPeerSessionCount(transport)
     out.derpRegionCode = transport.cfg.derpRegionCode
     out.derpHostname = transport.cfg.derpHostname
-    out.tailnetIPs = []
-    out.tailnetPeers = []
+    var tailnetIPs: str[] = []
+    var tailnetPeers: str[] = []
     if len(transport.cfg.syntheticIPv4) > 0:
-        add(out.tailnetIPs, transport.cfg.syntheticIPv4)
+        add(tailnetIPs, transport.cfg.syntheticIPv4)
     if len(transport.cfg.syntheticIPv6) > 0:
-        add(out.tailnetIPs, transport.cfg.syntheticIPv6)
+        add(tailnetIPs, transport.cfg.syntheticIPv6)
     for i in 0..<transport.listenerMappings.len:
         if transport.listenerMappings[i].published:
             out.publishedCount = out.publishedCount + 1
@@ -610,7 +775,11 @@ fn v3Libp2pTailnetStatusFill(out: var V3Libp2pTailnetStatusSnapshot,
             if out.publishedCount > 0:
                 out.tailnetPath = "direct+derp"
     for i in 0..<transport.peerSessions.len:
-        add(out.tailnetPeers, transport.peerSessions[i].peerId)
+        let peerId = transport.peerSessions[i].peerId
+        if len(peerId) > 0:
+            add(tailnetPeers, peerId)
+    out.tailnetIPs = tailnetIPs
+    out.tailnetPeers = tailnetPeers
     out.tailnetRelay = transport.cfg.relayEndpoint
     out.tailnetDerpMapSummary = v3Libp2pTailnetDerpMapSummary(transport)
 
