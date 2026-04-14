@@ -1,5 +1,6 @@
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/project/rwad_accumulator as accum
 
 const
     v3RwadSerialVersion: int32 = 1
@@ -66,6 +67,8 @@ type
         nullifierCount: int32
         serialRoot: layout.FixedBytes32
         nullifierRoot: layout.FixedBytes32
+        serialAccumulatorRoot: layout.FixedBytes32
+        nullifierAccumulatorRoot: layout.FixedBytes32
         appHash: layout.FixedBytes32
 
     V3RwadStateMachine =
@@ -115,6 +118,8 @@ fn v3RwadCommitSummaryZero(): V3RwadCommitSummary =
     out.nullifierCount = 0
     out.serialRoot = layout.fixedBytes32Zero()
     out.nullifierRoot = layout.fixedBytes32Zero()
+    out.serialAccumulatorRoot = accum.v3RwadAccumulatorEmptyRoot()
+    out.nullifierAccumulatorRoot = accum.v3RwadAccumulatorEmptyRoot()
     out.appHash = layout.fixedBytes32Zero()
     return out
 
@@ -240,6 +245,109 @@ fn v3RwadNullifierRoot(machine: V3RwadStateMachine): layout.FixedBytes32 =
     for i in 0..<machine.nullifiers.len:
         lt.v3AppendFixed32(buf, machine.nullifiers[i].nullifierCid)
     return lt.v3FixedCidFromBuf(buf)
+
+fn v3RwadLiveNoteAccumulatorLeaves(machine: V3RwadStateMachine): layout.FixedBytes32[] =
+    var out: layout.FixedBytes32[]
+    out = []
+    for i in 0..<machine.notes.len:
+        if machine.notes[i].live:
+            add(out, v3RwadNoteCid(machine.notes[i]))
+    return out
+
+fn v3RwadNullifierAccumulatorLeaves(machine: V3RwadStateMachine): layout.FixedBytes32[] =
+    var out: layout.FixedBytes32[]
+    out = []
+    for i in 0..<machine.nullifiers.len:
+        add(out, machine.nullifiers[i].nullifierCid)
+    return out
+
+fn v3RwadSerialAccumulatorRoot(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    return accum.v3RwadAccumulatorRoot(v3RwadLiveNoteAccumulatorLeaves(machine))
+
+fn v3RwadNullifierAccumulatorRoot(machine: V3RwadStateMachine): layout.FixedBytes32 =
+    return accum.v3RwadAccumulatorRoot(v3RwadNullifierAccumulatorLeaves(machine))
+
+fn v3RwadSerialAccumulatorProof(machine: V3RwadStateMachine,
+                                noteId: int64,
+                                out: var accum.V3RwadAccumulatorProof): bool =
+    let noteCount = machine.notes.len
+    var leaves: layout.FixedBytes32[]
+    leaves = []
+    var targetIndex = -1
+    for i in 0..<noteCount:
+        if !machine.notes[i].live:
+            continue
+        if machine.notes[i].noteId == noteId:
+            targetIndex = leaves.len
+        add(leaves, v3RwadNoteCid(machine.notes[i]))
+    if targetIndex < 0 || leaves.len <= 0:
+        out = accum.v3RwadAccumulatorProofZero()
+        return false
+    out = accum.v3RwadAccumulatorProofZero()
+    out.leafCid = leaves[targetIndex]
+    out.leafIndex = targetIndex
+    out.leafCount = leaves.len
+    out.rootCid = accum.v3RwadAccumulatorRoot(leaves)
+    var level = accum.v3RwadAccumulatorLeafHashes(leaves)
+    var index = targetIndex
+    while level.len > 1:
+        let siblingIndex = if (index % 2) == 0:
+            if index + 1 < level.len: index + 1 else: index
+        else:
+            index - 1
+        add(out.siblingHashes, level[siblingIndex])
+        out.siblingCount = out.siblingHashes.len
+        var next: layout.FixedBytes32[]
+        next = []
+        var i = 0
+        while i < level.len:
+            let left = level[i]
+            let right = if i + 1 < level.len: level[i + 1] else: level[i]
+            add(next, accum.v3RwadAccumulatorNodeHash(left, right))
+            i = i + 2
+        index = index / 2
+        level = next
+    return true
+
+fn v3RwadNullifierAccumulatorProof(machine: V3RwadStateMachine,
+                                   noteId: int64,
+                                   out: var accum.V3RwadAccumulatorProof): bool =
+    let nullifierCount = machine.nullifiers.len
+    var leaves: layout.FixedBytes32[]
+    leaves = []
+    var targetIndex = -1
+    for i in 0..<nullifierCount:
+        if machine.nullifiers[i].noteId == noteId:
+            targetIndex = leaves.len
+        add(leaves, machine.nullifiers[i].nullifierCid)
+    if targetIndex < 0 || leaves.len <= 0:
+        out = accum.v3RwadAccumulatorProofZero()
+        return false
+    out = accum.v3RwadAccumulatorProofZero()
+    out.leafCid = leaves[targetIndex]
+    out.leafIndex = targetIndex
+    out.leafCount = leaves.len
+    out.rootCid = accum.v3RwadAccumulatorRoot(leaves)
+    var level = accum.v3RwadAccumulatorLeafHashes(leaves)
+    var index = targetIndex
+    while level.len > 1:
+        let siblingIndex = if (index % 2) == 0:
+            if index + 1 < level.len: index + 1 else: index
+        else:
+            index - 1
+        add(out.siblingHashes, level[siblingIndex])
+        out.siblingCount = out.siblingHashes.len
+        var next: layout.FixedBytes32[]
+        next = []
+        var i = 0
+        while i < level.len:
+            let left = level[i]
+            let right = if i + 1 < level.len: level[i + 1] else: level[i]
+            add(next, accum.v3RwadAccumulatorNodeHash(left, right))
+            i = i + 2
+        index = index / 2
+        level = next
+    return true
 
 fn v3RwadOwnerRoot(machine: V3RwadStateMachine, ownerId: layout.FixedBytes32): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(256)
@@ -492,6 +600,8 @@ fn v3RwadStateMachineCommit(machine: var V3RwadStateMachine): V3RwadCommitSummar
     out.nullifierCount = machine.nullifiers.len
     out.serialRoot = v3RwadSerialRoot(machine)
     out.nullifierRoot = v3RwadNullifierRoot(machine)
+    out.serialAccumulatorRoot = v3RwadSerialAccumulatorRoot(machine)
+    out.nullifierAccumulatorRoot = v3RwadNullifierAccumulatorRoot(machine)
     out.appHash = v3RwadAppHash(machine)
     machine.lastCommitAppHash = out.appHash
     return out

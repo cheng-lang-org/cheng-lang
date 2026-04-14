@@ -1,7 +1,231 @@
-import std/system
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/anti_entropy as anti
 import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+import cheng/v3/tooling/path as v3path
+
+const
+    v3ChainNodeStateMagic: str = "v3.chain_node.state.v1"
+
+fn v3ChainNodeUsage() =
+    os.writeLine(os.get_stdout(), "usage: chain_node <command> [flags]")
+    os.writeLine(os.get_stdout(), "")
+    os.writeLine(os.get_stdout(), "commands:")
+    os.writeLine(os.get_stdout(), "  self-test")
+    os.writeLine(os.get_stdout(), "  init --state:<file> --node-id:<id> --address-seed:<seed> [--force]")
+    os.writeLine(os.get_stdout(), "  mint --state:<file> --asset:<id> --account:<id> --amount:<n>")
+    os.writeLine(os.get_stdout(), "  transfer --state:<file> --asset:<id> --from:<id> --to:<id> --amount:<n>")
+    os.writeLine(os.get_stdout(), "  balance --state:<file> --asset:<id> --account:<id>")
+    os.writeLine(os.get_stdout(), "  show-state --state:<file>")
+    os.writeLine(os.get_stdout(), "  dump-snapshot --state:<file>")
+    os.writeLine(os.get_stdout(), "  serve-once --state:<file> [--host:<ip>] [--port:<n>] [--ready-path:<file>]")
+    os.writeLine(os.get_stdout(), "  sync-once --state:<file> [--node-id:<id> --address-seed:<seed>] [--host:<ip>] --port:<n>")
+    os.writeLine(os.get_stdout(), "  daemon-serve --state:<file> [--host:<ip>] [--port:<n>] [--ready-path:<file>] [--interval-ms:<n>] [--max-serve-count:<n>]")
+    os.writeLine(os.get_stdout(), "  daemon-sync --state:<file> [--node-id:<id> --address-seed:<seed>] [--host:<ip>] --port:<n> [--interval-ms:<n>] [--max-sync-count:<n>]")
+
+fn v3ChainNodeInt64Text(value: int64): str =
+    return strings.int64ToStr(value)
+
+fn v3ChainNodeHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3ChainNodeBytesFromHex(text: str): Result[Bytes] =
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("v3 chain_node: invalid hex length")
+    var out = bytesAlloc(len(text) / 2)
+    var i = 0
+    while i < len(text):
+        let hi = v3ChainNodeHexValue(text[i])
+        let lo = v3ChainNodeHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 chain_node: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3ChainNodeTextStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn v3ChainNodeReadFlagValue(flag: str, outValue: var str): bool =
+    outValue = ""
+    let count = cmdline.paramCount()
+    let colonPrefix = flag + ":"
+    let eqPrefix = flag + "="
+    for i in 1..count:
+        let arg = cmdline.paramStr(i)
+        if arg == flag:
+            if i >= count:
+                return false
+            outValue = cmdline.paramStr(i + 1)
+            return true
+        if v3ChainNodeTextStartsWith(arg, colonPrefix):
+            outValue = strings.sliceBytes(arg, len(colonPrefix), len(arg) - len(colonPrefix))
+            return true
+        if v3ChainNodeTextStartsWith(arg, eqPrefix):
+            outValue = strings.sliceBytes(arg, len(eqPrefix), len(arg) - len(eqPrefix))
+            return true
+    return false
+
+fn v3ChainNodeParseInt64Text(raw: str): Result[int64] =
+    let text = strutil.strip(raw)
+    if len(text) <= 0:
+        return Err[int64]("v3 chain_node: invalid integer: " + raw)
+    var sign = int64(1)
+    var i = 0
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        sign = int64(-1)
+        i = 1
+    if i >= len(text):
+        return Err[int64]("v3 chain_node: invalid integer: " + raw)
+    var value = int64(0)
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int64]("v3 chain_node: invalid integer: " + raw)
+        let digit = int64(int32(ch) - int32('0'))
+        value = value * int64(10) + digit
+        i = i + 1
+    return Ok[int64](value * sign)
+
+fn v3ChainNodeReadRequiredFlag(flag: str,
+                               outValue: var str): Result[bool] =
+    outValue = ""
+    if !v3ChainNodeReadFlagValue(flag, outValue):
+        return Err[bool]("v3 chain_node: missing " + flag)
+    outValue = strutil.strip(outValue)
+    if len(outValue) <= 0:
+        return Err[bool]("v3 chain_node: missing " + flag)
+    return Ok[bool](true)
+
+fn v3ChainNodeReadRequiredInt64Flag(flag: str): Result[int64] =
+    var raw = ""
+    let readRes = v3ChainNodeReadRequiredFlag(flag, raw)
+    if IsErr(readRes):
+        return Err[int64](Error(readRes))
+    let parsedRes = v3ChainNodeParseInt64Text(raw)
+    if IsErr(parsedRes):
+        return Err[int64]("v3 chain_node: invalid integer for " + flag + ": " + raw)
+    return Ok[int64](Value(parsedRes))
+
+fn v3ChainNodeReadRequiredStatePath(outValue: var str): Result[bool] =
+    return v3ChainNodeReadRequiredFlag("--state", outValue)
+
+fn v3ChainNodeSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot): str =
+    var out = ""
+    out = out + "node_id=" + snapshot.nodeId + "\n"
+    out = out + "serve_count=" + intToStr(snapshot.serveCount) + "\n"
+    out = out + "event_count=" + intToStr(snapshot.events.len) + "\n"
+    out = out + "tip_event_cid=" + layout.fixedBytes32Hex(snapshot.tipEventCid) + "\n"
+    out = out + "forest_cid=" + layout.fixedBytes32Hex(snapshot.forest.forestCid) + "\n"
+    out = out + "signature_event_count=" + intToStr(snapshot.signature.eventCount) + "\n"
+    out = out + "signature_account_count=" + intToStr(snapshot.signature.accountCount)
+    return out
+
+fn v3ChainNodeStateText(snapshot: node.V3ChainNodeServeSnapshot): str =
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    return v3ChainNodeStateMagic + "\n" +
+        "node_id=" + snapshot.nodeId + "\n" +
+        "payload_hex=" + bytesToHex(payload) + "\n"
+
+fn v3ChainNodeWriteSnapshotState(pathRaw: str,
+                                 snapshot: node.V3ChainNodeServeSnapshot): bool =
+    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3ChainNodeStateText(snapshot))
+
+fn v3ChainNodeExtractStateText(text: str,
+                               outNodeId: var str,
+                               outPayloadHex: var str): bool =
+    outNodeId = ""
+    outPayloadHex = ""
+    let lines = strutil.split(text, '\n')
+    var phase = 0
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if phase == 0:
+            if line != v3ChainNodeStateMagic:
+                return false
+            phase = 1
+            continue
+        if phase == 1:
+            if len(line) <= 8 || v3path.v3TextSlice(line, 0, 8) != "node_id=":
+                return false
+            outNodeId = strutil.strip(v3path.v3TextSlice(line, 8, len(line) - 8))
+            phase = 2
+            continue
+        if phase == 2:
+            if len(line) <= 12 || v3path.v3TextSlice(line, 0, 12) != "payload_hex=":
+                return false
+            outPayloadHex = strutil.strip(v3path.v3TextSlice(line, 12, len(line) - 12))
+            phase = 3
+            continue
+        return false
+    if phase != 3:
+        return false
+    if len(outNodeId) <= 0:
+        return false
+    if len(outPayloadHex) <= 0:
+        return false
+    return true
+
+fn v3ChainNodeLoadState(pathRaw: str): Result[node.V3ChainNode] =
+    let currentDir = os.getCurrentDir()
+    let absolutePath = v3path.v3PathAbsolute(currentDir, pathRaw)
+    let text = v3path.v3ReadTextFile(currentDir, pathRaw)
+    let trimmedText = strutil.strip(text)
+    if len(trimmedText) <= 0:
+        return Err[node.V3ChainNode]("v3 chain_node: missing or empty state file: " + absolutePath)
+    var nodeId = ""
+    var payloadHex = ""
+    if !v3ChainNodeExtractStateText(text, nodeId, payloadHex):
+        return Err[node.V3ChainNode]("v3 chain_node: invalid state file: " + absolutePath)
+    let payloadRes = v3ChainNodeBytesFromHex(payloadHex)
+    if IsErr(payloadRes):
+        return Err[node.V3ChainNode](Error(payloadRes))
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(Value(payloadRes))
+    if IsErr(snapshotRes):
+        return Err[node.V3ChainNode](Error(snapshotRes))
+    let snapshot = Value(snapshotRes)
+    let replayRes = node.v3ChainNodeReplayFromSnapshot(nodeId,
+                                                       snapshot.address,
+                                                       snapshot)
+    if IsErr(replayRes):
+        return Err[node.V3ChainNode](Error(replayRes))
+    return Ok[node.V3ChainNode](Value(replayRes))
+
+fn v3ChainNodeLoadOrInitForSync(statePath: str): Result[node.V3ChainNode] =
+    if v3path.v3PathFileExists(v3path.v3PathAbsolute(os.getCurrentDir(), statePath)):
+        return v3ChainNodeLoadState(statePath)
+    var nodeId = ""
+    let nodeIdRes = v3ChainNodeReadRequiredFlag("--node-id", nodeId)
+    if IsErr(nodeIdRes):
+        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    var addressSeed = ""
+    let seedRes = v3ChainNodeReadRequiredFlag("--address-seed", addressSeed)
+    if IsErr(seedRes):
+        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    return Ok[node.V3ChainNode](node.v3ChainNodeInit(nodeId, addressSeed))
 
 fn v3ChainNodeMainSelfTest(): int32 =
     var server = node.v3ChainNodeInit("node-a", "chain-node-a")
@@ -39,5 +263,296 @@ fn v3ChainNodeMainSelfTest(): int32 =
     echo("v3 chain_node self-test ok")
     return 0
 
-fn main(): int32 =
-    return v3ChainNodeMainSelfTest()
+fn v3ChainNodeSleepMs(value: int32) =
+    if value <= 0:
+        return
+    let valueText = intToStr(value)
+    var command = "sleep $(printf '%d.%03d' $(( "
+    command = command + valueText
+    command = command + " / 1000 )) $(( "
+    command = command + valueText
+    command = command + " % 1000 )))"
+    let sleepRes = os.execCmdEx(command, 0, os.getCurrentDir())
+    let sleepRc = os.execCmdResultExitCode(sleepRes)
+    assert(sleepRc == 0, "v3 chain_node: sleep failed")
+
+fn v3ChainNodeInitCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let absoluteStatePath = v3path.v3PathAbsolute(os.getCurrentDir(), statePath)
+    if v3path.v3PathFileExists(absoluteStatePath) && !cmdline.hasFlag("--force"):
+        os.writeLine(os.get_stderr(), "v3 chain_node: state already exists: " + absoluteStatePath + " (pass --force to overwrite)")
+        return 2
+    var nodeId = ""
+    let nodeIdRes = v3ChainNodeReadRequiredFlag("--node-id", nodeId)
+    if IsErr(nodeIdRes):
+        os.writeLine(os.get_stderr(), Error(nodeIdRes))
+        return 2
+    var addressSeed = ""
+    let seedRes = v3ChainNodeReadRequiredFlag("--address-seed", addressSeed)
+    if IsErr(seedRes):
+        os.writeLine(os.get_stderr(), Error(seedRes))
+        return 2
+    var state = node.v3ChainNodeInit(nodeId, addressSeed)
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
+        os.writeLine(os.get_stderr(), "v3 chain_node: failed to write state: " + absoluteStatePath)
+        return 2
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeMintCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let accountId = cmdline.readInt32FlagOrDefault("--account", -1)
+    let amountRes = v3ChainNodeReadRequiredInt64Flag("--amount")
+    if assetId <= 0 || accountId <= 0 || IsErr(amountRes):
+        if IsErr(amountRes):
+            os.writeLine(os.get_stderr(), Error(amountRes))
+        else:
+            os.writeLine(os.get_stderr(), "v3 chain_node: mint requires --asset --account --amount")
+        return 2
+    let amount = Value(amountRes)
+    let mintRes = node.v3ChainNodeMint(state, assetId, accountId, amount)
+    if !mintRes.ok:
+        os.writeLine(os.get_stderr(), Error(mintRes))
+        return 2
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
+        os.writeLine(os.get_stderr(), "v3 chain_node: failed to persist state: " + statePath)
+        return 2
+    os.writeLine(os.get_stdout(), "event_cid=" + layout.fixedBytes32Hex(mintRes.value))
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeTransferCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let fromAccount = cmdline.readInt32FlagOrDefault("--from", -1)
+    let toAccount = cmdline.readInt32FlagOrDefault("--to", -1)
+    let amountRes = v3ChainNodeReadRequiredInt64Flag("--amount")
+    if assetId <= 0 || fromAccount <= 0 || toAccount <= 0 || IsErr(amountRes):
+        if IsErr(amountRes):
+            os.writeLine(os.get_stderr(), Error(amountRes))
+        else:
+            os.writeLine(os.get_stderr(), "v3 chain_node: transfer requires --asset --from --to --amount")
+        return 2
+    let amount = Value(amountRes)
+    let transferRes = node.v3ChainNodeTransfer(state, assetId, fromAccount, toAccount, amount)
+    if !transferRes.ok:
+        os.writeLine(os.get_stderr(), Error(transferRes))
+        return 2
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
+        os.writeLine(os.get_stderr(), "v3 chain_node: failed to persist state: " + statePath)
+        return 2
+    os.writeLine(os.get_stdout(), "event_cid=" + layout.fixedBytes32Hex(transferRes.value))
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeBalanceCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let state = Value(loadRes)
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let accountId = cmdline.readInt32FlagOrDefault("--account", -1)
+    if assetId <= 0 || accountId <= 0:
+        os.writeLine(os.get_stderr(), "v3 chain_node: balance requires --asset and --account")
+        return 2
+    let balanceRes = node.v3ChainNodeBalance(state, assetId, accountId)
+    if !balanceRes.ok:
+        os.writeLine(os.get_stderr(), Error(balanceRes))
+        return 2
+    os.writeLine(os.get_stdout(), "balance=" + v3ChainNodeInt64Text(balanceRes.value))
+    os.writeLine(os.get_stdout(), "forest_cid=" + layout.fixedBytes32Hex(node.v3ChainNodeForestCid(state)))
+    return 0
+
+fn v3ChainNodeShowStateCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeDumpSnapshotCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    os.writeLine(os.get_stdout(), "payload_hex=" + bytesToHex(net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)))
+    return 0
+
+fn v3ChainNodeServeOnceCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let host = cmdline.readFlagOrDefault("--host", "127.0.0.1")
+    let port = cmdline.readInt32FlagOrDefault("--port", 0)
+    let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
+        os.writeLine(os.get_stderr(), "v3 chain_node: failed to persist state: " + statePath)
+        return 2
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    let serveRes = tcp_transport.v3Libp2pTcpServePayloadOnce(host,
+                                                             port,
+                                                             types.v3Libp2pProtocolSync,
+                                                             payload,
+                                                             readyPath)
+    if IsErr(serveRes):
+        os.writeLine(os.get_stderr(), Error(serveRes))
+        return 2
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeSyncOnceCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3ChainNodeLoadOrInitForSync(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let host = cmdline.readFlagOrDefault("--host", "127.0.0.1")
+    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    if port <= 0:
+        os.writeLine(os.get_stderr(), "v3 chain_node: sync-once requires --port")
+        return 2
+    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce(host,
+                                                              port,
+                                                              types.v3Libp2pProtocolSync)
+    if IsErr(payloadRes):
+        os.writeLine(os.get_stderr(), Error(payloadRes))
+        return 2
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(Value(payloadRes))
+    if IsErr(snapshotRes):
+        os.writeLine(os.get_stderr(), Error(snapshotRes))
+        return 2
+    let syncRes = node.v3ChainNodeSyncOnce(state, Value(snapshotRes))
+    if IsErr(syncRes):
+        os.writeLine(os.get_stderr(), Error(syncRes))
+        return 2
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
+        os.writeLine(os.get_stderr(), "v3 chain_node: failed to persist state: " + statePath)
+        return 2
+    os.writeLine(os.get_stdout(), "changed=" + intToStr(Value(syncRes) ? 1 : 0))
+    os.writeLine(os.get_stdout(), v3ChainNodeSnapshotReport(snapshot))
+    return 0
+
+fn v3ChainNodeDaemonServeCommand(): int32 =
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 0)
+    let maxServeCount = cmdline.readInt32FlagOrDefault("--max-serve-count", 0)
+    var served = 0
+    while maxServeCount <= 0 || served < maxServeCount:
+        let rc = v3ChainNodeServeOnceCommand()
+        if rc != 0:
+            return rc
+        served = served + 1
+        if intervalMs > 0 && (maxServeCount <= 0 || served < maxServeCount):
+            v3ChainNodeSleepMs(intervalMs)
+    return 0
+
+fn v3ChainNodeDaemonSyncCommand(): int32 =
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 1000)
+    let maxSyncCount = cmdline.readInt32FlagOrDefault("--max-sync-count", 0)
+    var synced = 0
+    while maxSyncCount <= 0 || synced < maxSyncCount:
+        let rc = v3ChainNodeSyncOnceCommand()
+        if rc != 0:
+            return rc
+        synced = synced + 1
+        if intervalMs > 0 && (maxSyncCount <= 0 || synced < maxSyncCount):
+            v3ChainNodeSleepMs(intervalMs)
+    return 0
+
+fn main(argc: int32, argv: ptr): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let count = cmdline.paramCount()
+    if count <= 0:
+        v3ChainNodeUsage()
+        return 0
+    let cmd = cmdline.paramStr(1)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3ChainNodeUsage()
+        return 0
+    if cmd == "self-test":
+        return v3ChainNodeMainSelfTest()
+    if cmd == "init":
+        return v3ChainNodeInitCommand()
+    if cmd == "mint":
+        return v3ChainNodeMintCommand()
+    if cmd == "transfer":
+        return v3ChainNodeTransferCommand()
+    if cmd == "balance":
+        return v3ChainNodeBalanceCommand()
+    if cmd == "show-state":
+        return v3ChainNodeShowStateCommand()
+    if cmd == "dump-snapshot":
+        return v3ChainNodeDumpSnapshotCommand()
+    if cmd == "serve-once":
+        return v3ChainNodeServeOnceCommand()
+    if cmd == "sync-once":
+        return v3ChainNodeSyncOnceCommand()
+    if cmd == "daemon-serve":
+        return v3ChainNodeDaemonServeCommand()
+    if cmd == "daemon-sync":
+        return v3ChainNodeDaemonSyncCommand()
+    os.writeLine(os.get_stderr(), "v3 chain_node: unknown command: " + cmd)
+    v3ChainNodeUsage()
+    return 2

@@ -9,6 +9,7 @@ import cheng/v3/libp2p/core/peerstore as ps
 import cheng/v3/libp2p/core/resources
 import cheng/v3/libp2p/core/scheduler
 import cheng/v3/libp2p/discovery/kad
+import cheng/v3/libp2p/identity/did
 import cheng/v3/libp2p/protocols/identify
 import cheng/v3/libp2p/protocols/gossipsub as gossip
 import cheng/v3/libp2p/protocols/webrtc_signal
@@ -33,6 +34,8 @@ type
 
     V3Libp2pHost =
         selfPeerId: types.V3Libp2pPeerId
+        hasDidIdentity: bool
+        didIdentity: did.V3DidIdentity
         selfResources: types.V3Libp2pNodeResource
         trustedInfra: bool
         workloadStickyKeys: str[]
@@ -62,6 +65,8 @@ fn v3Libp2pHostInit(seed: str): V3Libp2pHost =
     var bootstrapCount = 0
     var out: V3Libp2pHost
     out.selfPeerId = selfPeer
+    out.hasDidIdentity = false
+    out.didIdentity = did.v3DidIdentityZero()
     out.selfResources = resources.v3Libp2pNodeResourceCollectLocal()
     out.trustedInfra = false
     out.workloadStickyKeys = []
@@ -85,6 +90,62 @@ fn v3Libp2pHostInit(seed: str): V3Libp2pHost =
     out.webrtcBrowserSessionPeers = []
     out.webrtcBrowserSessions = []
     return out
+
+fn v3Libp2pHostInitWithDid(identity: did.V3DidIdentity): V3Libp2pHost =
+    var out = v3Libp2pHostInit(identity.deviceSeed)
+    out.selfPeerId = identity.selfDevice.devicePeerId
+    out.hasDidIdentity = true
+    out.didIdentity = did.v3DidIdentityClone(identity)
+    return out
+
+fn v3Libp2pHostInitWithDidStore(identityStorePath: str,
+                                rootSeedHint: str,
+                                deviceSeedHint: str,
+                                deviceLabelHint: str,
+                                epochSeconds: int64): Result[V3Libp2pHost] =
+    var out: V3Libp2pHost
+    let initRes = v3Libp2pHostInitWithDidStoreFill(out,
+                                                   identityStorePath,
+                                                   rootSeedHint,
+                                                   deviceSeedHint,
+                                                   deviceLabelHint,
+                                                   epochSeconds)
+    if IsErr(initRes):
+        return Err[V3Libp2pHost](Error(initRes))
+    return Ok[V3Libp2pHost](out)
+
+fn v3Libp2pHostInitWithDidStoreFill(out: var V3Libp2pHost,
+                                    identityStorePath: str,
+                                    rootSeedHint: str,
+                                    deviceSeedHint: str,
+                                    deviceLabelHint: str,
+                                    epochSeconds: int64): Result[bool] =
+    var identity = did.v3DidIdentityZero()
+    let identityRes = did.v3DidLoadOrCreateIdentityFill(identity,
+                                                        "",
+                                                        identityStorePath,
+                                                        rootSeedHint,
+                                                        deviceSeedHint,
+                                                        deviceLabelHint,
+                                                        epochSeconds)
+    if IsErr(identityRes):
+        return Err[bool](Error(identityRes))
+    out = v3Libp2pHostInitWithDid(identity)
+    return Ok[bool](true)
+
+fn v3Libp2pHostHasDidIdentity(host: V3Libp2pHost): bool =
+    return host.hasDidIdentity
+
+fn v3Libp2pHostDidText(host: V3Libp2pHost): str =
+    if !host.hasDidIdentity:
+        return ""
+    return did.v3DidIdentityDid(host.didIdentity)
+
+fn v3Libp2pHostSaveDidIdentity(identityStorePath: str,
+                               host: V3Libp2pHost): Result[bool] =
+    if !host.hasDidIdentity:
+        return Err[bool]("v3 libp2p host: missing did identity")
+    return did.v3DidSaveIdentity("", identityStorePath, host.didIdentity)
 
 fn v3Libp2pWebrtcSignalIngressCount(host: V3Libp2pHost): int32 =
     return host.webrtcSignalIngressPayloads.len

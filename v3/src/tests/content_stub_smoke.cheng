@@ -162,127 +162,6 @@ fn contentStubSmokePrepareArtifacts(out: var content.V3ContentPublishArtifacts,
     out.bundleCid = content.v3ContentPublishArtifactsExpectedBundleCid(out)
     return Ok[bool](true)
 
-fn contentStubSmokeFetchPullAndRebuild(requester: var host.V3Libp2pHost,
-                                       node: var host.V3Libp2pHost,
-                                       center: binary.V3LsmrAddress,
-                                       stub: content.V3ContentStub,
-                                       manifest: swarm.V3ErasureShardManifest,
-                                       params: swarm.V3ErasureEncodingParams,
-                                       shardPayloads: Bytes[],
-                                       expectedBlob: Bytes): bool =
-    var listenAddr: types.V3Libp2pMultiaddr
-    multiaddr.v3Libp2pMultiaddrFillTcp(listenAddr, "127.0.0.1", 6307)
-    let listenRes = host.v3Libp2pListen(node, listenAddr)
-    assert(IsOk(listenRes), "v3 content stub smoke: fetch listen")
-    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolSync)
-    host.v3Libp2pRegisterHandler(requester, types.v3Libp2pProtocolSync)
-    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolContent)
-    host.v3Libp2pRegisterHandler(requester, types.v3Libp2pProtocolContent)
-    let dialRes = host.v3Libp2pDial(requester,
-                                    node.selfPeerId,
-                                    listenAddr,
-                                    overlay.v3OverlayRoleEdgeRelayStore)
-    assert(IsOk(dialRes), "v3 content stub smoke: fetch dial")
-    let advertFetchRes = runtime_host.v3ContentRuntimeFetchAdvert(requester,
-                                                                  node,
-                                                                  node.selfPeerId,
-                                                                  overlay.v3OverlayScopeRegion,
-                                                                  center,
-                                                                  stub)
-    assert(IsOk(advertFetchRes), "v3 content stub smoke: fetch advert")
-    if !layout.fixedBytes32Equal(Value(advertFetchRes).advertCid, stub.advertCid):
-        return false
-    var serverRuntime = runtime.v3ContentRuntimeInit()
-    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(serverRuntime, manifest)
-    assert(IsOk(storeManifestRes), "v3 content stub smoke: store manifest")
-    var fetchedManifest = swarm.v3ErasureShardManifestZero()
-    let manifestFetchRes = runtime_host.v3ContentRuntimeRequestManifestFill(fetchedManifest,
-                                                                            requester,
-                                                                            node,
-                                                                            node.selfPeerId,
-                                                                            serverRuntime,
-                                                                            stub)
-    assert(IsOk(manifestFetchRes), "v3 content stub smoke: fetch manifest")
-    if !layout.fixedBytes32Equal(fetchedManifest.manifestCid, stub.manifestCid):
-        return false
-    if fetchedManifest.shardCount != 3:
-        return false
-    let recoveryPlanFetchRes = runtime_host.v3ContentRuntimeFetchRecoveryPlan(requester,
-                                                                              node,
-                                                                              node.selfPeerId,
-                                                                              overlay.v3OverlayScopeRegion,
-                                                                              center,
-                                                                              stub)
-    assert(IsOk(recoveryPlanFetchRes), "v3 content stub smoke: fetch recovery plan")
-    let fetchedPlan = Value(recoveryPlanFetchRes)
-    if !layout.fixedBytes32Equal(fetchedPlan.planCid, stub.recoveryPlanCid):
-        return false
-    let targetsRes = runtime.v3ContentRuntimeBuildPullTargets(fetchedManifest.manifestCid,
-                                                              fetchedManifest.shardIndices,
-                                                              fetchedManifest.shardPayloadCids,
-                                                              fetchedPlan.manifestCid,
-                                                              fetchedPlan.requestCount,
-                                                              fetchedPlan.requestPeerIds,
-                                                              fetchedPlan.requestShardIndices,
-                                                              fetchedPlan.requestShardCids)
-    assert(IsOk(targetsRes), "v3 content stub smoke: build pull targets")
-    let targets = Value(targetsRes)
-    if targets.len != shardPayloads.len:
-        return false
-    let requestsRes = runtime.v3ContentRuntimeBuildPullRequests(fetchedManifest.manifestCid,
-                                                                fetchedManifest.shardIndices,
-                                                                fetchedManifest.shardPayloadCids,
-                                                                fetchedPlan.manifestCid,
-                                                                fetchedPlan.requestCount,
-                                                                fetchedPlan.requestPeerIds,
-                                                                fetchedPlan.requestShardIndices,
-                                                                fetchedPlan.requestShardCids)
-    assert(IsOk(requestsRes), "v3 content stub smoke: build pull requests")
-    let requests = Value(requestsRes)
-    if requests.len != shardPayloads.len:
-        return false
-    for i in 0..<requests.len:
-        let shardIndex = requests[i].shardIndex
-        var response = swarm.v3ErasureShardPullResponseZero()
-        let responseFillRes = swarm.v3ErasureShardPullResponseFill(response,
-                                                                   requests[i],
-                                                                   shardPayloads[shardIndex])
-        assert(IsOk(responseFillRes), "v3 content stub smoke: seed shard response")
-        let storeRes = runtime.v3ContentRuntimeStoreShardResponse(serverRuntime, response)
-        assert(IsOk(storeRes), "v3 content stub smoke: store server cache")
-    var clientRuntime = runtime.v3ContentRuntimeInit()
-    let openStreamCount0 = requester.openStreamProtocols.len
-    var pulled: swarm.V3ErasureShardPullResponse[]
-    pulled = []
-    for i in 0..<targets.len:
-        if !layout.fixedBytes32Equal(targets[i].peerId, node.selfPeerId.value):
-            return false
-        let pullRes = runtime_host.v3ContentRuntimeRequestShardPull(requester,
-                                                                    node,
-                                                                    node.selfPeerId,
-                                                                    serverRuntime,
-                                                                    targets[i].request)
-        assert(IsOk(pullRes), "v3 content stub smoke: pull shard")
-        let pulledResponse = Value(pullRes)
-        let clientStoreRes = runtime.v3ContentRuntimeStoreShardResponse(clientRuntime, pulledResponse)
-        assert(IsOk(clientStoreRes), "v3 content stub smoke: store client cache")
-        add(pulled, pulledResponse)
-    if requester.openStreamProtocols.len - openStreamCount0 != targets.len:
-        return false
-    var cachedShard: Bytes
-    assert(runtime.v3ContentRuntimeCachedShard(clientRuntime, targets[0].request, cachedShard),
-        "v3 content stub smoke: cached shard")
-    if !contentStubSmokeBytesEqual(cachedShard, shardPayloads[targets[0].request.shardIndex]):
-        return false
-    let rebuildRes = runtime.v3ContentRuntimeRebuildBlobAgainstStub(stub,
-                                                                    fetchedManifest,
-                                                                    params,
-                                                                    pulled)
-    assert(IsOk(rebuildRes), "v3 content stub smoke: rebuild against stub")
-    if !contentStubSmokeBytesEqual(Value(rebuildRes), expectedBlob):
-        return false
-    return true
-
 fn main(): int32 =
     var node = host.v3Libp2pHostInit("content.stub.node")
     var requester = host.v3Libp2pHostInit("content.stub.requester")
@@ -411,15 +290,123 @@ fn main(): int32 =
     assert(IsOk(stubDecodedRes), "v3 content stub smoke: stub decode")
     assert(layout.fixedBytes32Equal(Value(stubDecodedRes).stubCid, stub.stubCid),
         "v3 content stub smoke: stub decoded cid")
-    assert(contentStubSmokeFetchPullAndRebuild(requester,
-                                               node,
-                                               center,
-                                               stub,
-                                               manifest,
-                                               params,
-                                               shardPayloads,
-                                               blob),
-        "v3 content stub smoke: fetch/pull/rebuild")
+    var listenAddr: types.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(listenAddr, "127.0.0.1", 6307)
+    let listenRes = host.v3Libp2pListen(node, listenAddr)
+    assert(IsOk(listenRes), "v3 content stub smoke: fetch listen")
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(requester, types.v3Libp2pProtocolSync)
+    host.v3Libp2pRegisterHandler(node, types.v3Libp2pProtocolContent)
+    host.v3Libp2pRegisterHandler(requester, types.v3Libp2pProtocolContent)
+    let dialRes = host.v3Libp2pDial(requester,
+                                    node.selfPeerId,
+                                    listenAddr,
+                                    overlay.v3OverlayRoleEdgeRelayStore)
+    assert(IsOk(dialRes), "v3 content stub smoke: fetch dial")
+    let advertFetchRes = runtime_host.v3ContentRuntimeFetchAdvert(requester,
+                                                                  node,
+                                                                  node.selfPeerId,
+                                                                  overlay.v3OverlayScopeRegion,
+                                                                  center,
+                                                                  stub)
+    assert(IsOk(advertFetchRes), "v3 content stub smoke: fetch advert")
+    assert(layout.fixedBytes32Equal(Value(advertFetchRes).advertCid, stub.advertCid),
+        "v3 content stub smoke: advert cid")
+
+    var serverRuntime = runtime.v3ContentRuntimeInit()
+    let storeManifestRes = runtime.v3ContentRuntimeStoreManifest(serverRuntime, manifest)
+    assert(IsOk(storeManifestRes), "v3 content stub smoke: store manifest")
+
+    var fetchedManifest = swarm.v3ErasureShardManifestZero()
+    let manifestFetchRes = runtime_host.v3ContentRuntimeRequestManifestFill(fetchedManifest,
+                                                                            requester,
+                                                                            node,
+                                                                            node.selfPeerId,
+                                                                            serverRuntime,
+                                                                            stub)
+    assert(IsOk(manifestFetchRes), "v3 content stub smoke: fetch manifest")
+    assert(layout.fixedBytes32Equal(fetchedManifest.manifestCid, stub.manifestCid),
+        "v3 content stub smoke: fetched manifest cid")
+    assert(fetchedManifest.shardCount == 3, "v3 content stub smoke: fetched shard count")
+
+    let recoveryPlanFetchRes = runtime_host.v3ContentRuntimeFetchRecoveryPlan(requester,
+                                                                              node,
+                                                                              node.selfPeerId,
+                                                                              overlay.v3OverlayScopeRegion,
+                                                                              center,
+                                                                              stub)
+    assert(IsOk(recoveryPlanFetchRes), "v3 content stub smoke: fetch recovery plan")
+    let fetchedPlan = Value(recoveryPlanFetchRes)
+    assert(layout.fixedBytes32Equal(fetchedPlan.planCid, stub.recoveryPlanCid),
+        "v3 content stub smoke: fetched plan cid")
+
+    let targetsRes = runtime.v3ContentRuntimeBuildPullTargets(fetchedManifest.manifestCid,
+                                                              fetchedManifest.shardIndices,
+                                                              fetchedManifest.shardPayloadCids,
+                                                              fetchedPlan.manifestCid,
+                                                              fetchedPlan.requestCount,
+                                                              fetchedPlan.requestPeerIds,
+                                                              fetchedPlan.requestShardIndices,
+                                                              fetchedPlan.requestShardCids)
+    assert(IsOk(targetsRes), "v3 content stub smoke: build pull targets")
+    let targets = Value(targetsRes)
+    assert(targets.len == shardPayloads.len, "v3 content stub smoke: target count")
+
+    let requestsRes = runtime.v3ContentRuntimeBuildPullRequests(fetchedManifest.manifestCid,
+                                                                fetchedManifest.shardIndices,
+                                                                fetchedManifest.shardPayloadCids,
+                                                                fetchedPlan.manifestCid,
+                                                                fetchedPlan.requestCount,
+                                                                fetchedPlan.requestPeerIds,
+                                                                fetchedPlan.requestShardIndices,
+                                                                fetchedPlan.requestShardCids)
+    assert(IsOk(requestsRes), "v3 content stub smoke: build pull requests")
+    let requests = Value(requestsRes)
+    assert(requests.len == shardPayloads.len, "v3 content stub smoke: request count")
+
+    for i in 0..<requests.len:
+        let shardIndex = requests[i].shardIndex
+        var response = swarm.v3ErasureShardPullResponseZero()
+        let responseFillRes = swarm.v3ErasureShardPullResponseFill(response,
+                                                                   requests[i],
+                                                                   shardPayloads[shardIndex])
+        assert(IsOk(responseFillRes), "v3 content stub smoke: seed shard response")
+        let storeRes = runtime.v3ContentRuntimeStoreShardResponse(serverRuntime, response)
+        assert(IsOk(storeRes), "v3 content stub smoke: store server cache")
+
+    var clientRuntime = runtime.v3ContentRuntimeInit()
+    let openStreamCount0 = requester.openStreamProtocols.len
+    var pulled: swarm.V3ErasureShardPullResponse[]
+    pulled = []
+    for i in 0..<targets.len:
+        assert(layout.fixedBytes32Equal(targets[i].peerId, node.selfPeerId.value),
+            "v3 content stub smoke: target peer")
+        let pullRes = runtime_host.v3ContentRuntimeRequestShardPull(requester,
+                                                                    node,
+                                                                    node.selfPeerId,
+                                                                    serverRuntime,
+                                                                    targets[i].request)
+        assert(IsOk(pullRes), "v3 content stub smoke: pull shard")
+        let pulledResponse = Value(pullRes)
+        let clientStoreRes = runtime.v3ContentRuntimeStoreShardResponse(clientRuntime, pulledResponse)
+        assert(IsOk(clientStoreRes), "v3 content stub smoke: store client cache")
+        add(pulled, pulledResponse)
+    assert(requester.openStreamProtocols.len - openStreamCount0 == targets.len,
+        "v3 content stub smoke: open stream count")
+
+    var cachedShard: Bytes
+    assert(runtime.v3ContentRuntimeCachedShard(clientRuntime, targets[0].request, cachedShard),
+        "v3 content stub smoke: cached shard")
+    assert(contentStubSmokeBytesEqual(cachedShard, shardPayloads[targets[0].request.shardIndex]),
+        "v3 content stub smoke: cached shard bytes")
+
+    let rebuildRes = runtime.v3ContentRuntimeRebuildBlobAgainstStub(stub,
+                                                                    fetchedManifest,
+                                                                    params,
+                                                                    pulled)
+    assert(IsOk(rebuildRes), "v3 content stub smoke: rebuild against stub")
+    assert(contentStubSmokeBytesEqual(Value(rebuildRes), blob),
+        "v3 content stub smoke: rebuilt blob")
 
     assert(contentStubSmokeBytesEqual(bytesFromString("alpha-beta--gamma!"),
                                       contentStubSmokeBlob(bytesFromString("alpha-"),

@@ -1,4 +1,572 @@
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/project/rwad_accumulator as accum
+import cheng/v3/project/rwad_serial_state_machine as serial
 import cheng/v3/project/rwad_bft_state_machine as rwad
+import cheng/v3/tooling/path as v3path
 
-fn main(): int32 =
-    return rwad.v3RwadBftSelfTest()
+const
+    v3RwadBftStateMagic: str = "v3.rwad.bft.state.v1"
+
+fn v3RwadMainUsage() =
+    os.writeLine(os.get_stdout(), "usage: rwad_bft_state_machine <command> [flags]")
+    os.writeLine(os.get_stdout(), "")
+    os.writeLine(os.get_stdout(), "commands:")
+    os.writeLine(os.get_stdout(), "  self-test")
+    os.writeLine(os.get_stdout(), "  init --state:<file> --app-id:<id> [--force]")
+    os.writeLine(os.get_stdout(), "  mint --state:<file> --height:<n> --owner:<text> --amount:<n>")
+    os.writeLine(os.get_stdout(), "  transfer --state:<file> --height:<n> --input-note-id:<n> --from:<text> --to:<text> --start:<n> --end:<n>")
+    os.writeLine(os.get_stdout(), "  query-owner --state:<file> --owner:<text>")
+    os.writeLine(os.get_stdout(), "  query-app-hash --state:<file>")
+    os.writeLine(os.get_stdout(), "  show-state --state:<file>")
+    os.writeLine(os.get_stdout(), "  note-proof --state:<file> --note-id:<n>")
+    os.writeLine(os.get_stdout(), "  nullifier-proof --state:<file> --note-id:<n>")
+
+fn v3RwadMainInt64Text(value: int64): str =
+    return strings.int64ToStr(value)
+
+fn v3RwadMainHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3RwadMainBytesFromHex(text: str): Result[Bytes] =
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("v3 rwad: invalid hex length")
+    var out = bytesAlloc(len(text) / 2)
+    var i = 0
+    while i < len(text):
+        let hi = v3RwadMainHexValue(text[i])
+        let lo = v3RwadMainHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 rwad: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3RwadMainReadRequiredFlag(flag: str,
+                              outValue: var str): Result[bool] =
+    outValue = ""
+    if !cmdline.readFlagValue(flag, outValue):
+        return Err[bool]("v3 rwad: missing " + flag)
+    outValue = strutil.strip(outValue)
+    if len(outValue) <= 0:
+        return Err[bool]("v3 rwad: empty " + flag)
+    return Ok[bool](true)
+
+fn v3RwadMainParseInt64Text(raw: str): Result[int64] =
+    let text = strutil.strip(raw)
+    if len(text) <= 0:
+        return Err[int64]("v3 rwad: invalid integer: " + raw)
+    var sign = int64(1)
+    var i = int32(0)
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        sign = int64(-1)
+        i = 1
+    if i >= len(text):
+        return Err[int64]("v3 rwad: invalid integer: " + raw)
+    var value = int64(0)
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int64]("v3 rwad: invalid integer: " + raw)
+        let digit = int64(int32(ch) - int32('0'))
+        value = value * int64(10) + digit
+        i = i + 1
+    return Ok[int64](value * sign)
+
+fn v3RwadMainReadRequiredInt64Flag(flag: str,
+                                   outValue: var int64): Result[bool] =
+    var raw = ""
+    let readRes = v3RwadMainReadRequiredFlag(flag, raw)
+    if IsErr(readRes):
+        return Err[bool](Error(readRes))
+    let parsedRes = v3RwadMainParseInt64Text(raw)
+    if IsErr(parsedRes):
+        return Err[bool]("v3 rwad: invalid integer for " + flag + ": " + raw)
+    outValue = Value(parsedRes)
+    return Ok[bool](true)
+
+fn v3RwadMainReadRequiredStatePath(outValue: var str): Result[bool] =
+    return v3RwadMainReadRequiredFlag("--state", outValue)
+
+fn v3RwadMainPrefixValue(line: str,
+                         prefix: str): str =
+    if !strutil.startsWith(line, prefix):
+        return ""
+    return strutil.strip(v3path.v3TextSlice(line, len(prefix), len(line) - len(prefix)))
+
+fn v3RwadMainParseInt64(text: str,
+                        outValue: var int64): bool =
+    let parsedRes = v3RwadMainParseInt64Text(text)
+    if IsErr(parsedRes):
+        return false
+    outValue = Value(parsedRes)
+    return true
+
+fn v3RwadMainParseFixed32(text: str,
+                          outValue: var layout.FixedBytes32): bool =
+    let fixedRes = layout.fixedBytes32FromHex(strutil.strip(text))
+    if IsErr(fixedRes):
+        return false
+    outValue = Value(fixedRes)
+    return true
+
+fn v3RwadMainStateText(machine: var rwad.V3RwadBftStateMachine): str =
+    var out = ""
+    out = out + v3RwadBftStateMagic + "\n"
+    out = out + "app_id_hex=" + bytesToHex(bytesFromString(machine.ledger.appId)) + "\n"
+    out = out + "next_serial=" + v3RwadMainInt64Text(machine.ledger.nextSerial) + "\n"
+    out = out + "next_note_id=" + v3RwadMainInt64Text(machine.ledger.nextNoteId) + "\n"
+    out = out + "last_finalized_height=" + v3RwadMainInt64Text(machine.ledger.lastFinalizedHeight) + "\n"
+    out = out + "last_apply_order_key=" + v3RwadMainInt64Text(machine.ledger.lastApplyOrderKey) + "\n"
+    out = out + "last_commit_app_hash=" + layout.fixedBytes32Hex(machine.ledger.lastCommitAppHash) + "\n"
+    out = out + "note_count=" + intToStr(machine.ledger.notes.len) + "\n"
+    for i in 0..<machine.ledger.notes.len:
+        let note = machine.ledger.notes[i]
+        out = out + "note[" + intToStr(i) + "]="
+        out = out + v3RwadMainInt64Text(note.noteId)
+        out = out + "|"
+        out = out + v3RwadMainInt64Text(note.startSerial)
+        out = out + "|"
+        out = out + v3RwadMainInt64Text(note.endSerial)
+        out = out + "|"
+        out = out + layout.fixedBytes32Hex(note.ownerId)
+        out = out + "|"
+        out = out + v3RwadMainInt64Text(note.createdHeight)
+        out = out + "|"
+        if note.live:
+            out = out + "1"
+        else:
+            out = out + "0"
+        out = out + "\n"
+    out = out + "nullifier_count=" + intToStr(machine.ledger.nullifiers.len) + "\n"
+    for i in 0..<machine.ledger.nullifiers.len:
+        let item = machine.ledger.nullifiers[i]
+        out = out + "nullifier[" + intToStr(i) + "]="
+        out = out + v3RwadMainInt64Text(item.noteId)
+        out = out + "|"
+        out = out + layout.fixedBytes32Hex(item.nullifierCid)
+        out = out + "|"
+        out = out + v3RwadMainInt64Text(item.spendHeight)
+        out = out + "\n"
+    return out
+
+fn v3RwadMainWriteState(pathRaw: str,
+                        machine: var rwad.V3RwadBftStateMachine): bool =
+    let stateText = v3RwadMainStateText(machine)
+    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, stateText)
+
+fn v3RwadMainParseNote(line: str,
+                       out: var serial.V3RwadIntervalNote): bool =
+    let prefixPos = strutil.split(line, '=')
+    if prefixPos.len != 2:
+        return false
+    let parts = strutil.split(prefixPos[1], '|')
+    if parts.len != 6:
+        return false
+    if !v3RwadMainParseInt64(parts[0], out.noteId):
+        return false
+    if !v3RwadMainParseInt64(parts[1], out.startSerial):
+        return false
+    if !v3RwadMainParseInt64(parts[2], out.endSerial):
+        return false
+    if !v3RwadMainParseFixed32(parts[3], out.ownerId):
+        return false
+    if !v3RwadMainParseInt64(parts[4], out.createdHeight):
+        return false
+    let liveText = strutil.strip(parts[5])
+    if liveText == "1":
+        out.live = true
+    elif liveText == "0":
+        out.live = false
+    else:
+        return false
+    return true
+
+fn v3RwadMainParseNullifier(line: str,
+                            out: var serial.V3RwadNullifier): bool =
+    let prefixPos = strutil.split(line, '=')
+    if prefixPos.len != 2:
+        return false
+    let parts = strutil.split(prefixPos[1], '|')
+    if parts.len != 3:
+        return false
+    if !v3RwadMainParseInt64(parts[0], out.noteId):
+        return false
+    if !v3RwadMainParseFixed32(parts[1], out.nullifierCid):
+        return false
+    if !v3RwadMainParseInt64(parts[2], out.spendHeight):
+        return false
+    return true
+
+fn v3RwadMainLoadState(pathRaw: str): Result[rwad.V3RwadBftStateMachine] =
+    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let trimmedText = strutil.strip(text)
+    if len(trimmedText) <= 0:
+        return Err[rwad.V3RwadBftStateMachine]("v3 rwad: missing or empty state file: " + pathRaw)
+    let lines = strutil.split(text, '\n')
+    var sawMagic = false
+    var appId = ""
+    var nextSerial = int64(1)
+    var nextNoteId = int64(1)
+    var lastFinalizedHeight = int64(0)
+    var lastApplyOrderKey = int64(0)
+    var lastCommitAppHash = layout.fixedBytes32Zero()
+    var notes: serial.V3RwadIntervalNote[]
+    var nullifiers: serial.V3RwadNullifier[]
+    notes = []
+    nullifiers = []
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if line == v3RwadBftStateMagic:
+            sawMagic = true
+        elif strutil.startsWith(line, "app_id_hex="):
+            let appRes = v3RwadMainBytesFromHex(v3RwadMainPrefixValue(line, "app_id_hex="))
+            if IsErr(appRes):
+                return Err[rwad.V3RwadBftStateMachine](Error(appRes))
+            appId = bytesToString(Value(appRes))
+        elif strutil.startsWith(line, "next_serial="):
+            if !v3RwadMainParseInt64(v3RwadMainPrefixValue(line, "next_serial="), nextSerial):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid next_serial")
+        elif strutil.startsWith(line, "next_note_id="):
+            if !v3RwadMainParseInt64(v3RwadMainPrefixValue(line, "next_note_id="), nextNoteId):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid next_note_id")
+        elif strutil.startsWith(line, "last_finalized_height="):
+            if !v3RwadMainParseInt64(v3RwadMainPrefixValue(line, "last_finalized_height="), lastFinalizedHeight):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid last_finalized_height")
+        elif strutil.startsWith(line, "last_apply_order_key="):
+            if !v3RwadMainParseInt64(v3RwadMainPrefixValue(line, "last_apply_order_key="), lastApplyOrderKey):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid last_apply_order_key")
+        elif strutil.startsWith(line, "last_commit_app_hash="):
+            if !v3RwadMainParseFixed32(v3RwadMainPrefixValue(line, "last_commit_app_hash="), lastCommitAppHash):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid last_commit_app_hash")
+        elif strutil.startsWith(line, "note["):
+            var note: serial.V3RwadIntervalNote
+            if !v3RwadMainParseNote(line, note):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid note line")
+            add(notes, note)
+        elif strutil.startsWith(line, "nullifier["):
+            var item: serial.V3RwadNullifier
+            if !v3RwadMainParseNullifier(line, item):
+                return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid nullifier line")
+            add(nullifiers, item)
+    if !sawMagic || len(appId) <= 0:
+        return Err[rwad.V3RwadBftStateMachine]("v3 rwad: invalid state header")
+    var machine = rwad.v3RwadBftStateMachineInit(appId)
+    machine.ledger.nextSerial = nextSerial
+    machine.ledger.nextNoteId = nextNoteId
+    machine.ledger.lastFinalizedHeight = lastFinalizedHeight
+    machine.ledger.lastApplyOrderKey = lastApplyOrderKey
+    machine.ledger.lastCommitAppHash = lastCommitAppHash
+    machine.ledger.notes = notes
+    machine.ledger.nullifiers = nullifiers
+    return Ok[rwad.V3RwadBftStateMachine](machine)
+
+fn v3RwadMainCommitReport(machine: var rwad.V3RwadBftStateMachine): str =
+    let commit = serial.v3RwadStateMachineCommit(machine.ledger)
+    var out = ""
+    out = out + "height=" + v3RwadMainInt64Text(commit.height) + "\n"
+    out = out + "next_serial=" + v3RwadMainInt64Text(commit.nextSerial) + "\n"
+    out = out + "next_note_id=" + v3RwadMainInt64Text(commit.nextNoteId) + "\n"
+    out = out + "live_note_count=" + intToStr(commit.liveNoteCount) + "\n"
+    out = out + "nullifier_count=" + intToStr(commit.nullifierCount) + "\n"
+    out = out + "serial_root=" + layout.fixedBytes32Hex(commit.serialRoot) + "\n"
+    out = out + "nullifier_root=" + layout.fixedBytes32Hex(commit.nullifierRoot) + "\n"
+    out = out + "serial_accumulator_root=" + layout.fixedBytes32Hex(commit.serialAccumulatorRoot) + "\n"
+    out = out + "nullifier_accumulator_root=" + layout.fixedBytes32Hex(commit.nullifierAccumulatorRoot) + "\n"
+    out = out + "app_hash=" + layout.fixedBytes32Hex(commit.appHash)
+    return out
+
+fn v3RwadMainBlockSummaryReport(summary: rwad.V3RwadBftBlockSummary): str =
+    var out = ""
+    out = out + "height=" + v3RwadMainInt64Text(summary.height) + "\n"
+    out = out + "tx_count=" + intToStr(summary.txCount) + "\n"
+    out = out + "applied_count=" + intToStr(summary.appliedCount) + "\n"
+    out = out + "rejected_count=" + intToStr(summary.rejectedCount) + "\n"
+    out = out + "serial_root=" + layout.fixedBytes32Hex(summary.serialRoot) + "\n"
+    out = out + "nullifier_root=" + layout.fixedBytes32Hex(summary.nullifierRoot) + "\n"
+    out = out + "serial_accumulator_root=" + layout.fixedBytes32Hex(summary.serialAccumulatorRoot) + "\n"
+    out = out + "nullifier_accumulator_root=" + layout.fixedBytes32Hex(summary.nullifierAccumulatorRoot) + "\n"
+    out = out + "app_hash=" + layout.fixedBytes32Hex(summary.appHash)
+    return out
+
+fn v3RwadMainProofReport(proof: var accum.V3RwadAccumulatorProof): str =
+    var out = ""
+    out = out + "leaf_cid=" + layout.fixedBytes32Hex(proof.leafCid) + "\n"
+    out = out + "leaf_index=" + intToStr(proof.leafIndex) + "\n"
+    out = out + "leaf_count=" + intToStr(proof.leafCount) + "\n"
+    out = out + "sibling_count=" + intToStr(proof.siblingCount) + "\n"
+    for i in 0..<proof.siblingHashes.len:
+        out = out + "sibling[" + intToStr(i) + "]=" + layout.fixedBytes32Hex(proof.siblingHashes[i]) + "\n"
+    out = out + "root_cid=" + layout.fixedBytes32Hex(proof.rootCid) + "\n"
+    out = out + "proof_valid=" + intToStr(accum.v3RwadAccumulatorProofVerify(proof) ? 1 : 0)
+    return out
+
+fn v3RwadMainInitCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let absoluteStatePath = v3path.v3PathAbsolute(os.getCurrentDir(), statePath)
+    if v3path.v3PathFileExists(absoluteStatePath) && !cmdline.hasFlag("--force"):
+        os.writeLine(os.get_stderr(), "v3 rwad: state already exists: " + absoluteStatePath + " (pass --force to overwrite)")
+        return 2
+    var appId = ""
+    let appRes = v3RwadMainReadRequiredFlag("--app-id", appId)
+    if IsErr(appRes):
+        os.writeLine(os.get_stderr(), Error(appRes))
+        return 2
+    var machine = rwad.v3RwadBftStateMachineInit(appId)
+    if !v3RwadMainWriteState(statePath, machine):
+        os.writeLine(os.get_stderr(), "v3 rwad: failed to write state: " + absoluteStatePath)
+        return 2
+    os.writeLine(os.get_stdout(), v3RwadMainCommitReport(machine))
+    return 0
+
+fn v3RwadMainMintCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var machine = Value(loadRes)
+    var height = int64(0)
+    let heightRes = v3RwadMainReadRequiredInt64Flag("--height", height)
+    if IsErr(heightRes):
+        os.writeLine(os.get_stderr(), Error(heightRes))
+        return 2
+    var ownerText = ""
+    let ownerRes = v3RwadMainReadRequiredFlag("--owner", ownerText)
+    if IsErr(ownerRes):
+        os.writeLine(os.get_stderr(), Error(ownerRes))
+        return 2
+    var amount = int64(0)
+    let amountRes = v3RwadMainReadRequiredInt64Flag("--amount", amount)
+    if IsErr(amountRes):
+        os.writeLine(os.get_stderr(), Error(amountRes))
+        return 2
+    let tx = rwad.v3RwadBftTxMint(serial.v3RwadOwnerIdFromText(ownerText), amount)
+    var block: rwad.V3RwadBftTx[]
+    block = []
+    add(block, tx)
+    var summary = rwad.v3RwadBftBlockSummaryZero(height)
+    rwad.v3RwadBftStateMachineFinalizeBlockSummary(machine, height, block, summary)
+    if summary.appliedCount != 1 || summary.rejectedCount != 0:
+        os.writeLine(os.get_stderr(), v3RwadMainBlockSummaryReport(summary))
+        return 2
+    if !v3RwadMainWriteState(statePath, machine):
+        os.writeLine(os.get_stderr(), "v3 rwad: failed to persist state: " + statePath)
+        return 2
+    os.writeLine(os.get_stdout(), v3RwadMainBlockSummaryReport(summary))
+    return 0
+
+fn v3RwadMainTransferCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var machine = Value(loadRes)
+    var height = int64(0)
+    var inputNoteId = int64(0)
+    var spendStart = int64(0)
+    var spendEnd = int64(0)
+    let heightRes = v3RwadMainReadRequiredInt64Flag("--height", height)
+    let noteRes = v3RwadMainReadRequiredInt64Flag("--input-note-id", inputNoteId)
+    let startRes = v3RwadMainReadRequiredInt64Flag("--start", spendStart)
+    let endRes = v3RwadMainReadRequiredInt64Flag("--end", spendEnd)
+    if IsErr(heightRes) || IsErr(noteRes) || IsErr(startRes) || IsErr(endRes):
+        if IsErr(heightRes):
+            os.writeLine(os.get_stderr(), Error(heightRes))
+        elif IsErr(noteRes):
+            os.writeLine(os.get_stderr(), Error(noteRes))
+        elif IsErr(startRes):
+            os.writeLine(os.get_stderr(), Error(startRes))
+        else:
+            os.writeLine(os.get_stderr(), Error(endRes))
+        return 2
+    var fromOwnerText = ""
+    var toOwnerText = ""
+    let fromRes = v3RwadMainReadRequiredFlag("--from", fromOwnerText)
+    let toRes = v3RwadMainReadRequiredFlag("--to", toOwnerText)
+    if IsErr(fromRes) || IsErr(toRes):
+        if IsErr(fromRes):
+            os.writeLine(os.get_stderr(), Error(fromRes))
+        else:
+            os.writeLine(os.get_stderr(), Error(toRes))
+        return 2
+    let tx = rwad.v3RwadBftTxTransfer(inputNoteId,
+                                      serial.v3RwadOwnerIdFromText(fromOwnerText),
+                                      serial.v3RwadOwnerIdFromText(toOwnerText),
+                                      spendStart,
+                                      spendEnd)
+    var block: rwad.V3RwadBftTx[]
+    block = []
+    add(block, tx)
+    var summary = rwad.v3RwadBftBlockSummaryZero(height)
+    rwad.v3RwadBftStateMachineFinalizeBlockSummary(machine, height, block, summary)
+    if summary.appliedCount != 1 || summary.rejectedCount != 0:
+        os.writeLine(os.get_stderr(), v3RwadMainBlockSummaryReport(summary))
+        return 2
+    if !v3RwadMainWriteState(statePath, machine):
+        os.writeLine(os.get_stderr(), "v3 rwad: failed to persist state: " + statePath)
+        return 2
+    os.writeLine(os.get_stdout(), v3RwadMainBlockSummaryReport(summary))
+    return 0
+
+fn v3RwadMainQueryOwnerCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let machine = Value(loadRes)
+    var ownerText = ""
+    let ownerRes = v3RwadMainReadRequiredFlag("--owner", ownerText)
+    if IsErr(ownerRes):
+        os.writeLine(os.get_stderr(), Error(ownerRes))
+        return 2
+    let ownerId = serial.v3RwadOwnerIdFromText(ownerText)
+    let query = rwad.v3RwadBftStateMachineQueryOwner(machine, ownerId)
+    os.writeLine(os.get_stdout(), "owner_id=" + layout.fixedBytes32Hex(ownerId))
+    os.writeLine(os.get_stdout(), "balance=" + v3RwadMainInt64Text(query.balance))
+    os.writeLine(os.get_stdout(), "live_note_count=" + intToStr(query.liveNoteCount))
+    os.writeLine(os.get_stdout(), "owner_root=" + layout.fixedBytes32Hex(query.ownerRoot))
+    os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(query.appHash))
+    os.writeLine(os.get_stdout(), "height=" + v3RwadMainInt64Text(query.height))
+    return 0
+
+fn v3RwadMainQueryAppHashCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let machine = Value(loadRes)
+    os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(rwad.v3RwadBftStateMachineQueryAppHash(machine)))
+    return 0
+
+fn v3RwadMainShowStateCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    var machine = Value(loadRes)
+    os.writeLine(os.get_stdout(), v3RwadMainCommitReport(machine))
+    return 0
+
+fn v3RwadMainNoteProofCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let machine = Value(loadRes)
+    var noteId = int64(0)
+    let noteRes = v3RwadMainReadRequiredInt64Flag("--note-id", noteId)
+    if IsErr(noteRes):
+        os.writeLine(os.get_stderr(), Error(noteRes))
+        return 2
+    var proof: accum.V3RwadAccumulatorProof
+    if !serial.v3RwadSerialAccumulatorProof(machine.ledger, noteId, proof):
+        os.writeLine(os.get_stderr(), "v3 rwad: missing live note for proof: " + v3RwadMainInt64Text(noteId))
+        return 2
+    os.writeLine(os.get_stdout(), v3RwadMainProofReport(proof))
+    return 0
+
+fn v3RwadMainNullifierProofCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3RwadMainReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    let loadRes = v3RwadMainLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let machine = Value(loadRes)
+    var noteId = int64(0)
+    let noteRes = v3RwadMainReadRequiredInt64Flag("--note-id", noteId)
+    if IsErr(noteRes):
+        os.writeLine(os.get_stderr(), Error(noteRes))
+        return 2
+    var proof: accum.V3RwadAccumulatorProof
+    if !serial.v3RwadNullifierAccumulatorProof(machine.ledger, noteId, proof):
+        os.writeLine(os.get_stderr(), "v3 rwad: missing nullifier for note: " + v3RwadMainInt64Text(noteId))
+        return 2
+    os.writeLine(os.get_stdout(), v3RwadMainProofReport(proof))
+    return 0
+
+fn main(argc: int32, argv: ptr): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let count = cmdline.paramCount()
+    if count <= 0:
+        v3RwadMainUsage()
+        return 0
+    let cmd = cmdline.paramStr(1)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3RwadMainUsage()
+        return 0
+    if cmd == "self-test":
+        return rwad.v3RwadBftSelfTest()
+    if cmd == "init":
+        return v3RwadMainInitCommand()
+    if cmd == "mint":
+        return v3RwadMainMintCommand()
+    if cmd == "transfer":
+        return v3RwadMainTransferCommand()
+    if cmd == "query-owner":
+        return v3RwadMainQueryOwnerCommand()
+    if cmd == "query-app-hash":
+        return v3RwadMainQueryAppHashCommand()
+    if cmd == "show-state":
+        return v3RwadMainShowStateCommand()
+    if cmd == "note-proof":
+        return v3RwadMainNoteProofCommand()
+    if cmd == "nullifier-proof":
+        return v3RwadMainNullifierProofCommand()
+    os.writeLine(os.get_stderr(), "v3 rwad: unknown command: " + cmd)
+    v3RwadMainUsage()
+    return 2

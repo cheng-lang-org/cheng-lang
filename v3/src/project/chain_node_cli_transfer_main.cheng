@@ -1,0 +1,42 @@
+import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node as node
+import cheng/v3/std/bytes_layout as layout
+
+importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+
+fn main(): int32 =
+    var statePath: str
+    statePath = ""
+    let hasStatePath = driver_c_read_flag_value_bridge("--state", statePath)
+    if !hasStatePath || cli.v3ChainNodeCliTextEmpty(statePath):
+        echo("v3 chain_node: missing --state")
+        return 2
+    let loadRes = cli.v3ChainNodeCliLoadState(statePath)
+    if IsErr(loadRes):
+        echo(Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let assetId = driver_c_read_int32_flag_or_default_bridge("--asset", -1)
+    let fromAccount = driver_c_read_int32_flag_or_default_bridge("--from", -1)
+    let toAccount = driver_c_read_int32_flag_or_default_bridge("--to", -1)
+    var amount: int64 = int64(0)
+    let amountRes = cli.v3ChainNodeCliReadRequiredInt64Flag("--amount", amount)
+    if assetId <= 0 || fromAccount <= 0 || toAccount <= 0 || IsErr(amountRes):
+        if IsErr(amountRes):
+            echo(Error(amountRes))
+        else:
+            echo("v3 chain_node: transfer requires --asset --from --to --amount")
+        return 2
+    let transferRes = node.v3ChainNodeTransfer(state, assetId, fromAccount, toAccount, amount)
+    if !transferRes.ok:
+        echo(transferRes.error)
+        return 2
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !cli.v3ChainNodeCliWriteState(statePath, snapshot):
+        echo("v3 chain_node: failed to persist state: " +
+             cli.v3ChainNodeCliAbsolutePath(statePath))
+        return 2
+    echo("event_cid=" + layout.fixedBytes32Hex(transferRes.value))
+    echo(cli.v3ChainNodeCliSnapshotReport(snapshot))
+    return 0

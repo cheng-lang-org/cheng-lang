@@ -46,6 +46,7 @@ compiler_pipeline_stub_smoke
 lowering_plan_smoke
 compiler_equivalence_smoke
 compiler_publish_smoke
+bft_three_replica_smoke
 primary_object_plan_smoke
 object_native_link_plan_smoke
 ffi_handle_smoke
@@ -53,10 +54,15 @@ program_selfhost_smoke
 csg_smoke
 consensus_smoke
 chain_node_smoke
+chain_node_zero_snapshot_replay_smoke
 chain_node_tailnet_smoke
 chain_node_libp2p_smoke
 bft_finalize_summary_smoke
 bft_state_machine_smoke
+oracle_plane_smoke
+oracle_bft_state_machine_smoke
+oracle_bft_three_replica_smoke
+oracle_runtime_host_smoke
 overlay_contracts_smoke
 pubsub_smoke
 dag_mempool_smoke
@@ -97,6 +103,7 @@ lsmr_bagua_prefix_tree_smoke
 udp_importc_smoke
 mobile_bridge_smoke
 mobile_sdk_smoke
+did_identity_smoke
 "
 
 run_tail_process_smoke=1
@@ -114,7 +121,9 @@ do
 done
 
 if [ "$run_tail_process_smoke" = "1" ]; then
+  sh "$root/v3/tooling/run_v3_chain_node_cli_smoke.sh" "$hostc" host
   sh "$root/v3/tooling/run_v3_chain_node_process_smoke.sh" "$hostc" host
+  sh "$root/v3/tooling/run_v3_chain_node_three_node_smoke.sh" "$hostc" host
   sh "$root/v3/tooling/run_v3_tailnet_control_smoke.sh" "$hostc" host
   sh "$root/v3/tooling/run_v3_fresh_node_selfhost_gate.sh" "$hostc" host
   sh "$root/v3/tooling/run_v3_migration_gate.sh" "$hostc" host

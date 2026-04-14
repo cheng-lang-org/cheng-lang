@@ -1,0 +1,57 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
+
+fn main(): int32 =
+    let upstreamPort = driver_c_read_int32_flag_or_default_bridge("--upstream-port", -1)
+    assert(upstreamPort > 0, "v3 chain_node process relay: invalid upstream port")
+
+    let port = driver_c_read_int32_flag_or_default_bridge("--port", 0)
+    var ready_path: str = ""
+    let has_ready = driver_c_read_flag_value_bridge("--ready-path", ready_path)
+    let ready_path_value = if has_ready: ready_path else: ""
+
+    var relay = node.v3ChainNodeInit("process.relay", "process.loopback")
+    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce("127.0.0.1",
+                                                              upstreamPort,
+                                                              types.v3Libp2pProtocolSync)
+    assert(payloadRes.ok, "v3 chain_node process relay: recv payload")
+
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(payloadRes.value)
+    assert(snapshotRes.ok, "v3 chain_node process relay: decode snapshot")
+
+    let syncRes = node.v3ChainNodeSyncOnce(relay, snapshotRes.value)
+    assert(syncRes.ok, "v3 chain_node process relay: sync")
+    assert(syncRes.value, "v3 chain_node process relay: sync changed")
+
+    let aliceRes = node.v3ChainNodeBalance(relay, 11, 1001)
+    let bobRes = node.v3ChainNodeBalance(relay, 11, 2002)
+    assert(aliceRes.ok, "v3 chain_node process relay: alice balance")
+    assert(bobRes.ok, "v3 chain_node process relay: bob balance")
+    assert(aliceRes.value == int64(55), "v3 chain_node process relay: alice 55")
+    assert(bobRes.value == int64(33), "v3 chain_node process relay: bob 33")
+
+    let relaySnapshot = node.v3ChainNodeServeOnce(relay)
+    assert(layout.fixedBytes32Equal(relaySnapshot.tipEventCid, snapshotRes.value.tipEventCid),
+        "v3 chain_node process relay: tip cid")
+    assert(layout.fixedBytes32Equal(relaySnapshot.forest.forestCid, snapshotRes.value.forest.forestCid),
+        "v3 chain_node process relay: forest cid")
+    assert(anti.v3AntiEntropySignatureEqual(relaySnapshot.signature, snapshotRes.value.signature),
+        "v3 chain_node process relay: signature")
+
+    let relayPayload = net.v3ChainNodeLibp2pEncodeSnapshot(relaySnapshot)
+    let serveRes = tcp_transport.v3Libp2pTcpServePayloadOnce("127.0.0.1",
+                                                             port,
+                                                             types.v3Libp2pProtocolSync,
+                                                             relayPayload,
+                                                             ready_path_value)
+    assert(serveRes.ok, "v3 chain_node process relay: serve once")
+    echo("v3 chain_node_process_relay_smoke ok")
+    return 0

@@ -2,6 +2,114 @@
 
 | 项目 | 内容 |
 |---|---|
+| 目标 | 把 `did identity store` 和 `rwad` CLI 里最容易反复出错的两条链一起彻底收掉：一条是大复合对象持久化/回读，一条是 `parseInt64(..., out)` 这类数字出参写回。 |
+| 状态 | 已完成。DID store 主链、host/mobile/browser/libp2p 入口和 `rwad_bft_state_machine` host/Linux object 入口都已重新前台 `ok`。 |
+| 主线 | [did.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/identity/did.cheng) 现在把 `V3DidIdentity` 收成小对象，只保留 `rootSeed/deviceSeed/storeText/selfDevice`；完整文档统一从 canonical store text 回建，创建和加载优先走 `v3DidLoadOrCreateIdentityFill(...)` / `v3DidIdentityLoadFill(...)`，并且创建分支固定 `save -> load` 回读。这样 `Result[V3DidIdentity]` 大值返回、`identity.document/selfDevice` 嵌套原地写回和“创建后直接信内存对象”三条老风险链一起被砍掉。随后又把同一形状继续上推到 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng)、[android_bridge.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/android_bridge.cheng)、[mobile_sdk.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/mobile_sdk.cheng)、[browser_sdk.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/browser/browser_sdk.cheng) 的 `*InitWithDidStoreFill(...)`，不再让 DID store 入口从上层重新掉回 `Result[大对象]`。[rwad_bft_state_machine_main.cheng](/Users/lbcheng/cheng-lang/v3/src/project/rwad_bft_state_machine_main.cheng) 则把 `parseInt64(..., out)` 全部改成纯返回的本地 `v3RwadMainParseInt64Text(...)`，不再让 flag 解析继续踩旧的 CLI 出参坑。 |
+| 文件 | `v3/src/libp2p/identity/did.cheng` `v3/src/tests/did_identity_smoke.cheng` `v3/src/project/rwad_bft_state_machine_main.cheng` `v3/docs/DID.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不再保留 `parseInt32/parseInt64(..., out)` 这类数字出参写回；不再在复合对象内部直接 `add(document.devices, ...)` 或原地改 `identity.document/selfDevice`；不把“内存创建成功”误当成“store roundtrip 成功”。 |
+| 验收 | [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) `did_identity_smoke mobile_bridge_smoke mobile_sdk_smoke libp2p_protocols_smoke rwad_bft_state_machine_smoke` 已前台 `ok`；[did_identity_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/did_identity_smoke.cheng) 已在 host、`stage2`、`stage3` 真编真跑 `ok`；[build_rwad_bft_state_machine_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_v3.sh) 与 [run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 已继续前台 `ok`。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 在 `cheng v3` 里补最小可用 `did:cheng` 身份层，让“同一 DID 下多设备、同一设备固定 PeerId”先在编译器和现有 libp2p host/mobile/browser 入口上成立，同时不碰瓷还没做完的 `did-auth`/DHT 发布。 |
+| 状态 | 已完成。`v3` 本体现在已经有确定性 DID 骨架、本地 enroll/revoke、`initWithDid(...)` 入口和 host/stage2/stage3 smoke。Linux 仍保持严格 preflight，真实阻塞不变。 |
+| 主线 | 这轮新增 [did.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/identity/did.cheng)，把 `Root DID + Device Method + Document` 收成最小权威模型：`rootSeed` 决定 `did:cheng:<root_peer_id>`，`deviceSeed` 决定固定设备 `PeerId`，同一 root 下不同设备可挂到同一 document，本地 `enroll/revoke` 发现错 root 或重复设备直接失败。随后把 [host.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/host/host.cheng)、[android_bridge.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/android_bridge.cheng)、[mobile_sdk.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/mobile_sdk.cheng)、[browser_sdk.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/browser/browser_sdk.cheng)、[mobile_capi.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/mobile_capi.cheng) 接上 `*InitWithDid(...)` 和 DID 文本查询，补 [did_identity_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/did_identity_smoke.cheng) 并挂进 host/stage23 runner。中途暴露出一个编译器硬坑：超长字符串拼接会把 `v3_call_expr_string_literal_count` 打成栈爆，我已把 proof digest 那段收成逐段 `out = out + ...`，host、`stage2`、`stage3` 现都已前台真绿。 |
+| 文件 | `v3/src/libp2p/identity/did.cheng` `v3/src/libp2p/host/host.cheng` `v3/src/libp2p/mobile/android_bridge.cheng` `v3/src/libp2p/mobile/mobile_sdk.cheng` `v3/src/libp2p/browser/browser_sdk.cheng` `v3/src/libp2p/mobile/mobile_capi.cheng` `v3/src/tests/did_identity_smoke.cheng` `v3/tooling/run_v3_host_smokes.sh` `v3/tooling/run_v3_stage23_libp2p_smokes.sh` `v3/docs/DID.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把外部 `cheng-libp2p` 的完整 `did-auth`/DHT/撤销 gossip 叙事冒充成 `v3` 已完成；不伪造设备签名；不把 Linux `exe` 阻塞伪装成已解决。 |
+| 验收 | [did_identity_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/did_identity_smoke.cheng) 必须在 host、`stage2`、`stage3` 真编真跑 `ok`；既有 [mobile_bridge_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/mobile_bridge_smoke.cheng)、[mobile_sdk_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/mobile_sdk_smoke.cheng)、[libp2p_protocols_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/libp2p_protocols_smoke.cheng) 必须继续真绿；[run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 必须继续 `ok`；`CHAIN_NODE_LINUX_ARTIFACT=exe` 必须继续只报真实 preflight 缺口。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 generic Linux `aarch64` 从“只能产 `.o`”再往前推一步：补上真正的 `_start`、统一 `nolibc exe` 构建脚本和严格 preflight，让 `exe` 失败时直接暴露真实缺口。 |
+| 状态 | 已完成。`_start` 入口和 `build_linux_nolibc_exe_v3.sh` 已落地；默认 `obj` 主线继续真绿；`exe` 现在会先输出严格 preflight 报告，再因为硬阻塞退出。 |
+| 主线 | 这轮新增 [v3_linux_nolibc_aarch64_entry.S](/Users/lbcheng/cheng-lang/v3/runtime/native/v3_linux_nolibc_aarch64_entry.S) 作为最小 Linux `aarch64` `_start`，直接把 `argc/argv` 转给 `cheng_v3_program_argv_entry`，返回后走 Linux `exit` syscall。再新增 [build_linux_nolibc_exe_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_linux_nolibc_exe_v3.sh)，把 generic Linux `exe` 收成统一入口：先验 `Linux ELF linker` 和 `nolibc runtime object`，只有两者都齐了才继续编主对象、编 startup 对象并链接。[build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh) 和 [build_rwad_bft_state_machine_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_v3.sh) 的 `*_LINUX_ARTIFACT=exe` 现在都走这条严格 preflight。当前这台 Darwin 机器上的真实阻塞已经钉死成两条：一，没有 Linux ELF linker；二，[system_helpers_backend_nolibc_linux_aarch64.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend_nolibc_linux_aarch64.cheng) 还不能被 `v3 seed` 编成 runtime object，第一处直接死在 `cheng_strlen_runtime` 的 `while + raw ptr`。 |
+| 文件 | `v3/runtime/native/v3_linux_nolibc_aarch64_entry.S` `v3/tooling/build_linux_nolibc_exe_v3.sh` `v3/tooling/build_chain_node_linux_v3.sh` `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` `src/tooling/toolchains/linux_aarch64.env` `v3/tooling/README.md` `v3/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 `exe` 冒充成已支持；不在缺 linker/runtime object 时继续往后编和链；不靠本机 Darwin `ld` 或伪 runtime provider 假装 Linux 可执行链路已打通。 |
+| 验收 | [v3_linux_nolibc_aarch64_entry.S](/Users/lbcheng/cheng-lang/v3/runtime/native/v3_linux_nolibc_aarch64_entry.S) 必须能被 `clang -target aarch64-unknown-linux-gnu` 真编成 `elf64-littleaarch64`；直接跑 [build_linux_nolibc_exe_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_linux_nolibc_exe_v3.sh) 和两条 `*_LINUX_ARTIFACT=exe` 包装脚本，必须统一输出 `linux_exe_preflight.txt` 并明确写出 `linker_detail=linux_elf_linker_missing`、`runtime_probe_detail=runtime_source_not_yet_supported_by_v3_seed`；默认 [build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh)、[build_rwad_bft_state_machine_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_v3.sh) 和 [run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 必须继续前台 `ok`。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `build_chain_node_linux_v3.sh` / `build_rwad_bft_state_machine_linux_v3.sh` 从“永远硬失败”的占位脚本收成真正可用的统一 Linux 入口。 |
+| 状态 | 已完成。现在默认直接产 generic Linux `aarch64` 的 `ELF relocatable object`；只有 `exe` 和 `x86_64` 继续硬失败。 |
+| 主线 | 这轮没有再扩 `v3 seed` 语义面，只把已经打通的 `aarch64 Linux object` 能力接回正式 Linux 入口。现在 [build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh) 和 [build_rwad_bft_state_machine_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_v3.sh) 默认目标都改成 `aarch64-unknown-linux-gnu`，默认产物类型改成 `obj`，并直接委托给各自的 `*_linux_obj_v3.sh` 真编 `.o`。如果显式给 `*_LINUX_ARTIFACT=exe`，或者目标给成 `x86_64-unknown-linux-gnu`，脚本会继续明确硬失败。同时把 [run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh)、[v3/tooling/README.md](/Users/lbcheng/cheng-lang/v3/tooling/README.md)、[v3/README.md](/Users/lbcheng/cheng-lang/v3/README.md) 一起追平，并把 `llvm-objdump` 查找收成跨平台探测，不再写死 macOS 路径。 |
+| 文件 | `v3/tooling/build_chain_node_linux_v3.sh` `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` `v3/tooling/run_v3_linux_object_smokes.sh` `v3/tooling/README.md` `v3/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把默认 Linux 入口继续留成全拒绝占位；不把 `exe` 冒充成已支持；不把 `x86_64` 冒充成已收通。 |
+| 验收 | 直接跑 [build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh) 和 [build_rwad_bft_state_machine_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_v3.sh) 必须默认成功；[run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 必须继续输出 `v3 linux object smokes: ok`；显式 `CHAIN_NODE_LINUX_ARTIFACT=exe` 与 `CHAIN_NODE_TARGET=x86_64-unknown-linux-gnu` 必须继续硬失败。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` 从“generic Linux 只能 fail-fast”推进到“generic Linux `aarch64` 至少能产出真 `ELF relocatable object`”，同时不打坏 host 现有 `chain_node/rwad_bft` 主链。 |
+| 状态 | 已完成。`aarch64-unknown-linux-gnu` 的 `emit obj` 已经能稳定产出真 `ELF 64-bit LSB relocatable, ARM aarch64`；host 的 [build_chain_node_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh) 和 [build_rwad_bft_state_machine_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_v3.sh) 也已复验继续前台 `ok`。 |
+| 主线 | 这轮直接改 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c)：把 `system-link-exec` 的目标能力拆成“完整 native codegen”和“primary object codegen”两层，正式接入 `--emit obj`；generic Linux `aarch64` 现在允许只落 primary object，不再强行走本机 Darwin link/provider C 编译；`emit obj` 成功后直接以本地 `stage3` 物化 `ELF` `.o` 返回。同时新增 [build_chain_node_linux_obj_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_obj_v3.sh)、[build_rwad_bft_state_machine_linux_obj_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_obj_v3.sh)、[run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 作为正式入口。中途 host build 暴露出 Darwin 分支 `v3_compile_asm_object(...)` 少了一个 `%s`，我已一并修掉并重新验收。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/tooling/build_chain_node_linux_obj_v3.sh` `v3/tooling/build_rwad_bft_state_machine_linux_obj_v3.sh` `v3/tooling/run_v3_linux_object_smokes.sh` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把当前成果冒充成 Linux 可执行文件；不把 `x86_64-unknown-linux-gnu` 冒充成已支持；不绕过本地 `stage3` 去信任网络下发二进制。 |
+| 验收 | [run_v3_linux_object_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_linux_object_smokes.sh) 必须输出 `v3 linux object smokes: ok`；[build_chain_node_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh) 与 [build_rwad_bft_state_machine_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_v3.sh) 必须继续前台 `ok`；直接跑 backend driver 的 `--emit obj --target x86_64-unknown-linux-gnu` 必须明确硬失败，不准再假装成功。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `v3` driver 本体也收成 target fail-fast，不再只靠外层 Linux 包装脚本拦截。 |
+| 状态 | 已完成。driver 本体现在已经会直接报告 supported target 矩阵，并对 generic Linux `x86_64/aarch64` 明确 fail-fast。 |
+| 主线 | 这轮直接改 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c)：新增 `supported_targets/target_support/target_support_detail`，把 generic Linux `x86_64/aarch64` 在 plan/primary/native-link 三层都标成 `target_codegen_not_supported`，并让 `status`、`print-build-plan`、`verify-world`、`system-link-exec` 同时输出明确 target 边界。这样以后不管从哪个脚本进来，都不会再先产出 `Mach-O arm64` 假对象再炸到链接阶段。重建 [bootstrap_bridge_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/bootstrap_bridge_v3.sh) 和 [build_backend_driver_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh) 后，新 driver 已经按这套口径生效。 |
+| 文件 | `v3/bootstrap/cheng_v3_seed.c` `v3/tooling/bootstrap_bridge_v3.sh` `v3/tooling/build_backend_driver_v3.sh` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不假装已经补完 generic Linux ELF `x86_64` 机器码发射；只把 driver 本体的 fail-fast 和诊断口径先收死。 |
+| 验收 | 重建后的 `artifacts/v3_backend_driver/cheng` 跑 `status` 必须打印 `supported_targets/target_support`；直接跑 `system-link-exec --target x86_64-unknown-linux-gnu` 必须明确报 `target codegen not supported`，不再掉到误导性的 native link 噪音。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 Linux `x86_64` 假构建噪音收成硬失败，再把 [RWAD密码学身份.md](/Users/lbcheng/cheng-lang/v3/docs/RWAD密码学身份.md) 追平当前真实实现。 |
+| 状态 | 已完成。Linux 包装脚本现在会直接拒绝不支持的 generic Linux triple；`RWAD` 文档也已补上当前 accumulator 主链和仍未实现的 zk 边界。 |
+| 主线 | 这轮不再继续让 [build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh) 和 [build_rwad_bft_state_machine_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_linux_v3.sh) 在 `x86_64-unknown-linux-gnu` 上先产出 `Mach-O arm64` 再拖到链接阶段爆炸，而是直接 hard fail，明确当前 `v3` seed backend 还没有 generic Linux ELF `x86_64/aarch64` 真发射。随后把 [RWAD密码学身份.md](/Users/lbcheng/cheng-lang/v3/docs/RWAD密码学身份.md) 增补成“当前已有 `serialAccumulatorRoot/nullifierAccumulatorRoot`、哈希树成员证明、CLI 摘要输出，但还没有 prover/verifier/circuit/batch proof/原子级 RWAD ID”这条真实口径。 |
+| 文件 | `v3/tooling/build_chain_node_linux_v3.sh` `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` `v3/docs/RWAD密码学身份.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把 generic Linux x86_64 误报成快成功；不把当前哈希树成员证明冒充成完整 zk 累加器主链。 |
+| 验收 | 两个 Linux 包装脚本都必须直接报“不支持 generic Linux ELF target”并退出；文档必须明确“当前 accumulator 已实现，但 zk/prover/verifier/circuit/batch proof 仍未实现”；`git diff --check` 必须通过。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把 `chain_node` 真 daemon CLI 和零事件快照回放正式接进 gate，并收掉 [content_stub_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_stub_smoke.cheng) 的 `stage2` 死循环，让 host / `stage23` 两条总 runner 一起回到前台全绿。 |
+| 状态 | 已完成。`chain_node` CLI 真 smoke、零事件快照回放 smoke、完整 host runner、完整 `stage23` runner 都已经前台 `ok`。 |
+| 主线 | 这轮先把 [chain_node.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node.cheng)、[chain_node_main.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_main.cheng)、[chain_node_cli_core.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_cli_core.cheng) 收成稳定的状态文件和快照回放主链：零事件 snapshot replay 现在会主动重建 `forest/signature`，状态文件固定写出并严格解析 `node_id/payload_hex`，CLI flag/int64 解析也全部改成本地稳定入口；随后新增 [chain_node_zero_snapshot_replay_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_zero_snapshot_replay_smoke.cheng) 和 [run_v3_chain_node_cli_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_chain_node_cli_smoke.sh)，并把它们接进 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 与 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh)。最后把 [content_stub_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_stub_smoke.cheng) 里那条“大量 composite 形参 helper”直接内联回 `main`，收掉 `stage2` 会被误编成死循环的源码形状。结果是单点 host/`stage2`/`stage3` `content_stub_smoke` 全部前台 `ok`，完整 host 总 runner 输出 `v3 host smokes: ok`，完整 `stage23` 总 runner 输出 `v3 stage2/stage3 libp2p: ok`。 |
+| 文件 | `v3/src/project/chain_node.cheng` `v3/src/project/chain_node_main.cheng` `v3/src/project/chain_node_cli_core.cheng` `v3/src/tests/chain_node_zero_snapshot_replay_smoke.cheng` `v3/src/tests/content_stub_smoke.cheng` `v3/tooling/run_v3_chain_node_cli_smoke.sh` `v3/tooling/run_v3_host_smokes.sh` `v3/tooling/run_v3_stage23_libp2p_smokes.sh` `src/std/cmdline.cheng` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把当前 `v3` backend 冒充成已经能产出 Linux x86_64 真目标；不把没有 prover/verifier/circuit 的 `RWAD` 冒充成完整 zk 主链。 |
+| 验收 | [run_v3_chain_node_cli_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_chain_node_cli_smoke.sh) 必须在 host/`stage2`/`stage3` 全部前台 `ok`；[chain_node_zero_snapshot_replay_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_zero_snapshot_replay_smoke.cheng) 必须在 host/`stage2`/`stage3` 真编真跑 `ok`；完整 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 必须输出 `v3 host smokes: ok`；完整 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 必须输出 `v3 stage2/stage3 libp2p: ok`。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 一口气落 `Linux 目标产物`、真正的 `chain_node daemon CLI`、`accumulator + zk + 完整原子级 RWAD 主链`。 |
+| 状态 | 未完成，当前被两个硬边界卡住。 |
+| 主线 | 这轮先把真实边界重新钉死。`chain_node` 的 host 主入口现在已经打通： [build_chain_node_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_v3.sh) 已前台输出 `v3 chain_node self-test ok`，说明 host 上的 ordinary lowering 和 daemon CLI 主链已经不再是 blocker。现在剩下的 Linux 真目标问题，已经收敛成更准确的一条： [build_chain_node_linux_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_chain_node_linux_v3.sh) 在 `x86_64-unknown-linux-gnu` 下仍会产出 `Mach-O arm64` 的 `.o`，随后被 host `cc` 以 `arm64` 口径去链，最后在链接阶段炸掉；也就是说，当前真正缺的是 `x86_64 Linux` 物件格式/机器码发射，不是 `chain_node_main` ordinary lowering。`RWAD` 这边，文档 [RWAD密码学身份.md](/Users/lbcheng/cheng-lang/v3/docs/RWAD密码学身份.md) 写得很清楚：仓库里只有 `serial interval note + nullifier + accumulator root` 这一层，没有 prover/verifier、约束系统、proof payload，也就没有办法诚实地“一口气完成 zk 和完整原子级主链”。不过当前已有的累加器证明主链已经收住了： [rwad_accumulator_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/rwad_accumulator_smoke.cheng) 现在在 host、`stage2`、`stage3` 都能真编真跑 `ok`， [build_rwad_bft_state_machine_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_rwad_bft_state_machine_v3.sh) 也已前台 `ok`。剩下没完成的，不再是“当前累加器也编不过”，而是真正缺 prover/verifier/circuit 和 Linux x86_64 codegen。 |
+| 文件 | `v3/tooling/build_chain_node_v3.sh` `v3/tooling/build_chain_node_linux_v3.sh` `v3/tooling/build_rwad_bft_state_machine_v3.sh` `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` `v3/src/project/chain_node_main.cheng` `v3/src/project/chain_node_cli_core.cheng` `v3/src/project/chain_node_cli_*_main.cheng` `v3/src/project/rwad_accumulator.cheng` `v3/src/project/rwad_serial_state_machine.cheng` `v3/docs/RWAD密码学身份.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把没有 prover/verifier/circuit 的仓库假装成已完成 zk；不把还编不过的 `chain_node` 入口硬说成真 daemon；不拿 shell 包壳冒充完整原子级 RWAD 主链。 |
+| 验收 | 当前仍未整体通过。真实结果是：`sh v3/tooling/build_chain_node_v3.sh` 已前台 `ok`，`sh v3/tooling/build_chain_node_linux_v3.sh` 失败；`sh v3/tooling/build_rwad_bft_state_machine_v3.sh` 已前台 `ok`，`rwad_accumulator_smoke` 也已在 host、`stage2`、`stage3` 真编真跑 `ok`。剩余失败面已经收敛到 Linux x86_64 真目标缺口和缺失 zk 子系统。 |
+
+| 项目 | 内容 |
+|---|---|
+| 目标 | 把“本机三节点 `chain_node` 测试”和“真正该用什么共识”落成真代码：新增三节点 `server -> relay -> client` 进程 smoke、新增 `BFT-SMI` 三副本确定性 smoke，并把两条 gate 接进 host / `stage23` 与 `v3/docs`。 |
+| 状态 | 已完成。`chain_node` 三节点传播和 `BFT-SMI` 三副本一致性都已经变成正式 runner/gate，不再只是口头说明。 |
+| 主线 | 这轮没有去伪装 `chain_node` 已经是完整共识节点，而是按当前代码真实边界收口：在 [chain_node_process_relay_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/chain_node_process_relay_smoke.cheng) 和 [run_v3_chain_node_three_node_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_chain_node_three_node_smoke.sh) 把 `server -> relay -> client` 三节点 snapshot sync 跑成真实进程 gate；同时在 [bft_three_replica_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/bft_three_replica_smoke.cheng) 把同一 `appId` 下的 `CheckTx / CheckTxBytes / CheckTxBytesWithContext + FinalizeBlockSummary / FinalizeBatchSummary(typed) / FinalizeBatchSummary(decoded batch)` 对拍成同一 `appHash/commit/balance`。随后把这两条门禁接进 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 和 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh)，并新增 [chain_node三节点测试.md](/Users/lbcheng/cheng-lang/v3/docs/chain_node三节点测试.md) 写死“`L0=chain_node/LSMR/libp2p`，`L1=BFT-SMI + CometBFT`”。 |
+| 文件 | `v3/src/tests/chain_node_process_relay_smoke.cheng` `v3/src/tests/bft_three_replica_smoke.cheng` `v3/tooling/run_v3_chain_node_three_node_smoke.sh` `v3/tooling/run_v3_host_smokes.sh` `v3/tooling/run_v3_stage23_libp2p_smokes.sh` `v3/docs/chain_node三节点测试.md` `v3/docs/README.md` `v3/tooling/README.md` `v3/README.md` `task_plan.md` `progress.md` `findings.md` |
+| 不做 | 不把当前 `chain_node` 冒充成三验证人 finality 节点；不新造一套假的链上共识协议；不假装现成脚本已经支持 Linux VPS 部署。 |
+| 验收 | host 定向 `bft_three_replica_smoke` 与 `run_v3_chain_node_three_node_smoke.sh` 必须前台 `ok`；`stage2/stage3` 下这两条也必须真编真跑 `ok`；完整 [run_v3_host_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_host_smokes.sh) 与 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 必须继续前台全绿。 |
+
+## 当前任务
+
+| 项目 | 内容 |
+|---|---|
 | 目标 | 收掉 host 上 `native_initial_crypto_frame` 的独立编译崩溃，把 `stage23` 的 QUIC/TLS 正式 gate 收回当前稳定主链 smoke，再把 [content_codec_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_codec_smoke.cheng) 和 [content_runtime_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_runtime_smoke.cheng) 的 `stage2/stage3` 编译崩溃一起收平，最终让 host / `stage23` 两条总 gate 同时回到全绿。 |
 | 状态 | 已完成。host gate、完整 `stage23`、fresh-node gate、migration gate、browser webrtc 尾 gate 都已重新前台全绿。 |
 | 主线 | 这轮没再碰 `QUIC/TLS` 运行时逻辑，只收正式 gate 的真实稳定边界。先确认 host 会被 [native_initial_crypto_frame_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/native_initial_crypto_frame_smoke.cheng) 打成 `rc=139`，而 `stage2` 又会在 `native_initial_crypto_frame / tls_client_hello_parse / tls_initial_packet_roundtrip / quic_transport_loopback / libp2p_quic_tls / pin_runtime_quic / content_quic` 这些 QUIC-native 切片入口上继续编挂；于是先把 host 正式 gate 收回 [native_client_hello_wire_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/native_client_hello_wire_smoke.cheng)，同时把 `stage23` 的 QUIC/TLS 切片 probe 从正式列表里撤掉。随后把 [content_codec_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_codec_smoke.cheng) 收成稳定的 `manifest/chunk/range/stub` 编解码闭环，再把 [content_runtime_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/content_runtime_smoke.cheng) 收成 `manifest/blob/shard cache + requestFetch/requestShardPull + rebuildBlob` 主路径，彻底删掉会把 host 跑崩、把 `stage2/stage3` 编译器打挂的 preview/parity/test-only 大形状。最终 host 与完整 [run_v3_stage23_libp2p_smokes.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_stage23_libp2p_smokes.sh) 都已重新输出 `ok`。 |

@@ -1,0 +1,107 @@
+import std/system
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/oracle_types as oracle_types
+import cheng/v3/project/oracle_bft_state_machine as oracle_bft
+import cheng/v3/tests/oracle_smoke_support as support
+
+fn main(): int32 =
+    let committee = support.oracleSmokeCommittee()
+    var machine = oracle_bft.v3OracleBftStateMachineInit("oracle.bft.smoke", committee)
+    let pairId = support.oracleSmokePairId(oracle_types.v3OracleAssetBtc, oracle_types.v3OracleQuoteUsd)
+    let pairIndex = oracle_types.v3OraclePairIndex(pairId)
+    let proposer = layout.fixedBytes32Zero()
+
+    var block1 = oracle_bft.v3OracleBftTxBatchZero()
+    for reporterSlot in 1..<5:
+        oracle_bft.v3OracleBftTxBatchAdd(block1, support.oracleSmokeBatch(int64(20), reporterSlot))
+    var summary1: oracle_bft.V3OracleBftBlockSummary
+    let context1 = oracle_bft.v3OracleBftBlockContextMake(int64(1),
+                                                          0,
+                                                          oracle_types.v3OracleRoundEndMs(int64(20)),
+                                                          proposer)
+    oracle_bft.v3OracleBftStateMachineFinalizeBatchSummaryWithContext(machine, context1, block1, summary1)
+    assert(summary1.acceptedCount == 4, "oracle bft smoke: block1 accepted")
+    assert(summary1.finalizedRoundCount == 0, "oracle bft smoke: block1 no finalize")
+
+    let latestBefore = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                                     pairId,
+                                                                     oracle_types.v3OracleRoundEndMs(int64(20)))
+    assert(latestBefore.code == oracle_bft.v3OracleBftCodeNotFinalized,
+        "oracle bft smoke: latest before quorum")
+
+    var block2 = oracle_bft.v3OracleBftTxBatchZero()
+    oracle_bft.v3OracleBftTxBatchAdd(block2, support.oracleSmokeBatch(int64(20), 5))
+    var summary2: oracle_bft.V3OracleBftBlockSummary
+    let context2 = oracle_bft.v3OracleBftBlockContextMake(int64(2),
+                                                          0,
+                                                          oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1),
+                                                          proposer)
+    oracle_bft.v3OracleBftStateMachineFinalizeBatchSummaryWithContext(machine, context2, block2, summary2)
+    assert(summary2.acceptedCount == 1, "oracle bft smoke: block2 accepted")
+    assert(summary2.finalizedRoundCount == 1, "oracle bft smoke: block2 finalize")
+    assert(summary2.lastFinalizedRoundId == int64(20), "oracle bft smoke: finalized round")
+
+    let latest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                               pairId,
+                                                               oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1))
+    assert(latest.code == oracle_bft.v3OracleBftCodeOk, "oracle bft smoke: latest ok")
+    assert(latest.priceE8 == support.oracleSmokePrice(int64(20), pairIndex, 3),
+        "oracle bft smoke: median price")
+
+    let twap = oracle_bft.v3OracleBftStateMachineQueryTwap(machine,
+                                                           pairId,
+                                                           1,
+                                                           oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1))
+    assert(twap.code == oracle_bft.v3OracleBftCodeOk, "oracle bft smoke: twap ok")
+    assert(twap.priceE8 == latest.priceE8, "oracle bft smoke: twap equals latest")
+
+    let staleLatest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                                    pairId,
+                                                                    oracle_types.v3OracleRoundStartMs(int64(22)))
+    assert(staleLatest.code == oracle_bft.v3OracleBftCodeStale, "oracle bft smoke: stale latest")
+    let staleTwap = oracle_bft.v3OracleBftStateMachineQueryTwap(machine,
+                                                                pairId,
+                                                                1,
+                                                                oracle_types.v3OracleRoundStartMs(int64(22)))
+    assert(staleTwap.code == oracle_bft.v3OracleBftCodeStale, "oracle bft smoke: stale twap")
+
+    let oldRoundCheck = oracle_bft.v3OracleBftStateMachineCheckTxWithContext(machine,
+                                                                              oracle_bft.v3OracleBftBlockContextMake(
+                                                                                  int64(3),
+                                                                                  0,
+                                                                                  oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1),
+                                                                                  proposer
+                                                                              ),
+                                                                              support.oracleSmokeBatch(int64(20), 6))
+    assert(oldRoundCheck.code == oracle_bft.v3OracleBftCodeBadRound, "oracle bft smoke: old round reject")
+
+    let futureRoundCheck = oracle_bft.v3OracleBftStateMachineCheckTxWithContext(machine,
+                                                                                 oracle_bft.v3OracleBftBlockContextMake(
+                                                                                     int64(3),
+                                                                                     0,
+                                                                                     oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1),
+                                                                                     proposer
+                                                                                 ),
+                                                                                 support.oracleSmokeBatch(int64(25), 1))
+    assert(futureRoundCheck.code == oracle_bft.v3OracleBftCodeBadRound,
+        "oracle bft smoke: future round reject")
+
+    var duplicateMachine = oracle_bft.v3OracleBftStateMachineInit("oracle.bft.dup", committee)
+    var dupBlock = oracle_bft.v3OracleBftTxBatchZero()
+    let dupBatch = support.oracleSmokeBatch(int64(30), 1)
+    oracle_bft.v3OracleBftTxBatchAdd(dupBlock, dupBatch)
+    oracle_bft.v3OracleBftTxBatchAdd(dupBlock, dupBatch)
+    var dupSummary: oracle_bft.V3OracleBftBlockSummary
+    let dupContext = oracle_bft.v3OracleBftBlockContextMake(int64(1),
+                                                            0,
+                                                            oracle_types.v3OracleRoundEndMs(int64(30)),
+                                                            proposer)
+    oracle_bft.v3OracleBftStateMachineFinalizeBatchSummaryWithContext(duplicateMachine,
+                                                                      dupContext,
+                                                                      dupBlock,
+                                                                      dupSummary)
+    assert(dupSummary.acceptedCount == 1, "oracle bft smoke: duplicate accepted once")
+    assert(dupSummary.rejectedCount == 1, "oracle bft smoke: duplicate rejected once")
+
+    echo("v3 oracle_bft_state_machine_smoke ok")
+    return 0

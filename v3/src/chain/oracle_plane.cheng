@@ -1,0 +1,271 @@
+import std/result
+import std/system
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/fixed256
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/oracle_types as oracle_types
+
+const
+    v3OracleBatchMagic: str = "v3.oracle.batch"
+    v3OracleBatchMagicSize: int32 = 15
+    v3OracleSignedBatchWireSize: int32 = 395
+
+type
+    V3OracleSignedBatch =
+        version: int32
+        committeeSetId: int32
+        reporterSlot: int32
+        roundId: int64
+        observedAtMs: int64
+        pricesE8: int64[]
+        sig: layout.FixedBytes64
+        batchCid: layout.FixedBytes32
+
+fn v3OracleSignedBatchZero(): V3OracleSignedBatch =
+    var out: V3OracleSignedBatch
+    out.version = oracle_types.v3OracleVersion
+    out.committeeSetId = 0
+    out.reporterSlot = 0
+    out.roundId = int64(0)
+    out.observedAtMs = int64(0)
+    out.pricesE8 = []
+    out.sig = layout.fixedBytes64Zero()
+    out.batchCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3OracleAppendU32BE(buf: var layout.ByteBuf, value: int64) =
+    lt.v3AppendU32BE(buf, value)
+
+fn v3OracleAppendI64BE(buf: var layout.ByteBuf, value: int64) =
+    v3OracleAppendU32BE(buf, int32(value >> 32))
+    v3OracleAppendU32BE(buf, int32(value & int64(0xffffffff)))
+
+fn v3OracleReadU32BE(span: layout.ByteSpan, offset: int32): Result[int64] =
+    if offset < 0 || offset + 4 > layout.byteSpanLen(span):
+        return Err[int64]("v3 oracle plane: short u32")
+    let b0: int64 = int64(layout.byteSpanAt(span, offset))
+    let b1: int64 = int64(layout.byteSpanAt(span, offset + 1))
+    let b2: int64 = int64(layout.byteSpanAt(span, offset + 2))
+    let b3: int64 = int64(layout.byteSpanAt(span, offset + 3))
+    return Ok[int64]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3OracleReadI64BE(span: layout.ByteSpan, offset: int32): Result[int64] =
+    let hiRes = v3OracleReadU32BE(span, offset)
+    if IsErr(hiRes):
+        return Err[int64](Error(hiRes))
+    let loRes = v3OracleReadU32BE(span, offset + 4)
+    if IsErr(loRes):
+        return Err[int64](Error(loRes))
+    let hi = Value(hiRes)
+    let lo = Value(loRes)
+    return Ok[int64]((hi << 32) | (lo & int64(0xffffffff)))
+
+fn v3OracleReadFixed32(span: layout.ByteSpan, offset: int32): Result[layout.FixedBytes32] =
+    if offset < 0 || offset + layout.fixedBytes32Size > layout.byteSpanLen(span):
+        return Err[layout.FixedBytes32]("v3 oracle plane: short fixed32")
+    return layout.fixedBytes32FromBytes(layout.byteSpanToBytes(layout.byteSpanSlice(span,
+                                                                                    offset,
+                                                                                    layout.fixedBytes32Size)))
+
+fn v3OracleReadFixed64(span: layout.ByteSpan, offset: int32): Result[layout.FixedBytes64] =
+    if offset < 0 || offset + layout.fixedBytes64Size > layout.byteSpanLen(span):
+        return Err[layout.FixedBytes64]("v3 oracle plane: short fixed64")
+    return layout.fixedBytes64FromBytes(layout.byteSpanToBytes(layout.byteSpanSlice(span,
+                                                                                    offset,
+                                                                                    layout.fixedBytes64Size)))
+
+fn v3OracleSignedBatchShapeValidate(batch: V3OracleSignedBatch): Result[bool] =
+    if batch.version != oracle_types.v3OracleVersion:
+        return Err[bool]("v3 oracle plane: bad version")
+    if batch.committeeSetId <= 0:
+        return Err[bool]("v3 oracle plane: bad committee set id")
+    if batch.reporterSlot <= 0 || batch.reporterSlot > oracle_types.v3OracleCommitteeMax:
+        return Err[bool]("v3 oracle plane: bad reporter slot")
+    if batch.observedAtMs < 0:
+        return Err[bool]("v3 oracle plane: bad observed time")
+    let expectedRound = oracle_types.v3OracleRoundIdFromObservedAtMs(batch.observedAtMs)
+    if batch.roundId != expectedRound:
+        return Err[bool]("v3 oracle plane: bad round id")
+    if batch.pricesE8.len != oracle_types.v3OraclePairCount:
+        return Err[bool]("v3 oracle plane: bad pair count")
+    for i in 0..<batch.pricesE8.len:
+        if batch.pricesE8[i] <= int64(0):
+            return Err[bool]("v3 oracle plane: bad price")
+    return Ok[bool](true)
+
+fn v3OracleSignedBatchSignableBytes(batch: V3OracleSignedBatch): Result[Bytes] =
+    let shapeRes = v3OracleSignedBatchShapeValidate(batch)
+    if IsErr(shapeRes):
+        return Err[Bytes](Error(shapeRes))
+    var buf: layout.ByteBuf = layout.byteBufInit(320)
+    layout.byteBufAppendBytes(buf, bytesFromString(v3OracleBatchMagic))
+    v3OracleAppendU32BE(buf, batch.version)
+    v3OracleAppendU32BE(buf, batch.committeeSetId)
+    v3OracleAppendU32BE(buf, batch.reporterSlot)
+    v3OracleAppendI64BE(buf, batch.roundId)
+    v3OracleAppendI64BE(buf, batch.observedAtMs)
+    for i in 0..<oracle_types.v3OraclePairCount:
+        v3OracleAppendI64BE(buf, batch.pricesE8[i])
+    return Ok[Bytes](layout.byteBufToBytes(buf))
+
+fn v3OracleSignedBatchCid(batch: V3OracleSignedBatch): Result[layout.FixedBytes32] =
+    let signableRes = v3OracleSignedBatchSignableBytes(batch)
+    if IsErr(signableRes):
+        return Err[layout.FixedBytes32](Error(signableRes))
+    var buf: layout.ByteBuf = layout.byteBufInit(384)
+    layout.byteBufAppendBytes(buf, bytesFromString("v3.oracle.batch.cid"))
+    layout.byteBufAppendBytes(buf, Value(signableRes))
+    layout.byteBufAppendBytes(buf, layout.fixedBytes64ToBytes(batch.sig))
+    return Ok[layout.FixedBytes32](lt.v3FixedCidFromBuf(buf))
+
+fn v3OracleSignedBatchStructuralValidate(batch: V3OracleSignedBatch): Result[bool] =
+    let shapeRes = v3OracleSignedBatchShapeValidate(batch)
+    if IsErr(shapeRes):
+        return Err[bool](Error(shapeRes))
+    let cidRes = v3OracleSignedBatchCid(batch)
+    if IsErr(cidRes):
+        return Err[bool](Error(cidRes))
+    if !layout.fixedBytes32Equal(Value(cidRes), batch.batchCid):
+        return Err[bool]("v3 oracle plane: bad batch cid")
+    return Ok[bool](true)
+
+fn v3OracleSignedBatchVerify(batch: V3OracleSignedBatch,
+                             pubKey: layout.FixedBytes65): Result[bool] =
+    let okRes = v3OracleSignedBatchStructuralValidate(batch)
+    if IsErr(okRes):
+        return Err[bool](Error(okRes))
+    let signableRes = v3OracleSignedBatchSignableBytes(batch)
+    if IsErr(signableRes):
+        return Err[bool](Error(signableRes))
+    let verifyRes = fixed256.p256VerifyMessageFixed64(pubKey, Value(signableRes), batch.sig)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    if !Value(verifyRes):
+        return Err[bool]("v3 oracle plane: bad signature")
+    return Ok[bool](true)
+
+fn v3OracleSignedBatchVerifyAgainstCommittee(batch: V3OracleSignedBatch,
+                                             committee: oracle_types.V3OracleCommitteeConfig): Result[bool] =
+    if committee.committeeSetId != batch.committeeSetId:
+        return Err[bool]("v3 oracle plane: wrong committee set")
+    if batch.reporterSlot <= 0 || batch.reporterSlot > committee.reporterCount:
+        return Err[bool]("v3 oracle plane: reporter outside committee")
+    return v3OracleSignedBatchVerify(batch, committee.reporterPubKeys[batch.reporterSlot - 1])
+
+fn v3OracleSignedBatchMake(priv: fixed256.Scalar256,
+                           committeeSetId: int32,
+                           reporterSlot: int32,
+                           observedAtMs: int64,
+                           pricesE8: int64[]): Result[V3OracleSignedBatch] =
+    var out = v3OracleSignedBatchZero()
+    out.version = oracle_types.v3OracleVersion
+    out.committeeSetId = committeeSetId
+    out.reporterSlot = reporterSlot
+    out.roundId = oracle_types.v3OracleRoundIdFromObservedAtMs(observedAtMs)
+    out.observedAtMs = observedAtMs
+    out.pricesE8 = []
+    for i in 0..<pricesE8.len:
+        add(out.pricesE8, pricesE8[i])
+    let signableRes = v3OracleSignedBatchSignableBytes(out)
+    if IsErr(signableRes):
+        return Err[V3OracleSignedBatch](Error(signableRes))
+    let sigRes = fixed256.p256SignMessageFixed64(priv, Value(signableRes))
+    if IsErr(sigRes):
+        return Err[V3OracleSignedBatch](Error(sigRes))
+    out.sig = Value(sigRes)
+    let cidRes = v3OracleSignedBatchCid(out)
+    if IsErr(cidRes):
+        return Err[V3OracleSignedBatch](Error(cidRes))
+    out.batchCid = Value(cidRes)
+    let okRes = v3OracleSignedBatchStructuralValidate(out)
+    if IsErr(okRes):
+        return Err[V3OracleSignedBatch](Error(okRes))
+    return Ok[V3OracleSignedBatch](out)
+
+fn v3OracleSignedBatchEncode(batch: V3OracleSignedBatch): Bytes =
+    let okRes = v3OracleSignedBatchStructuralValidate(batch)
+    if IsErr(okRes):
+        system.panic(Error(okRes))
+    var buf: layout.ByteBuf = layout.byteBufInit(v3OracleSignedBatchWireSize)
+    layout.byteBufAppendBytes(buf, bytesFromString(v3OracleBatchMagic))
+    v3OracleAppendU32BE(buf, batch.version)
+    v3OracleAppendU32BE(buf, batch.committeeSetId)
+    v3OracleAppendU32BE(buf, batch.reporterSlot)
+    v3OracleAppendI64BE(buf, batch.roundId)
+    v3OracleAppendI64BE(buf, batch.observedAtMs)
+    for i in 0..<oracle_types.v3OraclePairCount:
+        v3OracleAppendI64BE(buf, batch.pricesE8[i])
+    layout.byteBufAppendBytes(buf, layout.fixedBytes64ToBytes(batch.sig))
+    layout.byteBufAppendBytes(buf, layout.fixedBytes32ToBytes(batch.batchCid))
+    return layout.byteBufToBytes(buf)
+
+fn v3OracleSignedBatchDecode(payload: Bytes): Result[V3OracleSignedBatch] =
+    let span = layout.byteSpanFromBytes(payload)
+    if layout.byteSpanLen(span) != v3OracleSignedBatchWireSize:
+        return Err[V3OracleSignedBatch]("v3 oracle plane: bad payload size")
+    let magic = layout.byteSpanToBytes(layout.byteSpanSlice(span, 0, v3OracleBatchMagicSize))
+    if bytesLen(magic) != v3OracleBatchMagicSize:
+        return Err[V3OracleSignedBatch]("v3 oracle plane: short magic")
+    for i in 0..<v3OracleBatchMagicSize:
+        if bytesGet(magic, i) != bytesGet(bytesFromString(v3OracleBatchMagic), i):
+            return Err[V3OracleSignedBatch]("v3 oracle plane: bad magic")
+    var offset = v3OracleBatchMagicSize
+    let versionRes = v3OracleReadU32BE(span, offset)
+    if IsErr(versionRes):
+        return Err[V3OracleSignedBatch](Error(versionRes))
+    offset = offset + 4
+    let committeeRes = v3OracleReadU32BE(span, offset)
+    if IsErr(committeeRes):
+        return Err[V3OracleSignedBatch](Error(committeeRes))
+    offset = offset + 4
+    let slotRes = v3OracleReadU32BE(span, offset)
+    if IsErr(slotRes):
+        return Err[V3OracleSignedBatch](Error(slotRes))
+    offset = offset + 4
+    let roundRes = v3OracleReadI64BE(span, offset)
+    if IsErr(roundRes):
+        return Err[V3OracleSignedBatch](Error(roundRes))
+    offset = offset + 8
+    let observedRes = v3OracleReadI64BE(span, offset)
+    if IsErr(observedRes):
+        return Err[V3OracleSignedBatch](Error(observedRes))
+    offset = offset + 8
+    var pricesE8: int64[]
+    pricesE8 = []
+    for i in 0..<oracle_types.v3OraclePairCount:
+        let priceRes = v3OracleReadI64BE(span, offset)
+        if IsErr(priceRes):
+            return Err[V3OracleSignedBatch](Error(priceRes))
+        add(pricesE8, Value(priceRes))
+        offset = offset + 8
+    let sigRes = v3OracleReadFixed64(span, offset)
+    if IsErr(sigRes):
+        return Err[V3OracleSignedBatch](Error(sigRes))
+    offset = offset + layout.fixedBytes64Size
+    let cidRes = v3OracleReadFixed32(span, offset)
+    if IsErr(cidRes):
+        return Err[V3OracleSignedBatch](Error(cidRes))
+    var out = v3OracleSignedBatchZero()
+    out.version = int32(Value(versionRes))
+    out.committeeSetId = int32(Value(committeeRes))
+    out.reporterSlot = int32(Value(slotRes))
+    out.roundId = Value(roundRes)
+    out.observedAtMs = Value(observedRes)
+    out.pricesE8 = pricesE8
+    out.sig = Value(sigRes)
+    out.batchCid = Value(cidRes)
+    let okRes = v3OracleSignedBatchStructuralValidate(out)
+    if IsErr(okRes):
+        return Err[V3OracleSignedBatch](Error(okRes))
+    return Ok[V3OracleSignedBatch](out)
+
+fn v3OracleSignedBatchValidatePayload(payload: Bytes,
+                                      expectedCid: layout.FixedBytes32): Result[bool] =
+    let batchRes = v3OracleSignedBatchDecode(payload)
+    if IsErr(batchRes):
+        return Err[bool](Error(batchRes))
+    let batch = Value(batchRes)
+    if !layout.fixedBytes32Equal(batch.batchCid, expectedCid):
+        return Err[bool]("v3 oracle plane: payload cid mismatch")
+    return Ok[bool](true)

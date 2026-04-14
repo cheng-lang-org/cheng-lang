@@ -1,0 +1,50 @@
+import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+
+importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+
+fn main(): int32 =
+    var statePath: str
+    statePath = ""
+    let hasStatePath = driver_c_read_flag_value_bridge("--state", statePath)
+    if !hasStatePath || cli.v3ChainNodeCliTextEmpty(statePath):
+        echo("v3 chain_node: missing --state")
+        return 2
+    var host: str
+    host = ""
+    let hasHost = driver_c_read_flag_value_bridge("--host", host)
+    let hostValue = if hasHost && len(host) > 0: host else: "127.0.0.1"
+    let port = driver_c_read_int32_flag_or_default_bridge("--port", -1)
+    if port <= 0:
+        echo("v3 chain_node: sync-once requires --port")
+        return 2
+    let loadRes = cli.v3ChainNodeCliLoadOrInitForSync(statePath)
+    if IsErr(loadRes):
+        echo(Error(loadRes))
+        return 2
+    var state = Value(loadRes)
+    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce(hostValue,
+                                                              port,
+                                                              types.v3Libp2pProtocolSync)
+    if !payloadRes.ok:
+        echo(payloadRes.error)
+        return 2
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(payloadRes.value)
+    if IsErr(snapshotRes):
+        echo(Error(snapshotRes))
+        return 2
+    let syncRes = node.v3ChainNodeSyncOnce(state, Value(snapshotRes))
+    if !syncRes.ok:
+        echo(syncRes.error)
+        return 2
+    if !cli.v3ChainNodeCliWriteState(statePath, node.v3ChainNodeServeOnce(state)):
+        echo("v3 chain_node: failed to persist state: " +
+             cli.v3ChainNodeCliAbsolutePath(statePath))
+        return 2
+    echo("changed=" + (syncRes.value ? "1" else: "0"))
+    echo(cli.v3ChainNodeCliSnapshotReport(node.v3ChainNodeServeOnce(state)))
+    return 0

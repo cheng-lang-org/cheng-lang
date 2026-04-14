@@ -347,19 +347,7 @@ fn msquicTls13ComputeSharedSecret(state: var MsQuicTls13HandshakeState): Result[
     if state.localKeyShareGroup == tlsGroupX25519:
         return curve25519SharedKey(state.localKeySharePriv, peerKey)
     if state.localKeyShareGroup == tlsGroupSecp256r1:
-        let privRes: Result[EcPrivateKey] = ecdsaPrivateKeyFromBytes(state.localKeySharePriv)
-        if IsErr(privRes):
-            return Err[Bytes](ErrorText(privRes))
-        let pubRes: Result[EcPublicKey] = ecdsaPublicKeyFromBytes(peerKey)
-        if IsErr(pubRes):
-            return Err[Bytes](ErrorText(pubRes))
-        let pRes: Result[EcPoint] = pointMul(Value(privRes).d, Value(pubRes).point)
-        if IsErr(pRes):
-            return Err[Bytes](ErrorText(pRes))
-        let p: EcPoint = Value(pRes)
-        if p.inf:
-            return Err[Bytes]("tls13: invalid ecdh point")
-        return Ok[Bytes](bigToBytes(p.x, 32))
+        return ecdhP256SharedSecretBytes(state.localKeySharePriv, peerKey)
     return Err[Bytes]("tls13: unsupported key share group")
 
 fn msquicTls13ComputeHandshakeSecrets(state: var MsQuicTls13HandshakeState): Result[bool] =
@@ -1464,10 +1452,7 @@ fn msquicTls13ParseCertificateVerify(state: var MsQuicTls13HandshakeState, data:
             return Err[bool]("tls13: sig hash mismatch")
         if state.peerLeaf.publicKey.kind != X509KeyEcdsaP256:
             return Err[bool]("tls13: ecdsa cert required")
-        let sigObjRes: Result[EcSignature] = ecdsaSignatureFromBytes(Value(sigRes).value)
-        if IsErr(sigObjRes):
-            return Err[bool](ErrorText(sigObjRes))
-        ok = ecdsaVerifyTrustedPublicKey(state.peerLeaf.publicKey.ecdsa, msg, Value(sigObjRes))
+        ok = ecdsaVerifyTrustedBytes(state.peerLeaf.publicKey.ecdsaBytes, msg, Value(sigRes).value)
     else:
         return Err[bool]("tls13: unsupported signature scheme")
     state.certVerifyOk = ok

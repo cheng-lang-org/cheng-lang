@@ -1,0 +1,46 @@
+import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
+
+importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
+importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
+
+fn main(): int32 =
+    var statePath: str
+    statePath = ""
+    let hasStatePath = driver_c_read_flag_value_bridge("--state", statePath)
+    if !hasStatePath || cli.v3ChainNodeCliTextEmpty(statePath):
+        echo("v3 chain_node: missing --state")
+        return 2
+    let loadRes = cli.v3ChainNodeCliLoadState(statePath)
+    if IsErr(loadRes):
+        echo(Error(loadRes))
+        return 2
+    var host: str
+    host = ""
+    let hasHost = driver_c_read_flag_value_bridge("--host", host)
+    let hostValue = if hasHost && len(host) > 0: host else: "127.0.0.1"
+    let port = driver_c_read_int32_flag_or_default_bridge("--port", 0)
+    var readyPath: str
+    readyPath = ""
+    let hasReady = driver_c_read_flag_value_bridge("--ready-path", readyPath)
+    let readyPathValue = if hasReady: readyPath else: ""
+    var state = Value(loadRes)
+    let snapshot = node.v3ChainNodeServeOnce(state)
+    if !cli.v3ChainNodeCliWriteState(statePath, snapshot):
+        echo("v3 chain_node: failed to persist state: " +
+             cli.v3ChainNodeCliAbsolutePath(statePath))
+        return 2
+    let payload = net.v3ChainNodeLibp2pEncodeSnapshot(snapshot)
+    let serveRes = tcp_transport.v3Libp2pTcpServePayloadOnce(hostValue,
+                                                             port,
+                                                             types.v3Libp2pProtocolSync,
+                                                             payload,
+                                                             readyPathValue)
+    if !serveRes.ok:
+        echo(serveRes.error)
+        return 2
+    echo(cli.v3ChainNodeCliSnapshotReport(snapshot))
+    return 0
