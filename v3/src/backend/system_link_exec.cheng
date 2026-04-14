@@ -47,10 +47,30 @@ fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub)
             else:
                 add(out, comprun.v3CompilerRuntimeNativePath(rootDir, "v3/runtime/native/v3_program_argv_native.c"))
         elif modulePath == "runtime/program_support_v3":
-            add(out, v3path.v3PathAbsolute(rootDir, "src/runtime/native/system_helpers.c"))
+            add(out, v3path.v3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng"))
         else:
             return Err[str[]]("v3 provider source: unsupported module " + modulePath)
     return Ok[str[]](out)
+
+fn v3SystemLinkExecLinkerFlavor(targetTriple: str): str =
+    if targetTriple == "arm64-apple-darwin":
+        return "ld64"
+    if slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple):
+        return "elf_aarch64_nolibc_internal"
+    if slplan.v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple):
+        return "elf_riscv64_builtin"
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return "coff_pe_builtin"
+    return "system_linker"
+
+fn v3SystemLinkExecLinkerProgram(targetTriple: str): str =
+    if slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple):
+        return "internal_elf_linker"
+    if slplan.v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple):
+        return "builtin_elf_linker_riscv64"
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return "builtin_coff_linker"
+    return "cc"
 
 fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                 req: creq.V3CompilerRequest,
@@ -129,6 +149,20 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     let primaryObjectPath = primaryPlan.outputPath
     if len(primaryObjectPath) > 0:
         add(linkInputs, primaryObjectPath)
+    var linuxNolibcSupportEnabled = false
+    var linuxNolibcRuntimeSourcePath = ""
+    var linuxNolibcRuntimeObjectPath = ""
+    var linuxNolibcStartupSourcePath = ""
+    var linuxNolibcStartupObjectPath = ""
+    if linkPlan.emitKind == creq.v3EmitExe &&
+       slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(linkPlan.targetTriple):
+        linuxNolibcSupportEnabled = true
+        linuxNolibcRuntimeSourcePath = v3path.v3PathAbsolute(rootDir, "src/std/system_helpers_backend_nolibc_linux_aarch64.cheng")
+        linuxNolibcRuntimeObjectPath = linkPlan.outputPath + ".runtime.system_helpers_backend_nolibc_linux_aarch64.o"
+        linuxNolibcStartupSourcePath = v3path.v3PathAbsolute(rootDir, "v3/runtime/native/v3_linux_nolibc_aarch64_entry.S")
+        linuxNolibcStartupObjectPath = linkPlan.outputPath + ".startup.v3_linux_nolibc_aarch64_entry.o"
+        add(linkInputs, linuxNolibcStartupObjectPath)
+        add(linkInputs, linuxNolibcRuntimeObjectPath)
     for i in 0..<linkPlan.providerModules.len:
         let providerModule = linkPlan.providerModules[i]
         var safe = ""
@@ -158,6 +192,15 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         add(objectMissing, "provider_object_paths_incomplete")
     if linkPlan.providerModules.len > 0 && providerSourcePaths.len != linkPlan.providerModules.len:
         add(objectMissing, "provider_source_paths_incomplete")
+    if linuxNolibcSupportEnabled:
+        if len(linuxNolibcRuntimeSourcePath) <= 0 || !v3path.v3PathFileExists(linuxNolibcRuntimeSourcePath):
+            add(objectMissing, "linux_nolibc_runtime_source_missing")
+        if len(linuxNolibcStartupSourcePath) <= 0 || !v3path.v3PathFileExists(linuxNolibcStartupSourcePath):
+            add(objectMissing, "linux_nolibc_startup_source_missing")
+        if len(linuxNolibcRuntimeObjectPath) <= 0:
+            add(objectMissing, "linux_nolibc_runtime_object_path_missing")
+        if len(linuxNolibcStartupObjectPath) <= 0:
+            add(objectMissing, "linux_nolibc_startup_object_path_missing")
     var objectPlan: objplan.V3ObjectPlanStub
     objectPlan.workspaceRoot = linkPlan.workspaceRoot
     objectPlan.packageRoot = linkPlan.packageRoot
@@ -166,6 +209,11 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     objectPlan.outputPath = linkPlan.outputPath
     objectPlan.targetTriple = linkPlan.targetTriple
     objectPlan.primaryObjectPath = primaryObjectPath
+    objectPlan.linuxNolibcSupportEnabled = linuxNolibcSupportEnabled
+    objectPlan.linuxNolibcRuntimeSourcePath = linuxNolibcRuntimeSourcePath
+    objectPlan.linuxNolibcRuntimeObjectPath = linuxNolibcRuntimeObjectPath
+    objectPlan.linuxNolibcStartupSourcePath = linuxNolibcStartupSourcePath
+    objectPlan.linuxNolibcStartupObjectPath = linuxNolibcStartupObjectPath
     objectPlan.providerModules = linkPlan.providerModules
     objectPlan.providerSourcePaths = providerSourcePaths
     objectPlan.providerObjectPaths = providerObjectPaths
@@ -184,9 +232,8 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         add(nativeMissing, "native_link_output_missing")
     if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) <= 0:
         add(nativeMissing, "native_link_entry_symbol_missing")
-    var linkerFlavor = "system_linker"
-    if linkPlan.targetTriple == "arm64-apple-darwin":
-        linkerFlavor = "ld64"
+    let linkerFlavor = v3SystemLinkExecLinkerFlavor(linkPlan.targetTriple)
+    let linkerProgram = v3SystemLinkExecLinkerProgram(linkPlan.targetTriple)
     var outputKind = nplan.v3NativeOutputArtifact
     if linkPlan.emitKind == creq.v3EmitExe:
         outputKind = nplan.v3NativeOutputExecutable
@@ -194,7 +241,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     nativePlan.targetTriple = linkPlan.targetTriple
     nativePlan.emitKind = linkPlan.emitKind
     nativePlan.outputPath = linkPlan.outputPath
-    nativePlan.linkerProgram = "cc"
+    nativePlan.linkerProgram = linkerProgram
     nativePlan.linkerFlavor = linkerFlavor
     nativePlan.outputKind = outputKind
     nativePlan.entrySymbol = linkPlan.entrySymbol
@@ -349,6 +396,15 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     out = out + "provider_object_count=" + intToStr(plan.objectPlan.providerObjectPaths.len) + "\n"
     out = out + "provider_source_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerSourcePaths) + "\n"
     out = out + "provider_object_paths=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.providerObjectPaths) + "\n"
+    out = out + "linux_nolibc_support_enabled=" + (plan.objectPlan.linuxNolibcSupportEnabled ? "1" : "0") + "\n"
+    out = out + "linux_nolibc_runtime_source=" +
+          (len(plan.objectPlan.linuxNolibcRuntimeSourcePath) > 0 ? plan.objectPlan.linuxNolibcRuntimeSourcePath : "-") + "\n"
+    out = out + "linux_nolibc_runtime_object=" +
+          (len(plan.objectPlan.linuxNolibcRuntimeObjectPath) > 0 ? plan.objectPlan.linuxNolibcRuntimeObjectPath : "-") + "\n"
+    out = out + "linux_nolibc_startup_source=" +
+          (len(plan.objectPlan.linuxNolibcStartupSourcePath) > 0 ? plan.objectPlan.linuxNolibcStartupSourcePath : "-") + "\n"
+    out = out + "linux_nolibc_startup_object=" +
+          (len(plan.objectPlan.linuxNolibcStartupObjectPath) > 0 ? plan.objectPlan.linuxNolibcStartupObjectPath : "-") + "\n"
     out = out + "object_link_input_count=" + intToStr(plan.objectPlan.linkInputPaths.len) + "\n"
     out = out + "object_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.linkInputPaths) + "\n"
     out = out + "object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.missingReasons) + "\n"

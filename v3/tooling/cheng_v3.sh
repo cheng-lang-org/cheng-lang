@@ -15,6 +15,14 @@ usage:
   cheng_v3.sh build-backend-driver
   cheng_v3.sh slice-gate
   cheng_v3.sh run-smokes
+  cheng_v3.sh debug-report [seed-flags...]
+  cheng_v3.sh print-symbols [seed-flags...]
+  cheng_v3.sh print-line-map [seed-flags...]
+  cheng_v3.sh print-elf --object:<path> [--report-out:<path>]
+  cheng_v3.sh verify-debug-tools
+  cheng_v3.sh verify-windows-builtin
+  cheng_v3.sh verify-riscv64-builtin
+  cheng_v3.sh run-cross-target-smokes
   cheng_v3.sh print-bootstrap
   cheng_v3.sh print-build-plan
 EOF
@@ -45,6 +53,20 @@ v3_print_build_plan() {
     sh "$root/v3/tooling/build_backend_driver_v3.sh"
   fi
   cat "$root/artifacts/v3_backend_driver/build_backend_driver_v3.report.txt"
+}
+
+v3_stage3_with_contract() {
+  subcmd="$1"
+  shift
+  v3_ensure_bridge
+  . "$bridge_env"
+  exec "$V3_BOOTSTRAP_STAGE3" "$subcmd" --contract-in:"$V3_BOOTSTRAP_STAGE1_SOURCE" "$@"
+}
+
+v3_stage3_plain() {
+  v3_ensure_bridge
+  . "$bridge_env"
+  exec "$V3_BOOTSTRAP_STAGE3" "$@"
 }
 
 v3_run_smokes() {
@@ -87,6 +109,30 @@ case "$cmd" in
     ;;
   run-smokes)
     v3_run_smokes
+    ;;
+  debug-report)
+    v3_stage3_with_contract debug-report "$@"
+    ;;
+  print-symbols)
+    v3_stage3_with_contract print-symbols "$@"
+    ;;
+  print-line-map)
+    v3_stage3_with_contract print-line-map "$@"
+    ;;
+  print-elf)
+    v3_stage3_plain print-elf "$@"
+    ;;
+  verify-debug-tools)
+    exec sh "$root/v3/tooling/verify_debug_tools_v3.sh" "$@"
+    ;;
+  verify-windows-builtin)
+    exec sh "$root/v3/tooling/verify_windows_builtin_linker_v3.sh" "$@"
+    ;;
+  verify-riscv64-builtin)
+    exec sh "$root/v3/tooling/verify_riscv64_builtin_linker_v3.sh" "$@"
+    ;;
+  run-cross-target-smokes)
+    exec sh "$root/v3/tooling/run_v3_windows_riscv_builtin_smokes.sh" "$@"
     ;;
   print-bootstrap)
     v3_print_bootstrap

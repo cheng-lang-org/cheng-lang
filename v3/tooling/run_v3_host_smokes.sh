@@ -39,6 +39,8 @@ ref10_ashr_smoke
 fixed256_curve25519_smoke
 fixedbytes32_seq_index_smoke
 compiler_runtime_smoke
+global_fixed_array_composite_smoke
+multiline_header_indent_smoke
 rwad_serial_state_machine_smoke
 rwad_bft_state_machine_smoke
 parser_path_smoke

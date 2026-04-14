@@ -303,6 +303,7 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `O3` 继续进入 SSA、后 SSA 优化和更强的清理收敛
 - 编译器内部向 `Arena + SoA + int32 index` 收敛
 - UIR call-site ABI lowering 负责 slice / out-ptr / handle / borrow bridge
+- `v3` 自举契约把编译器并行固定为 `two_pass + function_scheduler + thread_local_arena`，用户程序默认仍是确定性单线程
 - dev 轨支持 direct-exe 和更快的反馈闭环
 - release 轨强调稳定发布和系统链接器收敛
 - tooling 强调 canonical 入口和 verify gate
@@ -314,6 +315,16 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `verify_backend_closedloop`
 - `backend_prod_closure`
 - `backend-prod-publish`
+
+## 性能目标与当前状态
+
+Cheng 不把“先自举成功，性能以后再补”当成正确路线。
+
+- 运行时性能目标：核心运行时、热路径程序和数值内核按同机 C `1:1` 对拍
+- 编译性能目标：编译吞吐和关键构建主链不低于同机 C 编译器
+- 当前实际情况：`v3` 的 `stage0 -> stage1 -> stage2 -> stage3`、`program-selfhost` 和 `chain_node` 主链已经打通，但性能闭环还没完全收口；现在能写成硬目标，不能写成“已经达到”
+
+也就是说，今天的 Cheng 已经不是“只能 bootstrap 的壳”，但也还不能在 README 里把运行时性能或编译性能写成既成事实。
 
 ## 快速上手
 

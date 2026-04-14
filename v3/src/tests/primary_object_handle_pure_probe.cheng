@@ -1,0 +1,98 @@
+import std/rawmem_support
+
+@importc("malloc")
+fn cHeapNew(size: int64): ptr
+@importc("realloc")
+fn cHeapResize(p: ptr, size: int64): ptr
+@importc("free")
+fn c_free(p: ptr)
+
+const
+    probe_handle_slot_mod: uint64 = 4294967296
+
+type
+    ProbeHandleSlot =
+        ptr: ptr
+        generation: uint32
+    ProbeHandleSlotPtr = ProbeHandleSlot *
+    Int32Ptr = int32 *
+
+var
+    probe_slots: ProbeHandleSlotPtr
+    probe_slots_len: int32
+    probe_slots_cap: int32
+
+fn probe_slot_at(idx: int32): ProbeHandleSlotPtr =
+    return ProbeHandleSlotPtr(rawmem_support.rawmemPtrAdd(ptr(probe_slots), idx * int32(sizeof ProbeHandleSlot)))
+
+fn probe_ensure_capacity(minCap: int32): bool =
+    if minCap <= probe_slots_cap:
+        return true
+    var newCap: int32 = probe_slots_cap
+    if newCap < 16:
+        newCap = 16
+    while newCap < minCap:
+        if newCap > 1073741823:
+            return false
+        newCap = newCap * 2
+    let bytes: int64 = int64(newCap) * int64(sizeof ProbeHandleSlot)
+    let mem: ptr = cHeapResize(ptr(probe_slots), bytes)
+    if mem == nil:
+        return false
+    probe_slots = ProbeHandleSlotPtr(mem)
+    for i in probe_slots_cap..<newCap:
+        let slot: ProbeHandleSlotPtr = probe_slot_at(i)
+        slot->ptr = nil
+        slot->generation = uint32(1)
+    probe_slots_cap = newCap
+    return true
+
+fn probe_register_ptr(p: ptr): uint64 =
+    if p == nil:
+        return uint64(0)
+    var idx: int32 = -1
+    for i in 0..<probe_slots_len:
+        let slot: ProbeHandleSlotPtr = probe_slot_at(i)
+        if slot->ptr == nil:
+            idx = i
+            break
+    if idx < 0:
+        idx = probe_slots_len
+        if !probe_ensure_capacity(idx + 1):
+            return uint64(0)
+        probe_slots_len = idx + 1
+    let slot: ProbeHandleSlotPtr = probe_slot_at(idx)
+    slot->ptr = p
+    if slot->generation == uint32(0):
+        slot->generation = uint32(1)
+    return uint64(slot->generation) * probe_handle_slot_mod + uint64(idx + 1)
+
+fn main(): int32 =
+    let cell0: ptr = cHeapNew(int64(sizeof int32))
+    if cell0 == nil:
+        return 1
+    *(Int32Ptr(cell0)) = 7
+    let h0: uint64 = probe_register_ptr(cell0)
+    if h0 == uint64(0):
+        c_free(cell0)
+        return 2
+    let slot0: ProbeHandleSlotPtr = probe_slot_at(0)
+    if slot0 == nil || slot0->ptr != cell0:
+        c_free(cell0)
+        return 3
+    slot0->ptr = nil
+    slot0->generation = slot0->generation + uint32(1)
+    if slot0->generation == uint32(0):
+        slot0->generation = uint32(1)
+    let cell1: ptr = cHeapNew(int64(sizeof int32))
+    if cell1 == nil:
+        c_free(cell0)
+        return 4
+    let h1: uint64 = probe_register_ptr(cell1)
+    c_free(cell0)
+    c_free(cell1)
+    if h1 == uint64(0):
+        return 5
+    if h1 == h0:
+        return 6
+    return 0

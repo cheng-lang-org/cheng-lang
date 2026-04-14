@@ -16,6 +16,8 @@ WebAssembly.instantiate(bytes, {
   env: {
     cheng_v3_browser_now_ms_bridge: () => 24680,
     cheng_v3_browser_echo_i32_bridge: (value) => value | 0,
+    cheng_v3_browser_peer_handle_bridge: () => 41,
+    cheng_v3_browser_did_handle_bridge: () => 84,
     cheng_v3_browser_dm_active_count_bridge: () => 7,
     cheng_v3_browser_dm_connect_start_bridge: (peerHandle) => (peerHandle | 0) + 1000,
     cheng_v3_browser_dm_wait_start_bridge: (peerHandle, timeoutMs) => ((peerHandle | 0) ^ (timeoutMs | 0)) | 0,
@@ -32,6 +34,12 @@ WebAssembly.instantiate(bytes, {
   }
   if (typeof exports.browserEchoI32 !== 'function') {
     throw new Error('missing export: browserEchoI32');
+  }
+  if (typeof exports.browserPeerHandle !== 'function') {
+    throw new Error('missing export: browserPeerHandle');
+  }
+  if (typeof exports.browserDidHandle !== 'function') {
+    throw new Error('missing export: browserDidHandle');
   }
   if (typeof exports.browserDmActiveCount !== 'function') {
     throw new Error('missing export: browserDmActiveCount');
@@ -53,6 +61,12 @@ WebAssembly.instantiate(bytes, {
   }
   if ((exports.browserEchoI32(31337) | 0) !== 31337) {
     throw new Error('browserEchoI32 != 31337');
+  }
+  if ((exports.browserPeerHandle() | 0) !== 41) {
+    throw new Error('browserPeerHandle != 41');
+  }
+  if ((exports.browserDidHandle() | 0) !== 84) {
+    throw new Error('browserDidHandle != 84');
   }
   if ((exports.browserDmActiveCount() | 0) !== 7) {
     throw new Error('browserDmActiveCount != 7');

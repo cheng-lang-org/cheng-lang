@@ -1,11 +1,21 @@
 import cheng/v3/tooling/compiler_request as creq
-import cheng/v3/tooling/path as v3path
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/backend/primary_object_plan as pobj
 import cheng/v3/backend/object_plan as objplan
 import cheng/v3/backend/native_link_plan as nplan
 
+fn endsWithText(text: str, suffix: str): bool =
+    if len(suffix) > len(text):
+        return false
+    let start = len(text) - len(suffix)
+    for i in 0..<len(suffix):
+        if text[start + i] != suffix[i]:
+            return false
+    return true
+
 fn main(): int32 =
-    let workspaceRoot = v3path.v3PathCurrentDir()
-    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+    let workspaceRoot = "/tmp/cheng-lang"
+    let outputPath = workspaceRoot + "/artifacts/v3_program_selfhost/program_selfhost_smoke"
     let primaryObjectPath = outputPath + ".primary.o"
     let providerModules = [
         "runtime/compiler_runtime_v3",
@@ -25,17 +35,17 @@ fn main(): int32 =
     ]
     var objectPlan: objplan.V3ObjectPlanStub
     objectPlan.workspaceRoot = workspaceRoot
-    objectPlan.packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    objectPlan.packageRoot = workspaceRoot + "/v3"
     objectPlan.packageId = "cheng/v3"
-    objectPlan.entryPath = v3path.v3PathJoin(workspaceRoot, "v3/src/tests/program_selfhost_smoke.cheng")
+    objectPlan.entryPath = workspaceRoot + "/v3/src/tests/program_selfhost_smoke.cheng"
     objectPlan.outputPath = outputPath
     objectPlan.targetTriple = "arm64-apple-darwin"
     objectPlan.primaryObjectPath = primaryObjectPath
     objectPlan.providerModules = providerModules
     objectPlan.providerSourcePaths = [
-        v3path.v3PathJoin(workspaceRoot, "v3/runtime/native/v3_program_argv_native.c"),
-        v3path.v3PathJoin(workspaceRoot, "v3/runtime/native/v3_core_runtime_stub.c"),
-        v3path.v3PathJoin(workspaceRoot, "src/runtime/native/system_helpers.c")
+        workspaceRoot + "/v3/runtime/native/v3_program_argv_native.c",
+        workspaceRoot + "/v3/runtime/native/v3_core_runtime_stub.c",
+        workspaceRoot + "/v3/src/runtime/program_support_backend_v3.cheng"
     ]
     objectPlan.providerObjectPaths = providerObjectPaths
     objectPlan.linkInputPaths = linkInputs
@@ -55,9 +65,7 @@ fn main(): int32 =
     nativePlan.linkInputPaths = objectPlan.linkInputPaths
     nativePlan.missingReasons = []
     nativePlan.pipelineStage = "object_plan_to_native_link_plan_stub"
-    assert(v3path.v3TextSlice(objectPlan.primaryObjectPath,
-                              objectPlan.primaryObjectPath.len - 10,
-                              10) == ".primary.o",
+    assert(endsWithText(objectPlan.primaryObjectPath, ".primary.o"),
            "v3 object plan: primary object suffix")
     assert(objectPlan.providerObjectPaths.len == 3, "v3 object plan: provider count")
     assert(objectPlan.providerSourcePaths.len == 3, "v3 object plan: provider sources")
@@ -65,9 +73,27 @@ fn main(): int32 =
     assert(nativePlan.linkerProgram == "cc", "v3 native link plan: linker program")
     assert(nativePlan.linkerFlavor == "ld64", "v3 native link plan: linker flavor")
     assert(nativePlan.outputKind == nplan.v3NativeOutputExecutable, "v3 native link plan: output kind")
-    assert(v3path.v3TextSlice(nativePlan.primaryObjectPath,
-                              nativePlan.primaryObjectPath.len - 10,
-                              10) == ".primary.o",
+    assert(endsWithText(nativePlan.primaryObjectPath, ".primary.o"),
            "v3 native link plan: primary object suffix")
+    assert(slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("aarch64-unknown-linux-gnu"),
+           "v3 target matrix: linux aarch64 nolibc")
+    assert(!slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("riscv64-unknown-linux-gnu"),
+           "v3 target matrix: riscv64 not nolibc")
+    assert(slplan.v3SystemLinkPlanTargetIsElfObject("riscv64-unknown-linux-gnu"),
+           "v3 target matrix: riscv64 elf")
+    assert(slplan.v3SystemLinkPlanTargetIsElfObject("x86_64-unknown-linux-gnu"),
+           "v3 target matrix: linux x86_64 elf")
+    assert(slplan.v3SystemLinkPlanTargetIsCoffObject("aarch64-pc-windows-msvc"),
+           "v3 target matrix: windows aarch64 coff")
+    assert(slplan.v3SystemLinkPlanTargetIsCoffObject("x86_64-pc-windows-msvc"),
+           "v3 target matrix: windows x86_64 coff")
+    assert(pobj.v3PrimaryObjectFormat("aarch64-unknown-linux-gnu") == "elf",
+           "v3 primary object format: linux aarch64")
+    assert(pobj.v3PrimaryObjectFormat("riscv64-unknown-linux-gnu") == "elf",
+           "v3 primary object format: linux riscv64")
+    assert(pobj.v3PrimaryObjectFormat("aarch64-pc-windows-msvc") == "coff",
+           "v3 primary object format: windows aarch64")
+    assert(pobj.v3PrimaryObjectFormat("x86_64-pc-windows-msvc") == "coff",
+           "v3 primary object format: windows x86_64")
     echo("v3 object_native_link_plan_smoke ok")
     return 0

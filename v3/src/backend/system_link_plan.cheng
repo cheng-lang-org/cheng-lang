@@ -75,8 +75,42 @@ fn v3SystemLinkPlanDeriveExecutionTrack(moduleKind: V3SystemModuleKind): crun.V3
         return crun.v3CompilerTrackTooling
     return crun.v3CompilerTrackProgram
 
+fn v3SystemLinkPlanTargetIsLinuxX8664(targetTriple: str): bool =
+    return targetTriple == "x86_64-unknown-linux-gnu"
+
+fn v3SystemLinkPlanTargetIsLinuxAarch64(targetTriple: str): bool =
+    return targetTriple == "aarch64-unknown-linux-gnu" || targetTriple == "arm64-unknown-linux-gnu"
+
+fn v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple: str): bool =
+    return targetTriple == "riscv64-unknown-linux-gnu"
+
+fn v3SystemLinkPlanTargetIsWindowsAarch64(targetTriple: str): bool =
+    return targetTriple == "aarch64-pc-windows-msvc" || targetTriple == "arm64-pc-windows-msvc"
+
+fn v3SystemLinkPlanTargetIsWindowsX8664(targetTriple: str): bool =
+    return targetTriple == "x86_64-pc-windows-msvc"
+
+fn v3SystemLinkPlanTargetIsWindows(targetTriple: str): bool =
+    return v3SystemLinkPlanTargetIsWindowsAarch64(targetTriple) ||
+           v3SystemLinkPlanTargetIsWindowsX8664(targetTriple)
+
+fn v3SystemLinkPlanTargetIsElfObject(targetTriple: str): bool =
+    return v3SystemLinkPlanTargetIsLinuxAarch64(targetTriple) ||
+           v3SystemLinkPlanTargetIsLinuxX8664(targetTriple) ||
+           v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple)
+
+fn v3SystemLinkPlanTargetIsCoffObject(targetTriple: str): bool =
+    return v3SystemLinkPlanTargetIsWindows(targetTriple)
+
+fn v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple: str): bool =
+    return v3SystemLinkPlanTargetIsLinuxAarch64(targetTriple)
+
 fn v3SystemLinkPlanTargetNeedsNativeProviders(targetTriple: str): bool =
     return targetTriple != "wasm32-unknown-unknown"
+
+fn v3SystemLinkPlanTargetRequiresNativeProviderModules(targetTriple: str): bool =
+    return v3SystemLinkPlanTargetNeedsNativeProviders(targetTriple) &&
+           !v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple)
 
 fn v3SystemLinkPlanWorkspaceRoot(plan: V3SystemLinkPlanStub): str =
     return plan.workspaceRoot
@@ -174,7 +208,7 @@ fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
     if emitKind == creq.v3EmitExe && runtimeTargets.len <= 0:
         add(missing, "runtime_targets_not_lowered")
     if emitKind == creq.v3EmitExe &&
-       v3SystemLinkPlanTargetNeedsNativeProviders(targetTriple) &&
+       v3SystemLinkPlanTargetRequiresNativeProviderModules(targetTriple) &&
        providerModules.len <= 0:
         add(missing, "runtime_provider_modules_not_selected")
     return missing
@@ -204,10 +238,11 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
         add(runtimeTargets, crun.v3CompilerToolingArgvRuntimeTarget())
     else:
         add(runtimeTargets, crun.v3CompilerProgramArgvRuntimeTarget())
-    if v3SystemLinkPlanTargetNeedsNativeProviders(requestTargetTriple):
-        add(providerModules, crun.v3CompilerRuntimeProviderModule())
-        add(providerModules, crun.v3CoreRuntimeProviderModule())
-        add(providerModules, crun.v3ProgramSupportProviderModule())
+    if v3SystemLinkPlanTargetRequiresNativeProviderModules(requestTargetTriple):
+        if toolingTrack:
+            crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackTooling, providerModules)
+        else:
+            crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackProgram, providerModules)
     let entrySymbol = v3SystemLinkPlanDeriveEntrySymbol(parsed, requestEmitKind)
     let missing = v3SystemLinkPlanMissingReasons(parsed,
                                                  requestEmitKind,
