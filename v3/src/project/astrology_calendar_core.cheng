@@ -99,7 +99,9 @@ fn v3AstrologyGregorianDaysInMonth(year: int32, month: int32): int32 =
     if month == 4 || month == 6 || month == 9 || month == 11:
         return 30
     if month == 2:
-        return v3AstrologyIsGregorianLeapYear(year) ? 29 : 28
+        if v3AstrologyIsGregorianLeapYear(year):
+            return 29
+        return 28
     return 0
 
 fn v3AstrologySolarDateValid(solar: V3AstrologySolarDate): bool =
@@ -134,62 +136,127 @@ fn v3AstrologyJdnToSolar(jdn: int32): V3AstrologySolarDate =
     let year = 100 * b + d - 4800 + (m / 10)
     return v3AstrologySolarDateMake(year, month, day, 0, 0)
 
-fn v3AstrologyLunarMonthRaw(lunar: V3AstrologyLunarDate): int32 =
-    return lunar.leap ? -lunar.month : lunar.month
+fn v3AstrologyLunarYearCode(year: int32): Result[int32] =
+    let baseYear = table.v3AstrologyLunarYearCodeBaseYear()
+    let lastYear = table.v3AstrologyLunarYearCodeLastYear()
+    if year < baseYear || year > lastYear:
+        return Err[int32]("v3 astrology calendar: lunar year out of range")
+    let codes = table.v3AstrologyLunarYearCodes()
+    return Ok[int32](codes[year - baseYear])
 
-fn v3AstrologyFindMonthRecordByJdn(jdn: int32): Result[table.V3AstrologyLunarMonthRecord] =
-    let rows = table.v3AstrologyLunarMonthTableFlat()
-    var i = 0
-    while i + 3 < rows.len:
-        let lunarYear = rows[i]
-        let lunarMonthRaw = rows[i + 1]
-        let firstJdn = rows[i + 2]
-        let dayCount = rows[i + 3]
-        if jdn >= firstJdn && jdn < firstJdn + dayCount:
-            return Ok[table.V3AstrologyLunarMonthRecord](
-                table.v3AstrologyLunarMonthRecordMake(lunarYear, lunarMonthRaw, firstJdn, dayCount))
-        i = i + 4
-    return Err[table.V3AstrologyLunarMonthRecord]("v3 astrology calendar: jdn out of lunar table range")
+fn v3AstrologyLunarLeapMonthFromCode(code: int32): int32 =
+    return code & 0x0f
 
-fn v3AstrologyFindMonthRecordByLunar(lunarYear: int32,
-                                     lunarMonthRaw: int32): Result[table.V3AstrologyLunarMonthRecord] =
-    let rows = table.v3AstrologyLunarMonthTableFlat()
-    var i = 0
-    while i + 3 < rows.len:
-        let rowYear = rows[i]
-        let rowMonthRaw = rows[i + 1]
-        if rowYear == lunarYear && rowMonthRaw == lunarMonthRaw:
-            return Ok[table.V3AstrologyLunarMonthRecord](
-                table.v3AstrologyLunarMonthRecordMake(rowYear, rowMonthRaw, rows[i + 2], rows[i + 3]))
-        i = i + 4
-    return Err[table.V3AstrologyLunarMonthRecord]("v3 astrology calendar: lunar month not found")
+fn v3AstrologyLunarLeapDaysFromCode(code: int32): int32 =
+    if v3AstrologyLunarLeapMonthFromCode(code) == 0:
+        return 0
+    if ((code >> 4) & 1) == 1:
+        return 30
+    return 29
+
+fn v3AstrologyLunarMonthDaysFromCode(code: int32, month: int32): int32 =
+    if month < 1 || month > 12:
+        return 0
+    if ((code >> (month + 4)) & 1) == 1:
+        return 30
+    return 29
+
+fn v3AstrologyLunarYearDaysFromCode(code: int32): int32 =
+    var total = 0
+    var month = 1
+    while month <= 12:
+        total = total + v3AstrologyLunarMonthDaysFromCode(code, month)
+        month = month + 1
+    total = total + v3AstrologyLunarLeapDaysFromCode(code)
+    return total
+
+fn v3AstrologyLunarYearStartJdn(year: int32): Result[int32] =
+    let codeRes = v3AstrologyLunarYearCode(year)
+    if IsErr(codeRes):
+        return Err[int32](Error(codeRes))
+    let baseYear = table.v3AstrologyLunarYearCodeBaseYear()
+    let baseJdn = table.v3AstrologyLunarYearBaseJdn()
+    let codes = table.v3AstrologyLunarYearCodes()
+    var out = baseJdn
+    var idx = 0
+    let target = year - baseYear
+    while idx < target:
+        out = out + v3AstrologyLunarYearDaysFromCode(codes[idx])
+        idx = idx + 1
+    return Ok[int32](out)
 
 fn v3AstrologyLunarFromSolar(solar: V3AstrologySolarDate): Result[V3AstrologyLunarDate] =
     if !v3AstrologySolarDateValid(solar):
         return Err[V3AstrologyLunarDate]("v3 astrology calendar: invalid solar date")
     let jdn = v3AstrologyGregorianToJdn(solar.year, solar.month, solar.day)
-    let recordRes = v3AstrologyFindMonthRecordByJdn(jdn)
-    if IsErr(recordRes):
-        return Err[V3AstrologyLunarDate](Error(recordRes))
-    let record = Value(recordRes)
-    return Ok[V3AstrologyLunarDate](v3AstrologyLunarDateMake(record.lunarYear,
-                                                             record.lunarMonthRaw < 0 ? -record.lunarMonthRaw : record.lunarMonthRaw,
-                                                             jdn - record.firstJdn + 1,
-                                                             record.lunarMonthRaw < 0))
+    let baseYear = table.v3AstrologyLunarYearCodeBaseYear()
+    let codes = table.v3AstrologyLunarYearCodes()
+    var lunarYear = baseYear
+    var yearStart = table.v3AstrologyLunarYearBaseJdn()
+    var idx = 0
+    while idx < codes.len:
+        let code = codes[idx]
+        let yearDays = v3AstrologyLunarYearDaysFromCode(code)
+        if jdn < yearStart + yearDays:
+            let leapMonth = v3AstrologyLunarLeapMonthFromCode(code)
+            var monthStart = yearStart
+            var month = 1
+            while month <= 12:
+                let normalDays = v3AstrologyLunarMonthDaysFromCode(code, month)
+                if jdn < monthStart + normalDays:
+                    return Ok[V3AstrologyLunarDate](v3AstrologyLunarDateMake(lunarYear,
+                                                                             month,
+                                                                             jdn - monthStart + 1,
+                                                                             false))
+                monthStart = monthStart + normalDays
+                if leapMonth == month:
+                    let leapDays = v3AstrologyLunarLeapDaysFromCode(code)
+                    if jdn < monthStart + leapDays:
+                        return Ok[V3AstrologyLunarDate](v3AstrologyLunarDateMake(lunarYear,
+                                                                                 month,
+                                                                                 jdn - monthStart + 1,
+                                                                                 true))
+                    monthStart = monthStart + leapDays
+                month = month + 1
+            return Err[V3AstrologyLunarDate]("v3 astrology calendar: lunar decode overflow")
+        yearStart = yearStart + yearDays
+        lunarYear = lunarYear + 1
+        idx = idx + 1
+    return Err[V3AstrologyLunarDate]("v3 astrology calendar: solar date out of lunar table range")
 
 fn v3AstrologySolarFromLunar(lunar: V3AstrologyLunarDate): Result[V3AstrologySolarDate] =
-    if lunar.year < 1899 || lunar.year > 2101:
+    if lunar.year < table.v3AstrologyLunarYearCodeBaseYear() || lunar.year > table.v3AstrologyLunarYearCodeLastYear():
         return Err[V3AstrologySolarDate]("v3 astrology calendar: lunar year out of range")
     if lunar.month < 1 || lunar.month > 12:
         return Err[V3AstrologySolarDate]("v3 astrology calendar: invalid lunar month")
-    let recordRes = v3AstrologyFindMonthRecordByLunar(lunar.year, v3AstrologyLunarMonthRaw(lunar))
-    if IsErr(recordRes):
-        return Err[V3AstrologySolarDate](Error(recordRes))
-    let record = Value(recordRes)
-    if lunar.day < 1 || lunar.day > record.dayCount:
-        return Err[V3AstrologySolarDate]("v3 astrology calendar: invalid lunar day")
-    let solar = v3AstrologyJdnToSolar(record.firstJdn + lunar.day - 1)
-    return Ok[V3AstrologySolarDate](solar)
+    let codeRes = v3AstrologyLunarYearCode(lunar.year)
+    if IsErr(codeRes):
+        return Err[V3AstrologySolarDate](Error(codeRes))
+    let code = Value(codeRes)
+    let leapMonth = v3AstrologyLunarLeapMonthFromCode(code)
+    if lunar.leap && leapMonth != lunar.month:
+        return Err[V3AstrologySolarDate]("v3 astrology calendar: invalid leap lunar month")
+    let yearStartRes = v3AstrologyLunarYearStartJdn(lunar.year)
+    if IsErr(yearStartRes):
+        return Err[V3AstrologySolarDate](Error(yearStartRes))
+    var monthStart = Value(yearStartRes)
+    var month = 1
+    while month <= 12:
+        let normalDays = v3AstrologyLunarMonthDaysFromCode(code, month)
+        if lunar.month == month && !lunar.leap:
+            if lunar.day < 1 || lunar.day > normalDays:
+                return Err[V3AstrologySolarDate]("v3 astrology calendar: invalid lunar day")
+            return Ok[V3AstrologySolarDate](v3AstrologyJdnToSolar(monthStart + lunar.day - 1))
+        monthStart = monthStart + normalDays
+        if leapMonth == month:
+            let leapDays = v3AstrologyLunarLeapDaysFromCode(code)
+            if lunar.month == month && lunar.leap:
+                if lunar.day < 1 || lunar.day > leapDays:
+                    return Err[V3AstrologySolarDate]("v3 astrology calendar: invalid lunar day")
+                return Ok[V3AstrologySolarDate](v3AstrologyJdnToSolar(monthStart + lunar.day - 1))
+            monthStart = monthStart + leapDays
+        month = month + 1
+    return Err[V3AstrologySolarDate]("v3 astrology calendar: lunar month not found")
 
 fn v3AstrologyStemText(index: int32): str =
     let idx = v3AstrologyNormalizeMod(index, 10)
@@ -228,7 +295,9 @@ fn v3AstrologyDayGanzhiIndexFromJdn(jdn: int32): int32 =
 
 fn v3AstrologyHourBranchIndex(hour: int32, minute: int32): int32 =
     let normalizedHour = v3AstrologyNormalizeMod(hour, 24)
-    let normalizedMinute = minute < 0 ? 0 : minute
+    var normalizedMinute = minute
+    if normalizedMinute < 0:
+        normalizedMinute = 0
     if normalizedHour == 23:
         return 0
     let totalMinutes = normalizedHour * 60 + normalizedMinute
@@ -282,9 +351,12 @@ fn v3AstrologySolarText(solar: V3AstrologySolarDate): str =
         + strings.intToStr(solar.minute)
 
 fn v3AstrologyLunarText(lunar: V3AstrologyLunarDate): str =
+    var leapText = ""
+    if lunar.leap:
+        leapText = "闰"
     return strings.intToStr(lunar.year)
         + "年"
-        + (lunar.leap ? "闰" : "")
+        + leapText
         + strings.intToStr(lunar.month)
         + "月"
         + strings.intToStr(lunar.day)

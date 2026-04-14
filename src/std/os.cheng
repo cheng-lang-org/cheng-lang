@@ -119,6 +119,9 @@ fn cheng_exec_file_capture_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq:
 @importc("cheng_exec_file_status")
 fn cheng_exec_file_status_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq: ptr,
                               workingDir: cstring, timeoutSec: int32): int64
+@importc("cheng_exec_file_pipe_spawn")
+fn cheng_exec_file_pipe_spawn_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq: ptr,
+                                  workingDir: cstring, readFd: var int32, writeFd: var int32, pid: var int64): int32
 @importc("driver_c_read_file_all_bridge_into")
 fn driver_c_read_file_all_bridge_into(path: cstring, out: var str)
 @importc("cheng_pty_is_supported")
@@ -140,6 +143,10 @@ fn cheng_pty_close(fd: int32): int32
 @importc("cheng_pty_wait")
 @ffi_out_ptrs(arg1)
 fn cheng_pty_wait(pid: int64): tuple[int32, int32]
+@importc("cheng_process_signal")
+fn cheng_process_signal_raw(pid: int64, signalCode: int32): int32
+@importc("usleep")
+fn libc_usleep(microseconds: uint32): int32
 importc fn cheng_errno(): int32
 importc fn cheng_strerror(err: int32): cstring
 importc fn libc_socket(domain: int32, typ: int32, protocol: int32): int32
@@ -688,6 +695,21 @@ fn execFileStatus(filePath: str, argv: str[], envOverrides: str[],
                                                  workingDirPtr,
                                                  timeoutSec)
     return int32(rc64)
+fn execFilePipeSpawn(filePath: str, argv: str[], envOverrides: str[],
+                     workingDir: str): tuple[bool, int32, int32, int64] =
+    var readFd: int32 = -1
+    var writeFd: int32 = -1
+    var pid: int64 = -1
+    if strings.len(filePath) == 0:
+        return (false, readFd, writeFd, pid)
+    let status: int32 = cheng_exec_file_pipe_spawn_raw(strToCStringTemp(filePath),
+                                                       ptr(argv),
+                                                       ptr(envOverrides),
+                                                       strToCStringTemp(workingDir),
+                                                       readFd,
+                                                       writeFd,
+                                                       pid)
+    return (status != 0, readFd, writeFd, pid)
 fn execCmdResultExitCode(result: ExecCmdResult): int32 =
     return result.exitCode
 fn execCmdResultOutput(result: ExecCmdResult): str =
@@ -723,6 +745,12 @@ fn ptyClose(fd: int32) =
     cheng_pty_close fd
 fn ptyWait(pid: int64): tuple[int32, int32] =
     return cheng_pty_wait(pid)
+fn processSignal(pid: int64, signalCode: int32): bool =
+    return cheng_process_signal_raw(pid, signalCode) == 0
+fn sleepMs(value: int32) =
+    if value <= 0:
+        return
+    libc_usleep(uint32(value * 1000))
 fn readFileSizedInto(path: str, size: int32, out: var str): bool =
     var f: File = openRead(path)
     if f == nil:

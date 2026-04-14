@@ -27,7 +27,7 @@ extern "C" {
 #define CHENG_WEAK_IMPORT __attribute__((weak))
 #endif
 
-/* Runtime hooks provided by system_helpers.c */
+/* Runtime hooks provided by the backend runtime surface. */
 extern int32_t cheng_file_exists(const char *path);
 extern int64_t cheng_file_mtime(const char *path);
 extern int64_t cheng_file_size(const char *path);
@@ -490,6 +490,20 @@ static int driver_c_resolve_self_path(const char *argv0, char *out, size_t out_c
     }
   }
 #endif
+#if defined(__linux__)
+  {
+    ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1u);
+    if (n > 0 && (size_t)n < sizeof(raw)) {
+      raw[n] = '\0';
+      resolved = realpath(raw, out);
+      if (resolved != NULL) return 1;
+      if (strlen(raw) < out_cap) {
+        snprintf(out, out_cap, "%s", raw);
+        return 1;
+      }
+    }
+  }
+#endif
   if (argv0 != NULL && argv0[0] != '\0') {
     resolved = realpath(argv0, out);
     if (resolved != NULL) return 1;
@@ -621,7 +635,7 @@ int32_t driver_c_backend_usage(void) {
   fputs("  --module-cache-unstable-allow --module-cache-unstable-allow:0|1\n", stderr);
   fputs("  --multi --no-multi --multi-force --no-multi-force\n", stderr);
   fputs("  --incremental --no-incremental --allow-no-main\n", stderr);
-  fputs("  --skip-global-init --runtime-obj:<path> --runtime-c:<path> --no-runtime-c\n", stderr);
+  fputs("  --skip-global-init --runtime-obj:<path> --no-runtime-c\n", stderr);
   fputs("  --generic-mode:<dict> --generic-spec-budget:<N>\n", stderr);
   fputs("  --borrow-ir:<mir|stage1> --generic-lowering:<mir_dict>\n", stderr);
   fputs("  --android-api:<N> --compile-stamp-out:<path>\n", stderr);
@@ -1388,6 +1402,78 @@ static int32_t driver_c_repo_root_from_tooling_input(const char *input_path,
   return 1;
 }
 
+static int driver_c_try_runtime_obj_path(const char *path, char *out, size_t out_cap) {
+  size_t n;
+  if (path == NULL || path[0] == '\0' || out == NULL || out_cap == 0) return 0;
+  if (access(path, R_OK) != 0) return 0;
+  n = strlen(path);
+  if (n + 1u > out_cap) return 0;
+  memcpy(out, path, n + 1u);
+  return 1;
+}
+
+static int driver_c_try_runtime_obj_under_root(const char *root,
+                                               const char *target,
+                                               char *out,
+                                               size_t out_cap) {
+  static const char *target_templates[] = {
+      "chengcache/runtime_selflink/system_helpers.backend.fullcompat.%s.o",
+      "chengcache/runtime_selflink/system_helpers.backend.combined.%s.o",
+      "artifacts/backend_mm/system_helpers.backend.combined.%s.o",
+      "chengcache/system_helpers.backend.cheng.%s.o",
+  };
+  static const char *static_candidates[] = {
+      "artifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o",
+      "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o",
+      "chengcache/system_helpers.backend.cheng.o",
+      "artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o",
+  };
+  char rel[PATH_MAX];
+  char candidate[PATH_MAX];
+  size_t i;
+  if (root == NULL || root[0] == '\0' || out == NULL || out_cap == 0) return 0;
+  if (target != NULL && target[0] != '\0') {
+    for (i = 0; i < sizeof(target_templates) / sizeof(target_templates[0]); ++i) {
+      if (snprintf(rel, sizeof(rel), target_templates[i], target) <= 0) continue;
+      if (snprintf(candidate, sizeof(candidate), "%s/%s", root, rel) <= 0) continue;
+      if (driver_c_try_runtime_obj_path(candidate, out, out_cap)) return 1;
+    }
+  }
+  for (i = 0; i < sizeof(static_candidates) / sizeof(static_candidates[0]); ++i) {
+    if (snprintf(candidate, sizeof(candidate), "%s/%s", root, static_candidates[i]) <= 0) continue;
+    if (driver_c_try_runtime_obj_path(candidate, out, out_cap)) return 1;
+  }
+  return 0;
+}
+
+static int driver_c_resolve_runtime_obj(const char *target, char *out, size_t out_cap) {
+  char self_path[PATH_MAX];
+  char root[PATH_MAX];
+  const char *env_runtime_obj = getenv("BACKEND_RUNTIME_OBJ");
+  const char *env_root = getenv("TOOLING_ROOT");
+  const char *input_path = getenv("BACKEND_INPUT");
+  const char *target_text = (target != NULL && target[0] != '\0') ? target : driver_c_host_target_default();
+  if (driver_c_try_runtime_obj_path(env_runtime_obj, out, out_cap)) return 1;
+  if (env_root != NULL && env_root[0] != '\0' &&
+      driver_c_try_runtime_obj_under_root(env_root, target_text, out, out_cap)) {
+    return 1;
+  }
+  if (driver_c_repo_root_from_tooling_input(input_path, root, sizeof(root)) &&
+      driver_c_try_runtime_obj_under_root(root, target_text, out, out_cap)) {
+    return 1;
+  }
+  if (driver_c_resolve_self_path(NULL, self_path, sizeof(self_path)) &&
+      driver_c_stage0_repo_root_from_path(self_path, root, sizeof(root)) &&
+      driver_c_try_runtime_obj_under_root(root, target_text, out, out_cap)) {
+    return 1;
+  }
+  if (getcwd(root, sizeof(root)) != NULL &&
+      driver_c_try_runtime_obj_under_root(root, target_text, out, out_cap)) {
+    return 1;
+  }
+  return 0;
+}
+
 static int32_t driver_c_write_executable_text(const char *out_path, const char *text) {
   FILE *fp;
   size_t want;
@@ -1619,9 +1705,8 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
                                       const char *target, const char *linker) {
   const char *target_text = (target != NULL) ? target : "";
   const char *linker_text = (linker != NULL && linker[0] != '\0') ? linker : "system";
-  const char *runtime_c = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
-  const char *runtime_obj = getenv("BACKEND_RUNTIME_OBJ");
-  const char *runtime_input = runtime_c;
+  char runtime_obj_buf[PATH_MAX];
+  const char *runtime_input = NULL;
   const char *cflags = getenv("BACKEND_CFLAGS");
   const char *ldflags = getenv("BACKEND_LDFLAGS");
   const char *cflags_text = (cflags != NULL) ? cflags : "";
@@ -1634,11 +1719,12 @@ int32_t driver_c_link_tmp_obj_default(const char *output_path, const char *obj_p
   if (output_path == NULL || output_path[0] == '\0') return -20;
   if (obj_path == NULL || obj_path[0] == '\0') return -21;
   if (strcmp(linker_text, "system") != 0) return -22;
-  if (driver_c_env_bool("BACKEND_NO_RUNTIME_C", 0) != 0 &&
-      runtime_obj != NULL && runtime_obj[0] != '\0' &&
-      access(runtime_obj, R_OK) == 0) {
-    runtime_input = runtime_obj;
+  runtime_obj_buf[0] = '\0';
+  if (!driver_c_resolve_runtime_obj(target_text, runtime_obj_buf, sizeof(runtime_obj_buf))) {
+    driver_c_diagf("[driver_c_link_tmp_obj_default] missing runtime_obj target='%s'\n", target_text);
+    return -27;
   }
+  runtime_input = runtime_obj_buf;
   const char *base = strrchr(obj_path, '/');
   const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
   int use_driver_entry_shim = strstr(obj_name, "backend_driver") != NULL ||

@@ -3,6 +3,7 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/path as v3path
 
 type
     V3CompilerEmit = enum
@@ -65,6 +66,32 @@ fn v3CompilerEmitText(kind: V3CompilerEmit): str =
 fn v3CompilerDefaultPackageRoot(workspaceRoot: str): str =
     return os.joinPath(workspaceRoot, "v3")
 
+fn v3CompilerPathIsWithinDir(pathRaw: str,
+                             dirRaw: str): bool =
+    let path = v3path.v3PathTrim(pathRaw)
+    var dir = v3path.v3PathTrim(dirRaw)
+    if len(path) <= 0 || len(dir) <= 0:
+        return false
+    while strings.hasSuffix(dir, "/"):
+        dir = v3path.v3TextSlice(dir, 0, dir.len - 1)
+    if path == dir:
+        return true
+    return strutil.startsWith(path, dir + "/")
+
+fn v3CompilerResolvePackageRoot(workspaceRoot: str,
+                                sourcePathRaw: str,
+                                packageRootRaw: str): str =
+    let packageRoot = v3path.v3PathAbsolute(workspaceRoot, packageRootRaw)
+    if len(packageRoot) <= 0 || strings.hasSuffix(packageRoot, "/v3"):
+        return packageRoot
+    if len(sourcePathRaw) <= 0:
+        return packageRoot
+    let sourcePath = v3path.v3PathAbsolute(workspaceRoot, sourcePathRaw)
+    let v3PackageRoot = v3path.v3PathJoin(packageRoot, "v3")
+    if v3CompilerPathIsWithinDir(sourcePath, v3PackageRoot):
+        return v3PackageRoot
+    return packageRoot
+
 fn v3CompilerWorldHeadFromArgs(args: str[]): str =
     return v3CompilerReadFlagOrDefault(args, "--world-head", "")
 
@@ -89,10 +116,11 @@ fn v3CompilerChannelFromArgs(args: str[]): str =
 fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
                                        args: str[],
                                        requireOutput: bool): Result[V3CompilerRequest] =
-    let packageRoot = v3CompilerReadFlagOrDefault(args, "--root", v3CompilerDefaultPackageRoot(workspaceRoot))
     let sourcePath = v3CompilerReadFlagOrDefault(args, "--in", "")
     if len(sourcePath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --in")
+    let packageRootRaw = v3CompilerReadFlagOrDefault(args, "--root", v3CompilerDefaultPackageRoot(workspaceRoot))
+    let packageRoot = v3CompilerResolvePackageRoot(workspaceRoot, sourcePath, packageRootRaw)
     let outputPath = v3CompilerReadFlagOrDefault(args, "--out", "")
     if requireOutput && len(outputPath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --out")

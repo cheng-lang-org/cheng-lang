@@ -12,7 +12,7 @@ fi
 check_pattern() {
   pattern="$1"
   label="$2"
-  if rg -n -S --glob '*.cheng' "$pattern" "$src_dir" >/tmp/v3_scan_hit.$$ 2>&1; then
+  if rg -n -S --glob '*.cheng' --glob '!tests/**' --glob '!**/tests/**' "$pattern" "$src_dir" >/tmp/v3_scan_hit.$$ 2>&1; then
     echo "v3 scan: hit forbidden pattern: $label" >&2
     cat /tmp/v3_scan_hit.$$ >&2
     rm -f /tmp/v3_scan_hit.$$

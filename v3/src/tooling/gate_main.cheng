@@ -1,5 +1,6 @@
 import std/cmdline as cmdline
 import std/os
+import std/result
 import std/strings
 import std/strutils as strutil
 import cheng/v3/lang/intern as langintern
@@ -8,6 +9,7 @@ import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/hotpath_scan as hotscan
 import cheng/v3/tooling/perf_gate as perfgate
 import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/r2c_react_v3 as r2c
 import cheng/v3/backend/build_plan as buildplan
 
 fn v3GatePrintLine(text: str) =
@@ -29,18 +31,68 @@ fn v3GateEnsureArtifactsDir(root: str): bool =
     return v3path.v3MkdirP(root, v3GateArtifactsDir(root))
 
 fn v3GateUsage() =
-    v3GatePrintLine("usage: cheng_v3 <command> [args]")
-    v3GatePrintLine("")
-    v3GatePrintLine("commands:")
-    v3GatePrintLine("  scan-hotpath")
-    v3GatePrintLine("  c-ref")
-    v3GatePrintLine("  compare-bench --baseline:<file> --candidate:<file> [--max-ratio-milli:<N>]")
-    v3GatePrintLine("  bootstrap-bridge")
-    v3GatePrintLine("  build-backend-driver")
-    v3GatePrintLine("  run-smokes")
-    v3GatePrintLine("  print-bootstrap")
-    v3GatePrintLine("  print-build-plan")
-    v3GatePrintLine("  slice-gate")
+    let lines: str[] = v3GateUsageLines()
+    for i in 0..<lines.len:
+        v3GatePrintLine(lines[i])
+
+fn v3GateUsageLines(): str[] =
+    return [
+        "usage: cheng_v3 <command> [args]",
+        "",
+        "commands:",
+        "  scan-hotpath",
+        "  c-ref",
+        "  compare-bench --baseline:<file> --candidate:<file> [--max-ratio-milli:<N>]",
+        "  bootstrap-bridge",
+        "  build-backend-driver",
+        "  run-smokes",
+        "  print-bootstrap",
+        "  print-build-plan",
+        "  slice-gate",
+        "  debug-report [seed-flags...]",
+        "  print-symbols [seed-flags...]",
+        "  print-line-map [seed-flags...]",
+        "  print-object --object:<path> [--report-out:<path>]",
+        "  print-elf --object:<path> [--report-out:<path>]",
+        "  print-asm [seed-flags...]",
+        "  profile-run [seed-flags...]",
+        "  verify-orphan-guard",
+        "  verify-debug-tools",
+        "  verify-debug-runtime",
+        "  verify-debug-profile",
+        "  verify-windows-builtin",
+        "  verify-riscv64-builtin",
+        "  run-cross-target-smokes",
+        "  run-host-smokes [smoke_name ...]",
+        "  run-stage23-libp2p-smokes [smoke_name ...]",
+        "  compile-exe",
+        "  build-zero-exit",
+        "  build-panic-trace",
+        "  build-bounds-trace",
+        "  build-signal-trace",
+        "  build-call-chain",
+        "  build-ffi-handle",
+        "  build-bft-state-machine",
+        "  build-rwad-bft-state-machine",
+        "  build-program-selfhost",
+        "  build-chain-node",
+        "  build-linux-nolibc-exe",
+        "  build-chain-node-linux",
+        "  build-rwad-bft-linux",
+        "  run-linux-object-smokes",
+        "  run-tcp-twoproc-smoke",
+        "  run-udp-importc-smoke",
+        "  run-wasm-smokes",
+        "  run-browser-host-wasm-smoke",
+        "  run-chain-node-cli-smoke",
+        "  run-chain-node-process-smoke",
+        "  run-chain-node-three-node-smoke",
+        "  run-tailnet-control-smoke",
+        "  run-fresh-node-selfhost-gate",
+        "  run-migration-gate",
+        "  run-browser-webrtc-smokes",
+        "  r2c-react-v3 <subcommand> [args]"
+    ]
 
 fn v3GateReadFlag(args: str[], key: str, defaultValue: str): str =
     for i in 0..<args.len:
@@ -58,6 +110,304 @@ fn v3GateCollectArgsFrom(startIndex: int32, count: int32): str[] =
     for i in startIndex..count:
         out.add(cmdline.paramStr(i))
     return out
+
+fn v3GateRunFailed(run: hostops.V3LoggedRun): bool =
+    if hostops.v3LoggedRunOk(run):
+        return false
+    v3GatePrintErr(hostops.v3LoggedRunSummary(run))
+    if len(strutil.strip(run.output)) > 0:
+        v3GatePrintErr(strutil.strip(run.output))
+    return true
+
+fn v3GateMaybePrintRunOutput(run: hostops.V3LoggedRun) =
+    if len(strutil.strip(run.output)) > 0:
+        v3GatePrintLine(strutil.strip(run.output))
+
+fn v3GateBootstrapOutDir(root: str): str =
+    return contracts.v3BootstrapOutDir(root)
+
+fn v3GateBootstrapLog(root: str, name: str): str =
+    return v3path.v3PathAbsolute(root, "artifacts/v3_bootstrap/" + name)
+
+fn v3GateBootstrapTarget(): str =
+    return os.getEnvDefault("V3_TARGET", contracts.v3BootstrapDefaultTarget())
+
+fn v3GateBootstrapEnvText(root: str,
+                          snapshot: contracts.V3BootstrapSnapshot): str =
+    let outDir: str = v3GateBootstrapOutDir(root)
+    return (
+        "V3_ROOT=" + root + "\n" +
+        "V3_TARGET=" + v3GateBootstrapTarget() + "\n" +
+        "V3_BOOTSTRAP_KIND=v3_seed\n" +
+        "V3_BOOTSTRAP_SEED_SOURCE=" + snapshot.seedSource.path + "\n" +
+        "V3_BOOTSTRAP_STAGE1_SOURCE=" + snapshot.stage1Source.path + "\n" +
+        "V3_COMPILER_ENTRY_SOURCE=" + contracts.v3BootstrapCompilerEntrySourcePath(root) + "\n" +
+        "V3_COMPILER_RUNTIME_SOURCE=" + contracts.v3BootstrapCompilerRuntimeSourcePath(root) + "\n" +
+        "V3_COMPILER_REQUEST_SOURCE=" + contracts.v3BootstrapCompilerRequestSourcePath(root) + "\n" +
+        "V3_BOOTSTRAP_STAGE0=" + snapshot.stage0Compiler.path + "\n" +
+        "V3_BOOTSTRAP_STAGE1=" + snapshot.stage1Compiler.path + "\n" +
+        "V3_BOOTSTRAP_STAGE2=" + snapshot.stage2Compiler.path + "\n" +
+        "V3_BOOTSTRAP_STAGE3=" + snapshot.stage3Compiler.path + "\n" +
+        "V3_BOOTSTRAP_ENV=" + snapshot.bootstrapEnv.path + "\n" +
+        "V3_BOOTSTRAP_SNAPSHOT=" + contracts.v3BootstrapSnapshotPath(root) + "\n" +
+        "V3_BOOTSTRAP_STAGE1_REPORT=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage1.report.txt") + "\n" +
+        "V3_BOOTSTRAP_STAGE2_REPORT=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage2.report.txt") + "\n" +
+        "V3_BOOTSTRAP_STAGE3_REPORT=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage3.report.txt") + "\n"
+    )
+
+fn v3GateBootstrapSnapshotText(root: str,
+                               snapshot: contracts.V3BootstrapSnapshot): str =
+    let outDir: str = v3GateBootstrapOutDir(root)
+    return (
+        "target=" + v3GateBootstrapTarget() + "\n" +
+        "bootstrap_kind=v3_seed\n" +
+        "seed_source=" + snapshot.seedSource.path + "\n" +
+        "stage1_source=" + snapshot.stage1Source.path + "\n" +
+        "compiler_entry_source=" + contracts.v3BootstrapCompilerEntrySourcePath(root) + "\n" +
+        "compiler_runtime_source=" + contracts.v3BootstrapCompilerRuntimeSourcePath(root) + "\n" +
+        "compiler_request_source=" + contracts.v3BootstrapCompilerRequestSourcePath(root) + "\n" +
+        "stage0=" + snapshot.stage0Compiler.path + "\n" +
+        "stage1=" + snapshot.stage1Compiler.path + "\n" +
+        "stage2=" + snapshot.stage2Compiler.path + "\n" +
+        "stage3=" + snapshot.stage3Compiler.path + "\n" +
+        "stage1_report=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage1.report.txt") + "\n" +
+        "stage2_report=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage2.report.txt") + "\n" +
+        "stage3_report=" + v3path.v3PathAbsolute(root, outDir + "/cheng.stage3.report.txt") + "\n" +
+        "stage0_build_log=" + v3GateBootstrapLog(root, "cheng.stage0.build.log") + "\n" +
+        "stage0_self_check_log=" + v3GateBootstrapLog(root, "cheng.stage0.self-check.log") + "\n" +
+        "stage1_build_log=" + v3GateBootstrapLog(root, "cheng.stage1.compile.log") + "\n" +
+        "stage1_self_check_log=" + v3GateBootstrapLog(root, "cheng.stage1.self-check.log") + "\n" +
+        "stage2_build_log=" + v3GateBootstrapLog(root, "cheng.stage2.compile.log") + "\n" +
+        "stage2_self_check_log=" + v3GateBootstrapLog(root, "cheng.stage2.self-check.log") + "\n" +
+        "stage3_build_log=" + v3GateBootstrapLog(root, "cheng.stage3.compile.log") + "\n" +
+        "stage3_self_check_log=" + v3GateBootstrapLog(root, "cheng.stage3.self-check.log") + "\n" +
+        "stage2_contract_log=" + v3GateBootstrapLog(root, "cheng.stage2.contract.txt") + "\n" +
+        "stage3_contract_log=" + v3GateBootstrapLog(root, "cheng.stage3.contract.txt") + "\n" +
+        "fixed_point=stage2_stage3_contract_match\n"
+    )
+
+fn v3GateBootstrapStageRun(root: str,
+                           label: str,
+                           binPath: str,
+                           args: str[],
+                           logPath: str): int32 =
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root, label, binPath, args, [], root, 0, logPath)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBootstrapBridge(root: str): int32 =
+    let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+    let outDir: str = v3GateBootstrapOutDir(root)
+    let ccBin: str = os.getEnvDefault("CC", "cc")
+    if !v3path.v3MkdirP(root, outDir):
+        v3GatePrintErr("v3 gate: failed to create bootstrap dir")
+        return 1
+    if !v3path.v3PathFileExists(snapshot.seedSource.path):
+        v3GatePrintErr("v3 gate: missing seed source: " + snapshot.seedSource.path)
+        return 1
+    if !v3path.v3PathFileExists(snapshot.stage1Source.path):
+        v3GatePrintErr("v3 gate: missing stage1 source: " + snapshot.stage1Source.path)
+        return 1
+    var ccArgs: str[] = []
+    ccArgs.add("-std=c11")
+    ccArgs.add("-O2")
+    ccArgs.add("-Wall")
+    ccArgs.add("-Wextra")
+    ccArgs.add("-pedantic")
+    ccArgs.add(snapshot.seedSource.path)
+    ccArgs.add("-o")
+    ccArgs.add(snapshot.stage0Compiler.path)
+    let ccRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(root,
+                                                                "stage0_cc",
+                                                                ccBin,
+                                                                ccArgs,
+                                                                [],
+                                                                root,
+                                                                0,
+                                                                "artifacts/v3_bootstrap/cheng.stage0.build.log")
+    if v3GateRunFailed(ccRun):
+        return ccRun.exitCode
+    if !contracts.v3BootstrapArtifactReady(snapshot.stage0Compiler):
+        v3GatePrintErr("v3 gate: missing stage0 compiler: " + snapshot.stage0Compiler.path)
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage0_self_check",
+                               snapshot.stage0Compiler.path,
+                               ["self-check", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage0.self-check.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage1_compile",
+                               snapshot.stage0Compiler.path,
+                               [
+                                   "compile-bootstrap",
+                                   "--in:" + snapshot.stage1Source.path,
+                                   "--out:" + snapshot.stage1Compiler.path,
+                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage1.report.txt")
+                               ],
+                               "artifacts/v3_bootstrap/cheng.stage1.compile.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage1_self_check",
+                               snapshot.stage1Compiler.path,
+                               ["self-check", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage1.self-check.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage2_compile",
+                               snapshot.stage1Compiler.path,
+                               [
+                                   "compile-bootstrap",
+                                   "--in:" + snapshot.stage1Source.path,
+                                   "--out:" + snapshot.stage2Compiler.path,
+                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage2.report.txt")
+                               ],
+                               "artifacts/v3_bootstrap/cheng.stage2.compile.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage2_self_check",
+                               snapshot.stage2Compiler.path,
+                               ["self-check", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage2.self-check.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage3_compile",
+                               snapshot.stage2Compiler.path,
+                               [
+                                   "compile-bootstrap",
+                                   "--in:" + snapshot.stage1Source.path,
+                                   "--out:" + snapshot.stage3Compiler.path,
+                                   "--report-out:" + v3GateBootstrapLog(root, "cheng.stage3.report.txt")
+                               ],
+                               "artifacts/v3_bootstrap/cheng.stage3.compile.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage3_self_check",
+                               snapshot.stage3Compiler.path,
+                               ["self-check", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage3.self-check.log") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage2_contract",
+                               snapshot.stage2Compiler.path,
+                               ["print-contract", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage2.contract.txt") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "stage3_contract",
+                               snapshot.stage3Compiler.path,
+                               ["print-contract", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_bootstrap/cheng.stage3.contract.txt") != 0:
+        return 1
+    let stage2Contract: str = v3path.v3ReadTextFile(root, "artifacts/v3_bootstrap/cheng.stage2.contract.txt")
+    let stage3Contract: str = v3path.v3ReadTextFile(root, "artifacts/v3_bootstrap/cheng.stage3.contract.txt")
+    if stage2Contract != stage3Contract:
+        v3GatePrintErr("v3 gate: fixed point mismatch stage2/stage3 contract drift")
+        return 1
+    if !v3path.v3WriteTextFile(root, snapshot.bootstrapEnv.path, v3GateBootstrapEnvText(root, snapshot)):
+        v3GatePrintErr("v3 gate: failed to write bootstrap env: " + snapshot.bootstrapEnv.path)
+        return 1
+    if !v3path.v3WriteTextFile(root,
+                               contracts.v3BootstrapSnapshotPath(root),
+                               v3GateBootstrapSnapshotText(root, snapshot)):
+        v3GatePrintErr("v3 gate: failed to write bootstrap snapshot: " + contracts.v3BootstrapSnapshotPath(root))
+        return 1
+    v3GatePrintLine("v3 bootstrap bridge ok: " + snapshot.stage2Compiler.path)
+    return 0
+
+fn v3GateEnsureBootstrapBridge(root: str): int32 =
+    let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+    let stage3Mtime: int64 = os.fileMtime(snapshot.stage3Compiler.path)
+    if contracts.v3BootstrapBridgeReady(snapshot) &&
+       stage3Mtime > int64(0) &&
+       os.fileMtime(snapshot.seedSource.path) <= stage3Mtime &&
+       os.fileMtime(snapshot.stage1Source.path) <= stage3Mtime:
+        return 0
+    return v3GateBootstrapBridge(root)
+
+fn v3GateBuildBackendDriver(root: str): int32 =
+    let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver")
+    if v3GateEnsureBootstrapBridge(root) != 0:
+        return 1
+    if !v3path.v3MkdirP(root, outDir):
+        v3GatePrintErr("v3 gate: failed to create backend driver dir")
+        return 1
+    if !contracts.v3BootstrapArtifactReady(snapshot.stage2Compiler):
+        v3GatePrintErr("v3 gate: missing stage2 compiler: " + snapshot.stage2Compiler.path)
+        return 1
+    if !v3path.v3PathFileExists(snapshot.stage1Source.path):
+        v3GatePrintErr("v3 gate: missing stage1 source: " + snapshot.stage1Source.path)
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "build_backend_driver",
+                               snapshot.stage2Compiler.path,
+                               [
+                                   "compile-bootstrap",
+                                   "--in:" + snapshot.stage1Source.path,
+                                   "--out:" + snapshot.backendDriverOut.path,
+                                   "--report-out:" + v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt")
+                               ],
+                               "artifacts/v3_backend_driver/build_backend_driver_v3.log") != 0:
+        return 1
+    if !contracts.v3BootstrapArtifactReady(snapshot.backendDriverOut):
+        v3GatePrintErr("v3 gate: missing backend driver output: " + snapshot.backendDriverOut.path)
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "backend_driver_contract",
+                               snapshot.backendDriverOut.path,
+                               ["print-contract", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_backend_driver/build_backend_driver_v3.contract.txt") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "backend_driver_status",
+                               snapshot.backendDriverOut.path,
+                               ["status"],
+                               "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "backend_driver_plan",
+                               snapshot.backendDriverOut.path,
+                               ["print-build-plan"],
+                               "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt") != 0:
+        return 1
+    if v3GateBootstrapStageRun(root,
+                               "reference_stage3_contract",
+                               snapshot.stage3Compiler.path,
+                               ["print-contract", "--in:" + snapshot.stage1Source.path],
+                               "artifacts/v3_backend_driver/reference_stage3.contract.txt") != 0:
+        return 1
+    let builtContract: str = v3path.v3ReadTextFile(root, "artifacts/v3_backend_driver/build_backend_driver_v3.contract.txt")
+    let stage3Contract: str = v3path.v3ReadTextFile(root, "artifacts/v3_backend_driver/reference_stage3.contract.txt")
+    if builtContract != stage3Contract:
+        v3GatePrintErr("v3 gate: backend driver contract drift vs stage3: " + snapshot.backendDriverOut.path)
+        return 1
+    let report: str =
+        "target=" + v3GateBootstrapTarget() + "\n" +
+        "bootstrap_kind=v3_seed\n" +
+        "compiler_class=ordinary_compiler\n" +
+        "stage0_compiler=" + snapshot.stage0Compiler.path + "\n" +
+        "stage1_compiler=" + snapshot.stage1Compiler.path + "\n" +
+        "stage2_compiler=" + snapshot.stage2Compiler.path + "\n" +
+        "stage3_compiler=" + snapshot.stage3Compiler.path + "\n" +
+        "bootstrap_contract_source=" + snapshot.stage1Source.path + "\n" +
+        "planned_entry_source=" + contracts.v3BootstrapCompilerEntrySourcePath(root) + "\n" +
+        "planned_runtime_source=" + contracts.v3BootstrapCompilerRuntimeSourcePath(root) + "\n" +
+        "planned_request_source=" + contracts.v3BootstrapCompilerRequestSourcePath(root) + "\n" +
+        "materialized_source=" + snapshot.stage1Source.path + "\n" +
+        "output=" + snapshot.backendDriverOut.path + "\n" +
+        "contract_log=" + v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.contract.txt") + "\n" +
+        "status_log=" + v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt") + "\n" +
+        "plan_log=" + v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt") + "\n" +
+        "log=" + v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.log") + "\n"
+    if !v3path.v3WriteTextFile(root,
+                               "artifacts/v3_backend_driver/build_backend_driver_v3.report.txt",
+                               report):
+        v3GatePrintErr("v3 gate: failed to write backend driver report")
+        return 1
+    v3GatePrintLine("v3 backend driver ok: " + snapshot.backendDriverOut.path)
+    return 0
 
 fn v3GateScanHotpath(root: str): int32 =
     let hits: hotscan.V3ForbiddenHit[] = hotscan.v3ScanForbiddenSourceDir(root, "v3/src")
@@ -96,37 +446,60 @@ fn v3GateCompareBench(root: str, baselinePath: str, candidatePath: str, maxRatio
         return 0
     return 1
 
-fn v3GateRunScript(root: str, label: str, scriptRel: str, logRel: str): int32 =
-    if !v3GateEnsureArtifactsDir(root):
-        v3GatePrintErr("v3 gate: failed to create artifacts dir")
+fn v3GateArgsContainFlag(args: str[], key: str): bool =
+    for i in 0..<args.len:
+        let arg = args[i]
+        if arg == key:
+            return true
+        if strutil.startsWith(arg, key + ":"):
+            return true
+        if strutil.startsWith(arg, key + "="):
+            return true
+    return false
+
+fn v3GateRunStage3Command(root: str,
+                          label: str,
+                          cmd: str,
+                          args: str[],
+                          logName: str,
+                          injectContract: bool): int32 =
+    if v3GateEnsureBootstrapBridge(root) != 0:
         return 1
-    let scriptPath: str = v3path.v3PathAbsolute(root, scriptRel)
-    let logPath: str = v3path.v3PathAbsolute(root, logRel)
-    var args: str[] = []
-    args.add(scriptPath)
-    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root, label, "/bin/sh", args, [], root, 0, logPath)
-    if !hostops.v3LoggedRunOk(run):
-        v3GatePrintErr(hostops.v3LoggedRunSummary(run))
-        if len(strutil.strip(run.output)) > 0:
-            v3GatePrintErr(strutil.strip(run.output))
+    let stage3: str = contracts.v3BootstrapStage3Path(root)
+    if !os.fileExists(stage3):
+        v3GatePrintErr("v3 gate: missing stage3 compiler: " + stage3)
+        return 1
+    var stageArgs: str[] = []
+    stageArgs.add(cmd)
+    if injectContract && !v3GateArgsContainFlag(args, "--contract-in"):
+        stageArgs.add("--contract-in:" + contracts.v3BootstrapStage1SourcePath(root))
+    for i in 0..<args.len:
+        stageArgs.add(args[i])
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                           label,
+                                                           stage3,
+                                                           stageArgs,
+                                                           [],
+                                                           root,
+                                                           0,
+                                                           "artifacts/v3_gate/" + logName)
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
         return run.exitCode
-    if len(strutil.strip(run.output)) > 0:
-        v3GatePrintLine(strutil.strip(run.output))
     return 0
 
 fn v3GateRunSmokes(root: str): int32 =
     if !v3GateEnsureArtifactsDir(root):
         v3GatePrintErr("v3 gate: failed to create artifacts dir")
         return 1
-    if v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
-                       "artifacts/v3_gate/bootstrap_bridge_v3.log") != 0:
+    if v3GateEnsureBootstrapBridge(root) != 0:
         return 1
-    let stage1Source: str = v3path.v3PathAbsolute(root, "v3/bootstrap/stage1_bootstrap.cheng")
+    let stage1Source: str = contracts.v3BootstrapStage1SourcePath(root)
     var bins: str[] = []
-    bins.add(v3GateBootstrapBin(root, "cheng.stage0"))
-    bins.add(v3GateBootstrapBin(root, "cheng.stage1"))
-    bins.add(v3GateBootstrapBin(root, "cheng.stage2"))
-    bins.add(v3GateBootstrapBin(root, "cheng.stage3"))
+    bins.add(contracts.v3BootstrapStage0Path(root))
+    bins.add(contracts.v3BootstrapStage1Path(root))
+    bins.add(contracts.v3BootstrapStage2Path(root))
+    bins.add(contracts.v3BootstrapStage3Path(root))
     for i in 0..<bins.len:
         let binPath: str = bins[i]
         if !os.fileExists(binPath):
@@ -145,6 +518,2150 @@ fn v3GateRunSmokes(root: str): int32 =
             return run.exitCode
     return 0
 
+fn v3GateEnsureBackendDriverReady(root: str, outCompiler: var str): int32 =
+    let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+    outCompiler = snapshot.backendDriverOut.path
+    if contracts.v3BootstrapArtifactReady(snapshot.backendDriverOut):
+        return 0
+    return v3GateBuildBackendDriver(root)
+
+fn v3GateCompileExeEnv(root: str,
+                       label: str,
+                       compilerPath: str,
+                       sourcePath: str,
+                       outPath: str,
+                       target: str,
+                       logRelPath: str,
+                       envOverrides: str[]): hostops.V3LoggedRun =
+    let packageRoot: str = v3path.v3PathAbsolute(root, "v3")
+    let outParts: os.SplitFileResult = os.splitFile(outPath)
+    if len(outParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, outParts.dir)
+    let logAbs: str = v3path.v3PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.splitFile(logAbs)
+    if len(logParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, logParts.dir)
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                           label,
+                                                           compilerPath,
+                                                           [
+                                                               "system-link-exec",
+                                                               "--root", packageRoot,
+                                                               "--in", sourcePath,
+                                                               "--emit", "exe",
+                                                               "--target", target,
+                                                               "--out", outPath
+                                                           ],
+                                                           envOverrides,
+                                                           root,
+                                                           int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300"))),
+                                                           logRelPath)
+    return run
+
+fn v3GateCompileExe(root: str,
+                    label: str,
+                    compilerPath: str,
+                    sourcePath: str,
+                    outPath: str,
+                    target: str,
+                    logRelPath: str): hostops.V3LoggedRun =
+    return v3GateCompileExeEnv(root, label, compilerPath, sourcePath, outPath, target, logRelPath, [])
+
+fn v3GateCompileExeSpawnEnv(root: str,
+                            label: str,
+                            compilerPath: str,
+                            sourcePath: str,
+                            outPath: str,
+                            target: str,
+                            logRelPath: str,
+                            envOverrides: str[]): Result[hostops.V3ParallelJob] =
+    let packageRoot: str = v3path.v3PathAbsolute(root, "v3")
+    let outParts: os.SplitFileResult = os.splitFile(outPath)
+    if len(outParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, outParts.dir)
+    let logAbs: str = v3path.v3PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.splitFile(logAbs)
+    if len(logParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, logParts.dir)
+    return hostops.v3ParallelSpawnFile(root,
+                                       label,
+                                       compilerPath,
+                                       [
+                                           "system-link-exec",
+                                           "--root", packageRoot,
+                                           "--in", sourcePath,
+                                           "--emit", "exe",
+                                           "--target", target,
+                                           "--out", outPath
+                                       ],
+                                       envOverrides,
+                                       root,
+                                       logRelPath)
+
+fn v3GateRunBinary(root: str,
+                   label: str,
+                   binPath: str,
+                   args: str[],
+                   timeoutSec: int32,
+                   logRelPath: str): hostops.V3LoggedRun =
+    let logAbs: str = v3path.v3PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.splitFile(logAbs)
+    if len(logParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, logParts.dir)
+    return hostops.v3RunFileLogged(root, label, binPath, args, [], root, timeoutSec, logRelPath)
+
+fn v3GateWriteProcessSnapshot(root: str,
+                              proc: hostops.V3SpawnedProcess,
+                              logRelPath: str,
+                              exitCode: int32): hostops.V3LoggedRun =
+    let logPath: str = v3path.v3PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.splitFile(logPath)
+    if len(logParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, logParts.dir)
+    let _logged: bool = v3path.v3WriteTextFile(root, logRelPath, proc.output)
+    return hostops.V3LoggedRun(label: proc.label,
+                               filePath: proc.filePath,
+                               logPath: logPath,
+                               exitCode: exitCode,
+                               output: proc.output)
+
+fn v3GateIsDigits(text: str): bool =
+    if len(text) <= 0:
+        return false
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn v3GateWaitReadyPort(root: str,
+                       readyPath: str,
+                       proc: var hostops.V3SpawnedProcess,
+                       outPort: var str): bool =
+    outPort = ""
+    root
+    for i in 0..<400:
+        i
+        hostops.v3SpawnedProcessDrain(proc, 0)
+        if os.fileExists(readyPath):
+            let candidate = strutil.strip(v3path.v3ReadTextFile("", readyPath))
+            if v3GateIsDigits(candidate):
+                outPort = candidate
+                return true
+        let waitRes = os.ptyWait(proc.pid)
+        if waitRes[0] == 1:
+            proc.pid = 0
+            hostops.v3SpawnedProcessDrain(proc, 0)
+            return false
+        if waitRes[0] < 0:
+            proc.pid = 0
+            hostops.v3SpawnedProcessDrain(proc, 0)
+            return false
+        os.sleepMs(50)
+    return false
+
+fn v3GateOutputContains(text: str, needle: str): bool =
+    return strutil.contains(text, needle)
+
+fn v3GateRequireOutput(run: hostops.V3LoggedRun,
+                       needle: str,
+                       context: str): bool =
+    if v3GateOutputContains(run.output, needle):
+        return true
+    v3GatePrintErr(context + ": missing output: " + needle)
+    if len(strutil.strip(run.output)) > 0:
+        v3GatePrintErr(strutil.strip(run.output))
+    return false
+
+fn v3GateCollectPositionals(args: str[]): str[] =
+    var out: str[] = []
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if !strutil.startsWith(arg, "--"):
+            out.add(arg)
+    return out
+
+fn v3GateRequireFile(path: str, context: str): bool =
+    if os.fileExists(path):
+        return true
+    v3GatePrintErr(context + ": missing file: " + path)
+    return false
+
+fn v3GateRequireFileContains(path: str,
+                             needle: str,
+                             context: str): bool =
+    if !v3GateRequireFile(path, context):
+        return false
+    let text: str = v3path.v3ReadTextFile("", path)
+    if v3GateOutputContains(text, needle):
+        return true
+    v3GatePrintErr(context + ": missing output: " + needle)
+    if len(strutil.strip(text)) > 0:
+        v3GatePrintErr(strutil.strip(text))
+    return false
+
+fn v3GateRequirePrefixArtifacts(prefix: str,
+                                suffixes: str[],
+                                context: str): bool =
+    for i in 0..<suffixes.len:
+        if !v3GateRequireFile(prefix + suffixes[i], context):
+            return false
+    return true
+
+fn v3GateRequireAnyOutput(text: str,
+                          needles: str[],
+                          context: str): bool =
+    if v3GateTextContainsAny(text, needles):
+        return true
+    v3GatePrintErr(context + ": missing expected output set")
+    if len(strutil.strip(text)) > 0:
+        v3GatePrintErr(strutil.strip(text))
+    return false
+
+fn v3GateResolveSmokeCompiler(root: str,
+                              explicitPath: str,
+                              primaryEnvKey: str,
+                              fallbackEnvKey: str,
+                              outCompiler: var str): int32 =
+    outCompiler = strutil.strip(explicitPath)
+    if len(outCompiler) <= 0 && len(primaryEnvKey) > 0:
+        outCompiler = strutil.strip(os.getEnvDefault(primaryEnvKey, ""))
+    if len(outCompiler) <= 0 && len(fallbackEnvKey) > 0:
+        outCompiler = strutil.strip(os.getEnvDefault(fallbackEnvKey, ""))
+    if len(outCompiler) <= 0:
+        return v3GateEnsureBackendDriverReady(root, outCompiler)
+    outCompiler = v3path.v3PathAbsolute(root, outCompiler)
+    if !os.fileExists(outCompiler):
+        v3GatePrintErr("v3 gate: missing compiler: " + outCompiler)
+        return 1
+    return 0
+
+fn v3GateResolveSmokeLabel(args: str[],
+                           envKey: str,
+                           defaultLabel: str): str =
+    let explicit: str = strutil.strip(v3GateReadFlag(args, "--label", ""))
+    if len(explicit) > 0:
+        return explicit
+    let keyed: str = strutil.strip(os.getEnvDefault(envKey, ""))
+    if len(keyed) > 0:
+        return keyed
+    let shared: str = strutil.strip(os.getEnvDefault("CHENG_V3_SMOKE_LABEL", ""))
+    if len(shared) > 0:
+        return shared
+    return defaultLabel
+
+fn v3GateTextContainsAny(text: str, needles: str[]): bool =
+    for i in 0..<needles.len:
+        if v3path.v3TextContains(text, needles[i]):
+            return true
+    return false
+
+fn v3GateVerifyOrphanGuard(root: str): int32 =
+    let toolingDir: str = v3path.v3PathAbsolute(root, "v3/tooling")
+    let bannedText: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh"]
+    let bannedNames: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh"]
+    let entries: str[] = os.walkDir(toolingDir)
+    for i in 0..<entries.len:
+        let entry: os.WalkDirEntry = os.walkDirEntry(entries, i)
+        let kind: os.PathComponent = os.walkDirEntryKind(entry)
+        if kind != os.PathComponent(0) &&
+           kind != os.PathComponent(2):
+            continue
+        let path: str = os.walkDirEntryPath(entry)
+        let parts: os.SplitFileResult = os.splitFile(path)
+        if parts.ext != ".sh" && parts.ext != ".py":
+            continue
+        let fileName: str = parts.name + parts.ext
+        if v3GateTextContainsAny(fileName, bannedNames):
+            v3GatePrintErr("verify_orphan_guard_v3: banned tooling entry name: " + path)
+            return 1
+        let text: str = v3path.v3ReadTextFile("", path)
+        if v3GateTextContainsAny(text, bannedText):
+            v3GatePrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
+            return 1
+    v3GatePrintLine("verify_orphan_guard_v3 ok")
+    return 0
+
+fn v3GateDefaultHostSmokes(): str[] =
+    return [
+        "ref10_ashr_smoke",
+        "fixed256_curve25519_smoke",
+        "fixedbytes32_seq_index_smoke",
+        "compiler_runtime_smoke",
+        "global_fixed_array_composite_smoke",
+        "multiline_header_indent_smoke",
+        "rwad_serial_state_machine_smoke",
+        "rwad_bft_state_machine_smoke",
+        "parser_path_smoke",
+        "compiler_pipeline_stub_smoke",
+        "lowering_plan_smoke",
+        "compiler_equivalence_smoke",
+        "compiler_publish_smoke",
+        "bft_three_replica_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "ffi_handle_smoke",
+        "program_selfhost_smoke",
+        "csg_smoke",
+        "consensus_smoke",
+        "chain_node_smoke",
+        "chain_node_zero_snapshot_replay_smoke",
+        "chain_node_tailnet_smoke",
+        "chain_node_libp2p_smoke",
+        "bft_finalize_summary_smoke",
+        "bft_state_machine_smoke",
+        "oracle_plane_smoke",
+        "oracle_bft_state_machine_smoke",
+        "oracle_bft_three_replica_smoke",
+        "oracle_runtime_host_smoke",
+        "overlay_contracts_smoke",
+        "pubsub_smoke",
+        "dag_mempool_smoke",
+        "plumtree_smoke",
+        "erasure_swarm_smoke",
+        "pin_plane_smoke",
+        "pin_scheduler_smoke",
+        "pin_runtime_host_smoke",
+        "pin_runtime_quic_smoke",
+        "content_codec_smoke",
+        "content_runtime_smoke",
+        "native_client_hello_wire_smoke",
+        "quic_transport_loopback_smoke",
+        "libp2p_quic_tls_smoke",
+        "libp2p_tailnet_policy_smoke",
+        "libp2p_tailnet_visibility_smoke",
+        "libp2p_tailnet_transport_smoke",
+        "libp2p_tailnet_derp_smoke",
+        "libp2p_resource_smoke",
+        "libp2p_scheduler_smoke",
+        "tailnet_control_core_smoke",
+        "tailnet_train_island_smoke",
+        "webrtc_signal_codec_smoke",
+        "webrtc_signal_session_smoke",
+        "webrtc_turn_fallback_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "content_quic_smoke",
+        "webrtc_datachannel_content_smoke",
+        "content_stub_smoke",
+        "libp2p_protocols_smoke",
+        "location_proof_smoke",
+        "chain_codec_binary_smoke",
+        "anti_entropy_smoke",
+        "anti_entropy_signature_fields_smoke",
+        "lsmr_types_smoke",
+        "lsmr_locality_storage_smoke",
+        "lsmr_bagua_prefix_tree_smoke",
+        "udp_importc_smoke",
+        "mobile_bridge_smoke",
+        "mobile_sdk_smoke",
+        "did_identity_smoke"
+    ]
+
+fn v3GateDefaultStage23Smokes(): str[] =
+    return [
+        "fixed256_curve25519_smoke",
+        "compiler_runtime_smoke",
+        "compiler_pipeline_stub_smoke",
+        "lowering_plan_smoke",
+        "compiler_equivalence_smoke",
+        "compiler_publish_smoke",
+        "bft_three_replica_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "program_selfhost_smoke",
+        "libp2p_core_smoke",
+        "libp2p_multiaddr_parse_boundary_smoke",
+        "libp2p_host_smoke",
+        "libp2p_tailnet_policy_smoke",
+        "libp2p_tailnet_visibility_smoke",
+        "libp2p_tailnet_transport_smoke",
+        "libp2p_tailnet_derp_smoke",
+        "libp2p_resource_smoke",
+        "libp2p_scheduler_smoke",
+        "tailnet_control_core_smoke",
+        "tailnet_train_island_smoke",
+        "webrtc_signal_codec_smoke",
+        "webrtc_signal_session_smoke",
+        "webrtc_turn_fallback_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "libp2p_tcp_smoke",
+        "libp2p_overlay_smoke",
+        "libp2p_protocols_smoke",
+        "chain_codec_binary_smoke",
+        "location_proof_smoke",
+        "anti_entropy_smoke",
+        "anti_entropy_signature_fields_smoke",
+        "lsmr_types_smoke",
+        "lsmr_locality_storage_smoke",
+        "lsmr_bagua_prefix_tree_smoke",
+        "overlay_contracts_smoke",
+        "pubsub_smoke",
+        "dag_mempool_smoke",
+        "plumtree_smoke",
+        "erasure_swarm_smoke",
+        "pin_plane_smoke",
+        "pin_scheduler_smoke",
+        "content_codec_smoke",
+        "content_runtime_smoke",
+        "content_stub_smoke",
+        "chain_node_tailnet_smoke",
+        "chain_node_libp2p_smoke",
+        "chain_node_zero_snapshot_replay_smoke",
+        "mobile_bridge_smoke",
+        "mobile_sdk_smoke",
+        "did_identity_smoke"
+    ]
+
+fn v3GateDefaultBrowserWebrtcSmokes(): str[] =
+    return [
+        "webrtc_signal_stream_smoke",
+        "webrtc_datachannel_browser_smoke",
+        "webrtc_browser_content_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "webrtc_browser_pubsub_smoke",
+        "webrtc_browser_light_node_smoke",
+        "browser_sdk_smoke"
+    ]
+
+fn v3GateStage23EnvOverrides(): str[] =
+    return ["BACKEND_INCREMENTAL=0", "BACKEND_MULTI_MODULE_CACHE=0"]
+
+fn v3GateSmokeRunTimeoutSec(): int32 =
+    return int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_SMOKE_RUN_TIMEOUT_SEC", "60")))
+
+fn v3GateRunSingleFixtureSmoke(root: str,
+                               suiteLabel: str,
+                               compilerPath: str,
+                               smokeName: str,
+                               outBin: str,
+                               stageLabel: str,
+                               envOverrides: str[]): int32 =
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/" + smokeName + ".cheng")
+    if !os.fileExists(src):
+        v3GatePrintErr(suiteLabel + ": missing source: " + src)
+        return 1
+    let compileLabel: str = suiteLabel + " compile " + stageLabel + " " + smokeName
+    let runLabel: str = suiteLabel + " run " + stageLabel + " " + smokeName
+    let compileRun = v3GateCompileExeEnv(root,
+                                         compileLabel,
+                                         compilerPath,
+                                         src,
+                                         outBin,
+                                         "arm64-apple-darwin",
+                                         outBin + ".compile.log",
+                                         envOverrides)
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = v3GateRunBinary(root,
+                              runLabel,
+                              outBin,
+                              [],
+                              v3GateSmokeRunTimeoutSec(),
+                              outBin + ".run.log")
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateRunTcpTwoprocSmoke(root: str,
+                            compilerPath: str,
+                            stageName: str,
+                            envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_tcp_twoproc")
+    let serverSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/libp2p_tcp_twoproc_server_smoke.cheng")
+    let clientSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/libp2p_tcp_twoproc_client_smoke.cheng")
+    let serverBin: str = os.joinPath(outDir, "libp2p_tcp_twoproc_server." + stageName)
+    let clientBin: str = os.joinPath(outDir, "libp2p_tcp_twoproc_client." + stageName)
+    let readyPath: str = os.joinPath(outDir, "libp2p_tcp_twoproc_server." + stageName + ".ready")
+    let _ = os.removeFile(readyPath)
+    if !os.fileExists(serverSrc) || !os.fileExists(clientSrc):
+        v3GatePrintErr("v3 libp2p tcp twoproc: missing source fixture")
+        return 1
+    let serverCompile = v3GateCompileExeEnv(root,
+                                            "v3 libp2p tcp twoproc compile " + stageName + " server",
+                                            compilerPath,
+                                            serverSrc,
+                                            serverBin,
+                                            "arm64-apple-darwin",
+                                            serverBin + ".compile.log",
+                                            envOverrides)
+    if v3GateRunFailed(serverCompile):
+        return serverCompile.exitCode
+    let clientCompile = v3GateCompileExeEnv(root,
+                                            "v3 libp2p tcp twoproc compile " + stageName + " client",
+                                            compilerPath,
+                                            clientSrc,
+                                            clientBin,
+                                            "arm64-apple-darwin",
+                                            clientBin + ".compile.log",
+                                            envOverrides)
+    if v3GateRunFailed(clientCompile):
+        return clientCompile.exitCode
+    let serverSpawn = hostops.v3SpawnFile(root,
+                                          "v3 libp2p tcp twoproc server " + stageName,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        v3GatePrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !v3GateWaitReadyPort(root, readyPath, serverProc, port):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, serverBin + ".run.log", 1)
+        v3GatePrintErr("v3 libp2p tcp twoproc: invalid ready port: " + port)
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = v3GateRunBinary(root,
+                                    "v3 libp2p tcp twoproc client " + stageName,
+                                    clientBin,
+                                    ["--port:" + port],
+                                    20,
+                                    clientBin + ".run.log")
+    if v3GateRunFailed(clientRun):
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, serverBin + ".run.log")
+        v3GateMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, serverBin + ".run.log")
+    v3GateMaybePrintRunOutput(serverRun)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    v3GateMaybePrintRunOutput(clientRun)
+    v3GatePrintLine("v3 libp2p_tcp_twoproc_smoke ok")
+    return 0
+
+fn v3GateWriteHelperScript(root: str,
+                           path: str,
+                           text: str,
+                           context: str): bool =
+    if v3path.v3WriteTextFile(root, path, text):
+        return true
+    v3GatePrintErr(context + ": failed to write helper script: " + path)
+    return false
+
+fn v3GateNodeTimeoutSec(): int32 =
+    return int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_NODE_TIMEOUT_SEC", "120")))
+
+fn v3GateRunNodeScript(root: str,
+                       label: str,
+                       scriptPath: str,
+                       args: str[],
+                       logRelPath: str): hostops.V3LoggedRun =
+    var nodeArgs: str[] = []
+    nodeArgs.add(scriptPath)
+    for i in 0..<args.len:
+        nodeArgs.add(args[i])
+    return hostops.v3RunProgramLogged(root,
+                                      label,
+                                      "node",
+                                      nodeArgs,
+                                      [],
+                                      root,
+                                      v3GateNodeTimeoutSec(),
+                                      logRelPath)
+
+fn v3GateWasmSmokesRunnerSource(): str =
+    return (
+        "const fs = require('fs');\n" +
+        "const outDir = process.argv[2];\n" +
+        "const label = process.argv[3] || 'host';\n" +
+        "async function run(name, imports) {\n" +
+        "  const wasm = fs.readFileSync(outDir + '/' + name + '.' + label + '.wasm');\n" +
+        "  const instanceRes = await WebAssembly.instantiate(wasm, imports);\n" +
+        "  const exp = instanceRes.instance.exports;\n" +
+        "  if (typeof exp.main !== 'function') {\n" +
+        "    throw new Error(name + ' missing export: main');\n" +
+        "  }\n" +
+        "  const rc = exp.main() | 0;\n" +
+        "  if (rc !== 0) {\n" +
+        "    throw new Error(name + ' returned ' + rc);\n" +
+        "  }\n" +
+        "  console.log(name + ': ok');\n" +
+        "}\n" +
+        "(async () => {\n" +
+        "  await run('wasm_zero_smoke', { env: {} });\n" +
+        "  await run('wasm_internal_call_smoke', { env: {} });\n" +
+        "  await run('wasm_importc_noarg_i32_smoke', { env: { cheng_test_zero: () => 0 } });\n" +
+        "  console.log('v3 wasm smokes: ok');\n" +
+        "})().catch((err) => {\n" +
+        "  console.error(err);\n" +
+        "  process.exit(1);\n" +
+        "});\n"
+    )
+
+fn v3GateBrowserHostWasmRunnerSource(): str =
+    return (
+        "const fs = require('fs');\n" +
+        "const wasmPath = process.argv[2];\n" +
+        "const bytes = fs.readFileSync(wasmPath);\n" +
+        "WebAssembly.instantiate(bytes, {\n" +
+        "  env: {\n" +
+        "    cheng_v3_browser_now_ms_bridge: () => 24680,\n" +
+        "    cheng_v3_browser_echo_i32_bridge: (value) => value | 0,\n" +
+        "    cheng_v3_browser_peer_handle_bridge: () => 41,\n" +
+        "    cheng_v3_browser_did_handle_bridge: () => 84,\n" +
+        "    cheng_v3_browser_dm_active_count_bridge: () => 7,\n" +
+        "    cheng_v3_browser_dm_connect_start_bridge: (peerHandle) => (peerHandle | 0) + 1000,\n" +
+        "    cheng_v3_browser_dm_wait_start_bridge: (peerHandle, timeoutMs) => ((peerHandle | 0) ^ (timeoutMs | 0)) | 0,\n" +
+        "    cheng_v3_browser_dm_send_start_bridge: (peerHandle, conversationHandle, messageHandle, timestampMs) =>\n" +
+        "      ((peerHandle | 0) + (conversationHandle | 0) + (messageHandle | 0) + (timestampMs | 0)) | 0,\n" +
+        "  },\n" +
+        "}).then(({ instance }) => {\n" +
+        "  const exp = instance.exports;\n" +
+        "  if (typeof exp.main !== 'function') {\n" +
+        "    throw new Error('missing export: main');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserNowMs !== 'function') {\n" +
+        "    throw new Error('missing export: browserNowMs');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserEchoI32 !== 'function') {\n" +
+        "    throw new Error('missing export: browserEchoI32');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserPeerHandle !== 'function') {\n" +
+        "    throw new Error('missing export: browserPeerHandle');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserDidHandle !== 'function') {\n" +
+        "    throw new Error('missing export: browserDidHandle');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserDmActiveCount !== 'function') {\n" +
+        "    throw new Error('missing export: browserDmActiveCount');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserDmConnectStart !== 'function') {\n" +
+        "    throw new Error('missing export: browserDmConnectStart');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserDmWaitStart !== 'function') {\n" +
+        "    throw new Error('missing export: browserDmWaitStart');\n" +
+        "  }\n" +
+        "  if (typeof exp.browserDmSendStart !== 'function') {\n" +
+        "    throw new Error('missing export: browserDmSendStart');\n" +
+        "  }\n" +
+        "  if ((exp.main() | 0) !== 0) {\n" +
+        "    throw new Error('main != 0');\n" +
+        "  }\n" +
+        "  if ((exp.browserNowMs() | 0) !== 24680) {\n" +
+        "    throw new Error('browserNowMs != 24680');\n" +
+        "  }\n" +
+        "  if ((exp.browserEchoI32(31337) | 0) !== 31337) {\n" +
+        "    throw new Error('browserEchoI32 != 31337');\n" +
+        "  }\n" +
+        "  if ((exp.browserPeerHandle() | 0) !== 41) {\n" +
+        "    throw new Error('browserPeerHandle != 41');\n" +
+        "  }\n" +
+        "  if ((exp.browserDidHandle() | 0) !== 84) {\n" +
+        "    throw new Error('browserDidHandle != 84');\n" +
+        "  }\n" +
+        "  if ((exp.browserDmActiveCount() | 0) !== 7) {\n" +
+        "    throw new Error('browserDmActiveCount != 7');\n" +
+        "  }\n" +
+        "  if ((exp.browserDmConnectStart(9) | 0) !== 1009) {\n" +
+        "    throw new Error('browserDmConnectStart mismatch');\n" +
+        "  }\n" +
+        "  if ((exp.browserDmWaitStart(11, 22) | 0) !== ((11 ^ 22) | 0)) {\n" +
+        "    throw new Error('browserDmWaitStart mismatch');\n" +
+        "  }\n" +
+        "  if ((exp.browserDmSendStart(1, 2, 3, 4) | 0) !== 10) {\n" +
+        "    throw new Error('browserDmSendStart mismatch');\n" +
+        "  }\n" +
+        "  console.log('v3 browser host wasm smoke: ok');\n" +
+        "}).catch((error) => {\n" +
+        "  console.error(error);\n" +
+        "  process.exit(1);\n" +
+        "});\n"
+    )
+
+fn v3GateRunWasmSmokes(root: str,
+                       compilerPath: str,
+                       label: str,
+                       envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_wasm_smokes")
+    let runnerPath: str = os.joinPath(outDir, "wasm_smokes_runner.js")
+    if !v3GateWriteHelperScript(root, runnerPath, v3GateWasmSmokesRunnerSource(), "v3 wasm smokes"):
+        return 1
+    let names: str[] = [
+        "wasm_zero_smoke",
+        "wasm_internal_call_smoke",
+        "wasm_importc_noarg_i32_smoke"
+    ]
+    var jobs: hostops.V3ParallelJob[] = []
+    for i in 0..<names.len:
+        let smokeName: str = names[i]
+        let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/" + smokeName + ".cheng")
+        let outWasm: str = os.joinPath(outDir, smokeName + "." + label + ".wasm")
+        let spawnRes = v3GateCompileExeSpawnEnv(root,
+                                                "v3 wasm smokes compile " + smokeName + " " + label,
+                                                compilerPath,
+                                                src,
+                                                outWasm,
+                                                "wasm32-unknown-unknown",
+                                                os.joinPath(outDir, smokeName + "." + label + ".compile.log"),
+                                                envOverrides)
+        if IsErr(spawnRes):
+            v3GatePrintErr(Error(spawnRes))
+            hostops.v3ParallelStopAll(root, jobs, 124)
+            return 1
+        jobs.add(Value(spawnRes))
+    var failedRun = hostops.v3LoggedRunZero("", "", "", 0, "")
+    if !hostops.v3ParallelWaitFailfast(root,
+                                       jobs,
+                                       int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300"))),
+                                       failedRun):
+        if v3GateRunFailed(failedRun):
+            return failedRun.exitCode
+        return 1
+    for i in 0..<names.len:
+        let smokeName: str = names[i]
+        let outWasm: str = os.joinPath(outDir, smokeName + "." + label + ".wasm")
+        if !os.fileExists(outWasm):
+            v3GatePrintErr("v3 wasm smokes: missing wasm output: " + outWasm)
+            return 1
+    let run = v3GateRunNodeScript(root,
+                                  "v3 wasm smokes run " + label,
+                                  runnerPath,
+                                  [outDir, label],
+                                  os.joinPath(outDir, "wasm_smokes." + label + ".run.log"))
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    if !v3GateRequireOutput(run, "v3 wasm smokes: ok", "v3 wasm smokes"):
+        return 1
+    return 0
+
+fn v3GateRunBrowserHostWasmSmoke(root: str,
+                                 compilerPath: str,
+                                 label: str,
+                                 envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_browser_host_wasm")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/libp2p/browser/browser_host_wasm_probe.cheng")
+    let outWasm: str = os.joinPath(outDir, "cheng_browser_host_abi." + label + ".wasm")
+    let runnerPath: str = os.joinPath(outDir, "browser_host_wasm_smoke_runner.js")
+    let compileRun = v3GateCompileExeEnv(root,
+                                         "v3 browser host wasm compile " + label,
+                                         compilerPath,
+                                         src,
+                                         outWasm,
+                                         "wasm32-unknown-unknown",
+                                         os.joinPath(outDir, "cheng_browser_host_abi." + label + ".compile.log"),
+                                         envOverrides)
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outWasm):
+        v3GatePrintErr("v3 browser host wasm smoke: missing wasm output: " + outWasm)
+        return 1
+    if !v3GateWriteHelperScript(root, runnerPath, v3GateBrowserHostWasmRunnerSource(), "v3 browser host wasm smoke"):
+        return 1
+    let run = v3GateRunNodeScript(root,
+                                  "v3 browser host wasm smoke run " + label,
+                                  runnerPath,
+                                  [outWasm],
+                                  os.joinPath(outDir, "browser_host_wasm." + label + ".run.log"))
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    if !v3GateRequireOutput(run, "v3 browser host wasm smoke: ok", "v3 browser host wasm smoke"):
+        return 1
+    return 0
+
+fn v3GateRunUdpImportcSmoke(root: str, args: str[]): int32 =
+    let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_SMOKE_COMPILER", "", compiler) != 0:
+        return 1
+    let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_SMOKE_LABEL", "host")
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_udp_importc")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/udp_importc_smoke.cheng")
+    let bin: str = os.joinPath(outDir, "udp_importc_smoke." + label)
+    let compileRun = v3GateCompileExeEnv(root,
+                                         "v3 udp importc compile " + label,
+                                         compiler,
+                                         src,
+                                         bin,
+                                         "arm64-apple-darwin",
+                                         os.joinPath(outDir, "udp_importc_smoke." + label + ".compile.log"),
+                                         [])
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = v3GateRunBinary(root,
+                              "v3 udp importc run " + label,
+                              bin,
+                              [],
+                              20,
+                              os.joinPath(outDir, "udp_importc_smoke." + label + ".run.log"))
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    if !v3GateRequireOutput(run, "v3 udp_importc_smoke ok", "v3 udp importc smoke"):
+        return 1
+    return 0
+
+fn v3GateBuildChainNodeBinary(root: str,
+                              compilerPath: str,
+                              outDir: str,
+                              label: str,
+                              envOverrides: str[],
+                              outBin: var str): int32 =
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/project/chain_node_main.cheng")
+    outBin = os.joinPath(outDir, "chain_node")
+    let compileRun = v3GateCompileExeEnv(root,
+                                         label,
+                                         compilerPath,
+                                         src,
+                                         outBin,
+                                         "arm64-apple-darwin",
+                                         os.joinPath(outDir, "chain_node.compile.log"),
+                                         envOverrides)
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outBin):
+        v3GatePrintErr("v3 chain_node cli smoke: missing chain_node binary: " + outBin)
+        return 1
+    return 0
+
+fn v3GateRunChainNodeCliSmoke(root: str,
+                              compilerPath: str,
+                              label: str,
+                              envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_chain_node_cli/" + label)
+    let tmpDir: str = os.joinPath(outDir, "cli_smoke")
+    if !v3path.v3MkdirP(root, tmpDir):
+        v3GatePrintErr("v3 chain_node cli smoke: failed to create tmp dir: " + tmpDir)
+        return 1
+    var bin = ""
+    if v3GateBuildChainNodeBinary(root,
+                                  compilerPath,
+                                  outDir,
+                                  "v3 chain_node cli smoke compile " + label,
+                                  envOverrides,
+                                  bin) != 0:
+        return 1
+    let serverState: str = os.joinPath(tmpDir, "server.state")
+    let clientState: str = os.joinPath(tmpDir, "client.state")
+    let readyPath: str = os.joinPath(tmpDir, "server.ready")
+    let serverLog: str = os.joinPath(outDir, "server." + label + ".log")
+    let syncLog: str = os.joinPath(outDir, "sync." + label + ".log")
+    let _ = os.removeFile(serverState)
+    let _ = os.removeFile(clientState)
+    let _ = os.removeFile(readyPath)
+    let initRun = v3GateRunBinary(root,
+                                  "v3 chain_node cli init " + label,
+                                  bin,
+                                  ["init", "--state:" + serverState, "--node-id:node-a", "--address-seed:chain-node-a"],
+                                  20,
+                                  os.joinPath(outDir, "init." + label + ".log"))
+    if v3GateRunFailed(initRun):
+        return initRun.exitCode
+    let mintRun = v3GateRunBinary(root,
+                                  "v3 chain_node cli mint " + label,
+                                  bin,
+                                  ["mint", "--state:" + serverState, "--asset:7", "--account:1001", "--amount:100"],
+                                  20,
+                                  os.joinPath(outDir, "mint." + label + ".log"))
+    if v3GateRunFailed(mintRun):
+        return mintRun.exitCode
+    let transferRun = v3GateRunBinary(root,
+                                      "v3 chain_node cli transfer " + label,
+                                      bin,
+                                      ["transfer", "--state:" + serverState, "--asset:7", "--from:1001", "--to:2002", "--amount:40"],
+                                      20,
+                                      os.joinPath(outDir, "transfer." + label + ".log"))
+    if v3GateRunFailed(transferRun):
+        return transferRun.exitCode
+    let balanceARun = v3GateRunBinary(root,
+                                      "v3 chain_node cli balance-a " + label,
+                                      bin,
+                                      ["balance", "--state:" + serverState, "--asset:7", "--account:1001"],
+                                      20,
+                                      os.joinPath(outDir, "balance_a." + label + ".log"))
+    if v3GateRunFailed(balanceARun):
+        return balanceARun.exitCode
+    let balanceBRun = v3GateRunBinary(root,
+                                      "v3 chain_node cli balance-b " + label,
+                                      bin,
+                                      ["balance", "--state:" + serverState, "--asset:7", "--account:2002"],
+                                      20,
+                                      os.joinPath(outDir, "balance_b." + label + ".log"))
+    if v3GateRunFailed(balanceBRun):
+        return balanceBRun.exitCode
+    let showRun = v3GateRunBinary(root,
+                                  "v3 chain_node cli show-state " + label,
+                                  bin,
+                                  ["show-state", "--state:" + serverState],
+                                  20,
+                                  os.joinPath(outDir, "show." + label + ".log"))
+    if v3GateRunFailed(showRun):
+        return showRun.exitCode
+    let snapshotRun = v3GateRunBinary(root,
+                                      "v3 chain_node cli dump-snapshot " + label,
+                                      bin,
+                                      ["dump-snapshot", "--state:" + serverState],
+                                      20,
+                                      os.joinPath(outDir, "snapshot." + label + ".log"))
+    if v3GateRunFailed(snapshotRun):
+        return snapshotRun.exitCode
+    let serverSpawn = hostops.v3SpawnFile(root,
+                                          "v3 chain_node cli daemon-serve " + label,
+                                          bin,
+                                          [
+                                              "daemon-serve",
+                                              "--state:" + serverState,
+                                              "--port:0",
+                                              "--ready-path:" + readyPath,
+                                              "--max-serve-count:1"
+                                          ],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        v3GatePrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var serverPort = ""
+    if !v3GateWaitReadyPort(root, readyPath, serverProc, serverPort):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, serverLog, 1)
+        v3GatePrintErr("v3 chain_node cli smoke: invalid ready port: " + serverPort)
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let syncRun = v3GateRunBinary(root,
+                                  "v3 chain_node cli daemon-sync " + label,
+                                  bin,
+                                  [
+                                      "daemon-sync",
+                                      "--state:" + clientState,
+                                      "--node-id:node-b",
+                                      "--address-seed:chain-node-b",
+                                      "--host:127.0.0.1",
+                                      "--port:" + serverPort,
+                                      "--max-sync-count:1",
+                                      "--interval-ms:10"
+                                  ],
+                                  20,
+                                  syncLog)
+    if v3GateRunFailed(syncRun):
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, serverLog)
+        v3GateMaybePrintRunOutput(serverRun)
+        return syncRun.exitCode
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, serverLog)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    let clientBalanceARun = v3GateRunBinary(root,
+                                            "v3 chain_node cli client-balance-a " + label,
+                                            bin,
+                                            ["balance", "--state:" + clientState, "--asset:7", "--account:1001"],
+                                            20,
+                                            os.joinPath(outDir, "client_balance_a." + label + ".log"))
+    if v3GateRunFailed(clientBalanceARun):
+        return clientBalanceARun.exitCode
+    let clientBalanceBRun = v3GateRunBinary(root,
+                                            "v3 chain_node cli client-balance-b " + label,
+                                            bin,
+                                            ["balance", "--state:" + clientState, "--asset:7", "--account:2002"],
+                                            20,
+                                            os.joinPath(outDir, "client_balance_b." + label + ".log"))
+    if v3GateRunFailed(clientBalanceBRun):
+        return clientBalanceBRun.exitCode
+    let clientShowRun = v3GateRunBinary(root,
+                                        "v3 chain_node cli client-show " + label,
+                                        bin,
+                                        ["show-state", "--state:" + clientState],
+                                        20,
+                                        os.joinPath(outDir, "client_show." + label + ".log"))
+    if v3GateRunFailed(clientShowRun):
+        return clientShowRun.exitCode
+    if !v3GateRequireOutput(initRun, "node_id=node-a", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(balanceARun, "balance=60", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(balanceBRun, "balance=40", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(showRun, "node_id=node-a", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(snapshotRun, "payload_hex=", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(syncRun, "changed=1", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(clientBalanceARun, "balance=60", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(clientBalanceBRun, "balance=40", "v3 chain_node cli smoke") ||
+       !v3GateRequireOutput(clientShowRun, "node_id=node-b", "v3 chain_node cli smoke"):
+        return 1
+    v3GateMaybePrintRunOutput(initRun)
+    v3GateMaybePrintRunOutput(mintRun)
+    v3GateMaybePrintRunOutput(transferRun)
+    v3GateMaybePrintRunOutput(balanceARun)
+    v3GateMaybePrintRunOutput(balanceBRun)
+    v3GateMaybePrintRunOutput(showRun)
+    v3GateMaybePrintRunOutput(snapshotRun)
+    v3GateMaybePrintRunOutput(serverRun)
+    v3GateMaybePrintRunOutput(syncRun)
+    v3GateMaybePrintRunOutput(clientBalanceARun)
+    v3GateMaybePrintRunOutput(clientBalanceBRun)
+    v3GateMaybePrintRunOutput(clientShowRun)
+    v3GatePrintLine("v3 chain_node cli smoke ok (" + label + ")")
+    return 0
+
+fn v3GateRunTailnetControlSmoke(root: str,
+                                compilerPath: str,
+                                stageName: str,
+                                envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_tailnet_control")
+    let controlProbeEndpoint: str = v3path.v3PathAbsolute(root, "v3/testdata/tailnet/headscale_control_ready.json")
+    let relayProbeEndpoint: str = v3path.v3PathAbsolute(root, "v3/testdata/tailnet/derp_ready.json")
+    let baselineSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/libp2p_tailnet_transport_smoke.cheng")
+    let baselineBin: str = os.joinPath(outDir, "libp2p_tailnet_transport_smoke." + stageName)
+    let baselineRun = v3GateCompileExeEnv(root,
+                                          "v3 tailnet control compile baseline " + stageName,
+                                          compilerPath,
+                                          baselineSrc,
+                                          baselineBin,
+                                          "arm64-apple-darwin",
+                                          baselineBin + ".compile.log",
+                                          envOverrides)
+    if v3GateRunFailed(baselineRun):
+        return baselineRun.exitCode
+    let baselineExec = v3GateRunBinary(root,
+                                       "v3 tailnet control run baseline " + stageName,
+                                       baselineBin,
+                                       [],
+                                       20,
+                                       os.joinPath(outDir, "libp2p_tailnet_transport_smoke." + stageName + ".run.log"))
+    if v3GateRunFailed(baselineExec):
+        return baselineExec.exitCode
+    let coreSmokeSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/tailnet_control_core_smoke.cheng")
+    let coreSmokeBin: str = os.joinPath(outDir, "tailnet_control_core_smoke." + stageName)
+    let coreSmokeCompile = v3GateCompileExeEnv(root,
+                                               "v3 tailnet control compile decode smoke " + stageName,
+                                               compilerPath,
+                                               coreSmokeSrc,
+                                               coreSmokeBin,
+                                               "arm64-apple-darwin",
+                                               coreSmokeBin + ".compile.log",
+                                               envOverrides)
+    if v3GateRunFailed(coreSmokeCompile):
+        return coreSmokeCompile.exitCode
+    let coreSmokeRun = v3GateRunBinary(root,
+                                       "v3 tailnet control run decode smoke " + stageName,
+                                       coreSmokeBin,
+                                       [],
+                                       20,
+                                       os.joinPath(outDir, "tailnet_control_core_smoke." + stageName + ".run.log"))
+    if v3GateRunFailed(coreSmokeRun):
+        return coreSmokeRun.exitCode
+    let coreSrc: str = v3path.v3PathAbsolute(root, "v3/src/project/tailnet_control_core.cheng")
+    let coreBin: str = os.joinPath(outDir, "tailnet_control_core." + stageName)
+    let coreCompile = v3GateCompileExeEnv(root,
+                                          "v3 tailnet control compile core " + stageName,
+                                          compilerPath,
+                                          coreSrc,
+                                          coreBin,
+                                          "arm64-apple-darwin",
+                                          coreBin + ".compile.log",
+                                          envOverrides)
+    if v3GateRunFailed(coreCompile):
+        return coreCompile.exitCode
+    let configureRun = v3GateRunBinary(root,
+                                       "v3 tailnet control configure " + stageName,
+                                       coreBin,
+                                       [
+                                           "--command", "configure",
+                                           "--provider-headscale", "1",
+                                           "--control-url", "https://headscale.example",
+                                           "--control-endpoint", "https://headscale.example/control",
+                                           "--relay-endpoint", "https://derp.sfo.example:443",
+                                           "--control-probe-endpoint", controlProbeEndpoint,
+                                           "--relay-probe-endpoint", relayProbeEndpoint,
+                                           "--namespace", "infra",
+                                           "--noise-public-key", "noise-pub-cli",
+                                           "--derp-region-code", "sfo",
+                                           "--derp-region-name", "SanFrancisco",
+                                           "--derp-hostname", "derp.sfo.example",
+                                           "--synthetic-ipv4", "100.64.0.44",
+                                           "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+                                           "--local-peer-id", "tailnet-control-test",
+                                           "--exact-routing", "1",
+                                           "--provider-ready", "1",
+                                           "--proxy-ready", "1"
+                                       ],
+                                       20,
+                                       os.joinPath(outDir, "tailnet_control_configure." + stageName + ".run.log"))
+    if v3GateRunFailed(configureRun):
+        return configureRun.exitCode
+    if !v3GateRequireOutput(configureRun, "configured=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "providerKind=headscale", "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "controlProbeEndpoint=" + controlProbeEndpoint, "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "controlPlane=headscale", "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "providerReady=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "proxyListenersReady=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(configureRun, "providerRuntimeActive=1", "v3 tailnet control"):
+        return 1
+    let listenRun = v3GateRunBinary(root,
+                                    "v3 tailnet control listen " + stageName,
+                                    coreBin,
+                                    [
+                                        "--command", "listen",
+                                        "--provider-headscale", "1",
+                                        "--control-url", "https://headscale.example",
+                                        "--control-endpoint", "https://headscale.example/control",
+                                        "--relay-endpoint", "https://derp.sfo.example:443",
+                                        "--control-probe-endpoint", controlProbeEndpoint,
+                                        "--relay-probe-endpoint", relayProbeEndpoint,
+                                        "--namespace", "infra",
+                                        "--noise-public-key", "noise-pub-cli",
+                                        "--derp-region-code", "sfo",
+                                        "--derp-region-name", "SanFrancisco",
+                                        "--derp-hostname", "derp.sfo.example",
+                                        "--synthetic-ipv4", "100.64.0.44",
+                                        "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+                                        "--local-peer-id", "tailnet-control-test",
+                                        "--exact-routing", "1",
+                                        "--provider-ready", "1",
+                                        "--proxy-ready", "1",
+                                        "--host", "127.0.0.1",
+                                        "--port", "7101",
+                                        "--transport", "tcp"
+                                    ],
+                                    20,
+                                    os.joinPath(outDir, "tailnet_control_listen." + stageName + ".run.log"))
+    if v3GateRunFailed(listenRun):
+        return listenRun.exitCode
+    if !v3GateRequireOutput(listenRun, "publishedAddr=/ip4/100.64.0.44/tcp/7101", "v3 tailnet control") ||
+       !v3GateRequireOutput(listenRun, "listener.0.raw=/ip4/127.0.0.1/tcp/7101", "v3 tailnet control") ||
+       !v3GateRequireOutput(listenRun, "providerKind=headscale", "v3 tailnet control") ||
+       !v3GateRequireOutput(listenRun, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example", "v3 tailnet control") ||
+       !v3GateRequireOutput(listenRun, "providerRuntimeActive=1", "v3 tailnet control"):
+        return 1
+    let dialRun = v3GateRunBinary(root,
+                                  "v3 tailnet control dial-plan " + stageName,
+                                  coreBin,
+                                  [
+                                      "--command", "dial-plan",
+                                      "--provider-headscale", "1",
+                                      "--control-url", "https://headscale.example",
+                                      "--control-endpoint", "https://headscale.example/control",
+                                      "--relay-endpoint", "https://derp.sfo.example:443",
+                                      "--control-probe-endpoint", controlProbeEndpoint,
+                                      "--relay-probe-endpoint", relayProbeEndpoint,
+                                      "--namespace", "infra",
+                                      "--noise-public-key", "noise-pub-cli",
+                                      "--derp-region-code", "sfo",
+                                      "--derp-region-name", "SanFrancisco",
+                                      "--derp-hostname", "derp.sfo.example",
+                                      "--synthetic-ipv4", "100.64.0.44",
+                                      "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+                                      "--local-peer-id", "tailnet-control-test",
+                                      "--exact-routing", "1",
+                                      "--provider-ready", "1",
+                                      "--proxy-ready", "1",
+                                      "--derp-healthy", "1",
+                                      "--bootstrap-listen-count", "1",
+                                      "--bootstrap-listen-raw-0", "/ip4/127.0.0.1/tcp/7101",
+                                      "--bootstrap-peer-count", "1",
+                                      "--bootstrap-peer-id-0", "peer-direct",
+                                      "--bootstrap-peer-remote-tailnet-ip-0", "100.64.0.88",
+                                      "--bootstrap-peer-direct-reachable-0", "1",
+                                      "--bootstrap-peer-relay-allowed-0", "1",
+                                      "--bootstrap-peer-relay-only-0", "0",
+                                      "--bootstrap-peer-derp-region-code-0", "sfo",
+                                      "--bootstrap-peer-signed-preface-0", "test-preface",
+                                      "--bootstrap-peer-bound-addr-text-0", "/ip4/127.0.0.1/tcp/7101",
+                                      "--bootstrap-peer-last-path-0", "direct",
+                                      "--bootstrap-peer-last-error-0", "",
+                                      "--peer-id", "peer-direct",
+                                      "--addr", "/ip4/100.64.0.44/tcp/7101"
+                                  ],
+                                  20,
+                                  os.joinPath(outDir, "tailnet_control_dial." + stageName + ".run.log"))
+    if v3GateRunFailed(dialRun):
+        return dialRun.exitCode
+    if !v3GateRequireOutput(dialRun, "dial.pathKind=direct", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "dial.routeText=/ip4/127.0.0.1/tcp/7101", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "sessionCount=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "relayHealthy=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "startupStage=derp-ready", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "peer.0.lastPath=direct", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "providerRuntimeActive=1", "v3 tailnet control") ||
+       !v3GateRequireOutput(dialRun, "providerRuntimeCommands=3", "v3 tailnet control"):
+        return 1
+    v3GateMaybePrintRunOutput(baselineExec)
+    v3GateMaybePrintRunOutput(coreSmokeRun)
+    v3GateMaybePrintRunOutput(configureRun)
+    v3GateMaybePrintRunOutput(listenRun)
+    v3GateMaybePrintRunOutput(dialRun)
+    v3GatePrintLine("v3 tailnet_control_smoke ok")
+    return 0
+
+fn v3GateRunFreshNodeSelfhostGate(root: str,
+                                  compilerPath: str,
+                                  label: str,
+                                  envOverrides: str[]): int32 =
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/program_selfhost_smoke.cheng")
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_fresh_node_gate/" + label)
+    let syncPrefix: str = os.joinPath(outDir, "program_selfhost_smoke.sync")
+    let freshPrefix: str = os.joinPath(outDir, "program_selfhost_smoke.fresh")
+    if !os.fileExists(src):
+        v3GatePrintErr("v3 fresh-node selfhost gate: missing source: " + src)
+        return 1
+    let syncRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                               "v3 fresh-node selfhost world-sync " + label,
+                                                               compilerPath,
+                                                               [
+                                                                   "world-sync",
+                                                                   "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                   "--in:" + src,
+                                                                   "--target:arm64-apple-darwin",
+                                                                   "--out:" + syncPrefix,
+                                                                   "--channel:stable"
+                                                               ],
+                                                               envOverrides,
+                                                               root,
+                                                               0,
+                                                               os.joinPath(outDir, "world_sync.log"))
+    if v3GateRunFailed(syncRun):
+        return syncRun.exitCode
+    if !v3GateRequirePrefixArtifacts(syncPrefix,
+                                     [
+                                         ".world.txt",
+                                         ".compiler.snapshot.txt",
+                                         ".std.snapshot.txt",
+                                         ".runtime.snapshot.txt",
+                                         ".csg.txt",
+                                         ".surface.txt",
+                                         ".receipt.txt",
+                                         ".lock.toml"
+                                     ],
+                                     "v3 fresh-node selfhost gate"):
+        return 1
+    let freshRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                                "v3 fresh-node selfhost fresh " + label,
+                                                                compilerPath,
+                                                                [
+                                                                    "fresh-node-selfhost",
+                                                                    "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                    "--in:" + src,
+                                                                    "--target:arm64-apple-darwin",
+                                                                    "--out:" + freshPrefix,
+                                                                    "--channel:stable",
+                                                                    "--baseline-csg:" + syncPrefix + ".csg.txt",
+                                                                    "--baseline-surface:" + syncPrefix + ".surface.txt",
+                                                                    "--baseline-receipt:" + syncPrefix + ".receipt.txt"
+                                                                ],
+                                                                envOverrides,
+                                                                root,
+                                                                0,
+                                                                os.joinPath(outDir, "fresh_node.log"))
+    if v3GateRunFailed(freshRun):
+        return freshRun.exitCode
+    if !v3GateRequireOutput(freshRun, "equivalence_passed=1", "v3 fresh-node selfhost gate") ||
+       !v3GateRequireOutput(freshRun, "publish_allowed=1", "v3 fresh-node selfhost gate") ||
+       !v3GateRequireOutput(freshRun, "receipt_equivalent=1", "v3 fresh-node selfhost gate") ||
+       !v3GateRequireOutput(freshRun, "receipt_cid_match=1", "v3 fresh-node selfhost gate") ||
+       !v3GateRequireFileContains(freshPrefix + ".fresh.txt", "receipt_equivalent=1", "v3 fresh-node selfhost gate") ||
+       !v3GateRequireFileContains(freshPrefix + ".fresh.txt", "receipt_cid_match=1", "v3 fresh-node selfhost gate"):
+        return 1
+    v3GateMaybePrintRunOutput(syncRun)
+    v3GateMaybePrintRunOutput(freshRun)
+    v3GatePrintLine("v3 fresh-node selfhost gate ok (" + label + ")")
+    return 0
+
+fn v3GateRunMigrationGate(root: str,
+                          compilerPath: str,
+                          label: str,
+                          envOverrides: str[]): int32 =
+    let currentSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/compiler_migration_fixture.cheng")
+    let legacySrc: str = v3path.v3PathAbsolute(root, "v3/testdata/compiler_migration/compiler_migration_fixture_legacy.cheng")
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_migration_gate/" + label)
+    let migratePrefix: str = os.joinPath(outDir, "compiler_migration_fixture.migrate")
+    let proofPrefix: str = os.joinPath(outDir, "compiler_migration_fixture.prove")
+    let blockedPrefix: str = os.joinPath(outDir, "compiler_migration_fixture.blocked")
+    let publishPrefix: str = os.joinPath(outDir, "compiler_migration_fixture.publish")
+    if !os.fileExists(currentSrc) || !os.fileExists(legacySrc):
+        v3GatePrintErr("v3 migration gate: missing fixture sources")
+        return 1
+    let migrateRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                                  "v3 migration gate migrate-csg " + label,
+                                                                  compilerPath,
+                                                                  [
+                                                                      "migrate-csg",
+                                                                      "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                      "--in:" + currentSrc,
+                                                                      "--legacy-in:" + legacySrc,
+                                                                      "--out:" + migratePrefix
+                                                                  ],
+                                                                  envOverrides,
+                                                                  root,
+                                                                  0,
+                                                                  os.joinPath(outDir, "migrate_csg.log"))
+    if v3GateRunFailed(migrateRun):
+        return migrateRun.exitCode
+    if !v3GateRequirePrefixArtifacts(migratePrefix,
+                                     [".migration.txt", ".migration.csg.txt", ".migration.surface.txt", ".migration.receipt.txt"],
+                                     "v3 migration gate") ||
+       !v3GateRequireOutput(migrateRun, "canonical_graph_cid=", "v3 migration gate"):
+        return 1
+    let proveRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                                "v3 migration gate prove-migration " + label,
+                                                                compilerPath,
+                                                                [
+                                                                    "prove-migration",
+                                                                    "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                    "--in:" + currentSrc,
+                                                                    "--legacy-in:" + legacySrc,
+                                                                    "--target:arm64-apple-darwin",
+                                                                    "--channel:stable",
+                                                                    "--out:" + proofPrefix
+                                                                ],
+                                                                envOverrides,
+                                                                root,
+                                                                0,
+                                                                os.joinPath(outDir, "prove_migration.log"))
+    if v3GateRunFailed(proveRun):
+        return proveRun.exitCode
+    if !v3GateRequirePrefixArtifacts(proofPrefix,
+                                     [".migration.txt", ".migration.csg.txt", ".migration.surface.txt", ".migration.receipt.txt", ".proof.txt"],
+                                     "v3 migration gate") ||
+       !v3GateRequireOutput(proveRun, "equivalence_kind=canonical_semantic_identity", "v3 migration gate") ||
+       !v3GateRequireOutput(proveRun, "graph_equivalent=1", "v3 migration gate") ||
+       !v3GateRequireOutput(proveRun, "export_surface_compatible=1", "v3 migration gate") ||
+       !v3GateRequireOutput(proveRun, "compile_receipt_equivalent=1", "v3 migration gate"):
+        return 1
+    let blockedRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                                  "v3 migration gate publish-blocked " + label,
+                                                                  compilerPath,
+                                                                  [
+                                                                      "publish-world",
+                                                                      "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                      "--in:" + currentSrc,
+                                                                      "--target:arm64-apple-darwin",
+                                                                      "--out:" + blockedPrefix,
+                                                                      "--channel:stable"
+                                                                  ],
+                                                                  envOverrides,
+                                                                  root,
+                                                                  0,
+                                                                  os.joinPath(outDir, "publish_blocked.log"))
+    if blockedRun.exitCode == 0:
+        v3GatePrintErr("v3 migration gate: stable publish unexpectedly passed without proof")
+        return 1
+    if !v3GateRequireAnyOutput(blockedRun.output,
+                               ["stable requires", "publish blocked", "missing --baseline"],
+                               "v3 migration gate"):
+        return 1
+    let publishRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                                  "v3 migration gate publish-world " + label,
+                                                                  compilerPath,
+                                                                  [
+                                                                      "publish-world",
+                                                                      "--root:" + v3path.v3PathAbsolute(root, "v3"),
+                                                                      "--in:" + currentSrc,
+                                                                      "--legacy-in:" + legacySrc,
+                                                                      "--target:arm64-apple-darwin",
+                                                                      "--out:" + publishPrefix,
+                                                                      "--channel:stable"
+                                                                  ],
+                                                                  envOverrides,
+                                                                  root,
+                                                                  0,
+                                                                  os.joinPath(outDir, "publish_migration.log"))
+    if v3GateRunFailed(publishRun):
+        return publishRun.exitCode
+    if !v3GateRequirePrefixArtifacts(publishPrefix,
+                                     [
+                                         ".world.txt",
+                                         ".compiler.snapshot.txt",
+                                         ".std.snapshot.txt",
+                                         ".runtime.snapshot.txt",
+                                         ".csg.txt",
+                                         ".surface.txt",
+                                         ".receipt.txt",
+                                         ".lock.toml",
+                                         ".migration.txt",
+                                         ".migration.csg.txt",
+                                         ".migration.surface.txt",
+                                         ".migration.receipt.txt",
+                                         ".proof.txt",
+                                         ".publish.txt"
+                                     ],
+                                     "v3 migration gate") ||
+       !v3GateRequireOutput(publishRun, "proof_mode=migration", "v3 migration gate") ||
+       !v3GateRequireOutput(publishRun, "equivalence_passed=1", "v3 migration gate") ||
+       !v3GateRequireOutput(publishRun, "publish_allowed=1", "v3 migration gate"):
+        return 1
+    v3GateMaybePrintRunOutput(migrateRun)
+    v3GateMaybePrintRunOutput(proveRun)
+    v3GateMaybePrintRunOutput(blockedRun)
+    v3GateMaybePrintRunOutput(publishRun)
+    v3GatePrintLine("v3 migration gate ok (" + label + ")")
+    return 0
+
+fn v3GateRunBrowserWebrtcSmokes(root: str,
+                                tests: str[],
+                                envOverrides: str[]): int32 =
+    let browserDir: str = v3path.v3PathAbsolute(root, "v3/tooling/browser_webrtc")
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_browser_webrtc")
+    var hostCompiler = ""
+    if v3GateResolveSmokeCompiler(root, "", "CHENG_V3_SMOKE_COMPILER", "", hostCompiler) != 0:
+        return 1
+    if v3GateEnsureBootstrapBridge(root) != 0:
+        return 1
+    let stage2: str = contracts.v3BootstrapStage2Path(root)
+    let stage3: str = contracts.v3BootstrapStage3Path(root)
+    if !os.fileExists(stage2) || !os.fileExists(stage3):
+        v3GatePrintErr("v3 browser webrtc smokes: missing bootstrap compiler")
+        return 1
+    if !os.dirExists(os.joinPath(browserDir, "node_modules/playwright")):
+        let npmRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(root,
+                                                                     "v3 browser webrtc npm-install",
+                                                                     "npm",
+                                                                     ["install", "--no-fund", "--no-audit"],
+                                                                     [],
+                                                                     browserDir,
+                                                                     600,
+                                                                     os.joinPath(outDir, "npm_install.log"))
+        if v3GateRunFailed(npmRun):
+            return npmRun.exitCode
+    let playwrightRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(root,
+                                                                        "v3 browser webrtc playwright-install",
+                                                                        "npx",
+                                                                        ["playwright", "install", "chromium"],
+                                                                        [],
+                                                                        browserDir,
+                                                                        600,
+                                                                        os.joinPath(outDir, "playwright_install.log"))
+    if v3GateRunFailed(playwrightRun):
+        return playwrightRun.exitCode
+    var names: str[] = v3GateDefaultBrowserWebrtcSmokes()
+    if tests.len > 0:
+        names = tests
+    for i in 0..<names.len:
+        let smokeName: str = names[i]
+        let hostBin: str = os.joinPath(outDir, smokeName + ".host")
+        if v3GateRunSingleFixtureSmoke(root,
+                                       "v3 browser webrtc",
+                                       hostCompiler,
+                                       smokeName,
+                                       hostBin,
+                                       "host",
+                                       envOverrides) != 0:
+            return 1
+        let stage2Bin: str = os.joinPath(outDir, smokeName + ".stage2")
+        if v3GateRunSingleFixtureSmoke(root,
+                                       "v3 browser webrtc",
+                                       stage2,
+                                       smokeName,
+                                       stage2Bin,
+                                       "stage2",
+                                       envOverrides) != 0:
+            return 1
+        let stage3Bin: str = os.joinPath(outDir, smokeName + ".stage3")
+        if v3GateRunSingleFixtureSmoke(root,
+                                       "v3 browser webrtc",
+                                       stage3,
+                                       smokeName,
+                                       stage3Bin,
+                                       "stage3",
+                                       envOverrides) != 0:
+            return 1
+    v3GatePrintLine("v3 browser webrtc smokes: ok")
+    return 0
+
+fn v3GateRunChainNodeProcessSmokeWithCompiler(root: str,
+                                              compilerPath: str,
+                                              label: str,
+                                              envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_chain_node_process/" + label)
+    let serverSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/chain_node_process_server_smoke.cheng")
+    let clientSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/chain_node_process_client_smoke.cheng")
+    let serverBin: str = os.joinPath(outDir, "chain_node_process_server")
+    let clientBin: str = os.joinPath(outDir, "chain_node_process_client")
+    let serverCompile = v3GateCompileExeEnv(root,
+                                            "run_chain_node_process_server_build " + label,
+                                            compilerPath,
+                                            serverSrc,
+                                            serverBin,
+                                            "arm64-apple-darwin",
+                                            os.joinPath(outDir, "chain_node_process_server.compile.log"),
+                                            envOverrides)
+    if v3GateRunFailed(serverCompile):
+        return serverCompile.exitCode
+    let clientCompile = v3GateCompileExeEnv(root,
+                                            "run_chain_node_process_client_build " + label,
+                                            compilerPath,
+                                            clientSrc,
+                                            clientBin,
+                                            "arm64-apple-darwin",
+                                            os.joinPath(outDir, "chain_node_process_client.compile.log"),
+                                            envOverrides)
+    if v3GateRunFailed(clientCompile):
+        return clientCompile.exitCode
+    let readyPath: str = os.joinPath(outDir, "server.ready")
+    let _ = os.removeFile(readyPath)
+    let spawnRes = hostops.v3SpawnFile(root, "chain_node_process_server " + label, serverBin, ["--port:0", "--ready-path:" + readyPath], [], root)
+    if IsErr(spawnRes):
+        v3GatePrintErr(Error(spawnRes))
+        return 1
+    var serverProc = Value(spawnRes)
+    var port = ""
+    if !v3GateWaitReadyPort(root, readyPath, serverProc, port):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, os.joinPath(outDir, "server.log"), 1)
+        v3GatePrintErr("v3 chain_node process smoke: invalid ready port")
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = v3GateRunBinary(root, "chain_node_process_client " + label, clientBin, ["--port:" + port], 20, os.joinPath(outDir, "client.log"))
+    if v3GateRunFailed(clientRun):
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, os.joinPath(outDir, "server.log"))
+        v3GateMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, os.joinPath(outDir, "server.log"))
+    v3GateMaybePrintRunOutput(serverRun)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    v3GateMaybePrintRunOutput(clientRun)
+    v3GatePrintLine("v3 chain_node process smoke ok (" + label + ")")
+    return 0
+
+fn v3GateRunChainNodeThreeNodeSmokeWithCompiler(root: str,
+                                                compilerPath: str,
+                                                label: str,
+                                                envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_chain_node_three_node/" + label)
+    let serverSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/chain_node_process_server_smoke.cheng")
+    let relaySrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/chain_node_process_relay_smoke.cheng")
+    let clientSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/chain_node_process_client_smoke.cheng")
+    let serverBin: str = os.joinPath(outDir, "chain_node_process_server")
+    let relayBin: str = os.joinPath(outDir, "chain_node_process_relay")
+    let clientBin: str = os.joinPath(outDir, "chain_node_process_client")
+    let serverCompile = v3GateCompileExeEnv(root,
+                                            "run_chain_node_three_node_server_build " + label,
+                                            compilerPath,
+                                            serverSrc,
+                                            serverBin,
+                                            "arm64-apple-darwin",
+                                            os.joinPath(outDir, "chain_node_process_server.compile.log"),
+                                            envOverrides)
+    if v3GateRunFailed(serverCompile):
+        return serverCompile.exitCode
+    let relayCompile = v3GateCompileExeEnv(root,
+                                           "run_chain_node_three_node_relay_build " + label,
+                                           compilerPath,
+                                           relaySrc,
+                                           relayBin,
+                                           "arm64-apple-darwin",
+                                           os.joinPath(outDir, "chain_node_process_relay.compile.log"),
+                                           envOverrides)
+    if v3GateRunFailed(relayCompile):
+        return relayCompile.exitCode
+    let clientCompile = v3GateCompileExeEnv(root,
+                                            "run_chain_node_three_node_client_build " + label,
+                                            compilerPath,
+                                            clientSrc,
+                                            clientBin,
+                                            "arm64-apple-darwin",
+                                            os.joinPath(outDir, "chain_node_process_client.compile.log"),
+                                            envOverrides)
+    if v3GateRunFailed(clientCompile):
+        return clientCompile.exitCode
+    let serverReady: str = os.joinPath(outDir, "server.ready")
+    let relayReady: str = os.joinPath(outDir, "relay.ready")
+    let _ = os.removeFile(serverReady)
+    let _ = os.removeFile(relayReady)
+    let serverSpawn = hostops.v3SpawnFile(root, "chain_node_three_node_server " + label, serverBin, ["--port:0", "--ready-path:" + serverReady], [], root)
+    if IsErr(serverSpawn):
+        v3GatePrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var serverPort = ""
+    if !v3GateWaitReadyPort(root, serverReady, serverProc, serverPort):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, os.joinPath(outDir, "server.log"), 1)
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let relaySpawn = hostops.v3SpawnFile(root, "chain_node_three_node_relay " + label, relayBin, ["--upstream-port:" + serverPort, "--port:0", "--ready-path:" + relayReady], [], root)
+    if IsErr(relaySpawn):
+        v3GatePrintErr(Error(relaySpawn))
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    var relayProc = Value(relaySpawn)
+    var relayPort = ""
+    if !v3GateWaitReadyPort(root, relayReady, relayProc, relayPort):
+        let relayRun = v3GateWriteProcessSnapshot(root, relayProc, os.joinPath(outDir, "relay.log"), 1)
+        v3GateMaybePrintRunOutput(relayRun)
+        hostops.v3SpawnedProcessKill(relayProc)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = v3GateRunBinary(root, "chain_node_three_node_client " + label, clientBin, ["--port:" + relayPort], 20, os.joinPath(outDir, "client.log"))
+    if v3GateRunFailed(clientRun):
+        let relayRun = hostops.v3SpawnedProcessWaitLogged(root, relayProc, 1, os.joinPath(outDir, "relay.log"))
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, os.joinPath(outDir, "server.log"))
+        v3GateMaybePrintRunOutput(serverRun)
+        v3GateMaybePrintRunOutput(relayRun)
+        return clientRun.exitCode
+    let relayRun = hostops.v3SpawnedProcessWaitLogged(root, relayProc, 20, os.joinPath(outDir, "relay.log"))
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, os.joinPath(outDir, "server.log"))
+    v3GateMaybePrintRunOutput(serverRun)
+    v3GateMaybePrintRunOutput(relayRun)
+    v3GateMaybePrintRunOutput(clientRun)
+    if v3GateRunFailed(relayRun):
+        return relayRun.exitCode
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    v3GatePrintLine("v3 chain_node three-node smoke ok (" + label + ")")
+    return 0
+
+fn v3GateRunHostSmokes(root: str, args: str[]): int32 =
+    let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_SMOKE_COMPILER", "", compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_hostrun")
+    let tailOnly: str = strutil.strip(v3GateReadFlag(args, "--tail-only", ""))
+    let positionals: str[] = v3GateCollectPositionals(args)
+    let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host")
+    if len(tailOnly) > 0:
+        if tailOnly == "wasm":
+            return v3GateRunWasmSmokes(root, compiler, label, [])
+        if tailOnly == "browser_host_wasm":
+            return v3GateRunBrowserHostWasmSmoke(root, compiler, label, [])
+        if tailOnly == "chain_node_cli":
+            return v3GateRunChainNodeCliSmoke(root, compiler, label, [])
+        if tailOnly == "chain_node_process":
+            return v3GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, [])
+        if tailOnly == "chain_node_three_node":
+            return v3GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, [])
+        if tailOnly == "tailnet_control":
+            return v3GateRunTailnetControlSmoke(root, compiler, label, [])
+        if tailOnly == "fresh_node_selfhost":
+            return v3GateRunFreshNodeSelfhostGate(root, compiler, label, [])
+        if tailOnly == "migration":
+            return v3GateRunMigrationGate(root, compiler, label, [])
+        v3GatePrintErr("v3 host smokes: unknown --tail-only: " + tailOnly)
+        return 1
+    var tests: str[] = v3GateDefaultHostSmokes()
+    var runTail: bool = true
+    if positionals.len > 0:
+        tests = positionals
+        runTail = false
+    for i in 0..<tests.len:
+        let smokeName: str = tests[i]
+        let outBin: str = os.joinPath(outDir, smokeName)
+        if v3GateRunSingleFixtureSmoke(root, "v3 host smokes", compiler, smokeName, outBin, "host", []) != 0:
+            return 1
+        if smokeName == "chain_node_libp2p_smoke":
+            if v3GateRunTcpTwoprocSmoke(root, compiler, "host", []) != 0:
+                return 1
+    if runTail:
+        if v3GateRunChainNodeCliSmoke(root, compiler, "host", []) != 0:
+            return 1
+        if v3GateRunChainNodeProcessSmokeWithCompiler(root, compiler, "host", []) != 0:
+            return 1
+        if v3GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, "host", []) != 0:
+            return 1
+        if v3GateRunTailnetControlSmoke(root, compiler, "host", []) != 0:
+            return 1
+        if v3GateRunFreshNodeSelfhostGate(root, compiler, "host", []) != 0:
+            return 1
+        if v3GateRunMigrationGate(root, compiler, "host", []) != 0:
+            return 1
+    v3GatePrintLine("v3 host smokes: ok")
+    return 0
+
+fn v3GateRunStage23Libp2pSmokes(root: str, args: str[]): int32 =
+    if v3GateEnsureBootstrapBridge(root) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_stage23_libp2p")
+    let stage2: str = contracts.v3BootstrapStage2Path(root)
+    let stage3: str = contracts.v3BootstrapStage3Path(root)
+    if !os.fileExists(stage2) || !os.fileExists(stage3):
+        v3GatePrintErr("v3 stage2/stage3 libp2p: missing bootstrap compiler")
+        return 1
+    let envOverrides: str[] = v3GateStage23EnvOverrides()
+    let tailOnly: str = strutil.strip(v3GateReadFlag(args, "--tail-only", ""))
+    let positionals: str[] = v3GateCollectPositionals(args)
+    if tailOnly == "browser_webrtc":
+        return v3GateRunBrowserWebrtcSmokes(root, positionals, envOverrides)
+    if len(tailOnly) > 0:
+        v3GatePrintErr("v3 stage2/stage3 libp2p: unknown --tail-only: " + tailOnly)
+        return 1
+    var tests: str[] = v3GateDefaultStage23Smokes()
+    var runTail: bool = true
+    if positionals.len > 0:
+        tests = positionals
+        runTail = false
+    for i in 0..<tests.len:
+        let smokeName: str = tests[i]
+        let stage2Bin: str = os.joinPath(outDir, smokeName + ".stage2")
+        if v3GateRunSingleFixtureSmoke(root, "v3 stage2/stage3 libp2p", stage2, smokeName, stage2Bin, "stage2", envOverrides) != 0:
+            return 1
+        if smokeName == "libp2p_tcp_smoke":
+            if v3GateRunTcpTwoprocSmoke(root, stage2, "stage2", envOverrides) != 0:
+                return 1
+        let stage3Bin: str = os.joinPath(outDir, smokeName + ".stage3")
+        if v3GateRunSingleFixtureSmoke(root, "v3 stage2/stage3 libp2p", stage3, smokeName, stage3Bin, "stage3", envOverrides) != 0:
+            return 1
+        if smokeName == "libp2p_tcp_smoke":
+            if v3GateRunTcpTwoprocSmoke(root, stage3, "stage3", envOverrides) != 0:
+                return 1
+    if runTail:
+        if v3GateRunChainNodeCliSmoke(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunChainNodeCliSmoke(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunChainNodeProcessSmokeWithCompiler(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunChainNodeProcessSmokeWithCompiler(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunChainNodeThreeNodeSmokeWithCompiler(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunChainNodeThreeNodeSmokeWithCompiler(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunTailnetControlSmoke(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunTailnetControlSmoke(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunFreshNodeSelfhostGate(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunFreshNodeSelfhostGate(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunMigrationGate(root, stage2, "stage2", envOverrides) != 0:
+            return 1
+        if v3GateRunMigrationGate(root, stage3, "stage3", envOverrides) != 0:
+            return 1
+        if v3GateRunBrowserWebrtcSmokes(root, [], envOverrides) != 0:
+            return 1
+    v3GatePrintLine("v3 stage2/stage3 libp2p: ok")
+    return 0
+
+fn v3GateBuildZeroExit(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_zero_exit")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_zero_exit_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_zero_exit_fixture")
+    let compileRun = v3GateCompileExe(root, "build_zero_exit", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_zero_exit/ordinary_zero_exit_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outBin) || !os.fileExists(outBin + ".v3.map"):
+        v3GatePrintErr("v3 zero-exit: missing output or line-map")
+        return 1
+    let run = v3GateRunBinary(root, "build_zero_exit_run", outBin, [], 20, "artifacts/v3_zero_exit/ordinary_zero_exit_fixture.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildCallChain(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_call_chain")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_call_chain_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_call_chain_fixture")
+    let compileRun = v3GateCompileExe(root, "build_call_chain", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_call_chain/ordinary_call_chain_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = v3GateRunBinary(root, "build_call_chain_run", outBin, [], 20, "artifacts/v3_call_chain/ordinary_call_chain_fixture.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildProgramSelfhost(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_program_selfhost")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/program_selfhost_smoke.cheng")
+    let outBin: str = os.joinPath(outDir, "program_selfhost_smoke")
+    let compileRun = v3GateCompileExe(root, "build_program_selfhost", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_program_selfhost/program_selfhost_smoke.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = v3GateRunBinary(root, "build_program_selfhost_run", outBin, [], 20, "artifacts/v3_program_selfhost/program_selfhost_smoke.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildFfiHandle(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_ffi_handle")
+    let okSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/ffi_handle_smoke.cheng")
+    let trapSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/ffi_handle_stale_trap_smoke.cheng")
+    let okBin: str = os.joinPath(outDir, "ffi_handle_smoke")
+    let trapBin: str = os.joinPath(outDir, "ffi_handle_stale_trap_smoke")
+    let okCompile = v3GateCompileExe(root, "build_ffi_handle_ok", compiler, okSrc, okBin, "arm64-apple-darwin", "artifacts/v3_ffi_handle/ffi_handle_smoke.compile.log")
+    if v3GateRunFailed(okCompile):
+        return okCompile.exitCode
+    let trapCompile = v3GateCompileExe(root, "build_ffi_handle_trap", compiler, trapSrc, trapBin, "arm64-apple-darwin", "artifacts/v3_ffi_handle/ffi_handle_stale_trap_smoke.compile.log")
+    if v3GateRunFailed(trapCompile):
+        return trapCompile.exitCode
+    if !os.fileExists(okBin + ".v3.map") || !os.fileExists(trapBin + ".v3.map"):
+        v3GatePrintErr("v3 ffi-handle: missing line-map sidecar")
+        return 1
+    let okRun = v3GateRunBinary(root, "build_ffi_handle_ok_run", okBin, [], 20, "artifacts/v3_ffi_handle/ffi_handle_smoke.run.log")
+    v3GateMaybePrintRunOutput(okRun)
+    if v3GateRunFailed(okRun):
+        return okRun.exitCode
+    let trapRun = v3GateRunBinary(root, "build_ffi_handle_trap_run", trapBin, [], 20, "artifacts/v3_ffi_handle/ffi_handle_stale_trap_smoke.run.log")
+    v3GateMaybePrintRunOutput(trapRun)
+    if trapRun.exitCode == 0:
+        v3GatePrintErr("v3 ffi-handle: stale trap unexpectedly exited 0")
+        return 1
+    if !v3GateRequireOutput(trapRun, "ffi handle invalid", "v3 ffi-handle") ||
+       !v3GateRequireOutput(trapRun, "reason=ffi_handle", "v3 ffi-handle") ||
+       !v3GateRequireOutput(trapRun, "ffi_handle_stale_trap_smoke.cheng:", "v3 ffi-handle"):
+        return 1
+    return 0
+
+fn v3GateReadProgramTrim(root: str,
+                         label: str,
+                         programName: str,
+                         args: str[],
+                         logRelPath: str): str =
+    let run: hostops.V3LoggedRun = hostops.v3RunProgramLogged(root,
+                                                              label,
+                                                              programName,
+                                                              args,
+                                                              [],
+                                                              root,
+                                                              20,
+                                                              logRelPath)
+    if v3GateRunFailed(run):
+        return ""
+    return strutil.strip(run.output)
+
+fn v3GateHostTarget(root: str): str =
+    let hostOs: str = v3GateReadProgramTrim(root, "v3 host uname-s", "uname", ["-s"], "artifacts/v3_gate/uname_s.log")
+    let hostArch: str = v3GateReadProgramTrim(root, "v3 host uname-m", "uname", ["-m"], "artifacts/v3_gate/uname_m.log")
+    if hostOs == "Darwin" && hostArch == "arm64":
+        return "arm64-apple-darwin"
+    if hostOs == "Linux" && hostArch == "x86_64":
+        return "x86_64-unknown-linux-gnu"
+    if hostOs == "Linux" && (hostArch == "aarch64" || hostArch == "arm64"):
+        return "aarch64-unknown-linux-gnu"
+    return ""
+
+fn v3GateCompileExeFromEnv(root: str): int32 =
+    let explicitCompiler: str = os.getEnvDefault("CHENG_V3_COMPILE_COMPILER", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_COMPILE_COMPILER", "", compiler) != 0:
+        return 1
+    let packageRoot: str = v3path.v3PathAbsolute(root, os.getEnvDefault("CHENG_V3_COMPILE_ROOT", "v3"))
+    let src: str = v3path.v3PathAbsolute(root, os.getEnvDefault("CHENG_V3_COMPILE_SOURCE", ""))
+    let outBin: str = v3path.v3PathAbsolute(root, os.getEnvDefault("CHENG_V3_COMPILE_OUT", ""))
+    let target: str = strutil.strip(os.getEnvDefault("CHENG_V3_COMPILE_TARGET", "arm64-apple-darwin"))
+    let label: str = os.getEnvDefault("CHENG_V3_COMPILE_LABEL", "v3 compile-exe")
+    let logPath: str = os.getEnvDefault("CHENG_V3_COMPILE_LOG", outBin + ".compile.log")
+    let reportPath: str = strutil.strip(os.getEnvDefault("CHENG_V3_COMPILE_REPORT", ""))
+    if len(src) <= 0 || !os.fileExists(src):
+        v3GatePrintErr("v3 compile-exe: missing source: " + src)
+        return 1
+    if len(outBin) <= 0:
+        v3GatePrintErr("v3 compile-exe: missing out path")
+        return 1
+    var args: str[] = [
+        "system-link-exec",
+        "--root", packageRoot,
+        "--in", src,
+        "--emit", "exe",
+        "--target", target,
+        "--out", outBin
+    ]
+    if len(reportPath) > 0:
+        args.add("--report-out")
+        args.add(v3path.v3PathAbsolute(root, reportPath))
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                           label,
+                                                           compiler,
+                                                           args,
+                                                           [],
+                                                           root,
+                                                           int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300"))),
+                                                           logPath)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildLinuxNolibcExe(root: str): int32 =
+    let targetRaw: str = strutil.strip(os.getEnvDefault("CHENG_V3_LINUX_EXE_TARGET", "aarch64-unknown-linux-gnu"))
+    let sourcePath: str = strutil.strip(os.getEnvDefault("CHENG_V3_LINUX_EXE_SOURCE", ""))
+    let outBin: str = strutil.strip(os.getEnvDefault("CHENG_V3_LINUX_EXE_OUT", ""))
+    if len(sourcePath) <= 0:
+        v3GatePrintErr("v3 linux exe: missing CHENG_V3_LINUX_EXE_SOURCE")
+        return 1
+    if len(outBin) <= 0:
+        v3GatePrintErr("v3 linux exe: missing CHENG_V3_LINUX_EXE_OUT")
+        return 1
+    var target = targetRaw
+    if target == "arm64-unknown-linux-gnu":
+        target = "aarch64-unknown-linux-gnu"
+    if target != "aarch64-unknown-linux-gnu":
+        v3GatePrintErr("v3 linux exe: unsupported target=" + targetRaw)
+        return 1
+    let explicitCompiler: str = os.getEnvDefault("CHENG_V3_LINUX_EXE_COMPILER", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_LINUX_EXE_COMPILER", "", compiler) != 0:
+        return 1
+    let packageRoot: str = v3path.v3PathAbsolute(root, "v3")
+    let reportPath: str = strutil.strip(os.getEnvDefault("CHENG_V3_LINUX_EXE_REPORT", ""))
+    var args: str[] = [
+        "system-link-exec",
+        "--root", packageRoot,
+        "--in", v3path.v3PathAbsolute(root, sourcePath),
+        "--emit", "exe",
+        "--target", target,
+        "--out", v3path.v3PathAbsolute(root, outBin)
+    ]
+    if len(reportPath) > 0:
+        args.add("--report-out")
+        args.add(v3path.v3PathAbsolute(root, reportPath))
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
+                                                           "v3 linux exe",
+                                                           compiler,
+                                                           args,
+                                                           [],
+                                                           root,
+                                                           int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300"))),
+                                                           v3path.v3PathAbsolute(root, outBin) + ".compile.log")
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildBftStateMachine(root: str): int32 =
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, "", "CHENG_V3_BFT_COMPILER", "", compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/project/bft_state_machine_main.cheng")
+    let outBin: str = os.joinPath(outDir, "bft_state_machine")
+    let compileRun = v3GateCompileExe(root,
+                                      "build_bft_state_machine",
+                                      compiler,
+                                      src,
+                                      outBin,
+                                      "arm64-apple-darwin",
+                                      os.joinPath(outDir, "bft_state_machine.compile.log"))
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = v3GateRunBinary(root,
+                              "build_bft_state_machine_run",
+                              outBin,
+                              [],
+                              20,
+                              os.joinPath(outDir, "bft_state_machine.self-test.log"))
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
+fn v3GateBuildRwadBftStateMachine(root: str): int32 =
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, "", "CHENG_V3_RWAD_COMPILER", "", compiler) != 0:
+        return 1
+    let target: str = os.getEnvDefault("RWAD_BFT_TARGET", "arm64-apple-darwin")
+    var defaultOutDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_rwad_bft_state_machine")
+    if target != "arm64-apple-darwin":
+        defaultOutDir = os.joinPath(defaultOutDir, target)
+    let outDir: str = os.getEnvDefault("RWAD_BFT_OUT_DIR", defaultOutDir)
+    let outBin: str = os.getEnvDefault("RWAD_BFT_OUT_BIN", os.joinPath(outDir, "rwad_bft_state_machine"))
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/project/rwad_bft_state_machine_main.cheng")
+    let compileRun = v3GateCompileExe(root,
+                                      "build_rwad_bft_state_machine",
+                                      compiler,
+                                      src,
+                                      outBin,
+                                      target,
+                                      os.joinPath(outDir, "rwad_bft_state_machine.compile.log"))
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    var runSelfTestDefault = "0"
+    if target == v3GateHostTarget(root):
+        runSelfTestDefault = "1"
+    let runSelfTest: str = os.getEnvDefault("RWAD_BFT_RUN_SELF_TEST", runSelfTestDefault)
+    if runSelfTest != "0":
+        let run = v3GateRunBinary(root,
+                                  "build_rwad_bft_state_machine_run",
+                                  outBin,
+                                  ["self-test"],
+                                  20,
+                                  os.joinPath(outDir, "rwad_bft_state_machine.self-test.log"))
+        v3GateMaybePrintRunOutput(run)
+        if v3GateRunFailed(run):
+            return run.exitCode
+    else:
+        v3GatePrintLine("v3 rwad_bft_state_machine: build ok target=" + target + " out=" + outBin)
+    return 0
+
+fn v3GateBuildPanicTrace(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_panic_trace")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_panic_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_panic_fixture")
+    let compileRun = v3GateCompileExe(root, "build_panic_trace", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_panic_trace/ordinary_panic_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let lineMap: str = outBin + ".v3.map"
+    if !os.fileExists(lineMap):
+        v3GatePrintErr("v3 panic-trace: missing line-map sidecar")
+        return 1
+    let lineMapText: str = v3path.v3ReadTextFile("", lineMap)
+    if !v3GateOutputContains(lineMapText, "v3_line_map_v1") || !v3GateOutputContains(lineMapText, "ordinary_panic_fixture.cheng"):
+        v3GatePrintErr("v3 panic-trace: invalid line-map")
+        return 1
+    let run = v3GateRunBinary(root, "build_panic_trace_run", outBin, [], 20, "artifacts/v3_panic_trace/ordinary_panic_fixture.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if run.exitCode == 0:
+        v3GatePrintErr("v3 panic-trace: expected non-zero exit")
+        return 1
+    if !v3GateRequireOutput(run, "v3 panic fixture", "v3 panic-trace") ||
+       !v3GateRequireOutput(run, "[cheng-v3] v3_crash_report_v1", "v3 panic-trace") ||
+       !v3GateRequireOutput(run, "reason=panic mode=backtrace", "v3 panic-trace") ||
+       !v3GateRequireOutput(run, "ordinary_panic_fixture.cheng:", "v3 panic-trace"):
+        return 1
+    return 0
+
+fn v3GateBuildBoundsTrace(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_bounds_trace")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_bounds_trace_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_bounds_trace_fixture")
+    let compileRun = v3GateCompileExe(root, "build_bounds_trace", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_bounds_trace/ordinary_bounds_trace_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outBin + ".v3.map"):
+        v3GatePrintErr("v3 bounds-trace: missing line-map sidecar")
+        return 1
+    let run = v3GateRunBinary(root, "build_bounds_trace_run", outBin, [], 20, "artifacts/v3_bounds_trace/ordinary_bounds_trace_fixture.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if run.exitCode == 0:
+        v3GatePrintErr("v3 bounds-trace: expected non-zero exit")
+        return 1
+    if !v3GateRequireOutput(run, "bounds check failed", "v3 bounds-trace") ||
+       !v3GateRequireOutput(run, "[cheng-v3] v3_crash_report_v1", "v3 bounds-trace") ||
+       !v3GateRequireOutput(run, "reason=bounds mode=backtrace", "v3 bounds-trace") ||
+       !v3GateRequireOutput(run, "ordinary_bounds_trace_fixture.cheng:", "v3 bounds-trace"):
+        return 1
+    return 0
+
+fn v3GateBuildSignalTrace(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_signal_trace")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_signal_trace_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_signal_trace_fixture")
+    let compileRun = v3GateCompileExe(root, "build_signal_trace", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_signal_trace/ordinary_signal_trace_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outBin + ".v3.map"):
+        v3GatePrintErr("v3 signal-trace: missing line-map sidecar")
+        return 1
+    let run = v3GateRunBinary(root, "build_signal_trace_run", outBin, [], 20, "artifacts/v3_signal_trace/ordinary_signal_trace_fixture.run.log")
+    v3GateMaybePrintRunOutput(run)
+    if run.exitCode == 0:
+        v3GatePrintErr("v3 signal-trace: expected non-zero exit")
+        return 1
+    if !v3GateRequireOutput(run, "[cheng-v3] v3_crash_report_v1", "v3 signal-trace") ||
+       !v3GateRequireOutput(run, "reason=signal mode=signal", "v3 signal-trace") ||
+       !v3GateRequireOutput(run, "ordinary_signal_trace_fixture.cheng:", "v3 signal-trace"):
+        return 1
+    return 0
+
+fn v3GateVerifyDebugRuntime(root: str): int32 =
+    if v3GateBuildPanicTrace(root) != 0:
+        return 1
+    if v3GateBuildBoundsTrace(root) != 0:
+        return 1
+    if v3GateBuildSignalTrace(root) != 0:
+        return 1
+    v3GatePrintLine("v3 debug runtime: ok")
+    return 0
+
+fn v3GateVerifyDebugProfile(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_debug_profile_verify")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_profile_hotspots_fixture.cheng")
+    let outBin: str = os.joinPath(outDir, "ordinary_profile_hotspots_fixture")
+    let report: str = os.joinPath(outDir, "profile.txt")
+    let compileRun = v3GateCompileExe(root, "verify_debug_profile", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_debug_profile_verify/ordinary_profile_hotspots_fixture.compile.log")
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let run = hostops.v3RunFileLogged(root,
+                                      "verify_debug_profile_run",
+                                      outBin,
+                                      [],
+                                      [
+                                          "CHENG_V3_PROFILE_ENABLE=1",
+                                          "CHENG_V3_PROFILE_HZ=200",
+                                          "CHENG_V3_PROFILE_OUT=" + report
+                                      ],
+                                      root,
+                                      20,
+                                      "artifacts/v3_debug_profile_verify/ordinary_profile_hotspots_fixture.run.log")
+    if v3GateRunFailed(run):
+        return run.exitCode
+    if !os.fileExists(report):
+        v3GatePrintErr("v3 debug profile: missing report")
+        return 1
+    let reportText: str = v3path.v3ReadTextFile("", report)
+    if !v3GateOutputContains(reportText, "v3_profile_v1") ||
+       !v3GateOutputContains(reportText, "hot_function[0]=") ||
+       !v3GateOutputContains(reportText, "hot_pc[0]=") ||
+       !v3GateOutputContains(reportText, "ordinary_profile_hotspots_fixture.cheng"):
+        v3GatePrintErr("v3 debug profile: invalid report")
+        return 1
+    v3GatePrintLine(strutil.strip(reportText))
+    v3GatePrintLine("v3 debug profile: ok")
+    return 0
+
+fn v3GateBuildChainNode(root: str): int32 =
+    var compiler = os.getEnvDefault("CHENG_V3_CHAIN_NODE_COMPILER", "")
+    if len(compiler) <= 0:
+        if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+            return 1
+    else:
+        compiler = v3path.v3PathAbsolute(root, compiler)
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/project/chain_node_main.cheng")
+    let target: str = os.getEnvDefault("CHAIN_NODE_TARGET", "arm64-apple-darwin")
+    var defaultOutDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_chain_node")
+    if target != "arm64-apple-darwin":
+        defaultOutDir = os.joinPath(defaultOutDir, target)
+    let outDir: str = os.getEnvDefault("CHAIN_NODE_OUT_DIR", defaultOutDir)
+    let outBin: str = os.getEnvDefault("CHAIN_NODE_OUT_BIN", os.joinPath(outDir, "chain_node"))
+    let compileRun = v3GateCompileExe(root, "build_chain_node", compiler, src, outBin, target, os.joinPath(outDir, "chain_node.compile.log"))
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    var runSelfTestDefault = "0"
+    if target == "arm64-apple-darwin":
+        runSelfTestDefault = "1"
+    let runSelfTestText: str = os.getEnvDefault("CHAIN_NODE_RUN_SELF_TEST", runSelfTestDefault)
+    if runSelfTestText != "0":
+        let run = v3GateRunBinary(root, "build_chain_node_self_test", outBin, ["self-test"], 20, os.joinPath(outDir, "chain_node.self-test.log"))
+        v3GateMaybePrintRunOutput(run)
+        if v3GateRunFailed(run):
+            return run.exitCode
+    else:
+        v3GatePrintLine("v3 chain_node: build ok target=" + target + " out=" + outBin)
+    return 0
+
+fn v3GateRunChainNodeProcessSmoke(root: str, args: str[]): int32 =
+    let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_CHAIN_NODE_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+        return 1
+    let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host")
+    return v3GateRunChainNodeProcessSmokeWithCompiler(root, compiler, label, [])
+
+fn v3GateRunChainNodeThreeNodeSmoke(root: str, args: str[]): int32 =
+    let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_CHAIN_NODE_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+        return 1
+    let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host")
+    return v3GateRunChainNodeThreeNodeSmokeWithCompiler(root, compiler, label, [])
+
 fn v3GateSlice(root: str): int32 =
     v3GatePrintLine("[v3 gate] hot-path forbidden scan")
     if v3GateScanHotpath(root) != 0:
@@ -159,20 +2676,123 @@ fn v3GateSlice(root: str): int32 =
         if v3GateCompareBench(root, baselinePath, candidatePath, int64(0)) != 0:
             return 1
     v3GatePrintLine("[v3 gate] bootstrap bridge")
-    if v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
-                       "artifacts/v3_gate/bootstrap_bridge_v3.log") != 0:
+    if v3GateBootstrapBridge(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] canonical backend driver")
-    if v3GateRunScript(root, "build_backend_driver_v3", "v3/tooling/build_backend_driver_v3.sh",
-                       "artifacts/v3_gate/build_backend_driver_v3.log") != 0:
+    if v3GateBuildBackendDriver(root) != 0:
         return 1
-    v3GatePrintLine("[v3 gate] v3 Cheng smokes")
+    v3GatePrintLine("[v3 gate] zero-exit ordinary compile")
+    if v3GateBuildZeroExit(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] panic-trace ordinary compile")
+    if v3GateBuildPanicTrace(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] bounds-trace ordinary compile")
+    if v3GateBuildBoundsTrace(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] signal-trace ordinary compile")
+    if v3GateBuildSignalTrace(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] orphan guard")
+    if v3GateVerifyOrphanGuard(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] debug tools")
+    if v3GateRunStage3Command(root, "verify_debug_tools", "verify-debug-tools", [], "verify-debug-tools.log", false) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] debug runtime")
+    if v3GateVerifyDebugRuntime(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] debug profile")
+    if v3GateVerifyDebugProfile(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] call-chain ordinary compile")
+    if v3GateBuildCallChain(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] ffi-handle ordinary compile")
+    if v3GateBuildFfiHandle(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] program-selfhost")
+    if v3GateBuildProgramSelfhost(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] chain_node")
+    if v3GateBuildChainNode(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] bootstrap subset self-checks")
     if v3GateRunSmokes(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] host fixed256 sha256 smoke")
+    if v3GateRunHostSmokes(root, ["fixed256_sha256_smoke"]) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] host default-init literals smoke")
+    if v3GateRunHostSmokes(root, ["default_init_literals_smoke"]) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] cross-target builtin smokes")
+    if v3GateRunStage3Command(root, "run_cross_target_smokes", "run-cross-target-smokes", [], "run-cross-target-smokes.log", false) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] v3 host smokes")
+    if v3GateRunHostSmokes(root, []) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] stage2/stage3 libp2p smokes")
+    if v3GateRunStage23Libp2pSmokes(root, []) != 0:
         return 1
     v3GatePrintLine("[v3 gate] ok")
     return 0
 
-fn main(argc: int32, argv: str*): int32 =
+fn v3GateHandlesCommand(cmd: str): bool =
+    return cmd == "scan-hotpath" ||
+           cmd == "c-ref" ||
+           cmd == "compare-bench" ||
+           cmd == "bootstrap-bridge" ||
+           cmd == "build-backend-driver" ||
+           cmd == "run-smokes" ||
+           cmd == "print-bootstrap" ||
+           cmd == "print-build-plan" ||
+           cmd == "slice-gate" ||
+           cmd == "debug-report" ||
+           cmd == "print-symbols" ||
+           cmd == "print-line-map" ||
+           cmd == "print-object" ||
+           cmd == "print-elf" ||
+           cmd == "print-asm" ||
+           cmd == "profile-run" ||
+           cmd == "verify-orphan-guard" ||
+           cmd == "verify-debug-tools" ||
+           cmd == "verify-debug-runtime" ||
+           cmd == "verify-debug-profile" ||
+           cmd == "verify-windows-builtin" ||
+           cmd == "verify-riscv64-builtin" ||
+           cmd == "run-cross-target-smokes" ||
+           cmd == "run-host-smokes" ||
+           cmd == "run-stage23-libp2p-smokes" ||
+           cmd == "compile-exe" ||
+           cmd == "build-zero-exit" ||
+           cmd == "build-panic-trace" ||
+           cmd == "build-bounds-trace" ||
+           cmd == "build-signal-trace" ||
+           cmd == "build-call-chain" ||
+           cmd == "build-ffi-handle" ||
+           cmd == "build-bft-state-machine" ||
+           cmd == "build-rwad-bft-state-machine" ||
+           cmd == "build-program-selfhost" ||
+           cmd == "build-chain-node" ||
+           cmd == "build-linux-nolibc-exe" ||
+           cmd == "build-chain-node-linux" ||
+           cmd == "build-rwad-bft-linux" ||
+           cmd == "run-linux-object-smokes" ||
+           cmd == "run-tcp-twoproc-smoke" ||
+           cmd == "run-udp-importc-smoke" ||
+           cmd == "run-wasm-smokes" ||
+           cmd == "run-browser-host-wasm-smoke" ||
+           cmd == "run-chain-node-cli-smoke" ||
+           cmd == "run-chain-node-process-smoke" ||
+           cmd == "run-chain-node-three-node-smoke" ||
+           cmd == "run-tailnet-control-smoke" ||
+           cmd == "run-fresh-node-selfhost-gate" ||
+           cmd == "run-migration-gate" ||
+           cmd == "run-browser-webrtc-smokes" ||
+           cmd == "r2c-react-v3"
+
+fn v3GateMain(argc: int32, argv: str*): int32 =
     argc
     argv
     cmdline.__cheng_captureCmdLine(argc, argv)
@@ -196,11 +2816,9 @@ fn main(argc: int32, argv: str*): int32 =
         let maxRatioText: str = v3GateReadFlag(args, "--max-ratio-milli", "0")
         return v3GateCompareBench(root, baselinePath, candidatePath, int64(strutil.parseInt(maxRatioText)))
     if cmd == "bootstrap-bridge":
-        return v3GateRunScript(root, "bootstrap_bridge_v3", "v3/tooling/bootstrap_bridge_v3.sh",
-                               "artifacts/v3_gate/bootstrap_bridge_v3.log")
+        return v3GateBootstrapBridge(root)
     if cmd == "build-backend-driver":
-        return v3GateRunScript(root, "build_backend_driver_v3", "v3/tooling/build_backend_driver_v3.sh",
-                               "artifacts/v3_gate/build_backend_driver_v3.log")
+        return v3GateBuildBackendDriver(root)
     if cmd == "run-smokes":
         return v3GateRunSmokes(root)
     if cmd == "print-bootstrap":
@@ -213,5 +2831,129 @@ fn main(argc: int32, argv: str*): int32 =
         return 0
     if cmd == "slice-gate":
         return v3GateSlice(root)
+    if cmd == "debug-report":
+        return v3GateRunStage3Command(root, "debug_report", cmd, args, "debug-report.log", true)
+    if cmd == "print-symbols":
+        return v3GateRunStage3Command(root, "print_symbols", cmd, args, "print-symbols.log", true)
+    if cmd == "print-line-map":
+        return v3GateRunStage3Command(root, "print_line_map", cmd, args, "print-line-map.log", true)
+    if cmd == "print-object":
+        return v3GateRunStage3Command(root, "print_object", cmd, args, "print-object.log", false)
+    if cmd == "print-elf":
+        return v3GateRunStage3Command(root, "print_elf", cmd, args, "print-elf.log", false)
+    if cmd == "print-asm":
+        return v3GateRunStage3Command(root, "print_asm", cmd, args, "print-asm.log", true)
+    if cmd == "profile-run":
+        return v3GateRunStage3Command(root, "profile_run", cmd, args, "profile-run.log", true)
+    if cmd == "verify-orphan-guard":
+        return v3GateVerifyOrphanGuard(root)
+    if cmd == "verify-debug-tools":
+        return v3GateRunStage3Command(root, "verify_debug_tools", cmd, args, "verify-debug-tools.log", false)
+    if cmd == "verify-debug-runtime":
+        return v3GateVerifyDebugRuntime(root)
+    if cmd == "verify-debug-profile":
+        return v3GateVerifyDebugProfile(root)
+    if cmd == "verify-windows-builtin":
+        return v3GateRunStage3Command(root, "verify_windows_builtin", cmd, args, "verify-windows-builtin.log", false)
+    if cmd == "verify-riscv64-builtin":
+        return v3GateRunStage3Command(root, "verify_riscv64_builtin", cmd, args, "verify-riscv64-builtin.log", false)
+    if cmd == "run-cross-target-smokes":
+        return v3GateRunStage3Command(root, "run_cross_target_smokes", cmd, args, "run-cross-target-smokes.log", false)
+    if cmd == "run-host-smokes":
+        return v3GateRunHostSmokes(root, args)
+    if cmd == "run-stage23-libp2p-smokes":
+        return v3GateRunStage23Libp2pSmokes(root, args)
+    if cmd == "compile-exe":
+        return v3GateCompileExeFromEnv(root)
+    if cmd == "build-zero-exit":
+        return v3GateBuildZeroExit(root)
+    if cmd == "build-panic-trace":
+        return v3GateBuildPanicTrace(root)
+    if cmd == "build-bounds-trace":
+        return v3GateBuildBoundsTrace(root)
+    if cmd == "build-signal-trace":
+        return v3GateBuildSignalTrace(root)
+    if cmd == "build-call-chain":
+        return v3GateBuildCallChain(root)
+    if cmd == "build-ffi-handle":
+        return v3GateBuildFfiHandle(root)
+    if cmd == "build-bft-state-machine":
+        return v3GateBuildBftStateMachine(root)
+    if cmd == "build-rwad-bft-state-machine":
+        return v3GateBuildRwadBftStateMachine(root)
+    if cmd == "build-program-selfhost":
+        return v3GateBuildProgramSelfhost(root)
+    if cmd == "build-chain-node":
+        return v3GateBuildChainNode(root)
+    if cmd == "build-linux-nolibc-exe":
+        return v3GateBuildLinuxNolibcExe(root)
+    if cmd == "build-chain-node-linux":
+        return v3GateRunStage3Command(root, "build_chain_node_linux", cmd, args, "build_chain_node_linux_v3.log", false)
+    if cmd == "build-rwad-bft-linux":
+        return v3GateRunStage3Command(root, "build_rwad_bft_linux", cmd, args, "build_rwad_bft_linux_v3.log", false)
+    if cmd == "run-linux-object-smokes":
+        return v3GateRunStage3Command(root, "run_linux_object_smokes", cmd, args, "run_linux_object_smokes_v3.log", false)
+    if cmd == "run-tcp-twoproc-smoke":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_SMOKE_COMPILER", "", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_SMOKE_LABEL", "host")
+        return v3GateRunTcpTwoprocSmoke(root, compiler, label, [])
+    if cmd == "run-udp-importc-smoke":
+        return v3GateRunUdpImportcSmoke(root, args)
+    if cmd == "run-wasm-smokes":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_WASM_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_WASM_LABEL", "host")
+        return v3GateRunWasmSmokes(root, compiler, label, [])
+    if cmd == "run-browser-host-wasm-smoke":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_WASM_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_WASM_LABEL", "host")
+        return v3GateRunBrowserHostWasmSmoke(root, compiler, label, [])
+    if cmd == "run-chain-node-cli-smoke":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_CHAIN_NODE_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host")
+        return v3GateRunChainNodeCliSmoke(root, compiler, label, [])
+    if cmd == "run-chain-node-process-smoke":
+        return v3GateRunChainNodeProcessSmoke(root, args)
+    if cmd == "run-chain-node-three-node-smoke":
+        return v3GateRunChainNodeThreeNodeSmoke(root, args)
+    if cmd == "run-tailnet-control-smoke":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_TAILNET_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_TAILNET_LABEL", "host")
+        return v3GateRunTailnetControlSmoke(root, compiler, label, [])
+    if cmd == "run-fresh-node-selfhost-gate":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_FRESH_NODE_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_FRESH_NODE_LABEL", "host")
+        return v3GateRunFreshNodeSelfhostGate(root, compiler, label, [])
+    if cmd == "run-migration-gate":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_MIGRATION_COMPILER", "CHENG_V3_SMOKE_COMPILER", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_MIGRATION_LABEL", "host")
+        return v3GateRunMigrationGate(root, compiler, label, [])
+    if cmd == "run-browser-webrtc-smokes":
+        return v3GateRunBrowserWebrtcSmokes(root, v3GateCollectPositionals(args), v3GateStage23EnvOverrides())
+    if cmd == "r2c-react-v3":
+        return r2c.v3R2cReactV3Main(root, args)
     v3GateUsage()
     return 1
+
+fn main(argc: int32, argv: str*): int32 =
+    return v3GateMain(argc, argv)

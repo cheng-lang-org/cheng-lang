@@ -153,6 +153,8 @@ int32_t cheng_v3_test_pki_hex_decode_len_bridge(ChengStrBridge text);
 void cheng_rawmem_write_i8(void* dst, int32_t idx, int8_t value);
 void cheng_rawmem_write_char(void* dst, int32_t idx, int32_t value);
 int32_t cheng_force_segv(void);
+void cheng_v3_native_register_line_map_from_argv0(const char* argv0);
+void cheng_v3_native_dump_backtrace_and_exit(const char* reason, int32_t code);
 void cheng_func_ptr_shadow_remember(void* p);
 void* cheng_func_ptr_shadow_recover(uint64_t p);
 void* cheng_machine_inst_new(int32_t op, int32_t rd, int32_t rn, int32_t rm,
@@ -484,6 +486,8 @@ char* chengQ_execQ_cmdQ_ex_0(char* command, char* workingDir, int32_t mergeStder
 int32_t cheng_pty_is_supported(void);
 int32_t cheng_pty_spawn(const char* command, const char* workingDir, int32_t* outMasterFd, int64_t* outPid);
 int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid);
+int32_t cheng_exec_file_pipe_spawn(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                                   const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid);
 char* cheng_pty_read(int32_t fd, int32_t maxBytes, int32_t* outEof);
 char* cheng_fd_read(int32_t fd, int32_t maxBytes, int32_t* outEof);
 char* cheng_fd_read_wait(int32_t fd, int32_t maxBytes, int32_t timeoutMs, int32_t* outEof);
@@ -491,6 +495,7 @@ int32_t cheng_fd_write(int32_t fd, const char* data, int32_t len);
 int32_t cheng_pty_write(int32_t fd, const char* data, int32_t len);
 int32_t cheng_pty_close(int32_t fd);
 int32_t cheng_pty_wait(int64_t pid, int32_t* outExitCode);
+int32_t cheng_process_signal(int64_t pid, int32_t signalCode);
 int32_t cheng_tcp_listener(int32_t port, int32_t* outPort);
 int32_t cheng_errno(void);
 const char* cheng_strerror(int32_t err);

@@ -1,11 +1,6 @@
 import std/result
 import cheng/v3/tooling/path as v3path
 
-importc fn cheng_v3_parser_parse_source_stub_bridge(packageRoot: str, sourcePath: str, parsed: var V3ParsedSourceStub, err: var str): int32
-importc fn cheng_v3_parser_module_to_source_bridge(workspaceRoot: str, packageRoot: str, modulePath: str): str
-importc fn cheng_v3_parser_source_to_module_bridge(workspaceRoot: str, packageRoot: str, sourcePath: str): str
-importc fn cheng_v3_parser_import_source_paths_bridge(workspaceRoot: str, packageRoot: str, text: str): str
-
 type
     V3ParsedSourceKind = enum
         v3ParsedOrdinarySource
@@ -220,19 +215,50 @@ fn v3ParserModulePathTail(modulePath: str, skipCount: int32): str =
             add(out, piece)
     return v3ParserJoinSlash(out)
 
+fn v3ParserPathSlash(pathRaw: str): str =
+    return v3ParserJoinSlash(v3ParserSplitChar(pathRaw, '\\'))
+
+fn v3ParserRelWithoutExt(pathRaw: str): str =
+    let path = v3ParserPathSlash(v3ParserNormalizePath(pathRaw))
+    if path.len >= 6 && v3path.v3TextSlice(path, path.len - 6, 6) == ".cheng":
+        return v3path.v3TextSlice(path, 0, path.len - 6)
+    return path
+
 fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
     let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot = v3ParserNormalizePath(packageRootRaw)
     let modulePath = v3path.v3PathTrim(modulePathRaw)
     if modulePath == "":
         return ""
-    return cheng_v3_parser_module_to_source_bridge(workspaceRoot, packageRoot, modulePath)
+    if v3ParserStartsWith(modulePath, "std/") && modulePath.len > 4:
+        return workspaceRoot + "/src/std/" + v3ParserModulePathTail(modulePath, 1) + ".cheng"
+    let packageId = v3ParserPackageId(packageRoot)
+    if packageId != "" && modulePath.len > packageId.len && v3ParserStartsWith(modulePath, packageId + "/"):
+        return packageRoot + "/src/" + v3ParserModulePathTail(modulePath, 2) + ".cheng"
+    return ""
 
 fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sourcePathRaw: str): str =
     let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot = v3ParserNormalizePath(packageRootRaw)
     let sourcePath = v3ParserNormalizePath(sourcePathRaw)
-    return cheng_v3_parser_source_to_module_bridge(workspaceRoot, packageRoot, sourcePath)
+    let packagePrefix = packageRoot + "/src/"
+    if v3ParserStartsWith(sourcePath, packagePrefix):
+        let rel = v3ParserRelWithoutExt(v3path.v3TextSlice(sourcePath,
+                                                           packagePrefix.len,
+                                                           sourcePath.len - packagePrefix.len))
+        let packageId = v3ParserPackageId(packageRoot)
+        if rel == "":
+            return packageId
+        return packageId + "/" + rel
+    let stdPrefix = workspaceRoot + "/src/std/"
+    if v3ParserStartsWith(sourcePath, stdPrefix):
+        let rel = v3ParserRelWithoutExt(v3path.v3TextSlice(sourcePath,
+                                                           stdPrefix.len,
+                                                           sourcePath.len - stdPrefix.len))
+        if rel == "":
+            return "std"
+        return "std/" + rel
+    return v3ParserFileStem(sourcePath)
 
 fn v3ParserHasCompilerTopLevel(textRaw: str): bool =
     let lines = v3ParserSplitChar(textRaw, '\n')
@@ -307,16 +333,13 @@ fn v3ParserCollectClosure(workspaceRoot: str,
         let currentSourcePath = ordered[scanPos]
         scanPos = scanPos + 1
         let text = v3path.v3ReadTextFile("", currentSourcePath)
-        let importSourceText = cheng_v3_parser_import_source_paths_bridge(workspaceRoot, packageRoot, text)
-        if v3ParserStartsWith(importSourceText, "!error:"):
-            err = v3path.v3TextSlice(importSourceText, 7, importSourceText.len - 7)
+        let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
+        var edges: V3ImportEdge[]
+        if !v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, text, edges, err):
             return false
-        let childSourcePaths = v3ParserSplitChar(importSourceText, '\n')
-        for i in 0..<childSourcePaths.len:
-            let childSourcePath = childSourcePaths[i]
-            if childSourcePath == "":
-                continue
-            if childSourcePath == "-":
+        for i in 0..<edges.len:
+            let childSourcePath = edges[i].targetSourcePath
+            if !edges[i].resolved:
                 unresolved = unresolved + 1
                 continue
             if v3ParserStringSeqContains(seen, childSourcePath):
@@ -330,4 +353,45 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
                              sourcePathRaw: str,
                              parsed: var V3ParsedSourceStub,
                              err: var str): bool =
-    return cheng_v3_parser_parse_source_stub_bridge(packageRootRaw, sourcePathRaw, parsed, err) != 0
+    let packageRoot = v3ParserNormalizePath(packageRootRaw)
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "":
+        err = "v3 parser: missing source path"
+        return false
+    if !v3ParserSourceExists(sourcePath):
+        err = "v3 parser: source file missing: " + sourcePath
+        return false
+    let workspaceRoot = v3ParserWorkspaceRoot(packageRoot)
+    let packageId = v3ParserPackageId(packageRoot)
+    let moduleStem = v3ParserFileStem(sourcePath)
+    let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
+    let rootText = v3path.v3ReadTextFile("", sourcePath)
+    if rootText == "":
+        err = "v3 parser: failed to read source: " + sourcePath
+        return false
+    var importEdges: V3ImportEdge[]
+    if !v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, rootText, importEdges, err):
+        return false
+    var seen: str[] = []
+    var ordered: str[] = []
+    var unresolved: int32 = 0
+    if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, unresolved, err):
+        return false
+    var ownerModulePaths: str[] = []
+    add(ownerModulePaths, ownerModulePath)
+    parsed.workspaceRoot = workspaceRoot
+    parsed.packageRoot = packageRoot
+    parsed.packageId = packageId
+    parsed.entrySourcePath = sourcePath
+    parsed.sourcePath = sourcePath
+    parsed.moduleStem = moduleStem
+    parsed.syntaxTag = "v3_source_stub_v1"
+    parsed.sourceKind = v3ParsedOrdinarySource
+    parsed.ownerModulePaths = ownerModulePaths
+    parsed.importEdges = importEdges
+    parsed.orderedClosureSourcePaths = ordered
+    parsed.hasCompilerTopLevel = v3ParserHasCompilerTopLevel(rootText)
+    parsed.mainFunctionPresent = v3ParserMainFunctionPresent(rootText)
+    parsed.unresolvedImportCount = unresolved
+    err = ""
+    return true

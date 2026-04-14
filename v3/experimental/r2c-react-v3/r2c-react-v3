@@ -1,0 +1,713 @@
+#!/usr/bin/env sh
+:
+set -eu
+
+root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
+exp_root="$root/v3/experimental/r2c-react-v3"
+bridge_env="$root/artifacts/v3_bootstrap/bootstrap.env"
+controller_name="${R2C_REACT_V3_CONTROLLER:-cheng.wrapper}"
+
+usage() {
+  cat <<EOF
+usage: r2c-react-v3 <subcommand> [args]
+subcommands:
+  help
+  status [--out <file>]
+  frontend --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]
+  static-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--asset-root <dir> ...]
+  semantic-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>]
+  codegen-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>]
+  exec-surface --repo <path> [--out-dir <dir>] [--codegen-manifest <file>]
+  compile --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]
+  discover-truth-routes --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]
+  capture-truth --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] [--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>]
+  prototype <args...>
+EOF
+}
+
+maybe_exec_stage3() {
+  if [ "${R2C_REACT_V3_NO_STAGE3_HANDOFF:-0}" = "1" ]; then
+    return 1
+  fi
+  if [ ! -f "$bridge_env" ]; then
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  . "$bridge_env"
+  if [ -n "${V3_BOOTSTRAP_STAGE3:-}" ] && "$V3_BOOTSTRAP_STAGE3" r2c-react-v3 help >/dev/null 2>&1; then
+    exec "$V3_BOOTSTRAP_STAGE3" r2c-react-v3 "$@"
+  fi
+  return 1
+}
+
+read_flag() {
+  key="$1"
+  default_value="$2"
+  shift 2
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      "$key")
+        shift
+        if [ "$#" -gt 0 ]; then
+          printf '%s\n' "$1"
+          return 0
+        fi
+        ;;
+      "$key":*)
+        printf '%s\n' "${1#"$key:"}"
+        return 0
+        ;;
+      "$key"=*)
+        printf '%s\n' "${1#"$key="}"
+        return 0
+        ;;
+    esac
+    shift
+  done
+  printf '%s\n' "$default_value"
+}
+
+collect_flag_values() {
+  key="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      "$key")
+        shift
+        if [ "$#" -gt 0 ]; then
+          printf '%s\n' "$1"
+        fi
+        ;;
+      "$key":*)
+        printf '%s\n' "${1#"$key:"}"
+        ;;
+      "$key"=*)
+        printf '%s\n' "${1#"$key="}"
+        ;;
+    esac
+    shift
+  done
+}
+
+abs_path() {
+  base="$1"
+  target="$2"
+  node -e 'const path=require("node:path"); console.log(path.resolve(process.argv[1], process.argv[2]));' "$base" "$target"
+}
+
+read_summary_value() {
+  summary_path="$1"
+  key="$2"
+  default_value="$3"
+  if [ ! -f "$summary_path" ]; then
+    printf '%s\n' "$default_value"
+    return 0
+  fi
+  value="$(awk -F= -v want="$key" '$1 == want { sub(/^[^=]*=/, ""); print; exit }' "$summary_path")"
+  if [ -n "$value" ]; then
+    printf '%s\n' "$value"
+  else
+    printf '%s\n' "$default_value"
+  fi
+}
+
+write_report() {
+  report_path="$1"
+  command_name="$2"
+  ok_value="$3"
+  reason_value="$4"
+  repo_root="$5"
+  out_dir="$6"
+  helper_script="$7"
+  helper_summary_path="$8"
+  helper_log_path="$9"
+  primary_artifact_path="${10}"
+  primary_artifact_format="${11}"
+  module_count="${12}"
+  route_count="${13}"
+  semantic_nodes_count="${14}"
+  typescript_version="${15}"
+  asset_count="${16:-0}"
+  tailwind_token_count="${17:-0}"
+  required_host_group_count="${18:-0}"
+  required_host_groups="${19:-}"
+  rsg_node_count="${20:-0}"
+  rsg_edge_count="${21:-0}"
+  blocker_count="${22:-0}"
+  blocked="${23:-false}"
+  mkdir -p "$(dirname "$report_path")"
+  REPORT_PATH="$report_path" \
+  REPORT_COMMAND="$command_name" \
+  REPORT_OK="$ok_value" \
+  REPORT_REASON="$reason_value" \
+  REPORT_WORKSPACE_ROOT="$root" \
+  REPORT_EXPERIMENTAL_ROOT="$exp_root" \
+  REPORT_REPO_ROOT="$repo_root" \
+  REPORT_OUT_DIR="$out_dir" \
+  REPORT_HELPER_SCRIPT="$helper_script" \
+  REPORT_HELPER_SUMMARY="$helper_summary_path" \
+  REPORT_HELPER_LOG="$helper_log_path" \
+  REPORT_PRIMARY_ARTIFACT="$primary_artifact_path" \
+  REPORT_PRIMARY_FORMAT="$primary_artifact_format" \
+  REPORT_MODULE_COUNT="$module_count" \
+  REPORT_ROUTE_COUNT="$route_count" \
+  REPORT_SEMANTIC_NODES_COUNT="$semantic_nodes_count" \
+  REPORT_TYPESCRIPT_VERSION="$typescript_version" \
+  REPORT_ASSET_COUNT="$asset_count" \
+  REPORT_TAILWIND_TOKEN_COUNT="$tailwind_token_count" \
+  REPORT_REQUIRED_HOST_GROUP_COUNT="$required_host_group_count" \
+  REPORT_REQUIRED_HOST_GROUPS="$required_host_groups" \
+  REPORT_RSG_NODE_COUNT="$rsg_node_count" \
+  REPORT_RSG_EDGE_COUNT="$rsg_edge_count" \
+  REPORT_BLOCKER_COUNT="$blocker_count" \
+  REPORT_BLOCKED="$blocked" \
+  REPORT_LEGACY_PROTOTYPE="$exp_root/r2c-react-v3.py" \
+  REPORT_CONTROLLER="$controller_name" \
+  node <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const requiredHostGroups = (process.env.REPORT_REQUIRED_HOST_GROUPS || '').split(',').map((item) => item.trim()).filter(Boolean);
+const out = {
+  format: 'controller_report_v1',
+  controller: process.env.REPORT_CONTROLLER,
+  command: process.env.REPORT_COMMAND,
+  ok: process.env.REPORT_OK === 'true',
+  reason: process.env.REPORT_REASON,
+  workspace_root: process.env.REPORT_WORKSPACE_ROOT,
+  experimental_root: process.env.REPORT_EXPERIMENTAL_ROOT,
+  repo_root: process.env.REPORT_REPO_ROOT,
+  out_dir: process.env.REPORT_OUT_DIR,
+  node_program: 'node',
+  python_program: 'python3',
+  helper_script: process.env.REPORT_HELPER_SCRIPT,
+  helper_summary_path: process.env.REPORT_HELPER_SUMMARY,
+  helper_log_path: process.env.REPORT_HELPER_LOG,
+  primary_artifact_path: process.env.REPORT_PRIMARY_ARTIFACT,
+  primary_artifact_format: process.env.REPORT_PRIMARY_FORMAT,
+  module_count: Number(process.env.REPORT_MODULE_COUNT || 0),
+  route_count: Number(process.env.REPORT_ROUTE_COUNT || 0),
+  semantic_nodes_count: Number(process.env.REPORT_SEMANTIC_NODES_COUNT || 0),
+  asset_count: Number(process.env.REPORT_ASSET_COUNT || 0),
+  tailwind_token_count: Number(process.env.REPORT_TAILWIND_TOKEN_COUNT || 0),
+  required_host_group_count: Number(process.env.REPORT_REQUIRED_HOST_GROUP_COUNT || 0),
+  required_host_groups: requiredHostGroups,
+  rsg_node_count: Number(process.env.REPORT_RSG_NODE_COUNT || 0),
+  rsg_edge_count: Number(process.env.REPORT_RSG_EDGE_COUNT || 0),
+  blocker_count: Number(process.env.REPORT_BLOCKER_COUNT || 0),
+  blocked: process.env.REPORT_BLOCKED === 'true',
+  typescript_version: process.env.REPORT_TYPESCRIPT_VERSION || '',
+  legacy_prototype_path: process.env.REPORT_LEGACY_PROTOTYPE,
+  commands: [
+    'status',
+    'frontend',
+    'static-surface',
+    'semantic-surface',
+    'codegen-surface',
+    'exec-surface',
+    'compile',
+    'discover-truth-routes',
+    'capture-truth',
+    'prototype',
+  ],
+};
+fs.mkdirSync(path.dirname(process.env.REPORT_PATH), { recursive: true });
+fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(out, null, 2) + '\n', 'utf8');
+EOF
+}
+
+status_cmd() {
+  out_path="$(read_flag --out "" "$@")"
+  if [ -n "$out_path" ]; then
+    report_path="$(abs_path "$root" "$out_path")"
+    mkdir -p "$(dirname "$report_path")"
+    REPORT_PATH="$report_path" \
+    REPORT_WORKSPACE_ROOT="$root" \
+    REPORT_EXPERIMENTAL_ROOT="$exp_root" \
+    REPORT_LEGACY_PROTOTYPE="$exp_root/r2c-react-v3.py" \
+    REPORT_CONTROLLER="$controller_name" \
+    node <<'EOF'
+const fs = require('node:fs');
+const path = require('node:path');
+const out = {
+  format: 'status_report_v1',
+  controller: process.env.REPORT_CONTROLLER,
+  workspace_root: process.env.REPORT_WORKSPACE_ROOT,
+  experimental_root: process.env.REPORT_EXPERIMENTAL_ROOT,
+  node_program: 'node',
+  legacy_prototype_path: process.env.REPORT_LEGACY_PROTOTYPE,
+  tsx_frontend_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-ts-frontend.mjs'),
+  static_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-static-surface.mjs'),
+  semantic_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-semantic-surface.mjs'),
+  codegen_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-codegen-surface.mjs'),
+  exec_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-exec-surface.mjs'),
+  truth_route_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-discover-truth-routes.mjs'),
+  truth_runtime_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-runtime.mjs'),
+};
+fs.mkdirSync(path.dirname(process.env.REPORT_PATH), { recursive: true });
+fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(out, null, 2) + '\n', 'utf8');
+EOF
+    printf '%s\n' "$report_path"
+    return 0
+  fi
+  node <<EOF
+console.log(JSON.stringify({
+  format: 'status_report_v1',
+  controller: '$controller_name',
+  workspace_root: '$root',
+  experimental_root: '$exp_root',
+  node_program: 'node',
+  legacy_prototype_path: '$exp_root/r2c-react-v3.py',
+  tsx_frontend_helper: '$exp_root/r2c-react-v3-ts-frontend.mjs',
+  static_surface_helper: '$exp_root/r2c-react-v3-static-surface.mjs',
+  semantic_surface_helper: '$exp_root/r2c-react-v3-semantic-surface.mjs',
+  codegen_surface_helper: '$exp_root/r2c-react-v3-codegen-surface.mjs',
+  exec_surface_helper: '$exp_root/r2c-react-v3-exec-surface.mjs',
+  truth_route_helper: '$exp_root/r2c-react-v3-discover-truth-routes.mjs',
+  truth_runtime_helper: '$exp_root/r2c-react-v3-truth-runtime.mjs',
+}, null, 2))
+EOF
+}
+
+frontend_like_cmd() {
+  command_name="$1"
+  hard_fail_after_frontend="$2"
+  shift 2
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  asset_values="$(collect_flag_values --asset-root "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
+  artifact_path="$out_dir/tsx_ast_v1.json"
+  summary_path="$out_dir/tsx_ast_v1.summary.env"
+  static_helper_script="$exp_root/r2c-react-v3-static-surface.mjs"
+  static_summary_path="$out_dir/static_surface.summary.env"
+  static_log_path="$out_dir/static_surface.log"
+  semantic_helper_script="$exp_root/r2c-react-v3-semantic-surface.mjs"
+  semantic_summary_path="$out_dir/semantic_surface.summary.env"
+  semantic_log_path="$out_dir/semantic_surface.log"
+  codegen_helper_script="$exp_root/r2c-react-v3-codegen-surface.mjs"
+  codegen_summary_path="$out_dir/codegen_surface.summary.env"
+  codegen_log_path="$out_dir/codegen_surface.log"
+  exec_helper_script="$exp_root/r2c-react-v3-exec-surface.mjs"
+  exec_summary_path="$out_dir/exec_surface.summary.env"
+  exec_log_path="$out_dir/exec_surface.log"
+  module_inventory_path="$out_dir/module_inventory_v1.json"
+  rsg_path="$out_dir/rsg_v1.json"
+  codegen_manifest_path="$out_dir/cheng_codegen_v1.json"
+  exec_snapshot_path="$out_dir/cheng_codegen_exec_snapshot_v1.json"
+  log_path="$out_dir/tsx_frontend.log"
+  if [ "$hard_fail_after_frontend" = "true" ]; then
+    report_path="$out_dir/compile_report_v1.json"
+  else
+    report_path="$out_dir/frontend_report_v1.json"
+  fi
+  mkdir -p "$out_dir"
+  set -- "$helper_script" --repo "$repo" --out "$artifact_path" --summary-out "$summary_path"
+  if [ -n "$runtime_values" ]; then
+    OLD_IFS="${IFS}"
+    IFS='
+'
+    for runtime_root in $runtime_values; do
+      set -- "$@" --runtime-root "$runtime_root"
+    done
+    IFS="${OLD_IFS}"
+  fi
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" tsx_ast_v1 0 0 0 ""
+    echo "r2c-react-v3: tsx frontend helper failed" >&2
+    tail -n 80 "$log_path" >&2 || true
+    return 1
+  fi
+  module_count="$(read_summary_value "$summary_path" module_count 0)"
+  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
+  if [ "$hard_fail_after_frontend" = "true" ]; then
+    set -- "$static_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$static_summary_path"
+    if [ -n "$asset_values" ]; then
+      OLD_IFS="${IFS}"
+      IFS='
+'
+      for asset_root in $asset_values; do
+        set -- "$@" --asset-root "$asset_root"
+      done
+      IFS="${OLD_IFS}"
+    fi
+    if ! node "$@" >"$static_log_path" 2>&1; then
+      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$static_helper_script" "$static_summary_path" "$static_log_path" "$module_inventory_path" module_inventory_v1 "$module_count" 0 0 "$typescript_version"
+      echo "r2c-react-v3: static surface helper failed" >&2
+      tail -n 80 "$static_log_path" >&2 || true
+      return 1
+    fi
+    asset_count="$(read_summary_value "$static_summary_path" asset_count 0)"
+    tailwind_token_count="$(read_summary_value "$static_summary_path" tailwind_token_count 0)"
+    required_host_group_count="$(read_summary_value "$static_summary_path" required_host_group_count 0)"
+    required_host_groups="$(read_summary_value "$static_summary_path" required_host_groups '')"
+    module_inventory_path="$(read_summary_value "$static_summary_path" module_inventory_path "$module_inventory_path")"
+    typescript_version="$(read_summary_value "$static_summary_path" typescript_version "$typescript_version")"
+    set -- "$semantic_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$semantic_summary_path"
+    if ! node "$@" >"$semantic_log_path" 2>&1; then
+      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$semantic_helper_script" "$semantic_summary_path" "$semantic_log_path" "$rsg_path" rsg_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
+      echo "r2c-react-v3: semantic surface helper failed" >&2
+      tail -n 80 "$semantic_log_path" >&2 || true
+      return 1
+    fi
+    rsg_node_count="$(read_summary_value "$semantic_summary_path" rsg_node_count 0)"
+    rsg_edge_count="$(read_summary_value "$semantic_summary_path" rsg_edge_count 0)"
+    blocker_count="$(read_summary_value "$semantic_summary_path" blocker_count 0)"
+    blocked="$(read_summary_value "$semantic_summary_path" blocked false)"
+    rsg_path="$(read_summary_value "$semantic_summary_path" rsg_path "$rsg_path")"
+    typescript_version="$(read_summary_value "$semantic_summary_path" typescript_version "$typescript_version")"
+    set -- "$codegen_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$codegen_summary_path"
+    if ! node "$@" >"$codegen_log_path" 2>&1; then
+      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$codegen_helper_script" "$codegen_summary_path" "$codegen_log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      echo "r2c-react-v3: codegen surface helper failed" >&2
+      tail -n 80 "$codegen_log_path" >&2 || true
+      return 1
+    fi
+    codegen_manifest_path="$(read_summary_value "$codegen_summary_path" codegen_manifest_path "$codegen_manifest_path")"
+    typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$typescript_version")"
+    set -- "$exec_helper_script" --repo "$repo" --out-dir "$out_dir" --codegen-manifest "$codegen_manifest_path" --summary-out "$exec_summary_path"
+    if ! node "$@" >"$exec_log_path" 2>&1; then
+      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      echo "r2c-react-v3: exec surface helper failed" >&2
+      tail -n 120 "$exec_log_path" >&2 || true
+      return 1
+    fi
+    exec_semantic_nodes_count="$(read_summary_value "$exec_summary_path" snapshot_semantic_nodes_count 0)"
+    exec_snapshot_path="$(read_summary_value "$exec_summary_path" snapshot_path "$exec_snapshot_path")"
+    write_report "$report_path" "$command_name" false exec_surface_only_truth_compare_not_lifted "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+    echo "r2c-react-v3: compile 已经 lift 到 frontend + static surface + semantic surface + codegen surface + exec surface；truth compare 还没 lift，旧原型请显式走 prototype compile" >&2
+    return 2
+  fi
+  write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" tsx_ast_v1 "$module_count" 0 0 "$typescript_version"
+  printf '%s\n' "$report_path"
+}
+
+static_surface_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
+  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  asset_values="$(collect_flag_values --asset-root "$@")"
+  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
+  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
+  frontend_log_path="$out_dir/tsx_frontend.log"
+  helper_script="$exp_root/r2c-react-v3-static-surface.mjs"
+  summary_path="$out_dir/static_surface.summary.env"
+  report_path="$out_dir/static_surface_report_v1.json"
+  log_path="$out_dir/static_surface.log"
+  module_inventory_path="$out_dir/module_inventory_v1.json"
+  mkdir -p "$out_dir"
+  if [ ! -f "$tsx_ast_path" ]; then
+    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
+    if [ -n "$runtime_values" ]; then
+      OLD_IFS="${IFS}"
+      IFS='
+'
+      for runtime_root in $runtime_values; do
+        set -- "$@" --runtime-root "$runtime_root"
+      done
+      IFS="${OLD_IFS}"
+    fi
+    if ! node "$@" >"$frontend_log_path" 2>&1; then
+      write_report "$report_path" static-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
+      echo "r2c-react-v3: tsx frontend helper failed" >&2
+      tail -n 80 "$frontend_log_path" >&2 || true
+      return 1
+    fi
+  fi
+  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
+  if [ -n "$asset_values" ]; then
+    OLD_IFS="${IFS}"
+    IFS='
+'
+    for asset_root in $asset_values; do
+      set -- "$@" --asset-root "$asset_root"
+    done
+    IFS="${OLD_IFS}"
+  fi
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" static-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$module_inventory_path" module_inventory_v1 0 0 0 ""
+    echo "r2c-react-v3: static surface helper failed" >&2
+    tail -n 80 "$log_path" >&2 || true
+    return 1
+  fi
+  module_count="$(read_summary_value "$summary_path" module_count 0)"
+  asset_count="$(read_summary_value "$summary_path" asset_count 0)"
+  tailwind_token_count="$(read_summary_value "$summary_path" tailwind_token_count 0)"
+  required_host_group_count="$(read_summary_value "$summary_path" required_host_group_count 0)"
+  required_host_groups="$(read_summary_value "$summary_path" required_host_groups '')"
+  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
+  module_inventory_path="$(read_summary_value "$summary_path" module_inventory_path "$module_inventory_path")"
+  write_report "$report_path" static-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$module_inventory_path" module_inventory_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
+  printf '%s\n' "$report_path"
+}
+
+semantic_surface_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
+  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
+  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
+  frontend_log_path="$out_dir/tsx_frontend.log"
+  helper_script="$exp_root/r2c-react-v3-semantic-surface.mjs"
+  summary_path="$out_dir/semantic_surface.summary.env"
+  report_path="$out_dir/semantic_surface_report_v1.json"
+  log_path="$out_dir/semantic_surface.log"
+  rsg_path="$out_dir/rsg_v1.json"
+  mkdir -p "$out_dir"
+  if [ ! -f "$tsx_ast_path" ]; then
+    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
+    if [ -n "$runtime_values" ]; then
+      OLD_IFS="${IFS}"
+      IFS='
+'
+      for runtime_root in $runtime_values; do
+        set -- "$@" --runtime-root "$runtime_root"
+      done
+      IFS="${OLD_IFS}"
+    fi
+    if ! node "$@" >"$frontend_log_path" 2>&1; then
+      write_report "$report_path" semantic-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
+      echo "r2c-react-v3: tsx frontend helper failed" >&2
+      tail -n 80 "$frontend_log_path" >&2 || true
+      return 1
+    fi
+  fi
+  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" semantic-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$rsg_path" rsg_v1 0 0 0 ""
+    echo "r2c-react-v3: semantic surface helper failed" >&2
+    tail -n 80 "$log_path" >&2 || true
+    return 1
+  fi
+  module_count="$(read_summary_value "$summary_path" module_count 0)"
+  rsg_node_count="$(read_summary_value "$summary_path" rsg_node_count 0)"
+  rsg_edge_count="$(read_summary_value "$summary_path" rsg_edge_count 0)"
+  blocker_count="$(read_summary_value "$summary_path" blocker_count 0)"
+  blocked="$(read_summary_value "$summary_path" blocked false)"
+  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
+  rsg_path="$(read_summary_value "$summary_path" rsg_path "$rsg_path")"
+  write_report "$report_path" semantic-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$rsg_path" rsg_v1 "$module_count" 0 0 "$typescript_version" 0 0 0 "" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+  printf '%s\n' "$report_path"
+}
+
+codegen_surface_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
+  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
+  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
+  frontend_log_path="$out_dir/tsx_frontend.log"
+  helper_script="$exp_root/r2c-react-v3-codegen-surface.mjs"
+  summary_path="$out_dir/codegen_surface.summary.env"
+  report_path="$out_dir/codegen_surface_report_v1.json"
+  log_path="$out_dir/codegen_surface.log"
+  codegen_manifest_path="$out_dir/cheng_codegen_v1.json"
+  mkdir -p "$out_dir"
+  if [ ! -f "$tsx_ast_path" ]; then
+    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
+    if [ -n "$runtime_values" ]; then
+      OLD_IFS="${IFS}"
+      IFS='
+'
+      for runtime_root in $runtime_values; do
+        set -- "$@" --runtime-root "$runtime_root"
+      done
+      IFS="${OLD_IFS}"
+    fi
+    if ! node "$@" >"$frontend_log_path" 2>&1; then
+      write_report "$report_path" codegen-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
+      echo "r2c-react-v3: tsx frontend helper failed" >&2
+      tail -n 80 "$frontend_log_path" >&2 || true
+      return 1
+    fi
+  fi
+  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" codegen-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 0 0 0 ""
+    echo "r2c-react-v3: codegen surface helper failed" >&2
+    tail -n 120 "$log_path" >&2 || true
+    return 1
+  fi
+  module_count="$(read_summary_value "$summary_path" module_count 0)"
+  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
+  codegen_manifest_path="$(read_summary_value "$summary_path" codegen_manifest_path "$codegen_manifest_path")"
+  write_report "$report_path" codegen-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" 0 0 "$typescript_version"
+  printf '%s\n' "$report_path"
+}
+
+exec_surface_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  codegen_manifest_raw="$(read_flag --codegen-manifest "$out_dir/cheng_codegen_v1.json" "$@")"
+  codegen_manifest_path="$(abs_path "$repo" "$codegen_manifest_raw")"
+  exec_helper_script="$exp_root/r2c-react-v3-exec-surface.mjs"
+  exec_summary_path="$out_dir/exec_surface.summary.env"
+  exec_report_path="$out_dir/exec_surface_report_v1.json"
+  exec_log_path="$out_dir/exec_surface.log"
+  exec_snapshot_path="$out_dir/cheng_codegen_exec_snapshot_v1.json"
+  codegen_summary_path="$out_dir/codegen_surface.summary.env"
+  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
+  mkdir -p "$out_dir"
+  if [ ! -f "$codegen_manifest_path" ]; then
+    if ! (codegen_surface_cmd --repo "$repo" --out-dir "$out_dir" >/dev/null); then
+      write_report "$exec_report_path" exec-surface false helper_failed "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 0 0 0 ""
+      echo "r2c-react-v3: codegen surface helper failed" >&2
+      return 1
+    fi
+  fi
+  set -- "$exec_helper_script" --repo "$repo" --out-dir "$out_dir" --codegen-manifest "$codegen_manifest_path" --summary-out "$exec_summary_path"
+  if ! node "$@" >"$exec_log_path" 2>&1; then
+    write_report "$exec_report_path" exec-surface false helper_failed "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 0 0 0 ""
+      echo "r2c-react-v3: exec surface helper failed" >&2
+    tail -n 120 "$exec_log_path" >&2 || true
+      return 1
+    fi
+  module_count="$(read_summary_value "$codegen_summary_path" module_count "$(read_summary_value "$frontend_summary_path" module_count 0)")"
+  typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$(read_summary_value "$frontend_summary_path" typescript_version '')")"
+  semantic_nodes_count="$(read_summary_value "$exec_summary_path" snapshot_semantic_nodes_count 0)"
+  exec_snapshot_path="$(read_summary_value "$exec_summary_path" snapshot_path "$exec_snapshot_path")"
+  write_report "$exec_report_path" exec-surface true ok "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 1 "$semantic_nodes_count" "$typescript_version"
+  printf '%s\n' "$exec_report_path"
+}
+
+discover_truth_routes_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  helper_script="$exp_root/r2c-react-v3-discover-truth-routes.mjs"
+  artifact_path="$out_dir/truth_routes_v1.json"
+  summary_path="$out_dir/truth_routes_v1.summary.env"
+  report_path="$out_dir/truth_routes_report_v1.json"
+  log_path="$out_dir/truth_routes.log"
+  mkdir -p "$out_dir"
+  set -- "$helper_script" --repo "$repo" --out "$artifact_path" --summary-out "$summary_path"
+  runtime_values="$(collect_flag_values --runtime-root "$@")"
+  if [ -n "$runtime_values" ]; then
+    OLD_IFS="${IFS}"
+    IFS='
+'
+    for runtime_root in $runtime_values; do
+      set -- "$@" --runtime-root "$runtime_root"
+    done
+    IFS="${OLD_IFS}"
+  fi
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" discover-truth-routes false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" truth_routes_v1 0 0 0 ""
+    echo "r2c-react-v3: truth route helper failed" >&2
+    tail -n 80 "$log_path" >&2 || true
+    return 1
+  fi
+  route_count="$(read_summary_value "$summary_path" route_count 0)"
+  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
+  write_report "$report_path" discover-truth-routes true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" truth_routes_v1 0 "$route_count" 0 "$typescript_version"
+  printf '%s\n' "$report_path"
+}
+
+capture_truth_cmd() {
+  repo_raw="$(read_flag --repo "$PWD" "$@")"
+  repo="$(cd "$repo_raw" && pwd)"
+  route="$(read_flag --route "" "$@")"
+  if [ -z "$route" ]; then
+    echo "r2c-react-v3: capture-truth missing --route" >&2
+    return 1
+  fi
+  default_out_dir="$repo/build/r2c_react_v3_cheng/truth/$route"
+  out_dir_raw="$(read_flag --out-dir "$default_out_dir" "$@")"
+  base_url="$(read_flag --base-url "" "$@")"
+  chrome_path="$(read_flag --chrome "" "$@")"
+  width="$(read_flag --width "" "$@")"
+  height="$(read_flag --height "" "$@")"
+  truth_flag="$(read_flag --truth-flag "" "$@")"
+  debug_port="$(read_flag --debug-port "" "$@")"
+  wait_ms="$(read_flag --wait-ms "" "$@")"
+  out_dir="$(abs_path "$repo" "$out_dir_raw")"
+  helper_script="$exp_root/r2c-react-v3-truth-runtime.mjs"
+  summary_path="$out_dir/$route.summary.env"
+  report_path="$out_dir/capture_truth_report_v1.json"
+  log_path="$out_dir/truth_runtime.log"
+  mkdir -p "$out_dir"
+  set -- "$helper_script" --route "$route" --out-dir "$out_dir" --summary-out "$summary_path"
+  if [ -n "$base_url" ]; then set -- "$@" --base-url "$base_url"; fi
+  if [ -n "$chrome_path" ]; then set -- "$@" --chrome "$chrome_path"; fi
+  if [ -n "$width" ]; then set -- "$@" --width "$width"; fi
+  if [ -n "$height" ]; then set -- "$@" --height "$height"; fi
+  if [ -n "$truth_flag" ]; then set -- "$@" --truth-flag "$truth_flag"; fi
+  if [ -n "$debug_port" ]; then set -- "$@" --debug-port "$debug_port"; fi
+  if [ -n "$wait_ms" ]; then set -- "$@" --wait-ms "$wait_ms"; fi
+  if ! node "$@" >"$log_path" 2>&1; then
+    write_report "$report_path" capture-truth false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "" truth_runtime_v1 0 0 0 ""
+    echo "r2c-react-v3: truth runtime helper failed" >&2
+    tail -n 120 "$log_path" >&2 || true
+    return 1
+  fi
+  semantic_nodes_count="$(read_summary_value "$summary_path" semantic_nodes_count 0)"
+  runtime_state_path="$(read_summary_value "$summary_path" runtime_state_path '')"
+  write_report "$report_path" capture-truth true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$runtime_state_path" truth_runtime_v1 0 1 "$semantic_nodes_count" ""
+  printf '%s\n' "$report_path"
+}
+
+cmd="${1:-help}"
+if [ "$#" -gt 0 ]; then
+  shift
+fi
+
+maybe_exec_stage3 "$cmd" "$@" || true
+
+case "$cmd" in
+  help|-h|--help)
+    usage
+    ;;
+  status)
+    status_cmd "$@"
+    ;;
+  frontend)
+    frontend_like_cmd frontend false "$@"
+    ;;
+  static-surface)
+    static_surface_cmd "$@"
+    ;;
+  semantic-surface)
+    semantic_surface_cmd "$@"
+    ;;
+  codegen-surface)
+    codegen_surface_cmd "$@"
+    ;;
+  exec-surface)
+    exec_surface_cmd "$@"
+    ;;
+  compile)
+    frontend_like_cmd compile true "$@"
+    ;;
+  discover-truth-routes)
+    discover_truth_routes_cmd "$@"
+    ;;
+  capture-truth)
+    capture_truth_cmd "$@"
+    ;;
+  prototype)
+    exec python3 "$exp_root/r2c-react-v3.py" "$@"
+    ;;
+  *)
+    echo "r2c-react-v3: unknown subcommand: $cmd" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

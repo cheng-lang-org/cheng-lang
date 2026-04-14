@@ -6,30 +6,23 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-if ! command -v cc >/dev/null 2>&1; then
-  echo "[verify_backend_stage1_fixed0_envs] missing cc" 1>&2
-  exit 2
-fi
-
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/backend_stage1_fixed0_envs.XXXXXX")"
 cleanup() {
   rm -rf "$tmpdir" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-driver="$tmpdir/backend_driver_fixed0_outer"
+driver="${BACKEND_DRIVER:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)}"
 fixture="tests/cheng/backend/fixtures/return_add.cheng"
 report_dir="artifacts/backend_stage1_fixed0_envs"
 report="$report_dir/backend_stage1_fixed0_envs.report.txt"
 
 mkdir -p "$report_dir"
 rm -f "$report"
-
-cc -std=c11 -Wno-deprecated-declarations -O0 \
-  src/backend/tooling/backend_driver_sidecar_outer_main.c \
-  src/backend/tooling/backend_driver_sidecar_outer_exports.c \
-  src/runtime/native/system_helpers.c \
-  -o "$driver"
+if [ "$driver" = "" ] || [ ! -x "$driver" ]; then
+  echo "[verify_backend_stage1_fixed0_envs] backend driver not executable: ${driver:-<unset>}" 1>&2
+  exit 2
+fi
 
 expect_gate() {
   env_name="$1"

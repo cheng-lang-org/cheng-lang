@@ -1,3 +1,19 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE 1
+#endif
+
+#ifndef _DEFAULT_SOURCE
+#define _DEFAULT_SOURCE 1
+#endif
+
+#ifndef _POSIX_C_SOURCE
+#define _POSIX_C_SOURCE 200809L
+#endif
+
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE 1
+#endif
+
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -8,9 +24,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
 
 #ifndef CHENG_V3_IMPL_SOURCE_PATH
 #define CHENG_V3_IMPL_SOURCE_PATH __FILE__
@@ -24,7 +46,7 @@
 #define CHENG_V3_EMBEDDED_CONTRACT_TEXT ""
 #endif
 
-#define CHENG_V3_MAX_FIELDS 32
+#define CHENG_V3_MAX_FIELDS 40
 #define CHENG_V3_MAX_CALL_ARGS 16
 #define CHENG_V3_CALL_ARG_REGS 8
 #define CHENG_V3_CALL_ARG_SPILL_STRIDE ((CHENG_V3_MAX_CALL_ARGS + 4) * 8)
@@ -65,6 +87,48 @@ typedef struct {
     char source_path[PATH_MAX];
 } V3BootstrapContract;
 
+typedef struct {
+    char **items;
+    size_t len;
+    size_t cap;
+} V3OwnedStringVec;
+
+typedef enum {
+    V3_FORBIDDEN_SUBSTRING = 0,
+    V3_FORBIDDEN_LABEL_COLON_STR = 1,
+    V3_FORBIDDEN_WHOLE_WORD = 2
+} V3ForbiddenPatternKind;
+
+typedef struct {
+    V3ForbiddenPatternKind kind;
+    const char *needle;
+    const char *label;
+} V3ForbiddenPattern;
+
+typedef struct {
+    char *path;
+    const char *label;
+} V3ForbiddenHit;
+
+typedef struct {
+    V3ForbiddenHit *items;
+    size_t len;
+    size_t cap;
+} V3ForbiddenHitVec;
+
+typedef struct {
+    char *name;
+    int64_t ns_per_op_milli;
+} V3BenchSample;
+
+typedef struct {
+    V3BenchSample *items;
+    size_t len;
+    size_t cap;
+} V3BenchDataset;
+
+typedef bool (*V3ReadyCheckFn)(const void *ctx);
+
 static const char *V3_REQUIRED_KEYS[] = {
     "syntax",
     "bootstrap_name",
@@ -82,6 +146,7 @@ static const char *V3_REQUIRED_KEYS[] = {
     "compiler_entry_source",
     "compiler_runtime_source",
     "compiler_request_source",
+    "tooling_gate_source",
     "lang_parser_source",
     "backend_system_link_plan_source",
     "backend_lowering_plan_source",
@@ -91,6 +156,7 @@ static const char *V3_REQUIRED_KEYS[] = {
     "backend_system_link_exec_source",
     "runtime_core_runtime_source",
     "runtime_compiler_runtime_source",
+    "runtime_debug_runtime_source",
     "tooling_bootstrap_contract_source",
     "backend_build_plan_source",
     "tooling_build_driver_script",
@@ -107,10 +173,53 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed self-check [--in:<path>]");
     puts("  cheng_v3_seed status [--contract-in:<path>]");
     puts("  cheng_v3_seed print-build-plan [--contract-in:<path>]");
+    puts("  cheng_v3_seed scan-hotpath");
+    puts("  cheng_v3_seed c-ref");
+    puts("  cheng_v3_seed compare-bench --baseline:<file> --candidate:<file> [--max-ratio-milli:<N>]");
+    puts("  cheng_v3_seed print-bootstrap");
+    puts("  cheng_v3_seed bootstrap-bridge");
+    puts("  cheng_v3_seed build-backend-driver");
+    puts("  cheng_v3_seed run-smokes");
+    puts("  cheng_v3_seed slice-gate");
     puts("  cheng_v3_seed debug-report [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed print-symbols [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed print-line-map [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
+    puts("  cheng_v3_seed print-object --object:<path> [--report-out:<path>]");
     puts("  cheng_v3_seed print-elf --object:<path> [--report-out:<path>]");
+    puts("  cheng_v3_seed print-asm [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
+    puts("  cheng_v3_seed profile-run [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--out:<path>] [--profile-hz:<int>] [--report-out:<path>]");
+    puts("  cheng_v3_seed verify-orphan-guard");
+    puts("  cheng_v3_seed verify-debug-tools");
+    puts("  cheng_v3_seed verify-debug-runtime");
+    puts("  cheng_v3_seed verify-debug-profile");
+    puts("  cheng_v3_seed verify-windows-builtin");
+    puts("  cheng_v3_seed verify-riscv64-builtin");
+    puts("  cheng_v3_seed run-cross-target-smokes");
+    puts("  cheng_v3_seed run-host-smokes [smoke_name ...]");
+    puts("  cheng_v3_seed run-stage23-libp2p-smokes [smoke_name ...]");
+    puts("  cheng_v3_seed build-zero-exit");
+    puts("  cheng_v3_seed build-panic-trace");
+    puts("  cheng_v3_seed build-bounds-trace");
+    puts("  cheng_v3_seed build-signal-trace");
+    puts("  cheng_v3_seed build-call-chain");
+    puts("  cheng_v3_seed build-ffi-handle");
+    puts("  cheng_v3_seed build-program-selfhost");
+    puts("  cheng_v3_seed build-chain-node");
+    puts("  cheng_v3_seed build-chain-node-linux");
+    puts("  cheng_v3_seed build-rwad-bft-linux");
+    puts("  cheng_v3_seed run-linux-object-smokes");
+    puts("  cheng_v3_seed run-tcp-twoproc-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-udp-importc-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-wasm-smokes [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-browser-host-wasm-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-chain-node-cli-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-chain-node-process-smoke");
+    puts("  cheng_v3_seed run-chain-node-three-node-smoke");
+    puts("  cheng_v3_seed run-tailnet-control-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-fresh-node-selfhost-gate [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-migration-gate [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-browser-webrtc-smokes [smoke_name ...]");
+    puts("  cheng_v3_seed r2c-react-v3 <subcommand> [args]");
     puts("  cheng_v3_seed emit-csg [--contract-in:<path>] [--in:<path>] [--root:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed migrate-csg [--contract-in:<path>] [--legacy-in:<path>] [--in:<path>] [--root:<path>] [--out:<bundle-prefix>] [--report-out:<path>]");
     puts("  cheng_v3_seed verify-world [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
@@ -131,6 +240,15 @@ static void *v3_xmalloc(size_t size) {
         exit(1);
     }
     return ptr;
+}
+
+static void *v3_xrealloc(void *ptr, size_t size) {
+    void *next = realloc(ptr, size);
+    if (!next) {
+        fprintf(stderr, "[cheng_v3_seed] out of memory resize=%zu\n", size);
+        exit(1);
+    }
+    return next;
 }
 
 static char *v3_strdup(const char *text) {
@@ -156,6 +274,102 @@ static char *v3_trim_inplace(char *text) {
 
 static bool v3_streq(const char *a, const char *b) {
     return strcmp(a, b) == 0;
+}
+
+static void v3_owned_string_vec_init(V3OwnedStringVec *vec) {
+    vec->items = NULL;
+    vec->len = 0U;
+    vec->cap = 0U;
+}
+
+static void v3_owned_string_vec_push_dup(V3OwnedStringVec *vec, const char *text) {
+    if (vec->len + 1U > vec->cap) {
+        size_t next_cap = vec->cap == 0U ? 16U : vec->cap * 2U;
+        vec->items = (char **)v3_xrealloc(vec->items, next_cap * sizeof(char *));
+        vec->cap = next_cap;
+    }
+    vec->items[vec->len++] = v3_strdup(text);
+}
+
+static char *v3_owned_string_vec_pop(V3OwnedStringVec *vec) {
+    if (vec->len == 0U) {
+        return NULL;
+    }
+    vec->len -= 1U;
+    return vec->items[vec->len];
+}
+
+static void v3_owned_string_vec_free(V3OwnedStringVec *vec) {
+    size_t i;
+    for (i = 0U; i < vec->len; ++i) {
+        free(vec->items[i]);
+    }
+    free(vec->items);
+    vec->items = NULL;
+    vec->len = 0U;
+    vec->cap = 0U;
+}
+
+static void v3_forbidden_hit_vec_init(V3ForbiddenHitVec *vec) {
+    vec->items = NULL;
+    vec->len = 0U;
+    vec->cap = 0U;
+}
+
+static void v3_forbidden_hit_vec_push(V3ForbiddenHitVec *vec,
+                                      const char *path,
+                                      const char *label) {
+    if (vec->len + 1U > vec->cap) {
+        size_t next_cap = vec->cap == 0U ? 16U : vec->cap * 2U;
+        vec->items = (V3ForbiddenHit *)v3_xrealloc(vec->items,
+                                                   next_cap * sizeof(V3ForbiddenHit));
+        vec->cap = next_cap;
+    }
+    vec->items[vec->len].path = v3_strdup(path);
+    vec->items[vec->len].label = label;
+    vec->len += 1U;
+}
+
+static void v3_forbidden_hit_vec_free(V3ForbiddenHitVec *vec) {
+    size_t i;
+    for (i = 0U; i < vec->len; ++i) {
+        free(vec->items[i].path);
+    }
+    free(vec->items);
+    vec->items = NULL;
+    vec->len = 0U;
+    vec->cap = 0U;
+}
+
+static void v3_bench_dataset_init(V3BenchDataset *dataset) {
+    dataset->items = NULL;
+    dataset->len = 0U;
+    dataset->cap = 0U;
+}
+
+static void v3_bench_dataset_push(V3BenchDataset *dataset,
+                                  const char *name,
+                                  int64_t ns_per_op_milli) {
+    if (dataset->len + 1U > dataset->cap) {
+        size_t next_cap = dataset->cap == 0U ? 16U : dataset->cap * 2U;
+        dataset->items = (V3BenchSample *)v3_xrealloc(dataset->items,
+                                                      next_cap * sizeof(V3BenchSample));
+        dataset->cap = next_cap;
+    }
+    dataset->items[dataset->len].name = v3_strdup(name);
+    dataset->items[dataset->len].ns_per_op_milli = ns_per_op_milli;
+    dataset->len += 1U;
+}
+
+static void v3_bench_dataset_free(V3BenchDataset *dataset) {
+    size_t i;
+    for (i = 0U; i < dataset->len; ++i) {
+        free(dataset->items[i].name);
+    }
+    free(dataset->items);
+    dataset->items = NULL;
+    dataset->len = 0U;
+    dataset->cap = 0U;
 }
 
 static bool v3_has_csv_token(const char *csv, const char *needle) {
@@ -675,10 +889,53 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "compile-bootstrap") ||
         !v3_has_csv_token(commands, "status") ||
         !v3_has_csv_token(commands, "print-build-plan") ||
+        !v3_has_csv_token(commands, "scan-hotpath") ||
+        !v3_has_csv_token(commands, "c-ref") ||
+        !v3_has_csv_token(commands, "compare-bench") ||
+        !v3_has_csv_token(commands, "print-bootstrap") ||
+        !v3_has_csv_token(commands, "bootstrap-bridge") ||
+        !v3_has_csv_token(commands, "build-backend-driver") ||
+        !v3_has_csv_token(commands, "run-smokes") ||
+        !v3_has_csv_token(commands, "slice-gate") ||
         !v3_has_csv_token(commands, "debug-report") ||
         !v3_has_csv_token(commands, "print-symbols") ||
         !v3_has_csv_token(commands, "print-line-map") ||
+        !v3_has_csv_token(commands, "print-object") ||
         !v3_has_csv_token(commands, "print-elf") ||
+        !v3_has_csv_token(commands, "print-asm") ||
+        !v3_has_csv_token(commands, "profile-run") ||
+        !v3_has_csv_token(commands, "verify-orphan-guard") ||
+        !v3_has_csv_token(commands, "verify-debug-tools") ||
+        !v3_has_csv_token(commands, "verify-debug-runtime") ||
+        !v3_has_csv_token(commands, "verify-debug-profile") ||
+        !v3_has_csv_token(commands, "verify-windows-builtin") ||
+        !v3_has_csv_token(commands, "verify-riscv64-builtin") ||
+        !v3_has_csv_token(commands, "run-cross-target-smokes") ||
+        !v3_has_csv_token(commands, "run-host-smokes") ||
+        !v3_has_csv_token(commands, "run-stage23-libp2p-smokes") ||
+        !v3_has_csv_token(commands, "build-zero-exit") ||
+        !v3_has_csv_token(commands, "build-panic-trace") ||
+        !v3_has_csv_token(commands, "build-bounds-trace") ||
+        !v3_has_csv_token(commands, "build-signal-trace") ||
+        !v3_has_csv_token(commands, "build-call-chain") ||
+        !v3_has_csv_token(commands, "build-ffi-handle") ||
+        !v3_has_csv_token(commands, "build-program-selfhost") ||
+        !v3_has_csv_token(commands, "build-chain-node") ||
+        !v3_has_csv_token(commands, "build-chain-node-linux") ||
+        !v3_has_csv_token(commands, "build-rwad-bft-linux") ||
+        !v3_has_csv_token(commands, "run-linux-object-smokes") ||
+        !v3_has_csv_token(commands, "run-tcp-twoproc-smoke") ||
+        !v3_has_csv_token(commands, "run-udp-importc-smoke") ||
+        !v3_has_csv_token(commands, "run-wasm-smokes") ||
+        !v3_has_csv_token(commands, "run-browser-host-wasm-smoke") ||
+        !v3_has_csv_token(commands, "run-chain-node-cli-smoke") ||
+        !v3_has_csv_token(commands, "run-chain-node-process-smoke") ||
+        !v3_has_csv_token(commands, "run-chain-node-three-node-smoke") ||
+        !v3_has_csv_token(commands, "run-tailnet-control-smoke") ||
+        !v3_has_csv_token(commands, "run-fresh-node-selfhost-gate") ||
+        !v3_has_csv_token(commands, "run-migration-gate") ||
+        !v3_has_csv_token(commands, "run-browser-webrtc-smokes") ||
+        !v3_has_csv_token(commands, "r2c-react-v3") ||
         !v3_has_csv_token(commands, "emit-csg") ||
         !v3_has_csv_token(commands, "migrate-csg") ||
         !v3_has_csv_token(commands, "verify-world") ||
@@ -722,6 +979,7 @@ static char *v3_contract_normalized_text(const V3BootstrapContract *contract) {
         "compiler_entry_source",
         "compiler_runtime_source",
         "compiler_request_source",
+        "tooling_gate_source",
         "lang_parser_source",
         "backend_system_link_plan_source",
         "backend_lowering_plan_source",
@@ -731,6 +989,7 @@ static char *v3_contract_normalized_text(const V3BootstrapContract *contract) {
         "backend_system_link_exec_source",
         "runtime_core_runtime_source",
         "runtime_compiler_runtime_source",
+        "runtime_debug_runtime_source",
         "tooling_bootstrap_contract_source",
         "backend_build_plan_source",
         "tooling_build_driver_script",
@@ -1052,6 +1311,553 @@ static bool v3_write_compile_report(const char *report_path,
     return v3_write_text_file(report_path, buffer);
 }
 
+typedef struct {
+    char root[PATH_MAX];
+    char target[128];
+    char out_dir[PATH_MAX];
+    char seed_source[PATH_MAX];
+    char stage1_source[PATH_MAX];
+    char compiler_entry_source[PATH_MAX];
+    char compiler_runtime_source[PATH_MAX];
+    char compiler_request_source[PATH_MAX];
+    char compiler_world_source[PATH_MAX];
+    char compiler_csg_source[PATH_MAX];
+    char compiler_world_libp2p_source[PATH_MAX];
+    char compiler_equivalence_source[PATH_MAX];
+    char lang_parser_source[PATH_MAX];
+    char backend_system_link_plan_source[PATH_MAX];
+    char backend_lowering_plan_source[PATH_MAX];
+    char backend_primary_object_plan_source[PATH_MAX];
+    char backend_object_plan_source[PATH_MAX];
+    char backend_native_link_plan_source[PATH_MAX];
+    char backend_system_link_exec_source[PATH_MAX];
+    char runtime_core_runtime_source[PATH_MAX];
+    char runtime_compiler_runtime_source[PATH_MAX];
+    char runtime_debug_runtime_source[PATH_MAX];
+    char tooling_gate_source[PATH_MAX];
+    char tooling_bootstrap_contract_source[PATH_MAX];
+    char backend_build_plan_source[PATH_MAX];
+    char tooling_build_driver_script[PATH_MAX];
+    char stage0[PATH_MAX];
+    char stage1[PATH_MAX];
+    char stage2[PATH_MAX];
+    char stage3[PATH_MAX];
+    char env_path[PATH_MAX];
+    char snapshot_path[PATH_MAX];
+    char backend_driver_out[PATH_MAX];
+    char stage0_build_log[PATH_MAX];
+    char stage0_self_check_log[PATH_MAX];
+    char stage1_build_log[PATH_MAX];
+    char stage1_self_check_log[PATH_MAX];
+    char stage2_build_log[PATH_MAX];
+    char stage2_self_check_log[PATH_MAX];
+    char stage3_build_log[PATH_MAX];
+    char stage3_self_check_log[PATH_MAX];
+    char stage2_contract_log[PATH_MAX];
+    char stage3_contract_log[PATH_MAX];
+    char stage1_report[PATH_MAX];
+    char stage2_report[PATH_MAX];
+    char stage3_report[PATH_MAX];
+} V3BootstrapPaths;
+
+static void v3_join_path(char *out, size_t cap, const char *a, const char *b);
+static void v3_contract_workspace_root(const V3BootstrapContract *contract, char *out, size_t cap);
+static bool v3_path_is_executable(const char *path);
+
+static bool v3_bootstrap_workspace_root(char *out, size_t cap) {
+    const char *env_root = getenv("CHENG_V3_ROOT");
+    if (env_root != NULL && env_root[0] != '\0') {
+        snprintf(out, cap, "%s", env_root);
+        return true;
+    }
+    if (CHENG_V3_EMBEDDED_CONTRACT_TEXT[0] != '\0') {
+        V3BootstrapContract contract;
+        if (v3_parse_contract_text(&contract,
+                                   CHENG_V3_EMBEDDED_SOURCE_PATH[0] != '\0' ? CHENG_V3_EMBEDDED_SOURCE_PATH : "<embedded>",
+                                   CHENG_V3_EMBEDDED_CONTRACT_TEXT)) {
+            v3_contract_workspace_root(&contract, out, cap);
+            v3_contract_free(&contract);
+            if (out[0] != '\0') {
+                return true;
+            }
+        } else {
+            v3_contract_free(&contract);
+        }
+    }
+    if (getcwd(out, cap) == NULL) {
+        perror("getcwd");
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+static void v3_bootstrap_target_default(char *out, size_t cap) {
+    const char *env_target = getenv("V3_TARGET");
+    if (env_target != NULL && env_target[0] != '\0') {
+        snprintf(out, cap, "%s", env_target);
+        return;
+    }
+    if (CHENG_V3_EMBEDDED_CONTRACT_TEXT[0] != '\0') {
+        V3BootstrapContract contract;
+        if (v3_parse_contract_text(&contract,
+                                   CHENG_V3_EMBEDDED_SOURCE_PATH[0] != '\0' ? CHENG_V3_EMBEDDED_SOURCE_PATH : "<embedded>",
+                                   CHENG_V3_EMBEDDED_CONTRACT_TEXT)) {
+            const char *target = v3_contract_get(&contract, "target");
+            snprintf(out, cap, "%s", target != NULL && target[0] != '\0' ? target : "arm64-apple-darwin");
+            v3_contract_free(&contract);
+            return;
+        }
+        v3_contract_free(&contract);
+    }
+    snprintf(out, cap, "%s", "arm64-apple-darwin");
+}
+
+static void v3_bootstrap_paths_init(V3BootstrapPaths *paths) {
+    memset(paths, 0, sizeof(*paths));
+    v3_bootstrap_workspace_root(paths->root, sizeof(paths->root));
+    v3_bootstrap_target_default(paths->target, sizeof(paths->target));
+    v3_join_path(paths->out_dir, sizeof(paths->out_dir), paths->root, "artifacts/v3_bootstrap");
+    v3_join_path(paths->seed_source, sizeof(paths->seed_source), paths->root, "v3/bootstrap/cheng_v3_seed.c");
+    v3_join_path(paths->stage1_source, sizeof(paths->stage1_source), paths->root, "v3/bootstrap/stage1_bootstrap.cheng");
+    v3_join_path(paths->compiler_entry_source, sizeof(paths->compiler_entry_source), paths->root, "v3/src/tooling/compiler_main.cheng");
+    v3_join_path(paths->compiler_runtime_source, sizeof(paths->compiler_runtime_source), paths->root, "v3/src/tooling/compiler_runtime.cheng");
+    v3_join_path(paths->compiler_request_source, sizeof(paths->compiler_request_source), paths->root, "v3/src/tooling/compiler_request.cheng");
+    v3_join_path(paths->compiler_world_source, sizeof(paths->compiler_world_source), paths->root, "v3/src/tooling/compiler_world.cheng");
+    v3_join_path(paths->compiler_csg_source, sizeof(paths->compiler_csg_source), paths->root, "v3/src/tooling/compiler_csg.cheng");
+    v3_join_path(paths->compiler_world_libp2p_source, sizeof(paths->compiler_world_libp2p_source), paths->root, "v3/src/tooling/compiler_world_libp2p.cheng");
+    v3_join_path(paths->compiler_equivalence_source, sizeof(paths->compiler_equivalence_source), paths->root, "v3/src/tooling/compiler_equivalence.cheng");
+    v3_join_path(paths->lang_parser_source, sizeof(paths->lang_parser_source), paths->root, "v3/src/lang/parser.cheng");
+    v3_join_path(paths->backend_system_link_plan_source, sizeof(paths->backend_system_link_plan_source), paths->root, "v3/src/backend/system_link_plan.cheng");
+    v3_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "v3/src/backend/lowering_plan.cheng");
+    v3_join_path(paths->backend_primary_object_plan_source, sizeof(paths->backend_primary_object_plan_source), paths->root, "v3/src/backend/primary_object_plan.cheng");
+    v3_join_path(paths->backend_object_plan_source, sizeof(paths->backend_object_plan_source), paths->root, "v3/src/backend/object_plan.cheng");
+    v3_join_path(paths->backend_native_link_plan_source, sizeof(paths->backend_native_link_plan_source), paths->root, "v3/src/backend/native_link_plan.cheng");
+    v3_join_path(paths->backend_system_link_exec_source, sizeof(paths->backend_system_link_exec_source), paths->root, "v3/src/backend/system_link_exec.cheng");
+    v3_join_path(paths->runtime_core_runtime_source, sizeof(paths->runtime_core_runtime_source), paths->root, "v3/src/runtime/core_runtime_v3.cheng");
+    v3_join_path(paths->runtime_compiler_runtime_source, sizeof(paths->runtime_compiler_runtime_source), paths->root, "v3/src/runtime/compiler_runtime_v3.cheng");
+    v3_join_path(paths->runtime_debug_runtime_source, sizeof(paths->runtime_debug_runtime_source), paths->root, "v3/src/runtime/debug_runtime_v3.cheng");
+    v3_join_path(paths->tooling_gate_source, sizeof(paths->tooling_gate_source), paths->root, "v3/src/tooling/gate_main.cheng");
+    v3_join_path(paths->tooling_bootstrap_contract_source, sizeof(paths->tooling_bootstrap_contract_source), paths->root, "v3/src/tooling/bootstrap_contracts.cheng");
+    v3_join_path(paths->backend_build_plan_source, sizeof(paths->backend_build_plan_source), paths->root, "v3/src/backend/build_plan.cheng");
+    v3_join_path(paths->tooling_build_driver_script, sizeof(paths->tooling_build_driver_script), paths->root, "v3/tooling/build_backend_driver_v3.sh");
+    v3_join_path(paths->stage0, sizeof(paths->stage0), paths->out_dir, "cheng.stage0");
+    v3_join_path(paths->stage1, sizeof(paths->stage1), paths->out_dir, "cheng.stage1");
+    v3_join_path(paths->stage2, sizeof(paths->stage2), paths->out_dir, "cheng.stage2");
+    v3_join_path(paths->stage3, sizeof(paths->stage3), paths->out_dir, "cheng.stage3");
+    v3_join_path(paths->env_path, sizeof(paths->env_path), paths->out_dir, "bootstrap.env");
+    v3_join_path(paths->snapshot_path, sizeof(paths->snapshot_path), paths->out_dir, "bootstrap_snapshot.txt");
+    v3_join_path(paths->backend_driver_out, sizeof(paths->backend_driver_out), paths->root, "artifacts/v3_backend_driver/cheng");
+    v3_join_path(paths->stage0_build_log, sizeof(paths->stage0_build_log), paths->out_dir, "cheng.stage0.build.log");
+    v3_join_path(paths->stage0_self_check_log, sizeof(paths->stage0_self_check_log), paths->out_dir, "cheng.stage0.self-check.log");
+    v3_join_path(paths->stage1_build_log, sizeof(paths->stage1_build_log), paths->out_dir, "cheng.stage1.compile.log");
+    v3_join_path(paths->stage1_self_check_log, sizeof(paths->stage1_self_check_log), paths->out_dir, "cheng.stage1.self-check.log");
+    v3_join_path(paths->stage2_build_log, sizeof(paths->stage2_build_log), paths->out_dir, "cheng.stage2.compile.log");
+    v3_join_path(paths->stage2_self_check_log, sizeof(paths->stage2_self_check_log), paths->out_dir, "cheng.stage2.self-check.log");
+    v3_join_path(paths->stage3_build_log, sizeof(paths->stage3_build_log), paths->out_dir, "cheng.stage3.compile.log");
+    v3_join_path(paths->stage3_self_check_log, sizeof(paths->stage3_self_check_log), paths->out_dir, "cheng.stage3.self-check.log");
+    v3_join_path(paths->stage2_contract_log, sizeof(paths->stage2_contract_log), paths->out_dir, "cheng.stage2.contract.txt");
+    v3_join_path(paths->stage3_contract_log, sizeof(paths->stage3_contract_log), paths->out_dir, "cheng.stage3.contract.txt");
+    v3_join_path(paths->stage1_report, sizeof(paths->stage1_report), paths->out_dir, "cheng.stage1.report.txt");
+    v3_join_path(paths->stage2_report, sizeof(paths->stage2_report), paths->out_dir, "cheng.stage2.report.txt");
+    v3_join_path(paths->stage3_report, sizeof(paths->stage3_report), paths->out_dir, "cheng.stage3.report.txt");
+}
+
+static bool v3_bootstrap_artifacts_ready(const V3BootstrapPaths *paths) {
+    struct stat st;
+    return access(paths->stage2, X_OK) == 0 &&
+           access(paths->stage3, X_OK) == 0 &&
+           stat(paths->env_path, &st) == 0 &&
+           S_ISREG(st.st_mode) &&
+           st.st_size > 0 &&
+           stat(paths->snapshot_path, &st) == 0 &&
+           S_ISREG(st.st_mode) &&
+           st.st_size > 0;
+}
+
+static bool v3_stat_mtime_ns(const char *path, uint64_t *out_ns) {
+    struct stat st;
+    uint64_t sec = 0;
+    uint64_t nsec = 0;
+    if (path == NULL || path[0] == '\0' || out_ns == NULL) {
+        return false;
+    }
+    if (stat(path, &st) != 0) {
+        return false;
+    }
+#if defined(__APPLE__)
+    sec = (uint64_t)st.st_mtimespec.tv_sec;
+    nsec = (uint64_t)st.st_mtimespec.tv_nsec;
+#else
+    sec = (uint64_t)st.st_mtime;
+    nsec = 0;
+#endif
+    *out_ns = sec * 1000000000ULL + nsec;
+    return true;
+}
+
+static bool v3_output_is_fresh_against_inputs(const char *output_path,
+                                              const char *const *input_paths,
+                                              size_t input_count) {
+    uint64_t output_ns = 0;
+    size_t i;
+    if (!v3_stat_mtime_ns(output_path, &output_ns)) {
+        return false;
+    }
+    for (i = 0; i < input_count; ++i) {
+        uint64_t input_ns = 0;
+        if (input_paths[i] == NULL || input_paths[i][0] == '\0') {
+            continue;
+        }
+        if (!v3_stat_mtime_ns(input_paths[i], &input_ns)) {
+            return false;
+        }
+        if (output_ns < input_ns) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool v3_bootstrap_artifacts_fresh(const V3BootstrapPaths *paths) {
+    const char *inputs[6];
+    if (!v3_bootstrap_artifacts_ready(paths)) {
+        return false;
+    }
+    inputs[0] = paths->seed_source;
+    inputs[1] = paths->stage1_source;
+    inputs[2] = paths->compiler_entry_source;
+    inputs[3] = paths->compiler_runtime_source;
+    inputs[4] = paths->compiler_request_source;
+    inputs[5] = paths->tooling_gate_source;
+    return v3_output_is_fresh_against_inputs(paths->stage2, inputs, 6U) &&
+           v3_output_is_fresh_against_inputs(paths->stage3, inputs, 6U) &&
+           v3_output_is_fresh_against_inputs(paths->env_path, inputs, 6U) &&
+           v3_output_is_fresh_against_inputs(paths->snapshot_path, inputs, 6U);
+}
+
+static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
+    const char *inputs[23];
+    if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
+        return false;
+    }
+    if (!v3_bootstrap_artifacts_fresh(paths)) {
+        return false;
+    }
+    inputs[0] = paths->env_path;
+    inputs[1] = paths->stage2;
+    inputs[2] = paths->stage3;
+    inputs[3] = paths->stage1_source;
+    inputs[4] = paths->compiler_entry_source;
+    inputs[5] = paths->compiler_runtime_source;
+    inputs[6] = paths->compiler_request_source;
+    inputs[7] = paths->compiler_world_source;
+    inputs[8] = paths->compiler_csg_source;
+    inputs[9] = paths->compiler_world_libp2p_source;
+    inputs[10] = paths->compiler_equivalence_source;
+    inputs[11] = paths->lang_parser_source;
+    inputs[12] = paths->backend_system_link_plan_source;
+    inputs[13] = paths->backend_lowering_plan_source;
+    inputs[14] = paths->backend_primary_object_plan_source;
+    inputs[15] = paths->backend_object_plan_source;
+    inputs[16] = paths->backend_native_link_plan_source;
+    inputs[17] = paths->backend_system_link_exec_source;
+    inputs[18] = paths->runtime_core_runtime_source;
+    inputs[19] = paths->runtime_compiler_runtime_source;
+    inputs[20] = paths->runtime_debug_runtime_source;
+    inputs[21] = paths->tooling_gate_source;
+    inputs[22] = paths->tooling_bootstrap_contract_source;
+    return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 23U) &&
+           v3_output_is_fresh_against_inputs(paths->backend_driver_out,
+                                             (const char *const *)&paths->backend_build_plan_source,
+                                             1U) &&
+           v3_output_is_fresh_against_inputs(paths->backend_driver_out,
+                                             (const char *const *)&paths->tooling_build_driver_script,
+                                             1U);
+}
+
+static bool v3_lock_holder_alive(const char *lock_path, bool *alive_out) {
+    char pid_text[64];
+    ssize_t pid_len;
+    char *end = NULL;
+    long pid = 0;
+    if (alive_out == NULL) {
+        return false;
+    }
+    *alive_out = false;
+    pid_len = readlink(lock_path, pid_text, sizeof(pid_text) - 1);
+    if (pid_len < 0) {
+        if (errno == ENOENT) {
+            return true;
+        }
+        perror("readlink");
+        return false;
+    }
+    pid_text[pid_len] = '\0';
+    errno = 0;
+    pid = strtol(pid_text, &end, 10);
+    if (errno != 0 || end == pid_text || *end != '\0' || pid <= 0) {
+        return true;
+    }
+    if (kill((pid_t)pid, 0) == 0 || errno == EPERM) {
+        *alive_out = true;
+        return true;
+    }
+    if (errno == ESRCH) {
+        *alive_out = false;
+        return true;
+    }
+    perror("kill");
+    return false;
+}
+
+static bool v3_acquire_pid_lock(const char *lock_path,
+                                bool *held_out,
+                                V3ReadyCheckFn ready_fn,
+                                const void *ready_ctx,
+                                const char *label) {
+    char pid_text[64];
+    if (held_out != NULL) {
+        *held_out = false;
+    }
+    snprintf(pid_text, sizeof(pid_text), "%ld", (long)getpid());
+    for (;;) {
+        if (symlink(pid_text, lock_path) == 0) {
+            if (held_out != NULL) {
+                *held_out = true;
+            }
+            return true;
+        }
+        if (errno != EEXIST) {
+            fprintf(stderr, "[cheng_v3_seed] %s lock create failed: %s\n", label, lock_path);
+            perror("symlink");
+            return false;
+        }
+        if (ready_fn != NULL && ready_fn(ready_ctx)) {
+            return true;
+        }
+        {
+            bool alive = false;
+            if (!v3_lock_holder_alive(lock_path, &alive)) {
+                return false;
+            }
+            if (!alive) {
+                if (unlink(lock_path) != 0 && errno != ENOENT) {
+                    fprintf(stderr, "[cheng_v3_seed] %s lock cleanup failed: %s\n", label, lock_path);
+                    perror("unlink");
+                    return false;
+                }
+                continue;
+            }
+        }
+        usleep(50000);
+    }
+}
+
+static void v3_release_pid_lock(const char *lock_path, bool *held_io) {
+    if (held_io == NULL || !*held_io) {
+        return;
+    }
+    if (unlink(lock_path) != 0 && errno != ENOENT) {
+        perror("unlink");
+    }
+    *held_io = false;
+}
+
+static bool v3_bootstrap_ready_check(const void *ctx) {
+    return v3_bootstrap_artifacts_fresh((const V3BootstrapPaths *)ctx);
+}
+
+static bool v3_backend_driver_ready_check(const void *ctx) {
+    return v3_backend_driver_ready((const V3BootstrapPaths *)ctx);
+}
+
+static bool v3_file_text_equal(const char *left_path, const char *right_path) {
+    char *left = v3_read_file(left_path);
+    char *right = v3_read_file(right_path);
+    bool same = false;
+    if (left != NULL && right != NULL) {
+        same = strcmp(left, right) == 0;
+    }
+    free(left);
+    free(right);
+    return same;
+}
+
+static bool v3_run_shell_command_logged(const char *command,
+                                        const char *log_path,
+                                        const char *label) {
+    char *quoted_log;
+    char *quoted_command;
+    size_t cap;
+    char *full;
+    int rc;
+    quoted_log = v3_shell_quote(log_path);
+    quoted_command = v3_shell_quote(command);
+    cap = strlen(quoted_log) + strlen(quoted_command) + 32U;
+    full = (char *)v3_xmalloc(cap);
+    snprintf(full,
+             cap,
+             "sh -lc %s > %s 2>&1",
+             quoted_command,
+             quoted_log);
+    free(quoted_log);
+    free(quoted_command);
+    rc = system(full);
+    if (rc != 0) {
+        fprintf(stderr, "[cheng_v3_seed] %s failed rc=%d log=%s\n", label, rc, log_path);
+        free(full);
+        return false;
+    }
+    free(full);
+    return true;
+}
+
+static bool v3_run_command_logged_argv(size_t arg_count,
+                                       const char **args,
+                                       const char *log_path,
+                                       const char *label) {
+    size_t i;
+    size_t cap = 32U;
+    size_t used = 0U;
+    char *command;
+    bool ok;
+    if (arg_count == 0U || args == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s missing argv\n", label);
+        return false;
+    }
+    for (i = 0U; i < arg_count; ++i) {
+        const char *arg = args[i] != NULL ? args[i] : "";
+        cap += strlen(arg) * 4U + 8U;
+    }
+    command = (char *)v3_xmalloc(cap);
+    command[0] = '\0';
+    for (i = 0U; i < arg_count; ++i) {
+        char *quoted = v3_shell_quote(args[i] != NULL ? args[i] : "");
+        size_t need = strlen(quoted) + 2U;
+        if (used + need + 1U >= cap) {
+            cap = cap + need + 64U;
+            command = (char *)v3_xrealloc(command, cap);
+        }
+        if (used > 0U) {
+            command[used++] = ' ';
+            command[used] = '\0';
+        }
+        memcpy(command + used, quoted, strlen(quoted) + 1U);
+        used += strlen(quoted);
+        free(quoted);
+    }
+    ok = v3_run_shell_command_logged(command, log_path, label);
+    free(command);
+    return ok;
+}
+
+static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
+    char *env_text;
+    char *snapshot_text;
+    size_t env_cap = 8192U;
+    size_t snapshot_cap = 12288U;
+    env_text = (char *)v3_xmalloc(env_cap);
+    snapshot_text = (char *)v3_xmalloc(snapshot_cap);
+    snprintf(env_text,
+             env_cap,
+             "V3_ROOT=%s\n"
+             "V3_TARGET=%s\n"
+             "V3_BOOTSTRAP_KIND=v3_seed\n"
+             "V3_BOOTSTRAP_SEED_SOURCE=%s\n"
+             "V3_BOOTSTRAP_STAGE1_SOURCE=%s\n"
+             "V3_COMPILER_ENTRY_SOURCE=%s\n"
+             "V3_COMPILER_RUNTIME_SOURCE=%s\n"
+             "V3_COMPILER_REQUEST_SOURCE=%s\n"
+             "V3_BOOTSTRAP_STAGE0=%s\n"
+             "V3_BOOTSTRAP_STAGE1=%s\n"
+             "V3_BOOTSTRAP_STAGE2=%s\n"
+             "V3_BOOTSTRAP_STAGE3=%s\n"
+             "V3_BOOTSTRAP_ENV=%s\n"
+             "V3_BOOTSTRAP_SNAPSHOT=%s\n"
+             "V3_BOOTSTRAP_STAGE1_REPORT=%s\n"
+             "V3_BOOTSTRAP_STAGE2_REPORT=%s\n"
+             "V3_BOOTSTRAP_STAGE3_REPORT=%s\n",
+             paths->root,
+             paths->target,
+             paths->seed_source,
+             paths->stage1_source,
+             paths->compiler_entry_source,
+             paths->compiler_runtime_source,
+             paths->compiler_request_source,
+             paths->stage0,
+             paths->stage1,
+             paths->stage2,
+             paths->stage3,
+             paths->env_path,
+             paths->snapshot_path,
+             paths->stage1_report,
+             paths->stage2_report,
+             paths->stage3_report);
+    snprintf(snapshot_text,
+             snapshot_cap,
+             "target=%s\n"
+             "bootstrap_kind=v3_seed\n"
+             "seed_source=%s\n"
+             "stage1_source=%s\n"
+             "compiler_entry_source=%s\n"
+             "compiler_runtime_source=%s\n"
+             "compiler_request_source=%s\n"
+             "tooling_gate_source=%s\n"
+             "stage0=%s\n"
+             "stage1=%s\n"
+             "stage2=%s\n"
+             "stage3=%s\n"
+             "stage1_report=%s\n"
+             "stage2_report=%s\n"
+             "stage3_report=%s\n"
+             "stage0_build_log=%s\n"
+             "stage0_self_check_log=%s\n"
+             "stage1_build_log=%s\n"
+             "stage1_self_check_log=%s\n"
+             "stage2_build_log=%s\n"
+             "stage2_self_check_log=%s\n"
+             "stage3_build_log=%s\n"
+             "stage3_self_check_log=%s\n"
+             "stage2_contract_log=%s\n"
+             "stage3_contract_log=%s\n"
+             "fixed_point=stage2_stage3_contract_match\n",
+             paths->target,
+             paths->seed_source,
+             paths->stage1_source,
+             paths->compiler_entry_source,
+             paths->compiler_runtime_source,
+             paths->compiler_request_source,
+             paths->tooling_gate_source,
+             paths->stage0,
+             paths->stage1,
+             paths->stage2,
+             paths->stage3,
+             paths->stage1_report,
+             paths->stage2_report,
+             paths->stage3_report,
+             paths->stage0_build_log,
+             paths->stage0_self_check_log,
+             paths->stage1_build_log,
+             paths->stage1_self_check_log,
+             paths->stage2_build_log,
+             paths->stage2_self_check_log,
+             paths->stage3_build_log,
+             paths->stage3_self_check_log,
+             paths->stage2_contract_log,
+             paths->stage3_contract_log);
+    if (!v3_ensure_parent_dir(paths->env_path) ||
+        !v3_write_text_file(paths->env_path, env_text) ||
+        !v3_write_text_file(paths->snapshot_path, snapshot_text)) {
+        free(env_text);
+        free(snapshot_text);
+        return false;
+    }
+    free(env_text);
+    free(snapshot_text);
+    return true;
+}
+
 static const char *v3_flag_value(int argc, char **argv, const char *flag) {
     size_t flag_len = strlen(flag);
     int i;
@@ -1313,6 +2119,8 @@ typedef struct {
 
 typedef struct {
     char path[PATH_MAX];
+    uint16_t file_type;
+    uint16_t machine;
     unsigned char *bytes;
     size_t len;
     size_t section_count;
@@ -3956,6 +4764,11 @@ static bool v3_parse_fixed_array_type(const char *type_text,
                                       char *elem_type_out,
                                       size_t elem_cap,
                                       int32_t *len_out);
+static bool v3_parse_fixed_array_type_meta(const char *type_text,
+                                           char *elem_type_out,
+                                           size_t elem_cap,
+                                           char *len_expr_out,
+                                           size_t len_expr_cap);
 static bool v3_normalize_type_text(const V3LoweringPlanStub *lowering,
                                    const char *owner_module_path,
                                    const V3ImportAlias *aliases,
@@ -3991,6 +4804,7 @@ static bool v3_normalize_type_text_with_params(const V3LoweringPlanStub *lowerin
                                                size_t cap) {
     char trimmed[256];
     char inner[256];
+    char len_expr[64];
     char normalized_inner[256];
     char base_name[128];
     char raw_type_args[CHENG_V3_MAX_TYPE_PARAMS][256];
@@ -4067,7 +4881,17 @@ static bool v3_normalize_type_text_with_params(const V3LoweringPlanStub *lowerin
         }
         return true;
     }
-    if (v3_parse_fixed_array_type(trimmed, inner, sizeof(inner), &fixed_len)) {
+    if (v3_parse_fixed_array_type_meta(trimmed,
+                                       inner,
+                                       sizeof(inner),
+                                       len_expr,
+                                       sizeof(len_expr)) &&
+        v3_eval_type_int32_expr(lowering,
+                                owner_module_path,
+                                aliases,
+                                alias_count,
+                                len_expr,
+                                &fixed_len)) {
         if (!v3_normalize_type_text_with_params(lowering,
                                                 owner_module_path,
                                                 aliases,
@@ -5097,10 +5921,10 @@ static bool v3_parse_fixed_array_type(const char *type_text,
                                       int32_t *len_out) {
     char copy[256];
     char len_text[64];
-    char *end = NULL;
-    long parsed_len;
     char *open;
     char *close;
+    char *end = NULL;
+    long parsed_len;
     if (v3_startswith(type_text, "Result[") || strlen(type_text) <= 3U) {
         return false;
     }
@@ -5125,6 +5949,38 @@ static bool v3_parse_fixed_array_type(const char *type_text,
         return false;
     }
     *len_out = (int32_t)parsed_len;
+    return true;
+}
+
+static bool v3_parse_fixed_array_type_meta(const char *type_text,
+                                           char *elem_type_out,
+                                           size_t elem_cap,
+                                           char *len_expr_out,
+                                           size_t len_expr_cap) {
+    char copy[256];
+    char len_text[64];
+    char *open;
+    char *close;
+    if (v3_startswith(type_text, "Result[") || strlen(type_text) <= 3U) {
+        return false;
+    }
+    snprintf(copy, sizeof(copy), "%s", type_text);
+    open = strrchr(copy, '[');
+    close = strrchr(copy, ']');
+    if (!open || !close || close <= open || close[1] != '\0') {
+        return false;
+    }
+    *open = '\0';
+    if (strchr(open + 1, '[') != NULL) {
+        return false;
+    }
+    v3_trim_copy_text(copy, elem_type_out, elem_cap);
+    snprintf(len_text, sizeof(len_text), "%.*s", (int)(close - open - 1), open + 1);
+    v3_trim_copy_text(len_text, len_text, sizeof(len_text));
+    if (elem_type_out[0] == '\0' || len_text[0] == '\0') {
+        return false;
+    }
+    v3_trim_copy_text(len_text, len_expr_out, len_expr_cap);
     return true;
 }
 
@@ -5496,7 +6352,7 @@ static bool v3_parse_function_signature_meta(const char *line,
                               function->param_names[i],
                               sizeof(function->param_names[i]));
             function->param_is_var[i] = param_is_var;
-            v3_trim_copy_text(type_text,
+            v3_trim_copy_text(param_is_var ? value_type_text : type_text,
                               function->param_types[i],
                               sizeof(function->param_types[i]));
             snprintf(function->param_abi_classes[i],
@@ -6887,12 +7743,100 @@ static bool v3_const_parse_binding_name(const char *statement,
     return name_out[0] != '\0';
 }
 
+static bool v3_const_identifier_char(char ch) {
+    unsigned char uch = (unsigned char)ch;
+    return isalnum(uch) || ch == '_';
+}
+
+static bool v3_const_text_has_identifier_token(const char *text,
+                                               const char *name) {
+    size_t text_len;
+    size_t name_len;
+    bool in_string = false;
+    size_t i;
+    if (text == NULL || name == NULL || name[0] == '\0') {
+        return false;
+    }
+    text_len = strlen(text);
+    name_len = strlen(name);
+    if (name_len == 0U || name_len > text_len) {
+        return false;
+    }
+    for (i = 0U; i < text_len; ++i) {
+        char ch = text[i];
+        if (ch == '"' && (i == 0U || text[i - 1U] != '\\')) {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && ch == '#') {
+            break;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (i + name_len > text_len) {
+            break;
+        }
+        if (strncmp(text + i, name, name_len) != 0) {
+            continue;
+        }
+        if (i > 0U && v3_const_identifier_char(text[i - 1U])) {
+            continue;
+        }
+        if (i + name_len < text_len &&
+            v3_const_identifier_char(text[i + name_len])) {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool v3_const_function_uses_top_level_name(char **lines,
+                                                  size_t line_count,
+                                                  size_t fn_line_index,
+                                                  const char *name) {
+    size_t i;
+    if (lines == NULL || name == NULL || name[0] == '\0' || fn_line_index >= line_count) {
+        return false;
+    }
+    for (i = fn_line_index; i < line_count; ++i) {
+        char line_copy[4096];
+        char *trimmed;
+        int32_t indent;
+        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
+        trimmed = v3_trim_inplace(line_copy);
+        if (*trimmed == '\0') {
+            continue;
+        }
+        indent = v3_line_indent(lines[i]);
+        if (i > fn_line_index &&
+            indent <= 0 &&
+            v3_is_top_level_decl_start(trimmed)) {
+            break;
+        }
+        if (i == fn_line_index) {
+            char *eq = strrchr(trimmed, '=');
+            if (eq != NULL &&
+                v3_const_text_has_identifier_token(eq + 1, name)) {
+                return true;
+            }
+            continue;
+        }
+        if (v3_const_text_has_identifier_token(trimmed, name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool v3_const_env_load_top_level_vars(const V3LoweringPlanStub *lowering,
                                              const V3LoweredFunctionStub *function,
                                              const V3ImportAlias *aliases,
                                              size_t alias_count,
                                              char **lines,
                                              size_t line_count,
+                                             size_t fn_line_index,
                                              V3ConstEnv *env,
                                              size_t depth) {
     bool in_var_block = false;
@@ -6938,6 +7882,14 @@ static bool v3_const_env_load_top_level_vars(const V3LoweringPlanStub *lowering,
                                                  &has_init,
                                                  expr,
                                                  sizeof(expr))) {
+            v3_const_value_free(&bound);
+            continue;
+        }
+        if (function != NULL &&
+            !v3_const_function_uses_top_level_name(lines,
+                                                  line_count,
+                                                  fn_line_index,
+                                                  name)) {
             v3_const_value_free(&bound);
             continue;
         }
@@ -7695,6 +8647,7 @@ static bool v3_const_eval_function(const V3LoweringPlanStub *lowering,
                                           alias_count,
                                           lines,
                                           line_count,
+                                          fn_line_index,
                                           &env,
                                           depth + 1U)) {
         goto cleanup;
@@ -7860,6 +8813,79 @@ static void v3_package_id_from_root(const char *package_root, char *out, size_t 
         return;
     }
     snprintf(out, cap, "cheng/%s", base);
+}
+
+static bool v3_path_last_component_is(const char *path, const char *name) {
+    const char *slash;
+    const char *base;
+    if (!path || !name) {
+        return false;
+    }
+    slash = strrchr(path, '/');
+    base = slash ? slash + 1 : path;
+    return strcmp(base, name) == 0;
+}
+
+static bool v3_path_is_within_dir(const char *path, const char *dir) {
+    char dir_copy[PATH_MAX];
+    size_t dir_len;
+    if (!path || path[0] == '\0' || !dir || dir[0] == '\0') {
+        return false;
+    }
+    v3_copy_text(dir_copy, sizeof(dir_copy), dir);
+    dir_len = strlen(dir_copy);
+    while (dir_len > 1U && dir_copy[dir_len - 1U] == '/') {
+        dir_copy[--dir_len] = '\0';
+    }
+    if (strcmp(path, dir_copy) == 0) {
+        return true;
+    }
+    return strncmp(path, dir_copy, dir_len) == 0 && path[dir_len] == '/';
+}
+
+static void v3_resolve_package_source_path(const char *package_root,
+                                           const char *source_path,
+                                           char *out,
+                                           size_t cap) {
+    char workspace_root[PATH_MAX];
+    if (!source_path || source_path[0] == '\0') {
+        out[0] = '\0';
+        return;
+    }
+    if (v3_const_os_is_absolute(source_path)) {
+        v3_copy_text(out, cap, source_path);
+        return;
+    }
+    v3_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
+    v3_join_path(out, cap, workspace_root, source_path);
+}
+
+static void v3_resolve_effective_package_root(const V3BootstrapContract *contract,
+                                              const char *package_root_flag,
+                                              const char *source_path,
+                                              char *out,
+                                              size_t cap) {
+    char default_package_root[PATH_MAX];
+    char package_root[PATH_MAX];
+    char source_abs[PATH_MAX];
+    char v3_package_root[PATH_MAX];
+    v3_default_package_root(contract, default_package_root, sizeof(default_package_root));
+    v3_copy_text(package_root,
+                 sizeof(package_root),
+                 package_root_flag && *package_root_flag ? package_root_flag : default_package_root);
+    if (v3_path_last_component_is(package_root, "v3")) {
+        v3_copy_text(out, cap, package_root);
+        return;
+    }
+    v3_resolve_package_source_path(package_root, source_path, source_abs, sizeof(source_abs));
+    if (source_abs[0] != '\0') {
+        v3_join_path(v3_package_root, sizeof(v3_package_root), package_root, "v3");
+        if (v3_path_is_within_dir(source_abs, v3_package_root)) {
+            v3_copy_text(out, cap, v3_package_root);
+            return;
+        }
+    }
+    v3_copy_text(out, cap, package_root);
 }
 
 static bool v3_path_exists_nonempty(const char *path) {
@@ -8037,6 +9063,10 @@ static void v3_populate_runtime_requirements(V3SystemLinkPlanStub *plan) {
                      &plan->provider_module_count,
                      CHENG_V3_MAX_PROVIDER_MODULES,
                      "runtime/core_runtime_v3");
+    v3_plan_add_path(plan->provider_modules,
+                     &plan->provider_module_count,
+                     CHENG_V3_MAX_PROVIDER_MODULES,
+                     "runtime/debug_runtime_v3");
     v3_plan_add_path(plan->provider_modules,
                      &plan->provider_module_count,
                      CHENG_V3_MAX_PROVIDER_MODULES,
@@ -9929,6 +10959,87 @@ static bool v3_seed_reachable_from_module_inits(const V3SystemLinkPlanStub *plan
         free(owned);
     }
     return true;
+}
+
+static bool v3_source_has_top_level_var_init(const char *source_path,
+                                             bool *has_init_out) {
+    char **lines = NULL;
+    char *owned = NULL;
+    size_t line_count = 0U;
+    bool in_var_block = false;
+    size_t i;
+    bool has_init = false;
+    if (has_init_out != NULL) {
+        *has_init_out = false;
+    }
+    if (source_path == NULL || source_path[0] == '\0' || has_init_out == NULL) {
+        return false;
+    }
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
+        return false;
+    }
+    for (i = 0; i < line_count; ++i) {
+        char line_copy[4096];
+        char name[128];
+        char raw_type[256];
+        char expr[4096];
+        bool binding_has_init = false;
+        int32_t indent;
+        char *trimmed;
+        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
+        indent = v3_line_indent(line_copy);
+        trimmed = v3_trim_inplace(line_copy);
+        if (*trimmed == '\0' || *trimmed == '#') {
+            continue;
+        }
+        if (indent <= 0 && strcmp(trimmed, "var") == 0) {
+            in_var_block = true;
+            continue;
+        }
+        if (indent <= 0 && !v3_startswith(trimmed, "var ")) {
+            in_var_block = false;
+        }
+        if (indent <= 0 && v3_startswith(trimmed, "var ")) {
+            trimmed += 4;
+        } else if (!in_var_block || indent <= 0) {
+            continue;
+        }
+        if (!v3_parse_top_level_var_binding_text(trimmed,
+                                                 name,
+                                                 sizeof(name),
+                                                 raw_type,
+                                                 sizeof(raw_type),
+                                                 &binding_has_init,
+                                                 expr,
+                                                 sizeof(expr))) {
+            continue;
+        }
+        if (binding_has_init) {
+            has_init = true;
+            break;
+        }
+    }
+    free(lines);
+    free(owned);
+    *has_init_out = has_init;
+    return true;
+}
+
+static bool v3_plan_has_module_global_inits(const V3SystemLinkPlanStub *plan) {
+    size_t i;
+    if (plan == NULL) {
+        return true;
+    }
+    for (i = 0U; i < plan->source_closure_count; ++i) {
+        bool has_init = false;
+        if (!v3_source_has_top_level_var_init(plan->source_closure_paths[i].text, &has_init)) {
+            return true;
+        }
+        if (has_init) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void v3_prune_lowering_to_reachable(const V3SystemLinkPlanStub *plan,
@@ -11908,7 +13019,7 @@ static bool v3_add_local_slot_for_type(const V3LoweringPlanStub *lowering,
                                        name,
                                        normalized_type,
                                        resolved_abi_class,
-                                       false,
+                                       as_indirect_param,
                                        8,
                                        8,
                                        next_offset_io);
@@ -11948,6 +13059,20 @@ static bool v3_emit_sp_load_reg(char *out,
                                 int32_t offset,
                                 const char *abi_class,
                                 int dst_reg);
+static void v3_emit_load_scalar_from_address(char *out,
+                                             size_t cap,
+                                             int addr_reg,
+                                             int32_t offset,
+                                             const char *abi_class,
+                                             int dst_reg);
+static void v3_emit_store_scalar_to_address(char *out,
+                                            size_t cap,
+                                            int addr_reg,
+                                            int32_t offset,
+                                            const char *abi_class,
+                                            int src_reg);
+static const char *v3_param_pass_abi_class(const V3AsmLocalSlot *slot,
+                                           const char *value_abi_class);
 static bool v3_emit_local_value_address(char *out,
                                         size_t cap,
                                         const V3AsmLocalSlot *slot,
@@ -11960,7 +13085,10 @@ static void v3_emit_load_slot(char *out,
     if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
         abort();
     }
-    if (slot->indirect_value || strcmp(slot->abi_class, "ptr") == 0) {
+    if (slot->indirect_value) {
+        v3_text_appendf(out, cap, "  ldr x16, [x16]\n");
+        v3_emit_load_scalar_from_address(out, cap, 16, 0, slot->abi_class, reg_index);
+    } else if (strcmp(slot->abi_class, "ptr") == 0) {
         v3_text_appendf(out, cap, "  ldr x%d, [x16]\n", reg_index);
     } else if (strcmp(slot->abi_class, "i8") == 0) {
         v3_text_appendf(out, cap, "  ldrsb x%d, [x16]\n", reg_index);
@@ -11986,7 +13114,10 @@ static void v3_emit_store_slot(char *out,
     if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
         abort();
     }
-    if (slot->indirect_value || strcmp(slot->abi_class, "ptr") == 0) {
+    if (slot->indirect_value) {
+        v3_text_appendf(out, cap, "  ldr x16, [x16]\n");
+        v3_emit_store_scalar_to_address(out, cap, 16, 0, slot->abi_class, reg_index);
+    } else if (strcmp(slot->abi_class, "ptr") == 0) {
         v3_text_appendf(out, cap, "  str x%d, [x16]\n", reg_index);
     } else if (strcmp(slot->abi_class, "i8") == 0 ||
                strcmp(slot->abi_class, "u8") == 0 ||
@@ -12007,6 +13138,14 @@ static bool v3_emit_local_value_address(char *out,
                                         const V3AsmLocalSlot *slot,
                                         int reg_index) {
     return slot != NULL && v3_emit_slot_address(out, cap, slot, reg_index);
+}
+
+static const char *v3_param_pass_abi_class(const V3AsmLocalSlot *slot,
+                                           const char *value_abi_class) {
+    if (slot != NULL && slot->indirect_value) {
+        return "ptr";
+    }
+    return value_abi_class;
 }
 
 static bool v3_external_call_signature(const V3SystemLinkPlanStub *plan,
@@ -24219,11 +25358,12 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         }
     }
     for (i = 0; i < function->param_count; ++i) {
+        const char *pass_abi = v3_param_pass_abi_class(&locals[i], function->param_abi_classes[i]);
         if (i < CHENG_V3_CALL_ARG_REGS) {
             if (!v3_emit_sp_store_reg(out,
                                       cap,
                                       locals[i].stack_offset,
-                                      function->param_abi_classes[i],
+                                      pass_abi,
                                       (int)i)) {
                 free(lines);
                 free(owned_lines);
@@ -24234,12 +25374,12 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         if (!v3_emit_sp_load_reg(out,
                                  cap,
                                  frame_size + (int32_t)(i - CHENG_V3_CALL_ARG_REGS) * 8,
-                                 function->param_abi_classes[i],
+                                 pass_abi,
                                  9) ||
             !v3_emit_sp_store_reg(out,
                                   cap,
                                   locals[i].stack_offset,
-                                  function->param_abi_classes[i],
+                                  pass_abi,
                                   9)) {
             free(lines);
             free(owned_lines);
@@ -24632,6 +25772,72 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
             char field_type[256];
             char field_abi[32];
             if (local_index >= 0) {
+                if (locals[local_index].indirect_value) {
+                    const char *value_type = locals[local_index].type_text;
+                    const char *value_abi = locals[local_index].abi_class;
+                    if (v3_abi_class_scalar_or_ptr(value_abi)) {
+                        if (!v3_emit_local_value_address(out, cap, &locals[local_index], 15) ||
+                            !v3_codegen_expr_scalar(plan,
+                                                    lowering,
+                                                    function,
+                                                    aliases,
+                                                    alias_count,
+                                                    locals,
+                                                    local_count,
+                                                    expr,
+                                                    value_abi,
+                                                    9,
+                                                    call_arg_base,
+                                                    string_temp_base,
+                                                    string_temp_stride,
+                                                    0,
+                                                    out,
+                                                    cap)) {
+                            fprintf(stderr,
+                                    "[cheng_v3_seed] emit indirect local scalar assignment failed function=%s target=%s expr=%s abi=%s stmt=%s\n",
+                                    function->symbol_text,
+                                    name,
+                                    expr,
+                                    value_abi,
+                                    statement);
+                            free(lines);
+                            free(owned_lines);
+                            return false;
+                        }
+                        v3_emit_store_scalar_to_address(out, cap, 15, 0, value_abi, 9);
+                        continue;
+                    }
+                    if (!v3_emit_local_value_address(out, cap, &locals[local_index], 15) ||
+                        !v3_materialize_composite_expr_into_address(plan,
+                                                                    lowering,
+                                                                    function,
+                                                                    aliases,
+                                                                    alias_count,
+                                                                    locals,
+                                                                    local_count,
+                                                                    expr,
+                                                                    value_type,
+                                                                    15,
+                                                                    call_arg_base,
+                                                                    string_temp_base,
+                                                                    string_temp_stride,
+                                                                    &string_label_index,
+                                                                    0,
+                                                                    out,
+                                                                    cap)) {
+                        fprintf(stderr,
+                                "[cheng_v3_seed] emit indirect local composite assignment failed function=%s target=%s expr=%s type=%s stmt=%s\n",
+                                function->symbol_text,
+                                name,
+                                expr,
+                                value_type,
+                                statement);
+                        free(lines);
+                        free(owned_lines);
+                        return false;
+                    }
+                    continue;
+                }
                 const char *abi_class = locals[local_index].abi_class;
                 if (v3_abi_class_scalar_or_ptr(abi_class)) {
                     if (!v3_codegen_expr_scalar(plan,
@@ -25534,6 +26740,10 @@ static void v3_provider_source_for_module(const V3SystemLinkPlanStub *plan,
         }
         return;
     }
+    if (v3_streq(module_path, "runtime/debug_runtime_v3")) {
+        v3_join_path(out, cap, plan->workspace_root, "src/runtime/native/system_helpers_debug_trace_profile.c");
+        return;
+    }
     if (v3_streq(module_path, "runtime/program_support_v3")) {
         v3_join_path(out, cap, plan->workspace_root, "v3/src/runtime/program_support_backend_v3.cheng");
         return;
@@ -25614,6 +26824,7 @@ static bool v3_build_primary_object_plan_stub(const V3SystemLinkPlanStub *plan,
     entry_function = v3_find_entry_lowered_function(lowering);
     if (entry_function &&
         v3_streq(plan->emit_kind, "exe") &&
+        !v3_plan_has_module_global_inits(plan) &&
         !v3_target_is_wasm32_unknown_unknown(plan->target_triple) &&
         v3_try_consteval_entry_program(plan, lowering, &consteval_entry)) {
         primary->consteval_entry_ready = true;
@@ -27372,9 +28583,10 @@ static bool v3_emit_simple_return_call_chunk(const V3SystemLinkPlanStub *plan,
     return true;
 }
 
-static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
-                                          const V3LoweringPlanStub *lowering,
-                                          const V3PrimaryObjectPlanStub *primary) {
+static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *plan,
+                                                   const V3LoweringPlanStub *lowering,
+                                                   const V3PrimaryObjectPlanStub *primary,
+                                                   bool compile_object) {
     size_t i;
     char asm_path[PATH_MAX];
     char module_init_symbols[CHENG_V3_MAX_PLAN_PATHS][PATH_MAX];
@@ -27390,6 +28602,12 @@ static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
     if (primary->consteval_entry_ready &&
         v3_target_uses_consteval_builtin_executable(plan->target_triple) &&
         v3_streq(plan->emit_kind, "exe")) {
+        if (!compile_object) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] print-asm unsupported for builtin consteval target: %s\n",
+                    plan->target_triple);
+            return false;
+        }
         return true;
     }
     snprintf(asm_path, sizeof(asm_path), "%s.s", primary->output_path);
@@ -27502,6 +28720,9 @@ static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
             return false;
         }
         free(text);
+        if (!compile_object) {
+            return true;
+        }
         return v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path);
     }
     text = (char *)v3_xmalloc(cap);
@@ -27654,7 +28875,22 @@ static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
         return false;
     }
     free(text);
+    if (!compile_object) {
+        return true;
+    }
     return v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path);
+}
+
+static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
+                                          const V3LoweringPlanStub *lowering,
+                                          const V3PrimaryObjectPlanStub *primary) {
+    return v3_materialize_primary_object_internal(plan, lowering, primary, true);
+}
+
+static bool v3_materialize_primary_asm_only(const V3SystemLinkPlanStub *plan,
+                                            const V3LoweringPlanStub *lowering,
+                                            const V3PrimaryObjectPlanStub *primary) {
+    return v3_materialize_primary_object_internal(plan, lowering, primary, false);
 }
 
 static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
@@ -27880,6 +29116,9 @@ enum {
 #define V3_PE_SECTION_MEM_EXECUTE 0x20000000U
 #define V3_PE_SECTION_MEM_READ 0x40000000U
 #define V3_PE_SECTION_MEM_WRITE 0x80000000U
+#define V3_MACHO_MAGIC_64 0xfeedfacfU
+#define V3_MACHO_LC_SEGMENT_64 0x19U
+#define V3_MACHO_LC_SYMTAB 0x2U
 
 static void v3_bytebuf_append_zero_fill(V3ByteBuf *buf, size_t len) {
     static const uint8_t ZEROES[32] = {0};
@@ -27918,6 +29157,33 @@ static uint64_t v3_read_u64_le_at(const unsigned char *data, size_t off) {
 
 static int64_t v3_read_i64_le_at(const unsigned char *data, size_t off) {
     return (int64_t)v3_read_u64_le_at(data, off);
+}
+
+static void v3_copy_fixed_name_bytes(const unsigned char *src,
+                                     size_t len,
+                                     char *out,
+                                     size_t cap) {
+    size_t i = 0U;
+    if (cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (src == NULL) {
+        return;
+    }
+    while (i < len && src[i] != 0U && i + 1U < cap) {
+        out[i] = (char)src[i];
+        i += 1U;
+    }
+    out[i] = '\0';
+    while (i > 0U && (out[i - 1U] == ' ' || out[i - 1U] == '\t')) {
+        out[i - 1U] = '\0';
+        i -= 1U;
+    }
+}
+
+static bool v3_range_fits(size_t len, size_t off, size_t need) {
+    return off <= len && need <= len - off;
 }
 
 static void v3_write_u16_le_at(unsigned char *data, size_t off, uint16_t value) {
@@ -28073,6 +29339,7 @@ static bool v3_parse_elf_relocatable_object(const char *path, V3ElfObjectStub *o
     uint16_t shentsize;
     uint16_t shnum;
     uint16_t shstrndx;
+    uint16_t elf_type;
     const V3ElfSectionStub *shstr = NULL;
     const unsigned char *shstrtab = NULL;
     size_t sym_count = 0U;
@@ -28093,18 +29360,26 @@ static bool v3_parse_elf_relocatable_object(const char *path, V3ElfObjectStub *o
         v3_elf_object_free(out);
         return false;
     }
-    if (v3_read_u16_le_at(out->bytes, 16U) != V3_ELF_ET_REL ||
-        v3_read_u16_le_at(out->bytes, 18U) != V3_ELF_EM_AARCH64) {
-        fprintf(stderr, "[cheng_v3_seed] unsupported ELF machine/type: %s\n", path);
+    elf_type = v3_read_u16_le_at(out->bytes, 16U);
+    if (elf_type != V3_ELF_ET_REL && elf_type != V3_ELF_ET_EXEC) {
+        fprintf(stderr, "[cheng_v3_seed] unsupported ELF type: %s\n", path);
         v3_elf_object_free(out);
         return false;
     }
+    out->file_type = elf_type;
+    out->machine = v3_read_u16_le_at(out->bytes, 18U);
     shoff = v3_read_u64_le_at(out->bytes, 40U);
     shentsize = v3_read_u16_le_at(out->bytes, 58U);
     shnum = v3_read_u16_le_at(out->bytes, 60U);
     shstrndx = v3_read_u16_le_at(out->bytes, 62U);
     if (shoff == 0U || shentsize < 64U || shnum == 0U ||
         shoff + (uint64_t)shentsize * (uint64_t)shnum > (uint64_t)out->len) {
+        if (elf_type == V3_ELF_ET_EXEC) {
+            out->section_count = 0U;
+            out->symbol_count = 0U;
+            out->reloc_count = 0U;
+            return true;
+        }
         fprintf(stderr, "[cheng_v3_seed] malformed ELF section table: %s\n", path);
         v3_elf_object_free(out);
         return false;
@@ -29259,7 +30534,7 @@ static bool v3_link_native_executable(const V3NativeLinkPlanStub *native_link,
                                       const char *output_path) {
     size_t i;
     size_t cap = PATH_MAX * (size_t)(native_link->link_input_count + 16U);
-    char *command;
+    char *command = NULL;
     int rc;
     if (!v3_ensure_parent_dir(output_path)) {
         return false;
@@ -29407,7 +30682,7 @@ static bool v3_link_native_shared_library(const V3NativeLinkPlanStub *native_lin
                                           const char *output_path) {
     size_t i;
     size_t cap = PATH_MAX * (size_t)(native_link->link_input_count + 24U);
-    char *command;
+    char *command = NULL;
     int rc;
     const char *base_name = output_path;
     if (!v3_ensure_parent_dir(output_path)) {
@@ -29552,7 +30827,6 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     const char *emit = v3_flag_value(argc, argv, "--emit");
     const char *target = v3_flag_value(argc, argv, "--target");
     const char *package_root_flag = v3_flag_value(argc, argv, "--root");
-    char default_package_root[PATH_MAX];
     char seen_paths[1][1];
     V3PlanPath seen[CHENG_V3_MAX_PLAN_PATHS];
     size_t seen_len = 0U;
@@ -29585,8 +30859,11 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     if (!target || *target == '\0') {
         target = v3_contract_get(contract, "target");
     }
-    v3_default_package_root(contract, default_package_root, sizeof(default_package_root));
-    v3_copy_text(plan->package_root, sizeof(plan->package_root), package_root_flag && *package_root_flag ? package_root_flag : default_package_root);
+    v3_resolve_effective_package_root(contract,
+                                      package_root_flag,
+                                      source_path,
+                                      plan->package_root,
+                                      sizeof(plan->package_root));
     v3_workspace_root_from_package_root(plan->package_root, plan->workspace_root, sizeof(plan->workspace_root));
     v3_package_id_from_root(plan->package_root, plan->package_id, sizeof(plan->package_id));
     v3_copy_text(plan->entry_path, sizeof(plan->entry_path), source_path);
@@ -31428,7 +32705,6 @@ static bool v3_compiler_legacy_build(int argc,
     const char *legacy_source_path = v3_flag_value(argc, argv, "--legacy-in");
     const char *package_root_flag = v3_flag_value(argc, argv, "--root");
     const char *channel = channel_override;
-    char default_package_root[PATH_MAX];
     char package_root[PATH_MAX];
     char workspace_root[PATH_MAX];
     char package_id[PATH_MAX];
@@ -31459,10 +32735,11 @@ static bool v3_compiler_legacy_build(int argc,
     memset(units, 0, sizeof(units));
     memset(migration, 0, sizeof(*migration));
     memset(world, 0, sizeof(*world));
-    v3_default_package_root(contract, default_package_root, sizeof(default_package_root));
-    v3_copy_text(package_root,
-                 sizeof(package_root),
-                 package_root_flag && *package_root_flag ? package_root_flag : default_package_root);
+    v3_resolve_effective_package_root(contract,
+                                      package_root_flag,
+                                      legacy_source_path,
+                                      package_root,
+                                      sizeof(package_root));
     v3_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
     if (package_id_hint && *package_id_hint != '\0') {
         v3_copy_text(package_id, sizeof(package_id), package_id_hint);
@@ -32471,7 +33748,7 @@ static char *v3_system_link_plan_report(const V3BootstrapContract *contract,
     v3_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     v3_report_append(&out, &cap, &used, line);
-    v3_report_append(&out, &cap, &used, "build_source_unit_count=21");
+    v3_report_append(&out, &cap, &used, "build_source_unit_count=23");
     v3_report_append(&out, &cap, &used, "link_mode=system_link");
     v3_report_append(&out, &cap, &used, "pipeline_stage=parser_stub_to_system_link_plan_stub");
     return out;
@@ -32810,11 +34087,14 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     char output_path[PATH_MAX];
     char resolved[PATH_MAX];
     char seed_source[PATH_MAX];
-    char extra_tooling[PATH_MAX];
     const char *keys[] = {
         "compiler_entry_source",
         "compiler_runtime_source",
         "compiler_request_source",
+        NULL,
+        NULL,
+        NULL,
+        NULL,
         "lang_parser_source",
         "backend_system_link_plan_source",
         "backend_lowering_plan_source",
@@ -32824,6 +34104,8 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "backend_system_link_exec_source",
         "runtime_core_runtime_source",
         "runtime_compiler_runtime_source",
+        "runtime_debug_runtime_source",
+        "tooling_gate_source",
         "tooling_bootstrap_contract_source",
         "backend_build_plan_source",
         "tooling_build_driver_script"
@@ -32832,6 +34114,10 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "compiler_entry_source",
         "compiler_runtime_source",
         "compiler_request_source",
+        "tooling_source",
+        "tooling_source",
+        "tooling_source",
+        "tooling_source",
         "lang_parser_source",
         "backend_system_link_plan_source",
         "backend_lowering_plan_source",
@@ -32841,9 +34127,34 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "backend_system_link_exec_source",
         "runtime_core_runtime_source",
         "runtime_compiler_runtime_source",
+        "runtime_debug_runtime_source",
+        "tooling_source",
         "tooling_source",
         "tooling_source",
         "tooling_source"
+    };
+    const char *manual_paths[] = {
+        NULL,
+        NULL,
+        NULL,
+        "v3/src/tooling/compiler_world.cheng",
+        "v3/src/tooling/compiler_csg.cheng",
+        "v3/src/tooling/compiler_world_libp2p.cheng",
+        "v3/src/tooling/compiler_equivalence.cheng",
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        NULL
     };
     size_t i;
     if (!v3_load_runtime_contract(argc, argv, &contract)) {
@@ -32869,18 +34180,5704 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     printf("source[0]=bootstrap_contract_source:%s\n", contract.source_path);
     printf("source[1]=seed_source:%s\n", seed_source);
     for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
-        v3_resolve_contract_path(&contract, keys[i], resolved, sizeof(resolved));
+        if (manual_paths[i] != NULL) {
+            v3_join_path(resolved, sizeof(resolved), workspace_root, manual_paths[i]);
+        } else {
+            v3_resolve_contract_path(&contract, keys[i], resolved, sizeof(resolved));
+        }
         printf("source[%zu]=%s:%s\n", i + 2U, labels[i], resolved);
     }
-    v3_join_path(extra_tooling, sizeof(extra_tooling), workspace_root, "v3/src/tooling/compiler_world.cheng");
-    printf("source[17]=tooling_source:%s\n", extra_tooling);
-    v3_join_path(extra_tooling, sizeof(extra_tooling), workspace_root, "v3/src/tooling/compiler_csg.cheng");
-    printf("source[18]=tooling_source:%s\n", extra_tooling);
-    v3_join_path(extra_tooling, sizeof(extra_tooling), workspace_root, "v3/src/tooling/compiler_world_libp2p.cheng");
-    printf("source[19]=tooling_source:%s\n", extra_tooling);
-    v3_join_path(extra_tooling, sizeof(extra_tooling), workspace_root, "v3/src/tooling/compiler_equivalence.cheng");
-    printf("source[20]=tooling_source:%s\n", extra_tooling);
     v3_contract_free(&contract);
+    return 0;
+}
+
+static int v3_cmd_bootstrap_bridge(int argc, char **argv);
+
+static int v3_cmd_print_bootstrap(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char *snapshot_text;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths)) {
+        if (v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+            return 1;
+        }
+        v3_bootstrap_paths_init(&paths);
+    }
+    snapshot_text = v3_read_file(paths.snapshot_path);
+    if (snapshot_text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] missing bootstrap snapshot: %s\n", paths.snapshot_path);
+        return 1;
+    }
+    fputs(snapshot_text, stdout);
+    free(snapshot_text);
+    return 0;
+}
+
+static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char lock_path[PATH_MAX];
+    char *command = NULL;
+    char *quoted_cc = NULL;
+    char *quoted_bin = NULL;
+    char *quoted_in = NULL;
+    char *quoted_out = NULL;
+    char *quoted_report = NULL;
+    const char *cc = getenv("CC");
+    size_t cap = PATH_MAX * 8U;
+    bool lock_held = false;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap root detect failed\n");
+        return 1;
+    }
+    if (cc == NULL || cc[0] == '\0') {
+        cc = "cc";
+    }
+    if (!v3_mkdir_p(paths.out_dir)) {
+        return 1;
+    }
+    v3_join_path(lock_path, sizeof(lock_path), paths.out_dir, ".bootstrap_bridge.lock");
+    if (v3_bootstrap_artifacts_fresh(&paths)) {
+        printf("v3 bootstrap bridge ok: %s\n", paths.stage2);
+        return 0;
+    }
+    if (!v3_acquire_pid_lock(lock_path, &lock_held, v3_bootstrap_ready_check, &paths, "bootstrap-bridge")) {
+        return 1;
+    }
+    if (v3_bootstrap_artifacts_fresh(&paths)) {
+        rc = 0;
+        goto done;
+    }
+    if (access(paths.seed_source, R_OK) != 0 ||
+        access(paths.stage1_source, R_OK) != 0 ||
+        access(paths.compiler_entry_source, R_OK) != 0 ||
+        access(paths.compiler_runtime_source, R_OK) != 0 ||
+        access(paths.compiler_request_source, R_OK) != 0 ||
+        access(paths.tooling_gate_source, R_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing source input under %s\n", paths.root);
+        goto done;
+    }
+    command = (char *)v3_xmalloc(cap);
+
+    quoted_cc = v3_shell_quote(cc);
+    quoted_in = v3_shell_quote(paths.seed_source);
+    quoted_out = v3_shell_quote(paths.stage0);
+    snprintf(command,
+             cap,
+             "%s -std=c11 -O2 -Wall -Wextra -pedantic %s -o %s",
+             quoted_cc,
+             quoted_in,
+             quoted_out);
+    free(quoted_cc);
+    free(quoted_in);
+    free(quoted_out);
+    if (!v3_run_shell_command_logged(command, paths.stage0_build_log, "bootstrap-bridge stage0_cc")) {
+        goto done;
+    }
+    if (access(paths.stage0, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing stage0: %s\n", paths.stage0);
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage0);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage0_self_check_log, "bootstrap-bridge stage0_self_check")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage0);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    quoted_out = v3_shell_quote(paths.stage1);
+    quoted_report = v3_shell_quote(paths.stage1_report);
+    snprintf(command,
+             cap,
+             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
+             quoted_bin,
+             quoted_in,
+             quoted_out,
+             quoted_report);
+    free(quoted_bin);
+    free(quoted_in);
+    free(quoted_out);
+    free(quoted_report);
+    if (!v3_run_shell_command_logged(command, paths.stage1_build_log, "bootstrap-bridge stage1_compile")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage1);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage1_self_check_log, "bootstrap-bridge stage1_self_check")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage1);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    quoted_out = v3_shell_quote(paths.stage2);
+    quoted_report = v3_shell_quote(paths.stage2_report);
+    snprintf(command,
+             cap,
+             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
+             quoted_bin,
+             quoted_in,
+             quoted_out,
+             quoted_report);
+    free(quoted_bin);
+    free(quoted_in);
+    free(quoted_out);
+    free(quoted_report);
+    if (!v3_run_shell_command_logged(command, paths.stage2_build_log, "bootstrap-bridge stage2_compile")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage2);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage2_self_check_log, "bootstrap-bridge stage2_self_check")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage2);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    quoted_out = v3_shell_quote(paths.stage3);
+    quoted_report = v3_shell_quote(paths.stage3_report);
+    snprintf(command,
+             cap,
+             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
+             quoted_bin,
+             quoted_in,
+             quoted_out,
+             quoted_report);
+    free(quoted_bin);
+    free(quoted_in);
+    free(quoted_out);
+    free(quoted_report);
+    if (!v3_run_shell_command_logged(command, paths.stage3_build_log, "bootstrap-bridge stage3_compile")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage3);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage3_self_check_log, "bootstrap-bridge stage3_self_check")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage2);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage2_contract_log, "bootstrap-bridge stage2_contract")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage3);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, paths.stage3_contract_log, "bootstrap-bridge stage3_contract")) {
+        goto done;
+    }
+
+    if (!v3_file_text_equal(paths.stage2_contract_log, paths.stage3_contract_log)) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge fixed point mismatch stage2/stage3\n");
+        goto done;
+    }
+    if (!v3_bootstrap_write_env_and_snapshot(&paths)) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge failed to write snapshot/env\n");
+        goto done;
+    }
+    rc = 0;
+done:
+    free(command);
+    v3_release_pid_lock(lock_path, &lock_held);
+    if (rc == 0) {
+        printf("v3 bootstrap bridge ok: %s\n", paths.stage2);
+    }
+    return rc;
+}
+
+static int v3_cmd_build_backend_driver(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char lock_path[PATH_MAX];
+    char log_path[PATH_MAX];
+    char report_path[PATH_MAX];
+    char compile_report_path[PATH_MAX];
+    char contract_log[PATH_MAX];
+    char status_log[PATH_MAX];
+    char plan_log[PATH_MAX];
+    char reference_contract_log[PATH_MAX];
+    char *command = NULL;
+    char *quoted_bin;
+    char *quoted_in;
+    char *quoted_out;
+    char *quoted_report;
+    char *report_text = NULL;
+    size_t cap = PATH_MAX * 8U;
+    bool lock_held = false;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_ensure_parent_dir(paths.backend_driver_out)) {
+        return 1;
+    }
+    v3_join_path(lock_path, sizeof(lock_path), paths.root, "artifacts/v3_backend_driver/.build_backend_driver_v3.lock");
+    if (access(paths.backend_driver_out, X_OK) == 0) {
+        printf("v3 backend driver ok: %s\n", paths.backend_driver_out);
+        return 0;
+    }
+    if (v3_backend_driver_ready(&paths)) {
+        printf("v3 backend driver ok: %s\n", paths.backend_driver_out);
+        return 0;
+    }
+    if (!v3_acquire_pid_lock(lock_path, &lock_held, v3_backend_driver_ready_check, &paths, "build-backend-driver")) {
+        return 1;
+    }
+    if (v3_backend_driver_ready(&paths)) {
+        rc = 0;
+        goto done;
+    }
+    if (!v3_bootstrap_artifacts_fresh(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        goto done;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.log");
+    v3_join_path(report_path, sizeof(report_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.report.txt");
+    v3_join_path(compile_report_path, sizeof(compile_report_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt");
+    v3_join_path(contract_log, sizeof(contract_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.contract.txt");
+    v3_join_path(status_log, sizeof(status_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt");
+    v3_join_path(plan_log, sizeof(plan_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt");
+    v3_join_path(reference_contract_log, sizeof(reference_contract_log), paths.root, "artifacts/v3_backend_driver/reference_stage3.contract.txt");
+    command = (char *)v3_xmalloc(cap);
+
+    quoted_bin = v3_shell_quote(paths.stage2);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    quoted_out = v3_shell_quote(paths.backend_driver_out);
+    quoted_report = v3_shell_quote(compile_report_path);
+    snprintf(command,
+             cap,
+             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
+             quoted_bin,
+             quoted_in,
+             quoted_out,
+             quoted_report);
+    free(quoted_bin);
+    free(quoted_in);
+    free(quoted_out);
+    free(quoted_report);
+    if (!v3_run_shell_command_logged(command, log_path, "build-backend-driver compile")) {
+        goto done;
+    }
+    if (access(paths.backend_driver_out, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver missing output: %s\n", paths.backend_driver_out);
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.backend_driver_out);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, contract_log, "build-backend-driver print-contract")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.backend_driver_out);
+    snprintf(command, cap, "%s status", quoted_bin);
+    free(quoted_bin);
+    if (!v3_run_shell_command_logged(command, status_log, "build-backend-driver status")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.backend_driver_out);
+    snprintf(command, cap, "%s print-build-plan", quoted_bin);
+    free(quoted_bin);
+    if (!v3_run_shell_command_logged(command, plan_log, "build-backend-driver print-build-plan")) {
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.stage3);
+    quoted_in = v3_shell_quote(paths.stage1_source);
+    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
+    free(quoted_bin);
+    free(quoted_in);
+    if (!v3_run_shell_command_logged(command, reference_contract_log, "build-backend-driver reference-stage3")) {
+        goto done;
+    }
+
+    if (!v3_file_text_equal(contract_log, reference_contract_log)) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver contract drift vs stage3: %s\n", paths.backend_driver_out);
+        goto done;
+    }
+
+    report_text = (char *)v3_xmalloc(8192U);
+    snprintf(report_text,
+             8192U,
+             "target=%s\n"
+             "bootstrap_kind=v3_seed\n"
+             "compiler_class=ordinary_compiler\n"
+             "stage0_compiler=%s\n"
+             "stage1_compiler=%s\n"
+             "stage2_compiler=%s\n"
+             "stage3_compiler=%s\n"
+             "bootstrap_contract_source=%s\n"
+             "planned_entry_source=%s\n"
+             "planned_runtime_source=%s\n"
+             "planned_request_source=%s\n"
+             "materialized_source=%s\n"
+             "output=%s\n"
+             "contract_log=%s\n"
+             "status_log=%s\n"
+             "plan_log=%s\n"
+             "log=%s\n",
+             paths.target,
+             paths.stage0,
+             paths.stage1,
+             paths.stage2,
+             paths.stage3,
+             paths.stage1_source,
+             paths.compiler_entry_source,
+             paths.compiler_runtime_source,
+             paths.compiler_request_source,
+             paths.stage1_source,
+             paths.backend_driver_out,
+             contract_log,
+             status_log,
+             plan_log,
+             log_path);
+    if (!v3_ensure_parent_dir(report_path) || !v3_write_text_file(report_path, report_text)) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver failed to write report: %s\n", report_path);
+        goto done;
+    }
+    rc = 0;
+done:
+    free(report_text);
+    free(command);
+    v3_release_pid_lock(lock_path, &lock_held);
+    if (rc == 0) {
+        printf("v3 backend driver ok: %s\n", paths.backend_driver_out);
+    }
+    return rc;
+}
+
+static int v3_cmd_run_smokes(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char log_path[PATH_MAX];
+    char *command;
+    char *quoted_bin;
+    char *quoted_in;
+    const char *bins[4];
+    size_t i;
+    size_t cap = PATH_MAX * 4U;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    bins[0] = paths.stage0;
+    bins[1] = paths.stage1;
+    bins[2] = paths.stage2;
+    bins[3] = paths.stage3;
+    command = (char *)v3_xmalloc(cap);
+    for (i = 0; i < 4U; ++i) {
+        const char *bin = bins[i];
+        const char *base = strrchr(bin, '/');
+        if (access(bin, X_OK) != 0) {
+            fprintf(stderr, "[cheng_v3_seed] run-smokes missing bootstrap compiler: %s\n", bin);
+            free(command);
+            return 1;
+        }
+        v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate");
+        if (!v3_mkdir_p(log_path)) {
+            free(command);
+            return 1;
+        }
+        v3_join_path(log_path, sizeof(log_path), log_path, base != NULL ? base + 1 : bin);
+        strncat(log_path, ".self-check.log", sizeof(log_path) - strlen(log_path) - 1U);
+        quoted_bin = v3_shell_quote(bin);
+        quoted_in = v3_shell_quote(paths.stage1_source);
+        snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
+        free(quoted_bin);
+        free(quoted_in);
+        if (!v3_run_shell_command_logged(command, log_path, "run-smokes self-check")) {
+            free(command);
+            return 1;
+        }
+    }
+    free(command);
+    return 0;
+}
+
+static bool v3_is_ident_char(int ch) {
+    return isalnum((unsigned char)ch) || ch == '_';
+}
+
+static bool v3_path_has_named_segment(const char *path, const char *segment) {
+    size_t len = strlen(segment);
+    const char *cursor = path;
+    while ((cursor = strstr(cursor, segment)) != NULL) {
+        bool left_ok = cursor == path || cursor[-1] == '/';
+        bool right_ok = cursor[len] == '\0' || cursor[len] == '/';
+        if (left_ok && right_ok) {
+            return true;
+        }
+        cursor += 1;
+    }
+    return false;
+}
+
+static bool v3_path_has_tests_segment(const char *path) {
+    return v3_path_has_named_segment(path, "tests");
+}
+
+static bool v3_is_cheng_source_path(const char *path) {
+    const char *dot = strrchr(path, '.');
+    return dot != NULL && strcmp(dot, ".cheng") == 0;
+}
+
+static bool v3_text_contains_whole_word(const char *text, const char *word) {
+    size_t len = strlen(word);
+    const char *cursor = text;
+    while ((cursor = strstr(cursor, word)) != NULL) {
+        bool left_ok = cursor == text || !v3_is_ident_char((unsigned char)cursor[-1]);
+        bool right_ok = cursor[len] == '\0' || !v3_is_ident_char((unsigned char)cursor[len]);
+        if (left_ok && right_ok) {
+            return true;
+        }
+        cursor += 1;
+    }
+    return false;
+}
+
+static bool v3_text_contains_label_colon_str(const char *text, const char *label) {
+    size_t len = strlen(label);
+    const char *cursor = text;
+    while ((cursor = strstr(cursor, label)) != NULL) {
+        const char *probe = cursor + len;
+        if ((cursor == text || !v3_is_ident_char((unsigned char)cursor[-1])) &&
+            *probe == ':') {
+            probe += 1;
+            while (*probe == ' ' || *probe == '\t' || *probe == '\r' || *probe == '\n') {
+                probe += 1;
+            }
+            if (strncmp(probe, "str", 3U) == 0 &&
+                (probe[3] == '\0' || !v3_is_ident_char((unsigned char)probe[3]))) {
+                return true;
+            }
+        }
+        cursor += 1;
+    }
+    return false;
+}
+
+static bool v3_text_contains_forbidden_pattern(const char *text,
+                                               const V3ForbiddenPattern *pattern) {
+    if (pattern->kind == V3_FORBIDDEN_WHOLE_WORD) {
+        return v3_text_contains_whole_word(text, pattern->needle);
+    }
+    if (pattern->kind == V3_FORBIDDEN_LABEL_COLON_STR) {
+        return v3_text_contains_label_colon_str(text, pattern->needle);
+    }
+    return strstr(text, pattern->needle) != NULL;
+}
+
+static bool v3_scan_forbidden_source_dir(const char *src_dir,
+                                         V3ForbiddenHitVec *hits) {
+    static const V3ForbiddenPattern patterns[] = {
+        { V3_FORBIDDEN_SUBSTRING, "local_payload", "local_payload" },
+        { V3_FORBIDDEN_SUBSTRING, "exec_plan_payload", "exec_plan_payload" },
+        { V3_FORBIDDEN_SUBSTRING, "entry_bridge", "entry_bridge" },
+        { V3_FORBIDDEN_SUBSTRING, "payloadText", "payloadText" },
+        { V3_FORBIDDEN_LABEL_COLON_STR, "runtimeTarget", "runtimeTarget: str" },
+        { V3_FORBIDDEN_LABEL_COLON_STR, "opName", "opName: str" },
+        { V3_FORBIDDEN_LABEL_COLON_STR, "kind", "kind: str" },
+        { V3_FORBIDDEN_WHOLE_WORD, "BigInt", "BigInt" }
+    };
+    V3OwnedStringVec dirs;
+    char *dir_path;
+    bool ok = true;
+    v3_owned_string_vec_init(&dirs);
+    v3_owned_string_vec_push_dup(&dirs, src_dir);
+    while ((dir_path = v3_owned_string_vec_pop(&dirs)) != NULL) {
+        DIR *dir = opendir(dir_path);
+        if (dir == NULL) {
+            fprintf(stderr, "[cheng_v3_seed] scan-hotpath open failed: %s\n", dir_path);
+            free(dir_path);
+            ok = false;
+            break;
+        }
+        for (;;) {
+            struct dirent *entry = readdir(dir);
+            char child_path[PATH_MAX];
+            struct stat st;
+            size_t i;
+            char *text;
+            if (entry == NULL) {
+                break;
+            }
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            v3_join_path(child_path, sizeof(child_path), dir_path, entry->d_name);
+            if (stat(child_path, &st) != 0) {
+                fprintf(stderr, "[cheng_v3_seed] scan-hotpath stat failed: %s\n", child_path);
+                ok = false;
+                break;
+            }
+            if (S_ISDIR(st.st_mode)) {
+                if (!v3_path_has_tests_segment(child_path)) {
+                    v3_owned_string_vec_push_dup(&dirs, child_path);
+                }
+                continue;
+            }
+            if (!S_ISREG(st.st_mode) ||
+                v3_path_has_tests_segment(child_path) ||
+                !v3_is_cheng_source_path(child_path)) {
+                continue;
+            }
+            text = v3_read_file(child_path);
+            if (text == NULL) {
+                fprintf(stderr, "[cheng_v3_seed] scan-hotpath read failed: %s\n", child_path);
+                ok = false;
+                break;
+            }
+            for (i = 0U; i < sizeof(patterns) / sizeof(patterns[0]); ++i) {
+                if (v3_text_contains_forbidden_pattern(text, &patterns[i])) {
+                    v3_forbidden_hit_vec_push(hits, child_path, patterns[i].label);
+                }
+            }
+            free(text);
+        }
+        closedir(dir);
+        free(dir_path);
+        if (!ok) {
+            break;
+        }
+    }
+    while ((dir_path = v3_owned_string_vec_pop(&dirs)) != NULL) {
+        free(dir_path);
+    }
+    v3_owned_string_vec_free(&dirs);
+    return ok;
+}
+
+static int v3_cmd_scan_hotpath(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    V3ForbiddenHitVec hits;
+    char src_dir[PATH_MAX];
+    char *report;
+    size_t cap;
+    size_t used = 0U;
+    size_t i;
+    char line[PATH_MAX * 2U];
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] scan-hotpath root detect failed\n");
+        return 1;
+    }
+    v3_join_path(src_dir, sizeof(src_dir), paths.root, "v3/src");
+    if (access(src_dir, R_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] scan-hotpath source dir not found: %s\n", src_dir);
+        return 1;
+    }
+    v3_forbidden_hit_vec_init(&hits);
+    if (!v3_scan_forbidden_source_dir(src_dir, &hits)) {
+        v3_forbidden_hit_vec_free(&hits);
+        return 1;
+    }
+    if (hits.len == 0U) {
+        v3_forbidden_hit_vec_free(&hits);
+        puts("v3 scan: ok");
+        return 0;
+    }
+    cap = 256U + hits.len * (PATH_MAX + 96U);
+    report = (char *)v3_xmalloc(cap);
+    report[0] = '\0';
+    for (i = 0U; i < hits.len; ++i) {
+        snprintf(line,
+                 sizeof(line),
+                 "v3 scan: hit forbidden pattern: %s @ %s",
+                 hits.items[i].label,
+                 hits.items[i].path);
+        v3_report_append(&report, &cap, &used, line);
+    }
+    fputs(report, stdout);
+    free(report);
+    v3_forbidden_hit_vec_free(&hits);
+    return 1;
+}
+
+static void v3_bench_first_field(const char *line,
+                                 char *out,
+                                 size_t cap) {
+    const char *cursor = line;
+    size_t len = 0U;
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor += 1;
+    }
+    while (cursor[len] != '\0' && !isspace((unsigned char)cursor[len])) {
+        len += 1U;
+    }
+    if (cap == 0U) {
+        return;
+    }
+    if (len >= cap) {
+        len = cap - 1U;
+    }
+    memcpy(out, cursor, len);
+    out[len] = '\0';
+}
+
+static void v3_bench_find_value(const char *line,
+                                const char *key,
+                                char *out,
+                                size_t cap) {
+    const char *cursor = strstr(line, key);
+    size_t len = 0U;
+    if (cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (cursor == NULL) {
+        return;
+    }
+    cursor += strlen(key);
+    while (cursor[len] != '\0' &&
+           ((cursor[len] >= '0' && cursor[len] <= '9') || cursor[len] == '.')) {
+        len += 1U;
+    }
+    if (len == 0U) {
+        return;
+    }
+    if (len >= cap) {
+        len = cap - 1U;
+    }
+    memcpy(out, cursor, len);
+    out[len] = '\0';
+}
+
+static int64_t v3_bench_parse_decimal_milli(const char *raw) {
+    int64_t whole = 0;
+    int64_t frac = 0;
+    int frac_digits = 0;
+    bool seen_dot = false;
+    size_t i;
+    if (raw == NULL || raw[0] == '\0') {
+        return -1;
+    }
+    for (i = 0U; raw[i] != '\0'; ++i) {
+        char ch = raw[i];
+        if (ch == '.') {
+            if (seen_dot) {
+                return -1;
+            }
+            seen_dot = true;
+            continue;
+        }
+        if (ch < '0' || ch > '9') {
+            return -1;
+        }
+        if (!seen_dot) {
+            whole = whole * 10 + (int64_t)(ch - '0');
+        } else if (frac_digits < 3) {
+            frac = frac * 10 + (int64_t)(ch - '0');
+            frac_digits += 1;
+        }
+    }
+    while (frac_digits < 3) {
+        frac *= 10;
+        frac_digits += 1;
+    }
+    return whole * 1000 + frac;
+}
+
+static bool v3_bench_dataset_load_file(const char *path,
+                                       V3BenchDataset *dataset) {
+    char *text = v3_read_file(path);
+    char *cursor;
+    if (text == NULL) {
+        return false;
+    }
+    cursor = text;
+    while (cursor != NULL && *cursor != '\0') {
+        char *next = strchr(cursor, '\n');
+        char name[256];
+        char ns_text[64];
+        int64_t ns_per_op_milli;
+        char *line;
+        if (next != NULL) {
+            *next = '\0';
+            next += 1;
+        }
+        line = v3_trim_inplace(cursor);
+        if (*line != '\0' && !v3_startswith(line, "sink=")) {
+            v3_bench_first_field(line, name, sizeof(name));
+            v3_bench_find_value(line, "ns_per_op=", ns_text, sizeof(ns_text));
+            ns_per_op_milli = v3_bench_parse_decimal_milli(ns_text);
+            if (name[0] != '\0' && ns_per_op_milli >= 0) {
+                v3_bench_dataset_push(dataset, name, ns_per_op_milli);
+            }
+        }
+        cursor = next;
+    }
+    free(text);
+    return true;
+}
+
+static int64_t v3_bench_dataset_lookup(const V3BenchDataset *dataset,
+                                       const char *name) {
+    size_t i;
+    for (i = 0U; i < dataset->len; ++i) {
+        if (v3_streq(dataset->items[i].name, name)) {
+            return dataset->items[i].ns_per_op_milli;
+        }
+    }
+    return -1;
+}
+
+static void v3_bench_milli_text(int64_t value,
+                                char *out,
+                                size_t cap) {
+    if (value < 0) {
+        snprintf(out, cap, "missing");
+        return;
+    }
+    snprintf(out, cap, "%lld.%03lld", (long long)(value / 1000), (long long)(value % 1000));
+}
+
+static int v3_compare_bench_files(const char *baseline_path,
+                                  const char *candidate_path,
+                                  int64_t max_ratio_milli) {
+    V3BenchDataset baseline;
+    V3BenchDataset candidate;
+    char *report;
+    size_t cap = 4096U;
+    size_t used = 0U;
+    size_t i;
+    bool ok = true;
+    char line[512];
+    char base_text[64];
+    char cand_text[64];
+    char ratio_text[64];
+    v3_bench_dataset_init(&baseline);
+    v3_bench_dataset_init(&candidate);
+    if (!v3_path_exists_nonempty(baseline_path)) {
+        fprintf(stderr, "[cheng_v3_seed] compare-bench baseline file not found: %s\n", baseline_path);
+        return 1;
+    }
+    if (!v3_path_exists_nonempty(candidate_path)) {
+        fprintf(stderr, "[cheng_v3_seed] compare-bench candidate file not found: %s\n", candidate_path);
+        return 1;
+    }
+    if (!v3_bench_dataset_load_file(baseline_path, &baseline)) {
+        fprintf(stderr, "[cheng_v3_seed] compare-bench failed to read baseline: %s\n", baseline_path);
+        return 1;
+    }
+    if (!v3_bench_dataset_load_file(candidate_path, &candidate)) {
+        fprintf(stderr, "[cheng_v3_seed] compare-bench failed to read candidate: %s\n", candidate_path);
+        v3_bench_dataset_free(&baseline);
+        return 1;
+    }
+    report = (char *)v3_xmalloc(cap);
+    report[0] = '\0';
+    v3_report_append(&report, &cap, &used, "bench base_ns cand_ns ratio");
+    for (i = 0U; i < baseline.len; ++i) {
+        int64_t candidate_milli = v3_bench_dataset_lookup(&candidate, baseline.items[i].name);
+        v3_bench_milli_text(baseline.items[i].ns_per_op_milli, base_text, sizeof(base_text));
+        v3_bench_milli_text(candidate_milli, cand_text, sizeof(cand_text));
+        if (candidate_milli < 0) {
+            snprintf(line,
+                     sizeof(line),
+                     "%s %s %s NA",
+                     baseline.items[i].name,
+                     base_text,
+                     cand_text);
+            ok = false;
+        } else {
+            int64_t ratio_milli = (candidate_milli * 1000) / baseline.items[i].ns_per_op_milli;
+            v3_bench_milli_text(ratio_milli, ratio_text, sizeof(ratio_text));
+            snprintf(line,
+                     sizeof(line),
+                     "%s %s %s %s",
+                     baseline.items[i].name,
+                     base_text,
+                     cand_text,
+                     ratio_text);
+            if (max_ratio_milli > 0 && ratio_milli > max_ratio_milli) {
+                ok = false;
+            }
+        }
+        v3_report_append(&report, &cap, &used, line);
+    }
+    for (i = 0U; i < candidate.len; ++i) {
+        if (v3_bench_dataset_lookup(&baseline, candidate.items[i].name) >= 0) {
+            continue;
+        }
+        v3_bench_milli_text(candidate.items[i].ns_per_op_milli, cand_text, sizeof(cand_text));
+        snprintf(line,
+                 sizeof(line),
+                 "%s missing %s NA",
+                 candidate.items[i].name,
+                 cand_text);
+        v3_report_append(&report, &cap, &used, line);
+        ok = false;
+    }
+    v3_report_append(&report, &cap, &used, ok ? "v3 compare: ok" : "v3 compare: failed");
+    fputs(report, stdout);
+    free(report);
+    v3_bench_dataset_free(&baseline);
+    v3_bench_dataset_free(&candidate);
+    return ok ? 0 : 1;
+}
+
+static int v3_cmd_compare_bench(int argc, char **argv) {
+    const char *baseline_path = v3_flag_value(argc, argv, "--baseline");
+    const char *candidate_path = v3_flag_value(argc, argv, "--candidate");
+    const char *max_ratio_text = v3_flag_value(argc, argv, "--max-ratio-milli");
+    int64_t max_ratio_milli = 0;
+    if (baseline_path == NULL || baseline_path[0] == '\0' ||
+        candidate_path == NULL || candidate_path[0] == '\0') {
+        fprintf(stderr,
+                "[cheng_v3_seed] compare-bench requires --baseline:<file> and --candidate:<file>\n");
+        return 1;
+    }
+    if (max_ratio_text != NULL && max_ratio_text[0] != '\0') {
+        char *end = NULL;
+        errno = 0;
+        max_ratio_milli = strtoll(max_ratio_text, &end, 10);
+        if (errno != 0 || end == max_ratio_text || *end != '\0') {
+            fprintf(stderr, "[cheng_v3_seed] compare-bench invalid --max-ratio-milli: %s\n", max_ratio_text);
+            return 1;
+        }
+    }
+    return v3_compare_bench_files(baseline_path, candidate_path, max_ratio_milli);
+}
+
+typedef int (*V3SeedCommandFn)(int argc, char **argv);
+
+static bool v3_text_contains_substring(const char *text, const char *needle) {
+    return text != NULL && needle != NULL && strstr(text, needle) != NULL;
+}
+
+static bool v3_text_has_line(const char *text, const char *line) {
+    size_t want_len = strlen(line);
+    const char *cursor = text;
+    if (text == NULL || line == NULL) {
+        return false;
+    }
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        if (len == want_len && strncmp(cursor, line, want_len) == 0) {
+            return true;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
+static bool v3_text_has_line_with_prefix(const char *text, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    const char *cursor = text;
+    if (text == NULL || prefix == NULL) {
+        return false;
+    }
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        if (len >= prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
+            return true;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
+static bool v3_text_has_positive_integer_line(const char *text, const char *prefix) {
+    size_t prefix_len = strlen(prefix);
+    const char *cursor = text;
+    if (text == NULL || prefix == NULL) {
+        return false;
+    }
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        if (len > prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
+            size_t i;
+            long long value = 0;
+            bool all_digits = true;
+            for (i = prefix_len; i < len; ++i) {
+                if (cursor[i] < '0' || cursor[i] > '9') {
+                    all_digits = false;
+                    break;
+                }
+                value = value * 10 + (long long)(cursor[i] - '0');
+            }
+            if (all_digits && value > 0) {
+                return true;
+            }
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
+static const char *v3_text_after_marker(const char *text, const char *marker) {
+    const char *hit;
+    if (text == NULL || marker == NULL) {
+        return NULL;
+    }
+    hit = strstr(text, marker);
+    if (hit == NULL) {
+        return NULL;
+    }
+    return hit + strlen(marker);
+}
+
+static bool v3_expect_text_has_line(const char *label, const char *text, const char *line) {
+    if (v3_text_has_line(text, line)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s missing line: %s\n", label, line);
+    return false;
+}
+
+static bool v3_expect_text_has_prefix(const char *label, const char *text, const char *prefix) {
+    if (v3_text_has_line_with_prefix(text, prefix)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s missing line prefix: %s\n", label, prefix);
+    return false;
+}
+
+static bool v3_expect_text_contains(const char *label, const char *text, const char *needle) {
+    if (v3_text_contains_substring(text, needle)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s missing text: %s\n", label, needle);
+    return false;
+}
+
+static bool v3_expect_file_exists_nonempty(const char *label, const char *path) {
+    if (v3_path_exists_nonempty(path)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s missing file: %s\n", label, path);
+    return false;
+}
+
+static bool v3_status_is_exit_code(int status, int code);
+static char *v3_debug_object_report(const char *path);
+
+static bool v3_run_binary_capture_output(char *const argv_local[],
+                                         const char *log_path,
+                                         int *status_out) {
+    pid_t pid;
+    int status = 0;
+    FILE *log_file = NULL;
+    if (!v3_ensure_parent_dir(log_path)) {
+        return false;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return false;
+    }
+    if (pid == 0) {
+        log_file = fopen(log_path, "wb");
+        if (log_file == NULL) {
+            perror("fopen");
+            _exit(127);
+        }
+        if (dup2(fileno(log_file), STDOUT_FILENO) < 0 ||
+            dup2(fileno(log_file), STDERR_FILENO) < 0) {
+            perror("dup2");
+            fclose(log_file);
+            _exit(127);
+        }
+        fclose(log_file);
+        execv(argv_local[0], argv_local);
+        perror("execv");
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return false;
+    }
+    if (status_out != NULL) {
+        *status_out = status;
+    }
+    return true;
+}
+
+static bool v3_spawn_binary_capture_output(char *const argv_local[],
+                                           const char *log_path,
+                                           pid_t *pid_out) {
+    pid_t pid;
+    FILE *log_file = NULL;
+    if (pid_out != NULL) {
+        *pid_out = -1;
+    }
+    if (!v3_ensure_parent_dir(log_path)) {
+        return false;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return false;
+    }
+    if (pid == 0) {
+        log_file = fopen(log_path, "wb");
+        if (log_file == NULL) {
+            perror("fopen");
+            _exit(127);
+        }
+        if (dup2(fileno(log_file), STDOUT_FILENO) < 0 ||
+            dup2(fileno(log_file), STDERR_FILENO) < 0) {
+            perror("dup2");
+            fclose(log_file);
+            _exit(127);
+        }
+        fclose(log_file);
+        execv(argv_local[0], argv_local);
+        perror("execv");
+        _exit(127);
+    }
+    if (pid_out != NULL) {
+        *pid_out = pid;
+    }
+    return true;
+}
+
+static void v3_kill_and_wait_pid(pid_t *pid_io) {
+    int status = 0;
+    if (pid_io == NULL || *pid_io <= 0) {
+        return;
+    }
+    kill(*pid_io, SIGTERM);
+    if (waitpid(*pid_io, &status, 0) < 0 && errno != ECHILD) {
+        perror("waitpid");
+    }
+    *pid_io = -1;
+}
+
+static bool v3_wait_pid_success(pid_t *pid_io,
+                                const char *label,
+                                const char *log_path) {
+    int status = 0;
+    if (pid_io == NULL || *pid_io <= 0) {
+        return false;
+    }
+    if (waitpid(*pid_io, &status, 0) < 0) {
+        perror("waitpid");
+        return false;
+    }
+    *pid_io = -1;
+    if (v3_status_is_exit_code(status, 0)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s failed log=%s status=%d\n", label, log_path, status);
+    return false;
+}
+
+static bool v3_process_alive(pid_t pid) {
+    if (pid <= 0) {
+        return false;
+    }
+    if (kill(pid, 0) == 0 || errno == EPERM) {
+        return true;
+    }
+    return false;
+}
+
+static bool v3_read_trimmed_file_text(const char *path,
+                                      char *out,
+                                      size_t out_cap) {
+    char *text = v3_read_file(path);
+    char *trimmed;
+    if (text == NULL) {
+        return false;
+    }
+    trimmed = v3_trim_inplace(text);
+    if (*trimmed == '\0') {
+        free(text);
+        return false;
+    }
+    v3_copy_text(out, out_cap, trimmed);
+    free(text);
+    return true;
+}
+
+static bool v3_wait_ready_port_file(const char *label,
+                                    const char *ready_path,
+                                    pid_t pid,
+                                    int timeout_ms,
+                                    char *port_out,
+                                    size_t port_cap) {
+    int ticks = timeout_ms / 50;
+    int i;
+    for (i = 0; i < ticks; ++i) {
+        if (v3_path_exists_nonempty(ready_path) &&
+            v3_read_trimmed_file_text(ready_path, port_out, port_cap)) {
+            return true;
+        }
+        if (!v3_process_alive(pid)) {
+            break;
+        }
+        usleep(50000);
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s ready-file timeout: %s\n", label, ready_path);
+    return false;
+}
+
+static bool v3_status_is_exit_code(int status, int code) {
+    return WIFEXITED(status) && WEXITSTATUS(status) == code;
+}
+
+static bool v3_exec_sh_script(const char *script_path,
+                              size_t arg_count,
+                              const char **args,
+                              const char *env_key_a,
+                              const char *env_value_a,
+                              const char *env_key_b,
+                              const char *env_value_b,
+                              int *exit_code_out) {
+    char **exec_argv;
+    pid_t child_pid;
+    int status = 0;
+    size_t i;
+    exec_argv = (char **)v3_xmalloc(sizeof(char *) * (arg_count + 3U));
+    exec_argv[0] = (char *)"sh";
+    exec_argv[1] = (char *)script_path;
+    for (i = 0U; i < arg_count; ++i) {
+        exec_argv[i + 2U] = (char *)(args[i] != NULL ? args[i] : "");
+    }
+    exec_argv[arg_count + 2U] = NULL;
+    child_pid = fork();
+    if (child_pid < 0) {
+        fprintf(stderr, "[cheng_v3_seed] fork failed for script=%s errno=%d\n", script_path, errno);
+        free(exec_argv);
+        return false;
+    }
+    if (child_pid == 0) {
+        if (env_key_a != NULL && env_value_a != NULL) {
+            setenv(env_key_a, env_value_a, 1);
+        }
+        if (env_key_b != NULL && env_value_b != NULL) {
+            setenv(env_key_b, env_value_b, 1);
+        }
+        execv("/bin/sh", exec_argv);
+        fprintf(stderr, "[cheng_v3_seed] execv failed for script=%s errno=%d\n", script_path, errno);
+        _exit(127);
+    }
+    free(exec_argv);
+    while (waitpid(child_pid, &status, 0) < 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+        fprintf(stderr, "[cheng_v3_seed] waitpid failed for script=%s errno=%d\n", script_path, errno);
+        if (exit_code_out != NULL) {
+            *exit_code_out = 1;
+        }
+        return false;
+    }
+    if (!WIFEXITED(status)) {
+        fprintf(stderr, "[cheng_v3_seed] script command failed status=%d script=%s\n", status, script_path);
+        if (exit_code_out != NULL) {
+            *exit_code_out = 1;
+        }
+        return false;
+    }
+    if (exit_code_out != NULL) {
+        *exit_code_out = WEXITSTATUS(status);
+    }
+    if (WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] script command failed status=%d exit=%d script=%s\n",
+                status,
+                WEXITSTATUS(status),
+                script_path);
+        return false;
+    }
+    return true;
+}
+
+static bool v3_run_script_passthrough(const char *root,
+                                      const char *script_rel_path,
+                                      int argc,
+                                      char **argv) {
+    char script_path[PATH_MAX];
+    const char **args;
+    size_t arg_count;
+    int i;
+    v3_join_path(script_path, sizeof(script_path), root, script_rel_path);
+    arg_count = argc > 2 ? (size_t)(argc - 2) : 0U;
+    args = arg_count > 0U ? (const char **)v3_xmalloc(sizeof(char *) * arg_count) : NULL;
+    for (i = 2; i < argc; ++i) {
+        args[(size_t)(i - 2)] = argv[i];
+    }
+    {
+        bool ok = v3_exec_sh_script(script_path, arg_count, args, NULL, NULL, NULL, NULL, NULL);
+        free(args);
+        return ok;
+    }
+}
+
+static void v3_save_env_value(const char *key,
+                              char *out,
+                              size_t cap,
+                              bool *had_value) {
+    const char *value = getenv(key);
+    if (had_value != NULL) {
+        *had_value = value != NULL && value[0] != '\0';
+    }
+    if (out != NULL && cap > 0U) {
+        out[0] = '\0';
+        if (value != NULL && value[0] != '\0') {
+            v3_copy_text(out, cap, value);
+        }
+    }
+}
+
+static void v3_restore_env_value(const char *key,
+                                 const char *saved,
+                                 bool had_value) {
+    if (had_value) {
+        setenv(key, saved, 1);
+    } else {
+        unsetenv(key);
+    }
+}
+
+static bool v3_run_script_args(const char *root,
+                               const char *script_rel_path,
+                               size_t arg_count,
+                               const char **args) {
+    char script_path[PATH_MAX];
+    v3_join_path(script_path, sizeof(script_path), root, script_rel_path);
+    return v3_exec_sh_script(script_path, arg_count, args, NULL, NULL, NULL, NULL, NULL);
+}
+
+static bool v3_run_script_args_with_env(const char *root,
+                                        const char *script_rel_path,
+                                        const char *compiler_env_key,
+                                        const char *compiler_env_value,
+                                        const char *label_env_key,
+                                        const char *label_env_value,
+                                        bool stage23_env,
+                                        size_t arg_count,
+                                        const char **args) {
+    char saved_compiler[PATH_MAX];
+    char saved_label[256];
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_compiler = false;
+    bool had_label = false;
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    bool ok;
+    if (compiler_env_key != NULL && compiler_env_value != NULL && compiler_env_value[0] != '\0') {
+        v3_save_env_value(compiler_env_key, saved_compiler, sizeof(saved_compiler), &had_compiler);
+        setenv(compiler_env_key, compiler_env_value, 1);
+    }
+    if (label_env_key != NULL && label_env_value != NULL && label_env_value[0] != '\0') {
+        v3_save_env_value(label_env_key, saved_label, sizeof(saved_label), &had_label);
+        setenv(label_env_key, label_env_value, 1);
+    }
+    if (stage23_env) {
+        v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+        v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+        setenv("BACKEND_INCREMENTAL", "0", 1);
+        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    }
+    ok = v3_run_script_args(root, script_rel_path, arg_count, args);
+    if (stage23_env) {
+        v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+        v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    }
+    if (label_env_key != NULL && label_env_value != NULL && label_env_value[0] != '\0') {
+        v3_restore_env_value(label_env_key, saved_label, had_label);
+    }
+    if (compiler_env_key != NULL && compiler_env_value != NULL && compiler_env_value[0] != '\0') {
+        v3_restore_env_value(compiler_env_key, saved_compiler, had_compiler);
+    }
+    return ok;
+}
+
+static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv);
+static int v3_cmd_verify_debug_tools_impl(int argc, char **argv);
+static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv);
+static int v3_cmd_verify_debug_profile_impl(int argc, char **argv);
+static int v3_cmd_verify_windows_builtin_impl(int argc, char **argv);
+static int v3_cmd_verify_riscv64_builtin_impl(int argc, char **argv);
+static int v3_cmd_run_cross_target_smokes_impl(int argc, char **argv);
+static int v3_cmd_run_host_smokes_impl(int argc, char **argv);
+static int v3_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv);
+static int v3_cmd_r2c_react_v3_impl(int argc, char **argv);
+static int v3_cmd_build_zero_exit_impl(int argc, char **argv);
+static int v3_cmd_build_panic_trace_impl(int argc, char **argv);
+static int v3_cmd_build_bounds_trace_impl(int argc, char **argv);
+static int v3_cmd_build_signal_trace_impl(int argc, char **argv);
+static int v3_cmd_build_call_chain_impl(int argc, char **argv);
+static int v3_cmd_build_ffi_handle_impl(int argc, char **argv);
+static int v3_cmd_build_program_selfhost_impl(int argc, char **argv);
+static int v3_cmd_build_chain_node_impl(int argc, char **argv);
+static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv);
+static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv);
+static int v3_cmd_run_linux_object_smokes_impl(int argc, char **argv);
+static int v3_cmd_run_tcp_twoproc_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_udp_importc_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv);
+static int v3_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_chain_node_process_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_chain_node_three_node_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_tailnet_control_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv);
+static int v3_cmd_run_migration_gate_impl(int argc, char **argv);
+static int v3_cmd_run_browser_webrtc_smokes_impl(int argc, char **argv);
+static bool v3_verify_runtime_fixture_output(const char *label,
+                                             const char *fixture_path,
+                                             const char *run_log_path,
+                                             const char *message_substring,
+                                             const char *reason_line,
+                                             bool require_signal_fields);
+static size_t v3_collect_smoke_positionals(int argc,
+                                           char **argv,
+                                           const char **out,
+                                           size_t cap);
+static bool v3_run_fixture_smoke_direct(const char *suite_label,
+                                        const char *compile_label,
+                                        const char *compiler_bin,
+                                        const char *root,
+                                        const char *root_v3,
+                                        const char *smoke_name,
+                                        const char *out_bin);
+
+static int v3_cmd_r2c_react_v3_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char script_path[PATH_MAX];
+    const char *controller_label = "cheng.stage3";
+    const char **args;
+    size_t arg_count;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] r2c-react-v3 root detect failed\n");
+        return 1;
+    }
+    v3_join_path(script_path,
+                 sizeof(script_path),
+                 paths.root,
+                 "v3/experimental/r2c-react-v3/r2c-react-v3");
+    if (strstr(argv[0] != NULL ? argv[0] : "", "/v3_backend_driver/") != NULL) {
+        controller_label = "cheng.backend_driver";
+    }
+    arg_count = argc > 2 ? (size_t)(argc - 2) : 0U;
+    args = arg_count > 0U ? (const char **)v3_xmalloc(sizeof(char *) * arg_count) : NULL;
+    {
+        int i;
+        for (i = 2; i < argc; ++i) {
+            args[(size_t)(i - 2)] = argv[i] != NULL ? argv[i] : "";
+        }
+    }
+    {
+        int exit_code = 0;
+        bool ok = v3_exec_sh_script(script_path,
+                                    arg_count,
+                                    args,
+                                    "R2C_REACT_V3_NO_STAGE3_HANDOFF",
+                                    "1",
+                                    "R2C_REACT_V3_CONTROLLER",
+                                    controller_label,
+                                    &exit_code);
+        free(args);
+        return ok ? 0 : (exit_code > 0 ? exit_code : 1);
+    }
+}
+
+static int v3_invoke_command_with_common_flags(V3SeedCommandFn fn,
+                                               const char *cmd_name,
+                                               const char *contract_path,
+                                               const char *root_path,
+                                               const char *source_path,
+                                               const char *emit,
+                                               const char *target,
+                                               const char *out_path,
+                                               const char *report_path) {
+    char contract_flag[PATH_MAX + 32];
+    char root_flag[PATH_MAX + 16];
+    char in_flag[PATH_MAX + 16];
+    char emit_flag[64];
+    char target_flag[256];
+    char out_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 24];
+    char *argv_local[10];
+    int argc_local = 0;
+    argv_local[argc_local++] = "cheng_v3_seed";
+    argv_local[argc_local++] = (char *)cmd_name;
+    if (contract_path != NULL && contract_path[0] != '\0') {
+        snprintf(contract_flag, sizeof(contract_flag), "--contract-in:%s", contract_path);
+        argv_local[argc_local++] = contract_flag;
+    }
+    if (root_path != NULL && root_path[0] != '\0') {
+        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_path);
+        argv_local[argc_local++] = root_flag;
+    }
+    if (source_path != NULL && source_path[0] != '\0') {
+        snprintf(in_flag, sizeof(in_flag), "--in:%s", source_path);
+        argv_local[argc_local++] = in_flag;
+    }
+    if (emit != NULL && emit[0] != '\0') {
+        snprintf(emit_flag, sizeof(emit_flag), "--emit:%s", emit);
+        argv_local[argc_local++] = emit_flag;
+    }
+    if (target != NULL && target[0] != '\0') {
+        snprintf(target_flag, sizeof(target_flag), "--target:%s", target);
+        argv_local[argc_local++] = target_flag;
+    }
+    if (out_path != NULL && out_path[0] != '\0') {
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", out_path);
+        argv_local[argc_local++] = out_flag;
+    }
+    if (report_path != NULL && report_path[0] != '\0') {
+        snprintf(report_flag, sizeof(report_flag), "--report-out:%s", report_path);
+        argv_local[argc_local++] = report_flag;
+    }
+    return fn(argc_local, argv_local);
+}
+
+static int v3_cmd_profile_run(int argc, char **argv);
+static int v3_cmd_debug_report(int argc, char **argv);
+static int v3_cmd_print_symbols(int argc, char **argv);
+static int v3_cmd_print_line_map(int argc, char **argv);
+static int v3_cmd_print_object(int argc, char **argv);
+static int v3_cmd_print_elf(int argc, char **argv);
+static int v3_cmd_print_asm(int argc, char **argv);
+static int v3_cmd_system_link_exec(int argc, char **argv);
+
+static int v3_invoke_profile_run(const char *contract_path,
+                                 const char *root_path,
+                                 const char *source_path,
+                                 const char *target,
+                                 const char *out_path,
+                                 const char *profile_hz,
+                                 const char *report_path) {
+    char contract_flag[PATH_MAX + 32];
+    char root_flag[PATH_MAX + 16];
+    char in_flag[PATH_MAX + 16];
+    char emit_flag[64];
+    char target_flag[256];
+    char out_flag[PATH_MAX + 16];
+    char hz_flag[64];
+    char report_flag[PATH_MAX + 24];
+    char *argv_local[10];
+    int argc_local = 0;
+    argv_local[argc_local++] = "cheng_v3_seed";
+    argv_local[argc_local++] = "profile-run";
+    if (contract_path != NULL && contract_path[0] != '\0') {
+        snprintf(contract_flag, sizeof(contract_flag), "--contract-in:%s", contract_path);
+        argv_local[argc_local++] = contract_flag;
+    }
+    if (root_path != NULL && root_path[0] != '\0') {
+        snprintf(root_flag, sizeof(root_flag), "--root:%s", root_path);
+        argv_local[argc_local++] = root_flag;
+    }
+    snprintf(in_flag, sizeof(in_flag), "--in:%s", source_path);
+    argv_local[argc_local++] = in_flag;
+    snprintf(emit_flag, sizeof(emit_flag), "--emit:exe");
+    argv_local[argc_local++] = emit_flag;
+    snprintf(target_flag, sizeof(target_flag), "--target:%s", target);
+    argv_local[argc_local++] = target_flag;
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", out_path);
+    argv_local[argc_local++] = out_flag;
+    if (profile_hz != NULL && profile_hz[0] != '\0') {
+        snprintf(hz_flag, sizeof(hz_flag), "--profile-hz:%s", profile_hz);
+        argv_local[argc_local++] = hz_flag;
+    }
+    if (report_path != NULL && report_path[0] != '\0') {
+        snprintf(report_flag, sizeof(report_flag), "--report-out:%s", report_path);
+        argv_local[argc_local++] = report_flag;
+    }
+    return v3_cmd_profile_run(argc_local, argv_local);
+}
+
+static bool v3_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
+                                                               const char *root_v3,
+                                                               const char *src_path,
+                                                               const char *emit_kind,
+                                                               const char *target,
+                                                               const char *out_path,
+                                                               const char *log_path,
+                                                               const char *report_path) {
+    char *quoted_bin = v3_shell_quote(compiler_bin);
+    char *quoted_root = v3_shell_quote(root_v3);
+    char *quoted_src = v3_shell_quote(src_path);
+    char *quoted_emit = v3_shell_quote(emit_kind);
+    char *quoted_target = v3_shell_quote(target);
+    char *quoted_out = v3_shell_quote(out_path);
+    char *quoted_report = report_path != NULL && report_path[0] != '\0' ? v3_shell_quote(report_path) : NULL;
+    size_t cap = strlen(quoted_bin) + strlen(quoted_root) + strlen(quoted_src) +
+                 strlen(quoted_emit) + strlen(quoted_target) + strlen(quoted_out) + 320U +
+                 (quoted_report != NULL ? strlen(quoted_report) : 0U);
+    char *command = (char *)v3_xmalloc(cap);
+    bool ok;
+    snprintf(command,
+             cap,
+             "%s system-link-exec --root:%s --in:%s --emit:%s --target:%s --out:%s%s%s",
+             quoted_bin,
+             quoted_root,
+             quoted_src,
+             quoted_emit,
+             quoted_target,
+             quoted_out,
+             quoted_report != NULL ? " --report-out:" : "",
+             quoted_report != NULL ? quoted_report : "");
+    free(quoted_bin);
+    free(quoted_root);
+    free(quoted_src);
+    free(quoted_emit);
+    free(quoted_target);
+    free(quoted_out);
+    free(quoted_report);
+    ok = v3_run_shell_command_logged(command, log_path, "ordinary fixture compile");
+    free(command);
+    return ok;
+}
+
+static bool v3_compile_fixture_with_backend_driver_target(const char *compiler_bin,
+                                                          const char *root_v3,
+                                                          const char *src_path,
+                                                          const char *target,
+                                                          const char *out_bin,
+                                                          const char *log_path) {
+    return v3_compile_fixture_with_backend_driver_emit_target(compiler_bin,
+                                                              root_v3,
+                                                              src_path,
+                                                              "exe",
+                                                              target,
+                                                              out_bin,
+                                                              log_path,
+                                                              NULL);
+}
+
+static int v3_cmd_c_ref(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char bench_dir[PATH_MAX];
+    char out_path[PATH_MAX];
+    char *command;
+    char *quoted_bench_dir;
+    char *log_text;
+    size_t cap = PATH_MAX * 4U;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] c-ref root detect failed\n");
+        return 1;
+    }
+    v3_join_path(bench_dir, sizeof(bench_dir), paths.root, "v3/bench/c_ref");
+    v3_join_path(out_path, sizeof(out_path), paths.root, "artifacts/v3_gate/c_ref_latest.txt");
+    if (!v3_ensure_parent_dir(out_path)) {
+        return 1;
+    }
+    quoted_bench_dir = v3_shell_quote(bench_dir);
+    command = (char *)v3_xmalloc(cap);
+    snprintf(command, cap, "make -C %s clean run", quoted_bench_dir);
+    free(quoted_bench_dir);
+    if (!v3_run_shell_command_logged(command, out_path, "c-ref")) {
+        log_text = v3_read_file(out_path);
+        if (log_text != NULL) {
+            fputs(log_text, stderr);
+            free(log_text);
+        }
+        free(command);
+        return 1;
+    }
+    free(command);
+    log_text = v3_read_file(out_path);
+    if (log_text != NULL) {
+        fputs(log_text, stdout);
+        free(log_text);
+    }
+    return 0;
+}
+
+static int v3_cmd_slice_gate(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char baseline_path[PATH_MAX];
+    char candidate_path[PATH_MAX];
+    char saved_chain_node_linux_artifact[64];
+    char saved_chain_node_run_self_test[64];
+    char saved_rwad_bft_linux_artifact[64];
+    char saved_rwad_bft_run_self_test[64];
+    char *host_fixed_argv[3];
+    char *host_default_argv[3];
+    char *host_full_argv[2];
+    char *stage23_full_argv[2];
+    const char *saved_env;
+    bool had_chain_node_linux_artifact = false;
+    bool had_chain_node_run_self_test = false;
+    bool had_rwad_bft_linux_artifact = false;
+    bool had_rwad_bft_run_self_test = false;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] slice-gate root detect failed\n");
+        return 1;
+    }
+    puts("[v3 gate] hot-path forbidden scan");
+    if (v3_cmd_scan_hotpath(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] same-machine C baseline");
+    if (v3_cmd_c_ref(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(baseline_path, sizeof(baseline_path), paths.root, "v3/bench/c_ref/baseline_arm64_apple_darwin.txt");
+    v3_join_path(candidate_path, sizeof(candidate_path), paths.root, "artifacts/v3_gate/c_ref_latest.txt");
+    if (v3_path_exists_nonempty(baseline_path)) {
+        puts("[v3 gate] frozen-vs-latest C baseline");
+        if (v3_compare_bench_files(baseline_path, candidate_path, 0) != 0) {
+            return 1;
+        }
+    }
+    puts("[v3 gate] bootstrap bridge");
+    if (v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] canonical backend driver");
+    if (v3_cmd_build_backend_driver(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] zero-exit ordinary compile");
+    if (v3_cmd_build_zero_exit_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] panic-trace ordinary compile");
+    if (v3_cmd_build_panic_trace_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] bounds-trace ordinary compile");
+    if (v3_cmd_build_bounds_trace_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] signal-trace ordinary compile");
+    if (v3_cmd_build_signal_trace_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] orphan guard");
+    if (v3_cmd_verify_orphan_guard_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] debug tools");
+    if (v3_cmd_verify_debug_tools_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] debug runtime");
+    if (v3_cmd_verify_debug_runtime_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] debug profile");
+    if (v3_cmd_verify_debug_profile_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] call-chain ordinary compile");
+    if (v3_cmd_build_call_chain_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] ffi-handle ordinary compile");
+    if (v3_cmd_build_ffi_handle_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] program-selfhost");
+    if (v3_cmd_build_program_selfhost_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] chain_node");
+    if (v3_cmd_build_chain_node_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] linux aarch64 object smokes");
+    if (v3_cmd_run_linux_object_smokes_impl(0, NULL) != 0) {
+        return 1;
+    }
+    saved_env = getenv("CHAIN_NODE_LINUX_ARTIFACT");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_chain_node_linux_artifact = true;
+        v3_copy_text(saved_chain_node_linux_artifact, sizeof(saved_chain_node_linux_artifact), saved_env);
+    }
+    saved_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_chain_node_run_self_test = true;
+        v3_copy_text(saved_chain_node_run_self_test, sizeof(saved_chain_node_run_self_test), saved_env);
+    }
+    saved_env = getenv("RWAD_BFT_LINUX_ARTIFACT");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_rwad_bft_linux_artifact = true;
+        v3_copy_text(saved_rwad_bft_linux_artifact, sizeof(saved_rwad_bft_linux_artifact), saved_env);
+    }
+    saved_env = getenv("RWAD_BFT_RUN_SELF_TEST");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_rwad_bft_run_self_test = true;
+        v3_copy_text(saved_rwad_bft_run_self_test, sizeof(saved_rwad_bft_run_self_test), saved_env);
+    }
+    setenv("CHAIN_NODE_LINUX_ARTIFACT", "exe", 1);
+    setenv("CHAIN_NODE_RUN_SELF_TEST", "0", 1);
+    puts("[v3 gate] chain_node linux exe");
+    if (v3_cmd_build_chain_node_linux_impl(0, NULL) != 0) {
+        return 1;
+    }
+    setenv("RWAD_BFT_LINUX_ARTIFACT", "exe", 1);
+    setenv("RWAD_BFT_RUN_SELF_TEST", "0", 1);
+    puts("[v3 gate] rwad_bft linux exe");
+    if (v3_cmd_build_rwad_bft_linux_impl(0, NULL) != 0) {
+        return 1;
+    }
+    if (had_chain_node_linux_artifact) {
+        setenv("CHAIN_NODE_LINUX_ARTIFACT", saved_chain_node_linux_artifact, 1);
+    } else {
+        unsetenv("CHAIN_NODE_LINUX_ARTIFACT");
+    }
+    if (had_chain_node_run_self_test) {
+        setenv("CHAIN_NODE_RUN_SELF_TEST", saved_chain_node_run_self_test, 1);
+    } else {
+        unsetenv("CHAIN_NODE_RUN_SELF_TEST");
+    }
+    if (had_rwad_bft_linux_artifact) {
+        setenv("RWAD_BFT_LINUX_ARTIFACT", saved_rwad_bft_linux_artifact, 1);
+    } else {
+        unsetenv("RWAD_BFT_LINUX_ARTIFACT");
+    }
+    if (had_rwad_bft_run_self_test) {
+        setenv("RWAD_BFT_RUN_SELF_TEST", saved_rwad_bft_run_self_test, 1);
+    } else {
+        unsetenv("RWAD_BFT_RUN_SELF_TEST");
+    }
+    puts("[v3 gate] bootstrap subset self-checks");
+    if (v3_cmd_run_smokes(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] host fixed256 sha256 smoke");
+    host_fixed_argv[0] = "cheng_v3_seed";
+    host_fixed_argv[1] = "run-host-smokes";
+    host_fixed_argv[2] = "fixed256_sha256_smoke";
+    if (v3_cmd_run_host_smokes_impl(3, host_fixed_argv) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] host default-init literals smoke");
+    host_default_argv[0] = "cheng_v3_seed";
+    host_default_argv[1] = "run-host-smokes";
+    host_default_argv[2] = "default_init_literals_smoke";
+    if (v3_cmd_run_host_smokes_impl(3, host_default_argv) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] cross-target builtin smokes");
+    if (v3_cmd_run_cross_target_smokes_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] v3 host smokes");
+    host_full_argv[0] = "cheng_v3_seed";
+    host_full_argv[1] = "run-host-smokes";
+    if (v3_cmd_run_host_smokes_impl(2, host_full_argv) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] stage2/stage3 libp2p smokes");
+    stage23_full_argv[0] = "cheng_v3_seed";
+    stage23_full_argv[1] = "run-stage23-libp2p-smokes";
+    if (v3_cmd_run_stage23_libp2p_smokes_impl(2, stage23_full_argv) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] ok");
+    return 0;
+}
+
+static bool v3_compile_host_fixture_with_backend_driver(const char *compiler_bin,
+                                                        const char *root_v3,
+                                                        const char *src_path,
+                                                        const char *out_bin,
+                                                        const char *log_path) {
+    return v3_compile_fixture_with_backend_driver_target(compiler_bin,
+                                                         root_v3,
+                                                         src_path,
+                                                         "arm64-apple-darwin",
+                                                         out_bin,
+                                                         log_path);
+}
+
+static bool v3_leaf_prepare_backend_driver(V3BootstrapPaths *paths,
+                                           char *root_v3,
+                                           size_t root_v3_cap) {
+    v3_bootstrap_paths_init(paths);
+    if (!v3_backend_driver_ready(paths) &&
+        v3_cmd_build_backend_driver(0, NULL) != 0) {
+        return false;
+    }
+    if (access(paths->backend_driver_out, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] missing backend driver: %s\n", paths->backend_driver_out);
+        return false;
+    }
+    v3_join_path(root_v3, root_v3_cap, paths->root, "v3");
+    return true;
+}
+
+static bool v3_dump_file_stdout(const char *path) {
+    char *text = v3_read_file(path);
+    if (text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] missing output log: %s\n", path);
+        return false;
+    }
+    fputs(text, stdout);
+    free(text);
+    return true;
+}
+
+static bool v3_expect_line_map_text(const char *label,
+                                    const char *line_map_path,
+                                    const char *fixture_substring,
+                                    bool require_header) {
+    char *text = v3_read_file(line_map_path);
+    bool ok = true;
+    if (text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s missing line-map: %s\n", label, line_map_path);
+        return false;
+    }
+    if (require_header) {
+        ok = ok && v3_expect_text_has_line(label, text, "v3_line_map_v1");
+    }
+    if (fixture_substring != NULL && fixture_substring[0] != '\0') {
+        ok = ok && v3_expect_text_contains(label, text, fixture_substring);
+    }
+    free(text);
+    return ok;
+}
+
+static const char *v3_host_target_triple(void) {
+#if defined(__APPLE__) && (defined(__aarch64__) || defined(__arm64__))
+    return "arm64-apple-darwin";
+#elif defined(__linux__) && defined(__x86_64__)
+    return "x86_64-unknown-linux-gnu";
+#elif defined(__linux__) && (defined(__aarch64__) || defined(__arm64__))
+    return "aarch64-unknown-linux-gnu";
+#else
+    return "";
+#endif
+}
+
+static int v3_cmd_build_zero_exit_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char line_map[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_zero_exit");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_zero_exit_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_zero_exit_fixture");
+    snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_zero_exit_fixture.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_zero_exit_fixture.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
+        !v3_expect_file_exists_nonempty("build-zero-exit line-map", line_map)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-zero-exit expected success log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_call_chain_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_call_chain");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_call_chain_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_call_chain_fixture");
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_call_chain_fixture.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_call_chain_fixture.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-call-chain expected success log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_program_selfhost_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_program_selfhost");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/program_selfhost_smoke.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "program_selfhost_smoke");
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "program_selfhost_smoke.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "program_selfhost_smoke.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-program-selfhost expected success log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_panic_trace_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char line_map[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_panic_trace");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_panic_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_panic_fixture");
+    snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_panic_fixture.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_panic_fixture.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
+        !v3_expect_file_exists_nonempty("build-panic-trace line-map", line_map) ||
+        !v3_expect_line_map_text("build-panic-trace line-map", line_map, "ordinary_panic_fixture.cheng", true)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("build-panic-trace",
+                                          src,
+                                          run_log,
+                                          "v3 panic fixture",
+                                          "[cheng-v3] reason=panic mode=backtrace",
+                                          false)) {
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_bounds_trace_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char line_map[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    char *run_text = NULL;
+    int status = 0;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_bounds_trace");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_bounds_trace_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_bounds_trace_fixture");
+    snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
+        !v3_expect_file_exists_nonempty("build-bounds-trace line-map", line_map)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("build-bounds-trace",
+                                          src,
+                                          run_log,
+                                          "[cheng] bounds check failed: idx=1 len=1",
+                                          "[cheng-v3] reason=bounds mode=backtrace",
+                                          false)) {
+        return 1;
+    }
+    run_text = v3_read_file(run_log);
+    if (run_text == NULL ||
+        !v3_expect_text_contains("build-bounds-trace", run_text, "ordinary_bounds_trace_fixture")) {
+        free(run_text);
+        return 1;
+    }
+    free(run_text);
+    rc = v3_dump_file_stdout(run_log) ? 0 : 1;
+    return rc;
+}
+
+static int v3_cmd_build_signal_trace_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char line_map[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_signal_trace");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_signal_trace_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_signal_trace_fixture");
+    snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
+        !v3_expect_file_exists_nonempty("build-signal-trace line-map", line_map)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("build-signal-trace",
+                                          src,
+                                          run_log,
+                                          "[cheng-v3] v3_crash_report_v1",
+                                          "[cheng-v3] reason=signal mode=signal",
+                                          true)) {
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_ffi_handle_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char ok_src[PATH_MAX];
+    char trap_src[PATH_MAX];
+    char ok_bin[PATH_MAX];
+    char trap_bin[PATH_MAX];
+    char ok_line_map[PATH_MAX];
+    char trap_line_map[PATH_MAX];
+    char ok_compile_log[PATH_MAX];
+    char trap_compile_log[PATH_MAX];
+    char ok_run_log[PATH_MAX];
+    char trap_run_log[PATH_MAX];
+    char *ok_argv[2];
+    char *trap_argv[2];
+    char *trap_text = NULL;
+    int status = 0;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_ffi_handle");
+    v3_join_path(ok_src, sizeof(ok_src), paths.root, "v3/src/tests/ffi_handle_smoke.cheng");
+    v3_join_path(trap_src, sizeof(trap_src), paths.root, "v3/src/tests/ffi_handle_stale_trap_smoke.cheng");
+    v3_join_path(ok_bin, sizeof(ok_bin), out_dir, "ffi_handle_smoke");
+    v3_join_path(trap_bin, sizeof(trap_bin), out_dir, "ffi_handle_stale_trap_smoke");
+    snprintf(ok_line_map, sizeof(ok_line_map), "%s.v3.map", ok_bin);
+    snprintf(trap_line_map, sizeof(trap_line_map), "%s.v3.map", trap_bin);
+    v3_join_path(ok_compile_log, sizeof(ok_compile_log), out_dir, "ffi_handle_smoke.compile.log");
+    v3_join_path(trap_compile_log, sizeof(trap_compile_log), out_dir, "ffi_handle_stale_trap_smoke.compile.log");
+    v3_join_path(ok_run_log, sizeof(ok_run_log), out_dir, "ffi_handle_smoke.run.log");
+    v3_join_path(trap_run_log, sizeof(trap_run_log), out_dir, "ffi_handle_stale_trap_smoke.run.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, ok_src, ok_bin, ok_compile_log) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, trap_src, trap_bin, trap_compile_log) ||
+        !v3_expect_file_exists_nonempty("build-ffi-handle ok line-map", ok_line_map) ||
+        !v3_expect_file_exists_nonempty("build-ffi-handle trap line-map", trap_line_map)) {
+        return 1;
+    }
+    ok_argv[0] = ok_bin;
+    ok_argv[1] = NULL;
+    trap_argv[0] = trap_bin;
+    trap_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(ok_argv, ok_run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-ffi-handle expected success log=%s\n", ok_run_log);
+        return 1;
+    }
+    if (!v3_run_binary_capture_output(trap_argv, trap_run_log, &status) ||
+        v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-ffi-handle expected trap log=%s\n", trap_run_log);
+        return 1;
+    }
+    trap_text = v3_read_file(trap_run_log);
+    if (trap_text == NULL ||
+        !v3_expect_text_contains("build-ffi-handle", trap_text, "[cheng] ffi handle invalid: op=resolve_ptr detail=released handle=") ||
+        !(v3_text_contains_substring(trap_text, "[cheng-v3] reason=ffi_handle mode=backtrace") ||
+          v3_text_contains_substring(trap_text, "[cheng-crash-trace] reason=ffi_handle")) ||
+        !v3_expect_text_contains("build-ffi-handle", trap_text, "ffi_handle_stale_trap_smoke.cheng:")) {
+        free(trap_text);
+        return 1;
+    }
+    free(trap_text);
+    if (!v3_dump_file_stdout(ok_run_log) || !v3_dump_file_stdout(trap_run_log)) {
+        return 1;
+    }
+    rc = 0;
+    return rc;
+}
+
+static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char default_out_dir[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char target_buf[256];
+    char *run_argv[3];
+    const char *target = getenv("CHAIN_NODE_TARGET");
+    const char *out_dir_env = getenv("CHAIN_NODE_OUT_DIR");
+    const char *out_bin_env = getenv("CHAIN_NODE_OUT_BIN");
+    const char *run_self_test_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
+    const char *host_target = v3_host_target_triple();
+    int status = 0;
+    bool run_self_test = false;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "arm64-apple-darwin";
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/chain_node_main.cheng");
+    v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node");
+    if (!v3_streq(target_buf, "arm64-apple-darwin")) {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    }
+    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
+        v3_copy_text(out_dir, sizeof(out_dir), out_dir_env);
+    } else {
+        v3_copy_text(out_dir, sizeof(out_dir), default_out_dir);
+    }
+    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
+        v3_copy_text(out_bin, sizeof(out_bin), out_bin_env);
+    } else {
+        v3_join_path(out_bin, sizeof(out_bin), out_dir, "chain_node");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "chain_node.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "chain_node.self-test.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_fixture_with_backend_driver_target(paths.backend_driver_out, root_v3, src, target_buf, out_bin, compile_log) ||
+        access(out_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-chain-node missing output: %s\n", out_bin);
+        return 1;
+    }
+    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !v3_streq(run_self_test_env, "auto")) {
+        run_self_test = !v3_streq(run_self_test_env, "0");
+    } else {
+        run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
+    }
+    if (!run_self_test) {
+        printf("v3 chain_node: build ok target=%s out=%s\n", target_buf, out_bin);
+        return 0;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = "self-test";
+    run_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-chain-node self-test failed log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static bool v3_text_is_decimal_digits(const char *text) {
+    size_t i;
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+    for (i = 0; text[i] != '\0'; ++i) {
+        if (text[i] < '0' || text[i] > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool v3_expect_linux_aarch64_object_report(const char *label,
+                                                  const char *path) {
+    char *text = v3_debug_object_report(path);
+    bool ok = true;
+    if (text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s object report missing: %s\n", label, path);
+        return false;
+    }
+    ok = ok && v3_expect_text_has_line(label, text, "v3_object_report_v1");
+    ok = ok && v3_expect_text_has_line(label, text, "format=elf64");
+    ok = ok && v3_expect_text_has_line(label, text, "machine=183");
+    ok = ok && v3_expect_text_has_prefix(label, text, "section_count=");
+    ok = ok && v3_expect_text_has_prefix(label, text, "symbol_count=");
+    free(text);
+    return ok;
+}
+
+static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char default_out_dir[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_path[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char target_buf[256];
+    const char *compiler_bin;
+    const char *compiler_env = getenv("CHENG_V3_CHAIN_NODE_COMPILER");
+    const char *target = getenv("CHAIN_NODE_TARGET");
+    const char *artifact_kind = getenv("CHAIN_NODE_LINUX_ARTIFACT");
+    const char *out_dir_env = getenv("CHAIN_NODE_OUT_DIR");
+    const char *out_bin_env = getenv("CHAIN_NODE_OUT_BIN");
+    const char *run_self_test_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
+    const char *host_target = v3_host_target_triple();
+    bool want_exe = false;
+    bool run_self_test = false;
+    char *run_argv[3];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = (compiler_env != NULL && compiler_env[0] != '\0') ? compiler_env : paths.backend_driver_out;
+    if (access(compiler_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-chain-node-linux missing compiler: %s\n", compiler_bin);
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (v3_streq(target, "arm64-unknown-linux-gnu")) {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (!v3_streq(target, "aarch64-unknown-linux-gnu")) {
+        if (v3_streq(target, "x86_64-unknown-linux-gnu")) {
+            fprintf(stderr, "v3 chain_node linux: unsupported target=%s\n", target);
+            fprintf(stderr, "v3 chain_node linux: x86_64 ordinary chain_node still has no verified Linux object or executable path\n");
+        } else {
+            fprintf(stderr, "v3 chain_node linux: unsupported target=%s\n", target);
+            fprintf(stderr, "v3 chain_node linux: supported linux target is aarch64-unknown-linux-gnu\n");
+        }
+        return 1;
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    if (artifact_kind != NULL && artifact_kind[0] != '\0') {
+        if (v3_streq(artifact_kind, "exe")) {
+            want_exe = true;
+        } else if (!v3_streq(artifact_kind, "obj")) {
+            fprintf(stderr, "v3 chain_node linux: unsupported artifact kind=%s\n", artifact_kind);
+            return 1;
+        }
+    }
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/chain_node_main.cheng");
+    if (want_exe) {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    } else {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node_obj");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    }
+    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
+        v3_copy_text(out_dir, sizeof(out_dir), out_dir_env);
+    } else {
+        v3_copy_text(out_dir, sizeof(out_dir), default_out_dir);
+    }
+    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
+        v3_copy_text(out_path, sizeof(out_path), out_bin_env);
+    } else {
+        v3_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "chain_node" : "chain_node.o");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "chain_node.compile.log" : "chain_node.obj.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "chain_node.self-test.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin,
+                                                            root_v3,
+                                                            src,
+                                                            want_exe ? "exe" : "obj",
+                                                            target_buf,
+                                                            out_path,
+                                                            compile_log,
+                                                            NULL) ||
+        !v3_expect_file_exists_nonempty("build-chain-node-linux output", out_path)) {
+        return 1;
+    }
+    if (!want_exe) {
+        if (!v3_expect_linux_aarch64_object_report("build-chain-node-linux", out_path)) {
+            return 1;
+        }
+        printf("v3 chain_node linux obj: build ok target=%s out=%s\n", target_buf, out_path);
+        return 0;
+    }
+    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !v3_streq(run_self_test_env, "auto")) {
+        run_self_test = !v3_streq(run_self_test_env, "0");
+    } else {
+        run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
+    }
+    if (!run_self_test) {
+        printf("v3 chain_node linux: build ok target=%s out=%s\n", target_buf, out_path);
+        return 0;
+    }
+    run_argv[0] = out_path;
+    run_argv[1] = "self-test";
+    run_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-chain-node-linux self-test failed log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char default_out_dir[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_path[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char target_buf[256];
+    const char *compiler_bin;
+    const char *compiler_env = getenv("CHENG_V3_RWAD_BFT_COMPILER");
+    const char *target = getenv("RWAD_BFT_TARGET");
+    const char *artifact_kind = getenv("RWAD_BFT_LINUX_ARTIFACT");
+    const char *out_dir_env = getenv("RWAD_BFT_OUT_DIR");
+    const char *out_bin_env = getenv("RWAD_BFT_OUT_BIN");
+    const char *run_self_test_env = getenv("RWAD_BFT_RUN_SELF_TEST");
+    const char *host_target = v3_host_target_triple();
+    bool want_exe = false;
+    bool run_self_test = false;
+    char *run_argv[3];
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = (compiler_env != NULL && compiler_env[0] != '\0') ? compiler_env : paths.backend_driver_out;
+    if (access(compiler_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-rwad-bft-linux missing compiler: %s\n", compiler_bin);
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (v3_streq(target, "arm64-unknown-linux-gnu")) {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (!v3_streq(target, "aarch64-unknown-linux-gnu")) {
+        if (v3_streq(target, "x86_64-unknown-linux-gnu")) {
+            fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported target=%s\n", target);
+            fprintf(stderr, "v3 rwad_bft_state_machine linux: x86_64 ordinary rwad_bft still has no verified Linux object or executable path\n");
+        } else {
+            fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported target=%s\n", target);
+            fprintf(stderr, "v3 rwad_bft_state_machine linux: supported linux target is aarch64-unknown-linux-gnu\n");
+        }
+        return 1;
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    if (artifact_kind != NULL && artifact_kind[0] != '\0') {
+        if (v3_streq(artifact_kind, "exe")) {
+            want_exe = true;
+        } else if (!v3_streq(artifact_kind, "obj")) {
+            fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported artifact kind=%s\n", artifact_kind);
+            return 1;
+        }
+    }
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/rwad_bft_state_machine_main.cheng");
+    if (want_exe) {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_rwad_bft_state_machine");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    } else {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_rwad_bft_state_machine_obj");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    }
+    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
+        v3_copy_text(out_dir, sizeof(out_dir), out_dir_env);
+    } else {
+        v3_copy_text(out_dir, sizeof(out_dir), default_out_dir);
+    }
+    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
+        v3_copy_text(out_path, sizeof(out_path), out_bin_env);
+    } else {
+        v3_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "rwad_bft_state_machine" : "rwad_bft_state_machine.o");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "rwad_bft_state_machine.compile.log" : "rwad_bft_state_machine.obj.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "rwad_bft_state_machine.self-test.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin,
+                                                            root_v3,
+                                                            src,
+                                                            want_exe ? "exe" : "obj",
+                                                            target_buf,
+                                                            out_path,
+                                                            compile_log,
+                                                            NULL) ||
+        !v3_expect_file_exists_nonempty("build-rwad-bft-linux output", out_path)) {
+        return 1;
+    }
+    if (!want_exe) {
+        if (!v3_expect_linux_aarch64_object_report("build-rwad-bft-linux", out_path)) {
+            return 1;
+        }
+        printf("v3 rwad_bft_state_machine linux obj: build ok target=%s out=%s\n", target_buf, out_path);
+        return 0;
+    }
+    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !v3_streq(run_self_test_env, "auto")) {
+        run_self_test = !v3_streq(run_self_test_env, "0");
+    } else {
+        run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
+    }
+    if (!run_self_test) {
+        printf("v3 rwad_bft_state_machine linux: build ok target=%s out=%s\n", target_buf, out_path);
+        return 0;
+    }
+    run_argv[0] = out_path;
+    run_argv[1] = "self-test";
+    run_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-rwad-bft-linux self-test failed log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_run_linux_object_smokes_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char chain_src[PATH_MAX];
+    char rwad_src[PATH_MAX];
+    char chain_out_dir[PATH_MAX];
+    char rwad_out_dir[PATH_MAX];
+    char chain_obj[PATH_MAX];
+    char rwad_obj[PATH_MAX];
+    char chain_log[PATH_MAX];
+    char rwad_log[PATH_MAX];
+    const char *target = "aarch64-unknown-linux-gnu";
+    (void)argc;
+    (void)argv;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    v3_join_path(chain_src, sizeof(chain_src), paths.root, "v3/src/project/chain_node_main.cheng");
+    v3_join_path(rwad_src, sizeof(rwad_src), paths.root, "v3/src/project/rwad_bft_state_machine_main.cheng");
+    v3_join_path(chain_out_dir, sizeof(chain_out_dir), paths.root, "artifacts/v3_chain_node_obj/aarch64-unknown-linux-gnu");
+    v3_join_path(rwad_out_dir, sizeof(rwad_out_dir), paths.root, "artifacts/v3_rwad_bft_state_machine_obj/aarch64-unknown-linux-gnu");
+    v3_join_path(chain_obj, sizeof(chain_obj), chain_out_dir, "chain_node.o");
+    v3_join_path(rwad_obj, sizeof(rwad_obj), rwad_out_dir, "rwad_bft_state_machine.o");
+    v3_join_path(chain_log, sizeof(chain_log), chain_out_dir, "chain_node.compile.log");
+    v3_join_path(rwad_log, sizeof(rwad_log), rwad_out_dir, "rwad_bft_state_machine.compile.log");
+    if (!v3_mkdir_p(chain_out_dir) ||
+        !v3_mkdir_p(rwad_out_dir) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
+                                                            root_v3,
+                                                            chain_src,
+                                                            "obj",
+                                                            target,
+                                                            chain_obj,
+                                                            chain_log,
+                                                            NULL) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
+                                                            root_v3,
+                                                            rwad_src,
+                                                            "obj",
+                                                            target,
+                                                            rwad_obj,
+                                                            rwad_log,
+                                                            NULL) ||
+        !v3_expect_file_exists_nonempty("run-linux-object-smokes chain_node", chain_obj) ||
+        !v3_expect_file_exists_nonempty("run-linux-object-smokes rwad_bft", rwad_obj) ||
+        !v3_expect_linux_aarch64_object_report("run-linux-object-smokes chain_node", chain_obj) ||
+        !v3_expect_linux_aarch64_object_report("run-linux-object-smokes rwad_bft", rwad_obj)) {
+        return 1;
+    }
+    puts("v3 linux object smokes: ok");
+    return 0;
+}
+
+static const char *v3_leaf_resolve_compiler_bin(int argc,
+                                                char **argv,
+                                                const char *env_primary,
+                                                const char *env_fallback,
+                                                const char *default_bin) {
+    const char *flag = v3_flag_value(argc, argv, "--compiler");
+    const char *value;
+    if (flag != NULL && flag[0] != '\0') {
+        return flag;
+    }
+    value = env_primary != NULL ? getenv(env_primary) : NULL;
+    if (value != NULL && value[0] != '\0') {
+        return value;
+    }
+    value = env_fallback != NULL ? getenv(env_fallback) : NULL;
+    if (value != NULL && value[0] != '\0') {
+        return value;
+    }
+    return default_bin;
+}
+
+static const char *v3_leaf_resolve_label(int argc,
+                                         char **argv,
+                                         const char *env_key,
+                                         const char *default_label) {
+    const char *flag = v3_flag_value(argc, argv, "--label");
+    const char *value;
+    if (flag != NULL && flag[0] != '\0') {
+        return flag;
+    }
+    value = env_key != NULL ? getenv(env_key) : NULL;
+    if (value != NULL && value[0] != '\0') {
+        return value;
+    }
+    return default_label;
+}
+
+static bool v3_leaf_expect_compiler(const char *label,
+                                    const char *compiler_bin) {
+    if (compiler_bin != NULL && compiler_bin[0] != '\0' && access(compiler_bin, X_OK) == 0) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s missing compiler: %s\n",
+            label,
+            compiler_bin != NULL ? compiler_bin : "");
+    return false;
+}
+
+static bool v3_run_compiler_command_logged(const char *compiler_bin,
+                                           size_t extra_arg_count,
+                                           const char **extra_args,
+                                           const char *log_path,
+                                           const char *label) {
+    const char **args;
+    size_t i;
+    bool ok;
+    args = (const char **)v3_xmalloc(sizeof(char *) * (extra_arg_count + 1U));
+    args[0] = compiler_bin;
+    for (i = 0U; i < extra_arg_count; ++i) {
+        args[i + 1U] = extra_args[i];
+    }
+    ok = v3_run_command_logged_argv(extra_arg_count + 1U, args, log_path, label);
+    free(args);
+    return ok;
+}
+
+static int v3_cmd_run_tcp_twoproc_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char server_src[PATH_MAX];
+    char client_src[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char client_bin[PATH_MAX];
+    char server_log[PATH_MAX];
+    char client_log[PATH_MAX];
+    char ready_path[PATH_MAX];
+    char port_text[64];
+    const char *compiler_bin;
+    const char *label;
+    char *server_argv[4];
+    char *client_argv[3];
+    char ready_arg[PATH_MAX + 32];
+    char port_arg[128];
+    pid_t server_pid = -1;
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_SMOKE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-tcp-twoproc-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(server_src, sizeof(server_src), paths.root, "v3/src/tests/libp2p_tcp_twoproc_server_smoke.cheng");
+    v3_join_path(client_src, sizeof(client_src), paths.root, "v3/src/tests/libp2p_tcp_twoproc_client_smoke.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_tcp_twoproc");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    snprintf(server_bin, sizeof(server_bin), "%s/libp2p_tcp_twoproc_server.%s", out_dir, label);
+    snprintf(client_bin, sizeof(client_bin), "%s/libp2p_tcp_twoproc_client.%s", out_dir, label);
+    snprintf(server_log, sizeof(server_log), "%s/libp2p_tcp_twoproc_server.%s.run.log", out_dir, label);
+    snprintf(client_log, sizeof(client_log), "%s/libp2p_tcp_twoproc_client.%s.run.log", out_dir, label);
+    snprintf(ready_path, sizeof(ready_path), "%s/libp2p_tcp_twoproc_server.%s.ready", out_dir, label);
+    unlink(ready_path);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, server_src, server_bin, server_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, client_src, client_bin, client_log)) {
+        return 1;
+    }
+    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
+    server_argv[0] = server_bin;
+    server_argv[1] = "--port:0";
+    server_argv[2] = ready_arg;
+    server_argv[3] = NULL;
+    if (!v3_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
+        !v3_wait_ready_port_file("run-tcp-twoproc-smoke server", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
+        !v3_text_is_decimal_digits(port_text)) {
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    snprintf(port_arg, sizeof(port_arg), "--port:%s", port_text);
+    client_argv[0] = client_bin;
+    client_argv[1] = port_arg;
+    client_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(client_argv, client_log, &status) ||
+        !v3_status_is_exit_code(status, 0) ||
+        !v3_wait_pid_success(&server_pid, "run-tcp-twoproc-smoke server", server_log)) {
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    if (!v3_dump_file_stdout(server_log) || !v3_dump_file_stdout(client_log)) {
+        return 1;
+    }
+    printf("v3 libp2p_tcp_twoproc_smoke ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_udp_importc_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char *run_argv[2];
+    const char *compiler_bin;
+    const char *label;
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_SMOKE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-udp-importc-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/udp_importc_smoke.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_udp_importc");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    snprintf(out_bin, sizeof(out_bin), "%s/udp_importc_smoke.%s", out_dir, label);
+    snprintf(compile_log, sizeof(compile_log), "%s/udp_importc_smoke.%s.compile.log", out_dir, label);
+    snprintf(run_log, sizeof(run_log), "%s/udp_importc_smoke.%s.run.log", out_dir, label);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, src, out_bin, compile_log)) {
+        return 1;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] run-udp-importc-smoke failed log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char js_path[PATH_MAX];
+    char js_log[PATH_MAX];
+    char out_zero[PATH_MAX];
+    char out_call[PATH_MAX];
+    char out_importc[PATH_MAX];
+    char log_zero[PATH_MAX];
+    char log_call[PATH_MAX];
+    char log_importc[PATH_MAX];
+    char src_zero[PATH_MAX];
+    char src_call[PATH_MAX];
+    char src_importc[PATH_MAX];
+    const char *compiler_bin;
+    const char *label;
+    char *js_text;
+    char *run_argv[7];
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_WASM_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_WASM_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-wasm-smokes", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_wasm_smokes");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    v3_join_path(src_zero, sizeof(src_zero), paths.root, "v3/src/tests/wasm_zero_smoke.cheng");
+    v3_join_path(src_call, sizeof(src_call), paths.root, "v3/src/tests/wasm_internal_call_smoke.cheng");
+    v3_join_path(src_importc, sizeof(src_importc), paths.root, "v3/src/tests/wasm_importc_noarg_i32_smoke.cheng");
+    snprintf(out_zero, sizeof(out_zero), "%s/wasm_zero_smoke.%s.wasm", out_dir, label);
+    snprintf(out_call, sizeof(out_call), "%s/wasm_internal_call_smoke.%s.wasm", out_dir, label);
+    snprintf(out_importc, sizeof(out_importc), "%s/wasm_importc_noarg_i32_smoke.%s.wasm", out_dir, label);
+    snprintf(log_zero, sizeof(log_zero), "%s/wasm_zero_smoke.%s.compile.log", out_dir, label);
+    snprintf(log_call, sizeof(log_call), "%s/wasm_internal_call_smoke.%s.compile.log", out_dir, label);
+    snprintf(log_importc, sizeof(log_importc), "%s/wasm_importc_noarg_i32_smoke.%s.compile.log", out_dir, label);
+    if (!v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_zero, "exe", "wasm32-unknown-unknown", out_zero, log_zero, NULL) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_call, "exe", "wasm32-unknown-unknown", out_call, log_call, NULL) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_importc, "exe", "wasm32-unknown-unknown", out_importc, log_importc, NULL)) {
+        return 1;
+    }
+    snprintf(js_path, sizeof(js_path), "%s/run_wasm_smokes.%s.js", out_dir, label);
+    snprintf(js_log, sizeof(js_log), "%s/run_wasm_smokes.%s.run.log", out_dir, label);
+    js_text = v3_strdup(
+        "const fs = require(\"fs\");\n"
+        "const outZero = process.argv[2];\n"
+        "const outCall = process.argv[3];\n"
+        "const outImportc = process.argv[4];\n"
+        "async function run(name, file, imports) {\n"
+        "  const wasm = fs.readFileSync(file);\n"
+        "  const { instance } = await WebAssembly.instantiate(wasm, imports);\n"
+        "  const rc = instance.exports.main();\n"
+        "  if ((rc | 0) !== 0) throw new Error(name + ' returned ' + rc);\n"
+        "  console.log(name + ': ok');\n"
+        "}\n"
+        "(async () => {\n"
+        "  await run('wasm_zero_smoke', outZero, { env: {} });\n"
+        "  await run('wasm_internal_call_smoke', outCall, { env: {} });\n"
+        "  await run('wasm_importc_noarg_i32_smoke', outImportc, { env: { cheng_test_zero: () => 0 } });\n"
+        "  console.log('v3 wasm smokes: ok');\n"
+        "})().catch((err) => { console.error(err); process.exit(1); });\n");
+    if (!v3_write_text_file(js_path, js_text)) {
+        free(js_text);
+        return 1;
+    }
+    free(js_text);
+    run_argv[0] = "/usr/bin/env";
+    run_argv[1] = "node";
+    run_argv[2] = js_path;
+    run_argv[3] = out_zero;
+    run_argv[4] = out_call;
+    run_argv[5] = out_importc;
+    run_argv[6] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, js_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] run-wasm-smokes node failed log=%s\n", js_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(js_log) ? 0 : 1;
+}
+
+static int v3_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char wasm_path[PATH_MAX];
+    char build_log[PATH_MAX];
+    char js_path[PATH_MAX];
+    char run_log[PATH_MAX];
+    char saved_compiler[PATH_MAX];
+    bool had_compiler = false;
+    const char *compiler_bin;
+    const char *label;
+    char *js_text;
+    char *run_argv[5];
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_WASM_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_WASM_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-browser-host-wasm-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_browser_host_wasm");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    snprintf(wasm_path, sizeof(wasm_path), "%s/cheng_browser_host_abi.%s.wasm", out_dir, label);
+    snprintf(build_log, sizeof(build_log), "%s/cheng_browser_host_abi.%s.build.log", out_dir, label);
+    snprintf(js_path, sizeof(js_path), "%s/cheng_browser_host_abi.%s.js", out_dir, label);
+    snprintf(run_log, sizeof(run_log), "%s/cheng_browser_host_abi.%s.run.log", out_dir, label);
+    v3_save_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
+    setenv("CHENG_V3_WASM_COMPILER", compiler_bin, 1);
+    if (!v3_run_script_args(paths.root,
+                            "v3/tooling/build_browser_host_wasm_v3.sh",
+                            1U,
+                            (const char *[1]){ wasm_path })) {
+        v3_restore_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, had_compiler);
+        return 1;
+    }
+    v3_restore_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, had_compiler);
+    if (!v3_expect_file_exists_nonempty("run-browser-host-wasm-smoke wasm", wasm_path)) {
+        return 1;
+    }
+    js_text = v3_strdup(
+        "const fs = require('fs');\n"
+        "const wasmPath = process.argv[2];\n"
+        "const bytes = fs.readFileSync(wasmPath);\n"
+        "WebAssembly.instantiate(bytes, {\n"
+        "  env: {\n"
+        "    cheng_v3_browser_now_ms_bridge: () => 24680,\n"
+        "    cheng_v3_browser_echo_i32_bridge: (value) => value | 0,\n"
+        "    cheng_v3_browser_peer_handle_bridge: () => 41,\n"
+        "    cheng_v3_browser_did_handle_bridge: () => 84,\n"
+        "    cheng_v3_browser_dm_active_count_bridge: () => 7,\n"
+        "    cheng_v3_browser_dm_connect_start_bridge: (peerHandle) => (peerHandle | 0) + 1000,\n"
+        "    cheng_v3_browser_dm_wait_start_bridge: (peerHandle, timeoutMs) => ((peerHandle | 0) ^ (timeoutMs | 0)) | 0,\n"
+        "    cheng_v3_browser_dm_send_start_bridge: (peerHandle, conversationHandle, messageHandle, timestampMs) => ((peerHandle | 0) + (conversationHandle | 0) + (messageHandle | 0) + (timestampMs | 0)) | 0,\n"
+        "  },\n"
+        "}).then(({ instance }) => {\n"
+        "  const exports = instance.exports;\n"
+        "  if ((exports.main() | 0) !== 0) throw new Error('main != 0');\n"
+        "  if ((exports.browserNowMs() | 0) !== 24680) throw new Error('browserNowMs != 24680');\n"
+        "  if ((exports.browserEchoI32(31337) | 0) !== 31337) throw new Error('browserEchoI32 != 31337');\n"
+        "  if ((exports.browserPeerHandle() | 0) !== 41) throw new Error('browserPeerHandle != 41');\n"
+        "  if ((exports.browserDidHandle() | 0) !== 84) throw new Error('browserDidHandle != 84');\n"
+        "  if ((exports.browserDmActiveCount() | 0) !== 7) throw new Error('browserDmActiveCount != 7');\n"
+        "  if ((exports.browserDmConnectStart(9) | 0) !== 1009) throw new Error('browserDmConnectStart mismatch');\n"
+        "  if ((exports.browserDmWaitStart(11, 22) | 0) !== ((11 ^ 22) | 0)) throw new Error('browserDmWaitStart mismatch');\n"
+        "  if ((exports.browserDmSendStart(1, 2, 3, 4) | 0) !== 10) throw new Error('browserDmSendStart mismatch');\n"
+        "  console.log('v3 browser host wasm smoke: ok');\n"
+        "}).catch((error) => { console.error(error); process.exit(1); });\n");
+    if (!v3_write_text_file(js_path, js_text)) {
+        free(js_text);
+        return 1;
+    }
+    free(js_text);
+    run_argv[0] = "/usr/bin/env";
+    run_argv[1] = "node";
+    run_argv[2] = js_path;
+    run_argv[3] = wasm_path;
+    run_argv[4] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] run-browser-host-wasm-smoke node failed log=%s build=%s\n", run_log, build_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char sync_prefix[PATH_MAX];
+    char fresh_prefix[PATH_MAX];
+    char sync_log[PATH_MAX];
+    char fresh_log[PATH_MAX];
+    const char *compiler_bin;
+    const char *label;
+    const char *sync_args[7];
+    const char *fresh_args[10];
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_FRESH_NODE_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_FRESH_NODE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-fresh-node-selfhost-gate", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/program_selfhost_smoke.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_fresh_node_gate");
+    v3_join_path(out_dir, sizeof(out_dir), out_dir, label);
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    v3_join_path(sync_prefix, sizeof(sync_prefix), out_dir, "program_selfhost_smoke.sync");
+    v3_join_path(fresh_prefix, sizeof(fresh_prefix), out_dir, "program_selfhost_smoke.fresh");
+    v3_join_path(sync_log, sizeof(sync_log), out_dir, "world_sync.log");
+    v3_join_path(fresh_log, sizeof(fresh_log), out_dir, "fresh_node.log");
+    sync_args[0] = "world-sync";
+    sync_args[1] = "--root";
+    sync_args[2] = root_v3;
+    sync_args[3] = "--in";
+    sync_args[4] = src;
+    sync_args[5] = "--target:arm64-apple-darwin";
+    sync_args[6] = "--channel:stable";
+    {
+        const char *sync_args_full[8];
+        char out_flag[PATH_MAX + 16];
+        size_t i;
+        for (i = 0U; i < 7U; ++i) {
+            sync_args_full[i] = sync_args[i];
+        }
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", sync_prefix);
+        sync_args_full[7] = out_flag;
+        if (!v3_run_compiler_command_logged(compiler_bin, 8U, sync_args_full, sync_log, "run-fresh-node-selfhost-gate world-sync")) {
+            return 1;
+        }
+    }
+    {
+        char world_report[PATH_MAX];
+        char compiler_snapshot[PATH_MAX];
+        char std_snapshot[PATH_MAX];
+        char runtime_snapshot[PATH_MAX];
+        char csg_report[PATH_MAX];
+        char surface_report[PATH_MAX];
+        char receipt_report[PATH_MAX];
+        char lock_report[PATH_MAX];
+        snprintf(world_report, sizeof(world_report), "%s.world.txt", sync_prefix);
+        snprintf(compiler_snapshot, sizeof(compiler_snapshot), "%s.compiler.snapshot.txt", sync_prefix);
+        snprintf(std_snapshot, sizeof(std_snapshot), "%s.std.snapshot.txt", sync_prefix);
+        snprintf(runtime_snapshot, sizeof(runtime_snapshot), "%s.runtime.snapshot.txt", sync_prefix);
+        snprintf(csg_report, sizeof(csg_report), "%s.csg.txt", sync_prefix);
+        snprintf(surface_report, sizeof(surface_report), "%s.surface.txt", sync_prefix);
+        snprintf(receipt_report, sizeof(receipt_report), "%s.receipt.txt", sync_prefix);
+        snprintf(lock_report, sizeof(lock_report), "%s.lock.toml", sync_prefix);
+        if (!v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate world report", world_report) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate compiler snapshot", compiler_snapshot) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate std snapshot", std_snapshot) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate runtime snapshot", runtime_snapshot) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate csg", csg_report) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate surface", surface_report) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate receipt", receipt_report) ||
+            !v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate lock", lock_report)) {
+            return 1;
+        }
+    }
+    {
+        char baseline_csg[PATH_MAX + 24];
+        char baseline_surface[PATH_MAX + 28];
+        char baseline_receipt[PATH_MAX + 28];
+        const char *fresh_args_full[11];
+        char out_flag[PATH_MAX + 16];
+        size_t i;
+        snprintf(baseline_csg, sizeof(baseline_csg), "--baseline-csg:%s.csg.txt", sync_prefix);
+        snprintf(baseline_surface, sizeof(baseline_surface), "--baseline-surface:%s.surface.txt", sync_prefix);
+        snprintf(baseline_receipt, sizeof(baseline_receipt), "--baseline-receipt:%s.receipt.txt", sync_prefix);
+        fresh_args[0] = "fresh-node-selfhost";
+        fresh_args[1] = "--root";
+        fresh_args[2] = root_v3;
+        fresh_args[3] = "--in";
+        fresh_args[4] = src;
+        fresh_args[5] = "--target:arm64-apple-darwin";
+        fresh_args[6] = "--channel:stable";
+        fresh_args[7] = baseline_csg;
+        fresh_args[8] = baseline_surface;
+        fresh_args[9] = baseline_receipt;
+        for (i = 0U; i < 10U; ++i) {
+            fresh_args_full[i] = fresh_args[i];
+        }
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", fresh_prefix);
+        fresh_args_full[10] = out_flag;
+        if (!v3_run_compiler_command_logged(compiler_bin, 11U, fresh_args_full, fresh_log, "run-fresh-node-selfhost-gate fresh-node-selfhost")) {
+            return 1;
+        }
+    }
+    {
+        char *fresh_text = v3_read_file(fresh_log);
+        char fresh_report[PATH_MAX];
+        if (fresh_text == NULL ||
+            !v3_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "equivalence_passed=1") ||
+            !v3_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "publish_allowed=1") ||
+            !v3_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "receipt_equivalent=1") ||
+            !v3_expect_text_has_line("run-fresh-node-selfhost-gate", fresh_text, "receipt_cid_match=1")) {
+            free(fresh_text);
+            return 1;
+        }
+        free(fresh_text);
+        snprintf(fresh_report, sizeof(fresh_report), "%s.fresh.txt", fresh_prefix);
+        if (!v3_expect_file_exists_nonempty("run-fresh-node-selfhost-gate fresh report", fresh_report)) {
+            return 1;
+        }
+    }
+    if (!v3_dump_file_stdout(sync_log) || !v3_dump_file_stdout(fresh_log)) {
+        return 1;
+    }
+    printf("v3 fresh-node selfhost gate ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_migration_gate_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char current_src[PATH_MAX];
+    char legacy_src[PATH_MAX];
+    char migrate_prefix[PATH_MAX];
+    char proof_prefix[PATH_MAX];
+    char blocked_prefix[PATH_MAX];
+    char publish_prefix[PATH_MAX];
+    char migrate_log[PATH_MAX];
+    char prove_log[PATH_MAX];
+    char blocked_log[PATH_MAX];
+    char publish_log[PATH_MAX];
+    const char *compiler_bin;
+    const char *label;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_MIGRATION_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_MIGRATION_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-migration-gate", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(current_src, sizeof(current_src), paths.root, "v3/src/tests/compiler_migration_fixture.cheng");
+    v3_join_path(legacy_src, sizeof(legacy_src), paths.root, "v3/testdata/compiler_migration/compiler_migration_fixture_legacy.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_migration_gate");
+    v3_join_path(out_dir, sizeof(out_dir), out_dir, label);
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    v3_join_path(migrate_prefix, sizeof(migrate_prefix), out_dir, "compiler_migration_fixture.migrate");
+    v3_join_path(proof_prefix, sizeof(proof_prefix), out_dir, "compiler_migration_fixture.prove");
+    v3_join_path(blocked_prefix, sizeof(blocked_prefix), out_dir, "compiler_migration_fixture.blocked");
+    v3_join_path(publish_prefix, sizeof(publish_prefix), out_dir, "compiler_migration_fixture.publish");
+    v3_join_path(migrate_log, sizeof(migrate_log), out_dir, "migrate_csg.log");
+    v3_join_path(prove_log, sizeof(prove_log), out_dir, "prove_migration.log");
+    v3_join_path(blocked_log, sizeof(blocked_log), out_dir, "publish_blocked.log");
+    v3_join_path(publish_log, sizeof(publish_log), out_dir, "publish_migration.log");
+    {
+        char out_flag[PATH_MAX + 16];
+        const char *args[6];
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", migrate_prefix);
+        args[0] = "migrate-csg";
+        args[1] = "--root";
+        args[2] = root_v3;
+        args[3] = "--in";
+        args[4] = current_src;
+        args[5] = out_flag;
+        if (!v3_run_compiler_command_logged(compiler_bin,
+                                            8U,
+                                            (const char *[8]){ "migrate-csg", "--root", root_v3, "--in", current_src, "--legacy-in", legacy_src, out_flag },
+                                            migrate_log,
+                                            "run-migration-gate migrate-csg")) {
+            return 1;
+        }
+    }
+    {
+        char *text = v3_read_file(migrate_log);
+        char path_buf[PATH_MAX];
+        if (text == NULL || !v3_expect_text_contains("run-migration-gate migrate", text, "canonical_graph_cid=")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        snprintf(path_buf, sizeof(path_buf), "%s.migration.txt", migrate_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate migration report", path_buf)) {
+            return 1;
+        }
+        snprintf(path_buf, sizeof(path_buf), "%s.migration.csg.txt", migrate_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate migration csg", path_buf)) {
+            return 1;
+        }
+        snprintf(path_buf, sizeof(path_buf), "%s.migration.surface.txt", migrate_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate migration surface", path_buf)) {
+            return 1;
+        }
+        snprintf(path_buf, sizeof(path_buf), "%s.migration.receipt.txt", migrate_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate migration receipt", path_buf)) {
+            return 1;
+        }
+    }
+    {
+        char out_flag[PATH_MAX + 16];
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", proof_prefix);
+        if (!v3_run_compiler_command_logged(compiler_bin,
+                                            10U,
+                                            (const char *[10]){ "prove-migration", "--root", root_v3, "--in", current_src, "--legacy-in", legacy_src, "--target:arm64-apple-darwin", "--channel:stable", out_flag },
+                                            prove_log,
+                                            "run-migration-gate prove-migration")) {
+            return 1;
+        }
+    }
+    {
+        char *text = v3_read_file(prove_log);
+        char path_buf[PATH_MAX];
+        if (text == NULL ||
+            !v3_expect_text_has_line("run-migration-gate prove", text, "equivalence_kind=canonical_semantic_identity") ||
+            !v3_expect_text_has_line("run-migration-gate prove", text, "graph_equivalent=1") ||
+            !v3_expect_text_has_line("run-migration-gate prove", text, "export_surface_compatible=1") ||
+            !v3_expect_text_has_line("run-migration-gate prove", text, "compile_receipt_equivalent=1")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        snprintf(path_buf, sizeof(path_buf), "%s.proof.txt", proof_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate proof", path_buf)) {
+            return 1;
+        }
+    }
+    {
+        char out_flag[PATH_MAX + 16];
+        int rc;
+        const char *args[8];
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", blocked_prefix);
+        args[0] = compiler_bin;
+        args[1] = "publish-world";
+        args[2] = "--root";
+        args[3] = root_v3;
+        args[4] = "--in";
+        args[5] = current_src;
+        args[6] = "--target:arm64-apple-darwin";
+        args[7] = out_flag;
+        rc = system("true");
+        (void)rc;
+        if (!v3_run_command_logged_argv(10U,
+                                        (const char *[10]){ compiler_bin, "publish-world", "--root", root_v3, "--in", current_src, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
+                                        blocked_log,
+                                        "run-migration-gate publish-blocked")) {
+            char *blocked_text = v3_read_file(blocked_log);
+            bool ok = blocked_text != NULL &&
+                      (v3_text_contains_substring(blocked_text, "stable requires") ||
+                       v3_text_contains_substring(blocked_text, "publish blocked") ||
+                       v3_text_contains_substring(blocked_text, "missing --baseline"));
+            free(blocked_text);
+            if (!ok) {
+                return 1;
+            }
+        } else {
+            fprintf(stderr, "[cheng_v3_seed] run-migration-gate stable publish unexpectedly passed\n");
+            return 1;
+        }
+    }
+    {
+        char out_flag[PATH_MAX + 16];
+        snprintf(out_flag, sizeof(out_flag), "--out:%s", publish_prefix);
+        if (!v3_run_compiler_command_logged(compiler_bin,
+                                            11U,
+                                            (const char *[11]){ "publish-world", "--root", root_v3, "--in", current_src, "--legacy-in", legacy_src, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
+                                            publish_log,
+                                            "run-migration-gate publish-world")) {
+            return 1;
+        }
+    }
+    {
+        char *text = v3_read_file(publish_log);
+        char path_buf[PATH_MAX];
+        if (text == NULL ||
+            !v3_expect_text_has_line("run-migration-gate publish", text, "proof_mode=migration") ||
+            !v3_expect_text_has_line("run-migration-gate publish", text, "equivalence_passed=1") ||
+            !v3_expect_text_has_line("run-migration-gate publish", text, "publish_allowed=1")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        snprintf(path_buf, sizeof(path_buf), "%s.publish.txt", publish_prefix);
+        if (!v3_expect_file_exists_nonempty("run-migration-gate publish proof", path_buf)) {
+            return 1;
+        }
+    }
+    if (!v3_dump_file_stdout(migrate_log) ||
+        !v3_dump_file_stdout(prove_log) ||
+        !v3_dump_file_stdout(blocked_log) ||
+        !v3_dump_file_stdout(publish_log)) {
+        return 1;
+    }
+    printf("v3 migration gate ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_browser_webrtc_smokes_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char browser_dir[PATH_MAX];
+    char npm_log[PATH_MAX];
+    char playwright_log[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char src[PATH_MAX];
+    char compile_label[PATH_MAX];
+    const char *host_compiler;
+    const char *tests[32];
+    size_t test_count;
+    size_t i;
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    int status = 0;
+    static const char *DEFAULT_TESTS[] = {
+        "webrtc_signal_stream_smoke",
+        "webrtc_datachannel_browser_smoke",
+        "webrtc_browser_content_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "webrtc_browser_pubsub_smoke",
+        "webrtc_browser_light_node_smoke",
+        "browser_sdk_smoke"
+    };
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    if (!v3_bootstrap_artifacts_fresh(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    host_compiler = v3_leaf_resolve_compiler_bin(argc,
+                                                 argv,
+                                                 "CHENG_V3_SMOKE_COMPILER",
+                                                 NULL,
+                                                 paths.backend_driver_out);
+    if (!v3_leaf_expect_compiler("run-browser-webrtc-smokes host", host_compiler) ||
+        !v3_leaf_expect_compiler("run-browser-webrtc-smokes stage2", paths.stage2) ||
+        !v3_leaf_expect_compiler("run-browser-webrtc-smokes stage3", paths.stage3)) {
+        return 1;
+    }
+    v3_join_path(browser_dir, sizeof(browser_dir), paths.root, "v3/tooling/browser_webrtc");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_browser_webrtc");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    v3_join_path(npm_log, sizeof(npm_log), out_dir, "npm_install.log");
+    v3_join_path(playwright_log, sizeof(playwright_log), out_dir, "playwright_install.log");
+    {
+        char playwright_dir[PATH_MAX];
+        char *quoted_browser_dir;
+        char *command;
+        v3_join_path(playwright_dir, sizeof(playwright_dir), browser_dir, "node_modules/playwright");
+        if (access(playwright_dir, R_OK) != 0) {
+            quoted_browser_dir = v3_shell_quote(browser_dir);
+            command = (char *)v3_xmalloc(strlen(quoted_browser_dir) + 96U);
+            snprintf(command, strlen(quoted_browser_dir) + 96U, "cd %s && npm install --no-fund --no-audit", quoted_browser_dir);
+            free(quoted_browser_dir);
+            if (!v3_run_shell_command_logged(command, npm_log, "run-browser-webrtc-smokes npm-install")) {
+                free(command);
+                return 1;
+            }
+            free(command);
+        }
+        quoted_browser_dir = v3_shell_quote(browser_dir);
+        command = (char *)v3_xmalloc(strlen(quoted_browser_dir) + 96U);
+        snprintf(command, strlen(quoted_browser_dir) + 96U, "cd %s && npx playwright install chromium", quoted_browser_dir);
+        free(quoted_browser_dir);
+        if (!v3_run_shell_command_logged(command, playwright_log, "run-browser-webrtc-smokes playwright-install")) {
+            free(command);
+            return 1;
+        }
+        free(command);
+    }
+    test_count = v3_collect_smoke_positionals(argc, argv, tests, sizeof(tests) / sizeof(tests[0]));
+    if (test_count == 0U) {
+        for (i = 0U; i < sizeof(DEFAULT_TESTS) / sizeof(DEFAULT_TESTS[0]); ++i) {
+            tests[i] = DEFAULT_TESTS[i];
+        }
+        test_count = sizeof(DEFAULT_TESTS) / sizeof(DEFAULT_TESTS[0]);
+    }
+    v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+    v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+    setenv("BACKEND_INCREMENTAL", "0", 1);
+    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    for (i = 0U; i < test_count; ++i) {
+        snprintf(src, sizeof(src), "%s/v3/src/tests/%s.cheng", paths.root, tests[i]);
+        snprintf(out_bin, sizeof(out_bin), "%s/%s.host", out_dir, tests[i]);
+        snprintf(compile_log, sizeof(compile_log), "%s/%s.host.compile.log", out_dir, tests[i]);
+        snprintf(run_log, sizeof(run_log), "%s/%s.host.run.log", out_dir, tests[i]);
+        if (!v3_compile_host_fixture_with_backend_driver(host_compiler, root_v3, src, out_bin, compile_log)) {
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return 1;
+        }
+        {
+            char *run_argv[2];
+            run_argv[0] = out_bin;
+            run_argv[1] = NULL;
+            if (!v3_run_binary_capture_output(run_argv, run_log, &status) || !v3_status_is_exit_code(status, 0)) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+        }
+        if (!v3_dump_file_stdout(run_log)) {
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return 1;
+        }
+        snprintf(out_bin, sizeof(out_bin), "%s/%s.stage2", out_dir, tests[i]);
+        snprintf(compile_label, sizeof(compile_label), "stage2 %s", tests[i]);
+        if (!v3_run_fixture_smoke_direct("run-browser-webrtc-smokes", compile_label, paths.stage2, paths.root, root_v3, tests[i], out_bin)) {
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return 1;
+        }
+        snprintf(out_bin, sizeof(out_bin), "%s/%s.stage3", out_dir, tests[i]);
+        snprintf(compile_label, sizeof(compile_label), "stage3 %s", tests[i]);
+        if (!v3_run_fixture_smoke_direct("run-browser-webrtc-smokes", compile_label, paths.stage3, paths.root, root_v3, tests[i], out_bin)) {
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return 1;
+        }
+    }
+    v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+    v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    puts("v3 browser webrtc smokes: ok");
+    return 0;
+}
+
+static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_root[PATH_MAX];
+    char tmp_template[PATH_MAX];
+    char *tmpdir;
+    char bin[PATH_MAX];
+    char build_log[PATH_MAX];
+    char server_state[PATH_MAX];
+    char client_state[PATH_MAX];
+    char ready_path[PATH_MAX];
+    char server_log[PATH_MAX];
+    char sync_log[PATH_MAX];
+    char init_log[PATH_MAX];
+    char mint_log[PATH_MAX];
+    char transfer_log[PATH_MAX];
+    char balance_a_log[PATH_MAX];
+    char balance_b_log[PATH_MAX];
+    char show_log[PATH_MAX];
+    char snapshot_log[PATH_MAX];
+    char client_balance_a_log[PATH_MAX];
+    char client_balance_b_log[PATH_MAX];
+    char client_show_log[PATH_MAX];
+    char server_port[64];
+    const char *compiler_bin;
+    const char *label;
+    char saved_compiler[PATH_MAX];
+    char saved_out_dir[PATH_MAX];
+    char saved_self_test[32];
+    bool had_compiler = false;
+    bool had_out_dir = false;
+    bool had_self_test = false;
+    pid_t server_pid = -1;
+    int status = 0;
+    char *daemon_argv[7];
+    char *sync_argv[10];
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_CHAIN_NODE_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_CHAIN_NODE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-chain-node-cli-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(out_root, sizeof(out_root), paths.root, "artifacts/v3_chain_node_cli");
+    v3_join_path(out_root, sizeof(out_root), out_root, label);
+    if (!v3_mkdir_p(out_root)) {
+        return 1;
+    }
+    v3_join_path(bin, sizeof(bin), out_root, "chain_node");
+    v3_join_path(build_log, sizeof(build_log), out_root, "build.log");
+    v3_save_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
+    v3_save_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, sizeof(saved_out_dir), &had_out_dir);
+    v3_save_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, sizeof(saved_self_test), &had_self_test);
+    setenv("CHENG_V3_CHAIN_NODE_COMPILER", compiler_bin, 1);
+    setenv("CHAIN_NODE_OUT_DIR", out_root, 1);
+    setenv("CHAIN_NODE_RUN_SELF_TEST", "0", 1);
+    {
+        char *quoted_root = v3_shell_quote(paths.root);
+        char *command = (char *)v3_xmalloc(strlen(quoted_root) + 96U);
+        snprintf(command, strlen(quoted_root) + 96U, "sh %s/v3/tooling/build_chain_node_v3.sh", quoted_root);
+        free(quoted_root);
+        if (!v3_run_shell_command_logged(command, build_log, "run-chain-node-cli-smoke build")) {
+            free(command);
+            v3_restore_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
+            v3_restore_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, had_out_dir);
+            v3_restore_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, had_self_test);
+            return 1;
+        }
+        free(command);
+    }
+    v3_restore_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
+    v3_restore_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, had_out_dir);
+    v3_restore_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, had_self_test);
+    if (!v3_leaf_expect_compiler("run-chain-node-cli-smoke binary", bin)) {
+        return 1;
+    }
+    snprintf(tmp_template, sizeof(tmp_template), "%s/tmp.XXXXXX", out_root);
+    tmpdir = mkdtemp(tmp_template);
+    if (tmpdir == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] run-chain-node-cli-smoke mkdtemp failed\n");
+        return 1;
+    }
+    snprintf(server_state, sizeof(server_state), "%s/server.state", tmpdir);
+    snprintf(client_state, sizeof(client_state), "%s/client.state", tmpdir);
+    snprintf(ready_path, sizeof(ready_path), "%s/server.ready", tmpdir);
+    snprintf(server_log, sizeof(server_log), "%s/server.log", tmpdir);
+    snprintf(sync_log, sizeof(sync_log), "%s/sync.log", tmpdir);
+    snprintf(init_log, sizeof(init_log), "%s/init.log", tmpdir);
+    snprintf(mint_log, sizeof(mint_log), "%s/mint.log", tmpdir);
+    snprintf(transfer_log, sizeof(transfer_log), "%s/transfer.log", tmpdir);
+    snprintf(balance_a_log, sizeof(balance_a_log), "%s/balance_a.log", tmpdir);
+    snprintf(balance_b_log, sizeof(balance_b_log), "%s/balance_b.log", tmpdir);
+    snprintf(show_log, sizeof(show_log), "%s/show.log", tmpdir);
+    snprintf(snapshot_log, sizeof(snapshot_log), "%s/snapshot.log", tmpdir);
+    snprintf(client_balance_a_log, sizeof(client_balance_a_log), "%s/client_balance_a.log", tmpdir);
+    snprintf(client_balance_b_log, sizeof(client_balance_b_log), "%s/client_balance_b.log", tmpdir);
+    snprintf(client_show_log, sizeof(client_show_log), "%s/client_show.log", tmpdir);
+    {
+        char state_arg[PATH_MAX + 16];
+        snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
+        if (!v3_run_command_logged_argv(5U,
+                                        (const char *[5]){ bin, "init", state_arg, "--node-id:node-a", "--address-seed:chain-node-a" },
+                                        init_log,
+                                        "run-chain-node-cli-smoke init") ||
+            !v3_run_command_logged_argv(6U,
+                                        (const char *[6]){ bin, "mint", state_arg, "--asset:7", "--account:1001", "--amount:100" },
+                                        mint_log,
+                                        "run-chain-node-cli-smoke mint") ||
+            !v3_run_command_logged_argv(7U,
+                                        (const char *[7]){ bin, "transfer", state_arg, "--asset:7", "--from:1001", "--to:2002", "--amount:40" },
+                                        transfer_log,
+                                        "run-chain-node-cli-smoke transfer")) {
+            return 1;
+        }
+        if (!v3_run_command_logged_argv(5U,
+                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:1001" },
+                                        balance_a_log,
+                                        "run-chain-node-cli-smoke balance-a") ||
+            !v3_run_command_logged_argv(5U,
+                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:2002" },
+                                        balance_b_log,
+                                        "run-chain-node-cli-smoke balance-b") ||
+            !v3_run_command_logged_argv(3U,
+                                        (const char *[3]){ bin, "show-state", state_arg },
+                                        show_log,
+                                        "run-chain-node-cli-smoke show") ||
+            !v3_run_command_logged_argv(3U,
+                                        (const char *[3]){ bin, "dump-snapshot", state_arg },
+                                        snapshot_log,
+                                        "run-chain-node-cli-smoke snapshot")) {
+            return 1;
+        }
+    }
+    {
+        char state_arg[PATH_MAX + 16];
+        char ready_arg[PATH_MAX + 24];
+        snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
+        snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
+        daemon_argv[0] = bin;
+        daemon_argv[1] = "daemon-serve";
+        daemon_argv[2] = state_arg;
+        daemon_argv[3] = "--port:0";
+        daemon_argv[4] = ready_arg;
+        daemon_argv[5] = "--max-serve-count:1";
+        daemon_argv[6] = NULL;
+        if (!v3_spawn_binary_capture_output(daemon_argv, server_log, &server_pid) ||
+            !v3_wait_ready_port_file("run-chain-node-cli-smoke daemon", ready_path, server_pid, 20000, server_port, sizeof(server_port)) ||
+            !v3_text_is_decimal_digits(server_port)) {
+            v3_kill_and_wait_pid(&server_pid);
+            return 1;
+        }
+    }
+    {
+        char state_arg[PATH_MAX + 16];
+        char port_arg[128];
+        snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
+        snprintf(port_arg, sizeof(port_arg), "--port:%s", server_port);
+        sync_argv[0] = bin;
+        sync_argv[1] = "daemon-sync";
+        sync_argv[2] = state_arg;
+        sync_argv[3] = "--node-id:node-b";
+        sync_argv[4] = "--address-seed:chain-node-b";
+        sync_argv[5] = "--host:127.0.0.1";
+        sync_argv[6] = port_arg;
+        sync_argv[7] = "--max-sync-count:1";
+        sync_argv[8] = "--interval-ms:10";
+        sync_argv[9] = NULL;
+        if (!v3_run_binary_capture_output(sync_argv, sync_log, &status) ||
+            !v3_status_is_exit_code(status, 0) ||
+            !v3_wait_pid_success(&server_pid, "run-chain-node-cli-smoke daemon", server_log)) {
+            v3_kill_and_wait_pid(&server_pid);
+            return 1;
+        }
+    }
+    {
+        char state_arg[PATH_MAX + 16];
+        snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
+        if (!v3_run_command_logged_argv(5U,
+                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:1001" },
+                                        client_balance_a_log,
+                                        "run-chain-node-cli-smoke client-balance-a") ||
+            !v3_run_command_logged_argv(5U,
+                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:2002" },
+                                        client_balance_b_log,
+                                        "run-chain-node-cli-smoke client-balance-b") ||
+            !v3_run_command_logged_argv(3U,
+                                        (const char *[3]){ bin, "show-state", state_arg },
+                                        client_show_log,
+                                        "run-chain-node-cli-smoke client-show")) {
+            return 1;
+        }
+    }
+    {
+        char *text = v3_read_file(init_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke init", text, "node_id=node-a")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(balance_a_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke balance-a", text, "balance=60")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(balance_b_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke balance-b", text, "balance=40")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(show_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke show", text, "node_id=node-a")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(snapshot_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke snapshot", text, "payload_hex=")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(sync_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke sync", text, "changed=1")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(client_balance_a_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke client-balance-a", text, "balance=60")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(client_balance_b_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke client-balance-b", text, "balance=40")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(client_show_log);
+        if (text == NULL || !v3_expect_text_contains("run-chain-node-cli-smoke client-show", text, "node_id=node-b")) {
+            free(text);
+            return 1;
+        }
+        free(text);
+    }
+    if (!v3_dump_file_stdout(init_log) ||
+        !v3_dump_file_stdout(mint_log) ||
+        !v3_dump_file_stdout(transfer_log) ||
+        !v3_dump_file_stdout(balance_a_log) ||
+        !v3_dump_file_stdout(balance_b_log) ||
+        !v3_dump_file_stdout(show_log) ||
+        !v3_dump_file_stdout(snapshot_log) ||
+        !v3_dump_file_stdout(server_log) ||
+        !v3_dump_file_stdout(sync_log) ||
+        !v3_dump_file_stdout(client_balance_a_log) ||
+        !v3_dump_file_stdout(client_balance_b_log) ||
+        !v3_dump_file_stdout(client_show_log)) {
+        return 1;
+    }
+    printf("v3 chain_node cli smoke ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_chain_node_process_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char server_src[PATH_MAX];
+    char client_src[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char client_bin[PATH_MAX];
+    char server_log[PATH_MAX];
+    char client_log[PATH_MAX];
+    char ready_path[PATH_MAX];
+    char port_text[64];
+    const char *compiler_bin;
+    const char *label;
+    char *server_argv[4];
+    char *client_argv[3];
+    char ready_arg[PATH_MAX + 32];
+    char client_port_arg[128];
+    pid_t server_pid = -1;
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_CHAIN_NODE_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_CHAIN_NODE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-chain-node-process-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(server_src, sizeof(server_src), paths.root, "v3/src/tests/chain_node_process_server_smoke.cheng");
+    v3_join_path(client_src, sizeof(client_src), paths.root, "v3/src/tests/chain_node_process_client_smoke.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_chain_node_process");
+    v3_join_path(out_dir, sizeof(out_dir), out_dir, label);
+    v3_join_path(server_bin, sizeof(server_bin), out_dir, "chain_node_process_server");
+    v3_join_path(client_bin, sizeof(client_bin), out_dir, "chain_node_process_client");
+    v3_join_path(server_log, sizeof(server_log), out_dir, "server.log");
+    v3_join_path(client_log, sizeof(client_log), out_dir, "client.log");
+    v3_join_path(ready_path, sizeof(ready_path), out_dir, "server.ready");
+    unlink(ready_path);
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, server_src, server_bin, server_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, client_src, client_bin, client_log)) {
+        return 1;
+    }
+    snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
+    server_argv[0] = server_bin;
+    server_argv[1] = "--port:0";
+    server_argv[2] = ready_arg;
+    server_argv[3] = NULL;
+    if (!v3_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
+        !v3_wait_ready_port_file("run-chain-node-process-smoke", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
+        !v3_text_is_decimal_digits(port_text)) {
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    snprintf(client_port_arg, sizeof(client_port_arg), "--port:%s", port_text);
+    client_argv[0] = client_bin;
+    client_argv[1] = client_port_arg;
+    client_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(client_argv, client_log, &status) ||
+        !v3_status_is_exit_code(status, 0) ||
+        !v3_wait_pid_success(&server_pid, "run-chain-node-process-smoke server", server_log)) {
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    if (!v3_dump_file_stdout(server_log) || !v3_dump_file_stdout(client_log)) {
+        return 1;
+    }
+    printf("v3 chain_node process smoke ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_chain_node_three_node_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char server_src[PATH_MAX];
+    char relay_src[PATH_MAX];
+    char client_src[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char relay_bin[PATH_MAX];
+    char client_bin[PATH_MAX];
+    char server_log[PATH_MAX];
+    char relay_log[PATH_MAX];
+    char client_log[PATH_MAX];
+    char server_ready[PATH_MAX];
+    char relay_ready[PATH_MAX];
+    char server_port[64];
+    char relay_port[64];
+    const char *compiler_bin;
+    const char *label;
+    char *server_argv[4];
+    char *relay_argv[5];
+    char *client_argv[3];
+    char server_ready_arg[PATH_MAX + 32];
+    char relay_ready_arg[PATH_MAX + 32];
+    char upstream_arg[128];
+    char relay_port_arg[128];
+    pid_t server_pid = -1;
+    pid_t relay_pid = -1;
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_CHAIN_NODE_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_CHAIN_NODE_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-chain-node-three-node-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(server_src, sizeof(server_src), paths.root, "v3/src/tests/chain_node_process_server_smoke.cheng");
+    v3_join_path(relay_src, sizeof(relay_src), paths.root, "v3/src/tests/chain_node_process_relay_smoke.cheng");
+    v3_join_path(client_src, sizeof(client_src), paths.root, "v3/src/tests/chain_node_process_client_smoke.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_chain_node_three_node");
+    v3_join_path(out_dir, sizeof(out_dir), out_dir, label);
+    v3_join_path(server_bin, sizeof(server_bin), out_dir, "chain_node_process_server");
+    v3_join_path(relay_bin, sizeof(relay_bin), out_dir, "chain_node_process_relay");
+    v3_join_path(client_bin, sizeof(client_bin), out_dir, "chain_node_process_client");
+    v3_join_path(server_log, sizeof(server_log), out_dir, "server.log");
+    v3_join_path(relay_log, sizeof(relay_log), out_dir, "relay.log");
+    v3_join_path(client_log, sizeof(client_log), out_dir, "client.log");
+    v3_join_path(server_ready, sizeof(server_ready), out_dir, "server.ready");
+    v3_join_path(relay_ready, sizeof(relay_ready), out_dir, "relay.ready");
+    unlink(server_ready);
+    unlink(relay_ready);
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, server_src, server_bin, server_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, relay_src, relay_bin, relay_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, client_src, client_bin, client_log)) {
+        return 1;
+    }
+    snprintf(server_ready_arg, sizeof(server_ready_arg), "--ready-path:%s", server_ready);
+    server_argv[0] = server_bin;
+    server_argv[1] = "--port:0";
+    server_argv[2] = server_ready_arg;
+    server_argv[3] = NULL;
+    if (!v3_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
+        !v3_wait_ready_port_file("run-chain-node-three-node-smoke server", server_ready, server_pid, 20000, server_port, sizeof(server_port)) ||
+        !v3_text_is_decimal_digits(server_port)) {
+        v3_kill_and_wait_pid(&relay_pid);
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    snprintf(upstream_arg, sizeof(upstream_arg), "--upstream-port:%s", server_port);
+    snprintf(relay_ready_arg, sizeof(relay_ready_arg), "--ready-path:%s", relay_ready);
+    relay_argv[0] = relay_bin;
+    relay_argv[1] = upstream_arg;
+    relay_argv[2] = "--port:0";
+    relay_argv[3] = relay_ready_arg;
+    relay_argv[4] = NULL;
+    if (!v3_spawn_binary_capture_output(relay_argv, relay_log, &relay_pid) ||
+        !v3_wait_ready_port_file("run-chain-node-three-node-smoke relay", relay_ready, relay_pid, 20000, relay_port, sizeof(relay_port)) ||
+        !v3_text_is_decimal_digits(relay_port)) {
+        v3_kill_and_wait_pid(&relay_pid);
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    snprintf(relay_port_arg, sizeof(relay_port_arg), "--port:%s", relay_port);
+    client_argv[0] = client_bin;
+    client_argv[1] = relay_port_arg;
+    client_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(client_argv, client_log, &status) ||
+        !v3_status_is_exit_code(status, 0) ||
+        !v3_wait_pid_success(&relay_pid, "run-chain-node-three-node-smoke relay", relay_log) ||
+        !v3_wait_pid_success(&server_pid, "run-chain-node-three-node-smoke server", server_log)) {
+        v3_kill_and_wait_pid(&relay_pid);
+        v3_kill_and_wait_pid(&server_pid);
+        return 1;
+    }
+    if (!v3_dump_file_stdout(server_log) ||
+        !v3_dump_file_stdout(relay_log) ||
+        !v3_dump_file_stdout(client_log)) {
+        return 1;
+    }
+    printf("v3 chain_node three-node smoke ok (%s)\n", label);
+    return 0;
+}
+
+static int v3_cmd_run_tailnet_control_smoke_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char probe_dir[PATH_MAX];
+    char probe_port_log[PATH_MAX];
+    char probe_ready_log[PATH_MAX];
+    char probe_log[PATH_MAX];
+    char baseline_src[PATH_MAX];
+    char core_smoke_src[PATH_MAX];
+    char core_src[PATH_MAX];
+    char baseline_bin[PATH_MAX];
+    char core_smoke_bin[PATH_MAX];
+    char core_bin[PATH_MAX];
+    char baseline_compile_log[PATH_MAX];
+    char core_smoke_compile_log[PATH_MAX];
+    char core_compile_log[PATH_MAX];
+    char baseline_run_log[PATH_MAX];
+    char core_smoke_run_log[PATH_MAX];
+    char configure_log[PATH_MAX];
+    char listen_log[PATH_MAX];
+    char dial_log[PATH_MAX];
+    char probe_port[64];
+    char control_probe_endpoint[PATH_MAX];
+    char relay_probe_endpoint[PATH_MAX];
+    const char *compiler_bin;
+    const char *label;
+    char *probe_argv[10];
+    pid_t probe_pid = -1;
+    int status = 0;
+    int rc = 1;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_TAILNET_COMPILER",
+                                                "CHENG_V3_SMOKE_COMPILER",
+                                                paths.backend_driver_out);
+    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_TAILNET_LABEL", "host");
+    if (!v3_leaf_expect_compiler("run-tailnet-control-smoke", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_tailnet_control");
+    v3_join_path(probe_dir, sizeof(probe_dir), paths.root, "v3/testdata/tailnet");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    snprintf(probe_port_log, sizeof(probe_port_log), "%s/tailnet_probe_port.%s.log", out_dir, label);
+    snprintf(probe_ready_log, sizeof(probe_ready_log), "%s/tailnet_probe_ready.%s.log", out_dir, label);
+    snprintf(probe_log, sizeof(probe_log), "%s/tailnet_probe_server.%s.log", out_dir, label);
+    if (!v3_run_command_logged_argv(4U,
+                                    (const char *[4]){
+                                        "/usr/bin/env",
+                                        "python3",
+                                        "-c",
+                                        "import socket; s = socket.socket(); s.bind(('127.0.0.1', 0)); print(s.getsockname()[1]); s.close()"
+                                    },
+                                    probe_port_log,
+                                    "run-tailnet-control-smoke pick-port") ||
+        !v3_read_trimmed_file_text(probe_port_log, probe_port, sizeof(probe_port)) ||
+        !v3_text_is_decimal_digits(probe_port)) {
+        return 1;
+    }
+    probe_argv[0] = "/usr/bin/env";
+    probe_argv[1] = "python3";
+    probe_argv[2] = "-m";
+    probe_argv[3] = "http.server";
+    probe_argv[4] = probe_port;
+    probe_argv[5] = "--bind";
+    probe_argv[6] = "127.0.0.1";
+    probe_argv[7] = "--directory";
+    probe_argv[8] = probe_dir;
+    probe_argv[9] = NULL;
+    if (!v3_spawn_binary_capture_output(probe_argv, probe_log, &probe_pid)) {
+        return 1;
+    }
+    snprintf(control_probe_endpoint, sizeof(control_probe_endpoint), "http://127.0.0.1:%s/headscale_control_ready.json", probe_port);
+    snprintf(relay_probe_endpoint, sizeof(relay_probe_endpoint), "http://127.0.0.1:%s/derp_ready.json", probe_port);
+    if (!v3_run_command_logged_argv(5U,
+                                    (const char *[5]){
+                                        "/usr/bin/env",
+                                        "python3",
+                                        "-c",
+                                        "import sys, time, urllib.request\nurl = sys.argv[1]\nfor _ in range(50):\n    try:\n        with urllib.request.urlopen(url, timeout=0.2) as resp:\n            if resp.status == 200:\n                raise SystemExit(0)\n    except Exception:\n        time.sleep(0.1)\nraise SystemExit(1)\n",
+                                        control_probe_endpoint
+                                    },
+                                    probe_ready_log,
+                                    "run-tailnet-control-smoke wait-probe")) {
+        v3_kill_and_wait_pid(&probe_pid);
+        return 1;
+    }
+    v3_join_path(baseline_src, sizeof(baseline_src), paths.root, "v3/src/tests/libp2p_tailnet_transport_smoke.cheng");
+    v3_join_path(core_smoke_src, sizeof(core_smoke_src), paths.root, "v3/src/tests/tailnet_control_core_smoke.cheng");
+    v3_join_path(core_src, sizeof(core_src), paths.root, "v3/src/project/tailnet_control_core.cheng");
+    snprintf(baseline_bin, sizeof(baseline_bin), "%s/libp2p_tailnet_transport_smoke.%s", out_dir, label);
+    snprintf(core_smoke_bin, sizeof(core_smoke_bin), "%s/tailnet_control_core_smoke.%s", out_dir, label);
+    snprintf(core_bin, sizeof(core_bin), "%s/tailnet_control_core.%s", out_dir, label);
+    snprintf(baseline_compile_log, sizeof(baseline_compile_log), "%s/libp2p_tailnet_transport_smoke.%s.compile.log", out_dir, label);
+    snprintf(core_smoke_compile_log, sizeof(core_smoke_compile_log), "%s/tailnet_control_core_smoke.%s.compile.log", out_dir, label);
+    snprintf(core_compile_log, sizeof(core_compile_log), "%s/tailnet_control_core.%s.compile.log", out_dir, label);
+    snprintf(baseline_run_log, sizeof(baseline_run_log), "%s/libp2p_tailnet_transport_smoke.%s.run.log", out_dir, label);
+    snprintf(core_smoke_run_log, sizeof(core_smoke_run_log), "%s/tailnet_control_core_smoke.%s.run.log", out_dir, label);
+    snprintf(configure_log, sizeof(configure_log), "%s/tailnet_control_configure.%s.run.log", out_dir, label);
+    snprintf(listen_log, sizeof(listen_log), "%s/tailnet_control_listen.%s.run.log", out_dir, label);
+    snprintf(dial_log, sizeof(dial_log), "%s/tailnet_control_dial.%s.run.log", out_dir, label);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, baseline_src, baseline_bin, baseline_compile_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, core_smoke_src, core_smoke_bin, core_smoke_compile_log) ||
+        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, core_src, core_bin, core_compile_log)) {
+        v3_kill_and_wait_pid(&probe_pid);
+        return 1;
+    }
+    if (!v3_run_command_logged_argv(1U, (const char *[1]){ baseline_bin }, baseline_run_log, "run-tailnet-control-smoke baseline") ||
+        !v3_run_command_logged_argv(1U, (const char *[1]){ core_smoke_bin }, core_smoke_run_log, "run-tailnet-control-smoke decode")) {
+        v3_kill_and_wait_pid(&probe_pid);
+        return 1;
+    }
+    {
+        const char *configure_args[] = {
+            core_bin, "--command", "configure", "--provider-headscale", "1",
+            "--control-url", "https://headscale.example",
+            "--control-endpoint", "https://headscale.example/control",
+            "--relay-endpoint", "https://derp.sfo.example:443",
+            "--control-probe-endpoint", control_probe_endpoint,
+            "--relay-probe-endpoint", relay_probe_endpoint,
+            "--namespace", "infra",
+            "--noise-public-key", "noise-pub-cli",
+            "--derp-region-code", "sfo",
+            "--derp-region-name", "SanFrancisco",
+            "--derp-hostname", "derp.sfo.example",
+            "--synthetic-ipv4", "100.64.0.44",
+            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+            "--local-peer-id", "tailnet-control-test",
+            "--exact-routing", "1",
+            "--provider-ready", "1",
+            "--proxy-ready", "1"
+        };
+        const char *listen_args[] = {
+            core_bin, "--command", "listen", "--provider-headscale", "1",
+            "--control-url", "https://headscale.example",
+            "--control-endpoint", "https://headscale.example/control",
+            "--relay-endpoint", "https://derp.sfo.example:443",
+            "--control-probe-endpoint", control_probe_endpoint,
+            "--relay-probe-endpoint", relay_probe_endpoint,
+            "--namespace", "infra",
+            "--noise-public-key", "noise-pub-cli",
+            "--derp-region-code", "sfo",
+            "--derp-region-name", "SanFrancisco",
+            "--derp-hostname", "derp.sfo.example",
+            "--synthetic-ipv4", "100.64.0.44",
+            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+            "--local-peer-id", "tailnet-control-test",
+            "--exact-routing", "1",
+            "--provider-ready", "1",
+            "--proxy-ready", "1",
+            "--host", "127.0.0.1",
+            "--port", "7101",
+            "--transport", "tcp"
+        };
+        const char *dial_args[] = {
+            core_bin, "--command", "dial-plan", "--provider-headscale", "1",
+            "--control-url", "https://headscale.example",
+            "--control-endpoint", "https://headscale.example/control",
+            "--relay-endpoint", "https://derp.sfo.example:443",
+            "--control-probe-endpoint", control_probe_endpoint,
+            "--relay-probe-endpoint", relay_probe_endpoint,
+            "--namespace", "infra",
+            "--noise-public-key", "noise-pub-cli",
+            "--derp-region-code", "sfo",
+            "--derp-region-name", "SanFrancisco",
+            "--derp-hostname", "derp.sfo.example",
+            "--synthetic-ipv4", "100.64.0.44",
+            "--synthetic-ipv6", "fd7a:115c:a1e0::44",
+            "--local-peer-id", "tailnet-control-test",
+            "--exact-routing", "1",
+            "--provider-ready", "1",
+            "--proxy-ready", "1",
+            "--derp-healthy", "1",
+            "--bootstrap-listen-count", "1",
+            "--bootstrap-listen-raw-0", "/ip4/127.0.0.1/tcp/7101",
+            "--bootstrap-peer-count", "1",
+            "--bootstrap-peer-id-0", "peer-direct",
+            "--bootstrap-peer-remote-tailnet-ip-0", "100.64.0.88",
+            "--bootstrap-peer-direct-reachable-0", "1",
+            "--bootstrap-peer-relay-allowed-0", "1",
+            "--bootstrap-peer-relay-only-0", "0",
+            "--bootstrap-peer-derp-region-code-0", "sfo",
+            "--bootstrap-peer-signed-preface-0", "test-preface",
+            "--bootstrap-peer-bound-addr-text-0", "/ip4/127.0.0.1/tcp/7101",
+            "--bootstrap-peer-last-path-0", "direct",
+            "--bootstrap-peer-last-error-0", "",
+            "--peer-id", "peer-direct",
+            "--addr", "/ip4/100.64.0.44/tcp/7101"
+        };
+        if (!v3_run_command_logged_argv(sizeof(configure_args) / sizeof(configure_args[0]),
+                                        configure_args,
+                                        configure_log,
+                                        "run-tailnet-control-smoke configure") ||
+            !v3_run_command_logged_argv(sizeof(listen_args) / sizeof(listen_args[0]),
+                                        listen_args,
+                                        listen_log,
+                                        "run-tailnet-control-smoke listen") ||
+            !v3_run_command_logged_argv(sizeof(dial_args) / sizeof(dial_args[0]),
+                                        dial_args,
+                                        dial_log,
+                                        "run-tailnet-control-smoke dial")) {
+            v3_kill_and_wait_pid(&probe_pid);
+            return 1;
+        }
+    }
+    {
+        char *text = v3_read_file(configure_log);
+        if (text == NULL ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "configured=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerKind=headscale") ||
+            !v3_expect_text_contains("run-tailnet-control-smoke configure", text, control_probe_endpoint) ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "controlPlane=headscale") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerReady=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "proxyListenersReady=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke configure", text, "providerRuntimeActive=1")) {
+            free(text);
+            v3_kill_and_wait_pid(&probe_pid);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(listen_log);
+        if (text == NULL ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke listen", text, "publishedAddr=/ip4/100.64.0.44/tcp/7101") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke listen", text, "listener.0.raw=/ip4/127.0.0.1/tcp/7101") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke listen", text, "providerKind=headscale") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke listen", text, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke listen", text, "providerRuntimeActive=1")) {
+            free(text);
+            v3_kill_and_wait_pid(&probe_pid);
+            return 1;
+        }
+        free(text);
+        text = v3_read_file(dial_log);
+        if (text == NULL ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "dial.pathKind=direct") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "dial.routeText=/ip4/127.0.0.1/tcp/7101") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "sessionCount=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "relayHealthy=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "startupStage=derp-ready") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "peer.0.lastPath=direct") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "providerRuntimeActive=1") ||
+            !v3_expect_text_has_line("run-tailnet-control-smoke dial", text, "providerRuntimeCommands=3")) {
+            free(text);
+            v3_kill_and_wait_pid(&probe_pid);
+            return 1;
+        }
+        free(text);
+    }
+    if (!v3_dump_file_stdout(baseline_run_log) ||
+        !v3_dump_file_stdout(core_smoke_run_log) ||
+        !v3_dump_file_stdout(configure_log) ||
+        !v3_dump_file_stdout(listen_log) ||
+        !v3_dump_file_stdout(dial_log)) {
+        v3_kill_and_wait_pid(&probe_pid);
+        return 1;
+    }
+    rc = 0;
+    printf("v3 tailnet_control_smoke ok (%s)\n", label);
+    v3_kill_and_wait_pid(&probe_pid);
+    return rc;
+}
+
+static int v3_cmd_verify_debug_tools(int argc, char **argv) {
+    return v3_cmd_verify_debug_tools_impl(argc, argv);
+    V3BootstrapPaths paths;
+    char out_dir[PATH_MAX];
+    char src_return[PATH_MAX];
+    char src_program_selfhost[PATH_MAX];
+    char src_call_chain[PATH_MAX];
+    char src_windows[PATH_MAX];
+    char linux_obj[PATH_MAX];
+    char host_obj[PATH_MAX];
+    char asm_obj[PATH_MAX];
+    char windows_exe[PATH_MAX];
+    char debug_report[PATH_MAX];
+    char symbols_report[PATH_MAX];
+    char line_map_report[PATH_MAX];
+    char elf_report[PATH_MAX];
+    char elf_alias_report[PATH_MAX];
+    char macho_report[PATH_MAX];
+    char pe_report[PATH_MAX];
+    char asm_report[PATH_MAX];
+    char asm_source_path[PATH_MAX];
+    char *debug_text = NULL;
+    char *symbols_text = NULL;
+    char *line_map_text = NULL;
+    char *elf_text = NULL;
+    char *elf_alias_text = NULL;
+    char *macho_text = NULL;
+    char *pe_text = NULL;
+    char *asm_text = NULL;
+    char *asm_source_text = NULL;
+    const char *asm_payload = NULL;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_debug_tools_verify");
+    v3_join_path(src_return, sizeof(src_return), paths.root, "tests/cheng/backend/fixtures/return_add.cheng");
+    v3_join_path(src_program_selfhost, sizeof(src_program_selfhost), paths.root, "v3/src/tests/program_selfhost_smoke.cheng");
+    v3_join_path(src_call_chain, sizeof(src_call_chain), paths.root, "v3/src/tests/ordinary_call_chain_fixture.cheng");
+    v3_join_path(src_windows, sizeof(src_windows), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
+    v3_join_path(linux_obj, sizeof(linux_obj), out_dir, "return_add_linux_aarch64.o");
+    v3_join_path(host_obj, sizeof(host_obj), out_dir, "return_add_host.o");
+    v3_join_path(asm_obj, sizeof(asm_obj), out_dir, "ordinary_call_chain_host.o");
+    v3_join_path(windows_exe, sizeof(windows_exe), out_dir, "hello_importc_puts.exe");
+    v3_join_path(debug_report, sizeof(debug_report), out_dir, "debug-report.txt");
+    v3_join_path(symbols_report, sizeof(symbols_report), out_dir, "symbols.txt");
+    v3_join_path(line_map_report, sizeof(line_map_report), out_dir, "line-map.txt");
+    v3_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
+    v3_join_path(elf_alias_report, sizeof(elf_alias_report), out_dir, "object-elf-alias.txt");
+    v3_join_path(macho_report, sizeof(macho_report), out_dir, "object-macho.txt");
+    v3_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
+    v3_join_path(asm_report, sizeof(asm_report), out_dir, "asm.txt");
+    snprintf(asm_source_path, sizeof(asm_source_path), "%s.s", asm_obj);
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_debug_report,
+                                            "debug-report",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            debug_report) != 0) {
+        goto cleanup;
+    }
+    debug_text = v3_read_file(debug_report);
+    if (debug_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools debug-report", debug_text, "v3_debug_report_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "entry=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "lowering_function_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "primary_object_item_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "native_linker_program=") ||
+        !v3_expect_text_contains("verify-debug-tools debug-report", debug_text, src_return)) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_symbols,
+                                            "print-symbols",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_program_selfhost,
+                                            "obj",
+                                            "arm64-apple-darwin",
+                                            host_obj,
+                                            symbols_report) != 0) {
+        goto cleanup;
+    }
+    symbols_text = v3_read_file(symbols_report);
+    if (symbols_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools symbols", symbols_text, "v3_symbols_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol[0]=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "primary_symbol_count=") ||
+        !v3_expect_text_has_line("verify-debug-tools symbols", symbols_text, "primary_unsupported_count=0")) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_line_map,
+                                            "print-line-map",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            line_map_report) != 0) {
+        goto cleanup;
+    }
+    line_map_text = v3_read_file(line_map_report);
+    if (line_map_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools line-map", line_map_text, "v3_line_map_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools line-map", line_map_text, "entry_count=") ||
+        !v3_expect_text_contains("verify-debug-tools line-map", line_map_text, "entry\t")) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                            "system-link-exec",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            NULL) != 0) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                            "system-link-exec",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "arm64-apple-darwin",
+                                            host_obj,
+                                            NULL) != 0) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_object,
+                                            "print-object",
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            NULL,
+                                            elf_report) != 0) {
+        goto cleanup;
+    }
+    /* print-object needs --object; re-run directly */
+cleanup:
+    free(debug_text);
+    free(symbols_text);
+    free(line_map_text);
+    free(elf_text);
+    free(elf_alias_text);
+    free(macho_text);
+    free(pe_text);
+    free(asm_text);
+    free(asm_source_text);
+    return rc;
+}
+
+static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char tooling_dir[PATH_MAX];
+    DIR *dir;
+    struct dirent *entry;
+    v3_bootstrap_paths_init(&paths);
+    (void)argc;
+    (void)argv;
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] verify-orphan-guard root detect failed\n");
+        return 1;
+    }
+    v3_join_path(tooling_dir, sizeof(tooling_dir), paths.root, "v3/tooling");
+    dir = opendir(tooling_dir);
+    if (dir == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] verify-orphan-guard open failed: %s\n", tooling_dir);
+        return 1;
+    }
+    while ((entry = readdir(dir)) != NULL) {
+        char child_path[PATH_MAX];
+        struct stat st;
+        const char *name = entry->d_name;
+        const char *ext = strrchr(name, '.');
+        char *text;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            continue;
+        }
+        if (strcmp(name, "guarded_exec_v3.py") == 0 ||
+            strcmp(name, "orphan_guard_run.sh") == 0) {
+            fprintf(stderr, "verify_orphan_guard_v3: banned tooling entry name: %s/%s\n", tooling_dir, name);
+            closedir(dir);
+            return 1;
+        }
+        if (ext == NULL || (strcmp(ext, ".sh") != 0 && strcmp(ext, ".py") != 0)) {
+            continue;
+        }
+        v3_join_path(child_path, sizeof(child_path), tooling_dir, name);
+        if (stat(child_path, &st) != 0) {
+            fprintf(stderr, "[cheng_v3_seed] verify-orphan-guard stat failed: %s\n", child_path);
+            closedir(dir);
+            return 1;
+        }
+        if (!S_ISREG(st.st_mode)) {
+            continue;
+        }
+        text = v3_read_file(child_path);
+        if (text == NULL) {
+            fprintf(stderr, "[cheng_v3_seed] verify-orphan-guard read failed: %s\n", child_path);
+            closedir(dir);
+            return 1;
+        }
+        if (strstr(text, "guarded_exec_v3.py") != NULL ||
+            strstr(text, "orphan_guard_run.sh") != NULL) {
+            fprintf(stderr, "verify_orphan_guard_v3: banned direct process guard ref in %s\n", child_path);
+            free(text);
+            closedir(dir);
+            return 1;
+        }
+        free(text);
+    }
+    closedir(dir);
+    puts("verify_orphan_guard_v3 ok");
+    return 0;
+}
+
+static int v3_cmd_verify_debug_tools_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char out_dir[PATH_MAX];
+    char src_return[PATH_MAX];
+    char src_program_selfhost[PATH_MAX];
+    char src_call_chain[PATH_MAX];
+    char src_windows[PATH_MAX];
+    char linux_obj[PATH_MAX];
+    char host_obj[PATH_MAX];
+    char asm_obj[PATH_MAX];
+    char windows_exe[PATH_MAX];
+    char debug_report[PATH_MAX];
+    char symbols_report[PATH_MAX];
+    char line_map_report[PATH_MAX];
+    char elf_report[PATH_MAX];
+    char elf_alias_report[PATH_MAX];
+    char macho_report[PATH_MAX];
+    char pe_report[PATH_MAX];
+    char asm_report[PATH_MAX];
+    char asm_source_path[PATH_MAX];
+    char object_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 24];
+    char *argv_local[4];
+    char *debug_text = NULL;
+    char *symbols_text = NULL;
+    char *line_map_text = NULL;
+    char *elf_text = NULL;
+    char *elf_alias_text = NULL;
+    char *macho_text = NULL;
+    char *pe_text = NULL;
+    char *asm_text = NULL;
+    char *asm_source_text = NULL;
+    const char *asm_payload = NULL;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_debug_tools_verify");
+    v3_join_path(src_return, sizeof(src_return), paths.root, "tests/cheng/backend/fixtures/return_add.cheng");
+    v3_join_path(src_program_selfhost, sizeof(src_program_selfhost), paths.root, "v3/src/tests/program_selfhost_smoke.cheng");
+    v3_join_path(src_call_chain, sizeof(src_call_chain), paths.root, "v3/src/tests/ordinary_call_chain_fixture.cheng");
+    v3_join_path(src_windows, sizeof(src_windows), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
+    v3_join_path(linux_obj, sizeof(linux_obj), out_dir, "return_add_linux_aarch64.o");
+    v3_join_path(host_obj, sizeof(host_obj), out_dir, "return_add_host.o");
+    v3_join_path(asm_obj, sizeof(asm_obj), out_dir, "ordinary_call_chain_host.o");
+    v3_join_path(windows_exe, sizeof(windows_exe), out_dir, "hello_importc_puts.exe");
+    v3_join_path(debug_report, sizeof(debug_report), out_dir, "debug-report.txt");
+    v3_join_path(symbols_report, sizeof(symbols_report), out_dir, "symbols.txt");
+    v3_join_path(line_map_report, sizeof(line_map_report), out_dir, "line-map.txt");
+    v3_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
+    v3_join_path(elf_alias_report, sizeof(elf_alias_report), out_dir, "object-elf-alias.txt");
+    v3_join_path(macho_report, sizeof(macho_report), out_dir, "object-macho.txt");
+    v3_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
+    v3_join_path(asm_report, sizeof(asm_report), out_dir, "asm.txt");
+    snprintf(asm_source_path, sizeof(asm_source_path), "%s.s", asm_obj);
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_debug_report,
+                                            "debug-report",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            debug_report) != 0) {
+        goto cleanup;
+    }
+    debug_text = v3_read_file(debug_report);
+    if (debug_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools debug-report", debug_text, "v3_debug_report_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "entry=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "lowering_function_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "primary_object_item_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools debug-report", debug_text, "native_linker_program=") ||
+        !v3_expect_text_contains("verify-debug-tools debug-report", debug_text, src_return)) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_symbols,
+                                            "print-symbols",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_program_selfhost,
+                                            "obj",
+                                            "arm64-apple-darwin",
+                                            host_obj,
+                                            symbols_report) != 0) {
+        goto cleanup;
+    }
+    symbols_text = v3_read_file(symbols_report);
+    if (symbols_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools symbols", symbols_text, "v3_symbols_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "lowering_symbol[0]=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools symbols", symbols_text, "primary_symbol_count=")) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_line_map,
+                                            "print-line-map",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            line_map_report) != 0) {
+        goto cleanup;
+    }
+    line_map_text = v3_read_file(line_map_report);
+    if (line_map_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools line-map", line_map_text, "v3_line_map_v1") ||
+        !v3_expect_text_has_prefix("verify-debug-tools line-map", line_map_text, "entry_count=") ||
+        !v3_expect_text_contains("verify-debug-tools line-map", line_map_text, "entry\t")) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                            "system-link-exec",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "aarch64-unknown-linux-gnu",
+                                            linux_obj,
+                                            NULL) != 0 ||
+        v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                            "system-link-exec",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_return,
+                                            "obj",
+                                            "arm64-apple-darwin",
+                                            host_obj,
+                                            NULL) != 0 ||
+        v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                            "system-link-exec",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_windows,
+                                            "exe",
+                                            "aarch64-pc-windows-msvc",
+                                            windows_exe,
+                                            NULL) != 0) {
+        goto cleanup;
+    }
+    argv_local[0] = "cheng_v3_seed";
+    argv_local[1] = "print-object";
+    snprintf(object_flag, sizeof(object_flag), "--object:%s", linux_obj);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_report);
+    argv_local[2] = object_flag;
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_object(4, argv_local) != 0) {
+        goto cleanup;
+    }
+    elf_text = v3_read_file(elf_report);
+    if (elf_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools elf", elf_text, "v3_object_report_v1") ||
+        !v3_expect_text_has_line("verify-debug-tools elf", elf_text, "format=elf64") ||
+        !v3_expect_text_has_prefix("verify-debug-tools elf", elf_text, "section_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools elf", elf_text, "symbol_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools elf", elf_text, "reloc_count=")) {
+        goto cleanup;
+    }
+    argv_local[1] = "print-elf";
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_alias_report);
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_elf(4, argv_local) != 0) {
+        goto cleanup;
+    }
+    elf_alias_text = v3_read_file(elf_alias_report);
+    if (elf_alias_text == NULL || strcmp(elf_text, elf_alias_text) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-tools print-elf alias drift\n");
+        goto cleanup;
+    }
+    argv_local[1] = "print-object";
+    snprintf(object_flag, sizeof(object_flag), "--object:%s", host_obj);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", macho_report);
+    argv_local[2] = object_flag;
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_object(4, argv_local) != 0) {
+        goto cleanup;
+    }
+    macho_text = v3_read_file(macho_report);
+    if (macho_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools macho", macho_text, "v3_object_report_v1") ||
+        !v3_expect_text_has_line("verify-debug-tools macho", macho_text, "format=macho64") ||
+        !v3_expect_text_has_prefix("verify-debug-tools macho", macho_text, "load_command_count=") ||
+        !v3_expect_text_has_prefix("verify-debug-tools macho", macho_text, "section_count=")) {
+        goto cleanup;
+    }
+    snprintf(object_flag, sizeof(object_flag), "--object:%s", windows_exe);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", pe_report);
+    argv_local[2] = object_flag;
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_object(4, argv_local) != 0) {
+        goto cleanup;
+    }
+    pe_text = v3_read_file(pe_report);
+    if (pe_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools pe", pe_text, "v3_object_report_v1") ||
+        !v3_expect_text_has_line("verify-debug-tools pe", pe_text, "format=pe/coff") ||
+        !v3_expect_text_has_prefix("verify-debug-tools pe", pe_text, "import_count=") ||
+        !v3_expect_text_contains("verify-debug-tools pe", pe_text, "UCRTBASE.dll!puts") ||
+        !v3_expect_text_contains("verify-debug-tools pe", pe_text, "KERNEL32.dll!ExitProcess")) {
+        goto cleanup;
+    }
+    if (v3_invoke_command_with_common_flags(v3_cmd_print_asm,
+                                            "print-asm",
+                                            paths.stage1_source,
+                                            paths.root,
+                                            src_call_chain,
+                                            "obj",
+                                            "arm64-apple-darwin",
+                                            asm_obj,
+                                            asm_report) != 0) {
+        goto cleanup;
+    }
+    asm_text = v3_read_file(asm_report);
+    asm_source_text = v3_read_file(asm_source_path);
+    asm_payload = v3_text_after_marker(asm_text, "asm_text_begin\n");
+    if (asm_text == NULL ||
+        asm_source_text == NULL ||
+        asm_payload == NULL ||
+        !v3_expect_text_has_line("verify-debug-tools asm", asm_text, "v3_asm_report_v1") ||
+        !v3_expect_text_has_line("verify-debug-tools asm", asm_text, "asm_text_begin") ||
+        !v3_expect_text_contains("verify-debug-tools asm", asm_payload, ".globl") ||
+        strcmp(asm_payload, asm_source_text) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-tools asm payload mismatch\n");
+        goto cleanup;
+    }
+    if (v3_cmd_verify_orphan_guard_impl(0, NULL) != 0) {
+        goto cleanup;
+    }
+    puts("v3 debug tools: ok");
+    rc = 0;
+cleanup:
+    free(debug_text);
+    free(symbols_text);
+    free(line_map_text);
+    free(elf_text);
+    free(elf_alias_text);
+    free(macho_text);
+    free(pe_text);
+    free(asm_text);
+    free(asm_source_text);
+    return rc;
+}
+
+static bool v3_verify_runtime_fixture_output(const char *label,
+                                             const char *fixture_path,
+                                             const char *run_log_path,
+                                             const char *message_substring,
+                                             const char *reason_line,
+                                             bool require_signal_fields) {
+    char *run_text = v3_read_file(run_log_path);
+    bool ok = true;
+    if (run_text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s missing run log: %s\n", label, run_log_path);
+        return false;
+    }
+    ok = ok && v3_expect_text_contains(label, run_text, message_substring);
+    ok = ok && v3_expect_text_has_line(label, run_text, "[cheng-v3] v3_crash_report_v1");
+    ok = ok && v3_expect_text_has_line(label, run_text, reason_line);
+    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] regs pc=0x");
+    ok = ok && v3_expect_text_contains(label, run_text, " fp=0x");
+    ok = ok && v3_expect_text_contains(label, run_text, " sp=0x");
+    ok = ok && v3_expect_text_contains(label, run_text, " lr=0x");
+    if (require_signal_fields) {
+        ok = ok && v3_expect_text_contains(label, run_text, " sig=");
+        ok = ok && v3_expect_text_contains(label, run_text, " fault=0x");
+    }
+    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] m#");
+    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] #");
+    ok = ok && v3_expect_text_contains(label, run_text, fixture_path);
+    free(run_text);
+    return ok;
+}
+
+static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char src_panic[PATH_MAX];
+    char src_bounds[PATH_MAX];
+    char src_signal[PATH_MAX];
+    char panic_bin[PATH_MAX];
+    char bounds_bin[PATH_MAX];
+    char signal_bin[PATH_MAX];
+    char panic_compile_log[PATH_MAX];
+    char bounds_compile_log[PATH_MAX];
+    char signal_compile_log[PATH_MAX];
+    char panic_run_log[PATH_MAX];
+    char bounds_run_log[PATH_MAX];
+    char signal_run_log[PATH_MAX];
+    char panic_line_map[PATH_MAX];
+    char bounds_line_map[PATH_MAX];
+    char signal_line_map[PATH_MAX];
+    char *panic_argv[2];
+    char *bounds_argv[2];
+    char *signal_argv[2];
+    char *bounds_log_text = NULL;
+    int status = 0;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (v3_cmd_build_backend_driver(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(root_v3, sizeof(root_v3), paths.root, "v3");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_debug_runtime_verify");
+    v3_join_path(src_panic, sizeof(src_panic), paths.root, "v3/src/tests/ordinary_panic_fixture.cheng");
+    v3_join_path(src_bounds, sizeof(src_bounds), paths.root, "v3/src/tests/ordinary_bounds_trace_fixture.cheng");
+    v3_join_path(src_signal, sizeof(src_signal), paths.root, "v3/src/tests/ordinary_signal_trace_fixture.cheng");
+    v3_join_path(panic_bin, sizeof(panic_bin), out_dir, "ordinary_panic_fixture");
+    v3_join_path(bounds_bin, sizeof(bounds_bin), out_dir, "ordinary_bounds_trace_fixture");
+    v3_join_path(signal_bin, sizeof(signal_bin), out_dir, "ordinary_signal_trace_fixture");
+    v3_join_path(panic_compile_log, sizeof(panic_compile_log), out_dir, "ordinary_panic_fixture.compile.log");
+    v3_join_path(bounds_compile_log, sizeof(bounds_compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
+    v3_join_path(signal_compile_log, sizeof(signal_compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
+    v3_join_path(panic_run_log, sizeof(panic_run_log), out_dir, "ordinary_panic_fixture.run.log");
+    v3_join_path(bounds_run_log, sizeof(bounds_run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
+    v3_join_path(signal_run_log, sizeof(signal_run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
+    snprintf(panic_line_map, sizeof(panic_line_map), "%s.v3.map", panic_bin);
+    snprintf(bounds_line_map, sizeof(bounds_line_map), "%s.v3.map", bounds_bin);
+    snprintf(signal_line_map, sizeof(signal_line_map), "%s.v3.map", signal_bin);
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    if (!v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_panic, panic_bin, panic_compile_log) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_bounds, bounds_bin, bounds_compile_log) ||
+        !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_signal, signal_bin, signal_compile_log) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime panic line-map", panic_line_map) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime bounds line-map", bounds_line_map) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime signal line-map", signal_line_map)) {
+        return 1;
+    }
+    panic_argv[0] = panic_bin;
+    panic_argv[1] = NULL;
+    bounds_argv[0] = bounds_bin;
+    bounds_argv[1] = NULL;
+    signal_argv[0] = signal_bin;
+    signal_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(panic_argv, panic_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("verify-debug-runtime panic",
+                                          src_panic,
+                                          panic_run_log,
+                                          "v3 panic fixture",
+                                          "[cheng-v3] reason=panic mode=backtrace",
+                                          false)) {
+        return 1;
+    }
+    if (!v3_run_binary_capture_output(bounds_argv, bounds_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("verify-debug-runtime bounds",
+                                          src_bounds,
+                                          bounds_run_log,
+                                          "[cheng] bounds check failed: idx=1 len=1",
+                                          "[cheng-v3] reason=bounds mode=backtrace",
+                                          false)) {
+        return 1;
+    }
+    bounds_log_text = v3_read_file(bounds_run_log);
+    if (bounds_log_text == NULL ||
+        !v3_expect_text_contains("verify-debug-runtime bounds", bounds_log_text, "ordinary_bounds_trace_fixture")) {
+        free(bounds_log_text);
+        return 1;
+    }
+    free(bounds_log_text);
+    if (!v3_run_binary_capture_output(signal_argv, signal_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_verify_runtime_fixture_output("verify-debug-runtime signal",
+                                          src_signal,
+                                          signal_run_log,
+                                          "[cheng-v3] v3_crash_report_v1",
+                                          "[cheng-v3] reason=signal mode=signal",
+                                          true)) {
+        return 1;
+    }
+    puts("v3 debug runtime: ok");
+    return 0;
+}
+
+static int v3_cmd_verify_debug_profile_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char out_dir[PATH_MAX];
+    char src[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char report[PATH_MAX];
+    char *report_text = NULL;
+    int rc = 1;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_debug_profile_verify");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_profile_hotspots_fixture.cheng");
+    v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_profile_hotspots_fixture");
+    v3_join_path(report, sizeof(report), out_dir, "profile.txt");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    if (v3_invoke_profile_run(paths.stage1_source,
+                              paths.root,
+                              src,
+                              "arm64-apple-darwin",
+                              out_bin,
+                              "200",
+                              report) != 0) {
+        return 1;
+    }
+    report_text = v3_read_file(report);
+    if (report_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-profile", report_text, "v3_profile_v1") ||
+        !v3_text_has_positive_integer_line(report_text, "total_samples=") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "hot_function[0]=") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "hot_function[1]=") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "hot_") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "ordinary_profile_hotspots_fixture.cheng") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "hot_pc[0]=") ||
+        !v3_expect_text_contains("verify-debug-profile", report_text, "|0x")) {
+        goto cleanup;
+    }
+    puts("v3 debug profile: ok");
+    rc = 0;
+cleanup:
+    free(report_text);
+    return rc;
+}
+
+static bool v3_verify_builtin_output_common(const char *label,
+                                            const char *out_path,
+                                            const char *report_path,
+                                            const char *expected_linker_program,
+                                            const char *expected_flavor) {
+    char *report_text = v3_read_file(report_path);
+    bool ok = true;
+    if (!v3_expect_file_exists_nonempty(label, out_path) || report_text == NULL) {
+        free(report_text);
+        return false;
+    }
+    ok = ok && v3_expect_text_contains(label, report_text, expected_linker_program);
+    ok = ok && v3_expect_text_contains(label, report_text, expected_flavor);
+    ok = ok && v3_expect_text_contains(label, report_text, "native_link_input_count=0");
+    ok = ok && v3_expect_text_contains(label, report_text, "native_link_missing_reasons=-");
+    free(report_text);
+    return ok;
+}
+
+static bool v3_build_builtin_fixture_current(const char *contract_path,
+                                             const char *root_path,
+                                             const char *src_path,
+                                             const char *target,
+                                             const char *out_path,
+                                             const char *report_path) {
+    return v3_invoke_command_with_common_flags(v3_cmd_system_link_exec,
+                                               "system-link-exec",
+                                               contract_path,
+                                               root_path,
+                                               src_path,
+                                               "exe",
+                                               target,
+                                               out_path,
+                                               report_path) == 0;
+}
+
+static int v3_cmd_verify_windows_builtin_impl(int argc, char **argv) {
+    static const char *RETURN_FIXTURES[] = {
+        "return_add", "return_call", "return_if_stmt", "return_while_sum",
+        "return_and_expr", "return_bitwise", "return_shift", "return_for_sum",
+        "return_while_break", "return_while_continue", "return_inline_if_and_ternary",
+        "return_call_mixed", "return_float32_arith_chain", "return_float32_roundtrip",
+        "return_float64_ops", "return_float_compare_cast", "return_float_mixed_int_cast",
+        "return_cast_i32",
+        "return_cast_i64"
+    };
+    V3BootstrapPaths paths;
+    char out_dir[PATH_MAX];
+    char hello_src[PATH_MAX];
+    char hello_out[PATH_MAX];
+    char hello_report[PATH_MAX];
+    char pe_report[PATH_MAX];
+    char object_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 24];
+    char *argv_local[4];
+    char *pe_text = NULL;
+    size_t i;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_windows_builtin_verify");
+    v3_join_path(hello_src, sizeof(hello_src), paths.root, "tests/cheng/backend/fixtures/hello_importc_puts.cheng");
+    v3_join_path(hello_out, sizeof(hello_out), out_dir, "hello_importc_puts.exe");
+    v3_join_path(hello_report, sizeof(hello_report), out_dir, "hello_importc_puts.report");
+    v3_join_path(pe_report, sizeof(pe_report), out_dir, "object-pe.txt");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_build_builtin_fixture_current(paths.stage1_source,
+                                          paths.root,
+                                          hello_src,
+                                          "aarch64-pc-windows-msvc",
+                                          hello_out,
+                                          hello_report) ||
+        !v3_verify_builtin_output_common("verify-windows-builtin hello",
+                                         hello_out,
+                                         hello_report,
+                                         "native_linker_program=internal_pe_consteval_linker",
+                                         "native_linker_flavor=pe_aarch64_consteval_internal")) {
+        return 1;
+    }
+    argv_local[0] = "cheng_v3_seed";
+    argv_local[1] = "print-object";
+    snprintf(object_flag, sizeof(object_flag), "--object:%s", hello_out);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", pe_report);
+    argv_local[2] = object_flag;
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_object(4, argv_local) != 0) {
+        return 1;
+    }
+    pe_text = v3_read_file(pe_report);
+    if (pe_text == NULL ||
+        !v3_expect_text_has_line("verify-windows-builtin", pe_text, "format=pe/coff") ||
+        !v3_expect_text_contains("verify-windows-builtin", pe_text, "UCRTBASE.dll!puts") ||
+        !v3_expect_text_contains("verify-windows-builtin", pe_text, "KERNEL32.dll!ExitProcess")) {
+        free(pe_text);
+        return 1;
+    }
+    free(pe_text);
+    for (i = 0U; i < sizeof(RETURN_FIXTURES) / sizeof(RETURN_FIXTURES[0]); ++i) {
+        char src[PATH_MAX];
+        char out_path[PATH_MAX];
+        char report_path[PATH_MAX];
+        v3_join_path(src, sizeof(src), paths.root, "tests/cheng/backend/fixtures");
+        v3_join_path(src, sizeof(src), src, RETURN_FIXTURES[i]);
+        strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
+        v3_join_path(out_path, sizeof(out_path), out_dir, RETURN_FIXTURES[i]);
+        strncat(out_path, ".exe", sizeof(out_path) - strlen(out_path) - 1U);
+        v3_join_path(report_path, sizeof(report_path), out_dir, RETURN_FIXTURES[i]);
+        strncat(report_path, ".report", sizeof(report_path) - strlen(report_path) - 1U);
+        if (!v3_build_builtin_fixture_current(paths.stage1_source,
+                                              paths.root,
+                                              src,
+                                              "aarch64-pc-windows-msvc",
+                                              out_path,
+                                              report_path) ||
+            !v3_verify_builtin_output_common("verify-windows-builtin fixture",
+                                             out_path,
+                                             report_path,
+                                             "native_linker_program=internal_pe_consteval_linker",
+                                             "native_linker_flavor=pe_aarch64_consteval_internal")) {
+            return 1;
+        }
+    }
+    puts("verify_windows_builtin_linker_v3 ok");
+    return 0;
+}
+
+static int v3_cmd_verify_riscv64_builtin_impl(int argc, char **argv) {
+    static const char *RETURN_FIXTURES[] = {
+        "return_add", "return_call", "return_if_stmt", "return_while_sum",
+        "return_and_expr", "return_bitwise", "return_shift", "return_for_sum",
+        "return_while_break", "return_while_continue", "return_inline_if_and_ternary",
+        "return_call_mixed", "return_float32_arith_chain", "return_float32_roundtrip",
+        "return_float64_ops", "return_float_compare_cast", "return_float_mixed_int_cast",
+        "return_cast_i32",
+        "return_cast_i64"
+    };
+    V3BootstrapPaths paths;
+    char out_dir[PATH_MAX];
+    char hello_src[PATH_MAX];
+    char hello_out[PATH_MAX];
+    char hello_report[PATH_MAX];
+    char elf_report[PATH_MAX];
+    char object_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 24];
+    char *argv_local[4];
+    char *elf_text = NULL;
+    size_t i;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_riscv64_builtin_verify");
+    v3_join_path(hello_src, sizeof(hello_src), paths.root, "tests/cheng/backend/fixtures/hello_puts.cheng");
+    v3_join_path(hello_out, sizeof(hello_out), out_dir, "hello_puts");
+    v3_join_path(hello_report, sizeof(hello_report), out_dir, "hello_puts.report");
+    v3_join_path(elf_report, sizeof(elf_report), out_dir, "object-elf.txt");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_build_builtin_fixture_current(paths.stage1_source,
+                                          paths.root,
+                                          hello_src,
+                                          "riscv64-unknown-linux-gnu",
+                                          hello_out,
+                                          hello_report) ||
+        !v3_verify_builtin_output_common("verify-riscv64-builtin hello",
+                                         hello_out,
+                                         hello_report,
+                                         "native_linker_program=internal_elf_consteval_linker",
+                                         "native_linker_flavor=elf_riscv64_consteval_internal")) {
+        return 1;
+    }
+    argv_local[0] = "cheng_v3_seed";
+    argv_local[1] = "print-object";
+    snprintf(object_flag, sizeof(object_flag), "--object:%s", hello_out);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", elf_report);
+    argv_local[2] = object_flag;
+    argv_local[3] = report_flag;
+    if (v3_cmd_print_object(4, argv_local) != 0) {
+        return 1;
+    }
+    elf_text = v3_read_file(elf_report);
+    if (elf_text == NULL ||
+        !v3_expect_text_has_line("verify-riscv64-builtin", elf_text, "format=elf64") ||
+        !v3_expect_text_has_line("verify-riscv64-builtin", elf_text, "elf_type=exec") ||
+        !v3_expect_text_contains("verify-riscv64-builtin", elf_text, "machine=243")) {
+        free(elf_text);
+        return 1;
+    }
+    free(elf_text);
+    for (i = 0U; i < sizeof(RETURN_FIXTURES) / sizeof(RETURN_FIXTURES[0]); ++i) {
+        char src[PATH_MAX];
+        char out_path[PATH_MAX];
+        char report_path[PATH_MAX];
+        v3_join_path(src, sizeof(src), paths.root, "tests/cheng/backend/fixtures");
+        v3_join_path(src, sizeof(src), src, RETURN_FIXTURES[i]);
+        strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
+        v3_join_path(out_path, sizeof(out_path), out_dir, RETURN_FIXTURES[i]);
+        v3_join_path(report_path, sizeof(report_path), out_dir, RETURN_FIXTURES[i]);
+        strncat(report_path, ".report", sizeof(report_path) - strlen(report_path) - 1U);
+        if (!v3_build_builtin_fixture_current(paths.stage1_source,
+                                              paths.root,
+                                              src,
+                                              "riscv64-unknown-linux-gnu",
+                                              out_path,
+                                              report_path) ||
+            !v3_verify_builtin_output_common("verify-riscv64-builtin fixture",
+                                             out_path,
+                                             report_path,
+                                             "native_linker_program=internal_elf_consteval_linker",
+                                             "native_linker_flavor=elf_riscv64_consteval_internal")) {
+            return 1;
+        }
+    }
+    puts("verify_riscv64_builtin_linker_v3 ok");
+    return 0;
+}
+
+static int v3_cmd_run_cross_target_smokes_impl(int argc, char **argv) {
+    (void)argc;
+    (void)argv;
+    if (v3_cmd_verify_windows_builtin_impl(0, NULL) != 0) {
+        return 1;
+    }
+    if (v3_cmd_verify_riscv64_builtin_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("run_v3_windows_riscv_builtin_smokes ok");
+    return 0;
+}
+
+static size_t v3_collect_smoke_positionals(int argc,
+                                           char **argv,
+                                           const char **out,
+                                           size_t cap) {
+    size_t count = 0U;
+    int i;
+    for (i = 2; i < argc && count < cap; ++i) {
+        const char *arg = argv[i];
+        if (arg == NULL || arg[0] == '\0') {
+            continue;
+        }
+        if (strncmp(arg, "--", 2U) == 0) {
+            if ((strcmp(arg, "--compiler") == 0 ||
+                 strcmp(arg, "--tail-only") == 0 ||
+                 strcmp(arg, "--label") == 0) &&
+                (i + 1) < argc) {
+                i += 1;
+            }
+            continue;
+        }
+        out[count++] = arg;
+    }
+    return count;
+}
+
+static bool v3_run_fixture_smoke_direct(const char *suite_label,
+                                        const char *compile_label,
+                                        const char *compiler_bin,
+                                        const char *root,
+                                        const char *root_v3,
+                                        const char *smoke_name,
+                                        const char *out_bin) {
+    char src[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char line_map[PATH_MAX];
+    char *run_argv[2];
+    int status = 0;
+    v3_join_path(src, sizeof(src), root, "v3/src/tests");
+    v3_join_path(src, sizeof(src), src, smoke_name);
+    strncat(src, ".cheng", sizeof(src) - strlen(src) - 1U);
+    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", out_bin);
+    snprintf(run_log, sizeof(run_log), "%s.run.log", out_bin);
+    snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
+    unlink(out_bin);
+    unlink(compile_log);
+    unlink(run_log);
+    unlink(line_map);
+    printf("[%s] compile %s\n", suite_label, compile_label);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_v3, src, out_bin, compile_log)) {
+        fprintf(stderr, "%s: compile failed: %s\n", suite_label, compile_label);
+        return false;
+    }
+    printf("[%s] run %s\n", suite_label, compile_label);
+    run_argv[0] = (char *)out_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "%s: run failed: %s\n", suite_label, compile_label);
+        return false;
+    }
+    return v3_dump_file_stdout(run_log);
+}
+
+static int v3_run_chain_node_process_smoke_with_env(const char *compiler_bin,
+                                                    const char *label,
+                                                    bool stage23_env) {
+    char saved_compiler[PATH_MAX];
+    char saved_label[256];
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_compiler = false;
+    bool had_label = false;
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    int rc;
+    v3_save_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
+    v3_save_env_value("CHENG_V3_CHAIN_NODE_LABEL", saved_label, sizeof(saved_label), &had_label);
+    setenv("CHENG_V3_CHAIN_NODE_COMPILER", compiler_bin, 1);
+    setenv("CHENG_V3_CHAIN_NODE_LABEL", label, 1);
+    if (stage23_env) {
+        v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+        v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+        setenv("BACKEND_INCREMENTAL", "0", 1);
+        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    }
+    rc = v3_cmd_run_chain_node_process_smoke_impl(0, NULL);
+    if (stage23_env) {
+        v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+        v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    }
+    v3_restore_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
+    v3_restore_env_value("CHENG_V3_CHAIN_NODE_LABEL", saved_label, had_label);
+    return rc;
+}
+
+static int v3_run_chain_node_three_node_smoke_with_env(const char *compiler_bin,
+                                                       const char *label,
+                                                       bool stage23_env) {
+    char saved_compiler[PATH_MAX];
+    char saved_label[256];
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_compiler = false;
+    bool had_label = false;
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    int rc;
+    v3_save_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
+    v3_save_env_value("CHENG_V3_CHAIN_NODE_LABEL", saved_label, sizeof(saved_label), &had_label);
+    setenv("CHENG_V3_CHAIN_NODE_COMPILER", compiler_bin, 1);
+    setenv("CHENG_V3_CHAIN_NODE_LABEL", label, 1);
+    if (stage23_env) {
+        v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+        v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+        setenv("BACKEND_INCREMENTAL", "0", 1);
+        setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    }
+    rc = v3_cmd_run_chain_node_three_node_smoke_impl(0, NULL);
+    if (stage23_env) {
+        v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+        v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    }
+    v3_restore_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, had_compiler);
+    v3_restore_env_value("CHENG_V3_CHAIN_NODE_LABEL", saved_label, had_label);
+    return rc;
+}
+
+static int v3_run_host_leaf_script(const char *root,
+                                   const char *script_rel_path,
+                                   const char *compiler_bin,
+                                   const char *label) {
+    char compiler_flag[PATH_MAX + 16];
+    char label_flag[256];
+    char *argv_local[4];
+    (void)root;
+    snprintf(compiler_flag, sizeof(compiler_flag), "--compiler:%s", compiler_bin);
+    snprintf(label_flag, sizeof(label_flag), "--label:%s", label);
+    argv_local[0] = (char *)"cheng_v3_seed";
+    argv_local[2] = compiler_flag;
+    argv_local[3] = label_flag;
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_wasm_smokes.sh") == 0) {
+        argv_local[1] = (char *)"run-wasm-smokes";
+        return v3_cmd_run_wasm_smokes_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_browser_host_wasm_smoke.sh") == 0) {
+        argv_local[1] = (char *)"run-browser-host-wasm-smoke";
+        return v3_cmd_run_browser_host_wasm_smoke_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_tcp_twoproc_smoke.sh") == 0) {
+        argv_local[1] = (char *)"run-tcp-twoproc-smoke";
+        return v3_cmd_run_tcp_twoproc_smoke_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_udp_importc_smoke.sh") == 0) {
+        argv_local[1] = (char *)"run-udp-importc-smoke";
+        return v3_cmd_run_udp_importc_smoke_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_chain_node_cli_smoke.sh") == 0) {
+        argv_local[1] = (char *)"run-chain-node-cli-smoke";
+        return v3_cmd_run_chain_node_cli_smoke_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_tailnet_control_smoke.sh") == 0) {
+        argv_local[1] = (char *)"run-tailnet-control-smoke";
+        return v3_cmd_run_tailnet_control_smoke_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_fresh_node_selfhost_gate.sh") == 0) {
+        argv_local[1] = (char *)"run-fresh-node-selfhost-gate";
+        return v3_cmd_run_fresh_node_selfhost_gate_impl(4, argv_local);
+    }
+    if (strcmp(script_rel_path, "v3/tooling/run_v3_migration_gate.sh") == 0) {
+        argv_local[1] = (char *)"run-migration-gate";
+        return v3_cmd_run_migration_gate_impl(4, argv_local);
+    }
+    return 1;
+}
+
+static int v3_run_stage23_leaf_script(const char *root,
+                                      const char *script_rel_path,
+                                      const char *compiler_bin,
+                                      const char *label) {
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    int rc;
+    (void)root;
+    v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+    v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+    setenv("BACKEND_INCREMENTAL", "0", 1);
+    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    rc = v3_run_host_leaf_script(root, script_rel_path, compiler_bin, label);
+    v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+    v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    return rc;
+}
+
+static int v3_run_stage23_browser_webrtc_script(const char *root,
+                                                const char *compiler_bin,
+                                                size_t positional_count,
+                                                const char **positionals) {
+    char saved_compiler[PATH_MAX];
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_compiler = false;
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    char **argv_local;
+    size_t i;
+    int rc;
+    (void)root;
+    v3_save_env_value("CHENG_V3_SMOKE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
+    v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+    v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+    setenv("CHENG_V3_SMOKE_COMPILER", compiler_bin, 1);
+    setenv("BACKEND_INCREMENTAL", "0", 1);
+    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    argv_local = (char **)v3_xmalloc(sizeof(char *) * (positional_count + 3U));
+    argv_local[0] = (char *)"cheng_v3_seed";
+    argv_local[1] = (char *)"run-browser-webrtc-smokes";
+    for (i = 0U; i < positional_count; ++i) {
+        argv_local[i + 2U] = (char *)(positionals[i] != NULL ? positionals[i] : "");
+    }
+    argv_local[positional_count + 2U] = NULL;
+    rc = v3_cmd_run_browser_webrtc_smokes_impl((int)(positional_count + 2U), argv_local);
+    free(argv_local);
+    v3_restore_env_value("CHENG_V3_SMOKE_COMPILER", saved_compiler, had_compiler);
+    v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+    v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    return rc;
+}
+
+static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_bin[PATH_MAX];
+    const char *tail_only;
+    const char *explicit_compiler;
+    const char *env_compiler;
+    const char *compiler_bin;
+    const char *positionals[256];
+    size_t positional_count;
+    size_t i;
+    bool run_tail = true;
+    static const char *DEFAULT_SMOKES[] = {
+        "ref10_ashr_smoke",
+        "fixed256_curve25519_smoke",
+        "fixedbytes32_seq_index_smoke",
+        "compiler_runtime_smoke",
+        "global_fixed_array_composite_smoke",
+        "multiline_header_indent_smoke",
+        "rwad_serial_state_machine_smoke",
+        "rwad_bft_state_machine_smoke",
+        "parser_path_smoke",
+        "compiler_pipeline_stub_smoke",
+        "lowering_plan_smoke",
+        "compiler_equivalence_smoke",
+        "compiler_publish_smoke",
+        "bft_three_replica_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "ffi_handle_smoke",
+        "program_selfhost_smoke",
+        "csg_smoke",
+        "consensus_smoke",
+        "chain_node_smoke",
+        "chain_node_zero_snapshot_replay_smoke",
+        "chain_node_tailnet_smoke",
+        "chain_node_libp2p_smoke",
+        "bft_finalize_summary_smoke",
+        "bft_state_machine_smoke",
+        "oracle_plane_smoke",
+        "oracle_bft_state_machine_smoke",
+        "oracle_bft_three_replica_smoke",
+        "oracle_runtime_host_smoke",
+        "overlay_contracts_smoke",
+        "pubsub_smoke",
+        "dag_mempool_smoke",
+        "plumtree_smoke",
+        "erasure_swarm_smoke",
+        "pin_plane_smoke",
+        "pin_scheduler_smoke",
+        "pin_runtime_host_smoke",
+        "pin_runtime_quic_smoke",
+        "content_codec_smoke",
+        "content_runtime_smoke",
+        "native_client_hello_wire_smoke",
+        "quic_transport_loopback_smoke",
+        "libp2p_quic_tls_smoke",
+        "libp2p_tailnet_policy_smoke",
+        "libp2p_tailnet_visibility_smoke",
+        "libp2p_tailnet_transport_smoke",
+        "libp2p_tailnet_derp_smoke",
+        "libp2p_resource_smoke",
+        "libp2p_scheduler_smoke",
+        "tailnet_control_core_smoke",
+        "tailnet_train_island_smoke",
+        "webrtc_signal_codec_smoke",
+        "webrtc_signal_session_smoke",
+        "webrtc_turn_fallback_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "content_quic_smoke",
+        "webrtc_datachannel_content_smoke",
+        "content_stub_smoke",
+        "libp2p_protocols_smoke",
+        "location_proof_smoke",
+        "chain_codec_binary_smoke",
+        "anti_entropy_smoke",
+        "anti_entropy_signature_fields_smoke",
+        "lsmr_types_smoke",
+        "lsmr_locality_storage_smoke",
+        "lsmr_bagua_prefix_tree_smoke",
+        "udp_importc_smoke",
+        "mobile_bridge_smoke",
+        "mobile_sdk_smoke",
+        "did_identity_smoke"
+    };
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    explicit_compiler = v3_flag_value(argc, argv, "--compiler");
+    env_compiler = getenv("CHENG_V3_SMOKE_COMPILER");
+    compiler_bin = (explicit_compiler != NULL && explicit_compiler[0] != '\0') ?
+                       explicit_compiler :
+                       ((env_compiler != NULL && env_compiler[0] != '\0') ? env_compiler : paths.backend_driver_out);
+    if (access(compiler_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] run-host-smokes missing compiler: %s\n", compiler_bin);
+        return 1;
+    }
+    tail_only = v3_flag_value(argc, argv, "--tail-only");
+    if (tail_only != NULL && tail_only[0] != '\0') {
+        if (strcmp(tail_only, "wasm") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_wasm_smokes.sh", compiler_bin, "host");
+        }
+        if (strcmp(tail_only, "browser_host_wasm") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_browser_host_wasm_smoke.sh", compiler_bin, "host");
+        }
+        if (strcmp(tail_only, "chain_node_cli") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_chain_node_cli_smoke.sh", compiler_bin, "host");
+        }
+        if (strcmp(tail_only, "chain_node_process") == 0) {
+            return v3_run_chain_node_process_smoke_with_env(compiler_bin, "host", false);
+        }
+        if (strcmp(tail_only, "chain_node_three_node") == 0) {
+            return v3_run_chain_node_three_node_smoke_with_env(compiler_bin, "host", false);
+        }
+        if (strcmp(tail_only, "tailnet_control") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_tailnet_control_smoke.sh", compiler_bin, "host");
+        }
+        if (strcmp(tail_only, "fresh_node_selfhost") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_fresh_node_selfhost_gate.sh", compiler_bin, "host");
+        }
+        if (strcmp(tail_only, "migration") == 0) {
+            return v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_migration_gate.sh", compiler_bin, "host");
+        }
+        fprintf(stderr, "[cheng_v3_seed] run-host-smokes unknown --tail-only: %s\n", tail_only);
+        return 1;
+    }
+    positional_count = v3_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
+    if (positional_count > 0U) {
+        run_tail = false;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_hostrun");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    if (positional_count > 0U) {
+        for (i = 0U; i < positional_count; ++i) {
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
+            if (!v3_run_fixture_smoke_direct("v3 host smokes",
+                                             positionals[i],
+                                             compiler_bin,
+                                             paths.root,
+                                             root_v3,
+                                             positionals[i],
+                                             out_bin)) {
+                return 1;
+            }
+            if (strcmp(positionals[i], "chain_node_libp2p_smoke") == 0 &&
+                v3_run_host_leaf_script(paths.root,
+                                        "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                        compiler_bin,
+                                        "host") != 0) {
+                return 1;
+            }
+        }
+    } else {
+        for (i = 0U; i < sizeof(DEFAULT_SMOKES) / sizeof(DEFAULT_SMOKES[0]); ++i) {
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
+            if (!v3_run_fixture_smoke_direct("v3 host smokes",
+                                             DEFAULT_SMOKES[i],
+                                             compiler_bin,
+                                             paths.root,
+                                             root_v3,
+                                             DEFAULT_SMOKES[i],
+                                             out_bin)) {
+                return 1;
+            }
+            if (strcmp(DEFAULT_SMOKES[i], "chain_node_libp2p_smoke") == 0 &&
+                v3_run_host_leaf_script(paths.root,
+                                        "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                        compiler_bin,
+                                        "host") != 0) {
+                return 1;
+            }
+        }
+    }
+    if (run_tail) {
+        if (v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_chain_node_cli_smoke.sh", compiler_bin, "host") != 0 ||
+            v3_run_chain_node_process_smoke_with_env(compiler_bin, "host", false) != 0 ||
+            v3_run_chain_node_three_node_smoke_with_env(compiler_bin, "host", false) != 0 ||
+            v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_tailnet_control_smoke.sh", compiler_bin, "host") != 0 ||
+            v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_fresh_node_selfhost_gate.sh", compiler_bin, "host") != 0 ||
+            v3_run_host_leaf_script(paths.root, "v3/tooling/run_v3_migration_gate.sh", compiler_bin, "host") != 0) {
+            return 1;
+        }
+    }
+    puts("v3 host smokes: ok");
+    return 0;
+}
+
+static int v3_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_label[PATH_MAX];
+    const char *tail_only;
+    const char *positionals[256];
+    size_t positional_count;
+    size_t i;
+    char saved_incremental[64];
+    char saved_multi_cache[64];
+    bool had_incremental = false;
+    bool had_multi_cache = false;
+    bool run_tail = true;
+    static const char *DEFAULT_SMOKES[] = {
+        "fixed256_curve25519_smoke",
+        "compiler_runtime_smoke",
+        "compiler_pipeline_stub_smoke",
+        "lowering_plan_smoke",
+        "compiler_equivalence_smoke",
+        "compiler_publish_smoke",
+        "bft_three_replica_smoke",
+        "primary_object_plan_smoke",
+        "object_native_link_plan_smoke",
+        "program_selfhost_smoke",
+        "libp2p_core_smoke",
+        "libp2p_multiaddr_parse_boundary_smoke",
+        "libp2p_host_smoke",
+        "libp2p_tailnet_policy_smoke",
+        "libp2p_tailnet_visibility_smoke",
+        "libp2p_tailnet_transport_smoke",
+        "libp2p_tailnet_derp_smoke",
+        "libp2p_resource_smoke",
+        "libp2p_scheduler_smoke",
+        "tailnet_control_core_smoke",
+        "tailnet_train_island_smoke",
+        "webrtc_signal_codec_smoke",
+        "webrtc_signal_session_smoke",
+        "webrtc_turn_fallback_smoke",
+        "libp2p_webrtc_sync_smoke",
+        "libp2p_tcp_smoke",
+        "libp2p_overlay_smoke",
+        "libp2p_protocols_smoke",
+        "chain_codec_binary_smoke",
+        "location_proof_smoke",
+        "anti_entropy_smoke",
+        "anti_entropy_signature_fields_smoke",
+        "lsmr_types_smoke",
+        "lsmr_locality_storage_smoke",
+        "lsmr_bagua_prefix_tree_smoke",
+        "overlay_contracts_smoke",
+        "pubsub_smoke",
+        "dag_mempool_smoke",
+        "plumtree_smoke",
+        "erasure_swarm_smoke",
+        "pin_plane_smoke",
+        "pin_scheduler_smoke",
+        "content_codec_smoke",
+        "content_runtime_smoke",
+        "content_stub_smoke",
+        "chain_node_tailnet_smoke",
+        "chain_node_libp2p_smoke",
+        "chain_node_zero_snapshot_replay_smoke",
+        "mobile_bridge_smoke",
+        "mobile_sdk_smoke",
+        "did_identity_smoke"
+    };
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] run-stage23-libp2p-smokes root detect failed\n");
+        return 1;
+    }
+    if (!v3_bootstrap_artifacts_fresh(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+        return 1;
+    }
+    v3_join_path(root_v3, sizeof(root_v3), paths.root, "v3");
+    if (access(paths.stage2, X_OK) != 0 || access(paths.stage3, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] run-stage23-libp2p-smokes missing bootstrap compiler\n");
+        return 1;
+    }
+    tail_only = v3_flag_value(argc, argv, "--tail-only");
+    positional_count = v3_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
+    if (positional_count > 0U) {
+        run_tail = false;
+    }
+    v3_save_env_value("BACKEND_INCREMENTAL", saved_incremental, sizeof(saved_incremental), &had_incremental);
+    v3_save_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, sizeof(saved_multi_cache), &had_multi_cache);
+    setenv("BACKEND_INCREMENTAL", "0", 1);
+    setenv("BACKEND_MULTI_MODULE_CACHE", "0", 1);
+    if (tail_only != NULL && tail_only[0] != '\0') {
+        if (strcmp(tail_only, "browser_webrtc") == 0) {
+            int rc = v3_run_stage23_browser_webrtc_script(paths.root, paths.stage3, positional_count, positionals);
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return rc;
+        }
+        fprintf(stderr, "[cheng_v3_seed] run-stage23-libp2p-smokes unknown --tail-only: %s\n", tail_only);
+        v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+        v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_stage23_libp2p");
+    if (!v3_mkdir_p(out_dir)) {
+        v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+        v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+        return 1;
+    }
+    if (positional_count > 0U) {
+        for (i = 0U; i < positional_count; ++i) {
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
+            strncat(out_bin, ".stage2", sizeof(out_bin) - strlen(out_bin) - 1U);
+            snprintf(compile_label, sizeof(compile_label), "stage2 %s", positionals[i]);
+            if (!v3_run_fixture_smoke_direct("v3 stage2/stage3 libp2p",
+                                             compile_label,
+                                             paths.stage2,
+                                             paths.root,
+                                             root_v3,
+                                             positionals[i],
+                                             out_bin)) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            if (strcmp(positionals[i], "libp2p_tcp_smoke") == 0 &&
+                v3_run_stage23_leaf_script(paths.root,
+                                           "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                           paths.stage2,
+                                           "stage2") != 0) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
+            strncat(out_bin, ".stage3", sizeof(out_bin) - strlen(out_bin) - 1U);
+            snprintf(compile_label, sizeof(compile_label), "stage3 %s", positionals[i]);
+            if (!v3_run_fixture_smoke_direct("v3 stage2/stage3 libp2p",
+                                             compile_label,
+                                             paths.stage3,
+                                             paths.root,
+                                             root_v3,
+                                             positionals[i],
+                                             out_bin)) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            if (strcmp(positionals[i], "libp2p_tcp_smoke") == 0 &&
+                v3_run_stage23_leaf_script(paths.root,
+                                           "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                           paths.stage3,
+                                           "stage3") != 0) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+        }
+    } else {
+        for (i = 0U; i < sizeof(DEFAULT_SMOKES) / sizeof(DEFAULT_SMOKES[0]); ++i) {
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
+            strncat(out_bin, ".stage2", sizeof(out_bin) - strlen(out_bin) - 1U);
+            snprintf(compile_label, sizeof(compile_label), "stage2 %s", DEFAULT_SMOKES[i]);
+            if (!v3_run_fixture_smoke_direct("v3 stage2/stage3 libp2p",
+                                             compile_label,
+                                             paths.stage2,
+                                             paths.root,
+                                             root_v3,
+                                             DEFAULT_SMOKES[i],
+                                             out_bin)) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            if (strcmp(DEFAULT_SMOKES[i], "libp2p_tcp_smoke") == 0 &&
+                v3_run_stage23_leaf_script(paths.root,
+                                           "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                           paths.stage2,
+                                           "stage2") != 0) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            v3_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
+            strncat(out_bin, ".stage3", sizeof(out_bin) - strlen(out_bin) - 1U);
+            snprintf(compile_label, sizeof(compile_label), "stage3 %s", DEFAULT_SMOKES[i]);
+            if (!v3_run_fixture_smoke_direct("v3 stage2/stage3 libp2p",
+                                             compile_label,
+                                             paths.stage3,
+                                             paths.root,
+                                             root_v3,
+                                             DEFAULT_SMOKES[i],
+                                             out_bin)) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+            if (strcmp(DEFAULT_SMOKES[i], "libp2p_tcp_smoke") == 0 &&
+                v3_run_stage23_leaf_script(paths.root,
+                                           "v3/tooling/run_v3_tcp_twoproc_smoke.sh",
+                                           paths.stage3,
+                                           "stage3") != 0) {
+                v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+                v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+                return 1;
+            }
+        }
+    }
+    if (run_tail) {
+        if (v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_chain_node_cli_smoke.sh", paths.stage2, "stage2") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_chain_node_cli_smoke.sh", paths.stage3, "stage3") != 0 ||
+            v3_run_chain_node_process_smoke_with_env(paths.stage2, "stage2", true) != 0 ||
+            v3_run_chain_node_process_smoke_with_env(paths.stage3, "stage3", true) != 0 ||
+            v3_run_chain_node_three_node_smoke_with_env(paths.stage2, "stage2", true) != 0 ||
+            v3_run_chain_node_three_node_smoke_with_env(paths.stage3, "stage3", true) != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_tailnet_control_smoke.sh", paths.stage2, "stage2") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_tailnet_control_smoke.sh", paths.stage3, "stage3") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_fresh_node_selfhost_gate.sh", paths.stage2, "stage2") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_fresh_node_selfhost_gate.sh", paths.stage3, "stage3") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_migration_gate.sh", paths.stage2, "stage2") != 0 ||
+            v3_run_stage23_leaf_script(paths.root, "v3/tooling/run_v3_migration_gate.sh", paths.stage3, "stage3") != 0 ||
+            v3_run_stage23_browser_webrtc_script(paths.root, paths.stage3, 0U, NULL) != 0) {
+            v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+            v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+            return 1;
+        }
+    }
+    v3_restore_env_value("BACKEND_INCREMENTAL", saved_incremental, had_incremental);
+    v3_restore_env_value("BACKEND_MULTI_MODULE_CACHE", saved_multi_cache, had_multi_cache);
+    puts("v3 stage2/stage3 libp2p: ok");
     return 0;
 }
 
@@ -32890,6 +39887,19 @@ static bool v3_write_optional_report_text(const char *report_path,
         return true;
     }
     return v3_ensure_parent_dir(report_path) && v3_write_text_file(report_path, text);
+}
+
+static char *v3_report_with_header(const char *header,
+                                   const char *body) {
+    size_t header_len = header != NULL ? strlen(header) : 0U;
+    size_t body_len = body != NULL ? strlen(body) : 0U;
+    char *out = (char *)v3_xmalloc(header_len + body_len + 3U);
+    if (body_len > 0U) {
+        snprintf(out, header_len + body_len + 3U, "%s\n%s", header, body);
+    } else {
+        snprintf(out, header_len + body_len + 3U, "%s\n", header);
+    }
+    return out;
 }
 
 static void v3_default_debug_output_path(const V3SystemLinkPlanStub *plan,
@@ -32914,6 +39924,14 @@ static void v3_default_debug_output_path(const V3SystemLinkPlanStub *plan,
              safe_module,
              safe_target,
              safe_emit);
+}
+
+static void v3_default_profile_output_path(const V3SystemLinkPlanStub *plan,
+                                           char *out,
+                                           size_t cap) {
+    char prefix[PATH_MAX];
+    v3_default_debug_output_path(plan, prefix, sizeof(prefix));
+    snprintf(out, cap, "%s.profile.txt", prefix);
 }
 
 static bool v3_build_exec_context(const V3BootstrapContract *contract,
@@ -33061,6 +40079,16 @@ static const char *v3_elf_layout_kind_name(int kind) {
     return "none";
 }
 
+static const char *v3_elf_file_type_name(uint16_t file_type) {
+    if (file_type == V3_ELF_ET_REL) {
+        return "rel";
+    }
+    if (file_type == V3_ELF_ET_EXEC) {
+        return "exec";
+    }
+    return "unknown";
+}
+
 static char *v3_debug_elf_object_report(const char *path) {
     V3ElfObjectStub obj;
     size_t cap = 65536U;
@@ -33074,8 +40102,13 @@ static char *v3_debug_elf_object_report(const char *path) {
         return NULL;
     }
     out[0] = '\0';
-    v3_report_append(&out, &cap, &used, "v3_elf_object_v1");
+    v3_report_append(&out, &cap, &used, "v3_object_report_v1");
+    v3_report_append(&out, &cap, &used, "format=elf64");
     snprintf(line, sizeof(line), "path=%s", obj.path);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "elf_type=%s", v3_elf_file_type_name(obj.file_type));
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "machine=%u", (unsigned)obj.machine);
     v3_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "section_count=%zu", obj.section_count);
     v3_report_append(&out, &cap, &used, line);
@@ -33090,6 +40123,8 @@ static char *v3_debug_elf_object_report(const char *path) {
                  (unsigned long long)obj.sections[i].addralign);
         v3_report_append(&out, &cap, &used, line);
     }
+    snprintf(line, sizeof(line), "load_command_count=0");
+    v3_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "symbol_count=%zu", obj.symbol_count);
     v3_report_append(&out, &cap, &used, line);
     for (i = 0U; i < obj.symbol_count; ++i) {
@@ -33123,8 +40158,585 @@ static char *v3_debug_elf_object_report(const char *path) {
                  (long long)rel->addend);
         v3_report_append(&out, &cap, &used, line);
     }
+    v3_report_append(&out, &cap, &used, "import_count=0");
     v3_elf_object_free(&obj);
     return out;
+}
+
+static char *v3_debug_macho_object_report(const char *path) {
+    unsigned char *bytes = NULL;
+    size_t len = 0U;
+    size_t cap = 65536U;
+    size_t used = 0U;
+    char *out = (char *)v3_xmalloc(cap);
+    char line[PATH_MAX * 2];
+    size_t section_count = 0U;
+    size_t symbol_count = 0U;
+    size_t reloc_count = 0U;
+    uint32_t ncmds;
+    uint32_t filetype;
+    uint32_t flags;
+    uint32_t cputype;
+    uint32_t cpusubtype;
+    uint32_t symoff = 0U;
+    uint32_t nsyms = 0U;
+    uint32_t stroff = 0U;
+    uint32_t strsize = 0U;
+    size_t load_off = 32U;
+    size_t i;
+    if (!v3_read_binary_file_alloc(path, &bytes, &len)) {
+        free(out);
+        return NULL;
+    }
+    if (!v3_range_fits(len, 0U, 32U) || v3_read_u32_le_at(bytes, 0U) != V3_MACHO_MAGIC_64) {
+        fprintf(stderr, "[cheng_v3_seed] unsupported Mach-O object: %s\n", path);
+        free(bytes);
+        free(out);
+        return NULL;
+    }
+    cputype = v3_read_u32_le_at(bytes, 4U);
+    cpusubtype = v3_read_u32_le_at(bytes, 8U);
+    filetype = v3_read_u32_le_at(bytes, 12U);
+    ncmds = v3_read_u32_le_at(bytes, 16U);
+    flags = v3_read_u32_le_at(bytes, 24U);
+    out[0] = '\0';
+    v3_report_append(&out, &cap, &used, "v3_object_report_v1");
+    v3_report_append(&out, &cap, &used, "format=macho64");
+    snprintf(line, sizeof(line), "path=%s", path);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "cputype=%u", cputype);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "cpusubtype=%u", cpusubtype);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "filetype=%u", filetype);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "flags=%u", flags);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "load_command_count=%u", ncmds);
+    v3_report_append(&out, &cap, &used, line);
+    for (i = 0U; i < (size_t)ncmds; ++i) {
+        uint32_t cmd;
+        uint32_t cmdsize;
+        if (!v3_range_fits(len, load_off, 8U)) {
+            free(bytes);
+            free(out);
+            return NULL;
+        }
+        cmd = v3_read_u32_le_at(bytes, load_off + 0U);
+        cmdsize = v3_read_u32_le_at(bytes, load_off + 4U);
+        if (cmdsize < 8U || !v3_range_fits(len, load_off, cmdsize)) {
+            free(bytes);
+            free(out);
+            return NULL;
+        }
+        snprintf(line, sizeof(line), "load_command[%zu]=cmd=0x%x|size=%u", i, cmd, cmdsize);
+        v3_report_append(&out, &cap, &used, line);
+        if (cmd == V3_MACHO_LC_SEGMENT_64 && cmdsize >= 72U) {
+            char segname[32];
+            uint32_t nsects = v3_read_u32_le_at(bytes, load_off + 64U);
+            size_t sect_off = load_off + 72U;
+            size_t j;
+            v3_copy_fixed_name_bytes(bytes + load_off + 8U, 16U, segname, sizeof(segname));
+            for (j = 0U; j < (size_t)nsects; ++j) {
+                char sectname[32];
+                char seglabel[32];
+                uint64_t addr;
+                uint64_t size_value;
+                uint32_t offset;
+                uint32_t align;
+                uint32_t reloff;
+                uint32_t nreloc;
+                uint32_t sect_flags;
+                size_t k;
+                if (!v3_range_fits(len, sect_off, 80U)) {
+                    free(bytes);
+                    free(out);
+                    return NULL;
+                }
+                v3_copy_fixed_name_bytes(bytes + sect_off + 0U, 16U, sectname, sizeof(sectname));
+                v3_copy_fixed_name_bytes(bytes + sect_off + 16U, 16U, seglabel, sizeof(seglabel));
+                addr = v3_read_u64_le_at(bytes, sect_off + 32U);
+                size_value = v3_read_u64_le_at(bytes, sect_off + 40U);
+                offset = v3_read_u32_le_at(bytes, sect_off + 48U);
+                align = v3_read_u32_le_at(bytes, sect_off + 52U);
+                reloff = v3_read_u32_le_at(bytes, sect_off + 56U);
+                nreloc = v3_read_u32_le_at(bytes, sect_off + 60U);
+                sect_flags = v3_read_u32_le_at(bytes, sect_off + 64U);
+                snprintf(line,
+                         sizeof(line),
+                         "section[%zu]=%s,%s|addr=%llu|size=%llu|offset=%u|align=%u|flags=0x%x",
+                         section_count,
+                         seglabel[0] != '\0' ? seglabel : segname,
+                         sectname,
+                         (unsigned long long)addr,
+                         (unsigned long long)size_value,
+                         offset,
+                         align,
+                         sect_flags);
+                v3_report_append(&out, &cap, &used, line);
+                for (k = 0U; k < (size_t)nreloc; ++k) {
+                    uint32_t r_address;
+                    uint32_t raw;
+                    uint32_t symbolnum;
+                    uint32_t pcrel;
+                    uint32_t length;
+                    uint32_t ext;
+                    uint32_t type;
+                    size_t reloc_off = (size_t)reloff + k * 8U;
+                    if (!v3_range_fits(len, reloc_off, 8U)) {
+                        free(bytes);
+                        free(out);
+                        return NULL;
+                    }
+                    r_address = v3_read_u32_le_at(bytes, reloc_off + 0U);
+                    raw = v3_read_u32_le_at(bytes, reloc_off + 4U);
+                    symbolnum = raw & 0x00ffffffU;
+                    pcrel = (raw >> 24U) & 0x1U;
+                    length = (raw >> 25U) & 0x3U;
+                    ext = (raw >> 27U) & 0x1U;
+                    type = (raw >> 28U) & 0xfU;
+                    snprintf(line,
+                             sizeof(line),
+                             "reloc[%zu]=target=%s,%s|address=%u|symbol=%u|pcrel=%u|length=%u|extern=%u|type=%u",
+                             reloc_count,
+                             seglabel[0] != '\0' ? seglabel : segname,
+                             sectname,
+                             r_address,
+                             symbolnum,
+                             pcrel,
+                             length,
+                             ext,
+                             type);
+                    v3_report_append(&out, &cap, &used, line);
+                    reloc_count += 1U;
+                }
+                section_count += 1U;
+                sect_off += 80U;
+            }
+        } else if (cmd == V3_MACHO_LC_SYMTAB && cmdsize >= 24U) {
+            symoff = v3_read_u32_le_at(bytes, load_off + 8U);
+            nsyms = v3_read_u32_le_at(bytes, load_off + 12U);
+            stroff = v3_read_u32_le_at(bytes, load_off + 16U);
+            strsize = v3_read_u32_le_at(bytes, load_off + 20U);
+        }
+        load_off += cmdsize;
+    }
+    snprintf(line, sizeof(line), "section_count=%zu", section_count);
+    v3_report_append(&out, &cap, &used, line);
+    if (nsyms > 0U) {
+        const unsigned char *strtab = NULL;
+        for (i = 0U; i < (size_t)nsyms; ++i) {
+            size_t sym_base = (size_t)symoff + i * 16U;
+            uint32_t strx;
+            uint8_t type;
+            uint8_t sect;
+            uint16_t desc;
+            uint64_t value;
+            char name[PATH_MAX];
+            if (!v3_range_fits(len, (size_t)symoff, (size_t)nsyms * 16U) ||
+                !v3_range_fits(len, (size_t)stroff, (size_t)strsize)) {
+                free(bytes);
+                free(out);
+                return NULL;
+            }
+            strtab = bytes + stroff;
+            strx = v3_read_u32_le_at(bytes, sym_base + 0U);
+            type = bytes[sym_base + 4U];
+            sect = bytes[sym_base + 5U];
+            desc = v3_read_u16_le_at(bytes, sym_base + 6U);
+            value = v3_read_u64_le_at(bytes, sym_base + 8U);
+            if (!v3_elf_copy_name_from_table(strtab, (size_t)strsize, strx, name, sizeof(name))) {
+                snprintf(name, sizeof(name), "%s", "<anonymous>");
+            }
+            snprintf(line,
+                     sizeof(line),
+                     "symbol[%zu]=%s|type=0x%x|sect=%u|desc=%u|value=%llu",
+                     symbol_count,
+                     name,
+                     (unsigned)type,
+                     (unsigned)sect,
+                     (unsigned)desc,
+                     (unsigned long long)value);
+            v3_report_append(&out, &cap, &used, line);
+            symbol_count += 1U;
+        }
+    }
+    snprintf(line, sizeof(line), "symbol_count=%zu", symbol_count);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "reloc_count=%zu", reloc_count);
+    v3_report_append(&out, &cap, &used, line);
+    v3_report_append(&out, &cap, &used, "import_count=0");
+    free(bytes);
+    return out;
+}
+
+static uint32_t v3_coff_rva_to_file_offset(const unsigned char *bytes,
+                                           size_t len,
+                                           size_t section_table_off,
+                                           uint16_t section_count,
+                                           uint32_t rva) {
+    size_t i;
+    for (i = 0U; i < (size_t)section_count; ++i) {
+        size_t base = section_table_off + i * 40U;
+        uint32_t virtual_size;
+        uint32_t virtual_address;
+        uint32_t size_of_raw_data;
+        uint32_t pointer_to_raw_data;
+        uint32_t span;
+        if (!v3_range_fits(len, base, 40U)) {
+            return 0U;
+        }
+        virtual_size = v3_read_u32_le_at(bytes, base + 8U);
+        virtual_address = v3_read_u32_le_at(bytes, base + 12U);
+        size_of_raw_data = v3_read_u32_le_at(bytes, base + 16U);
+        pointer_to_raw_data = v3_read_u32_le_at(bytes, base + 20U);
+        span = virtual_size > size_of_raw_data ? virtual_size : size_of_raw_data;
+        if (rva >= virtual_address && rva < virtual_address + span) {
+            return pointer_to_raw_data + (rva - virtual_address);
+        }
+    }
+    return 0U;
+}
+
+static char *v3_debug_coff_pe_report(const char *path) {
+    unsigned char *bytes = NULL;
+    size_t len = 0U;
+    size_t cap = 65536U;
+    size_t used = 0U;
+    char *out = (char *)v3_xmalloc(cap);
+    char line[PATH_MAX * 2];
+    bool is_pe = false;
+    size_t header_off = 0U;
+    size_t section_table_off;
+    uint16_t machine;
+    uint16_t section_count_u16;
+    uint32_t ptr_symtab;
+    uint32_t num_syms;
+    uint16_t size_optional;
+    uint16_t characteristics;
+    uint16_t optional_magic = 0U;
+    uint16_t subsystem = 0U;
+    size_t section_count = 0U;
+    size_t symbol_count = 0U;
+    size_t reloc_count = 0U;
+    size_t import_count = 0U;
+    size_t i;
+    if (!v3_read_binary_file_alloc(path, &bytes, &len)) {
+        free(out);
+        return NULL;
+    }
+    if (v3_range_fits(len, 0U, 2U) &&
+        bytes[0] == 'M' &&
+        bytes[1] == 'Z') {
+        uint32_t pe_off;
+        if (!v3_range_fits(len, 0x3cU, 4U)) {
+            free(bytes);
+            free(out);
+            return NULL;
+        }
+        pe_off = v3_read_u32_le_at(bytes, 0x3cU);
+        if (!v3_range_fits(len, pe_off, 24U) ||
+            bytes[pe_off] != 'P' ||
+            bytes[pe_off + 1U] != 'E' ||
+            bytes[pe_off + 2U] != 0U ||
+            bytes[pe_off + 3U] != 0U) {
+            free(bytes);
+            free(out);
+            return NULL;
+        }
+        header_off = (size_t)pe_off + 4U;
+        is_pe = true;
+    } else {
+        header_off = 0U;
+    }
+    if (!v3_range_fits(len, header_off, 20U)) {
+        free(bytes);
+        free(out);
+        return NULL;
+    }
+    machine = v3_read_u16_le_at(bytes, header_off + 0U);
+    section_count_u16 = v3_read_u16_le_at(bytes, header_off + 2U);
+    ptr_symtab = v3_read_u32_le_at(bytes, header_off + 8U);
+    num_syms = v3_read_u32_le_at(bytes, header_off + 12U);
+    size_optional = v3_read_u16_le_at(bytes, header_off + 16U);
+    characteristics = v3_read_u16_le_at(bytes, header_off + 18U);
+    section_table_off = header_off + 20U + (size_t)size_optional;
+    if (!v3_range_fits(len, section_table_off, (size_t)section_count_u16 * 40U)) {
+        free(bytes);
+        free(out);
+        return NULL;
+    }
+    if (is_pe && size_optional >= 70U && v3_range_fits(len, header_off + 20U, size_optional)) {
+        optional_magic = v3_read_u16_le_at(bytes, header_off + 20U);
+        subsystem = v3_read_u16_le_at(bytes, header_off + 20U + 68U);
+    }
+    out[0] = '\0';
+    v3_report_append(&out, &cap, &used, "v3_object_report_v1");
+    v3_report_append(&out, &cap, &used, is_pe ? "format=pe/coff" : "format=coff");
+    snprintf(line, sizeof(line), "path=%s", path);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "machine=0x%x", machine);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "characteristics=0x%x", characteristics);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "optional_magic=0x%x", optional_magic);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "subsystem=%u", subsystem);
+    v3_report_append(&out, &cap, &used, line);
+    v3_report_append(&out, &cap, &used, "load_command_count=0");
+    for (i = 0U; i < (size_t)section_count_u16; ++i) {
+        size_t base = section_table_off + i * 40U;
+        char name[32];
+        uint32_t virtual_size = v3_read_u32_le_at(bytes, base + 8U);
+        uint32_t virtual_address = v3_read_u32_le_at(bytes, base + 12U);
+        uint32_t size_of_raw_data = v3_read_u32_le_at(bytes, base + 16U);
+        uint32_t pointer_to_raw_data = v3_read_u32_le_at(bytes, base + 20U);
+        uint32_t pointer_to_relocations = v3_read_u32_le_at(bytes, base + 24U);
+        uint16_t number_of_relocations = v3_read_u16_le_at(bytes, base + 32U);
+        uint32_t section_chars = v3_read_u32_le_at(bytes, base + 36U);
+        size_t j;
+        v3_copy_fixed_name_bytes(bytes + base, 8U, name, sizeof(name));
+        snprintf(line,
+                 sizeof(line),
+                 "section[%zu]=%s|vaddr=%u|vsize=%u|raw_off=%u|raw_size=%u|chars=0x%x",
+                 section_count,
+                 name[0] != '\0' ? name : "<anonymous>",
+                 virtual_address,
+                 virtual_size,
+                 pointer_to_raw_data,
+                 size_of_raw_data,
+                 section_chars);
+        v3_report_append(&out, &cap, &used, line);
+        if (!is_pe && number_of_relocations > 0U) {
+            for (j = 0U; j < (size_t)number_of_relocations; ++j) {
+                size_t reloc_off = (size_t)pointer_to_relocations + j * 10U;
+                uint32_t virtual_addr;
+                uint32_t symbol_index;
+                uint16_t type;
+                if (!v3_range_fits(len, reloc_off, 10U)) {
+                    free(bytes);
+                    free(out);
+                    return NULL;
+                }
+                virtual_addr = v3_read_u32_le_at(bytes, reloc_off + 0U);
+                symbol_index = v3_read_u32_le_at(bytes, reloc_off + 4U);
+                type = v3_read_u16_le_at(bytes, reloc_off + 8U);
+                snprintf(line,
+                         sizeof(line),
+                         "reloc[%zu]=target=%s|offset=%u|symbol_index=%u|type=0x%x",
+                         reloc_count,
+                         name[0] != '\0' ? name : "<anonymous>",
+                         virtual_addr,
+                         symbol_index,
+                         type);
+                v3_report_append(&out, &cap, &used, line);
+                reloc_count += 1U;
+            }
+        }
+        section_count += 1U;
+    }
+    snprintf(line, sizeof(line), "section_count=%zu", section_count);
+    v3_report_append(&out, &cap, &used, line);
+    if (ptr_symtab != 0U && num_syms > 0U) {
+        size_t sym_table_size = (size_t)num_syms * 18U;
+        const unsigned char *string_table = NULL;
+        uint32_t string_table_size = 0U;
+        if (!v3_range_fits(len, (size_t)ptr_symtab, sym_table_size + 4U)) {
+            free(bytes);
+            free(out);
+            return NULL;
+        }
+        string_table = bytes + ptr_symtab + sym_table_size;
+        string_table_size = v3_read_u32_le_at(string_table, 0U);
+        for (i = 0U; i < (size_t)num_syms; ++i) {
+            size_t sym_off = (size_t)ptr_symtab + i * 18U;
+            char name[PATH_MAX];
+            uint32_t zeroes = v3_read_u32_le_at(bytes, sym_off + 0U);
+            uint32_t name_off = v3_read_u32_le_at(bytes, sym_off + 4U);
+            uint32_t value = v3_read_u32_le_at(bytes, sym_off + 8U);
+            uint16_t section_number = v3_read_u16_le_at(bytes, sym_off + 12U);
+            uint16_t type = v3_read_u16_le_at(bytes, sym_off + 14U);
+            uint8_t storage_class = bytes[sym_off + 16U];
+            uint8_t aux_count = bytes[sym_off + 17U];
+            if (zeroes == 0U && name_off > 0U && name_off < string_table_size) {
+                v3_elf_copy_name_from_table(string_table, (size_t)string_table_size, name_off, name, sizeof(name));
+            } else {
+                v3_copy_fixed_name_bytes(bytes + sym_off, 8U, name, sizeof(name));
+            }
+            snprintf(line,
+                     sizeof(line),
+                     "symbol[%zu]=%s|value=%u|section=%d|type=0x%x|storage=%u|aux=%u",
+                     symbol_count,
+                     name[0] != '\0' ? name : "<anonymous>",
+                     value,
+                     (int)section_number,
+                     (unsigned)type,
+                     (unsigned)storage_class,
+                     (unsigned)aux_count);
+            v3_report_append(&out, &cap, &used, line);
+            symbol_count += 1U;
+            i += (size_t)aux_count;
+        }
+    }
+    snprintf(line, sizeof(line), "symbol_count=%zu", symbol_count);
+    v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "reloc_count=%zu", reloc_count);
+    v3_report_append(&out, &cap, &used, line);
+    if (is_pe && optional_magic == V3_PE_OPTIONAL_MAGIC_PE32_PLUS && size_optional >= 0x78U) {
+        uint32_t import_rva = v3_read_u32_le_at(bytes, header_off + 20U + 0x78U);
+        uint32_t import_size = v3_read_u32_le_at(bytes, header_off + 20U + 0x7cU);
+        uint32_t import_off = v3_coff_rva_to_file_offset(bytes, len, section_table_off, section_count_u16, import_rva);
+        if (import_rva != 0U && import_size != 0U && import_off != 0U) {
+            size_t desc_off = (size_t)import_off;
+            while (v3_range_fits(len, desc_off, 20U)) {
+                uint32_t original_first_thunk = v3_read_u32_le_at(bytes, desc_off + 0U);
+                uint32_t name_rva = v3_read_u32_le_at(bytes, desc_off + 12U);
+                uint32_t first_thunk = v3_read_u32_le_at(bytes, desc_off + 16U);
+                uint32_t thunk_rva;
+                uint32_t name_off;
+                char dll_name[256];
+                size_t thunk_off;
+                if (original_first_thunk == 0U && name_rva == 0U && first_thunk == 0U) {
+                    break;
+                }
+                name_off = v3_coff_rva_to_file_offset(bytes, len, section_table_off, section_count_u16, name_rva);
+                if (name_off == 0U || !v3_elf_copy_name_from_table(bytes + name_off, len - name_off, 0U, dll_name, sizeof(dll_name))) {
+                    snprintf(dll_name, sizeof(dll_name), "%s", "<unknown-dll>");
+                }
+                thunk_rva = original_first_thunk != 0U ? original_first_thunk : first_thunk;
+                thunk_off = (size_t)v3_coff_rva_to_file_offset(bytes, len, section_table_off, section_count_u16, thunk_rva);
+                while (thunk_off != 0U && v3_range_fits(len, thunk_off, 8U)) {
+                    uint64_t thunk_data = v3_read_u64_le_at(bytes, thunk_off);
+                    if (thunk_data == 0U) {
+                        break;
+                    }
+                    if ((thunk_data & (1ULL << 63U)) != 0ULL) {
+                        snprintf(line,
+                                 sizeof(line),
+                                 "import[%zu]=%s!ordinal_%llu",
+                                 import_count,
+                                 dll_name,
+                                 (unsigned long long)(thunk_data & 0xffffULL));
+                    } else {
+                        uint32_t hint_name_rva = (uint32_t)(thunk_data & 0xffffffffU);
+                        uint32_t hint_name_off = v3_coff_rva_to_file_offset(bytes, len, section_table_off, section_count_u16, hint_name_rva);
+                        char func_name[256];
+                        if (hint_name_off == 0U || !v3_range_fits(len, (size_t)hint_name_off + 2U, 1U) ||
+                            !v3_elf_copy_name_from_table(bytes + hint_name_off + 2U, len - (size_t)hint_name_off - 2U, 0U, func_name, sizeof(func_name))) {
+                            snprintf(func_name, sizeof(func_name), "%s", "<unknown>");
+                        }
+                        snprintf(line,
+                                 sizeof(line),
+                                 "import[%zu]=%s!%s",
+                                 import_count,
+                                 dll_name,
+                                 func_name);
+                    }
+                    v3_report_append(&out, &cap, &used, line);
+                    import_count += 1U;
+                    thunk_off += 8U;
+                }
+                desc_off += 20U;
+            }
+        }
+    }
+    snprintf(line, sizeof(line), "import_count=%zu", import_count);
+    v3_report_append(&out, &cap, &used, line);
+    free(bytes);
+    return out;
+}
+
+static char *v3_debug_object_report(const char *path) {
+    FILE *fp = NULL;
+    unsigned char magic[8];
+    size_t got = 0U;
+    fp = fopen(path, "rb");
+    if (fp == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] failed to open object: %s\n", path);
+        return NULL;
+    }
+    got = fread(magic, 1U, sizeof(magic), fp);
+    fclose(fp);
+    if (got >= 4U &&
+        magic[0] == 0x7fU &&
+        magic[1] == 'E' &&
+        magic[2] == 'L' &&
+        magic[3] == 'F') {
+        return v3_debug_elf_object_report(path);
+    }
+    if (got >= 4U &&
+        magic[0] == 0xcfU &&
+        magic[1] == 0xfaU &&
+        magic[2] == 0xedU &&
+        magic[3] == 0xfeU) {
+        return v3_debug_macho_object_report(path);
+    }
+    if (got >= 2U &&
+        magic[0] == 'M' &&
+        magic[1] == 'Z') {
+        return v3_debug_coff_pe_report(path);
+    }
+    if (got >= 2U) {
+        uint16_t machine = v3_read_u16_le_at(magic, 0U);
+        if (machine == 0x14cU || machine == 0x8664U || machine == 0xaa64U) {
+            return v3_debug_coff_pe_report(path);
+        }
+    }
+    fprintf(stderr, "[cheng_v3_seed] unsupported object format: %s\n", path);
+    return NULL;
+}
+
+static char *v3_debug_asm_report(const V3SystemLinkPlanStub *plan,
+                                 const V3PrimaryObjectPlanStub *primary) {
+    char asm_path[PATH_MAX];
+    char *asm_text;
+    size_t cap;
+    size_t len;
+    char *out;
+    snprintf(asm_path, sizeof(asm_path), "%s.s", primary->output_path);
+    asm_text = v3_read_file(asm_path);
+    if (!asm_text) {
+        return NULL;
+    }
+    len = strlen(asm_text);
+    cap = len + PATH_MAX * 2U + 256U;
+    out = (char *)v3_xmalloc(cap);
+    snprintf(out,
+             cap,
+             "v3_asm_report_v1\npath=%s\ntarget=%s\nemit=%s\nasm_text_begin\n%s",
+             asm_path,
+             plan->target_triple,
+             plan->emit_kind,
+             asm_text);
+    free(asm_text);
+    return out;
+}
+
+static bool v3_run_profiled_binary(const char *path) {
+    pid_t pid;
+    int status = 0;
+    char *argv_local[2];
+    argv_local[0] = (char *)path;
+    argv_local[1] = NULL;
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return false;
+    }
+    if (pid == 0) {
+        execv(path, argv_local);
+        perror("execv");
+        _exit(127);
+    }
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return false;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] profiled program failed: %s status=%d\n", path, status);
+    return false;
 }
 
 static int v3_cmd_debug_report(int argc, char **argv) {
@@ -33159,6 +40771,11 @@ static int v3_cmd_debug_report(int argc, char **argv) {
         return 1;
     }
     report = v3_system_link_exec_report(&contract, &plan, &world, lowering, &primary, &object_plan, &native_link);
+    {
+        char *wrapped = v3_report_with_header("v3_debug_report_v1", report);
+        free(report);
+        report = wrapped;
+    }
     if (!v3_write_optional_report_text(report_path, report)) {
         fprintf(stderr, "v3 compiler: failed to write report: %s\n", report_path);
         free(report);
@@ -33271,7 +40888,13 @@ static int v3_cmd_print_line_map(int argc, char **argv) {
     return 0;
 }
 
+static int v3_cmd_print_object(int argc, char **argv);
+
 static int v3_cmd_print_elf(int argc, char **argv) {
+    return v3_cmd_print_object(argc, argv);
+}
+
+static int v3_cmd_print_object(int argc, char **argv) {
     const char *object_path = v3_flag_value(argc, argv, "--object");
     const char *report_path = v3_flag_value(argc, argv, "--report-out");
     char *report;
@@ -33279,7 +40902,7 @@ static int v3_cmd_print_elf(int argc, char **argv) {
         fprintf(stderr, "[cheng_v3_seed] missing --object:<path>\n");
         return 1;
     }
-    report = v3_debug_elf_object_report(object_path);
+    report = v3_debug_object_report(object_path);
     if (!report) {
         return 1;
     }
@@ -33291,6 +40914,177 @@ static int v3_cmd_print_elf(int argc, char **argv) {
     fputs(report, stdout);
     free(report);
     return 0;
+}
+
+static int v3_cmd_print_asm(int argc, char **argv) {
+    V3BootstrapContract contract;
+    V3SystemLinkPlanStub plan;
+    V3CompilerWorldArtifacts world;
+    V3LoweringPlanStub *lowering = NULL;
+    V3PrimaryObjectPlanStub primary;
+    V3ObjectPlanStub object_plan;
+    V3NativeLinkPlanStub native_link;
+    const char *report_path = v3_flag_value(argc, argv, "--report-out");
+    char *report;
+    if (!v3_load_runtime_contract(argc, argv, &contract)) {
+        return 1;
+    }
+    if (!v3_validate_contract(&contract)) {
+        v3_contract_free(&contract);
+        return 1;
+    }
+    if (!v3_build_exec_context(&contract,
+                               argc,
+                               argv,
+                               false,
+                               false,
+                               &plan,
+                               &world,
+                               &lowering,
+                               &primary,
+                               &object_plan,
+                               &native_link)) {
+        v3_contract_free(&contract);
+        return 1;
+    }
+    if (primary.missing_reason_count > 0U ||
+        !v3_materialize_primary_asm_only(&plan, lowering, &primary)) {
+        free(lowering);
+        v3_compiler_world_artifacts_free(&world);
+        v3_contract_free(&contract);
+        return 1;
+    }
+    report = v3_debug_asm_report(&plan, &primary);
+    if (!report) {
+        free(lowering);
+        v3_compiler_world_artifacts_free(&world);
+        v3_contract_free(&contract);
+        return 1;
+    }
+    if (!v3_write_optional_report_text(report_path, report)) {
+        fprintf(stderr, "v3 compiler: failed to write report: %s\n", report_path);
+        free(report);
+        free(lowering);
+        v3_compiler_world_artifacts_free(&world);
+        v3_contract_free(&contract);
+        return 1;
+    }
+    fputs(report, stdout);
+    free(report);
+    free(lowering);
+    v3_compiler_world_artifacts_free(&world);
+    v3_contract_free(&contract);
+    return 0;
+}
+
+static int v3_cmd_profile_run(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    const char *source_path = v3_flag_value(argc, argv, "--in");
+    const char *root_path = v3_flag_value(argc, argv, "--root");
+    const char *out_flag = v3_flag_value(argc, argv, "--out");
+    const char *report_flag = v3_flag_value(argc, argv, "--report-out");
+    const char *profile_hz = v3_flag_value(argc, argv, "--profile-hz");
+    const char *target = v3_flag_value(argc, argv, "--target");
+    const char *emit = v3_flag_value(argc, argv, "--emit");
+    char workspace_root[PATH_MAX];
+    char package_root[PATH_MAX];
+    char package_probe[PATH_MAX];
+    char output_path[PATH_MAX];
+    char report_path[PATH_MAX];
+    char compile_log[PATH_MAX];
+    const char *slash;
+    const char *base;
+    size_t stem_len;
+    char *report = NULL;
+    int rc = 1;
+    v3_bootstrap_paths_init(&paths);
+    if (!source_path || *source_path == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] profile-run requires --in:<path>\n");
+        return 1;
+    }
+    if (!target || *target == '\0') {
+        target = "arm64-apple-darwin";
+    }
+    if (!v3_streq(target, "arm64-apple-darwin")) {
+        fprintf(stderr, "[cheng_v3_seed] profile-run currently requires local runnable target arm64-apple-darwin\n");
+        return 1;
+    }
+    if (emit && *emit != '\0' && !v3_streq(emit, "exe")) {
+        fprintf(stderr, "[cheng_v3_seed] profile-run requires --emit:exe\n");
+        return 1;
+    }
+    if (root_path && *root_path != '\0') {
+        v3_copy_text(workspace_root, sizeof(workspace_root), root_path);
+    } else if (paths.root[0] != '\0') {
+        v3_copy_text(workspace_root, sizeof(workspace_root), paths.root);
+    } else if (!getcwd(workspace_root, sizeof(workspace_root))) {
+        perror("getcwd");
+        return 1;
+    }
+    v3_copy_text(package_root, sizeof(package_root), workspace_root);
+    v3_join_path(package_probe, sizeof(package_probe), workspace_root, "v3/src");
+    if (v3_path_is_directory(package_probe)) {
+        v3_join_path(package_root, sizeof(package_root), workspace_root, "v3");
+    }
+    if (out_flag && *out_flag != '\0') {
+        v3_copy_text(output_path, sizeof(output_path), out_flag);
+    } else {
+        slash = strrchr(source_path, '/');
+        base = slash ? slash + 1 : source_path;
+        stem_len = strlen(base);
+        if (stem_len >= 6U && strcmp(base + stem_len - 6U, ".cheng") == 0) {
+            stem_len -= 6U;
+        }
+        if (stem_len == 0U) {
+            base = "profile_run";
+            stem_len = strlen(base);
+        }
+        v3_join_path(output_path, sizeof(output_path), workspace_root, "artifacts/v3_debug_profile");
+        strncat(output_path, "/", sizeof(output_path) - strlen(output_path) - 1U);
+        strncat(output_path, base, stem_len);
+        output_path[strlen(output_path)] = '\0';
+    }
+    if (report_flag && *report_flag != '\0') {
+        v3_copy_text(report_path, sizeof(report_path), report_flag);
+    } else {
+        snprintf(report_path, sizeof(report_path), "%s.v3.profile.txt", output_path);
+    }
+    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", output_path);
+    if (!v3_ensure_parent_dir(output_path) ||
+        !v3_ensure_parent_dir(report_path)) {
+        return 1;
+    }
+    if (!v3_path_exists_nonempty(paths.backend_driver_out) &&
+        v3_cmd_build_backend_driver(0, NULL) != 0) {
+        return 1;
+    }
+    if (!v3_path_exists_nonempty(paths.backend_driver_out)) {
+        fprintf(stderr, "[cheng_v3_seed] profile-run missing backend driver: %s\n", paths.backend_driver_out);
+        return 1;
+    }
+    if (!v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out,
+                                                     package_root,
+                                                     source_path,
+                                                     output_path,
+                                                     compile_log)) {
+        return 1;
+    }
+    setenv("CHENG_V3_PROFILE_ENABLE", "1", 1);
+    setenv("CHENG_V3_PROFILE_OUT", report_path, 1);
+    setenv("CHENG_V3_PROFILE_HZ", (profile_hz && *profile_hz != '\0') ? profile_hz : "200", 1);
+    if (!v3_run_profiled_binary(output_path)) {
+        goto cleanup;
+    }
+    report = v3_read_file(report_path);
+    if (!report) {
+        fprintf(stderr, "[cheng_v3_seed] missing profile report: %s\n", report_path);
+        goto cleanup;
+    }
+    fputs(report, stdout);
+    rc = 0;
+cleanup:
+    free(report);
+    return rc;
 }
 
 static int v3_cmd_emit_csg(int argc, char **argv) {
@@ -33339,7 +41133,6 @@ static int v3_cmd_migrate_csg(int argc, char **argv) {
     const char *prefix = v3_flag_value(argc, argv, "--out");
     const char *current_source_path = v3_flag_value(argc, argv, "--in");
     const char *package_root_flag = v3_flag_value(argc, argv, "--root");
-    char default_package_root[PATH_MAX];
     char package_root[PATH_MAX];
     char workspace_root[PATH_MAX];
     char package_id[PATH_MAX];
@@ -33360,10 +41153,11 @@ static int v3_cmd_migrate_csg(int argc, char **argv) {
         v3_contract_free(&contract);
         return 1;
     }
-    v3_default_package_root(&contract, default_package_root, sizeof(default_package_root));
-    v3_copy_text(package_root,
-                 sizeof(package_root),
-                 package_root_flag && *package_root_flag ? package_root_flag : default_package_root);
+    v3_resolve_effective_package_root(&contract,
+                                      package_root_flag,
+                                      current_source_path,
+                                      package_root,
+                                      sizeof(package_root));
     v3_workspace_root_from_package_root(package_root, workspace_root, sizeof(workspace_root));
     v3_package_id_from_root(package_root, package_id, sizeof(package_id));
     if (current_source_path && *current_source_path != '\0') {
@@ -34140,21 +41934,45 @@ static int v3_cmd_selfhost_build(int argc, char **argv) {
 
 static int v3_cmd_system_link_exec(int argc, char **argv) {
     V3BootstrapContract contract;
-    V3SystemLinkPlanStub plan;
-    V3CompilerWorldArtifacts world;
+    V3SystemLinkPlanStub *plan = NULL;
+    V3CompilerWorldArtifacts *world = NULL;
     V3LoweringPlanStub *lowering = NULL;
-    V3PrimaryObjectPlanStub primary;
-    V3ObjectPlanStub object_plan;
-    V3NativeLinkPlanStub native_link;
+    V3PrimaryObjectPlanStub *primary = NULL;
+    V3ObjectPlanStub *object_plan = NULL;
+    V3NativeLinkPlanStub *native_link = NULL;
     const char *report_path = v3_flag_value(argc, argv, "--report-out");
-    char *report;
+    char *report = NULL;
     int rc = 2;
     bool pipeline_ready;
+    plan = (V3SystemLinkPlanStub *)calloc(1U, sizeof(V3SystemLinkPlanStub));
+    world = (V3CompilerWorldArtifacts *)calloc(1U, sizeof(V3CompilerWorldArtifacts));
+    primary = (V3PrimaryObjectPlanStub *)calloc(1U, sizeof(V3PrimaryObjectPlanStub));
+    object_plan = (V3ObjectPlanStub *)calloc(1U, sizeof(V3ObjectPlanStub));
+    native_link = (V3NativeLinkPlanStub *)calloc(1U, sizeof(V3NativeLinkPlanStub));
+    if (plan == NULL || world == NULL || primary == NULL || object_plan == NULL || native_link == NULL) {
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
+        fprintf(stderr, "v3 compiler: system-link-exec out of memory allocating execution context\n");
+        return 1;
+    }
     if (!v3_load_runtime_contract(argc, argv, &contract)) {
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
     if (!v3_validate_contract(&contract)) {
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
     if (!v3_build_exec_context(&contract,
@@ -34162,98 +41980,133 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
                                argv,
                                true,
                                true,
-                               &plan,
-                               &world,
+                               plan,
+                               world,
                                &lowering,
-                               &primary,
-                               &object_plan,
-                               &native_link)) {
+                               primary,
+                               object_plan,
+                               native_link)) {
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
-    if (!v3_streq(plan.emit_kind, "obj") &&
-        object_plan.missing_reason_count <= 0U &&
-        object_plan.linux_nolibc_support_enabled &&
-        !v3_materialize_linux_nolibc_support_objects(&contract, &plan, &object_plan)) {
+    if (!v3_streq(plan->emit_kind, "obj") &&
+        object_plan->missing_reason_count <= 0U &&
+        object_plan->linux_nolibc_support_enabled &&
+        !v3_materialize_linux_nolibc_support_objects(&contract, plan, object_plan)) {
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
-    if (!v3_streq(plan.emit_kind, "obj") &&
-        native_link.missing_reason_count <= 0U &&
-        object_plan.provider_source_count > 0U &&
-        !v3_materialize_provider_objects(&contract, &plan, &object_plan)) {
+    if (!v3_streq(plan->emit_kind, "obj") &&
+        native_link->missing_reason_count <= 0U &&
+        object_plan->provider_source_count > 0U &&
+        !v3_materialize_provider_objects(&contract, plan, object_plan)) {
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
-    if (primary.missing_reason_count <= 0U &&
-        !v3_materialize_primary_object(&plan, lowering, &primary)) {
+    if (primary->missing_reason_count <= 0U &&
+        !v3_materialize_primary_object(plan, lowering, primary)) {
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     }
-    report = v3_system_link_exec_report(&contract, &plan, &world, lowering, &primary, &object_plan, &native_link);
+    report = v3_system_link_exec_report(&contract, plan, world, lowering, primary, object_plan, native_link);
     if (report_path && *report_path != '\0') {
         if (!v3_ensure_parent_dir(report_path) || !v3_write_text_file(report_path, report)) {
             free(report);
             free(lowering);
-            v3_compiler_world_artifacts_free(&world);
+            v3_compiler_world_artifacts_free(world);
             v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
             return 1;
         }
     }
-    if (v3_streq(plan.emit_kind, "obj")) {
-        if (primary.missing_reason_count > 0U) {
+    if (v3_streq(plan->emit_kind, "obj")) {
+        if (primary->missing_reason_count > 0U) {
             fprintf(stderr, "v3 compiler: primary object machine code not emitted\n");
             fputs(report, stderr);
             free(report);
             free(lowering);
-            v3_compiler_world_artifacts_free(&world);
+            v3_compiler_world_artifacts_free(world);
             v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
             return 2;
         }
         rc = 0;
         fputs(report, stderr);
         free(report);
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return rc;
     }
-    pipeline_ready = plan.missing_reason_count <= 0U &&
+    pipeline_ready = plan->missing_reason_count <= 0U &&
                      lowering->missing_reason_count <= 0U &&
-                     primary.missing_reason_count <= 0U &&
-                     object_plan.missing_reason_count <= 0U &&
-                     native_link.missing_reason_count <= 0U;
-    if (primary.missing_reason_count > 0U) {
-        if (v3_plan_reasons_contains(primary.missing_reasons,
-                                     primary.missing_reason_count,
+                     primary->missing_reason_count <= 0U &&
+                     object_plan->missing_reason_count <= 0U &&
+                     native_link->missing_reason_count <= 0U;
+    if (primary->missing_reason_count > 0U) {
+        if (v3_plan_reasons_contains(primary->missing_reasons,
+                                     primary->missing_reason_count,
                                      "primary_object_target_codegen_not_supported") ||
-            v3_plan_reasons_contains(plan.missing_reasons,
-                                     plan.missing_reason_count,
+            v3_plan_reasons_contains(plan->missing_reasons,
+                                     plan->missing_reason_count,
                                      "target_codegen_not_supported")) {
-            fprintf(stderr, "v3 compiler: target codegen not supported for %s\n", plan.target_triple);
+            fprintf(stderr, "v3 compiler: target codegen not supported for %s\n", plan->target_triple);
             fprintf(stderr, "v3 compiler: supported targets=%s\n", v3_supported_seed_target_csv());
             fprintf(stderr, "v3 compiler: target detail=%s\n",
-                    v3_requested_emit_support_detail(plan.target_triple, plan.emit_kind));
-        } else if (v3_plan_reasons_contains(primary.missing_reasons,
-                                     primary.missing_reason_count,
+                    v3_requested_emit_support_detail(plan->target_triple, plan->emit_kind));
+        } else if (v3_plan_reasons_contains(primary->missing_reasons,
+                                     primary->missing_reason_count,
                                      "primary_object_body_semantics_missing")) {
             fprintf(stderr, "v3 compiler: primary object body semantics missing\n");
-            if (primary.unsupported_function_count > 0U) {
+            if (primary->unsupported_function_count > 0U) {
                 fprintf(stderr,
                         "v3 compiler: first unsupported function=%s body_kind=%s abi=%s first_line=%s\n",
-                        primary.unsupported_function_symbols[0].text,
-                        primary.unsupported_body_kinds[0],
-                        primary.unsupported_abi_summaries[0],
-                        primary.unsupported_first_lines[0]);
+                        primary->unsupported_function_symbols[0].text,
+                        primary->unsupported_body_kinds[0],
+                        primary->unsupported_abi_summaries[0],
+                        primary->unsupported_first_lines[0]);
             }
-        } else if (v3_plan_reasons_contains(primary.missing_reasons,
-                                            primary.missing_reason_count,
+        } else if (v3_plan_reasons_contains(primary->missing_reasons,
+                                            primary->missing_reason_count,
                                             "primary_object_call_target_missing")) {
             fprintf(stderr, "v3 compiler: primary object call target missing\n");
         } else {
@@ -34261,20 +42114,30 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
         }
     } else if (!pipeline_ready) {
         fprintf(stderr, "v3 compiler: ordinary pipeline blocked\n");
-    } else if (v3_streq(plan.emit_kind, "shared") ?
-                   !v3_link_native_shared_library(&native_link, plan.output_path) :
-                   !v3_link_native_executable(&native_link, plan.output_path)) {
+    } else if (v3_streq(plan->emit_kind, "shared") ?
+                   !v3_link_native_shared_library(native_link, plan->output_path) :
+                   !v3_link_native_executable(native_link, plan->output_path)) {
         free(report);
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
-    } else if (v3_streq(plan.emit_kind, "exe") &&
-               !v3_write_executable_line_map(&plan, lowering)) {
+    } else if (v3_streq(plan->emit_kind, "exe") &&
+               !v3_write_executable_line_map(plan, lowering)) {
         free(report);
         free(lowering);
-        v3_compiler_world_artifacts_free(&world);
+        v3_compiler_world_artifacts_free(world);
         v3_contract_free(&contract);
+        free(plan);
+        free(world);
+        free(primary);
+        free(object_plan);
+        free(native_link);
         return 1;
     } else {
         rc = 0;
@@ -34282,8 +42145,13 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
     fputs(report, stderr);
     free(report);
     free(lowering);
-    v3_compiler_world_artifacts_free(&world);
+    v3_compiler_world_artifacts_free(world);
     v3_contract_free(&contract);
+    free(plan);
+    free(world);
+    free(primary);
+    free(object_plan);
+    free(native_link);
     return rc;
 }
 
@@ -34304,6 +42172,30 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "print-build-plan")) {
         return v3_cmd_print_build_plan(argc, argv);
     }
+    if (v3_streq(argv[1], "scan-hotpath")) {
+        return v3_cmd_scan_hotpath(argc, argv);
+    }
+    if (v3_streq(argv[1], "c-ref")) {
+        return v3_cmd_c_ref(argc, argv);
+    }
+    if (v3_streq(argv[1], "compare-bench")) {
+        return v3_cmd_compare_bench(argc, argv);
+    }
+    if (v3_streq(argv[1], "print-bootstrap")) {
+        return v3_cmd_print_bootstrap(argc, argv);
+    }
+    if (v3_streq(argv[1], "bootstrap-bridge")) {
+        return v3_cmd_bootstrap_bridge(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-backend-driver")) {
+        return v3_cmd_build_backend_driver(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-smokes")) {
+        return v3_cmd_run_smokes(argc, argv);
+    }
+    if (v3_streq(argv[1], "slice-gate")) {
+        return v3_cmd_slice_gate(argc, argv);
+    }
     if (v3_streq(argv[1], "debug-report")) {
         return v3_cmd_debug_report(argc, argv);
     }
@@ -34313,8 +42205,113 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "print-line-map")) {
         return v3_cmd_print_line_map(argc, argv);
     }
+    if (v3_streq(argv[1], "print-object")) {
+        return v3_cmd_print_object(argc, argv);
+    }
     if (v3_streq(argv[1], "print-elf")) {
         return v3_cmd_print_elf(argc, argv);
+    }
+    if (v3_streq(argv[1], "print-asm")) {
+        return v3_cmd_print_asm(argc, argv);
+    }
+    if (v3_streq(argv[1], "profile-run")) {
+        return v3_cmd_profile_run(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-orphan-guard")) {
+        return v3_cmd_verify_orphan_guard_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-debug-tools")) {
+        return v3_cmd_verify_debug_tools(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-debug-runtime")) {
+        return v3_cmd_verify_debug_runtime_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-debug-profile")) {
+        return v3_cmd_verify_debug_profile_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-windows-builtin")) {
+        return v3_cmd_verify_windows_builtin_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "verify-riscv64-builtin")) {
+        return v3_cmd_verify_riscv64_builtin_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-cross-target-smokes")) {
+        return v3_cmd_run_cross_target_smokes_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-host-smokes")) {
+        return v3_cmd_run_host_smokes_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-stage23-libp2p-smokes")) {
+        return v3_cmd_run_stage23_libp2p_smokes_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "r2c-react-v3")) {
+        return v3_cmd_r2c_react_v3_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-zero-exit")) {
+        return v3_cmd_build_zero_exit_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-panic-trace")) {
+        return v3_cmd_build_panic_trace_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-bounds-trace")) {
+        return v3_cmd_build_bounds_trace_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-signal-trace")) {
+        return v3_cmd_build_signal_trace_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-call-chain")) {
+        return v3_cmd_build_call_chain_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-ffi-handle")) {
+        return v3_cmd_build_ffi_handle_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-program-selfhost")) {
+        return v3_cmd_build_program_selfhost_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-chain-node")) {
+        return v3_cmd_build_chain_node_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-chain-node-linux")) {
+        return v3_cmd_build_chain_node_linux_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-rwad-bft-linux")) {
+        return v3_cmd_build_rwad_bft_linux_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-linux-object-smokes")) {
+        return v3_cmd_run_linux_object_smokes_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-tcp-twoproc-smoke")) {
+        return v3_cmd_run_tcp_twoproc_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-udp-importc-smoke")) {
+        return v3_cmd_run_udp_importc_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-wasm-smokes")) {
+        return v3_cmd_run_wasm_smokes_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-browser-host-wasm-smoke")) {
+        return v3_cmd_run_browser_host_wasm_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-chain-node-cli-smoke")) {
+        return v3_cmd_run_chain_node_cli_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-chain-node-process-smoke")) {
+        return v3_cmd_run_chain_node_process_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-chain-node-three-node-smoke")) {
+        return v3_cmd_run_chain_node_three_node_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-tailnet-control-smoke")) {
+        return v3_cmd_run_tailnet_control_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-fresh-node-selfhost-gate")) {
+        return v3_cmd_run_fresh_node_selfhost_gate_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-migration-gate")) {
+        return v3_cmd_run_migration_gate_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-browser-webrtc-smokes")) {
+        return v3_cmd_run_browser_webrtc_smokes_impl(argc, argv);
     }
     if (v3_streq(argv[1], "emit-csg")) {
         return v3_cmd_emit_csg(argc, argv);

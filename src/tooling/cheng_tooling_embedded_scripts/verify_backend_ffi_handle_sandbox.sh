@@ -44,6 +44,18 @@ fi
 
 target="${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}"
 gate_linker="${BACKEND_FFI_HANDLE_SANDBOX_LINKER:-system}"
+runtime_link_env="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_link_env --driver:"$driver" --target:"$target" --linker:self)"
+runtime_obj=""
+for entry in $runtime_link_env; do
+  case "$entry" in
+    BACKEND_RUNTIME_OBJ=*)
+      runtime_obj="${entry#BACKEND_RUNTIME_OBJ=}"
+      ;;
+  esac
+done
+if [ "$runtime_obj" = "" ] || [ ! -f "$runtime_obj" ]; then
+  fail "missing runtime object for probe/runtime surface: $runtime_obj"
+fi
 case "$gate_linker" in
   ""|auto|system)
     link_env="BACKEND_LINKER=system BACKEND_NO_RUNTIME_C=0"
@@ -58,11 +70,10 @@ case "$gate_linker" in
 esac
 
 header_file="src/runtime/native/system_helpers.h"
-c_runtime_file="src/runtime/native/system_helpers.c"
 backend_runtime_file="src/std/system_helpers_backend.cheng"
 fixture_ok="tests/cheng/backend/fixtures/ffi_importc_handle_annotated_i32.cheng"
 
-for runtime_file in "$header_file" "$c_runtime_file" "$backend_runtime_file" "$fixture_ok"; do
+for runtime_file in "$header_file" "$backend_runtime_file" "$fixture_ok"; do
   if [ ! -f "$runtime_file" ]; then
     fail "missing required file: $runtime_file"
   fi
@@ -83,11 +94,13 @@ for sym in \
   if ! rg -q "$sym" "$header_file"; then
     fail "missing header symbol: $sym"
   fi
-  if ! rg -q "$sym" "$c_runtime_file"; then
-    fail "missing C runtime symbol: $sym"
-  fi
   if ! rg -q "$sym" "$backend_runtime_file"; then
     fail "missing backend runtime symbol: $sym"
+  fi
+  if command -v nm >/dev/null 2>&1; then
+    if ! nm -g "$runtime_obj" 2>/dev/null | awk '{print $NF}' | sed 's/^_//' | grep -Fxq "$sym"; then
+      fail "missing runtime object symbol: $sym ($runtime_obj)"
+    fi
   fi
 done
 
@@ -182,7 +195,7 @@ esac
 set +e
 # shellcheck disable=SC2086
 "$cc_bin" -std=c11 -O2 -I src/runtime/native \
-  "$c_runtime_file" \
+  "$runtime_obj" \
   "$probe_src" \
   -o "$probe_bin" $extra_ldflags >"$probe_compile_log" 2>&1
 probe_compile_status="$?"
@@ -252,8 +265,8 @@ fi
   echo "link_env=$link_env"
   echo "cc=$cc_bin"
   echo "header_file=$header_file"
-  echo "c_runtime_file=$c_runtime_file"
   echo "backend_runtime_file=$backend_runtime_file"
+  echo "runtime_obj=$runtime_obj"
   echo "fixture_ok=$fixture_ok"
   echo "probe_src=$probe_src"
   echo "probe_bin=$probe_bin"

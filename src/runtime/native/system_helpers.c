@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #if !defined(_WIN32)
 #include <poll.h>
@@ -146,8 +147,15 @@ void cheng_dump_backtrace_if_enabled(void);
 static int cheng_backtrace_enabled(void);
 static void cheng_dump_native_backtrace_if_enabled(void);
 static void cheng_dump_backtrace_now(const char* reason);
+static void cheng_v3_profile_maybe_init(const char* exe_path);
+static void cheng_v3_profile_write_report(void);
+static void cheng_exec_kill_target(pid_t pid, int sig);
+static pid_t cheng_exec_spawn_orphan_guard(pid_t targetPid);
+static void cheng_exec_stop_orphan_guard(pid_t guardPid);
 static int64_t cheng_exec_wait_status(pid_t pid, int32_t timeoutSec);
 int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid);
+int32_t cheng_exec_file_pipe_spawn(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                                   const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid);
 char* cheng_fd_read_wait(int32_t fd, int32_t maxBytes, int32_t timeoutMs, int32_t* outEof);
 uint64_t cheng_ffi_handle_register_ptr(void* ptr);
 void* cheng_ffi_handle_resolve_ptr(uint64_t handle);
@@ -1032,10 +1040,51 @@ static volatile int32_t cheng_crash_trace_installed = 0;
 static volatile sig_atomic_t cheng_crash_trace_handling = 0;
 static const char* cheng_crash_trace_phase = NULL;
 
+#define CHENG_V3_PROFILE_MAX_SAMPLES 65536
+#define CHENG_V3_PROFILE_MAX_DEPTH 8
+
+typedef struct ChengV3ProfileSample {
+    uint8_t depth;
+    uintptr_t pcs[CHENG_V3_PROFILE_MAX_DEPTH];
+} ChengV3ProfileSample;
+
+typedef struct ChengV3ProfileCount {
+    char* key;
+    uint32_t count;
+} ChengV3ProfileCount;
+
+static ChengV3ProfileSample* cheng_v3_profile_samples = NULL;
+static int32_t cheng_v3_profile_capacity = 0;
+static volatile sig_atomic_t cheng_v3_profile_sample_count = 0;
+static volatile sig_atomic_t cheng_v3_profile_dropped_samples = 0;
+static volatile sig_atomic_t cheng_v3_profile_initialized = 0;
+static volatile sig_atomic_t cheng_v3_profile_enabled_cache = -1;
+static volatile sig_atomic_t cheng_v3_profile_installed = 0;
+static char cheng_v3_profile_out_path[PATH_MAX];
+
 static int cheng_flag_enabled(const char* raw) {
     if (raw == NULL || raw[0] == '\0') return 0;
     if (raw[0] == '0' && raw[1] == '\0') return 0;
     return 1;
+}
+
+static int cheng_v3_profile_env_enabled(void) {
+    return cheng_flag_enabled(getenv("CHENG_V3_PROFILE_ENABLE"));
+}
+
+static int32_t cheng_v3_profile_hz_value(void) {
+    const char* raw = getenv("CHENG_V3_PROFILE_HZ");
+    char* end = NULL;
+    long value = 200;
+    if (raw != NULL && raw[0] != '\0') {
+        value = strtol(raw, &end, 10);
+        if (end == raw) {
+            value = 200;
+        }
+    }
+    if (value < 10) value = 10;
+    if (value > 2000) value = 2000;
+    return (int32_t)value;
 }
 
 static int cheng_crash_trace_env_enabled(void) {
@@ -1292,8 +1341,16 @@ static uintptr_t cheng_v3_signal_context_pc(void* signal_context) {
     return 0U;
 #endif
 #else
+#if defined(__linux__) && defined(__aarch64__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL) {
+        return 0U;
+    }
+    return (uintptr_t)context->uc_mcontext.pc;
+#else
     (void)signal_context;
     return 0U;
+#endif
 #endif
 }
 
@@ -1313,8 +1370,16 @@ static uintptr_t cheng_v3_signal_context_fp(void* signal_context) {
     return 0U;
 #endif
 #else
+#if defined(__linux__) && defined(__aarch64__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL) {
+        return 0U;
+    }
+    return (uintptr_t)context->uc_mcontext.regs[29];
+#else
     (void)signal_context;
     return 0U;
+#endif
 #endif
 }
 
@@ -1334,8 +1399,16 @@ static uintptr_t cheng_v3_signal_context_sp(void* signal_context) {
     return 0U;
 #endif
 #else
+#if defined(__linux__) && defined(__aarch64__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL) {
+        return 0U;
+    }
+    return (uintptr_t)context->uc_mcontext.sp;
+#else
     (void)signal_context;
     return 0U;
+#endif
 #endif
 }
 
@@ -1353,8 +1426,16 @@ static uintptr_t cheng_v3_signal_context_lr(void* signal_context) {
     return 0U;
 #endif
 #else
+#if defined(__linux__) && defined(__aarch64__)
+    const ucontext_t* context = (const ucontext_t*)signal_context;
+    if (context == NULL) {
+        return 0U;
+    }
+    return (uintptr_t)context->uc_mcontext.regs[30];
+#else
     (void)signal_context;
     return 0U;
+#endif
 #endif
 }
 
@@ -1373,7 +1454,8 @@ static int32_t cheng_v3_dump_machine_signal_frames(const ChengV3EmbeddedLineMapE
     while (current_pc != 0U && depth < 48) {
         const ChengV3EmbeddedLineMapEntry* entry =
             cheng_v3_embedded_line_map_find_pc_in_entries(entries, count, current_pc);
-#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
+    (defined(__linux__) && defined(__aarch64__))
         if (depth > 0 &&
             cheng_probably_valid_ptr((const void*)current_fp) &&
             (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) == 0U) {
@@ -1388,7 +1470,8 @@ static int32_t cheng_v3_dump_machine_signal_frames(const ChengV3EmbeddedLineMapE
                                            current_lr,
                                            entry);
         emitted += 1;
-#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
+    (defined(__linux__) && defined(__aarch64__))
         if (!cheng_probably_valid_ptr((const void*)current_fp) ||
             (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
             break;
@@ -1435,7 +1518,8 @@ static int32_t cheng_v3_dump_source_signal_frames(const ChengV3EmbeddedLineMapEn
             cheng_v3_async_write_source_frame(depth, entry, current_pc);
             mapped += 1;
         }
-#if defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
+    (defined(__linux__) && defined(__aarch64__))
         if (!cheng_probably_valid_ptr((const void*)current_fp) ||
             (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
             break;
@@ -1465,6 +1549,39 @@ static int32_t cheng_v3_dump_source_signal_frames(const ChengV3EmbeddedLineMapEn
     return mapped;
 }
 
+static void cheng_v3_async_write_crash_header(const char* reason,
+                                              const char* mode,
+                                              int32_t sig,
+                                              uintptr_t pc,
+                                              uintptr_t fp,
+                                              uintptr_t sp,
+                                              uintptr_t lr,
+                                              uintptr_t fault_addr) {
+    cheng_crash_trace_write_cstr("[cheng-v3] v3_crash_report_v1\n");
+    cheng_crash_trace_write_cstr("[cheng-v3] reason=");
+    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
+    cheng_crash_trace_write_cstr(" mode=");
+    cheng_crash_trace_write_cstr(mode != NULL ? mode : "?");
+    cheng_crash_trace_write_cstr("\n");
+    cheng_crash_trace_write_cstr("[cheng-v3] regs pc=");
+    cheng_crash_trace_write_hex_uintptr(pc);
+    cheng_crash_trace_write_cstr(" fp=");
+    cheng_crash_trace_write_hex_uintptr(fp);
+    cheng_crash_trace_write_cstr(" sp=");
+    cheng_crash_trace_write_hex_uintptr(sp);
+    cheng_crash_trace_write_cstr(" lr=");
+    cheng_crash_trace_write_hex_uintptr(lr);
+    if (sig != 0) {
+        cheng_crash_trace_write_cstr(" sig=");
+        cheng_crash_trace_write_i32(sig);
+    }
+    if (sig != 0 || fault_addr != 0U) {
+        cheng_crash_trace_write_cstr(" fault=");
+        cheng_crash_trace_write_hex_uintptr(fault_addr);
+    }
+    cheng_crash_trace_write_cstr("\n");
+}
+
 static void cheng_v3_dump_source_signal_trace_if_available(const char* reason,
                                                            int32_t sig,
                                                            const siginfo_t* info,
@@ -1491,38 +1608,18 @@ static void cheng_v3_dump_source_signal_trace_if_available(const char* reason,
     fp = cheng_v3_signal_context_fp(signal_context);
     sp = cheng_v3_signal_context_sp(signal_context);
     lr = cheng_v3_signal_context_lr(signal_context);
-    cheng_crash_trace_write_cstr("[cheng-v3] machine-trace reason=");
-    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
-    cheng_crash_trace_write_cstr(" mode=signal sig=");
-    cheng_crash_trace_write_i32(sig);
-    cheng_crash_trace_write_cstr(" pc=");
-    cheng_crash_trace_write_hex_uintptr(pc);
-    cheng_crash_trace_write_cstr(" fp=");
-    cheng_crash_trace_write_hex_uintptr(fp);
-    cheng_crash_trace_write_cstr(" sp=");
-    cheng_crash_trace_write_hex_uintptr(sp);
-    cheng_crash_trace_write_cstr(" lr=");
-    cheng_crash_trace_write_hex_uintptr(lr);
-    if (info != NULL && info->si_addr != NULL) {
-        cheng_crash_trace_write_cstr(" fault=");
-        cheng_crash_trace_write_hex_uintptr((uintptr_t)info->si_addr);
-    }
-    cheng_crash_trace_write_cstr("\n");
+    cheng_v3_async_write_crash_header(reason,
+                                      "signal",
+                                      sig,
+                                      pc,
+                                      fp,
+                                      sp,
+                                      lr,
+                                      info != NULL && info->si_addr != NULL ? (uintptr_t)info->si_addr : 0U);
     cheng_v3_dump_machine_signal_frames(entries, count, pc, fp, sp, lr);
-    cheng_crash_trace_write_cstr("[cheng-v3] source-signal reason=");
-    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
-    cheng_crash_trace_write_cstr(" sig=");
-    cheng_crash_trace_write_i32(sig);
-    cheng_crash_trace_write_cstr(" pc=");
-    cheng_crash_trace_write_hex_uintptr(pc);
-    if (info != NULL && info->si_addr != NULL) {
-        cheng_crash_trace_write_cstr(" fault=");
-        cheng_crash_trace_write_hex_uintptr((uintptr_t)info->si_addr);
-    }
-    cheng_crash_trace_write_cstr("\n");
     mapped = cheng_v3_dump_source_signal_frames(entries, count, pc, fp);
     if (mapped <= 0) {
-        cheng_crash_trace_write_cstr("[cheng-v3] source-signal mapped_frames=0\n");
+        cheng_crash_trace_write_cstr("[cheng-v3] source_frames=0\n");
     }
 }
 
@@ -1764,9 +1861,6 @@ static void cheng_v3_dump_machine_backtrace_if_available(const char* reason) {
         embedded_entries = cheng_v3_embedded_line_map_entries_getter();
         embedded_count = cheng_v3_embedded_line_map_count_getter();
     }
-    fprintf(stderr,
-            "[cheng-v3] machine-trace reason=%s mode=backtrace\n",
-            reason != NULL ? reason : "?");
     for (i = 0; i < count; ++i) {
         uintptr_t pc = (uintptr_t)frames[i];
         uintptr_t symbol_pc = 0U;
@@ -1844,10 +1938,6 @@ static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
             embedded_entries = cheng_v3_embedded_line_map_entries_getter();
             embedded_count = cheng_v3_embedded_line_map_count_getter();
         }
-        fprintf(stderr,
-                "[cheng-v3] source-trace reason=%s map=%s\n",
-                reason != NULL ? reason : "?",
-                cheng_v3_line_map_loaded_path[0] != '\0' ? cheng_v3_line_map_loaded_path : "?");
         for (i = 0; i < count; ++i) {
             Dl_info info;
             const ChengV3EmbeddedLineMapEntry* embedded_entry;
@@ -1906,12 +1996,12 @@ static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
             mapped += 1;
         }
         if (mapped <= 0) {
-            fprintf(stderr, "[cheng-v3] source-trace mapped_frames=0\n");
+            fprintf(stderr, "[cheng-v3] source_frames=0\n");
         }
         fflush(stderr);
     }
 #else
-    fprintf(stderr, "[cheng-v3] source-trace unavailable\n");
+    fprintf(stderr, "[cheng-v3] source_frames=unavailable\n");
     fflush(stderr);
 #endif
 }
@@ -1935,6 +2025,11 @@ WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
     snprintf(map_path, sizeof(map_path), "%s.v3.map", exe_path);
     cheng_v3_line_map_load_path(map_path);
     cheng_crash_trace_install_handlers();
+    cheng_v3_profile_maybe_init(exe_path);
+}
+
+WEAK void cheng_v3_native_register_line_map_from_argv0(const char* argv0) {
+    cheng_v3_register_line_map_from_argv0(argv0);
 }
 
 static ChengSidecarBundleCache cheng_sidecar_cache = {0};
@@ -1998,7 +2093,12 @@ static void cheng_dump_native_backtrace_if_enabled(void) {
 
 static void cheng_dump_backtrace_now(const char* reason) {
     const char* actual_reason = reason != NULL && reason[0] != '\0' ? reason : "panic";
+    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
+    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
+    uintptr_t sp = (uintptr_t)&pc;
+    uintptr_t lr = pc;
     cheng_crash_trace_dump_now(actual_reason);
+    cheng_v3_async_write_crash_header(actual_reason, "backtrace", 0, pc, fp, sp, lr, 0U);
     cheng_v3_dump_machine_backtrace_if_available(actual_reason);
     cheng_v3_dump_source_backtrace_if_available(actual_reason);
     cheng_dump_native_backtrace_if_enabled();
@@ -5031,6 +5131,13 @@ WEAK void cheng_v3_panic_cstring_and_exit(const char* text) {
     cheng_exit(1);
 }
 
+WEAK void cheng_v3_native_dump_backtrace_and_exit(const char* reason, int32_t code) {
+    const char* safe = (reason != NULL && reason[0] != '\0') ? reason : "panic";
+    fflush(stderr);
+    cheng_dump_backtrace_now(safe);
+    cheng_exit(code != 0 ? code : 1);
+}
+
 void cheng_bounds_check(int32_t len, int32_t idx) {
     if (idx < 0 || idx >= len) {
         fprintf(stderr, "[cheng] bounds check failed: idx=%d len=%d\n", idx, len);
@@ -6811,6 +6918,358 @@ static void cheng_v3_mkdir_all_raw(const char* path, int include_leaf) {
     }
     free(scratch);
 }
+
+static void cheng_v3_profile_ensure_parent_dir(const char* path) {
+    char parent[PATH_MAX];
+    size_t len;
+    const char* slash;
+    if (path == NULL || path[0] == '\0') {
+        return;
+    }
+    slash = strrchr(path, '/');
+#if defined(_WIN32)
+    {
+        const char* backslash = strrchr(path, '\\');
+        if (backslash != NULL && (slash == NULL || backslash > slash)) {
+            slash = backslash;
+        }
+    }
+#endif
+    if (slash == NULL) {
+        return;
+    }
+    len = (size_t)(slash - path);
+    if (len == 0U || len >= sizeof(parent)) {
+        return;
+    }
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    cheng_v3_mkdir_all_raw(parent, 1);
+}
+
+static uint8_t cheng_v3_profile_capture_frames(void* signal_context,
+                                               uintptr_t* pcs,
+                                               uint8_t pcs_cap) {
+    uintptr_t current_pc = cheng_v3_signal_context_pc(signal_context);
+    uintptr_t current_fp = cheng_v3_signal_context_fp(signal_context);
+    uint8_t depth = 0;
+    if (pcs == NULL || pcs_cap == 0U || current_pc == 0U) {
+        return 0U;
+    }
+    while (current_pc != 0U && depth < pcs_cap) {
+        pcs[depth++] = current_pc;
+#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
+    (defined(__linux__) && defined(__aarch64__))
+        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
+            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
+            break;
+        }
+        {
+            const uintptr_t* frame = (const uintptr_t*)current_fp;
+            uintptr_t next_fp = frame[0];
+            uintptr_t return_pc = frame[1];
+            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
+                break;
+            }
+            if (return_pc == 0U) {
+                break;
+            }
+#if defined(__arm64__) || defined(__aarch64__)
+            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
+#else
+            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
+#endif
+            current_fp = next_fp;
+        }
+#else
+        break;
+#endif
+    }
+    return depth;
+}
+
+static void cheng_v3_profile_signal_handler(int sig, siginfo_t* info, void* signal_context) {
+    int32_t index;
+    (void)sig;
+    (void)info;
+    if (cheng_v3_profile_samples == NULL || cheng_v3_profile_capacity <= 0) {
+        return;
+    }
+    index = __sync_fetch_and_add(&cheng_v3_profile_sample_count, 1);
+    if (index < 0 || index >= cheng_v3_profile_capacity) {
+        __sync_fetch_and_add(&cheng_v3_profile_dropped_samples, 1);
+        return;
+    }
+    cheng_v3_profile_samples[index].depth =
+        cheng_v3_profile_capture_frames(signal_context,
+                                        cheng_v3_profile_samples[index].pcs,
+                                        CHENG_V3_PROFILE_MAX_DEPTH);
+}
+
+static int cheng_v3_profile_count_cmp(const void* left, const void* right) {
+    const ChengV3ProfileCount* a = (const ChengV3ProfileCount*)left;
+    const ChengV3ProfileCount* b = (const ChengV3ProfileCount*)right;
+    if (a->count > b->count) return -1;
+    if (a->count < b->count) return 1;
+    if (a->key == NULL && b->key == NULL) return 0;
+    if (a->key == NULL) return 1;
+    if (b->key == NULL) return -1;
+    return strcmp(a->key, b->key);
+}
+
+static int cheng_v3_profile_count_add(ChengV3ProfileCount** items,
+                                      int32_t* len,
+                                      int32_t* cap,
+                                      const char* key) {
+    ChengV3ProfileCount* grown = NULL;
+    int32_t i;
+    if (items == NULL || len == NULL || cap == NULL || key == NULL || key[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; i < *len; ++i) {
+        if ((*items)[i].key != NULL && strcmp((*items)[i].key, key) == 0) {
+            (*items)[i].count += 1U;
+            return 1;
+        }
+    }
+    if (*len >= *cap) {
+        int32_t next_cap = *cap > 0 ? (*cap * 2) : 32;
+        grown = (ChengV3ProfileCount*)realloc(*items, (size_t)next_cap * sizeof(ChengV3ProfileCount));
+        if (grown == NULL) {
+            return 0;
+        }
+        for (i = *cap; i < next_cap; i += 1) {
+            grown[i].key = NULL;
+            grown[i].count = 0U;
+        }
+        *items = grown;
+        *cap = next_cap;
+    }
+    (*items)[*len].key = cheng_copy_string_bytes(key, strlen(key));
+    if ((*items)[*len].key == NULL) {
+        return 0;
+    }
+    (*items)[*len].count = 1U;
+    *len += 1;
+    return 1;
+}
+
+static void cheng_v3_profile_counts_free(ChengV3ProfileCount* items,
+                                         int32_t len) {
+    int32_t i;
+    if (items == NULL) {
+        return;
+    }
+    for (i = 0; i < len; i += 1) {
+        cheng_free(items[i].key);
+    }
+    free(items);
+}
+
+static void cheng_v3_profile_labels_for_pc(uintptr_t pc,
+                                           char* function_out,
+                                           size_t function_cap,
+                                           char* source_out,
+                                           size_t source_cap) {
+    const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
+    uint64_t embedded_count = 0U;
+    const ChengV3EmbeddedLineMapEntry* embedded_entry = NULL;
+    Dl_info info;
+    memset(&info, 0, sizeof(info));
+    if (function_cap > 0U) function_out[0] = '\0';
+    if (source_cap > 0U) source_out[0] = '\0';
+    cheng_v3_try_resolve_embedded_line_map_getters();
+    if (cheng_v3_embedded_line_map_entries_getter != NULL &&
+        cheng_v3_embedded_line_map_count_getter != NULL) {
+        embedded_entries = cheng_v3_embedded_line_map_entries_getter();
+        embedded_count = cheng_v3_embedded_line_map_count_getter();
+        embedded_entry = cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
+    }
+    if (embedded_entry != NULL) {
+        snprintf(function_out,
+                 function_cap,
+                 "%s",
+                 embedded_entry->function_name != NULL && embedded_entry->function_name[0] != '\0' ?
+                     embedded_entry->function_name :
+                     "?");
+        snprintf(source_out,
+                 source_cap,
+                 "%s:%d",
+                 embedded_entry->source_path != NULL && embedded_entry->source_path[0] != '\0' ?
+                     embedded_entry->source_path :
+                     "?",
+                 cheng_v3_line_span_start(embedded_entry->signature_line, embedded_entry->body_first_line));
+        return;
+    }
+    if (dladdr((void*)pc, &info) != 0 && info.dli_sname != NULL) {
+        const ChengV3LineMapEntry* entry = cheng_v3_line_map_find(info.dli_sname);
+        snprintf(function_out, function_cap, "%s", info.dli_sname);
+        if (entry != NULL) {
+            snprintf(source_out,
+                     source_cap,
+                     "%s:%d",
+                     entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?",
+                     cheng_v3_line_span_start(entry->signature_line, entry->body_first_line));
+        }
+        return;
+    }
+    snprintf(function_out, function_cap, "pc_%zx", (size_t)pc);
+    snprintf(source_out, source_cap, "pc_%zx", (size_t)pc);
+}
+
+static void cheng_v3_profile_stop_timer(void) {
+#if !defined(_WIN32)
+    struct itimerval timer;
+    memset(&timer, 0, sizeof(timer));
+    setitimer(ITIMER_REAL, &timer, NULL);
+#endif
+}
+
+static void cheng_v3_profile_write_report(void) {
+    FILE* file = NULL;
+    int32_t sample_count = cheng_v3_profile_sample_count;
+    ChengV3ProfileCount* function_counts = NULL;
+    ChengV3ProfileCount* source_counts = NULL;
+    ChengV3ProfileCount* pc_counts = NULL;
+    int32_t function_len = 0;
+    int32_t source_len = 0;
+    int32_t pc_len = 0;
+    int32_t function_cap = 0;
+    int32_t source_cap = 0;
+    int32_t pc_cap = 0;
+    int32_t i;
+    if (!cheng_v3_profile_env_enabled() || cheng_v3_profile_out_path[0] == '\0') {
+        return;
+    }
+    cheng_v3_profile_stop_timer();
+    if (sample_count < 0) sample_count = 0;
+    if (sample_count > cheng_v3_profile_capacity) {
+        sample_count = cheng_v3_profile_capacity;
+    }
+    for (i = 0; i < sample_count; i += 1) {
+        char function_name[PATH_MAX];
+        char source_name[PATH_MAX];
+        char pc_name[64];
+        uintptr_t pc;
+        if (cheng_v3_profile_samples == NULL || cheng_v3_profile_samples[i].depth == 0U) {
+            continue;
+        }
+        pc = cheng_v3_profile_samples[i].pcs[0];
+        cheng_v3_profile_labels_for_pc(pc,
+                                       function_name,
+                                       sizeof(function_name),
+                                       source_name,
+                                       sizeof(source_name));
+        snprintf(pc_name, sizeof(pc_name), "0x%zx", (size_t)pc);
+        if (!cheng_v3_profile_count_add(&function_counts, &function_len, &function_cap, function_name) ||
+            !cheng_v3_profile_count_add(&source_counts, &source_len, &source_cap, source_name) ||
+            !cheng_v3_profile_count_add(&pc_counts, &pc_len, &pc_cap, pc_name)) {
+            cheng_v3_profile_counts_free(function_counts, function_len);
+            cheng_v3_profile_counts_free(source_counts, source_len);
+            cheng_v3_profile_counts_free(pc_counts, pc_len);
+            return;
+        }
+    }
+    if (function_len > 1) qsort(function_counts, (size_t)function_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
+    if (source_len > 1) qsort(source_counts, (size_t)source_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
+    if (pc_len > 1) qsort(pc_counts, (size_t)pc_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
+    cheng_v3_profile_ensure_parent_dir(cheng_v3_profile_out_path);
+    file = fopen(cheng_v3_profile_out_path, "wb");
+    if (file == NULL) {
+        cheng_v3_profile_counts_free(function_counts, function_len);
+        cheng_v3_profile_counts_free(source_counts, source_len);
+        cheng_v3_profile_counts_free(pc_counts, pc_len);
+        return;
+    }
+    fprintf(file, "v3_profile_v1\n");
+    fprintf(file, "total_samples=%d\n", sample_count);
+    fprintf(file, "dropped_samples=%d\n", (int)cheng_v3_profile_dropped_samples);
+    for (i = 0; i < function_len && i < 8; i += 1) {
+        fprintf(file, "hot_function[%d]=%u|%s\n",
+                i,
+                function_counts[i].count,
+                function_counts[i].key != NULL ? function_counts[i].key : "?");
+    }
+    for (i = 0; i < source_len && i < 8; i += 1) {
+        fprintf(file, "hot_source[%d]=%u|%s\n",
+                i,
+                source_counts[i].count,
+                source_counts[i].key != NULL ? source_counts[i].key : "?");
+    }
+    for (i = 0; i < pc_len && i < 8; i += 1) {
+        fprintf(file, "hot_pc[%d]=%u|%s\n",
+                i,
+                pc_counts[i].count,
+                pc_counts[i].key != NULL ? pc_counts[i].key : "?");
+    }
+    fclose(file);
+    cheng_v3_profile_counts_free(function_counts, function_len);
+    cheng_v3_profile_counts_free(source_counts, source_len);
+    cheng_v3_profile_counts_free(pc_counts, pc_len);
+}
+
+static void cheng_v3_profile_maybe_init(const char* exe_path) {
+#if defined(_WIN32)
+    (void)exe_path;
+    cheng_v3_profile_enabled_cache = 0;
+    return;
+#else
+    struct sigaction sa;
+    struct itimerval timer;
+    int32_t hz;
+    const char* out_env;
+    if (cheng_v3_profile_initialized) {
+        return;
+    }
+    if (!cheng_v3_profile_env_enabled()) {
+        cheng_v3_profile_enabled_cache = 0;
+        return;
+    }
+#if !(defined(__APPLE__) && defined(__arm64__)) && !(defined(__linux__) && defined(__aarch64__))
+    {
+        cheng_v3_profile_enabled_cache = 0;
+        return;
+    }
+#endif
+    cheng_v3_profile_capacity = CHENG_V3_PROFILE_MAX_SAMPLES;
+    cheng_v3_profile_samples = (ChengV3ProfileSample*)calloc(
+        (size_t)cheng_v3_profile_capacity,
+        sizeof(ChengV3ProfileSample)
+    );
+    if (cheng_v3_profile_samples == NULL) {
+        cheng_v3_profile_enabled_cache = 0;
+        return;
+    }
+    out_env = getenv("CHENG_V3_PROFILE_OUT");
+    if (out_env != NULL && out_env[0] != '\0') {
+        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "%s", out_env);
+    } else if (exe_path != NULL && exe_path[0] != '\0') {
+        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "%s.v3.profile.txt", exe_path);
+    } else {
+        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "cheng_v3.profile.txt");
+    }
+    if (__sync_lock_test_and_set(&cheng_v3_profile_installed, 1) == 0) {
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = cheng_v3_profile_signal_handler;
+        sa.sa_flags = SA_SIGINFO;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGALRM, &sa, NULL);
+    }
+    hz = cheng_v3_profile_hz_value();
+    memset(&timer, 0, sizeof(timer));
+    timer.it_interval.tv_sec = 0;
+    timer.it_interval.tv_usec = 1000000 / hz;
+    if (timer.it_interval.tv_usec <= 0) {
+        timer.it_interval.tv_usec = 1000;
+    }
+    timer.it_value = timer.it_interval;
+    setitimer(ITIMER_REAL, &timer, NULL);
+    atexit(cheng_v3_profile_write_report);
+    cheng_v3_profile_enabled_cache = 1;
+    cheng_v3_profile_initialized = 1;
+#endif
+}
+
 static char* cheng_v3_bridge_copy_cstring(ChengStrBridge text) {
     const char* safe = "";
     size_t n = 0u;
@@ -11955,11 +12414,11 @@ static int64_t cheng_exec_wait_status(pid_t pid, int32_t timeoutSec) {
             int64_t nowNs = cheng_monotime_ns();
             if (nowNs >= deadlineNs) {
                 if (!termSent) {
-                    kill(pid, SIGTERM);
+                    cheng_exec_kill_target(pid, SIGTERM);
                     termSent = 1;
                     termSentNs = nowNs;
                 } else if (nowNs - termSentNs >= 50000000LL) {
-                    kill(pid, SIGKILL);
+                    cheng_exec_kill_target(pid, SIGKILL);
                 }
                 timedOut = 1;
             }
@@ -11988,6 +12447,94 @@ static int64_t cheng_exec_wait_status(pid_t pid, int32_t timeoutSec) {
 #endif
 }
 
+static void cheng_exec_kill_target(pid_t pid, int sig) {
+#if defined(_WIN32)
+    (void)pid;
+    (void)sig;
+#else
+    if (pid <= 0) return;
+    if (kill(-pid, sig) != 0) {
+        (void)kill(pid, sig);
+    }
+#endif
+}
+
+static pid_t cheng_exec_spawn_orphan_guard(pid_t targetPid) {
+#if defined(_WIN32)
+    (void)targetPid;
+    return -1;
+#else
+    pid_t guardPid = -1;
+    if (targetPid <= 0) return -1;
+    guardPid = fork();
+    if (guardPid != 0) {
+        return guardPid;
+    }
+    for (;;) {
+        if (getppid() == 1) {
+            cheng_exec_kill_target(targetPid, SIGTERM);
+            usleep(200000);
+            cheng_exec_kill_target(targetPid, SIGKILL);
+            _exit(0);
+        }
+        if (kill(targetPid, 0) != 0 && errno == ESRCH) {
+            _exit(0);
+        }
+        usleep(200000);
+    }
+#endif
+}
+
+static void cheng_exec_stop_orphan_guard(pid_t guardPid) {
+#if defined(_WIN32)
+    (void)guardPid;
+#else
+    if (guardPid <= 0) return;
+    (void)kill(guardPid, SIGTERM);
+    (void)waitpid(guardPid, NULL, 0);
+#endif
+}
+
+static void cheng_exec_spawn_detached_orphan_guard(pid_t wrapperPid, pid_t targetPid) {
+#if defined(_WIN32)
+    (void)wrapperPid;
+    (void)targetPid;
+#else
+    pid_t guardPid = -1;
+    if (wrapperPid <= 0 || targetPid <= 0) return;
+    guardPid = fork();
+    if (guardPid < 0) {
+        return;
+    }
+    if (guardPid > 0) {
+        (void)waitpid(guardPid, NULL, 0);
+        return;
+    }
+    {
+        pid_t workerPid = fork();
+        if (workerPid < 0) {
+            _exit(0);
+        }
+        if (workerPid > 0) {
+            _exit(0);
+        }
+    }
+    (void)setsid();
+    for (;;) {
+        if (kill(targetPid, 0) != 0 && errno == ESRCH) {
+            _exit(0);
+        }
+        if (kill(wrapperPid, 0) != 0 && errno == ESRCH) {
+            cheng_exec_kill_target(targetPid, SIGTERM);
+            usleep(200000);
+            cheng_exec_kill_target(targetPid, SIGKILL);
+            _exit(0);
+        }
+        usleep(200000);
+    }
+#endif
+}
+
 static int cheng_exec_spawn_addchdir(posix_spawn_file_actions_t* actions, const char* workingDir) {
     if (!workingDir || !workingDir[0]) return 0;
 #if defined(__APPLE__)
@@ -12010,6 +12557,8 @@ static int64_t cheng_exec_file_status_fork(const char* filePath, char** argv, ch
                                            const char* workingDir, int32_t timeoutSec) {
     int devNullFd = -1;
     pid_t pid = -1;
+    pid_t guardPid = -1;
+    int64_t rc = -1;
     devNullFd = open("/dev/null", O_WRONLY);
     if (devNullFd < 0) {
         return -1;
@@ -12020,6 +12569,7 @@ static int64_t cheng_exec_file_status_fork(const char* filePath, char** argv, ch
         return -1;
     }
     if (pid == 0) {
+        (void)setpgid(0, 0);
         if (workingDir && workingDir[0]) chdir(workingDir);
         dup2(devNullFd, STDOUT_FILENO);
         dup2(devNullFd, STDERR_FILENO);
@@ -12028,7 +12578,11 @@ static int64_t cheng_exec_file_status_fork(const char* filePath, char** argv, ch
         _exit(127);
     }
     close(devNullFd);
-    return cheng_exec_wait_status(pid, timeoutSec);
+    (void)setpgid(pid, pid);
+    guardPid = cheng_exec_spawn_orphan_guard(pid);
+    rc = cheng_exec_wait_status(pid, timeoutSec);
+    cheng_exec_stop_orphan_guard(guardPid);
+    return rc;
 }
 
 char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
@@ -12048,6 +12602,7 @@ char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envO
     char** envp = NULL;
     int captureFd = -1;
     pid_t pid = -1;
+    pid_t guardPid = -1;
     char* out = NULL;
     char capturePath[] = "/tmp/cheng_exec_capture.XXXXXX";
     if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
@@ -12066,6 +12621,7 @@ char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envO
         return cheng_strdup("");
     }
     if (pid == 0) {
+        (void)setpgid(0, 0);
         if (workingDir && workingDir[0]) chdir(workingDir);
         dup2(captureFd, STDOUT_FILENO);
         if (mergeStderr != 0) dup2(captureFd, STDERR_FILENO);
@@ -12082,7 +12638,10 @@ char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envO
     captureFd = -1;
     cheng_exec_free_argv_env(argv, envp);
     {
+        (void)setpgid(pid, pid);
+        guardPid = cheng_exec_spawn_orphan_guard(pid);
         int64_t rc = cheng_exec_wait_status(pid, timeoutSec);
+        cheng_exec_stop_orphan_guard(guardPid);
         if (exitCode) *exitCode = rc;
     }
     out = driver_c_read_file_all(capturePath);
@@ -12145,7 +12704,12 @@ int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* env
     if (spawnRc != 0) {
         return 127;
     }
-    rc = cheng_exec_wait_status(pid, timeoutSec);
+    (void)setpgid(pid, pid);
+    {
+        pid_t guardPid = cheng_exec_spawn_orphan_guard(pid);
+        rc = cheng_exec_wait_status(pid, timeoutSec);
+        cheng_exec_stop_orphan_guard(guardPid);
+    }
     return rc;
 #endif
 }
@@ -12271,6 +12835,84 @@ int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* o
     if (flags != -1) {
         fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
     }
+    if (outReadFd) *outReadFd = out_pipe[0];
+    if (outWriteFd) *outWriteFd = in_pipe[1];
+    if (outPid) *outPid = (int64_t)pid;
+    return 1;
+#endif
+}
+
+int32_t cheng_exec_file_pipe_spawn(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
+                                   const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid) {
+#if defined(_WIN32)
+    (void)filePath;
+    (void)argvSeqPtr;
+    (void)envOverridesSeqPtr;
+    (void)workingDir;
+    if (outReadFd) *outReadFd = -1;
+    if (outWriteFd) *outWriteFd = -1;
+    if (outPid) *outPid = -1;
+    return 0;
+#else
+    char** argv = NULL;
+    char** envp = NULL;
+    int in_pipe[2];
+    int out_pipe[2];
+    pid_t pid = -1;
+    if (outReadFd) *outReadFd = -1;
+    if (outWriteFd) *outWriteFd = -1;
+    if (outPid) *outPid = -1;
+    if (!filePath || !filePath[0]) return 0;
+    if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
+        return 0;
+    }
+    if (pipe(in_pipe) != 0) {
+        cheng_exec_free_argv_env(argv, envp);
+        return 0;
+    }
+    if (pipe(out_pipe) != 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        cheng_exec_free_argv_env(argv, envp);
+        return 0;
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        cheng_exec_free_argv_env(argv, envp);
+        return 0;
+    }
+    if (pid == 0) {
+        (void)setpgid(0, 0);
+        dup2(in_pipe[0], STDIN_FILENO);
+        dup2(out_pipe[1], STDOUT_FILENO);
+        dup2(out_pipe[1], STDERR_FILENO);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        if (workingDir && workingDir[0]) chdir(workingDir);
+        execve(filePath, argv, envp ? envp : environ);
+        _exit(127);
+    }
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    cheng_exec_free_argv_env(argv, envp);
+    (void)setpgid(pid, pid);
+    {
+        int flags = fcntl(out_pipe[0], F_GETFL);
+        if (flags != -1) {
+            fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        flags = fcntl(in_pipe[1], F_GETFL);
+        if (flags != -1) {
+            fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+    cheng_exec_spawn_detached_orphan_guard(getpid(), pid);
     if (outReadFd) *outReadFd = out_pipe[0];
     if (outWriteFd) *outWriteFd = in_pipe[1];
     if (outPid) *outPid = (int64_t)pid;
@@ -12450,6 +13092,23 @@ int32_t cheng_pty_wait(int64_t pid, int32_t* outExitCode) {
         else *outExitCode = status;
     }
     return 1;
+#endif
+}
+
+int32_t cheng_process_signal(int64_t pid, int32_t signalCode) {
+#if defined(_WIN32)
+    (void)pid;
+    (void)signalCode;
+    return -1;
+#else
+    if (pid <= 0 || signalCode <= 0) return -1;
+    if (kill(-(pid_t)pid, signalCode) == 0) {
+        return 0;
+    }
+    if (kill((pid_t)pid, signalCode) == 0) {
+        return 0;
+    }
+    return -1;
 #endif
 }
 

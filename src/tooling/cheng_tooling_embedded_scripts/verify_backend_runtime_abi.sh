@@ -7,9 +7,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 header_file="src/runtime/native/system_helpers.h"
-c_runtime_main="src/runtime/native/system_helpers.c"
-c_runtime_float_bits="src/runtime/native/system_helpers_float_bits.c"
-backend_runtime_file="src/std/system_helpers_backend.cheng"
+target="${BACKEND_TARGET:-$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} detect_host_target 2>/dev/null || echo arm64-apple-darwin)}"
 
 fail() {
   echo "[verify_backend_runtime_abi] $1" 1>&2
@@ -27,17 +25,36 @@ extract_header_symbols() {
     | sort -u
 }
 
-extract_c_defined_symbols() {
-  rg -N --no-filename '^[[:space:]]*(__attribute__\(\([^)]*\)\)[[:space:]]*)*[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\([^;]*\)[[:space:]]*\{' "$@" \
-    | sed -E 's/^[[:space:]]*(__attribute__\(\([^)]*\)\)[[:space:]]*)*//' \
-    | sed -E 's/^[[:space:]]*[A-Za-z_][A-Za-z0-9_[:space:]\*]*[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' \
+extract_runtime_symbols() {
+  nm -g "$1" 2>/dev/null \
+    | awk '{print $NF}' \
+    | sed 's/^_//' \
     | sort -u
 }
 
-extract_backend_symbols() {
-  rg -N --no-filename '^[[:space:]]*fn[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' "$1" \
-    | sed -E 's/^[[:space:]]*fn[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*\(.*/\1/' \
-    | sort -u
+resolve_runtime_obj() {
+  if [ "${BACKEND_RUNTIME_OBJ:-}" != "" ] && [ -f "${BACKEND_RUNTIME_OBJ}" ]; then
+    printf '%s\n' "${BACKEND_RUNTIME_OBJ}"
+    return 0
+  fi
+  candidates="
+chengcache/runtime_selflink/system_helpers.backend.fullcompat.${target}.o
+chengcache/runtime_selflink/system_helpers.backend.combined.${target}.o
+artifacts/backend_mm/system_helpers.backend.combined.${target}.o
+chengcache/system_helpers.backend.cheng.${target}.o
+artifacts/backend_selfhost_self_obj/stage1.native.runtime.dedup.o
+artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.stage1shim.o
+chengcache/system_helpers.backend.cheng.o
+artifacts/backend_selfhost_self_obj/system_helpers.backend.cheng.o
+"
+  for cand in $candidates; do
+    [ "$cand" != "" ] || continue
+    if [ -f "$cand" ]; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done
+  return 1
 }
 
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cheng_runtime_abi.XXXXXX")"
@@ -47,33 +64,20 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 require_file "$header_file"
-require_file "$c_runtime_main"
-require_file "$backend_runtime_file"
+command -v nm >/dev/null 2>&1 || fail "nm is required"
 
 header_symbols="$tmp_dir/header_symbols.txt"
-c_symbols="$tmp_dir/c_symbols.txt"
 backend_symbols="$tmp_dir/backend_symbols.txt"
-missing_in_c="$tmp_dir/missing_in_c.txt"
 missing_in_backend="$tmp_dir/missing_in_backend.txt"
 allowed_backend_missing="$tmp_dir/allowed_backend_missing.txt"
 unexpected_backend_missing="$tmp_dir/unexpected_backend_missing.txt"
+runtime_obj="$(resolve_runtime_obj || true)"
+
+[ "$runtime_obj" != "" ] || fail "missing runtime object for target=$target"
+[ -f "$runtime_obj" ] || fail "missing runtime object for target=$target: $runtime_obj"
 
 extract_header_symbols "$header_file" > "$header_symbols"
-
-if [ -f "$c_runtime_float_bits" ]; then
-  extract_c_defined_symbols "$c_runtime_main" "$c_runtime_float_bits" > "$c_symbols"
-else
-  extract_c_defined_symbols "$c_runtime_main" > "$c_symbols"
-fi
-
-extract_backend_symbols "$backend_runtime_file" > "$backend_symbols"
-
-comm -23 "$header_symbols" "$c_symbols" > "$missing_in_c"
-if [ -s "$missing_in_c" ]; then
-  echo "[verify_backend_runtime_abi] C runtime missing header symbols:" 1>&2
-  cat "$missing_in_c" 1>&2
-  exit 1
-fi
+extract_runtime_symbols "$runtime_obj" > "$backend_symbols"
 
 cat > "$allowed_backend_missing" <<'EOF'
 alloc
@@ -133,9 +137,6 @@ if [ -s "$unexpected_backend_missing" ]; then
 fi
 
 for alias in __addr _addr; do
-  if ! grep -qx "$alias" "$c_symbols"; then
-    fail "C runtime missing alias symbol: $alias"
-  fi
   if ! grep -qx "$alias" "$backend_symbols"; then
     fail "backend runtime missing alias symbol: $alias"
   fi

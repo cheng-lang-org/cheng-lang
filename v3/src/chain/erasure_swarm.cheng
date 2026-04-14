@@ -112,6 +112,31 @@ fn v3ErasurePeerAdvertZero(): V3ErasurePeerAdvert =
         advertCid: layout.fixedBytes32Zero()
     )
 
+fn v3ErasurePeerAdvertFill(out: var V3ErasurePeerAdvert,
+                           advert: V3ErasurePeerAdvert) =
+    out = v3ErasurePeerAdvertZero()
+    out.version = advert.version
+    out.peerId = advert.peerId
+    out.blobCid = advert.blobCid
+    out.manifestCid = advert.manifestCid
+    out.shardCount = advert.shardCount
+    out.availabilityPermille = advert.availabilityPermille
+    out.maxConcurrentPulls = advert.maxConcurrentPulls
+    out.advertCid = advert.advertCid
+    out.shardIndices = []
+    for i in 0..<advert.shardIndices.len:
+        add(out.shardIndices, advert.shardIndices[i])
+    out.shardPayloadCids = []
+    for i in 0..<advert.shardPayloadCids.len:
+        add(out.shardPayloadCids, advert.shardPayloadCids[i])
+
+fn v3ErasurePeerAdvertAppend(out: var V3ErasurePeerAdvert[],
+                             advert: V3ErasurePeerAdvert) =
+    let insert = v3ErasurePeerAdvertZero()
+    add(out, insert)
+    let idx = out.len - 1
+    v3ErasurePeerAdvertFill(out[idx], advert)
+
 fn v3ErasureRecoveryPlanZero(): V3ErasureRecoveryPlan =
     return V3ErasureRecoveryPlan(
         version: 1,
@@ -742,11 +767,13 @@ fn v3ErasureCountAvailableUniqueShards(manifest: V3ErasureShardManifest,
         add(selected, false)
     var count = 0
     for i in 0..<adverts.len:
-        let advertRes = v3ErasurePeerAdvertValidate(adverts[i], manifest, params)
+        var advert = v3ErasurePeerAdvertZero()
+        v3ErasurePeerAdvertFill(advert, adverts[i])
+        let advertRes = v3ErasurePeerAdvertValidate(advert, manifest, params)
         if IsErr(advertRes):
             return Err[int32](Error(advertRes))
-        for j in 0..<adverts[i].shardCount:
-            let shardIndex = adverts[i].shardIndices[j]
+        for j in 0..<advert.shardCount:
+            let shardIndex = advert.shardIndices[j]
             if !selected[shardIndex]:
                 selected[shardIndex] = true
                 count = count + 1
@@ -770,11 +797,13 @@ fn v3ErasureSelectPeerForShard(adverts: V3ErasurePeerAdvert[],
     var bestShardCount = 0
     var bestAvailability = 0
     for i in 0..<adverts.len:
-        if v3ErasureAdvertShardPos(adverts[i], shardIndex) < 0:
+        var advert = v3ErasurePeerAdvertZero()
+        v3ErasurePeerAdvertFill(advert, adverts[i])
+        if v3ErasureAdvertShardPos(advert, shardIndex) < 0:
             continue
         let reuse = peerUseCounts[i]
-        let shardCount = adverts[i].shardCount
-        let availability = adverts[i].availabilityPermille
+        let shardCount = advert.shardCount
+        let availability = advert.availabilityPermille
         if bestAdvert < 0:
             bestAdvert = i
             bestReuse = reuse
@@ -789,8 +818,11 @@ fn v3ErasureSelectPeerForShard(adverts: V3ErasurePeerAdvert[],
         elif reuse == bestReuse && shardCount == bestShardCount && availability > bestAvailability:
             take = true
         elif reuse == bestReuse && shardCount == bestShardCount && availability == bestAvailability &&
-             lt.v3FixedBytes32Less(adverts[i].peerId, adverts[bestAdvert].peerId):
-            take = true
+             bestAdvert >= 0:
+            var bestAdvertInfo = v3ErasurePeerAdvertZero()
+            v3ErasurePeerAdvertFill(bestAdvertInfo, adverts[bestAdvert])
+            if lt.v3FixedBytes32Less(advert.peerId, bestAdvertInfo.peerId):
+                take = true
         if take:
             bestAdvert = i
             bestReuse = reuse
@@ -805,7 +837,9 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
     if IsErr(manifestRes):
         return Err[V3ErasureRecoveryPlan](Error(manifestRes))
     for i in 0..<adverts.len:
-        let advertRes = v3ErasurePeerAdvertValidate(adverts[i], manifest, params)
+        var advert = v3ErasurePeerAdvertZero()
+        v3ErasurePeerAdvertFill(advert, adverts[i])
+        let advertRes = v3ErasurePeerAdvertValidate(advert, manifest, params)
         if IsErr(advertRes):
             return Err[V3ErasureRecoveryPlan](Error(advertRes))
     let threshold = v3ErasureRecoveryThreshold(params)
@@ -852,7 +886,9 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
                 continue
             var candidateCount = 0
             for advertPos in 0..<adverts.len:
-                if v3ErasureAdvertShardPos(adverts[advertPos], shardIndex) >= 0:
+                var advert = v3ErasurePeerAdvertZero()
+                v3ErasurePeerAdvertFill(advert, adverts[advertPos])
+                if v3ErasureAdvertShardPos(advert, shardIndex) >= 0:
                     candidateCount = candidateCount + 1
             if candidateCount <= 0:
                 continue
@@ -860,8 +896,10 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
             if chosenAdvert < 0:
                 continue
             let chosenReuse = peerUseCounts[chosenAdvert]
-            let chosenAdvertShardCount = adverts[chosenAdvert].shardCount
-            let chosenAvailability = adverts[chosenAdvert].availabilityPermille
+            var chosenAdvertInfo = v3ErasurePeerAdvertZero()
+            v3ErasurePeerAdvertFill(chosenAdvertInfo, adverts[chosenAdvert])
+            let chosenAdvertShardCount = chosenAdvertInfo.shardCount
+            let chosenAvailability = chosenAdvertInfo.availabilityPermille
             if bestShard < 0 ||
                candidateCount < bestCandidateCount ||
                (candidateCount == bestCandidateCount && chosenReuse < bestReuse) ||
@@ -883,9 +921,11 @@ fn v3ErasureBuildRecoveryPlan(manifest: V3ErasureShardManifest,
         selected[bestShard] = true
         peerUseCounts[bestAdvert] = peerUseCounts[bestAdvert] + 1
         let manifestPos = v3ErasureManifestShardPos(manifest, bestShard)
-        let requestPeerId = adverts[bestAdvert].peerId
+        var bestAdvertInfo = v3ErasurePeerAdvertZero()
+        v3ErasurePeerAdvertFill(bestAdvertInfo, adverts[bestAdvert])
+        let requestPeerId = bestAdvertInfo.peerId
         let requestShardCid = manifest.shardPayloadCids[manifestPos]
-        let requestAdvertCid = adverts[bestAdvert].advertCid
+        let requestAdvertCid = bestAdvertInfo.advertCid
         requestPeerIds[requestCount] = requestPeerId
         requestShardIndices[requestCount] = bestShard
         requestShardCids[requestCount] = requestShardCid
