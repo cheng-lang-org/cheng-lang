@@ -148,7 +148,7 @@ static int cheng_backtrace_enabled(void);
 static void cheng_dump_native_backtrace_if_enabled(void);
 static void cheng_dump_backtrace_now(const char* reason);
 static void cheng_v3_profile_maybe_init(const char* exe_path);
-static void cheng_v3_profile_write_report(void);
+static void cheng_v3_profile_write_reports(void);
 static void cheng_exec_kill_target(pid_t pid, int sig);
 static pid_t cheng_exec_spawn_orphan_guard(pid_t targetPid);
 static void cheng_exec_stop_orphan_guard(pid_t guardPid);
@@ -1048,11 +1048,6 @@ typedef struct ChengV3ProfileSample {
     uintptr_t pcs[CHENG_V3_PROFILE_MAX_DEPTH];
 } ChengV3ProfileSample;
 
-typedef struct ChengV3ProfileCount {
-    char* key;
-    uint32_t count;
-} ChengV3ProfileCount;
-
 static ChengV3ProfileSample* cheng_v3_profile_samples = NULL;
 static int32_t cheng_v3_profile_capacity = 0;
 static volatile sig_atomic_t cheng_v3_profile_sample_count = 0;
@@ -1060,7 +1055,7 @@ static volatile sig_atomic_t cheng_v3_profile_dropped_samples = 0;
 static volatile sig_atomic_t cheng_v3_profile_initialized = 0;
 static volatile sig_atomic_t cheng_v3_profile_enabled_cache = -1;
 static volatile sig_atomic_t cheng_v3_profile_installed = 0;
-static char cheng_v3_profile_out_path[PATH_MAX];
+static char cheng_v3_profile_raw_out_path[PATH_MAX];
 
 static int cheng_flag_enabled(const char* raw) {
     if (raw == NULL || raw[0] == '\0') return 0;
@@ -1684,160 +1679,7 @@ static void cheng_crash_trace_dump_now(const char* reason) {
     cheng_crash_trace_dump_async(reason, 0);
 }
 
-typedef struct ChengV3LineMapEntry {
-    char* symbol;
-    char* function_name;
-    char* source_path;
-    int32_t signature_line;
-    int32_t body_first_line;
-    int32_t body_last_line;
-} ChengV3LineMapEntry;
-
-static ChengV3LineMapEntry* cheng_v3_line_map_entries = NULL;
-static int32_t cheng_v3_line_map_len = 0;
-static int32_t cheng_v3_line_map_cap = 0;
 static int32_t cheng_v3_line_map_registered = 0;
-static char cheng_v3_line_map_loaded_path[PATH_MAX];
-
-static const char* cheng_v3_symbol_normalize(const char* text) {
-    if (text == NULL) return "";
-    while (*text == '_') {
-        text++;
-    }
-    return text;
-}
-
-static int cheng_v3_line_map_symbol_eq(const char* lhs, const char* rhs) {
-    if (lhs == NULL || rhs == NULL) return 0;
-    if (strcmp(lhs, rhs) == 0) return 1;
-    return strcmp(cheng_v3_symbol_normalize(lhs), cheng_v3_symbol_normalize(rhs)) == 0;
-}
-
-static int32_t cheng_v3_parse_i32(const char* text) {
-    char* end = NULL;
-    long value;
-    if (text == NULL || text[0] == '\0') return 0;
-    value = strtol(text, &end, 10);
-    if (end == text) return 0;
-    return (int32_t)value;
-}
-
-static int cheng_v3_line_map_add_entry(const char* symbol,
-                                       const char* function_name,
-                                       const char* source_path,
-                                       int32_t signature_line,
-                                       int32_t body_first_line,
-                                       int32_t body_last_line) {
-    ChengV3LineMapEntry* grown = NULL;
-    if (symbol == NULL || symbol[0] == '\0' || source_path == NULL || source_path[0] == '\0') {
-        return 0;
-    }
-    if (cheng_v3_line_map_len >= cheng_v3_line_map_cap) {
-        int32_t next_cap = cheng_v3_line_map_cap > 0 ? cheng_v3_line_map_cap * 2 : 32;
-        grown = (ChengV3LineMapEntry*)realloc(
-            cheng_v3_line_map_entries,
-            (size_t)next_cap * sizeof(ChengV3LineMapEntry)
-        );
-        if (grown == NULL) {
-            return 0;
-        }
-        cheng_v3_line_map_entries = grown;
-        cheng_v3_line_map_cap = next_cap;
-    }
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].symbol =
-        cheng_copy_string_bytes(symbol, strlen(symbol));
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].function_name =
-        cheng_copy_string_bytes(function_name != NULL ? function_name : "",
-                                strlen(function_name != NULL ? function_name : ""));
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].source_path =
-        cheng_copy_string_bytes(source_path, strlen(source_path));
-    if (cheng_v3_line_map_entries[cheng_v3_line_map_len].symbol == NULL ||
-        cheng_v3_line_map_entries[cheng_v3_line_map_len].function_name == NULL ||
-        cheng_v3_line_map_entries[cheng_v3_line_map_len].source_path == NULL) {
-        return 0;
-    }
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].signature_line = signature_line;
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].body_first_line = body_first_line;
-    cheng_v3_line_map_entries[cheng_v3_line_map_len].body_last_line = body_last_line;
-    cheng_v3_line_map_len += 1;
-    return 1;
-}
-
-static int cheng_v3_line_map_load_path(const char* path) {
-    FILE* file = NULL;
-    char* owned = NULL;
-    char* cursor = NULL;
-    char* line = NULL;
-    long size = 0;
-    int ok = 0;
-    if (path == NULL || path[0] == '\0') return 0;
-    file = fopen(path, "rb");
-    if (file == NULL) return 0;
-    if (fseek(file, 0, SEEK_END) != 0) goto cleanup;
-    size = ftell(file);
-    if (size < 0) goto cleanup;
-    if (fseek(file, 0, SEEK_SET) != 0) goto cleanup;
-    owned = (char*)malloc((size_t)size + 1u);
-    if (owned == NULL) goto cleanup;
-    if (size > 0 && fread(owned, 1, (size_t)size, file) != (size_t)size) goto cleanup;
-    owned[size] = '\0';
-    cursor = owned;
-    line = strsep(&cursor, "\n");
-    if (line == NULL || strcmp(line, "v3_line_map_v1") != 0) {
-        goto cleanup;
-    }
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        char* fields[7];
-        size_t field_count = 0U;
-        char* field_cursor = NULL;
-        char* tab = NULL;
-        if (strncmp(line, "entry\t", 6) != 0) {
-            continue;
-        }
-        field_cursor = line + 6;
-        fields[field_count++] = field_cursor;
-        while (field_count < 7U && (tab = strchr(field_cursor, '\t')) != NULL) {
-            *tab = '\0';
-            field_cursor = tab + 1;
-            fields[field_count++] = field_cursor;
-        }
-        if (field_count != 6U) {
-            goto cleanup;
-        }
-        if (!cheng_v3_line_map_add_entry(fields[0],
-                                         fields[1],
-                                         fields[2],
-                                         cheng_v3_parse_i32(fields[3]),
-                                         cheng_v3_parse_i32(fields[4]),
-                                         cheng_v3_parse_i32(fields[5]))) {
-            goto cleanup;
-        }
-    }
-    snprintf(cheng_v3_line_map_loaded_path,
-             sizeof(cheng_v3_line_map_loaded_path),
-             "%s",
-             path);
-    ok = cheng_v3_line_map_len > 0 ? 1 : 0;
-cleanup:
-    if (file != NULL) fclose(file);
-    if (!ok) {
-        cheng_v3_line_map_len = 0;
-        cheng_v3_line_map_loaded_path[0] = '\0';
-    }
-    free(owned);
-    return ok;
-}
-
-static const ChengV3LineMapEntry* cheng_v3_line_map_find(const char* symbol) {
-    int32_t i;
-    for (i = 0; i < cheng_v3_line_map_len; ++i) {
-        if (cheng_v3_line_map_symbol_eq(cheng_v3_line_map_entries[i].symbol, symbol)) {
-            return &cheng_v3_line_map_entries[i];
-        }
-    }
-    return NULL;
-}
-
 static int32_t cheng_v3_line_span_start(int32_t signature_line,
                                         int32_t body_first_line) {
     return body_first_line > 0 ? body_first_line : signature_line;
@@ -1872,7 +1714,6 @@ static void cheng_v3_dump_machine_backtrace_if_available(const char* reason) {
         int32_t line_end = 0;
         const ChengV3EmbeddedLineMapEntry* embedded_entry =
             cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
-        const ChengV3LineMapEntry* file_entry = NULL;
         Dl_info info;
         memset(&info, 0, sizeof(info));
         if (dladdr(frames[i], &info) != 0 && info.dli_sname != NULL) {
@@ -1886,15 +1727,6 @@ static void cheng_v3_dump_machine_backtrace_if_available(const char* reason) {
             line_start = cheng_v3_line_span_start(embedded_entry->signature_line,
                                                   embedded_entry->body_first_line);
             line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
-        } else if (symbol_name != NULL && symbol_name[0] != '\0') {
-            file_entry = cheng_v3_line_map_find(symbol_name);
-            if (file_entry != NULL) {
-                function_name = file_entry->function_name;
-                source_path = file_entry->source_path;
-                line_start = cheng_v3_line_span_start(file_entry->signature_line,
-                                                      file_entry->body_first_line);
-                line_end = cheng_v3_line_span_end(line_start, file_entry->body_last_line);
-            }
         }
         if (symbol_pc != 0U && pc >= symbol_pc) {
             offset = pc - symbol_pc;

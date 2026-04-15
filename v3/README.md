@@ -64,6 +64,15 @@ make -C v3/bench/c_ref run
 
 v3/tooling/build_backend_driver_v3.sh
 
+v3/tooling/build_bft_state_machine_v3.sh
+
+v3/tooling/build_rwad_bft_state_machine_v3.sh
+
+v3/tooling/build_browser_host_wasm_v3.sh
+
+CHENG_V3_LINUX_EXE_SOURCE=/abs/path/file.cheng CHENG_V3_LINUX_EXE_OUT=/abs/path/out \
+v3/tooling/build_linux_nolibc_exe_v3.sh
+
 v3/tooling/build_chain_node_linux_v3.sh
 
 v3/tooling/build_rwad_bft_state_machine_linux_v3.sh
@@ -96,12 +105,16 @@ v3/tooling/run_slice_gate.sh
 和 `v3/bootstrap/stage1_bootstrap.cheng` 收成
 `artifacts/v3_bootstrap/cheng.stage0 -> cheng.stage1 -> cheng.stage2 -> cheng.stage3`
 以及 `bootstrap.env`；
+`v3/tooling/build_backend_driver_v3.sh` 现在会先刷新 `bootstrap.env`，再直接把 fresh `cheng.stage3` 的 live `build-backend-driver` 命令转发出去，不再多绕一层 `cheng_v3.sh`；
 `v3/tooling/cheng_v3.sh debug-report/print-symbols/print-line-map/print-elf`
 现在已经把 seed 里真实的 `world/lock/lowering/primary/object/native` 调试面、
 符号表、源码行映射和 Linux AArch64 ELF relocatable object 检视面直接公开出来，
 查 ordinary pipeline 不再先依赖 `lldb/nm/objdump`；
+`v3/tooling/cheng_v3.sh profile-run` 当前固定走“runtime 只产 `v3_profile_raw_v1`，再由 live `profile-report` 编译器命令汇总成 `v3_profile_v1`”这条路径；整条链不再编额外 helper，也不再依赖 `.v3.map` 文本解析，同时已经删掉 C 侧 `CHENG_V3_PROFILE_OUT` 最终报告分支；如果只开 profiler 而不显式给 raw 输出路径，runtime 默认会写 `<exe>.v3.profile.raw.txt`；
+`v3/tooling/cheng_v3.sh verify-debug-runtime` 现在还会直接卡死 debug runtime bridge 的 source/object 合同：provider source 必须是 `src/runtime/native/system_helpers_debug_trace_profile.c`，并且 `runtime_debug_runtime_v3.o` 的导出符号面只能保留正式 crash/profile/line-map 入口；
+同一条 gate 现在还会继续卡 Darwin 宿主未定义符号白名单，以及 Linux AArch64 `nolibc` runtime object 的 syscall 依赖白名单，防止 bridge/runtime 依赖面继续静默长回去；
 `v3/tooling/run_v3_host_smokes.sh` 会用当前 host compiler 真编真跑 `v3/src/tests` 里的 ordinary program smoke、`chain_node_smoke`、链语义 smoke、`bft_three_replica_smoke` 和 `udp_importc_smoke`；尾段还会真跑 `chain_node` 两进程与三进程同步 gate。这条 host smoke 当前已经全绿。`v3/tooling/build_zero_exit_v3.sh` 和 `v3/tooling/build_call_chain_v3.sh` 现在都能用 `artifacts/v3_backend_driver/cheng` 真编真链真跑，说明 ordinary 主链已经越过 `.o/link/argv bridge`，并且 no-arg 尾调用必须按 `b callee` 发射，不能再用 `bl ...; ret`。这轮再把 ordinary lowering 改成按 entry 可达函数裁剪后，`program_selfhost` 的可达集已经从 `598` 个函数压到 `16` 个，`chain_node` 从 `1120` 个压到 `112` 个；当前剩下的统一真阻塞还是 `primary object body semantics missing`，只是现在已经不再被大闭包噪音淹没。可用 `CHENG_V3_SMOKE_COMPILER=<path>` 切换编译器入口；
-generic Linux 这一层现在已经真打通：`v3/tooling/build_chain_node_linux_v3.sh` 和 `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` 默认会真产 `aarch64-unknown-linux-gnu` 的 `ELF relocatable object`，`v3/tooling/run_v3_linux_object_smokes.sh` 会做正式物件格式验收；同时 `v3/tooling/build_linux_nolibc_exe_v3.sh` 已经能通过 `v3 seed` 内建的 `internal_elf_linker` 真产 Linux AArch64 `nolibc exe`。`x86_64-unknown-linux-gnu` 仍然没有 verified ordinary object/exe 路径。
+generic Linux 这一层现在已经真打通：`v3/tooling/build_chain_node_linux_v3.sh` 和 `v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` 默认会真产 `aarch64-unknown-linux-gnu` 的 `ELF relocatable object`，`v3/tooling/run_v3_linux_object_smokes.sh` 会做正式物件格式验收；同时 `v3/tooling/build_linux_nolibc_exe_v3.sh` 已经能通过 `v3 seed` 内建的 `internal_elf_linker` 真产 Linux AArch64 `nolibc exe`。另外 ordinary `x86_64-unknown-linux-gnu` 现在也已经有 verified object/exe 路径：`CHAIN_NODE_TARGET=x86_64-unknown-linux-gnu CHAIN_NODE_LINUX_ARTIFACT=exe v3/tooling/build_chain_node_linux_v3.sh`、`RWAD_BFT_TARGET=x86_64-unknown-linux-gnu RWAD_BFT_LINUX_ARTIFACT=exe v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` 都能在 x64 Linux 主机上直接产出并跑 self-test。
 `v3/tooling/run_slice_gate.sh` 和 `v3/tooling/build_backend_driver_v3.sh`
 都只吃这条主线。
 
@@ -110,6 +123,7 @@ generic Linux 这一层现在已经真打通：`v3/tooling/build_chain_node_linu
 - 上面这段 Linux 口径已经过期。generic Linux `aarch64` `nolibc exe` 现在已经由 `v3 seed` 自己内建的 `internal_elf_linker` 真打通，不再依赖宿主 `ld/lld/gcc`；`CHAIN_NODE_LINUX_ARTIFACT=exe v3/tooling/build_chain_node_linux_v3.sh` 和 `RWAD_BFT_LINUX_ARTIFACT=exe v3/tooling/build_rwad_bft_state_machine_linux_v3.sh` 都会直接产出 Linux AArch64 ELF 可执行文件。
 - Windows 和 `riscv64` 这期不伪装成“`v3 seed` 已直接支持”。当前真实已落地的是仓库主 backend 的内建 `COFF/PE` 与 `riscv64 ELF` self-link 能力；我把它们收成了 `v3/tooling/verify_windows_builtin_linker_v3.sh`、`v3/tooling/verify_riscv64_builtin_linker_v3.sh` 和 `v3/tooling/run_v3_windows_riscv_builtin_smokes.sh` 三个统一入口。
 - 这三个入口会优先复用现成主 backend driver；如果仓库里还没有健康的主 backend driver，会直接 fail-fast，并要求显式提供 `BACKEND_DRIVER=/abs/path/to/cheng`，不做假成功和 silent fallback。
+- `v3/tooling/bootstrap_bridge_v3.sh` 现在只保留最小冷启动选择：有 `cheng.stage3` 就直接交给 `cheng.stage3 bootstrap-bridge`，没有则复用 `cheng.stage0 bootstrap-bridge`，再没有才回 C seed 临时 runner；真正的 freshness 判断已经回到编译器本体。
 
 硬规则：
 

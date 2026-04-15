@@ -38,6 +38,8 @@
 - `verify-orphan-guard` 这种门禁不要用“图省事”的宽规则。普通 `python3` 辅助脚本并不等于旧 guard 旁路；真正该禁的是 `guarded_exec_v3.py / orphan_guard_run.sh` 这类已退役守护入口和它们的直接残留引用。误把普通测试探针也算违规，只会让门禁先坏在无关处。
 - Cheng 侧和 seed C 侧同时维护同名门禁时，必须防两类 bug：一类是 Cheng 侧把目录当文件读，另一类是 seed 侧脚本 passthrough 把命令再绕回 `cheng_v3.sh`。`verify-orphan-guard` 这轮已经证明，少修任意一侧都会挂死。
 - 叶子脚本能不能压成纯壳，不看意愿，只看 live 命令面。当前 stage3/backend-driver 没公开的叶子入口，宁可保留真实执行体，也不能先压成假薄壳再让 gate/smoke 全面回归。
+- `debug/runtime` 这条桥不能只写“已退出主链”。像 `v3_debug_runtime_shim.c` 这种死壳，只要文件还在，后面就会被重新塞回去；最稳收法是物理删除文件，再让 gate 直接验 `provider_source_paths` 和 provider object 导出符号白名单。
+- `build_backend_driver_v3.sh` 这种冷启动薄壳，能直转发 fresh `stage3` 就不要再多绕一层 `cheng_v3.sh`。多一层壳就多一份 freshness/错误路径/日志行为定义。
 - debug/runtime bridge 再缩时，`providerNativeSources`、`system_link_exec`、对象级 smoke 和 seed 里的 runtime source resolver 必须一起指向同一份 native 源文件；只改其中一处，桥接面会立刻分叉。
 - `v3_cmd_system_link_exec` 这类 seed/backend-driver 入口绝不能把 `V3SystemLinkPlanStub / V3PrimaryObjectPlanStub / V3ObjectPlanStub / V3NativeLinkPlanStub` 这种大 plan 对象直接放栈上。Linux x86_64 默认 8MB 栈会在函数序言就撞死，表面看像 `system-link-exec` 随机段错误；这类大对象必须改成堆分配，再去看真正的 target/codegen 阻塞。
 - `stage1_bootstrap.cheng`、`gate_main.cheng`、`compiler_runtime.cheng` 里的命令名补齐，不等于 live 的 `cheng.stage3` 已经有对应入口。真正的命令面以 `v3/bootstrap/cheng_v3_seed.c` 的 dispatch 为准；没改 seed、没重建 bootstrap 前，任何叶子壳都不能先压成纯转发。
@@ -45,3 +47,32 @@
 - 长参数宿主命令不要再手写 argc 常量。`tailnet_control` 这轮已经证明，多一两个 flag 以后最容易把末尾关键参数静默截断；统一用 `sizeof(array)/sizeof(array[0])` 才是稳定写法。
 - `v3/bootstrap/cheng_v3_seed.c` 自己也必须始终按严格宿主编译规则过。Darwin 下只用 `cc -std=c11 -pedantic` 编 seed 时，`strsep` 和 `st_mtimespec` 需要显式 `_GNU_SOURCE/_DARWIN_C_SOURCE`；这层不补齐，bootstrap 会先死在外根编译而不是死在 Cheng 逻辑。
 - seed 里的 shell bridge helper 不能把命令构造和日志格式化混在一起。像 `v3_run_shell_command_logged(...)` 这种共享路径，只要 `snprintf(...)` 多塞一个实参，整条实际执行命令都会被污染，问题还会伪装成“下游脚本坏了”。 |
+- `x509DecodeEcdsaSignature(...)` 这类固定宽度签名解码，不要再绕 `leftPad Bytes` 之类的中间拼装。当前编译路径下，ASN.1 整数值最稳的写法就是直接抄进最终固定 64 字节 `r||s` 输出，不然最容易在证书 `CertificateVerify` 上变成“材料看着都对，但签名就是 invalid”。
+- ordinary `v3` smoke 里临时排障不能写动态 `echo(ErrorText(...))`。seed 只支持字面量 `echo`；要打印动态错误，就直接 `panic(ErrorText(...))` 或改成断言，不要再把编译链先打坏。
+2026-04-15
+- Darwin 目标的符号补名必须幂等。Mach-O 下既会遇到裸 `foo` 也会遇到已带 `_foo` 的符号；只要平台层无脑再补一次 `_`，汇编里就会出现 `__foo`，最后在 native link 阶段伪装成 provider 闭包缺失。
+- 长跑 gate 里不要只会补默认 backend driver。`stage2/stage3` 这类 bootstrap 编译器路径在共享产物目录被刷新时也会暂时失效；compile helper 和 Cheng 侧 gate 都必须把“缺 bootstrap 编译器就先补 bootstrap bridge”写成正式逻辑，不然 `stage23` 会随机炸在中段。
+- `cheng.stage3` 的 live 命令面最终还是以 `v3/bootstrap/cheng_v3_seed.c` 的 dispatch 为准。只改 `stage1_bootstrap / compiler_runtime / gate_main / cheng_v3.sh` 不够；新命令要想真 live，seed usage、自检 token、dispatch、实现必须一次性一起改。
+- 只要 build 命令允许用户传 `out` 或 `report` 路径，就必须在 compile 前先 `v3_ensure_parent_dir(...)`。不然第一眼看上去像 codegen/linker 坏了，真根只是日志或产物父目录没建。
+- 当 `host_ops` 已经接管并行和进程监管后，旧 shell helper 不能只“停用不删”。像 `failfast_parallel.sh` 这种死入口应该直接删除，并写进 `verify-orphan-guard` 禁止复活。
+- debug runtime bridge 继续缩时，最稳形状不是把 live provider 再拆成多份 `providerNativeSources`，而是继续保留一份正式 provider 源文件，对内再拆 `trace/profile` include 单元。这样 `provider source path` 合同、seed resolver、system_link_exec 和对象级 gate 才不会分叉。
+- `verify-debug-runtime` 不能只看 `provider_source_paths` 和导出符号。像 `runtime_debug_runtime_v3.o` 这类 bridge object，还必须再卡一层未定义符号白名单，不然额外宿主依赖会从 undefined surface 静默长回来。
+- `bootstrap_bridge_v3.sh` 这类带锁 wrapper 再压薄时，允许直接调用 fresh `cheng.stage3 bootstrap-bridge`，但绝不能在持锁 shell 里 `exec`。必须让 shell 保持到 EXIT，靠 `trap cleanup` 真把锁清掉。
+- bootstrap 冷启动分层要收得更准：只有 `v3/bootstrap/cheng_v3_seed.c` 比 `cheng.stage3` 新时，才需要重编临时 seed runner；如果只是 `stage1_bootstrap/compiler_main/compiler_runtime/compiler_request/gate_main` 变了，直接让 fresh `cheng.stage3 bootstrap-bridge` 处理才是最短路径。
+- debug/runtime 宿主桥继续往下拆时，第一刀先拆 `host-only base`，不是先拆更多 provider 文件。把 env/path/stderr/getter resolve 这批纯宿主底座先单独收走，`trace/profile` 两块才不会继续互相夹带共享细节。
+- Linux 对象门禁不能照搬 Darwin host debug bridge 的名字。当前 `aarch64-unknown-linux-gnu` 真在跑的是 `system_helpers_backend_nolibc_linux_aarch64.o`；要卡 Linux 依赖面，就必须直接检查这份 runtime object 的未定义 syscall 集合。
+- `bootstrap_bridge_v3.sh` 继续收薄时别忘了现成的 `cheng.stage0`。只要 `stage0` 还是同代 seed 产物，就应该优先直接复用 `cheng.stage0 bootstrap-bridge`，不要每次都回临时 seed runner。
+- 试过但没接进 live dispatch 的 helper 不能继续留在树上冒充能力。像这轮的 `profile_report.cheng/profile_report_main.cheng`，既然 `profile-run` 最终没走它们，就必须连同 contract、build plan、README 一起撤回真实口径。
+- profiler 最稳的职责边界是：runtime 只产 `v3_profile_raw_v1` 原始样本，最终 `v3_profile_v1` 由编译器侧汇总；不要把热点聚合和报告文本格式重新塞回 live debug bridge。
+- `x86_64-unknown-linux-gnu` 的字符串特判不能偷懒走通用临时寄存器。像 `str == str`、`str + str` 这种直接 call native bridge 的热路径，caller 必须按 SysV 真把参数地址放进 `rdi/rsi/rdx`，`sret` 也要占掉第一个整型参数位；只把地址塞进 `rax/rbx` 再 call，会在 provider 里伪装成“str bridge 自己崩了”。
+- `v3_join_path(out, ..., out, suffix)` 这种原地拼接必须原生 alias-safe。只要 helper 直接 `snprintf(out, "%s/%s", out, suffix)`，产物路径就会被截成 `/<suffix>`，最后把 `.o/.exe` 直接写到文件系统根目录。
+- 远端换 seed 不能只同步 `v3/bootstrap/cheng_v3_seed.c`。`v3/bootstrap/stage1_bootstrap.cheng` 不一起同步时，`cheng.stage0` 自检会直接报 `supported_commands drift`，看起来像 bootstrap 坏了，真根只是 seed/stage1 版本不一致。
+- 远端验 backend driver 不能只看脚本打印 `ok`。这条链有 freshness 命中旧产物的可能；要确认真换代，最稳做法是删掉 `artifacts/v3_backend_driver` 再重建，并看产物时间戳或直接跑 x64 smoke。
+- 多机 `chain_node` 部署时，先分清“进程在 `LISTEN`”和“对端真的能拨进来”不是一回事。像这次 64 上的 `ufw default deny incoming`，会让 dmit 的 `sync-once` 直接卡死在 TCP 收包；不先查端口放行规则，很容易把网络面误判成 Cheng/runtime 问题。
+- `verify-debug-profile` 不能再一边说“runtime 只产 raw”，一边在 Cheng gate 里直接吃 `CHENG_V3_PROFILE_OUT`。只要 gate 还绕回 C 侧最终报告，profile 主线就没有真收口；最稳形状是 runtime 只写 raw，编译器和 gate 都统一走 live `profile-report`。
+- `bootstrap_bridge_v3.sh` 这种冷启动壳不要再自己维护第二套 freshness 规则。壳只该负责选择现成 `stage3`、退到 `stage0`、最后才回临时 seed runner；真正的“哪些源码变了要不要重建”必须只留在 `stage0/stage3 bootstrap-bridge` 本体里。
+- profile 这条线要真收口，不能只改 gate，还要把 live debug bridge 里的 `CHENG_V3_PROFILE_OUT` 和最终 `v3_profile_v1` 聚合一起删掉。runtime 只保留 raw，最终报告永远交给 live `profile-report`。
+- `cheng_v3.sh` 这类薄壳不要再维护一长串逐条转发的 `case`。最稳形状是“特殊入口 + contract 命令组 + plain stage3 命令组”，这样命令面缩短后反而更不容易和 live stage3 dispatch 再漂。
+- debug bridge 依赖面收缩后，`verify-debug-runtime` 的未定义符号白名单也要同步缩。像这轮删掉 final profile 聚合后，Darwin 白名单里的 `_qsort/_realloc/_strcmp` 如果不一起删，gate 会把正确收口误判成失败。
+- `profile-report` 这类 tooling 一旦已经坐实在当前 seed/stage3 的 live 命令面里，就不能再额外留一条“编 helper -> 跑 helper”或“只在 compiler_main 留假 dispatch”的旁路。真正稳的形状是只保留一条当前命令面里的 live 实现，再把 freshness、锁和 README 全压回这条主链。
+- `compiler_main.cheng` 里多一条命令 dispatch，不代表当前 `cheng.stage3/backend-driver` 真的已经有这个 live 命令。判断命令面是否已上线，必须先看 `v3/bootstrap/cheng_v3_seed.c` 的真实 dispatch，再看 fresh 产物能不能直接调用成功；做不到这两点时，`compiler_main` 里的同名入口就是假路径，必须删掉。

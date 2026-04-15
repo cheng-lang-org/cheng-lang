@@ -18,7 +18,10 @@ subcommands:
   semantic-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>]
   codegen-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>]
   exec-surface --repo <path> [--out-dir <dir>] [--codegen-manifest <file>]
-  compile --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]
+  exec-route-matrix --tsx-ast <file> --exec-snapshot <file> --truth-routes-file <file> [--codegen-manifest <file>] [--truth-trace <file>] [--out <file>]
+  compare-truth --exec-snapshot <file> --truth-trace <file> [--truth-state <state>] [--out <file>]
+  compare-truth-matrix --exec-route-matrix <file> --truth-trace <file> [--out <file>]
+  compile --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...] [--truth-trace <file>] [--truth-state <state>] [--truth-routes-file <file>] [--truth-routes-discover]
   discover-truth-routes --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]
   capture-truth --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] [--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>]
   prototype <args...>
@@ -87,6 +90,20 @@ collect_flag_values() {
     esac
     shift
   done
+}
+
+has_flag() {
+  key="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      "$key")
+        return 0
+        ;;
+    esac
+    shift
+  done
+  return 1
 }
 
 abs_path() {
@@ -204,9 +221,12 @@ const out = {
     'semantic-surface',
     'codegen-surface',
     'exec-surface',
+    'exec-route-matrix',
     'compile',
     'discover-truth-routes',
     'capture-truth',
+    'compare-truth',
+    'compare-truth-matrix',
     'prototype',
   ],
 };
@@ -242,6 +262,9 @@ const out = {
   exec_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-exec-surface.mjs'),
   truth_route_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-discover-truth-routes.mjs'),
   truth_runtime_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-runtime.mjs'),
+  exec_route_matrix_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-exec-route-matrix.mjs'),
+  truth_compare_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-compare.mjs'),
+  truth_compare_matrix_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-compare-matrix.mjs'),
 };
 fs.mkdirSync(path.dirname(process.env.REPORT_PATH), { recursive: true });
 fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(out, null, 2) + '\n', 'utf8');
@@ -264,6 +287,9 @@ console.log(JSON.stringify({
   exec_surface_helper: '$exp_root/r2c-react-v3-exec-surface.mjs',
   truth_route_helper: '$exp_root/r2c-react-v3-discover-truth-routes.mjs',
   truth_runtime_helper: '$exp_root/r2c-react-v3-truth-runtime.mjs',
+  exec_route_matrix_helper: '$exp_root/r2c-react-v3-exec-route-matrix.mjs',
+  truth_compare_helper: '$exp_root/r2c-react-v3-truth-compare.mjs',
+  truth_compare_matrix_helper: '$exp_root/r2c-react-v3-truth-compare-matrix.mjs',
 }, null, 2))
 EOF
 }
@@ -293,6 +319,29 @@ frontend_like_cmd() {
   exec_helper_script="$exp_root/r2c-react-v3-exec-surface.mjs"
   exec_summary_path="$out_dir/exec_surface.summary.env"
   exec_log_path="$out_dir/exec_surface.log"
+  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
+  truth_state="$(read_flag --truth-state "" "$@")"
+  truth_routes_file_raw="$(read_flag --truth-routes-file "" "$@")"
+  truth_routes_discover=false
+  if has_flag --truth-routes-discover "$@"; then
+    truth_routes_discover=true
+  fi
+  truth_route_helper_script="$exp_root/r2c-react-v3-discover-truth-routes.mjs"
+  truth_routes_summary_path="$out_dir/truth_routes_v1.summary.env"
+  truth_routes_log_path="$out_dir/truth_routes.log"
+  truth_routes_path="$out_dir/truth_routes_v1.json"
+  exec_route_matrix_helper_script="$exp_root/r2c-react-v3-exec-route-matrix.mjs"
+  exec_route_matrix_summary_path="$out_dir/exec_route_matrix.summary.env"
+  exec_route_matrix_log_path="$out_dir/exec_route_matrix.log"
+  exec_route_matrix_path="$out_dir/cheng_codegen_exec_route_matrix_v1.json"
+  truth_compare_helper_script="$exp_root/r2c-react-v3-truth-compare.mjs"
+  truth_compare_summary_path="$out_dir/truth_compare.summary.env"
+  truth_compare_log_path="$out_dir/truth_compare.log"
+  truth_compare_path="$out_dir/truth_compare_v1.json"
+  truth_compare_matrix_helper_script="$exp_root/r2c-react-v3-truth-compare-matrix.mjs"
+  truth_compare_matrix_summary_path="$out_dir/truth_compare_matrix.summary.env"
+  truth_compare_matrix_log_path="$out_dir/truth_compare_matrix.log"
+  truth_compare_matrix_path="$out_dir/truth_compare_matrix_v1.json"
   module_inventory_path="$out_dir/module_inventory_v1.json"
   rsg_path="$out_dir/rsg_v1.json"
   codegen_manifest_path="$out_dir/cheng_codegen_v1.json"
@@ -376,9 +425,86 @@ frontend_like_cmd() {
     fi
     exec_semantic_nodes_count="$(read_summary_value "$exec_summary_path" snapshot_semantic_nodes_count 0)"
     exec_snapshot_path="$(read_summary_value "$exec_summary_path" snapshot_path "$exec_snapshot_path")"
-    write_report "$report_path" "$command_name" false exec_surface_only_truth_compare_not_lifted "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-    echo "r2c-react-v3: compile 已经 lift 到 frontend + static surface + semantic surface + codegen surface + exec surface；truth compare 还没 lift，旧原型请显式走 prototype compile" >&2
-    return 2
+    if [ -z "$truth_trace_raw" ]; then
+      write_report "$report_path" "$command_name" false truth_compare_input_missing "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      echo "r2c-react-v3: compile 现在已经 lift 到 exec surface；要完成真值验收请显式传 --truth-trace 和可选 --truth-state" >&2
+      return 2
+    fi
+    truth_trace_path="$(abs_path "$repo" "$truth_trace_raw")"
+    if [ ! -f "$truth_trace_path" ]; then
+      write_report "$report_path" "$command_name" false missing_truth_trace "$repo" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      echo "r2c-react-v3: missing truth trace: $truth_trace_path" >&2
+      return 1
+    fi
+    set -- "$truth_compare_helper_script" --exec-snapshot "$exec_snapshot_path" --truth-trace "$truth_trace_path" --out "$truth_compare_path" --summary-out "$truth_compare_summary_path"
+    if [ -n "$truth_state" ]; then
+      set -- "$@" --truth-state "$truth_state"
+    fi
+    if ! node "$@" >"$truth_compare_log_path" 2>&1; then
+      truth_compare_reason="$(read_summary_value "$truth_compare_summary_path" truth_compare_reason helper_failed)"
+      truth_compare_path="$(read_summary_value "$truth_compare_summary_path" truth_compare_path "$truth_compare_path")"
+      write_report "$report_path" "$command_name" false "$truth_compare_reason" "$repo" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      echo "r2c-react-v3: truth compare failed" >&2
+      tail -n 120 "$truth_compare_log_path" >&2 || true
+      return 2
+    fi
+    truth_compare_path="$(read_summary_value "$truth_compare_summary_path" truth_compare_path "$truth_compare_path")"
+    route_count=1
+    if [ "$truth_routes_discover" = "true" ]; then
+      set -- "$truth_route_helper_script" --repo "$repo" --out "$truth_routes_path" --summary-out "$truth_routes_summary_path"
+      if [ -n "$runtime_values" ]; then
+        OLD_IFS="${IFS}"
+        IFS='
+'
+        for runtime_root in $runtime_values; do
+          set -- "$@" --runtime-root "$runtime_root"
+        done
+        IFS="${OLD_IFS}"
+      fi
+      if ! node "$@" >"$truth_routes_log_path" 2>&1; then
+        write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$truth_route_helper_script" "$truth_routes_summary_path" "$truth_routes_log_path" "$truth_routes_path" truth_routes_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+        echo "r2c-react-v3: truth route helper failed" >&2
+        tail -n 120 "$truth_routes_log_path" >&2 || true
+        return 1
+      fi
+      truth_routes_path="$(read_summary_value "$truth_routes_summary_path" out_path "$truth_routes_path")"
+    elif [ -n "$truth_routes_file_raw" ]; then
+      truth_routes_path="$(abs_path "$repo" "$truth_routes_file_raw")"
+      if [ ! -f "$truth_routes_path" ]; then
+        write_report "$report_path" "$command_name" false missing_truth_routes "$repo" "$out_dir" "$exec_route_matrix_helper_script" "$exec_route_matrix_summary_path" "$exec_route_matrix_log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+        echo "r2c-react-v3: missing truth routes: $truth_routes_path" >&2
+        return 1
+      fi
+    fi
+    if [ "$truth_routes_discover" = "true" ] || [ -n "$truth_routes_file_raw" ]; then
+      set -- "$exec_route_matrix_helper_script" --tsx-ast "$artifact_path" --exec-snapshot "$exec_snapshot_path" --truth-routes-file "$truth_routes_path" --codegen-manifest "$codegen_manifest_path" --truth-trace "$truth_trace_path" --out "$exec_route_matrix_path" --summary-out "$exec_route_matrix_summary_path"
+      if ! node "$@" >"$exec_route_matrix_log_path" 2>&1; then
+        write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$exec_route_matrix_helper_script" "$exec_route_matrix_summary_path" "$exec_route_matrix_log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+        echo "r2c-react-v3: exec route matrix helper failed" >&2
+        tail -n 120 "$exec_route_matrix_log_path" >&2 || true
+        return 1
+      fi
+      route_count="$(read_summary_value "$exec_route_matrix_summary_path" route_count 0)"
+      exec_route_matrix_path="$(read_summary_value "$exec_route_matrix_summary_path" route_matrix_path "$exec_route_matrix_path")"
+      set -- "$truth_compare_matrix_helper_script" --exec-route-matrix "$exec_route_matrix_path" --truth-trace "$truth_trace_path" --out "$truth_compare_matrix_path" --summary-out "$truth_compare_matrix_summary_path"
+      if ! node "$@" >"$truth_compare_matrix_log_path" 2>&1; then
+        truth_compare_matrix_reason="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_reason helper_failed)"
+        route_count="$(read_summary_value "$truth_compare_matrix_summary_path" route_count "$route_count")"
+        truth_compare_matrix_path="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_path "$truth_compare_matrix_path")"
+        write_report "$report_path" "$command_name" false "$truth_compare_matrix_reason" "$repo" "$out_dir" "$truth_compare_matrix_helper_script" "$truth_compare_matrix_summary_path" "$truth_compare_matrix_log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+        echo "r2c-react-v3: truth compare matrix failed" >&2
+        tail -n 120 "$truth_compare_matrix_log_path" >&2 || true
+        return 2
+      fi
+      route_count="$(read_summary_value "$truth_compare_matrix_summary_path" route_count "$route_count")"
+      truth_compare_matrix_path="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_path "$truth_compare_matrix_path")"
+      write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$truth_compare_matrix_helper_script" "$truth_compare_matrix_summary_path" "$truth_compare_matrix_log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+      printf '%s\n' "$report_path"
+      return 0
+    fi
+    write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
+    printf '%s\n' "$report_path"
+    return 0
   fi
   write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" tsx_ast_v1 "$module_count" 0 0 "$typescript_version"
   printf '%s\n' "$report_path"
@@ -536,6 +662,15 @@ codegen_surface_cmd() {
     fi
   fi
   set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
+  if [ -n "$runtime_values" ]; then
+    OLD_IFS="${IFS}"
+    IFS='
+'
+    for runtime_root in $runtime_values; do
+      set -- "$@" --runtime-root "$runtime_root"
+    done
+    IFS="${OLD_IFS}"
+  fi
   if ! node "$@" >"$log_path" 2>&1; then
     write_report "$report_path" codegen-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 0 0 0 ""
     echo "r2c-react-v3: codegen surface helper failed" >&2
@@ -543,9 +678,10 @@ codegen_surface_cmd() {
     return 1
   fi
   module_count="$(read_summary_value "$summary_path" module_count 0)"
+  route_count="$(read_summary_value "$summary_path" route_count 0)"
   typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
   codegen_manifest_path="$(read_summary_value "$summary_path" codegen_manifest_path "$codegen_manifest_path")"
-  write_report "$report_path" codegen-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" 0 0 "$typescript_version"
+  write_report "$report_path" codegen-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" "$route_count" 0 "$typescript_version"
   printf '%s\n' "$report_path"
 }
 
@@ -579,11 +715,125 @@ exec_surface_cmd() {
       return 1
     fi
   module_count="$(read_summary_value "$codegen_summary_path" module_count "$(read_summary_value "$frontend_summary_path" module_count 0)")"
+  route_count="$(read_summary_value "$codegen_summary_path" route_count 0)"
   typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$(read_summary_value "$frontend_summary_path" typescript_version '')")"
   semantic_nodes_count="$(read_summary_value "$exec_summary_path" snapshot_semantic_nodes_count 0)"
   exec_snapshot_path="$(read_summary_value "$exec_summary_path" snapshot_path "$exec_snapshot_path")"
-  write_report "$exec_report_path" exec-surface true ok "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" 1 "$semantic_nodes_count" "$typescript_version"
+  write_report "$exec_report_path" exec-surface true ok "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" "$route_count" "$semantic_nodes_count" "$typescript_version"
   printf '%s\n' "$exec_report_path"
+}
+
+compare_truth_cmd() {
+  exec_snapshot_raw="$(read_flag --exec-snapshot "" "$@")"
+  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
+  truth_state="$(read_flag --truth-state "" "$@")"
+  if [ -z "$exec_snapshot_raw" ] || [ -z "$truth_trace_raw" ]; then
+    echo "r2c-react-v3: compare-truth missing --exec-snapshot or --truth-trace" >&2
+    return 1
+  fi
+  exec_snapshot_path="$(abs_path "$PWD" "$exec_snapshot_raw")"
+  truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
+  out_raw="$(read_flag --out "$(dirname "$exec_snapshot_path")/truth_compare_v1.json" "$@")"
+  truth_compare_path="$(abs_path "$PWD" "$out_raw")"
+  out_dir="$(dirname "$truth_compare_path")"
+  truth_compare_helper_script="$exp_root/r2c-react-v3-truth-compare.mjs"
+  truth_compare_summary_path="$out_dir/truth_compare.summary.env"
+  truth_compare_log_path="$out_dir/truth_compare.log"
+  compare_report_path="$out_dir/compare_truth_report_v1.json"
+  mkdir -p "$out_dir"
+  set -- "$truth_compare_helper_script" --exec-snapshot "$exec_snapshot_path" --truth-trace "$truth_trace_path" --out "$truth_compare_path" --summary-out "$truth_compare_summary_path"
+  if [ -n "$truth_state" ]; then
+    set -- "$@" --truth-state "$truth_state"
+  fi
+  if ! node "$@" >"$truth_compare_log_path" 2>&1; then
+    truth_compare_reason="$(read_summary_value "$truth_compare_summary_path" truth_compare_reason helper_failed)"
+    write_report "$compare_report_path" compare-truth false "$truth_compare_reason" "$PWD" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 0 1 0 ""
+    echo "r2c-react-v3: compare-truth failed" >&2
+    tail -n 120 "$truth_compare_log_path" >&2 || true
+    return 2
+  fi
+  semantic_nodes_count="$(read_summary_value "$truth_compare_summary_path" exec_semantic_nodes_count 0)"
+  write_report "$compare_report_path" compare-truth true ok "$PWD" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 0 1 "$semantic_nodes_count" ""
+  printf '%s\n' "$compare_report_path"
+}
+
+exec_route_matrix_cmd() {
+  tsx_ast_raw="$(read_flag --tsx-ast "" "$@")"
+  exec_snapshot_raw="$(read_flag --exec-snapshot "" "$@")"
+  truth_routes_raw="$(read_flag --truth-routes-file "" "$@")"
+  codegen_manifest_raw="$(read_flag --codegen-manifest "" "$@")"
+  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
+  if [ -z "$tsx_ast_raw" ] || [ -z "$exec_snapshot_raw" ] || [ -z "$truth_routes_raw" ]; then
+    echo "r2c-react-v3: exec-route-matrix missing --tsx-ast, --exec-snapshot, or --truth-routes-file" >&2
+    return 1
+  fi
+  tsx_ast_path="$(abs_path "$PWD" "$tsx_ast_raw")"
+  exec_snapshot_path="$(abs_path "$PWD" "$exec_snapshot_raw")"
+  truth_routes_path="$(abs_path "$PWD" "$truth_routes_raw")"
+  codegen_manifest_path=""
+  if [ -n "$codegen_manifest_raw" ]; then
+    codegen_manifest_path="$(abs_path "$PWD" "$codegen_manifest_raw")"
+  fi
+  truth_trace_path=""
+  if [ -n "$truth_trace_raw" ]; then
+    truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
+  fi
+  out_raw="$(read_flag --out "$(dirname "$exec_snapshot_path")/cheng_codegen_exec_route_matrix_v1.json" "$@")"
+  exec_route_matrix_path="$(abs_path "$PWD" "$out_raw")"
+  out_dir="$(dirname "$exec_route_matrix_path")"
+  helper_script="$exp_root/r2c-react-v3-exec-route-matrix.mjs"
+  summary_path="$out_dir/exec_route_matrix.summary.env"
+  log_path="$out_dir/exec_route_matrix.log"
+  report_path="$out_dir/exec_route_matrix_report_v1.json"
+  mkdir -p "$out_dir"
+  set -- "$helper_script" --tsx-ast "$tsx_ast_path" --exec-snapshot "$exec_snapshot_path" --truth-routes-file "$truth_routes_path" --out "$exec_route_matrix_path" --summary-out "$summary_path"
+  if [ -n "$codegen_manifest_path" ]; then
+    set -- "$@" --codegen-manifest "$codegen_manifest_path"
+  fi
+  if [ -n "$truth_trace_path" ]; then
+    set -- "$@" --truth-trace "$truth_trace_path"
+  fi
+  if ! node "$@" >"$log_path" 2>&1; then
+    route_count="$(read_summary_value "$summary_path" route_count 0)"
+    write_report "$report_path" exec-route-matrix false helper_failed "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 0 "$route_count" 0 ""
+    echo "r2c-react-v3: exec-route-matrix failed" >&2
+    tail -n 120 "$log_path" >&2 || true
+    return 1
+  fi
+  route_count="$(read_summary_value "$summary_path" route_count 0)"
+  write_report "$report_path" exec-route-matrix true ok "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 0 "$route_count" 0 ""
+  printf '%s\n' "$report_path"
+}
+
+compare_truth_matrix_cmd() {
+  exec_route_matrix_raw="$(read_flag --exec-route-matrix "" "$@")"
+  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
+  if [ -z "$exec_route_matrix_raw" ] || [ -z "$truth_trace_raw" ]; then
+    echo "r2c-react-v3: compare-truth-matrix missing --exec-route-matrix or --truth-trace" >&2
+    return 1
+  fi
+  exec_route_matrix_path="$(abs_path "$PWD" "$exec_route_matrix_raw")"
+  truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
+  out_raw="$(read_flag --out "$(dirname "$exec_route_matrix_path")/truth_compare_matrix_v1.json" "$@")"
+  truth_compare_matrix_path="$(abs_path "$PWD" "$out_raw")"
+  out_dir="$(dirname "$truth_compare_matrix_path")"
+  helper_script="$exp_root/r2c-react-v3-truth-compare-matrix.mjs"
+  summary_path="$out_dir/truth_compare_matrix.summary.env"
+  log_path="$out_dir/truth_compare_matrix.log"
+  report_path="$out_dir/compare_truth_matrix_report_v1.json"
+  mkdir -p "$out_dir"
+  set -- "$helper_script" --exec-route-matrix "$exec_route_matrix_path" --truth-trace "$truth_trace_path" --out "$truth_compare_matrix_path" --summary-out "$summary_path"
+  if ! node "$@" >"$log_path" 2>&1; then
+    truth_compare_matrix_reason="$(read_summary_value "$summary_path" truth_compare_matrix_reason helper_failed)"
+    route_count="$(read_summary_value "$summary_path" route_count 0)"
+    write_report "$report_path" compare-truth-matrix false "$truth_compare_matrix_reason" "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 0 "$route_count" 0 ""
+    echo "r2c-react-v3: compare-truth-matrix failed" >&2
+    tail -n 120 "$log_path" >&2 || true
+    return 2
+  fi
+  route_count="$(read_summary_value "$summary_path" route_count 0)"
+  write_report "$report_path" compare-truth-matrix true ok "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 0 "$route_count" 0 ""
+  printf '%s\n' "$report_path"
 }
 
 discover_truth_routes_cmd() {
@@ -692,6 +942,15 @@ case "$cmd" in
     ;;
   exec-surface)
     exec_surface_cmd "$@"
+    ;;
+  exec-route-matrix)
+    exec_route_matrix_cmd "$@"
+    ;;
+  compare-truth)
+    compare_truth_cmd "$@"
+    ;;
+  compare-truth-matrix)
+    compare_truth_matrix_cmd "$@"
     ;;
   compile)
     frontend_like_cmd compile true "$@"

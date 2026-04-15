@@ -188,6 +188,7 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed print-elf --object:<path> [--report-out:<path>]");
     puts("  cheng_v3_seed print-asm [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed profile-run [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--out:<path>] [--profile-hz:<int>] [--report-out:<path>]");
+    puts("  cheng_v3_seed profile-report --in:<raw-report> [--out:<final-report>]");
     puts("  cheng_v3_seed verify-orphan-guard");
     puts("  cheng_v3_seed verify-debug-tools");
     puts("  cheng_v3_seed verify-debug-runtime");
@@ -204,8 +205,12 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed build-call-chain");
     puts("  cheng_v3_seed build-ffi-handle");
     puts("  cheng_v3_seed build-program-selfhost");
+    puts("  cheng_v3_seed build-bft-state-machine");
+    puts("  cheng_v3_seed build-browser-host-wasm [out.wasm]");
     puts("  cheng_v3_seed build-chain-node");
+    puts("  cheng_v3_seed build-rwad-bft-state-machine");
     puts("  cheng_v3_seed build-chain-node-linux");
+    puts("  cheng_v3_seed build-linux-nolibc-exe");
     puts("  cheng_v3_seed build-rwad-bft-linux");
     puts("  cheng_v3_seed run-linux-object-smokes");
     puts("  cheng_v3_seed run-tcp-twoproc-smoke [--compiler:<path>] [--label:<name>]");
@@ -904,6 +909,7 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "print-elf") ||
         !v3_has_csv_token(commands, "print-asm") ||
         !v3_has_csv_token(commands, "profile-run") ||
+        !v3_has_csv_token(commands, "profile-report") ||
         !v3_has_csv_token(commands, "verify-orphan-guard") ||
         !v3_has_csv_token(commands, "verify-debug-tools") ||
         !v3_has_csv_token(commands, "verify-debug-runtime") ||
@@ -920,8 +926,12 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "build-call-chain") ||
         !v3_has_csv_token(commands, "build-ffi-handle") ||
         !v3_has_csv_token(commands, "build-program-selfhost") ||
+        !v3_has_csv_token(commands, "build-bft-state-machine") ||
+        !v3_has_csv_token(commands, "build-browser-host-wasm") ||
         !v3_has_csv_token(commands, "build-chain-node") ||
+        !v3_has_csv_token(commands, "build-rwad-bft-state-machine") ||
         !v3_has_csv_token(commands, "build-chain-node-linux") ||
+        !v3_has_csv_token(commands, "build-linux-nolibc-exe") ||
         !v3_has_csv_token(commands, "build-rwad-bft-linux") ||
         !v3_has_csv_token(commands, "run-linux-object-smokes") ||
         !v3_has_csv_token(commands, "run-tcp-twoproc-smoke") ||
@@ -1537,7 +1547,7 @@ static bool v3_bootstrap_artifacts_fresh(const V3BootstrapPaths *paths) {
 }
 
 static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
-    const char *inputs[23];
+    const char *inputs[26];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
     }
@@ -1547,32 +1557,31 @@ static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
     inputs[0] = paths->env_path;
     inputs[1] = paths->stage2;
     inputs[2] = paths->stage3;
-    inputs[3] = paths->stage1_source;
-    inputs[4] = paths->compiler_entry_source;
-    inputs[5] = paths->compiler_runtime_source;
-    inputs[6] = paths->compiler_request_source;
-    inputs[7] = paths->compiler_world_source;
-    inputs[8] = paths->compiler_csg_source;
-    inputs[9] = paths->compiler_world_libp2p_source;
-    inputs[10] = paths->compiler_equivalence_source;
-    inputs[11] = paths->lang_parser_source;
-    inputs[12] = paths->backend_system_link_plan_source;
-    inputs[13] = paths->backend_lowering_plan_source;
-    inputs[14] = paths->backend_primary_object_plan_source;
-    inputs[15] = paths->backend_object_plan_source;
-    inputs[16] = paths->backend_native_link_plan_source;
-    inputs[17] = paths->backend_system_link_exec_source;
-    inputs[18] = paths->runtime_core_runtime_source;
-    inputs[19] = paths->runtime_compiler_runtime_source;
-    inputs[20] = paths->runtime_debug_runtime_source;
-    inputs[21] = paths->tooling_gate_source;
-    inputs[22] = paths->tooling_bootstrap_contract_source;
-    return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 23U) &&
+    inputs[3] = paths->seed_source;
+    inputs[4] = paths->stage1_source;
+    inputs[5] = paths->compiler_entry_source;
+    inputs[6] = paths->compiler_runtime_source;
+    inputs[7] = paths->compiler_request_source;
+    inputs[8] = paths->compiler_world_source;
+    inputs[9] = paths->compiler_csg_source;
+    inputs[10] = paths->compiler_world_libp2p_source;
+    inputs[11] = paths->compiler_equivalence_source;
+    inputs[12] = paths->lang_parser_source;
+    inputs[13] = paths->backend_system_link_plan_source;
+    inputs[14] = paths->backend_lowering_plan_source;
+    inputs[15] = paths->backend_primary_object_plan_source;
+    inputs[16] = paths->backend_object_plan_source;
+    inputs[17] = paths->backend_native_link_plan_source;
+    inputs[18] = paths->backend_system_link_exec_source;
+    inputs[19] = paths->runtime_core_runtime_source;
+    inputs[20] = paths->runtime_compiler_runtime_source;
+    inputs[21] = paths->runtime_debug_runtime_source;
+    inputs[22] = paths->tooling_gate_source;
+    inputs[23] = paths->tooling_bootstrap_contract_source;
+    inputs[24] = paths->backend_build_plan_source;
+    return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 25U) &&
            v3_output_is_fresh_against_inputs(paths->backend_driver_out,
-                                             (const char *const *)&paths->backend_build_plan_source,
-                                             1U) &&
-           v3_output_is_fresh_against_inputs(paths->backend_driver_out,
-                                             (const char *const *)&paths->tooling_build_driver_script,
+                                             (const char *const[]){ paths->tooling_build_driver_script },
                                              1U);
 }
 
@@ -2245,6 +2254,18 @@ static bool v3_target_is_linux_x86_64(const char *target_triple);
 static bool v3_target_is_linux_generic_aarch64(const char *target_triple);
 static bool v3_target_is_linux_riscv64(const char *target_triple);
 static bool v3_target_is_windows_aarch64(const char *target_triple);
+static bool v3_active_target_is_linux_x86_64(void);
+static bool v3_abi_class_word_reg(const char *abi_class);
+static const char *v3_x64_qreg_name(int reg_index);
+static const char *v3_x64_dreg_name(int reg_index);
+static const char *v3_x64_hreg_name(int reg_index);
+static const char *v3_x64_breg_name(int reg_index);
+static void v3_emit_x64_cmp_zero_set_bool(char *out,
+                                          size_t cap,
+                                          int src_reg,
+                                          int dst_reg,
+                                          bool wide,
+                                          const char *cond);
 
 static bool v3_target_is_ohos_aarch64(const char *target_triple) {
     return target_triple != NULL &&
@@ -2284,6 +2305,21 @@ static bool v3_target_uses_consteval_builtin_executable(const char *target_tripl
            v3_target_is_linux_riscv64(target_triple);
 }
 
+static bool v3_target_matches_native_host(const char *target_triple) {
+#if defined(__APPLE__) && defined(__aarch64__)
+    return v3_target_is_darwin_arm64(target_triple);
+#elif defined(__linux__) && defined(__x86_64__)
+    return v3_target_is_linux_x86_64(target_triple);
+#elif defined(__linux__) && defined(__aarch64__)
+    return v3_target_is_linux_generic_aarch64(target_triple);
+#elif defined(__linux__) && defined(__riscv)
+    return v3_target_is_linux_riscv64(target_triple);
+#else
+    (void)target_triple;
+    return false;
+#endif
+}
+
 static bool v3_target_uses_linux_nolibc_runtime(const char *target_triple) {
     return v3_target_is_linux_generic_aarch64(target_triple);
 }
@@ -2302,7 +2338,7 @@ static bool v3_target_supports_seed_native_codegen(const char *target_triple) {
 }
 
 static const char *v3_supported_seed_target_csv(void) {
-    return "arm64-apple-darwin,aarch64-linux-android,aarch64-linux-ohos,aarch64-unknown-linux-ohos,aarch64-unknown-linux-gnu,aarch64-pc-windows-msvc,riscv64-unknown-linux-gnu,wasm32-unknown-unknown";
+    return "arm64-apple-darwin,aarch64-linux-android,aarch64-linux-ohos,aarch64-unknown-linux-ohos,aarch64-unknown-linux-gnu,x86_64-unknown-linux-gnu,aarch64-pc-windows-msvc,riscv64-unknown-linux-gnu,wasm32-unknown-unknown";
 }
 
 static const char *v3_target_support_state(const char *target_triple) {
@@ -2310,7 +2346,7 @@ static const char *v3_target_support_state(const char *target_triple) {
         return "supported";
     }
     if (v3_target_is_linux_x86_64(target_triple)) {
-        return "unsupported_generic_linux_x86_64";
+        return "supported";
     }
     if (v3_target_is_linux_generic_aarch64(target_triple)) {
         return "supported";
@@ -2329,7 +2365,7 @@ static const char *v3_target_support_detail(const char *target_triple) {
         v3_target_is_linux_generic_aarch64(target_triple)) {
         return v3_target_is_linux_generic_aarch64(target_triple) ?
                    "v3_seed_generic_linux_aarch64_nolibc_pipeline_available" :
-                   "v3_seed_generic_linux_emit_gated";
+                   "v3_seed_generic_linux_x86_64_system_pipeline_available";
     }
     if (v3_target_is_windows_aarch64(target_triple)) {
         return "v3_seed_builtin_windows_aarch64_consteval_exe_available";
@@ -2343,6 +2379,7 @@ static const char *v3_target_support_detail(const char *target_triple) {
 static bool v3_target_supports_primary_object_codegen(const char *target_triple) {
     return v3_target_is_darwin_arm64(target_triple) ||
            v3_target_is_elf_aarch64(target_triple) ||
+           v3_target_is_linux_x86_64(target_triple) ||
            v3_target_is_linux_riscv64(target_triple) ||
            v3_target_is_windows_aarch64(target_triple) ||
            v3_target_is_wasm32_unknown_unknown(target_triple);
@@ -2355,7 +2392,8 @@ static bool v3_target_supports_requested_emit(const char *target_triple,
     }
     if (emit_kind != NULL &&
         (v3_streq(emit_kind, "obj") || v3_streq(emit_kind, "exe")) &&
-        v3_target_is_linux_generic_aarch64(target_triple)) {
+        (v3_target_is_linux_generic_aarch64(target_triple) ||
+         v3_target_is_linux_x86_64(target_triple))) {
         return true;
     }
     if (emit_kind != NULL &&
@@ -2372,7 +2410,7 @@ static const char *v3_requested_emit_support_state(const char *target_triple,
         return "supported_for_requested_emit";
     }
     if (v3_target_is_linux_x86_64(target_triple)) {
-        return "unsupported_generic_linux_x86_64";
+        return "supported_for_requested_emit";
     }
     if (v3_target_is_linux_generic_aarch64(target_triple)) {
         return "unsupported_generic_linux_aarch64";
@@ -2392,10 +2430,16 @@ static const char *v3_requested_emit_support_detail(const char *target_triple,
         if (v3_target_is_linux_generic_aarch64(target_triple)) {
             return "v3_seed_generic_linux_aarch64_object_codegen_available";
         }
+        if (v3_target_is_linux_x86_64(target_triple)) {
+            return "v3_seed_generic_linux_x86_64_object_codegen_available";
+        }
     }
     if (emit_kind != NULL && v3_streq(emit_kind, "exe")) {
         if (v3_target_is_linux_generic_aarch64(target_triple)) {
             return "v3_seed_generic_linux_aarch64_nolibc_exe_available";
+        }
+        if (v3_target_is_linux_x86_64(target_triple)) {
+            return "v3_seed_generic_linux_x86_64_exe_available";
         }
         if (v3_target_is_windows_aarch64(target_triple)) {
             return "v3_seed_builtin_windows_aarch64_consteval_exe_available";
@@ -2430,7 +2474,8 @@ static bool v3_target_supports_native_link_for_emit(const char *target_triple,
         return true;
     }
     return v3_streq(emit_kind, "exe") &&
-           (v3_target_uses_linux_nolibc_runtime(target_triple) ||
+           (v3_target_is_linux_x86_64(target_triple) ||
+            v3_target_uses_linux_nolibc_runtime(target_triple) ||
             v3_target_uses_consteval_builtin_executable(target_triple));
 }
 
@@ -2450,7 +2495,8 @@ static void v3_copy_platform_symbol_name(const char *target_triple,
         return;
     }
     if (v3_target_needs_leading_underscore(target_triple) &&
-        !(symbol[0] == 'L' && symbol[1] == '_')) {
+        !(symbol[0] == 'L' && symbol[1] == '_') &&
+        symbol[0] != '_') {
         snprintf(out, cap, "_%s", symbol);
         return;
     }
@@ -3847,15 +3893,99 @@ static bool v3_emit_scalar_cast_reg(char *out,
         return false;
     }
     if (strcmp(dst_abi, "bool") == 0) {
-        v3_text_appendf(out, cap, "  cmp %c%d, #0\n  cset w%d, ne\n",
-                        strcmp(src_abi, "i64") == 0 || strcmp(src_abi, "ptr") == 0 ? 'x' : 'w',
-                        reg_index,
-                        reg_index);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_zero_set_bool(out,
+                                          cap,
+                                          reg_index,
+                                          reg_index,
+                                          strcmp(src_abi, "i64") == 0 || strcmp(src_abi, "ptr") == 0,
+                                          "ne");
+        } else {
+            v3_text_appendf(out, cap, "  cmp %c%d, #0\n  cset w%d, ne\n",
+                            strcmp(src_abi, "i64") == 0 || strcmp(src_abi, "ptr") == 0 ? 'x' : 'w',
+                            reg_index,
+                            reg_index);
+        }
         return true;
     }
     if (strcmp(src_abi, dst_abi) == 0 &&
         strcmp(src_type, dst_type) == 0) {
         return true;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        if (strcmp(dst_abi, "i64") == 0 || strcmp(dst_abi, "ptr") == 0) {
+            if (strcmp(src_abi, "bool") == 0 || strcmp(src_abi, "u8") == 0) {
+                v3_text_appendf(out, cap, "  movzbl %s, %s\n",
+                                v3_x64_breg_name(reg_index),
+                                v3_x64_dreg_name(reg_index));
+                return true;
+            }
+            if (strcmp(src_abi, "i8") == 0) {
+                v3_text_appendf(out, cap, "  movsbq %s, %s\n",
+                                v3_x64_breg_name(reg_index),
+                                v3_x64_qreg_name(reg_index));
+                return true;
+            }
+            if (strcmp(src_abi, "u16") == 0) {
+                v3_text_appendf(out, cap, "  movzwl %s, %s\n",
+                                v3_x64_hreg_name(reg_index),
+                                v3_x64_dreg_name(reg_index));
+                return true;
+            }
+            if (strcmp(src_abi, "i16") == 0) {
+                v3_text_appendf(out, cap, "  movswq %s, %s\n",
+                                v3_x64_hreg_name(reg_index),
+                                v3_x64_qreg_name(reg_index));
+                return true;
+            }
+            if (strcmp(src_abi, "i32") == 0) {
+                v3_text_appendf(out, cap, "  movslq %s, %s\n",
+                                v3_x64_dreg_name(reg_index),
+                                v3_x64_qreg_name(reg_index));
+                return true;
+            }
+            if (strcmp(src_abi, "i64") == 0 || strcmp(src_abi, "ptr") == 0) {
+                return true;
+            }
+            return false;
+        }
+        if (strcmp(dst_abi, "i32") == 0) {
+            if (strcmp(src_abi, "i64") == 0 || strcmp(src_abi, "ptr") == 0) {
+                v3_text_appendf(out, cap, "  movl %s, %s\n",
+                                v3_x64_dreg_name(reg_index),
+                                v3_x64_dreg_name(reg_index));
+            }
+            return true;
+        }
+        if (strcmp(dst_abi, "i16") == 0) {
+            v3_text_appendf(out,
+                            cap,
+                            v3_scalar_type_is_unsigned(dst_type) ? "  movzwl %s, %s\n" : "  movswl %s, %s\n",
+                            v3_x64_hreg_name(reg_index),
+                            v3_x64_dreg_name(reg_index));
+            return true;
+        }
+        if (strcmp(dst_abi, "u16") == 0) {
+            v3_text_appendf(out, cap, "  movzwl %s, %s\n",
+                            v3_x64_hreg_name(reg_index),
+                            v3_x64_dreg_name(reg_index));
+            return true;
+        }
+        if (strcmp(dst_abi, "i8") == 0) {
+            v3_text_appendf(out,
+                            cap,
+                            v3_scalar_type_is_unsigned(dst_type) ? "  movzbl %s, %s\n" : "  movsbl %s, %s\n",
+                            v3_x64_breg_name(reg_index),
+                            v3_x64_dreg_name(reg_index));
+            return true;
+        }
+        if (strcmp(dst_abi, "u8") == 0) {
+            v3_text_appendf(out, cap, "  movzbl %s, %s\n",
+                            v3_x64_breg_name(reg_index),
+                            v3_x64_dreg_name(reg_index));
+            return true;
+        }
+        return false;
     }
     if (strcmp(dst_abi, "i64") == 0 || strcmp(dst_abi, "ptr") == 0) {
         if (strcmp(src_abi, "bool") == 0 ||
@@ -8738,23 +8868,51 @@ static bool v3_parent_dir(const char *path, char *out, size_t cap) {
 }
 
 static void v3_join_path(char *out, size_t cap, const char *a, const char *b) {
-    if (!a || *a == '\0') {
-        v3_copy_text(out, cap, b ? b : "");
+    char *a_copy = NULL;
+    char *b_copy = NULL;
+    const char *left = a;
+    const char *right = b;
+    if (out != NULL && a != NULL && out == a) {
+        size_t n = strlen(a) + 1U;
+        a_copy = (char *)malloc(n);
+        if (a_copy != NULL) {
+            memcpy(a_copy, a, n);
+            left = a_copy;
+        }
+    }
+    if (out != NULL && b != NULL && out == b) {
+        size_t n = strlen(b) + 1U;
+        b_copy = (char *)malloc(n);
+        if (b_copy != NULL) {
+            memcpy(b_copy, b, n);
+            right = b_copy;
+        }
+    }
+    if (!left || *left == '\0') {
+        v3_copy_text(out, cap, right ? right : "");
+        free(a_copy);
+        free(b_copy);
         return;
     }
-    if (!b || *b == '\0') {
-        v3_copy_text(out, cap, a);
+    if (!right || *right == '\0') {
+        v3_copy_text(out, cap, left);
+        free(a_copy);
+        free(b_copy);
         return;
     }
-    if (b[0] == '/') {
-        v3_copy_text(out, cap, b);
+    if (right[0] == '/') {
+        v3_copy_text(out, cap, right);
+        free(a_copy);
+        free(b_copy);
         return;
     }
-    if (a[strlen(a) - 1U] == '/') {
-        snprintf(out, cap, "%s%s", a, b);
-        return;
+    if (left[strlen(left) - 1U] == '/') {
+        snprintf(out, cap, "%s%s", left, right);
+    } else {
+        snprintf(out, cap, "%s/%s", left, right);
     }
-    snprintf(out, cap, "%s/%s", a, b);
+    free(a_copy);
+    free(b_copy);
 }
 
 static void v3_strip_ext(char *text) {
@@ -11226,6 +11384,414 @@ static void v3_runtime_entry_bridge_symbol(const V3SystemLinkPlanStub *plan,
 static void v3_text_append(char *out, size_t cap, const char *text);
 static void v3_text_appendf(char *out, size_t cap, const char *fmt, ...);
 
+static const char *v3_x64_qreg_name(int reg_index) {
+    switch (reg_index) {
+        case 0: return "%rax";
+        case 1: return "%rbx";
+        case 2: return "%rdx";
+        case 3: return "%rcx";
+        case 4: return "%r8";
+        case 5: return "%r9";
+        case 6: return "%r10";
+        case 7: return "%r11";
+        case 8: return "%r12";
+        case 9: return "%r13";
+        case 10: return "%r14";
+        case 11: return "%r15";
+        case 14: return "%rdi";
+        case 15: return "%rsi";
+        case 16: return "%r10";
+        case 17: return "%r11";
+        case 29: return "%rbp";
+        default: return "%rax";
+    }
+}
+
+static const char *v3_x64_dreg_name(int reg_index) {
+    switch (reg_index) {
+        case 0: return "%eax";
+        case 1: return "%ebx";
+        case 2: return "%edx";
+        case 3: return "%ecx";
+        case 4: return "%r8d";
+        case 5: return "%r9d";
+        case 6: return "%r10d";
+        case 7: return "%r11d";
+        case 8: return "%r12d";
+        case 9: return "%r13d";
+        case 10: return "%r14d";
+        case 11: return "%r15d";
+        case 14: return "%edi";
+        case 15: return "%esi";
+        case 16: return "%r10d";
+        case 17: return "%r11d";
+        case 29: return "%ebp";
+        default: return "%eax";
+    }
+}
+
+static const char *v3_x64_hreg_name(int reg_index) {
+    switch (reg_index) {
+        case 0: return "%ax";
+        case 1: return "%bx";
+        case 2: return "%dx";
+        case 3: return "%cx";
+        case 4: return "%r8w";
+        case 5: return "%r9w";
+        case 6: return "%r10w";
+        case 7: return "%r11w";
+        case 8: return "%r12w";
+        case 9: return "%r13w";
+        case 10: return "%r14w";
+        case 11: return "%r15w";
+        case 14: return "%di";
+        case 15: return "%si";
+        case 16: return "%r10w";
+        case 17: return "%r11w";
+        case 29: return "%bp";
+        default: return "%ax";
+    }
+}
+
+static const char *v3_x64_breg_name(int reg_index) {
+    switch (reg_index) {
+        case 0: return "%al";
+        case 1: return "%bl";
+        case 2: return "%dl";
+        case 3: return "%cl";
+        case 4: return "%r8b";
+        case 5: return "%r9b";
+        case 6: return "%r10b";
+        case 7: return "%r11b";
+        case 8: return "%r12b";
+        case 9: return "%r13b";
+        case 10: return "%r14b";
+        case 11: return "%r15b";
+        case 14: return "%dil";
+        case 15: return "%sil";
+        case 16: return "%r10b";
+        case 17: return "%r11b";
+        default: return "%al";
+    }
+}
+
+static int v3_call_arg_reg_count_for_target(const V3SystemLinkPlanStub *plan,
+                                            bool composite_return) {
+    if (plan != NULL && v3_target_is_linux_x86_64(plan->target_triple)) {
+        return composite_return ? 5 : 6;
+    }
+    return CHENG_V3_CALL_ARG_REGS;
+}
+
+static const char *v3_x64_call_arg_qreg(size_t arg_index, bool composite_return) {
+    static const char *NORMAL[] = {"%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"};
+    static const char *SRET[] = {"%rsi", "%rdx", "%rcx", "%r8", "%r9"};
+    if (composite_return) {
+        return arg_index < sizeof(SRET) / sizeof(SRET[0]) ? SRET[arg_index] : NULL;
+    }
+    return arg_index < sizeof(NORMAL) / sizeof(NORMAL[0]) ? NORMAL[arg_index] : NULL;
+}
+
+static const char *v3_x64_call_arg_dreg(size_t arg_index, bool composite_return) {
+    static const char *NORMAL[] = {"%edi", "%esi", "%edx", "%ecx", "%r8d", "%r9d"};
+    static const char *SRET[] = {"%esi", "%edx", "%ecx", "%r8d", "%r9d"};
+    if (composite_return) {
+        return arg_index < sizeof(SRET) / sizeof(SRET[0]) ? SRET[arg_index] : NULL;
+    }
+    return arg_index < sizeof(NORMAL) / sizeof(NORMAL[0]) ? NORMAL[arg_index] : NULL;
+}
+
+static const char *v3_x64_call_arg_breg(size_t arg_index, bool composite_return) {
+    static const char *NORMAL[] = {"%dil", "%sil", "%dl", "%cl", "%r8b", "%r9b"};
+    static const char *SRET[] = {"%sil", "%dl", "%cl", "%r8b", "%r9b"};
+    if (composite_return) {
+        return arg_index < sizeof(SRET) / sizeof(SRET[0]) ? SRET[arg_index] : NULL;
+    }
+    return arg_index < sizeof(NORMAL) / sizeof(NORMAL[0]) ? NORMAL[arg_index] : NULL;
+}
+
+static int v3_x64_call_arg_virtual_reg(size_t arg_index, bool composite_return) {
+    static const int NORMAL[] = {14, 15, 2, 3, 4, 5};
+    static const int SRET[] = {15, 2, 3, 4, 5};
+    if (composite_return) {
+        return arg_index < sizeof(SRET) / sizeof(SRET[0]) ? SRET[arg_index] : -1;
+    }
+    return arg_index < sizeof(NORMAL) / sizeof(NORMAL[0]) ? NORMAL[arg_index] : -1;
+}
+
+static int v3_x64_pick_scratch_reg(int reg_a, int reg_b) {
+    if (reg_a != 16 && reg_b != 16) {
+        return 16;
+    }
+    if (reg_a != 17 && reg_b != 17) {
+        return 17;
+    }
+    if (reg_a != 0 && reg_b != 0) {
+        return 0;
+    }
+    if (reg_a != 2 && reg_b != 2) {
+        return 2;
+    }
+    return 3;
+}
+
+static bool v3_x64_reg_is_callee_saved(int reg_index) {
+    return reg_index == 1 || reg_index == 8 || reg_index == 9 ||
+           reg_index == 10 || reg_index == 11 || reg_index == 29;
+}
+
+static int v3_x64_pick_preserved_reg(int reg_a, int reg_b) {
+    static const int CANDIDATES[] = {8, 9, 10, 11, 1};
+    size_t i;
+    for (i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); ++i) {
+        if (CANDIDATES[i] != reg_a && CANDIDATES[i] != reg_b) {
+            return CANDIDATES[i];
+        }
+    }
+    return -1;
+}
+
+static int v3_x64_pick_preserved_reg3(int reg_a, int reg_b, int reg_c) {
+    static const int CANDIDATES[] = {8, 9, 10, 11, 1};
+    size_t i;
+    for (i = 0; i < sizeof(CANDIDATES) / sizeof(CANDIDATES[0]); ++i) {
+        if (CANDIDATES[i] != reg_a &&
+            CANDIDATES[i] != reg_b &&
+            CANDIDATES[i] != reg_c) {
+            return CANDIDATES[i];
+        }
+    }
+    return -1;
+}
+
+static void v3_emit_x64_prepare_rdi_rsi_q_q(char *out,
+                                            size_t cap,
+                                            int rdi_src_reg,
+                                            int rsi_src_reg) {
+    int safe_rsi_src_reg = rsi_src_reg;
+    if (rdi_src_reg != 14 && rsi_src_reg == 14) {
+        int scratch_reg = v3_x64_pick_scratch_reg(rdi_src_reg, rsi_src_reg);
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %s\n",
+                        v3_x64_qreg_name(14),
+                        v3_x64_qreg_name(scratch_reg));
+        safe_rsi_src_reg = scratch_reg;
+    }
+    if (rdi_src_reg != 14) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %%rdi\n",
+                        v3_x64_qreg_name(rdi_src_reg));
+    }
+    if (safe_rsi_src_reg != 15) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %%rsi\n",
+                        v3_x64_qreg_name(safe_rsi_src_reg));
+    }
+}
+
+static void v3_emit_x64_prepare_rdi_esi_q_d(char *out,
+                                            size_t cap,
+                                            int rdi_src_reg,
+                                            int esi_src_reg) {
+    int safe_esi_src_reg = esi_src_reg;
+    if (rdi_src_reg != 14 && esi_src_reg == 14) {
+        int scratch_reg = v3_x64_pick_scratch_reg(rdi_src_reg, esi_src_reg);
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %s\n",
+                        v3_x64_qreg_name(14),
+                        v3_x64_qreg_name(scratch_reg));
+        safe_esi_src_reg = scratch_reg;
+    }
+    if (rdi_src_reg != 14) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %%rdi\n",
+                        v3_x64_qreg_name(rdi_src_reg));
+    }
+    if (safe_esi_src_reg != 15) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movl %s, %%esi\n",
+                        v3_x64_dreg_name(safe_esi_src_reg));
+    }
+}
+
+static void v3_emit_x64_prepare_edi_esi_d_d(char *out,
+                                            size_t cap,
+                                            int edi_src_reg,
+                                            int esi_src_reg) {
+    int safe_esi_src_reg = esi_src_reg;
+    if (edi_src_reg != 14 && esi_src_reg == 14) {
+        int scratch_reg = v3_x64_pick_scratch_reg(edi_src_reg, esi_src_reg);
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %s\n",
+                        v3_x64_qreg_name(14),
+                        v3_x64_qreg_name(scratch_reg));
+        safe_esi_src_reg = scratch_reg;
+    }
+    if (edi_src_reg != 14) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movl %s, %%edi\n",
+                        v3_x64_dreg_name(edi_src_reg));
+    }
+    if (safe_esi_src_reg != 15) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movl %s, %%esi\n",
+                        v3_x64_dreg_name(safe_esi_src_reg));
+    }
+}
+
+static int32_t v3_incoming_stack_arg_offset_for_target(const V3SystemLinkPlanStub *plan,
+                                                       int32_t frame_size,
+                                                       int32_t stack_arg_index) {
+    if (plan != NULL && v3_target_is_linux_x86_64(plan->target_triple)) {
+        return frame_size + 56 + stack_arg_index * 8;
+    }
+    return frame_size + stack_arg_index * 8;
+}
+
+static const char *v3_x64_cond_suffix(const char *cond) {
+    if (cond == NULL) {
+        return "e";
+    }
+    if (strcmp(cond, "eq") == 0) return "e";
+    if (strcmp(cond, "ne") == 0) return "ne";
+    if (strcmp(cond, "lt") == 0) return "l";
+    if (strcmp(cond, "le") == 0) return "le";
+    if (strcmp(cond, "gt") == 0) return "g";
+    if (strcmp(cond, "ge") == 0) return "ge";
+    return "e";
+}
+
+static void v3_emit_x64_move_reg(char *out,
+                                 size_t cap,
+                                 int dst_reg,
+                                 int src_reg,
+                                 const char *abi_class) {
+    if (v3_abi_class_word_reg(abi_class)) {
+        if (dst_reg != src_reg) {
+            v3_text_appendf(out, cap,
+                            "  movl %s, %s\n",
+                            v3_x64_dreg_name(src_reg),
+                            v3_x64_dreg_name(dst_reg));
+        }
+        return;
+    }
+    if (dst_reg != src_reg) {
+        v3_text_appendf(out, cap,
+                        "  movq %s, %s\n",
+                        v3_x64_qreg_name(src_reg),
+                        v3_x64_qreg_name(dst_reg));
+    }
+}
+
+static void v3_emit_x64_cmp_zero_set_bool(char *out,
+                                          size_t cap,
+                                          int src_reg,
+                                          int dst_reg,
+                                          bool wide,
+                                          const char *cond) {
+    v3_text_appendf(out, cap,
+                    "  cmp%s $0, %s\n"
+                    "  movl $0, %s\n"
+                    "  set%s %s\n",
+                    wide ? "q" : "l",
+                    wide ? v3_x64_qreg_name(src_reg) : v3_x64_dreg_name(src_reg),
+                    v3_x64_dreg_name(dst_reg),
+                    v3_x64_cond_suffix(cond),
+                    v3_x64_breg_name(dst_reg));
+}
+
+static void v3_emit_x64_cmp_regs_set_bool(char *out,
+                                          size_t cap,
+                                          int left_reg,
+                                          int right_reg,
+                                          int dst_reg,
+                                          bool wide,
+                                          const char *cond) {
+    v3_text_appendf(out, cap,
+                    "  cmp%s %s, %s\n"
+                    "  movl $0, %s\n"
+                    "  set%s %s\n",
+                    wide ? "q" : "l",
+                    wide ? v3_x64_qreg_name(right_reg) : v3_x64_dreg_name(right_reg),
+                    wide ? v3_x64_qreg_name(left_reg) : v3_x64_dreg_name(left_reg),
+                    v3_x64_dreg_name(dst_reg),
+                    v3_x64_cond_suffix(cond),
+                    v3_x64_breg_name(dst_reg));
+}
+
+static void v3_emit_x64_branch_zero(char *out,
+                                    size_t cap,
+                                    int reg_index,
+                                    bool wide,
+                                    bool branch_if_zero,
+                                    const char *label) {
+    v3_text_appendf(out, cap,
+                    "  cmp%s $0, %s\n"
+                    "  j%s %s\n",
+                    wide ? "q" : "l",
+                    wide ? v3_x64_qreg_name(reg_index) : v3_x64_dreg_name(reg_index),
+                    branch_if_zero ? "e" : "ne",
+                    label);
+}
+
+static void v3_emit_branch_zero(char *out,
+                                size_t cap,
+                                int reg_index,
+                                bool wide,
+                                const char *label) {
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_emit_x64_branch_zero(out, cap, reg_index, wide, true, label);
+        return;
+    }
+    v3_text_appendf(out, cap,
+                    "  cmp %c%d, #0\n"
+                    "  b.eq %s\n",
+                    wide ? 'x' : 'w',
+                    reg_index,
+                    label);
+}
+
+static void v3_emit_branch_nonzero(char *out,
+                                   size_t cap,
+                                   int reg_index,
+                                   bool wide,
+                                   const char *label) {
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_emit_x64_branch_zero(out, cap, reg_index, wide, false, label);
+        return;
+    }
+    v3_text_appendf(out, cap,
+                    "  cmp %c%d, #0\n"
+                    "  b.ne %s\n",
+                    wide ? 'x' : 'w',
+                    reg_index,
+                    label);
+}
+
+static void v3_emit_jump_label(char *out,
+                               size_t cap,
+                               const char *label) {
+    v3_text_appendf(out,
+                    cap,
+                    v3_active_target_is_linux_x86_64() ? "  jmp %s\n" : "  b %s\n",
+                    label);
+}
+
+static const char *v3_active_codegen_target_triple = NULL;
+
+static bool v3_active_target_is_linux_x86_64(void) {
+    return v3_target_is_linux_x86_64(v3_active_codegen_target_triple);
+}
+
 static void v3_append_cstring_section_for_target(const V3SystemLinkPlanStub *plan,
                                                  char *out,
                                                  size_t cap) {
@@ -11288,6 +11854,20 @@ static bool v3_emit_symbol_address_for_target(const V3SystemLinkPlanStub *plan,
                         symbol_name);
         return true;
     }
+    if (v3_target_is_linux_x86_64(plan->target_triple)) {
+        if (v3_streq(plan->emit_kind, "shared") && !local_label) {
+            v3_text_appendf(out, cap,
+                            "  movq %s@GOTPCREL(%%rip), %s\n",
+                            symbol_name,
+                            v3_x64_qreg_name(reg_index));
+            return true;
+        }
+        v3_text_appendf(out, cap,
+                        "  leaq %s(%%rip), %s\n",
+                        symbol_name,
+                        v3_x64_qreg_name(reg_index));
+        return true;
+    }
     v3_text_appendf(out, cap,
                     "  adrp x%d, %s@PAGE\n"
                     "  add x%d, x%d, %s@PAGEOFF\n",
@@ -11305,6 +11885,21 @@ static void v3_emit_call_named_symbol(const V3SystemLinkPlanStub *plan,
                                       const char *symbol) {
     char target_symbol[PATH_MAX];
     v3_copy_target_symbol_name(plan, symbol, target_symbol, sizeof(target_symbol));
+    if (plan != NULL && v3_target_is_linux_x86_64(plan->target_triple)) {
+        v3_text_appendf(out, cap, "  call %s\n", target_symbol);
+        return;
+    }
+    v3_text_appendf(out, cap, "  bl %s\n", target_symbol);
+}
+
+static void v3_emit_call_target_symbol_text(const V3SystemLinkPlanStub *plan,
+                                            char *out,
+                                            size_t cap,
+                                            const char *target_symbol) {
+    if (plan != NULL && v3_target_is_linux_x86_64(plan->target_triple)) {
+        v3_text_appendf(out, cap, "  call %s\n", target_symbol);
+        return;
+    }
     v3_text_appendf(out, cap, "  bl %s\n", target_symbol);
 }
 
@@ -11479,9 +12074,15 @@ static bool v3_append_embedded_line_map(char *text,
         if (!v3_emit_symbol_address_for_target(plan, text, cap, 0, "L_v3_embedded_line_map_count_value")) {
             return false;
         }
-        v3_text_append(text, cap,
-                       "  ldr x0, [x0]\n"
-                       "  ret\n");
+        if (v3_target_is_linux_x86_64(plan->target_triple)) {
+            v3_text_append(text, cap,
+                           "  movq 0(%rax), %rax\n"
+                           "  retq\n");
+        } else {
+            v3_text_append(text, cap,
+                           "  ldr x0, [x0]\n"
+                           "  ret\n");
+        }
     }
     return true;
 }
@@ -13082,6 +13683,55 @@ static void v3_emit_load_slot(char *out,
                               size_t cap,
                               const V3AsmLocalSlot *slot,
                               int reg_index) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (!slot || slot->stack_offset < 0) {
+            abort();
+        }
+        if (slot->indirect_value) {
+            v3_text_appendf(out, cap,
+                            "  movq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(16));
+            v3_emit_load_scalar_from_address(out, cap, 16, 0, slot->abi_class, reg_index);
+        } else if (strcmp(slot->abi_class, "ptr") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(reg_index));
+        } else if (strcmp(slot->abi_class, "i8") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movsbq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(reg_index));
+        } else if (strcmp(slot->abi_class, "u8") == 0 ||
+                   strcmp(slot->abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movzbl %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_dreg_name(reg_index));
+        } else if (strcmp(slot->abi_class, "i16") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movswq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(reg_index));
+        } else if (strcmp(slot->abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movzwl %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_dreg_name(reg_index));
+        } else if (strcmp(slot->abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movslq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(reg_index));
+        } else {
+            v3_text_appendf(out, cap,
+                            "  movq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(reg_index));
+        }
+        return;
+    }
     if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
         abort();
     }
@@ -13111,6 +13761,47 @@ static void v3_emit_store_slot(char *out,
                                size_t cap,
                                const V3AsmLocalSlot *slot,
                                int reg_index) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (!slot || slot->stack_offset < 0) {
+            abort();
+        }
+        if (slot->indirect_value) {
+            v3_text_appendf(out, cap,
+                            "  movq %d(%%rsp), %s\n",
+                            slot->stack_offset,
+                            v3_x64_qreg_name(16));
+            v3_emit_store_scalar_to_address(out, cap, 16, 0, slot->abi_class, reg_index);
+        } else if (strcmp(slot->abi_class, "ptr") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movq %s, %d(%%rsp)\n",
+                            v3_x64_qreg_name(reg_index),
+                            slot->stack_offset);
+        } else if (strcmp(slot->abi_class, "i8") == 0 ||
+                   strcmp(slot->abi_class, "u8") == 0 ||
+                   strcmp(slot->abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movb %s, %d(%%rsp)\n",
+                            v3_x64_breg_name(reg_index),
+                            slot->stack_offset);
+        } else if (strcmp(slot->abi_class, "i16") == 0 ||
+                   strcmp(slot->abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movw %s, %d(%%rsp)\n",
+                            v3_x64_hreg_name(reg_index),
+                            slot->stack_offset);
+        } else if (strcmp(slot->abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap,
+                            "  movl %s, %d(%%rsp)\n",
+                            v3_x64_dreg_name(reg_index),
+                            slot->stack_offset);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  movq %s, %d(%%rsp)\n",
+                            v3_x64_qreg_name(reg_index),
+                            slot->stack_offset);
+        }
+        return;
+    }
     if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
         abort();
     }
@@ -13567,6 +14258,21 @@ static void v3_emit_call_arg_spill_load(char *out,
     }
 }
 
+static void v3_emit_call_arg_spill_load_adjusted(char *out,
+                                                 size_t cap,
+                                                 int32_t call_arg_base,
+                                                 int call_depth,
+                                                 size_t arg_index,
+                                                 int dest_reg_index,
+                                                 const char *abi_class,
+                                                 int32_t extra_sp_offset) {
+    int32_t offset =
+        call_arg_base + call_depth * CHENG_V3_CALL_ARG_SPILL_STRIDE + (int32_t)arg_index * 8 + extra_sp_offset;
+    if (!v3_emit_sp_load_reg(out, cap, offset, abi_class, dest_reg_index)) {
+        abort();
+    }
+}
+
 static const char *v3_call_arg_load_abi(const V3AsmCallTarget *target, size_t arg_index) {
     if (target == NULL || arg_index >= CHENG_V3_MAX_CALL_ARGS) {
         return "ptr";
@@ -13745,14 +14451,30 @@ static bool v3_emit_str_literal_into_slot(const V3SystemLinkPlanStub *plan,
     if (!v3_emit_symbol_address_for_target(plan, out, cap, 9, label)) {
         return false;
     }
-    v3_text_appendf(out, cap,
-                    "  str x9, [x15, #0]\n"
-                    "  mov w10, #%d\n"
-                    "  str w10, [x15, #8]\n"
-                    "  str wzr, [x15, #12]\n"
-                    "  str wzr, [x15, #16]\n"
-                    "  str wzr, [x15, #20]\n",
-                    (int)strlen(literal_text));
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap,
+                        "  movq %s, 0(%s)\n"
+                        "  movl $%d, 8(%s)\n"
+                        "  movl $0, 12(%s)\n"
+                        "  movl $0, 16(%s)\n"
+                        "  movl $0, 20(%s)\n",
+                        v3_x64_qreg_name(9),
+                        v3_x64_qreg_name(15),
+                        (int)strlen(literal_text),
+                        v3_x64_qreg_name(15),
+                        v3_x64_qreg_name(15),
+                        v3_x64_qreg_name(15),
+                        v3_x64_qreg_name(15));
+    } else {
+        v3_text_appendf(out, cap,
+                        "  str x9, [x15, #0]\n"
+                        "  mov w10, #%d\n"
+                        "  str w10, [x15, #8]\n"
+                        "  str wzr, [x15, #12]\n"
+                        "  str wzr, [x15, #16]\n"
+                        "  str wzr, [x15, #20]\n",
+                        (int)strlen(literal_text));
+    }
     return true;
 }
 
@@ -13777,19 +14499,35 @@ static bool v3_emit_str_literal_into_address(const V3SystemLinkPlanStub *plan,
     if (!v3_emit_symbol_address_for_target(plan, out, cap, 9, label)) {
         return false;
     }
-    v3_text_appendf(out, cap,
-                    "  str x9, [x%d, #0]\n"
-                    "  mov w10, #%d\n"
-                    "  str w10, [x%d, #8]\n"
-                    "  str wzr, [x%d, #12]\n"
-                    "  str wzr, [x%d, #16]\n"
-                    "  str wzr, [x%d, #20]\n",
-                    dest_addr_reg,
-                    (int)strlen(literal_text),
-                    dest_addr_reg,
-                    dest_addr_reg,
-                    dest_addr_reg,
-                    dest_addr_reg);
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap,
+                        "  movq %s, 0(%s)\n"
+                        "  movl $%d, 8(%s)\n"
+                        "  movl $0, 12(%s)\n"
+                        "  movl $0, 16(%s)\n"
+                        "  movl $0, 20(%s)\n",
+                        v3_x64_qreg_name(9),
+                        v3_x64_qreg_name(dest_addr_reg),
+                        (int)strlen(literal_text),
+                        v3_x64_qreg_name(dest_addr_reg),
+                        v3_x64_qreg_name(dest_addr_reg),
+                        v3_x64_qreg_name(dest_addr_reg),
+                        v3_x64_qreg_name(dest_addr_reg));
+    } else {
+        v3_text_appendf(out, cap,
+                        "  str x9, [x%d, #0]\n"
+                        "  mov w10, #%d\n"
+                        "  str w10, [x%d, #8]\n"
+                        "  str wzr, [x%d, #12]\n"
+                        "  str wzr, [x%d, #16]\n"
+                        "  str wzr, [x%d, #20]\n",
+                        dest_addr_reg,
+                        (int)strlen(literal_text),
+                        dest_addr_reg,
+                        dest_addr_reg,
+                        dest_addr_reg,
+                        dest_addr_reg);
+    }
     return true;
 }
 
@@ -13818,6 +14556,41 @@ static bool v3_emit_zero_address_range(char *out,
                                        size_t cap,
                                        int addr_reg,
                                        int32_t size) {
+    if (v3_active_target_is_linux_x86_64()) {
+        int32_t offset = 0;
+        while (offset + 8 <= size) {
+            int32_t chunk_base = offset;
+            int32_t chunk_limit = size;
+            if (chunk_limit - chunk_base > 32760) {
+                chunk_limit = chunk_base + 32760;
+            }
+            if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, chunk_base)) {
+                return false;
+            }
+            while (offset + 8 <= chunk_limit) {
+                v3_text_appendf(out, cap,
+                                "  movq $0, %d(%s)\n",
+                                offset - chunk_base,
+                                v3_x64_qreg_name(14));
+                offset += 8;
+            }
+        }
+        if (offset + 4 <= size) {
+            if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, offset)) {
+                return false;
+            }
+            v3_text_appendf(out, cap, "  movl $0, 0(%s)\n", v3_x64_qreg_name(14));
+            offset += 4;
+        }
+        while (offset < size) {
+            if (!v3_emit_add_address_offset(out, cap, 14, addr_reg, offset)) {
+                return false;
+            }
+            v3_text_appendf(out, cap, "  movb $0, 0(%s)\n", v3_x64_qreg_name(14));
+            offset += 1;
+        }
+        return true;
+    }
     int32_t offset = 0;
     while (offset + 8 <= size) {
         int32_t chunk_base = offset;
@@ -13868,6 +14641,22 @@ static void v3_emit_load_scalar_from_address(char *out,
                                              int32_t offset,
                                              const char *abi_class,
                                              int dst_reg) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (strcmp(abi_class, "i8") == 0) {
+            v3_text_appendf(out, cap, "  movsbq %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_qreg_name(dst_reg));
+        } else if (strcmp(abi_class, "u8") == 0 || strcmp(abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap, "  movzbl %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_dreg_name(dst_reg));
+        } else if (strcmp(abi_class, "i16") == 0) {
+            v3_text_appendf(out, cap, "  movswq %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_qreg_name(dst_reg));
+        } else if (strcmp(abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap, "  movzwl %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_dreg_name(dst_reg));
+        } else if (strcmp(abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap, "  movslq %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_qreg_name(dst_reg));
+        } else {
+            v3_text_appendf(out, cap, "  movq %d(%s), %s\n", offset, v3_x64_qreg_name(addr_reg), v3_x64_qreg_name(dst_reg));
+        }
+        return;
+    }
     if (strcmp(abi_class, "i8") == 0) {
         v3_text_appendf(out, cap, "  ldrsb x%d, [x%d, #%d]\n", dst_reg, addr_reg, offset);
     } else if (strcmp(abi_class, "u8") == 0 || strcmp(abi_class, "bool") == 0) {
@@ -13889,6 +14678,21 @@ static void v3_emit_store_scalar_to_address(char *out,
                                             int32_t offset,
                                             const char *abi_class,
                                             int src_reg) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (strcmp(abi_class, "i8") == 0 ||
+            strcmp(abi_class, "u8") == 0 ||
+            strcmp(abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap, "  movb %s, %d(%s)\n", v3_x64_breg_name(src_reg), offset, v3_x64_qreg_name(addr_reg));
+        } else if (strcmp(abi_class, "i16") == 0 ||
+                   strcmp(abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap, "  movw %s, %d(%s)\n", v3_x64_hreg_name(src_reg), offset, v3_x64_qreg_name(addr_reg));
+        } else if (strcmp(abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap, "  movl %s, %d(%s)\n", v3_x64_dreg_name(src_reg), offset, v3_x64_qreg_name(addr_reg));
+        } else {
+            v3_text_appendf(out, cap, "  movq %s, %d(%s)\n", v3_x64_qreg_name(src_reg), offset, v3_x64_qreg_name(addr_reg));
+        }
+        return;
+    }
     if (strcmp(abi_class, "i8") == 0 ||
         strcmp(abi_class, "u8") == 0 ||
         strcmp(abi_class, "bool") == 0) {
@@ -13911,6 +14715,49 @@ static bool v3_emit_copy_address_to_address(const V3SystemLinkPlanStub *plan,
                                             int32_t size) {
     if (size < 0) {
         return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        int preserved_dst_reg = -1;
+        int preserved_src_reg = -1;
+        if (!v3_x64_reg_is_callee_saved(dst_reg)) {
+            preserved_dst_reg = v3_x64_pick_preserved_reg(dst_reg, src_reg);
+            if (preserved_dst_reg < 0) {
+                return false;
+            }
+            v3_text_appendf(out, cap,
+                            "  movq %s, %s\n",
+                            v3_x64_qreg_name(dst_reg),
+                            v3_x64_qreg_name(preserved_dst_reg));
+        }
+        if (src_reg != dst_reg &&
+            !v3_x64_reg_is_callee_saved(src_reg)) {
+            preserved_src_reg = v3_x64_pick_preserved_reg3(dst_reg,
+                                                           src_reg,
+                                                           preserved_dst_reg);
+            if (preserved_src_reg < 0) {
+                return false;
+            }
+            v3_text_appendf(out, cap,
+                            "  movq %s, %s\n",
+                            v3_x64_qreg_name(src_reg),
+                            v3_x64_qreg_name(preserved_src_reg));
+        }
+        v3_emit_x64_prepare_rdi_rsi_q_q(out, cap, dst_reg, src_reg);
+        v3_text_appendf(out, cap, "  movl $%d, %%edx\n", size);
+        v3_emit_call_named_symbol(plan, out, cap, "copyMem");
+        if (preserved_src_reg >= 0) {
+            v3_text_appendf(out, cap,
+                            "  movq %s, %s\n",
+                            v3_x64_qreg_name(preserved_src_reg),
+                            v3_x64_qreg_name(src_reg));
+        }
+        if (preserved_dst_reg >= 0) {
+            v3_text_appendf(out, cap,
+                            "  movq %s, %s\n",
+                            v3_x64_qreg_name(preserved_dst_reg),
+                            v3_x64_qreg_name(dst_reg));
+        }
+        return true;
     }
     v3_text_appendf(out, cap,
                     "  mov x0, x%d\n"
@@ -13961,6 +14808,20 @@ static bool v3_emit_copy_slot_to_address(const V3SystemLinkPlanStub *plan,
 }
 
 static bool v3_emit_mov_imm(char *out, size_t cap, int reg_index, int64_t value) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (value >= INT32_MIN && value <= INT32_MAX) {
+            v3_text_appendf(out, cap,
+                            "  movq $%lld, %s\n",
+                            (long long)value,
+                            v3_x64_qreg_name(reg_index));
+            return true;
+        }
+        v3_text_appendf(out, cap,
+                        "  movabsq $%lld, %s\n",
+                        (long long)value,
+                        v3_x64_qreg_name(reg_index));
+        return true;
+    }
     uint64_t bits = (uint64_t)value;
     bool emitted = false;
     int shift;
@@ -14600,7 +15461,7 @@ static bool v3_emit_field_path_address(char *out,
         char next_type[256];
         char next_abi[32];
         if (v3_is_internal_ref_type(current_type)) {
-            v3_text_appendf(out, cap, "  ldr x%d, [x%d]\n", addr_reg, addr_reg);
+            v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", addr_reg);
         }
         if (!v3_resolve_field_meta(lowering,
                                    current_type,
@@ -14827,7 +15688,7 @@ static bool v3_emit_member_access_address(const V3SystemLinkPlanStub *plan,
          (strcmp(normalized_base_type, "ptr") == 0 ||
           strcmp(normalized_base_type, "cstring") == 0 ||
           v3_type_text_strip_one_pointer_suffix(normalized_base_type, nested_type, sizeof(nested_type))))) {
-        v3_text_appendf(out, cap, "  ldr x%d, [x%d]\n", addr_reg, addr_reg);
+        v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", addr_reg);
     }
     if (!v3_emit_add_address_offset(out, cap, addr_reg, addr_reg, field_offset)) {
         return false;
@@ -14902,9 +15763,41 @@ static bool v3_emit_index_access_address(const V3SystemLinkPlanStub *plan,
     int32_t elem_size = 0;
     int data_offset = -1;
     bool base_is_fixed_array = false;
+    const bool target_is_linux_x86_64 =
+        plan != NULL && v3_target_is_linux_x86_64(plan->target_triple);
     int base_reg = addr_reg == 13 ? 14 : 13;
     int index_reg = 11;
     int size_reg = 12;
+    if (target_is_linux_x86_64) {
+        const int temp_regs[] = {9, 10, 11, 8, 16, 17};
+        size_t temp_i;
+        base_reg = -1;
+        index_reg = -1;
+        size_reg = -1;
+        for (temp_i = 0U; temp_i < sizeof(temp_regs) / sizeof(temp_regs[0]); ++temp_i) {
+            if (temp_regs[temp_i] != addr_reg) {
+                base_reg = temp_regs[temp_i];
+                break;
+            }
+        }
+        for (temp_i = 0U; temp_i < sizeof(temp_regs) / sizeof(temp_regs[0]); ++temp_i) {
+            if (temp_regs[temp_i] != addr_reg && temp_regs[temp_i] != base_reg) {
+                index_reg = temp_regs[temp_i];
+                break;
+            }
+        }
+        for (temp_i = 0U; temp_i < sizeof(temp_regs) / sizeof(temp_regs[0]); ++temp_i) {
+            if (temp_regs[temp_i] != addr_reg &&
+                temp_regs[temp_i] != base_reg &&
+                temp_regs[temp_i] != index_reg) {
+                size_reg = temp_regs[temp_i];
+                break;
+            }
+        }
+        if (base_reg < 0 || index_reg < 0 || size_reg < 0) {
+            return false;
+        }
+    }
     v3_trim_copy_text(expr_text, expr, sizeof(expr));
     if (!v3_parse_index_access_expr(expr, base_expr, sizeof(base_expr), index_expr, sizeof(index_expr)) ||
         !v3_infer_expr_type(plan,
@@ -15069,28 +15962,49 @@ static bool v3_emit_index_access_address(const V3SystemLinkPlanStub *plan,
                 return false;
             }
         } else if (strcmp(normalized_base_type, "Bytes") == 0 || strcmp(normalized_base_type, "str") == 0) {
-            v3_text_appendf(out, cap, "  ldrsw x%d, [x%d, #8]\n", size_reg, base_reg);
+            v3_emit_load_scalar_from_address(out, cap, base_reg, 8, "i32", size_reg);
         } else {
-            v3_text_appendf(out, cap, "  ldrsw x%d, [x%d]\n", size_reg, base_reg);
+            v3_emit_load_scalar_from_address(out, cap, base_reg, 0, "i32", size_reg);
         }
         v3_emit_address_spill_store(out, cap, call_arg_base, call_depth, base_reg);
         v3_emit_index_spill_store(out, cap, call_arg_base, call_depth, index_reg);
-        v3_text_appendf(out, cap, "  mov w0, w%d\n", size_reg);
-        v3_text_appendf(out, cap, "  mov w1, w%d\n", index_reg);
+        if (target_is_linux_x86_64) {
+            v3_emit_x64_prepare_edi_esi_d_d(out, cap, size_reg, index_reg);
+        } else {
+            v3_text_appendf(out, cap, "  mov w0, w%d\n", size_reg);
+            v3_text_appendf(out, cap, "  mov w1, w%d\n", index_reg);
+        }
         v3_emit_call_named_symbol(plan, out, cap, "cheng_bounds_check");
         v3_emit_address_spill_load(out, cap, call_arg_base, call_depth, base_reg);
         v3_emit_index_spill_load(out, cap, call_arg_base, call_depth, index_reg);
     }
     if (data_offset >= 0) {
-        v3_text_appendf(out, cap, "  ldr x%d, [x%d, #%d]\n", base_reg, base_reg, data_offset);
+        v3_emit_load_scalar_from_address(out, cap, base_reg, data_offset, "ptr", base_reg);
     }
     if (elem_size != 1) {
         if (!v3_emit_mov_imm(out, cap, size_reg, elem_size)) {
             return false;
         }
-        v3_text_appendf(out, cap, "  mul x%d, x%d, x%d\n", index_reg, index_reg, size_reg);
+        if (target_is_linux_x86_64) {
+            v3_text_appendf(out, cap, "  imulq %s, %s\n",
+                            v3_x64_qreg_name(size_reg),
+                            v3_x64_qreg_name(index_reg));
+        } else {
+            v3_text_appendf(out, cap, "  mul x%d, x%d, x%d\n", index_reg, index_reg, size_reg);
+        }
     }
-    v3_text_appendf(out, cap, "  add x%d, x%d, x%d\n", addr_reg, base_reg, index_reg);
+    if (target_is_linux_x86_64) {
+        if (addr_reg != base_reg) {
+            v3_text_appendf(out, cap, "  movq %s, %s\n",
+                            v3_x64_qreg_name(base_reg),
+                            v3_x64_qreg_name(addr_reg));
+        }
+        v3_text_appendf(out, cap, "  addq %s, %s\n",
+                        v3_x64_qreg_name(index_reg),
+                        v3_x64_qreg_name(addr_reg));
+    } else {
+        v3_text_appendf(out, cap, "  add x%d, x%d, x%d\n", addr_reg, base_reg, index_reg);
+    }
     if (field_type_out) {
         snprintf(field_type_out, field_type_cap, "%s", elem_type);
     }
@@ -15322,7 +16236,11 @@ static bool v3_emit_lvalue_address(const V3SystemLinkPlanStub *plan,
             return false;
         }
         if (pointer_reg != addr_reg) {
-            v3_text_appendf(out, cap, "  mov x%d, x%d\n", addr_reg, pointer_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_emit_x64_move_reg(out, cap, addr_reg, pointer_reg, "ptr");
+            } else {
+                v3_text_appendf(out, cap, "  mov x%d, x%d\n", addr_reg, pointer_reg);
+            }
         }
         return true;
     }
@@ -15949,6 +16867,18 @@ static void v3_emit_reg_to_return(char *out,
                                   size_t cap,
                                   int src_reg_index,
                                   const char *abi_class) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (v3_abi_class_word_reg(abi_class)) {
+            if (src_reg_index != 0) {
+                v3_text_appendf(out, cap, "  movl %s, %%eax\n", v3_x64_dreg_name(src_reg_index));
+            }
+        } else if (strcmp(abi_class, "i64") == 0 || strcmp(abi_class, "ptr") == 0) {
+            if (src_reg_index != 0) {
+                v3_text_appendf(out, cap, "  movq %s, %%rax\n", v3_x64_qreg_name(src_reg_index));
+            }
+        }
+        return;
+    }
     if (v3_abi_class_word_reg(abi_class)) {
         v3_text_appendf(out, cap, "  mov w0, w%d\n", src_reg_index);
     } else if (strcmp(abi_class, "i64") == 0 || strcmp(abi_class, "ptr") == 0) {
@@ -15965,6 +16895,13 @@ static bool v3_emit_sp_adjust(char *out, size_t cap, bool subtract, int32_t amou
     if (amount == 0) {
         return true;
     }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap,
+                        "  %sq $%d, %%rsp\n",
+                        subtract ? "sub" : "add",
+                        amount);
+        return true;
+    }
     if (amount <= 4095) {
         v3_text_appendf(out, cap, "  %s sp, sp, #%d\n", subtract ? "sub" : "add", amount);
         return true;
@@ -15979,6 +16916,14 @@ static bool v3_emit_sp_adjust(char *out, size_t cap, bool subtract, int32_t amou
 static bool v3_emit_sp_offset_address(char *out, size_t cap, int dst_reg, int32_t offset) {
     if (offset < 0) {
         return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        if (offset == 0) {
+            v3_text_appendf(out, cap, "  movq %%rsp, %s\n", v3_x64_qreg_name(dst_reg));
+        } else {
+            v3_text_appendf(out, cap, "  leaq %d(%%rsp), %s\n", offset, v3_x64_qreg_name(dst_reg));
+        }
+        return true;
     }
     if (offset == 0) {
         v3_text_appendf(out, cap, "  mov x%d, sp\n", dst_reg);
@@ -16003,6 +16948,18 @@ static bool v3_emit_add_address_offset(char *out,
     if (offset < 0) {
         return false;
     }
+    if (v3_active_target_is_linux_x86_64()) {
+        if (offset == 0) {
+            v3_emit_x64_move_reg(out, cap, dst_reg, src_reg, "ptr");
+        } else {
+            v3_text_appendf(out, cap,
+                            "  leaq %d(%s), %s\n",
+                            offset,
+                            v3_x64_qreg_name(src_reg),
+                            v3_x64_qreg_name(dst_reg));
+        }
+        return true;
+    }
     if (offset == 0) {
         if (dst_reg != src_reg) {
             v3_text_appendf(out, cap, "  mov x%d, x%d\n", dst_reg, src_reg);
@@ -16025,6 +16982,21 @@ static bool v3_emit_sp_store_reg(char *out,
                                  int32_t offset,
                                  const char *abi_class,
                                  int src_reg) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (strcmp(abi_class, "i8") == 0 ||
+            strcmp(abi_class, "u8") == 0 ||
+            strcmp(abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap, "  movb %s, %d(%%rsp)\n", v3_x64_breg_name(src_reg), offset);
+        } else if (strcmp(abi_class, "i16") == 0 ||
+                   strcmp(abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap, "  movw %s, %d(%%rsp)\n", v3_x64_dreg_name(src_reg), offset);
+        } else if (strcmp(abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n", v3_x64_dreg_name(src_reg), offset);
+        } else {
+            v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n", v3_x64_qreg_name(src_reg), offset);
+        }
+        return true;
+    }
     if (!v3_emit_sp_offset_address(out, cap, 16, offset)) {
         return false;
     }
@@ -16037,6 +17009,23 @@ static bool v3_emit_sp_load_reg(char *out,
                                 int32_t offset,
                                 const char *abi_class,
                                 int dst_reg) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (strcmp(abi_class, "i8") == 0) {
+            v3_text_appendf(out, cap, "  movsbq %d(%%rsp), %s\n", offset, v3_x64_qreg_name(dst_reg));
+        } else if (strcmp(abi_class, "u8") == 0 ||
+                   strcmp(abi_class, "bool") == 0) {
+            v3_text_appendf(out, cap, "  movzbl %d(%%rsp), %s\n", offset, v3_x64_dreg_name(dst_reg));
+        } else if (strcmp(abi_class, "i16") == 0) {
+            v3_text_appendf(out, cap, "  movswq %d(%%rsp), %s\n", offset, v3_x64_qreg_name(dst_reg));
+        } else if (strcmp(abi_class, "u16") == 0) {
+            v3_text_appendf(out, cap, "  movzwl %d(%%rsp), %s\n", offset, v3_x64_dreg_name(dst_reg));
+        } else if (strcmp(abi_class, "i32") == 0) {
+            v3_text_appendf(out, cap, "  movslq %d(%%rsp), %s\n", offset, v3_x64_qreg_name(dst_reg));
+        } else {
+            v3_text_appendf(out, cap, "  movq %d(%%rsp), %s\n", offset, v3_x64_qreg_name(dst_reg));
+        }
+        return true;
+    }
     if (!v3_emit_sp_offset_address(out, cap, 16, offset)) {
         return false;
     }
@@ -16045,6 +17034,20 @@ static bool v3_emit_sp_load_reg(char *out,
 }
 
 static bool v3_emit_function_epilogue(char *out, size_t cap, int32_t frame_size) {
+    if (v3_active_target_is_linux_x86_64()) {
+        if (!v3_emit_sp_adjust(out, cap, false, frame_size)) {
+            return false;
+        }
+        v3_text_append(out, cap,
+                       "  popq %r15\n"
+                       "  popq %r14\n"
+                       "  popq %r13\n"
+                       "  popq %r12\n"
+                       "  popq %rbx\n"
+                       "  popq %rbp\n"
+                       "  retq\n");
+        return true;
+    }
     int32_t save_offset = frame_size - 16;
     if (save_offset < 0) {
         return false;
@@ -17584,41 +18587,71 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
                                          15);
         }
     }
-    if (arg_count > CHENG_V3_CALL_ARG_REGS) {
-        int32_t stack_arg_bytes =
-            v3_align_up_i32((int32_t)(arg_count - CHENG_V3_CALL_ARG_REGS) * 8, 16);
-        v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
-        for (i = CHENG_V3_CALL_ARG_REGS; i < arg_count; ++i) {
-            const char *stack_abi = v3_call_arg_load_abi(&target, i);
-            int32_t stack_offset = (int32_t)(i - CHENG_V3_CALL_ARG_REGS) * 8;
-            v3_emit_call_arg_spill_load(out,
-                                        cap,
-                                        call_arg_base,
-                                        call_depth,
-                                        i,
-                                        9,
-                                        stack_abi);
-            if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
+    {
+        int call_reg_count = v3_call_arg_reg_count_for_target(plan, false);
+        if ((int)arg_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
             } else {
-                v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
+                v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
+            }
+            for (i = (size_t)call_reg_count; i < arg_count; ++i) {
+                const char *stack_abi = v3_call_arg_load_abi(&target, i);
+                int32_t stack_offset = (int32_t)(i - (size_t)call_reg_count) * 8;
+                v3_emit_call_arg_spill_load_adjusted(out,
+                                                     cap,
+                                                     call_arg_base,
+                                                     call_depth,
+                                                     i,
+                                                     9,
+                                                     stack_abi,
+                                                     v3_active_target_is_linux_x86_64()
+                                                         ? stack_arg_bytes
+                                                         : 0);
+                if (v3_active_target_is_linux_x86_64()) {
+                    if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                        v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
+                                        v3_x64_dreg_name(9),
+                                        stack_offset);
+                    } else {
+                        v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
+                                        v3_x64_qreg_name(9),
+                                        stack_offset);
+                    }
+                } else if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                    v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
+                } else {
+                    v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
+                }
             }
         }
-    }
-    for (i = 0; i < arg_count && i < CHENG_V3_CALL_ARG_REGS; ++i) {
-        v3_emit_call_arg_spill_load(out,
-                                    cap,
-                                    call_arg_base,
-                                    call_depth,
-                                    i,
-                                    (int)i,
-                                    v3_call_arg_load_abi(&target, i));
-    }
-    v3_text_appendf(out, cap, "  bl %s\n", target.symbol_name);
-    if (arg_count > CHENG_V3_CALL_ARG_REGS) {
-        int32_t stack_arg_bytes =
-            v3_align_up_i32((int32_t)(arg_count - CHENG_V3_CALL_ARG_REGS) * 8, 16);
-        v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
+        for (i = 0; i < arg_count && (int)i < call_reg_count; ++i) {
+            int dest_reg = v3_active_target_is_linux_x86_64() ?
+                           v3_x64_call_arg_virtual_reg(i, false) :
+                           (int)i;
+            v3_emit_call_arg_spill_load_adjusted(out,
+                                                 cap,
+                                                 call_arg_base,
+                                                 call_depth,
+                                                 i,
+                                                 dest_reg,
+                                                 v3_call_arg_load_abi(&target, i),
+                                                 v3_active_target_is_linux_x86_64() && (int)arg_count > call_reg_count
+                                                     ? v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16)
+                                                     : 0);
+        }
+        v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+        if ((int)arg_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
+            } else {
+                v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
+            }
+        }
     }
     if (strcmp(expected_abi, "void") != 0 &&
         strcmp(target.return_abi_class, expected_abi) != 0) {
@@ -17641,11 +18674,23 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
     if (strcmp(expected_abi, "void") != 0 && target_reg != 0) {
         if (strcmp(expected_abi, "i64") == 0 &&
             strcmp(target.return_abi_class, "i32") == 0) {
-            v3_text_appendf(out, cap, "  sxtw x%d, w0\n", target_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  movslq %%eax, %s\n", v3_x64_qreg_name(target_reg));
+            } else {
+                v3_text_appendf(out, cap, "  sxtw x%d, w0\n", target_reg);
+            }
         } else if (v3_abi_class_word_reg(expected_abi)) {
-            v3_text_appendf(out, cap, "  mov w%d, w0\n", target_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  movl %%eax, %s\n", v3_x64_dreg_name(target_reg));
+            } else {
+                v3_text_appendf(out, cap, "  mov w%d, w0\n", target_reg);
+            }
         } else {
-            v3_text_appendf(out, cap, "  mov x%d, x0\n", target_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  movq %%rax, %s\n", v3_x64_qreg_name(target_reg));
+            } else {
+                v3_text_appendf(out, cap, "  mov x%d, x0\n", target_reg);
+            }
         }
     }
     return true;
@@ -18058,67 +19103,187 @@ static bool v3_codegen_binary_expr_scalar(const V3SystemLinkPlanStub *plan,
                               call_depth,
                               target_reg,
                               expected_abi);
-    if (strcmp(op, "|") == 0) {
-        v3_text_appendf(out, cap, "  orr x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "||") == 0) {
-        v3_text_appendf(out, cap, "  orr w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "^") == 0) {
-        v3_text_appendf(out, cap, "  eor x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "&") == 0) {
-        v3_text_appendf(out, cap, "  and x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "&&") == 0) {
-        v3_text_appendf(out, cap, "  and w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "+") == 0) {
-        v3_text_appendf(out, cap, "  add x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "-") == 0) {
-        v3_text_appendf(out, cap, "  sub x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "*") == 0) {
-        v3_text_appendf(out, cap, "  mul x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, "/") == 0) {
-        v3_text_appendf(out, cap,
-                        left_is_unsigned ?
-                        "  udiv x%d, x%d, x%d\n" :
-                        "  sdiv x%d, x%d, x%d\n",
-                        target_reg,
-                        target_reg,
-                        target_reg + 1);
-    } else if (strcmp(op, "%") == 0) {
-        v3_text_appendf(out, cap,
-                        left_is_unsigned ?
-                        "  udiv x14, x%d, x%d\n"
-                        "  msub x%d, x14, x%d, x%d\n" :
-                        "  sdiv x14, x%d, x%d\n"
-                        "  msub x%d, x14, x%d, x%d\n",
-                        target_reg,
-                        target_reg + 1,
-                        target_reg,
-                        target_reg + 1,
-                        target_reg);
-    } else if (strcmp(op, "<<") == 0) {
-        v3_text_appendf(out, cap, "  lslv x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
-    } else if (strcmp(op, ">>") == 0) {
-        if (strcmp(left_abi, "i32") == 0) {
-            v3_text_appendf(out, cap, "  asrv w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
-            v3_text_appendf(out, cap, "  sxtw x%d, w%d\n", target_reg, target_reg);
-        } else if (strcmp(left_abi, "u32") == 0 ||
-                   strcmp(left_abi, "i16") == 0 ||
-                   strcmp(left_abi, "u16") == 0 ||
-                   strcmp(left_abi, "i8") == 0 ||
-                   strcmp(left_abi, "u8") == 0 ||
-                   strcmp(left_abi, "bool") == 0) {
-            v3_text_appendf(out, cap, "  lsrv w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
+    if (v3_active_target_is_linux_x86_64()) {
+        const bool wide = strcmp(expected_abi, "i64") == 0 || strcmp(expected_abi, "ptr") == 0;
+        int work_reg = target_reg;
+        if (strcmp(op, "|") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  orq %s, %s\n" : "  orl %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "||") == 0) {
+            v3_text_appendf(out, cap, "  orl %s, %s\n",
+                            v3_x64_dreg_name(target_reg + 1),
+                            v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "^") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  xorq %s, %s\n" : "  xorl %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "&") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  andq %s, %s\n" : "  andl %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "&&") == 0) {
+            v3_text_appendf(out, cap, "  andl %s, %s\n",
+                            v3_x64_dreg_name(target_reg + 1),
+                            v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "+") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  addq %s, %s\n" : "  addl %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "-") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  subq %s, %s\n" : "  subl %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "*") == 0) {
+            v3_text_appendf(out, cap,
+                            wide ? "  imulq %s, %s\n" : "  imull %s, %s\n",
+                            wide ? v3_x64_qreg_name(target_reg + 1) : v3_x64_dreg_name(target_reg + 1),
+                            wide ? v3_x64_qreg_name(target_reg) : v3_x64_dreg_name(target_reg));
+        } else if (strcmp(op, "/") == 0 || strcmp(op, "%") == 0) {
+            if (wide) {
+                v3_text_appendf(out, cap, "  movq %s, %s\n",
+                                v3_x64_qreg_name(target_reg + 1),
+                                v3_x64_qreg_name(17));
+                if (target_reg != 0) {
+                    v3_text_appendf(out, cap, "  movq %s, %%rax\n", v3_x64_qreg_name(target_reg));
+                }
+                if (left_is_unsigned) {
+                    v3_text_append(out, cap, "  xorl %edx, %edx\n");
+                    v3_text_appendf(out, cap, "  divq %s\n", v3_x64_qreg_name(17));
+                } else {
+                    v3_text_append(out, cap, "  cqto\n");
+                    v3_text_appendf(out, cap, "  idivq %s\n", v3_x64_qreg_name(17));
+                }
+                if (strcmp(op, "/") == 0) {
+                    if (target_reg != 0) {
+                        v3_text_appendf(out, cap, "  movq %%rax, %s\n", v3_x64_qreg_name(target_reg));
+                    }
+                } else if (target_reg != 2) {
+                    v3_text_appendf(out, cap, "  movq %%rdx, %s\n", v3_x64_qreg_name(target_reg));
+                }
+            } else {
+                v3_text_appendf(out, cap, "  movl %s, %s\n",
+                                v3_x64_dreg_name(target_reg + 1),
+                                v3_x64_dreg_name(17));
+                if (target_reg != 0) {
+                    v3_text_appendf(out, cap, "  movl %s, %%eax\n", v3_x64_dreg_name(target_reg));
+                }
+                if (left_is_unsigned) {
+                    v3_text_append(out, cap, "  xorl %edx, %edx\n");
+                    v3_text_appendf(out, cap, "  divl %s\n", v3_x64_dreg_name(17));
+                } else {
+                    v3_text_append(out, cap, "  cdq\n");
+                    v3_text_appendf(out, cap, "  idivl %s\n", v3_x64_dreg_name(17));
+                }
+                if (strcmp(op, "/") == 0) {
+                    if (target_reg != 0) {
+                        v3_text_appendf(out, cap, "  movl %%eax, %s\n", v3_x64_dreg_name(target_reg));
+                    }
+                } else if (target_reg != 2) {
+                    v3_text_appendf(out, cap, "  movl %%edx, %s\n", v3_x64_dreg_name(target_reg));
+                }
+            }
+        } else if (strcmp(op, "<<") == 0 || strcmp(op, ">>") == 0) {
+            if (target_reg == 3) {
+                v3_emit_x64_move_reg(out, cap, 16, target_reg, wide ? "i64" : "i32");
+                work_reg = 16;
+            }
+            v3_text_appendf(out, cap, "  movl %s, %%ecx\n", v3_x64_dreg_name(target_reg + 1));
+            if (strcmp(op, "<<") == 0) {
+                v3_text_appendf(out, cap,
+                                wide ? "  shlq %%cl, %s\n" : "  shll %%cl, %s\n",
+                                wide ? v3_x64_qreg_name(work_reg) : v3_x64_dreg_name(work_reg));
+            } else if (strcmp(left_abi, "i32") == 0) {
+                v3_text_appendf(out, cap, "  sarl %%cl, %s\n", v3_x64_dreg_name(work_reg));
+                v3_text_appendf(out, cap, "  movslq %s, %s\n",
+                                v3_x64_dreg_name(work_reg),
+                                v3_x64_qreg_name(work_reg));
+            } else if (strcmp(left_abi, "u32") == 0 ||
+                       strcmp(left_abi, "i16") == 0 ||
+                       strcmp(left_abi, "u16") == 0 ||
+                       strcmp(left_abi, "i8") == 0 ||
+                       strcmp(left_abi, "u8") == 0 ||
+                       strcmp(left_abi, "bool") == 0) {
+                v3_text_appendf(out, cap, "  shrl %%cl, %s\n", v3_x64_dreg_name(work_reg));
+            } else {
+                v3_text_appendf(out, cap,
+                                left_is_unsigned ? "  shrq %%cl, %s\n" : "  sarq %%cl, %s\n",
+                                v3_x64_qreg_name(work_reg));
+            }
+            if (work_reg != target_reg) {
+                v3_emit_x64_move_reg(out, cap, target_reg, work_reg, wide ? "i64" : "i32");
+            }
         } else {
-            v3_text_appendf(out,
-                            cap,
+            return false;
+        }
+    } else {
+        if (strcmp(op, "|") == 0) {
+            v3_text_appendf(out, cap, "  orr x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "||") == 0) {
+            v3_text_appendf(out, cap, "  orr w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "^") == 0) {
+            v3_text_appendf(out, cap, "  eor x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "&") == 0) {
+            v3_text_appendf(out, cap, "  and x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "&&") == 0) {
+            v3_text_appendf(out, cap, "  and w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "+") == 0) {
+            v3_text_appendf(out, cap, "  add x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "-") == 0) {
+            v3_text_appendf(out, cap, "  sub x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "*") == 0) {
+            v3_text_appendf(out, cap, "  mul x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, "/") == 0) {
+            v3_text_appendf(out, cap,
                             left_is_unsigned ?
-                            "  lsrv x%d, x%d, x%d\n" :
-                            "  asrv x%d, x%d, x%d\n",
+                            "  udiv x%d, x%d, x%d\n" :
+                            "  sdiv x%d, x%d, x%d\n",
                             target_reg,
                             target_reg,
                             target_reg + 1);
+        } else if (strcmp(op, "%") == 0) {
+            v3_text_appendf(out, cap,
+                            left_is_unsigned ?
+                            "  udiv x14, x%d, x%d\n"
+                            "  msub x%d, x14, x%d, x%d\n" :
+                            "  sdiv x14, x%d, x%d\n"
+                            "  msub x%d, x14, x%d, x%d\n",
+                            target_reg,
+                            target_reg + 1,
+                            target_reg,
+                            target_reg + 1,
+                            target_reg);
+        } else if (strcmp(op, "<<") == 0) {
+            v3_text_appendf(out, cap, "  lslv x%d, x%d, x%d\n", target_reg, target_reg, target_reg + 1);
+        } else if (strcmp(op, ">>") == 0) {
+            if (strcmp(left_abi, "i32") == 0) {
+                v3_text_appendf(out, cap, "  asrv w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
+                v3_text_appendf(out, cap, "  sxtw x%d, w%d\n", target_reg, target_reg);
+            } else if (strcmp(left_abi, "u32") == 0 ||
+                       strcmp(left_abi, "i16") == 0 ||
+                       strcmp(left_abi, "u16") == 0 ||
+                       strcmp(left_abi, "i8") == 0 ||
+                       strcmp(left_abi, "u8") == 0 ||
+                       strcmp(left_abi, "bool") == 0) {
+                v3_text_appendf(out, cap, "  lsrv w%d, w%d, w%d\n", target_reg, target_reg, target_reg + 1);
+            } else {
+                v3_text_appendf(out,
+                                cap,
+                                left_is_unsigned ?
+                                "  lsrv x%d, x%d, x%d\n" :
+                                "  asrv x%d, x%d, x%d\n",
+                                target_reg,
+                                target_reg,
+                                target_reg + 1);
+            }
+        } else {
+            return false;
         }
-    } else {
-        return false;
     }
     return true;
 }
@@ -18260,17 +19425,31 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
                                                         cap)) {
             return false;
         }
-        if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 0) ||
-            !v3_emit_slot_address(out, cap, &right_scratch_slot, 1)) {
+        if (v3_active_target_is_linux_x86_64()) {
+            if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 14) ||
+                !v3_emit_slot_address(out, cap, &right_scratch_slot, 15)) {
+                return false;
+            }
+        } else if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 0) ||
+                   !v3_emit_slot_address(out, cap, &right_scratch_slot, 1)) {
             return false;
         }
         if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
             v3_emit_call_named_symbol(plan, out, cap, "driver_c_str_eq_bridge");
-            v3_text_appendf(out, cap,
-                            "  cmp w0, #0\n"
-                            "  cset w%d, %s\n",
-                            target_reg,
-                            strcmp(op, "==") == 0 ? "ne" : "eq");
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_emit_x64_cmp_zero_set_bool(out,
+                                              cap,
+                                              0,
+                                              target_reg,
+                                              false,
+                                              strcmp(op, "==") == 0 ? "ne" : "eq");
+            } else {
+                v3_text_appendf(out, cap,
+                                "  cmp w0, #0\n"
+                                "  cset w%d, %s\n",
+                                target_reg,
+                                strcmp(op, "==") == 0 ? "ne" : "eq");
+            }
             return true;
         } else if (strcmp(op, "<") == 0) {
             cond = "lt";
@@ -18283,15 +19462,25 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
         } else {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  ldr x0, [x0, #0]\n"
-                        "  ldr x1, [x1, #0]\n");
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap,
+                           "  movq 0(%rax), %rdi\n"
+                           "  movq 0(%rbx), %rsi\n");
+        } else {
+            v3_text_appendf(out, cap,
+                            "  ldr x0, [x0, #0]\n"
+                            "  ldr x1, [x1, #0]\n");
+        }
         v3_emit_call_named_symbol(plan, out, cap, "cheng_strcmp");
-        v3_text_appendf(out, cap,
-                        "  cmp w0, #0\n"
-                        "  cset w%d, %s\n",
-                        target_reg,
-                        cond);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_zero_set_bool(out, cap, 0, target_reg, false, cond);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp w0, #0\n"
+                            "  cset w%d, %s\n",
+                            target_reg,
+                            cond);
+        }
         return true;
     }
     if (strcmp(left_abi, "ptr") == 0 && strcmp(right_abi, "ptr") == 0) {
@@ -18368,21 +19557,29 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
         return false;
     }
     if (compare_wide) {
-        v3_text_appendf(out, cap,
-                        "  cmp x%d, x%d\n"
-                        "  cset w%d, %s\n",
-                        target_reg,
-                        target_reg + 1,
-                        target_reg,
-                        cond);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_regs_set_bool(out, cap, target_reg, target_reg + 1, target_reg, true, cond);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp x%d, x%d\n"
+                            "  cset w%d, %s\n",
+                            target_reg,
+                            target_reg + 1,
+                            target_reg,
+                            cond);
+        }
     } else {
-        v3_text_appendf(out, cap,
-                        "  cmp w%d, w%d\n"
-                        "  cset w%d, %s\n",
-                        target_reg,
-                        target_reg + 1,
-                        target_reg,
-                        cond);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_regs_set_bool(out, cap, target_reg, target_reg + 1, target_reg, false, cond);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp w%d, w%d\n"
+                            "  cset w%d, %s\n",
+                            target_reg,
+                            target_reg + 1,
+                            target_reg,
+                            cond);
+        }
     }
     return true;
 }
@@ -18588,7 +19785,7 @@ static bool v3_codegen_intrinsic_len_expr(const V3SystemLinkPlanStub *plan,
         } else {
             return false;
         }
-        v3_text_appendf(out, cap, "  ldrsw x%d, [x15, #%d]\n", target_reg, offset);
+        v3_emit_load_scalar_from_address(out, cap, 15, offset, "i32", target_reg);
         return true;
     }
     local_index = v3_find_local_slot(locals, local_count, trimmed);
@@ -18605,7 +19802,7 @@ static bool v3_codegen_intrinsic_len_expr(const V3SystemLinkPlanStub *plan,
         if (!v3_emit_local_value_address(out, cap, &locals[local_index], 15)) {
             return false;
         }
-        v3_text_appendf(out, cap, "  ldrsw x%d, [x15, #%d]\n", target_reg, offset);
+        v3_emit_load_scalar_from_address(out, cap, 15, offset, "i32", target_reg);
         return true;
     }
     if (!v3_infer_expr_type(plan,
@@ -18746,9 +19943,17 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
             return false;
         }
         if (strcmp(inner_abi, "i64") == 0) {
-            v3_text_appendf(out, cap, "  neg x%d, x%d\n", target_reg, target_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  negq %s\n", v3_x64_qreg_name(target_reg));
+            } else {
+                v3_text_appendf(out, cap, "  neg x%d, x%d\n", target_reg, target_reg);
+            }
         } else {
-            v3_text_appendf(out, cap, "  neg w%d, w%d\n", target_reg, target_reg);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  negl %s\n", v3_x64_dreg_name(target_reg));
+            } else {
+                v3_text_appendf(out, cap, "  neg w%d, w%d\n", target_reg, target_reg);
+            }
         }
         return v3_emit_scalar_cast_reg(out,
                                        cap,
@@ -18840,7 +20045,7 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
             return false;
         }
         if (strcmp(pointee_type, "char") == 0) {
-            v3_text_appendf(out, cap, "  ldrb w%d, [x%d, #0]\n", target_reg, target_reg);
+            v3_emit_load_scalar_from_address(out, cap, target_reg, 0, "u8", target_reg);
             return true;
         }
         v3_emit_load_scalar_from_address(out, cap, target_reg, 0, pointee_abi, target_reg);
@@ -18876,11 +20081,15 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
         }
         snprintf(false_label, sizeof(false_label), "L_v3_ifexpr_false_%d", label_id);
         snprintf(end_label, sizeof(end_label), "L_v3_ifexpr_end_%d", label_id);
-        v3_text_appendf(out, cap,
-                        "  cmp w%d, #0\n"
-                        "  b.eq %s\n",
-                        target_reg,
-                        false_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_branch_zero(out, cap, target_reg, false, true, false_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp w%d, #0\n"
+                            "  b.eq %s\n",
+                            target_reg,
+                            false_label);
+        }
         if (!v3_codegen_expr_scalar(plan,
                                     lowering,
                                     current_function,
@@ -18899,11 +20108,19 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                     cap)) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  b %s\n"
-                        "%s:\n",
-                        end_label,
-                        false_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap,
+                            "  jmp %s\n"
+                            "%s:\n",
+                            end_label,
+                            false_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  b %s\n"
+                            "%s:\n",
+                            end_label,
+                            false_label);
+        }
         if (!v3_codegen_expr_scalar(plan,
                                     lowering,
                                     current_function,
@@ -18955,11 +20172,15 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
         }
         snprintf(false_label, sizeof(false_label), "L_v3_expr_false_%d", label_id);
         snprintf(end_label, sizeof(end_label), "L_v3_expr_end_%d", label_id);
-        v3_text_appendf(out, cap,
-                        "  cmp w%d, #0\n"
-                        "  b.eq %s\n",
-                        target_reg,
-                        false_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_branch_zero(out, cap, target_reg, false, true, false_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp w%d, #0\n"
+                            "  b.eq %s\n",
+                            target_reg,
+                            false_label);
+        }
         if (!v3_codegen_expr_scalar(plan,
                                     lowering,
                                     current_function,
@@ -18978,11 +20199,19 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                     cap)) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  b %s\n"
-                        "%s:\n",
-                        end_label,
-                        false_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap,
+                            "  jmp %s\n"
+                            "%s:\n",
+                            end_label,
+                            false_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  b %s\n"
+                            "%s:\n",
+                            end_label,
+                            false_label);
+        }
         if (!v3_codegen_expr_scalar(plan,
                                     lowering,
                                     current_function,
@@ -19008,14 +20237,22 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                       locals, local_count, expr, "||", "bool", target_reg,
                                       call_arg_base, string_temp_base, string_temp_stride, call_depth,
                                       out, cap)) {
-        v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, ne\n", target_reg, target_reg);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_zero_set_bool(out, cap, target_reg, target_reg, false, "ne");
+        } else {
+            v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, ne\n", target_reg, target_reg);
+        }
         return true;
     }
     if (v3_codegen_binary_expr_scalar(plan, lowering, current_function, aliases, alias_count,
                                       locals, local_count, expr, "&&", "bool", target_reg,
                                       call_arg_base, string_temp_base, string_temp_stride, call_depth,
                                       out, cap)) {
-        v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, ne\n", target_reg, target_reg);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_zero_set_bool(out, cap, target_reg, target_reg, false, "ne");
+        } else {
+            v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, ne\n", target_reg, target_reg);
+        }
         return true;
     }
     if (v3_codegen_compare_expr_scalar(plan, lowering, current_function, aliases, alias_count,
@@ -19123,7 +20360,11 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                     cap)) {
             return false;
         }
-        v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_x64_cmp_zero_set_bool(out, cap, target_reg, target_reg, false, "eq");
+        } else {
+            v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+        }
         return true;
     }
     if (v3_parse_index_access_expr(expr, base_expr, sizeof(base_expr), index_expr, sizeof(index_expr))) {
@@ -19166,7 +20407,7 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
             return false;
         }
         if (strcmp(base_type, "Bytes") == 0 || strcmp(base_type, "str") == 0 || strcmp(field_type, "char") == 0) {
-            v3_text_appendf(out, cap, "  ldrb w%d, [x15, #0]\n", target_reg);
+            v3_emit_load_scalar_from_address(out, cap, 15, 0, "u8", target_reg);
         } else {
             v3_emit_load_scalar_from_address(out, cap, 15, 0, field_abi, target_reg);
         }
@@ -19246,9 +20487,13 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                               sizeof(field_abi))) {
                 return false;
             }
-            v3_text_appendf(out, cap, "  ldr w%d, [x15, #0]\n", target_reg);
+            v3_emit_load_scalar_from_address(out, cap, 15, 0, "i32", target_reg);
             if (result_kind == V3_RESULT_INTRINSIC_IS_ERR) {
-                v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+                if (v3_active_target_is_linux_x86_64()) {
+                    v3_emit_x64_cmp_zero_set_bool(out, cap, target_reg, target_reg, false, "eq");
+                } else {
+                    v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+                }
             }
             return true;
         }
@@ -19514,9 +20759,13 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
                                               sizeof(field_abi))) {
                 return false;
             }
-            v3_text_appendf(out, cap, "  ldr w%d, [x15, #0]\n", target_reg);
+            v3_emit_load_scalar_from_address(out, cap, 15, 0, "i32", target_reg);
             if (result_kind == V3_RESULT_INTRINSIC_IS_ERR) {
-                v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+                if (v3_active_target_is_linux_x86_64()) {
+                    v3_emit_x64_cmp_zero_set_bool(out, cap, target_reg, target_reg, false, "eq");
+                } else {
+                    v3_text_appendf(out, cap, "  cmp w%d, #0\n  cset w%d, eq\n", target_reg, target_reg);
+                }
             }
             return true;
         }
@@ -20164,46 +21413,76 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                          15);
         }
     }
-    v3_emit_call_dest_spill_load(out,
-                                 cap,
-                                 call_arg_base,
-                                 call_depth,
-                                 8);
-    if (arg_count > CHENG_V3_CALL_ARG_REGS) {
-        int32_t stack_arg_bytes =
-            v3_align_up_i32((int32_t)(arg_count - CHENG_V3_CALL_ARG_REGS) * 8, 16);
-        v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
-        for (i = CHENG_V3_CALL_ARG_REGS; i < arg_count; ++i) {
-            const char *stack_abi = v3_call_arg_load_abi(&target, i);
-            int32_t stack_offset = (int32_t)(i - CHENG_V3_CALL_ARG_REGS) * 8;
-            v3_emit_call_arg_spill_load(out,
-                                        cap,
-                                        call_arg_base,
-                                        call_depth,
-                                        i,
-                                        9,
-                                        stack_abi);
-            if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
+    {
+        int call_reg_count = v3_call_arg_reg_count_for_target(plan, true);
+        v3_emit_call_dest_spill_load(out,
+                                     cap,
+                                     call_arg_base,
+                                     call_depth,
+                                     v3_active_target_is_linux_x86_64() ? 14 : 8);
+        if ((int)arg_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
             } else {
-                v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
+                v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
+            }
+            for (i = (size_t)call_reg_count; i < arg_count; ++i) {
+                const char *stack_abi = v3_call_arg_load_abi(&target, i);
+                int32_t stack_offset = (int32_t)(i - (size_t)call_reg_count) * 8;
+                v3_emit_call_arg_spill_load_adjusted(out,
+                                                     cap,
+                                                     call_arg_base,
+                                                     call_depth,
+                                                     i,
+                                                     9,
+                                                     stack_abi,
+                                                     v3_active_target_is_linux_x86_64()
+                                                         ? stack_arg_bytes
+                                                         : 0);
+                if (v3_active_target_is_linux_x86_64()) {
+                    if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                        v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
+                                        v3_x64_dreg_name(9),
+                                        stack_offset);
+                    } else {
+                        v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
+                                        v3_x64_qreg_name(9),
+                                        stack_offset);
+                    }
+                } else if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                    v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
+                } else {
+                    v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
+                }
             }
         }
-    }
-    for (i = 0; i < arg_count && i < CHENG_V3_CALL_ARG_REGS; ++i) {
-        v3_emit_call_arg_spill_load(out,
-                                    cap,
-                                    call_arg_base,
-                                    call_depth,
-                                    i,
-                                    (int)i,
-                                    v3_call_arg_load_abi(&target, i));
-    }
-    v3_text_appendf(out, cap, "  bl %s\n", target.symbol_name);
-    if (arg_count > CHENG_V3_CALL_ARG_REGS) {
-        int32_t stack_arg_bytes =
-            v3_align_up_i32((int32_t)(arg_count - CHENG_V3_CALL_ARG_REGS) * 8, 16);
-        v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
+        for (i = 0; i < arg_count && (int)i < call_reg_count; ++i) {
+            int dest_reg = v3_active_target_is_linux_x86_64() ?
+                           v3_x64_call_arg_virtual_reg(i, true) :
+                           (int)i;
+            v3_emit_call_arg_spill_load_adjusted(out,
+                                                 cap,
+                                                 call_arg_base,
+                                                 call_depth,
+                                                 i,
+                                                 dest_reg,
+                                                 v3_call_arg_load_abi(&target, i),
+                                                 v3_active_target_is_linux_x86_64() && (int)arg_count > call_reg_count
+                                                     ? v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16)
+                                                     : 0);
+        }
+        v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+        if ((int)arg_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
+            } else {
+                v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
+            }
+        }
     }
     return true;
 }
@@ -20402,10 +21681,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         }
         snprintf(false_label, sizeof(false_label), "L_v3_ifcexpr_false_%d", label_id);
         snprintf(end_label, sizeof(end_label), "L_v3_ifcexpr_end_%d", label_id);
-        v3_text_appendf(out, cap,
-                        "  cmp w9, #0\n"
-                        "  b.eq %s\n",
-                        false_label);
+        v3_emit_branch_zero(out, cap, 9, false, false_label);
         v3_emit_call_dest_spill_load(out,
                                      cap,
                                      call_arg_base,
@@ -20430,11 +21706,8 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                         cap)) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  b %s\n"
-                        "%s:\n",
-                        end_label,
-                        false_label);
+        v3_emit_jump_label(out, cap, end_label);
+        v3_text_appendf(out, cap, "%s:\n", false_label);
         v3_emit_call_dest_spill_load(out,
                                      cap,
                                      call_arg_base,
@@ -20497,10 +21770,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         }
         snprintf(false_label, sizeof(false_label), "L_v3_cexpr_false_%d", label_id);
         snprintf(end_label, sizeof(end_label), "L_v3_cexpr_end_%d", label_id);
-        v3_text_appendf(out, cap,
-                        "  cmp w9, #0\n"
-                        "  b.eq %s\n",
-                        false_label);
+        v3_emit_branch_zero(out, cap, 9, false, false_label);
         v3_emit_call_dest_spill_load(out,
                                      cap,
                                      call_arg_base,
@@ -20525,11 +21795,8 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                         cap)) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  b %s\n"
-                        "%s:\n",
-                        end_label,
-                        false_label);
+        v3_emit_jump_label(out, cap, end_label);
+        v3_text_appendf(out, cap, "%s:\n", false_label);
         v3_emit_call_dest_spill_load(out,
                                      cap,
                                      call_arg_base,
@@ -20634,15 +21901,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                             call_depth + 1,
                                                             out,
                                                             cap) ||
-                !v3_emit_slot_address(out, cap, &left_slot, 0) ||
-                !v3_emit_slot_address(out, cap, &right_slot, 1)) {
+                !(v3_active_target_is_linux_x86_64()
+                      ? (v3_emit_slot_address(out, cap, &left_slot, 15) &&
+                         v3_emit_slot_address(out, cap, &right_slot, 2))
+                      : (v3_emit_slot_address(out, cap, &left_slot, 0) &&
+                         v3_emit_slot_address(out, cap, &right_slot, 1)))) {
                 return false;
             }
             v3_emit_call_dest_spill_load(out,
                                          cap,
                                          call_arg_base,
                                          call_depth,
-                                         8);
+                                         v3_active_target_is_linux_x86_64() ? 14 : 8);
             v3_emit_call_named_symbol(plan, out, cap, "driver_c_str_concat_bridge");
             return true;
         }
@@ -20658,7 +21928,20 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         char elem_abi[32];
         int32_t elem_size = 0;
         int32_t fixed_len = 0;
+        int scalar_value_reg = 9;
         int buffer_reg = dest_addr_reg == 14 ? 13 : 14;
+        if (v3_active_target_is_linux_x86_64()) {
+            if (dest_addr_reg == scalar_value_reg) {
+                scalar_value_reg = 10;
+            }
+            buffer_reg = 10;
+            if (buffer_reg == dest_addr_reg || buffer_reg == scalar_value_reg) {
+                buffer_reg = 11;
+            }
+            if (buffer_reg == dest_addr_reg || buffer_reg == scalar_value_reg) {
+                buffer_reg = 8;
+            }
+        }
         int elem_addr_reg = dest_addr_reg == 15 ? 14 : 15;
         size_t i;
         if (v3_parse_fixed_array_type(normalized_dest_type,
@@ -20722,7 +22005,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                 local_count,
                                                 args[i],
                                                 elem_abi,
-                                                9,
+                                                scalar_value_reg,
                                                 call_arg_base,
                                                 string_temp_base,
                                                 string_temp_stride,
@@ -20731,12 +22014,21 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                 cap)) {
                         return false;
                     }
-                    v3_emit_store_scalar_to_address(out, cap, dest_addr_reg, elem_offset, elem_abi, 9);
+                    v3_emit_store_scalar_to_address(out,
+                                                    cap,
+                                                    dest_addr_reg,
+                                                    elem_offset,
+                                                    elem_abi,
+                                                    scalar_value_reg);
                     continue;
                 }
                 if (elem_offset == 0) {
                     if (elem_addr_reg != dest_addr_reg) {
-                        v3_text_appendf(out, cap, "  mov x%d, x%d\n", elem_addr_reg, dest_addr_reg);
+                        if (v3_active_target_is_linux_x86_64()) {
+                            v3_emit_x64_move_reg(out, cap, elem_addr_reg, dest_addr_reg, "ptr");
+                        } else {
+                            v3_text_appendf(out, cap, "  mov x%d, x%d\n", elem_addr_reg, dest_addr_reg);
+                        }
                     }
                 } else if (!v3_emit_add_address_offset(out,
                                                        cap,
@@ -20785,13 +22077,9 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         if (!v3_emit_mov_imm(out, cap, 9, (int64_t)arg_count)) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  str w9, [x%d, #0]\n"
-                        "  str w9, [x%d, #4]\n"
-                        "  str x0, [x%d, #8]\n",
-                        dest_addr_reg,
-                        dest_addr_reg,
-                        dest_addr_reg);
+        v3_emit_store_scalar_to_address(out, cap, dest_addr_reg, 0, "i32", 9);
+        v3_emit_store_scalar_to_address(out, cap, dest_addr_reg, 4, "i32", 9);
+        v3_emit_store_scalar_to_address(out, cap, dest_addr_reg, 8, "ptr", 0);
         v3_emit_call_dest_spill_store(out,
                                       cap,
                                       call_arg_base,
@@ -20819,7 +22107,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                             local_count,
                                             args[i],
                                             elem_abi,
-                                            9,
+                                            scalar_value_reg,
                                             call_arg_base,
                                             string_temp_base,
                                             string_temp_stride,
@@ -20833,8 +22121,13 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                              call_arg_base,
                                              call_depth,
                                              dest_addr_reg);
-                v3_text_appendf(out, cap, "  ldr x%d, [x%d, #8]\n", buffer_reg, dest_addr_reg);
-                v3_emit_store_scalar_to_address(out, cap, buffer_reg, elem_offset, elem_abi, 9);
+                v3_emit_load_scalar_from_address(out, cap, dest_addr_reg, 8, "ptr", buffer_reg);
+                v3_emit_store_scalar_to_address(out,
+                                                cap,
+                                                buffer_reg,
+                                                elem_offset,
+                                                elem_abi,
+                                                scalar_value_reg);
                 continue;
             }
             v3_emit_call_dest_spill_load(out,
@@ -20842,9 +22135,16 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                          call_arg_base,
                                          call_depth,
                                          dest_addr_reg);
-            v3_text_appendf(out, cap, "  ldr x%d, [x%d, #8]\n", buffer_reg, dest_addr_reg);
+            v3_emit_load_scalar_from_address(out, cap, dest_addr_reg, 8, "ptr", buffer_reg);
             if (elem_offset == 0) {
-                v3_text_appendf(out, cap, "  mov x15, x%d\n", buffer_reg);
+                if (v3_active_target_is_linux_x86_64()) {
+                    v3_text_appendf(out, cap,
+                                    "  movq %s, %s\n",
+                                    v3_x64_qreg_name(buffer_reg),
+                                    v3_x64_qreg_name(15));
+                } else {
+                    v3_text_appendf(out, cap, "  mov x15, x%d\n", buffer_reg);
+                }
             } else if (!v3_emit_add_address_offset(out, cap, 15, buffer_reg, elem_offset)) {
                 return false;
             }
@@ -21517,10 +22817,15 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                    strcmp(field_abi, "composite") != 0) {
             return false;
         }
-        v3_text_appendf(out, cap,
-                        "  ldrsw x10, [x15, #0]\n"
-                        "  mov x0, x15\n"
-                        "  mov x1, x10\n");
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_emit_load_scalar_from_address(out, cap, 15, 0, "i32", 10);
+            v3_emit_x64_prepare_rdi_esi_q_d(out, cap, 15, 10);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  ldrsw x10, [x15, #0]\n"
+                            "  mov x0, x15\n"
+                            "  mov x1, x10\n");
+        }
         if (!v3_emit_mov_imm(out, cap, 2, elem_size)) {
             return false;
         }
@@ -21591,6 +22896,9 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
             if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
                 return false;
             }
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_append(out, cap, "  movq %rax, %rdi\n");
+            }
             v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
             return true;
         }
@@ -21626,6 +22934,9 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                         out,
                                         cap)) {
                 return false;
+            }
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_append(out, cap, "  movq %rax, %rdi\n");
             }
             v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
             return true;
@@ -21707,9 +23018,16 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                 return false;
             }
         }
-        v3_text_appendf(out, cap,
-                        "  mov x0, x15\n");
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(15));
+        } else {
+            v3_text_appendf(out, cap,
+                            "  mov x0, x15\n");
+        }
         v3_emit_call_named_symbol(plan, out, cap, "cheng_str_to_cstring_temp_bridge");
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap, "  movq %rax, %rdi\n");
+        }
         v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
         return true;
     }
@@ -21731,6 +23049,9 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
         }
         if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
             return false;
+        }
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap, "  movq %rax, %rdi\n");
         }
         v3_emit_call_named_symbol(plan, out, cap, "puts");
         return true;
@@ -21761,10 +23082,7 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
             return false;
         }
         snprintf(ok_label, sizeof(ok_label), "L_v3_assert_ok_%d", label_id);
-        v3_text_appendf(out, cap,
-                        "  cmp w9, #0\n"
-                        "  b.ne %s\n",
-                        ok_label);
+        v3_emit_branch_nonzero(out, cap, 9, false, ok_label);
         if (arg_count == 2U) {
             if (!v3_parse_string_literal_text(args[1], literal, sizeof(literal))) {
                 return false;
@@ -21784,6 +23102,9 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
         }
         if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
             return false;
+        }
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap, "  movq %rax, %rdi\n");
         }
         v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
         v3_text_appendf(out, cap, "%s:\n", ok_label);
@@ -23268,7 +24589,7 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
         if (!label) {
             return false;
         }
-        v3_text_appendf(out, cap, "  b %s\n", label);
+        v3_emit_jump_label(out, cap, label);
         *terminated_out = true;
         return true;
     }
@@ -23277,7 +24598,7 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
         if (!label) {
             return false;
         }
-        v3_text_appendf(out, cap, "  b %s\n", label);
+        v3_emit_jump_label(out, cap, label);
         *terminated_out = true;
         return true;
     }
@@ -23787,10 +25108,7 @@ static bool v3_emit_if_statement(const V3SystemLinkPlanStub *plan,
                         cond);
                 return false;
             }
-            v3_text_appendf(out, cap,
-                            "  cmp w9, #0\n"
-                            "  b.eq %s\n",
-                            next_label);
+            v3_emit_branch_zero(out, cap, 9, false, next_label);
         } else {
             next_label[0] = '\0';
         }
@@ -23996,7 +25314,7 @@ static bool v3_emit_if_statement(const V3SystemLinkPlanStub *plan,
             }
         }
         if (!is_else && !branch_terminated) {
-            v3_text_appendf(out, cap, "  b %s\n", end_label);
+            v3_emit_jump_label(out, cap, end_label);
         }
         if (!is_else) {
             v3_text_appendf(out, cap, "%s:\n", next_label);
@@ -24064,10 +25382,7 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                 cap)) {
         return false;
     }
-    v3_text_appendf(out, cap,
-                    "  cmp w9, #0\n"
-                    "  b.eq %s\n",
-                    end_label);
+    v3_emit_branch_zero(out, cap, 9, false, end_label);
     if (inline_stmt[0] != '\0') {
         if (v3_startswith(inline_stmt, "if ") ||
             v3_startswith(inline_stmt, "while ") ||
@@ -24095,7 +25410,7 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
             v3_pop_loop_labels();
             return false;
         }
-        v3_text_appendf(out, cap, "  b %s\n", start_label);
+        v3_emit_jump_label(out, cap, start_label);
         v3_text_appendf(out, cap, "%s:\n", end_label);
         v3_pop_loop_labels();
         return true;
@@ -24226,7 +25541,7 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
             return false;
         }
     }
-    v3_text_appendf(out, cap, "  b %s\n", start_label);
+    v3_emit_jump_label(out, cap, start_label);
     v3_text_appendf(out, cap, "%s:\n", end_label);
     v3_pop_loop_labels();
     return true;
@@ -24327,10 +25642,19 @@ static bool v3_emit_case_const_table_statement(const V3SystemLinkPlanStub *plan,
             if (!v3_emit_mov_imm(out, cap, 10, match_value)) {
                 return false;
             }
-            v3_text_appendf(out, cap,
-                            "  cmp x9, x10\n"
-                            "  b.ne %s\n",
-                            next_label);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap,
+                                "  cmpq %s, %s\n"
+                                "  jne %s\n",
+                                v3_x64_qreg_name(10),
+                                v3_x64_qreg_name(9),
+                                next_label);
+            } else {
+                v3_text_appendf(out, cap,
+                                "  cmp x9, x10\n"
+                                "  b.ne %s\n",
+                                next_label);
+            }
         } else {
             saw_else = true;
             next_label[0] = '\0';
@@ -24364,7 +25688,9 @@ static bool v3_emit_case_const_table_statement(const V3SystemLinkPlanStub *plan,
             all_arms_terminated = false;
         }
         if (!branch_terminated) {
-            v3_text_appendf(out, cap, "  b %s\n", end_label);
+            v3_text_appendf(out, cap,
+                            v3_active_target_is_linux_x86_64() ? "  jmp %s\n" : "  b %s\n",
+                            end_label);
         }
         if (!is_else) {
             v3_text_appendf(out, cap, "%s:\n", next_label);
@@ -24492,15 +25818,33 @@ static bool v3_emit_for_statement(const V3SystemLinkPlanStub *plan,
         return false;
     }
     if (end_inclusive) {
-        v3_text_appendf(out, cap,
-                        "  cmp x9, x10\n"
-                        "  b.gt %s\n",
-                        end_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap,
+                            "  cmpq %s, %s\n"
+                            "  jg %s\n",
+                            v3_x64_qreg_name(10),
+                            v3_x64_qreg_name(9),
+                            end_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp x9, x10\n"
+                            "  b.gt %s\n",
+                            end_label);
+        }
     } else {
-        v3_text_appendf(out, cap,
-                        "  cmp x9, x10\n"
-                        "  b.ge %s\n",
-                        end_label);
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap,
+                            "  cmpq %s, %s\n"
+                            "  jge %s\n",
+                            v3_x64_qreg_name(10),
+                            v3_x64_qreg_name(9),
+                            end_label);
+        } else {
+            v3_text_appendf(out, cap,
+                            "  cmp x9, x10\n"
+                            "  b.ge %s\n",
+                            end_label);
+        }
     }
     if (inline_stmt[0] != '\0') {
         if (v3_startswith(inline_stmt, "if ") ||
@@ -24539,9 +25883,13 @@ static bool v3_emit_for_statement(const V3SystemLinkPlanStub *plan,
         }
         v3_text_appendf(out, cap, "%s:\n", continue_label);
         v3_emit_load_slot(out, cap, &locals[iter_local_index], 9);
-        v3_text_appendf(out, cap, "  add x9, x9, #1\n");
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_appendf(out, cap, "  addq $1, %s\n", v3_x64_qreg_name(9));
+        } else {
+            v3_text_appendf(out, cap, "  add x9, x9, #1\n");
+        }
         v3_emit_store_slot(out, cap, &locals[iter_local_index], 9);
-        v3_text_appendf(out, cap, "  b %s\n", start_label);
+        v3_emit_jump_label(out, cap, start_label);
         v3_text_appendf(out, cap, "%s:\n", end_label);
         v3_pop_loop_labels();
         return true;
@@ -24698,9 +26046,13 @@ static bool v3_emit_for_statement(const V3SystemLinkPlanStub *plan,
     }
     v3_text_appendf(out, cap, "%s:\n", continue_label);
     v3_emit_load_slot(out, cap, &locals[iter_local_index], 9);
-    v3_text_appendf(out, cap, "  add x9, x9, #1\n");
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap, "  addq $1, %s\n", v3_x64_qreg_name(9));
+    } else {
+        v3_text_appendf(out, cap, "  add x9, x9, #1\n");
+    }
     v3_emit_store_slot(out, cap, &locals[iter_local_index], 9);
-    v3_text_appendf(out, cap, "  b %s\n", start_label);
+    v3_emit_jump_label(out, cap, start_label);
     v3_text_appendf(out, cap, "%s:\n", end_label);
     v3_pop_loop_labels();
     return true;
@@ -25304,6 +26656,9 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
     }
     /* Keep a 16-byte guard gap between scratch spill space and the saved FP/LR pair. */
     frame_size = ((next_offset + 15 + 32) / 16) * 16;
+    if (v3_active_target_is_linux_x86_64()) {
+        frame_size += 8;
+    }
     if (frame_size < 16) {
         frame_size = 16;
     }
@@ -25337,29 +26692,59 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                         "%s:\n",
                         symbol_name,
                         symbol_name);
-        if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
-            free(lines);
-            free(owned_lines);
-            return false;
-        }
-        if (save_offset <= 504 && (save_offset % 8) == 0) {
-            v3_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
-        } else if (!v3_emit_sp_offset_address(out, cap, 16, save_offset)) {
-            free(lines);
-            free(owned_lines);
-            return false;
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap,
+                           "  pushq %rbp\n"
+                           "  pushq %rbx\n"
+                           "  pushq %r12\n"
+                           "  pushq %r13\n"
+                           "  pushq %r14\n"
+                           "  pushq %r15\n");
+            if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
         } else {
-            v3_text_appendf(out, cap, "  stp x29, x30, [x16]\n");
-        }
-        if (!v3_emit_sp_offset_address(out, cap, 29, save_offset)) {
-            free(lines);
-            free(owned_lines);
-            return false;
+            if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
+            if (save_offset <= 504 && (save_offset % 8) == 0) {
+                v3_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
+            } else if (!v3_emit_sp_offset_address(out, cap, 16, save_offset)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            } else {
+                v3_text_appendf(out, cap, "  stp x29, x30, [x16]\n");
+            }
+            if (!v3_emit_sp_offset_address(out, cap, 29, save_offset)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
         }
     }
     for (i = 0; i < function->param_count; ++i) {
         const char *pass_abi = v3_param_pass_abi_class(&locals[i], function->param_abi_classes[i]);
-        if (i < CHENG_V3_CALL_ARG_REGS) {
+        int call_reg_count = v3_call_arg_reg_count_for_target(plan, composite_return);
+        if (v3_active_target_is_linux_x86_64() && (int)i < call_reg_count) {
+            int arg_reg = v3_x64_call_arg_virtual_reg(i, composite_return);
+            if (arg_reg < 0 ||
+                !v3_emit_sp_store_reg(out,
+                                      cap,
+                                      locals[i].stack_offset,
+                                      pass_abi,
+                                      arg_reg)) {
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
+            continue;
+        }
+        if (!v3_active_target_is_linux_x86_64() && i < CHENG_V3_CALL_ARG_REGS) {
             if (!v3_emit_sp_store_reg(out,
                                       cap,
                                       locals[i].stack_offset,
@@ -25373,7 +26758,9 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         }
         if (!v3_emit_sp_load_reg(out,
                                  cap,
-                                 frame_size + (int32_t)(i - CHENG_V3_CALL_ARG_REGS) * 8,
+                                 v3_incoming_stack_arg_offset_for_target(plan,
+                                                                         frame_size,
+                                                                         (int32_t)(i - (size_t)call_reg_count)),
                                  pass_abi,
                                  9) ||
             !v3_emit_sp_store_reg(out,
@@ -25391,7 +26778,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                                   cap,
                                   locals[sret_local_index].stack_offset,
                                   "ptr",
-                                  8)) {
+                                  v3_active_target_is_linux_x86_64() ? 14 : 8)) {
             free(lines);
             free(owned_lines);
             return false;
@@ -26503,6 +27890,9 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
         string_temp_stride = string_temp_slots * 24;
         next_offset += string_temp_stride * spill_layers;
         frame_size = ((next_offset + 15 + 32) / 16) * 16;
+        if (v3_active_target_is_linux_x86_64()) {
+            frame_size += 8;
+        }
         if (frame_size < 16) {
             frame_size = 16;
         }
@@ -26529,24 +27919,39 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
                     symbol_name);
     {
         int32_t save_offset = frame_size - 16;
-        if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
-            free(lines);
-            free(owned);
-            return false;
-        }
-        if (save_offset <= 504 && (save_offset % 8) == 0) {
-            v3_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
-        } else if (!v3_emit_sp_offset_address(out, cap, 16, save_offset)) {
-            free(lines);
-            free(owned);
-            return false;
+        if (v3_active_target_is_linux_x86_64()) {
+            v3_text_append(out, cap,
+                           "  pushq %rbp\n"
+                           "  pushq %rbx\n"
+                           "  pushq %r12\n"
+                           "  pushq %r13\n"
+                           "  pushq %r14\n"
+                           "  pushq %r15\n");
+            if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
+                free(lines);
+                free(owned);
+                return false;
+            }
         } else {
-            v3_text_appendf(out, cap, "  stp x29, x30, [x16]\n");
-        }
-        if (!v3_emit_sp_offset_address(out, cap, 29, save_offset)) {
-            free(lines);
-            free(owned);
-            return false;
+            if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
+                free(lines);
+                free(owned);
+                return false;
+            }
+            if (save_offset <= 504 && (save_offset % 8) == 0) {
+                v3_text_appendf(out, cap, "  stp x29, x30, [sp, #%d]\n", save_offset);
+            } else if (!v3_emit_sp_offset_address(out, cap, 16, save_offset)) {
+                free(lines);
+                free(owned);
+                return false;
+            } else {
+                v3_text_appendf(out, cap, "  stp x29, x30, [x16]\n");
+            }
+            if (!v3_emit_sp_offset_address(out, cap, 29, save_offset)) {
+                free(lines);
+                free(owned);
+                return false;
+            }
         }
     }
 
@@ -26701,27 +28106,54 @@ static void v3_append_entry_bridge_with_module_inits(const V3SystemLinkPlanStub 
                     bridge_symbol,
                     setcmd_symbol,
                     bridge_symbol);
-    v3_text_append(out, cap,
-                   "  sub sp, sp, #32\n"
-                   "  stp x0, x1, [sp]\n"
-                   "  str x30, [sp, #24]\n"
-                   );
-    v3_text_appendf(out, cap, "  bl %s\n", setcmd_symbol);
-    if (module_init_count > 0U) {
+    if (v3_target_is_linux_x86_64(plan->target_triple)) {
         v3_text_append(out, cap,
-                       "  ldr x30, [sp, #24]\n");
+                       "  subq $24, %rsp\n"
+                       "  movq %rdi, 0(%rsp)\n"
+                       "  movq %rsi, 8(%rsp)\n");
+    } else {
+        v3_text_append(out, cap,
+                       "  sub sp, sp, #32\n"
+                       "  stp x0, x1, [sp]\n"
+                       "  str x30, [sp, #24]\n");
+    }
+    if (v3_target_is_linux_x86_64(plan->target_triple)) {
+        v3_text_appendf(out, cap, "  call %s\n", setcmd_symbol);
+    } else {
+        v3_text_appendf(out, cap, "  bl %s\n", setcmd_symbol);
+    }
+    if (module_init_count > 0U) {
+        if (!v3_target_is_linux_x86_64(plan->target_triple)) {
+            v3_text_append(out, cap,
+                           "  ldr x30, [sp, #24]\n");
+        }
         for (i = 0; i < module_init_count; ++i) {
-            v3_text_appendf(out, cap, "  bl %s\n", module_init_symbols[i]);
+            if (v3_target_is_linux_x86_64(plan->target_triple)) {
+                v3_text_appendf(out, cap, "  call %s\n", module_init_symbols[i]);
+            } else {
+                v3_text_appendf(out, cap, "  bl %s\n", module_init_symbols[i]);
+            }
         }
     }
-    v3_text_appendf(out, cap,
-                    "  ldr x30, [sp, #24]\n"
-                    "  ldp x0, x1, [sp]\n"
-                    "  add sp, sp, #32\n"
-                    "  b %s\n"
-                    "%s:\n",
-                    entry_symbol,
-                    end_label);
+    if (v3_target_is_linux_x86_64(plan->target_triple)) {
+        v3_text_appendf(out, cap,
+                        "  movq 0(%%rsp), %%rdi\n"
+                        "  movq 8(%%rsp), %%rsi\n"
+                        "  addq $24, %%rsp\n"
+                        "  jmp %s\n"
+                        "%s:\n",
+                        entry_symbol,
+                        end_label);
+    } else {
+        v3_text_appendf(out, cap,
+                        "  ldr x30, [sp, #24]\n"
+                        "  ldp x0, x1, [sp]\n"
+                        "  add sp, sp, #32\n"
+                        "  b %s\n"
+                        "%s:\n",
+                        entry_symbol,
+                        end_label);
+    }
 }
 
 static void v3_provider_source_for_module(const V3SystemLinkPlanStub *plan,
@@ -28443,8 +29875,9 @@ static bool v3_compile_c_object(const char *target_triple,
         return false;
     }
     target_clause[0] = '\0';
-    if (v3_target_is_linux_x86_64(target_triple) ||
-        v3_target_is_linux_generic_aarch64(target_triple)) {
+    if ((v3_target_is_linux_x86_64(target_triple) ||
+         v3_target_is_linux_generic_aarch64(target_triple)) &&
+        !v3_target_matches_native_host(target_triple)) {
         snprintf(target_clause, sizeof(target_clause), " -target %s", target_triple);
     }
     quoted_cc = v3_shell_quote(cc);
@@ -28492,8 +29925,9 @@ static bool v3_compile_asm_object(const char *target_triple,
         return false;
     }
     target_clause[0] = '\0';
-    if (v3_target_is_linux_x86_64(target_triple) ||
-        v3_target_is_linux_generic_aarch64(target_triple)) {
+    if ((v3_target_is_linux_x86_64(target_triple) ||
+         v3_target_is_linux_generic_aarch64(target_triple)) &&
+        !v3_target_matches_native_host(target_triple)) {
         snprintf(target_clause, sizeof(target_clause), " -target %s", target_triple);
     }
     quoted_cc = v3_shell_quote(cc);
@@ -28596,6 +30030,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
     if (primary->missing_reason_count > 0U) {
         return false;
     }
+    v3_active_codegen_target_triple = plan != NULL ? plan->target_triple : NULL;
     if (v3_target_is_wasm32_unknown_unknown(plan->target_triple)) {
         return v3_materialize_wasm_module(plan, lowering, primary);
     }
@@ -28669,10 +30104,16 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                  "%s:\n",
                  entry_symbol,
                  entry_symbol);
-        strncat(text,
-                "  sub sp, sp, #16\n"
-                "  str x30, [sp, #8]\n",
-                cap - strlen(text) - 1U);
+        if (v3_target_is_linux_x86_64(plan->target_triple)) {
+            strncat(text,
+                    "  subq $8, %rsp\n",
+                    cap - strlen(text) - 1U);
+        } else {
+            strncat(text,
+                    "  sub sp, sp, #16\n"
+                    "  str x30, [sp, #8]\n",
+                    cap - strlen(text) - 1U);
+        }
         for (i = 0; i < primary->consteval_echo_count; ++i) {
             char label[64];
             char chunk[256];
@@ -28687,14 +30128,24 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
             char chunk[256];
             char end_label[64];
             v3_embedded_line_map_end_label(0U, end_label, sizeof(end_label));
-            snprintf(chunk, sizeof(chunk),
-                     "  ldr x30, [sp, #8]\n"
-                     "  add sp, sp, #16\n"
-                     "  mov w0, #%d\n"
-                     "  ret\n"
-                     "%s:\n",
-                     primary->consteval_return_code,
-                     end_label);
+            if (v3_target_is_linux_x86_64(plan->target_triple)) {
+                snprintf(chunk, sizeof(chunk),
+                         "  addq $8, %%rsp\n"
+                         "  movl $%d, %%eax\n"
+                         "  retq\n"
+                         "%s:\n",
+                         primary->consteval_return_code,
+                         end_label);
+            } else {
+                snprintf(chunk, sizeof(chunk),
+                         "  ldr x30, [sp, #8]\n"
+                         "  add sp, sp, #16\n"
+                         "  mov w0, #%d\n"
+                         "  ret\n"
+                         "%s:\n",
+                         primary->consteval_return_code,
+                         end_label);
+            }
             strncat(text, chunk, cap - strlen(text) - 1U);
         }
         if (v3_streq(plan->emit_kind, "exe")) {
@@ -29018,8 +30469,9 @@ static bool v3_compile_linux_nolibc_startup_object(const char *target_triple,
         return false;
     }
     target_clause[0] = '\0';
-    if (v3_target_is_linux_x86_64(target_triple) ||
-        v3_target_is_linux_generic_aarch64(target_triple)) {
+    if ((v3_target_is_linux_x86_64(target_triple) ||
+         v3_target_is_linux_generic_aarch64(target_triple)) &&
+        !v3_target_matches_native_host(target_triple)) {
         snprintf(target_clause, sizeof(target_clause), " -target %s", target_triple);
     }
     quoted_cc = v3_shell_quote(cc);
@@ -35177,6 +36629,14 @@ static bool v3_expect_text_contains(const char *label, const char *text, const c
     return false;
 }
 
+static bool v3_expect_text_not_contains(const char *label, const char *text, const char *needle) {
+    if (!v3_text_contains_substring(text, needle)) {
+        return true;
+    }
+    fprintf(stderr, "[cheng_v3_seed] %s unexpected text: %s\n", label, needle);
+    return false;
+}
+
 static bool v3_expect_file_exists_nonempty(const char *label, const char *path) {
     if (v3_path_exists_nonempty(path)) {
         return true;
@@ -35187,6 +36647,230 @@ static bool v3_expect_file_exists_nonempty(const char *label, const char *path) 
 
 static bool v3_status_is_exit_code(int status, int code);
 static char *v3_debug_object_report(const char *path);
+
+static bool v3_report_extract_symbol_name(const char *line,
+                                          char *out,
+                                          size_t cap) {
+    const char *eq;
+    const char *bar;
+    size_t len;
+    if (line == NULL || out == NULL || cap == 0U || !v3_startswith(line, "symbol[")) {
+        return false;
+    }
+    eq = strchr(line, '=');
+    if (eq == NULL) {
+        return false;
+    }
+    eq += 1;
+    bar = strchr(eq, '|');
+    if (bar == NULL || bar <= eq) {
+        return false;
+    }
+    len = (size_t)(bar - eq);
+    if (len >= cap) {
+        len = cap - 1U;
+    }
+    memcpy(out, eq, len);
+    out[len] = '\0';
+    return true;
+}
+
+static void v3_normalize_report_symbol_name(const char *name,
+                                            char *out,
+                                            size_t cap) {
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    if (name == NULL) {
+        out[0] = '\0';
+        return;
+    }
+    if (name[0] == '_') {
+        v3_copy_text(out, cap, name + 1);
+        return;
+    }
+    v3_copy_text(out, cap, name);
+}
+
+static bool v3_report_symbol_line_is_export(const char *line) {
+    if (line == NULL || !v3_startswith(line, "symbol[")) {
+        return false;
+    }
+    if (v3_text_contains_substring(line, "|type=0xf|")) {
+        return true;
+    }
+    if (v3_text_contains_substring(line, "|bind=1|") &&
+        !v3_text_contains_substring(line, "|shndx=0|")) {
+        return true;
+    }
+    return false;
+}
+
+static bool v3_report_symbol_line_is_undefined(const char *line) {
+    if (line == NULL || !v3_startswith(line, "symbol[")) {
+        return false;
+    }
+    if (v3_text_contains_substring(line, "|type=0x1|") &&
+        v3_text_contains_substring(line, "|sect=0|")) {
+        return true;
+    }
+    if (v3_text_contains_substring(line, "|bind=1|") &&
+        v3_text_contains_substring(line, "|shndx=0|")) {
+        return true;
+    }
+    return false;
+}
+
+static bool v3_expect_object_export_whitelist(const char *label,
+                                              const char *object_path,
+                                              const char *const *allowed,
+                                              size_t allowed_count) {
+    char *report = NULL;
+    const char *cursor;
+    bool *seen = NULL;
+    bool ok = true;
+    size_t export_count = 0U;
+    size_t i;
+    report = v3_debug_object_report(object_path);
+    if (report == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s failed to inspect object: %s\n", label, object_path);
+        return false;
+    }
+    seen = (bool *)v3_xmalloc(sizeof(bool) * allowed_count);
+    memset(seen, 0, sizeof(bool) * allowed_count);
+    cursor = report;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        char line[PATH_MAX * 2];
+        size_t copy_len = len < sizeof(line) - 1U ? len : sizeof(line) - 1U;
+        memcpy(line, cursor, copy_len);
+        line[copy_len] = '\0';
+        if (v3_report_symbol_line_is_export(line)) {
+            char raw_name[PATH_MAX];
+            char normalized[PATH_MAX];
+            bool matched = false;
+            if (!v3_report_extract_symbol_name(line, raw_name, sizeof(raw_name))) {
+                fprintf(stderr, "[cheng_v3_seed] %s malformed symbol line: %s\n", label, line);
+                ok = false;
+                break;
+            }
+            v3_normalize_report_symbol_name(raw_name, normalized, sizeof(normalized));
+            for (i = 0U; i < allowed_count; ++i) {
+                if (strcmp(normalized, allowed[i]) == 0) {
+                    if (seen[i]) {
+                        fprintf(stderr, "[cheng_v3_seed] %s duplicate export: %s\n", label, normalized);
+                        ok = false;
+                    }
+                    seen[i] = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                fprintf(stderr, "[cheng_v3_seed] %s unexpected export: %s (%s)\n", label, normalized, object_path);
+                ok = false;
+            }
+            export_count += 1U;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    if (ok && export_count != allowed_count) {
+        fprintf(stderr,
+                "[cheng_v3_seed] %s export count mismatch: expected=%zu actual=%zu\n",
+                label,
+                allowed_count,
+                export_count);
+        ok = false;
+    }
+    for (i = 0U; i < allowed_count; ++i) {
+        if (!seen[i]) {
+            fprintf(stderr, "[cheng_v3_seed] %s missing export: %s\n", label, allowed[i]);
+            ok = false;
+        }
+    }
+    free(seen);
+    free(report);
+    return ok;
+}
+
+static bool v3_expect_object_undefined_whitelist(const char *label,
+                                                 const char *object_path,
+                                                 const char *const *allowed,
+                                                 size_t allowed_count) {
+    char *report = NULL;
+    const char *cursor;
+    bool *seen = NULL;
+    bool ok = true;
+    size_t undefined_count = 0U;
+    size_t i;
+    report = v3_debug_object_report(object_path);
+    if (report == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s failed to inspect object: %s\n", label, object_path);
+        return false;
+    }
+    seen = (bool *)v3_xmalloc(sizeof(bool) * allowed_count);
+    memset(seen, 0, sizeof(bool) * allowed_count);
+    cursor = report;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        char line[PATH_MAX * 2];
+        size_t copy_len = len < sizeof(line) - 1U ? len : sizeof(line) - 1U;
+        memcpy(line, cursor, copy_len);
+        line[copy_len] = '\0';
+        if (v3_report_symbol_line_is_undefined(line)) {
+            char raw_name[PATH_MAX];
+            bool matched = false;
+            if (!v3_report_extract_symbol_name(line, raw_name, sizeof(raw_name))) {
+                fprintf(stderr, "[cheng_v3_seed] %s malformed symbol line: %s\n", label, line);
+                ok = false;
+                break;
+            }
+            for (i = 0U; i < allowed_count; ++i) {
+                if (strcmp(raw_name, allowed[i]) == 0) {
+                    if (seen[i]) {
+                        fprintf(stderr,
+                                "[cheng_v3_seed] %s duplicate undefined symbol: %s\n",
+                                label,
+                                raw_name);
+                        ok = false;
+                    }
+                    seen[i] = true;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] %s unexpected undefined symbol: %s (%s)\n",
+                        label,
+                        raw_name,
+                        object_path);
+                ok = false;
+            }
+            undefined_count += 1U;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    if (ok && undefined_count != allowed_count) {
+        fprintf(stderr,
+                "[cheng_v3_seed] %s undefined symbol count mismatch: expected=%zu actual=%zu\n",
+                label,
+                allowed_count,
+                undefined_count);
+        ok = false;
+    }
+    for (i = 0U; i < allowed_count; ++i) {
+        if (!seen[i]) {
+            fprintf(stderr, "[cheng_v3_seed] %s missing undefined symbol: %s\n", label, allowed[i]);
+            ok = false;
+        }
+    }
+    free(seen);
+    free(report);
+    return ok;
+}
 
 static bool v3_run_binary_capture_output(char *const argv_local[],
                                          const char *log_path,
@@ -35539,8 +37223,12 @@ static int v3_cmd_build_signal_trace_impl(int argc, char **argv);
 static int v3_cmd_build_call_chain_impl(int argc, char **argv);
 static int v3_cmd_build_ffi_handle_impl(int argc, char **argv);
 static int v3_cmd_build_program_selfhost_impl(int argc, char **argv);
+static int v3_cmd_build_bft_state_machine_impl(int argc, char **argv);
+static int v3_cmd_build_browser_host_wasm_impl(int argc, char **argv);
 static int v3_cmd_build_chain_node_impl(int argc, char **argv);
+static int v3_cmd_build_rwad_bft_state_machine_impl(int argc, char **argv);
 static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv);
+static int v3_cmd_build_linux_nolibc_exe_impl(int argc, char **argv);
 static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv);
 static int v3_cmd_run_linux_object_smokes_impl(int argc, char **argv);
 static int v3_cmd_run_tcp_twoproc_smoke_impl(int argc, char **argv);
@@ -35560,6 +37248,13 @@ static bool v3_verify_runtime_fixture_output(const char *label,
                                              const char *message_substring,
                                              const char *reason_line,
                                              bool require_signal_fields);
+static const char *v3_leaf_resolve_compiler_bin(int argc,
+                                                char **argv,
+                                                const char *env_primary,
+                                                const char *env_fallback,
+                                                const char *default_bin);
+static bool v3_leaf_expect_compiler(const char *label,
+                                    const char *compiler_bin);
 static size_t v3_collect_smoke_positionals(int argc,
                                            char **argv,
                                            const char **out,
@@ -35665,12 +37360,22 @@ static int v3_invoke_command_with_common_flags(V3SeedCommandFn fn,
 }
 
 static int v3_cmd_profile_run(int argc, char **argv);
+static bool v3_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
+                                                               const char *root_v3,
+                                                               const char *src_path,
+                                                               const char *emit_kind,
+                                                               const char *target,
+                                                               const char *out_path,
+                                                               const char *log_path,
+                                                               const char *report_path);
 static int v3_cmd_debug_report(int argc, char **argv);
 static int v3_cmd_print_symbols(int argc, char **argv);
 static int v3_cmd_print_line_map(int argc, char **argv);
 static int v3_cmd_print_object(int argc, char **argv);
 static int v3_cmd_print_elf(int argc, char **argv);
 static int v3_cmd_print_asm(int argc, char **argv);
+static const char *v3_host_target_triple(void);
+static int v3_cmd_profile_report(int argc, char **argv);
 static int v3_cmd_system_link_exec(int argc, char **argv);
 
 static int v3_invoke_profile_run(const char *contract_path,
@@ -35717,6 +37422,292 @@ static int v3_invoke_profile_run(const char *contract_path,
         argv_local[argc_local++] = report_flag;
     }
     return v3_cmd_profile_run(argc_local, argv_local);
+}
+
+static void v3_profile_raw_report_path_from_report(const char *report_path,
+                                                   char *out,
+                                                   size_t cap) {
+    size_t len;
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (report_path == NULL || report_path[0] == '\0') {
+        return;
+    }
+    len = strlen(report_path);
+    if (len > 4U && strcmp(report_path + len - 4U, ".txt") == 0) {
+        snprintf(out, cap, "%.*s.raw.txt", (int)(len - 4U), report_path);
+        return;
+    }
+    snprintf(out, cap, "%s.raw.txt", report_path);
+}
+
+static void v3_profile_log_error(const char *log_path, const char *message) {
+    if (log_path != NULL && log_path[0] != '\0') {
+        v3_ensure_parent_dir(log_path);
+        v3_write_text_file(log_path, message);
+    }
+}
+
+static void v3_profile_report_path_from_raw(const char *raw_report_path,
+                                            char *out,
+                                            size_t cap) {
+    size_t len;
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (raw_report_path == NULL || raw_report_path[0] == '\0') {
+        return;
+    }
+    len = strlen(raw_report_path);
+    if (len > 8U && strcmp(raw_report_path + len - 8U, ".raw.txt") == 0) {
+        snprintf(out, cap, "%.*s.txt", (int)(len - 8U), raw_report_path);
+        return;
+    }
+    snprintf(out, cap, "%s.report.txt", raw_report_path);
+}
+
+static int v3_cmd_bootstrap_bridge(int argc, char **argv);
+
+static bool v3_profile_report_live_compiler_bin(const V3BootstrapPaths *paths,
+                                                char *out,
+                                                size_t cap) {
+    if (paths == NULL || out == NULL || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (v3_backend_driver_ready(paths)) {
+        v3_copy_text(out, cap, paths->backend_driver_out);
+        return true;
+    }
+    if (v3_bootstrap_artifacts_fresh(paths) && v3_path_exists_nonempty(paths->stage3)) {
+        v3_copy_text(out, cap, paths->stage3);
+        return true;
+    }
+    if (v3_cmd_bootstrap_bridge(0, NULL) == 0) {
+        if (v3_backend_driver_ready(paths)) {
+            v3_copy_text(out, cap, paths->backend_driver_out);
+            return true;
+        }
+        if (v3_bootstrap_artifacts_fresh(paths) && v3_path_exists_nonempty(paths->stage3)) {
+            v3_copy_text(out, cap, paths->stage3);
+            return true;
+        }
+    }
+    return false;
+}
+
+typedef struct {
+    char *key;
+    uint32_t count;
+} V3ProfileCount;
+
+static int v3_profile_count_cmp(const void *left, const void *right) {
+    const V3ProfileCount *a = (const V3ProfileCount *)left;
+    const V3ProfileCount *b = (const V3ProfileCount *)right;
+    if (a->count != b->count) {
+        return a->count < b->count ? 1 : -1;
+    }
+    if (a->key == NULL && b->key == NULL) return 0;
+    if (a->key == NULL) return 1;
+    if (b->key == NULL) return -1;
+    return strcmp(a->key, b->key);
+}
+
+static bool v3_profile_count_add(V3ProfileCount **items,
+                                 int32_t *len,
+                                 int32_t *cap,
+                                 const char *key) {
+    int32_t i;
+    int32_t next_cap;
+    V3ProfileCount *grown = NULL;
+    const char *safe_key = (key != NULL && key[0] != '\0') ? key : "?";
+    for (i = 0; i < *len; i += 1) {
+        if ((*items)[i].key != NULL && strcmp((*items)[i].key, safe_key) == 0) {
+            (*items)[i].count += 1U;
+            return true;
+        }
+    }
+    if (*len >= *cap) {
+        next_cap = *cap > 0 ? *cap * 2 : 16;
+        grown = (V3ProfileCount *)realloc(*items, (size_t)next_cap * sizeof(V3ProfileCount));
+        if (grown == NULL) {
+            return false;
+        }
+        *items = grown;
+        *cap = next_cap;
+    }
+    (*items)[*len].key = v3_strdup(safe_key);
+    if ((*items)[*len].key == NULL) {
+        return false;
+    }
+    (*items)[*len].count = 1U;
+    *len += 1;
+    return true;
+}
+
+static void v3_profile_counts_free(V3ProfileCount *items, int32_t len) {
+    int32_t i;
+    if (items == NULL) return;
+    for (i = 0; i < len; i += 1) {
+        free(items[i].key);
+    }
+    free(items);
+}
+
+static void v3_profile_trim_line(char *line) {
+    size_t len;
+    if (line == NULL) return;
+    len = strlen(line);
+    while (len > 0U && (line[len - 1U] == '\r' || line[len - 1U] == '\n')) {
+        line[len - 1U] = '\0';
+        len -= 1U;
+    }
+}
+
+static bool v3_profile_report_transform_raw(const char *raw_report_path,
+                                            const char *report_path,
+                                            const char *log_path) {
+    char *raw_text = NULL;
+    char *cursor = NULL;
+    char *line = NULL;
+    bool header_seen = false;
+    int32_t total_samples = 0;
+    int32_t dropped_samples = 0;
+    int32_t sample_count = 0;
+    V3ProfileCount *function_counts = NULL;
+    V3ProfileCount *source_counts = NULL;
+    V3ProfileCount *pc_counts = NULL;
+    int32_t function_len = 0;
+    int32_t source_len = 0;
+    int32_t pc_len = 0;
+    int32_t function_cap = 0;
+    int32_t source_cap = 0;
+    int32_t pc_cap = 0;
+    char *report = NULL;
+    size_t report_cap = 1024U;
+    size_t report_used = 0U;
+    char line_buf[PATH_MAX * 2];
+    bool ok = false;
+    int32_t i;
+    (void)log_path;
+    if (!v3_path_exists_nonempty(raw_report_path)) {
+        v3_profile_log_error(log_path, "v3 profile report: missing raw profile\n");
+        return false;
+    }
+    if (!v3_ensure_parent_dir(report_path) || !v3_ensure_parent_dir(log_path)) {
+        return false;
+    }
+    raw_text = v3_read_file(raw_report_path);
+    if (raw_text == NULL) {
+        v3_profile_log_error(log_path, "v3 profile report: failed to read raw profile\n");
+        goto done;
+    }
+    cursor = raw_text;
+    while ((line = strsep(&cursor, "\n")) != NULL) {
+        char *rest;
+        char *pc_key;
+        char *function_key;
+        char *source_key;
+        v3_profile_trim_line(line);
+        if (line[0] == '\0') {
+            continue;
+        }
+        if (!header_seen) {
+            header_seen = true;
+            if (strcmp(line, "v3_profile_raw_v1") != 0) {
+                v3_profile_log_error(log_path, "v3 profile report: invalid raw header\n");
+                goto done;
+            }
+            continue;
+        }
+        if (strncmp(line, "total_samples=", 14) == 0) {
+            v3_parse_i32_text(line + 14, &total_samples);
+            continue;
+        }
+        if (strncmp(line, "dropped_samples=", 16) == 0) {
+            v3_parse_i32_text(line + 16, &dropped_samples);
+            continue;
+        }
+        if (strncmp(line, "sample\t", 7) != 0) {
+            continue;
+        }
+        rest = line + 7;
+        pc_key = strsep(&rest, "\t");
+        function_key = strsep(&rest, "\t");
+        source_key = strsep(&rest, "\t");
+        if (!v3_profile_count_add(&pc_counts, &pc_len, &pc_cap, pc_key) ||
+            !v3_profile_count_add(&function_counts, &function_len, &function_cap, function_key) ||
+            !v3_profile_count_add(&source_counts, &source_len, &source_cap, source_key)) {
+            v3_profile_log_error(log_path, "v3 profile report: out of memory while counting samples\n");
+            goto done;
+        }
+        sample_count += 1;
+    }
+    if (!header_seen) {
+        v3_profile_log_error(log_path, "v3 profile report: invalid raw header\n");
+        goto done;
+    }
+    if (total_samples <= 0) {
+        total_samples = sample_count;
+    }
+    if (function_len > 1) {
+        qsort(function_counts, (size_t)function_len, sizeof(V3ProfileCount), v3_profile_count_cmp);
+    }
+    if (source_len > 1) {
+        qsort(source_counts, (size_t)source_len, sizeof(V3ProfileCount), v3_profile_count_cmp);
+    }
+    if (pc_len > 1) {
+        qsort(pc_counts, (size_t)pc_len, sizeof(V3ProfileCount), v3_profile_count_cmp);
+    }
+    report = (char *)v3_xmalloc(report_cap);
+    report[0] = '\0';
+    v3_report_append(&report, &report_cap, &report_used, "v3_profile_v1");
+    snprintf(line_buf, sizeof(line_buf), "total_samples=%d", total_samples);
+    v3_report_append(&report, &report_cap, &report_used, line_buf);
+    snprintf(line_buf, sizeof(line_buf), "dropped_samples=%d", dropped_samples);
+    v3_report_append(&report, &report_cap, &report_used, line_buf);
+    for (i = 0; i < function_len && i < 8; i += 1) {
+        snprintf(line_buf,
+                 sizeof(line_buf),
+                 "hot_function[%d]=%u|%s",
+                 i,
+                 function_counts[i].count,
+                 function_counts[i].key != NULL ? function_counts[i].key : "?");
+        v3_report_append(&report, &report_cap, &report_used, line_buf);
+    }
+    for (i = 0; i < source_len && i < 8; i += 1) {
+        snprintf(line_buf,
+                 sizeof(line_buf),
+                 "hot_source[%d]=%u|%s",
+                 i,
+                 source_counts[i].count,
+                 source_counts[i].key != NULL ? source_counts[i].key : "?");
+        v3_report_append(&report, &report_cap, &report_used, line_buf);
+    }
+    for (i = 0; i < pc_len && i < 8; i += 1) {
+        snprintf(line_buf,
+                 sizeof(line_buf),
+                 "hot_pc[%d]=%u|%s",
+                 i,
+                 pc_counts[i].count,
+                 pc_counts[i].key != NULL ? pc_counts[i].key : "?");
+        v3_report_append(&report, &report_cap, &report_used, line_buf);
+    }
+    if (!v3_write_text_file(report_path, report)) {
+        v3_profile_log_error(log_path, "v3 profile report: failed to write report\n");
+        goto done;
+    }
+    ok = true;
+done:
+    free(report);
+    free(raw_text);
+    v3_profile_counts_free(function_counts, function_len);
+    v3_profile_counts_free(source_counts, source_len);
+    v3_profile_counts_free(pc_counts, pc_len);
+    return ok;
 }
 
 static bool v3_compile_fixture_with_backend_driver_emit_target(const char *compiler_bin,
@@ -36015,7 +38006,35 @@ static bool v3_compile_host_fixture_with_backend_driver(const char *compiler_bin
                                                         const char *src_path,
                                                         const char *out_bin,
                                                         const char *log_path) {
-    return v3_compile_fixture_with_backend_driver_target(compiler_bin,
+    V3BootstrapPaths paths;
+    const char *resolved_compiler = compiler_bin;
+    v3_bootstrap_paths_init(&paths);
+    if (resolved_compiler != NULL &&
+        resolved_compiler[0] != '\0') {
+        if (strcmp(resolved_compiler, paths.backend_driver_out) == 0 &&
+            access(resolved_compiler, X_OK) != 0) {
+            if (!v3_backend_driver_ready(&paths) &&
+                v3_cmd_build_backend_driver(0, NULL) != 0) {
+                return false;
+            }
+            resolved_compiler = paths.backend_driver_out;
+        } else if ((strcmp(resolved_compiler, paths.stage0) == 0 ||
+                    strcmp(resolved_compiler, paths.stage1) == 0 ||
+                    strcmp(resolved_compiler, paths.stage2) == 0 ||
+                    strcmp(resolved_compiler, paths.stage3) == 0) &&
+                   access(resolved_compiler, X_OK) != 0) {
+            if (!v3_bootstrap_artifacts_fresh(&paths) &&
+                v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+                return false;
+            }
+        }
+    }
+    if (resolved_compiler == NULL || resolved_compiler[0] == '\0' || access(resolved_compiler, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] missing compiler during fixture compile: %s\n",
+                resolved_compiler != NULL ? resolved_compiler : "");
+        return false;
+    }
+    return v3_compile_fixture_with_backend_driver_target(resolved_compiler,
                                                          root_v3,
                                                          src_path,
                                                          "arm64-apple-darwin",
@@ -36182,6 +38201,89 @@ static int v3_cmd_build_program_selfhost_impl(int argc, char **argv) {
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
         !v3_status_is_exit_code(status, 0)) {
         fprintf(stderr, "[cheng_v3_seed] build-program-selfhost expected success log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_bft_state_machine_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char default_out_dir[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char target_buf[256];
+    const char *compiler_bin;
+    const char *target = getenv("BFT_STATE_TARGET");
+    const char *out_dir_env = getenv("BFT_STATE_OUT_DIR");
+    const char *out_bin_env = getenv("BFT_STATE_OUT_BIN");
+    const char *run_self_test_env = getenv("BFT_STATE_RUN_SELF_TEST");
+    const char *host_target = v3_host_target_triple();
+    char *run_argv[3];
+    int status = 0;
+    bool run_self_test = false;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_BFT_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    if (!v3_leaf_expect_compiler("build-bft-state-machine", compiler_bin)) {
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "arm64-apple-darwin";
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/bft_state_machine_main.cheng");
+    v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_bft_state_machine");
+    if (!v3_streq(target_buf, "arm64-apple-darwin")) {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    }
+    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
+        v3_copy_text(out_dir, sizeof(out_dir), out_dir_env);
+    } else {
+        v3_copy_text(out_dir, sizeof(out_dir), default_out_dir);
+    }
+    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
+        v3_copy_text(out_bin, sizeof(out_bin), out_bin_env);
+    } else {
+        v3_join_path(out_bin, sizeof(out_bin), out_dir, "bft_state_machine");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "bft_state_machine.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "bft_state_machine.self-test.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_ensure_parent_dir(out_bin) ||
+        !v3_compile_fixture_with_backend_driver_target(compiler_bin,
+                                                       root_v3,
+                                                       src,
+                                                       target_buf,
+                                                       out_bin,
+                                                       compile_log) ||
+        access(out_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-bft-state-machine missing output: %s\n", out_bin);
+        return 1;
+    }
+    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !v3_streq(run_self_test_env, "auto")) {
+        run_self_test = !v3_streq(run_self_test_env, "0");
+    } else {
+        run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
+    }
+    if (!run_self_test) {
+        printf("v3 bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
+        return 0;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = "self-test";
+    run_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-bft-state-machine self-test failed log=%s\n", run_log);
         return 1;
     }
     return v3_dump_file_stdout(run_log) ? 0 : 1;
@@ -36397,6 +38499,62 @@ static int v3_cmd_build_ffi_handle_impl(int argc, char **argv) {
     return rc;
 }
 
+static int v3_cmd_build_browser_host_wasm_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_path[PATH_MAX];
+    char compile_log[PATH_MAX];
+    const char *compiler_bin;
+    const char *positionals[2];
+    size_t positional_count = 0U;
+    const char *out_env = getenv("CHENG_V3_BROWSER_HOST_WASM_OUT");
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_WASM_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    if (!v3_leaf_expect_compiler("build-browser-host-wasm", compiler_bin)) {
+        return 1;
+    }
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/libp2p/browser/browser_host_wasm_probe.cheng");
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_browser_host_wasm");
+    positional_count = v3_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
+    if (out_env != NULL && out_env[0] != '\0') {
+        if (v3_const_os_is_absolute(out_env)) {
+            v3_copy_text(out_path, sizeof(out_path), out_env);
+        } else {
+            v3_join_path(out_path, sizeof(out_path), paths.root, out_env);
+        }
+    } else if (positional_count > 0U && positionals[0][0] != '\0') {
+        if (v3_const_os_is_absolute(positionals[0])) {
+            v3_copy_text(out_path, sizeof(out_path), positionals[0]);
+        } else {
+            v3_join_path(out_path, sizeof(out_path), paths.root, positionals[0]);
+        }
+    } else {
+        v3_join_path(out_path, sizeof(out_path), out_dir, "cheng_browser_host_abi.wasm");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "cheng_browser_host_abi.compile.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_ensure_parent_dir(out_path) ||
+        !v3_compile_fixture_with_backend_driver_target(compiler_bin,
+                                                       root_v3,
+                                                       src,
+                                                       "wasm32-unknown-unknown",
+                                                       out_path,
+                                                       compile_log) ||
+        !v3_expect_file_exists_nonempty("build-browser-host-wasm output", out_path)) {
+        return 1;
+    }
+    printf("v3 browser host wasm: build ok out=%s\n", out_path);
+    return 0;
+}
+
 static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
     V3BootstrapPaths paths;
     char root_v3[PATH_MAX];
@@ -36467,6 +38625,89 @@ static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
     return v3_dump_file_stdout(run_log) ? 0 : 1;
 }
 
+static int v3_cmd_build_rwad_bft_state_machine_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src[PATH_MAX];
+    char default_out_dir[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char out_bin[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char run_log[PATH_MAX];
+    char target_buf[256];
+    const char *compiler_bin;
+    const char *target = getenv("RWAD_BFT_TARGET");
+    const char *out_dir_env = getenv("RWAD_BFT_OUT_DIR");
+    const char *out_bin_env = getenv("RWAD_BFT_OUT_BIN");
+    const char *run_self_test_env = getenv("RWAD_BFT_RUN_SELF_TEST");
+    const char *host_target = v3_host_target_triple();
+    bool run_self_test = false;
+    char *run_argv[3];
+    int status = 0;
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_RWAD_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    if (!v3_leaf_expect_compiler("build-rwad-bft-state-machine", compiler_bin)) {
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "arm64-apple-darwin";
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/rwad_bft_state_machine_main.cheng");
+    v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_rwad_bft_state_machine");
+    if (!v3_streq(target_buf, "arm64-apple-darwin")) {
+        v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
+    }
+    if (out_dir_env != NULL && out_dir_env[0] != '\0') {
+        v3_copy_text(out_dir, sizeof(out_dir), out_dir_env);
+    } else {
+        v3_copy_text(out_dir, sizeof(out_dir), default_out_dir);
+    }
+    if (out_bin_env != NULL && out_bin_env[0] != '\0') {
+        v3_copy_text(out_bin, sizeof(out_bin), out_bin_env);
+    } else {
+        v3_join_path(out_bin, sizeof(out_bin), out_dir, "rwad_bft_state_machine");
+    }
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "rwad_bft_state_machine.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "rwad_bft_state_machine.self-test.log");
+    if (!v3_mkdir_p(out_dir) ||
+        !v3_ensure_parent_dir(out_bin) ||
+        !v3_compile_fixture_with_backend_driver_target(compiler_bin,
+                                                       root_v3,
+                                                       src,
+                                                       target_buf,
+                                                       out_bin,
+                                                       compile_log) ||
+        access(out_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-rwad-bft-state-machine missing output: %s\n", out_bin);
+        return 1;
+    }
+    if (run_self_test_env != NULL && run_self_test_env[0] != '\0' && !v3_streq(run_self_test_env, "auto")) {
+        run_self_test = !v3_streq(run_self_test_env, "0");
+    } else {
+        run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
+    }
+    if (!run_self_test) {
+        printf("v3 rwad_bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
+        return 0;
+    }
+    run_argv[0] = out_bin;
+    run_argv[1] = "self-test";
+    run_argv[2] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-rwad-bft-state-machine self-test failed log=%s\n", run_log);
+        return 1;
+    }
+    return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
 static bool v3_text_is_decimal_digits(const char *text) {
     size_t i;
     if (text == NULL || text[0] == '\0') {
@@ -36491,6 +38732,23 @@ static bool v3_expect_linux_aarch64_object_report(const char *label,
     ok = ok && v3_expect_text_has_line(label, text, "v3_object_report_v1");
     ok = ok && v3_expect_text_has_line(label, text, "format=elf64");
     ok = ok && v3_expect_text_has_line(label, text, "machine=183");
+    ok = ok && v3_expect_text_has_prefix(label, text, "section_count=");
+    ok = ok && v3_expect_text_has_prefix(label, text, "symbol_count=");
+    free(text);
+    return ok;
+}
+
+static bool v3_expect_linux_x86_64_object_report(const char *label,
+                                                 const char *path) {
+    char *text = v3_debug_object_report(path);
+    bool ok = true;
+    if (text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s object report missing: %s\n", label, path);
+        return false;
+    }
+    ok = ok && v3_expect_text_has_line(label, text, "v3_object_report_v1");
+    ok = ok && v3_expect_text_has_line(label, text, "format=elf64");
+    ok = ok && v3_expect_text_has_line(label, text, "machine=62");
     ok = ok && v3_expect_text_has_prefix(label, text, "section_count=");
     ok = ok && v3_expect_text_has_prefix(label, text, "symbol_count=");
     free(text);
@@ -36535,14 +38793,11 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
     if (v3_streq(target, "arm64-unknown-linux-gnu")) {
         target = "aarch64-unknown-linux-gnu";
     }
-    if (!v3_streq(target, "aarch64-unknown-linux-gnu")) {
-        if (v3_streq(target, "x86_64-unknown-linux-gnu")) {
-            fprintf(stderr, "v3 chain_node linux: unsupported target=%s\n", target);
-            fprintf(stderr, "v3 chain_node linux: x86_64 ordinary chain_node still has no verified Linux object or executable path\n");
-        } else {
-            fprintf(stderr, "v3 chain_node linux: unsupported target=%s\n", target);
-            fprintf(stderr, "v3 chain_node linux: supported linux target is aarch64-unknown-linux-gnu\n");
-        }
+    if (!v3_streq(target, "aarch64-unknown-linux-gnu") &&
+        !v3_streq(target, "x86_64-unknown-linux-gnu")) {
+        fprintf(stderr, "v3 chain_node linux: unsupported target=%s\n", target);
+        fprintf(stderr,
+                "v3 chain_node linux: supported linux targets are aarch64-unknown-linux-gnu and x86_64-unknown-linux-gnu\n");
         return 1;
     }
     v3_copy_text(target_buf, sizeof(target_buf), target);
@@ -36587,7 +38842,10 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
         return 1;
     }
     if (!want_exe) {
-        if (!v3_expect_linux_aarch64_object_report("build-chain-node-linux", out_path)) {
+        if ((v3_streq(target_buf, "aarch64-unknown-linux-gnu") &&
+             !v3_expect_linux_aarch64_object_report("build-chain-node-linux", out_path)) ||
+            (v3_streq(target_buf, "x86_64-unknown-linux-gnu") &&
+             !v3_expect_linux_x86_64_object_report("build-chain-node-linux", out_path))) {
             return 1;
         }
         printf("v3 chain_node linux obj: build ok target=%s out=%s\n", target_buf, out_path);
@@ -36611,6 +38869,86 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
         return 1;
     }
     return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_build_linux_nolibc_exe_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char root_v3[PATH_MAX];
+    char src_path[PATH_MAX];
+    char out_path[PATH_MAX];
+    char report_path[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char target_buf[256];
+    const char *compiler_bin;
+    const char *target = getenv("CHENG_V3_LINUX_EXE_TARGET");
+    const char *source_env = getenv("CHENG_V3_LINUX_EXE_SOURCE");
+    const char *out_env = getenv("CHENG_V3_LINUX_EXE_OUT");
+    const char *report_env = getenv("CHENG_V3_LINUX_EXE_REPORT");
+    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
+        return 1;
+    }
+    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
+                                                argv,
+                                                "CHENG_V3_LINUX_EXE_COMPILER",
+                                                NULL,
+                                                paths.backend_driver_out);
+    if (!v3_leaf_expect_compiler("build-linux-nolibc-exe", compiler_bin)) {
+        return 1;
+    }
+    if (source_env == NULL || source_env[0] == '\0') {
+        fprintf(stderr, "v3 linux exe: missing CHENG_V3_LINUX_EXE_SOURCE\n");
+        return 1;
+    }
+    if (out_env == NULL || out_env[0] == '\0') {
+        fprintf(stderr, "v3 linux exe: missing CHENG_V3_LINUX_EXE_OUT\n");
+        return 1;
+    }
+    if (target == NULL || target[0] == '\0') {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (v3_streq(target, "arm64-unknown-linux-gnu")) {
+        target = "aarch64-unknown-linux-gnu";
+    }
+    if (!v3_streq(target, "aarch64-unknown-linux-gnu")) {
+        fprintf(stderr, "v3 linux exe: unsupported target=%s\n", target);
+        return 1;
+    }
+    v3_copy_text(target_buf, sizeof(target_buf), target);
+    if (v3_const_os_is_absolute(source_env)) {
+        v3_copy_text(src_path, sizeof(src_path), source_env);
+    } else {
+        v3_join_path(src_path, sizeof(src_path), paths.root, source_env);
+    }
+    if (v3_const_os_is_absolute(out_env)) {
+        v3_copy_text(out_path, sizeof(out_path), out_env);
+    } else {
+        v3_join_path(out_path, sizeof(out_path), paths.root, out_env);
+    }
+    if (report_env != NULL && report_env[0] != '\0') {
+        if (v3_const_os_is_absolute(report_env)) {
+            v3_copy_text(report_path, sizeof(report_path), report_env);
+        } else {
+            v3_join_path(report_path, sizeof(report_path), paths.root, report_env);
+        }
+    } else {
+        report_path[0] = '\0';
+    }
+    snprintf(compile_log, sizeof(compile_log), "%s.compile.log", out_path);
+    if (!v3_ensure_parent_dir(out_path) ||
+        (report_path[0] != '\0' && !v3_ensure_parent_dir(report_path)) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin,
+                                                            root_v3,
+                                                            src_path,
+                                                            "exe",
+                                                            target_buf,
+                                                            out_path,
+                                                            compile_log,
+                                                            report_path[0] != '\0' ? report_path : NULL) ||
+        !v3_expect_file_exists_nonempty("build-linux-nolibc-exe output", out_path)) {
+        return 1;
+    }
+    printf("v3 linux exe: build ok target=%s out=%s\n", target_buf, out_path);
+    return 0;
 }
 
 static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv) {
@@ -36651,14 +38989,11 @@ static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv) {
     if (v3_streq(target, "arm64-unknown-linux-gnu")) {
         target = "aarch64-unknown-linux-gnu";
     }
-    if (!v3_streq(target, "aarch64-unknown-linux-gnu")) {
-        if (v3_streq(target, "x86_64-unknown-linux-gnu")) {
-            fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported target=%s\n", target);
-            fprintf(stderr, "v3 rwad_bft_state_machine linux: x86_64 ordinary rwad_bft still has no verified Linux object or executable path\n");
-        } else {
-            fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported target=%s\n", target);
-            fprintf(stderr, "v3 rwad_bft_state_machine linux: supported linux target is aarch64-unknown-linux-gnu\n");
-        }
+    if (!v3_streq(target, "aarch64-unknown-linux-gnu") &&
+        !v3_streq(target, "x86_64-unknown-linux-gnu")) {
+        fprintf(stderr, "v3 rwad_bft_state_machine linux: unsupported target=%s\n", target);
+        fprintf(stderr,
+                "v3 rwad_bft_state_machine linux: supported linux targets are aarch64-unknown-linux-gnu and x86_64-unknown-linux-gnu\n");
         return 1;
     }
     v3_copy_text(target_buf, sizeof(target_buf), target);
@@ -36703,7 +39038,10 @@ static int v3_cmd_build_rwad_bft_linux_impl(int argc, char **argv) {
         return 1;
     }
     if (!want_exe) {
-        if (!v3_expect_linux_aarch64_object_report("build-rwad-bft-linux", out_path)) {
+        if ((v3_streq(target_buf, "aarch64-unknown-linux-gnu") &&
+             !v3_expect_linux_aarch64_object_report("build-rwad-bft-linux", out_path)) ||
+            (v3_streq(target_buf, "x86_64-unknown-linux-gnu") &&
+             !v3_expect_linux_x86_64_object_report("build-rwad-bft-linux", out_path))) {
             return 1;
         }
         printf("v3 rwad_bft_state_machine linux obj: build ok target=%s out=%s\n", target_buf, out_path);
@@ -36821,6 +39159,32 @@ static const char *v3_leaf_resolve_label(int argc,
 
 static bool v3_leaf_expect_compiler(const char *label,
                                     const char *compiler_bin) {
+    V3BootstrapPaths paths;
+    v3_bootstrap_paths_init(&paths);
+    if (compiler_bin != NULL && compiler_bin[0] != '\0') {
+        if (strcmp(compiler_bin, paths.backend_driver_out) == 0 &&
+            access(compiler_bin, X_OK) != 0) {
+            if (!v3_backend_driver_ready(&paths) &&
+                v3_cmd_build_backend_driver(0, NULL) != 0) {
+                fprintf(stderr, "[cheng_v3_seed] %s failed to rebuild backend driver: %s\n",
+                        label,
+                        compiler_bin);
+                return false;
+            }
+        } else if ((strcmp(compiler_bin, paths.stage0) == 0 ||
+                    strcmp(compiler_bin, paths.stage1) == 0 ||
+                    strcmp(compiler_bin, paths.stage2) == 0 ||
+                    strcmp(compiler_bin, paths.stage3) == 0) &&
+                   access(compiler_bin, X_OK) != 0) {
+            if (!v3_bootstrap_artifacts_fresh(&paths) &&
+                v3_cmd_bootstrap_bridge(0, NULL) != 0) {
+                fprintf(stderr, "[cheng_v3_seed] %s failed to rebuild bootstrap compiler: %s\n",
+                        label,
+                        compiler_bin);
+                return false;
+            }
+        }
+    }
     if (compiler_bin != NULL && compiler_bin[0] != '\0' && access(compiler_bin, X_OK) == 0) {
         return true;
     }
@@ -38525,7 +40889,8 @@ static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv) {
             continue;
         }
         if (strcmp(name, "guarded_exec_v3.py") == 0 ||
-            strcmp(name, "orphan_guard_run.sh") == 0) {
+            strcmp(name, "orphan_guard_run.sh") == 0 ||
+            strcmp(name, "failfast_parallel.sh") == 0) {
             fprintf(stderr, "verify_orphan_guard_v3: banned tooling entry name: %s/%s\n", tooling_dir, name);
             closedir(dir);
             return 1;
@@ -38549,7 +40914,8 @@ static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv) {
             return 1;
         }
         if (strstr(text, "guarded_exec_v3.py") != NULL ||
-            strstr(text, "orphan_guard_run.sh") != NULL) {
+            strstr(text, "orphan_guard_run.sh") != NULL ||
+            strstr(text, "failfast_parallel.sh") != NULL) {
             fprintf(stderr, "verify_orphan_guard_v3: banned direct process guard ref in %s\n", child_path);
             free(text);
             closedir(dir);
@@ -38853,19 +41219,89 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     char panic_bin[PATH_MAX];
     char bounds_bin[PATH_MAX];
     char signal_bin[PATH_MAX];
+    char linux_bin[PATH_MAX];
     char panic_compile_log[PATH_MAX];
     char bounds_compile_log[PATH_MAX];
     char signal_compile_log[PATH_MAX];
     char panic_run_log[PATH_MAX];
     char bounds_run_log[PATH_MAX];
     char signal_run_log[PATH_MAX];
+    char panic_report[PATH_MAX];
+    char linux_compile_log[PATH_MAX];
+    char linux_report[PATH_MAX];
     char panic_line_map[PATH_MAX];
     char bounds_line_map[PATH_MAX];
     char signal_line_map[PATH_MAX];
+    char direct_debug_source[PATH_MAX];
+    char linux_runtime_source[PATH_MAX];
+    char shim_debug_source[PATH_MAX];
+    char panic_debug_provider_object[PATH_MAX];
+    char linux_runtime_object[PATH_MAX];
     char *panic_argv[2];
     char *bounds_argv[2];
     char *signal_argv[2];
     char *bounds_log_text = NULL;
+    char *linux_report_text = NULL;
+    char *panic_report_text = NULL;
+    const char *host_target = NULL;
+    const char *const *allowed_debug_runtime_undefined = NULL;
+    size_t allowed_debug_runtime_undefined_count = 0U;
+    const char *linux_target = "aarch64-unknown-linux-gnu";
+    static const char *const allowed_debug_runtime_exports[] = {
+        "cheng_crash_trace_enabled",
+        "cheng_crash_trace_mark",
+        "cheng_crash_trace_set_phase",
+        "cheng_dump_backtrace_if_enabled",
+        "cheng_force_segv",
+        "cheng_v3_native_dump_backtrace_and_exit",
+        "cheng_v3_native_register_line_map_from_argv0"
+    };
+    static const char *const allowed_debug_runtime_undefined_darwin[] = {
+        "__NSGetExecutablePath",
+        "___memcpy_chk",
+        "___stack_chk_fail",
+        "___stack_chk_guard",
+        "___stderrp",
+        "__exit",
+        "_abort",
+        "_atexit",
+        "_backtrace",
+        "_backtrace_symbols_fd",
+        "_calloc",
+        "_dladdr",
+        "_dlerror",
+        "_dlsym",
+        "_exit",
+        "_fclose",
+        "_fflush",
+        "_fopen$DARWIN_EXTSN",
+        "_fprintf",
+        "_fputc",
+        "_free",
+        "_fwrite",
+        "_getenv",
+        "_malloc",
+        "_memcpy",
+        "_mkdir",
+        "_raise",
+        "_realpath$DARWIN_EXTSN",
+        "_setitimer",
+        "_sigaction",
+        "_snprintf",
+        "_stat",
+        "_strlen",
+        "_strrchr",
+        "_strtol",
+        "_write"
+    };
+    static const char *const allowed_linux_runtime_undefined[] = {
+        "__cheng_linux_syscall1",
+        "__cheng_linux_syscall2",
+        "__cheng_linux_syscall3",
+        "__cheng_linux_syscall4",
+        "__cheng_linux_syscall5",
+        "__cheng_linux_syscall6"
+    };
     int status = 0;
     (void)argc;
     (void)argv;
@@ -38878,29 +41314,120 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     v3_join_path(src_panic, sizeof(src_panic), paths.root, "v3/src/tests/ordinary_panic_fixture.cheng");
     v3_join_path(src_bounds, sizeof(src_bounds), paths.root, "v3/src/tests/ordinary_bounds_trace_fixture.cheng");
     v3_join_path(src_signal, sizeof(src_signal), paths.root, "v3/src/tests/ordinary_signal_trace_fixture.cheng");
+    v3_join_path(direct_debug_source, sizeof(direct_debug_source), paths.root, "src/runtime/native/system_helpers_debug_trace_profile.c");
+    v3_join_path(linux_runtime_source,
+                 sizeof(linux_runtime_source),
+                 paths.root,
+                 "src/std/system_helpers_backend_nolibc_linux_aarch64.cheng");
+    v3_join_path(shim_debug_source, sizeof(shim_debug_source), paths.root, "v3/runtime/native/v3_debug_runtime_shim.c");
     v3_join_path(panic_bin, sizeof(panic_bin), out_dir, "ordinary_panic_fixture");
     v3_join_path(bounds_bin, sizeof(bounds_bin), out_dir, "ordinary_bounds_trace_fixture");
     v3_join_path(signal_bin, sizeof(signal_bin), out_dir, "ordinary_signal_trace_fixture");
+    v3_join_path(linux_bin, sizeof(linux_bin), out_dir, "ordinary_panic_fixture_linux");
     v3_join_path(panic_compile_log, sizeof(panic_compile_log), out_dir, "ordinary_panic_fixture.compile.log");
+    v3_join_path(linux_compile_log, sizeof(linux_compile_log), out_dir, "ordinary_panic_fixture_linux.compile.log");
     v3_join_path(bounds_compile_log, sizeof(bounds_compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
     v3_join_path(signal_compile_log, sizeof(signal_compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
     v3_join_path(panic_run_log, sizeof(panic_run_log), out_dir, "ordinary_panic_fixture.run.log");
     v3_join_path(bounds_run_log, sizeof(bounds_run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
     v3_join_path(signal_run_log, sizeof(signal_run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
+    v3_join_path(panic_report, sizeof(panic_report), out_dir, "ordinary_panic_fixture.report.txt");
+    v3_join_path(linux_report, sizeof(linux_report), out_dir, "ordinary_panic_fixture_linux.report.txt");
     snprintf(panic_line_map, sizeof(panic_line_map), "%s.v3.map", panic_bin);
     snprintf(bounds_line_map, sizeof(bounds_line_map), "%s.v3.map", bounds_bin);
     snprintf(signal_line_map, sizeof(signal_line_map), "%s.v3.map", signal_bin);
+    snprintf(panic_debug_provider_object,
+             sizeof(panic_debug_provider_object),
+             "%s.provider.runtime_debug_runtime_v3.o",
+             panic_bin);
+    snprintf(linux_runtime_object,
+             sizeof(linux_runtime_object),
+             "%s.runtime.system_helpers_backend_nolibc_linux_aarch64.o",
+             linux_bin);
+    host_target = v3_host_target_triple();
     if (!v3_mkdir_p(out_dir)) {
         return 1;
     }
-    if (!v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_panic, panic_bin, panic_compile_log) ||
+    if (v3_path_exists_nonempty(shim_debug_source)) {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-runtime dead shim still exists: %s\n", shim_debug_source);
+        return 1;
+    }
+    if (!v3_expect_file_exists_nonempty("verify-debug-runtime direct source", direct_debug_source)) {
+        return 1;
+    }
+    if (host_target == NULL || host_target[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-runtime unsupported host target\n");
+        return 1;
+    }
+    if (v3_text_contains_substring(host_target, "-apple-darwin")) {
+        allowed_debug_runtime_undefined = allowed_debug_runtime_undefined_darwin;
+        allowed_debug_runtime_undefined_count =
+            sizeof(allowed_debug_runtime_undefined_darwin) / sizeof(allowed_debug_runtime_undefined_darwin[0]);
+    } else {
+        fprintf(stderr,
+                "[cheng_v3_seed] verify-debug-runtime undefined whitelist unsupported host target: %s\n",
+                host_target);
+        return 1;
+    }
+    if (!v3_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
+                                                            root_v3,
+                                                            src_panic,
+                                                            "exe",
+                                                            host_target,
+                                                            panic_bin,
+                                                            panic_compile_log,
+                                                            panic_report) ||
         !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_bounds, bounds_bin, bounds_compile_log) ||
         !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src_signal, signal_bin, signal_compile_log) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(paths.backend_driver_out,
+                                                            root_v3,
+                                                            src_panic,
+                                                            "exe",
+                                                            linux_target,
+                                                            linux_bin,
+                                                            linux_compile_log,
+                                                            linux_report) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime panic report", panic_report) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime panic provider object", panic_debug_provider_object) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime linux report", linux_report) ||
+        !v3_expect_file_exists_nonempty("verify-debug-runtime linux runtime object", linux_runtime_object) ||
         !v3_expect_file_exists_nonempty("verify-debug-runtime panic line-map", panic_line_map) ||
         !v3_expect_file_exists_nonempty("verify-debug-runtime bounds line-map", bounds_line_map) ||
         !v3_expect_file_exists_nonempty("verify-debug-runtime signal line-map", signal_line_map)) {
         return 1;
     }
+    panic_report_text = v3_read_file(panic_report);
+    if (panic_report_text == NULL ||
+        !v3_expect_text_contains("verify-debug-runtime panic report", panic_report_text, "provider_source_paths=") ||
+        !v3_expect_text_contains("verify-debug-runtime panic report", panic_report_text, direct_debug_source) ||
+        !v3_expect_text_not_contains("verify-debug-runtime panic report", panic_report_text, shim_debug_source) ||
+        !v3_expect_text_contains("verify-debug-runtime panic report", panic_report_text, panic_debug_provider_object) ||
+        !v3_expect_object_export_whitelist("verify-debug-runtime provider exports",
+                                           panic_debug_provider_object,
+                                           allowed_debug_runtime_exports,
+                                           sizeof(allowed_debug_runtime_exports) / sizeof(allowed_debug_runtime_exports[0])) ||
+        !v3_expect_object_undefined_whitelist("verify-debug-runtime provider undefined",
+                                              panic_debug_provider_object,
+                                              allowed_debug_runtime_undefined,
+                                              allowed_debug_runtime_undefined_count)) {
+        free(panic_report_text);
+        return 1;
+    }
+    free(panic_report_text);
+    linux_report_text = v3_read_file(linux_report);
+    if (linux_report_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-runtime linux report", linux_report_text, "linux_nolibc_support_enabled=1") ||
+        !v3_expect_text_contains("verify-debug-runtime linux report", linux_report_text, linux_runtime_source) ||
+        !v3_expect_text_contains("verify-debug-runtime linux report", linux_report_text, linux_runtime_object) ||
+        !v3_expect_object_undefined_whitelist("verify-debug-runtime linux runtime undefined",
+                                              linux_runtime_object,
+                                              allowed_linux_runtime_undefined,
+                                              sizeof(allowed_linux_runtime_undefined) /
+                                                  sizeof(allowed_linux_runtime_undefined[0]))) {
+        free(linux_report_text);
+        return 1;
+    }
+    free(linux_report_text);
     panic_argv[0] = panic_bin;
     panic_argv[1] = NULL;
     bounds_argv[0] = bounds_bin;
@@ -38951,10 +41478,18 @@ static int v3_cmd_verify_debug_profile_impl(int argc, char **argv) {
     char src[PATH_MAX];
     char out_bin[PATH_MAX];
     char report[PATH_MAX];
+    char raw_report[PATH_MAX];
+    char direct_report[PATH_MAX];
+    char direct_log[PATH_MAX];
+    char compiler_bin[PATH_MAX];
+    char in_flag[PATH_MAX + 16];
+    char out_flag[PATH_MAX + 16];
+    char *report_argv[5];
+    char *raw_report_text = NULL;
     char *report_text = NULL;
+    char *direct_report_text = NULL;
+    int status = 0;
     int rc = 1;
-    (void)argc;
-    (void)argv;
     v3_bootstrap_paths_init(&paths);
     if (!v3_bootstrap_artifacts_ready(&paths) && v3_cmd_bootstrap_bridge(0, NULL) != 0) {
         return 1;
@@ -38963,6 +41498,9 @@ static int v3_cmd_verify_debug_profile_impl(int argc, char **argv) {
     v3_join_path(src, sizeof(src), paths.root, "v3/src/tests/ordinary_profile_hotspots_fixture.cheng");
     v3_join_path(out_bin, sizeof(out_bin), out_dir, "ordinary_profile_hotspots_fixture");
     v3_join_path(report, sizeof(report), out_dir, "profile.txt");
+    v3_join_path(direct_report, sizeof(direct_report), out_dir, "profile.direct.txt");
+    v3_profile_raw_report_path_from_report(report, raw_report, sizeof(raw_report));
+    snprintf(direct_log, sizeof(direct_log), "%s.profile-report.log", direct_report);
     if (!v3_mkdir_p(out_dir)) {
         return 1;
     }
@@ -38987,9 +41525,41 @@ static int v3_cmd_verify_debug_profile_impl(int argc, char **argv) {
         !v3_expect_text_contains("verify-debug-profile", report_text, "|0x")) {
         goto cleanup;
     }
+    raw_report_text = v3_read_file(raw_report);
+    if (raw_report_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-profile raw", raw_report_text, "v3_profile_raw_v1") ||
+        !v3_text_has_positive_integer_line(raw_report_text, "total_samples=") ||
+        !v3_expect_text_contains("verify-debug-profile raw", raw_report_text, "sample\t0x")) {
+        goto cleanup;
+    }
+    if (!v3_profile_report_live_compiler_bin(&paths, compiler_bin, sizeof(compiler_bin))) {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-profile missing live compiler\n");
+        goto cleanup;
+    }
+    snprintf(in_flag, sizeof(in_flag), "--in:%s", raw_report);
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", direct_report);
+    report_argv[0] = compiler_bin;
+    report_argv[1] = "profile-report";
+    report_argv[2] = in_flag;
+    report_argv[3] = out_flag;
+    report_argv[4] = NULL;
+    if (!v3_run_binary_capture_output(report_argv, direct_log, &status) ||
+        !v3_status_is_exit_code(status, 0) ||
+        !v3_expect_file_exists_nonempty("verify-debug-profile direct report", direct_report)) {
+        goto cleanup;
+    }
+    direct_report_text = v3_read_file(direct_report);
+    if (direct_report_text == NULL ||
+        !v3_expect_text_has_line("verify-debug-profile direct", direct_report_text, "v3_profile_v1") ||
+        strcmp(report_text, direct_report_text) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] verify-debug-profile direct report mismatch: %s\n", direct_report);
+        goto cleanup;
+    }
     puts("v3 debug profile: ok");
     rc = 0;
 cleanup:
+    free(direct_report_text);
+    free(raw_report_text);
     free(report_text);
     return rc;
 }
@@ -39515,6 +42085,7 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
         "content_codec_smoke",
         "content_runtime_smoke",
         "native_client_hello_wire_smoke",
+        "quic_tls_transport_ecdsa_smoke",
         "quic_transport_loopback_smoke",
         "libp2p_quic_tls_smoke",
         "libp2p_tailnet_policy_smoke",
@@ -40991,7 +43562,9 @@ static int v3_cmd_profile_run(int argc, char **argv) {
     char package_probe[PATH_MAX];
     char output_path[PATH_MAX];
     char report_path[PATH_MAX];
+    char raw_report_path[PATH_MAX];
     char compile_log[PATH_MAX];
+    char profile_report_log[PATH_MAX];
     const char *slash;
     const char *base;
     size_t stem_len;
@@ -41049,12 +43622,15 @@ static int v3_cmd_profile_run(int argc, char **argv) {
     } else {
         snprintf(report_path, sizeof(report_path), "%s.v3.profile.txt", output_path);
     }
+    v3_profile_raw_report_path_from_report(report_path, raw_report_path, sizeof(raw_report_path));
     snprintf(compile_log, sizeof(compile_log), "%s.compile.log", output_path);
+    snprintf(profile_report_log, sizeof(profile_report_log), "%s.profile-report.log", output_path);
     if (!v3_ensure_parent_dir(output_path) ||
-        !v3_ensure_parent_dir(report_path)) {
+        !v3_ensure_parent_dir(report_path) ||
+        !v3_ensure_parent_dir(raw_report_path)) {
         return 1;
     }
-    if (!v3_path_exists_nonempty(paths.backend_driver_out) &&
+    if (!v3_backend_driver_ready(&paths) &&
         v3_cmd_build_backend_driver(0, NULL) != 0) {
         return 1;
     }
@@ -41070,9 +43646,24 @@ static int v3_cmd_profile_run(int argc, char **argv) {
         return 1;
     }
     setenv("CHENG_V3_PROFILE_ENABLE", "1", 1);
-    setenv("CHENG_V3_PROFILE_OUT", report_path, 1);
+    unsetenv("CHENG_V3_PROFILE_OUT");
+    setenv("CHENG_V3_PROFILE_RAW_OUT", raw_report_path, 1);
     setenv("CHENG_V3_PROFILE_HZ", (profile_hz && *profile_hz != '\0') ? profile_hz : "200", 1);
     if (!v3_run_profiled_binary(output_path)) {
+        goto cleanup;
+    }
+    unsetenv("CHENG_V3_PROFILE_ENABLE");
+    unsetenv("CHENG_V3_PROFILE_RAW_OUT");
+    unsetenv("CHENG_V3_PROFILE_OUT");
+    unsetenv("CHENG_V3_PROFILE_HZ");
+    if (!v3_path_exists_nonempty(raw_report_path)) {
+        fprintf(stderr, "[cheng_v3_seed] missing raw profile report: %s\n", raw_report_path);
+        goto cleanup;
+    }
+    if (!v3_profile_report_transform_raw(raw_report_path,
+                                         report_path,
+                                         profile_report_log)) {
+        fprintf(stderr, "[cheng_v3_seed] profile report transform failed: %s\n", profile_report_log);
         goto cleanup;
     }
     report = v3_read_file(report_path);
@@ -41083,6 +43674,42 @@ static int v3_cmd_profile_run(int argc, char **argv) {
     fputs(report, stdout);
     rc = 0;
 cleanup:
+    free(report);
+    return rc;
+}
+
+static int v3_cmd_profile_report(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    const char *raw_report_path = v3_flag_value(argc, argv, "--in");
+    const char *out_flag = v3_flag_value(argc, argv, "--out");
+    char report_path[PATH_MAX];
+    char profile_report_log[PATH_MAX];
+    char *report = NULL;
+    int rc = 1;
+    v3_bootstrap_paths_init(&paths);
+    if (raw_report_path == NULL || raw_report_path[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] profile-report requires --in:<raw-report>\n");
+        return 1;
+    }
+    if (out_flag != NULL && out_flag[0] != '\0') {
+        v3_copy_text(report_path, sizeof(report_path), out_flag);
+    } else {
+        v3_profile_report_path_from_raw(raw_report_path, report_path, sizeof(report_path));
+    }
+    snprintf(profile_report_log, sizeof(profile_report_log), "%s.profile-report.log", report_path);
+    if (!v3_profile_report_transform_raw(raw_report_path,
+                                         report_path,
+                                         profile_report_log)) {
+        fprintf(stderr, "[cheng_v3_seed] profile report transform failed: %s\n", profile_report_log);
+        return 1;
+    }
+    report = v3_read_file(report_path);
+    if (report == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] missing profile report: %s\n", report_path);
+        return 1;
+    }
+    fputs(report, stdout);
+    rc = 0;
     free(report);
     return rc;
 }
@@ -42217,6 +44844,9 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "profile-run")) {
         return v3_cmd_profile_run(argc, argv);
     }
+    if (v3_streq(argv[1], "profile-report")) {
+        return v3_cmd_profile_report(argc, argv);
+    }
     if (v3_streq(argv[1], "verify-orphan-guard")) {
         return v3_cmd_verify_orphan_guard_impl(argc, argv);
     }
@@ -42268,11 +44898,23 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "build-program-selfhost")) {
         return v3_cmd_build_program_selfhost_impl(argc, argv);
     }
+    if (v3_streq(argv[1], "build-bft-state-machine")) {
+        return v3_cmd_build_bft_state_machine_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-browser-host-wasm")) {
+        return v3_cmd_build_browser_host_wasm_impl(argc, argv);
+    }
     if (v3_streq(argv[1], "build-chain-node")) {
         return v3_cmd_build_chain_node_impl(argc, argv);
     }
+    if (v3_streq(argv[1], "build-rwad-bft-state-machine")) {
+        return v3_cmd_build_rwad_bft_state_machine_impl(argc, argv);
+    }
     if (v3_streq(argv[1], "build-chain-node-linux")) {
         return v3_cmd_build_chain_node_linux_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "build-linux-nolibc-exe")) {
+        return v3_cmd_build_linux_nolibc_exe_impl(argc, argv);
     }
     if (v3_streq(argv[1], "build-rwad-bft-linux")) {
         return v3_cmd_build_rwad_bft_linux_impl(argc, argv);

@@ -322,7 +322,11 @@ fn v3GateEnsureBootstrapBridge(root: str): int32 =
     if contracts.v3BootstrapBridgeReady(snapshot) &&
        stage3Mtime > int64(0) &&
        os.fileMtime(snapshot.seedSource.path) <= stage3Mtime &&
-       os.fileMtime(snapshot.stage1Source.path) <= stage3Mtime:
+       os.fileMtime(snapshot.stage1Source.path) <= stage3Mtime &&
+       os.fileMtime(contracts.v3BootstrapCompilerEntrySourcePath(root)) <= stage3Mtime &&
+       os.fileMtime(contracts.v3BootstrapCompilerRuntimeSourcePath(root)) <= stage3Mtime &&
+       os.fileMtime(contracts.v3BootstrapCompilerRequestSourcePath(root)) <= stage3Mtime &&
+       os.fileMtime(contracts.v3BootstrapGateMainSourcePath(root)) <= stage3Mtime:
         return 0
     return v3GateBootstrapBridge(root)
 
@@ -525,6 +529,25 @@ fn v3GateEnsureBackendDriverReady(root: str, outCompiler: var str): int32 =
         return 0
     return v3GateBuildBackendDriver(root)
 
+fn v3GateEnsureCompilerReady(root: str, compilerPath: str, outCompiler: var str): int32 =
+    let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
+    outCompiler = v3path.v3PathAbsolute(root, compilerPath)
+    if outCompiler == snapshot.backendDriverOut.path:
+        if !os.fileExists(outCompiler):
+            return v3GateEnsureBackendDriverReady(root, outCompiler)
+        return 0
+    if outCompiler == snapshot.stage0Compiler.path ||
+       outCompiler == snapshot.stage1Compiler.path ||
+       outCompiler == snapshot.stage2Compiler.path ||
+       outCompiler == snapshot.stage3Compiler.path:
+        if !os.fileExists(outCompiler):
+            return v3GateEnsureBootstrapBridge(root)
+        return 0
+    if os.fileExists(outCompiler):
+        return 0
+    v3GatePrintErr("v3 gate: missing compiler: " + outCompiler)
+    return 1
+
 fn v3GateCompileExeEnv(root: str,
                        label: str,
                        compilerPath: str,
@@ -534,6 +557,7 @@ fn v3GateCompileExeEnv(root: str,
                        logRelPath: str,
                        envOverrides: str[]): hostops.V3LoggedRun =
     let packageRoot: str = v3path.v3PathAbsolute(root, "v3")
+    var compilerAbs: str = ""
     let outParts: os.SplitFileResult = os.splitFile(outPath)
     if len(outParts.dir) > 0:
         let _ = v3path.v3MkdirP(root, outParts.dir)
@@ -541,9 +565,15 @@ fn v3GateCompileExeEnv(root: str,
     let logParts: os.SplitFileResult = os.splitFile(logAbs)
     if len(logParts.dir) > 0:
         let _ = v3path.v3MkdirP(root, logParts.dir)
+    if v3GateEnsureCompilerReady(root, compilerPath, compilerAbs) != 0:
+        return hostops.v3LoggedRunZero(label,
+                                       compilerAbs,
+                                       logAbs,
+                                       1,
+                                       "v3 gate: compiler missing during compile: " + compilerAbs + "\n")
     let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
                                                            label,
-                                                           compilerPath,
+                                                           compilerAbs,
                                                            [
                                                                "system-link-exec",
                                                                "--root", packageRoot,
@@ -758,8 +788,8 @@ fn v3GateTextContainsAny(text: str, needles: str[]): bool =
 
 fn v3GateVerifyOrphanGuard(root: str): int32 =
     let toolingDir: str = v3path.v3PathAbsolute(root, "v3/tooling")
-    let bannedText: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh"]
-    let bannedNames: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh"]
+    let bannedText: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh", "failfast_parallel.sh"]
+    let bannedNames: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh", "failfast_parallel.sh"]
     let entries: str[] = os.walkDir(toolingDir)
     for i in 0..<entries.len:
         let entry: os.WalkDirEntry = os.walkDirEntry(entries, i)
@@ -826,6 +856,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "content_codec_smoke",
         "content_runtime_smoke",
         "native_client_hello_wire_smoke",
+        "quic_tls_transport_ecdsa_smoke",
         "quic_transport_loopback_smoke",
         "libp2p_quic_tls_smoke",
         "libp2p_tailnet_policy_smoke",
@@ -2427,27 +2458,68 @@ fn v3GateBuildBftStateMachine(root: str): int32 =
     var compiler = ""
     if v3GateResolveSmokeCompiler(root, "", "CHENG_V3_BFT_COMPILER", "", compiler) != 0:
         return 1
-    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine")
+    let target: str = os.getEnvDefault("BFT_STATE_TARGET", "arm64-apple-darwin")
+    var defaultOutDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine")
+    if target != "arm64-apple-darwin":
+        defaultOutDir = os.joinPath(defaultOutDir, target)
+    let outDir: str = os.getEnvDefault("BFT_STATE_OUT_DIR", defaultOutDir)
     let src: str = v3path.v3PathAbsolute(root, "v3/src/project/bft_state_machine_main.cheng")
-    let outBin: str = os.joinPath(outDir, "bft_state_machine")
+    let outBin: str = os.getEnvDefault("BFT_STATE_OUT_BIN", os.joinPath(outDir, "bft_state_machine"))
     let compileRun = v3GateCompileExe(root,
                                       "build_bft_state_machine",
                                       compiler,
                                       src,
                                       outBin,
-                                      "arm64-apple-darwin",
+                                      target,
                                       os.joinPath(outDir, "bft_state_machine.compile.log"))
     if v3GateRunFailed(compileRun):
         return compileRun.exitCode
-    let run = v3GateRunBinary(root,
-                              "build_bft_state_machine_run",
-                              outBin,
-                              [],
-                              20,
-                              os.joinPath(outDir, "bft_state_machine.self-test.log"))
-    v3GateMaybePrintRunOutput(run)
-    if v3GateRunFailed(run):
-        return run.exitCode
+    var runSelfTestDefault = "0"
+    if target == v3GateHostTarget(root):
+        runSelfTestDefault = "1"
+    let runSelfTest: str = os.getEnvDefault("BFT_STATE_RUN_SELF_TEST", runSelfTestDefault)
+    if runSelfTest != "0":
+        let run = v3GateRunBinary(root,
+                                  "build_bft_state_machine_run",
+                                  outBin,
+                                  ["self-test"],
+                                  60,
+                                  os.joinPath(outDir, "bft_state_machine.self-test.log"))
+        v3GateMaybePrintRunOutput(run)
+        if v3GateRunFailed(run):
+            return run.exitCode
+    else:
+        v3GatePrintLine("v3 bft_state_machine: build ok target=" + target + " out=" + outBin)
+    return 0
+
+fn v3GateBuildBrowserHostWasm(root: str, args: str[]): int32 =
+    let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_WASM_COMPILER", "", compiler) != 0:
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_browser_host_wasm")
+    let src: str = v3path.v3PathAbsolute(root, "v3/src/libp2p/browser/browser_host_wasm_probe.cheng")
+    let positionals: str[] = v3GateCollectPositionals(args)
+    var outWasm: str = os.getEnvDefault("CHENG_V3_BROWSER_HOST_WASM_OUT", "")
+    if len(outWasm) <= 0 && positionals.len > 0:
+        outWasm = positionals[0]
+    if len(outWasm) <= 0:
+        outWasm = os.joinPath(outDir, "cheng_browser_host_abi.wasm")
+    else:
+        outWasm = v3path.v3PathAbsolute(root, outWasm)
+    let compileRun = v3GateCompileExe(root,
+                                      "build_browser_host_wasm",
+                                      compiler,
+                                      src,
+                                      outWasm,
+                                      "wasm32-unknown-unknown",
+                                      os.joinPath(outDir, "cheng_browser_host_abi.compile.log"))
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if !os.fileExists(outWasm):
+        v3GatePrintErr("v3 browser host wasm: missing wasm output: " + outWasm)
+        return 1
+    v3GatePrintLine("v3 browser host wasm: build ok out=" + outWasm)
     return 0
 
 fn v3GateBuildRwadBftStateMachine(root: str): int32 =
@@ -2585,6 +2657,7 @@ fn v3GateVerifyDebugProfile(root: str): int32 =
     let src: str = v3path.v3PathAbsolute(root, "v3/src/tests/ordinary_profile_hotspots_fixture.cheng")
     let outBin: str = os.joinPath(outDir, "ordinary_profile_hotspots_fixture")
     let report: str = os.joinPath(outDir, "profile.txt")
+    let rawReport: str = os.joinPath(outDir, "profile.raw.txt")
     let compileRun = v3GateCompileExe(root, "verify_debug_profile", compiler, src, outBin, "arm64-apple-darwin", "artifacts/v3_debug_profile_verify/ordinary_profile_hotspots_fixture.compile.log")
     if v3GateRunFailed(compileRun):
         return compileRun.exitCode
@@ -2595,13 +2668,35 @@ fn v3GateVerifyDebugProfile(root: str): int32 =
                                       [
                                           "CHENG_V3_PROFILE_ENABLE=1",
                                           "CHENG_V3_PROFILE_HZ=200",
-                                          "CHENG_V3_PROFILE_OUT=" + report
+                                          "CHENG_V3_PROFILE_RAW_OUT=" + rawReport
                                       ],
                                       root,
                                       20,
                                       "artifacts/v3_debug_profile_verify/ordinary_profile_hotspots_fixture.run.log")
     if v3GateRunFailed(run):
         return run.exitCode
+    if !os.fileExists(rawReport):
+        v3GatePrintErr("v3 debug profile: missing raw report")
+        return 1
+    let rawReportText: str = v3path.v3ReadTextFile("", rawReport)
+    if !v3GateOutputContains(rawReportText, "v3_profile_raw_v1") ||
+       !v3GateOutputContains(rawReportText, "sample\t0x"):
+        v3GatePrintErr("v3 debug profile: invalid raw report")
+        return 1
+    let transformRun = hostops.v3RunFileLogged(root,
+                                               "verify_debug_profile_transform",
+                                               compiler,
+                                               [
+                                                   "profile-report",
+                                                   "--in:" + rawReport,
+                                                   "--out:" + report
+                                               ],
+                                               [],
+                                               root,
+                                               20,
+                                               "artifacts/v3_debug_profile_verify/profile-report.run.log")
+    if v3GateRunFailed(transformRun):
+        return transformRun.exitCode
     if !os.fileExists(report):
         v3GatePrintErr("v3 debug profile: missing report")
         return 1
@@ -2879,6 +2974,8 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return v3GateBuildFfiHandle(root)
     if cmd == "build-bft-state-machine":
         return v3GateBuildBftStateMachine(root)
+    if cmd == "build-browser-host-wasm":
+        return v3GateBuildBrowserHostWasm(root, args)
     if cmd == "build-rwad-bft-state-machine":
         return v3GateBuildRwadBftStateMachine(root)
     if cmd == "build-program-selfhost":

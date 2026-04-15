@@ -2,6 +2,9 @@
 
 | 项目 | 结论 |
 |---|---|
+| 新发现 | `debug/runtime` 这条桥不能只靠“退出主链”收口。像 [v3_debug_runtime_shim.c](/Users/lbcheng/cheng-lang/v3/runtime/native/v3_debug_runtime_shim.c) 这种死壳，只要文件还在，后面就总有人顺手重新接回去。最稳收法是两步一起做：物理删除文件，再让 `verify-debug-runtime` 直接硬查 build report 里的 `provider_source_paths` 和 provider object 的导出符号白名单。 |
+| 新发现 | 收 `debug/runtime` bridge 这轮不该硬上 provider 多源大改。当前 object/native plan 还是“一模块一 native source”，这时最短真收法不是拆更多 C 文件，而是把 live source 固定成 [system_helpers_debug_trace_profile.c](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers_debug_trace_profile.c)，再用 object report 钉死导出面。这样 gate 直接约束真实产物，不会又造一层抽象。 |
+| 新发现 | [build_backend_driver_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/build_backend_driver_v3.sh) 这种冷启动壳，真正多余的不是 freshness，而是再多绕一层 [cheng_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh)。只要 `bootstrap.env` 已经 fresh，最稳形状就是直接 `exec "$V3_BOOTSTRAP_STAGE3" build-backend-driver`，少一跳就少一份壳层行为定义。 |
 | 新发现 | `bootstrap_bridge_v3.sh` 这层最短真收法不是继续在壳里复制 `stage0 -> stage3` 的全部步骤，而是只编一个临时 seed runner，再把真正 `bootstrap-bridge` 交给编译器命令。否则脚本和编译器会长期维护两套 bootstrap 定义，而且直接拿 canonical `stage0` 自己去重编自己还有机会撞上自覆盖问题。 |
 | 新发现 | `run_slice_gate.sh` 不能简单退化成调用旧的最小 `slice-gate`。壳层真正承载的是总 gate，不只是 hotpath+bootstrap+backend-driver+self-check；要收编这层，必须把 `debug/runtime/profile/ordinary compile/host/stage23/cross-target` 这些顺序一起搬回编译器本体。 |
 | 新发现 | 这轮最稳的收口不是把所有叶子脚本一口气铲平，而是先把“编排权”收回 `stage3`，叶子验证先允许继续复用现有脚本。这样 bootstrap/gate 的行为定义先只剩一份，后面再逐个把 `build_zero_exit/build_chain_node/...` 这些专项验证继续内建化。 |
@@ -1398,3 +1401,27 @@
 | 新发现 | 像 `tailnet_control` 这种 flag 很长的外部命令，不能再手写 argc 常量。只要后面多加几个参数却忘了同步计数，前面的命令看起来还能跑，真正关键的末尾 flag 会被静默截断；最稳的写法就是统一用 `sizeof(array)/sizeof(array[0])`。 |
 | 新发现 | seed runner 自己也要按严格宿主编译规则过。当前 Darwin 下用 `cc -std=c11 -pedantic` 编 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 时，`strsep` 和 `st_mtimespec` 只有在顶层显式开 `_GNU_SOURCE/_DARWIN_C_SOURCE` 才是稳定形状；不把这层收住，bootstrap 会先死在外根编译。 |
 | 新发现 | `v3_run_shell_command_logged(...)` 这种共享 helper 里一个多余的 `snprintf(...)` 实参就会把整条命令串污染掉。seed 侧的 shell bridge 不能想当然复用“看起来只是日志”的格式化代码，命令构造和日志构造必须严格分开。 |
+| 新发现 | `x509: signature invalid` 这次真根不在 transport 证书，也不在 `ECDSA` 数学，而在 [x509DecodeEcdsaSignature(...)](/Users/lbcheng/cheng-lang/src/std/tls/x509.cheng) 这条 DER 解码链。当前编译路径下，把 ASN.1 整数再绕一层中间 `Bytes` 组合，会让 `CertificateVerify` 用到错误的 `r||s`；这类固定宽度签名最稳的写法就是直接解进最终 64 字节缓冲。 |
+| 新发现 | ordinary `v3` smoke 里临时排障不能再用动态 `echo(ErrorText(...))`。seed 只支持字面量 `echo`，这类写法会把 lowering 编译链直接打坏；要么直接 `panic(ErrorText(...))`，要么用 `assert`。 |
+| 新发现 | Darwin 平台符号补名前缀必须幂等。像 Mach-O 这种目标既会遇到裸 `foo`，也会遇到已经带 `_foo` 的符号；如果统一无脑补 `_`，最终汇编里就会变成 `__foo`，症状只会在 native link 阶段表现成一串“明明 provider 已定义、调用侧却还是未定义”的假闭包问题。 |
+| 新发现 | 长跑 smoke 里不能只对默认 backend driver 做“缺失即重建”。`stage2/stage3` 这类 bootstrap 编译器路径在并行 gate、bootstrap 刷新或共享产物目录被重写时，同样可能短暂失效；如果 `compile helper` 只会补 backend driver，就会把真正的产物刷新问题伪装成 `missing compiler during fixture compile`，然后随机炸在 `stage23` 中段。 |
+| 新发现 | 这轮真正的断点不在 `gate_main`、也不在壳脚本，而在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 live command dispatch。只要 seed 没把新命令接上，`stage1_bootstrap / compiler_runtime / cheng_v3.sh / smoke` 全部追平也还是会报 `unknown command`。 |
+| 新发现 | build 命令只支持可配置 `out/report` 还不够，必须先 `v3_ensure_parent_dir(...)`。`build-linux-nolibc-exe` 这轮第一次真跑时挂的不是链接，而是 `content_stub_smoke.compile.log` 的父目录根本没建。 |
+| 新发现 | `host_ops` 真把并行/进程监管接回 Cheng 以后，像 [failfast_parallel.sh](/Users/lbcheng/cheng-lang/v3/tooling/failfast_parallel.sh) 这种死 helper 不能继续留着。最稳的形状是直接删掉，再把名字写进 `verify-orphan-guard` 的硬门禁，防止以后被悄悄复活。 |
+| 新发现 | debug runtime bridge 再缩时，不需要把 live provider 再拆成多份 `providerNativeSources`。当前最稳形状是“对外仍一份正式 provider 源文件，内部再按 `trace/profile` 拆 `.inc`”；这样 `provider source path` 合同、seed resolver、system_link_exec 和对象级 gate 都还能继续指向同一条正式路径。 |
+| 新发现 | 只查 `provider_source_paths` 和导出符号还不够，debug bridge 还会悄悄从未定义符号面长回宿主依赖。最稳门禁是再加一层对象级未定义符号白名单，直接卡死 `runtime_debug_runtime_v3.o` 允许依赖的宿主符号集合。 |
+| 新发现 | `bootstrap_bridge_v3.sh` 这种带锁 wrapper 继续压薄时，不能因为想直转发 `stage3` 就回到 `exec`。持锁 shell 一旦 `exec`，`trap cleanup` 就没机会清锁；正确形状是“同锁内普通子进程调用 `cheng.stage3 bootstrap-bridge`，shell 自己走到 EXIT 再清锁”。 |
+| 新发现 | bootstrap 冷启动的最佳分层已经更明确了：只有 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 变了，才值得重编临时 seed runner；如果只是 `stage1_bootstrap/compiler_main/compiler_runtime/compiler_request/gate_main` 变了，直接让 fresh `cheng.stage3 bootstrap-bridge` 处理才是最短路径。 |
+| 新发现 | debug/runtime 宿主桥继续往下拆时，第一刀应该先拆“host-only base”，不是先拆更多 provider 文件。把 env/path/stderr/write/getter-resolve 这类纯宿主底座单独收走以后，`trace/profile` 两块才能继续各自缩，不会再把共享宿主细节散落回各个 include。 |
+| 新发现 | Linux 这条门禁不能假设会有 `runtime_debug_runtime_v3.o`。当前 `aarch64-unknown-linux-gnu` 真在跑的是 `system_helpers_backend_nolibc_linux_aarch64.o`；要卡 Linux 对象依赖面，就必须直接检查这份 runtime object，而不是拿 Darwin host debug bridge 的命名去套 Linux。 |
+| 新发现 | `bootstrap_bridge_v3.sh` 继续收薄时，`cheng.stage0` 也是现成可复用的冷启动层，不该被忽略。只要 `stage0` 和当前 seed 同代，就应优先直接复用 `cheng.stage0 bootstrap-bridge`，而不是每次都回去重编临时 seed runner。 |
+| 新发现 | 试过但没接进 live 链的 helper 不能留在树上冒充能力。像这轮的 `profile_report.cheng/profile_report_main.cheng`，只要 `profile-run` 最终没走它们，`build_plan/contract/README` 就必须一起撤回真实口径，不然下一轮排障会先被假入口误导。 |
+| 新发现 | 当前 profiler 最稳的分层不是“runtime 直接吐最终 `v3_profile_v1`”，而是“runtime 只产原始 `v3_profile_raw_v1`，编译器侧再汇总成 `v3_profile_v1`”。这样 live debug bridge 只保留取样和原始 frame 材料，不把热点聚合文本格式重新塞回宿主 runtime。 |
+| 新发现 | 这条 profiler 分层不能只停在 seed C。只要 Cheng 侧 `verify-debug-profile` 还在直接吃 `CHENG_V3_PROFILE_OUT`，调试 gate 仍然绑着 C 侧最终报告逻辑；最稳收法是让 gate 也改成 `CHENG_V3_PROFILE_RAW_OUT -> live profile-report`，这样编译器侧和 gate 侧才是同一条真实主线。 |
+| 新发现 | `bootstrap_bridge_v3.sh` 不该继续自己维护 `seed/stage1/compiler_*` 的 freshness 表。冷启动壳最稳的边界就是“只负责找到现成的 `stage3`、再退到 `stage0`、最后才回临时 seed runner”；真正哪些源变了、要不要重建，必须只由 `stage0/stage3 bootstrap-bridge` 本体裁决。 |
+| 新发现 | 只把 Cheng gate 改成 `raw -> profile-report` 还不够。只要 live debug bridge 里还保留 `CHENG_V3_PROFILE_OUT` 和 `v3_debug_profile_write_final_report()`，runtime 就仍然背着第二条最终报告语义；要把 profile 真收口，必须把这条 C 分支物理删掉。 |
+| 新发现 | profile C 分支删掉以后，`verify-debug-runtime` 的 Darwin 未定义符号白名单也必须同步追平；否则 gate 还会继续期待 `_qsort/_realloc/_strcmp` 这类只在旧最终聚合路径里才会出现的宿主依赖，直接把正确收口误报成回归。 |
+| 新发现 | `cheng_v3.sh` 这种薄壳继续收时，最稳的不是再发明新 helper，而是把命令分成“需要 contract”和“plain stage3”两组统一分派。这样 shell 入口仍然够薄，但不会因为一长串重复 case 再次把命令面和 live stage3 漂开。 |
+| 新发现 | `profile-run` 这条线已经证明，单独再编一个 Cheng helper 可执行文件不等于“能力回到 Cheng”。如果 live stage3/backend-driver 根本没有同名命令面，最后只会得到一份不会被调用的 sidecar 代码；这类能力必须先在 seed/live dispatch 里坐实，再谈从 C 往 Cheng 迁。 |
+| 新发现 | `profile-report` 这类 tooling 能力一旦已经进了 live compiler 命令面，seed 就不能再保留“再编一个 helper 再跑”的第二条实现。两条路径并存时，freshness、锁和 README 会一起漂；最稳形状就是 seed 统一直调 live compiler，自身只保留最小分发。 |
+| 新发现 | `compiler_main.cheng` 里挂上一条新 dispatch，不等于当前 backend driver 真有这个 live 命令。`profile-report` 这轮已经证明，只要 seed/stage3 真实命令面没一起换代，`compiler_main` 里的同名入口就是假路径；最稳做法是先以 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 live dispatch 为准，确认命令真能被当前 `cheng.stage3/backend-driver` 直接调用，再决定要不要保留 Cheng 侧入口。 |

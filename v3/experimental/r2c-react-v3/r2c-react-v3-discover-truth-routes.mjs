@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 
 const SOURCE_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'artifacts', '.git', '.build', '.tmp-deploy']);
@@ -16,7 +17,7 @@ const ROUTE_FUNCTION_ALLOWLIST = new Set([
   'resolveInitialHomeCategory',
 ]);
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const out = {
     repo: '',
     runtimeRoots: [],
@@ -46,7 +47,7 @@ function normalizeRootValue(value) {
   return raw.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
 }
 
-function normalizeRoots(repo, requested) {
+export function normalizeRoots(repo, requested) {
   const picks = requested.length > 0 ? requested : ['app'];
   const out = [];
   for (const item of picks) {
@@ -104,7 +105,7 @@ function walkSources(repo, roots) {
   return out;
 }
 
-function writeSidecarSummary(summaryPath, values) {
+export function writeSidecarSummary(summaryPath, values) {
   if (!summaryPath) return;
   const lines = Object.entries(values).map(([key, value]) => `${key}=${String(value ?? '')}`);
   fs.mkdirSync(path.dirname(summaryPath), { recursive: true });
@@ -221,7 +222,7 @@ function reasonForRouteLiteral(ts, node) {
   return '';
 }
 
-function discoverTruthRoutes(repo, runtimeRoots) {
+export function discoverTruthRoutes(repo, runtimeRoots) {
   const ts = loadTypeScript(repo);
   tsGlobal = ts;
   const routeMap = new Map();
@@ -286,21 +287,28 @@ function discoverTruthRoutes(repo, runtimeRoots) {
   };
 }
 
-const args = parseArgs(process.argv);
-const repo = path.resolve(args.repo);
-const runtimeRoots = normalizeRoots(repo, args.runtimeRoots);
-const doc = discoverTruthRoutes(repo, runtimeRoots);
-if (args.outPath) {
-  const outPath = path.resolve(args.outPath);
-  fs.mkdirSync(path.dirname(outPath), { recursive: true });
-  fs.writeFileSync(outPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+export function runCli(argv = process.argv) {
+  const args = parseArgs(argv);
+  const repo = path.resolve(args.repo);
+  const runtimeRoots = normalizeRoots(repo, args.runtimeRoots);
+  const doc = discoverTruthRoutes(repo, runtimeRoots);
+  if (args.outPath) {
+    const outPath = path.resolve(args.outPath);
+    fs.mkdirSync(path.dirname(outPath), { recursive: true });
+    fs.writeFileSync(outPath, `${JSON.stringify(doc, null, 2)}\n`, 'utf8');
+  }
+  writeSidecarSummary(args.summaryOut ? path.resolve(args.summaryOut) : '', {
+    format: doc.format,
+    repo_root: repo,
+    source_roots: runtimeRoots.join(','),
+    typescript_version: doc.typescriptVersion,
+    route_count: doc.routes.length,
+    out_path: args.outPath ? path.resolve(args.outPath) : '',
+  });
+  process.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
 }
-writeSidecarSummary(args.summaryOut ? path.resolve(args.summaryOut) : '', {
-  format: doc.format,
-  repo_root: repo,
-  source_roots: runtimeRoots.join(','),
-  typescript_version: doc.typescriptVersion,
-  route_count: doc.routes.length,
-  out_path: args.outPath ? path.resolve(args.outPath) : '',
-});
-process.stdout.write(`${JSON.stringify(doc, null, 2)}\n`);
+
+const entryHref = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : '';
+if (import.meta.url === entryHref) {
+  runCli(process.argv);
+}

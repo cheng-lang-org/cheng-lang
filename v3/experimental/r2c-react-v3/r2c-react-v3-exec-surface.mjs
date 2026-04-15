@@ -93,12 +93,19 @@ function countHookCalls(moduleDoc, name) {
   return hookCalls.filter((item) => String(item?.name || '') === name).length;
 }
 
+const HOME_DEFAULT_EXCLUDED_TAGS = new Set([
+  'PwaWanDmSmokePage',
+  'PwaWanSessionSmokePage',
+  'PwaContentMediaSyncSmokePage',
+]);
+
 function buildSnapshot(tsxAstDoc, manifest) {
   const modules = Array.isArray(tsxAstDoc?.modules) ? tsxAstDoc.modules : [];
   const entryModulePath = String(manifest.entry_module || modules[0]?.path || '');
   const entryModule = modules.find((item) => String(item?.path || '') === entryModulePath) || modules[0] || {};
   const hookCalls = Array.isArray(entryModule.hook_calls) ? entryModule.hook_calls : [];
-  const jsxElements = Array.isArray(entryModule.jsx_elements) ? entryModule.jsx_elements : [];
+  const jsxElements = (Array.isArray(entryModule.jsx_elements) ? entryModule.jsx_elements : [])
+    .filter((item) => !HOME_DEFAULT_EXCLUDED_TAGS.has(String(item?.tag || '')));
   const components = Array.isArray(entryModule.components) ? entryModule.components : [];
   const effectCount = countHookCalls(entryModule, 'useEffect');
   const stateSlotCount = countHookCalls(entryModule, 'useState');
@@ -180,7 +187,7 @@ function main() {
   const tsxAstPath = path.join(outDir, 'tsx_ast_v1.json');
   const manifest = readJson(manifestPath);
   const tsxAstDoc = readJson(tsxAstPath);
-  const tool = process.env.R2C_REACT_V3_TOOLING_BIN || path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+  const tool = process.env.R2C_REACT_V3_TOOLING_BIN || path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
   const overlay = createExecOverlay(workspaceRoot, outDir, Array.isArray(manifest.modules) ? manifest.modules.length : 0);
   const exePath = path.join(outDir, 'cheng_exec_overlay_smoke');
   const compileReportPath = path.join(outDir, 'cheng_exec_overlay_report.txt');

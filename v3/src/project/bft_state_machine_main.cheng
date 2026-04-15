@@ -1,4 +1,534 @@
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/rawbytes
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/libp2p/core/types
 import cheng/v3/project/bft_state_machine as bft
+import cheng/v3/project/bft_validator_host as host
+import cheng/v3/tooling/path as v3path
 
-fn main(): int32 =
-    return bft.v3BftSelfTest()
+@importc("cheng_v3_sleep_ms_bridge")
+fn cheng_v3_sleep_ms_bridge(value: int32)
+
+fn v3BftMainUsage() =
+    os.writeLine(os.get_stdout(), "usage: bft_state_machine <command> [flags]")
+    os.writeLine(os.get_stdout(), "")
+    os.writeLine(os.get_stdout(), "commands:")
+    os.writeLine(os.get_stdout(), "  self-test")
+    os.writeLine(os.get_stdout(), "  init --state:<file> --app-id:<id> --validator-slot:<n> [--force]")
+    os.writeLine(os.get_stdout(), "  submit-mint --queue:<file> --asset:<id> --account:<id> --amount:<n>")
+    os.writeLine(os.get_stdout(), "  submit-transfer --queue:<file> --asset:<id> --from:<id> --to:<id> --amount:<n>")
+    os.writeLine(os.get_stdout(), "  show-state --state:<file>")
+    os.writeLine(os.get_stdout(), "  query-balance --state:<file> --asset:<id> --account:<id>")
+    os.writeLine(os.get_stdout(), "  proposal-serve-daemon --file:<file> --host:<ip> --port:<n> [--ready-path:<file>] [--interval-ms:<n>] [--max-serve-count:<n>]")
+    os.writeLine(os.get_stdout(), "  commit-serve-daemon --file:<file> --host:<ip> --port:<n> [--ready-path:<file>] [--interval-ms:<n>] [--max-serve-count:<n>]")
+    os.writeLine(os.get_stdout(), "  vote-capture-daemon --file:<file> --host:<ip> --port:<n> [--ready-path:<file>] [--interval-ms:<n>] [--max-vote-count:<n>]")
+    os.writeLine(os.get_stdout(), "  validator-proposer-daemon --state:<file> --queue:<file> --proposal-file:<file> --commit-file:<file> --votes-file:<file> [--interval-ms:<n>] [--max-rounds:<n>] [--max-txs:<n>]")
+    os.writeLine(os.get_stdout(), "  validator-follower-daemon --state:<file> --proposal-host:<ip> --proposal-port:<n> --vote-host:<ip> --vote-port:<n> --commit-host:<ip> --commit-port:<n> [--interval-ms:<n>] [--max-rounds:<n>]")
+
+fn v3BftMainTextStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn v3BftMainReadFlagValue(flag: str, outValue: var str): bool =
+    outValue = ""
+    let count = cmdline.paramCount()
+    let colonPrefix = flag + ":"
+    let eqPrefix = flag + "="
+    for i in 1..count:
+        let arg = cmdline.paramStr(i)
+        if arg == flag:
+            if i >= count:
+                return false
+            outValue = cmdline.paramStr(i + 1)
+            return true
+        if v3BftMainTextStartsWith(arg, colonPrefix):
+            outValue = v3path.v3TextSlice(arg, len(colonPrefix), len(arg) - len(colonPrefix))
+            return true
+        if v3BftMainTextStartsWith(arg, eqPrefix):
+            outValue = v3path.v3TextSlice(arg, len(eqPrefix), len(arg) - len(eqPrefix))
+            return true
+    return false
+
+fn v3BftMainReadRequiredFlag(flag: str, outValue: var str): Result[bool] =
+    outValue = ""
+    if !v3BftMainReadFlagValue(flag, outValue):
+        return Err[bool]("v3 bft main: missing " + flag)
+    outValue = strutil.strip(outValue)
+    if len(outValue) <= 0:
+        return Err[bool]("v3 bft main: empty " + flag)
+    return Ok[bool](true)
+
+fn v3BftMainReadRequiredStatePath(outValue: var str): Result[bool] =
+    return v3BftMainReadRequiredFlag("--state", outValue)
+
+fn v3BftMainReadRequiredQueuePath(outValue: var str): Result[bool] =
+    return v3BftMainReadRequiredFlag("--queue", outValue)
+
+fn v3BftMainReadRequiredInt64Flag(flag: str): Result[int64] =
+    var raw = ""
+    let readRes = v3BftMainReadRequiredFlag(flag, raw)
+    if IsErr(readRes):
+        return Err[int64](Error(readRes))
+    return host.v3BftValidatorParseInt64Text(raw)
+
+fn v3BftMainSleepMs(value: int32) =
+    if value <= 0:
+        return
+    cheng_v3_sleep_ms_bridge(value)
+
+fn v3BftMainSelfTest(): int32 =
+    let appId = "bft-validator-self-test"
+    let init1Res = host.v3BftValidatorStateInit(appId, 1)
+    let init2Res = host.v3BftValidatorStateInit(appId, 2)
+    let init3Res = host.v3BftValidatorStateInit(appId, 3)
+    assert(IsOk(init1Res), "v3 bft main: init1")
+    assert(IsOk(init2Res), "v3 bft main: init2")
+    assert(IsOk(init3Res), "v3 bft main: init3")
+    var state1 = Value(init1Res)
+    var state2 = Value(init2Res)
+    var state3 = Value(init3Res)
+
+    let mintWire = bft.v3BftEncodeTx(bft.v3BftTxMint(7, 1001, int64(100)))
+    var batch1: Bytes[]
+    batch1 = []
+    add(batch1, mintWire)
+    let proposal1Res = host.v3BftValidatorProposalFromTxs(appId, int64(1), 1, batch1)
+    assert(IsOk(proposal1Res), "v3 bft main: proposal1")
+    let preview1Res = host.v3BftValidatorPreviewProposal(state1, Value(proposal1Res))
+    let preview2Res = host.v3BftValidatorPreviewProposal(state2, Value(proposal1Res))
+    assert(IsOk(preview1Res), "v3 bft main: preview1")
+    assert(IsOk(preview2Res), "v3 bft main: preview2")
+    assert(layout.fixedBytes32Equal(Value(preview1Res).proposalHash, Value(preview2Res).proposalHash), "v3 bft main: preview proposal hash")
+    assert(layout.fixedBytes32Equal(Value(preview1Res).appHash, Value(preview2Res).appHash), "v3 bft main: preview app hash")
+    let selfVote1Res = host.v3BftValidatorBuildVote(state1, Value(proposal1Res))
+    let vote2Res = host.v3BftValidatorBuildVote(state2, Value(proposal1Res))
+    assert(IsOk(selfVote1Res), "v3 bft main: self vote1")
+    assert(IsOk(vote2Res), "v3 bft main: vote2")
+    var votes1: host.V3BftVote[]
+    votes1 = []
+    add(votes1, Value(selfVote1Res))
+    add(votes1, Value(vote2Res))
+    let commit1Res = host.v3BftValidatorCommitFromVotes(Value(proposal1Res), Value(preview1Res), votes1)
+    assert(IsOk(commit1Res), "v3 bft main: commit1")
+    assert(IsOk(host.v3BftValidatorStateApplyCommit(state1, Value(commit1Res))), "v3 bft main: apply commit1 state1")
+    assert(IsOk(host.v3BftValidatorStateApplyCommit(state2, Value(commit1Res))), "v3 bft main: apply commit1 state2")
+
+    let alice1 = host.v3BftValidatorQueryBalance(state1, 7, 1001)
+    let alice2 = host.v3BftValidatorQueryBalance(state2, 7, 1001)
+    let alice3 = host.v3BftValidatorQueryBalance(state3, 7, 1001)
+    assert(alice1.balance == int64(100), "v3 bft main: alice1")
+    assert(alice2.balance == alice1.balance, "v3 bft main: alice2")
+    assert(alice3.balance == int64(0), "v3 bft main: alice3")
+    echo("v3 bft_state_machine self-test ok")
+    return 0
+
+fn v3BftMainInitCommand(): int32 =
+    var statePath = ""
+    let stateRes = v3BftMainReadRequiredStatePath(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    let absoluteStatePath = v3path.v3PathAbsolute(os.getCurrentDir(), statePath)
+    if v3path.v3PathFileExists(absoluteStatePath) && !cmdline.hasFlag("--force"):
+        os.writeLine(os.get_stderr(), "v3 bft main: state already exists: " + absoluteStatePath + " (pass --force to overwrite)")
+        return 2
+    var appId = ""
+    let appIdRes = v3BftMainReadRequiredFlag("--app-id", appId)
+    if IsErr(appIdRes):
+        os.writeLine(os.get_stderr(), Error(appIdRes))
+        return 2
+    let validatorSlot = cmdline.readInt32FlagOrDefault("--validator-slot", 0)
+    let initRes = host.v3BftValidatorStateInit(appId, validatorSlot)
+    if IsErr(initRes):
+        os.writeLine(os.get_stderr(), Error(initRes))
+        return 2
+    if !host.v3BftValidatorWriteState(statePath, Value(initRes)):
+        os.writeLine(os.get_stderr(), "v3 bft main: failed to write state: " + absoluteStatePath)
+        return 2
+    os.writeLine(os.get_stdout(), host.v3BftValidatorStateSummary(Value(initRes)))
+    return 0
+
+fn v3BftMainSubmitMintCommand(): int32 =
+    var queuePath = ""
+    let queueRes = v3BftMainReadRequiredQueuePath(queuePath)
+    if IsErr(queueRes):
+        os.writeLine(os.get_stderr(), Error(queueRes))
+        return 2
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let accountId = cmdline.readInt32FlagOrDefault("--account", -1)
+    let amountRes = v3BftMainReadRequiredInt64Flag("--amount")
+    if assetId <= 0 || accountId <= 0 || IsErr(amountRes):
+        if IsErr(amountRes):
+            os.writeLine(os.get_stderr(), Error(amountRes))
+        else:
+            os.writeLine(os.get_stderr(), "v3 bft main: submit-mint requires --asset --account --amount")
+        return 2
+    let txWire = bft.v3BftEncodeTx(bft.v3BftTxMint(assetId, accountId, Value(amountRes)))
+    if !host.v3BftValidatorQueueAppend(queuePath, txWire):
+        os.writeLine(os.get_stderr(), "v3 bft main: failed to append queue")
+        return 2
+    os.writeLine(os.get_stdout(), "queued_tx=" + bytesToHex(txWire))
+    return 0
+
+fn v3BftMainSubmitTransferCommand(): int32 =
+    var queuePath = ""
+    let queueRes = v3BftMainReadRequiredQueuePath(queuePath)
+    if IsErr(queueRes):
+        os.writeLine(os.get_stderr(), Error(queueRes))
+        return 2
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let fromAccount = cmdline.readInt32FlagOrDefault("--from", -1)
+    let toAccount = cmdline.readInt32FlagOrDefault("--to", -1)
+    let amountRes = v3BftMainReadRequiredInt64Flag("--amount")
+    if assetId <= 0 || fromAccount <= 0 || toAccount <= 0 || IsErr(amountRes):
+        if IsErr(amountRes):
+            os.writeLine(os.get_stderr(), Error(amountRes))
+        else:
+            os.writeLine(os.get_stderr(), "v3 bft main: submit-transfer requires --asset --from --to --amount")
+        return 2
+    let txWire = bft.v3BftEncodeTx(bft.v3BftTxTransfer(assetId, fromAccount, toAccount, Value(amountRes)))
+    if !host.v3BftValidatorQueueAppend(queuePath, txWire):
+        os.writeLine(os.get_stderr(), "v3 bft main: failed to append queue")
+        return 2
+    os.writeLine(os.get_stdout(), "queued_tx=" + bytesToHex(txWire))
+    return 0
+
+fn v3BftMainShowStateCommand(): int32 =
+    var statePath = ""
+    let stateRes = v3BftMainReadRequiredStatePath(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    let loadRes = host.v3BftValidatorLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    os.writeLine(os.get_stdout(), host.v3BftValidatorStateSummary(Value(loadRes)))
+    return 0
+
+fn v3BftMainQueryBalanceCommand(): int32 =
+    var statePath = ""
+    let stateRes = v3BftMainReadRequiredStatePath(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    let loadRes = host.v3BftValidatorLoadState(statePath)
+    if IsErr(loadRes):
+        os.writeLine(os.get_stderr(), Error(loadRes))
+        return 2
+    let assetId = cmdline.readInt32FlagOrDefault("--asset", -1)
+    let accountId = cmdline.readInt32FlagOrDefault("--account", -1)
+    if assetId <= 0 || accountId <= 0:
+        os.writeLine(os.get_stderr(), "v3 bft main: query-balance requires --asset and --account")
+        return 2
+    let res = host.v3BftValidatorQueryBalance(Value(loadRes), assetId, accountId)
+    os.writeLine(os.get_stdout(), "balance=" + host.v3BftValidatorInt64Text(res.balance))
+    os.writeLine(os.get_stdout(), "height=" + host.v3BftValidatorInt64Text(res.height))
+    os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(res.appHash))
+    return 0
+
+fn v3BftMainServeHexDaemonCommand(protocol: types.V3Libp2pProtocolId): int32 =
+    var filePath = ""
+    let fileRes = v3BftMainReadRequiredFlag("--file", filePath)
+    if IsErr(fileRes):
+        os.writeLine(os.get_stderr(), Error(fileRes))
+        return 2
+    let hostText = cmdline.readFlagOrDefault("--host", "0.0.0.0")
+    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 200)
+    let maxServeCount = cmdline.readInt32FlagOrDefault("--max-serve-count", 0)
+    if port <= 0:
+        os.writeLine(os.get_stderr(), "v3 bft main: serve daemon requires --port")
+        return 2
+    var served = 0
+    while maxServeCount <= 0 || served < maxServeCount:
+        let payloadRes = host.v3BftValidatorReadHexFile(filePath)
+        if IsOk(payloadRes) && bytesLen(Value(payloadRes)) > 0:
+            let serveRes = host.v3BftValidatorServeHexFileOnce(filePath, hostText, port, protocol, readyPath)
+            if IsErr(serveRes):
+                os.writeLine(os.get_stderr(), Error(serveRes))
+                return 2
+            served = served + 1
+        else:
+            v3BftMainSleepMs(intervalMs)
+    return 0
+
+fn v3BftMainVoteCaptureDaemonCommand(): int32 =
+    var filePath = ""
+    let fileRes = v3BftMainReadRequiredFlag("--file", filePath)
+    if IsErr(fileRes):
+        os.writeLine(os.get_stderr(), Error(fileRes))
+        return 2
+    let hostText = cmdline.readFlagOrDefault("--host", "0.0.0.0")
+    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 0)
+    let maxVoteCount = cmdline.readInt32FlagOrDefault("--max-vote-count", 0)
+    if port <= 0:
+        os.writeLine(os.get_stderr(), "v3 bft main: vote-capture-daemon requires --port")
+        return 2
+    var captured = 0
+    while maxVoteCount <= 0 || captured < maxVoteCount:
+        let captureRes = host.v3BftValidatorCaptureVoteOnce(filePath, hostText, port, readyPath)
+        if IsErr(captureRes):
+            os.writeLine(os.get_stderr(), Error(captureRes))
+            return 2
+        captured = captured + 1
+        if intervalMs > 0 && (maxVoteCount <= 0 || captured < maxVoteCount):
+            v3BftMainSleepMs(intervalMs)
+    return 0
+
+fn v3BftMainClearFile(pathRaw: str) =
+    let _ = v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, "")
+
+fn v3BftMainFollowerVoteStep(statePath: str,
+                             state: var host.V3BftValidatorState,
+                             proposalHost: str,
+                             proposalPort: int32,
+                             voteHost: str,
+                             votePort: int32): Result[bool] =
+    let proposalRes = host.v3BftValidatorRecvProposal(proposalHost, proposalPort)
+    if IsErr(proposalRes):
+        return Err[bool](Error(proposalRes))
+    let proposal = Value(proposalRes)
+    if proposal.height <= state.machine.lastFinalizedHeight:
+        return Ok[bool](false)
+    let voteRes = host.v3BftValidatorBuildVote(state, proposal)
+    if IsOk(voteRes):
+        let sendRes = host.v3BftValidatorSendVote(voteHost, votePort, Value(voteRes))
+        if IsErr(sendRes):
+            return Err[bool](Error(sendRes))
+        state.lastVotedHeight = proposal.height
+        state.lastVotedProposalHash = host.v3BftValidatorProposalHash(proposal)
+        if !host.v3BftValidatorWriteState(statePath, state):
+            return Err[bool]("v3 bft main: failed to persist voted state")
+        return Ok[bool](true)
+    if Error(voteRes) == "v3 bft validator: already voted for proposal":
+        return Ok[bool](false)
+    return Err[bool](Error(voteRes))
+
+fn v3BftMainFollowerCommitStep(statePath: str,
+                               state: var host.V3BftValidatorState,
+                               commitHost: str,
+                               commitPort: int32): Result[int64] =
+    let commitRes = host.v3BftValidatorRecvCommit(commitHost, commitPort)
+    if IsErr(commitRes):
+        return Err[int64](Error(commitRes))
+    let commit = Value(commitRes)
+    if commit.height <= state.machine.lastFinalizedHeight:
+        return Ok[int64](int64(0))
+    let applyRes = host.v3BftValidatorStateApplyCommit(state, commit)
+    if IsErr(applyRes):
+        return Err[int64](Error(applyRes))
+    if !host.v3BftValidatorWriteState(statePath, state):
+        return Err[int64]("v3 bft main: failed to persist follower state")
+    os.writeLine(os.get_stdout(), "applied_height=" + host.v3BftValidatorInt64Text(commit.height))
+    os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(commit.appHash))
+    return Ok[int64](commit.height)
+
+fn v3BftMainProposerDaemonCommand(): int32 =
+    var statePath = ""
+    let stateRes = v3BftMainReadRequiredStatePath(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    var queuePath = ""
+    let queueRes = v3BftMainReadRequiredQueuePath(queuePath)
+    if IsErr(queueRes):
+        os.writeLine(os.get_stderr(), Error(queueRes))
+        return 2
+    var proposalFile = ""
+    let proposalFileRes = v3BftMainReadRequiredFlag("--proposal-file", proposalFile)
+    if IsErr(proposalFileRes):
+        os.writeLine(os.get_stderr(), Error(proposalFileRes))
+        return 2
+    var commitFile = ""
+    let commitFileRes = v3BftMainReadRequiredFlag("--commit-file", commitFile)
+    if IsErr(commitFileRes):
+        os.writeLine(os.get_stderr(), Error(commitFileRes))
+        return 2
+    var votesFile = ""
+    let votesFileRes = v3BftMainReadRequiredFlag("--votes-file", votesFile)
+    if IsErr(votesFileRes):
+        os.writeLine(os.get_stderr(), Error(votesFileRes))
+        return 2
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 200)
+    let maxRounds = cmdline.readInt32FlagOrDefault("--max-rounds", 0)
+    let maxTxs = cmdline.readInt32FlagOrDefault("--max-txs", 16)
+    var committedRounds = 0
+    while maxRounds <= 0 || committedRounds < maxRounds:
+        let loadRes = host.v3BftValidatorLoadState(statePath)
+        if IsErr(loadRes):
+            os.writeLine(os.get_stderr(), Error(loadRes))
+            return 2
+        var state = Value(loadRes)
+        let queueLoadRes = host.v3BftValidatorQueueLoad(queuePath)
+        if IsErr(queueLoadRes):
+            os.writeLine(os.get_stderr(), Error(queueLoadRes))
+            return 2
+        let queueAll = Value(queueLoadRes)
+        let proposalPayloadRes = host.v3BftValidatorReadHexFile(proposalFile)
+        let hasProposal = IsOk(proposalPayloadRes) && bytesLen(Value(proposalPayloadRes)) > 0
+        if !hasProposal:
+            if queueAll.len <= 0:
+                v3BftMainSleepMs(intervalMs)
+                continue
+            var batch: Bytes[]
+            batch = []
+            let takeCount = (maxTxs > 0 && maxTxs < queueAll.len) ? maxTxs : queueAll.len
+            for i in 0..<takeCount:
+                add(batch, queueAll[i])
+            let proposalRes = host.v3BftValidatorProposalFromTxs(state.machine.appId,
+                                                                 state.machine.lastFinalizedHeight + int64(1),
+                                                                 state.validatorSlot,
+                                                                 batch)
+            if IsErr(proposalRes):
+                os.writeLine(os.get_stderr(), Error(proposalRes))
+                return 2
+            if !host.v3BftValidatorWriteHexFile(proposalFile, host.v3BftValidatorEncodeProposal(Value(proposalRes))):
+                os.writeLine(os.get_stderr(), "v3 bft main: failed to write proposal file")
+                return 2
+            v3BftMainClearFile(votesFile)
+            v3BftMainSleepMs(intervalMs)
+            continue
+        let proposalRes = host.v3BftValidatorLoadProposalFile(proposalFile)
+        if IsErr(proposalRes):
+            os.writeLine(os.get_stderr(), Error(proposalRes))
+            return 2
+        let previewRes = host.v3BftValidatorPreviewProposal(state, Value(proposalRes))
+        if IsErr(previewRes):
+            os.writeLine(os.get_stderr(), Error(previewRes))
+            return 2
+        let selfVoteRes = host.v3BftValidatorBuildVote(state, Value(proposalRes))
+        if IsErr(selfVoteRes):
+            os.writeLine(os.get_stderr(), Error(selfVoteRes))
+            return 2
+        let voteSetRes = host.v3BftValidatorVoteSetForProposal(votesFile,
+                                                               Value(proposalRes),
+                                                               Value(selfVoteRes),
+                                                               Value(previewRes))
+        if IsErr(voteSetRes):
+            os.writeLine(os.get_stderr(), Error(voteSetRes))
+            return 2
+        if Value(voteSetRes).len < host.v3BftValidatorQuorum:
+            v3BftMainSleepMs(intervalMs)
+            continue
+        let commitRes = host.v3BftValidatorCommitFromVotes(Value(proposalRes), Value(previewRes), Value(voteSetRes))
+        if IsErr(commitRes):
+            os.writeLine(os.get_stderr(), Error(commitRes))
+            return 2
+        let applyRes = host.v3BftValidatorStateApplyCommit(state, Value(commitRes))
+        if IsErr(applyRes):
+            os.writeLine(os.get_stderr(), Error(applyRes))
+            return 2
+        if !host.v3BftValidatorWriteState(statePath, state):
+            os.writeLine(os.get_stderr(), "v3 bft main: failed to write proposer state")
+            return 2
+        if !host.v3BftValidatorWriteHexFile(commitFile, host.v3BftValidatorEncodeCommit(Value(commitRes))):
+            os.writeLine(os.get_stderr(), "v3 bft main: failed to write commit file")
+            return 2
+        var remaining: Bytes[]
+        remaining = []
+        for i in Value(proposalRes).txs.len..<queueAll.len:
+            add(remaining, queueAll[i])
+        if !host.v3BftValidatorQueueWrite(queuePath, remaining):
+            os.writeLine(os.get_stderr(), "v3 bft main: failed to write queue file")
+            return 2
+        v3BftMainClearFile(proposalFile)
+        v3BftMainClearFile(votesFile)
+        committedRounds = committedRounds + 1
+        os.writeLine(os.get_stdout(), "committed_height=" + host.v3BftValidatorInt64Text(Value(commitRes).height))
+        os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(Value(commitRes).appHash))
+        if maxRounds <= 0 || committedRounds < maxRounds:
+            v3BftMainSleepMs(intervalMs)
+    return 0
+
+fn v3BftMainFollowerDaemonCommand(): int32 =
+    var statePath = ""
+    let stateRes = v3BftMainReadRequiredStatePath(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    let proposalHost = cmdline.readFlagOrDefault("--proposal-host", "")
+    let proposalPort = cmdline.readInt32FlagOrDefault("--proposal-port", -1)
+    let voteHost = cmdline.readFlagOrDefault("--vote-host", "")
+    let votePort = cmdline.readInt32FlagOrDefault("--vote-port", -1)
+    let commitHost = cmdline.readFlagOrDefault("--commit-host", "")
+    let commitPort = cmdline.readInt32FlagOrDefault("--commit-port", -1)
+    let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 100)
+    let maxRounds = cmdline.readInt32FlagOrDefault("--max-rounds", 0)
+    if len(proposalHost) <= 0 || proposalPort <= 0 || len(voteHost) <= 0 || votePort <= 0 || len(commitHost) <= 0 || commitPort <= 0:
+        os.writeLine(os.get_stderr(), "v3 bft main: follower daemon requires proposal/vote/commit host+port")
+        return 2
+    var appliedRounds = 0
+    while maxRounds <= 0 || appliedRounds < maxRounds:
+        let loadRes = host.v3BftValidatorLoadState(statePath)
+        if IsErr(loadRes):
+            os.writeLine(os.get_stderr(), Error(loadRes))
+            return 2
+        var state = Value(loadRes)
+        let voteStepRes = v3BftMainFollowerVoteStep(statePath,
+                                                    state,
+                                                    proposalHost,
+                                                    proposalPort,
+                                                    voteHost,
+                                                    votePort)
+        if IsErr(voteStepRes):
+            os.writeLine(os.get_stderr(), Error(voteStepRes))
+            return 2
+        let commitStepRes = v3BftMainFollowerCommitStep(statePath, state, commitHost, commitPort)
+        if IsErr(commitStepRes):
+            os.writeLine(os.get_stderr(), Error(commitStepRes))
+            return 2
+        if Value(commitStepRes) > int64(0):
+            appliedRounds = appliedRounds + 1
+        if maxRounds <= 0 || appliedRounds < maxRounds:
+            v3BftMainSleepMs(intervalMs)
+    return 0
+
+fn main(argc: int32, argv: ptr): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let count = cmdline.paramCount()
+    if count <= 0:
+        return v3BftMainSelfTest()
+    let cmd = cmdline.paramStr(1)
+    if len(cmd) <= 0:
+        return v3BftMainSelfTest()
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3BftMainUsage()
+        return 0
+    if cmd == "self-test":
+        return v3BftMainSelfTest()
+    if cmd == "init":
+        return v3BftMainInitCommand()
+    if cmd == "submit-mint":
+        return v3BftMainSubmitMintCommand()
+    if cmd == "submit-transfer":
+        return v3BftMainSubmitTransferCommand()
+    if cmd == "show-state":
+        return v3BftMainShowStateCommand()
+    if cmd == "query-balance":
+        return v3BftMainQueryBalanceCommand()
+    if cmd == "proposal-serve-daemon":
+        return v3BftMainServeHexDaemonCommand(host.v3BftValidatorProposalProtocol())
+    if cmd == "commit-serve-daemon":
+        return v3BftMainServeHexDaemonCommand(host.v3BftValidatorCommitProtocol())
+    if cmd == "vote-capture-daemon":
+        return v3BftMainVoteCaptureDaemonCommand()
+    if cmd == "validator-proposer-daemon":
+        return v3BftMainProposerDaemonCommand()
+    if cmd == "validator-follower-daemon":
+        return v3BftMainFollowerDaemonCommand()
+    os.writeLine(os.get_stderr(), "v3 bft main: unknown command: " + cmd)
+    v3BftMainUsage()
+    return 2

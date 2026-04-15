@@ -2,6 +2,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { discoverTruthRoutes, normalizeRoots } from './r2c-react-v3-discover-truth-routes.mjs';
+import { buildCodegenRouteCatalog } from './r2c-react-v3-route-matrix-shared.mjs';
 
 function parseArgs(argv) {
   const out = {
@@ -9,6 +11,7 @@ function parseArgs(argv) {
     tsxAstPath: '',
     outDir: '',
     summaryOut: '',
+    runtimeRoots: [],
   };
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -16,8 +19,9 @@ function parseArgs(argv) {
     else if (arg === '--tsx-ast') out.tsxAstPath = String(argv[++i] || '');
     else if (arg === '--out-dir') out.outDir = String(argv[++i] || '');
     else if (arg === '--summary-out') out.summaryOut = String(argv[++i] || '');
+    else if (arg === '--runtime-root') out.runtimeRoots.push(String(argv[++i] || ''));
     else if (arg === '-h' || arg === '--help') {
-      console.log('Usage: r2c-react-v3-codegen-surface.mjs --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--summary-out <file>]');
+      console.log('Usage: r2c-react-v3-codegen-surface.mjs --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir>] [--summary-out <file>]');
       process.exit(0);
     }
   }
@@ -105,6 +109,9 @@ function renderRuntimeCheng() {
     '',
     '    R2cGeneratedProjectSurface =',
     '        packageId: str',
+    '        routeCatalogModule: str',
+    '        routeCount: int32',
+    '        routeIds: str[]',
     '        projectModule: str',
     '        mainModule: str',
     '        entryModule: str',
@@ -130,6 +137,9 @@ function renderRuntimeCheng() {
     'fn r2cGeneratedProjectSurfaceZero(): R2cGeneratedProjectSurface =',
     '    var out: R2cGeneratedProjectSurface',
     '    out.packageId = ""',
+    '    out.routeCatalogModule = ""',
+    '    out.routeCount = 0',
+    '    out.routeIds = []',
     '    out.projectModule = ""',
     '    out.mainModule = ""',
     '    out.entryModule = ""',
@@ -178,6 +188,8 @@ function renderProjectCheng(manifest) {
     lines.push(`import ${item.import_path} as ${item.module_name}`);
   }
   lines.push('');
+  lines.push(renderStrArrayFn('r2cGeneratedRouteIds', manifest.route_ids || []).trimEnd());
+  lines.push('');
   lines.push(renderStrArrayFn('r2cGeneratedModuleSourcePaths', manifest.modules.map((item) => item.source_path)).trimEnd());
   lines.push('');
   lines.push('fn r2cGeneratedAllModules(): runtime.R2cGeneratedModuleSurface[] =');
@@ -190,6 +202,9 @@ function renderProjectCheng(manifest) {
   lines.push('fn r2cGeneratedProjectSurface(): runtime.R2cGeneratedProjectSurface =');
   lines.push('    var out = runtime.r2cGeneratedProjectSurfaceZero()');
   lines.push(`    out.packageId = ${chengStr(manifest.package_id)}`);
+  lines.push(`    out.routeCatalogModule = ${chengStr(manifest.route_catalog_module)}`);
+  lines.push(`    out.routeCount = ${Number(manifest.route_count || 0)}`);
+  lines.push('    out.routeIds = r2cGeneratedRouteIds()');
   lines.push(`    out.projectModule = ${chengStr(manifest.project_module)}`);
   lines.push(`    out.mainModule = ${chengStr(manifest.main_module)}`);
   lines.push(`    out.entryModule = ${chengStr(manifest.entry_module)}`);
@@ -313,7 +328,7 @@ function resolveEntryModule(modules) {
   return modules[0]?.path || '';
 }
 
-function buildManifest(repo, outDir, modules) {
+function buildManifest(repo, outDir, modules, routeCatalog) {
   const packageRoot = path.resolve(outDir, 'cheng_codegen');
   const packageId = 'pkg://cheng/cheng_codegen';
   const modulePrefix = 'cheng_codegen';
@@ -343,16 +358,20 @@ function buildManifest(repo, outDir, modules) {
     ui_host_module: `${packageImportPrefix}/ui_host`,
     react18_compat_module: `${packageImportPrefix}/react18_compat`,
     app_runner_module: `${packageImportPrefix}/app_runner`,
+    route_catalog_module: `${packageImportPrefix}/project`,
+    route_catalog_path: path.join(outDir, 'cheng_codegen_route_catalog_v1.json'),
     project_module: `${packageImportPrefix}/project`,
     entry_project_module: `${packageImportPrefix}/project_entry`,
     main_module: `${packageImportPrefix}/main`,
     entry_module: entryModule,
     runner_mode: 'codegen_surface_v1',
+    route_count: Number(routeCatalog?.routeCount || 0),
+    route_ids: Array.isArray(routeCatalog?.routes) ? routeCatalog.routes : [],
     modules: generatedModules,
   };
 }
 
-function writePackage(manifest, modules) {
+function writePackage(manifest, modules, routeCatalog) {
   const packageRoot = manifest.package_root;
   const srcRoot = path.join(packageRoot, 'src');
   const modulesRoot = path.join(srcRoot, 'modules');
@@ -430,6 +449,57 @@ function runCodegenSmoke(workspaceRoot, manifest) {
   return summary;
 }
 
+const HOME_DEFAULT_EXCLUDED_TAGS = new Set([
+  'PwaWanDmSmokePage',
+  'PwaWanSessionSmokePage',
+  'PwaContentMediaSyncSmokePage',
+]);
+
+function countHookCalls(moduleDoc, name) {
+  const hookCalls = Array.isArray(moduleDoc?.hook_calls) ? moduleDoc.hook_calls : [];
+  return hookCalls.filter((item) => String(item?.name || '') === name).length;
+}
+
+function buildBaseExecSnapshot(doc, manifest) {
+  const modules = Array.isArray(doc?.modules) ? doc.modules : [];
+  const entryModulePath = String(manifest.entry_module || modules[0]?.path || '');
+  const entryModule = modules.find((item) => String(item?.path || '') === entryModulePath) || modules[0] || {};
+  const hookCalls = Array.isArray(entryModule.hook_calls) ? entryModule.hook_calls : [];
+  const jsxElements = (Array.isArray(entryModule.jsx_elements) ? entryModule.jsx_elements : [])
+    .filter((item) => !HOME_DEFAULT_EXCLUDED_TAGS.has(String(item?.tag || '')));
+  const components = Array.isArray(entryModule.components) ? entryModule.components : [];
+  const effectCount = countHookCalls(entryModule, 'useEffect');
+  const stateSlotCount = countHookCalls(entryModule, 'useState');
+  const hookSlotCount = hookCalls.length;
+  const semanticNodesCount = jsxElements.length;
+  const componentCount = components.length;
+  return {
+    format: 'cheng_codegen_exec_snapshot_v1',
+    route_state: 'home_default',
+    mount_phase: 'prepared',
+    commit_phase: 'committed',
+    render_ready: true,
+    semantic_nodes_loaded: semanticNodesCount > 0,
+    semantic_nodes_count: semanticNodesCount,
+    module_count: modules.length,
+    component_count: componentCount,
+    effect_count: effectCount,
+    state_slot_count: stateSlotCount,
+    passive_effects_flushed: false,
+    passive_effect_flush_count: 0,
+    hook_slot_count: hookSlotCount,
+    effect_slot_count: effectCount,
+    component_instance_count: componentCount,
+    tree_node_count: semanticNodesCount,
+    root_node_count: semanticNodesCount > 0 ? 1 : 0,
+    module_node_count: modules.length,
+    component_node_count: componentCount,
+    element_node_count: semanticNodesCount,
+    hook_node_count: hookSlotCount,
+    effect_node_count: effectCount,
+  };
+}
+
 function main() {
   const args = parseArgs(process.argv);
   const workspaceRoot = resolveWorkspaceRoot();
@@ -441,18 +511,28 @@ function main() {
     throw new Error(`unexpected tsx ast format: ${String(doc.format || '')}`);
   }
   const modules = Array.isArray(doc.modules) ? doc.modules : [];
-  const manifest = buildManifest(repo, outDir, modules);
-  writePackage(manifest, modules);
+  const runtimeRoots = normalizeRoots(repo, args.runtimeRoots);
+  const truthRoutesDoc = discoverTruthRoutes(repo, runtimeRoots);
+  const routeIds = Array.isArray(truthRoutesDoc.routes) ? truthRoutesDoc.routes.map((entry) => String(entry?.routeId || '').trim()).filter(Boolean) : [];
+  const manifestStub = buildManifest(repo, outDir, modules, { routeCount: routeIds.length });
+  const baseSnapshot = buildBaseExecSnapshot(doc, manifestStub);
+  const routeCatalog = buildCodegenRouteCatalog(baseSnapshot, routeIds, 'react_surface_runner_v1', modules, repo);
+  routeCatalog.outPath = path.join(outDir, 'cheng_codegen_route_catalog_v1.json');
+  const manifest = buildManifest(repo, outDir, modules, routeCatalog);
+  writePackage(manifest, modules, routeCatalog);
   const smoke = runCodegenSmoke(workspaceRoot, manifest);
   if (!smoke.ok) {
     writeJson(path.join(outDir, 'cheng_codegen_v1.json'), manifest);
+    writeJson(path.join(outDir, 'cheng_codegen_route_catalog_v1.json'), routeCatalog);
     writeJson(path.join(outDir, 'cheng_codegen_smoke_v1.json'), smoke);
     writeSummary(args.summaryOut, {
       module_count: modules.length,
       codegen_module_count: manifest.modules.length,
+      route_count: routeCatalog.routeCount,
       package_root: manifest.package_root,
       package_id: manifest.package_id,
       runner_mode: manifest.runner_mode,
+      route_catalog_path: routeCatalog.outPath,
       smoke_ok: false,
       smoke_reason: smoke.reason,
       smoke_report_path: smoke.report_path,
@@ -463,15 +543,19 @@ function main() {
     process.exit(1);
   }
   const manifestPath = path.join(outDir, 'cheng_codegen_v1.json');
+  const routeCatalogPath = path.join(outDir, 'cheng_codegen_route_catalog_v1.json');
   const smokePath = path.join(outDir, 'cheng_codegen_smoke_v1.json');
   writeJson(manifestPath, manifest);
+  writeJson(routeCatalogPath, routeCatalog);
   writeJson(smokePath, smoke);
   writeSummary(args.summaryOut, {
     module_count: modules.length,
     codegen_module_count: manifest.modules.length,
+    route_count: routeCatalog.routeCount,
     package_root: manifest.package_root,
     package_id: manifest.package_id,
     runner_mode: manifest.runner_mode,
+    route_catalog_path: routeCatalogPath,
     smoke_ok: true,
     smoke_reason: smoke.reason,
     smoke_report_path: smoke.report_path,
@@ -480,6 +564,7 @@ function main() {
     smoke_edge_count: smoke.edge_count,
     typescript_version: String(doc.typescript_version || ''),
     codegen_manifest_path: manifestPath,
+    route_catalog_path: routeCatalogPath,
     codegen_smoke_path: smokePath,
   });
   console.log(JSON.stringify({
@@ -488,6 +573,7 @@ function main() {
     out_dir: outDir,
     module_count: modules.length,
     codegen_module_count: manifest.modules.length,
+    route_count: routeCatalog.routeCount,
     package_root: manifest.package_root,
     smoke_ok: true,
     smoke_node_count: smoke.node_count,
