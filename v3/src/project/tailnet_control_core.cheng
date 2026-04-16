@@ -1,18 +1,41 @@
 import std/system
+import std/cmdline as cmdline
 import std/strutils as strutil
 import std/strings
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
 import cheng/v3/libp2p/transports/tailnet_transport as tsnet
 
-importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
-importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
-
 fn tailnetCtlReadFlag(key: str, defaultValue: str): str =
     var out: str = ""
-    if driver_c_read_flag_value_bridge(key, out):
+    if cmdline.readFirstFlagValue(key, out):
         return out
     return defaultValue
+
+fn tailnetCtlReadInt32FlagOrDefault(key: str, defaultValue: int32): int32 =
+    var raw: str = ""
+    if !cmdline.readFirstFlagValue(key, raw):
+        return defaultValue
+    let text = strutil.strip(raw)
+    if len(text) == 0:
+        return defaultValue
+    if text == "0":
+        return 0
+    var out: int32 = 0
+    var i = 0
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        return defaultValue
+    if i >= len(text):
+        return defaultValue
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return defaultValue
+        out = out * 10 + (int32(ch) - int32('0'))
+        i = i + 1
+    return out
 
 fn tailnetCtlReadIndexedFlag(prefix: str, index: int32, defaultValue: str): str =
     return tailnetCtlReadFlag(prefix + intToStr(index), defaultValue)
@@ -266,7 +289,7 @@ fn tailnetCtlInitTransportFromFlags(): tsnet.V3Libp2pTailnetTransport =
                                        derpHealthy,
                                        listenerNeedsRepair,
                                        startupStage)
-    let bootstrapListenCount = driver_c_read_int32_flag_or_default_bridge("--bootstrap-listen-count", 0)
+    let bootstrapListenCount = tailnetCtlReadInt32FlagOrDefault("--bootstrap-listen-count", 0)
     var bootstrapListenIndex = 0
     while bootstrapListenIndex < bootstrapListenCount:
         let rawText = tailnetCtlReadIndexedFlag("--bootstrap-listen-raw-", bootstrapListenIndex, "")
@@ -276,7 +299,7 @@ fn tailnetCtlInitTransportFromFlags(): tsnet.V3Libp2pTailnetTransport =
             let listenRes = tsnet.v3Libp2pTailnetListen(transport, Value(rawRes))
             assert(IsOk(listenRes), "tailnet control core: bootstrap listen restore")
         bootstrapListenIndex = bootstrapListenIndex + 1
-    let bootstrapPeerCount = driver_c_read_int32_flag_or_default_bridge("--bootstrap-peer-count", 0)
+    let bootstrapPeerCount = tailnetCtlReadInt32FlagOrDefault("--bootstrap-peer-count", 0)
     var bootstrapPeerIndex = 0
     while bootstrapPeerIndex < bootstrapPeerCount:
         var session = tsnet.v3Libp2pTailnetPeerSessionZero()
@@ -395,7 +418,7 @@ fn tailnetCtlApplyCommandFill(out: var str,
     if command == "listen":
         let transportText = tailnetCtlReadFlag("--transport", "tcp")
         let host = tailnetCtlReadFlag("--host", "127.0.0.1")
-        let port = driver_c_read_int32_flag_or_default_bridge("--port", 0)
+        let port = tailnetCtlReadInt32FlagOrDefault("--port", 0)
         assert(port > 0, "tailnet control core: listen port")
         var rawAddr = types.v3Libp2pMultiaddrZero()
         if transportText == "quic":

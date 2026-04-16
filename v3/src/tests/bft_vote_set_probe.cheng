@@ -1,0 +1,89 @@
+import std/os
+import std/cmdline
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/project/bft_validator_host as host
+
+fn main(): int32 =
+    let statePath = cmdline.readFlagOrDefault("--state", "")
+    let proposalFile = cmdline.readFlagOrDefault("--proposal-file", "")
+    let votesFile = cmdline.readFlagOrDefault("--votes-file", "")
+    if len(statePath) <= 0 || len(proposalFile) <= 0 || len(votesFile) <= 0:
+        os.writeLine(os.get_stderr(), "bft_vote_set_probe requires --state --proposal-file --votes-file")
+        return 2
+    os.writeLine(os.get_stdout(), "stage=load_state")
+    let stateRes = host.v3BftValidatorLoadState(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=load_proposal")
+    let proposalRes = host.v3BftValidatorLoadProposalFile(proposalFile)
+    if IsErr(proposalRes):
+        os.writeLine(os.get_stderr(), Error(proposalRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=preview")
+    let previewRes = host.v3BftValidatorPreviewProposal(Value(stateRes), Value(proposalRes))
+    if IsErr(previewRes):
+        os.writeLine(os.get_stderr(), Error(previewRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=build_self_vote")
+    let selfVoteRes = host.v3BftValidatorBuildVote(Value(stateRes), Value(proposalRes))
+    if IsErr(selfVoteRes):
+        os.writeLine(os.get_stderr(), Error(selfVoteRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=load_inbox")
+    let inboxRes = host.v3BftValidatorVoteInboxLoad(votesFile)
+    if IsErr(inboxRes):
+        os.writeLine(os.get_stderr(), Error(inboxRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=vote_set")
+    let voteSetRes = host.v3BftValidatorVoteSetForProposal(votesFile,
+                                                           Value(proposalRes),
+                                                           Value(selfVoteRes),
+                                                           Value(previewRes))
+    if IsErr(voteSetRes):
+        os.writeLine(os.get_stderr(), Error(voteSetRes))
+        return 2
+    let preview = Value(previewRes)
+    let inbox = Value(inboxRes)
+    let voteSet = Value(voteSetRes)
+    os.writeLine(os.get_stdout(), "stage=commit_from_votes")
+    let commitRes = host.v3BftValidatorCommitFromVotes(Value(proposalRes), preview, voteSet)
+    if IsErr(commitRes):
+        os.writeLine(os.get_stderr(), Error(commitRes))
+        return 2
+    os.writeLine(os.get_stdout(), "stage=apply_commit")
+    var state = Value(stateRes)
+    let applyRes = host.v3BftValidatorStateApplyCommit(state, Value(commitRes))
+    if IsErr(applyRes):
+        os.writeLine(os.get_stderr(), Error(applyRes))
+        return 2
+    os.writeLine(os.get_stdout(), "inbox_count=" + intToStr(inbox.len))
+    os.writeLine(os.get_stdout(), "vote_set_count=" + intToStr(voteSet.len))
+    os.writeLine(os.get_stdout(), "proposal_hash=" + layout.fixedBytes32Hex(preview.proposalHash))
+    os.writeLine(os.get_stdout(), "app_hash=" + layout.fixedBytes32Hex(preview.appHash))
+    os.writeLine(os.get_stdout(), "tip_event_cid=" + layout.fixedBytes32Hex(preview.tipEventCid))
+    os.writeLine(os.get_stdout(), "event_count=" + intToStr(preview.eventCount))
+    os.writeLine(os.get_stdout(), "account_count=" + intToStr(preview.accountCount))
+    os.writeLine(os.get_stdout(), "commit_app_hash=" + layout.fixedBytes32Hex(Value(commitRes).appHash))
+    os.writeLine(os.get_stdout(), "commit_tip_event_cid=" + layout.fixedBytes32Hex(Value(commitRes).tipEventCid))
+    os.writeLine(os.get_stdout(), "commit_event_count=" + intToStr(Value(commitRes).eventCount))
+    os.writeLine(os.get_stdout(), "commit_account_count=" + intToStr(Value(commitRes).accountCount))
+    for i in 0..<inbox.len:
+        os.writeLine(os.get_stdout(),
+                     "inbox_vote[" + intToStr(i) + "]=" +
+                     intToStr(inbox[i].validatorSlot) + "," +
+                     layout.fixedBytes32Hex(inbox[i].proposalHash) + "," +
+                     layout.fixedBytes32Hex(inbox[i].appHash) + "," +
+                     layout.fixedBytes32Hex(inbox[i].tipEventCid) + "," +
+                     intToStr(inbox[i].eventCount) + "," +
+                     intToStr(inbox[i].accountCount))
+    for i in 0..<voteSet.len:
+        os.writeLine(os.get_stdout(),
+                     "vote_set[" + intToStr(i) + "]=" +
+                     intToStr(voteSet[i].validatorSlot) + "," +
+                     layout.fixedBytes32Hex(voteSet[i].proposalHash) + "," +
+                     layout.fixedBytes32Hex(voteSet[i].appHash) + "," +
+                     layout.fixedBytes32Hex(voteSet[i].tipEventCid) + "," +
+                     intToStr(voteSet[i].eventCount) + "," +
+                     intToStr(voteSet[i].accountCount))
+    return 0

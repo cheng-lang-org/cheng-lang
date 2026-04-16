@@ -34,7 +34,7 @@ fn p256FixedScratchZero(scratch: var P256FixedMontgomeryScratch) =
         scratch.words[i] = 0
 
 fn p256FixedLowWordBitsU64(v: uint64): uint64 =
-    return uint64(uint32(v))
+    return v - ((v >> uint64(p256FixedWordBits)) << uint64(p256FixedWordBits))
 
 fn p256FixedSquareAccumulate(c0: var uint64,
                              c1: var uint64,
@@ -90,10 +90,18 @@ fn p256FixedSquareBuildScratch(a: var P256Fixed): Result[P256FixedMontgomeryScra
     return Ok[P256FixedMontgomeryScratch](scratch)
 
 fn p256FixedWordToBitsU64(w: int32): uint64 =
-    return uint64(uint32(w))
+    if w >= 0:
+        return uint64(w)
+    let mag: int64 = int64(0) - int64(w)
+    return (uint64(1) << uint64(p256FixedWordBits)) - uint64(mag)
 
 fn p256FixedWordFromBitsU64(v: uint64): int32 =
-    return int32(uint32(v))
+    let low: uint64 = p256FixedLowWordBitsU64(v)
+    let signCut: uint64 = uint64(1) << uint64(p256FixedWordBits - 1)
+    if low < signCut:
+        return int32(low)
+    let gap: uint64 = (uint64(1) << uint64(p256FixedWordBits)) - low
+    return 0 - int32(gap)
 
 fn p256FixedZero(): P256Fixed =
     var out: P256Fixed
@@ -253,33 +261,74 @@ fn p256FixedSubRaw(a: var P256Fixed, b: var P256Fixed): P256FixedSubRawResult =
     p256FixedSubRawInto(out.value, out.borrow, a, b)
     return out
 
+fn p256FixedAddRawStep(outWord: var int32,
+                       carryOut: var int32,
+                       av: uint64,
+                       bv: uint64,
+                       carryIn: int32) =
+    let sum: uint64 = av + bv + uint64(carryIn)
+    outWord = p256FixedWordFromBitsU64(sum)
+    carryOut = int32(sum >> uint64(p256FixedWordBits))
+
+fn p256FixedSubRawStep(outWord: var int32,
+                       borrowOut: var int32,
+                       av: uint64,
+                       bv: uint64,
+                       borrowIn: int32) =
+    let wordBase: uint64 = uint64(1) << uint64(p256FixedWordBits)
+    let subWord: uint64 = bv + uint64(borrowIn)
+    if av >= subWord:
+        outWord = p256FixedWordFromBitsU64(av - subWord)
+        borrowOut = 0
+    else:
+        outWord = p256FixedWordFromBitsU64(wordBase + av - subWord)
+        borrowOut = 1
+
 fn p256FixedAddRawInto(out: var P256Fixed,
                        carry: var uint64,
                        a: var P256Fixed,
                        b: var P256Fixed) =
-    carry = uint64(0)
-    for i in 0..<p256FixedLimbCount:
-        let av: uint64 = p256FixedWordToBitsU64(a.limbs[i])
-        let bv: uint64 = p256FixedWordToBitsU64(b.limbs[i])
-        let sum: uint64 = av + bv + carry
-        out.limbs[i] = p256FixedWordFromBitsU64(sum)
-        carry = sum >> uint64(p256FixedWordBits)
+    var carry0 = 0
+    var carry1 = 0
+    var carry2 = 0
+    var carry3 = 0
+    var carry4 = 0
+    var carry5 = 0
+    var carry6 = 0
+    var carry7 = 0
+    var carry8 = 0
+    p256FixedAddRawStep(out.limbs[0], carry1, p256FixedWordToBitsU64(a.limbs[0]), p256FixedWordToBitsU64(b.limbs[0]), carry0)
+    p256FixedAddRawStep(out.limbs[1], carry2, p256FixedWordToBitsU64(a.limbs[1]), p256FixedWordToBitsU64(b.limbs[1]), carry1)
+    p256FixedAddRawStep(out.limbs[2], carry3, p256FixedWordToBitsU64(a.limbs[2]), p256FixedWordToBitsU64(b.limbs[2]), carry2)
+    p256FixedAddRawStep(out.limbs[3], carry4, p256FixedWordToBitsU64(a.limbs[3]), p256FixedWordToBitsU64(b.limbs[3]), carry3)
+    p256FixedAddRawStep(out.limbs[4], carry5, p256FixedWordToBitsU64(a.limbs[4]), p256FixedWordToBitsU64(b.limbs[4]), carry4)
+    p256FixedAddRawStep(out.limbs[5], carry6, p256FixedWordToBitsU64(a.limbs[5]), p256FixedWordToBitsU64(b.limbs[5]), carry5)
+    p256FixedAddRawStep(out.limbs[6], carry7, p256FixedWordToBitsU64(a.limbs[6]), p256FixedWordToBitsU64(b.limbs[6]), carry6)
+    p256FixedAddRawStep(out.limbs[7], carry8, p256FixedWordToBitsU64(a.limbs[7]), p256FixedWordToBitsU64(b.limbs[7]), carry7)
+    carry = uint64(carry8)
 
 fn p256FixedSubRawInto(out: var P256Fixed,
                        borrow: var uint64,
                        a: var P256Fixed,
                        b: var P256Fixed) =
-    borrow = uint64(0)
-    let wordBase: uint64 = uint64(1) << uint64(p256FixedWordBits)
-    for i in 0..<p256FixedLimbCount:
-        let av: uint64 = p256FixedWordToBitsU64(a.limbs[i])
-        let bv: uint64 = p256FixedWordToBitsU64(b.limbs[i]) + borrow
-        if av >= bv:
-            out.limbs[i] = p256FixedWordFromBitsU64(av - bv)
-            borrow = uint64(0)
-        else:
-            out.limbs[i] = p256FixedWordFromBitsU64(wordBase + av - bv)
-            borrow = uint64(1)
+    var borrow0 = 0
+    var borrow1 = 0
+    var borrow2 = 0
+    var borrow3 = 0
+    var borrow4 = 0
+    var borrow5 = 0
+    var borrow6 = 0
+    var borrow7 = 0
+    var borrow8 = 0
+    p256FixedSubRawStep(out.limbs[0], borrow1, p256FixedWordToBitsU64(a.limbs[0]), p256FixedWordToBitsU64(b.limbs[0]), borrow0)
+    p256FixedSubRawStep(out.limbs[1], borrow2, p256FixedWordToBitsU64(a.limbs[1]), p256FixedWordToBitsU64(b.limbs[1]), borrow1)
+    p256FixedSubRawStep(out.limbs[2], borrow3, p256FixedWordToBitsU64(a.limbs[2]), p256FixedWordToBitsU64(b.limbs[2]), borrow2)
+    p256FixedSubRawStep(out.limbs[3], borrow4, p256FixedWordToBitsU64(a.limbs[3]), p256FixedWordToBitsU64(b.limbs[3]), borrow3)
+    p256FixedSubRawStep(out.limbs[4], borrow5, p256FixedWordToBitsU64(a.limbs[4]), p256FixedWordToBitsU64(b.limbs[4]), borrow4)
+    p256FixedSubRawStep(out.limbs[5], borrow6, p256FixedWordToBitsU64(a.limbs[5]), p256FixedWordToBitsU64(b.limbs[5]), borrow5)
+    p256FixedSubRawStep(out.limbs[6], borrow7, p256FixedWordToBitsU64(a.limbs[6]), p256FixedWordToBitsU64(b.limbs[6]), borrow6)
+    p256FixedSubRawStep(out.limbs[7], borrow8, p256FixedWordToBitsU64(a.limbs[7]), p256FixedWordToBitsU64(b.limbs[7]), borrow7)
+    borrow = uint64(borrow8)
 
 fn p256FixedMontgomeryAddMulAt(scratch: var P256FixedMontgomeryScratch,
                                offset: int32,
@@ -613,21 +662,14 @@ fn p256FixedBuildMontgomeryContext(modulus: BigInt): Result[P256FixedMontgomeryC
     return Ok[P256FixedMontgomeryContext](out)
 
 fn p256FixedModAdd(a: var P256Fixed, b: var P256Fixed, modulus: var P256Fixed): Result[P256Fixed] =
-    let addRaw: P256FixedAddRawResult = p256FixedAddRaw(a, b)
-    if addRaw.carry != uint64(0) || p256FixedCmp(addRaw.value, modulus) >= 0:
-        let reduceRes: Result[P256Fixed] = p256FixedSubtractModulusWithHigh(addRaw.value,
-                                                                            addRaw.carry,
-                                                                            modulus)
-        if IsErr(reduceRes):
-            return Err[P256Fixed](Error(reduceRes))
-        return Ok[P256Fixed](Value(reduceRes))
-    return Ok[P256Fixed](addRaw.value)
+    var out: P256Fixed
+    p256FixedModAddTrustedInto(out, a, b, modulus)
+    return Ok[P256Fixed](out)
 
 fn p256FixedModAddTrusted(a: var P256Fixed, b: var P256Fixed, modulus: var P256Fixed): P256Fixed =
-    let addRaw: P256FixedAddRawResult = p256FixedAddRaw(a, b)
-    if addRaw.carry != uint64(0) || p256FixedCmp(addRaw.value, modulus) >= 0:
-        return p256FixedSubtractModulusWithHighTrusted(addRaw.value, addRaw.carry, modulus)
-    return addRaw.value
+    var out: P256Fixed
+    p256FixedModAddTrustedInto(out, a, b, modulus)
+    return out
 
 fn p256FixedModAddTrustedInto(out: var P256Fixed,
                               a: var P256Fixed,
@@ -640,28 +682,14 @@ fn p256FixedModAddTrustedInto(out: var P256Fixed,
         return
 
 fn p256FixedModSub(a: var P256Fixed, b: var P256Fixed, modulus: var P256Fixed): Result[P256Fixed] =
-    let subRaw: P256FixedSubRawResult = p256FixedSubRaw(a, b)
-    if subRaw.borrow == uint64(0):
-        return Ok[P256Fixed](subRaw.value)
-    let diffRaw: P256FixedSubRawResult = p256FixedSubRaw(b, a)
-    if diffRaw.borrow != uint64(0):
-        return Err[P256Fixed]("p256_fixed: wrapped subtraction diff borrow")
-    let reduceRaw: P256FixedSubRawResult = p256FixedSubRaw(modulus, diffRaw.value)
-    if reduceRaw.borrow != uint64(0):
-        return Err[P256Fixed]("p256_fixed: modulus subtraction borrow")
-    return Ok[P256Fixed](reduceRaw.value)
+    var out: P256Fixed
+    p256FixedModSubTrustedInto(out, a, b, modulus)
+    return Ok[P256Fixed](out)
 
 fn p256FixedModSubTrusted(a: var P256Fixed, b: var P256Fixed, modulus: var P256Fixed): P256Fixed =
-    let subRaw: P256FixedSubRawResult = p256FixedSubRaw(a, b)
-    if subRaw.borrow == uint64(0):
-        return subRaw.value
-    let diffRaw: P256FixedSubRawResult = p256FixedSubRaw(b, a)
-    if diffRaw.borrow != uint64(0):
-        panic("p256_fixed: wrapped subtraction diff borrow")
-    let reduceRaw: P256FixedSubRawResult = p256FixedSubRaw(modulus, diffRaw.value)
-    if reduceRaw.borrow != uint64(0):
-        panic("p256_fixed: modulus subtraction borrow")
-    return reduceRaw.value
+    var out: P256Fixed
+    p256FixedModSubTrustedInto(out, a, b, modulus)
+    return out
 
 fn p256FixedModSubTrustedInto(out: var P256Fixed,
                               a: var P256Fixed,

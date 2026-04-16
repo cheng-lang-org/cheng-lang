@@ -77,7 +77,7 @@ case "$out" in
   *) out="$root/$out" ;;
 esac
 
-cmd="src/tooling/build_mobile_export.sh"
+cmd="src/tooling/cheng_tooling_embedded_scripts/build_mobile_export.sh"
 args="--with-android-project"
 if [ "$name" != "" ]; then
   args="$args --name:$name"
@@ -97,7 +97,7 @@ fi
 
 echo "[ci-android] export: $in"
 set -- $args
-"$cmd" "$in" "$@"
+sh "$cmd" "$in" "$@"
 
 project="$out/android_project"
 if [ ! -f "$project/gradlew" ]; then
@@ -105,7 +105,7 @@ if [ ! -f "$project/gradlew" ]; then
   exit 2
 fi
 
-verify_script="src/tooling/verify_android_kotlin_only.sh"
+verify_script="src/tooling/cheng_tooling_embedded_scripts/verify_android_kotlin_only.sh"
 sh "$verify_script" --project:"$project"
 
 echo "[ci-android] build: $project"

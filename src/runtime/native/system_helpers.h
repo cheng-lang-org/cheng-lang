@@ -63,6 +63,7 @@ int32_t cheng_v3_udp_bind_host_port_bridge(ChengStrBridge host,
 int32_t cheng_v3_udp_bind_fd_bridge(ChengStrBridge host, int32_t port, int32_t isV6);
 int32_t cheng_v3_udp_bound_port_bridge(int32_t fd, int32_t isV6);
 int32_t cheng_v3_udp_platform_use_len_field_bridge(void);
+int32_t cheng_v3_udp_platform_msg_dontwait_bridge(void);
 int32_t __cheng_str_eq(const char* a, const char* b);
 bool cheng_str_is_empty(const char* s);
 bool cheng_str_nonempty(const char* s);
@@ -312,15 +313,15 @@ int32_t cheng_v3_os_file_exists_bridge(ChengStrBridge path);
 int32_t cheng_v3_os_dir_exists_bridge(ChengStrBridge path);
 int64_t cheng_v3_os_file_size_bridge(ChengStrBridge path);
 ChengStrBridge cheng_v3_read_file_bridge(ChengStrBridge path);
-int32_t cheng_v3_tcp_loopback_payload_bridge(ChengStrBridge protocol_text,
-                                             ChengStrBridge payload_text,
-                                             ChengStrBridge* response_text,
-                                             ChengStrBridge* err_text);
-int32_t cheng_v3_tcp_loopback_request_response_bridge(ChengStrBridge protocol_text,
-                                                      ChengStrBridge request_text,
-                                                      ChengStrBridge response_text,
-                                                      ChengStrBridge* client_response_text,
-                                                      ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_loopback_payload_impl_bridge(ChengStrBridge protocol_text,
+                                                  ChengStrBridge payload_text,
+                                                  ChengStrBridge* response_text,
+                                                  ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_loopback_request_response_impl_bridge(ChengStrBridge protocol_text,
+                                                           ChengStrBridge request_text,
+                                                           ChengStrBridge response_text,
+                                                           ChengStrBridge* client_response_text,
+                                                           ChengStrBridge* err_text);
 int32_t cheng_v3_webrtc_datachannel_request_response_bridge(ChengStrBridge protocol_text,
                                                             ChengStrBridge signal_text,
                                                             ChengStrBridge request_text,
@@ -348,6 +349,7 @@ int32_t cheng_v3_webrtc_browser_session_exchange_bridge(uint64_t handle,
 int32_t cheng_v3_webrtc_browser_session_close_bridge(uint64_t handle,
                                                      ChengStrBridge* err_text);
 int32_t cheng_v3_webrtc_browser_session_active_count_bridge(void);
+ChengStrBridge cheng_v3_mobile_biometric_fingerprint_authorize_bridge_native(ChengStrBridge request_wire);
 uint64_t cheng_v3_tailnet_provider_open_bridge(ChengStrBridge provider_kind_text,
                                                ChengStrBridge control_endpoint_text,
                                                ChengStrBridge relay_endpoint_text,
@@ -374,17 +376,17 @@ int32_t cheng_v3_system_gpu_device_count_bridge(void);
 int32_t cheng_v3_system_gpu_core_count_bridge(void);
 int32_t cheng_v3_system_npu_device_count_bridge(void);
 int32_t cheng_v3_system_npu_core_count_bridge(void);
-int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
-                                               int32_t port,
-                                               ChengStrBridge protocol_text,
-                                               ChengStrBridge payload_text,
-                                               ChengStrBridge ready_path_text,
-                                               ChengStrBridge* err_text);
-int32_t cheng_v3_tcp_recv_payload_once_bridge(ChengStrBridge host_text,
-                                              int32_t port,
-                                              ChengStrBridge protocol_text,
-                                              ChengStrBridge* response_text,
-                                              ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_serve_payload_once_impl_bridge(ChengStrBridge host_text,
+                                                    int32_t port,
+                                                    ChengStrBridge protocol_text,
+                                                    ChengStrBridge payload_text,
+                                                    ChengStrBridge ready_path_text,
+                                                    ChengStrBridge* err_text);
+int32_t cheng_v3_tcp_recv_payload_once_impl_bridge(ChengStrBridge host_text,
+                                                   int32_t port,
+                                                   ChengStrBridge protocol_text,
+                                                   ChengStrBridge* response_text,
+                                                   ChengStrBridge* err_text);
 ChengStrBridge cheng_v3_tcp_loopback_multistream_bridge(ChengStrBridge protocol_text);
 ChengStrBridge cheng_v3_sha256_hex_bridge(ChengStrBridge text);
 int64_t cheng_v3_sha256_word_bridge(ChengStrBridge text, int32_t word_index);
@@ -392,13 +394,6 @@ int32_t driver_c_cli_param1_eq_bridge(ChengStrBridge expected);
 int32_t driver_c_cli_param1_eq_raw_bridge(const char* expected_ptr, int32_t expected_len);
 int32_t driver_c_compiler_core_print_usage_bridge(void);
 int32_t driver_c_compiler_core_print_status_bridge(void);
-ChengStrBridge driver_c_exec_file_capture_or_panic_bridge(ChengStrBridge file_path,
-                                                          ChengSeqHeader argv,
-                                                          ChengStrBridge working_dir,
-                                                          ChengStrBridge label);
-void driver_c_compare_text_files_or_panic_bridge(ChengStrBridge left_path,
-                                                 ChengStrBridge right_path,
-                                                 ChengStrBridge label);
 ChengStrBridge driver_c_read_flag_or_default_bridge(ChengStrBridge key, ChengStrBridge default_value);
 int32_t driver_c_read_flag_value_bridge(ChengStrBridge key, ChengStrBridge* out_value);
 int32_t driver_c_read_int32_flag_or_default_bridge(ChengStrBridge key, int32_t default_value);
@@ -418,10 +413,6 @@ ChengStrBridge driver_c_provider_field_for_module_from_plan_text_bridge(ChengStr
                                                                         ChengStrBridge field_name);
 ChengStrBridge driver_c_compiler_core_provider_source_kind_bridge(ChengStrBridge plan_text);
 ChengStrBridge driver_c_compiler_core_provider_compile_mode_bridge(ChengStrBridge plan_text);
-int32_t driver_c_run_stage_selfhost_host_bridge(void);
-int32_t driver_c_run_tooling_selfhost_host_bridge(void);
-int32_t driver_c_run_tooling_selfhost_check_bridge(void);
-int32_t driver_c_run_program_selfhost_check_bridge(void);
 int32_t driver_c_compiler_core_tooling_local_payload_bridge(const char* payload);
 int32_t driver_c_compiler_core_program_local_payload_bridge(const char* payload);
 int32_t driver_c_compiler_core_program_argv_bridge(int32_t argc, const char** argv);
@@ -477,9 +468,6 @@ char* cheng_list_dir(const char* path);
 char* cheng_read_file(const char* path);
 int32_t cheng_write_file(const char* path, const char* content);
 char* cheng_exec_cmd_ex(const char* command, const char* workingDir, int32_t mergeStderr, int64_t* exitCode);
-char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
-                              const char* workingDir, int32_t mergeStderr, int32_t timeoutSec,
-                              int64_t* exitCode);
 int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
                                const char* workingDir, int32_t timeoutSec);
 char* chengQ_execQ_cmdQ_ex_0(char* command, char* workingDir, int32_t mergeStderr, int64_t* exitCode);

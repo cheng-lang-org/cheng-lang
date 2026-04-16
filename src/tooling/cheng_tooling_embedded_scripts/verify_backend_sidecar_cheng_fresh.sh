@@ -466,7 +466,7 @@ wrapper_source="$root/src/backend/tooling/backend_driver_uir_sidecar_wrapper.che
 helper_source="$root/src/backend/tooling/backend_driver_uir_sidecar_bundle.c"
 outer_source="$root/src/backend/tooling/backend_driver_sidecar_outer_main.c"
 outer_exports_source="$root/src/backend/tooling/backend_driver_sidecar_outer_exports.c"
-runtime_source="$root/src/runtime/native/system_helpers.c"
+runtime_source="$root/src/runtime/native/system_helpers_selflink_shim.c"
 
 compiler_path="$cache_dir/backend_driver_currentsrc_sidecar_wrapper.$target.sh"
 compiler_meta="$compiler_path.meta"

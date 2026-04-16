@@ -2,13 +2,7 @@ import std/result
 import std/rawbytes
 import cheng/v3/libp2p/core/multistream
 import cheng/v3/libp2p/core/types
-
-importc fn cheng_v3_tcp_loopback_payload_bridge(protocolText: str, payloadWire: str, responseWire: var str, errWire: var str): int32
-importc fn cheng_v3_tcp_loopback_request_response_bridge(protocolText: str, requestWire: str, responseWire: str, clientResponseWire: var str, errWire: var str): int32
-importc fn cheng_v3_tcp_serve_payload_once_bridge(hostText: str, port: int32, protocolText: str, payloadWire: str, readyPath: str, errWire: var str): int32
-importc fn cheng_v3_tcp_recv_payload_once_bridge(hostText: str, port: int32, protocolText: str, responseWire: var str, errWire: var str): int32
-importc fn cheng_v3_tcp_request_response_bridge(hostText: str, port: int32, protocolText: str, requestWire: str, clientResponseWire: var str, errWire: var str): int32
-importc fn cheng_v3_tcp_serve_request_capture_once_bridge(hostText: str, port: int32, protocolText: str, responseWire: str, readyPath: str, requestWire: var str, errWire: var str): int32
+import cheng/v3/runtime/tcp_bridge_abi as tcpabi
 
 type
     V3Libp2pTcpTransportConfig =
@@ -17,6 +11,89 @@ type
 
 fn v3Libp2pTcpOwnedBytesFromString(text: str): Bytes =
     return bytesSlice(bytesFromString(text), 0, len(text))
+
+fn v3Libp2pTcpHexDigit(value: int32): int32 =
+    if value < 10:
+        return int32('0') + value
+    return int32('a') + (value - 10)
+
+fn v3Libp2pTcpBridgeHexFrom(data: ptr, n: int32): str =
+    if data == nil || n <= 0:
+        return ""
+    var out = bytesAlloc(n * 2)
+    var i = 0
+    while i < n:
+        let value = chengRawbytesGetAt(data, i)
+        let hi = value / 16
+        let lo = value - (hi * 16)
+        bytesSet(out, i * 2, v3Libp2pTcpHexDigit(hi))
+        bytesSet(out, i * 2 + 1, v3Libp2pTcpHexDigit(lo))
+        i = i + 1
+    return bytesToString(out)
+
+fn v3Libp2pTcpBytesFromHandle(handle: uint64): Result[Bytes] =
+    if handle == uint64(0):
+        return Err[Bytes]("v3 libp2p tcp: bridge failed")
+    let n = tcpabi.cheng_v3_buffer_handle_len_bridge(handle)
+    if n < 0:
+        tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        return Err[Bytes]("v3 libp2p tcp: bridge handle len failed")
+    var out = bytesAlloc(n)
+    for i in 0..<n:
+        let b = tcpabi.cheng_v3_buffer_handle_byte_bridge(handle, i)
+        if b < 0:
+            tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+            return Err[Bytes]("v3 libp2p tcp: bridge handle byte failed")
+        bytesSet(out, i, b)
+    tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+    return Ok[Bytes](out)
+
+fn v3Libp2pTcpHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3Libp2pTcpBytesFromHex(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("v3 libp2p tcp: invalid capture hex length")
+    var out = bytesAlloc(len(text) / 2)
+    var i = 0
+    while i < len(text):
+        let hi = v3Libp2pTcpHexValue(text[i])
+        let lo = v3Libp2pTcpHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 libp2p tcp: invalid capture hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3Libp2pTcpDecodeCapturedLines(text: str): Result[Bytes[]] =
+    var out: Bytes[]
+    out = []
+    var start = 0
+    var i = 0
+    while i <= len(text):
+        let atEnd = i >= len(text)
+        var sawLineBreak = false
+        if !atEnd:
+            sawLineBreak = text[i] == '\n'
+        if atEnd || sawLineBreak:
+            let count = i - start
+            if count > 0:
+                let line = bytesToString(bytesSlice(bytesFromString(text), start, count))
+                let bytesRes = v3Libp2pTcpBytesFromHex(line)
+                if IsErr(bytesRes):
+                    return Err[Bytes[]](Error(bytesRes))
+                add(out, Value(bytesRes))
+            start = i + 1
+        i = i + 1
+    return Ok[Bytes[]](out)
 
 fn v3Libp2pTcpTransportConfigDefault(): V3Libp2pTcpTransportConfig =
     return V3Libp2pTcpTransportConfig(
@@ -31,18 +108,11 @@ fn v3Libp2pTcpTransportSupportsAddr(addr: types.V3Libp2pMultiaddr): bool =
 
 fn v3Libp2pTcpLoopbackRoundtrip(protocol: types.V3Libp2pProtocolId,
                                 payload: Bytes): Result[Bytes] =
-    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var responseWire = ""
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_loopback_payload_bridge(bytesToString(selectBytes),
-                                                         bytesToString(payload),
-                                                         responseWire,
-                                                         errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[Bytes]("v3 libp2p tcp: loopback payload bridge failed")
-        return Err[Bytes](errWire)
-    return Ok[Bytes](v3Libp2pTcpOwnedBytesFromString(responseWire))
+    return v3Libp2pTcpLoopbackRequestResponseRaw(protocol,
+                                                 payload.data,
+                                                 payload.len,
+                                                 payload.data,
+                                                 payload.len)
 
 fn v3Libp2pTcpLoopbackMultistream(protocol: types.V3Libp2pProtocolId): Result[bool] =
     let roundtripRes = v3Libp2pTcpLoopbackRoundtrip(protocol, emptyBytes())
@@ -52,22 +122,39 @@ fn v3Libp2pTcpLoopbackMultistream(protocol: types.V3Libp2pProtocolId): Result[bo
         return Err[bool]("v3 libp2p tcp: unexpected loopback payload")
     return Ok[bool](true)
 
+fn v3Libp2pTcpLoopbackRequestResponseRaw(protocol: types.V3Libp2pProtocolId,
+                                         requestData: ptr,
+                                         requestLen: int32,
+                                         responseData: ptr,
+                                         responseLen: int32): Result[Bytes] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    let selectText = bytesToString(selectBytes)
+    let requestHandle = tcpabi.cheng_v3_buffer_handle_from_raw_bridge(requestData, requestLen)
+    let responseHandle = tcpabi.cheng_v3_buffer_handle_from_raw_bridge(responseData, responseLen)
+    if requestHandle == uint64(0) || responseHandle == uint64(0):
+        if requestHandle != uint64(0):
+            tcpabi.cheng_v3_buffer_handle_release_bridge(requestHandle)
+        if responseHandle != uint64(0):
+            tcpabi.cheng_v3_buffer_handle_release_bridge(responseHandle)
+        return Err[Bytes]("v3 libp2p tcp: loopback input handle failed")
+    let handle = tcpabi.cheng_v3_tcp_loopback_request_response_handle_bridge(selectText,
+                                                                             requestHandle,
+                                                                             responseHandle)
+    tcpabi.cheng_v3_buffer_handle_release_bridge(requestHandle)
+    tcpabi.cheng_v3_buffer_handle_release_bridge(responseHandle)
+    let bytesRes = v3Libp2pTcpBytesFromHandle(handle)
+    if IsErr(bytesRes):
+        return Err[Bytes]("v3 libp2p tcp: loopback request-response bridge failed")
+    return Ok[Bytes](Value(bytesRes))
+
 fn v3Libp2pTcpLoopbackRequestResponse(protocol: types.V3Libp2pProtocolId,
                                       requestPayload: Bytes,
                                       responsePayload: Bytes): Result[Bytes] =
-    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var clientResponseWire = ""
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_loopback_request_response_bridge(bytesToString(selectBytes),
-                                                                  bytesToString(requestPayload),
-                                                                  bytesToString(responsePayload),
-                                                                  clientResponseWire,
-                                                                  errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[Bytes]("v3 libp2p tcp: loopback request-response bridge failed")
-        return Err[Bytes](errWire)
-    return Ok[Bytes](v3Libp2pTcpOwnedBytesFromString(clientResponseWire))
+    return v3Libp2pTcpLoopbackRequestResponseRaw(protocol,
+                                                 requestPayload.data,
+                                                 requestPayload.len,
+                                                 responsePayload.data,
+                                                 responsePayload.len)
 
 fn v3Libp2pTcpServePayloadOnce(host: str,
                                port: int32,
@@ -75,54 +162,40 @@ fn v3Libp2pTcpServePayloadOnce(host: str,
                                payload: Bytes,
                                readyPath: str): Result[bool] =
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_serve_payload_once_bridge(host,
-                                                           port,
-                                                           bytesToString(selectBytes),
-                                                           bytesToString(payload),
-                                                           readyPath,
-                                                           errWire)
+    let selectText = bytesToString(selectBytes)
+    let payloadHex = v3Libp2pTcpBridgeHexFrom(payload.data, payload.len)
+    let ok: int32 = tcpabi.cheng_v3_tcp_serve_payload_once_bridge(host,
+                                                                  port,
+                                                                  selectText,
+                                                                  payloadHex,
+                                                                  readyPath)
     if ok == 0:
-        if errWire == "":
-            return Err[bool]("v3 libp2p tcp: serve payload bridge failed")
-        return Err[bool](errWire)
+        return Err[bool]("v3 libp2p tcp: serve payload bridge failed")
     return Ok[bool](true)
 
 fn v3Libp2pTcpRecvPayloadOnce(host: str,
                               port: int32,
                               protocol: types.V3Libp2pProtocolId): Result[Bytes] =
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var responseWire = ""
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_recv_payload_once_bridge(host,
-                                                          port,
-                                                          bytesToString(selectBytes),
-                                                          responseWire,
-                                                          errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[Bytes]("v3 libp2p tcp: recv payload bridge failed")
-        return Err[Bytes](errWire)
-    return Ok[Bytes](v3Libp2pTcpOwnedBytesFromString(responseWire))
+    let selectText = bytesToString(selectBytes)
+    let handle = tcpabi.cheng_v3_tcp_recv_payload_once_bridge(host, port, selectText)
+    let bytesRes = v3Libp2pTcpBytesFromHandle(handle)
+    if IsErr(bytesRes):
+        return Err[Bytes]("v3 libp2p tcp: recv payload bridge failed")
+    return Ok[Bytes](Value(bytesRes))
 
 fn v3Libp2pTcpRequestResponse(host: str,
                               port: int32,
                               protocol: types.V3Libp2pProtocolId,
                               requestPayload: Bytes): Result[Bytes] =
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var responseWire = ""
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_request_response_bridge(host,
-                                                         port,
-                                                         bytesToString(selectBytes),
-                                                         bytesToString(requestPayload),
-                                                         responseWire,
-                                                         errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[Bytes]("v3 libp2p tcp: request-response bridge failed")
-        return Err[Bytes](errWire)
-    return Ok[Bytes](v3Libp2pTcpOwnedBytesFromString(responseWire))
+    let selectText = bytesToString(selectBytes)
+    let requestHex = v3Libp2pTcpBridgeHexFrom(requestPayload.data, requestPayload.len)
+    let handle = tcpabi.cheng_v3_tcp_request_response_bridge(host, port, selectText, requestHex)
+    let bytesRes = v3Libp2pTcpBytesFromHandle(handle)
+    if IsErr(bytesRes):
+        return Err[Bytes]("v3 libp2p tcp: request-response bridge failed")
+    return Ok[Bytes](Value(bytesRes))
 
 fn v3Libp2pTcpServeRequestCaptureOnce(host: str,
                                       port: int32,
@@ -130,17 +203,56 @@ fn v3Libp2pTcpServeRequestCaptureOnce(host: str,
                                       responsePayload: Bytes,
                                       readyPath: str): Result[Bytes] =
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var requestWire = ""
-    var errWire = ""
-    let ok: int32 = cheng_v3_tcp_serve_request_capture_once_bridge(host,
-                                                                   port,
-                                                                   bytesToString(selectBytes),
-                                                                   bytesToString(responsePayload),
-                                                                   readyPath,
-                                                                   requestWire,
-                                                                   errWire)
+    let selectText = bytesToString(selectBytes)
+    let responseHex = v3Libp2pTcpBridgeHexFrom(responsePayload.data, responsePayload.len)
+    let handle = tcpabi.cheng_v3_tcp_serve_request_capture_once_bridge(host, port, selectText, responseHex, readyPath)
+    let bytesRes = v3Libp2pTcpBytesFromHandle(handle)
+    if IsErr(bytesRes):
+        return Err[Bytes]("v3 libp2p tcp: serve request capture bridge failed")
+    return Ok[Bytes](Value(bytesRes))
+
+fn v3Libp2pTcpServePayloadWindow(host: str,
+                                 port: int32,
+                                 protocol: types.V3Libp2pProtocolId,
+                                 payload: Bytes,
+                                 readyPath: str,
+                                 maxServeCount: int32,
+                                 waitMs: int32): Result[bool] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    let selectText = bytesToString(selectBytes)
+    let payloadHex = v3Libp2pTcpBridgeHexFrom(payload.data, payload.len)
+    let ok: int32 = tcpabi.cheng_v3_tcp_serve_payload_window_bridge(host,
+                                                                    port,
+                                                                    selectText,
+                                                                    payloadHex,
+                                                                    readyPath,
+                                                                    maxServeCount,
+                                                                    waitMs)
     if ok == 0:
-        if errWire == "":
-            return Err[Bytes]("v3 libp2p tcp: serve request capture bridge failed")
-        return Err[Bytes](errWire)
-    return Ok[Bytes](v3Libp2pTcpOwnedBytesFromString(requestWire))
+        return Err[bool]("v3 libp2p tcp: serve payload window bridge failed")
+    return Ok[bool](true)
+
+fn v3Libp2pTcpServeRequestCaptureWindow(host: str,
+                                        port: int32,
+                                        protocol: types.V3Libp2pProtocolId,
+                                        responsePayload: Bytes,
+                                        readyPath: str,
+                                        maxCaptureCount: int32,
+                                        waitMs: int32): Result[Bytes[]] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    let selectText = bytesToString(selectBytes)
+    let responseHex = v3Libp2pTcpBridgeHexFrom(responsePayload.data, responsePayload.len)
+    let handle = tcpabi.cheng_v3_tcp_serve_request_capture_window_bridge(host,
+                                                                         port,
+                                                                         selectText,
+                                                                         responseHex,
+                                                                         readyPath,
+                                                                         maxCaptureCount,
+                                                                         waitMs)
+    let capturedRes = v3Libp2pTcpBytesFromHandle(handle)
+    if IsErr(capturedRes):
+        return Err[Bytes[]]("v3 libp2p tcp: serve request capture window bridge failed")
+    let decodeRes = v3Libp2pTcpDecodeCapturedLines(bytesToString(Value(capturedRes)))
+    if IsErr(decodeRes):
+        return Err[Bytes[]](Error(decodeRes))
+    return Ok[Bytes[]](Value(decodeRes))

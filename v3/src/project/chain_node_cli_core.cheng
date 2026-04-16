@@ -1,6 +1,8 @@
 import std/system
+import std/os
 import std/result
 import std/rawbytes
+import std/cmdline as cmdline
 import std/strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
@@ -9,69 +11,33 @@ import cheng/v3/project/chain_node as node
 import cheng/v3/project/chain_node_libp2p as net
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/transports/tcp_transport
+import cheng/v3/tooling/path as v3path
 
 const
     v3ChainNodeCliStateMagic: str = "v3.chain_node.state.v1"
 
-importc fn driver_c_read_flag_value_bridge(key: str, outValue: var str): bool
-importc fn driver_c_read_int32_flag_or_default_bridge(key: str, defaultValue: int32): int32
-importc fn driver_c_get_current_dir_bridge(): str
-importc fn driver_c_join_path2_bridge(left: str, right: str): str
-importc fn driver_c_create_dir_all_bridge(path: str)
-importc fn driver_c_write_text_file_bridge(path: str, content: str)
-importc fn cheng_v3_read_file_bridge(path: str): str
-importc fn cheng_v3_os_file_exists_bridge(path: str): int32
-@importc("paramCount")
-fn v3ChainNodeCliParamCountBridge(): int32
-@importc("__cheng_rt_paramStrCopyBridgeInto")
-fn v3ChainNodeCliParamStrCopyBridge(i: int32, out: var str)
-
-fn v3ChainNodeCliParamStr(i: int32): str =
-    var out: str
-    v3ChainNodeCliParamStrCopyBridge(i, out)
-    return out
-
 fn v3ChainNodeCliHasFlag(flag: str): bool =
-    let count = v3ChainNodeCliParamCountBridge()
-    for i in 1..count:
-        if v3ChainNodeCliParamStr(i) == flag:
-            return true
-    return false
+    return cmdline.hasFlag(flag)
 
 fn v3ChainNodeCliReadFlag(key: str, defaultValue: str): str =
     var out: str
     out = ""
-    if driver_c_read_flag_value_bridge(key, out):
+    if cmdline.readFirstFlagValue(key, out):
         return out
     return defaultValue
 
-fn v3ChainNodeCliTextStartsWith(text: str, prefix: str): bool =
-    if len(prefix) > len(text):
-        return false
-    for i in 0..<len(prefix):
-        if text[i] != prefix[i]:
-            return false
-    return true
-
 fn v3ChainNodeCliReadFlagValue(key: str, outValue: var str): bool =
-    outValue = ""
-    let count = v3ChainNodeCliParamCountBridge()
-    let colonPrefix = key + ":"
-    let eqPrefix = key + "="
-    for i in 1..count:
-        let arg = v3ChainNodeCliParamStr(i)
-        if arg == key:
-            if i >= count:
-                return false
-            outValue = v3ChainNodeCliParamStr(i + 1)
-            return true
-        if v3ChainNodeCliTextStartsWith(arg, colonPrefix):
-            outValue = strings.sliceBytes(arg, len(colonPrefix), len(arg) - len(colonPrefix))
-            return true
-        if v3ChainNodeCliTextStartsWith(arg, eqPrefix):
-            outValue = strings.sliceBytes(arg, len(eqPrefix), len(arg) - len(eqPrefix))
-            return true
-    return false
+    return cmdline.readFirstFlagValue(key, outValue)
+
+fn v3ChainNodeCliReadInt32FlagOrDefault(key: str, defaultValue: int32): int32 =
+    var raw: str
+    raw = ""
+    if !cmdline.readFirstFlagValue(key, raw):
+        return defaultValue
+    let parsedRes = v3ChainNodeCliParseInt32Text(raw)
+    if IsErr(parsedRes):
+        return defaultValue
+    return Value(parsedRes)
 
 fn v3ChainNodeCliParseInt64Text(raw: str): Result[int64] =
     let text = strutil.strip(raw)
@@ -96,6 +62,15 @@ fn v3ChainNodeCliParseInt64Text(raw: str): Result[int64] =
         i = i + 1
     return Ok[int64](value * sign)
 
+fn v3ChainNodeCliParseInt32Text(raw: str): Result[int32] =
+    let parsedRes = v3ChainNodeCliParseInt64Text(raw)
+    if IsErr(parsedRes):
+        return Err[int32](Error(parsedRes))
+    let value64 = Value(parsedRes)
+    if value64 < int64(-2147483648) || value64 > int64(2147483647):
+        return Err[int32]("v3 chain_node: invalid int32: " + raw)
+    return Ok[int32](int32(value64))
+
 fn v3ChainNodeCliReadRequiredFlag(key: str,
                                   outValue: var str): Result[bool] =
     outValue = ""
@@ -106,16 +81,19 @@ fn v3ChainNodeCliReadRequiredFlag(key: str,
         return Err[bool]("v3 chain_node: missing " + key)
     return Ok[bool](true)
 
-fn v3ChainNodeCliReadRequiredInt64Flag(key: str): Result[int64] =
+fn v3ChainNodeCliReadRequiredInt64Flag(key: str,
+                                       outValue: var int64): Result[bool] =
+    outValue = int64(0)
     var raw: str
     raw = ""
     let readRes = v3ChainNodeCliReadRequiredFlag(key, raw)
     if IsErr(readRes):
-        return Err[int64](Error(readRes))
+        return Err[bool](Error(readRes))
     let parsedRes = v3ChainNodeCliParseInt64Text(raw)
     if IsErr(parsedRes):
-        return Err[int64]("v3 chain_node: invalid integer for " + key + ": " + raw)
-    return Ok[int64](Value(parsedRes))
+        return Err[bool]("v3 chain_node: invalid integer for " + key + ": " + raw)
+    outValue = Value(parsedRes)
+    return Ok[bool](true)
 
 fn v3ChainNodeCliHexValue(ch: char): int32 =
     if ch >= '0' && ch <= '9':
@@ -142,30 +120,13 @@ fn v3ChainNodeCliBytesFromHex(text: str): Result[Bytes] =
     return Ok[Bytes](out)
 
 fn v3ChainNodeCliCurrentDir(): str =
-    return driver_c_get_current_dir_bridge()
+    return os.getCurrentDir()
 
 fn v3ChainNodeCliAbsolutePath(pathRaw: str): str =
-    if len(pathRaw) <= 0:
-        return ""
-    if pathRaw[0] == '/':
-        return pathRaw
-    return driver_c_join_path2_bridge(v3ChainNodeCliCurrentDir(), pathRaw)
-
-fn v3ChainNodeCliLastSep(path: str): int32 =
-    var out: int32 = -1
-    for i in 0..<len(path):
-        if path[i] == '/':
-            out = i
-    return out
-
-fn v3ChainNodeCliParentDir(path: str): str =
-    let pos = v3ChainNodeCliLastSep(path)
-    if pos <= 0:
-        return ""
-    return strings.sliceBytes(path, 0, pos)
+    return v3path.v3PathAbsolute(v3ChainNodeCliCurrentDir(), pathRaw)
 
 fn v3ChainNodeCliFileExists(pathRaw: str): bool =
-    return cheng_v3_os_file_exists_bridge(v3ChainNodeCliAbsolutePath(pathRaw)) != 0
+    return v3path.v3PathFileExists(v3ChainNodeCliAbsolutePath(pathRaw))
 
 fn v3ChainNodeCliTextEmpty(text: str): bool =
     return len(text) <= 0
@@ -178,12 +139,9 @@ fn v3ChainNodeCliStateText(snapshot: node.V3ChainNodeServeSnapshot): str =
 
 fn v3ChainNodeCliWriteState(pathRaw: str,
                             snapshot: node.V3ChainNodeServeSnapshot): bool =
-    let path = v3ChainNodeCliAbsolutePath(pathRaw)
-    let parent = v3ChainNodeCliParentDir(path)
-    if len(parent) > 0:
-        driver_c_create_dir_all_bridge(parent)
-    driver_c_write_text_file_bridge(path, v3ChainNodeCliStateText(snapshot))
-    return cheng_v3_os_file_exists_bridge(path) != 0
+    return v3path.v3WriteTextFile(v3ChainNodeCliCurrentDir(),
+                                  pathRaw,
+                                  v3ChainNodeCliStateText(snapshot))
 
 fn v3ChainNodeCliExtractStateText(text: str,
                                   outNodeId: var str,
@@ -224,7 +182,7 @@ fn v3ChainNodeCliExtractStateText(text: str,
 
 fn v3ChainNodeCliLoadState(pathRaw: str): Result[node.V3ChainNode] =
     let path = v3ChainNodeCliAbsolutePath(pathRaw)
-    let text = cheng_v3_read_file_bridge(path)
+    let text = v3path.v3ReadTextFile(v3ChainNodeCliCurrentDir(), pathRaw)
     if len(text) <= 0:
         return Err[node.V3ChainNode]("v3 chain_node: missing or empty state file: " + path)
     var nodeId: str
@@ -338,8 +296,8 @@ fn v3ChainNodeCmdMintRun(statePath: str): int32 =
         echo(Error(loadRes))
         return 2
     var state = Value(loadRes)
-    let assetId = driver_c_read_int32_flag_or_default_bridge("--asset", -1)
-    let accountId = driver_c_read_int32_flag_or_default_bridge("--account", -1)
+    let assetId = v3ChainNodeCliReadInt32FlagOrDefault("--asset", -1)
+    let accountId = v3ChainNodeCliReadInt32FlagOrDefault("--account", -1)
     var amount: int64 = int64(0)
     let amountRes = v3ChainNodeCliReadRequiredInt64Flag("--amount", amount)
     if assetId <= 0 || accountId <= 0 || IsErr(amountRes):
@@ -374,9 +332,9 @@ fn v3ChainNodeCmdTransferRun(statePath: str): int32 =
         echo(Error(loadRes))
         return 2
     var state = Value(loadRes)
-    let assetId = driver_c_read_int32_flag_or_default_bridge("--asset", -1)
-    let fromAccount = driver_c_read_int32_flag_or_default_bridge("--from", -1)
-    let toAccount = driver_c_read_int32_flag_or_default_bridge("--to", -1)
+    let assetId = v3ChainNodeCliReadInt32FlagOrDefault("--asset", -1)
+    let fromAccount = v3ChainNodeCliReadInt32FlagOrDefault("--from", -1)
+    let toAccount = v3ChainNodeCliReadInt32FlagOrDefault("--to", -1)
     var amount: int64 = int64(0)
     let amountRes = v3ChainNodeCliReadRequiredInt64Flag("--amount", amount)
     if assetId <= 0 || fromAccount <= 0 || toAccount <= 0 || IsErr(amountRes):
@@ -410,8 +368,8 @@ fn v3ChainNodeCmdBalanceRun(statePath: str): int32 =
     if IsErr(loadRes):
         echo(Error(loadRes))
         return 2
-    let assetId = driver_c_read_int32_flag_or_default_bridge("--asset", -1)
-    let accountId = driver_c_read_int32_flag_or_default_bridge("--account", -1)
+    let assetId = v3ChainNodeCliReadInt32FlagOrDefault("--asset", -1)
+    let accountId = v3ChainNodeCliReadInt32FlagOrDefault("--account", -1)
     if assetId <= 0 || accountId <= 0:
         echo("v3 chain_node: balance requires --asset --account")
         return 2
@@ -447,7 +405,7 @@ fn v3ChainNodeCmdDumpSnapshotRun(statePath: str): int32 =
     if stateMissing:
         echo("v3 chain_node: missing --state")
         return 2
-    let text = cheng_v3_read_file_bridge(v3ChainNodeCliAbsolutePath(statePath))
+    let text = v3path.v3ReadTextFile(v3ChainNodeCliCurrentDir(), statePath)
     if len(text) <= 0:
         echo("v3 chain_node: missing or empty state file: " +
              v3ChainNodeCliAbsolutePath(statePath))
@@ -468,7 +426,7 @@ fn v3ChainNodeCmdServeOnceRun(statePath: str): int32 =
         echo(Error(loadRes))
         return 2
     var state = Value(loadRes)
-    let port = driver_c_read_int32_flag_or_default_bridge("--port", 0)
+    let port = v3ChainNodeCliReadInt32FlagOrDefault("--port", 0)
     let hostText = v3ChainNodeCliReadFlag("--host", "127.0.0.1")
     let readyPath = v3ChainNodeCliReadFlag("--ready-path", "")
     let snapshot = node.v3ChainNodeServeOnce(state)
@@ -502,7 +460,7 @@ fn v3ChainNodeCmdSyncOnceRun(statePath: str): int32 =
         return 2
     var state = Value(loadRes)
     let hostText = v3ChainNodeCliReadFlag("--host", "127.0.0.1")
-    let port = driver_c_read_int32_flag_or_default_bridge("--port", -1)
+    let port = v3ChainNodeCliReadInt32FlagOrDefault("--port", -1)
     if port <= 0:
         echo("v3 chain_node: sync-once requires --port")
         return 2

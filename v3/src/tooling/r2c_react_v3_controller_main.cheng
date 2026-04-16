@@ -1,0 +1,1592 @@
+import std/cmdline as cmdline
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/r2c_process as r2cproc
+
+fn r2cControllerPrintLine(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn r2cControllerPrintErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn r2cControllerRoot(): str =
+    return v3path.v3PathCurrentDir()
+
+fn r2cControllerEffectiveRoot(root: str): str =
+    if strings.len(root) > 0:
+        return root
+    return r2cControllerRoot()
+
+fn r2cControllerCollectArgsFrom(startIndex: int32,
+                                count: int32): str[] =
+    var out: str[] = []
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        let raw: str = cmdline.paramStr(i)
+        add(out, v3path.v3TextSlice(raw, 0, strings.len(raw)))
+    return out
+
+fn r2cControllerReadFlag(args: str[],
+                         key: str,
+                         defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.startsWith(arg, key + ":"):
+            return strings.dropPrefix(arg, key + ":")
+        if strutil.startsWith(arg, key + "="):
+            return strings.dropPrefix(arg, key + "=")
+        if arg == key:
+            if i + 1 < args.len:
+                return args[i + 1]
+    return defaultValue
+
+fn r2cControllerOwnText(text: str): str =
+    return v3path.v3TextSlice(text, 0, strings.len(text))
+
+fn r2cControllerHasFlag(args: str[],
+                        key: str): bool =
+    for i in 0..<args.len:
+        if args[i] == key:
+            return true
+    return false
+
+fn r2cControllerCollectFlagValues(args: str[],
+                                  key: str): str[] =
+    var out: str[] = []
+    var skipNext = false
+    for i in 0..<args.len:
+        if skipNext:
+            skipNext = false
+            continue
+        let arg: str = args[i]
+        if strutil.startsWith(arg, key + ":"):
+            add(out, strings.dropPrefix(arg, key + ":"))
+            continue
+        if strutil.startsWith(arg, key + "="):
+            add(out, strings.dropPrefix(arg, key + "="))
+            continue
+        if arg == key:
+            if i + 1 < args.len:
+                add(out, args[i + 1])
+                skipNext = true
+    return out
+
+fn r2cControllerExperimentalRoot(root: str): str =
+    return v3path.v3PathAbsolute(root, "v3/experimental/r2c-react-v3")
+
+fn r2cControllerDefaultOutDir(repo: str): str =
+    return v3path.v3PathAbsolute(repo, "build/r2c_react_v3_cheng")
+
+fn r2cControllerRunNodeHelper(root: str,
+                              scriptPath: str,
+                              helperArgs: str[],
+                              logPath: str,
+                              exitCodeOut: var int32,
+                              outputOut: var str): bool =
+    var argv: str[] = []
+    add(argv, scriptPath)
+    for i in 0..<helperArgs.len:
+        add(argv, helperArgs[i])
+    return r2cproc.r2cProcessRunProgramLogged(root,
+                                              "r2c-react-v3 node helper",
+                                              "node",
+                                              argv,
+                                              root,
+                                              logPath,
+                                              exitCodeOut,
+                                              outputOut)
+
+fn r2cControllerFilterNativeGuiRuntimeArgs(args: str[]): str[] =
+    var out: str[] = []
+    var skipNext = false
+    for i in 0..<args.len:
+        if skipNext:
+            skipNext = false
+            continue
+        let arg: str = args[i]
+        if arg == "--runtime-contract" || arg == "--runtime-contract-path" || arg == "--compiled-runtime-exe":
+            if i + 1 < args.len:
+                skipNext = true
+            continue
+        let isInlineContractEq: bool = strutil.startsWith(arg, "--runtime-contract=")
+        let isInlineContractColon: bool = strutil.startsWith(arg, "--runtime-contract:")
+        let isInlineContractPathEq: bool = strutil.startsWith(arg, "--runtime-contract-path=")
+        let isInlineContractPathColon: bool = strutil.startsWith(arg, "--runtime-contract-path:")
+        let isInlineRuntimeExeEq: bool = strutil.startsWith(arg, "--compiled-runtime-exe=")
+        let isInlineRuntimeExeColon: bool = strutil.startsWith(arg, "--compiled-runtime-exe:")
+        if isInlineContractEq || isInlineContractColon || isInlineContractPathEq:
+            continue
+        if isInlineContractPathColon || isInlineRuntimeExeEq || isInlineRuntimeExeColon:
+            continue
+        add(out, arg)
+    return out
+
+fn r2cControllerReadSummaryValue(summaryPath: str,
+                                 key: str,
+                                 defaultValue: str): str =
+    if !v3path.v3PathFileExists(summaryPath):
+        return defaultValue
+    let text: str = v3path.v3ReadTextFile("", summaryPath)
+    let total: int32 = strings.len(text)
+    let prefix: str = key + "="
+    let prefixLen: int32 = strings.len(prefix)
+    var start: int32 = 0
+    for i in 0..total:
+        var endHit = false
+        if i == total:
+            endHit = true
+        elif text[i] == '\n':
+            endHit = true
+        if !endHit:
+            continue
+        let lineLen: int32 = i - start
+        if lineLen >= prefixLen:
+            let line: str = v3path.v3TextSlice(text, start, lineLen)
+            let head: str = v3path.v3TextSlice(line, 0, prefixLen)
+            if head == prefix:
+                return v3path.v3TextSlice(line, prefixLen, strings.len(line) - prefixLen)
+        start = i + 1
+    return defaultValue
+
+fn r2cControllerParseInt32(text: str): int32 =
+    return strutil.parseInt(text)
+
+fn r2cControllerJsonQuote(text: str): str =
+    let quote: str = strings.charToStr(char(34))
+    return quote + text + quote
+
+fn r2cControllerJsonBool(value: bool): str =
+    if value:
+        return "true"
+    return "false"
+
+fn r2cControllerJsonArrayFromCsv(csvText: str): str =
+    let total: int32 = strings.len(csvText)
+    if total <= 0:
+        return "[]"
+    var out = "["
+    var wrote = false
+    var start: int32 = 0
+    for i in 0..total:
+        var endHit = false
+        if i == total:
+            endHit = true
+        elif csvText[i] == ',':
+            endHit = true
+        if !endHit:
+            continue
+        let itemLen: int32 = i - start
+        if itemLen > 0:
+            let item: str = v3path.v3TextSlice(csvText, start, itemLen)
+            if wrote:
+                out = out + ", "
+            out = out + r2cControllerJsonQuote(item)
+            wrote = true
+        start = i + 1
+    out = out + "]"
+    return out
+
+fn r2cControllerWriteCompileReport(reportPath: str,
+                                   root: str,
+                                   repo: str,
+                                   outDir: str,
+                                   helperScript: str,
+                                   helperSummaryPath: str,
+                                   helperLogPath: str,
+                                   primaryArtifactPath: str,
+                                   primaryArtifactFormat: str,
+                                   ok: bool,
+                                   reason: str,
+                                   moduleCount: int32,
+                                   routeCount: int32,
+                                   semanticNodesCount: int32,
+                                   typescriptVersion: str,
+                                   assetCount: int32,
+                                   tailwindTokenCount: int32,
+                                   requiredHostGroupCount: int32,
+                                   requiredHostGroupsCsv: str,
+                                   rsgNodeCount: int32,
+                                   rsgEdgeCount: int32,
+                                   blockerCount: int32,
+                                   blocked: bool,
+                                   truthCompareSummaryPath: str,
+                                   truthCompareMatrixSummaryPath: str): bool =
+    let truthCompareOkText: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_ok", "")
+    let truthCompareReason: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_reason", "")
+    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_ok", "")
+    let truthCompareMatrixReason: str = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_reason", "")
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"compile\",\n"
+    report = report + "  \"ok\": " + r2cControllerJsonBool(ok) + ",\n"
+    report = report + "  \"reason\": " + r2cControllerJsonQuote(reason) + ",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(root) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(r2cControllerExperimentalRoot(root)) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(helperSummaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(helperLogPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(primaryArtifactPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": " + r2cControllerJsonQuote(primaryArtifactFormat) + ",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    report = report + "  \"semantic_nodes_count\": " + intToStr(semanticNodesCount) + ",\n"
+    report = report + "  \"asset_count\": " + intToStr(assetCount) + ",\n"
+    report = report + "  \"tailwind_token_count\": " + intToStr(tailwindTokenCount) + ",\n"
+    report = report + "  \"required_host_group_count\": " + intToStr(requiredHostGroupCount) + ",\n"
+    report = report + "  \"required_host_groups\": " + r2cControllerJsonArrayFromCsv(requiredHostGroupsCsv) + ",\n"
+    report = report + "  \"rsg_node_count\": " + intToStr(rsgNodeCount) + ",\n"
+    report = report + "  \"rsg_edge_count\": " + intToStr(rsgEdgeCount) + ",\n"
+    report = report + "  \"blocker_count\": " + intToStr(blockerCount) + ",\n"
+    report = report + "  \"blocked\": " + r2cControllerJsonBool(blocked) + ",\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    if truthCompareOkText == "true" || truthCompareOkText == "false":
+        report = report + "  \"truth_compare_ok\": " + truthCompareOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_ok\": null,\n"
+    report = report + "  \"truth_compare_reason\": " + r2cControllerJsonQuote(truthCompareReason) + ",\n"
+    if truthCompareMatrixOkText == "true" || truthCompareMatrixOkText == "false":
+        report = report + "  \"truth_compare_matrix_ok\": " + truthCompareMatrixOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_matrix_ok\": null,\n"
+    report = report + "  \"truth_compare_matrix_reason\": " + r2cControllerJsonQuote(truthCompareMatrixReason) + "\n"
+    report = report + "}\n"
+    return v3path.v3WriteTextFile("", reportPath, report)
+
+fn r2cControllerWriteStatusReport(reportPath: str,
+                                  root: str): bool =
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    var report = "{\n"
+    report = report + "  \"format\": \"status_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"tsx_frontend_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")) + ",\n"
+    report = report + "  \"static_surface_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-static-surface.mjs")) + ",\n"
+    report = report + "  \"semantic_surface_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-semantic-surface.mjs")) + ",\n"
+    report = report + "  \"codegen_surface_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")) + ",\n"
+    report = report + "  \"exec_surface_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-exec-surface.mjs")) + ",\n"
+    report = report + "  \"native_gui_bundle_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")) + ",\n"
+    report = report + "  \"native_gui_runtime_helper\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"native_gui_runtime_mode\": \"cheng_controller_compiled_json_v1\",\n"
+    report = report + "  \"native_gui_run_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-run.mjs")) + ",\n"
+    report = report + "  \"native_gui_replay_hit_inspector_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-replay-hit-inspector.mjs")) + ",\n"
+    report = report + "  \"exec_route_matrix_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")) + ",\n"
+    report = report + "  \"truth_route_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")) + ",\n"
+    report = report + "  \"truth_compare_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare.mjs")) + ",\n"
+    report = report + "  \"truth_compare_matrix_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare-matrix.mjs")) + ",\n"
+    report = report + "  \"node_helper_surface_mode\": \"cheng_controller_min_surface_v1\",\n"
+    report = report + "  \"legacy_wrapper_required\": false,\n"
+    report = report + "  \"legacy_prototype_required\": false,\n"
+    report = report + "  \"active_node_helper_count\": 11,\n"
+    report = report + "  \"retired_node_helper_count\": 1,\n"
+    report = report + "  \"retired_node_helpers\": [\"native_gui_runtime_helper\"],\n"
+    report = report + "  \"standalone_node_helper_count\": 1,\n"
+    report = report + "  \"standalone_node_helpers\": [\"exec_surface_helper\"],\n"
+    report = report + "  \"active_node_helpers\": [\"tsx_frontend_helper\", \"static_surface_helper\", \"semantic_surface_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"native_gui_replay_hit_inspector_helper\", \"exec_route_matrix_helper\", \"truth_route_helper\", \"truth_compare_helper\", \"truth_compare_matrix_helper\"]\n"
+    report = report + "}\n"
+    return v3path.v3WriteTextFile("", reportPath, report)
+
+fn r2cControllerCompile(root: str,
+                        args: str[]): int32 =
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    let truthState: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-state", ""))
+    let truthRoutesFileRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-routes-file", ""))
+    let truthRoutesDiscover: bool = cmdline.hasFlag("--truth-routes-discover")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let runtimeRoots: str[] = []
+    let assetRoots: str[] = []
+    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let staticHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-static-surface.mjs")
+    let semanticHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-semantic-surface.mjs")
+    let codegenHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")
+    let nativeGuiBundleHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")
+    let truthRoutesHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")
+    let execRouteMatrixHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")
+    let truthCompareHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare.mjs")
+    let truthCompareMatrixHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare-matrix.mjs")
+    let tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let staticSummaryPath: str = os.joinPath(outDir, "static_surface.summary.env")
+    let semanticSummaryPath: str = os.joinPath(outDir, "semantic_surface.summary.env")
+    let codegenSummaryPath: str = os.joinPath(outDir, "codegen_surface.summary.env")
+    let execSummaryPath: str = os.joinPath(outDir, "exec_surface.summary.env")
+    let nativeGuiBundleSummaryPath: str = os.joinPath(outDir, "native_gui_bundle.summary.env")
+    let truthRoutesSummaryPath: str = os.joinPath(outDir, "truth_routes_v1.summary.env")
+    let execRouteMatrixSummaryPath: str = os.joinPath(outDir, "exec_route_matrix.summary.env")
+    let truthCompareSummaryPath: str = os.joinPath(outDir, "truth_compare.summary.env")
+    let truthCompareMatrixSummaryPath: str = os.joinPath(outDir, "truth_compare_matrix.summary.env")
+    let reportPath: str = os.joinPath(outDir, "compile_report_v1.json")
+    var moduleInventoryPath: str = os.joinPath(outDir, "module_inventory_v1.json")
+    var rsgPath: str = os.joinPath(outDir, "rsg_v1.json")
+    var codegenManifestPath: str = os.joinPath(outDir, "cheng_codegen_v1.json")
+    var routeCatalogPath: str = os.joinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+    var execSnapshotPath: str = os.joinPath(outDir, "cheng_codegen_exec_snapshot_v1.json")
+    var nativeGuiBundlePath: str = os.joinPath(outDir, "native_gui_bundle_v1.json")
+    var execRouteMatrixPath: str = os.joinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
+    var truthComparePath: str = os.joinPath(outDir, "truth_compare_v1.json")
+    var truthCompareMatrixPath: str = os.joinPath(outDir, "truth_compare_matrix_v1.json")
+    var truthRoutesPath: str = os.joinPath(outDir, "truth_routes_v1.json")
+    var truthTracePath = ""
+    var moduleCount: int32 = 0
+    var routeCount: int32 = 0
+    var execSemanticNodesCount: int32 = 0
+    var assetCount: int32 = 0
+    var tailwindTokenCount: int32 = 0
+    var requiredHostGroupCount: int32 = 0
+    var requiredHostGroupsCsv = ""
+    var rsgNodeCount: int32 = 0
+    var rsgEdgeCount: int32 = 0
+    var blockerCount: int32 = 0
+    var blocked = false
+    var typescriptVersion = ""
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+
+    var frontendArgs: str[] = []
+    add(frontendArgs, "--repo")
+    add(frontendArgs, repo)
+    add(frontendArgs, "--out")
+    add(frontendArgs, tsxAstPath)
+    add(frontendArgs, "--summary-out")
+    add(frontendArgs, tsxSummaryPath)
+    for i in 0..<runtimeRoots.len:
+        add(frontendArgs, "--runtime-root")
+        add(frontendArgs, runtimeRoots[i])
+    let frontendLogPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
+
+    var staticArgs: str[] = []
+    add(staticArgs, "--repo")
+    add(staticArgs, repo)
+    add(staticArgs, "--out-dir")
+    add(staticArgs, outDir)
+    add(staticArgs, "--tsx-ast")
+    add(staticArgs, tsxAstPath)
+    add(staticArgs, "--summary-out")
+    add(staticArgs, staticSummaryPath)
+    for i in 0..<assetRoots.len:
+        add(staticArgs, "--asset-root")
+        add(staticArgs, assetRoots[i])
+    let staticLogPath: str = os.joinPath(outDir, "static_surface.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, staticHelper, staticArgs, staticLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: static surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    assetCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "asset_count", "0"))
+    tailwindTokenCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "tailwind_token_count", "0"))
+    requiredHostGroupCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "required_host_group_count", "0"))
+    requiredHostGroupsCsv = r2cControllerReadSummaryValue(staticSummaryPath, "required_host_groups", "")
+    moduleInventoryPath = os.joinPath(outDir, "module_inventory_v1.json")
+
+    var semanticArgs: str[] = []
+    add(semanticArgs, "--repo")
+    add(semanticArgs, repo)
+    add(semanticArgs, "--out-dir")
+    add(semanticArgs, outDir)
+    add(semanticArgs, "--tsx-ast")
+    add(semanticArgs, tsxAstPath)
+    add(semanticArgs, "--summary-out")
+    add(semanticArgs, semanticSummaryPath)
+    let semanticLogPath: str = os.joinPath(outDir, "semantic_surface.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, semanticHelper, semanticArgs, semanticLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: semantic surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    rsgNodeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(semanticSummaryPath, "rsg_node_count", "0"))
+    rsgEdgeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(semanticSummaryPath, "rsg_edge_count", "0"))
+    blockerCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(semanticSummaryPath, "blocker_count", "0"))
+    blocked = r2cControllerReadSummaryValue(semanticSummaryPath, "blocked", "false") == "true"
+    rsgPath = os.joinPath(outDir, "rsg_v1.json")
+
+    var codegenArgs: str[] = []
+    add(codegenArgs, "--repo")
+    add(codegenArgs, repo)
+    add(codegenArgs, "--out-dir")
+    add(codegenArgs, outDir)
+    add(codegenArgs, "--tsx-ast")
+    add(codegenArgs, tsxAstPath)
+    add(codegenArgs, "--summary-out")
+    add(codegenArgs, codegenSummaryPath)
+    if strings.len(truthTraceRaw) > 0:
+        truthTracePath = v3path.v3PathAbsolute(repo, truthTraceRaw)
+        if !v3path.v3PathFileExists(truthTracePath):
+            r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+            return 1
+        add(codegenArgs, "--truth-trace")
+        add(codegenArgs, truthTracePath)
+    let codegenLogPath: str = os.joinPath(outDir, "codegen_surface.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: codegen surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    codegenManifestPath = os.joinPath(outDir, "cheng_codegen_v1.json")
+    routeCatalogPath = os.joinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+
+    var nativeGuiBundleArgs: str[] = []
+    add(nativeGuiBundleArgs, "--repo")
+    add(nativeGuiBundleArgs, repo)
+    add(nativeGuiBundleArgs, "--out-dir")
+    add(nativeGuiBundleArgs, outDir)
+    add(nativeGuiBundleArgs, "--codegen-manifest")
+    add(nativeGuiBundleArgs, codegenManifestPath)
+    add(nativeGuiBundleArgs, "--exec-snapshot")
+    add(nativeGuiBundleArgs, execSnapshotPath)
+    add(nativeGuiBundleArgs, "--host-contract")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "unimaker_host_v1.json"))
+    add(nativeGuiBundleArgs, "--asset-manifest")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "asset_manifest_v1.json"))
+    add(nativeGuiBundleArgs, "--tailwind-manifest")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "tailwind_style_manifest_v1.json"))
+    add(nativeGuiBundleArgs, "--route-catalog")
+    add(nativeGuiBundleArgs, routeCatalogPath)
+    add(nativeGuiBundleArgs, "--out")
+    add(nativeGuiBundleArgs, nativeGuiBundlePath)
+    add(nativeGuiBundleArgs, "--summary-out")
+    add(nativeGuiBundleArgs, nativeGuiBundleSummaryPath)
+    let nativeGuiBundleLogPath: str = os.joinPath(outDir, "native_gui_bundle.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, nativeGuiBundleHelper, nativeGuiBundleArgs, nativeGuiBundleLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    nativeGuiBundlePath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_bundle_path", nativeGuiBundlePath)
+    execSemanticNodesCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "initial_semantic_nodes_count", "0"))
+    execSnapshotPath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_exec_snapshot_path", execSnapshotPath)
+    routeCatalogPath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_route_catalog_path", routeCatalogPath)
+
+    if strings.len(truthTraceRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: missing --truth-trace")
+        return 2
+
+    var truthCompareArgs: str[] = []
+    add(truthCompareArgs, "--exec-snapshot")
+    add(truthCompareArgs, execSnapshotPath)
+    add(truthCompareArgs, "--truth-trace")
+    add(truthCompareArgs, truthTracePath)
+    add(truthCompareArgs, "--codegen-manifest")
+    add(truthCompareArgs, codegenManifestPath)
+    add(truthCompareArgs, "--out")
+    add(truthCompareArgs, truthComparePath)
+    add(truthCompareArgs, "--summary-out")
+    add(truthCompareArgs, truthCompareSummaryPath)
+    if strings.len(truthState) > 0:
+        add(truthCompareArgs, "--truth-state")
+        add(truthCompareArgs, truthState)
+    let truthCompareLogPath: str = os.joinPath(outDir, "truth_compare.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, truthCompareHelper, truthCompareArgs, truthCompareLogPath, helperExitCode, helperOutput):
+        let reason: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_reason", "helper_failed")
+        truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
+        r2cControllerPrintErr("r2c-react-v3: truth compare failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        return 2
+
+    truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
+    routeCount = 1
+    var finalHelperScript: str = truthCompareHelper
+    var finalHelperSummaryPath: str = truthCompareSummaryPath
+    var finalHelperLogPath: str = truthCompareLogPath
+    var finalArtifactPath: str = truthComparePath
+    var finalArtifactFormat = "truth_compare_v1"
+    var finalTruthCompareMatrixSummaryPath = ""
+
+    if truthRoutesDiscover:
+        var truthRoutesArgs: str[] = []
+        add(truthRoutesArgs, "--repo")
+        add(truthRoutesArgs, repo)
+        add(truthRoutesArgs, "--out")
+        add(truthRoutesArgs, truthRoutesPath)
+        add(truthRoutesArgs, "--summary-out")
+        add(truthRoutesArgs, truthRoutesSummaryPath)
+        for i in 0..<runtimeRoots.len:
+            add(truthRoutesArgs, "--runtime-root")
+            add(truthRoutesArgs, runtimeRoots[i])
+        let truthRoutesLogPath: str = os.joinPath(outDir, "truth_routes.log")
+        if !r2cControllerRunNodeHelper(effectiveRoot, truthRoutesHelper, truthRoutesArgs, truthRoutesLogPath, helperExitCode, helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: truth route helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+        truthRoutesPath = os.joinPath(outDir, "truth_routes_v1.json")
+    elif strings.len(truthRoutesFileRaw) > 0:
+        truthRoutesPath = v3path.v3PathAbsolute(repo, truthRoutesFileRaw)
+        if !v3path.v3PathFileExists(truthRoutesPath):
+            r2cControllerPrintErr("r2c-react-v3: missing truth routes: " + truthRoutesPath)
+            return 1
+
+    if truthRoutesDiscover || strings.len(truthRoutesFileRaw) > 0:
+        var execRouteMatrixArgs: str[] = []
+        add(execRouteMatrixArgs, "--route-catalog")
+        add(execRouteMatrixArgs, routeCatalogPath)
+        add(execRouteMatrixArgs, "--exec-snapshot")
+        add(execRouteMatrixArgs, execSnapshotPath)
+        add(execRouteMatrixArgs, "--truth-routes-file")
+        add(execRouteMatrixArgs, truthRoutesPath)
+        add(execRouteMatrixArgs, "--codegen-manifest")
+        add(execRouteMatrixArgs, codegenManifestPath)
+        add(execRouteMatrixArgs, "--truth-trace")
+        add(execRouteMatrixArgs, truthTracePath)
+        add(execRouteMatrixArgs, "--out")
+        add(execRouteMatrixArgs, execRouteMatrixPath)
+        add(execRouteMatrixArgs, "--summary-out")
+        add(execRouteMatrixArgs, execRouteMatrixSummaryPath)
+        let execRouteMatrixLogPath: str = os.joinPath(outDir, "exec_route_matrix.log")
+        if !r2cControllerRunNodeHelper(effectiveRoot, execRouteMatrixHelper, execRouteMatrixArgs, execRouteMatrixLogPath, helperExitCode, helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: exec route matrix helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+
+        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", "0"))
+        execRouteMatrixPath = os.joinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
+
+        var truthCompareMatrixArgs: str[] = []
+        add(truthCompareMatrixArgs, "--exec-route-matrix")
+        add(truthCompareMatrixArgs, execRouteMatrixPath)
+        add(truthCompareMatrixArgs, "--truth-trace")
+        add(truthCompareMatrixArgs, truthTracePath)
+        add(truthCompareMatrixArgs, "--codegen-manifest")
+        add(truthCompareMatrixArgs, codegenManifestPath)
+        add(truthCompareMatrixArgs, "--out")
+        add(truthCompareMatrixArgs, truthCompareMatrixPath)
+        add(truthCompareMatrixArgs, "--summary-out")
+        add(truthCompareMatrixArgs, truthCompareMatrixSummaryPath)
+        let truthCompareMatrixLogPath: str = os.joinPath(outDir, "truth_compare_matrix.log")
+        if !r2cControllerRunNodeHelper(effectiveRoot, truthCompareMatrixHelper, truthCompareMatrixArgs, truthCompareMatrixLogPath, helperExitCode, helperOutput):
+            let reason: str = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_reason", "helper_failed")
+            routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "route_count", intToStr(routeCount)))
+            truthCompareMatrixPath = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_path", truthCompareMatrixPath)
+            r2cControllerPrintErr("r2c-react-v3: truth compare matrix failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            return 2
+
+        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "route_count", intToStr(routeCount)))
+        truthCompareMatrixPath = os.joinPath(outDir, "truth_compare_matrix_v1.json")
+        finalHelperScript = truthCompareMatrixHelper
+        finalHelperSummaryPath = truthCompareMatrixSummaryPath
+        finalHelperLogPath = truthCompareMatrixLogPath
+        finalArtifactPath = truthCompareMatrixPath
+        finalArtifactFormat = "truth_compare_matrix_v1"
+        finalTruthCompareMatrixSummaryPath = truthCompareMatrixSummaryPath
+
+    let truthCompareOkText: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_ok", "")
+    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath, "truth_compare_matrix_ok", "")
+    let nativeGuiLauncherModule: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_launcher_module", "")
+    let nativeGuiHostReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_ready", "")
+    let nativeGuiRendererReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_renderer_ready", "")
+    let nativeGuiSessionPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_path", "")
+    let nativeGuiSessionPreviewReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_preview_ready", "")
+    let nativeGuiSessionPreviewMode: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_preview_mode", "")
+    let nativeGuiLayoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_path", "")
+    let nativeGuiLayoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_ready", "")
+    let nativeGuiLayoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_node_count", "0")
+    let nativeGuiLayoutSurfaceSourceModule: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_module", "")
+    let nativeGuiLayoutSurfaceSourceComponent: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_component", "")
+    let nativeGuiLayoutSurfaceStrategy: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_strategy", "")
+    let nativeGuiLayoutSurfaceComponentExpansionCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_component_expansion_count", "0")
+    let nativeGuiLayoutSurfaceParsedModuleCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_parsed_module_count", "0")
+    let nativeGuiLayoutSurfaceStyledNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_styled_node_count", "0")
+    let nativeGuiLayoutSurfaceInteractiveNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_interactive_node_count", "0")
+    let nativeGuiStyleLayoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_path", "")
+    let nativeGuiStyleLayoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_ready", "")
+    let nativeGuiStyleLayoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_node_count", "0")
+    let nativeGuiStyleLayoutOverlayNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_overlay_node_count", "0")
+    let nativeGuiStyleLayoutSurfaceSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_surface_node_count", "0")
+    let nativeGuiStyleLayoutSurfaceControlNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_control_node_count", "0")
+    let nativeGuiNativeLayoutPlanPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_path", "")
+    let nativeGuiNativeLayoutPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_ready", "")
+    let nativeGuiNativeLayoutPlanPolicySource: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_policy_source", "")
+    let nativeGuiNativeLayoutPlanItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_item_count", "0")
+    let nativeGuiNativeLayoutPlanViewportItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_viewport_item_count", "0")
+    let nativeGuiNativeLayoutPlanClippedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_clipped_item_count", "0")
+    let nativeGuiNativeLayoutPlanInteractiveItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_interactive_item_count", "0")
+    let nativeGuiNativeLayoutPlanSourceBackedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", "0")
+    let nativeGuiNativeLayoutPlanScrollHeightText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_scroll_height", "0")
+    var finalRouteCountText: str = intToStr(routeCount)
+    if strings.len(finalTruthCompareMatrixSummaryPath) > 0:
+        finalRouteCountText = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath, "route_count", finalRouteCountText)
+    elif truthRoutesDiscover || strings.len(truthRoutesFileRaw) > 0:
+        finalRouteCountText = r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", finalRouteCountText)
+    if strings.len(finalRouteCountText) <= 0:
+        finalRouteCountText = "0"
+    var finalReport = "{\n"
+    finalReport = finalReport + "  \"format\": \"controller_report_v1\",\n"
+    finalReport = finalReport + "  \"controller\": \"cheng.live_controller\",\n"
+    finalReport = finalReport + "  \"command\": \"compile\",\n"
+    finalReport = finalReport + "  \"ok\": true,\n"
+    finalReport = finalReport + "  \"reason\": \"ok\",\n"
+    finalReport = finalReport + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    finalReport = finalReport + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    finalReport = finalReport + "  \"native_gui_bundle_path\": " + r2cControllerJsonQuote(nativeGuiBundlePath) + ",\n"
+    finalReport = finalReport + "  \"native_gui_launcher_module\": " + r2cControllerJsonQuote(nativeGuiLauncherModule) + ",\n"
+    finalReport = finalReport + "  \"native_gui_session_path\": " + r2cControllerJsonQuote(nativeGuiSessionPath) + ",\n"
+    finalReport = finalReport + "  \"native_gui_session_preview_mode\": " + r2cControllerJsonQuote(nativeGuiSessionPreviewMode) + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_path\": " + r2cControllerJsonQuote(nativeGuiLayoutSurfacePath) + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_node_count\": " + nativeGuiLayoutSurfaceNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_source_module\": " + r2cControllerJsonQuote(nativeGuiLayoutSurfaceSourceModule) + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_source_component\": " + r2cControllerJsonQuote(nativeGuiLayoutSurfaceSourceComponent) + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_strategy\": " + r2cControllerJsonQuote(nativeGuiLayoutSurfaceStrategy) + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_component_expansion_count\": " + nativeGuiLayoutSurfaceComponentExpansionCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_parsed_module_count\": " + nativeGuiLayoutSurfaceParsedModuleCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_styled_node_count\": " + nativeGuiLayoutSurfaceStyledNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_layout_surface_interactive_node_count\": " + nativeGuiLayoutSurfaceInteractiveNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_style_layout_surface_path\": " + r2cControllerJsonQuote(nativeGuiStyleLayoutSurfacePath) + ",\n"
+    finalReport = finalReport + "  \"native_gui_style_layout_surface_node_count\": " + nativeGuiStyleLayoutSurfaceNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_style_layout_overlay_node_count\": " + nativeGuiStyleLayoutOverlayNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_style_layout_surface_surface_node_count\": " + nativeGuiStyleLayoutSurfaceSurfaceNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_style_layout_surface_control_node_count\": " + nativeGuiStyleLayoutSurfaceControlNodeCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_path\": " + r2cControllerJsonQuote(nativeGuiNativeLayoutPlanPath) + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_policy_source\": " + r2cControllerJsonQuote(nativeGuiNativeLayoutPlanPolicySource) + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_item_count\": " + nativeGuiNativeLayoutPlanItemCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_viewport_item_count\": " + nativeGuiNativeLayoutPlanViewportItemCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_clipped_item_count\": " + nativeGuiNativeLayoutPlanClippedItemCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_interactive_item_count\": " + nativeGuiNativeLayoutPlanInteractiveItemCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_source_backed_item_count\": " + nativeGuiNativeLayoutPlanSourceBackedItemCountText + ",\n"
+    finalReport = finalReport + "  \"native_gui_native_layout_plan_scroll_height\": " + nativeGuiNativeLayoutPlanScrollHeightText + ",\n"
+    finalReport = finalReport + "  \"route_count\": " + finalRouteCountText + ",\n"
+    if nativeGuiHostReadyText == "true" || nativeGuiHostReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_host_ready\": " + nativeGuiHostReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_host_ready\": null,\n"
+    if nativeGuiRendererReadyText == "true" || nativeGuiRendererReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_renderer_ready\": " + nativeGuiRendererReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_renderer_ready\": null,\n"
+    if nativeGuiSessionPreviewReadyText == "true" || nativeGuiSessionPreviewReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_session_preview_ready\": " + nativeGuiSessionPreviewReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_session_preview_ready\": null,\n"
+    if nativeGuiLayoutSurfaceReadyText == "true" || nativeGuiLayoutSurfaceReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_layout_surface_ready\": " + nativeGuiLayoutSurfaceReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_layout_surface_ready\": null,\n"
+    if nativeGuiStyleLayoutSurfaceReadyText == "true" || nativeGuiStyleLayoutSurfaceReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_style_layout_surface_ready\": " + nativeGuiStyleLayoutSurfaceReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_style_layout_surface_ready\": null,\n"
+    if nativeGuiNativeLayoutPlanReadyText == "true" || nativeGuiNativeLayoutPlanReadyText == "false":
+        finalReport = finalReport + "  \"native_gui_native_layout_plan_ready\": " + nativeGuiNativeLayoutPlanReadyText + ",\n"
+    else:
+        finalReport = finalReport + "  \"native_gui_native_layout_plan_ready\": null,\n"
+    if truthCompareOkText == "true" || truthCompareOkText == "false":
+        finalReport = finalReport + "  \"truth_compare_ok\": " + truthCompareOkText + ",\n"
+    else:
+        finalReport = finalReport + "  \"truth_compare_ok\": null,\n"
+    if truthCompareMatrixOkText == "true" || truthCompareMatrixOkText == "false":
+        finalReport = finalReport + "  \"truth_compare_matrix_ok\": " + truthCompareMatrixOkText + "\n"
+    else:
+        finalReport = finalReport + "  \"truth_compare_matrix_ok\": null\n"
+    finalReport = finalReport + "}\n"
+    v3path.v3WriteTextFile("", reportPath, finalReport)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerStatus(root: str,
+                       args: str[]): int32 =
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let outPathRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out", ""))
+    if strings.len(outPathRaw) > 0:
+        let outPath: str = v3path.v3PathAbsolute(effectiveRoot, outPathRaw)
+        if !r2cControllerWriteStatusReport(outPath, effectiveRoot):
+            r2cControllerPrintErr("r2c-react-v3: failed to write status report")
+            return 1
+        r2cControllerPrintLine(outPath)
+        return 0
+    let outPath: str = os.joinPath(effectiveRoot, "artifacts/r2c_react_v3_status_report_v1.json")
+    if !r2cControllerWriteStatusReport(outPath, effectiveRoot):
+        r2cControllerPrintErr("r2c-react-v3: failed to write status report")
+        return 1
+    let body: str = v3path.v3ReadTextFile("", outPath)
+    r2cControllerPrintLine(body)
+    return 0
+
+fn r2cControllerNativeGuiBundle(root: str,
+                                args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let routeStateFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--route-state", ""))
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let staticHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-static-surface.mjs")
+    let codegenHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")
+    let nativeGuiBundleHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")
+    let tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let staticSummaryPath: str = os.joinPath(outDir, "static_surface.summary.env")
+    let codegenSummaryPath: str = os.joinPath(outDir, "codegen_surface.summary.env")
+    let execSummaryPath: str = os.joinPath(outDir, "exec_surface.summary.env")
+    let nativeGuiBundleSummaryPath: str = os.joinPath(outDir, "native_gui_bundle.summary.env")
+    let reportPath: str = os.joinPath(outDir, "native_gui_bundle_report_v1.json")
+    var codegenManifestPath: str = os.joinPath(outDir, "cheng_codegen_v1.json")
+    var routeCatalogPath: str = os.joinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+    var execSnapshotPath: str = os.joinPath(outDir, "cheng_codegen_exec_snapshot_v1.json")
+    var nativeGuiBundlePath: str = os.joinPath(outDir, "native_gui_bundle_v1.json")
+    var moduleCount: int32 = 0
+    var routeCount: int32 = 0
+    var semanticNodesCount: int32 = 0
+    var assetCount: int32 = 0
+    var tailwindTokenCount: int32 = 0
+    var requiredHostGroupCount: int32 = 0
+    var requiredHostGroupsCsv = ""
+    var typescriptVersion = ""
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+
+    var frontendArgs: str[] = []
+    add(frontendArgs, "--repo")
+    add(frontendArgs, repo)
+    add(frontendArgs, "--out")
+    add(frontendArgs, tsxAstPath)
+    add(frontendArgs, "--summary-out")
+    add(frontendArgs, tsxSummaryPath)
+    let frontendLogPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
+
+    var staticArgs: str[] = []
+    add(staticArgs, "--repo")
+    add(staticArgs, repo)
+    add(staticArgs, "--out-dir")
+    add(staticArgs, outDir)
+    add(staticArgs, "--tsx-ast")
+    add(staticArgs, tsxAstPath)
+    add(staticArgs, "--summary-out")
+    add(staticArgs, staticSummaryPath)
+    let staticLogPath: str = os.joinPath(outDir, "static_surface.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, staticHelper, staticArgs, staticLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: static surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    assetCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "asset_count", "0"))
+    tailwindTokenCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "tailwind_token_count", "0"))
+    requiredHostGroupCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(staticSummaryPath, "required_host_group_count", "0"))
+    requiredHostGroupsCsv = r2cControllerReadSummaryValue(staticSummaryPath, "required_host_groups", "")
+    typescriptVersion = r2cControllerReadSummaryValue(staticSummaryPath, "typescript_version", typescriptVersion)
+
+    var codegenArgs: str[] = []
+    add(codegenArgs, "--repo")
+    add(codegenArgs, repo)
+    add(codegenArgs, "--out-dir")
+    add(codegenArgs, outDir)
+    add(codegenArgs, "--tsx-ast")
+    add(codegenArgs, tsxAstPath)
+    add(codegenArgs, "--summary-out")
+    add(codegenArgs, codegenSummaryPath)
+    let codegenLogPath: str = os.joinPath(outDir, "codegen_surface.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: codegen surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    codegenManifestPath = r2cControllerReadSummaryValue(codegenSummaryPath, "codegen_manifest_path", codegenManifestPath)
+    routeCatalogPath = r2cControllerReadSummaryValue(codegenSummaryPath, "route_catalog_path", routeCatalogPath)
+    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(codegenSummaryPath, "typescript_version", typescriptVersion)
+
+    var nativeGuiBundleArgs: str[] = []
+    add(nativeGuiBundleArgs, "--repo")
+    add(nativeGuiBundleArgs, repo)
+    add(nativeGuiBundleArgs, "--out-dir")
+    add(nativeGuiBundleArgs, outDir)
+    add(nativeGuiBundleArgs, "--codegen-manifest")
+    add(nativeGuiBundleArgs, codegenManifestPath)
+    add(nativeGuiBundleArgs, "--exec-snapshot")
+    add(nativeGuiBundleArgs, execSnapshotPath)
+    add(nativeGuiBundleArgs, "--host-contract")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "unimaker_host_v1.json"))
+    add(nativeGuiBundleArgs, "--asset-manifest")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "asset_manifest_v1.json"))
+    add(nativeGuiBundleArgs, "--tailwind-manifest")
+    add(nativeGuiBundleArgs, os.joinPath(outDir, "tailwind_style_manifest_v1.json"))
+    add(nativeGuiBundleArgs, "--route-catalog")
+    add(nativeGuiBundleArgs, routeCatalogPath)
+    add(nativeGuiBundleArgs, "--out")
+    add(nativeGuiBundleArgs, nativeGuiBundlePath)
+    add(nativeGuiBundleArgs, "--summary-out")
+    add(nativeGuiBundleArgs, nativeGuiBundleSummaryPath)
+    if strings.len(routeStateFlag) > 0:
+        add(nativeGuiBundleArgs, "--route-state")
+        add(nativeGuiBundleArgs, routeStateFlag)
+    let nativeGuiBundleLogPath: str = os.joinPath(outDir, "native_gui_bundle.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, nativeGuiBundleHelper, nativeGuiBundleArgs, nativeGuiBundleLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: native gui bundle helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    nativeGuiBundlePath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_bundle_path", nativeGuiBundlePath)
+    semanticNodesCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "initial_semantic_nodes_count", "0"))
+    execSnapshotPath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_exec_snapshot_path", execSnapshotPath)
+    routeCatalogPath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_route_catalog_path", routeCatalogPath)
+    let launcherModule: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_launcher_module", "")
+    let hostReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_ready", "")
+    let rendererReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_renderer_ready", "")
+    let sessionPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_path", "")
+    let sessionPreviewReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_preview_ready", "")
+    let sessionPreviewMode: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_preview_mode", "")
+    let routeState: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_route_state", routeStateFlag)
+    let layoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_path", "")
+    let layoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_ready", "")
+    let layoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_node_count", "0")
+    let layoutSurfaceSourceModule: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_module", "")
+    let layoutSurfaceSourceComponent: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_source_component", "")
+    let layoutSurfaceStrategy: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_strategy", "")
+    let layoutSurfaceComponentExpansionCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_component_expansion_count", "0")
+    let layoutSurfaceParsedModuleCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_parsed_module_count", "0")
+    let layoutSurfaceStyledNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_styled_node_count", "0")
+    let layoutSurfaceInteractiveNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_layout_surface_interactive_node_count", "0")
+    let styleLayoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_path", "")
+    let styleLayoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_ready", "")
+    let styleLayoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_node_count", "0")
+    let styleLayoutOverlayNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_overlay_node_count", "0")
+    let styleLayoutSurfaceSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_surface_node_count", "0")
+    let styleLayoutSurfaceControlNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_style_layout_surface_control_node_count", "0")
+    let nativeLayoutPlanPath: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_path", "")
+    let nativeLayoutPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_ready", "")
+    let nativeLayoutPlanPolicySource: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_policy_source", "")
+    let nativeLayoutPlanItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_item_count", "0")
+    let nativeLayoutPlanViewportItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_viewport_item_count", "0")
+    let nativeLayoutPlanClippedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_clipped_item_count", "0")
+    let nativeLayoutPlanInteractiveItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_interactive_item_count", "0")
+    let nativeLayoutPlanSourceBackedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", "0")
+    let nativeLayoutPlanScrollHeightText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_scroll_height", "0")
+    let reportModuleCountText: str = r2cControllerReadSummaryValue(codegenSummaryPath, "module_count", r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
+    let reportRouteCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "route_count", r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
+    let reportSemanticNodesCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "initial_semantic_nodes_count", "0")
+    let reportAssetCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "asset_count", r2cControllerReadSummaryValue(staticSummaryPath, "asset_count", "0"))
+    let reportTailwindCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "tailwind_token_count", r2cControllerReadSummaryValue(staticSummaryPath, "tailwind_token_count", "0"))
+    let reportRequiredGroupCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_group_count", r2cControllerReadSummaryValue(staticSummaryPath, "required_host_group_count", "0"))
+    let reportRequiredGroupsCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_groups", r2cControllerReadSummaryValue(staticSummaryPath, "required_host_groups", ""))
+    let hostAbiFeatureHitsCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_feature_hits", "")
+    let hostAbiFirstBatchReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_ready", "")
+    let hostAbiFirstBatchFeaturesCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_features", "")
+    let hostAbiFirstBatchMissingFeaturesCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_abi_first_batch_missing_features", "")
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"native-gui-bundle\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(nativeGuiBundlePath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"native_gui_bundle_v1\",\n"
+    report = report + "  \"module_count\": " + reportModuleCountText + ",\n"
+    report = report + "  \"route_count\": " + reportRouteCountText + ",\n"
+    report = report + "  \"semantic_nodes_count\": " + reportSemanticNodesCountText + ",\n"
+    report = report + "  \"asset_count\": " + reportAssetCountText + ",\n"
+    report = report + "  \"tailwind_token_count\": " + reportTailwindCountText + ",\n"
+    report = report + "  \"required_host_group_count\": " + reportRequiredGroupCountText + ",\n"
+    report = report + "  \"required_host_groups\": " + r2cControllerJsonArrayFromCsv(reportRequiredGroupsCsv) + ",\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    report = report + "  \"native_gui_launcher_module\": " + r2cControllerJsonQuote(launcherModule) + ",\n"
+    report = report + "  \"native_gui_session_path\": " + r2cControllerJsonQuote(sessionPath) + ",\n"
+    report = report + "  \"native_gui_session_preview_mode\": " + r2cControllerJsonQuote(sessionPreviewMode) + ",\n"
+    report = report + "  \"native_gui_route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    report = report + "  \"native_gui_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
+    report = report + "  \"native_gui_layout_surface_node_count\": " + layoutSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_source_module\": " + r2cControllerJsonQuote(layoutSurfaceSourceModule) + ",\n"
+    report = report + "  \"native_gui_layout_surface_source_component\": " + r2cControllerJsonQuote(layoutSurfaceSourceComponent) + ",\n"
+    report = report + "  \"native_gui_layout_surface_strategy\": " + r2cControllerJsonQuote(layoutSurfaceStrategy) + ",\n"
+    report = report + "  \"native_gui_layout_surface_component_expansion_count\": " + layoutSurfaceComponentExpansionCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_parsed_module_count\": " + layoutSurfaceParsedModuleCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_styled_node_count\": " + layoutSurfaceStyledNodeCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_interactive_node_count\": " + layoutSurfaceInteractiveNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_node_count\": " + styleLayoutSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_overlay_node_count\": " + styleLayoutOverlayNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_surface_node_count\": " + styleLayoutSurfaceSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_control_node_count\": " + styleLayoutSurfaceControlNodeCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_path\": " + r2cControllerJsonQuote(nativeLayoutPlanPath) + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_policy_source\": " + r2cControllerJsonQuote(nativeLayoutPlanPolicySource) + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_clipped_item_count\": " + nativeLayoutPlanClippedItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_interactive_item_count\": " + nativeLayoutPlanInteractiveItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_source_backed_item_count\": " + nativeLayoutPlanSourceBackedItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_scroll_height\": " + nativeLayoutPlanScrollHeightText + ",\n"
+    report = report + "  \"native_gui_host_abi_feature_hits\": " + r2cControllerJsonArrayFromCsv(hostAbiFeatureHitsCsv) + ",\n"
+    report = report + "  \"native_gui_host_abi_first_batch_features\": " + r2cControllerJsonArrayFromCsv(hostAbiFirstBatchFeaturesCsv) + ",\n"
+    report = report + "  \"native_gui_host_abi_first_batch_missing_features\": " + r2cControllerJsonArrayFromCsv(hostAbiFirstBatchMissingFeaturesCsv) + ",\n"
+    if hostAbiFirstBatchReadyText == "true" || hostAbiFirstBatchReadyText == "false":
+        report = report + "  \"native_gui_host_abi_first_batch_ready\": " + hostAbiFirstBatchReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_host_abi_first_batch_ready\": null,\n"
+    if hostReadyText == "true" || hostReadyText == "false":
+        report = report + "  \"native_gui_host_ready\": " + hostReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_host_ready\": null,\n"
+    if rendererReadyText == "true" || rendererReadyText == "false":
+        report = report + "  \"native_gui_renderer_ready\": " + rendererReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_renderer_ready\": null,\n"
+    if sessionPreviewReadyText == "true" || sessionPreviewReadyText == "false":
+        report = report + "  \"native_gui_session_preview_ready\": " + sessionPreviewReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_session_preview_ready\": null,\n"
+    if layoutSurfaceReadyText == "true" || layoutSurfaceReadyText == "false":
+        report = report + "  \"native_gui_layout_surface_ready\": " + layoutSurfaceReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_layout_surface_ready\": null,\n"
+    if styleLayoutSurfaceReadyText == "true" || styleLayoutSurfaceReadyText == "false":
+        report = report + "  \"native_gui_style_layout_surface_ready\": " + styleLayoutSurfaceReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_style_layout_surface_ready\": null,\n"
+    if nativeLayoutPlanReadyText == "true" || nativeLayoutPlanReadyText == "false":
+        report = report + "  \"native_gui_native_layout_plan_ready\": " + nativeLayoutPlanReadyText + "\n"
+    else:
+        report = report + "  \"native_gui_native_layout_plan_ready\": null\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerRunNativeGui(root: str,
+                             args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let sessionFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--session-path", ""))
+    let bundleFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--bundle-path", ""))
+    let screenshotFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--screenshot-out", ""))
+    let autoCloseMs: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--auto-close-ms", "1200"))
+    let clickSpec: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--click", ""))
+    let resizeSpec: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--resize", ""))
+    let scrollY: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--scroll-y", ""))
+    let waitAfterClickMs: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--wait-after-click-ms", ""))
+    let focusItemId: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--focus-item-id", ""))
+    let typeText: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--type-text", ""))
+    let sendKey: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--send-key", ""))
+    let routeStateFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--route-state", ""))
+    let inspectorStateFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--inspector-state-out", ""))
+    let openSourceOnClick: bool = cmdline.hasFlag("--open-source-on-click")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    let nativeGuiRunHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-run.mjs")
+    let nativeGuiBundleSummaryPath: str = os.joinPath(outDir, "native_gui_bundle.summary.env")
+    let nativeGuiRunSummaryPath: str = os.joinPath(outDir, "native_gui_run.summary.env")
+    let reportPath: str = os.joinPath(outDir, "native_gui_run_report_v1.json")
+    let codegenSummaryPath: str = os.joinPath(outDir, "codegen_surface.summary.env")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    var sessionPath: str = os.joinPath(outDir, "native_gui_session_v1.json")
+    var bundlePath: str = os.joinPath(outDir, "native_gui_bundle_v1.json")
+    var screenshotPath: str = os.joinPath(outDir, "native_gui_session.png")
+    var inspectorStatePath: str = os.joinPath(outDir, "native_gui_inspector_state_v1.json")
+    if strings.len(sessionFlag) > 0:
+        sessionPath = v3path.v3PathAbsolute(outDir, sessionFlag)
+    if strings.len(bundleFlag) > 0:
+        bundlePath = v3path.v3PathAbsolute(outDir, bundleFlag)
+    if strings.len(screenshotFlag) > 0:
+        screenshotPath = v3path.v3PathAbsolute(outDir, screenshotFlag)
+    if strings.len(inspectorStateFlag) > 0:
+        inspectorStatePath = v3path.v3PathAbsolute(outDir, inspectorStateFlag)
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+
+    var nativeGuiRunArgs: str[] = []
+    add(nativeGuiRunArgs, "--repo")
+    add(nativeGuiRunArgs, repo)
+    add(nativeGuiRunArgs, "--out-dir")
+    add(nativeGuiRunArgs, outDir)
+    add(nativeGuiRunArgs, "--session-path")
+    add(nativeGuiRunArgs, sessionPath)
+    add(nativeGuiRunArgs, "--bundle-path")
+    add(nativeGuiRunArgs, bundlePath)
+    add(nativeGuiRunArgs, "--auto-close-ms")
+    add(nativeGuiRunArgs, autoCloseMs)
+    add(nativeGuiRunArgs, "--screenshot-out")
+    add(nativeGuiRunArgs, screenshotPath)
+    add(nativeGuiRunArgs, "--inspector-state-out")
+    add(nativeGuiRunArgs, inspectorStatePath)
+    if strings.len(clickSpec) > 0:
+        add(nativeGuiRunArgs, "--click")
+        add(nativeGuiRunArgs, clickSpec)
+    if strings.len(resizeSpec) > 0:
+        add(nativeGuiRunArgs, "--resize")
+        add(nativeGuiRunArgs, resizeSpec)
+    if strings.len(scrollY) > 0:
+        add(nativeGuiRunArgs, "--scroll-y")
+        add(nativeGuiRunArgs, scrollY)
+    if strings.len(waitAfterClickMs) > 0:
+        add(nativeGuiRunArgs, "--wait-after-click-ms")
+        add(nativeGuiRunArgs, waitAfterClickMs)
+    if strings.len(focusItemId) > 0:
+        add(nativeGuiRunArgs, "--focus-item-id")
+        add(nativeGuiRunArgs, focusItemId)
+    if strings.len(typeText) > 0:
+        add(nativeGuiRunArgs, "--type-text")
+        add(nativeGuiRunArgs, typeText)
+    if strings.len(sendKey) > 0:
+        add(nativeGuiRunArgs, "--send-key")
+        add(nativeGuiRunArgs, sendKey)
+    if strings.len(routeStateFlag) > 0:
+        add(nativeGuiRunArgs, "--route-state")
+        add(nativeGuiRunArgs, routeStateFlag)
+    if openSourceOnClick:
+        add(nativeGuiRunArgs, "--open-source-on-click")
+    add(nativeGuiRunArgs, "--summary-out")
+    add(nativeGuiRunArgs, nativeGuiRunSummaryPath)
+    let nativeGuiRunLogPath: str = os.joinPath(outDir, "native_gui_run.log")
+    if !r2cControllerRunNodeHelper(effectiveRoot, nativeGuiRunHelper, nativeGuiRunArgs, nativeGuiRunLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: native gui run helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    sessionPath = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_path", sessionPath)
+    screenshotPath = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_screenshot_path", screenshotPath)
+    let hostExePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_host_exe_path", "")
+    let hostReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_host_ready", "")
+    let rendererReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_renderer_ready", "")
+    let windowOpenedText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_window_opened", "")
+    let screenshotWrittenText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_screenshot_written", "")
+    let windowTitle: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_window_title", "")
+    let routeState: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_route_state", "")
+    let entryModule: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_entry_module", "")
+    let layoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_item_count", "0")
+    let layoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_path", "")
+    let layoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_ready", "")
+    let layoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_node_count", "0")
+    let layoutSurfaceSourceModule: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_source_module", "")
+    let layoutSurfaceSourceComponent: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_source_component", "")
+    let layoutSurfaceStrategy: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_strategy", "")
+    let layoutSurfaceComponentExpansionCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_component_expansion_count", "0")
+    let layoutSurfaceParsedModuleCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_parsed_module_count", "0")
+    let layoutSurfaceStyledNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_styled_node_count", "0")
+    let layoutSurfaceInteractiveNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_layout_surface_interactive_node_count", "0")
+    let styleLayoutSurfacePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_surface_path", "")
+    let styleLayoutSurfaceReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_surface_ready", "")
+    let styleLayoutSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_surface_node_count", "0")
+    let styleLayoutOverlayNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_overlay_node_count", "0")
+    let styleLayoutSurfaceSurfaceNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_surface_surface_node_count", "0")
+    let styleLayoutSurfaceControlNodeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_style_layout_surface_control_node_count", "0")
+    let nativeLayoutPlanPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_path", "")
+    let nativeLayoutPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_ready", "")
+    let nativeLayoutPlanPolicySource: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_policy_source", "")
+    let nativeLayoutPlanItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_item_count", "0")
+    let nativeLayoutPlanViewportItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_viewport_item_count", "0")
+    let nativeLayoutPlanClippedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_clipped_item_count", "0")
+    let nativeLayoutPlanInteractiveItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_interactive_item_count", "0")
+    let nativeLayoutPlanSourceBackedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", "0")
+    let nativeLayoutPlanScrollHeightText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_native_layout_plan_scroll_height", "0")
+    let initialRenderPlanPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_initial_render_plan_path", "")
+    let initialRenderPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_initial_render_plan_ready", "")
+    let initialRenderPlanCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_initial_render_plan_command_count", "0")
+    let initialRenderPlanVisibleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_initial_render_plan_visible_layout_item_count", "0")
+    let renderPlanPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_render_plan_path", "")
+    let renderPlanReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_render_plan_ready", "")
+    let renderPlanCommandCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_render_plan_command_count", "0")
+    let renderPlanVisibleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_render_plan_visible_layout_item_count", "0")
+    let runtimePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_path", "")
+    let runtimeReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_ready", "")
+    let runtimeError: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_error", "")
+    let runtimeExePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_exe_path", "")
+    let initialRuntimeStatePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_initial_runtime_state_path", "")
+    let runtimeStatePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_runtime_state_path", "")
+    let clickCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_click_count", "0")
+    let resizeCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_resize_count", "0")
+    let scrollCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_scroll_count", "0")
+    let focusCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_focus_count", "0")
+    let keyCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_key_count", "0")
+    let textCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_text_count", "0")
+    let lastClickXText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_last_click_x", "")
+    let lastClickYText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_last_click_y", "")
+    let scrollOffsetYText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_scroll_offset_y", "")
+    let focusedItemId: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_focused_item_id", "")
+    let typedText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_typed_text", "")
+    let lastKey: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_last_key", "")
+    let visibleLayoutItemCountText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_visible_layout_item_count", "0")
+    let hitItemId: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_item_id", "")
+    let hitSourceNodeId: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_source_node_id", "")
+    let hitSourceModulePath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_source_module_path", "")
+    let hitSourceComponentName: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_source_component_name", "")
+    let hitSourceLineText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_source_line", "0")
+    let hitItemInteractiveText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_item_interactive", "")
+    let hitInspectorPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_inspector_path", "")
+    let hitInspectorReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_hit_inspector_ready", "")
+    inspectorStatePath = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_inspector_state_path", inspectorStatePath)
+    let inspectorStateReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_inspector_state_ready", "")
+    let sourceJumpEnabledText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_enabled", "")
+    let sourceJumpAttemptedText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_attempted", "")
+    let sourceJumpOkText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_ok", "")
+    let sourceJumpTargetPath: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_target_path", "")
+    let sourceJumpTargetLineText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_target_line", "0")
+    let sourceJumpCommand: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_command", "")
+    let sourceJumpError: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_source_jump_error", "")
+    let windowWidthText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_window_width", "")
+    let windowHeightText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_window_height", "")
+    let sessionPreviewReadyText: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_preview_ready", "")
+    let sessionPreviewMode: str = r2cControllerReadSummaryValue(nativeGuiRunSummaryPath, "native_gui_session_preview_mode", "")
+    let moduleCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "module_count", r2cControllerReadSummaryValue(codegenSummaryPath, "module_count", r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0")))
+    let routeCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "route_count", r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
+    let semanticNodesCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "initial_semantic_nodes_count", "0")
+    let assetCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "asset_count", "0")
+    let tailwindTokenCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "tailwind_token_count", "0")
+    let requiredHostGroupCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_group_count", "0")
+    let requiredHostGroupsCsv: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "required_host_groups", "")
+    let typescriptVersion: str = r2cControllerReadSummaryValue(codegenSummaryPath, "typescript_version", r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", ""))
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"run-native-gui\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(sessionPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"native_gui_session_v1\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(nativeGuiRunHelper) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(nativeGuiRunSummaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(nativeGuiRunLogPath) + ",\n"
+    report = report + "  \"module_count\": " + moduleCountText + ",\n"
+    report = report + "  \"route_count\": " + routeCountText + ",\n"
+    report = report + "  \"semantic_nodes_count\": " + semanticNodesCountText + ",\n"
+    report = report + "  \"asset_count\": " + assetCountText + ",\n"
+    report = report + "  \"tailwind_token_count\": " + tailwindTokenCountText + ",\n"
+    report = report + "  \"required_host_group_count\": " + requiredHostGroupCountText + ",\n"
+    report = report + "  \"required_host_groups\": " + r2cControllerJsonArrayFromCsv(requiredHostGroupsCsv) + ",\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    report = report + "  \"native_gui_bundle_path\": " + r2cControllerJsonQuote(bundlePath) + ",\n"
+    report = report + "  \"native_gui_session_path\": " + r2cControllerJsonQuote(sessionPath) + ",\n"
+    report = report + "  \"native_gui_session_preview_mode\": " + r2cControllerJsonQuote(sessionPreviewMode) + ",\n"
+    report = report + "  \"native_gui_layout_surface_path\": " + r2cControllerJsonQuote(layoutSurfacePath) + ",\n"
+    report = report + "  \"native_gui_layout_surface_node_count\": " + layoutSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_source_module\": " + r2cControllerJsonQuote(layoutSurfaceSourceModule) + ",\n"
+    report = report + "  \"native_gui_layout_surface_source_component\": " + r2cControllerJsonQuote(layoutSurfaceSourceComponent) + ",\n"
+    report = report + "  \"native_gui_layout_surface_strategy\": " + r2cControllerJsonQuote(layoutSurfaceStrategy) + ",\n"
+    report = report + "  \"native_gui_layout_surface_component_expansion_count\": " + layoutSurfaceComponentExpansionCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_parsed_module_count\": " + layoutSurfaceParsedModuleCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_styled_node_count\": " + layoutSurfaceStyledNodeCountText + ",\n"
+    report = report + "  \"native_gui_layout_surface_interactive_node_count\": " + layoutSurfaceInteractiveNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_path\": " + r2cControllerJsonQuote(styleLayoutSurfacePath) + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_node_count\": " + styleLayoutSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_overlay_node_count\": " + styleLayoutOverlayNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_surface_node_count\": " + styleLayoutSurfaceSurfaceNodeCountText + ",\n"
+    report = report + "  \"native_gui_style_layout_surface_control_node_count\": " + styleLayoutSurfaceControlNodeCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_path\": " + r2cControllerJsonQuote(nativeLayoutPlanPath) + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_policy_source\": " + r2cControllerJsonQuote(nativeLayoutPlanPolicySource) + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_item_count\": " + nativeLayoutPlanItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_viewport_item_count\": " + nativeLayoutPlanViewportItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_clipped_item_count\": " + nativeLayoutPlanClippedItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_interactive_item_count\": " + nativeLayoutPlanInteractiveItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_source_backed_item_count\": " + nativeLayoutPlanSourceBackedItemCountText + ",\n"
+    report = report + "  \"native_gui_native_layout_plan_scroll_height\": " + nativeLayoutPlanScrollHeightText + ",\n"
+    report = report + "  \"native_gui_initial_render_plan_path\": " + r2cControllerJsonQuote(initialRenderPlanPath) + ",\n"
+    report = report + "  \"native_gui_initial_render_plan_command_count\": " + initialRenderPlanCommandCountText + ",\n"
+    report = report + "  \"native_gui_initial_render_plan_visible_layout_item_count\": " + initialRenderPlanVisibleLayoutItemCountText + ",\n"
+    report = report + "  \"native_gui_render_plan_path\": " + r2cControllerJsonQuote(renderPlanPath) + ",\n"
+    report = report + "  \"native_gui_render_plan_command_count\": " + renderPlanCommandCountText + ",\n"
+    report = report + "  \"native_gui_render_plan_visible_layout_item_count\": " + renderPlanVisibleLayoutItemCountText + ",\n"
+    report = report + "  \"native_gui_runtime_path\": " + r2cControllerJsonQuote(runtimePath) + ",\n"
+    report = report + "  \"native_gui_runtime_error\": " + r2cControllerJsonQuote(runtimeError) + ",\n"
+    report = report + "  \"native_gui_runtime_exe_path\": " + r2cControllerJsonQuote(runtimeExePath) + ",\n"
+    report = report + "  \"native_gui_initial_runtime_state_path\": " + r2cControllerJsonQuote(initialRuntimeStatePath) + ",\n"
+    report = report + "  \"native_gui_runtime_state_path\": " + r2cControllerJsonQuote(runtimeStatePath) + ",\n"
+    report = report + "  \"native_gui_host_exe_path\": " + r2cControllerJsonQuote(hostExePath) + ",\n"
+    report = report + "  \"native_gui_screenshot_path\": " + r2cControllerJsonQuote(screenshotPath) + ",\n"
+    report = report + "  \"native_gui_window_title\": " + r2cControllerJsonQuote(windowTitle) + ",\n"
+    report = report + "  \"native_gui_route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    report = report + "  \"native_gui_entry_module\": " + r2cControllerJsonQuote(entryModule) + ",\n"
+    report = report + "  \"native_gui_layout_item_count\": " + layoutItemCountText + ",\n"
+    report = report + "  \"native_gui_visible_layout_item_count\": " + visibleLayoutItemCountText + ",\n"
+    report = report + "  \"native_gui_click_count\": " + clickCountText + ",\n"
+    report = report + "  \"native_gui_resize_count\": " + resizeCountText + ",\n"
+    report = report + "  \"native_gui_scroll_count\": " + scrollCountText + ",\n"
+    report = report + "  \"native_gui_focus_count\": " + focusCountText + ",\n"
+    report = report + "  \"native_gui_key_count\": " + keyCountText + ",\n"
+    report = report + "  \"native_gui_text_count\": " + textCountText + ",\n"
+    if strings.len(lastClickXText) > 0:
+        report = report + "  \"native_gui_last_click_x\": " + lastClickXText + ",\n"
+    else:
+        report = report + "  \"native_gui_last_click_x\": null,\n"
+    if strings.len(lastClickYText) > 0:
+        report = report + "  \"native_gui_last_click_y\": " + lastClickYText + ",\n"
+    else:
+        report = report + "  \"native_gui_last_click_y\": null,\n"
+    if strings.len(scrollOffsetYText) > 0:
+        report = report + "  \"native_gui_scroll_offset_y\": " + scrollOffsetYText + ",\n"
+    else:
+        report = report + "  \"native_gui_scroll_offset_y\": null,\n"
+    report = report + "  \"native_gui_focused_item_id\": " + r2cControllerJsonQuote(focusedItemId) + ",\n"
+    report = report + "  \"native_gui_typed_text\": " + r2cControllerJsonQuote(typedText) + ",\n"
+    report = report + "  \"native_gui_last_key\": " + r2cControllerJsonQuote(lastKey) + ",\n"
+    report = report + "  \"native_gui_hit_item_id\": " + r2cControllerJsonQuote(hitItemId) + ",\n"
+    report = report + "  \"native_gui_hit_source_node_id\": " + r2cControllerJsonQuote(hitSourceNodeId) + ",\n"
+    report = report + "  \"native_gui_hit_source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
+    report = report + "  \"native_gui_hit_source_component_name\": " + r2cControllerJsonQuote(hitSourceComponentName) + ",\n"
+    report = report + "  \"native_gui_hit_source_line\": " + hitSourceLineText + ",\n"
+    if hitItemInteractiveText == "true" || hitItemInteractiveText == "false":
+        report = report + "  \"native_gui_hit_item_interactive\": " + hitItemInteractiveText + ",\n"
+    else:
+        report = report + "  \"native_gui_hit_item_interactive\": null,\n"
+    report = report + "  \"native_gui_hit_inspector_path\": " + r2cControllerJsonQuote(hitInspectorPath) + ",\n"
+    if hitInspectorReadyText == "true" || hitInspectorReadyText == "false":
+        report = report + "  \"native_gui_hit_inspector_ready\": " + hitInspectorReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_hit_inspector_ready\": null,\n"
+    report = report + "  \"native_gui_inspector_state_path\": " + r2cControllerJsonQuote(inspectorStatePath) + ",\n"
+    if inspectorStateReadyText == "true" || inspectorStateReadyText == "false":
+        report = report + "  \"native_gui_inspector_state_ready\": " + inspectorStateReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_inspector_state_ready\": null,\n"
+    if sourceJumpEnabledText == "true" || sourceJumpEnabledText == "false":
+        report = report + "  \"native_gui_source_jump_enabled\": " + sourceJumpEnabledText + ",\n"
+    else:
+        report = report + "  \"native_gui_source_jump_enabled\": null,\n"
+    if sourceJumpAttemptedText == "true" || sourceJumpAttemptedText == "false":
+        report = report + "  \"native_gui_source_jump_attempted\": " + sourceJumpAttemptedText + ",\n"
+    else:
+        report = report + "  \"native_gui_source_jump_attempted\": null,\n"
+    if sourceJumpOkText == "true" || sourceJumpOkText == "false":
+        report = report + "  \"native_gui_source_jump_ok\": " + sourceJumpOkText + ",\n"
+    else:
+        report = report + "  \"native_gui_source_jump_ok\": null,\n"
+    report = report + "  \"native_gui_source_jump_target_path\": " + r2cControllerJsonQuote(sourceJumpTargetPath) + ",\n"
+    report = report + "  \"native_gui_source_jump_target_line\": " + sourceJumpTargetLineText + ",\n"
+    report = report + "  \"native_gui_source_jump_command\": " + r2cControllerJsonQuote(sourceJumpCommand) + ",\n"
+    report = report + "  \"native_gui_source_jump_error\": " + r2cControllerJsonQuote(sourceJumpError) + ",\n"
+    if strings.len(windowWidthText) > 0:
+        report = report + "  \"native_gui_window_width\": " + windowWidthText + ",\n"
+    else:
+        report = report + "  \"native_gui_window_width\": null,\n"
+    if strings.len(windowHeightText) > 0:
+        report = report + "  \"native_gui_window_height\": " + windowHeightText + ",\n"
+    else:
+        report = report + "  \"native_gui_window_height\": null,\n"
+    if hostReadyText == "true" || hostReadyText == "false":
+        report = report + "  \"native_gui_host_ready\": " + hostReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_host_ready\": null,\n"
+    if rendererReadyText == "true" || rendererReadyText == "false":
+        report = report + "  \"native_gui_renderer_ready\": " + rendererReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_renderer_ready\": null,\n"
+    if sessionPreviewReadyText == "true" || sessionPreviewReadyText == "false":
+        report = report + "  \"native_gui_session_preview_ready\": " + sessionPreviewReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_session_preview_ready\": null,\n"
+    if layoutSurfaceReadyText == "true" || layoutSurfaceReadyText == "false":
+        report = report + "  \"native_gui_layout_surface_ready\": " + layoutSurfaceReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_layout_surface_ready\": null,\n"
+    if styleLayoutSurfaceReadyText == "true" || styleLayoutSurfaceReadyText == "false":
+        report = report + "  \"native_gui_style_layout_surface_ready\": " + styleLayoutSurfaceReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_style_layout_surface_ready\": null,\n"
+    if nativeLayoutPlanReadyText == "true" || nativeLayoutPlanReadyText == "false":
+        report = report + "  \"native_gui_native_layout_plan_ready\": " + nativeLayoutPlanReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_native_layout_plan_ready\": null,\n"
+    if initialRenderPlanReadyText == "true" || initialRenderPlanReadyText == "false":
+        report = report + "  \"native_gui_initial_render_plan_ready\": " + initialRenderPlanReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_initial_render_plan_ready\": null,\n"
+    if renderPlanReadyText == "true" || renderPlanReadyText == "false":
+        report = report + "  \"native_gui_render_plan_ready\": " + renderPlanReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_render_plan_ready\": null,\n"
+    if runtimeReadyText == "true" || runtimeReadyText == "false":
+        report = report + "  \"native_gui_runtime_ready\": " + runtimeReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_runtime_ready\": null,\n"
+    if windowOpenedText == "true" || windowOpenedText == "false":
+        report = report + "  \"native_gui_window_opened\": " + windowOpenedText + ",\n"
+    else:
+        report = report + "  \"native_gui_window_opened\": null,\n"
+    if screenshotWrittenText == "true" || screenshotWrittenText == "false":
+        report = report + "  \"native_gui_screenshot_written\": " + screenshotWrittenText + "\n"
+    else:
+        report = report + "  \"native_gui_screenshot_written\": null\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerNativeGuiRuntime(root: str,
+                                 args: str[]): int32 =
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let runtimeContractFlag: str = r2cControllerReadFlag(args, "--runtime-contract", "")
+    if strings.len(runtimeContractFlag) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native-gui-runtime missing --runtime-contract")
+        return 1
+    let runtimeContractPath: str = v3path.v3PathAbsolute(effectiveRoot, runtimeContractFlag)
+    if !v3path.v3PathFileExists(runtimeContractPath):
+        r2cControllerPrintErr("r2c-react-v3: native-gui-runtime missing runtime contract: " + runtimeContractPath)
+        return 1
+    let runtimeDirDefault: str = v3path.v3PathParentDir(runtimeContractPath)
+    let runtimeExePath: str = v3path.v3PathJoin(runtimeDirDefault, "native_gui_runtime_compiled_main")
+    if !v3path.v3PathFileExists(runtimeExePath):
+        r2cControllerPrintErr("r2c-react-v3: native-gui-runtime missing compiled runtime exe: " + runtimeExePath)
+        return 1
+    var runtimeArgs: str[] = []
+    add(runtimeArgs, "--runtime-contract")
+    add(runtimeArgs, runtimeContractPath)
+    let filteredRuntimeArgs: str[] = r2cControllerFilterNativeGuiRuntimeArgs(args)
+    for i in 0..<filteredRuntimeArgs.len:
+        add(runtimeArgs, filteredRuntimeArgs[i])
+    let runtimeDir: str = v3path.v3PathParentDir(runtimeContractPath)
+    let runtimeOutputPath: str = os.joinPath(runtimeDir, "native_gui_runtime_direct_v1.json")
+    let runtimeLogPath: str = os.joinPath(runtimeDir, "native_gui_runtime_direct.log")
+    var runtimeExitCode: int32 = 0
+    var runtimeOutput: str
+    os.osSetEmpty(runtimeOutput)
+    let runtimeOk = r2cproc.r2cProcessRunFileLogged(effectiveRoot,
+                                                    "r2c-react-v3 native-gui-runtime",
+                                                    runtimeExePath,
+                                                    runtimeArgs,
+                                                    runtimeDir,
+                                                    runtimeLogPath,
+                                                    runtimeExitCode,
+                                                    runtimeOutput)
+    if !v3path.v3WriteTextFile("", runtimeOutputPath, runtimeOutput):
+        r2cControllerPrintErr("r2c-react-v3: failed to write native runtime output: " + runtimeOutputPath)
+        return 1
+    if !runtimeOk:
+        if strings.len(runtimeOutput) > 0:
+            r2cControllerPrintErr(runtimeOutput)
+        r2cControllerPrintErr("r2c-react-v3: native gui runtime failed")
+        if runtimeExitCode != 0:
+            return runtimeExitCode
+        return 1
+    if strings.len(runtimeOutput) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: native-gui-runtime empty stdout: " + runtimeExePath)
+        return 1
+    r2cControllerPrintLine(runtimeOutput)
+    return 0
+
+fn r2cControllerReplayHitInspector(root: str,
+                                   args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let inspectorStateFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--inspector-state", ""))
+    if strings.len(inspectorStateFlag) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector missing --inspector-state")
+        return 1
+    let outFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out", ""))
+    let openSource: bool = cmdline.hasFlag("--open-source")
+    let inspectorStatePath: str = v3path.v3PathAbsolute(effectiveRoot, inspectorStateFlag)
+    let outDirBase: str = v3path.v3PathParentDir(inspectorStatePath)
+    var outDir: str = outDirBase
+    var replayPath: str = os.joinPath(outDir, "native_gui_inspector_replay_v1.json")
+    if strings.len(outFlag) > 0:
+        replayPath = v3path.v3PathAbsolute(effectiveRoot, outFlag)
+        outDir = v3path.v3PathParentDir(replayPath)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    let helper: str = os.joinPath(experimentalRoot, "r2c-react-v3-replay-hit-inspector.mjs")
+    let summaryPath: str = os.joinPath(outDir, "native_gui_inspector_replay.summary.env")
+    let logPath: str = os.joinPath(outDir, "native_gui_inspector_replay.log")
+    let reportPath: str = os.joinPath(outDir, "native_gui_inspector_replay_report_v1.json")
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+
+    var helperArgs: str[] = []
+    add(helperArgs, "--inspector-state")
+    add(helperArgs, inspectorStatePath)
+    add(helperArgs, "--out")
+    add(helperArgs, replayPath)
+    add(helperArgs, "--summary-out")
+    add(helperArgs, summaryPath)
+    if openSource:
+        add(helperArgs, "--open-source")
+    if !r2cControllerRunNodeHelper(effectiveRoot, helper, helperArgs, logPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    replayPath = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_path", replayPath)
+    let inspectorStateReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_state_ready", "")
+    let replayReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_ready", "")
+    let panelTitle: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_panel_title", "")
+    let panelLineCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_panel_line_count", "0")
+    let replaySourceOpenRequestedText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_requested", "")
+    let replaySourceOpenOkText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_ok", "")
+    let replaySourceOpenTargetPath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_target_path", "")
+    let replaySourceOpenTargetLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_target_line", "0")
+    let replaySourceOpenCommand: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_command", "")
+    let replaySourceOpenError: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_error", "")
+    let hitItemId: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_id", "")
+    let hitSourceModulePath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_module_path", "")
+    let hitSourceComponentName: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_component_name", "")
+    let hitSourceLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_line", "0")
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"replay-hit-inspector\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(replayPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"native_gui_inspector_replay_v1\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helper) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"native_gui_inspector_state_path\": " + r2cControllerJsonQuote(inspectorStatePath) + ",\n"
+    if inspectorStateReadyText == "true" || inspectorStateReadyText == "false":
+        report = report + "  \"native_gui_inspector_state_ready\": " + inspectorStateReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_inspector_state_ready\": null,\n"
+    report = report + "  \"native_gui_inspector_replay_path\": " + r2cControllerJsonQuote(replayPath) + ",\n"
+    if replayReadyText == "true" || replayReadyText == "false":
+        report = report + "  \"native_gui_inspector_replay_ready\": " + replayReadyText + ",\n"
+    else:
+        report = report + "  \"native_gui_inspector_replay_ready\": null,\n"
+    report = report + "  \"native_gui_inspector_replay_panel_title\": " + r2cControllerJsonQuote(panelTitle) + ",\n"
+    report = report + "  \"native_gui_inspector_replay_panel_line_count\": " + panelLineCountText + ",\n"
+    report = report + "  \"native_gui_hit_item_id\": " + r2cControllerJsonQuote(hitItemId) + ",\n"
+    report = report + "  \"native_gui_hit_source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
+    report = report + "  \"native_gui_hit_source_component_name\": " + r2cControllerJsonQuote(hitSourceComponentName) + ",\n"
+    report = report + "  \"native_gui_hit_source_line\": " + hitSourceLineText + ",\n"
+    if replaySourceOpenRequestedText == "true" || replaySourceOpenRequestedText == "false":
+        report = report + "  \"native_gui_replay_source_open_requested\": " + replaySourceOpenRequestedText + ",\n"
+    else:
+        report = report + "  \"native_gui_replay_source_open_requested\": null,\n"
+    if replaySourceOpenOkText == "true" || replaySourceOpenOkText == "false":
+        report = report + "  \"native_gui_replay_source_open_ok\": " + replaySourceOpenOkText + ",\n"
+    else:
+        report = report + "  \"native_gui_replay_source_open_ok\": null,\n"
+    report = report + "  \"native_gui_replay_source_open_target_path\": " + r2cControllerJsonQuote(replaySourceOpenTargetPath) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_target_line\": " + replaySourceOpenTargetLineText + ",\n"
+    report = report + "  \"native_gui_replay_source_open_command\": " + r2cControllerJsonQuote(replaySourceOpenCommand) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_error\": " + r2cControllerJsonQuote(replaySourceOpenError) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerHelp() =
+    r2cControllerPrintLine("usage: cheng r2c-react-v3 <subcommand> [args]")
+    r2cControllerPrintLine("subcommands: help, status, native-gui-bundle, native-gui-runtime, run-native-gui, replay-hit-inspector, compile")
+    r2cControllerPrintLine("native-gui-runtime flags: --runtime-contract <file> [--state-* ...] [--event-* ...]")
+    r2cControllerPrintLine("run-native-gui flags: --click x,y --resize WxH --scroll-y <n> --wait-after-click-ms <n> --focus-item-id <id> --type-text <text> --send-key <key> --inspector-state-out <file> --open-source-on-click")
+    r2cControllerPrintLine("replay-hit-inspector flags: --inspector-state <file> --out <file> --open-source")
+
+fn v3R2cReactV3Main(root: str,
+                    args: str[]): int32 =
+    if args.len <= 0:
+        r2cControllerHelp()
+        return 0
+    let cmd: str = args[0]
+    var tail: str[] = []
+    for i in 1..<args.len:
+        add(tail, args[i])
+    if cmd == "help" || cmd == "--help" || cmd == "-h":
+        r2cControllerHelp()
+        return 0
+    if cmd == "status":
+        return r2cControllerStatus(root, tail)
+    if cmd == "native-gui-bundle":
+        return r2cControllerNativeGuiBundle(root, tail)
+    if cmd == "native-gui-runtime":
+        return r2cControllerNativeGuiRuntime(root, tail)
+    if cmd == "run-native-gui":
+        return r2cControllerRunNativeGui(root, tail)
+    if cmd == "replay-hit-inspector":
+        return r2cControllerReplayHitInspector(root, tail)
+    if cmd == "compile":
+        return r2cControllerCompile(root, tail)
+    r2cControllerPrintErr("r2c-react-v3: unknown subcommand: " + cmd)
+    return 2
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let rootDir: str = r2cControllerRoot()
+    let count: int32 = cmdline.paramCount()
+    let args: str[] = r2cControllerCollectArgsFrom(1, count)
+    return v3R2cReactV3Main(rootDir, args)

@@ -474,10 +474,13 @@ fn msquicNativeFlushShortPackets(side: int32): Result[bool] =
     return Ok[bool](true)
 
 fn msquicNativeSendClientHello(): Result[bool] =
+    echo("msquic_native_client_hello_stage=keygen_begin")
     let genRes: Result[bool] = msquicTls13HandshakeGenerateX25519(msquicNativeSession.client.handshake)
     if IsErr(genRes):
         return Err[bool](ErrorText(genRes))
+    echo("msquic_native_client_hello_stage=keygen_ok")
     msquicTls13HandshakeSetServerName(msquicNativeSession.client.handshake, msquicNativeSession.clientTlsPolicy.serverName)
+    echo("msquic_native_client_hello_stage=build_begin")
     let helloRes: Result[Bytes] = msquicTls13BuildClientHello(
         msquicNativeSession.client.handshake,
         msquicNativeSeededBytes(17),
@@ -488,12 +491,19 @@ fn msquicNativeSendClientHello(): Result[bool] =
     if IsErr(helloRes):
         return Err[bool](ErrorText(helloRes))
     let raw: Bytes = Value(helloRes)
+    echo("msquic_native_client_hello_stage=build_ok")
     msquicTls13HandshakeAppendTranscript(msquicNativeSession.client.handshake, raw)
+    echo("msquic_native_client_hello_stage=transcript_ok")
     var pkt: MsQuicPacket = initMsQuicPacket(msquicNativeNextPacketNumber(msquicNativeClientSide, QuicPacketInitial))
     let addRes: Result[bool] = msquicPacketAddFrame(pkt, msquicFrameCrypto(0, raw))
     if IsErr(addRes):
         return Err[bool](ErrorText(addRes))
-    return msquicNativeSendPacket(msquicNativeClientSide, QuicPacketInitial, pkt)
+    echo("msquic_native_client_hello_stage=frame_ok")
+    let sendRes: Result[bool] = msquicNativeSendPacket(msquicNativeClientSide, QuicPacketInitial, pkt)
+    if IsErr(sendRes):
+        return Err[bool](ErrorText(sendRes))
+    echo("msquic_native_client_hello_stage=send_ok")
+    return Ok[bool](true)
 
 fn msquicNativeSendServerFlight(): Result[bool] =
     if msquicNativeSession.serverFlightSent:
@@ -894,11 +904,17 @@ fn msquicNativeStartListener(addr: MultiAddress, settings: MsQuicSettings, tlsPo
     let bindRes: Result[bool] = datapath_runtime.msquicDatapathBindUdp(msquicNativeDatapathRt, id, bindText)
     if IsErr(bindRes):
         return Err[int32](ErrorText(bindRes))
+    let boundText: str = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, id)
+    if strings.len(boundText) <= 0:
+        return Err[int32]("msquic native: listener bound addr missing")
+    let boundAddrRes = parseMultiAddress(boundText)
+    if IsErr(boundAddrRes):
+        return Err[int32](ErrorText(boundAddrRes))
     msquicNativeListenerDatapathId = id
     msquicNativeListenerRunning = true
     msquicNativeListenerSettings = settings
     msquicNativeListenerTlsPolicy = tlsPolicy
-    msquicNativeListenAddr = addr
+    msquicNativeListenAddr = Value(boundAddrRes)
     return Ok[int32](id)
 
 fn msquicNativeStopListener() =

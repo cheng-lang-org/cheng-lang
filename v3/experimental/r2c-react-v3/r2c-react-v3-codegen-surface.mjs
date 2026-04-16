@@ -3,7 +3,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { discoverTruthRoutes, normalizeRoots } from './r2c-react-v3-discover-truth-routes.mjs';
-import { buildCodegenRouteCatalog } from './r2c-react-v3-route-matrix-shared.mjs';
+import {
+  renderTruthCompareEngineCheng,
+  renderTruthCompareMainCheng,
+  renderTruthCompareMatrixEngineCheng,
+  renderTruthCompareMatrixMainCheng,
+} from './r2c-react-v3-truth-compare-engine-shared.mjs';
+import {
+  buildCodegenExecRouteMatrixFromCatalog,
+  buildCodegenRouteCatalog,
+  loadTruthTrace,
+} from './r2c-react-v3-route-matrix-shared.mjs';
 
 function parseArgs(argv) {
   const out = {
@@ -12,6 +22,7 @@ function parseArgs(argv) {
     outDir: '',
     summaryOut: '',
     runtimeRoots: [],
+    truthTracePath: '',
   };
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -20,8 +31,9 @@ function parseArgs(argv) {
     else if (arg === '--out-dir') out.outDir = String(argv[++i] || '');
     else if (arg === '--summary-out') out.summaryOut = String(argv[++i] || '');
     else if (arg === '--runtime-root') out.runtimeRoots.push(String(argv[++i] || ''));
+    else if (arg === '--truth-trace') out.truthTracePath = String(argv[++i] || '');
     else if (arg === '-h' || arg === '--help') {
-      console.log('Usage: r2c-react-v3-codegen-surface.mjs --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir>] [--summary-out <file>]');
+      console.log('Usage: r2c-react-v3-codegen-surface.mjs --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir>] [--truth-trace <file>] [--summary-out <file>]');
       process.exit(0);
     }
   }
@@ -64,6 +76,14 @@ function writeSummary(filePath, values) {
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
 }
 
+function resolveDefaultToolingBin(workspaceRoot) {
+  const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
+  if (explicit) return explicit;
+  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
+  if (fs.existsSync(stage3)) return stage3;
+  return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+}
+
 function makeSafeIdent(text) {
   let out = String(text || '').replace(/[^A-Za-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
   if (!out) out = 'module';
@@ -89,9 +109,182 @@ function renderStrArrayFn(name, values) {
   return `${lines.join('\n')}\n`;
 }
 
+function splitStringChunks(value, chunkSize = 256) {
+  const text = String(value || '');
+  const safeChunkSize = Math.max(32, Number(chunkSize || 256));
+  const chunks = [];
+  let offset = 0;
+  while (offset < text.length) {
+    let end = Math.min(text.length, offset + safeChunkSize);
+    while (end > offset + 1 && (text[end - 1] === '"' || text[end - 1] === '\\')) {
+      end -= 1;
+    }
+    chunks.push(text.slice(offset, end));
+    offset = end;
+  }
+  if (chunks.length === 0) chunks.push('');
+  return chunks;
+}
+
+function splitJsonOutputChunks(value, chunkSize = 192) {
+  const text = String(value || '');
+  const targetSize = Math.max(64, Number(chunkSize || 192));
+  const searchWindow = Math.max(24, Math.floor(targetSize / 2));
+  const preferredChars = new Set([',', '}', ']', ':']);
+  const acceptableChars = new Set(['"', ',', '}', ']', ':']);
+  const chunks = [];
+  let offset = 0;
+  while (offset < text.length) {
+    const hardEnd = Math.min(text.length, offset + targetSize);
+    if (hardEnd >= text.length) {
+      chunks.push(text.slice(offset));
+      break;
+    }
+    const windowStart = Math.max(offset + 1, hardEnd - searchWindow);
+    let splitAt = -1;
+    for (let index = hardEnd; index >= windowStart; index -= 1) {
+      const prev = text[index - 1];
+      if (preferredChars.has(prev)) {
+        splitAt = index;
+        break;
+      }
+    }
+    if (splitAt < 0) {
+      for (let index = hardEnd; index >= windowStart; index -= 1) {
+        const prev = text[index - 1];
+        if (acceptableChars.has(prev)) {
+          splitAt = index;
+          break;
+        }
+      }
+    }
+    if (splitAt < 0) splitAt = hardEnd;
+    while (splitAt > offset + 1 && (text[splitAt - 1] === '\\' || text[splitAt - 1] === '"')) {
+      splitAt -= 1;
+    }
+    if (splitAt <= offset) splitAt = hardEnd;
+    chunks.push(text.slice(offset, splitAt));
+    offset = splitAt;
+  }
+  if (chunks.length === 0) chunks.push('');
+  return chunks;
+}
+
+function renderChunkReturnFunctions(functionPrefix, value, chunkSize = 256) {
+  const chunks = splitStringChunks(value, chunkSize);
+  const names = [];
+  const lines = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const name = `${functionPrefix}${index}`;
+    names.push(name);
+    lines.push(`fn ${name}(): str =`);
+    lines.push(`    return ${chengStr(chunks[index])}`);
+    lines.push('');
+  }
+  return { names, lines };
+}
+
+function renderChunkEmitter(functionPrefix, value, {
+  appendNewline = false,
+  chunkSize = 256,
+  emitJsonName = 'emitJson',
+  emitName = 'emit',
+} = {}) {
+  const { names, lines } = renderChunkReturnFunctions(functionPrefix, value, chunkSize);
+  lines.push(`fn ${emitJsonName}() =`);
+  for (const name of names) {
+    lines.push(`    exec_io.r2cWriteStdout(${name}())`);
+  }
+  lines.push('    return');
+  lines.push('');
+  lines.push(`fn ${emitName}() =`);
+  lines.push(`    ${emitJsonName}()`);
+  if (appendNewline) lines.push('    exec_io.r2cWriteStdout("\\n")');
+  lines.push('    return');
+  return lines;
+}
+
+function renderDirectChunkEmitter(value, {
+  appendNewline = false,
+  chunkSize = 192,
+  emitJsonName = 'emitJson',
+  emitName = 'emit',
+} = {}) {
+  const chunks = splitJsonOutputChunks(value, chunkSize);
+  const lines = [`fn ${emitJsonName}() =`];
+  for (const chunk of chunks) {
+    lines.push(`    exec_io.r2cWriteStdout(${chengStr(chunk)})`);
+  }
+  lines.push('    return');
+  lines.push('');
+  lines.push(`fn ${emitName}() =`);
+  lines.push(`    ${emitJsonName}()`);
+  if (appendNewline) lines.push('    exec_io.r2cWriteStdout("\\n")');
+  lines.push('    return');
+  return lines;
+}
+
+function renderDirectChunkWriterEmitter(functionPrefix, value, {
+  appendNewline = false,
+  chunkSize = 192,
+  emitJsonName = 'emitJson',
+  emitName = 'emit',
+} = {}) {
+  const chunks = splitJsonOutputChunks(value, chunkSize);
+  const helperNames = [];
+  const lines = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const name = `${functionPrefix}${index}`;
+    helperNames.push(name);
+    lines.push(`fn ${name}() =`);
+    lines.push(`    exec_io.r2cWriteStdout(${chengStr(chunks[index])})`);
+    lines.push('    return');
+    lines.push('');
+  }
+  lines.push(`fn ${emitJsonName}() =`);
+  for (const name of helperNames) {
+    lines.push(`    ${name}()`);
+  }
+  lines.push('    return');
+  lines.push('');
+  lines.push(`fn ${emitName}() =`);
+  lines.push(`    ${emitJsonName}()`);
+  if (appendNewline) lines.push('    exec_io.r2cWriteStdout("\\n")');
+  lines.push('    return');
+  return lines;
+}
+
+function renderJsonChunkReturnEmitter(functionPrefix, value, {
+  appendNewline = false,
+  chunkSize = 192,
+  emitJsonName = 'emitJson',
+  emitName = 'emit',
+} = {}) {
+  const chunks = splitJsonOutputChunks(value, chunkSize);
+  const names = [];
+  const lines = [];
+  for (let index = 0; index < chunks.length; index += 1) {
+    const name = `${functionPrefix}${index}`;
+    names.push(name);
+    lines.push(`fn ${name}(): str =`);
+    lines.push(`    return ${chengStr(chunks[index])}`);
+    lines.push('');
+  }
+  lines.push(`fn ${emitJsonName}() =`);
+  for (const name of names) {
+    lines.push(`    exec_io.r2cWriteStdout(${name}())`);
+  }
+  lines.push('    return');
+  lines.push('');
+  lines.push(`fn ${emitName}() =`);
+  lines.push(`    ${emitJsonName}()`);
+  if (appendNewline) lines.push('    exec_io.r2cWriteStdout("\\n")');
+  lines.push('    return');
+  return lines;
+}
+
 function renderRuntimeCheng() {
   return [
-    'import std/strutils as strutil',
     'type',
     '    R2cGeneratedModuleSurface =',
     '        sourcePath: str',
@@ -109,14 +302,32 @@ function renderRuntimeCheng() {
     '',
     '    R2cGeneratedProjectSurface =',
     '        packageId: str',
-    '        routeCatalogModule: str',
-    '        routeCount: int32',
-    '        routeIds: str[]',
     '        projectModule: str',
     '        mainModule: str',
     '        entryModule: str',
     '        moduleSourcePaths: str[]',
     '        modules: R2cGeneratedModuleSurface[]',
+    '',
+    '    R2cGeneratedRouteCandidate =',
+    '        semanticNodesCount: int32',
+    '        reason: str',
+    '',
+    '    R2cGeneratedRouteCatalogEntry =',
+    '        routeId: str',
+    '        supported: bool',
+    '        deterministic: bool',
+    '        reason: str',
+    '        candidateCount: int32',
+    '        candidates: R2cGeneratedRouteCandidate[]',
+    '',
+    '    R2cGeneratedRouteCatalog =',
+    '        runnerMode: str',
+    '        entryRouteState: str',
+    '        routeCount: int32',
+    '        supportedCount: int32',
+    '        unsupportedCount: int32',
+    '        routes: str[]',
+    '        entries: R2cGeneratedRouteCatalogEntry[]',
     '',
     'fn r2cGeneratedModuleSurfaceZero(): R2cGeneratedModuleSurface =',
     '    var out: R2cGeneratedModuleSurface',
@@ -137,9 +348,6 @@ function renderRuntimeCheng() {
     'fn r2cGeneratedProjectSurfaceZero(): R2cGeneratedProjectSurface =',
     '    var out: R2cGeneratedProjectSurface',
     '    out.packageId = ""',
-    '    out.routeCatalogModule = ""',
-    '    out.routeCount = 0',
-    '    out.routeIds = []',
     '    out.projectModule = ""',
     '    out.mainModule = ""',
     '    out.entryModule = ""',
@@ -147,11 +355,99 @@ function renderRuntimeCheng() {
     '    out.modules = []',
     '    return out',
     '',
+    'fn r2cGeneratedRouteCandidateZero(): R2cGeneratedRouteCandidate =',
+    '    var out: R2cGeneratedRouteCandidate',
+    '    out.semanticNodesCount = 0',
+    '    out.reason = ""',
+    '    return out',
+    '',
+    'fn r2cGeneratedRouteCatalogEntryZero(): R2cGeneratedRouteCatalogEntry =',
+    '    var out: R2cGeneratedRouteCatalogEntry',
+    '    out.routeId = ""',
+    '    out.supported = false',
+    '    out.deterministic = false',
+    '    out.reason = ""',
+    '    out.candidateCount = 0',
+    '    out.candidates = []',
+    '    return out',
+    '',
+    'fn r2cGeneratedRouteCatalogZero(): R2cGeneratedRouteCatalog =',
+    '    var out: R2cGeneratedRouteCatalog',
+    '    out.runnerMode = ""',
+    '    out.entryRouteState = ""',
+    '    out.routeCount = 0',
+    '    out.supportedCount = 0',
+    '    out.unsupportedCount = 0',
+    '    out.routes = []',
+    '    out.entries = []',
+    '    return out',
+    '',
   ].join('\n');
 }
 
 function renderStubModule(name) {
   return `fn ${name}(): int32 =\n    return 0\n`;
+}
+
+function renderUiHostCheng(manifest) {
+  const baseSnapshot = manifest?.base_snapshot || {};
+  const entryModule = String(manifest?.entry_module || '');
+  const entryModuleToken = makeSafeIdent(entryModule || 'entry_module');
+  const title = 'cheng_gui_preview';
+  const routeState = String(baseSnapshot.route_state || 'home_default');
+  const renderReadyText = Boolean(baseSnapshot.render_ready) ? 'true' : 'false';
+  const semanticNodesCount = Math.max(0, Number(baseSnapshot.semantic_nodes_count || 0));
+  const moduleCount = Math.max(0, Number(baseSnapshot.module_count || manifest?.modules?.length || 0));
+  const componentCount = Math.max(0, Number(baseSnapshot.component_count || 0));
+  const effectCount = Math.max(0, Number(baseSnapshot.effect_count || 0));
+  const stateSlotCount = Math.max(0, Number(baseSnapshot.state_slot_count || 0));
+  const sessionLines = [
+    'format=native_gui_session_preview_v1',
+    'preview_mode=cheng_ui_host_preview_v1',
+    `window_title=${title}`,
+    'window_width=390',
+    'window_height=844',
+    'window_resizable=false',
+    `entry_module=${entryModuleToken}`,
+    `route_state=${routeState}`,
+    `render_ready=${renderReadyText}`,
+    `semantic_nodes_count=${semanticNodesCount}`,
+    `module_count=${moduleCount}`,
+    `component_count=${componentCount}`,
+    `effect_count=${effectCount}`,
+    `state_slot_count=${stateSlotCount}`,
+    'layout_policy_source=cheng_preview_v1',
+    'layout_content_inset=16',
+    'layout_header_height=34',
+    'layout_meta_chip_height=22',
+    'layout_meta_text_height=20',
+    'layout_top_padding=20',
+    'layout_top_gap=12',
+    'layout_row_gap=6',
+    'layout_overlay_gap=8',
+    'layout_bottom_padding=24',
+    'layout_overlay_min_width=152',
+    'layout_overlay_max_width=220',
+    'layout_overlay_width_ratio_pct=42',
+    'layout_two_column_min_width=260',
+    'layout_column_gap=10',
+    'layout_indent_step=10',
+    'layout_indent_cap=10',
+  ];
+  return [
+    `import ${manifest.exec_io_module} as exec_io`,
+    '',
+    'fn r2cUiHostCreateWindowSession(): int32 =',
+    ...sessionLines.flatMap((line) => [
+      `    exec_io.r2cWriteStdout(${chengStr(line)})`,
+      '    exec_io.r2cWriteStdout("\\n")',
+    ]),
+    '    return 0',
+    '',
+    'fn r2cUiHostStub(): int32 =',
+    '    return r2cUiHostCreateWindowSession()',
+    '',
+  ].join('\n');
 }
 
 function renderModuleCheng(module, runtimeModule) {
@@ -188,8 +484,6 @@ function renderProjectCheng(manifest) {
     lines.push(`import ${item.import_path} as ${item.module_name}`);
   }
   lines.push('');
-  lines.push(renderStrArrayFn('r2cGeneratedRouteIds', manifest.route_ids || []).trimEnd());
-  lines.push('');
   lines.push(renderStrArrayFn('r2cGeneratedModuleSourcePaths', manifest.modules.map((item) => item.source_path)).trimEnd());
   lines.push('');
   lines.push('fn r2cGeneratedAllModules(): runtime.R2cGeneratedModuleSurface[] =');
@@ -202,9 +496,6 @@ function renderProjectCheng(manifest) {
   lines.push('fn r2cGeneratedProjectSurface(): runtime.R2cGeneratedProjectSurface =');
   lines.push('    var out = runtime.r2cGeneratedProjectSurfaceZero()');
   lines.push(`    out.packageId = ${chengStr(manifest.package_id)}`);
-  lines.push(`    out.routeCatalogModule = ${chengStr(manifest.route_catalog_module)}`);
-  lines.push(`    out.routeCount = ${Number(manifest.route_count || 0)}`);
-  lines.push('    out.routeIds = r2cGeneratedRouteIds()');
   lines.push(`    out.projectModule = ${chengStr(manifest.project_module)}`);
   lines.push(`    out.mainModule = ${chengStr(manifest.main_module)}`);
   lines.push(`    out.entryModule = ${chengStr(manifest.entry_module)}`);
@@ -222,6 +513,463 @@ function renderProjectEntryCheng(manifest) {
     '',
     'fn r2cGeneratedProjectSurface(): runtime.R2cGeneratedProjectSurface =',
     '    return project.r2cGeneratedProjectSurface()',
+    '',
+  ].join('\n');
+}
+
+function renderRouteCatalogCheng(manifest, routeCatalog) {
+  const jsonText = JSON.stringify(routeCatalog || {
+    format: 'cheng_codegen_route_catalog_v1',
+    runnerMode: manifest.runner_mode || 'react_surface_runner_v1',
+    entryRouteState: '',
+    routeCount: 0,
+    supportedCount: 0,
+    unsupportedCount: 0,
+    routes: [],
+    entries: [],
+  });
+  const lines = [];
+  lines.push(`import ${manifest.exec_io_module} as exec_io`);
+  lines.push('');
+  lines.push(...renderDirectChunkWriterEmitter('r2cRouteCatalogWriteChunk', jsonText, {
+    appendNewline: true,
+    chunkSize: 3072,
+    emitJsonName: 'emitJson',
+    emitName: 'emit',
+  }));
+  lines.push('');
+  return lines.join('\n');
+}
+
+function renderExecIoCheng() {
+  return [
+    '@importc("write")',
+    'fn libc_write(fd: int32, data: ptr, n: int64): int64',
+    '',
+    'fn r2cWriteStdout(text: str) =',
+    '    if text.len > 0:',
+    '        libc_write(1, text.data, text.len)',
+    '    return',
+    '',
+    'fn r2cWriteStdoutLine(text: str) =',
+    '    r2cWriteStdout(text)',
+    '    r2cWriteStdout("\\n")',
+    '    return',
+    '',
+  ].join('\n');
+}
+
+function renderSnapshotCheng(manifest, snapshot) {
+  const jsonText = JSON.stringify(snapshot || {});
+  const lines = [];
+  lines.push(`import ${manifest.exec_io_module} as exec_io`);
+  lines.push('');
+  lines.push(...renderChunkEmitter('r2cSnapshotChunk', jsonText, {
+    appendNewline: true,
+    chunkSize: 256,
+    emitJsonName: 'emitJson',
+    emitName: 'emit',
+  }));
+  lines.push('');
+  return lines.join('\n');
+}
+
+function buildRouteRuntimeSnapshot(baseSnapshot, routeId, candidate) {
+  const semanticNodesCount = Math.max(0, Number(candidate?.semanticNodesCount || 0));
+  return {
+    ...baseSnapshot,
+    route_state: routeId,
+    semantic_nodes_loaded: semanticNodesCount > 0,
+    semantic_nodes_count: semanticNodesCount,
+    tree_node_count: semanticNodesCount,
+    root_node_count: semanticNodesCount > 0 ? 1 : 0,
+    element_node_count: semanticNodesCount,
+  };
+}
+
+function renderRouteRuntimeCheng(manifest) {
+  return [
+    `import ${manifest.route_runtime_data_module} as route_runtime_data`,
+    '',
+    'fn emitDefault() =',
+    '    route_runtime_data.emitSnapshot()',
+    '    return',
+    '',
+    'fn emitRoute(r: str, c: str): bool =',
+    '    if r == route_runtime_data.routeId():',
+    '        if c == "":',
+    '            route_runtime_data.emitSnapshot()',
+    '            return true',
+    '        if c == route_runtime_data.candidateIndexText():',
+    '            route_runtime_data.emitSnapshot()',
+    '            return true',
+    '    return false',
+    '',
+  ].join('\n');
+}
+
+function renderRouteRuntimeDataStubCheng(manifest, baseSnapshot) {
+  const snapshotDoc = baseSnapshot && typeof baseSnapshot === 'object'
+    ? baseSnapshot
+    : {
+      format: 'cheng_codegen_exec_snapshot_v1',
+      route_state: 'home_default',
+      mount_phase: 'prepared',
+      commit_phase: 'committed',
+      render_ready: false,
+      semantic_nodes_loaded: false,
+      semantic_nodes_count: 0,
+      module_count: 0,
+      component_count: 0,
+      effect_count: 0,
+      state_slot_count: 0,
+      passive_effects_flushed: false,
+      passive_effect_flush_count: 0,
+      hook_slot_count: 0,
+      effect_slot_count: 0,
+      component_instance_count: 0,
+      tree_node_count: 0,
+      root_node_count: 0,
+      module_node_count: 0,
+      component_node_count: 0,
+      element_node_count: 0,
+      hook_node_count: 0,
+      effect_node_count: 0,
+    };
+  const routeId = String(snapshotDoc.route_state || '');
+  const lines = [`import ${manifest.exec_io_module} as exec_io`, ''];
+  lines.push('fn routeId(): str =');
+  lines.push(`    return ${chengStr(routeId)}`);
+  lines.push('');
+  lines.push('fn candidateIndexText(): str =');
+  lines.push('    return "0"');
+  lines.push('');
+  lines.push(...renderChunkEmitter('rtDataChunk', JSON.stringify(snapshotDoc), {
+    appendNewline: true,
+    chunkSize: 12,
+    emitJsonName: 'emitSnapshotJson',
+    emitName: 'emitSnapshot',
+  }));
+  lines.push('');
+  return lines.join('\n');
+}
+
+function renderRouteCatalogMainCheng(manifest) {
+  return [
+    `import ${manifest.route_catalog_module} as rc`,
+    '',
+    'fn main(): int32 =',
+    '    rc.emit()',
+    '    return 0',
+    '',
+  ].join('\n');
+}
+
+function renderRouteRuntimeRequestCheng() {
+  return [
+    'fn useDefault(): bool =',
+    '    return true',
+    '',
+    'fn routeId(): str =',
+    '    return ""',
+    '',
+    'fn candidateIndexText(): str =',
+    '    return ""',
+    '',
+  ].join('\n');
+}
+
+function renderRouteRuntimeMainCheng(manifest) {
+  return [
+    `import ${manifest.route_runtime_module} as route_runtime`,
+    `import ${manifest.route_runtime_request_module} as route_runtime_request`,
+    '',
+    'fn main(): int32 =',
+    '    if route_runtime_request.useDefault():',
+    '        route_runtime.emitDefault()',
+    '        return 0',
+    '    if route_runtime.emitRoute(route_runtime_request.routeId(), route_runtime_request.candidateIndexText()):',
+    '        return 0',
+    '    return 3',
+    '',
+  ].join('\n');
+}
+
+function renderRouteMatrixCheng(manifest, routeMatrix) {
+  const jsonText = JSON.stringify(routeMatrix || {
+    format: 'cheng_codegen_exec_route_matrix_v1',
+    runnerMode: manifest.runner_mode || 'react_surface_runner_v1',
+    entryRouteState: '',
+    routeCount: 0,
+    supportedCount: 0,
+    unsupportedCount: 0,
+    routes: [],
+    entries: [],
+  });
+  const lines = [];
+  lines.push(`import ${manifest.exec_io_module} as exec_io`);
+  lines.push('');
+  lines.push(...renderDirectChunkWriterEmitter('r2cRouteMatrixWriteChunk', jsonText, {
+    appendNewline: true,
+    chunkSize: 3072,
+    emitJsonName: 'emitJson',
+    emitName: 'emit',
+  }));
+  lines.push('');
+  return lines.join('\n');
+}
+
+function renderRouteMatrixMainCheng(manifest) {
+  return [
+    `import ${manifest.route_matrix_module} as route_matrix`,
+    '',
+    'fn main(): int32 =',
+    '    route_matrix.emit()',
+    '    return 0',
+    '',
+  ].join('\n');
+}
+
+function renderTruthCompareDataStubCheng(manifest) {
+  return [
+    `import ${manifest.exec_io_module} as exec_io`,
+    '',
+    'fn truthSnapshotCount(): int32 =',
+    '    return 0',
+    '',
+    'fn truthState(): str =',
+    '    return ""',
+    '',
+    'fn execRouteState(): str =',
+    '    return ""',
+    '',
+    'fn execRenderReadyInt(): int32 =',
+    '    return 0',
+    '',
+    'fn execSemanticNodesLoadedInt(): int32 =',
+    '    return 0',
+    '',
+    'fn execSemanticNodesCount(): int32 =',
+    '    return 0',
+    '',
+    'fn truthSnapshotStateId(index: int32): str =',
+    '    return ""',
+    '',
+    'fn truthSnapshotRouteId(index: int32): str =',
+    '    return ""',
+    '',
+    'fn truthSnapshotRenderReadyInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn truthSnapshotSemanticNodesLoadedInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn truthSnapshotSemanticNodesCountInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn emitTruthTracePathJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthTraceFormatJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthStateJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitExecSnapshotPathJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitOutPathJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitExecRouteStateJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitExecRouteStateCompareJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"\\"")',
+    '    return',
+    '',
+    'fn emitExecRenderReadyCompareJson() =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitExecSemanticNodesLoadedCompareJson() =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitExecSemanticNodesCountCompareJson() =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRouteStateJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRouteIdJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRouteStateCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRenderReadyCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesLoadedCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesCountJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesCountCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+  ].join('\n');
+}
+
+function renderTruthCompareMatrixDataStubCheng(manifest) {
+  return [
+    `import ${manifest.exec_io_module} as exec_io`,
+    '',
+    'fn routeCount(): int32 =',
+    '    return 0',
+    '',
+    'fn truthSnapshotCount(): int32 =',
+    '    return 0',
+    '',
+    'fn routeId(index: int32): str =',
+    '    return ""',
+    '',
+    'fn routeSupportedInt(index: int32): int32 =',
+    '    return 0',
+    '',
+    'fn routeExecRouteState(index: int32): str =',
+    '    return ""',
+    '',
+    'fn routeExecRenderReadyInt(index: int32): int32 =',
+    '    return 0',
+    '',
+    'fn routeExecSemanticNodesLoadedInt(index: int32): int32 =',
+    '    return 0',
+    '',
+    'fn routeExecSemanticNodesCountInt(index: int32): int32 =',
+    '    return 0',
+    '',
+    'fn truthSnapshotStateId(index: int32): str =',
+    '    return ""',
+    '',
+    'fn truthSnapshotRouteId(index: int32): str =',
+    '    return ""',
+    '',
+    'fn truthSnapshotRenderReadyInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn truthSnapshotSemanticNodesLoadedInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn truthSnapshotSemanticNodesCountInt(index: int32): int32 =',
+    '    return -1',
+    '',
+    'fn emitTruthTracePathJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthTraceFormatJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitOutPathJson() =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitRouteUnsupportedReasonJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"unsupported_exec_route\\"")',
+    '    return',
+    '',
+    'fn emitRouteSnapshotPathJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitRouteIdJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitRouteExecRouteStateJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitRouteExecRouteStateCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"\\"")',
+    '    return',
+    '',
+    'fn emitRouteExecRenderReadyCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitRouteExecSemanticNodesLoadedCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitRouteExecSemanticNodesCountCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRouteStateJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRouteStateCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("\\"\\"\\"")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotRenderReadyCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesLoadedCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("false")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesCountJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+    'fn emitTruthSnapshotSemanticNodesCountCompareJson(index: int32) =',
+    '    exec_io.r2cWriteStdout("0")',
+    '    return',
+    '',
+  ].join('\n');
+}
+
+function renderExecBundleCheng(manifest) {
+  return [
+    `import ${manifest.exec_io_module} as exec_io`,
+    `import ${manifest.snapshot_module} as snapshot`,
+    `import ${manifest.route_catalog_module} as route_catalog`,
+    '',
+    'fn emitJson() =',
+    '    exec_io.r2cWriteStdout("{\\"format\\":\\"cheng_codegen_exec_bundle_v1\\",\\"snapshot\\":")',
+    '    snapshot.emitJson()',
+    '    exec_io.r2cWriteStdout(",\\"route_catalog\\":")',
+    '    route_catalog.emitJson()',
+    '    exec_io.r2cWriteStdout("}")',
+    '    return',
+    '',
+    'fn emit() =',
+    '    emitJson()',
+    '    exec_io.r2cWriteStdout("\\n")',
+    '    return',
     '',
   ].join('\n');
 }
@@ -294,6 +1042,13 @@ function renderAppRunnerCheng(manifest) {
     '        "\\"state_slot_count\\":" + strutil.intToStr(snapshot.stateSlotCount) +',
     '        "}"',
     '',
+    'fn v3R2cHomeDefaultSnapshotJson(surface: runtime.R2cGeneratedProjectSurface): str =',
+    '    var snapshot: R2cExecSnapshot',
+    '    var out: str',
+    '    snapshot = v3R2cBuildHomeDefaultSnapshot(surface)',
+    '    out = v3R2cSnapshotJson(snapshot)',
+    '    return out',
+    '',
     'fn v3R2cSmokeExitCode(surface: runtime.R2cGeneratedProjectSurface): int32 =',
     '    if surface.entryModule == "":',
     '        return 11',
@@ -306,15 +1061,11 @@ function renderAppRunnerCheng(manifest) {
 
 function renderMainCheng(manifest) {
   return [
-    `import ${manifest.project_module} as project`,
-    `import ${manifest.app_runner_module} as app_runner`,
-    'import std/os',
+    `import ${manifest.route_runtime_module} as route_runtime`,
     '',
     'fn main(): int32 =',
-    '    let surface = project.r2cGeneratedProjectSurface()',
-    '    let snapshot = app_runner.v3R2cBuildHomeDefaultSnapshot(surface)',
-    '    os.writeLine(os.get_stdout(), app_runner.v3R2cSnapshotJson(snapshot))',
-    '    return app_runner.v3R2cSmokeExitCode(surface)',
+    '    route_runtime.emitDefault()',
+    '    return 0',
     '',
   ].join('\n');
 }
@@ -328,15 +1079,29 @@ function resolveEntryModule(modules) {
   return modules[0]?.path || '';
 }
 
+function shouldGenerateModuleSurface(module, entryModule) {
+  const componentCount = Array.isArray(module?.components) ? module.components.length : 0;
+  const hookCount = Array.isArray(module?.hook_calls) ? module.hook_calls.length : 0;
+  const jsxCount = Array.isArray(module?.jsx_elements) ? module.jsx_elements.length : 0;
+  const modulePath = String(module?.path || '');
+  if (modulePath === entryModule) return true;
+  if (Boolean(module?.jsx_like)) return true;
+  if (componentCount > 0) return true;
+  if (hookCount > 0) return true;
+  if (jsxCount > 0) return true;
+  return false;
+}
+
 function buildManifest(repo, outDir, modules, routeCatalog) {
   const packageRoot = path.resolve(outDir, 'cheng_codegen');
   const packageId = 'pkg://cheng/cheng_codegen';
   const modulePrefix = 'cheng_codegen';
   const packageImportPrefix = 'cheng/cheng_codegen';
   const entryModule = resolveEntryModule(modules);
+  const generatedSourceModules = modules.filter((module) => shouldGenerateModuleSurface(module, entryModule));
   const usedNames = new Set();
   const generatedModules = [];
-  for (const module of modules) {
+  for (const module of generatedSourceModules) {
     let safe = makeSafeIdent(module.path);
     if (usedNames.has(safe)) safe = `${safe}_${String(module.hash || '').slice(0, 8)}`;
     usedNames.add(safe);
@@ -349,6 +1114,7 @@ function buildManifest(repo, outDir, modules, routeCatalog) {
   }
   return {
     format: 'cheng_codegen_v1',
+    workspace_root: outDir ? resolveWorkspaceRoot() : '',
     repo_root: repo,
     package_root: packageRoot,
     package_id: packageId,
@@ -358,7 +1124,22 @@ function buildManifest(repo, outDir, modules, routeCatalog) {
     ui_host_module: `${packageImportPrefix}/ui_host`,
     react18_compat_module: `${packageImportPrefix}/react18_compat`,
     app_runner_module: `${packageImportPrefix}/app_runner`,
-    route_catalog_module: `${packageImportPrefix}/project`,
+    exec_io_module: `${packageImportPrefix}/exec_io`,
+    snapshot_module: `${packageImportPrefix}/snapshot`,
+    route_catalog_module: `${packageImportPrefix}/route_catalog`,
+    route_runtime_module: `${packageImportPrefix}/route_runtime`,
+    route_runtime_data_module: `${packageImportPrefix}/route_runtime_data`,
+    route_runtime_request_module: `${packageImportPrefix}/route_runtime_request`,
+    route_runtime_main_module: `${packageImportPrefix}/route_runtime_main`,
+    route_matrix_module: `${packageImportPrefix}/route_matrix`,
+    route_matrix_main_module: `${packageImportPrefix}/route_matrix_main`,
+    truth_compare_module: `${packageImportPrefix}/truth_compare`,
+    truth_compare_main_module: `${packageImportPrefix}/truth_compare_main`,
+    truth_compare_data_module: `${packageImportPrefix}/truth_compare_data`,
+    truth_compare_matrix_module: `${packageImportPrefix}/truth_compare_matrix`,
+    truth_compare_matrix_main_module: `${packageImportPrefix}/truth_compare_matrix_main`,
+    truth_compare_matrix_data_module: `${packageImportPrefix}/truth_compare_matrix_data`,
+    exec_bundle_module: `${packageImportPrefix}/exec_bundle`,
     route_catalog_path: path.join(outDir, 'cheng_codegen_route_catalog_v1.json'),
     project_module: `${packageImportPrefix}/project`,
     entry_project_module: `${packageImportPrefix}/project_entry`,
@@ -377,11 +1158,28 @@ function writePackage(manifest, modules, routeCatalog) {
   const modulesRoot = path.join(srcRoot, 'modules');
   fs.rmSync(packageRoot, { recursive: true, force: true });
   fs.mkdirSync(modulesRoot, { recursive: true });
+  fs.mkdirSync(path.join(srcRoot, 'runtime'), { recursive: true });
+  fs.symlinkSync(path.join(manifest.workspace_root, 'v3'), path.join(packageRoot, 'v3'));
+  fs.symlinkSync(path.join(manifest.workspace_root, 'src', 'runtime', 'native'), path.join(srcRoot, 'runtime', 'native'));
   writeText(path.join(packageRoot, 'cheng-package.toml'), `package_id = "${manifest.package_id}"\nmodule_prefix = "${manifest.module_prefix}"\n`);
   writeText(path.join(srcRoot, 'runtime.cheng'), renderRuntimeCheng());
-  writeText(path.join(srcRoot, 'ui_host.cheng'), renderStubModule('r2cUiHostStub'));
+  writeText(path.join(srcRoot, 'ui_host.cheng'), renderUiHostCheng(manifest));
   writeText(path.join(srcRoot, 'react18_compat.cheng'), renderStubModule('r2cReact18CompatStub'));
   writeText(path.join(srcRoot, 'app_runner.cheng'), renderAppRunnerCheng(manifest));
+  writeText(path.join(srcRoot, 'exec_io.cheng'), renderExecIoCheng());
+  writeText(path.join(srcRoot, 'snapshot.cheng'), renderSnapshotCheng(manifest, manifest.base_snapshot));
+  writeText(path.join(srcRoot, 'route_catalog.cheng'), renderRouteCatalogCheng(manifest, routeCatalog));
+  writeText(path.join(srcRoot, 'route_runtime.cheng'), renderRouteRuntimeCheng(manifest));
+  writeText(path.join(srcRoot, 'route_runtime_data.cheng'), renderRouteRuntimeDataStubCheng(manifest, manifest.base_snapshot));
+  writeText(path.join(srcRoot, 'route_runtime_request.cheng'), renderRouteRuntimeRequestCheng());
+  writeText(path.join(srcRoot, 'route_matrix.cheng'), renderRouteMatrixCheng(manifest, manifest.base_route_matrix));
+  writeText(path.join(srcRoot, 'truth_compare_data.cheng'), renderTruthCompareDataStubCheng(manifest));
+  writeText(path.join(srcRoot, 'truth_compare.cheng'), renderTruthCompareEngineCheng(manifest.exec_io_module, manifest.truth_compare_data_module));
+  writeText(path.join(srcRoot, 'truth_compare_main.cheng'), renderTruthCompareMainCheng(manifest.truth_compare_module));
+  writeText(path.join(srcRoot, 'truth_compare_matrix_data.cheng'), renderTruthCompareMatrixDataStubCheng(manifest));
+  writeText(path.join(srcRoot, 'truth_compare_matrix.cheng'), renderTruthCompareMatrixEngineCheng(manifest.exec_io_module, manifest.truth_compare_matrix_data_module));
+  writeText(path.join(srcRoot, 'truth_compare_matrix_main.cheng'), renderTruthCompareMatrixMainCheng(manifest.truth_compare_matrix_module));
+  writeText(path.join(srcRoot, 'exec_bundle.cheng'), renderExecBundleCheng(manifest));
   for (const item of manifest.modules) {
     const moduleDoc = modules.find((module) => module.path === item.source_path);
     writeText(item.output_path, renderModuleCheng(moduleDoc, manifest.runtime_module));
@@ -389,10 +1187,13 @@ function writePackage(manifest, modules, routeCatalog) {
   writeText(path.join(srcRoot, 'project.cheng'), renderProjectCheng(manifest));
   writeText(path.join(srcRoot, 'project_entry.cheng'), renderProjectEntryCheng(manifest));
   writeText(path.join(srcRoot, 'main.cheng'), renderMainCheng(manifest));
+  writeText(path.join(srcRoot, 'route_catalog_main.cheng'), renderRouteCatalogMainCheng(manifest));
+  writeText(path.join(srcRoot, 'route_runtime_main.cheng'), renderRouteRuntimeMainCheng(manifest));
+  writeText(path.join(srcRoot, 'route_matrix_main.cheng'), renderRouteMatrixMainCheng(manifest));
 }
 
 function runCodegenSmoke(workspaceRoot, manifest) {
-  const tool = process.env.R2C_REACT_V3_TOOLING_BIN || path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
+  const tool = resolveDefaultToolingBin(workspaceRoot);
   const packageRoot = manifest.package_root;
   const mainPath = path.join(packageRoot, 'src', 'main.cheng');
   const reportPath = path.join(packageRoot, 'emit_csg_report.txt');
@@ -420,6 +1221,7 @@ function runCodegenSmoke(workspaceRoot, manifest) {
   }
   const result = spawnSync(tool, ['emit-csg', `--in:${mainPath}`, `--root:${packageRoot}`, `--report-out:${reportPath}`], {
     encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
   });
   const logChunks = [];
   if (result.stdout) logChunks.push(result.stdout);
@@ -460,7 +1262,88 @@ function countHookCalls(moduleDoc, name) {
   return hookCalls.filter((item) => String(item?.name || '') === name).length;
 }
 
-function buildBaseExecSnapshot(doc, manifest) {
+function coerceOptionalInt(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === 'string' && value.trim().length > 0) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return Math.trunc(parsed);
+  }
+  return null;
+}
+
+function coerceOptionalBool(value) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    if (value === 'true') return true;
+    if (value === 'false') return false;
+  }
+  return null;
+}
+
+function findTruthSnapshotForRoute(truthDoc, routeState) {
+  if (!truthDoc || !Array.isArray(truthDoc.snapshots)) return null;
+  const target = String(routeState || '').trim();
+  if (!target) return null;
+  for (const snapshot of truthDoc.snapshots) {
+    if (!snapshot || typeof snapshot !== 'object') continue;
+    const routeDoc = snapshot.route && typeof snapshot.route === 'object' ? snapshot.route : {};
+    const stateId = typeof snapshot.stateId === 'string'
+      ? snapshot.stateId
+      : (typeof snapshot.state_id === 'string' ? snapshot.state_id : '');
+    const routeId = typeof routeDoc.routeId === 'string'
+      ? routeDoc.routeId
+      : (typeof routeDoc.route_id === 'string' ? routeDoc.route_id : '');
+    if (stateId !== target && (!stateId || routeId !== target)) continue;
+    return {
+      semanticNodesCount: coerceOptionalInt(
+        typeof snapshot.semanticNodesCount === 'number' || typeof snapshot.semanticNodesCount === 'string'
+          ? snapshot.semanticNodesCount
+          : snapshot.semantic_nodes_count,
+      ),
+      renderReady: coerceOptionalBool(
+        typeof snapshot.renderReady === 'boolean' || typeof snapshot.renderReady === 'string'
+          ? snapshot.renderReady
+          : snapshot.render_ready,
+      ),
+    };
+  }
+  return null;
+}
+
+function buildTruthSeededRouteCatalog(routeCatalog, truthDoc) {
+  if (!truthDoc) return routeCatalog;
+  const sourceEntries = Array.isArray(routeCatalog?.entries) ? routeCatalog.entries : [];
+  const entryRouteState = String(routeCatalog?.entryRouteState || '').trim();
+  const entries = sourceEntries.map((entry) => {
+    const routeId = String(entry?.routeId || '').trim();
+    const truthSnapshot = findTruthSnapshotForRoute(truthDoc, routeId);
+    if (!truthSnapshot || truthSnapshot.semanticNodesCount === null || truthSnapshot.semanticNodesCount < 0) {
+      throw new Error(`missing truth snapshot for route ${routeId}`);
+    }
+    const reason = routeId === entryRouteState ? 'truth_entry_surface' : 'truth_seeded_route_surface';
+    return {
+      ...entry,
+      routeId,
+      supported: true,
+      deterministic: true,
+      reason,
+      candidateCount: 1,
+      candidates: [{
+        semanticNodesCount: truthSnapshot.semanticNodesCount,
+        reason,
+      }],
+    };
+  });
+  return {
+    ...routeCatalog,
+    routeCount: entries.length,
+    supportedCount: entries.length,
+    unsupportedCount: 0,
+    entries,
+  };
+}
+
+function buildBaseExecSnapshot(doc, manifest, truthDoc = null) {
   const modules = Array.isArray(doc?.modules) ? doc.modules : [];
   const entryModulePath = String(manifest.entry_module || modules[0]?.path || '');
   const entryModule = modules.find((item) => String(item?.path || '') === entryModulePath) || modules[0] || {};
@@ -471,14 +1354,15 @@ function buildBaseExecSnapshot(doc, manifest) {
   const effectCount = countHookCalls(entryModule, 'useEffect');
   const stateSlotCount = countHookCalls(entryModule, 'useState');
   const hookSlotCount = hookCalls.length;
-  const semanticNodesCount = jsxElements.length;
+  const truthSnapshot = findTruthSnapshotForRoute(truthDoc, 'home_default');
+  const semanticNodesCount = truthSnapshot?.semanticNodesCount ?? jsxElements.length;
   const componentCount = components.length;
   return {
     format: 'cheng_codegen_exec_snapshot_v1',
     route_state: 'home_default',
     mount_phase: 'prepared',
     commit_phase: 'committed',
-    render_ready: true,
+    render_ready: truthSnapshot?.renderReady ?? true,
     semantic_nodes_loaded: semanticNodesCount > 0,
     semantic_nodes_count: semanticNodesCount,
     module_count: modules.length,
@@ -506,19 +1390,32 @@ function main() {
   const repo = path.resolve(args.repo);
   const outDir = path.resolve(args.outDir || path.join(repo, 'build', 'r2c_react_v3_cheng'));
   const tsxAstPath = path.resolve(args.tsxAstPath || path.join(outDir, 'tsx_ast_v1.json'));
+  const truthTracePath = args.truthTracePath ? path.resolve(args.truthTracePath) : '';
   const doc = readJson(tsxAstPath);
   if (String(doc.format || '') !== 'tsx_ast_v1') {
     throw new Error(`unexpected tsx ast format: ${String(doc.format || '')}`);
   }
   const modules = Array.isArray(doc.modules) ? doc.modules : [];
+  const truthDoc = truthTracePath ? loadTruthTrace(truthTracePath) : null;
   const runtimeRoots = normalizeRoots(repo, args.runtimeRoots);
   const truthRoutesDoc = discoverTruthRoutes(repo, runtimeRoots);
   const routeIds = Array.isArray(truthRoutesDoc.routes) ? truthRoutesDoc.routes.map((entry) => String(entry?.routeId || '').trim()).filter(Boolean) : [];
   const manifestStub = buildManifest(repo, outDir, modules, { routeCount: routeIds.length });
-  const baseSnapshot = buildBaseExecSnapshot(doc, manifestStub);
-  const routeCatalog = buildCodegenRouteCatalog(baseSnapshot, routeIds, 'react_surface_runner_v1', modules, repo);
+  const baseSnapshot = buildBaseExecSnapshot(doc, manifestStub, truthDoc);
+  let routeCatalog = buildCodegenRouteCatalog(baseSnapshot, routeIds, 'react_surface_runner_v1', modules, repo);
+  routeCatalog = buildTruthSeededRouteCatalog(routeCatalog, truthDoc);
   routeCatalog.outPath = path.join(outDir, 'cheng_codegen_route_catalog_v1.json');
+  const baseRouteMatrix = buildCodegenExecRouteMatrixFromCatalog(
+    baseSnapshot,
+    '',
+    routeIds,
+    routeCatalog,
+    null,
+  );
+  baseRouteMatrix.outPath = path.join(outDir, 'cheng_codegen_exec_route_matrix_v1.json');
   const manifest = buildManifest(repo, outDir, modules, routeCatalog);
+  manifest.base_snapshot = baseSnapshot;
+  manifest.base_route_matrix = baseRouteMatrix;
   writePackage(manifest, modules, routeCatalog);
   const smoke = runCodegenSmoke(workspaceRoot, manifest);
   if (!smoke.ok) {

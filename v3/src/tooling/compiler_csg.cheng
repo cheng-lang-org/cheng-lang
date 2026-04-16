@@ -350,12 +350,15 @@ fn v3CompilerCsgSourceModulePath(workspaceRoot: str,
 
 fn v3CompilerLegacyLineIndentAt(rawLine: str,
                                 stop: int32): str =
-    if stop >= len(rawLine):
+    let n = len(rawLine)
+    if stop >= n:
         return rawLine
-    let ch = rawLine[stop]
-    if ch != ' ' && ch != '\t':
-        return v3path.v3TextSlice(rawLine, 0, stop)
-    return v3CompilerLegacyLineIndentAt(rawLine, stop + 1)
+    for i in stop..<n:
+        let code = int32(rawLine[i])
+        if code == 32 || code == 9:
+            continue
+        return v3path.v3TextSlice(rawLine, 0, i)
+    return rawLine
 
 fn v3CompilerLegacyLineIndent(rawLine: str): str =
     return v3CompilerLegacyLineIndentAt(rawLine, 0)
@@ -367,17 +370,19 @@ fn v3CompilerLegacyFindMatchingBracket(text: str,
 fn v3CompilerLegacyFindMatchingBracketStep(text: str,
                                            index: int32,
                                            depth: int32): int32 =
-    if index >= len(text):
-        return -1
-    let ch = text[index]
-    if ch == '[':
-        return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, depth + 1)
-    if ch == ']':
-        let nextDepth = depth - 1
-        if nextDepth == 0:
-            return index
-        return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, nextDepth)
-    return v3CompilerLegacyFindMatchingBracketStep(text, index + 1, depth)
+    let n = len(text)
+    var currentDepth = depth
+    for i in index..<n:
+        let code = int32(text[i])
+        if code == 91:
+            currentDepth = currentDepth + 1
+            continue
+        if code == 93:
+            let nextDepth = currentDepth - 1
+            if nextDepth == 0:
+                return i
+            currentDepth = nextDepth
+    return -1
 
 fn v3CompilerLegacyTopLevelComma(text: str): int32 =
     return v3CompilerLegacyTopLevelCommaStep(text, 0, 0)
@@ -385,17 +390,19 @@ fn v3CompilerLegacyTopLevelComma(text: str): int32 =
 fn v3CompilerLegacyTopLevelCommaStep(text: str,
                                      index: int32,
                                      depth: int32): int32 =
-    if index >= len(text):
-        return -1
-    let ch = text[index]
-    if ch == '[':
-        return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth + 1)
-    if ch == ']':
-        return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth - 1)
-    if ch == ',':
-        if depth == 0:
-            return index
-    return v3CompilerLegacyTopLevelCommaStep(text, index + 1, depth)
+    let n = len(text)
+    var currentDepth = depth
+    for i in index..<n:
+        let code = int32(text[i])
+        if code == 91:
+            currentDepth = currentDepth + 1
+            continue
+        if code == 93:
+            currentDepth = currentDepth - 1
+            continue
+        if code == 44 && currentDepth == 0:
+            return i
+    return -1
 
 fn v3CompilerLegacyRewriteSeqTypes(textRaw: str,
                                    outAppliedCount: var int32): str =
@@ -1288,18 +1295,22 @@ fn v3CompileReceiptFromReportText(text: str,
     if IsErr(csgRes):
         return Err[bool]("v3 compiler csg: invalid compiler_csg_cid")
     let canonicalCsgRaw = v3CompilerWorldLineValue(text, "canonical_compiler_csg_cid")
-    let canonicalCsgRes = len(canonicalCsgRaw) > 0 ?
-        layout.fixedBytes32FromHex(canonicalCsgRaw) :
-        layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "compiler_csg_cid"))
+    var canonicalCsgRes: Result[layout.FixedBytes32]
+    if len(canonicalCsgRaw) > 0:
+        canonicalCsgRes = layout.fixedBytes32FromHex(canonicalCsgRaw)
+    else:
+        canonicalCsgRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "compiler_csg_cid"))
     if IsErr(canonicalCsgRes):
         return Err[bool]("v3 compiler csg: invalid canonical_compiler_csg_cid")
     let digestRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "output_digest"))
     if IsErr(digestRes):
         return Err[bool]("v3 compiler csg: invalid output_digest")
     let canonicalDigestRaw = v3CompilerWorldLineValue(text, "canonical_output_digest")
-    let canonicalDigestRes = len(canonicalDigestRaw) > 0 ?
-        layout.fixedBytes32FromHex(canonicalDigestRaw) :
-        layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "output_digest"))
+    var canonicalDigestRes: Result[layout.FixedBytes32]
+    if len(canonicalDigestRaw) > 0:
+        canonicalDigestRes = layout.fixedBytes32FromHex(canonicalDigestRaw)
+    else:
+        canonicalDigestRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "output_digest"))
     if IsErr(canonicalDigestRes):
         return Err[bool]("v3 compiler csg: invalid canonical_output_digest")
     let receiptCidRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "receipt_cid"))

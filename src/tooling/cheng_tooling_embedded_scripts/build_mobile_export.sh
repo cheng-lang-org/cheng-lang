@@ -104,7 +104,7 @@ if [ "$name" = "" ]; then
   name="${base%.cheng}"
 fi
 
-root="$(cd "$(dirname "$0")/../.." && pwd)"
+root="$(cd "$(dirname "$0")/../../.." && pwd)"
 
 if [ "$out" = "" ]; then
   out="mobile_build/$name"
@@ -117,8 +117,12 @@ esac
 if [ "$mobile_root" = "" ]; then
   if [ -n "${MOBILE_ROOT:-}" ]; then
     mobile_root="$MOBILE_ROOT"
+  elif [ -d "$HOME/.cheng-packages/cheng-mobile/src" ]; then
+    mobile_root="$HOME/.cheng-packages/cheng-mobile/src"
   elif [ -d "$HOME/.cheng-packages/cheng-mobile" ]; then
     mobile_root="$HOME/.cheng-packages/cheng-mobile"
+  elif [ -d "$root/../cheng-mobile/src" ]; then
+    mobile_root="$root/../cheng-mobile/src"
   elif [ -d "$root/../cheng-mobile" ]; then
     mobile_root="$root/../cheng-mobile"
   fi
@@ -135,11 +139,15 @@ if [ "$with_android" -eq 0 ] && [ "$with_ios" -eq 0 ] && [ "$with_harmony" -eq 0
   with_harmony=1
 fi
 
-runtime_c="$root/src/runtime/native/system_helpers.c"
-runtime_h="$root/src/runtime/native/system_helpers.h"
+runtime_stub_c="$root/src/runtime/mobile/system_helpers_mobile_stub.c"
+runtime_stub_h="$root/src/runtime/mobile/system_helpers_mobile_stub.h"
 runtime_stb_image_h="$root/src/runtime/native/stb_image.h"
-if [ ! -f "$runtime_c" ] || [ ! -f "$runtime_h" ]; then
-  echo "[Error] runtime helpers not found under src/runtime/native" 1>&2
+runtime_sidecar_h="$root/src/runtime/native/cheng_sidecar_loader.h"
+runtime_twoway_h="$root/v3/runtime/native/v3_str_twoway_search.h"
+runtime_mobile_exports_c="$root/src/runtime/mobile/cheng_mobile_exports.c"
+runtime_mobile_exports_h="$root/src/runtime/mobile/cheng_mobile_exports.h"
+if [ ! -f "$runtime_stub_c" ] || [ ! -f "$runtime_stub_h" ]; then
+  echo "[Error] mobile runtime stub missing under src/runtime/mobile" 1>&2
   exit 2
 fi
 
@@ -283,8 +291,7 @@ copy_common_cpp_sources() {
   mkdir -p "$dst_cpp"
 
   cp "$app_c" "$dst_cpp/cheng_mobile_app.c"
-  cp "$runtime_c" "$dst_cpp/system_helpers.c"
-  cp "$runtime_h" "$dst_cpp/system_helpers.h"
+  copy_runtime_native_bundle "$dst_cpp"
   if [ -f "$runtime_stb_image_h" ]; then
     cp "$runtime_stb_image_h" "$dst_cpp/stb_image.h"
   fi
@@ -294,6 +301,25 @@ copy_common_cpp_sources() {
   cp "$mobile_root/bridge/cheng_mobile_host_api.h" "$dst_cpp/cheng_mobile_host_api.h"
   cp "$mobile_root/bridge/cheng_mobile_host_core.c" "$dst_cpp/cheng_mobile_host_core.c"
   cp "$mobile_root/bridge/cheng_mobile_host_core.h" "$dst_cpp/cheng_mobile_host_core.h"
+}
+
+copy_runtime_native_bundle() {
+  dst_dir="$1"
+  mkdir -p "$dst_dir"
+
+  cp "$runtime_stub_c" "$dst_dir/system_helpers.c"
+  cp "$runtime_stub_h" "$dst_dir/system_helpers.h"
+  [ -f "$runtime_sidecar_h" ] && cp "$runtime_sidecar_h" "$dst_dir/cheng_sidecar_loader.h"
+  [ -f "$runtime_twoway_h" ] && cp "$runtime_twoway_h" "$dst_dir/v3_str_twoway_search.h"
+
+  for dep in \
+    "$root/src/runtime/native/system_helpers_debug_entry.inc" \
+    "$root/src/runtime/native/system_helpers_debug_host_base.inc" \
+    "$root/src/runtime/native/system_helpers_debug_profile.inc" \
+    "$root/src/runtime/native/system_helpers_debug_state.inc" \
+    "$root/src/runtime/native/system_helpers_debug_trace.inc"; do
+    [ -f "$dep" ] && cp "$dep" "$dst_dir/$(basename "$dep")"
+  done
 }
 
 weave_plugins_android() {
@@ -403,6 +429,11 @@ if [ "$with_android" -eq 1 ]; then
   cp "$mobile_root/android/cheng_mobile_android_gl.h" "$android_cpp/cheng_mobile_android_gl.h"
   cp "$mobile_root/android/cheng_gui_native_android.c" "$android_cpp/cheng_gui_native_android.c"
   cp "$mobile_root/android/stb_truetype.h" "$android_cpp/stb_truetype.h"
+  [ -f "$runtime_mobile_exports_c" ] && cp "$runtime_mobile_exports_c" "$android_cpp/cheng_mobile_exports.c"
+  [ -f "$runtime_mobile_exports_h" ] && cp "$runtime_mobile_exports_h" "$android_cpp/cheng_mobile_exports.h"
+
+  mobile_bridge_override="src/tooling/mobile/cheng_mobile_bridge.h"
+  [ -f "$mobile_bridge_override" ] && cp "$mobile_bridge_override" "$android_cpp/cheng_mobile_bridge.h"
 
   # Optional Android host overrides from cheng-lang.
   mobile_android_override="src/tooling/mobile/android"
@@ -413,6 +444,7 @@ if [ "$with_android" -eq 1 ]; then
     kotlin_dst="$android_project/app/src/main/kotlin/com/cheng/mobile"
     mkdir -p "$kotlin_dst"
     [ -f "$mobile_android_override/ChengActivity.kt" ] && cp "$mobile_android_override/ChengActivity.kt" "$kotlin_dst/ChengActivity.kt"
+    [ -f "$mobile_android_override/ChengNative.kt" ] && cp "$mobile_android_override/ChengNative.kt" "$kotlin_dst/ChengNative.kt"
     [ -f "$mobile_android_override/ChengSurfaceView.kt" ] && cp "$mobile_android_override/ChengSurfaceView.kt" "$kotlin_dst/ChengSurfaceView.kt"
     [ -f "$mobile_android_override/AndroidHostServices.kt" ] && cp "$mobile_android_override/AndroidHostServices.kt" "$kotlin_dst/AndroidHostServices.kt"
   fi
@@ -439,10 +471,12 @@ if [ "$with_ios" -eq 1 ]; then
   cp "$mobile_root/ios/cheng_mobile_ios_glue.h" "$ios_src/cheng_mobile_ios_glue.h"
   cp "$mobile_root/ios/cheng_mobile_ios_glue.m" "$ios_src/cheng_mobile_ios_glue.m"
   cp "$mobile_root/ios/cheng_mobile_host_ios.m" "$ios_src/cheng_mobile_host_ios.m"
+  [ -f "$mobile_root/ios/ChengViewControllerSwift.swift" ] && cp "$mobile_root/ios/ChengViewControllerSwift.swift" "$ios_src/ChengViewControllerSwift.swift"
 
   cp "$app_c" "$ios_src/cheng_mobile_app.c"
-  cp "$runtime_c" "$ios_src/system_helpers.c"
-  cp "$runtime_h" "$ios_src/system_helpers.h"
+  copy_runtime_native_bundle "$ios_src"
+  [ -f "$runtime_mobile_exports_c" ] && cp "$runtime_mobile_exports_c" "$ios_src/cheng_mobile_exports.c"
+  [ -f "$runtime_mobile_exports_h" ] && cp "$runtime_mobile_exports_h" "$ios_src/cheng_mobile_exports.h"
   if [ -f "$runtime_stb_image_h" ]; then
     cp "$runtime_stb_image_h" "$ios_src/stb_image.h"
   fi
@@ -452,6 +486,28 @@ if [ "$with_ios" -eq 1 ]; then
   cp "$mobile_root/bridge/cheng_mobile_host_api.h" "$ios_src/cheng_mobile_host_api.h"
   cp "$mobile_root/bridge/cheng_mobile_host_core.c" "$ios_src/cheng_mobile_host_core.c"
   cp "$mobile_root/bridge/cheng_mobile_host_core.h" "$ios_src/cheng_mobile_host_core.h"
+
+  mobile_bridge_override="src/tooling/mobile/cheng_mobile_bridge.h"
+  [ -f "$mobile_bridge_override" ] && cp "$mobile_bridge_override" "$ios_src/cheng_mobile_bridge.h"
+
+  mobile_ios_override="src/tooling/mobile/ios"
+  if [ -d "$mobile_ios_override" ]; then
+    for name in ChengViewController.h ChengViewController.m ChengViewControllerSwift.swift cheng_mobile_ios_glue.h cheng_mobile_ios_glue.m cheng_mobile_host_ios.m cheng_mobile_exports.h cheng_mobile_exports.c; do
+      if [ -f "$mobile_ios_override/$name" ]; then
+        cp "$mobile_ios_override/$name" "$ios_src/$name"
+      fi
+    done
+    find "$mobile_ios_override" -maxdepth 1 -type f \( -name '*.swift' -o -name '*.m' -o -name '*.h' -o -name '*.c' \) | while read -r extra; do
+      base="$(basename "$extra")"
+      [ -f "$ios_src/$base" ] && continue
+      cp "$extra" "$ios_src/$base"
+    done
+  fi
+
+  if [ -f "$ios_src/ChengViewControllerSwift.swift" ]; then
+    sed -i.bak 's/view\.multipleTouchEnabled/view.isMultipleTouchEnabled/g' "$ios_src/ChengViewControllerSwift.swift"
+    rm -f "$ios_src/ChengViewControllerSwift.swift.bak"
+  fi
 
   copy_assets_into "$assets" "$ios_src/Assets" "$in"
   weave_plugins_ios "$ios_project"
@@ -476,8 +532,7 @@ if [ "$with_harmony" -eq 1 ]; then
   cp "$mobile_root/harmony/CMakeLists.txt" "$harmony_project/CMakeLists.txt"
 
   cp "$app_c" "$harmony_project/cheng_mobile_app.c"
-  cp "$runtime_c" "$harmony_project/system_helpers.c"
-  cp "$runtime_h" "$harmony_project/system_helpers.h"
+  copy_runtime_native_bundle "$harmony_project"
   if [ -f "$runtime_stb_image_h" ]; then
     cp "$runtime_stb_image_h" "$harmony_project/stb_image.h"
   fi

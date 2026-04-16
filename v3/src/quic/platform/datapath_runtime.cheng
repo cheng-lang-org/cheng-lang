@@ -92,11 +92,33 @@ fn msquicDatapathStart(rt: var MsQuicDatapathRuntime, id: int32): Result[bool] =
     rt.active[idx] = true
     return Ok[bool](true)
 
+fn msquicDatapathDropAt(rt: var MsQuicDatapathRuntime, idx: int32) =
+    if idx < 0 || idx >= rt.count:
+        return
+    let last = rt.count - 1
+    if idx != last:
+        rt.ids[idx] = rt.ids[last]
+        rt.kinds[idx] = rt.kinds[last]
+        rt.active[idx] = rt.active[last]
+        rt.udpSocketId[idx] = rt.udpSocketId[last]
+        rt.udpUseLenField[idx] = rt.udpUseLenField[last]
+        rt.udpLastTos[idx] = rt.udpLastTos[last]
+        rt.udpLastTosIsV6[idx] = rt.udpLastTosIsV6[last]
+        rt.udpAddr[idx] = rt.udpAddr[last]
+        rt.packetsSent[idx] = rt.packetsSent[last]
+        rt.packetsRecv[idx] = rt.packetsRecv[last]
+        rt.bytesSent[idx] = rt.bytesSent[last]
+        rt.bytesRecv[idx] = rt.bytesRecv[last]
+    initMsQuicDatapathRuntimeSlotInto(rt, last)
+    rt.count = rt.count - 1
+
 fn msquicDatapathStop(rt: var MsQuicDatapathRuntime, id: int32): Result[bool] =
     let idx: int32 = msquicDatapathFindMut(rt, id)
     if idx < 0:
         return Err[bool]("msquic datapath: ! found")
-    rt.active[idx] = false
+    if rt.udpSocketId[idx] >= 0:
+        msquicUdpUnbind(rt.udpSocketId[idx])
+    msquicDatapathDropAt(rt, idx)
     return Ok[bool](true)
 
 fn msquicDatapathRecordSend(rt: var MsQuicDatapathRuntime, id: int32, bytes: int64): Result[bool] =
@@ -126,6 +148,18 @@ fn msquicDatapathSummary(rt: var MsQuicDatapathRuntime, id: int32): str =
     out = out + " packetsSent=" + msquicPlatformIntToString(rt.packetsSent[idx])
     out = out + " packetsRecv=" + msquicPlatformIntToString(rt.packetsRecv[idx])
     return out
+
+fn msquicDatapathPacketsSent(rt: var MsQuicDatapathRuntime, id: int32): int64 =
+    let idx: int32 = msquicDatapathFind(rt, id)
+    if idx < 0:
+        return int64(0)
+    return rt.packetsSent[idx]
+
+fn msquicDatapathPacketsRecv(rt: var MsQuicDatapathRuntime, id: int32): int64 =
+    let idx: int32 = msquicDatapathFind(rt, id)
+    if idx < 0:
+        return int64(0)
+    return rt.packetsRecv[idx]
 
 fn msquicDatapathBindUdp(rt: var MsQuicDatapathRuntime, id: int32, addrText: str): Result[bool] =
     let idx: int32 = msquicDatapathFindMut(rt, id)

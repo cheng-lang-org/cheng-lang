@@ -764,6 +764,14 @@ int32_t cheng_v3_udp_platform_use_len_field_bridge(void) {
 #endif
 }
 
+int32_t cheng_v3_udp_platform_msg_dontwait_bridge(void) {
+#if defined(__linux__)
+  return 0x40;
+#else
+  return 0x80;
+#endif
+}
+
 static int32_t cheng_v3_hex_value_ascii(char c) {
   if (c >= '0' && c <= '9') {
     return (int32_t)(c - '0');

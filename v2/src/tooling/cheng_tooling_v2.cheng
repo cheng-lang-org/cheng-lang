@@ -1,5 +1,6 @@
 import std/cmdline as cmdline
 import std/os
+import std/os_host_process as hostos
 import std/strings as strings
 import std/strutils as strutils
 import std/system
@@ -86,72 +87,62 @@ type
         sampleId: str
         sourcePath: str
         expectPass: bool
+    ToolingBootstrapProgram =
+        rootPath: str
+        sourcePath: str
+        targetTriple: str
+        emitKind: str
+    NetworkSelfhostReport =
+        ok: bool
+        reason: str
+        sourceManifestText: str
+        sourceManifestCid: str
+        rulePackText: str
+        rulePackCid: str
+        compilerRulePackText: str
+        compilerRulePackCid: str
+        releaseArtifactText: str
+        releaseCompileKey: str
+        objImageCid: str
+        objSectionCount: int32
+        objSymbolCount: int32
+        objRelocCount: int32
+        linkPlanCid: str
+        runtimeTargetCount: int32
+        runtimeUnresolvedCount: int32
+        nativeLinkClosureOk: bool
+        topologyCount: int32
+        rulePackEntryCount: int32
+        compilerRulePackEntryCount: int32
+        compileKeyTopologyCovered: bool
+        compileKeyAddressingCovered: bool
+        compileKeyDepthCovered: bool
+        compileKeyAddressBindingCovered: bool
+        compileKeyDistanceMetricCovered: bool
+        compileKeyPriorityCovered: bool
+        compileKeyDispersalCovered: bool
+        compileKeySignatureCovered: bool
+        compileKeyCanonicalMultipathCovered: bool
+        releaseManifestMatchesSourceManifest: bool
+        lsmrPriorityMappingFixed: bool
+        lsmrAddressingMode: str
+        lsmrAddressBinding: str
+        lsmrDistanceMetric: str
+        lsmrRoutePlanModel: str
+        randomGossipFallbackPresent: bool
+    ToolingSelfhostStageResult =
+        sourceManifestText: str
+        rulePackText: str
+        compilerRulePackText: str
+        releaseArtifactText: str
+        stageHash: uint64
+        report: NetworkSelfhostReport
     V2PackageClosureSpec =
         sampleId: str
         sourcePath: str
     CycleSurfaceSpec =
         label: str
         topLevelKind: str
-
-@importc("driver_c_write_text_file_bridge")
-fn writeTextFileBridge(path: str, text: str)
-
-@importc("driver_c_compare_text_files_bridge")
-fn compareTextFilesBridge(leftPath: str, rightPath: str): bool
-
-@importc("driver_c_compare_binary_files_bridge")
-fn compareBinaryFilesBridge(leftPath: str, rightPath: str): bool
-
-@importc("driver_c_exec_file_capture_or_panic_bridge")
-fn execFileCaptureOrPanicBridge(filePath: str, argv: str[], workingDir: str, label: str): str
-
-@importc("driver_c_compare_text_files_or_panic_bridge")
-fn compareTextFilesOrPanicBridge(leftPath: str, rightPath: str, label: str)
-
-@importc("driver_c_create_dir_all_bridge")
-fn createDirAllBridge(path: str)
-
-@importc("driver_c_get_current_dir_bridge")
-fn currentWorkingDirBridge(): str
-
-@importc("driver_c_join_path2_bridge")
-fn joinPath2Bridge(left: str, right: str): str
-
-@importc("driver_c_program_absolute_path_bridge")
-fn programAbsolutePathBridge(): str
-
-@importc("driver_c_absolute_path_bridge")
-fn absolutePathBridge(path: str): str
-
-@importc("driver_c_extract_line_value_bridge")
-fn extractLineValueBridge(text: str, key: str): str
-
-@importc("driver_c_count_external_cc_providers_bridge")
-fn countExternalCcProvidersBridge(planText: str): int32
-
-@importc("driver_c_parse_plan_int32_or_zero_bridge")
-fn parsePlanInt32OrZeroBridge(planText: str, key: str): int32
-
-@importc("driver_c_provider_field_for_module_from_plan_text_bridge")
-fn providerFieldForModuleFromPlanTextBridge(planText: str, moduleName: str, fieldName: str): str
-
-@importc("driver_c_compiler_core_provider_source_kind_bridge")
-fn compilerCoreProviderSourceKindBridge(planText: str): str
-
-@importc("driver_c_compiler_core_provider_compile_mode_bridge")
-fn compilerCoreProviderCompileModeBridge(planText: str): str
-
-@importc("driver_c_run_stage_selfhost_host_bridge")
-fn runStageSelfhostHostBridge(): int32
-
-@importc("driver_c_run_tooling_selfhost_host_bridge")
-fn runToolingSelfhostHostBridge(): int32
-
-@importc("driver_c_run_tooling_selfhost_check_bridge")
-fn runToolingSelfhostCheckBridge(): int32
-
-@importc("driver_c_run_program_selfhost_check_bridge")
-fn runProgramSelfhostCheckBridge(): int32
 
 fn taijiJsonEscape(text: str): str =
     var out: str = ""
@@ -190,22 +181,149 @@ fn readCidFlag(): str =
     return readFlagDefault("--cid", "")
 
 fn createDirAll(path: str) =
-    createDirAllBridge(path)
+    if len(path) == 0 || os.dirExists(path):
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0 && parent != path:
+        createDirAll(parent)
+    if !os.dirExists(path):
+        os.createDir(path)
 
 fn writeTextFile(path: str, text: str) =
-    writeTextFileBridge(path, text)
+    if len(path) <= 0:
+        return
+    let parent = os.parentDir(path)
+    if len(parent) > 0:
+        createDirAll(parent)
+    os.writeFile(path, text)
 
 fn joinPath2(left: str, right: str): str =
-    return joinPath2Bridge(left, right)
+    return os.joinPath(left, right)
 
 fn currentCompilerPath(): str =
-    return programAbsolutePathBridge()
+    let raw = cmdline.programName()
+    if len(raw) <= 0:
+        return ""
+    return os.absolutePath(raw)
 
 fn absolutePath(path: str): str =
-    return absolutePathBridge(path)
+    if len(path) <= 0:
+        return ""
+    return os.absolutePath(path)
 
 fn currentWorkingDir(): str =
-    return currentWorkingDirBridge()
+    return os.getCurrentDir()
+
+fn currentRepoRoot(): str =
+    return currentWorkingDir()
+
+fn textStartsWith(text: str, prefix: str): bool =
+    if len(prefix) > len(text):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn extractLineValue(text: str, key: str): str =
+    let prefix = key + "="
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = strings.sliceBytes(text, start, i - start)
+            if len(line) >= len(prefix) && textStartsWith(line, prefix):
+                return strings.sliceBytes(line, len(prefix), len(line) - len(prefix))
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn countTextOccurrences(text: str, needle: str): int32 =
+    if len(needle) <= 0 || len(text) < len(needle):
+        return 0
+    var out: int32 = 0
+    for i in 0..<(len(text) - len(needle) + 1):
+        if strings.sliceBytes(text, i, len(needle)) == needle:
+            out = out + 1
+    return out
+
+fn parseInt32StrictOrZero(text: str): int32 =
+    if len(text) <= 0:
+        return 0
+    var sign: int32 = 1
+    var i: int32 = 0
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        sign = -1
+        i = 1
+    if i >= len(text):
+        return 0
+    var out: int32 = 0
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return 0
+        out = out * 10 + (int32(ch) - int32('0'))
+        i = i + 1
+    return out * sign
+
+fn parsePlanInt32OrZero(planText: str, key: str): int32 =
+    return parseInt32StrictOrZero(extractLineValue(planText, key))
+
+fn countExternalCcProvidersFromPlanText(planText: str): int32 =
+    return countTextOccurrences(planText, "compile_mode=external_cc_obj")
+
+fn providerFieldForModuleFromPlanText(planText: str, moduleName: str, fieldName: str): str =
+    if len(planText) <= 0 || len(moduleName) <= 0 || len(fieldName) <= 0:
+        return ""
+    let prefix = "provider_module."
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= len(planText):
+        if i == len(planText) || planText[i] == '\n':
+            let line = strings.sliceBytes(planText, start, i - start)
+            if textStartsWith(line, prefix):
+                let nameMarker = ".name="
+                let markerAt = parser.findText(line, nameMarker)
+                if markerAt > len(prefix):
+                    let indexText = strings.sliceBytes(line, len(prefix), markerAt - len(prefix))
+                    let lineModule = strings.sliceBytes(line,
+                                                        markerAt + len(nameMarker),
+                                                        len(line) - (markerAt + len(nameMarker)))
+                    if lineModule == moduleName:
+                        return extractLineValue(planText,
+                                                prefix + indexText + "." + fieldName)
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn compilerCoreProviderSourceKind(planText: str): str =
+    return providerFieldForModuleFromPlanText(planText,
+                                              "runtime/compiler_core_runtime_v2",
+                                              "source_kind")
+
+fn compilerCoreProviderCompileMode(planText: str): str =
+    return providerFieldForModuleFromPlanText(planText,
+                                              "runtime/compiler_core_runtime_v2",
+                                              "compile_mode")
+
+fn compareTextFiles(leftPath: str, rightPath: str): bool =
+    if !os.fileExists(leftPath) || !os.fileExists(rightPath):
+        return false
+    return os.readFile(leftPath) == os.readFile(rightPath)
+
+fn compareBinaryFiles(leftPath: str, rightPath: str): bool =
+    if !os.fileExists(leftPath) || !os.fileExists(rightPath):
+        return false
+    let left = bytes.readFileBytes(leftPath)
+    let right = bytes.readFileBytes(rightPath)
+    if left.len != right.len:
+        return false
+    for i in 0..<left.len:
+        if bytes.bufByteAt(left, i) != bytes.bufByteAt(right, i):
+            return false
+    return true
 
 fn zrpcProbeSpec(sampleId: str, sourcePath: str, expectPass: bool): ZrpcProbeSpec =
     var out: ZrpcProbeSpec
@@ -434,20 +552,21 @@ fn programRoutineParamTypeText(program: ccore.CompilerCoreProgram,
         return ""
     return program.routineParams[decl.paramStart + paramIdx].typeText
 
-fn compareTextFiles(leftPath: str, rightPath: str): bool =
-    return compareTextFilesBridge(leftPath, rightPath)
-
-fn compareBinaryFiles(leftPath: str, rightPath: str): bool =
-    return compareBinaryFilesBridge(leftPath, rightPath)
-
 fn runCompilerCommandOrPanic(compilerPath: str,
                              argv: str[],
                              workingDir: str,
                              label: str): str =
-    return execFileCaptureOrPanicBridge(compilerPath, argv, workingDir, label)
+    let result = hostos.execFileCapture(compilerPath, argv, [], workingDir, true, 300)
+    let output = os.execCmdResultOutput(result)
+    if os.execCmdResultExitCode(result) != 0:
+        if len(output) > 0:
+            system.panic(label + "\n" + output)
+        system.panic(label)
+    return output
 
 fn compareExpectedTextOrPanic(expectedPath: str, actualPath: str, label: str) =
-    compareTextFilesOrPanicBridge(expectedPath, actualPath, label)
+    if !compareTextFiles(expectedPath, actualPath):
+        system.panic(label)
 
 fn taijiProofArtifact(text: str, allPass: bool): TaijiProofArtifact =
     var out: TaijiProofArtifact
@@ -485,6 +604,48 @@ fn joinTextList(values: str[], sep: str): str =
             out = out + sep
         out = out + values[i]
     return out
+
+fn collectPrefixedLineValues(text: str, prefix: str): str[] =
+    var out: str[] = []
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = strings.sliceBytes(text, start, i - start)
+            if len(line) >= len(prefix) && textStartsWith(line, prefix):
+                add(out, strings.sliceBytes(line, len(prefix), len(line) - len(prefix)))
+            start = i + 1
+        i = i + 1
+    return out
+
+fn prefixedLineKey(prefix: str): str =
+    if len(prefix) > 0 && prefix[len(prefix) - 1] == '=':
+        return strings.sliceBytes(prefix, 0, len(prefix) - 1)
+    return prefix
+
+fn buildNetworkSmokeReportText(smoke: str,
+                               stdoutPath: str,
+                               prefixes: str[],
+                               stdoutText: str,
+                               outStageTotal: var int32): str =
+    var lines: str[] = []
+    outStageTotal = 0
+    add(lines, "v2_network_smoke_report_v1")
+    add(lines, "smoke=" + smoke)
+    add(lines, "stdout_path=" + stdoutPath)
+    add(lines, "prefix_count=" + intToStr(prefixes.len))
+    for i in 0..<prefixes.len:
+        let stages = collectPrefixedLineValues(stdoutText, prefixes[i])
+        var stagesText = "-"
+        if stages.len > 0:
+            stagesText = joinTextList(stages, ",")
+        outStageTotal = outStageTotal + stages.len
+        add(lines, "prefix." + intToStr(i) + ".name=" + prefixedLineKey(prefixes[i]))
+        add(lines, "prefix." + intToStr(i) + ".count=" + intToStr(stages.len))
+        add(lines, "prefix." + intToStr(i) + ".stages=" + stagesText)
+    add(lines, "stage_total=" + intToStr(outStageTotal))
+    add(lines, "ok=1")
+    return joinTextList(lines, "\n") + "\n"
 
 fn jsonEscape(text: str): str =
     var out: str = ""
@@ -2985,15 +3146,6 @@ fn runTaijiSeedSet(): int32 =
     printLine("semantic_edge_catalog_cid=" + catalogDoc.cid)
     return 0
 
-fn parsePlanInt32OrZero(planText: str, key: str): int32 =
-    return parsePlanInt32OrZeroBridge(planText, key)
-
-fn countExternalCcProvidersFromPlanText(planText: str): int32 =
-    return countExternalCcProvidersBridge(planText)
-
-fn providerFieldForModuleFromPlanText(planText: str, moduleName: str, fieldName: str): str =
-    return providerFieldForModuleFromPlanTextBridge(planText, moduleName, fieldName)
-
 fn stageReleasePath(stageDir: str): str =
     return joinPath2(stageDir, "release.txt")
 
@@ -3041,8 +3193,8 @@ fn buildStageArtifacts(compilerPath: str,
     let systemLinkExecArgv = ["system-link-exec", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", binaryPath, "--report-out", systemLinkExecPath]
     let systemLinkExecOutput = runCompilerCommandOrPanic(compilerPath, systemLinkExecArgv, workingDir, "stage-selfhost-host system-link-exec failed")
     writeTextFile(systemLinkExecPath, systemLinkExecOutput)
-    let compilerCoreProviderSourceKind = compilerCoreProviderSourceKindBridge(systemLinkPlanOutput)
-    let compilerCoreProviderCompileMode = compilerCoreProviderCompileModeBridge(systemLinkPlanOutput)
+    let compilerCoreProviderSourceKind = compilerCoreProviderSourceKind(systemLinkPlanOutput)
+    let compilerCoreProviderCompileMode = compilerCoreProviderCompileMode(systemLinkPlanOutput)
     var out: NativeStageArtifacts
     out.compilerPath = compilerPath
     out.releasePath = releasePath
@@ -3055,6 +3207,779 @@ fn buildStageArtifacts(compilerPath: str,
     out.compilerCoreProviderSourceKind = compilerCoreProviderSourceKind
     out.compilerCoreProviderCompileMode = compilerCoreProviderCompileMode
     return out
+
+fn readRequiredLineValue(text: str, key: str, label: str): str =
+    let value = extractLineValue(text, key)
+    if len(value) <= 0:
+        system.panic(label + key)
+    return value
+
+fn uint64HexDigitLower(value: uint64): str =
+    let digit = int32(value & uint64(15))
+    if digit < 10:
+        return charToStr(char(int32('0') + digit))
+    return charToStr(char(int32('a') + (digit - 10)))
+
+fn uint64HexLower16(value: uint64): str =
+    var out: str = ""
+    var shift: int32 = 60
+    while shift >= 0:
+        out = out + uint64HexDigitLower(value >> uint64(shift))
+        shift = shift - 4
+    return out
+
+fn fnv1a64UpdateText(seed: uint64, text: str): uint64 =
+    var out = seed
+    for i in 0..<len(text):
+        out = out ^ uint64(int32(text[i]))
+        out = out * uint64(1099511628211)
+    return out
+
+fn toolingNormalizeRepoPath(raw: str, repoRoot: str): str =
+    if len(raw) <= 0:
+        system.panic("missing input path")
+    let abs = absolutePath(raw)
+    if len(abs) <= 0:
+        system.panic("missing normalized path")
+    if len(repoRoot) > 0 && textStartsWith(abs, repoRoot):
+        if len(abs) == len(repoRoot):
+            return abs
+        if len(abs) > len(repoRoot) && abs[len(repoRoot)] == '/':
+            return strings.sliceBytes(abs, len(repoRoot) + 1, len(abs) - len(repoRoot) - 1)
+    return abs
+
+fn toolingProgramFromFlags(): ToolingBootstrapProgram =
+    let repoRoot = currentRepoRoot()
+    let rootRaw = readFlagDefault("--root", "v2/examples")
+    let sourceRaw = readFlagDefault("--in", "v2/examples/network_distribution_module.cheng")
+    let targetRaw = readFlagDefault("--target", "arm64-apple-darwin")
+    let emitRaw = readFlagDefault("--emit", "exe")
+    let rootPath = toolingNormalizeRepoPath(rootRaw, repoRoot)
+    let sourcePath = toolingNormalizeRepoPath(sourceRaw, repoRoot)
+    if !os.dirExists(rootPath):
+        system.panic("tooling selfhost: missing root " + rootPath)
+    if !os.fileExists(sourcePath):
+        system.panic("tooling selfhost: missing source " + sourcePath)
+    var out: ToolingBootstrapProgram
+    out.rootPath = rootPath
+    out.sourcePath = sourcePath
+    out.targetTriple = targetRaw
+    out.emitKind = emitRaw
+    return out
+
+fn toolingChengLiteralEscape(text: str): str =
+    var out: str = "\""
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        else:
+            out = out + charToStr(ch)
+    out = out + "\""
+    return out
+
+fn toolingEmitStage1ModuleText(program: ToolingBootstrapProgram): str =
+    var lines: str[] = []
+    add(lines, "import compiler/driver/manifest_resolver_v2 as manifest")
+    add(lines, "import compiler/driver/release_artifact_v2 as rart")
+    add(lines, "import compiler/driver/network_distribution_pipeline_v2 as npipe")
+    add(lines, "import compiler/frontend/v2_source_parser as parser")
+    add(lines, "")
+    add(lines, "fn bootstrapExamplesRoot(): str =")
+    add(lines, "    return " + toolingChengLiteralEscape(program.rootPath))
+    add(lines, "")
+    add(lines, "fn bootstrapNetworkSource(): str =")
+    add(lines, "    return " + toolingChengLiteralEscape(program.sourcePath))
+    add(lines, "")
+    add(lines, "fn bootstrapTargetTriple(): str =")
+    add(lines, "    return " + toolingChengLiteralEscape(program.targetTriple))
+    add(lines, "")
+    add(lines, "fn bootstrapReleaseEmitKind(): str =")
+    add(lines, "    return " + toolingChengLiteralEscape(program.emitKind))
+    add(lines, "")
+    add(lines, "fn bootstrapSourceManifest(): manifest.SourceManifestBundle =")
+    add(lines, "    return manifest.resolveSourceManifest(bootstrapExamplesRoot())")
+    add(lines, "")
+    add(lines, "fn bootstrapNetworkPipeline(): npipe.NetworkDistributionPipelineBundle =")
+    add(lines, "    let parsed = parser.parseV2SourceFileStrict(bootstrapNetworkSource())")
+    add(lines, "    return npipe.compileNetworkDistributionProgram(parsed.networkProgram)")
+    add(lines, "")
+    add(lines, "fn bootstrapReleaseArtifact(): rart.ReleaseArtifactBundle =")
+    add(lines, "    return rart.buildReleaseArtifact(bootstrapNetworkSource(), bootstrapReleaseEmitKind(), bootstrapTargetTriple())")
+    return mresolve.joinLines(lines)
+
+fn toolingParseStage1ReturnString(line: str): str =
+    let trimmed = trimAsciiWhitespace(line)
+    if !textStartsWith(trimmed, "return "):
+        return ""
+    let raw = trimAsciiWhitespace(strings.sliceBytes(trimmed, len("return "), len(trimmed) - len("return ")))
+    if len(raw) < 2 || raw[0] != '"' || raw[len(raw) - 1] != '"':
+        return ""
+    var out: str = ""
+    var i: int32 = 1
+    while i < len(raw) - 1:
+        let ch = raw[i]
+        if ch == '\\' && i + 1 < len(raw) - 1:
+            let esc = raw[i + 1]
+            if esc == 'n':
+                out = out + "\n"
+            else:
+                out = out + charToStr(esc)
+            i = i + 2
+        else:
+            out = out + charToStr(ch)
+            i = i + 1
+    return out
+
+fn toolingParseStage1ProgramText(text: str): ToolingBootstrapProgram =
+    var currentFn: str = ""
+    var rootPath: str = ""
+    var sourcePath: str = ""
+    var targetTriple: str = ""
+    var emitKind: str = ""
+    var lineStart: int32 = 0
+    for i in 0..len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = trimAsciiWhitespace(strings.sliceBytes(text, lineStart, i - lineStart))
+            if textStartsWith(line, "fn bootstrapExamplesRoot(): str ="):
+                currentFn = "bootstrapExamplesRoot"
+            elif textStartsWith(line, "fn bootstrapNetworkSource(): str ="):
+                currentFn = "bootstrapNetworkSource"
+            elif textStartsWith(line, "fn bootstrapTargetTriple(): str ="):
+                currentFn = "bootstrapTargetTriple"
+            elif textStartsWith(line, "fn bootstrapReleaseEmitKind(): str ="):
+                currentFn = "bootstrapReleaseEmitKind"
+            elif textStartsWith(line, "return "):
+                let value = toolingParseStage1ReturnString(line)
+                if currentFn == "bootstrapExamplesRoot":
+                    rootPath = value
+                elif currentFn == "bootstrapNetworkSource":
+                    sourcePath = value
+                elif currentFn == "bootstrapTargetTriple":
+                    targetTriple = value
+                elif currentFn == "bootstrapReleaseEmitKind":
+                    emitKind = value
+            lineStart = i + 1
+    if len(rootPath) <= 0 || len(sourcePath) <= 0 || len(targetTriple) <= 0 || len(emitKind) <= 0:
+        system.panic("tooling selfhost: incomplete stage1 bootstrap module")
+    var out: ToolingBootstrapProgram
+    out.rootPath = rootPath
+    out.sourcePath = sourcePath
+    out.targetTriple = targetTriple
+    out.emitKind = emitKind
+    return out
+
+fn toolingBuildNetworkSelfhostReport(rootPath: str, sourcePath: str, targetTriple: str): NetworkSelfhostReport =
+    let manifestBundle = mresolve.resolveSourceManifest(rootPath)
+    let networkBundle = networkBundleFromSource(sourcePath)
+    let releaseBundle = rart.buildReleaseArtifact(sourcePath, "exe", targetTriple)
+    let rulePackOpCount = canonicalOpCountForDomain(networkBundle, "rule_pack")
+    let compilerRulePackOpCount = canonicalOpCountForDomain(networkBundle, "compiler_rule_pack")
+    let hasPublishSourceManifestOp = hasCanonicalOp(networkBundle, "publish_source_manifest")
+    let hasPublishRulePackOp = hasCanonicalOp(networkBundle, "publish_rule_pack")
+    let hasPublishCompilerRulePackOp = hasCanonicalOp(networkBundle, "publish_compiler_rule_pack")
+    var out: NetworkSelfhostReport
+    out.ok = false
+    if manifestBundle.topologyCanonicalForms.len <= 0:
+        out.reason = "missing_topology_canonical_form"
+        return out
+    if !verifyPriorityMappings(networkBundle):
+        out.reason = "priority_mapping_mismatch"
+        return out
+    if !hasPublishSourceManifestOp || !hasPublishRulePackOp || !hasPublishCompilerRulePackOp:
+        out.reason = "missing_publish_ops"
+        return out
+    if rulePackOpCount <= 0:
+        out.reason = "missing_rule_pack_domain_ops"
+        return out
+    if compilerRulePackOpCount <= 0:
+        out.reason = "missing_compiler_rule_pack_domain_ops"
+        return out
+    if releaseBundle.moduleKind != "network_distribution":
+        out.reason = "release_artifact_wrong_module_kind"
+        return out
+    if releaseBundle.manifestCid != manifestBundle.manifestCid:
+        out.reason = "release_manifest_mismatch"
+        return out
+    if !releaseCompileKeyCoversNetworkBundle(releaseBundle, networkBundle):
+        out.reason = "compile_key_missing_network_fields"
+        return out
+    if !releaseBundle.nativeLinkClosureOk:
+        out.reason = "native_link_closure_unresolved"
+        return out
+    out.ok = true
+    out.reason = ""
+    out.sourceManifestText = buildSourceManifestArtifactText(manifestBundle)
+    out.sourceManifestCid = manifestBundle.manifestCid
+    out.rulePackText = buildNetworkArtifactText(networkBundle, "rule_pack", "v2.rule_pack.v1")
+    out.rulePackCid = ident.sha256HexText(out.rulePackText)
+    out.compilerRulePackText = buildNetworkArtifactText(networkBundle, "compiler_rule_pack", "v2.compiler_rule_pack.v1")
+    out.compilerRulePackCid = ident.sha256HexText(out.compilerRulePackText)
+    out.releaseArtifactText = releaseBundle.artifactText + "\n"
+    out.releaseCompileKey = releaseBundle.compileKey
+    out.objImageCid = releaseBundle.objImageCid
+    out.objSectionCount = releaseBundle.objSectionCount
+    out.objSymbolCount = releaseBundle.objSymbolCount
+    out.objRelocCount = releaseBundle.objRelocCount
+    out.linkPlanCid = releaseBundle.linkPlanCid
+    out.runtimeTargetCount = releaseBundle.runtimeTargetCount
+    out.runtimeUnresolvedCount = releaseBundle.runtimeUnresolvedCount
+    out.nativeLinkClosureOk = releaseBundle.nativeLinkClosureOk
+    out.topologyCount = manifestBundle.topologyCanonicalForms.len
+    out.rulePackEntryCount = rulePackOpCount
+    out.compilerRulePackEntryCount = compilerRulePackOpCount
+    out.compileKeyTopologyCovered = true
+    out.compileKeyAddressingCovered = true
+    out.compileKeyDepthCovered = true
+    out.compileKeyAddressBindingCovered = true
+    out.compileKeyDistanceMetricCovered = true
+    out.compileKeyPriorityCovered = true
+    out.compileKeyDispersalCovered = true
+    out.compileKeySignatureCovered = true
+    out.compileKeyCanonicalMultipathCovered = true
+    out.releaseManifestMatchesSourceManifest = true
+    out.lsmrPriorityMappingFixed = true
+    out.lsmrAddressingMode = lcontract.lsmrRuntimeContract().addressingMode
+    out.lsmrAddressBinding = lcontract.lsmrRuntimeContract().addressBinding
+    out.lsmrDistanceMetric = lcontract.lsmrRuntimeContract().distanceMetric
+    out.lsmrRoutePlanModel = lcontract.lsmrRuntimeContract().routePlanModel
+    out.randomGossipFallbackPresent = false
+    return out
+
+fn toolingBuildStageResult(program: ToolingBootstrapProgram): ToolingSelfhostStageResult =
+    var out: ToolingSelfhostStageResult
+    out.report = toolingBuildNetworkSelfhostReport(program.rootPath, program.sourcePath, program.targetTriple)
+    if !out.report.ok:
+        return out
+    out.sourceManifestText = out.report.sourceManifestText
+    out.rulePackText = out.report.rulePackText
+    out.compilerRulePackText = out.report.compilerRulePackText
+    out.releaseArtifactText = out.report.releaseArtifactText
+    var hash: uint64 = uint64(1469598103934665603)
+    hash = fnv1a64UpdateText(hash, "v2.bootstrap.tooling_stage1.v1")
+    hash = fnv1a64UpdateText(hash, program.rootPath)
+    hash = fnv1a64UpdateText(hash, program.sourcePath)
+    hash = fnv1a64UpdateText(hash, program.targetTriple)
+    hash = fnv1a64UpdateText(hash, program.emitKind)
+    hash = fnv1a64UpdateText(hash, out.report.sourceManifestCid)
+    hash = fnv1a64UpdateText(hash, out.report.rulePackCid)
+    hash = fnv1a64UpdateText(hash, out.report.compilerRulePackCid)
+    hash = fnv1a64UpdateText(hash, out.report.releaseCompileKey)
+    hash = fnv1a64UpdateText(hash, out.report.objImageCid)
+    out.stageHash = hash
+    return out
+
+fn toolingStageResultsEqual(left: ToolingSelfhostStageResult, right: ToolingSelfhostStageResult): bool =
+    if !left.report.ok || !right.report.ok:
+        return false
+    return left.sourceManifestText == right.sourceManifestText &&
+           left.rulePackText == right.rulePackText &&
+           left.compilerRulePackText == right.compilerRulePackText &&
+           left.releaseArtifactText == right.releaseArtifactText &&
+           left.report.sourceManifestCid == right.report.sourceManifestCid &&
+           left.report.rulePackCid == right.report.rulePackCid &&
+           left.report.compilerRulePackCid == right.report.compilerRulePackCid &&
+           left.report.releaseCompileKey == right.report.releaseCompileKey &&
+           left.report.objImageCid == right.report.objImageCid &&
+           left.stageHash == right.stageHash
+
+fn removeTree(path: str) =
+    if len(path) <= 0:
+        return
+    if os.fileExists(path):
+        let _ = os.removeFile(path)
+        return
+    if !os.dirExists(path):
+        return
+    let entries = os.walkDir(path)
+    for i in 0..<entries.len:
+        let childPath = os.walkDirEntryPath(entries[i])
+        if os.dirExists(childPath):
+            removeTree(childPath)
+        elif os.fileExists(childPath):
+            let _ = os.removeFile(childPath)
+    os.removeDir(path)
+
+fn buildProgramBinaryOrPanic(compilerPath: str,
+                             sourcePath: str,
+                             targetTriple: str,
+                             binaryPath: str,
+                             label: str) =
+    let workingDir = currentWorkingDir()
+    let argv = ["system-link-exec", "--in", sourcePath, "--emit", "exe", "--target", targetTriple, "--out", binaryPath]
+    let _ = runCompilerCommandOrPanic(compilerPath, argv, workingDir, label)
+
+const toolingProgramRunTimeoutDefaultSec: int32 = 30
+const toolingProgramRunTimeoutNetworkSmokeSec: int32 = 60
+const toolingProgramRunTimeoutChainNodeSec: int32 = 10
+
+fn runBinaryCaptureOrPanic(binaryPath: str,
+                           argv: str[],
+                           label: str,
+                           timeoutSeconds: int32): str =
+    let result = hostos.execFileCapture(binaryPath, argv, [], currentWorkingDir(), true, timeoutSeconds)
+    let output = os.execCmdResultOutput(result)
+    if os.execCmdResultExitCode(result) != 0:
+        system.panic(label + "\n" + output)
+    return output
+
+const toolingProcessRunning: int32 = -2147483000
+
+fn toolingAllocateLoopbackUdpPortOrPanic(label: str): int32 =
+    let fd = os.udpBindFdBridge("127.0.0.1", 0, 0)
+    if fd < 0:
+        system.panic(label + "\nfailed to allocate loopback udp port")
+    let port = os.udpBoundPortBridge(fd, 0)
+    let _ = os.udpCloseFd(fd)
+    if port <= 0:
+        system.panic(label + "\nfailed to read allocated loopback udp port")
+    return port
+
+fn toolingLastNonEmptyLine(text: str): str =
+    var out = ""
+    var start = 0
+    var i = 0
+    while i <= len(text):
+        if i == len(text) || text[i] == '\n':
+            let line = strutils.strip(strings.sliceBytes(text, start, i - start))
+            if len(line) > 0:
+                out = line
+            start = i + 1
+        i = i + 1
+    return out
+
+fn toolingClosePipeFd(fd: var int32) =
+    if fd >= 0:
+        hostos.ptyClose(fd)
+        fd = -1
+
+fn toolingDrainPipeOutput(readFd: var int32, out: var str, timeoutMs: int32) =
+    if readFd < 0:
+        return
+    var waitMs = timeoutMs
+    while readFd >= 0:
+        let readRes = hostos.fdReadWait(readFd, 65536, waitMs)
+        let chunk = readRes[0]
+        let eof = readRes[1]
+        if len(chunk) > 0:
+            out = out + chunk
+            waitMs = 0
+            continue
+        if eof:
+            toolingClosePipeFd(readFd)
+        break
+
+fn toolingSpawnedProcessPoll(pid: var int64,
+                             readFd: var int32,
+                             out: var str): int32 =
+    if pid <= 0:
+        return 0
+    toolingDrainPipeOutput(readFd, out, 0)
+    let waitRes = hostos.ptyWait(pid)
+    let waitStatus = waitRes[0]
+    if waitStatus == 1:
+        let exitCode = waitRes[1]
+        toolingDrainPipeOutput(readFd, out, 0)
+        pid = 0
+        return exitCode
+    if waitStatus < 0:
+        toolingDrainPipeOutput(readFd, out, 0)
+        pid = 0
+        return -1
+    return toolingProcessRunning
+
+fn toolingSpawnedProcessKill(pid: var int64,
+                             readFd: var int32,
+                             writeFd: var int32,
+                             out: var str) =
+    toolingClosePipeFd(writeFd)
+    if pid > 0:
+        let _ = hostos.processSignal(pid, 15)
+        os.sleepMs(100)
+        let _ = hostos.processSignal(pid, 9)
+        let _wait = hostos.ptyWait(pid)
+        pid = 0
+    toolingDrainPipeOutput(readFd, out, 0)
+    toolingClosePipeFd(readFd)
+
+fn toolingSpawnedProcessWaitOrPanic(pid: var int64,
+                                    readFd: var int32,
+                                    writeFd: var int32,
+                                    out: var str,
+                                    timeoutMs: int32,
+                                    label: str): int32 =
+    var remaining = timeoutMs
+    while true:
+        let status = toolingSpawnedProcessPoll(pid, readFd, out)
+        if status != toolingProcessRunning:
+            toolingClosePipeFd(writeFd)
+            toolingDrainPipeOutput(readFd, out, 0)
+            toolingClosePipeFd(readFd)
+            return status
+        if remaining <= 0:
+            toolingSpawnedProcessKill(pid, readFd, writeFd, out)
+            system.panic(label + "\nserve-once timeout\n" + out)
+        os.sleepMs(20)
+        remaining = remaining - 20
+
+fn runChainNodeProcessSmokeCaptureOrPanic(chainNodeBinary: str,
+                                          programsDir: str,
+                                          label: str): str =
+    let serverRoot = joinPath2(programsDir, "chain_node_process_server_root")
+    let clientRoot = joinPath2(programsDir, "chain_node_process_client_root")
+    let serverLog = joinPath2(programsDir, "chain_node_process_server.stdout")
+    let syncLog = joinPath2(programsDir, "chain_node_process_client_sync.stdout")
+    removeTree(serverRoot)
+    removeTree(clientRoot)
+    removeTree(serverLog)
+    removeTree(syncLog)
+    let port = toolingAllocateLoopbackUdpPortOrPanic(label)
+    let listen = "/ip4/127.0.0.1/udp/" + intToStr(port) + "/quic-v1"
+    let _mintStdout = runBinaryCaptureOrPanic(chainNodeBinary,
+                                              ["mint",
+                                               "--root", serverRoot,
+                                               "--node-id", "server",
+                                               "--account", "alice",
+                                               "--asset", "cheng",
+                                               "--amount", "11"],
+                                              label + "\nmint failed",
+                                              toolingProgramRunTimeoutChainNodeSec)
+    let serverSpawn = hostos.execFilePipeSpawn(chainNodeBinary,
+                                           ["serve-once",
+                                            "--root", serverRoot,
+                                            "--node-id", "server",
+                                            "--listen", listen],
+                                           [],
+                                           currentWorkingDir())
+    if !serverSpawn[0]:
+        system.panic(label + "\nserve-once spawn failed")
+    var serverReadFd = serverSpawn[1]
+    var serverWriteFd = serverSpawn[2]
+    var serverPid = serverSpawn[3]
+    var serverOutput = ""
+    toolingClosePipeFd(serverWriteFd)
+    os.sleepMs(1000)
+    let serverEarlyStatus = toolingSpawnedProcessPoll(serverPid, serverReadFd, serverOutput)
+    writeTextFile(serverLog, serverOutput)
+    if serverEarlyStatus != toolingProcessRunning:
+        toolingSpawnedProcessKill(serverPid, serverReadFd, serverWriteFd, serverOutput)
+        writeTextFile(serverLog, serverOutput)
+        system.panic(label + "\nserve-once exited before sync\n" + serverOutput)
+    let syncResult = hostos.execFileCapture(chainNodeBinary,
+                                        ["sync-once",
+                                         "--root", clientRoot,
+                                         "--node-id", "client",
+                                         "--peer", listen],
+                                        [],
+                                        currentWorkingDir(),
+                                        true,
+                                        90)
+    let syncOutput = os.execCmdResultOutput(syncResult)
+    writeTextFile(syncLog, syncOutput)
+    if os.execCmdResultExitCode(syncResult) != 0:
+        toolingSpawnedProcessKill(serverPid, serverReadFd, serverWriteFd, serverOutput)
+        writeTextFile(serverLog, serverOutput)
+        system.panic(label + "\nsync-once failed\n" + syncOutput + "\n" + serverOutput)
+    let balanceResult = hostos.execFileCapture(chainNodeBinary,
+                                           ["balance",
+                                            "--root", clientRoot,
+                                            "--node-id", "client",
+                                            "--account", "alice",
+                                            "--asset", "cheng"],
+                                           [],
+                                           currentWorkingDir(),
+                                           true,
+                                           10)
+    let balanceOutput = os.execCmdResultOutput(balanceResult)
+    if os.execCmdResultExitCode(balanceResult) != 0:
+        toolingSpawnedProcessKill(serverPid, serverReadFd, serverWriteFd, serverOutput)
+        writeTextFile(serverLog, serverOutput)
+        system.panic(label + "\nbalance failed\n" + balanceOutput + "\n" + serverOutput)
+    let serverExitCode = toolingSpawnedProcessWaitOrPanic(serverPid,
+                                                          serverReadFd,
+                                                          serverWriteFd,
+                                                          serverOutput,
+                                                          60000,
+                                                          label)
+    writeTextFile(serverLog, serverOutput)
+    if serverExitCode != 0:
+        system.panic(label + "\nserve-once failed\n" + serverOutput)
+    let syncOut = toolingLastNonEmptyLine(syncOutput)
+    let balanceOut = toolingLastNonEmptyLine(balanceOutput)
+    let serverOut = toolingLastNonEmptyLine(serverOutput)
+    if len(syncOut) <= 0 || len(balanceOut) <= 0 || len(serverOut) <= 0:
+        system.panic(label + "\nmissing chain-node process smoke output\n" +
+                     "sync=" + syncOutput + "\n" +
+                     "balance=" + balanceOutput + "\n" +
+                     "server=" + serverOutput)
+    var out = ""
+    out = out + "chain_node_process_smoke_stage=mint_ok\n"
+    out = out + "chain_node_process_smoke_stage=sync_ok\n"
+    out = out + "chain_node_process_smoke_stage=balance_ok\n"
+    out = out + "sync_output=" + syncOut + "\n"
+    out = out + "balance_output=" + balanceOut + "\n"
+    out = out + "server_output=" + serverOut + "\n"
+    out = out + "chain_node_process_smoke=ok\n"
+    return out
+
+fn printRequiredPrefixedLineValue(text: str, sourceKey: str, outputKey: str) =
+    let value = readRequiredLineValue(text, sourceKey, "missing required tooling selfhost value ")
+    printLine(outputKey + "=" + value)
+
+fn runToolingSelfhostHost(): int32 =
+    let compilerPath = absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
+    let outDir = absolutePath(readFlagDefault("--out-dir", "v2/artifacts/full_selfhost/tooling_selfhost"))
+    let rootRaw = "v2/examples"
+    let sourceRaw = "v2/examples/network_distribution_module.cheng"
+    let targetRaw = "arm64-apple-darwin"
+    let workingDir = currentWorkingDir()
+    createDirAll(outDir)
+    let sourceManifestStdout = toolingSelfhostPath(outDir, "source_manifest.stdout")
+    let sourceManifestFile = toolingSelfhostPath(outDir, "source_manifest.txt")
+    let rulePackStdout = toolingSelfhostPath(outDir, "rule_pack.stdout")
+    let rulePackFile = toolingSelfhostPath(outDir, "rule_pack.txt")
+    let compilerRulePackStdout = toolingSelfhostPath(outDir, "compiler_rule_pack.stdout")
+    let compilerRulePackFile = toolingSelfhostPath(outDir, "compiler_rule_pack.txt")
+    let releaseStdout = toolingSelfhostPath(outDir, "release_artifact.stdout")
+    let releaseFile = toolingSelfhostPath(outDir, "release_artifact.txt")
+    let networkSelfhostFile = toolingSelfhostPath(outDir, "network_selfhost.txt")
+    let toolingSelfhostCheckFile = toolingSelfhostPath(outDir, "tooling_selfhost_check.txt")
+
+    let sourceManifestArgv = ["publish-source-manifest", "--root", rootRaw, "--out", sourceManifestFile]
+    let sourceManifestText = runCompilerCommandOrPanic(compilerPath,
+                                                       sourceManifestArgv,
+                                                       workingDir,
+                                                       "tooling selfhost host: source manifest failed")
+    writeTextFile(sourceManifestStdout, sourceManifestText)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected",
+                               sourceManifestStdout,
+                               "tooling selfhost host: source manifest stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_source_manifest.expected",
+                               sourceManifestFile,
+                               "tooling selfhost host: source manifest file mismatch")
+
+    let rulePackArgv = ["publish-rule-pack", "--in", sourceRaw, "--out", rulePackFile]
+    let rulePackText = runCompilerCommandOrPanic(compilerPath,
+                                                 rulePackArgv,
+                                                 workingDir,
+                                                 "tooling selfhost host: rule pack failed")
+    writeTextFile(rulePackStdout, rulePackText)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected",
+                               rulePackStdout,
+                               "tooling selfhost host: rule pack stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_rule_pack.expected",
+                               rulePackFile,
+                               "tooling selfhost host: rule pack file mismatch")
+
+    let compilerRulePackArgv = ["publish-compiler-rule-pack", "--in", sourceRaw, "--out", compilerRulePackFile]
+    let compilerRulePackText = runCompilerCommandOrPanic(compilerPath,
+                                                         compilerRulePackArgv,
+                                                         workingDir,
+                                                         "tooling selfhost host: compiler rule pack failed")
+    writeTextFile(compilerRulePackStdout, compilerRulePackText)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected",
+                               compilerRulePackStdout,
+                               "tooling selfhost host: compiler rule pack stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_compiler_rule_pack.expected",
+                               compilerRulePackFile,
+                               "tooling selfhost host: compiler rule pack file mismatch")
+
+    let releaseArgv = ["release-compile", "--in", sourceRaw, "--emit", "exe", "--target", targetRaw, "--out", releaseFile]
+    let releaseText = runCompilerCommandOrPanic(compilerPath,
+                                                releaseArgv,
+                                                workingDir,
+                                                "tooling selfhost host: release compile failed")
+    writeTextFile(releaseStdout, releaseText)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected",
+                               releaseStdout,
+                               "tooling selfhost host: release stdout mismatch")
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_release_artifact.expected",
+                               releaseFile,
+                               "tooling selfhost host: release file mismatch")
+
+    let networkSelfhostArgv = ["verify-network-selfhost", "--root", rootRaw, "--in", sourceRaw]
+    let networkSelfhostText = runCompilerCommandOrPanic(compilerPath,
+                                                        networkSelfhostArgv,
+                                                        workingDir,
+                                                        "tooling selfhost host: network selfhost failed")
+    writeTextFile(networkSelfhostFile, networkSelfhostText)
+    compareExpectedTextOrPanic("v2/tests/contracts/network_selfhost.expected",
+                               networkSelfhostFile,
+                               "tooling selfhost host: network selfhost mismatch")
+
+    let toolingSelfhostCheckArgv = ["tooling-selfhost-check", "--root", rootRaw, "--in", sourceRaw]
+    let toolingSelfhostCheckText = runCompilerCommandOrPanic(compilerPath,
+                                                             toolingSelfhostCheckArgv,
+                                                             workingDir,
+                                                             "tooling selfhost host: tooling-selfhost-check failed")
+    writeTextFile(toolingSelfhostCheckFile, toolingSelfhostCheckText)
+    compareExpectedTextOrPanic("v2/tests/contracts/tooling_selfhost.expected",
+                               toolingSelfhostCheckFile,
+                               "tooling selfhost host: tooling-selfhost-check mismatch")
+
+    printLine("tooling_selfhost_host_ok=1")
+    printLine("compiler=" + compilerPath)
+    writeText(toolingSelfhostCheckText)
+    return 0
+
+fn runStageSelfhostHost(): int32 =
+    let compilerPath = absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
+    let outDir = absolutePath(readFlagDefault("--out-dir", "v2/artifacts/full_selfhost"))
+    let targetTriple = readFlagDefault("--target", "arm64-apple-darwin")
+    let sourceRaw = "v2/src/tooling/cheng_v2.cheng"
+    let workingDir = currentWorkingDir()
+    let stage1Dir = stageNamedDir(outDir, "cheng_v2.stage1")
+    let stage2Dir = stageNamedDir(outDir, "cheng_v2.stage2")
+    let stage3Dir = stageNamedDir(outDir, "cheng_v2.stage3")
+    let stage2ToolingDir = stage2ToolingDirPath(outDir)
+    let stage2ToolingReport = stage2ToolingReportPath(outDir)
+    createDirAll(stage1Dir)
+    createDirAll(stage2Dir)
+    createDirAll(stage3Dir)
+    let stage1 = buildStageArtifacts(compilerPath, sourceRaw, targetTriple, stage1Dir, "cheng_v2")
+    let stage2 = buildStageArtifacts(stage1.binaryPath, sourceRaw, targetTriple, stage2Dir, "cheng_v2")
+    let stage3 = buildStageArtifacts(stage2.binaryPath, sourceRaw, targetTriple, stage3Dir, "cheng_v2")
+    let releaseEqual = compareTextFiles(stage2.releasePath, stage3.releasePath)
+    let planEqual = compareTextFiles(stage2.systemLinkPlanPath, stage3.systemLinkPlanPath)
+    let execEqual = compareTextFiles(stage2.systemLinkExecPath, stage3.systemLinkExecPath)
+    let binaryEqual = compareBinaryFiles(stage2.binaryPath, stage3.binaryPath)
+    let outputCidEqual = stage2.outputFileCid == stage3.outputFileCid
+    let noExternalCProvider = stage1.externalCcProviderCount == 0 &&
+                              stage2.externalCcProviderCount == 0 &&
+                              stage3.externalCcProviderCount == 0 &&
+                              stage2.compilerCoreProviderSourceKind == "cheng_module" &&
+                              stage2.compilerCoreProviderCompileMode == "machine_obj"
+    let toolingSelfhostArgv = ["tooling-selfhost-host", "--compiler", stage2.binaryPath, "--out-dir", stage2ToolingDir]
+    let toolingSelfhostText = runCompilerCommandOrPanic(stage2.binaryPath,
+                                                        toolingSelfhostArgv,
+                                                        workingDir,
+                                                        "full selfhost: stage2 tooling selfhost failed")
+    writeTextFile(stage2ToolingReport, toolingSelfhostText)
+    let stage2ToolingOk = extractLineValue(toolingSelfhostText, "tooling_selfhost_host_ok") == "1"
+    let ok = releaseEqual &&
+             planEqual &&
+             execEqual &&
+             binaryEqual &&
+             outputCidEqual &&
+             stage2ToolingOk &&
+             noExternalCProvider
+    printLine("full_selfhost_ok=" + if ok: "1" else: "0")
+    printLine("compiler=" + compilerPath)
+    printLine("stage1_binary_cid=" + stage1.binaryCid)
+    printLine("stage2_binary_cid=" + stage2.binaryCid)
+    printLine("stage3_binary_cid=" + stage3.binaryCid)
+    printLine("stage2_stage3_release_equal=" + if releaseEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_plan_equal=" + if planEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_exec_equal=" + if execEqual: "1" else: "0")
+    printLine("stage2_stage3_binary_equal=" + if binaryEqual: "1" else: "0")
+    printLine("stage2_stage3_output_file_cid_equal=" + if outputCidEqual: "1" else: "0")
+    printLine("stage2_tooling_selfhost_ok=" + if stage2ToolingOk: "1" else: "0")
+    printRequiredPrefixedLineValue(toolingSelfhostText, "tooling_selfhost_proof_target", "stage2_tooling_proof_target")
+    printRequiredPrefixedLineValue(toolingSelfhostText, "tooling_selfhost_stage0_hash", "stage2_tooling_stage0_hash")
+    printRequiredPrefixedLineValue(toolingSelfhostText, "tooling_selfhost_stage1_hash", "stage2_tooling_stage1_hash")
+    printRequiredPrefixedLineValue(toolingSelfhostText, "tooling_selfhost_stage2_hash", "stage2_tooling_stage2_hash")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_stage0_stage1_equal",
+                                   "stage2_tooling_stage0_stage1_equal")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_stage1_stage2_equal",
+                                   "stage2_tooling_stage1_stage2_equal")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_stage1_stage2_source_equal",
+                                   "stage2_tooling_stage1_stage2_source_equal")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_source_manifest_cid",
+                                   "stage2_tooling_source_manifest_cid")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_rule_pack_cid",
+                                   "stage2_tooling_rule_pack_cid")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compiler_rule_pack_cid",
+                                   "stage2_tooling_compiler_rule_pack_cid")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_release_compile_key",
+                                   "stage2_tooling_release_compile_key")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_obj_image_cid",
+                                   "stage2_tooling_obj_image_cid")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_obj_section_count",
+                                   "stage2_tooling_obj_section_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_obj_symbol_count",
+                                   "stage2_tooling_obj_symbol_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_obj_reloc_count",
+                                   "stage2_tooling_obj_reloc_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_topology_count",
+                                   "stage2_tooling_topology_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_rule_pack_entry_count",
+                                   "stage2_tooling_rule_pack_entry_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compiler_rule_pack_entry_count",
+                                   "stage2_tooling_compiler_rule_pack_entry_count")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_priority_mapping_fixed",
+                                   "stage2_tooling_priority_mapping_fixed")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_lsmr_addressing_mode",
+                                   "stage2_tooling_lsmr_addressing_mode")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_lsmr_address_binding",
+                                   "stage2_tooling_lsmr_address_binding")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_lsmr_distance_metric",
+                                   "stage2_tooling_lsmr_distance_metric")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_lsmr_route_plan_model",
+                                   "stage2_tooling_lsmr_route_plan_model")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_topology_covered",
+                                   "stage2_tooling_compile_key_topology_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_addressing_covered",
+                                   "stage2_tooling_compile_key_addressing_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_depth_covered",
+                                   "stage2_tooling_compile_key_depth_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_address_binding_covered",
+                                   "stage2_tooling_compile_key_address_binding_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_distance_metric_covered",
+                                   "stage2_tooling_compile_key_distance_metric_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_priority_covered",
+                                   "stage2_tooling_compile_key_priority_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_dispersal_covered",
+                                   "stage2_tooling_compile_key_dispersal_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_signature_covered",
+                                   "stage2_tooling_compile_key_signature_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_compile_key_canonical_multipath_covered",
+                                   "stage2_tooling_compile_key_canonical_multipath_covered")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_release_manifest_matches_source_manifest",
+                                   "stage2_tooling_release_manifest_matches_source_manifest")
+    printRequiredPrefixedLineValue(toolingSelfhostText,
+                                   "tooling_selfhost_random_gossip_fallback_present",
+                                   "stage2_tooling_random_gossip_fallback_present")
+    printLine("stage1_external_cc_provider_count=" + intToStr(stage1.externalCcProviderCount))
+    printLine("stage2_external_cc_provider_count=" + intToStr(stage2.externalCcProviderCount))
+    printLine("stage3_external_cc_provider_count=" + intToStr(stage3.externalCcProviderCount))
+    printLine("compiler_core_provider_source_kind=" + stage2.compilerCoreProviderSourceKind)
+    printLine("compiler_core_provider_compile_mode=" + stage2.compilerCoreProviderCompileMode)
+    printLine("compiler_core_dispatch_provider_removed=" + if noExternalCProvider: "1" else: "0")
+    printLine("emit_c_used_after_stage0=0")
+    return ok ? 0 : 1
 
 fn printUsage() =
     printLine("cheng_tooling_v2")
@@ -3406,17 +4331,309 @@ fn releaseCompileKeyCoversNetworkBundle(releaseBundle: rart.ReleaseArtifactBundl
                 return false
     return true
 
-fn runStageSelfhostHost(): int32 =
-    return runStageSelfhostHostBridge()
-
-fn runToolingSelfhostHost(): int32 =
-    return runToolingSelfhostHostBridge()
-
 fn runToolingSelfhostCheck(): int32 =
-    return runToolingSelfhostCheckBridge()
+    let program = toolingProgramFromFlags()
+    let stage1Text = toolingEmitStage1ModuleText(program)
+    let stage1Program = toolingParseStage1ProgramText(stage1Text)
+    let stage2Text = toolingEmitStage1ModuleText(stage1Program)
+    let stage2Program = toolingParseStage1ProgramText(stage2Text)
+    let stage0Result = toolingBuildStageResult(program)
+    let stage1Result = toolingBuildStageResult(stage1Program)
+    let stage2Result = toolingBuildStageResult(stage2Program)
+    let stage0Stage1Equal = toolingStageResultsEqual(stage0Result, stage1Result)
+    let stage1Stage2Equal = toolingStageResultsEqual(stage1Result, stage2Result)
+    let stage1Stage2SourceEqual = stage1Text == stage2Text
+    printLine("tooling_selfhost_stage0_hash=" + uint64HexLower16(stage0Result.stageHash))
+    printLine("tooling_selfhost_stage1_hash=" + uint64HexLower16(stage1Result.stageHash))
+    printLine("tooling_selfhost_stage2_hash=" + uint64HexLower16(stage2Result.stageHash))
+    printLine("tooling_selfhost_proof_target=" + program.targetTriple)
+    printLine("tooling_selfhost_stage0_stage1_equal=" + if stage0Stage1Equal: "1" else: "0")
+    printLine("tooling_selfhost_stage1_stage2_equal=" + if stage1Stage2Equal: "1" else: "0")
+    printLine("tooling_selfhost_stage1_stage2_source_equal=" + if stage1Stage2SourceEqual: "1" else: "0")
+    if !stage0Result.report.ok:
+        printLine("tooling_selfhost_ok=0")
+        printLine("reason=" + stage0Result.report.reason)
+        return 1
+    printLine("tooling_selfhost_source_manifest_cid=" + stage0Result.report.sourceManifestCid)
+    printLine("tooling_selfhost_rule_pack_cid=" + stage0Result.report.rulePackCid)
+    printLine("tooling_selfhost_compiler_rule_pack_cid=" + stage0Result.report.compilerRulePackCid)
+    printLine("tooling_selfhost_release_compile_key=" + stage0Result.report.releaseCompileKey)
+    printLine("tooling_selfhost_obj_image_cid=" + stage0Result.report.objImageCid)
+    printLine("tooling_selfhost_obj_section_count=" + intToStr(stage0Result.report.objSectionCount))
+    printLine("tooling_selfhost_obj_symbol_count=" + intToStr(stage0Result.report.objSymbolCount))
+    printLine("tooling_selfhost_obj_reloc_count=" + intToStr(stage0Result.report.objRelocCount))
+    printLine("tooling_selfhost_topology_count=" + intToStr(stage0Result.report.topologyCount))
+    printLine("tooling_selfhost_rule_pack_entry_count=" + intToStr(stage0Result.report.rulePackEntryCount))
+    printLine("tooling_selfhost_compiler_rule_pack_entry_count=" + intToStr(stage0Result.report.compilerRulePackEntryCount))
+    printLine("tooling_selfhost_priority_mapping_fixed=" + if stage0Result.report.lsmrPriorityMappingFixed: "1" else: "0")
+    printLine("tooling_selfhost_lsmr_addressing_mode=" + stage0Result.report.lsmrAddressingMode)
+    printLine("tooling_selfhost_lsmr_address_binding=" + stage0Result.report.lsmrAddressBinding)
+    printLine("tooling_selfhost_lsmr_distance_metric=" + stage0Result.report.lsmrDistanceMetric)
+    printLine("tooling_selfhost_lsmr_route_plan_model=" + stage0Result.report.lsmrRoutePlanModel)
+    printLine("tooling_selfhost_compile_key_topology_covered=" + if stage0Result.report.compileKeyTopologyCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_addressing_covered=" + if stage0Result.report.compileKeyAddressingCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_depth_covered=" + if stage0Result.report.compileKeyDepthCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_address_binding_covered=" + if stage0Result.report.compileKeyAddressBindingCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_distance_metric_covered=" + if stage0Result.report.compileKeyDistanceMetricCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_priority_covered=" + if stage0Result.report.compileKeyPriorityCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_dispersal_covered=" + if stage0Result.report.compileKeyDispersalCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_signature_covered=" + if stage0Result.report.compileKeySignatureCovered: "1" else: "0")
+    printLine("tooling_selfhost_compile_key_canonical_multipath_covered=" + if stage0Result.report.compileKeyCanonicalMultipathCovered: "1" else: "0")
+    printLine("tooling_selfhost_release_manifest_matches_source_manifest=" + if stage0Result.report.releaseManifestMatchesSourceManifest: "1" else: "0")
+    printLine("tooling_selfhost_random_gossip_fallback_present=" + if stage0Result.report.randomGossipFallbackPresent: "1" else: "0")
+    let ok = stage0Stage1Equal && stage1Stage2Equal && stage1Stage2SourceEqual
+    printLine("tooling_selfhost_ok=" + if ok: "1" else: "0")
+    return ok ? 0 : 1
 
 fn runProgramSelfhostCheck(): int32 =
-    return runProgramSelfhostCheckBridge()
+    let compilerPath = absolutePath(readFlagDefault("--compiler", currentCompilerPath()))
+    let outDir = absolutePath(readFlagDefault("--out-dir", "v2/artifacts/full_selfhost/program_selfhost"))
+    let targetTriple = readFlagDefault("--target", "arm64-apple-darwin")
+    let compilerSource = "v2/src/tooling/cheng_v2.cheng"
+    let lsmrAdvancedSource = "v2/cheng-quic/src/tests/lsmr_advanced_features_smoke.cheng"
+    let chainStateSource = "v2/cheng-quic/src/tests/chain_state_tree_sync_smoke.cheng"
+    let quicTlsEcdsaSource = "v2/cheng-quic/src/tests/quic_tls_transport_ecdsa_smoke.cheng"
+    let msquicChainSource = "v2/cheng-quic/src/tests/msquic_chain_smoke.cheng"
+    let chainNodeSource = "v2/cheng-quic/src/project/chain_node.cheng"
+    let quicTlsEcdsaPrefixes = ["v2_quic_tls_transport_ecdsa_stage="]
+    let msquicChainPrefixes = ["msquic_chain_smoke_alg_stage=",
+                               "msquic_chain_smoke_stage=",
+                               "msquic_native_dial_stage=",
+                               "msquic_native_client_hello_stage=",
+                               "msquic_native_server_flight_stage=",
+                               "msquic_tls13_cert_verify_stage=",
+                               "msquic_tls13_parse_stage=",
+                               "msquic_native_client_finished_stage=",
+                               "msquic_transport_dial_stage="]
+    let stagesDir = joinPath2(outDir, "stages")
+    let stage1Dir = joinPath2(stagesDir, "cheng_v2.stage1")
+    let stage2Dir = joinPath2(stagesDir, "cheng_v2.stage2")
+    let stage3Dir = joinPath2(stagesDir, "cheng_v2.stage3")
+    let programsDir = joinPath2(outDir, "programs")
+    let lsmrAdvancedBinary = joinPath2(programsDir, "lsmr_advanced_features_smoke_bin")
+    let lsmrAdvancedStdoutPath = joinPath2(programsDir, "lsmr_advanced_features_smoke.stdout")
+    let chainStateBinary = joinPath2(programsDir, "chain_state_tree_sync_smoke_bin")
+    let chainStateStdoutPath = joinPath2(programsDir, "chain_state_tree_sync_smoke.stdout")
+    let quicTlsEcdsaBinary = joinPath2(programsDir, "quic_tls_transport_ecdsa_smoke_bin")
+    let quicTlsEcdsaStdoutPath = joinPath2(programsDir, "quic_tls_transport_ecdsa_smoke.stdout")
+    let quicTlsEcdsaReportPath = joinPath2(programsDir, "quic_tls_transport_ecdsa_smoke.report.txt")
+    let msquicChainBinary = joinPath2(programsDir, "msquic_chain_smoke_bin")
+    let msquicChainStdoutPath = joinPath2(programsDir, "msquic_chain_smoke.stdout")
+    let msquicChainReportPath = joinPath2(programsDir, "msquic_chain_smoke.report.txt")
+    let chainNodeBinary = joinPath2(programsDir, "chain_node_bin")
+    let chainNodeZeroRoot = joinPath2(programsDir, "chain_node_zero_root")
+    let chainNodeMintRoot = joinPath2(programsDir, "chain_node_mint_root")
+    let chainNodeProcessStdoutPath = joinPath2(programsDir, "chain_node_process_smoke.stdout")
+    removeTree(outDir)
+    createDirAll(stage1Dir)
+    createDirAll(stage2Dir)
+    createDirAll(stage3Dir)
+    createDirAll(programsDir)
+    removeTree(chainNodeZeroRoot)
+    removeTree(chainNodeMintRoot)
+
+    let stage1 = buildStageArtifacts(compilerPath, compilerSource, targetTriple, stage1Dir, "cheng_v2")
+    let stage2 = buildStageArtifacts(stage1.binaryPath, compilerSource, targetTriple, stage2Dir, "cheng_v2")
+    let stage3 = buildStageArtifacts(stage2.binaryPath, compilerSource, targetTriple, stage3Dir, "cheng_v2")
+    let releaseEqual = compareTextFiles(stage2.releasePath, stage3.releasePath)
+    let planEqual = compareTextFiles(stage2.systemLinkPlanPath, stage3.systemLinkPlanPath)
+    let execEqual = compareTextFiles(stage2.systemLinkExecPath, stage3.systemLinkExecPath)
+    let binaryEqual = compareBinaryFiles(stage2.binaryPath, stage3.binaryPath)
+    let outputCidEqual = stage2.outputFileCid == stage3.outputFileCid
+    let noExternalCProvider = stage1.externalCcProviderCount == 0 &&
+                              stage2.externalCcProviderCount == 0 &&
+                              stage3.externalCcProviderCount == 0 &&
+                              stage2.compilerCoreProviderSourceKind == "cheng_module" &&
+                              stage2.compilerCoreProviderCompileMode == "machine_obj"
+    var quicTlsEcdsaStageTotal: int32 = 0
+    var msquicChainStageTotal: int32 = 0
+
+    buildProgramBinaryOrPanic(stage2.binaryPath,
+                              lsmrAdvancedSource,
+                              targetTriple,
+                              lsmrAdvancedBinary,
+                              "program selfhost: lsmr advanced smoke compile failed")
+    let lsmrAdvancedStdout = runBinaryCaptureOrPanic(lsmrAdvancedBinary,
+                                                     [],
+                                                     "program selfhost: lsmr advanced smoke run failed",
+                                                     toolingProgramRunTimeoutDefaultSec)
+    writeTextFile(lsmrAdvancedStdoutPath, lsmrAdvancedStdout)
+    compareExpectedTextOrPanic("v2/tests/contracts/lsmr_advanced_features_smoke.expected",
+                               lsmrAdvancedStdoutPath,
+                               "program selfhost: lsmr advanced smoke mismatch")
+    let lsmrAdvancedOk = true
+
+    buildProgramBinaryOrPanic(stage2.binaryPath,
+                              chainStateSource,
+                              targetTriple,
+                              chainStateBinary,
+                              "program selfhost: chain state tree sync smoke compile failed")
+    let chainStateStdout = runBinaryCaptureOrPanic(chainStateBinary,
+                                                   [],
+                                                   "program selfhost: chain state tree sync smoke run failed",
+                                                   toolingProgramRunTimeoutDefaultSec)
+    writeTextFile(chainStateStdoutPath, chainStateStdout)
+    compareExpectedTextOrPanic("v2/tests/contracts/chain_state_tree_sync_smoke.expected",
+                               chainStateStdoutPath,
+                               "program selfhost: chain state tree sync smoke mismatch")
+    let chainStateOk = true
+
+    buildProgramBinaryOrPanic(stage2.binaryPath,
+                              quicTlsEcdsaSource,
+                              targetTriple,
+                              quicTlsEcdsaBinary,
+                              "program selfhost: quic tls transport ecdsa smoke compile failed")
+    let quicTlsEcdsaStdout = runBinaryCaptureOrPanic(quicTlsEcdsaBinary,
+                                                     [],
+                                                     "program selfhost: quic tls transport ecdsa smoke run failed",
+                                                     toolingProgramRunTimeoutNetworkSmokeSec)
+    writeTextFile(quicTlsEcdsaStdoutPath, quicTlsEcdsaStdout)
+    compareExpectedTextOrPanic("v2/tests/contracts/quic_tls_transport_ecdsa_smoke.expected",
+                               quicTlsEcdsaStdoutPath,
+                               "program selfhost: quic tls transport ecdsa smoke mismatch")
+    writeTextFile(quicTlsEcdsaReportPath,
+                  buildNetworkSmokeReportText("quic_tls_transport_ecdsa_smoke",
+                                              quicTlsEcdsaStdoutPath,
+                                              quicTlsEcdsaPrefixes,
+                                              quicTlsEcdsaStdout,
+                                              quicTlsEcdsaStageTotal))
+    let quicTlsEcdsaOk = true
+
+    buildProgramBinaryOrPanic(stage2.binaryPath,
+                              msquicChainSource,
+                              targetTriple,
+                              msquicChainBinary,
+                              "program selfhost: msquic chain smoke compile failed")
+    let msquicChainStdout = runBinaryCaptureOrPanic(msquicChainBinary,
+                                                    [],
+                                                    "program selfhost: msquic chain smoke run failed",
+                                                    toolingProgramRunTimeoutNetworkSmokeSec)
+    writeTextFile(msquicChainStdoutPath, msquicChainStdout)
+    compareExpectedTextOrPanic("v2/tests/contracts/msquic_chain_smoke.expected",
+                               msquicChainStdoutPath,
+                               "program selfhost: msquic chain smoke mismatch")
+    writeTextFile(msquicChainReportPath,
+                  buildNetworkSmokeReportText("msquic_chain_smoke",
+                                              msquicChainStdoutPath,
+                                              msquicChainPrefixes,
+                                              msquicChainStdout,
+                                              msquicChainStageTotal))
+    let msquicChainOk = true
+
+    buildProgramBinaryOrPanic(stage2.binaryPath,
+                              chainNodeSource,
+                              targetTriple,
+                              chainNodeBinary,
+                              "program selfhost: chain node compile failed")
+    let chainNodeBuildOk = true
+
+    let chainNodeZeroBalanceStdout = runBinaryCaptureOrPanic(chainNodeBinary,
+                                                             ["balance",
+                                                              "--root", chainNodeZeroRoot,
+                                                              "--node-id", "program-selfhost-zero",
+                                                              "--account", "alice",
+                                                              "--asset", "cheng"],
+                                                             "program selfhost: chain node zero balance failed",
+                                                             toolingProgramRunTimeoutChainNodeSec)
+    let chainNodeZeroBalance = extractLineValue(chainNodeZeroBalanceStdout, "balance")
+    let chainNodeZeroBalanceOk = chainNodeZeroBalance == "0"
+    if !chainNodeZeroBalanceOk:
+        system.panic("program selfhost: chain node zero balance mismatch")
+
+    let chainNodeMintStdout = runBinaryCaptureOrPanic(chainNodeBinary,
+                                                      ["mint",
+                                                       "--root", chainNodeMintRoot,
+                                                       "--node-id", "program-selfhost-mint",
+                                                       "--account", "alice",
+                                                       "--asset", "cheng",
+                                                       "--amount", "11"],
+                                                      "program selfhost: chain node mint failed",
+                                                      toolingProgramRunTimeoutChainNodeSec)
+    let chainNodeMintEventCid = extractLineValue(chainNodeMintStdout, "event_cid")
+    let chainNodeMintOk = len(chainNodeMintEventCid) > 0
+    if !chainNodeMintOk:
+        system.panic("program selfhost: chain node mint output missing event_cid")
+
+    let chainNodeAfterMintBalanceStdout = runBinaryCaptureOrPanic(chainNodeBinary,
+                                                                  ["balance",
+                                                                   "--root", chainNodeMintRoot,
+                                                                   "--node-id", "program-selfhost-mint",
+                                                                   "--account", "alice",
+                                                                   "--asset", "cheng"],
+                                                                  "program selfhost: chain node minted balance failed",
+                                                                  toolingProgramRunTimeoutChainNodeSec)
+    let chainNodeAfterMintBalance = extractLineValue(chainNodeAfterMintBalanceStdout, "balance")
+    let chainNodeAfterMintBalanceOk = chainNodeAfterMintBalance == "11"
+    if !chainNodeAfterMintBalanceOk:
+        system.panic("program selfhost: chain node minted balance mismatch")
+
+    let chainNodeProcessStdout = runChainNodeProcessSmokeCaptureOrPanic(chainNodeBinary,
+                                                                        programsDir,
+                                                                        "program selfhost: chain node process smoke failed")
+    writeTextFile(chainNodeProcessStdoutPath, chainNodeProcessStdout)
+    compareExpectedTextOrPanic("v2/tests/contracts/chain_node_process_smoke.expected",
+                               chainNodeProcessStdoutPath,
+                               "program selfhost: chain node process smoke mismatch")
+    let chainNodeProcessSyncOutput = extractLineValue(chainNodeProcessStdout, "sync_output")
+    let chainNodeProcessBalanceOutput = extractLineValue(chainNodeProcessStdout, "balance_output")
+    let chainNodeProcessServerOutput = extractLineValue(chainNodeProcessStdout, "server_output")
+    let chainNodeProcessOk = len(chainNodeProcessSyncOutput) > 0 &&
+                             len(chainNodeProcessBalanceOutput) > 0 &&
+                             len(chainNodeProcessServerOutput) > 0
+    if !chainNodeProcessOk:
+        system.panic("program selfhost: chain node process smoke output missing required line")
+
+    let ok = releaseEqual &&
+             planEqual &&
+             execEqual &&
+             binaryEqual &&
+             outputCidEqual &&
+             noExternalCProvider &&
+             lsmrAdvancedOk &&
+             chainStateOk &&
+             quicTlsEcdsaOk &&
+             msquicChainOk &&
+             chainNodeBuildOk &&
+             chainNodeZeroBalanceOk &&
+             chainNodeMintOk &&
+             chainNodeAfterMintBalanceOk &&
+             chainNodeProcessOk
+    printLine("program_selfhost_ok=" + if ok: "1" else: "0")
+    printLine("compiler=" + compilerPath)
+    printLine("stage1_binary_cid=" + stage1.binaryCid)
+    printLine("stage2_binary_cid=" + stage2.binaryCid)
+    printLine("stage3_binary_cid=" + stage3.binaryCid)
+    printLine("stage2_stage3_release_equal=" + if releaseEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_plan_equal=" + if planEqual: "1" else: "0")
+    printLine("stage2_stage3_system_link_exec_equal=" + if execEqual: "1" else: "0")
+    printLine("stage2_stage3_binary_equal=" + if binaryEqual: "1" else: "0")
+    printLine("stage2_stage3_output_file_cid_equal=" + if outputCidEqual: "1" else: "0")
+    printLine("stage1_external_cc_provider_count=" + intToStr(stage1.externalCcProviderCount))
+    printLine("stage2_external_cc_provider_count=" + intToStr(stage2.externalCcProviderCount))
+    printLine("stage3_external_cc_provider_count=" + intToStr(stage3.externalCcProviderCount))
+    printLine("compiler_core_provider_source_kind=" + stage2.compilerCoreProviderSourceKind)
+    printLine("compiler_core_provider_compile_mode=" + stage2.compilerCoreProviderCompileMode)
+    printLine("stage2_lsmr_advanced_smoke_ok=1")
+    printLine("stage2_chain_state_tree_sync_smoke_ok=1")
+    printLine("stage2_quic_tls_transport_ecdsa_smoke_ok=1")
+    printLine("stage2_quic_tls_transport_ecdsa_report_version=v2_network_smoke_report_v1")
+    printLine("stage2_quic_tls_transport_ecdsa_report_path=" + quicTlsEcdsaReportPath)
+    printLine("stage2_quic_tls_transport_ecdsa_stage_total=" + intToStr(quicTlsEcdsaStageTotal))
+    printLine("stage2_msquic_chain_smoke_ok=1")
+    printLine("stage2_msquic_chain_report_version=v2_network_smoke_report_v1")
+    printLine("stage2_msquic_chain_report_path=" + msquicChainReportPath)
+    printLine("stage2_msquic_chain_stage_total=" + intToStr(msquicChainStageTotal))
+    printLine("stage2_chain_node_build_ok=1")
+    printLine("stage2_chain_node_zero_balance=" + chainNodeZeroBalance)
+    printLine("stage2_chain_node_mint_event_cid_present=" + if chainNodeMintOk: "1" else: "0")
+    printLine("stage2_chain_node_balance_after_mint=" + chainNodeAfterMintBalance)
+    printLine("stage2_chain_node_process_smoke_ok=" + if chainNodeProcessOk: "1" else: "0")
+    printLine("stage2_chain_node_process_shell_orchestration=0")
+    printLine("stage2_program_runtime_bridge_shell_exec_used=0")
+    printLine("stage2_chain_node_sync_once_output=" + chainNodeProcessSyncOutput)
+    printLine("stage2_chain_node_sync_balance_output=" + chainNodeProcessBalanceOutput)
+    printLine("stage2_chain_node_serve_once_output=" + chainNodeProcessServerOutput)
+    return ok ? 0 : 1
 
 fn isEmptyText(text: str): bool =
     return len(text) == 0

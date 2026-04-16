@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #if !defined(_WIN32)
@@ -64,11 +65,19 @@
 #define CHENG_HAS_EXECINFO 0
 #endif
 #if defined(__APPLE__)
+#include <TargetConditionals.h>
 #include <sys/ucontext.h>
 #include <mach-o/dyld.h>
 #include <crt_externs.h>
 #include <mach/mach.h>
+#if !TARGET_OS_IPHONE
 #include <mach/mach_vm.h>
+#endif
+#endif
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define CHENG_TARGET_APPLE_MOBILE 1
+#else
+#define CHENG_TARGET_APPLE_MOBILE 0
 #endif
 #include "cheng_sidecar_loader.h"
 #include "../../../v3/runtime/native/v3_str_twoway_search.h"
@@ -80,6 +89,50 @@
 #define WEAK __attribute__((weak))
 #else
 #define WEAK
+#endif
+
+#if defined(__GNUC__) || defined(__clang__)
+extern int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
+    const char* request_id,
+    int32_t purpose,
+    const char* did_text,
+    const char* prompt_title,
+    const char* prompt_reason,
+    const char* device_binding_seed_hint,
+    const char* device_label_hint,
+    char* out_feature32_hex,
+    int32_t out_feature32_cap,
+    char* out_device_binding_seed,
+    int32_t out_device_binding_seed_cap,
+    char* out_device_label,
+    int32_t out_device_label_cap,
+    char* out_sensor_id,
+    int32_t out_sensor_id_cap,
+    char* out_hardware_attestation,
+    int32_t out_hardware_attestation_cap,
+    char* out_error,
+    int32_t out_error_cap) __attribute__((weak));
+#else
+extern int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
+    const char* request_id,
+    int32_t purpose,
+    const char* did_text,
+    const char* prompt_title,
+    const char* prompt_reason,
+    const char* device_binding_seed_hint,
+    const char* device_label_hint,
+    char* out_feature32_hex,
+    int32_t out_feature32_cap,
+    char* out_device_binding_seed,
+    int32_t out_device_binding_seed_cap,
+    char* out_device_label,
+    int32_t out_device_label_cap,
+    char* out_sensor_id,
+    int32_t out_sensor_id_cap,
+    char* out_hardware_attestation,
+    int32_t out_hardware_attestation_cap,
+    char* out_error,
+    int32_t out_error_cap);
 #endif
 
 #if defined(__APPLE__)
@@ -144,11 +197,7 @@ char* driver_c_bool_to_str(bool value);
 static char* cheng_copy_string_bytes(const char* src, size_t len);
 static int driver_c_runtime_resolve_self_path(char* out, size_t out_cap);
 void cheng_dump_backtrace_if_enabled(void);
-static int cheng_backtrace_enabled(void);
-static void cheng_dump_native_backtrace_if_enabled(void);
 static void cheng_dump_backtrace_now(const char* reason);
-static void cheng_v3_profile_maybe_init(const char* exe_path);
-static void cheng_v3_profile_write_reports(void);
 static void cheng_exec_kill_target(pid_t pid, int sig);
 static pid_t cheng_exec_spawn_orphan_guard(pid_t targetPid);
 static void cheng_exec_stop_orphan_guard(pid_t guardPid);
@@ -560,16 +609,6 @@ void cheng_rawmem_write_char(void* dst, int32_t idx, int32_t value) {
     ((uint8_t*)dst)[idx] = (uint8_t)value;
 }
 
-int32_t cheng_force_segv(void) {
-#if defined(_WIN32)
-    volatile int* p = (volatile int*)0;
-    *p = 1;
-#else
-    raise(SIGSEGV);
-#endif
-    return 0;
-}
-
 void* cheng_seq_slice_alloc(void* buffer, int32_t len, int32_t start_pos, int32_t stop_pos,
                             int32_t exclusive, int32_t elem_size,
                             int32_t* out_len, int32_t* out_cap) {
@@ -855,6 +894,14 @@ WEAK int32_t cheng_v3_udp_platform_use_len_field_bridge(void) {
 #endif
 }
 
+WEAK int32_t cheng_v3_udp_platform_msg_dontwait_bridge(void) {
+#if defined(__linux__)
+    return 0x40;
+#else
+    return 0x80;
+#endif
+}
+
 static int32_t cheng_v3_hex_value_ascii(char c) {
     if (c >= '0' && c <= '9') {
         return (int32_t)(c - '0');
@@ -1023,846 +1070,13 @@ static int32_t driver_c_env_i32(const char* name, int32_t fallback) {
     return (int32_t)value;
 }
 
-#define CHENG_CRASH_TRACE_RING 128
+#include "system_helpers_debug_state.inc"
 
-typedef struct ChengCrashTraceEntry {
-    const char* tag;
-    int32_t a;
-    int32_t b;
-    int32_t c;
-    int32_t d;
-} ChengCrashTraceEntry;
+#include "system_helpers_debug_host_base.inc"
 
-static ChengCrashTraceEntry cheng_crash_trace_ring[CHENG_CRASH_TRACE_RING];
-static volatile int32_t cheng_crash_trace_next = 0;
-static volatile int32_t cheng_crash_trace_enabled_cache = -1;
-static volatile int32_t cheng_crash_trace_installed = 0;
-static volatile sig_atomic_t cheng_crash_trace_handling = 0;
-static const char* cheng_crash_trace_phase = NULL;
-
-#define CHENG_V3_PROFILE_MAX_SAMPLES 65536
-#define CHENG_V3_PROFILE_MAX_DEPTH 8
-
-typedef struct ChengV3ProfileSample {
-    uint8_t depth;
-    uintptr_t pcs[CHENG_V3_PROFILE_MAX_DEPTH];
-} ChengV3ProfileSample;
-
-static ChengV3ProfileSample* cheng_v3_profile_samples = NULL;
-static int32_t cheng_v3_profile_capacity = 0;
-static volatile sig_atomic_t cheng_v3_profile_sample_count = 0;
-static volatile sig_atomic_t cheng_v3_profile_dropped_samples = 0;
-static volatile sig_atomic_t cheng_v3_profile_initialized = 0;
-static volatile sig_atomic_t cheng_v3_profile_enabled_cache = -1;
-static volatile sig_atomic_t cheng_v3_profile_installed = 0;
-static char cheng_v3_profile_raw_out_path[PATH_MAX];
-
-static int cheng_flag_enabled(const char* raw) {
-    if (raw == NULL || raw[0] == '\0') return 0;
-    if (raw[0] == '0' && raw[1] == '\0') return 0;
-    return 1;
-}
-
-static int cheng_v3_profile_env_enabled(void) {
-    return cheng_flag_enabled(getenv("CHENG_V3_PROFILE_ENABLE"));
-}
-
-static int32_t cheng_v3_profile_hz_value(void) {
-    const char* raw = getenv("CHENG_V3_PROFILE_HZ");
-    char* end = NULL;
-    long value = 200;
-    if (raw != NULL && raw[0] != '\0') {
-        value = strtol(raw, &end, 10);
-        if (end == raw) {
-            value = 200;
-        }
-    }
-    if (value < 10) value = 10;
-    if (value > 2000) value = 2000;
-    return (int32_t)value;
-}
-
-static int cheng_crash_trace_env_enabled(void) {
-    const char* raw = getenv("CHENG_CRASH_TRACE");
-    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
-    raw = getenv("BACKEND_CRASH_TRACE");
-    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
-    raw = getenv("STAGE1_CRASH_TRACE");
-    if (raw != NULL && raw[0] != '\0') return cheng_flag_enabled(raw);
-    return 1;
-}
-
-static size_t cheng_crash_trace_cstrnlen(const char* s, size_t limit) {
-    size_t n = 0;
-    if (s == NULL) return 0;
-    while (n < limit && s[n] != '\0') n++;
-    return n;
-}
-
-static void cheng_crash_trace_write_buf(const char* buf, size_t len) {
-    size_t off = 0;
-    while (off < len) {
-        ssize_t wrote = write(2, buf + off, len - off);
-        if (wrote <= 0) return;
-        off += (size_t)wrote;
-    }
-}
-
-static void cheng_crash_trace_write_cstr(const char* s) {
-    const char* text = (s != NULL) ? s : "?";
-    cheng_crash_trace_write_buf(text, cheng_crash_trace_cstrnlen(text, 160));
-}
-
-static void cheng_crash_trace_write_i32(int32_t value) {
-    char buf[24];
-    char* out = buf + sizeof(buf);
-    uint32_t mag;
-    *--out = '\0';
-    if (value < 0) {
-        mag = (uint32_t)(-(value + 1)) + 1u;
-    } else {
-        mag = (uint32_t)value;
-    }
-    do {
-        *--out = (char)('0' + (mag % 10u));
-        mag /= 10u;
-    } while (mag != 0u);
-    if (value < 0) {
-        *--out = '-';
-    }
-    cheng_crash_trace_write_cstr(out);
-}
-
-static void cheng_crash_trace_write_hex_uintptr(uintptr_t value) {
-    static const char hex[] = "0123456789abcdef";
-    char buf[2 + sizeof(uintptr_t) * 2 + 1];
-    size_t digits = sizeof(uintptr_t) * 2U;
-    size_t i;
-    buf[0] = '0';
-    buf[1] = 'x';
-    for (i = 0; i < digits; ++i) {
-        unsigned shift = (unsigned)((digits - 1U - i) * 4U);
-        buf[2 + i] = hex[(value >> shift) & 0xfU];
-    }
-    buf[2 + digits] = '\0';
-    cheng_crash_trace_write_buf(buf, 2U + digits);
-}
-
-static void cheng_crash_trace_dump_async(const char* reason, int32_t sig) {
-    cheng_crash_trace_write_cstr("[cheng-crash-trace] reason=");
-    cheng_crash_trace_write_cstr(reason);
-    if (sig != 0) {
-        cheng_crash_trace_write_cstr(" sig=");
-        cheng_crash_trace_write_i32(sig);
-    }
-    if (cheng_crash_trace_phase != NULL) {
-        cheng_crash_trace_write_cstr(" phase=");
-        cheng_crash_trace_write_cstr(cheng_crash_trace_phase);
-    }
-    cheng_crash_trace_write_cstr("\n");
-    int32_t end = cheng_crash_trace_next;
-    int32_t start = end > CHENG_CRASH_TRACE_RING ? end - CHENG_CRASH_TRACE_RING : 0;
-    for (int32_t i = start; i < end; ++i) {
-        const ChengCrashTraceEntry* entry = &cheng_crash_trace_ring[(uint32_t)i % CHENG_CRASH_TRACE_RING];
-        if (entry->tag == NULL) continue;
-        cheng_crash_trace_write_cstr("[cheng-crash-trace] #");
-        cheng_crash_trace_write_i32(i);
-        cheng_crash_trace_write_cstr(" ");
-        cheng_crash_trace_write_cstr(entry->tag);
-        cheng_crash_trace_write_cstr(" a=");
-        cheng_crash_trace_write_i32(entry->a);
-        cheng_crash_trace_write_cstr(" b=");
-        cheng_crash_trace_write_i32(entry->b);
-        cheng_crash_trace_write_cstr(" c=");
-        cheng_crash_trace_write_i32(entry->c);
-        cheng_crash_trace_write_cstr(" d=");
-        cheng_crash_trace_write_i32(entry->d);
-        cheng_crash_trace_write_cstr("\n");
-    }
-}
-
-typedef struct ChengV3EmbeddedLineMapEntry {
-    const void* start_pc;
-    const void* end_pc;
-    const char* function_name;
-    const char* source_path;
-    int32_t signature_line;
-    int32_t body_first_line;
-    int32_t body_last_line;
-    int32_t reserved;
-} ChengV3EmbeddedLineMapEntry;
-
-typedef const ChengV3EmbeddedLineMapEntry* (*ChengV3EmbeddedLineMapEntriesGetter)(void);
-typedef uint64_t (*ChengV3EmbeddedLineMapCountGetter)(void);
-
-static ChengV3EmbeddedLineMapEntriesGetter cheng_v3_embedded_line_map_entries_getter = NULL;
-static ChengV3EmbeddedLineMapCountGetter cheng_v3_embedded_line_map_count_getter = NULL;
-static volatile int32_t cheng_v3_embedded_line_map_getters_resolved = 0;
-
-static void cheng_v3_try_resolve_embedded_line_map_getters(void) {
-    if (__sync_lock_test_and_set(&cheng_v3_embedded_line_map_getters_resolved, 1) != 0) {
-        return;
-    }
-    dlerror();
-    cheng_v3_embedded_line_map_entries_getter =
-        (ChengV3EmbeddedLineMapEntriesGetter)dlsym(RTLD_DEFAULT, "cheng_v3_embedded_line_map_entries_get");
-    dlerror();
-    cheng_v3_embedded_line_map_count_getter =
-        (ChengV3EmbeddedLineMapCountGetter)dlsym(RTLD_DEFAULT, "cheng_v3_embedded_line_map_count_get");
-}
-
-static const ChengV3EmbeddedLineMapEntry* cheng_v3_embedded_line_map_find_pc_in_entries(
-    const ChengV3EmbeddedLineMapEntry* entries,
-    uint64_t count,
-    uintptr_t pc
-) {
-    uint64_t i;
-    if (entries == NULL || count == 0U || pc == 0U) {
-        return NULL;
-    }
-    for (i = 0; i < count; ++i) {
-        uintptr_t start = (uintptr_t)entries[i].start_pc;
-        uintptr_t end = (uintptr_t)entries[i].end_pc;
-        if (start == 0U) {
-            continue;
-        }
-        if (pc < start) {
-            continue;
-        }
-        if (end != 0U && pc >= end) {
-            continue;
-        }
-        return &entries[i];
-    }
-    return NULL;
-}
-
-static void cheng_v3_async_write_line_span(const ChengV3EmbeddedLineMapEntry* entry) {
-    int32_t line_start = 0;
-    int32_t line_end = 0;
-    if (entry == NULL) {
-        return;
-    }
-    line_start = entry->body_first_line > 0 ? entry->body_first_line : entry->signature_line;
-    line_end = entry->body_last_line > 0 ? entry->body_last_line : line_start;
-    cheng_crash_trace_write_i32(line_start);
-    if (line_end > line_start) {
-        cheng_crash_trace_write_cstr("-");
-        cheng_crash_trace_write_i32(line_end);
-    }
-}
-
-static void cheng_v3_async_write_source_frame(int32_t frame_index,
-                                              const ChengV3EmbeddedLineMapEntry* entry,
-                                              uintptr_t pc) {
-    if (entry == NULL) {
-        return;
-    }
-    cheng_crash_trace_write_cstr("[cheng-v3] #");
-    cheng_crash_trace_write_i32(frame_index);
-    cheng_crash_trace_write_cstr(" ");
-    cheng_crash_trace_write_cstr(
-        entry->function_name != NULL && entry->function_name[0] != '\0' ? entry->function_name : "?"
-    );
-    cheng_crash_trace_write_cstr(" ");
-    cheng_crash_trace_write_cstr(
-        entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?"
-    );
-    cheng_crash_trace_write_cstr(":");
-    cheng_v3_async_write_line_span(entry);
-    cheng_crash_trace_write_cstr(" pc=");
-    cheng_crash_trace_write_hex_uintptr(pc);
-    cheng_crash_trace_write_cstr("\n");
-}
-
-static void cheng_v3_async_write_machine_frame(int32_t frame_index,
-                                               uintptr_t pc,
-                                               uintptr_t fp,
-                                               uintptr_t sp,
-                                               uintptr_t lr,
-                                               const ChengV3EmbeddedLineMapEntry* entry) {
-    uintptr_t offset = 0U;
-    if (entry != NULL && entry->start_pc != NULL && pc >= (uintptr_t)entry->start_pc) {
-        offset = pc - (uintptr_t)entry->start_pc;
-    }
-    cheng_crash_trace_write_cstr("[cheng-v3] m#");
-    cheng_crash_trace_write_i32(frame_index);
-    cheng_crash_trace_write_cstr(" pc=");
-    cheng_crash_trace_write_hex_uintptr(pc);
-    cheng_crash_trace_write_cstr(" fp=");
-    cheng_crash_trace_write_hex_uintptr(fp);
-    cheng_crash_trace_write_cstr(" sp=");
-    if (sp != 0U) {
-        cheng_crash_trace_write_hex_uintptr(sp);
-    } else {
-        cheng_crash_trace_write_cstr("?");
-    }
-    cheng_crash_trace_write_cstr(" lr=");
-    if (lr != 0U) {
-        cheng_crash_trace_write_hex_uintptr(lr);
-    } else {
-        cheng_crash_trace_write_cstr("?");
-    }
-    cheng_crash_trace_write_cstr(" off=");
-    cheng_crash_trace_write_hex_uintptr(offset);
-    if (entry != NULL) {
-        cheng_crash_trace_write_cstr(" fn=");
-        cheng_crash_trace_write_cstr(
-            entry->function_name != NULL && entry->function_name[0] != '\0' ? entry->function_name : "?"
-        );
-        cheng_crash_trace_write_cstr(" src=");
-        cheng_crash_trace_write_cstr(
-            entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?"
-        );
-        cheng_crash_trace_write_cstr(":");
-        cheng_v3_async_write_line_span(entry);
-    }
-    cheng_crash_trace_write_cstr("\n");
-}
-
-static uintptr_t cheng_v3_signal_context_pc(void* signal_context) {
-#if defined(__APPLE__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL || context->uc_mcontext == NULL) {
-        return 0U;
-    }
-#if defined(__arm64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__pc;
-#elif defined(__x86_64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__rip;
-#elif defined(__i386__)
-    return (uintptr_t)context->uc_mcontext->__ss.__eip;
-#else
-    return 0U;
-#endif
-#else
-#if defined(__linux__) && defined(__aarch64__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL) {
-        return 0U;
-    }
-    return (uintptr_t)context->uc_mcontext.pc;
-#else
-    (void)signal_context;
-    return 0U;
-#endif
-#endif
-}
-
-static uintptr_t cheng_v3_signal_context_fp(void* signal_context) {
-#if defined(__APPLE__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL || context->uc_mcontext == NULL) {
-        return 0U;
-    }
-#if defined(__arm64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__fp;
-#elif defined(__x86_64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__rbp;
-#elif defined(__i386__)
-    return (uintptr_t)context->uc_mcontext->__ss.__ebp;
-#else
-    return 0U;
-#endif
-#else
-#if defined(__linux__) && defined(__aarch64__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL) {
-        return 0U;
-    }
-    return (uintptr_t)context->uc_mcontext.regs[29];
-#else
-    (void)signal_context;
-    return 0U;
-#endif
-#endif
-}
-
-static uintptr_t cheng_v3_signal_context_sp(void* signal_context) {
-#if defined(__APPLE__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL || context->uc_mcontext == NULL) {
-        return 0U;
-    }
-#if defined(__arm64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__sp;
-#elif defined(__x86_64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__rsp;
-#elif defined(__i386__)
-    return (uintptr_t)context->uc_mcontext->__ss.__esp;
-#else
-    return 0U;
-#endif
-#else
-#if defined(__linux__) && defined(__aarch64__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL) {
-        return 0U;
-    }
-    return (uintptr_t)context->uc_mcontext.sp;
-#else
-    (void)signal_context;
-    return 0U;
-#endif
-#endif
-}
-
-static uintptr_t cheng_v3_signal_context_lr(void* signal_context) {
-#if defined(__APPLE__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL || context->uc_mcontext == NULL) {
-        return 0U;
-    }
-#if defined(__arm64__)
-    return (uintptr_t)context->uc_mcontext->__ss.__lr;
-#elif defined(__x86_64__) || defined(__i386__)
-    return 0U;
-#else
-    return 0U;
-#endif
-#else
-#if defined(__linux__) && defined(__aarch64__)
-    const ucontext_t* context = (const ucontext_t*)signal_context;
-    if (context == NULL) {
-        return 0U;
-    }
-    return (uintptr_t)context->uc_mcontext.regs[30];
-#else
-    (void)signal_context;
-    return 0U;
-#endif
-#endif
-}
-
-static int32_t cheng_v3_dump_machine_signal_frames(const ChengV3EmbeddedLineMapEntry* entries,
-                                                   uint64_t count,
-                                                   uintptr_t pc,
-                                                   uintptr_t fp,
-                                                   uintptr_t sp,
-                                                   uintptr_t lr) {
-    int32_t depth = 0;
-    int32_t emitted = 0;
-    uintptr_t current_pc = pc;
-    uintptr_t current_fp = fp;
-    uintptr_t current_sp = sp;
-    uintptr_t current_lr = lr;
-    while (current_pc != 0U && depth < 48) {
-        const ChengV3EmbeddedLineMapEntry* entry =
-            cheng_v3_embedded_line_map_find_pc_in_entries(entries, count, current_pc);
-#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
-    (defined(__linux__) && defined(__aarch64__))
-        if (depth > 0 &&
-            cheng_probably_valid_ptr((const void*)current_fp) &&
-            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) == 0U) {
-            const uintptr_t* current_frame = (const uintptr_t*)current_fp;
-            current_lr = current_frame[1];
-        }
-#endif
-        cheng_v3_async_write_machine_frame(depth,
-                                           current_pc,
-                                           current_fp,
-                                           current_sp,
-                                           current_lr,
-                                           entry);
-        emitted += 1;
-#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
-    (defined(__linux__) && defined(__aarch64__))
-        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
-            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
-            break;
-        }
-        {
-            const uintptr_t* frame = (const uintptr_t*)current_fp;
-            uintptr_t next_fp = frame[0];
-            uintptr_t return_pc = frame[1];
-            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
-                break;
-            }
-            if (return_pc == 0U) {
-                break;
-            }
-#if defined(__arm64__)
-            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
-#else
-            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
-#endif
-            current_fp = next_fp;
-            current_sp = 0U;
-            current_lr = 0U;
-        }
-        depth += 1;
-#else
-        break;
-#endif
-    }
-    return emitted;
-}
-
-static int32_t cheng_v3_dump_source_signal_frames(const ChengV3EmbeddedLineMapEntry* entries,
-                                                  uint64_t count,
-                                                  uintptr_t pc,
-                                                  uintptr_t fp) {
-    int32_t depth = 0;
-    int32_t mapped = 0;
-    uintptr_t current_pc = pc;
-    uintptr_t current_fp = fp;
-    while (current_pc != 0U && depth < 48) {
-        const ChengV3EmbeddedLineMapEntry* entry =
-            cheng_v3_embedded_line_map_find_pc_in_entries(entries, count, current_pc);
-        if (entry != NULL) {
-            cheng_v3_async_write_source_frame(depth, entry, current_pc);
-            mapped += 1;
-        }
-#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
-    (defined(__linux__) && defined(__aarch64__))
-        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
-            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
-            break;
-        }
-        {
-            const uintptr_t* frame = (const uintptr_t*)current_fp;
-            uintptr_t next_fp = frame[0];
-            uintptr_t return_pc = frame[1];
-            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
-                break;
-            }
-            if (return_pc == 0U) {
-                break;
-            }
-#if defined(__arm64__)
-            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
-#else
-            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
-#endif
-            current_fp = next_fp;
-        }
-        depth += 1;
-#else
-        break;
-#endif
-    }
-    return mapped;
-}
-
-static void cheng_v3_async_write_crash_header(const char* reason,
-                                              const char* mode,
-                                              int32_t sig,
-                                              uintptr_t pc,
-                                              uintptr_t fp,
-                                              uintptr_t sp,
-                                              uintptr_t lr,
-                                              uintptr_t fault_addr) {
-    cheng_crash_trace_write_cstr("[cheng-v3] v3_crash_report_v1\n");
-    cheng_crash_trace_write_cstr("[cheng-v3] reason=");
-    cheng_crash_trace_write_cstr(reason != NULL ? reason : "?");
-    cheng_crash_trace_write_cstr(" mode=");
-    cheng_crash_trace_write_cstr(mode != NULL ? mode : "?");
-    cheng_crash_trace_write_cstr("\n");
-    cheng_crash_trace_write_cstr("[cheng-v3] regs pc=");
-    cheng_crash_trace_write_hex_uintptr(pc);
-    cheng_crash_trace_write_cstr(" fp=");
-    cheng_crash_trace_write_hex_uintptr(fp);
-    cheng_crash_trace_write_cstr(" sp=");
-    cheng_crash_trace_write_hex_uintptr(sp);
-    cheng_crash_trace_write_cstr(" lr=");
-    cheng_crash_trace_write_hex_uintptr(lr);
-    if (sig != 0) {
-        cheng_crash_trace_write_cstr(" sig=");
-        cheng_crash_trace_write_i32(sig);
-    }
-    if (sig != 0 || fault_addr != 0U) {
-        cheng_crash_trace_write_cstr(" fault=");
-        cheng_crash_trace_write_hex_uintptr(fault_addr);
-    }
-    cheng_crash_trace_write_cstr("\n");
-}
-
-static void cheng_v3_dump_source_signal_trace_if_available(const char* reason,
-                                                           int32_t sig,
-                                                           const siginfo_t* info,
-                                                           void* signal_context) {
-    const ChengV3EmbeddedLineMapEntry* entries = NULL;
-    uint64_t count = 0U;
-    uintptr_t pc = 0U;
-    uintptr_t fp = 0U;
-    uintptr_t sp = 0U;
-    uintptr_t lr = 0U;
-    int32_t mapped = 0;
-    if (cheng_v3_embedded_line_map_entries_getter == NULL || cheng_v3_embedded_line_map_count_getter == NULL) {
-        return;
-    }
-    entries = cheng_v3_embedded_line_map_entries_getter();
-    count = cheng_v3_embedded_line_map_count_getter();
-    if (entries == NULL || count == 0U) {
-        return;
-    }
-    pc = cheng_v3_signal_context_pc(signal_context);
-    if (pc == 0U) {
-        return;
-    }
-    fp = cheng_v3_signal_context_fp(signal_context);
-    sp = cheng_v3_signal_context_sp(signal_context);
-    lr = cheng_v3_signal_context_lr(signal_context);
-    cheng_v3_async_write_crash_header(reason,
-                                      "signal",
-                                      sig,
-                                      pc,
-                                      fp,
-                                      sp,
-                                      lr,
-                                      info != NULL && info->si_addr != NULL ? (uintptr_t)info->si_addr : 0U);
-    cheng_v3_dump_machine_signal_frames(entries, count, pc, fp, sp, lr);
-    mapped = cheng_v3_dump_source_signal_frames(entries, count, pc, fp);
-    if (mapped <= 0) {
-        cheng_crash_trace_write_cstr("[cheng-v3] source_frames=0\n");
-    }
-}
-
-static void cheng_crash_trace_signal_handler(int sig, siginfo_t* info, void* signal_context) {
-    if (cheng_crash_trace_handling) _exit(128 + sig);
-    cheng_crash_trace_handling = 1;
-    cheng_v3_dump_source_signal_trace_if_available("signal", sig, info, signal_context);
-    cheng_crash_trace_dump_async("signal", sig);
-    cheng_dump_native_backtrace_if_enabled();
-    _exit(128 + sig);
-}
-
-static void cheng_crash_trace_install_handlers(void) {
-    if (__sync_lock_test_and_set(&cheng_crash_trace_installed, 1) != 0) return;
-    cheng_v3_try_resolve_embedded_line_map_getters();
-#if !defined(_WIN32)
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_sigaction = cheng_crash_trace_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGSEGV, &sa, NULL);
-    sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGILL, &sa, NULL);
-    sigaction(SIGTRAP, &sa, NULL);
-    sigaction(SIGFPE, &sa, NULL);
-#if defined(SIGSYS)
-    sigaction(SIGSYS, &sa, NULL);
-#endif
-#endif
-}
-
-WEAK int32_t cheng_crash_trace_enabled(void) {
-    int32_t cached = cheng_crash_trace_enabled_cache;
-    if (cached >= 0) return cached;
-    cached = cheng_crash_trace_env_enabled() ? 1 : 0;
-    cheng_crash_trace_enabled_cache = cached;
-    if (cached) cheng_crash_trace_install_handlers();
-    return cached;
-}
-
-WEAK void cheng_crash_trace_set_phase(const char* phase) {
-    if (!cheng_crash_trace_enabled()) return;
-    cheng_crash_trace_phase = phase;
-}
-
-WEAK void cheng_crash_trace_mark(const char* tag, int32_t a, int32_t b, int32_t c, int32_t d) {
-    if (!cheng_crash_trace_enabled()) return;
-    int32_t serial = __sync_fetch_and_add(&cheng_crash_trace_next, 1);
-    ChengCrashTraceEntry* entry = &cheng_crash_trace_ring[(uint32_t)serial % CHENG_CRASH_TRACE_RING];
-    entry->a = a;
-    entry->b = b;
-    entry->c = c;
-    entry->d = d;
-    __sync_synchronize();
-    entry->tag = tag;
-}
-
-static void cheng_crash_trace_dump_now(const char* reason) {
-    if (!cheng_crash_trace_enabled()) return;
-    cheng_crash_trace_dump_async(reason, 0);
-}
-
-static int32_t cheng_v3_line_map_registered = 0;
-static int32_t cheng_v3_line_span_start(int32_t signature_line,
-                                        int32_t body_first_line) {
-    return body_first_line > 0 ? body_first_line : signature_line;
-}
-
-static int32_t cheng_v3_line_span_end(int32_t line_start,
-                                      int32_t body_last_line) {
-    return body_last_line > 0 ? body_last_line : line_start;
-}
-
-static void cheng_v3_dump_machine_backtrace_if_available(const char* reason) {
-#if CHENG_HAS_EXECINFO
-    void* frames[48];
-    int count = backtrace(frames, 48);
-    int i;
-    const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
-    uint64_t embedded_count = 0U;
-    cheng_v3_try_resolve_embedded_line_map_getters();
-    if (cheng_v3_embedded_line_map_entries_getter != NULL &&
-        cheng_v3_embedded_line_map_count_getter != NULL) {
-        embedded_entries = cheng_v3_embedded_line_map_entries_getter();
-        embedded_count = cheng_v3_embedded_line_map_count_getter();
-    }
-    for (i = 0; i < count; ++i) {
-        uintptr_t pc = (uintptr_t)frames[i];
-        uintptr_t symbol_pc = 0U;
-        uintptr_t offset = 0U;
-        const char* symbol_name = "?";
-        const char* source_path = NULL;
-        const char* function_name = NULL;
-        int32_t line_start = 0;
-        int32_t line_end = 0;
-        const ChengV3EmbeddedLineMapEntry* embedded_entry =
-            cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
-        Dl_info info;
-        memset(&info, 0, sizeof(info));
-        if (dladdr(frames[i], &info) != 0 && info.dli_sname != NULL) {
-            symbol_name = info.dli_sname;
-            symbol_pc = (uintptr_t)info.dli_saddr;
-        }
-        if (embedded_entry != NULL) {
-            symbol_pc = (uintptr_t)embedded_entry->start_pc;
-            function_name = embedded_entry->function_name;
-            source_path = embedded_entry->source_path;
-            line_start = cheng_v3_line_span_start(embedded_entry->signature_line,
-                                                  embedded_entry->body_first_line);
-            line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
-        }
-        if (symbol_pc != 0U && pc >= symbol_pc) {
-            offset = pc - symbol_pc;
-        }
-        fprintf(stderr,
-                "[cheng-v3] m#%d pc=0x%zx symbol=%s off=0x%zx",
-                i,
-                (size_t)pc,
-                symbol_name != NULL && symbol_name[0] != '\0' ? symbol_name : "?",
-                (size_t)offset);
-        if (function_name != NULL && function_name[0] != '\0') {
-            fprintf(stderr, " fn=%s", function_name);
-        }
-        if (source_path != NULL && source_path[0] != '\0') {
-            fprintf(stderr, " src=%s:%d", source_path, line_start);
-            if (line_end > line_start) {
-                fprintf(stderr, "-%d", line_end);
-            }
-        }
-        fprintf(stderr, "\n");
-    }
-    fflush(stderr);
-#else
-    (void)reason;
-#endif
-}
-
-static void cheng_v3_dump_source_backtrace_if_available(const char* reason) {
-    int mapped = 0;
-    if (cheng_v3_line_map_len <= 0) return;
-#if CHENG_HAS_EXECINFO
-    {
-        void* frames[48];
-        int count = backtrace(frames, 48);
-        int i;
-        const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
-        uint64_t embedded_count = 0U;
-        cheng_v3_try_resolve_embedded_line_map_getters();
-        if (cheng_v3_embedded_line_map_entries_getter != NULL &&
-            cheng_v3_embedded_line_map_count_getter != NULL) {
-            embedded_entries = cheng_v3_embedded_line_map_entries_getter();
-            embedded_count = cheng_v3_embedded_line_map_count_getter();
-        }
-        for (i = 0; i < count; ++i) {
-            Dl_info info;
-            const ChengV3EmbeddedLineMapEntry* embedded_entry;
-            const ChengV3LineMapEntry* entry;
-            const char* function_name = NULL;
-            const char* source_path = NULL;
-            uintptr_t pc;
-            uintptr_t symbol_pc;
-            uintptr_t offset;
-            int32_t line_start;
-            int32_t line_end;
-            pc = (uintptr_t)frames[i];
-            symbol_pc = 0U;
-            offset = 0U;
-            memset(&info, 0, sizeof(info));
-            if (dladdr(frames[i], &info) != 0 && info.dli_sname != NULL) {
-                symbol_pc = (uintptr_t)info.dli_saddr;
-            }
-            embedded_entry =
-                cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
-            entry = NULL;
-            if (embedded_entry != NULL) {
-                symbol_pc = (uintptr_t)embedded_entry->start_pc;
-                function_name = embedded_entry->function_name;
-                source_path = embedded_entry->source_path;
-                line_start = cheng_v3_line_span_start(embedded_entry->signature_line,
-                                                      embedded_entry->body_first_line);
-                line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
-            } else {
-                if (info.dli_sname == NULL) {
-                    continue;
-                }
-                entry = cheng_v3_line_map_find(info.dli_sname);
-                if (entry == NULL) {
-                    continue;
-                }
-                function_name = entry->function_name;
-                source_path = entry->source_path;
-                line_start = cheng_v3_line_span_start(entry->signature_line,
-                                                      entry->body_first_line);
-                line_end = cheng_v3_line_span_end(line_start, entry->body_last_line);
-            }
-            offset = (symbol_pc != 0U && pc >= symbol_pc) ? (pc - symbol_pc) : 0U;
-            fprintf(stderr,
-                    "[cheng-v3] #%d %s %s:%d",
-                    i,
-                    function_name != NULL && function_name[0] != '\0' ?
-                        function_name :
-                        (info.dli_sname != NULL ? info.dli_sname : "?"),
-                    source_path != NULL ? source_path : "?",
-                    line_start);
-            if (line_end > line_start) {
-                fprintf(stderr, "-%d", line_end);
-            }
-            fprintf(stderr, " +0x%zx\n", (size_t)offset);
-            mapped += 1;
-        }
-        if (mapped <= 0) {
-            fprintf(stderr, "[cheng-v3] source_frames=0\n");
-        }
-        fflush(stderr);
-    }
-#else
-    fprintf(stderr, "[cheng-v3] source_frames=unavailable\n");
-    fflush(stderr);
-#endif
-}
-
-WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
-    char exe_path[PATH_MAX];
-    char map_path[PATH_MAX];
-    if (cheng_v3_line_map_registered) {
-        return;
-    }
-    cheng_v3_line_map_registered = 1;
-    if (!driver_c_runtime_resolve_self_path(exe_path, sizeof(exe_path))) {
-        if (argv0 == NULL || argv0[0] == '\0') {
-            cheng_crash_trace_install_handlers();
-            return;
-        }
-        if (realpath(argv0, exe_path) == NULL) {
-            snprintf(exe_path, sizeof(exe_path), "%s", argv0);
-        }
-    }
-    snprintf(map_path, sizeof(map_path), "%s.v3.map", exe_path);
-    cheng_v3_line_map_load_path(map_path);
-    cheng_crash_trace_install_handlers();
-    cheng_v3_profile_maybe_init(exe_path);
-}
-
-WEAK void cheng_v3_native_register_line_map_from_argv0(const char* argv0) {
-    cheng_v3_register_line_map_from_argv0(argv0);
-}
+#define CHENG_V3_DEBUG_WEAK WEAK
+#include "system_helpers_debug_trace.inc"
+#undef CHENG_V3_DEBUG_WEAK
 
 static ChengSidecarBundleCache cheng_sidecar_cache = {0};
 static CHENG_THREAD_LOCAL int32_t driver_c_build_emit_obj_dispatch_depth = 0;
@@ -1896,48 +1110,6 @@ static void driver_c_diagf(const char* fmt, ...) {
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fflush(stderr);
-}
-
-static int cheng_backtrace_enabled(void) {
-    const char* raw = getenv("CHENG_PANIC_BACKTRACE");
-    if (raw == NULL || raw[0] == '\0') {
-        raw = getenv("BACKEND_DEBUG_BACKTRACE");
-    }
-    if (raw == NULL || raw[0] == '\0') return 1;
-    if (raw[0] == '0' && raw[1] == '\0') return 0;
-    return 1;
-}
-
-static void cheng_dump_native_backtrace_if_enabled(void) {
-    if (!cheng_backtrace_enabled()) return;
-#if CHENG_HAS_EXECINFO
-    {
-        void* frames[48];
-        int count = backtrace(frames, 48);
-        if (count > 0) {
-            backtrace_symbols_fd(frames, count, 2);
-            return;
-        }
-    }
-#endif
-    cheng_crash_trace_write_cstr("[cheng] backtrace unavailable\n");
-}
-
-static void cheng_dump_backtrace_now(const char* reason) {
-    const char* actual_reason = reason != NULL && reason[0] != '\0' ? reason : "panic";
-    uintptr_t pc = (uintptr_t)__builtin_return_address(0);
-    uintptr_t fp = (uintptr_t)__builtin_frame_address(0);
-    uintptr_t sp = (uintptr_t)&pc;
-    uintptr_t lr = pc;
-    cheng_crash_trace_dump_now(actual_reason);
-    cheng_v3_async_write_crash_header(actual_reason, "backtrace", 0, pc, fp, sp, lr, 0U);
-    cheng_v3_dump_machine_backtrace_if_available(actual_reason);
-    cheng_v3_dump_source_backtrace_if_available(actual_reason);
-    cheng_dump_native_backtrace_if_enabled();
-}
-
-void cheng_dump_backtrace_if_enabled(void) {
-    cheng_dump_backtrace_now("panic");
 }
 
 static CHENG_MAYBE_UNUSED int cheng_arg_is_help(const char* arg) {
@@ -3428,6 +2600,13 @@ WEAK int32_t driver_c_emit_obj_default(void* module, const char* target, const c
 
 WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* objPath,
                                            const char* target, const char* linker) {
+#if CHENG_TARGET_APPLE_MOBILE
+    (void)outputPath;
+    (void)objPath;
+    (void)target;
+    (void)linker;
+    return -22;
+#else
     const char* targetText = (target != NULL) ? target : "";
     const char* linkerText = (linker != NULL && linker[0] != '\0') ? linker : "system";
     const char* runtimeC = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
@@ -3526,6 +2705,7 @@ WEAK int32_t driver_c_link_tmp_obj_default(const char* outputPath, const char* o
         if (rc != 0) return -28;
     }
     return 0;
+#endif
 }
 
 WEAK int32_t driver_c_link_tmp_obj_system(const char* outputPath, const char* objPath,
@@ -6259,7 +5439,7 @@ void* cheng_realloc(void* p, int32_t size) {
     }
     return out;
 }
-#if defined(__APPLE__) && UINTPTR_MAX > 0xffffffffu
+#if defined(__APPLE__) && UINTPTR_MAX > 0xffffffffu && !CHENG_TARGET_APPLE_MOBILE
 typedef struct {
     mach_vm_address_t addr;
     mach_vm_size_t size;
@@ -6317,7 +5497,7 @@ static bool cheng_safe_cstr_view_impl(const char* s, bool allow_bridge, const ch
         if (out_len != NULL) *out_len = known_len;
         return true;
     }
-#if defined(__APPLE__) && UINTPTR_MAX > 0xffffffffu
+#if defined(__APPLE__) && UINTPTR_MAX > 0xffffffffu && !CHENG_TARGET_APPLE_MOBILE
     if (raw < (uintptr_t)0x1000ULL) {
         return false;
     }
@@ -6627,6 +5807,7 @@ WEAK ChengStrBridge driver_c_str_concat_bridge(ChengStrBridge a, ChengStrBridge 
     out[la + lb] = '\0';
     return cheng_str_bridge_from_owned(out);
 }
+
 static int cheng_v3_ascii_space_char(unsigned char ch) {
     return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v';
 }
@@ -6700,406 +5881,25 @@ WEAK ChengStrBridge cheng_v3_os_join_path_bridge(ChengStrBridge left, ChengStrBr
     out[total] = '\0';
     return cheng_str_bridge_from_owned(out);
 }
-static int cheng_v3_path_is_sep(char ch) {
-    return ch == '/' || ch == '\\';
+
+#include "system_helpers_debug_profile.inc"
+
+#include "system_helpers_debug_entry.inc"
+
+WEAK void cheng_v3_register_line_map_from_argv0(const char* argv0) {
+    v3_debug_register_line_map_from_argv0_impl(argv0);
 }
-static void cheng_v3_mkdir_if_needed(const char* path) {
-    if (path == NULL || path[0] == '\0' || cheng_dir_exists(path)) {
-        return;
-    }
-    if (cheng_mkdir1(path) == 0) {
-        return;
-    }
-    if (!cheng_dir_exists(path)) {
-        fprintf(stderr, "[cheng] mkdir failed: %s\n", path);
-        abort();
-    }
+
+WEAK void cheng_v3_native_register_line_map_from_argv0(const char* argv0) {
+    cheng_v3_register_line_map_from_argv0(argv0);
 }
+
+static void cheng_dump_backtrace_now(const char* reason) {
+    v3_debug_dump_backtrace_now_impl(reason);
+}
+
 static void cheng_v3_mkdir_all_raw(const char* path, int include_leaf) {
-    size_t len = 0u;
-    char* scratch = NULL;
-    if (path == NULL || path[0] == '\0') {
-        return;
-    }
-    len = strlen(path);
-    scratch = (char*)malloc(len + 1u);
-    if (scratch == NULL) {
-        fprintf(stderr, "[cheng] mkdir scratch alloc failed\n");
-        abort();
-    }
-    memcpy(scratch, path, len + 1u);
-    for (size_t i = 0u; i < len; ++i) {
-        char ch = scratch[i];
-        if (!cheng_v3_path_is_sep(ch)) {
-            continue;
-        }
-        if (i == 0u) {
-            continue;
-        }
-#if defined(_WIN32)
-        if (i == 2u && scratch[1] == ':') {
-            continue;
-        }
-#endif
-        scratch[i] = '\0';
-        cheng_v3_mkdir_if_needed(scratch);
-        scratch[i] = ch;
-    }
-    if (include_leaf) {
-        cheng_v3_mkdir_if_needed(scratch);
-    }
-    free(scratch);
-}
-
-static void cheng_v3_profile_ensure_parent_dir(const char* path) {
-    char parent[PATH_MAX];
-    size_t len;
-    const char* slash;
-    if (path == NULL || path[0] == '\0') {
-        return;
-    }
-    slash = strrchr(path, '/');
-#if defined(_WIN32)
-    {
-        const char* backslash = strrchr(path, '\\');
-        if (backslash != NULL && (slash == NULL || backslash > slash)) {
-            slash = backslash;
-        }
-    }
-#endif
-    if (slash == NULL) {
-        return;
-    }
-    len = (size_t)(slash - path);
-    if (len == 0U || len >= sizeof(parent)) {
-        return;
-    }
-    memcpy(parent, path, len);
-    parent[len] = '\0';
-    cheng_v3_mkdir_all_raw(parent, 1);
-}
-
-static uint8_t cheng_v3_profile_capture_frames(void* signal_context,
-                                               uintptr_t* pcs,
-                                               uint8_t pcs_cap) {
-    uintptr_t current_pc = cheng_v3_signal_context_pc(signal_context);
-    uintptr_t current_fp = cheng_v3_signal_context_fp(signal_context);
-    uint8_t depth = 0;
-    if (pcs == NULL || pcs_cap == 0U || current_pc == 0U) {
-        return 0U;
-    }
-    while (current_pc != 0U && depth < pcs_cap) {
-        pcs[depth++] = current_pc;
-#if (defined(__APPLE__) && (defined(__arm64__) || defined(__x86_64__) || defined(__i386__))) || \
-    (defined(__linux__) && defined(__aarch64__))
-        if (!cheng_probably_valid_ptr((const void*)current_fp) ||
-            (current_fp & (uintptr_t)(sizeof(uintptr_t) - 1U)) != 0U) {
-            break;
-        }
-        {
-            const uintptr_t* frame = (const uintptr_t*)current_fp;
-            uintptr_t next_fp = frame[0];
-            uintptr_t return_pc = frame[1];
-            if (next_fp <= current_fp || (next_fp - current_fp) > (uintptr_t)(8U * 1024U * 1024U)) {
-                break;
-            }
-            if (return_pc == 0U) {
-                break;
-            }
-#if defined(__arm64__) || defined(__aarch64__)
-            current_pc = return_pc > 4U ? return_pc - 4U : return_pc;
-#else
-            current_pc = return_pc > 1U ? return_pc - 1U : return_pc;
-#endif
-            current_fp = next_fp;
-        }
-#else
-        break;
-#endif
-    }
-    return depth;
-}
-
-static void cheng_v3_profile_signal_handler(int sig, siginfo_t* info, void* signal_context) {
-    int32_t index;
-    (void)sig;
-    (void)info;
-    if (cheng_v3_profile_samples == NULL || cheng_v3_profile_capacity <= 0) {
-        return;
-    }
-    index = __sync_fetch_and_add(&cheng_v3_profile_sample_count, 1);
-    if (index < 0 || index >= cheng_v3_profile_capacity) {
-        __sync_fetch_and_add(&cheng_v3_profile_dropped_samples, 1);
-        return;
-    }
-    cheng_v3_profile_samples[index].depth =
-        cheng_v3_profile_capture_frames(signal_context,
-                                        cheng_v3_profile_samples[index].pcs,
-                                        CHENG_V3_PROFILE_MAX_DEPTH);
-}
-
-static int cheng_v3_profile_count_cmp(const void* left, const void* right) {
-    const ChengV3ProfileCount* a = (const ChengV3ProfileCount*)left;
-    const ChengV3ProfileCount* b = (const ChengV3ProfileCount*)right;
-    if (a->count > b->count) return -1;
-    if (a->count < b->count) return 1;
-    if (a->key == NULL && b->key == NULL) return 0;
-    if (a->key == NULL) return 1;
-    if (b->key == NULL) return -1;
-    return strcmp(a->key, b->key);
-}
-
-static int cheng_v3_profile_count_add(ChengV3ProfileCount** items,
-                                      int32_t* len,
-                                      int32_t* cap,
-                                      const char* key) {
-    ChengV3ProfileCount* grown = NULL;
-    int32_t i;
-    if (items == NULL || len == NULL || cap == NULL || key == NULL || key[0] == '\0') {
-        return 0;
-    }
-    for (i = 0; i < *len; ++i) {
-        if ((*items)[i].key != NULL && strcmp((*items)[i].key, key) == 0) {
-            (*items)[i].count += 1U;
-            return 1;
-        }
-    }
-    if (*len >= *cap) {
-        int32_t next_cap = *cap > 0 ? (*cap * 2) : 32;
-        grown = (ChengV3ProfileCount*)realloc(*items, (size_t)next_cap * sizeof(ChengV3ProfileCount));
-        if (grown == NULL) {
-            return 0;
-        }
-        for (i = *cap; i < next_cap; i += 1) {
-            grown[i].key = NULL;
-            grown[i].count = 0U;
-        }
-        *items = grown;
-        *cap = next_cap;
-    }
-    (*items)[*len].key = cheng_copy_string_bytes(key, strlen(key));
-    if ((*items)[*len].key == NULL) {
-        return 0;
-    }
-    (*items)[*len].count = 1U;
-    *len += 1;
-    return 1;
-}
-
-static void cheng_v3_profile_counts_free(ChengV3ProfileCount* items,
-                                         int32_t len) {
-    int32_t i;
-    if (items == NULL) {
-        return;
-    }
-    for (i = 0; i < len; i += 1) {
-        cheng_free(items[i].key);
-    }
-    free(items);
-}
-
-static void cheng_v3_profile_labels_for_pc(uintptr_t pc,
-                                           char* function_out,
-                                           size_t function_cap,
-                                           char* source_out,
-                                           size_t source_cap) {
-    const ChengV3EmbeddedLineMapEntry* embedded_entries = NULL;
-    uint64_t embedded_count = 0U;
-    const ChengV3EmbeddedLineMapEntry* embedded_entry = NULL;
-    Dl_info info;
-    memset(&info, 0, sizeof(info));
-    if (function_cap > 0U) function_out[0] = '\0';
-    if (source_cap > 0U) source_out[0] = '\0';
-    cheng_v3_try_resolve_embedded_line_map_getters();
-    if (cheng_v3_embedded_line_map_entries_getter != NULL &&
-        cheng_v3_embedded_line_map_count_getter != NULL) {
-        embedded_entries = cheng_v3_embedded_line_map_entries_getter();
-        embedded_count = cheng_v3_embedded_line_map_count_getter();
-        embedded_entry = cheng_v3_embedded_line_map_find_pc_in_entries(embedded_entries, embedded_count, pc);
-    }
-    if (embedded_entry != NULL) {
-        snprintf(function_out,
-                 function_cap,
-                 "%s",
-                 embedded_entry->function_name != NULL && embedded_entry->function_name[0] != '\0' ?
-                     embedded_entry->function_name :
-                     "?");
-        snprintf(source_out,
-                 source_cap,
-                 "%s:%d",
-                 embedded_entry->source_path != NULL && embedded_entry->source_path[0] != '\0' ?
-                     embedded_entry->source_path :
-                     "?",
-                 cheng_v3_line_span_start(embedded_entry->signature_line, embedded_entry->body_first_line));
-        return;
-    }
-    if (dladdr((void*)pc, &info) != 0 && info.dli_sname != NULL) {
-        const ChengV3LineMapEntry* entry = cheng_v3_line_map_find(info.dli_sname);
-        snprintf(function_out, function_cap, "%s", info.dli_sname);
-        if (entry != NULL) {
-            snprintf(source_out,
-                     source_cap,
-                     "%s:%d",
-                     entry->source_path != NULL && entry->source_path[0] != '\0' ? entry->source_path : "?",
-                     cheng_v3_line_span_start(entry->signature_line, entry->body_first_line));
-        }
-        return;
-    }
-    snprintf(function_out, function_cap, "pc_%zx", (size_t)pc);
-    snprintf(source_out, source_cap, "pc_%zx", (size_t)pc);
-}
-
-static void cheng_v3_profile_stop_timer(void) {
-#if !defined(_WIN32)
-    struct itimerval timer;
-    memset(&timer, 0, sizeof(timer));
-    setitimer(ITIMER_REAL, &timer, NULL);
-#endif
-}
-
-static void cheng_v3_profile_write_report(void) {
-    FILE* file = NULL;
-    int32_t sample_count = cheng_v3_profile_sample_count;
-    ChengV3ProfileCount* function_counts = NULL;
-    ChengV3ProfileCount* source_counts = NULL;
-    ChengV3ProfileCount* pc_counts = NULL;
-    int32_t function_len = 0;
-    int32_t source_len = 0;
-    int32_t pc_len = 0;
-    int32_t function_cap = 0;
-    int32_t source_cap = 0;
-    int32_t pc_cap = 0;
-    int32_t i;
-    if (!cheng_v3_profile_env_enabled() || cheng_v3_profile_out_path[0] == '\0') {
-        return;
-    }
-    cheng_v3_profile_stop_timer();
-    if (sample_count < 0) sample_count = 0;
-    if (sample_count > cheng_v3_profile_capacity) {
-        sample_count = cheng_v3_profile_capacity;
-    }
-    for (i = 0; i < sample_count; i += 1) {
-        char function_name[PATH_MAX];
-        char source_name[PATH_MAX];
-        char pc_name[64];
-        uintptr_t pc;
-        if (cheng_v3_profile_samples == NULL || cheng_v3_profile_samples[i].depth == 0U) {
-            continue;
-        }
-        pc = cheng_v3_profile_samples[i].pcs[0];
-        cheng_v3_profile_labels_for_pc(pc,
-                                       function_name,
-                                       sizeof(function_name),
-                                       source_name,
-                                       sizeof(source_name));
-        snprintf(pc_name, sizeof(pc_name), "0x%zx", (size_t)pc);
-        if (!cheng_v3_profile_count_add(&function_counts, &function_len, &function_cap, function_name) ||
-            !cheng_v3_profile_count_add(&source_counts, &source_len, &source_cap, source_name) ||
-            !cheng_v3_profile_count_add(&pc_counts, &pc_len, &pc_cap, pc_name)) {
-            cheng_v3_profile_counts_free(function_counts, function_len);
-            cheng_v3_profile_counts_free(source_counts, source_len);
-            cheng_v3_profile_counts_free(pc_counts, pc_len);
-            return;
-        }
-    }
-    if (function_len > 1) qsort(function_counts, (size_t)function_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
-    if (source_len > 1) qsort(source_counts, (size_t)source_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
-    if (pc_len > 1) qsort(pc_counts, (size_t)pc_len, sizeof(ChengV3ProfileCount), cheng_v3_profile_count_cmp);
-    cheng_v3_profile_ensure_parent_dir(cheng_v3_profile_out_path);
-    file = fopen(cheng_v3_profile_out_path, "wb");
-    if (file == NULL) {
-        cheng_v3_profile_counts_free(function_counts, function_len);
-        cheng_v3_profile_counts_free(source_counts, source_len);
-        cheng_v3_profile_counts_free(pc_counts, pc_len);
-        return;
-    }
-    fprintf(file, "v3_profile_v1\n");
-    fprintf(file, "total_samples=%d\n", sample_count);
-    fprintf(file, "dropped_samples=%d\n", (int)cheng_v3_profile_dropped_samples);
-    for (i = 0; i < function_len && i < 8; i += 1) {
-        fprintf(file, "hot_function[%d]=%u|%s\n",
-                i,
-                function_counts[i].count,
-                function_counts[i].key != NULL ? function_counts[i].key : "?");
-    }
-    for (i = 0; i < source_len && i < 8; i += 1) {
-        fprintf(file, "hot_source[%d]=%u|%s\n",
-                i,
-                source_counts[i].count,
-                source_counts[i].key != NULL ? source_counts[i].key : "?");
-    }
-    for (i = 0; i < pc_len && i < 8; i += 1) {
-        fprintf(file, "hot_pc[%d]=%u|%s\n",
-                i,
-                pc_counts[i].count,
-                pc_counts[i].key != NULL ? pc_counts[i].key : "?");
-    }
-    fclose(file);
-    cheng_v3_profile_counts_free(function_counts, function_len);
-    cheng_v3_profile_counts_free(source_counts, source_len);
-    cheng_v3_profile_counts_free(pc_counts, pc_len);
-}
-
-static void cheng_v3_profile_maybe_init(const char* exe_path) {
-#if defined(_WIN32)
-    (void)exe_path;
-    cheng_v3_profile_enabled_cache = 0;
-    return;
-#else
-    struct sigaction sa;
-    struct itimerval timer;
-    int32_t hz;
-    const char* out_env;
-    if (cheng_v3_profile_initialized) {
-        return;
-    }
-    if (!cheng_v3_profile_env_enabled()) {
-        cheng_v3_profile_enabled_cache = 0;
-        return;
-    }
-#if !(defined(__APPLE__) && defined(__arm64__)) && !(defined(__linux__) && defined(__aarch64__))
-    {
-        cheng_v3_profile_enabled_cache = 0;
-        return;
-    }
-#endif
-    cheng_v3_profile_capacity = CHENG_V3_PROFILE_MAX_SAMPLES;
-    cheng_v3_profile_samples = (ChengV3ProfileSample*)calloc(
-        (size_t)cheng_v3_profile_capacity,
-        sizeof(ChengV3ProfileSample)
-    );
-    if (cheng_v3_profile_samples == NULL) {
-        cheng_v3_profile_enabled_cache = 0;
-        return;
-    }
-    out_env = getenv("CHENG_V3_PROFILE_OUT");
-    if (out_env != NULL && out_env[0] != '\0') {
-        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "%s", out_env);
-    } else if (exe_path != NULL && exe_path[0] != '\0') {
-        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "%s.v3.profile.txt", exe_path);
-    } else {
-        snprintf(cheng_v3_profile_out_path, sizeof(cheng_v3_profile_out_path), "cheng_v3.profile.txt");
-    }
-    if (__sync_lock_test_and_set(&cheng_v3_profile_installed, 1) == 0) {
-        memset(&sa, 0, sizeof(sa));
-        sa.sa_sigaction = cheng_v3_profile_signal_handler;
-        sa.sa_flags = SA_SIGINFO;
-        sigemptyset(&sa.sa_mask);
-        sigaction(SIGALRM, &sa, NULL);
-    }
-    hz = cheng_v3_profile_hz_value();
-    memset(&timer, 0, sizeof(timer));
-    timer.it_interval.tv_sec = 0;
-    timer.it_interval.tv_usec = 1000000 / hz;
-    if (timer.it_interval.tv_usec <= 0) {
-        timer.it_interval.tv_usec = 1000;
-    }
-    timer.it_value = timer.it_interval;
-    setitimer(ITIMER_REAL, &timer, NULL);
-    atexit(cheng_v3_profile_write_report);
-    cheng_v3_profile_enabled_cache = 1;
-    cheng_v3_profile_initialized = 1;
-#endif
+    v3_debug_mkdir_all_raw(path, include_leaf);
 }
 
 static char* cheng_v3_bridge_copy_cstring(ChengStrBridge text) {
@@ -8361,10 +7161,10 @@ static int cheng_v3_tcp_write_ready_port_raw(const char* ready_path, uint16_t po
     fclose(f);
     return 1;
 }
-WEAK int32_t cheng_v3_tcp_loopback_payload_bridge(ChengStrBridge protocol_text,
-                                                  ChengStrBridge payload_text,
-                                                  ChengStrBridge* response_text,
-                                                  ChengStrBridge* err_text) {
+WEAK int32_t cheng_v3_tcp_loopback_payload_impl_bridge(ChengStrBridge protocol_text,
+                                                       ChengStrBridge payload_text,
+                                                       ChengStrBridge* response_text,
+                                                       ChengStrBridge* err_text) {
 #if defined(_WIN32)
     const char* not_impl = "v3 libp2p tcp: win32 loopback payload bridge not implemented";
     if (response_text != NULL) {
@@ -8582,11 +7382,11 @@ cleanup:
     return err.ptr == NULL || err.len == 0 ? 1 : 0;
 #endif
 }
-WEAK int32_t cheng_v3_tcp_loopback_request_response_bridge(ChengStrBridge protocol_text,
-                                                           ChengStrBridge request_text,
-                                                           ChengStrBridge response_text,
-                                                           ChengStrBridge* client_response_text,
-                                                           ChengStrBridge* err_text) {
+WEAK int32_t cheng_v3_tcp_loopback_request_response_impl_bridge(ChengStrBridge protocol_text,
+                                                                ChengStrBridge request_text,
+                                                                ChengStrBridge response_text,
+                                                                ChengStrBridge* client_response_text,
+                                                                ChengStrBridge* err_text) {
 #if defined(_WIN32)
     const char* not_impl = "v3 libp2p tcp: win32 loopback request-response bridge not implemented";
     if (client_response_text != NULL) {
@@ -9765,6 +8565,262 @@ WEAK int32_t cheng_v3_webrtc_browser_session_active_count_bridge(void) {
     return cheng_v3_browser_session_active_count;
 }
 
+static void cheng_v3_bio_safe_copy(char* dst, size_t cap, const char* src) {
+    if (dst == NULL || cap == 0u) {
+        return;
+    }
+    if (src == NULL) {
+        dst[0] = '\0';
+        return;
+    }
+    strncpy(dst, src, cap - 1u);
+    dst[cap - 1u] = '\0';
+}
+
+static int cheng_v3_bio_hex_nibble(char ch, uint8_t* out) {
+    if (out == NULL) {
+        return 0;
+    }
+    if (ch >= '0' && ch <= '9') {
+        *out = (uint8_t)(ch - '0');
+        return 1;
+    }
+    if (ch >= 'a' && ch <= 'f') {
+        *out = (uint8_t)(10 + (ch - 'a'));
+        return 1;
+    }
+    if (ch >= 'A' && ch <= 'F') {
+        *out = (uint8_t)(10 + (ch - 'A'));
+        return 1;
+    }
+    return 0;
+}
+
+static int cheng_v3_bio_wire_find_value(const char* wire,
+                                        const char* key,
+                                        const char** out_value,
+                                        size_t* out_len) {
+    if (wire == NULL || key == NULL || out_value == NULL || out_len == NULL) {
+        return 0;
+    }
+    const size_t key_len = strlen(key);
+    const char* p = wire;
+    while (*p != '\0') {
+        const char* line_end = strchr(p, '\n');
+        if (line_end == NULL) {
+            line_end = p + strlen(p);
+        }
+        const char* eq = memchr(p, '=', (size_t)(line_end - p));
+        if (eq != NULL && (size_t)(eq - p) == key_len && strncmp(p, key, key_len) == 0) {
+            *out_value = eq + 1;
+            *out_len = (size_t)(line_end - (eq + 1));
+            return 1;
+        }
+        if (*line_end == '\0') {
+            break;
+        }
+        p = line_end + 1;
+    }
+    return 0;
+}
+
+static int cheng_v3_bio_wire_copy_text(const char* wire, const char* key, char* out, size_t out_cap) {
+    const char* value = NULL;
+    size_t len = 0u;
+    if (!cheng_v3_bio_wire_find_value(wire, key, &value, &len)) {
+        cheng_v3_bio_safe_copy(out, out_cap, "");
+        return 1;
+    }
+    if (out == NULL || out_cap == 0u || out_cap <= len) {
+        return 0;
+    }
+    memcpy(out, value, len);
+    out[len] = '\0';
+    return 1;
+}
+
+static int cheng_v3_bio_wire_copy_hex_decoded(const char* wire, const char* key, char* out, size_t out_cap) {
+    const char* value = NULL;
+    size_t len = 0u;
+    if (!cheng_v3_bio_wire_find_value(wire, key, &value, &len)) {
+        cheng_v3_bio_safe_copy(out, out_cap, "");
+        return 1;
+    }
+    if (out == NULL || out_cap == 0u || (len % 2u) != 0u) {
+        return 0;
+    }
+    const size_t out_len = len / 2u;
+    if (out_cap <= out_len) {
+        return 0;
+    }
+    for (size_t i = 0u; i < out_len; i += 1u) {
+        uint8_t hi = 0u;
+        uint8_t lo = 0u;
+        if (!cheng_v3_bio_hex_nibble(value[i * 2u], &hi) ||
+            !cheng_v3_bio_hex_nibble(value[i * 2u + 1u], &lo)) {
+            return 0;
+        }
+        out[i] = (char)((hi << 4u) | lo);
+    }
+    out[out_len] = '\0';
+    return 1;
+}
+
+static int cheng_v3_bio_hex_encode_utf8(const char* src, char* out, size_t out_cap) {
+    static const char* digits = "0123456789abcdef";
+    if (out == NULL || out_cap == 0u) {
+        return 0;
+    }
+    if (src == NULL || src[0] == '\0') {
+        out[0] = '\0';
+        return 1;
+    }
+    const size_t n = strlen(src);
+    if (out_cap <= (n * 2u)) {
+        return 0;
+    }
+    for (size_t i = 0u; i < n; i += 1u) {
+        const uint8_t value = (uint8_t)src[i];
+        out[i * 2u] = digits[value >> 4u];
+        out[i * 2u + 1u] = digits[value & 0x0fu];
+    }
+    out[n * 2u] = '\0';
+    return 1;
+}
+
+WEAK ChengStrBridge cheng_v3_mobile_biometric_fingerprint_authorize_bridge_native_impl(ChengStrBridge request_wire) {
+    if (cheng_mobile_host_biometric_fingerprint_authorize_bridge == NULL) {
+        char error_hex[1024];
+        char response_raw[2048];
+        error_hex[0] = '\0';
+        (void)cheng_v3_bio_hex_encode_utf8("v3 biometric: mobile host bridge missing", error_hex, sizeof(error_hex));
+        (void)snprintf(response_raw,
+                       sizeof(response_raw),
+                       "ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=%s\n",
+                       error_hex);
+        return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
+    }
+
+    const char* request_wire_raw = cheng_str_to_cstring_temp_bridge(request_wire);
+    char request_id_raw[256];
+    char purpose_raw[32];
+    char did_text_raw[8192];
+    char prompt_title_raw[512];
+    char prompt_reason_raw[1024];
+    char device_binding_seed_hint_raw[512];
+    char device_label_hint_raw[512];
+    request_id_raw[0] = '\0';
+    purpose_raw[0] = '\0';
+    did_text_raw[0] = '\0';
+    prompt_title_raw[0] = '\0';
+    prompt_reason_raw[0] = '\0';
+    device_binding_seed_hint_raw[0] = '\0';
+    device_label_hint_raw[0] = '\0';
+
+    if (request_wire_raw == NULL ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "request_id", request_id_raw, sizeof(request_id_raw)) ||
+        !cheng_v3_bio_wire_copy_text(request_wire_raw, "purpose", purpose_raw, sizeof(purpose_raw)) ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "did", did_text_raw, sizeof(did_text_raw)) ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "prompt_title", prompt_title_raw, sizeof(prompt_title_raw)) ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "prompt_reason", prompt_reason_raw, sizeof(prompt_reason_raw)) ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "device_binding_seed_hint", device_binding_seed_hint_raw, sizeof(device_binding_seed_hint_raw)) ||
+        !cheng_v3_bio_wire_copy_hex_decoded(request_wire_raw, "device_label_hint", device_label_hint_raw, sizeof(device_label_hint_raw))) {
+        char error_hex[1024];
+        char response_raw[2048];
+        error_hex[0] = '\0';
+        (void)cheng_v3_bio_hex_encode_utf8("v3 biometric: invalid request wire", error_hex, sizeof(error_hex));
+        (void)snprintf(response_raw,
+                       sizeof(response_raw),
+                       "ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=%s\n",
+                       error_hex);
+        return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
+    }
+
+    const int32_t purpose = (int32_t)strtol(purpose_raw, NULL, 10);
+    char feature32_hex_raw[65];
+    char device_binding_seed_raw[512];
+    char device_label_raw[512];
+    char sensor_id_raw[256];
+    char hardware_attestation_raw[8192];
+    char error_raw[512];
+    feature32_hex_raw[0] = '\0';
+    device_binding_seed_raw[0] = '\0';
+    device_label_raw[0] = '\0';
+    sensor_id_raw[0] = '\0';
+    hardware_attestation_raw[0] = '\0';
+    error_raw[0] = '\0';
+
+    const int32_t ok = cheng_mobile_host_biometric_fingerprint_authorize_bridge(
+        request_id_raw,
+        purpose,
+        did_text_raw,
+        prompt_title_raw,
+        prompt_reason_raw,
+        device_binding_seed_hint_raw,
+        device_label_hint_raw,
+        feature32_hex_raw,
+        (int32_t)sizeof(feature32_hex_raw),
+        device_binding_seed_raw,
+        (int32_t)sizeof(device_binding_seed_raw),
+        device_label_raw,
+        (int32_t)sizeof(device_label_raw),
+        sensor_id_raw,
+        (int32_t)sizeof(sensor_id_raw),
+        hardware_attestation_raw,
+        (int32_t)sizeof(hardware_attestation_raw),
+        error_raw,
+        (int32_t)sizeof(error_raw));
+
+    if (ok == 0) {
+        const char* err_raw_final = error_raw[0] != '\0' ? error_raw : "v3 biometric: host authorize failed";
+        char error_hex[1024];
+        char response_raw[2048];
+        error_hex[0] = '\0';
+        (void)cheng_v3_bio_hex_encode_utf8(err_raw_final, error_hex, sizeof(error_hex));
+        (void)snprintf(response_raw,
+                       sizeof(response_raw),
+                       "ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=%s\n",
+                       error_hex);
+        return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
+    }
+
+    char device_binding_seed_hex[1024];
+    char device_label_hex[1024];
+    char sensor_id_hex[512];
+    char hardware_attestation_hex[24576];
+    char response_raw[32768];
+    if (!cheng_v3_bio_hex_encode_utf8(device_binding_seed_raw, device_binding_seed_hex, sizeof(device_binding_seed_hex)) ||
+        !cheng_v3_bio_hex_encode_utf8(device_label_raw, device_label_hex, sizeof(device_label_hex)) ||
+        !cheng_v3_bio_hex_encode_utf8(sensor_id_raw, sensor_id_hex, sizeof(sensor_id_hex)) ||
+        !cheng_v3_bio_hex_encode_utf8(hardware_attestation_raw, hardware_attestation_hex, sizeof(hardware_attestation_hex))) {
+        char error_hex[1024];
+        error_hex[0] = '\0';
+        (void)cheng_v3_bio_hex_encode_utf8("v3 biometric: response wire overflow", error_hex, sizeof(error_hex));
+        (void)snprintf(response_raw,
+                       sizeof(response_raw),
+                       "ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=%s\n",
+                       error_hex);
+        return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
+    }
+
+    response_raw[0] = '\0';
+    (void)snprintf(response_raw,
+                   sizeof(response_raw),
+                   "ok=1\n"
+                   "feature32_hex=%s\n"
+                   "device_binding_seed_hex=%s\n"
+                   "device_label_hex=%s\n"
+                   "sensor_id_hex=%s\n"
+                   "hardware_attestation_hex=%s\n"
+                   "error_hex=\n",
+                   feature32_hex_raw,
+                   device_binding_seed_hex,
+                   device_label_hex,
+                   sensor_id_hex,
+                   hardware_attestation_hex);
+    return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
+}
+
 typedef struct ChengV3TailnetProviderRuntime {
     int32_t provider_ready;
     int32_t proxy_ready;
@@ -10580,12 +9636,12 @@ cleanup:
     return err.ptr == NULL || err.len == 0 ? 1 : 0;
 #endif
 }
-WEAK int32_t cheng_v3_tcp_serve_payload_once_bridge(ChengStrBridge host_text,
-                                                    int32_t port,
-                                                    ChengStrBridge protocol_text,
-                                                    ChengStrBridge payload_text,
-                                                    ChengStrBridge ready_path_text,
-                                                    ChengStrBridge* err_text) {
+WEAK int32_t cheng_v3_tcp_serve_payload_once_impl_bridge(ChengStrBridge host_text,
+                                                         int32_t port,
+                                                         ChengStrBridge protocol_text,
+                                                         ChengStrBridge payload_text,
+                                                         ChengStrBridge ready_path_text,
+                                                         ChengStrBridge* err_text) {
 #if defined(_WIN32)
     const char* not_impl = "v3 libp2p tcp: win32 serve payload bridge not implemented";
     if (err_text != NULL) {
@@ -10726,11 +9782,11 @@ cleanup:
     return err.ptr == NULL || err.len == 0 ? 1 : 0;
 #endif
 }
-WEAK int32_t cheng_v3_tcp_recv_payload_once_bridge(ChengStrBridge host_text,
-                                                   int32_t port,
-                                                   ChengStrBridge protocol_text,
-                                                   ChengStrBridge* response_text,
-                                                   ChengStrBridge* err_text) {
+WEAK int32_t cheng_v3_tcp_recv_payload_once_impl_bridge(ChengStrBridge host_text,
+                                                        int32_t port,
+                                                        ChengStrBridge protocol_text,
+                                                        ChengStrBridge* response_text,
+                                                        ChengStrBridge* err_text) {
 #if defined(_WIN32)
     const char* not_impl = "v3 libp2p tcp: win32 recv payload bridge not implemented";
     if (response_text != NULL) {
@@ -10860,7 +9916,7 @@ WEAK ChengStrBridge cheng_v3_tcp_loopback_multistream_bridge(ChengStrBridge prot
     ChengStrBridge response = ok;
     ChengStrBridge err = ok;
     ChengStrBridge payload = ok;
-    int32_t bridge_ok = cheng_v3_tcp_loopback_payload_bridge(protocol_text, payload, &response, &err);
+    int32_t bridge_ok = cheng_v3_tcp_loopback_payload_impl_bridge(protocol_text, payload, &response, &err);
     cheng_v3_bridge_release_owned(response);
     if (bridge_ok) {
         return ok;
@@ -12369,7 +11425,7 @@ static void cheng_exec_spawn_detached_orphan_guard(pid_t wrapperPid, pid_t targe
 
 static int cheng_exec_spawn_addchdir(posix_spawn_file_actions_t* actions, const char* workingDir) {
     if (!workingDir || !workingDir[0]) return 0;
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !CHENG_TARGET_APPLE_MOBILE
     return posix_spawn_file_actions_addchdir(actions, workingDir);
 #else
     (void)actions;
@@ -12378,7 +11434,7 @@ static int cheng_exec_spawn_addchdir(posix_spawn_file_actions_t* actions, const 
 }
 
 static int cheng_exec_spawn_addchdir_supported(void) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) && !CHENG_TARGET_APPLE_MOBILE
     return 1;
 #else
     return 0;
@@ -12415,72 +11471,6 @@ static int64_t cheng_exec_file_status_fork(const char* filePath, char** argv, ch
     rc = cheng_exec_wait_status(pid, timeoutSec);
     cheng_exec_stop_orphan_guard(guardPid);
     return rc;
-}
-
-char* cheng_exec_file_capture(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,
-                              const char* workingDir, int32_t mergeStderr, int32_t timeoutSec,
-                              int64_t* exitCode) {
-    if (exitCode) *exitCode = -1;
-    if (!filePath || !filePath[0]) return cheng_strdup("");
-#if defined(_WIN32)
-    (void)argvSeqPtr;
-    (void)envOverridesSeqPtr;
-    (void)workingDir;
-    (void)mergeStderr;
-    (void)timeoutSec;
-    return cheng_strdup("");
-#else
-    char** argv = NULL;
-    char** envp = NULL;
-    int captureFd = -1;
-    pid_t pid = -1;
-    pid_t guardPid = -1;
-    char* out = NULL;
-    char capturePath[] = "/tmp/cheng_exec_capture.XXXXXX";
-    if (!cheng_exec_load_argv_env(filePath, argvSeqPtr, envOverridesSeqPtr, &argv, &envp)) {
-        return cheng_strdup("");
-    }
-    captureFd = mkstemp(capturePath);
-    if (captureFd < 0) {
-        cheng_exec_free_argv_env(argv, envp);
-        return cheng_strdup("");
-    }
-    pid = fork();
-    if (pid < 0) {
-        close(captureFd);
-        unlink(capturePath);
-        cheng_exec_free_argv_env(argv, envp);
-        return cheng_strdup("");
-    }
-    if (pid == 0) {
-        (void)setpgid(0, 0);
-        if (workingDir && workingDir[0]) chdir(workingDir);
-        dup2(captureFd, STDOUT_FILENO);
-        if (mergeStderr != 0) dup2(captureFd, STDERR_FILENO);
-        close(captureFd);
-        execve(filePath, argv, envp ? envp : environ);
-        {
-            const char* msg = strerror(errno);
-            if (!msg) msg = "execve failed";
-            dprintf(STDERR_FILENO, "%s\n", msg);
-        }
-        _exit(127);
-    }
-    close(captureFd);
-    captureFd = -1;
-    cheng_exec_free_argv_env(argv, envp);
-    {
-        (void)setpgid(pid, pid);
-        guardPid = cheng_exec_spawn_orphan_guard(pid);
-        int64_t rc = cheng_exec_wait_status(pid, timeoutSec);
-        cheng_exec_stop_orphan_guard(guardPid);
-        if (exitCode) *exitCode = rc;
-    }
-    out = driver_c_read_file_all(capturePath);
-    unlink(capturePath);
-    if (!out) out = cheng_strdup("");
-    return out;
-#endif
 }
 
 int64_t cheng_exec_file_status(const char* filePath, void* argvSeqPtr, void* envOverridesSeqPtr,

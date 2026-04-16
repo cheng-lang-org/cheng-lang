@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import child_process from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 export const HOME_DEFAULT_EQUIVALENT_ROUTES = new Set([
   'home_default',
@@ -122,6 +124,50 @@ const FIXED_ROUTE_COUNTS = {
 const lucideIconNodeCountCache = new Map();
 const lucideIconDomCountCache = new Map();
 const taobaoProductSurfaceCache = new Map();
+const exactRouteSemanticCountCache = new Map();
+
+export function resolvePrimaryRouteSurface(routeState, entryRouteState = '') {
+  const route = String(routeState || '').trim();
+  const entryRoute = String(entryRouteState || '').trim();
+  if (!route) return null;
+  if ((entryRoute && route === entryRoute) || HOME_DEFAULT_EQUIVALENT_ROUTES.has(route)) {
+    return {
+      strategy: 'entry_module',
+      modulePath: '',
+      componentName: '',
+      reason: 'entry_module_surface',
+    };
+  }
+  const lastReturn = LAST_RETURN_ROUTE_COMPONENTS[route];
+  if (lastReturn) {
+    return {
+      strategy: 'last_return',
+      modulePath: String(lastReturn[0] || ''),
+      componentName: String(lastReturn[1] || ''),
+      reason: 'last_return_route_component',
+    };
+  }
+  const totalSurface = TOTAL_SURFACE_PLUS_APP_FRAME_ROUTE_COMPONENTS[route]
+    || TOTAL_SURFACE_ROUTE_COMPONENTS[route]
+    || EARLY_RETURN_PLUS_APP_ROOT_ROUTE_COMPONENTS[route];
+  if (totalSurface) {
+    return {
+      strategy: 'total_surface',
+      modulePath: String(totalSurface[0] || ''),
+      componentName: String(totalSurface[1] || ''),
+      reason: 'total_surface_route_component',
+    };
+  }
+  if (route === 'home_ziwei_overlay_open') {
+    return {
+      strategy: 'total_surface',
+      modulePath: ZIWEI_PAGE_MODULE_PATH,
+      componentName: 'ZiweiPage',
+      reason: 'ziwei_overlay_component',
+    };
+  }
+  return null;
+}
 
 export function readJson(filePath) {
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -555,6 +601,60 @@ function loadTaobaoProductSurface(repoRoot) {
   return resolved;
 }
 
+function syncRepoHelperTemplate(repoRoot, relativeTargetPath, templateFileName) {
+  const templatePath = fileURLToPath(new URL(`./${templateFileName}`, import.meta.url));
+  const targetPath = path.join(repoRoot, relativeTargetPath);
+  const next = fs.readFileSync(templatePath, 'utf8');
+  let current = null;
+  if (fs.existsSync(targetPath)) {
+    current = fs.readFileSync(targetPath, 'utf8');
+  }
+  if (current !== next) {
+    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+    fs.writeFileSync(targetPath, next, 'utf8');
+  }
+  return targetPath;
+}
+
+function loadExactRouteSemanticCount(routeState, repoRoot) {
+  const cacheKey = `${repoRoot}::${routeState}`;
+  if (exactRouteSemanticCountCache.has(cacheKey)) {
+    return exactRouteSemanticCountCache.get(cacheKey);
+  }
+  let resolved = null;
+  if (routeState === 'home_bazi_overlay_open') {
+    const helperPath = syncRepoHelperTemplate(
+      repoRoot,
+      'node_modules/.cache/r2c-react-v3/bazi-overlay-count.tsx',
+      'r2c-react-v3-bazi-overlay-count.template.tsx',
+    );
+    const tsxBin = path.join(repoRoot, 'node_modules', '.bin', 'tsx');
+    if (!fs.existsSync(tsxBin)) {
+      throw new Error(`missing tsx helper runtime: ${tsxBin}`);
+    }
+    const run = child_process.spawnSync(tsxBin, [helperPath], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      maxBuffer: 32 * 1024 * 1024,
+    });
+    if (run.status !== 0) {
+      throw new Error(`exact route helper failed for ${routeState}: ${String(run.stderr || run.stdout || '').trim()}`);
+    }
+    const stdoutText = String(run.stdout || '').trim();
+    if (!stdoutText) {
+      throw new Error(`exact route helper returned empty output for ${routeState}`);
+    }
+    const doc = JSON.parse(stdoutText);
+    const count = coerceJsonInt(doc?.semanticNodesCount);
+    if (count === null || count <= 0) {
+      throw new Error(`exact route helper returned invalid semanticNodesCount for ${routeState}`);
+    }
+    resolved = count;
+  }
+  exactRouteSemanticCountCache.set(cacheKey, resolved);
+  return resolved;
+}
+
 function refArray(surfaceLike, fieldName) {
   return Array.isArray(surfaceLike?.[fieldName]) ? surfaceLike[fieldName] : [];
 }
@@ -830,6 +930,17 @@ function deriveTotalSurfaceSnapshots(modules, baseSnapshot, routeState, componen
   return buildRouteCandidates(baseSnapshot, routeState, `${componentName}_${reasonSuffix}`, counts);
 }
 
+function deriveExactRenderedRouteSnapshots(baseSnapshot, routeState, repoRoot) {
+  const count = loadExactRouteSemanticCount(routeState, repoRoot);
+  if (count === null) return [];
+  return buildRouteCandidates(
+    baseSnapshot,
+    routeState,
+    'BaziPage_visible_overlay_dom_plus_app_shell_exact',
+    [{ count, label: 'semantic_dom' }],
+  );
+}
+
 function deriveNodesBranchSnapshots(modules, baseSnapshot, routeState, uniqueComponents, repoRoot) {
   const nodesPage = findComponentSurface(modules, NODES_PAGE_MODULE_PATH, 'NodesPage');
   const nodeDetail = findComponentSurface(modules, NODES_PAGE_MODULE_PATH, 'NodeDetail');
@@ -875,6 +986,7 @@ export function deriveExecRouteSnapshots(modules, baseSnapshot, routeState, uniq
     deriveEcomTruthSnapshots(baseSnapshot, routeState, repoRoot),
     deriveLanguageSelectorSnapshots(modules, baseSnapshot, routeState, repoRoot),
     deriveNodesBranchSnapshots(modules, baseSnapshot, routeState, uniqueComponents, repoRoot),
+    deriveExactRenderedRouteSnapshots(baseSnapshot, routeState, repoRoot),
     deriveTotalSurfaceSnapshots(modules, baseSnapshot, routeState, TOTAL_SURFACE_ROUTE_COMPONENTS, uniqueComponents, repoRoot),
     deriveTotalSurfaceSnapshots(
       modules,
@@ -1065,6 +1177,131 @@ export function buildCodegenRouteCatalog(execSnapshot, routeIds, runnerMode, mod
   catalog.routes = ordered;
   catalog.entries = entries;
   return catalog;
+}
+
+function buildRouteSnapshotFromCatalogCandidate(execSnapshot, routeId, candidate) {
+  const semanticNodesCount = Math.max(0, Number(candidate?.semanticNodesCount || 0));
+  return {
+    ...execSnapshot,
+    route_state: routeId,
+    semantic_nodes_loaded: semanticNodesCount > 0,
+    semantic_nodes_count: semanticNodesCount,
+    tree_node_count: semanticNodesCount,
+    root_node_count: semanticNodesCount > 0 ? 1 : 0,
+    element_node_count: semanticNodesCount,
+  };
+}
+
+export function buildCodegenExecRouteMatrixFromCatalog(execSnapshot, snapshotPath, routeIds, routeCatalog, truthDoc = null) {
+  const matrix = buildCodegenExecRouteMatrixZero();
+  const ordered = [];
+  const entryRoute = String(execSnapshot.route_state || '').trim();
+  if (entryRoute) ordered.push(entryRoute);
+  for (const route of routeIds) {
+    const value = String(route || '').trim();
+    if (value && !ordered.includes(value)) ordered.push(value);
+  }
+  const routeEntryMap = new Map();
+  for (const entry of Array.isArray(routeCatalog?.entries) ? routeCatalog.entries : []) {
+    const routeId = String(entry?.routeId || '').trim();
+    if (routeId && !routeEntryMap.has(routeId)) routeEntryMap.set(routeId, entry);
+  }
+  const entries = [];
+  for (const route of ordered) {
+    if (entryRoute && route === entryRoute) {
+      entries.push({
+        routeId: route,
+        supported: true,
+        reason: 'ok',
+        snapshotPath: snapshotPath,
+        snapshot: execSnapshot,
+      });
+      continue;
+    }
+    const routeCatalogEntry = routeEntryMap.get(route);
+    if (!routeCatalogEntry) {
+      entries.push({
+        routeId: route,
+        supported: false,
+        reason: 'missing_route_catalog_entry',
+        snapshotPath: '',
+        snapshot: buildCodegenExecSnapshotZero(),
+      });
+      continue;
+    }
+    const candidates = Array.isArray(routeCatalogEntry.candidates) ? routeCatalogEntry.candidates : [];
+    const firstReason = String(candidates[0]?.reason || routeCatalogEntry.reason || 'derived_candidate').trim() || 'derived_candidate';
+    if (!Boolean(routeCatalogEntry.supported) || candidates.length <= 0) {
+      entries.push({
+        routeId: route,
+        supported: false,
+        reason: String(routeCatalogEntry.reason || 'unsupported_exec_route') || 'unsupported_exec_route',
+        snapshotPath: '',
+        snapshot: buildCodegenExecSnapshotZero(),
+      });
+      continue;
+    }
+    if (String(routeCatalogEntry.reason || '') === 'equivalent_entry_surface') {
+      entries.push({
+        routeId: route,
+        supported: true,
+        reason: 'equivalent_entry_surface',
+        snapshotPath: snapshotPath,
+        snapshot: buildRouteSnapshotFromCatalogCandidate(execSnapshot, route, candidates[0]),
+      });
+      continue;
+    }
+    if (!truthDoc) {
+      entries.push({
+        routeId: route,
+        supported: false,
+        reason: `${firstReason}_needs_truth_check`,
+        snapshotPath: '',
+        snapshot: buildCodegenExecSnapshotZero(),
+      });
+      continue;
+    }
+    let supportedEntry = null;
+    for (const candidate of candidates) {
+      const derivedSnapshot = buildRouteSnapshotFromCatalogCandidate(execSnapshot, route, candidate);
+      const derivedCompare = compareExecSnapshotToTruthDoc(
+        derivedSnapshot,
+        snapshotPath,
+        truthDoc,
+        '',
+        route,
+      );
+      if (Boolean(derivedCompare.ok)) {
+        supportedEntry = {
+          routeId: route,
+          supported: true,
+          reason: `${String(candidate?.reason || firstReason)}_truth_checked`,
+          snapshotPath: snapshotPath,
+          snapshot: derivedSnapshot,
+        };
+        break;
+      }
+    }
+    if (supportedEntry) {
+      entries.push(supportedEntry);
+      continue;
+    }
+    entries.push({
+      routeId: route,
+      supported: false,
+      reason: `${firstReason}_truth_mismatch`,
+      snapshotPath: '',
+      snapshot: buildCodegenExecSnapshotZero(),
+    });
+  }
+  matrix.runnerMode = String(routeCatalog?.runnerMode || 'react_surface_runner_v1') || 'react_surface_runner_v1';
+  matrix.entryRouteState = entryRoute;
+  matrix.routeCount = ordered.length;
+  matrix.supportedCount = entries.filter((item) => Boolean(item.supported)).length;
+  matrix.unsupportedCount = entries.filter((item) => !Boolean(item.supported)).length;
+  matrix.routes = ordered;
+  matrix.entries = entries;
+  return matrix;
 }
 
 export function compareExecRouteMatrixToTruth(execRouteMatrix, truthDoc, truthTracePath) {

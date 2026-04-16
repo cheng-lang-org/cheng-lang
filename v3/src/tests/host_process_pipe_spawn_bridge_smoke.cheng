@@ -1,0 +1,80 @@
+import std/os
+import std/strutils as strutil
+import std/strings
+
+@importc("cheng_pipe_spawn_bridge")
+fn cheng_pipe_spawn_bridge(command: cstring, workingDir: cstring): int32
+@importc("cheng_pipe_spawn_bridge_last_read_fd")
+fn cheng_pipe_spawn_bridge_last_read_fd(): int32
+@importc("cheng_pipe_spawn_bridge_last_write_fd")
+fn cheng_pipe_spawn_bridge_last_write_fd(): int32
+@importc("cheng_pipe_spawn_bridge_last_pid_i32")
+fn cheng_pipe_spawn_bridge_last_pid_i32(): int32
+@importc("cheng_fd_read_wait_bridge")
+fn cheng_fd_read_wait_bridge(fd: int32, maxBytes: int32, timeoutMs: int32): cstring
+@importc("cheng_fd_read_wait_bridge_last_eof")
+fn cheng_fd_read_wait_bridge_last_eof(): int32
+@importc("cheng_pty_close_bridge")
+fn cheng_pty_close_bridge(fd: int32): int32
+@importc("cheng_pty_wait_bridge")
+fn cheng_pty_wait_bridge(pid: int64): int32
+@importc("cheng_pty_wait_bridge_last_exit_code")
+fn cheng_pty_wait_bridge_last_exit_code(): int32
+@importc("cheng_free")
+fn cheng_free_raw(p: ptr)
+
+fn main(): int32 =
+    let command: cstring = strToCStringTemp("/bin/echo bridge-ok")
+    let workingDir: cstring = strToCStringTemp("")
+    let status: int32 = cheng_pipe_spawn_bridge(command, workingDir)
+    let readFd: int32 = cheng_pipe_spawn_bridge_last_read_fd()
+    var writeFd: int32 = cheng_pipe_spawn_bridge_last_write_fd()
+    let pid32: int32 = cheng_pipe_spawn_bridge_last_pid_i32()
+    var pid64Assigned: int64 = -1
+    pid64Assigned = int64(pid32)
+    assert(status != 0, "pipe spawn status")
+    assert(readFd >= 0, "pipe spawn read fd")
+    assert(writeFd >= 0, "pipe spawn write fd")
+    assert(pid32 > 0, "pipe spawn pid")
+    assert(pid64Assigned > 0, "pipe spawn pid assigned")
+    let _closeWrite = cheng_pty_close_bridge(writeFd)
+    writeFd = -1
+    var output = ""
+    var eof = false
+    var spins: int32 = 0
+    var exitCode: int32 = -1
+    var waited = false
+    while !eof && spins < 200:
+        spins = spins + 1
+        let raw: cstring = cheng_fd_read_wait_bridge(readFd, 65536, 20)
+        let text: str = strFromCStringCopy(raw)
+        cheng_free_raw(ptr(raw))
+        if strings.len(text) > 0:
+            output = output + text
+        eof = cheng_fd_read_wait_bridge_last_eof() != 0
+        if !eof:
+            let waitStatus: int32 = cheng_pty_wait_bridge(int64(pid32))
+            if waitStatus < 0:
+                assert(false, "pipe wait failed")
+            if waitStatus == 1:
+                exitCode = cheng_pty_wait_bridge_last_exit_code()
+                waited = true
+                break
+        os.sleepMs(10)
+    let _closeRead = cheng_pty_close_bridge(readFd)
+    if !waited:
+        var waitSpins: int32 = 0
+        while waitSpins < 200:
+            waitSpins = waitSpins + 1
+            let waitStatus: int32 = cheng_pty_wait_bridge(int64(pid32))
+            if waitStatus < 0:
+                assert(false, "pipe wait final failed")
+            if waitStatus == 1:
+                exitCode = cheng_pty_wait_bridge_last_exit_code()
+                waited = true
+                break
+            os.sleepMs(10)
+    assert(exitCode == 0, "pipe spawn exit")
+    assert(strutil.strip(output) == "bridge-ok", "pipe spawn output")
+    echo("v3 host_process_pipe_spawn_bridge_smoke ok")
+    return 0

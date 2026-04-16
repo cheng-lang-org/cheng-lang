@@ -1,0 +1,91 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+import cheng/v3/tooling/path as v3path
+
+importc fn cheng_v3_exec_program_capture_bridge(programName: cstring, argvSeq: str[], workingDir: cstring, exitCode: var int64): cstring
+importc fn cheng_v3_exec_program_capture_bridge_dispose(raw: cstring)
+
+fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
+    let name: str = strutil.strip(nameRaw)
+    if strings.len(name) <= 0:
+        return ""
+    if strutil.contains(name, "/"):
+        let absolute: str = v3path.v3PathAbsolute(root, name)
+        if v3path.v3FileExistsNonEmpty(root, absolute):
+            return absolute
+        return ""
+    let pathEnv: str = os.getEnv("PATH")
+    let total: int32 = strings.len(pathEnv)
+    var start: int32 = 0
+    for i in 0..total:
+        var endHit = false
+        if i == total:
+            endHit = true
+        elif pathEnv[i] == ':':
+            endHit = true
+        if !endHit:
+            continue
+        let itemLen: int32 = i - start
+        if itemLen > 0:
+            let dirText: str = v3path.v3TextSlice(pathEnv, start, itemLen)
+            let candidate: str = os.joinPath(dirText, name)
+            if v3path.v3FileExistsNonEmpty(root, candidate):
+                return candidate
+        start = i + 1
+    return ""
+
+fn r2cProcessCapture(filePath: str,
+                     argv: str[],
+                     workingDir: str,
+                     timeoutSec: int32,
+                     outputOut: var str): int32 =
+    let _ = timeoutSec
+    os.osSetEmpty(outputOut)
+    if strings.len(filePath) <= 0:
+        return -1
+    var exitCode64: int64 = -1
+    let rawOutput: cstring = cheng_v3_exec_program_capture_bridge(strToCStringTemp(filePath),
+                                                                  argv,
+                                                                  strToCStringTemp(workingDir),
+                                                                  exitCode64)
+    outputOut = strFromCStringCopy(rawOutput)
+    cheng_v3_exec_program_capture_bridge_dispose(rawOutput)
+    return int32(exitCode64)
+
+fn r2cProcessRunFileLogged(root: str,
+                           label: str,
+                           filePathRaw: str,
+                           argv: str[],
+                           workingDirRaw: str,
+                           logPathRaw: str,
+                           exitCodeOut: var int32,
+                           outputOut: var str): bool =
+    let filePath: str = v3path.v3PathAbsolute(root, filePathRaw)
+    var workingDir: str = v3path.v3PathAbsolute(root, workingDirRaw)
+    if !v3path.v3PathNonEmpty(workingDirRaw):
+        workingDir = root
+    let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
+    let exitCode: int32 = r2cProcessCapture(filePath, argv, workingDir, 120, outputOut)
+    exitCodeOut = exitCode
+    let _logged: bool = v3path.v3WriteTextFile(root, logPath, outputOut)
+    let _ = label
+    return exitCode == 0
+
+fn r2cProcessRunProgramLogged(root: str,
+                              label: str,
+                              programName: str,
+                              argv: str[],
+                              workingDirRaw: str,
+                              logPathRaw: str,
+                              exitCodeOut: var int32,
+                              outputOut: var str): bool =
+    let programPath: str = r2cProcessResolveProgram(root, programName)
+    if !v3path.v3PathNonEmpty(programPath):
+        exitCodeOut = -1
+        os.osSetStr(outputOut, "missing executable: " + programName)
+        let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
+        let _logged: bool = v3path.v3WriteTextFile(root, logPath, outputOut)
+        let _ = label
+        return false
+    return r2cProcessRunFileLogged(root, label, programPath, argv, workingDirRaw, logPathRaw, exitCodeOut, outputOut)

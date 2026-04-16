@@ -182,6 +182,7 @@ function buildHostContract(modules) {
     name: 'unimaker_host_v1',
     methods,
     required_groups: requiredGroups,
+    feature_hits: [...featureHits].sort(),
   };
 }
 

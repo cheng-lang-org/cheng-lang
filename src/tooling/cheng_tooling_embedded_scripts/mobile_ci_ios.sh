@@ -77,7 +77,7 @@ case "$out" in
   *) out="$root/$out" ;;
 esac
 
-cmd="src/tooling/build_mobile_export.sh"
+cmd="src/tooling/cheng_tooling_embedded_scripts/build_mobile_export.sh"
 args="--with-ios-project"
 if [ "$name" != "" ]; then
   args="$args --name:$name"
@@ -97,7 +97,7 @@ fi
 
 echo "[ci-ios] export: $in"
 set -- $args
-"$cmd" "$in" "$@"
+sh "$cmd" "$in" "$@"
 
 project="$out/ios_project"
 if [ ! -d "$project" ]; then
@@ -129,6 +129,7 @@ if [ ! -d "$project/ChengMobileApp.xcodeproj" ] || ! command -v xcodebuild >/dev
     src="$project/ChengMobileApp"
     sdk="$(xcrun --sdk iphonesimulator --show-sdk-path)"
     xcrun --sdk iphonesimulator clang -fobjc-arc -fsyntax-only -isysroot "$sdk" -I"$src" "$src/cheng_mobile_ios_glue.m"
+    xcrun --sdk iphonesimulator clang -fobjc-arc -fsyntax-only -isysroot "$sdk" -I"$src" "$src/cheng_mobile_host_ios.m"
     xcrun --sdk iphonesimulator clang -fobjc-arc -fsyntax-only -isysroot "$sdk" -I"$src" "$src/ChengViewController.m"
   else
     echo "[ci-ios] xcrun not found; skip fallback syntax check"

@@ -1,7 +1,10 @@
 import std/system
+import std/rawbytes
 import cheng/v3/overlay/contracts as overlay
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/protocols/identify as identify
+import cheng/v3/libp2p/transports/tcp_transport
 import cheng/v3/libp2p/host/host
 
 fn main(): int32 =
@@ -37,6 +40,37 @@ fn main(): int32 =
     assert(IsOk(dialBackRes), "v3 libp2p resource: server dial back")
     host.v3Libp2pSetPeerTrustedInfra(server, trustedClient.selfPeerId, true)
     host.v3Libp2pSetPeerTrustedInfra(trustedClient, server.selfPeerId, true)
+    let localTrustedRes = host.v3Libp2pIdentifyResourcesForPeer(server, trustedClient.selfPeerId)
+    assert(IsOk(localTrustedRes), "v3 libp2p resource: local trusted visible")
+    let identifyPayload = identify.v3Libp2pIdentifyRequestEncode()
+    let localServeRes = host.v3Libp2pServePayloadFromPeer(server,
+                                                          trustedClient.selfPeerId,
+                                                          types.v3Libp2pProtocolIdentify,
+                                                          identifyPayload)
+    assert(IsOk(localServeRes), "v3 libp2p resource: local identify serve")
+    var localServePayload: Bytes
+    localServePayload = Value(localServeRes)
+    var localDecoded = types.v3Libp2pNodeResourceZero()
+    let localDecodeRes = identify.v3Libp2pIdentifyResponseDecodeFill(localDecoded,
+                                                                     localServePayload)
+    assert(IsOk(localDecodeRes), "v3 libp2p resource: local identify decode")
+    let localTcpRes = tcp_transport.v3Libp2pTcpLoopbackRequestResponseRaw(types.v3Libp2pProtocolIdentify,
+                                                                          identifyPayload.data,
+                                                                          identifyPayload.len,
+                                                                          localServePayload.data,
+                                                                          localServePayload.len)
+    assert(IsOk(localTcpRes), "v3 libp2p resource: local tcp rr")
+    let localTcpPayload = Value(localTcpRes)
+    assert(bytesLen(localTcpPayload) == bytesLen(localServePayload),
+        "v3 libp2p resource: local tcp rr len")
+    let responseMagic = bytesFromString("v3.identify.resource")
+    for i in 0..<bytesLen(responseMagic):
+        assert(bytesGet(localTcpPayload, i) == bytesGet(responseMagic, i),
+            "v3 libp2p resource: local tcp rr magic")
+    var localTcpDecoded = types.v3Libp2pNodeResourceZero()
+    let localTcpDecodeRes = identify.v3Libp2pIdentifyResponseDecodeFill(localTcpDecoded,
+                                                                        localTcpPayload)
+    assert(IsOk(localTcpDecodeRes), "v3 libp2p resource: local tcp rr decode")
 
     var sample = types.v3Libp2pNodeResourceZero()
     let identifyRes = host.v3Libp2pIdentifyRequest(trustedClient,

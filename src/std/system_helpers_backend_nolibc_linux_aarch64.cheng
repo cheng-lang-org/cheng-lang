@@ -278,6 +278,7 @@ var
     cheng_stdio_stdin_token: int32
     cheng_stdio_stdout_token: int32
     cheng_stdio_stderr_token: int32
+    cheng_webrtc_bridge_last_error: str
 
 fn puts_runtime(text: ptr): int32 =
     return cheng_puts(text)
@@ -1901,6 +1902,14 @@ fn cheng_runtime_str_copy(raw: ptr, n: int32): str =
         return cheng_runtime_str_empty()
     return cheng_runtime_str_view_owned(outRaw, n)
 
+fn cheng_runtime_str_dispose(value: var str) =
+    if value.flags == chengStrFlagOwned && value.data != nil:
+        chengFreeCompat(value.data)
+    value = cheng_runtime_str_empty()
+@exportc("cheng_v3_tcp_bridge_str_dispose_bridge")
+fn cheng_v3_tcp_bridge_str_dispose_bridge_export(value: var str) =
+    cheng_runtime_str_dispose(value)
+
 fn cheng_runtime_error_str(text: ptr): str =
     if text == nil:
         return cheng_runtime_str_empty()
@@ -3366,13 +3375,70 @@ fn cheng_v3_system_npu_device_count_bridge_export(): int32 =
 @exportc("cheng_v3_system_npu_core_count_bridge")
 fn cheng_v3_system_npu_core_count_bridge_export(): int32 =
     return 0
+@exportc("cheng_v3_udp_platform_msg_dontwait_bridge")
+fn cheng_v3_udp_platform_msg_dontwait_bridge_export(): int32 =
+    return cheng_msg_dontwait
 
-@exportc("cheng_v3_tcp_loopback_request_response_bridge")
-fn cheng_v3_tcp_loopback_request_response_bridge_export(protocolText: str,
-                                                        requestWire: str,
-                                                        responseWire: str,
-                                                        clientResponseWire: var str,
-                                                        errWire: var str): int32 =
+@exportc("cheng_v3_tcp_bridge_str_empty_bridge")
+fn cheng_v3_tcp_bridge_str_empty_bridge_export(): str =
+    return cheng_runtime_str_empty()
+@exportc("cheng_v3_tcp_bridge_str_len_bridge")
+fn cheng_v3_tcp_bridge_str_len_bridge_export(value: str): int32 =
+    return cheng_runtime_str_len(value)
+@exportc("cheng_v3_tcp_bridge_str_data_bridge")
+fn cheng_v3_tcp_bridge_str_data_bridge_export(value: str): ptr =
+    return cheng_runtime_str_data(value)
+@exportc("cheng_v3_tcp_bridge_malloc_bridge")
+fn cheng_v3_tcp_bridge_malloc_bridge_export(size: int32): ptr =
+    return chengAllocCompat(size)
+@exportc("cheng_v3_tcp_bridge_free_bridge")
+fn cheng_v3_tcp_bridge_free_bridge_export(p: ptr) =
+    chengFreeCompat(p)
+@exportc("cheng_v3_tcp_bridge_bytes_copy_bridge")
+fn cheng_v3_tcp_bridge_bytes_copy_bridge_export(dst: ptr, src: ptr, n: int32) =
+    cheng_bytes_copy(dst, src, int64(n))
+@exportc("cheng_v3_tcp_buffer_handle_register_bridge")
+fn cheng_v3_tcp_buffer_handle_register_bridge_export(raw: ptr): uint64 =
+    return uint64(raw)
+@exportc("cheng_v3_tcp_buffer_handle_resolve_bridge")
+fn cheng_v3_tcp_buffer_handle_resolve_bridge_export(handle: uint64): ptr =
+    return ptr(handle)
+@exportc("cheng_v3_tcp_buffer_handle_release_raw_bridge")
+fn cheng_v3_tcp_buffer_handle_release_raw_bridge_export(handle: uint64): int32 =
+    let raw: ptr = ptr(handle)
+    if raw == nil:
+        return -1
+    chengFreeCompat(raw)
+    return 0
+@exportc("cheng_v3_buffer_handle_len_bridge")
+fn cheng_v3_buffer_handle_len_bridge_export(handle: uint64): int32 =
+    return cheng_v3_buffer_handle_len(ptr(handle))
+
+@exportc("cheng_v3_buffer_handle_byte_bridge")
+fn cheng_v3_buffer_handle_byte_bridge_export(handle: uint64, idx: int32): int32 =
+    let raw: ptr = ptr(handle)
+    let n: int32 = cheng_v3_buffer_handle_len(raw)
+    if n < 0 || idx < 0 || idx >= n:
+        return -1
+    return int32(*(UInt8Ptr(ptr(uint64(cheng_v3_buffer_handle_payload_ptr(raw)) + uint64(idx)))))
+
+@exportc("cheng_v3_buffer_handle_release_bridge")
+fn cheng_v3_buffer_handle_release_bridge_export(handle: uint64): int32 =
+    let raw: ptr = ptr(handle)
+    if cheng_v3_buffer_handle_len(raw) < 0:
+        return -1
+    store_int32(raw, 0)
+    chengFreeCompat(raw)
+    return 0
+@exportc("cheng_v3_buffer_handle_from_raw_bridge")
+fn cheng_v3_buffer_handle_from_raw_bridge_export(data: ptr, n: int32): uint64 =
+    return cheng_v3_buffer_handle_new_from_buf(data, n)
+
+fn cheng_v3_tcp_loopback_request_response_fill(protocolText: str,
+                                               requestWire: str,
+                                               responseWire: str,
+                                               clientResponseWire: var str,
+                                               errWire: var str): int32 =
     clientResponseWire = cheng_runtime_str_empty()
     errWire = cheng_runtime_str_empty()
     var listenerFd: int32 = -1
@@ -3492,24 +3558,96 @@ fn cheng_v3_tcp_loopback_request_response_bridge_export(protocolText: str,
     cheng_runtime_close_if_open(listenerFd)
     return cheng_runtime_str_len(errWire) == 0 ? 1 : 0
 
+@exportc("cheng_v3_tcp_loopback_request_response_impl_bridge")
+fn cheng_v3_tcp_loopback_request_response_impl_bridge_export(protocolText: str,
+                                                             requestWire: str,
+                                                             responseWire: str,
+                                                             clientResponseWire: var str,
+                                                             errWire: var str): int32 =
+    return cheng_v3_tcp_loopback_request_response_fill(protocolText,
+                                                       requestWire,
+                                                       responseWire,
+                                                       clientResponseWire,
+                                                       errWire)
+
+@exportc("cheng_v3_tcp_loopback_request_response_bridge")
+fn cheng_v3_tcp_loopback_request_response_bridge_export(protocolText: str,
+                                                        requestHex: str,
+                                                        responseHex: str): uint64 =
+    var requestWire: str = cheng_runtime_str_empty()
+    var responseWire: str = cheng_runtime_str_empty()
+    var decodeErr: str = cheng_runtime_str_empty()
+    if !cheng_v3_tcp_hex_decode_str(requestHex, requestWire, decodeErr):
+        cheng_runtime_str_dispose(requestWire)
+        cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_str_dispose(decodeErr)
+        return uint64(0)
+    if !cheng_v3_tcp_hex_decode_str(responseHex, responseWire, decodeErr):
+        cheng_runtime_str_dispose(requestWire)
+        cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_str_dispose(decodeErr)
+        return uint64(0)
+    var clientResponseWire: str = cheng_runtime_str_empty()
+    var errWire: str = cheng_runtime_str_empty()
+    let ok: int32 = cheng_v3_tcp_loopback_request_response_impl_bridge_export(protocolText,
+                                                                              requestWire,
+                                                                              responseWire,
+                                                                              clientResponseWire,
+                                                                              errWire)
+    cheng_runtime_str_dispose(requestWire)
+    cheng_runtime_str_dispose(responseWire)
+    cheng_runtime_str_dispose(decodeErr)
+    if ok == 0:
+        cheng_runtime_str_dispose(clientResponseWire)
+        cheng_runtime_str_dispose(errWire)
+        return uint64(0)
+    let handle: uint64 = cheng_v3_buffer_handle_new_from_str(clientResponseWire)
+    cheng_runtime_str_dispose(clientResponseWire)
+    cheng_runtime_str_dispose(errWire)
+    return handle
+@exportc("cheng_v3_tcp_loopback_request_response_handle_bridge")
+fn cheng_v3_tcp_loopback_request_response_handle_bridge_export(protocolText: str,
+                                                               requestHandle: uint64,
+                                                               responseHandle: uint64): uint64 =
+    let requestRaw: ptr = ptr(requestHandle)
+    let responseRaw: ptr = ptr(responseHandle)
+    let requestLen: int32 = cheng_v3_buffer_handle_len(requestRaw)
+    let responseLen: int32 = cheng_v3_buffer_handle_len(responseRaw)
+    if requestLen < 0 || responseLen < 0:
+        return uint64(0)
+    let requestWire: str = cheng_runtime_str_copy(cheng_v3_buffer_handle_payload_ptr(requestRaw), requestLen)
+    let responseWire: str = cheng_runtime_str_copy(cheng_v3_buffer_handle_payload_ptr(responseRaw), responseLen)
+    var clientResponseWire: str = cheng_runtime_str_empty()
+    var errWire: str = cheng_runtime_str_empty()
+    let ok: int32 = cheng_v3_tcp_loopback_request_response_impl_bridge_export(protocolText,
+                                                                              requestWire,
+                                                                              responseWire,
+                                                                              clientResponseWire,
+                                                                              errWire)
+    cheng_runtime_str_dispose(requestWire)
+    cheng_runtime_str_dispose(responseWire)
+    if ok == 0:
+        cheng_runtime_str_dispose(clientResponseWire)
+        cheng_runtime_str_dispose(errWire)
+        return uint64(0)
+    let handle: uint64 = cheng_v3_buffer_handle_new_from_str(clientResponseWire)
+    cheng_runtime_str_dispose(clientResponseWire)
+    cheng_runtime_str_dispose(errWire)
+    return handle
+
 @exportc("cheng_v3_tcp_loopback_payload_bridge")
 fn cheng_v3_tcp_loopback_payload_bridge_export(protocolText: str,
-                                               payloadWire: str,
-                                               responseWire: var str,
-                                               errWire: var str): int32 =
+                                               payloadHex: str): uint64 =
     return cheng_v3_tcp_loopback_request_response_bridge_export(protocolText,
-                                                                payloadWire,
-                                                                payloadWire,
-                                                                responseWire,
-                                                                errWire)
+                                                                payloadHex,
+                                                                payloadHex)
 
-@exportc("cheng_v3_tcp_serve_payload_once_bridge")
-fn cheng_v3_tcp_serve_payload_once_bridge_export(hostText: str,
-                                                 port: int32,
-                                                 protocolText: str,
-                                                 payloadWire: str,
-                                                 readyPath: str,
-                                                 errWire: var str): int32 =
+fn cheng_v3_tcp_serve_payload_once_fill(hostText: str,
+                                        port: int32,
+                                        protocolText: str,
+                                        payloadWire: str,
+                                        readyPath: str,
+                                        errWire: var str): int32 =
     errWire = cheng_runtime_str_empty()
     var listenerFd: int32 = -1
     var serverFd: int32 = -1
@@ -3578,12 +3716,33 @@ fn cheng_v3_tcp_serve_payload_once_bridge_export(hostText: str,
         return 1
     return 0
 
-@exportc("cheng_v3_tcp_recv_payload_once_bridge")
-fn cheng_v3_tcp_recv_payload_once_bridge_export(hostText: str,
-                                                port: int32,
-                                                protocolText: str,
-                                                responseWire: var str,
-                                                errWire: var str): int32 =
+@exportc("cheng_v3_tcp_serve_payload_once_bridge")
+fn cheng_v3_tcp_serve_payload_once_bridge_export(hostText: str,
+                                                 port: int32,
+                                                 protocolText: str,
+                                                 payloadHex: str,
+                                                 readyPath: str): int32 =
+    var payloadWire: str = cheng_runtime_str_empty()
+    var errWire: str = cheng_runtime_str_empty()
+    if !cheng_v3_tcp_hex_decode_str(payloadHex, payloadWire, errWire):
+        cheng_runtime_str_dispose(payloadWire)
+        cheng_runtime_str_dispose(errWire)
+        return 0
+    let ok: int32 = cheng_v3_tcp_serve_payload_once_fill(hostText,
+                                                         port,
+                                                         protocolText,
+                                                         payloadWire,
+                                                         readyPath,
+                                                         errWire)
+    cheng_runtime_str_dispose(payloadWire)
+    cheng_runtime_str_dispose(errWire)
+    return ok
+
+fn cheng_v3_tcp_recv_payload_once_fill(hostText: str,
+                                       port: int32,
+                                       protocolText: str,
+                                       responseWire: var str,
+                                       errWire: var str): int32 =
     responseWire = cheng_runtime_str_empty()
     errWire = cheng_runtime_str_empty()
     var clientFd: int32 = -1
@@ -3638,9 +3797,59 @@ fn cheng_v3_tcp_recv_payload_once_bridge_export(hostText: str,
         return 1
     return 0
 
+@exportc("cheng_v3_tcp_recv_payload_once_impl_bridge")
+fn cheng_v3_tcp_recv_payload_once_impl_bridge_export(hostText: str,
+                                                     port: int32,
+                                                     protocolText: str,
+                                                     responseWire: var str,
+                                                     errWire: var str): int32 =
+    return cheng_v3_tcp_recv_payload_once_fill(hostText,
+                                               port,
+                                               protocolText,
+                                               responseWire,
+                                               errWire)
+
+@exportc("cheng_v3_tcp_recv_payload_once_bridge")
+fn cheng_v3_tcp_recv_payload_once_bridge_export(hostText: str,
+                                                port: int32,
+                                                protocolText: str): uint64 =
+    var responseWire: str = cheng_runtime_str_empty()
+    var errWire: str = cheng_runtime_str_empty()
+    let ok: int32 = cheng_v3_tcp_recv_payload_once_impl_bridge_export(hostText,
+                                                                      port,
+                                                                      protocolText,
+                                                                      responseWire,
+                                                                      errWire)
+    if ok == 0:
+        cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_str_dispose(errWire)
+        return uint64(0)
+    let handle: uint64 = cheng_v3_buffer_handle_new_from_str(responseWire)
+    cheng_runtime_str_dispose(responseWire)
+    cheng_runtime_str_dispose(errWire)
+    return handle
+
 fn cheng_runtime_webrtc_unsupported(errWire: var str, text: ptr): int32 =
     errWire = cheng_runtime_error_str(text)
     return 0
+
+fn cheng_runtime_webrtc_last_error_clear() =
+    cheng_runtime_str_dispose(cheng_webrtc_bridge_last_error)
+
+fn cheng_runtime_webrtc_last_error_set(value: str) =
+    cheng_runtime_str_dispose(cheng_webrtc_bridge_last_error)
+    cheng_webrtc_bridge_last_error = cheng_runtime_str_copy(cheng_runtime_str_data(value),
+                                                            cheng_runtime_str_len(value))
+
+fn cheng_runtime_webrtc_last_error_set_ptr(text: ptr) =
+    cheng_runtime_str_dispose(cheng_webrtc_bridge_last_error)
+    cheng_webrtc_bridge_last_error = cheng_runtime_error_str(text)
+
+@exportc("cheng_v3_webrtc_last_error_handle_bridge")
+fn cheng_v3_webrtc_last_error_handle_bridge_export(): uint64 =
+    if cheng_runtime_str_len(cheng_webrtc_bridge_last_error) == 0:
+        return uint64(0)
+    return cheng_v3_buffer_handle_new_from_str(cheng_webrtc_bridge_last_error)
 
 @exportc("cheng_v3_webrtc_datachannel_request_response_bridge")
 fn cheng_v3_webrtc_datachannel_request_response_bridge_export(protocolText: str,
@@ -3656,6 +3865,18 @@ fn cheng_v3_webrtc_datachannel_request_response_bridge_export(protocolText: str,
     clientResponseWire = cheng_runtime_str_empty()
     return cheng_runtime_webrtc_unsupported(errWire,
                                             "v3 libp2p webrtc: browser/datachannel unsupported on linux nolibc")
+
+@exportc("cheng_v3_webrtc_datachannel_request_response_handle_bridge")
+fn cheng_v3_webrtc_datachannel_request_response_handle_bridge_export(protocolText: str,
+                                                                     signalWire: str,
+                                                                     requestWire: str,
+                                                                     responseWire: str): uint64 =
+    protocolText
+    signalWire
+    requestWire
+    responseWire
+    cheng_runtime_webrtc_last_error_set_ptr("v3 libp2p webrtc: browser/datachannel unsupported on linux nolibc")
+    return uint64(0)
 
 @exportc("cheng_v3_webrtc_browser_request_response_bridge")
 fn cheng_v3_webrtc_browser_request_response_bridge_export(protocolText: str,
@@ -3688,6 +3909,20 @@ fn cheng_v3_webrtc_browser_session_open_bridge_export(policyText: str,
                                      "v3 libp2p webrtc browser: session open unsupported on linux nolibc")
     return uint64(0)
 
+@exportc("cheng_v3_webrtc_browser_session_open_handle_bridge")
+fn cheng_v3_webrtc_browser_session_open_handle_bridge_export(policyText: str,
+                                                             labelText: str): uint64 =
+    policyText
+    labelText
+    cheng_runtime_webrtc_last_error_set_ptr("v3 libp2p webrtc browser: session open unsupported on linux nolibc")
+    return uint64(0)
+
+@exportc("cheng_v3_webrtc_browser_session_signal_handle_bridge")
+fn cheng_v3_webrtc_browser_session_signal_handle_bridge_export(handle: uint64): uint64 =
+    handle
+    cheng_runtime_webrtc_last_error_set_ptr("v3 libp2p webrtc browser: signal transcript unsupported on linux nolibc")
+    return uint64(0)
+
 @exportc("cheng_v3_webrtc_browser_session_exchange_bridge")
 fn cheng_v3_webrtc_browser_session_exchange_bridge_export(handle: uint64,
                                                           protocolText: str,
@@ -3703,12 +3938,99 @@ fn cheng_v3_webrtc_browser_session_exchange_bridge_export(handle: uint64,
     return cheng_runtime_webrtc_unsupported(errWire,
                                             "v3 libp2p webrtc browser: session exchange unsupported on linux nolibc")
 
+@exportc("cheng_v3_webrtc_browser_session_exchange_handle_bridge")
+fn cheng_v3_webrtc_browser_session_exchange_handle_bridge_export(handle: uint64,
+                                                                 protocolText: str,
+                                                                 requestWire: str,
+                                                                 responseWire: str): uint64 =
+    handle
+    protocolText
+    requestWire
+    responseWire
+    cheng_runtime_webrtc_last_error_set_ptr("v3 libp2p webrtc browser: session exchange unsupported on linux nolibc")
+    return uint64(0)
+
 @exportc("cheng_v3_webrtc_browser_session_close_bridge")
 fn cheng_v3_webrtc_browser_session_close_bridge_export(handle: uint64, errWire: var str): int32 =
     handle
     return cheng_runtime_webrtc_unsupported(errWire,
                                             "v3 libp2p webrtc browser: session close unsupported on linux nolibc")
 
+@exportc("cheng_v3_webrtc_browser_session_close_simple_bridge")
+fn cheng_v3_webrtc_browser_session_close_simple_bridge_export(handle: uint64): int32 =
+    handle
+    cheng_runtime_webrtc_last_error_set_ptr("v3 libp2p webrtc browser: session close unsupported on linux nolibc")
+    return 0
+
 @exportc("cheng_v3_webrtc_browser_session_active_count_bridge")
 fn cheng_v3_webrtc_browser_session_active_count_bridge_export(): int32 =
     return 0
+const
+    chengV3BufferHandleMagic: int32 = 1128817459
+
+fn cheng_v3_buffer_handle_payload_ptr(raw: ptr): ptr =
+    if raw == nil:
+        return nil
+    return ptr(uint64(raw) + uint64(8))
+
+fn cheng_v3_buffer_handle_new_from_str(value: str): uint64 =
+    let n: int32 = cheng_runtime_str_len(value)
+    let raw: ptr = chengAllocCompat(8 + n)
+    if raw == nil:
+        return uint64(0)
+    store_int32(raw, chengV3BufferHandleMagic)
+    store_int32(ptr(uint64(raw) + uint64(4)), n)
+    if n > 0:
+        cheng_bytes_copy(cheng_v3_buffer_handle_payload_ptr(raw),
+                         cheng_runtime_str_data(value),
+                         int64(n))
+    return uint64(raw)
+
+fn cheng_v3_buffer_handle_new_from_buf(data: ptr, n: int32): uint64 =
+    if n < 0:
+        return uint64(0)
+    let raw: ptr = chengAllocCompat(8 + n)
+    if raw == nil:
+        return uint64(0)
+    store_int32(raw, chengV3BufferHandleMagic)
+    store_int32(ptr(uint64(raw) + uint64(4)), n)
+    if n > 0:
+        cheng_bytes_copy(cheng_v3_buffer_handle_payload_ptr(raw), data, int64(n))
+    return uint64(raw)
+
+fn cheng_v3_buffer_handle_len(raw: ptr): int32 =
+    if raw == nil || load_int32(raw) != chengV3BufferHandleMagic:
+        return -1
+    return load_int32(ptr(uint64(raw) + uint64(4)))
+
+fn cheng_v3_tcp_hex_value(ch: uint8): int32 =
+    if ch >= uint8(int32('0')) && ch <= uint8(int32('9')):
+        return int32(ch) - int32(uint8(int32('0')))
+    if ch >= uint8(int32('a')) && ch <= uint8(int32('f')):
+        return 10 + int32(ch) - int32(uint8(int32('a')))
+    if ch >= uint8(int32('A')) && ch <= uint8(int32('F')):
+        return 10 + int32(ch) - int32(uint8(int32('A')))
+    return -1
+
+fn cheng_v3_tcp_hex_decode_str(text: str, out: var str, errWire: var str): bool =
+    out = cheng_runtime_str_empty()
+    if (cheng_runtime_str_len(text) % 2) != 0:
+        errWire = cheng_runtime_error_str("v3 libp2p tcp: invalid capture hex length")
+        return false
+    let outRaw: ptr = chengAllocCompat(cheng_runtime_str_len(text) / 2 + 1)
+    if outRaw == nil:
+        errWire = cheng_runtime_error_str("v3 libp2p tcp: alloc failed")
+        return false
+    var i = 0
+    while i < cheng_runtime_str_len(text):
+        let hi = cheng_v3_tcp_hex_value(*(UInt8Ptr(ptr(uint64(cheng_runtime_str_data(text)) + uint64(i)))))
+        let lo = cheng_v3_tcp_hex_value(*(UInt8Ptr(ptr(uint64(cheng_runtime_str_data(text)) + uint64(i + 1)))))
+        if hi < 0 || lo < 0:
+            chengFreeCompat(outRaw)
+            errWire = cheng_runtime_error_str("v3 libp2p tcp: invalid capture hex")
+            return false
+        *(UInt8Ptr(ptr(uint64(outRaw) + uint64(i / 2)))) = uint8((hi << 4) | lo)
+        i = i + 2
+    *(UInt8Ptr(ptr(uint64(outRaw) + uint64(cheng_runtime_str_len(text) / 2)))) = uint8(0)
+    out = cheng_runtime_str_view_owned(outRaw, cheng_runtime_str_len(text) / 2)
+    return true

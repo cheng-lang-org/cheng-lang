@@ -1,23 +1,15 @@
+import std/os
+import std/strings
+import std/strutils as strutil
+
 type
     V3PathSplitFileResult =
         dir: str
         name: str
         ext: str
 
-importc fn cheng_v3_str_strip_bridge(s: str): str
-importc fn cheng_v3_os_is_absolute_bridge(path: str): int32
-importc fn cheng_v3_os_join_path_bridge(left: str, right: str): str
-importc fn cheng_v3_os_file_exists_bridge(path: str): int32
-importc fn cheng_v3_os_dir_exists_bridge(path: str): int32
-importc fn cheng_v3_os_file_size_bridge(path: str): int64
-importc fn cheng_v3_read_file_bridge(path: str): str
-importc fn driver_c_get_current_dir_bridge(): str
-importc fn driver_c_str_slice_bridge(s: str, start: int32, count: int32): str
-importc fn driver_c_create_dir_all_bridge(path: str)
-importc fn driver_c_write_text_file_bridge(path: str, content: str)
-
 fn v3PathTrim(raw: str): str =
-    return cheng_v3_str_strip_bridge(raw)
+    return strutil.strip(raw)
 
 fn v3PathNonEmpty(raw: str): bool =
     return v3PathTrim(raw) != ""
@@ -25,7 +17,7 @@ fn v3PathNonEmpty(raw: str): bool =
 fn v3TextSlice(text: str, start: int32, count: int32): str =
     if count <= 0:
         return ""
-    return driver_c_str_slice_bridge(text, start, count)
+    return strings.sliceBytes(text, start, count)
 
 fn v3TextStartsWith(text: str, prefix: str): bool =
     if prefix.len > text.len:
@@ -51,16 +43,22 @@ fn v3TextContains(text: str, sub: str): bool =
     return false
 
 fn v3PathCurrentDir(): str =
-    return driver_c_get_current_dir_bridge()
+    return os.getCurrentDir()
 
 fn v3PathIsAbsolute(raw: str): bool =
     let path = v3PathTrim(raw)
-    return cheng_v3_os_is_absolute_bridge(path) != 0
+    if !v3PathNonEmpty(path):
+        return false
+    if path[0] == '/' || path[0] == '\\':
+        return true
+    if path.len > 1 && path[1] == ':':
+        return true
+    return false
 
 fn v3PathJoin(left: str, right: str): str =
     let leftPath = v3PathTrim(left)
     let rightPath = v3PathTrim(right)
-    return cheng_v3_os_join_path_bridge(leftPath, rightPath)
+    return os.joinPath(leftPath, rightPath)
 
 fn v3PathAbsolute(root: str, raw: str): str =
     let text: str = v3PathTrim(raw)
@@ -74,19 +72,23 @@ fn v3PathFileExists(pathRaw: str): bool =
     let path = v3PathTrim(pathRaw)
     if !v3PathNonEmpty(path):
         return false
-    return cheng_v3_os_file_exists_bridge(path) != 0
+    let f: os.File = os.openRead(path)
+    if f == nil:
+        return false
+    os.close(f)
+    return true
 
 fn v3PathDirExists(pathRaw: str): bool =
     let path = v3PathTrim(pathRaw)
     if !v3PathNonEmpty(path):
         return false
-    return cheng_v3_os_dir_exists_bridge(path) != 0
+    return os.dirExists(path)
 
 fn v3PathFileSize(pathRaw: str): int64 =
     let path = v3PathTrim(pathRaw)
     if !v3PathNonEmpty(path):
         return int64(0)
-    return cheng_v3_os_file_size_bridge(path)
+    return os.fileSize(path)
 
 fn v3PathExists(root: str, raw: str): bool =
     let path: str = v3PathAbsolute(root, raw)
@@ -149,12 +151,24 @@ fn v3PathSplitFile(pathRaw: str): V3PathSplitFileResult =
         ext: v3TextSlice(base, lastDot, base.len - lastDot)
     )
 
+fn v3PathCreateDirAll(path: str): bool =
+    if !v3PathNonEmpty(path):
+        return false
+    if os.dirExists(path):
+        return true
+    let parent = os.parentDir(path)
+    if v3PathNonEmpty(parent) && parent != path && !os.dirExists(parent):
+        if !v3PathCreateDirAll(parent):
+            return false
+    if !os.dirExists(path):
+        os.createDir(path)
+    return os.dirExists(path)
+
 fn v3MkdirP(root: str, raw: str): bool =
     let path: str = v3PathAbsolute(root, raw)
     if !v3PathNonEmpty(path):
         return false
-    driver_c_create_dir_all_bridge(path)
-    return v3PathDirExists(path)
+    return v3PathCreateDirAll(path)
 
 fn v3WriteTextFile(root: str, raw: str, text: str): bool =
     let path: str = v3PathAbsolute(root, raw)
@@ -162,12 +176,13 @@ fn v3WriteTextFile(root: str, raw: str, text: str): bool =
         return false
     let parent: str = v3PathParentDir(path)
     if v3PathNonEmpty(parent):
-        driver_c_create_dir_all_bridge(parent)
-    driver_c_write_text_file_bridge(path, text)
+        if !v3PathCreateDirAll(parent):
+            return false
+    os.writeFile(path, text)
     return v3PathFileExists(path)
 
 fn v3ReadTextFile(root: str, raw: str): str =
     let path: str = v3PathAbsolute(root, raw)
     if !v3PathFileExists(path):
         return ""
-    return cheng_v3_read_file_bridge(path)
+    return os.readFile(path)

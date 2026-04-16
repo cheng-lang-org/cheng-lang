@@ -78,7 +78,7 @@ static void v3_debug_async_write_source_frame(int32_t frame_index,
                                               const ChengV3EmbeddedLineMapEntry* entry,
                                               uintptr_t pc) {
     if (entry == NULL) return;
-    v3_debug_write_cstr("[cheng-v3] #");
+    v3_debug_write_cstr("#");
     v3_debug_write_i32(frame_index);
     v3_debug_write_cstr(" ");
     v3_debug_write_cstr(
@@ -105,7 +105,7 @@ static void v3_debug_async_write_machine_frame(int32_t frame_index,
     if (entry != NULL && entry->start_pc != NULL && pc >= (uintptr_t)entry->start_pc) {
         offset = pc - (uintptr_t)entry->start_pc;
     }
-    v3_debug_write_cstr("[cheng-v3] m#");
+    v3_debug_write_cstr("m#");
     v3_debug_write_i32(frame_index);
     v3_debug_write_cstr(" pc=");
     v3_debug_write_hex_uintptr(pc);
@@ -236,21 +236,21 @@ static uintptr_t cheng_v3_signal_context_lr(void* signal_context) {
 #endif
 }
 
-static void v3_debug_async_write_crash_header(const char* reason,
-                                              const char* mode,
-                                              int32_t sig,
-                                              uintptr_t pc,
-                                              uintptr_t fp,
-                                              uintptr_t sp,
-                                              uintptr_t lr,
-                                              uintptr_t fault_addr) {
-    v3_debug_write_cstr("[cheng-v3] v3_crash_report_v1\n");
-    v3_debug_write_cstr("[cheng-v3] reason=");
+static void v3_debug_async_write_crash_raw_header(const char* reason,
+                                                  const char* mode,
+                                                  int32_t sig,
+                                                  uintptr_t pc,
+                                                  uintptr_t fp,
+                                                  uintptr_t sp,
+                                                  uintptr_t lr,
+                                                  uintptr_t fault_addr) {
+    v3_debug_write_cstr("v3_crash_raw_v1\n");
+    v3_debug_write_cstr("reason=");
     v3_debug_write_cstr(reason != NULL ? reason : "?");
     v3_debug_write_cstr(" mode=");
     v3_debug_write_cstr(mode != NULL ? mode : "?");
     v3_debug_write_cstr("\n");
-    v3_debug_write_cstr("[cheng-v3] regs pc=");
+    v3_debug_write_cstr("regs pc=");
     v3_debug_write_hex_uintptr(pc);
     v3_debug_write_cstr(" fp=");
     v3_debug_write_hex_uintptr(fp);
@@ -402,18 +402,18 @@ static void v3_debug_dump_source_signal_trace_if_available(const char* reason,
     fp = cheng_v3_signal_context_fp(signal_context);
     sp = cheng_v3_signal_context_sp(signal_context);
     lr = cheng_v3_signal_context_lr(signal_context);
-    v3_debug_async_write_crash_header(reason,
-                                      "signal",
-                                      sig,
-                                      pc,
-                                      fp,
-                                      sp,
-                                      lr,
-                                      info != NULL && info->si_addr != NULL ? (uintptr_t)info->si_addr : 0U);
+    v3_debug_async_write_crash_raw_header(reason,
+                                          "signal",
+                                          sig,
+                                          pc,
+                                          fp,
+                                          sp,
+                                          lr,
+                                          info != NULL && info->si_addr != NULL ? (uintptr_t)info->si_addr : 0U);
     v3_debug_dump_machine_signal_frames(entries, count, pc, fp, sp, lr);
     mapped = v3_debug_dump_source_signal_frames(entries, count, pc, fp);
     if (mapped <= 0) {
-        v3_debug_write_cstr("[cheng-v3] source_frames=0\n");
+        v3_debug_write_cstr("source_frames=0\n");
     }
 }
 
@@ -590,7 +590,7 @@ static void v3_debug_dump_machine_backtrace_if_available(const char* reason) {
             offset = pc - symbol_pc;
         }
         fprintf(stderr,
-                "[cheng-v3] m#%d pc=0x%zx symbol=%s off=0x%zx",
+                "m#%d pc=0x%zx symbol=%s off=0x%zx",
                 i,
                 (size_t)pc,
                 symbol_name != NULL && symbol_name[0] != '\0' ? symbol_name : "?",
@@ -629,7 +629,7 @@ static void v3_debug_dump_source_backtrace_if_available(const char* reason) {
             embedded_count = cheng_v3_embedded_line_map_count_getter();
         }
         if (embedded_entries == NULL || embedded_count == 0U) {
-            fprintf(stderr, "[cheng-v3] source_frames=0\n");
+            fprintf(stderr, "source_frames=0\n");
             fflush(stderr);
             return;
         }
@@ -661,7 +661,7 @@ static void v3_debug_dump_source_backtrace_if_available(const char* reason) {
             line_end = cheng_v3_line_span_end(line_start, embedded_entry->body_last_line);
             offset = (symbol_pc != 0U && pc >= symbol_pc) ? (pc - symbol_pc) : 0U;
             fprintf(stderr,
-                    "[cheng-v3] #%d %s %s:%d",
+                    "#%d %s %s:%d",
                     i,
                     function_name != NULL && function_name[0] != '\0' ?
                         function_name :
@@ -675,12 +675,12 @@ static void v3_debug_dump_source_backtrace_if_available(const char* reason) {
             mapped += 1;
         }
         if (mapped <= 0) {
-            fprintf(stderr, "[cheng-v3] source_frames=0\n");
+            fprintf(stderr, "source_frames=0\n");
         }
         fflush(stderr);
     }
 #else
-    fprintf(stderr, "[cheng-v3] source_frames=unavailable\n");
+    fprintf(stderr, "source_frames=unavailable\n");
     fflush(stderr);
 #endif
 }
@@ -692,7 +692,7 @@ static void v3_debug_dump_backtrace_now(const char* reason) {
     uintptr_t sp = (uintptr_t)&pc;
     uintptr_t lr = pc;
     v3_debug_crash_trace_dump_now(actual_reason);
-    v3_debug_async_write_crash_header(actual_reason, "backtrace", 0, pc, fp, sp, lr, 0U);
+    v3_debug_async_write_crash_raw_header(actual_reason, "backtrace", 0, pc, fp, sp, lr, 0U);
     v3_debug_dump_machine_backtrace_if_available(actual_reason);
     v3_debug_dump_source_backtrace_if_available(actual_reason);
     v3_debug_dump_native_backtrace_if_enabled();
@@ -712,7 +712,11 @@ CHENG_V3_DEBUG_WEAK int32_t cheng_force_segv(void) {
     return 0;
 }
 
+#if defined(__GNUC__) || defined(__clang__)
+static __attribute__((unused)) void v3_debug_path_mkdir_if_needed(const char* path) {
+#else
 static void v3_debug_path_mkdir_if_needed(const char* path) {
+#endif
     if (path == NULL || path[0] == '\0' || v3_debug_dir_exists(path)) return;
     if (v3_debug_mkdir1(path) == 0) return;
     if (!v3_debug_dir_exists(path)) {

@@ -1,0 +1,311 @@
+import cheng/v3/project/astrology_scalar_lunar_year_code_table as lunarYearCodeTable
+import cheng/v3/project/astrology_scalar_lunar_year_start_table as lunarYearStartTable
+import cheng/v3/project/astrology_scalar_jie_boundary_minute_table as jieBoundaryMinuteTable
+import cheng/v3/project/astrology_scalar_jie_boundary_second_table as jieBoundarySecondTable
+
+fn v3AstrologyScalarNormalizeMod(value: int32, modulus: int32): int32 =
+    let rem = value % modulus
+    if rem < 0:
+        return rem + modulus
+    return rem
+
+fn v3AstrologyScalarGregorianToJdn(year: int32, month: int32, day: int32): int32 =
+    let a = (14 - month) / 12
+    let y = year + 4800 - a
+    let m = month + 12 * a - 3
+    return day + ((153 * m + 2) / 5) + 365 * y + (y / 4) - (y / 100) + (y / 400) - 32045
+
+fn v3AstrologyScalarHmHour(hm: int32): int32 =
+    return hm / 60
+
+fn v3AstrologyScalarHmMinute(hm: int32): int32 =
+    return v3AstrologyScalarNormalizeMod(hm, 60)
+
+fn v3AstrologyScalarMinutesSince1900(year: int32, month: int32, day: int32, hm: int32): int32 =
+    let jdn = v3AstrologyScalarGregorianToJdn(year, month, day)
+    let hour = v3AstrologyScalarHmHour(hm)
+    let minute = v3AstrologyScalarHmMinute(hm)
+    return (jdn - 2415021) * 1440 + hour * 60 + minute
+
+fn v3AstrologyScalarGanzhiIndexFromGanZhi(ganIndex: int32, zhiIndex: int32): int32 =
+    var normalizedGanIndex = v3AstrologyScalarNormalizeMod(ganIndex, 10)
+    var normalizedZhiIndex = v3AstrologyScalarNormalizeMod(zhiIndex, 12)
+    var probe = 0
+    while probe < 60:
+        if v3AstrologyScalarNormalizeMod(probe, 10) == normalizedGanIndex:
+            if v3AstrologyScalarNormalizeMod(probe, 12) == normalizedZhiIndex:
+                return probe
+        probe = probe + 1
+    return normalizedZhiIndex
+
+fn v3AstrologyScalarBoundaryReached(currentMinute: int32, boundaryMinute: int32, boundarySecond: int32): int32 =
+    if currentMinute > boundaryMinute:
+        return 1
+    if currentMinute == boundaryMinute && boundarySecond == 0:
+        return 1
+    return 0
+
+fn v3AstrologyScalarExactAstrologyYear(year: int32, month: int32, day: int32, hm: int32): int32 =
+    let currentMinute = v3AstrologyScalarMinutesSince1900(year, month, day, hm)
+    let liChunMinute = jieBoundaryMinuteTable.v3AstrologyScalarJieBoundaryMinute(year, 2)
+    let liChunSecond = jieBoundarySecondTable.v3AstrologyScalarJieBoundarySecond(year, 2)
+    if v3AstrologyScalarBoundaryReached(currentMinute, liChunMinute, liChunSecond) != 0:
+        return year
+    return year - 1
+
+fn v3AstrologyScalarYearGanIndexExact(year: int32, month: int32, day: int32, hm: int32): int32 =
+    return v3AstrologyScalarNormalizeMod(v3AstrologyScalarExactAstrologyYear(year, month, day, hm) - 4, 10)
+
+fn v3AstrologyScalarYearZhiIndexExact(year: int32, month: int32, day: int32, hm: int32): int32 =
+    return v3AstrologyScalarNormalizeMod(v3AstrologyScalarExactAstrologyYear(year, month, day, hm) - 4, 12)
+
+fn v3AstrologyScalarYearGanzhiExactIndex(year: int32, month: int32, day: int32, hm: int32): int32 =
+    let ganIndex = v3AstrologyScalarYearGanIndexExact(year, month, day, hm)
+    let zhiIndex = v3AstrologyScalarYearZhiIndexExact(year, month, day, hm)
+    return v3AstrologyScalarGanzhiIndexFromGanZhi(ganIndex, zhiIndex)
+
+fn v3AstrologyScalarMonthIndexExact(year: int32, month: int32, day: int32, hm: int32): int32 =
+    let currentMinute = v3AstrologyScalarMinutesSince1900(year, month, day, hm)
+    var index = -3
+    var slot = 0
+    while slot < 16:
+        let boundaryMinute = jieBoundaryMinuteTable.v3AstrologyScalarJieBoundaryMinute(year, slot)
+        let boundarySecond = jieBoundarySecondTable.v3AstrologyScalarJieBoundarySecond(year, slot)
+        if v3AstrologyScalarBoundaryReached(currentMinute, boundaryMinute, boundarySecond) == 0:
+            return index
+        index = index + 1
+        slot = slot + 1
+    return index
+
+fn v3AstrologyScalarMonthGanzhiExactIndex(year: int32, month: int32, day: int32, hm: int32): int32 =
+    let index = v3AstrologyScalarMonthIndexExact(year, month, day, hm)
+    let yearGanIndexExact = v3AstrologyScalarYearGanIndexExact(year, month, day, hm)
+    let offsetBase = v3AstrologyScalarNormalizeMod(yearGanIndexExact + (index < 0 ? 1 : 0), 5)
+    let offset = v3AstrologyScalarNormalizeMod((offsetBase + 1) * 2, 10)
+    let monthGanIndex = v3AstrologyScalarNormalizeMod((index < 0 ? index + 10 : index) + offset, 10)
+    let monthZhiIndex = v3AstrologyScalarNormalizeMod((index < 0 ? index + 12 : index) + 2, 12)
+    return v3AstrologyScalarGanzhiIndexFromGanZhi(monthGanIndex, monthZhiIndex)
+
+fn v3AstrologyScalarDayGanzhiIndex(year: int32, month: int32, day: int32): int32 =
+    let jdn = v3AstrologyScalarGregorianToJdn(year, month, day)
+    return v3AstrologyScalarNormalizeMod(jdn + 49, 60)
+
+fn v3AstrologyScalarHourBranchIndex(hour: int32, minute: int32): int32 =
+    let normalizedHour = v3AstrologyScalarNormalizeMod(hour, 24)
+    var normalizedMinute = minute
+    if normalizedMinute < 0:
+        normalizedMinute = 0
+    if normalizedHour == 23:
+        return 0
+    let totalMinutes = normalizedHour * 60 + normalizedMinute
+    return v3AstrologyScalarNormalizeMod(((totalMinutes / 60) + 1) / 2, 12)
+
+fn v3AstrologyScalarHourGanzhiIndex(dayGanzhiIndex: int32,
+                                    hour: int32,
+                                    minute: int32,
+                                    lateZiBoundaryAt23: int32): int32 =
+    let hourBranchIndex = v3AstrologyScalarHourBranchIndex(hour, minute)
+    var effectiveDayGanzhiIndex = v3AstrologyScalarNormalizeMod(dayGanzhiIndex, 60)
+    if lateZiBoundaryAt23 != 0 && v3AstrologyScalarNormalizeMod(hour, 24) == 23:
+        effectiveDayGanzhiIndex = v3AstrologyScalarNormalizeMod(dayGanzhiIndex + 1, 60)
+    let dayStemIndex = v3AstrologyScalarNormalizeMod(effectiveDayGanzhiIndex, 10)
+    let hourStemIndex = v3AstrologyScalarNormalizeMod((v3AstrologyScalarNormalizeMod(dayStemIndex, 5) * 2) + hourBranchIndex, 10)
+    var probe = 0
+    while probe < 60:
+        if v3AstrologyScalarNormalizeMod(probe, 10) == hourStemIndex && v3AstrologyScalarNormalizeMod(probe, 12) == hourBranchIndex:
+            return probe
+        probe = probe + 1
+    return hourBranchIndex
+
+fn v3AstrologyScalarLunarLeapMonthFromCode(code: int32): int32 =
+    return code % 16
+
+fn v3AstrologyScalarLunarLeapDaysFromCode(code: int32): int32 =
+    if v3AstrologyScalarLunarLeapMonthFromCode(code) == 0:
+        return 0
+    if (code / 16) % 2 == 1:
+        return 30
+    return 29
+
+fn v3AstrologyScalarLunarMonthDaysFromCode(code: int32, month: int32): int32 =
+    if month < 1 || month > 12:
+        return 0
+    if (code / (1 << (month + 4))) % 2 == 1:
+        return 30
+    return 29
+
+fn v3AstrologyScalarLunarYearDaysFromCode(code: int32): int32 =
+    var total = 0
+    var month = 1
+    while month <= 12:
+        total = total + v3AstrologyScalarLunarMonthDaysFromCode(code, month)
+        month = month + 1
+    total = total + v3AstrologyScalarLunarLeapDaysFromCode(code)
+    return total
+
+fn v3AstrologyScalarLunarPackMake(lunarYear: int32, lunarMonth: int32, lunarDay: int32, leapBit: int32): int32 =
+    return ((lunarYear - 1899) << 10) + (leapBit << 9) + (lunarMonth << 5) + lunarDay
+
+fn v3AstrologyScalarLunarPack(year: int32, month: int32, day: int32): int32 =
+    let jdn = v3AstrologyScalarGregorianToJdn(year, month, day)
+    var lunarYear = 1899
+    var yearStart = lunarYearStartTable.v3AstrologyScalarLunarYearStartJdn(lunarYear)
+    while lunarYear <= 2101:
+        let code = lunarYearCodeTable.v3AstrologyScalarLunarYearCode(lunarYear)
+        let yearDays = v3AstrologyScalarLunarYearDaysFromCode(code)
+        if jdn < yearStart + yearDays:
+            let leapMonth = v3AstrologyScalarLunarLeapMonthFromCode(code)
+            var monthStart = yearStart
+            var lunarMonth = 1
+            while lunarMonth <= 12:
+                let normalDays = v3AstrologyScalarLunarMonthDaysFromCode(code, lunarMonth)
+                if jdn < monthStart + normalDays:
+                    return v3AstrologyScalarLunarPackMake(lunarYear, lunarMonth, jdn - monthStart + 1, 0)
+                monthStart = monthStart + normalDays
+                if leapMonth == lunarMonth:
+                    let leapDays = v3AstrologyScalarLunarLeapDaysFromCode(code)
+                    if jdn < monthStart + leapDays:
+                        return v3AstrologyScalarLunarPackMake(lunarYear, lunarMonth, jdn - monthStart + 1, 1)
+                    monthStart = monthStart + leapDays
+                lunarMonth = lunarMonth + 1
+            return 0
+        yearStart = yearStart + yearDays
+        lunarYear = lunarYear + 1
+    return 0
+
+fn v3AstrologyScalarStemElementId(stemIndex: int32): int32 =
+    let idx = v3AstrologyScalarNormalizeMod(stemIndex, 10)
+    if idx == 0 || idx == 1:
+        return 0
+    if idx == 2 || idx == 3:
+        return 1
+    if idx == 4 || idx == 5:
+        return 2
+    if idx == 6 || idx == 7:
+        return 3
+    return 4
+
+fn v3AstrologyScalarBranchElementId(branchIndex: int32): int32 =
+    let idx = v3AstrologyScalarNormalizeMod(branchIndex, 12)
+    if idx == 2 || idx == 3:
+        return 0
+    if idx == 5 || idx == 6:
+        return 1
+    if idx == 4 || idx == 7 || idx == 1 || idx == 10:
+        return 2
+    if idx == 8 || idx == 9:
+        return 3
+    return 4
+
+fn v3AstrologyScalarElementSupportScore(dayElement: int32, otherElement: int32): int32 =
+    let base = v3AstrologyScalarNormalizeMod(dayElement, 5)
+    let other = v3AstrologyScalarNormalizeMod(otherElement, 5)
+    if base == other:
+        return 1
+    if v3AstrologyScalarNormalizeMod(other + 1, 5) == base:
+        return 2
+    if v3AstrologyScalarNormalizeMod(other + 2, 5) == base:
+        return -2
+    if v3AstrologyScalarNormalizeMod(base + 1, 5) == other:
+        return -1
+    return 0
+
+fn v3AstrologyScalarTodaySupportScore(dayGanIndex: int32,
+                                      dayGanzhiIndex: int32,
+                                      hourGanzhiIndex: int32): int32 =
+    let dayElement = v3AstrologyScalarStemElementId(dayGanIndex)
+    let todayStemElement = v3AstrologyScalarStemElementId(dayGanzhiIndex)
+    let todayBranchElement = v3AstrologyScalarBranchElementId(dayGanzhiIndex)
+    let hourBranchElement = v3AstrologyScalarBranchElementId(hourGanzhiIndex)
+    var out = 0
+    out = out + v3AstrologyScalarElementSupportScore(dayElement, todayStemElement)
+    out = out + v3AstrologyScalarElementSupportScore(dayElement, todayBranchElement)
+    out = out + v3AstrologyScalarElementSupportScore(dayElement, hourBranchElement)
+    return out
+
+fn v3AstrologyScalarRelationScore(ziweiRelationScore: int32,
+                                  wuxingWood: int32,
+                                  wuxingMetal: int32,
+                                  wuxingWater: int32): int32 =
+    return ziweiRelationScore + wuxingWater + wuxingWood - wuxingMetal
+
+fn v3AstrologyScalarCareerScore(ziweiCareerScore: int32,
+                                wuxingWood: int32,
+                                wuxingFire: int32,
+                                wuxingWater: int32): int32 =
+    return ziweiCareerScore + wuxingWood + wuxingFire - wuxingWater
+
+fn v3AstrologyScalarMoneyScore(ziweiWealthScore: int32,
+                               wuxingWood: int32,
+                               wuxingEarth: int32,
+                               wuxingMetal: int32): int32 =
+    return ziweiWealthScore + wuxingMetal + wuxingEarth - wuxingWood
+
+fn v3AstrologyScalarHealthScore(ziweiHealthScore: int32,
+                                dayMasterStrength: int32,
+                                wuxingEarth: int32,
+                                wuxingFire: int32): int32 =
+    var healthBase = 1
+    if dayMasterStrength <= 0:
+        healthBase = -1
+    return ziweiHealthScore + healthBase + wuxingEarth - wuxingFire
+
+fn v3AstrologyScalarLearningScore(ziweiLearningScore: int32,
+                                  wuxingFire: int32,
+                                  wuxingMetal: int32,
+                                  wuxingWater: int32): int32 =
+    return ziweiLearningScore + wuxingWater + wuxingMetal - wuxingFire
+
+fn v3AstrologyScalarExpressionScore(ziweiExpressionScore: int32,
+                                    wuxingWood: int32,
+                                    wuxingFire: int32,
+                                    wuxingEarth: int32): int32 =
+    return ziweiExpressionScore + wuxingFire + wuxingWood - wuxingEarth
+
+fn v3AstrologyScalarActionBalance(careerScore: int32,
+                                  expressionScore: int32,
+                                  todaySupportScore: int32,
+                                  healthScore: int32): int32 =
+    return careerScore + expressionScore + todaySupportScore - healthScore
+
+fn v3AstrologyScalarActionScore(actionBalance: int32, learningScore: int32): int32 =
+    return actionBalance - learningScore
+
+fn v3AstrologyScalarBit(value: int32): int32 =
+    if value != 0:
+        return 1
+    return 0
+
+fn v3AstrologyScalarLowerTrigramIndex(dayMasterStrength: int32,
+                                      todaySupportScore: int32,
+                                      relationScore: int32): int32 =
+    let bit0 = v3AstrologyScalarBit(dayMasterStrength >= 1 ? 1 : 0)
+    let bit1 = v3AstrologyScalarBit(todaySupportScore >= 0 ? 1 : 0)
+    let bit2 = v3AstrologyScalarBit(relationScore >= 0 ? 1 : 0)
+    return bit0 + bit1 * 2 + bit2 * 4
+
+fn v3AstrologyScalarUpperTrigramIndex(careerScore: int32,
+                                      siHuaScore: int32,
+                                      actionScore: int32): int32 =
+    let bit0 = v3AstrologyScalarBit(careerScore >= 0 ? 1 : 0)
+    let bit1 = v3AstrologyScalarBit(siHuaScore >= 0 ? 1 : 0)
+    let bit2 = v3AstrologyScalarBit(actionScore >= 0 ? 1 : 0)
+    return bit0 + bit1 * 2 + bit2 * 4
+
+fn v3AstrologyScalarHexagramIndex(lowerTrigramIndex: int32, upperTrigramIndex: int32): int32 =
+    return lowerTrigramIndex + upperTrigramIndex * 8
+
+fn v3AstrologyScalarMovingLineBase(dayGanzhiIndex: int32,
+                                   hourGanzhiIndex: int32,
+                                   mingGongIndex: int32,
+                                   shenGongIndex: int32): int32 =
+    return dayGanzhiIndex + hourGanzhiIndex + mingGongIndex + shenGongIndex
+
+fn v3AstrologyScalarMovingLine(movingLineBase: int32, yearZhiIndex: int32): int32 =
+    return v3AstrologyScalarNormalizeMod(movingLineBase + yearZhiIndex, 6) + 1
+
+fn v3AstrologyScalarChangedHexagramIndex(hexagramIndex: int32, movingLine: int32): int32 =
+    return hexagramIndex ^ (1 << (movingLine - 1))
+
+fn main(): int32 =
+    return 0

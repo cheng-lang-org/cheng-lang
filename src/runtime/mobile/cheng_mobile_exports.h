@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #ifndef CHENG_MOBILE_ABI_VERSION
-#define CHENG_MOBILE_ABI_VERSION 2
+#define CHENG_MOBILE_ABI_VERSION 4
 #endif
 
 #ifndef CHENG_MOBILE_CAP_RENDER_SEMANTIC
@@ -24,6 +24,9 @@ extern "C" {
 #ifndef CHENG_MOBILE_CAP_IME_INPUT
 #define CHENG_MOBILE_CAP_IME_INPUT (1ull << 3)
 #endif
+#ifndef CHENG_MOBILE_CAP_BIOMETRIC_ATTESTATION
+#define CHENG_MOBILE_CAP_BIOMETRIC_ATTESTATION (1ull << 4)
+#endif
 
 #ifndef CHENG_MOBILE_EXPORTS_SHARED_TYPES
 #define CHENG_MOBILE_EXPORTS_SHARED_TYPES
@@ -35,6 +38,26 @@ typedef struct ChengHostPlatformAPI {
   int32_t (*clipboard_read_text)(char* buf, int32_t cap);
   int32_t (*geo_get_current)(double* out_lat, double* out_lon);
   int64_t (*time_now_ms)(void);
+  int32_t (*biometric_fingerprint_authorize)(
+      const char* request_id,
+      int32_t purpose,
+      const char* did_text,
+      const char* prompt_title,
+      const char* prompt_reason,
+      const char* device_binding_seed_hint,
+      const char* device_label_hint,
+      char* out_feature32_hex,
+      int32_t out_feature32_cap,
+      char* out_device_binding_seed,
+      int32_t out_device_binding_seed_cap,
+      char* out_device_label,
+      int32_t out_device_label_cap,
+      char* out_sensor_id,
+      int32_t out_sensor_id_cap,
+      char* out_hardware_attestation,
+      int32_t out_hardware_attestation_cap,
+      char* out_error,
+      int32_t out_error_cap);
 } ChengHostPlatformAPI;
 
 typedef struct ChengInputRingBufferDesc {
@@ -65,6 +88,26 @@ int32_t cheng_app_pull_side_effect(uint64_t app_id, char* out_buf, int32_t out_c
 int32_t cheng_app_push_side_effect_result(uint64_t app_id, const char* envelope_utf8);
 uint64_t cheng_app_capture_frame_hash(uint64_t app_id);
 int32_t cheng_app_capture_frame_rgba(uint64_t app_id, uint8_t* out_rgba, int32_t out_bytes);
+int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
+    const char* request_id,
+    int32_t purpose,
+    const char* did_text,
+    const char* prompt_title,
+    const char* prompt_reason,
+    const char* device_binding_seed_hint,
+    const char* device_label_hint,
+    char* out_feature32_hex,
+    int32_t out_feature32_cap,
+    char* out_device_binding_seed,
+    int32_t out_device_binding_seed_cap,
+    char* out_device_label,
+    int32_t out_device_label_cap,
+    char* out_sensor_id,
+    int32_t out_sensor_id_cap,
+    char* out_hardware_attestation,
+    int32_t out_hardware_attestation_cap,
+    char* out_error,
+    int32_t out_error_cap);
 #endif
 
 #ifdef __cplusplus

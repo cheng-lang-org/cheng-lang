@@ -12,6 +12,7 @@ const
     maxBigIntLimbs = 256
     maxBigIntHalfDigits = maxBigIntLimbs * 2
     bigIntWordBase: int64 = int64(1) << 32
+    bigModInvOddBinaryMaxSteps = maxBigIntLimbs * bigIntWordBits * 16
 
 type
     BigInt =
@@ -32,16 +33,31 @@ type
         top: int32
 
 fn bigWordToU64(w: int32): int64 =
-    return int64(uint32(w))
+    let bits: uint64 = bigWordToBitsU64(w)
+    return int64(bits)
 
 fn bigWordFromU64(v: int64): int32 =
-    return int32(uint32(v))
+    if v >= 0:
+        return bigWordFromBitsU64(uint64(v))
+    let mag: int64 = int64(0) - v
+    let magBits: uint64 = uint64(mag)
+    let magShifted: uint64 = (magBits >> uint64(bigIntWordBits)) << uint64(bigIntWordBits)
+    let magLow: uint64 = magBits - magShifted
+    if magLow == 0:
+        return 0
+    let lowBits: uint64 = (uint64(1) << uint64(bigIntWordBits)) - magLow
+    return bigWordFromBitsU64(lowBits)
 
 fn bigWordToBitsU64(w: int32): uint64 =
-    return uint64(uint32(w))
+    if w >= 0:
+        return uint64(w)
+    return (uint64(1) << uint64(bigIntWordBits)) - uint64(int64(0) - int64(w))
 
 fn bigWordFromBitsU64(v: uint64): int32 =
-    return int32(uint32(v))
+    let low: uint64 = v - ((v >> uint64(bigIntWordBits)) << uint64(bigIntWordBits))
+    if low < (uint64(1) << uint64(bigIntWordBits - 1)):
+        return int32(low)
+    return 0 - int32((uint64(1) << uint64(bigIntWordBits)) - low)
 
 fn bigLowHalfBitsU64(v: uint64): uint64 =
     let hi: uint64 = v >> uint64(16)
@@ -49,7 +65,7 @@ fn bigLowHalfBitsU64(v: uint64): uint64 =
 
 fn bigLowByte(v: uint64): int32 =
     let hi: uint64 = v >> uint64(8)
-    return int32(uint32(v - (hi << uint64(8))))
+    return int32(v - (hi << uint64(8)))
 
 fn bigBorrowFromWide(wide: int64): int64 =
     return int64(1) - (wide >> bigIntWordBits)
@@ -584,7 +600,11 @@ fn bigModInvOddBinary(a: BigInt, m: BigInt): Result[BigInt] =
     var v: BigInt = m
     var x1: BigInt = one
     var x2: BigInt = bigZero()
+    var steps: int32 = 0
     while true:
+        steps = steps + 1
+        if steps > bigModInvOddBinaryMaxSteps:
+            return Err[BigInt]("bigint: inverse iteration overflow")
         while ! bigIsZero(u) && ! bigIsOdd(u):
             u = bigShiftRight1(u)
             let halfRes: Result[BigInt] = bigHalfModOdd(x1, m)

@@ -26,7 +26,16 @@ type
         ok: bool
 
 fn v3BenchIsSpace(ch: char): bool =
-    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+    let code = int32(ch)
+    if code == 32:
+        return true
+    if code == 9:
+        return true
+    if code == 10:
+        return true
+    if code == 13:
+        return true
+    return false
 
 fn v3BenchFirstField(line: str): str =
     let n: int32 = len(line)
@@ -109,7 +118,7 @@ fn v3BenchDatasetLoadText(pool: langintern.V3InternPool, text: str): V3BenchData
         if len(name) <= 0 || nsMilli < int64(0):
             continue
         let benchId: langintern.V3InternId = langintern.v3Intern(pool, name)
-        out.samples.add(V3BenchSample(benchId: benchId, nsPerOpMilli: nsMilli))
+        add(out.samples, V3BenchSample(benchId: benchId, nsPerOpMilli: nsMilli))
     return out
 
 fn v3BenchDatasetLoadFile(pool: langintern.V3InternPool, path: str): V3BenchDataset =
@@ -118,8 +127,9 @@ fn v3BenchDatasetLoadFile(pool: langintern.V3InternPool, path: str): V3BenchData
     return v3BenchDatasetLoadText(pool, os.readFile(path))
 
 fn v3BenchCompare(base: V3BenchDataset, candidate: V3BenchDataset, maxRatioMilli: int64): V3BenchCompare =
-    var rows: V3BenchCompareRow[] = []
-    var ok: bool = true
+    var out: V3BenchCompare
+    out.rows = []
+    out.ok = true
     for i in 0..<base.samples.len:
         let sample: V3BenchSample = base.samples[i]
         let candidateMilli: int64 = v3BenchDatasetLookup(candidate, sample.benchId)
@@ -132,18 +142,18 @@ fn v3BenchCompare(base: V3BenchDataset, candidate: V3BenchDataset, maxRatioMilli
         row.missingBaseline = false
         row.tooSlow = false
         if row.missingCandidate:
-            ok = false
+            out.ok = false
         else:
             row.ratioMilli = (candidateMilli * int64(1000)) div sample.nsPerOpMilli
             if maxRatioMilli > int64(0) && row.ratioMilli > maxRatioMilli:
                 row.tooSlow = true
-                ok = false
-        rows.add(row)
+                out.ok = false
+        add(out.rows, row)
     for i in 0..<candidate.samples.len:
         let sample: V3BenchSample = candidate.samples[i]
         if v3BenchDatasetLookup(base, sample.benchId) >= int64(0):
             continue
-        rows.add(V3BenchCompareRow(
+        add(out.rows, V3BenchCompareRow(
             benchId: sample.benchId,
             baseNsPerOpMilli: -1,
             candidateNsPerOpMilli: sample.nsPerOpMilli,
@@ -152,11 +162,11 @@ fn v3BenchCompare(base: V3BenchDataset, candidate: V3BenchDataset, maxRatioMilli
             missingBaseline: true,
             tooSlow: false
         ))
-        ok = false
-    return V3BenchCompare(rows: rows, ok: ok)
+        out.ok = false
+    return out
 
 fn v3BenchMilliText(value: int64): str =
-    if value < int64(0):
+    if value < 0:
         return "missing"
     let whole: int64 = value div int64(1000)
     let frac: int64 = value mod int64(1000)
@@ -169,7 +179,7 @@ fn v3BenchMilliText(value: int64): str =
 
 fn v3BenchCompareReport(pool: langintern.V3InternPool, compare: V3BenchCompare): str =
     var rows: str[] = []
-    rows.add("bench base_ns cand_ns ratio")
+    add(rows, "bench base_ns cand_ns ratio")
     for i in 0..<compare.rows.len:
         let row: V3BenchCompareRow = compare.rows[i]
         let benchNameRes = langintern.v3LookupIntern(pool, row.benchId)
@@ -179,14 +189,14 @@ fn v3BenchCompareReport(pool: langintern.V3InternPool, compare: V3BenchCompare):
         var ratioText: str = "NA"
         if row.ratioMilli >= int64(0):
             ratioText = v3BenchMilliText(row.ratioMilli)
-        rows.add(
+        add(rows,
             benchName + " " +
             v3BenchMilliText(row.baseNsPerOpMilli) + " " +
             v3BenchMilliText(row.candidateNsPerOpMilli) + " " +
             ratioText
         )
     if compare.ok:
-        rows.add("v3 compare: ok")
+        add(rows, "v3 compare: ok")
     else:
-        rows.add("v3 compare: failed")
+        add(rows, "v3 compare: failed")
     return strutil.join(rows, "\n") + "\n"

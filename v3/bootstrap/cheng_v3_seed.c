@@ -17,6 +17,7 @@
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -25,10 +26,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -129,6 +134,12 @@ typedef struct {
 
 typedef bool (*V3ReadyCheckFn)(const void *ctx);
 
+static bool v3_status_is_exit_code(int status, int code);
+static bool v3_run_binary_capture_output(char *const argv_local[],
+                                         const char *log_path,
+                                         int *status_out);
+static char *v3_debug_object_report(const char *path);
+
 static const char *V3_REQUIRED_KEYS[] = {
     "syntax",
     "bootstrap_name",
@@ -189,6 +200,7 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed print-asm [--contract-in:<path>] [--in:<path>] [--root:<path>] [--emit:<exe|shared|obj>] [--target:<triple>] [--out:<path>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed profile-run [--contract-in:<path>] [--in:<path>] [--root:<path>] [--target:<triple>] [--out:<path>] [--profile-hz:<int>] [--report-out:<path>]");
     puts("  cheng_v3_seed profile-report --in:<raw-report> [--out:<final-report>]");
+    puts("  cheng_v3_seed crash-report --in:<raw-log> [--out:<final-report>]");
     puts("  cheng_v3_seed verify-orphan-guard");
     puts("  cheng_v3_seed verify-debug-tools");
     puts("  cheng_v3_seed verify-debug-runtime");
@@ -206,6 +218,10 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed build-ffi-handle");
     puts("  cheng_v3_seed build-program-selfhost");
     puts("  cheng_v3_seed build-bft-state-machine");
+    puts("  cheng_v3_seed deploy-bft-validator-three-node");
+    puts("  cheng_v3_seed status-bft-validator-three-node");
+    puts("  cheng_v3_seed stop-bft-validator-three-node");
+    puts("  cheng_v3_seed bench-bft-validator-three-node [--tx-count:<n>] [--transfer-amount:<n>] [--max-txs-per-block:<n>]");
     puts("  cheng_v3_seed build-browser-host-wasm [out.wasm]");
     puts("  cheng_v3_seed build-chain-node");
     puts("  cheng_v3_seed build-rwad-bft-state-machine");
@@ -221,6 +237,7 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed run-chain-node-process-smoke");
     puts("  cheng_v3_seed run-chain-node-three-node-smoke");
     puts("  cheng_v3_seed run-tailnet-control-smoke [--compiler:<path>] [--label:<name>]");
+    puts("  cheng_v3_seed run-v2-selfhost-gate");
     puts("  cheng_v3_seed run-fresh-node-selfhost-gate [--compiler:<path>] [--label:<name>]");
     puts("  cheng_v3_seed run-migration-gate [--compiler:<path>] [--label:<name>]");
     puts("  cheng_v3_seed run-browser-webrtc-smokes [smoke_name ...]");
@@ -234,7 +251,7 @@ static void v3_usage(void) {
     puts("  cheng_v3_seed publish-world [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<bundle-prefix> [--channel:<stable|edge>] [--legacy-in:<path>] [--baseline-csg:<path>] [--baseline-surface:<path>] [--baseline-receipt:<path>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed fresh-node-selfhost [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<bundle-prefix> [--channel:<stable|edge>] [--legacy-in:<path>] [--baseline-csg:<path>] [--baseline-surface:<path>] [--baseline-receipt:<path>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]");
     puts("  cheng_v3_seed selfhost-build [--contract-in:<path>] [--in:<path>] [--root:<path>] --target:<triple> --out:<path> [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]");
-    puts("  cheng_v3_seed system-link-exec [--contract-in:<path>] [--in:<path>] [--root:<path>] --emit:<exe|shared|obj> --target:<triple> --out:<path> [--channel:<stable|edge>] [--report-out:<path>]");
+    puts("  cheng_v3_seed system-link-exec [--contract-in:<path>] [--in:<path>] [--root:<path>] --emit:<exe|shared|obj> --target:<triple> --out:<path> [--link-input:<obj>] [--channel:<stable|edge>] [--report-out:<path>]");
     puts("  cheng_v3_seed compile-bootstrap --in:<path> --out:<path> [--report-out:<path>]");
 }
 
@@ -910,6 +927,7 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "print-asm") ||
         !v3_has_csv_token(commands, "profile-run") ||
         !v3_has_csv_token(commands, "profile-report") ||
+        !v3_has_csv_token(commands, "crash-report") ||
         !v3_has_csv_token(commands, "verify-orphan-guard") ||
         !v3_has_csv_token(commands, "verify-debug-tools") ||
         !v3_has_csv_token(commands, "verify-debug-runtime") ||
@@ -927,6 +945,10 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "build-ffi-handle") ||
         !v3_has_csv_token(commands, "build-program-selfhost") ||
         !v3_has_csv_token(commands, "build-bft-state-machine") ||
+        !v3_has_csv_token(commands, "deploy-bft-validator-three-node") ||
+        !v3_has_csv_token(commands, "status-bft-validator-three-node") ||
+        !v3_has_csv_token(commands, "stop-bft-validator-three-node") ||
+        !v3_has_csv_token(commands, "bench-bft-validator-three-node") ||
         !v3_has_csv_token(commands, "build-browser-host-wasm") ||
         !v3_has_csv_token(commands, "build-chain-node") ||
         !v3_has_csv_token(commands, "build-rwad-bft-state-machine") ||
@@ -942,6 +964,7 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         !v3_has_csv_token(commands, "run-chain-node-process-smoke") ||
         !v3_has_csv_token(commands, "run-chain-node-three-node-smoke") ||
         !v3_has_csv_token(commands, "run-tailnet-control-smoke") ||
+        !v3_has_csv_token(commands, "run-v2-selfhost-gate") ||
         !v3_has_csv_token(commands, "run-fresh-node-selfhost-gate") ||
         !v3_has_csv_token(commands, "run-migration-gate") ||
         !v3_has_csv_token(commands, "run-browser-webrtc-smokes") ||
@@ -1263,14 +1286,47 @@ static bool v3_compile_wrapper(const char *wrapper_path, const char *out_path) {
     return true;
 }
 
+static void v3_wrapper_impl_source_path(char *out, size_t cap) {
+    char cwd[PATH_MAX];
+    size_t len;
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (CHENG_V3_IMPL_SOURCE_PATH[0] == '\0') {
+        return;
+    }
+    len = strlen(CHENG_V3_IMPL_SOURCE_PATH);
+    if (CHENG_V3_IMPL_SOURCE_PATH[0] == '/' ||
+        CHENG_V3_IMPL_SOURCE_PATH[0] == '\\' ||
+        (len > 1U && CHENG_V3_IMPL_SOURCE_PATH[1] == ':')) {
+        snprintf(out, cap, "%s", CHENG_V3_IMPL_SOURCE_PATH);
+        return;
+    }
+    if (getcwd(cwd, sizeof(cwd)) == NULL) {
+        snprintf(out, cap, "%s", CHENG_V3_IMPL_SOURCE_PATH);
+        return;
+    }
+    if (cwd[0] != '\0' && cwd[strlen(cwd) - 1U] == '/') {
+        snprintf(out, cap, "%s%s", cwd, CHENG_V3_IMPL_SOURCE_PATH);
+        return;
+    }
+    snprintf(out, cap, "%s/%s", cwd, CHENG_V3_IMPL_SOURCE_PATH);
+}
+
 static bool v3_write_wrapper_source(const char *wrapper_path,
                                     const char *embedded_source_path,
                                     const char *contract_text) {
-    char *escaped_impl = v3_c_escape(CHENG_V3_IMPL_SOURCE_PATH);
+    char impl_source_path[PATH_MAX];
+    char *escaped_impl;
     char *escaped_source = v3_c_escape(embedded_source_path);
     char *escaped_contract = v3_c_escape(contract_text);
-    size_t cap = strlen(escaped_impl) + strlen(escaped_source) + strlen(escaped_contract) + 256U;
-    char *text = (char *)v3_xmalloc(cap);
+    size_t cap;
+    char *text;
+    v3_wrapper_impl_source_path(impl_source_path, sizeof(impl_source_path));
+    escaped_impl = v3_c_escape(impl_source_path);
+    cap = strlen(escaped_impl) + strlen(escaped_source) + strlen(escaped_contract) + 256U;
+    text = (char *)v3_xmalloc(cap);
     snprintf(text, cap,
              "#define CHENG_V3_IMPL_SOURCE_PATH \"%s\"\n"
              "#define CHENG_V3_EMBEDDED_SOURCE_PATH \"%s\"\n"
@@ -1344,6 +1400,10 @@ typedef struct {
     char runtime_core_runtime_source[PATH_MAX];
     char runtime_compiler_runtime_source[PATH_MAX];
     char runtime_debug_runtime_source[PATH_MAX];
+    char runtime_core_provider_source[PATH_MAX];
+    char runtime_compiler_tooling_provider_source[PATH_MAX];
+    char runtime_debug_provider_source[PATH_MAX];
+    char runtime_program_support_provider_source[PATH_MAX];
     char tooling_gate_source[PATH_MAX];
     char tooling_bootstrap_contract_source[PATH_MAX];
     char backend_build_plan_source[PATH_MAX];
@@ -1447,6 +1507,10 @@ static void v3_bootstrap_paths_init(V3BootstrapPaths *paths) {
     v3_join_path(paths->runtime_core_runtime_source, sizeof(paths->runtime_core_runtime_source), paths->root, "v3/src/runtime/core_runtime_v3.cheng");
     v3_join_path(paths->runtime_compiler_runtime_source, sizeof(paths->runtime_compiler_runtime_source), paths->root, "v3/src/runtime/compiler_runtime_v3.cheng");
     v3_join_path(paths->runtime_debug_runtime_source, sizeof(paths->runtime_debug_runtime_source), paths->root, "v3/src/runtime/debug_runtime_v3.cheng");
+    v3_join_path(paths->runtime_core_provider_source, sizeof(paths->runtime_core_provider_source), paths->root, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng");
+    v3_join_path(paths->runtime_compiler_tooling_provider_source, sizeof(paths->runtime_compiler_tooling_provider_source), paths->root, "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng");
+    v3_join_path(paths->runtime_debug_provider_source, sizeof(paths->runtime_debug_provider_source), paths->root, "v3/src/runtime/debug_runtime_stub_v3.cheng");
+    v3_join_path(paths->runtime_program_support_provider_source, sizeof(paths->runtime_program_support_provider_source), paths->root, "v3/src/runtime/program_support_backend_v3.cheng");
     v3_join_path(paths->tooling_gate_source, sizeof(paths->tooling_gate_source), paths->root, "v3/src/tooling/gate_main.cheng");
     v3_join_path(paths->tooling_bootstrap_contract_source, sizeof(paths->tooling_bootstrap_contract_source), paths->root, "v3/src/tooling/bootstrap_contracts.cheng");
     v3_join_path(paths->backend_build_plan_source, sizeof(paths->backend_build_plan_source), paths->root, "v3/src/backend/build_plan.cheng");
@@ -1547,7 +1611,7 @@ static bool v3_bootstrap_artifacts_fresh(const V3BootstrapPaths *paths) {
 }
 
 static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
-    const char *inputs[26];
+    const char *inputs[25];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
     }
@@ -1557,31 +1621,31 @@ static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
     inputs[0] = paths->env_path;
     inputs[1] = paths->stage2;
     inputs[2] = paths->stage3;
-    inputs[3] = paths->seed_source;
-    inputs[4] = paths->stage1_source;
-    inputs[5] = paths->compiler_entry_source;
-    inputs[6] = paths->compiler_runtime_source;
-    inputs[7] = paths->compiler_request_source;
-    inputs[8] = paths->compiler_world_source;
-    inputs[9] = paths->compiler_csg_source;
-    inputs[10] = paths->compiler_world_libp2p_source;
-    inputs[11] = paths->compiler_equivalence_source;
-    inputs[12] = paths->lang_parser_source;
-    inputs[13] = paths->backend_system_link_plan_source;
-    inputs[14] = paths->backend_lowering_plan_source;
-    inputs[15] = paths->backend_primary_object_plan_source;
-    inputs[16] = paths->backend_object_plan_source;
-    inputs[17] = paths->backend_native_link_plan_source;
-    inputs[18] = paths->backend_system_link_exec_source;
-    inputs[19] = paths->runtime_core_runtime_source;
-    inputs[20] = paths->runtime_compiler_runtime_source;
-    inputs[21] = paths->runtime_debug_runtime_source;
-    inputs[22] = paths->tooling_gate_source;
-    inputs[23] = paths->tooling_bootstrap_contract_source;
-    inputs[24] = paths->backend_build_plan_source;
+    inputs[3] = paths->compiler_entry_source;
+    inputs[4] = paths->compiler_runtime_source;
+    inputs[5] = paths->compiler_request_source;
+    inputs[6] = paths->compiler_world_source;
+    inputs[7] = paths->compiler_csg_source;
+    inputs[8] = paths->compiler_world_libp2p_source;
+    inputs[9] = paths->compiler_equivalence_source;
+    inputs[10] = paths->lang_parser_source;
+    inputs[11] = paths->backend_system_link_plan_source;
+    inputs[12] = paths->backend_lowering_plan_source;
+    inputs[13] = paths->backend_primary_object_plan_source;
+    inputs[14] = paths->backend_object_plan_source;
+    inputs[15] = paths->backend_native_link_plan_source;
+    inputs[16] = paths->backend_system_link_exec_source;
+    inputs[17] = paths->runtime_core_runtime_source;
+    inputs[18] = paths->runtime_compiler_runtime_source;
+    inputs[19] = paths->runtime_debug_runtime_source;
+    inputs[20] = paths->tooling_bootstrap_contract_source;
+    inputs[21] = paths->backend_build_plan_source;
+    inputs[22] = paths->runtime_core_provider_source;
+    inputs[23] = paths->runtime_compiler_tooling_provider_source;
+    inputs[24] = paths->runtime_program_support_provider_source;
     return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 25U) &&
            v3_output_is_fresh_against_inputs(paths->backend_driver_out,
-                                             (const char *const[]){ paths->tooling_build_driver_script },
+                                             (const char *const[]){ paths->runtime_debug_provider_source },
                                              1U);
 }
 
@@ -1693,6 +1757,76 @@ static bool v3_file_text_equal(const char *left_path, const char *right_path) {
     return same;
 }
 
+static bool v3_build_plan_line_relevant(const char *line) {
+    return strncmp(line, "target=", 7U) == 0 ||
+           strncmp(line, "linker=", 7U) == 0 ||
+           strncmp(line, "stage2_compiler=", 16U) == 0 ||
+           strncmp(line, "entry=", 6U) == 0 ||
+           strncmp(line, "output=", 7U) == 0 ||
+           strncmp(line, "source[", 7U) == 0;
+}
+
+static char *v3_build_plan_comparable_text(const char *text) {
+    size_t cap;
+    char *out;
+    size_t out_len = 0U;
+    const char *cursor;
+    if (text == NULL) {
+        return NULL;
+    }
+    cap = strlen(text) + 1U;
+    out = (char *)v3_xmalloc(cap);
+    out[0] = '\0';
+    cursor = text;
+    while (*cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        char line[PATH_MAX * 4U];
+        if (len >= sizeof(line)) {
+            len = sizeof(line) - 1U;
+        }
+        memcpy(line, cursor, len);
+        line[len] = '\0';
+        if (v3_build_plan_line_relevant(line)) {
+            if (out_len + len + 2U > cap) {
+                size_t next_cap = cap * 2U + len + 2U;
+                char *grown = (char *)realloc(out, next_cap);
+                if (grown == NULL) {
+                    free(out);
+                    fprintf(stderr, "[cheng_v3_seed] out of memory\n");
+                    exit(1);
+                }
+                out = grown;
+                cap = next_cap;
+            }
+            memcpy(out + out_len, line, len);
+            out_len += len;
+            out[out_len++] = '\n';
+            out[out_len] = '\0';
+        }
+        cursor = end != NULL ? end + 1 : cursor + len;
+    }
+    return out;
+}
+
+static bool v3_build_plan_files_equal(const char *left_path, const char *right_path) {
+    char *left = v3_read_file(left_path);
+    char *right = v3_read_file(right_path);
+    char *left_cmp = NULL;
+    char *right_cmp = NULL;
+    bool same = false;
+    if (left != NULL && right != NULL) {
+        left_cmp = v3_build_plan_comparable_text(left);
+        right_cmp = v3_build_plan_comparable_text(right);
+        same = left_cmp != NULL && right_cmp != NULL && strcmp(left_cmp, right_cmp) == 0;
+    }
+    free(left);
+    free(right);
+    free(left_cmp);
+    free(right_cmp);
+    return same;
+}
+
 static bool v3_run_shell_command_logged(const char *command,
                                         const char *log_path,
                                         const char *label) {
@@ -1727,38 +1861,132 @@ static bool v3_run_command_logged_argv(size_t arg_count,
                                        const char *log_path,
                                        const char *label) {
     size_t i;
-    size_t cap = 32U;
-    size_t used = 0U;
-    char *command;
-    bool ok;
+    char **exec_argv;
+    pid_t pid;
+    int status = 0;
+    FILE *log_file = NULL;
+    int stdin_fd = -1;
     if (arg_count == 0U || args == NULL) {
         fprintf(stderr, "[cheng_v3_seed] %s missing argv\n", label);
         return false;
     }
-    for (i = 0U; i < arg_count; ++i) {
-        const char *arg = args[i] != NULL ? args[i] : "";
-        cap += strlen(arg) * 4U + 8U;
+    if (!v3_ensure_parent_dir(log_path)) {
+        return false;
     }
-    command = (char *)v3_xmalloc(cap);
-    command[0] = '\0';
+    exec_argv = (char **)v3_xmalloc(sizeof(char *) * (arg_count + 1U));
     for (i = 0U; i < arg_count; ++i) {
-        char *quoted = v3_shell_quote(args[i] != NULL ? args[i] : "");
-        size_t need = strlen(quoted) + 2U;
-        if (used + need + 1U >= cap) {
-            cap = cap + need + 64U;
-            command = (char *)v3_xrealloc(command, cap);
-        }
-        if (used > 0U) {
-            command[used++] = ' ';
-            command[used] = '\0';
-        }
-        memcpy(command + used, quoted, strlen(quoted) + 1U);
-        used += strlen(quoted);
-        free(quoted);
+        exec_argv[i] = (char *)(args[i] != NULL ? args[i] : "");
     }
-    ok = v3_run_shell_command_logged(command, log_path, label);
-    free(command);
-    return ok;
+    exec_argv[arg_count] = NULL;
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        free(exec_argv);
+        return false;
+    }
+    if (pid == 0) {
+        log_file = fopen(log_path, "wb");
+        if (log_file == NULL) {
+            perror("fopen");
+            _exit(127);
+        }
+        stdin_fd = open("/dev/null", O_RDONLY);
+        if (stdin_fd < 0) {
+            perror("open");
+            fclose(log_file);
+            _exit(127);
+        }
+        if (dup2(stdin_fd, STDIN_FILENO) < 0) {
+            perror("dup2");
+            close(stdin_fd);
+            fclose(log_file);
+            _exit(127);
+        }
+        if (dup2(fileno(log_file), STDOUT_FILENO) < 0 ||
+            dup2(fileno(log_file), STDERR_FILENO) < 0) {
+            perror("dup2");
+            close(stdin_fd);
+            fclose(log_file);
+            _exit(127);
+        }
+        close(stdin_fd);
+        fclose(log_file);
+        execvp(exec_argv[0], exec_argv);
+        perror("execvp");
+        _exit(127);
+    }
+    free(exec_argv);
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return false;
+    }
+    if (status != 0) {
+        fprintf(stderr, "[cheng_v3_seed] %s failed rc=%d log=%s\n", label, status, log_path);
+        return false;
+    }
+    return true;
+}
+
+static bool v3_run_command_logged_argv_quiet(size_t arg_count,
+                                             const char **args,
+                                             const char *log_path,
+                                             const char *label) {
+    size_t i;
+    char **exec_argv;
+    pid_t pid;
+    int status = 0;
+    FILE *log_file = NULL;
+    int stdin_fd = -1;
+    if (arg_count == 0U || args == NULL) {
+        return false;
+    }
+    (void)label;
+    if (!v3_ensure_parent_dir(log_path)) {
+        return false;
+    }
+    exec_argv = (char **)v3_xmalloc(sizeof(char *) * (arg_count + 1U));
+    for (i = 0U; i < arg_count; ++i) {
+        exec_argv[i] = (char *)(args[i] != NULL ? args[i] : "");
+    }
+    exec_argv[arg_count] = NULL;
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        free(exec_argv);
+        return false;
+    }
+    if (pid == 0) {
+        log_file = fopen(log_path, "wb");
+        if (log_file == NULL) {
+            _exit(127);
+        }
+        stdin_fd = open("/dev/null", O_RDONLY);
+        if (stdin_fd < 0) {
+            fclose(log_file);
+            _exit(127);
+        }
+        if (dup2(stdin_fd, STDIN_FILENO) < 0) {
+            close(stdin_fd);
+            fclose(log_file);
+            _exit(127);
+        }
+        if (dup2(fileno(log_file), STDOUT_FILENO) < 0 ||
+            dup2(fileno(log_file), STDERR_FILENO) < 0) {
+            close(stdin_fd);
+            fclose(log_file);
+            _exit(127);
+        }
+        close(stdin_fd);
+        fclose(log_file);
+        execvp(exec_argv[0], exec_argv);
+        _exit(127);
+    }
+    free(exec_argv);
+    if (waitpid(pid, &status, 0) < 0) {
+        perror("waitpid");
+        return false;
+    }
+    return status == 0;
 }
 
 static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
@@ -1772,8 +2000,7 @@ static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
              env_cap,
              "V3_ROOT=%s\n"
              "V3_TARGET=%s\n"
-             "V3_BOOTSTRAP_KIND=v3_seed\n"
-             "V3_BOOTSTRAP_SEED_SOURCE=%s\n"
+             "V3_BOOTSTRAP_KIND=v3_selfhost\n"
              "V3_BOOTSTRAP_STAGE1_SOURCE=%s\n"
              "V3_COMPILER_ENTRY_SOURCE=%s\n"
              "V3_COMPILER_RUNTIME_SOURCE=%s\n"
@@ -1789,7 +2016,6 @@ static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
              "V3_BOOTSTRAP_STAGE3_REPORT=%s\n",
              paths->root,
              paths->target,
-             paths->seed_source,
              paths->stage1_source,
              paths->compiler_entry_source,
              paths->compiler_runtime_source,
@@ -1806,8 +2032,7 @@ static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
     snprintf(snapshot_text,
              snapshot_cap,
              "target=%s\n"
-             "bootstrap_kind=v3_seed\n"
-             "seed_source=%s\n"
+             "bootstrap_kind=v3_selfhost\n"
              "stage1_source=%s\n"
              "compiler_entry_source=%s\n"
              "compiler_runtime_source=%s\n"
@@ -1832,7 +2057,6 @@ static bool v3_bootstrap_write_env_and_snapshot(const V3BootstrapPaths *paths) {
              "stage3_contract_log=%s\n"
              "fixed_point=stage2_stage3_contract_match\n",
              paths->target,
-             paths->seed_source,
              paths->stage1_source,
              paths->compiler_entry_source,
              paths->compiler_runtime_source,
@@ -1892,6 +2116,7 @@ static const char *v3_flag_value(int argc, char **argv, const char *flag) {
 #define CHENG_V3_MAX_RUNTIME_TARGETS 8
 #define CHENG_V3_MAX_PROVIDER_MODULES 8
 #define CHENG_V3_MAX_PLAN_FUNCTIONS 4096
+#define CHENG_V3_MAX_SOURCE_LINES 16384
 #define CHENG_V3_MAX_IMPORT_ALIASES 128
 #define CHENG_V3_MAX_CALLEES 64
 #define CHENG_V3_CONST_MAX_FIELDS 64
@@ -1922,6 +2147,7 @@ typedef struct {
     char package_id[PATH_MAX];
     char entry_path[PATH_MAX];
     char output_path[PATH_MAX];
+    char extra_link_input_path[PATH_MAX];
     char target_triple[128];
     char module_stem[PATH_MAX];
     char module_kind[64];
@@ -2565,6 +2791,13 @@ typedef struct {
     char param_types[CHENG_V3_MAX_CALL_ARGS][128];
     bool param_is_var[CHENG_V3_MAX_CALL_ARGS];
     char param_abi_classes[CHENG_V3_MAX_CALL_ARGS][32];
+    bool ffi_handle_enabled;
+    bool ffi_handle_return_is_handle;
+    bool ffi_handle_param_is_handle[CHENG_V3_MAX_CALL_ARGS];
+    int32_t ffi_handle_consume_index;
+    char ffi_handle_register_symbol_name[PATH_MAX];
+    char ffi_handle_resolve_symbol_name[PATH_MAX];
+    char ffi_handle_invalidate_symbol_name[PATH_MAX];
 } V3AsmCallTarget;
 
 typedef enum {
@@ -3340,6 +3573,9 @@ static int32_t v3_find_lowered_function_index_by_symbol(const V3LoweringPlanStub
 static bool v3_lowering_function_name_from_line(char *trimmed, char *out, size_t cap);
 static bool v3_importc_function_name_from_line(char *trimmed, char *out, size_t cap);
 static bool v3_importc_symbol_from_annotation(char *trimmed, char *out, size_t cap);
+static bool v3_is_annotation_line(const char *trimmed);
+static bool v3_annotation_named(const char *trimmed, const char *name);
+static bool v3_parse_ffi_handle_consume_annotation(const char *trimmed, int32_t *out_idx);
 static bool v3_exportc_symbol_from_annotation(char *trimmed, char *out, size_t cap);
 static void v3_parse_import_aliases_from_lines(char **lines,
                                                size_t line_count,
@@ -4368,7 +4604,7 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     size_t i;
     bool in_const_block = false;
@@ -4385,7 +4621,7 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
     }
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             fprintf(stderr, "[cheng_v3_seed] type scan line overflow: %s\n", source_path);
             free(owned);
             return false;
@@ -5428,7 +5664,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     size_t i = 0U;
     bool in_type_block = false;
@@ -5444,7 +5680,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     }
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(owned);
             return false;
         }
@@ -5712,7 +5948,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     size_t i = 0U;
     bool in_type_block = false;
@@ -5728,7 +5964,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     }
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(owned);
             return false;
         }
@@ -5956,7 +6192,7 @@ static bool v3_refresh_function_abis_from_source(const V3SystemLinkPlanStub *pla
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     size_t i;
     v3_source_path_to_module_path(plan->workspace_root,
@@ -5971,7 +6207,7 @@ static bool v3_refresh_function_abis_from_source(const V3SystemLinkPlanStub *pla
     }
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(owned);
             return false;
         }
@@ -6604,10 +6840,10 @@ static bool v3_load_function_source_lines(const V3LoweredFunctionStub *function,
     if (!owned) {
         return false;
     }
-    lines = (char **)v3_xmalloc(sizeof(char *) * CHENG_V3_MAX_PLAN_FUNCTIONS);
+    lines = (char **)v3_xmalloc(sizeof(char *) * CHENG_V3_MAX_SOURCE_LINES);
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(lines);
             free(owned);
             return false;
@@ -6976,6 +7212,9 @@ static bool v3_consteval_source_callee_is_importc_puts(const char *source_path,
             continue;
         }
         if (v3_importc_symbol_from_annotation(trimmed, pending_symbol, sizeof(pending_symbol))) {
+            continue;
+        }
+        if (pending_symbol[0] != '\0' && v3_is_annotation_line(trimmed)) {
             continue;
         }
         function_name[0] = '\0';
@@ -9470,7 +9709,7 @@ static bool v3_load_import_aliases_from_source_path(const char *source_path,
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     owned = v3_read_file(source_path);
     if (!owned) {
@@ -9478,7 +9717,7 @@ static bool v3_load_import_aliases_from_source_path(const char *source_path,
     }
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(owned);
             return false;
         }
@@ -9560,6 +9799,7 @@ static bool v3_resolve_intrinsic_module_call_target(const char *module_path,
                                                     const char *function_name,
                                                     V3AsmCallTarget *target) {
     memset(target, 0, sizeof(*target));
+    target->ffi_handle_consume_index = -1;
     target->external = true;
     if (strcmp(module_path, "std/strutils") == 0 &&
         strcmp(function_name, "strip") == 0) {
@@ -10118,6 +10358,30 @@ static bool v3_importc_symbol_from_annotation(char *trimmed, char *out, size_t c
     return true;
 }
 
+static bool v3_is_annotation_line(const char *trimmed) {
+    return trimmed != NULL && trimmed[0] == '@';
+}
+
+static bool v3_annotation_named(const char *trimmed, const char *name) {
+    size_t name_len;
+    const char *cursor;
+    if (!v3_is_annotation_line(trimmed) || name == NULL || name[0] == '\0') {
+        return false;
+    }
+    cursor = trimmed + 1;
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    name_len = strlen(name);
+    if (!v3_startswith(cursor, name)) {
+        return false;
+    }
+    cursor += name_len;
+    return *cursor == '\0' ||
+           *cursor == '(' ||
+           isspace((unsigned char)*cursor);
+}
+
 static bool v3_exportc_symbol_from_annotation(char *trimmed, char *out, size_t cap) {
     char *open_quote;
     char *close_quote;
@@ -10136,6 +10400,152 @@ static bool v3_exportc_symbol_from_annotation(char *trimmed, char *out, size_t c
     }
     *close_quote = '\0';
     snprintf(out, cap, "%s", open_quote + 1);
+    return true;
+}
+
+static bool v3_type_is_handle_scalar_text(const char *type_text) {
+    char trimmed[128];
+    if (type_text == NULL || type_text[0] == '\0') {
+        return false;
+    }
+    v3_trim_copy_text(type_text, trimmed, sizeof(trimmed));
+    return strcmp(trimmed, "uint64") == 0 ||
+           strcmp(trimmed, "uint32") == 0 ||
+           strcmp(trimmed, "u64") == 0 ||
+           strcmp(trimmed, "u32") == 0;
+}
+
+static bool v3_parse_ffi_handle_consume_annotation(const char *trimmed, int32_t *out_idx) {
+    const char *open_paren;
+    const char *close_paren;
+    char token[128];
+    const char *cursor;
+    int32_t value = 0;
+    if (out_idx != NULL) {
+        *out_idx = -1;
+    }
+    if (!v3_annotation_named(trimmed, "ffi_handle_consume")) {
+        return false;
+    }
+    open_paren = strchr(trimmed, '(');
+    close_paren = open_paren != NULL ? strrchr(open_paren + 1, ')') : NULL;
+    if (open_paren == NULL || close_paren == NULL || close_paren <= open_paren + 1) {
+        return false;
+    }
+    snprintf(token, sizeof(token), "%.*s", (int)(close_paren - open_paren - 1), open_paren + 1);
+    v3_trim_copy_text(token, token, sizeof(token));
+    cursor = strrchr(token, '=');
+    if (cursor != NULL) {
+        cursor += 1;
+    } else {
+        cursor = token;
+    }
+    while (*cursor != '\0' && isspace((unsigned char)*cursor)) {
+        cursor++;
+    }
+    if (!v3_startswith(cursor, "arg")) {
+        return false;
+    }
+    cursor += 3;
+    if (!isdigit((unsigned char)*cursor)) {
+        return false;
+    }
+    while (*cursor != '\0') {
+        if (!isdigit((unsigned char)*cursor)) {
+            return false;
+        }
+        value = value * 10 + (int32_t)(*cursor - '0');
+        cursor++;
+    }
+    if (out_idx != NULL) {
+        *out_idx = value;
+    }
+    return true;
+}
+
+static bool v3_signature_text_complete(const char *text) {
+    const char *open_paren = strchr(text, '(');
+    bool in_string = false;
+    int32_t paren_depth = 0;
+    bool saw_close = false;
+    size_t i;
+    if (text == NULL || text[0] == '\0') {
+        return false;
+    }
+    if (open_paren == NULL) {
+        return true;
+    }
+    for (i = (size_t)(open_paren - text); text[i] != '\0'; ++i) {
+        char ch = text[i];
+        if (ch == '"' && (i == 0U || text[i - 1U] != '\\')) {
+            in_string = !in_string;
+            continue;
+        }
+        if (in_string) {
+            continue;
+        }
+        if (ch == '(') {
+            paren_depth += 1;
+            continue;
+        }
+        if (ch == ')') {
+            if (paren_depth > 0) {
+                paren_depth -= 1;
+            }
+            if (paren_depth == 0) {
+                saw_close = true;
+            }
+        }
+    }
+    return saw_close && paren_depth == 0;
+}
+
+static bool v3_append_signature_line(char *out, size_t cap, const char *line) {
+    char trimmed[4096];
+    size_t out_len;
+    if (out == NULL || cap <= 1U || line == NULL) {
+        return false;
+    }
+    v3_trim_copy_text(line, trimmed, sizeof(trimmed));
+    if (trimmed[0] == '\0') {
+        return true;
+    }
+    out_len = strlen(out);
+    if (out_len > 0U) {
+        if (out_len + 1U >= cap) {
+            return false;
+        }
+        out[out_len++] = ' ';
+        out[out_len] = '\0';
+    }
+    if (out_len + strlen(trimmed) + 1U > cap) {
+        return false;
+    }
+    snprintf(out + out_len, cap - out_len, "%s", trimmed);
+    return true;
+}
+
+static bool v3_collect_signature_text(char **cursor_io,
+                                      const char *first_line,
+                                      char *out,
+                                      size_t cap) {
+    out[0] = '\0';
+    if (!v3_append_signature_line(out, cap, first_line)) {
+        return false;
+    }
+    while (!v3_signature_text_complete(out)) {
+        char *next_line;
+        if (cursor_io == NULL || *cursor_io == NULL) {
+            return false;
+        }
+        next_line = strsep(cursor_io, "\n");
+        if (next_line == NULL) {
+            return false;
+        }
+        if (!v3_append_signature_line(out, cap, next_line)) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -10169,7 +10579,8 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
     size_t alias_count = 0U;
     V3LoweredFunctionStub probe;
     char pending_symbol[PATH_MAX];
-    char pending_annotation_name[128];
+    bool pending_ffi_handle = false;
+    int32_t pending_ffi_handle_consume_index = -1;
     if (source_path == NULL || source_path[0] == '\0' ||
         callee == NULL || callee[0] == '\0' ||
         target == NULL) {
@@ -10180,7 +10591,6 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
         return false;
     }
     pending_symbol[0] = '\0';
-    pending_annotation_name[0] = '\0';
     v3_source_path_to_module_path(plan->workspace_root,
                                   plan->package_root,
                                   plan->package_id,
@@ -10201,9 +10611,9 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
         char line_copy[4096];
         char signature_copy[4096];
         char function_name[128];
+        size_t i;
         char *trimmed;
         char *signature_trimmed;
-        size_t i;
         bool matched = false;
         snprintf(line_copy, sizeof(line_copy), "%s", line);
         trimmed = v3_trim_inplace(line_copy);
@@ -10211,34 +10621,54 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
             continue;
         }
         if (v3_importc_symbol_from_annotation(trimmed, pending_symbol, sizeof(pending_symbol))) {
-            pending_annotation_name[0] = '\0';
+            pending_ffi_handle = false;
+            pending_ffi_handle_consume_index = -1;
+            continue;
+        }
+        if (pending_symbol[0] != '\0' && v3_is_annotation_line(trimmed)) {
+            if (v3_annotation_named(trimmed, "ffi_handle")) {
+                pending_ffi_handle = true;
+            } else {
+                int32_t consume_index = -1;
+                if (v3_parse_ffi_handle_consume_annotation(trimmed, &consume_index)) {
+                    pending_ffi_handle_consume_index = consume_index;
+                }
+            }
             continue;
         }
         function_name[0] = '\0';
         if (v3_importc_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
             matched = true;
-            snprintf(pending_annotation_name, sizeof(pending_annotation_name), "%s", function_name);
         } else if (pending_symbol[0] != '\0' &&
                    v3_lowering_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
             matched = true;
-            snprintf(pending_annotation_name, sizeof(pending_annotation_name), "%s", function_name);
         } else {
             pending_symbol[0] = '\0';
-            pending_annotation_name[0] = '\0';
+            pending_ffi_handle = false;
+            pending_ffi_handle_consume_index = -1;
             continue;
         }
         if (!matched || strcmp(function_name, callee) != 0) {
-            if (pending_symbol[0] != '\0' && strcmp(function_name, pending_annotation_name) == 0) {
+            if (pending_symbol[0] == '\0') {
                 continue;
             }
             pending_symbol[0] = '\0';
-            pending_annotation_name[0] = '\0';
+            pending_ffi_handle = false;
+            pending_ffi_handle_consume_index = -1;
             continue;
         }
         {
             const char *symbol_name = function_name;
+            char collected_signature[4096];
             memset(&probe, 0, sizeof(probe));
-            snprintf(signature_copy, sizeof(signature_copy), "%s", line);
+            if (!v3_collect_signature_text(&cursor,
+                                           line,
+                                           collected_signature,
+                                           sizeof(collected_signature))) {
+                free(owned);
+                return false;
+            }
+            snprintf(signature_copy, sizeof(signature_copy), "%s", collected_signature);
             signature_trimmed = v3_trim_inplace(signature_copy);
             if (!v3_parse_importc_signature_meta(signature_trimmed, function_name, &probe)) {
                 free(owned);
@@ -10248,6 +10678,7 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
                 symbol_name = pending_symbol;
             }
             memset(target, 0, sizeof(*target));
+            target->ffi_handle_consume_index = -1;
             target->external = true;
             snprintf(target->callee_name, sizeof(target->callee_name), "%s", function_name);
             v3_copy_target_symbol_name(plan, symbol_name, target->symbol_name, sizeof(target->symbol_name));
@@ -10293,6 +10724,29 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
                     snprintf(target->param_abi_classes[i], sizeof(target->param_abi_classes[i]), "%s", probe.param_abi_classes[i]);
                 }
                 target->param_is_var[i] = probe.param_is_var[i];
+                target->ffi_handle_param_is_handle[i] =
+                    pending_ffi_handle && v3_type_is_handle_scalar_text(probe.param_types[i]);
+            }
+            if (pending_ffi_handle) {
+                target->ffi_handle_enabled = true;
+                target->ffi_handle_return_is_handle = v3_type_is_handle_scalar_text(probe.return_type);
+                if (pending_ffi_handle_consume_index >= 0 &&
+                    pending_ffi_handle_consume_index < (int32_t)target->param_count &&
+                    target->ffi_handle_param_is_handle[pending_ffi_handle_consume_index]) {
+                    target->ffi_handle_consume_index = pending_ffi_handle_consume_index;
+                }
+                snprintf(target->ffi_handle_register_symbol_name,
+                         sizeof(target->ffi_handle_register_symbol_name),
+                         "%s",
+                         "cheng_ffi_handle_register_ptr");
+                snprintf(target->ffi_handle_resolve_symbol_name,
+                         sizeof(target->ffi_handle_resolve_symbol_name),
+                         "%s",
+                         "cheng_ffi_handle_resolve_ptr");
+                snprintf(target->ffi_handle_invalidate_symbol_name,
+                         sizeof(target->ffi_handle_invalidate_symbol_name),
+                         "%s",
+                         "cheng_ffi_handle_invalidate");
             }
             free(owned);
             return true;
@@ -10692,7 +11146,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
     char *owned;
     char *cursor;
     char *line;
-    char *lines[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    char *lines[CHENG_V3_MAX_SOURCE_LINES];
     size_t line_count = 0U;
     size_t i;
     v3_source_path_to_module_path(plan->workspace_root,
@@ -10708,7 +11162,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
     pending_export_symbol[0] = '\0';
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(owned);
             fprintf(stderr, "[cheng_v3_seed] lowering source line inventory too large\n");
             return false;
@@ -11692,6 +12146,25 @@ static void v3_emit_x64_move_reg(char *out,
     }
 }
 
+static void v3_emit_move_reg_abi(char *out,
+                                 size_t cap,
+                                 int dst_reg,
+                                 int src_reg,
+                                 const char *abi_class) {
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_emit_x64_move_reg(out, cap, dst_reg, src_reg, abi_class);
+        return;
+    }
+    if (dst_reg == src_reg) {
+        return;
+    }
+    if (v3_abi_class_word_reg(abi_class)) {
+        v3_text_appendf(out, cap, "  mov w%d, w%d\n", dst_reg, src_reg);
+    } else {
+        v3_text_appendf(out, cap, "  mov x%d, x%d\n", dst_reg, src_reg);
+    }
+}
+
 static void v3_emit_x64_cmp_zero_set_bool(char *out,
                                           size_t cap,
                                           int src_reg,
@@ -12594,10 +13067,10 @@ static bool v3_load_source_lines(const char *source_path,
     if (!owned) {
         return false;
     }
-    lines = (char **)v3_xmalloc(sizeof(char *) * CHENG_V3_MAX_PLAN_FUNCTIONS);
+    lines = (char **)v3_xmalloc(sizeof(char *) * CHENG_V3_MAX_SOURCE_LINES);
     cursor = owned;
     while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
             free(lines);
             free(owned);
             return false;
@@ -13059,7 +13532,59 @@ static bool v3_parse_named_arg_meta(const char *arg_text,
                                     char *expr_out,
                                     size_t expr_cap);
 
-static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
+static int32_t v3_expr_string_literal_lexical_count(const char *expr_text) {
+    const char *cursor = expr_text;
+    bool in_string = false;
+    bool escape = false;
+    int32_t count = 0;
+    if (!expr_text) {
+        return 0;
+    }
+    while (*cursor) {
+        char ch = *cursor;
+        if (!in_string) {
+            if (ch == '"') {
+                in_string = true;
+                escape = false;
+                count += 1;
+            }
+            cursor += 1;
+            continue;
+        }
+        if (escape) {
+            escape = false;
+            cursor += 1;
+            continue;
+        }
+        if (ch == '\\') {
+            escape = true;
+            cursor += 1;
+            continue;
+        }
+        if (ch == '"') {
+            in_string = false;
+        }
+        cursor += 1;
+    }
+    return count;
+}
+
+static int32_t v3_call_expr_string_literal_count_slow(const char *expr_text, int32_t depth);
+
+static int32_t v3_call_expr_string_literal_count_inner(const char *expr_text, int32_t depth) {
+    if (!expr_text) {
+        return 0;
+    }
+    if (depth >= 24) {
+        return v3_expr_string_literal_lexical_count(expr_text);
+    }
+    if (strlen(expr_text) >= 4096U) {
+        return v3_expr_string_literal_lexical_count(expr_text);
+    }
+    return v3_call_expr_string_literal_count_slow(expr_text, depth);
+}
+
+static int32_t v3_call_expr_string_literal_count_slow(const char *expr_text, int32_t depth) {
     static const char *OPS[] = {
         "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "&", "+", "-", "*", "/", "%"
     };
@@ -13096,20 +13621,20 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
         if (strcmp(named_expr, expr) == 0 || strlen(named_expr) >= expr_len) {
             return 0;
         }
-        return v3_call_expr_string_literal_count(named_expr);
+        return v3_call_expr_string_literal_count_inner(named_expr, depth + 1);
     }
     if (v3_trim_outer_parens(expr, outer, sizeof(outer))) {
         if (strcmp(outer, expr) == 0 || strlen(outer) >= expr_len) {
             return 0;
         }
-        return v3_call_expr_string_literal_count(outer);
+        return v3_call_expr_string_literal_count_inner(outer, depth + 1);
     }
     if (expr[0] == '!') {
-        return v3_call_expr_string_literal_count(expr + 1);
+        return v3_call_expr_string_literal_count_inner(expr + 1, depth + 1);
     }
     if (expr[0] == '-' && expr[1] != '\0' &&
         !v3_parse_int_literal_text(expr, NULL)) {
-        return v3_call_expr_string_literal_count(expr + 1);
+        return v3_call_expr_string_literal_count_inner(expr + 1, depth + 1);
     }
     if (v3_parse_if_expr(expr,
                          if_cond,
@@ -13118,9 +13643,9 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
                          sizeof(if_true),
                          if_false,
                          sizeof(if_false))) {
-        int32_t cond_count = v3_call_expr_string_literal_count(if_cond);
-        int32_t true_count = v3_call_expr_string_literal_count(if_true);
-        int32_t false_count = v3_call_expr_string_literal_count(if_false);
+        int32_t cond_count = v3_call_expr_string_literal_count_inner(if_cond, depth + 1);
+        int32_t true_count = v3_call_expr_string_literal_count_inner(if_true, depth + 1);
+        int32_t false_count = v3_call_expr_string_literal_count_inner(if_false, depth + 1);
         best = cond_count > true_count ? cond_count : true_count;
         return best > false_count ? best : false_count;
     }
@@ -13131,9 +13656,9 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
                               sizeof(ternary_true),
                               ternary_false,
                               sizeof(ternary_false))) {
-        int32_t cond_count = v3_call_expr_string_literal_count(ternary_cond);
-        int32_t true_count = v3_call_expr_string_literal_count(ternary_true);
-        int32_t false_count = v3_call_expr_string_literal_count(ternary_false);
+        int32_t cond_count = v3_call_expr_string_literal_count_inner(ternary_cond, depth + 1);
+        int32_t true_count = v3_call_expr_string_literal_count_inner(ternary_true, depth + 1);
+        int32_t false_count = v3_call_expr_string_literal_count_inner(ternary_false, depth + 1);
         best = cond_count > true_count ? cond_count : true_count;
         return best > false_count ? best : false_count;
     }
@@ -13148,8 +13673,8 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
             snprintf(right, sizeof(right), "%s", expr + op_index + strlen(OPS[i]));
             v3_trim_copy_text(left, left, sizeof(left));
             v3_trim_copy_text(right, right, sizeof(right));
-            left_count = v3_call_expr_string_literal_count(left);
-            right_count = v3_call_expr_string_literal_count(right);
+            left_count = v3_call_expr_string_literal_count_inner(left, depth + 1);
+            right_count = v3_call_expr_string_literal_count_inner(right, depth + 1);
             return left_count > right_count ? left_count : right_count;
         }
     }
@@ -13157,16 +13682,16 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
         if (strcmp(base_name, expr) == 0 || strlen(base_name) >= expr_len) {
             return 0;
         }
-        return v3_call_expr_string_literal_count(base_name);
+        return v3_call_expr_string_literal_count_inner(base_name, depth + 1);
     }
     if (v3_parse_index_access_expr(expr, base_name, sizeof(base_name), index_expr, sizeof(index_expr))) {
         int32_t base_count = 0;
         int32_t index_count = 0;
         if (strcmp(base_name, expr) != 0 && strlen(base_name) < expr_len) {
-            base_count = v3_call_expr_string_literal_count(base_name);
+            base_count = v3_call_expr_string_literal_count_inner(base_name, depth + 1);
         }
         if (strcmp(index_expr, expr) != 0 && strlen(index_expr) < expr_len) {
-            index_count = v3_call_expr_string_literal_count(index_expr);
+            index_count = v3_call_expr_string_literal_count_inner(index_expr, depth + 1);
         }
         return base_count > index_count ? base_count : index_count;
     }
@@ -13174,7 +13699,7 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
         for (i = 0; i < arg_count; ++i) {
             int32_t arg_count_value = 0;
             if (strcmp(args[i], expr) != 0 && strlen(args[i]) < expr_len) {
-                arg_count_value = v3_call_expr_string_literal_count(args[i]);
+                arg_count_value = v3_call_expr_string_literal_count_inner(args[i], depth + 1);
             }
             if (arg_count_value > best) {
                 best = arg_count_value;
@@ -13196,7 +13721,7 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
                 top_level_count += 1;
             }
             if (strcmp(args[i], expr) != 0 && strlen(args[i]) < expr_len) {
-                nested_count = v3_call_expr_string_literal_count(args[i]);
+                nested_count = v3_call_expr_string_literal_count_inner(args[i], depth + 1);
             }
             if (nested_count > best) {
                 best = nested_count;
@@ -13205,6 +13730,10 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
         return top_level_count > best ? top_level_count : best;
     }
     return 0;
+}
+
+static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
+    return v3_call_expr_string_literal_count_inner(expr_text, 0);
 }
 
 static void v3_call_arg_temp_name(const V3LoweredFunctionStub *function,
@@ -13891,6 +14420,7 @@ static bool v3_external_call_signature(const V3SystemLinkPlanStub *plan,
             continue;
         }
         memset(target, 0, sizeof(*target));
+        target->ffi_handle_consume_index = -1;
         target->external = true;
         snprintf(target->callee_name, sizeof(target->callee_name), "%s", lookup);
         v3_copy_target_symbol_name(plan, TABLE[i].symbol, target->symbol_name, sizeof(target->symbol_name));
@@ -13990,6 +14520,7 @@ static bool v3_resolve_call_target(const V3SystemLinkPlanStub *plan,
                 return false;
             }
             memset(target, 0, sizeof(*target));
+            target->ffi_handle_consume_index = -1;
             target->external = false;
             target->lowered_function = callee_function;
             snprintf(target->callee_name, sizeof(target->callee_name), "%s", callee_function->function_name);
@@ -14142,6 +14673,7 @@ static bool v3_resolve_return_call_arg0_i32_target(const V3SystemLinkPlanStub *p
             return false;
         }
         memset(target, 0, sizeof(*target));
+        target->ffi_handle_consume_index = -1;
         target->external = true;
         snprintf(target->symbol_name, sizeof(target->symbol_name), "%s", wasm_symbol);
         snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
@@ -14210,6 +14742,7 @@ static bool v3_resolve_return_call_params_i32_target(const V3SystemLinkPlanStub 
             return false;
         }
         memset(target, 0, sizeof(*target));
+        target->ffi_handle_consume_index = -1;
         target->external = true;
         snprintf(target->symbol_name, sizeof(target->symbol_name), "%s", wasm_symbol);
         snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
@@ -14277,11 +14810,28 @@ static const char *v3_call_arg_load_abi(const V3AsmCallTarget *target, size_t ar
     if (target == NULL || arg_index >= CHENG_V3_MAX_CALL_ARGS) {
         return "ptr";
     }
+    if (target->ffi_handle_enabled && target->ffi_handle_param_is_handle[arg_index]) {
+        return "ptr";
+    }
     if (target->param_is_var[arg_index]) {
         return "ptr";
     }
     return v3_abi_class_scalar_or_ptr(target->param_abi_classes[arg_index]) ?
            target->param_abi_classes[arg_index] : "ptr";
+}
+
+static void v3_emit_unary_helper_call(const V3SystemLinkPlanStub *plan,
+                                      char *out,
+                                      size_t cap,
+                                      const char *symbol_name,
+                                      const char *arg_abi_class,
+                                      int src_reg,
+                                      const char *ret_abi_class,
+                                      int dst_reg) {
+    int arg_reg = v3_active_target_is_linux_x86_64() ? 14 : 0;
+    v3_emit_move_reg_abi(out, cap, arg_reg, src_reg, arg_abi_class);
+    v3_emit_call_named_symbol(plan, out, cap, symbol_name);
+    v3_emit_move_reg_abi(out, cap, dst_reg, 0, ret_abi_class);
 }
 
 static void v3_emit_call_dest_spill_store(char *out,
@@ -14296,6 +14846,19 @@ static void v3_emit_call_dest_spill_store(char *out,
     }
 }
 
+static void v3_emit_call_dest_spill_store_abi(char *out,
+                                              size_t cap,
+                                              int32_t call_arg_base,
+                                              int call_depth,
+                                              const char *abi_class,
+                                              int src_reg_index) {
+    int32_t offset =
+        call_arg_base + call_depth * CHENG_V3_CALL_ARG_SPILL_STRIDE + (int32_t)CHENG_V3_MAX_CALL_ARGS * 8;
+    if (!v3_emit_sp_store_reg(out, cap, offset, abi_class, src_reg_index)) {
+        abort();
+    }
+}
+
 static void v3_emit_call_dest_spill_load(char *out,
                                          size_t cap,
                                          int32_t call_arg_base,
@@ -14304,6 +14867,19 @@ static void v3_emit_call_dest_spill_load(char *out,
     int32_t offset =
         call_arg_base + call_depth * CHENG_V3_CALL_ARG_SPILL_STRIDE + (int32_t)CHENG_V3_MAX_CALL_ARGS * 8;
     if (!v3_emit_sp_load_reg(out, cap, offset, "ptr", dest_reg_index)) {
+        abort();
+    }
+}
+
+static void v3_emit_call_dest_spill_load_abi(char *out,
+                                             size_t cap,
+                                             int32_t call_arg_base,
+                                             int call_depth,
+                                             int dest_reg_index,
+                                             const char *abi_class) {
+    int32_t offset =
+        call_arg_base + call_depth * CHENG_V3_CALL_ARG_SPILL_STRIDE + (int32_t)CHENG_V3_MAX_CALL_ARGS * 8;
+    if (!v3_emit_sp_load_reg(out, cap, offset, abi_class, dest_reg_index)) {
         abort();
     }
 }
@@ -18343,6 +18919,7 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
                                    size_t cap) {
     V3AsmCallTarget target;
     size_t i;
+    int32_t ffi_handle_consume_index = -1;
     if (!v3_resolve_call_target(plan, lowering, current_function, aliases, alias_count, callee, &target)) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call resolve failed caller=%s callee=%s\n",
@@ -18367,6 +18944,7 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
                 arg_count);
         return false;
     }
+    ffi_handle_consume_index = target.ffi_handle_consume_index;
     for (i = 0; i < arg_count; ++i) {
         if (target.param_is_var[i]) {
             char lvalue_type[256];
@@ -18416,6 +18994,98 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
                                          i,
                                          "ptr",
                                          15);
+            continue;
+        }
+        if (target.ffi_handle_enabled && (int32_t)i == ffi_handle_consume_index) {
+            if (!v3_codegen_expr_scalar(plan,
+                                        lowering,
+                                        current_function,
+                                        aliases,
+                                        alias_count,
+                                        locals,
+                                        local_count,
+                                        args[i],
+                                        target.param_abi_classes[i],
+                                        9,
+                                        call_arg_base,
+                                        string_temp_base,
+                                        string_temp_stride,
+                                        call_depth + 1,
+                                        out,
+                                        cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] scalar call ffi_handle consume arg emit failed caller=%s callee=%s arg_index=%zu expr=%s abi=%s\n",
+                        current_function->symbol_text,
+                        callee,
+                        i,
+                        args[i],
+                        target.param_abi_classes[i]);
+                return false;
+            }
+            v3_emit_call_dest_spill_store_abi(out,
+                                              cap,
+                                              call_arg_base,
+                                              call_depth,
+                                              target.param_abi_classes[i],
+                                              9);
+            v3_emit_unary_helper_call(plan,
+                                      out,
+                                      cap,
+                                      target.ffi_handle_resolve_symbol_name,
+                                      target.param_abi_classes[i],
+                                      9,
+                                      "ptr",
+                                      0);
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         i,
+                                         "ptr",
+                                         0);
+            continue;
+        }
+        if (target.ffi_handle_enabled && target.ffi_handle_param_is_handle[i]) {
+            if (!v3_codegen_expr_scalar(plan,
+                                        lowering,
+                                        current_function,
+                                        aliases,
+                                        alias_count,
+                                        locals,
+                                        local_count,
+                                        args[i],
+                                        target.param_abi_classes[i],
+                                        9,
+                                        call_arg_base,
+                                        string_temp_base,
+                                        string_temp_stride,
+                                        call_depth + 1,
+                                        out,
+                                        cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] scalar call ffi_handle arg emit failed caller=%s callee=%s arg_index=%zu expr=%s abi=%s\n",
+                        current_function->symbol_text,
+                        callee,
+                        i,
+                        args[i],
+                        target.param_abi_classes[i]);
+                return false;
+            }
+            v3_emit_unary_helper_call(plan,
+                                      out,
+                                      cap,
+                                      target.ffi_handle_resolve_symbol_name,
+                                      target.param_abi_classes[i],
+                                      9,
+                                      "ptr",
+                                      0);
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         i,
+                                         "ptr",
+                                         0);
             continue;
         }
         if (v3_abi_class_scalar_or_ptr(target.param_abi_classes[i])) {
@@ -18651,6 +19321,50 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
             } else {
                 v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
             }
+        }
+        if (ffi_handle_consume_index >= 0) {
+            if (strcmp(target.return_abi_class, "void") != 0) {
+                v3_emit_call_arg_spill_store(out,
+                                             cap,
+                                             call_arg_base,
+                                             call_depth,
+                                             (size_t)ffi_handle_consume_index,
+                                             target.return_abi_class,
+                                             0);
+            }
+            v3_emit_call_dest_spill_load_abi(out,
+                                             cap,
+                                             call_arg_base,
+                                             call_depth,
+                                             9,
+                                             target.param_abi_classes[ffi_handle_consume_index]);
+            v3_emit_unary_helper_call(plan,
+                                      out,
+                                      cap,
+                                      target.ffi_handle_invalidate_symbol_name,
+                                      target.param_abi_classes[ffi_handle_consume_index],
+                                      9,
+                                      "i32",
+                                      0);
+            if (strcmp(target.return_abi_class, "void") != 0) {
+                v3_emit_call_arg_spill_load(out,
+                                            cap,
+                                            call_arg_base,
+                                            call_depth,
+                                            (size_t)ffi_handle_consume_index,
+                                            0,
+                                            target.return_abi_class);
+            }
+        }
+        if (target.ffi_handle_enabled && target.ffi_handle_return_is_handle) {
+            v3_emit_unary_helper_call(plan,
+                                      out,
+                                      cap,
+                                      target.ffi_handle_register_symbol_name,
+                                      "ptr",
+                                      0,
+                                      target.return_abi_class,
+                                      0);
         }
     }
     if (strcmp(expected_abi, "void") != 0 &&
@@ -28161,19 +28875,38 @@ static void v3_provider_source_for_module(const V3SystemLinkPlanStub *plan,
                                           char *out,
                                           size_t cap) {
     if (v3_streq(module_path, "runtime/core_runtime_v3")) {
-        v3_join_path(out, cap, plan->workspace_root, "v3/runtime/native/v3_core_runtime_stub.c");
+        if (v3_streq(plan->target_triple, "arm64-apple-darwin")) {
+            v3_join_path(out,
+                         cap,
+                         plan->workspace_root,
+                         "v3/src/runtime/core_runtime_provider_darwin_v3.cheng");
+        } else {
+            v3_join_path(out,
+                         cap,
+                         plan->workspace_root,
+                         "v3/src/runtime/core_runtime_provider_linux_v3.cheng");
+        }
         return;
     }
     if (v3_streq(module_path, "runtime/compiler_runtime_v3")) {
         if (v3_streq(plan->module_kind, "compiler_control_plane")) {
-            v3_join_path(out, cap, plan->workspace_root, "v3/runtime/native/v3_tooling_argv_native.c");
+            v3_join_path(out,
+                         cap,
+                         plan->workspace_root,
+                         "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng");
         } else {
-            v3_join_path(out, cap, plan->workspace_root, "v3/runtime/native/v3_program_argv_native.c");
+            v3_join_path(out,
+                         cap,
+                         plan->workspace_root,
+                         "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng");
         }
         return;
     }
     if (v3_streq(module_path, "runtime/debug_runtime_v3")) {
-        v3_join_path(out, cap, plan->workspace_root, "src/runtime/native/system_helpers_debug_trace_profile.c");
+        v3_join_path(out,
+                     cap,
+                     plan->workspace_root,
+                     "v3/src/runtime/debug_runtime_stub_v3.cheng");
         return;
     }
     if (v3_streq(module_path, "runtime/program_support_v3")) {
@@ -28445,6 +29178,12 @@ static bool v3_build_object_plan_stub(const V3SystemLinkPlanStub *plan,
                          CHENG_V3_MAX_PLAN_PATHS,
                          object_plan->primary_object_path);
     }
+    if (plan->extra_link_input_path[0] != '\0') {
+        v3_plan_add_path(object_plan->link_input_paths,
+                         &object_plan->link_input_count,
+                         CHENG_V3_MAX_PLAN_PATHS,
+                         plan->extra_link_input_path);
+    }
     if (v3_streq(plan->emit_kind, "exe") &&
         v3_target_uses_linux_nolibc_runtime(plan->target_triple)) {
         object_plan->linux_nolibc_support_enabled = true;
@@ -28550,6 +29289,99 @@ static bool v3_path_is_directory(const char *path) {
 
 static bool v3_path_is_executable(const char *path) {
     return path != NULL && path[0] != '\0' && access(path, X_OK) == 0;
+}
+
+static bool v3_resolve_self_path(char *out, size_t cap) {
+    char raw[PATH_MAX];
+    char *resolved = NULL;
+    if (out == NULL || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+#if defined(__APPLE__)
+    {
+        uint32_t size = (uint32_t)sizeof(raw);
+        if (_NSGetExecutablePath(raw, &size) == 0) {
+            resolved = realpath(raw, out);
+            if (resolved != NULL) {
+                return true;
+            }
+            if (strlen(raw) < cap) {
+                snprintf(out, cap, "%s", raw);
+                return true;
+            }
+        }
+    }
+#elif !defined(_WIN32)
+    {
+        ssize_t n = readlink("/proc/self/exe", raw, sizeof(raw) - 1U);
+        if (n > 0 && (size_t)n < sizeof(raw)) {
+            raw[n] = '\0';
+            resolved = realpath(raw, out);
+            if (resolved != NULL) {
+                return true;
+            }
+            if ((size_t)n < cap) {
+                snprintf(out, cap, "%s", raw);
+                return true;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
+static bool v3_bootstrap_current_compiler_path(const V3BootstrapPaths *paths,
+                                               char *out,
+                                               size_t cap) {
+    if (paths == NULL || out == NULL || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (v3_resolve_self_path(out, cap) && v3_path_is_executable(out)) {
+        return true;
+    }
+    if (v3_path_is_executable(paths->stage3)) {
+        snprintf(out, cap, "%s", paths->stage3);
+        return true;
+    }
+    if (v3_path_is_executable(paths->stage2)) {
+        snprintf(out, cap, "%s", paths->stage2);
+        return true;
+    }
+    if (v3_path_is_executable(paths->stage1)) {
+        snprintf(out, cap, "%s", paths->stage1);
+        return true;
+    }
+    if (v3_path_is_executable(paths->stage0)) {
+        snprintf(out, cap, "%s", paths->stage0);
+        return true;
+    }
+    return false;
+}
+
+static bool v3_bootstrap_materialize_stage0(const V3BootstrapPaths *paths,
+                                            const char *compiler_path) {
+    char note[PATH_MAX * 2U];
+    if (paths == NULL || compiler_path == NULL || compiler_path[0] == '\0') {
+        return false;
+    }
+    if (!v3_path_is_executable(compiler_path)) {
+        return false;
+    }
+    if (strcmp(compiler_path, paths->stage0) != 0) {
+        if (!v3_copy_file_bytes(compiler_path, paths->stage0)) {
+            return false;
+        }
+        if (chmod(paths->stage0, 0755) != 0) {
+            perror("chmod");
+            return false;
+        }
+        snprintf(note, sizeof(note), "stage0_materialized_from=%s\n", compiler_path);
+        return v3_write_text_file(paths->stage0_build_log, note);
+    }
+    snprintf(note, sizeof(note), "stage0_reused_from=%s\n", compiler_path);
+    return v3_write_text_file(paths->stage0_build_log, note);
 }
 
 static bool v3_resolve_executable_program(const char *program, char *out, size_t cap) {
@@ -29045,6 +29877,25 @@ typedef struct {
     uint32_t type_index;
 } V3WasmImportStub;
 
+typedef struct {
+    V3AsmLocalSlot locals[CHENG_V3_MAX_ASM_LOCALS];
+    uint32_t local_indices[CHENG_V3_MAX_ASM_LOCALS];
+    size_t local_count;
+    size_t param_count;
+    V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
+    size_t alias_count;
+} V3WasmFunctionContext;
+
+static bool v3_wasm_abi_uses_i32_value(const char *abi_class) {
+    return abi_class != NULL &&
+           (strcmp(abi_class, "i32") == 0 ||
+            strcmp(abi_class, "bool") == 0 ||
+            strcmp(abi_class, "i8") == 0 ||
+            strcmp(abi_class, "u8") == 0 ||
+            strcmp(abi_class, "i16") == 0 ||
+            strcmp(abi_class, "u16") == 0);
+}
+
 static bool v3_wasm_signature_type_index(size_t param_count,
                                          const char *return_abi_class,
                                          const char param_abi_classes[][32],
@@ -29053,19 +29904,1318 @@ static bool v3_wasm_signature_type_index(size_t param_count,
     if (return_abi_class == NULL || type_index_out == NULL) {
         return false;
     }
-    if (strcmp(return_abi_class, "i32") != 0) {
+    if (!v3_wasm_abi_uses_i32_value(return_abi_class)) {
         return false;
     }
     if (param_count > 4U) {
         return false;
     }
     for (i = 0U; i < param_count; ++i) {
-        if (strcmp(param_abi_classes[i], "i32") != 0) {
+        if (!v3_wasm_abi_uses_i32_value(param_abi_classes[i])) {
             return false;
         }
     }
     *type_index_out = (uint32_t)param_count;
     return true;
+}
+
+static int32_t v3_wasm_find_import_index(const V3WasmImportStub *imports,
+                                         size_t import_count,
+                                         const char *symbol_name,
+                                         uint32_t type_index);
+
+static bool v3_wasm_append_sleb_i32(V3WasmBuffer *buf, int32_t value) {
+    bool more = true;
+    while (more) {
+        unsigned char byte = (unsigned char)(value & 0x7f);
+        const bool sign_bit = (byte & 0x40U) != 0U;
+        value >>= 7;
+        if ((value == 0 && !sign_bit) || (value == -1 && sign_bit)) {
+            more = false;
+        } else {
+            byte |= 0x80U;
+        }
+        if (!v3_wasm_append_u8(buf, byte)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool v3_wasm_trim_wrapping_parens(const char *text,
+                                         char *out,
+                                         size_t cap) {
+    char trimmed[4096];
+    bool changed = false;
+    v3_trim_copy_text(text, trimmed, sizeof(trimmed));
+    while (trimmed[0] == '(') {
+        size_t len = strlen(trimmed);
+        size_t i;
+        int32_t paren_depth = 0;
+        bool in_string = false;
+        bool wraps = len > 1U && trimmed[len - 1U] == ')';
+        if (!wraps) {
+            break;
+        }
+        for (i = 0U; i < len; ++i) {
+            char ch = trimmed[i];
+            if (ch == '"' && (i == 0U || trimmed[i - 1U] != '\\')) {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (ch == '(') {
+                paren_depth += 1;
+            } else if (ch == ')') {
+                paren_depth -= 1;
+                if (paren_depth == 0 && i + 1U < len) {
+                    wraps = false;
+                    break;
+                }
+            }
+        }
+        if (!wraps || paren_depth != 0) {
+            break;
+        }
+        snprintf(trimmed, sizeof(trimmed), "%.*s", (int)(len - 2U), trimmed + 1);
+        v3_trim_copy_text(trimmed, trimmed, sizeof(trimmed));
+        changed = true;
+    }
+    snprintf(out, cap, "%s", trimmed);
+    return changed || out[0] != '\0';
+}
+
+static int32_t v3_wasm_find_local_slot_index(const V3WasmFunctionContext *ctx,
+                                             const char *name) {
+    size_t i;
+    if (ctx == NULL || name == NULL || name[0] == '\0') {
+        return -1;
+    }
+    for (i = 0U; i < ctx->local_count; ++i) {
+        if (strcmp(ctx->locals[i].name, name) == 0) {
+            return (int32_t)i;
+        }
+    }
+    return -1;
+}
+
+static bool v3_wasm_context_add_local(V3WasmFunctionContext *ctx,
+                                      const char *name,
+                                      const char *type_text,
+                                      const char *abi_class,
+                                      uint32_t local_index) {
+    if (ctx == NULL ||
+        name == NULL || name[0] == '\0' ||
+        type_text == NULL || type_text[0] == '\0' ||
+        abi_class == NULL || !v3_wasm_abi_uses_i32_value(abi_class)) {
+        return false;
+    }
+    if (v3_wasm_find_local_slot_index(ctx, name) >= 0) {
+        return true;
+    }
+    if (ctx->local_count >= CHENG_V3_MAX_ASM_LOCALS) {
+        fprintf(stderr, "[cheng_v3_seed] wasm local table overflow local=%s\n", name);
+        return false;
+    }
+    memset(&ctx->locals[ctx->local_count], 0, sizeof(ctx->locals[ctx->local_count]));
+    snprintf(ctx->locals[ctx->local_count].name, sizeof(ctx->locals[ctx->local_count].name), "%s", name);
+    snprintf(ctx->locals[ctx->local_count].type_text, sizeof(ctx->locals[ctx->local_count].type_text), "%s", type_text);
+    snprintf(ctx->locals[ctx->local_count].abi_class, sizeof(ctx->locals[ctx->local_count].abi_class), "%s", abi_class);
+    ctx->locals[ctx->local_count].stack_offset = -1;
+    ctx->local_indices[ctx->local_count] = local_index;
+    ctx->local_count += 1U;
+    return true;
+}
+
+static bool v3_wasm_context_init(const V3SystemLinkPlanStub *plan,
+                                 const V3LoweringPlanStub *lowering,
+                                 const V3LoweredFunctionStub *function,
+                                 V3WasmFunctionContext *ctx) {
+    size_t i;
+    (void)lowering;
+    memset(ctx, 0, sizeof(*ctx));
+    if (!v3_load_import_aliases_from_source_path(function->source_path,
+                                                 ctx->aliases,
+                                                 &ctx->alias_count,
+                                                 CHENG_V3_MAX_IMPORT_ALIASES)) {
+        fprintf(stderr, "[cheng_v3_seed] wasm alias load failed: %s\n", function->source_path);
+        return false;
+    }
+    if (!v3_wasm_abi_uses_i32_value(function->return_abi_class) ||
+        function->param_count > 4U) {
+        return false;
+    }
+    for (i = 0U; i < function->param_count; ++i) {
+        if (!v3_wasm_abi_uses_i32_value(function->param_abi_classes[i]) ||
+            !v3_wasm_context_add_local(ctx,
+                                       function->param_names[i],
+                                       function->param_types[i],
+                                       function->param_abi_classes[i],
+                                       (uint32_t)i)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] wasm param local init failed function=%s param=%s type=%s abi=%s\n",
+                    function->symbol_text,
+                    function->param_names[i],
+                    function->param_types[i],
+                    function->param_abi_classes[i]);
+            return false;
+        }
+    }
+    ctx->param_count = function->param_count;
+    return true;
+}
+
+static bool v3_wasm_register_import(const char *function_symbol,
+                                    const V3AsmCallTarget *target,
+                                    V3WasmImportStub *imports,
+                                    size_t *import_count) {
+    uint32_t type_index = 0U;
+    if (target == NULL || !target->external) {
+        return true;
+    }
+    if (!v3_wasm_signature_type_index(target->param_count,
+                                      target->return_abi_class,
+                                      target->param_abi_classes,
+                                      &type_index)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm unsupported external call signature function=%s symbol=%s ret=%s argc=%zu\n",
+                function_symbol,
+                target->symbol_name,
+                target->return_abi_class,
+                target->param_count);
+        return false;
+    }
+    if (imports == NULL || import_count == NULL) {
+        return true;
+    }
+    if (v3_wasm_find_import_index(imports, *import_count, target->symbol_name, type_index) >= 0) {
+        return true;
+    }
+    if (*import_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+        fprintf(stderr, "[cheng_v3_seed] wasm import table overflow\n");
+        return false;
+    }
+    snprintf(imports[*import_count].symbol_name,
+             sizeof(imports[*import_count].symbol_name),
+             "%s",
+             target->symbol_name);
+    imports[*import_count].type_index = type_index;
+    *import_count += 1U;
+    return true;
+}
+
+static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
+                                 const V3LoweringPlanStub *lowering,
+                                 const V3LoweredFunctionStub *function,
+                                 V3WasmFunctionContext *ctx,
+                                 const char *expr_text,
+                                 V3WasmImportStub *imports,
+                                 size_t *import_count);
+
+static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
+                                 const V3LoweringPlanStub *lowering,
+                                 const V3LoweredFunctionStub *function,
+                                 V3WasmFunctionContext *ctx,
+                                 const char *callee,
+                                 char args[][4096],
+                                 size_t arg_count,
+                                 V3WasmImportStub *imports,
+                                 size_t *import_count) {
+    V3AsmCallTarget target;
+    size_t i;
+    if (!v3_resolve_call_target(plan,
+                                lowering,
+                                function,
+                                ctx->aliases,
+                                ctx->alias_count,
+                                callee,
+                                &target)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm call target resolve failed function=%s callee=%s\n",
+                function->symbol_text,
+                callee);
+        return false;
+    }
+    if (!v3_wasm_abi_uses_i32_value(target.return_abi_class) || target.param_count != arg_count) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm call signature reject function=%s callee=%s ret=%s argc=%zu expected=%zu\n",
+                function->symbol_text,
+                callee,
+                target.return_abi_class,
+                target.param_count,
+                arg_count);
+        return false;
+    }
+    for (i = 0U; i < arg_count; ++i) {
+        if (!v3_wasm_abi_uses_i32_value(target.param_abi_classes[i]) ||
+            !v3_wasm_analyze_expr(plan, lowering, function, ctx, args[i], imports, import_count)) {
+            return false;
+        }
+    }
+    return v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+}
+
+static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
+                                 const V3LoweringPlanStub *lowering,
+                                 const V3LoweredFunctionStub *function,
+                                 V3WasmFunctionContext *ctx,
+                                 const char *expr_text,
+                                 V3WasmImportStub *imports,
+                                 size_t *import_count) {
+    static const char *OPS[] = {
+        "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "&", "+", "-", "*", "/", "%"
+    };
+    char expr[4096];
+    char inferred_type[256];
+    char inferred_abi[32];
+    size_t i;
+    char callee[PATH_MAX];
+    char arg_text[4096];
+    char args[CHENG_V3_MAX_CALL_ARGS][4096];
+    size_t arg_count = 0U;
+    char cond_expr[4096];
+    char true_expr[4096];
+    char false_expr[4096];
+    v3_wasm_trim_wrapping_parens(expr_text, expr, sizeof(expr));
+    if (!v3_infer_expr_type(plan,
+                            lowering,
+                            function,
+                            ctx->aliases,
+                            ctx->alias_count,
+                            ctx->locals,
+                            ctx->local_count,
+                            expr,
+                            inferred_type,
+                            sizeof(inferred_type),
+                            inferred_abi,
+                            sizeof(inferred_abi)) ||
+        !v3_wasm_abi_uses_i32_value(inferred_abi)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm expr infer/type reject function=%s expr=%s abi=%s type=%s\n",
+                function->symbol_text,
+                expr,
+                inferred_abi,
+                inferred_type);
+        return false;
+    }
+    if (v3_parse_if_expr(expr,
+                         cond_expr,
+                         sizeof(cond_expr),
+                         true_expr,
+                         sizeof(true_expr),
+                         false_expr,
+                         sizeof(false_expr)) ||
+        v3_parse_ternary_expr(expr,
+                              cond_expr,
+                              sizeof(cond_expr),
+                              true_expr,
+                              sizeof(true_expr),
+                              false_expr,
+                              sizeof(false_expr))) {
+        return v3_wasm_analyze_expr(plan, lowering, function, ctx, cond_expr, imports, import_count) &&
+               v3_wasm_analyze_expr(plan, lowering, function, ctx, true_expr, imports, import_count) &&
+               v3_wasm_analyze_expr(plan, lowering, function, ctx, false_expr, imports, import_count);
+    }
+    if (expr[0] == '!' && expr[1] != '\0') {
+        return v3_wasm_analyze_expr(plan, lowering, function, ctx, expr + 1, imports, import_count);
+    }
+    for (i = 0U; i < sizeof(OPS) / sizeof(OPS[0]); ++i) {
+        int32_t op_index = v3_find_top_level_binary_op_last(expr, OPS[i]);
+        if (op_index > 0) {
+            char left[4096];
+            char right[4096];
+            snprintf(left, sizeof(left), "%.*s", op_index, expr);
+            snprintf(right, sizeof(right), "%s", expr + op_index + strlen(OPS[i]));
+            v3_trim_copy_text(left, left, sizeof(left));
+            v3_trim_copy_text(right, right, sizeof(right));
+            return v3_wasm_analyze_expr(plan, lowering, function, ctx, left, imports, import_count) &&
+                   v3_wasm_analyze_expr(plan, lowering, function, ctx, right, imports, import_count);
+        }
+    }
+    if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        return v3_wasm_analyze_call(plan, lowering, function, ctx, callee, args, arg_count, imports, import_count);
+    }
+    if (v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+        return v3_wasm_analyze_call(plan, lowering, function, ctx, callee, args, 1U, imports, import_count);
+    }
+    return true;
+}
+
+static bool v3_wasm_prepare_statement(const V3SystemLinkPlanStub *plan,
+                                      const V3LoweringPlanStub *lowering,
+                                      const V3LoweredFunctionStub *function,
+                                      V3WasmFunctionContext *ctx,
+                                      const char *statement,
+                                      V3WasmImportStub *imports,
+                                      size_t *import_count) {
+    char name[128];
+    char type_text[256];
+    char expr[4096];
+    char cond[4096];
+    char inline_stmt[8192];
+    if (v3_startswith(statement, "if ")) {
+        if (!v3_parse_if_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+            !v3_wasm_analyze_expr(plan, lowering, function, ctx, cond, imports, import_count)) {
+            return false;
+        }
+        if (inline_stmt[0] != '\0') {
+            return v3_wasm_prepare_statement(plan, lowering, function, ctx, inline_stmt, imports, import_count);
+        }
+        return true;
+    }
+    if (v3_startswith(statement, "elif ")) {
+        if (!v3_parse_elif_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+            !v3_wasm_analyze_expr(plan, lowering, function, ctx, cond, imports, import_count)) {
+            return false;
+        }
+        if (inline_stmt[0] != '\0') {
+            return v3_wasm_prepare_statement(plan, lowering, function, ctx, inline_stmt, imports, import_count);
+        }
+        return true;
+    }
+    if (v3_startswith(statement, "else")) {
+        if (!v3_parse_else_header(statement, inline_stmt, sizeof(inline_stmt))) {
+            return false;
+        }
+        if (inline_stmt[0] != '\0') {
+            return v3_wasm_prepare_statement(plan, lowering, function, ctx, inline_stmt, imports, import_count);
+        }
+        return true;
+    }
+    if (v3_startswith(statement, "while ")) {
+        if (!v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+            !v3_wasm_analyze_expr(plan, lowering, function, ctx, cond, imports, import_count)) {
+            return false;
+        }
+        if (inline_stmt[0] != '\0') {
+            return v3_wasm_prepare_statement(plan, lowering, function, ctx, inline_stmt, imports, import_count);
+        }
+        return true;
+    }
+    if (v3_startswith(statement, "for ") || v3_startswith(statement, "case ")) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm generic statement not supported function=%s stmt=%s\n",
+                function->symbol_text,
+                statement);
+        return false;
+    }
+    if ((v3_startswith(statement, "let ") || v3_startswith(statement, "var ")) &&
+        v3_parse_binding_decl_meta(statement,
+                                   v3_startswith(statement, "let ") ? "let " : "var ",
+                                   name,
+                                   sizeof(name),
+                                   type_text,
+                                   sizeof(type_text))) {
+        char normalized_type[256];
+        const char *abi_class = v3_resolved_type_abi_class(lowering,
+                                                           function->owner_module_path,
+                                                           ctx->aliases,
+                                                           ctx->alias_count,
+                                                           type_text,
+                                                           normalized_type,
+                                                           sizeof(normalized_type));
+        return v3_wasm_context_add_local(ctx,
+                                         name,
+                                         normalized_type[0] != '\0' ? normalized_type : type_text,
+                                         abi_class,
+                                         (uint32_t)ctx->local_count);
+    }
+    if ((v3_startswith(statement, "let ") || v3_startswith(statement, "var ")) &&
+        v3_parse_binding_meta(statement,
+                              v3_startswith(statement, "let ") ? "let " : "var ",
+                              name,
+                              sizeof(name),
+                              type_text,
+                              sizeof(type_text),
+                              expr,
+                              sizeof(expr))) {
+        char inferred_type[256];
+        char inferred_abi[32];
+        char normalized_type[256];
+        const char *abi_class = NULL;
+        if (!v3_wasm_analyze_expr(plan, lowering, function, ctx, expr, imports, import_count)) {
+            return false;
+        }
+        if (type_text[0] == '\0') {
+            if (!v3_infer_expr_type(plan,
+                                    lowering,
+                                    function,
+                                    ctx->aliases,
+                                    ctx->alias_count,
+                                    ctx->locals,
+                                    ctx->local_count,
+                                    expr,
+                                    inferred_type,
+                                    sizeof(inferred_type),
+                                    inferred_abi,
+                                    sizeof(inferred_abi))) {
+                return false;
+            }
+            snprintf(type_text, sizeof(type_text), "%s", inferred_type);
+        }
+        abi_class = v3_resolved_type_abi_class(lowering,
+                                               function->owner_module_path,
+                                               ctx->aliases,
+                                               ctx->alias_count,
+                                               type_text,
+                                               normalized_type,
+                                               sizeof(normalized_type));
+        return v3_wasm_context_add_local(ctx,
+                                         name,
+                                         normalized_type[0] != '\0' ? normalized_type : type_text,
+                                         abi_class,
+                                         (uint32_t)ctx->local_count);
+    }
+    if (strcmp(statement, "return") == 0) {
+        return false;
+    }
+    if (v3_startswith(statement, "return ")) {
+        return v3_wasm_analyze_expr(plan, lowering, function, ctx, statement + 7, imports, import_count);
+    }
+    if (v3_parse_assignment_meta(statement, name, sizeof(name), expr, sizeof(expr))) {
+        return v3_wasm_find_local_slot_index(ctx, name) >= 0 &&
+               v3_wasm_analyze_expr(plan, lowering, function, ctx, expr, imports, import_count);
+    }
+    return v3_wasm_analyze_expr(plan, lowering, function, ctx, statement, imports, import_count);
+}
+
+static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
+                                             const V3LoweringPlanStub *lowering,
+                                             const V3LoweredFunctionStub *function,
+                                             V3WasmFunctionContext *ctx,
+                                             V3WasmImportStub *imports,
+                                             size_t *import_count) {
+    char **lines = NULL;
+    char *owned_lines = NULL;
+    size_t line_count = 0U;
+    size_t fn_line_index = 0U;
+    char param_names[CHENG_V3_CONST_MAX_BINDINGS][128];
+    size_t param_count = 0U;
+    char owned_path[PATH_MAX];
+    char inline_signature_body[8192];
+    bool has_inline_signature_body = false;
+    size_t i;
+    if (!v3_wasm_context_init(plan, lowering, function, ctx) ||
+        !v3_load_function_source_lines(function,
+                                       &lines,
+                                       &owned_lines,
+                                       &line_count,
+                                       &fn_line_index,
+                                       param_names,
+                                       &param_count,
+                                       owned_path)) {
+        return false;
+    }
+    inline_signature_body[0] = '\0';
+    {
+        char signature_copy[8192];
+        char *eq;
+        snprintf(signature_copy, sizeof(signature_copy), "%s", lines[fn_line_index]);
+        eq = strrchr(signature_copy, '=');
+        if (eq != NULL) {
+            v3_trim_copy_text(eq + 1, inline_signature_body, sizeof(inline_signature_body));
+            has_inline_signature_body = inline_signature_body[0] != '\0';
+        }
+    }
+    if (has_inline_signature_body) {
+        bool ok = v3_wasm_prepare_statement(plan,
+                                            lowering,
+                                            function,
+                                            ctx,
+                                            inline_signature_body,
+                                            imports,
+                                            import_count);
+        free(lines);
+        free(owned_lines);
+        return ok;
+    }
+    for (i = fn_line_index + 1U; i < line_count; ) {
+        char raw_copy[4096];
+        char *trimmed;
+        int32_t indent;
+        char statement[8192];
+        snprintf(raw_copy, sizeof(raw_copy), "%s", lines[i]);
+        trimmed = v3_trim_inplace(raw_copy);
+        if (*trimmed == '\0') {
+            i += 1U;
+            continue;
+        }
+        indent = v3_line_indent(lines[i]);
+        if (indent <= 0 && v3_is_top_level_decl_start(trimmed)) {
+            break;
+        }
+        if (!v3_collect_statement_from_lines(lines, line_count, &i, statement, sizeof(statement)) ||
+            !v3_wasm_prepare_statement(plan, lowering, function, ctx, statement, imports, import_count)) {
+            free(lines);
+            free(owned_lines);
+            return false;
+        }
+    }
+    free(lines);
+    free(owned_lines);
+    return true;
+}
+
+static bool v3_wasm_emit_expr(const V3SystemLinkPlanStub *plan,
+                              const V3LoweringPlanStub *lowering,
+                              const V3LoweredFunctionStub *function,
+                              const V3WasmFunctionContext *ctx,
+                              const char *expr_text,
+                              const V3WasmImportStub *imports,
+                              size_t import_count,
+                              V3WasmBuffer *body);
+
+static bool v3_wasm_emit_statement(const V3SystemLinkPlanStub *plan,
+                                   const V3LoweringPlanStub *lowering,
+                                   const V3LoweredFunctionStub *function,
+                                   const V3WasmFunctionContext *ctx,
+                                   char **lines,
+                                   size_t line_count,
+                                   size_t *index_io,
+                                   int32_t statement_indent,
+                                   const char *statement,
+                                   const V3WasmImportStub *imports,
+                                   size_t import_count,
+                                   bool allow_implicit_return,
+                                   V3WasmBuffer *body,
+                                   bool *terminated_out);
+
+static bool v3_wasm_emit_block_statements(const V3SystemLinkPlanStub *plan,
+                                          const V3LoweringPlanStub *lowering,
+                                          const V3LoweredFunctionStub *function,
+                                          const V3WasmFunctionContext *ctx,
+                                          char **lines,
+                                          size_t line_count,
+                                          size_t *index_io,
+                                          int32_t parent_indent,
+                                          const V3WasmImportStub *imports,
+                                          size_t import_count,
+                                          V3WasmBuffer *body,
+                                          bool *terminated_out) {
+    bool terminated = false;
+    while (*index_io < line_count) {
+        char raw_copy[4096];
+        char *trimmed;
+        int32_t indent;
+        char statement[8192];
+        snprintf(raw_copy, sizeof(raw_copy), "%s", lines[*index_io]);
+        trimmed = v3_trim_inplace(raw_copy);
+        if (*trimmed == '\0') {
+            *index_io += 1U;
+            continue;
+        }
+        indent = v3_line_indent(lines[*index_io]);
+        if (indent <= parent_indent) {
+            break;
+        }
+        if (!v3_collect_statement_from_lines(lines, line_count, index_io, statement, sizeof(statement))) {
+            return false;
+        }
+        if (terminated) {
+            continue;
+        }
+        if (!v3_wasm_emit_statement(plan,
+                                    lowering,
+                                    function,
+                                    ctx,
+                                    lines,
+                                    line_count,
+                                    index_io,
+                                    indent,
+                                    statement,
+                                    imports,
+                                    import_count,
+                                    false,
+                                    body,
+                                    &terminated)) {
+            return false;
+        }
+    }
+    *terminated_out = terminated;
+    return true;
+}
+
+static bool v3_wasm_emit_call_target(const V3LoweringPlanStub *lowering,
+                                     const V3AsmCallTarget *target,
+                                     const V3WasmImportStub *imports,
+                                     size_t import_count,
+                                     V3WasmBuffer *body) {
+    uint32_t callee_index = 0U;
+    if (target->external) {
+        uint32_t type_index = 0U;
+        int32_t import_index;
+        if (!v3_wasm_signature_type_index(target->param_count,
+                                          target->return_abi_class,
+                                          target->param_abi_classes,
+                                          &type_index)) {
+            return false;
+        }
+        import_index = v3_wasm_find_import_index(imports, import_count, target->symbol_name, type_index);
+        if (import_index < 0) {
+            fprintf(stderr, "[cheng_v3_seed] wasm missing import symbol=%s\n", target->symbol_name);
+            return false;
+        }
+        callee_index = (uint32_t)import_index;
+    } else {
+        int32_t local_index = v3_find_lowered_function_index_by_symbol(lowering,
+                                                                       target->lowered_function->symbol_text);
+        if (local_index < 0) {
+            fprintf(stderr, "[cheng_v3_seed] wasm local callee missing symbol=%s\n",
+                    target->lowered_function->symbol_text);
+            return false;
+        }
+        callee_index = (uint32_t)import_count + (uint32_t)local_index;
+    }
+    return v3_wasm_append_u8(body, 0x10U) &&
+           v3_wasm_append_uleb_u32(body, callee_index);
+}
+
+static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
+                                   const V3LoweringPlanStub *lowering,
+                                   const V3LoweredFunctionStub *function,
+                                   const V3WasmFunctionContext *ctx,
+                                   const char *callee,
+                                   char args[][4096],
+                                   size_t arg_count,
+                                   const V3WasmImportStub *imports,
+                                   size_t import_count,
+                                   V3WasmBuffer *body) {
+    V3AsmCallTarget target;
+    size_t i;
+    if (!v3_resolve_call_target(plan,
+                                lowering,
+                                function,
+                                ctx->aliases,
+                                ctx->alias_count,
+                                callee,
+                                &target) ||
+        !v3_wasm_abi_uses_i32_value(target.return_abi_class) ||
+        target.param_count != arg_count) {
+        return false;
+    }
+    for (i = 0U; i < arg_count; ++i) {
+        if (!v3_wasm_abi_uses_i32_value(target.param_abi_classes[i]) ||
+            !v3_wasm_emit_expr(plan,
+                               lowering,
+                               function,
+                               ctx,
+                               args[i],
+                               imports,
+                               import_count,
+                               body)) {
+            return false;
+        }
+    }
+    return v3_wasm_emit_call_target(lowering, &target, imports, import_count, body);
+}
+
+static bool v3_wasm_emit_expr(const V3SystemLinkPlanStub *plan,
+                              const V3LoweringPlanStub *lowering,
+                              const V3LoweredFunctionStub *function,
+                              const V3WasmFunctionContext *ctx,
+                              const char *expr_text,
+                              const V3WasmImportStub *imports,
+                              size_t import_count,
+                              V3WasmBuffer *body) {
+    static const char *OPS[] = {
+        "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "&", "+", "-", "*", "/", "%"
+    };
+    char expr[4096];
+    char callee[PATH_MAX];
+    char arg_text[4096];
+    char args[CHENG_V3_MAX_CALL_ARGS][4096];
+    size_t arg_count = 0U;
+    char cond_expr[4096];
+    char true_expr[4096];
+    char false_expr[4096];
+    int64_t literal_value = 0;
+    int32_t char_value = 0;
+    size_t i;
+    v3_wasm_trim_wrapping_parens(expr_text, expr, sizeof(expr));
+    if (v3_parse_if_expr(expr,
+                         cond_expr,
+                         sizeof(cond_expr),
+                         true_expr,
+                         sizeof(true_expr),
+                         false_expr,
+                         sizeof(false_expr)) ||
+        v3_parse_ternary_expr(expr,
+                              cond_expr,
+                              sizeof(cond_expr),
+                              true_expr,
+                              sizeof(true_expr),
+                              false_expr,
+                              sizeof(false_expr))) {
+        return v3_wasm_emit_expr(plan, lowering, function, ctx, cond_expr, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x04U) &&
+               v3_wasm_append_u8(body, 0x7fU) &&
+               v3_wasm_emit_expr(plan, lowering, function, ctx, true_expr, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x05U) &&
+               v3_wasm_emit_expr(plan, lowering, function, ctx, false_expr, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x0bU);
+    }
+    if (expr[0] == '!' && expr[1] != '\0') {
+        return v3_wasm_emit_expr(plan, lowering, function, ctx, expr + 1, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x45U);
+    }
+    if (expr[0] == '-' && expr[1] != '\0' && !v3_parse_int_literal_text(expr, &literal_value)) {
+        return v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, 0) &&
+               v3_wasm_emit_expr(plan, lowering, function, ctx, expr + 1, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x6bU);
+    }
+    for (i = 0U; i < sizeof(OPS) / sizeof(OPS[0]); ++i) {
+        int32_t op_index = v3_find_top_level_binary_op_last(expr, OPS[i]);
+        if (op_index > 0) {
+            char left[4096];
+            char right[4096];
+            char left_type[256];
+            char left_abi[32];
+            bool left_unsigned = false;
+            snprintf(left, sizeof(left), "%.*s", op_index, expr);
+            snprintf(right, sizeof(right), "%s", expr + op_index + strlen(OPS[i]));
+            v3_trim_copy_text(left, left, sizeof(left));
+            v3_trim_copy_text(right, right, sizeof(right));
+            if (!v3_infer_expr_type(plan,
+                                    lowering,
+                                    function,
+                                    ctx->aliases,
+                                    ctx->alias_count,
+                                    ctx->locals,
+                                    ctx->local_count,
+                                    left,
+                                    left_type,
+                                    sizeof(left_type),
+                                    left_abi,
+                                    sizeof(left_abi)) ||
+                !v3_wasm_emit_expr(plan, lowering, function, ctx, left, imports, import_count, body) ||
+                !v3_wasm_emit_expr(plan, lowering, function, ctx, right, imports, import_count, body)) {
+                return false;
+            }
+            left_unsigned = v3_scalar_type_is_unsigned(left_type);
+            if (strcmp(OPS[i], "||") == 0) {
+                return v3_wasm_append_u8(body, 0x72U) &&
+                       v3_wasm_append_u8(body, 0x45U) &&
+                       v3_wasm_append_u8(body, 0x45U);
+            }
+            if (strcmp(OPS[i], "&&") == 0) {
+                return v3_wasm_append_u8(body, 0x71U) &&
+                       v3_wasm_append_u8(body, 0x45U) &&
+                       v3_wasm_append_u8(body, 0x45U);
+            }
+            if (strcmp(OPS[i], "==") == 0) return v3_wasm_append_u8(body, 0x46U);
+            if (strcmp(OPS[i], "!=") == 0) return v3_wasm_append_u8(body, 0x47U);
+            if (strcmp(OPS[i], "<") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x49U : 0x48U);
+            if (strcmp(OPS[i], ">") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x4bU : 0x4aU);
+            if (strcmp(OPS[i], "<=") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x4dU : 0x4cU);
+            if (strcmp(OPS[i], ">=") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x4fU : 0x4eU);
+            if (strcmp(OPS[i], "|") == 0) return v3_wasm_append_u8(body, 0x72U);
+            if (strcmp(OPS[i], "^") == 0) return v3_wasm_append_u8(body, 0x73U);
+            if (strcmp(OPS[i], "&") == 0) return v3_wasm_append_u8(body, 0x71U);
+            if (strcmp(OPS[i], "+") == 0) return v3_wasm_append_u8(body, 0x6aU);
+            if (strcmp(OPS[i], "-") == 0) return v3_wasm_append_u8(body, 0x6bU);
+            if (strcmp(OPS[i], "*") == 0) return v3_wasm_append_u8(body, 0x6cU);
+            if (strcmp(OPS[i], "/") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x6eU : 0x6dU);
+            if (strcmp(OPS[i], "%") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x70U : 0x6fU);
+            if (strcmp(OPS[i], "<<") == 0) return v3_wasm_append_u8(body, 0x74U);
+            if (strcmp(OPS[i], ">>") == 0) return v3_wasm_append_u8(body, left_unsigned ? 0x76U : 0x75U);
+        }
+    }
+    if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        return v3_wasm_emit_call_expr(plan, lowering, function, ctx, callee, args, arg_count, imports, import_count, body);
+    }
+    if (v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+        return v3_wasm_emit_call_expr(plan, lowering, function, ctx, callee, args, 1U, imports, import_count, body);
+    }
+    {
+        int32_t local_slot = v3_wasm_find_local_slot_index(ctx, expr);
+        if (local_slot >= 0) {
+            return v3_wasm_append_u8(body, 0x20U) &&
+                   v3_wasm_append_uleb_u32(body, ctx->local_indices[local_slot]);
+        }
+    }
+    {
+        const V3TopLevelConstStub *top_level_const =
+            v3_find_expr_top_level_const(lowering,
+                                         function->owner_module_path,
+                                         ctx->aliases,
+                                         ctx->alias_count,
+                                         expr);
+        if (top_level_const && v3_wasm_abi_uses_i32_value(top_level_const->abi_class)) {
+            int32_t value =
+                strcmp(top_level_const->abi_class, "bool") == 0
+                    ? (top_level_const->bool_value ? 1 : 0)
+                    : (int32_t)top_level_const->i64_value;
+            return v3_wasm_append_u8(body, 0x41U) &&
+                   v3_wasm_append_sleb_i32(body, value);
+        }
+    }
+    if (v3_parse_char_literal_text(expr, &char_value)) {
+        return v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, char_value);
+    }
+    if (v3_parse_int_literal_text(expr, &literal_value)) {
+        return v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, (int32_t)literal_value);
+    }
+    if (strcmp(expr, "true") == 0) {
+        return v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, 1);
+    }
+    if (strcmp(expr, "false") == 0 || strcmp(expr, "nil") == 0) {
+        return v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, 0);
+    }
+    fprintf(stderr,
+            "[cheng_v3_seed] wasm expr emit unsupported function=%s expr=%s\n",
+            function->symbol_text,
+            expr);
+    return false;
+}
+
+static bool v3_wasm_emit_if_statement(const V3SystemLinkPlanStub *plan,
+                                      const V3LoweringPlanStub *lowering,
+                                      const V3LoweredFunctionStub *function,
+                                      const V3WasmFunctionContext *ctx,
+                                      char **lines,
+                                      size_t line_count,
+                                      size_t *index_io,
+                                      int32_t statement_indent,
+                                      const char *statement,
+                                      const V3WasmImportStub *imports,
+                                      size_t import_count,
+                                      V3WasmBuffer *body,
+                                      bool *terminated_out) {
+    char cond[4096];
+    char inline_stmt[8192];
+    bool then_terminated = false;
+    bool else_terminated = false;
+    if (!v3_parse_if_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+        !v3_wasm_emit_expr(plan, lowering, function, ctx, cond, imports, import_count, body) ||
+        !v3_wasm_append_u8(body, 0x04U) ||
+        !v3_wasm_append_u8(body, 0x40U)) {
+        return false;
+    }
+    if (inline_stmt[0] != '\0') {
+        if (!v3_wasm_emit_statement(plan,
+                                    lowering,
+                                    function,
+                                    ctx,
+                                    NULL,
+                                    0U,
+                                    NULL,
+                                    statement_indent + 1,
+                                    inline_stmt,
+                                    imports,
+                                    import_count,
+                                    false,
+                                    body,
+                                    &then_terminated)) {
+            return false;
+        }
+    } else if (lines != NULL && index_io != NULL) {
+        if (!v3_wasm_emit_block_statements(plan,
+                                           lowering,
+                                           function,
+                                           ctx,
+                                           lines,
+                                           line_count,
+                                           index_io,
+                                           statement_indent,
+                                           imports,
+                                           import_count,
+                                           body,
+                                           &then_terminated)) {
+            return false;
+        }
+    }
+    if (lines != NULL && index_io != NULL) {
+        while (*index_io < line_count) {
+            char raw_copy[4096];
+            char *trimmed;
+            int32_t indent;
+            snprintf(raw_copy, sizeof(raw_copy), "%s", lines[*index_io]);
+            trimmed = v3_trim_inplace(raw_copy);
+            if (*trimmed == '\0') {
+                *index_io += 1U;
+                continue;
+            }
+            indent = v3_line_indent(lines[*index_io]);
+            if (indent != statement_indent) {
+                break;
+            }
+            if (v3_startswith(trimmed, "elif ")) {
+                char elif_stmt[8192];
+                char elif_as_if[8192];
+                if (!v3_collect_statement_from_lines(lines, line_count, index_io, elif_stmt, sizeof(elif_stmt))) {
+                    return false;
+                }
+                snprintf(elif_as_if, sizeof(elif_as_if), "if %s", elif_stmt + 5);
+                if (!v3_wasm_append_u8(body, 0x05U) ||
+                    !v3_wasm_emit_statement(plan,
+                                            lowering,
+                                            function,
+                                            ctx,
+                                            lines,
+                                            line_count,
+                                            index_io,
+                                            statement_indent,
+                                            elif_as_if,
+                                            imports,
+                                            import_count,
+                                            false,
+                                            body,
+                                            &else_terminated)) {
+                    return false;
+                }
+                return v3_wasm_append_u8(body, 0x0bU) &&
+                       ((*terminated_out = then_terminated && else_terminated), true);
+            }
+            if (v3_startswith(trimmed, "else")) {
+                char else_stmt[8192];
+                char else_inline[8192];
+                if (!v3_collect_statement_from_lines(lines, line_count, index_io, else_stmt, sizeof(else_stmt)) ||
+                    !v3_parse_else_header(else_stmt, else_inline, sizeof(else_inline)) ||
+                    !v3_wasm_append_u8(body, 0x05U)) {
+                    return false;
+                }
+                if (else_inline[0] != '\0') {
+                    if (!v3_wasm_emit_statement(plan,
+                                                lowering,
+                                                function,
+                                                ctx,
+                                                NULL,
+                                                0U,
+                                                NULL,
+                                                statement_indent + 1,
+                                                else_inline,
+                                                imports,
+                                                import_count,
+                                                false,
+                                                body,
+                                                &else_terminated)) {
+                        return false;
+                    }
+                } else if (!v3_wasm_emit_block_statements(plan,
+                                                          lowering,
+                                                          function,
+                                                          ctx,
+                                                          lines,
+                                                          line_count,
+                                                          index_io,
+                                                          statement_indent,
+                                                          imports,
+                                                          import_count,
+                                                          body,
+                                                          &else_terminated)) {
+                    return false;
+                }
+                return v3_wasm_append_u8(body, 0x0bU) &&
+                       ((*terminated_out = then_terminated && else_terminated), true);
+            }
+            break;
+        }
+    }
+    *terminated_out = false;
+    return v3_wasm_append_u8(body, 0x0bU);
+}
+
+static bool v3_wasm_emit_while_statement(const V3SystemLinkPlanStub *plan,
+                                         const V3LoweringPlanStub *lowering,
+                                         const V3LoweredFunctionStub *function,
+                                         const V3WasmFunctionContext *ctx,
+                                         char **lines,
+                                         size_t line_count,
+                                         size_t *index_io,
+                                         int32_t statement_indent,
+                                         const char *statement,
+                                         const V3WasmImportStub *imports,
+                                         size_t import_count,
+                                         V3WasmBuffer *body) {
+    char cond[4096];
+    char inline_stmt[8192];
+    bool branch_terminated = false;
+    if (!v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+        !v3_wasm_append_u8(body, 0x02U) ||
+        !v3_wasm_append_u8(body, 0x40U) ||
+        !v3_wasm_append_u8(body, 0x03U) ||
+        !v3_wasm_append_u8(body, 0x40U) ||
+        !v3_wasm_emit_expr(plan, lowering, function, ctx, cond, imports, import_count, body) ||
+        !v3_wasm_append_u8(body, 0x45U) ||
+        !v3_wasm_append_u8(body, 0x0dU) ||
+        !v3_wasm_append_uleb_u32(body, 1U)) {
+        return false;
+    }
+    if (inline_stmt[0] != '\0') {
+        if (!v3_wasm_emit_statement(plan,
+                                    lowering,
+                                    function,
+                                    ctx,
+                                    NULL,
+                                    0U,
+                                    NULL,
+                                    statement_indent + 1,
+                                    inline_stmt,
+                                    imports,
+                                    import_count,
+                                    false,
+                                    body,
+                                    &branch_terminated)) {
+            return false;
+        }
+    } else if (lines != NULL && index_io != NULL) {
+        if (!v3_wasm_emit_block_statements(plan,
+                                           lowering,
+                                           function,
+                                           ctx,
+                                           lines,
+                                           line_count,
+                                           index_io,
+                                           statement_indent,
+                                           imports,
+                                           import_count,
+                                           body,
+                                           &branch_terminated)) {
+            return false;
+        }
+    }
+    return v3_wasm_append_u8(body, 0x0cU) &&
+           v3_wasm_append_uleb_u32(body, 0U) &&
+           v3_wasm_append_u8(body, 0x0bU) &&
+           v3_wasm_append_u8(body, 0x0bU);
+}
+
+static bool v3_wasm_emit_statement(const V3SystemLinkPlanStub *plan,
+                                   const V3LoweringPlanStub *lowering,
+                                   const V3LoweredFunctionStub *function,
+                                   const V3WasmFunctionContext *ctx,
+                                   char **lines,
+                                   size_t line_count,
+                                   size_t *index_io,
+                                   int32_t statement_indent,
+                                   const char *statement,
+                                   const V3WasmImportStub *imports,
+                                   size_t import_count,
+                                   bool allow_implicit_return,
+                                   V3WasmBuffer *body,
+                                   bool *terminated_out) {
+    char name[128];
+    char type_text[256];
+    char expr[4096];
+    int32_t local_slot = -1;
+    *terminated_out = false;
+    if (v3_startswith(statement, "if ")) {
+        return v3_wasm_emit_if_statement(plan,
+                                         lowering,
+                                         function,
+                                         ctx,
+                                         lines,
+                                         line_count,
+                                         index_io,
+                                         statement_indent,
+                                         statement,
+                                         imports,
+                                         import_count,
+                                         body,
+                                         terminated_out);
+    }
+    if (v3_startswith(statement, "while ")) {
+        return v3_wasm_emit_while_statement(plan,
+                                            lowering,
+                                            function,
+                                            ctx,
+                                            lines,
+                                            line_count,
+                                            index_io,
+                                            statement_indent,
+                                            statement,
+                                            imports,
+                                            import_count,
+                                            body);
+    }
+    if ((v3_startswith(statement, "let ") || v3_startswith(statement, "var ")) &&
+        v3_parse_binding_decl_meta(statement,
+                                   v3_startswith(statement, "let ") ? "let " : "var ",
+                                   name,
+                                   sizeof(name),
+                                   type_text,
+                                   sizeof(type_text))) {
+        local_slot = v3_wasm_find_local_slot_index(ctx, name);
+        return local_slot >= 0 &&
+               v3_wasm_append_u8(body, 0x41U) &&
+               v3_wasm_append_sleb_i32(body, 0) &&
+               v3_wasm_append_u8(body, 0x21U) &&
+               v3_wasm_append_uleb_u32(body, ctx->local_indices[local_slot]);
+    }
+    if ((v3_startswith(statement, "let ") || v3_startswith(statement, "var ")) &&
+        v3_parse_binding_meta(statement,
+                              v3_startswith(statement, "let ") ? "let " : "var ",
+                              name,
+                              sizeof(name),
+                              type_text,
+                              sizeof(type_text),
+                              expr,
+                              sizeof(expr))) {
+        local_slot = v3_wasm_find_local_slot_index(ctx, name);
+        return local_slot >= 0 &&
+               v3_wasm_emit_expr(plan, lowering, function, ctx, expr, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x21U) &&
+               v3_wasm_append_uleb_u32(body, ctx->local_indices[local_slot]);
+    }
+    if (v3_startswith(statement, "return ")) {
+        *terminated_out = true;
+        return v3_wasm_emit_expr(plan, lowering, function, ctx, statement + 7, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x0fU);
+    }
+    if (v3_parse_assignment_meta(statement, name, sizeof(name), expr, sizeof(expr))) {
+        local_slot = v3_wasm_find_local_slot_index(ctx, name);
+        return local_slot >= 0 &&
+               v3_wasm_emit_expr(plan, lowering, function, ctx, expr, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x21U) &&
+               v3_wasm_append_uleb_u32(body, ctx->local_indices[local_slot]);
+    }
+    if (!v3_wasm_emit_expr(plan, lowering, function, ctx, statement, imports, import_count, body)) {
+        return false;
+    }
+    if (allow_implicit_return) {
+        *terminated_out = true;
+        return v3_wasm_append_u8(body, 0x0fU);
+    }
+    return v3_wasm_append_u8(body, 0x1aU);
+}
+
+static bool v3_wasm_encode_function_body_generic(const V3SystemLinkPlanStub *plan,
+                                                 const V3LoweringPlanStub *lowering,
+                                                 const V3LoweredFunctionStub *function,
+                                                 const V3WasmImportStub *imports,
+                                                 size_t import_count,
+                                                 V3WasmBuffer *code_section) {
+    V3WasmFunctionContext ctx;
+    V3WasmBuffer body;
+    char **lines = NULL;
+    char *owned_lines = NULL;
+    size_t line_count = 0U;
+    size_t fn_line_index = 0U;
+    char param_names[CHENG_V3_CONST_MAX_BINDINGS][128];
+    size_t param_count = 0U;
+    char owned_path[PATH_MAX];
+    char inline_signature_body[8192];
+    bool has_inline_signature_body = false;
+    bool terminated = false;
+    if (!v3_wasm_prepare_function_context(plan, lowering, function, &ctx, NULL, NULL) ||
+        !v3_load_function_source_lines(function,
+                                       &lines,
+                                       &owned_lines,
+                                       &line_count,
+                                       &fn_line_index,
+                                       param_names,
+                                       &param_count,
+                                       owned_path)) {
+        return false;
+    }
+    v3_wasm_buffer_init(&body);
+    if (ctx.local_count > ctx.param_count) {
+        if (!v3_wasm_append_uleb_u32(&body, 1U) ||
+            !v3_wasm_append_uleb_u32(&body, (uint32_t)(ctx.local_count - ctx.param_count)) ||
+            !v3_wasm_append_u8(&body, 0x7fU)) {
+            goto fail;
+        }
+    } else if (!v3_wasm_append_u8(&body, 0x00U)) {
+        goto fail;
+    }
+    inline_signature_body[0] = '\0';
+    {
+        char signature_copy[8192];
+        char *eq;
+        snprintf(signature_copy, sizeof(signature_copy), "%s", lines[fn_line_index]);
+        eq = strrchr(signature_copy, '=');
+        if (eq != NULL) {
+            v3_trim_copy_text(eq + 1, inline_signature_body, sizeof(inline_signature_body));
+            has_inline_signature_body = inline_signature_body[0] != '\0';
+        }
+    }
+    if (has_inline_signature_body) {
+        if (!v3_wasm_emit_statement(plan,
+                                    lowering,
+                                    function,
+                                    &ctx,
+                                    NULL,
+                                    0U,
+                                    NULL,
+                                    0,
+                                    inline_signature_body,
+                                    imports,
+                                    import_count,
+                                    true,
+                                    &body,
+                                    &terminated)) {
+            goto fail;
+        }
+    } else {
+        size_t i;
+        for (i = fn_line_index + 1U; i < line_count; ) {
+            char raw_copy[4096];
+            char *trimmed;
+            int32_t indent;
+            char statement[8192];
+            bool allow_implicit_return = false;
+            snprintf(raw_copy, sizeof(raw_copy), "%s", lines[i]);
+            trimmed = v3_trim_inplace(raw_copy);
+            if (*trimmed == '\0') {
+                i += 1U;
+                continue;
+            }
+            indent = v3_line_indent(lines[i]);
+            if (indent <= 0 && v3_is_top_level_decl_start(trimmed)) {
+                break;
+            }
+            if (!v3_collect_statement_from_lines(lines, line_count, &i, statement, sizeof(statement))) {
+                goto fail;
+            }
+            if (terminated) {
+                continue;
+            }
+            allow_implicit_return = v3_is_last_logical_statement_in_function(lines, line_count, i);
+            if (!v3_wasm_emit_statement(plan,
+                                        lowering,
+                                        function,
+                                        &ctx,
+                                        lines,
+                                        line_count,
+                                        &i,
+                                        indent,
+                                        statement,
+                                        imports,
+                                        import_count,
+                                        allow_implicit_return,
+                                        &body,
+                                        &terminated)) {
+                goto fail;
+            }
+        }
+    }
+    if (!terminated ||
+        !v3_wasm_append_u8(&body, 0x0bU) ||
+        !v3_wasm_append_uleb_u32(code_section, (uint32_t)body.len) ||
+        !v3_wasm_append_bytes(code_section, body.data, body.len)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] wasm generic body fell through function=%s\n",
+                function->symbol_text);
+        goto fail;
+    }
+    v3_wasm_buffer_free(&body);
+    free(lines);
+    free(owned_lines);
+    return true;
+fail:
+    v3_wasm_buffer_free(&body);
+    free(lines);
+    free(owned_lines);
+    return false;
 }
 
 static int32_t v3_wasm_find_import_index(const V3WasmImportStub *imports,
@@ -29116,6 +31266,9 @@ static bool v3_wasm_resolve_external_noarg_i32_from_source_path(const V3SystemLi
             continue;
         }
         if (v3_importc_symbol_from_annotation(trimmed, pending_symbol, sizeof(pending_symbol))) {
+            continue;
+        }
+        if (pending_symbol[0] != '\0' && v3_is_annotation_line(trimmed)) {
             continue;
         }
         function_name[0] = '\0';
@@ -29192,6 +31345,9 @@ static bool v3_wasm_resolve_external_arg0_i32_from_source_path(const V3SystemLin
             continue;
         }
         if (v3_importc_symbol_from_annotation(trimmed, pending_symbol, sizeof(pending_symbol))) {
+            continue;
+        }
+        if (pending_symbol[0] != '\0' && v3_is_annotation_line(trimmed)) {
             continue;
         }
         function_name[0] = '\0';
@@ -29274,6 +31430,9 @@ static bool v3_wasm_resolve_external_i32_params_from_source_path(const V3SystemL
         if (v3_importc_symbol_from_annotation(trimmed, pending_symbol, sizeof(pending_symbol))) {
             continue;
         }
+        if (pending_symbol[0] != '\0' && v3_is_annotation_line(trimmed)) {
+            continue;
+        }
         function_name[0] = '\0';
         if (v3_importc_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
             matched_decl = true;
@@ -29327,10 +31486,10 @@ static bool v3_wasm_collect_imports(const V3SystemLinkPlanStub *plan,
     *import_count = 0U;
     for (i = 0; i < lowering->function_count; ++i) {
         const V3LoweredFunctionStub *function = &lowering->functions[i];
-        if (strcmp(function->return_abi_class, "i32") != 0 ||
+        if (!v3_wasm_abi_uses_i32_value(function->return_abi_class) ||
             function->param_count > 4U) {
             fprintf(stderr,
-                    "[cheng_v3_seed] wasm target only supports i32 functions with argc<=4 and i32 params today: %s abi=%s argc=%zu\n",
+                    "[cheng_v3_seed] wasm target only supports i32-value functions with argc<=4 today: %s abi=%s argc=%zu\n",
                     function->symbol_text,
                     function->return_abi_class,
                     function->param_count);
@@ -29339,9 +31498,9 @@ static bool v3_wasm_collect_imports(const V3SystemLinkPlanStub *plan,
         {
             size_t param_index;
             for (param_index = 0U; param_index < function->param_count; ++param_index) {
-                if (strcmp(function->param_abi_classes[param_index], "i32") != 0) {
+                if (!v3_wasm_abi_uses_i32_value(function->param_abi_classes[param_index])) {
                     fprintf(stderr,
-                            "[cheng_v3_seed] wasm target only supports i32 params today: %s param=%zu abi=%s\n",
+                            "[cheng_v3_seed] wasm target only supports i32-value params today: %s param=%zu abi=%s\n",
                             function->symbol_text,
                             param_index,
                             function->param_abi_classes[param_index]);
@@ -29495,12 +31654,22 @@ static bool v3_wasm_collect_imports(const V3SystemLinkPlanStub *plan,
             }
             continue;
         }
-        fprintf(stderr,
-                "[cheng_v3_seed] wasm target unsupported body kind function=%s body=%s first_line=%s\n",
-                function->symbol_text,
-                function->body_kind,
-                function->first_body_line);
-        return false;
+        {
+            V3WasmFunctionContext ctx;
+            if (!v3_wasm_prepare_function_context(plan,
+                                                  lowering,
+                                                  function,
+                                                  &ctx,
+                                                  imports,
+                                                  import_count)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] wasm generic prepare failed function=%s body=%s first_line=%s\n",
+                        function->symbol_text,
+                        function->body_kind,
+                        function->first_body_line);
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -29513,6 +31682,17 @@ static bool v3_wasm_encode_function_body(const V3SystemLinkPlanStub *plan,
                                          V3WasmBuffer *code_section) {
     V3WasmBuffer body;
     uint32_t callee_index = 0U;
+    if (strcmp(function->body_kind, "return_zero_i32") != 0 &&
+        strcmp(function->body_kind, "return_call_noarg_i32") != 0 &&
+        strcmp(function->body_kind, "return_call_arg0_i32") != 0 &&
+        strcmp(function->body_kind, "return_call_params_i32") != 0) {
+        return v3_wasm_encode_function_body_generic(plan,
+                                                    lowering,
+                                                    function,
+                                                    imports,
+                                                    import_count,
+                                                    code_section);
+    }
     v3_wasm_buffer_init(&body);
     if (!v3_wasm_append_u8(&body, 0x00U)) {
         v3_wasm_buffer_free(&body);
@@ -32279,6 +34459,7 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     const char *emit = v3_flag_value(argc, argv, "--emit");
     const char *target = v3_flag_value(argc, argv, "--target");
     const char *package_root_flag = v3_flag_value(argc, argv, "--root");
+    const char *link_input_path = v3_flag_value(argc, argv, "--link-input");
     char seen_paths[1][1];
     V3PlanPath seen[CHENG_V3_MAX_PLAN_PATHS];
     size_t seen_len = 0U;
@@ -32320,8 +34501,16 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     v3_package_id_from_root(plan->package_root, plan->package_id, sizeof(plan->package_id));
     v3_copy_text(plan->entry_path, sizeof(plan->entry_path), source_path);
     v3_copy_text(plan->output_path, sizeof(plan->output_path), out_path ? out_path : "");
+    v3_copy_text(plan->extra_link_input_path,
+                 sizeof(plan->extra_link_input_path),
+                 link_input_path != NULL ? link_input_path : "");
     v3_copy_text(plan->target_triple, sizeof(plan->target_triple), target);
     v3_copy_text(plan->emit_kind, sizeof(plan->emit_kind), emit);
+    if (plan->extra_link_input_path[0] != '\0' &&
+        !v3_path_exists_nonempty(plan->extra_link_input_path)) {
+        fprintf(stderr, "[cheng_v3_seed] explicit link input missing: %s\n", plan->extra_link_input_path);
+        return false;
+    }
     if (!v3_target_supports_requested_emit(plan->target_triple, plan->emit_kind)) {
         v3_plan_add_reason(plan, "target_codegen_not_supported");
     }
@@ -34550,6 +36739,9 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                 pending_importc = true;
                 continue;
             }
+            if (pending_importc && v3_is_annotation_line(trimmed)) {
+                continue;
+            }
             if (v3_importc_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
                 pending_importc = false;
                 continue;
@@ -34743,6 +36935,9 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             }
             if (v3_startswith(trimmed, "@importc")) {
                 pending_importc = true;
+                continue;
+            }
+            if (pending_importc && v3_is_annotation_line(trimmed)) {
                 continue;
             }
             if (v3_importc_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
@@ -35153,6 +37348,9 @@ static char *v3_system_link_plan_report(const V3BootstrapContract *contract,
     v3_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "output=%s", plan->output_path);
     v3_report_append(&out, &cap, &used, line);
+    snprintf(line, sizeof(line), "extra_link_input=%s",
+             plan->extra_link_input_path[0] != '\0' ? plan->extra_link_input_path : "-");
+    v3_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "target=%s", plan->target_triple);
     v3_report_append(&out, &cap, &used, line);
     snprintf(line, sizeof(line), "supported_targets=%s", v3_supported_seed_target_csv());
@@ -35200,7 +37398,7 @@ static char *v3_system_link_plan_report(const V3BootstrapContract *contract,
     v3_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     v3_report_append(&out, &cap, &used, line);
-    v3_report_append(&out, &cap, &used, "build_source_unit_count=23");
+    v3_report_append(&out, &cap, &used, "build_source_unit_count=22");
     v3_report_append(&out, &cap, &used, "link_mode=system_link");
     v3_report_append(&out, &cap, &used, "pipeline_stage=parser_stub_to_system_link_plan_stub");
     return out;
@@ -35520,7 +37718,7 @@ static int v3_cmd_status(int argc, char **argv) {
     puts("cheng_v3c");
     puts("version=v3.compiler_runtime.v1");
     puts("execution=argv_control_plane");
-    puts("bootstrap_mode=v3_seed");
+    puts("bootstrap_mode=v3_selfhost");
     printf("contract_target=%s\n", target);
     printf("supported_targets=%s\n", v3_supported_seed_target_csv());
     printf("target_support=%s\n", v3_target_support_state(target));
@@ -35538,7 +37736,6 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     char stage2_path[PATH_MAX];
     char output_path[PATH_MAX];
     char resolved[PATH_MAX];
-    char seed_source[PATH_MAX];
     const char *keys[] = {
         "compiler_entry_source",
         "compiler_runtime_source",
@@ -35557,10 +37754,8 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "runtime_core_runtime_source",
         "runtime_compiler_runtime_source",
         "runtime_debug_runtime_source",
-        "tooling_gate_source",
         "tooling_bootstrap_contract_source",
-        "backend_build_plan_source",
-        "tooling_build_driver_script"
+        "backend_build_plan_source"
     };
     const char *labels[] = {
         "compiler_entry_source",
@@ -35580,8 +37775,6 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "runtime_core_runtime_source",
         "runtime_compiler_runtime_source",
         "runtime_debug_runtime_source",
-        "tooling_source",
-        "tooling_source",
         "tooling_source",
         "tooling_source"
     };
@@ -35619,7 +37812,6 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     v3_contract_workspace_root(&contract, workspace_root, sizeof(workspace_root));
     v3_join_path(stage2_path, sizeof(stage2_path), workspace_root, "artifacts/v3_bootstrap/cheng.stage2");
     v3_join_path(output_path, sizeof(output_path), workspace_root, "artifacts/v3_backend_driver/cheng");
-    v3_join_path(seed_source, sizeof(seed_source), workspace_root, "v3/bootstrap/cheng_v3_seed.c");
     printf("target=%s\n", v3_contract_get(&contract, "target"));
     printf("supported_targets=%s\n", v3_supported_seed_target_csv());
     printf("target_support=%s\n", v3_target_support_state(v3_contract_get(&contract, "target")));
@@ -35630,20 +37822,23 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     printf("entry=%s\n", resolved);
     printf("output=%s\n", output_path);
     printf("source[0]=bootstrap_contract_source:%s\n", contract.source_path);
-    printf("source[1]=seed_source:%s\n", seed_source);
     for (i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
         if (manual_paths[i] != NULL) {
             v3_join_path(resolved, sizeof(resolved), workspace_root, manual_paths[i]);
         } else {
             v3_resolve_contract_path(&contract, keys[i], resolved, sizeof(resolved));
         }
-        printf("source[%zu]=%s:%s\n", i + 2U, labels[i], resolved);
+        printf("source[%zu]=%s:%s\n", i + 1U, labels[i], resolved);
     }
     v3_contract_free(&contract);
     return 0;
 }
 
 static int v3_cmd_bootstrap_bridge(int argc, char **argv);
+static bool v3_run_binary_capture_output(char *const argv_local[],
+                                         const char *log_path,
+                                         int *status_out);
+static bool v3_status_is_exit_code(int status, int code);
 
 static int v3_cmd_print_bootstrap(int argc, char **argv) {
     V3BootstrapPaths paths;
@@ -35670,13 +37865,12 @@ static int v3_cmd_print_bootstrap(int argc, char **argv) {
 static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
     V3BootstrapPaths paths;
     char lock_path[PATH_MAX];
+    char bootstrap_compiler[PATH_MAX];
     char *command = NULL;
-    char *quoted_cc = NULL;
     char *quoted_bin = NULL;
     char *quoted_in = NULL;
     char *quoted_out = NULL;
     char *quoted_report = NULL;
-    const char *cc = getenv("CC");
     size_t cap = PATH_MAX * 8U;
     bool lock_held = false;
     int rc = 1;
@@ -35686,9 +37880,6 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
     if (paths.root[0] == '\0') {
         fprintf(stderr, "[cheng_v3_seed] bootstrap root detect failed\n");
         return 1;
-    }
-    if (cc == NULL || cc[0] == '\0') {
-        cc = "cc";
     }
     if (!v3_mkdir_p(paths.out_dir)) {
         return 1;
@@ -35705,8 +37896,7 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
         rc = 0;
         goto done;
     }
-    if (access(paths.seed_source, R_OK) != 0 ||
-        access(paths.stage1_source, R_OK) != 0 ||
+    if (access(paths.stage1_source, R_OK) != 0 ||
         access(paths.compiler_entry_source, R_OK) != 0 ||
         access(paths.compiler_runtime_source, R_OK) != 0 ||
         access(paths.compiler_request_source, R_OK) != 0 ||
@@ -35714,23 +37904,16 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
         fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing source input under %s\n", paths.root);
         goto done;
     }
-    command = (char *)v3_xmalloc(cap);
-
-    quoted_cc = v3_shell_quote(cc);
-    quoted_in = v3_shell_quote(paths.seed_source);
-    quoted_out = v3_shell_quote(paths.stage0);
-    snprintf(command,
-             cap,
-             "%s -std=c11 -O2 -Wall -Wextra -pedantic %s -o %s",
-             quoted_cc,
-             quoted_in,
-             quoted_out);
-    free(quoted_cc);
-    free(quoted_in);
-    free(quoted_out);
-    if (!v3_run_shell_command_logged(command, paths.stage0_build_log, "bootstrap-bridge stage0_cc")) {
+    if (!v3_bootstrap_current_compiler_path(&paths, bootstrap_compiler, sizeof(bootstrap_compiler))) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing live bootstrap compiler\n");
         goto done;
     }
+    if (!v3_bootstrap_materialize_stage0(&paths, bootstrap_compiler)) {
+        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge failed to materialize stage0 from %s\n",
+                bootstrap_compiler);
+        goto done;
+    }
+    command = (char *)v3_xmalloc(cap);
     if (access(paths.stage0, X_OK) != 0) {
         fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing stage0: %s\n", paths.stage0);
         goto done;
@@ -35871,19 +38054,27 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     char log_path[PATH_MAX];
     char report_path[PATH_MAX];
     char compile_report_path[PATH_MAX];
-    char contract_log[PATH_MAX];
     char status_log[PATH_MAX];
     char plan_log[PATH_MAX];
-    char reference_contract_log[PATH_MAX];
+    char reference_plan_log[PATH_MAX];
+    char package_root[PATH_MAX];
+    char smoke_src[PATH_MAX];
+    char smoke_bin[PATH_MAX];
+    char smoke_compile_log[PATH_MAX];
+    char smoke_run_log[PATH_MAX];
+    char smoke_report_path[PATH_MAX];
     char *command = NULL;
     char *quoted_bin;
+    char *quoted_root;
     char *quoted_in;
     char *quoted_out;
     char *quoted_report;
+    char *run_argv[2];
     char *report_text = NULL;
-    size_t cap = PATH_MAX * 8U;
+    size_t cap = PATH_MAX * 10U;
     bool lock_held = false;
     int rc = 1;
+    int status = 0;
     (void)argc;
     (void)argv;
     v3_bootstrap_paths_init(&paths);
@@ -35891,7 +38082,8 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
         return 1;
     }
     v3_join_path(lock_path, sizeof(lock_path), paths.root, "artifacts/v3_backend_driver/.build_backend_driver_v3.lock");
-    if (access(paths.backend_driver_out, X_OK) == 0) {
+    if (access(paths.backend_driver_out, X_OK) == 0 &&
+        v3_backend_driver_ready(&paths)) {
         printf("v3 backend driver ok: %s\n", paths.backend_driver_out);
         return 0;
     }
@@ -35912,24 +38104,33 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.log");
     v3_join_path(report_path, sizeof(report_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.report.txt");
     v3_join_path(compile_report_path, sizeof(compile_report_path), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt");
-    v3_join_path(contract_log, sizeof(contract_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.contract.txt");
     v3_join_path(status_log, sizeof(status_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt");
     v3_join_path(plan_log, sizeof(plan_log), paths.root, "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt");
-    v3_join_path(reference_contract_log, sizeof(reference_contract_log), paths.root, "artifacts/v3_backend_driver/reference_stage3.contract.txt");
+    v3_join_path(reference_plan_log, sizeof(reference_plan_log), paths.root, "artifacts/v3_backend_driver/reference_stage3.plan.txt");
+    v3_join_path(package_root, sizeof(package_root), paths.root, "v3");
+    v3_join_path(smoke_src, sizeof(smoke_src), paths.root, "v3/src/tests/ordinary_zero_exit_fixture.cheng");
+    v3_join_path(smoke_bin, sizeof(smoke_bin), paths.root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest");
+    snprintf(smoke_report_path, sizeof(smoke_report_path), "%s.report.txt", smoke_bin);
+    v3_join_path(smoke_compile_log, sizeof(smoke_compile_log), paths.root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.compile.log");
+    v3_join_path(smoke_run_log, sizeof(smoke_run_log), paths.root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.run.log");
     command = (char *)v3_xmalloc(cap);
 
     quoted_bin = v3_shell_quote(paths.stage2);
-    quoted_in = v3_shell_quote(paths.stage1_source);
+    quoted_root = v3_shell_quote(package_root);
+    quoted_in = v3_shell_quote(paths.compiler_entry_source);
     quoted_out = v3_shell_quote(paths.backend_driver_out);
     quoted_report = v3_shell_quote(compile_report_path);
     snprintf(command,
              cap,
-             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
+             "%s system-link-exec --root:%s --in:%s --emit:exe --target:%s --out:%s --report-out:%s",
              quoted_bin,
+             quoted_root,
              quoted_in,
+             paths.target,
              quoted_out,
              quoted_report);
     free(quoted_bin);
+    free(quoted_root);
     free(quoted_in);
     free(quoted_out);
     free(quoted_report);
@@ -35938,15 +38139,6 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     }
     if (access(paths.backend_driver_out, X_OK) != 0) {
         fprintf(stderr, "[cheng_v3_seed] build-backend-driver missing output: %s\n", paths.backend_driver_out);
-        goto done;
-    }
-
-    quoted_bin = v3_shell_quote(paths.backend_driver_out);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, contract_log, "build-backend-driver print-contract")) {
         goto done;
     }
 
@@ -35965,24 +38157,56 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     }
 
     quoted_bin = v3_shell_quote(paths.stage3);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
+    snprintf(command, cap, "%s print-build-plan", quoted_bin);
     free(quoted_bin);
+    if (!v3_run_shell_command_logged(command, reference_plan_log, "build-backend-driver reference-stage3")) {
+        goto done;
+    }
+
+    if (!v3_build_plan_files_equal(plan_log, reference_plan_log)) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver plan drift vs stage3: %s\n", paths.backend_driver_out);
+        goto done;
+    }
+
+    quoted_bin = v3_shell_quote(paths.backend_driver_out);
+    quoted_root = v3_shell_quote(package_root);
+    quoted_in = v3_shell_quote(smoke_src);
+    quoted_out = v3_shell_quote(smoke_bin);
+    quoted_report = v3_shell_quote(smoke_report_path);
+    snprintf(command,
+             cap,
+             "%s system-link-exec --root:%s --in:%s --emit:exe --target:%s --out:%s --report-out:%s",
+             quoted_bin,
+             quoted_root,
+             quoted_in,
+             paths.target,
+             quoted_out,
+             quoted_report);
+    free(quoted_bin);
+    free(quoted_root);
     free(quoted_in);
-    if (!v3_run_shell_command_logged(command, reference_contract_log, "build-backend-driver reference-stage3")) {
+    free(quoted_out);
+    free(quoted_report);
+    if (!v3_run_shell_command_logged(command, smoke_compile_log, "build-backend-driver zero-exit compile")) {
+        goto done;
+    }
+    if (access(smoke_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver zero-exit smoke missing output: %s\n", smoke_bin);
+        goto done;
+    }
+    run_argv[0] = smoke_bin;
+    run_argv[1] = NULL;
+    if (!v3_run_binary_capture_output(run_argv, smoke_run_log, &status) ||
+        !v3_status_is_exit_code(status, 0)) {
+        fprintf(stderr, "[cheng_v3_seed] build-backend-driver zero-exit smoke failed log=%s\n", smoke_run_log);
         goto done;
     }
 
-    if (!v3_file_text_equal(contract_log, reference_contract_log)) {
-        fprintf(stderr, "[cheng_v3_seed] build-backend-driver contract drift vs stage3: %s\n", paths.backend_driver_out);
-        goto done;
-    }
-
-    report_text = (char *)v3_xmalloc(8192U);
+    report_text = (char *)v3_xmalloc(12288U);
     snprintf(report_text,
-             8192U,
+             12288U,
              "target=%s\n"
-             "bootstrap_kind=v3_seed\n"
+             "bootstrap_kind=v3_selfhost\n"
              "compiler_class=ordinary_compiler\n"
              "stage0_compiler=%s\n"
              "stage1_compiler=%s\n"
@@ -35994,10 +38218,15 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
              "planned_request_source=%s\n"
              "materialized_source=%s\n"
              "output=%s\n"
-             "contract_log=%s\n"
              "status_log=%s\n"
              "plan_log=%s\n"
-             "log=%s\n",
+             "reference_plan_log=%s\n"
+             "log=%s\n"
+             "zero_exit_smoke_source=%s\n"
+             "zero_exit_smoke_output=%s\n"
+             "zero_exit_smoke_report=%s\n"
+             "zero_exit_smoke_compile_log=%s\n"
+             "zero_exit_smoke_run_log=%s\n",
              paths.target,
              paths.stage0,
              paths.stage1,
@@ -36007,12 +38236,17 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
              paths.compiler_entry_source,
              paths.compiler_runtime_source,
              paths.compiler_request_source,
-             paths.stage1_source,
+             paths.compiler_entry_source,
              paths.backend_driver_out,
-             contract_log,
              status_log,
              plan_log,
-             log_path);
+             reference_plan_log,
+             log_path,
+             smoke_src,
+             smoke_bin,
+             smoke_report_path,
+             smoke_compile_log,
+             smoke_run_log);
     if (!v3_ensure_parent_dir(report_path) || !v3_write_text_file(report_path, report_text)) {
         fprintf(stderr, "[cheng_v3_seed] build-backend-driver failed to write report: %s\n", report_path);
         goto done;
@@ -36637,6 +38871,38 @@ static bool v3_expect_text_not_contains(const char *label, const char *text, con
     return false;
 }
 
+static bool v3_text_line_value(const char *text,
+                               const char *key,
+                               char *out,
+                               size_t cap) {
+    size_t key_len = strlen(key);
+    const char *cursor = text;
+    if (out == NULL || cap == 0U) {
+        return false;
+    }
+    out[0] = '\0';
+    if (text == NULL || key == NULL) {
+        return false;
+    }
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        if (len > key_len + 1U &&
+            strncmp(cursor, key, key_len) == 0 &&
+            cursor[key_len] == '=') {
+            size_t value_len = len - key_len - 1U;
+            if (value_len >= cap) {
+                value_len = cap - 1U;
+            }
+            memcpy(out, cursor + key_len + 1U, value_len);
+            out[value_len] = '\0';
+            return true;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    return false;
+}
+
 static bool v3_expect_file_exists_nonempty(const char *label, const char *path) {
     if (v3_path_exists_nonempty(path)) {
         return true;
@@ -36644,9 +38910,6 @@ static bool v3_expect_file_exists_nonempty(const char *label, const char *path) 
     fprintf(stderr, "[cheng_v3_seed] %s missing file: %s\n", label, path);
     return false;
 }
-
-static bool v3_status_is_exit_code(int status, int code);
-static char *v3_debug_object_report(const char *path);
 
 static bool v3_report_extract_symbol_name(const char *line,
                                           char *out,
@@ -36786,6 +39049,82 @@ static bool v3_expect_object_export_whitelist(const char *label,
     for (i = 0U; i < allowed_count; ++i) {
         if (!seen[i]) {
             fprintf(stderr, "[cheng_v3_seed] %s missing export: %s\n", label, allowed[i]);
+            ok = false;
+        }
+    }
+    free(seen);
+    free(report);
+    return ok;
+}
+
+static bool v3_expect_object_export_contract(const char *label,
+                                             const char *object_path,
+                                             const char *const *public_exports,
+                                             size_t public_export_count,
+                                             const char *internal_prefix) {
+    char *report = NULL;
+    const char *cursor;
+    bool *seen = NULL;
+    bool ok = true;
+    size_t export_count = 0U;
+    size_t i;
+    report = v3_debug_object_report(object_path);
+    if (report == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s failed to inspect object: %s\n", label, object_path);
+        return false;
+    }
+    seen = (bool *)v3_xmalloc(sizeof(bool) * public_export_count);
+    memset(seen, 0, sizeof(bool) * public_export_count);
+    cursor = report;
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        char line[PATH_MAX * 2];
+        size_t copy_len = len < sizeof(line) - 1U ? len : sizeof(line) - 1U;
+        memcpy(line, cursor, copy_len);
+        line[copy_len] = '\0';
+        if (v3_report_symbol_line_is_export(line)) {
+            char raw_name[PATH_MAX];
+            char normalized[PATH_MAX];
+            bool matched_public = false;
+            if (!v3_report_extract_symbol_name(line, raw_name, sizeof(raw_name))) {
+                fprintf(stderr, "[cheng_v3_seed] %s malformed symbol line: %s\n", label, line);
+                ok = false;
+                break;
+            }
+            v3_normalize_report_symbol_name(raw_name, normalized, sizeof(normalized));
+            for (i = 0U; i < public_export_count; ++i) {
+                if (strcmp(normalized, public_exports[i]) == 0) {
+                    if (seen[i]) {
+                        fprintf(stderr, "[cheng_v3_seed] %s duplicate export: %s\n", label, normalized);
+                        ok = false;
+                    }
+                    seen[i] = true;
+                    matched_public = true;
+                    break;
+                }
+            }
+            if (!matched_public &&
+                !(internal_prefix != NULL && internal_prefix[0] != '\0' &&
+                  v3_startswith(normalized, internal_prefix))) {
+                fprintf(stderr, "[cheng_v3_seed] %s unexpected export: %s (%s)\n", label, normalized, object_path);
+                ok = false;
+            }
+            export_count += 1U;
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+    if (ok && export_count < public_export_count) {
+        fprintf(stderr,
+                "[cheng_v3_seed] %s export count too small: expected_at_least=%zu actual=%zu\n",
+                label,
+                public_export_count,
+                export_count);
+        ok = false;
+    }
+    for (i = 0U; i < public_export_count; ++i) {
+        if (!seen[i]) {
+            fprintf(stderr, "[cheng_v3_seed] %s missing export: %s\n", label, public_exports[i]);
             ok = false;
         }
     }
@@ -36945,6 +39284,72 @@ static bool v3_spawn_binary_capture_output(char *const argv_local[],
         execv(argv_local[0], argv_local);
         perror("execv");
         _exit(127);
+    }
+    if (pid_out != NULL) {
+        *pid_out = pid;
+    }
+    return true;
+}
+
+static bool v3_spawn_binary_detached_logged(char *const argv_local[],
+                                            const char *log_path,
+                                            const char *pid_path,
+                                            pid_t *pid_out) {
+    pid_t pid;
+    int status = 0;
+    FILE *log_file = NULL;
+    FILE *null_file = NULL;
+    char pid_text[64];
+    if (pid_out != NULL) {
+        *pid_out = -1;
+    }
+    if (!v3_ensure_parent_dir(log_path) ||
+        !v3_ensure_parent_dir(pid_path)) {
+        return false;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return false;
+    }
+    if (pid == 0) {
+        signal(SIGHUP, SIG_IGN);
+        if (setsid() < 0) {
+            perror("setsid");
+            _exit(127);
+        }
+        null_file = fopen("/dev/null", "rb");
+        if (null_file == NULL) {
+            perror("fopen");
+            _exit(127);
+        }
+        log_file = fopen(log_path, "wb");
+        if (log_file == NULL) {
+            perror("fopen");
+            fclose(null_file);
+            _exit(127);
+        }
+        if (dup2(fileno(null_file), STDIN_FILENO) < 0 ||
+            dup2(fileno(log_file), STDOUT_FILENO) < 0 ||
+            dup2(fileno(log_file), STDERR_FILENO) < 0) {
+            perror("dup2");
+            fclose(log_file);
+            fclose(null_file);
+            _exit(127);
+        }
+        fclose(log_file);
+        fclose(null_file);
+        execv(argv_local[0], argv_local);
+        perror("execv");
+        _exit(127);
+    }
+    snprintf(pid_text, sizeof(pid_text), "%ld\n", (long)pid);
+    if (!v3_write_text_file(pid_path, pid_text)) {
+        kill(pid, SIGTERM);
+        if (waitpid(pid, &status, 0) < 0 && errno != ECHILD) {
+            perror("waitpid");
+        }
+        return false;
     }
     if (pid_out != NULL) {
         *pid_out = pid;
@@ -37206,6 +39611,143 @@ static bool v3_run_script_args_with_env(const char *root,
     return ok;
 }
 
+static bool v3_compile_host_fixture_with_backend_driver(const char *compiler_bin,
+                                                        const char *root_v3,
+                                                        const char *src_path,
+                                                        const char *out_bin,
+                                                        const char *log_path);
+static bool v3_leaf_prepare_backend_driver(V3BootstrapPaths *paths,
+                                           char *root_v3,
+                                           size_t root_v3_cap);
+static const char *v3_host_target_triple(void);
+
+static int v3_exec_binary_passthrough_with_env(const char *path,
+                                               size_t arg_count,
+                                               const char **args,
+                                               const char *env_key,
+                                               const char *env_value) {
+    char **argv_local;
+    size_t i;
+    if (path == NULL || path[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] missing binary for passthrough dispatch\n");
+        return 1;
+    }
+    argv_local = (char **)v3_xmalloc(sizeof(char *) * (arg_count + 2U));
+    argv_local[0] = (char *)path;
+    for (i = 0U; i < arg_count; ++i) {
+        argv_local[i + 1U] = (char *)(args[i] != NULL ? args[i] : "");
+    }
+    argv_local[arg_count + 1U] = NULL;
+    if (env_key != NULL && env_value != NULL && env_key[0] != '\0') {
+        setenv(env_key, env_value, 1);
+    }
+    execv(path, argv_local);
+    fprintf(stderr,
+            "[cheng_v3_seed] execv failed for passthrough=%s errno=%d\n",
+            path,
+            errno);
+    free(argv_local);
+    return 127;
+}
+
+static bool v3_r2c_prepare_controller_bin(V3BootstrapPaths *paths,
+                                          char *out_bin,
+                                          size_t out_bin_cap) {
+    char root_v3[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char compile_log[PATH_MAX];
+    char controller_source[PATH_MAX];
+    char controller_impl_source[PATH_MAX];
+    char path_source[PATH_MAX];
+    char program_argv_source[PATH_MAX];
+    char core_runtime_source[PATH_MAX];
+    char debug_runtime_source[PATH_MAX];
+    char program_support_source[PATH_MAX];
+    const char *inputs[8];
+    if (paths == NULL || out_bin == NULL || out_bin_cap == 0U) {
+        return false;
+    }
+    if (!v3_leaf_prepare_backend_driver(paths, root_v3, sizeof(root_v3))) {
+        return false;
+    }
+    v3_join_path(out_dir,
+                 sizeof(out_dir),
+                 paths->root,
+                 "artifacts/v3_r2c_react_v3_controller");
+    v3_join_path(out_bin, out_bin_cap, out_dir, "cheng");
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "build.compile.log");
+    v3_join_path(controller_source,
+                 sizeof(controller_source),
+                 paths->root,
+                 "v3/src/tooling/r2c_react_v3.cheng");
+    v3_join_path(controller_impl_source,
+                 sizeof(controller_impl_source),
+                 paths->root,
+                 "v3/src/tooling/r2c_react_v3_controller_main.cheng");
+    v3_join_path(path_source,
+                 sizeof(path_source),
+                 paths->root,
+                 "v3/src/tooling/path.cheng");
+    v3_join_path(program_argv_source,
+                 sizeof(program_argv_source),
+                 paths->root,
+                 "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng");
+#if defined(__APPLE__)
+        v3_join_path(core_runtime_source,
+                     sizeof(core_runtime_source),
+                     paths->root,
+                     "v3/src/runtime/core_runtime_provider_darwin_v3.cheng");
+#else
+        v3_join_path(core_runtime_source,
+                     sizeof(core_runtime_source),
+                     paths->root,
+                     "v3/src/runtime/core_runtime_provider_linux_v3.cheng");
+#endif
+    v3_join_path(debug_runtime_source,
+                 sizeof(debug_runtime_source),
+                 paths->root,
+                 "v3/src/runtime/debug_runtime_stub_v3.cheng");
+    v3_join_path(program_support_source,
+                 sizeof(program_support_source),
+                 paths->root,
+                 "v3/src/runtime/program_support_backend_v3.cheng");
+    inputs[0] = paths->backend_driver_out;
+    inputs[1] = controller_source;
+    inputs[2] = controller_impl_source;
+    inputs[3] = path_source;
+    inputs[4] = program_argv_source;
+    inputs[5] = core_runtime_source;
+    inputs[6] = debug_runtime_source;
+    inputs[7] = program_support_source;
+    if (access(out_bin, X_OK) == 0 &&
+        v3_output_is_fresh_against_inputs(out_bin, inputs, 8U)) {
+        return true;
+    }
+    if (!v3_mkdir_p(out_dir)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] failed to create r2c controller out-dir: %s\n",
+                out_dir);
+        return false;
+    }
+    if (!v3_compile_host_fixture_with_backend_driver(paths->backend_driver_out,
+                                                     root_v3,
+                                                     controller_source,
+                                                     out_bin,
+                                                     compile_log)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] failed to compile r2c controller log=%s\n",
+                compile_log);
+        return false;
+    }
+    if (access(out_bin, X_OK) != 0) {
+        fprintf(stderr,
+                "[cheng_v3_seed] missing r2c controller binary: %s\n",
+                out_bin);
+        return false;
+    }
+    return true;
+}
+
 static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv);
 static int v3_cmd_verify_debug_tools_impl(int argc, char **argv);
 static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv);
@@ -37239,12 +39781,14 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv);
 static int v3_cmd_run_chain_node_process_smoke_impl(int argc, char **argv);
 static int v3_cmd_run_chain_node_three_node_smoke_impl(int argc, char **argv);
 static int v3_cmd_run_tailnet_control_smoke_impl(int argc, char **argv);
+static int v3_cmd_run_v2_selfhost_gate_impl(int argc, char **argv);
 static int v3_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv);
 static int v3_cmd_run_migration_gate_impl(int argc, char **argv);
 static int v3_cmd_run_browser_webrtc_smokes_impl(int argc, char **argv);
 static bool v3_verify_runtime_fixture_output(const char *label,
                                              const char *fixture_path,
                                              const char *run_log_path,
+                                             const char *report_path,
                                              const char *message_substring,
                                              const char *reason_line,
                                              bool require_signal_fields);
@@ -37269,8 +39813,8 @@ static bool v3_run_fixture_smoke_direct(const char *suite_label,
 
 static int v3_cmd_r2c_react_v3_impl(int argc, char **argv) {
     V3BootstrapPaths paths;
-    char script_path[PATH_MAX];
     const char *controller_label = "cheng.stage3";
+    char controller_bin[PATH_MAX];
     const char **args;
     size_t arg_count;
     v3_bootstrap_paths_init(&paths);
@@ -37278,34 +39822,26 @@ static int v3_cmd_r2c_react_v3_impl(int argc, char **argv) {
         fprintf(stderr, "[cheng_v3_seed] r2c-react-v3 root detect failed\n");
         return 1;
     }
-    v3_join_path(script_path,
-                 sizeof(script_path),
-                 paths.root,
-                 "v3/experimental/r2c-react-v3/r2c-react-v3");
     if (strstr(argv[0] != NULL ? argv[0] : "", "/v3_backend_driver/") != NULL) {
         controller_label = "cheng.backend_driver";
     }
+    if (!v3_r2c_prepare_controller_bin(&paths, controller_bin, sizeof(controller_bin))) {
+        return 1;
+    }
+    setenv("CHENG_V3_ROOT", paths.root, 1);
     arg_count = argc > 2 ? (size_t)(argc - 2) : 0U;
-    args = arg_count > 0U ? (const char **)v3_xmalloc(sizeof(char *) * arg_count) : NULL;
-    {
+    args = (const char **)v3_xmalloc(sizeof(char *) * arg_count);
+    if (argc > 2) {
         int i;
         for (i = 2; i < argc; ++i) {
             args[(size_t)(i - 2)] = argv[i] != NULL ? argv[i] : "";
         }
     }
-    {
-        int exit_code = 0;
-        bool ok = v3_exec_sh_script(script_path,
-                                    arg_count,
-                                    args,
-                                    "R2C_REACT_V3_NO_STAGE3_HANDOFF",
-                                    "1",
-                                    "R2C_REACT_V3_CONTROLLER",
-                                    controller_label,
-                                    &exit_code);
-        free(args);
-        return ok ? 0 : (exit_code > 0 ? exit_code : 1);
-    }
+    return v3_exec_binary_passthrough_with_env(controller_bin,
+                                               arg_count,
+                                               args,
+                                               "R2C_REACT_V3_CONTROLLER",
+                                               controller_label);
 }
 
 static int v3_invoke_command_with_common_flags(V3SeedCommandFn fn,
@@ -37376,6 +39912,7 @@ static int v3_cmd_print_elf(int argc, char **argv);
 static int v3_cmd_print_asm(int argc, char **argv);
 static const char *v3_host_target_triple(void);
 static int v3_cmd_profile_report(int argc, char **argv);
+static int v3_cmd_crash_report(int argc, char **argv);
 static int v3_cmd_system_link_exec(int argc, char **argv);
 
 static int v3_invoke_profile_run(const char *contract_path,
@@ -37450,6 +39987,8 @@ static void v3_profile_log_error(const char *log_path, const char *message) {
     }
 }
 
+static void v3_profile_trim_line(char *line);
+
 static void v3_profile_report_path_from_raw(const char *raw_report_path,
                                             char *out,
                                             size_t cap) {
@@ -37467,6 +40006,119 @@ static void v3_profile_report_path_from_raw(const char *raw_report_path,
         return;
     }
     snprintf(out, cap, "%s.report.txt", raw_report_path);
+}
+
+static void v3_crash_report_path_from_raw(const char *raw_log_path,
+                                          char *out,
+                                          size_t cap) {
+    size_t len;
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (raw_log_path == NULL || raw_log_path[0] == '\0') {
+        return;
+    }
+    len = strlen(raw_log_path);
+    if (len > 8U && strcmp(raw_log_path + len - 8U, ".run.log") == 0) {
+        snprintf(out, cap, "%.*s.report.txt", (int)(len - 8U), raw_log_path);
+        return;
+    }
+    if (len > 8U && strcmp(raw_log_path + len - 8U, ".raw.txt") == 0) {
+        snprintf(out, cap, "%.*s.txt", (int)(len - 8U), raw_log_path);
+        return;
+    }
+    snprintf(out, cap, "%s.report.txt", raw_log_path);
+}
+
+static void v3_crash_log_error(const char *log_path, const char *message) {
+    if (log_path != NULL && log_path[0] != '\0') {
+        v3_ensure_parent_dir(log_path);
+        v3_write_text_file(log_path, message);
+    }
+}
+
+static bool v3_crash_report_raw_line_allowed(const char *line) {
+    if (line == NULL || line[0] == '\0') {
+        return false;
+    }
+    if (strncmp(line, "reason=", 7) == 0) return true;
+    if (strncmp(line, "regs pc=", 8) == 0) return true;
+    if (strncmp(line, "m#", 2) == 0) return true;
+    if (line[0] == '#' && line[1] >= '0' && line[1] <= '9') return true;
+    if (strncmp(line, "source_frames=", 14) == 0) return true;
+    return false;
+}
+
+static bool v3_crash_report_transform_raw(const char *raw_log_path,
+                                          const char *report_path,
+                                          const char *log_path) {
+    char *raw_text = NULL;
+    char *cursor = NULL;
+    char *line = NULL;
+    char *report = NULL;
+    size_t report_cap = 1024U;
+    size_t report_used = 0U;
+    char line_buf[PATH_MAX * 2];
+    bool header_seen = false;
+    bool saw_reason = false;
+    bool saw_regs = false;
+    bool saw_machine = false;
+    bool ok = false;
+    if (!v3_path_exists_nonempty(raw_log_path)) {
+        v3_crash_log_error(log_path, "v3 crash report: missing raw log\n");
+        return false;
+    }
+    if (!v3_ensure_parent_dir(report_path) || !v3_ensure_parent_dir(log_path)) {
+        return false;
+    }
+    raw_text = v3_read_file(raw_log_path);
+    if (raw_text == NULL) {
+        v3_crash_log_error(log_path, "v3 crash report: failed to read raw log\n");
+        goto done;
+    }
+    report = (char *)v3_xmalloc(report_cap);
+    report[0] = '\0';
+    cursor = raw_text;
+    while ((line = strsep(&cursor, "\n")) != NULL) {
+        v3_profile_trim_line(line);
+        if (line[0] == '\0') {
+            continue;
+        }
+        if (!header_seen) {
+            if (strcmp(line, "v3_crash_raw_v1") != 0) {
+                continue;
+            }
+            header_seen = true;
+            v3_report_append(&report, &report_cap, &report_used, "[cheng-v3] v3_crash_report_v1");
+            continue;
+        }
+        if (!v3_crash_report_raw_line_allowed(line)) {
+            continue;
+        }
+        snprintf(line_buf, sizeof(line_buf), "[cheng-v3] %s", line);
+        v3_report_append(&report, &report_cap, &report_used, line_buf);
+        if (strncmp(line, "reason=", 7) == 0) {
+            saw_reason = true;
+        } else if (strncmp(line, "regs pc=", 8) == 0) {
+            saw_regs = true;
+        } else if (strncmp(line, "m#", 2) == 0) {
+            saw_machine = true;
+        }
+    }
+    if (!header_seen || !saw_reason || !saw_regs || !saw_machine) {
+        v3_crash_log_error(log_path, "v3 crash report: invalid raw log\n");
+        goto done;
+    }
+    if (!v3_write_text_file(report_path, report)) {
+        v3_crash_log_error(log_path, "v3 crash report: failed to write report\n");
+        goto done;
+    }
+    ok = true;
+done:
+    free(report);
+    free(raw_text);
+    return ok;
 }
 
 static int v3_cmd_bootstrap_bridge(int argc, char **argv);
@@ -37811,6 +40463,59 @@ static int v3_cmd_c_ref(int argc, char **argv) {
     return 0;
 }
 
+static int v3_cmd_verify_tcp_bio_linux_regression_impl(void) {
+    char saved_chain_node_linux_artifact[64];
+    char saved_chain_node_run_self_test[64];
+    char *bio_same_person_argv[3];
+    const char *saved_env;
+    bool had_chain_node_linux_artifact = false;
+    bool had_chain_node_run_self_test = false;
+    puts("[v3 gate] tcp/bio/linux early regression: bio_same_person_smoke");
+    bio_same_person_argv[0] = "cheng_v3_seed";
+    bio_same_person_argv[1] = "run-host-smokes";
+    bio_same_person_argv[2] = "bio_same_person_smoke";
+    if (v3_cmd_run_host_smokes_impl(3, bio_same_person_argv) != 0) {
+        return 1;
+    }
+    saved_env = getenv("CHAIN_NODE_LINUX_ARTIFACT");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_chain_node_linux_artifact = true;
+        v3_copy_text(saved_chain_node_linux_artifact, sizeof(saved_chain_node_linux_artifact), saved_env);
+    }
+    saved_env = getenv("CHAIN_NODE_RUN_SELF_TEST");
+    if (saved_env != NULL && saved_env[0] != '\0') {
+        had_chain_node_run_self_test = true;
+        v3_copy_text(saved_chain_node_run_self_test, sizeof(saved_chain_node_run_self_test), saved_env);
+    }
+    setenv("CHAIN_NODE_LINUX_ARTIFACT", "exe", 1);
+    setenv("CHAIN_NODE_RUN_SELF_TEST", "0", 1);
+    puts("[v3 gate] tcp/bio/linux early regression: chain_node linux exe");
+    if (v3_cmd_build_chain_node_linux_impl(0, NULL) != 0) {
+        if (had_chain_node_linux_artifact) {
+            setenv("CHAIN_NODE_LINUX_ARTIFACT", saved_chain_node_linux_artifact, 1);
+        } else {
+            unsetenv("CHAIN_NODE_LINUX_ARTIFACT");
+        }
+        if (had_chain_node_run_self_test) {
+            setenv("CHAIN_NODE_RUN_SELF_TEST", saved_chain_node_run_self_test, 1);
+        } else {
+            unsetenv("CHAIN_NODE_RUN_SELF_TEST");
+        }
+        return 1;
+    }
+    if (had_chain_node_linux_artifact) {
+        setenv("CHAIN_NODE_LINUX_ARTIFACT", saved_chain_node_linux_artifact, 1);
+    } else {
+        unsetenv("CHAIN_NODE_LINUX_ARTIFACT");
+    }
+    if (had_chain_node_run_self_test) {
+        setenv("CHAIN_NODE_RUN_SELF_TEST", saved_chain_node_run_self_test, 1);
+    } else {
+        unsetenv("CHAIN_NODE_RUN_SELF_TEST");
+    }
+    return 0;
+}
+
 static int v3_cmd_slice_gate(int argc, char **argv) {
     V3BootstrapPaths paths;
     char baseline_path[PATH_MAX];
@@ -37905,6 +40610,13 @@ static int v3_cmd_slice_gate(int argc, char **argv) {
     }
     puts("[v3 gate] chain_node");
     if (v3_cmd_build_chain_node_impl(0, NULL) != 0) {
+        return 1;
+    }
+    puts("[v3 gate] v2 selfhost gate");
+    if (v3_cmd_run_v2_selfhost_gate_impl(0, NULL) != 0) {
+        return 1;
+    }
+    if (v3_cmd_verify_tcp_bio_linux_regression_impl() != 0) {
         return 1;
     }
     puts("[v3 gate] linux aarch64 object smokes");
@@ -38223,8 +40935,11 @@ static int v3_cmd_build_bft_state_machine_impl(int argc, char **argv) {
     const char *run_self_test_env = getenv("BFT_STATE_RUN_SELF_TEST");
     const char *host_target = v3_host_target_triple();
     char *run_argv[3];
+    char *run_text = NULL;
     int status = 0;
     bool run_self_test = false;
+    const char *build_inputs[2];
+    const char *run_inputs[3];
     if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
         return 1;
     }
@@ -38274,6 +40989,28 @@ static int v3_cmd_build_bft_state_machine_impl(int argc, char **argv) {
     } else {
         run_self_test = host_target[0] != '\0' && v3_streq(target_buf, host_target);
     }
+    build_inputs[0] = compiler_bin;
+    build_inputs[1] = src;
+    if (access(out_bin, X_OK) == 0 &&
+        v3_output_is_fresh_against_inputs(out_bin, build_inputs, 2U)) {
+        if (!run_self_test) {
+            printf("v3 bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
+            return 0;
+        }
+        run_inputs[0] = compiler_bin;
+        run_inputs[1] = src;
+        run_inputs[2] = out_bin;
+        if (access(run_log, R_OK) == 0 &&
+            v3_output_is_fresh_against_inputs(run_log, run_inputs, 3U)) {
+            run_text = v3_read_file(run_log);
+            if (run_text != NULL && strstr(run_text, "v3 bft_state_machine self-test ok") != NULL) {
+                fputs(run_text, stdout);
+                free(run_text);
+                return 0;
+            }
+            free(run_text);
+        }
+    }
     if (!run_self_test) {
         printf("v3 bft_state_machine: build ok target=%s out=%s\n", target_buf, out_bin);
         return 0;
@@ -38289,6 +41026,1733 @@ static int v3_cmd_build_bft_state_machine_impl(int argc, char **argv) {
     return v3_dump_file_stdout(run_log) ? 0 : 1;
 }
 
+typedef struct {
+    char local_deploy_dir[PATH_MAX];
+    char server_root[PATH_MAX];
+    char relay_root[PATH_MAX];
+    char server_ssh[256];
+    char relay_ssh[256];
+    char server_addr[256];
+    char app_id[256];
+    int proposal_port;
+    int commit_port;
+    int vote_port;
+    int state_port;
+    int proposer_interval_ms;
+    int follower_interval_ms;
+    int proposal_window_ms;
+    int vote_window_ms;
+    int commit_window_ms;
+    int default_max_txs;
+    int asset_id;
+    int alice_id;
+    int bob_id;
+    long long mint_amount;
+    long long transfer_amount;
+} V3BftDeployConfig;
+
+static void v3_bft_config_init(const V3BootstrapPaths *paths,
+                               V3BftDeployConfig *cfg) {
+    const char *value;
+    memset(cfg, 0, sizeof(*cfg));
+    v3_join_path(cfg->local_deploy_dir,
+                 sizeof(cfg->local_deploy_dir),
+                 paths->root,
+                 "artifacts/v3_bft_validator_deploy");
+    value = getenv("CHENG_V3_BFT_SERVER_ROOT");
+    snprintf(cfg->server_root,
+             sizeof(cfg->server_root),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "/root/cheng-lang-deploy");
+    value = getenv("CHENG_V3_BFT_RELAY_ROOT");
+    snprintf(cfg->relay_root,
+             sizeof(cfg->relay_root),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "/root/cheng-lang-deploy");
+    value = getenv("CHENG_V3_BFT_SERVER_SSH");
+    snprintf(cfg->server_ssh,
+             sizeof(cfg->server_ssh),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "root@64.176.84.12");
+    value = getenv("CHENG_V3_BFT_RELAY_SSH");
+    snprintf(cfg->relay_ssh,
+             sizeof(cfg->relay_ssh),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "dmit");
+    value = getenv("CHENG_V3_BFT_SERVER_ADDR");
+    snprintf(cfg->server_addr,
+             sizeof(cfg->server_addr),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "64.176.84.12");
+    value = getenv("CHENG_V3_BFT_APP_ID");
+    snprintf(cfg->app_id,
+             sizeof(cfg->app_id),
+             "%s",
+             value != NULL && value[0] != '\0' ? value : "cheng-bft-live-20260415");
+    value = getenv("CHENG_V3_BFT_PROPOSAL_PORT");
+    cfg->proposal_port = value != NULL && value[0] != '\0' ? atoi(value) : 42061;
+    value = getenv("CHENG_V3_BFT_COMMIT_PORT");
+    cfg->commit_port = value != NULL && value[0] != '\0' ? atoi(value) : 42062;
+    value = getenv("CHENG_V3_BFT_VOTE_PORT");
+    cfg->vote_port = value != NULL && value[0] != '\0' ? atoi(value) : 42063;
+    value = getenv("CHENG_V3_BFT_STATE_PORT");
+    cfg->state_port = value != NULL && value[0] != '\0' ? atoi(value) : 42064;
+    value = getenv("CHENG_V3_BFT_PROPOSER_INTERVAL_MS");
+    cfg->proposer_interval_ms = value != NULL && value[0] != '\0' ? atoi(value) : 20;
+    value = getenv("CHENG_V3_BFT_FOLLOWER_INTERVAL_MS");
+    cfg->follower_interval_ms = value != NULL && value[0] != '\0' ? atoi(value) : 20;
+    value = getenv("CHENG_V3_BFT_PROPOSAL_WINDOW_MS");
+    cfg->proposal_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
+    value = getenv("CHENG_V3_BFT_VOTE_WINDOW_MS");
+    cfg->vote_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
+    value = getenv("CHENG_V3_BFT_COMMIT_WINDOW_MS");
+    cfg->commit_window_ms = value != NULL && value[0] != '\0' ? atoi(value) : 1000;
+    value = getenv("CHENG_V3_BFT_DEFAULT_MAX_TXS");
+    cfg->default_max_txs = value != NULL && value[0] != '\0' ? atoi(value) : 128;
+    value = getenv("CHENG_V3_BFT_ASSET_ID");
+    cfg->asset_id = value != NULL && value[0] != '\0' ? atoi(value) : 7;
+    value = getenv("CHENG_V3_BFT_ALICE_ID");
+    cfg->alice_id = value != NULL && value[0] != '\0' ? atoi(value) : 1001;
+    value = getenv("CHENG_V3_BFT_BOB_ID");
+    cfg->bob_id = value != NULL && value[0] != '\0' ? atoi(value) : 2002;
+    value = getenv("CHENG_V3_BFT_MINT_AMOUNT");
+    cfg->mint_amount = value != NULL && value[0] != '\0' ? atoll(value) : 100LL;
+    value = getenv("CHENG_V3_BFT_TRANSFER_AMOUNT");
+    cfg->transfer_amount = value != NULL && value[0] != '\0' ? atoll(value) : 33LL;
+}
+
+static void v3_bft_remote_deploy_dir(const char *repo_root,
+                                     char *out,
+                                     size_t cap) {
+    v3_join_path(out, cap, repo_root, "artifacts/v3_bft_validator_deploy");
+}
+
+static void v3_bft_remote_bin(const char *repo_root,
+                              char *out,
+                              size_t cap) {
+    char temp[PATH_MAX];
+    v3_join_path(temp, sizeof(temp), repo_root, "artifacts/v3_bft_state_machine");
+    v3_join_path(temp, sizeof(temp), temp, "x86_64-unknown-linux-gnu");
+    v3_join_path(out, cap, temp, "bft_state_machine");
+}
+
+static void v3_bft_local_bin(const V3BootstrapPaths *paths,
+                             char *out,
+                             size_t cap) {
+    char temp[PATH_MAX];
+    v3_join_path(temp, sizeof(temp), paths->root, "artifacts/v3_bft_state_machine");
+    v3_join_path(out, cap, temp, "bft_state_machine");
+}
+
+static bool v3_bft_write_manifest(const V3BftDeployConfig *cfg) {
+    char manifest[PATH_MAX];
+    char text[2048];
+    v3_join_path(manifest, sizeof(manifest), cfg->local_deploy_dir, "deploy.env");
+    if (!v3_mkdir_p(cfg->local_deploy_dir)) {
+        return false;
+    }
+    snprintf(text,
+             sizeof(text),
+             "app_id=%s\n"
+             "server_ssh=%s\n"
+             "relay_ssh=%s\n"
+             "server_addr=%s\n"
+             "server_root=%s\n"
+             "relay_root=%s\n"
+             "local_deploy_dir=%s\n"
+             "proposal_port=%d\n"
+             "commit_port=%d\n"
+             "vote_port=%d\n"
+             "state_port=%d\n"
+             "proposer_interval_ms=%d\n"
+             "follower_interval_ms=%d\n"
+             "proposal_window_ms=%d\n"
+             "vote_window_ms=%d\n"
+             "commit_window_ms=%d\n"
+             "default_max_txs=%d\n"
+             "asset_id=%d\n"
+             "alice_id=%d\n"
+             "bob_id=%d\n"
+             "mint_amount=%lld\n"
+             "transfer_amount=%lld\n",
+             cfg->app_id,
+             cfg->server_ssh,
+             cfg->relay_ssh,
+             cfg->server_addr,
+             cfg->server_root,
+             cfg->relay_root,
+             cfg->local_deploy_dir,
+             cfg->proposal_port,
+             cfg->commit_port,
+             cfg->vote_port,
+             cfg->state_port,
+             cfg->proposer_interval_ms,
+             cfg->follower_interval_ms,
+             cfg->proposal_window_ms,
+             cfg->vote_window_ms,
+             cfg->commit_window_ms,
+             cfg->default_max_txs,
+             cfg->asset_id,
+             cfg->alice_id,
+             cfg->bob_id,
+             cfg->mint_amount,
+             cfg->transfer_amount);
+    return v3_write_text_file(manifest, text);
+}
+
+static bool v3_bft_run_local_shell(const char *command,
+                                   const char *log_path,
+                                   const char *label) {
+    return v3_run_shell_command_logged(command, log_path, label);
+}
+
+static bool v3_bft_run_remote_shell(const char *ssh_host,
+                                    const char *command,
+                                    const char *log_path,
+                                    const char *label) {
+    char *quoted_command;
+    char *remote;
+    const char *argv_local[6];
+    size_t remote_cap;
+    bool ok;
+    quoted_command = v3_shell_quote(command);
+    remote_cap = strlen(quoted_command) + 16U;
+    remote = (char *)v3_xmalloc(remote_cap);
+    snprintf(remote, remote_cap, "sh -lc %s", quoted_command);
+    argv_local[0] = "ssh";
+    argv_local[1] = "-n";
+    argv_local[2] = "-o";
+    argv_local[3] = "BatchMode=yes";
+    argv_local[4] = ssh_host;
+    argv_local[5] = remote;
+    ok = v3_run_command_logged_argv(6U, argv_local, log_path, label);
+    free(remote);
+    free(quoted_command);
+    return ok;
+}
+
+static bool v3_bft_run_local_argv(const char **args,
+                                  size_t arg_count,
+                                  const char *log_path,
+                                  const char *label) {
+    return v3_run_command_logged_argv(arg_count, args, log_path, label);
+}
+
+static bool v3_bft_run_local_argv_quiet(const char **args,
+                                        size_t arg_count,
+                                        const char *log_path,
+                                        const char *label) {
+    return v3_run_command_logged_argv_quiet(arg_count, args, log_path, label);
+}
+
+static bool v3_bft_run_remote_argv(const char *ssh_host,
+                                   const char **args,
+                                   size_t arg_count,
+                                   const char *log_path,
+                                   const char *label) {
+    const char *argv_remote[20];
+    size_t i;
+    if (arg_count + 5U >= sizeof(argv_remote) / sizeof(argv_remote[0])) {
+        fprintf(stderr, "[cheng_v3_seed] %s argv overflow\n", label);
+        return false;
+    }
+    argv_remote[0] = "ssh";
+    argv_remote[1] = "-n";
+    argv_remote[2] = "-o";
+    argv_remote[3] = "BatchMode=yes";
+    argv_remote[4] = ssh_host;
+    for (i = 0U; i < arg_count; ++i) {
+        argv_remote[i + 5U] = args[i];
+    }
+    argv_remote[arg_count + 5U] = NULL;
+    return v3_run_command_logged_argv(arg_count + 5U, argv_remote, log_path, label);
+}
+
+static bool v3_bft_run_remote_argv_quiet(const char *ssh_host,
+                                         const char **args,
+                                         size_t arg_count,
+                                         const char *log_path,
+                                         const char *label) {
+    const char *argv_remote[20];
+    size_t i;
+    if (arg_count + 5U >= sizeof(argv_remote) / sizeof(argv_remote[0])) {
+        return false;
+    }
+    argv_remote[0] = "ssh";
+    argv_remote[1] = "-n";
+    argv_remote[2] = "-o";
+    argv_remote[3] = "BatchMode=yes";
+    argv_remote[4] = ssh_host;
+    for (i = 0U; i < arg_count; ++i) {
+        argv_remote[i + 5U] = args[i];
+    }
+    argv_remote[arg_count + 5U] = NULL;
+    return v3_run_command_logged_argv_quiet(arg_count + 5U, argv_remote, log_path, label);
+}
+
+static bool v3_bft_rsync_repo(const char *root,
+                              const char *ssh_host,
+                              const char *remote_root,
+                              const char *log_path) {
+    const char *argv_rsync[16];
+    char src[PATH_MAX];
+    char dst[PATH_MAX + 256];
+    snprintf(src, sizeof(src), "%s/", root);
+    snprintf(dst, sizeof(dst), "%s:%s/", ssh_host, remote_root);
+    argv_rsync[0] = "rsync";
+    argv_rsync[1] = "-az";
+    argv_rsync[2] = "--delete";
+    argv_rsync[3] = "--exclude";
+    argv_rsync[4] = ".git";
+    argv_rsync[5] = "--exclude";
+    argv_rsync[6] = "artifacts";
+    argv_rsync[7] = "--exclude";
+    argv_rsync[8] = "chengcache";
+    argv_rsync[9] = "--exclude";
+    argv_rsync[10] = "node_modules";
+    argv_rsync[11] = src;
+    argv_rsync[12] = dst;
+    argv_rsync[13] = NULL;
+    return v3_run_command_logged_argv(13U, argv_rsync, log_path, "bft_rsync");
+}
+
+static bool v3_bft_build_remote_x86_state_machine(const char *ssh_host,
+                                                  const char *remote_root,
+                                                  const char *log_path,
+                                                  const char *label) {
+    char remote_root_v3[PATH_MAX];
+    char remote_src[PATH_MAX];
+    char remote_seed_source[PATH_MAX];
+    char remote_seed_runner[PATH_MAX];
+    char remote_backend_driver[PATH_MAX];
+    char remote_out_dir[PATH_MAX];
+    char remote_out_bin[PATH_MAX];
+    char *quoted_root = NULL;
+    char *quoted_root_v3 = NULL;
+    char *quoted_src = NULL;
+    char *quoted_seed_source = NULL;
+    char *quoted_seed_runner = NULL;
+    char *quoted_backend_driver = NULL;
+    char *quoted_out_dir = NULL;
+    char *quoted_out_bin = NULL;
+    char *command = NULL;
+    size_t cap;
+    bool ok;
+    if (ssh_host == NULL || ssh_host[0] == '\0' ||
+        remote_root == NULL || remote_root[0] == '\0' ||
+        log_path == NULL || log_path[0] == '\0' ||
+        label == NULL || label[0] == '\0') {
+        return false;
+    }
+    v3_join_path(remote_root_v3, sizeof(remote_root_v3), remote_root, "v3");
+    v3_join_path(remote_src, sizeof(remote_src), remote_root_v3, "src/project/bft_state_machine_main.cheng");
+    v3_join_path(remote_seed_source, sizeof(remote_seed_source), remote_root_v3, "bootstrap/cheng_v3_seed.c");
+    v3_join_path(remote_seed_runner, sizeof(remote_seed_runner), remote_root, "artifacts/v3_gate/cheng.remote_seed_runner");
+    v3_join_path(remote_backend_driver, sizeof(remote_backend_driver), remote_root, "artifacts/v3_backend_driver/cheng");
+    v3_join_path(remote_out_dir,
+                 sizeof(remote_out_dir),
+                 remote_root,
+                 "artifacts/v3_bft_state_machine/x86_64-unknown-linux-gnu");
+    v3_join_path(remote_out_bin, sizeof(remote_out_bin), remote_out_dir, "bft_state_machine");
+    quoted_root = v3_shell_quote(remote_root);
+    quoted_root_v3 = v3_shell_quote(remote_root_v3);
+    quoted_src = v3_shell_quote(remote_src);
+    quoted_seed_source = v3_shell_quote(remote_seed_source);
+    quoted_seed_runner = v3_shell_quote(remote_seed_runner);
+    quoted_backend_driver = v3_shell_quote(remote_backend_driver);
+    quoted_out_dir = v3_shell_quote(remote_out_dir);
+    quoted_out_bin = v3_shell_quote(remote_out_bin);
+    cap = strlen(quoted_root) +
+          strlen(quoted_root_v3) +
+          strlen(quoted_src) +
+          strlen(quoted_seed_source) +
+          strlen(quoted_seed_runner) * 2U +
+          strlen(quoted_backend_driver) * 2U +
+          strlen(quoted_out_dir) +
+          strlen(quoted_out_bin) +
+          2048U;
+    command = (char *)v3_xmalloc(cap);
+    snprintf(command,
+             cap,
+             "set -eu && cd %s && mkdir -p artifacts/v3_gate && lock_dir=artifacts/v3_gate/bft_remote_build.lock && lock_pid=\"$lock_dir/pid\" && while ! mkdir \"$lock_dir\" 2>/dev/null; do holder=\"\"; if [ -f \"$lock_pid\" ]; then holder=$(cat \"$lock_pid\" 2>/dev/null || true); fi; if [ -z \"$holder\" ] || ! kill -0 \"$holder\" 2>/dev/null; then rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true; continue; fi; sleep 0.1; done && printf '%%s\\n' \"$$\" > \"$lock_pid\" && trap 'rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true' EXIT INT TERM && cc -std=c11 -O2 -Wall -Wextra -pedantic %s -o %s && %s build-backend-driver && test -x %s && mkdir -p %s && %s system-link-exec --root:%s --in:%s --emit:exe --target:x86_64-unknown-linux-gnu --out:%s",
+             quoted_root,
+             quoted_seed_source,
+             quoted_seed_runner,
+             quoted_seed_runner,
+             quoted_backend_driver,
+             quoted_out_dir,
+             quoted_backend_driver,
+             quoted_root_v3,
+             quoted_src,
+             quoted_out_bin);
+    ok = v3_bft_run_remote_shell(ssh_host, command, log_path, label);
+    free(command);
+    free(quoted_root);
+    free(quoted_root_v3);
+    free(quoted_src);
+    free(quoted_seed_source);
+    free(quoted_seed_runner);
+    free(quoted_backend_driver);
+    free(quoted_out_dir);
+    free(quoted_out_bin);
+    return ok;
+}
+
+static bool v3_bft_copy_remote_file_via_local_scp(const char *src_ssh,
+                                                  const char *src_path,
+                                                  const char *dst_ssh,
+                                                  const char *dst_path,
+                                                  const char *log_path,
+                                                  const char *label) {
+    const char *argv_scp[7];
+    char src[PATH_MAX + 256];
+    char dst[PATH_MAX + 256];
+    if (src_ssh == NULL || src_ssh[0] == '\0' ||
+        src_path == NULL || src_path[0] == '\0' ||
+        dst_ssh == NULL || dst_ssh[0] == '\0' ||
+        dst_path == NULL || dst_path[0] == '\0' ||
+        log_path == NULL || log_path[0] == '\0' ||
+        label == NULL || label[0] == '\0') {
+        return false;
+    }
+    snprintf(src, sizeof(src), "%s:%s", src_ssh, src_path);
+    snprintf(dst, sizeof(dst), "%s:%s", dst_ssh, dst_path);
+    argv_scp[0] = "scp";
+    argv_scp[1] = "-3";
+    argv_scp[2] = "-q";
+    argv_scp[3] = "-B";
+    argv_scp[4] = src;
+    argv_scp[5] = dst;
+    argv_scp[6] = NULL;
+    return v3_run_command_logged_argv(6U, argv_scp, log_path, label);
+}
+
+static bool v3_bft_remote_allow_udp_port(const char *ssh_host,
+                                         int port,
+                                         const char *log_path,
+                                         const char *label) {
+    char command[4096];
+    if (ssh_host == NULL || ssh_host[0] == '\0' ||
+        port <= 0 ||
+        log_path == NULL || log_path[0] == '\0' ||
+        label == NULL || label[0] == '\0') {
+        return false;
+    }
+    snprintf(command,
+             sizeof(command),
+             "set -eu && port=%d && if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then ufw allow \"$port/udp\" >/dev/null 2>&1 || ufw allow \"$port/udp\"; exit 0; fi && if command -v iptables >/dev/null 2>&1; then if ! iptables -C INPUT -p udp --dport \"$port\" -j ACCEPT >/dev/null 2>&1; then iptables -I INPUT -p udp --dport \"$port\" -j ACCEPT; fi; exit 0; fi && if command -v nft >/dev/null 2>&1 && nft list table inet filter >/dev/null 2>&1; then if ! nft list ruleset 2>/dev/null | grep -q \"udp dport $port accept\"; then nft add rule inet filter input udp dport \"$port\" accept; fi; exit 0; fi && exit 0",
+             port);
+    return v3_bft_run_remote_shell(ssh_host, command, log_path, label);
+}
+
+static bool v3_bft_collect_local_status(const char *bin_path,
+                                        const char *state_path,
+                                        const V3BftDeployConfig *cfg,
+                                        bool quiet_failures,
+                                        const char *summary_log,
+                                        char *height_out,
+                                        size_t height_cap,
+                                        char *hash_out,
+                                        size_t hash_cap,
+                                        char *alice_out,
+                                        size_t alice_cap,
+                                        char *bob_out,
+                                        size_t bob_cap) {
+    const char *summary_argv[7];
+    char asset_arg[64];
+    char account_a_arg[64];
+    char account_b_arg[64];
+    char state_arg[PATH_MAX + 32];
+    char *summary_text;
+    snprintf(state_arg, sizeof(state_arg), "--state:%s", state_path);
+    snprintf(asset_arg, sizeof(asset_arg), "--asset:%d", cfg->asset_id);
+    snprintf(account_a_arg, sizeof(account_a_arg), "--account-a:%d", cfg->alice_id);
+    snprintf(account_b_arg, sizeof(account_b_arg), "--account-b:%d", cfg->bob_id);
+    summary_argv[0] = bin_path;
+    summary_argv[1] = "query-summary";
+    summary_argv[2] = state_arg;
+    summary_argv[3] = asset_arg;
+    summary_argv[4] = account_a_arg;
+    summary_argv[5] = account_b_arg;
+    summary_argv[6] = NULL;
+    if ((!quiet_failures
+             ? !v3_bft_run_local_argv(summary_argv, 6U, summary_log, "bft_local_summary")
+             : !v3_bft_run_local_argv_quiet(summary_argv, 6U, summary_log, "bft_local_summary"))) {
+        return false;
+    }
+    summary_text = v3_read_file(summary_log);
+    if (summary_text == NULL) {
+        free(summary_text);
+        return false;
+    }
+    v3_text_line_value(summary_text, "height", height_out, height_cap);
+    v3_text_line_value(summary_text, "app_hash", hash_out, hash_cap);
+    v3_text_line_value(summary_text, "balance_a", alice_out, alice_cap);
+    v3_text_line_value(summary_text, "balance_b", bob_out, bob_cap);
+    free(summary_text);
+    return height_out[0] != '\0' &&
+           hash_out[0] != '\0' &&
+           alice_out[0] != '\0' &&
+           bob_out[0] != '\0';
+}
+
+static bool v3_bft_collect_remote_status(const char *ssh_host,
+                                         const char *bin_path,
+                                         const char *state_path,
+                                         const V3BftDeployConfig *cfg,
+                                         bool quiet_failures,
+                                         const char *summary_log,
+                                         char *height_out,
+                                         size_t height_cap,
+                                         char *hash_out,
+                                         size_t hash_cap,
+                                         char *alice_out,
+                                         size_t alice_cap,
+                                         char *bob_out,
+                                         size_t bob_cap) {
+    const char *summary_args[7];
+    char asset_arg[64];
+    char account_a_arg[64];
+    char account_b_arg[64];
+    char state_arg[PATH_MAX + 32];
+    char *summary_text;
+    snprintf(state_arg, sizeof(state_arg), "--state:%s", state_path);
+    snprintf(asset_arg, sizeof(asset_arg), "--asset:%d", cfg->asset_id);
+    snprintf(account_a_arg, sizeof(account_a_arg), "--account-a:%d", cfg->alice_id);
+    snprintf(account_b_arg, sizeof(account_b_arg), "--account-b:%d", cfg->bob_id);
+    summary_args[0] = bin_path;
+    summary_args[1] = "query-summary";
+    summary_args[2] = state_arg;
+    summary_args[3] = asset_arg;
+    summary_args[4] = account_a_arg;
+    summary_args[5] = account_b_arg;
+    summary_args[6] = NULL;
+    if ((!quiet_failures
+             ? !v3_bft_run_remote_argv(ssh_host, summary_args, 6U, summary_log, "bft_remote_summary")
+             : !v3_bft_run_remote_argv_quiet(ssh_host, summary_args, 6U, summary_log, "bft_remote_summary"))) {
+        return false;
+    }
+    summary_text = v3_read_file(summary_log);
+    if (summary_text == NULL) {
+        free(summary_text);
+        return false;
+    }
+    v3_text_line_value(summary_text, "height", height_out, height_cap);
+    v3_text_line_value(summary_text, "app_hash", hash_out, hash_cap);
+    v3_text_line_value(summary_text, "balance_a", alice_out, alice_cap);
+    v3_text_line_value(summary_text, "balance_b", bob_out, bob_cap);
+    free(summary_text);
+    return height_out[0] != '\0' &&
+           hash_out[0] != '\0' &&
+           alice_out[0] != '\0' &&
+           bob_out[0] != '\0';
+}
+
+static void v3_bft_print_status_line(const char *name,
+                                     const char *height,
+                                     const char *hash,
+                                     const char *alice,
+                                     const char *bob) {
+    printf("node=%s\n", name);
+    printf("height=%s\n", height);
+    printf("app_hash=%s\n", hash);
+    printf("alice_balance=%s\n", alice);
+    printf("bob_balance=%s\n", bob);
+}
+
+static long long v3_bft_monotime_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0LL;
+    }
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static long long v3_bft_walltime_ms(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0) {
+        return 0LL;
+    }
+    return (long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L);
+}
+
+static bool v3_bft_remote_state_mtime_ms(const char *ssh_host,
+                                         const char *state_path,
+                                         const char *log_path,
+                                         const char *label,
+                                         long long *out_ms) {
+    char command[PATH_MAX + 256];
+    char value_buf[64];
+    char *text;
+    if (ssh_host == NULL || ssh_host[0] == '\0' ||
+        state_path == NULL || state_path[0] == '\0' ||
+        log_path == NULL || log_path[0] == '\0' ||
+        out_ms == NULL) {
+        return false;
+    }
+    snprintf(command,
+             sizeof(command),
+             "set -eu && test -f %s && printf 'mtime_ms=%%s000\\n' \"$(stat -c %%Y %s)\"",
+             state_path,
+             state_path);
+    if (!v3_bft_run_remote_shell(ssh_host, command, log_path, label)) {
+        return false;
+    }
+    text = v3_read_file(log_path);
+    if (text == NULL) {
+        return false;
+    }
+    if (!v3_text_line_value(text, "mtime_ms", value_buf, sizeof(value_buf))) {
+        free(text);
+        return false;
+    }
+    *out_ms = atoll(value_buf);
+    free(text);
+    return *out_ms > 0LL;
+}
+
+static void v3_bft_format_milli(long long value_milli,
+                                char *out,
+                                size_t cap) {
+    long long whole = value_milli / 1000LL;
+    long long frac = value_milli % 1000LL;
+    if (frac < 0) {
+        frac = -frac;
+    }
+    snprintf(out, cap, "%lld.%03lld", whole, frac);
+}
+
+static bool v3_bft_wait_cluster_state(const V3BftDeployConfig *cfg,
+                                      const char *server_bin,
+                                      const char *relay_bin,
+                                      const char *local_bin,
+                                      const char *server_state,
+                                      const char *relay_state,
+                                      const char *local_state,
+                                      const char *log_prefix,
+                                      const char *want_height,
+                                      const char *want_alice,
+                                      const char *want_bob,
+                                      char *server_height,
+                                      size_t server_height_cap,
+                                      char *server_hash,
+                                      size_t server_hash_cap,
+                                      char *server_alice,
+                                      size_t server_alice_cap,
+                                      char *server_bob,
+                                      size_t server_bob_cap,
+                                      char *relay_height,
+                                      size_t relay_height_cap,
+                                      char *relay_hash,
+                                      size_t relay_hash_cap,
+                                      char *relay_alice,
+                                      size_t relay_alice_cap,
+                                      char *relay_bob,
+                                      size_t relay_bob_cap,
+                                      char *local_height,
+                                      size_t local_height_cap,
+                                      char *local_hash,
+                                      size_t local_hash_cap,
+                                      char *local_alice,
+                                      size_t local_alice_cap,
+                                      char *local_bob,
+                                      size_t local_bob_cap) {
+    size_t attempt;
+    char server_summary_log[PATH_MAX];
+    char relay_summary_log[PATH_MAX];
+    char local_summary_log[PATH_MAX];
+    snprintf(server_summary_log, sizeof(server_summary_log), "%s.server.summary.log", log_prefix);
+    snprintf(relay_summary_log, sizeof(relay_summary_log), "%s.relay.summary.log", log_prefix);
+    snprintf(local_summary_log, sizeof(local_summary_log), "%s.local.summary.log", log_prefix);
+    for (attempt = 0U; attempt < 300U; ++attempt) {
+        if (v3_bft_collect_remote_status(cfg->server_ssh,
+                                         server_bin,
+                                         server_state,
+                                         cfg,
+                                         true,
+                                         server_summary_log,
+                                         server_height,
+                                         server_height_cap,
+                                         server_hash,
+                                         server_hash_cap,
+                                         server_alice,
+                                         server_alice_cap,
+                                         server_bob,
+                                         server_bob_cap) &&
+            v3_bft_collect_remote_status(cfg->relay_ssh,
+                                         relay_bin,
+                                         relay_state,
+                                         cfg,
+                                         true,
+                                         relay_summary_log,
+                                         relay_height,
+                                         relay_height_cap,
+                                         relay_hash,
+                                         relay_hash_cap,
+                                         relay_alice,
+                                         relay_alice_cap,
+                                         relay_bob,
+                                         relay_bob_cap) &&
+            v3_bft_collect_local_status(local_bin,
+                                        local_state,
+                                        cfg,
+                                        true,
+                                        local_summary_log,
+                                        local_height,
+                                        local_height_cap,
+                                        local_hash,
+                                        local_hash_cap,
+                                        local_alice,
+                                        local_alice_cap,
+                                        local_bob,
+                                        local_bob_cap) &&
+            strcmp(server_height, want_height) == 0 &&
+            strcmp(relay_height, want_height) == 0 &&
+            strcmp(local_height, want_height) == 0 &&
+            server_hash[0] != '\0' &&
+            strcmp(server_hash, relay_hash) == 0 &&
+            strcmp(server_hash, local_hash) == 0 &&
+            strcmp(server_alice, want_alice) == 0 &&
+            strcmp(relay_alice, want_alice) == 0 &&
+            strcmp(local_alice, want_alice) == 0 &&
+            strcmp(server_bob, want_bob) == 0 &&
+            strcmp(relay_bob, want_bob) == 0 &&
+            strcmp(local_bob, want_bob) == 0) {
+            return true;
+        }
+        usleep(200000);
+    }
+    return false;
+}
+
+static void v3_bft_expected_baseline(const V3BftDeployConfig *cfg,
+                                     char *height_out,
+                                     size_t height_cap,
+                                     char *alice_out,
+                                     size_t alice_cap,
+                                     char *bob_out,
+                                     size_t bob_cap) {
+    long long want_alice = 0LL;
+    long long want_bob = 0LL;
+    if (height_out != NULL && height_cap > 0U) {
+        snprintf(height_out, height_cap, "1");
+    }
+    if (cfg != NULL) {
+        want_alice = cfg->mint_amount - cfg->transfer_amount;
+        want_bob = cfg->transfer_amount;
+    }
+    if (alice_out != NULL && alice_cap > 0U) {
+        snprintf(alice_out, alice_cap, "%lld", want_alice);
+    }
+    if (bob_out != NULL && bob_cap > 0U) {
+        snprintf(bob_out, bob_cap, "%lld", want_bob);
+    }
+}
+
+static bool v3_bft_wait_cluster_baseline(const V3BftDeployConfig *cfg,
+                                         const char *server_bin,
+                                         const char *relay_bin,
+                                         const char *local_bin,
+                                         const char *server_state,
+                                         const char *relay_state,
+                                         const char *local_state,
+                                         const char *log_prefix,
+                                         char *server_height,
+                                         size_t server_height_cap,
+                                         char *server_hash,
+                                         size_t server_hash_cap,
+                                         char *server_alice,
+                                         size_t server_alice_cap,
+                                         char *server_bob,
+                                         size_t server_bob_cap,
+                                         char *relay_height,
+                                         size_t relay_height_cap,
+                                         char *relay_hash,
+                                         size_t relay_hash_cap,
+                                         char *relay_alice,
+                                         size_t relay_alice_cap,
+                                         char *relay_bob,
+                                         size_t relay_bob_cap,
+                                         char *local_height,
+                                         size_t local_height_cap,
+                                         char *local_hash,
+                                         size_t local_hash_cap,
+                                         char *local_alice,
+                                         size_t local_alice_cap,
+                                         char *local_bob,
+                                         size_t local_bob_cap) {
+    char want_height[64];
+    char want_alice[64];
+    char want_bob[64];
+    v3_bft_expected_baseline(cfg,
+                             want_height,
+                             sizeof(want_height),
+                             want_alice,
+                             sizeof(want_alice),
+                             want_bob,
+                             sizeof(want_bob));
+    return v3_bft_wait_cluster_state(cfg,
+                                     server_bin,
+                                     relay_bin,
+                                     local_bin,
+                                     server_state,
+                                     relay_state,
+                                     local_state,
+                                     log_prefix,
+                                     want_height,
+                                     want_alice,
+                                     want_bob,
+                                     server_height,
+                                     server_height_cap,
+                                     server_hash,
+                                     server_hash_cap,
+                                     server_alice,
+                                     server_alice_cap,
+                                     server_bob,
+                                     server_bob_cap,
+                                     relay_height,
+                                     relay_height_cap,
+                                     relay_hash,
+                                     relay_hash_cap,
+                                     relay_alice,
+                                     relay_alice_cap,
+                                     relay_bob,
+                                     relay_bob_cap,
+                                     local_height,
+                                     local_height_cap,
+                                     local_hash,
+                                     local_hash_cap,
+                                     local_alice,
+                                     local_alice_cap,
+                                     local_bob,
+                                     local_bob_cap);
+}
+
+static int v3_cmd_stop_bft_validator_three_node_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    V3BftDeployConfig cfg;
+    char server_dir[PATH_MAX];
+    char relay_dir[PATH_MAX];
+    char local_follower_pid[PATH_MAX];
+    char server_log[PATH_MAX];
+    char relay_log[PATH_MAX];
+    char local_log[PATH_MAX];
+    char command[4096];
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    v3_bft_config_init(&paths, &cfg);
+    v3_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
+    v3_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
+    v3_join_path(local_follower_pid, sizeof(local_follower_pid), cfg.local_deploy_dir, "local_follower.pid");
+    v3_join_path(server_log, sizeof(server_log), paths.root, "artifacts/v3_gate/bft_stop_server.log");
+    v3_join_path(relay_log, sizeof(relay_log), paths.root, "artifacts/v3_gate/bft_stop_relay.log");
+    v3_join_path(local_log, sizeof(local_log), paths.root, "artifacts/v3_gate/bft_stop_local.log");
+    snprintf(command,
+             sizeof(command),
+             "set -u ; for pid in %s/server_proposal.pid %s/server_commit.pid %s/server_vote.pid %s/server_state.pid %s/server_proposer.pid; do if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi; done ; pkill -f -- \"[p]roposal-serve-daemon --file:%s/server.proposal.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[c]ommit-serve-daemon --file:%s/server.commit.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[s]tate-serve-daemon --file:%s/server.machine.hex\" >/dev/null 2>&1 || true ; pkill -f -- \"[v]ote-capture-daemon --file:%s/server.votes\" >/dev/null 2>&1 || true ; pkill -f -- \"[v]alidator-proposer-daemon --state:%s/server.state\" >/dev/null 2>&1 || true",
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, server_log, "bft_stop_server")) {
+        return 1;
+    }
+    snprintf(command,
+             sizeof(command),
+             "set -u ; pid=%s/relay_follower.pid; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/relay.state\" >/dev/null 2>&1 || true",
+             relay_dir,
+             relay_dir);
+    if (!v3_bft_run_remote_shell(cfg.relay_ssh, command, relay_log, "bft_stop_relay")) {
+        return 1;
+    }
+    snprintf(command,
+             sizeof(command),
+             "set -u ; pid=%s; if [ -f \"$pid\" ]; then p=$(cat \"$pid\"); if [ -n \"$p\" ]; then kill \"$p\" >/dev/null 2>&1 || true; sleep 1; kill -9 \"$p\" >/dev/null 2>&1 || true; fi; rm -f \"$pid\"; fi ; pkill -f -- \"[v]alidator-follower-daemon --state:%s/local.state\" >/dev/null 2>&1 || true",
+             local_follower_pid,
+             cfg.local_deploy_dir);
+    if (!v3_bft_run_local_shell(command, local_log, "bft_stop_local")) {
+        return 1;
+    }
+    puts("v3 bft deploy: stopped");
+    return 0;
+}
+
+static int v3_cmd_status_bft_validator_three_node_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    V3BftDeployConfig cfg;
+    char server_dir[PATH_MAX];
+    char relay_dir[PATH_MAX];
+    char server_state[PATH_MAX];
+    char relay_state[PATH_MAX];
+    char local_state[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char relay_bin[PATH_MAX];
+    char local_bin[PATH_MAX];
+    char server_height[128];
+    char server_hash[128];
+    char server_alice[128];
+    char server_bob[128];
+    char relay_height[128];
+    char relay_hash[128];
+    char relay_alice[128];
+    char relay_bob[128];
+    char local_height[128];
+    char local_hash[128];
+    char local_alice[128];
+    char local_bob[128];
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    v3_bft_config_init(&paths, &cfg);
+    v3_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
+    v3_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
+    v3_join_path(server_state, sizeof(server_state), server_dir, "server.state");
+    v3_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
+    v3_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
+    v3_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
+    v3_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
+    v3_bft_local_bin(&paths, local_bin, sizeof(local_bin));
+    if (!v3_bft_collect_remote_status(cfg.server_ssh,
+                                      server_bin,
+                                      server_state,
+                                      &cfg,
+                                      false,
+                                      "artifacts/v3_gate/bft_server_status.summary.log",
+                                      server_height,
+                                      sizeof(server_height),
+                                      server_hash,
+                                      sizeof(server_hash),
+                                      server_alice,
+                                      sizeof(server_alice),
+                                      server_bob,
+                                      sizeof(server_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] status-bft-validator-three-node server failed\n");
+        return 1;
+    }
+    if (!v3_bft_collect_remote_status(cfg.relay_ssh,
+                                      relay_bin,
+                                      relay_state,
+                                      &cfg,
+                                      false,
+                                      "artifacts/v3_gate/bft_relay_status.summary.log",
+                                      relay_height,
+                                      sizeof(relay_height),
+                                      relay_hash,
+                                      sizeof(relay_hash),
+                                      relay_alice,
+                                      sizeof(relay_alice),
+                                      relay_bob,
+                                      sizeof(relay_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] status-bft-validator-three-node relay failed\n");
+        return 1;
+    }
+    if (!v3_bft_collect_local_status(local_bin,
+                                     local_state,
+                                     &cfg,
+                                     false,
+                                     "artifacts/v3_gate/bft_local_status.summary.log",
+                                     local_height,
+                                     sizeof(local_height),
+                                     local_hash,
+                                     sizeof(local_hash),
+                                     local_alice,
+                                     sizeof(local_alice),
+                                     local_bob,
+                                     sizeof(local_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] status-bft-validator-three-node local failed\n");
+        return 1;
+    }
+    v3_bft_print_status_line("server", server_height, server_hash, server_alice, server_bob);
+    puts("---");
+    v3_bft_print_status_line("relay", relay_height, relay_hash, relay_alice, relay_bob);
+    puts("---");
+    v3_bft_print_status_line("local", local_height, local_hash, local_alice, local_bob);
+    return 0;
+}
+
+static int v3_cmd_deploy_bft_validator_three_node_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    V3BftDeployConfig cfg;
+    char server_dir[PATH_MAX];
+    char relay_dir[PATH_MAX];
+    char server_state[PATH_MAX];
+    char relay_state[PATH_MAX];
+    char local_state[PATH_MAX];
+    char local_bin[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char relay_bin[PATH_MAX];
+    char log_path[PATH_MAX];
+    char command[16384];
+    char server_height[128];
+    char server_hash[128];
+    char server_alice[128];
+    char server_bob[128];
+    char relay_height[128];
+    char relay_hash[128];
+    char relay_alice[128];
+    char relay_bob[128];
+    char local_height[128];
+    char local_hash[128];
+    char local_alice[128];
+    char local_bob[128];
+    char local_follower_pid[PATH_MAX];
+    char local_follower_log[PATH_MAX];
+    char local_state_arg[PATH_MAX + 32];
+    char local_proposal_host_arg[128];
+    char local_proposal_port_arg[64];
+    char local_vote_host_arg[128];
+    char local_vote_port_arg[64];
+    char local_commit_host_arg[128];
+    char local_commit_port_arg[64];
+    char local_sync_host_arg[128];
+    char local_sync_port_arg[64];
+    char local_interval_arg[64];
+    char local_start_note[256];
+    char server_probe_cmd[PATH_MAX + 256];
+    char saved_bft_self_test[32];
+    pid_t local_pid = -1;
+    bool had_saved_bft_self_test = false;
+    char *local_follower_argv[13];
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    v3_bft_config_init(&paths, &cfg);
+    v3_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
+    v3_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
+    v3_join_path(server_state, sizeof(server_state), server_dir, "server.state");
+    v3_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
+    v3_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
+    v3_join_path(local_follower_pid, sizeof(local_follower_pid), cfg.local_deploy_dir, "local_follower.pid");
+    v3_join_path(local_follower_log, sizeof(local_follower_log), cfg.local_deploy_dir, "local.follower.log");
+    v3_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
+    v3_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
+    v3_bft_local_bin(&paths, local_bin, sizeof(local_bin));
+    if (!v3_bft_write_manifest(&cfg)) {
+        fprintf(stderr, "[cheng_v3_seed] deploy-bft-validator-three-node failed to write manifest\n");
+        return 1;
+    }
+    if (v3_cmd_stop_bft_validator_three_node_impl(argc, argv) != 0) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_sync_server.mkdir.log");
+    snprintf(command, sizeof(command), "set -eu && mkdir -p %s", cfg.server_root);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_sync_server_mkdir")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_sync_server.log");
+    if (!v3_bft_rsync_repo(paths.root, cfg.server_ssh, cfg.server_root, log_path)) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_sync_relay.mkdir.log");
+    snprintf(command, sizeof(command), "set -eu && mkdir -p %s", cfg.relay_root);
+    if (!v3_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_sync_relay_mkdir")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_sync_relay.log");
+    if (!v3_bft_rsync_repo(paths.root, cfg.relay_ssh, cfg.relay_root, log_path)) {
+        return 1;
+    }
+    v3_save_env_value("BFT_STATE_RUN_SELF_TEST",
+                      saved_bft_self_test,
+                      sizeof(saved_bft_self_test),
+                      &had_saved_bft_self_test);
+    setenv("BFT_STATE_RUN_SELF_TEST", "0", 1);
+    if (v3_cmd_build_bft_state_machine_impl(argc, argv) != 0) {
+        v3_restore_env_value("BFT_STATE_RUN_SELF_TEST", saved_bft_self_test, had_saved_bft_self_test);
+        return 1;
+    }
+    v3_restore_env_value("BFT_STATE_RUN_SELF_TEST", saved_bft_self_test, had_saved_bft_self_test);
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_build_relay.log");
+    if (!v3_bft_build_remote_x86_state_machine(cfg.relay_ssh,
+                                               cfg.relay_root,
+                                               log_path,
+                                               "bft_build_relay")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_prepare_server_bin_dir.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && mkdir -p %s/artifacts/v3_bft_state_machine/x86_64-unknown-linux-gnu",
+             cfg.server_root);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_prepare_server_bin_dir")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_copy_server_bin.log");
+    if (!v3_bft_copy_remote_file_via_local_scp(cfg.relay_ssh,
+                                               relay_bin,
+                                               cfg.server_ssh,
+                                               server_bin,
+                                               log_path,
+                                               "bft_copy_server_bin")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_open_server_proposal_udp.log");
+    if (!v3_bft_remote_allow_udp_port(cfg.server_ssh,
+                                      cfg.proposal_port,
+                                      log_path,
+                                      "bft_open_server_proposal_udp")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_open_server_vote_udp.log");
+    if (!v3_bft_remote_allow_udp_port(cfg.server_ssh,
+                                      cfg.vote_port,
+                                      log_path,
+                                      "bft_open_server_vote_udp")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_open_server_commit_udp.log");
+    if (!v3_bft_remote_allow_udp_port(cfg.server_ssh,
+                                      cfg.commit_port,
+                                      log_path,
+                                      "bft_open_server_commit_udp")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_open_server_state_udp.log");
+    if (!v3_bft_remote_allow_udp_port(cfg.server_ssh,
+                                      cfg.state_port,
+                                      log_path,
+                                      "bft_open_server_state_udp")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_init_server.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && mkdir -p %s && rm -f %s/server.proposal.ready %s/server.commit.ready %s/server.vote.ready %s/server.state.ready %s/server.state.vote_lock %s/server.queue.cursor %s/server.machine.hex %s/server_state.pid && rm -rf %s/server.machine.hex.snapshots && : > %s/server.queue && : > %s/server.proposal.hex && : > %s/server.commit.hex && : > %s/server.votes && %s init --state:%s/server.state --app-id:%s --validator-slot:1 --force",
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_dir,
+             server_bin,
+             server_dir,
+             cfg.app_id);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_init_server")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_init_relay.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && mkdir -p %s && rm -f %s/relay.state.vote_lock && %s init --state:%s/relay.state --app-id:%s --validator-slot:2 --force",
+             relay_dir,
+             relay_dir,
+             relay_bin,
+             relay_dir,
+             cfg.app_id);
+    if (!v3_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_init_relay")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_init_local.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && mkdir -p %s && rm -f %s.vote_lock && %s init --state:%s --app-id:%s --validator-slot:3 --force",
+             cfg.local_deploy_dir,
+             local_state,
+             local_bin,
+             local_state,
+             cfg.app_id);
+    if (!v3_bft_run_local_shell(command, log_path, "bft_init_local")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_seed_queue.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && %s submit-mint --queue:%s/server.queue --asset:%d --account:%d --amount:%lld && %s submit-transfer --queue:%s/server.queue --asset:%d --from:%d --to:%d --amount:%lld",
+             server_bin,
+             server_dir,
+             cfg.asset_id,
+             cfg.alice_id,
+             cfg.mint_amount,
+             server_bin,
+             server_dir,
+             cfg.asset_id,
+             cfg.alice_id,
+             cfg.bob_id,
+             cfg.transfer_amount);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_seed_queue")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_start_server_proposer.log");
+    command[0] = '\0';
+    v3_text_appendf(command,
+                    sizeof(command),
+                    "set -eu && rm -f %s/server.proposal.ready %s/server.commit.ready %s/server.vote.ready %s/server.state.ready %s/server_proposal.pid %s/server_commit.pid %s/server_proposer.pid %s/server_state.pid",
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir);
+    v3_text_appendf(command,
+                    sizeof(command),
+                    " && setsid -f sh -lc 'echo $$ > %s/server_proposal.pid && exec %s proposal-serve-daemon --file:%s/server.proposal.hex --host:0.0.0.0 --port:%d --ready-path:%s/server.proposal.ready --interval-ms:%d > %s/server.proposal.log 2>&1 < /dev/null'",
+                    server_dir,
+                    server_bin,
+                    server_dir,
+                    cfg.proposal_port,
+                    server_dir,
+                    cfg.follower_interval_ms,
+                    server_dir);
+    v3_text_appendf(command,
+                    sizeof(command),
+                    " && setsid -f sh -lc 'echo $$ > %s/server_commit.pid && exec %s commit-serve-daemon --file:%s/server.commit.hex --host:0.0.0.0 --port:%d --ready-path:%s/server.commit.ready --interval-ms:%d > %s/server.commit.log 2>&1 < /dev/null'",
+                    server_dir,
+                    server_bin,
+                    server_dir,
+                    cfg.commit_port,
+                    server_dir,
+                    cfg.follower_interval_ms,
+                    server_dir);
+    v3_text_appendf(command,
+                    sizeof(command),
+                    " && setsid -f sh -lc 'echo $$ > %s/server_proposer.pid && exec %s validator-proposer-daemon --state:%s/server.state --queue:%s/server.queue --proposal-host:0.0.0.0 --proposal-port:%d --vote-host:0.0.0.0 --vote-port:%d --commit-host:0.0.0.0 --commit-port:%d --proposal-file:%s/server.proposal.hex --commit-file:%s/server.commit.hex --state-sync-file:%s/server.machine.hex --proposal-ready-path:%s/server.proposal.ready --vote-ready-path:%s/server.vote.ready --commit-ready-path:%s/server.commit.ready --interval-ms:%d --proposal-window-ms:%d --vote-window-ms:%d --commit-window-ms:%d --max-txs:%d > %s/server.proposer.log 2>&1 < /dev/null'",
+                    server_dir,
+                    server_bin,
+                    server_dir,
+                    server_dir,
+                    cfg.proposal_port,
+                    cfg.vote_port,
+                    cfg.commit_port,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    cfg.proposer_interval_ms,
+                    0,
+                    cfg.vote_window_ms,
+                    0,
+                    (getenv("CHENG_V3_BFT_MAX_TXS") != NULL && getenv("CHENG_V3_BFT_MAX_TXS")[0] != '\0') ? atoi(getenv("CHENG_V3_BFT_MAX_TXS")) : cfg.default_max_txs,
+                    server_dir);
+    v3_text_appendf(command,
+                    sizeof(command),
+                    " && setsid -f sh -lc 'echo $$ > %s/server_state.pid && exec %s state-serve-daemon --file:%s/server.machine.hex --host:0.0.0.0 --port:%d --interval-ms:%d > %s/server.state.log 2>&1 < /dev/null'",
+                    server_dir,
+                    server_bin,
+                    server_dir,
+                    cfg.state_port,
+                    cfg.follower_interval_ms,
+                    server_dir);
+    v3_text_appendf(command,
+                    sizeof(command),
+                    " && i=0 && while { [ ! -f %s/server_proposal.pid ] || [ ! -f %s/server_commit.pid ] || [ ! -f %s/server_proposer.pid ] || [ ! -f %s/server_state.pid ]; } && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/server_proposal.pid && test -f %s/server_commit.pid && test -f %s/server_proposer.pid && test -f %s/server_state.pid",
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir,
+                    server_dir);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_start_server_proposer")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_probe_server_proposal.log");
+    snprintf(server_probe_cmd,
+             sizeof(server_probe_cmd),
+             "set -eu && %s probe-proposal --host:%s --port:%d --attempts:3 --interval-ms:100 --handshake-only:1",
+             local_bin,
+             cfg.server_addr,
+             cfg.proposal_port);
+    if (!v3_bft_run_local_shell(server_probe_cmd, log_path, "bft_probe_server_proposal")) {
+        (void)v3_cmd_stop_bft_validator_three_node_impl(argc, argv);
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_start_relay_follower.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && rm -f %s/relay_follower.pid && setsid -f sh -lc 'echo $$ > %s/relay_follower.pid && exec %s validator-follower-daemon --state:%s/relay.state --proposal-host:%s --proposal-port:%d --vote-host:%s --vote-port:%d --commit-host:%s --commit-port:%d --sync-host:%s --sync-port:%d --interval-ms:%d > %s/relay.follower.log 2>&1 < /dev/null' && i=0 && while [ ! -f %s/relay_follower.pid ] && [ \"$i\" -lt 50 ]; do i=$((i + 1)); sleep 0.1; done && test -f %s/relay_follower.pid",
+             relay_dir,
+             relay_dir,
+             relay_bin,
+             relay_dir,
+             cfg.server_addr,
+             cfg.proposal_port,
+             cfg.server_addr,
+             cfg.vote_port,
+             cfg.server_addr,
+             cfg.commit_port,
+             cfg.server_addr,
+             cfg.state_port,
+             cfg.follower_interval_ms,
+             relay_dir,
+             relay_dir,
+             relay_dir);
+    if (!v3_bft_run_remote_shell(cfg.relay_ssh, command, log_path, "bft_start_relay_follower")) {
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_start_local_follower.log");
+    unlink(local_follower_pid);
+    snprintf(local_state_arg, sizeof(local_state_arg), "--state:%s", local_state);
+    snprintf(local_proposal_host_arg, sizeof(local_proposal_host_arg), "--proposal-host:%s", cfg.server_addr);
+    snprintf(local_proposal_port_arg, sizeof(local_proposal_port_arg), "--proposal-port:%d", cfg.proposal_port);
+    snprintf(local_vote_host_arg, sizeof(local_vote_host_arg), "--vote-host:%s", cfg.server_addr);
+    snprintf(local_vote_port_arg, sizeof(local_vote_port_arg), "--vote-port:%d", cfg.vote_port);
+    snprintf(local_commit_host_arg, sizeof(local_commit_host_arg), "--commit-host:%s", cfg.server_addr);
+    snprintf(local_commit_port_arg, sizeof(local_commit_port_arg), "--commit-port:%d", cfg.commit_port);
+    snprintf(local_sync_host_arg, sizeof(local_sync_host_arg), "--sync-host:%s", cfg.server_addr);
+    snprintf(local_sync_port_arg, sizeof(local_sync_port_arg), "--sync-port:%d", cfg.state_port);
+    snprintf(local_interval_arg, sizeof(local_interval_arg), "--interval-ms:%d", cfg.follower_interval_ms);
+    local_follower_argv[0] = local_bin;
+    local_follower_argv[1] = "validator-follower-daemon";
+    local_follower_argv[2] = local_state_arg;
+    local_follower_argv[3] = local_proposal_host_arg;
+    local_follower_argv[4] = local_proposal_port_arg;
+    local_follower_argv[5] = local_vote_host_arg;
+    local_follower_argv[6] = local_vote_port_arg;
+    local_follower_argv[7] = local_commit_host_arg;
+    local_follower_argv[8] = local_commit_port_arg;
+    local_follower_argv[9] = local_sync_host_arg;
+    local_follower_argv[10] = local_sync_port_arg;
+    local_follower_argv[11] = local_interval_arg;
+    local_follower_argv[12] = NULL;
+    if (!v3_spawn_binary_detached_logged(local_follower_argv,
+                                         local_follower_log,
+                                         local_follower_pid,
+                                         &local_pid)) {
+        fprintf(stderr, "[cheng_v3_seed] bft_start_local_follower spawn failed log=%s pid=%s\n",
+                local_follower_log,
+                local_follower_pid);
+        return 1;
+    }
+    {
+        int spin;
+        bool alive = false;
+        for (spin = 0; spin < 50; ++spin) {
+            if (v3_process_alive(local_pid)) {
+                alive = true;
+                break;
+            }
+            usleep(100000);
+        }
+        if (!alive) {
+            fprintf(stderr, "[cheng_v3_seed] bft_start_local_follower died pid=%ld log=%s\n",
+                    (long)local_pid,
+                    local_follower_log);
+            return 1;
+        }
+    }
+    snprintf(local_start_note,
+             sizeof(local_start_note),
+             "pid=%ld\nlog=%s\n",
+             (long)local_pid,
+             local_follower_log);
+    if (!v3_write_text_file(log_path, local_start_note)) {
+        return 1;
+    }
+    if (!v3_bft_wait_cluster_baseline(&cfg,
+                                      server_bin,
+                                      relay_bin,
+                                      local_bin,
+                                      server_state,
+                                      relay_state,
+                                      local_state,
+                                      "artifacts/v3_gate/bft_wait_baseline",
+                                      server_height,
+                                      sizeof(server_height),
+                                      server_hash,
+                                      sizeof(server_hash),
+                                      server_alice,
+                                      sizeof(server_alice),
+                                      server_bob,
+                                      sizeof(server_bob),
+                                      relay_height,
+                                      sizeof(relay_height),
+                                      relay_hash,
+                                      sizeof(relay_hash),
+                                      relay_alice,
+                                      sizeof(relay_alice),
+                                      relay_bob,
+                                      sizeof(relay_bob),
+                                      local_height,
+                                      sizeof(local_height),
+                                      local_hash,
+                                      sizeof(local_hash),
+                                      local_alice,
+                                      sizeof(local_alice),
+                                      local_bob,
+                                      sizeof(local_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] deploy-bft-validator-three-node did not converge\n");
+        return 1;
+    }
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_ue_check.log");
+    snprintf(command,
+             sizeof(command),
+             "ps -Ao pid=,ppid=,state=,etime=,command= | awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'");
+    if (!v3_bft_run_local_shell(command, log_path, "bft_ue_check")) {
+        return 1;
+    }
+    {
+        char *ue_text = v3_read_file(log_path);
+        if (ue_text != NULL && ue_text[0] != '\0') {
+            fprintf(stderr, "[cheng_v3_seed] deploy-bft-validator-three-node unexpected UE process\n%s", ue_text);
+            free(ue_text);
+            return 1;
+        }
+        free(ue_text);
+    }
+    v3_bft_print_status_line("server", server_height, server_hash, server_alice, server_bob);
+    puts("---");
+    v3_bft_print_status_line("relay", relay_height, relay_hash, relay_alice, relay_bob);
+    puts("---");
+    v3_bft_print_status_line("local", local_height, local_hash, local_alice, local_bob);
+    return 0;
+}
+
+static int v3_cmd_bench_bft_validator_three_node_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    V3BftDeployConfig cfg;
+    const char *tx_count_text = v3_flag_value(argc, argv, "--tx-count");
+    const char *transfer_amount_text = v3_flag_value(argc, argv, "--transfer-amount");
+    const char *max_txs_text = v3_flag_value(argc, argv, "--max-txs-per-block");
+    int tx_count = tx_count_text != NULL && tx_count_text[0] != '\0' ? atoi(tx_count_text) : 256;
+    long long transfer_amount = transfer_amount_text != NULL && transfer_amount_text[0] != '\0' ? atoll(transfer_amount_text) : 1LL;
+    int max_txs_per_block = max_txs_text != NULL && max_txs_text[0] != '\0' ? atoi(max_txs_text) : tx_count;
+    char saved_max_txs_env[32];
+    bool had_saved_max_txs_env = false;
+    char server_dir[PATH_MAX];
+    char relay_dir[PATH_MAX];
+    char server_state[PATH_MAX];
+    char relay_state[PATH_MAX];
+    char local_state[PATH_MAX];
+    char server_bin[PATH_MAX];
+    char relay_bin[PATH_MAX];
+    char local_bin[PATH_MAX];
+    char log_path[PATH_MAX];
+    char command[16384];
+    char server_height[128];
+    char server_hash[128];
+    char server_alice[128];
+    char server_bob[128];
+    char relay_height[128];
+    char relay_hash[128];
+    char relay_alice[128];
+    char relay_bob[128];
+    char local_height[128];
+    char local_hash[128];
+    char local_alice[128];
+    char local_bob[128];
+    char want_height[64];
+    char want_alice[64];
+    char want_bob[64];
+    char tps_text[64];
+    char kib_text[64];
+    char queued_count_buf[64];
+    char queued_bytes_buf[64];
+    char tx_wire_bytes_buf[64];
+    char *bench_text = NULL;
+    char *ue_text = NULL;
+    long long base_height;
+    long long base_alice;
+    long long base_bob;
+    long long required_amount;
+    long long queued_count;
+    long long queued_bytes;
+    long long tx_wire_bytes;
+    long long blocks_needed;
+    long long start_ms;
+    long long server_end_ms;
+    long long relay_end_ms;
+    long long local_end_ms;
+    uint64_t local_end_ns;
+    long long elapsed_ms;
+    long long tps_milli;
+    long long bytes_per_sec;
+    long long kib_per_sec_milli;
+    long long topup_amount;
+    (void)argc;
+    (void)argv;
+    if (tx_count <= 0 || transfer_amount <= 0LL || max_txs_per_block <= 0) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node requires positive --tx-count --transfer-amount --max-txs-per-block\n");
+        return 1;
+    }
+    {
+        const char *saved_max_txs_env_ptr = getenv("CHENG_V3_BFT_MAX_TXS");
+        if (saved_max_txs_env_ptr != NULL && saved_max_txs_env_ptr[0] != '\0') {
+            snprintf(saved_max_txs_env, sizeof(saved_max_txs_env), "%s", saved_max_txs_env_ptr);
+            had_saved_max_txs_env = true;
+        }
+        char max_txs_env[32];
+        snprintf(max_txs_env, sizeof(max_txs_env), "%d", max_txs_per_block);
+        setenv("CHENG_V3_BFT_MAX_TXS", max_txs_env, 1);
+    }
+    if (v3_cmd_deploy_bft_validator_three_node_impl(argc, argv) != 0) {
+        if (had_saved_max_txs_env) {
+            setenv("CHENG_V3_BFT_MAX_TXS", saved_max_txs_env, 1);
+        } else {
+            unsetenv("CHENG_V3_BFT_MAX_TXS");
+        }
+        return 1;
+    }
+    if (had_saved_max_txs_env) {
+        setenv("CHENG_V3_BFT_MAX_TXS", saved_max_txs_env, 1);
+    } else {
+        unsetenv("CHENG_V3_BFT_MAX_TXS");
+    }
+    v3_bootstrap_paths_init(&paths);
+    v3_bft_config_init(&paths, &cfg);
+    v3_bft_remote_deploy_dir(cfg.server_root, server_dir, sizeof(server_dir));
+    v3_bft_remote_deploy_dir(cfg.relay_root, relay_dir, sizeof(relay_dir));
+    v3_join_path(server_state, sizeof(server_state), server_dir, "server.state");
+    v3_join_path(relay_state, sizeof(relay_state), relay_dir, "relay.state");
+    v3_join_path(local_state, sizeof(local_state), cfg.local_deploy_dir, "local.state");
+    v3_bft_remote_bin(cfg.server_root, server_bin, sizeof(server_bin));
+    v3_bft_remote_bin(cfg.relay_root, relay_bin, sizeof(relay_bin));
+    v3_bft_local_bin(&paths, local_bin, sizeof(local_bin));
+    if (!v3_bft_wait_cluster_baseline(&cfg,
+                                      server_bin,
+                                      relay_bin,
+                                      local_bin,
+                                      server_state,
+                                      relay_state,
+                                      local_state,
+                                      "artifacts/v3_gate/bft_bench_bootstrap_wait",
+                                      server_height,
+                                      sizeof(server_height),
+                                      server_hash,
+                                      sizeof(server_hash),
+                                      server_alice,
+                                      sizeof(server_alice),
+                                      server_bob,
+                                      sizeof(server_bob),
+                                      relay_height,
+                                      sizeof(relay_height),
+                                      relay_hash,
+                                      sizeof(relay_hash),
+                                      relay_alice,
+                                      sizeof(relay_alice),
+                                      relay_bob,
+                                      sizeof(relay_bob),
+                                      local_height,
+                                      sizeof(local_height),
+                                      local_hash,
+                                      sizeof(local_hash),
+                                      local_alice,
+                                      sizeof(local_alice),
+                                      local_bob,
+                                      sizeof(local_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node baseline wait failed\n");
+        return 1;
+    }
+    base_height = atoll(server_height);
+    base_alice = atoll(server_alice);
+    base_bob = atoll(server_bob);
+    required_amount = (long long)tx_count * transfer_amount;
+    if (base_alice < required_amount) {
+        topup_amount = required_amount - base_alice + transfer_amount;
+        v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_bench_topup.log");
+        snprintf(command,
+                 sizeof(command),
+                 "set -eu && %s submit-mint --queue:%s/server.queue --asset:%d --account:%d --amount:%lld",
+                 server_bin,
+                 server_dir,
+                 cfg.asset_id,
+                 cfg.alice_id,
+                 topup_amount);
+        if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_bench_topup")) {
+            return 1;
+        }
+        base_height += 1LL;
+        base_alice += topup_amount;
+        snprintf(want_height, sizeof(want_height), "%lld", base_height);
+        snprintf(want_alice, sizeof(want_alice), "%lld", base_alice);
+        snprintf(want_bob, sizeof(want_bob), "%lld", base_bob);
+        if (!v3_bft_wait_cluster_state(&cfg,
+                                       server_bin,
+                                       relay_bin,
+                                       local_bin,
+                                       server_state,
+                                       relay_state,
+                                       local_state,
+                                       "artifacts/v3_gate/bft_bench_topup_wait",
+                                       want_height,
+                                       want_alice,
+                                       want_bob,
+                                       server_height,
+                                       sizeof(server_height),
+                                       server_hash,
+                                       sizeof(server_hash),
+                                       server_alice,
+                                       sizeof(server_alice),
+                                       server_bob,
+                                       sizeof(server_bob),
+                                       relay_height,
+                                       sizeof(relay_height),
+                                       relay_hash,
+                                       sizeof(relay_hash),
+                                       relay_alice,
+                                       sizeof(relay_alice),
+                                       relay_bob,
+                                       sizeof(relay_bob),
+                                       local_height,
+                                       sizeof(local_height),
+                                       local_hash,
+                                       sizeof(local_hash),
+                                       local_alice,
+                                       sizeof(local_alice),
+                                       local_bob,
+                                       sizeof(local_bob))) {
+            fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node topup did not converge\n");
+            return 1;
+        }
+    }
+    start_ms = v3_bft_walltime_ms();
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_bench_submit_series.log");
+    snprintf(command,
+             sizeof(command),
+             "set -eu && %s submit-transfer-series --queue:%s/server.queue --asset:%d --from:%d --to:%d --amount:%lld --count:%d",
+             server_bin,
+             server_dir,
+             cfg.asset_id,
+             cfg.alice_id,
+             cfg.bob_id,
+             transfer_amount,
+             tx_count);
+    if (!v3_bft_run_remote_shell(cfg.server_ssh, command, log_path, "bft_bench_submit_series")) {
+        return 1;
+    }
+    bench_text = v3_read_file(log_path);
+    if (bench_text == NULL ||
+        !v3_text_line_value(bench_text, "queued_count", queued_count_buf, sizeof(queued_count_buf)) ||
+        !v3_text_line_value(bench_text, "queued_bytes", queued_bytes_buf, sizeof(queued_bytes_buf)) ||
+        !v3_text_line_value(bench_text, "tx_wire_bytes", tx_wire_bytes_buf, sizeof(tx_wire_bytes_buf))) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node failed to parse submit series report\n");
+        free(bench_text);
+        return 1;
+    }
+    queued_count = atoll(queued_count_buf);
+    queued_bytes = atoll(queued_bytes_buf);
+    tx_wire_bytes = atoll(tx_wire_bytes_buf);
+    free(bench_text);
+    bench_text = NULL;
+    if (queued_count != (long long)tx_count || queued_bytes <= 0LL || tx_wire_bytes <= 0LL) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node invalid submit series report\n");
+        return 1;
+    }
+    blocks_needed = (queued_count + (long long)max_txs_per_block - 1LL) / (long long)max_txs_per_block;
+    snprintf(want_height, sizeof(want_height), "%lld", base_height + blocks_needed);
+    snprintf(want_alice, sizeof(want_alice), "%lld", base_alice - required_amount);
+    snprintf(want_bob, sizeof(want_bob), "%lld", base_bob + required_amount);
+    if (!v3_bft_wait_cluster_state(&cfg,
+                                   server_bin,
+                                   relay_bin,
+                                   local_bin,
+                                   server_state,
+                                   relay_state,
+                                   local_state,
+                                   "artifacts/v3_gate/bft_bench_final_wait",
+                                   want_height,
+                                   want_alice,
+                                   want_bob,
+                                   server_height,
+                                   sizeof(server_height),
+                                   server_hash,
+                                   sizeof(server_hash),
+                                   server_alice,
+                                   sizeof(server_alice),
+                                   server_bob,
+                                   sizeof(server_bob),
+                                   relay_height,
+                                   sizeof(relay_height),
+                                   relay_hash,
+                                   sizeof(relay_hash),
+                                   relay_alice,
+                                   sizeof(relay_alice),
+                                   relay_bob,
+                                   sizeof(relay_bob),
+                                   local_height,
+                                   sizeof(local_height),
+                                   local_hash,
+                                   sizeof(local_hash),
+                                   local_alice,
+                                   sizeof(local_alice),
+                                   local_bob,
+                                   sizeof(local_bob))) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node did not converge\n");
+        return 1;
+    }
+    server_end_ms = 0LL;
+    relay_end_ms = 0LL;
+    local_end_ms = 0LL;
+    local_end_ns = 0ULL;
+    if (!v3_bft_remote_state_mtime_ms(cfg.server_ssh,
+                                      server_state,
+                                      "artifacts/v3_gate/bft_bench_server_mtime.log",
+                                      "bft_bench_server_mtime",
+                                      &server_end_ms) ||
+        !v3_bft_remote_state_mtime_ms(cfg.relay_ssh,
+                                      relay_state,
+                                      "artifacts/v3_gate/bft_bench_relay_mtime.log",
+                                      "bft_bench_relay_mtime",
+                                      &relay_end_ms) ||
+        !v3_stat_mtime_ns(local_state, &local_end_ns)) {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node failed to read final commit time\n");
+        return 1;
+    }
+    local_end_ms = (long long)(local_end_ns / 1000000ULL);
+    elapsed_ms = server_end_ms;
+    if (relay_end_ms > elapsed_ms) {
+        elapsed_ms = relay_end_ms;
+    }
+    if (local_end_ms > elapsed_ms) {
+        elapsed_ms = local_end_ms;
+    }
+    elapsed_ms = elapsed_ms - start_ms;
+    if (elapsed_ms <= 0LL) {
+        elapsed_ms = 1LL;
+    }
+    tps_milli = queued_count * 1000000LL / elapsed_ms;
+    bytes_per_sec = queued_bytes * 1000LL / elapsed_ms;
+    kib_per_sec_milli = queued_bytes * 1000000LL / (elapsed_ms * 1024LL);
+    v3_bft_format_milli(tps_milli, tps_text, sizeof(tps_text));
+    v3_bft_format_milli(kib_per_sec_milli, kib_text, sizeof(kib_text));
+    v3_join_path(log_path, sizeof(log_path), paths.root, "artifacts/v3_gate/bft_bench_ue_check.log");
+    snprintf(command,
+             sizeof(command),
+             "ps -Ao pid=,ppid=,state=,etime=,command= | awk '$2==1 && $3 ~ /^U/ && $5 ~ /bft_state_machine/'");
+    if (!v3_bft_run_local_shell(command, log_path, "bft_bench_ue_check")) {
+        return 1;
+    }
+    ue_text = v3_read_file(log_path);
+    if (ue_text != NULL && ue_text[0] != '\0') {
+        fprintf(stderr, "[cheng_v3_seed] bench-bft-validator-three-node unexpected UE process\n%s", ue_text);
+        free(ue_text);
+        return 1;
+    }
+    free(ue_text);
+    printf("tx_count=%lld\n", queued_count);
+    printf("tx_wire_bytes=%lld\n", tx_wire_bytes);
+    printf("committed_bytes=%lld\n", queued_bytes);
+    printf("block_count=%lld\n", blocks_needed);
+    printf("elapsed_ms=%lld\n", elapsed_ms);
+    printf("tps=%s\n", tps_text);
+    printf("throughput_bytes_per_sec=%lld\n", bytes_per_sec);
+    printf("throughput_kib_per_sec=%s\n", kib_text);
+    printf("final_height=%s\n", server_height);
+    printf("app_hash=%s\n", server_hash);
+    printf("alice_balance=%s\n", server_alice);
+    printf("bob_balance=%s\n", server_bob);
+    return 0;
+}
+
 static int v3_cmd_build_panic_trace_impl(int argc, char **argv) {
     V3BootstrapPaths paths;
     char root_v3[PATH_MAX];
@@ -38298,8 +42762,12 @@ static int v3_cmd_build_panic_trace_impl(int argc, char **argv) {
     char line_map[PATH_MAX];
     char compile_log[PATH_MAX];
     char run_log[PATH_MAX];
+    char report_path[PATH_MAX];
+    char report_log[PATH_MAX];
+    char *report_text = NULL;
     char *run_argv[2];
     int status = 0;
+    int rc = 1;
     (void)argc;
     (void)argv;
     if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
@@ -38311,6 +42779,8 @@ static int v3_cmd_build_panic_trace_impl(int argc, char **argv) {
     snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
     v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_panic_fixture.compile.log");
     v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_panic_fixture.run.log");
+    v3_join_path(report_path, sizeof(report_path), out_dir, "ordinary_panic_fixture.report.txt");
+    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
     if (!v3_mkdir_p(out_dir) ||
         !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
         !v3_expect_file_exists_nonempty("build-panic-trace line-map", line_map) ||
@@ -38320,16 +42790,29 @@ static int v3_cmd_build_panic_trace_impl(int argc, char **argv) {
     run_argv[0] = out_bin;
     run_argv[1] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
-        v3_status_is_exit_code(status, 0) ||
-        !v3_verify_runtime_fixture_output("build-panic-trace",
+        v3_status_is_exit_code(status, 0)) {
+        return 1;
+    }
+    if (!v3_crash_report_transform_raw(run_log, report_path, report_log)) {
+        return 1;
+    }
+    if (!v3_verify_runtime_fixture_output("build-panic-trace",
                                           src,
                                           run_log,
+                                          report_path,
                                           "v3 panic fixture",
-                                          "[cheng-v3] reason=panic mode=backtrace",
+                                          "reason=panic mode=backtrace",
                                           false)) {
         return 1;
     }
-    return v3_dump_file_stdout(run_log) ? 0 : 1;
+    report_text = v3_read_file(report_path);
+    if (report_text == NULL) {
+        return 1;
+    }
+    fputs(report_text, stdout);
+    rc = 0;
+    free(report_text);
+    return rc;
 }
 
 static int v3_cmd_build_bounds_trace_impl(int argc, char **argv) {
@@ -38341,8 +42824,10 @@ static int v3_cmd_build_bounds_trace_impl(int argc, char **argv) {
     char line_map[PATH_MAX];
     char compile_log[PATH_MAX];
     char run_log[PATH_MAX];
+    char report_path[PATH_MAX];
+    char report_log[PATH_MAX];
     char *run_argv[2];
-    char *run_text = NULL;
+    char *report_text = NULL;
     int status = 0;
     int rc = 1;
     (void)argc;
@@ -38356,6 +42841,8 @@ static int v3_cmd_build_bounds_trace_impl(int argc, char **argv) {
     snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
     v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_bounds_trace_fixture.compile.log");
     v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
+    v3_join_path(report_path, sizeof(report_path), out_dir, "ordinary_bounds_trace_fixture.report.txt");
+    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
     if (!v3_mkdir_p(out_dir) ||
         !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
         !v3_expect_file_exists_nonempty("build-bounds-trace line-map", line_map)) {
@@ -38364,23 +42851,28 @@ static int v3_cmd_build_bounds_trace_impl(int argc, char **argv) {
     run_argv[0] = out_bin;
     run_argv[1] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
-        v3_status_is_exit_code(status, 0) ||
-        !v3_verify_runtime_fixture_output("build-bounds-trace",
+        v3_status_is_exit_code(status, 0)) {
+        return 1;
+    }
+    if (!v3_crash_report_transform_raw(run_log, report_path, report_log)) {
+        return 1;
+    }
+    if (!v3_verify_runtime_fixture_output("build-bounds-trace",
                                           src,
                                           run_log,
+                                          report_path,
                                           "[cheng] bounds check failed: idx=1 len=1",
-                                          "[cheng-v3] reason=bounds mode=backtrace",
+                                          "reason=bounds mode=backtrace",
                                           false)) {
         return 1;
     }
-    run_text = v3_read_file(run_log);
-    if (run_text == NULL ||
-        !v3_expect_text_contains("build-bounds-trace", run_text, "ordinary_bounds_trace_fixture")) {
-        free(run_text);
+    report_text = v3_read_file(report_path);
+    if (report_text == NULL) {
         return 1;
     }
-    free(run_text);
-    rc = v3_dump_file_stdout(run_log) ? 0 : 1;
+    fputs(report_text, stdout);
+    rc = 0;
+    free(report_text);
     return rc;
 }
 
@@ -38393,8 +42885,12 @@ static int v3_cmd_build_signal_trace_impl(int argc, char **argv) {
     char line_map[PATH_MAX];
     char compile_log[PATH_MAX];
     char run_log[PATH_MAX];
+    char report_path[PATH_MAX];
+    char report_log[PATH_MAX];
+    char *report_text = NULL;
     char *run_argv[2];
     int status = 0;
+    int rc = 1;
     (void)argc;
     (void)argv;
     if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
@@ -38406,6 +42902,8 @@ static int v3_cmd_build_signal_trace_impl(int argc, char **argv) {
     snprintf(line_map, sizeof(line_map), "%s.v3.map", out_bin);
     v3_join_path(compile_log, sizeof(compile_log), out_dir, "ordinary_signal_trace_fixture.compile.log");
     v3_join_path(run_log, sizeof(run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
+    v3_join_path(report_path, sizeof(report_path), out_dir, "ordinary_signal_trace_fixture.report.txt");
+    snprintf(report_log, sizeof(report_log), "%s.crash-report.log", report_path);
     if (!v3_mkdir_p(out_dir) ||
         !v3_compile_host_fixture_with_backend_driver(paths.backend_driver_out, root_v3, src, out_bin, compile_log) ||
         !v3_expect_file_exists_nonempty("build-signal-trace line-map", line_map)) {
@@ -38414,16 +42912,29 @@ static int v3_cmd_build_signal_trace_impl(int argc, char **argv) {
     run_argv[0] = out_bin;
     run_argv[1] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
-        v3_status_is_exit_code(status, 0) ||
-        !v3_verify_runtime_fixture_output("build-signal-trace",
+        v3_status_is_exit_code(status, 0)) {
+        return 1;
+    }
+    if (!v3_crash_report_transform_raw(run_log, report_path, report_log)) {
+        return 1;
+    }
+    if (!v3_verify_runtime_fixture_output("build-signal-trace",
                                           src,
                                           run_log,
-                                          "[cheng-v3] v3_crash_report_v1",
-                                          "[cheng-v3] reason=signal mode=signal",
+                                          report_path,
+                                          "v3_crash_raw_v1",
+                                          "reason=signal mode=signal",
                                           true)) {
         return 1;
     }
-    return v3_dump_file_stdout(run_log) ? 0 : 1;
+    report_text = v3_read_file(report_path);
+    if (report_text == NULL) {
+        return 1;
+    }
+    fputs(report_text, stdout);
+    rc = 0;
+    free(report_text);
+    return rc;
 }
 
 static int v3_cmd_build_ffi_handle_impl(int argc, char **argv) {
@@ -39342,16 +43853,19 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
     char out_zero[PATH_MAX];
     char out_call[PATH_MAX];
     char out_importc[PATH_MAX];
+    char out_control[PATH_MAX];
     char log_zero[PATH_MAX];
     char log_call[PATH_MAX];
     char log_importc[PATH_MAX];
+    char log_control[PATH_MAX];
     char src_zero[PATH_MAX];
     char src_call[PATH_MAX];
     char src_importc[PATH_MAX];
+    char src_control[PATH_MAX];
     const char *compiler_bin;
     const char *label;
     char *js_text;
-    char *run_argv[7];
+    char *run_argv[8];
     int status = 0;
     if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
         return 1;
@@ -39372,15 +43886,19 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
     v3_join_path(src_zero, sizeof(src_zero), paths.root, "v3/src/tests/wasm_zero_smoke.cheng");
     v3_join_path(src_call, sizeof(src_call), paths.root, "v3/src/tests/wasm_internal_call_smoke.cheng");
     v3_join_path(src_importc, sizeof(src_importc), paths.root, "v3/src/tests/wasm_importc_noarg_i32_smoke.cheng");
+    v3_join_path(src_control, sizeof(src_control), paths.root, "v3/src/tests/wasm_scalar_control_flow_smoke.cheng");
     snprintf(out_zero, sizeof(out_zero), "%s/wasm_zero_smoke.%s.wasm", out_dir, label);
     snprintf(out_call, sizeof(out_call), "%s/wasm_internal_call_smoke.%s.wasm", out_dir, label);
     snprintf(out_importc, sizeof(out_importc), "%s/wasm_importc_noarg_i32_smoke.%s.wasm", out_dir, label);
+    snprintf(out_control, sizeof(out_control), "%s/wasm_scalar_control_flow_smoke.%s.wasm", out_dir, label);
     snprintf(log_zero, sizeof(log_zero), "%s/wasm_zero_smoke.%s.compile.log", out_dir, label);
     snprintf(log_call, sizeof(log_call), "%s/wasm_internal_call_smoke.%s.compile.log", out_dir, label);
     snprintf(log_importc, sizeof(log_importc), "%s/wasm_importc_noarg_i32_smoke.%s.compile.log", out_dir, label);
+    snprintf(log_control, sizeof(log_control), "%s/wasm_scalar_control_flow_smoke.%s.compile.log", out_dir, label);
     if (!v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_zero, "exe", "wasm32-unknown-unknown", out_zero, log_zero, NULL) ||
         !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_call, "exe", "wasm32-unknown-unknown", out_call, log_call, NULL) ||
-        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_importc, "exe", "wasm32-unknown-unknown", out_importc, log_importc, NULL)) {
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_importc, "exe", "wasm32-unknown-unknown", out_importc, log_importc, NULL) ||
+        !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin, root_v3, src_control, "exe", "wasm32-unknown-unknown", out_control, log_control, NULL)) {
         return 1;
     }
     snprintf(js_path, sizeof(js_path), "%s/run_wasm_smokes.%s.js", out_dir, label);
@@ -39390,6 +43908,7 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
         "const outZero = process.argv[2];\n"
         "const outCall = process.argv[3];\n"
         "const outImportc = process.argv[4];\n"
+        "const outControl = process.argv[5];\n"
         "async function run(name, file, imports) {\n"
         "  const wasm = fs.readFileSync(file);\n"
         "  const { instance } = await WebAssembly.instantiate(wasm, imports);\n"
@@ -39401,6 +43920,7 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
         "  await run('wasm_zero_smoke', outZero, { env: {} });\n"
         "  await run('wasm_internal_call_smoke', outCall, { env: {} });\n"
         "  await run('wasm_importc_noarg_i32_smoke', outImportc, { env: { cheng_test_zero: () => 0 } });\n"
+        "  await run('wasm_scalar_control_flow_smoke', outControl, { env: {} });\n"
         "  console.log('v3 wasm smokes: ok');\n"
         "})().catch((err) => { console.error(err); process.exit(1); });\n");
     if (!v3_write_text_file(js_path, js_text)) {
@@ -39414,7 +43934,8 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
     run_argv[3] = out_zero;
     run_argv[4] = out_call;
     run_argv[5] = out_importc;
-    run_argv[6] = NULL;
+    run_argv[6] = out_control;
+    run_argv[7] = NULL;
     if (!v3_run_binary_capture_output(run_argv, js_log, &status) ||
         !v3_status_is_exit_code(status, 0)) {
         fprintf(stderr, "[cheng_v3_seed] run-wasm-smokes node failed log=%s\n", js_log);
@@ -39515,6 +44036,140 @@ static int v3_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv) {
         return 1;
     }
     return v3_dump_file_stdout(run_log) ? 0 : 1;
+}
+
+static int v3_cmd_run_v2_selfhost_gate_impl(int argc, char **argv) {
+    V3BootstrapPaths paths;
+    char compiler_bin[PATH_MAX];
+    char out_dir[PATH_MAX];
+    char program_out_dir[PATH_MAX];
+    char tooling_log[PATH_MAX];
+    char program_log[PATH_MAX];
+    char quic_report_path[PATH_MAX];
+    char msquic_report_path[PATH_MAX];
+    char *text = NULL;
+    char *quic_report_text = NULL;
+    char *msquic_report_text = NULL;
+    (void)argc;
+    (void)argv;
+    v3_bootstrap_paths_init(&paths);
+    if (paths.root[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] run-v2-selfhost-gate root detect failed\n");
+        return 1;
+    }
+    v3_join_path(compiler_bin, sizeof(compiler_bin), paths.root, "v2/artifacts/bootstrap/cheng_v2c");
+    if (access(compiler_bin, X_OK) != 0) {
+        fprintf(stderr, "[cheng_v3_seed] run-v2-selfhost-gate missing compiler: %s\n", compiler_bin);
+        return 1;
+    }
+    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v2_selfhost_gate");
+    v3_join_path(program_out_dir, sizeof(program_out_dir), out_dir, "program_selfhost");
+    if (!v3_mkdir_p(out_dir)) {
+        return 1;
+    }
+    v3_join_path(tooling_log, sizeof(tooling_log), out_dir, "tooling-selfhost-check.log");
+    if (!v3_run_command_logged_argv(6U,
+                                    (const char *[6]){ compiler_bin,
+                                                       "tooling-selfhost-check",
+                                                       "--root",
+                                                       "v2/examples",
+                                                       "--in",
+                                                       "v2/examples/network_distribution_module.cheng" },
+                                    tooling_log,
+                                    "run-v2-selfhost-gate tooling-selfhost-check")) {
+        return 1;
+    }
+    text = v3_read_file(tooling_log);
+    if (text == NULL ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate tooling", text, "tooling_selfhost_ok=1")) {
+        free(text);
+        return 1;
+    }
+    free(text);
+    text = NULL;
+    v3_join_path(program_log, sizeof(program_log), out_dir, "program-selfhost-check.log");
+    if (!v3_run_command_logged_argv(6U,
+                                    (const char *[6]){ compiler_bin,
+                                                       "program-selfhost-check",
+                                                       "--compiler",
+                                                       compiler_bin,
+                                                       "--out-dir",
+                                                       program_out_dir },
+                                    program_log,
+                                    "run-v2-selfhost-gate program-selfhost-check")) {
+        return 1;
+    }
+    text = v3_read_file(program_log);
+    if (text == NULL ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "program_selfhost_ok=1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_quic_tls_transport_ecdsa_smoke_ok=1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program",
+                                 text,
+                                 "stage2_quic_tls_transport_ecdsa_report_version=v2_network_smoke_report_v1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_quic_tls_transport_ecdsa_stage_total=12") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_msquic_chain_smoke_ok=1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program",
+                                 text,
+                                 "stage2_msquic_chain_report_version=v2_network_smoke_report_v1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_msquic_chain_stage_total=60") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_chain_node_process_shell_orchestration=0") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate program", text, "stage2_program_runtime_bridge_shell_exec_used=0")) {
+        free(text);
+        return 1;
+    }
+    if (!v3_text_line_value(text,
+                            "stage2_quic_tls_transport_ecdsa_report_path",
+                            quic_report_path,
+                            sizeof(quic_report_path)) ||
+        !v3_expect_file_exists_nonempty("run-v2-selfhost-gate quic report", quic_report_path)) {
+        free(text);
+        return 1;
+    }
+    if (!v3_text_line_value(text,
+                            "stage2_msquic_chain_report_path",
+                            msquic_report_path,
+                            sizeof(msquic_report_path)) ||
+        !v3_expect_file_exists_nonempty("run-v2-selfhost-gate msquic report", msquic_report_path)) {
+        free(text);
+        return 1;
+    }
+    quic_report_text = v3_read_file(quic_report_path);
+    msquic_report_text = v3_read_file(msquic_report_path);
+    if (quic_report_text == NULL ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate quic report",
+                                 quic_report_text,
+                                 "v2_network_smoke_report_v1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate quic report",
+                                 quic_report_text,
+                                 "smoke=quic_tls_transport_ecdsa_smoke") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate quic report", quic_report_text, "stage_total=12")) {
+        free(text);
+        free(quic_report_text);
+        free(msquic_report_text);
+        return 1;
+    }
+    if (msquic_report_text == NULL ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate msquic report",
+                                 msquic_report_text,
+                                 "v2_network_smoke_report_v1") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate msquic report",
+                                 msquic_report_text,
+                                 "smoke=msquic_chain_smoke") ||
+        !v3_expect_text_has_line("run-v2-selfhost-gate msquic report", msquic_report_text, "stage_total=60")) {
+        free(text);
+        free(quic_report_text);
+        free(msquic_report_text);
+        return 1;
+    }
+    free(text);
+    free(quic_report_text);
+    free(msquic_report_text);
+    if (!v3_dump_file_stdout(tooling_log) ||
+        !v3_dump_file_stdout(program_log)) {
+        return 1;
+    }
+    puts("v2 selfhost gate: ok");
+    return 0;
 }
 
 static int v3_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv) {
@@ -39782,10 +44437,10 @@ static int v3_cmd_run_migration_gate_impl(int argc, char **argv) {
         args[7] = out_flag;
         rc = system("true");
         (void)rc;
-        if (!v3_run_command_logged_argv(10U,
-                                        (const char *[10]){ compiler_bin, "publish-world", "--root", root_v3, "--in", current_src, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
-                                        blocked_log,
-                                        "run-migration-gate publish-blocked")) {
+        if (!v3_run_command_logged_argv_quiet(10U,
+                                              (const char *[10]){ compiler_bin, "publish-world", "--root", root_v3, "--in", current_src, "--target:arm64-apple-darwin", out_flag, "--channel:stable" },
+                                              blocked_log,
+                                              "run-migration-gate publish-blocked")) {
             char *blocked_text = v3_read_file(blocked_log);
             bool ok = blocked_text != NULL &&
                       (v3_text_contains_substring(blocked_text, "stable requires") ||
@@ -41182,19 +45837,29 @@ cleanup:
 static bool v3_verify_runtime_fixture_output(const char *label,
                                              const char *fixture_path,
                                              const char *run_log_path,
+                                             const char *report_path,
                                              const char *message_substring,
                                              const char *reason_line,
                                              bool require_signal_fields) {
     char *run_text = v3_read_file(run_log_path);
+    char *report_text = v3_read_file(report_path);
+    char prefixed_reason[512];
     bool ok = true;
     if (run_text == NULL) {
         fprintf(stderr, "[cheng_v3_seed] %s missing run log: %s\n", label, run_log_path);
+        free(report_text);
         return false;
     }
+    if (report_text == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s missing report: %s\n", label, report_path);
+        free(run_text);
+        return false;
+    }
+    snprintf(prefixed_reason, sizeof(prefixed_reason), "[cheng-v3] %s", reason_line);
     ok = ok && v3_expect_text_contains(label, run_text, message_substring);
-    ok = ok && v3_expect_text_has_line(label, run_text, "[cheng-v3] v3_crash_report_v1");
+    ok = ok && v3_expect_text_has_line(label, run_text, "v3_crash_raw_v1");
     ok = ok && v3_expect_text_has_line(label, run_text, reason_line);
-    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] regs pc=0x");
+    ok = ok && v3_expect_text_contains(label, run_text, "regs pc=0x");
     ok = ok && v3_expect_text_contains(label, run_text, " fp=0x");
     ok = ok && v3_expect_text_contains(label, run_text, " sp=0x");
     ok = ok && v3_expect_text_contains(label, run_text, " lr=0x");
@@ -41202,10 +45867,24 @@ static bool v3_verify_runtime_fixture_output(const char *label,
         ok = ok && v3_expect_text_contains(label, run_text, " sig=");
         ok = ok && v3_expect_text_contains(label, run_text, " fault=0x");
     }
-    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] m#");
-    ok = ok && v3_expect_text_contains(label, run_text, "[cheng-v3] #");
+    ok = ok && v3_expect_text_contains(label, run_text, "m#");
+    ok = ok && v3_expect_text_contains(label, run_text, "#");
     ok = ok && v3_expect_text_contains(label, run_text, fixture_path);
+    ok = ok && v3_expect_text_has_line(label, report_text, "[cheng-v3] v3_crash_report_v1");
+    ok = ok && v3_expect_text_has_line(label, report_text, prefixed_reason);
+    ok = ok && v3_expect_text_contains(label, report_text, "[cheng-v3] regs pc=0x");
+    ok = ok && v3_expect_text_contains(label, report_text, " fp=0x");
+    ok = ok && v3_expect_text_contains(label, report_text, " sp=0x");
+    ok = ok && v3_expect_text_contains(label, report_text, " lr=0x");
+    if (require_signal_fields) {
+        ok = ok && v3_expect_text_contains(label, report_text, " sig=");
+        ok = ok && v3_expect_text_contains(label, report_text, " fault=0x");
+    }
+    ok = ok && v3_expect_text_contains(label, report_text, "[cheng-v3] m#");
+    ok = ok && v3_expect_text_contains(label, report_text, "[cheng-v3] #");
+    ok = ok && v3_expect_text_contains(label, report_text, fixture_path);
     free(run_text);
+    free(report_text);
     return ok;
 }
 
@@ -41227,6 +45906,12 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     char bounds_run_log[PATH_MAX];
     char signal_run_log[PATH_MAX];
     char panic_report[PATH_MAX];
+    char panic_crash_report[PATH_MAX];
+    char bounds_crash_report[PATH_MAX];
+    char signal_crash_report[PATH_MAX];
+    char panic_crash_report_log[PATH_MAX];
+    char bounds_crash_report_log[PATH_MAX];
+    char signal_crash_report_log[PATH_MAX];
     char linux_compile_log[PATH_MAX];
     char linux_report[PATH_MAX];
     char panic_line_map[PATH_MAX];
@@ -41241,58 +45926,34 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     char *bounds_argv[2];
     char *signal_argv[2];
     char *bounds_log_text = NULL;
+    char *direct_debug_source_text = NULL;
     char *linux_report_text = NULL;
     char *panic_report_text = NULL;
     const char *host_target = NULL;
     const char *const *allowed_debug_runtime_undefined = NULL;
     size_t allowed_debug_runtime_undefined_count = 0U;
     const char *linux_target = "aarch64-unknown-linux-gnu";
+    const char *debug_runtime_internal_export_prefix = "cheng_v3_runtime_debug_runtime_stub_v3__";
     static const char *const allowed_debug_runtime_exports[] = {
         "cheng_crash_trace_enabled",
         "cheng_crash_trace_mark",
         "cheng_crash_trace_set_phase",
         "cheng_dump_backtrace_if_enabled",
         "cheng_force_segv",
+        "cheng_v3_debug_profile_flush_from_argv0",
         "cheng_v3_native_dump_backtrace_and_exit",
         "cheng_v3_native_register_line_map_from_argv0"
     };
     static const char *const allowed_debug_runtime_undefined_darwin[] = {
-        "__NSGetExecutablePath",
-        "___memcpy_chk",
-        "___stack_chk_fail",
-        "___stack_chk_guard",
-        "___stderrp",
-        "__exit",
-        "_abort",
-        "_atexit",
-        "_backtrace",
-        "_backtrace_symbols_fd",
-        "_calloc",
-        "_dladdr",
-        "_dlerror",
-        "_dlsym",
+        "_cheng_bounds_check",
         "_exit",
         "_fclose",
         "_fflush",
-        "_fopen$DARWIN_EXTSN",
-        "_fprintf",
-        "_fputc",
-        "_free",
+        "_fgets",
+        "_fopen",
         "_fwrite",
         "_getenv",
-        "_malloc",
-        "_memcpy",
-        "_mkdir",
-        "_raise",
-        "_realpath$DARWIN_EXTSN",
-        "_setitimer",
-        "_sigaction",
-        "_snprintf",
-        "_stat",
-        "_strlen",
-        "_strrchr",
-        "_strtol",
-        "_write"
+        "_puts"
     };
     static const char *const allowed_linux_runtime_undefined[] = {
         "__cheng_linux_syscall1",
@@ -41314,7 +45975,7 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     v3_join_path(src_panic, sizeof(src_panic), paths.root, "v3/src/tests/ordinary_panic_fixture.cheng");
     v3_join_path(src_bounds, sizeof(src_bounds), paths.root, "v3/src/tests/ordinary_bounds_trace_fixture.cheng");
     v3_join_path(src_signal, sizeof(src_signal), paths.root, "v3/src/tests/ordinary_signal_trace_fixture.cheng");
-    v3_join_path(direct_debug_source, sizeof(direct_debug_source), paths.root, "src/runtime/native/system_helpers_debug_trace_profile.c");
+    v3_join_path(direct_debug_source, sizeof(direct_debug_source), paths.root, "v3/src/runtime/debug_runtime_stub_v3.cheng");
     v3_join_path(linux_runtime_source,
                  sizeof(linux_runtime_source),
                  paths.root,
@@ -41332,6 +45993,12 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     v3_join_path(bounds_run_log, sizeof(bounds_run_log), out_dir, "ordinary_bounds_trace_fixture.run.log");
     v3_join_path(signal_run_log, sizeof(signal_run_log), out_dir, "ordinary_signal_trace_fixture.run.log");
     v3_join_path(panic_report, sizeof(panic_report), out_dir, "ordinary_panic_fixture.report.txt");
+    v3_join_path(panic_crash_report, sizeof(panic_crash_report), out_dir, "ordinary_panic_fixture.crash.txt");
+    v3_join_path(bounds_crash_report, sizeof(bounds_crash_report), out_dir, "ordinary_bounds_trace_fixture.crash.txt");
+    v3_join_path(signal_crash_report, sizeof(signal_crash_report), out_dir, "ordinary_signal_trace_fixture.crash.txt");
+    snprintf(panic_crash_report_log, sizeof(panic_crash_report_log), "%s.crash-report.log", panic_crash_report);
+    snprintf(bounds_crash_report_log, sizeof(bounds_crash_report_log), "%s.crash-report.log", bounds_crash_report);
+    snprintf(signal_crash_report_log, sizeof(signal_crash_report_log), "%s.crash-report.log", signal_crash_report);
     v3_join_path(linux_report, sizeof(linux_report), out_dir, "ordinary_panic_fixture_linux.report.txt");
     snprintf(panic_line_map, sizeof(panic_line_map), "%s.v3.map", panic_bin);
     snprintf(bounds_line_map, sizeof(bounds_line_map), "%s.v3.map", bounds_bin);
@@ -41355,6 +46022,21 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     if (!v3_expect_file_exists_nonempty("verify-debug-runtime direct source", direct_debug_source)) {
         return 1;
     }
+    direct_debug_source_text = v3_read_file(direct_debug_source);
+    if (direct_debug_source_text == NULL ||
+        !v3_expect_text_contains("verify-debug-runtime direct source",
+                                 direct_debug_source_text,
+                                 "@exportc(\"cheng_v3_native_dump_backtrace_and_exit\")") ||
+        !v3_expect_text_contains("verify-debug-runtime direct source",
+                                 direct_debug_source_text,
+                                 "@exportc(\"cheng_force_segv\")") ||
+        !v3_expect_text_contains("verify-debug-runtime direct source",
+                                 direct_debug_source_text,
+                                 "@exportc(\"cheng_v3_debug_profile_flush_from_argv0\")")) {
+        free(direct_debug_source_text);
+        return 1;
+    }
+    free(direct_debug_source_text);
     if (host_target == NULL || host_target[0] == '\0') {
         fprintf(stderr, "[cheng_v3_seed] verify-debug-runtime unsupported host target\n");
         return 1;
@@ -41402,10 +46084,11 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
         !v3_expect_text_contains("verify-debug-runtime panic report", panic_report_text, direct_debug_source) ||
         !v3_expect_text_not_contains("verify-debug-runtime panic report", panic_report_text, shim_debug_source) ||
         !v3_expect_text_contains("verify-debug-runtime panic report", panic_report_text, panic_debug_provider_object) ||
-        !v3_expect_object_export_whitelist("verify-debug-runtime provider exports",
-                                           panic_debug_provider_object,
-                                           allowed_debug_runtime_exports,
-                                           sizeof(allowed_debug_runtime_exports) / sizeof(allowed_debug_runtime_exports[0])) ||
+        !v3_expect_object_export_contract("verify-debug-runtime provider exports",
+                                          panic_debug_provider_object,
+                                          allowed_debug_runtime_exports,
+                                          sizeof(allowed_debug_runtime_exports) / sizeof(allowed_debug_runtime_exports[0]),
+                                          debug_runtime_internal_export_prefix) ||
         !v3_expect_object_undefined_whitelist("verify-debug-runtime provider undefined",
                                               panic_debug_provider_object,
                                               allowed_debug_runtime_undefined,
@@ -41435,20 +46118,24 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     signal_argv[0] = signal_bin;
     signal_argv[1] = NULL;
     if (!v3_run_binary_capture_output(panic_argv, panic_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_crash_report_transform_raw(panic_run_log, panic_crash_report, panic_crash_report_log) ||
         !v3_verify_runtime_fixture_output("verify-debug-runtime panic",
                                           src_panic,
                                           panic_run_log,
+                                          panic_crash_report,
                                           "v3 panic fixture",
-                                          "[cheng-v3] reason=panic mode=backtrace",
+                                          "reason=panic mode=backtrace",
                                           false)) {
         return 1;
     }
     if (!v3_run_binary_capture_output(bounds_argv, bounds_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_crash_report_transform_raw(bounds_run_log, bounds_crash_report, bounds_crash_report_log) ||
         !v3_verify_runtime_fixture_output("verify-debug-runtime bounds",
                                           src_bounds,
                                           bounds_run_log,
+                                          bounds_crash_report,
                                           "[cheng] bounds check failed: idx=1 len=1",
-                                          "[cheng-v3] reason=bounds mode=backtrace",
+                                          "reason=bounds mode=backtrace",
                                           false)) {
         return 1;
     }
@@ -41460,11 +46147,13 @@ static int v3_cmd_verify_debug_runtime_impl(int argc, char **argv) {
     }
     free(bounds_log_text);
     if (!v3_run_binary_capture_output(signal_argv, signal_run_log, &status) || v3_status_is_exit_code(status, 0) ||
+        !v3_crash_report_transform_raw(signal_run_log, signal_crash_report, signal_crash_report_log) ||
         !v3_verify_runtime_fixture_output("verify-debug-runtime signal",
                                           src_signal,
                                           signal_run_log,
-                                          "[cheng-v3] v3_crash_report_v1",
-                                          "[cheng-v3] reason=signal mode=signal",
+                                          signal_crash_report,
+                                          "v3_crash_raw_v1",
+                                          "reason=signal mode=signal",
                                           true)) {
         return 1;
     }
@@ -42084,6 +46773,10 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
         "pin_runtime_quic_smoke",
         "content_codec_smoke",
         "content_runtime_smoke",
+        "bio_reed_solomon_smoke",
+        "bio_same_person_smoke",
+        "bio_did_chain_node_smoke",
+        "bio_did_mobile_biometric_smoke",
         "native_client_hello_wire_smoke",
         "quic_tls_transport_ecdsa_smoke",
         "quic_transport_loopback_smoke",
@@ -43714,6 +48407,40 @@ static int v3_cmd_profile_report(int argc, char **argv) {
     return rc;
 }
 
+static int v3_cmd_crash_report(int argc, char **argv) {
+    const char *raw_log_path = v3_flag_value(argc, argv, "--in");
+    const char *out_flag = v3_flag_value(argc, argv, "--out");
+    char report_path[PATH_MAX];
+    char crash_report_log[PATH_MAX];
+    char *report = NULL;
+    int rc = 1;
+    if (raw_log_path == NULL || raw_log_path[0] == '\0') {
+        fprintf(stderr, "[cheng_v3_seed] crash-report requires --in:<raw-log>\n");
+        return 1;
+    }
+    if (out_flag != NULL && out_flag[0] != '\0') {
+        v3_copy_text(report_path, sizeof(report_path), out_flag);
+    } else {
+        v3_crash_report_path_from_raw(raw_log_path, report_path, sizeof(report_path));
+    }
+    snprintf(crash_report_log, sizeof(crash_report_log), "%s.crash-report.log", report_path);
+    if (!v3_crash_report_transform_raw(raw_log_path,
+                                       report_path,
+                                       crash_report_log)) {
+        fprintf(stderr, "[cheng_v3_seed] crash report transform failed: %s\n", crash_report_log);
+        return 1;
+    }
+    report = v3_read_file(report_path);
+    if (report == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] missing crash report: %s\n", report_path);
+        return 1;
+    }
+    fputs(report, stdout);
+    rc = 0;
+    free(report);
+    return rc;
+}
+
 static int v3_cmd_emit_csg(int argc, char **argv) {
     V3BootstrapContract contract;
     V3SystemLinkPlanStub plan;
@@ -44847,6 +49574,9 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "profile-report")) {
         return v3_cmd_profile_report(argc, argv);
     }
+    if (v3_streq(argv[1], "crash-report")) {
+        return v3_cmd_crash_report(argc, argv);
+    }
     if (v3_streq(argv[1], "verify-orphan-guard")) {
         return v3_cmd_verify_orphan_guard_impl(argc, argv);
     }
@@ -44901,6 +49631,18 @@ int main(int argc, char **argv) {
     if (v3_streq(argv[1], "build-bft-state-machine")) {
         return v3_cmd_build_bft_state_machine_impl(argc, argv);
     }
+    if (v3_streq(argv[1], "deploy-bft-validator-three-node")) {
+        return v3_cmd_deploy_bft_validator_three_node_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "status-bft-validator-three-node")) {
+        return v3_cmd_status_bft_validator_three_node_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "stop-bft-validator-three-node")) {
+        return v3_cmd_stop_bft_validator_three_node_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "bench-bft-validator-three-node")) {
+        return v3_cmd_bench_bft_validator_three_node_impl(argc, argv);
+    }
     if (v3_streq(argv[1], "build-browser-host-wasm")) {
         return v3_cmd_build_browser_host_wasm_impl(argc, argv);
     }
@@ -44945,6 +49687,9 @@ int main(int argc, char **argv) {
     }
     if (v3_streq(argv[1], "run-tailnet-control-smoke")) {
         return v3_cmd_run_tailnet_control_smoke_impl(argc, argv);
+    }
+    if (v3_streq(argv[1], "run-v2-selfhost-gate")) {
+        return v3_cmd_run_v2_selfhost_gate_impl(argc, argv);
     }
     if (v3_streq(argv[1], "run-fresh-node-selfhost-gate")) {
         return v3_cmd_run_fresh_node_selfhost_gate_impl(argc, argv);

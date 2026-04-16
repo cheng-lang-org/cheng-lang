@@ -1,10 +1,14 @@
 #include <stdint.h>
 #include <limits.h>
 #include <errno.h>
+#include <stdio.h>
+#include <string.h>
+#include <dlfcn.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/statvfs.h>
+#include "../../../src/runtime/native/system_helpers.h"
 
 #if defined(__APPLE__)
 #include <sys/sysctl.h>
@@ -158,4 +162,43 @@ int64_t cheng_v3_native_system_disk_available_bytes_value_bridge(void) {
     }
     return (int64_t)total;
   }
+}
+
+static int cheng_v3_core_bio_hex_encode_utf8(const char* src, char* out, size_t out_cap) {
+  static const char* digits = "0123456789abcdef";
+  if (out == NULL || out_cap == 0u) {
+    return 0;
+  }
+  if (src == NULL || src[0] == '\0') {
+    out[0] = '\0';
+    return 1;
+  }
+  size_t n = strlen(src);
+  if (out_cap <= (n * 2u)) {
+    return 0;
+  }
+  for (size_t i = 0u; i < n; i += 1u) {
+    uint8_t value = (uint8_t)src[i];
+    out[i * 2u] = digits[value >> 4u];
+    out[i * 2u + 1u] = digits[value & 0x0fu];
+  }
+  out[n * 2u] = '\0';
+  return 1;
+}
+
+__attribute__((weak)) ChengStrBridge cheng_v3_mobile_biometric_fingerprint_authorize_bridge_native(ChengStrBridge request_wire) {
+  typedef ChengStrBridge (*ChengV3BioNativeImplFn)(ChengStrBridge);
+  ChengV3BioNativeImplFn impl = (ChengV3BioNativeImplFn)dlsym(RTLD_DEFAULT, "cheng_v3_mobile_biometric_fingerprint_authorize_bridge_native_impl");
+  if (impl != NULL) {
+    return impl(request_wire);
+  }
+  char error_hex[1024];
+  char response_raw[2048];
+  error_hex[0] = '\0';
+  (void)cheng_v3_core_bio_hex_encode_utf8("v3 biometric: mobile host bridge missing", error_hex, sizeof(error_hex));
+  (void)snprintf(response_raw,
+                 sizeof(response_raw),
+                 "ok=0\nfeature32_hex=\ndevice_binding_seed_hex=\ndevice_label_hex=\nsensor_id_hex=\nhardware_attestation_hex=\nerror_hex=%s\n",
+                 error_hex);
+  return driver_c_str_from_utf8_copy_bridge(response_raw, (int32_t)strlen(response_raw));
 }

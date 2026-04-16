@@ -8,12 +8,15 @@ import cheng/v3/std/crypto/fixed256
 import cheng/v3/chain/consensus as consensus
 import cheng/v3/chain/lsmr_types as lt
 import cheng/v3/libp2p/core/types
-import cheng/v3/libp2p/transports/tcp_transport
+import cheng/v3/libp2p/transports/quic_transport
 import cheng/v3/project/bft_state_machine as bft
 import cheng/v3/tooling/path as v3path
 
 const
     v3BftValidatorStateMagic: str = "v3.bft.validator.state.v1"
+    v3BftValidatorVoteLockMagic: str = "v3.bft.validator.vote_lock.v1"
+    v3BftValidatorQueueCursorMagic: str = "v3.bft.validator.queue_cursor.v1"
+    v3BftValidatorStateSyncAck: str = "ok"
     v3BftProposalWireVersion: int32 = 1
     v3BftVoteWireVersion: int32 = 1
     v3BftCommitWireVersion: int32 = 1
@@ -67,6 +70,12 @@ type
         tipEventCid: layout.FixedBytes32
         eventCount: int32
         accountCount: int32
+
+    V3BftValidatorQueueTracker =
+        knownFileSize: int64
+        knownLineCount: int32
+        consumedLineCount: int32
+        pendingTxs: Bytes[]
 
 fn v3BftValidatorInt64Text(value: int64): str =
     return strings.int64ToStr(value)
@@ -234,11 +243,20 @@ fn v3BftValidatorPrivateScalar(slot: int32): Result[fixed256.Scalar256] =
         return Err[fixed256.Scalar256]("v3 bft validator: unknown validator slot")
     return fixed256.scalar256FromHex(hexText)
 
+fn v3BftValidatorPublicKeyHex(slot: int32): str =
+    if slot == 1:
+        return "04963c1356849b8478030a6eb572581063ccedf53fda0bc7241247eba977e3b0666e4bf0c12caa47487c2927f83b17d6f9f332481cd2ab0c4885f91fc2a6c547d5"
+    if slot == 2:
+        return "04a07a1b4f54e85504185a40456e9020fcb7ae67bda04ac1fe5cd790e67035497a1be276d433dc5b772ca543cc6b96d6d443ff2da9e1ca1b3b847d1bab55ec0c2d"
+    if slot == 3:
+        return "04849d0a4d07c118a06e274519e743f23b327104b017e985ac50a7749f592120d865abc57511ef74ee12878e0583770e6457acb1abbe408a27ad220068936307ee"
+    return ""
+
 fn v3BftValidatorPublicKey(slot: int32): Result[layout.FixedBytes65] =
-    let privRes = v3BftValidatorPrivateScalar(slot)
-    if IsErr(privRes):
-        return Err[layout.FixedBytes65](Error(privRes))
-    return fixed256.p256PublicKey65FromPrivateScalar(Value(privRes))
+    let hexText = v3BftValidatorPublicKeyHex(slot)
+    if len(hexText) <= 0:
+        return Err[layout.FixedBytes65]("v3 bft validator: unknown validator slot")
+    return layout.fixedBytes65FromHex(hexText)
 
 fn v3BftValidatorSlotValid(slot: int32): bool =
     return slot >= 1 && slot <= v3BftValidatorCount
@@ -549,16 +567,9 @@ fn v3BftValidatorPreviewProposal(state: V3BftValidatorState,
         return Err[V3BftProposalPreview]("v3 bft validator: proposal app id mismatch")
     if proposal.height != state.machine.lastFinalizedHeight + int64(1):
         return Err[V3BftProposalPreview]("v3 bft validator: proposal height mismatch")
-    var txs: bft.V3BftTx[]
-    txs = []
-    for i in 0..<proposal.txs.len:
-        let txRes = bft.v3BftDecodeTx(layout.byteSpanFromBytes(proposal.txs[i]))
-        if IsErr(txRes):
-            return Err[V3BftProposalPreview](Error(txRes))
-        add(txs, Value(txRes))
     var clone = bft.v3BftStateMachineClone(state.machine)
     var summary = bft.v3BftBlockSummaryZero(int64(0))
-    bft.v3BftStateMachineFinalizeBlockSummary(clone, proposal.height, txs, summary)
+    bft.v3BftStateMachineFinalizeBlockBytesSummary(clone, proposal.height, proposal.txs, summary)
     let commit = bft.v3BftStateMachineCommit(clone)
     var out: V3BftProposalPreview
     out.proposalHash = v3BftValidatorProposalHash(proposal)
@@ -568,16 +579,19 @@ fn v3BftValidatorPreviewProposal(state: V3BftValidatorState,
     out.accountCount = commit.accountCount
     return Ok[V3BftProposalPreview](out)
 
-fn v3BftValidatorBuildVote(state: V3BftValidatorState,
-                           proposal: V3BftProposal): Result[V3BftVote] =
+fn v3BftValidatorBuildVoteAllowRepeat(state: V3BftValidatorState,
+                                      proposal: V3BftProposal,
+                                      allowRepeat: bool): Result[V3BftVote] =
     let previewRes = v3BftValidatorPreviewProposal(state, proposal)
     if IsErr(previewRes):
         return Err[V3BftVote](Error(previewRes))
     let preview = Value(previewRes)
     if state.lastVotedHeight == proposal.height:
         if layout.fixedBytes32Equal(state.lastVotedProposalHash, preview.proposalHash):
-            return Err[V3BftVote]("v3 bft validator: already voted for proposal")
-        return Err[V3BftVote]("v3 bft validator: conflicting proposal at same height")
+            if !allowRepeat:
+                return Err[V3BftVote]("v3 bft validator: already voted for proposal")
+        else:
+            return Err[V3BftVote]("v3 bft validator: conflicting proposal at same height")
     var vote: V3BftVote
     vote.version = v3BftVoteWireVersion
     vote.appId = proposal.appId
@@ -598,6 +612,10 @@ fn v3BftValidatorBuildVote(state: V3BftValidatorState,
         return Err[V3BftVote](Error(sigRes))
     vote.sig = Value(sigRes)
     return Ok[V3BftVote](vote)
+
+fn v3BftValidatorBuildVote(state: V3BftValidatorState,
+                           proposal: V3BftProposal): Result[V3BftVote] =
+    return v3BftValidatorBuildVoteAllowRepeat(state, proposal, false)
 
 fn v3BftValidatorVerifyVote(vote: V3BftVote): Result[bool] =
     if vote.version != v3BftVoteWireVersion:
@@ -739,15 +757,8 @@ fn v3BftValidatorStateApplyCommit(state: var V3BftValidatorState,
     if IsErr(proposalRes):
         return Err[bool](Error(proposalRes))
     let proposal = Value(proposalRes)
-    var txs: bft.V3BftTx[]
-    txs = []
-    for i in 0..<proposal.txs.len:
-        let txRes = bft.v3BftDecodeTx(layout.byteSpanFromBytes(proposal.txs[i]))
-        if IsErr(txRes):
-            return Err[bool](Error(txRes))
-        add(txs, Value(txRes))
     var summary = bft.v3BftBlockSummaryZero(int64(0))
-    bft.v3BftStateMachineFinalizeBlockSummary(state.machine, proposal.height, txs, summary)
+    bft.v3BftStateMachineFinalizeBlockBytesSummary(state.machine, proposal.height, proposal.txs, summary)
     let commitRes = bft.v3BftStateMachineCommit(state.machine)
     if !layout.fixedBytes32Equal(commitRes.appHash, commit.appHash):
         return Err[bool]("v3 bft validator: commit app hash apply mismatch")
@@ -878,6 +889,36 @@ fn v3BftValidatorWriteState(pathRaw: str,
                             state: V3BftValidatorState): bool =
     return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorStateText(state))
 
+fn v3BftValidatorVoteLockText(state: V3BftValidatorState): str =
+    var out = ""
+    out = out + v3BftValidatorVoteLockMagic + "\n"
+    out = out + "last_voted_height=" + v3BftValidatorInt64Text(state.lastVotedHeight) + "\n"
+    out = out + "last_voted_proposal_hash=" + layout.fixedBytes32Hex(state.lastVotedProposalHash) + "\n"
+    return out
+
+fn v3BftValidatorQueueCursorText(consumedLineCount: int32): str =
+    var out = ""
+    out = out + v3BftValidatorQueueCursorMagic + "\n"
+    out = out + "consumed_line_count=" + intToStr(consumedLineCount) + "\n"
+    return out
+
+fn v3BftValidatorDefaultVoteLockPath(statePathRaw: str): str =
+    return statePathRaw + ".vote_lock"
+
+fn v3BftValidatorDefaultQueueCursorPath(queuePathRaw: str): str =
+    return queuePathRaw + ".cursor"
+
+fn v3BftValidatorDefaultStateSyncDir(stateSyncFilePathRaw: str): str =
+    return stateSyncFilePathRaw + ".snapshots"
+
+fn v3BftValidatorWriteVoteLock(pathRaw: str,
+                               state: V3BftValidatorState): bool =
+    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorVoteLockText(state))
+
+fn v3BftValidatorWriteQueueCursor(pathRaw: str,
+                                  consumedLineCount: int32): bool =
+    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorQueueCursorText(consumedLineCount))
+
 fn v3BftValidatorLoadState(pathRaw: str): Result[V3BftValidatorState] =
     let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
     let trimmed = strutil.strip(text)
@@ -906,7 +947,7 @@ fn v3BftValidatorLoadState(pathRaw: str): Result[V3BftValidatorState] =
                 return Err[V3BftValidatorState](Error(heightRes))
             lastVotedHeight = Value(heightRes)
         elif v3path.v3TextStartsWith(line, "last_voted_proposal_hash="):
-            let hashRes = layout.fixedBytes32FromHex(v3path.v3TextSlice(line, 26, len(line) - 26))
+            let hashRes = layout.fixedBytes32FromHex(v3path.v3TextSlice(line, 25, len(line) - 25))
             if IsErr(hashRes):
                 return Err[V3BftValidatorState](Error(hashRes))
             lastVotedProposalHash = Value(hashRes)
@@ -929,6 +970,82 @@ fn v3BftValidatorLoadState(pathRaw: str): Result[V3BftValidatorState] =
     out.machine = Value(machineRes)
     return Ok[V3BftValidatorState](out)
 
+fn v3BftValidatorLoadVoteLock(pathRaw: str,
+                              state: var V3BftValidatorState): Result[bool] =
+    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let trimmed = strutil.strip(text)
+    if len(trimmed) <= 0:
+        return Ok[bool](false)
+    let lines = strutil.split(text, '\n')
+    var sawMagic = false
+    var sawHeight = false
+    var sawHash = false
+    var lastVotedHeight = int64(0)
+    var lastVotedProposalHash = layout.fixedBytes32Zero()
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if line == v3BftValidatorVoteLockMagic:
+            sawMagic = true
+        elif v3path.v3TextStartsWith(line, "last_voted_height="):
+            let heightRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 18, len(line) - 18))
+            if IsErr(heightRes):
+                return Err[bool](Error(heightRes))
+            lastVotedHeight = Value(heightRes)
+            sawHeight = true
+        elif v3path.v3TextStartsWith(line, "last_voted_proposal_hash="):
+            let hashRes = layout.fixedBytes32FromHex(v3path.v3TextSlice(line, 25, len(line) - 25))
+            if IsErr(hashRes):
+                return Err[bool](Error(hashRes))
+            lastVotedProposalHash = Value(hashRes)
+            sawHash = true
+    if !sawMagic:
+        return Err[bool]("v3 bft validator: bad vote lock magic")
+    if !sawHeight || !sawHash:
+        return Err[bool]("v3 bft validator: incomplete vote lock")
+    state.lastVotedHeight = lastVotedHeight
+    state.lastVotedProposalHash = lastVotedProposalHash
+    return Ok[bool](true)
+
+fn v3BftValidatorLoadQueueCursor(pathRaw: str): Result[int32] =
+    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let trimmed = strutil.strip(text)
+    if len(trimmed) <= 0:
+        return Ok[int32](0)
+    let lines = strutil.split(text, '\n')
+    var sawMagic = false
+    var sawCount = false
+    var consumedLineCount = 0
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if line == v3BftValidatorQueueCursorMagic:
+            sawMagic = true
+        elif v3path.v3TextStartsWith(line, "consumed_line_count="):
+            let countRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 20, len(line) - 20))
+            if IsErr(countRes):
+                return Err[int32](Error(countRes))
+            consumedLineCount = int32(Value(countRes))
+            sawCount = true
+    if !sawMagic:
+        return Err[int32]("v3 bft validator: bad queue cursor magic")
+    if !sawCount || consumedLineCount < 0:
+        return Err[int32]("v3 bft validator: bad queue cursor count")
+    return Ok[int32](consumedLineCount)
+
+fn v3BftValidatorLoadLiveState(statePathRaw: str,
+                               voteLockPathRaw: str): Result[V3BftValidatorState] =
+    let stateRes = v3BftValidatorLoadState(statePathRaw)
+    if IsErr(stateRes):
+        return Err[V3BftValidatorState](Error(stateRes))
+    var state = Value(stateRes)
+    let voteLockRes = v3BftValidatorLoadVoteLock(voteLockPathRaw, state)
+    if IsErr(voteLockRes):
+        return Err[V3BftValidatorState](Error(voteLockRes))
+    return Ok[V3BftValidatorState](state)
+
 fn v3BftValidatorWriteHexFile(pathRaw: str,
                               data: Bytes): bool =
     return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, bytesToHex(data) + "\n")
@@ -936,6 +1053,86 @@ fn v3BftValidatorWriteHexFile(pathRaw: str,
 fn v3BftValidatorReadHexFile(pathRaw: str): Result[Bytes] =
     let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
     return v3BftValidatorBytesFromHex(text)
+
+fn v3BftValidatorStateSnapshotPath(snapshotDirRaw: str,
+                                   height: int64): str =
+    return v3path.v3PathJoin(snapshotDirRaw, v3BftValidatorInt64Text(height) + ".hex")
+
+fn v3BftValidatorReadStateSnapshot(snapshotDirRaw: str,
+                                   height: int64): Result[Bytes] =
+    let pathRaw = v3BftValidatorStateSnapshotPath(snapshotDirRaw, height)
+    if !v3path.v3FileExistsNonEmpty(os.getCurrentDir(), pathRaw):
+        return Err[Bytes]("v3 bft validator: missing state snapshot")
+    return v3BftValidatorReadHexFile(pathRaw)
+
+fn v3BftValidatorWriteStateSnapshot(snapshotDirRaw: str,
+                                    machine: bft.V3BftStateMachine): bool =
+    if !v3path.v3MkdirP(os.getCurrentDir(), snapshotDirRaw):
+        return false
+    return v3BftValidatorWriteHexFile(v3BftValidatorStateSnapshotPath(snapshotDirRaw, machine.lastFinalizedHeight),
+                                      v3BftValidatorEncodeMachine(machine))
+
+fn v3BftValidatorEncodeStateSyncRequest(height: int64): Bytes =
+    var out = ""
+    out = out + "height="
+    out = out + v3BftValidatorInt64Text(height)
+    out = out + "\n"
+    return bytesFromString(out)
+
+fn v3BftValidatorDecodeStateSyncRequest(data: Bytes): Result[int64] =
+    let text = strutil.strip(bytesToString(data))
+    if !v3path.v3TextStartsWith(text, "height="):
+        return Err[int64]("v3 bft validator: bad state sync request")
+    return v3BftValidatorParseInt64Text(v3path.v3TextSlice(text, 7, len(text) - 7))
+
+fn v3BftValidatorEncodeStateSyncPayload(machineBytes: Bytes): Bytes =
+    var out = ""
+    out = out + "machine_hex="
+    out = out + bytesToHex(machineBytes)
+    out = out + "\n"
+    return bytesFromString(out)
+
+fn v3BftValidatorEncodeStateSyncError(err: str): Bytes =
+    var out = ""
+    out = out + "error="
+    out = out + err
+    out = out + "\n"
+    return bytesFromString(out)
+
+fn v3BftValidatorDecodeStateSyncPayload(data: Bytes): Result[bft.V3BftStateMachine] =
+    let text = bytesToString(data)
+    let lines = strutil.split(text, '\n')
+    var machineHex = ""
+    var errText = ""
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if v3path.v3TextStartsWith(line, "machine_hex="):
+            machineHex = strutil.strip(v3path.v3TextSlice(line, 12, len(line) - 12))
+        elif v3path.v3TextStartsWith(line, "error="):
+            errText = strutil.strip(v3path.v3TextSlice(line, 6, len(line) - 6))
+    if len(errText) > 0:
+        return Err[bft.V3BftStateMachine](errText)
+    if len(machineHex) <= 0:
+        return Err[bft.V3BftStateMachine]("v3 bft validator: missing state sync payload")
+    let machineBytesRes = v3BftValidatorBytesFromHex(machineHex)
+    if IsErr(machineBytesRes):
+        return Err[bft.V3BftStateMachine](Error(machineBytesRes))
+    return v3BftValidatorDecodeMachine(Value(machineBytesRes))
+
+fn v3BftValidatorStateSyncPayloadForHeight(snapshotDirRaw: str,
+                                           height: int64): Bytes =
+    let snapshotRes = v3BftValidatorReadStateSnapshot(snapshotDirRaw, height)
+    if IsErr(snapshotRes):
+        return v3BftValidatorEncodeStateSyncError(Error(snapshotRes))
+    return v3BftValidatorEncodeStateSyncPayload(Value(snapshotRes))
+
+fn v3BftValidatorRetryableStateSyncRecvError(err: str): bool =
+    return v3path.v3TextStartsWith(err, "v3 libp2p quic: dial") ||
+           v3path.v3TextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
+           v3path.v3TextStartsWith(err, "msquic native: pipe read timeout") ||
+           v3path.v3TextStartsWith(err, "msquic: pipe closed")
 
 fn v3BftValidatorQueueLoad(pathRaw: str): Result[Bytes[]] =
     let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
@@ -973,6 +1170,115 @@ fn v3BftValidatorQueueAppend(pathRaw: str,
     var txs = Value(existingRes)
     add(txs, txWire)
     return v3BftValidatorQueueWrite(pathRaw, txs)
+
+fn v3BftValidatorQueueTrackerInit(pathRaw: str,
+                                  cursorPathRaw: str): Result[V3BftValidatorQueueTracker] =
+    let consumedRes = v3BftValidatorLoadQueueCursor(cursorPathRaw)
+    if IsErr(consumedRes):
+        return Err[V3BftValidatorQueueTracker](Error(consumedRes))
+    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let lines = strutil.split(text, '\n')
+    let knownFileSize = v3path.v3PathFileSize(v3path.v3PathAbsolute(os.getCurrentDir(), pathRaw))
+    var knownLineCount = 0
+    var pendingTxs: Bytes[]
+    pendingTxs = []
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        let bytesRes = v3BftValidatorBytesFromHex(line)
+        if IsErr(bytesRes):
+            return Err[V3BftValidatorQueueTracker](Error(bytesRes))
+        let txRes = bft.v3BftDecodeTx(layout.byteSpanFromBytes(Value(bytesRes)))
+        if IsErr(txRes):
+            return Err[V3BftValidatorQueueTracker]("v3 bft validator: bad queued tx")
+        if knownLineCount >= Value(consumedRes):
+            add(pendingTxs, Value(bytesRes))
+        knownLineCount = knownLineCount + 1
+    if Value(consumedRes) > knownLineCount:
+        return Err[V3BftValidatorQueueTracker]("v3 bft validator: queue cursor beyond queue tail")
+    var out: V3BftValidatorQueueTracker
+    out.knownFileSize = knownFileSize
+    out.knownLineCount = knownLineCount
+    out.consumedLineCount = Value(consumedRes)
+    out.pendingTxs = pendingTxs
+    return Ok[V3BftValidatorQueueTracker](out)
+
+fn v3BftValidatorQueueTrackerRefresh(pathRaw: str,
+                                     tracker: var V3BftValidatorQueueTracker): Result[int32] =
+    let queuePath = v3path.v3PathAbsolute(os.getCurrentDir(), pathRaw)
+    let fileSize = v3path.v3PathFileSize(queuePath)
+    if fileSize == tracker.knownFileSize:
+        return Ok[int32](0)
+    if fileSize < tracker.knownFileSize:
+        return Err[int32]("v3 bft validator: queue file shrank")
+    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let lines = strutil.split(text, '\n')
+    var seenLineCount = 0
+    var newCount = 0
+    for i in 0..<lines.len:
+        let line = strutil.strip(lines[i])
+        if len(line) <= 0:
+            continue
+        if seenLineCount >= tracker.knownLineCount:
+            let bytesRes = v3BftValidatorBytesFromHex(line)
+            if IsErr(bytesRes):
+                return Err[int32](Error(bytesRes))
+            let txRes = bft.v3BftDecodeTx(layout.byteSpanFromBytes(Value(bytesRes)))
+            if IsErr(txRes):
+                return Err[int32]("v3 bft validator: bad queued tx")
+            add(tracker.pendingTxs, Value(bytesRes))
+            newCount = newCount + 1
+        seenLineCount = seenLineCount + 1
+    if seenLineCount < tracker.knownLineCount:
+        return Err[int32]("v3 bft validator: queue line count regressed")
+    tracker.knownLineCount = seenLineCount
+    tracker.knownFileSize = fileSize
+    return Ok[int32](newCount)
+
+fn v3BftValidatorQueueTrackerCommit(cursorPathRaw: str,
+                                    tracker: var V3BftValidatorQueueTracker,
+                                    txCount: int32): Result[bool] =
+    if txCount < 0 || txCount > tracker.pendingTxs.len:
+        return Err[bool]("v3 bft validator: queue commit count out of range")
+    var remaining: Bytes[]
+    remaining = []
+    for i in txCount..<tracker.pendingTxs.len:
+        add(remaining, tracker.pendingTxs[i])
+    tracker.pendingTxs = remaining
+    tracker.consumedLineCount = tracker.consumedLineCount + txCount
+    if tracker.consumedLineCount > tracker.knownLineCount:
+        return Err[bool]("v3 bft validator: queue cursor advanced past queue tail")
+    if !v3BftValidatorWriteQueueCursor(cursorPathRaw, tracker.consumedLineCount):
+        return Err[bool]("v3 bft validator: failed to write queue cursor")
+    return Ok[bool](true)
+
+fn v3BftValidatorVoteMatchesPreview(vote: V3BftVote,
+                                    proposal: V3BftProposal,
+                                    preview: V3BftProposalPreview): bool =
+    return vote.accepted &&
+           vote.appId == proposal.appId &&
+           vote.height == proposal.height &&
+           layout.fixedBytes32Equal(vote.proposalHash, preview.proposalHash) &&
+           layout.fixedBytes32Equal(vote.appHash, preview.appHash) &&
+           layout.fixedBytes32Equal(vote.tipEventCid, preview.tipEventCid) &&
+           vote.eventCount == preview.eventCount &&
+           vote.accountCount == preview.accountCount
+
+fn v3BftValidatorVoteSetAdd(out: var V3BftVote[],
+                            vote: V3BftVote,
+                            proposal: V3BftProposal,
+                            preview: V3BftProposalPreview): Result[bool] =
+    let verifyRes = v3BftValidatorVerifyVote(vote)
+    if IsErr(verifyRes):
+        return Err[bool](Error(verifyRes))
+    if !v3BftValidatorVoteMatchesPreview(vote, proposal, preview):
+        return Ok[bool](false)
+    for i in 0..<out.len:
+        if out[i].validatorSlot == vote.validatorSlot:
+            return Ok[bool](false)
+    add(out, vote)
+    return Ok[bool](true)
 
 fn v3BftValidatorVoteInboxLoad(pathRaw: str): Result[V3BftVote[]] =
     let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
@@ -1015,26 +1321,9 @@ fn v3BftValidatorVoteSetForProposal(pathRaw: str,
         let vote = inbox[i]
         if vote.validatorSlot == selfVote.validatorSlot:
             continue
-        let verifyRes = v3BftValidatorVerifyVote(vote)
-        if IsErr(verifyRes):
+        let addRes = v3BftValidatorVoteSetAdd(out, vote, proposal, preview)
+        if IsErr(addRes):
             continue
-        if !vote.accepted:
-            continue
-        if vote.appId != proposal.appId ||
-           vote.height != proposal.height ||
-           !layout.fixedBytes32Equal(vote.proposalHash, preview.proposalHash) ||
-           !layout.fixedBytes32Equal(vote.appHash, preview.appHash) ||
-           !layout.fixedBytes32Equal(vote.tipEventCid, preview.tipEventCid) ||
-           vote.eventCount != preview.eventCount ||
-           vote.accountCount != preview.accountCount:
-            continue
-        var seen = false
-        for j in 0..<out.len:
-            if out[j].validatorSlot == vote.validatorSlot:
-                seen = true
-                break
-        if !seen:
-            add(out, vote)
     return Ok[V3BftVote[]](out)
 
 fn v3BftValidatorProposalProtocol(): types.V3Libp2pProtocolId =
@@ -1046,6 +1335,12 @@ fn v3BftValidatorVoteProtocol(): types.V3Libp2pProtocolId =
 fn v3BftValidatorCommitProtocol(): types.V3Libp2pProtocolId =
     return types.v3Libp2pProtocolBftCommit
 
+fn v3BftValidatorStateSyncProtocol(): types.V3Libp2pProtocolId =
+    return types.v3Libp2pProtocolBftStateSync
+
+fn v3BftValidatorPublicTransportServerName(): str =
+    return "server.cheng-quic.internal"
+
 fn v3BftValidatorServeHexFileOnce(pathRaw: str,
                                   host: str,
                                   port: int32,
@@ -1056,32 +1351,110 @@ fn v3BftValidatorServeHexFileOnce(pathRaw: str,
         return Err[bool](Error(payloadRes))
     if bytesLen(Value(payloadRes)) <= 0:
         return Err[bool]("v3 bft validator: empty payload file")
-    return tcp_transport.v3Libp2pTcpServePayloadOnce(host, port, protocol, Value(payloadRes), readyPath)
+    return quic_transport.v3Libp2pQuicServePayloadOnceNamed(host,
+                                                            port,
+                                                            v3BftValidatorPublicTransportServerName(),
+                                                            protocol,
+                                                            Value(payloadRes),
+                                                            readyPath)
 
 fn v3BftValidatorCaptureVoteOnce(pathRaw: str,
                                  host: str,
                                  port: int32,
                                  readyPath: str): Result[bool] =
     let ack = bytesFromString("ok")
-    let requestRes = tcp_transport.v3Libp2pTcpServeRequestCaptureOnce(host,
-                                                                      port,
-                                                                      v3BftValidatorVoteProtocol(),
-                                                                      ack,
-                                                                      readyPath)
+    let requestRes = quic_transport.v3Libp2pQuicServeRequestCaptureOnceNamed(host,
+                                                                             port,
+                                                                             v3BftValidatorPublicTransportServerName(),
+                                                                             v3BftValidatorVoteProtocol(),
+                                                                             ack,
+                                                                             readyPath)
     if IsErr(requestRes):
         return Err[bool](Error(requestRes))
     if !v3BftValidatorVoteInboxAppend(pathRaw, Value(requestRes)):
         return Err[bool]("v3 bft validator: failed to append vote inbox")
     return Ok[bool](true)
 
+fn v3BftValidatorServeProposalWindow(host: str,
+                                     port: int32,
+                                     proposal: V3BftProposal,
+                                     readyPath: str,
+                                     maxServeCount: int32,
+                                     waitMs: int32): Result[bool] =
+    return quic_transport.v3Libp2pQuicServePayloadWindowNamed(host,
+                                                              port,
+                                                              v3BftValidatorPublicTransportServerName(),
+                                                              v3BftValidatorProposalProtocol(),
+                                                              v3BftValidatorEncodeProposal(proposal),
+                                                              readyPath,
+                                                              maxServeCount,
+                                                              waitMs)
+
+fn v3BftValidatorServeCommitWindow(host: str,
+                                   port: int32,
+                                   commit: V3BftCommit,
+                                   readyPath: str,
+                                   maxServeCount: int32,
+                                   waitMs: int32): Result[bool] =
+    return quic_transport.v3Libp2pQuicServePayloadWindowNamed(host,
+                                                              port,
+                                                              v3BftValidatorPublicTransportServerName(),
+                                                              v3BftValidatorCommitProtocol(),
+                                                              v3BftValidatorEncodeCommit(commit),
+                                                              readyPath,
+                                                              maxServeCount,
+                                                              waitMs)
+
+fn v3BftValidatorServeStateWindow(host: str,
+                                  port: int32,
+                                  machine: bft.V3BftStateMachine,
+                                  readyPath: str,
+                                  maxServeCount: int32,
+                                  waitMs: int32): Result[bool] =
+    return quic_transport.v3Libp2pQuicServePayloadWindowNamed(host,
+                                                              port,
+                                                              v3BftValidatorPublicTransportServerName(),
+                                                              v3BftValidatorStateSyncProtocol(),
+                                                              v3BftValidatorEncodeMachine(machine),
+                                                              readyPath,
+                                                              maxServeCount,
+                                                              waitMs)
+
+fn v3BftValidatorCaptureVotesWindow(host: str,
+                                    port: int32,
+                                    readyPath: str,
+                                    maxCaptureCount: int32,
+                                    waitMs: int32): Result[V3BftVote[]] =
+    let ack = bytesFromString("ok")
+    let captureRes = quic_transport.v3Libp2pQuicServeRequestCaptureWindowNamed(host,
+                                                                               port,
+                                                                               v3BftValidatorPublicTransportServerName(),
+                                                                               v3BftValidatorVoteProtocol(),
+                                                                               ack,
+                                                                               readyPath,
+                                                                               maxCaptureCount,
+                                                                               waitMs)
+    if IsErr(captureRes):
+        return Err[V3BftVote[]](Error(captureRes))
+    var out: V3BftVote[]
+    out = []
+    let wires = Value(captureRes)
+    for i in 0..<wires.len:
+        let voteRes = v3BftValidatorDecodeVote(wires[i])
+        if IsErr(voteRes):
+            return Err[V3BftVote[]](Error(voteRes))
+        add(out, Value(voteRes))
+    return Ok[V3BftVote[]](out)
+
 fn v3BftValidatorSendVote(host: str,
                           port: int32,
                           vote: V3BftVote): Result[bool] =
     let voteWire = v3BftValidatorEncodeVote(vote)
-    let replyRes = tcp_transport.v3Libp2pTcpRequestResponse(host,
-                                                            port,
-                                                            v3BftValidatorVoteProtocol(),
-                                                            voteWire)
+    let replyRes = quic_transport.v3Libp2pQuicRequestResponseNamed(host,
+                                                                   port,
+                                                                   v3BftValidatorPublicTransportServerName(),
+                                                                   v3BftValidatorVoteProtocol(),
+                                                                   voteWire)
     if IsErr(replyRes):
         return Err[bool](Error(replyRes))
     if bytesToString(Value(replyRes)) != "ok":
@@ -1096,9 +1469,10 @@ fn v3BftValidatorLoadProposalFile(pathRaw: str): Result[V3BftProposal] =
 
 fn v3BftValidatorRecvProposal(host: str,
                               port: int32): Result[V3BftProposal] =
-    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce(host,
-                                                              port,
-                                                              v3BftValidatorProposalProtocol())
+    let payloadRes = quic_transport.v3Libp2pQuicRecvPayloadOnceNamed(host,
+                                                                     port,
+                                                                     v3BftValidatorPublicTransportServerName(),
+                                                                     v3BftValidatorProposalProtocol())
     if IsErr(payloadRes):
         return Err[V3BftProposal](Error(payloadRes))
     return v3BftValidatorDecodeProposal(Value(payloadRes))
@@ -1111,12 +1485,61 @@ fn v3BftValidatorLoadCommitFile(pathRaw: str): Result[V3BftCommit] =
 
 fn v3BftValidatorRecvCommit(host: str,
                             port: int32): Result[V3BftCommit] =
-    let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce(host,
-                                                              port,
-                                                              v3BftValidatorCommitProtocol())
+    let payloadRes = quic_transport.v3Libp2pQuicRecvPayloadOnceNamed(host,
+                                                                     port,
+                                                                     v3BftValidatorPublicTransportServerName(),
+                                                                     v3BftValidatorCommitProtocol())
     if IsErr(payloadRes):
         return Err[V3BftCommit](Error(payloadRes))
     return v3BftValidatorDecodeCommit(Value(payloadRes))
+
+fn v3BftValidatorRecvStateMachine(host: str,
+                                  port: int32,
+                                  height: int64): Result[bft.V3BftStateMachine] =
+    let ackRes = quic_transport.v3Libp2pQuicRequestResponseNamed(host,
+                                                                 port,
+                                                                 v3BftValidatorPublicTransportServerName(),
+                                                                 v3BftValidatorStateSyncProtocol(),
+                                                                 v3BftValidatorEncodeStateSyncRequest(height))
+    if IsErr(ackRes):
+        return Err[bft.V3BftStateMachine](Error(ackRes))
+    if strutil.strip(bytesToString(Value(ackRes))) != v3BftValidatorStateSyncAck:
+        return Err[bft.V3BftStateMachine]("v3 bft validator: state sync ack mismatch")
+    for attempt in 0..<512:
+        let payloadRes = quic_transport.v3Libp2pQuicRecvPayloadOnceNamed(host,
+                                                                         port,
+                                                                         v3BftValidatorPublicTransportServerName(),
+                                                                         v3BftValidatorStateSyncProtocol())
+        if IsOk(payloadRes):
+            return v3BftValidatorDecodeStateSyncPayload(Value(payloadRes))
+        if !v3BftValidatorRetryableStateSyncRecvError(Error(payloadRes)):
+            return Err[bft.V3BftStateMachine](Error(payloadRes))
+        attempt
+    return Err[bft.V3BftStateMachine]("v3 bft validator: state sync payload unavailable")
+
+fn v3BftValidatorMachineMatchesCommit(machine: bft.V3BftStateMachine,
+                                      commit: V3BftCommit): bool =
+    let machineCommit = bft.v3BftStateMachineCommit(machine)
+    return machineCommit.height == commit.height &&
+           layout.fixedBytes32Equal(machineCommit.appHash, commit.appHash) &&
+           layout.fixedBytes32Equal(machineCommit.tipEventCid, commit.tipEventCid) &&
+           machineCommit.eventCount == commit.eventCount &&
+           machineCommit.accountCount == commit.accountCount
+
+fn v3BftValidatorSyncMachineFromCommit(state: var V3BftValidatorState,
+                                       commit: V3BftCommit,
+                                       syncHost: str,
+                                       syncPort: int32): Result[bool] =
+    if len(syncHost) <= 0 || syncPort <= 0:
+        return Err[bool]("v3 bft validator: missing state sync endpoint")
+    let machineRes = v3BftValidatorRecvStateMachine(syncHost, syncPort, commit.height)
+    if IsErr(machineRes):
+        return Err[bool](Error(machineRes))
+    let machine = Value(machineRes)
+    if !v3BftValidatorMachineMatchesCommit(machine, commit):
+        return Err[bool]("v3 bft validator: state sync commit mismatch")
+    state.machine = machine
+    return Ok[bool](true)
 
 fn v3BftValidatorQueryBalance(state: V3BftValidatorState,
                               assetId: int32,

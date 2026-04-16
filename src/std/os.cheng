@@ -110,41 +110,14 @@ importc fn libc_write(fd: int32, data: ptr, n: int64): int64
 @importc("read")
 fn libc_read(fd: int32, data: ptr, n: int64): int64
 importc fn libc_close(fd: int32): int32
-@importc("cheng_exec_cmd_ex")
-fn cheng_exec_cmd_ex_raw(command: cstring, workingDir: cstring, mergeStderr: int32, exitCode: var int64): cstring
-@importc("cheng_exec_file_capture")
-fn cheng_exec_file_capture_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq: ptr,
-                               workingDir: cstring, mergeStderr: int32,
-                               timeoutSec: int32, exitCode: var int64): cstring
-@importc("cheng_exec_file_status")
-fn cheng_exec_file_status_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq: ptr,
-                              workingDir: cstring, timeoutSec: int32): int64
-@importc("cheng_exec_file_pipe_spawn")
-fn cheng_exec_file_pipe_spawn_raw(filePath: cstring, argvSeq: ptr, envOverridesSeq: ptr,
-                                  workingDir: cstring, readFd: var int32, writeFd: var int32, pid: var int64): int32
+@importc("cheng_exec_cmd_capture")
+fn cheng_exec_cmd_capture_raw(command: cstring, workingDir: cstring, mergeStderr: int32): cstring
+@importc("cheng_exec_cmd_last_exit_code")
+fn cheng_exec_cmd_last_exit_code_raw(): int64
+@importc("cheng_exec_cmd_status")
+fn cheng_exec_cmd_status_raw(command: cstring, workingDir: cstring): int32
 @importc("driver_c_read_file_all_bridge_into")
 fn driver_c_read_file_all_bridge_into(path: cstring, out: var str)
-@importc("cheng_pty_is_supported")
-fn cheng_pty_is_supported(): int32
-@importc("cheng_pty_spawn")
-fn cheng_pty_spawn_raw(command: cstring, workingDir: cstring, masterFd: var int32, pid: var int64): int32
-@importc("cheng_pipe_spawn")
-fn cheng_pipe_spawn_raw(command: cstring, workingDir: cstring, readFd: var int32, writeFd: var int32, pid: var int64): int32
-@importc("cheng_pty_read")
-fn cheng_pty_read_raw(fd: int32, maxBytes: int32, eofCode: var int32): cstring
-@importc("cheng_fd_read")
-fn cheng_fd_read_raw(fd: int32, maxBytes: int32, eofCode: var int32): cstring
-@importc("cheng_fd_read_wait")
-fn cheng_fd_read_wait_raw(fd: int32, maxBytes: int32, timeoutMs: int32, eofCode: var int32): cstring
-@importc("cheng_pty_write")
-fn cheng_pty_write(fd: int32, data: cstring, len: int32): int32
-@importc("cheng_pty_close")
-fn cheng_pty_close(fd: int32): int32
-@importc("cheng_pty_wait")
-@ffi_out_ptrs(arg1)
-fn cheng_pty_wait(pid: int64): tuple[int32, int32]
-@importc("cheng_process_signal")
-fn cheng_process_signal_raw(pid: int64, signalCode: int32): int32
 @importc("usleep")
 fn libc_usleep(microseconds: uint32): int32
 importc fn cheng_errno(): int32
@@ -164,6 +137,7 @@ importc fn cheng_v3_udp_bind_host_port_bridge(host: str, port: int32, isV6: int3
 importc fn cheng_v3_udp_bind_fd_bridge(host: str, port: int32, isV6: int32): int32
 importc fn cheng_v3_udp_bound_port_bridge(fd: int32, isV6: int32): int32
 importc fn cheng_v3_udp_platform_use_len_field_bridge(): int32
+importc fn cheng_v3_udp_platform_msg_dontwait_bridge(): int32
 fn udpErrno(): int32 =
     return cheng_errno()
 
@@ -256,6 +230,9 @@ fn udpBoundPortBridge(fd: int32, isV6: int32): int32 =
 
 fn udpPlatformUseLenFieldBridge(): int32 =
     return cheng_v3_udp_platform_use_len_field_bridge()
+
+fn udpPlatformMsgDontWaitBridge(): int32 =
+    return cheng_v3_udp_platform_msg_dontwait_bridge()
 
 fn openImplRead(filename: str): File =
     let pathText: cstring = strToCStringTemp(filename)
@@ -377,6 +354,31 @@ type
         output: str
         exitCode: int
 type
+    ExecFilePipeSpawnResult = object
+        ok: bool
+        readFd: int32
+        writeFd: int32
+        pid: int64
+type
+    PtySpawnResult = object
+        ok: bool
+        masterFd: int32
+        pid: int64
+type
+    PipeSpawnResult = object
+        ok: bool
+        readFd: int32
+        writeFd: int32
+        pid: int64
+type
+    TextReadResult = object
+        text: str
+        eof: bool
+type
+    PtyWaitResult = object
+        waitStatus: int32
+        exitCode: int32
+type
     seq_WalkDirEntry = WalkDirEntry[]
 fn os_newSeq_WalkDirEntry(len: int32, cap: int32): seq_WalkDirEntry =
     var out: str[]
@@ -457,7 +459,10 @@ fn commandLineParams(): str[] =
 fn quoteShell(value: str): str =
     if strings.len(value) == 0 || value[0] == char(0):
         return "''"
-    return "'" + value + "'"
+    var out: str = "'"
+    out = out + value
+    out = out + "'"
+    return out
 
 fn joinPath(a: str, b: str): str =
     if strings.len(a) == 0 || a[0] == char(0):
@@ -468,7 +473,10 @@ fn joinPath(a: str, b: str): str =
     let last: char = a[aLen - 1]
     if last == '/' || last == '\\':
         return a + b
-    return a + "/" + b
+    var out: str = a
+    out = out + "/"
+    out = out + b
+    return out
 fn `/`(a: str, b: str): str =
     return joinPath(a, b)
 
@@ -578,7 +586,10 @@ fn copyDir(src: str, dest: str) =
     src
     dest
 fn makeWalkDirEntry(kind: PathComponent, path: str): str =
-    return intToStr(int32(kind)) + "|" + path
+    var out: str = intToStr(int32(kind))
+    out = out + "|"
+    out = out + path
+    return out
 fn walkDir(path: str): str[] =
     var out: str[]
     if strings.len(path) == 0 || path[0] == char(0) || ! dirExists path:
@@ -652,101 +663,24 @@ fn execCmdExImpl(command: str, options: uint64, workingDir: str): ExecCmdResult 
     let mask: uint64 = uint64(1)
     if (options & mask) != 0:
         merge = 1
-    var exitCode64: int64 = -1
-    let output1: str = strFromCStringBorrow(cheng_exec_cmd_ex_raw(strToCStringTemp(command),
-                                                                  strToCStringTemp(workingDir),
-                                                                  merge, exitCode64))
+    let output1: str = strFromCStringBorrow(cheng_exec_cmd_capture_raw(strToCStringTemp(command),
+                                                                       strToCStringTemp(workingDir),
+                                                                       merge))
+    let exitCode64: int64 = cheng_exec_cmd_last_exit_code_raw()
     osSetStr(output0, output1)
     exitCode0 = int32(exitCode64)
     return ExecCmdResult(output: output0, exitCode: exitCode0)
 fn execCmdEx(command: str, options: uint64, workingDir: str): ExecCmdResult =
     return execCmdExImpl(command, options, workingDir)
-fn execFileCapture(filePath: str, argv: str[], envOverrides: str[],
-                   workingDir: str, mergeStderr: bool, timeoutSec: int32): ExecCmdResult =
-    var output0: str
-    osSetEmpty(output0)
-    var exitCode0: int32 = -1
-    if strings.len(filePath) == 0:
-        return ExecCmdResult(output: output0, exitCode: exitCode0)
-    var merge: int32 = 0
-    if mergeStderr:
-        merge = 1
-    var exitCode64: int64 = -1
-    let output1: str = strFromCStringBorrow(cheng_exec_file_capture_raw(strToCStringTemp(filePath),
-                                                                        ptr(argv), ptr(envOverrides),
-                                                                        strToCStringTemp(workingDir),
-                                                                        merge, timeoutSec, exitCode64))
-    osSetStr(output0, output1)
-    exitCode0 = int32(exitCode64)
-    return ExecCmdResult(output: output0, exitCode: exitCode0)
-
-fn execFileStatus(filePath: str, argv: str[], envOverrides: str[],
-                  workingDir: str, timeoutSec: int32): int32 =
-    let pathEmpty = strings.len(filePath) == 0
-    if pathEmpty:
+fn execCmdStatus(command: str, workingDir: str): int32 =
+    if strings.len(command) == 0:
         return -1
-    let filePathPtr: cstring = strToCStringTemp(filePath)
-    let argvPtr: ptr = ptr(argv)
-    let envPtr: ptr = ptr(envOverrides)
-    let workingDirPtr: cstring = strToCStringTemp(workingDir)
-    let rc64: int64 = cheng_exec_file_status_raw(filePathPtr,
-                                                 argvPtr,
-                                                 envPtr,
-                                                 workingDirPtr,
-                                                 timeoutSec)
-    return int32(rc64)
-fn execFilePipeSpawn(filePath: str, argv: str[], envOverrides: str[],
-                     workingDir: str): tuple[bool, int32, int32, int64] =
-    var readFd: int32 = -1
-    var writeFd: int32 = -1
-    var pid: int64 = -1
-    if strings.len(filePath) == 0:
-        return (false, readFd, writeFd, pid)
-    let status: int32 = cheng_exec_file_pipe_spawn_raw(strToCStringTemp(filePath),
-                                                       ptr(argv),
-                                                       ptr(envOverrides),
-                                                       strToCStringTemp(workingDir),
-                                                       readFd,
-                                                       writeFd,
-                                                       pid)
-    return (status != 0, readFd, writeFd, pid)
+    return cheng_exec_cmd_status_raw(strToCStringTemp(command),
+                                     strToCStringTemp(workingDir))
 fn execCmdResultExitCode(result: ExecCmdResult): int32 =
     return result.exitCode
 fn execCmdResultOutput(result: ExecCmdResult): str =
     return result.output
-fn ptySupported(): bool =
-    cheng_pty_is_supported() != 0
-fn ptySpawn(command: str, workingDir: str): tuple[bool, int32, int64] =
-    var masterFd: int32 = -1
-    var pid: int64 = -1
-    let status: int32 = cheng_pty_spawn_raw(command, workingDir, masterFd, pid)
-    return (status != 0, masterFd, pid)
-fn pipeSpawn(command: str, workingDir: str): tuple[bool, int32, int32, int64] =
-    var readFd: int32 = -1
-    var writeFd: int32 = -1
-    var pid: int64 = -1
-    let status: int32 = cheng_pipe_spawn_raw(command, workingDir, readFd, writeFd, pid)
-    return (status != 0, readFd, writeFd, pid)
-fn ptyRead(fd: int32, maxBytes: int32): tuple[str, bool] =
-    var eofCode: int32 = 0
-    let text: str = strFromCStringBorrow(cheng_pty_read_raw(fd, maxBytes, eofCode))
-    return (text, eofCode != 0)
-fn fdRead(fd: int32, maxBytes: int32): tuple[str, bool] =
-    var eofCode: int32 = 0
-    let text: str = strFromCStringBorrow(cheng_fd_read_raw(fd, maxBytes, eofCode))
-    return (text, eofCode != 0)
-fn fdReadWait(fd: int32, maxBytes: int32, timeoutMs: int32): tuple[str, bool] =
-    var eofCode: int32 = 0
-    let text: str = strFromCStringBorrow(cheng_fd_read_wait_raw(fd, maxBytes, timeoutMs, eofCode))
-    return (text, eofCode != 0)
-fn ptyWrite(fd: int32, data: str): int32 =
-    return cheng_pty_write(fd, strToCStringTemp(data), strings.len(data))
-fn ptyClose(fd: int32) =
-    cheng_pty_close fd
-fn ptyWait(pid: int64): tuple[int32, int32] =
-    return cheng_pty_wait(pid)
-fn processSignal(pid: int64, signalCode: int32): bool =
-    return cheng_process_signal_raw(pid, signalCode) == 0
 fn sleepMs(value: int32) =
     if value <= 0:
         return

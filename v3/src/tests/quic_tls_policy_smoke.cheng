@@ -27,10 +27,6 @@ fn main(): int32 =
     assert(decodedParsed.keyUsage == 5, "v3 quic tls policy: decoded key usage")
     assert(!decodedParsed.isCa, "v3 quic tls policy: decoded not ca")
     assert(!decodedParsed.hasUnknownCritical, "v3 quic tls policy: decoded no unknown critical")
-    assert(decodedParsed.extKeyUsageCount > 0,
-        "v3 quic tls policy: decoded has eku")
-    assert(decodedParsed.hasServerAuthEku,
-        "v3 quic tls policy: decoded server auth eku")
     assert(decodedParsed.dnsNameCount > 0, "v3 quic tls policy: decoded has san dns")
     assert(x509VerifyHostname(decodedParsed, "localhost"),
         "v3 quic tls policy: decoded hostname")
@@ -54,9 +50,6 @@ fn main(): int32 =
     assert(cert.keyUsage == 5, "v3 quic tls policy: policy key usage")
     assert(!cert.isCa, "v3 quic tls policy: policy not ca")
     assert(!cert.hasUnknownCritical, "v3 quic tls policy: policy no unknown critical")
-    assert(cert.extKeyUsageCount > 0, "v3 quic tls policy: policy has eku")
-    assert(cert.hasServerAuthEku,
-        "v3 quic tls policy: policy server auth eku")
     assert(cert.dnsNameCount > 0, "v3 quic tls policy: policy has san dns")
     assert(x509VerifyHostname(cert, "localhost"),
         "v3 quic tls policy: policy hostname")
@@ -113,5 +106,31 @@ fn main(): int32 =
     let root = Value(rootsRes).items[0]
     let rootCaRes = x509VerifyCaConstraints(root)
     assert(IsOk(rootCaRes), "v3 quic tls policy: trust root ca constraints")
+    let publicPolicy = testpki.msquicMakePublicTransportTlsPolicy("server.cheng-quic.internal")
+    assert(publicPolicy.serverName == "server.cheng-quic.internal",
+        "v3 quic tls policy: public server name")
+    assert(publicPolicy.certLeafKeyKind == X509KeyEcdsaP256,
+        "v3 quic tls policy: public key kind")
+    assert(bytesLen(publicPolicy.certPrivateKey) == testpki.msquicPublicTransportKeyPkcs8DerPairCount,
+        "v3 quic tls policy: public private key len")
+    var publicCert: X509Certificate = initX509Certificate()
+    let publicParseRes: Result[bool] = x509ParseCertificateInto(publicCert, publicPolicy.certChain0)
+    if IsErr(publicParseRes):
+        panic(ErrorText(publicParseRes))
+    assert(publicCert.extKeyUsageCount > 0,
+        "v3 quic tls policy: public has eku")
+    assert(publicCert.hasServerAuthEku,
+        "v3 quic tls policy: public server auth eku")
+    assert(x509VerifyHostname(publicCert, "server.cheng-quic.internal"),
+        "v3 quic tls policy: public exact hostname")
+    assert(x509VerifyHostname(publicCert, "relay.cheng-quic.internal"),
+        "v3 quic tls policy: public alt hostname")
+    assert(x509VerifyHostname(publicCert, "edge.cheng-quic.internal"),
+        "v3 quic tls policy: public wildcard hostname")
+    assert(!x509VerifyHostname(publicCert, "edge.sub.cheng-quic.internal"),
+        "v3 quic tls policy: public reject deep wildcard")
+    let publicLeafRes = x509VerifyLeafConstraints(publicCert)
+    if IsErr(publicLeafRes):
+        panic(ErrorText(publicLeafRes))
     echo("v3 quic_tls_policy_smoke ok")
     return 0

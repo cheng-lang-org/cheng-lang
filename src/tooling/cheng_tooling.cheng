@@ -1,4 +1,5 @@
 import std/os
+import std/os_host_process as hostos
 import std/strutils as strutil
 import std/strings
 import std/cmdline as tcmdline
@@ -1313,11 +1314,11 @@ fn tooling_execFileDirect(filePath: str, argv: str[], envOverrides: str[],
                           workingDir: str, timeoutSec: int32,
                           capturePreferred: bool): os.ExecCmdResult =
     if capturePreferred:
-        return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
-    let directRc: int32 = os.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
+        return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+    let directRc: int32 = hostos.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
     if directRc == 0 || directRc == 124:
         return os.ExecCmdResult(output: "", exitCode: directRc)
-    return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+    return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
 
 fn tooling_commandPathCached(nameRaw: str): str =
     if !tooling_strNonEmpty(strutil.strip(nameRaw)):
@@ -2087,44 +2088,28 @@ fn tooling_releaseLibraryIncludeRuntime(): bool =
     return tooling_isTrue(os.getEnvDefault("BACKEND_RELEASE_LIBRARY_INCLUDE_RUNTIME", "1"))
 
 fn tooling_releaseRuntimeSrcPath(root: str): str =
-    return tooling_pathAbsolute(root, "src/runtime/native/system_helpers.c")
+    return tooling_runtimeRefreshRuntimeSrc(root)
 
-fn tooling_releaseRuntimeObjPath(root: str, outPath: str): str =
-    return tooling_pathAbsolute(
-        root,
-        "chengcache/release_runtime_obj/system_helpers." +
-        (tooling_strNonEmpty(tooling_sanitizeShellSafeToken(root, outPath)) ?
-            tooling_sanitizeShellSafeToken(root, outPath) :
-            "release_runtime") + ".o"
-    )
+fn tooling_releaseRuntimeObjPath(root: str, target: str): str =
+    let driver: str = tooling_resolveStage0Driver(root, "")
+    return tooling_backendLinkEnvRuntimeObjPath(root, driver, target)
 
-fn tooling_releaseRuntimeCompileCmd(root: str, target: str, outPath: str): str =
-    if tooling_strNonEmpty(tooling_compileTargetFlag(target)):
-        return tooling_shellQuote(tooling_releaseCcBin()) + " -std=c11 -O2 " +
-               tooling_compileTargetFlag(target) + " " +
-               "-I " + tooling_shellQuote(tooling_pathAbsolute(root, "src/runtime/native")) + " " +
-               "-c " + tooling_shellQuote(tooling_releaseRuntimeSrcPath(root)) + " " +
-               "-o " + tooling_shellQuote(tooling_releaseRuntimeObjPath(root, outPath))
-    return tooling_shellQuote(tooling_releaseCcBin()) + " -std=c11 -O2 " +
-           "-I " + tooling_shellQuote(tooling_pathAbsolute(root, "src/runtime/native")) + " " +
-           "-c " + tooling_shellQuote(tooling_releaseRuntimeSrcPath(root)) + " " +
-           "-o " + tooling_shellQuote(tooling_releaseRuntimeObjPath(root, outPath))
-
-fn tooling_releaseStaticLinkCmd(outPath: str, objectPath: str): str =
-    if tooling_releaseLibraryIncludeRuntime() && tooling_strNonEmpty(tooling_releaseRuntimeObjPath("", outPath)):
+fn tooling_releaseStaticLinkCmd(outPath: str, objectPath: str, runtimeObjPath: str): str =
+    if tooling_releaseLibraryIncludeRuntime() && tooling_strNonEmpty(runtimeObjPath):
         return tooling_shellQuote(tooling_releaseArBin()) + " rcs " + tooling_shellQuote(outPath) + " " +
-               tooling_shellQuote(objectPath) + " " + tooling_shellQuote(tooling_releaseRuntimeObjPath("", outPath))
+               tooling_shellQuote(objectPath) + " " + tooling_shellQuote(runtimeObjPath)
     return tooling_shellQuote(tooling_releaseArBin()) + " rcs " + tooling_shellQuote(outPath) + " " +
            tooling_shellQuote(objectPath)
 
 fn tooling_releaseSharedLinkCmd(root: str, target: str, outPath: str,
-                                objectPath: str, releaseLdflagsRaw: str): str =
+                                objectPath: str, releaseLdflagsRaw: str,
+                                runtimeObjPath: str): str =
     return tooling_shellQuote(tooling_releaseCcBin()) + " " +
         (tooling_strNonEmpty(tooling_compileTargetFlag(target)) ? tooling_compileTargetFlag(target) + " " : "") +
         tooling_releaseSharedFlag(target) + " -o " + tooling_shellQuote(outPath) + " " +
         tooling_shellQuote(objectPath) +
-        ((tooling_releaseLibraryIncludeRuntime() && tooling_strNonEmpty(tooling_releaseRuntimeObjPath(root, outPath))) ?
-            " " + tooling_shellQuote(tooling_releaseRuntimeObjPath(root, outPath)) :
+        ((tooling_releaseLibraryIncludeRuntime() && tooling_strNonEmpty(runtimeObjPath)) ?
+            " " + tooling_shellQuote(runtimeObjPath) :
             "") +
         (tooling_targetNeedsDlForShared(target) ? " -ldl" : "") +
         (tooling_strNonEmpty(releaseLdflagsRaw) ? " " + releaseLdflagsRaw : "")
@@ -2137,22 +2122,12 @@ fn tooling_linkReleaseLibrary(root: str, emitModeRaw: str, target: str, outPath:
     if !tooling_strNonEmpty(tooling_releaseArBin()):
         tooling_printErr("cheng_tooling: BACKEND_RELEASE_AR is empty")
         return 1
+    let runtimeObjPath: str = tooling_releaseLibraryIncludeRuntime()
+        ? tooling_releaseRuntimeObjPath(root, target)
+        : ""
     if tooling_releaseLibraryIncludeRuntime():
-        if !os.fileExists(tooling_releaseRuntimeSrcPath(root)):
-            tooling_printErr("cheng_tooling: missing runtime C source: " + tooling_releaseRuntimeSrcPath(root))
-            return 1
-        if tooling_strNonEmpty(os.parentDir(tooling_releaseRuntimeObjPath(root, outPath))):
-            if !tooling_mkdirP(root, os.parentDir(tooling_releaseRuntimeObjPath(root, outPath))):
-                tooling_printErr(
-                    "cheng_tooling: failed to create runtime obj dir: " +
-                    os.parentDir(tooling_releaseRuntimeObjPath(root, outPath))
-                )
-                return 1
-        let runtimeCompileRes: os.ExecCmdResult =
-            tooling_exec(root, tooling_releaseRuntimeCompileCmd(root, target, outPath))
-        tooling_printExecOutput(runtimeCompileRes)
-        if os.execCmdResultExitCode(runtimeCompileRes) != 0:
-            tooling_printErr("cheng_tooling: release runtime C object build failed")
+        if !tooling_strNonEmpty(runtimeObjPath) || !os.fileExists(runtimeObjPath):
+            tooling_printErr("cheng_tooling: missing release runtime object for target=" + target)
             return 1
     if os.fileExists(outPath):
         os.removeFile outPath
@@ -2160,13 +2135,11 @@ fn tooling_linkReleaseLibrary(root: str, emitModeRaw: str, target: str, outPath:
         tooling_exec(
             root,
             tooling_strEq(strutil.toLowerAscii(strutil.strip(emitModeRaw)), "static") ?
-                tooling_releaseStaticLinkCmd(outPath, objectPath) :
-                tooling_releaseSharedLinkCmd(root, target, outPath, objectPath, releaseLdflagsRaw)
+                tooling_releaseStaticLinkCmd(outPath, objectPath, runtimeObjPath) :
+                tooling_releaseSharedLinkCmd(root, target, outPath, objectPath, releaseLdflagsRaw, runtimeObjPath)
         )
     tooling_printExecOutput(linkRes)
     let linkRc: int32 = os.execCmdResultExitCode(linkRes)
-    if tooling_releaseLibraryIncludeRuntime() && os.fileExists(tooling_releaseRuntimeObjPath(root, outPath)):
-        os.removeFile(tooling_releaseRuntimeObjPath(root, outPath))
     if linkRc != 0:
         tooling_printErr("cheng_tooling: release library link failed emit=" + strutil.toLowerAscii(strutil.strip(emitModeRaw)))
         return linkRc
@@ -5751,6 +5724,33 @@ fn tooling_runtimeObjHasRequiredSymbols(root: str, objPath: str): bool =
         " need[\"cheng_error_info_bridge_ok\"]=1;" +
         " need[\"cheng_error_info_bridge_new\"]=1;" +
         " need[\"cheng_error_info_bridge_copy_from\"]=1;" +
+        " need[\"cheng_exec_cmd_ex\"]=1;" +
+        " need[\"cheng_exec_file_pipe_spawn\"]=1;" +
+        " need[\"cheng_pty_is_supported\"]=1;" +
+        " need[\"cheng_pty_spawn\"]=1;" +
+        " need[\"cheng_pipe_spawn\"]=1;" +
+        " need[\"cheng_pty_read\"]=1;" +
+        " need[\"cheng_fd_read\"]=1;" +
+        " need[\"cheng_fd_read_wait\"]=1;" +
+        " need[\"cheng_pty_write\"]=1;" +
+        " need[\"cheng_pty_close\"]=1;" +
+        " need[\"cheng_pty_wait\"]=1;" +
+        " need[\"cheng_process_signal\"]=1;" +
+        " need[\"cheng_abi_sum_ptr_len_i32\"]=1;" +
+        " need[\"cheng_abi_sum_seq_i32\"]=1;" +
+        " need[\"cheng_abi_borrow_mut_pair_i32\"]=1;" +
+        " need[\"cheng_ffi_handle_register_ptr\"]=1;" +
+        " need[\"cheng_ffi_handle_resolve_ptr\"]=1;" +
+        " need[\"cheng_ffi_handle_invalidate\"]=1;" +
+        " need[\"cheng_ffi_handle_new_i32\"]=1;" +
+        " need[\"cheng_ffi_handle_get_i32\"]=1;" +
+        " need[\"cheng_ffi_handle_add_i32\"]=1;" +
+        " need[\"cheng_ffi_handle_release_i32\"]=1;" +
+        " need[\"cheng_ffi_raw_new_i32\"]=1;" +
+        " need[\"cheng_ffi_raw_get_i32\"]=1;" +
+        " need[\"cheng_ffi_raw_add_i32\"]=1;" +
+        " need[\"cheng_ffi_raw_release_i32\"]=1;" +
+        " need[\"driver_c_write_text_file_bridge\"]=1;" +
         " need[\"driver_c_proof_buildModuleFromFileStage1TargetRetained\"]=1;" +
         " need[\"driver_c_proof_buildModuleFromFileStage1Retained\"]=1;" +
         " need[\"driver_c_proof_build_emit_obj_from_file_stage1_target_impl\"]=1;" +
@@ -5776,23 +5776,34 @@ fn tooling_runtimeObjHasRequiredSymbols(root: str, objPath: str): bool =
     tooling_runtimeObjSymbolCachePut(root, objPath, ok)
     return ok
 
+fn tooling_runtimeAuthoritySourcePath(root: str): str =
+    return os.joinPath(root, "src/std/system_helpers_backend.cheng")
+
+fn tooling_runtimeMinimalNativeBridgeRelativeList(): str[] =
+    var out: str[] = []
+    add(out, "src/runtime/native/system_helpers_selflink_shim.c")
+    add(out, "src/runtime/native/system_helpers_io_time_bridge.c")
+    add(out, "src/runtime/native/system_helpers_host_process_ffi_bridge.c")
+    return out
+
+fn tooling_runtimeMinimalNativeBridgeSourceList(root: str): str[] =
+    let rels: str[] = tooling_runtimeMinimalNativeBridgeRelativeList()
+    var out: str[] = []
+    for i in 0..<rels.len:
+        add(out, os.joinPath(root, rels[i]))
+    return out
+
 fn tooling_runtimeObjNeedsRefresh(root: str, objPath: str): bool =
     if !tooling_strNonEmpty(objPath) || !os.fileExists(objPath):
         return true
     let objMtime: int64 = os.fileMtime(objPath)
     if objMtime <= 0:
         return true
-    let runtimeSrc: str = os.joinPath(root, "src/std/system_helpers_backend.cheng")
-    let runtimeNativeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers.c")
-    let runtimeNativeHeader: str = os.joinPath(root, "src/runtime/native/system_helpers.h")
-    let shimSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_selflink_shim.c")
-    let minRuntimeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_selflink_min_runtime.c")
-    let fdWriteBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_fd_write_bridge.c")
-    let epochTimeBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_epoch_time_bridge.c")
-    let openCloseBridgeSrc: str = os.joinPath(root, "src/runtime/native/system_helpers_open_close_bridge.c")
-    let deps: str[] = [runtimeSrc, runtimeNativeSrc, runtimeNativeHeader,
-                       shimSrc, minRuntimeSrc,
-                       fdWriteBridgeSrc, epochTimeBridgeSrc, openCloseBridgeSrc]
+    var deps: str[] = []
+    add(deps, tooling_runtimeAuthoritySourcePath(root))
+    let bridgeDeps: str[] = tooling_runtimeMinimalNativeBridgeSourceList(root)
+    for i in 0..<bridgeDeps.len:
+        add(deps, bridgeDeps[i])
     for i in 0..<deps.len:
         let dep: str = deps[i]
         if os.fileExists(dep) && os.fileMtime(dep) > objMtime:
@@ -5945,19 +5956,16 @@ fn tooling_runtimeRefreshDisableSidecar(stage0RouteRaw: str): bool =
     return false
 
 fn tooling_runtimeRefreshRuntimeSrc(root: str): str =
-    return os.joinPath(root, "src/std/system_helpers_backend.cheng")
+    return tooling_runtimeAuthoritySourcePath(root)
 
 fn tooling_runtimeRefreshShimSrc(root: str): str =
     return os.joinPath(root, "src/runtime/native/system_helpers_selflink_shim.c")
 
-fn tooling_runtimeRefreshFdWriteBridgeSrc(root: str): str =
-    return os.joinPath(root, "src/runtime/native/system_helpers_fd_write_bridge.c")
+fn tooling_runtimeRefreshIoTimeBridgeSrc(root: str): str =
+    return os.joinPath(root, "src/runtime/native/system_helpers_io_time_bridge.c")
 
-fn tooling_runtimeRefreshEpochTimeBridgeSrc(root: str): str =
-    return os.joinPath(root, "src/runtime/native/system_helpers_epoch_time_bridge.c")
-
-fn tooling_runtimeRefreshOpenCloseBridgeSrc(root: str): str =
-    return os.joinPath(root, "src/runtime/native/system_helpers_open_close_bridge.c")
+fn tooling_runtimeRefreshHostProcessFfiBridgeSrc(root: str): str =
+    return os.joinPath(root, "src/runtime/native/system_helpers_host_process_ffi_bridge.c")
 
 fn tooling_runtimeRefreshBridgeSrc(root: str): str =
     return os.joinPath(root, "src/backend/tooling/backend_driver_symbol_bridge.c")
@@ -5971,14 +5979,11 @@ fn tooling_runtimeRefreshRuntimeDir(root: str): str =
 fn tooling_runtimeRefreshShimObj(root: str, target: str): str =
     return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_selflink_shim." + target + ".o")
 
-fn tooling_runtimeRefreshFdWriteBridgeObj(root: str, target: str): str =
-    return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_fd_write_bridge." + target + ".o")
+fn tooling_runtimeRefreshIoTimeBridgeObj(root: str, target: str): str =
+    return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_io_time_bridge." + target + ".o")
 
-fn tooling_runtimeRefreshEpochTimeBridgeObj(root: str, target: str): str =
-    return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_epoch_time_bridge." + target + ".o")
-
-fn tooling_runtimeRefreshOpenCloseBridgeObj(root: str, target: str): str =
-    return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_open_close_bridge." + target + ".o")
+fn tooling_runtimeRefreshHostProcessFfiBridgeObj(root: str, target: str): str =
+    return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "system_helpers_host_process_ffi_bridge." + target + ".o")
 
 fn tooling_runtimeRefreshBridgeObj(root: str, target: str): str =
     return os.joinPath(tooling_runtimeRefreshRuntimeDir(root), "backend_driver_symbol_bridge." + target + ".o")
@@ -6030,8 +6035,9 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
     let refreshEnabled: bool =
         tooling_isTrue(os.getEnvDefault("BACKEND_RUNTIME_OBJ_REFRESH", "0")) ||
         tooling_isTrue(os.getEnvDefault("BACKEND_BUILD_DRIVER_RUNTIME_OBJ_REFRESH", "0")) ||
-        tooling_isTrue(os.getEnvDefault("BACKEND_SELFHOST_RUNTIME_OBJ_REFRESH", "0"))
-    if !refreshEnabled && fallbackUsable:
+        tooling_isTrue(os.getEnvDefault("BACKEND_SELFHOST_RUNTIME_OBJ_REFRESH", "0")) ||
+        !fallbackOk
+    if !refreshEnabled && fallbackOk:
         return fallbackPath
     if !tooling_strNonEmpty(tooling_runtimeLdArch(target)):
         return fallbackPath
@@ -6048,48 +6054,20 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
     else:
         var prepared: bool = false
         if false && os.fileExists(tooling_runtimeRefreshMmSourceObj(root, target)) &&
-           os.fileExists(tooling_runtimeRefreshFdWriteBridgeSrc(root)) &&
-           os.fileExists(tooling_runtimeRefreshEpochTimeBridgeSrc(root)) &&
-           os.fileExists(tooling_runtimeRefreshOpenCloseBridgeSrc(root)):
+           os.fileExists(tooling_runtimeRefreshIoTimeBridgeSrc(root)):
             var compileEnv: str[] = []
             var ccArgs: str[] = []
             add(ccArgs, "-std=c11")
             add(ccArgs, "-O2")
             add(ccArgs, "-mmacosx-version-min=11.0")
             add(ccArgs, "-c")
-            add(ccArgs, tooling_runtimeRefreshFdWriteBridgeSrc(root))
+            add(ccArgs, tooling_runtimeRefreshIoTimeBridgeSrc(root))
             add(ccArgs, "-o")
-            add(ccArgs, tooling_runtimeRefreshFdWriteBridgeObj(root, target))
+            add(ccArgs, tooling_runtimeRefreshIoTimeBridgeObj(root, target))
             let prepMmFdRes: os.ExecCmdResult =
                 tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
             prepRcFinal = os.execCmdResultExitCode(prepMmFdRes)
             tooling_runtimeRefreshAppendOutput(prepOutLogs, prepMmFdRes)
-            if prepRcFinal == 0:
-                ccArgs = []
-                add(ccArgs, "-std=c11")
-                add(ccArgs, "-O2")
-                add(ccArgs, "-mmacosx-version-min=11.0")
-                add(ccArgs, "-c")
-                add(ccArgs, tooling_runtimeRefreshEpochTimeBridgeSrc(root))
-                add(ccArgs, "-o")
-                add(ccArgs, tooling_runtimeRefreshEpochTimeBridgeObj(root, target))
-                let prepMmEpochRes: os.ExecCmdResult =
-                    tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
-                prepRcFinal = os.execCmdResultExitCode(prepMmEpochRes)
-                tooling_runtimeRefreshAppendOutput(prepOutLogs, prepMmEpochRes)
-            if prepRcFinal == 0:
-                ccArgs = []
-                add(ccArgs, "-std=c11")
-                add(ccArgs, "-O2")
-                add(ccArgs, "-mmacosx-version-min=11.0")
-                add(ccArgs, "-c")
-                add(ccArgs, tooling_runtimeRefreshOpenCloseBridgeSrc(root))
-                add(ccArgs, "-o")
-                add(ccArgs, tooling_runtimeRefreshOpenCloseBridgeObj(root, target))
-                let prepMmOpenCloseRes: os.ExecCmdResult =
-                    tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
-                prepRcFinal = os.execCmdResultExitCode(prepMmOpenCloseRes)
-                tooling_runtimeRefreshAppendOutput(prepOutLogs, prepMmOpenCloseRes)
             if prepRcFinal == 0:
                 var ldArgs: str[] = []
                 add(ldArgs, "-r")
@@ -6098,12 +6076,10 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
                 add(ldArgs, "-o")
                 add(ldArgs, tooling_runtimeRefreshCombinedTmp(root, target))
                 add(ldArgs, tooling_runtimeRefreshMmSourceObj(root, target))
-                add(ldArgs, tooling_runtimeRefreshFdWriteBridgeObj(root, target))
-                add(ldArgs, tooling_runtimeRefreshEpochTimeBridgeObj(root, target))
-                add(ldArgs, tooling_runtimeRefreshOpenCloseBridgeObj(root, target))
+                add(ldArgs, tooling_runtimeRefreshIoTimeBridgeObj(root, target))
                 let prepMmLdRes: os.ExecCmdResult =
                     tooling_execProgramDirect(root, "ld", ldArgs, compileEnv, root, timeoutSec, true)
-                prepRcFinal = os.execCmdResultExitCode(prepMmLdRes)
+                    prepRcFinal = os.execCmdResultExitCode(prepMmLdRes)
                 tooling_runtimeRefreshAppendOutput(prepOutLogs, prepMmLdRes)
                 if prepRcFinal == 0 &&
                    !os.renameFile(
@@ -6120,9 +6096,8 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
                        tooling_runtimeObjHasRequiredSymbols(root, tooling_runtimeRefreshCombinedObj(root, target))
         if !prepared:
             if !os.fileExists(tooling_runtimeRefreshShimSrc(root)) ||
-               !os.fileExists(tooling_runtimeRefreshFdWriteBridgeSrc(root)) ||
-               !os.fileExists(tooling_runtimeRefreshEpochTimeBridgeSrc(root)) ||
-               !os.fileExists(tooling_runtimeRefreshOpenCloseBridgeSrc(root)):
+               !os.fileExists(tooling_runtimeRefreshIoTimeBridgeSrc(root)) ||
+               !os.fileExists(tooling_runtimeRefreshHostProcessFfiBridgeSrc(root)):
                 return fallbackPath
             prepRcFinal = 0
             if prepRcFinal == 0:
@@ -6145,9 +6120,9 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
                     add(ccArgs, "-O2")
                     add(ccArgs, "-mmacosx-version-min=11.0")
                     add(ccArgs, "-c")
-                    add(ccArgs, tooling_runtimeRefreshFdWriteBridgeSrc(root))
+                    add(ccArgs, tooling_runtimeRefreshIoTimeBridgeSrc(root))
                     add(ccArgs, "-o")
-                    add(ccArgs, tooling_runtimeRefreshFdWriteBridgeObj(root, target))
+                    add(ccArgs, tooling_runtimeRefreshIoTimeBridgeObj(root, target))
                     let fdRes: os.ExecCmdResult =
                         tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
                     prepRcFinal = os.execCmdResultExitCode(fdRes)
@@ -6158,26 +6133,13 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
                     add(ccArgs, "-O2")
                     add(ccArgs, "-mmacosx-version-min=11.0")
                     add(ccArgs, "-c")
-                    add(ccArgs, tooling_runtimeRefreshEpochTimeBridgeSrc(root))
+                    add(ccArgs, tooling_runtimeRefreshHostProcessFfiBridgeSrc(root))
                     add(ccArgs, "-o")
-                    add(ccArgs, tooling_runtimeRefreshEpochTimeBridgeObj(root, target))
-                    let epochRes: os.ExecCmdResult =
+                    add(ccArgs, tooling_runtimeRefreshHostProcessFfiBridgeObj(root, target))
+                    let hostBridgeRes: os.ExecCmdResult =
                         tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
-                    prepRcFinal = os.execCmdResultExitCode(epochRes)
-                    tooling_runtimeRefreshAppendOutput(prepOutLogs, epochRes)
-                if prepRcFinal == 0:
-                    ccArgs = []
-                    add(ccArgs, "-std=c11")
-                    add(ccArgs, "-O2")
-                    add(ccArgs, "-mmacosx-version-min=11.0")
-                    add(ccArgs, "-c")
-                    add(ccArgs, tooling_runtimeRefreshOpenCloseBridgeSrc(root))
-                    add(ccArgs, "-o")
-                    add(ccArgs, tooling_runtimeRefreshOpenCloseBridgeObj(root, target))
-                    let openCloseRes: os.ExecCmdResult =
-                        tooling_execProgramDirect(root, "cc", ccArgs, compileEnv, root, timeoutSec, true)
-                    prepRcFinal = os.execCmdResultExitCode(openCloseRes)
-                    tooling_runtimeRefreshAppendOutput(prepOutLogs, openCloseRes)
+                    prepRcFinal = os.execCmdResultExitCode(hostBridgeRes)
+                    tooling_runtimeRefreshAppendOutput(prepOutLogs, hostBridgeRes)
                 if prepRcFinal == 0:
                     var ldArgs: str[] = []
                     add(ldArgs, "-r")
@@ -6186,9 +6148,8 @@ fn tooling_prepareRuntimeObjForTargetWithRoute(root: str, compilerPath: str, tar
                     add(ldArgs, "-o")
                     add(ldArgs, tooling_runtimeRefreshCombinedTmp(root, target))
                     add(ldArgs, tooling_runtimeRefreshShimObj(root, target))
-                    add(ldArgs, tooling_runtimeRefreshFdWriteBridgeObj(root, target))
-                    add(ldArgs, tooling_runtimeRefreshEpochTimeBridgeObj(root, target))
-                    add(ldArgs, tooling_runtimeRefreshOpenCloseBridgeObj(root, target))
+                    add(ldArgs, tooling_runtimeRefreshIoTimeBridgeObj(root, target))
+                    add(ldArgs, tooling_runtimeRefreshHostProcessFfiBridgeObj(root, target))
                     let ldRes: os.ExecCmdResult =
                         tooling_execProgramDirect(root, "ld", ldArgs, compileEnv, root, timeoutSec, true)
                     prepRcFinal = os.execCmdResultExitCode(ldRes)
@@ -6291,14 +6252,12 @@ fn tooling_cmdBackendResolveSelflinkRuntimeObjFromArgs(root: str, argStart: int3
     if !tooling_strNonEmpty(target) || tooling_strEq(target, "auto"):
         tooling_printErr("cheng_tooling: unable to resolve backend target; pass --target:<triple>")
         return 1
-    let ok: bool = tooling_strNonEmpty(tooling_backendResolveSelflinkRuntimeObjPath(root, target, prepare)) &&
-                   os.fileExists(tooling_backendResolveSelflinkRuntimeObjPath(root, target, prepare)) &&
-                   tooling_runtimeObjHasRequiredSymbols(
-                       root,
-                       tooling_backendResolveSelflinkRuntimeObjPath(root, target, prepare)
-                   )
+    let runtimeObjPath: str = tooling_backendResolveSelflinkRuntimeObjPath(root, target, prepare)
+    let ok: bool = tooling_strNonEmpty(runtimeObjPath) &&
+                   os.fileExists(runtimeObjPath) &&
+                   tooling_runtimeObjHasRequiredSymbols(root, runtimeObjPath)
     tooling_printOut("backend_runtime_obj_target=" + target)
-    tooling_printOut("backend_runtime_obj_path=" + tooling_backendResolveSelflinkRuntimeObjPath(root, target, prepare))
+    tooling_printOut("backend_runtime_obj_path=" + runtimeObjPath)
     tooling_printOut("backend_runtime_obj_ok=" + tooling_boolText(ok))
     if ok:
         return 0
@@ -7705,11 +7664,10 @@ fn tooling_backendDriverCurrentsrcProofPublishedStage0SourceList(): str[] =
     add(out, "src/backend/tooling/backend_driver_proof.cheng")
     add(out, "src/backend/tooling/backend_driver_uir_shared.cheng")
     add(out, "src/backend/tooling/backend_driver_uir_module_shared.cheng")
-    add(out, "src/runtime/native/system_helpers_selflink_shim.c")
-    add(out, "src/runtime/native/system_helpers_selflink_min_runtime.c")
-    add(out, "src/runtime/native/system_helpers_fd_write_bridge.c")
-    add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
-    add(out, "src/runtime/native/system_helpers_open_close_bridge.c")
+    add(out, "src/std/system_helpers_backend.cheng")
+    let runtimeBridges: str[] = tooling_runtimeMinimalNativeBridgeRelativeList()
+    for i in 0..<runtimeBridges.len:
+        add(out, runtimeBridges[i])
     return out
 
 fn tooling_backendDriverCurrentsrcProofBootstrapStage0SourceList(): str[] =
@@ -8047,7 +8005,6 @@ fn tooling_backendDriverUirSidecarDependencyPaths(root: str): str[] =
     var out: str[] = []
     add(out, tooling_backendDriverUirSidecarCSourcePath(root))
     add(out, tooling_backendDriverUirSidecarWrapperSourcePath(root))
-    add(out, os.joinPath(root, "src/runtime/native/system_helpers.h"))
     let stage0Deps: str[] = tooling_stage0CapabilitySourceList()
     for i in 0..<stage0Deps.len:
         let dep: str = os.joinPath(root, stage0Deps[i])
@@ -8074,8 +8031,7 @@ fn tooling_backendDriverSidecarOuterDriverNeedsRebuild(root: str, outPath: str):
     add(deps, tooling_backendDriverSidecarOuterDriverSourcePath(root))
     add(deps, tooling_backendDriverSidecarOuterExportsSourcePath(root))
     add(deps, tooling_backendDriverUirSidecarCSourcePath(root))
-    add(deps, os.joinPath(root, "src/runtime/native/system_helpers.c"))
-    add(deps, os.joinPath(root, "src/runtime/native/system_helpers.h"))
+    add(deps, tooling_runtimeRefreshShimSrc(root))
     for i in 0..<deps.len:
         let dep: str = deps[i]
         if !os.fileExists(dep):
@@ -8087,7 +8043,7 @@ fn tooling_backendDriverSidecarOuterDriverNeedsRebuild(root: str, outPath: str):
 fn tooling_prepareBackendDriverSidecarOuterDriver(root: str, target: str): str =
     let sourcePath: str = tooling_backendDriverSidecarOuterDriverSourcePath(root)
     let exportSourcePath: str = tooling_backendDriverSidecarOuterExportsSourcePath(root)
-    let runtimePath: str = os.joinPath(root, "src/runtime/native/system_helpers.c")
+    let runtimePath: str = tooling_runtimeRefreshShimSrc(root)
     let outPath: str = tooling_backendDriverSidecarOuterDriverPath(root, target)
     if !os.fileExists(sourcePath) || !os.fileExists(exportSourcePath) || !os.fileExists(runtimePath):
         return ""
@@ -12030,15 +11986,15 @@ fn tooling_cmdCompileExe(root: str, inRaw: str, outRaw: str, nameRaw: str, targe
     var res: os.ExecCmdResult
     if directExecAllowed:
         if directCapturePreferred:
-            res = os.execFileCapture(stage0Exec, stage0Args, envOverrides, root, true, timeoutSec)
+            res = hostos.execFileCapture(stage0Exec, stage0Args, envOverrides, root, true, timeoutSec)
         else:
-            let directRc: int32 = os.execFileStatus(stage0Exec, stage0Args, envOverrides, root, timeoutSec)
+            let directRc: int32 = hostos.execFileStatus(stage0Exec, stage0Args, envOverrides, root, timeoutSec)
             if directRc == 0:
                 res = os.ExecCmdResult(output: "", exitCode: 0)
             elif directRc == 124:
                 res = os.ExecCmdResult(output: "", exitCode: directRc)
             else:
-                res = os.execFileCapture(stage0Exec, stage0Args, envOverrides, root, true, timeoutSec)
+                res = hostos.execFileCapture(stage0Exec, stage0Args, envOverrides, root, true, timeoutSec)
     else:
         res = tooling_exec(root, runCmd)
     compileExecMs = tooling_nowMs() - compileExecStartMs
@@ -20354,7 +20310,7 @@ fn tooling_cmdVerifyStdLayoutSync(root: str): int32 =
             tooling_printErr("[verify_std_layout_sync] found unmerged copy files in " + stdRoot)
             return 1
     let requiredModules: str[] = [
-        "seqs.cheng", "strings.cheng", "system.cheng", "os.cheng", "syncio.cheng",
+        "seqs.cheng", "strings.cheng", "system.cheng", "os.cheng",
         "streams.cheng", "tables.cheng", "hashmaps.cheng", "hashsets.cheng", "cmdline.cheng",
         "bytes.cheng", "rawbytes.cheng", "result.cheng", "option.cheng", "strformat.cheng",
         "strutils.cheng", "json.cheng", "parseutils.cheng", "varint.cheng",

@@ -1,0 +1,114 @@
+import std/result
+import std/strings as strings
+import cheng/v3/mobile/hardware/biometric
+import cheng/v3/project/chain_node as chain
+import cheng/v3/project/bio_did_chain_node as flow
+
+type
+    V3BioDidMobileFingerprintRequest =
+        requestId: str
+        didText: str
+        deviceBindingSeedHint: str
+        deviceLabelHint: str
+        promptTitle: str
+        promptReason: str
+
+fn v3BioDidMobileFingerprintRequestZero(): V3BioDidMobileFingerprintRequest =
+    var out: V3BioDidMobileFingerprintRequest
+    out.requestId = ""
+    out.didText = ""
+    out.deviceBindingSeedHint = ""
+    out.deviceLabelHint = ""
+    out.promptTitle = ""
+    out.promptReason = ""
+    return out
+
+fn v3BioDidMobileFingerprintRequestValidate(request: V3BioDidMobileFingerprintRequest,
+                                            importing: bool): Result[bool] =
+    if strings.len(request.requestId) <= 0:
+        return Err[bool]("v3 bio did mobile: request id required")
+    if importing && strings.len(request.didText) <= 0:
+        return Err[bool]("v3 bio did mobile: did required for import")
+    if strings.len(request.deviceBindingSeedHint) <= 0:
+        return Err[bool]("v3 bio did mobile: device binding seed required")
+    if strings.len(request.deviceLabelHint) <= 0:
+        return Err[bool]("v3 bio did mobile: device label required")
+    if strings.len(request.promptTitle) <= 0:
+        return Err[bool]("v3 bio did mobile: prompt title required")
+    if strings.len(request.promptReason) <= 0:
+        return Err[bool]("v3 bio did mobile: prompt reason required")
+    return Ok[bool](true)
+
+fn v3BioDidMobileFingerprintAuthorizeReq(request: V3BioDidMobileFingerprintRequest,
+                                         importing: bool):
+                                         biometric.V3BiometricFingerprintAuthorizeReq =
+    var out = biometric.v3BiometricFingerprintAuthorizeReqZero()
+    out.requestId = request.requestId
+    if importing:
+        out.purpose = biometric.v3BiometricPurposeDidImport
+    else:
+        out.purpose = biometric.v3BiometricPurposeDidCreate
+    out.didText = request.didText
+    out.promptTitle = request.promptTitle
+    out.promptReason = request.promptReason
+    out.deviceBindingSeedHint = request.deviceBindingSeedHint
+    out.deviceLabelHint = request.deviceLabelHint
+    return out
+
+fn v3BioDidMobileHardwareCaptureFromResp(request: V3BioDidMobileFingerprintRequest,
+                                         resp: biometric.V3BiometricFingerprintAuthorizeResp):
+                                         Result[flow.V3BioDidHardwareCapture] =
+    if resp.deviceBindingSeed != request.deviceBindingSeedHint:
+        return Err[flow.V3BioDidHardwareCapture](
+            "v3 bio did mobile: host device binding seed mismatch"
+        )
+    if resp.deviceLabel != request.deviceLabelHint:
+        return Err[flow.V3BioDidHardwareCapture]("v3 bio did mobile: host device label mismatch")
+    var capture = flow.v3BioDidHardwareCaptureZero()
+    capture.verified = true
+    capture.feature32 = resp.feature32
+    capture.requestId = request.requestId
+    capture.sensorId = resp.sensorId
+    capture.deviceBindingSeed = resp.deviceBindingSeed
+    capture.deviceLabel = resp.deviceLabel
+    capture.hardwareAttestation = resp.hardwareAttestation
+    return Ok[flow.V3BioDidHardwareCapture](capture)
+
+fn v3BioDidMobileCreateWithFingerprint(node: var chain.V3ChainNode,
+                                       request: V3BioDidMobileFingerprintRequest,
+                                       epochSeconds: int64): Result[flow.V3BioDidProvisionResult] =
+    let reqOk = v3BioDidMobileFingerprintRequestValidate(request, false)
+    if IsErr(reqOk):
+        return Err[flow.V3BioDidProvisionResult](Error(reqOk))
+    let authReq = v3BioDidMobileFingerprintAuthorizeReq(request, false)
+    var authResp = biometric.v3BiometricFingerprintAuthorizeRespZero()
+    let authOk = biometric.v3BiometricFingerprintAuthorizeBlockingFillV3(authResp,
+                                                                         request.requestId,
+                                                                         authReq)
+    if IsErr(authOk):
+        return Err[flow.V3BioDidProvisionResult](Error(authOk))
+    let captureRes = v3BioDidMobileHardwareCaptureFromResp(request, authResp)
+    if IsErr(captureRes):
+        return Err[flow.V3BioDidProvisionResult](Error(captureRes))
+    return flow.v3BioDidCreateWithHardwareCapture(node, Value(captureRes), epochSeconds)
+
+fn v3BioDidMobileImportWithFingerprint(node: var chain.V3ChainNode,
+                                       request: V3BioDidMobileFingerprintRequest,
+                                       epochSeconds: int64): Result[flow.V3BioDidProvisionResult] =
+    let reqOk = v3BioDidMobileFingerprintRequestValidate(request, true)
+    if IsErr(reqOk):
+        return Err[flow.V3BioDidProvisionResult](Error(reqOk))
+    let authReq = v3BioDidMobileFingerprintAuthorizeReq(request, true)
+    var authResp = biometric.v3BiometricFingerprintAuthorizeRespZero()
+    let authOk = biometric.v3BiometricFingerprintAuthorizeBlockingFillV3(authResp,
+                                                                         request.requestId,
+                                                                         authReq)
+    if IsErr(authOk):
+        return Err[flow.V3BioDidProvisionResult](Error(authOk))
+    let captureRes = v3BioDidMobileHardwareCaptureFromResp(request, authResp)
+    if IsErr(captureRes):
+        return Err[flow.V3BioDidProvisionResult](Error(captureRes))
+    return flow.v3BioDidImportWithHardwareCapture(node,
+                                                  request.didText,
+                                                  Value(captureRes),
+                                                  epochSeconds)

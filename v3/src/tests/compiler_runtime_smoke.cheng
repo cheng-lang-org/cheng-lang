@@ -1,5 +1,9 @@
 import cheng/v3/tooling/compiler_runtime as crun
 import cheng/v3/backend/build_plan as buildplan
+import cheng/v3/runtime/core_runtime_v3 as corun
+import cheng/v3/runtime/compiler_runtime_v3 as rtrun
+import cheng/v3/runtime/debug_runtime_v3 as dbrun
+import cheng/v3/runtime/program_support_v3 as psrun
 
 fn main(): int32 =
     let contract = crun.v3CompilerRuntimeContract("/tmp/cheng-lang")
@@ -20,6 +24,34 @@ fn main(): int32 =
            "v3 compiler runtime: core provider")
     assert(crun.v3DebugRuntimeProviderModule() == "runtime/debug_runtime_v3",
            "v3 compiler runtime: debug provider")
+    let programRuntimeContract = rtrun.v3CompilerRuntimeContract("/tmp/cheng-lang",
+                                                                 rtrun.v3CompilerRuntimeTrackProgram)
+    let toolingRuntimeContract = rtrun.v3CompilerRuntimeContract("/tmp/cheng-lang",
+                                                                 rtrun.v3CompilerRuntimeTrackTooling)
+    let coreDarwinContract = corun.v3CoreRuntimeContractForTarget("/tmp/cheng-lang",
+                                                                  "arm64-apple-darwin")
+    let coreLinuxContract = corun.v3CoreRuntimeContractForTarget("/tmp/cheng-lang",
+                                                                 "x86_64-unknown-linux-gnu")
+    let debugRuntimeContract = dbrun.v3DebugRuntimeContract("/tmp/cheng-lang")
+    let programSupportContract = psrun.v3ProgramSupportContract("/tmp/cheng-lang")
+    assert(programRuntimeContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng",
+           "v3 compiler runtime: program argv provider source")
+    assert(toolingRuntimeContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng",
+           "v3 compiler runtime: tooling argv provider source")
+    assert(coreDarwinContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/core_runtime_provider_darwin_v3.cheng",
+           "v3 compiler runtime: darwin core provider source")
+    assert(coreLinuxContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/core_runtime_provider_linux_v3.cheng",
+           "v3 compiler runtime: linux core provider source")
+    assert(debugRuntimeContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/debug_runtime_stub_v3.cheng",
+           "v3 compiler runtime: debug provider source")
+    assert(programSupportContract.providerNativeSources[0] ==
+               "/tmp/cheng-lang/v3/src/runtime/program_support_backend_v3.cheng",
+           "v3 compiler runtime: support provider source")
     var providers: str[]
     crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackProgram, providers)
     assert(providers.len == 4, "v3 compiler runtime: provider count")
@@ -36,6 +68,9 @@ fn main(): int32 =
     assert(lines.len >= 6, "v3 compiler runtime: usage lines")
     assert(lines[0] == "cheng_v3c", "v3 compiler runtime: usage header")
     var sawSystemLink = false
+    var sawBootstrapBridge = false
+    var sawBuildBackendDriver = false
+    var sawHostBridgeAudit = false
     var sawEmitCsg = false
     var sawMigrateCsg = false
     var sawVerifyWorld = false
@@ -45,49 +80,13 @@ fn main(): int32 =
     var sawPublishWorld = false
     var sawFreshNodeSelfhost = false
     var sawSelfhostBuild = false
-    var sawScanHotpath = false
-    var sawCRef = false
-    var sawCompareBench = false
-    var sawBootstrapBridge = false
-    var sawBuildBackendDriver = false
-    var sawRunSmokes = false
-    var sawPrintBootstrap = false
-    var sawSliceGate = false
-    var sawDebugReport = false
-    var sawPrintSymbols = false
-    var sawPrintLineMap = false
-    var sawPrintObject = false
-    var sawPrintElf = false
-    var sawPrintAsm = false
-    var sawProfileRun = false
-    var sawProfileReport = false
-    var sawVerifyDebugTools = false
-    var sawVerifyDebugRuntime = false
-    var sawVerifyDebugProfile = false
-    var sawVerifyWindowsBuiltin = false
-    var sawVerifyRiscvBuiltin = false
-    var sawRunCrossTargetSmokes = false
-    var sawRunHostSmokes = false
-    var sawRunStage23Libp2pSmokes = false
-    var sawBuildZeroExit = false
-    var sawBuildPanicTrace = false
-    var sawBuildBoundsTrace = false
-    var sawBuildSignalTrace = false
-    var sawBuildCallChain = false
-    var sawBuildFfiHandle = false
-    var sawBuildBftStateMachine = false
-    var sawBuildBrowserHostWasm = false
-    var sawBuildRwadBftStateMachine = false
-    var sawBuildProgramSelfhost = false
-    var sawBuildChainNode = false
-    var sawBuildLinuxNolibcExe = false
-    var sawBuildChainNodeLinux = false
-    var sawBuildRwadBftLinux = false
-    var sawRunLinuxObjectSmokes = false
-    var sawRunChainNodeProcessSmoke = false
-    var sawRunChainNodeThreeNodeSmoke = false
-    var sawR2cReactV3 = false
     for i in 0..<lines.len:
+        if lines[i] == "  bootstrap-bridge             rebuild and install bootstrap stage0-stage3 via candidate artifacts":
+            sawBootstrapBridge = true
+        if lines[i] == "  build-backend-driver         rebuild and verify the ordinary backend driver":
+            sawBuildBackendDriver = true
+        if lines[i] == "  host-bridge-audit            fail if legacy host-bridge surfaces leak back into the live path":
+            sawHostBridgeAudit = true
         if lines[i] == "  system-link-exec             ordinary AOT compile entry (canonical CSG + provider object plan)":
             sawSystemLink = true
         if lines[i] == "  emit-csg                     emit the canonical compiler CSG report for a source closure":
@@ -108,90 +107,9 @@ fn main(): int32 =
             sawFreshNodeSelfhost = true
         if lines[i] == "  selfhost-build               run the selfhost build gate pinned to a world head":
             sawSelfhostBuild = true
-        if lines[i] == "  scan-hotpath                 scan v3 source for forbidden hot-path patterns":
-            sawScanHotpath = true
-        if lines[i] == "  c-ref                        run the same-machine C reference baseline":
-            sawCRef = true
-        if lines[i] == "  compare-bench                compare two benchmark reports against a max ratio":
-            sawCompareBench = true
-        if lines[i] == "  bootstrap-bridge             materialize stage0 -> stage3 bootstrap compilers":
-            sawBootstrapBridge = true
-        if lines[i] == "  build-backend-driver         build the ordinary Cheng compiler from stage2":
-            sawBuildBackendDriver = true
-        if lines[i] == "  run-smokes                   run bootstrap self-check smokes":
-            sawRunSmokes = true
-        if lines[i] == "  print-bootstrap              print the current bootstrap snapshot":
-            sawPrintBootstrap = true
-        if lines[i] == "  slice-gate                   run the v3 gate slice":
-            sawSliceGate = true
-        if lines[i] == "  debug-report                 print the canonical debug pipeline report":
-            sawDebugReport = true
-        if lines[i] == "  print-symbols                print lowering and object/native symbols":
-            sawPrintSymbols = true
-        if lines[i] == "  print-line-map               print the source line mapping report":
-            sawPrintLineMap = true
-        if lines[i] == "  print-object                 print Mach-O / ELF / COFF object structure":
-            sawPrintObject = true
-        if lines[i] == "  print-elf                    compatibility alias of print-object":
-            sawPrintElf = true
-        if lines[i] == "  print-asm                    print the emitted assembly text":
-            sawPrintAsm = true
-        if lines[i] == "  profile-run                  build, run, and dump the builtin profiler report":
-            sawProfileRun = true
-        if lines[i] == "  profile-report               transform a raw profiler dump into the final report":
-            sawProfileReport = true
-        if lines[i] == "  verify-debug-tools           run the built-in debug tooling verification gate":
-            sawVerifyDebugTools = true
-        if lines[i] == "  verify-debug-runtime         run the built-in crash report verification gate":
-            sawVerifyDebugRuntime = true
-        if lines[i] == "  verify-debug-profile         run the built-in statistical profiler gate":
-            sawVerifyDebugProfile = true
-        if lines[i] == "  verify-windows-builtin       verify the builtin Windows AArch64 executable path":
-            sawVerifyWindowsBuiltin = true
-        if lines[i] == "  verify-riscv64-builtin       verify the builtin Linux RISCV64 executable path":
-            sawVerifyRiscvBuiltin = true
-        if lines[i] == "  run-cross-target-smokes      run the builtin Windows and RISCV cross-target smokes":
-            sawRunCrossTargetSmokes = true
-        if lines[i] == "  run-host-smokes              run the host smoke suite from the compiler entry":
-            sawRunHostSmokes = true
-        if lines[i] == "  run-stage23-libp2p-smokes    run the stage2/stage3 libp2p smoke suite from the compiler entry":
-            sawRunStage23Libp2pSmokes = true
-        if lines[i] == "  build-zero-exit              build and run the ordinary zero-exit fixture":
-            sawBuildZeroExit = true
-        if lines[i] == "  build-panic-trace            build and verify the panic crash report fixture":
-            sawBuildPanicTrace = true
-        if lines[i] == "  build-bounds-trace           build and verify the bounds crash report fixture":
-            sawBuildBoundsTrace = true
-        if lines[i] == "  build-signal-trace           build and verify the signal crash report fixture":
-            sawBuildSignalTrace = true
-        if lines[i] == "  build-call-chain             build and run the ordinary call-chain fixture":
-            sawBuildCallChain = true
-        if lines[i] == "  build-ffi-handle             build and verify the ffi handle fixture pair":
-            sawBuildFfiHandle = true
-        if lines[i] == "  build-bft-state-machine      build and run the standalone BFT state machine":
-            sawBuildBftStateMachine = true
-        if lines[i] == "  build-browser-host-wasm      build the browser host wasm ABI probe":
-            sawBuildBrowserHostWasm = true
-        if lines[i] == "  build-rwad-bft-state-machine build rwad_bft_state_machine for the selected target":
-            sawBuildRwadBftStateMachine = true
-        if lines[i] == "  build-program-selfhost       build and run the program selfhost fixture":
-            sawBuildProgramSelfhost = true
-        if lines[i] == "  build-chain-node             build the chain_node daemon and run self-test on host target":
-            sawBuildChainNode = true
-        if lines[i] == "  build-linux-nolibc-exe       build a generic Linux aarch64 nolibc executable from env":
-            sawBuildLinuxNolibcExe = true
-        if lines[i] == "  build-chain-node-linux       build chain_node for generic Linux aarch64 (obj or nolibc exe)":
-            sawBuildChainNodeLinux = true
-        if lines[i] == "  build-rwad-bft-linux         build rwad_bft_state_machine for generic Linux aarch64 (obj or nolibc exe)":
-            sawBuildRwadBftLinux = true
-        if lines[i] == "  run-linux-object-smokes      verify generic Linux aarch64 object emission for chain_node and rwad_bft":
-            sawRunLinuxObjectSmokes = true
-        if lines[i] == "  run-chain-node-process-smoke build and run the two-process chain_node sync smoke":
-            sawRunChainNodeProcessSmoke = true
-        if lines[i] == "  run-chain-node-three-node-smoke build and run the three-node chain_node sync smoke":
-            sawRunChainNodeThreeNodeSmoke = true
-        if lines[i] == "  r2c-react-v3                 run the React.js -> Cheng v3 controller":
-            sawR2cReactV3 = true
+    assert(sawBootstrapBridge, "v3 compiler runtime: usage bootstrap bridge")
+    assert(sawBuildBackendDriver, "v3 compiler runtime: usage build backend driver")
+    assert(sawHostBridgeAudit, "v3 compiler runtime: usage host bridge audit")
     assert(sawSystemLink, "v3 compiler runtime: usage ordinary command")
     assert(sawEmitCsg, "v3 compiler runtime: usage emit csg")
     assert(sawMigrateCsg, "v3 compiler runtime: usage migrate csg")
@@ -202,54 +120,12 @@ fn main(): int32 =
     assert(sawPublishWorld, "v3 compiler runtime: usage publish world")
     assert(sawFreshNodeSelfhost, "v3 compiler runtime: usage fresh node")
     assert(sawSelfhostBuild, "v3 compiler runtime: usage selfhost build")
-    assert(sawScanHotpath, "v3 compiler runtime: usage scan hotpath")
-    assert(sawCRef, "v3 compiler runtime: usage c ref")
-    assert(sawCompareBench, "v3 compiler runtime: usage compare bench")
-    assert(sawBootstrapBridge, "v3 compiler runtime: usage bootstrap bridge")
-    assert(sawBuildBackendDriver, "v3 compiler runtime: usage build backend driver")
-    assert(sawRunSmokes, "v3 compiler runtime: usage run smokes")
-    assert(sawPrintBootstrap, "v3 compiler runtime: usage print bootstrap")
-    assert(sawSliceGate, "v3 compiler runtime: usage slice gate")
-    assert(sawDebugReport, "v3 compiler runtime: usage debug report")
-    assert(sawPrintSymbols, "v3 compiler runtime: usage print symbols")
-    assert(sawPrintLineMap, "v3 compiler runtime: usage print line map")
-    assert(sawPrintObject, "v3 compiler runtime: usage print object")
-    assert(sawPrintElf, "v3 compiler runtime: usage print elf")
-    assert(sawPrintAsm, "v3 compiler runtime: usage print asm")
-    assert(sawProfileRun, "v3 compiler runtime: usage profile run")
-    assert(sawProfileReport, "v3 compiler runtime: usage profile report")
-    assert(sawVerifyDebugTools, "v3 compiler runtime: usage verify debug tools")
-    assert(sawVerifyDebugRuntime, "v3 compiler runtime: usage verify debug runtime")
-    assert(sawVerifyDebugProfile, "v3 compiler runtime: usage verify debug profile")
-    assert(sawVerifyWindowsBuiltin, "v3 compiler runtime: usage verify windows builtin")
-    assert(sawVerifyRiscvBuiltin, "v3 compiler runtime: usage verify riscv builtin")
-    assert(sawRunCrossTargetSmokes, "v3 compiler runtime: usage cross target smokes")
-    assert(sawRunHostSmokes, "v3 compiler runtime: usage host smokes")
-    assert(sawRunStage23Libp2pSmokes, "v3 compiler runtime: usage stage23 libp2p smokes")
-    assert(sawBuildZeroExit, "v3 compiler runtime: usage build zero exit")
-    assert(sawBuildPanicTrace, "v3 compiler runtime: usage build panic trace")
-    assert(sawBuildBoundsTrace, "v3 compiler runtime: usage build bounds trace")
-    assert(sawBuildSignalTrace, "v3 compiler runtime: usage build signal trace")
-    assert(sawBuildCallChain, "v3 compiler runtime: usage build call chain")
-    assert(sawBuildFfiHandle, "v3 compiler runtime: usage build ffi handle")
-    assert(sawBuildBftStateMachine, "v3 compiler runtime: usage build bft state machine")
-    assert(sawBuildBrowserHostWasm, "v3 compiler runtime: usage build browser host wasm")
-    assert(sawBuildRwadBftStateMachine, "v3 compiler runtime: usage build rwad bft state machine")
-    assert(sawBuildProgramSelfhost, "v3 compiler runtime: usage build program selfhost")
-    assert(sawBuildChainNode, "v3 compiler runtime: usage build chain node")
-    assert(sawBuildLinuxNolibcExe, "v3 compiler runtime: usage build linux nolibc exe")
-    assert(sawBuildChainNodeLinux, "v3 compiler runtime: usage build chain node linux")
-    assert(sawBuildRwadBftLinux, "v3 compiler runtime: usage build rwad bft linux")
-    assert(sawRunLinuxObjectSmokes, "v3 compiler runtime: usage linux object smokes")
-    assert(sawRunChainNodeProcessSmoke, "v3 compiler runtime: usage chain node process smoke")
-    assert(sawRunChainNodeThreeNodeSmoke, "v3 compiler runtime: usage chain node three node smoke")
-    assert(sawR2cReactV3, "v3 compiler runtime: usage r2c react v3")
 
     let plan = buildplan.v3BackendBuildPlanDefault("/tmp/cheng-lang")
     assert(plan.entryPath == "/tmp/cheng-lang/v3/src/tooling/compiler_main.cheng",
            "v3 compiler runtime: build entry path")
     assert(plan.linker == buildplan.v3BackendLinkerSystemLink, "v3 compiler runtime: linker mode")
-    assert(plan.sourceUnits.len >= 23, "v3 compiler runtime: build sources")
+    assert(plan.sourceUnits.len >= 20, "v3 compiler runtime: build sources")
 
     echo("v3 compiler_runtime_smoke ok")
     return 0

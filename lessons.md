@@ -1,3 +1,91 @@
+2026-04-16
+- `native_gui_host_ready/native_gui_renderer_ready` 这类 readiness 不能在 [r2c-react-v3-native-gui-bundle.mjs](/Users/lbcheng/cheng-lang/v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-bundle.mjs) 里继续硬写 `false`。只要前面已经拿到了 `first_batch host ABI + session preview + layout/style/layout plan + render plan + compiled runtime`，就必须按真产物现算，不然 report 会自己打自己脸。
+- `r2c-react-v3` 继续收 Node helper 面时，别假删还在 live 的 helper。最稳口径是先在 [r2c_react_v3_controller_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/r2c_react_v3_controller_main.cheng) 把 `active_node_helpers/retired_node_helpers` 写成正式合同，再让 gate 对着这份合同硬卡。
+- fresh-clean gate 如果要验 bundle runtime mode，别再去 grep controller report。像这轮这样，`runtime_mode` 在 `native_gui_bundle_v1.json`，不在 `native_gui_bundle_report_v1.json`；gate 必须直接验产物本体。
+- `system_helpers_backend.cheng` host object 直编一旦已经绿了，下一层真 blocker 往往不是 lowering 本体，而是 ordinary compiler 请求面自己把 `--emit` 锁死了。这轮 `run-linux-object-smokes` 就是现场例子：provider 已经编通，真正拦路的是 [compiler_request.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_request.cheng) / [compiler_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng) 只认 `exe`。
+- `--emit` 这种正式协议不能 seed 说支持 `exe/shared/obj`，ordinary 却只认 `exe`。这类分叉会把 stage3、backend_driver 和 gate 打成假一致；修法必须落在公共请求层，而不是继续绕 gate 或改脚本。
+- Linux object 验收别只信默认 smoke。仓里 [run-linux-object-smokes](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 当前只覆盖 `aarch64-unknown-linux-gnu`；要确认 `x86_64-unknown-linux-gnu` 主线也真通，必须再单独跑 `build-chain-node-linux` 和 `build-rwad-bft-linux` 的 `x86_64` object 产物。
+- Android JNI 这类纯文本 mobile CAPI 返回，优先直接走 `ChengStr -> cheng_str_to_cstring_temp_bridge` 主链。像 UniMaker 这轮 `bioDidCreate/import`，JNI 先绕 `buffer handle` 再转字符串，真机排障很脏；直接调 `v3MobileCapiBioDidCreateWire/ImportWire` 配 `bioDidResultOrError(...)`，链路更短，空结果时还能直接看到 `bridge_len/store/flags`。
+- Android 这条 ordinary mobile CAPI 返回大文本时，别再拿 `strDataPtr(text)` 直接喂 `cheng_v3_buffer_handle_from_raw_bridge`。像这轮 `bioDidCreate/import` 的 provision 文本就是 store-backed `str`，`strDataPtr` 可能给空；最稳口径是先 `strToCStringTemp(text)` 真物化，再按 `len(text)` 拷进 buffer handle。
+- [os_host_process.cheng](/Users/lbcheng/cheng-lang/src/std/os_host_process.cheng) 这类大函数如果既做 process 控制又直接返回复合结果，不要在函数体里新绑复合局部。像这轮 `execFileCapture` 只有它红，而 bridge/API smoke 都绿；最稳收法是拆成 `fill helper + 薄对象返回`。
+- host smoke 一旦怀疑源码和运行结果对不上，先删 [artifacts/v3_hostrun](/Users/lbcheng/cheng-lang/artifacts/v3_hostrun) 里对应的 binary/log/object 再复验。旧 hostrun 产物会把上一次错误继续带出来，特别容易把“已经修掉的红点”误看成没修。
+- [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 这类 provider host object 直编一旦红在 seed lowering，先别再误判成剩余 C 边界；最稳顺序是先把泛型 `load/store` 收成定型 helper，再本地补 `cheng_bytes_* / cheng_seq_*`，最后把命令拼接和字面量写入拍平成 ordinary 能发射的直线链。
+- provider helper 里不要再写 `ptr("literal")`、转义字符字面量或 `if` 分支里一串 `pos += ...` 多语句。当前 seed 对这几种形状都不稳；像这轮这样改成 ASCII 数值直写和单赋值 helper 返回，host object 才能稳定编过。
+- `system_helpers_backend` 这条线单独 `system-link-exec --emit:obj` 通过后，必须马上补跑 `bootstrap_bridge_v3.sh`、`build_backend_driver_v3.sh`、`verify_backend_ffi_handle_sandbox.sh`、`host-bridge-audit`，否则很容易只修了一个 isolated compile case，却把 active driver 或 `@ffi_handle` 主线悄悄打坏。
+- Android 双 `.so` 这条链里，像 [mobile_capi.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/mobile/mobile_capi.cheng) 这种 ordinary shared 如果 `importc("cheng_v3_buffer_handle_*")`，不要再在 Cheng 里临时造第二套结果 handle。当前最稳口径是让 wrapper `libchengv3libp2p.so` 直接导出同名 bridge，`libchengv3mobile.so` 保持 unresolved import，装载时在同一个 load group 里解析；JNI 也统一走这套 buffer-handle ABI。
+- `host-bridge-audit` 不能再靠硬编码边界名报状态。像这轮 `pure_cheng_zero_c_ready=1` 能成立，是因为它改成了按 live provider 真导出的 `process/fs/socket/entropy` 能力现算；后面只要 audit 还写死字符串，结论就不可信。
+- [os_host_process.cheng](/Users/lbcheng/cheng-lang/src/std/os_host_process.cheng) 这类普通 Cheng 宿主进程层，别再保留 `var out` 回写 ABI。最稳口径已经坐实：桥函数只返回 status，`pid/fd/eof/exitCode` 全走固定 slot getter，普通层只做显式读取。
+- `importc/exportc` 这条边里，`pid:int64` getter 目前不够稳。像这轮现场已经坐实，process spawn 先落 `int32 pid getter` 再转 `int64` 才稳定；别再把跨边界小整数硬抬成 `int64` 以为更“通用”。
+- stdout-only 的 shell 包装别再写成 `(...) 2>/dev/null`。这轮 `execFileCapture` 已经真打出过 `127`，直接拼 `command + " 2>/dev/null"` 才是当前稳定形状。
+- 熵桥接不能只“导出过”。像这轮 [rand.cheng](/Users/lbcheng/cheng-lang/src/std/crypto/rand.cheng) 之前虽然声明了 entropy import，实际没走 provider；后面这种能力一旦说“已收回 pure Cheng”，必须补 smoke 真跑。
+- ordinary `@ffi_handle` 不能只做 `register/resolve`，释放语义还必须跟正式 `@ffi_handle_consume(argN)` 对齐。像这轮 annotated stale trap 为空日志，不是 runtime 没接上，而是 release 后没有 invalidate handle 槽；最稳口径是 seed ordinary lowering 也按 consume 注解做显式失效。
+- 直接调用 `cheng.stage3 system-link-exec` 时，别再赌 `BACKEND_RUNTIME_OBJ/BACKEND_NO_RUNTIME_C` 这类 shell 环境变量会自动进 native link。现场已经坐实，直调 binary 不吃这层 wrapper 语义；真要补额外对象，必须给 seed 一个正式入口，比如这轮补的 `--link-input:<obj>`。
+- [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 当前编不出 host runtime object，已经不是 host bridge 边界问题。`host-bridge-audit` 这轮真实输出已是 `remaining_non_pure_cheng_boundary=none`；真正红点是 backend 还缺一组统一语义：`load/store` 标量化、`cheng_seq_get/set`、`cheng_bytes_*`、条件表达式复合实参和若干 `stmt_call/stmt_if/stmt_let` 形状。
+- [cheng_safe_read_stream(...)](/Users/lbcheng/cheng-lang/v3/src/runtime/program_support_backend_v3.cheng) 不是“读完整文件”，只是“stream 为空时兜底 stdin”。以后看到名字里有 `safe_read_stream`，先查实现；真要把文件读成字符串，直接用 [cheng_read_text_file(...)](/Users/lbcheng/cheng-lang/v3/src/runtime/program_support_backend_v3.cheng) 或自己 `fread`。
+- `v3` provider 这条线上，`importc/exportc` 带 `str[]` 形参本身可以成立；如果 direct argv 桥编得过却连不上，先查 live provider 有没有真公开对应符号，不要先把锅甩给 seq ABI。
+- provider 返回 raw cstring 给普通 Cheng 调用方时，默认先走 `strFromCStringCopy(...) + explicit dispose`。`strFromCStringBorrow(...)` 只适合绝不释放、且生命周期完全受控的只读指针；一旦桥另一侧返回的是可释放内存，borrow 很容易演变成泄漏或误释放。
+- ordinary 遇到 `scalar call resolve failed` 时，先别急着把业务函数降级。像这轮 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 已现场坐实，真根可能只是 `importc` resolver 只认单行签名；跨行 `@importc + fn` 一样要先 `rg` 源码，再补 resolver。
+- [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 这类 provider stub 里，`store(outX, -1/1/0)` 不要再把字面量直接塞进去。Linux nolibc ordinary 很容易把它误判成坏参数；最稳写法是先落 `let value: int32/int64 = ...`，再 `store(outX, value)`。
+- [os_host_process.cheng](/Users/lbcheng/cheng-lang/src/std/os_host_process.cheng) 这类 host FFI 边界里，`str -> cstring` 不要继续赌隐式桥接。像这轮 `cheng_pipe_spawn/cheng_pty_spawn/cheng_pty_write` 直接显式 `strToCStringTemp(...)`，ordinary 发射面会稳很多。
+- `r2c-react-v3` controller 这条主线当前不能硬拗 `direct argv + ptr/seq FFI`。这轮 ordinary 已现场坐实，`cheng_exec_file_pipe_spawn(filePath, argvSeq, envSeq, ...)` 会直接卡在 `scalar call resolve failed`；最稳口径是先把执行边界收成独立 [r2c_process.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/r2c_process.cheng)，内部只用 ordinary 已稳定的 `std/os.execCmdEx`。
+- 程序解析不要再赌 `command -v`。这轮 controller 已经现场打出过 `missing executable: node`，但 shell 里同机 `PATH` 明明能找到 `~/.nvm/.../node`；最稳口径是直接读 `PATH` 逐项拼真实候选路径。
+- [os_host_process.cheng](/Users/lbcheng/cheng-lang/src/std/os_host_process.cheng) 这种基础层如果做过 pipe-capture 试探，收尾前必须拉回 ordinary 能编的稳定口径。当前最稳形状就是 `execFileCapture -> execCmdEx`、`execFileStatus -> execCmdStatus`，不要把实验版直接留在 live 树里。
+- `system_helpers.c` 拆分线不能再拿“annotated fixture 编不过”当 runtime 依赖没清完。先分清两件事：`cheng_ffi_handle_*` runtime object 合同能不能真编真跑，和 `@ffi_handle` ordinary lowering 有没有接上；这轮已经坐实，前者已通，后者还卡在 `scalar call resolve failed ... rawHandleNewI32`。
+- 这种 native pointer typedef 一定先展开再落 Cheng alias。像这轮 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 里的 `DarwinDirentPtr = DarwinDirentPtr`，会直接把 stage3 编译拖进栈爆和超大内存；改成 `DarwinDirent *` 才回到可诊断的普通编译错误。
+- 这类“已经收回 pure Cheng”的主线，不能只信前一轮文档和口头结论；继续干活前必须先 `rg` 真源码。像这轮 [peer_id.cheng](/Users/lbcheng/cheng-lang/v3/src/libp2p/core/peer_id.cheng) 和 [program_support_backend_v3.cheng](/Users/lbcheng/cheng-lang/v3/src/runtime/program_support_backend_v3.cheng) 就又漂回了旧 `cheng_v3_base58btc_*` 桥，不先扫文件就会被假状态误导。
+- `host-bridge-audit` 只能按现场输出写结论。这轮真实状态已经是“旧 `exec_file_*` 桥清干净了，但还剩 `os_process_fs_socket_entropy_signal`”，所以只能说宿主边界继续缩小，不能把 `pure_cheng_zero_c_ready=0` 说成已经完成。
+- `program_support_backend_v3` 这类 v3 provider 里，只要已经导出了 `file_exists/file_size/getcwd`，就别漏 `cheng_file_mtime`。这轮 `build-backend-driver` 现场已经坐实，普通 tooling 主链会直接因为 `_cheng_file_mtime` 未定义掉链接；最稳口径就是按 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 的 Darwin `stat -> st_mtimespec.tv_sec` 现成实现补齐。
+- `build-backend-driver` 不要让正在运行的 ordinary driver 直接自举自己。`r2c-react-v3 status/native-gui-runtime` 这轮已经坐实，fresh 保证一旦重进 `backend_driver/cheng build-backend-driver`，最容易踩 ordinary 还没吃稳的 helper/provider 语法面；最稳口径是让 [compiler_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng) 优先回 `v3CompilerBridgeCompilerPath(...)` 这条稳定 Cheng bridge。
+- `build-backend-driver` 的 build plan 对拍不要再额外造字符串裁剪 helper。像这轮 [v3CompilerBuildPlanComparableText](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng) 这种文本过滤器，只会把普通编译面平白扩成新红点；如果计划文本原文就能稳定比对，直接比原文。
+- `bootstrap-bridge` 真要从 shell 收回 pure Cheng，最稳切法是“shell 只管 seed freshness + cold-start 分发，live stage 候选安装全交给 `compiler_main bootstrap-bridge`”。seed 自己的重建入口还在 C 里时，不能假装 shell 已经能完全消失。
+- `bootstrap-bridge` 和 `build-backend-driver` 一样，安装必须走 candidate artifact。`stage0.next -> stage1.next -> stage2.next -> stage3.next -> contract compare -> rename install` 是当前最稳口径；直接覆盖 live `cheng.stage*` 会把 fixed point 和失败回滚一起搞脏。
+- live 路径里已经死掉的宿主桥要物理删，不要只在文档里说“以后别用”。像这轮 `exec_file_pipe_spawn`，最稳收法就是同时删 `os_host_process import`、`program_support_backend export` 和 `host-bridge-audit` 放行条件。
+- shell 里的 freshness helper 不能写 `[ ! "$src" -nt "$bin" ]`。这轮已经现场坐实，`sh` 会把它吃成歪表达式，旧 `backend_driver/stage3/bootstrap_driver` 会被一直误判成 fresh；最稳写法就是显式 `if [ "$src" -nt "$bin" ]; then return 1; fi`。
+- ordinary `compiler_main` 里这种长串宿主命令，不要赌多行 `\"...\" + ...` 表达式在 seed/ordinary 下都能被一致发射。像这轮 `planCompareCommand`，旧写法会把 `+ v3CompilerQuoteShell(...) +` 直接打进命令文本；最稳口径是逐段 `var cmd = ...; cmd = cmd + ...` 累加。
+- 用户目标已经明确是“零新增 C 依赖、只用纯 Cheng”时，不能再给 `std/os execFile` 这类缺口补 [system_helpers.c](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c) 新桥。正确方向是继续收 pure Cheng provider，或者把调用点直接切回仓里已有的 Cheng 实现。
+- `v3/libp2p/core/peer_id` 这种协议层模块不要继续挂 `base58btc` bridge。仓里已经有纯 Cheng [multibase.cheng](/Users/lbcheng/cheng-lang/src/std/multiformats/multibase.cheng)；直接切过去以后，`backend_driver/controller` 从干净产物重建会更稳，也更符合零 C 主线。
+- `native-gui-bundle` 这条链的 controller 超时不能固定写死 `30000ms`。fresh `home_default/content_detail` 已经坐实，纯 Cheng 主链正常也可能超过 30 秒；最稳口径是给足硬预算，比如这轮的 `120000ms`。
+- 遇到 out-dir 内的 launcher/provider 编译红灯时，先把同一条 `system-link-exec` 命令单独抽出来重放，再 fresh 一个全新 out-dir 复验。像这轮 `publish_selector`，第一次 `native_gui_launcher_compile_failed` 并不是稳定源码错，单独重放和 fresh 新目录都直接通过，真根更像旧中间态干扰。
+- `backend_driver` 已经成了真 ordinary compiler 后，`cheng_v3.sh` 的用户面编译命令就不要再默认绕回 seed `stage3`。最稳口径是把 `status/print-build-plan/emit-csg/migrate-csg/verify-world/world-sync/prove-equivalence/prove-migration/publish-world/fresh-node-selfhost/selfhost-build/system-link-exec` 一口气切到 fresh `artifacts/v3_backend_driver/cheng`，只把 bootstrap/gate 留给 `stage3`。
+- `build-backend-driver` 可以正式挂进 `backend_driver`，但冷启动和日常自举必须分层。最稳口径是：已有 fresh pure Cheng driver 时直接调它；没有时先用 `cheng.stage3 system-link-exec` 冷启动编出 `cheng.bootstrap`，再把后续 `build-backend-driver` 校验和安装全部交给 pure Cheng 实现，不能再走 seed 的旧特殊命令。
+- `backend_driver` 自举自己时不能原地覆盖正在运行的 `cheng`。最稳口径是先产出 `cheng.next` 和 `cheng.next.v3.map`，跑完 `status/print-build-plan/zero-exit smoke` 后再按 `rename map -> rename binary` 安装。
+- 如果 selfhost/reference 的 build plan 原文已经全等，就直接比原文，不要额外造行过滤扫描器。像这轮那段自定义 plan 裁剪逻辑，只带来了 `idx=len` 的 bounds crash，没有任何真实收益。
+- `r2c-react-v3` runtime 一旦 ordinary 已能直接发完整 `native_gui_runtime_v1`，就不要再保留中间 helper 形态。最稳口径是 controller 直接执行 `native_gui_runtime_compiled_main`，`status` 也同步写成 `native_gui_runtime_helper=""`；退役 helper 文件直接删，不留“以后可能还用”的活口。
+- `r2c-react-v3` 这种编译链主线完成后，验收不能只看一条路由。至少要同时复验一个启动页、一个长内容滚动页、一个交互命中页；这轮最小闭环就是 `home_default/content_detail/publish_selector` 三条。
+- `bootstrap_bridge_v3.sh` 这种冷启动薄壳不能只要看到旧 `cheng.stage3` 可执行就直接复用。只要 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 或 [stage1_bootstrap.cheng](/Users/lbcheng/cheng-lang/v3/bootstrap/stage1_bootstrap.cheng) 比 live `stage3/stage0` 新，就必须直接回 seed runner 真重建；不然 seed 里的新命令实现根本进不了 live 主线。
+- `backend_driver` 一旦真改成 ordinary `compiler_main` 物化物，`print-build-plan` 对拍就不能继续做整份文本全等。bootstrap `stage3` 会天然多出 `supported_targets/target_support*` 诊断行；最稳口径是只比 `target/linker/stage2_compiler/entry/output/source[*]` 这些 build plan 核心字段。
+- `build_backend_driver_v3.report.txt` 不能再把 `materialized_source` 写成 `stage1_bootstrap.cheng`。这条报告现在必须显式钉住 `materialized_source=*compiler_main.cheng`，同时给出 `reference_plan_log` 和 `zero_exit_smoke_*`，否则用户面会继续被旧 bootstrap 壳误导。
+- `compiler_request.v3CompilerReadFlagOrDefault(...)` 当前不能直接拿来做 ordinary selfhost compiler 的关键命令解析。像这轮 `system-link-exec` 已现场打出过 `unsupported --emit: --root:/...`；最稳口径是关键编译命令直接读 runtime `cmdline.readFlagOrDefault(...)`。
+- 当前 ordinary runtime argv 会多带一个尾部空参数。凡是要把 argv 原样转发给 bridge compiler 的地方，都必须先过滤空尾参数，不然命令面会平白漂一格。
+- `std/os` 的 `execFileStatus/execFileCapture/quoteShell` 当前不适合直接做 ordinary selfhost bridge。最稳收法是本地逐段拼 shell 命令，再自己做最小单引号包裹，不要继续赌链式字符串 helper。
+- 当前 `v3` selfhost compiler 最稳的形状是“本地 pure Cheng 先落 deterministic plan/report，再把真执行交给 live Cheng compiler”；不要再把命令面停在 `native link not implemented`。
+- `native-gui-runtime` 这类主链一旦切掉旧 helper，不要把退役入口和只服务它的 evaluator 死代码继续留仓。最稳口径是物理删入口文件，再把 shared 里只服务旧入口的 `reduce-kv -> runtime/render-plan` JS evaluator 一起删掉，不给后面误回滚留口子。
+- `r2c-react-v3 native-gui-runtime` 这条链如果目标是把 Node 从 active runtime 面上摘掉，不要只改 controller，不要只改 bundle。最稳口径是像这轮这样同时把 controller、旧 shell wrapper、fresh bundle 共同指到同一个原生 helper：原生 helper 直接执行 `native_gui_runtime_compiled_main`，JSON 透传，`reduce-kv` 则按 runtime contract 原地重建 `native_gui_runtime_v1 + native_render_plan_v1`。
+- `r2c-react-v3` 原生 GUI 一旦已经把 direct runtime 收回 `cheng.stage3 r2c-react-v3 native-gui-runtime`，就不要再让 `native-gui-bundle.mjs` 继续本地重建 `native_gui_runtime_v1`。最稳口径是 bundle 只产 `runtime_contract_v1 + native_gui_runtime_compiled_main`，然后直接调 controller 取回初始 runtime JSON，并归档独立 `native_gui_runtime_main.controller.log`。
+- `r2c-react-v3` 原生 GUI 如果目标是“Cheng 主控，Node 退出实时主链”，宿主就不要继续执行 launcher/helper 路径。最稳口径是像这轮这样把 `native_gui_runtime_exe_path` 直接切到 `native_gui_runtime_compiled_main`，然后让 AppKit host 原生消费 `native_gui_runtime_reduce_kv_v1`，自己按 `native_layout_plan_v1.items` 重建 `state/render_plan`。
+- `native_gui_runtime_reduce_kv_v1` 这条 compiled runtime 合同里，只要 `selected_index/focused_index/visible_layout_item_count` 已经是 compiled 真值，宿主就不要再重新猜命中树。最稳口径是直接用 layout item index 回填 `selected_source_module_path/source_line/interactive`，`typed_text/last_key` 只保留事件本地增量；这样 click/focus/text/key 和 source jump 都能稳定跟 compiled runtime 对齐。
+- `v3` 只要已经有 live Cheng 编译器，bootstrap/build-backend-driver/status/print-build-plan 这条 active 主线就不要再把 `seed_source` 放进用户面 build plan 或报告里，也不要在日常刷新时先回 `cc -> cheng.stage0`。最稳口径是像这轮这样切到 `v3_selfhost`：直接拿当前 `cheng.stage3`/`backend_driver` 物化 `cheng.stage0`，再重编 `stage1 -> stage3`。但在 `stage3/backend_driver` 还没脱离 seed 代码体之前，`seed_source` 仍必须保留在 freshness 依赖里，不能假装已经彻底删掉。 |
+- `r2c-react-v3` 原生 GUI 一旦遇到长内容路由，不要再把 64+ 个 `R2cNativeGuiItem` 直接堆在单个 `r2cNativeGuiItems()` 里。像这轮 `content_detail` 的 97 个 item，ordinary 会从 `item_64` 开始掉 `prepare binding infer type failed / primary_object_body_semantics_missing`；最稳口径是生成分块 append helper，把每个函数里的 composite 局部变量数压在稳定范围内。
+- `open-source-on-click` 这条链不能在 click 后再被 focus/key/text 事件清空状态。像这轮 `publish_selector`，真实 click 已命中 `node_13 -> PublishTypeSelector.tsx:39`，但后续 focus 又把 `source_jump_*` 擦掉，Node 最后只会看到假失败；最稳口径是宿主只在新 click 时 `clearSourceJumpState()`，非点击 runtime 事件保留最近一次 click 的 jump 结果。
+- `native_gui_host_macos.m` 这类带 scripted scenario 的宿主，不能一边靠真实 `mouseDown/scrollWheel/keyDown/windowDidResize` 驱动，一边又想要确定性自动验收。像这轮 fresh `run-native-gui` 的组合场景，真 runtime 已经通了，但宿主会漂成 `resize=1`、`scroll/click/focus/text=0`、`key=3`；最稳口径是 scripted resize 直接调 runtime，并在 scripted scenario 期间屏蔽真实输入事件。
+- `r2c-react-v3` 已经把 runtime executable 收回 `cheng_controller_v1` 后，别忘了 `run-native-gui` 的“自动补 session”也是主链一部分。像这轮这样直接让它调用 `cheng.stage3/backend_driver r2c-react-v3 native-gui-bundle`，比继续回 shell wrapper 再设 `R2C_REACT_V3_NO_STAGE3_HANDOFF=1` 稳得多，不然主控面会暗中分叉。
+- `r2c-react-v3` 原生 GUI 如果目标是“Cheng 主控，Node 最薄 helper”，别直接拿宿主去调 Node runtime executable。最稳口径是像这轮这样先落 `runtime_contract_v1 + shell launcher`，launcher 真执行 `cheng.stage3 r2c-react-v3 native-gui-runtime`，再由 controller 调最薄 Node helper；这样宿主入口和调度权先收回 Cheng，后面再继续削 helper 本体。
+- `replay-hit-inspector` 这种二次消费 inspector 状态的入口，不能偷吃第一次 live 点击时临时拼出来的 `source_jump_*`。最稳口径是让 `native_gui_inspector_state_v1.json` 自己固化 `target_path/target_line`，而且直接从 `repo_root + source_module_path + source_line` 机械求值；这样 replay 和 live 点击走同一份真状态，不会因为第一次没开 `--open-source-on-click` 就断链。
+- `r2c_react_v3_controller_main.cheng` 这类 live tooling controller 里，路径父目录别再调 `os.dirName(...)`。这轮已经坐实它会把 `emit composite binding` 直接打炸；最稳口径是统一走 `v3path.v3PathParentDir(...)`。
+- `v2` 这条还会被 stage0/bootstrap C 直接吃到的 tooling helper，别在字符串拼接或 `add(...)` 参数位上写内联 `if ... else ...` 表达式。像这轮 `buildNetworkSmokeReportText(...)` 里的 `if stages.len > 0` 就会被 live `cheng_v2c` 直接打成 `unsupported if-expr`；最稳口径是先落局部变量，再拼最终字符串。
+- 原生 GUI 真要做“点了就跳源码”，不要让 Node/helper 重新猜路径或补一条平行跳转链。最稳口径是宿主直接吃 `repo_root + source_module_path + source_line`，由 AppKit host 自己调 `xed --line`，再把 `source_jump_*` 状态原样回传给 helper/report/inspector。
+- 原生 GUI 真想继续做 inspector，不要只把命中结果散落在 `summary.env` 和 report 字段里。最稳口径是直接落独立 `native_gui_hit_inspector_v1.json`，把 `layout_item/source_node/style_node` 一起固化；这样后面做源码跳转、白盒调试或原生 inspector 面板时，不需要再二次回拼。
+- 原生 GUI 真想做“从画面回源码”，`source_node_id` 不够。最稳口径是把 `module_path/component_name/line` 直接带进 `native_layout_plan_v1.items`，让 host 点击时原样回传；这样后面做源码跳转或 inspector，不需要再回 Node 猜一次。
+- 旧 `cheng.stage0/stage3` 如果是按相对 `CHENG_V3_IMPL_SOURCE_PATH` 构建出来的，`bootstrap-bridge` 生成的 `stage1.generated.c` 会在 `artifacts/v3_bootstrap` 目录下找不到 `./v3/bootstrap/cheng_v3_seed.c`。最稳恢复法是先直接用 [cheng.bootstrap_bridge_runner](/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.bootstrap_bridge_runner) 跑一次 `bootstrap-bridge`，把 stage3 拉正后再回 `bootstrap_bridge_v3.sh` / `build_backend_driver_v3.sh` 官方入口。
+- 原生 GUI 一旦进入真实滚动，不要再让 session 只塞 `viewport_items`。最稳收法是 session/host 真吃 full `native_layout_plan.items`，宿主自己按 `scroll_offset_y` 做裁剪、可见项统计和命中测试；否则滚动和 source-node 回传永远会漂。
+- `native_layout_plan` 的布局常量不能继续硬编码在 Node helper 里。最稳口径是像这轮这样由 Cheng preview 流直接下发 `layout_policy_source/layout_*`，Node 只做机械 plan 生成；这样后面把布局求解继续收回 Cheng 时，不会留下第二份真值。
+- 原生 GUI 从 `style_layout_surface_v1` 再往前推时，别继续把坐标/截断/滚动这些临时逻辑塞在 `native_gui_session_v1` 里。最稳收法是先独立落 `native_layout_plan_v1`，把 `item_count/viewport_item_count/clipped_item_count/scroll_height` 一起写死，再让 session/host 只消费 plan。
+- Cheng QUIC 的 client `dial`/`pipe read` 不能继续在非阻塞 UDP `queue empty` 上空转 5 秒。像这轮 [native_runtime.cheng](/Users/lbcheng/cheng-lang/v3/src/quic/native_runtime.cheng) 的 tight loop，单次 `probe-proposal` 失败握手就能冲到约 `1.3GB` 峰值；后续所有等待收包的热路径都必须带明确节流或真正的超时阻塞收包。
+- `deploy-bft-validator-three-node` 这类会起 detached follower 的入口，不能在公网 proposal 口还没证实能完成 QUIC 握手前就直接放后台。最稳口径是先前台 probe，再起 follower；握手不过就 fail-fast，不允许后台重试链条继续吃机器资源。
+- `msquic_chain_smoke` 这类会落本地块目录的 smoke，不能继续复用固定 artifact root 再赌 `std/os removeDir` 能清干净。最稳口径是先按 `base/_1/_2...` 选 fresh root，再把 reset 失败当硬错误；否则回放最容易被旧 journal 里的重复合法事件误导成“共识错了”。
+- `compiler_core` 的 tooling/program 两条执行轨不能共用同一套 native support source 列表。普通程序如果还带 `v2/bootstrap/cheng_v2c_tooling.c`，会白白重编大 C；如果去掉后不同时把 [system_helpers_tooling_entry_bridge.c](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers_tooling_entry_bridge.c) 编成 `CHENG_TOOLING_ENTRY_NO_BOOTSTRAP` stub，又会直接 unresolved。最稳收法就是“tooling 轨保留 bootstrap tooling，program 轨 stub 化 tooling entry”。
+- `quic_tls_transport_ecdsa_smoke` 不能在同一进程里对同一张叶子证书连续做两到三遍 ECDSA/X509 验签。当前实现下这会把内存和时延一起放大；最稳口径是保留“原始签名解码检查 + 一次正式 `x509VerifyChain`”，不要在 smoke 里重复验同一张 cert。
+- `program-selfhost-check` 里 `quic` 和 `msquic` 不能共用一个拍脑袋的短超时。`quic_tls_transport_ecdsa_smoke` 很短，但 `msquic_chain_smoke` 正常跑完就明显更久；最稳收法是保留原生超时兜底，但把 network smoke 阈值提到能覆盖真实运行时间的量级，同时把关键阶段写进 stdout 合同。
 2026-04-03
 - 不要用长时间探测命令反复直接拉起 `v2/artifacts/bootstrap/cheng_v2_system_link_exec`。优先用 `cheng_v2c` 做只读检查；必须跑 `cheng_v2_system_link_exec` 时，只跑前台、一次性、可立即验收的命令，不留后台或悬挂会话。
 2026-04-06
@@ -50,6 +138,10 @@
 - `x509DecodeEcdsaSignature(...)` 这类固定宽度签名解码，不要再绕 `leftPad Bytes` 之类的中间拼装。当前编译路径下，ASN.1 整数值最稳的写法就是直接抄进最终固定 64 字节 `r||s` 输出，不然最容易在证书 `CertificateVerify` 上变成“材料看着都对，但签名就是 invalid”。
 - ordinary `v3` smoke 里临时排障不能写动态 `echo(ErrorText(...))`。seed 只支持字面量 `echo`；要打印动态错误，就直接 `panic(ErrorText(...))` 或改成断言，不要再把编译链先打坏。
 2026-04-15
+- `v3` 上这类“纯 Cheng 密码学很慢”的问题，先别急着调窗口或怀疑协议。先确认 live 热路径到底有没有真走到 fixed/Jacobian/预计算主线；这轮 `P-256 verify/pubkey/generator mul` 的真根就是代码里快路径早有了，但调用还停在大整数慢路。
+- 固定委员会的验证人公钥不能在验签时从私钥现算。委员会一旦固定，公钥就该当常量或配置读入；运行时重复派生既慢，也会把热路径和私钥材料绑得太紧。
+- `FixedBytes32/64/65` 这类已经定长、上游已验形状的密码学热入口，不要再补一层重复 parse/shape check。多一轮就是多一轮白算，收益为零。
+- 三节点 BFT bench 的结束时间要按“全网最后一次 commit 真落盘”算，最稳代理量就是三边最终 state 文件的最新 mtime；提交返回时间和外层 wait loop 结束时间都不是真实最终性时间。
 - Darwin 目标的符号补名必须幂等。Mach-O 下既会遇到裸 `foo` 也会遇到已带 `_foo` 的符号；只要平台层无脑再补一次 `_`，汇编里就会出现 `__foo`，最后在 native link 阶段伪装成 provider 闭包缺失。
 - 长跑 gate 里不要只会补默认 backend driver。`stage2/stage3` 这类 bootstrap 编译器路径在共享产物目录被刷新时也会暂时失效；compile helper 和 Cheng 侧 gate 都必须把“缺 bootstrap 编译器就先补 bootstrap bridge”写成正式逻辑，不然 `stage23` 会随机炸在中段。
 - `cheng.stage3` 的 live 命令面最终还是以 `v3/bootstrap/cheng_v3_seed.c` 的 dispatch 为准。只改 `stage1_bootstrap / compiler_runtime / gate_main / cheng_v3.sh` 不够；新命令要想真 live，seed usage、自检 token、dispatch、实现必须一次性一起改。
@@ -76,3 +168,109 @@
 - debug bridge 依赖面收缩后，`verify-debug-runtime` 的未定义符号白名单也要同步缩。像这轮删掉 final profile 聚合后，Darwin 白名单里的 `_qsort/_realloc/_strcmp` 如果不一起删，gate 会把正确收口误判成失败。
 - `profile-report` 这类 tooling 一旦已经坐实在当前 seed/stage3 的 live 命令面里，就不能再额外留一条“编 helper -> 跑 helper”或“只在 compiler_main 留假 dispatch”的旁路。真正稳的形状是只保留一条当前命令面里的 live 实现，再把 freshness、锁和 README 全压回这条主链。
 - `compiler_main.cheng` 里多一条命令 dispatch，不代表当前 `cheng.stage3/backend-driver` 真的已经有这个 live 命令。判断命令面是否已上线，必须先看 `v3/bootstrap/cheng_v3_seed.c` 的真实 dispatch，再看 fresh 产物能不能直接调用成功；做不到这两点时，`compiler_main` 里的同名入口就是假路径，必须删掉。
+- `system_helpers_debug_trace_profile.c` 收掉旧依赖，不等于整条宿主链已经收口。只要共享宿主大 runtime `src/runtime/native/system_helpers.c` 还保留 `.v3.map` 文本加载或 `CHENG_V3_PROFILE_OUT` 最终报告，backend-driver 和旧 host runtime 仍会背着第二套依赖面；这类收口必须同时改 shared runtime 和专用 bridge，再用 gate 把旧词面直接卡死。
+- `system_helpers.c` 和 `system_helpers_debug_trace_profile.c` 的收口不能只看“都删了旧词面”。只要 shared runtime 还手抄一份 trace/profile，本质上就是两套 live 实现，后面一定再漂；最稳做法是让 `system_helpers.c` 直接复用同一份 `system_helpers_debug_trace.inc / system_helpers_debug_profile.inc`，把旧本地实现物理删掉。
+- `system_helpers.c` 和 `system_helpers_debug_trace_profile.c` 共享了 `trace/profile` 还不够。只要 `register_line_map` / `dump_backtrace` 入口桥还各留一份，后面改 `argv0/self-path/init` 时还是会再漂；最稳做法是再抽一层 `system_helpers_debug_entry.inc`，并让 gate 直接检查两边都包含它。
+- `system_helpers.c` 和 `system_helpers_debug_trace_profile.c` 连 `entry bridge` 都共享以后，`host-only base` 也必须跟着共享。`env/path/write/getter resolve` 这层如果还各留一份，后面只要改一边，另一边就会继续漂；最稳做法是两边都直接包含同一份 `system_helpers_debug_host_base.inc`。
+- 大改 seed/runtime 之后，验 `verify-debug-runtime / verify-debug-profile / host smoke` 不能只复用现成 `artifacts/v3_bootstrap` 和 `artifacts/v3_backend_driver`。这两份生成物命中旧版本时，症状会伪装成 ordinary fixture 编译红灯；最稳做法是直接删生成物强制重建再验。
+- `host-only base` 共享以后，gate 也要跟着锁死 `system_helpers_debug_host_base.inc`。只查旧词面和 `entry.inc` 不够；如果不把 `host_base.inc` 也写进门禁，后面很容易又在 `system_helpers.c` 里手抄回第二份 env/path/write/getter resolve。
+- 远端同步源码别再用 `rsync --relative` 搭绝对路径。它会把文件落到错误的嵌套目录里，表面上“同步成功”，实际远端还在编旧源码。多机修补时直接把文件推到准确目标路径。
+- 文本 state 文件的 key 前缀长度必须按真实字符数切，不能手抄偏移。像 `last_voted_proposal_hash=` 实际是 25 个字符，写成 26 会直接把 64 位 hex 砍成 63 位，状态文件当场报废。
+- `tcp_transport` 里把 `bytesToString(payload)` 这种大二进制字符串直接塞进 `importc` 调用不稳。proposal 这种小 payload 可能碰巧过，commit 这种大 payload 会把 bridge 调用搬坏；正确形状是先落本地 `str` 变量，再把变量传进 native bridge。
+- `system_helpers.c` 和 `system_helpers_debug_trace_profile.c` 不能只共享 helper 实现。只要 crash trace、embedded line-map getter、raw profile 的常量、typedef 和 static global 还各写一份，状态面后面一定再漂；最稳做法是连这层也抽成同一份 `system_helpers_debug_state.inc`，再把它写进 `verify-debug-runtime` 硬门禁。
+- `profile` 收口以后，`crash` 也不能继续让 C runtime 直接吐最终 `[cheng-v3] v3_crash_report_v1`。只要 runtime 还负责最终崩溃文本格式，seed/stage3 的 live 命令面和宿主桥就还是两条语义；最稳做法是 runtime 只写 `v3_crash_raw_v1`，最终报告统一交给 live `crash-report`。
+- 删 `v1/v2` 旧代码不能按“`v3` 没 import”直接判断。先看全仓引用闭包；像 `src/std/system.cheng`、`src/std/cmdline.cheng` 这种 shared std 模块虽然不在 `v3/` 目录下，实际仍被 `v3` 主线大量依赖。能一口气删的，优先是全仓零引用的 tracked 生成物，比如 `v2/cheng-quic/*.tmp.linkobj` 和根目录那些 Mach-O probe。 |
+- 当前仓库没有 tracked `v1/` 树；`v2/tests/contracts/*.expected`、`v2/tests/contracts/*probe.cheng` 和 `v2/vendor/cheng-quic` 这类文件看着像“旧东西”，但不少仍被 `v2` bootstrap/tooling 直接引用或作为 live symlink 存在。清理 `v2` 时先看整仓闭包，不要按文件名主观删。 |
+- 这个仓库里没有 `v2/`、`v3/` 前缀或目录归属的 shared 代码，命名口径上就按 `v1` 看；但“算 `v1`”不等于“现在能删”，删除还是必须看全仓 live 闭包，尤其是 `src/std/*` 和 `src/runtime/native/*` 这批共享底座。 |
+- 清 `src/` 下的 `v1` 旧代码时，最稳标准是两道门：一是不在 `v2/v3` import 图里，二是全仓没有显式路径引用。满足这两条的内部模块可以直接删；`src/std/*`、`src/runtime/native/*`、`src/web/*`、`src/tests/*` 这种共享或外部面不要和内部旧编译链一起一锅端。 |
+- 清 `src/std/*`、`src/web/*` 这类共享面时，还要再补第三道门：模块名精确 import 也必须为零。只查全路径会漏掉 `import std/syncio`、`import std/net/stream/connection` 这种真实引用；删共享模块前先查 `^import <module>(\\s|$)`。 |
+- `ssh host sh -lc '... sh -lc '\''echo $$ > pid && exec daemon'\'' &'` 这种远端后台形状不稳，外层 shell 很容易抱着后台 job 不退，最后本地 deploy 一直卡着。Linux 远端守护进程要用 `setsid -f sh -lc 'echo $$ > pid && exec ...'`；Darwin 本机没有 `setsid` 命令，本机后台再单独保留 `sh -lc ... &` 形状。 |
+- `validator-follower-daemon` 里不能只把 `recv proposal/commit` 的网络超时当可重试；`send vote` 走的也是 `request-response`，一样会碰到 `v3 libp2p tcp: recv response: Operation timed out`。这类错误如果直接返回 fatal，本机 follower 会停在 `last_voted_height=1` 但永远不 apply commit；`sendVote` 也要走同一套 retryable 判定。 |
+- `src/web/examples` 这类目录就算仓内零 import，只要 README 还把它当公开示例面暴露，也不能按死代码直接删。示例面和内部模块要分开裁决。 |
+- `.meta` 这类 sidecar 不能只看 import/path 引用；像 wrapper 里按 `$0.meta` 读取的文件，本身就是 live 合同，删之前必须先查调用脚本的运行时约定。 |
+- 删 `src/backend/tooling` 下的 sidecar/stage0 旧 C 文件时，至少同时过三道门：basename 零引用、全路径零引用、没有通配构建入口把它们扫进 native 源集。三道都过了才算真死代码。 |
+- 像 `backend_driver_uir_sidecar_runtime_compat.c` 这种只剩 README 或 PURE-01 当“禁止回流 token”提到的旧 compat 文件，源码本体和禁词门禁要分开处理：源码该删就删，禁词扫描继续保留，别因为还要防回流就把死文件硬留在树上。 |
+- 清共享模块时，basename 模糊命中不能当 live 证据。像 `sets.cheng` 很容易误撞 `hashsets.cheng`；要删 `src/std/*`、`src/web/*` 时，优先看精确 import、精确路径和 README 公开面。 |
+- `src/web/cli/*` 和 `src/web/examples/*` 这类目录，就算仓内零 import，只要各自 README 还把它们当公开 CLI / 示例入口，也要按对外 surface 保留，不能和普通共享模块一锅端。 |
+- 删 `src/std/*` 里的 shared 模块时，别只删源码本体。像 `std/c`、`std/hashes`、`std/system_c`、`std/syncio` 这种旧模块，常常还在 `stage1` 路径特判或 `verify_std_layout_sync` 清单里留着名字；源码和这些陈旧特判必须一起删。 |
+- 清 `src/backend/tooling/*.cheng` 不能沿用 C sidecar 的“basename/path 为零就删”。像 `backend_driver_runtime_keepalive.cheng`、`backend_driver_uir_exports_keepalive.cheng` 这种文件，虽然没有路径字符串命中，但会被 `import backend/tooling/...` 直接吃进去；这一层必须改用“精确模块 import + 精确路径 + basename”三道门。 |
+- 缩 `src/runtime/native` 时，最稳模式是“保留符号不变，把多个 live 小 bridge 收成少数正式 provider `.c`，旧实现退成 `.inc`，再一次性切换 `v2/bootstrap/tooling/current runtime` 三条 source list”。不要继续让几十个小 bridge `.c` 在不同 source list 里各自漂。 |
+- `selflink_cmdline_bridge`、`selflink_str_eq_bridge` 这类只被 live source list 当 provider 引入、实现又很稳定的小桥，不该继续各占一个正式 `.c`。直接收成同一个 `selflink_support_bridge.c`，旧实现退 `.inc`，source list 最不容易再漂。 |
+- `selflink_exe_entry_bridge`、`selflink_program_exe_entry_bridge` 这类“只有 track 不同、符号和语义固定”的入口桥，别用 runtime 分支去合并。最稳做法是一份 `system_helpers_selflink_entry_bridge.c` 加编译宏，在 program track 编译时显式传 `-DCHENG_SELFLINK_PROGRAM_ENTRY=1`，让 tooling/program 选择继续停在编译期。 |
+- 如果某个 native sidecar 的符号已经完整并进 live runtime，本体却还只被验证脚本或嵌入脚本单独引用，那它就不是正式 provider 了。像 `system_helpers_float_bits.c` 这种文件，最稳做法是删源码，并把验证层直接改回 live `system_helpers.c`。 |
+- 拆 `system_helpers_stdio_bridge.c` 时，第一刀先抽“只读 machine-target 常量桥”，不要一上来碰 `driver_c` 解释器主循环或状态面。这一簇只依赖 `ChengStrBridge + driver_c_str_eq_raw_bridge`，最适合先独立成正式 provider，再一次性追平 `runtime_provider_object_v2 / system_link_exec_v2 / cheng_v2c_tooling` 三条 live source list。 |
+2026-04-15
+- `deploy-bft-validator-three-node` 这类真机入口里，远端 `build-bft-state-machine` 不要再强绑 `BFT_STATE_RUN_SELF_TEST=1`。纯 Cheng `P-256 verify` 在远端主机上会把 build 自测拖成假卡死；deploy 应该拿后面的三节点实块收敛做真验收。
+- 本地长期 daemon 不能再靠 `nohup sh -lc ... &`。这层壳在宿主下会把子进程一起带走；最稳做法是 seed 里原生 `fork/setsid/exec`，直接写 `pid/log`。
+- 三节点 deploy 的收敛轮询必须把 remote/local query 失败当作“本轮未收敛”，不是立刻向 stderr 喷硬错误。偶发 SSH 抖动会让已经成功的部署看起来像失败。
+- `deploy-bft-validator-three-node` 这条链不能在中途看到一次 `height=0` 就先判死。按当前 `proposal/vote/commit` 窗口配置，fresh `stop -> deploy` 常常要走完整轮窗口才会一起落到 `height=1`；验收要看 deploy 最终输出或随后单独 `status`。
+- `64 / dmit / 本机` 这条 `v3` 三验证人链当前已经再次真对齐到 `height=1`、`alice=67`、`bob=33`、`app_hash=1db83b23eb2b038ccb6dafe2a307906cbcf7e8d683fcfebff7b92d0e873aae6d`。后面再收口时，重点放在 deploy 编排和性能，不要再怀疑账本或签名主语义是否能通。
+- `v3` 当前 ABI 下，`importc/@exportc` 热路径不要再让 `str` 走 `var` 出参回写。`tcp_transport <-> runtime` 这轮已经验证：哪怕只剩一个 `var str`，也会在 bridge 回写阶段段错；最稳口径是“桥只返标量，字节结果改走 handle/slot 读回”。
+- `program_support_backend_v3.cheng` 里 TCP server 侧的局部 helper 也别再用 `var str` 在函数间回写 `request/err`。就算不跨 C 边界，最稳形状也还是“当前函数本地槽直接消费”。
+- Cheng 里带索引的边界判断不能赌 `&&/||` 会短路。像 `if !atEnd && text[i] == '\n'` 这种写法，在空串场景照样可能摸到 `text[0]`；涉及 `xs[i]` 时直接拆成显式 `if !atEnd:` 分支。
+- proposer 先发 proposal、再开 vote capture 的双阶段循环里，follower 不能把 `sendVote` 失败当成“下轮再重新收 proposal”就完事。最稳做法是拿着同一个 proposal 短时重试发 vote，跨过 phase 切换；否则会稳定形成 proposer 空等票、follower 重拿 proposal 的活锁。
+- `v3` seed 里凡是“已经是 shell 命令字符串”的入口，不能再走 `v3_run_command_logged_argv -> v3_run_shell_command_logged` 这条“双重 quoting”链。像 BFT 的 remote/local shell runner，这样会把 `ssh host sh -lc ...` 重新包坏；正确做法是直接把完整 shell 命令交给 `v3_run_shell_command_logged`。
+- `pkill -f` 做 daemon 停机时，模式不能直接抄完整命令名，不然很容易把正在执行 stop 的 shell 自己一起命中。最稳形状是用子命令加 state/file，并把首字母写成 `[x]` 这种不会自匹配的正则。
+- 三节点 BFT 压测要算“全网最终 commit 时间”，结束时间不能拿提交返回时间凑。当前最稳口径是取三边 state 文件或最终落盘文件里最晚的 mtime，再和 submit 起点做差。
+- validator host 的 proposal `preview/apply` 不要先 decode 成 `V3BftTx[]` 再交回状态机。同一批 `proposal.txs` 走 `FinalizeBlockBytesSummary(...)` 一次做完才是热路径最短形状。
+- 只要 seed 的 logged command helper 会去跑 `ssh`，child stdin 就必须先接 `/dev/null`。否则链已经收敛了，CLI 仍然可能卡在最后一条 `show-state/query-balance` 上不退。
+- 远端非交互运维命令统一用 `ssh -n -o BatchMode=yes`，不要再赌默认 SSH 会自动像批处理一样收尾。
+- BFT deploy/bench 的默认间隔和窗口不要散落硬编码。固定委员会链当前稳定值要作为 config 字段显式写死：`20/20/1000/1000/1000`，`default_max_txs=128`。
+- `system_helpers_stdio_bridge.c` 继续往下拆时，第二刀优先抽 `path/file/plan` 这类纯工具桥，不要先碰 `run_stage_selfhost_host`、`compiler_core_local_payload` 这些挨着 selfhost 和解释器状态的大入口。判断标准很简单：依赖闭包如果还停在 `path/file/text` helper，就适合独立成 provider。 |
+- `system_helpers_stdio_bridge.c` 第三刀最稳的是先抽 tooling entry：`print_usage/print_status/tooling-selfhost-check/program-selfhost-check/compiler_core_tooling_local_payload` 这簇只依赖 CLI argv、弱导入 tooling handle 和很薄的 payload label 解析；真正还绑着 `driver_c_prog_current_frame`、`abort_with_label_output`、`build_stage_artifacts` 的 selfhost 主入口要继续后放，不能混着拆。 |
+- `system_helpers_stdio_bridge.c` 第四刀可以再抽 selfhost host 主入口，但 `driver_c_die_errno`、`driver_c_parent_dir_inplace` 这类程序运行时 builtin 仍要留在 `stdio bridge`。它们虽然贴着 selfhost 代码，真实依赖面却还在 `driver_c_prog` 主链里，不能按位置顺手搬走。 |
+- `system_helpers_stdio_bridge.c` 每切一刀都先单编译剩余 `stdio bridge`。这轮最先暴露的问题不是 source list，而是 runtime helper 被抽空；先过单编译，再跑 backend driver 和 host smoke，定位会快很多。 |
+- 抽 `system_helpers_stdio_bridge.c` 里的宿主弱桥时，定义可以搬走，但原型还要留在 `stdio bridge` 顶部。程序运行时 builtin 还会直接调用 `cheng_fopen/cheng_fclose/cheng_fread/cheng_fwrite/...`；不补前置声明，C99 会先在剩余文件里炸隐式声明。 |
+- `cheng_fopen/get_stdin/get_stdout/get_stderr/cheng_fclose/cheng_fread/cheng_fwrite/cheng_fseek/cheng_ftell/cheng_system_entropy_fill/cheng_fflush/cheng_fgetc/cheng_file_exists/cheng_file_size/cheng_dir_exists/cheng_mkdir1/cheng_file_mtime/cheng_getcwd/cheng_rawbytes_get_at/cheng_rawbytes_set_at/driver_c_read_file_all` 这一簇宿主 `stdio/fs` 弱桥和 `driver_c_prog` 状态解耦，适合作为 `system_helpers_stdio_bridge.c` 的第五刀正式 provider。 |
+- 当 `system_helpers_stdio_bridge.c` 剩余内容已经基本只剩 `driver_c_prog` 解释器和 program 入口时，不要再保留这个旧 provider 名。直接把 live provider 正式换成 `system_helpers_program_runtime_bridge.c`，再把旧 `system_helpers_stdio_bridge.c` 降成 fail-fast stub，最容易把陈旧 source list 当场炸出来。 |
+- provider 正式换名前，先用 `rg` 把 live 代码面旧路径清零；换名后再单编译新 provider、单编译 `cheng_v2c_tooling.c`、重建 backend driver、跑 host smoke。这样能确认不是“只改了名字，主链还在吃旧路径”。 |
+- 三验证人链如果只提供 latest commit 而没有 commit 校验过的 state sync，follower 只要漏掉一个高度，就会永久卡在 `proposal height mismatch`。这类恢复路径不能靠放宽窗口，必须补一条“latest quorum commit + machine snapshot 一致性校验”的状态追平主线。 |
+- `query-summary` 这种单 state 单命令摘要口必须优先于 `show-state + 多次 query-balance` 拼装。多机 deploy/status/bench 轮询里，少一轮 SSH 就少一层抖动和假红灯。 |
+- seed 里长 `snprintf` 命令串一旦新增 flag，第一件事不是相信肉眼，而是重新对 `%s/%d` 个数和参数个数。少一个实参时，最容易出现“编译通过、deploy 在起 daemon 前静默坏掉”的假挂死。 |
+- 验 state-sync 恢复不要一上来整轮重跑远端 bench。最快、最真、最稳的验收是：先让三边收敛，手工杀掉一个 follower，让另外两边继续推进几个高度，再重启 follower，看它是否现场打出 `synced_height=` 并和另外两边重新一致。 |
+- `state-sync` 这类文本载荷别再写内联 `"prefix" + x + "suffix"`。当前主线会把它误编成字面串；最稳口径是局部 `out` 分步追加。
+- `machine_hex=` / `error=` 这类固定前缀 payload，slice 起点一定要按字节数写死后再数一遍。`machine_hex=` 是 `12`，写成 `11` 会把 `=` 一起带进 hex。
+- 远端 `x86_64` 二进制用 `backend_driver` 重编前，先同步刚改过的 Cheng 源。否则远端编出来的还是旧逻辑，probe 看起来像“二进制没换”，真根其实是源码没过去。
+- 三验证人 deploy 主线里的 Linux `x86_64` 产物，不要再让 `64` 自己走 remote `bootstrap/stage3 build`。最稳做法是只在 `dmit` 上用 Linux `backend_driver` 构建一次，再由本机 `scp -3 -B` 转拷到 `64`。
+- seed/runtime 里只要编译器已经明确报“数组下标越界”，就按真实栈踩坏点处理，不要把它当噪音 warning。像这轮 `inputs[5]` 写进 `const char *inputs[5]`，线上现象就会直接变成 `*** stack smashing detected ***`。
+- relay fresh build 要追当前源码时，别继续拿远端旧 `cheng.stage3` 当入口。先同步最新 `cheng_v3_seed.c`，在远端现编一个临时 seed runner，再用它执行 `build-backend-driver`，这样构建入口和当前补丁才是同一份源码。
+- 三验证人链如果要求 fresh baseline 稳定落到 `height=1 / alice=67 / bob=33`，初始 `submit-mint + submit-transfer` 就必须在 proposer 启动前入队。先起 proposer 再写队列，会把第一块漂成空块，后面所有“高度=1”验收都会假失败。
+- deploy 和 bench 不要各自维护一套 baseline 常量。`height=1`、`alice=mint-transfer`、`bob=transfer` 必须收成同一个 helper；只要一边硬编码、一边读 config，后面改 `mint_amount/transfer_amount` 时就会炸出假的 baseline 失败。
+- 记录 bench 数字时，只认 fresh 前台重跑出来的最新结果。像这轮 `200 tx / 32 max_txs` 已更新成 `elapsed_ms=55973 / tps=3.573 / throughput_bytes_per_sec=114`，旧值不能继续沿用。
+- `path/file/plan` 这类 helper 真想从 live C provider 里撤掉，不能只改 `.cheng` 源，还要先查 [v2/bootstrap/cheng_v2c_tooling.c](/Users/lbcheng/cheng-lang/v2/bootstrap/cheng_v2c_tooling.c) 的真实依赖面。这轮验证它只剩 source list 和 symbol whitelist，没有深层调用；最稳顺序就是“先把 Cheng helper 补齐，再删 live source list 和白名单，最后把旧 provider 降成 fail-fast stub”。
+- `v3` 里继续把路径/文件 helper 收回 Cheng 时，先拿真 smoke 验，不要看到 `std/os` 现成 API 就直接全量替换。像这轮 [v3/src/tooling/path.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/path.cheng) 用 `os.fileExists(...)` 后，`compiler_runtime_smoke` 没炸，但 [run_v3_chain_node_cli_smoke.sh](/Users/lbcheng/cheng-lang/v3/tooling/run_v3_chain_node_cli_smoke.sh) 立刻暴露 seed ordinary lowering 还吃不稳这个形状；当前最稳写法是改成 `os.openRead + os.close` 这条已经在 `std/os.readFile` 主链里长期跑过的闭包。 |
+- `std/cmdline` 适合作为 `readFirstFlagValue` 的统一入口，但别把 `parseInt32` 想当然带进所有 ordinary fixture 编译链。`tailnet_control_core` 这轮已经证明，seed ordinary fixture 仍可能在 `std/cmdline::cmdIsSpace` 的 `char` 条件上直接炸；当前最稳口径是“flag 读取统一走 `readFirstFlagValue`，整型解析在调用侧本地实现”。
+- 原生 GUI 主线别等完整 CSS/layout 引擎都齐了才给可视化语义。先把 JSX 里静态可见的 `className/attr` 抬成 `layout_role/style_traits/detail_text`，马上就能把“纯标签树”推进成“样式感知 surface”，这是当前最短真路径。 |
+- 原生 GUI 从“样式感知 surface”再往前走时，别把更多临时展示字段继续塞回 session。最稳收法是先落独立 `style_layout_surface_v1`，把 `visual_role/density/prominence/accent_tone/row_height/...` 收成正式 IR，再让 session/host 只消费这份 IR。 |
+- 原生 GUI 新 IR 一旦落库，别忘了把 `run helper -> wrapper report -> cheng.stage3/backend_driver report` 三层一起追平。只补 bundle summary 不够，live 报告缺字段时，用户会直接把它当成“主线还没真接上”。 |
+- `chain_node_cli_*_main` 这种 wrapper 一旦已经有 [chain_node_cli_core.cheng](/Users/lbcheng/cheng-lang/v3/src/project/chain_node_cli_core.cheng) 的正式 `Cmd*Main/Run`，就不要继续在每个入口里复制 `--state/--host/--port` 读参和报错逻辑。复制面一大，像 `--amount` 这种 `var out` 签名错位就会长期潜伏；最稳收法是 wrapper 直接回 core，只给确实需要不同输出格式的入口留特例。 |
+- `selfhost_host` 这类 provider 里，如果某个 bridge 只是在替 `std/os` 做“exec 抓输出”或“文本文件 compare”，就不要只把 Cheng 侧调用改掉。最稳收法是一口气删掉 `@importc`、native provider 实现、`system_helpers.h` 声明，以及 `machine_pipeline/bootstrap` 里的 direct-exec whitelist；这样不会留下死符号回流口。 |
+- `tooling-selfhost-host / stage-selfhost-host` 这类自举 orchestration 命令收回纯 Cheng 后，第一轮红灯先拿旧 stage0 C 入口复跑一遍再判断。像这轮 `release stdout mismatch` 的真根不是新实现，而是 `v2/tests/contracts/{tooling_release_artifact,network_selfhost,tooling_selfhost,full_selfhost}.expected` 已经跟当前确定性输出漂了；不做旧入口对照，很容易把合同漂移误判成逻辑回归。 |
+- 还会被 stage0 直接编的老 `v2` 文件里，列表构造优先写显式 `seqs.add(...)`，不要再偷懒写裸 `add(...)`。当前 stage0 对这类重载解析还不稳，像 [compiler_core_runtime_v2.cheng](/Users/lbcheng/cheng-lang/v2/src/runtime/compiler_core_runtime_v2.cheng) 这轮就因为裸 `add(...)` 直接卡死在 usage/help helper。 |
+- 只要 helper 会递归扫源码、展开组件或组大 JSON，就不能只靠“节点数截断”碰运气。最稳口径是进程 heap 上限和 `RSS / 模块数 / 展开数 / 源码尺寸` 一起硬卡，超预算直接失败，不允许把整机拖进 swap 或 watchdog reset。 |
+- `P-256` 这类固定素数模数上的逆元，不要再走通用 `bigModInvOddBinary(...)`。这轮已经实锤：`ecdsaSignBytes(...) -> nModInv(k)` 一旦落到那条旧路径，就可能不收敛并持续分配 `BigInt`，把进程顶到 `178GB+`；最稳口径是固定模数直接走 Montgomery 指数逆元，同时给通用逆元保留硬步数上限，只负责 fail-fast，不负责主路径正确性。 |
+2026-04-16
+- `r2c-react-v3` 原生 GUI runtime 不要继续在 ordinary executable 里硬拗 `str/composite` JSON emitter。当前 seed/ordinary 会在 `void(str)` helper、返回字符串 builder、CLI 读参这几种形状上卡 `primary_object_body_semantics_missing`，或者把表达式直接写进字面文本；最稳口径是先把 runtime executable 收成受控 `node_helper_v1`，同时继续生成 Cheng runtime source 归档，等 ordinary string lowering 修完再切回。
+- 原生 GUI 事件回环验收要拆成两条：一条钉 `resize/scroll/focus/text/key -> state/render_plan`，一条钉 `click -> hit/source/inspector`。不要把所有事件都压进一条坐标链里；一旦中间先 resize 再 scroll，后面的点击坐标很容易自然 miss，最后把假 miss 当成逻辑回归。
+- `msquic` listener 绑定 `udp/0` 时，真正可拨号的地址只能以 datapath 返回的已分配端口为准。像这轮 [v2/cheng-quic/src/native_runtime.cheng](/Users/lbcheng/cheng-lang/v2/cheng-quic/src/native_runtime.cheng) 如果继续把请求地址当 live listener 地址，client 就会一直向 `0` 端口发包，表面只看到 `client_hello_ok` 后静默卡死。
+- UDP datapath 的 canonical 地址必须全链路统一成 multiaddress。bind 结果、recv `fromAddr`、session 里的 `clientAddrText/listenerAddrText` 只要混入 `udp://...`，后面的 `parseMultiAddress(...)` 和 peer 元数据就会漂；最稳口径是统一回 `/ip4|ip6/.../udp/.../quic-v1`。
+- `driver_c_prog` 下的网络收尾路径不要偷用 `std/os` 的未公开字段。像这轮 stop/unbind 末尾才炸出来的 `module=std/os field=cheng_close_fd`，本质上就是 live program runtime API 面没对齐；关闭 FD 一律走已公开的 `udpCloseFd(...)`。
+- `v3 public QUIC` 这条线上，像 `acceptPending` 这种“由下层包处理函数回写全局，再让上层 accept loop 读回来”的状态侧信道不稳，必须改成局部返回值或同调用栈内的直接判定。像这轮公网 proposal server，`server_finished_ok=true`、`accept_pending=true` 和 `data_frame side=server len=45` 都已经出现，但 `accept()` 仍不返回，说明不能继续赌这类全局槽读回。
+- `udpRecvFromNonblock(...)` 这条纯 Cheng UDP 主线不能再把 `MSG_DONTWAIT` 硬编码成单一常量。像这轮 `x86_64-unknown-linux-gnu` 上把它写成 `128`，`recvfrom(..., flags=128)` 实际不会非阻塞，结果 client/server 都静默卡进阻塞 `recvfrom`，表面像 QUIC `accept/app recv/pipe_read` 全部乱了；最稳口径是把 `MSG_DONTWAIT` 收成 runtime platform export，Linux 走 `0x40`，Darwin/BSD 走 `0x80`。
+- 目标只是复验 `v3 public QUIC` 的 proposal 公网读回时，不要重跑 `deploy-bft-validator-three-node`。最短真链路是直接在 `64` 用真实 `sample_proposer/proposal.hex` 起 `proposal-serve-daemon`，再让本机和 `dmit` 各自跑 `probe-proposal`；这样能直接钉住 client 读链，不会被 `dmit` 上 `build-backend-driver` 的长链噪音拖住。
+- `r2c-react-v3` 的原生 GUI runtime 如果继续走 ordinary `system-link-exec` executable，当前 ordinary lowering 还吃不下这类 `str/composite` builder：状态组装、字符串累加、CLI 读参和 render plan 文本生成都会在 `primary_object_body_semantics_missing` 卡死。最稳下一步不是继续在 helper 形状上硬拗，而是把这段 runtime 上移到 tooling command surface，或者先补 ordinary 对 `str/composite` 运行时 builder 的 lowering。 |
+- `v3` 这类 provider bridge 收口时，只共享 `@importc` ABI 声明，不要急着再抽“共享 wrapper 模块”。当前编译器还吃不稳“导入模块里再调 provider-exported Cheng 符号”这条链，像 `tcp_bridge_provider_shared.cheng` 一接进 live 主线就会报 `scalar call resolve failed`；最稳做法是 ABI 一处定义，Darwin/Linux final wrapper 各自在本地 provider 收口，等编译器先补这类跨模块解析。 |
+- `run_slice_gate.sh` 这类长链 gate，补完新回归点以后一定要真从头跑到尾并归档完整日志。像这轮先靠全量日志才炸出 `pin_runtime_quic_smoke` 缺 `_cheng_v3_udp_platform_msg_dontwait_bridge`，修完以后又把剩余问题收敛成单独的 stage2 `libp2p_webrtc_sync_smoke`；不跑全链，红灯会一直被后面的随机 smoke 掩住。 |
+- 用户目标如果已经明确是“零 C 依赖、只用纯 Cheng”，就不要再花刀去补 `system_helpers.c/.h` 这类宿主 fallback 面。正确方向是把 live 主线继续往纯 Cheng provider 收、删掉 C 依赖，而不是把两套口径都补齐。 |
+- 收纯 Cheng 主线时，不能只看真正的 link input。`freshness` 输入、seed 辅助构建函数、debug gate 的旁路文件检查，只要还点名旧 C provider，就都要一起清掉；不然主线已经纯了，辅助口径还会把人带回旧结论。 |
+- 纯 Cheng provider object 的验收合同，不能继续照搬旧 C provider 的“只剩公开 ABI 导出”假设。当前 primary object/provider 会把顶层 helper 和全局槽一起导出；最稳口径是公开 ABI 单独白名单，额外导出只允许模块私有前缀，未定义符号白名单也必须按真实 object 输出追平。 |
+- WebRTC 这类 provider-exported bridge 只要跨 `@importc` 回传字符串结果，就不要再走 `var str` 出参回写。当前最稳口径是“bridge 直接返 buffer handle，错误文本存 runtime 槽，再由调用侧按 handle 读回”；这样能同时避开 stage2 的出参回写不稳和 stage3 ordinary 的 composite 实参缺口。 |
+- 只要当前编译器还会给“同函数里的多条表达式字符串”撞局部符号，错误字面量就不能直接散写在 wrapper 分支里。最稳做法是先落本地槽，再传给后续 helper；同理，`const str` 也不要直接做 composite 实参。 |
+- ordinary `system-link-exec` 的 live provider 改动，不能只改 [system_link_exec.cheng](/Users/lbcheng/cheng-lang/v3/src/backend/system_link_exec.cheng)。只要活跃 backend driver 还是从 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 起，它就会继续吐旧 provider 路径；最稳顺序是“源码侧 provider 先改好，再把 seed 里的 `v3_provider_source_for_module(...)` 同步追平，最后立刻重建 backend driver 并用一条 ordinary smoke 验执行面”。 |
+- 当前 seed 对 `program_support_backend_v3` 这类 provider helper，仍然不稳地吃不下“多条裸函数调用语句 + 立即跟字面量拼接”的形状。像这轮 `cheng_exec_cmd_ex`，最稳写法是收成 `cheng_raw_concat_export(...)` 的值传递链，不要在 helper 里连写一串 `cheng_bytes_copy(...)` 再赌发射器能稳过。 |
+- `cheng_exec_cmd_ex` 这类 provider ABI 只要还靠 `var int64` 给 ordinary/controller 回写退出码，就可能在 provider 入口直接把 `exitCode` 指针写炸；最稳口径是改成“capture 返回输出 + 单独 `last_exit_code` getter”的无出参 ABI，彻底绕开这类回写。
+- `r2c-react-v3` 的 direct `native-gui-runtime` 只需要 helper 退出码时，不要再走会抓输出的 `execCmdEx`。最稳收法是 controller 直接走 `execCmdStatus(...)`，真正的 runtime JSON 只从 `native_gui_runtime_direct_v1.json` 读回。
+- seed 冷启动链里的本地 C helper，不要把前置声明放到第一次调用后面。像这轮 `v3_host_target_triple()`，平时复用现成 `stage3` 看不出来，一旦 fresh 走到 `bootstrap-bridge stage0_cc` 就会直接因为隐式声明炸死。 |
+- migration gate 里“预期失败才算通过”的路径，不能走会主动向 stderr 打 `failed rc=...` 的 logged runner。像 `publish-blocked` 这种 stable 拒绝校验，最稳做法是静默执行、只读 log 文本断言，不要把正常拒绝再伪装成红灯。 |
+- `compile-bootstrap` 生成 wrapper 时，`seed.c` include 必须直接写绝对路径。相对 `#include "v3/bootstrap/cheng_v3_seed.c"` 会按 generated 文件目录去找，到了 `artifacts/v3_bootstrap/*.generated.c` 就天然找不到。 |
+- `program_support_backend_v3` 这类 provider helper 里，只要热循环/条件分支还在 seed 发射器覆盖面内，就不要再在 `for/if` 嵌套里塞 `cheng_str_copy_cstring(...)` 这种字符串 helper。最稳口径是直接写固定字节缓冲，把 JSON 转义这类逻辑收成纯字节拷贝。 |

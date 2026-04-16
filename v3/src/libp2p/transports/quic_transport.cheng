@@ -1,12 +1,15 @@
 import std/result
 import std/rawbytes
+import std/os
 import cheng/v3/libp2p/core/multistream
+import cheng/v3/libp2p/core/multiaddr as core_multiaddr
 import cheng/v3/libp2p/core/types
 import cheng/v3/quic/multiaddress as qaddr
 import cheng/v3/quic/connection as qconn
 import cheng/v3/quic/msquictransport_native as qtransport
 import cheng/v3/quic/tls/policy as qpolicy
 import cheng/v3/quic/tls/test_pki as testpki
+import cheng/v3/tooling/path as v3path
 
 type
     V3Libp2pQuicTransportConfig =
@@ -38,6 +41,184 @@ fn v3Libp2pQuicTransportSupportsAddr(addr: types.V3Libp2pMultiaddr): bool =
 fn v3Libp2pQuicTransportText(): str =
     return "quic(tls)->native_stream"
 
+fn v3Libp2pQuicBytesAppend(dst: var Bytes, extra: Bytes) =
+    let oldLen: int32 = bytesLen(dst)
+    let addLen: int32 = bytesLen(extra)
+    if addLen <= 0:
+        return
+    let out: Bytes = bytesAlloc(oldLen + addLen)
+    for i in 0..<oldLen:
+        bytesSet(out, i, bytesGet(dst, i))
+    for j in 0..<addLen:
+        bytesSet(out, oldLen + j, bytesGet(extra, j))
+    dst = out
+
+fn v3Libp2pQuicEncodeFrame(payload: Bytes): Bytes =
+    let payloadLen: int32 = bytesLen(payload)
+    let out: Bytes = bytesAlloc(4 + payloadLen)
+    bytesSet(out, 0, (payloadLen >> 24) & 0xff)
+    bytesSet(out, 1, (payloadLen >> 16) & 0xff)
+    bytesSet(out, 2, (payloadLen >> 8) & 0xff)
+    bytesSet(out, 3, payloadLen & 0xff)
+    for i in 0..<payloadLen:
+        bytesSet(out, 4 + i, bytesGet(payload, i))
+    return out
+
+fn v3Libp2pQuicDecodeFrameLen(header: Bytes): Result[int32] =
+    if bytesLen(header) != 4:
+        return Err[int32]("v3 libp2p quic: invalid frame header")
+    let b0 = bytesGet(header, 0)
+    let b1 = bytesGet(header, 1)
+    let b2 = bytesGet(header, 2)
+    let b3 = bytesGet(header, 3)
+    return Ok[int32]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3Libp2pQuicReadExact(t: var qtransport.MsQuicTransport,
+                         conn: var qconn.Connection,
+                         count: int32): Result[Bytes] =
+    if count <= 0:
+        return Ok[Bytes](emptyBytes())
+    var out: Bytes
+    out = emptyBytes()
+    while bytesLen(out) < count:
+        let chunkRes = qtransport.msquicTransportRead(t, conn, count - bytesLen(out))
+        if IsErr(chunkRes):
+            return Err[Bytes](ErrorText(chunkRes))
+        let chunk = Value(chunkRes)
+        if bytesLen(chunk) <= 0:
+            return Err[Bytes]("v3 libp2p quic: unexpected eof")
+        v3Libp2pQuicBytesAppend(out, chunk)
+    return Ok[Bytes](out)
+
+fn v3Libp2pQuicWriteExact(t: var qtransport.MsQuicTransport,
+                          conn: var qconn.Connection,
+                          payload: Bytes): Result[bool] =
+    let writeRes = qtransport.msquicTransportWrite(t, conn, payload)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    if Value(writeRes) != bytesLen(payload):
+        return Err[bool]("v3 libp2p quic: short write")
+    return Ok[bool](true)
+
+fn v3Libp2pQuicReadFrame(t: var qtransport.MsQuicTransport,
+                         conn: var qconn.Connection): Result[Bytes] =
+    let headerRes = v3Libp2pQuicReadExact(t, conn, 4)
+    if IsErr(headerRes):
+        return Err[Bytes](ErrorText(headerRes))
+    let lenRes = v3Libp2pQuicDecodeFrameLen(Value(headerRes))
+    if IsErr(lenRes):
+        return Err[Bytes](ErrorText(lenRes))
+    let payloadLen = Value(lenRes)
+    if payloadLen <= 0:
+        return Ok[Bytes](emptyBytes())
+    return v3Libp2pQuicReadExact(t, conn, payloadLen)
+
+fn v3Libp2pQuicWriteReadyPort(readyPath: str, boundPort: int32): bool =
+    if len(readyPath) <= 0:
+        return true
+    return v3path.v3WriteTextFile(os.getCurrentDir(), readyPath, intToStr(boundPort) + "\n")
+
+fn v3Libp2pQuicAddrFromHostPort(host: str, port: int32): Result[qaddr.MultiAddress] =
+    if port < 0 || port > 65535:
+        return Err[qaddr.MultiAddress]("v3 libp2p quic: invalid port")
+    var addr: types.V3Libp2pMultiaddr
+    core_multiaddr.v3Libp2pMultiaddrFillQuic(addr, host, port)
+    return v3Libp2pQuicParseAddr(addr)
+
+fn v3Libp2pQuicBoundPort(addr: qaddr.MultiAddress): int32 =
+    let text = qaddr.quicMultiAddressToString(addr)
+    if len(text) <= 0:
+        return 0
+    var parsed: types.V3Libp2pMultiaddr
+    let fillRes = core_multiaddr.v3Libp2pMultiaddrFillFromBytes(parsed, bytesFromString(text))
+    if IsErr(fillRes):
+        return 0
+    return parsed.port
+
+fn v3Libp2pQuicConfigureTlsWithPolicy(t: var qtransport.MsQuicTransport,
+                                      policy: qpolicy.MsQuicTlsPolicy): Result[bool] =
+    return qtransport.setMsQuicTransportTlsPolicy(t, policy)
+
+fn v3Libp2pQuicConfigureTlsWithServerName(t: var qtransport.MsQuicTransport,
+                                          serverName: str): Result[bool] =
+    if len(serverName) > 0 && serverName != "localhost":
+        let policy: qpolicy.MsQuicTlsPolicy = testpki.msquicMakePublicTransportTlsPolicy(serverName)
+        return v3Libp2pQuicConfigureTlsWithPolicy(t, policy)
+    let policy: qpolicy.MsQuicTlsPolicy = testpki.msquicMakeLocalhostTransportTlsPolicy()
+    return v3Libp2pQuicConfigureTlsWithPolicy(t, policy)
+
+fn v3Libp2pQuicStartListenerNamed(listener: var qtransport.MsQuicTransport,
+                                  host: str,
+                                  port: int32,
+                                  serverName: str): Result[int32] =
+    let addrRes = v3Libp2pQuicAddrFromHostPort(host, port)
+    if IsErr(addrRes):
+        return Err[int32](ErrorText(addrRes))
+    listener = qtransport.initMsQuicTransport()
+    let tlsRes = v3Libp2pQuicConfigureTlsWithServerName(listener, serverName)
+    if IsErr(tlsRes):
+        return Err[int32]("v3 libp2p quic: listener tls: " + ErrorText(tlsRes))
+    qtransport.start(listener, Value(addrRes))
+    if !listener.running:
+        return Err[int32]("v3 libp2p quic: listener start: " + listener.lastError)
+    return Ok[int32](v3Libp2pQuicBoundPort(listener.listenAddr))
+
+fn v3Libp2pQuicStartListener(listener: var qtransport.MsQuicTransport,
+                             host: str,
+                             port: int32): Result[int32] =
+    return v3Libp2pQuicStartListenerNamed(listener, host, port, "localhost")
+
+fn v3Libp2pQuicDialClientNamed(client: var qtransport.MsQuicTransport,
+                               conn: var qconn.Connection,
+                               host: str,
+                               port: int32,
+                               serverName: str): Result[bool] =
+    let addrRes = v3Libp2pQuicAddrFromHostPort(host, port)
+    if IsErr(addrRes):
+        return Err[bool](ErrorText(addrRes))
+    client = qtransport.initMsQuicTransport()
+    let tlsRes = v3Libp2pQuicConfigureTlsWithServerName(client, serverName)
+    if IsErr(tlsRes):
+        return Err[bool]("v3 libp2p quic: client tls: " + ErrorText(tlsRes))
+    let dialRes = qtransport.dial(client, Value(addrRes))
+    if IsErr(dialRes):
+        return Err[bool]("v3 libp2p quic: dial: " + ErrorText(dialRes))
+    conn = Value(dialRes)
+    return Ok[bool](true)
+
+fn v3Libp2pQuicDialClient(client: var qtransport.MsQuicTransport,
+                          conn: var qconn.Connection,
+                          host: str,
+                          port: int32): Result[bool] =
+    return v3Libp2pQuicDialClientNamed(client, conn, host, port, "localhost")
+
+fn v3Libp2pQuicClientSelectProtocol(client: var qtransport.MsQuicTransport,
+                                    conn: var qconn.Connection,
+                                    protocol: types.V3Libp2pProtocolId): Result[bool] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    let writeRes = v3Libp2pQuicWriteExact(client, conn, selectBytes)
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    os.writeLine(os.get_stderr(), "v3_quic_client_select_wait bytes=" + intToStr(bytesLen(selectBytes)))
+    let echoRes = v3Libp2pQuicReadExact(client, conn, bytesLen(selectBytes))
+    if IsErr(echoRes):
+        return Err[bool](ErrorText(echoRes))
+    if !multistream.v3Libp2pMultistreamAccepts(Value(echoRes), protocol):
+        return Err[bool]("v3 libp2p quic: multistream response mismatch")
+    return Ok[bool](true)
+
+fn v3Libp2pQuicServerSelectProtocol(listener: var qtransport.MsQuicTransport,
+                                    conn: var qconn.Connection,
+                                    protocol: types.V3Libp2pProtocolId): Result[bool] =
+    let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
+    os.writeLine(os.get_stderr(), "v3_quic_server_select_wait bytes=" + intToStr(bytesLen(selectBytes)))
+    let recvRes = v3Libp2pQuicReadExact(listener, conn, bytesLen(selectBytes))
+    if IsErr(recvRes):
+        return Err[bool](ErrorText(recvRes))
+    if !multistream.v3Libp2pMultistreamAccepts(Value(recvRes), protocol):
+        return Err[bool]("v3 libp2p quic: multistream request mismatch got=" + bytesToHex(Value(recvRes)))
+    return v3Libp2pQuicWriteExact(listener, conn, selectBytes)
+
 fn v3Libp2pQuicAddrText(addr: types.V3Libp2pMultiaddr): str =
     if len(addr.raw) > 0:
         return addr.raw
@@ -54,8 +235,7 @@ fn v3Libp2pQuicParseAddr(addr: types.V3Libp2pMultiaddr): Result[qaddr.MultiAddre
     return qaddr.parseMultiAddress(v3Libp2pQuicAddrText(addr))
 
 fn v3Libp2pQuicConfigureTls(t: var qtransport.MsQuicTransport): Result[bool] =
-    let policy: qpolicy.MsQuicTlsPolicy = testpki.msquicMakeLocalhostTransportTlsPolicy()
-    return qtransport.setMsQuicTransportTlsPolicy(t, policy)
+    return v3Libp2pQuicConfigureTlsWithServerName(t, "localhost")
 
 fn v3Libp2pQuicLoopbackOpenInto(out: var V3Libp2pQuicLoopbackPair,
                                 addr: types.V3Libp2pMultiaddr): Result[bool] =
@@ -121,3 +301,232 @@ fn v3Libp2pQuicLoopbackSelectProtocol(pair: var V3Libp2pQuicLoopbackPair,
     if !multistream.v3Libp2pMultistreamAccepts(Value(readRes), protocol):
         return Err[bool]("v3 libp2p quic: multistream select mismatch")
     return Ok[bool](true)
+
+fn v3Libp2pQuicServePayloadOnce(host: str,
+                                port: int32,
+                                protocol: types.V3Libp2pProtocolId,
+                                payload: Bytes,
+                                readyPath: str): Result[bool] =
+    return v3Libp2pQuicServePayloadWindow(host, port, protocol, payload, readyPath, 1, -1)
+
+fn v3Libp2pQuicServePayloadOnceNamed(host: str,
+                                     port: int32,
+                                     serverName: str,
+                                     protocol: types.V3Libp2pProtocolId,
+                                     payload: Bytes,
+                                     readyPath: str): Result[bool] =
+    return v3Libp2pQuicServePayloadWindowNamed(host,
+                                               port,
+                                               serverName,
+                                               protocol,
+                                               payload,
+                                               readyPath,
+                                               1,
+                                               -1)
+
+fn v3Libp2pQuicRecvPayloadOnce(host: str,
+                               port: int32,
+                               protocol: types.V3Libp2pProtocolId): Result[Bytes] =
+    return v3Libp2pQuicRecvPayloadOnceNamed(host, port, "localhost", protocol)
+
+fn v3Libp2pQuicRecvPayloadOnceNamed(host: str,
+                                    port: int32,
+                                    serverName: str,
+                                    protocol: types.V3Libp2pProtocolId): Result[Bytes] =
+    var client = qtransport.initMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = v3Libp2pQuicDialClientNamed(client, conn, host, port, serverName)
+    if IsErr(dialRes):
+        return Err[Bytes](ErrorText(dialRes))
+    let selectRes = v3Libp2pQuicClientSelectProtocol(client, conn, protocol)
+    if IsErr(selectRes):
+        qconn.connClose(conn)
+        return Err[Bytes](ErrorText(selectRes))
+    let payloadRes = v3Libp2pQuicReadFrame(client, conn)
+    qconn.connClose(conn)
+    if IsErr(payloadRes):
+        return Err[Bytes](ErrorText(payloadRes))
+    return Ok[Bytes](Value(payloadRes))
+
+fn v3Libp2pQuicRequestResponse(host: str,
+                               port: int32,
+                               protocol: types.V3Libp2pProtocolId,
+                               requestPayload: Bytes): Result[Bytes] =
+    return v3Libp2pQuicRequestResponseNamed(host, port, "localhost", protocol, requestPayload)
+
+fn v3Libp2pQuicRequestResponseNamed(host: str,
+                                    port: int32,
+                                    serverName: str,
+                                    protocol: types.V3Libp2pProtocolId,
+                                    requestPayload: Bytes): Result[Bytes] =
+    var client = qtransport.initMsQuicTransport()
+    var conn: qconn.Connection
+    let dialRes = v3Libp2pQuicDialClientNamed(client, conn, host, port, serverName)
+    if IsErr(dialRes):
+        return Err[Bytes](ErrorText(dialRes))
+    let selectRes = v3Libp2pQuicClientSelectProtocol(client, conn, protocol)
+    if IsErr(selectRes):
+        qconn.connClose(conn)
+        return Err[Bytes](ErrorText(selectRes))
+    let writeRes = v3Libp2pQuicWriteExact(client, conn, v3Libp2pQuicEncodeFrame(requestPayload))
+    if IsErr(writeRes):
+        qconn.connClose(conn)
+        return Err[Bytes](ErrorText(writeRes))
+    let responseRes = v3Libp2pQuicReadFrame(client, conn)
+    qconn.connClose(conn)
+    if IsErr(responseRes):
+        return Err[Bytes](ErrorText(responseRes))
+    return Ok[Bytes](Value(responseRes))
+
+fn v3Libp2pQuicServeRequestCaptureOnce(host: str,
+                                       port: int32,
+                                       protocol: types.V3Libp2pProtocolId,
+                                       responsePayload: Bytes,
+                                       readyPath: str): Result[Bytes] =
+    return v3Libp2pQuicServeRequestCaptureOnceNamed(host,
+                                                    port,
+                                                    "localhost",
+                                                    protocol,
+                                                    responsePayload,
+                                                    readyPath)
+
+fn v3Libp2pQuicServeRequestCaptureOnceNamed(host: str,
+                                            port: int32,
+                                            serverName: str,
+                                            protocol: types.V3Libp2pProtocolId,
+                                            responsePayload: Bytes,
+                                            readyPath: str): Result[Bytes] =
+    let captureRes = v3Libp2pQuicServeRequestCaptureWindowNamed(host,
+                                                                port,
+                                                                serverName,
+                                                                protocol,
+                                                                responsePayload,
+                                                                readyPath,
+                                                                1,
+                                                                -1)
+    if IsErr(captureRes):
+        return Err[Bytes](Error(captureRes))
+    let captured = Value(captureRes)
+    if captured.len <= 0:
+        return Err[Bytes]("v3 libp2p quic: capture empty")
+    return Ok[Bytes](captured[0])
+
+fn v3Libp2pQuicServePayloadWindow(host: str,
+                                  port: int32,
+                                  protocol: types.V3Libp2pProtocolId,
+                                  payload: Bytes,
+                                  readyPath: str,
+                                  maxServeCount: int32,
+                                  waitMs: int32): Result[bool] =
+    return v3Libp2pQuicServePayloadWindowNamed(host,
+                                               port,
+                                               "localhost",
+                                               protocol,
+                                               payload,
+                                               readyPath,
+                                               maxServeCount,
+                                               waitMs)
+
+fn v3Libp2pQuicServePayloadWindowNamed(host: str,
+                                       port: int32,
+                                       serverName: str,
+                                       protocol: types.V3Libp2pProtocolId,
+                                       payload: Bytes,
+                                       readyPath: str,
+                                       maxServeCount: int32,
+                                       waitMs: int32): Result[bool] =
+    var listener = qtransport.initMsQuicTransport()
+    let startRes = v3Libp2pQuicStartListenerNamed(listener, host, port, serverName)
+    if IsErr(startRes):
+        return Err[bool](Error(startRes))
+    if !v3Libp2pQuicWriteReadyPort(readyPath, Value(startRes)):
+        qtransport.stop(listener)
+        return Err[bool]("v3 libp2p quic: ready path write failed")
+    var servedCount = 0
+    while maxServeCount <= 0 || servedCount < maxServeCount:
+        let acceptRes = qtransport.acceptTimed(listener, waitMs)
+        if IsErr(acceptRes):
+            if ErrorText(acceptRes) == "msquic: accept timeout":
+                break
+            qtransport.stop(listener)
+            return Err[bool]("v3 libp2p quic: accept: " + ErrorText(acceptRes))
+        var conn = Value(acceptRes)
+        var dropConn = false
+        let selectRes = v3Libp2pQuicServerSelectProtocol(listener, conn, protocol)
+        if IsErr(selectRes):
+            os.writeLine(os.get_stderr(), "v3_quic_serve_select_err=" + ErrorText(selectRes))
+            dropConn = true
+        if !dropConn:
+            let writeRes = v3Libp2pQuicWriteExact(listener, conn, v3Libp2pQuicEncodeFrame(payload))
+            if IsErr(writeRes):
+                os.writeLine(os.get_stderr(), "v3_quic_serve_write_err=" + ErrorText(writeRes))
+                dropConn = true
+        qconn.connClose(conn)
+        if dropConn:
+            continue
+        servedCount = servedCount + 1
+    qtransport.stop(listener)
+    return Ok[bool](true)
+
+fn v3Libp2pQuicServeRequestCaptureWindow(host: str,
+                                         port: int32,
+                                         protocol: types.V3Libp2pProtocolId,
+                                         responsePayload: Bytes,
+                                         readyPath: str,
+                                         maxCaptureCount: int32,
+                                         waitMs: int32): Result[Bytes[]] =
+    return v3Libp2pQuicServeRequestCaptureWindowNamed(host,
+                                                      port,
+                                                      "localhost",
+                                                      protocol,
+                                                      responsePayload,
+                                                      readyPath,
+                                                      maxCaptureCount,
+                                                      waitMs)
+
+fn v3Libp2pQuicServeRequestCaptureWindowNamed(host: str,
+                                              port: int32,
+                                              serverName: str,
+                                              protocol: types.V3Libp2pProtocolId,
+                                              responsePayload: Bytes,
+                                              readyPath: str,
+                                              maxCaptureCount: int32,
+                                              waitMs: int32): Result[Bytes[]] =
+    var listener = qtransport.initMsQuicTransport()
+    let startRes = v3Libp2pQuicStartListenerNamed(listener, host, port, serverName)
+    if IsErr(startRes):
+        return Err[Bytes[]](Error(startRes))
+    if !v3Libp2pQuicWriteReadyPort(readyPath, Value(startRes)):
+        qtransport.stop(listener)
+        return Err[Bytes[]]("v3 libp2p quic: ready path write failed")
+    var captured: Bytes[]
+    captured = []
+    while maxCaptureCount <= 0 || captured.len < maxCaptureCount:
+        let acceptRes = qtransport.acceptTimed(listener, waitMs)
+        if IsErr(acceptRes):
+            if ErrorText(acceptRes) == "msquic: accept timeout":
+                break
+            qtransport.stop(listener)
+            return Err[Bytes[]]("v3 libp2p quic: accept: " + ErrorText(acceptRes))
+        var conn = Value(acceptRes)
+        var dropConn = false
+        let selectRes = v3Libp2pQuicServerSelectProtocol(listener, conn, protocol)
+        var requestPayload = emptyBytes()
+        if IsErr(selectRes):
+            dropConn = true
+        if !dropConn:
+            let requestRes = v3Libp2pQuicReadFrame(listener, conn)
+            if IsErr(requestRes):
+                dropConn = true
+            else:
+                requestPayload = Value(requestRes)
+        if !dropConn:
+            let writeRes = v3Libp2pQuicWriteExact(listener, conn, v3Libp2pQuicEncodeFrame(responsePayload))
+            if IsErr(writeRes):
+                dropConn = true
+        qconn.connClose(conn)
+        if dropConn:
+            continue
+        add(captured, requestPayload)
+    qtransport.stop(listener)
+    return Ok[Bytes[]](captured)

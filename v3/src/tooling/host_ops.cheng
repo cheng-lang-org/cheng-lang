@@ -1,4 +1,5 @@
 import std/os
+import std/os_host_process as hostos
 import std/result
 import std/strutils as strutil
 import std/strings
@@ -35,11 +36,11 @@ fn v3ExecFileDirect(filePath: str, argv: str[], envOverrides: str[],
                     workingDir: str, timeoutSec: int32,
                     capturePreferred: bool): os.ExecCmdResult =
     if capturePreferred:
-        return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
-    let directRc: int32 = os.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
+        return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+    let directRc: int32 = hostos.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
     if directRc == 0 || directRc == 124:
         return os.ExecCmdResult(output: "", exitCode: directRc)
-    return os.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
+    return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
 
 fn v3ResolveProgram(root: str, nameRaw: str): str =
     let name: str = strutil.strip(nameRaw)
@@ -114,12 +115,12 @@ fn v3SpawnedProcessZero(): V3SpawnedProcess =
 
 fn v3SpawnedProcessCloseRead(proc: var V3SpawnedProcess) =
     if proc.readFd >= 0:
-        os.ptyClose(proc.readFd)
+        hostos.ptyClose(proc.readFd)
         proc.readFd = -1
 
 fn v3SpawnedProcessCloseWrite(proc: var V3SpawnedProcess) =
     if proc.writeFd >= 0:
-        os.ptyClose(proc.writeFd)
+        hostos.ptyClose(proc.writeFd)
         proc.writeFd = -1
 
 fn v3SpawnedProcessCleanup(proc: var V3SpawnedProcess) =
@@ -132,9 +133,9 @@ fn v3SpawnedProcessDrain(proc: var V3SpawnedProcess, timeoutMs: int32) =
         return
     var waitMs = timeoutMs
     while proc.readFd >= 0:
-        let readRes = os.fdReadWait(proc.readFd, 65536, waitMs)
-        let chunk = readRes[0]
-        let eof = readRes[1]
+        let readRes = hostos.fdReadWait(proc.readFd, 65536, waitMs)
+        let chunk = readRes.text
+        let eof = readRes.eof
         if strings.len(chunk) > 0:
             proc.output = proc.output + chunk
             waitMs = 0
@@ -146,7 +147,7 @@ fn v3SpawnedProcessDrain(proc: var V3SpawnedProcess, timeoutMs: int32) =
 fn v3SpawnedProcessSignal(proc: V3SpawnedProcess, signalCode: int32): bool =
     if proc.pid <= 0:
         return false
-    return os.processSignal(proc.pid, signalCode)
+    return hostos.processSignal(proc.pid, signalCode)
 
 fn v3SpawnedProcessKill(proc: var V3SpawnedProcess) =
     if proc.pid <= 0:
@@ -156,8 +157,8 @@ fn v3SpawnedProcessKill(proc: var V3SpawnedProcess) =
     os.sleepMs(100)
     let _kill = v3SpawnedProcessSignal(proc, v3ProcessSigKill)
     var exitCode = -1
-    let _wait = os.ptyWait(proc.pid)
-    exitCode = _wait[1]
+    let _wait = hostos.ptyWait(proc.pid)
+    exitCode = _wait.exitCode
     v3SpawnedProcessDrain(proc, 0)
     v3SpawnedProcessCleanup(proc)
 
@@ -179,10 +180,10 @@ fn v3SpawnedProcessPoll(proc: var V3SpawnedProcess): int32 =
     if proc.pid <= 0:
         return 0
     v3SpawnedProcessDrain(proc, 0)
-    let waitRes = os.ptyWait(proc.pid)
-    let waitStatus = waitRes[0]
+    let waitRes = hostos.ptyWait(proc.pid)
+    let waitStatus = waitRes.waitStatus
     if waitStatus == 1:
-        let exitCode = waitRes[1]
+        let exitCode = waitRes.exitCode
         v3SpawnedProcessDrain(proc, 0)
         v3SpawnedProcessCleanup(proc)
         return exitCode
@@ -191,6 +192,10 @@ fn v3SpawnedProcessPoll(proc: var V3SpawnedProcess): int32 =
         v3SpawnedProcessCleanup(proc)
         return -1
     return v3ProcessRunning
+
+fn v3SpawnedProcessRunning(proc: var V3SpawnedProcess): bool =
+    let exitCode = v3SpawnedProcessPoll(proc)
+    return exitCode == v3ProcessRunning
 
 fn v3SpawnedProcessWaitLogged(root: str,
                               proc: var V3SpawnedProcess,
@@ -205,10 +210,10 @@ fn v3SpawnedProcessWaitLogged(root: str,
     var exitCode = -1
     while proc.pid > 0:
         v3SpawnedProcessDrain(proc, 20)
-        let waitRes = os.ptyWait(proc.pid)
-        let waitStatus = waitRes[0]
+        let waitRes = hostos.ptyWait(proc.pid)
+        let waitStatus = waitRes.waitStatus
         if waitStatus == 1:
-            exitCode = waitRes[1]
+            exitCode = waitRes.exitCode
             proc.pid = 0
             break
         if waitStatus < 0:
@@ -252,14 +257,14 @@ fn v3SpawnFile(root: str,
     var workingDir: str = v3path.v3PathAbsolute(root, workingDirRaw)
     if !v3path.v3PathNonEmpty(workingDirRaw):
         workingDir = root
-    let spawnRes = os.execFilePipeSpawn(filePath, argv, envOverrides, workingDir)
-    if !spawnRes[0]:
+    let spawnRes = hostos.execFilePipeSpawn(filePath, argv, envOverrides, workingDir)
+    if !spawnRes.ok:
         return Err[V3SpawnedProcess]("spawn failed: " + filePath)
     return Ok[V3SpawnedProcess](V3SpawnedProcess(label: label,
                                                  filePath: filePath,
-                                                 readFd: spawnRes[1],
-                                                 writeFd: spawnRes[2],
-                                                 pid: spawnRes[3],
+                                                 readFd: spawnRes.readFd,
+                                                 writeFd: spawnRes.writeFd,
+                                                 pid: spawnRes.pid,
                                                  output: ""))
 
 fn v3SpawnProgram(root: str,

@@ -1897,10 +1897,14 @@ static void cheng_fill_frame(ChengAppRuntimeCtx* ctx) {
 }
 
 uint64_t cheng_app_capabilities(void) {
-  return CHENG_MOBILE_CAP_RENDER_SEMANTIC |
-         CHENG_MOBILE_CAP_SIDE_EFFECT_BRIDGE |
-         CHENG_MOBILE_CAP_FRAME_CAPTURE |
-         CHENG_MOBILE_CAP_IME_INPUT;
+  uint64_t caps = CHENG_MOBILE_CAP_RENDER_SEMANTIC |
+                  CHENG_MOBILE_CAP_SIDE_EFFECT_BRIDGE |
+                  CHENG_MOBILE_CAP_FRAME_CAPTURE |
+                  CHENG_MOBILE_CAP_IME_INPUT;
+  if (s_host_api.biometric_fingerprint_authorize != NULL) {
+    caps |= CHENG_MOBILE_CAP_BIOMETRIC_ATTESTATION;
+  }
+  return caps;
 }
 
 static void cheng_ring_push_touch(ChengAppRuntimeCtx* ctx, const ChengRingTouchEventV1* ev) {
@@ -2265,4 +2269,74 @@ int32_t cheng_app_capture_frame_rgba(uint64_t app_id, uint8_t* out_rgba, int32_t
     out_rgba[i * 4u + 3u] = (uint8_t)((px >> 24u) & 0xFFu);
   }
   return need;
+}
+
+int32_t cheng_mobile_host_biometric_fingerprint_authorize_bridge(
+    const char* request_id,
+    int32_t purpose,
+    const char* did_text,
+    const char* prompt_title,
+    const char* prompt_reason,
+    const char* device_binding_seed_hint,
+    const char* device_label_hint,
+    char* out_feature32_hex,
+    int32_t out_feature32_cap,
+    char* out_device_binding_seed,
+    int32_t out_device_binding_seed_cap,
+    char* out_device_label,
+    int32_t out_device_label_cap,
+    char* out_sensor_id,
+    int32_t out_sensor_id_cap,
+    char* out_hardware_attestation,
+    int32_t out_hardware_attestation_cap,
+    char* out_error,
+    int32_t out_error_cap) {
+  if (out_feature32_hex != NULL && out_feature32_cap > 0) {
+    out_feature32_hex[0] = '\0';
+  }
+  if (out_device_binding_seed != NULL && out_device_binding_seed_cap > 0) {
+    out_device_binding_seed[0] = '\0';
+  }
+  if (out_device_label != NULL && out_device_label_cap > 0) {
+    out_device_label[0] = '\0';
+  }
+  if (out_sensor_id != NULL && out_sensor_id_cap > 0) {
+    out_sensor_id[0] = '\0';
+  }
+  if (out_hardware_attestation != NULL && out_hardware_attestation_cap > 0) {
+    out_hardware_attestation[0] = '\0';
+  }
+  if (out_error != NULL && out_error_cap > 0) {
+    out_error[0] = '\0';
+  }
+  if (s_host_api.biometric_fingerprint_authorize == NULL) {
+    if (out_error != NULL && out_error_cap > 0) {
+      (void)snprintf(out_error, (size_t)out_error_cap, "%s", "v3 biometric: host api missing");
+    }
+    return 0;
+  }
+  const int32_t ok = s_host_api.biometric_fingerprint_authorize(
+      request_id,
+      purpose,
+      did_text,
+      prompt_title,
+      prompt_reason,
+      device_binding_seed_hint,
+      device_label_hint,
+      out_feature32_hex,
+      out_feature32_cap,
+      out_device_binding_seed,
+      out_device_binding_seed_cap,
+      out_device_label,
+      out_device_label_cap,
+      out_sensor_id,
+      out_sensor_id_cap,
+      out_hardware_attestation,
+      out_hardware_attestation_cap,
+      out_error,
+      out_error_cap);
+  if (ok == 0 && out_error != NULL && out_error_cap > 0 && out_error[0] == '\0') {
+    (void)snprintf(out_error, (size_t)out_error_cap, "%s", "v3 biometric: host authorize failed");
+  }
+  return ok;
 }

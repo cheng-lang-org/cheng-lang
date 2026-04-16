@@ -5,12 +5,14 @@ import cheng/v3/std/crypto/hash256
 import cheng/v3/libp2p/core/multistream
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/protocols/webrtc_signal as signal
+import cheng/v3/runtime/tcp_bridge_abi as tcpabi
 
-importc fn cheng_v3_webrtc_datachannel_request_response_bridge(protocolText: str, signalWire: str, requestWire: str, responseWire: str, clientResponseWire: var str, errWire: var str): int32
-importc fn cheng_v3_webrtc_browser_request_response_bridge(protocolText: str, policyWire: str, labelText: str, requestWire: str, responseWire: str, signalResponseWire: var str, clientResponseWire: var str, errWire: var str): int32
-importc fn cheng_v3_webrtc_browser_session_open_bridge(policyText: str, labelText: str, signalResponseWire: var str, errWire: var str): uint64
-importc fn cheng_v3_webrtc_browser_session_exchange_bridge(handle: uint64, protocolText: str, requestWire: str, responseWire: str, clientResponseWire: var str, errWire: var str): int32
-importc fn cheng_v3_webrtc_browser_session_close_bridge(handle: uint64, errWire: var str): int32
+importc fn cheng_v3_webrtc_last_error_handle_bridge(): uint64
+importc fn cheng_v3_webrtc_datachannel_request_response_handle_bridge(protocolText: str, signalWire: str, requestWire: str, responseWire: str): uint64
+importc fn cheng_v3_webrtc_browser_session_open_handle_bridge(policyText: str, labelText: str): uint64
+importc fn cheng_v3_webrtc_browser_session_signal_handle_bridge(handle: uint64): uint64
+importc fn cheng_v3_webrtc_browser_session_exchange_handle_bridge(handle: uint64, protocolText: str, requestWire: str, responseWire: str): uint64
+importc fn cheng_v3_webrtc_browser_session_close_simple_bridge(handle: uint64): int32
 importc fn cheng_v3_webrtc_browser_session_active_count_bridge(): int32
 
 var v3Libp2pWebrtcNativeDatachannelOpenCount: int32 = 0
@@ -24,6 +26,35 @@ var v3Libp2pWebrtcLastSessionId: layout.FixedBytes32 = layout.fixedBytes32Zero()
 
 fn v3Libp2pWebrtcOwnedBytesFromString(text: str): Bytes =
     return bytesSlice(bytesFromString(text), 0, len(text))
+
+fn v3Libp2pWebrtcBytesFromHandle(handle: uint64): Result[Bytes] =
+    if handle == uint64(0):
+        return Err[Bytes]("v3 libp2p webrtc: bridge failed")
+    let n = tcpabi.cheng_v3_buffer_handle_len_bridge(handle)
+    if n < 0:
+        tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        return Err[Bytes]("v3 libp2p webrtc: bridge handle len failed")
+    var out = bytesAlloc(n)
+    for i in 0..<n:
+        let b = tcpabi.cheng_v3_buffer_handle_byte_bridge(handle, i)
+        if b < 0:
+            tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+            return Err[Bytes]("v3 libp2p webrtc: bridge handle byte failed")
+        bytesSet(out, i, b)
+    tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+    return Ok[Bytes](out)
+
+fn v3Libp2pWebrtcLastErrorText(fallback: str): str =
+    let handle = cheng_v3_webrtc_last_error_handle_bridge()
+    if handle == uint64(0):
+        return fallback
+    let errRes = v3Libp2pWebrtcBytesFromHandle(handle)
+    if IsErr(errRes):
+        return fallback
+    let errBytes = Value(errRes)
+    if bytesLen(errBytes) <= 0:
+        return fallback
+    return bytesToString(errBytes)
 
 type
     V3Libp2pWebrtcTransportConfig =
@@ -344,19 +375,16 @@ fn v3Libp2pWebrtcNativeRequestResponse(protocol: types.V3Libp2pProtocolId,
     if !signal.v3Libp2pWebrtcSignalSessionReady(session):
         return Err[bool]("v3 libp2p webrtc: signal session not ready")
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var clientResponseWire = ""
-    var errWire = ""
-    let ok = cheng_v3_webrtc_datachannel_request_response_bridge(bytesToString(selectBytes),
-                                                                 bytesToString(signalWire),
-                                                                 bytesToString(requestPayload),
-                                                                 bytesToString(responsePayload),
-                                                                 clientResponseWire,
-                                                                 errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[bool]("v3 libp2p webrtc: native datachannel bridge failed")
-        return Err[bool](errWire)
-    outPayload = v3Libp2pWebrtcOwnedBytesFromString(clientResponseWire)
+    let responseHandle = cheng_v3_webrtc_datachannel_request_response_handle_bridge(bytesToString(selectBytes),
+                                                                                    bytesToString(signalWire),
+                                                                                    bytesToString(requestPayload),
+                                                                                    bytesToString(responsePayload))
+    if responseHandle == uint64(0):
+        return Err[bool](v3Libp2pWebrtcLastErrorText("v3 libp2p webrtc: native datachannel bridge failed"))
+    let responseRes = v3Libp2pWebrtcBytesFromHandle(responseHandle)
+    if IsErr(responseRes):
+        return Err[bool](Error(responseRes))
+    outPayload = Value(responseRes)
     v3Libp2pWebrtcNativeDatachannelOpenCount = v3Libp2pWebrtcNativeDatachannelOpenCount + 1
     v3Libp2pWebrtcNativeDatachannelRequestCount = v3Libp2pWebrtcNativeDatachannelRequestCount + 1
     v3Libp2pWebrtcRememberStats(session.sessionId, protocol, session.relayOnly)
@@ -370,16 +398,10 @@ fn v3Libp2pWebrtcBrowserSessionOpenInto(out: var V3Libp2pWebrtcBrowserSession,
     let sessionId = v3Libp2pWebrtcTransportSessionId(remoteAddr, cfg.dataChannelLabel)
     let policyMsg = v3Libp2pWebrtcTransportSignalPolicy(cfg, sessionId)
     let policyWire = signal.v3Libp2pWebrtcSignalEncode(policyMsg)
-    var signalResponseWire = ""
-    var errWire = ""
-    let handle = cheng_v3_webrtc_browser_session_open_bridge(bytesToString(policyWire),
-                                                             cfg.dataChannelLabel,
-                                                             signalResponseWire,
-                                                             errWire)
+    let handle = cheng_v3_webrtc_browser_session_open_handle_bridge(bytesToString(policyWire),
+                                                                    cfg.dataChannelLabel)
     if handle == uint64(0):
-        if errWire == "":
-            return Err[bool]("v3 libp2p webrtc browser: session open failed")
-        return Err[bool](errWire)
+        return Err[bool](v3Libp2pWebrtcLastErrorText("v3 libp2p webrtc browser: session open failed"))
     out = v3Libp2pWebrtcBrowserSessionZero()
     out.handle = handle
     out.cfg = cfg
@@ -392,20 +414,30 @@ fn v3Libp2pWebrtcBrowserSessionOpenInto(out: var V3Libp2pWebrtcBrowserSession,
     out.remoteAddr.networkDomain = remoteAddr.networkDomain
     out.remoteAddr.visibility = remoteAddr.visibility
     out.remoteAddr.priority = remoteAddr.priority
-    out.signalWire = v3Libp2pWebrtcOwnedBytesFromString(signalResponseWire)
+    let signalHandle = cheng_v3_webrtc_browser_session_signal_handle_bridge(handle)
+    if signalHandle == uint64(0):
+        let closeOk = cheng_v3_webrtc_browser_session_close_simple_bridge(handle)
+        closeOk
+        return Err[bool](v3Libp2pWebrtcLastErrorText("v3 libp2p webrtc browser: signal transcript missing"))
+    let signalRes = v3Libp2pWebrtcBytesFromHandle(signalHandle)
+    if IsErr(signalRes):
+        let closeOk = cheng_v3_webrtc_browser_session_close_simple_bridge(handle)
+        closeOk
+        return Err[bool](Error(signalRes))
+    out.signalWire = Value(signalRes)
     var session = signal.v3Libp2pWebrtcSignalSessionZero()
     let applyRes = signal.v3Libp2pWebrtcSignalTranscriptApply(session, out.signalWire)
     if IsErr(applyRes):
-        var closeErr = ""
-        cheng_v3_webrtc_browser_session_close_bridge(handle, closeErr)
+        let closeOk = cheng_v3_webrtc_browser_session_close_simple_bridge(handle)
+        closeOk
         return Err[bool]("v3 libp2p webrtc browser: signal transcript: " + ErrorText(applyRes))
     if !signal.v3Libp2pWebrtcSignalSessionReady(session):
-        var closeErr = ""
-        cheng_v3_webrtc_browser_session_close_bridge(handle, closeErr)
+        let closeOk = cheng_v3_webrtc_browser_session_close_simple_bridge(handle)
+        closeOk
         return Err[bool]("v3 libp2p webrtc browser: signal session not ready")
     if !layout.fixedBytes32Equal(session.sessionId, sessionId):
-        var closeErr = ""
-        cheng_v3_webrtc_browser_session_close_bridge(handle, closeErr)
+        let closeOk = cheng_v3_webrtc_browser_session_close_simple_bridge(handle)
+        closeOk
         return Err[bool]("v3 libp2p webrtc browser: session id mismatch")
     out.sessionId = session.sessionId
     out.ready = true
@@ -421,19 +453,16 @@ fn v3Libp2pWebrtcBrowserSessionExchange(session: var V3Libp2pWebrtcBrowserSessio
     if !session.ready || session.handle == uint64(0):
         return Err[bool]("v3 libp2p webrtc browser: session missing")
     let selectBytes = multistream.v3Libp2pMultistreamSelectBytes(protocol)
-    var clientResponseWire = ""
-    var errWire = ""
-    let ok = cheng_v3_webrtc_browser_session_exchange_bridge(session.handle,
-                                                             bytesToString(selectBytes),
-                                                             bytesToString(requestPayload),
-                                                             bytesToString(responsePayload),
-                                                             clientResponseWire,
-                                                             errWire)
-    if ok == 0:
-        if errWire == "":
-            return Err[bool]("v3 libp2p webrtc browser: session exchange failed")
-        return Err[bool](errWire)
-    outPayload = v3Libp2pWebrtcOwnedBytesFromString(clientResponseWire)
+    let responseHandle = cheng_v3_webrtc_browser_session_exchange_handle_bridge(session.handle,
+                                                                                bytesToString(selectBytes),
+                                                                                bytesToString(requestPayload),
+                                                                                bytesToString(responsePayload))
+    if responseHandle == uint64(0):
+        return Err[bool](v3Libp2pWebrtcLastErrorText("v3 libp2p webrtc browser: session exchange failed"))
+    let responseRes = v3Libp2pWebrtcBytesFromHandle(responseHandle)
+    if IsErr(responseRes):
+        return Err[bool](Error(responseRes))
+    outPayload = Value(responseRes)
     v3Libp2pWebrtcBrowserDatachannelRequestCount = v3Libp2pWebrtcBrowserDatachannelRequestCount + 1
     v3Libp2pWebrtcRememberStats(session.sessionId, protocol, session.relayOnly)
     return Ok[bool](true)
@@ -442,14 +471,11 @@ fn v3Libp2pWebrtcBrowserSessionClose(session: var V3Libp2pWebrtcBrowserSession):
     if session.handle == uint64(0):
         session = v3Libp2pWebrtcBrowserSessionZero()
         return Ok[bool](true)
-    var errWire = ""
-    let ok = cheng_v3_webrtc_browser_session_close_bridge(session.handle, errWire)
+    let ok = cheng_v3_webrtc_browser_session_close_simple_bridge(session.handle)
     let hadError = ok == 0
     session = v3Libp2pWebrtcBrowserSessionZero()
     if hadError:
-        if errWire == "":
-            return Err[bool]("v3 libp2p webrtc browser: session close failed")
-        return Err[bool](errWire)
+        return Err[bool](v3Libp2pWebrtcLastErrorText("v3 libp2p webrtc browser: session close failed"))
     return Ok[bool](true)
 
 fn v3Libp2pWebrtcBrowserSessionActiveCountNow(): int32 =

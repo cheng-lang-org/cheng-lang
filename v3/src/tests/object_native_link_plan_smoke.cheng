@@ -1,8 +1,10 @@
 import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/primary_object_plan as pobj
 import cheng/v3/backend/object_plan as objplan
 import cheng/v3/backend/native_link_plan as nplan
+import cheng/v3/backend/system_link_exec as sexec
 
 fn endsWithText(text: str, suffix: str): bool =
     if len(suffix) > len(text):
@@ -10,6 +12,20 @@ fn endsWithText(text: str, suffix: str): bool =
     let start = len(text) - len(suffix)
     for i in 0..<len(suffix):
         if text[start + i] != suffix[i]:
+            return false
+    return true
+
+fn containsText(items: str[], value: str): bool =
+    for i in 0..<items.len:
+        if items[i] == value:
+            return true
+    return false
+
+fn allPureCheng(items: str[]): bool =
+    if items.len <= 0:
+        return false
+    for i in 0..<items.len:
+        if !endsWithText(items[i], ".cheng"):
             return false
     return true
 
@@ -46,9 +62,9 @@ fn main(): int32 =
     objectPlan.primaryObjectPath = primaryObjectPath
     objectPlan.providerModules = providerModules
     objectPlan.providerSourcePaths = [
-        workspaceRoot + "/v3/runtime/native/v3_program_argv_native.c",
-        workspaceRoot + "/v3/runtime/native/v3_core_runtime_stub.c",
-        workspaceRoot + "/src/runtime/native/system_helpers_debug_trace_profile.c",
+        workspaceRoot + "/v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng",
+        workspaceRoot + "/v3/src/runtime/core_runtime_provider_darwin_v3.cheng",
+        workspaceRoot + "/v3/src/runtime/debug_runtime_stub_v3.cheng",
         workspaceRoot + "/v3/src/runtime/program_support_backend_v3.cheng"
     ]
     objectPlan.providerObjectPaths = providerObjectPaths
@@ -79,6 +95,65 @@ fn main(): int32 =
     assert(nativePlan.outputKind == nplan.v3NativeOutputExecutable, "v3 native link plan: output kind")
     assert(endsWithText(nativePlan.primaryObjectPath, ".primary.o"),
            "v3 native link plan: primary object suffix")
+    let realWorkspaceRoot = v3path.v3PathCurrentDir()
+    let realPackageRoot = v3path.v3PathJoin(realWorkspaceRoot, "v3")
+    var ordinaryLinkPlan: slplan.V3SystemLinkPlanStub
+    var toolingLinkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    let ordinaryReq = creq.v3CompilerRequestNew(
+        realPackageRoot,
+        v3path.v3PathJoin(realPackageRoot, "src/tests/program_selfhost_smoke.cheng"),
+        v3path.v3PathJoin(realWorkspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke"),
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    let toolingReq = creq.v3CompilerRequestNew(
+        realPackageRoot,
+        v3path.v3PathJoin(realPackageRoot, "src/tooling/compiler_main.cheng"),
+        v3path.v3PathJoin(realWorkspaceRoot, "artifacts/v3_backend_driver/cheng"),
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    assert(slplan.v3BuildSystemLinkPlanStub(realWorkspaceRoot, ordinaryReq, ordinaryLinkPlan, err),
+           "v3 object plan: ordinary link plan")
+    assert(slplan.v3BuildSystemLinkPlanStub(realWorkspaceRoot, toolingReq, toolingLinkPlan, err),
+           "v3 object plan: tooling link plan")
+    let ordinaryProvidersRes = sexec.v3ProviderSourcesForPlan(realWorkspaceRoot, ordinaryLinkPlan)
+    let toolingProvidersRes = sexec.v3ProviderSourcesForPlan(realWorkspaceRoot, toolingLinkPlan)
+    assert(IsOk(ordinaryProvidersRes), "v3 object plan: ordinary providers")
+    assert(IsOk(toolingProvidersRes), "v3 object plan: tooling providers")
+    let ordinaryProviders = Value(ordinaryProvidersRes)
+    let toolingProviders = Value(toolingProvidersRes)
+    assert(allPureCheng(ordinaryProviders), "v3 object plan: ordinary pure cheng providers")
+    assert(allPureCheng(toolingProviders), "v3 object plan: tooling pure cheng providers")
+    assert(containsText(ordinaryProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot,
+                                          "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng")),
+           "v3 object plan: ordinary argv provider")
+    assert(containsText(toolingProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot,
+                                          "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng")),
+           "v3 object plan: tooling argv provider")
+    assert(containsText(ordinaryProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/debug_runtime_stub_v3.cheng")),
+           "v3 object plan: ordinary debug provider")
+    assert(containsText(toolingProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/debug_runtime_stub_v3.cheng")),
+           "v3 object plan: tooling debug provider")
+    assert(containsText(ordinaryProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/program_support_backend_v3.cheng")),
+           "v3 object plan: ordinary support provider")
+    assert(containsText(toolingProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/program_support_backend_v3.cheng")),
+           "v3 object plan: tooling support provider")
+    assert(containsText(ordinaryProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng")),
+           "v3 object plan: ordinary core provider")
+    assert(containsText(toolingProviders,
+                        v3path.v3PathJoin(realWorkspaceRoot, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng")),
+           "v3 object plan: tooling core provider")
     assert(slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("aarch64-unknown-linux-gnu"),
            "v3 target matrix: linux aarch64 nolibc")
     assert(!slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("riscv64-unknown-linux-gnu"),

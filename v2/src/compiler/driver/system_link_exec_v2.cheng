@@ -1,5 +1,6 @@
 import std/seqs
 import std/os
+import std/os_host_process as hostos
 import std/strings as strings
 import std/bytes
 import std/rawbytes as rawbytes
@@ -137,28 +138,26 @@ fn compilerCoreExecutionTrack(sourcePath: str): str =
 fn compilerCoreNativeSupportSources(emitKind: str, sourcePath: str): str[] =
     var out: str[]
     out = []
-    seqs.add(out, "src/runtime/native/system_helpers_char_seq_compat_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_seq_free_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_str_repr_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_stdio_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers.c")
-    seqs.add(out, "src/runtime/native/system_helpers_epoch_time_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c")
-    seqs.add(out, "src/runtime/native/system_helpers_selflink_str_eq_bridge.c")
-    seqs.add(out, "v2/bootstrap/cheng_v2c_tooling.c")
+    let sourceTrack = compilerCoreExecutionTrack(sourcePath)
+    seqs.add(out, "src/runtime/native/system_helpers_compat_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_machine_target_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_tooling_entry_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_host_stdio_fs_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_program_runtime_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_selflink_shim.c")
+    seqs.add(out, "src/runtime/native/system_helpers_io_time_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_host_process_ffi_bridge.c")
+    seqs.add(out, "src/runtime/native/system_helpers_selflink_support_bridge.c")
+    if strings.streq(sourceTrack, "tooling"):
+        seqs.add(out, "v2/bootstrap/cheng_v2c_tooling.c")
     if emitKind == "exe":
-        var entryBridgePath: str = "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c"
-        if compilerCoreExecutionTrack(sourcePath) == "program":
-            entryBridgePath = "src/runtime/native/system_helpers_selflink_program_exe_entry_bridge.c"
-        seqs.add(out, entryBridgePath)
+        seqs.add(out, "src/runtime/native/system_helpers_selflink_entry_bridge.c")
     return out
 
 fn compileNativeSupportObject(sourcePath: str,
                               targetTriple: str,
-                              objPath: str): NativeSupportObjectBundle =
+                              objPath: str,
+                              sourceTrack: str): NativeSupportObjectBundle =
     ensureParentDir(objPath)
     let ccPath = os.getEnvDefault("CC", "")
     var compilerFile: str = "/usr/bin/cc"
@@ -177,12 +176,18 @@ fn compileNativeSupportObject(sourcePath: str,
     seqs.add(argv, "-pedantic")
     if targetTriple == "arm64-apple-darwin":
         seqs.add(argv, "-mmacosx-version-min=" + mtarget.machineTargetDarwinMinosText(targetTriple))
+    if strings.streq(sourcePath, "src/runtime/native/system_helpers_selflink_entry_bridge.c") &&
+       strings.streq(sourceTrack, "program"):
+        seqs.add(argv, "-DCHENG_SELFLINK_PROGRAM_ENTRY=1")
+    if strings.streq(sourcePath, "src/runtime/native/system_helpers_tooling_entry_bridge.c") &&
+       strings.streq(sourceTrack, "program"):
+        seqs.add(argv, "-DCHENG_TOOLING_ENTRY_NO_BOOTSTRAP=1")
     seqs.add(argv, "-c")
     seqs.add(argv, sourcePath)
     seqs.add(argv, "-o")
     seqs.add(argv, objPath)
     var envOverrides: str[]
-    let res = os.execFileCapture(compilerFile,
+    let res = hostos.execFileCapture(compilerFile,
                                  argv,
                                  envOverrides,
                                  os.getCurrentDir(),
@@ -271,6 +276,7 @@ fn buildSystemLinkExec(sourcePath: str,
                        targetTriple: str,
                        outputPath: str): SystemLinkExecBundle =
     let artifact = rart.buildReleaseArtifact(sourcePath, emitKind, targetTriple)
+    let sourceTrack = compilerCoreExecutionTrack(sourcePath)
     let missingReason0 = extractLineValue(artifact.systemLinkPlanText, "missing_reason.0")
     let localPayloadCount = extractLineValue(artifact.systemLinkPlanText,
                                              "compiler_core_program_local_payload_function_count")
@@ -329,8 +335,9 @@ fn buildSystemLinkExec(sourcePath: str,
         for i in 0..<supportSources.len:
             let supportObjPath = actualOutputPath + ".support." + intToStr(i) + ".o"
             let supportObj = compileNativeSupportObject(supportSources[i],
-                                                        targetTriple,
-                                                        supportObjPath)
+                                                       targetTriple,
+                                                       supportObjPath,
+                                                       sourceTrack)
             seqs.add(supportObjPaths, supportObjPath)
             seqs.add(supportObjFileCids, supportObj.fileCid)
             seqs.add(supportObjFileByteCounts, supportObj.fileByteCount)
@@ -348,7 +355,7 @@ fn buildSystemLinkExec(sourcePath: str,
         seqs.add(sdkArgv, sdkName)
         seqs.add(sdkArgv, "--show-sdk-path")
         var envOverrides: str[]
-        let sdkRes = os.execFileCapture("/usr/bin/xcrun",
+        let sdkRes = hostos.execFileCapture("/usr/bin/xcrun",
                                         sdkArgv,
                                         envOverrides,
                                         os.getCurrentDir(),
@@ -373,7 +380,7 @@ fn buildSystemLinkExec(sourcePath: str,
                                        providerObjPaths,
                                        supportObjPaths)
     var envOverrides: str[]
-    let linkRes = os.execFileCapture(linkerPath,
+    let linkRes = hostos.execFileCapture(linkerPath,
                                      argv,
                                      envOverrides,
                                      os.getCurrentDir(),

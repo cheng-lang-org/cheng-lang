@@ -2,6 +2,7 @@
 
 import std/result
 import std/rawbytes
+import std/os
 import cheng/v3/quic/multiaddress
 import cheng/v3/quic/native_runtime
 
@@ -332,7 +333,8 @@ fn quicConnRead(c: var Connection, count: int32): Result[Bytes] =
     if count <= 0:
         return Ok[Bytes](emptyBytes())
     if c.pipeIdx >= 0:
-        for i in 0..<256:
+        let maxPipeReads: int32 = if msquicNativeIsPipeIdx(c.pipeIdx): 2048 else: 256
+        for i in 0..<maxPipeReads:
             if bytesLen(c.stream) >= count:
                 break
             let readRes: Result[Bytes] = pipeRead(c.pipeIdx, c.pipeSide, count - bytesLen(c.stream))
@@ -342,6 +344,9 @@ fn quicConnRead(c: var Connection, count: int32): Result[Bytes] =
                 return Err[Bytes](ErrorText(readRes))
             let chunk: Bytes = Value(readRes)
             if bytesLen(chunk) <= 0:
+                if msquicNativeIsPipeIdx(c.pipeIdx):
+                    os.sleepMs(10)
+                    continue
                 break
             bytesAppend(c.stream, chunk)
         let taken: Bytes = bytesTakePrefix(c.stream, count)

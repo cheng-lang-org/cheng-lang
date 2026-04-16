@@ -15,43 +15,47 @@ import cheng/quic/chain/anti_entropy
 import cheng/quic/chain/consensus
 
 fn chainSmokeRoot(name: str): str =
-    return os.joinPath("/Users/lbcheng/cheng-lang/v2/cheng-quic/artifacts", name)
+    let base = os.joinPath("/Users/lbcheng/cheng-lang/v2/cheng-quic/artifacts", name)
+    let baseDirExists = os.dirExists(base)
+    let baseFileExists = os.fileExists(base)
+    if ! baseDirExists:
+        if ! baseFileExists:
+            return base
+    var suffix: int32 = 1
+    while true:
+        let candidate = base + "_" + intToStr(suffix)
+        let candidateDirExists = os.dirExists(candidate)
+        let candidateFileExists = os.fileExists(candidate)
+        if ! candidateDirExists:
+            if ! candidateFileExists:
+                return candidate
+        suffix = suffix + 1
 
 fn chainSmokeRemovePathRec(path: str): bool =
     if path == "":
         return true
     if os.fileExists(path):
         return os.removeFile(path)
+    let dirExists = os.dirExists(path)
+    if ! dirExists:
+        return true
+    let items = os.walkDir(path)
+    for i in 0..<items.len:
+        let entry = os.os_get_WalkDirEntry(items, i)
+        let childPath = os.walkDirEntryPath(entry)
+        if os.dirExists(childPath):
+            if ! chainSmokeRemovePathRec(childPath):
+                return false
+        else:
+            let childFileExists = os.fileExists(childPath)
+            if childFileExists:
+                if ! os.removeFile(childPath):
+                    return false
+    os.removeDir(path)
     return ! os.dirExists(path)
 
 fn chainSmokeResetRoot(root: str): bool =
-    if root == "":
-        return true
-    let blocksDir = os.joinPath(root, "blocks")
-    if os.dirExists(blocksDir):
-        let blockItems = os.walkDir(blocksDir)
-        for i in 0..<blockItems.len:
-            let blockEntry = os.os_get_WalkDirEntry(blockItems, i)
-            let blockPath = os.walkDirEntryPath(blockEntry)
-            if os.fileExists(blockPath) && ! os.removeFile(blockPath):
-                return false
-        os.removeDir(blocksDir)
-        if os.dirExists(blocksDir):
-            return false
-    let chainDir = os.joinPath(root, "chain")
-    if os.dirExists(chainDir):
-        let chainItems = os.walkDir(chainDir)
-        for i in 0..<chainItems.len:
-            let chainEntry = os.os_get_WalkDirEntry(chainItems, i)
-            let chainPath = os.walkDirEntryPath(chainEntry)
-            if os.fileExists(chainPath) && ! os.removeFile(chainPath):
-                return false
-        os.removeDir(chainDir)
-        if os.dirExists(chainDir):
-            return false
-    if os.dirExists(root):
-        os.removeDir(root)
-    return ! os.dirExists(root)
+    return chainSmokeRemovePathRec(root)
 
 fn chainSmokeConfig(rootName: str, nodeId: str): ChainNodeConfig =
     var cfg = defaultChainNodeConfig()
@@ -608,7 +612,8 @@ fn chainSmokeAlgorithms(): Result[bool] =
     if chainAccountBalance(batchIdx, chainAccountKey("alice", "cheng")) != 15:
         return Err[bool]("chain smoke: consensus batch ordering mismatch")
     let badRoot = chainSmokeRoot("chain_smoke_bad_append")
-    let _ = chainSmokeResetRoot(badRoot)
+    if ! chainSmokeResetRoot(badRoot):
+        return Err[bool]("chain smoke: reset bad append root failed")
     var badNode: ChainNode
     let badNodeRes = initChainNodeInto(badNode, chainSmokeConfig("chain_smoke_bad_append", "node-bad"))
     if IsErr(badNodeRes):
@@ -639,8 +644,10 @@ fn runMsQuicChainSmoke(): Result[bool] =
     let algoRes = chainSmokeAlgorithms()
     if IsErr(algoRes):
         return algoRes
-    let _ = chainSmokeResetRoot(chainSmokeRoot("chain_smoke_server"))
-    let _ = chainSmokeResetRoot(chainSmokeRoot("chain_smoke_client"))
+    if ! chainSmokeResetRoot(chainSmokeRoot("chain_smoke_server")):
+        return Err[bool]("chain smoke: reset server root failed")
+    if ! chainSmokeResetRoot(chainSmokeRoot("chain_smoke_client")):
+        return Err[bool]("chain smoke: reset client root failed")
     echo("msquic_chain_smoke_stage=init_server_begin")
     var server: ChainNode
     let serverRes = initChainNodeInto(server, chainSmokeConfig("chain_smoke_server", "node-server"))

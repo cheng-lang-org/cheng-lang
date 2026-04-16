@@ -755,10 +755,26 @@ fn p256ModAdd(a: BigInt, b: BigInt): Result[BigInt] =
 fn p256ModSub(a: BigInt, b: BigInt): Result[BigInt] =
     return bigModSub(a, b, p256P)
 
-fn p256ModInv(a: BigInt): Result[BigInt] =
-    if bigIsZero(a):
+fn p256FixedPrimeModInv(a: BigInt,
+                        modulus: BigInt,
+                        modulusMinus2: pfix.P256Fixed,
+                        ctx: pfix.P256FixedMontgomeryContext): Result[BigInt] =
+    let modRes: Result[BigInt] = bigMod(a, modulus)
+    if IsErr(modRes):
+        return Err[BigInt](Error(modRes))
+    var reduced: BigInt = Value(modRes)
+    if bigIsZero(reduced):
         return Err[BigInt]("ecdsa: inverse of zero")
-    return bigModInvOddBinary(a, p256P)
+    let fixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(reduced)
+    if IsErr(fixedRes):
+        return Err[BigInt](Error(fixedRes))
+    var fixed: pfix.P256Fixed = Value(fixedRes)
+    var exp: pfix.P256Fixed = modulusMinus2
+    let invFixed: pfix.P256Fixed = pfix.p256FixedModExpWithContextTrusted(fixed, exp, ctx)
+    return Ok[BigInt](pfix.p256FixedToBigInt(invFixed))
+
+fn p256ModInv(a: BigInt): Result[BigInt] =
+    return p256FixedPrimeModInv(a, p256P, p256PMinus2Fixed, p256PCtxFixed)
 
 fn nMod(a: BigInt): Result[BigInt] =
     return bigMod(a, p256N)
@@ -782,9 +798,7 @@ fn nModAdd(a: BigInt, b: BigInt): Result[BigInt] =
     return bigModAdd(a, b, p256N)
 
 fn nModInv(a: BigInt): Result[BigInt] =
-    if bigIsZero(a):
-        return Err[BigInt]("ecdsa: inverse of zero")
-    return bigModInvOddBinary(a, p256N)
+    return p256FixedPrimeModInv(a, p256N, p256NMinus2Fixed, p256NCtxFixed)
 
 fn p256FieldFixedZero(): pfix.P256Fixed =
     return pfix.p256FixedZero()
@@ -1439,16 +1453,16 @@ fn pointMulGeneratorR(k: BigInt): Result[BigInt] =
     let initRes: Result[bool] = p256EnsureInit()
     if IsErr(initRes):
         return Err[BigInt](Error(initRes))
-    let pointRes: Result[EcPoint] = pointMulGenerator(k)
-    if IsErr(pointRes):
-        return Err[BigInt](Error(pointRes))
-    let point: EcPoint = Value(pointRes)
-    if point.inf:
-        return Err[BigInt]("ecdsa: generator multiplication at infinity")
-    return nMod(point.x)
+    var scalarBig: BigInt = k
+    let scalarRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(scalarBig)
+    if IsErr(scalarRes):
+        return Err[BigInt](Error(scalarRes))
+    let rFixed: pfix.P256Fixed = pointMulGeneratorRFixedCrash(Value(scalarRes))
+    return Ok[BigInt](pfix.p256FixedToBigInt(rFixed))
 
 fn pointMulGeneratorRFixedCrash(k: pfix.P256Fixed): pfix.P256Fixed =
-    let result: EcPointJacobianFixed = pointMulGeneratorJacobianWnafFixed(k)
+    var result: EcPointJacobianFixed
+    pointMulGeneratorJacobianComb6FixedInto(result, k)
     return pointJacobianXToScalarFixedCrash(result)
 
 fn isInfinity(p: EcPoint): bool =
@@ -2196,7 +2210,9 @@ fn pointMulGeneratorFixed(k: BigInt): Result[EcPointFixed] =
     let scalarRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(scalarBig)
     if IsErr(scalarRes):
         return Err[EcPointFixed](Error(scalarRes))
-    return pointMulGeneratorWnafFixed(Value(scalarRes))
+    var result: EcPointJacobianFixed
+    pointMulGeneratorJacobianComb6FixedInto(result, Value(scalarRes))
+    return pointJacobianToAffineFixed(result)
 
 fn p256Hash(msg: Bytes): Result[BigInt] =
     let digest: Bytes = sha256Digest(msg)
@@ -2256,14 +2272,13 @@ fn publicKeyFromPrivateKey(priv: EcPrivateKey): Result[EcPublicKey] =
     let initRes: Result[bool] = p256EnsureInit()
     if IsErr(initRes):
         return Err[EcPublicKey](Error(initRes))
-    var base: EcPoint = p256G
-    var point: EcPoint
-    let mulRes: Result[bool] = pointMulJacobianInto(point, priv.d, base)
-    if IsErr(mulRes):
-        return Err[EcPublicKey](Error(mulRes))
-    if point.inf:
+    let pointRes: Result[EcPointFixed] = pointMulGeneratorFixed(priv.d)
+    if IsErr(pointRes):
+        return Err[EcPublicKey](Error(pointRes))
+    let pointFixed: EcPointFixed = Value(pointRes)
+    if pointFixed.inf:
         return Err[EcPublicKey]("ecdsa: public key at infinity")
-    return Ok[EcPublicKey](EcPublicKey(point: point))
+    return Ok[EcPublicKey](EcPublicKey(point: pointBigFromFixed(pointFixed)))
 
 fn generateEcKeyPair(): Result[EcKeyPair] =
     let initRes: Result[bool] = p256EnsureInit()
@@ -2291,50 +2306,57 @@ fn generateEcKeyPair(): Result[EcKeyPair] =
         return Ok[EcKeyPair](EcKeyPair(publicKey: Value(pubRes), privateKey: priv))
     return Err[EcKeyPair]("ecdsa: failed to generate key")
 
-fn ecdsaSignScalarCore(d: BigInt, msg: Bytes, rOut: var BigInt, sOut: var BigInt): Result[bool] =
+fn ecdsaSignScalarResult(d: BigInt, msg: Bytes): Result[EcSignature] =
     let initRes: Result[bool] = p256EnsureInit()
     if IsErr(initRes):
-        return Err[bool](Error(initRes))
+        return Err[EcSignature](Error(initRes))
     if bigIsZero(d) || bigCmp(d, p256N) >= 0:
-        return Err[bool]("ecdsa: invalid private key")
+        return Err[EcSignature]("ecdsa: invalid private key")
     let eRes: Result[BigInt] = p256Hash(msg)
     if IsErr(eRes):
-        return Err[bool](Error(eRes))
+        return Err[EcSignature](Error(eRes))
     let eModRes: Result[BigInt] = nMod(Value(eRes))
     if IsErr(eModRes):
-        return Err[bool](Error(eModRes))
+        return Err[EcSignature](Error(eModRes))
     let kRes: Result[BigInt] = p256DeterministicK(d, msg)
     if IsErr(kRes):
-        return Err[bool](Error(kRes))
+        return Err[EcSignature](Error(kRes))
     let k: BigInt = Value(kRes)
     let rRes: Result[BigInt] = pointMulGeneratorR(k)
     if IsErr(rRes):
-        return Err[bool](Error(rRes))
+        return Err[EcSignature](Error(rRes))
     let r: BigInt = Value(rRes)
     if bigIsZero(r):
-        return Err[bool]("ecdsa: r is zero")
+        return Err[EcSignature]("ecdsa: r is zero")
     let rdRes: Result[BigInt] = nModMul(r, d)
     if IsErr(rdRes):
-        return Err[bool](Error(rdRes))
+        return Err[EcSignature](Error(rdRes))
     let sumRes: Result[BigInt] = nModAdd(Value(eModRes), Value(rdRes))
     if IsErr(sumRes):
-        return Err[bool](Error(sumRes))
+        return Err[EcSignature](Error(sumRes))
     let kInvRes: Result[BigInt] = nModInv(k)
     if IsErr(kInvRes):
-        return Err[bool](Error(kInvRes))
+        return Err[EcSignature](Error(kInvRes))
     let sRes: Result[BigInt] = nModMul(Value(kInvRes), Value(sumRes))
     if IsErr(sRes):
-        return Err[bool](Error(sRes))
+        return Err[EcSignature](Error(sRes))
     var s: BigInt = Value(sRes)
     if bigIsZero(s):
-        return Err[bool]("ecdsa: s is zero")
+        return Err[EcSignature]("ecdsa: s is zero")
     if bigCmp(s, p256NHalf) > 0:
         let subRes: Result[BigInt] = bigSub(p256N, s)
         if IsErr(subRes):
-            return Err[bool](Error(subRes))
+            return Err[EcSignature](Error(subRes))
         s = Value(subRes)
-    rOut = r
-    sOut = s
+    return Ok[EcSignature](EcSignature(r: r, s: s))
+
+fn ecdsaSignScalarCore(d: BigInt, msg: Bytes, rOut: var BigInt, sOut: var BigInt): Result[bool] =
+    let sigRes: Result[EcSignature] = ecdsaSignScalarResult(d, msg)
+    if IsErr(sigRes):
+        return Err[bool](Error(sigRes))
+    let sig: EcSignature = Value(sigRes)
+    rOut = sig.r
+    sOut = sig.s
     return Ok[bool](true)
 
 fn ecdsaVerifyPointScalars(pubPoint: EcPoint,
@@ -2368,34 +2390,26 @@ fn ecdsaVerifyPointScalars(pubPoint: EcPoint,
     let u2Res: Result[BigInt] = nModMul(r, Value(wRes))
     if IsErr(u2Res):
         return false
-    var gBase: EcPoint = p256G
-    var left: EcPoint
-    let leftMulRes: Result[bool] = pointMulJacobianInto(left, Value(u1Res), gBase)
-    if IsErr(leftMulRes):
+    let u1FixedRes: Result[pfix.P256Fixed] = ecdsaScalarToFixed(Value(u1Res))
+    if IsErr(u1FixedRes):
         return false
-    var pubBase: EcPoint = pubPoint
-    var right: EcPoint
-    let rightMulRes: Result[bool] = pointMulJacobianInto(right, Value(u2Res), pubBase)
-    if IsErr(rightMulRes):
+    let u2FixedRes: Result[pfix.P256Fixed] = ecdsaScalarToFixed(Value(u2Res))
+    if IsErr(u2FixedRes):
         return false
-    var sum: EcPoint
-    let addRes: Result[bool] = pointAddInto(sum, left, right)
-    if IsErr(addRes):
+    let rFixedRes: Result[pfix.P256Fixed] = ecdsaScalarToFixed(r)
+    if IsErr(rFixedRes):
         return false
-    if sum.inf:
+    let xFixedRes: Result[pfix.P256Fixed] = ecdsaVerifyShamirX(pubPoint,
+                                                               Value(u1FixedRes),
+                                                               Value(u2FixedRes))
+    if IsErr(xFixedRes):
         return false
-    let vRes: Result[BigInt] = nMod(sum.x)
-    if IsErr(vRes):
-        return false
-    return bigCmp(Value(vRes), r) == 0
+    var xFixed: pfix.P256Fixed = Value(xFixedRes)
+    var rFixed: pfix.P256Fixed = Value(rFixedRes)
+    return pfix.p256FixedCmp(xFixed, rFixed) == 0
 
 fn ecdsaSign(priv: EcPrivateKey, msg: Bytes): Result[EcSignature] =
-    var r: BigInt
-    var s: BigInt
-    let coreRes: Result[bool] = ecdsaSignScalarCore(priv.d, msg, r, s)
-    if IsErr(coreRes):
-        return Err[EcSignature](Error(coreRes))
-    return Ok[EcSignature](EcSignature(r: r, s: s))
+    return ecdsaSignScalarResult(priv.d, msg)
 
 fn ecdsaScalarToFixed(a: BigInt): Result[pfix.P256Fixed] =
     var aBig: BigInt = a
@@ -2601,12 +2615,11 @@ fn ecdsaSignBytes(privData: Bytes, msg: Bytes): Result[Bytes] =
     let dRes: Result[bool] = ecdsaParsePrivateScalarBytes(privData, d)
     if IsErr(dRes):
         return Err[Bytes](Error(dRes))
-    var r: BigInt
-    var s: BigInt
-    let sigRes: Result[bool] = ecdsaSignScalarCore(d, msg, r, s)
+    let sigRes: Result[EcSignature] = ecdsaSignScalarResult(d, msg)
     if IsErr(sigRes):
         return Err[Bytes](Error(sigRes))
-    let sigBytes: Bytes = ecdsaSignatureScalarsToBytes(r, s)
+    let sig: EcSignature = Value(sigRes)
+    let sigBytes: Bytes = ecdsaSignatureScalarsToBytes(sig.r, sig.s)
     return Ok[Bytes](sigBytes)
 
 fn ecdsaVerifyBytes(pubData: Bytes, msg: Bytes, sig: Bytes): bool =
@@ -2641,15 +2654,13 @@ fn ecdsaPublicKeyFromPrivateBytes(privData: Bytes): Result[Bytes] =
     let initRes: Result[bool] = p256EnsureInit()
     if IsErr(initRes):
         return Err[Bytes](Error(initRes))
-    var base: EcPoint = p256G
-    var point: EcPoint
-    let mulRes: Result[bool] = pointMulJacobianInto(point, d, base)
-    if IsErr(mulRes):
-        return Err[Bytes](Error(mulRes))
-    if point.inf:
+    let pointRes: Result[EcPointFixed] = pointMulGeneratorFixed(d)
+    if IsErr(pointRes):
+        return Err[Bytes](Error(pointRes))
+    let pointFixed: EcPointFixed = Value(pointRes)
+    if pointFixed.inf:
         return Err[Bytes]("ecdsa: public key at infinity")
-    let pubBytes: Bytes = ecdsaPublicPointToBytes(point)
-    return Ok[Bytes](pubBytes)
+    return Ok[Bytes](ecdsaPublicPointFixedToBytes(pointFixed))
 
 fn ecdhP256SharedSecretBytes(privData: Bytes, peerPubData: Bytes): Result[Bytes] =
     var d: BigInt

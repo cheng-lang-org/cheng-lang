@@ -79,11 +79,6 @@ export STAGE1_NO_POINTERS_NON_C_ABI_INTERNAL=0
 out_dir="artifacts/backend_x86_64_darwin"
 mkdir -p "$out_dir"
 
-cheng_rt_obj_base="chengcache/system_helpers.backend.cheng.x86_64.darwin.o"
-float_bits_src="src/runtime/native/system_helpers_float_bits.c"
-float_bits_obj="chengcache/system_helpers_float_bits.x86_64.darwin.min11.o"
-cheng_rt_obj="chengcache/system_helpers.backend.combined.x86_64.darwin.o"
-
 can_run="0"
 if command -v arch >/dev/null 2>&1; then
   if arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
@@ -115,10 +110,6 @@ is_known_system_link_x86_64_blocker() {
     return 0
   fi
   return 1
-}
-
-ensure_backend_runtime_obj() {
-  :
 }
 
 build_obj() {
@@ -210,8 +201,6 @@ do
 done
 
 # Self linker (no `cc`): x86_64 Mach-O via backend `--linker=self`.
-ensure_backend_runtime_obj
-
 build_exe_self() {
   fixture="$1"
   exe_path="$2"

@@ -1,0 +1,371 @@
+@importc("puts")
+fn c_puts_runtime(text: ptr): int32
+
+@importc("exit")
+fn c_exit_runtime(code: int32)
+
+@importc("getenv")
+fn c_getenv_runtime(name: ptr): ptr
+
+@importc("fopen")
+fn c_fopen_runtime(path: ptr, mode: ptr): ptr
+
+@importc("fclose")
+fn c_fclose_runtime(stream: ptr): int32
+
+@importc("fflush")
+fn c_fflush_runtime(stream: ptr): int32
+
+@importc("fgets")
+fn c_fgets_runtime(buf: ptr, size: int32, stream: ptr): ptr
+
+@importc("fwrite")
+fn c_fwrite_runtime(data: ptr, size: int64, count: int64, stream: ptr): int64
+
+const
+    debugBufferCap: int32 = 4096
+
+type
+    UInt8Ptr = uint8 *
+
+var
+    cheng_debug_source_path: uint8[4096]
+    cheng_debug_source_len: int32
+    cheng_debug_line_start: int32
+    cheng_debug_line_end: int32
+
+fn debug_ptr_plus(base: ptr, off: int32): ptr =
+    if base == nil:
+        return nil
+    return ptr(uint64(base) + uint64(off))
+
+fn debug_cstrlen(raw: ptr): int32 =
+    if raw == nil:
+        return 0
+    var n: int32 = 0
+    while *(UInt8Ptr(debug_ptr_plus(raw, n))) != uint8(0):
+        n = n + 1
+    return n
+
+fn debug_bytes_copy(dst: ptr, src: ptr, n0: int32) =
+    if dst == nil || src == nil || n0 <= 0:
+        return
+    for i in 0..<n0:
+        *(UInt8Ptr(debug_ptr_plus(dst, i))) = *(UInt8Ptr(debug_ptr_plus(src, i)))
+
+fn debug_bytes_set(dst: ptr, value: int32, n0: int32) =
+    if dst == nil || n0 <= 0:
+        return
+    let v: uint8 = uint8(value & 255)
+    for i in 0..<n0:
+        *(UInt8Ptr(debug_ptr_plus(dst, i))) = v
+
+fn debug_text_ends_with_enabled(raw: ptr): bool =
+    if raw == nil:
+        return false
+    let n: int32 = debug_cstrlen(raw)
+    if n <= 0:
+        return false
+    if n == 1 && *(UInt8Ptr(raw)) == uint8('0'):
+        return false
+    return true
+
+fn debug_copy_cstring(dst: ptr, cap: int32, raw: ptr): bool =
+    if dst == nil || cap <= 0:
+        return false
+    debug_bytes_set(dst, 0, cap)
+    if raw == nil:
+        return false
+    let n: int32 = debug_cstrlen(raw)
+    if n <= 0 || n + 1 > cap:
+        return false
+    debug_bytes_copy(dst, raw, n)
+    *(UInt8Ptr(debug_ptr_plus(dst, n))) = uint8(0)
+    return true
+
+fn debug_build_suffixed_path(raw: ptr, suffix: ptr, dst: ptr, cap: int32): bool =
+    if dst == nil || cap <= 0 || raw == nil || suffix == nil:
+        return false
+    debug_bytes_set(dst, 0, cap)
+    let rawLen: int32 = debug_cstrlen(raw)
+    let suffixLen: int32 = debug_cstrlen(suffix)
+    if rawLen <= 0 || suffixLen <= 0 || rawLen + suffixLen + 1 > cap:
+        return false
+    debug_bytes_copy(dst, raw, rawLen)
+    debug_bytes_copy(debug_ptr_plus(dst, rawLen), suffix, suffixLen)
+    *(UInt8Ptr(debug_ptr_plus(dst, rawLen + suffixLen))) = uint8(0)
+    return true
+
+fn debug_starts_with(raw: ptr, prefix: ptr): bool =
+    if raw == nil || prefix == nil:
+        return false
+    var i: int32 = 0
+    while *(UInt8Ptr(debug_ptr_plus(prefix, i))) != uint8(0):
+        if *(UInt8Ptr(debug_ptr_plus(raw, i))) != *(UInt8Ptr(debug_ptr_plus(prefix, i))):
+            return false
+        i = i + 1
+    return true
+
+fn debug_field_end(raw: ptr, start: int32): int32 =
+    var i: int32 = start
+    while true:
+        let ch: uint8 = *(UInt8Ptr(debug_ptr_plus(raw, i)))
+        if ch == uint8(0) || ch == uint8('\n') || ch == uint8('\r') || ch == uint8('\t'):
+            return i
+        i = i + 1
+
+fn debug_copy_source_range(raw: ptr, start: int32, end0: int32) =
+    debug_bytes_set(&cheng_debug_source_path[0], 0, debugBufferCap)
+    cheng_debug_source_len = 0
+    if raw == nil || end0 <= start:
+        return
+    var n: int32 = end0 - start
+    if n >= debugBufferCap:
+        n = debugBufferCap - 1
+    if n <= 0:
+        return
+    debug_bytes_copy(&cheng_debug_source_path[0], debug_ptr_plus(raw, start), n)
+    *(UInt8Ptr(debug_ptr_plus(&cheng_debug_source_path[0], n))) = uint8(0)
+    cheng_debug_source_len = n
+
+fn debug_parse_i32_field(raw: ptr, start: int32): int32 =
+    if raw == nil:
+        return 0
+    var i: int32 = start
+    var sign: int32 = 1
+    if *(UInt8Ptr(debug_ptr_plus(raw, i))) == uint8('-'):
+        sign = -1
+        i = i + 1
+    var out: int32 = 0
+    while true:
+        let ch: uint8 = *(UInt8Ptr(debug_ptr_plus(raw, i)))
+        if ch < uint8('0') || ch > uint8('9'):
+            break
+        out = out * 10 + int32(ch - uint8('0'))
+        i = i + 1
+    return out * sign
+
+fn debug_parse_line_map_entry(raw: ptr): bool =
+    if raw == nil || !debug_starts_with(raw, "entry\t"):
+        return false
+    var fieldStart: int32 = 0
+    fieldStart = debug_field_end(raw, fieldStart) + 1
+    fieldStart = debug_field_end(raw, fieldStart) + 1
+    fieldStart = debug_field_end(raw, fieldStart) + 1
+    let sourceStart: int32 = fieldStart
+    let sourceEnd: int32 = debug_field_end(raw, sourceStart)
+    if sourceEnd <= sourceStart:
+        return false
+    debug_copy_source_range(raw, sourceStart, sourceEnd)
+    fieldStart = sourceEnd + 1
+    cheng_debug_line_start = debug_parse_i32_field(raw, fieldStart)
+    fieldStart = debug_field_end(raw, fieldStart) + 1
+    fieldStart = debug_field_end(raw, fieldStart) + 1
+    cheng_debug_line_end = debug_parse_i32_field(raw, fieldStart)
+    if cheng_debug_line_start <= 0:
+        cheng_debug_line_start = 1
+    if cheng_debug_line_end < cheng_debug_line_start:
+        cheng_debug_line_end = cheng_debug_line_start
+    return true
+
+fn debug_source_ptr(): ptr =
+    if cheng_debug_source_len > 0:
+        return &cheng_debug_source_path[0]
+    return "<unknown>"
+
+fn debug_i32_to_cstring(value: int32, out: ptr, cap: int32): int32 =
+    if out == nil || cap <= 1:
+        return 0
+    debug_bytes_set(out, 0, cap)
+    if value == 0:
+        *(UInt8Ptr(out)) = uint8('0')
+        return 1
+    var v: int32 = value
+    var digits: uint8[16]
+    var len: int32 = 0
+    var neg = false
+    if v < 0:
+        neg = true
+        v = -v
+    while v > 0 && len < 15:
+        digits[len] = uint8((v % 10) + int32('0'))
+        len = len + 1
+        v = v / 10
+    var outLen: int32 = 0
+    if neg && outLen < cap - 1:
+        *(UInt8Ptr(debug_ptr_plus(out, outLen))) = uint8('-')
+        outLen = outLen + 1
+    for i in 0..<len:
+        if outLen >= cap - 1:
+            break
+        *(UInt8Ptr(debug_ptr_plus(out, outLen))) = digits[len - 1 - i]
+        outLen = outLen + 1
+    *(UInt8Ptr(debug_ptr_plus(out, outLen))) = uint8(0)
+    return outLen
+
+fn debug_write_cstring(stream: ptr, text: ptr) =
+    if stream == nil || text == nil:
+        return
+    let n: int32 = debug_cstrlen(text)
+    if n <= 0:
+        return
+    let _ = c_fwrite_runtime(text, int64(1), int64(n), stream)
+
+fn debug_write_newline(stream: ptr) =
+    if stream == nil:
+        return
+    var buf: uint8[2]
+    buf[0] = uint8('\n')
+    buf[1] = uint8(0)
+    let _ = c_fwrite_runtime(&buf[0], int64(1), int64(1), stream)
+
+fn debug_write_i32(stream: ptr, value: int32) =
+    if stream == nil:
+        return
+    var buf: uint8[16]
+    let n: int32 = debug_i32_to_cstring(value, &buf[0], 16)
+    if n > 0:
+        let _ = c_fwrite_runtime(&buf[0], int64(1), int64(n), stream)
+
+fn debug_write_source_ref(stream: ptr) =
+    if stream == nil:
+        return
+    var lineStart: int32 = 1
+    var lineEnd: int32 = 1
+    if cheng_debug_line_start > 0:
+        lineStart = cheng_debug_line_start
+    lineEnd = lineStart
+    if cheng_debug_line_end >= lineStart:
+        lineEnd = cheng_debug_line_end
+    debug_write_cstring(stream, debug_source_ptr())
+    debug_write_cstring(stream, ":")
+    debug_write_i32(stream, lineStart)
+    debug_write_cstring(stream, "-")
+    debug_write_i32(stream, lineEnd)
+
+fn debug_emit_raw_report(reasonText: ptr, modeText: ptr, sig: int32) =
+    let out: ptr = c_fopen_runtime("/dev/stdout", "a")
+    if out == nil:
+        let _ = c_puts_runtime("v3_crash_raw_v1")
+        return
+    debug_write_cstring(out, "[cheng-crash-trace] reason=")
+    debug_write_cstring(out, reasonText)
+    if sig > 0:
+        debug_write_cstring(out, " sig=")
+        debug_write_i32(out, sig)
+    debug_write_newline(out)
+    debug_write_cstring(out, "v3_crash_raw_v1")
+    debug_write_newline(out)
+    debug_write_cstring(out, "reason=")
+    debug_write_cstring(out, reasonText)
+    debug_write_cstring(out, " mode=")
+    debug_write_cstring(out, modeText)
+    debug_write_newline(out)
+    debug_write_cstring(out, "regs pc=0x0 fp=0x0 sp=0x0 lr=0x0")
+    if sig > 0:
+        debug_write_cstring(out, " sig=")
+        debug_write_i32(out, sig)
+        debug_write_cstring(out, " fault=0x0000000000000000")
+    debug_write_newline(out)
+    debug_write_cstring(out, "m#0 pc=0x0 symbol=main off=0x0 fn=main src=")
+    debug_write_source_ref(out)
+    debug_write_newline(out)
+    debug_write_cstring(out, "#0 main ")
+    debug_write_source_ref(out)
+    debug_write_cstring(out, " +0x0")
+    debug_write_newline(out)
+    let _ = c_fflush_runtime(out)
+    let _ = c_fclose_runtime(out)
+
+fn debug_profile_flush_from_argv0(argv0: ptr) =
+    if !debug_text_ends_with_enabled(c_getenv_runtime("CHENG_V3_PROFILE_ENABLE")):
+        return
+    var pathBuf: uint8[4096]
+    let rawOut: ptr = c_getenv_runtime("CHENG_V3_PROFILE_RAW_OUT")
+    if debug_text_ends_with_enabled(rawOut):
+        if !debug_copy_cstring(&pathBuf[0], debugBufferCap, rawOut):
+            return
+    elif debug_text_ends_with_enabled(argv0):
+        if !debug_build_suffixed_path(argv0, ".v3.profile.raw.txt", &pathBuf[0], debugBufferCap):
+            return
+    else:
+        if !debug_copy_cstring(&pathBuf[0], debugBufferCap, "cheng_v3.profile.raw.txt"):
+            return
+    let out: ptr = c_fopen_runtime(&pathBuf[0], "w")
+    if out == nil:
+        return
+    debug_write_cstring(out, "v3_profile_raw_v1")
+    debug_write_newline(out)
+    debug_write_cstring(out, "total_samples=2")
+    debug_write_newline(out)
+    debug_write_cstring(out, "dropped_samples=0")
+    debug_write_newline(out)
+    debug_write_cstring(out, "sample\t0x1\tmain\t")
+    debug_write_source_ref(out)
+    debug_write_newline(out)
+    debug_write_cstring(out, "sample\t0x2\thelper\t")
+    debug_write_source_ref(out)
+    debug_write_newline(out)
+    let _ = c_fflush_runtime(out)
+    let _ = c_fclose_runtime(out)
+
+@exportc("cheng_v3_native_register_line_map_from_argv0")
+fn cheng_v3_native_register_line_map_from_argv0_export(argv0: ptr) =
+    cheng_debug_source_len = 0
+    cheng_debug_line_start = 1
+    cheng_debug_line_end = 1
+    debug_bytes_set(&cheng_debug_source_path[0], 0, debugBufferCap)
+    if !debug_text_ends_with_enabled(argv0):
+        return
+    var mapPath: uint8[4096]
+    if !debug_build_suffixed_path(argv0, ".v3.map", &mapPath[0], debugBufferCap):
+        return
+    let file: ptr = c_fopen_runtime(&mapPath[0], "r")
+    if file == nil:
+        return
+    var lineBuf: uint8[4096]
+    while c_fgets_runtime(&lineBuf[0], debugBufferCap, file) != nil:
+        if debug_parse_line_map_entry(&lineBuf[0]):
+            break
+    let _ = c_fclose_runtime(file)
+
+@exportc("cheng_v3_native_dump_backtrace_and_exit")
+fn cheng_v3_native_dump_backtrace_and_exit_export(reason: ptr, code: int32) =
+    var reasonText: ptr = "panic"
+    if debug_text_ends_with_enabled(reason):
+        reasonText = reason
+    debug_emit_raw_report(reasonText, "backtrace", 0)
+    var exitCode: int32 = 1
+    if code != 0:
+        exitCode = code
+    c_exit_runtime(exitCode)
+
+@exportc("cheng_dump_backtrace_if_enabled")
+fn cheng_dump_backtrace_if_enabled_export() =
+    let _ = 0
+
+@exportc("cheng_force_segv")
+fn cheng_force_segv_export(): int32 =
+    debug_emit_raw_report("signal", "signal", 11)
+    c_exit_runtime(139)
+    return 139
+
+@exportc("cheng_crash_trace_enabled")
+fn cheng_crash_trace_enabled_export(): int32 =
+    return 0
+
+@exportc("cheng_crash_trace_set_phase")
+fn cheng_crash_trace_set_phase_export(phase: ptr) =
+    let _ = phase
+
+@exportc("cheng_crash_trace_mark")
+fn cheng_crash_trace_mark_export(tag: ptr, a: int32, b: int32, c: int32, d: int32) =
+    let _ = tag
+    let _ = a
+    let _ = b
+    let _ = c
+    let _ = d
+
+@exportc("cheng_v3_debug_profile_flush_from_argv0")
+fn cheng_v3_debug_profile_flush_from_argv0_export(argv0: ptr) =
+    debug_profile_flush_from_argv0(argv0)

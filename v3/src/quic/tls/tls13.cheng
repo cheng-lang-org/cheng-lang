@@ -99,44 +99,56 @@ fn msquicTls13UpdateSecret(secret: Bytes, cipher: MsQuicCipherSuite): Result[Byt
     let hashLen: int32 = msquicTls13HashLen(cipher)
     return msquicTls13ExpandLabel(secret, "quic ku", emptyBytes(), hashLen, cipher)
 
-fn msquicTls13DeriveSecrets(psk: Bytes, sharedSecret: Bytes, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[MsQuicTls13Secrets] =
+fn msquicTls13DeriveSecretsInto(
+    out: var MsQuicTls13Secrets,
+    psk: Bytes,
+    sharedSecret: Bytes,
+    transcriptHash: Bytes,
+    cipher: MsQuicCipherSuite
+): Result[bool] =
     let zeroSalt: Bytes = emptyBytes()
     let early: Bytes = msquicTls13HkdfExtract(cipher, psk, zeroSalt)
     let emptyHash: Bytes = msquicTls13EmptyHash(cipher)
     let derivedRes: Result[Bytes] = msquicTls13DeriveSecret(early, "derived", emptyHash, cipher)
     if IsErr(derivedRes):
-        return Err[MsQuicTls13Secrets](ErrorText(derivedRes))
+        return Err[bool](ErrorText(derivedRes))
     let derived: Bytes = Value(derivedRes)
     let handshake: Bytes = msquicTls13HkdfExtract(cipher, sharedSecret, derived)
     let chsRes: Result[Bytes] = msquicTls13DeriveSecret(handshake, "c hs traffic", transcriptHash, cipher)
     if IsErr(chsRes):
-        return Err[MsQuicTls13Secrets](ErrorText(chsRes))
+        return Err[bool](ErrorText(chsRes))
     let shsRes: Result[Bytes] = msquicTls13DeriveSecret(handshake, "s hs traffic", transcriptHash, cipher)
     if IsErr(shsRes):
-        return Err[MsQuicTls13Secrets](ErrorText(shsRes))
+        return Err[bool](ErrorText(shsRes))
     let derived2Res: Result[Bytes] = msquicTls13DeriveSecret(handshake, "derived", emptyHash, cipher)
     if IsErr(derived2Res):
-        return Err[MsQuicTls13Secrets](ErrorText(derived2Res))
+        return Err[bool](ErrorText(derived2Res))
     let derived2: Bytes = Value(derived2Res)
     let master: Bytes = msquicTls13HkdfExtract(cipher, emptyBytes(), derived2)
     let hashLen: int32 = msquicTls13HashLen(cipher)
     let resMasterRes: Result[Bytes] = msquicTls13ExpandLabel(master, "res master", emptyBytes(), hashLen, cipher)
     if IsErr(resMasterRes):
-        return Err[MsQuicTls13Secrets](ErrorText(resMasterRes))
+        return Err[bool](ErrorText(resMasterRes))
     let capRes: Result[Bytes] = msquicTls13DeriveSecret(master, "c ap traffic", transcriptHash, cipher)
     if IsErr(capRes):
-        return Err[MsQuicTls13Secrets](ErrorText(capRes))
+        return Err[bool](ErrorText(capRes))
     let sapRes: Result[Bytes] = msquicTls13DeriveSecret(master, "s ap traffic", transcriptHash, cipher)
     if IsErr(sapRes):
-        return Err[MsQuicTls13Secrets](ErrorText(sapRes))
-    return Ok[MsQuicTls13Secrets](MsQuicTls13Secrets(
-        clientHandshakeTrafficSecret: Value(chsRes),
-        serverHandshakeTrafficSecret: Value(shsRes),
-        clientTrafficSecret0: Value(capRes),
-        serverTrafficSecret0: Value(sapRes),
-        masterSecret: master,
-        resumptionMasterSecret: Value(resMasterRes)
-    ))
+        return Err[bool](ErrorText(sapRes))
+    out.clientHandshakeTrafficSecret = Value(chsRes)
+    out.serverHandshakeTrafficSecret = Value(shsRes)
+    out.clientTrafficSecret0 = Value(capRes)
+    out.serverTrafficSecret0 = Value(sapRes)
+    out.masterSecret = master
+    out.resumptionMasterSecret = Value(resMasterRes)
+    return Ok[bool](true)
+
+fn msquicTls13DeriveSecrets(psk: Bytes, sharedSecret: Bytes, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[MsQuicTls13Secrets] =
+    var out: MsQuicTls13Secrets
+    let fillRes: Result[bool] = msquicTls13DeriveSecretsInto(out, psk, sharedSecret, transcriptHash, cipher)
+    if IsErr(fillRes):
+        return Err[MsQuicTls13Secrets](ErrorText(fillRes))
+    return Ok[MsQuicTls13Secrets](out)
 
 fn msquicTls13DeriveEarlyTrafficSecret(psk: Bytes, transcriptHash: Bytes, cipher: MsQuicCipherSuite): Result[Bytes] =
     if bytesLen(psk) <= 0:

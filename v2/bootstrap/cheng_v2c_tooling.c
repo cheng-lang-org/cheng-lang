@@ -10,6 +10,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -11550,6 +11555,70 @@ static char *extract_line_value(const char *body, const char *key) {
     }
     out = trim_copy(start, end);
     return out;
+}
+
+static void collect_prefixed_line_values(const char *text,
+                                         const char *prefix,
+                                         StringList *out_values) {
+    const char *cursor = text != NULL ? text : "";
+    size_t prefix_len = strlen(prefix);
+    while (cursor != NULL && *cursor != '\0') {
+        const char *end = strchr(cursor, '\n');
+        size_t line_len = end != NULL ? (size_t)(end - cursor) : strlen(cursor);
+        if (line_len >= prefix_len && strncmp(cursor, prefix, prefix_len) == 0) {
+            string_list_push_take(out_values, trim_copy(cursor + prefix_len, cursor + line_len));
+        }
+        cursor = end != NULL ? end + 1 : NULL;
+    }
+}
+
+static char *build_network_smoke_report_text(const char *smoke_name,
+                                             const char *stdout_path,
+                                             const char **prefixes,
+                                             size_t prefix_count,
+                                             const char *stdout_text,
+                                             int *out_stage_total) {
+    StringList lines = {0};
+    char *joined = NULL;
+    char *report = NULL;
+    int stage_total = 0;
+    size_t i;
+    string_list_push_copy(&lines, "v2_network_smoke_report_v1");
+    string_list_pushf(&lines, "smoke=%s", smoke_name);
+    string_list_pushf(&lines, "stdout_path=%s", stdout_path);
+    string_list_pushf(&lines, "prefix_count=%zu", prefix_count);
+    for (i = 0; i < prefix_count; ++i) {
+        StringList stages = {0};
+        char key_buf[256];
+        char *stage_csv = NULL;
+        size_t prefix_len = strlen(prefixes[i]);
+        collect_prefixed_line_values(stdout_text, prefixes[i], &stages);
+        stage_total += (int)stages.len;
+        if (prefix_len > 0U && prefixes[i][prefix_len - 1U] == '=') {
+            prefix_len -= 1U;
+        }
+        if (prefix_len >= sizeof(key_buf)) {
+            die("network smoke prefix too long");
+        }
+        memcpy(key_buf, prefixes[i], prefix_len);
+        key_buf[prefix_len] = '\0';
+        string_list_pushf(&lines, "prefix.%zu.name=%s", i, key_buf);
+        string_list_pushf(&lines, "prefix.%zu.count=%zu", i, stages.len);
+        stage_csv = stages.len > 0 ? string_list_join(&stages, ",") : xstrdup_text("-");
+        string_list_pushf(&lines, "prefix.%zu.stages=%s", i, stage_csv);
+        free(stage_csv);
+        string_list_free(&stages);
+    }
+    string_list_pushf(&lines, "stage_total=%d", stage_total);
+    string_list_push_copy(&lines, "ok=1");
+    joined = string_list_join(&lines, "\n");
+    report = xformat("%s\n", joined);
+    free(joined);
+    string_list_free(&lines);
+    if (out_stage_total != NULL) {
+        *out_stage_total = stage_total;
+    }
+    return report;
 }
 
 static char *parse_call_body(const char *line, const char *prefix) {
@@ -29977,27 +30046,6 @@ static int compiler_core_importc_symbol_allows_direct_exec(const char *symbol_na
            strcmp(symbol_name, "driver_c_read_int32_flag_or_default_bridge") == 0 ||
            strcmp(symbol_name, "driver_c_chr_i32_compat") == 0 ||
            strcmp(symbol_name, "driver_c_ord_char_compat") == 0 ||
-           strcmp(symbol_name, "driver_c_compiler_core_print_usage_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_compiler_core_print_status_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_absolute_path_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_program_absolute_path_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_get_current_dir_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_join_path2_bridge") == 0 ||
-           strcmp(symbol_name, "driver_c_create_dir_all_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_write_text_file_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_compare_text_files_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_compare_binary_files_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_exec_file_capture_or_panic_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_compare_text_files_or_panic_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_extract_line_value_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_count_external_cc_providers_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_parse_plan_int32_or_zero_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_provider_field_for_module_from_plan_text_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_compiler_core_provider_source_kind_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_compiler_core_provider_compile_mode_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_run_stage_selfhost_host_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_run_tooling_selfhost_host_bridge") == 0 ||
-        strcmp(symbol_name, "driver_c_run_program_selfhost_check_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_machine_target_architecture_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_machine_target_obj_format_bridge") == 0 ||
         strcmp(symbol_name, "driver_c_machine_target_symbol_prefix_bridge") == 0 ||
@@ -47210,17 +47258,17 @@ static void runtime_provider_external_cc_compile_inputs(const char *module_path,
         string_list_push_copy(out_paths, "v2/src/runtime/compiler_core_native_dispatch.h");
         string_list_push_copy(out_paths, "v2/bootstrap/cheng_v2c_tooling.c");
         string_list_push_copy(out_paths, "v2/bootstrap/cheng_v2c_tooling.h");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_char_seq_compat_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_seq_free_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_str_repr_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_stdio_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_epoch_time_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_str_eq_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_compat_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_machine_target_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_tooling_entry_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_host_stdio_fs_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_program_runtime_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_shim.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_io_time_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_host_process_ffi_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_support_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/cheng_sidecar_loader.h");
+        string_list_push_copy(out_paths, "v3/runtime/native/v3_str_twoway_search.h");
         return;
     }
     die("v2 runtime provider object: unsupported external cc compile inputs");
@@ -47233,17 +47281,15 @@ static void runtime_provider_external_cc_source_files(const char *module_path,
         string_list_push_copy(out_paths, "v2/src/runtime/compiler_core_native_provider.c");
         string_list_push_copy(out_paths, "v2/src/runtime/compiler_core_native_dispatch.c");
         string_list_push_copy(out_paths, "v2/bootstrap/cheng_v2c_tooling.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_char_seq_compat_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_rawmem_as_void_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_seq_free_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_str_repr_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_stdio_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_epoch_time_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_cmdline_bridge.c");
-        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_str_eq_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_compat_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_machine_target_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_tooling_entry_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_host_stdio_fs_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_program_runtime_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_shim.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_io_time_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_host_process_ffi_bridge.c");
+        string_list_push_copy(out_paths, "src/runtime/native/system_helpers_selflink_support_bridge.c");
         return;
     }
     die("v2 runtime provider object: unsupported external cc source files");
@@ -49707,6 +49753,15 @@ static void build_program_binary_or_die(const char *repo_root,
     string_list_free(&argv);
 }
 
+static const int program_selfhost_default_run_timeout_ms = 30000;
+static const int program_selfhost_network_smoke_timeout_ms = 60000;
+static pid_t spawn_exec_to_file_or_die(const char *file_path,
+                                       const StringList *argv,
+                                       const char *working_dir,
+                                       const char *stdout_path,
+                                       const char *label);
+static int wait_pid_with_timeout(pid_t pid, int timeout_ms);
+
 static char *run_binary_capture_or_die(const char *binary_path,
                                        const char *repo_root,
                                        const char *label,
@@ -49724,6 +49779,192 @@ static char *run_binary_capture_or_die(const char *binary_path,
     return stdout_text;
 }
 
+static char *run_binary_capture_to_file_with_timeout_or_die(const char *binary_path,
+                                                            const char *repo_root,
+                                                            const char *label,
+                                                            int argc,
+                                                            const char **argv_items,
+                                                            const char *stdout_path,
+                                                            int timeout_ms) {
+    StringList argv;
+    int i;
+    pid_t pid;
+    int exit_code;
+    char *stdout_text;
+    memset(&argv, 0, sizeof(argv));
+    for (i = 0; i < argc; ++i) {
+        string_list_push_copy(&argv, argv_items[i]);
+    }
+    remove_tree_or_die(stdout_path);
+    pid = spawn_exec_to_file_or_die(binary_path, &argv, repo_root, stdout_path, label);
+    exit_code = wait_pid_with_timeout(pid, timeout_ms);
+    stdout_text = read_file_text(stdout_path);
+    string_list_free(&argv);
+    if (exit_code == 124) {
+        die(xformat("%s\ntimeout_ms=%d\n%s", label, timeout_ms, stdout_text));
+    }
+    if (exit_code != 0) {
+        die(xformat("%s\n%s", label, stdout_text));
+    }
+    return stdout_text;
+}
+
+static int allocate_loopback_udp_port_or_die(const char *label) {
+    int fd;
+    struct sockaddr_in addr;
+    socklen_t addr_len = (socklen_t)sizeof(addr);
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        die_errno(label, "socket");
+    }
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(0);
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(fd, (const struct sockaddr *)&addr, addr_len) != 0) {
+        close(fd);
+        die_errno(label, "bind");
+    }
+    if (getsockname(fd, (struct sockaddr *)&addr, &addr_len) != 0) {
+        close(fd);
+        die_errno(label, "getsockname");
+    }
+    close(fd);
+    return (int)ntohs(addr.sin_port);
+}
+
+static pid_t spawn_exec_to_file_or_die(const char *file_path,
+                                       const StringList *argv,
+                                       const char *working_dir,
+                                       const char *stdout_path,
+                                       const char *label) {
+    int out_fd;
+    int stdin_fd;
+    pid_t pid;
+    out_fd = open(stdout_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out_fd < 0) {
+        die_errno(label, stdout_path);
+    }
+    stdin_fd = open("/dev/null", O_RDONLY);
+    if (stdin_fd < 0) {
+        close(out_fd);
+        die_errno(label, "/dev/null");
+    }
+    pid = fork();
+    if (pid < 0) {
+        close(stdin_fd);
+        close(out_fd);
+        die_errno(label, "fork");
+    }
+    if (pid == 0) {
+        char **exec_argv = (char **)xcalloc(argv->len + 2, sizeof(char *));
+        size_t i;
+        if (working_dir != NULL && working_dir[0] != '\0' && chdir(working_dir) != 0) {
+            _exit(127);
+        }
+        if (dup2(stdin_fd, STDIN_FILENO) < 0 ||
+            dup2(out_fd, STDOUT_FILENO) < 0 ||
+            dup2(out_fd, STDERR_FILENO) < 0) {
+            _exit(127);
+        }
+        close(stdin_fd);
+        close(out_fd);
+        exec_argv[0] = (char *)file_path;
+        for (i = 0; i < argv->len; ++i) {
+            exec_argv[i + 1] = argv->items[i];
+        }
+        exec_argv[argv->len + 1] = NULL;
+        execv(file_path, exec_argv);
+        _exit(127);
+    }
+    close(stdin_fd);
+    close(out_fd);
+    return pid;
+}
+
+static int wait_pid_with_timeout(pid_t pid, int timeout_ms) {
+    int elapsed = 0;
+    int status = 0;
+    for (;;) {
+        pid_t rc = waitpid(pid, &status, WNOHANG);
+        if (rc < 0) {
+            die_errno("program selfhost: waitpid failed", "serve-once");
+        }
+        if (rc == pid) {
+            if (WIFEXITED(status)) {
+                return WEXITSTATUS(status);
+            }
+            if (WIFSIGNALED(status)) {
+                return 128 + WTERMSIG(status);
+            }
+            return 127;
+        }
+        if (elapsed >= timeout_ms) {
+            kill(pid, SIGTERM);
+            usleep(100000);
+            if (waitpid(pid, &status, WNOHANG) == 0) {
+                kill(pid, SIGKILL);
+            }
+            if (waitpid(pid, &status, 0) < 0) {
+                return 124;
+            }
+            return 124;
+        }
+        usleep(20000);
+        elapsed += 20;
+    }
+}
+
+static int poll_pid_exit_code(pid_t pid) {
+    int status = 0;
+    pid_t rc = waitpid(pid, &status, WNOHANG);
+    if (rc < 0) {
+        die_errno("program selfhost: waitpid failed", "serve-once");
+    }
+    if (rc == 0) {
+        return 124;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 127;
+}
+
+static char *last_non_empty_line_copy(const char *text) {
+    const char *line_start = text != NULL ? text : "";
+    const char *best_start = NULL;
+    const char *best_end = NULL;
+    const char *p = line_start;
+    for (;;) {
+        if (*p == '\n' || *p == '\0') {
+            const char *start = line_start;
+            const char *end = p;
+            while (start < end && (*start == ' ' || *start == '\t' || *start == '\r')) {
+                start += 1;
+            }
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r')) {
+                end -= 1;
+            }
+            if (end > start) {
+                best_start = start;
+                best_end = end;
+            }
+            if (*p == '\0') {
+                break;
+            }
+            line_start = p + 1;
+        }
+        p += 1;
+    }
+    if (best_start == NULL) {
+        return xstrdup_text("");
+    }
+    return xstrdup_range(best_start, best_end);
+}
+
 static char *run_chain_node_process_smoke_capture_or_die(const char *repo_root,
                                                          const char *chain_node_binary,
                                                          const char *programs_dir,
@@ -49732,10 +49973,21 @@ static char *run_chain_node_process_smoke_capture_or_die(const char *repo_root,
     char client_root[PATH_MAX];
     char server_log[PATH_MAX];
     char sync_log[PATH_MAX];
+    char listen[128];
     StringList argv;
-    char *script;
+    StringList server_argv;
     char *stdout_text;
+    char *sync_stdout;
+    char *balance_stdout;
+    char *server_stdout;
+    char *sync_out;
+    char *balance_out;
+    char *server_out;
+    pid_t server_pid;
+    int server_exit_code;
+    int port;
     memset(&argv, 0, sizeof(argv));
+    memset(&server_argv, 0, sizeof(server_argv));
     if (snprintf(server_root, sizeof(server_root), "%s/chain_node_process_server_root", programs_dir) >=
             (int)sizeof(server_root) ||
         snprintf(client_root, sizeof(client_root), "%s/chain_node_process_client_root", programs_dir) >=
@@ -49746,41 +49998,91 @@ static char *run_chain_node_process_smoke_capture_or_die(const char *repo_root,
             (int)sizeof(sync_log)) {
         die("program selfhost: chain node process smoke path too long");
     }
-    script = xformat("set -eu\n"
-                     "port=$((20000 + ($$ %% 20000)))\n"
-                     "listen=\"/ip4/127.0.0.1/udp/$port/quic-v1\"\n"
-                     "server_root='%s'\n"
-                     "client_root='%s'\n"
-                     "server_log='%s'\n"
-                     "sync_log='%s'\n"
-                     "rm -rf \"$server_root\" \"$client_root\" \"$server_log\" \"$sync_log\"\n"
-                     "'%s' mint --root \"$server_root\" --node-id server --account alice --asset cheng --amount 11 > /dev/null\n"
-                     "printf 'chain_node_process_smoke_stage=mint_ok\\n'\n"
-                     "(timeout 60s '%s' serve-once --root \"$server_root\" --node-id server --listen \"$listen\" > \"$server_log\") &\n"
-                     "server_pid=$!\n"
-                     "sleep 1\n"
-                     "timeout 90s '%s' sync-once --root \"$client_root\" --node-id client --peer \"$listen\" > \"$sync_log\" || { wait $server_pid || true; exit 1; }\n"
-                     "sync_out=$(tail -n 1 \"$sync_log\")\n"
-                     "printf 'chain_node_process_smoke_stage=sync_ok\\n'\n"
-                     "balance_out=$(timeout 10s '%s' balance --root \"$client_root\" --node-id client --account alice --asset cheng) || { wait $server_pid || true; exit 1; }\n"
-                     "printf 'chain_node_process_smoke_stage=balance_ok\\n'\n"
-                     "wait $server_pid || exit 1\n"
-                     "server_out=$(tail -n 1 \"$server_log\")\n"
-                     "printf 'sync_output=%%s\\n' \"$sync_out\"\n"
-                     "printf 'balance_output=%%s\\n' \"$balance_out\"\n"
-                     "printf 'server_output=%%s\\n' \"$server_out\"\n"
-                     "printf 'chain_node_process_smoke=ok\\n'\n",
-                     server_root,
-                     client_root,
-                     server_log,
-                     sync_log,
-                     chain_node_binary,
-                     chain_node_binary,
-                     chain_node_binary,
-                     chain_node_binary);
-    string_list_push_copy(&argv, "-lc");
-    string_list_push_take(&argv, script);
-    stdout_text = run_command_capture_or_die("/bin/sh", &argv, repo_root, label);
+    remove_tree_or_die(server_root);
+    remove_tree_or_die(client_root);
+    remove_tree_or_die(server_log);
+    remove_tree_or_die(sync_log);
+    port = allocate_loopback_udp_port_or_die("program selfhost: allocate loopback udp port failed");
+    snprintf(listen, sizeof(listen), "/ip4/127.0.0.1/udp/%d/quic-v1", port);
+    {
+        const char *mint_argv[] = {
+            "mint",
+            "--root", server_root,
+            "--node-id", "server",
+            "--account", "alice",
+            "--asset", "cheng",
+            "--amount", "11"
+        };
+        stdout_text = run_binary_capture_or_die(chain_node_binary, repo_root, "program selfhost: mint failed", 11, mint_argv);
+        free(stdout_text);
+    }
+    string_list_push_copy(&server_argv, "serve-once");
+    append_flag_pair(&server_argv, "--root", server_root);
+    append_flag_pair(&server_argv, "--node-id", "server");
+    append_flag_pair(&server_argv, "--listen", listen);
+    server_pid = spawn_exec_to_file_or_die(chain_node_binary,
+                                           &server_argv,
+                                           repo_root,
+                                           server_log,
+                                           "program selfhost: serve-once spawn failed");
+    string_list_free(&server_argv);
+    usleep(1000000);
+    server_exit_code = poll_pid_exit_code(server_pid);
+    if (server_exit_code != 124) {
+        server_stdout = read_file_text(server_log);
+        die(xformat("%s\nserve-once exited before sync\n%s", label, server_stdout));
+    }
+    {
+        const char *sync_argv[] = {
+            "sync-once",
+            "--root", client_root,
+            "--node-id", "client",
+            "--peer", listen
+        };
+        sync_stdout = run_binary_capture_or_die(chain_node_binary, repo_root, "program selfhost: sync-once failed", 7, sync_argv);
+        write_text_file(sync_log, sync_stdout);
+    }
+    {
+        const char *balance_argv[] = {
+            "balance",
+            "--root", client_root,
+            "--node-id", "client",
+            "--account", "alice",
+            "--asset", "cheng"
+        };
+        balance_stdout = run_binary_capture_or_die(chain_node_binary, repo_root, "program selfhost: balance failed", 9, balance_argv);
+    }
+    server_exit_code = wait_pid_with_timeout(server_pid, 60000);
+    server_stdout = read_file_text(server_log);
+    if (server_exit_code != 0) {
+        die(xformat("%s\nserve-once failed\n%s", label, server_stdout));
+    }
+    sync_out = last_non_empty_line_copy(sync_stdout);
+    balance_out = last_non_empty_line_copy(balance_stdout);
+    server_out = last_non_empty_line_copy(server_stdout);
+    if (sync_out[0] == '\0' || balance_out[0] == '\0' || server_out[0] == '\0') {
+        die(xformat("%s\nmissing chain-node process smoke output\nsync=%s\nbalance=%s\nserver=%s",
+                    label,
+                    sync_stdout,
+                    balance_stdout,
+                    server_stdout));
+    }
+    stdout_text = xformat("chain_node_process_smoke_stage=mint_ok\n"
+                          "chain_node_process_smoke_stage=sync_ok\n"
+                          "chain_node_process_smoke_stage=balance_ok\n"
+                          "sync_output=%s\n"
+                          "balance_output=%s\n"
+                          "server_output=%s\n"
+                          "chain_node_process_smoke=ok\n",
+                          sync_out,
+                          balance_out,
+                          server_out);
+    free(sync_stdout);
+    free(balance_stdout);
+    free(server_stdout);
+    free(sync_out);
+    free(balance_out);
+    free(server_out);
     string_list_free(&argv);
     return stdout_text;
 }
@@ -50173,6 +50475,12 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     char lsmr_advanced_stdout_path[PATH_MAX];
     char chain_state_binary[PATH_MAX];
     char chain_state_stdout_path[PATH_MAX];
+    char quic_tls_ecdsa_binary[PATH_MAX];
+    char quic_tls_ecdsa_stdout_path[PATH_MAX];
+    char quic_tls_ecdsa_report_path[PATH_MAX];
+    char msquic_chain_binary[PATH_MAX];
+    char msquic_chain_stdout_path[PATH_MAX];
+    char msquic_chain_report_path[PATH_MAX];
     char chain_node_binary[PATH_MAX];
     char chain_node_zero_root[PATH_MAX];
     char chain_node_mint_root[PATH_MAX];
@@ -50182,6 +50490,10 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     NativeStageArtifacts stage3;
     char *lsmr_advanced_stdout = NULL;
     char *chain_state_stdout = NULL;
+    char *quic_tls_ecdsa_stdout = NULL;
+    char *quic_tls_ecdsa_report_text = NULL;
+    char *msquic_chain_stdout = NULL;
+    char *msquic_chain_report_text = NULL;
     char *chain_node_zero_balance_stdout = NULL;
     char *chain_node_mint_stdout = NULL;
     char *chain_node_after_mint_balance_stdout = NULL;
@@ -50200,6 +50512,10 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     int no_external_c_provider = 0;
     int lsmr_advanced_ok = 0;
     int chain_state_ok = 0;
+    int quic_tls_ecdsa_ok = 0;
+    int quic_tls_ecdsa_stage_total = 0;
+    int msquic_chain_ok = 0;
+    int msquic_chain_stage_total = 0;
     int chain_node_build_ok = 0;
     int chain_node_zero_balance_ok = 0;
     int chain_node_mint_ok = 0;
@@ -50212,7 +50528,23 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     const char *compiler_source_raw = "v2/src/tooling/cheng_v2.cheng";
     const char *lsmr_advanced_source_raw = "v2/cheng-quic/src/tests/lsmr_advanced_features_smoke.cheng";
     const char *chain_state_source_raw = "v2/cheng-quic/src/tests/chain_state_tree_sync_smoke.cheng";
+    const char *quic_tls_ecdsa_source_raw = "v2/cheng-quic/src/tests/quic_tls_transport_ecdsa_smoke.cheng";
+    const char *msquic_chain_source_raw = "v2/cheng-quic/src/tests/msquic_chain_smoke.cheng";
     const char *chain_node_source_raw = "v2/cheng-quic/src/project/chain_node.cheng";
+    const char *quic_tls_ecdsa_prefixes[] = {
+        "v2_quic_tls_transport_ecdsa_stage="
+    };
+    const char *msquic_chain_prefixes[] = {
+        "msquic_chain_smoke_alg_stage=",
+        "msquic_chain_smoke_stage=",
+        "msquic_native_dial_stage=",
+        "msquic_native_client_hello_stage=",
+        "msquic_native_server_flight_stage=",
+        "msquic_tls13_cert_verify_stage=",
+        "msquic_tls13_parse_stage=",
+        "msquic_native_client_finished_stage=",
+        "msquic_transport_dial_stage="
+    };
     resolve_existing_input_path(repo_root,
                                 compiler_raw,
                                 compiler_abs,
@@ -50237,6 +50569,30 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
                  sizeof(chain_state_stdout_path),
                  "%s/chain_state_tree_sync_smoke.stdout",
                  programs_dir) >= (int)sizeof(chain_state_stdout_path) ||
+        snprintf(quic_tls_ecdsa_binary,
+                 sizeof(quic_tls_ecdsa_binary),
+                 "%s/quic_tls_transport_ecdsa_smoke_bin",
+                 programs_dir) >= (int)sizeof(quic_tls_ecdsa_binary) ||
+        snprintf(quic_tls_ecdsa_stdout_path,
+                 sizeof(quic_tls_ecdsa_stdout_path),
+                 "%s/quic_tls_transport_ecdsa_smoke.stdout",
+                 programs_dir) >= (int)sizeof(quic_tls_ecdsa_stdout_path) ||
+        snprintf(quic_tls_ecdsa_report_path,
+                 sizeof(quic_tls_ecdsa_report_path),
+                 "%s/quic_tls_transport_ecdsa_smoke.report.txt",
+                 programs_dir) >= (int)sizeof(quic_tls_ecdsa_report_path) ||
+        snprintf(msquic_chain_binary,
+                 sizeof(msquic_chain_binary),
+                 "%s/msquic_chain_smoke_bin",
+                 programs_dir) >= (int)sizeof(msquic_chain_binary) ||
+        snprintf(msquic_chain_stdout_path,
+                 sizeof(msquic_chain_stdout_path),
+                 "%s/msquic_chain_smoke.stdout",
+                 programs_dir) >= (int)sizeof(msquic_chain_stdout_path) ||
+        snprintf(msquic_chain_report_path,
+                 sizeof(msquic_chain_report_path),
+                 "%s/msquic_chain_smoke.report.txt",
+                 programs_dir) >= (int)sizeof(msquic_chain_report_path) ||
         snprintf(chain_node_binary, sizeof(chain_node_binary), "%s/chain_node_bin", programs_dir) >=
             (int)sizeof(chain_node_binary) ||
         snprintf(chain_node_zero_root, sizeof(chain_node_zero_root), "%s/chain_node_zero_root", programs_dir) >=
@@ -50277,9 +50633,13 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
                                 target_raw,
                                 lsmr_advanced_binary,
                                 "program selfhost: lsmr advanced smoke compile failed");
-    lsmr_advanced_stdout =
-        run_binary_capture_or_die(lsmr_advanced_binary, repo_root, "program selfhost: lsmr advanced smoke run failed", 0, NULL);
-    write_text_file(lsmr_advanced_stdout_path, lsmr_advanced_stdout);
+    lsmr_advanced_stdout = run_binary_capture_to_file_with_timeout_or_die(lsmr_advanced_binary,
+                                                                          repo_root,
+                                                                          "program selfhost: lsmr advanced smoke run failed",
+                                                                          0,
+                                                                          NULL,
+                                                                          lsmr_advanced_stdout_path,
+                                                                          program_selfhost_default_run_timeout_ms);
     compare_expected_text_or_die(repo_root,
                                  "v2/tests/contracts/lsmr_advanced_features_smoke.expected",
                                  lsmr_advanced_stdout_path,
@@ -50292,14 +50652,72 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
                                 target_raw,
                                 chain_state_binary,
                                 "program selfhost: chain state tree sync smoke compile failed");
-    chain_state_stdout =
-        run_binary_capture_or_die(chain_state_binary, repo_root, "program selfhost: chain state tree sync smoke run failed", 0, NULL);
-    write_text_file(chain_state_stdout_path, chain_state_stdout);
+    chain_state_stdout = run_binary_capture_to_file_with_timeout_or_die(chain_state_binary,
+                                                                        repo_root,
+                                                                        "program selfhost: chain state tree sync smoke run failed",
+                                                                        0,
+                                                                        NULL,
+                                                                        chain_state_stdout_path,
+                                                                        program_selfhost_default_run_timeout_ms);
     compare_expected_text_or_die(repo_root,
                                  "v2/tests/contracts/chain_state_tree_sync_smoke.expected",
                                  chain_state_stdout_path,
                                  "program selfhost: chain state tree sync smoke mismatch");
     chain_state_ok = 1;
+
+    build_program_binary_or_die(repo_root,
+                                stage2.binary_path,
+                                quic_tls_ecdsa_source_raw,
+                                target_raw,
+                                quic_tls_ecdsa_binary,
+                                "program selfhost: quic tls transport ecdsa smoke compile failed");
+    quic_tls_ecdsa_stdout = run_binary_capture_to_file_with_timeout_or_die(quic_tls_ecdsa_binary,
+                                                                           repo_root,
+                                                                           "program selfhost: quic tls transport ecdsa smoke run failed",
+                                                                           0,
+                                                                           NULL,
+                                                                           quic_tls_ecdsa_stdout_path,
+                                                                           program_selfhost_network_smoke_timeout_ms);
+    compare_expected_text_or_die(repo_root,
+                                 "v2/tests/contracts/quic_tls_transport_ecdsa_smoke.expected",
+                                 quic_tls_ecdsa_stdout_path,
+                                 "program selfhost: quic tls transport ecdsa smoke mismatch");
+    quic_tls_ecdsa_report_text =
+        build_network_smoke_report_text("quic_tls_transport_ecdsa_smoke",
+                                        quic_tls_ecdsa_stdout_path,
+                                        quic_tls_ecdsa_prefixes,
+                                        sizeof(quic_tls_ecdsa_prefixes) / sizeof(quic_tls_ecdsa_prefixes[0]),
+                                        quic_tls_ecdsa_stdout,
+                                        &quic_tls_ecdsa_stage_total);
+    write_text_file(quic_tls_ecdsa_report_path, quic_tls_ecdsa_report_text);
+    quic_tls_ecdsa_ok = 1;
+
+    build_program_binary_or_die(repo_root,
+                                stage2.binary_path,
+                                msquic_chain_source_raw,
+                                target_raw,
+                                msquic_chain_binary,
+                                "program selfhost: msquic chain smoke compile failed");
+    msquic_chain_stdout = run_binary_capture_to_file_with_timeout_or_die(msquic_chain_binary,
+                                                                         repo_root,
+                                                                         "program selfhost: msquic chain smoke run failed",
+                                                                         0,
+                                                                         NULL,
+                                                                         msquic_chain_stdout_path,
+                                                                         program_selfhost_network_smoke_timeout_ms);
+    compare_expected_text_or_die(repo_root,
+                                 "v2/tests/contracts/msquic_chain_smoke.expected",
+                                 msquic_chain_stdout_path,
+                                 "program selfhost: msquic chain smoke mismatch");
+    msquic_chain_report_text =
+        build_network_smoke_report_text("msquic_chain_smoke",
+                                        msquic_chain_stdout_path,
+                                        msquic_chain_prefixes,
+                                        sizeof(msquic_chain_prefixes) / sizeof(msquic_chain_prefixes[0]),
+                                        msquic_chain_stdout,
+                                        &msquic_chain_stage_total);
+    write_text_file(msquic_chain_report_path, msquic_chain_report_text);
+    msquic_chain_ok = 1;
 
     build_program_binary_or_die(repo_root,
                                 stage2.binary_path,
@@ -50399,6 +50817,8 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
          no_external_c_provider &&
          lsmr_advanced_ok &&
          chain_state_ok &&
+         quic_tls_ecdsa_ok &&
+         msquic_chain_ok &&
          chain_node_build_ok &&
          chain_node_zero_balance_ok &&
          chain_node_mint_ok &&
@@ -50421,17 +50841,31 @@ static int cmd_program_selfhost_check(const char *repo_root, int argc, char **ar
     printf("compiler_core_provider_compile_mode=%s\n", stage2.compiler_core_provider_compile_mode);
     printf("stage2_lsmr_advanced_smoke_ok=%d\n", lsmr_advanced_ok);
     printf("stage2_chain_state_tree_sync_smoke_ok=%d\n", chain_state_ok);
+    printf("stage2_quic_tls_transport_ecdsa_smoke_ok=%d\n", quic_tls_ecdsa_ok);
+    printf("stage2_quic_tls_transport_ecdsa_report_version=v2_network_smoke_report_v1\n");
+    printf("stage2_quic_tls_transport_ecdsa_report_path=%s\n", quic_tls_ecdsa_report_path);
+    printf("stage2_quic_tls_transport_ecdsa_stage_total=%d\n", quic_tls_ecdsa_stage_total);
+    printf("stage2_msquic_chain_smoke_ok=%d\n", msquic_chain_ok);
+    printf("stage2_msquic_chain_report_version=v2_network_smoke_report_v1\n");
+    printf("stage2_msquic_chain_report_path=%s\n", msquic_chain_report_path);
+    printf("stage2_msquic_chain_stage_total=%d\n", msquic_chain_stage_total);
     printf("stage2_chain_node_build_ok=%d\n", chain_node_build_ok);
     printf("stage2_chain_node_zero_balance=%s\n", chain_node_zero_balance);
     printf("stage2_chain_node_mint_event_cid_present=%d\n", chain_node_mint_ok ? 1 : 0);
     printf("stage2_chain_node_balance_after_mint=%s\n", chain_node_after_mint_balance);
     printf("stage2_chain_node_process_smoke_ok=%d\n", chain_node_process_ok);
+    printf("stage2_chain_node_process_shell_orchestration=0\n");
+    printf("stage2_program_runtime_bridge_shell_exec_used=0\n");
     printf("stage2_chain_node_sync_once_output=%s\n", chain_node_process_sync_output);
     printf("stage2_chain_node_sync_balance_output=%s\n", chain_node_process_balance_output);
     printf("stage2_chain_node_serve_once_output=%s\n", chain_node_process_server_output);
 
     free(lsmr_advanced_stdout);
     free(chain_state_stdout);
+    free(quic_tls_ecdsa_stdout);
+    free(quic_tls_ecdsa_report_text);
+    free(msquic_chain_stdout);
+    free(msquic_chain_report_text);
     free(chain_node_zero_balance_stdout);
     free(chain_node_mint_stdout);
     free(chain_node_after_mint_balance_stdout);
@@ -52110,20 +52544,22 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
     }
     if (strcmp(artifact.module_kind, "compiler_core") == 0) {
         static const char *k_support_sources[] = {
-            "src/runtime/native/system_helpers_char_seq_compat_bridge.c",
-            "src/runtime/native/system_helpers_rawmem_as_void_bridge.c",
-            "src/runtime/native/system_helpers_seq_free_bridge.c",
-            "src/runtime/native/system_helpers_str_repr_bridge.c",
-            "src/runtime/native/system_helpers_stdio_bridge.c",
-            "src/runtime/native/system_helpers.c",
-            "src/runtime/native/system_helpers_epoch_time_bridge.c",
-            "src/runtime/native/system_helpers_ptr_seq_bits_bridge.c",
-            "src/runtime/native/system_helpers_cmdline_ptr_pty_bridge.c",
-            "src/runtime/native/system_helpers_selflink_cmdline_bridge.c",
-            "src/runtime/native/system_helpers_selflink_str_eq_bridge.c",
+            "src/runtime/native/system_helpers_compat_bridge.c",
+            "src/runtime/native/system_helpers_machine_target_bridge.c",
+            "src/runtime/native/system_helpers_tooling_entry_bridge.c",
+            "src/runtime/native/system_helpers_host_stdio_fs_bridge.c",
+            "src/runtime/native/system_helpers_program_runtime_bridge.c",
+            "src/runtime/native/system_helpers_selflink_shim.c",
+            "src/runtime/native/system_helpers_io_time_bridge.c",
+            "src/runtime/native/system_helpers_host_process_ffi_bridge.c",
+            "src/runtime/native/system_helpers_selflink_support_bridge.c",
             "v2/bootstrap/cheng_v2c_tooling.c"
         };
+        const char *source_track = compiler_core_execution_track(source_abs);
         size_t support_source_count = sizeof(k_support_sources) / sizeof(k_support_sources[0]);
+        if (strcmp(source_track, "tooling") != 0 && support_source_count > 0u) {
+            support_source_count = support_source_count - 1u;
+        }
         for (i = 0; i < support_source_count; ++i) {
             ByteList support_obj_bytes;
             char *support_abs = xformat("%s.support.%zu.o", output_abs, i);
@@ -52162,6 +52598,10 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
                                   "-mmacosx-version-min=%s",
                                   machine_target_darwin_minos_text(target_raw));
             }
+            if (strcmp(source_track, "program") == 0 &&
+                strcmp(k_support_sources[i], "src/runtime/native/system_helpers_tooling_entry_bridge.c") == 0) {
+                string_list_push_copy(&compile_argv, "-DCHENG_TOOLING_ENTRY_NO_BOOTSTRAP=1");
+            }
             string_list_push_copy(&compile_argv, "-c");
             string_list_push_copy(&compile_argv, support_source_abs);
             string_list_push_copy(&compile_argv, "-o");
@@ -52189,10 +52629,9 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
             free(support_obj_cid);
         }
         if (strcmp(emit_raw, "exe") == 0) {
-            const char *entry_support_source =
-                strcmp(compiler_core_execution_track(source_abs), "program") == 0
-                    ? "src/runtime/native/system_helpers_selflink_program_exe_entry_bridge.c"
-                    : "src/runtime/native/system_helpers_selflink_exe_entry_bridge.c";
+            const char *entry_support_source = "src/runtime/native/system_helpers_selflink_entry_bridge.c";
+            const int entry_is_program =
+                strcmp(compiler_core_execution_track(source_abs), "program") == 0;
             const char *cc_path = getenv("CC");
             const char *compiler_file =
                 (cc_path != NULL && cc_path[0] != '\0' && strchr(cc_path, '/') == NULL)
@@ -52226,6 +52665,9 @@ static int cmd_system_link_exec(const char *repo_root, int argc, char **argv) {
                 string_list_pushf(&compile_argv,
                                   "-mmacosx-version-min=%s",
                                   machine_target_darwin_minos_text(target_raw));
+            }
+            if (entry_is_program) {
+                string_list_push_copy(&compile_argv, "-DCHENG_SELFLINK_PROGRAM_ENTRY=1");
             }
             string_list_push_copy(&compile_argv, "-c");
             string_list_push_copy(&compile_argv, support_source_abs);

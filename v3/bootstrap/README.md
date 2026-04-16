@@ -9,6 +9,13 @@
 - 再由 `cheng.stage0 -> cheng.stage1 -> cheng.stage2 -> cheng.stage3` 继续重编同一份 bootstrap 子集源码
 - 同时写出 `artifacts/v3_bootstrap/bootstrap.env`
 
+当前 live 主线已经切到 `v3_selfhost`：
+
+- 只要仓库里已有 fresh `cheng.stage3`，`bootstrap-bridge` 就直接拿它重编 `stage1 -> stage2 -> stage3`
+- `cheng.stage0` 只再承担物化物和冷启动角色，不再是日常自举刷新时的权威真值
+- 但只要 `cheng_v3_seed.c` 或 `stage1_bootstrap.cheng` 比 live `stage3/stage0` 新，外层薄壳就必须直接回 C seed 临时 runner 真重建，不能继续信旧 `stage3`
+- 只有完全没有 live Cheng 编译器时，外层薄壳才会回到 C seed 临时 runner
+
 当前 bootstrap 子集源码不是完整 Cheng 语法，而是 `v3` 第一个自举子集：
 
 ```text

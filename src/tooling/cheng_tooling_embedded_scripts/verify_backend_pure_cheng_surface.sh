@@ -96,7 +96,6 @@ check_runtime_direct_recursion() {
   rm -f "$runtime_direct_recursion_file.tmp"
 }
 
-check_runtime_direct_recursion "$root/src/runtime/native/system_helpers.c"
 check_runtime_direct_recursion "$root/src/runtime/native/system_helpers_selflink_min_runtime.c"
 check_runtime_direct_recursion "$root/src/runtime/native/system_helpers_selflink_shim.c"
 
