@@ -8,6 +8,9 @@ cd "$root"
 
 compat_header_file="src/runtime/native/system_helpers.h"
 backend_runtime_file="src/std/system_helpers_backend.cheng"
+runtime_bridge_shim="src/runtime/native/system_helpers_selflink_shim.c"
+runtime_bridge_iotime="src/runtime/native/system_helpers_io_time_bridge.c"
+runtime_bridge_host_process_ffi="src/runtime/native/system_helpers_host_process_ffi_bridge.c"
 cc_bin="${CC:-cc}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cheng_runtime_abi.XXXXXX")"
 
@@ -201,8 +204,25 @@ resolve_runtime_obj() {
   fail "built runtime object missing required symbols: $built"
 }
 
+authority_has_symbol() {
+  sym="$1"
+  for src in \
+    "$backend_runtime_file" \
+    "$runtime_bridge_shim" \
+    "$runtime_bridge_iotime" \
+    "$runtime_bridge_host_process_ffi"; do
+    if rg -q "$sym" "$src"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 require_file "$backend_runtime_file"
 require_file "$compat_header_file"
+require_file "$runtime_bridge_shim"
+require_file "$runtime_bridge_iotime"
+require_file "$runtime_bridge_host_process_ffi"
 command -v rg >/dev/null 2>&1 || fail "rg is required"
 command -v nm >/dev/null 2>&1 || fail "nm is required"
 command -v "$cc_bin" >/dev/null 2>&1 || fail "C compiler not found: $cc_bin"
@@ -216,8 +236,8 @@ defined_symbols_file "$runtime_obj" "$runtime_symbols"
 
 while IFS= read -r sym; do
   [ "$sym" != "" ] || continue
-  if ! rg -q "$sym" "$backend_runtime_file"; then
-    fail "missing pure cheng runtime symbol: $sym"
+  if ! authority_has_symbol "$sym"; then
+    fail "missing runtime authority symbol: $sym"
   fi
   if ! rg -q "$sym" "$compat_header_file"; then
     fail "missing compat header symbol: $sym"

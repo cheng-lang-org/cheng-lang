@@ -118,6 +118,106 @@ fn v3CompilerRunCommandLogged(rootDir: str,
         v3CompilerPrintErr("v3 compiler: " + context + " failed")
     return false
 
+fn v3CompilerSharedEmitExtension(targetTriple: str): str =
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return ".dll"
+    if targetTriple == "arm64-apple-darwin":
+        return ".dylib"
+    return ".so"
+
+fn v3CompilerSharedEmitFileHint(targetTriple: str): str =
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return "PE32+"
+    if targetTriple == "arm64-apple-darwin":
+        return "shared library"
+    return "shared object"
+
+fn v3CompilerRunSharedEmitSmokes(rootDir: str): int32 =
+    let packageRoot = v3path.v3PathAbsolute(rootDir, "v3")
+    let fixtureSource = v3path.v3PathAbsolute(rootDir, "v3/src/tests/shared_emit_fixture.cheng")
+    let outDir = v3path.v3PathAbsolute(rootDir, "artifacts/v3_shared_emit_smokes")
+    let targetTriple = cmdline.readFlagOrDefault("--target", contracts.v3BootstrapDefaultTarget())
+    let extension = v3CompilerSharedEmitExtension(targetTriple)
+    let outLib = v3path.v3PathAbsolute(rootDir, "artifacts/v3_shared_emit_smokes/shared_emit_fixture" + extension)
+    let reportPath = v3path.v3PathAbsolute(rootDir, "artifacts/v3_shared_emit_smokes/shared_emit_fixture.report.txt")
+    let compileLogPath = v3path.v3PathAbsolute(rootDir, "artifacts/v3_shared_emit_smokes/shared_emit_fixture.compile.log")
+    let fileLogPath = v3path.v3PathAbsolute(rootDir, "artifacts/v3_shared_emit_smokes/shared_emit_fixture.file.txt")
+    var currentCompiler = cmdline.programName()
+    if len(currentCompiler) <= 0:
+        currentCompiler = v3CompilerBridgeCompilerPath(rootDir)
+    if len(currentCompiler) <= 0:
+        v3CompilerPrintErr("v3 compiler: missing current compiler for run-shared-emit-smokes")
+        return 2
+    if !v3path.v3MkdirP(rootDir, outDir):
+        v3CompilerPrintErr("v3 compiler: failed to create shared emit smoke dir")
+        return 2
+    if v3path.v3PathFileExists(outLib):
+        os.removeFile(outLib)
+    if v3path.v3PathFileExists(reportPath):
+        os.removeFile(reportPath)
+    let compileCommand = v3CompilerQuoteShell(currentCompiler) +
+                         " " + v3CompilerQuoteShell("system-link-exec") +
+                         " " + v3CompilerQuoteShell("--root:" + packageRoot) +
+                         " " + v3CompilerQuoteShell("--in:" + fixtureSource) +
+                         " " + v3CompilerQuoteShell("--emit:shared") +
+                         " " + v3CompilerQuoteShell("--target:" + targetTriple) +
+                         " " + v3CompilerQuoteShell("--out:" + outLib) +
+                         " " + v3CompilerQuoteShell("--report-out:" + reportPath)
+    if !v3CompilerRunCommandLogged(rootDir, compileCommand, compileLogPath, "run-shared-emit-smokes compile"):
+        return 2
+    if !v3path.v3FileExistsNonEmpty(rootDir, outLib):
+        v3CompilerPrintErr("v3 compiler: shared emit smoke missing output: " + outLib)
+        return 2
+    if !v3path.v3FileExistsNonEmpty(rootDir, reportPath):
+        v3CompilerPrintErr("v3 compiler: shared emit smoke missing report: " + reportPath)
+        return 2
+    let reportText = v3path.v3ReadTextFile("", reportPath)
+    if !v3path.v3TextContains(reportText, "emit=shared") ||
+       !v3path.v3TextContains(reportText, "main_function_present=0") ||
+       !v3path.v3TextContains(reportText, "missing_reasons=-") ||
+       !v3path.v3TextContains(reportText, "native_link_missing_reasons=-"):
+        v3CompilerPrintErr("v3 compiler: shared emit smoke report shape mismatch: " + reportPath)
+        return 2
+    let fileCommand = "file " + v3CompilerQuoteShell(outLib)
+    if !v3CompilerRunCommandLogged(rootDir, fileCommand, fileLogPath, "run-shared-emit-smokes file"):
+        return 2
+    let fileText = v3path.v3ReadTextFile("", fileLogPath)
+    let expectedHint = v3CompilerSharedEmitFileHint(targetTriple)
+    if len(expectedHint) > 0 && !v3path.v3TextContains(fileText, expectedHint):
+        v3CompilerPrintErr("v3 compiler: shared emit smoke expected `" + expectedHint + "` in file output")
+        v3CompilerPrintErr(strutil.strip(fileText))
+        return 2
+    v3CompilerPrintLine("v3 shared emit smokes: ok")
+    v3CompilerPrintLine("target=" + targetTriple)
+    v3CompilerPrintLine("out=" + outLib)
+    v3CompilerPrintLine("report=" + reportPath)
+    return 0
+
+fn v3CompilerTextContainsAll(text: str,
+                             needles: str[]): bool =
+    for i in 0..<needles.len:
+        if !strutil.contains(text, needles[i]):
+            return false
+    return true
+
+fn v3CompilerRemovePathTree(path: str): bool =
+    if !v3path.v3PathNonEmpty(path):
+        return true
+    let command = "rm -rf " + v3CompilerQuoteShell(path)
+    return os.execCmdStatus(command, "") == 0
+
+fn v3CompilerCleanHostrunArtifacts(rootDir: str,
+                                   smokeNames: str[]): bool =
+    let hostrunDir = v3path.v3PathAbsolute(rootDir, "artifacts/v3_hostrun")
+    if !os.dirExists(hostrunDir):
+        return true
+    var command = "rm -rf"
+    for i in 0..<smokeNames.len:
+        command = command + " "
+        command = command + v3CompilerQuoteShell(hostrunDir + "/" + smokeNames[i])
+        command = command + "*"
+    return os.execCmdStatus(command, "") == 0
+
 fn v3CompilerRequestFromRuntimeFlags(workspaceRoot: str,
                                      requireOutput: bool): Result[creq.V3CompilerRequest] =
     let sourcePath = cmdline.readFlagOrDefault("--in", "")
@@ -714,7 +814,7 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
     v3CompilerPrintLine("v3 bootstrap bridge ok: " + snapshot.stage2Compiler.path)
     return 0
 
-fn v3CompilerHostBridgeAudit(rootDir: str): int32 =
+fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let stdOsPath = v3path.v3PathAbsolute(rootDir, "src/std/os.cheng")
     let hostProcessPath = v3path.v3PathAbsolute(rootDir, "src/std/os_host_process.cheng")
     let backendPath = v3path.v3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng")
@@ -864,10 +964,129 @@ fn v3CompilerHostBridgeAudit(rootDir: str): int32 =
         out = out + "pure_cheng_zero_c_ready=1\n"
     else:
         out = out + "pure_cheng_zero_c_ready=0\n"
-    v3CompilerPrintLine(strutil.strip(out))
-    if legacyExecCmdFileRaw || legacyExecFileCaptureBridge || legacyExecFilePipeBridge || legacyExecFilePipeImport ||
-       legacyPeerIdBase58Bridge:
+    return strutil.strip(out)
+
+fn v3CompilerHostBridgeAudit(rootDir: str): int32 =
+    let out = v3CompilerHostBridgeAuditText(rootDir)
+    v3CompilerPrintLine(out)
+    if strutil.contains(out, "legacy_exec_file_capture_raw_present=1") ||
+       strutil.contains(out, "legacy_exec_file_capture_bridge_present=1") ||
+       strutil.contains(out, "legacy_exec_file_pipe_bridge_present=1") ||
+       strutil.contains(out, "legacy_exec_file_pipe_import_present=1") ||
+       strutil.contains(out, "legacy_peer_id_base58_bridge_present=1"):
         return 2
+    return 0
+
+fn v3CompilerR2cReactFreshCleanGate(rootDir: str,
+                                    args: str[]): int32 =
+    let repoRaw = cmdline.readFlagOrDefault("--repo", "/Users/lbcheng/UniMaker/React.js")
+    let repo = v3path.v3PathAbsolute(rootDir, repoRaw)
+    if !os.dirExists(repo):
+        v3CompilerPrintErr("v3 compiler: missing React.js repo: " + repo)
+        return 2
+    let statusOut = "/tmp/r2c-status-fresh-clean-gate.json"
+    let smokeNames: str[] = [
+        "compiler_runtime_smoke",
+        "host_process_pipe_spawn_bridge_smoke",
+        "host_process_pipe_spawn_api_smoke",
+        "host_process_exec_file_capture_smoke",
+        "host_process_exec_file_direct_seq_smoke"
+    ]
+    let routeStates: str[] = ["home_default", "content_detail", "publish_selector"]
+    let statusNeedles: str[] = [
+        "\"native_gui_runtime_helper\": \"\"",
+        "\"legacy_wrapper_required\": false",
+        "\"active_node_helper_count\": 11",
+        "\"retired_node_helper_count\": 1",
+        "\"standalone_node_helper_count\": 1",
+        "\"retired_node_helpers\": [\"native_gui_runtime_helper\"]",
+        "\"standalone_node_helpers\": [\"exec_surface_helper\"]"
+    ]
+    let reportNeedles: str[] = [
+        "\"ok\": true",
+        "\"native_gui_host_ready\": true",
+        "\"native_gui_renderer_ready\": true"
+    ]
+    if !v3CompilerRemovePathTree(statusOut):
+        v3CompilerPrintErr("v3 compiler: failed to clear status report: " + statusOut)
+        return 2
+    for i in 0..<routeStates.len:
+        let bundleOutDir = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeStates[i]
+        if !v3CompilerRemovePathTree(bundleOutDir):
+            v3CompilerPrintErr("v3 compiler: failed to clear bundle dir: " + bundleOutDir)
+            return 2
+    if !v3CompilerCleanHostrunArtifacts(rootDir, smokeNames):
+        v3CompilerPrintErr("v3 compiler: failed to clear stale hostrun artifacts")
+        return 2
+    let bootstrapRc = v3CompilerBootstrapBridge(rootDir)
+    if bootstrapRc != 0:
+        return bootstrapRc
+    let backendDriverRc = v3CompilerBuildBackendDriver(rootDir)
+    if backendDriverRc != 0:
+        return backendDriverRc
+    let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
+    let stage3Path = bootstrapSnapshot.stage3Compiler.path
+    if !v3path.v3FileExistsNonEmpty(rootDir, stage3Path):
+        v3CompilerPrintErr("v3 compiler: missing stage3 for r2c fresh gate: " + stage3Path)
+        return 2
+    if v3CompilerForwardToBridge(rootDir, stage3Path, "run-host-smokes", smokeNames) != 0:
+        v3CompilerPrintErr("v3 compiler: run-host-smokes failed inside r2c fresh gate")
+        return 2
+    let auditText = v3CompilerHostBridgeAuditText(rootDir)
+    v3CompilerPrintLine(auditText)
+    if !strutil.contains(auditText, "pure_cheng_zero_c_ready=1") ||
+       !strutil.contains(auditText, "remaining_non_pure_cheng_boundary=none"):
+        v3CompilerPrintErr("v3 compiler: host bridge audit not ready for r2c fresh gate")
+        return 2
+    if v3CompilerForwardToBridge(rootDir,
+                                 stage3Path,
+                                 "r2c-react-v3",
+                                 ["status", "--out", statusOut]) != 0:
+        v3CompilerPrintErr("v3 compiler: r2c-react-v3 status failed inside fresh gate")
+        return 2
+    if !v3path.v3PathFileExists(statusOut):
+        v3CompilerPrintErr("v3 compiler: missing r2c status report: " + statusOut)
+        return 2
+    let statusText = v3path.v3ReadTextFile("", statusOut)
+    if !v3CompilerTextContainsAll(statusText, statusNeedles):
+        v3CompilerPrintErr("v3 compiler: r2c status report drifted from expected helper contract")
+        return 2
+    for i in 0..<routeStates.len:
+        let routeState = routeStates[i]
+        let bundleOutDir = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeState
+        if v3CompilerForwardToBridge(rootDir,
+                                     stage3Path,
+                                     "r2c-react-v3",
+                                     [
+                                         "native-gui-bundle",
+                                         "--repo", repo,
+                                         "--out-dir", bundleOutDir,
+                                         "--route-state", routeState
+                                     ]) != 0:
+            v3CompilerPrintErr("v3 compiler: native-gui-bundle failed for route: " + routeState)
+            return 2
+        let bundleReport = os.joinPath(bundleOutDir, "native_gui_bundle_report_v1.json")
+        let bundleSummary = os.joinPath(bundleOutDir, "native_gui_bundle.summary.env")
+        let bundleJson = os.joinPath(bundleOutDir, "native_gui_bundle_v1.json")
+        if !v3path.v3PathFileExists(bundleReport) || !v3path.v3PathFileExists(bundleSummary) || !v3path.v3PathFileExists(bundleJson):
+            v3CompilerPrintErr("v3 compiler: missing bundle artifacts for route: " + routeState)
+            return 2
+        let reportText = v3path.v3ReadTextFile("", bundleReport)
+        let summaryText = v3path.v3ReadTextFile("", bundleSummary)
+        if !v3CompilerTextContainsAll(reportText, reportNeedles):
+            v3CompilerPrintErr("v3 compiler: bundle report drifted for route: " + routeState)
+            return 2
+        if !strutil.contains(summaryText, "native_gui_runtime_mode=cheng_compiled_json_v1") ||
+           !strutil.contains(summaryText, "native_gui_route_state=" + routeState):
+            v3CompilerPrintErr("v3 compiler: bundle runtime mode drifted for route: " + routeState)
+            return 2
+    v3CompilerPrintLine("r2c-react-v3 fresh clean gate: ok")
+    v3CompilerPrintLine("status_report=" + statusOut)
+    for i in 0..<routeStates.len:
+        let routeState = routeStates[i]
+        let bundleOutDir = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeState
+        let bundleReport = os.joinPath(bundleOutDir, "native_gui_bundle_report_v1.json")
+        v3CompilerPrintLine("bundle_report_" + routeState + "=" + bundleReport)
     return 0
 
 fn v3CompilerLegacyMigrationBuild(rootDir: str,
@@ -1506,6 +1725,10 @@ fn main(argc: int32, argv: str*): int32 =
         return v3CompilerBuildBackendDriver(rootDir)
     if cmd == "host-bridge-audit":
         return v3CompilerHostBridgeAudit(rootDir)
+    if cmd == "r2c-react-v3-fresh-clean-gate":
+        return v3CompilerR2cReactFreshCleanGate(rootDir, args)
+    if cmd == "run-shared-emit-smokes":
+        return v3CompilerRunSharedEmitSmokes(rootDir)
     if cmd == "emit-csg":
         return v3CompilerEmitCsg(rootDir, args)
     if cmd == "migrate-csg":

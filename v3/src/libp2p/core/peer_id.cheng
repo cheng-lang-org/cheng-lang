@@ -1,7 +1,6 @@
 import std/result
 import std/rawbytes
 import std/strings
-import std/multiformats/multibase
 import std/crypto/sha256
 import std/crypto/sha512
 import std/crypto/ed25519/ref10
@@ -15,24 +14,111 @@ const
     v3Libp2pPeerIdBytesSize: int32 = 38
     v3Libp2pPeerIdIdentityCode: int32 = 0
 
+fn v3Libp2pBase58Char(digit: int32): int32 =
+    if digit < 9:
+        return int32('1') + digit
+    if digit < 17:
+        return int32('A') + (digit - 9)
+    if digit < 22:
+        return int32('J') + (digit - 17)
+    if digit < 33:
+        return int32('P') + (digit - 22)
+    if digit < 44:
+        return int32('a') + (digit - 33)
+    return int32('m') + (digit - 44)
+
+fn v3Libp2pBase58Value(c: char): int32 =
+    let code = int32(c)
+    if code >= int32('1') && code <= int32('9'):
+        return code - int32('1')
+    if code >= int32('A') && code <= int32('H'):
+        return 9 + (code - int32('A'))
+    if code >= int32('J') && code <= int32('N'):
+        return 17 + (code - int32('J'))
+    if code >= int32('P') && code <= int32('Z'):
+        return 22 + (code - int32('P'))
+    if code >= int32('a') && code <= int32('k'):
+        return 33 + (code - int32('a'))
+    if code >= int32('m') && code <= int32('z'):
+        return 44 + (code - int32('m'))
+    return -1
+
 fn v3Libp2pEncodeBase58(data: Bytes): str =
     if bytesLen(data) <= 0:
         return ""
-    let encodedRes = multibase.encodeMultibase(multibase.baseBase58Btc, data)
-    if IsErr(encodedRes):
+    var zeros = 0
+    while zeros < bytesLen(data) && bytesGet(data, zeros) == 0:
+        zeros = zeros + 1
+    let size = (bytesLen(data) * 138) / 100 + 1
+    let digits = bytesAlloc(size)
+    var i = 0
+    while i < bytesLen(data):
+        var carry = bytesGet(data, i)
+        var j = size - 1
+        while j >= 0:
+            let value = bytesGet(digits, j)
+            carry = carry + value * 256
+            bytesSet(digits, j, carry % 58)
+            carry = carry / 58
+            j = j - 1
+        i = i + 1
+    var start = 0
+    while start < size && bytesGet(digits, start) == 0:
+        start = start + 1
+    let outLen = zeros + (size - start)
+    if outLen <= 0:
         return ""
-    let encoded = Value(encodedRes)
-    if len(encoded) <= 1:
-        return ""
-    return strings.sliceBytes(encoded, 1, len(encoded) - 1)
+    let out = bytesAlloc(outLen)
+    var outIdx = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, int32('1'))
+        outIdx = outIdx + 1
+    var k = start
+    while k < size:
+        bytesSet(out, outIdx, v3Libp2pBase58Char(bytesGet(digits, k)))
+        outIdx = outIdx + 1
+        k = k + 1
+    return bytesToString(out)
 
 fn v3Libp2pDecodeBase58(text: str): Result[Bytes] =
     if len(text) <= 0:
         return Err[Bytes]("v3 libp2p peer: empty peer text")
-    let decodedRes = multibase.decodeMultibase("z" + text)
-    if IsErr(decodedRes):
+    var zeros = 0
+    while zeros < len(text) && text[zeros] == '1':
+        zeros = zeros + 1
+    let size = (len(text) * 733) / 1000 + 1
+    let b256 = bytesAlloc(size)
+    var i = 0
+    while i < len(text):
+        let value = v3Libp2pBase58Value(text[i])
+        if value < 0:
+            return Err[Bytes]("v3 libp2p peer: invalid peer text")
+        var carry = value
+        var j = size - 1
+        while j >= 0:
+            let digit = bytesGet(b256, j)
+            carry = carry + digit * 58
+            bytesSet(b256, j, carry % 256)
+            carry = carry / 256
+            j = j - 1
+        i = i + 1
+    var start = 0
+    while start < size && bytesGet(b256, start) == 0:
+        start = start + 1
+    let outLen = zeros + (size - start)
+    let out = bytesAlloc(outLen)
+    var outIdx = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, 0)
+        outIdx = outIdx + 1
+    var k = start
+    while k < size:
+        bytesSet(out, outIdx, bytesGet(b256, k))
+        outIdx = outIdx + 1
+        k = k + 1
+    if bytesLen(out) <= 0:
         return Err[Bytes]("v3 libp2p peer: invalid peer text")
-    return Ok[Bytes](Value(decodedRes))
+    return Ok[Bytes](out)
 
 fn v3Libp2pPeerSeedBytes(seed: str): Bytes =
     return sha256.sha256Digest(bytesFromString("v3.libp2p.peer|" + seed))

@@ -262,12 +262,27 @@ esac
 
 compat_header_file="src/runtime/native/system_helpers.h"
 backend_runtime_file="src/std/system_helpers_backend.cheng"
+runtime_bridge_host_process_ffi="src/runtime/native/system_helpers_host_process_ffi_bridge.c"
+runtime_bridge_raw_ffi="src/runtime/native/system_helpers_ffi_raw_bridge.c"
 fixture_ok="tests/cheng/backend/fixtures/ffi_importc_handle_sandbox_i32.cheng"
 fixture_trap="tests/cheng/backend/fixtures/ffi_importc_handle_stale_trap_i32.cheng"
 fixture_ann="tests/cheng/backend/fixtures/ffi_importc_handle_annotated_i32.cheng"
 fixture_ann_trap="tests/cheng/backend/fixtures/ffi_importc_handle_annotated_stale_trap_i32.cheng"
 
-for runtime_file in "$compat_header_file" "$backend_runtime_file" "$fixture_ok" "$fixture_trap" "$fixture_ann" "$fixture_ann_trap"; do
+authority_has_symbol() {
+  sym="$1"
+  for src in \
+    "$backend_runtime_file" \
+    "$runtime_bridge_host_process_ffi" \
+    "$runtime_bridge_raw_ffi"; do
+    if rg -q "$sym" "$src"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+for runtime_file in "$compat_header_file" "$backend_runtime_file" "$runtime_bridge_host_process_ffi" "$runtime_bridge_raw_ffi" "$fixture_ok" "$fixture_trap" "$fixture_ann" "$fixture_ann_trap"; do
   if [ ! -f "$runtime_file" ]; then
     fail "missing required file: $runtime_file"
   fi
@@ -289,8 +304,8 @@ for sym in \
   cheng_ffi_raw_get_i32 \
   cheng_ffi_raw_add_i32 \
   cheng_ffi_raw_release_i32; do
-  if ! rg -q "$sym" "$backend_runtime_file"; then
-    fail "missing pure cheng runtime symbol: $sym"
+  if ! authority_has_symbol "$sym"; then
+    fail "missing runtime authority symbol: $sym"
   fi
   if ! rg -q "$sym" "$compat_header_file"; then
     fail "missing compat header symbol: $sym"
@@ -601,7 +616,7 @@ fi
   echo "gate_linker=$gate_linker"
   echo "link_env=$link_env"
   echo "cc=$cc_bin"
-  echo "header_file=$header_file"
+  echo "compat_header_file=$compat_header_file"
   echo "backend_runtime_file=$backend_runtime_file"
   echo "runtime_obj=$runtime_obj"
   echo "raw_runtime_obj=$raw_runtime_obj"

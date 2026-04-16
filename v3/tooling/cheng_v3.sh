@@ -3,6 +3,7 @@ set -eu
 
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 bridge_env="$root/artifacts/v3_bootstrap/bootstrap.env"
+backend_driver_bin="$root/artifacts/v3_backend_driver/cheng"
 
 v3_usage() {
   cat <<EOF
@@ -14,6 +15,7 @@ usage:
   cheng_v3.sh bootstrap-bridge
   cheng_v3.sh build-backend-driver
   cheng_v3.sh host-bridge-audit
+  cheng_v3.sh run-shared-emit-smokes
   cheng_v3.sh status
   cheng_v3.sh slice-gate
   cheng_v3.sh run-smokes
@@ -83,8 +85,50 @@ usage:
 EOF
 }
 
-v3_ensure_bridge() {
+v3_try_bootstrap_bridge_quiet() {
+  if [ -x "$backend_driver_bin" ] &&
+     "$backend_driver_bin" bootstrap-bridge >/dev/null 2>&1; then
+    return 0
+  fi
+  if [ -f "$bridge_env" ]; then
+    . "$bridge_env"
+    if [ -x "${V3_BOOTSTRAP_STAGE3:-}" ] &&
+       "$V3_BOOTSTRAP_STAGE3" bootstrap-bridge >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
   sh "$root/v3/tooling/bootstrap_bridge_v3.sh" >/dev/null
+}
+
+v3_try_build_backend_driver_quiet() {
+  if [ -x "$backend_driver_bin" ] &&
+     "$backend_driver_bin" build-backend-driver >/dev/null 2>&1; then
+    return 0
+  fi
+  v3_ensure_bridge
+  . "$bridge_env"
+  if [ -x "${V3_BOOTSTRAP_STAGE3:-}" ] &&
+     "$V3_BOOTSTRAP_STAGE3" build-backend-driver >/dev/null 2>&1; then
+    return 0
+  fi
+  sh "$root/v3/tooling/build_backend_driver_v3.sh" >/dev/null
+}
+
+v3_exec_bootstrap_bridge() {
+  if [ -x "$backend_driver_bin" ]; then
+    exec "$backend_driver_bin" bootstrap-bridge "$@"
+  fi
+  if [ -f "$bridge_env" ]; then
+    . "$bridge_env"
+    if [ -x "${V3_BOOTSTRAP_STAGE3:-}" ]; then
+      exec "$V3_BOOTSTRAP_STAGE3" bootstrap-bridge "$@"
+    fi
+  fi
+  exec sh "$root/v3/tooling/bootstrap_bridge_v3.sh" "$@"
+}
+
+v3_ensure_bridge() {
+  v3_try_bootstrap_bridge_quiet
   if [ ! -f "$bridge_env" ]; then
     echo "v3 tooling: missing bootstrap env: $bridge_env" >&2
     exit 1
@@ -94,24 +138,20 @@ v3_ensure_bridge() {
 v3_print_bootstrap() {
   v3_ensure_bridge
   . "$bridge_env"
-  if [ -f "${V3_BOOTSTRAP_SNAPSHOT:-}" ]; then
-    cat "$V3_BOOTSTRAP_SNAPSHOT"
-    exit 0
-  fi
-  "$V3_BOOTSTRAP_STAGE2" print-contract --in:"$V3_BOOTSTRAP_STAGE1_SOURCE"
+  exec "$V3_BOOTSTRAP_STAGE3" print-bootstrap
 }
 
 v3_ensure_backend_driver() {
-  sh "$root/v3/tooling/build_backend_driver_v3.sh" >/dev/null
-  if [ ! -x "$root/artifacts/v3_backend_driver/cheng" ]; then
-    echo "v3 tooling: missing backend driver: $root/artifacts/v3_backend_driver/cheng" >&2
+  v3_try_build_backend_driver_quiet
+  if [ ! -x "$backend_driver_bin" ]; then
+    echo "v3 tooling: missing backend driver: $backend_driver_bin" >&2
     exit 1
   fi
 }
 
 v3_is_backend_driver_cmd() {
   case "$1" in
-    build-backend-driver|host-bridge-audit|status|print-build-plan|emit-csg|migrate-csg|verify-world|world-sync|prove-equivalence|prove-migration|publish-world|fresh-node-selfhost|selfhost-build|system-link-exec)
+    build-backend-driver|host-bridge-audit|r2c-react-v3-fresh-clean-gate|run-shared-emit-smokes|status|print-build-plan|emit-csg|migrate-csg|verify-world|world-sync|prove-equivalence|prove-migration|publish-world|fresh-node-selfhost|selfhost-build|system-link-exec)
       return 0
       ;;
     *)
@@ -158,7 +198,7 @@ v3_stage3_plain() {
 
 v3_backend_driver_plain() {
   v3_ensure_backend_driver
-  exec "$root/artifacts/v3_backend_driver/cheng" "$@"
+  exec "$backend_driver_bin" "$@"
 }
 
 cmd="${1:-help}"
@@ -178,13 +218,10 @@ case "$cmd" in
     v3_stage3_plain compare-bench "$@"
     ;;
   bootstrap-bridge)
-    exec sh "$root/v3/tooling/bootstrap_bridge_v3.sh" "$@"
+    v3_exec_bootstrap_bridge "$@"
     ;;
   r2c-react-v3)
     exec "$root/v3/experimental/r2c-react-v3/r2c-react-v3" "$@"
-    ;;
-  r2c-react-v3-fresh-clean-gate)
-    exec sh "$root/v3/tooling/r2c_react_v3_fresh_clean_gate.sh" "$@"
     ;;
   print-bootstrap)
     v3_print_bootstrap

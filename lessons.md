@@ -1,4 +1,10 @@
 2026-04-16
+- `shared emit` 这类“请求面刚打通”的能力，下一步别只靠手工命令。最稳口径是马上补一条 mainless fixture smoke，既卡 report 字段，也卡磁盘产物真类型。
+- [cheng_v3.sh](/Users/lbcheng/cheng-lang/v3/tooling/cheng_v3.sh) 往零脚本入口收时，先把 live `backend_driver/stage3` 放到优先级最前，shell 只留 cold-start fallback。这样用户面主路径已经是 Cheng，不会再被薄壳分叉带偏。
+- 真 Linux `x86_64` 如果目标只是验 `exe/native link`，先直接上远端 fresh `cheng.stage3 system-link-exec --target:x86_64-unknown-linux-gnu`。远端 ordinary backend driver 自举还没完全绿时，不要把两条账混成一个 blocker。
+- `peer_id` 这类协议层如果目标只是去掉 bridge，别先硬拖 [multibase.cheng](/Users/lbcheng/cheng-lang/src/std/multiformats/multibase.cheng) 进 ordinary 主线。先用最小 smoke 真编；如果 seed 还吃不下它的 composite/常量形状，就像这轮这样把实际只需要的 `base58btc` 算法本地化成 seed 可发射的纯 Cheng 版本。
+- runtime ABI 权威不要再写成单文件。最稳口径已经坐实：专项 gate 先按 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) + 最小 native bridge 源组成的组合合同验真，再顺手核对兼容头 [system_helpers.h](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.h)。
+- [cheng_tooling.cheng](/Users/lbcheng/cheng-lang/src/tooling/cheng_tooling.cheng) 里的 runtime freshness/source list 只放 live 入口。像这轮这样保留 `system_helpers_selflink_shim.c + system_helpers_io_time_bridge.c + system_helpers_host_process_ffi_bridge.c`，不要把 `system_helpers_selflink_min_runtime.c` 这种后备兼容入口继续混进 active proof。
 - `native_gui_host_ready/native_gui_renderer_ready` 这类 readiness 不能在 [r2c-react-v3-native-gui-bundle.mjs](/Users/lbcheng/cheng-lang/v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-bundle.mjs) 里继续硬写 `false`。只要前面已经拿到了 `first_batch host ABI + session preview + layout/style/layout plan + render plan + compiled runtime`，就必须按真产物现算，不然 report 会自己打自己脸。
 - `r2c-react-v3` 继续收 Node helper 面时，别假删还在 live 的 helper。最稳口径是先在 [r2c_react_v3_controller_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/r2c_react_v3_controller_main.cheng) 把 `active_node_helpers/retired_node_helpers` 写成正式合同，再让 gate 对着这份合同硬卡。
 - fresh-clean gate 如果要验 bundle runtime mode，别再去 grep controller report。像这轮这样，`runtime_mode` 在 `native_gui_bundle_v1.json`，不在 `native_gui_bundle_report_v1.json`；gate 必须直接验产物本体。
@@ -6,6 +12,7 @@
 - `--emit` 这种正式协议不能 seed 说支持 `exe/shared/obj`，ordinary 却只认 `exe`。这类分叉会把 stage3、backend_driver 和 gate 打成假一致；修法必须落在公共请求层，而不是继续绕 gate 或改脚本。
 - Linux object 验收别只信默认 smoke。仓里 [run-linux-object-smokes](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 当前只覆盖 `aarch64-unknown-linux-gnu`；要确认 `x86_64-unknown-linux-gnu` 主线也真通，必须再单独跑 `build-chain-node-linux` 和 `build-rwad-bft-linux` 的 `x86_64` object 产物。
 - Android JNI 这类纯文本 mobile CAPI 返回，优先直接走 `ChengStr -> cheng_str_to_cstring_temp_bridge` 主链。像 UniMaker 这轮 `bioDidCreate/import`，JNI 先绕 `buffer handle` 再转字符串，真机排障很脏；直接调 `v3MobileCapiBioDidCreateWire/ImportWire` 配 `bioDidResultOrError(...)`，链路更短，空结果时还能直接看到 `bridge_len/store/flags`。
+- UniMaker 这轮 Android 真机 trace 已经坐实：`biometric -> capture -> native.call` 全绿时，`v3MobileCapiBioDidCreateWire` 这种跨 `libchengv3mobile.so -> libchengv3libp2p.so` 的 `ChengStr` 直返仍可能被吃空；双 `.so` 正式口径还是 `WireHandle + cheng_v3_buffer_handle_* bridge`，不要把 direct `ChengStr` 当生产返回 ABI。
 - Android 这条 ordinary mobile CAPI 返回大文本时，别再拿 `strDataPtr(text)` 直接喂 `cheng_v3_buffer_handle_from_raw_bridge`。像这轮 `bioDidCreate/import` 的 provision 文本就是 store-backed `str`，`strDataPtr` 可能给空；最稳口径是先 `strToCStringTemp(text)` 真物化，再按 `len(text)` 拷进 buffer handle。
 - [os_host_process.cheng](/Users/lbcheng/cheng-lang/src/std/os_host_process.cheng) 这类大函数如果既做 process 控制又直接返回复合结果，不要在函数体里新绑复合局部。像这轮 `execFileCapture` 只有它红，而 bridge/API smoke 都绿；最稳收法是拆成 `fill helper + 薄对象返回`。
 - host smoke 一旦怀疑源码和运行结果对不上，先删 [artifacts/v3_hostrun](/Users/lbcheng/cheng-lang/artifacts/v3_hostrun) 里对应的 binary/log/object 再复验。旧 hostrun 产物会把上一次错误继续带出来，特别容易把“已经修掉的红点”误看成没修。
