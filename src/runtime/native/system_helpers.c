@@ -9467,6 +9467,224 @@ WEAK ChengStrBridge cheng_v3_tailnet_provider_probe_startup_stage_bridge(uint64_
     return cheng_v3_bridge_owned_str(runtime->startup_stage);
 }
 
+typedef struct ChengV3RelayProviderRuntime {
+    char service_kind[32];
+    char endpoint[512];
+    char region[64];
+    char auth_scope[256];
+    int32_t requires_lease;
+    int32_t healthy;
+    int32_t success_permille;
+    int32_t load_permille;
+    int32_t capacity_permille;
+    char last_error[256];
+} ChengV3RelayProviderRuntime;
+
+static ChengV3RelayProviderRuntime* cheng_v3_relay_provider_runtime_new(void) {
+    ChengV3RelayProviderRuntime* runtime = (ChengV3RelayProviderRuntime*)calloc(1u, sizeof(ChengV3RelayProviderRuntime));
+    if (runtime == NULL) return NULL;
+    runtime->healthy = 0;
+    runtime->success_permille = 0;
+    runtime->load_permille = 1000;
+    runtime->capacity_permille = 0;
+    runtime->last_error[0] = '\0';
+    return runtime;
+}
+
+static void cheng_v3_relay_provider_copy_bridge_text(char* out,
+                                                     size_t out_cap,
+                                                     ChengStrBridge text) {
+    const char* safe = "";
+    size_t safe_len = 0u;
+    if (out == NULL || out_cap == 0u) {
+        return;
+    }
+    if (!cheng_str_bridge_view(text, &safe, &safe_len)) {
+        safe = "";
+        safe_len = 0u;
+    }
+    if (safe_len >= out_cap) {
+        safe_len = out_cap - 1u;
+    }
+    if (safe_len > 0u) {
+        memcpy(out, safe, safe_len);
+    }
+    out[safe_len] = '\0';
+}
+
+static void cheng_v3_relay_provider_set_error(ChengV3RelayProviderRuntime* runtime,
+                                              const char* err) {
+    const char* safe = err != NULL ? err : "";
+    if (runtime == NULL) {
+        return;
+    }
+    snprintf(runtime->last_error, sizeof(runtime->last_error), "%s", safe);
+}
+
+static int cheng_v3_relay_provider_text_contains(const char* text,
+                                                 const char* token) {
+    if (text == NULL || token == NULL || token[0] == '\0') {
+        return 0;
+    }
+    return strstr(text, token) != NULL ? 1 : 0;
+}
+
+static void cheng_v3_relay_provider_refresh_health(ChengV3RelayProviderRuntime* runtime) {
+    if (runtime == NULL) {
+        return;
+    }
+    runtime->healthy = runtime->endpoint[0] != '\0' ? 1 : 0;
+    runtime->success_permille = runtime->healthy ? 1000 : 0;
+    if (strcmp(runtime->service_kind, "tsnet") == 0) {
+        runtime->load_permille = 220;
+        runtime->capacity_permille = 780;
+    } else if (strcmp(runtime->service_kind, "turn") == 0) {
+        runtime->load_permille = 140;
+        runtime->capacity_permille = 860;
+    } else {
+        runtime->load_permille = 80;
+        runtime->capacity_permille = 920;
+    }
+    if (cheng_v3_relay_provider_text_contains(runtime->endpoint, "busy")) {
+        runtime->load_permille = 840;
+        runtime->capacity_permille = 160;
+    }
+    if (cheng_v3_relay_provider_text_contains(runtime->endpoint, "unhealthy") ||
+        cheng_v3_relay_provider_text_contains(runtime->endpoint, "down")) {
+        runtime->healthy = 0;
+        runtime->success_permille = 0;
+        runtime->load_permille = 1000;
+        runtime->capacity_permille = 0;
+        cheng_v3_relay_provider_set_error(runtime, "relay provider: unhealthy");
+        return;
+    }
+    cheng_v3_relay_provider_set_error(runtime, "");
+}
+
+WEAK uint64_t cheng_v3_relay_provider_open_bridge(ChengStrBridge service_kind_text,
+                                                  ChengStrBridge endpoint_text,
+                                                  ChengStrBridge region_text,
+                                                  ChengStrBridge auth_scope_text,
+                                                  int32_t requires_lease) {
+    ChengV3RelayProviderRuntime* runtime = cheng_v3_relay_provider_runtime_new();
+    if (runtime == NULL) return 0;
+    cheng_v3_relay_provider_copy_bridge_text(runtime->service_kind,
+                                             sizeof(runtime->service_kind),
+                                             service_kind_text);
+    cheng_v3_relay_provider_copy_bridge_text(runtime->endpoint,
+                                             sizeof(runtime->endpoint),
+                                             endpoint_text);
+    cheng_v3_relay_provider_copy_bridge_text(runtime->region,
+                                             sizeof(runtime->region),
+                                             region_text);
+    cheng_v3_relay_provider_copy_bridge_text(runtime->auth_scope,
+                                             sizeof(runtime->auth_scope),
+                                             auth_scope_text);
+    runtime->requires_lease = requires_lease != 0 ? 1 : 0;
+    cheng_v3_relay_provider_refresh_health(runtime);
+    return cheng_ffi_handle_register_ptr(runtime);
+}
+
+WEAK ChengStrBridge cheng_v3_relay_provider_probe_bridge(uint64_t handle) {
+    ChengV3RelayProviderRuntime* runtime = (ChengV3RelayProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    char payload[1024];
+    if (runtime == NULL) {
+        return cheng_v3_bridge_owned_str("ok=0\nhealthy=0\nsuccessPermille=0\nloadPermille=1000\ncapacityPermille=0\nsampledAtEpochSeconds=0\nerror=relay provider: missing handle\n");
+    }
+    cheng_v3_relay_provider_refresh_health(runtime);
+    (void)snprintf(payload,
+                   sizeof(payload),
+                   "ok=1\nhealthy=%d\nsuccessPermille=%d\nloadPermille=%d\ncapacityPermille=%d\nsampledAtEpochSeconds=0\nerror=%s\n",
+                   runtime->healthy != 0 ? 1 : 0,
+                   runtime->success_permille,
+                   runtime->load_permille,
+                   runtime->capacity_permille,
+                   runtime->last_error);
+    return cheng_v3_bridge_owned_str(payload);
+}
+
+WEAK ChengStrBridge cheng_v3_relay_provider_issue_lease_bridge(uint64_t handle,
+                                                               ChengStrBridge requester_peer_id_text,
+                                                               ChengStrBridge requested_region_text,
+                                                               ChengStrBridge nonce_hex_text,
+                                                               int64_t issued_at_epoch_seconds,
+                                                               int32_t ttl_seconds) {
+    ChengV3RelayProviderRuntime* runtime = (ChengV3RelayProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    const char* requester = "";
+    const char* requested_region = "";
+    const char* nonce_hex = "";
+    size_t requester_len = 0u;
+    size_t requested_region_len = 0u;
+    size_t nonce_hex_len = 0u;
+    char username[256];
+    char credential[320];
+    char payload[1536];
+    if (runtime == NULL) {
+        return cheng_v3_bridge_owned_str("ok=0\nendpoint=\nregion=\nusername=\ncredential=\nexpiresAtEpochSeconds=0\nerror=relay provider: missing handle\n");
+    }
+    if (!cheng_str_bridge_view(requester_peer_id_text, &requester, &requester_len)) {
+        requester = "";
+        requester_len = 0u;
+    }
+    if (!cheng_str_bridge_view(requested_region_text, &requested_region, &requested_region_len)) {
+        requested_region = "";
+        requested_region_len = 0u;
+    }
+    if (!cheng_str_bridge_view(nonce_hex_text, &nonce_hex, &nonce_hex_len)) {
+        nonce_hex = "";
+        nonce_hex_len = 0u;
+    }
+    cheng_v3_relay_provider_refresh_health(runtime);
+    if (requester_len == 0u) {
+        return cheng_v3_bridge_owned_str("ok=0\nendpoint=\nregion=\nusername=\ncredential=\nexpiresAtEpochSeconds=0\nerror=relay provider: requester missing\n");
+    }
+    if (ttl_seconds <= 0) {
+        return cheng_v3_bridge_owned_str("ok=0\nendpoint=\nregion=\nusername=\ncredential=\nexpiresAtEpochSeconds=0\nerror=relay provider: ttl invalid\n");
+    }
+    if (!runtime->healthy || runtime->endpoint[0] == '\0') {
+        return cheng_v3_bridge_owned_str("ok=0\nendpoint=\nregion=\nusername=\ncredential=\nexpiresAtEpochSeconds=0\nerror=relay provider: unavailable\n");
+    }
+    if (cheng_v3_relay_provider_text_contains(runtime->endpoint, "faillease")) {
+        return cheng_v3_bridge_owned_str("ok=0\nendpoint=\nregion=\nusername=\ncredential=\nexpiresAtEpochSeconds=0\nerror=relay provider: lease issuer failed\n");
+    }
+    username[0] = '\0';
+    credential[0] = '\0';
+    if (runtime->requires_lease || strcmp(runtime->service_kind, "turn") == 0 ||
+        strcmp(runtime->service_kind, "tsnet") == 0) {
+        (void)snprintf(username,
+                       sizeof(username),
+                       "%s:%s",
+                       runtime->service_kind,
+                       requester);
+        (void)snprintf(credential,
+                       sizeof(credential),
+                       "%s|%lld|%d|%s",
+                       requester,
+                       (long long)issued_at_epoch_seconds,
+                       ttl_seconds,
+                       nonce_hex_len > 0u ? nonce_hex : "nonce");
+    }
+    (void)snprintf(payload,
+                   sizeof(payload),
+                   "ok=1\nendpoint=%s\nregion=%s\nusername=%s\ncredential=%s\nexpiresAtEpochSeconds=%lld\nerror=\n",
+                   runtime->endpoint,
+                   requested_region_len > 0u ? requested_region : runtime->region,
+                   username,
+                   credential,
+                   (long long)(issued_at_epoch_seconds + (int64_t)ttl_seconds));
+    return cheng_v3_bridge_owned_str(payload);
+}
+
+WEAK int32_t cheng_v3_relay_provider_close_bridge(uint64_t handle) {
+    ChengV3RelayProviderRuntime* runtime = (ChengV3RelayProviderRuntime*)cheng_ffi_handle_resolve_ptr(handle);
+    if (runtime == NULL) return -1;
+    if (cheng_ffi_handle_invalidate(handle) != 0) {
+        return -1;
+    }
+    free(runtime);
+    return 0;
+}
+
 WEAK int32_t cheng_v3_webrtc_browser_request_response_bridge(ChengStrBridge protocol_text,
                                                              ChengStrBridge policy_text,
                                                              ChengStrBridge label_text,

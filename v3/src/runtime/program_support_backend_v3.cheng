@@ -280,6 +280,14 @@ type
         proxyReady: bool
         listenerNeedsRepair: bool
         derpHealthy: bool
+    ChengV3RelayProviderRuntime =
+        serviceKind: ptr
+        endpoint: ptr
+        region: ptr
+        authScope: ptr
+        requiresLease: int32
+        healthy: int32
+        lastError: ptr
     ChengFixedBytes32 =
         data: uint8[32]
     ChengV3WebrtcBrowserSessionState =
@@ -298,6 +306,7 @@ type
     ChengMemHeaderPtr = ChengMemHeader *
     ChengFfiHandleSlotPtr = ChengFfiHandleSlot *
     ChengV3TailnetProviderRuntimePtr = ChengV3TailnetProviderRuntime *
+    ChengV3RelayProviderRuntimePtr = ChengV3RelayProviderRuntime *
     ChengV3WebrtcBrowserSessionStatePtr = ChengV3WebrtcBrowserSessionState *
     StrPtr = str *
 
@@ -1123,13 +1132,8 @@ fn cheng_pty_wait_bridge(pid: int64): int32 =
     cheng_pty_wait_last_exit_code_runtime = -1
     if pid <= 0:
         return -1
-    let statusMem: ptr = cheng_malloc_export(int32(sizeof int32))
-    if statusMem == nil:
-        return -1
-    *(Int32Ptr(statusMem)) = 0
-    let rc: int32 = libc_waitpid_runtime(int32(pid), statusMem, chengHostWnohang)
-    let status: int32 = *(Int32Ptr(statusMem))
-    cheng_free_export(statusMem)
+    var status: int32 = 0
+    let rc: int32 = libc_waitpid_runtime(int32(pid), ptr(&status), chengHostWnohang)
     if rc == 0:
         return 0
     if rc < 0:
@@ -2816,6 +2820,95 @@ fn cheng_tailnet_provider_sync_derp(runtime: ChengV3TailnetProviderRuntimePtr): 
     cheng_str_dispose(loadErr)
     cheng_tailnet_provider_set_error_cstring(runtime, "")
     return true
+
+fn cheng_relay_provider_runtime_new(): ChengV3RelayProviderRuntimePtr =
+    let mem = cheng_malloc_export(int32(sizeof ChengV3RelayProviderRuntime))
+    if mem == nil:
+        return nil
+    let runtime = ChengV3RelayProviderRuntimePtr(mem)
+    runtime->serviceKind = nil
+    runtime->endpoint = nil
+    runtime->region = nil
+    runtime->authScope = nil
+    runtime->requiresLease = 0
+    runtime->healthy = 0
+    runtime->lastError = nil
+    return runtime
+
+fn cheng_relay_provider_runtime_dispose(runtime: ChengV3RelayProviderRuntimePtr) =
+    if runtime == nil:
+        return
+    cheng_free_export(runtime->serviceKind)
+    cheng_free_export(runtime->endpoint)
+    cheng_free_export(runtime->region)
+    cheng_free_export(runtime->authScope)
+    cheng_free_export(runtime->lastError)
+    cheng_free_export(ptr(runtime))
+
+fn cheng_relay_provider_set_error_cstring(runtime: ChengV3RelayProviderRuntimePtr, text: ptr) =
+    if runtime == nil:
+        return
+    cheng_free_export(runtime->lastError)
+    runtime->lastError = cheng_string_copy(text, cheng_cstrlen_raw(text))
+
+fn cheng_relay_provider_set_error(runtime: ChengV3RelayProviderRuntimePtr, text: str) =
+    if runtime == nil:
+        return
+    cheng_free_export(runtime->lastError)
+    runtime->lastError = cheng_copy_cstring_from_str(text)
+
+fn cheng_relay_provider_probe_payload(runtime: ChengV3RelayProviderRuntimePtr): str =
+    if runtime == nil:
+        return cheng_str_empty()
+    let healthyText = runtime->healthy != 0 ? "1" : "0"
+    var errorText = cheng_str_copy_cstring(runtime->lastError)
+    let out = "ok=1\n" +
+              "healthy=" + healthyText + "\n" +
+              "successPermille=1000\n" +
+              "loadPermille=0\n" +
+              "capacityPermille=1000\n" +
+              "error=" + errorText + "\n"
+    cheng_str_dispose(errorText)
+    return out
+
+fn cheng_relay_provider_issue_lease_payload(runtime: ChengV3RelayProviderRuntimePtr,
+                                            requesterPeerIdText: str,
+                                            requestedRegionText: str,
+                                            nonceHex: str): str =
+    if runtime == nil:
+        return cheng_str_empty()
+    if runtime->healthy == 0:
+        var errorText = cheng_str_copy_cstring(runtime->lastError)
+        let out = "ok=0\nerror=" + errorText + "\n"
+        cheng_str_dispose(errorText)
+        return out
+    if runtime->requiresLease != 0 && cheng_str_len(requesterPeerIdText) <= 0:
+        return "ok=0\nerror=relay provider: requester missing\n"
+    var endpointText = cheng_str_copy_cstring(runtime->endpoint)
+    var regionText = cheng_str_copy_cstring(runtime->region)
+    if cheng_str_len(requestedRegionText) > 0:
+        cheng_str_dispose(regionText)
+        regionText = cheng_str_dup(requestedRegionText)
+    var usernameText = cheng_str_empty()
+    var credentialText = cheng_str_empty()
+    if runtime->requiresLease != 0:
+        var serviceText = cheng_str_copy_cstring(runtime->serviceKind)
+        var scopeText = cheng_str_copy_cstring(runtime->authScope)
+        usernameText = serviceText + ":" + requesterPeerIdText + ":" + nonceHex
+        credentialText = "scope=" + scopeText + "|peer=" + requesterPeerIdText + "|nonce=" + nonceHex
+        cheng_str_dispose(serviceText)
+        cheng_str_dispose(scopeText)
+    let out = "ok=1\n" +
+              "region=" + regionText + "\n" +
+              "endpoint=" + endpointText + "\n" +
+              "username=" + usernameText + "\n" +
+              "credential=" + credentialText + "\n" +
+              "error=\n"
+    cheng_str_dispose(endpointText)
+    cheng_str_dispose(regionText)
+    cheng_str_dispose(usernameText)
+    cheng_str_dispose(credentialText)
+    return out
 
 fn cheng_errno_code(): int32 =
     return native_cheng_v3_errno_code_runtime()
@@ -5148,6 +5241,146 @@ fn cheng_v3_tailnet_provider_probe_last_error_bridge_export(handle: uint64): str
         return cheng_str_empty()
     let runtime = ChengV3TailnetProviderRuntimePtr(runtimeRaw)
     return cheng_str_copy_cstring(runtime->lastError)
+
+@exportc("cheng_v3_relay_provider_open_bridge")
+fn cheng_v3_relay_provider_open_bridge_export(serviceKindText: str,
+                                              endpointText: str,
+                                              regionText: str,
+                                              authScopeText: str,
+                                              requiresLease: int32): uint64 =
+    if cheng_str_len(serviceKindText) <= 0 || cheng_str_len(endpointText) <= 0:
+        return uint64(0)
+    if cheng_str_equals_cstring(serviceKindText, "none"):
+        return uint64(0)
+    let runtime = cheng_relay_provider_runtime_new()
+    if runtime == nil:
+        return uint64(0)
+    runtime->serviceKind = cheng_copy_cstring_from_str(serviceKindText)
+    runtime->endpoint = cheng_copy_cstring_from_str(endpointText)
+    runtime->region = cheng_copy_cstring_from_str(regionText)
+    runtime->authScope = cheng_copy_cstring_from_str(authScopeText)
+    runtime->requiresLease = requiresLease != 0 ? 1 : 0
+    runtime->healthy = 1
+    cheng_relay_provider_set_error_cstring(runtime, "")
+    let handle = cheng_ffi_handle_register_ptr_export(ptr(runtime))
+    if handle == uint64(0):
+        cheng_relay_provider_runtime_dispose(runtime)
+        return uint64(0)
+    return handle
+
+@exportc("cheng_v3_relay_provider_probe_bridge")
+fn cheng_v3_relay_provider_probe_bridge_export(handle: uint64): str =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return cheng_str_empty()
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    return cheng_relay_provider_probe_payload(runtime)
+
+@exportc("cheng_v3_relay_provider_probe_handle_bridge")
+fn cheng_v3_relay_provider_probe_handle_bridge_export(handle: uint64): uint64 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return uint64(0)
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    var payload = cheng_relay_provider_probe_payload(runtime)
+    let out = cheng_buffer_handle_new_from_str(payload)
+    cheng_str_dispose(payload)
+    return out
+
+@exportc("cheng_v3_relay_provider_probe_healthy_bridge")
+fn cheng_v3_relay_provider_probe_healthy_bridge_export(handle: uint64): int32 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return 0
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    return runtime->healthy
+
+@exportc("cheng_v3_relay_provider_probe_success_permille_bridge")
+fn cheng_v3_relay_provider_probe_success_permille_bridge_export(handle: uint64): int32 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return 0
+    return 1000
+
+@exportc("cheng_v3_relay_provider_probe_load_permille_bridge")
+fn cheng_v3_relay_provider_probe_load_permille_bridge_export(handle: uint64): int32 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return 1000
+    return 0
+
+@exportc("cheng_v3_relay_provider_probe_capacity_permille_bridge")
+fn cheng_v3_relay_provider_probe_capacity_permille_bridge_export(handle: uint64): int32 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return 0
+    return 1000
+
+@exportc("cheng_v3_relay_provider_issue_lease_bridge")
+fn cheng_v3_relay_provider_issue_lease_bridge_export(handle: uint64,
+                                                     requesterPeerIdText: str,
+                                                     requestedRegionText: str,
+                                                     nonceHex: str,
+                                                     issuedAtEpochSeconds: int64,
+                                                     ttlSeconds: int32): str =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return cheng_str_empty()
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    if issuedAtEpochSeconds < 0 || ttlSeconds <= 0:
+        cheng_relay_provider_set_error_cstring(runtime, "relay provider: lease ttl invalid")
+        runtime->healthy = 0
+        return cheng_relay_provider_issue_lease_payload(runtime,
+                                                        requesterPeerIdText,
+                                                        requestedRegionText,
+                                                        nonceHex)
+    runtime->healthy = 1
+    cheng_relay_provider_set_error_cstring(runtime, "")
+    return cheng_relay_provider_issue_lease_payload(runtime,
+                                                    requesterPeerIdText,
+                                                    requestedRegionText,
+                                                    nonceHex)
+
+@exportc("cheng_v3_relay_provider_issue_lease_handle_bridge")
+fn cheng_v3_relay_provider_issue_lease_handle_bridge_export(handle: uint64,
+                                                            requesterPeerIdText: str,
+                                                            requestedRegionText: str,
+                                                            nonceHex: str,
+                                                            issuedAtEpochSeconds: int64,
+                                                            ttlSeconds: int32): uint64 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return uint64(0)
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    var payload = cheng_str_empty()
+    if issuedAtEpochSeconds < 0 || ttlSeconds <= 0:
+        cheng_relay_provider_set_error_cstring(runtime, "relay provider: lease ttl invalid")
+        runtime->healthy = 0
+        payload = cheng_relay_provider_issue_lease_payload(runtime,
+                                                           requesterPeerIdText,
+                                                           requestedRegionText,
+                                                           nonceHex)
+    else:
+        runtime->healthy = 1
+        cheng_relay_provider_set_error_cstring(runtime, "")
+        payload = cheng_relay_provider_issue_lease_payload(runtime,
+                                                           requesterPeerIdText,
+                                                           requestedRegionText,
+                                                           nonceHex)
+    let out = cheng_buffer_handle_new_from_str(payload)
+    cheng_str_dispose(payload)
+    return out
+
+@exportc("cheng_v3_relay_provider_close_bridge")
+fn cheng_v3_relay_provider_close_bridge_export(handle: uint64): int32 =
+    let runtimeRaw = cheng_ffi_handle_resolve_ptr_export(handle)
+    if runtimeRaw == nil:
+        return -1
+    let runtime = ChengV3RelayProviderRuntimePtr(runtimeRaw)
+    if cheng_ffi_handle_invalidate_export(handle) != 0:
+        return -1
+    cheng_relay_provider_runtime_dispose(runtime)
+    return 0
 
 @exportc("cheng_v3_webrtc_last_error_handle_bridge")
 fn cheng_v3_webrtc_last_error_handle_bridge_export(): uint64 =

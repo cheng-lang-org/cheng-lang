@@ -1,5 +1,6 @@
 import std/rawbytes
 import std/result
+import std/times
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/std/crypto/hash256
 import cheng/v3/libp2p/core/multistream
@@ -88,6 +89,27 @@ fn v3Libp2pWebrtcTransportConfigZero(): V3Libp2pWebrtcTransportConfig =
     out.turnServers = []
     out.dataChannelLabel = "cheng-libp2p"
     return out
+
+fn v3Libp2pWebrtcTransportConfigApplyRelayLease(cfg: var V3Libp2pWebrtcTransportConfig,
+                                                lease: types.V3Libp2pRelayLease): Result[bool] =
+    if !types.v3Libp2pRelayLeaseActiveAt(lease, times.epochTimeSeconds()):
+        return Err[bool]("v3 libp2p webrtc: relay lease inactive")
+    if lease.serviceKind == types.v3Libp2pRelayServiceStun:
+        if len(lease.endpointText) <= 0:
+            return Err[bool]("v3 libp2p webrtc: stun endpoint missing")
+        add(cfg.stunUrls, lease.endpointText)
+        return Ok[bool](true)
+    if lease.serviceKind == types.v3Libp2pRelayServiceTurn:
+        if len(lease.endpointText) <= 0:
+            return Err[bool]("v3 libp2p webrtc: turn endpoint missing")
+        var server = signal.v3Libp2pWebrtcTurnServerZero()
+        server.url = lease.endpointText
+        server.username = lease.username
+        server.credential = lease.credential
+        add(cfg.turnServers, server)
+        cfg.relayOnly = true
+        return Ok[bool](true)
+    return Err[bool]("v3 libp2p webrtc: unsupported relay lease service")
 
 fn v3Libp2pWebrtcLoopbackPairZero(): V3Libp2pWebrtcLoopbackPair =
     var out: V3Libp2pWebrtcLoopbackPair

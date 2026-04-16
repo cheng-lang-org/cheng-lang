@@ -21,6 +21,24 @@ bootstrap_contracts="$root/v3/src/tooling/bootstrap_contracts.cheng"
 cc_bin="${CC:-cc}"
 target_triple="$(uname -m)-$(uname -s | tr '[:upper:]' '[:lower:]')"
 
+v3_host_target() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "$(uname -m)-apple-darwin"
+      ;;
+    Linux)
+      printf '%s\n' "$(uname -m)-unknown-linux-gnu"
+      ;;
+    *)
+      printf '%s\n' "arm64-apple-darwin"
+      ;;
+  esac
+}
+
+if [ "${CHENG_V3_TARGET:-}" = "" ]; then
+  export CHENG_V3_TARGET="$(v3_host_target)"
+fi
+
 mkdir -p "$out_dir"
 
 v3_bin_fresh() {

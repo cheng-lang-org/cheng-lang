@@ -1,0 +1,152 @@
+import std/result
+import std/rawbytes
+
+fn base58FlickrChar(digit: int32): int32 =
+    if digit < 9:
+        return int32('1') + digit
+    if digit < 20:
+        return int32('a') + (digit - 9)
+    if digit < 34:
+        return int32('m') + (digit - 20)
+    if digit < 42:
+        return int32('A') + (digit - 34)
+    if digit < 47:
+        return int32('J') + (digit - 42)
+    return int32('P') + (digit - 47)
+
+fn base58Char(digit: int32): int32 =
+    if digit < 9:
+        return int32('1') + digit
+    if digit < 17:
+        return int32('A') + (digit - 9)
+    if digit < 22:
+        return int32('J') + (digit - 17)
+    if digit < 33:
+        return int32('P') + (digit - 22)
+    if digit < 44:
+        return int32('a') + (digit - 33)
+    return int32('m') + (digit - 44)
+
+fn base58FlickrValue(c: char): int32 =
+    let code = int32(c)
+    if code >= int32('1') && code <= int32('9'):
+        return code - int32('1')
+    if code >= int32('a') && code <= int32('k'):
+        return 9 + (code - int32('a'))
+    if code >= int32('m') && code <= int32('z'):
+        return 20 + (code - int32('m'))
+    if code >= int32('A') && code <= int32('H'):
+        return 34 + (code - int32('A'))
+    if code >= int32('J') && code <= int32('N'):
+        return 42 + (code - int32('J'))
+    if code >= int32('P') && code <= int32('Z'):
+        return 47 + (code - int32('P'))
+    return -1
+
+fn base58Value(c: char): int32 =
+    let code = int32(c)
+    if code >= int32('1') && code <= int32('9'):
+        return code - int32('1')
+    if code >= int32('A') && code <= int32('H'):
+        return 9 + (code - int32('A'))
+    if code >= int32('J') && code <= int32('N'):
+        return 17 + (code - int32('J'))
+    if code >= int32('P') && code <= int32('Z'):
+        return 22 + (code - int32('P'))
+    if code >= int32('a') && code <= int32('k'):
+        return 33 + (code - int32('a'))
+    if code >= int32('m') && code <= int32('z'):
+        return 44 + (code - int32('m'))
+    return -1
+
+fn encodeBase58Inner(data: Bytes, useFlickr: bool): str =
+    if bytesLen(data) <= 0:
+        return ""
+    var zeros = 0
+    while zeros < bytesLen(data) && bytesGet(data, zeros) == 0:
+        zeros = zeros + 1
+    let size = (bytesLen(data) * 138) / 100 + 1
+    let digits = bytesAlloc(size)
+    var i = 0
+    while i < bytesLen(data):
+        var carry = bytesGet(data, i)
+        var j = size - 1
+        while j >= 0:
+            let value = bytesGet(digits, j)
+            carry = carry + value * 256
+            bytesSet(digits, j, carry % 58)
+            carry = carry / 58
+            j = j - 1
+        i = i + 1
+    var start = 0
+    while start < size && bytesGet(digits, start) == 0:
+        start = start + 1
+    let outLen = zeros + (size - start)
+    if outLen <= 0:
+        return ""
+    let out = bytesAlloc(outLen)
+    var outIdx = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, int32('1'))
+        outIdx = outIdx + 1
+    var k = start
+    while k < size:
+        if useFlickr:
+            bytesSet(out, outIdx, base58FlickrChar(bytesGet(digits, k)))
+        else:
+            bytesSet(out, outIdx, base58Char(bytesGet(digits, k)))
+        outIdx = outIdx + 1
+        k = k + 1
+    return bytesToString(out)
+
+fn decodeBase58Inner(text: str, label: str, useFlickr: bool): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    var zeros = 0
+    while zeros < len(text) && text[zeros] == '1':
+        zeros = zeros + 1
+    let size = (len(text) * 733) / 1000 + 1
+    let b256 = bytesAlloc(size)
+    var i = 0
+    while i < len(text):
+        var value = base58Value(text[i])
+        if useFlickr:
+            value = base58FlickrValue(text[i])
+        if value < 0:
+            return Err[Bytes]("multibase: invalid " + label)
+        var carry = value
+        var j = size - 1
+        while j >= 0:
+            let digit = bytesGet(b256, j)
+            carry = carry + digit * 58
+            bytesSet(b256, j, carry % 256)
+            carry = carry / 256
+            j = j - 1
+        i = i + 1
+    var start = 0
+    while start < size && bytesGet(b256, start) == 0:
+        start = start + 1
+    let outLen = zeros + (size - start)
+    let out = bytesAlloc(outLen)
+    var outIdx = 0
+    while outIdx < zeros:
+        bytesSet(out, outIdx, 0)
+        outIdx = outIdx + 1
+    var k = start
+    while k < size:
+        bytesSet(out, outIdx, bytesGet(b256, k))
+        outIdx = outIdx + 1
+        k = k + 1
+    return Ok[Bytes](out)
+
+fn encodeBase58(data: Bytes): str =
+    return encodeBase58Inner(data, false)
+
+fn decodeBase58(text: str): Result[Bytes] =
+    return decodeBase58Inner(text, "base58", false)
+
+fn encodeBase58Flickr(data: Bytes): str =
+    return encodeBase58Inner(data, true)
+
+fn decodeBase58Flickr(text: str): Result[Bytes] =
+    return decodeBase58Inner(text, "base58flickr", true)

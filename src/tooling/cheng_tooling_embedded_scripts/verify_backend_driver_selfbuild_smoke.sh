@@ -10,7 +10,7 @@ Usage:
 
 Env:
   DRIVER_SELFBUILD_SMOKE_TIMEOUT=<seconds>         default: 55
-  DRIVER_SELFBUILD_SMOKE_OUTPUT=<path>             default: artifacts/backend_driver/cheng.selfbuild_smoke
+  DRIVER_SELFBUILD_SMOKE_OUTPUT=<path>             default: artifacts/v3_backend_driver/cheng.selfbuild_smoke
   DRIVER_SELFBUILD_SMOKE_REPORT=<path>             default: artifacts/backend_driver_selfbuild_smoke/selfbuild_smoke_report.tsv
   DRIVER_SELFBUILD_SMOKE_REQUIRE_REBUILD=<0|1>     default: 0
   DRIVER_SELFBUILD_SMOKE_MAX_STAGE0_ATTEMPTS=<N>   default: 1
@@ -333,7 +333,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 build_timeout="${DRIVER_SELFBUILD_SMOKE_TIMEOUT:-55}"
-output_rel="${DRIVER_SELFBUILD_SMOKE_OUTPUT:-artifacts/backend_driver/cheng.selfbuild_smoke}"
+output_rel="${DRIVER_SELFBUILD_SMOKE_OUTPUT:-artifacts/v3_backend_driver/cheng.selfbuild_smoke}"
 report="${DRIVER_SELFBUILD_SMOKE_REPORT:-artifacts/backend_driver_selfbuild_smoke/selfbuild_smoke_report.tsv}"
 require_rebuild="${DRIVER_SELFBUILD_SMOKE_REQUIRE_REBUILD:-0}"
 max_stage0_attempts="${DRIVER_SELFBUILD_SMOKE_MAX_STAGE0_ATTEMPTS:-1}"

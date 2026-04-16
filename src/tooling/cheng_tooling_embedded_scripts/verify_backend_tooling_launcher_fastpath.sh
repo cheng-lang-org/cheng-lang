@@ -7,7 +7,7 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
 tool="${TOOLING_SELF_BIN:-$root/artifacts/tooling_cmd/cheng_tooling}"
-driver="${BACKEND_DRIVER:-$root/artifacts/backend_driver/cheng}"
+driver="${BACKEND_DRIVER:-$("$tool" backend_driver_path)}"
 src="$root/src/tooling/cheng_tooling.cheng"
 artifacts_dir="$root/artifacts"
 final_out_dir="$artifacts_dir/backend_tooling_launcher_fastpath"

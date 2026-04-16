@@ -132,8 +132,11 @@ if [ "$closedloop_gate_ok" != "1" ] || [ "$prod_closure_gate_ok" != "1" ]; then
 fi
 
 driver="${BACKEND_DRIVER:-}"
-if [ "$driver" = "" ] && [ -x "artifacts/backend_driver/cheng" ]; then
-  driver="artifacts/backend_driver/cheng"
+if [ "$driver" = "" ]; then
+  driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
+fi
+if [ "$driver" = "" ] && [ -x "artifacts/v3_backend_driver/cheng" ]; then
+  driver="artifacts/v3_backend_driver/cheng"
 fi
 if [ "$driver" = "" ] && [ -x "./cheng" ]; then
   driver="./cheng"

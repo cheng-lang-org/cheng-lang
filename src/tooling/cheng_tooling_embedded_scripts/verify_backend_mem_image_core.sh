@@ -100,8 +100,7 @@ resolve_driver() {
   for candidate in \
     "${BACKEND_MEM_IMAGE_CORE_DRIVER:-}" \
     "${BACKEND_DRIVER:-}" \
-    "artifacts/backend_driver/cheng" \
-    "artifacts/backend_driver/cheng.fixed3" \
+    "artifacts/v3_backend_driver/cheng" \
     "dist/releases/current/cheng" \
     "$path_from_resolver"; do
     if [ "$candidate" = "" ] || [ ! -x "$candidate" ]; then

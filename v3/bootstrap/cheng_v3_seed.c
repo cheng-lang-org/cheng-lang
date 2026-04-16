@@ -14201,6 +14201,24 @@ static void v3_emit_store_scalar_to_address(char *out,
                                             int32_t offset,
                                             const char *abi_class,
                                             int src_reg);
+static bool v3_x64_external_memory_arg_stack_bytes(const V3LoweringPlanStub *lowering,
+                                                   const V3LoweredFunctionStub *current_function,
+                                                   const V3ImportAlias *aliases,
+                                                   size_t alias_count,
+                                                   const V3AsmCallTarget *target,
+                                                   size_t arg_index,
+                                                   int32_t *stack_bytes_out);
+static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
+                                     const V3LoweringPlanStub *lowering,
+                                     const V3LoweredFunctionStub *current_function,
+                                     const V3ImportAlias *aliases,
+                                     size_t alias_count,
+                                     const V3AsmCallTarget *target,
+                                     bool composite_return,
+                                     int32_t call_arg_base,
+                                     int call_depth,
+                                     char *out,
+                                     size_t cap);
 static const char *v3_param_pass_abi_class(const V3AsmLocalSlot *slot,
                                            const char *value_abi_class);
 static bool v3_emit_local_value_address(char *out,
@@ -15344,6 +15362,294 @@ static bool v3_emit_copy_address_to_address(const V3SystemLinkPlanStub *plan,
         return false;
     }
     v3_emit_call_named_symbol(plan, out, cap, "copyMem");
+    return true;
+}
+
+static bool v3_x64_external_memory_arg_stack_bytes(const V3LoweringPlanStub *lowering,
+                                                   const V3LoweredFunctionStub *current_function,
+                                                   const V3ImportAlias *aliases,
+                                                   size_t alias_count,
+                                                   const V3AsmCallTarget *target,
+                                                   size_t arg_index,
+                                                   int32_t *stack_bytes_out) {
+    char normalized_type[256];
+    V3TypeLayoutStub layout;
+    if (!stack_bytes_out) {
+        return false;
+    }
+    *stack_bytes_out = 0;
+    if (!v3_active_target_is_linux_x86_64() ||
+        target == NULL ||
+        !target->external ||
+        arg_index >= target->param_count ||
+        strcmp(target->param_abi_classes[arg_index], "composite") != 0) {
+        return true;
+    }
+    if (!lowering ||
+        !current_function ||
+        !v3_normalize_type_text(lowering,
+                                current_function->owner_module_path,
+                                aliases,
+                                alias_count,
+                                target->param_types[arg_index],
+                                normalized_type,
+                                sizeof(normalized_type)) ||
+        !v3_compute_type_layout_impl(lowering, normalized_type, &layout, 0U)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] x64 external composite arg layout failed caller=%s callee=%s arg_index=%zu type=%s\n",
+                current_function ? current_function->symbol_text : "<nil>",
+                target ? target->callee_name : "<nil>",
+                arg_index,
+                target ? target->param_types[arg_index] : "<nil>");
+        return false;
+    }
+    if (layout.size <= 0 || layout.align <= 0 || layout.align > 8) {
+        fprintf(stderr,
+                "[cheng_v3_seed] x64 external composite arg invalid layout caller=%s callee=%s arg_index=%zu type=%s size=%d align=%d\n",
+                current_function->symbol_text,
+                target->callee_name,
+                arg_index,
+                normalized_type,
+                layout.size,
+                layout.align);
+        return false;
+    }
+    if (layout.size <= 16) {
+        fprintf(stderr,
+                "[cheng_v3_seed] x64 external small composite arg unsupported caller=%s callee=%s arg_index=%zu type=%s size=%d\n",
+                current_function->symbol_text,
+                target->callee_name,
+                arg_index,
+                normalized_type,
+                layout.size);
+        return false;
+    }
+    *stack_bytes_out = v3_align_up_i32(layout.size, 8);
+    return true;
+}
+
+static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
+                                     const V3LoweringPlanStub *lowering,
+                                     const V3LoweredFunctionStub *current_function,
+                                     const V3ImportAlias *aliases,
+                                     size_t alias_count,
+                                     const V3AsmCallTarget *target,
+                                     bool composite_return,
+                                     int32_t call_arg_base,
+                                     int call_depth,
+                                     char *out,
+                                     size_t cap) {
+    size_t i;
+    if (!target) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64() && target->external) {
+        int call_reg_count = v3_call_arg_reg_count_for_target(plan, composite_return);
+        int gp_arg_index = 0;
+        int32_t raw_stack_bytes = 0;
+        int32_t stack_arg_bytes = 0;
+        int32_t stack_offset = 0;
+        for (i = 0; i < target->param_count; ++i) {
+            int32_t composite_stack_bytes = 0;
+            if (!v3_x64_external_memory_arg_stack_bytes(lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        target,
+                                                        i,
+                                                        &composite_stack_bytes)) {
+                return false;
+            }
+            if (composite_stack_bytes > 0) {
+                raw_stack_bytes += composite_stack_bytes;
+                continue;
+            }
+            if (gp_arg_index < call_reg_count) {
+                gp_arg_index += 1;
+                continue;
+            }
+            raw_stack_bytes += 8;
+            gp_arg_index += 1;
+        }
+        stack_arg_bytes = v3_align_up_i32(raw_stack_bytes, 16);
+        if (stack_arg_bytes > 0) {
+            v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
+        }
+        gp_arg_index = 0;
+        stack_offset = 0;
+        for (i = 0; i < target->param_count; ++i) {
+            const char *arg_abi = v3_call_arg_load_abi(target, i);
+            int32_t composite_stack_bytes = 0;
+            if (!v3_x64_external_memory_arg_stack_bytes(lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        target,
+                                                        i,
+                                                        &composite_stack_bytes)) {
+                return false;
+            }
+            if (composite_stack_bytes > 0) {
+                v3_emit_call_arg_spill_load_adjusted(out,
+                                                     cap,
+                                                     call_arg_base,
+                                                     call_depth,
+                                                     i,
+                                                     9,
+                                                     "ptr",
+                                                     stack_arg_bytes);
+                if (!v3_emit_sp_offset_address(out, cap, 14, stack_offset) ||
+                    !v3_emit_copy_address_to_address(plan,
+                                                     out,
+                                                     cap,
+                                                     14,
+                                                     9,
+                                                     composite_stack_bytes)) {
+                    return false;
+                }
+                stack_offset += composite_stack_bytes;
+                continue;
+            }
+            if (gp_arg_index < call_reg_count) {
+                gp_arg_index += 1;
+                continue;
+            }
+            v3_emit_call_arg_spill_load_adjusted(out,
+                                                 cap,
+                                                 call_arg_base,
+                                                 call_depth,
+                                                 i,
+                                                 9,
+                                                 arg_abi,
+                                                 stack_arg_bytes);
+            if (strcmp(arg_abi, "i32") == 0 || strcmp(arg_abi, "bool") == 0) {
+                v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
+                                v3_x64_dreg_name(9),
+                                stack_offset);
+            } else {
+                v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
+                                v3_x64_qreg_name(9),
+                                stack_offset);
+            }
+            stack_offset += 8;
+            gp_arg_index += 1;
+        }
+        gp_arg_index = 0;
+        for (i = 0; i < target->param_count; ++i) {
+            int32_t composite_stack_bytes = 0;
+            if (!v3_x64_external_memory_arg_stack_bytes(lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        target,
+                                                        i,
+                                                        &composite_stack_bytes)) {
+                return false;
+            }
+            if (composite_stack_bytes > 0) {
+                continue;
+            }
+            if (gp_arg_index >= call_reg_count) {
+                gp_arg_index += 1;
+                continue;
+            }
+            v3_emit_call_arg_spill_load_adjusted(out,
+                                                 cap,
+                                                 call_arg_base,
+                                                 call_depth,
+                                                 i,
+                                                 v3_x64_call_arg_virtual_reg((size_t)gp_arg_index, composite_return),
+                                                 v3_call_arg_load_abi(target, i),
+                                                 stack_arg_bytes);
+            gp_arg_index += 1;
+        }
+        if (composite_return) {
+            v3_emit_call_dest_spill_load(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         14);
+        }
+        v3_emit_call_target_symbol_text(plan, out, cap, target->symbol_name);
+        if (stack_arg_bytes > 0) {
+            v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
+        }
+        return true;
+    }
+    {
+        int call_reg_count = v3_call_arg_reg_count_for_target(plan, composite_return);
+        if ((int)target->param_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(target->param_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
+            } else {
+                v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
+            }
+            for (i = (size_t)call_reg_count; i < target->param_count; ++i) {
+                const char *stack_abi = v3_call_arg_load_abi(target, i);
+                int32_t offset = (int32_t)(i - (size_t)call_reg_count) * 8;
+                v3_emit_call_arg_spill_load_adjusted(out,
+                                                     cap,
+                                                     call_arg_base,
+                                                     call_depth,
+                                                     i,
+                                                     9,
+                                                     stack_abi,
+                                                     v3_active_target_is_linux_x86_64()
+                                                         ? stack_arg_bytes
+                                                         : 0);
+                if (v3_active_target_is_linux_x86_64()) {
+                    if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                        v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
+                                        v3_x64_dreg_name(9),
+                                        offset);
+                    } else {
+                        v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
+                                        v3_x64_qreg_name(9),
+                                        offset);
+                    }
+                } else if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
+                    v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", offset);
+                } else {
+                    v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", offset);
+                }
+            }
+        }
+        for (i = 0; i < target->param_count && (int)i < call_reg_count; ++i) {
+            int dest_reg = v3_active_target_is_linux_x86_64() ?
+                           v3_x64_call_arg_virtual_reg(i, composite_return) :
+                           (int)i;
+            v3_emit_call_arg_spill_load_adjusted(out,
+                                                 cap,
+                                                 call_arg_base,
+                                                 call_depth,
+                                                 i,
+                                                 dest_reg,
+                                                 v3_call_arg_load_abi(target, i),
+                                                 v3_active_target_is_linux_x86_64() &&
+                                                         (int)target->param_count > call_reg_count
+                                                     ? v3_align_up_i32((int32_t)(target->param_count - (size_t)call_reg_count) * 8, 16)
+                                                     : 0);
+        }
+        if (composite_return) {
+            v3_emit_call_dest_spill_load(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         v3_active_target_is_linux_x86_64() ? 14 : 8);
+        }
+        v3_emit_call_target_symbol_text(plan, out, cap, target->symbol_name);
+        if ((int)target->param_count > call_reg_count) {
+            int32_t stack_arg_bytes =
+                v3_align_up_i32((int32_t)(target->param_count - (size_t)call_reg_count) * 8, 16);
+            if (v3_active_target_is_linux_x86_64()) {
+                v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
+            } else {
+                v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
+            }
+        }
+    }
     return true;
 }
 
@@ -19258,69 +19564,18 @@ static bool v3_codegen_call_scalar(const V3SystemLinkPlanStub *plan,
         }
     }
     {
-        int call_reg_count = v3_call_arg_reg_count_for_target(plan, false);
-        if ((int)arg_count > call_reg_count) {
-            int32_t stack_arg_bytes =
-                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
-            } else {
-                v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
-            }
-            for (i = (size_t)call_reg_count; i < arg_count; ++i) {
-                const char *stack_abi = v3_call_arg_load_abi(&target, i);
-                int32_t stack_offset = (int32_t)(i - (size_t)call_reg_count) * 8;
-                v3_emit_call_arg_spill_load_adjusted(out,
-                                                     cap,
-                                                     call_arg_base,
-                                                     call_depth,
-                                                     i,
-                                                     9,
-                                                     stack_abi,
-                                                     v3_active_target_is_linux_x86_64()
-                                                         ? stack_arg_bytes
-                                                         : 0);
-                if (v3_active_target_is_linux_x86_64()) {
-                    if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                        v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
-                                        v3_x64_dreg_name(9),
-                                        stack_offset);
-                    } else {
-                        v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
-                                        v3_x64_qreg_name(9),
-                                        stack_offset);
-                    }
-                } else if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                    v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
-                } else {
-                    v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
-                }
-            }
-        }
-        for (i = 0; i < arg_count && (int)i < call_reg_count; ++i) {
-            int dest_reg = v3_active_target_is_linux_x86_64() ?
-                           v3_x64_call_arg_virtual_reg(i, false) :
-                           (int)i;
-            v3_emit_call_arg_spill_load_adjusted(out,
-                                                 cap,
-                                                 call_arg_base,
-                                                 call_depth,
-                                                 i,
-                                                 dest_reg,
-                                                 v3_call_arg_load_abi(&target, i),
-                                                 v3_active_target_is_linux_x86_64() && (int)arg_count > call_reg_count
-                                                     ? v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16)
-                                                     : 0);
-        }
-        v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
-        if ((int)arg_count > call_reg_count) {
-            int32_t stack_arg_bytes =
-                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
-            } else {
-                v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
-            }
+        if (!v3_emit_call_from_spills(plan,
+                                      lowering,
+                                      current_function,
+                                      aliases,
+                                      alias_count,
+                                      &target,
+                                      false,
+                                      call_arg_base,
+                                      call_depth,
+                                      out,
+                                      cap)) {
+            return false;
         }
         if (ffi_handle_consume_index >= 0) {
             if (strcmp(target.return_abi_class, "void") != 0) {
@@ -20139,17 +20394,53 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
                                                         cap)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 14) ||
-                !v3_emit_slot_address(out, cap, &right_scratch_slot, 15)) {
+        if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
+            V3AsmCallTarget str_eq_target;
+            memset(&str_eq_target, 0, sizeof(str_eq_target));
+            str_eq_target.external = true;
+            str_eq_target.param_count = 2U;
+            snprintf(str_eq_target.callee_name, sizeof(str_eq_target.callee_name), "%s", "driver_c_str_eq_bridge");
+            v3_copy_target_symbol_name(plan,
+                                       "driver_c_str_eq_bridge",
+                                       str_eq_target.symbol_name,
+                                       sizeof(str_eq_target.symbol_name));
+            snprintf(str_eq_target.return_type, sizeof(str_eq_target.return_type), "%s", "int32");
+            snprintf(str_eq_target.return_abi_class, sizeof(str_eq_target.return_abi_class), "%s", "i32");
+            snprintf(str_eq_target.param_types[0], sizeof(str_eq_target.param_types[0]), "%s", "str");
+            snprintf(str_eq_target.param_types[1], sizeof(str_eq_target.param_types[1]), "%s", "str");
+            snprintf(str_eq_target.param_abi_classes[0], sizeof(str_eq_target.param_abi_classes[0]), "%s", "composite");
+            snprintf(str_eq_target.param_abi_classes[1], sizeof(str_eq_target.param_abi_classes[1]), "%s", "composite");
+            if (!v3_emit_local_value_address(out, cap, &left_scratch_slot, 15) ||
+                !v3_emit_local_value_address(out, cap, &right_scratch_slot, 9)) {
                 return false;
             }
-        } else if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 0) ||
-                   !v3_emit_slot_address(out, cap, &right_scratch_slot, 1)) {
-            return false;
-        }
-        if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
-            v3_emit_call_named_symbol(plan, out, cap, "driver_c_str_eq_bridge");
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         0U,
+                                         "ptr",
+                                         15);
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         1U,
+                                         "ptr",
+                                         9);
+            if (!v3_emit_call_from_spills(plan,
+                                          lowering,
+                                          current_function,
+                                          aliases,
+                                          alias_count,
+                                          &str_eq_target,
+                                          false,
+                                          call_arg_base,
+                                          call_depth,
+                                          out,
+                                          cap)) {
+                return false;
+            }
             if (v3_active_target_is_linux_x86_64()) {
                 v3_emit_x64_cmp_zero_set_bool(out,
                                               cap,
@@ -20174,6 +20465,15 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
         } else if (strcmp(op, ">=") == 0) {
             cond = "ge";
         } else {
+            return false;
+        }
+        if (v3_active_target_is_linux_x86_64()) {
+            if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 14) ||
+                !v3_emit_slot_address(out, cap, &right_scratch_slot, 15)) {
+                return false;
+            }
+        } else if (!v3_emit_slot_address(out, cap, &left_scratch_slot, 0) ||
+                   !v3_emit_slot_address(out, cap, &right_scratch_slot, 1)) {
             return false;
         }
         if (v3_active_target_is_linux_x86_64()) {
@@ -22127,78 +22427,17 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                          15);
         }
     }
-    {
-        int call_reg_count = v3_call_arg_reg_count_for_target(plan, true);
-        v3_emit_call_dest_spill_load(out,
-                                     cap,
-                                     call_arg_base,
-                                     call_depth,
-                                     v3_active_target_is_linux_x86_64() ? 14 : 8);
-        if ((int)arg_count > call_reg_count) {
-            int32_t stack_arg_bytes =
-                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_appendf(out, cap, "  subq $%d, %%rsp\n", stack_arg_bytes);
-            } else {
-                v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
-            }
-            for (i = (size_t)call_reg_count; i < arg_count; ++i) {
-                const char *stack_abi = v3_call_arg_load_abi(&target, i);
-                int32_t stack_offset = (int32_t)(i - (size_t)call_reg_count) * 8;
-                v3_emit_call_arg_spill_load_adjusted(out,
-                                                     cap,
-                                                     call_arg_base,
-                                                     call_depth,
-                                                     i,
-                                                     9,
-                                                     stack_abi,
-                                                     v3_active_target_is_linux_x86_64()
-                                                         ? stack_arg_bytes
-                                                         : 0);
-                if (v3_active_target_is_linux_x86_64()) {
-                    if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                        v3_text_appendf(out, cap, "  movl %s, %d(%%rsp)\n",
-                                        v3_x64_dreg_name(9),
-                                        stack_offset);
-                    } else {
-                        v3_text_appendf(out, cap, "  movq %s, %d(%%rsp)\n",
-                                        v3_x64_qreg_name(9),
-                                        stack_offset);
-                    }
-                } else if (strcmp(stack_abi, "i32") == 0 || strcmp(stack_abi, "bool") == 0) {
-                    v3_text_appendf(out, cap, "  str w9, [sp, #%d]\n", stack_offset);
-                } else {
-                    v3_text_appendf(out, cap, "  str x9, [sp, #%d]\n", stack_offset);
-                }
-            }
-        }
-        for (i = 0; i < arg_count && (int)i < call_reg_count; ++i) {
-            int dest_reg = v3_active_target_is_linux_x86_64() ?
-                           v3_x64_call_arg_virtual_reg(i, true) :
-                           (int)i;
-            v3_emit_call_arg_spill_load_adjusted(out,
-                                                 cap,
-                                                 call_arg_base,
-                                                 call_depth,
-                                                 i,
-                                                 dest_reg,
-                                                 v3_call_arg_load_abi(&target, i),
-                                                 v3_active_target_is_linux_x86_64() && (int)arg_count > call_reg_count
-                                                     ? v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16)
-                                                     : 0);
-        }
-        v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
-        if ((int)arg_count > call_reg_count) {
-            int32_t stack_arg_bytes =
-                v3_align_up_i32((int32_t)(arg_count - (size_t)call_reg_count) * 8, 16);
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_appendf(out, cap, "  addq $%d, %%rsp\n", stack_arg_bytes);
-            } else {
-                v3_text_appendf(out, cap, "  add sp, sp, #%d\n", stack_arg_bytes);
-            }
-        }
-    }
-    return true;
+    return v3_emit_call_from_spills(plan,
+                                    lowering,
+                                    current_function,
+                                    aliases,
+                                    alias_count,
+                                    &target,
+                                    true,
+                                    call_arg_base,
+                                    call_depth,
+                                    out,
+                                    cap);
 }
 
 static bool v3_emit_constructor_into_address(const V3SystemLinkPlanStub *plan,
@@ -22553,6 +22792,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         if (plus_index >= 0) {
             V3AsmLocalSlot left_slot;
             V3AsmLocalSlot right_slot;
+            V3AsmCallTarget concat_target;
             snprintf(left_expr, sizeof(left_expr), "%.*s", plus_index, expr);
             snprintf(right_expr, sizeof(right_expr), "%s", expr + plus_index + 1);
             v3_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
@@ -22614,21 +22854,52 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                             string_label_index_io,
                                                             call_depth + 1,
                                                             out,
-                                                            cap) ||
-                !(v3_active_target_is_linux_x86_64()
-                      ? (v3_emit_slot_address(out, cap, &left_slot, 15) &&
-                         v3_emit_slot_address(out, cap, &right_slot, 2))
-                      : (v3_emit_slot_address(out, cap, &left_slot, 0) &&
-                         v3_emit_slot_address(out, cap, &right_slot, 1)))) {
+                                                            cap)) {
                 return false;
             }
-            v3_emit_call_dest_spill_load(out,
+            memset(&concat_target, 0, sizeof(concat_target));
+            concat_target.external = true;
+            concat_target.param_count = 2U;
+            snprintf(concat_target.callee_name, sizeof(concat_target.callee_name), "%s", "driver_c_str_concat_bridge");
+            v3_copy_target_symbol_name(plan,
+                                       "driver_c_str_concat_bridge",
+                                       concat_target.symbol_name,
+                                       sizeof(concat_target.symbol_name));
+            snprintf(concat_target.return_type, sizeof(concat_target.return_type), "%s", "str");
+            snprintf(concat_target.return_abi_class, sizeof(concat_target.return_abi_class), "%s", "composite");
+            snprintf(concat_target.param_types[0], sizeof(concat_target.param_types[0]), "%s", "str");
+            snprintf(concat_target.param_types[1], sizeof(concat_target.param_types[1]), "%s", "str");
+            snprintf(concat_target.param_abi_classes[0], sizeof(concat_target.param_abi_classes[0]), "%s", "composite");
+            snprintf(concat_target.param_abi_classes[1], sizeof(concat_target.param_abi_classes[1]), "%s", "composite");
+            if (!v3_emit_local_value_address(out, cap, &left_slot, 15) ||
+                !v3_emit_local_value_address(out, cap, &right_slot, 9)) {
+                return false;
+            }
+            v3_emit_call_arg_spill_store(out,
                                          cap,
                                          call_arg_base,
                                          call_depth,
-                                         v3_active_target_is_linux_x86_64() ? 14 : 8);
-            v3_emit_call_named_symbol(plan, out, cap, "driver_c_str_concat_bridge");
-            return true;
+                                         0U,
+                                         "ptr",
+                                         15);
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         call_depth,
+                                         1U,
+                                         "ptr",
+                                         9);
+            return v3_emit_call_from_spills(plan,
+                                            lowering,
+                                            current_function,
+                                            aliases,
+                                            alias_count,
+                                            &concat_target,
+                                            true,
+                                            call_arg_base,
+                                            call_depth,
+                                            out,
+                                            cap);
         }
     }
     if (strcmp(expr, "[]") == 0) {
@@ -23732,13 +24003,41 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                 return false;
             }
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(15));
-        } else {
-            v3_text_appendf(out, cap,
-                            "  mov x0, x15\n");
+        {
+            V3AsmCallTarget panic_target;
+            memset(&panic_target, 0, sizeof(panic_target));
+            panic_target.external = true;
+            panic_target.param_count = 1U;
+            snprintf(panic_target.callee_name, sizeof(panic_target.callee_name), "%s", "cheng_str_to_cstring_temp_bridge");
+            v3_copy_target_symbol_name(plan,
+                                       "cheng_str_to_cstring_temp_bridge",
+                                       panic_target.symbol_name,
+                                       sizeof(panic_target.symbol_name));
+            snprintf(panic_target.return_type, sizeof(panic_target.return_type), "%s", "ptr");
+            snprintf(panic_target.return_abi_class, sizeof(panic_target.return_abi_class), "%s", "ptr");
+            snprintf(panic_target.param_types[0], sizeof(panic_target.param_types[0]), "%s", "str");
+            snprintf(panic_target.param_abi_classes[0], sizeof(panic_target.param_abi_classes[0]), "%s", "composite");
+            v3_emit_call_arg_spill_store(out,
+                                         cap,
+                                         call_arg_base,
+                                         0,
+                                         0U,
+                                         "ptr",
+                                         15);
+            if (!v3_emit_call_from_spills(plan,
+                                          lowering,
+                                          current_function,
+                                          aliases,
+                                          alias_count,
+                                          &panic_target,
+                                          false,
+                                          call_arg_base,
+                                          0,
+                                          out,
+                                          cap)) {
+                return false;
+            }
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_str_to_cstring_temp_bridge");
         if (v3_active_target_is_linux_x86_64()) {
             v3_text_append(out, cap, "  movq %rax, %rdi\n");
         }
@@ -37866,12 +38165,9 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
     V3BootstrapPaths paths;
     char lock_path[PATH_MAX];
     char bootstrap_compiler[PATH_MAX];
-    char *command = NULL;
-    char *quoted_bin = NULL;
-    char *quoted_in = NULL;
-    char *quoted_out = NULL;
-    char *quoted_report = NULL;
-    size_t cap = PATH_MAX * 8U;
+    char in_flag[PATH_MAX + 16];
+    char out_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 16];
     bool lock_held = false;
     int rc = 1;
     (void)argc;
@@ -37913,120 +38209,90 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
                 bootstrap_compiler);
         goto done;
     }
-    command = (char *)v3_xmalloc(cap);
     if (access(paths.stage0, X_OK) != 0) {
         fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing stage0: %s\n", paths.stage0);
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage0);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage0_self_check_log, "bootstrap-bridge stage0_self_check")) {
+    snprintf(in_flag, sizeof(in_flag), "--in:%s", paths.stage1_source);
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage0, "self-check", in_flag },
+                                    paths.stage0_self_check_log,
+                                    "bootstrap-bridge stage0_self_check")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage0);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    quoted_out = v3_shell_quote(paths.stage1);
-    quoted_report = v3_shell_quote(paths.stage1_report);
-    snprintf(command,
-             cap,
-             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
-             quoted_bin,
-             quoted_in,
-             quoted_out,
-             quoted_report);
-    free(quoted_bin);
-    free(quoted_in);
-    free(quoted_out);
-    free(quoted_report);
-    if (!v3_run_shell_command_logged(command, paths.stage1_build_log, "bootstrap-bridge stage1_compile")) {
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", paths.stage1);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", paths.stage1_report);
+    if (!v3_run_command_logged_argv(5U,
+                                    (const char *[5]){ paths.stage0,
+                                                       "compile-bootstrap",
+                                                       in_flag,
+                                                       out_flag,
+                                                       report_flag },
+                                    paths.stage1_build_log,
+                                    "bootstrap-bridge stage1_compile")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage1);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage1_self_check_log, "bootstrap-bridge stage1_self_check")) {
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage1, "self-check", in_flag },
+                                    paths.stage1_self_check_log,
+                                    "bootstrap-bridge stage1_self_check")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage1);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    quoted_out = v3_shell_quote(paths.stage2);
-    quoted_report = v3_shell_quote(paths.stage2_report);
-    snprintf(command,
-             cap,
-             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
-             quoted_bin,
-             quoted_in,
-             quoted_out,
-             quoted_report);
-    free(quoted_bin);
-    free(quoted_in);
-    free(quoted_out);
-    free(quoted_report);
-    if (!v3_run_shell_command_logged(command, paths.stage2_build_log, "bootstrap-bridge stage2_compile")) {
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", paths.stage2);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", paths.stage2_report);
+    if (!v3_run_command_logged_argv(5U,
+                                    (const char *[5]){ paths.stage1,
+                                                       "compile-bootstrap",
+                                                       in_flag,
+                                                       out_flag,
+                                                       report_flag },
+                                    paths.stage2_build_log,
+                                    "bootstrap-bridge stage2_compile")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage2);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage2_self_check_log, "bootstrap-bridge stage2_self_check")) {
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage2, "self-check", in_flag },
+                                    paths.stage2_self_check_log,
+                                    "bootstrap-bridge stage2_self_check")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage2);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    quoted_out = v3_shell_quote(paths.stage3);
-    quoted_report = v3_shell_quote(paths.stage3_report);
-    snprintf(command,
-             cap,
-             "%s compile-bootstrap --in:%s --out:%s --report-out:%s",
-             quoted_bin,
-             quoted_in,
-             quoted_out,
-             quoted_report);
-    free(quoted_bin);
-    free(quoted_in);
-    free(quoted_out);
-    free(quoted_report);
-    if (!v3_run_shell_command_logged(command, paths.stage3_build_log, "bootstrap-bridge stage3_compile")) {
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", paths.stage3);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", paths.stage3_report);
+    if (!v3_run_command_logged_argv(5U,
+                                    (const char *[5]){ paths.stage2,
+                                                       "compile-bootstrap",
+                                                       in_flag,
+                                                       out_flag,
+                                                       report_flag },
+                                    paths.stage3_build_log,
+                                    "bootstrap-bridge stage3_compile")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage3);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s self-check --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage3_self_check_log, "bootstrap-bridge stage3_self_check")) {
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage3, "self-check", in_flag },
+                                    paths.stage3_self_check_log,
+                                    "bootstrap-bridge stage3_self_check")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage2);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage2_contract_log, "bootstrap-bridge stage2_contract")) {
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage2, "print-contract", in_flag },
+                                    paths.stage2_contract_log,
+                                    "bootstrap-bridge stage2_contract")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage3);
-    quoted_in = v3_shell_quote(paths.stage1_source);
-    snprintf(command, cap, "%s print-contract --in:%s", quoted_bin, quoted_in);
-    free(quoted_bin);
-    free(quoted_in);
-    if (!v3_run_shell_command_logged(command, paths.stage3_contract_log, "bootstrap-bridge stage3_contract")) {
+    if (!v3_run_command_logged_argv(3U,
+                                    (const char *[3]){ paths.stage3, "print-contract", in_flag },
+                                    paths.stage3_contract_log,
+                                    "bootstrap-bridge stage3_contract")) {
         goto done;
     }
 
@@ -38040,7 +38306,6 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
     }
     rc = 0;
 done:
-    free(command);
     v3_release_pid_lock(lock_path, &lock_held);
     if (rc == 0) {
         printf("v3 bootstrap bridge ok: %s\n", paths.stage2);
@@ -38063,15 +38328,13 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     char smoke_compile_log[PATH_MAX];
     char smoke_run_log[PATH_MAX];
     char smoke_report_path[PATH_MAX];
-    char *command = NULL;
-    char *quoted_bin;
-    char *quoted_root;
-    char *quoted_in;
-    char *quoted_out;
-    char *quoted_report;
+    char root_flag[PATH_MAX + 16];
+    char in_flag[PATH_MAX + 16];
+    char target_flag[256];
+    char out_flag[PATH_MAX + 16];
+    char report_flag[PATH_MAX + 16];
     char *run_argv[2];
     char *report_text = NULL;
-    size_t cap = PATH_MAX * 10U;
     bool lock_held = false;
     int rc = 1;
     int status = 0;
@@ -38113,28 +38376,23 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     snprintf(smoke_report_path, sizeof(smoke_report_path), "%s.report.txt", smoke_bin);
     v3_join_path(smoke_compile_log, sizeof(smoke_compile_log), paths.root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.compile.log");
     v3_join_path(smoke_run_log, sizeof(smoke_run_log), paths.root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest.run.log");
-    command = (char *)v3_xmalloc(cap);
 
-    quoted_bin = v3_shell_quote(paths.stage2);
-    quoted_root = v3_shell_quote(package_root);
-    quoted_in = v3_shell_quote(paths.compiler_entry_source);
-    quoted_out = v3_shell_quote(paths.backend_driver_out);
-    quoted_report = v3_shell_quote(compile_report_path);
-    snprintf(command,
-             cap,
-             "%s system-link-exec --root:%s --in:%s --emit:exe --target:%s --out:%s --report-out:%s",
-             quoted_bin,
-             quoted_root,
-             quoted_in,
-             paths.target,
-             quoted_out,
-             quoted_report);
-    free(quoted_bin);
-    free(quoted_root);
-    free(quoted_in);
-    free(quoted_out);
-    free(quoted_report);
-    if (!v3_run_shell_command_logged(command, log_path, "build-backend-driver compile")) {
+    snprintf(root_flag, sizeof(root_flag), "--root:%s", package_root);
+    snprintf(in_flag, sizeof(in_flag), "--in:%s", paths.compiler_entry_source);
+    snprintf(target_flag, sizeof(target_flag), "--target:%s", paths.target);
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", paths.backend_driver_out);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", compile_report_path);
+    if (!v3_run_command_logged_argv(8U,
+                                    (const char *[8]){ paths.stage2,
+                                                       "system-link-exec",
+                                                       root_flag,
+                                                       in_flag,
+                                                       "--emit:exe",
+                                                       target_flag,
+                                                       out_flag,
+                                                       report_flag },
+                                    log_path,
+                                    "build-backend-driver compile")) {
         goto done;
     }
     if (access(paths.backend_driver_out, X_OK) != 0) {
@@ -38142,24 +38400,24 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.backend_driver_out);
-    snprintf(command, cap, "%s status", quoted_bin);
-    free(quoted_bin);
-    if (!v3_run_shell_command_logged(command, status_log, "build-backend-driver status")) {
+    if (!v3_run_command_logged_argv(2U,
+                                    (const char *[2]){ paths.backend_driver_out, "status" },
+                                    status_log,
+                                    "build-backend-driver status")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.backend_driver_out);
-    snprintf(command, cap, "%s print-build-plan", quoted_bin);
-    free(quoted_bin);
-    if (!v3_run_shell_command_logged(command, plan_log, "build-backend-driver print-build-plan")) {
+    if (!v3_run_command_logged_argv(2U,
+                                    (const char *[2]){ paths.backend_driver_out, "print-build-plan" },
+                                    plan_log,
+                                    "build-backend-driver print-build-plan")) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.stage3);
-    snprintf(command, cap, "%s print-build-plan", quoted_bin);
-    free(quoted_bin);
-    if (!v3_run_shell_command_logged(command, reference_plan_log, "build-backend-driver reference-stage3")) {
+    if (!v3_run_command_logged_argv(2U,
+                                    (const char *[2]){ paths.stage3, "print-build-plan" },
+                                    reference_plan_log,
+                                    "build-backend-driver reference-stage3")) {
         goto done;
     }
 
@@ -38168,26 +38426,20 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
         goto done;
     }
 
-    quoted_bin = v3_shell_quote(paths.backend_driver_out);
-    quoted_root = v3_shell_quote(package_root);
-    quoted_in = v3_shell_quote(smoke_src);
-    quoted_out = v3_shell_quote(smoke_bin);
-    quoted_report = v3_shell_quote(smoke_report_path);
-    snprintf(command,
-             cap,
-             "%s system-link-exec --root:%s --in:%s --emit:exe --target:%s --out:%s --report-out:%s",
-             quoted_bin,
-             quoted_root,
-             quoted_in,
-             paths.target,
-             quoted_out,
-             quoted_report);
-    free(quoted_bin);
-    free(quoted_root);
-    free(quoted_in);
-    free(quoted_out);
-    free(quoted_report);
-    if (!v3_run_shell_command_logged(command, smoke_compile_log, "build-backend-driver zero-exit compile")) {
+    snprintf(in_flag, sizeof(in_flag), "--in:%s", smoke_src);
+    snprintf(out_flag, sizeof(out_flag), "--out:%s", smoke_bin);
+    snprintf(report_flag, sizeof(report_flag), "--report-out:%s", smoke_report_path);
+    if (!v3_run_command_logged_argv(8U,
+                                    (const char *[8]){ paths.backend_driver_out,
+                                                       "system-link-exec",
+                                                       root_flag,
+                                                       in_flag,
+                                                       "--emit:exe",
+                                                       target_flag,
+                                                       out_flag,
+                                                       report_flag },
+                                    smoke_compile_log,
+                                    "build-backend-driver zero-exit compile")) {
         goto done;
     }
     if (access(smoke_bin, X_OK) != 0) {
@@ -38254,7 +38506,6 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
     rc = 0;
 done:
     free(report_text);
-    free(command);
     v3_release_pid_lock(lock_path, &lock_held);
     if (rc == 0) {
         printf("v3 backend driver ok: %s\n", paths.backend_driver_out);

@@ -13,7 +13,6 @@ fi
 
 # Hard guard for production entrypoints + all UIR source files.
 bad_core="$(rg -n "import[[:space:]]+cheng/backend/(mir|lir|isel|regalloc)" \
-  src/backend/tooling/backend_driver.cheng \
   src/backend/machine -g '*.cheng' \
   src/backend/uir -g '*.cheng' || true)"
 
@@ -167,8 +166,7 @@ fi
 bad_lir_ctor_surface="$(rg -n "\\blir[A-Z][A-Za-z0-9_]*\\b" \
   src/backend/obj \
   src/backend/machine \
-  src/backend/uir \
-  src/backend/tooling -g '*.cheng' \
+  src/backend/uir -g '*.cheng' \
   -g '!src/backend/machine/machine_internal/**' \
   -g '!src/backend/uir/uir_internal/**' || true)"
 if [ "$bad_lir_ctor_surface" != "" ]; then

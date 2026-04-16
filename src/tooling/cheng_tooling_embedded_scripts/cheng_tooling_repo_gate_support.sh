@@ -108,15 +108,13 @@ repo_gate_support_ids() {
     verify_backend_stage1_fixed0_envs \
     verify_backend_string_literal_regression \
     verify_backend_macho_cstring_overlap \
-    verify_backend_sidecar_cheng_fresh \
     verify_backend_default_output_safety \
     verify_new_expr_surface \
     verify_backend_pure_cheng_surface \
     verify_backend_dod_soa \
     verify_backend_mir_borrow \
     verify_backend_string_abi_contract \
-    verify_backend_dot_lowering_contract \
-    verify_backend_selfhost_currentsrc_proof; do
+    verify_backend_dot_lowering_contract; do
     printf '%s\n' "$gate_id"
   done
 }
@@ -551,13 +549,7 @@ run_augmented_bundle() {
     fi
   fi
   if [ "$bundle_driver" = "" ]; then
-    if [ -x "$root/artifacts/backend_driver/cheng" ]; then
-      bundle_driver="$root/artifacts/backend_driver/cheng"
-    elif [ -x "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
-      bundle_driver="$root/artifacts/backend_selfhost_self_obj/cheng.stage2"
-    else
-      bundle_driver="$("$bundle_tool_bin" backend_driver_path)"
-    fi
+    bundle_driver="$("$bundle_tool_bin" backend_driver_path)"
   fi
   if [ "$bundle_has_driver" = "0" ]; then
     set -- "$@" "--driver:$bundle_driver"

@@ -12,6 +12,24 @@ compiler_request="$root/v3/src/tooling/compiler_request.cheng"
 bootstrap_contracts="$root/v3/src/tooling/bootstrap_contracts.cheng"
 build_plan_source="$root/v3/src/backend/build_plan.cheng"
 
+v3_host_target() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "$(uname -m)-apple-darwin"
+      ;;
+    Linux)
+      printf '%s\n' "$(uname -m)-unknown-linux-gnu"
+      ;;
+    *)
+      printf '%s\n' "arm64-apple-darwin"
+      ;;
+  esac
+}
+
+if [ "${CHENG_V3_TARGET:-}" = "" ]; then
+  export CHENG_V3_TARGET="$(v3_host_target)"
+fi
+
 v3_bin_fresh() {
   bin="$1"
   shift

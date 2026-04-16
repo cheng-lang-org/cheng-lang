@@ -19,6 +19,14 @@ type
         reachability: types.V3Libp2pReachabilityKind
         priority: int32
 
+    V3Libp2pPeerRelayCacheEntry =
+        descriptor: types.V3Libp2pRelayDescriptor
+        successCount: int32
+        failureCount: int32
+        lastSuccessEpochSeconds: int64
+        lastFailureEpochSeconds: int64
+        failureCooldownUntilEpochSeconds: int64
+
     V3Libp2pPeerRecord =
         peerId: types.V3Libp2pPeerId
         endpoints: V3Libp2pPeerEndpoint[]
@@ -34,6 +42,7 @@ type
         trustPermille: int32
         resources: types.V3Libp2pNodeResource
         cacheEntries: V3Libp2pPeerCacheEntry[]
+        relayEntries: V3Libp2pPeerRelayCacheEntry[]
 
     V3Libp2pPeerstore =
         peers: V3Libp2pPeerRecord[]
@@ -100,6 +109,40 @@ fn v3Libp2pPeerEndpointClone(endpoint: V3Libp2pPeerEndpoint): V3Libp2pPeerEndpoi
     out.priority = endpoint.priority
     return out
 
+fn v3Libp2pPeerRelayCacheEntryZero(): V3Libp2pPeerRelayCacheEntry =
+    var out: V3Libp2pPeerRelayCacheEntry
+    out.descriptor = types.v3Libp2pRelayDescriptorZero()
+    out.successCount = 0
+    out.failureCount = 0
+    out.lastSuccessEpochSeconds = int64(0)
+    out.lastFailureEpochSeconds = int64(0)
+    out.failureCooldownUntilEpochSeconds = int64(0)
+    return out
+
+fn v3Libp2pPeerRelayCacheEntryClone(entry: V3Libp2pPeerRelayCacheEntry): V3Libp2pPeerRelayCacheEntry =
+    var out = v3Libp2pPeerRelayCacheEntryZero()
+    out.descriptor.peerId = entry.descriptor.peerId
+    out.descriptor.serviceKind = entry.descriptor.serviceKind
+    out.descriptor.region = entry.descriptor.region
+    out.descriptor.endpointText = entry.descriptor.endpointText
+    out.descriptor.authScope = entry.descriptor.authScope
+    out.descriptor.requiresLease = entry.descriptor.requiresLease
+    out.descriptor.advertisedAtEpochSeconds = entry.descriptor.advertisedAtEpochSeconds
+    out.descriptor.ttlSeconds = entry.descriptor.ttlSeconds
+    out.descriptor.health.healthy = entry.descriptor.health.healthy
+    out.descriptor.health.sampledAtEpochSeconds = entry.descriptor.health.sampledAtEpochSeconds
+    out.descriptor.health.successPermille = entry.descriptor.health.successPermille
+    out.descriptor.health.loadPermille = entry.descriptor.health.loadPermille
+    out.descriptor.health.capacityPermille = entry.descriptor.health.capacityPermille
+    out.descriptor.health.failureCooldownUntilEpochSeconds = entry.descriptor.health.failureCooldownUntilEpochSeconds
+    out.descriptor.health.lastError = entry.descriptor.health.lastError
+    out.successCount = entry.successCount
+    out.failureCount = entry.failureCount
+    out.lastSuccessEpochSeconds = entry.lastSuccessEpochSeconds
+    out.lastFailureEpochSeconds = entry.lastFailureEpochSeconds
+    out.failureCooldownUntilEpochSeconds = entry.failureCooldownUntilEpochSeconds
+    return out
+
 fn v3Libp2pPeerRecordZero(): V3Libp2pPeerRecord =
     var routingRole = 0
     var out: V3Libp2pPeerRecord
@@ -116,6 +159,7 @@ fn v3Libp2pPeerRecordZero(): V3Libp2pPeerRecord =
     out.trustPermille = 0
     out.resources = types.v3Libp2pNodeResourceZero()
     out.cacheEntries = []
+    out.relayEntries = []
     return out
 
 fn v3Libp2pPeerstoreZero(): V3Libp2pPeerstore =
@@ -143,6 +187,21 @@ fn v3Libp2pPeerRecordCacheEntryPos(record: V3Libp2pPeerRecord,
     for i in 0..<record.cacheEntries.len:
         if record.cacheEntries[i].cacheKey == cacheKey:
             return i
+    return -1
+
+fn v3Libp2pPeerRelayCacheEntryPos(record: V3Libp2pPeerRecord,
+                                  serviceKind: types.V3Libp2pRelayServiceKind,
+                                  region: str,
+                                  endpointText: str): int32 =
+    for i in 0..<record.relayEntries.len:
+        let descriptor = record.relayEntries[i].descriptor
+        if descriptor.serviceKind != serviceKind:
+            continue
+        if descriptor.region != region:
+            continue
+        if descriptor.endpointText != endpointText:
+            continue
+        return i
     return -1
 
 fn v3Libp2pPeerRecordWorstCacheEntryPos(record: V3Libp2pPeerRecord): int32 =
@@ -173,6 +232,131 @@ fn v3Libp2pPeerRecordEvictCache(record: var V3Libp2pPeerRecord,
         return false
     v3Libp2pPeerRecordCacheRemovePos(record, pos)
     return true
+
+fn v3Libp2pPeerRecordRelayRemovePos(record: var V3Libp2pPeerRecord,
+                                    pos: int32) =
+    if pos < 0 || pos >= record.relayEntries.len:
+        return
+    var next: V3Libp2pPeerRelayCacheEntry[]
+    next = []
+    for i in 0..<record.relayEntries.len:
+        if i == pos:
+            continue
+        add(next, v3Libp2pPeerRelayCacheEntryClone(record.relayEntries[i]))
+    record.relayEntries = next
+
+fn v3Libp2pPeerRecordPutRelayDescriptor(record: var V3Libp2pPeerRecord,
+                                        descriptor: types.V3Libp2pRelayDescriptor) =
+    if descriptor.serviceKind == types.v3Libp2pRelayServiceNone:
+        return
+    if len(descriptor.endpointText) <= 0:
+        return
+    let pos = v3Libp2pPeerRelayCacheEntryPos(record,
+                                             descriptor.serviceKind,
+                                             descriptor.region,
+                                             descriptor.endpointText)
+    if pos >= 0:
+        let prev = record.relayEntries[pos]
+        var next = v3Libp2pPeerRelayCacheEntryClone(prev)
+        next.descriptor.peerId = descriptor.peerId
+        next.descriptor.serviceKind = descriptor.serviceKind
+        next.descriptor.region = descriptor.region
+        next.descriptor.endpointText = descriptor.endpointText
+        next.descriptor.authScope = descriptor.authScope
+        next.descriptor.requiresLease = descriptor.requiresLease
+        next.descriptor.advertisedAtEpochSeconds = descriptor.advertisedAtEpochSeconds
+        next.descriptor.ttlSeconds = descriptor.ttlSeconds
+        next.descriptor.health.healthy = descriptor.health.healthy
+        next.descriptor.health.sampledAtEpochSeconds = descriptor.health.sampledAtEpochSeconds
+        next.descriptor.health.successPermille = descriptor.health.successPermille
+        next.descriptor.health.loadPermille = descriptor.health.loadPermille
+        next.descriptor.health.capacityPermille = descriptor.health.capacityPermille
+        next.descriptor.health.failureCooldownUntilEpochSeconds = descriptor.health.failureCooldownUntilEpochSeconds
+        next.descriptor.health.lastError = descriptor.health.lastError
+        if next.failureCooldownUntilEpochSeconds < descriptor.health.failureCooldownUntilEpochSeconds:
+            next.failureCooldownUntilEpochSeconds = descriptor.health.failureCooldownUntilEpochSeconds
+        record.relayEntries[pos] = next
+        return
+    var insert = v3Libp2pPeerRelayCacheEntryZero()
+    insert.descriptor.peerId = descriptor.peerId
+    insert.descriptor.serviceKind = descriptor.serviceKind
+    insert.descriptor.region = descriptor.region
+    insert.descriptor.endpointText = descriptor.endpointText
+    insert.descriptor.authScope = descriptor.authScope
+    insert.descriptor.requiresLease = descriptor.requiresLease
+    insert.descriptor.advertisedAtEpochSeconds = descriptor.advertisedAtEpochSeconds
+    insert.descriptor.ttlSeconds = descriptor.ttlSeconds
+    insert.descriptor.health.healthy = descriptor.health.healthy
+    insert.descriptor.health.sampledAtEpochSeconds = descriptor.health.sampledAtEpochSeconds
+    insert.descriptor.health.successPermille = descriptor.health.successPermille
+    insert.descriptor.health.loadPermille = descriptor.health.loadPermille
+    insert.descriptor.health.capacityPermille = descriptor.health.capacityPermille
+    insert.descriptor.health.failureCooldownUntilEpochSeconds = descriptor.health.failureCooldownUntilEpochSeconds
+    insert.descriptor.health.lastError = descriptor.health.lastError
+    insert.failureCooldownUntilEpochSeconds = descriptor.health.failureCooldownUntilEpochSeconds
+    add(record.relayEntries, insert)
+
+fn v3Libp2pPeerRecordRemoveRelayDescriptor(record: var V3Libp2pPeerRecord,
+                                           serviceKind: types.V3Libp2pRelayServiceKind,
+                                           region: str,
+                                           endpointText: str): bool =
+    let pos = v3Libp2pPeerRelayCacheEntryPos(record, serviceKind, region, endpointText)
+    if pos < 0:
+        return false
+    v3Libp2pPeerRecordRelayRemovePos(record, pos)
+    return true
+
+fn v3Libp2pPeerRecordRelayEntryAtFill(out: var V3Libp2pPeerRelayCacheEntry,
+                                      record: V3Libp2pPeerRecord,
+                                      pos: int32): bool =
+    if pos < 0 || pos >= record.relayEntries.len:
+        return false
+    out = v3Libp2pPeerRelayCacheEntryClone(record.relayEntries[pos])
+    return true
+
+fn v3Libp2pPeerRecordObserveRelaySuccess(record: var V3Libp2pPeerRecord,
+                                         serviceKind: types.V3Libp2pRelayServiceKind,
+                                         region: str,
+                                         endpointText: str,
+                                         observedAtEpochSeconds: int64) =
+    var pos = v3Libp2pPeerRelayCacheEntryPos(record, serviceKind, region, endpointText)
+    if pos < 0:
+        return
+    record.relayEntries[pos].successCount = record.relayEntries[pos].successCount + 1
+    record.relayEntries[pos].lastSuccessEpochSeconds = observedAtEpochSeconds
+    record.relayEntries[pos].failureCooldownUntilEpochSeconds = int64(0)
+    record.relayEntries[pos].descriptor.health.failureCooldownUntilEpochSeconds = int64(0)
+    record.relayEntries[pos].descriptor.health.healthy = true
+    record.relayEntries[pos].descriptor.health.lastError = ""
+    var total = record.relayEntries[pos].successCount + record.relayEntries[pos].failureCount
+    var successPermille = record.relayEntries[pos].descriptor.health.successPermille
+    if total > 0:
+        successPermille = (record.relayEntries[pos].successCount * 1000) / total
+    record.relayEntries[pos].descriptor.health.successPermille = successPermille
+
+fn v3Libp2pPeerRecordObserveRelayFailure(record: var V3Libp2pPeerRecord,
+                                         serviceKind: types.V3Libp2pRelayServiceKind,
+                                         region: str,
+                                         endpointText: str,
+                                         observedAtEpochSeconds: int64,
+                                         cooldownSeconds: int32,
+                                         errText: str) =
+    var pos = v3Libp2pPeerRelayCacheEntryPos(record, serviceKind, region, endpointText)
+    if pos < 0:
+        return
+    record.relayEntries[pos].failureCount = record.relayEntries[pos].failureCount + 1
+    record.relayEntries[pos].lastFailureEpochSeconds = observedAtEpochSeconds
+    record.relayEntries[pos].failureCooldownUntilEpochSeconds =
+        observedAtEpochSeconds + int64(cooldownSeconds)
+    record.relayEntries[pos].descriptor.health.failureCooldownUntilEpochSeconds =
+        record.relayEntries[pos].failureCooldownUntilEpochSeconds
+    record.relayEntries[pos].descriptor.health.lastError = errText
+    record.relayEntries[pos].descriptor.health.healthy = false
+    var total = record.relayEntries[pos].successCount + record.relayEntries[pos].failureCount
+    var successPermille = record.relayEntries[pos].descriptor.health.successPermille
+    if total > 0:
+        successPermille = (record.relayEntries[pos].successCount * 1000) / total
+    record.relayEntries[pos].descriptor.health.successPermille = successPermille
 
 fn v3Libp2pPeerRecordObserveCache(record: var V3Libp2pPeerRecord,
                                   cacheKey: str,
@@ -402,6 +586,9 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     next.cacheEntries = []
     for i in 0..<record.cacheEntries.len:
         add(next.cacheEntries, v3Libp2pPeerCacheEntryClone(record.cacheEntries[i]))
+    next.relayEntries = []
+    for i in 0..<record.relayEntries.len:
+        add(next.relayEntries, v3Libp2pPeerRelayCacheEntryClone(record.relayEntries[i]))
     let targetPeerId = record.peerId
     let pos = v3Libp2pPeerstorePos(store, targetPeerId)
     if pos >= 0:
@@ -423,6 +610,9 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
         store.peers[pos].cacheEntries = []
         for i in 0..<next.cacheEntries.len:
             add(store.peers[pos].cacheEntries, v3Libp2pPeerCacheEntryClone(next.cacheEntries[i]))
+        store.peers[pos].relayEntries = []
+        for i in 0..<next.relayEntries.len:
+            add(store.peers[pos].relayEntries, v3Libp2pPeerRelayCacheEntryClone(next.relayEntries[i]))
         return
     let insert = v3Libp2pPeerRecordZero()
     add(store.peers, insert)
@@ -445,6 +635,9 @@ fn v3Libp2pPeerstoreUpsert(store: var V3Libp2pPeerstore,
     store.peers[idx].cacheEntries = []
     for i in 0..<next.cacheEntries.len:
         add(store.peers[idx].cacheEntries, v3Libp2pPeerCacheEntryClone(next.cacheEntries[i]))
+    store.peers[idx].relayEntries = []
+    for i in 0..<next.relayEntries.len:
+        add(store.peers[idx].relayEntries, v3Libp2pPeerRelayCacheEntryClone(next.relayEntries[i]))
 
 fn v3Libp2pPeerstoreCount(store: V3Libp2pPeerstore): int32 =
     return store.peers.len

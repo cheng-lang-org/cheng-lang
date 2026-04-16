@@ -22,8 +22,6 @@ Usage:
                         [--opt|--opt:0|1] [--opt2|--opt2:0|1] [--opt-level:0|1|2|3]
                         [--ldflags:<text>] [--fn-sched:<ws>]
                         [--no-runtime-c|--no-runtime-c:0|1] [--runtime-obj:<path>]
-                        [--sidecar-mode:cheng] [--sidecar-bundle:<path>] [--sidecar-compiler:<path>]
-                        [--sidecar-child-mode:<cli|outer_cli>] [--sidecar-outer-compiler:<path>]
                         [--module-cache:<path>] [--multi-module-cache|--multi-module-cache:0|1]
                         [--module-cache-unstable-allow|--module-cache-unstable-allow:0|1]
                         [--generic-mode:dict] [--generic-spec-budget:<N>] [--generic-lowering:mir_dict]
@@ -46,7 +44,7 @@ Notes:
   - Default `MM=orc`.
   - Executable output for bare `--name:<bin>` defaults to `artifacts/chengc/<bin>`.
   - `--jobs:<N>` / `--fn-jobs:<N>` / `--ldflags:<text>` / `--fn-sched:<ws>` control backend compile surface.
-  - `--whole-program` / `--opt*` / `--generic-*` / `--sidecar-*` / `--module-cache*` / `--no-runtime-c` / `--runtime-obj`
+  - `--whole-program` / `--opt*` / `--generic-*` / `--module-cache*` / `--no-runtime-c` / `--runtime-obj`
     are explicit compile-surface flags for exe builds.
   - No-pointer policy is fixed by the compiler/toolchain default and is not part of the public `chengc` flag surface.
   - Only `--fn-sched:ws` is supported.
@@ -428,13 +426,7 @@ target_supports_self_linker() {
 }
 
 resolve_backend_sidecar_defaults_field() {
-  field="$1"
-  target_raw="$2"
-  resolver="$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh"
-  if [ ! -f "$resolver" ]; then
-    return 1
-  fi
-  sh "$resolver" --root:"$root" --target:"$target_raw" --field:"$field"
+  return 1
 }
 
 if [ "${1:-}" = "" ] || [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
@@ -1029,16 +1021,6 @@ driver_current_contract_ok() {
 }
 
 tooling_selfhost_stage0_for_input() {
-  input_path="$1"
-  case "$input_path" in
-    src/tooling/cheng_tooling.cheng|*/src/tooling/cheng_tooling.cheng)
-      cand="${CHENG_TOOLING_SELFHOST_STAGE0:-artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2}"
-      if [ -x "$cand" ] && driver_can_run "$cand"; then
-        printf '%s\n' "$cand"
-        return 0
-      fi
-      ;;
-  esac
   return 1
 }
 
@@ -1046,8 +1028,6 @@ if [ -n "${BACKEND_DRIVER:-}" ]; then
   driver="$BACKEND_DRIVER"
 elif selfhost_stage0="$(tooling_selfhost_stage0_for_input "$in" 2>/dev/null || true)" && [ "$selfhost_stage0" != "" ]; then
   driver="$selfhost_stage0"
-elif [ "${BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./artifacts/backend_driver/cheng" ] && driver_can_run "./artifacts/backend_driver/cheng"; then
-  driver="./artifacts/backend_driver/cheng"
 elif [ "${BACKEND_DRIVER_DIRECT:-1}" != "0" ] && [ -x "./cheng" ] && driver_can_run "./cheng"; then
   driver="./cheng"
 else
@@ -1127,76 +1107,21 @@ case "$backend_target" in
     ;;
 esac
 
-backend_sidecar_mode="$sidecar_mode_raw"
-if [ "$backend_sidecar_mode" = "" ]; then
-  backend_sidecar_mode="$(resolve_backend_sidecar_defaults_field mode "$backend_target" 2>/dev/null || true)"
+if [ "$sidecar_mode_raw" != "" ] || [ "$sidecar_bundle_raw" != "" ] || [ "$sidecar_compiler_raw" != "" ] ||
+   [ "$sidecar_child_mode_raw" != "" ] || [ "$sidecar_outer_compiler_raw" != "" ] ||
+   [ "${BACKEND_UIR_SIDECAR_MODE:-}" != "" ] || [ "${BACKEND_UIR_SIDECAR_BUNDLE:-}" != "" ] ||
+   [ "${BACKEND_UIR_SIDECAR_COMPILER:-}" != "" ] || [ "${BACKEND_UIR_SIDECAR_CHILD_MODE:-}" != "" ] ||
+   [ "${BACKEND_UIR_SIDECAR_OUTER_COMPILER:-}" != "" ] || [ "${BACKEND_UIR_FORCE_SIDECAR:-}" != "" ] ||
+   [ "${BACKEND_UIR_PREFER_SIDECAR:-}" != "" ]; then
+  echo "[Error] chengc: old backend sidecar surface has been removed; use unified v3 backend driver path" 1>&2
+  exit 2
 fi
-backend_sidecar_mode="$(normalize_sidecar_mode_text "$backend_sidecar_mode")"
-if [ "$backend_sidecar_mode" = "" ]; then
-  echo "[Error] missing strict fresh Cheng sidecar mode; run verify_backend_sidecar_cheng_fresh" 1>&2
-  exit 1
-fi
-
-backend_sidecar_bundle="$sidecar_bundle_raw"
-if [ "$backend_sidecar_bundle" = "" ]; then
-  backend_sidecar_bundle="$(resolve_backend_sidecar_defaults_field bundle "$backend_target" 2>/dev/null || true)"
-fi
-if [ "$backend_sidecar_bundle" = "" ]; then
-  echo "[Error] missing strict fresh Cheng sidecar bundle; run verify_backend_sidecar_cheng_fresh" 1>&2
-  exit 1
-fi
-
-backend_sidecar_compiler="$sidecar_compiler_raw"
-if [ "$backend_sidecar_compiler" = "" ]; then
-  backend_sidecar_compiler="$(resolve_backend_sidecar_defaults_field compiler "$backend_target" 2>/dev/null || true)"
-fi
-if [ "$backend_sidecar_compiler" = "" ]; then
-  echo "[Error] missing strict fresh Cheng sidecar compiler; run verify_backend_sidecar_cheng_fresh" 1>&2
-  exit 1
-fi
-
-backend_sidecar_driver=""
-backend_sidecar_real_driver="${BACKEND_UIR_SIDECAR_REAL_DRIVER:-${TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER:-}}"
-if [ "${BACKEND_DRIVER:-}" = "" ] && [ "$backend_sidecar_mode" = "cheng" ]; then
-  backend_sidecar_driver="$(resolve_backend_sidecar_defaults_field driver "$backend_target" 2>/dev/null || true)"
-  if [ "$backend_sidecar_driver" != "" ] && [ -x "$backend_sidecar_driver" ]; then
-    driver="$backend_sidecar_driver"
-    driver_exec="$driver"
-    driver_real_env=""
-  fi
-fi
-backend_sidecar_child_mode="$sidecar_child_mode_raw"
+backend_sidecar_mode=""
+backend_sidecar_bundle=""
+backend_sidecar_compiler=""
+backend_sidecar_real_driver=""
+backend_sidecar_child_mode=""
 backend_sidecar_outer_companion=""
-if [ "$backend_sidecar_mode" = "cheng" ]; then
-  if [ "$backend_sidecar_real_driver" = "" ]; then
-    backend_sidecar_real_driver="$(resolve_backend_sidecar_defaults_field real_driver "$backend_target" 2>/dev/null || true)"
-  fi
-  if [ "$backend_sidecar_real_driver" = "" ]; then
-    echo "[Error] missing strict fresh Cheng sidecar real driver; set TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER or run verify_backend_sidecar_cheng_fresh" 1>&2
-    exit 1
-  fi
-  if [ "$backend_sidecar_child_mode" = "" ]; then
-    backend_sidecar_child_mode="$(resolve_backend_sidecar_defaults_field child_mode "$backend_target" 2>/dev/null || true)"
-  fi
-  backend_sidecar_child_mode="$(normalize_sidecar_child_mode_text "$backend_sidecar_child_mode")"
-  if [ "$backend_sidecar_child_mode" = "" ]; then
-    echo "[Error] missing strict fresh Cheng sidecar child mode; run verify_backend_sidecar_cheng_fresh" 1>&2
-    exit 1
-  fi
-  if [ "$backend_sidecar_child_mode" = "outer_cli" ]; then
-    backend_sidecar_outer_companion="$sidecar_outer_compiler_raw"
-    if [ "$backend_sidecar_outer_companion" = "" ]; then
-      backend_sidecar_outer_companion="$(resolve_backend_sidecar_defaults_field outer_companion "$backend_target" 2>/dev/null || true)"
-    fi
-    if [ "$backend_sidecar_outer_companion" = "" ]; then
-      echo "[Error] missing strict fresh Cheng sidecar outer companion; run verify_backend_sidecar_cheng_fresh" 1>&2
-      exit 1
-    fi
-  elif [ "$sidecar_outer_compiler_raw" != "" ]; then
-    echo "[Error] --sidecar-outer-compiler requires --sidecar-child-mode:outer_cli" 1>&2
-    exit 2
-  fi
-fi
 
 backend_whole_program="$whole_program_raw"
 if [ "$backend_whole_program" = "" ]; then

@@ -5,6 +5,24 @@ root="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
 bridge_env="$root/artifacts/v3_bootstrap/bootstrap.env"
 backend_driver_bin="$root/artifacts/v3_backend_driver/cheng"
 
+v3_host_target() {
+  case "$(uname -s)" in
+    Darwin)
+      printf '%s\n' "$(uname -m)-apple-darwin"
+      ;;
+    Linux)
+      printf '%s\n' "$(uname -m)-unknown-linux-gnu"
+      ;;
+    *)
+      printf '%s\n' "arm64-apple-darwin"
+      ;;
+  esac
+}
+
+if [ "${CHENG_V3_TARGET:-}" = "" ]; then
+  export CHENG_V3_TARGET="$(v3_host_target)"
+fi
+
 v3_usage() {
   cat <<EOF
 cheng_v3
@@ -16,6 +34,7 @@ usage:
   cheng_v3.sh build-backend-driver
   cheng_v3.sh host-bridge-audit
   cheng_v3.sh run-shared-emit-smokes
+  cheng_v3.sh r2c-react-v3-native-gui-bundle-smoke [--repo <path>] [--route-state <id>] [--out-dir <dir>]
   cheng_v3.sh status
   cheng_v3.sh slice-gate
   cheng_v3.sh run-smokes
@@ -70,6 +89,7 @@ usage:
   cheng_v3.sh run-browser-webrtc-smokes
   cheng_v3.sh r2c-react-v3 <subcommand> [args]
   cheng_v3.sh r2c-react-v3-fresh-clean-gate [--repo <path>]
+  cheng_v3.sh r2c-react-v3-native-gui-bundle-smoke [--repo <path>] [--route-state <id>] [--out-dir <dir>]
   cheng_v3.sh print-bootstrap
   cheng_v3.sh print-build-plan
   cheng_v3.sh emit-csg [seed-flags...]
@@ -151,7 +171,7 @@ v3_ensure_backend_driver() {
 
 v3_is_backend_driver_cmd() {
   case "$1" in
-    build-backend-driver|host-bridge-audit|r2c-react-v3-fresh-clean-gate|run-shared-emit-smokes|status|print-build-plan|emit-csg|migrate-csg|verify-world|world-sync|prove-equivalence|prove-migration|publish-world|fresh-node-selfhost|selfhost-build|system-link-exec)
+    build-backend-driver|host-bridge-audit|r2c-react-v3-fresh-clean-gate|r2c-react-v3-native-gui-bundle-smoke|run-shared-emit-smokes|status|print-build-plan|emit-csg|migrate-csg|verify-world|world-sync|prove-equivalence|prove-migration|publish-world|fresh-node-selfhost|selfhost-build|system-link-exec)
       return 0
       ;;
     *)

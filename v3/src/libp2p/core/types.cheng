@@ -42,6 +42,13 @@ const
     v3Libp2pProtocolBftVote: int32 = 13
     v3Libp2pProtocolBftCommit: int32 = 14
     v3Libp2pProtocolBftStateSync: int32 = 15
+    v3Libp2pProtocolRelayDescribe: int32 = 16
+    v3Libp2pProtocolRelayLease: int32 = 17
+
+    v3Libp2pRelayServiceNone: int32 = 0
+    v3Libp2pRelayServiceStun: int32 = 1
+    v3Libp2pRelayServiceTurn: int32 = 2
+    v3Libp2pRelayServiceTsnet: int32 = 3
 
 type
     V3Libp2pTransportKind = int32
@@ -53,6 +60,7 @@ type
     V3Libp2pProtocolId = int32
     V3Libp2pConnId = int32
     V3Libp2pStreamId = int32
+    V3Libp2pRelayServiceKind = int32
 
     V3Libp2pPeerId =
         value: layout.FixedBytes32
@@ -86,6 +94,38 @@ type
         hasPeerId: bool
         peerId: V3Libp2pPeerId
 
+    V3Libp2pRelayHealth =
+        healthy: bool
+        sampledAtEpochSeconds: int64
+        successPermille: int32
+        loadPermille: int32
+        capacityPermille: int32
+        failureCooldownUntilEpochSeconds: int64
+        lastError: str
+
+    V3Libp2pRelayDescriptor =
+        peerId: V3Libp2pPeerId
+        serviceKind: V3Libp2pRelayServiceKind
+        region: str
+        endpointText: str
+        authScope: str
+        requiresLease: bool
+        advertisedAtEpochSeconds: int64
+        ttlSeconds: int32
+        health: V3Libp2pRelayHealth
+
+    V3Libp2pRelayLease =
+        relayPeerId: V3Libp2pPeerId
+        requesterPeerId: V3Libp2pPeerId
+        serviceKind: V3Libp2pRelayServiceKind
+        region: str
+        endpointText: str
+        username: str
+        credential: str
+        issuedAtEpochSeconds: int64
+        expiresAtEpochSeconds: int64
+        nonce: layout.FixedBytes32
+
 fn v3Libp2pPeerIdZero(): V3Libp2pPeerId =
     var out: V3Libp2pPeerId
     return out
@@ -118,6 +158,44 @@ fn v3Libp2pMultiaddrZero(): V3Libp2pMultiaddr =
     out.secure = v3Libp2pSecureNone
     out.mux = v3Libp2pMuxNone
     out.hasPeerId = false
+    return out
+
+fn v3Libp2pRelayHealthZero(): V3Libp2pRelayHealth =
+    var out: V3Libp2pRelayHealth
+    out.healthy = false
+    out.sampledAtEpochSeconds = int64(0)
+    out.successPermille = 0
+    out.loadPermille = 1000
+    out.capacityPermille = 0
+    out.failureCooldownUntilEpochSeconds = int64(0)
+    out.lastError = ""
+    return out
+
+fn v3Libp2pRelayDescriptorZero(): V3Libp2pRelayDescriptor =
+    var out: V3Libp2pRelayDescriptor
+    out.peerId = v3Libp2pPeerIdZero()
+    out.serviceKind = v3Libp2pRelayServiceNone
+    out.region = ""
+    out.endpointText = ""
+    out.authScope = ""
+    out.requiresLease = false
+    out.advertisedAtEpochSeconds = int64(0)
+    out.ttlSeconds = 0
+    out.health = v3Libp2pRelayHealthZero()
+    return out
+
+fn v3Libp2pRelayLeaseZero(): V3Libp2pRelayLease =
+    var out: V3Libp2pRelayLease
+    out.relayPeerId = v3Libp2pPeerIdZero()
+    out.requesterPeerId = v3Libp2pPeerIdZero()
+    out.serviceKind = v3Libp2pRelayServiceNone
+    out.region = ""
+    out.endpointText = ""
+    out.username = ""
+    out.credential = ""
+    out.issuedAtEpochSeconds = int64(0)
+    out.expiresAtEpochSeconds = int64(0)
+    out.nonce = layout.fixedBytes32Zero()
     return out
 
 fn v3Libp2pPeerIdEqual(a: V3Libp2pPeerId, b: V3Libp2pPeerId): bool =
@@ -167,6 +245,50 @@ fn v3Libp2pMuxText(kind: V3Libp2pMuxKind): str =
         return "yamux"
     return "none"
 
+fn v3Libp2pRelayServiceText(kind: V3Libp2pRelayServiceKind): str =
+    if kind == v3Libp2pRelayServiceStun:
+        return "stun"
+    if kind == v3Libp2pRelayServiceTurn:
+        return "turn"
+    if kind == v3Libp2pRelayServiceTsnet:
+        return "tsnet"
+    return "none"
+
+fn v3Libp2pRelayServiceRequiresLease(kind: V3Libp2pRelayServiceKind): bool =
+    if kind == v3Libp2pRelayServiceTurn:
+        return true
+    if kind == v3Libp2pRelayServiceTsnet:
+        return true
+    return false
+
+fn v3Libp2pRelayDescriptorActiveAt(descriptor: V3Libp2pRelayDescriptor,
+                                   epochSeconds: int64): bool =
+    if descriptor.serviceKind == v3Libp2pRelayServiceNone:
+        return false
+    if len(descriptor.endpointText) <= 0:
+        return false
+    if descriptor.ttlSeconds <= 0:
+        return false
+    if descriptor.advertisedAtEpochSeconds <= int64(0):
+        return false
+    if epochSeconds < descriptor.advertisedAtEpochSeconds:
+        return false
+    return epochSeconds <= descriptor.advertisedAtEpochSeconds + int64(descriptor.ttlSeconds)
+
+fn v3Libp2pRelayLeaseActiveAt(lease: V3Libp2pRelayLease,
+                              epochSeconds: int64): bool =
+    if lease.serviceKind == v3Libp2pRelayServiceNone:
+        return false
+    if len(lease.endpointText) <= 0:
+        return false
+    if lease.issuedAtEpochSeconds <= int64(0):
+        return false
+    if lease.expiresAtEpochSeconds < lease.issuedAtEpochSeconds:
+        return false
+    if epochSeconds < lease.issuedAtEpochSeconds:
+        return false
+    return epochSeconds <= lease.expiresAtEpochSeconds
+
 fn v3Libp2pProtocolWireText(protocol: V3Libp2pProtocolId): str =
     if protocol == v3Libp2pProtocolIdentify:
         return "/ipfs/id/1.0.0"
@@ -198,4 +320,8 @@ fn v3Libp2pProtocolWireText(protocol: V3Libp2pProtocolId): str =
         return "/cheng/bft-commit/1.0.0"
     if protocol == v3Libp2pProtocolBftStateSync:
         return "/cheng/bft-state-sync/1.0.0"
+    if protocol == v3Libp2pProtocolRelayDescribe:
+        return "/cheng/relay-describe/1.0.0"
+    if protocol == v3Libp2pProtocolRelayLease:
+        return "/cheng/relay-lease/1.0.0"
     return "/cheng/unknown/0.0.0"

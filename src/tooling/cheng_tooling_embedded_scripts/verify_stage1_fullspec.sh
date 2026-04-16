@@ -554,8 +554,8 @@ fi
 
 driver="${BACKEND_DRIVER:-}"
 if [ "$driver" = "" ]; then
-  if [ -x "artifacts/backend_driver/cheng" ]; then
-    driver="artifacts/backend_driver/cheng"
+  if [ -x "artifacts/v3_backend_driver/cheng" ]; then
+    driver="artifacts/v3_backend_driver/cheng"
   elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage2" ]; then
     driver="artifacts/backend_selfhost_self_obj/cheng.stage2"
   elif [ -x "artifacts/backend_selfhost_self_obj/cheng.stage1" ]; then

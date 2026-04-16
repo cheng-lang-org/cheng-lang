@@ -76,7 +76,6 @@ script_is_self_trampoline() {
 is_native_only_repo_bypass() {
   case "${1:-}" in
     build-backend-driver|build_backend_driver|\
-    bootstrap-pure|bootstrap_pure|bootstrap|\
     verify_backend_noalias_opt|verify_backend_egraph_cost|verify_backend_dod_opt_regression)
       return 0
       ;;
@@ -153,40 +152,7 @@ tooling_build_global_force_direct() {
 }
 
 tooling_resolve_strict_sidecar_contract() {
-  resolved_sidecar_mode=""
-  resolved_sidecar_bundle=""
-  resolved_sidecar_compiler=""
-  resolved_sidecar_real_driver=""
-  resolved_sidecar_child_mode=""
-  resolved_sidecar_outer_companion=""
-  if [ "$root" = "" ]; then
-    return 1
-  fi
-  sidecar_resolver="$root/src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh"
-  if [ ! -f "$sidecar_resolver" ]; then
-    return 1
-  fi
-  resolved_sidecar_mode="$(sh "$sidecar_resolver" --root:"$root" --field:mode)"
-  [ "$resolved_sidecar_mode" = "cheng" ] || return 1
-  resolved_sidecar_bundle="$(sh "$sidecar_resolver" --root:"$root" --field:bundle)"
-  [ -s "$resolved_sidecar_bundle" ] || return 1
-  resolved_sidecar_compiler="$(sh "$sidecar_resolver" --root:"$root" --field:compiler)"
-  [ -x "$resolved_sidecar_compiler" ] || return 1
-  resolved_sidecar_real_driver="$(sh "$sidecar_resolver" --root:"$root" --field:real_driver)"
-  [ -x "$resolved_sidecar_real_driver" ] || return 1
-  resolved_sidecar_child_mode="$(sh "$sidecar_resolver" --root:"$root" --field:child_mode)"
-  case "$resolved_sidecar_child_mode" in
-    cli|outer_cli)
-      ;;
-    *)
-      return 1
-      ;;
-  esac
-  if [ "$resolved_sidecar_child_mode" = "outer_cli" ]; then
-    resolved_sidecar_outer_companion="$(sh "$sidecar_resolver" --root:"$root" --field:outer_companion)"
-    [ -x "$resolved_sidecar_outer_companion" ] || return 1
-  fi
-  return 0
+  return 1
 }
 
 root="$(resolve_root "$script_dir" || true)"
@@ -255,23 +221,7 @@ run_one() {
     return 127
   fi
   if tooling_build_global_force_direct "$@"; then
-    if ! tooling_resolve_strict_sidecar_contract; then
-      printf '%s\n' "[cheng_tooling.real] missing strict fresh Cheng sidecar contract for direct build-global" 1>&2
-      return 1
-    fi
-    env \
-      TOOLING_SELF_BIN="$bin" \
-      TOOLING_BUILD_GLOBAL_STAGE0_ROUTE=direct \
-      BACKEND_UIR_SIDECAR_DISABLE=0 \
-      BACKEND_UIR_PREFER_SIDECAR=1 \
-      BACKEND_UIR_FORCE_SIDECAR=1 \
-      BACKEND_UIR_SIDECAR_MODE="$resolved_sidecar_mode" \
-      BACKEND_UIR_SIDECAR_BUNDLE="$resolved_sidecar_bundle" \
-      BACKEND_UIR_SIDECAR_COMPILER="$resolved_sidecar_compiler" \
-      TOOLING_BUILD_GLOBAL_CURRENTSOURCE_REAL_DRIVER="$resolved_sidecar_real_driver" \
-      BACKEND_UIR_SIDECAR_CHILD_MODE="$resolved_sidecar_child_mode" \
-      BACKEND_UIR_SIDECAR_OUTER_COMPILER="$resolved_sidecar_outer_companion" \
-      "$bin" "$@"
+    env TOOLING_SELF_BIN="$bin" TOOLING_BUILD_GLOBAL_STAGE0_ROUTE=direct "$bin" "$@"
     return $?
   fi
   env TOOLING_SELF_BIN="$bin" "$bin" "$@"

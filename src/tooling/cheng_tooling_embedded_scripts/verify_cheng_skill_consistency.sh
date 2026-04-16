@@ -173,8 +173,8 @@ if [ "$skill_compile" = "1" ]; then
     driver="$(TOOLING_STAGE0_ALLOW_LEGACY_FALLBACK=0 BACKEND_DRIVER_PATH_ALLOW_SELFHOST="$allow_selfhost" ${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
   fi
   if [ "$driver" = "" ]; then
-    if [ -x "artifacts/backend_driver/cheng" ]; then
-      driver="artifacts/backend_driver/cheng"
+    if [ -x "artifacts/v3_backend_driver/cheng" ]; then
+      driver="artifacts/v3_backend_driver/cheng"
     elif [ -x "dist/releases/current/cheng" ]; then
       driver="dist/releases/current/cheng"
     fi

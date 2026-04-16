@@ -12,8 +12,10 @@ Usage:
   src/tooling/cheng_tooling_embedded_scripts/backend_driver_path.sh [--path-only]
 
 Notes:
-  - Resolves a healthy backend driver from the strict repo-local selfhost lineage first.
-  - Health probe is intentionally conservative: `--help` + system-link smoke.
+  - Old backend driver has been removed.
+  - This resolver now returns the v3 compatibility wrapper
+    `src/tooling/backend_driver_exec.sh`.
+  - Health probe is intentionally conservative: `--help` + compile smoke.
 EOF
 }
 
@@ -144,13 +146,6 @@ driver_ok() {
 
 find_fallback_driver() {
   for cand in \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage1" \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1" \
-    "$root/artifacts/backend_driver/cheng" \
-    "$root/artifacts/backend_driver/cheng.fixed3" \
     "$root/src/tooling/backend_driver_exec.sh"; do
     if driver_ok "$cand"; then
       printf '%s\n' "$cand"
@@ -204,15 +199,12 @@ fi
 
 resolved="$(find_fallback_driver || true)"
 if [ "$resolved" = "" ] && [ "${BACKEND_DRIVER_PATH_PREFER_REBUILD:-0}" = "1" ]; then
-  tool="$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh"
-  if [ -x "$tool" ]; then
-    set +e
-    sh "$tool" build_backend_driver --name:artifacts/backend_driver/cheng >/dev/null 2>&1
-    rebuild_status=$?
-    set -e
-    if [ "$rebuild_status" -eq 0 ]; then
-      resolved="$(find_fallback_driver || true)"
-    fi
+  set +e
+  sh "$root/v3/tooling/build_backend_driver_v3.sh" >/dev/null 2>&1
+  rebuild_status=$?
+  set -e
+  if [ "$rebuild_status" -eq 0 ]; then
+    resolved="$(find_fallback_driver || true)"
   fi
 fi
 

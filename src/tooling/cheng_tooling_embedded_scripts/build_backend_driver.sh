@@ -5,6 +5,4 @@ set -eu
 
 root="${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}"
 cd "$root"
-
-tool="$root/src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh"
-exec sh "$tool" build_backend_driver "$@"
+exec sh "$root/v3/tooling/build_backend_driver_v3.sh" "$@"

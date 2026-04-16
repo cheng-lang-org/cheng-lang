@@ -55,11 +55,12 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
-driver_file="src/backend/tooling/backend_driver.cheng"
+uir_types_file="src/backend/uir/uir_types.cheng"
+uir_semantic_file="src/backend/uir/uir_semantic_lowering.cheng"
+uir_opt_file="src/backend/uir/uir_opt.cheng"
 uir_builder_file="src/backend/uir/uir_internal/uir_core_builder.cheng"
-stage1_file="src/stage1/frontend_lib.cheng"
 
-for required in "$driver_file" "$uir_builder_file" "$stage1_file"; do
+for required in "$uir_types_file" "$uir_semantic_file" "$uir_opt_file" "$uir_builder_file"; do
   if [ ! -f "$required" ]; then
     echo "[build_backend_profile_schema] missing source file: $required" 1>&2
     exit 2
@@ -74,9 +75,10 @@ trap cleanup EXIT
 
 marker_regex='backend_profile|uir_profile|generics_report|\[stage1\] profile'
 rg --no-filename --no-line-number -o "$marker_regex" \
-  "$driver_file" \
+  "$uir_types_file" \
+  "$uir_semantic_file" \
+  "$uir_opt_file" \
   "$uir_builder_file" \
-  "$stage1_file" \
   | LC_ALL=C sort >"$tmp_markers"
 
 marker_count="$(wc -l < "$tmp_markers" | tr -d ' ')"
@@ -94,7 +96,7 @@ fi
   echo "BACKEND_PROFILE_SCHEMA_MARKER_REGEX=backend_profile|uir_profile|generics_report|\\\\[stage1\\\\]\\\\ profile"
   echo "BACKEND_PROFILE_SCHEMA_MARKER_COUNT=$marker_count"
   echo "BACKEND_PROFILE_SCHEMA_MARKER_SHA256=$marker_sha"
-  echo "BACKEND_PROFILE_SCHEMA_SOURCES=$driver_file,$uir_builder_file,$stage1_file"
+  echo "BACKEND_PROFILE_SCHEMA_SOURCES=$uir_types_file,$uir_semantic_file,$uir_opt_file,$uir_builder_file"
 } >"$out"
 
 echo "backend profile schema generated: $out"

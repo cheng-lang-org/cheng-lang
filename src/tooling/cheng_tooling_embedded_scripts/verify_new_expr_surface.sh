@@ -44,7 +44,13 @@ generic_compile_log="$out_dir/return_new_expr_infer_generic_box.compile.log"
 generic_run_log="$out_dir/return_new_expr_infer_generic_box.run.log"
 compat_stage0_default="$root/dist/releases/2026-02-23T09_54_03Z_e84f22d_14/cheng"
 compat_stage0="${NEW_EXPR_COMPAT_STAGE0:-$compat_stage0_default}"
-compat_driver="${NEW_EXPR_COMPAT_DRIVER:-$root/artifacts/backend_driver/cheng}"
+compat_driver="${NEW_EXPR_COMPAT_DRIVER:-}"
+if [ "$compat_driver" = "" ]; then
+  compat_driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
+fi
+if [ "$compat_driver" = "" ]; then
+  compat_driver="$root/artifacts/v3_backend_driver/cheng"
+fi
 compat_target="${NEW_EXPR_COMPAT_TARGET:-arm64-apple-darwin}"
 compat_report="$root/artifacts/new_expr_stage0_compat/new_expr_stage0_compat.report.txt"
 compat_compile_log=""

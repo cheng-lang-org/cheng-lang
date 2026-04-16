@@ -58,12 +58,7 @@ resolve_real_driver() {
   fi
 
   for cand in \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage1" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage1" \
-    "$root/artifacts/backend_driver/cheng" \
-    "$root/artifacts/backend_driver/cheng.fixed3"; do
+    "$root/artifacts/v3_backend_driver/cheng"; do
     if [ -x "$cand" ] && driver_current_contract_ok "$cand"; then
       printf '%s\n' "$cand"
       return 0

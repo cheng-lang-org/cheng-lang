@@ -6,11 +6,15 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-compat_header_file="src/runtime/native/system_helpers.h"
-backend_runtime_file="src/std/system_helpers_backend.cheng"
-runtime_bridge_shim="src/runtime/native/system_helpers_selflink_shim.c"
-runtime_bridge_iotime="src/runtime/native/system_helpers_io_time_bridge.c"
-runtime_bridge_host_process_ffi="src/runtime/native/system_helpers_host_process_ffi_bridge.c"
+# shellcheck disable=SC1091
+. "$root/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh"
+backend_runtime_abi_contract_load
+
+compat_header_file="$BACKEND_RUNTIME_ABI_COMPAT_HEADER"
+backend_runtime_file="$BACKEND_RUNTIME_ABI_AUTHORITY"
+runtime_bridge_shim="$BACKEND_RUNTIME_ABI_BRIDGE_SHIM"
+runtime_bridge_iotime="$BACKEND_RUNTIME_ABI_BRIDGE_IOTIME"
+runtime_bridge_host_process_ffi="$BACKEND_RUNTIME_ABI_BRIDGE_HOST_PROCESS_FFI"
 cc_bin="${CC:-cc}"
 tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/cheng_runtime_abi.XXXXXX")"
 
@@ -130,10 +134,7 @@ build_runtime_obj() {
   mkdir -p "$build_dir" "$(dirname "$out")"
   idx=0
   objs=""
-  for src in \
-    src/runtime/native/system_helpers_selflink_shim.c \
-    src/runtime/native/system_helpers_io_time_bridge.c \
-    src/runtime/native/system_helpers_host_process_ffi_bridge.c; do
+  for src in $(backend_runtime_abi_contract_each_runtime_bridge); do
     require_file "$src"
     obj="$build_dir/obj.$idx.o"
     log="$build_dir/obj.$idx.log"
@@ -206,11 +207,7 @@ resolve_runtime_obj() {
 
 authority_has_symbol() {
   sym="$1"
-  for src in \
-    "$backend_runtime_file" \
-    "$runtime_bridge_shim" \
-    "$runtime_bridge_iotime" \
-    "$runtime_bridge_host_process_ffi"; do
+  for src in $(backend_runtime_abi_contract_each_core_authority); do
     if rg -q "$sym" "$src"; then
       return 0
     fi
@@ -218,11 +215,7 @@ authority_has_symbol() {
   return 1
 }
 
-require_file "$backend_runtime_file"
-require_file "$compat_header_file"
-require_file "$runtime_bridge_shim"
-require_file "$runtime_bridge_iotime"
-require_file "$runtime_bridge_host_process_ffi"
+backend_runtime_abi_contract_require_core_files || fail "runtime ABI contract files missing"
 command -v rg >/dev/null 2>&1 || fail "rg is required"
 command -v nm >/dev/null 2>&1 || fail "nm is required"
 command -v "$cc_bin" >/dev/null 2>&1 || fail "C compiler not found: $cc_bin"

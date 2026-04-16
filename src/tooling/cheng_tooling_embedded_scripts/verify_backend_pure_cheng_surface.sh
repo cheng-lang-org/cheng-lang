@@ -16,6 +16,10 @@ USAGE
 root="${TOOLING_ROOT:-$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)}"
 cd "$root"
 
+# shellcheck disable=SC1091
+. "$root/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh"
+backend_runtime_abi_contract_load
+
 case "${1:-}" in
   --help|-h)
     usage
@@ -51,16 +55,11 @@ rm -rf "$out_dir"
 mkdir -p "$out_dir"
 
 {
-  printf '%s\n' "src/backend/tooling/backend_driver_proof.cheng"
-  printf '%s\n' "src/backend/tooling/backend_driver_uir_shared.cheng"
-  printf '%s\n' "src/backend/tooling/backend_driver_uir_module_shared.cheng"
-  printf '%s\n' "src/backend/tooling/backend_driver_uir_sidecar_wrapper.cheng"
-  printf '%s\n' "src/backend/tooling/backend_driver_uir_sidecar.cheng"
-  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/backend_driver_currentsrc_sidecar_wrapper.sh"
-  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/resolve_backend_sidecar_defaults.sh"
-  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/verify_backend_sidecar_cheng_fresh.sh"
-  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_bootstrap_self_obj.sh"
-  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/verify_backend_selfhost_currentsrc_proof.sh"
+  printf '%s\n' "src/tooling/cheng_tooling.cheng"
+  printf '%s\n' "src/tooling/cheng_tooling_embedded_scripts/chengc.sh"
+  printf '%s\n' "v3/src/tooling/compiler_main.cheng"
+  printf '%s\n' "v3/src/tooling/compiler_request.cheng"
+  printf '%s\n' "v3/src/tooling/compiler_runtime.cheng"
 } >"$active_surface_file"
 
 printf '%s\n' \
@@ -96,8 +95,9 @@ check_runtime_direct_recursion() {
   rm -f "$runtime_direct_recursion_file.tmp"
 }
 
-check_runtime_direct_recursion "$root/src/runtime/native/system_helpers_selflink_min_runtime.c"
-check_runtime_direct_recursion "$root/src/runtime/native/system_helpers_selflink_shim.c"
+for runtime_src in $(backend_runtime_abi_contract_each_runtime_bridge_abs); do
+  check_runtime_direct_recursion "$runtime_src"
+done
 
 active_c_compat_count="$(wc -l <"$active_c_compat_file" | tr -d ' ')"
 active_fallback_count="$(wc -l <"$active_fallback_file" | tr -d ' ')"

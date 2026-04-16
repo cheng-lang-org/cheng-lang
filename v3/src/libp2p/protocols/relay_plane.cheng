@@ -1,0 +1,419 @@
+import std/result
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+import cheng/v3/libp2p/core/types
+
+const
+    v3Libp2pRelayDescribeVersion: int32 = 1
+    v3Libp2pRelayLeaseVersion: int32 = 1
+
+type
+    V3Libp2pRelayDescribeRequest =
+        serviceKind: types.V3Libp2pRelayServiceKind
+        region: str
+
+    V3Libp2pRelayLeaseRequest =
+        requesterPeerId: types.V3Libp2pPeerId
+        serviceKind: types.V3Libp2pRelayServiceKind
+        region: str
+
+fn v3Libp2pRelayDescribeRequestZero(): V3Libp2pRelayDescribeRequest =
+    var out: V3Libp2pRelayDescribeRequest
+    out.serviceKind = types.v3Libp2pRelayServiceNone
+    out.region = ""
+    return out
+
+fn v3Libp2pRelayLeaseRequestZero(): V3Libp2pRelayLeaseRequest =
+    var out: V3Libp2pRelayLeaseRequest
+    out.requesterPeerId = types.v3Libp2pPeerIdZero()
+    out.serviceKind = types.v3Libp2pRelayServiceNone
+    out.region = ""
+    return out
+
+fn v3Libp2pRelayAppendU32(buf: var layout.ByteBuf, value: int32) =
+    layout.byteBufAppendByte(buf, (value >> 24) & 255)
+    layout.byteBufAppendByte(buf, (value >> 16) & 255)
+    layout.byteBufAppendByte(buf, (value >> 8) & 255)
+    layout.byteBufAppendByte(buf, value & 255)
+
+fn v3Libp2pRelayAppendI64(buf: var layout.ByteBuf, value: int64) =
+    v3Libp2pRelayAppendU32(buf, int32((value >> 32) & int64(0xffffffff)))
+    v3Libp2pRelayAppendU32(buf, int32(value & int64(0xffffffff)))
+
+fn v3Libp2pRelayAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
+    for i in 0..<layout.fixedBytes32Size:
+        layout.byteBufAppendByte(buf, int32(value.data[i]) & 255)
+
+fn v3Libp2pRelayAppendStr(buf: var layout.ByteBuf, text: str) =
+    let data = bytesFromString(text)
+    v3Libp2pRelayAppendU32(buf, bytesLen(data))
+    layout.byteBufAppendBytes(buf, data)
+
+fn v3Libp2pRelayReadU32(span: layout.ByteSpan, offset: int32): Result[int32] =
+    if offset < 0 || offset + 4 > layout.byteSpanLen(span):
+        return Err[int32]("v3 libp2p relay: short u32")
+    let b0 = layout.byteSpanAt(span, offset)
+    let b1 = layout.byteSpanAt(span, offset + 1)
+    let b2 = layout.byteSpanAt(span, offset + 2)
+    let b3 = layout.byteSpanAt(span, offset + 3)
+    return Ok[int32]((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+
+fn v3Libp2pRelayReadI64(span: layout.ByteSpan, offset: int32): Result[int64] =
+    let hiRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(hiRes):
+        return Err[int64](Error(hiRes))
+    let loRes = v3Libp2pRelayReadU32(span, offset + 4)
+    if IsErr(loRes):
+        return Err[int64](Error(loRes))
+    return Ok[int64]((int64(Value(hiRes)) << 32) | (int64(Value(loRes)) & int64(0xffffffff)))
+
+fn v3Libp2pRelayReadFixed32(span: layout.ByteSpan, offset: int32): Result[layout.FixedBytes32] =
+    if offset < 0 || offset + layout.fixedBytes32Size > layout.byteSpanLen(span):
+        return Err[layout.FixedBytes32]("v3 libp2p relay: short fixed32")
+    return layout.fixedBytes32FromBytes(layout.byteSpanToBytes(layout.byteSpanSlice(span,
+                                                                                   offset,
+                                                                                   layout.fixedBytes32Size)))
+
+fn v3Libp2pRelayReadStr(span: layout.ByteSpan, offset: int32): Result[str] =
+    let lenRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(lenRes):
+        return Err[str](Error(lenRes))
+    let size = Value(lenRes)
+    let start = offset + 4
+    if size < 0 || start + size > layout.byteSpanLen(span):
+        return Err[str]("v3 libp2p relay: short string")
+    let data = layout.byteSpanToBytes(layout.byteSpanSlice(span, start, size))
+    return Ok[str](bytesToString(data))
+
+fn v3Libp2pRelayStrNext(span: layout.ByteSpan, offset: int32): Result[int32] =
+    let lenRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(lenRes):
+        return Err[int32](Error(lenRes))
+    return Ok[int32](offset + 4 + Value(lenRes))
+
+fn v3Libp2pRelayKeyText(serviceKind: types.V3Libp2pRelayServiceKind,
+                        region: str): str =
+    var out = "relay/"
+    out = out + types.v3Libp2pRelayServiceText(serviceKind)
+    out = out + "/"
+    if len(region) > 0:
+        out = out + region
+        return out
+    out = out + "global"
+    return out
+
+fn v3Libp2pRelayKeyCid(serviceKind: types.V3Libp2pRelayServiceKind,
+                       region: str): layout.FixedBytes32 =
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(v3Libp2pRelayKeyText(serviceKind,
+                                                                                            region))))
+
+fn v3Libp2pRelayDescriptorMatches(descriptor: types.V3Libp2pRelayDescriptor,
+                                  serviceKind: types.V3Libp2pRelayServiceKind,
+                                  region: str,
+                                  epochSeconds: int64): bool =
+    if descriptor.serviceKind != serviceKind:
+        return false
+    if len(region) > 0 && descriptor.region != region:
+        return false
+    if !types.v3Libp2pRelayDescriptorActiveAt(descriptor, epochSeconds):
+        return false
+    return descriptor.health.healthy
+
+fn v3Libp2pRelayDescribeRequestEncode(serviceKind: types.V3Libp2pRelayServiceKind,
+                                      region: str): Bytes =
+    var buf = layout.byteBufInit(64)
+    v3Libp2pRelayAppendU32(buf, v3Libp2pRelayDescribeVersion)
+    v3Libp2pRelayAppendU32(buf, serviceKind)
+    v3Libp2pRelayAppendStr(buf, region)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pRelayDescribeRequestDecodeFill(out: var V3Libp2pRelayDescribeRequest,
+                                          payload: Bytes): Result[bool] =
+    var span = layout.byteSpanFromBytes(payload)
+    let versionRes = v3Libp2pRelayReadU32(span, 0)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3Libp2pRelayDescribeVersion:
+        return Err[bool]("v3 libp2p relay: describe version")
+    let serviceRes = v3Libp2pRelayReadU32(span, 4)
+    if IsErr(serviceRes):
+        return Err[bool](Error(serviceRes))
+    let regionRes = v3Libp2pRelayReadStr(span, 8)
+    if IsErr(regionRes):
+        return Err[bool](Error(regionRes))
+    out = v3Libp2pRelayDescribeRequestZero()
+    out.serviceKind = Value(serviceRes)
+    out.region = Value(regionRes)
+    return Ok[bool](true)
+
+fn v3Libp2pRelayDescriptorEncode(descriptor: types.V3Libp2pRelayDescriptor): Bytes =
+    var buf = layout.byteBufInit(128)
+    v3Libp2pRelayAppendFixed32(buf, descriptor.peerId.value)
+    v3Libp2pRelayAppendU32(buf, descriptor.serviceKind)
+    v3Libp2pRelayAppendStr(buf, descriptor.region)
+    v3Libp2pRelayAppendStr(buf, descriptor.endpointText)
+    v3Libp2pRelayAppendStr(buf, descriptor.authScope)
+    v3Libp2pRelayAppendU32(buf, int32(descriptor.requiresLease))
+    v3Libp2pRelayAppendI64(buf, descriptor.advertisedAtEpochSeconds)
+    v3Libp2pRelayAppendU32(buf, descriptor.ttlSeconds)
+    v3Libp2pRelayAppendU32(buf, int32(descriptor.health.healthy))
+    v3Libp2pRelayAppendI64(buf, descriptor.health.sampledAtEpochSeconds)
+    v3Libp2pRelayAppendU32(buf, descriptor.health.successPermille)
+    v3Libp2pRelayAppendU32(buf, descriptor.health.loadPermille)
+    v3Libp2pRelayAppendU32(buf, descriptor.health.capacityPermille)
+    v3Libp2pRelayAppendI64(buf, descriptor.health.failureCooldownUntilEpochSeconds)
+    v3Libp2pRelayAppendStr(buf, descriptor.health.lastError)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pRelayDescriptorDecodeFill(out: var types.V3Libp2pRelayDescriptor,
+                                     payload: Bytes): Result[bool] =
+    var span = layout.byteSpanFromBytes(payload)
+    var offset = 0
+    let peerRes = v3Libp2pRelayReadFixed32(span, offset)
+    if IsErr(peerRes):
+        return Err[bool](Error(peerRes))
+    offset = offset + layout.fixedBytes32Size
+    let serviceRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(serviceRes):
+        return Err[bool](Error(serviceRes))
+    offset = offset + 4
+    let regionRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(regionRes):
+        return Err[bool](Error(regionRes))
+    let regionNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(regionNextRes):
+        return Err[bool](Error(regionNextRes))
+    offset = Value(regionNextRes)
+    let endpointRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    let endpointNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(endpointNextRes):
+        return Err[bool](Error(endpointNextRes))
+    offset = Value(endpointNextRes)
+    let scopeRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(scopeRes):
+        return Err[bool](Error(scopeRes))
+    let scopeNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(scopeNextRes):
+        return Err[bool](Error(scopeNextRes))
+    offset = Value(scopeNextRes)
+    let requiresLeaseRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(requiresLeaseRes):
+        return Err[bool](Error(requiresLeaseRes))
+    offset = offset + 4
+    let advertisedRes = v3Libp2pRelayReadI64(span, offset)
+    if IsErr(advertisedRes):
+        return Err[bool](Error(advertisedRes))
+    offset = offset + 8
+    let ttlRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(ttlRes):
+        return Err[bool](Error(ttlRes))
+    offset = offset + 4
+    let healthyRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(healthyRes):
+        return Err[bool](Error(healthyRes))
+    offset = offset + 4
+    let sampledRes = v3Libp2pRelayReadI64(span, offset)
+    if IsErr(sampledRes):
+        return Err[bool](Error(sampledRes))
+    offset = offset + 8
+    let successRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(successRes):
+        return Err[bool](Error(successRes))
+    offset = offset + 4
+    let loadRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    offset = offset + 4
+    let capacityRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(capacityRes):
+        return Err[bool](Error(capacityRes))
+    offset = offset + 4
+    let cooldownRes = v3Libp2pRelayReadI64(span, offset)
+    if IsErr(cooldownRes):
+        return Err[bool](Error(cooldownRes))
+    offset = offset + 8
+    let errRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(errRes):
+        return Err[bool](Error(errRes))
+    out = types.v3Libp2pRelayDescriptorZero()
+    out.peerId.value = Value(peerRes)
+    out.serviceKind = Value(serviceRes)
+    out.region = Value(regionRes)
+    out.endpointText = Value(endpointRes)
+    out.authScope = Value(scopeRes)
+    out.requiresLease = Value(requiresLeaseRes) != 0
+    out.advertisedAtEpochSeconds = Value(advertisedRes)
+    out.ttlSeconds = Value(ttlRes)
+    out.health.healthy = Value(healthyRes) != 0
+    out.health.sampledAtEpochSeconds = Value(sampledRes)
+    out.health.successPermille = Value(successRes)
+    out.health.loadPermille = Value(loadRes)
+    out.health.capacityPermille = Value(capacityRes)
+    out.health.failureCooldownUntilEpochSeconds = Value(cooldownRes)
+    out.health.lastError = Value(errRes)
+    return Ok[bool](true)
+
+fn v3Libp2pRelayDescriptorListEncode(descriptors: types.V3Libp2pRelayDescriptor[]): Bytes =
+    var buf = layout.byteBufInit(256)
+    v3Libp2pRelayAppendU32(buf, v3Libp2pRelayDescribeVersion)
+    v3Libp2pRelayAppendU32(buf, descriptors.len)
+    for i in 0..<descriptors.len:
+        let payload = v3Libp2pRelayDescriptorEncode(descriptors[i])
+        v3Libp2pRelayAppendU32(buf, bytesLen(payload))
+        layout.byteBufAppendBytes(buf, payload)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pRelayDescriptorListDecodeFill(out: var types.V3Libp2pRelayDescriptor[],
+                                         payload: Bytes): Result[bool] =
+    out = []
+    var span = layout.byteSpanFromBytes(payload)
+    let versionRes = v3Libp2pRelayReadU32(span, 0)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3Libp2pRelayDescribeVersion:
+        return Err[bool]("v3 libp2p relay: describe response version")
+    let countRes = v3Libp2pRelayReadU32(span, 4)
+    if IsErr(countRes):
+        return Err[bool](Error(countRes))
+    var offset = 8
+    for i in 0..<Value(countRes):
+        let sizeRes = v3Libp2pRelayReadU32(span, offset)
+        if IsErr(sizeRes):
+            return Err[bool](Error(sizeRes))
+        offset = offset + 4
+        let size = Value(sizeRes)
+        if size < 0 || offset + size > layout.byteSpanLen(span):
+            return Err[bool]("v3 libp2p relay: descriptor response short")
+        let itemBytes = layout.byteSpanToBytes(layout.byteSpanSlice(span, offset, size))
+        offset = offset + size
+        var descriptor = types.v3Libp2pRelayDescriptorZero()
+        let decodeRes = v3Libp2pRelayDescriptorDecodeFill(descriptor, itemBytes)
+        if IsErr(decodeRes):
+            return Err[bool](Error(decodeRes))
+        add(out, descriptor)
+    return Ok[bool](true)
+
+fn v3Libp2pRelayLeaseRequestEncode(requesterPeerId: types.V3Libp2pPeerId,
+                                   serviceKind: types.V3Libp2pRelayServiceKind,
+                                   region: str): Bytes =
+    var buf = layout.byteBufInit(96)
+    v3Libp2pRelayAppendU32(buf, v3Libp2pRelayLeaseVersion)
+    v3Libp2pRelayAppendFixed32(buf, requesterPeerId.value)
+    v3Libp2pRelayAppendU32(buf, serviceKind)
+    v3Libp2pRelayAppendStr(buf, region)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pRelayLeaseRequestDecodeFill(out: var V3Libp2pRelayLeaseRequest,
+                                       payload: Bytes): Result[bool] =
+    var span = layout.byteSpanFromBytes(payload)
+    let versionRes = v3Libp2pRelayReadU32(span, 0)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3Libp2pRelayLeaseVersion:
+        return Err[bool]("v3 libp2p relay: lease request version")
+    let peerRes = v3Libp2pRelayReadFixed32(span, 4)
+    if IsErr(peerRes):
+        return Err[bool](Error(peerRes))
+    let serviceRes = v3Libp2pRelayReadU32(span, 4 + layout.fixedBytes32Size)
+    if IsErr(serviceRes):
+        return Err[bool](Error(serviceRes))
+    let regionRes = v3Libp2pRelayReadStr(span, 8 + layout.fixedBytes32Size)
+    if IsErr(regionRes):
+        return Err[bool](Error(regionRes))
+    out = v3Libp2pRelayLeaseRequestZero()
+    out.requesterPeerId.value = Value(peerRes)
+    out.serviceKind = Value(serviceRes)
+    out.region = Value(regionRes)
+    return Ok[bool](true)
+
+fn v3Libp2pRelayLeaseEncode(lease: types.V3Libp2pRelayLease): Bytes =
+    var buf = layout.byteBufInit(192)
+    v3Libp2pRelayAppendU32(buf, v3Libp2pRelayLeaseVersion)
+    v3Libp2pRelayAppendFixed32(buf, lease.relayPeerId.value)
+    v3Libp2pRelayAppendFixed32(buf, lease.requesterPeerId.value)
+    v3Libp2pRelayAppendU32(buf, lease.serviceKind)
+    v3Libp2pRelayAppendStr(buf, lease.region)
+    v3Libp2pRelayAppendStr(buf, lease.endpointText)
+    v3Libp2pRelayAppendStr(buf, lease.username)
+    v3Libp2pRelayAppendStr(buf, lease.credential)
+    v3Libp2pRelayAppendI64(buf, lease.issuedAtEpochSeconds)
+    v3Libp2pRelayAppendI64(buf, lease.expiresAtEpochSeconds)
+    v3Libp2pRelayAppendFixed32(buf, lease.nonce)
+    return layout.byteBufToBytes(buf)
+
+fn v3Libp2pRelayLeaseDecodeFill(out: var types.V3Libp2pRelayLease,
+                                payload: Bytes): Result[bool] =
+    var span = layout.byteSpanFromBytes(payload)
+    var offset = 0
+    let versionRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(versionRes):
+        return Err[bool](Error(versionRes))
+    if Value(versionRes) != v3Libp2pRelayLeaseVersion:
+        return Err[bool]("v3 libp2p relay: lease version")
+    offset = offset + 4
+    let relayPeerRes = v3Libp2pRelayReadFixed32(span, offset)
+    if IsErr(relayPeerRes):
+        return Err[bool](Error(relayPeerRes))
+    offset = offset + layout.fixedBytes32Size
+    let requesterPeerRes = v3Libp2pRelayReadFixed32(span, offset)
+    if IsErr(requesterPeerRes):
+        return Err[bool](Error(requesterPeerRes))
+    offset = offset + layout.fixedBytes32Size
+    let serviceRes = v3Libp2pRelayReadU32(span, offset)
+    if IsErr(serviceRes):
+        return Err[bool](Error(serviceRes))
+    offset = offset + 4
+    let regionRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(regionRes):
+        return Err[bool](Error(regionRes))
+    let regionNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(regionNextRes):
+        return Err[bool](Error(regionNextRes))
+    offset = Value(regionNextRes)
+    let endpointRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(endpointRes):
+        return Err[bool](Error(endpointRes))
+    let endpointNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(endpointNextRes):
+        return Err[bool](Error(endpointNextRes))
+    offset = Value(endpointNextRes)
+    let userRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(userRes):
+        return Err[bool](Error(userRes))
+    let userNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(userNextRes):
+        return Err[bool](Error(userNextRes))
+    offset = Value(userNextRes)
+    let credentialRes = v3Libp2pRelayReadStr(span, offset)
+    if IsErr(credentialRes):
+        return Err[bool](Error(credentialRes))
+    let credentialNextRes = v3Libp2pRelayStrNext(span, offset)
+    if IsErr(credentialNextRes):
+        return Err[bool](Error(credentialNextRes))
+    offset = Value(credentialNextRes)
+    let issuedRes = v3Libp2pRelayReadI64(span, offset)
+    if IsErr(issuedRes):
+        return Err[bool](Error(issuedRes))
+    offset = offset + 8
+    let expiresRes = v3Libp2pRelayReadI64(span, offset)
+    if IsErr(expiresRes):
+        return Err[bool](Error(expiresRes))
+    offset = offset + 8
+    let nonceRes = v3Libp2pRelayReadFixed32(span, offset)
+    if IsErr(nonceRes):
+        return Err[bool](Error(nonceRes))
+    out = types.v3Libp2pRelayLeaseZero()
+    out.relayPeerId.value = Value(relayPeerRes)
+    out.requesterPeerId.value = Value(requesterPeerRes)
+    out.serviceKind = Value(serviceRes)
+    out.region = Value(regionRes)
+    out.endpointText = Value(endpointRes)
+    out.username = Value(userRes)
+    out.credential = Value(credentialRes)
+    out.issuedAtEpochSeconds = Value(issuedRes)
+    out.expiresAtEpochSeconds = Value(expiresRes)
+    out.nonce = Value(nonceRes)
+    return Ok[bool](true)

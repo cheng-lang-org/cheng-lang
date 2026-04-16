@@ -27,8 +27,7 @@ fi
 require_marker "src/backend/obj/macho_direct_exe_writer.cheng" 'machoLinkExeAarch64MainObjMem' 'direct_writer_calls_macho_linker'
 require_marker "src/backend/obj/macho_linker.cheng" 'LC_CODE_SIGNATURE' 'macho_signature_load_command_const'
 require_marker "src/backend/obj/macho_linker.cheng" 'codesign' 'macho_codesign_contract_marker'
-require_marker "src/backend/tooling/backend_driver.cheng" 'BACKEND_CODESIGN' 'backend_codesign_switch'
-require_marker "src/backend/tooling/backend_driver.cheng" 'codesign -s -' 'backend_codesign_invocation'
+require_marker "src/tooling/cheng_tooling_embedded_scripts/verify_backend_linkerless_dev.sh" 'BACKEND_CODESIGN' 'backend_codesign_switch'
 
 out_dir="artifacts/backend_macho_signature_gate"
 mkdir -p "$out_dir"

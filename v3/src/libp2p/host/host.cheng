@@ -1,7 +1,10 @@
 import std/result
 import std/rawbytes
+import std/times
+import std/strings
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/overlay/contracts as overlay
+import cheng/v3/std/crypto/hash256
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/peer_id
 import cheng/v3/libp2p/core/multiaddr
@@ -13,9 +16,12 @@ import cheng/v3/libp2p/identity/did
 import cheng/v3/libp2p/protocols/identify
 import cheng/v3/libp2p/protocols/gossipsub as gossip
 import cheng/v3/libp2p/protocols/webrtc_signal
+import cheng/v3/libp2p/protocols/relay_plane
 import cheng/v3/libp2p/protocols/store_sync as store_sync
 import cheng/v3/libp2p/transports/tcp_transport
 import cheng/v3/libp2p/transports/webrtc_transport
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
+import cheng/v3/libp2p/transports/relay_provider
 import cheng/v3/chain/pin_plane as pin
 import cheng/v3/chain/pin_runtime as pin_runtime
 import cheng/v3/chain/erasure_swarm as swarm
@@ -31,6 +37,11 @@ type
         streamCount: int32
         syncRequestCount: int32
         syncServeCount: int32
+
+    V3Libp2pRelayCandidate =
+        peerId: types.V3Libp2pPeerId
+        descriptor: types.V3Libp2pRelayDescriptor
+        weight: int32
 
     V3Libp2pHost =
         selfPeerId: types.V3Libp2pPeerId
@@ -58,6 +69,9 @@ type
         webrtcSignalEgressPayloads: Bytes[]
         webrtcBrowserSessionPeers: types.V3Libp2pPeerId[]
         webrtcBrowserSessions: webrtc_transport.V3Libp2pWebrtcBrowserSession[]
+        relayProviders: relay_provider.V3Libp2pRelayProvider[]
+        relayDescriptors: types.V3Libp2pRelayDescriptor[]
+        relayLeaseCounter: int64
 
 fn v3Libp2pHostInit(seed: str): V3Libp2pHost =
     var selfPeer: types.V3Libp2pPeerId
@@ -89,6 +103,9 @@ fn v3Libp2pHostInit(seed: str): V3Libp2pHost =
     out.webrtcSignalEgressPayloads = []
     out.webrtcBrowserSessionPeers = []
     out.webrtcBrowserSessions = []
+    out.relayProviders = []
+    out.relayDescriptors = []
+    out.relayLeaseCounter = int64(0)
     return out
 
 fn v3Libp2pHostInitWithDid(identity: did.V3DidIdentity): V3Libp2pHost =
@@ -156,8 +173,414 @@ fn v3Libp2pWebrtcSignalEgressCount(host: V3Libp2pHost): int32 =
 fn v3Libp2pHostRefreshLocalResources(host: var V3Libp2pHost) =
     host.selfResources = resources.v3Libp2pNodeResourceCollectLocal()
 
+fn v3Libp2pHostObserveSelfResources(host: var V3Libp2pHost,
+                                    sample: types.V3Libp2pNodeResource) =
+    host.selfResources = resources.v3Libp2pNodeResourceClone(sample)
+
 fn v3Libp2pHostSelfResources(host: V3Libp2pHost): types.V3Libp2pNodeResource =
     return resources.v3Libp2pNodeResourceClone(host.selfResources)
+
+fn v3Libp2pRelayCandidateZero(): V3Libp2pRelayCandidate =
+    var out: V3Libp2pRelayCandidate
+    out.peerId = types.v3Libp2pPeerIdZero()
+    out.descriptor = types.v3Libp2pRelayDescriptorZero()
+    out.weight = 0
+    return out
+
+fn v3Libp2pRelayRegionIsGlobal(region: str): bool =
+    return len(region) <= 0 || region == "global"
+
+fn v3Libp2pRelayRegionMatches(descriptorRegion: str,
+                              requestedRegion: str): bool =
+    if len(requestedRegion) <= 0:
+        return true
+    if descriptorRegion == requestedRegion:
+        return true
+    return v3Libp2pRelayRegionIsGlobal(descriptorRegion)
+
+fn v3Libp2pRelayPermilleClamp(value: int32): int32 =
+    if value < 0:
+        return 0
+    if value > 1000:
+        return 1000
+    return value
+
+fn v3Libp2pRelayAvailablePermille(availableBytes: int64,
+                                  totalBytes: int64): int32 =
+    if totalBytes <= int64(0):
+        return 1000
+    if availableBytes <= int64(0):
+        return 0
+    let permille = int32((availableBytes * int64(1000)) / totalBytes)
+    return v3Libp2pRelayPermilleClamp(permille)
+
+fn v3Libp2pRelayLoadPermille(sample: types.V3Libp2pNodeResource): int32 =
+    let availablePermille = v3Libp2pRelayAvailablePermille(sample.memoryAvailableBytes,
+                                                           sample.memoryTotalBytes)
+    return v3Libp2pRelayPermilleClamp(1000 - availablePermille)
+
+fn v3Libp2pRelayCapacityPermille(sample: types.V3Libp2pNodeResource): int32 =
+    let memoryPermille = v3Libp2pRelayAvailablePermille(sample.memoryAvailableBytes,
+                                                        sample.memoryTotalBytes)
+    let diskPermille = v3Libp2pRelayAvailablePermille(sample.diskAvailableBytes,
+                                                      sample.diskTotalBytes)
+    if sample.diskTotalBytes <= int64(0):
+        return memoryPermille
+    if diskPermille < memoryPermille:
+        return diskPermille
+    return memoryPermille
+
+fn v3Libp2pRelayHealthAllowed(sample: types.V3Libp2pNodeResource): bool =
+    return v3Libp2pRelayCapacityPermille(sample) >= 100
+
+fn v3Libp2pHostPublicWebrtcAddrFill(host: V3Libp2pHost,
+                                    out: var types.V3Libp2pMultiaddr): bool =
+    for i in 0..<host.listenAddrs.len:
+        let addr = host.listenAddrs[i]
+        if addr.transport != types.v3Libp2pTransportWebrtc:
+            continue
+        if addr.networkDomain != types.v3Libp2pNetworkDomainPublic:
+            continue
+        if addr.visibility != types.v3Libp2pVisibilityPublic:
+            continue
+        out = multiaddr.v3Libp2pMultiaddrClone(addr)
+        return true
+    out = types.v3Libp2pMultiaddrZero()
+    return false
+
+fn v3Libp2pHostRelayAuthScope(host: V3Libp2pHost): str =
+    return "cheng-v3-relay"
+
+fn v3Libp2pHostRelayLocalRegion(regionHint: str,
+                                derpRegionCode: str): str =
+    if len(regionHint) > 0:
+        return regionHint
+    if len(derpRegionCode) > 0:
+        return derpRegionCode
+    return "global"
+
+fn v3Libp2pHostRelayRequesterAuthenticated(host: V3Libp2pHost,
+                                           requesterPeerId: types.V3Libp2pPeerId): bool =
+    if types.v3Libp2pPeerIdEqual(requesterPeerId, types.v3Libp2pPeerIdZero()):
+        return false
+    let pos = ps.v3Libp2pPeerstorePos(host.peers, requesterPeerId)
+    if pos < 0:
+        return false
+    return host.peers.peers[pos].connected
+
+fn v3Libp2pHostRelayProviderPos(host: V3Libp2pHost,
+                                serviceKind: types.V3Libp2pRelayServiceKind,
+                                endpointText: str): int32 =
+    for i in 0..<host.relayProviders.len:
+        if host.relayProviders[i].serviceKind != serviceKind:
+            continue
+        if host.relayProviders[i].endpointText != endpointText:
+            continue
+        return i
+    return -1
+
+fn v3Libp2pHostRelaySyncSelfRecord(host: var V3Libp2pHost) =
+    var record = ps.v3Libp2pPeerRecordZero()
+    let pos = ps.v3Libp2pPeerstorePos(host.peers, host.selfPeerId)
+    if pos >= 0:
+        record = host.peers.peers[pos]
+    record.peerId = host.selfPeerId
+    record.trustedInfra = host.trustedInfra
+    record.relayEntries = []
+    for i in 0..<host.relayDescriptors.len:
+        ps.v3Libp2pPeerRecordPutRelayDescriptor(record, host.relayDescriptors[i])
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+
+fn v3Libp2pHostRelayUnpublishDescriptor(host: var V3Libp2pHost,
+                                        descriptor: types.V3Libp2pRelayDescriptor) =
+    let regionKey = relay_plane.v3Libp2pRelayKeyCid(descriptor.serviceKind, descriptor.region)
+    kad.v3Libp2pKadRemoveProvider(host.kadState, regionKey, host.selfPeerId)
+    if !v3Libp2pRelayRegionIsGlobal(descriptor.region):
+        let globalKey = relay_plane.v3Libp2pRelayKeyCid(descriptor.serviceKind, "global")
+        kad.v3Libp2pKadRemoveProvider(host.kadState, globalKey, host.selfPeerId)
+
+fn v3Libp2pHostRelayRemoveLocalDescriptor(host: var V3Libp2pHost,
+                                          serviceKind: types.V3Libp2pRelayServiceKind,
+                                          endpointText: str) =
+    var nextDescriptors: types.V3Libp2pRelayDescriptor[]
+    var nextProviders: relay_provider.V3Libp2pRelayProvider[]
+    nextDescriptors = []
+    nextProviders = []
+    for i in 0..<host.relayDescriptors.len:
+        let descriptor = host.relayDescriptors[i]
+        if descriptor.serviceKind == serviceKind && descriptor.endpointText == endpointText:
+            v3Libp2pHostRelayUnpublishDescriptor(host, descriptor)
+            continue
+        add(nextDescriptors, descriptor)
+    for i in 0..<host.relayProviders.len:
+        let provider = host.relayProviders[i]
+        if provider.serviceKind == serviceKind && provider.endpointText == endpointText:
+            var providerToClose = provider
+            relay_provider.v3Libp2pRelayProviderClose(providerToClose)
+            continue
+        add(nextProviders, provider)
+    host.relayDescriptors = nextDescriptors
+    host.relayProviders = nextProviders
+    v3Libp2pHostRelaySyncSelfRecord(host)
+
+fn v3Libp2pHostRelayClearLocalState(host: var V3Libp2pHost) =
+    for i in 0..<host.relayDescriptors.len:
+        v3Libp2pHostRelayUnpublishDescriptor(host, host.relayDescriptors[i])
+    for i in 0..<host.relayProviders.len:
+        var provider = host.relayProviders[i]
+        relay_provider.v3Libp2pRelayProviderClose(provider)
+    host.relayProviders = []
+    host.relayDescriptors = []
+    v3Libp2pHostRelaySyncSelfRecord(host)
+
+fn v3Libp2pHostRelayAdvertiseDescriptor(host: var V3Libp2pHost,
+                                        serviceKind: types.V3Libp2pRelayServiceKind,
+                                        endpointText: str,
+                                        region: str,
+                                        authScope: str,
+                                        advertisedAtEpochSeconds: int64,
+                                        ttlSeconds: int32): Result[bool] =
+    var provider = relay_provider.v3Libp2pRelayProviderZero()
+    let openRes = relay_provider.v3Libp2pRelayProviderOpenFill(provider,
+                                                               serviceKind,
+                                                               endpointText,
+                                                               region,
+                                                               authScope,
+                                                               types.v3Libp2pRelayServiceRequiresLease(serviceKind))
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    var health = types.v3Libp2pRelayHealthZero()
+    let healthRes = relay_provider.v3Libp2pRelayProviderProbeHealthFill(health,
+                                                                        provider,
+                                                                        advertisedAtEpochSeconds)
+    if IsErr(healthRes):
+        var providerToClose = provider
+        relay_provider.v3Libp2pRelayProviderClose(providerToClose)
+        return Err[bool](Error(healthRes))
+    let resourceLoadPermille = v3Libp2pRelayLoadPermille(host.selfResources)
+    let resourceCapacityPermille = v3Libp2pRelayCapacityPermille(host.selfResources)
+    if resourceLoadPermille > health.loadPermille:
+        health.loadPermille = resourceLoadPermille
+    if resourceCapacityPermille < health.capacityPermille:
+        health.capacityPermille = resourceCapacityPermille
+    if health.capacityPermille < 100 || health.loadPermille >= 950:
+        health.healthy = false
+        if len(health.lastError) <= 0:
+            health.lastError = "v3 libp2p host: relay capacity exhausted"
+    if !health.healthy:
+        var providerToClose = provider
+        relay_provider.v3Libp2pRelayProviderClose(providerToClose)
+        return Ok[bool](false)
+    var descriptor = types.v3Libp2pRelayDescriptorZero()
+    descriptor.peerId = host.selfPeerId
+    descriptor.serviceKind = serviceKind
+    descriptor.region = v3Libp2pHostRelayOwnedText(region)
+    descriptor.endpointText = v3Libp2pHostRelayOwnedText(endpointText)
+    descriptor.authScope = v3Libp2pHostRelayOwnedText(authScope)
+    descriptor.requiresLease = types.v3Libp2pRelayServiceRequiresLease(serviceKind)
+    descriptor.advertisedAtEpochSeconds = advertisedAtEpochSeconds
+    descriptor.ttlSeconds = ttlSeconds
+    descriptor.health = health
+    var storedProvider = relay_provider.v3Libp2pRelayProviderZero()
+    storedProvider.handle = provider.handle
+    storedProvider.serviceKind = serviceKind
+    storedProvider.endpointText = v3Libp2pHostRelayOwnedText(endpointText)
+    storedProvider.region = v3Libp2pHostRelayOwnedText(region)
+    storedProvider.authScope = v3Libp2pHostRelayOwnedText(authScope)
+    storedProvider.requiresLease = types.v3Libp2pRelayServiceRequiresLease(serviceKind)
+    var storedDescriptor = types.v3Libp2pRelayDescriptorZero()
+    storedDescriptor.peerId = descriptor.peerId
+    storedDescriptor.serviceKind = descriptor.serviceKind
+    storedDescriptor.region = descriptor.region
+    storedDescriptor.endpointText = descriptor.endpointText
+    storedDescriptor.authScope = descriptor.authScope
+    storedDescriptor.requiresLease = descriptor.requiresLease
+    storedDescriptor.advertisedAtEpochSeconds = descriptor.advertisedAtEpochSeconds
+    storedDescriptor.ttlSeconds = descriptor.ttlSeconds
+    storedDescriptor.health = descriptor.health
+    add(host.relayProviders, storedProvider)
+    add(host.relayDescriptors, storedDescriptor)
+    kad.v3Libp2pKadProvide(host.kadState,
+                           relay_plane.v3Libp2pRelayKeyCid(serviceKind, region),
+                           host.selfPeerId)
+    if !v3Libp2pRelayRegionIsGlobal(region):
+        kad.v3Libp2pKadProvide(host.kadState,
+                               relay_plane.v3Libp2pRelayKeyCid(serviceKind, "global"),
+                               host.selfPeerId)
+    return Ok[bool](true)
+
+fn v3Libp2pHostRelayEndpointText(scheme: str,
+                                 publicHost: str,
+                                 publicPort: int32): str =
+    var endpointText = scheme
+    endpointText = endpointText + ":"
+    endpointText = endpointText + publicHost
+    endpointText = endpointText + ":"
+    endpointText = endpointText + intToStr(publicPort)
+    return endpointText
+
+fn v3Libp2pHostRelayOwnedText(text: str): str =
+    if strLenFast(text) <= 0:
+        return ""
+    return newStringCopy(strDataPtr(text), strLenFast(text))
+
+fn v3Libp2pHostRelayAdvertiseStun(host: var V3Libp2pHost,
+                                  publicHost: str,
+                                  publicPort: int32,
+                                  region: str,
+                                  authScope: str,
+                                  advertisedAtEpochSeconds: int64,
+                                  ttlSeconds: int32): Result[bool] =
+    let endpointText = v3Libp2pHostRelayEndpointText("stun", publicHost, publicPort)
+    return v3Libp2pHostRelayAdvertiseDescriptor(host,
+                                                types.v3Libp2pRelayServiceStun,
+                                                endpointText,
+                                                region,
+                                                authScope,
+                                                advertisedAtEpochSeconds,
+                                                ttlSeconds)
+
+fn v3Libp2pHostRelayAdvertiseTurn(host: var V3Libp2pHost,
+                                  publicHost: str,
+                                  publicPort: int32,
+                                  region: str,
+                                  authScope: str,
+                                  advertisedAtEpochSeconds: int64,
+                                  ttlSeconds: int32): Result[bool] =
+    let endpointText = v3Libp2pHostRelayEndpointText("turn", publicHost, publicPort)
+    return v3Libp2pHostRelayAdvertiseDescriptor(host,
+                                                types.v3Libp2pRelayServiceTurn,
+                                                endpointText,
+                                                region,
+                                                authScope,
+                                                advertisedAtEpochSeconds,
+                                                ttlSeconds)
+
+fn v3Libp2pHostRelayAdvertiseTsnet(host: var V3Libp2pHost,
+                                   endpointText: str,
+                                   region: str,
+                                   authScope: str,
+                                   advertisedAtEpochSeconds: int64,
+                                   ttlSeconds: int32): Result[bool] =
+    return v3Libp2pHostRelayAdvertiseDescriptor(host,
+                                                types.v3Libp2pRelayServiceTsnet,
+                                                endpointText,
+                                                region,
+                                                authScope,
+                                                advertisedAtEpochSeconds,
+                                                ttlSeconds)
+
+fn v3Libp2pHostRelayNonce(host: var V3Libp2pHost,
+                          requesterPeerId: types.V3Libp2pPeerId,
+                          serviceKind: types.V3Libp2pRelayServiceKind,
+                          region: str,
+                          issuedAtEpochSeconds: int64): layout.FixedBytes32 =
+    host.relayLeaseCounter = host.relayLeaseCounter + int64(1)
+    let payload = "v3.libp2p.relay.lease|" +
+                  peer_id.v3Libp2pPeerIdText(host.selfPeerId) + "|" +
+                  peer_id.v3Libp2pPeerIdText(requesterPeerId) + "|" +
+                  types.v3Libp2pRelayServiceText(serviceKind) + "|" +
+                  region + "|" +
+                  strings.int64ToStr(issuedAtEpochSeconds) + "|" +
+                  strings.int64ToStr(host.relayLeaseCounter)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(payload)))
+
+fn v3Libp2pHostRefreshRelayRoleApply(host: var V3Libp2pHost,
+                                     regionHint: str,
+                                     ttlSeconds: int32,
+                                     tsnetReady: bool,
+                                     tsnetDerpHealthy: bool,
+                                     tsnetRelayEndpoint: str,
+                                     tsnetDerpRegionCode: str): Result[bool] =
+    let advertisedAt = times.epochTimeSeconds()
+    var nextTtl = ttlSeconds
+    if nextTtl <= 0:
+        nextTtl = 60
+    v3Libp2pHostRelayClearLocalState(host)
+    if !host.trustedInfra:
+        return Ok[bool](true)
+    if !v3Libp2pRelayHealthAllowed(host.selfResources):
+        return Ok[bool](true)
+    v3Libp2pRegisterHandler(host, types.v3Libp2pProtocolRelayDescribe)
+    v3Libp2pRegisterHandler(host, types.v3Libp2pProtocolRelayLease)
+    let authScope = v3Libp2pHostRelayAuthScope(host)
+    let defaultRegion = v3Libp2pHostRelayLocalRegion(regionHint, tsnetDerpRegionCode)
+    let tsnetRelayRegion = defaultRegion
+    var publishedHealthy = true
+    var publicWebrtcAddr = types.v3Libp2pMultiaddrZero()
+    let hasPublicWebrtcAddr = v3Libp2pHostPublicWebrtcAddrFill(host, publicWebrtcAddr)
+    let hasWebrtcSignal = v3Libp2pProtocolRegistered(host, types.v3Libp2pProtocolWebrtcSignal)
+    if hasPublicWebrtcAddr:
+        if hasWebrtcSignal:
+            let stunRes = v3Libp2pHostRelayAdvertiseStun(host,
+                                                         publicWebrtcAddr.host,
+                                                         publicWebrtcAddr.port,
+                                                         defaultRegion,
+                                                         authScope,
+                                                         advertisedAt,
+                                                         nextTtl)
+            if IsErr(stunRes):
+                return Err[bool](Error(stunRes))
+            if !Value(stunRes):
+                publishedHealthy = false
+            let turnRes = v3Libp2pHostRelayAdvertiseTurn(host,
+                                                         publicWebrtcAddr.host,
+                                                         publicWebrtcAddr.port,
+                                                         defaultRegion,
+                                                         authScope,
+                                                         advertisedAt,
+                                                         nextTtl)
+            if IsErr(turnRes):
+                return Err[bool](Error(turnRes))
+            if !Value(turnRes):
+                publishedHealthy = false
+    if tsnetReady:
+        if tsnetDerpHealthy:
+            if len(tsnetRelayEndpoint) > 0:
+                let tsnetRes = v3Libp2pHostRelayAdvertiseTsnet(host,
+                                                               tsnetRelayEndpoint,
+                                                               tsnetRelayRegion,
+                                                               authScope,
+                                                               advertisedAt,
+                                                               nextTtl)
+                if IsErr(tsnetRes):
+                    return Err[bool](Error(tsnetRes))
+                if !Value(tsnetRes):
+                    publishedHealthy = false
+    v3Libp2pHostRelaySyncSelfRecord(host)
+    return Ok[bool](publishedHealthy)
+
+fn v3Libp2pHostRefreshRelayRole(host: var V3Libp2pHost,
+                                transport: tsnet.V3Libp2pTailnetTransport,
+                                regionHint: str,
+                                ttlSeconds: int32): Result[bool] =
+    var tsnetReady = false
+    if transport.providerReady:
+        if transport.proxyListenersReady:
+            if !transport.listenerNeedsRepair:
+                tsnetReady = true
+    var tsnetDerpHealthy = false
+    if transport.derpHealthy:
+        if len(transport.cfg.relayEndpoint) > 0:
+            tsnetDerpHealthy = true
+    return v3Libp2pHostRefreshRelayRoleApply(host,
+                                             regionHint,
+                                             ttlSeconds,
+                                             tsnetReady,
+                                             tsnetDerpHealthy,
+                                             transport.cfg.relayEndpoint,
+                                             transport.cfg.derpRegionCode)
+
+fn v3Libp2pObservePeerRelayDescriptor(host: var V3Libp2pHost,
+                                      peerId: types.V3Libp2pPeerId,
+                                      descriptor: types.V3Libp2pRelayDescriptor) =
+    var record = ps.v3Libp2pPeerRecordZero()
+    let pos = ps.v3Libp2pPeerstorePos(host.peers, peerId)
+    if pos >= 0:
+        record = host.peers.peers[pos]
+    record.peerId = peerId
+    ps.v3Libp2pPeerRecordPutRelayDescriptor(record, descriptor)
+    ps.v3Libp2pPeerstoreUpsert(host.peers, record)
 
 fn v3Libp2pPeerResourcesFill(out: var types.V3Libp2pNodeResource,
                              host: V3Libp2pHost,
@@ -910,6 +1333,94 @@ fn v3Libp2pSyncRequestWebrtc(host: var V3Libp2pHost,
         return Err[bool](Error(responsePayloadRes))
     return v3Libp2pSyncDecodePayload(responsePayload, out)
 
+fn v3Libp2pRelayDescribeServePayload(host: var V3Libp2pHost,
+                                     requesterPeerId: types.V3Libp2pPeerId,
+                                     requestPayload: Bytes): Result[Bytes] =
+    if !v3Libp2pHostRelayRequesterAuthenticated(host, requesterPeerId):
+        return Err[Bytes]("v3 libp2p host: relay describe requester unauthenticated")
+    var request = relay_plane.v3Libp2pRelayDescribeRequestZero()
+    let decodeRes = relay_plane.v3Libp2pRelayDescribeRequestDecodeFill(request, requestPayload)
+    if IsErr(decodeRes):
+        return Err[Bytes](Error(decodeRes))
+    if request.serviceKind == types.v3Libp2pRelayServiceNone:
+        return Err[Bytes]("v3 libp2p host: relay describe missing service")
+    let now = times.epochTimeSeconds()
+    var descriptors: types.V3Libp2pRelayDescriptor[]
+    descriptors = []
+    for i in 0..<host.relayDescriptors.len:
+        let descriptor = host.relayDescriptors[i]
+        if descriptor.serviceKind != request.serviceKind:
+            continue
+        if !types.v3Libp2pRelayDescriptorActiveAt(descriptor, now):
+            continue
+        if !descriptor.health.healthy:
+            continue
+        if !v3Libp2pRelayRegionMatches(descriptor.region, request.region):
+            continue
+        add(descriptors, descriptor)
+    return Ok[Bytes](relay_plane.v3Libp2pRelayDescriptorListEncode(descriptors))
+
+fn v3Libp2pRelayLeaseServePayload(host: var V3Libp2pHost,
+                                  requesterPeerId: types.V3Libp2pPeerId,
+                                  requestPayload: Bytes): Result[Bytes] =
+    if !v3Libp2pHostRelayRequesterAuthenticated(host, requesterPeerId):
+        return Err[Bytes]("v3 libp2p host: relay lease requester unauthenticated")
+    var request = relay_plane.v3Libp2pRelayLeaseRequestZero()
+    let decodeRes = relay_plane.v3Libp2pRelayLeaseRequestDecodeFill(request, requestPayload)
+    if IsErr(decodeRes):
+        return Err[Bytes](Error(decodeRes))
+    if request.serviceKind == types.v3Libp2pRelayServiceNone:
+        return Err[Bytes]("v3 libp2p host: relay lease missing service")
+    if !types.v3Libp2pPeerIdEqual(request.requesterPeerId, requesterPeerId):
+        return Err[Bytes]("v3 libp2p host: relay lease requester mismatch")
+    let now = times.epochTimeSeconds()
+    var selected = types.v3Libp2pRelayDescriptorZero()
+    var selectedOk = false
+    var exactMatch = false
+    for i in 0..<host.relayDescriptors.len:
+        let descriptor = host.relayDescriptors[i]
+        if descriptor.serviceKind != request.serviceKind:
+            continue
+        if !types.v3Libp2pRelayDescriptorActiveAt(descriptor, now):
+            continue
+        if !descriptor.health.healthy:
+            continue
+        if !v3Libp2pRelayRegionMatches(descriptor.region, request.region):
+            continue
+        let candidateExact = descriptor.region == request.region
+        if !selectedOk || (candidateExact && !exactMatch):
+            selected = descriptor
+            selectedOk = true
+            exactMatch = candidateExact
+    if !selectedOk:
+        return Err[Bytes]("v3 libp2p host: relay lease descriptor missing")
+    let providerPos = v3Libp2pHostRelayProviderPos(host,
+                                                   selected.serviceKind,
+                                                   selected.endpointText)
+    if providerPos < 0:
+        return Err[Bytes]("v3 libp2p host: relay lease provider missing")
+    let nonce = v3Libp2pHostRelayNonce(host,
+                                       requesterPeerId,
+                                       selected.serviceKind,
+                                       selected.region,
+                                       now)
+    var lease = types.v3Libp2pRelayLeaseZero()
+    let issueRes = relay_provider.v3Libp2pRelayProviderIssueLeaseFill(lease,
+                                                                      host.relayProviders[providerPos],
+                                                                      host.selfPeerId,
+                                                                      requesterPeerId,
+                                                                      peer_id.v3Libp2pPeerIdText(requesterPeerId),
+                                                                      request.region,
+                                                                      now,
+                                                                      30,
+                                                                      nonce)
+    if IsErr(issueRes):
+        v3Libp2pHostRelayRemoveLocalDescriptor(host,
+                                               selected.serviceKind,
+                                               selected.endpointText)
+        return Err[Bytes](Error(issueRes))
+    return Ok[Bytes](relay_plane.v3Libp2pRelayLeaseEncode(lease))
+
 fn v3Libp2pServePayloadFromPeer(host: var V3Libp2pHost,
                                 requesterPeerId: types.V3Libp2pPeerId,
                                 protocol: types.V3Libp2pProtocolId,
@@ -933,6 +1444,10 @@ fn v3Libp2pServePayloadFromPeer(host: var V3Libp2pHost,
         if !host.pinRuntimeAttached:
             return Err[Bytes]("v3 libp2p host: pin runtime missing")
         return pin_runtime.v3PinRuntimeServeChallengePayload(host.pinRuntime, requestPayload)
+    if protocol == types.v3Libp2pProtocolRelayDescribe:
+        return v3Libp2pRelayDescribeServePayload(host, requesterPeerId, requestPayload)
+    if protocol == types.v3Libp2pProtocolRelayLease:
+        return v3Libp2pRelayLeaseServePayload(host, requesterPeerId, requestPayload)
     return Err[Bytes]("v3 libp2p host: local protocol handler unsupported")
 
 fn v3Libp2pServePayload(host: var V3Libp2pHost,
@@ -1142,6 +1657,80 @@ fn v3Libp2pIdentifyRequest(host: var V3Libp2pHost,
     v3Libp2pObservePeerResources(host, remotePeerId, out)
     return Ok[bool](true)
 
+fn v3Libp2pRelayDescribeRequest(host: var V3Libp2pHost,
+                                remoteHost: var V3Libp2pHost,
+                                remotePeerId: types.V3Libp2pPeerId,
+                                serviceKind: types.V3Libp2pRelayServiceKind,
+                                region: str,
+                                out: var types.V3Libp2pRelayDescriptor[]): Result[bool] =
+    out = []
+    if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
+        return Err[bool]("v3 libp2p host: relay describe peer mismatch")
+    if !v3Libp2pProtocolRegistered(host, types.v3Libp2pProtocolRelayDescribe):
+        return Err[bool]("v3 libp2p host: local relay describe handler missing")
+    if !v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolRelayDescribe):
+        return Err[bool]("v3 libp2p host: remote relay describe handler missing")
+    let requestPayload = relay_plane.v3Libp2pRelayDescribeRequestEncode(serviceKind, region)
+    var responsePayload: Bytes
+    let requestRes = v3Libp2pRequestResponse(host,
+                                             remoteHost,
+                                             remotePeerId,
+                                             types.v3Libp2pProtocolRelayDescribe,
+                                             requestPayload,
+                                             responsePayload)
+    if IsErr(requestRes):
+        return Err[bool](Error(requestRes))
+    let decodeRes = relay_plane.v3Libp2pRelayDescriptorListDecodeFill(out, responsePayload)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    for i in 0..<out.len:
+        if !types.v3Libp2pPeerIdEqual(out[i].peerId, remotePeerId):
+            return Err[bool]("v3 libp2p host: relay describe peer id mismatch")
+        v3Libp2pObservePeerRelayDescriptor(host, remotePeerId, out[i])
+    return Ok[bool](true)
+
+fn v3Libp2pRelayLeaseRequest(host: var V3Libp2pHost,
+                             remoteHost: var V3Libp2pHost,
+                             remotePeerId: types.V3Libp2pPeerId,
+                             serviceKind: types.V3Libp2pRelayServiceKind,
+                             region: str,
+                             out: var types.V3Libp2pRelayLease): Result[bool] =
+    if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
+        return Err[bool]("v3 libp2p host: relay lease peer mismatch")
+    if !v3Libp2pProtocolRegistered(host, types.v3Libp2pProtocolRelayLease):
+        return Err[bool]("v3 libp2p host: local relay lease handler missing")
+    if !v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolRelayLease):
+        return Err[bool]("v3 libp2p host: remote relay lease handler missing")
+    let requestPayload = relay_plane.v3Libp2pRelayLeaseRequestEncode(host.selfPeerId,
+                                                                     serviceKind,
+                                                                     region)
+    var responsePayload: Bytes
+    let requestRes = v3Libp2pRequestResponse(host,
+                                             remoteHost,
+                                             remotePeerId,
+                                             types.v3Libp2pProtocolRelayLease,
+                                             requestPayload,
+                                             responsePayload)
+    if IsErr(requestRes):
+        return Err[bool](Error(requestRes))
+    let decodeRes = relay_plane.v3Libp2pRelayLeaseDecodeFill(out, responsePayload)
+    if IsErr(decodeRes):
+        return Err[bool](Error(decodeRes))
+    if !types.v3Libp2pPeerIdEqual(out.relayPeerId, remotePeerId):
+        return Err[bool]("v3 libp2p host: relay lease relay peer mismatch")
+    if !types.v3Libp2pPeerIdEqual(out.requesterPeerId, host.selfPeerId):
+        return Err[bool]("v3 libp2p host: relay lease requester mismatch")
+    let pos = ps.v3Libp2pPeerstorePos(host.peers, remotePeerId)
+    if pos >= 0:
+        var record = host.peers.peers[pos]
+        ps.v3Libp2pPeerRecordObserveRelaySuccess(record,
+                                                 out.serviceKind,
+                                                 out.region,
+                                                 out.endpointText,
+                                                 times.epochTimeSeconds())
+        ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[bool](true)
+
 fn v3Libp2pPinServePayload(host: var V3Libp2pHost,
                            requestPayload: Bytes): Result[Bytes] =
     return v3Libp2pServePayload(host, types.v3Libp2pProtocolPin, requestPayload)
@@ -1149,6 +1738,182 @@ fn v3Libp2pPinServePayload(host: var V3Libp2pHost,
 fn v3Libp2pKadProvide(host: var V3Libp2pHost,
                       keyCid: layout.FixedBytes32) =
     kad.v3Libp2pKadProvide(host.kadState, keyCid, host.selfPeerId)
+
+fn v3Libp2pRelayProviderPeerSeen(peerIds: types.V3Libp2pPeerId[],
+                                 peerId: types.V3Libp2pPeerId): bool =
+    for i in 0..<peerIds.len:
+        if types.v3Libp2pPeerIdEqual(peerIds[i], peerId):
+            return true
+    return false
+
+fn v3Libp2pRelayCandidateWeight(entry: ps.V3Libp2pPeerRelayCacheEntry,
+                                requestedRegion: str,
+                                nowEpochSeconds: int64): int32 =
+    if !types.v3Libp2pRelayDescriptorActiveAt(entry.descriptor, nowEpochSeconds):
+        return -1
+    if !entry.descriptor.health.healthy:
+        return -1
+    if !v3Libp2pRelayRegionMatches(entry.descriptor.region, requestedRegion):
+        return -1
+    var cooldownUntil = entry.failureCooldownUntilEpochSeconds
+    if entry.descriptor.health.failureCooldownUntilEpochSeconds > cooldownUntil:
+        cooldownUntil = entry.descriptor.health.failureCooldownUntilEpochSeconds
+    if cooldownUntil > nowEpochSeconds:
+        return -1
+    var successPermille = entry.descriptor.health.successPermille
+    let total = entry.successCount + entry.failureCount
+    if total > 0:
+        successPermille = (entry.successCount * 1000) / total
+    let loadHeadroom = 1000 - entry.descriptor.health.loadPermille
+    let capacityPermille = entry.descriptor.health.capacityPermille
+    if loadHeadroom <= 0 || capacityPermille <= 0:
+        return -1
+    var regionBonus = 500
+    if entry.descriptor.region == requestedRegion:
+        regionBonus = 1000
+    elif v3Libp2pRelayRegionIsGlobal(entry.descriptor.region):
+        regionBonus = 400
+    return v3Libp2pRelayPermilleClamp(successPermille) +
+           v3Libp2pRelayPermilleClamp(loadHeadroom) +
+           v3Libp2pRelayPermilleClamp(capacityPermille) +
+           regionBonus
+
+fn v3Libp2pRelayCandidateInsertSorted(out: var V3Libp2pRelayCandidate[],
+                                      candidate: V3Libp2pRelayCandidate) =
+    add(out, candidate)
+    var pos = out.len - 1
+    while pos > 0:
+        if out[pos - 1].weight >= out[pos].weight:
+            break
+        let moved = out[pos - 1]
+        out[pos - 1] = out[pos]
+        out[pos] = moved
+        pos = pos - 1
+
+fn v3Libp2pRelayCandidateRemovePos(candidates: var V3Libp2pRelayCandidate[],
+                                   pos: int32) =
+    if pos < 0 || pos >= candidates.len:
+        return
+    var next: V3Libp2pRelayCandidate[]
+    next = []
+    for i in 0..<candidates.len:
+        if i == pos:
+            continue
+        add(next, candidates[i])
+    candidates = next
+
+fn v3Libp2pRelayPickWeightedPos(candidates: V3Libp2pRelayCandidate[],
+                                entropyText: str): int32 =
+    if candidates.len <= 0:
+        return -1
+    var totalWeight = int64(0)
+    for i in 0..<candidates.len:
+        if candidates[i].weight > 0:
+            totalWeight = totalWeight + int64(candidates[i].weight)
+    if totalWeight <= int64(0):
+        return -1
+    let digest = hash256.sha256Fixed(layout.byteSpanFromBytes(bytesFromString(entropyText)))
+    var threshold = int64(0)
+    for i in 0..<4:
+        threshold = (threshold << 8) | int64(int32(digest.data[i]) & 255)
+    threshold = threshold % totalWeight
+    var cumulative = int64(0)
+    for i in 0..<candidates.len:
+        if candidates[i].weight <= 0:
+            continue
+        cumulative = cumulative + int64(candidates[i].weight)
+        if threshold < cumulative:
+            return i
+    return candidates.len - 1
+
+fn v3Libp2pSelectRelayCandidatesWithEntropy(host: V3Libp2pHost,
+                                            serviceKind: types.V3Libp2pRelayServiceKind,
+                                            region: str,
+                                            limit: int32,
+                                            entropyText: str,
+                                            nowEpochSeconds: int64,
+                                            out: var V3Libp2pRelayCandidate[]): Result[bool] =
+    out = []
+    if serviceKind == types.v3Libp2pRelayServiceNone:
+        return Err[bool]("v3 libp2p host: relay candidate service missing")
+    if limit <= 0:
+        return Err[bool]("v3 libp2p host: relay candidate limit invalid")
+    var providerPeerIds: types.V3Libp2pPeerId[]
+    providerPeerIds = []
+    let regionProviders = kad.v3Libp2pKadFindProvidersByKey(host.kadState,
+                                                            relay_plane.v3Libp2pRelayKeyCid(serviceKind, region),
+                                                            64)
+    for i in 0..<regionProviders.len:
+        if v3Libp2pRelayProviderPeerSeen(providerPeerIds, regionProviders[i]):
+            continue
+        add(providerPeerIds, regionProviders[i])
+    if !v3Libp2pRelayRegionIsGlobal(region):
+        let globalProviders = kad.v3Libp2pKadFindProvidersByKey(host.kadState,
+                                                                relay_plane.v3Libp2pRelayKeyCid(serviceKind, "global"),
+                                                                64)
+        for i in 0..<globalProviders.len:
+            if v3Libp2pRelayProviderPeerSeen(providerPeerIds, globalProviders[i]):
+                continue
+            add(providerPeerIds, globalProviders[i])
+    var ranked: V3Libp2pRelayCandidate[]
+    ranked = []
+    for i in 0..<providerPeerIds.len:
+        let pos = ps.v3Libp2pPeerstorePos(host.peers, providerPeerIds[i])
+        if pos < 0:
+            continue
+        let record = host.peers.peers[pos]
+        var best = v3Libp2pRelayCandidateZero()
+        var found = false
+        for j in 0..<record.relayEntries.len:
+            let entry = record.relayEntries[j]
+            if entry.descriptor.serviceKind != serviceKind:
+                continue
+            let weight = v3Libp2pRelayCandidateWeight(entry, region, nowEpochSeconds)
+            if weight < 0:
+                continue
+            let exact = entry.descriptor.region == region
+            let bestExact = best.descriptor.region == region
+            if !found || weight > best.weight || (weight == best.weight && exact && !bestExact):
+                best.peerId = providerPeerIds[i]
+                best.descriptor = entry.descriptor
+                best.weight = weight
+                found = true
+        if found:
+            v3Libp2pRelayCandidateInsertSorted(ranked, best)
+    if ranked.len <= 0:
+        return Err[bool]("v3 libp2p host: relay candidate missing")
+    var pool: V3Libp2pRelayCandidate[]
+    pool = []
+    let maxPool = ranked.len < 5 ? ranked.len : 5
+    for i in 0..<maxPool:
+        add(pool, ranked[i])
+    let pickCount = limit < pool.len ? limit : pool.len
+    for i in 0..<pickCount:
+        let pickPos = v3Libp2pRelayPickWeightedPos(pool,
+                                                   entropyText + "|" + intToStr(i))
+        if pickPos < 0:
+            break
+        add(out, pool[pickPos])
+        v3Libp2pRelayCandidateRemovePos(pool, pickPos)
+    return Ok[bool](out.len > 0)
+
+fn v3Libp2pSelectRelayCandidates(host: V3Libp2pHost,
+                                 serviceKind: types.V3Libp2pRelayServiceKind,
+                                 region: str,
+                                 limit: int32,
+                                 out: var V3Libp2pRelayCandidate[]): Result[bool] =
+    let now = times.epochTimeSeconds()
+    let entropy = peer_id.v3Libp2pPeerIdText(host.selfPeerId) + "|" +
+                  types.v3Libp2pRelayServiceText(serviceKind) + "|" +
+                  region + "|" +
+                  strings.int64ToStr(now)
+    return v3Libp2pSelectRelayCandidatesWithEntropy(host,
+                                                    serviceKind,
+                                                    region,
+                                                    limit,
+                                                    entropy,
+                                                    now,
+                                                    out)
 
 fn v3Libp2pFindPeers(host: V3Libp2pHost,
                      target: types.V3Libp2pPeerId,

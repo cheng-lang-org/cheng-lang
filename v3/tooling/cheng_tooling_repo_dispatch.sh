@@ -38,13 +38,11 @@ driver_help_ok() {
 
 pick_driver() {
   for cand in \
+    "$root/src/tooling/backend_driver_exec.sh" \
     "${BACKEND_DRIVER:-}" \
     "${BACKEND_SELF_LINKER_DRIVER:-}" \
     "${BACKEND_LINKER_ABI_CORE_DRIVER:-}" \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2" \
-    "$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof" \
-    "$root/artifacts/backend_selfhost_self_obj/cheng.stage2" \
-    "$root/artifacts/backend_driver/cheng" \
+    "$root/artifacts/v3_backend_driver/cheng" \
     "$root/dist/releases/current/cheng"; do
     [ "$cand" != "" ] || continue
     if driver_help_ok "$cand"; then

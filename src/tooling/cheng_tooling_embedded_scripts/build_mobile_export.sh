@@ -106,6 +106,10 @@ fi
 
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
 
+# shellcheck disable=SC1091
+. "$root/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh"
+backend_runtime_abi_contract_load
+
 if [ "$out" = "" ]; then
   out="mobile_build/$name"
 fi
@@ -139,8 +143,8 @@ if [ "$with_android" -eq 0 ] && [ "$with_ios" -eq 0 ] && [ "$with_harmony" -eq 0
   with_harmony=1
 fi
 
-runtime_stub_c="$root/src/runtime/mobile/system_helpers_mobile_stub.c"
-runtime_stub_h="$root/src/runtime/mobile/system_helpers_mobile_stub.h"
+runtime_stub_c="$BACKEND_RUNTIME_ABI_MOBILE_STUB_C_ABS"
+runtime_stub_h="$BACKEND_RUNTIME_ABI_MOBILE_STUB_H_ABS"
 runtime_stb_image_h="$root/src/runtime/native/stb_image.h"
 runtime_sidecar_h="$root/src/runtime/native/cheng_sidecar_loader.h"
 runtime_twoway_h="$root/v3/runtime/native/v3_str_twoway_search.h"

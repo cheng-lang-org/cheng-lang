@@ -14,6 +14,8 @@
 - `v3/tooling/scan_forbidden_hotpath.sh` 会直接扫 `v3/src` 里被禁的字符串壳和 `BigInt`
 - `v3/tooling/cheng_v3.sh` 是 `v3` 自己的主控入口
 - `v3/tooling/cheng_v3.sh host-bridge-audit` 现在会直接调用 pure Cheng `backend_driver`，硬查 legacy `exec_file_capture/exec_file_pipe_spawn` 这类旧宿主桥面，以及 `peer_id` 漂回 `cheng_v3_base58btc_* bridge` 这种协议层回流，有没有重新漏回 live 路径
+- `v3/tooling/cheng_v3.sh r2c-react-v3-native-gui-bundle-smoke` 现在会直接走 pure Cheng `backend_driver`，只做一条 route 的 `native-gui-bundle` focused smoke，硬卡 `report/summary` 里的 `host_ready/renderer_ready/runtime_mode/exec_snapshot/route_catalog`
+- runtime ABI 的 live 合同现在固定落在 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env)，`host-bridge-audit`、runtime ABI gate、FFI handle gate、mobile export 和 selfhost runtime patch 都按这份合同取 `system_helpers_backend.cheng + 3 个最小 native bridge`
 - `v3/tooling/verify_orphan_guard_v3.sh` 会扫描 `v3/tooling` 顶层所有入口文件（`.sh`、`.py`、无后缀），硬禁把 `guarded_exec_v3.py`、`orphan_guard_run.sh`、`failfast_parallel.sh` 这类已退役壳重新塞回主线
 - `v3/tooling/cheng_v3.sh debug-report/print-symbols/print-line-map/print-elf` 现在直接把 seed 内部调试面公开出来：可直接看 ordinary pipeline 报告、函数符号、源码行映射和 Linux AArch64 ELF relocatable object，不再先依赖 `lldb/nm/objdump`
 - `v3/tooling/cheng_v3.sh profile-run` 现在固定走两段式：runtime 只写 `v3_profile_raw_v1`，随后由 live 的 `profile-report` 编译器命令把 raw 报告转成最终 `v3_profile_v1`；这条链已经不再编临时 helper，可直接由 `cheng.stage3`/`artifacts/v3_backend_driver/cheng` 承担，live debug bridge 也不再保留 `CHENG_V3_PROFILE_OUT` 最终报告路径；如果用户只开 `CHENG_V3_PROFILE_ENABLE=1` 而没显式给 raw 路径，runtime 默认会落 `<exe>.v3.profile.raw.txt`

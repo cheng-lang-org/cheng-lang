@@ -1,6 +1,7 @@
 import std/cmdline as cmdline
 import std/os
 import std/result
+import std/strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/bootstrap_contracts as contracts
@@ -10,6 +11,7 @@ import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/tooling/compiler_equivalence as ceq
 import cheng/v3/tooling/compiler_world_libp2p as cwlp
+import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
 import cheng/v3/lang/parser
 import cheng/v3/backend/system_link_plan as slplan
@@ -103,6 +105,36 @@ fn v3CompilerQuoteShell(value: str): str =
     out = out + "'"
     return out
 
+fn v3CompilerEnvLineValue(text: str, key: str): str =
+    let prefix = key + "="
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= text.len:
+        let atEnd: bool = i == text.len
+        if atEnd || text[i] == '\n':
+            let line = strings.sliceBytes(text, start, i - start)
+            if line.len >= prefix.len &&
+               strings.sliceBytes(line, 0, prefix.len) == prefix:
+                return strings.sliceBytes(line, prefix.len, line.len - prefix.len)
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn v3CompilerRuntimeAbiContractText(rootDir: str): str =
+    return v3path.v3ReadTextFile(
+        "",
+        v3path.v3PathAbsolute(rootDir, "src/tooling/backend_runtime_abi_contract.env")
+    )
+
+fn v3CompilerRuntimeAbiPath(rootDir: str,
+                            contractText: str,
+                            key: str,
+                            fallbackRel: str): str =
+    let relPath = strutil.strip(v3CompilerEnvLineValue(contractText, key))
+    if len(relPath) > 0:
+        return v3path.v3PathAbsolute(rootDir, relPath)
+    return v3path.v3PathAbsolute(rootDir, fallbackRel)
+
 fn v3CompilerRunCommandLogged(rootDir: str,
                               command: str,
                               logPath: str,
@@ -117,6 +149,35 @@ fn v3CompilerRunCommandLogged(rootDir: str,
     else:
         v3CompilerPrintErr("v3 compiler: " + context + " failed")
     return false
+
+fn v3CompilerRunFileLogged(rootDir: str,
+                           filePath: str,
+                           argv: str[],
+                           logPath: str,
+                           context: str): bool =
+    let run = hostops.v3RunFileLogged(rootDir, context, filePath, argv, [], rootDir, 0, logPath)
+    if hostops.v3LoggedRunOk(run):
+        return true
+    let output = strutil.strip(run.output)
+    if len(output) > 0:
+        v3CompilerPrintErr(output)
+    else:
+        v3CompilerPrintErr("v3 compiler: " + context + " failed")
+    return false
+
+fn v3CompilerPlanCoreText(planText: str): str =
+    let lines = strutil.split(planText, '\n')
+    var out = ""
+    for i in 0..<lines.len:
+        let line = lines[i]
+        if strutil.startsWith(line, "target=") ||
+           strutil.startsWith(line, "linker=") ||
+           strutil.startsWith(line, "stage2_compiler=") ||
+           strutil.startsWith(line, "entry=") ||
+           strutil.startsWith(line, "output=") ||
+           strutil.startsWith(line, "source["):
+            out = out + line + "\n"
+    return out
 
 fn v3CompilerSharedEmitExtension(targetTriple: str): str =
     if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
@@ -191,6 +252,72 @@ fn v3CompilerRunSharedEmitSmokes(rootDir: str): int32 =
     v3CompilerPrintLine("target=" + targetTriple)
     v3CompilerPrintLine("out=" + outLib)
     v3CompilerPrintLine("report=" + reportPath)
+    return 0
+
+fn v3CompilerR2cReactNativeGuiBundleSmoke(rootDir: str,
+                                          args: str[]): int32 =
+    args
+    let repoRaw = cmdline.readFlagOrDefault("--repo", "/Users/lbcheng/UniMaker/React.js")
+    let routeState = cmdline.readFlagOrDefault("--route-state", "home_default")
+    let outDirRaw = cmdline.readFlagOrDefault("--out-dir", "/tmp/r2c-native-gui-bundle-smoke-" + routeState)
+    let repo = v3path.v3PathAbsolute(rootDir, repoRaw)
+    let outDir = v3path.v3PathAbsolute(rootDir, outDirRaw)
+    let bundleReport = os.joinPath(outDir, "native_gui_bundle_report_v1.json")
+    let bundleSummary = os.joinPath(outDir, "native_gui_bundle.summary.env")
+    let bundleJson = os.joinPath(outDir, "native_gui_bundle_v1.json")
+    if !os.dirExists(repo):
+        v3CompilerPrintErr("v3 compiler: missing React.js repo: " + repo)
+        return 2
+    if !v3CompilerRemovePathTree(outDir):
+        v3CompilerPrintErr("v3 compiler: failed to clear native gui bundle smoke dir: " + outDir)
+        return 2
+    let bootstrapScript = v3path.v3PathAbsolute(rootDir, "v3/tooling/bootstrap_bridge_v3.sh")
+    let buildBackendDriverScript = v3path.v3PathAbsolute(rootDir, "v3/tooling/build_backend_driver_v3.sh")
+    let bootstrapCommand = "sh " + v3CompilerQuoteShell(bootstrapScript)
+    if os.execCmdStatus(bootstrapCommand, rootDir) != 0:
+        v3CompilerPrintErr("v3 compiler: bootstrap bridge failed inside native gui bundle smoke")
+        return 2
+    let buildBackendDriverCommand = "sh " + v3CompilerQuoteShell(buildBackendDriverScript)
+    if os.execCmdStatus(buildBackendDriverCommand, rootDir) != 0:
+        v3CompilerPrintErr("v3 compiler: backend driver build script failed inside native gui bundle smoke")
+        return 2
+    let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
+    let stage3Path = bootstrapSnapshot.stage3Compiler.path
+    if !v3path.v3FileExistsNonEmpty(rootDir, stage3Path):
+        v3CompilerPrintErr("v3 compiler: missing stage3 for native gui bundle smoke: " + stage3Path)
+        return 2
+    if v3CompilerForwardToBridge(rootDir,
+                                 stage3Path,
+                                 "r2c-react-v3",
+                                 [
+                                     "native-gui-bundle",
+                                     "--repo", repo,
+                                     "--out-dir", outDir,
+                                     "--route-state", routeState
+                                 ]) != 0:
+        v3CompilerPrintErr("v3 compiler: native-gui-bundle failed inside smoke for route: " + routeState)
+        return 2
+    if !v3path.v3PathFileExists(bundleReport) || !v3path.v3PathFileExists(bundleSummary) || !v3path.v3PathFileExists(bundleJson):
+        v3CompilerPrintErr("v3 compiler: missing native gui bundle smoke artifacts for route: " + routeState)
+        return 2
+    let reportText = v3path.v3ReadTextFile("", bundleReport)
+    let summaryText = v3path.v3ReadTextFile("", bundleSummary)
+    if !strutil.contains(reportText, "\"ok\": true") ||
+       !strutil.contains(reportText, "\"native_gui_host_ready\": true") ||
+       !strutil.contains(reportText, "\"native_gui_renderer_ready\": true"):
+        v3CompilerPrintErr("v3 compiler: native gui bundle smoke report drifted for route: " + routeState)
+        return 2
+    if !strutil.contains(summaryText, "native_gui_runtime_mode=cheng_compiled_json_v1") ||
+       !strutil.contains(summaryText, "native_gui_route_state=" + routeState) ||
+       !strutil.contains(summaryText, "native_gui_exec_snapshot_path=") ||
+       !strutil.contains(summaryText, "native_gui_route_catalog_path="):
+        v3CompilerPrintErr("v3 compiler: native gui bundle smoke summary drifted for route: " + routeState)
+        return 2
+    v3CompilerPrintLine("r2c-react-v3 native gui bundle smoke: ok")
+    v3CompilerPrintLine("route_state=" + routeState)
+    v3CompilerPrintLine("bundle_report=" + bundleReport)
+    v3CompilerPrintLine("bundle_summary=" + bundleSummary)
+    v3CompilerPrintLine("bundle_json=" + bundleJson)
     return 0
 
 fn v3CompilerTextContainsAll(text: str,
@@ -405,15 +532,15 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     if len(currentCompiler) <= 0:
         v3CompilerPrintErr("v3 compiler: missing current compiler for build-backend-driver")
         return 2
-    let compileCommand = v3CompilerQuoteShell(currentCompiler) +
-                         " " + v3CompilerQuoteShell("system-link-exec") +
-                         " " + v3CompilerQuoteShell("--root:" + packageRoot) +
-                         " " + v3CompilerQuoteShell("--in:" + compilerEntrySource) +
-                         " " + v3CompilerQuoteShell("--emit:exe") +
-                         " " + v3CompilerQuoteShell("--target:" + targetTriple) +
-                         " " + v3CompilerQuoteShell("--out:" + backendDriverCandidateOut) +
-                         " " + v3CompilerQuoteShell("--report-out:" + compileReportPath)
-    if !v3CompilerRunCommandLogged(rootDir, compileCommand, compileLogPath, "build-backend-driver compile"):
+    var compileArgs: str[] = []
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + packageRoot)
+    add(compileArgs, "--in:" + compilerEntrySource)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:" + targetTriple)
+    add(compileArgs, "--out:" + backendDriverCandidateOut)
+    add(compileArgs, "--report-out:" + compileReportPath)
+    if !v3CompilerRunFileLogged(rootDir, currentCompiler, compileArgs, compileLogPath, "build-backend-driver compile"):
         return 2
     if !v3path.v3PathFileExists(backendDriverCandidateOut):
         v3CompilerPrintErr("v3 compiler: missing backend driver candidate output: " + backendDriverCandidateOut)
@@ -421,62 +548,97 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     if !v3path.v3PathFileExists(backendDriverCandidateMapOut):
         v3CompilerPrintErr("v3 compiler: missing backend driver candidate map: " + backendDriverCandidateMapOut)
         return 2
-    let statusCommand = v3CompilerQuoteShell(backendDriverCandidateOut) + " " + v3CompilerQuoteShell("status")
-    if !v3CompilerRunCommandLogged(rootDir, statusCommand, statusLogPath, "build-backend-driver status"):
+    let statusArgs = ["status"]
+    if !v3CompilerRunFileLogged(rootDir, backendDriverCandidateOut, statusArgs, statusLogPath, "build-backend-driver status"):
         return 2
-    let planCommand = v3CompilerQuoteShell(backendDriverCandidateOut) + " " + v3CompilerQuoteShell("print-build-plan")
-    if !v3CompilerRunCommandLogged(rootDir, planCommand, planLogPath, "build-backend-driver plan"):
+    let planArgs = ["print-build-plan"]
+    if !v3CompilerRunFileLogged(rootDir, backendDriverCandidateOut, planArgs, planLogPath, "build-backend-driver plan"):
         return 2
-    let referencePlanCommand = v3CompilerQuoteShell(currentCompiler) + " " + v3CompilerQuoteShell("print-build-plan")
-    if !v3CompilerRunCommandLogged(rootDir, referencePlanCommand, referencePlanLogPath, "build-backend-driver reference-plan"):
+    let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
+    var referenceCompiler = currentCompiler
+    let referencePlanArgs = ["print-build-plan"]
+    if !v3CompilerRunFileLogged(rootDir, referenceCompiler, referencePlanArgs, referencePlanLogPath, "build-backend-driver reference-plan"):
         return 2
-    let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
-    var planCompareCommand = "grep -E "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-    planCompareCommand = planCompareCommand + " "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
-    planCompareCommand = planCompareCommand + " > "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-    planCompareCommand = planCompareCommand + " && grep -E "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-    planCompareCommand = planCompareCommand + " "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
-    planCompareCommand = planCompareCommand + " > "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-    planCompareCommand = planCompareCommand + " && cmp -s "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-    planCompareCommand = planCompareCommand + " "
-    planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-    if os.execCmdStatus(planCompareCommand, rootDir) != 0:
-        v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
-        return 2
-    let smokeCompileCommand = v3CompilerQuoteShell(backendDriverCandidateOut) +
-                              " " + v3CompilerQuoteShell("system-link-exec") +
-                              " " + v3CompilerQuoteShell("--root:" + packageRoot) +
-                              " " + v3CompilerQuoteShell("--in:" + smokeSource) +
-                              " " + v3CompilerQuoteShell("--emit:exe") +
-                              " " + v3CompilerQuoteShell("--target:" + targetTriple) +
-                              " " + v3CompilerQuoteShell("--out:" + smokeOut) +
-                              " " + v3CompilerQuoteShell("--report-out:" + smokeCompileReportPath)
-    if !v3CompilerRunCommandLogged(rootDir, smokeCompileCommand, smokeCompileLogPath, "build-backend-driver zero-exit compile"):
+    let currentPlanText = v3path.v3ReadTextFile("", referencePlanLogPath)
+    if !v3CompilerTextContainsAll(currentPlanText, ["target=" + targetTriple]):
+        let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
+        if len(bootstrapReference) > 0 && bootstrapReference != currentCompiler:
+            referenceCompiler = bootstrapReference
+            if !v3CompilerRunFileLogged(rootDir,
+                                        referenceCompiler,
+                                        referencePlanArgs,
+                                        referencePlanLogPath,
+                                        "build-backend-driver reference-plan"):
+                return 2
+    let referencePlanText = v3path.v3ReadTextFile("", referencePlanLogPath)
+    var referencePlanCheck = "skip_target_mismatch"
+    if v3CompilerTextContainsAll(referencePlanText, ["target=" + targetTriple]):
+        let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
+        var planCompareCommand = "grep -E "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
+        planCompareCommand = planCompareCommand + " > "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+        planCompareCommand = planCompareCommand + " && grep -E "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
+        planCompareCommand = planCompareCommand + " > "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+        planCompareCommand = planCompareCommand + " && cmp -s "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+        if os.execCmdStatus(planCompareCommand, rootDir) != 0:
+            v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
+            return 2
+        referencePlanCheck = "ok"
+    var smokeCompileArgs: str[] = []
+    add(smokeCompileArgs, "system-link-exec")
+    add(smokeCompileArgs, "--root:" + packageRoot)
+    add(smokeCompileArgs, "--in:" + smokeSource)
+    add(smokeCompileArgs, "--emit:exe")
+    add(smokeCompileArgs, "--target:" + targetTriple)
+    add(smokeCompileArgs, "--out:" + smokeOut)
+    add(smokeCompileArgs, "--report-out:" + smokeCompileReportPath)
+    if !v3CompilerRunFileLogged(rootDir,
+                                backendDriverCandidateOut,
+                                smokeCompileArgs,
+                                smokeCompileLogPath,
+                                "build-backend-driver zero-exit compile"):
         return 2
     if !v3path.v3PathFileExists(smokeOut) || !v3path.v3PathFileExists(smokeOut + ".v3.map"):
         v3CompilerPrintErr("v3 compiler: backend driver zero-exit smoke missing output: " + smokeOut)
         return 2
-    let smokeRunCommand = v3CompilerQuoteShell(smokeOut)
-    if !v3CompilerRunCommandLogged(rootDir, smokeRunCommand, smokeRunLogPath, "build-backend-driver zero-exit run"):
+    let smokeRunArgs: str[] = []
+    if !v3CompilerRunFileLogged(rootDir, smokeOut, smokeRunArgs, smokeRunLogPath, "build-backend-driver zero-exit run"):
         return 2
     let smokeRunText = strutil.strip(v3path.v3ReadTextFile("", smokeRunLogPath))
     if len(smokeRunText) > 0:
         v3CompilerPrintErr("v3 compiler: backend driver zero-exit smoke expected empty stdout")
         return 2
     var installReport = ""
+    if v3path.v3PathFileExists(backendDriverMapOut):
+        if !os.removeFile(backendDriverMapOut):
+            installReport = installReport + "map_remove_existing=failed\n"
+            v3path.v3WriteTextFile(rootDir, installLogPath, installReport)
+            v3CompilerPrintErr("v3 compiler: failed to remove existing backend driver map: " + backendDriverMapOut)
+            return 2
+        installReport = installReport + "map_remove_existing=ok\n"
     if !os.renameFile(backendDriverCandidateMapOut, backendDriverMapOut):
         installReport = installReport + "map_rename=failed\n"
         v3path.v3WriteTextFile(rootDir, installLogPath, installReport)
         v3CompilerPrintErr("v3 compiler: failed to install backend driver map: " + backendDriverMapOut)
         return 2
     installReport = installReport + "map_rename=ok\n"
+    if v3path.v3PathFileExists(backendDriverOut):
+        if !os.removeFile(backendDriverOut):
+            installReport = installReport + "binary_remove_existing=failed\n"
+            v3path.v3WriteTextFile(rootDir, installLogPath, installReport)
+            v3CompilerPrintErr("v3 compiler: failed to remove existing backend driver output: " + backendDriverOut)
+            return 2
+        installReport = installReport + "binary_remove_existing=ok\n"
     if !os.renameFile(backendDriverCandidateOut, backendDriverOut):
         installReport = installReport + "binary_rename=failed\n"
         v3path.v3WriteTextFile(rootDir, installLogPath, installReport)
@@ -491,6 +653,8 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     report = report + "bootstrap_kind=v3_selfhost\n"
     report = report + "compiler_class=ordinary_compiler\n"
     report = report + "current_compiler=" + currentCompiler + "\n"
+    report = report + "reference_compiler=" + referenceCompiler + "\n"
+    report = report + "reference_plan_check=" + referencePlanCheck + "\n"
     report = report + "planned_entry_source=" + compilerEntrySource + "\n"
     report = report + "planned_runtime_source=" + compilerRuntimeSource + "\n"
     report = report + "planned_request_source=" + compilerRequestSource + "\n"
@@ -819,10 +983,31 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let hostProcessPath = v3path.v3PathAbsolute(rootDir, "src/std/os_host_process.cheng")
     let backendPath = v3path.v3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng")
     let peerIdPath = v3path.v3PathAbsolute(rootDir, "v3/src/libp2p/core/peer_id.cheng")
-    let runtimeAuthorityPath = v3path.v3PathAbsolute(rootDir, "src/std/system_helpers_backend.cheng")
-    let nativeBridgeShimPath = v3path.v3PathAbsolute(rootDir, "src/runtime/native/system_helpers_selflink_shim.c")
-    let nativeBridgeIoTimePath = v3path.v3PathAbsolute(rootDir, "src/runtime/native/system_helpers_io_time_bridge.c")
-    let nativeBridgeHostProcessFfiPath = v3path.v3PathAbsolute(rootDir, "src/runtime/native/system_helpers_host_process_ffi_bridge.c")
+    let runtimeContractText = v3CompilerRuntimeAbiContractText(rootDir)
+    let runtimeAuthorityPath = v3CompilerRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_AUTHORITY",
+        "src/std/system_helpers_backend.cheng"
+    )
+    let nativeBridgeShimPath = v3CompilerRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_BRIDGE_SHIM",
+        "src/runtime/native/system_helpers_selflink_shim.c"
+    )
+    let nativeBridgeIoTimePath = v3CompilerRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_BRIDGE_IOTIME",
+        "src/runtime/native/system_helpers_io_time_bridge.c"
+    )
+    let nativeBridgeHostProcessFfiPath = v3CompilerRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_BRIDGE_HOST_PROCESS_FFI",
+        "src/runtime/native/system_helpers_host_process_ffi_bridge.c"
+    )
     let stdOsText = v3path.v3ReadTextFile("", stdOsPath)
     let hostProcessText = v3path.v3ReadTextFile("", hostProcessPath)
     let backendText = v3path.v3ReadTextFile("", backendPath)
@@ -994,13 +1179,16 @@ fn v3CompilerR2cReactFreshCleanGate(rootDir: str,
     ]
     let routeStates: str[] = ["home_default", "content_detail", "publish_selector"]
     let statusNeedles: str[] = [
+        "\"static_surface_helper\": \"\"",
+        "\"semantic_surface_helper\": \"\"",
+        "\"exec_surface_helper\": \"\"",
         "\"native_gui_runtime_helper\": \"\"",
         "\"legacy_wrapper_required\": false",
-        "\"active_node_helper_count\": 11",
-        "\"retired_node_helper_count\": 1",
-        "\"standalone_node_helper_count\": 1",
-        "\"retired_node_helpers\": [\"native_gui_runtime_helper\"]",
-        "\"standalone_node_helpers\": [\"exec_surface_helper\"]"
+        "\"active_node_helper_count\": 9",
+        "\"retired_node_helper_count\": 4",
+        "\"standalone_node_helper_count\": 0",
+        "\"retired_node_helpers\": [\"native_gui_runtime_helper\", \"semantic_surface_helper\", \"static_surface_helper\", \"exec_surface_helper\"]",
+        "\"standalone_node_helpers\": []"
     ]
     let reportNeedles: str[] = [
         "\"ok\": true",
@@ -1018,12 +1206,16 @@ fn v3CompilerR2cReactFreshCleanGate(rootDir: str,
     if !v3CompilerCleanHostrunArtifacts(rootDir, smokeNames):
         v3CompilerPrintErr("v3 compiler: failed to clear stale hostrun artifacts")
         return 2
-    let bootstrapRc = v3CompilerBootstrapBridge(rootDir)
-    if bootstrapRc != 0:
-        return bootstrapRc
-    let backendDriverRc = v3CompilerBuildBackendDriver(rootDir)
-    if backendDriverRc != 0:
-        return backendDriverRc
+    let bootstrapScript = v3path.v3PathAbsolute(rootDir, "v3/tooling/bootstrap_bridge_v3.sh")
+    let buildBackendDriverScript = v3path.v3PathAbsolute(rootDir, "v3/tooling/build_backend_driver_v3.sh")
+    let bootstrapCommand = "sh " + v3CompilerQuoteShell(bootstrapScript)
+    if os.execCmdStatus(bootstrapCommand, rootDir) != 0:
+        v3CompilerPrintErr("v3 compiler: bootstrap bridge script failed inside r2c fresh gate")
+        return 2
+    let buildBackendDriverCommand = "sh " + v3CompilerQuoteShell(buildBackendDriverScript)
+    if os.execCmdStatus(buildBackendDriverCommand, rootDir) != 0:
+        v3CompilerPrintErr("v3 compiler: backend driver build script failed inside r2c fresh gate")
+        return 2
     let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
     let stage3Path = bootstrapSnapshot.stage3Compiler.path
     if !v3path.v3FileExistsNonEmpty(rootDir, stage3Path):
@@ -1086,7 +1278,11 @@ fn v3CompilerR2cReactFreshCleanGate(rootDir: str,
         let routeState = routeStates[i]
         let bundleOutDir = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeState
         let bundleReport = os.joinPath(bundleOutDir, "native_gui_bundle_report_v1.json")
-        v3CompilerPrintLine("bundle_report_" + routeState + "=" + bundleReport)
+        var bundleLine = "bundle_report_"
+        bundleLine = bundleLine + routeState
+        bundleLine = bundleLine + "="
+        bundleLine = bundleLine + bundleReport
+        v3CompilerPrintLine(bundleLine)
     return 0
 
 fn v3CompilerLegacyMigrationBuild(rootDir: str,
@@ -1727,6 +1923,8 @@ fn main(argc: int32, argv: str*): int32 =
         return v3CompilerHostBridgeAudit(rootDir)
     if cmd == "r2c-react-v3-fresh-clean-gate":
         return v3CompilerR2cReactFreshCleanGate(rootDir, args)
+    if cmd == "r2c-react-v3-native-gui-bundle-smoke":
+        return v3CompilerR2cReactNativeGuiBundleSmoke(rootDir, args)
     if cmd == "run-shared-emit-smokes":
         return v3CompilerRunSharedEmitSmokes(rootDir)
     if cmd == "emit-csg":

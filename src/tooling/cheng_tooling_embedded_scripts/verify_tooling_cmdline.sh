@@ -39,7 +39,6 @@ tool_chengc_help_out="$out_dir/tooling_cmdline.tool_chengc.help.txt"
 help_out_multicall="$out_dir/tooling_cmdline.backend_prod_closure.multicall.help.txt"
 help_out_multicall_chengc="$out_dir/tooling_cmdline.chengc.multicall.help.txt"
 help_out_multicall_new_expr="$out_dir/tooling_cmdline.verify_new_expr_surface.multicall.help.txt"
-help_out_multicall_currentsrc_proof="$out_dir/tooling_cmdline.verify_backend_selfhost_currentsrc_proof.multicall.help.txt"
 help_out_multicall_mir_borrow="$out_dir/tooling_cmdline.verify_backend_mir_borrow.multicall.help.txt"
 help_out_multicall_string_abi="$out_dir/tooling_cmdline.verify_backend_string_abi_contract.multicall.help.txt"
 help_out_multicall_dot_lowering="$out_dir/tooling_cmdline.verify_backend_dot_lowering_contract.multicall.help.txt"
@@ -51,7 +50,6 @@ repo_strlit_out="$out_dir/tooling_cmdline.repo_string_literal.txt"
 repo_strformat_out="$out_dir/tooling_cmdline.repo_std_strformat.txt"
 repo_output_safety_out="$out_dir/tooling_cmdline.repo_backend_default_output_safety.txt"
 repo_new_expr_out="$out_dir/tooling_cmdline.repo_verify_new_expr_surface.txt"
-repo_currentsrc_proof_out="$out_dir/tooling_cmdline.repo_backend_selfhost_currentsrc_proof.txt"
 repo_mir_borrow_out="$out_dir/tooling_cmdline.repo_backend_mir_borrow.txt"
 repo_string_abi_out="$out_dir/tooling_cmdline.repo_backend_string_abi_contract.txt"
 repo_dot_lowering_out="$out_dir/tooling_cmdline.repo_backend_dot_lowering_contract.txt"
@@ -63,7 +61,6 @@ tool_strlit_out="$out_dir/tooling_cmdline.tool_string_literal.txt"
 tool_strformat_out="$out_dir/tooling_cmdline.tool_std_strformat.txt"
 tool_output_safety_out="$out_dir/tooling_cmdline.tool_backend_default_output_safety.txt"
 tool_new_expr_out="$out_dir/tooling_cmdline.tool_verify_new_expr_surface.txt"
-tool_currentsrc_proof_out="$out_dir/tooling_cmdline.tool_backend_selfhost_currentsrc_proof.txt"
 tool_mir_borrow_out="$out_dir/tooling_cmdline.tool_backend_mir_borrow.txt"
 tool_string_abi_out="$out_dir/tooling_cmdline.tool_backend_string_abi_contract.txt"
 tool_dot_lowering_out="$out_dir/tooling_cmdline.tool_backend_dot_lowering_contract.txt"
@@ -76,7 +73,6 @@ real_strlit_out="$out_dir/tooling_cmdline.real_string_literal.txt"
 real_strformat_out="$out_dir/tooling_cmdline.real_std_strformat.txt"
 real_output_safety_out="$out_dir/tooling_cmdline.real_backend_default_output_safety.txt"
 real_new_expr_out="$out_dir/tooling_cmdline.real_verify_new_expr_surface.txt"
-real_currentsrc_proof_out="$out_dir/tooling_cmdline.real_backend_selfhost_currentsrc_proof.txt"
 real_mir_borrow_out="$out_dir/tooling_cmdline.real_backend_mir_borrow.txt"
 real_core_backend_prod_help_out="$out_dir/tooling_cmdline.real_core_backend_prod_closure.help.txt"
 real_primary_verify_help_out="$out_dir/tooling_cmdline.real_primary_verify.help.txt"
@@ -86,7 +82,6 @@ real_primary_strlit_out="$out_dir/tooling_cmdline.real_primary_string_literal.tx
 real_primary_strformat_out="$out_dir/tooling_cmdline.real_primary_std_strformat.txt"
 real_primary_output_safety_out="$out_dir/tooling_cmdline.real_primary_backend_default_output_safety.txt"
 real_primary_new_expr_out="$out_dir/tooling_cmdline.real_primary_verify_new_expr_surface.txt"
-real_primary_currentsrc_proof_out="$out_dir/tooling_cmdline.real_primary_backend_selfhost_currentsrc_proof.txt"
 real_primary_mir_borrow_out="$out_dir/tooling_cmdline.real_primary_backend_mir_borrow.txt"
 global_bin="$out_dir/cheng_tooling"
 install_dir="$out_dir/bin"
@@ -96,8 +91,6 @@ bundle_dir="$root/artifacts/tooling_bundle/full"
 bundle_manifest="$bundle_dir/manifest.tsv"
 bundle_new_expr_bin="$bundle_dir/bin/verify_new_expr_surface"
 bundle_new_expr_help_out="$out_dir/tooling_cmdline.bundle.verify_new_expr_surface.help.txt"
-bundle_currentsrc_proof_bin="$bundle_dir/bin/verify_backend_selfhost_currentsrc_proof"
-bundle_currentsrc_proof_help_out="$out_dir/tooling_cmdline.bundle.verify_backend_selfhost_currentsrc_proof.help.txt"
 bundle_mir_borrow_bin="$bundle_dir/bin/verify_backend_mir_borrow"
 bundle_mir_borrow_help_out="$out_dir/tooling_cmdline.bundle.verify_backend_mir_borrow.help.txt"
 bundle_string_abi_bin="$bundle_dir/bin/verify_backend_string_abi_contract"
@@ -105,9 +98,6 @@ bundle_dot_lowering_bin="$bundle_dir/bin/verify_backend_dot_lowering_contract"
 bundle_string_abi_help_out="$out_dir/tooling_cmdline.bundle.verify_backend_string_abi_contract.help.txt"
 bundle_dot_lowering_help_out="$out_dir/tooling_cmdline.bundle.verify_backend_dot_lowering_contract.help.txt"
 report="$out_dir/tooling_cmdline.report.txt"
-currentsrc_proof_out_dir="$out_dir/tooling_cmdline.currentsrc_proof"
-currentsrc_proof_session="tooling.cmdline.currentsrc.proof"
-published_currentsrc_proof_dir="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof"
 
 run_gate_sanitized() {
   env \
@@ -122,34 +112,11 @@ run_gate_sanitized() {
     "$@"
 }
 
-run_currentsrc_proof_gate() {
-  runner="$1"
-  log="$2"
-  reuse="$3"
-  shift 3
-  env \
-    SELFHOST_CURRENTSRC_PROOF_SESSION="$currentsrc_proof_session" \
-    SELFHOST_CURRENTSRC_PROOF_OUT_DIR="$currentsrc_proof_out_dir" \
-    SELFHOST_CURRENTSRC_PROOF_REUSE="$reuse" \
-    SELFHOST_CURRENTSRC_PROOF_SKIP_DIRECT_SMOKE=1 \
-    "$runner" "$@" verify_backend_selfhost_currentsrc_proof >"$log" 2>&1
-}
-
 run_mir_borrow_gate() {
   runner="$1"
   log="$2"
   shift 2
   run_gate_sanitized "$runner" "$@" verify_backend_mir_borrow >"$log" 2>&1
-}
-
-seed_currentsrc_proof_out_dir() {
-  if [ ! -d "$published_currentsrc_proof_dir" ]; then
-    echo "[verify_tooling_cmdline] missing published current-source proof dir: $published_currentsrc_proof_dir" 1>&2
-    exit 1
-  fi
-  rm -rf "$currentsrc_proof_out_dir"
-  mkdir -p "$currentsrc_proof_out_dir"
-  cp -R "$published_currentsrc_proof_dir"/. "$currentsrc_proof_out_dir"/
 }
 
 run_contract_gate() {
@@ -292,14 +259,6 @@ run_logged_expect "$repo_new_expr_out" \
   160 \
   run_gate_sanitized sh "$repo_tool" verify_new_expr_surface
 
-seed_currentsrc_proof_out_dir
-run_logged_expect "$repo_currentsrc_proof_out" \
-  "repo current-source proof gate command failed" \
-  'verify_backend_selfhost_currentsrc_proof ok' \
-  "repo current-source proof gate failed" \
-  200 \
-  run_currentsrc_proof_gate sh "$repo_currentsrc_proof_out" 1 "$repo_tool"
-
 run_logged_expect "$repo_mir_borrow_out" \
   "repo mir_borrow gate command failed" \
   'verify_backend_mir_borrow ok' \
@@ -334,7 +293,7 @@ run_logged_expect "$list_out" \
   "" \
   160 \
   env TOOLING_FORCE_BUILD=1 TOOLING_LINKER=system "$tool" list
-for id in backend_prod_closure verify_backend_closedloop chengc verify_tooling_cmdline verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
+for id in backend_prod_closure verify_backend_closedloop chengc verify_tooling_cmdline verify_new_expr_surface verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$list_out"; then
     echo "[verify_tooling_cmdline] missing id in list output: $id" 1>&2
     exit 1
@@ -436,13 +395,6 @@ run_logged_expect "$tool_new_expr_out" \
   160 \
   run_gate_sanitized "$global_bin" verify_new_expr_surface
 
-run_logged_expect "$tool_currentsrc_proof_out" \
-  "global current-source proof gate command failed" \
-  'verify_backend_selfhost_currentsrc_proof ok' \
-  "global current-source proof gate failed" \
-  200 \
-  run_currentsrc_proof_gate "$global_bin" "$tool_currentsrc_proof_out" 1
-
 run_logged_expect "$tool_mir_borrow_out" \
   "global mir_borrow gate command failed" \
   'verify_backend_mir_borrow ok' \
@@ -470,7 +422,7 @@ run_logged_expect "$real_list_out" \
   "" \
   160 \
   "$real_tool" list
-for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
+for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$real_list_out"; then
     echo "[verify_tooling_cmdline] real launcher missing id in list output: $id" 1>&2
     exit 1
@@ -492,7 +444,7 @@ run_logged_expect "$real_primary_list_out" \
   "" \
   160 \
   "$real_primary_bin" list
-for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_selfhost_currentsrc_proof verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
+for id in chengc backend_prod_closure verify verify_new_expr_surface verify_backend_mir_borrow verify_backend_string_abi_contract verify_backend_dot_lowering_contract verify_backend_macho_cstring_overlap verify_std_string_json; do
   if ! rg -qx "$id" "$real_primary_list_out"; then
     echo "[verify_tooling_cmdline] real primary binary missing id in list output: $id" 1>&2
     exit 1
@@ -557,13 +509,6 @@ run_logged_expect "$real_primary_new_expr_out" \
   "real primary binary new-expr surface gate failed" \
   160 \
   run_gate_sanitized "$real_primary_bin" verify_new_expr_surface
-
-run_logged_expect "$real_primary_currentsrc_proof_out" \
-  "real primary binary current-source proof gate command failed" \
-  'verify_backend_selfhost_currentsrc_proof ok' \
-  "real primary binary current-source proof gate failed" \
-  200 \
-  run_currentsrc_proof_gate "$real_primary_bin" "$real_primary_currentsrc_proof_out" 1
 
 run_logged_expect "$real_primary_mir_borrow_out" \
   "real primary binary mir_borrow gate command failed" \
@@ -631,13 +576,6 @@ run_logged_expect "$real_new_expr_out" \
   160 \
   run_gate_sanitized "$real_tool" verify_new_expr_surface
 
-run_logged_expect "$real_currentsrc_proof_out" \
-  "real launcher current-source proof gate command failed" \
-  'verify_backend_selfhost_currentsrc_proof ok' \
-  "real launcher current-source proof gate failed" \
-  200 \
-  run_currentsrc_proof_gate "$real_tool" "$real_currentsrc_proof_out" 1
-
 run_logged_expect "$real_mir_borrow_out" \
   "real launcher mir_borrow gate command failed" \
   'verify_backend_mir_borrow ok' \
@@ -664,10 +602,6 @@ for link in backend_prod_closure verify_backend_closedloop cheng_tooling chengc;
     exit 1
   fi
 done
-if [ ! -x "$install_dir/verify_backend_selfhost_currentsrc_proof" ]; then
-  echo "[verify_tooling_cmdline] missing multicall link: $install_dir/verify_backend_selfhost_currentsrc_proof" 1>&2
-  exit 1
-fi
 if [ ! -x "$install_dir/verify_backend_mir_borrow" ]; then
   echo "[verify_tooling_cmdline] missing multicall link: $install_dir/verify_backend_mir_borrow" 1>&2
   exit 1
@@ -707,13 +641,6 @@ run_logged_expect "$help_out_multicall_chengc" \
   120 \
   "$install_dir/chengc" --help
 
-run_logged_expect "$help_out_multicall_currentsrc_proof" \
-  "multicall verify_backend_selfhost_currentsrc_proof --help failed" \
-  'Usage:' \
-  "multicall verify_backend_selfhost_currentsrc_proof help text missing" \
-  120 \
-  "$install_dir/verify_backend_selfhost_currentsrc_proof" --help
-
 run_logged_expect "$help_out_multicall_mir_borrow" \
   "multicall verify_backend_mir_borrow --help failed" \
   'Usage:' \
@@ -746,10 +673,6 @@ if [ ! -x "$bundle_new_expr_bin" ]; then
   echo "[verify_tooling_cmdline] missing bundled script-backed gate: $bundle_new_expr_bin" 1>&2
   exit 1
 fi
-if [ ! -x "$bundle_currentsrc_proof_bin" ]; then
-  echo "[verify_tooling_cmdline] missing bundled script-backed gate: $bundle_currentsrc_proof_bin" 1>&2
-  exit 1
-fi
 if [ ! -x "$bundle_mir_borrow_bin" ]; then
   echo "[verify_tooling_cmdline] missing bundled script-backed gate: $bundle_mir_borrow_bin" 1>&2
   exit 1
@@ -768,11 +691,6 @@ if [ ! -f "$bundle_manifest" ]; then
 fi
 if ! rg -q '^verify_new_expr_surface\t' "$bundle_manifest"; then
   echo "[verify_tooling_cmdline] bundle manifest missing verify_new_expr_surface" 1>&2
-  sed -n '1,160p' "$bundle_manifest" 1>&2 || true
-  exit 1
-fi
-if ! rg -q '^verify_backend_selfhost_currentsrc_proof\t' "$bundle_manifest"; then
-  echo "[verify_tooling_cmdline] bundle manifest missing verify_backend_selfhost_currentsrc_proof" 1>&2
   sed -n '1,160p' "$bundle_manifest" 1>&2 || true
   exit 1
 fi
@@ -797,13 +715,6 @@ run_logged_expect "$bundle_new_expr_help_out" \
   "bundled verify_new_expr_surface help text missing" \
   120 \
   "$bundle_new_expr_bin" --help
-
-run_logged_expect "$bundle_currentsrc_proof_help_out" \
-  "bundled verify_backend_selfhost_currentsrc_proof --help failed" \
-  'Usage:' \
-  "bundled verify_backend_selfhost_currentsrc_proof help text missing" \
-  120 \
-  "$bundle_currentsrc_proof_bin" --help
 
 run_logged_expect "$bundle_mir_borrow_help_out" \
   "bundled verify_backend_mir_borrow --help failed" \
@@ -838,7 +749,6 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "repo_std_strformat_output=$final_out_dir/$(basename -- "$repo_strformat_out")"
   echo "repo_backend_default_output_safety_output=$final_out_dir/$(basename -- "$repo_output_safety_out")"
   echo "repo_verify_new_expr_surface_output=$final_out_dir/$(basename -- "$repo_new_expr_out")"
-  echo "repo_backend_selfhost_currentsrc_proof_output=$final_out_dir/$(basename -- "$repo_currentsrc_proof_out")"
   echo "repo_backend_mir_borrow_output=$final_out_dir/$(basename -- "$repo_mir_borrow_out")"
   echo "repo_backend_string_abi_contract_output=$final_out_dir/$(basename -- "$repo_string_abi_out")"
   echo "repo_backend_dot_lowering_contract_output=$final_out_dir/$(basename -- "$repo_dot_lowering_out")"
@@ -851,7 +761,6 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "global_std_strformat_output=$final_out_dir/$(basename -- "$tool_strformat_out")"
   echo "global_backend_default_output_safety_output=$final_out_dir/$(basename -- "$tool_output_safety_out")"
   echo "global_verify_new_expr_surface_output=$final_out_dir/$(basename -- "$tool_new_expr_out")"
-  echo "global_backend_selfhost_currentsrc_proof_output=$final_out_dir/$(basename -- "$tool_currentsrc_proof_out")"
   echo "global_backend_mir_borrow_output=$final_out_dir/$(basename -- "$tool_mir_borrow_out")"
   echo "global_backend_string_abi_contract_output=$final_out_dir/$(basename -- "$tool_string_abi_out")"
   echo "global_backend_dot_lowering_contract_output=$final_out_dir/$(basename -- "$tool_dot_lowering_out")"
@@ -866,7 +775,6 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "real_primary_std_strformat_output=$final_out_dir/$(basename -- "$real_primary_strformat_out")"
   echo "real_primary_backend_default_output_safety_output=$final_out_dir/$(basename -- "$real_primary_output_safety_out")"
   echo "real_primary_verify_new_expr_surface_output=$final_out_dir/$(basename -- "$real_primary_new_expr_out")"
-  echo "real_primary_backend_selfhost_currentsrc_proof_output=$final_out_dir/$(basename -- "$real_primary_currentsrc_proof_out")"
   echo "real_primary_backend_mir_borrow_output=$final_out_dir/$(basename -- "$real_primary_mir_borrow_out")"
   echo "real_template=$real_tool_src"
   echo "real_verify_help_output=$final_out_dir/$(basename -- "$real_verify_help_out")"
@@ -876,7 +784,6 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "real_std_strformat_output=$final_out_dir/$(basename -- "$real_strformat_out")"
   echo "real_backend_default_output_safety_output=$final_out_dir/$(basename -- "$real_output_safety_out")"
   echo "real_verify_new_expr_surface_output=$final_out_dir/$(basename -- "$real_new_expr_out")"
-  echo "real_backend_selfhost_currentsrc_proof_output=$final_out_dir/$(basename -- "$real_currentsrc_proof_out")"
   echo "real_backend_mir_borrow_output=$final_out_dir/$(basename -- "$real_mir_borrow_out")"
   echo "real_core_backend_prod_help_output=$final_out_dir/$(basename -- "$real_core_backend_prod_help_out")"
   echo "list_output=$final_out_dir/$(basename -- "$list_out")"
@@ -884,7 +791,6 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "help_output_multicall=$final_out_dir/$(basename -- "$help_out_multicall")"
   echo "help_output_multicall_chengc=$final_out_dir/$(basename -- "$help_out_multicall_chengc")"
   echo "help_output_multicall_new_expr=$final_out_dir/$(basename -- "$help_out_multicall_new_expr")"
-  echo "help_output_multicall_currentsrc_proof=$final_out_dir/$(basename -- "$help_out_multicall_currentsrc_proof")"
   echo "help_output_multicall_mir_borrow=$final_out_dir/$(basename -- "$help_out_multicall_mir_borrow")"
   echo "help_output_multicall_string_abi=$final_out_dir/$(basename -- "$help_out_multicall_string_abi")"
   echo "help_output_multicall_dot_lowering=$final_out_dir/$(basename -- "$help_out_multicall_dot_lowering")"
@@ -895,11 +801,9 @@ run_logged_expect "$bundle_dot_lowering_help_out" \
   echo "bundle_dir=$bundle_dir"
   echo "bundle_manifest=$bundle_manifest"
   echo "bundle_new_expr_help_output=$final_out_dir/$(basename -- "$bundle_new_expr_help_out")"
-  echo "bundle_currentsrc_proof_help_output=$final_out_dir/$(basename -- "$bundle_currentsrc_proof_help_out")"
   echo "bundle_mir_borrow_help_output=$final_out_dir/$(basename -- "$bundle_mir_borrow_help_out")"
   echo "bundle_string_abi_help_output=$final_out_dir/$(basename -- "$bundle_string_abi_help_out")"
   echo "bundle_dot_lowering_help_output=$final_out_dir/$(basename -- "$bundle_dot_lowering_help_out")"
-  echo "currentsrc_proof_out_dir=$final_out_dir/$(basename -- "$currentsrc_proof_out_dir")"
 } >"$report"
 
 publish_dir="$(mktemp -d "$artifacts_dir/tooling_cmdline.publish.XXXXXX")"

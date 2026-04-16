@@ -5,64 +5,13 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-proof_meta_value() {
-  driver_path="$1"
-  key="$2"
-  meta_path="$driver_path.meta"
-  if [ ! -f "$meta_path" ]; then
-    return 1
-  fi
-  sed -n "s/^$key=//p" "$meta_path" | sed -n '1p'
-}
-
 driver_selection=""
 driver_selection_detail=""
 driver_meta=""
 
 choose_default_driver() {
-  currentsrc_driver="$root/artifacts/backend_selfhost_self_obj/probe_currentsrc_proof/cheng.stage2.proof"
-  strict_driver="$root/artifacts/backend_selfhost_self_obj/probe_prod.strict.noreuse/cheng.stage2.proof"
-  currentsrc_publish_status=""
-  currentsrc_degraded_reason=""
-
-  if [ -x "$currentsrc_driver" ]; then
-    currentsrc_publish_status="$(proof_meta_value "$currentsrc_driver" publish_status || true)"
-    currentsrc_degraded_reason="$(proof_meta_value "$currentsrc_driver" degraded_reason || true)"
-  fi
-
-  if [ -x "$currentsrc_driver" ] && [ "$currentsrc_publish_status" != "degraded" ]; then
-    driver_selection="probe_currentsrc_proof"
-    driver_meta="$currentsrc_driver.meta"
-    printf '%s\n' "$currentsrc_driver"
-    return 0
-  fi
-
-  if [ -x "$strict_driver" ]; then
-    driver_selection="probe_prod.strict.noreuse"
-    driver_meta="$strict_driver.meta"
-    if [ "$currentsrc_publish_status" = "degraded" ]; then
-      driver_selection_detail="currentsrc_proof_degraded"
-      if [ "$currentsrc_degraded_reason" != "" ]; then
-        driver_selection_detail="$driver_selection_detail:$currentsrc_degraded_reason"
-      fi
-    fi
-    printf '%s\n' "$strict_driver"
-    return 0
-  fi
-
-  if [ -x "$currentsrc_driver" ]; then
-    driver_selection="probe_currentsrc_proof_degraded"
-    driver_meta="$currentsrc_driver.meta"
-    driver_selection_detail="$currentsrc_publish_status"
-    if [ "$currentsrc_degraded_reason" != "" ]; then
-      driver_selection_detail="$driver_selection_detail:$currentsrc_degraded_reason"
-    fi
-    printf '%s\n' "$currentsrc_driver"
-    return 0
-  fi
-
-  driver_selection="backend_driver"
-  printf '%s\n' "$root/artifacts/backend_driver/cheng"
+  driver_selection="backend_driver_path"
+  printf '%s\n' "$(${TOOLING_SELF_BIN:-$root/artifacts/tooling_cmd/cheng_tooling} backend_driver_path)"
 }
 
 driver="${BACKEND_DRIVER:-}"

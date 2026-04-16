@@ -5,7 +5,13 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
-driver="${BACKEND_DRIVER:-$root/artifacts/backend_driver/cheng}"
+driver="${BACKEND_DRIVER:-}"
+if [ "$driver" = "" ]; then
+  driver="$(${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling} backend_driver_path 2>/dev/null || true)"
+fi
+if [ "$driver" = "" ]; then
+  driver="$root/artifacts/v3_backend_driver/cheng"
+fi
 stage0="${BACKEND_STAGE0_PROBE:-$root/artifacts/backend_selfhost_self_obj/cheng_stage0_default}"
 timeout_secs="${BACKEND_PTR_OBJECT_TIMEOUT:-60}"
 out_dir="$root/artifacts/backend_ptr_object_abi"

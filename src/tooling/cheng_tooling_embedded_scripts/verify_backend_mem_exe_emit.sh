@@ -141,7 +141,7 @@ macho_x64_file="src/backend/obj/macho_linker_x86_64.cheng"
 elf_file="src/backend/obj/elf_linker.cheng"
 elf_rv64_file="src/backend/obj/elf_linker_riscv64.cheng"
 coff_file="src/backend/obj/coff_linker.cheng"
-driver_file="src/backend/tooling/backend_driver.cheng"
+driver_file="src/tooling/cheng_tooling.cheng"
 chengc_file="src/tooling/cheng_tooling_embedded_inline.cheng"
 link_env_file="src/tooling/cheng_tooling_embedded_inline.cheng"
 

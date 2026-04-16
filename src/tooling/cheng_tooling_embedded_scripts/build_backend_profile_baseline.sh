@@ -59,14 +59,13 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
+plugin_system_file="src/tooling/cheng_tooling_embedded_scripts/verify_backend_plugin_system.sh"
+embedded_inline_file="src/tooling/cheng_tooling_embedded_inline.cheng"
+
 for required in \
   "$schema_file" \
-  "src/backend/tooling/backend_driver.cheng" \
-  "src/tooling/cheng_tooling_embedded_inline.cheng" \
-  "src/tooling/cheng_tooling_embedded_inline.cheng" \
-  "src/tooling/cheng_tooling_embedded_inline.cheng" \
-  "src/tooling/cheng_tooling_embedded_inline.cheng" \
-  "src/tooling/cheng_tooling_embedded_inline.cheng"; do
+  "$plugin_system_file" \
+  "$embedded_inline_file"; do
   if [ ! -f "$required" ]; then
     echo "[build_backend_profile_baseline] missing file: $required" 1>&2
     exit 2
@@ -79,19 +78,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-rg --no-filename --no-line-number -o '"backend_profile|uir_profile|generics_report|plugin_enable=|plugin_path=|plugin_paths=|metering_plugin="' \
-  src/backend/tooling/backend_driver.cheng \
+rg --no-filename --no-line-number -o 'PLUGIN_ENABLE=|PLUGIN_PATHS=|METERING_PLUGIN=|backend_driver_path' \
+  "$plugin_system_file" \
   | LC_ALL=C sort >"$tmp_driver_markers"
 
 driver_marker_count="$(wc -l < "$tmp_driver_markers" | tr -d ' ')"
 driver_marker_sha="$(hash_file "$tmp_driver_markers")"
 
 schema_sha="$(hash_file "$schema_file")"
-closedloop_sha="$(hash_file src/tooling/cheng_tooling_embedded_inline.cheng)"
-plugin_isolation_sha="$(hash_file src/tooling/cheng_tooling_embedded_inline.cheng)"
-plugin_system_sha="$(hash_file src/tooling/cheng_tooling_embedded_inline.cheng)"
-verify_schema_sha="$(hash_file src/tooling/cheng_tooling_embedded_inline.cheng)"
-verify_baseline_sha="$(hash_file src/tooling/cheng_tooling_embedded_inline.cheng)"
+closedloop_sha="$(hash_file "$embedded_inline_file")"
+plugin_isolation_sha="$(hash_file "$embedded_inline_file")"
+plugin_system_sha="$(hash_file "$plugin_system_file")"
+verify_schema_sha="$(hash_file "$embedded_inline_file")"
+verify_baseline_sha="$(hash_file "$embedded_inline_file")"
 
 out_dir="$(dirname "$out")"
 if [ "$out_dir" != "" ] && [ ! -d "$out_dir" ]; then

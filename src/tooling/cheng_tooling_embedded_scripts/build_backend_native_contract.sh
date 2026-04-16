@@ -59,7 +59,7 @@ if ! command -v rg >/dev/null 2>&1; then
   exit 2
 fi
 
-driver_file="src/backend/tooling/backend_driver.cheng"
+driver_file="v3/src/tooling/compiler_main.cheng"
 builder_file="src/backend/uir/uir_internal/uir_core_builder.cheng"
 tooling_file="src/tooling/cheng_tooling.cheng"
 for required in "$doc" "$driver_file" "$builder_file" "$tooling_file"; do

@@ -88,7 +88,7 @@ fi
 
 driver="$($tool driver-path --path-only 2>/dev/null | tail -n 1 | tr -d '\r' || true)"
 if [ "$driver" = "" ]; then
-  driver="artifacts/backend_driver/cheng"
+  driver="artifacts/v3_backend_driver/cheng"
 fi
 if [ ! -x "$driver" ]; then
   echo "[verify_backend_noalias_opt] backend driver not executable: $driver" 1>&2

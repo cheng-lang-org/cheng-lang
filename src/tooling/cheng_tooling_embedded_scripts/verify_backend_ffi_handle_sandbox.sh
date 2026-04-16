@@ -6,6 +6,10 @@ set -eu
 root="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 cd "$root"
 
+# shellcheck disable=SC1091
+. "$root/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh"
+backend_runtime_abi_contract_load
+
 tooling_self_bin="${TOOLING_SELF_BIN:-artifacts/tooling_cmd/cheng_tooling.real.bin}"
 
 if [ "${CLEAN_CHENG_LOCAL:-1}" = "1" ] && [ "${TOOLING_CLEANUP_DEPTH:-0}" = "0" ]; then
@@ -147,7 +151,7 @@ build_runtime_obj() {
   build_dir="chengcache/runtime_selflink/.verify_backend_ffi_handle_sandbox.${target}"
   extra_flags="$(runtime_cc_extra_flags)"
   mkdir -p "$build_dir" "$(dirname "$out")"
-  src="src/runtime/native/system_helpers_host_process_ffi_bridge.c"
+  src="$BACKEND_RUNTIME_ABI_BRIDGE_HOST_PROCESS_FFI"
   log="$build_dir/ffi_handle_bridge.log"
   if [ "$extra_flags" != "" ]; then
     # shellcheck disable=SC2086
@@ -168,7 +172,7 @@ build_raw_runtime_obj() {
   out="chengcache/runtime_selflink/system_helpers.ffi_raw_bridge.${target}.o"
   build_dir="chengcache/runtime_selflink/.verify_backend_ffi_handle_sandbox.${target}"
   extra_flags="$(runtime_cc_extra_flags)"
-  src="src/runtime/native/system_helpers_ffi_raw_bridge.c"
+  src="$BACKEND_RUNTIME_ABI_BRIDGE_RAW_FFI"
   log="$build_dir/ffi_raw_bridge.log"
   mkdir -p "$build_dir" "$(dirname "$out")"
   if [ "$extra_flags" != "" ]; then
@@ -260,10 +264,10 @@ case "$gate_linker" in
     ;;
 esac
 
-compat_header_file="src/runtime/native/system_helpers.h"
-backend_runtime_file="src/std/system_helpers_backend.cheng"
-runtime_bridge_host_process_ffi="src/runtime/native/system_helpers_host_process_ffi_bridge.c"
-runtime_bridge_raw_ffi="src/runtime/native/system_helpers_ffi_raw_bridge.c"
+compat_header_file="$BACKEND_RUNTIME_ABI_COMPAT_HEADER"
+backend_runtime_file="$BACKEND_RUNTIME_ABI_AUTHORITY"
+runtime_bridge_host_process_ffi="$BACKEND_RUNTIME_ABI_BRIDGE_HOST_PROCESS_FFI"
+runtime_bridge_raw_ffi="$BACKEND_RUNTIME_ABI_BRIDGE_RAW_FFI"
 fixture_ok="tests/cheng/backend/fixtures/ffi_importc_handle_sandbox_i32.cheng"
 fixture_trap="tests/cheng/backend/fixtures/ffi_importc_handle_stale_trap_i32.cheng"
 fixture_ann="tests/cheng/backend/fixtures/ffi_importc_handle_annotated_i32.cheng"
@@ -271,10 +275,7 @@ fixture_ann_trap="tests/cheng/backend/fixtures/ffi_importc_handle_annotated_stal
 
 authority_has_symbol() {
   sym="$1"
-  for src in \
-    "$backend_runtime_file" \
-    "$runtime_bridge_host_process_ffi" \
-    "$runtime_bridge_raw_ffi"; do
+  for src in $(backend_runtime_abi_contract_each_ffi_authority); do
     if rg -q "$sym" "$src"; then
       return 0
     fi

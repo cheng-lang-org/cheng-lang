@@ -367,6 +367,19 @@ int32_t cheng_v3_tailnet_provider_probe_proxy_ready_bridge(uint64_t handle);
 int32_t cheng_v3_tailnet_provider_probe_listener_needs_repair_bridge(uint64_t handle);
 int32_t cheng_v3_tailnet_provider_probe_derp_healthy_bridge(uint64_t handle);
 ChengStrBridge cheng_v3_tailnet_provider_probe_startup_stage_bridge(uint64_t handle);
+uint64_t cheng_v3_relay_provider_open_bridge(ChengStrBridge service_kind_text,
+                                             ChengStrBridge endpoint_text,
+                                             ChengStrBridge region_text,
+                                             ChengStrBridge auth_scope_text,
+                                             int32_t requires_lease);
+ChengStrBridge cheng_v3_relay_provider_probe_bridge(uint64_t handle);
+ChengStrBridge cheng_v3_relay_provider_issue_lease_bridge(uint64_t handle,
+                                                          ChengStrBridge requester_peer_id_text,
+                                                          ChengStrBridge requested_region_text,
+                                                          ChengStrBridge nonce_hex_text,
+                                                          int64_t issued_at_epoch_seconds,
+                                                          int32_t ttl_seconds);
+int32_t cheng_v3_relay_provider_close_bridge(uint64_t handle);
 int32_t cheng_v3_system_cpu_logical_cores_bridge(void);
 int64_t cheng_v3_system_memory_available_bytes_bridge(void);
 int64_t cheng_v3_system_memory_total_bytes_bridge(void);

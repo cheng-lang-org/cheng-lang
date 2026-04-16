@@ -197,6 +197,135 @@ function writeSidecarSummary(summaryPath, values) {
   fs.writeFileSync(summaryPath, `${lines.join('\n')}\n`, 'utf8');
 }
 
+function classifyAsset(relPath) {
+  const ext = path.extname(String(relPath || '')).toLowerCase();
+  if (['.png', '.jpg', '.jpeg', '.gif', '.webp', '.svg', '.ico'].includes(ext)) return 'image';
+  if (['.woff', '.woff2', '.ttf', '.otf'].includes(ext)) return 'font';
+  if (ext === '.wasm') return 'wasm';
+  if (['.mp3', '.wav', '.ogg'].includes(ext)) return 'audio';
+  if (['.mp4', '.webm'].includes(ext)) return 'video';
+  if (ext === '.html') return 'html';
+  if (ext === '.css') return 'css';
+  if (ext === '.json') return 'json';
+  return 'other';
+}
+
+function walkAssets(repo) {
+  const out = [];
+  function walk(current) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue;
+        walk(path.join(current, entry.name));
+        continue;
+      }
+      const fullPath = path.join(current, entry.name);
+      const relPath = path.relative(repo, fullPath).split(path.sep).join('/');
+      const ext = path.extname(relPath).toLowerCase();
+      if (!ASSET_EXTS.has(ext) || SOURCE_EXTS.has(ext)) continue;
+      out.push({
+        path: relPath,
+        kind: classifyAsset(relPath),
+      });
+    }
+  }
+  walk(repo);
+  out.sort((a, b) => a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind));
+  return out;
+}
+
+function writeLines(filePath, lines) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
+}
+
+function writeSurfaceFeed(outDir, repo, runtimeRoots, tsVersion, modules) {
+  const metaPath = path.join(outDir, 'tsx_surface_meta_v1.env');
+  const modulesPath = path.join(outDir, 'tsx_surface_modules_v1.tsv');
+  const featureCountsPath = path.join(outDir, 'tsx_surface_feature_counts_v1.tsv');
+  const staticImportsPath = path.join(outDir, 'tsx_surface_static_imports_v1.tsv');
+  const dynamicImportsPath = path.join(outDir, 'tsx_surface_dynamic_imports_v1.tsv');
+  const assetRefsPath = path.join(outDir, 'tsx_surface_asset_refs_v1.tsv');
+  const componentsPath = path.join(outDir, 'tsx_surface_components_v1.tsv');
+  const blockersPath = path.join(outDir, 'tsx_surface_blockers_v1.tsv');
+  const tailwindTokensPath = path.join(outDir, 'tsx_surface_tailwind_tokens_v1.tsv');
+  const discoveredAssetsPath = path.join(outDir, 'tsx_surface_discovered_assets_v1.tsv');
+
+  writeSidecarSummary(metaPath, {
+    format: 'tsx_surface_feed_v1',
+    repo_root: repo,
+    source_roots: runtimeRoots.join(','),
+    typescript_version: tsVersion,
+    module_count: modules.length,
+  });
+
+  const moduleLines = [];
+  const featureCountLines = [];
+  const staticImportLines = [];
+  const dynamicImportLines = [];
+  const assetRefLines = [];
+  const componentLines = [];
+  const blockerLines = [];
+  const tailwindTokenLines = [];
+
+  for (const module of modules) {
+    const modulePath = String(module.path || '');
+    moduleLines.push([
+      modulePath,
+      module.generated ? '1' : '0',
+      module.jsx_like ? '1' : '0',
+      String(Number(module.export_count || 0)),
+    ].join('\t'));
+
+    for (const [featureName, countValue] of Object.entries(module.feature_counts || {})) {
+      const count = Number(countValue || 0);
+      if (count <= 0) continue;
+      featureCountLines.push([modulePath, featureName, String(count)].join('\t'));
+    }
+    for (const specifier of module.static_imports || []) {
+      staticImportLines.push([modulePath, String(specifier || '')].join('\t'));
+    }
+    for (const specifier of module.dynamic_imports || []) {
+      dynamicImportLines.push([modulePath, String(specifier || '')].join('\t'));
+    }
+    for (const assetPath of module.asset_refs || []) {
+      const assetText = String(assetPath || '');
+      assetRefLines.push([modulePath, assetText, classifyAsset(assetText)].join('\t'));
+    }
+    for (const component of module.components || []) {
+      componentLines.push([
+        modulePath,
+        String(component.name || ''),
+        String(component.kind || ''),
+        String(Number(component.line || 0)),
+      ].join('\t'));
+    }
+    for (const blocker of module.blockers || []) {
+      blockerLines.push([
+        modulePath,
+        String(blocker.file || ''),
+        String(Number(blocker.line || 0)),
+        String(Number(blocker.column || 0)),
+        String(blocker.code || ''),
+      ].join('\t'));
+    }
+    for (const token of module.tailwind_class_tokens || []) {
+      tailwindTokenLines.push([modulePath, String(token || '')].join('\t'));
+    }
+  }
+
+  const discoveredAssetLines = walkAssets(repo).map((entry) => [entry.path, entry.kind].join('\t'));
+  writeLines(modulesPath, moduleLines);
+  writeLines(featureCountsPath, featureCountLines);
+  writeLines(staticImportsPath, staticImportLines);
+  writeLines(dynamicImportsPath, dynamicImportLines);
+  writeLines(assetRefsPath, assetRefLines);
+  writeLines(componentsPath, componentLines);
+  writeLines(blockersPath, blockerLines);
+  writeLines(tailwindTokensPath, tailwindTokenLines);
+  writeLines(discoveredAssetsPath, discoveredAssetLines);
+}
+
 function lineColOf(ts, sourceFile, node) {
   const pos = ts.getLineAndCharacterOfPosition(sourceFile, node.getStart(sourceFile, false));
   return { line: pos.line + 1, column: pos.character + 1 };
@@ -1955,6 +2084,7 @@ function main() {
     const outPath = path.resolve(args.outPath);
     fs.mkdirSync(path.dirname(outPath), { recursive: true });
     fs.writeFileSync(outPath, `${JSON.stringify(out, null, 2)}\n`, 'utf8');
+    writeSurfaceFeed(path.dirname(outPath), repo, runtimeRoots, ts.version, modules);
   }
   writeSidecarSummary(args.summaryOut ? path.resolve(args.summaryOut) : '', {
     format: out.format,
