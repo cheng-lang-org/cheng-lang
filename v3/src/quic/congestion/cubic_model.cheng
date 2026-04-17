@@ -1,6 +1,14 @@
 # CUBIC congestion control model.
 
 import cheng/v3/quic/congestion/common
+
+const
+    cubicScale = 1024
+    cubicBetaScaledDefault = 717
+    cubicCScaledDefault = 410
+    cubicMillisPerSecond = 1000
+    cubicMillisCubeScale = 1000000000
+
 type
     CubicModel =
         hasHadCongestionEvent: bool
@@ -46,48 +54,8 @@ type
 
         recoverySentPacketNumber: int64
         datagramPayloadBytes: int64
-        beta: float64
-        cParam: float64
-        kCubicSeconds: float64
-
-fn cubicAbs(value: float64): float64 =
-    if value < 0.0:
-        return -value
-    return value
-
-fn cubicCbrt(value: float64): float64 =
-    if value == 0.0:
-        return 0.0
-    var x: float64 = value
-    var neg: bool = false
-    if x < 0.0:
-        x = -x
-        neg = true
-    var y: float64 = x
-    for i in 0..<20:
-        let denom: float64 = y * y
-        if denom == 0.0:
-            break
-        y = (2.0 * y + x / denom) / 3.0
-    if neg:
-        return -y
-    return y
-
-fn cubicClampFloat(value: float64, minVal: float64, maxVal: float64): float64 =
-    var v: float64 = value
-    if v < minVal:
-        v = minVal
-    if v > maxVal:
-        v = maxVal
-    return v
-
-fn cubicClampFloatToInt64(value: float64): int64 =
-    if value <= 0.0:
-        return 0
-    let maxVal: float64 = float64(maxInt64Value)
-    if value >= maxVal:
-        return maxInt64Value
-    return int64(value)
+        betaScaled: int64
+        cParamScaled: int64
 
 fn cubicMaxInt64(a: int64, b: int64): int64 =
     if a > b:
@@ -111,15 +79,158 @@ fn cubicSaturatingAdd(a: int64, b: int64): int64 =
         return maxInt64Value
     return a + b
 
+fn cubicSaturatingMulPositive(a: int64, b: int64): int64 =
+    if a <= 0 || b <= 0:
+        return 0
+    if a > maxInt64Value / b:
+        return maxInt64Value
+    return a * b
+
+fn cubicSaturatingMulSigned(a: int64, b: int64): int64 =
+    if a == 0 || b == 0:
+        return 0
+    var neg: bool = false
+    var x: int64 = a
+    var y: int64 = b
+    if x < 0:
+        x = -x
+        neg = !neg
+    if y < 0:
+        y = -y
+        neg = !neg
+    let product: int64 = cubicSaturatingMulPositive(x, y)
+    if !neg:
+        return product
+    if product >= maxInt64Value:
+        return -maxInt64Value
+    return -product
+
+fn cubicCubePositive(value: int64): int64 =
+    if value <= 0:
+        return 0
+    let square: int64 = cubicSaturatingMulPositive(value, value)
+    return cubicSaturatingMulPositive(square, value)
+
+fn cubicIntegerCbrt(value: int64): int64 =
+    if value <= 0:
+        return 0
+    var hi: int64 = 1
+    while hi < maxInt64Value && cubicCubePositive(hi) < value:
+        if hi > maxInt64Value / 2:
+            hi = maxInt64Value
+            break
+        hi = hi * 2
+    var lo: int64 = 0
+    while lo < hi:
+        let gap: int64 = hi - lo
+        let mid: int64 = lo + ((gap + 1) / 2)
+        let cube: int64 = cubicCubePositive(mid)
+        if cube == value:
+            return mid
+        if cube < value:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+fn cubicAddSignedClamped(base: int64, delta: int64): int64 =
+    if delta >= 0:
+        return cubicSaturatingAdd(base, delta)
+    let magnitude: int64 = -delta
+    if magnitude >= base:
+        return 0
+    return base - magnitude
+
+fn cubicBytesToPackets(model: CubicModel, bytes: int64): int64 =
+    if bytes <= 0 || model.datagramPayloadBytes <= 0:
+        return 0
+    var packets: int64 = bytes / model.datagramPayloadBytes
+    if packets <= 0:
+        packets = 1
+    return packets
+
+fn cubicPacketsToBytes(model: CubicModel, packets: int64): int64 =
+    if packets <= 0 || model.datagramPayloadBytes <= 0:
+        return 0
+    return cubicSaturatingMulPositive(packets, model.datagramPayloadBytes)
+
+fn cubicPacketsScaledToBytes(model: CubicModel, packetsScaled: int64): int64 =
+    if packetsScaled <= 0 || model.datagramPayloadBytes <= 0:
+        return 0
+    let scaledBytes: int64 = cubicSaturatingMulPositive(packetsScaled, model.datagramPayloadBytes)
+    var bytes: int64 = scaledBytes / cubicScale
+    if scaledBytes % cubicScale != 0:
+        bytes = bytes + 1
+    return bytes
+
+fn cubicReducedWindow(model: CubicModel): int64 =
+    let minCwnd: int64 = cubicComputeMinCwnd(model)
+    if model.congestionWindow <= 0:
+        return minCwnd
+    let scaled: int64 = cubicSaturatingMulPositive(model.congestionWindow, model.betaScaled)
+    var reduced: int64 = scaled / cubicScale
+    if reduced < minCwnd:
+        reduced = minCwnd
+    return reduced
+
+fn cubicScaledPacketOffset(model: CubicModel, diffMs: int64): int64 =
+    if diffMs == 0 || model.cParamScaled <= 0:
+        return 0
+    let square: int64 = cubicSaturatingMulSigned(diffMs, diffMs)
+    let cube: int64 = cubicSaturatingMulSigned(square, diffMs)
+    if cube == 0:
+        return 0
+    let numerator: int64 = cubicSaturatingMulSigned(model.cParamScaled, cube)
+    return numerator / cubicMillisCubeScale
+
 fn cubicUpdateKCubic(model: var CubicModel) =
-    if model.cParam <= 0.0 || model.windowMax <= 0:
-        model.kCubicSeconds = 0.0
+    if model.cParamScaled <= 0 || model.windowMax <= 0:
+        model.kCubic = 0
         return
-    let numerator: float64 = float64(model.windowMax) * (1.0 - model.beta)
-    if numerator <= 0.0:
-        model.kCubicSeconds = 0.0
+    let windowMaxPackets: int64 = cubicBytesToPackets(model, model.windowMax)
+    if windowMaxPackets <= 0:
+        model.kCubic = 0
         return
-    model.kCubicSeconds = cubicCbrt(numerator / model.cParam)
+    let oneMinusBetaScaled: int64 = cubicScale - model.betaScaled
+    if oneMinusBetaScaled <= 0:
+        model.kCubic = 0
+        return
+    var cubicRootInput: int64 = cubicSaturatingMulPositive(windowMaxPackets, oneMinusBetaScaled)
+    cubicRootInput = cubicSaturatingMulPositive(cubicRootInput, cubicMillisCubeScale)
+    cubicRootInput = cubicRootInput / model.cParamScaled
+    if cubicRootInput <= 0:
+        model.kCubic = 0
+        return
+    model.kCubic = cubicIntegerCbrt(cubicRootInput)
+
+fn cubicComputeTargetWindow(model: CubicModel, nowUs: int64): int64 =
+    if model.timeOfCongAvoidStart == 0:
+        return model.congestionWindow
+    let windowMaxPackets: int64 = cubicBytesToPackets(model, model.windowMax)
+    if windowMaxPackets <= 0:
+        return model.congestionWindow
+    var elapsedUs: int64 = 0
+    if nowUs > model.timeOfCongAvoidStart:
+        elapsedUs = nowUs - model.timeOfCongAvoidStart
+    let elapsedMs: int64 = elapsedUs / cubicMillisPerSecond
+    let diffMs: int64 = elapsedMs - model.kCubic
+    let basePacketsScaled: int64 = cubicSaturatingMulPositive(windowMaxPackets, cubicScale)
+    let deltaPacketsScaled: int64 = cubicScaledPacketOffset(model, diffMs)
+    let desiredPacketsScaled: int64 = cubicAddSignedClamped(basePacketsScaled, deltaPacketsScaled)
+    return cubicPacketsScaledToBytes(model, desiredPacketsScaled)
+
+fn cubicComputeRenoTarget(model: var CubicModel, acked: int64): int64 =
+    if acked <= 0:
+        return model.congestionWindow
+    if model.congestionWindow <= 0:
+        return cubicPacketsToBytes(model, 1)
+    let growthUnits: int64 = cubicSaturatingMulPositive(model.datagramPayloadBytes, acked)
+    model.aimdAccumulator = cubicSaturatingAdd(model.aimdAccumulator, growthUnits)
+    if model.aimdAccumulator < model.congestionWindow:
+        return model.congestionWindow
+    let renoInc: int64 = model.aimdAccumulator / model.congestionWindow
+    model.aimdAccumulator = model.aimdAccumulator % model.congestionWindow
+    return cubicSaturatingAdd(model.congestionWindow, renoInc)
 
 fn cubicInit(
     initialWindowPackets: int32,
@@ -127,56 +238,61 @@ fn cubicInit(
     sendIdleTimeoutMs: int32
 ): CubicModel =
     let initialWindowBytes: int64 = int64(datagramPayloadBytes) * int64(initialWindowPackets)
-    CubicModel(
-        hasHadCongestionEvent: false,
-        isInRecovery: false,
-        isInPersistentCongestion: false,
-        timeOfLastAckValid: false,
-        initialWindowPackets: initialWindowPackets,
-        sendIdleTimeoutMs: sendIdleTimeoutMs,
-        congestionWindow: initialWindowBytes,
-        prevCongestionWindow: initialWindowBytes,
-        slowStartThreshold: maxInt64Value,
-        prevSlowStartThreshold: maxInt64Value,
-        aimdWindow: initialWindowBytes,
-        prevAimdWindow: initialWindowBytes,
-        aimdAccumulator: 0,
-        bytesInFlight: 0,
-        bytesInFlightMax: initialWindowBytes / 2,
-        lastSendAllowance: 0,
-        exemptions: 0,
-        timeOfLastAck: 0,
-        timeOfCongAvoidStart: 0,
-        kCubic: 0,
-        prevKCubic: 0,
-        windowPrior: initialWindowBytes,
-        prevWindowPrior: initialWindowBytes,
-        windowMax: initialWindowBytes,
-        prevWindowMax: initialWindowBytes,
-        windowLastMax: initialWindowBytes,
-        prevWindowLastMax: initialWindowBytes,
-        hyStartState: hyStartNotStarted,
-        hyStartAckCount: 0,
-        minRttInLastRound: 0,
-        minRttInCurrentRound: maxInt64Value,
-        cssBaselineMinRtt: 0,
-        hyStartRoundEnd: 0,
-        cWndSlowStartGrowthDivisor: 1,
-        conservativeSlowStartRounds: 0,
-        recoverySentPacketNumber: 0,
-        datagramPayloadBytes: int64(datagramPayloadBytes),
-        beta: 0.7,
-        cParam: 0.4,
-        kCubicSeconds: 0.0
-    )
+    var model: CubicModel
+    model.hasHadCongestionEvent = false
+    model.isInRecovery = false
+    model.isInPersistentCongestion = false
+    model.timeOfLastAckValid = false
+    model.initialWindowPackets = initialWindowPackets
+    model.sendIdleTimeoutMs = sendIdleTimeoutMs
+    model.congestionWindow = initialWindowBytes
+    model.prevCongestionWindow = initialWindowBytes
+    model.slowStartThreshold = maxInt64Value
+    model.prevSlowStartThreshold = maxInt64Value
+    model.aimdWindow = initialWindowBytes
+    model.prevAimdWindow = initialWindowBytes
+    model.aimdAccumulator = 0
+    model.bytesInFlight = 0
+    model.bytesInFlightMax = initialWindowBytes / 2
+    model.lastSendAllowance = 0
+    model.exemptions = 0
+    model.timeOfLastAck = 0
+    model.timeOfCongAvoidStart = 0
+    model.kCubic = 0
+    model.prevKCubic = 0
+    model.windowPrior = initialWindowBytes
+    model.prevWindowPrior = initialWindowBytes
+    model.windowMax = initialWindowBytes
+    model.prevWindowMax = initialWindowBytes
+    model.windowLastMax = initialWindowBytes
+    model.prevWindowLastMax = initialWindowBytes
+    model.hyStartState = hyStartNotStarted
+    model.hyStartAckCount = 0
+    model.minRttInLastRound = 0
+    model.minRttInCurrentRound = maxInt64Value
+    model.cssBaselineMinRtt = 0
+    model.hyStartRoundEnd = 0
+    model.cWndSlowStartGrowthDivisor = 1
+    model.conservativeSlowStartRounds = 0
+    model.recoverySentPacketNumber = 0
+    model.datagramPayloadBytes = int64(datagramPayloadBytes)
+    model.betaScaled = cubicBetaScaledDefault
+    model.cParamScaled = cubicCScaledDefault
+    return model
 
 fn cubicEnterRecovery(model: var CubicModel, lostBytes: int64) =
     model.isInRecovery = true
     model.hasHadCongestionEvent = true
-    if model.congestionWindow > lostBytes:
-        model.congestionWindow = model.congestionWindow - lostBytes
+    if model.bytesInFlight > lostBytes:
+        model.bytesInFlight = model.bytesInFlight - lostBytes
     else:
-        model.congestionWindow = minCwndInMss
+        model.bytesInFlight = 0
+    model.congestionWindow = cubicReducedWindow(model)
+    model.slowStartThreshold = model.congestionWindow
+    model.aimdWindow = model.congestionWindow
+    model.aimdAccumulator = 0
+    model.timeOfCongAvoidStart = 0
+    cubicUpdateKCubic(model)
 
 fn cubicCanSend(model: CubicModel): bool =
     return model.bytesInFlight < model.congestionWindow || model.exemptions > 0
@@ -220,25 +336,17 @@ fn cubicOnDataAcked(model: var CubicModel, ack: AckEventSnapshot) =
     else:
         if model.timeOfCongAvoidStart == 0:
             model.timeOfCongAvoidStart = ack.timeNow
-        var elapsedUs: int64 = 0
-        if ack.timeNow > model.timeOfCongAvoidStart:
-            elapsedUs = ack.timeNow - model.timeOfCongAvoidStart
-        let t: float64 = float64(elapsedUs) / float64(microSecsInSec)
-        let diff: float64 = t - model.kCubicSeconds
-        let cubicTarget: float64 = float64(model.windowMax) + model.cParam * diff * diff * diff
-        var renoInc: float64 = 0.0
-        if model.congestionWindow == 0:
-            renoInc = float64(model.datagramPayloadBytes)
+        let cubicTarget: int64 = cubicComputeTargetWindow(model, ack.timeNow)
+        let renoTarget: int64 = cubicComputeRenoTarget(model, acked)
+        if cubicTarget > renoTarget:
+            model.congestionWindow = cubicTarget
         else:
-            renoInc = float64(model.datagramPayloadBytes) * float64(acked) / float64(model.congestionWindow)
-        let renoTarget: float64 = float64(model.congestionWindow) + renoInc
-        let desired: float64 = if cubicTarget > renoTarget: cubicTarget else: renoTarget
-        let bounded: float64 = cubicClampFloat(desired, float64(minCwnd), float64(maxInt64Value))
-        model.congestionWindow = cubicClampFloatToInt64(bounded)
+            model.congestionWindow = renoTarget
 
     if model.congestionWindow < minCwnd:
         model.congestionWindow = minCwnd
 
+    model.aimdWindow = model.congestionWindow
     if model.bytesInFlight > model.congestionWindow:
         model.bytesInFlight = model.congestionWindow
     if model.bytesInFlight > model.bytesInFlightMax:
@@ -253,31 +361,38 @@ fn cubicOnDataLost(model: var CubicModel, loss: LossEventSnapshot) =
 
     model.isInRecovery = true
     model.hasHadCongestionEvent = true
+    model.isInPersistentCongestion = loss.persistentCongestion
     model.recoverySentPacketNumber = loss.largestSentPacketNumber
 
     model.windowLastMax = model.windowMax
     model.windowPrior = model.congestionWindow
-    model.windowMax = cubicMaxInt64(model.congestionWindow, cubicComputeMinCwnd(model))
 
     let minCwnd: int64 = cubicComputeMinCwnd(model)
-    var ssthresh: int64 = model.congestionWindow / 2
-    if ssthresh < minCwnd:
+    model.windowMax = cubicMaxInt64(model.congestionWindow, minCwnd)
+    var ssthresh: int64 = cubicReducedWindow(model)
+    if loss.persistentCongestion:
         ssthresh = minCwnd
     model.slowStartThreshold = ssthresh
     model.congestionWindow = ssthresh
+    model.aimdWindow = ssthresh
+    model.aimdAccumulator = 0
+    model.timeOfCongAvoidStart = 0
 
     cubicUpdateKCubic(model)
     model.bytesInFlight = cubicMinInt64(model.bytesInFlight, model.congestionWindow)
 
 fn cubicOnProbeTimeout(model: var CubicModel) =
     let minCwnd: int64 = cubicComputeMinCwnd(model)
-    var ssthresh: int64 = model.congestionWindow / 2
-    if ssthresh < minCwnd:
-        ssthresh = minCwnd
-    model.slowStartThreshold = ssthresh
+    model.slowStartThreshold = cubicReducedWindow(model)
+    if model.slowStartThreshold < minCwnd:
+        model.slowStartThreshold = minCwnd
     model.congestionWindow = minCwnd
+    model.aimdWindow = minCwnd
+    model.aimdAccumulator = 0
     model.bytesInFlight = cubicMinInt64(model.bytesInFlight, model.congestionWindow)
     model.isInRecovery = false
+    model.isInPersistentCongestion = false
+    model.timeOfCongAvoidStart = 0
     cubicUpdateKCubic(model)
 
 fn cubicBytesInFlight(model: CubicModel): int64 =

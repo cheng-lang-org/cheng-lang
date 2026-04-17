@@ -1,0 +1,67 @@
+import std/cmdline as cmdline
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/host/diloco_host
+import cheng/DiLoCo/tests/support
+
+fn main(): int32 =
+    let port = cmdline.readInt32FlagOrDefault("--port", 0)
+    var readyPathRaw: str = ""
+    let hasReady = cmdline.readFirstFlagValue("--ready-path", readyPathRaw)
+    let readyPath = if hasReady: readyPathRaw else: ""
+
+    let jobBundleCid = support.v3DiLoCoTestJobBundleCid("quic-twoproc")
+    let leaderPeerId = support.v3DiLoCoTestPeer("diloco.quic.leader")
+    let initialModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-initial-model")
+    let initialOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-initial-optimizer")
+    let leaderModelDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-leader-model-delta")
+    let leaderOptimizerDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-leader-optimizer-delta")
+    let mergedModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-model")
+    let mergedOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-optimizer")
+
+    var node = diloco_host.v3DiLoCoHostInit("diloco.quic.server")
+    var job = core.v3DiLoCoJobZero()
+    var version = core.v3DiLoCoGlobalVersionZero()
+    let openRes = core.v3DiLoCoOpenJobFill(job,
+                                           version,
+                                           node.state,
+                                           jobBundleCid,
+                                           2,
+                                           5,
+                                           60,
+                                           initialModelRef,
+                                           initialOptimizerRef)
+    assert(openRes.ok, "v3 diloco quic twoproc: open")
+    var cohort = core.v3DiLoCoCohortZero()
+    let joinLeaderRes = core.v3DiLoCoJoinCohortFill(cohort, node.state, jobBundleCid, leaderPeerId)
+    assert(joinLeaderRes.ok, "v3 diloco quic twoproc: join leader")
+    diloco_host.v3DiLoCoHostEnableAutoLeader(node,
+                                             jobBundleCid,
+                                             leaderPeerId,
+                                             leaderModelDeltaRef,
+                                             leaderOptimizerDeltaRef,
+                                             8,
+                                             64,
+                                             5,
+                                             8,
+                                             16)
+
+    let serveRes = diloco_host.v3DiLoCoHostServeWindowNamed(node,
+                                                            "127.0.0.1",
+                                                            port,
+                                                            "localhost",
+                                                            readyPath,
+                                                            8,
+                                                            20000)
+    assert(serveRes.ok, "v3 diloco quic twoproc: serve")
+
+    var currentVersion = core.v3DiLoCoGlobalVersionZero()
+    let versionRes = core.v3DiLoCoFetchGlobalVersionFill(currentVersion, node.state, jobBundleCid)
+    assert(versionRes.ok, "v3 diloco quic twoproc: fetch current version")
+    assert(currentVersion.committedOuterStep == 1, "v3 diloco quic twoproc: committed outer step")
+    assert(node.state.jobs[0].currentOuterStep == 2, "v3 diloco quic twoproc: advanced outer step")
+    let mergedModelContract = core.v3DiLoCoArtifactRefValidate(mergedModelRef)
+    assert(mergedModelContract.ok, "v3 diloco quic twoproc: merged model contract")
+    let mergedOptimizerContract = core.v3DiLoCoArtifactRefValidate(mergedOptimizerRef)
+    assert(mergedOptimizerContract.ok, "v3 diloco quic twoproc: merged optimizer contract")
+    echo("v3 diloco_quic_twoproc_server_smoke ok")
+    return 0

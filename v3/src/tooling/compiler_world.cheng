@@ -1,4 +1,5 @@
 import std/result
+import std/system as system
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/lsmr_types as lt
@@ -48,6 +49,9 @@ fn v3CompilerWorldUniverseId(): str =
 
 fn v3CompilerWorldDefaultChannel(): str =
     return "stable"
+
+fn v3CompilerWorldOwnText(text: str): str =
+    return system.systemToStringStr(text)
 
 fn v3CompilerWorldNormalizeChannel(raw: str): Result[str] =
     let channel = strutil.strip(raw)
@@ -215,22 +219,25 @@ fn v3CompilerPackageSnapshotMake(packageId: str,
                                  csgRootCid: layout.FixedBytes32,
                                  exportSurfaceCid: layout.FixedBytes32,
                                  signature: str): V3CompilerPackageSnapshot =
+    let packageIdOwned = v3CompilerWorldOwnText(packageId)
+    let channelOwned = v3CompilerWorldOwnText(channel)
+    let signatureOwned = v3CompilerWorldOwnText(signature)
     var out: V3CompilerPackageSnapshot
     out.version = 1
-    out.packageId = packageId
-    out.channel = channel
+    out.packageId = packageIdOwned
+    out.channel = channelOwned
     out.sourceBundleCid = sourceBundleCid
     out.csgRootCid = csgRootCid
     out.exportSurfaceCid = exportSurfaceCid
-    out.signature = signature
+    out.signature = signatureOwned
     var buf: layout.ByteBuf = layout.byteBufInit(256)
     v3CompilerWorldAppendText(buf, "v3.compiler.package_snapshot")
-    v3CompilerWorldAppendText(buf, packageId)
-    v3CompilerWorldAppendText(buf, channel)
+    v3CompilerWorldAppendText(buf, packageIdOwned)
+    v3CompilerWorldAppendText(buf, channelOwned)
     v3CompilerWorldAppendFixed32(buf, sourceBundleCid)
     v3CompilerWorldAppendFixed32(buf, csgRootCid)
     v3CompilerWorldAppendFixed32(buf, exportSurfaceCid)
-    v3CompilerWorldAppendText(buf, signature)
+    v3CompilerWorldAppendText(buf, signatureOwned)
     out.snapshotCid = lt.v3FixedCidFromBuf(buf)
     return out
 
@@ -242,12 +249,14 @@ fn v3CompilerWorldHeadMake(channel: str,
                            stdPkgCid: layout.FixedBytes32,
                            runtimePkgCid: layout.FixedBytes32,
                            signature: str): V3CompilerWorldHead =
-    let universeId = v3CompilerWorldUniverseId()
+    let universeId = v3CompilerWorldOwnText(v3CompilerWorldUniverseId())
+    let channelOwned = v3CompilerWorldOwnText(channel)
+    let signatureOwned = v3CompilerWorldOwnText(signature)
     let manifestRootCid = v3CompilerWorldManifestRootCid(compilerPkgCid, stdPkgCid, runtimePkgCid)
     var out: V3CompilerWorldHead
     out.version = 1
     out.universeId = universeId
-    out.channel = channel
+    out.channel = channelOwned
     out.headEpoch = headEpoch
     out.prevHeadCid = prevHeadCid
     out.manifestRootCid = manifestRootCid
@@ -255,11 +264,11 @@ fn v3CompilerWorldHeadMake(channel: str,
     out.compilerPkgCid = compilerPkgCid
     out.stdPkgCid = stdPkgCid
     out.runtimePkgCid = runtimePkgCid
-    out.signature = signature
+    out.signature = signatureOwned
     var buf: layout.ByteBuf = layout.byteBufInit(256)
     v3CompilerWorldAppendText(buf, "v3.compiler.world_head")
     v3CompilerWorldAppendText(buf, universeId)
-    v3CompilerWorldAppendText(buf, channel)
+    v3CompilerWorldAppendText(buf, channelOwned)
     lt.v3AppendU32BE(buf, headEpoch)
     v3CompilerWorldAppendFixed32(buf, prevHeadCid)
     v3CompilerWorldAppendFixed32(buf, manifestRootCid)
@@ -267,7 +276,7 @@ fn v3CompilerWorldHeadMake(channel: str,
     v3CompilerWorldAppendFixed32(buf, compilerPkgCid)
     v3CompilerWorldAppendFixed32(buf, stdPkgCid)
     v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
-    v3CompilerWorldAppendText(buf, signature)
+    v3CompilerWorldAppendText(buf, signatureOwned)
     out.headCid = lt.v3FixedCidFromBuf(buf)
     return out
 
@@ -278,7 +287,7 @@ fn v3CompilerLocalUniverseBuildForChannel(channelRaw: str,
     let channelRes = v3CompilerWorldNormalizeChannel(channelRaw)
     if IsErr(channelRes):
         return Err[V3CompilerLocalUniverse](Error(channelRes))
-    let channel = Value(channelRes)
+    let channel = v3CompilerWorldOwnText(Value(channelRes))
     let compilerSnapshot = v3CompilerPackageSnapshotMake("cheng/v3/compiler",
                                                          channel,
                                                          sourceBundleCid,
@@ -329,15 +338,33 @@ fn v3CompilerWorldQuotedValue(text: str): str =
 
 fn v3CompilerWorldLineValue(text: str, key: str): str =
     let lines = strutil.split(text, '\n')
-    let plainPrefix = key + "="
-    let quotedPrefix = key + " = "
     for i in 0..<lines.len:
         let line = strutil.strip(lines[i])
-        if strutil.startsWith(line, plainPrefix):
-            let rawValue = v3path.v3TextSlice(line, len(plainPrefix), len(line) - len(plainPrefix))
+        var plainMatch = false
+        if line.len > key.len:
+            if int32(line[key.len]) == 61:
+                plainMatch = true
+        if plainMatch:
+            for j in 0..<key.len:
+                if line[j] != key[j]:
+                    plainMatch = false
+                    break
+        if plainMatch:
+            let rawValue = v3path.v3TextSlice(line, key.len + 1, len(line) - (key.len + 1))
             return strutil.strip(rawValue)
-        if strutil.startsWith(line, quotedPrefix):
-            let rawValue = v3path.v3TextSlice(line, len(quotedPrefix), len(line) - len(quotedPrefix))
+        var quotedMatch = false
+        if line.len > key.len + 2:
+            if int32(line[key.len]) == 32:
+                if int32(line[key.len + 1]) == 61:
+                    if int32(line[key.len + 2]) == 32:
+                        quotedMatch = true
+        if quotedMatch:
+            for j in 0..<key.len:
+                if line[j] != key[j]:
+                    quotedMatch = false
+                    break
+        if quotedMatch:
+            let rawValue = v3path.v3TextSlice(line, key.len + 3, len(line) - (key.len + 3))
             return v3CompilerWorldQuotedValue(rawValue)
     return ""
 
@@ -345,7 +372,10 @@ fn v3CompilerWorldFixed32Value(text: str, key: str): Result[layout.FixedBytes32]
     let value = v3CompilerWorldLineValue(text, key)
     if len(value) <= 0:
         return Err[layout.FixedBytes32]("v3 compiler world: missing key: " + key)
-    return layout.fixedBytes32FromHex(value)
+    let valueRes = layout.fixedBytes32FromHex(value)
+    if IsErr(valueRes):
+        return Err[layout.FixedBytes32]("v3 compiler world: invalid fixed32 for key: " + key)
+    return Ok[layout.FixedBytes32](Value(valueRes))
 
 fn v3CompilerLockSnapshotFromText(text: str,
                                   lockPath: str): Result[V3CompilerLockSnapshot] =

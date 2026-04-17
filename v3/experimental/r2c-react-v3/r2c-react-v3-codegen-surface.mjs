@@ -975,6 +975,14 @@ function renderExecBundleCheng(manifest) {
 }
 
 function renderAppRunnerCheng(manifest) {
+  const baseSnapshot = manifest?.base_snapshot || {};
+  const routeState = String(baseSnapshot.route_state || 'home_default');
+  const renderReadyText = chengBool(Boolean(baseSnapshot.render_ready));
+  const semanticNodesCount = Math.max(0, Number(baseSnapshot.semantic_nodes_count || 0));
+  const moduleCount = Math.max(0, Number(baseSnapshot.module_count || 0));
+  const componentCount = Math.max(0, Number(baseSnapshot.component_count || 0));
+  const effectCount = Math.max(0, Number(baseSnapshot.effect_count || 0));
+  const stateSlotCount = Math.max(0, Number(baseSnapshot.state_slot_count || 0));
   return [
     `import ${manifest.runtime_module} as runtime`,
     'import std/strutils as strutil',
@@ -1006,20 +1014,18 @@ function renderAppRunnerCheng(manifest) {
     '    out.stateSlotCount = 0',
     '    return out',
     '',
-    'fn v3R2cBuildHomeDefaultSnapshot(surface: runtime.R2cGeneratedProjectSurface): R2cExecSnapshot =',
+    'fn v3R2cBuildEntrySnapshot(surface: runtime.R2cGeneratedProjectSurface): R2cExecSnapshot =',
     '    var out = v3R2cExecSnapshotZero()',
-    '    out.routeState = "home_default"',
+    `    out.routeState = ${chengStr(routeState)}`,
     '    out.mountPhase = "prepared"',
     '    out.commitPhase = "committed"',
-    '    out.renderReady = true',
-    '    if surface.modules.len > 0:',
-    '        let entry = surface.modules[0]',
-    '        out.semanticNodesLoaded = entry.jsxElementCount > 0',
-    '        out.semanticNodesCount = entry.jsxElementCount',
-    '        out.moduleCount = 1',
-    '        out.componentCount = entry.componentCount',
-    '        out.effectCount = entry.effectCount',
-    '        out.stateSlotCount = entry.stateSlotCount',
+    `    out.renderReady = ${renderReadyText}`,
+    `    out.semanticNodesLoaded = ${chengBool(semanticNodesCount > 0)}`,
+    `    out.semanticNodesCount = ${semanticNodesCount}`,
+    `    out.moduleCount = ${moduleCount}`,
+    `    out.componentCount = ${componentCount}`,
+    `    out.effectCount = ${effectCount}`,
+    `    out.stateSlotCount = ${stateSlotCount}`,
     '    return out',
     '',
     'fn v3R2cBoolJson(value: bool): str =',
@@ -1042,10 +1048,10 @@ function renderAppRunnerCheng(manifest) {
     '        "\\"state_slot_count\\":" + strutil.intToStr(snapshot.stateSlotCount) +',
     '        "}"',
     '',
-    'fn v3R2cHomeDefaultSnapshotJson(surface: runtime.R2cGeneratedProjectSurface): str =',
+    'fn v3R2cEntrySnapshotJson(surface: runtime.R2cGeneratedProjectSurface): str =',
     '    var snapshot: R2cExecSnapshot',
     '    var out: str',
-    '    snapshot = v3R2cBuildHomeDefaultSnapshot(surface)',
+    '    snapshot = v3R2cBuildEntrySnapshot(surface)',
     '    out = v3R2cSnapshotJson(snapshot)',
     '    return out',
     '',
@@ -1310,6 +1316,31 @@ function findTruthSnapshotForRoute(truthDoc, routeState) {
   return null;
 }
 
+function resolveTruthSnapshotRouteState(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return '';
+  const routeDoc = snapshot.route && typeof snapshot.route === 'object' ? snapshot.route : {};
+  const stateId = typeof snapshot.stateId === 'string'
+    ? snapshot.stateId
+    : (typeof snapshot.state_id === 'string' ? snapshot.state_id : '');
+  if (String(stateId || '').trim()) return String(stateId).trim();
+  const routeId = typeof routeDoc.routeId === 'string'
+    ? routeDoc.routeId
+    : (typeof routeDoc.route_id === 'string' ? routeDoc.route_id : '');
+  return String(routeId || '').trim();
+}
+
+function resolveEntryRouteState(truthDoc) {
+  const snapshots = Array.isArray(truthDoc?.snapshots) ? truthDoc.snapshots : [];
+  if (snapshots.length <= 0) return 'home_default';
+  if (snapshots.length === 1) {
+    return resolveTruthSnapshotRouteState(snapshots[0]) || 'home_default';
+  }
+  if (findTruthSnapshotForRoute(truthDoc, 'home_default')) {
+    return 'home_default';
+  }
+  return resolveTruthSnapshotRouteState(snapshots[0]) || 'home_default';
+}
+
 function buildTruthSeededRouteCatalog(routeCatalog, truthDoc) {
   if (!truthDoc) return routeCatalog;
   const sourceEntries = Array.isArray(routeCatalog?.entries) ? routeCatalog.entries : [];
@@ -1318,7 +1349,7 @@ function buildTruthSeededRouteCatalog(routeCatalog, truthDoc) {
     const routeId = String(entry?.routeId || '').trim();
     const truthSnapshot = findTruthSnapshotForRoute(truthDoc, routeId);
     if (!truthSnapshot || truthSnapshot.semanticNodesCount === null || truthSnapshot.semanticNodesCount < 0) {
-      throw new Error(`missing truth snapshot for route ${routeId}`);
+      return entry;
     }
     const reason = routeId === entryRouteState ? 'truth_entry_surface' : 'truth_seeded_route_surface';
     return {
@@ -1354,12 +1385,13 @@ function buildBaseExecSnapshot(doc, manifest, truthDoc = null) {
   const effectCount = countHookCalls(entryModule, 'useEffect');
   const stateSlotCount = countHookCalls(entryModule, 'useState');
   const hookSlotCount = hookCalls.length;
-  const truthSnapshot = findTruthSnapshotForRoute(truthDoc, 'home_default');
+  const entryRouteState = resolveEntryRouteState(truthDoc);
+  const truthSnapshot = findTruthSnapshotForRoute(truthDoc, entryRouteState);
   const semanticNodesCount = truthSnapshot?.semanticNodesCount ?? jsxElements.length;
   const componentCount = components.length;
   return {
     format: 'cheng_codegen_exec_snapshot_v1',
-    route_state: 'home_default',
+    route_state: entryRouteState,
     mount_phase: 'prepared',
     commit_phase: 'committed',
     render_ready: truthSnapshot?.renderReady ?? true,

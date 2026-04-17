@@ -1,0 +1,61 @@
+import std/result
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_world_libp2p as cwlp
+import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/chain/pubsub
+import cheng/v3/libp2p/core/types as core
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/host/host
+
+fn main(): int32 =
+    let workspaceRoot = v3path.v3PathCurrentDir()
+    let packageRoot = v3path.v3PathJoin(workspaceRoot, "v3")
+    let sourcePath = v3path.v3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.v3PathJoin(workspaceRoot, "artifacts/v3_compiler_world_head_probe/program_selfhost_smoke")
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    let planRes = sexec.v3BuildSystemLinkExecPlan(workspaceRoot, req)
+    assert(IsOk(planRes), "v3 compiler world head probe: build plan")
+    let plan = Value(planRes)
+    var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
+    var syncHost = host.v3Libp2pHostInit("compiler-world-sync")
+    cwlp.v3CompilerWorldRegister(seedHost)
+    cwlp.v3CompilerWorldRegister(syncHost)
+    var seedAddr = core.v3Libp2pMultiaddrZero()
+    var syncAddr = core.v3Libp2pMultiaddrZero()
+    multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6461)
+    multiaddr.v3Libp2pMultiaddrFillTcp(syncAddr, "127.0.0.1", 6462)
+    assert(IsOk(host.v3Libp2pListen(seedHost, seedAddr)), "v3 compiler world head probe: seed listen")
+    assert(IsOk(host.v3Libp2pListen(syncHost, syncAddr)), "v3 compiler world head probe: sync listen")
+    assert(IsOk(host.v3Libp2pDial(syncHost, seedHost.selfPeerId, seedAddr, 1)), "v3 compiler world head probe: dial seed")
+    assert(IsOk(host.v3Libp2pDial(seedHost, syncHost.selfPeerId, syncAddr, 1)), "v3 compiler world head probe: dial sync")
+    cwlp.v3CompilerWorldPublishUniverse(seedHost,
+                                        plan.localUniverse,
+                                        plan.compilerCsg,
+                                        plan.exportSurface,
+                                        plan.compileReceipt)
+    let syncRes = cwlp.v3CompilerWorldSync(syncHost, seedHost, seedHost.selfPeerId)
+    assert(IsOk(syncRes), "v3 compiler world head probe: sync")
+    var worldText = ""
+    assert(cwlp.v3CompilerWorldFirstPayloadTextByKind(syncHost,
+                                                      pubsub.v3PubSubPayloadKindCompilerWorldHead,
+                                                      worldText),
+           "v3 compiler world head probe: synced head text")
+    let probeText = worldText + "\nprobe_prev=" + cworld.v3CompilerWorldLineValue(worldText, "prev_head_cid") +
+                    "\nprobe_manifest=" + cworld.v3CompilerWorldLineValue(worldText, "manifest_root_cid") + "\n"
+    assert(v3path.v3WriteTextFile(workspaceRoot,
+                                  "artifacts/v3_compiler_world_head_probe/world_head_probe.txt",
+                                  probeText),
+           "v3 compiler world head probe: write probe")
+    var parsed: cworld.V3CompilerWorldHead
+    let parseRes = cworld.v3CompilerWorldHeadFromReportText(worldText, parsed)
+    assert(IsOk(parseRes), "v3 compiler world head probe: parse head")
+    return 0

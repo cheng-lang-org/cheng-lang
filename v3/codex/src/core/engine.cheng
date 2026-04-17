@@ -1,0 +1,212 @@
+import std/monotimes
+import std/os
+import std/os_host_process as hostos
+import std/result
+import std/strings
+import std/times
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexNowUnix(): int64 =
+    return times.epochTimeSeconds()
+
+fn codexNowMonoNs(): int64 =
+    return monotimes.monoTimeNs(monotimes.getMonoTime())
+
+fn codexSessionId(): str =
+    return "codex-" + strings.int64ToStr(codexNowUnix()) + "-" + strings.int64ToStr(codexNowMonoNs())
+
+fn codexDefaultTitle(promptText: str, commandText: str, sessionId: str): str =
+    let promptTitle = textutil.codexTitleFromText(promptText)
+    if textutil.codexTextNonEmpty(promptTitle):
+        return promptTitle
+    let commandTitle = textutil.codexTitleFromText(commandText)
+    if textutil.codexTextNonEmpty(commandTitle):
+        return commandTitle
+    return sessionId
+
+fn codexNewSession(cwd: str, title: str, promptText: str, commandText: str): types.CodexSession =
+    var out = types.codexSessionZero()
+    out.sessionId = codexSessionId()
+    out.cwd = cwd
+    out.createdAt = codexNowUnix()
+    out.updatedAt = out.createdAt
+    out.lastExitCode = -1
+    if textutil.codexTextNonEmpty(title):
+        out.title = title
+    else:
+        out.title = codexDefaultTitle(promptText, commandText, out.sessionId)
+    return out
+
+fn codexEnsureSession(home: str, req: types.CodexExecRequest): Result[types.CodexSession] =
+    if textutil.codexTextNonEmpty(req.sessionId):
+        let loadRes = store.codexStoreSessionRead(home, req.sessionId)
+        if IsErr(loadRes):
+            return Err[types.CodexSession](Error(loadRes))
+        return Ok[types.CodexSession](Value(loadRes))
+    var cwd = os.getCurrentDir()
+    if textutil.codexTextNonEmpty(req.cwd):
+        cwd = req.cwd
+    return Ok[types.CodexSession](codexNewSession(cwd, req.title, req.promptText, req.commandText))
+
+fn codexAssistantSummary(exitCode: int32, outputText: str): str =
+    if exitCode == 0:
+        if textutil.codexTextNonEmpty(outputText):
+            return "command ok rc=0"
+        return "command ok rc=0 (no output)"
+    if textutil.codexTextNonEmpty(outputText):
+        return "command failed rc=" + intToStr(exitCode)
+    return "command failed rc=" + intToStr(exitCode) + " (no output)"
+
+fn codexAppendTurn(session: var types.CodexSession,
+                   promptText: str,
+                   commandText: str,
+                   outputText: str,
+                   exitCode: int32,
+                   approved: bool) =
+    var turn = types.codexTurnZero()
+    turn.promptText = promptText
+    turn.commandText = commandText
+    turn.outputText = outputText
+    turn.exitCode = exitCode
+    turn.approved = approved
+    turn.assistantText = codexAssistantSummary(exitCode, outputText)
+    add(session.turns, turn)
+    session.updatedAt = codexNowUnix()
+    session.lastExitCode = exitCode
+
+fn codexShellCapture(commandText: str, cwd: str, outOutput: var str, outExitCode: var int32) =
+    hostos.osHostProcessExecFileCaptureFill("/bin/sh",
+                                            ["-lc", commandText],
+                                            [],
+                                            cwd,
+                                            true,
+                                            0,
+                                            outOutput,
+                                            outExitCode)
+
+fn codexSandboxProfilePathText(path: str): str =
+    return "\"" + path + "\""
+
+fn codexSandboxAllowWriteRule(path: str): str =
+    return "(allow file-read* file-test-existence file-write* (subpath " +
+        codexSandboxProfilePathText(path) + "))\n"
+
+fn codexSandboxProfileText(writableRoot: str): str =
+    var out = ""
+    out = out + "(version 1)\n"
+    out = out + "(deny default)\n"
+    out = out + "(allow process*)\n"
+    out = out + "(allow file-read*)\n"
+    out = out + "(allow file-read* file-test-existence file-write-data (literal \"/dev/null\"))\n"
+    out = out + "(allow file-read-data file-test-existence file-write-data (subpath \"/dev/fd\"))\n"
+    out = out + "(allow file-read* file-test-existence file-write* (subpath \"/tmp\"))\n"
+    out = out + "(allow file-read* file-write* (subpath \"/private/tmp\"))\n"
+    out = out + "(allow file-read* file-write* (subpath \"/var/tmp\"))\n"
+    out = out + "(allow file-read* file-write* (subpath \"/private/var/tmp\"))\n"
+    if textutil.codexTextNonEmpty(writableRoot):
+        out = out + codexSandboxAllowWriteRule(writableRoot)
+    return out
+
+fn codexSandboxWritableRoot(cwd: str, writableRoot: str): str =
+    if !textutil.codexTextNonEmpty(writableRoot):
+        return cwd
+    if os.isAbsolute(writableRoot):
+        return writableRoot
+    return os.joinPath(cwd, writableRoot)
+
+fn codexExecuteShell(home: str,
+                     req: types.CodexExecRequest): Result[types.CodexExecResult] =
+    if !textutil.codexTextNonEmpty(req.commandText):
+        return Err[types.CodexExecResult]("codex exec: missing --command")
+    if !req.autoApprove:
+        return Err[types.CodexExecResult]("codex exec: shell execution requires --auto-approve")
+    let sessionRes = codexEnsureSession(home, req)
+    if IsErr(sessionRes):
+        return Err[types.CodexExecResult](Error(sessionRes))
+    var session = Value(sessionRes)
+    var cwd = session.cwd
+    if textutil.codexTextNonEmpty(req.cwd):
+        cwd = req.cwd
+    var outputText = ""
+    var exitCode = -1
+    codexShellCapture(req.commandText, cwd, outputText, exitCode)
+    codexAppendTurn(session, req.promptText, req.commandText, outputText, exitCode, true)
+    let saveRes = store.codexStoreSessionWrite(home, session)
+    if IsErr(saveRes):
+        return Err[types.CodexExecResult](Error(saveRes))
+    var out = types.codexExecResultZero()
+    out.ok = exitCode == 0
+    out.exitCode = exitCode
+    out.outputText = outputText
+    out.assistantText = codexAssistantSummary(exitCode, outputText)
+    return Ok[types.CodexExecResult](out)
+
+fn codexSessionRenderSummary(session: types.CodexSession): str =
+    var out = ""
+    out = out + "session_id=" + session.sessionId + "\n"
+    out = out + "title=" + session.title + "\n"
+    out = out + "cwd=" + session.cwd + "\n"
+    out = out + "turn_count=" + intToStr(session.turns.len) + "\n"
+    out = out + "last_exit_code=" + intToStr(session.lastExitCode)
+    return out
+
+fn codexSessionHistoryText(session: types.CodexSession, maxTurns: int32): str =
+    if session.turns.len <= 0:
+        return "(empty session)"
+    var start = 0
+    if maxTurns > 0 && session.turns.len > maxTurns:
+        start = session.turns.len - maxTurns
+    var out = ""
+    for i in start..<session.turns.len:
+        let turn = session.turns[i]
+        out = out + "[" + intToStr(i + 1) + "] "
+        if textutil.codexTextNonEmpty(turn.promptText):
+            out = out + "prompt: " + turn.promptText + "\n"
+        if textutil.codexTextNonEmpty(turn.commandText):
+            out = out + "$ " + turn.commandText + "\n"
+        if textutil.codexTextNonEmpty(turn.outputText):
+            out = out + turn.outputText
+            if len(turn.outputText) <= 0 || turn.outputText[len(turn.outputText) - 1] != '\n':
+                out = out + "\n"
+        out = out + turn.assistantText + "\n"
+    return out
+
+fn codexApplyPatch(cwd: str, patchPath: str): Result[types.CodexExecResult] =
+    if !textutil.codexTextNonEmpty(patchPath):
+        return Err[types.CodexExecResult]("codex apply: missing --patch")
+    let command = "git apply " + os.quoteShell(patchPath)
+    var out = types.codexExecResultZero()
+    codexShellCapture(command, cwd, out.outputText, out.exitCode)
+    out.ok = out.exitCode == 0
+    out.assistantText = codexAssistantSummary(out.exitCode, out.outputText)
+    return Ok[types.CodexExecResult](out)
+
+fn codexRunInSandbox(cwd: str, writableRoot: str, commandText: str): Result[types.CodexExecResult] =
+    if !textutil.codexTextNonEmpty(commandText):
+        return Err[types.CodexExecResult]("codex sandbox: missing command")
+    let sandboxExec = "/usr/bin/sandbox-exec"
+    if !store.codexStoreFileExists(sandboxExec):
+        return Err[types.CodexExecResult]("codex sandbox: /usr/bin/sandbox-exec not available")
+    var actualCwd = os.getCurrentDir()
+    if textutil.codexTextNonEmpty(cwd):
+        actualCwd = cwd
+    let writeRoot = codexSandboxWritableRoot(actualCwd, writableRoot)
+    let profilePath = "/tmp/codex-sandbox-" + strings.int64ToStr(codexNowUnix()) + "-" +
+        strings.int64ToStr(codexNowMonoNs()) + ".sb"
+    if !store.codexStoreWriteText(profilePath, codexSandboxProfileText(writeRoot)):
+        return Err[types.CodexExecResult]("codex sandbox: failed to write profile")
+    var out = types.codexExecResultZero()
+    hostos.osHostProcessExecFileCaptureFill(sandboxExec,
+                                            ["-f", profilePath, "/bin/sh", "-lc", commandText],
+                                            [],
+                                            actualCwd,
+                                            true,
+                                            0,
+                                            out.outputText,
+                                            out.exitCode)
+    let _remove = os.removeFile(profilePath)
+    out.ok = out.exitCode == 0
+    out.assistantText = codexAssistantSummary(out.exitCode, out.outputText)
+    return Ok[types.CodexExecResult](out)

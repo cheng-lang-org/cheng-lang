@@ -138,6 +138,22 @@ export function resolvePrimaryRouteSurface(routeState, entryRouteState = '') {
       reason: 'entry_module_surface',
     };
   }
+  if (route === 'publish_selector') {
+    return {
+      strategy: 'entry_module',
+      modulePath: '',
+      componentName: '',
+      reason: 'publish_selector_entry_module_surface',
+    };
+  }
+  if (route === 'content_detail') {
+    return {
+      strategy: 'entry_module',
+      modulePath: '',
+      componentName: '',
+      reason: 'content_detail_entry_module_surface',
+    };
+  }
   const lastReturn = LAST_RETURN_ROUTE_COMPONENTS[route];
   if (lastReturn) {
     return {

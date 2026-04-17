@@ -1,10 +1,19 @@
-# Cheng 工具链（Backend-only）
+# Cheng 工具链（Backend-only，已归档）
 
-> 迁移说明（2026-02）：仓库已移除 `src/tooling/*.sh` 与 `scripts/*.sh` 入口壳；逻辑体统一收敛到全局可执行入口 `cheng_tooling` 的内嵌命令表（`src/tooling/cheng_tooling_embedded_inline.cheng`）。
-> 统一执行口径：`cheng_tooling <id>`（例如 `cheng_tooling verify_backend_closedloop`）。
-> 零脚本门禁：`verify_backend_zero_script_closure` 强制仓库不保留 `.sh` 入口文件。
-> Stage1 fixed=0 门禁：`verify_backend_stage1_fixed0_envs` 强制 `STAGE1_SKIP_SEM/STAGE1_SKIP_OWNERSHIP` 已移除，且 `STAGE1_SEM_FIXED_0/STAGE1_OWNERSHIP_FIXED_0` 只能为 `0`。
-> 运行时内嵌查询口径（2026-02-25）：`cheng_tooling embedded-ids/embedded-text` 直接调用 `tooling/cheng_tooling_embedded_inline`；内嵌 map 重写统一走 `cheng_tooling embedded-map-rewrite`（仓库已移除 Python query 脚本）。
+> 迁移说明（2026-04-16）：`src/tooling/cheng_tooling.cheng` 已物理删除，`artifacts/tooling_cmd/cheng_tooling`
+> 与 `artifacts/backend_driver/cheng` 都已退出现役主线。当前 v3 统一入口是
+> `artifacts/v3_backend_driver/cheng` 和 `artifacts/v3_bootstrap/cheng.stage3`。
+>
+> 本文档以下内容仅保留旧 backend-only 链路的历史记录，不能再当作 v3 的现行操作手册。
+> 当前请优先阅读 `v3/tooling/README.md`。
+
+> 进一步收口说明（2026-04-16）：
+> `src/tooling` 现在只保留 live ABI 合同和历史记录。旧 package/mobile/demo/fullchain/backend-only
+> tooling 源码与 shell wrapper 正在物理移除；
+> 下文凡提到已删除入口，都只剩历史记录意义。
+>
+> `src/tooling/cheng_tooling_embedded_scripts/` 已整体删除。下文再出现这批 wrapper/source 模板，
+> 一律只按历史档案理解。
 
 ## 进程通知（2026-02-25：单 Driver 收口）
 
@@ -99,7 +108,7 @@ artifacts/tooling_cmd/cheng_tooling stage0-ue-clean --strict:1
 - repo 内直接执行 `src/tooling/cheng_tooling_embedded_scripts/cheng_tooling.sh` 时，任何“存在非空同名内嵌脚本且不是自 trampoline wrapper”的入口都会优先走 repo-local 源码脚本，不等待 canonical `artifacts/tooling_cmd/cheng_tooling` 重编完成；典型包括 `verify`、`verify_tooling_cmdline`、`verify_backend_stage1_fixed0_envs`、`verify_backend_string_literal_regression`、`verify_backend_default_output_safety`、`verify_new_expr_surface`、`verify_backend_string_abi_contract`、`verify_backend_dot_lowering_contract`、`verify_backend_selfhost_currentsrc_proof`、`chengc`。标准库基线入口已迁到 `cheng_tooling` 原生命令，不再依赖 repo-local std gate shell。
 - `src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real.sh` 是 `.real` launcher 的 source 模板；repo wrapper 每次启动都会把它同步到 `artifacts/tooling_cmd/cheng_tooling.real`。
 - `src/tooling/cheng_tooling_embedded_scripts/cheng_tooling_real_bin.sh` 是 `.real.bin` launcher 的 source 模板；repo wrapper 每次启动都会把它同步到 `artifacts/tooling_cmd/cheng_tooling.real.bin`。
-- direct `.real` / direct `.real.bin` 默认都会落到 `artifacts/tooling_bundle/core/cheng_tooling_global` 这份稳定 core tooling 产物；`.real` 额外只保留 `126/127/139` 到 core/full 的回退。`223` 现统一视为 `deterministic_exit_223`，会直接报 `child exited 223 directly (non-POSIX signal)`，不再自动 fallback/skip。
+- direct `.real` / direct `.real.bin` 默认优先落到 `artifacts/tooling_bundle/core/cheng_tooling_global` 这份稳定 core tooling 产物；若 core 缺失则按现行 launcher 合同继续回退到 `full`。`.real` 额外只保留 `126/127/139` 到 core/full 的回退。`223` 现统一视为 `deterministic_exit_223`，会直接报 `child exited 223 directly (non-POSIX signal)`，不再自动 fallback/skip。`verify_tooling_cmdline` 在缺 core 时会把该专项记成 `skipped=missing_core_bin`，不把整条回归误判成 launcher 失效。
 - 当前 canonical `artifacts/tooling_cmd/cheng_tooling` 也会把这类脚本入口直通到 repo-local 最新实现；`.real` 和 `.real.bin` launcher 在仓库内也都会保守回退到 `src/tooling/cheng_tooling_embedded_scripts/<id>.sh`，所以 direct `.real.bin verify_backend_stage1_fixed0_envs`、`verify_backend_string_literal_regression`、`verify_backend_default_output_safety`、`verify_new_expr_surface`、`verify_backend_string_abi_contract`、`verify_backend_dot_lowering_contract`、`verify_backend_selfhost_currentsrc_proof` 这类 script-backed gate 现在也能工作。`verify_std_*` / `build_std_perf_baseline` 已改为 native route + native wrapper surface。
 - wrapper 的 `list` / `embedded-ids` 现在也会把 repo-local 非空 script-backed gate 合并进输出，不需要等 fresh tooling binary 重编后才看见新增入口；当前包括 `verify_new_expr_surface`、`verify_backend_string_abi_contract`、`verify_backend_dot_lowering_contract`、`verify_backend_selfhost_currentsrc_proof`。
 - 这些 script-backed gate 属于迁移中的兼容面，不代表规范主口径。后续重写 gate 时，应优先把语义核心搬到 Cheng/native 路径，再决定是否保留 shell 薄包装。
@@ -192,10 +201,10 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - `cheng_tooling verify` 默认追加 `verify_backend_string_literal_regression`、`verify_std_strformat`、`verify_backend_default_output_safety`、`verify_new_expr_surface`、`verify_backend_selfhost_currentsrc_proof`、`verify_backend_string_abi_contract` 与 `verify_backend_dot_lowering_contract`；其中 `verify_backend_string_abi_contract` 与 `verify_backend_dot_lowering_contract` 既是 default-verify gate，也是 `backend_prod_closure` required gate；`verify_new_expr_surface` 负责阻断 real-source `new x` 语句面回退，并要求 bare current-source `cheng.stage2` 直接 compile+run `var x: T = new(T)` 最小 smoke；current-source proof gate 负责保证 bare `cheng.stage2` 与 `cheng.stage2.proof` 两条 fresh proof surface 都能 direct-compile + run `return_i64` smoke。`verify_backend_runtime_abi` 与 `verify_backend_sidecar_cheng_fresh` 已退出默认 `verify` 图，保留为专项 native-substrate gate。
 - RPSPAR-02 ZRPC 收口 gate：`cheng_tooling verify_backend_rawptr_contract` 负责契约收口；`backend_prod_closure` / `verify_backend_closedloop` 同步执行 `rawptr_surface_forbid + rawptr_closedloop`，共同覆盖“语言表面绝对零裸指针”闭环。
 - RPSPAR-02 Raw Pointer Surface 禁令：`cheng_tooling verify_backend_rawptr_surface_forbid` 校验“裸指针声明/指针运算/裸 `void*` 透出”三类负例必须失败，且诊断必须包含 `slice/tuple/handle/borrow` 替代建议；输出 `artifacts/backend_rawptr_surface_forbid/*.report.txt`。
-- PURE-01 全栈纯化 surface gate：`cheng_tooling verify_backend_pure_cheng_surface` 现在冻结的是 active strict sidecar/proof manifest，本身检查三类漂移：active surface 是否重新引用 `backend_driver_c_sidecar_*` / `driver_c_build_module_stage1*` / `backend_driver_uir_sidecar_runtime_compat.c`、是否重新引入 `emergency_c` / `dist/releases/current/cheng` 这类 fallback 词面、以及 runtime ABI 合同 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env) 里三份现役 native bridge（`system_helpers_selflink_shim.c` / `system_helpers_io_time_bridge.c` / `system_helpers_host_process_ffi_bridge.c`）的 `driver_c_build_module_stage1_direct` 是否重新出现 direct->sidecar 回流。输出 `artifacts/backend_pure_cheng_surface/*.report.txt`。裸指针与 legacy `new` 语义漂移继续由独立 rawptr/new surface gate 负责，不在 PURE-01 里重复统计。
+- PURE-01 全栈纯化 surface gate：`cheng_tooling verify_backend_pure_cheng_surface` 现在冻结的是 active strict sidecar/proof manifest，本身检查三类漂移：active surface 是否重新引用 `backend_driver_c_sidecar_*` / `driver_c_build_module_stage1*` / `backend_driver_uir_sidecar_runtime_compat.c`、是否重新引入 `emergency_c` / `dist/releases/current/cheng` 这类 fallback 词面、以及 runtime ABI 合同 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env) 是否重新把 `src/runtime/native` 旧桥拉回 live 面。输出 `artifacts/backend_pure_cheng_surface/*.report.txt`。裸指针与 legacy `new` 语义漂移继续由独立 rawptr/new surface gate 负责，不在 PURE-01 里重复统计。
 - RPSPAR-03 Slice 影子桥接：`cheng_tooling verify_backend_ffi_slice_shim` 校验 `importc` 形参 `T[]` 的桥接调用可编译（默认 compile-only；可设 `BACKEND_FFI_SLICE_SHIM_RUN=1` 开启运行）并覆盖 legacy `openArray[T]` 与用户层裸指针 surface 负例；输出 `artifacts/backend_ffi_slice_shim/backend_ffi_slice_shim.<target>.report.txt`。
 - RPSPAR-04 Out-Ptr 影子桥接：`cheng_tooling verify_backend_ffi_outptr_tuple` 校验 `@ffi_out_ptrs + @importc` 的 tuple wrapper 降级（运行态正例 + status obj-only 正例 + arity 负例诊断）；输出 `artifacts/backend_ffi_outptr_tuple/*.report.txt`。
-- RPSPAR-05 Handle 沙盒映射：`cheng_tooling verify_backend_ffi_handle_sandbox` 现在分三段校验：C probe 真跑 `cheng_ffi_handle_*` 的 runtime `ptr<->slot` 映射并确认无效 handle 返回 `-1`；backend fixture 真跑 direct `@importc("cheng_ffi_handle_*")` 成功路径并单独验证 stale handle 会带 `reason=ffi_handle` crash；最后再硬卡 `@ffi_handle` 注解源码合同仍绑定 `cheng_ffi_raw_*`。这条 gate 现在先以 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env) 固定的 `system_helpers_backend.cheng + 3 个最小 native bridge` 为主合同，再附加 `system_helpers_ffi_raw_bridge.c` 与兼容头 [system_helpers.h](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.h)；普通 `stage3/backend_driver` 对 annotated import 的 lowering 还没接上时，报告会明写 `source_contract_only_stage3_lowering_pending`，不再把这个编译器缺口误记成 runtime C 权威没清完。
+- RPSPAR-05 Handle 沙盒映射：`cheng_tooling verify_backend_ffi_handle_sandbox` 现在分三段校验：C probe 真跑 `cheng_ffi_handle_*` 的 runtime `ptr<->slot` 映射并确认无效 handle 返回 `-1`；backend fixture 真跑 direct `@importc("cheng_ffi_handle_*")` 成功路径并单独验证 stale handle 会带 `reason=ffi_handle` crash；最后再硬卡 `@ffi_handle` 注解源码合同仍绑定 `cheng_ffi_raw_*`。这条 gate 现在先以 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env) 固定的 `system_helpers_backend.cheng + v3_runtime_abi.h` 为主合同，再附加 `system_helpers_ffi_raw_bridge.c`；普通 `stage3/backend_driver` 对 annotated import 的 lowering 还没接上时，报告会明写 `source_contract_only_stage3_lowering_pending`，不再把这个编译器缺口误记成 runtime C 权威没清完。
 - RPSPAR-06 Borrow Struct* 桥接：`cheng_tooling verify_backend_ffi_borrow_bridge` 校验 `importc + var object` 正向桥接可运行，并校验产物符号包含 `_cheng_abi_borrow_mut_pair_i32`（默认固定 `system + runtime C` 口径以避免自链接 runtime 缺符号）；输出 `artifacts/backend_ffi_borrow_bridge/*.report.txt`。
 - RPSPAR-07 Raw Pointer FFI 迁移：`cheng_tooling verify_backend_rawptr_migration` 校验迁移脚本 `cheng_tooling rawptr_migrate_ffi` 的 apply/check/rollback 闭环、风险报告与文档迁移入口；输出 `artifacts/backend_rawptr_migration/*.report.txt`。一键迁移：`cheng_tooling rawptr_migrate_ffi --root:<path> --apply --report:artifacts/backend_rawptr_migration/rawptr_migration.report.txt --backup-manifest:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`；回滚：`cheng_tooling rawptr_migrate_ffi --rollback:artifacts/backend_rawptr_migration/rawptr_migration.backups.tsv`。
 - RPSPAR-08 Raw Pointer 生产闭环：`cheng_tooling verify_backend_rawptr_closedloop` 校验 Raw Pointer required gate 集合与 `verify_backend_closedloop` / `backend_prod_closure` / `verify.sh` / CI 接入一致性；输出 `artifacts/backend_rawptr_closedloop/*.report.txt`。
@@ -700,7 +709,7 @@ cheng_tooling verify_libp2p_prod_closure
 cheng_tooling verify_backend_runtime_abi
 ```
 说明：
-- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 native bridge 源形成的 runtime 合同、最小 native runtime object，以及兼容头 [system_helpers.h](/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.h) 的符号一致性（含 `_addr`/`__addr` 别名兼容）。
+- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 ABI 头 [v3_runtime_abi.h](/Users/lbcheng/cheng-lang/v3/runtime/native/v3_runtime_abi.h) 形成的 runtime 合同与兼容 surface 一致性。
 - 统一权威路径现在固定写在 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env)，对应的脚本入口是 [backend_runtime_abi_contract.sh](/Users/lbcheng/cheng-lang/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh)；`verify_backend_runtime_abi`、`verify_backend_ffi_handle_sandbox`、`verify_backend_pure_cheng_surface`、`build_mobile_export` 与 `verify_backend_selfhost_bootstrap_self_obj` 都从这里取 live 路径。
 - `verify.sh`、`verify_backend_closedloop` 与 CI（Linux amd64 / macOS arm64）会执行此检查。
 

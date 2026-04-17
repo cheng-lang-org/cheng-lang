@@ -337,28 +337,28 @@ var
     cheng_getcwd_buf: ptr
 
 fn cheng_af_inet(): int32 =
-    return chengTcpAfInet
+    return native_cheng_v3_af_inet_runtime()
 
 fn cheng_af_inet6(): int32 =
-    return chengTcpAfInet6
+    return native_cheng_v3_af_inet6_runtime()
 
 fn cheng_sock_stream(): int32 =
-    return chengTcpSockStream
+    return native_cheng_v3_sock_stream_runtime()
 
 fn cheng_sock_dgram(): int32 =
-    return chengTcpSockDgram
+    return native_cheng_v3_sock_dgram_runtime()
 
 fn cheng_ipproto_ip(): int32 =
-    return chengTcpIpprotoIp
+    return native_cheng_v3_ipproto_ip_runtime()
 
 fn cheng_sol_socket(): int32 =
-    return chengTcpSolSocket
+    return native_cheng_v3_sol_socket_runtime()
 
 fn cheng_so_reuseaddr(): int32 =
-    return chengTcpSoReuseaddr
+    return native_cheng_v3_so_reuseaddr_runtime()
 
 fn cheng_msg_waitall(): int32 =
-    return chengTcpMsgWaitall
+    return native_cheng_v3_msg_waitall_runtime()
 
 fn cheng_sockaddr_use_len_field(): bool =
     return native_cheng_v3_sockaddr_use_len_field_runtime() != 0
@@ -773,8 +773,25 @@ fn cheng_exec_program_free_argv(argvRaw: ptr, argc: int32) =
         i = i + 1
     cheng_free_export(argvRaw)
 
-fn cheng_exec_program_build_argv(programName: ptr, argvSeq: str[]): ptr =
-    let slotCount: int32 = argvSeq.len + 2
+fn cheng_exec_program_argv_wire_count(argvWire: str): int32 =
+    let wireLen = cheng_str_len(argvWire)
+    if wireLen <= 0:
+        return 0
+    let wireData = cheng_str_data(argvWire)
+    var count: int32 = 0
+    var i: int32 = 0
+    while i < wireLen:
+        let ch = *(UInt8Ptr(cheng_ptr_plus(wireData, i)))
+        if ch == uint8(0):
+            count = count + 1
+        i = i + 1
+    if *(UInt8Ptr(cheng_ptr_plus(wireData, wireLen - 1))) != uint8(0):
+        count = count + 1
+    return count
+
+fn cheng_exec_program_build_argv(programName: ptr, argvWire: str): ptr =
+    let argCount = cheng_exec_program_argv_wire_count(argvWire)
+    let slotCount: int32 = argCount + 2
     let argvRaw: ptr = cheng_malloc_export(slotCount * int32(sizeof ptr))
     if argvRaw == nil:
         return nil
@@ -785,13 +802,29 @@ fn cheng_exec_program_build_argv(programName: ptr, argvSeq: str[]): ptr =
         return nil
     *(VoidPtrPtr(argvRaw)) = programCopy
     var builtCount: int32 = 1
-    for i in 0..<argvSeq.len:
-        let argCopy: ptr = cheng_copy_cstring_from_str(argvSeq[i])
+    let wireLen = cheng_str_len(argvWire)
+    let wireData = cheng_str_data(argvWire)
+    var start: int32 = 0
+    var i: int32 = 0
+    while i < wireLen:
+        let ch = *(UInt8Ptr(cheng_ptr_plus(wireData, i)))
+        if ch != uint8(0):
+            i = i + 1
+            continue
+        let argCopy: ptr = cheng_string_copy(cheng_ptr_plus(wireData, start), i - start)
         if argCopy == nil:
             cheng_exec_program_free_argv(argvRaw, builtCount)
             return nil
         *(VoidPtrPtr(cheng_ptr_plus(argvRaw, builtCount * int32(sizeof ptr)))) = argCopy
         builtCount = builtCount + 1
+        start = i + 1
+        i = i + 1
+    if start < wireLen:
+        let argCopy: ptr = cheng_string_copy(cheng_ptr_plus(wireData, start), wireLen - start)
+        if argCopy == nil:
+            cheng_exec_program_free_argv(argvRaw, builtCount)
+            return nil
+        *(VoidPtrPtr(cheng_ptr_plus(argvRaw, builtCount * int32(sizeof ptr)))) = argCopy
     return argvRaw
 
 fn cheng_exec_program_read_capture_file(path: ptr): ptr =
@@ -806,31 +839,32 @@ fn cheng_exec_program_read_capture_file(path: ptr): ptr =
 
 @exportc("cheng_v3_exec_program_capture_bridge")
 fn cheng_v3_exec_program_capture_bridge_export(programName: ptr,
-                                               argvSeq: str[],
+                                               argvWire: str,
                                                workingDir: ptr,
                                                exitCode: Int64Ptr): ptr =
     cheng_exec_program_set_exit_code(exitCode, -1)
     if programName == nil || *UInt8Ptr(programName) == uint8(0):
         return cheng_exec_program_empty_cstring()
-    let argvRaw: ptr = cheng_exec_program_build_argv(programName, argvSeq)
+    let argvCount = cheng_exec_program_argv_wire_count(argvWire)
+    let argvRaw: ptr = cheng_exec_program_build_argv(programName, argvWire)
     if argvRaw == nil:
         return cheng_exec_program_empty_cstring()
     let capturePath: ptr = cheng_string_copy("/tmp/cheng_v3_exec_capture.XXXXXX",
                                              cheng_cstrlen_raw("/tmp/cheng_v3_exec_capture.XXXXXX"))
     if capturePath == nil:
-        cheng_exec_program_free_argv(argvRaw, argvSeq.len + 1)
+        cheng_exec_program_free_argv(argvRaw, argvCount + 1)
         return cheng_exec_program_empty_cstring()
     let captureFd: int32 = libc_mkstemp(capturePath)
     if captureFd < 0:
         cheng_free_export(capturePath)
-        cheng_exec_program_free_argv(argvRaw, argvSeq.len + 1)
+        cheng_exec_program_free_argv(argvRaw, argvCount + 1)
         return cheng_exec_program_empty_cstring()
     let childPid: int32 = libc_fork()
     if childPid < 0:
         let ignoredCloseCapture = libc_close(captureFd)
         let ignoredUnlinkCapture = libc_unlink(capturePath)
         cheng_free_export(capturePath)
-        cheng_exec_program_free_argv(argvRaw, argvSeq.len + 1)
+        cheng_exec_program_free_argv(argvRaw, argvCount + 1)
         return cheng_exec_program_empty_cstring()
     if childPid == 0:
         if workingDir != nil && cheng_cstrlen_raw(workingDir) > 0:
@@ -857,7 +891,7 @@ fn cheng_v3_exec_program_capture_bridge_export(programName: ptr,
     let output: ptr = cheng_exec_program_read_capture_file(capturePath)
     let ignoredUnlinkCapture = libc_unlink(capturePath)
     cheng_free_export(capturePath)
-    cheng_exec_program_free_argv(argvRaw, argvSeq.len + 1)
+    cheng_exec_program_free_argv(argvRaw, argvCount + 1)
     if output == nil:
         return cheng_exec_program_empty_cstring()
     return output
@@ -1620,8 +1654,9 @@ fn cheng_runtime_flag_inline_value(arg: str, key: str, outValue: var str): bool 
     if cheng_bytes_compare(cheng_str_data(arg), cheng_str_data(key), keyLen) != 0:
         return false
     let sep = *(UInt8Ptr(cheng_ptr_plus(cheng_str_data(arg), keyLen)))
-    if sep != uint8(int32(':')) && sep != uint8(int32('=')):
-        return false
+    if int32(sep) != 58:
+        if int32(sep) != 61:
+            return false
     outValue = cheng_str_copy(cheng_ptr_plus(cheng_str_data(arg), keyLen + 1), argLen - keyLen - 1)
     return true
 
@@ -1863,10 +1898,14 @@ fn cheng_v3_os_is_absolute_bridge_export(path: str): int32 =
     if data == nil || n <= 0:
         return 0
     let ch0: uint8 = *(UInt8Ptr(data))
-    if ch0 == uint8(int32('/')) || ch0 == uint8(int32('\\')):
+    if int32(ch0) == 47:
         return 1
-    if n >= 2 && *(UInt8Ptr(cheng_ptr_plus(data, 1))) == uint8(int32(':')):
+    if int32(ch0) == 92:
         return 1
+    if n >= 2:
+        let ch1: uint8 = *(UInt8Ptr(cheng_ptr_plus(data, 1)))
+        if int32(ch1) == 58:
+            return 1
     return 0
 
 @exportc("cheng_v3_os_join_path_bridge")
@@ -2282,17 +2321,20 @@ fn cheng_mkdir_all_raw(path: ptr, includeLeaf: bool) =
     let scratch = cheng_string_copy(path, n)
     if scratch == nil:
         return
-    for i in 0..<n:
+    var i: int32 = 0
+    while i < n:
         let ch = cheng_load_u8(scratch, i)
-        if !cheng_path_is_sep(ch):
-            continue
-        if i == 0:
-            continue
-        if i == 2 && cheng_load_u8(scratch, 1) == int32(':'):
-            continue
-        *(UInt8Ptr(cheng_ptr_plus(scratch, i))) = uint8(0)
-        cheng_mkdir_if_needed(scratch)
-        *(UInt8Ptr(cheng_ptr_plus(scratch, i))) = uint8(ch)
+        if cheng_path_is_sep(ch):
+            if i > 0:
+                var skip = false
+                if i == 2:
+                    if cheng_load_u8(scratch, 1) == 58:
+                        skip = true
+                if !skip:
+                    *(UInt8Ptr(cheng_ptr_plus(scratch, i))) = uint8(0)
+                    cheng_mkdir_if_needed(scratch)
+                    *(UInt8Ptr(cheng_ptr_plus(scratch, i))) = uint8(ch)
+        i = i + 1
     if includeLeaf:
         cheng_mkdir_if_needed(scratch)
     cheng_free_export(scratch)
@@ -2879,7 +2921,9 @@ fn cheng_relay_provider_issue_lease_payload(runtime: ChengV3RelayProviderRuntime
         return cheng_str_empty()
     if runtime->healthy == 0:
         var errorText = cheng_str_copy_cstring(runtime->lastError)
-        let out = "ok=0\nerror=" + errorText + "\n"
+        var out = "ok=0\nerror="
+        out = out + errorText
+        out = out + "\n"
         cheng_str_dispose(errorText)
         return out
     if runtime->requiresLease != 0 && cheng_str_len(requesterPeerIdText) <= 0:
@@ -2894,16 +2938,33 @@ fn cheng_relay_provider_issue_lease_payload(runtime: ChengV3RelayProviderRuntime
     if runtime->requiresLease != 0:
         var serviceText = cheng_str_copy_cstring(runtime->serviceKind)
         var scopeText = cheng_str_copy_cstring(runtime->authScope)
-        usernameText = serviceText + ":" + requesterPeerIdText + ":" + nonceHex
-        credentialText = "scope=" + scopeText + "|peer=" + requesterPeerIdText + "|nonce=" + nonceHex
+        usernameText = serviceText
+        usernameText = usernameText + ":"
+        usernameText = usernameText + requesterPeerIdText
+        usernameText = usernameText + ":"
+        usernameText = usernameText + nonceHex
+        credentialText = "scope="
+        credentialText = credentialText + scopeText
+        credentialText = credentialText + "|peer="
+        credentialText = credentialText + requesterPeerIdText
+        credentialText = credentialText + "|nonce="
+        credentialText = credentialText + nonceHex
         cheng_str_dispose(serviceText)
         cheng_str_dispose(scopeText)
-    let out = "ok=1\n" +
-              "region=" + regionText + "\n" +
-              "endpoint=" + endpointText + "\n" +
-              "username=" + usernameText + "\n" +
-              "credential=" + credentialText + "\n" +
-              "error=\n"
+    var out = "ok=1\n"
+    out = out + "region="
+    out = out + regionText
+    out = out + "\n"
+    out = out + "endpoint="
+    out = out + endpointText
+    out = out + "\n"
+    out = out + "username="
+    out = out + usernameText
+    out = out + "\n"
+    out = out + "credential="
+    out = out + credentialText
+    out = out + "\n"
+    out = out + "error=\n"
     cheng_str_dispose(endpointText)
     cheng_str_dispose(regionText)
     cheng_str_dispose(usernameText)
@@ -2925,12 +2986,12 @@ fn cheng_sockaddr_ipv4_make(port: int32, inaddr: int32): ptr =
     if addr == nil:
         return nil
     cheng_bytes_set(addr, 0, chengSockaddrInLen)
-    let family = chengTcpAfInet
+    let family = cheng_af_inet()
     if cheng_sockaddr_use_len_field():
-        *(UInt8Ptr(addr)) = uint8(chengSockaddrInLen)
+        *(UInt8Ptr(cheng_ptr_plus(addr, 0))) = uint8(chengSockaddrInLen)
         *(UInt8Ptr(cheng_ptr_plus(addr, 1))) = uint8(family & 255)
     else:
-        *(UInt8Ptr(addr)) = uint8(family & 255)
+        *(UInt8Ptr(cheng_ptr_plus(addr, 0))) = uint8(family & 255)
         *(UInt8Ptr(cheng_ptr_plus(addr, 1))) = uint8((family >> 8) & 255)
     *(UInt8Ptr(cheng_ptr_plus(addr, 2))) = uint8((port >> 8) & 255)
     *(UInt8Ptr(cheng_ptr_plus(addr, 3))) = uint8(port & 255)
@@ -2950,10 +3011,10 @@ fn cheng_sockaddr_ipv6_make(port: int32, inaddr: ptr): ptr =
     cheng_bytes_set(addr, 0, chengSockaddrIn6Len)
     let family = cheng_af_inet6()
     if cheng_sockaddr_use_len_field():
-        *(UInt8Ptr(addr)) = uint8(chengSockaddrIn6Len)
+        *(UInt8Ptr(cheng_ptr_plus(addr, 0))) = uint8(chengSockaddrIn6Len)
         *(UInt8Ptr(cheng_ptr_plus(addr, 1))) = uint8(family & 255)
     else:
-        *(UInt8Ptr(addr)) = uint8(family & 255)
+        *(UInt8Ptr(cheng_ptr_plus(addr, 0))) = uint8(family & 255)
         *(UInt8Ptr(cheng_ptr_plus(addr, 1))) = uint8((family >> 8) & 255)
     *(UInt8Ptr(cheng_ptr_plus(addr, 2))) = uint8((port >> 8) & 255)
     *(UInt8Ptr(cheng_ptr_plus(addr, 3))) = uint8(port & 255)
@@ -3010,7 +3071,7 @@ fn cheng_sockaddr_ipv4_parse(hostText: str, port: int32): ptr =
     if !cheng_parse_ipv4_addr(hostText, octets):
         cheng_free_export(octets)
         return nil
-    let inaddr = (int32(*(UInt8Ptr(octets))) << 24) |
+    let inaddr = (int32(*(UInt8Ptr(cheng_ptr_plus(octets, 0)))) << 24) |
                  (int32(*(UInt8Ptr(cheng_ptr_plus(octets, 1)))) << 16) |
                  (int32(*(UInt8Ptr(cheng_ptr_plus(octets, 2)))) << 8) |
                  int32(*(UInt8Ptr(cheng_ptr_plus(octets, 3))))
@@ -3227,9 +3288,65 @@ fn cheng_v3_udp_recvfrom_addr_bridge_export(fd: int32, buf: ptr, len: int32, fla
 @exportc("cheng_v3_udp_platform_use_len_field_bridge")
 fn cheng_v3_udp_platform_use_len_field_bridge_export(): int32 =
     return cheng_sockaddr_use_len_field() ? 1 : 0
+
+@exportc("cheng_v3_udp_use_len_field_consistency_bridge")
+fn cheng_v3_udp_use_len_field_consistency_bridge_export(): int32 =
+    let raw = native_cheng_v3_sockaddr_use_len_field_runtime()
+    let ternaryValue = cheng_sockaddr_use_len_field() ? 1 : 0
+    var helperBranch = 0
+    if cheng_sockaddr_use_len_field():
+        helperBranch = 1
+    var rawBranch = 0
+    if native_cheng_v3_sockaddr_use_len_field_runtime() != 0:
+        rawBranch = 1
+    return raw + (ternaryValue * 10) + (helperBranch * 100) + (rawBranch * 1000)
+
 @exportc("cheng_v3_udp_platform_msg_dontwait_bridge")
 fn cheng_v3_udp_platform_msg_dontwait_bridge_export(): int32 =
     return cheng_sockaddr_use_len_field() ? 128 : 64
+
+@exportc("cheng_v3_udp_ipv4_sockaddr_sanity_bridge")
+fn cheng_v3_udp_ipv4_sockaddr_sanity_bridge_export(): int32 =
+    let addr = cheng_sockaddr_ipv4_parse("127.0.0.1", 6210)
+    if addr == nil:
+        return 1
+    let b0 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 0))))
+    let b1 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 1))))
+    let b2 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 2))))
+    let b3 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 3))))
+    let b4 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 4))))
+    let b5 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 5))))
+    let b6 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 6))))
+    let b7 = int32(*(UInt8Ptr(cheng_ptr_plus(addr, 7))))
+    cheng_free_export(addr)
+    if b0 != 2:
+        return 10 + b0
+    if b1 != 0:
+        return 20 + b1
+    if b2 != ((6210 >> 8) & 255):
+        return 30 + b2
+    if b3 != (6210 & 255):
+        return 40 + b3
+    if b4 != 127:
+        return 50 + b4
+    if b5 != 0:
+        return 60 + b5
+    if b6 != 0:
+        return 70 + b6
+    if b7 != 1:
+        return 80 + b7
+    return 0
+
+@exportc("cheng_v3_udp_ipv4_sockaddr_byte_bridge")
+fn cheng_v3_udp_ipv4_sockaddr_byte_bridge_export(index: int32): int32 =
+    if index < 0 || index >= 8:
+        return -2
+    let addr = cheng_sockaddr_ipv4_parse("127.0.0.1", 6210)
+    if addr == nil:
+        return -1
+    let value = int32(*(UInt8Ptr(cheng_ptr_plus(addr, index))))
+    cheng_free_export(addr)
+    return value
 
 fn cheng_write_u32be(out: ptr, value: uint32) =
     if out == nil:

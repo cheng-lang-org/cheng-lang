@@ -133,7 +133,7 @@ fn v3CompilerWorldFirstPayloadTextByKind(hostRef: host.V3Libp2pHost,
         let ingress = hostRef.storeEntries[i].ingress
         if ingress.payloadKind != payloadKind:
             continue
-        outText = rawbytes.bytesToString(ingress.payload)
+        outText = cworld.v3CompilerWorldOwnText(rawbytes.bytesToString(ingress.payload))
         return true
     outText = ""
     return false
@@ -216,15 +216,16 @@ fn v3CompilerWorldSyncSmokeReport(rootDir: str,
 
 fn v3CompilerWorldFreshNodeSelfhostReport(rootDir: str,
                                           req: creq.V3CompilerRequest,
-                                          channelRaw: str,
-                                          localUniverse: cworld.V3CompilerLocalUniverse,
-                                          compilerCsg: ccsg.V3CompilerCsg,
-                                          exportSurface: ccsg.V3CsgExportSurface,
-                                          receipt: ccsg.V3CompileReceipt): Result[str] =
+                                          plan: sexec.V3SystemLinkExecPlan): Result[str] =
     var seedHost = host.v3Libp2pHostInit("compiler-world-seed")
     var freshHost = host.v3Libp2pHostInit("compiler-world-fresh")
     v3CompilerWorldRegister(seedHost)
     v3CompilerWorldRegister(freshHost)
+    let localUniverse = plan.localUniverse
+    let compilerCsg = plan.compilerCsg
+    let exportSurface = plan.exportSurface
+    let receipt = plan.compileReceipt
+    let channelRaw = localUniverse.worldHead.channel
     var seedAddr = core.v3Libp2pMultiaddrZero()
     var freshAddr = core.v3Libp2pMultiaddrZero()
     multiaddr.v3Libp2pMultiaddrFillTcp(seedAddr, "127.0.0.1", 6463)
@@ -254,41 +255,48 @@ fn v3CompilerWorldFreshNodeSelfhostReport(rootDir: str,
                                               pubsub.v3PubSubPayloadKindCompilerWorldHead,
                                               worldText):
         return Err[str]("v3 compiler world libp2p: missing fresh world head")
+    worldText = cworld.v3CompilerWorldOwnText(worldText)
     var receiptText = ""
     if !v3CompilerWorldFirstPayloadTextByKind(freshHost,
                                               pubsub.v3PubSubPayloadKindCompilerCompileReceipt,
                                               receiptText):
         return Err[str]("v3 compiler world libp2p: missing fresh receipt")
+    receiptText = cworld.v3CompilerWorldOwnText(receiptText)
     var syncedHead: cworld.V3CompilerWorldHead
     let parseHeadRes = cworld.v3CompilerWorldHeadFromReportText(worldText, syncedHead)
     if IsErr(parseHeadRes):
-        return Err[str](Error(parseHeadRes))
+        return Err[str]("v3 compiler world libp2p: parse fresh head failed: " + Error(parseHeadRes))
     if !layout.fixedBytes32Equal(syncedHead.headCid, localUniverse.worldHead.headCid):
         return Err[str]("v3 compiler world libp2p: fresh node head cid mismatch")
     var syncedReceipt: ccsg.V3CompileReceipt
     let parseReceiptRes = ccsg.v3CompileReceiptFromReportText(receiptText, syncedReceipt)
     if IsErr(parseReceiptRes):
-        return Err[str](Error(parseReceiptRes))
+        return Err[str]("v3 compiler world libp2p: parse fresh receipt failed: " + Error(parseReceiptRes))
     if !ccsg.v3CompileReceiptEquivalent(receipt, syncedReceipt):
         return Err[str]("v3 compiler world libp2p: synced receipt drift")
+    let requestedWorldHead = cworld.v3CompilerWorldOwnText(layout.fixedBytes32Hex(syncedHead.headCid))
+    let sourcePath = cworld.v3CompilerWorldOwnText(req.sourcePath)
+    let freshOutputPath = cworld.v3CompilerWorldOwnText(req.outputPath + ".fresh_node")
+    let targetTriple = cworld.v3CompilerWorldOwnText(req.targetTriple)
     let freshReq = creq.v3CompilerRequestNew(req.rootDir,
-                                             req.sourcePath,
-                                             req.outputPath + ".fresh_node",
-                                             req.targetTriple,
+                                             sourcePath,
+                                             freshOutputPath,
+                                             targetTriple,
                                              req.emitKind,
                                              "")
     let freshPlanRes = sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir,
                                                                           freshReq,
-                                                                          layout.fixedBytes32Hex(syncedHead.headCid),
+                                                                          requestedWorldHead,
                                                                           "",
                                                                           "",
                                                                           channelRaw)
     if IsErr(freshPlanRes):
-        return Err[str](Error(freshPlanRes))
+        return Err[str]("v3 compiler world libp2p: fresh rebuild plan failed: " + Error(freshPlanRes))
     let freshPlan = Value(freshPlanRes)
-    if !ccsg.v3CompileReceiptEquivalent(syncedReceipt, freshPlan.compileReceipt):
+    let freshReceipt = freshPlan.compileReceipt
+    if !ccsg.v3CompileReceiptEquivalent(syncedReceipt, freshReceipt):
         return Err[str]("v3 compiler world libp2p: fresh rebuild receipt drift")
-    if !layout.fixedBytes32Equal(syncedReceipt.receiptCid, freshPlan.compileReceipt.receiptCid):
+    if !layout.fixedBytes32Equal(syncedReceipt.receiptCid, freshReceipt.receiptCid):
         return Err[str]("v3 compiler world libp2p: fresh rebuild receipt cid mismatch")
     return Ok[str](
         "seed_entries=" + intToStr(v3CompilerWorldStoredEntryCount(seedHost)) + "\n" +
@@ -298,7 +306,7 @@ fn v3CompilerWorldFreshNodeSelfhostReport(rootDir: str,
         "world_head_cid=" + layout.fixedBytes32Hex(syncedHead.headCid) + "\n" +
         "seed_receipt_cid=" + layout.fixedBytes32Hex(receipt.receiptCid) + "\n" +
         "synced_receipt_cid=" + layout.fixedBytes32Hex(syncedReceipt.receiptCid) + "\n" +
-        "fresh_receipt_cid=" + layout.fixedBytes32Hex(freshPlan.compileReceipt.receiptCid) + "\n" +
+        "fresh_receipt_cid=" + layout.fixedBytes32Hex(freshReceipt.receiptCid) + "\n" +
         "receipt_equivalent=1\n" +
         "receipt_cid_match=1"
     )

@@ -112,6 +112,11 @@ type
         reachability: types.V3Libp2pReachabilityKind
         routeText: str
 
+    V3Libp2pTailnetDialPlanOutcome =
+        plan: V3Libp2pTailnetDialPlan
+        ok: bool
+        errorText: str
+
     V3Libp2pTailnetTransport =
         cfg: V3Libp2pTailnetTransportConfig
         runtimeHandle: uint64
@@ -277,6 +282,39 @@ fn v3Libp2pTailnetDialPlanZero(): V3Libp2pTailnetDialPlan =
     out.needsRepair = false
     out.reachability = types.v3Libp2pReachabilityUnknown
     out.routeText = ""
+    return out
+
+fn v3Libp2pTailnetDialPlanInit(out: var V3Libp2pTailnetDialPlan,
+                               peerId: str,
+                               requestedAddr: types.V3Libp2pMultiaddr,
+                               relayOnly: bool,
+                               directOnly: bool,
+                               selectedRelayPeerId: str,
+                               selectedRelayEndpoint: str,
+                               selectedRelayRegion: str) =
+    out.peerId = peerId
+    out.requestedAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
+    out.rawAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
+    out.publishedAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
+    out.selectedRelayPeerId = selectedRelayPeerId
+    out.selectedRelayEndpoint = selectedRelayEndpoint
+    out.selectedRelayRegion = selectedRelayRegion
+    out.pathKind = v3Libp2pTailnetPathIdle
+    out.directAllowed = !relayOnly
+    out.relayAllowed = false
+    out.relayOnly = relayOnly
+    out.directOnly = directOnly
+    out.needsRepair = false
+    out.reachability = types.v3Libp2pReachabilityUnknown
+    out.routeText = ""
+
+fn v3Libp2pTailnetDialPlanOutcomeBuild(plan: V3Libp2pTailnetDialPlan,
+                                       ok: bool,
+                                       errorText: str): V3Libp2pTailnetDialPlanOutcome =
+    var out: V3Libp2pTailnetDialPlanOutcome
+    out.plan = plan
+    out.ok = ok
+    out.errorText = errorText
     return out
 
 fn v3Libp2pTailnetTransportInit(cfg: V3Libp2pTailnetTransportConfig): V3Libp2pTailnetTransport =
@@ -669,30 +707,31 @@ fn v3Libp2pTailnetStatusPathKind(transport: V3Libp2pTailnetTransport): V3Libp2pT
         return v3Libp2pTailnetPathDerp
     return v3Libp2pTailnetPathIdle
 
-fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
-                                        transport: V3Libp2pTailnetTransport,
-                                        peerId: str,
-                                        requestedAddr: types.V3Libp2pMultiaddr,
-                                        relayOnly: bool,
-                                        directOnly: bool,
-                                        selectedRelayPeerId: str,
-                                        selectedRelayEndpoint: str,
-                                        selectedRelayRegion: str): Result[bool] =
+fn v3Libp2pTailnetDialPlanBuildWithRelay(transport: V3Libp2pTailnetTransport,
+                                         peerId: str,
+                                         requestedAddr: types.V3Libp2pMultiaddr,
+                                         relayOnly: bool,
+                                         directOnly: bool,
+                                         selectedRelayPeerId: str,
+                                         selectedRelayEndpoint: str,
+                                         selectedRelayRegion: str): V3Libp2pTailnetDialPlanOutcome =
+    var out = v3Libp2pTailnetDialPlanZero()
+    v3Libp2pTailnetDialPlanInit(out,
+                                peerId,
+                                requestedAddr,
+                                relayOnly,
+                                directOnly,
+                                selectedRelayPeerId,
+                                selectedRelayEndpoint,
+                                selectedRelayRegion)
     if relayOnly && directOnly:
-        return Err[bool]("v3 libp2p tailnet: relay-only conflicts with direct-only")
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out,
+                                                   false,
+                                                   "v3 libp2p tailnet: relay-only conflicts with direct-only")
     if requestedAddr.networkDomain != types.v3Libp2pNetworkDomainTailnet:
-        return Err[bool]("v3 libp2p tailnet: dial plan requires tailnet addr")
-    out = v3Libp2pTailnetDialPlanZero()
-    out.peerId = peerId
-    out.requestedAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
-    out.rawAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
-    out.publishedAddr = multiaddr.v3Libp2pMultiaddrClone(requestedAddr)
-    out.selectedRelayPeerId = selectedRelayPeerId
-    out.selectedRelayEndpoint = selectedRelayEndpoint
-    out.selectedRelayRegion = selectedRelayRegion
-    out.relayOnly = relayOnly
-    out.directOnly = directOnly
-    out.directAllowed = !relayOnly
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out,
+                                                   false,
+                                                   "v3 libp2p tailnet: dial plan requires tailnet addr")
     let providerReady = v3Libp2pTailnetProviderRuntimeReadyNow(transport)
     let proxyListenersReady = v3Libp2pTailnetProviderRuntimeProxyReadyNow(transport)
     let listenerNeedsRepair = v3Libp2pTailnetProviderRuntimeListenerNeedsRepairNow(transport)
@@ -728,7 +767,7 @@ fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
             out.routeText = v3Libp2pTailnetAddrText(out.rawAddr)
         else:
             out.routeText = v3Libp2pTailnetAddrText(out.publishedAddr)
-        return Ok[bool](true)
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out, true, "")
 
     let directPossible = out.directAllowed &&
                          providerReady &&
@@ -745,7 +784,7 @@ fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
                 out.routeText = v3Libp2pTailnetAddrText(out.rawAddr)
             else:
                 out.routeText = v3Libp2pTailnetAddrText(out.publishedAddr)
-        return Ok[bool](true)
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out, true, "")
 
     if out.relayAllowed:
         out.pathKind = v3Libp2pTailnetPathDerp
@@ -756,7 +795,7 @@ fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
             out.routeText = transport.cfg.relayEndpoint
         if len(out.selectedRelayRegion) <= 0:
             out.selectedRelayRegion = transport.cfg.derpRegionCode
-        return Ok[bool](true)
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out, true, "")
 
     if out.needsRepair:
         out.pathKind = v3Libp2pTailnetPathRepair
@@ -764,7 +803,9 @@ fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
         out.selectedRelayEndpoint = ""
         out.selectedRelayRegion = ""
         out.routeText = "repair"
-        return Err[bool]("v3 libp2p tailnet: listener repair required")
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out,
+                                                   false,
+                                                   "v3 libp2p tailnet: listener repair required")
 
     if providerReady && !proxyListenersReady:
         out.pathKind = v3Libp2pTailnetPathDirectPending
@@ -772,14 +813,52 @@ fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
         out.selectedRelayEndpoint = ""
         out.selectedRelayRegion = ""
         out.routeText = "direct-pending"
-        return Err[bool]("v3 libp2p tailnet: proxy listeners pending")
+        return v3Libp2pTailnetDialPlanOutcomeBuild(out,
+                                                   false,
+                                                   "v3 libp2p tailnet: proxy listeners pending")
 
     out.pathKind = v3Libp2pTailnetPathIdle
     out.selectedRelayPeerId = ""
     out.selectedRelayEndpoint = ""
     out.selectedRelayRegion = ""
     out.routeText = "idle"
-    return Err[bool]("v3 libp2p tailnet: no dial path")
+    return v3Libp2pTailnetDialPlanOutcomeBuild(out, false, "v3 libp2p tailnet: no dial path")
+
+fn v3Libp2pTailnetDialPlanBuild(transport: V3Libp2pTailnetTransport,
+                                peerId: str,
+                                requestedAddr: types.V3Libp2pMultiaddr,
+                                relayOnly: bool,
+                                directOnly: bool): V3Libp2pTailnetDialPlanOutcome =
+    return v3Libp2pTailnetDialPlanBuildWithRelay(transport,
+                                                 peerId,
+                                                 requestedAddr,
+                                                 relayOnly,
+                                                 directOnly,
+                                                 "",
+                                                 "",
+                                                 "")
+
+fn v3Libp2pTailnetDialPlanFillWithRelay(out: var V3Libp2pTailnetDialPlan,
+                                        transport: V3Libp2pTailnetTransport,
+                                        peerId: str,
+                                        requestedAddr: types.V3Libp2pMultiaddr,
+                                        relayOnly: bool,
+                                        directOnly: bool,
+                                        selectedRelayPeerId: str,
+                                        selectedRelayEndpoint: str,
+                                        selectedRelayRegion: str): Result[bool] =
+    let build = v3Libp2pTailnetDialPlanBuildWithRelay(transport,
+                                                      peerId,
+                                                      requestedAddr,
+                                                      relayOnly,
+                                                      directOnly,
+                                                      selectedRelayPeerId,
+                                                      selectedRelayEndpoint,
+                                                      selectedRelayRegion)
+    out = build.plan
+    if build.ok:
+        return Ok[bool](true)
+    return Err[bool](build.errorText)
 
 fn v3Libp2pTailnetDialPlanFill(out: var V3Libp2pTailnetDialPlan,
                                transport: V3Libp2pTailnetTransport,
@@ -787,15 +866,15 @@ fn v3Libp2pTailnetDialPlanFill(out: var V3Libp2pTailnetDialPlan,
                                requestedAddr: types.V3Libp2pMultiaddr,
                                relayOnly: bool,
                                directOnly: bool): Result[bool] =
-    return v3Libp2pTailnetDialPlanFillWithRelay(out,
-                                                transport,
-                                                peerId,
-                                                requestedAddr,
-                                                relayOnly,
-                                                directOnly,
-                                                "",
-                                                "",
-                                                "")
+    let build = v3Libp2pTailnetDialPlanBuild(transport,
+                                             peerId,
+                                             requestedAddr,
+                                             relayOnly,
+                                             directOnly)
+    out = build.plan
+    if build.ok:
+        return Ok[bool](true)
+    return Err[bool](build.errorText)
 
 fn v3Libp2pTailnetStatusFill(out: var V3Libp2pTailnetStatusSnapshot,
                              transport: V3Libp2pTailnetTransport) =

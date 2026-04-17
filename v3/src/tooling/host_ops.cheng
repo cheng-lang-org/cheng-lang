@@ -6,6 +6,14 @@ import std/strings
 import std/monotimes
 import cheng/v3/tooling/path as v3path
 
+@importc("cheng_v3_exec_program_capture_bridge")
+fn cheng_v3_exec_program_capture_bridge(programName: cstring,
+                                        argvWire: str,
+                                        workingDir: cstring,
+                                        exitCode: var int64): cstring
+@importc("cheng_v3_exec_program_capture_bridge_dispose")
+fn cheng_v3_exec_program_capture_bridge_dispose(raw: cstring)
+
 type
     V3LoggedRun =
         label: str
@@ -32,14 +40,85 @@ const
     v3ProcessSigKill = 9
     v3ProcessRunning = -2147483000
 
+fn v3LoggedRunMake(label: str,
+                   filePath: str,
+                   logPath: str,
+                   exitCode: int32,
+                   output: str): V3LoggedRun =
+    var out: V3LoggedRun
+    out.label = label
+    out.filePath = filePath
+    out.logPath = logPath
+    out.exitCode = exitCode
+    out.output = output
+    return out
+
+fn v3SpawnedProcessMake(label: str,
+                        filePath: str,
+                        readFd: int32,
+                        writeFd: int32,
+                        pid: int64,
+                        output: str): V3SpawnedProcess =
+    var out: V3SpawnedProcess
+    out.label = label
+    out.filePath = filePath
+    out.readFd = readFd
+    out.writeFd = writeFd
+    out.pid = pid
+    out.output = output
+    return out
+
+fn v3ParallelJobMake(label: str,
+                     logPath: str,
+                     proc: V3SpawnedProcess): V3ParallelJob =
+    var out: V3ParallelJob
+    out.label = label
+    out.logPath = logPath
+    out.proc = proc
+    return out
+
+fn v3HostOpsMissingExecutableText(programName: str): str =
+    var out = "missing executable: "
+    out = out + programName
+    out = out + "\n"
+    return out
+
+fn v3HostOpsEncodeArgvWire(argv: str[]): str =
+    var out = ""
+    let sep = strings.charToStr('\0')
+    for i in 0..<argv.len:
+        out = out + argv[i]
+        out = out + sep
+    return out
+
+fn v3HostOpsDirectCapture(filePath: str,
+                          argv: str[],
+                          workingDir: str,
+                          outputOut: var str): int32 =
+    outputOut = ""
+    if strings.len(filePath) <= 0:
+        return -1
+    var exitCode64: int64 = -1
+    let argvWire = v3HostOpsEncodeArgvWire(argv)
+    let rawOutput: cstring = cheng_v3_exec_program_capture_bridge(strToCStringTemp(filePath),
+                                                                  argvWire,
+                                                                  strToCStringTemp(workingDir),
+                                                                  exitCode64)
+    outputOut = strFromCStringCopy(rawOutput)
+    cheng_v3_exec_program_capture_bridge_dispose(rawOutput)
+    return int32(exitCode64)
+
 fn v3ExecFileDirect(filePath: str, argv: str[], envOverrides: str[],
                     workingDir: str, timeoutSec: int32,
                     capturePreferred: bool): os.ExecCmdResult =
-    if capturePreferred:
-        return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
-    let directRc: int32 = hostos.execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
-    if directRc == 0 || directRc == 124:
-        return os.ExecCmdResult(output: "", exitCode: directRc)
+    let _ = capturePreferred
+    if envOverrides.len == 0 && timeoutSec <= 0:
+        var output = ""
+        let exitCode = v3HostOpsDirectCapture(filePath, argv, workingDir, output)
+        var out: os.ExecCmdResult
+        out.output = output
+        out.exitCode = exitCode
+        return out
     return hostos.execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
 
 fn v3ResolveProgram(root: str, nameRaw: str): str =
@@ -51,10 +130,25 @@ fn v3ResolveProgram(root: str, nameRaw: str): str =
         if v3path.v3FileExistsNonEmpty(root, absolute):
             return absolute
         return ""
-    let probe: os.ExecCmdResult = os.execCmdEx("command -v " + os.quoteShell(name) + " 2>/dev/null", uint64(7), root)
-    if os.execCmdResultExitCode(probe) != 0:
-        return ""
-    return strutil.strip(os.execCmdResultOutput(probe))
+    let pathEnv: str = os.getEnv("PATH")
+    let total: int32 = strings.len(pathEnv)
+    var start: int32 = 0
+    for i in 0..total:
+        var endHit = false
+        if i == total:
+            endHit = true
+        elif pathEnv[i] == ':':
+            endHit = true
+        if !endHit:
+            continue
+        let itemLen: int32 = i - start
+        if itemLen > 0:
+            let dirText: str = v3path.v3TextSlice(pathEnv, start, itemLen)
+            let candidate: str = os.joinPath(dirText, name)
+            if v3path.v3FileExistsNonEmpty(root, candidate):
+                return candidate
+        start = i + 1
+    return ""
 
 fn v3RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOverrides: str[],
                    workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
@@ -63,55 +157,47 @@ fn v3RunFileLogged(root: str, label: str, filePathRaw: str, argv: str[], envOver
     if !v3path.v3PathNonEmpty(workingDirRaw):
         workingDir = root
     let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
+    if !v3path.v3FileExistsNonEmpty(root, filePath):
+        let missingText = v3HostOpsMissingExecutableText(filePath)
+        let _logged: bool = v3path.v3WriteTextFile(root, logPath, missingText)
+        return v3LoggedRunMake(label, filePath, logPath, 127, missingText)
     let res: os.ExecCmdResult = v3ExecFileDirect(filePath, argv, envOverrides, workingDir, timeoutSec, true)
-    let _logged: bool = v3path.v3WriteTextFile(root, logPath, os.execCmdResultOutput(res))
-    return V3LoggedRun(
-        label: label,
-        filePath: filePath,
-        logPath: logPath,
-        exitCode: os.execCmdResultExitCode(res),
-        output: os.execCmdResultOutput(res)
-    )
+    let outputText = os.execCmdResultOutput(res)
+    let exitCode = os.execCmdResultExitCode(res)
+    let _logged: bool = v3path.v3WriteTextFile(root, logPath, outputText)
+    return v3LoggedRunMake(label, filePath, logPath, exitCode, outputText)
 
 fn v3RunProgramLogged(root: str, label: str, programName: str, argv: str[], envOverrides: str[],
                       workingDirRaw: str, timeoutSec: int32, logPathRaw: str): V3LoggedRun =
     let programPath: str = v3ResolveProgram(root, programName)
     if !v3path.v3PathNonEmpty(programPath):
         let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
-        let _logged: bool = v3path.v3WriteTextFile(root, logPath, "missing executable: " + programName + "\n")
-        return V3LoggedRun(
-            label: label,
-            filePath: programName,
-            logPath: logPath,
-            exitCode: 127,
-            output: "missing executable: " + programName + "\n"
-        )
+        let missingText = v3HostOpsMissingExecutableText(programName)
+        let _logged: bool = v3path.v3WriteTextFile(root, logPath, missingText)
+        return v3LoggedRunMake(label, programName, logPath, 127, missingText)
     return v3RunFileLogged(root, label, programPath, argv, envOverrides, workingDirRaw, timeoutSec, logPathRaw)
 
 fn v3LoggedRunOk(run: V3LoggedRun): bool =
     return run.exitCode == 0
 
 fn v3LoggedRunSummary(run: V3LoggedRun): str =
-    return run.label + " rc=" + intToStr(run.exitCode) + " log=" + run.logPath
+    var out = ""
+    out = out + run.label
+    out = out + " rc="
+    out = out + intToStr(run.exitCode)
+    out = out + " log="
+    out = out + run.logPath
+    return out
 
 fn v3LoggedRunZero(label: str,
                    filePath: str,
                    logPath: str,
                    exitCode: int32,
                    output: str): V3LoggedRun =
-    return V3LoggedRun(label: label,
-                       filePath: filePath,
-                       logPath: logPath,
-                       exitCode: exitCode,
-                       output: output)
+    return v3LoggedRunMake(label, filePath, logPath, exitCode, output)
 
 fn v3SpawnedProcessZero(): V3SpawnedProcess =
-    return V3SpawnedProcess(label: "",
-                            filePath: "",
-                            readFd: -1,
-                            writeFd: -1,
-                            pid: 0,
-                            output: "")
+    return v3SpawnedProcessMake("", "", -1, -1, 0, "")
 
 fn v3SpawnedProcessCloseRead(proc: var V3SpawnedProcess) =
     if proc.readFd >= 0:
@@ -168,11 +254,11 @@ fn v3SpawnedProcessFinalize(root: str,
                             exitCode: int32): V3LoggedRun =
     let logPath: str = v3path.v3PathAbsolute(root, logPathRaw)
     let _logged: bool = v3path.v3WriteTextFile(root, logPath, proc.output)
-    let out = V3LoggedRun(label: proc.label,
-                          filePath: proc.filePath,
-                          logPath: logPath,
-                          exitCode: exitCode,
-                          output: proc.output)
+    let out = v3LoggedRunMake(proc.label,
+                              proc.filePath,
+                              logPath,
+                              exitCode,
+                              proc.output)
     proc = v3SpawnedProcessZero()
     return out
 
@@ -239,11 +325,11 @@ fn v3SpawnedProcessWaitLogged(root: str,
     if timedOut:
         exitCode = 124
     let _logged: bool = v3path.v3WriteTextFile(root, logPath, proc.output)
-    let out = V3LoggedRun(label: proc.label,
-                          filePath: proc.filePath,
-                          logPath: logPath,
-                          exitCode: exitCode,
-                          output: proc.output)
+    let out = v3LoggedRunMake(proc.label,
+                              proc.filePath,
+                              logPath,
+                              exitCode,
+                              proc.output)
     proc = v3SpawnedProcessZero()
     return out
 
@@ -259,13 +345,15 @@ fn v3SpawnFile(root: str,
         workingDir = root
     let spawnRes = hostos.execFilePipeSpawn(filePath, argv, envOverrides, workingDir)
     if !spawnRes.ok:
-        return Err[V3SpawnedProcess]("spawn failed: " + filePath)
-    return Ok[V3SpawnedProcess](V3SpawnedProcess(label: label,
-                                                 filePath: filePath,
-                                                 readFd: spawnRes.readFd,
-                                                 writeFd: spawnRes.writeFd,
-                                                 pid: spawnRes.pid,
-                                                 output: ""))
+        var err = "spawn failed: "
+        err = err + filePath
+        return Err[V3SpawnedProcess](err)
+    return Ok[V3SpawnedProcess](v3SpawnedProcessMake(label,
+                                                     filePath,
+                                                     spawnRes.readFd,
+                                                     spawnRes.writeFd,
+                                                     spawnRes.pid,
+                                                     ""))
 
 fn v3SpawnProgram(root: str,
                   label: str,
@@ -275,7 +363,7 @@ fn v3SpawnProgram(root: str,
                   workingDirRaw: str): Result[V3SpawnedProcess] =
     let programPath: str = v3ResolveProgram(root, programName)
     if !v3path.v3PathNonEmpty(programPath):
-        return Err[V3SpawnedProcess]("missing executable: " + programName)
+        return Err[V3SpawnedProcess](v3HostOpsMissingExecutableText(programName))
     return v3SpawnFile(root, label, programPath, argv, envOverrides, workingDirRaw)
 
 fn v3ParallelSpawnFile(root: str,
@@ -288,9 +376,9 @@ fn v3ParallelSpawnFile(root: str,
     let spawnRes = v3SpawnFile(root, label, filePathRaw, argv, envOverrides, workingDirRaw)
     if IsErr(spawnRes):
         return Err[V3ParallelJob](Error(spawnRes))
-    return Ok[V3ParallelJob](V3ParallelJob(label: label,
-                                           logPath: v3path.v3PathAbsolute(root, logPathRaw),
-                                           proc: Value(spawnRes)))
+    return Ok[V3ParallelJob](v3ParallelJobMake(label,
+                                               v3path.v3PathAbsolute(root, logPathRaw),
+                                               Value(spawnRes)))
 
 fn v3ParallelSpawnProgram(root: str,
                           label: str,
@@ -302,9 +390,9 @@ fn v3ParallelSpawnProgram(root: str,
     let spawnRes = v3SpawnProgram(root, label, programName, argv, envOverrides, workingDirRaw)
     if IsErr(spawnRes):
         return Err[V3ParallelJob](Error(spawnRes))
-    return Ok[V3ParallelJob](V3ParallelJob(label: label,
-                                           logPath: v3path.v3PathAbsolute(root, logPathRaw),
-                                           proc: Value(spawnRes)))
+    return Ok[V3ParallelJob](v3ParallelJobMake(label,
+                                               v3path.v3PathAbsolute(root, logPathRaw),
+                                               Value(spawnRes)))
 
 fn v3ParallelStopAll(root: str,
                      jobs: var V3ParallelJob[],

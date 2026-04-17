@@ -6,6 +6,88 @@ import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/r2c_process as r2cproc
 import cheng/v3/tooling/r2c_react_v3_surface_main as r2csurface
 
+type
+    R2cReplaySourceOpenResult =
+        requested: bool
+        ok: bool
+        targetPath: str
+        targetLine: int32
+        command: str
+        error: str
+
+    R2cTruthSnapshotMatch =
+        found: bool
+        matchedIndex: int32
+        stateId: str
+        routeId: str
+        semanticNodesPath: str
+        renderReadyKnown: bool
+        renderReady: bool
+        semanticNodesCountKnown: bool
+        semanticNodesCount: int32
+
+    R2cSemanticNodeDoc =
+        nodeId: str
+        pathText: str
+        key: str
+        keyFallback1: str
+        keyFallback2: str
+        nodeKind: str
+        tag: str
+        label: str
+        classPreview: str
+        detailText: str
+        textPreview: str
+        depth: int32
+        modulePath: str
+        componentName: str
+        line: int32
+
+    R2cTruthCompareEval =
+        ok: bool
+        reason: str
+        truthTraceFormat: str
+        truthState: str
+        matchedSnapshotIndex: int32
+        execRouteState: str
+        execRenderReady: bool
+        execSemanticNodesLoaded: bool
+        execSnapshotSemanticNodesCount: int32
+        execSemanticNodesCount: int32
+        execLayoutSurfacePath: str
+        truthRouteState: str
+        truthRouteId: str
+        truthSemanticNodesPath: str
+        truthRenderReady: bool
+        truthSemanticNodesLoaded: bool
+        truthSemanticNodesCountKnown: bool
+        truthTraceSemanticNodesCount: int32
+        truthSemanticNodesCount: int32
+        semanticNodeCountCompareBasis: str
+        semanticNodeDiffReady: bool
+        semanticNodeDiffPath: str
+        semanticNodeDiffBasis: str
+        semanticNodeDiffExecNodeCount: int32
+        semanticNodeDiffTruthNodeCount: int32
+        semanticNodeDiffSharedCount: int32
+        semanticNodeDiffExecOnlyCount: int32
+        semanticNodeDiffTruthOnlyCount: int32
+        missingTruthFieldsCsv: str
+        missingTruthFieldsCount: int32
+        mismatchCount: int32
+        mismatchRouteState: bool
+        mismatchRouteStateExecValue: str
+        mismatchRouteStateTruthValue: str
+        mismatchRenderReady: bool
+        mismatchRenderReadyExecValue: str
+        mismatchRenderReadyTruthValue: str
+        mismatchSemanticNodesLoaded: bool
+        mismatchSemanticNodesLoadedExecValue: str
+        mismatchSemanticNodesLoadedTruthValue: str
+        mismatchSemanticNodesCount: bool
+        mismatchSemanticNodesCountExecValue: str
+        mismatchSemanticNodesCountTruthValue: str
+
 fn r2cControllerPrintLine(text: str) =
     os.writeLine(os.get_stdout(), text)
 
@@ -80,6 +162,27 @@ fn r2cControllerCollectFlagValues(args: str[],
             if i + 1 < args.len:
                 add(out, args[i + 1])
                 skipNext = true
+    return out
+
+fn r2cControllerCollectCmdlineFlagValues(key: str): str[] =
+    var out: str[] = []
+    let count: int32 = cmdline.paramCount()
+    var skipNext = false
+    for i in 1..count:
+        if skipNext:
+            skipNext = false
+            continue
+        let arg: str = cmdline.paramStr(i)
+        if arg == key:
+            if i + 1 <= count:
+                add(out, r2cControllerOwnText(cmdline.paramStr(i + 1)))
+                skipNext = true
+            continue
+        if v3path.v3TextStartsWith(arg, key + ":"):
+            add(out, strings.dropPrefix(arg, key + ":"))
+            continue
+        if v3path.v3TextStartsWith(arg, key + "="):
+            add(out, strings.dropPrefix(arg, key + "="))
     return out
 
 fn r2cControllerExperimentalRoot(root: str): str =
@@ -159,8 +262,54 @@ fn r2cControllerReadSummaryValue(summaryPath: str,
         start = i + 1
     return defaultValue
 
+fn r2cControllerDigitValue(text: str): int32 =
+    if text == "0":
+        return 0
+    elif text == "1":
+        return 1
+    elif text == "2":
+        return 2
+    elif text == "3":
+        return 3
+    elif text == "4":
+        return 4
+    elif text == "5":
+        return 5
+    elif text == "6":
+        return 6
+    elif text == "7":
+        return 7
+    elif text == "8":
+        return 8
+    elif text == "9":
+        return 9
+    return -1
+
+fn r2cControllerParsePositiveInt32Raw(raw: str): int32 =
+    let total: int32 = strings.len(raw)
+    if total <= 0:
+        return 0
+    if total == 1:
+        return r2cControllerDigitValue(raw)
+    let prefixValue: int32 = r2cControllerParsePositiveInt32Raw(r2cControllerSlice(raw, 0, total - 1))
+    let lastDigit: int32 = r2cControllerDigitValue(r2cControllerSlice(raw, total - 1, 1))
+    if prefixValue < 0 || lastDigit < 0:
+        return -1
+    return prefixValue * 10 + lastDigit
+
 fn r2cControllerParseInt32(text: str): int32 =
-    return strutil.parseInt(text)
+    let raw: str = text
+    if strings.len(raw) <= 0:
+        return 0
+    if r2cControllerSlice(raw, 0, 1) == "-":
+        let negParsed: int32 = r2cControllerParsePositiveInt32Raw(r2cControllerSlice(raw, 1, strings.len(raw) - 1))
+        if negParsed < 0:
+            return 0
+        return 0 - negParsed
+    let parsed: int32 = r2cControllerParsePositiveInt32Raw(raw)
+    if parsed < 0:
+        return 0
+    return parsed
 
 fn r2cControllerJsonQuote(text: str): str =
     let quote: str = strings.charToStr(char(34))
@@ -170,6 +319,1020 @@ fn r2cControllerJsonBool(value: bool): str =
     if value:
         return "true"
     return "false"
+
+fn r2cControllerTextFind(text: str,
+                         needle: str,
+                         startRaw: int32): int32 =
+    let total: int32 = strings.len(text)
+    let needleLen: int32 = strings.len(needle)
+    if needleLen <= 0:
+        return startRaw
+    if total < needleLen:
+        return -1
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    if start > total - needleLen:
+        return -1
+    for i in start..(total - needleLen):
+        if r2cControllerSlice(text, i, needleLen) == needle:
+            return i
+    return -1
+
+fn r2cControllerJsonSkipWhitespace(text: str,
+                                   startRaw: int32): int32 =
+    var start: int32 = startRaw
+    if start < 0:
+        start = 0
+    let total: int32 = strings.len(text)
+    while start < total:
+        let ch = text[start]
+        if ch == char(32):
+            start = start + 1
+        elif ch == char(10):
+            start = start + 1
+        elif ch == char(13):
+            start = start + 1
+        elif ch == char(9):
+            start = start + 1
+        else:
+            return start
+    return start
+
+fn r2cControllerJsonFindValueStart(text: str,
+                                   key: str,
+                                   startRaw: int32): int32 =
+    let keyPattern: str = r2cControllerJsonQuote(key)
+    let keyPos: int32 = r2cControllerTextFind(text, keyPattern, startRaw)
+    if keyPos < 0:
+        return -1
+    let total: int32 = strings.len(text)
+    var pos: int32 = keyPos + strings.len(keyPattern)
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(58):
+            return r2cControllerJsonSkipWhitespace(text, pos + 1)
+        pos = pos + 1
+    return -1
+
+fn r2cControllerJsonHasField(text: str,
+                             key: str): bool =
+    return r2cControllerJsonFindValueStart(text, key, 0) >= 0
+
+fn r2cControllerJsonReadStringLiteralAdvance(text: str,
+                                             startRaw: int32,
+                                             out: var str,
+                                             nextPos: var int32): bool =
+    out = ""
+    nextPos = startRaw
+    let total: int32 = strings.len(text)
+    if startRaw < 0 || startRaw >= total:
+        return false
+    if text[startRaw] != char(34):
+        return false
+    var pos: int32 = startRaw + 1
+    while pos < total:
+        let ch = text[pos]
+        if ch == char(34):
+            nextPos = pos + 1
+            return true
+        if ch == '\\':
+            if pos + 1 >= total:
+                return false
+            let esc = text[pos + 1]
+            if esc == char(34):
+                out = out + strings.charToStr(char(34))
+            elif esc == '\\':
+                out = out + "\\"
+            elif esc == 'n':
+                out = out + "\n"
+            elif esc == 'r':
+                out = out + "\r"
+            elif esc == 't':
+                out = out + "\t"
+            else:
+                out = out + strings.charToStr(esc)
+            pos = pos + 2
+            continue
+        out = out + strings.charToStr(ch)
+        pos = pos + 1
+    return false
+
+fn r2cControllerJsonReadStringField(text: str,
+                                    key: str,
+                                    fallback: str): str =
+    let valueStart: int32 = r2cControllerJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    var out: str
+    var nextPos: int32 = 0
+    if !r2cControllerJsonReadStringLiteralAdvance(text, valueStart, out, nextPos):
+        return fallback
+    return out
+
+fn r2cControllerJsonReadBoolField(text: str,
+                                  key: str,
+                                  fallback: bool): bool =
+    let valueStart: int32 = r2cControllerJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    if r2cControllerTextFind(text, "true", valueStart) == valueStart:
+        return true
+    if r2cControllerTextFind(text, "false", valueStart) == valueStart:
+        return false
+    return fallback
+
+fn r2cControllerJsonReadIntField(text: str,
+                                 key: str,
+                                 fallback: int32): int32 =
+    let valueStart: int32 = r2cControllerJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let total: int32 = strings.len(text)
+    var endPos: int32 = valueStart
+    if endPos < total && text[endPos] == '-':
+        endPos = endPos + 1
+    var sawDigit = false
+    while endPos < total:
+        let digitText: str = r2cControllerSlice(text, endPos, 1)
+        if r2cControllerDigitValue(digitText) < 0:
+            break
+        sawDigit = true
+        endPos = endPos + 1
+    if !sawDigit:
+        return fallback
+    return r2cControllerParseInt32(r2cControllerSlice(text, valueStart, endPos - valueStart))
+
+fn r2cControllerJsonFindBalancedEnd(text: str,
+                                    startRaw: int32,
+                                    openCh: char,
+                                    closeCh: char): int32 =
+    let total: int32 = strings.len(text)
+    if startRaw < 0 || startRaw >= total:
+        return -1
+    if text[startRaw] != openCh:
+        return -1
+    var depth: int32 = 0
+    var inString = false
+    var escaped = false
+    for i in startRaw..<total:
+        let ch = text[i]
+        if inString:
+            if escaped:
+                escaped = false
+            elif ch == '\\':
+                escaped = true
+            elif ch == char(34):
+                inString = false
+            continue
+        if ch == char(34):
+            inString = true
+            continue
+        if ch == openCh:
+            depth = depth + 1
+            continue
+        if ch == closeCh:
+            depth = depth - 1
+            if depth == 0:
+                return i
+    return -1
+
+fn r2cControllerJsonReadObjectFieldRaw(text: str,
+                                       key: str,
+                                       fallback: str): str =
+    let valueStart: int32 = r2cControllerJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let endPos: int32 = r2cControllerJsonFindBalancedEnd(text, valueStart, char(123), char(125))
+    if endPos < valueStart:
+        return fallback
+    return r2cControllerSlice(text, valueStart, endPos - valueStart + 1)
+
+fn r2cControllerJsonReadArrayFieldRaw(text: str,
+                                      key: str,
+                                      fallback: str): str =
+    let valueStart: int32 = r2cControllerJsonFindValueStart(text, key, 0)
+    if valueStart < 0:
+        return fallback
+    let endPos: int32 = r2cControllerJsonFindBalancedEnd(text, valueStart, char(91), char(93))
+    if endPos < valueStart:
+        return fallback
+    return r2cControllerSlice(text, valueStart, endPos - valueStart + 1)
+
+fn r2cControllerJsonArrayNextObjectRaw(arrayText: str,
+                                       startRaw: int32,
+                                       itemRaw: var str,
+                                       nextPos: var int32): bool =
+    itemRaw = ""
+    let total: int32 = strings.len(arrayText)
+    var pos: int32 = startRaw
+    if pos < 0:
+        pos = 0
+    pos = r2cControllerJsonSkipWhitespace(arrayText, pos)
+    if pos < total && arrayText[pos] == char(91):
+        pos = r2cControllerJsonSkipWhitespace(arrayText, pos + 1)
+    if pos < total && arrayText[pos] == ',':
+        pos = r2cControllerJsonSkipWhitespace(arrayText, pos + 1)
+    if pos >= total || arrayText[pos] == char(93):
+        nextPos = total
+        return false
+    if arrayText[pos] != char(123):
+        nextPos = pos
+        return false
+    let endPos: int32 = r2cControllerJsonFindBalancedEnd(arrayText, pos, char(123), char(125))
+    if endPos < pos:
+        nextPos = pos
+        return false
+    itemRaw = r2cControllerSlice(arrayText, pos, endPos - pos + 1)
+    nextPos = endPos + 1
+    return true
+
+fn r2cControllerCsvAppend(csvText: str,
+                          item: str): str =
+    if strings.len(item) <= 0:
+        return csvText
+    if strings.len(csvText) <= 0:
+        return item
+    return csvText + "," + item
+
+fn r2cControllerJsonStringifyStringValue(value: str): str =
+    return value
+
+fn r2cControllerJsonStringifyBoolValue(value: bool): str =
+    return r2cControllerJsonBool(value)
+
+fn r2cControllerJsonStringifyIntValue(value: int32): str =
+    return intToStr(value)
+
+fn r2cControllerSemanticNodeKind(kindRaw: str): str =
+    if kindRaw == "tree_element" || kindRaw == "element":
+        return "element"
+    if kindRaw == "tree_button" || kindRaw == "tree_input" || kindRaw == "tree_link" || kindRaw == "tree_media":
+        return "element"
+    if kindRaw == "tree_text" || kindRaw == "text":
+        return "text"
+    if kindRaw == "tree_component" || kindRaw == "component":
+        return "component"
+    if kindRaw == "tree_component_ref" || kindRaw == "component_ref":
+        return "component_ref"
+    if kindRaw == "tree_branch" || kindRaw == "branch":
+        return "branch"
+    if kindRaw == "tree_repeat" || kindRaw == "repeat":
+        return "repeat"
+    if kindRaw == "tree_fragment" || kindRaw == "fragment":
+        return "fragment"
+    return kindRaw
+
+fn r2cControllerSemanticNodeIncluded(nodeKind: str): bool =
+    if nodeKind == "component" || nodeKind == "component_ref":
+        return false
+    if nodeKind == "branch" || nodeKind == "repeat" || nodeKind == "fragment":
+        return false
+    return true
+
+fn r2cControllerSemanticNodeKey(nodeKind: str,
+                                tag: str,
+                                label: str,
+                                classPreview: str,
+                                textPreview: str): str =
+    if nodeKind == "element":
+        if strings.len(classPreview) > 0:
+            return "element|" + tag + "|" + classPreview
+        return "element|" + tag
+    if nodeKind == "text":
+        if strings.len(textPreview) > 0:
+            return "text|" + textPreview
+        return "text|" + label
+    if nodeKind == "branch":
+        return "branch|" + label
+    if nodeKind == "component":
+        return "component|" + tag + "|" + label
+    return nodeKind + "|" + tag + "|" + label
+
+fn r2cControllerSemanticNodeFallbackKey1(nodeKind: str,
+                                         tag: str,
+                                         label: str,
+                                         textPreview: str): str =
+    if nodeKind == "element":
+        if strings.len(textPreview) > 0:
+            return "element|" + tag + "|text:" + textPreview
+    return ""
+
+fn r2cControllerSemanticNodeFallbackKey2(nodeKind: str,
+                                         tag: str): str =
+    if nodeKind == "element":
+        return "element|" + tag
+    return ""
+
+fn r2cControllerSemanticNodeAllowsTagFallback(node: R2cSemanticNodeDoc): bool =
+    if strings.len(node.keyFallback2) <= 0:
+        return false
+    if node.key != node.keyFallback2:
+        return false
+    if strings.len(node.classPreview) > 0:
+        return false
+    if strings.len(node.textPreview) > 0:
+        return false
+    return true
+
+fn r2cControllerSemanticNodeKeysMatch(left: R2cSemanticNodeDoc,
+                                      right: R2cSemanticNodeDoc): bool =
+    if strings.len(left.key) > 0 && left.key == right.key:
+        return true
+    if strings.len(left.keyFallback1) > 0:
+        if left.keyFallback1 == right.key || left.keyFallback1 == right.keyFallback1:
+            return true
+    if strings.len(right.keyFallback1) > 0:
+        if left.key == right.keyFallback1:
+            return true
+    if r2cControllerSemanticNodeAllowsTagFallback(left) && r2cControllerSemanticNodeAllowsTagFallback(right):
+        if left.keyFallback2 == right.keyFallback2:
+            return true
+    return false
+
+fn r2cControllerJsonReadExecSemanticNode(nodeRaw: str,
+                                         out: var R2cSemanticNodeDoc): bool =
+    out.nodeId = r2cControllerJsonReadStringField(nodeRaw, "id", "")
+    out.pathText = ""
+    out.nodeKind = r2cControllerSemanticNodeKind(r2cControllerJsonReadStringField(nodeRaw, "kind", ""))
+    if !r2cControllerSemanticNodeIncluded(out.nodeKind):
+        return false
+    out.tag = r2cControllerJsonReadStringField(nodeRaw, "tag", "")
+    out.label = r2cControllerJsonReadStringField(nodeRaw, "label", "")
+    out.classPreview = r2cControllerJsonReadStringField(nodeRaw, "class_preview", "")
+    out.detailText = r2cControllerJsonReadStringField(nodeRaw, "detail_text", "")
+    out.textPreview = ""
+    out.depth = r2cControllerJsonReadIntField(nodeRaw, "depth", 0)
+    out.modulePath = r2cControllerJsonReadStringField(nodeRaw, "module_path", "")
+    out.componentName = r2cControllerJsonReadStringField(nodeRaw, "component_name", "")
+    out.line = r2cControllerJsonReadIntField(nodeRaw, "line", 0)
+    if out.nodeKind == "text":
+        out.textPreview = out.label
+    else:
+        out.textPreview = r2cControllerJsonReadStringField(nodeRaw, "text_preview", "")
+    out.key = r2cControllerSemanticNodeKey(out.nodeKind,
+                                           out.tag,
+                                           out.label,
+                                           out.classPreview,
+                                           out.textPreview)
+    out.keyFallback1 = r2cControllerSemanticNodeFallbackKey1(out.nodeKind,
+                                                             out.tag,
+                                                             out.label,
+                                                             out.textPreview)
+    out.keyFallback2 = r2cControllerSemanticNodeFallbackKey2(out.nodeKind,
+                                                             out.tag)
+    return true
+
+fn r2cControllerJsonReadTruthSemanticNode(nodeRaw: str,
+                                          out: var R2cSemanticNodeDoc): bool =
+    out.nodeId = ""
+    out.pathText = r2cControllerJsonReadStringField(nodeRaw, "path", "")
+    out.nodeKind = r2cControllerSemanticNodeKind(r2cControllerJsonReadStringField(nodeRaw, "kind", ""))
+    if !r2cControllerSemanticNodeIncluded(out.nodeKind):
+        return false
+    out.tag = r2cControllerJsonReadStringField(nodeRaw, "tag", "")
+    out.label = r2cControllerJsonReadStringField(nodeRaw, "label", "")
+    out.classPreview = r2cControllerJsonReadStringField(nodeRaw, "classPreview", "")
+    if strings.len(out.classPreview) <= 0:
+        out.classPreview = r2cControllerJsonReadStringField(nodeRaw, "class_preview", "")
+    out.detailText = ""
+    out.textPreview = r2cControllerJsonReadStringField(nodeRaw, "textPreview", "")
+    if strings.len(out.textPreview) <= 0:
+        out.textPreview = r2cControllerJsonReadStringField(nodeRaw, "text_preview", "")
+    out.depth = r2cControllerJsonReadIntField(nodeRaw, "depth", 0)
+    out.modulePath = ""
+    out.componentName = ""
+    out.line = 0
+    out.key = r2cControllerSemanticNodeKey(out.nodeKind,
+                                           out.tag,
+                                           out.label,
+                                           out.classPreview,
+                                           out.textPreview)
+    out.keyFallback1 = r2cControllerSemanticNodeFallbackKey1(out.nodeKind,
+                                                             out.tag,
+                                                             out.label,
+                                                             out.textPreview)
+    out.keyFallback2 = r2cControllerSemanticNodeFallbackKey2(out.nodeKind,
+                                                             out.tag)
+    return true
+
+fn r2cControllerLoadExecSemanticNodes(layoutSurfacePath: str,
+                                      out: var R2cSemanticNodeDoc[]): bool =
+    out = []
+    let docText: str = v3path.v3ReadTextFile("", layoutSurfacePath)
+    if r2cControllerJsonReadStringField(docText, "format", "") != "layout_surface_v1":
+        return false
+    let nodesRaw: str = r2cControllerJsonReadArrayFieldRaw(docText, "nodes", "")
+    if strings.len(nodesRaw) <= 0:
+        return true
+    var nodeRaw: str
+    var cursor: int32 = 0
+    var nextPos: int32 = 0
+    while r2cControllerJsonArrayNextObjectRaw(nodesRaw, cursor, nodeRaw, nextPos):
+        cursor = nextPos
+        var node: R2cSemanticNodeDoc
+        if r2cControllerJsonReadExecSemanticNode(nodeRaw, node):
+            add(out, node)
+    return true
+
+fn r2cControllerLoadTruthSemanticNodes(truthSemanticNodesPath: str,
+                                       out: var R2cSemanticNodeDoc[]): bool =
+    out = []
+    let docText: str = v3path.v3ReadTextFile("", truthSemanticNodesPath)
+    if r2cControllerJsonReadStringField(docText, "format", "") != "semantic_dom_nodes_v1":
+        return false
+    let nodesRaw: str = r2cControllerJsonReadArrayFieldRaw(docText, "nodes", "")
+    if strings.len(nodesRaw) <= 0:
+        return true
+    var nodeRaw: str
+    var cursor: int32 = 0
+    var nextPos: int32 = 0
+    while r2cControllerJsonArrayNextObjectRaw(nodesRaw, cursor, nodeRaw, nextPos):
+        cursor = nextPos
+        var node: R2cSemanticNodeDoc
+        if r2cControllerJsonReadTruthSemanticNode(nodeRaw, node):
+            add(out, node)
+    return true
+
+fn r2cControllerSemanticNodeJson(node: R2cSemanticNodeDoc): str =
+    var out = "{"
+    out = out + "\"node_id\":" + r2cControllerJsonQuote(node.nodeId) + ","
+    out = out + "\"path\":" + r2cControllerJsonQuote(node.pathText) + ","
+    out = out + "\"key\":" + r2cControllerJsonQuote(node.key) + ","
+    out = out + "\"kind\":" + r2cControllerJsonQuote(node.nodeKind) + ","
+    out = out + "\"tag\":" + r2cControllerJsonQuote(node.tag) + ","
+    out = out + "\"label\":" + r2cControllerJsonQuote(node.label) + ","
+    out = out + "\"class_preview\":" + r2cControllerJsonQuote(node.classPreview) + ","
+    out = out + "\"detail_text\":" + r2cControllerJsonQuote(node.detailText) + ","
+    out = out + "\"text_preview\":" + r2cControllerJsonQuote(node.textPreview) + ","
+    out = out + "\"depth\":" + intToStr(node.depth) + ","
+    out = out + "\"module_path\":" + r2cControllerJsonQuote(node.modulePath) + ","
+    out = out + "\"component_name\":" + r2cControllerJsonQuote(node.componentName) + ","
+    out = out + "\"line\":" + intToStr(node.line)
+    out = out + "}"
+    return out
+
+fn r2cControllerSemanticNodeJsonArray(nodes: R2cSemanticNodeDoc[]): str =
+    var out = "["
+    for i in 0..<nodes.len:
+        if i > 0:
+            out = out + ", "
+        out = out + r2cControllerSemanticNodeJson(nodes[i])
+    out = out + "]"
+    return out
+
+fn r2cControllerWriteSemanticNodeDiff(execSnapshotPath: str,
+                                      truthSemanticNodesPath: str,
+                                      semanticNodeDiffPath: str,
+                                      compare: var R2cTruthCompareEval): bool =
+    compare.semanticNodeDiffReady = false
+    compare.semanticNodeDiffPath = semanticNodeDiffPath
+    compare.semanticNodeDiffBasis = ""
+    compare.semanticNodeDiffExecNodeCount = 0
+    compare.semanticNodeDiffTruthNodeCount = 0
+    compare.semanticNodeDiffSharedCount = 0
+    compare.semanticNodeDiffExecOnlyCount = 0
+    compare.semanticNodeDiffTruthOnlyCount = 0
+    compare.execLayoutSurfacePath = ""
+    if strings.len(truthSemanticNodesPath) <= 0:
+        return true
+    let execDir: str = v3path.v3PathParentDir(execSnapshotPath)
+    let execLayoutSurfacePath: str = os.joinPath(execDir, "layout_surface_v1.json")
+    compare.execLayoutSurfacePath = execLayoutSurfacePath
+    if !v3path.v3PathFileExists(execLayoutSurfacePath) || !v3path.v3PathFileExists(truthSemanticNodesPath):
+        return true
+    var execNodes: R2cSemanticNodeDoc[] = []
+    var truthNodes: R2cSemanticNodeDoc[] = []
+    if !r2cControllerLoadExecSemanticNodes(execLayoutSurfacePath, execNodes):
+        return false
+    if !r2cControllerLoadTruthSemanticNodes(truthSemanticNodesPath, truthNodes):
+        return false
+    compare.semanticNodeDiffBasis = "exec_layout_surface_vs_truth_dom"
+    compare.semanticNodeDiffExecNodeCount = execNodes.len
+    compare.semanticNodeDiffTruthNodeCount = truthNodes.len
+    var truthMatched: bool[] = []
+    for i in 0..<truthNodes.len:
+        add(truthMatched, false)
+    var execOnly: R2cSemanticNodeDoc[] = []
+    var truthOnly: R2cSemanticNodeDoc[] = []
+    for i in 0..<execNodes.len:
+        let execNode = execNodes[i]
+        var matchedIndex: int32 = -1
+        for j in 0..<truthNodes.len:
+            if truthMatched[j]:
+                continue
+            if r2cControllerSemanticNodeKeysMatch(execNode, truthNodes[j]):
+                matchedIndex = j
+                break
+        if matchedIndex >= 0:
+            truthMatched[matchedIndex] = true
+            compare.semanticNodeDiffSharedCount = compare.semanticNodeDiffSharedCount + 1
+        else:
+            compare.semanticNodeDiffExecOnlyCount = compare.semanticNodeDiffExecOnlyCount + 1
+            if execOnly.len < 48:
+                add(execOnly, execNode)
+    for i in 0..<truthNodes.len:
+        if truthMatched[i]:
+            continue
+        compare.semanticNodeDiffTruthOnlyCount = compare.semanticNodeDiffTruthOnlyCount + 1
+        if truthOnly.len < 48:
+            add(truthOnly, truthNodes[i])
+    var diffDoc = "{\n"
+    diffDoc = diffDoc + "  \"format\": \"semantic_node_diff_v1\",\n"
+    diffDoc = diffDoc + "  \"ready\": true,\n"
+    diffDoc = diffDoc + "  \"compare_basis\": " + r2cControllerJsonQuote(compare.semanticNodeDiffBasis) + ",\n"
+    diffDoc = diffDoc + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    diffDoc = diffDoc + "  \"exec_layout_surface_path\": " + r2cControllerJsonQuote(execLayoutSurfacePath) + ",\n"
+    diffDoc = diffDoc + "  \"truth_semantic_nodes_path\": " + r2cControllerJsonQuote(truthSemanticNodesPath) + ",\n"
+    diffDoc = diffDoc + "  \"exec_snapshot_semantic_nodes_count\": " + intToStr(compare.execSnapshotSemanticNodesCount) + ",\n"
+    diffDoc = diffDoc + "  \"exec_layout_surface_node_count\": " + intToStr(compare.semanticNodeDiffExecNodeCount) + ",\n"
+    diffDoc = diffDoc + "  \"truth_semantic_nodes_count\": " + intToStr(compare.semanticNodeDiffTruthNodeCount) + ",\n"
+    diffDoc = diffDoc + "  \"shared_count\": " + intToStr(compare.semanticNodeDiffSharedCount) + ",\n"
+    diffDoc = diffDoc + "  \"exec_only_count\": " + intToStr(compare.semanticNodeDiffExecOnlyCount) + ",\n"
+    diffDoc = diffDoc + "  \"truth_only_count\": " + intToStr(compare.semanticNodeDiffTruthOnlyCount) + ",\n"
+    diffDoc = diffDoc + "  \"exec_only_nodes\": " + r2cControllerSemanticNodeJsonArray(execOnly) + ",\n"
+    diffDoc = diffDoc + "  \"truth_only_nodes\": " + r2cControllerSemanticNodeJsonArray(truthOnly) + "\n"
+    diffDoc = diffDoc + "}\n"
+    if !v3path.v3WriteTextFile("", semanticNodeDiffPath, diffDoc):
+        return false
+    compare.semanticNodeDiffReady = true
+    return true
+
+fn r2cControllerRefreshSemanticNodeCompareStatus(compare: var R2cTruthCompareEval) =
+    if !compare.truthSemanticNodesCountKnown:
+        return
+    if compare.mismatchSemanticNodesLoaded && compare.mismatchCount > 0:
+        compare.mismatchCount = compare.mismatchCount - 1
+    compare.mismatchSemanticNodesLoaded = false
+    compare.mismatchSemanticNodesLoadedExecValue = ""
+    compare.mismatchSemanticNodesLoadedTruthValue = ""
+    compare.execSemanticNodesLoaded = compare.execSemanticNodesCount > 0
+    compare.truthSemanticNodesLoaded = compare.truthSemanticNodesCount > 0
+    if compare.execSemanticNodesLoaded != compare.truthSemanticNodesLoaded:
+        compare.mismatchSemanticNodesLoaded = true
+        compare.mismatchSemanticNodesLoadedExecValue = r2cControllerJsonStringifyBoolValue(compare.execSemanticNodesLoaded)
+        compare.mismatchSemanticNodesLoadedTruthValue = r2cControllerJsonStringifyBoolValue(compare.truthSemanticNodesLoaded)
+        compare.mismatchCount = compare.mismatchCount + 1
+    if compare.mismatchSemanticNodesCount && compare.mismatchCount > 0:
+        compare.mismatchCount = compare.mismatchCount - 1
+    compare.mismatchSemanticNodesCount = false
+    compare.mismatchSemanticNodesCountExecValue = ""
+    compare.mismatchSemanticNodesCountTruthValue = ""
+    if compare.execSemanticNodesCount != compare.truthSemanticNodesCount:
+        compare.mismatchSemanticNodesCount = true
+        compare.mismatchSemanticNodesCountExecValue = r2cControllerJsonStringifyIntValue(compare.execSemanticNodesCount)
+        compare.mismatchSemanticNodesCountTruthValue = r2cControllerJsonStringifyIntValue(compare.truthSemanticNodesCount)
+        compare.mismatchCount = compare.mismatchCount + 1
+    if compare.missingTruthFieldsCount > 0:
+        compare.ok = false
+        compare.reason = "missing_truth_fields"
+    elif compare.mismatchCount > 0:
+        compare.ok = false
+        compare.reason = "mismatch"
+    else:
+        compare.ok = true
+        compare.reason = "ok"
+
+fn r2cControllerFindTruthSnapshotMatch(truthDocText: str,
+                                       targetState: str,
+                                       out: var R2cTruthSnapshotMatch): bool =
+    out.matchedIndex = -1
+    let snapshotsRaw: str = r2cControllerJsonReadArrayFieldRaw(truthDocText, "snapshots", "")
+    if strings.len(snapshotsRaw) <= 0:
+        return false
+    var entryRaw: str
+    var cursor: int32 = 0
+    var nextPos: int32 = 0
+    var index: int32 = 0
+    while r2cControllerJsonArrayNextObjectRaw(snapshotsRaw, cursor, entryRaw, nextPos):
+        cursor = nextPos
+        var stateId: str = r2cControllerJsonReadStringField(entryRaw, "stateId", "")
+        if strings.len(stateId) <= 0:
+            stateId = r2cControllerJsonReadStringField(entryRaw, "state_id", "")
+        var routeId = ""
+        let routeRaw: str = r2cControllerJsonReadObjectFieldRaw(entryRaw, "route", "")
+        if strings.len(routeRaw) > 0:
+            routeId = r2cControllerJsonReadStringField(routeRaw, "routeId", "")
+            if strings.len(routeId) <= 0:
+                routeId = r2cControllerJsonReadStringField(routeRaw, "route_id", "")
+        var semanticNodesPath = r2cControllerJsonReadStringField(entryRaw, "semanticNodesPath", "")
+        if strings.len(semanticNodesPath) <= 0:
+            semanticNodesPath = r2cControllerJsonReadStringField(entryRaw, "semantic_nodes_path", "")
+        var renderReadyKnown = false
+        var renderReady = false
+        if r2cControllerJsonHasField(entryRaw, "renderReady"):
+            renderReadyKnown = true
+            renderReady = r2cControllerJsonReadBoolField(entryRaw, "renderReady", false)
+        elif r2cControllerJsonHasField(entryRaw, "render_ready"):
+            renderReadyKnown = true
+            renderReady = r2cControllerJsonReadBoolField(entryRaw, "render_ready", false)
+        var semanticNodesCountKnown = false
+        var semanticNodesCount: int32 = 0
+        if r2cControllerJsonHasField(entryRaw, "semanticNodesCount"):
+            semanticNodesCountKnown = true
+            semanticNodesCount = r2cControllerJsonReadIntField(entryRaw, "semanticNodesCount", 0)
+        elif r2cControllerJsonHasField(entryRaw, "semantic_nodes_count"):
+            semanticNodesCountKnown = true
+            semanticNodesCount = r2cControllerJsonReadIntField(entryRaw, "semantic_nodes_count", 0)
+        if stateId == targetState || (strings.len(stateId) <= 0 && routeId == targetState):
+            out.found = true
+            out.matchedIndex = index
+            out.stateId = stateId
+            out.routeId = routeId
+            out.semanticNodesPath = semanticNodesPath
+            out.renderReadyKnown = renderReadyKnown
+            out.renderReady = renderReady
+            out.semanticNodesCountKnown = semanticNodesCountKnown
+            out.semanticNodesCount = semanticNodesCount
+            return true
+        index = index + 1
+    return true
+
+fn r2cControllerEvaluateTruthCompare(execSnapshotText: str,
+                                     truthDocText: str,
+                                     requestedTruthState: str,
+                                     out: var R2cTruthCompareEval): bool =
+    out.truthTraceFormat = r2cControllerJsonReadStringField(truthDocText, "format", "")
+    if out.truthTraceFormat != "truth_trace_v2" && out.truthTraceFormat != "r2c-truth-trace-v1":
+        return false
+    let snapshotsRaw: str = r2cControllerJsonReadArrayFieldRaw(truthDocText, "snapshots", "")
+    if strings.len(snapshotsRaw) <= 0:
+        return false
+    out.execRouteState = r2cControllerJsonReadStringField(execSnapshotText, "route_state", "")
+    out.execRenderReady = r2cControllerJsonReadBoolField(execSnapshotText, "render_ready", false)
+    out.execSemanticNodesLoaded = r2cControllerJsonReadBoolField(execSnapshotText, "semantic_nodes_loaded", false)
+    out.execSnapshotSemanticNodesCount = r2cControllerJsonReadIntField(execSnapshotText, "semantic_nodes_count", 0)
+    out.execSemanticNodesCount = out.execSnapshotSemanticNodesCount
+    out.semanticNodeCountCompareBasis = "exec_snapshot_vs_truth_trace"
+    out.truthState = requestedTruthState
+    if strings.len(out.truthState) <= 0:
+        out.truthState = out.execRouteState
+    var matched: R2cTruthSnapshotMatch
+    if !r2cControllerFindTruthSnapshotMatch(truthDocText, out.truthState, matched):
+        return false
+    out.matchedSnapshotIndex = matched.matchedIndex
+    if !matched.found:
+        out.reason = "missing_truth_state"
+        return true
+    out.truthRouteState = matched.stateId
+    out.truthRouteId = matched.routeId
+    out.truthSemanticNodesPath = matched.semanticNodesPath
+    out.truthRenderReady = matched.renderReady
+    out.truthSemanticNodesCountKnown = matched.semanticNodesCountKnown
+    out.truthTraceSemanticNodesCount = matched.semanticNodesCount
+    out.truthSemanticNodesCount = out.truthTraceSemanticNodesCount
+    if matched.semanticNodesCountKnown:
+        out.truthSemanticNodesLoaded = matched.semanticNodesCount > 0
+    if strings.len(out.truthRouteState) <= 0:
+        out.missingTruthFieldsCsv = r2cControllerCsvAppend(out.missingTruthFieldsCsv, "route_state")
+        out.missingTruthFieldsCount = out.missingTruthFieldsCount + 1
+    elif out.execRouteState != out.truthRouteState:
+        out.mismatchRouteState = true
+        out.mismatchRouteStateExecValue = r2cControllerJsonStringifyStringValue(out.execRouteState)
+        out.mismatchRouteStateTruthValue = r2cControllerJsonStringifyStringValue(out.truthRouteState)
+        out.mismatchCount = out.mismatchCount + 1
+    if !matched.renderReadyKnown:
+        out.missingTruthFieldsCsv = r2cControllerCsvAppend(out.missingTruthFieldsCsv, "render_ready")
+        out.missingTruthFieldsCount = out.missingTruthFieldsCount + 1
+    elif out.execRenderReady != out.truthRenderReady:
+        out.mismatchRenderReady = true
+        out.mismatchRenderReadyExecValue = r2cControllerJsonStringifyBoolValue(out.execRenderReady)
+        out.mismatchRenderReadyTruthValue = r2cControllerJsonStringifyBoolValue(out.truthRenderReady)
+        out.mismatchCount = out.mismatchCount + 1
+    if !matched.semanticNodesCountKnown:
+        out.missingTruthFieldsCsv = r2cControllerCsvAppend(out.missingTruthFieldsCsv, "semantic_nodes_loaded")
+        out.missingTruthFieldsCount = out.missingTruthFieldsCount + 1
+        out.missingTruthFieldsCsv = r2cControllerCsvAppend(out.missingTruthFieldsCsv, "semantic_nodes_count")
+        out.missingTruthFieldsCount = out.missingTruthFieldsCount + 1
+    else:
+        if out.execSemanticNodesLoaded != out.truthSemanticNodesLoaded:
+            out.mismatchSemanticNodesLoaded = true
+            out.mismatchSemanticNodesLoadedExecValue = r2cControllerJsonStringifyBoolValue(out.execSemanticNodesLoaded)
+            out.mismatchSemanticNodesLoadedTruthValue = r2cControllerJsonStringifyBoolValue(out.truthSemanticNodesLoaded)
+            out.mismatchCount = out.mismatchCount + 1
+        if out.execSemanticNodesCount != out.truthSemanticNodesCount:
+            out.mismatchSemanticNodesCount = true
+            out.mismatchSemanticNodesCountExecValue = r2cControllerJsonStringifyIntValue(out.execSemanticNodesCount)
+            out.mismatchSemanticNodesCountTruthValue = r2cControllerJsonStringifyIntValue(out.truthSemanticNodesCount)
+            out.mismatchCount = out.mismatchCount + 1
+    if out.missingTruthFieldsCount > 0:
+        out.reason = "missing_truth_fields"
+        return true
+    if out.mismatchCount > 0:
+        out.reason = "mismatch"
+        return true
+    out.ok = true
+    out.reason = "ok"
+    return true
+
+fn r2cControllerTruthCompareMismatchesJson(compare: R2cTruthCompareEval): str =
+    var out = "["
+    var wrote = false
+    if compare.mismatchRouteState:
+        out = out + "{\"field\":\"route_state\",\"exec_value\":" + r2cControllerJsonQuote(compare.mismatchRouteStateExecValue) + ",\"truth_value\":" + r2cControllerJsonQuote(compare.mismatchRouteStateTruthValue) + "}"
+        wrote = true
+    if compare.mismatchRenderReady:
+        if wrote:
+            out = out + ", "
+        out = out + "{\"field\":\"render_ready\",\"exec_value\":" + r2cControllerJsonQuote(compare.mismatchRenderReadyExecValue) + ",\"truth_value\":" + r2cControllerJsonQuote(compare.mismatchRenderReadyTruthValue) + "}"
+        wrote = true
+    if compare.mismatchSemanticNodesLoaded:
+        if wrote:
+            out = out + ", "
+        out = out + "{\"field\":\"semantic_nodes_loaded\",\"exec_value\":" + r2cControllerJsonQuote(compare.mismatchSemanticNodesLoadedExecValue) + ",\"truth_value\":" + r2cControllerJsonQuote(compare.mismatchSemanticNodesLoadedTruthValue) + "}"
+        wrote = true
+    if compare.mismatchSemanticNodesCount:
+        if wrote:
+            out = out + ", "
+        out = out + "{\"field\":\"semantic_nodes_count\",\"exec_value\":" + r2cControllerJsonQuote(compare.mismatchSemanticNodesCountExecValue) + ",\"truth_value\":" + r2cControllerJsonQuote(compare.mismatchSemanticNodesCountTruthValue) + "}"
+    out = out + "]"
+    return out
+
+fn r2cControllerWriteTruthCompareArtifacts(truthComparePath: str,
+                                           summaryPath: str,
+                                           execSnapshotPath: str,
+                                           truthTracePath: str,
+                                           compare: R2cTruthCompareEval): bool =
+    let missingTruthFieldsJson: str = r2cControllerJsonArrayFromCsv(compare.missingTruthFieldsCsv)
+    let mismatchesJson: str = r2cControllerTruthCompareMismatchesJson(compare)
+    var compareDoc = "{\n"
+    compareDoc = compareDoc + "  \"format\": \"truth_compare_v1\",\n"
+    compareDoc = compareDoc + "  \"ok\": " + r2cControllerJsonBool(compare.ok) + ",\n"
+    compareDoc = compareDoc + "  \"reason\": " + r2cControllerJsonQuote(compare.reason) + ",\n"
+    compareDoc = compareDoc + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    compareDoc = compareDoc + "  \"truth_trace_format\": " + r2cControllerJsonQuote(compare.truthTraceFormat) + ",\n"
+    compareDoc = compareDoc + "  \"truth_state\": " + r2cControllerJsonQuote(compare.truthState) + ",\n"
+    compareDoc = compareDoc + "  \"matched_snapshot_index\": " + intToStr(compare.matchedSnapshotIndex) + ",\n"
+    compareDoc = compareDoc + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    compareDoc = compareDoc + "  \"out_path\": " + r2cControllerJsonQuote(truthComparePath) + ",\n"
+    compareDoc = compareDoc + "  \"exec_layout_surface_path\": " + r2cControllerJsonQuote(compare.execLayoutSurfacePath) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_count_compare_basis\": " + r2cControllerJsonQuote(compare.semanticNodeCountCompareBasis) + ",\n"
+    compareDoc = compareDoc + "  \"exec_route_state\": " + r2cControllerJsonQuote(compare.execRouteState) + ",\n"
+    compareDoc = compareDoc + "  \"exec_render_ready\": " + r2cControllerJsonBool(compare.execRenderReady) + ",\n"
+    compareDoc = compareDoc + "  \"exec_semantic_nodes_loaded\": " + r2cControllerJsonBool(compare.execSemanticNodesLoaded) + ",\n"
+    compareDoc = compareDoc + "  \"exec_snapshot_semantic_nodes_count\": " + intToStr(compare.execSnapshotSemanticNodesCount) + ",\n"
+    compareDoc = compareDoc + "  \"exec_semantic_nodes_count\": " + intToStr(compare.execSemanticNodesCount) + ",\n"
+    compareDoc = compareDoc + "  \"truth_semantic_nodes_path\": " + r2cControllerJsonQuote(compare.truthSemanticNodesPath) + ",\n"
+    compareDoc = compareDoc + "  \"truth_route_state\": " + r2cControllerJsonQuote(compare.truthRouteState) + ",\n"
+    compareDoc = compareDoc + "  \"truth_route_id\": " + r2cControllerJsonQuote(compare.truthRouteId) + ",\n"
+    compareDoc = compareDoc + "  \"truth_render_ready\": " + r2cControllerJsonBool(compare.truthRenderReady) + ",\n"
+    compareDoc = compareDoc + "  \"truth_semantic_nodes_loaded\": " + r2cControllerJsonBool(compare.truthSemanticNodesLoaded) + ",\n"
+    compareDoc = compareDoc + "  \"truth_trace_semantic_nodes_count\": " + intToStr(compare.truthTraceSemanticNodesCount) + ",\n"
+    compareDoc = compareDoc + "  \"truth_semantic_nodes_count\": " + intToStr(compare.truthSemanticNodesCount) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_ready\": " + r2cControllerJsonBool(compare.semanticNodeDiffReady) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_path\": " + r2cControllerJsonQuote(compare.semanticNodeDiffPath) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_basis\": " + r2cControllerJsonQuote(compare.semanticNodeDiffBasis) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_exec_node_count\": " + intToStr(compare.semanticNodeDiffExecNodeCount) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_truth_node_count\": " + intToStr(compare.semanticNodeDiffTruthNodeCount) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_shared_count\": " + intToStr(compare.semanticNodeDiffSharedCount) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_exec_only_count\": " + intToStr(compare.semanticNodeDiffExecOnlyCount) + ",\n"
+    compareDoc = compareDoc + "  \"semantic_node_diff_truth_only_count\": " + intToStr(compare.semanticNodeDiffTruthOnlyCount) + ",\n"
+    compareDoc = compareDoc + "  \"missing_truth_fields\": " + missingTruthFieldsJson + ",\n"
+    compareDoc = compareDoc + "  \"mismatches\": " + mismatchesJson + "\n"
+    compareDoc = compareDoc + "}\n"
+    if !v3path.v3WriteTextFile("", truthComparePath, compareDoc):
+        return false
+    var summaryText = ""
+    summaryText = summaryText + "truth_compare_ok=" + r2cControllerJsonBool(compare.ok) + "\n"
+    summaryText = summaryText + "truth_compare_reason=" + compare.reason + "\n"
+    summaryText = summaryText + "truth_compare_path=" + truthComparePath + "\n"
+    summaryText = summaryText + "truth_state=" + compare.truthState + "\n"
+    summaryText = summaryText + "matched_snapshot_index=" + intToStr(compare.matchedSnapshotIndex) + "\n"
+    summaryText = summaryText + "mismatch_count=" + intToStr(compare.mismatchCount) + "\n"
+    summaryText = summaryText + "missing_truth_fields_count=" + intToStr(compare.missingTruthFieldsCount) + "\n"
+    summaryText = summaryText + "semantic_node_count_compare_basis=" + compare.semanticNodeCountCompareBasis + "\n"
+    summaryText = summaryText + "exec_snapshot_semantic_nodes_count=" + intToStr(compare.execSnapshotSemanticNodesCount) + "\n"
+    summaryText = summaryText + "exec_semantic_nodes_count=" + intToStr(compare.execSemanticNodesCount) + "\n"
+    summaryText = summaryText + "truth_trace_semantic_nodes_count=" + intToStr(compare.truthTraceSemanticNodesCount) + "\n"
+    summaryText = summaryText + "truth_semantic_nodes_count=" + intToStr(compare.truthSemanticNodesCount) + "\n"
+    summaryText = summaryText + "exec_layout_surface_path=" + compare.execLayoutSurfacePath + "\n"
+    summaryText = summaryText + "truth_semantic_nodes_path=" + compare.truthSemanticNodesPath + "\n"
+    summaryText = summaryText + "semantic_node_diff_ready=" + r2cControllerJsonBool(compare.semanticNodeDiffReady) + "\n"
+    summaryText = summaryText + "semantic_node_diff_path=" + compare.semanticNodeDiffPath + "\n"
+    summaryText = summaryText + "semantic_node_diff_basis=" + compare.semanticNodeDiffBasis + "\n"
+    summaryText = summaryText + "semantic_node_diff_exec_node_count=" + intToStr(compare.semanticNodeDiffExecNodeCount) + "\n"
+    summaryText = summaryText + "semantic_node_diff_truth_node_count=" + intToStr(compare.semanticNodeDiffTruthNodeCount) + "\n"
+    summaryText = summaryText + "semantic_node_diff_shared_count=" + intToStr(compare.semanticNodeDiffSharedCount) + "\n"
+    summaryText = summaryText + "semantic_node_diff_exec_only_count=" + intToStr(compare.semanticNodeDiffExecOnlyCount) + "\n"
+    summaryText = summaryText + "semantic_node_diff_truth_only_count=" + intToStr(compare.semanticNodeDiffTruthOnlyCount) + "\n"
+    return v3path.v3WriteTextFile("", summaryPath, summaryText)
+
+fn r2cControllerWriteCompareTruthDirect(execSnapshotPath: str,
+                                        truthTracePath: str,
+                                        truthState: str,
+                                        truthComparePath: str,
+                                        summaryPath: str): bool =
+    if !v3path.v3PathFileExists(execSnapshotPath) || !v3path.v3PathFileExists(truthTracePath):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth direct missing input")
+        return false
+    let execSnapshotText: str = v3path.v3ReadTextFile("", execSnapshotPath)
+    let truthDocText: str = v3path.v3ReadTextFile("", truthTracePath)
+    let formatStart: int32 = r2cControllerJsonFindValueStart(truthDocText, "format", 0)
+    let snapshotsStart: int32 = r2cControllerJsonFindValueStart(truthDocText, "snapshots", 0)
+    let truthTraceFormat: str = r2cControllerJsonReadStringField(truthDocText, "format", "")
+    let snapshotsRaw: str = r2cControllerJsonReadArrayFieldRaw(truthDocText, "snapshots", "")
+    var compare: R2cTruthCompareEval
+    if !r2cControllerEvaluateTruthCompare(execSnapshotText, truthDocText, truthState, compare):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth eval rejected truth_bytes=" + intToStr(strings.len(truthDocText)) + " format_start=" + intToStr(formatStart) + " snapshots_start=" + intToStr(snapshotsStart) + " trace format=" + truthTraceFormat + " snapshots_bytes=" + intToStr(strings.len(snapshotsRaw)))
+        return false
+    if strings.len(compare.truthSemanticNodesPath) <= 0:
+        var inferredTruthState: str = truthState
+        if strings.len(inferredTruthState) <= 0:
+            inferredTruthState = compare.execRouteState
+        let inferredTruthSemanticNodesPath: str = os.joinPath(v3path.v3PathParentDir(truthTracePath),
+                                                              inferredTruthState + ".semantic_dom_nodes_v1.json")
+        if v3path.v3PathFileExists(inferredTruthSemanticNodesPath):
+            compare.truthSemanticNodesPath = inferredTruthSemanticNodesPath
+    let semanticNodeDiffPath: str = os.joinPath(v3path.v3PathParentDir(truthComparePath), "semantic_node_diff_v1.json")
+    if !r2cControllerWriteSemanticNodeDiff(execSnapshotPath,
+                                           compare.truthSemanticNodesPath,
+                                           semanticNodeDiffPath,
+                                           compare):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth semantic diff failed")
+        return false
+    if compare.semanticNodeDiffReady:
+        compare.semanticNodeCountCompareBasis = compare.semanticNodeDiffBasis
+        compare.execSemanticNodesCount = compare.semanticNodeDiffExecNodeCount
+        compare.truthSemanticNodesCount = compare.semanticNodeDiffTruthNodeCount
+        r2cControllerRefreshSemanticNodeCompareStatus(compare)
+    if !r2cControllerWriteTruthCompareArtifacts(truthComparePath,
+                                                summaryPath,
+                                                execSnapshotPath,
+                                                truthTracePath,
+                                                compare):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth write artifacts failed")
+        return false
+    return true
+
+fn r2cControllerTruthCompareMatrixReason(unsupportedCount: int32,
+                                         mismatchCount: int32,
+                                         missingTruthStateCount: int32,
+                                         missingTruthFieldCount: int32): str =
+    if unsupportedCount > 0:
+        return "unsupported_exec_routes"
+    if missingTruthStateCount > 0:
+        return "missing_truth_states"
+    if missingTruthFieldCount > 0:
+        return "missing_truth_fields"
+    if mismatchCount > 0:
+        return "mismatch"
+    return "ok"
+
+fn r2cControllerWriteTruthCompareMatrixArtifacts(execRouteMatrixPath: str,
+                                                 truthTracePath: str,
+                                                 truthCompareMatrixPath: str,
+                                                 summaryPath: str): bool =
+    if !v3path.v3PathFileExists(execRouteMatrixPath) || !v3path.v3PathFileExists(truthTracePath):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix direct missing input")
+        return false
+    let execRouteMatrixText: str = v3path.v3ReadTextFile("", execRouteMatrixPath)
+    let truthDocText: str = v3path.v3ReadTextFile("", truthTracePath)
+    let truthTraceFormat: str = r2cControllerJsonReadStringField(truthDocText, "format", "")
+    if truthTraceFormat != "truth_trace_v2" && truthTraceFormat != "r2c-truth-trace-v1":
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix unsupported trace format: " + truthTraceFormat)
+        return false
+    if strings.len(r2cControllerJsonReadArrayFieldRaw(truthDocText, "snapshots", "")) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix missing snapshots[]")
+        return false
+    let entriesRaw: str = r2cControllerJsonReadArrayFieldRaw(execRouteMatrixText, "entries", "")
+    if strings.len(entriesRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix missing entries[]")
+        return false
+    var entriesJson = "["
+    var wroteEntry = false
+    var routeCount: int32 = 0
+    var okCount: int32 = 0
+    var unsupportedCount: int32 = 0
+    var mismatchCount: int32 = 0
+    var missingTruthStateCount: int32 = 0
+    var missingTruthFieldCount: int32 = 0
+    var entryRaw: str
+    var cursor: int32 = 0
+    var nextPos: int32 = 0
+    while r2cControllerJsonArrayNextObjectRaw(entriesRaw, cursor, entryRaw, nextPos):
+        cursor = nextPos
+        routeCount = routeCount + 1
+        let routeId: str = r2cControllerJsonReadStringField(entryRaw, "routeId", "")
+        let supported: bool = r2cControllerJsonReadBoolField(entryRaw, "supported", false)
+        let snapshotPath: str = r2cControllerJsonReadStringField(entryRaw, "snapshotPath", "")
+        let execReason: str = r2cControllerJsonReadStringField(entryRaw, "reason", "")
+        let snapshotRaw: str = r2cControllerJsonReadObjectFieldRaw(entryRaw, "snapshot", "{}")
+        let execRouteState: str = r2cControllerJsonReadStringField(snapshotRaw, "route_state", "")
+        let execSemanticNodesCount: int32 = r2cControllerJsonReadIntField(snapshotRaw, "semantic_nodes_count", 0)
+        var entryOk = false
+        var entryReason = execReason
+        var matchedSnapshotIndex: int32 = -1
+        var truthRouteState = ""
+        var truthSemanticNodesCount: int32 = 0
+        var missingTruthFieldsCsv = ""
+        var mismatchesJson = "[]"
+        if !supported:
+            unsupportedCount = unsupportedCount + 1
+            if strings.len(entryReason) <= 0:
+                entryReason = "unsupported_exec_route"
+        else:
+            var compare: R2cTruthCompareEval
+            if !r2cControllerEvaluateTruthCompare(snapshotRaw, truthDocText, routeId, compare):
+                r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix eval failed for route: " + routeId)
+                return false
+            entryOk = compare.ok
+            entryReason = compare.reason
+            matchedSnapshotIndex = compare.matchedSnapshotIndex
+            truthRouteState = compare.truthRouteState
+            truthSemanticNodesCount = compare.truthSemanticNodesCount
+            missingTruthFieldsCsv = compare.missingTruthFieldsCsv
+            mismatchesJson = r2cControllerTruthCompareMismatchesJson(compare)
+            execSemanticNodesCount = compare.execSemanticNodesCount
+            if compare.ok:
+                okCount = okCount + 1
+            elif compare.reason == "missing_truth_state":
+                missingTruthStateCount = missingTruthStateCount + 1
+            elif compare.reason == "missing_truth_fields":
+                missingTruthFieldCount = missingTruthFieldCount + 1
+            elif compare.reason == "mismatch":
+                mismatchCount = mismatchCount + 1
+        if wroteEntry:
+            entriesJson = entriesJson + ",\n"
+        entriesJson = entriesJson + "    {\n"
+        entriesJson = entriesJson + "      \"routeId\": " + r2cControllerJsonQuote(routeId) + ",\n"
+        entriesJson = entriesJson + "      \"supported\": " + r2cControllerJsonBool(supported) + ",\n"
+        entriesJson = entriesJson + "      \"ok\": " + r2cControllerJsonBool(entryOk) + ",\n"
+        entriesJson = entriesJson + "      \"reason\": " + r2cControllerJsonQuote(entryReason) + ",\n"
+        entriesJson = entriesJson + "      \"matchedSnapshotIndex\": " + intToStr(matchedSnapshotIndex) + ",\n"
+        entriesJson = entriesJson + "      \"snapshotPath\": " + r2cControllerJsonQuote(snapshotPath) + ",\n"
+        entriesJson = entriesJson + "      \"execRouteState\": " + r2cControllerJsonQuote(execRouteState) + ",\n"
+        entriesJson = entriesJson + "      \"truthRouteState\": " + r2cControllerJsonQuote(truthRouteState) + ",\n"
+        entriesJson = entriesJson + "      \"execSemanticNodesCount\": " + intToStr(execSemanticNodesCount) + ",\n"
+        entriesJson = entriesJson + "      \"truthSemanticNodesCount\": " + intToStr(truthSemanticNodesCount) + ",\n"
+        entriesJson = entriesJson + "      \"missingTruthFields\": " + r2cControllerJsonArrayFromCsv(missingTruthFieldsCsv) + ",\n"
+        entriesJson = entriesJson + "      \"mismatches\": " + mismatchesJson + "\n"
+        entriesJson = entriesJson + "    }"
+        wroteEntry = true
+    entriesJson = entriesJson + "\n  ]"
+    let finalOk: bool = unsupportedCount == 0 &&
+                        mismatchCount == 0 &&
+                        missingTruthStateCount == 0 &&
+                        missingTruthFieldCount == 0
+    let finalReason: str = r2cControllerTruthCompareMatrixReason(unsupportedCount,
+                                                                 mismatchCount,
+                                                                 missingTruthStateCount,
+                                                                 missingTruthFieldCount)
+    var matrixDoc = "{\n"
+    matrixDoc = matrixDoc + "  \"format\": \"truth_compare_matrix_v1\",\n"
+    matrixDoc = matrixDoc + "  \"ok\": " + r2cControllerJsonBool(finalOk) + ",\n"
+    matrixDoc = matrixDoc + "  \"reason\": " + r2cControllerJsonQuote(finalReason) + ",\n"
+    matrixDoc = matrixDoc + "  \"truthTracePath\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    matrixDoc = matrixDoc + "  \"truthTraceFormat\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
+    matrixDoc = matrixDoc + "  \"routeCount\": " + intToStr(routeCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"okCount\": " + intToStr(okCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"unsupportedCount\": " + intToStr(unsupportedCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"mismatchCount\": " + intToStr(mismatchCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"missingTruthStateCount\": " + intToStr(missingTruthStateCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"missingTruthFieldCount\": " + intToStr(missingTruthFieldCount) + ",\n"
+    matrixDoc = matrixDoc + "  \"entries\": " + entriesJson + ",\n"
+    matrixDoc = matrixDoc + "  \"outPath\": " + r2cControllerJsonQuote(truthCompareMatrixPath) + "\n"
+    matrixDoc = matrixDoc + "}\n"
+    if !v3path.v3WriteTextFile("", truthCompareMatrixPath, matrixDoc):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix write json failed")
+        return false
+    var summaryText = ""
+    summaryText = summaryText + "truth_compare_matrix_ok=" + r2cControllerJsonBool(finalOk) + "\n"
+    summaryText = summaryText + "truth_compare_matrix_reason=" + finalReason + "\n"
+    summaryText = summaryText + "truth_compare_matrix_path=" + truthCompareMatrixPath + "\n"
+    summaryText = summaryText + "route_count=" + intToStr(routeCount) + "\n"
+    summaryText = summaryText + "ok_count=" + intToStr(okCount) + "\n"
+    summaryText = summaryText + "unsupported_count=" + intToStr(unsupportedCount) + "\n"
+    summaryText = summaryText + "mismatch_count=" + intToStr(mismatchCount) + "\n"
+    summaryText = summaryText + "missing_truth_state_count=" + intToStr(missingTruthStateCount) + "\n"
+    summaryText = summaryText + "missing_truth_field_count=" + intToStr(missingTruthFieldCount) + "\n"
+    if !v3path.v3WriteTextFile("", summaryPath, summaryText):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix write summary failed")
+        return false
+    return true
+
+fn r2cControllerJsonCountStringArrayItems(arrayText: str): int32 =
+    let total: int32 = strings.len(arrayText)
+    if total <= 0:
+        return 0
+    var count: int32 = 0
+    var pos: int32 = 0
+    var inString = false
+    var escaped = false
+    while pos < total:
+        let ch = arrayText[pos]
+        if inString:
+            if escaped:
+                escaped = false
+            elif ch == char(92):
+                escaped = true
+            elif ch == char(34):
+                inString = false
+        else:
+            if ch == char(34):
+                inString = true
+                count = count + 1
+        pos = pos + 1
+    return count
 
 fn r2cControllerJsonArrayFromCsv(csvText: str): str =
     let total: int32 = strings.len(csvText)
@@ -196,6 +1359,67 @@ fn r2cControllerJsonArrayFromCsv(csvText: str): str =
         start = i + 1
     out = out + "]"
     return out
+
+fn r2cControllerShellQuoteSimple(text: str): str =
+    return "'" + text + "'"
+
+fn r2cControllerReplaySourceOpen(root: str,
+                                 repoRoot: str,
+                                 hitSourceModulePath: str,
+                                 hitSourceLine: int32,
+                                 sourceJumpTargetPath: str,
+                                 sourceJumpTargetLine: int32,
+                                 openLogPath: str): R2cReplaySourceOpenResult =
+    var result: R2cReplaySourceOpenResult
+    var targetPath: str = sourceJumpTargetPath
+    var targetLine: int32 = sourceJumpTargetLine
+    if strings.len(targetPath) <= 0:
+        if strings.len(repoRoot) > 0 && strings.len(hitSourceModulePath) > 0:
+            targetPath = v3path.v3PathAbsolute(repoRoot, hitSourceModulePath)
+    if targetLine <= 0:
+        targetLine = hitSourceLine
+        if targetLine <= 0:
+            targetLine = 1
+    result.targetPath = targetPath
+    result.targetLine = targetLine
+    if strings.len(targetPath) <= 0:
+        result.error = "missing_target_path"
+        return result
+    if !v3path.v3PathFileExists(targetPath):
+        result.error = "source_file_missing:" + targetPath
+        return result
+    result.requested = true
+    var command = "/usr/bin/xed"
+    command = command + " " + r2cControllerShellQuoteSimple("--background")
+    command = command + " " + r2cControllerShellQuoteSimple("--line")
+    command = command + " " + r2cControllerShellQuoteSimple(intToStr(targetLine))
+    command = command + " " + r2cControllerShellQuoteSimple(targetPath)
+    result.command = command
+    var argv: str[] = []
+    add(argv, "--background")
+    add(argv, "--line")
+    add(argv, intToStr(targetLine))
+    add(argv, targetPath)
+    var exitCode: int32 = 0
+    var output: str
+    os.osSetEmpty(output)
+    let runOk = r2cproc.r2cProcessRunProgramLogged(root,
+                                                   "r2c-react-v3 replay-hit-inspector open-source",
+                                                   "/usr/bin/xed",
+                                                   argv,
+                                                   root,
+                                                   openLogPath,
+                                                   exitCode,
+                                                   output)
+    if runOk:
+        result.ok = true
+        return result
+    let trimmed: str = strutil.strip(output)
+    if strings.len(trimmed) > 0:
+        result.error = trimmed
+        return result
+    result.error = "xed_exit_" + intToStr(exitCode)
+    return result
 
 fn r2cControllerWriteCompileReport(reportPath: str,
                                    root: str,
@@ -281,24 +1505,25 @@ fn r2cControllerWriteStatusReport(reportPath: str,
     report = report + "  \"semantic_surface_helper\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"codegen_surface_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")) + ",\n"
     report = report + "  \"exec_surface_helper\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"truth_runtime_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-truth-runtime.mjs")) + ",\n"
     report = report + "  \"native_gui_bundle_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")) + ",\n"
     report = report + "  \"native_gui_runtime_helper\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"native_gui_runtime_mode\": \"cheng_controller_compiled_json_v1\",\n"
     report = report + "  \"native_gui_run_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-run.mjs")) + ",\n"
-    report = report + "  \"native_gui_replay_hit_inspector_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-replay-hit-inspector.mjs")) + ",\n"
+    report = report + "  \"native_gui_replay_hit_inspector_helper\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"exec_route_matrix_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")) + ",\n"
     report = report + "  \"truth_route_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")) + ",\n"
-    report = report + "  \"truth_compare_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare.mjs")) + ",\n"
-    report = report + "  \"truth_compare_matrix_helper\": " + r2cControllerJsonQuote(os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare-matrix.mjs")) + ",\n"
+    report = report + "  \"truth_compare_helper\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"truth_compare_matrix_helper\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"node_helper_surface_mode\": \"cheng_controller_min_surface_v1\",\n"
     report = report + "  \"legacy_wrapper_required\": false,\n"
     report = report + "  \"legacy_prototype_required\": false,\n"
-    report = report + "  \"active_node_helper_count\": 9,\n"
-    report = report + "  \"retired_node_helper_count\": 4,\n"
-    report = report + "  \"retired_node_helpers\": [\"native_gui_runtime_helper\", \"semantic_surface_helper\", \"static_surface_helper\", \"exec_surface_helper\"],\n"
-    report = report + "  \"standalone_node_helper_count\": 0,\n"
-    report = report + "  \"standalone_node_helpers\": [],\n"
-    report = report + "  \"active_node_helpers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"native_gui_replay_hit_inspector_helper\", \"exec_route_matrix_helper\", \"truth_route_helper\", \"truth_compare_helper\", \"truth_compare_matrix_helper\"]\n"
+    report = report + "  \"active_node_helper_count\": 6,\n"
+    report = report + "  \"retired_node_helper_count\": 7,\n"
+    report = report + "  \"retired_node_helpers\": [\"native_gui_runtime_helper\", \"native_gui_replay_hit_inspector_helper\", \"semantic_surface_helper\", \"static_surface_helper\", \"exec_surface_helper\", \"truth_compare_helper\", \"truth_compare_matrix_helper\"],\n"
+    report = report + "  \"standalone_node_helper_count\": 1,\n"
+    report = report + "  \"standalone_node_helpers\": [\"truth_runtime_helper\"],\n"
+    report = report + "  \"active_node_helpers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"exec_route_matrix_helper\", \"truth_route_helper\"]\n"
     report = report + "}\n"
     return v3path.v3WriteTextFile("", reportPath, report)
 
@@ -324,17 +1549,12 @@ fn r2cControllerCompile(root: str,
     let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
     let codegenHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")
     let nativeGuiBundleHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")
-    let truthRoutesHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")
-    let execRouteMatrixHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")
-    let truthCompareHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare.mjs")
-    let truthCompareMatrixHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-truth-compare-matrix.mjs")
     let tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
     let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
     let staticSummaryPath: str = os.joinPath(outDir, "static_surface.summary.env")
     let semanticSummaryPath: str = os.joinPath(outDir, "semantic_surface.summary.env")
     let codegenSummaryPath: str = os.joinPath(outDir, "codegen_surface.summary.env")
     let nativeGuiBundleSummaryPath: str = os.joinPath(outDir, "native_gui_bundle.summary.env")
-    let truthRoutesSummaryPath: str = os.joinPath(outDir, "truth_routes_v1.summary.env")
     let execRouteMatrixSummaryPath: str = os.joinPath(outDir, "exec_route_matrix.summary.env")
     let truthCompareSummaryPath: str = os.joinPath(outDir, "truth_compare.summary.env")
     let truthCompareMatrixSummaryPath: str = os.joinPath(outDir, "truth_compare_matrix.summary.env")
@@ -345,10 +1565,6 @@ fn r2cControllerCompile(root: str,
     var routeCatalogPath: str = os.joinPath(outDir, "cheng_codegen_route_catalog_v1.json")
     var execSnapshotPath: str = os.joinPath(outDir, "cheng_codegen_exec_snapshot_v1.json")
     var nativeGuiBundlePath: str = os.joinPath(outDir, "native_gui_bundle_v1.json")
-    var execRouteMatrixPath: str = os.joinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
-    var truthComparePath: str = os.joinPath(outDir, "truth_compare_v1.json")
-    var truthCompareMatrixPath: str = os.joinPath(outDir, "truth_compare_matrix_v1.json")
-    var truthRoutesPath: str = os.joinPath(outDir, "truth_routes_v1.json")
     var truthTracePath = ""
     var moduleCount: int32 = 0
     var routeCount: int32 = 0
@@ -478,125 +1694,56 @@ fn r2cControllerCompile(root: str,
     if strings.len(truthTraceRaw) <= 0:
         r2cControllerPrintErr("r2c-react-v3: missing --truth-trace")
         return 2
-
-    var truthCompareArgs: str[] = []
-    add(truthCompareArgs, "--exec-snapshot")
-    add(truthCompareArgs, execSnapshotPath)
-    add(truthCompareArgs, "--truth-trace")
-    add(truthCompareArgs, truthTracePath)
-    add(truthCompareArgs, "--codegen-manifest")
-    add(truthCompareArgs, codegenManifestPath)
-    add(truthCompareArgs, "--out")
-    add(truthCompareArgs, truthComparePath)
-    add(truthCompareArgs, "--summary-out")
-    add(truthCompareArgs, truthCompareSummaryPath)
+    let truthCompareControllerPath: str = v3path.v3PathAbsolute(effectiveRoot, "artifacts/v3_bootstrap/cheng.stage3")
+    if !v3path.v3PathFileExists(truthCompareControllerPath):
+        r2cControllerPrintErr("r2c-react-v3: missing stage3 controller for truth compare: " + truthCompareControllerPath)
+        return 2
+    let truthCompareControllerLogPath: str = os.joinPath(outDir, "truth_compare_controller.log")
+    var truthCompareControllerArgs: str[] = []
+    add(truthCompareControllerArgs, "r2c-react-v3")
+    add(truthCompareControllerArgs, "truth-compare")
+    add(truthCompareControllerArgs, "--repo")
+    add(truthCompareControllerArgs, repo)
+    add(truthCompareControllerArgs, "--out-dir")
+    add(truthCompareControllerArgs, outDir)
+    add(truthCompareControllerArgs, "--exec-snapshot")
+    add(truthCompareControllerArgs, execSnapshotPath)
+    add(truthCompareControllerArgs, "--codegen-manifest")
+    add(truthCompareControllerArgs, codegenManifestPath)
+    add(truthCompareControllerArgs, "--route-catalog")
+    add(truthCompareControllerArgs, routeCatalogPath)
+    add(truthCompareControllerArgs, "--truth-trace")
+    add(truthCompareControllerArgs, truthTracePath)
     if strings.len(truthState) > 0:
-        add(truthCompareArgs, "--truth-state")
-        add(truthCompareArgs, truthState)
-    let truthCompareLogPath: str = os.joinPath(outDir, "truth_compare.log")
-    if !r2cControllerRunNodeHelper(effectiveRoot, truthCompareHelper, truthCompareArgs, truthCompareLogPath, helperExitCode, helperOutput):
-        let reason: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_reason", "helper_failed")
-        truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
-        r2cControllerPrintErr("r2c-react-v3: truth compare failed")
+        add(truthCompareControllerArgs, "--truth-state")
+        add(truthCompareControllerArgs, truthState)
+    if strings.len(truthRoutesFileRaw) > 0:
+        add(truthCompareControllerArgs, "--truth-routes-file")
+        add(truthCompareControllerArgs, truthRoutesFileRaw)
+    if truthRoutesDiscover:
+        add(truthCompareControllerArgs, "--truth-routes-discover")
+    for i in 0..<runtimeRoots.len:
+        add(truthCompareControllerArgs, "--runtime-root")
+        add(truthCompareControllerArgs, runtimeRoots[i])
+    if !r2cproc.r2cProcessRunProgramLogged(effectiveRoot,
+                                           "r2c-react-v3 cheng controller",
+                                           truthCompareControllerPath,
+                                           truthCompareControllerArgs,
+                                           effectiveRoot,
+                                           truthCompareControllerLogPath,
+                                           helperExitCode,
+                                           helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: truth compare controller failed")
         if strings.len(helperOutput) > 0:
             r2cControllerPrintErr(helperOutput)
         return 2
 
-    truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
-    routeCount = 1
-    var finalHelperScript: str = truthCompareHelper
-    var finalHelperSummaryPath: str = truthCompareSummaryPath
-    var finalHelperLogPath: str = truthCompareLogPath
-    var finalArtifactPath: str = truthComparePath
-    var finalArtifactFormat = "truth_compare_v1"
-    var finalTruthCompareMatrixSummaryPath = ""
-
-    if truthRoutesDiscover:
-        var truthRoutesArgs: str[] = []
-        add(truthRoutesArgs, "--repo")
-        add(truthRoutesArgs, repo)
-        add(truthRoutesArgs, "--out")
-        add(truthRoutesArgs, truthRoutesPath)
-        add(truthRoutesArgs, "--summary-out")
-        add(truthRoutesArgs, truthRoutesSummaryPath)
-        for i in 0..<runtimeRoots.len:
-            add(truthRoutesArgs, "--runtime-root")
-            add(truthRoutesArgs, runtimeRoots[i])
-        let truthRoutesLogPath: str = os.joinPath(outDir, "truth_routes.log")
-        if !r2cControllerRunNodeHelper(effectiveRoot, truthRoutesHelper, truthRoutesArgs, truthRoutesLogPath, helperExitCode, helperOutput):
-            r2cControllerPrintErr("r2c-react-v3: truth route helper failed")
-            if strings.len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
-            return 1
-        truthRoutesPath = os.joinPath(outDir, "truth_routes_v1.json")
-    elif strings.len(truthRoutesFileRaw) > 0:
-        truthRoutesPath = v3path.v3PathAbsolute(repo, truthRoutesFileRaw)
-        if !v3path.v3PathFileExists(truthRoutesPath):
-            r2cControllerPrintErr("r2c-react-v3: missing truth routes: " + truthRoutesPath)
-            return 1
-
-    if truthRoutesDiscover || strings.len(truthRoutesFileRaw) > 0:
-        var execRouteMatrixArgs: str[] = []
-        add(execRouteMatrixArgs, "--route-catalog")
-        add(execRouteMatrixArgs, routeCatalogPath)
-        add(execRouteMatrixArgs, "--exec-snapshot")
-        add(execRouteMatrixArgs, execSnapshotPath)
-        add(execRouteMatrixArgs, "--truth-routes-file")
-        add(execRouteMatrixArgs, truthRoutesPath)
-        add(execRouteMatrixArgs, "--codegen-manifest")
-        add(execRouteMatrixArgs, codegenManifestPath)
-        add(execRouteMatrixArgs, "--truth-trace")
-        add(execRouteMatrixArgs, truthTracePath)
-        add(execRouteMatrixArgs, "--out")
-        add(execRouteMatrixArgs, execRouteMatrixPath)
-        add(execRouteMatrixArgs, "--summary-out")
-        add(execRouteMatrixArgs, execRouteMatrixSummaryPath)
-        let execRouteMatrixLogPath: str = os.joinPath(outDir, "exec_route_matrix.log")
-        if !r2cControllerRunNodeHelper(effectiveRoot, execRouteMatrixHelper, execRouteMatrixArgs, execRouteMatrixLogPath, helperExitCode, helperOutput):
-            r2cControllerPrintErr("r2c-react-v3: exec route matrix helper failed")
-            if strings.len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            if helperExitCode != 0:
-                return helperExitCode
-            return 1
-
-        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", "0"))
-        execRouteMatrixPath = os.joinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
-
-        var truthCompareMatrixArgs: str[] = []
-        add(truthCompareMatrixArgs, "--exec-route-matrix")
-        add(truthCompareMatrixArgs, execRouteMatrixPath)
-        add(truthCompareMatrixArgs, "--truth-trace")
-        add(truthCompareMatrixArgs, truthTracePath)
-        add(truthCompareMatrixArgs, "--codegen-manifest")
-        add(truthCompareMatrixArgs, codegenManifestPath)
-        add(truthCompareMatrixArgs, "--out")
-        add(truthCompareMatrixArgs, truthCompareMatrixPath)
-        add(truthCompareMatrixArgs, "--summary-out")
-        add(truthCompareMatrixArgs, truthCompareMatrixSummaryPath)
-        let truthCompareMatrixLogPath: str = os.joinPath(outDir, "truth_compare_matrix.log")
-        if !r2cControllerRunNodeHelper(effectiveRoot, truthCompareMatrixHelper, truthCompareMatrixArgs, truthCompareMatrixLogPath, helperExitCode, helperOutput):
-            let reason: str = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_reason", "helper_failed")
-            routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "route_count", intToStr(routeCount)))
-            truthCompareMatrixPath = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_path", truthCompareMatrixPath)
-            r2cControllerPrintErr("r2c-react-v3: truth compare matrix failed")
-            if strings.len(helperOutput) > 0:
-                r2cControllerPrintErr(helperOutput)
-            return 2
-
-        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "route_count", intToStr(routeCount)))
-        truthCompareMatrixPath = os.joinPath(outDir, "truth_compare_matrix_v1.json")
-        finalHelperScript = truthCompareMatrixHelper
-        finalHelperSummaryPath = truthCompareMatrixSummaryPath
-        finalHelperLogPath = truthCompareMatrixLogPath
-        finalArtifactPath = truthCompareMatrixPath
-        finalArtifactFormat = "truth_compare_matrix_v1"
-        finalTruthCompareMatrixSummaryPath = truthCompareMatrixSummaryPath
+    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath,
+                                                                       "route_count",
+                                                                       r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", "1")))
 
     let truthCompareOkText: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_ok", "")
-    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath, "truth_compare_matrix_ok", "")
+    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "truth_compare_matrix_ok", "")
     let nativeGuiLauncherModule: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_launcher_module", "")
     let nativeGuiHostReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_host_ready", "")
     let nativeGuiRendererReadyText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_renderer_ready", "")
@@ -629,9 +1776,13 @@ fn r2cControllerCompile(root: str,
     let nativeGuiNativeLayoutPlanSourceBackedItemCountText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_source_backed_item_count", "0")
     let nativeGuiNativeLayoutPlanScrollHeightText: str = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_native_layout_plan_scroll_height", "0")
     var finalRouteCountText: str = intToStr(routeCount)
-    if strings.len(finalTruthCompareMatrixSummaryPath) > 0:
-        finalRouteCountText = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath, "route_count", finalRouteCountText)
-    elif truthRoutesDiscover || strings.len(truthRoutesFileRaw) > 0:
+    var hasTruthRoutesInput: bool = truthRoutesDiscover
+    if !hasTruthRoutesInput:
+        if strings.len(truthRoutesFileRaw) > 0:
+            hasTruthRoutesInput = true
+    if v3path.v3PathFileExists(truthCompareMatrixSummaryPath):
+        finalRouteCountText = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath, "route_count", finalRouteCountText)
+    elif hasTruthRoutesInput:
         finalRouteCountText = r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", finalRouteCountText)
     if strings.len(finalRouteCountText) <= 0:
         finalRouteCountText = "0"
@@ -724,6 +1875,1179 @@ fn r2cControllerStatus(root: str,
         return 1
     let body: str = v3path.v3ReadTextFile("", outPath)
     r2cControllerPrintLine(body)
+    return 0
+
+fn r2cControllerCodegenSurface(root: str,
+                               args: str[]): int32 =
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let tsxAstFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--tsx-ast", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    if strings.len(tsxAstFlag) > 0:
+        tsxAstPath = v3path.v3PathAbsolute(repo, tsxAstFlag)
+    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let codegenHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let codegenSummaryPath: str = os.joinPath(outDir, "codegen_surface.summary.env")
+    let reportPath: str = os.joinPath(outDir, "codegen_surface_report_v1.json")
+    let frontendLogPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    let codegenLogPath: str = os.joinPath(outDir, "codegen_surface.log")
+    var codegenManifestPath: str = os.joinPath(outDir, "cheng_codegen_v1.json")
+    var routeCount: int32 = 0
+    var moduleCount: int32 = 0
+    var typescriptVersion = ""
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    if !v3path.v3PathFileExists(tsxAstPath):
+        var frontendArgs: str[] = []
+        add(frontendArgs, "--repo")
+        add(frontendArgs, repo)
+        add(frontendArgs, "--out")
+        add(frontendArgs, tsxAstPath)
+        add(frontendArgs, "--summary-out")
+        add(frontendArgs, tsxSummaryPath)
+        for i in 0..<runtimeRoots.len:
+            add(frontendArgs, "--runtime-root")
+            add(frontendArgs, runtimeRoots[i])
+        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+
+    var codegenArgs: str[] = []
+    add(codegenArgs, "--repo")
+    add(codegenArgs, repo)
+    add(codegenArgs, "--out-dir")
+    add(codegenArgs, outDir)
+    add(codegenArgs, "--tsx-ast")
+    add(codegenArgs, tsxAstPath)
+    add(codegenArgs, "--summary-out")
+    add(codegenArgs, codegenSummaryPath)
+    for i in 0..<runtimeRoots.len:
+        add(codegenArgs, "--runtime-root")
+        add(codegenArgs, runtimeRoots[i])
+    if strings.len(truthTraceRaw) > 0:
+        let truthTracePath: str = v3path.v3PathAbsolute(repo, truthTraceRaw)
+        if !v3path.v3PathFileExists(truthTracePath):
+            r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+            return 1
+        add(codegenArgs, "--truth-trace")
+        add(codegenArgs, truthTracePath)
+    if !r2cControllerRunNodeHelper(effectiveRoot, codegenHelper, codegenArgs, codegenLogPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: codegen surface helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(codegenSummaryPath, "module_count", "0"))
+    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(codegenSummaryPath, "route_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(codegenSummaryPath, "typescript_version", "")
+    codegenManifestPath = r2cControllerReadSummaryValue(codegenSummaryPath, "codegen_manifest_path", codegenManifestPath)
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"codegen-surface\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(codegenHelper) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(codegenSummaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(codegenLogPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(codegenManifestPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"cheng_codegen_v1\",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerDiscoverTruthRoutes(root: str,
+                                    args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let helperScript: str = os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")
+    let artifactPath: str = os.joinPath(outDir, "truth_routes_v1.json")
+    let summaryPath: str = os.joinPath(outDir, "truth_routes_v1.summary.env")
+    let reportPath: str = os.joinPath(outDir, "truth_routes_report_v1.json")
+    let logPath: str = os.joinPath(outDir, "truth_routes.log")
+    var routeCount: int32 = 0
+    var typescriptVersion = ""
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    var helperArgs: str[] = []
+    add(helperArgs, "--repo")
+    add(helperArgs, repo)
+    add(helperArgs, "--out")
+    add(helperArgs, artifactPath)
+    add(helperArgs, "--summary-out")
+    add(helperArgs, summaryPath)
+    for i in 0..<runtimeRoots.len:
+        add(helperArgs, "--runtime-root")
+        add(helperArgs, runtimeRoots[i])
+    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: truth route helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(summaryPath, "route_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(summaryPath, "typescript_version", "")
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"discover-truth-routes\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"truth_routes_v1\",\n"
+    report = report + "  \"module_count\": 0,\n"
+    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerFrontend(root: str,
+                         args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let helperScript: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let artifactPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    let summaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let reportPath: str = os.joinPath(outDir, "frontend_report_v1.json")
+    let logPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    var moduleCount: int32 = 0
+    var typescriptVersion = ""
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    var helperArgs: str[] = []
+    add(helperArgs, "--repo")
+    add(helperArgs, repo)
+    add(helperArgs, "--out")
+    add(helperArgs, artifactPath)
+    add(helperArgs, "--summary-out")
+    add(helperArgs, summaryPath)
+    for i in 0..<runtimeRoots.len:
+        add(helperArgs, "--runtime-root")
+        add(helperArgs, runtimeRoots[i])
+    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(summaryPath, "module_count", "0"))
+    typescriptVersion = r2cControllerReadSummaryValue(summaryPath, "typescript_version", "")
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"frontend\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(artifactPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"tsx_ast_v1\",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"route_count\": 0,\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerStaticSurface(root: str,
+                              args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let tsxAstFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--tsx-ast", ""))
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let assetRoots: str[] = r2cControllerCollectCmdlineFlagValues("--asset-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    if strings.len(tsxAstFlag) > 0:
+        tsxAstPath = v3path.v3PathAbsolute(repo, tsxAstFlag)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let frontendLogPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    let summaryPath: str = os.joinPath(outDir, "static_surface.summary.env")
+    let logPath: str = os.joinPath(outDir, "static_surface.log")
+    let reportPath: str = os.joinPath(outDir, "static_surface_report_v1.json")
+    let moduleInventoryPath: str = os.joinPath(outDir, "module_inventory_v1.json")
+    var moduleCount: int32 = 0
+    var assetCount: int32 = 0
+    var tailwindTokenCount: int32 = 0
+    var requiredHostGroupCount: int32 = 0
+    var requiredHostGroupsCsv = ""
+    var typescriptVersion = ""
+    var frontendRan = false
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    if strings.len(tsxAstFlag) <= 0:
+        frontendRan = true
+        var frontendArgs: str[] = []
+        add(frontendArgs, "--repo")
+        add(frontendArgs, repo)
+        add(frontendArgs, "--out")
+        add(frontendArgs, tsxAstPath)
+        add(frontendArgs, "--summary-out")
+        add(frontendArgs, tsxSummaryPath)
+        for i in 0..<runtimeRoots.len:
+            add(frontendArgs, "--runtime-root")
+            add(frontendArgs, runtimeRoots[i])
+        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+        moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
+        typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
+
+    var staticSurface: r2csurface.R2cStaticSurfaceRunResult
+    if !r2csurface.r2cRunStaticSurface(repo, outDir, tsxAstPath, summaryPath, assetRoots, staticSurface):
+        r2cControllerPrintErr("r2c-react-v3: static surface failed")
+        if strings.len(staticSurface.message) > 0:
+            r2cControllerPrintErr(staticSurface.message)
+        return 1
+    if moduleCount <= 0:
+        moduleCount = staticSurface.moduleCount
+    assetCount = staticSurface.assetCount
+    tailwindTokenCount = staticSurface.tailwindTokenCount
+    requiredHostGroupCount = staticSurface.requiredHostGroupCount
+    requiredHostGroupsCsv = staticSurface.requiredHostGroupsCsv
+    if strings.len(staticSurface.typescriptVersion) > 0:
+        typescriptVersion = staticSurface.typescriptVersion
+
+    var logText = ""
+    logText = logText + "controller=static-surface\n"
+    logText = logText + "repo_root=" + repo + "\n"
+    logText = logText + "out_dir=" + outDir + "\n"
+    logText = logText + "tsx_ast_path=" + tsxAstPath + "\n"
+    logText = logText + "frontend_ran=" + r2cControllerJsonBool(frontendRan) + "\n"
+    logText = logText + "summary_path=" + summaryPath + "\n"
+    if !v3path.v3WriteTextFile("", logPath, logText):
+        r2cControllerPrintErr("r2c-react-v3: static surface failed to write log: " + logPath)
+        return 1
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"static-surface\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(moduleInventoryPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"module_inventory_v1\",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"route_count\": 0,\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": " + intToStr(assetCount) + ",\n"
+    report = report + "  \"tailwind_token_count\": " + intToStr(tailwindTokenCount) + ",\n"
+    report = report + "  \"required_host_group_count\": " + intToStr(requiredHostGroupCount) + ",\n"
+    report = report + "  \"required_host_groups\": " + r2cControllerJsonArrayFromCsv(requiredHostGroupsCsv) + ",\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerSemanticSurface(root: str,
+                                args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let tsxAstFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--tsx-ast", ""))
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var tsxAstPath: str = os.joinPath(outDir, "tsx_ast_v1.json")
+    if strings.len(tsxAstFlag) > 0:
+        tsxAstPath = v3path.v3PathAbsolute(repo, tsxAstFlag)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let tsxHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")
+    let tsxSummaryPath: str = os.joinPath(outDir, "tsx_ast_v1.summary.env")
+    let frontendLogPath: str = os.joinPath(outDir, "tsx_frontend.log")
+    let summaryPath: str = os.joinPath(outDir, "semantic_surface.summary.env")
+    let logPath: str = os.joinPath(outDir, "semantic_surface.log")
+    let reportPath: str = os.joinPath(outDir, "semantic_surface_report_v1.json")
+    let rsgPath: str = os.joinPath(outDir, "rsg_v1.json")
+    let blockerReportPath: str = os.joinPath(outDir, "compile_blockers_v1.json")
+    var moduleCount: int32 = 0
+    var rsgNodeCount: int32 = 0
+    var rsgEdgeCount: int32 = 0
+    var blockerCount: int32 = 0
+    var blocked = false
+    var typescriptVersion = ""
+    var frontendRan = false
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    if strings.len(tsxAstFlag) <= 0:
+        frontendRan = true
+        var frontendArgs: str[] = []
+        add(frontendArgs, "--repo")
+        add(frontendArgs, repo)
+        add(frontendArgs, "--out")
+        add(frontendArgs, tsxAstPath)
+        add(frontendArgs, "--summary-out")
+        add(frontendArgs, tsxSummaryPath)
+        for i in 0..<runtimeRoots.len:
+            add(frontendArgs, "--runtime-root")
+            add(frontendArgs, runtimeRoots[i])
+        if !r2cControllerRunNodeHelper(effectiveRoot, tsxHelper, frontendArgs, frontendLogPath, helperExitCode, helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: tsx frontend helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+        moduleCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(tsxSummaryPath, "module_count", "0"))
+        typescriptVersion = r2cControllerReadSummaryValue(tsxSummaryPath, "typescript_version", "")
+
+    var semanticSurface: r2csurface.R2cSemanticSurfaceRunResult
+    if !r2csurface.r2cRunSemanticSurface(repo, outDir, tsxAstPath, summaryPath, semanticSurface):
+        r2cControllerPrintErr("r2c-react-v3: semantic surface failed")
+        if strings.len(semanticSurface.message) > 0:
+            r2cControllerPrintErr(semanticSurface.message)
+        return 1
+    if moduleCount <= 0:
+        moduleCount = semanticSurface.moduleCount
+    rsgNodeCount = semanticSurface.rsgNodeCount
+    rsgEdgeCount = semanticSurface.rsgEdgeCount
+    blockerCount = semanticSurface.blockerCount
+    blocked = semanticSurface.blocked
+    if strings.len(semanticSurface.typescriptVersion) > 0:
+        typescriptVersion = semanticSurface.typescriptVersion
+
+    var logText = ""
+    logText = logText + "controller=semantic-surface\n"
+    logText = logText + "repo_root=" + repo + "\n"
+    logText = logText + "out_dir=" + outDir + "\n"
+    logText = logText + "tsx_ast_path=" + tsxAstPath + "\n"
+    logText = logText + "frontend_ran=" + r2cControllerJsonBool(frontendRan) + "\n"
+    logText = logText + "summary_path=" + summaryPath + "\n"
+    logText = logText + "entry_module=" + semanticSurface.entryModule + "\n"
+    if !v3path.v3WriteTextFile("", logPath, logText):
+        r2cControllerPrintErr("r2c-react-v3: semantic surface failed to write log: " + logPath)
+        return 1
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"semantic-surface\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(rsgPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"rsg_v1\",\n"
+    report = report + "  \"module_count\": " + intToStr(moduleCount) + ",\n"
+    report = report + "  \"route_count\": 0,\n"
+    report = report + "  \"semantic_nodes_count\": 0,\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": " + intToStr(rsgNodeCount) + ",\n"
+    report = report + "  \"rsg_edge_count\": " + intToStr(rsgEdgeCount) + ",\n"
+    report = report + "  \"blocker_count\": " + intToStr(blockerCount) + ",\n"
+    report = report + "  \"blocked\": " + r2cControllerJsonBool(blocked) + ",\n"
+    report = report + "  \"typescript_version\": " + r2cControllerJsonQuote(typescriptVersion) + ",\n"
+    report = report + "  \"entry_module\": " + r2cControllerJsonQuote(semanticSurface.entryModule) + ",\n"
+    report = report + "  \"blocker_report_path\": " + r2cControllerJsonQuote(blockerReportPath) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerCaptureTruth(root: str,
+                             args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let routeState: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--route", ""))
+    if strings.len(routeState) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: capture-truth missing --route")
+        return 1
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    let defaultOutDir: str = v3path.v3PathAbsolute(repo, "build/r2c_react_v3_cheng/truth/" + routeState)
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", defaultOutDir))
+    let baseUrl: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--base-url", ""))
+    let chromePath: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--chrome", ""))
+    let width: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--width", ""))
+    let height: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--height", ""))
+    let truthFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-flag", ""))
+    let debugPort: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--debug-port", ""))
+    let waitMs: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--wait-ms", ""))
+    let outDir: str = v3path.v3PathAbsolute(repo, outDirFlag)
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let helperScript: str = os.joinPath(experimentalRoot, "r2c-react-v3-truth-runtime.mjs")
+    let summaryPath: str = os.joinPath(outDir, routeState + ".summary.env")
+    let reportPath: str = os.joinPath(outDir, "capture_truth_report_v1.json")
+    let logPath: str = os.joinPath(outDir, "truth_runtime.log")
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    if !os.dirExists(repo):
+        r2cControllerPrintErr("r2c-react-v3: missing repo: " + repo)
+        return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+
+    var helperArgs: str[] = []
+    add(helperArgs, "--route")
+    add(helperArgs, routeState)
+    add(helperArgs, "--out-dir")
+    add(helperArgs, outDir)
+    add(helperArgs, "--summary-out")
+    add(helperArgs, summaryPath)
+    if strings.len(baseUrl) > 0:
+        add(helperArgs, "--base-url")
+        add(helperArgs, baseUrl)
+    if strings.len(chromePath) > 0:
+        add(helperArgs, "--chrome")
+        add(helperArgs, chromePath)
+    if strings.len(width) > 0:
+        add(helperArgs, "--width")
+        add(helperArgs, width)
+    if strings.len(height) > 0:
+        add(helperArgs, "--height")
+        add(helperArgs, height)
+    if strings.len(truthFlag) > 0:
+        add(helperArgs, "--truth-flag")
+        add(helperArgs, truthFlag)
+    if strings.len(debugPort) > 0:
+        add(helperArgs, "--debug-port")
+        add(helperArgs, debugPort)
+    if strings.len(waitMs) > 0:
+        add(helperArgs, "--wait-ms")
+        add(helperArgs, waitMs)
+    if !r2cControllerRunNodeHelper(effectiveRoot, helperScript, helperArgs, logPath, helperExitCode, helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: truth runtime helper failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+
+    let truthTracePath: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_path", "")
+    let truthTraceFormat: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_format", "truth_trace_v2")
+    let truthTraceStateCountText: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_state_count", "1")
+    let runtimeStatePath: str = r2cControllerReadSummaryValue(summaryPath, "runtime_state_path", "")
+    let domPath: str = r2cControllerReadSummaryValue(summaryPath, "dom_path", "")
+    let semanticNodesPath: str = r2cControllerReadSummaryValue(summaryPath, "semantic_nodes_path", "")
+    let metaPath: str = r2cControllerReadSummaryValue(summaryPath, "runtime_meta_path", "")
+    let domHash: str = r2cControllerReadSummaryValue(summaryPath, "dom_hash", "")
+    let pathname: str = r2cControllerReadSummaryValue(summaryPath, "pathname", "")
+    let searchText: str = r2cControllerReadSummaryValue(summaryPath, "search", "")
+    let hashText: str = r2cControllerReadSummaryValue(summaryPath, "hash", "")
+    let semanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_nodes_count", "0")
+    let documentNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "document_nodes_count", "0")
+
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"capture-truth\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"primary_artifact_format\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
+    report = report + "  \"module_count\": 0,\n"
+    report = report + "  \"route_count\": " + truthTraceStateCountText + ",\n"
+    report = report + "  \"semantic_nodes_count\": " + semanticNodesCountText + ",\n"
+    report = report + "  \"asset_count\": 0,\n"
+    report = report + "  \"tailwind_token_count\": 0,\n"
+    report = report + "  \"required_host_group_count\": 0,\n"
+    report = report + "  \"required_host_groups\": [],\n"
+    report = report + "  \"rsg_node_count\": 0,\n"
+    report = report + "  \"rsg_edge_count\": 0,\n"
+    report = report + "  \"blocker_count\": 0,\n"
+    report = report + "  \"blocked\": false,\n"
+    report = report + "  \"typescript_version\": \"\",\n"
+    report = report + "  \"truth_route\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"truth_trace_format\": " + r2cControllerJsonQuote(truthTraceFormat) + ",\n"
+    report = report + "  \"runtime_state_path\": " + r2cControllerJsonQuote(runtimeStatePath) + ",\n"
+    report = report + "  \"dom_path\": " + r2cControllerJsonQuote(domPath) + ",\n"
+    report = report + "  \"semantic_nodes_path\": " + r2cControllerJsonQuote(semanticNodesPath) + ",\n"
+    report = report + "  \"runtime_meta_path\": " + r2cControllerJsonQuote(metaPath) + ",\n"
+    report = report + "  \"dom_hash\": " + r2cControllerJsonQuote(domHash) + ",\n"
+    report = report + "  \"document_nodes_count\": " + documentNodesCountText + ",\n"
+    report = report + "  \"pathname\": " + r2cControllerJsonQuote(pathname) + ",\n"
+    report = report + "  \"search\": " + r2cControllerJsonQuote(searchText) + ",\n"
+    report = report + "  \"hash\": " + r2cControllerJsonQuote(hashText) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerCompareTruthCompat(root: str,
+                                   args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let execSnapshotRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--exec-snapshot", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    let codegenManifestRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--codegen-manifest", ""))
+    let truthState: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-state", ""))
+    if strings.len(execSnapshotRaw) <= 0 || strings.len(truthTraceRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: compare-truth missing --exec-snapshot or --truth-trace")
+        return 1
+    let execSnapshotPath: str = v3path.v3PathAbsolute(currentDir, execSnapshotRaw)
+    let truthTracePath: str = v3path.v3PathAbsolute(currentDir, truthTraceRaw)
+    if !v3path.v3PathFileExists(execSnapshotPath):
+        r2cControllerPrintErr("r2c-react-v3: missing exec snapshot: " + execSnapshotPath)
+        return 1
+    if !v3path.v3PathFileExists(truthTracePath):
+        r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+        return 1
+    var codegenManifestPath = ""
+    if strings.len(codegenManifestRaw) > 0:
+        codegenManifestPath = v3path.v3PathAbsolute(currentDir, codegenManifestRaw)
+        if !v3path.v3PathFileExists(codegenManifestPath):
+            r2cControllerPrintErr("r2c-react-v3: missing codegen manifest: " + codegenManifestPath)
+            return 1
+    let outRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out",
+                                                                     os.joinPath(v3path.v3PathParentDir(execSnapshotPath),
+                                                                                 "truth_compare_v1.json")))
+    let truthComparePath: str = v3path.v3PathAbsolute(currentDir, outRaw)
+    let outDir: str = v3path.v3PathParentDir(truthComparePath)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let summaryPath: str = os.joinPath(outDir, "truth_compare.summary.env")
+    let reportPath: str = os.joinPath(outDir, "compare_truth_report_v1.json")
+    if !r2cControllerWriteCompareTruthDirect(execSnapshotPath,
+                                             truthTracePath,
+                                             truthState,
+                                             truthComparePath,
+                                             summaryPath):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth failed")
+        return 2
+    let semanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "exec_semantic_nodes_count", "0")
+    let execSnapshotSemanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "exec_snapshot_semantic_nodes_count", semanticNodesCountText)
+    let truthSemanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "truth_semantic_nodes_count", "0")
+    let truthTraceSemanticNodesCountText: str = r2cControllerReadSummaryValue(summaryPath, "truth_trace_semantic_nodes_count", truthSemanticNodesCountText)
+    let semanticNodeCountCompareBasis: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_count_compare_basis", "")
+    let truthCompareOkText: str = r2cControllerReadSummaryValue(summaryPath, "truth_compare_ok", "")
+    let truthCompareReason: str = r2cControllerReadSummaryValue(summaryPath, "truth_compare_reason", "")
+    let execLayoutSurfacePath: str = r2cControllerReadSummaryValue(summaryPath, "exec_layout_surface_path", "")
+    let truthSemanticNodesPath: str = r2cControllerReadSummaryValue(summaryPath, "truth_semantic_nodes_path", "")
+    let semanticNodeDiffReadyText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_ready", "")
+    let semanticNodeDiffPath: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_path", "")
+    let semanticNodeDiffBasis: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_basis", "")
+    let semanticNodeDiffExecNodeCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_exec_node_count", "0")
+    let semanticNodeDiffTruthNodeCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_truth_node_count", "0")
+    let semanticNodeDiffSharedCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_shared_count", "0")
+    let semanticNodeDiffExecOnlyCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_exec_only_count", "0")
+    let semanticNodeDiffTruthOnlyCountText: str = r2cControllerReadSummaryValue(summaryPath, "semantic_node_diff_truth_only_count", "0")
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"compare-truth\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"truth_state\": " + r2cControllerJsonQuote(truthState) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(truthComparePath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"truth_compare_v1\",\n"
+    report = report + "  \"route_count\": 1,\n"
+    report = report + "  \"semantic_nodes_count\": " + semanticNodesCountText + ",\n"
+    report = report + "  \"semantic_node_count_compare_basis\": " + r2cControllerJsonQuote(semanticNodeCountCompareBasis) + ",\n"
+    report = report + "  \"exec_snapshot_semantic_nodes_count\": " + execSnapshotSemanticNodesCountText + ",\n"
+    report = report + "  \"truth_semantic_nodes_count\": " + truthSemanticNodesCountText + ",\n"
+    report = report + "  \"truth_trace_semantic_nodes_count\": " + truthTraceSemanticNodesCountText + ",\n"
+    report = report + "  \"exec_layout_surface_path\": " + r2cControllerJsonQuote(execLayoutSurfacePath) + ",\n"
+    report = report + "  \"truth_semantic_nodes_path\": " + r2cControllerJsonQuote(truthSemanticNodesPath) + ",\n"
+    if semanticNodeDiffReadyText == "true" || semanticNodeDiffReadyText == "false":
+        report = report + "  \"semantic_node_diff_ready\": " + semanticNodeDiffReadyText + ",\n"
+    else:
+        report = report + "  \"semantic_node_diff_ready\": null,\n"
+    report = report + "  \"semantic_node_diff_path\": " + r2cControllerJsonQuote(semanticNodeDiffPath) + ",\n"
+    report = report + "  \"semantic_node_diff_basis\": " + r2cControllerJsonQuote(semanticNodeDiffBasis) + ",\n"
+    report = report + "  \"semantic_node_diff_exec_node_count\": " + semanticNodeDiffExecNodeCountText + ",\n"
+    report = report + "  \"semantic_node_diff_truth_node_count\": " + semanticNodeDiffTruthNodeCountText + ",\n"
+    report = report + "  \"semantic_node_diff_shared_count\": " + semanticNodeDiffSharedCountText + ",\n"
+    report = report + "  \"semantic_node_diff_exec_only_count\": " + semanticNodeDiffExecOnlyCountText + ",\n"
+    report = report + "  \"semantic_node_diff_truth_only_count\": " + semanticNodeDiffTruthOnlyCountText + ",\n"
+    if truthCompareOkText == "true" || truthCompareOkText == "false":
+        report = report + "  \"truth_compare_ok\": " + truthCompareOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_ok\": null,\n"
+    report = report + "  \"truth_compare_reason\": " + r2cControllerJsonQuote(truthCompareReason) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerExecRouteMatrix(root: str,
+                                args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let tsxAstRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--tsx-ast", ""))
+    let routeCatalogRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--route-catalog", ""))
+    let execSnapshotRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--exec-snapshot", ""))
+    let truthRoutesRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-routes-file", ""))
+    let codegenManifestRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--codegen-manifest", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    if (strings.len(routeCatalogRaw) <= 0 && strings.len(tsxAstRaw) <= 0) ||
+       strings.len(execSnapshotRaw) <= 0 ||
+       strings.len(truthRoutesRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: exec-route-matrix missing (--route-catalog or --tsx-ast), --exec-snapshot, or --truth-routes-file")
+        return 1
+    var tsxAstPath = ""
+    if strings.len(tsxAstRaw) > 0:
+        tsxAstPath = v3path.v3PathAbsolute(currentDir, tsxAstRaw)
+        if !v3path.v3PathFileExists(tsxAstPath):
+            r2cControllerPrintErr("r2c-react-v3: missing tsx ast: " + tsxAstPath)
+            return 1
+    var routeCatalogPath = ""
+    if strings.len(routeCatalogRaw) > 0:
+        routeCatalogPath = v3path.v3PathAbsolute(currentDir, routeCatalogRaw)
+        if !v3path.v3PathFileExists(routeCatalogPath):
+            r2cControllerPrintErr("r2c-react-v3: missing route catalog: " + routeCatalogPath)
+            return 1
+    let execSnapshotPath: str = v3path.v3PathAbsolute(currentDir, execSnapshotRaw)
+    let truthRoutesPath: str = v3path.v3PathAbsolute(currentDir, truthRoutesRaw)
+    if !v3path.v3PathFileExists(execSnapshotPath):
+        r2cControllerPrintErr("r2c-react-v3: missing exec snapshot: " + execSnapshotPath)
+        return 1
+    if !v3path.v3PathFileExists(truthRoutesPath):
+        r2cControllerPrintErr("r2c-react-v3: missing truth routes: " + truthRoutesPath)
+        return 1
+    var codegenManifestPath = ""
+    if strings.len(codegenManifestRaw) > 0:
+        codegenManifestPath = v3path.v3PathAbsolute(currentDir, codegenManifestRaw)
+        if !v3path.v3PathFileExists(codegenManifestPath):
+            r2cControllerPrintErr("r2c-react-v3: missing codegen manifest: " + codegenManifestPath)
+            return 1
+    var truthTracePath = ""
+    if strings.len(truthTraceRaw) > 0:
+        truthTracePath = v3path.v3PathAbsolute(currentDir, truthTraceRaw)
+        if !v3path.v3PathFileExists(truthTracePath):
+            r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+            return 1
+    let outRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out",
+                                                                     os.joinPath(v3path.v3PathParentDir(execSnapshotPath),
+                                                                                 "cheng_codegen_exec_route_matrix_v1.json")))
+    let execRouteMatrixPath: str = v3path.v3PathAbsolute(currentDir, outRaw)
+    let outDir: str = v3path.v3PathParentDir(execRouteMatrixPath)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let helperScript: str = os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")
+    let summaryPath: str = os.joinPath(outDir, "exec_route_matrix.summary.env")
+    let logPath: str = os.joinPath(outDir, "exec_route_matrix.log")
+    let reportPath: str = os.joinPath(outDir, "exec_route_matrix_report_v1.json")
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    var helperArgs: str[] = []
+    add(helperArgs, "--exec-snapshot")
+    add(helperArgs, execSnapshotPath)
+    add(helperArgs, "--truth-routes-file")
+    add(helperArgs, truthRoutesPath)
+    add(helperArgs, "--out")
+    add(helperArgs, execRouteMatrixPath)
+    add(helperArgs, "--summary-out")
+    add(helperArgs, summaryPath)
+    if strings.len(routeCatalogPath) > 0:
+        add(helperArgs, "--route-catalog")
+        add(helperArgs, routeCatalogPath)
+    else:
+        add(helperArgs, "--tsx-ast")
+        add(helperArgs, tsxAstPath)
+    if strings.len(codegenManifestPath) > 0:
+        add(helperArgs, "--codegen-manifest")
+        add(helperArgs, codegenManifestPath)
+    if strings.len(truthTracePath) > 0:
+        add(helperArgs, "--truth-trace")
+        add(helperArgs, truthTracePath)
+    if !r2cControllerRunNodeHelper(effectiveRoot,
+                                   helperScript,
+                                   helperArgs,
+                                   logPath,
+                                   helperExitCode,
+                                   helperOutput):
+        r2cControllerPrintErr("r2c-react-v3: exec-route-matrix failed")
+        if strings.len(helperOutput) > 0:
+            r2cControllerPrintErr(helperOutput)
+        if helperExitCode != 0:
+            return helperExitCode
+        return 1
+    let routeCountText: str = r2cControllerReadSummaryValue(summaryPath, "route_count", "0")
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"exec-route-matrix\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    report = report + "  \"truth_routes_path\": " + r2cControllerJsonQuote(truthRoutesPath) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helperScript) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(execRouteMatrixPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"cheng_codegen_exec_route_matrix_v1\",\n"
+    report = report + "  \"route_count\": " + routeCountText + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerCompareTruthMatrixCompat(root: str,
+                                         args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let execRouteMatrixRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--exec-route-matrix", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    let codegenManifestRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--codegen-manifest", ""))
+    if strings.len(execRouteMatrixRaw) <= 0 || strings.len(truthTraceRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix missing --exec-route-matrix or --truth-trace")
+        return 1
+    let execRouteMatrixPath: str = v3path.v3PathAbsolute(currentDir, execRouteMatrixRaw)
+    let truthTracePath: str = v3path.v3PathAbsolute(currentDir, truthTraceRaw)
+    if !v3path.v3PathFileExists(execRouteMatrixPath):
+        r2cControllerPrintErr("r2c-react-v3: missing exec route matrix: " + execRouteMatrixPath)
+        return 1
+    if !v3path.v3PathFileExists(truthTracePath):
+        r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+        return 1
+    var codegenManifestPath = ""
+    if strings.len(codegenManifestRaw) > 0:
+        codegenManifestPath = v3path.v3PathAbsolute(currentDir, codegenManifestRaw)
+        if !v3path.v3PathFileExists(codegenManifestPath):
+            r2cControllerPrintErr("r2c-react-v3: missing codegen manifest: " + codegenManifestPath)
+            return 1
+    let outRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out",
+                                                                     os.joinPath(v3path.v3PathParentDir(execRouteMatrixPath),
+                                                                                 "truth_compare_matrix_v1.json")))
+    let truthCompareMatrixPath: str = v3path.v3PathAbsolute(currentDir, outRaw)
+    let outDir: str = v3path.v3PathParentDir(truthCompareMatrixPath)
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let summaryPath: str = os.joinPath(outDir, "truth_compare_matrix.summary.env")
+    let reportPath: str = os.joinPath(outDir, "compare_truth_matrix_report_v1.json")
+    if !r2cControllerWriteTruthCompareMatrixArtifacts(execRouteMatrixPath,
+                                                      truthTracePath,
+                                                      truthCompareMatrixPath,
+                                                      summaryPath):
+        r2cControllerPrintErr("r2c-react-v3: compare-truth-matrix failed")
+        return 2
+    let routeCountText: str = r2cControllerReadSummaryValue(summaryPath, "route_count", "0")
+    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(summaryPath, "truth_compare_matrix_ok", "")
+    let truthCompareMatrixReason: str = r2cControllerReadSummaryValue(summaryPath, "truth_compare_matrix_reason", "")
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"compare-truth-matrix\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"exec_route_matrix_path\": " + r2cControllerJsonQuote(execRouteMatrixPath) + ",\n"
+    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote("") + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(truthCompareMatrixPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": \"truth_compare_matrix_v1\",\n"
+    report = report + "  \"route_count\": " + routeCountText + ",\n"
+    if truthCompareMatrixOkText == "true" || truthCompareMatrixOkText == "false":
+        report = report + "  \"truth_compare_matrix_ok\": " + truthCompareMatrixOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_matrix_ok\": null,\n"
+    report = report + "  \"truth_compare_matrix_reason\": " + r2cControllerJsonQuote(truthCompareMatrixReason) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
+    return 0
+
+fn r2cControllerTruthCompare(root: str,
+                             args: str[]): int32 =
+    args
+    let effectiveRoot: str = r2cControllerEffectiveRoot(root)
+    let currentDir: str = v3path.v3PathCurrentDir()
+    let repoBase: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--repo", currentDir))
+    let outDirFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out-dir", ""))
+    let execSnapshotRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--exec-snapshot", ""))
+    let codegenManifestRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--codegen-manifest", ""))
+    let routeCatalogRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--route-catalog", ""))
+    let truthTraceRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-trace", ""))
+    let truthState: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-state", ""))
+    let truthRoutesFileRaw: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--truth-routes-file", ""))
+    let truthRoutesDiscover: bool = cmdline.hasFlag("--truth-routes-discover")
+    let runtimeRoots: str[] = r2cControllerCollectCmdlineFlagValues("--runtime-root")
+    let repo: str = v3path.v3PathAbsolute(effectiveRoot, repoBase)
+    var outDir: str = r2cControllerDefaultOutDir(repo)
+    if strings.len(outDirFlag) > 0:
+        outDir = v3path.v3PathAbsolute(repo, outDirFlag)
+    var execSnapshotPath: str = os.joinPath(outDir, "cheng_codegen_exec_snapshot_v1.json")
+    var codegenManifestPath: str = os.joinPath(outDir, "cheng_codegen_v1.json")
+    var routeCatalogPath: str = os.joinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+    if strings.len(execSnapshotRaw) > 0:
+        execSnapshotPath = v3path.v3PathAbsolute(repo, execSnapshotRaw)
+    if strings.len(codegenManifestRaw) > 0:
+        codegenManifestPath = v3path.v3PathAbsolute(repo, codegenManifestRaw)
+    if strings.len(routeCatalogRaw) > 0:
+        routeCatalogPath = v3path.v3PathAbsolute(repo, routeCatalogRaw)
+    if strings.len(truthTraceRaw) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: missing --truth-trace")
+        return 2
+    let truthTracePath: str = v3path.v3PathAbsolute(repo, truthTraceRaw)
+    if !v3path.v3PathFileExists(execSnapshotPath):
+        r2cControllerPrintErr("r2c-react-v3: missing exec snapshot: " + execSnapshotPath)
+        return 1
+    if !v3path.v3PathFileExists(truthTracePath):
+        r2cControllerPrintErr("r2c-react-v3: missing truth trace: " + truthTracePath)
+        return 1
+    if strings.len(codegenManifestPath) > 0:
+        if !v3path.v3PathFileExists(codegenManifestPath):
+            r2cControllerPrintErr("r2c-react-v3: missing codegen manifest: " + codegenManifestPath)
+            return 1
+    if truthRoutesDiscover:
+        if !v3path.v3PathFileExists(routeCatalogPath):
+            r2cControllerPrintErr("r2c-react-v3: missing route catalog: " + routeCatalogPath)
+            return 1
+    elif strings.len(truthRoutesFileRaw) > 0:
+        if !v3path.v3PathFileExists(routeCatalogPath):
+            r2cControllerPrintErr("r2c-react-v3: missing route catalog: " + routeCatalogPath)
+            return 1
+    var scratchOk: bool = v3path.v3MkdirP("", outDir)
+    scratchOk
+    let experimentalRoot: str = r2cControllerExperimentalRoot(effectiveRoot)
+    let truthRoutesHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")
+    let execRouteMatrixHelper: str = os.joinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")
+    let truthRoutesSummaryPath: str = os.joinPath(outDir, "truth_routes_v1.summary.env")
+    let execRouteMatrixSummaryPath: str = os.joinPath(outDir, "exec_route_matrix.summary.env")
+    let truthCompareSummaryPath: str = os.joinPath(outDir, "truth_compare.summary.env")
+    let truthCompareMatrixSummaryPath: str = os.joinPath(outDir, "truth_compare_matrix.summary.env")
+    let reportPath: str = os.joinPath(outDir, "truth_compare_report_v1.json")
+    let truthRoutesLogPath: str = os.joinPath(outDir, "truth_routes.log")
+    let execRouteMatrixLogPath: str = os.joinPath(outDir, "exec_route_matrix.log")
+    var truthRoutesPath: str = os.joinPath(outDir, "truth_routes_v1.json")
+    var execRouteMatrixPath: str = os.joinPath(outDir, "cheng_codegen_exec_route_matrix_v1.json")
+    var truthComparePath: str = os.joinPath(outDir, "truth_compare_v1.json")
+    var truthCompareMatrixPath: str = os.joinPath(outDir, "truth_compare_matrix_v1.json")
+    var helperExitCode: int32 = 0
+    var helperOutput: str
+    os.osSetEmpty(helperOutput)
+    var routeCount: int32 = 1
+    var primaryArtifactPath: str = truthComparePath
+    var primaryArtifactFormat: str = "truth_compare_v1"
+    var finalHelperSummaryPath: str = truthCompareSummaryPath
+    var finalHelperLogPath: str = ""
+    var finalTruthCompareMatrixSummaryPath: str = ""
+    var hasTruthRoutesInput: bool = truthRoutesDiscover
+    if !hasTruthRoutesInput:
+        if strings.len(truthRoutesFileRaw) > 0:
+            hasTruthRoutesInput = true
+
+    if !r2cControllerWriteCompareTruthDirect(execSnapshotPath,
+                                             truthTracePath,
+                                             truthState,
+                                             truthComparePath,
+                                             truthCompareSummaryPath):
+        r2cControllerPrintErr("r2c-react-v3: truth compare failed")
+        return 2
+
+    truthComparePath = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_path", truthComparePath)
+
+    if truthRoutesDiscover:
+        var truthRoutesArgs: str[] = []
+        add(truthRoutesArgs, "--repo")
+        add(truthRoutesArgs, repo)
+        add(truthRoutesArgs, "--out")
+        add(truthRoutesArgs, truthRoutesPath)
+        add(truthRoutesArgs, "--summary-out")
+        add(truthRoutesArgs, truthRoutesSummaryPath)
+        for i in 0..<runtimeRoots.len:
+            add(truthRoutesArgs, "--runtime-root")
+            add(truthRoutesArgs, runtimeRoots[i])
+        if !r2cControllerRunNodeHelper(effectiveRoot,
+                                       truthRoutesHelper,
+                                       truthRoutesArgs,
+                                       truthRoutesLogPath,
+                                       helperExitCode,
+                                       helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: truth route helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+    elif strings.len(truthRoutesFileRaw) > 0:
+        truthRoutesPath = v3path.v3PathAbsolute(repo, truthRoutesFileRaw)
+        if !v3path.v3PathFileExists(truthRoutesPath):
+            r2cControllerPrintErr("r2c-react-v3: missing truth routes: " + truthRoutesPath)
+            return 1
+
+    if hasTruthRoutesInput:
+        var execRouteMatrixArgs: str[] = []
+        add(execRouteMatrixArgs, "--route-catalog")
+        add(execRouteMatrixArgs, routeCatalogPath)
+        add(execRouteMatrixArgs, "--exec-snapshot")
+        add(execRouteMatrixArgs, execSnapshotPath)
+        add(execRouteMatrixArgs, "--truth-routes-file")
+        add(execRouteMatrixArgs, truthRoutesPath)
+        add(execRouteMatrixArgs, "--codegen-manifest")
+        add(execRouteMatrixArgs, codegenManifestPath)
+        add(execRouteMatrixArgs, "--truth-trace")
+        add(execRouteMatrixArgs, truthTracePath)
+        add(execRouteMatrixArgs, "--out")
+        add(execRouteMatrixArgs, execRouteMatrixPath)
+        add(execRouteMatrixArgs, "--summary-out")
+        add(execRouteMatrixArgs, execRouteMatrixSummaryPath)
+        if !r2cControllerRunNodeHelper(effectiveRoot,
+                                       execRouteMatrixHelper,
+                                       execRouteMatrixArgs,
+                                       execRouteMatrixLogPath,
+                                       helperExitCode,
+                                       helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: exec route matrix helper failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+
+        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "route_count", "0"))
+        execRouteMatrixPath = r2cControllerReadSummaryValue(execRouteMatrixSummaryPath, "exec_route_matrix_path", execRouteMatrixPath)
+
+        if !r2cControllerWriteTruthCompareMatrixArtifacts(execRouteMatrixPath,
+                                                          truthTracePath,
+                                                          truthCompareMatrixPath,
+                                                          truthCompareMatrixSummaryPath):
+            r2cControllerPrintErr("r2c-react-v3: truth compare matrix failed")
+            return 2
+
+        truthCompareMatrixPath = r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath,
+                                                               "truth_compare_matrix_path",
+                                                               truthCompareMatrixPath)
+        routeCount = r2cControllerParseInt32(r2cControllerReadSummaryValue(truthCompareMatrixSummaryPath,
+                                                                           "route_count",
+                                                                           intToStr(routeCount)))
+        primaryArtifactPath = truthCompareMatrixPath
+        primaryArtifactFormat = "truth_compare_matrix_v1"
+        finalHelperSummaryPath = truthCompareMatrixSummaryPath
+        finalHelperLogPath = execRouteMatrixLogPath
+        finalTruthCompareMatrixSummaryPath = truthCompareMatrixSummaryPath
+
+    let truthCompareOkText: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_ok", "")
+    let truthCompareReason: str = r2cControllerReadSummaryValue(truthCompareSummaryPath, "truth_compare_reason", "")
+    let truthCompareMatrixOkText: str = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath,
+                                                                      "truth_compare_matrix_ok",
+                                                                      "")
+    let truthCompareMatrixReason: str = r2cControllerReadSummaryValue(finalTruthCompareMatrixSummaryPath,
+                                                                      "truth_compare_matrix_reason",
+                                                                      "")
+    var report = "{\n"
+    report = report + "  \"format\": \"controller_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"command\": \"truth-compare\",\n"
+    report = report + "  \"ok\": true,\n"
+    report = report + "  \"reason\": \"ok\",\n"
+    report = report + "  \"workspace_root\": " + r2cControllerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + r2cControllerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"repo_root\": " + r2cControllerJsonQuote(repo) + ",\n"
+    report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
+    report = report + "  \"exec_snapshot_path\": " + r2cControllerJsonQuote(execSnapshotPath) + ",\n"
+    report = report + "  \"truth_trace_path\": " + r2cControllerJsonQuote(truthTracePath) + ",\n"
+    report = report + "  \"truth_state\": " + r2cControllerJsonQuote(truthState) + ",\n"
+    report = report + "  \"truth_routes_path\": " + r2cControllerJsonQuote(truthRoutesPath) + ",\n"
+    report = report + "  \"exec_route_matrix_path\": " + r2cControllerJsonQuote(execRouteMatrixPath) + ",\n"
+    report = report + "  \"truth_compare_summary_path\": " + r2cControllerJsonQuote(truthCompareSummaryPath) + ",\n"
+    report = report + "  \"truth_compare_matrix_summary_path\": " + r2cControllerJsonQuote(finalTruthCompareMatrixSummaryPath) + ",\n"
+    report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(finalHelperSummaryPath) + ",\n"
+    report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(finalHelperLogPath) + ",\n"
+    report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(primaryArtifactPath) + ",\n"
+    report = report + "  \"primary_artifact_format\": " + r2cControllerJsonQuote(primaryArtifactFormat) + ",\n"
+    report = report + "  \"route_count\": " + intToStr(routeCount) + ",\n"
+    if truthCompareOkText == "true" || truthCompareOkText == "false":
+        report = report + "  \"truth_compare_ok\": " + truthCompareOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_ok\": null,\n"
+    report = report + "  \"truth_compare_reason\": " + r2cControllerJsonQuote(truthCompareReason) + ",\n"
+    if truthCompareMatrixOkText == "true" || truthCompareMatrixOkText == "false":
+        report = report + "  \"truth_compare_matrix_ok\": " + truthCompareMatrixOkText + ",\n"
+    else:
+        report = report + "  \"truth_compare_matrix_ok\": null,\n"
+    report = report + "  \"truth_compare_matrix_reason\": " + r2cControllerJsonQuote(truthCompareMatrixReason) + "\n"
+    report = report + "}\n"
+    v3path.v3WriteTextFile("", reportPath, report)
+    r2cControllerPrintLine(reportPath)
     return 0
 
 fn r2cControllerNativeGuiBundle(root: str,
@@ -1030,6 +3354,50 @@ fn r2cControllerRunNativeGui(root: str,
     var helperExitCode: int32 = 0
     var helperOutput: str
     os.osSetEmpty(helperOutput)
+    let bundleControllerPath: str = v3path.v3PathAbsolute(effectiveRoot, "artifacts/v3_bootstrap/cheng.stage3")
+    let bundleControllerLogPath: str = os.joinPath(outDir, "native_gui_run.bundle_controller.log")
+    let hasExplicitSession: bool = strings.len(sessionFlag) > 0
+    let hasExplicitBundle: bool = strings.len(bundleFlag) > 0
+    let useExplicitArtifacts: bool = hasExplicitSession &&
+                                     hasExplicitBundle &&
+                                     v3path.v3PathFileExists(sessionPath) &&
+                                     v3path.v3PathFileExists(bundlePath)
+    if !useExplicitArtifacts:
+        if !v3path.v3PathFileExists(bundleControllerPath):
+            r2cControllerPrintErr("r2c-react-v3: missing stage3 controller for run-native-gui bundle: " + bundleControllerPath)
+            return 1
+        var bundleControllerArgs: str[] = []
+        add(bundleControllerArgs, "r2c-react-v3")
+        add(bundleControllerArgs, "native-gui-bundle")
+        add(bundleControllerArgs, "--repo")
+        add(bundleControllerArgs, repo)
+        add(bundleControllerArgs, "--out-dir")
+        add(bundleControllerArgs, outDir)
+        if strings.len(routeStateFlag) > 0:
+            add(bundleControllerArgs, "--route-state")
+            add(bundleControllerArgs, routeStateFlag)
+        if !r2cproc.r2cProcessRunProgramLogged(effectiveRoot,
+                                               "r2c-react-v3 native-gui-bundle controller",
+                                               bundleControllerPath,
+                                               bundleControllerArgs,
+                                               effectiveRoot,
+                                               bundleControllerLogPath,
+                                               helperExitCode,
+                                               helperOutput):
+            r2cControllerPrintErr("r2c-react-v3: native gui bundle controller failed")
+            if strings.len(helperOutput) > 0:
+                r2cControllerPrintErr(helperOutput)
+            if helperExitCode != 0:
+                return helperExitCode
+            return 1
+        sessionPath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_session_path", sessionPath)
+        bundlePath = r2cControllerReadSummaryValue(nativeGuiBundleSummaryPath, "native_gui_bundle_path", bundlePath)
+    if !v3path.v3PathFileExists(sessionPath):
+        r2cControllerPrintErr("r2c-react-v3: native gui run missing session: " + sessionPath)
+        return 1
+    if !v3path.v3PathFileExists(bundlePath):
+        r2cControllerPrintErr("r2c-react-v3: native gui run missing bundle: " + bundlePath)
+        return 1
 
     var nativeGuiRunArgs: str[] = []
     add(nativeGuiRunArgs, "--repo")
@@ -1416,6 +3784,9 @@ fn r2cControllerReplayHitInspector(root: str,
     let outFlag: str = r2cControllerOwnText(cmdline.readFlagOrDefault("--out", ""))
     let openSource: bool = cmdline.hasFlag("--open-source")
     let inspectorStatePath: str = v3path.v3PathAbsolute(effectiveRoot, inspectorStateFlag)
+    if !v3path.v3PathFileExists(inspectorStatePath):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector missing inspector state: " + inspectorStatePath)
+        return 1
     let outDirBase: str = v3path.v3PathParentDir(inspectorStatePath)
     var outDir: str = outDirBase
     var replayPath: str = os.joinPath(outDir, "native_gui_inspector_replay_v1.json")
@@ -1424,47 +3795,134 @@ fn r2cControllerReplayHitInspector(root: str,
         outDir = v3path.v3PathParentDir(replayPath)
     var scratchOk: bool = v3path.v3MkdirP("", outDir)
     scratchOk
-    let experimentalRoot: str = v3path.v3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
-    let helper: str = os.joinPath(experimentalRoot, "r2c-react-v3-replay-hit-inspector.mjs")
     let summaryPath: str = os.joinPath(outDir, "native_gui_inspector_replay.summary.env")
     let logPath: str = os.joinPath(outDir, "native_gui_inspector_replay.log")
+    let openSourceLogPath: str = os.joinPath(outDir, "native_gui_inspector_replay.open_source.log")
     let reportPath: str = os.joinPath(outDir, "native_gui_inspector_replay_report_v1.json")
-    var helperExitCode: int32 = 0
-    var helperOutput: str
-    os.osSetEmpty(helperOutput)
-
-    var helperArgs: str[] = []
-    add(helperArgs, "--inspector-state")
-    add(helperArgs, inspectorStatePath)
-    add(helperArgs, "--out")
-    add(helperArgs, replayPath)
-    add(helperArgs, "--summary-out")
-    add(helperArgs, summaryPath)
-    if openSource:
-        add(helperArgs, "--open-source")
-    if !r2cControllerRunNodeHelper(effectiveRoot, helper, helperArgs, logPath, helperExitCode, helperOutput):
-        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector helper failed")
-        if strings.len(helperOutput) > 0:
-            r2cControllerPrintErr(helperOutput)
-        if helperExitCode != 0:
-            return helperExitCode
+    let stateText: str = v3path.v3ReadTextFile("", inspectorStatePath)
+    if strings.len(stateText) <= 0:
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector empty inspector state: " + inspectorStatePath)
+        return 1
+    let stateFormat: str = r2cControllerJsonReadStringField(stateText, "format", "")
+    if stateFormat != "native_gui_inspector_state_v1":
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector format mismatch: " + stateFormat)
         return 1
 
-    replayPath = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_path", replayPath)
-    let inspectorStateReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_state_ready", "")
-    let replayReadyText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_ready", "")
-    let panelTitle: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_panel_title", "")
-    let panelLineCountText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_inspector_replay_panel_line_count", "0")
-    let replaySourceOpenRequestedText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_requested", "")
-    let replaySourceOpenOkText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_ok", "")
-    let replaySourceOpenTargetPath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_target_path", "")
-    let replaySourceOpenTargetLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_target_line", "0")
-    let replaySourceOpenCommand: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_command", "")
-    let replaySourceOpenError: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_replay_source_open_error", "")
-    let hitItemId: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_item_id", "")
-    let hitSourceModulePath: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_module_path", "")
-    let hitSourceComponentName: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_component_name", "")
-    let hitSourceLineText: str = r2cControllerReadSummaryValue(summaryPath, "native_gui_hit_source_line", "0")
+    let windowText: str = r2cControllerJsonReadObjectFieldRaw(stateText, "window", "{}")
+    let hitText: str = r2cControllerJsonReadObjectFieldRaw(stateText, "hit", "{}")
+    let panelText: str = r2cControllerJsonReadObjectFieldRaw(stateText, "panel", "{}")
+    let sourceJumpJson: str = r2cControllerJsonReadObjectFieldRaw(
+        stateText,
+        "source_jump",
+        "{\"enabled\":false,\"attempted\":false,\"ok\":false,\"target_path\":\"\",\"target_line\":0,\"command\":\"\",\"error\":\"\"}"
+    )
+    let panelLinesJson: str = r2cControllerJsonReadArrayFieldRaw(panelText, "lines", "[]")
+
+    let inspectorStateReady: bool = r2cControllerJsonReadBoolField(stateText, "ready", false)
+    let stateReason: str = r2cControllerJsonReadStringField(stateText, "reason", "")
+    let replayOk: bool = inspectorStateReady
+    var replayReason: str = "ok"
+    if !replayOk:
+        replayReason = stateReason
+        if strings.len(replayReason) <= 0:
+            replayReason = "inspector_not_ready"
+    let repoRoot: str = r2cControllerJsonReadStringField(stateText, "repo_root", "")
+    let routeState: str = r2cControllerJsonReadStringField(windowText, "route_state", "")
+    let entryModule: str = r2cControllerJsonReadStringField(windowText, "entry_module", "")
+    let hitItemId: str = r2cControllerJsonReadStringField(hitText, "item_id", "")
+    let hitSourceModulePath: str = r2cControllerJsonReadStringField(hitText, "source_module_path", "")
+    let hitSourceComponentName: str = r2cControllerJsonReadStringField(hitText, "source_component_name", "")
+    let hitSourceLine: int32 = r2cControllerJsonReadIntField(hitText, "source_line", 0)
+    let panelTitle: str = r2cControllerJsonReadStringField(panelText, "title", "")
+    let panelLineCount: int32 = r2cControllerJsonCountStringArrayItems(panelLinesJson)
+
+    let sourceJumpEnabled: bool = r2cControllerJsonReadBoolField(sourceJumpJson, "enabled", false)
+    let sourceJumpAttempted: bool = r2cControllerJsonReadBoolField(sourceJumpJson, "attempted", false)
+    let sourceJumpOk: bool = r2cControllerJsonReadBoolField(sourceJumpJson, "ok", false)
+    let sourceJumpTargetPath: str = r2cControllerJsonReadStringField(sourceJumpJson, "target_path", "")
+    let sourceJumpTargetLine: int32 = r2cControllerJsonReadIntField(sourceJumpJson, "target_line", 0)
+    let sourceJumpCommand: str = r2cControllerJsonReadStringField(sourceJumpJson, "command", "")
+    let sourceJumpError: str = r2cControllerJsonReadStringField(sourceJumpJson, "error", "")
+
+    var replaySourceOpen = R2cReplaySourceOpenResult(targetPath: sourceJumpTargetPath,
+                                                     targetLine: sourceJumpTargetLine)
+    if openSource:
+        replaySourceOpen = r2cControllerReplaySourceOpen(effectiveRoot,
+                                                         repoRoot,
+                                                         hitSourceModulePath,
+                                                         hitSourceLine,
+                                                         sourceJumpTargetPath,
+                                                         sourceJumpTargetLine,
+                                                         openSourceLogPath)
+
+    var replayText = "{\n"
+    replayText = replayText + "  \"format\": \"native_gui_inspector_replay_v1\",\n"
+    replayText = replayText + "  \"ok\": " + r2cControllerJsonBool(replayOk) + ",\n"
+    replayText = replayText + "  \"reason\": " + r2cControllerJsonQuote(replayReason) + ",\n"
+    replayText = replayText + "  \"inspector_state_path\": " + r2cControllerJsonQuote(inspectorStatePath) + ",\n"
+    replayText = replayText + "  \"repo_root\": " + r2cControllerJsonQuote(repoRoot) + ",\n"
+    replayText = replayText + "  \"route_state\": " + r2cControllerJsonQuote(routeState) + ",\n"
+    replayText = replayText + "  \"entry_module\": " + r2cControllerJsonQuote(entryModule) + ",\n"
+    replayText = replayText + "  \"hit_item_id\": " + r2cControllerJsonQuote(hitItemId) + ",\n"
+    replayText = replayText + "  \"hit_source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
+    replayText = replayText + "  \"hit_source_component_name\": " + r2cControllerJsonQuote(hitSourceComponentName) + ",\n"
+    replayText = replayText + "  \"hit_source_line\": " + intToStr(hitSourceLine) + ",\n"
+    replayText = replayText + "  \"panel_title\": " + r2cControllerJsonQuote(panelTitle) + ",\n"
+    replayText = replayText + "  \"panel_line_count\": " + intToStr(panelLineCount) + ",\n"
+    replayText = replayText + "  \"panel_lines\": " + panelLinesJson + ",\n"
+    replayText = replayText + "  \"source_jump\": " + sourceJumpJson + ",\n"
+    replayText = replayText + "  \"replay_source_open\": {\n"
+    replayText = replayText + "    \"requested\": " + r2cControllerJsonBool(replaySourceOpen.requested) + ",\n"
+    replayText = replayText + "    \"ok\": " + r2cControllerJsonBool(replaySourceOpen.ok) + ",\n"
+    replayText = replayText + "    \"target_path\": " + r2cControllerJsonQuote(replaySourceOpen.targetPath) + ",\n"
+    replayText = replayText + "    \"target_line\": " + intToStr(replaySourceOpen.targetLine) + ",\n"
+    replayText = replayText + "    \"command\": " + r2cControllerJsonQuote(replaySourceOpen.command) + ",\n"
+    replayText = replayText + "    \"error\": " + r2cControllerJsonQuote(replaySourceOpen.error) + "\n"
+    replayText = replayText + "  }\n"
+    replayText = replayText + "}\n"
+
+    if !v3path.v3WriteTextFile("", replayPath, replayText):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector failed to write replay doc: " + replayPath)
+        return 1
+
+    var summary = ""
+    summary = summary + "native_gui_inspector_state_path=" + inspectorStatePath + "\n"
+    summary = summary + "native_gui_inspector_state_ready=" + r2cControllerJsonBool(inspectorStateReady) + "\n"
+    summary = summary + "native_gui_inspector_replay_path=" + replayPath + "\n"
+    summary = summary + "native_gui_inspector_replay_ready=" + r2cControllerJsonBool(replayOk) + "\n"
+    summary = summary + "native_gui_inspector_replay_panel_title=" + panelTitle + "\n"
+    summary = summary + "native_gui_inspector_replay_panel_line_count=" + intToStr(panelLineCount) + "\n"
+    summary = summary + "native_gui_replay_source_open_requested=" + r2cControllerJsonBool(replaySourceOpen.requested) + "\n"
+    summary = summary + "native_gui_replay_source_open_ok=" + r2cControllerJsonBool(replaySourceOpen.ok) + "\n"
+    summary = summary + "native_gui_replay_source_open_target_path=" + replaySourceOpen.targetPath + "\n"
+    summary = summary + "native_gui_replay_source_open_target_line=" + intToStr(replaySourceOpen.targetLine) + "\n"
+    summary = summary + "native_gui_replay_source_open_command=" + replaySourceOpen.command + "\n"
+    summary = summary + "native_gui_replay_source_open_error=" + replaySourceOpen.error + "\n"
+    summary = summary + "native_gui_hit_item_id=" + hitItemId + "\n"
+    summary = summary + "native_gui_hit_source_module_path=" + hitSourceModulePath + "\n"
+    summary = summary + "native_gui_hit_source_component_name=" + hitSourceComponentName + "\n"
+    summary = summary + "native_gui_hit_source_line=" + intToStr(hitSourceLine) + "\n"
+    if !v3path.v3WriteTextFile("", summaryPath, summary):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector failed to write summary: " + summaryPath)
+        return 1
+
+    var logText = ""
+    logText = logText + "controller=replay-hit-inspector\n"
+    logText = logText + "inspector_state_path=" + inspectorStatePath + "\n"
+    logText = logText + "replay_path=" + replayPath + "\n"
+    logText = logText + "summary_path=" + summaryPath + "\n"
+    logText = logText + "open_source_requested=" + r2cControllerJsonBool(openSource) + "\n"
+    logText = logText + "replay_source_open_requested=" + r2cControllerJsonBool(replaySourceOpen.requested) + "\n"
+    logText = logText + "replay_source_open_ok=" + r2cControllerJsonBool(replaySourceOpen.ok) + "\n"
+    logText = logText + "replay_source_open_target_path=" + replaySourceOpen.targetPath + "\n"
+    logText = logText + "replay_source_open_target_line=" + intToStr(replaySourceOpen.targetLine) + "\n"
+    logText = logText + "replay_source_open_command=" + replaySourceOpen.command + "\n"
+    logText = logText + "replay_source_open_error=" + replaySourceOpen.error + "\n"
+    if openSource:
+        logText = logText + "replay_source_open_log_path=" + openSourceLogPath + "\n"
+    if !v3path.v3WriteTextFile("", logPath, logText):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector failed to write log: " + logPath)
+        return 1
 
     var report = "{\n"
     report = report + "  \"format\": \"controller_report_v1\",\n"
@@ -1476,45 +3934,43 @@ fn r2cControllerReplayHitInspector(root: str,
     report = report + "  \"out_dir\": " + r2cControllerJsonQuote(outDir) + ",\n"
     report = report + "  \"primary_artifact_path\": " + r2cControllerJsonQuote(replayPath) + ",\n"
     report = report + "  \"primary_artifact_format\": \"native_gui_inspector_replay_v1\",\n"
-    report = report + "  \"helper_script\": " + r2cControllerJsonQuote(helper) + ",\n"
+    report = report + "  \"helper_script\": " + r2cControllerJsonQuote("") + ",\n"
     report = report + "  \"helper_summary_path\": " + r2cControllerJsonQuote(summaryPath) + ",\n"
     report = report + "  \"helper_log_path\": " + r2cControllerJsonQuote(logPath) + ",\n"
     report = report + "  \"native_gui_inspector_state_path\": " + r2cControllerJsonQuote(inspectorStatePath) + ",\n"
-    if inspectorStateReadyText == "true" || inspectorStateReadyText == "false":
-        report = report + "  \"native_gui_inspector_state_ready\": " + inspectorStateReadyText + ",\n"
-    else:
-        report = report + "  \"native_gui_inspector_state_ready\": null,\n"
+    report = report + "  \"native_gui_inspector_state_ready\": " + r2cControllerJsonBool(inspectorStateReady) + ",\n"
     report = report + "  \"native_gui_inspector_replay_path\": " + r2cControllerJsonQuote(replayPath) + ",\n"
-    if replayReadyText == "true" || replayReadyText == "false":
-        report = report + "  \"native_gui_inspector_replay_ready\": " + replayReadyText + ",\n"
-    else:
-        report = report + "  \"native_gui_inspector_replay_ready\": null,\n"
+    report = report + "  \"native_gui_inspector_replay_ready\": " + r2cControllerJsonBool(replayOk) + ",\n"
     report = report + "  \"native_gui_inspector_replay_panel_title\": " + r2cControllerJsonQuote(panelTitle) + ",\n"
-    report = report + "  \"native_gui_inspector_replay_panel_line_count\": " + panelLineCountText + ",\n"
+    report = report + "  \"native_gui_inspector_replay_panel_line_count\": " + intToStr(panelLineCount) + ",\n"
     report = report + "  \"native_gui_hit_item_id\": " + r2cControllerJsonQuote(hitItemId) + ",\n"
     report = report + "  \"native_gui_hit_source_module_path\": " + r2cControllerJsonQuote(hitSourceModulePath) + ",\n"
     report = report + "  \"native_gui_hit_source_component_name\": " + r2cControllerJsonQuote(hitSourceComponentName) + ",\n"
-    report = report + "  \"native_gui_hit_source_line\": " + hitSourceLineText + ",\n"
-    if replaySourceOpenRequestedText == "true" || replaySourceOpenRequestedText == "false":
-        report = report + "  \"native_gui_replay_source_open_requested\": " + replaySourceOpenRequestedText + ",\n"
-    else:
-        report = report + "  \"native_gui_replay_source_open_requested\": null,\n"
-    if replaySourceOpenOkText == "true" || replaySourceOpenOkText == "false":
-        report = report + "  \"native_gui_replay_source_open_ok\": " + replaySourceOpenOkText + ",\n"
-    else:
-        report = report + "  \"native_gui_replay_source_open_ok\": null,\n"
-    report = report + "  \"native_gui_replay_source_open_target_path\": " + r2cControllerJsonQuote(replaySourceOpenTargetPath) + ",\n"
-    report = report + "  \"native_gui_replay_source_open_target_line\": " + replaySourceOpenTargetLineText + ",\n"
-    report = report + "  \"native_gui_replay_source_open_command\": " + r2cControllerJsonQuote(replaySourceOpenCommand) + ",\n"
-    report = report + "  \"native_gui_replay_source_open_error\": " + r2cControllerJsonQuote(replaySourceOpenError) + "\n"
+    report = report + "  \"native_gui_hit_source_line\": " + intToStr(hitSourceLine) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_requested\": " + r2cControllerJsonBool(replaySourceOpen.requested) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_ok\": " + r2cControllerJsonBool(replaySourceOpen.ok) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_target_path\": " + r2cControllerJsonQuote(replaySourceOpen.targetPath) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_target_line\": " + intToStr(replaySourceOpen.targetLine) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_command\": " + r2cControllerJsonQuote(replaySourceOpen.command) + ",\n"
+    report = report + "  \"native_gui_replay_source_open_error\": " + r2cControllerJsonQuote(replaySourceOpen.error) + "\n"
     report = report + "}\n"
-    v3path.v3WriteTextFile("", reportPath, report)
+    if !v3path.v3WriteTextFile("", reportPath, report):
+        r2cControllerPrintErr("r2c-react-v3: replay-hit-inspector failed to write report: " + reportPath)
+        return 1
     r2cControllerPrintLine(reportPath)
     return 0
 
 fn r2cControllerHelp() =
     r2cControllerPrintLine("usage: cheng r2c-react-v3 <subcommand> [args]")
-    r2cControllerPrintLine("subcommands: help, status, native-gui-bundle, native-gui-runtime, run-native-gui, replay-hit-inspector, compile")
+    r2cControllerPrintLine("subcommands: help, status, frontend, static-surface, semantic-surface, codegen-surface, discover-truth-routes, capture-truth, truth-compare, compare-truth, exec-route-matrix, compare-truth-matrix, native-gui-bundle, native-gui-runtime, run-native-gui, replay-hit-inspector, compile")
+    r2cControllerPrintLine("frontend flags: --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]")
+    r2cControllerPrintLine("static-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]")
+    r2cControllerPrintLine("semantic-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...]")
+    r2cControllerPrintLine("discover-truth-routes flags: --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]")
+    r2cControllerPrintLine("capture-truth flags: --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] [--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>]")
+    r2cControllerPrintLine("compare-truth flags: --exec-snapshot <file> --truth-trace <file> [--codegen-manifest <file>] [--truth-state <state>] [--out <file>]")
+    r2cControllerPrintLine("exec-route-matrix flags: (--route-catalog <file> | --tsx-ast <file>) --exec-snapshot <file> --truth-routes-file <file> [--codegen-manifest <file>] [--truth-trace <file>] [--out <file>]")
+    r2cControllerPrintLine("compare-truth-matrix flags: --exec-route-matrix <file> --truth-trace <file> [--codegen-manifest <file>] [--out <file>]")
     r2cControllerPrintLine("native-gui-runtime flags: --runtime-contract <file> [--state-* ...] [--event-* ...]")
     r2cControllerPrintLine("run-native-gui flags: --click x,y --resize WxH --scroll-y <n> --wait-after-click-ms <n> --focus-item-id <id> --type-text <text> --send-key <key> --inspector-state-out <file> --open-source-on-click")
     r2cControllerPrintLine("replay-hit-inspector flags: --inspector-state <file> --out <file> --open-source")
@@ -1533,6 +3989,26 @@ fn v3R2cReactV3Main(root: str,
         return 0
     if cmd == "status":
         return r2cControllerStatus(root, tail)
+    if cmd == "frontend":
+        return r2cControllerFrontend(root, tail)
+    if cmd == "static-surface":
+        return r2cControllerStaticSurface(root, tail)
+    if cmd == "semantic-surface":
+        return r2cControllerSemanticSurface(root, tail)
+    if cmd == "codegen-surface":
+        return r2cControllerCodegenSurface(root, tail)
+    if cmd == "discover-truth-routes":
+        return r2cControllerDiscoverTruthRoutes(root, tail)
+    if cmd == "capture-truth":
+        return r2cControllerCaptureTruth(root, tail)
+    if cmd == "truth-compare":
+        return r2cControllerTruthCompare(root, tail)
+    if cmd == "compare-truth":
+        return r2cControllerCompareTruthCompat(root, tail)
+    if cmd == "exec-route-matrix":
+        return r2cControllerExecRouteMatrix(root, tail)
+    if cmd == "compare-truth-matrix":
+        return r2cControllerCompareTruthMatrixCompat(root, tail)
     if cmd == "native-gui-bundle":
         return r2cControllerNativeGuiBundle(root, tail)
     if cmd == "native-gui-runtime":

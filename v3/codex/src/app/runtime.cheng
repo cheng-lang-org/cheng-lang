@@ -1,0 +1,620 @@
+import std/os
+import std/os_host_process as hostos
+import std/result
+import std/strings
+import std/times
+import cheng/codex/core/argv as argvutil
+import cheng/codex/core/engine
+import cheng/codex/core/store
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+fn codexPrintOut(text: str) =
+    os.writeLine(os.get_stdout(), text)
+
+fn codexPrintErr(text: str) =
+    os.writeLine(os.get_stderr(), text)
+
+fn codexResolveHome(): str =
+    return store.codexStoreHome(argvutil.codexReadFlagOrDefault("--home", ""))
+
+fn codexResolveSessionFlag(): str =
+    return argvutil.codexReadFlagOrDefault("--session", "")
+
+fn codexResolveCwd(): str =
+    let raw = argvutil.codexReadFlagOrDefault("--cwd", "")
+    if textutil.codexTextNonEmpty(raw):
+        return raw
+    return os.getCurrentDir()
+
+fn codexResolveAutoApprove(): bool =
+    return argvutil.codexHasFlag("--auto-approve")
+
+fn codexUsage() =
+    codexPrintOut("usage: codex [command] [flags]")
+    codexPrintOut("")
+    codexPrintOut("commands:")
+    codexPrintOut("  exec --command:<shell> [--prompt:<text>] [stdin] [--cwd:<path>] [--title:<text>] [--session:<id>] --auto-approve")
+    codexPrintOut("  resume [--last] [--list] [session_id]")
+    codexPrintOut("  status")
+    codexPrintOut("  login --api-key:<text>")
+    codexPrintOut("  login status")
+    codexPrintOut("  logout")
+    codexPrintOut("  plugin list")
+    codexPrintOut("  plugin get <name>")
+    codexPrintOut("  plugin add <name> [--path:<dir>]")
+    codexPrintOut("  plugin remove <name> | --name:<name>")
+    codexPrintOut("  mcp list")
+    codexPrintOut("  mcp get <name>")
+    codexPrintOut("  mcp add <name> --url:<url>")
+    codexPrintOut("  mcp add <name> -- <command>...")
+    codexPrintOut("  mcp remove <name> | --name:<name>")
+    codexPrintOut("  apply --patch:<file> [--cwd:<path>]")
+    codexPrintOut("  sandbox info")
+    codexPrintOut("  sandbox run --command:<shell> [--cwd:<path>] [--write-root:<path>]")
+    codexPrintOut("  sandbox run -- [command args...]")
+    codexPrintOut("")
+    codexPrintOut("no command -> launch tui")
+
+fn codexReadPositionalOrFlag(index: int32, flag: str): str =
+    let flagged = argvutil.codexReadFlagOrDefault(flag, "")
+    if textutil.codexTextNonEmpty(flagged):
+        return flagged
+    if argvutil.codexArgCount() >= index:
+        return textutil.codexTextTrim(argvutil.codexArgStr(index))
+    return ""
+
+fn codexArgLooksLikeFlag(raw: str): bool =
+    return strings.hasPrefix(raw, "-")
+
+fn codexReadPositional(index: int32): str =
+    if argvutil.codexArgCount() < index:
+        return ""
+    let value = textutil.codexTextTrim(argvutil.codexArgStr(index))
+    if !textutil.codexTextNonEmpty(value):
+        return ""
+    if codexArgLooksLikeFlag(value):
+        return ""
+    return value
+
+fn codexBuildShellCommand(startIndex: int32): str =
+    let count = argvutil.codexArgCount()
+    var out = ""
+    var i = startIndex
+    while i <= count:
+        let value = argvutil.codexArgStr(i)
+        if textutil.codexTextNonEmpty(value):
+            if textutil.codexTextNonEmpty(out):
+                out = out + " "
+            out = out + os.quoteShell(value)
+        i = i + 1
+    return out
+
+fn codexBuildShellCommandAfterMarker(startIndex: int32, marker: str): str =
+    let count = argvutil.codexArgCount()
+    var i = startIndex
+    while i <= count:
+        if argvutil.codexArgStr(i) == marker:
+            return codexBuildShellCommand(i + 1)
+        i = i + 1
+    return ""
+
+fn codexReadAvailableStdinText(): str =
+    var out = ""
+    let first = hostos.fdReadWait(0, 65536, 0)
+    if strings.len(first.text) <= 0 && !first.eof:
+        return ""
+    if strings.len(first.text) > 0:
+        out = out + first.text
+    if first.eof:
+        return out
+    while true:
+        let next = hostos.fdReadWait(0, 65536, 20)
+        if strings.len(next.text) > 0:
+            out = out + next.text
+            if next.eof:
+                return out
+            continue
+        return out
+
+fn codexResolveExecPromptText(): str =
+    let flagPrompt = argvutil.codexReadFlagOrDefault("--prompt", "")
+    let stdinPrompt = codexReadAvailableStdinText()
+    if !textutil.codexTextNonEmpty(stdinPrompt):
+        return flagPrompt
+    if !textutil.codexTextNonEmpty(flagPrompt):
+        return stdinPrompt
+    return flagPrompt + "\n" + stdinPrompt
+
+fn codexResolveResumeSelector(): str =
+    let sessionFlag = codexResolveSessionFlag()
+    if textutil.codexTextNonEmpty(sessionFlag):
+        return sessionFlag
+    return codexReadPositional(2)
+
+fn codexResumeWantsList(): bool =
+    if argvutil.codexHasFlag("--list"):
+        return true
+    return argvutil.codexHasFlag("--all")
+
+fn codexResumeWantsLast(): bool =
+    return argvutil.codexHasFlag("--last")
+
+fn codexResolveSandboxWriteRoot(): str =
+    let raw = argvutil.codexReadFlagOrDefault("--write-root", "")
+    if textutil.codexTextNonEmpty(raw):
+        return raw
+    return codexResolveCwd()
+
+fn codexPrintExecResult(run: types.CodexExecResult) =
+    if textutil.codexTextNonEmpty(run.outputText):
+        os.write(os.get_stdout(), run.outputText)
+        if run.outputText[len(run.outputText) - 1] != '\n':
+            os.write(os.get_stdout(), "\n")
+    codexPrintOut(run.assistantText)
+
+fn codexStatusCommand(home: str): int32 =
+    let apiKey = store.codexStoreReadApiKey(home)
+    let sessionCount = store.codexStoreCountSessions(home)
+    let plugins = store.codexStoreListPluginSpecs(home)
+    let pluginCount = plugins.len
+    let mcpServers = store.codexStoreListMcpServerSpecs(home)
+    let mcpCount = mcpServers.len
+    codexPrintOut("home=" + home)
+    codexPrintOut("auth_configured=" + textutil.codexBoolText(textutil.codexTextNonEmpty(apiKey)))
+    codexPrintOut("session_count=" + intToStr(sessionCount))
+    codexPrintOut("plugin_count=" + intToStr(pluginCount))
+    codexPrintOut("mcp_count=" + intToStr(mcpCount))
+    let lastRes = store.codexStoreLoadLastSession(home)
+    if IsOk(lastRes):
+        let session = Value(lastRes)
+        codexPrintOut("last_session=" + session.sessionId)
+        codexPrintOut("last_title=" + session.title)
+    else:
+        codexPrintOut("last_session=")
+        codexPrintOut("last_title=")
+    return 0
+
+fn codexLoginStatusCommand(home: str): int32 =
+    let apiKey = store.codexStoreReadApiKey(home)
+    codexPrintOut("auth_configured=" + textutil.codexBoolText(textutil.codexTextNonEmpty(apiKey)))
+    return 0
+
+fn codexLoginCommand(home: str): int32 =
+    let apiKey = argvutil.codexReadFlagOrDefault("--api-key", "")
+    if !textutil.codexTextNonEmpty(apiKey):
+        codexPrintErr("codex login: missing --api-key")
+        return 1
+    let saveRes = store.codexStoreSaveApiKey(home, apiKey)
+    if IsErr(saveRes):
+        codexPrintErr(Error(saveRes))
+        return 1
+    codexPrintOut("login_saved=true")
+    return 0
+
+fn codexLogoutCommand(home: str): int32 =
+    if !store.codexStoreClearApiKey(home):
+        codexPrintErr("codex logout: failed to clear auth")
+        return 1
+    codexPrintOut("logout_cleared=true")
+    return 0
+
+fn codexPluginPathText(spec: types.CodexPluginSpec): str =
+    if textutil.codexTextNonEmpty(spec.path):
+        return spec.path
+    return "(inline)"
+
+fn codexPluginListCommand(home: str): int32 =
+    let specs = store.codexStoreListPluginSpecs(home)
+    if specs.len <= 0:
+        codexPrintOut("plugin_count=0")
+        return 0
+    codexPrintOut("plugin_count=" + intToStr(specs.len))
+    for i in 0..<specs.len:
+        let spec = specs[i]
+        codexPrintOut("plugin[" + intToStr(i) + "]=" + spec.name +
+                      " path=" + codexPluginPathText(spec) +
+                      " enabled=" + textutil.codexBoolText(spec.enabled))
+    return 0
+
+fn codexPluginGetCommand(home: str): int32 =
+    let name = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(name):
+        codexPrintErr("codex plugin get: missing plugin name")
+        return 1
+    let getRes = store.codexStoreGetPluginSpec(home, name)
+    if IsErr(getRes):
+        codexPrintErr(Error(getRes))
+        return 1
+    let spec = Value(getRes)
+    codexPrintOut("name=" + spec.name)
+    codexPrintOut("path=" + codexPluginPathText(spec))
+    codexPrintOut("enabled=" + textutil.codexBoolText(spec.enabled))
+    return 0
+
+fn codexPluginAddCommand(home: str): int32 =
+    let name = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(name):
+        codexPrintErr("codex plugin add: missing plugin name")
+        return 1
+    let path = argvutil.codexReadFlagOrDefault("--path", "")
+    let addRes = store.codexStoreSaveNamedPlugin(home, name, path)
+    if IsErr(addRes):
+        codexPrintErr(Error(addRes))
+        return 1
+    codexPrintOut("plugin_added=" + textutil.codexBoolText(Value(addRes)))
+    if textutil.codexTextNonEmpty(path):
+        codexPrintOut("plugin_path=" + path)
+    return 0
+
+fn codexPluginRemoveCommand(home: str): int32 =
+    let name = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(name):
+        codexPrintErr("codex plugin remove: missing plugin name")
+        return 1
+    let removeRes = store.codexStoreRemovePlugin(home, name)
+    if IsErr(removeRes):
+        codexPrintErr(Error(removeRes))
+        return 1
+    codexPrintOut("plugin_removed=" + textutil.codexBoolText(Value(removeRes)))
+    return 0
+
+fn codexMcpTransportSummary(spec: types.CodexMcpServerSpec): str =
+    if spec.transportKind == "stdio":
+        return "stdio command=" + spec.launchCommand
+    if spec.transportKind == "streamable_http":
+        return "streamable_http url=" + spec.url
+    if spec.transportKind == "legacy":
+        return "legacy"
+    return spec.transportKind
+
+fn codexMcpListCommand(home: str): int32 =
+    let items = store.codexStoreListMcpServerSpecs(home)
+    if items.len <= 0:
+        codexPrintOut("mcp_count=0")
+        return 0
+    codexPrintOut("mcp_count=" + intToStr(items.len))
+    for i in 0..<items.len:
+        let spec = items[i]
+        codexPrintOut("mcp[" + intToStr(i) + "]=" + spec.name +
+                      " transport=" + spec.transportKind +
+                      " enabled=" + textutil.codexBoolText(spec.enabled))
+    return 0
+
+fn codexMcpGetCommand(home: str): int32 =
+    let name = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(name):
+        codexPrintErr("codex mcp get: missing server name")
+        return 1
+    let getRes = store.codexStoreGetMcpServerSpec(home, name)
+    if IsErr(getRes):
+        codexPrintErr(Error(getRes))
+        return 1
+    let spec = Value(getRes)
+    codexPrintOut("name=" + spec.name)
+    codexPrintOut("transport=" + spec.transportKind)
+    if textutil.codexTextNonEmpty(spec.launchCommand):
+        codexPrintOut("command=" + spec.launchCommand)
+    if textutil.codexTextNonEmpty(spec.cwd):
+        codexPrintOut("cwd=" + spec.cwd)
+    if textutil.codexTextNonEmpty(spec.url):
+        codexPrintOut("url=" + spec.url)
+    if textutil.codexTextNonEmpty(spec.bearerTokenEnvVar):
+        codexPrintOut("bearer_token_env_var=" + spec.bearerTokenEnvVar)
+    codexPrintOut("enabled=" + textutil.codexBoolText(spec.enabled))
+    return 0
+
+fn codexMcpAddCommand(home: str): int32 =
+    let name = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(name):
+        codexPrintErr("codex mcp add: missing server name")
+        return 1
+    let url = argvutil.codexReadFlagOrDefault("--url", "")
+    let commandFlag = argvutil.codexReadFlagOrDefault("--command", "")
+    let tailCommand = codexBuildShellCommandAfterMarker(4, "--")
+    var spec = types.codexMcpServerSpecZero()
+    spec.name = name
+    spec.cwd = argvutil.codexReadFlagOrDefault("--cwd", "")
+    spec.bearerTokenEnvVar = argvutil.codexReadFlagOrDefault("--bearer-token-env-var", "")
+    spec.enabled = true
+    if textutil.codexTextNonEmpty(url):
+        spec.transportKind = "streamable_http"
+        spec.url = url
+        if textutil.codexTextNonEmpty(commandFlag) || textutil.codexTextNonEmpty(tailCommand):
+            codexPrintErr("codex mcp add: choose either --url or a command after --")
+            return 1
+    else:
+        var launchCommand = commandFlag
+        if !textutil.codexTextNonEmpty(launchCommand):
+            launchCommand = tailCommand
+        if !textutil.codexTextNonEmpty(launchCommand):
+            codexPrintErr("codex mcp add: missing --url or command after --")
+            return 1
+        spec.transportKind = "stdio"
+        spec.launchCommand = launchCommand
+    let addRes = store.codexStoreSaveMcpServerSpec(home, spec)
+    if IsErr(addRes):
+        codexPrintErr(Error(addRes))
+        return 1
+    codexPrintOut("mcp_added=" + textutil.codexBoolText(Value(addRes)))
+    codexPrintOut("mcp_transport=" + codexMcpTransportSummary(spec))
+    return 0
+
+fn codexMcpRemoveCommand(home: str): int32 =
+    let value = codexReadPositionalOrFlag(3, "--name")
+    if !textutil.codexTextNonEmpty(value):
+        codexPrintErr("codex mcp remove: missing server name")
+        return 1
+    let removeRes = store.codexStoreRemoveMcpServer(home, value)
+    if IsErr(removeRes):
+        codexPrintErr(Error(removeRes))
+        return 1
+    codexPrintOut("mcp_removed=" + textutil.codexBoolText(Value(removeRes)))
+    return 0
+
+fn codexExecCommand(home: str): int32 =
+    var req = types.codexExecRequestZero()
+    req.sessionId = codexResolveSessionFlag()
+    req.title = argvutil.codexReadFlagOrDefault("--title", "")
+    req.cwd = codexResolveCwd()
+    req.promptText = codexResolveExecPromptText()
+    req.commandText = argvutil.codexReadFlagOrDefault("--command", "")
+    req.autoApprove = codexResolveAutoApprove()
+    let execRes = engine.codexExecuteShell(home, req)
+    if IsErr(execRes):
+        codexPrintErr(Error(execRes))
+        return 1
+    let run = Value(execRes)
+    codexPrintExecResult(run)
+    if run.ok:
+        return 0
+    return 1
+
+fn codexApplyCommand(): int32 =
+    let patchPath = argvutil.codexReadFlagOrDefault("--patch", "")
+    let cwd = codexResolveCwd()
+    let applyRes = engine.codexApplyPatch(cwd, patchPath)
+    if IsErr(applyRes):
+        codexPrintErr(Error(applyRes))
+        return 1
+    let run = Value(applyRes)
+    codexPrintExecResult(run)
+    if run.ok:
+        return 0
+    return 1
+
+fn codexSessionListText(home: str): str =
+    let sessions = store.codexStoreListSessions(home)
+    if sessions.len <= 0:
+        return "(no sessions)"
+    var out = ""
+    for i in 0..<sessions.len:
+        let item = sessions[i]
+        out = out + item.sessionId + " | " + item.title + " | rc=" + intToStr(item.lastExitCode) + "\n"
+    return out
+
+fn codexScreenClearText(): str =
+    let esc = strings.charToStr(char(27))
+    return esc + "[2J" + esc + "[H"
+
+fn codexStdinReadLine(prompt: str): str =
+    os.write(os.get_stdout(), prompt)
+    let f = os.get_stdin()
+    var out = ""
+    while true:
+        let ch = os.c_fgetc(f)
+        if ch < 0:
+            break
+        if ch == 10:
+            break
+        if ch == 13:
+            continue
+        out = out + strings.charToStr(char(ch))
+    return out
+
+fn codexTuiHeader(session: types.CodexSession): str =
+    var out = ""
+    out = out + "Codex v3\n"
+    out = out + "session: " + session.sessionId + "\n"
+    out = out + "title:   " + session.title + "\n"
+    out = out + "cwd:     " + session.cwd + "\n"
+    out = out + "help: /shell <cmd> | /sessions | /resume <id> | /title <text> | /quit\n"
+    out = out + "------------------------------------------------------------\n"
+    return out
+
+fn codexTuiRender(session: types.CodexSession) =
+    os.write(os.get_stdout(), codexScreenClearText())
+    os.write(os.get_stdout(), codexTuiHeader(session))
+    let history = engine.codexSessionHistoryText(session, 12)
+    os.write(os.get_stdout(), history)
+    if session.turns.len > 0 && len(history) > 0:
+        if history[len(history) - 1] != '\n':
+            os.write(os.get_stdout(), "\n")
+
+fn codexTuiExec(home: str,
+                session: var types.CodexSession,
+                commandText: str,
+                promptText: str,
+                autoApprove: bool): bool =
+    if !autoApprove:
+        let answer = codexStdinReadLine("approve [y/N]: ")
+        if answer != "y" && answer != "Y" && answer != "yes":
+            engine.codexAppendTurn(session, promptText, commandText, "approval denied", 126, false)
+            let saveRes = store.codexStoreSessionWrite(home, session)
+            return false
+    var req = types.codexExecRequestZero()
+    req.sessionId = session.sessionId
+    req.title = session.title
+    req.cwd = session.cwd
+    req.promptText = promptText
+    req.commandText = commandText
+    req.autoApprove = true
+    let runRes = engine.codexExecuteShell(home, req)
+    if IsErr(runRes):
+        engine.codexAppendTurn(session, promptText, commandText, Error(runRes), 1, true)
+        let saveErr = store.codexStoreSessionWrite(home, session)
+        return false
+    let loadRes = store.codexStoreSessionRead(home, session.sessionId)
+    if IsOk(loadRes):
+        session = Value(loadRes)
+    return Value(runRes).ok
+
+fn codexLoadResumeTarget(home: str): Result[types.CodexSession] =
+    let sessionId = codexResolveResumeSelector()
+    if textutil.codexTextNonEmpty(sessionId):
+        return store.codexStoreSessionRead(home, sessionId)
+    if codexResumeWantsLast():
+        return store.codexStoreLoadLastSession(home)
+    return store.codexStoreLoadLastSession(home)
+
+fn codexTuiRun(home: str, createIfMissing: bool): int32 =
+    var session = types.codexSessionZero()
+    let resumeRes = codexLoadResumeTarget(home)
+    if IsOk(resumeRes):
+        session = Value(resumeRes)
+    else:
+        if !createIfMissing:
+            codexPrintErr(Error(resumeRes))
+            return 1
+        session = engine.codexNewSession(codexResolveCwd(), argvutil.codexReadFlagOrDefault("--title", ""), "", "")
+        let saveNew = store.codexStoreSessionWrite(home, session)
+        if IsErr(saveNew):
+            codexPrintErr(Error(saveNew))
+            return 1
+    let autoApprove = codexResolveAutoApprove()
+    while true:
+        codexTuiRender(session)
+        let line = textutil.codexTextTrim(codexStdinReadLine("codex> "))
+        if !textutil.codexTextNonEmpty(line):
+            continue
+        if line == "/quit":
+            let saveQuit = store.codexStoreSessionWrite(home, session)
+            return 0
+        if line == "/sessions":
+            engine.codexAppendTurn(session, "/sessions", "", codexSessionListText(home), 0, true)
+            let saveSessions = store.codexStoreSessionWrite(home, session)
+            continue
+        if textutil.codexTextStartsWith(line, "/resume "):
+            let target = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/resume "))
+            let loadRes = store.codexStoreSessionRead(home, target)
+            if IsErr(loadRes):
+                engine.codexAppendTurn(session, line, "", Error(loadRes), 1, true)
+                let saveErr = store.codexStoreSessionWrite(home, session)
+                continue
+            session = Value(loadRes)
+            continue
+        if textutil.codexTextStartsWith(line, "/title "):
+            session.title = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/title "))
+            session.updatedAt = times.epochTimeSeconds()
+            let saveTitle = store.codexStoreSessionWrite(home, session)
+            continue
+        if textutil.codexTextStartsWith(line, "/shell "):
+            let commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "/shell "))
+            codexTuiExec(home, session, commandText, line, autoApprove)
+            continue
+        if textutil.codexTextStartsWith(line, "!"):
+            let commandText = textutil.codexTextTrim(textutil.codexTextDropPrefix(line, "!"))
+            codexTuiExec(home, session, commandText, line, autoApprove)
+            continue
+        engine.codexAppendTurn(session,
+                               line,
+                               "",
+                               "plain prompt captured; current Cheng slice executes shell via /shell or !",
+                               0,
+                               true)
+        let savePlain = store.codexStoreSessionWrite(home, session)
+    return 0
+
+fn codexResumeCommand(home: str): int32 =
+    if codexResumeWantsList():
+        codexPrintOut(codexSessionListText(home))
+        return 0
+    return codexTuiRun(home, false)
+
+fn codexSandboxInfoCommand(): int32 =
+    codexPrintOut("supported=1")
+    codexPrintOut("executor=/usr/bin/sandbox-exec")
+    codexPrintOut("mode=seatbelt_no_network_write_cwd_tmp")
+    return 0
+
+fn codexSandboxRunCommand(): int32 =
+    let cwd = codexResolveCwd()
+    let writeRoot = codexResolveSandboxWriteRoot()
+    var commandText = argvutil.codexReadFlagOrDefault("--command", "")
+    if !textutil.codexTextNonEmpty(commandText):
+        commandText = codexBuildShellCommandAfterMarker(3, "--")
+    let runRes = engine.codexRunInSandbox(cwd, writeRoot, commandText)
+    if IsErr(runRes):
+        codexPrintErr(Error(runRes))
+        return 1
+    let run = Value(runRes)
+    codexPrintExecResult(run)
+    if run.ok:
+        return 0
+    return 1
+
+fn codexSandboxCommand(): int32 =
+    let sub = codexReadPositional(2)
+    if sub == "info":
+        return codexSandboxInfoCommand()
+    if sub == "run":
+        return codexSandboxRunCommand()
+    codexPrintErr("codex sandbox: supported subcommands are info/run")
+    return 1
+
+fn codexDispatchMain(defaultToTui: bool): int32 =
+    let home = codexResolveHome()
+    let count = argvutil.codexArgCount()
+    if count <= 0:
+        if defaultToTui:
+            return codexTuiRun(home, true)
+        codexUsage()
+        return 0
+    let command = argvutil.codexArgStr(1)
+    if command == "help" || command == "--help" || command == "-h":
+        codexUsage()
+        return 0
+    if command == "status":
+        return codexStatusCommand(home)
+    if command == "login":
+        if count >= 2 && argvutil.codexArgStr(2) == "status":
+            return codexLoginStatusCommand(home)
+        return codexLoginCommand(home)
+    if command == "logout":
+        return codexLogoutCommand(home)
+    if command == "exec":
+        return codexExecCommand(home)
+    if command == "resume":
+        return codexResumeCommand(home)
+    if command == "plugin":
+        if count >= 2 && argvutil.codexArgStr(2) == "list":
+            return codexPluginListCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "get":
+            return codexPluginGetCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "add":
+            return codexPluginAddCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "remove":
+            return codexPluginRemoveCommand(home)
+        codexPrintErr("codex plugin: supported subcommands are list/get/add/remove")
+        return 1
+    if command == "mcp":
+        if count >= 2 && argvutil.codexArgStr(2) == "list":
+            return codexMcpListCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "get":
+            return codexMcpGetCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "add":
+            return codexMcpAddCommand(home)
+        if count >= 2 && argvutil.codexArgStr(2) == "remove":
+            return codexMcpRemoveCommand(home)
+        codexPrintErr("codex mcp: supported subcommands are list/get/add/remove")
+        return 1
+    if command == "apply":
+        return codexApplyCommand()
+    if command == "sandbox":
+        return codexSandboxCommand()
+    if command == "tui":
+        return codexTuiRun(home, true)
+    if defaultToTui:
+        return codexTuiRun(home, true)
+    codexPrintErr("codex: unknown command: " + command)
+    return 1

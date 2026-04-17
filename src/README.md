@@ -7,20 +7,19 @@
 - `std/`：标准库与后端运行时源码。
 - `tooling/`：canonical tooling 命令、build/verify gate 与发布闭环。
 
-当前主口径：
+当前主口径已经收口到 `v3`：
 
 ```sh
-TOOLING=artifacts/tooling_cmd/cheng_tooling
-
-$TOOLING build-backend-driver
-$TOOLING driver-path --path-only
-$TOOLING verify_backend_closedloop
-$TOOLING backend_prod_closure
+sh v3/tooling/cheng_v3.sh bootstrap-bridge
+sh v3/tooling/cheng_v3.sh build-backend-driver
+artifacts/v3_backend_driver/cheng status
+sh v3/tooling/cheng_v3.sh run-smokes
 ```
 
 说明：
-- 当前默认入口是 `cheng_tooling` 与 `artifacts/v3_backend_driver/cheng`。
+- `src/tooling/cheng_tooling.cheng` 已移除，`artifacts/tooling_cmd/cheng_tooling` 不再是现役入口。
+- 旧 `artifacts/backend_driver/cheng` 已退役；当前编译入口是 `artifacts/v3_backend_driver/cheng` 与 `artifacts/v3_bootstrap/cheng.stage3`。
 - 历史 `docs/cheng-dev-plan.md` 与 `tooling_exec.sh` 不再是当前仓库的主文档入口。
-- 更完整的工具链说明见 `src/tooling/README.md`；语言与闭环口径见 `docs/cheng-formal-spec.md`。
+- `src/tooling/README.md` 现仅保留旧 backend-only 链路历史说明；当前工具链说明见 `v3/tooling/README.md`，语言与闭环口径见 `docs/cheng-formal-spec.md`。
 
 GUI IDE 见 `../cheng-ide/README.md`（或 `$IDE_ROOT/README.md`）。

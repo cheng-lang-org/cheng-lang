@@ -1,0 +1,155 @@
+# MsQuic congestion validation suite(minimal).
+
+import std/result
+import cheng/v3/quic/congestion/common
+import cheng/v3/quic/congestion/bbr_model
+import cheng/v3/quic/congestion/cubic_model
+import cheng/v3/quic/congestion/controller
+import cheng/v3/quic/congestion/pacing_scheduler
+
+fn initAckSnapshot(nowUs: int64,
+                   largestAck: int64,
+                   largestSent: int64,
+                   ackedBytes: int64): common.AckEventSnapshot =
+    var snapshot: common.AckEventSnapshot
+    snapshot.timeNow = nowUs
+    snapshot.largestAck = largestAck
+    snapshot.largestSentPacketNumber = largestSent
+    snapshot.totalAckedRetransmittableBytes = ackedBytes
+    snapshot.ackedRetransmittableBytes = ackedBytes
+    snapshot.smoothedRtt = 50000
+    snapshot.minRtt = 40000
+    snapshot.oneWayDelay = 0
+    snapshot.adjustedAckTime = nowUs
+    snapshot.implicitAck = false
+    snapshot.hasLoss = false
+    snapshot.largestAckAppLimited = false
+    snapshot.minRttValid = true
+    return snapshot
+
+fn initLossSnapshot(largestSent: int64, lostBytes: int64): common.LossEventSnapshot =
+    var snapshot: common.LossEventSnapshot
+    snapshot.largestPacketNumberLost = largestSent
+    snapshot.largestSentPacketNumber = largestSent
+    snapshot.retransmittableBytesLost = lostBytes
+    snapshot.persistentCongestion = false
+    return snapshot
+
+fn validateSlidingWindowBasics(): Result[bool] =
+    var window = common.initSlidingWindowExtremum(10, 4, common.swMax)
+    common.slidingWindowUpdate(window, 3, 1)
+    common.slidingWindowUpdate(window, 9, 2)
+    common.slidingWindowUpdate(window, 5, 3)
+    if common.slidingWindowCurrentValue(window, -1) != 9:
+        return Err[bool]("congestion: sliding window max mismatch")
+    common.slidingWindowExpireEntries(window, 25)
+    if common.slidingWindowCurrentValue(window, -1) != -1:
+        return Err[bool]("congestion: sliding window expire mismatch")
+    return Ok[bool](true)
+
+fn validateBbrBasics(): Result[bool] =
+    var model = bbr_model.bbrInit(common.quicInitialWindowPackets, 1200)
+    if !bbr_model.bbrCanSend(model):
+        return Err[bool]("congestion: bbr cannot send at init")
+    let allowance = bbr_model.bbrSendAllowance(model)
+    if allowance <= 0:
+        return Err[bool]("congestion: send allowance ! positive")
+    let window = model.congestionWindow
+    if window <= 0:
+        return Err[bool]("congestion: window ! positive")
+    bbr_model.bbrOnPacketSent(model, 1200, false)
+    let ack = initAckSnapshot(2000000, 1, 1, 1200)
+    let ackHeight = bbr_model.bbrOnDataAcked(model, ack)
+    if ackHeight < 0:
+        return Err[bool]("congestion: ack height negative")
+    if model.deliveryRateBps <= 0:
+        return Err[bool]("congestion: delivery rate ! positive")
+    if model.sendQuantum <= 0:
+        return Err[bool]("congestion: send quantum ! positive")
+    let loss = initLossSnapshot(2, 600)
+    bbr_model.bbrOnDataLost(model, loss)
+    if !bbr_model.bbrCanSend(model):
+        return Err[bool]("congestion: bbr cannot send after ack/loss")
+    return Ok[bool](true)
+
+fn validateCubicBasics(): Result[bool] =
+    var model = cubic_model.cubicInit(common.quicInitialWindowPackets, 1200, 0)
+    if !cubic_model.cubicCanSend(model):
+        return Err[bool]("congestion: cubic cannot send at init")
+    let allowance = cubic_model.cubicSendAllowance(model)
+    if allowance <= 0:
+        return Err[bool]("congestion: cubic allowance ! positive")
+    let window0 = model.congestionWindow
+    if window0 <= 0:
+        return Err[bool]("congestion: cubic window ! positive")
+    cubic_model.cubicOnPacketSent(model, 1200, true)
+    let ack = initAckSnapshot(2000000, 1, 1, 1200)
+    cubic_model.cubicOnDataAcked(model, ack)
+    if model.congestionWindow < window0:
+        return Err[bool]("congestion: cubic window regressed on ack")
+    let loss = initLossSnapshot(2, 600)
+    cubic_model.cubicOnDataLost(model, loss)
+    if model.congestionWindow <= 0:
+        return Err[bool]("congestion: cubic window ! positive after loss")
+    cubic_model.cubicOnProbeTimeout(model)
+    if model.congestionWindow <= 0:
+        return Err[bool]("congestion: cubic window ! positive after pto")
+    return Ok[bool](true)
+
+fn validatePacingBasics(): Result[bool] =
+    var model = bbr_model.bbrInit(common.quicInitialWindowPackets, 1200)
+    var pacing = pacing_scheduler.pacingInit(true)
+    bbr_model.bbrOnPacketSent(model, 1200, false)
+    let ack = initAckSnapshot(1000000, 1, 1, 1200)
+    let ackHeight = bbr_model.bbrOnDataAcked(model, ack)
+    if model.pacingRateBps <= 0:
+        return Err[bool]("congestion: pacing rate ! set")
+    if ackHeight > 0:
+        pacing_scheduler.pacingRecordAckHeight(pacing, ackHeight)
+    let allowance = pacing_scheduler.pacingAllowance(pacing, model, 1000000)
+    if allowance <= 0:
+        return Err[bool]("congestion: pacing allowance ! positive")
+    pacing_scheduler.pacingCommitSend(pacing, 1000000, 600)
+    if pacing.burstAllowanceBytes < 0:
+        return Err[bool]("congestion: pacing burst allowance negative")
+    return Ok[bool](true)
+
+fn validateCongestionControllerBasics(algorithm: common.CongestionAlgorithm): Result[bool] =
+    var cc = controller.congestionControllerInit(algorithm, 1200, common.quicInitialWindowPackets)
+    if !controller.congestionControllerCanSend(cc):
+        return Err[bool]("congestion: controller cannot send at init")
+    let allowance = controller.congestionControllerSendAllowance(cc, 1000)
+    if allowance <= 0:
+        return Err[bool]("congestion: controller allowance ! positive")
+    let window = controller.congestionControllerWindowBytes(cc)
+    if window <= 0:
+        return Err[bool]("congestion: controller window ! positive")
+    controller.congestionControllerOnPacketSent(cc, 1200, true, false, 1000)
+    let ack = initAckSnapshot(2000000, 1, 1, 1200)
+    controller.congestionControllerOnAcked(cc, ack)
+    let loss = initLossSnapshot(2, 600)
+    controller.congestionControllerOnLost(cc, loss)
+    if !controller.congestionControllerCanSend(cc):
+        return Err[bool]("congestion: controller cannot send after ack/loss")
+    return Ok[bool](true)
+
+fn runCongestionValidationSuite(): Result[bool] =
+    let windowRes = validateSlidingWindowBasics()
+    if IsErr(windowRes):
+        return Err[bool](ErrorText(windowRes))
+    let cubicRes = validateCubicBasics()
+    if IsErr(cubicRes):
+        return Err[bool](ErrorText(cubicRes))
+    let bbrRes = validateBbrBasics()
+    if IsErr(bbrRes):
+        return Err[bool](ErrorText(bbrRes))
+    let pacingRes = validatePacingBasics()
+    if IsErr(pacingRes):
+        return Err[bool](ErrorText(pacingRes))
+    let cubicControllerRes = validateCongestionControllerBasics(common.caCubic)
+    if IsErr(cubicControllerRes):
+        return Err[bool](ErrorText(cubicControllerRes))
+    let bbrControllerRes = validateCongestionControllerBasics(common.caBbr)
+    if IsErr(bbrControllerRes):
+        return Err[bool](ErrorText(bbrControllerRes))
+    return Ok[bool](true)

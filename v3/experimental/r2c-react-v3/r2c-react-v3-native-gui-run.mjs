@@ -331,25 +331,6 @@ function exitCodeOf(result) {
   return -1;
 }
 
-function findWorkspaceRoot(scriptPath) {
-  let current = path.dirname(scriptPath);
-  while (true) {
-    if (fs.existsSync(path.join(current, 'v3', 'experimental', 'r2c-react-v3'))) return current;
-    const parent = path.dirname(current);
-    if (parent === current) break;
-    current = parent;
-  }
-  throw new Error(`failed to resolve workspace root from ${scriptPath}`);
-}
-
-function resolveDefaultToolingBin(workspaceRoot) {
-  const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
-  if (explicit) return explicit;
-  const stage3 = path.join(workspaceRoot, 'artifacts', 'v3_bootstrap', 'cheng.stage3');
-  if (fs.existsSync(stage3)) return stage3;
-  return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
-}
-
 function resolveClang() {
   const xcrun = spawnSync('xcrun', ['--sdk', 'macosx', '--find', 'clang'], { encoding: 'utf8' });
   if (xcrun.status === 0) {
@@ -359,39 +340,6 @@ function resolveClang() {
   return { bin: 'clang', prefix: [] };
 }
 
-function sessionMatchesRoute(sessionPath, targetRouteState) {
-  if (!targetRouteState || !fs.existsSync(sessionPath)) return true;
-  try {
-    const sessionDoc = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
-    return String(sessionDoc?.window?.route_state || '') === String(targetRouteState);
-  } catch {
-    return false;
-  }
-}
-
-function ensureSession(repo, outDir, bundlePath, sessionPath, bundleSummaryPath, toolPath, routeState) {
-  const targetRouteState = String(routeState || '').trim();
-  if (fs.existsSync(sessionPath) && fs.existsSync(bundlePath) && sessionMatchesRoute(sessionPath, targetRouteState)) return;
-  const result = run(toolPath, [
-    'r2c-react-v3',
-    'native-gui-bundle',
-    '--repo', repo,
-    '--out-dir', outDir,
-    ...(targetRouteState ? ['--route-state', targetRouteState] : []),
-  ]);
-  const bundleLogPath = path.join(outDir, 'native_gui_run.bundle.log');
-  writeText(bundleLogPath, [result.stdout || '', result.stderr || '', result.error ? String(result.error.stack || result.error.message || result.error) : ''].filter(Boolean).join('\n'));
-  if (exitCodeOf(result) !== 0) {
-    throw new Error(`native_gui_bundle_helper_failed:${exitCodeOf(result)}`);
-  }
-  const bundleSummary = parseSummaryEnv(bundleSummaryPath);
-  if (bundleSummary.native_gui_bundle_path) bundlePath = String(bundleSummary.native_gui_bundle_path);
-  if (bundleSummary.native_gui_session_path) sessionPath = String(bundleSummary.native_gui_session_path);
-  if (!fs.existsSync(sessionPath)) {
-    throw new Error(`native_gui_session_missing:${sessionPath}`);
-  }
-}
-
 function main() {
   if (process.platform !== 'darwin') {
     throw new Error(`native_gui_run_platform_unsupported:${process.platform}`);
@@ -399,8 +347,8 @@ function main() {
   const args = parseArgs(process.argv);
   const repo = path.resolve(args.repo);
   const outDir = path.resolve(args.outDir || path.join(repo, 'build', 'r2c_react_v3_cheng'));
-  const workspaceRoot = findWorkspaceRoot(path.resolve(process.argv[1]));
-  const toolPath = resolveDefaultToolingBin(workspaceRoot);
+  const scriptDir = path.dirname(path.resolve(process.argv[1]));
+  const workspaceRoot = path.resolve(path.join(scriptDir, '..', '..', '..'));
   const hostSourcePath = path.resolve(args.hostSourcePath || path.join(workspaceRoot, 'v3', 'experimental', 'r2c-react-v3', 'native_gui_host_macos.m'));
   const bundlePath = path.resolve(args.bundlePath || path.join(outDir, 'native_gui_bundle_v1.json'));
   const bundleSummaryPath = path.join(outDir, 'native_gui_bundle.summary.env');
@@ -416,7 +364,12 @@ function main() {
   const runLogPath = path.join(outDir, 'native_gui_host_macos.run.log');
   const autoCloseMs = String(args.autoCloseMs || '1200').trim() || '1200';
 
-  ensureSession(repo, outDir, bundlePath, sessionPath, bundleSummaryPath, toolPath, args.routeState);
+  if (!fs.existsSync(bundlePath)) {
+    throw new Error(`native_gui_bundle_missing:${bundlePath}`);
+  }
+  if (!fs.existsSync(sessionPath)) {
+    throw new Error(`native_gui_session_missing:${sessionPath}`);
+  }
   const sessionDoc = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
   if (String(sessionDoc?.format || '') !== 'native_gui_session_v1') {
     throw new Error(`unexpected native gui session format: ${String(sessionDoc?.format || '')}`);
@@ -541,7 +494,7 @@ function main() {
     native_gui_resize_observer_host_ready: Boolean(runtimeStateDoc?.resize_observer_host_ready),
     native_gui_initial_runtime_state_path: bundleSummary.native_gui_runtime_state_path || '',
     native_gui_runtime_state_path: runtimeStatePath,
-    native_gui_controller_tool_path: toolPath,
+    native_gui_controller_tool_path: '',
     native_gui_window_opened: String(fields.window_opened || '') === 'true',
     native_gui_window_title: String(fields.window_title || ''),
     native_gui_route_state: String(fields.route_state || ''),

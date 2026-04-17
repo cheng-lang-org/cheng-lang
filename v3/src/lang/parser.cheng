@@ -79,20 +79,32 @@ fn v3ParserDirPart(pathRaw: str): str =
         return ""
     return v3path.v3TextSlice(path, 0, lastSep)
 
+fn v3ParserPackageManifestExists(dirRaw: str): bool =
+    let dir = v3ParserNormalizePath(dirRaw)
+    if dir == "":
+        return false
+    return v3path.v3PathFileExists(v3path.v3PathJoin(dir, "cheng-package.toml"))
+
+fn v3ParserSharedV3Root(packageRootRaw: str): str =
+    var cursor = v3ParserNormalizePath(packageRootRaw)
+    while cursor != "":
+        if v3path.v3PathBaseName(cursor) == "v3" &&
+           v3ParserPackageManifestExists(cursor):
+            return cursor
+        let parent = v3path.v3PathParentDir(cursor)
+        if parent == "" || parent == cursor:
+            break
+        cursor = parent
+    return ""
+
 fn v3ParserWorkspaceRoot(packageRootRaw: str): str =
     let packageRoot = v3ParserNormalizePath(packageRootRaw)
-    var lastSep: int32 = -1
-    for i in 0..<packageRoot.len:
-        if packageRoot[i] == '/' || packageRoot[i] == '\\':
-            lastSep = i
-    var base = packageRoot
-    var parent = ""
-    if lastSep >= 0:
-        base = v3path.v3TextSlice(packageRoot, lastSep + 1, packageRoot.len - lastSep - 1)
-        if lastSep > 0:
-            parent = v3path.v3TextSlice(packageRoot, 0, lastSep)
-    if base == "v3" && parent != "":
-        return parent
+    let sharedV3Root = v3ParserSharedV3Root(packageRoot)
+    if sharedV3Root != "":
+        let parent = v3path.v3PathParentDir(sharedV3Root)
+        if parent != "":
+            return parent
+        return sharedV3Root
     return packageRoot
 
 fn v3ParserPackageId(packageRootRaw: str): str =
@@ -224,6 +236,15 @@ fn v3ParserRelWithoutExt(pathRaw: str): str =
         return v3path.v3TextSlice(path, 0, path.len - 6)
     return path
 
+fn v3ParserSharedV3PackageRoot(workspaceRootRaw: str): str =
+    let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
+    if workspaceRoot == "":
+        return ""
+    let sharedV3Root = v3ParserNormalizePath(v3path.v3PathJoin(workspaceRoot, "v3"))
+    if v3ParserPackageManifestExists(sharedV3Root):
+        return sharedV3Root
+    return ""
+
 fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
     let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
     let packageRoot = v3ParserNormalizePath(packageRootRaw)
@@ -232,6 +253,11 @@ fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, mo
         return ""
     if v3ParserStartsWith(modulePath, "std/") && modulePath.len > 4:
         return workspaceRoot + "/src/std/" + v3ParserModulePathTail(modulePath, 1) + ".cheng"
+    let sharedV3PackageRoot = v3ParserSharedV3PackageRoot(workspaceRoot)
+    if sharedV3PackageRoot != "" &&
+       v3ParserStartsWith(modulePath, "cheng/v3/") &&
+       modulePath.len > 9:
+        return sharedV3PackageRoot + "/src/" + v3ParserModulePathTail(modulePath, 2) + ".cheng"
     let packageId = v3ParserPackageId(packageRoot)
     if packageId != "" && modulePath.len > packageId.len && v3ParserStartsWith(modulePath, packageId + "/"):
         return packageRoot + "/src/" + v3ParserModulePathTail(modulePath, 2) + ".cheng"
@@ -250,6 +276,15 @@ fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, so
         if rel == "":
             return packageId
         return packageId + "/" + rel
+    let sharedV3PackageRoot = v3ParserSharedV3PackageRoot(workspaceRoot)
+    let sharedV3Prefix = sharedV3PackageRoot + "/src/"
+    if sharedV3PackageRoot != "" && v3ParserStartsWith(sourcePath, sharedV3Prefix):
+        let rel = v3ParserRelWithoutExt(v3path.v3TextSlice(sourcePath,
+                                                           sharedV3Prefix.len,
+                                                           sourcePath.len - sharedV3Prefix.len))
+        if rel == "":
+            return "cheng/v3"
+        return "cheng/v3/" + rel
     let stdPrefix = workspaceRoot + "/src/std/"
     if v3ParserStartsWith(sourcePath, stdPrefix):
         let rel = v3ParserRelWithoutExt(v3path.v3TextSlice(sourcePath,

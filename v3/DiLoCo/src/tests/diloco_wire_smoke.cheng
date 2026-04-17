@@ -1,0 +1,344 @@
+import std/rawbytes
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/DiLoCo/core/diloco as core
+import cheng/DiLoCo/protocol/wire
+import cheng/DiLoCo/tests/support
+
+fn v3DiLoCoWireSmokeCopyBytes(value: Bytes): Bytes =
+    let out = bytesAlloc(bytesLen(value))
+    for i in 0..<bytesLen(value):
+        bytesSet(out, i, bytesGet(value, i))
+    return out
+
+fn v3DiLoCoWireSmokeVerifyLineage(jobBundleCid: layout.FixedBytes32,
+                                  version: core.V3DiLoCoGlobalVersion): Result[bool] =
+    var lineageReq = wire.v3DiLoCoFetchLineageRequestZero()
+    lineageReq.jobBundleCid = jobBundleCid
+    let lineageReqBytes: Bytes = wire.v3DiLoCoFetchLineageRequestEncode(lineageReq)
+    var lineageReqRoundtrip = wire.v3DiLoCoFetchLineageRequestZero()
+    let lineageReqRes: Result[bool] = wire.v3DiLoCoFetchLineageRequestDecodeFill(lineageReqRoundtrip,
+                                                                                  lineageReqBytes)
+    if !lineageReqRes.ok:
+        return Err[bool]("v3 diloco wire smoke: lineage request")
+    var lineageResp = wire.v3DiLoCoFetchLineageResponseZero()
+    lineageResp.versions = []
+    add(lineageResp.versions, core.v3DiLoCoGlobalVersionZero())
+    lineageResp.versions[0].jobBundleCid = version.jobBundleCid
+    lineageResp.versions[0].versionCid = version.versionCid
+    lineageResp.versions[0].baseVersionCid = version.baseVersionCid
+    lineageResp.versions[0].committedOuterStep = version.committedOuterStep
+    lineageResp.versions[0].publisherPeerId.value = version.publisherPeerId.value
+    lineageResp.versions[0].modelRef.stubCid = version.modelRef.stubCid
+    lineageResp.versions[0].modelRef.blobSummaryCid = version.modelRef.blobSummaryCid
+    lineageResp.versions[0].modelRef.manifestCid = version.modelRef.manifestCid
+    lineageResp.versions[0].modelRef.blobCid = version.modelRef.blobCid
+    lineageResp.versions[0].modelRef.payloadLen = version.modelRef.payloadLen
+    lineageResp.versions[0].modelRef.paramsCid = version.modelRef.paramsCid
+    lineageResp.versions[0].modelRef.layoutKind = version.modelRef.layoutKind
+    lineageResp.versions[0].modelRef.dataShardCount = version.modelRef.dataShardCount
+    lineageResp.versions[0].modelRef.parityShardCount = version.modelRef.parityShardCount
+    lineageResp.versions[0].modelRef.shardPayloadBytes = version.modelRef.shardPayloadBytes
+    lineageResp.versions[0].optimizerRef.stubCid = version.optimizerRef.stubCid
+    lineageResp.versions[0].optimizerRef.blobSummaryCid = version.optimizerRef.blobSummaryCid
+    lineageResp.versions[0].optimizerRef.manifestCid = version.optimizerRef.manifestCid
+    lineageResp.versions[0].optimizerRef.blobCid = version.optimizerRef.blobCid
+    lineageResp.versions[0].optimizerRef.payloadLen = version.optimizerRef.payloadLen
+    lineageResp.versions[0].optimizerRef.paramsCid = version.optimizerRef.paramsCid
+    lineageResp.versions[0].optimizerRef.layoutKind = version.optimizerRef.layoutKind
+    lineageResp.versions[0].optimizerRef.dataShardCount = version.optimizerRef.dataShardCount
+    lineageResp.versions[0].optimizerRef.parityShardCount = version.optimizerRef.parityShardCount
+    lineageResp.versions[0].optimizerRef.shardPayloadBytes = version.optimizerRef.shardPayloadBytes
+    lineageResp.versions[0].acceptedCount = version.acceptedCount
+    lineageResp.versions[0].committedAtEpochSeconds = version.committedAtEpochSeconds
+    add(lineageResp.versions, core.v3DiLoCoGlobalVersionZero())
+    let lineageRespBytes: Bytes = wire.v3DiLoCoFetchLineageResponseEncode(lineageResp)
+    var lineageRespRoundtrip = wire.v3DiLoCoFetchLineageResponseZero()
+    let lineageRespRes: Result[bool] = wire.v3DiLoCoFetchLineageResponseDecodeFill(lineageRespRoundtrip,
+                                                                                    lineageRespBytes)
+    if !lineageRespRes.ok:
+        return Err[bool]("v3 diloco wire smoke: lineage response")
+    if lineageRespRoundtrip.versions.len != 2:
+        return Err[bool]("v3 diloco wire smoke: lineage count")
+    if !layout.fixedBytes32Equal(lineageRespRoundtrip.versions[0].versionCid, version.versionCid):
+        return Err[bool]("v3 diloco wire smoke: lineage version")
+    return Ok[bool](true)
+
+fn v3DiLoCoWireSmokeVerifyEnvelopeFailures(openReqBytes: Bytes): Result[bool] =
+    var badVersion: Bytes = v3DiLoCoWireSmokeCopyBytes(openReqBytes)
+    bytesSet(badVersion, 7, 2)
+    var envelope = wire.v3DiLoCoEnvelopeZero()
+    let badVersionRes: Result[bool] = wire.v3DiLoCoEnvelopeDecodeFill(envelope, badVersion)
+    if badVersionRes.ok:
+        return Err[bool]("v3 diloco wire smoke: bad version reject")
+
+    var badKind: Bytes = v3DiLoCoWireSmokeCopyBytes(openReqBytes)
+    bytesSet(badKind, 11, 99)
+    let badKindRes: Result[bool] = wire.v3DiLoCoEnvelopeDecodeFill(envelope, badKind)
+    if badKindRes.ok:
+        return Err[bool]("v3 diloco wire smoke: bad kind reject")
+
+    let shortPayload: Bytes = bytesSlice(openReqBytes, 0, bytesLen(openReqBytes) - 1)
+    let shortRes: Result[bool] = wire.v3DiLoCoEnvelopeDecodeFill(envelope, shortPayload)
+    if shortRes.ok:
+        return Err[bool]("v3 diloco wire smoke: short shape reject")
+
+    let errorPayload: Bytes = wire.v3DiLoCoWireEncodeErrorEnvelope(wire.v3DiLoCoMessageFetchGlobalVersion,
+                                                                   "forced-error")
+    var errorResponse = wire.v3DiLoCoFetchGlobalVersionResponseZero()
+    let errorRes: Result[bool] = wire.v3DiLoCoFetchGlobalVersionResponseDecodeFill(errorResponse,
+                                                                                   errorPayload)
+    if errorRes.ok:
+        return Err[bool]("v3 diloco wire smoke: error envelope reject")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let jobBundleCid = support.v3DiLoCoTestJobBundleCid("wire-smoke")
+    let leaderPeerId = support.v3DiLoCoTestPeer("diloco.wire.leader")
+    let workerPeerId = support.v3DiLoCoTestPeer("diloco.wire.worker")
+    let initialModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-initial-model")
+    let initialOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-initial-optimizer")
+    let deltaModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-delta-model")
+    let deltaOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-delta-optimizer")
+    let mergedModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-merged-model")
+    let mergedOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "wire-merged-optimizer")
+
+    var job = core.v3DiLoCoJobZero()
+    job.jobBundleCid = jobBundleCid
+    job.requestedWorkerCount = 2
+    job.innerStepBudget = 5
+    job.outerStepTimeoutSeconds = 60
+    job.currentGlobalVersionCid = support.v3DiLoCoTestJobBundleCid("wire-current-version")
+    job.currentOuterStep = 1
+    job.sealed = true
+    job.cohortCid = support.v3DiLoCoTestJobBundleCid("wire-cohort")
+    job.openedAtEpochSeconds = int64(11)
+
+    var cohort = core.v3DiLoCoCohortZero()
+    cohort.jobBundleCid = jobBundleCid
+    cohort.cohortCid = job.cohortCid
+    cohort.leaderPeerId = leaderPeerId
+    cohort.members = [leaderPeerId, workerPeerId]
+    cohort.sealedAtEpochSeconds = int64(12)
+    cohort.fixedMemberCount = 2
+
+    var lease = core.v3DiLoCoLeaseZero()
+    lease.jobBundleCid = jobBundleCid
+    lease.cohortCid = cohort.cohortCid
+    lease.peerId = workerPeerId
+    lease.baseVersionCid = job.currentGlobalVersionCid
+    lease.outerStep = 1
+    lease.innerStepBudget = 5
+    lease.leasedAtEpochSeconds = int64(13)
+    lease.expiresAtEpochSeconds = int64(73)
+    lease.active = true
+
+    var barrier = core.v3DiLoCoBarrierZero()
+    barrier.jobBundleCid = jobBundleCid
+    barrier.cohortCid = cohort.cohortCid
+    barrier.baseVersionCid = lease.baseVersionCid
+    barrier.outerStep = 1
+    barrier.expectedMemberCount = 2
+    barrier.completedPeerIds = [leaderPeerId, workerPeerId]
+    barrier.sealed = true
+
+    var delta = core.v3DiLoCoOuterDeltaZero()
+    delta.jobBundleCid = jobBundleCid
+    delta.deltaCid = support.v3DiLoCoTestJobBundleCid("wire-delta")
+    delta.baseVersionCid = lease.baseVersionCid
+    delta.outerStep = 1
+    delta.publisherPeerId = workerPeerId
+    delta.modelDeltaRef = deltaModelRef
+    delta.optimizerDeltaRef = deltaOptimizerRef
+    delta.sampleCount = 9
+    delta.tokenCount = 72
+    delta.innerStepCount = 5
+    delta.weightNumerator = 9
+    delta.weightDenominator = 16
+    delta.submittedAtEpochSeconds = int64(14)
+
+    var status = core.v3DiLoCoStepStatusZero()
+    status.jobBundleCid = jobBundleCid
+    status.baseVersionCid = lease.baseVersionCid
+    status.outerStep = 1
+    status.barrierReady = true
+    status.barrierArrivedCount = 2
+    status.expectedMemberCount = 2
+    status.contributionCount = 2
+    status.commitPublished = true
+    status.mergeCommitCid = support.v3DiLoCoTestJobBundleCid("wire-commit")
+
+    var version = core.v3DiLoCoGlobalVersionZero()
+    version.jobBundleCid = jobBundleCid
+    version.versionCid = support.v3DiLoCoTestJobBundleCid("wire-version")
+    version.baseVersionCid = lease.baseVersionCid
+    version.committedOuterStep = 1
+    version.publisherPeerId = leaderPeerId
+    version.modelRef = mergedModelRef
+    version.optimizerRef = mergedOptimizerRef
+    version.acceptedCount = 2
+    version.committedAtEpochSeconds = int64(15)
+
+    var commit = core.v3DiLoCoMergeCommitZero()
+    commit.jobBundleCid = jobBundleCid
+    commit.commitCid = status.mergeCommitCid
+    commit.baseVersionCid = lease.baseVersionCid
+    commit.nextGlobalVersionCid = version.versionCid
+    commit.outerStep = 1
+    commit.leaderPeerId = leaderPeerId
+    commit.acceptedCount = 2
+    commit.contributionCids = [delta.deltaCid, support.v3DiLoCoTestJobBundleCid("wire-delta-leader")]
+    commit.publishedAtEpochSeconds = int64(15)
+
+    var openReq = wire.v3DiLoCoOpenJobRequestZero()
+    openReq.jobBundleCid = jobBundleCid
+    openReq.requestedWorkerCount = 2
+    openReq.innerStepBudget = 5
+    openReq.outerStepTimeoutSeconds = 60
+    openReq.initialModelRef = initialModelRef
+    openReq.initialOptimizerRef = initialOptimizerRef
+    let openReqBytes = wire.v3DiLoCoOpenJobRequestEncode(openReq)
+    var openReqRoundtrip = wire.v3DiLoCoOpenJobRequestZero()
+    let openReqRes = wire.v3DiLoCoOpenJobRequestDecodeFill(openReqRoundtrip, openReqBytes)
+    assert(openReqRes.ok, "v3 diloco wire smoke: open request")
+    assert(layout.fixedBytes32Equal(openReqRoundtrip.jobBundleCid, jobBundleCid), "v3 diloco wire smoke: open request cid")
+
+    var openResp = wire.v3DiLoCoOpenJobResponseZero()
+    openResp.job = job
+    openResp.version = version
+    let openRespBytes = wire.v3DiLoCoOpenJobResponseEncode(openResp)
+    var openRespRoundtrip = wire.v3DiLoCoOpenJobResponseZero()
+    let openRespRes = wire.v3DiLoCoOpenJobResponseDecodeFill(openRespRoundtrip, openRespBytes)
+    assert(openRespRes.ok, "v3 diloco wire smoke: open response")
+    assert(layout.fixedBytes32Equal(openRespRoundtrip.version.versionCid, version.versionCid), "v3 diloco wire smoke: open response version")
+
+    var joinReq = wire.v3DiLoCoJoinCohortRequestZero()
+    joinReq.jobBundleCid = jobBundleCid
+    joinReq.peerId = workerPeerId
+    let joinReqBytes = wire.v3DiLoCoJoinCohortRequestEncode(joinReq)
+    var joinReqRoundtrip = wire.v3DiLoCoJoinCohortRequestZero()
+    let joinReqRes = wire.v3DiLoCoJoinCohortRequestDecodeFill(joinReqRoundtrip, joinReqBytes)
+    assert(joinReqRes.ok,
+        "v3 diloco wire smoke: join request")
+    var joinResp = wire.v3DiLoCoJoinCohortResponseZero()
+    joinResp.cohort = cohort
+    let joinRespBytes = wire.v3DiLoCoJoinCohortResponseEncode(joinResp)
+    var joinRespRoundtrip = wire.v3DiLoCoJoinCohortResponseZero()
+    let joinRespRes = wire.v3DiLoCoJoinCohortResponseDecodeFill(joinRespRoundtrip, joinRespBytes)
+    assert(joinRespRes.ok,
+        "v3 diloco wire smoke: join response")
+
+    var leaseReq = wire.v3DiLoCoFetchLeaseRequestZero()
+    leaseReq.jobBundleCid = jobBundleCid
+    leaseReq.peerId = workerPeerId
+    let leaseReqBytes = wire.v3DiLoCoFetchLeaseRequestEncode(leaseReq)
+    var leaseReqRoundtrip = wire.v3DiLoCoFetchLeaseRequestZero()
+    let leaseReqRes = wire.v3DiLoCoFetchLeaseRequestDecodeFill(leaseReqRoundtrip, leaseReqBytes)
+    assert(leaseReqRes.ok,
+        "v3 diloco wire smoke: lease request")
+    var leaseResp = wire.v3DiLoCoFetchLeaseResponseZero()
+    leaseResp.lease = lease
+    let leaseRespBytes = wire.v3DiLoCoFetchLeaseResponseEncode(leaseResp)
+    var leaseRespRoundtrip = wire.v3DiLoCoFetchLeaseResponseZero()
+    let leaseRespRes = wire.v3DiLoCoFetchLeaseResponseDecodeFill(leaseRespRoundtrip, leaseRespBytes)
+    assert(leaseRespRes.ok,
+        "v3 diloco wire smoke: lease response")
+
+    var barrierReq = wire.v3DiLoCoReportInnerStepDoneRequestZero()
+    barrierReq.jobBundleCid = jobBundleCid
+    barrierReq.peerId = workerPeerId
+    let barrierReqBytes = wire.v3DiLoCoReportInnerStepDoneRequestEncode(barrierReq)
+    var barrierReqRoundtrip = wire.v3DiLoCoReportInnerStepDoneRequestZero()
+    let barrierReqRes = wire.v3DiLoCoReportInnerStepDoneRequestDecodeFill(barrierReqRoundtrip, barrierReqBytes)
+    assert(barrierReqRes.ok,
+        "v3 diloco wire smoke: barrier request")
+    var barrierResp = wire.v3DiLoCoReportInnerStepDoneResponseZero()
+    barrierResp.barrier = barrier
+    let barrierRespBytes = wire.v3DiLoCoReportInnerStepDoneResponseEncode(barrierResp)
+    var barrierRespRoundtrip = wire.v3DiLoCoReportInnerStepDoneResponseZero()
+    let barrierRespRes = wire.v3DiLoCoReportInnerStepDoneResponseDecodeFill(barrierRespRoundtrip, barrierRespBytes)
+    assert(barrierRespRes.ok,
+        "v3 diloco wire smoke: barrier response")
+
+    var deltaReq = wire.v3DiLoCoSubmitOuterDeltaRequestZero()
+    deltaReq.jobBundleCid = jobBundleCid
+    deltaReq.baseVersionCid = lease.baseVersionCid
+    deltaReq.outerStep = 1
+    deltaReq.publisherPeerId = workerPeerId
+    deltaReq.modelDeltaRef = deltaModelRef
+    deltaReq.optimizerDeltaRef = deltaOptimizerRef
+    deltaReq.sampleCount = 9
+    deltaReq.tokenCount = 72
+    deltaReq.innerStepCount = 5
+    deltaReq.weightNumerator = 9
+    deltaReq.weightDenominator = 16
+    let deltaReqBytes = wire.v3DiLoCoSubmitOuterDeltaRequestEncode(deltaReq)
+    var deltaReqRoundtrip = wire.v3DiLoCoSubmitOuterDeltaRequestZero()
+    let deltaReqRes = wire.v3DiLoCoSubmitOuterDeltaRequestDecodeFill(deltaReqRoundtrip, deltaReqBytes)
+    assert(deltaReqRes.ok,
+        "v3 diloco wire smoke: delta request")
+    assert(deltaReqRoundtrip.outerStep == 1, "v3 diloco wire smoke: delta request outer step")
+    var deltaResp = wire.v3DiLoCoSubmitOuterDeltaResponseZero()
+    deltaResp.delta = delta
+    let deltaRespBytes = wire.v3DiLoCoSubmitOuterDeltaResponseEncode(deltaResp)
+    var deltaRespRoundtrip = wire.v3DiLoCoSubmitOuterDeltaResponseZero()
+    let deltaRespRes = wire.v3DiLoCoSubmitOuterDeltaResponseDecodeFill(deltaRespRoundtrip, deltaRespBytes)
+    assert(deltaRespRes.ok,
+        "v3 diloco wire smoke: delta response")
+
+    var statusReq = wire.v3DiLoCoFetchStepStatusRequestZero()
+    statusReq.jobBundleCid = jobBundleCid
+    let statusReqBytes = wire.v3DiLoCoFetchStepStatusRequestEncode(statusReq)
+    var statusReqRoundtrip = wire.v3DiLoCoFetchStepStatusRequestZero()
+    let statusReqRes = wire.v3DiLoCoFetchStepStatusRequestDecodeFill(statusReqRoundtrip, statusReqBytes)
+    assert(statusReqRes.ok,
+        "v3 diloco wire smoke: status request")
+    var statusResp = wire.v3DiLoCoFetchStepStatusResponseZero()
+    statusResp.status = status
+    let statusRespBytes = wire.v3DiLoCoFetchStepStatusResponseEncode(statusResp)
+    var statusRespRoundtrip = wire.v3DiLoCoFetchStepStatusResponseZero()
+    let statusRespRes = wire.v3DiLoCoFetchStepStatusResponseDecodeFill(statusRespRoundtrip, statusRespBytes)
+    assert(statusRespRes.ok,
+        "v3 diloco wire smoke: status response")
+
+    var commitReq = wire.v3DiLoCoPublishMergeCommitRequestZero()
+    commitReq.jobBundleCid = jobBundleCid
+    commitReq.publisherPeerId = leaderPeerId
+    commitReq.mergedModelRef = mergedModelRef
+    commitReq.mergedOptimizerRef = mergedOptimizerRef
+    let commitReqBytes = wire.v3DiLoCoPublishMergeCommitRequestEncode(commitReq)
+    var commitReqRoundtrip = wire.v3DiLoCoPublishMergeCommitRequestZero()
+    let commitReqRes = wire.v3DiLoCoPublishMergeCommitRequestDecodeFill(commitReqRoundtrip, commitReqBytes)
+    assert(commitReqRes.ok,
+        "v3 diloco wire smoke: commit request")
+    var commitResp = wire.v3DiLoCoPublishMergeCommitResponseZero()
+    commitResp.commit = commit
+    commitResp.version = version
+    let commitRespBytes = wire.v3DiLoCoPublishMergeCommitResponseEncode(commitResp)
+    var commitRespRoundtrip = wire.v3DiLoCoPublishMergeCommitResponseZero()
+    let commitRespRes = wire.v3DiLoCoPublishMergeCommitResponseDecodeFill(commitRespRoundtrip, commitRespBytes)
+    assert(commitRespRes.ok,
+        "v3 diloco wire smoke: commit response")
+
+    var versionReq = wire.v3DiLoCoFetchGlobalVersionRequestZero()
+    versionReq.jobBundleCid = jobBundleCid
+    let versionReqBytes = wire.v3DiLoCoFetchGlobalVersionRequestEncode(versionReq)
+    var versionReqRoundtrip = wire.v3DiLoCoFetchGlobalVersionRequestZero()
+    let versionReqRes = wire.v3DiLoCoFetchGlobalVersionRequestDecodeFill(versionReqRoundtrip, versionReqBytes)
+    assert(versionReqRes.ok,
+        "v3 diloco wire smoke: version request")
+    var versionResp = wire.v3DiLoCoFetchGlobalVersionResponseZero()
+    versionResp.version = version
+    let versionRespBytes = wire.v3DiLoCoFetchGlobalVersionResponseEncode(versionResp)
+    var versionRespRoundtrip = wire.v3DiLoCoFetchGlobalVersionResponseZero()
+    let versionRespRes = wire.v3DiLoCoFetchGlobalVersionResponseDecodeFill(versionRespRoundtrip, versionRespBytes)
+    assert(versionRespRes.ok,
+        "v3 diloco wire smoke: version response")
+
+    let lineageCheckRes: Result[bool] = v3DiLoCoWireSmokeVerifyLineage(jobBundleCid, version)
+    assert(lineageCheckRes.ok, "v3 diloco wire smoke: lineage helper")
+    let failureCheckRes: Result[bool] = v3DiLoCoWireSmokeVerifyEnvelopeFailures(openReqBytes)
+    assert(failureCheckRes.ok, "v3 diloco wire smoke: failure helper")
+
+    echo("v3 diloco_wire_smoke ok")
+    return 0

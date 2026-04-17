@@ -103,6 +103,28 @@ fn v3BftMainReadRequiredInt64Flag(flag: str): Result[int64] =
         return Err[int64](Error(readRes))
     return host.v3BftValidatorParseInt64Text(raw)
 
+fn v3BftMainReadServePort(flag: str): Result[int32] =
+    let port = cmdline.readInt32FlagOrDefault(flag, -1)
+    if port < 0 || port > 65535:
+        return Err[int32]("v3 bft main: invalid " + flag)
+    return Ok[int32](port)
+
+fn v3BftMainResolveReadyPortForSecondPhase(requestedPort: int32,
+                                           readyPath: str): Result[int32] =
+    if requestedPort > 0:
+        return Ok[int32](requestedPort)
+    if requestedPort == 0:
+        if len(readyPath) <= 0:
+            return Err[int32]("v3 bft main: state-serve-daemon requires --ready-path when --port:0")
+        let portText = strutil.strip(v3path.v3ReadTextFile(os.getCurrentDir(), readyPath))
+        let parseRes = host.v3BftValidatorParseInt64Text(portText)
+        if IsErr(parseRes):
+            return Err[int32]("v3 bft main: invalid ready port")
+        if Value(parseRes) <= int64(0) || Value(parseRes) > int64(65535):
+            return Err[int32]("v3 bft main: invalid ready port")
+        return Ok[int32](int32(Value(parseRes)))
+    return Err[int32]("v3 bft main: invalid --port")
+
 fn v3BftMainSleepMs(value: int32) =
     if value <= 0:
         return
@@ -112,7 +134,8 @@ fn v3BftMainFollowerRetryableRecvError(err: str): bool =
     return v3BftMainTextStartsWith(err, "v3 libp2p quic: dial") ||
            v3BftMainTextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
            v3BftMainTextStartsWith(err, "msquic native: pipe read timeout") ||
-           v3BftMainTextStartsWith(err, "msquic: pipe closed")
+           v3BftMainTextStartsWith(err, "msquic native: handshake ! ready") ||
+           v3BftMainTextStartsWith(err, "msquic native: session ! ready")
 
 fn v3BftMainSelfTest(): int32 =
     let appId = "bft-validator-self-test"
@@ -944,13 +967,14 @@ fn v3BftMainServeHexDaemonCommand(protocol: types.V3Libp2pProtocolId): int32 =
         os.writeLine(os.get_stderr(), Error(fileRes))
         return 2
     let hostText = cmdline.readFlagOrDefault("--host", "0.0.0.0")
-    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let portRes = v3BftMainReadServePort("--port")
+    if IsErr(portRes):
+        os.writeLine(os.get_stderr(), Error(portRes))
+        return 2
+    let port = Value(portRes)
     let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
     let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 200)
     let maxServeCount = cmdline.readInt32FlagOrDefault("--max-serve-count", 0)
-    if port <= 0:
-        os.writeLine(os.get_stderr(), "v3 bft main: serve daemon requires --port")
-        return 2
     var served = 0
     while maxServeCount <= 0 || served < maxServeCount:
         let payloadRes = host.v3BftValidatorReadHexFile(filePath)
@@ -971,16 +995,17 @@ fn v3BftMainStateServeDaemonCommand(): int32 =
         os.writeLine(os.get_stderr(), Error(fileRes))
         return 2
     let hostText = cmdline.readFlagOrDefault("--host", "0.0.0.0")
-    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let portRes = v3BftMainReadServePort("--port")
+    if IsErr(portRes):
+        os.writeLine(os.get_stderr(), Error(portRes))
+        return 2
+    let port = Value(portRes)
     var snapshotDir = cmdline.readFlagOrDefault("--snapshot-dir", "")
     if len(snapshotDir) <= 0:
         snapshotDir = host.v3BftValidatorDefaultStateSyncDir(filePath)
     let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
     let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 0)
     let maxServeCount = cmdline.readInt32FlagOrDefault("--max-serve-count", 0)
-    if port <= 0:
-        os.writeLine(os.get_stderr(), "v3 bft main: state-serve-daemon requires --port")
-        return 2
     var served = 0
     while maxServeCount <= 0 || served < maxServeCount:
         let requestRes = quic_transport.v3Libp2pQuicServeRequestCaptureOnceNamed(hostText,
@@ -998,8 +1023,12 @@ fn v3BftMainStateServeDaemonCommand(): int32 =
             payload = host.v3BftValidatorStateSyncPayloadForHeight(snapshotDir, Value(heightRes))
         else:
             payload = host.v3BftValidatorEncodeStateSyncError(Error(heightRes))
+        let payloadPortRes = v3BftMainResolveReadyPortForSecondPhase(port, readyPath)
+        if IsErr(payloadPortRes):
+            os.writeLine(os.get_stderr(), Error(payloadPortRes))
+            return 2
         let serveRes = quic_transport.v3Libp2pQuicServePayloadOnceNamed(hostText,
-                                                                        port,
+                                                                        Value(payloadPortRes),
                                                                         host.v3BftValidatorPublicTransportServerName(),
                                                                         host.v3BftValidatorStateSyncProtocol(),
                                                                         payload,
@@ -1019,13 +1048,14 @@ fn v3BftMainVoteCaptureDaemonCommand(): int32 =
         os.writeLine(os.get_stderr(), Error(fileRes))
         return 2
     let hostText = cmdline.readFlagOrDefault("--host", "0.0.0.0")
-    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let portRes = v3BftMainReadServePort("--port")
+    if IsErr(portRes):
+        os.writeLine(os.get_stderr(), Error(portRes))
+        return 2
+    let port = Value(portRes)
     let readyPath = cmdline.readFlagOrDefault("--ready-path", "")
     let intervalMs = cmdline.readInt32FlagOrDefault("--interval-ms", 0)
     let maxVoteCount = cmdline.readInt32FlagOrDefault("--max-vote-count", 0)
-    if port <= 0:
-        os.writeLine(os.get_stderr(), "v3 bft main: vote-capture-daemon requires --port")
-        return 2
     var captured = 0
     while maxVoteCount <= 0 || captured < maxVoteCount:
         let captureRes = host.v3BftValidatorCaptureVoteOnce(filePath, hostText, port, readyPath)

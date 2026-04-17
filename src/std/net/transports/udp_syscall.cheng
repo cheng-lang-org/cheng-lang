@@ -12,6 +12,8 @@ const
     udpAfInet6Linux = 10
     udpAfInet6Bsd = 30
     udpSockDgram = 2
+    udpRecvScratchSlots = 64
+    udpRecvScratchAddrBytes = 128
 
     udpIpProtoIp = 0
     udpIpProtoIpv6 = 41
@@ -52,6 +54,12 @@ type
         data: Bytes
         fromAddr: UdpSockAddr
 
+var
+    udpRecvScratchReady: bool = false
+    udpRecvScratchFd: int32[udpRecvScratchSlots]
+    udpRecvScratchData: Bytes[udpRecvScratchSlots]
+    udpRecvScratchAddr: Bytes[udpRecvScratchSlots]
+
 fn udpErrno(): int32 =
     return os.udpErrno()
 
@@ -73,6 +81,59 @@ fn udpErrSupportsLenFallback(code: int32): bool =
     if code == udpErrOpNotSuppLinux || code == udpErrOpNotSuppBsd:
         return true
     return false
+
+fn udpRecvScratchInit() =
+    if udpRecvScratchReady:
+        return
+    for i in 0..<udpRecvScratchSlots:
+        udpRecvScratchFd[i] = -1
+        udpRecvScratchData[i] = emptyBytes()
+        udpRecvScratchAddr[i] = emptyBytes()
+    udpRecvScratchReady = true
+
+fn udpRecvScratchSlot(fd: int32): int32 =
+    udpRecvScratchInit()
+    var freeIdx: int32 = -1
+    for i in 0..<udpRecvScratchSlots:
+        if udpRecvScratchFd[i] == fd:
+            return i
+        if udpRecvScratchFd[i] < 0 && freeIdx < 0:
+            freeIdx = i
+    if freeIdx >= 0:
+        udpRecvScratchFd[freeIdx] = fd
+        return freeIdx
+    var slot: int32 = fd % udpRecvScratchSlots
+    if slot < 0:
+        slot = 0 - slot
+    udpRecvScratchFd[slot] = fd
+    udpRecvScratchData[slot] = emptyBytes()
+    udpRecvScratchAddr[slot] = emptyBytes()
+    return slot
+
+fn udpRecvScratchPayload(fd: int32, maxBytes: int32): Bytes =
+    let slot: int32 = udpRecvScratchSlot(fd)
+    if slot < 0:
+        return emptyBytes()
+    if maxBytes > bytesLen(udpRecvScratchData[slot]):
+        udpRecvScratchData[slot] = bytesAlloc(maxBytes)
+    return udpRecvScratchData[slot]
+
+fn udpRecvScratchAddrBuf(fd: int32): Bytes =
+    let slot: int32 = udpRecvScratchSlot(fd)
+    if slot < 0:
+        return emptyBytes()
+    if udpRecvScratchAddrBytes > bytesLen(udpRecvScratchAddr[slot]):
+        udpRecvScratchAddr[slot] = bytesAlloc(udpRecvScratchAddrBytes)
+    return udpRecvScratchAddr[slot]
+
+fn udpRecvScratchRelease(fd: int32) =
+    udpRecvScratchInit()
+    for i in 0..<udpRecvScratchSlots:
+        if udpRecvScratchFd[i] == fd:
+            udpRecvScratchFd[i] = -1
+            udpRecvScratchData[i] = emptyBytes()
+            udpRecvScratchAddr[i] = emptyBytes()
+            return
 
 fn udpSocketEnableNonblock(fd: int32) =
     if fd < 0:
@@ -126,6 +187,7 @@ fn udpSocketOpenDgram(isV6: bool): Result[UdpSocketHandle] =
 fn udpSocketClose(fd: int32) =
     if fd < 0:
         return
+    udpRecvScratchRelease(fd)
     let _ = os.udpCloseFd(fd)
 
 fn udpWriteU16BE(buf: Bytes, offset: int32, value: int32) =
@@ -298,8 +360,10 @@ fn udpRecvFromNonblock(fd: int32, maxBytes: int32, out: var UdpRecvResult): Resu
         return Err[bool]("udp syscall: invalid recv size")
 
     let recvFlags: int32 = os.udpPlatformMsgDontWaitBridge()
-    let dataBuf: Bytes = bytesAlloc(maxBytes)
-    let rawAddr: Bytes = bytesAlloc(128)
+    let dataBuf: Bytes = udpRecvScratchPayload(fd, maxBytes)
+    let rawAddr: Bytes = udpRecvScratchAddrBuf(fd)
+    if bytesLen(dataBuf) < maxBytes || bytesLen(rawAddr) < udpRecvScratchAddrBytes:
+        return Err[bool]("udp syscall: recv scratch unavailable")
     var rawLen: int32 = 0
     var recvErr: int32 = 0
     let recvLenRaw: int32 = cheng_v3_udp_recvfrom_addr_bridge(
@@ -343,8 +407,10 @@ fn udpRecvFromBlocking(fd: int32, maxBytes: int32, out: var UdpRecvResult): Resu
     if maxBytes <= 0:
         return Err[bool]("udp syscall: invalid recv size")
 
-    let dataBuf: Bytes = bytesAlloc(maxBytes)
-    let rawAddr: Bytes = bytesAlloc(128)
+    let dataBuf: Bytes = udpRecvScratchPayload(fd, maxBytes)
+    let rawAddr: Bytes = udpRecvScratchAddrBuf(fd)
+    if bytesLen(dataBuf) < maxBytes || bytesLen(rawAddr) < udpRecvScratchAddrBytes:
+        return Err[bool]("udp syscall: recv scratch unavailable")
     var rawLen: int32 = 0
     var recvErr: int32 = 0
     let recvLenRaw: int32 = cheng_v3_udp_recvfrom_addr_bridge(

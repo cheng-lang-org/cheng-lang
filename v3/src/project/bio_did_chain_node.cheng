@@ -4,6 +4,7 @@ import std/strings as strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/std/crypto/fixed256
+import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/consensus as consensus
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/peer_id
@@ -14,8 +15,18 @@ import cheng/v3/project/chain_node as chain
 
 const
     v3BioDidChainAssetId: int32 = 930001
+    v3BioDidOperatorAnchorAssetId: int32 = 930002
+    v3BioDidOperatorAnchorAccountId: int32 = 1
     v3BioDidBundleVersionText = "2"
+    v3BioDidOperatorAnchorVersionText = "2"
+    v3BioDidOperatorAnchorVersionTextLegacy = "1"
     v3BioDidHardwareAttestationVersion: int32 = 1
+    v3BioDidRecoveryModeSecretV1 = "recovery_secret_v1"
+    v3BioDidOperatorTag = "v3.bio.did.operator.v1"
+    v3BioDidOperatorIndexInitCap: int32 = 64
+    v3BioDidOperatorBundleKindAndroidBioV1 = "android_bio_v1"
+    v3BioDidOperatorBundleKindBrowserPublicV1 = "browser_public_v1"
+    v3BioDidOperatorBundleKindBrowserRecoveryDraftV1 = "browser_recovery_draft_v1"
 
 type
     V3BioDidHardwareCapture =
@@ -64,13 +75,132 @@ type
         hardware: V3BioDidHardwareAttestation
         bundleCid: layout.FixedBytes32
 
+    V3BioDidChainBundleHeader =
+        action: str
+        bundleSeq: int32
+        didText: str
+        bundleCid: layout.FixedBytes32
+
     V3BioDidProvisionResult =
         identity: did.V3DidIdentity
         document: did.V3DidDocument
         bundle: V3BioDidChainBundle
 
+    V3BioDidOperatorAnchor =
+        operatorId: layout.FixedBytes32
+        bundleKind: str
+        recoveryMode: str
+        didText: str
+        subjectDidText: str
+        deviceDidText: str
+        bundleSeq: int32
+        bundleCid: layout.FixedBytes32
+        bundleText: str
+        eventId: str
+
+    V3BioDidOperatorRecord =
+        operatorId: layout.FixedBytes32
+        bundleKind: str
+        didText: str
+        subjectDidText: str
+        deviceDidText: str
+        bundleSeq: int32
+        bundleCid: layout.FixedBytes32
+        bundleText: str
+        eventId: str
+        anchorSeq: int32
+
+    V3BioDidOperatorKindKey =
+        operatorId: layout.FixedBytes32
+        bundleKind: str
+
+    V3BioDidOperatorIndex =
+        keys: layout.FixedBytes32[]
+        vals: V3BioDidOperatorRecord[]
+        used: int32[]
+        len: int32
+
+    V3BioDidOperatorKindIndex =
+        keys: V3BioDidOperatorKindKey[]
+        vals: V3BioDidOperatorRecord[]
+        used: int32[]
+        len: int32
+
+    V3BioDidChainState =
+        node: chain.V3ChainNode
+        operatorIndex: V3BioDidOperatorIndex
+        operatorKindIndex: V3BioDidOperatorKindIndex
+        operatorAnchorSeq: int32
+
 var v3BioDidTrustedAttestorPubKeyHex: str = ""
 var v3BioDidTrustedAttestorRootKeyId: str = ""
+
+fn v3BioDidCopyText(text: str): str =
+    var out = ""
+    out = did.v3DidTextAppend(out, text)
+    return out
+
+fn v3BioDidTextEqual(left: str, right: str): bool =
+    let leftLen = strings.len(left)
+    if leftLen != strings.len(right):
+        return false
+    for i in 0..<leftLen:
+        if left[i] != right[i]:
+            return false
+    return true
+
+fn v3BioDidTextDiffIndex(left: str, right: str): int32 =
+    let leftLen = strings.len(left)
+    let rightLen = strings.len(right)
+    var stop = leftLen
+    if rightLen < stop:
+        stop = rightLen
+    for i in 0..<stop:
+        if left[i] != right[i]:
+            return i
+    if leftLen != rightLen:
+        return stop
+    return -1
+
+fn v3BioDidTextSliceHex(text: str, start0: int32, count0: int32): str =
+    let textLen = strings.len(text)
+    if textLen <= 0 || count0 <= 0:
+        return ""
+    var start = start0
+    if start < 0:
+        start = 0
+    if start >= textLen:
+        return ""
+    var count = count0
+    if start + count > textLen:
+        count = textLen - start
+    return did.v3DidStoreEncodeText(strings.sliceBytes(text, start, count))
+
+fn v3BioDidTextMismatch(label: str,
+                        want: str,
+                        got: str): str =
+    let diffAt = v3BioDidTextDiffIndex(want, got)
+    var snippetStart = diffAt - 8
+    if snippetStart < 0:
+        snippetStart = 0
+    var out = "v3 bio did: "
+    out = did.v3DidTextAppend(out, label)
+    out = did.v3DidTextAppend(out, " want_len=")
+    out = did.v3DidTextAppend(out, strings.intToStr(strings.len(want)))
+    out = did.v3DidTextAppend(out, " got_len=")
+    out = did.v3DidTextAppend(out, strings.intToStr(strings.len(got)))
+    out = did.v3DidTextAppend(out, " diff_at=")
+    out = did.v3DidTextAppend(out, strings.intToStr(diffAt))
+    out = did.v3DidTextAppend(out, " want_hex=")
+    out = did.v3DidTextAppend(out, v3BioDidTextSliceHex(want, snippetStart, 24))
+    out = did.v3DidTextAppend(out, " got_hex=")
+    out = did.v3DidTextAppend(out, v3BioDidTextSliceHex(got, snippetStart, 24))
+    return out
+
+fn v3BioDidOperatorBundleKindNormalize(bundleKind: str): str =
+    if strings.len(bundleKind) <= 0:
+        return v3BioDidOperatorBundleKindAndroidBioV1
+    return bundleKind
 
 fn v3BioDidHardwareCaptureZero(): V3BioDidHardwareCapture =
     var out: V3BioDidHardwareCapture
@@ -133,6 +263,334 @@ fn v3BioDidProvisionResultZero(): V3BioDidProvisionResult =
     out.bundle = v3BioDidChainBundleZero()
     return out
 
+fn v3BioDidOperatorAnchorZero(): V3BioDidOperatorAnchor =
+    var out: V3BioDidOperatorAnchor
+    out.operatorId = layout.fixedBytes32Zero()
+    out.bundleKind = ""
+    out.recoveryMode = ""
+    out.didText = ""
+    out.subjectDidText = ""
+    out.deviceDidText = ""
+    out.bundleSeq = 0
+    out.bundleCid = layout.fixedBytes32Zero()
+    out.bundleText = ""
+    out.eventId = ""
+    return out
+
+fn v3BioDidOperatorRecordZero(): V3BioDidOperatorRecord =
+    var out: V3BioDidOperatorRecord
+    out.operatorId = layout.fixedBytes32Zero()
+    out.bundleKind = ""
+    out.didText = ""
+    out.subjectDidText = ""
+    out.deviceDidText = ""
+    out.bundleSeq = 0
+    out.bundleCid = layout.fixedBytes32Zero()
+    out.bundleText = ""
+    out.eventId = ""
+    out.anchorSeq = 0
+    return out
+
+fn v3BioDidOperatorKindKeyZero(): V3BioDidOperatorKindKey =
+    var out: V3BioDidOperatorKindKey
+    out.operatorId = layout.fixedBytes32Zero()
+    out.bundleKind = ""
+    return out
+
+fn v3BioDidOperatorIndexZero(): V3BioDidOperatorIndex =
+    var out: V3BioDidOperatorIndex
+    var keys: layout.FixedBytes32[]
+    var vals: V3BioDidOperatorRecord[]
+    var used: int32[]
+    keys.len = 0
+    vals.len = 0
+    used.len = 0
+    out.keys = keys
+    out.vals = vals
+    out.used = used
+    out.len = 0
+    return out
+
+fn v3BioDidOperatorKindIndexZero(): V3BioDidOperatorKindIndex =
+    var out: V3BioDidOperatorKindIndex
+    var keys: V3BioDidOperatorKindKey[]
+    var vals: V3BioDidOperatorRecord[]
+    var used: int32[]
+    keys.len = 0
+    vals.len = 0
+    used.len = 0
+    out.keys = keys
+    out.vals = vals
+    out.used = used
+    out.len = 0
+    return out
+
+fn v3BioDidChainStateZero(node: chain.V3ChainNode): V3BioDidChainState =
+    var out: V3BioDidChainState
+    out.node = node
+    out.operatorIndex = v3BioDidOperatorIndexZero()
+    out.operatorKindIndex = v3BioDidOperatorKindIndexZero()
+    out.operatorAnchorSeq = 0
+    return out
+
+fn v3BioDidChainStateInit(nodeId: str, addressSeed: str): V3BioDidChainState =
+    return v3BioDidChainStateZero(chain.v3ChainNodeInit(nodeId, addressSeed))
+
+fn v3BioDidOperatorIndexRoundUpPow2(x0: int32): int32 =
+    if x0 < 2:
+        return 1
+    var x = x0 - 1
+    x = x | (x >> 1)
+    x = x | (x >> 2)
+    x = x | (x >> 4)
+    x = x | (x >> 8)
+    x = x | (x >> 16)
+    return x + 1
+
+fn v3BioDidOperatorIndexInit(initialCap: int32): V3BioDidOperatorIndex =
+    var cap = initialCap
+    if cap < 8:
+        cap = 8
+    cap = v3BioDidOperatorIndexRoundUpPow2(cap)
+    var out = v3BioDidOperatorIndexZero()
+    var i = 0
+    while i < cap:
+        add(out.keys, layout.fixedBytes32Zero())
+        add(out.vals, v3BioDidOperatorRecordZero())
+        add(out.used, 0)
+        i = i + 1
+    return out
+
+fn v3BioDidOperatorIndexHash(key: layout.FixedBytes32): int32 =
+    var h: int32 = 0
+    for i in 0..<32:
+        let code = int32(key.data[i]) & 255
+        h = h + code
+        h = h + (h << 10)
+        h = h ^ (h >> 6)
+    h = h + (h << 3)
+    h = h ^ (h >> 11)
+    h = h + (h << 15)
+    return h
+
+fn v3BioDidOperatorIndexFindSlot(index: V3BioDidOperatorIndex,
+                                 key: layout.FixedBytes32,
+                                 allowInsert: bool): int32 =
+    let cap = index.keys.len
+    if cap <= 0:
+        return -1
+    var probe = (v3BioDidOperatorIndexHash(key) & 0x7fffffff) % cap
+    var scanned = 0
+    while scanned < cap:
+        if index.used[probe] == 0:
+            if allowInsert:
+                return probe
+            return -1
+        if layout.fixedBytes32Equal(index.keys[probe], key):
+            return probe
+        probe = probe + 1
+        if probe >= cap:
+            probe = 0
+        scanned = scanned + 1
+    return -1
+
+fn v3BioDidOperatorIndexFindSlotMut(index: var V3BioDidOperatorIndex,
+                                    key: layout.FixedBytes32,
+                                    allowInsert: bool): int32 =
+    let cap = index.keys.len
+    if cap <= 0:
+        return -1
+    var probe = (v3BioDidOperatorIndexHash(key) & 0x7fffffff) % cap
+    var scanned = 0
+    while scanned < cap:
+        if index.used[probe] == 0:
+            if allowInsert:
+                return probe
+            return -1
+        if layout.fixedBytes32Equal(index.keys[probe], key):
+            return probe
+        probe = probe + 1
+        if probe >= cap:
+            probe = 0
+        scanned = scanned + 1
+    return -1
+
+fn v3BioDidOperatorIndexGrow(index: var V3BioDidOperatorIndex): Result[bool] =
+    let oldCap = index.keys.len
+    let nextCap = oldCap * 2
+    var next = v3BioDidOperatorIndexInit(nextCap)
+    var i = 0
+    while i < oldCap:
+        if index.used[i] != 0:
+            let putRes = v3BioDidOperatorIndexPut(next, index.keys[i], index.vals[i])
+            if IsErr(putRes):
+                return Err[bool](Error(putRes))
+        i = i + 1
+    index.keys = next.keys
+    index.vals = next.vals
+    index.used = next.used
+    index.len = next.len
+    return Ok[bool](true)
+
+fn v3BioDidOperatorIndexPut(index: var V3BioDidOperatorIndex,
+                            key: layout.FixedBytes32,
+                            record: V3BioDidOperatorRecord): Result[bool] =
+    if index.keys.len <= 0:
+        let initCap = v3BioDidOperatorIndexInitCap
+        index = v3BioDidOperatorIndexInit(initCap)
+    if (index.len + 1) * 10 >= index.keys.len * 7:
+        let growRes = v3BioDidOperatorIndexGrow(index)
+        if IsErr(growRes):
+            return Err[bool](Error(growRes))
+    let slot = v3BioDidOperatorIndexFindSlotMut(index, key, true)
+    if slot < 0:
+        return Err[bool]("v3 bio did: operator index slot missing")
+    if index.used[slot] == 0:
+        index.len = index.len + 1
+        index.used[slot] = 1
+    index.keys[slot] = key
+    index.vals[slot] = record
+    return Ok[bool](true)
+
+fn v3BioDidOperatorKindIndexInit(initialCap: int32): V3BioDidOperatorKindIndex =
+    var cap = initialCap
+    if cap < 8:
+        cap = 8
+    cap = v3BioDidOperatorIndexRoundUpPow2(cap)
+    var out = v3BioDidOperatorKindIndexZero()
+    var i = 0
+    while i < cap:
+        add(out.keys, v3BioDidOperatorKindKeyZero())
+        add(out.vals, v3BioDidOperatorRecordZero())
+        add(out.used, 0)
+        i = i + 1
+    return out
+
+fn v3BioDidTextHash(text: str): int32 =
+    var h: int32 = 0
+    for i in 0..<strings.len(text):
+        let code = int32(text[i]) & 255
+        h = h + code
+        h = h + (h << 10)
+        h = h ^ (h >> 6)
+    h = h + (h << 3)
+    h = h ^ (h >> 11)
+    h = h + (h << 15)
+    return h
+
+fn v3BioDidOperatorKindKeyHash(key: V3BioDidOperatorKindKey): int32 =
+    return v3BioDidOperatorIndexHash(key.operatorId) ^ v3BioDidTextHash(key.bundleKind)
+
+fn v3BioDidOperatorKindKeyEqual(left: V3BioDidOperatorKindKey,
+                                right: V3BioDidOperatorKindKey): bool =
+    if !layout.fixedBytes32Equal(left.operatorId, right.operatorId):
+        return false
+    return v3BioDidTextEqual(left.bundleKind, right.bundleKind)
+
+fn v3BioDidOperatorKindIndexFindSlot(index: V3BioDidOperatorKindIndex,
+                                     key: V3BioDidOperatorKindKey,
+                                     allowInsert: bool): int32 =
+    let cap = index.keys.len
+    if cap <= 0:
+        return -1
+    var probe = (v3BioDidOperatorKindKeyHash(key) & 0x7fffffff) % cap
+    var scanned = 0
+    while scanned < cap:
+        if index.used[probe] == 0:
+            if allowInsert:
+                return probe
+            return -1
+        if v3BioDidOperatorKindKeyEqual(index.keys[probe], key):
+            return probe
+        probe = probe + 1
+        if probe >= cap:
+            probe = 0
+        scanned = scanned + 1
+    return -1
+
+fn v3BioDidOperatorKindIndexFindSlotMut(index: var V3BioDidOperatorKindIndex,
+                                        key: V3BioDidOperatorKindKey,
+                                        allowInsert: bool): int32 =
+    let cap = index.keys.len
+    if cap <= 0:
+        return -1
+    var probe = (v3BioDidOperatorKindKeyHash(key) & 0x7fffffff) % cap
+    var scanned = 0
+    while scanned < cap:
+        if index.used[probe] == 0:
+            if allowInsert:
+                return probe
+            return -1
+        if v3BioDidOperatorKindKeyEqual(index.keys[probe], key):
+            return probe
+        probe = probe + 1
+        if probe >= cap:
+            probe = 0
+        scanned = scanned + 1
+    return -1
+
+fn v3BioDidOperatorKindIndexGrow(index: var V3BioDidOperatorKindIndex): Result[bool] =
+    let oldCap = index.keys.len
+    let nextCap = oldCap * 2
+    var next = v3BioDidOperatorKindIndexInit(nextCap)
+    var i = 0
+    while i < oldCap:
+        if index.used[i] != 0:
+            let putRes = v3BioDidOperatorKindIndexPut(next, index.keys[i], index.vals[i])
+            if IsErr(putRes):
+                return Err[bool](Error(putRes))
+        i = i + 1
+    index.keys = next.keys
+    index.vals = next.vals
+    index.used = next.used
+    index.len = next.len
+    return Ok[bool](true)
+
+fn v3BioDidOperatorKindIndexPut(index: var V3BioDidOperatorKindIndex,
+                                key: V3BioDidOperatorKindKey,
+                                record: V3BioDidOperatorRecord): Result[bool] =
+    if index.keys.len <= 0:
+        let initCap = v3BioDidOperatorIndexInitCap
+        index = v3BioDidOperatorKindIndexInit(initCap)
+    if (index.len + 1) * 10 >= index.keys.len * 7:
+        let growRes = v3BioDidOperatorKindIndexGrow(index)
+        if IsErr(growRes):
+            return Err[bool](Error(growRes))
+    let slot = v3BioDidOperatorKindIndexFindSlotMut(index, key, true)
+    if slot < 0:
+        return Err[bool]("v3 bio did: operator kind index slot missing")
+    if index.used[slot] == 0:
+        index.len = index.len + 1
+        index.used[slot] = 1
+    index.keys[slot] = key
+    index.vals[slot] = record
+    return Ok[bool](true)
+
+fn v3BioDidOperatorRecordShouldReplace(current: V3BioDidOperatorRecord,
+                                       incoming: V3BioDidOperatorRecord): bool =
+    if layout.fixedBytes32Equal(current.operatorId, layout.fixedBytes32Zero()):
+        return true
+    if incoming.bundleSeq != current.bundleSeq:
+        return incoming.bundleSeq > current.bundleSeq
+    return incoming.anchorSeq >= current.anchorSeq
+
+fn v3BioDidOperatorKindIndexLookup(index: V3BioDidOperatorKindIndex,
+                                   operatorId: layout.FixedBytes32,
+                                   bundleKind: str): Result[V3BioDidOperatorRecord] =
+    if strings.len(bundleKind) <= 0:
+        return Err[V3BioDidOperatorRecord]("v3 bio did: operator bundle kind required")
+    let slot = v3BioDidOperatorKindIndexFindSlot(
+        index,
+        V3BioDidOperatorKindKey(operatorId: operatorId, bundleKind: bundleKind),
+        false
+    )
+    if slot < 0:
+        return Err[V3BioDidOperatorRecord]("v3 bio did: operator bundle not found")
+    let record = index.vals[slot]
+    if layout.fixedBytes32Equal(record.operatorId, layout.fixedBytes32Zero()):
+        return Err[V3BioDidOperatorRecord]("v3 bio did: operator bundle record missing")
+    return Ok[V3BioDidOperatorRecord](record)
+
 fn v3BioDidActionValid(action: str): bool =
     if action == "create":
         return true
@@ -150,9 +608,12 @@ fn v3BioDidRootSeedFromRootSecret(rootSecret: layout.FixedBytes32): str =
 
 fn v3BioDidDeviceSeedFromRootSecret(rootSecret: layout.FixedBytes32,
                                     deviceBindingSeed: str): str =
+    let rootSecretHex = layout.fixedBytes32Hex(rootSecret)
+    var payload = rootSecretHex
+    payload = did.v3DidTextAppend(payload, "|")
+    payload = did.v3DidTextAppend(payload, deviceBindingSeed)
     return layout.fixedBytes32Hex(
-        did.v3DidHashTagged("v3.bio.did.device.seed",
-                            layout.fixedBytes32Hex(rootSecret) + "|" + deviceBindingSeed)
+        did.v3DidHashTagged("v3.bio.did.device.seed", payload)
     )
 
 fn v3BioDidDeviceBindingSeedHash(deviceBindingSeed: str): layout.FixedBytes32 =
@@ -164,10 +625,14 @@ fn v3BioDidChallengeNonce(action: str,
                           documentVersion: did.V3DidWord64,
                           bundleSeq: int32): layout.FixedBytes32 =
     var proofText = action
-    proofText = proofText + "|" + didText
-    proofText = proofText + "|" + peer_id.v3Libp2pPeerIdText(devicePeerId)
-    proofText = proofText + "|" + did.v3DidStoreWord64Hex(documentVersion)
-    proofText = proofText + "|" + strings.intToStr(bundleSeq)
+    proofText = did.v3DidTextAppend(proofText, "|")
+    proofText = did.v3DidTextAppend(proofText, didText)
+    proofText = did.v3DidTextAppend(proofText, "|")
+    proofText = did.v3DidTextAppend(proofText, peer_id.v3Libp2pPeerIdText(devicePeerId))
+    proofText = did.v3DidTextAppend(proofText, "|")
+    proofText = did.v3DidTextAppend(proofText, did.v3DidStoreWord64Hex(documentVersion))
+    proofText = did.v3DidTextAppend(proofText, "|")
+    proofText = did.v3DidTextAppend(proofText, strings.intToStr(bundleSeq))
     return did.v3DidHashTagged("v3.bio.did.challenge", proofText)
 
 fn v3BioDidChainAccountId(didText: str): int32 =
@@ -193,7 +658,7 @@ fn v3BioDidSetTrustedAttestorHex(pubKeyHex: str): Result[bool] =
         return Err[bool](Error(pubRes))
     if !fixed256.p256PublicKey65Valid(Value(pubRes)):
         return Err[bool]("v3 bio did: invalid trusted attestor pubkey")
-    v3BioDidTrustedAttestorPubKeyHex = layout.fixedBytes65Hex(Value(pubRes))
+    v3BioDidTrustedAttestorPubKeyHex = v3BioDidCopyText(layout.fixedBytes65Hex(Value(pubRes)))
     v3BioDidTrustedAttestorRootKeyId = ""
     return Ok[bool](true)
 
@@ -204,7 +669,7 @@ fn v3BioDidSetTrustedAttestorRootHex(pubKeyHex: str,
     let setRes = v3BioDidSetTrustedAttestorHex(pubKeyHex)
     if IsErr(setRes):
         return Err[bool](Error(setRes))
-    v3BioDidTrustedAttestorRootKeyId = rootKeyId
+    v3BioDidTrustedAttestorRootKeyId = v3BioDidCopyText(rootKeyId)
     return Ok[bool](true)
 
 fn v3BioDidAddTrustedAttestor(pubKey: layout.FixedBytes65): Result[bool] =
@@ -224,8 +689,12 @@ fn v3BioDidTrustedAttestorRequired(pubKey: layout.FixedBytes65): Result[bool] =
 fn v3BioDidTrustedAttestorRootRequired(rootKeyId: str): Result[bool] =
     if strings.len(v3BioDidTrustedAttestorRootKeyId) <= 0:
         return Err[bool]("v3 bio did: trusted attestor root key id required")
-    if rootKeyId != v3BioDidTrustedAttestorRootKeyId:
-        return Err[bool]("v3 bio did: hardware attestation root key mismatch")
+    if !v3BioDidTextEqual(rootKeyId, v3BioDidTrustedAttestorRootKeyId):
+        var out = "v3 bio did: hardware attestation root key mismatch expected_hex="
+        out = did.v3DidTextAppend(out, did.v3DidStoreEncodeText(v3BioDidTrustedAttestorRootKeyId))
+        out = did.v3DidTextAppend(out, " got_hex=")
+        out = did.v3DidTextAppend(out, did.v3DidStoreEncodeText(rootKeyId))
+        return Err[bool](out)
     return Ok[bool](true)
 
 fn v3BioDidPurposeFromAction(action: str): Result[int32] =
@@ -246,17 +715,28 @@ fn v3BioDidHardwareBindingText(hardware: V3BioDidHardwareAttestation,
                                bundleSeq: int32,
                                challengeNonce: layout.FixedBytes32): str =
     var out = "v3_bio_did_hardware_binding_version=1"
-    out = out + "|action=" + action
-    out = out + "|did=" + didText
-    out = out + "|device_peer_id=" + peer_id.v3Libp2pPeerIdText(devicePeerId)
-    out = out + "|document_version=" + did.v3DidStoreWord64Hex(documentVersion)
-    out = out + "|bundle_seq=" + strings.intToStr(bundleSeq)
-    out = out + "|challenge_nonce=" + layout.fixedBytes32Hex(challengeNonce)
-    out = out + "|request_id=" + did.v3DidStoreEncodeText(hardware.requestId)
-    out = out + "|sensor_id=" + did.v3DidStoreEncodeText(hardware.sensorId)
-    out = out + "|verified_at=" + did.v3DidStoreWord64Hex(hardware.verifiedAtEpochSeconds)
-    out = out + "|device_binding_seed_hash=" + layout.fixedBytes32Hex(hardware.deviceBindingSeedHash)
-    out = out + "|attestation_cid=" + layout.fixedBytes32Hex(hardware.attestationCid)
+    out = did.v3DidTextAppend(out, "|action=")
+    out = did.v3DidTextAppend(out, action)
+    out = did.v3DidTextAppend(out, "|did=")
+    out = did.v3DidTextAppend(out, didText)
+    out = did.v3DidTextAppend(out, "|device_peer_id=")
+    out = did.v3DidTextAppend(out, peer_id.v3Libp2pPeerIdText(devicePeerId))
+    out = did.v3DidTextAppend(out, "|document_version=")
+    out = did.v3DidTextAppend(out, did.v3DidStoreWord64Hex(documentVersion))
+    out = did.v3DidTextAppend(out, "|bundle_seq=")
+    out = did.v3DidTextAppend(out, strings.intToStr(bundleSeq))
+    out = did.v3DidTextAppend(out, "|challenge_nonce=")
+    out = did.v3DidTextAppend(out, layout.fixedBytes32Hex(challengeNonce))
+    out = did.v3DidTextAppend(out, "|request_id=")
+    out = did.v3DidTextAppend(out, did.v3DidStoreEncodeText(hardware.requestId))
+    out = did.v3DidTextAppend(out, "|sensor_id=")
+    out = did.v3DidTextAppend(out, did.v3DidStoreEncodeText(hardware.sensorId))
+    out = did.v3DidTextAppend(out, "|verified_at=")
+    out = did.v3DidTextAppend(out, did.v3DidStoreWord64Hex(hardware.verifiedAtEpochSeconds))
+    out = did.v3DidTextAppend(out, "|device_binding_seed_hash=")
+    out = did.v3DidTextAppend(out, layout.fixedBytes32Hex(hardware.deviceBindingSeedHash))
+    out = did.v3DidTextAppend(out, "|attestation_cid=")
+    out = did.v3DidTextAppend(out, layout.fixedBytes32Hex(hardware.attestationCid))
     return out
 
 fn v3BioDidHardwareBindingCid(hardware: V3BioDidHardwareAttestation,
@@ -274,6 +754,23 @@ fn v3BioDidHardwareBindingCid(hardware: V3BioDidHardwareAttestation,
                                                            documentVersion,
                                                            bundleSeq,
                                                            challengeNonce))
+
+fn v3BioDidInvalidInt32Field(fieldName: str,
+                             fieldText: str): str =
+    var out = "v3 bio did: invalid int32 field "
+    out = did.v3DidTextAppend(out, fieldName)
+    out = did.v3DidTextAppend(out, " len=")
+    out = did.v3DidTextAppend(out, strings.intToStr(strings.len(fieldText)))
+    out = did.v3DidTextAppend(out, " hex=")
+    out = did.v3DidTextAppend(out, did.v3DidStoreEncodeText(fieldText))
+    return out
+
+fn v3BioDidParseInt32Field(fieldName: str,
+                           fieldText: str): Result[int32] =
+    let parsedRes = did.v3DidStoreParseInt32(fieldText)
+    if IsErr(parsedRes):
+        return Err[int32](v3BioDidInvalidInt32Field(fieldName, fieldText))
+    return parsedRes
 
 fn v3BioDidParseHardwareAttestation(text: str): Result[V3BioDidParsedHardwareAttestation] =
     if strings.len(text) <= 0:
@@ -321,16 +818,16 @@ fn v3BioDidParseHardwareAttestation(text: str): Result[V3BioDidParsedHardwareAtt
     let signatureTextRes = did.v3DidStoreFindValue(lines, "signature")
     if IsErr(signatureTextRes):
         return Err[V3BioDidParsedHardwareAttestation](Error(signatureTextRes))
-    let versionRes = did.v3DidStoreParseInt32(Value(versionTextRes))
+    let versionRes = v3BioDidParseInt32Field("v3_biometric_attestation_version", Value(versionTextRes))
     if IsErr(versionRes):
         return Err[V3BioDidParsedHardwareAttestation](Error(versionRes))
-    let purposeRes = did.v3DidStoreParseInt32(Value(purposeTextRes))
+    let purposeRes = v3BioDidParseInt32Field("purpose", Value(purposeTextRes))
     if IsErr(purposeRes):
         return Err[V3BioDidParsedHardwareAttestation](Error(purposeRes))
-    let platformRes = did.v3DidStoreParseInt32(Value(platformTextRes))
+    let platformRes = v3BioDidParseInt32Field("platform", Value(platformTextRes))
     if IsErr(platformRes):
         return Err[V3BioDidParsedHardwareAttestation](Error(platformRes))
-    let attestationKindRes = did.v3DidStoreParseInt32(Value(attestationKindTextRes))
+    let attestationKindRes = v3BioDidParseInt32Field("attestation_kind", Value(attestationKindTextRes))
     if IsErr(attestationKindRes):
         return Err[V3BioDidParsedHardwareAttestation](Error(attestationKindRes))
     let requestIdBytesRes = did.v3DidStoreDecodeBytes(Value(requestIdTextRes))
@@ -427,8 +924,10 @@ fn v3BioDidHardwareAttestationSignatureVerify(parsed: V3BioDidParsedHardwareAtte
         return Err[bool]("v3 bio did: hardware attestation signature mismatch")
     let canonicalText = biometric.v3BiometricFingerprintAttestationText(envelope,
                                                                         parsed.signature)
-    if canonicalText != text:
-        return Err[bool]("v3 bio did: non canonical hardware attestation")
+    if !v3BioDidTextEqual(canonicalText, text):
+        return Err[bool](v3BioDidTextMismatch("non canonical hardware attestation",
+                                              canonicalText,
+                                              text))
     return Ok[bool](true)
 
 fn v3BioDidCaptureValidate(capture: V3BioDidHardwareCapture): Result[bool] =
@@ -462,14 +961,14 @@ fn v3BioDidCaptureAttestationValidate(capture: V3BioDidHardwareCapture,
         return Err[bool](Error(verifyRes))
     if parsed.purpose != Value(purposeRes):
         return Err[bool]("v3 bio did: hardware attestation purpose mismatch")
-    if parsed.requestId != capture.requestId:
+    if !v3BioDidTextEqual(parsed.requestId, capture.requestId):
         return Err[bool]("v3 bio did: hardware attestation request id mismatch")
-    if parsed.sensorId != capture.sensorId:
+    if !v3BioDidTextEqual(parsed.sensorId, capture.sensorId):
         return Err[bool]("v3 bio did: hardware attestation sensor id mismatch")
     let wantBindingSeedHash = v3BioDidDeviceBindingSeedHash(capture.deviceBindingSeed)
     if !layout.fixedBytes32Equal(parsed.deviceBindingSeedHash, wantBindingSeedHash):
         return Err[bool]("v3 bio did: hardware attestation device binding mismatch")
-    if parsed.deviceLabel != capture.deviceLabel:
+    if !v3BioDidTextEqual(parsed.deviceLabel, capture.deviceLabel):
         return Err[bool]("v3 bio did: hardware attestation device label mismatch")
     let wantFeatureCommitment = biometric.v3BiometricFingerprintFeatureCommitment(capture.feature32)
     if !layout.fixedBytes32Equal(parsed.featureCommitment, wantFeatureCommitment):
@@ -508,9 +1007,9 @@ fn v3BioDidHardwareAttestationValidate(hardware: V3BioDidHardwareAttestation,
         return Err[bool](Error(verifyRes))
     if parsed.purpose != Value(purposeRes):
         return Err[bool]("v3 bio did: stored hardware attestation purpose mismatch")
-    if parsed.requestId != hardware.requestId:
+    if !v3BioDidTextEqual(parsed.requestId, hardware.requestId):
         return Err[bool]("v3 bio did: stored hardware attestation request id mismatch")
-    if parsed.sensorId != hardware.sensorId:
+    if !v3BioDidTextEqual(parsed.sensorId, hardware.sensorId):
         return Err[bool]("v3 bio did: stored hardware attestation sensor id mismatch")
     if !layout.fixedBytes32Equal(parsed.deviceBindingSeedHash, hardware.deviceBindingSeedHash):
         return Err[bool]("v3 bio did: stored hardware attestation binding mismatch")
@@ -552,32 +1051,66 @@ fn v3BioDidHardwareAttestationMake(capture: V3BioDidHardwareCapture,
 
 fn v3BioDidChainBundleText(bundle: V3BioDidChainBundle): str =
     var out = ""
-    did.v3DidStoreAppendLine(out, "v3_bio_did_bundle_version", v3BioDidBundleVersionText)
-    did.v3DidStoreAppendLine(out, "action", bundle.action)
-    did.v3DidStoreAppendLine(out, "bundle_seq", strings.intToStr(bundle.bundleSeq))
-    did.v3DidStoreAppendLine(out, "did", bundle.didText)
-    did.v3DidStoreAppendLine(out, "device_peer_id", peer_id.v3Libp2pPeerIdText(bundle.devicePeerId))
-    did.v3DidStoreAppendLine(out, "document_text", did.v3DidStoreEncodeText(bundle.documentText))
-    did.v3DidStoreAppendLine(out, "record_version", strings.intToStr(bundle.record.version))
-    did.v3DidStoreAppendLine(out, "record_helper", layout.fixedBytes32Hex(bundle.record.helper))
-    did.v3DidStoreAppendLine(out, "record_pub_key", layout.fixedBytes65Hex(bundle.record.pubKey))
-    did.v3DidStoreAppendLine(out, "record_code_n", strings.intToStr(bundle.record.codeN))
-    did.v3DidStoreAppendLine(out, "record_code_k", strings.intToStr(bundle.record.codeK))
-    did.v3DidStoreAppendLine(out, "record_max_correctable", strings.intToStr(bundle.record.maxCorrectable))
-    did.v3DidStoreAppendLine(out, "record_cid", layout.fixedBytes32Hex(bundle.record.recordCid))
-    did.v3DidStoreAppendLine(out, "challenge_nonce", layout.fixedBytes32Hex(bundle.assertion.challengeNonce))
-    did.v3DidStoreAppendLine(out, "assert_commit_a", layout.fixedBytes65Hex(bundle.assertion.commitA))
-    did.v3DidStoreAppendLine(out, "assert_response_z", layout.fixedBytes32Hex(bundle.assertion.responseZ))
-    did.v3DidStoreAppendLine(out, "assert_proof_cid", layout.fixedBytes32Hex(bundle.assertion.proofCid))
-    did.v3DidStoreAppendLine(out, "hardware_version", strings.intToStr(bundle.hardware.version))
-    did.v3DidStoreAppendLine(out, "hardware_request_id", did.v3DidStoreEncodeText(bundle.hardware.requestId))
-    did.v3DidStoreAppendLine(out, "hardware_sensor_id", did.v3DidStoreEncodeText(bundle.hardware.sensorId))
-    did.v3DidStoreAppendLine(out, "hardware_verified_at", did.v3DidStoreWord64Hex(bundle.hardware.verifiedAtEpochSeconds))
-    did.v3DidStoreAppendLine(out, "hardware_device_binding_seed_hash", layout.fixedBytes32Hex(bundle.hardware.deviceBindingSeedHash))
-    did.v3DidStoreAppendLine(out, "hardware_attestation_text", did.v3DidStoreEncodeText(bundle.hardware.attestationText))
-    did.v3DidStoreAppendLine(out, "hardware_attestation_cid", layout.fixedBytes32Hex(bundle.hardware.attestationCid))
-    did.v3DidStoreAppendLine(out, "hardware_binding_cid", layout.fixedBytes32Hex(bundle.hardware.bindingCid))
+    out = did.v3DidStoreAppendLine(out, "v3_bio_did_bundle_version", v3BioDidBundleVersionText)
+    out = did.v3DidStoreAppendLine(out, "action", bundle.action)
+    out = did.v3DidStoreAppendLine(out, "bundle_seq", strings.intToStr(bundle.bundleSeq))
+    out = did.v3DidStoreAppendLine(out, "did", bundle.didText)
+    out = did.v3DidStoreAppendLine(out, "device_peer_id", peer_id.v3Libp2pPeerIdText(bundle.devicePeerId))
+    out = did.v3DidStoreAppendLine(out, "document_text", did.v3DidStoreEncodeText(bundle.documentText))
+    out = did.v3DidStoreAppendLine(out, "record_version", strings.intToStr(bundle.record.version))
+    out = did.v3DidStoreAppendLine(out, "record_helper", layout.fixedBytes32Hex(bundle.record.helper))
+    out = did.v3DidStoreAppendLine(out, "record_pub_key", layout.fixedBytes65Hex(bundle.record.pubKey))
+    out = did.v3DidStoreAppendLine(out, "record_code_n", strings.intToStr(bundle.record.codeN))
+    out = did.v3DidStoreAppendLine(out, "record_code_k", strings.intToStr(bundle.record.codeK))
+    out = did.v3DidStoreAppendLine(out, "record_max_correctable", strings.intToStr(bundle.record.maxCorrectable))
+    out = did.v3DidStoreAppendLine(out, "record_cid", layout.fixedBytes32Hex(bundle.record.recordCid))
+    out = did.v3DidStoreAppendLine(out, "challenge_nonce", layout.fixedBytes32Hex(bundle.assertion.challengeNonce))
+    out = did.v3DidStoreAppendLine(out, "assert_commit_a", layout.fixedBytes65Hex(bundle.assertion.commitA))
+    out = did.v3DidStoreAppendLine(out, "assert_response_z", layout.fixedBytes32Hex(bundle.assertion.responseZ))
+    out = did.v3DidStoreAppendLine(out, "assert_proof_cid", layout.fixedBytes32Hex(bundle.assertion.proofCid))
+    out = did.v3DidStoreAppendLine(out, "hardware_version", strings.intToStr(bundle.hardware.version))
+    out = did.v3DidStoreAppendLine(out, "hardware_request_id", did.v3DidStoreEncodeText(bundle.hardware.requestId))
+    out = did.v3DidStoreAppendLine(out, "hardware_sensor_id", did.v3DidStoreEncodeText(bundle.hardware.sensorId))
+    out = did.v3DidStoreAppendLine(out, "hardware_verified_at", did.v3DidStoreWord64Hex(bundle.hardware.verifiedAtEpochSeconds))
+    out = did.v3DidStoreAppendLine(out, "hardware_device_binding_seed_hash", layout.fixedBytes32Hex(bundle.hardware.deviceBindingSeedHash))
+    out = did.v3DidStoreAppendLine(out, "hardware_attestation_text", did.v3DidStoreEncodeText(bundle.hardware.attestationText))
+    out = did.v3DidStoreAppendLine(out, "hardware_attestation_cid", layout.fixedBytes32Hex(bundle.hardware.attestationCid))
+    out = did.v3DidStoreAppendLine(out, "hardware_binding_cid", layout.fixedBytes32Hex(bundle.hardware.bindingCid))
     return out
+
+fn v3BioDidChainBundleHeaderParseText(text: str): Result[V3BioDidChainBundleHeader] =
+    if strings.len(text) <= 0:
+        return Err[V3BioDidChainBundleHeader]("v3 bio did: missing bundle text")
+    let lines = strutil.split(text, '\n')
+    let versionRes = did.v3DidStoreFindValue(lines, "v3_bio_did_bundle_version")
+    if IsErr(versionRes):
+        return Err[V3BioDidChainBundleHeader](Error(versionRes))
+    if Value(versionRes) != v3BioDidBundleVersionText:
+        return Err[V3BioDidChainBundleHeader]("v3 bio did: unsupported bundle version")
+    let actionRes = did.v3DidStoreFindValue(lines, "action")
+    if IsErr(actionRes):
+        return Err[V3BioDidChainBundleHeader](Error(actionRes))
+    if !v3BioDidActionValid(Value(actionRes)):
+        return Err[V3BioDidChainBundleHeader]("v3 bio did: invalid bundle action")
+    let bundleSeqTextRes = did.v3DidStoreFindValue(lines, "bundle_seq")
+    if IsErr(bundleSeqTextRes):
+        return Err[V3BioDidChainBundleHeader](Error(bundleSeqTextRes))
+    let didTextRes = did.v3DidStoreFindValue(lines, "did")
+    if IsErr(didTextRes):
+        return Err[V3BioDidChainBundleHeader](Error(didTextRes))
+    let parsedSeqRes = v3BioDidParseInt32Field("bundle_seq", Value(bundleSeqTextRes))
+    if IsErr(parsedSeqRes):
+        return Err[V3BioDidChainBundleHeader](Error(parsedSeqRes))
+    if Value(parsedSeqRes) <= 0:
+        return Err[V3BioDidChainBundleHeader]("v3 bio did: invalid bundle seq")
+    if strings.len(Value(didTextRes)) <= 0:
+        return Err[V3BioDidChainBundleHeader]("v3 bio did: bundle did required")
+    var out: V3BioDidChainBundleHeader
+    out.action = Value(actionRes)
+    out.bundleSeq = Value(parsedSeqRes)
+    out.didText = Value(didTextRes)
+    out.bundleCid = v3BioDidBundleCid(text)
+    return Ok[V3BioDidChainBundleHeader](out)
 
 fn v3BioDidChainBundleVerify(bundle: V3BioDidChainBundle): Result[did.V3DidDocument] =
     if !v3BioDidActionValid(bundle.action):
@@ -591,9 +1124,9 @@ fn v3BioDidChainBundleVerify(bundle: V3BioDidChainBundle): Result[did.V3DidDocum
     let canonicalDocumentTextRes = did.v3DidDocumentBuildText(document)
     if IsErr(canonicalDocumentTextRes):
         return Err[did.V3DidDocument](Error(canonicalDocumentTextRes))
-    if Value(canonicalDocumentTextRes) != bundle.documentText:
+    if !v3BioDidTextEqual(Value(canonicalDocumentTextRes), bundle.documentText):
         return Err[did.V3DidDocument]("v3 bio did: non canonical document text")
-    if document.did != bundle.didText:
+    if !v3BioDidTextEqual(document.did, bundle.didText):
         return Err[did.V3DidDocument]("v3 bio did: bundle did mismatch")
     let devicePos = did.v3DidDocumentFindDevicePos(document, bundle.devicePeerId)
     if devicePos < 0:
@@ -676,7 +1209,7 @@ fn v3BioDidChainBundleParseText(text: str): Result[V3BioDidChainBundle] =
     let documentTextHexRes = did.v3DidStoreFindValue(lines, "document_text")
     if IsErr(documentTextHexRes):
         return Err[V3BioDidChainBundle](Error(documentTextHexRes))
-    let parsedSeqRes = did.v3DidStoreParseInt32(Value(bundleSeqRes))
+    let parsedSeqRes = v3BioDidParseInt32Field("bundle_seq", Value(bundleSeqRes))
     if IsErr(parsedSeqRes):
         return Err[V3BioDidChainBundle](Error(parsedSeqRes))
     let devicePeerRes = did.v3DidPeerIdFromHex(Value(devicePeerTextRes))
@@ -706,7 +1239,7 @@ fn v3BioDidChainBundleParseText(text: str): Result[V3BioDidChainBundle] =
     let recordCidTextRes = did.v3DidStoreFindValue(lines, "record_cid")
     if IsErr(recordCidTextRes):
         return Err[V3BioDidChainBundle](Error(recordCidTextRes))
-    let recordVersionRes = did.v3DidStoreParseInt32(Value(recordVersionTextRes))
+    let recordVersionRes = v3BioDidParseInt32Field("record_version", Value(recordVersionTextRes))
     if IsErr(recordVersionRes):
         return Err[V3BioDidChainBundle](Error(recordVersionRes))
     let recordHelperRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(recordHelperTextRes))
@@ -715,13 +1248,13 @@ fn v3BioDidChainBundleParseText(text: str): Result[V3BioDidChainBundle] =
     let recordPubKeyRes = layout.fixedBytes65FromHex(Value(recordPubKeyTextRes))
     if IsErr(recordPubKeyRes):
         return Err[V3BioDidChainBundle](Error(recordPubKeyRes))
-    let recordCodeNRes = did.v3DidStoreParseInt32(Value(recordCodeNTextRes))
+    let recordCodeNRes = v3BioDidParseInt32Field("record_code_n", Value(recordCodeNTextRes))
     if IsErr(recordCodeNRes):
         return Err[V3BioDidChainBundle](Error(recordCodeNRes))
-    let recordCodeKRes = did.v3DidStoreParseInt32(Value(recordCodeKTextRes))
+    let recordCodeKRes = v3BioDidParseInt32Field("record_code_k", Value(recordCodeKTextRes))
     if IsErr(recordCodeKRes):
         return Err[V3BioDidChainBundle](Error(recordCodeKRes))
-    let recordMaxCorrectableRes = did.v3DidStoreParseInt32(Value(recordMaxCorrectableTextRes))
+    let recordMaxCorrectableRes = v3BioDidParseInt32Field("record_max_correctable", Value(recordMaxCorrectableTextRes))
     if IsErr(recordMaxCorrectableRes):
         return Err[V3BioDidChainBundle](Error(recordMaxCorrectableRes))
     let recordCidRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(recordCidTextRes))
@@ -775,7 +1308,7 @@ fn v3BioDidChainBundleParseText(text: str): Result[V3BioDidChainBundle] =
     let assertProofCidRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(assertProofCidTextRes))
     if IsErr(assertProofCidRes):
         return Err[V3BioDidChainBundle](Error(assertProofCidRes))
-    let hardwareVersionRes = did.v3DidStoreParseInt32(Value(hardwareVersionTextRes))
+    let hardwareVersionRes = v3BioDidParseInt32Field("hardware_version", Value(hardwareVersionTextRes))
     if IsErr(hardwareVersionRes):
         return Err[V3BioDidChainBundle](Error(hardwareVersionRes))
     let hardwareRequestIdBytesRes = did.v3DidStoreDecodeBytes(Value(hardwareRequestIdTextRes))
@@ -835,7 +1368,7 @@ fn v3BioDidChainBundleParseText(text: str): Result[V3BioDidChainBundle] =
     let verifyRes = v3BioDidChainBundleVerify(out)
     if IsErr(verifyRes):
         return Err[V3BioDidChainBundle](Error(verifyRes))
-    if v3BioDidChainBundleText(out) != text:
+    if !v3BioDidTextEqual(v3BioDidChainBundleText(out), text):
         return Err[V3BioDidChainBundle]("v3 bio did: non canonical bundle text")
     out.bundleCid = v3BioDidBundleCid(text)
     return Ok[V3BioDidChainBundle](out)
@@ -1018,9 +1551,489 @@ fn v3BioDidChainLoadLatest(node: chain.V3ChainNode,
         return Err[V3BioDidChainBundle](Error(bundleRes))
     if Value(bundleRes).bundleSeq != bundleSeq:
         return Err[V3BioDidChainBundle]("v3 bio did: latest bundle seq mismatch")
-    if Value(bundleRes).didText != didText:
+    if !v3BioDidTextEqual(Value(bundleRes).didText, didText):
         return Err[V3BioDidChainBundle]("v3 bio did: latest bundle did mismatch")
     return Ok[V3BioDidChainBundle](Value(bundleRes))
+
+fn v3BioDidOperatorIdFromRecoverySecretHex(recoverySecretHex: str): Result[layout.FixedBytes32] =
+    let secretRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(recoverySecretHex)
+    if IsErr(secretRes):
+        return Err[layout.FixedBytes32](Error(secretRes))
+    return Ok[layout.FixedBytes32](
+        did.v3DidHashTagged(v3BioDidOperatorTag, layout.fixedBytes32Hex(Value(secretRes)))
+    )
+
+fn v3BioDidOperatorAnchorLegacyText(anchor: V3BioDidOperatorAnchor): str =
+    var out = ""
+    out = did.v3DidStoreAppendLine(out,
+                                   "v3_bio_did_operator_anchor_version",
+                                   v3BioDidOperatorAnchorVersionTextLegacy)
+    out = did.v3DidStoreAppendLine(out, "operator_id", layout.fixedBytes32Hex(anchor.operatorId))
+    out = did.v3DidStoreAppendLine(out, "recovery_mode", anchor.recoveryMode)
+    out = did.v3DidStoreAppendLine(out, "did", anchor.didText)
+    out = did.v3DidStoreAppendLine(out, "bundle_seq", strings.intToStr(anchor.bundleSeq))
+    out = did.v3DidStoreAppendLine(out, "bundle_cid", layout.fixedBytes32Hex(anchor.bundleCid))
+    out = did.v3DidStoreAppendLine(out, "bundle_text", did.v3DidStoreEncodeText(anchor.bundleText))
+    out = did.v3DidStoreAppendLine(out, "event_id", did.v3DidStoreEncodeText(anchor.eventId))
+    return out
+
+fn v3BioDidOperatorAnchorText(anchor: V3BioDidOperatorAnchor): str =
+    var out = ""
+    out = did.v3DidStoreAppendLine(out, "v3_bio_did_operator_anchor_version", v3BioDidOperatorAnchorVersionText)
+    out = did.v3DidStoreAppendLine(out, "operator_id", layout.fixedBytes32Hex(anchor.operatorId))
+    out = did.v3DidStoreAppendLine(out, "bundle_kind", v3BioDidOperatorBundleKindNormalize(anchor.bundleKind))
+    out = did.v3DidStoreAppendLine(out, "recovery_mode", anchor.recoveryMode)
+    out = did.v3DidStoreAppendLine(out, "did", anchor.didText)
+    out = did.v3DidStoreAppendLine(out, "subject_did", anchor.subjectDidText)
+    out = did.v3DidStoreAppendLine(out, "device_did", anchor.deviceDidText)
+    out = did.v3DidStoreAppendLine(out, "bundle_seq", strings.intToStr(anchor.bundleSeq))
+    out = did.v3DidStoreAppendLine(out, "bundle_cid", layout.fixedBytes32Hex(anchor.bundleCid))
+    out = did.v3DidStoreAppendLine(out, "bundle_text", did.v3DidStoreEncodeText(anchor.bundleText))
+    out = did.v3DidStoreAppendLine(out, "event_id", did.v3DidStoreEncodeText(anchor.eventId))
+    return out
+
+fn v3BioDidOperatorAnchorVerify(anchor: V3BioDidOperatorAnchor): Result[bool] =
+    if layout.fixedBytes32Equal(anchor.operatorId, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 bio did: operator id required")
+    if strings.len(v3BioDidOperatorBundleKindNormalize(anchor.bundleKind)) <= 0:
+        return Err[bool]("v3 bio did: operator bundle kind required")
+    if !v3BioDidTextEqual(anchor.recoveryMode, v3BioDidRecoveryModeSecretV1):
+        return Err[bool]("v3 bio did: unsupported operator recovery mode")
+    if strings.len(anchor.didText) <= 0:
+        return Err[bool]("v3 bio did: operator did required")
+    if strings.len(anchor.subjectDidText) <= 0:
+        return Err[bool]("v3 bio did: operator subject did required")
+    if strings.len(anchor.deviceDidText) <= 0:
+        return Err[bool]("v3 bio did: operator device did required")
+    if !v3BioDidTextEqual(anchor.didText, anchor.subjectDidText):
+        return Err[bool]("v3 bio did: operator primary did mismatch")
+    if anchor.bundleSeq <= 0:
+        return Err[bool]("v3 bio did: operator bundle seq required")
+    if layout.fixedBytes32Equal(anchor.bundleCid, layout.fixedBytes32Zero()):
+        return Err[bool]("v3 bio did: operator bundle cid required")
+    if strings.len(anchor.bundleText) <= 0:
+        return Err[bool]("v3 bio did: operator bundle text required")
+    if strings.len(anchor.eventId) <= 0:
+        return Err[bool]("v3 bio did: operator event id required")
+    let headerRes = v3BioDidChainBundleHeaderParseText(anchor.bundleText)
+    if IsErr(headerRes):
+        return Err[bool](Error(headerRes))
+    let header = Value(headerRes)
+    if !v3BioDidTextEqual(header.didText, anchor.didText):
+        return Err[bool]("v3 bio did: operator did mismatch")
+    if header.bundleSeq != anchor.bundleSeq:
+        return Err[bool]("v3 bio did: operator bundle seq mismatch")
+    if !layout.fixedBytes32Equal(header.bundleCid, anchor.bundleCid):
+        return Err[bool]("v3 bio did: operator bundle cid mismatch")
+    return Ok[bool](true)
+
+fn v3BioDidOperatorAnchorParseText(text: str): Result[V3BioDidOperatorAnchor] =
+    if strings.len(text) <= 0:
+        return Err[V3BioDidOperatorAnchor]("v3 bio did: missing operator anchor text")
+    let lines = strutil.split(text, '\n')
+    let versionRes = did.v3DidStoreFindValue(lines, "v3_bio_did_operator_anchor_version")
+    if IsErr(versionRes):
+        return Err[V3BioDidOperatorAnchor](Error(versionRes))
+    let versionText = Value(versionRes)
+    let isV2 = v3BioDidTextEqual(versionText, v3BioDidOperatorAnchorVersionText)
+    let isV1 = v3BioDidTextEqual(versionText, v3BioDidOperatorAnchorVersionTextLegacy)
+    if !isV2 && !isV1:
+        return Err[V3BioDidOperatorAnchor]("v3 bio did: unsupported operator anchor version")
+    let operatorIdTextRes = did.v3DidStoreFindValue(lines, "operator_id")
+    if IsErr(operatorIdTextRes):
+        return Err[V3BioDidOperatorAnchor](Error(operatorIdTextRes))
+    var bundleKindText = v3BioDidOperatorBundleKindAndroidBioV1
+    if isV2:
+        let bundleKindTextRes = did.v3DidStoreFindValue(lines, "bundle_kind")
+        if IsErr(bundleKindTextRes):
+            return Err[V3BioDidOperatorAnchor](Error(bundleKindTextRes))
+        bundleKindText = v3BioDidOperatorBundleKindNormalize(Value(bundleKindTextRes))
+    let recoveryModeRes = did.v3DidStoreFindValue(lines, "recovery_mode")
+    if IsErr(recoveryModeRes):
+        return Err[V3BioDidOperatorAnchor](Error(recoveryModeRes))
+    let didTextRes = did.v3DidStoreFindValue(lines, "did")
+    if IsErr(didTextRes):
+        return Err[V3BioDidOperatorAnchor](Error(didTextRes))
+    let didText = Value(didTextRes)
+    var subjectDidText = didText
+    var deviceDidText = didText
+    if isV2:
+        let subjectDidTextRes = did.v3DidStoreFindValue(lines, "subject_did")
+        if IsErr(subjectDidTextRes):
+            return Err[V3BioDidOperatorAnchor](Error(subjectDidTextRes))
+        subjectDidText = Value(subjectDidTextRes)
+        let deviceDidTextRes = did.v3DidStoreFindValue(lines, "device_did")
+        if IsErr(deviceDidTextRes):
+            return Err[V3BioDidOperatorAnchor](Error(deviceDidTextRes))
+        deviceDidText = Value(deviceDidTextRes)
+    let bundleSeqTextRes = did.v3DidStoreFindValue(lines, "bundle_seq")
+    if IsErr(bundleSeqTextRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleSeqTextRes))
+    let bundleCidTextRes = did.v3DidStoreFindValue(lines, "bundle_cid")
+    if IsErr(bundleCidTextRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleCidTextRes))
+    let bundleTextEncodedRes = did.v3DidStoreFindValue(lines, "bundle_text")
+    if IsErr(bundleTextEncodedRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleTextEncodedRes))
+    let eventIdEncodedRes = did.v3DidStoreFindValue(lines, "event_id")
+    if IsErr(eventIdEncodedRes):
+        return Err[V3BioDidOperatorAnchor](Error(eventIdEncodedRes))
+    let operatorIdRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(operatorIdTextRes))
+    if IsErr(operatorIdRes):
+        return Err[V3BioDidOperatorAnchor](Error(operatorIdRes))
+    let bundleSeqRes = did.v3DidStoreParseInt32(Value(bundleSeqTextRes))
+    if IsErr(bundleSeqRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleSeqRes))
+    let bundleCidRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(Value(bundleCidTextRes))
+    if IsErr(bundleCidRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleCidRes))
+    let bundleTextBytesRes = did.v3DidStoreDecodeBytes(Value(bundleTextEncodedRes))
+    if IsErr(bundleTextBytesRes):
+        return Err[V3BioDidOperatorAnchor](Error(bundleTextBytesRes))
+    let eventIdBytesRes = did.v3DidStoreDecodeBytes(Value(eventIdEncodedRes))
+    if IsErr(eventIdBytesRes):
+        return Err[V3BioDidOperatorAnchor](Error(eventIdBytesRes))
+    var out = v3BioDidOperatorAnchorZero()
+    out.operatorId = Value(operatorIdRes)
+    out.bundleKind = bundleKindText
+    out.recoveryMode = Value(recoveryModeRes)
+    out.didText = didText
+    out.subjectDidText = subjectDidText
+    out.deviceDidText = deviceDidText
+    out.bundleSeq = Value(bundleSeqRes)
+    out.bundleCid = Value(bundleCidRes)
+    out.bundleText = bytesToString(Value(bundleTextBytesRes))
+    out.eventId = bytesToString(Value(eventIdBytesRes))
+    let verifyRes = v3BioDidOperatorAnchorVerify(out)
+    if IsErr(verifyRes):
+        return Err[V3BioDidOperatorAnchor](Error(verifyRes))
+    let canonicalText = isV2 ? v3BioDidOperatorAnchorText(out) : v3BioDidOperatorAnchorLegacyText(out)
+    if !v3BioDidTextEqual(canonicalText, text):
+        return Err[V3BioDidOperatorAnchor]("v3 bio did: non canonical operator anchor text")
+    return Ok[V3BioDidOperatorAnchor](out)
+
+fn v3BioDidChainCurrentOperatorAnchorSeq(node: chain.V3ChainNode): int32 =
+    var maxSeq = 0
+    for i in 0..<node.events.len:
+        let event = node.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
+            continue
+        if event.assetId != v3BioDidOperatorAnchorAssetId:
+            continue
+        if event.toAccount != v3BioDidOperatorAnchorAccountId:
+            continue
+        if event.fromAccount > maxSeq:
+            maxSeq = event.fromAccount
+    return maxSeq
+
+fn v3BioDidChainLoadOperatorAnchorText(node: chain.V3ChainNode,
+                                       anchorSeq: int32): Result[str] =
+    var maxOrdinal = 0
+    for i in 0..<node.events.len:
+        let event = node.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
+            continue
+        if event.assetId != v3BioDidOperatorAnchorAssetId:
+            continue
+        if event.toAccount != v3BioDidOperatorAnchorAccountId:
+            continue
+        if event.fromAccount != anchorSeq:
+            continue
+        let ordinal = int32(event.amount)
+        if int64(ordinal) != event.amount:
+            return Err[str]("v3 bio did: operator chunk ordinal overflow")
+        if ordinal > maxOrdinal:
+            maxOrdinal = ordinal
+    if maxOrdinal <= 0:
+        return Err[str]("v3 bio did: operator anchor seq missing")
+    var chunks: layout.FixedBytes32[]
+    var ordinal = 1
+    while ordinal <= maxOrdinal:
+        var foundCount = 0
+        var chunk = layout.fixedBytes32Zero()
+        for i in 0..<node.events.len:
+            let event = node.events[i]
+            if event.kind != consensus.v3ConsensusKindMint:
+                continue
+            if event.assetId != v3BioDidOperatorAnchorAssetId:
+                continue
+            if event.toAccount != v3BioDidOperatorAnchorAccountId:
+                continue
+            if event.fromAccount != anchorSeq:
+                continue
+            if event.amount != int64(ordinal):
+                continue
+            foundCount = foundCount + 1
+            chunk = event.fromParentCid
+        if foundCount != 1:
+            return Err[str]("v3 bio did: operator chunk multiplicity mismatch")
+        add(chunks, chunk)
+        ordinal = ordinal + 1
+    let payloadRes = v3BioDidChunksToPayload(chunks)
+    if IsErr(payloadRes):
+        return Err[str](Error(payloadRes))
+    return Ok[str](bytesToString(Value(payloadRes)))
+
+fn v3BioDidChainAppendOperatorAnchor(node: var chain.V3ChainNode,
+                                     anchor: V3BioDidOperatorAnchor): Result[layout.FixedBytes32] =
+    let verifyRes = v3BioDidOperatorAnchorVerify(anchor)
+    if IsErr(verifyRes):
+        return Err[layout.FixedBytes32](Error(verifyRes))
+    let anchorSeq = v3BioDidChainCurrentOperatorAnchorSeq(node) + 1
+    let payload = bytesFromString(v3BioDidOperatorAnchorText(anchor))
+    let chunkCount = v3BioDidChunkCount(payload.len)
+    var lastEventCid = layout.fixedBytes32Zero()
+    for chunkIndex in 0..<chunkCount:
+        let parentCid = chain.v3ChainNodeAccountHead(node.index,
+                                                     v3BioDidOperatorAnchorAssetId,
+                                                     v3BioDidOperatorAnchorAccountId)
+        var event = consensus.v3ChainEventMint(v3BioDidOperatorAnchorAssetId,
+                                               v3BioDidOperatorAnchorAccountId,
+                                               parentCid,
+                                               int64(chunkIndex + 1),
+                                               node.nextEpoch,
+                                               node.nextGanzhi,
+                                               chain.v3ChainNodeSpaceSlot(v3BioDidOperatorAnchorAccountId,
+                                                                          v3BioDidOperatorAnchorAccountId),
+                                               node.nextTick)
+        event.fromAccount = anchorSeq
+        event.fromParentCid = v3BioDidChunkFixed(payload, chunkIndex)
+        event.bodyCid = consensus.v3ChainEventBodyCid(event)
+        let applyRes = chain.v3ChainNodeApplyEvent(node, event)
+        if IsErr(applyRes):
+            return Err[layout.FixedBytes32](Error(applyRes))
+        lastEventCid = Value(applyRes)
+    return Ok[layout.FixedBytes32](lastEventCid)
+
+fn v3BioDidChainAppendOperatorBundleAnchorWithMeta(node: var chain.V3ChainNode,
+                                                   operatorId: layout.FixedBytes32,
+                                                   subjectDidText: str,
+                                                   deviceDidText: str,
+                                                   bundleKind: str,
+                                                   bundle: V3BioDidChainBundle,
+                                                   eventId: str): Result[layout.FixedBytes32] =
+    var anchor = v3BioDidOperatorAnchorZero()
+    anchor.operatorId = operatorId
+    anchor.bundleKind = v3BioDidOperatorBundleKindNormalize(bundleKind)
+    anchor.recoveryMode = v3BioDidRecoveryModeSecretV1
+    anchor.didText = subjectDidText
+    anchor.subjectDidText = subjectDidText
+    anchor.deviceDidText = deviceDidText
+    anchor.bundleSeq = bundle.bundleSeq
+    anchor.bundleCid = bundle.bundleCid
+    anchor.bundleText = v3BioDidChainBundleText(bundle)
+    anchor.eventId = eventId
+    return v3BioDidChainAppendOperatorAnchor(node, anchor)
+
+fn v3BioDidChainAppendOperatorBundleAnchor(node: var chain.V3ChainNode,
+                                           operatorId: layout.FixedBytes32,
+                                           bundle: V3BioDidChainBundle,
+                                           eventId: str): Result[layout.FixedBytes32] =
+    return v3BioDidChainAppendOperatorBundleAnchorWithMeta(node,
+                                                           operatorId,
+                                                           bundle.didText,
+                                                           bundle.didText,
+                                                           v3BioDidOperatorBundleKindAndroidBioV1,
+                                                           bundle,
+                                                           eventId)
+
+fn v3BioDidOperatorRecordFromAnchor(anchor: V3BioDidOperatorAnchor,
+                                    anchorSeq: int32): V3BioDidOperatorRecord =
+    var record = v3BioDidOperatorRecordZero()
+    record.operatorId = anchor.operatorId
+    record.bundleKind = v3BioDidOperatorBundleKindNormalize(anchor.bundleKind)
+    record.didText = anchor.didText
+    record.subjectDidText = anchor.subjectDidText
+    record.deviceDidText = anchor.deviceDidText
+    record.bundleSeq = anchor.bundleSeq
+    record.bundleCid = anchor.bundleCid
+    record.bundleText = anchor.bundleText
+    record.eventId = anchor.eventId
+    record.anchorSeq = anchorSeq
+    return record
+
+fn v3BioDidOperatorIndexesPut(operatorIndex: var V3BioDidOperatorIndex,
+                              operatorKindIndex: var V3BioDidOperatorKindIndex,
+                              record: V3BioDidOperatorRecord): Result[bool] =
+    let kindPutRes = v3BioDidOperatorKindIndexPut(
+        operatorKindIndex,
+        V3BioDidOperatorKindKey(
+            operatorId: record.operatorId,
+            bundleKind: v3BioDidOperatorBundleKindNormalize(record.bundleKind)
+        ),
+        record
+    )
+    if IsErr(kindPutRes):
+        return Err[bool](Error(kindPutRes))
+    let currentRes = v3BioDidOperatorIndexLookup(operatorIndex, layout.fixedBytes32Hex(record.operatorId))
+    if IsErr(currentRes) || v3BioDidOperatorRecordShouldReplace(Value(currentRes), record):
+        let putRes = v3BioDidOperatorIndexPut(operatorIndex, record.operatorId, record)
+        if IsErr(putRes):
+            return Err[bool](Error(putRes))
+    return Ok[bool](true)
+
+fn v3BioDidOperatorIndexRebuild(node: chain.V3ChainNode): Result[V3BioDidOperatorIndex] =
+    let initCap = v3BioDidOperatorIndexInitCap
+    var out = v3BioDidOperatorIndexInit(initCap)
+    var kindOut = v3BioDidOperatorKindIndexInit(initCap)
+    let maxSeq = v3BioDidChainCurrentOperatorAnchorSeq(node)
+    var anchorSeq = 1
+    while anchorSeq <= maxSeq:
+        let textRes = v3BioDidChainLoadOperatorAnchorText(node, anchorSeq)
+        if IsErr(textRes):
+            return Err[V3BioDidOperatorIndex](Error(textRes))
+        let anchorRes = v3BioDidOperatorAnchorParseText(Value(textRes))
+        if IsErr(anchorRes):
+            return Err[V3BioDidOperatorIndex](Error(anchorRes))
+        let anchor = Value(anchorRes)
+        let putRes = v3BioDidOperatorIndexesPut(out,
+                                                kindOut,
+                                                v3BioDidOperatorRecordFromAnchor(anchor, anchorSeq))
+        if IsErr(putRes):
+            return Err[V3BioDidOperatorIndex](Error(putRes))
+        anchorSeq = anchorSeq + 1
+    return Ok[V3BioDidOperatorIndex](out)
+
+fn v3BioDidOperatorIndexLookup(index: V3BioDidOperatorIndex,
+                               operatorIdHex: str): Result[V3BioDidOperatorRecord] =
+    let operatorIdRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(operatorIdHex)
+    if IsErr(operatorIdRes):
+        return Err[V3BioDidOperatorRecord](Error(operatorIdRes))
+    let operatorId = Value(operatorIdRes)
+    let slot = v3BioDidOperatorIndexFindSlot(index, operatorId, false)
+    if slot < 0:
+        return Err[V3BioDidOperatorRecord]("v3 bio did: operator not found")
+    let record = index.vals[slot]
+    if layout.fixedBytes32Equal(record.operatorId, layout.fixedBytes32Zero()):
+        return Err[V3BioDidOperatorRecord]("v3 bio did: operator record missing")
+    return Ok[V3BioDidOperatorRecord](record)
+
+fn v3BioDidOperatorLookup(index: V3BioDidOperatorIndex,
+                          operatorKindIndex: V3BioDidOperatorKindIndex,
+                          operatorIdHex: str,
+                          preferredKinds: str[]): Result[V3BioDidOperatorRecord] =
+    let operatorIdRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(operatorIdHex)
+    if IsErr(operatorIdRes):
+        return Err[V3BioDidOperatorRecord](Error(operatorIdRes))
+    let operatorId = Value(operatorIdRes)
+    for i in 0..<preferredKinds.len:
+        let bundleKind = v3BioDidOperatorBundleKindNormalize(preferredKinds[i])
+        let lookupKindRes = v3BioDidOperatorKindIndexLookup(operatorKindIndex, operatorId, bundleKind)
+        if IsOk(lookupKindRes):
+            return lookupKindRes
+    return v3BioDidOperatorIndexLookup(index, operatorIdHex)
+
+fn v3BioDidOperatorLookupJson(index: V3BioDidOperatorIndex,
+                              operatorKindIndex: V3BioDidOperatorKindIndex,
+                              operatorIdHex: str,
+                              preferredKinds: str[]): str =
+    let operatorIdRes: Result[layout.FixedBytes32] = layout.fixedBytes32FromHex(operatorIdHex)
+    if IsErr(operatorIdRes):
+        return "{\"ok\":false,\"found\":false,\"operatorId\":\"\",\"error\":\"invalid_operator_id\"}"
+    let operatorId = layout.fixedBytes32Hex(Value(operatorIdRes))
+    let lookupRes = v3BioDidOperatorLookup(index, operatorKindIndex, operatorId, preferredKinds)
+    if IsErr(lookupRes):
+        return "{\"ok\":true,\"found\":false,\"operatorId\":\"" + operatorId + "\"}"
+    let record = Value(lookupRes)
+    let bundleTextEncoded = did.v3DidStoreEncodeText(record.bundleText)
+    let eventIdEncoded = did.v3DidStoreEncodeText(record.eventId)
+    var out = "{\"ok\":true,\"found\":true"
+    out = out + ",\"operatorId\":\"" + operatorId + "\""
+    out = out + ",\"did\":\"" + record.didText + "\""
+    out = out + ",\"subjectDid\":\"" + record.subjectDidText + "\""
+    out = out + ",\"deviceDid\":\"" + record.deviceDidText + "\""
+    out = out + ",\"bundleSeq\":" + strings.intToStr(record.bundleSeq)
+    out = out + ",\"bundleCid\":\"" + layout.fixedBytes32Hex(record.bundleCid) + "\""
+    out = out + ",\"bundleText\":\"" + bundleTextEncoded + "\""
+    out = out + ",\"bundleTextEncoding\":\"did_store_hex_v1\""
+    out = out + ",\"bundleKind\":\"" + v3BioDidOperatorBundleKindNormalize(record.bundleKind) + "\""
+    out = out + ",\"eventId\":\"" + eventIdEncoded + "\""
+    out = out + ",\"eventIdEncoding\":\"did_store_hex_v1\""
+    out = out + "}"
+    return out
+
+fn v3BioDidOperatorLookupJsonFromNode(nodeState: chain.V3ChainNode,
+                                      operatorIdHex: str): str =
+    var emptyKinds: str[]
+    emptyKinds.len = 0
+    let stateRes = v3BioDidChainStateFromNode(nodeState)
+    if IsErr(stateRes):
+        let errorText = did.v3DidStoreEncodeText(Error(stateRes))
+        return "{\"ok\":false,\"found\":false,\"operatorId\":\"" +
+               operatorIdHex +
+               "\",\"error\":\"" +
+               errorText +
+               "\",\"errorEncoding\":\"did_store_hex_v1" +
+               "\"}"
+    let state = Value(stateRes)
+    return v3BioDidOperatorLookupJson(state.operatorIndex,
+                                      state.operatorKindIndex,
+                                      operatorIdHex,
+                                      emptyKinds)
+
+fn v3BioDidChainStateSyncOperatorIndex(state: var V3BioDidChainState): Result[bool] =
+    let maxSeq = v3BioDidChainCurrentOperatorAnchorSeq(state.node)
+    if maxSeq < state.operatorAnchorSeq:
+        return Err[bool]("v3 bio did: operator index seq overflow")
+    var changed = false
+    var anchorSeq = state.operatorAnchorSeq + 1
+    while anchorSeq <= maxSeq:
+        let textRes = v3BioDidChainLoadOperatorAnchorText(state.node, anchorSeq)
+        if IsErr(textRes):
+            return Err[bool](Error(textRes))
+        let anchorRes = v3BioDidOperatorAnchorParseText(Value(textRes))
+        if IsErr(anchorRes):
+            return Err[bool](Error(anchorRes))
+        let anchor = Value(anchorRes)
+        let putRes = v3BioDidOperatorIndexesPut(state.operatorIndex,
+                                                state.operatorKindIndex,
+                                                v3BioDidOperatorRecordFromAnchor(anchor, anchorSeq))
+        if IsErr(putRes):
+            return Err[bool](Error(putRes))
+        changed = true
+        anchorSeq = anchorSeq + 1
+    state.operatorAnchorSeq = maxSeq
+    return Ok[bool](changed)
+
+fn v3BioDidChainStateFromNode(node: chain.V3ChainNode): Result[V3BioDidChainState] =
+    var out = v3BioDidChainStateZero(node)
+    let syncRes = v3BioDidChainStateSyncOperatorIndex(out)
+    if IsErr(syncRes):
+        return Err[V3BioDidChainState](Error(syncRes))
+    return Ok[V3BioDidChainState](out)
+
+fn v3BioDidChainStateReplayFromSnapshot(nodeId: str,
+                                        addressSeed: str,
+                                        snapshot: chain.V3ChainNodeServeSnapshot):
+                                        Result[V3BioDidChainState] =
+    let initNode = chain.v3ChainNodeInit(nodeId, addressSeed)
+    let nodeRes = chain.v3ChainNodeReplayFromSnapshot(nodeId, initNode.address, snapshot)
+    if IsErr(nodeRes):
+        return Err[V3BioDidChainState](Error(nodeRes))
+    return v3BioDidChainStateFromNode(Value(nodeRes))
+
+fn v3BioDidOperatorLookupJsonFromState(state: var V3BioDidChainState,
+                                       operatorIdHex: str): str =
+    var emptyKinds: str[]
+    emptyKinds.len = 0
+    return v3BioDidOperatorLookupJsonFromStateWithKinds(state, operatorIdHex, emptyKinds)
+
+fn v3BioDidOperatorLookupJsonFromStateWithKinds(state: var V3BioDidChainState,
+                                                operatorIdHex: str,
+                                                preferredKinds: str[]): str =
+    let syncRes = v3BioDidChainStateSyncOperatorIndex(state)
+    if IsErr(syncRes):
+        let errorText = did.v3DidStoreEncodeText(Error(syncRes))
+        return "{\"ok\":false,\"found\":false,\"operatorId\":\"" +
+               operatorIdHex +
+               "\",\"error\":\"" +
+               errorText +
+               "\",\"errorEncoding\":\"did_store_hex_v1" +
+               "\"}"
+    return v3BioDidOperatorLookupJson(state.operatorIndex,
+                                      state.operatorKindIndex,
+                                      operatorIdHex,
+                                      preferredKinds)
 
 fn v3BioDidChainRequestIdSeen(node: chain.V3ChainNode,
                               didText: str,
@@ -1192,7 +2205,7 @@ fn v3BioDidImportWithHardwareCapture(node: var chain.V3ChainNode,
         return Err[V3BioDidProvisionResult](Error(rootSecretRes))
     let rootSecret = Value(rootSecretRes)
     let rootSeed = v3BioDidRootSeedFromRootSecret(rootSecret)
-    if did.v3DidFromRootSeed(rootSeed) != didText:
+    if !v3BioDidTextEqual(did.v3DidFromRootSeed(rootSeed), didText):
         return Err[V3BioDidProvisionResult]("v3 bio did: fingerprint did mismatch")
     let deviceSeed = v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
     let devicePeerId = did.v3DidDevicePeerIdFromSeed(deviceSeed)
@@ -1268,7 +2281,7 @@ fn v3BioDidImportFromLatestBundleWithHardwareCapture(latestBundle: V3BioDidChain
         return Err[V3BioDidProvisionResult](Error(rootSecretRes))
     let rootSecret = Value(rootSecretRes)
     let rootSeed = v3BioDidRootSeedFromRootSecret(rootSecret)
-    if did.v3DidFromRootSeed(rootSeed) != latestBundle.didText:
+    if !v3BioDidTextEqual(did.v3DidFromRootSeed(rootSeed), latestBundle.didText):
         return Err[V3BioDidProvisionResult]("v3 bio did: fingerprint did mismatch")
     let deviceSeed = v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
     let devicePeerId = did.v3DidDevicePeerIdFromSeed(deviceSeed)
@@ -1321,3 +2334,135 @@ fn v3BioDidImportFromLatestBundleWithHardwareCapture(latestBundle: V3BioDidChain
     out.document = document
     out.bundle = Value(bundleRes)
     return Ok[V3BioDidProvisionResult](out)
+
+fn v3BioDidOperatorEventId(operatorId: layout.FixedBytes32,
+                           bundleKind: str,
+                           bundle: V3BioDidChainBundle): str =
+    return bundle.action +
+           "|" +
+           layout.fixedBytes32Hex(operatorId) +
+           "|" +
+           v3BioDidOperatorBundleKindNormalize(bundleKind) +
+           "|" +
+           bundle.didText +
+           "|" +
+           strings.intToStr(bundle.bundleSeq) +
+           "|" +
+           bundle.hardware.requestId
+
+fn v3BioDidChainStateCreateWithHardwareCapture(state: var V3BioDidChainState,
+                                               capture: V3BioDidHardwareCapture,
+                                               epochSeconds: int64): Result[V3BioDidProvisionResult] =
+    var node = state.node
+    let createRes = v3BioDidCreateWithHardwareCapture(node, capture, epochSeconds)
+    state.node = node
+    return createRes
+
+fn v3BioDidChainStateImportWithHardwareCapture(state: var V3BioDidChainState,
+                                               didText: str,
+                                               capture: V3BioDidHardwareCapture,
+                                               epochSeconds: int64): Result[V3BioDidProvisionResult] =
+    var node = state.node
+    let importRes = v3BioDidImportWithHardwareCapture(node, didText, capture, epochSeconds)
+    state.node = node
+    return importRes
+
+fn v3BioDidChainStateAppendOperatorAnchor(state: var V3BioDidChainState,
+                                          anchor: V3BioDidOperatorAnchor): Result[layout.FixedBytes32] =
+    let syncRes = v3BioDidChainStateSyncOperatorIndex(state)
+    if IsErr(syncRes):
+        return Err[layout.FixedBytes32](Error(syncRes))
+    var node = state.node
+    let appendRes = v3BioDidChainAppendOperatorAnchor(node, anchor)
+    state.node = node
+    if IsErr(appendRes):
+        return Err[layout.FixedBytes32](Error(appendRes))
+    let nextAnchorSeq = state.operatorAnchorSeq + 1
+    let putRes = v3BioDidOperatorIndexesPut(state.operatorIndex,
+                                            state.operatorKindIndex,
+                                            v3BioDidOperatorRecordFromAnchor(anchor, nextAnchorSeq))
+    if IsErr(putRes):
+        return Err[layout.FixedBytes32](Error(putRes))
+    state.operatorAnchorSeq = nextAnchorSeq
+    return Ok[layout.FixedBytes32](Value(appendRes))
+
+fn v3BioDidChainStateAppendOperatorBundleAnchorWithMeta(state: var V3BioDidChainState,
+                                                        operatorId: layout.FixedBytes32,
+                                                        subjectDidText: str,
+                                                        deviceDidText: str,
+                                                        bundleKind: str,
+                                                        bundle: V3BioDidChainBundle): Result[layout.FixedBytes32] =
+    return v3BioDidChainStateAppendOperatorAnchor(
+        state,
+        V3BioDidOperatorAnchor(
+            operatorId: operatorId,
+            bundleKind: v3BioDidOperatorBundleKindNormalize(bundleKind),
+            recoveryMode: v3BioDidRecoveryModeSecretV1,
+            didText: subjectDidText,
+            subjectDidText: subjectDidText,
+            deviceDidText: deviceDidText,
+            bundleSeq: bundle.bundleSeq,
+            bundleCid: bundle.bundleCid,
+            bundleText: v3BioDidChainBundleText(bundle),
+            eventId: v3BioDidOperatorEventId(operatorId,
+                                             v3BioDidOperatorBundleKindNormalize(bundleKind),
+                                             bundle)
+        )
+    )
+
+fn v3BioDidChainStateAppendOperatorBundleAnchor(state: var V3BioDidChainState,
+                                                operatorId: layout.FixedBytes32,
+                                                bundle: V3BioDidChainBundle): Result[layout.FixedBytes32] =
+    return v3BioDidChainStateAppendOperatorBundleAnchorWithMeta(state,
+                                                                operatorId,
+                                                                bundle.didText,
+                                                                bundle.didText,
+                                                                v3BioDidOperatorBundleKindAndroidBioV1,
+                                                                bundle)
+
+fn v3BioDidChainStateServeOnce(state: var V3BioDidChainState): chain.V3ChainNodeServeSnapshot =
+    var node = state.node
+    let snapshot = chain.v3ChainNodeServeOnce(node)
+    state.node = node
+    return snapshot
+
+fn v3BioDidEnsureWithHardwareCapture(state: var V3BioDidChainState,
+                                     operatorId: layout.FixedBytes32,
+                                     capture: V3BioDidHardwareCapture,
+                                     epochSeconds: int64): Result[V3BioDidProvisionResult] =
+    let syncRes = v3BioDidChainStateSyncOperatorIndex(state)
+    if IsErr(syncRes):
+        return Err[V3BioDidProvisionResult](Error(syncRes))
+    let lookupRes = v3BioDidOperatorIndexLookup(state.operatorIndex, layout.fixedBytes32Hex(operatorId))
+    if IsOk(lookupRes):
+        let importRes = v3BioDidChainStateImportWithHardwareCapture(state,
+                                                                    Value(lookupRes).didText,
+                                                                    capture,
+                                                                    epochSeconds)
+        if IsErr(importRes):
+            return Err[V3BioDidProvisionResult](Error(importRes))
+        let anchorRes = v3BioDidChainStateAppendOperatorBundleAnchorWithMeta(
+            state,
+            operatorId,
+            Value(lookupRes).subjectDidText,
+            Value(importRes).bundle.didText,
+            v3BioDidOperatorBundleKindAndroidBioV1,
+            Value(importRes).bundle
+        )
+        if IsErr(anchorRes):
+            return Err[V3BioDidProvisionResult](Error(anchorRes))
+        return importRes
+    let createRes = v3BioDidChainStateCreateWithHardwareCapture(state, capture, epochSeconds)
+    if IsErr(createRes):
+        return Err[V3BioDidProvisionResult](Error(createRes))
+    let anchorRes = v3BioDidChainStateAppendOperatorBundleAnchorWithMeta(
+        state,
+        operatorId,
+        Value(createRes).bundle.didText,
+        Value(createRes).bundle.didText,
+        v3BioDidOperatorBundleKindAndroidBioV1,
+        Value(createRes).bundle
+    )
+    if IsErr(anchorRes):
+        return Err[V3BioDidProvisionResult](Error(anchorRes))
+    return createRes

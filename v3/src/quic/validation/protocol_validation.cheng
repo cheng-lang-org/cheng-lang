@@ -1,0 +1,114 @@
+# MsQuic protocol validation helpers(packet/frame, minimal).
+
+import std/result
+import std/rawbytes
+import cheng/v3/quic/core/frame_model
+import cheng/v3/quic/core/packet_model
+
+fn msquicFrameRequiresStream(kind: frame_model.MsQuicFrameType): bool =
+    if kind == frame_model.FrameData ||
+       kind == frame_model.FrameMaxStreamData ||
+       kind == frame_model.FrameReset ||
+       kind == frame_model.FrameStopSending:
+        return true
+    return false
+
+fn msquicFrameAllowsData(kind: frame_model.MsQuicFrameType): bool =
+    if kind == frame_model.FrameData ||
+       kind == frame_model.FrameAck ||
+       kind == frame_model.FrameCrypto ||
+       kind == frame_model.FrameDatagram ||
+       kind == frame_model.FramePathChallenge ||
+       kind == frame_model.FramePathResponse ||
+       kind == frame_model.FrameConnectionClose ||
+       kind == frame_model.FrameConnectionCloseApp ||
+       kind == frame_model.FrameAckFrequency ||
+       kind == frame_model.FrameNewToken ||
+       kind == frame_model.FrameNewConnectionId:
+        return true
+    return false
+
+fn msquicFrameUsesOffset(kind: frame_model.MsQuicFrameType): bool =
+    if kind == frame_model.FrameData ||
+       kind == frame_model.FrameAck ||
+       kind == frame_model.FrameCrypto ||
+       kind == frame_model.FrameConnectionClose ||
+       kind == frame_model.FrameAckFrequency:
+        return true
+    return false
+
+fn msquicFrameUsesValue(kind: frame_model.MsQuicFrameType): bool =
+    if kind == frame_model.FrameAck ||
+       kind == frame_model.FrameMaxData ||
+       kind == frame_model.FrameMaxStreamData ||
+       kind == frame_model.FrameReset ||
+       kind == frame_model.FrameStopSending ||
+       kind == frame_model.FrameMaxStreamsBidi ||
+       kind == frame_model.FrameMaxStreamsUni ||
+       kind == frame_model.FrameConnectionClose ||
+       kind == frame_model.FrameConnectionCloseApp ||
+       kind == frame_model.FrameAckFrequency ||
+       kind == frame_model.FrameRetireConnectionId ||
+       kind == frame_model.FrameStreamsBlockedBidi ||
+       kind == frame_model.FrameStreamsBlockedUni ||
+       kind == frame_model.FrameDataBlocked ||
+       kind == frame_model.FrameStreamDataBlocked:
+        return true
+    return false
+
+fn msquicFrameAckEliciting(kind: frame_model.MsQuicFrameType): bool =
+    if kind == frame_model.FrameAck ||
+       kind == frame_model.FramePadding ||
+       kind == frame_model.FrameConnectionClose ||
+       kind == frame_model.FrameConnectionCloseApp:
+        return false
+    return true
+
+fn msquicValidateFrame(frame: frame_model.MsQuicFrame): Result[bool] =
+    if frame.streamId < 0:
+        return Err[bool]("msquic validate: negative stream id")
+    if frame.offset < 0:
+        return Err[bool]("msquic validate: negative offset")
+    if frame.value < 0:
+        return Err[bool]("msquic validate: negative value")
+    let needsStream = msquicFrameRequiresStream(frame.kind)
+    if !needsStream && frame.streamId != 0:
+        return Err[bool]("msquic validate: non-stream frame has stream id")
+    if !msquicFrameUsesOffset(frame.kind) && frame.offset != 0:
+        return Err[bool]("msquic validate: unexpected offset")
+    if !msquicFrameUsesValue(frame.kind) && frame.value != 0:
+        return Err[bool]("msquic validate: unexpected value")
+    if !msquicFrameAllowsData(frame.kind) && bytesLen(frame.data) > 0:
+        return Err[bool]("msquic validate: unexpected frame data")
+    return Ok[bool](true)
+
+fn msquicValidatePacket(p: packet_model.MsQuicPacket): Result[bool] =
+    if p.number < 0:
+        return Err[bool]("msquic validate: negative packet number")
+    if p.framesCount < 0:
+        return Err[bool]("msquic validate: negative frame count")
+    if p.framesCount > packet_model.msQuicMaxFramesPerPacket:
+        return Err[bool]("msquic validate: frame count overflow")
+    var hasAckEliciting = false
+    for i in 0..<p.framesCount:
+        let frame = p.frames[i]
+        let frameRes = msquicValidateFrame(frame)
+        if IsErr(frameRes):
+            return Err[bool](ErrorText(frameRes))
+        if msquicFrameAckEliciting(frame.kind):
+            hasAckEliciting = true
+    if hasAckEliciting != p.ackEliciting:
+        return Err[bool]("msquic validate: ack eliciting mismatch")
+    return Ok[bool](true)
+
+fn msquicValidatePacketBytes(data: Bytes): Result[bool] =
+    let pktRes = packet_model.msquicPacketPayloadDecode(data, 0)
+    if IsErr(pktRes):
+        return Err[bool](ErrorText(pktRes))
+    return msquicValidatePacket(Value(pktRes))
+
+fn msquicValidatePacketPayloadBytes(data: Bytes, packetNumber: int64): Result[bool] =
+    let pktRes = packet_model.msquicPacketPayloadDecode(data, packetNumber)
+    if IsErr(pktRes):
+        return Err[bool](ErrorText(pktRes))
+    return msquicValidatePacket(Value(pktRes))

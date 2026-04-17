@@ -11,12 +11,17 @@ import {
 
 const NATIVE_GUI_BUNDLE_HEAP_GUARD_ENV = 'R2C_REACT_V3_NATIVE_GUI_BUNDLE_HEAP_GUARD';
 const DEFAULT_NATIVE_GUI_BUNDLE_MAX_OLD_SPACE_MB = 768;
-const DEFAULT_LAYOUT_SURFACE_NODE_LIMIT = 96;
+const DEFAULT_LAYOUT_SURFACE_NODE_LIMIT = 256;
 const DEFAULT_LAYOUT_SURFACE_COMPONENT_EXPANSION_LIMIT = 64;
 const DEFAULT_LAYOUT_SURFACE_MODULE_PARSE_LIMIT = 64;
+const DEFAULT_LAYOUT_SURFACE_MAP_EXPANSION_LIMIT = 24;
 const DEFAULT_LAYOUT_SURFACE_MAX_SOURCE_CHARS = 2 * 1024 * 1024;
 const DEFAULT_LAYOUT_SURFACE_MAX_RSS_MB = 768;
 const NATIVE_GUI_RUNTIME_CONTROLLER_TIMEOUT_MS = 120000;
+const UNKNOWN_STATIC_VALUE = Symbol('r2c_react_v3_unknown_static_value');
+const STATIC_NO_RETURN = Symbol('r2c_react_v3_static_no_return');
+const JSX_RESOLUTION_CONTINUE = Symbol('r2c_react_v3_jsx_resolution_continue');
+const JSX_RESOLUTION_NONE = Symbol('r2c_react_v3_jsx_resolution_none');
 
 function parseArgs(argv) {
   const out = {
@@ -198,6 +203,33 @@ function resolveModulePath(codegenManifest, importPath) {
   return path.join(packageRoot, 'src', `${rel}.cheng`);
 }
 
+function normalizeCodegenManifestPaths(codegenManifest, outDir) {
+  const packageImportPrefix = String(codegenManifest?.package_import_prefix || '').trim();
+  if (!packageImportPrefix) {
+    throw new Error('codegen manifest missing package_import_prefix');
+  }
+  const declaredPackageRootRaw = String(codegenManifest?.package_root || '').trim();
+  const declaredPackageRoot = declaredPackageRootRaw ? path.resolve(declaredPackageRootRaw) : '';
+  const expectedPackageRoot = path.resolve(path.join(outDir, 'cheng_codegen'));
+  const packageRoot = fs.existsSync(expectedPackageRoot)
+    ? expectedPackageRoot
+    : declaredPackageRoot;
+  if (!packageRoot) {
+    throw new Error('codegen manifest missing package_root');
+  }
+  const declaredRouteCatalogRaw = String(codegenManifest?.route_catalog_path || '').trim();
+  const declaredRouteCatalogPath = declaredRouteCatalogRaw ? path.resolve(declaredRouteCatalogRaw) : '';
+  const expectedRouteCatalogPath = path.resolve(path.join(outDir, 'cheng_codegen_route_catalog_v1.json'));
+  const routeCatalogPath = fs.existsSync(expectedRouteCatalogPath)
+    ? expectedRouteCatalogPath
+    : declaredRouteCatalogPath;
+  return {
+    ...codegenManifest,
+    package_root: packageRoot,
+    route_catalog_path: routeCatalogPath,
+  };
+}
+
 function countAssetKinds(entries) {
   const counts = new Map();
   for (const entry of entries) {
@@ -360,6 +392,37 @@ function buildUniqueComponentRegistry(tsxAstDoc) {
   return seen;
 }
 
+function buildRouteStaticEvalEnv(modulePath, componentName, routeState) {
+  const env = new Map();
+  const moduleText = String(modulePath || '').trim();
+  const componentText = String(componentName || '').trim();
+  const routeText = String(routeState || '').trim();
+  if (!routeText) return env;
+  if (moduleText === 'app/App.tsx' && componentText === 'AppContent') {
+    env.set('__r2cTruthRouteState', routeText);
+    env.set('__r2cTruthMode', true);
+    env.set('__r2cSmokeMode', false);
+    if (routeText === 'content_detail') {
+      const truthContentFixture = markStaticObjectCompleteness({
+        id: 'truth-content',
+        type: 'image',
+        publishCategory: 'content',
+        userId: '12D3KooWDode1D7fBs5zNLvKW97hVyMxpGRnusNC',
+        userName: 'UniMaker 节点',
+        avatar: '',
+        content: '通过 cheng-libp2p 发布的示例内容，用于原生 Android 与 React 真值截图对齐。',
+        media: 'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22960%22%20height%3D%221280%22%20viewBox%3D%220%200%20960%201280%22%3E%3Crect%20width%3D%22960%22%20height%3D%221280%22%20fill%3D%22%238B5CF6%22%2F%3E%3Ctext%20x%3D%2296%22%20y%3D%221040%22%20fill%3D%22%23ffffff%22%20font-size%3D%2288%22%3EUniMaker%20Content%3C%2Ftext%3E%3C%2Fsvg%3E',
+        coverMedia: 'data:image/svg+xml;charset=UTF-8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22960%22%20height%3D%221280%22%20viewBox%3D%220%200%20960%201280%22%3E%3Crect%20width%3D%22960%22%20height%3D%221280%22%20fill%3D%22%238B5CF6%22%2F%3E%3Ctext%20x%3D%2296%22%20y%3D%221040%22%20fill%3D%22%23ffffff%22%20font-size%3D%2288%22%3EUniMaker%20Content%3C%2Ftext%3E%3C%2Fsvg%3E',
+        likes: 128,
+        comments: 32,
+        timestamp: 0,
+      }, true);
+      env.set('__r2cTruthContentFixture', truthContentFixture);
+    }
+  }
+  return env;
+}
+
 function currentRssBytes() {
   const usage = typeof process.memoryUsage === 'function' ? process.memoryUsage() : null;
   return Number(usage?.rss || 0);
@@ -503,6 +566,32 @@ function collectReturnExpressions(ts, rootNode) {
   return entries;
 }
 
+function pickLastReturnedJsxExpression(ts, rootNode) {
+  const returns = collectReturnExpressions(ts, rootNode);
+  return returns[returns.length - 1] || null;
+}
+
+function findLocalRenderHelperBody(ts, componentBody, helperName) {
+  if (!componentBody || !ts.isBlock(componentBody)) return null;
+  for (const statement of componentBody.statements || []) {
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text === helperName) {
+      if ((statement.parameters || []).length === 0) return statement.body || null;
+      continue;
+    }
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations || []) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== helperName) continue;
+      const initializer = declaration.initializer;
+      if (!initializer) continue;
+      if ((ts.isArrowFunction(initializer) || ts.isFunctionExpression(initializer))
+        && (initializer.parameters || []).length === 0) {
+        return initializer.body || null;
+      }
+    }
+  }
+  return null;
+}
+
 function extractStaticExpressionText(ts, expr) {
   if (!expr) return '';
   if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) {
@@ -516,7 +605,1191 @@ function extractStaticExpressionText(ts, expr) {
   return '';
 }
 
-function extractJsxAttributes(ts, attributes) {
+function staticValueToInlineText(value) {
+  if (isUnknownStaticValue(value) || value === null || value === undefined) return '';
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return String(value);
+  }
+  return '';
+}
+
+function isUnknownStaticValue(value) {
+  return value === UNKNOWN_STATIC_VALUE;
+}
+
+function isStaticNoReturn(value) {
+  return value === STATIC_NO_RETURN;
+}
+
+function isStaticPlainObject(value) {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function markStaticObjectCompleteness(target, complete) {
+  if (!isStaticPlainObject(target)) return target;
+  Object.defineProperty(target, '__r2cStaticObjectComplete', {
+    value: complete === true,
+    enumerable: false,
+    configurable: true,
+    writable: true,
+  });
+  return target;
+}
+
+function isStaticObjectComplete(value) {
+  return isStaticPlainObject(value) && value.__r2cStaticObjectComplete === true;
+}
+
+function normalizeStaticString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function isStaticP2PMediaUri(value) {
+  return normalizeStaticString(value).startsWith('p2pmedia://');
+}
+
+function makeStaticFunctionDescriptor(parsed, node, env) {
+  return {
+    __r2cStaticFunction: true,
+    parsed,
+    node,
+    env: new Map(env),
+  };
+}
+
+function isStaticFunctionDescriptor(value) {
+  return Boolean(value && value.__r2cStaticFunction);
+}
+
+function makeStaticImportBindingDescriptor(binding) {
+  return {
+    __r2cStaticImportBinding: true,
+    specifier: String(binding?.specifier || ''),
+    importedName: String(binding?.importedName || ''),
+    resolvedModulePath: String(binding?.resolvedModulePath || ''),
+    external: Boolean(binding?.external),
+  };
+}
+
+function isStaticImportBindingDescriptor(value) {
+  return Boolean(value && value.__r2cStaticImportBinding);
+}
+
+function makeStaticStateSetterDescriptor(stateName) {
+  return {
+    __r2cStaticStateSetter: true,
+    stateName: String(stateName || '').trim(),
+  };
+}
+
+function isStaticStateSetterDescriptor(value) {
+  return Boolean(value && value.__r2cStaticStateSetter);
+}
+
+function resolveStaticTruthiness(value) {
+  if (isUnknownStaticValue(value)) return UNKNOWN_STATIC_VALUE;
+  if (value === null || value === undefined) return false;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0 && !Number.isNaN(value);
+  if (typeof value === 'string') return value.length > 0;
+  if (Array.isArray(value)) return true;
+  if (typeof value === 'object') return true;
+  return UNKNOWN_STATIC_VALUE;
+}
+
+function resolveRelativeModulePath(repo, fromModulePath, specifier) {
+  const request = String(specifier || '').trim();
+  if (!request.startsWith('.')) return '';
+  const fromDir = path.posix.dirname(String(fromModulePath || '').replace(/\\/g, '/'));
+  const base = path.posix.normalize(path.posix.join(fromDir, request));
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    path.posix.join(base, 'index.ts'),
+    path.posix.join(base, 'index.tsx'),
+    path.posix.join(base, 'index.js'),
+    path.posix.join(base, 'index.jsx'),
+  ];
+  for (const candidate of candidates) {
+    const fullPath = path.join(repo, candidate);
+    if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) return candidate;
+  }
+  return '';
+}
+
+function getModuleImportBindings(ts, repo, parsed, importCache) {
+  const cacheKey = String(parsed?.modulePath || '');
+  if (importCache.has(cacheKey)) return importCache.get(cacheKey);
+  const out = new Map();
+  for (const statement of parsed?.sourceFile?.statements || []) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause || !ts.isStringLiteral(statement.moduleSpecifier)) {
+      continue;
+    }
+    const specifier = statement.moduleSpecifier.text;
+    const resolvedModulePath = resolveRelativeModulePath(repo, parsed.modulePath, specifier);
+    const external = !resolvedModulePath;
+    const clause = statement.importClause;
+    if (clause.name?.text) {
+      out.set(String(clause.name.text), {
+        specifier,
+        importedName: 'default',
+        resolvedModulePath,
+        external,
+      });
+    }
+    if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+      for (const element of clause.namedBindings.elements || []) {
+        const localName = String(element.name?.text || '').trim();
+        if (!localName) continue;
+        out.set(localName, {
+          specifier,
+          importedName: String(element.propertyName?.text || element.name.text || '').trim() || localName,
+          resolvedModulePath,
+          external,
+        });
+      }
+    }
+  }
+  importCache.set(cacheKey, out);
+  return out;
+}
+
+function findTopLevelNamedDeclaration(ts, sourceFile, name) {
+  for (const statement of sourceFile?.statements || []) {
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text === name) {
+      return { kind: 'function', node: statement };
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations || []) {
+        if (ts.isIdentifier(declaration.name) && declaration.name.text === name) {
+          return { kind: 'variable', node: declaration };
+        }
+      }
+    }
+    if (ts.isExportDeclaration(statement)
+      && statement.moduleSpecifier
+      && ts.isStringLiteral(statement.moduleSpecifier)) {
+      if (!statement.exportClause) {
+        return {
+          kind: 'reexport_star',
+          specifier: statement.moduleSpecifier.text,
+          importedName: name,
+        };
+      }
+      if (ts.isNamedExports(statement.exportClause)) {
+        for (const element of statement.exportClause.elements || []) {
+          if (String(element.name?.text || '') !== name) continue;
+          return {
+            kind: 'reexport',
+            specifier: statement.moduleSpecifier.text,
+            importedName: String(element.propertyName?.text || element.name.text || '').trim() || name,
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function bindPatternStaticValue(ts, pattern, value, env) {
+  if (!pattern) return;
+  if (ts.isIdentifier(pattern)) {
+    env.set(String(pattern.text), value);
+    return;
+  }
+  if (ts.isObjectBindingPattern(pattern)) {
+    for (const element of pattern.elements || []) {
+      const propertyName = String(
+        element.propertyName && ts.isIdentifier(element.propertyName)
+          ? element.propertyName.text
+          : element.name && ts.isIdentifier(element.name)
+            ? element.name.text
+            : '',
+      ).trim();
+      let nextValue = UNKNOWN_STATIC_VALUE;
+      if (!isUnknownStaticValue(value) && isStaticPlainObject(value) && propertyName && Object.prototype.hasOwnProperty.call(value, propertyName)) {
+        nextValue = value[propertyName];
+      }
+      bindPatternStaticValue(ts, element.name, nextValue, env);
+    }
+    return;
+  }
+  if (ts.isArrayBindingPattern(pattern)) {
+    for (let index = 0; index < (pattern.elements || []).length; index += 1) {
+      const element = pattern.elements[index];
+      if (ts.isOmittedExpression(element)) continue;
+      const nextValue = Array.isArray(value) && index < value.length ? value[index] : UNKNOWN_STATIC_VALUE;
+      bindPatternStaticValue(ts, element.name, nextValue, env);
+    }
+  }
+}
+
+function resolveNamedValueFromModule(ts, repo, modulePath, name, sourceCache, budgetState, importCache, valueCache, evalStack) {
+  const key = `${String(modulePath || '').trim()}#${String(name || '').trim()}`;
+  if (!modulePath || !name) return UNKNOWN_STATIC_VALUE;
+  if (valueCache.has(key)) return valueCache.get(key);
+  if (evalStack.has(key)) return UNKNOWN_STATIC_VALUE;
+  evalStack.add(key);
+  const parsed = parseSourceModule(ts, repo, modulePath, sourceCache, budgetState);
+  let value = UNKNOWN_STATIC_VALUE;
+  if (parsed?.sourceFile) {
+    const declaration = findTopLevelNamedDeclaration(ts, parsed.sourceFile, name);
+    if (declaration?.kind === 'function') {
+      value = makeStaticFunctionDescriptor(parsed, declaration.node, new Map());
+    } else if (declaration?.kind === 'variable') {
+      value = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        declaration.node.initializer,
+        new Map(),
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+    } else if (declaration?.kind === 'reexport' || declaration?.kind === 'reexport_star') {
+      const targetModulePath = resolveRelativeModulePath(repo, parsed.modulePath, declaration.specifier);
+      if (targetModulePath) {
+        value = resolveNamedValueFromModule(
+          ts,
+          repo,
+          targetModulePath,
+          declaration.importedName,
+          sourceCache,
+          budgetState,
+          importCache,
+          valueCache,
+          evalStack,
+        );
+      }
+    }
+  }
+  valueCache.set(key, value);
+  evalStack.delete(key);
+  return value;
+}
+
+function resolveIdentifierStaticValue(ts, repo, parsed, name, env, sourceCache, budgetState, importCache, valueCache, evalStack) {
+  const text = String(name || '').trim();
+  if (!text) return UNKNOWN_STATIC_VALUE;
+  if (env.has(text)) return env.get(text);
+  if (text === 'undefined') return undefined;
+  const imports = getModuleImportBindings(ts, repo, parsed, importCache);
+  if (imports.has(text)) {
+    const binding = imports.get(text);
+    if (binding?.resolvedModulePath) {
+      return resolveNamedValueFromModule(
+        ts,
+        repo,
+        binding.resolvedModulePath,
+        binding.importedName,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+    }
+    if (binding?.external) {
+      return makeStaticImportBindingDescriptor(binding);
+    }
+  }
+  return resolveNamedValueFromModule(
+    ts,
+    repo,
+    parsed.modulePath,
+    text,
+    sourceCache,
+    budgetState,
+    importCache,
+    valueCache,
+    evalStack,
+  );
+}
+
+function applyStaticFunction(ts, repo, fnValue, args, sourceCache, budgetState, importCache, valueCache, evalStack) {
+  if (!isStaticFunctionDescriptor(fnValue)) return UNKNOWN_STATIC_VALUE;
+  const localEnv = new Map(fnValue.env);
+  for (let index = 0; index < (fnValue.node?.parameters || []).length; index += 1) {
+    const param = fnValue.node.parameters[index];
+    let argValue = index < args.length ? args[index] : UNKNOWN_STATIC_VALUE;
+    if (isUnknownStaticValue(argValue) && param.initializer) {
+      argValue = evaluateStaticValue(
+        ts,
+        repo,
+        fnValue.parsed,
+        param.initializer,
+        localEnv,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+    }
+    bindPatternStaticValue(ts, param.name, argValue, localEnv);
+  }
+  if (fnValue.node.body && ts.isBlock(fnValue.node.body)) {
+    const result = evaluateStaticStatements(
+      ts,
+      repo,
+      fnValue.parsed,
+      fnValue.node.body,
+      localEnv,
+      sourceCache,
+      budgetState,
+      importCache,
+      valueCache,
+      evalStack,
+    );
+    return isStaticNoReturn(result) ? undefined : result;
+  }
+  return evaluateStaticValue(
+    ts,
+    repo,
+    fnValue.parsed,
+    fnValue.node.body || null,
+    localEnv,
+    sourceCache,
+    budgetState,
+    importCache,
+    valueCache,
+    evalStack,
+  );
+}
+
+function bindUseStateDeclaration(ts, repo, parsed, declaration, env, sourceCache, budgetState, importCache, valueCache) {
+  if (!declaration?.initializer || !ts.isCallExpression(declaration.initializer)) return false;
+  if (!ts.isIdentifier(declaration.initializer.expression) || declaration.initializer.expression.text !== 'useState') return false;
+  if (!ts.isArrayBindingPattern(declaration.name)) return false;
+  const elements = declaration.name.elements || [];
+  const firstArg = declaration.initializer.arguments[0];
+  const initialValue = (ts.isArrowFunction(firstArg) || ts.isFunctionExpression(firstArg))
+    ? applyStaticFunction(
+      ts,
+      repo,
+      makeStaticFunctionDescriptor(parsed, firstArg, env),
+      [],
+      sourceCache,
+      budgetState,
+      importCache,
+      valueCache,
+    )
+    : evaluateStaticValue(ts, repo, parsed, firstArg, env, sourceCache, budgetState, importCache, valueCache);
+  const stateElement = elements[0];
+  const setterElement = elements[1];
+  let stateName = '';
+  if (stateElement && !ts.isOmittedExpression(stateElement)) {
+    if (ts.isIdentifier(stateElement.name)) {
+      stateName = String(stateElement.name.text || '').trim();
+    }
+    bindPatternStaticValue(ts, stateElement.name, initialValue, env);
+  }
+  if (setterElement && !ts.isOmittedExpression(setterElement)) {
+    if (ts.isIdentifier(setterElement.name) && stateName) {
+      env.set(String(setterElement.name.text || '').trim(), makeStaticStateSetterDescriptor(stateName));
+    } else {
+      bindPatternStaticValue(ts, setterElement.name, UNKNOWN_STATIC_VALUE, env);
+    }
+  }
+  return true;
+}
+
+function applyStaticEffectStateUpdates(ts, repo, parsed, expr, env, sourceCache, budgetState, importCache, valueCache) {
+  if (!ts.isCallExpression(expr) || !ts.isIdentifier(expr.expression)) return false;
+  const hookName = String(expr.expression.text || '').trim();
+  if (hookName !== 'useEffect' && hookName !== 'useLayoutEffect') return false;
+  const callback = expr.arguments[0];
+  if (!(ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) return true;
+  const applySetterCall = (callExpr) => {
+    if (!ts.isCallExpression(callExpr) || !ts.isIdentifier(callExpr.expression) || callExpr.arguments.length <= 0) {
+      return false;
+    }
+    const setter = env.get(String(callExpr.expression.text || '').trim());
+    if (!isStaticStateSetterDescriptor(setter) || !setter.stateName) {
+      return false;
+    }
+    const nextValue = evaluateStaticValue(
+      ts,
+      repo,
+      parsed,
+      callExpr.arguments[0],
+      env,
+      sourceCache,
+      budgetState,
+      importCache,
+      valueCache,
+    );
+    if (isStaticFunctionDescriptor(nextValue)) {
+      return false;
+    }
+    env.set(setter.stateName, nextValue);
+    return true;
+  };
+  if (ts.isBlock(callback.body)) {
+    for (const statement of callback.body.statements || []) {
+      if (ts.isExpressionStatement(statement)) {
+        applySetterCall(statement.expression);
+      }
+    }
+    return true;
+  }
+  applySetterCall(callback.body);
+  return true;
+}
+
+function evaluateStaticStatements(ts, repo, parsed, block, env, sourceCache, budgetState, importCache, valueCache, evalStack) {
+  const runStatement = (statement, scope) => {
+    if (!statement) return STATIC_NO_RETURN;
+    if (ts.isBlock(statement)) {
+      const blockScope = new Map(scope);
+      for (const item of statement.statements || []) {
+        const result = runStatement(item, blockScope);
+        if (!isStaticNoReturn(result)) return result;
+      }
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text) {
+      scope.set(String(statement.name.text), makeStaticFunctionDescriptor(parsed, statement, scope));
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isExpressionStatement(statement)) {
+      if (applyStaticEffectStateUpdates(ts, repo, parsed, statement.expression, scope, sourceCache, budgetState, importCache, valueCache)) {
+        return STATIC_NO_RETURN;
+      }
+      evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        statement.expression,
+        scope,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isVariableStatement(statement)) {
+      for (const declaration of statement.declarationList.declarations || []) {
+        if (bindUseStateDeclaration(ts, repo, parsed, declaration, scope, sourceCache, budgetState, importCache, valueCache)) {
+          continue;
+        }
+        const value = evaluateStaticValue(
+          ts,
+          repo,
+          parsed,
+          declaration.initializer,
+          scope,
+          sourceCache,
+          budgetState,
+          importCache,
+          valueCache,
+          evalStack,
+        );
+        bindPatternStaticValue(ts, declaration.name, value, scope);
+      }
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isIfStatement(statement)) {
+      const condValue = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        statement.expression,
+        scope,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+      const truthiness = resolveStaticTruthiness(condValue);
+      if (truthiness === true) {
+        return runStatement(statement.thenStatement, scope);
+      }
+      if (truthiness === false) {
+        return statement.elseStatement ? runStatement(statement.elseStatement, scope) : STATIC_NO_RETURN;
+      }
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isForOfStatement(statement)) {
+      const iterableValue = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        statement.expression,
+        scope,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+      if (Array.isArray(iterableValue) || typeof iterableValue === 'string') {
+        const iterableItems = Array.isArray(iterableValue) ? iterableValue : [...iterableValue];
+        for (const itemValue of iterableItems) {
+          const iterationScope = new Map(scope);
+          const initializer = statement.initializer;
+          if (ts.isVariableDeclarationList(initializer)) {
+            const declaration = initializer.declarations?.[0];
+            if (declaration) {
+              bindPatternStaticValue(ts, declaration.name, itemValue, iterationScope);
+            }
+          } else if (ts.isIdentifier(initializer)) {
+            iterationScope.set(String(initializer.text || '').trim(), itemValue);
+          }
+          const result = runStatement(statement.statement, iterationScope);
+          if (!isStaticNoReturn(result)) return result;
+        }
+      }
+      return STATIC_NO_RETURN;
+    }
+    if (ts.isReturnStatement(statement)) {
+      if (!statement.expression) return undefined;
+      return evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        statement.expression,
+        scope,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+        evalStack,
+      );
+    }
+    return STATIC_NO_RETURN;
+  };
+
+  const scope = new Map(env);
+  for (const statement of block?.statements || []) {
+    const result = runStatement(statement, scope);
+    if (!isStaticNoReturn(result)) return result;
+  }
+  return STATIC_NO_RETURN;
+}
+
+function evaluateStaticValue(ts, repo, parsed, expr, env, sourceCache, budgetState, importCache, valueCache, evalStack = new Set()) {
+  if (!expr) return UNKNOWN_STATIC_VALUE;
+  if (ts.isAsExpression(expr) || ts.isTypeAssertionExpression(expr) || ts.isSatisfiesExpression?.(expr)) {
+    return evaluateStaticValue(ts, repo, parsed, expr.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+  }
+  if (ts.isParenthesizedExpression(expr)) {
+    return evaluateStaticValue(ts, repo, parsed, expr.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+  }
+  if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+  if (ts.isTemplateExpression(expr)) {
+    let out = expr.head.text;
+    for (const span of expr.templateSpans || []) {
+      const value = evaluateStaticValue(ts, repo, parsed, span.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      if (isUnknownStaticValue(value)) return UNKNOWN_STATIC_VALUE;
+      out += String(value);
+      out += span.literal.text;
+    }
+    return out;
+  }
+  if (ts.isNumericLiteral(expr)) return Number(expr.text);
+  if (expr.kind === ts.SyntaxKind.TrueKeyword) return true;
+  if (expr.kind === ts.SyntaxKind.FalseKeyword) return false;
+  if (expr.kind === ts.SyntaxKind.NullKeyword) return null;
+  if (ts.isIdentifier(expr)) {
+    return resolveIdentifierStaticValue(ts, repo, parsed, expr.text, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+  }
+  if (ts.isArrayLiteralExpression(expr)) {
+    const out = [];
+    for (const element of expr.elements || []) {
+      if (ts.isSpreadElement(element)) {
+        const spreadValue = evaluateStaticValue(ts, repo, parsed, element.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (Array.isArray(spreadValue)) out.push(...spreadValue);
+        continue;
+      }
+      out.push(evaluateStaticValue(ts, repo, parsed, element, env, sourceCache, budgetState, importCache, valueCache, evalStack));
+    }
+    return out;
+  }
+  if (ts.isObjectLiteralExpression(expr)) {
+    const out = {};
+    let complete = true;
+    for (const property of expr.properties || []) {
+      if (ts.isPropertyAssignment(property)) {
+        const name = ts.isIdentifier(property.name) || ts.isStringLiteral(property.name)
+          ? String(property.name.text)
+          : '';
+        if (!name) continue;
+        out[name] = evaluateStaticValue(ts, repo, parsed, property.initializer, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      } else if (ts.isShorthandPropertyAssignment(property)) {
+        out[String(property.name.text)] = resolveIdentifierStaticValue(ts, repo, parsed, property.name.text, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      } else if (ts.isSpreadAssignment(property)) {
+        const spreadValue = evaluateStaticValue(ts, repo, parsed, property.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (isStaticPlainObject(spreadValue)) {
+          Object.assign(out, spreadValue);
+          if (!isStaticObjectComplete(spreadValue)) complete = false;
+        } else {
+          complete = false;
+        }
+      }
+    }
+    return markStaticObjectCompleteness(out, complete);
+  }
+  if (ts.isPropertyAccessExpression(expr) || (typeof ts.isPropertyAccessChain === 'function' && ts.isPropertyAccessChain(expr))) {
+    const target = evaluateStaticValue(ts, repo, parsed, expr.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if ((target === null || target === undefined)
+      && typeof ts.isPropertyAccessChain === 'function'
+      && ts.isPropertyAccessChain(expr)) {
+      return undefined;
+    }
+    const propertyName = String(expr.name?.text || '').trim();
+    if (Array.isArray(target) && propertyName === 'length') return target.length;
+    if (typeof target === 'string' && propertyName === 'length') return target.length;
+    if (isStaticPlainObject(target) && Object.prototype.hasOwnProperty.call(target, propertyName)) return target[propertyName];
+    if (isStaticObjectComplete(target)) return undefined;
+    return UNKNOWN_STATIC_VALUE;
+  }
+  if (ts.isElementAccessExpression(expr) || (typeof ts.isElementAccessChain === 'function' && ts.isElementAccessChain(expr))) {
+    const target = evaluateStaticValue(ts, repo, parsed, expr.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if ((target === null || target === undefined)
+      && typeof ts.isElementAccessChain === 'function'
+      && ts.isElementAccessChain(expr)) {
+      return undefined;
+    }
+    const indexValue = evaluateStaticValue(ts, repo, parsed, expr.argumentExpression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if (Array.isArray(target) && Number.isInteger(indexValue) && indexValue >= 0 && indexValue < target.length) return target[indexValue];
+    if (isStaticPlainObject(target) && !isUnknownStaticValue(indexValue) && Object.prototype.hasOwnProperty.call(target, String(indexValue))) return target[String(indexValue)];
+    if (isStaticObjectComplete(target) && !isUnknownStaticValue(indexValue)) return undefined;
+    return UNKNOWN_STATIC_VALUE;
+  }
+  if (ts.isPrefixUnaryExpression(expr)) {
+    if (expr.operator === ts.SyntaxKind.TypeOfKeyword) {
+      if (ts.isIdentifier(expr.operand)) {
+        const operandValue = resolveIdentifierStaticValue(ts, repo, parsed, expr.operand.text, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (isUnknownStaticValue(operandValue)) return 'undefined';
+        if (operandValue === null) return 'object';
+        return typeof operandValue;
+      }
+      const operandValue = evaluateStaticValue(ts, repo, parsed, expr.operand, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      if (isUnknownStaticValue(operandValue)) return UNKNOWN_STATIC_VALUE;
+      if (operandValue === null) return 'object';
+      return typeof operandValue;
+    }
+    const operand = evaluateStaticValue(ts, repo, parsed, expr.operand, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if (expr.operator === ts.SyntaxKind.ExclamationToken) {
+      const truthiness = resolveStaticTruthiness(operand);
+      return truthiness === true ? false : truthiness === false ? true : UNKNOWN_STATIC_VALUE;
+    }
+    if (expr.operator === ts.SyntaxKind.MinusToken) return typeof operand === 'number' ? -operand : UNKNOWN_STATIC_VALUE;
+  }
+  if (ts.isBinaryExpression(expr)) {
+    const left = evaluateStaticValue(ts, repo, parsed, expr.left, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if (expr.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+      const leftTruthiness = resolveStaticTruthiness(left);
+      if (leftTruthiness === false) return left;
+      if (leftTruthiness === true) return evaluateStaticValue(ts, repo, parsed, expr.right, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      const rightValue = evaluateStaticValue(ts, repo, parsed, expr.right, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      return resolveStaticTruthiness(rightValue) === false ? rightValue : UNKNOWN_STATIC_VALUE;
+    }
+    if (expr.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
+      const leftTruthiness = resolveStaticTruthiness(left);
+      if (leftTruthiness === true) return left;
+      if (leftTruthiness === false) return evaluateStaticValue(ts, repo, parsed, expr.right, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      const rightValue = evaluateStaticValue(ts, repo, parsed, expr.right, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      return resolveStaticTruthiness(rightValue) === true ? rightValue : UNKNOWN_STATIC_VALUE;
+    }
+    const right = evaluateStaticValue(ts, repo, parsed, expr.right, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if (expr.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+      return left !== null && left !== undefined && !isUnknownStaticValue(left) ? left : right;
+    }
+    if (expr.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken) return left === right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.ExclamationEqualsEqualsToken) return left !== right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.GreaterThanToken && typeof left === 'number' && typeof right === 'number') return left > right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.GreaterThanEqualsToken && typeof left === 'number' && typeof right === 'number') return left >= right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.LessThanToken && typeof left === 'number' && typeof right === 'number') return left < right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.LessThanEqualsToken && typeof left === 'number' && typeof right === 'number') return left <= right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.MinusToken && typeof left === 'number' && typeof right === 'number') return left - right;
+    if (expr.operatorToken.kind === ts.SyntaxKind.PlusToken) {
+      if (typeof left === 'number' && typeof right === 'number') return left + right;
+      if (!isUnknownStaticValue(left) && !isUnknownStaticValue(right)) return String(left) + String(right);
+    }
+    return UNKNOWN_STATIC_VALUE;
+  }
+  if (ts.isConditionalExpression(expr)) {
+    const condition = evaluateStaticValue(ts, repo, parsed, expr.condition, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    const truthiness = resolveStaticTruthiness(condition);
+    if (truthiness === true) return evaluateStaticValue(ts, repo, parsed, expr.whenTrue, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    if (truthiness === false) return evaluateStaticValue(ts, repo, parsed, expr.whenFalse, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+    return UNKNOWN_STATIC_VALUE;
+  }
+  if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr) || ts.isFunctionDeclaration(expr)) {
+    return makeStaticFunctionDescriptor(parsed, expr, env);
+  }
+  if (ts.isCallExpression(expr)) {
+    if (ts.isIdentifier(expr.expression)) {
+      const fnName = String(expr.expression.text || '').trim();
+      if (fnName === 'readTruthRouteQuery') {
+        const truthRoute = String(env.get('__r2cTruthRouteState') || '').trim();
+        if (truthRoute) {
+          return markStaticObjectCompleteness({
+            enabled: true,
+            route: truthRoute,
+          }, true);
+        }
+      }
+      if (fnName === 'readPwaSmokeQuery') {
+        if (env.get('__r2cSmokeMode') === false) {
+          return markStaticObjectCompleteness({
+            enabled: false,
+            kind: 'none',
+            role: 'receiver',
+            reporter: '',
+            namespace: '',
+            messageText: 'pwa-smoke-message',
+            targetPeerId: '',
+            flow: 'content',
+            mediaKind: 'image',
+            title: '',
+          }, true);
+        }
+      }
+      if (fnName === 'readOverlayAppRoute') {
+        if (env.get('__r2cTruthMode') === true) {
+          return null;
+        }
+      }
+      if (fnName === 'buildTruthContent') {
+        const truthContentFixture = env.get('__r2cTruthContentFixture');
+        if (isStaticPlainObject(truthContentFixture)) {
+          return truthContentFixture;
+        }
+      }
+      if (fnName === 'resolvePreviewMediaSource') {
+        const tinyPreview = normalizeStaticString(evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        if (tinyPreview) return tinyPreview;
+        const coverMedia = normalizeStaticString(evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        if (coverMedia && !isStaticP2PMediaUri(coverMedia)) return coverMedia;
+        return '';
+      }
+      if (fnName === 'collectImageDetailMediaRefs') {
+        const options = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (!isStaticPlainObject(options)) return UNKNOWN_STATIC_VALUE;
+        if (normalizeStaticString(options.type) !== 'image') return [];
+        const out = [];
+        const pushUnique = (value) => {
+          const text = normalizeStaticString(value);
+          if (!text || out.includes(text)) return;
+          out.push(text);
+        };
+        for (const item of Array.isArray(options.mediaItems) ? options.mediaItems : []) {
+          pushUnique(item);
+        }
+        pushUnique(options.media);
+        if (out.length === 0) {
+          pushUnique(options.coverMedia);
+        }
+        return out;
+      }
+      if (fnName === 'resolveImageDetailSource') {
+        const media = normalizeStaticString(evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        const resolvedSource = normalizeStaticString(evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        const tinyPreview = evaluateStaticValue(ts, repo, parsed, expr.arguments[2], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        const coverMedia = evaluateStaticValue(ts, repo, parsed, expr.arguments[3], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (resolvedSource) return resolvedSource;
+        if (!media) {
+          const preview = normalizeStaticString(tinyPreview);
+          if (preview) return preview;
+          const cover = normalizeStaticString(coverMedia);
+          return cover && !isStaticP2PMediaUri(cover) ? cover : '';
+        }
+        if (!isStaticP2PMediaUri(media)) return media;
+        const preview = normalizeStaticString(tinyPreview);
+        if (preview) return preview;
+        const cover = normalizeStaticString(coverMedia);
+        return cover && !isStaticP2PMediaUri(cover) ? cover : '';
+      }
+      if (fnName === 'Boolean') {
+        const value = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        const truthiness = resolveStaticTruthiness(value);
+        return truthiness === UNKNOWN_STATIC_VALUE ? UNKNOWN_STATIC_VALUE : truthiness;
+      }
+      if (fnName === 'parseInt' || fnName === 'Number') {
+        const rawValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (typeof rawValue === 'number') return rawValue;
+        if (typeof rawValue === 'string') {
+          const parsedNumber = fnName === 'Number'
+            ? Number(rawValue)
+            : Number.parseInt(rawValue, (() => {
+              const radixValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+              return typeof radixValue === 'number' ? radixValue : undefined;
+            })());
+          return Number.isNaN(parsedNumber) ? UNKNOWN_STATIC_VALUE : parsedNumber;
+        }
+      }
+      if (fnName === 'encodeURIComponent') {
+        const rawValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (typeof rawValue === 'string') return encodeURIComponent(rawValue);
+      }
+      if (fnName === 'createContext' || fnName === 'useContext') {
+        return evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      }
+      if (fnName === 'useState') {
+        const firstArg = expr.arguments[0];
+        const initialValue = ts.isArrowFunction(firstArg) || ts.isFunctionExpression(firstArg)
+          ? applyStaticFunction(ts, repo, makeStaticFunctionDescriptor(parsed, firstArg, env), [], sourceCache, budgetState, importCache, valueCache, evalStack)
+          : evaluateStaticValue(ts, repo, parsed, firstArg, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        return [initialValue, UNKNOWN_STATIC_VALUE];
+      }
+      if (fnName === 'useDeferredValue') {
+        return evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      }
+      if (fnName === 'useMemo') {
+        const callbackValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        return applyStaticFunction(ts, repo, callbackValue, [], sourceCache, budgetState, importCache, valueCache, evalStack);
+      }
+      if (fnName === 'useCallback') {
+        return evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      }
+      const fnValue = resolveIdentifierStaticValue(ts, repo, parsed, fnName, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      if (isStaticFunctionDescriptor(fnValue)) {
+        const args = expr.arguments.map((arg) => evaluateStaticValue(ts, repo, parsed, arg, env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        return applyStaticFunction(ts, repo, fnValue, args, sourceCache, budgetState, importCache, valueCache, evalStack);
+      }
+    }
+    if (ts.isPropertyAccessExpression(expr.expression)) {
+      if (ts.isIdentifier(expr.expression.expression)) {
+        const builtinTarget = String(expr.expression.expression.text || '').trim();
+        const builtinMethod = String(expr.expression.name?.text || '').trim();
+        if (builtinTarget === 'Object') {
+          const argValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+          if (builtinMethod === 'values' && isStaticPlainObject(argValue)) return Object.values(argValue);
+          if (builtinMethod === 'keys' && isStaticPlainObject(argValue)) return Object.keys(argValue);
+          if (builtinMethod === 'entries' && isStaticPlainObject(argValue)) return Object.entries(argValue);
+          if (builtinMethod === 'fromEntries') {
+            const entryValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+            if (Array.isArray(entryValue)) {
+              const out = {};
+              let complete = true;
+              for (const row of entryValue) {
+                if (!Array.isArray(row) || row.length < 2 || isUnknownStaticValue(row[0])) {
+                  complete = false;
+                  continue;
+                }
+                out[String(row[0])] = row[1];
+              }
+              return markStaticObjectCompleteness(out, complete);
+            }
+          }
+        }
+        if (builtinTarget === 'Array') {
+          if (builtinMethod === 'isArray') {
+            const argValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+            return Array.isArray(argValue);
+          }
+        }
+        if (builtinTarget === 'JSON') {
+          if (builtinMethod === 'stringify') {
+            const argValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+            if (!isUnknownStaticValue(argValue)) {
+              try {
+                return JSON.stringify(argValue);
+              } catch {
+                return UNKNOWN_STATIC_VALUE;
+              }
+            }
+          }
+          if (builtinMethod === 'parse') {
+            const argValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+            if (typeof argValue === 'string') {
+              try {
+                const parsedValue = JSON.parse(argValue);
+                return isStaticPlainObject(parsedValue)
+                  ? markStaticObjectCompleteness(parsedValue, true)
+                  : parsedValue;
+              } catch {
+                return UNKNOWN_STATIC_VALUE;
+              }
+            }
+          }
+        }
+        if (builtinTarget === 'Math') {
+          const argValues = expr.arguments.map((arg) => evaluateStaticValue(ts, repo, parsed, arg, env, sourceCache, budgetState, importCache, valueCache, evalStack));
+          if (argValues.every((value) => typeof value === 'number')) {
+            if (builtinMethod === 'floor') return Math.floor(argValues[0]);
+            if (builtinMethod === 'round') return Math.round(argValues[0]);
+            if (builtinMethod === 'trunc') return Math.trunc(argValues[0]);
+            if (builtinMethod === 'max') return Math.max(...argValues);
+            if (builtinMethod === 'min') return Math.min(...argValues);
+          }
+        }
+        if (builtinTarget === 'Date' && builtinMethod === 'now' && expr.arguments.length === 0) {
+          return Date.now();
+        }
+      }
+      const targetValue = evaluateStaticValue(ts, repo, parsed, expr.expression.expression, env, sourceCache, budgetState, importCache, valueCache, evalStack);
+      const methodName = String(expr.expression.name?.text || '').trim();
+      if (Array.isArray(targetValue) && (methodName === 'map' || methodName === 'filter' || methodName === 'find' || methodName === 'reduce' || methodName === 'some')) {
+        const callbackValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (!isStaticFunctionDescriptor(callbackValue)) return UNKNOWN_STATIC_VALUE;
+        if (methodName === 'map') {
+          return targetValue.map((item, index) => applyStaticFunction(ts, repo, callbackValue, [item, index, targetValue], sourceCache, budgetState, importCache, valueCache, evalStack));
+        }
+        if (methodName === 'filter') {
+          const out = [];
+          for (let index = 0; index < targetValue.length; index += 1) {
+            const item = targetValue[index];
+            const keep = applyStaticFunction(ts, repo, callbackValue, [item, index, targetValue], sourceCache, budgetState, importCache, valueCache, evalStack);
+            if (keep === false) continue;
+            out.push(item);
+          }
+          return out;
+        }
+        if (methodName === 'reduce') {
+          let acc;
+          let startIndex = 0;
+          if (expr.arguments.length > 1) {
+            acc = evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+          } else if (targetValue.length > 0) {
+            acc = targetValue[0];
+            startIndex = 1;
+          } else {
+            return UNKNOWN_STATIC_VALUE;
+          }
+          for (let index = startIndex; index < targetValue.length; index += 1) {
+            acc = applyStaticFunction(ts, repo, callbackValue, [acc, targetValue[index], index, targetValue], sourceCache, budgetState, importCache, valueCache, evalStack);
+          }
+          return acc;
+        }
+        if (methodName === 'some') {
+          for (let index = 0; index < targetValue.length; index += 1) {
+            const item = targetValue[index];
+            const match = applyStaticFunction(ts, repo, callbackValue, [item, index, targetValue], sourceCache, budgetState, importCache, valueCache, evalStack);
+            if (resolveStaticTruthiness(match) === true) return true;
+          }
+          return false;
+        }
+        for (let index = 0; index < targetValue.length; index += 1) {
+          const item = targetValue[index];
+          const match = applyStaticFunction(ts, repo, callbackValue, [item, index, targetValue], sourceCache, budgetState, importCache, valueCache, evalStack);
+          if (match === true) return item;
+        }
+        return undefined;
+      }
+      if (Array.isArray(targetValue) && methodName === 'includes') {
+        const searchValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        return targetValue.includes(searchValue);
+      }
+      if (Array.isArray(targetValue) && methodName === 'push') {
+        const pushedValues = expr.arguments.map((arg) => evaluateStaticValue(ts, repo, parsed, arg, env, sourceCache, budgetState, importCache, valueCache, evalStack));
+        targetValue.push(...pushedValues);
+        return targetValue.length;
+      }
+      if (Array.isArray(targetValue) && methodName === 'join') {
+        const separatorValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        const separator = separatorValue === undefined || isUnknownStaticValue(separatorValue) ? ',' : String(separatorValue);
+        const parts = [];
+        for (const item of targetValue) {
+          if (isUnknownStaticValue(item) || item === null || item === undefined) {
+            return UNKNOWN_STATIC_VALUE;
+          }
+          if (typeof item !== 'string' && typeof item !== 'number' && typeof item !== 'boolean') {
+            return UNKNOWN_STATIC_VALUE;
+          }
+          parts.push(String(item));
+        }
+        return parts.join(separator);
+      }
+      if (Array.isArray(targetValue) && methodName === 'sort') return [...targetValue];
+      if (Array.isArray(targetValue) && methodName === 'slice') {
+        const start = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        const end = evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if ((start === undefined || typeof start === 'number') && (end === undefined || typeof end === 'number')) {
+          return targetValue.slice(start, end);
+        }
+      }
+      if (typeof targetValue === 'string' && methodName === 'trim') return targetValue.trim();
+      if (typeof targetValue === 'string' && methodName === 'toLowerCase') return targetValue.toLowerCase();
+      if (typeof targetValue === 'string' && methodName === 'padStart') {
+        const maxLength = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        const fillString = evaluateStaticValue(ts, repo, parsed, expr.arguments[1], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (typeof maxLength === 'number') {
+          return targetValue.padStart(maxLength, typeof fillString === 'string' ? fillString : ' ');
+        }
+      }
+      if (typeof targetValue === 'string' && methodName === 'startsWith') {
+        const searchValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (typeof searchValue === 'string') return targetValue.startsWith(searchValue);
+      }
+      if (typeof targetValue === 'string' && methodName === 'endsWith') {
+        const searchValue = evaluateStaticValue(ts, repo, parsed, expr.arguments[0], env, sourceCache, budgetState, importCache, valueCache, evalStack);
+        if (typeof searchValue === 'string') return targetValue.endsWith(searchValue);
+      }
+    }
+  }
+  return UNKNOWN_STATIC_VALUE;
+}
+
+function populateStaticEnvFromBlock(ts, repo, parsed, block, env, sourceCache, budgetState, importCache, valueCache) {
+  for (const statement of block?.statements || []) {
+    if (ts.isFunctionDeclaration(statement) && statement.name?.text) {
+      env.set(String(statement.name.text), makeStaticFunctionDescriptor(parsed, statement, env));
+      continue;
+    }
+    if (ts.isExpressionStatement(statement)
+      && applyStaticEffectStateUpdates(ts, repo, parsed, statement.expression, env, sourceCache, budgetState, importCache, valueCache)) {
+      continue;
+    }
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations || []) {
+      if (bindUseStateDeclaration(ts, repo, parsed, declaration, env, sourceCache, budgetState, importCache, valueCache)) {
+        continue;
+      }
+      const value = evaluateStaticValue(ts, repo, parsed, declaration.initializer, env, sourceCache, budgetState, importCache, valueCache);
+      bindPatternStaticValue(ts, declaration.name, value, env);
+    }
+  }
+}
+
+function resolveVisibleReturnedJsxFromStatement(ts, repo, parsed, statement, env, sourceCache, budgetState, importCache, valueCache) {
+  if (!statement) return JSX_RESOLUTION_CONTINUE;
+  if (ts.isBlock(statement)) {
+    const scope = new Map(env);
+    for (const item of statement.statements || []) {
+      const result = resolveVisibleReturnedJsxFromStatement(ts, repo, parsed, item, scope, sourceCache, budgetState, importCache, valueCache);
+      if (result !== JSX_RESOLUTION_CONTINUE) return result;
+    }
+    const fallback = pickLastReturnedJsxExpression(ts, statement);
+    return fallback || JSX_RESOLUTION_CONTINUE;
+  }
+  if (ts.isFunctionDeclaration(statement) && statement.name?.text) {
+    env.set(String(statement.name.text), makeStaticFunctionDescriptor(parsed, statement, env));
+    return JSX_RESOLUTION_CONTINUE;
+  }
+  if (ts.isVariableStatement(statement)) {
+    for (const declaration of statement.declarationList.declarations || []) {
+      const value = evaluateStaticValue(ts, repo, parsed, declaration.initializer, env, sourceCache, budgetState, importCache, valueCache);
+      bindPatternStaticValue(ts, declaration.name, value, env);
+    }
+    return JSX_RESOLUTION_CONTINUE;
+  }
+  if (ts.isIfStatement(statement)) {
+    const conditionValue = evaluateStaticValue(ts, repo, parsed, statement.expression, env, sourceCache, budgetState, importCache, valueCache);
+    const truthiness = resolveStaticTruthiness(conditionValue);
+    if (truthiness === true) {
+      return resolveVisibleReturnedJsxFromStatement(ts, repo, parsed, statement.thenStatement, new Map(env), sourceCache, budgetState, importCache, valueCache);
+    }
+    if (truthiness === false) {
+      return resolveVisibleReturnedJsxFromStatement(ts, repo, parsed, statement.elseStatement, new Map(env), sourceCache, budgetState, importCache, valueCache);
+    }
+    return JSX_RESOLUTION_CONTINUE;
+  }
+  if (ts.isReturnStatement(statement)) {
+    if (!statement.expression || statement.expression.kind === ts.SyntaxKind.NullKeyword) return JSX_RESOLUTION_NONE;
+    return expressionContainsJsx(ts, statement.expression) ? statement.expression : JSX_RESOLUTION_NONE;
+  }
+  return JSX_RESOLUTION_CONTINUE;
+}
+
+function resolveVisibleReturnedJsxExpression(ts, repo, parsed, body, env, sourceCache, budgetState, importCache, valueCache) {
+  if (!body) return null;
+  if (!ts.isBlock(body)) return expressionContainsJsx(ts, body) ? body : null;
+  const result = resolveVisibleReturnedJsxFromStatement(ts, repo, parsed, body, new Map(env), sourceCache, budgetState, importCache, valueCache);
+  if (result === JSX_RESOLUTION_CONTINUE || result === JSX_RESOLUTION_NONE) return null;
+  return result;
+}
+
+function camelToKebabCase(value) {
+  return String(value || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
+    .replace(/([A-Z])([A-Z][a-z])/g, '$1-$2')
+    .toLowerCase();
+}
+
+function loadLucideIconSource(ts, fullPath, visited = new Set()) {
+  if (!fullPath || visited.has(fullPath) || !fs.existsSync(fullPath)) return null;
+  visited.add(fullPath);
+  const sourceText = fs.readFileSync(fullPath, 'utf8');
+  const sourceFile = ts.createSourceFile(fullPath, sourceText, ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+  for (const statement of sourceFile.statements || []) {
+    if (!ts.isExportDeclaration(statement) || !statement.moduleSpecifier || !ts.isStringLiteral(statement.moduleSpecifier)) {
+      continue;
+    }
+    const exportClause = statement.exportClause;
+    const reexportsDefault = !exportClause
+      || (ts.isNamedExports(exportClause)
+        && exportClause.elements.some((element) => String(element.name?.text || '') === 'default'));
+    if (!reexportsDefault) continue;
+    const specifier = String(statement.moduleSpecifier.text || '').trim();
+    if (!specifier.startsWith('.')) continue;
+    const nextFullPath = path.resolve(path.dirname(fullPath), specifier);
+    const candidate = fs.existsSync(nextFullPath)
+      ? nextFullPath
+      : fs.existsSync(`${nextFullPath}.js`)
+        ? `${nextFullPath}.js`
+        : '';
+    if (!candidate) continue;
+    const resolved = loadLucideIconSource(ts, candidate, visited);
+    if (resolved) return resolved;
+  }
+  for (const statement of sourceFile.statements || []) {
+    if (!ts.isVariableStatement(statement)) continue;
+    for (const declaration of statement.declarationList.declarations || []) {
+      const initializer = declaration.initializer;
+      if (!initializer || !ts.isCallExpression(initializer) || initializer.arguments.length < 2) continue;
+      if (!ts.isIdentifier(initializer.expression) || initializer.expression.text !== 'createLucideIcon') continue;
+      const iconNameExpr = initializer.arguments[0];
+      const shapeArray = initializer.arguments[1];
+      if (!ts.isStringLiteral(iconNameExpr) || !ts.isArrayLiteralExpression(shapeArray)) continue;
+      const shapes = shapeArray.elements
+        .map((element) => {
+          if (!ts.isArrayLiteralExpression(element) || element.elements.length < 1) return null;
+          const tagExpr = element.elements[0];
+          const tag = ts.isStringLiteral(tagExpr) ? tagExpr.text : '';
+          return tag ? { tag } : null;
+        })
+        .filter(Boolean);
+      return {
+        iconName: String(iconNameExpr.text || '').trim(),
+        shapes,
+      };
+    }
+  }
+  return null;
+}
+
+function loadLucideIconSpec(ts, repo, iconName, lucideIconCache) {
+  const key = String(iconName || '').trim();
+  if (!key) return null;
+  if (lucideIconCache.has(key)) return lucideIconCache.get(key);
+  const relPath = path.join('node_modules', 'lucide-react', 'dist', 'esm', 'icons', `${camelToKebabCase(key)}.js`);
+  const fullPath = path.join(repo, relPath);
+  if (!fs.existsSync(fullPath)) {
+    lucideIconCache.set(key, null);
+    return null;
+  }
+  const iconSource = loadLucideIconSource(ts, fullPath);
+  const resolvedIconName = String(iconSource?.iconName || key).trim() || key;
+  const shapes = Array.isArray(iconSource?.shapes) ? iconSource.shapes : [];
+  const out = {
+    iconName: resolvedIconName,
+    className: `lucide lucide-${camelToKebabCase(resolvedIconName)}`,
+    shapes,
+  };
+  lucideIconCache.set(key, out);
+  return out;
+}
+
+function loadLucideIconSpecFromStaticValue(ts, repo, value, lucideIconCache) {
+  if (!isStaticImportBindingDescriptor(value)) return null;
+  if (value.specifier !== 'lucide-react') return null;
+  return loadLucideIconSpec(ts, repo, value.importedName, lucideIconCache);
+}
+
+function extractJsxAttributes(ts, repo, parsed, attributes, env, sourceCache, budgetState, importCache, valueCache) {
   const out = {};
   const props = Array.isArray(attributes?.properties) ? attributes.properties : [];
   for (const property of props) {
@@ -532,8 +1805,46 @@ function extractJsxAttributes(ts, attributes) {
       continue;
     }
     if (ts.isJsxExpression(property.initializer) && property.initializer.expression) {
+      const staticValue = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        property.initializer.expression,
+        env,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+      );
+      const resolvedText = staticValueToInlineText(staticValue);
+      if (resolvedText) {
+        out[key] = resolvedText;
+        continue;
+      }
       const value = extractStaticExpressionText(ts, property.initializer.expression);
       if (value) out[key] = value;
+    }
+  }
+  return out;
+}
+
+function extractJsxAttributeExpressions(ts, attributes) {
+  const out = {};
+  const props = Array.isArray(attributes?.properties) ? attributes.properties : [];
+  for (const property of props) {
+    if (!ts.isJsxAttribute(property)) continue;
+    const key = String(property.name?.text || '').trim();
+    if (!key) continue;
+    if (!property.initializer) {
+      out[key] = true;
+      continue;
+    }
+    if (ts.isStringLiteral(property.initializer)) {
+      out[key] = property.initializer.text;
+      continue;
+    }
+    if (ts.isJsxExpression(property.initializer)) {
+      out[key] = property.initializer.expression || null;
     }
   }
   return out;
@@ -629,7 +1940,7 @@ function buildNodeDetailText(node) {
   return normalizeInlineText(parts.join('  '), 96);
 }
 
-function collectDirectChildText(ts, children) {
+function collectDirectChildText(ts, repo, parsed, children, env, sourceCache, budgetState, importCache, valueCache) {
   const values = [];
   for (const child of children || []) {
     if (ts.isJsxText(child)) {
@@ -638,7 +1949,21 @@ function collectDirectChildText(ts, children) {
       continue;
     }
     if (ts.isJsxExpression(child) && child.expression) {
-      const text = normalizeInlineText(extractStaticExpressionText(ts, child.expression), 56);
+      const staticValue = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        child.expression,
+        env,
+        sourceCache,
+        budgetState,
+        importCache,
+        valueCache,
+      );
+      const text = normalizeInlineText(
+        staticValueToInlineText(staticValue) || extractStaticExpressionText(ts, child.expression),
+        56,
+      );
       if (text) values.push(text);
     }
   }
@@ -672,6 +1997,9 @@ function elementLabel(tagName, attrs, textSnippet) {
 
 function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
   const state = createLayoutSurfaceBudgetState();
+  const importCache = new Map();
+  const valueCache = new Map();
+  const lucideIconCache = new Map();
 
   const allocateNode = (node) => {
     assertLayoutSurfaceBudget(state, 'allocate_node');
@@ -687,15 +2015,47 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
     };
   };
 
-  const buildComponentChildren = (modulePath, componentName, stack) => {
+  const buildPropsEnv = (parsed, attrExpressions, env) => {
+    const out = new Map();
+    for (const [key, rawValue] of Object.entries(attrExpressions || {})) {
+      if (rawValue && typeof rawValue === 'object' && typeof rawValue.kind === 'number') {
+        out.set(key, evaluateStaticValue(ts, repo, parsed, rawValue, env, sourceCache, state, importCache, valueCache));
+      } else {
+        out.set(key, rawValue);
+      }
+    }
+    return out;
+  };
+
+  const buildComponentStaticEnv = (parsed, declaration, propsEnv = new Map()) => {
+    const env = new Map(propsEnv);
+    const propsObject = Object.fromEntries(propsEnv.entries());
+    for (const param of declaration?.node?.parameters || []) {
+      bindPatternStaticValue(ts, param.name, propsEnv.get('props') ?? propsObject, env);
+    }
+    if (declaration?.body && ts.isBlock(declaration.body)) {
+      populateStaticEnvFromBlock(ts, repo, parsed, declaration.body, env, sourceCache, state, importCache, valueCache);
+    }
+    return env;
+  };
+
+  const resolveComponentRenderExpr = (parsed, declaration, propsEnv = new Map()) => {
+    if (!declaration) return { env: new Map(propsEnv), expr: null };
+    const env = buildComponentStaticEnv(parsed, declaration, propsEnv);
+    return {
+      env,
+      expr: resolveVisibleReturnedJsxExpression(ts, repo, parsed, declaration.body, env, sourceCache, state, importCache, valueCache),
+    };
+  };
+
+  const buildComponentChildren = (modulePath, componentName, stack, propsEnv = new Map()) => {
     const parsed = parseSourceModule(ts, repo, modulePath, sourceCache, state);
     if (!parsed?.sourceFile) return [];
     const declaration = findComponentDeclaration(ts, parsed.sourceFile, componentName);
     if (!declaration) return [];
-    const returns = collectReturnExpressions(ts, declaration.body);
-    const expr = returns[returns.length - 1] || null;
+    const { env, expr } = resolveComponentRenderExpr(parsed, declaration, propsEnv);
     if (!expr) return [];
-    return buildNodes(expr, parsed, componentName, stack);
+    return buildNodes(expr, parsed, componentName, stack, env);
   };
 
   const buildBranchChildren = (label, children) => {
@@ -709,12 +2069,12 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
     return [branchNode];
   };
 
-  const buildNodes = (expr, parsed, ownerComponentName, stack = new Set()) => {
+  const buildNodes = (expr, parsed, ownerComponentName, stack = new Set(), env = new Map()) => {
     if (!expr || state.truncated) return [];
     const sourceFile = parsed.sourceFile;
 
     if (ts.isParenthesizedExpression(expr)) {
-      return buildNodes(expr.expression, parsed, ownerComponentName, stack);
+      return buildNodes(expr.expression, parsed, ownerComponentName, stack, env);
     }
     if (ts.isJsxFragment(expr)) {
       const fragmentNode = allocateNode({
@@ -725,24 +2085,30 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
       if (!fragmentNode) return [];
       for (const child of expr.children || []) {
         const nextExpr = ts.isJsxExpression(child) ? child.expression : child;
-        fragmentNode.children.push(...buildNodes(nextExpr, parsed, ownerComponentName, stack));
+        fragmentNode.children.push(...buildNodes(nextExpr, parsed, ownerComponentName, stack, env));
       }
       return [fragmentNode];
     }
     if (ts.isJsxElement(expr) || ts.isJsxSelfClosingElement(expr)) {
       const opening = ts.isJsxElement(expr) ? expr.openingElement : expr;
       const tagName = String(opening.tagName.getText(sourceFile) || '').trim();
-      const attrs = extractJsxAttributes(ts, opening.attributes);
+      const attrs = extractJsxAttributes(ts, repo, parsed, opening.attributes, env, sourceCache, state, importCache, valueCache);
+      const attrExpressions = extractJsxAttributeExpressions(ts, opening.attributes);
       const attrNames = collectJsxAttributeNames(opening.attributes);
       const classTokens = splitClassTokens(attrs.className);
       const line = lineOfTsNode(ts, sourceFile, opening);
       const children = ts.isJsxElement(expr) ? expr.children : [];
+      const directChildText = collectDirectChildText(ts, repo, parsed, children, env, sourceCache, state, importCache, valueCache);
       if (/^[a-z]/.test(tagName)) {
         const nodeKind = classifyTreeNodeKind(tagName);
         const node = allocateNode({
           kind: nodeKind,
           tag: tagName,
-          label: elementLabel(tagName, attrs, collectDirectChildText(ts, children)),
+          label: elementLabel(
+            tagName,
+            attrs,
+            directChildText,
+          ),
           line,
           module_path: parsed.modulePath,
           component_name: ownerComponentName,
@@ -757,27 +2123,65 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
         node.detail_text = buildNodeDetailText(node);
         for (const child of children) {
           const nextExpr = ts.isJsxExpression(child) ? child.expression : child;
-          node.children.push(...buildNodes(nextExpr, parsed, ownerComponentName, stack));
+          node.children.push(...buildNodes(nextExpr, parsed, ownerComponentName, stack, env));
         }
         return [node];
       }
       const ref = uniqueComponents.get(tagName) || null;
+      const importBinding = getModuleImportBindings(ts, repo, parsed, importCache).get(tagName) || null;
+      const boundValue = env.has(tagName)
+        ? env.get(tagName)
+        : resolveIdentifierStaticValue(ts, repo, parsed, tagName, env, sourceCache, state, importCache, valueCache, new Set());
+      const iconSpec = !ref && importBinding?.external && importBinding.specifier === 'lucide-react'
+        ? loadLucideIconSpec(ts, repo, importBinding.importedName, lucideIconCache)
+        : (loadLucideIconSpecFromStaticValue(ts, repo, boundValue, lucideIconCache) || null);
       const componentNode = allocateNode({
-        kind: ref ? 'tree_component' : 'tree_component_ref',
+        kind: ref ? 'tree_component' : (iconSpec ? 'tree_element' : 'tree_component_ref'),
         tag: tagName,
-        label: normalizeInlineText(`<${tagName}>`, 76),
+        label: iconSpec
+          ? elementLabel('svg', { className: normalizeInlineText(`${iconSpec.className} ${attrs.className || ''}`, 96) }, '')
+          : normalizeInlineText(`<${tagName}>`, 76),
         line,
         module_path: parsed.modulePath,
         component_name: ownerComponentName,
         attr_names: attrNames,
-        class_tokens: classTokens,
-        class_preview: summarizeClassTokens(classTokens),
-        layout_role: ref ? 'component' : 'component_ref',
-        style_traits: collectStyleTraits(classTokens, attrNames, attrs),
+        class_tokens: iconSpec ? splitClassTokens(`${iconSpec.className} ${attrs.className || ''}`) : classTokens,
+        class_preview: iconSpec
+          ? normalizeInlineText(`${iconSpec.className} ${attrs.className || ''}`, 96)
+          : summarizeClassTokens(classTokens),
+        layout_role: iconSpec
+          ? classifyLayoutRole('svg', 'tree_element', splitClassTokens(`${iconSpec.className} ${attrs.className || ''}`), attrNames, attrs)
+          : (ref ? 'component' : 'component_ref'),
+        style_traits: iconSpec
+          ? collectStyleTraits(splitClassTokens(`${iconSpec.className} ${attrs.className || ''}`), attrNames, attrs)
+          : collectStyleTraits(classTokens, attrNames, attrs),
         detail_text: '',
       });
       if (!componentNode) return [];
       componentNode.detail_text = buildNodeDetailText(componentNode);
+      if (iconSpec) {
+        componentNode.tag = 'svg';
+        for (const shape of iconSpec.shapes || []) {
+          const iconChild = allocateNode({
+            kind: 'tree_element',
+            tag: shape.tag,
+            label: normalizeInlineText(`<${shape.tag}>`, 76),
+            line,
+            module_path: parsed.modulePath,
+            component_name: ownerComponentName,
+            attr_names: [],
+            class_tokens: [],
+            class_preview: '',
+            layout_role: 'element',
+            style_traits: [],
+            detail_text: '',
+          });
+          if (!iconChild) break;
+          iconChild.detail_text = buildNodeDetailText(iconChild);
+          componentNode.children.push(iconChild);
+        }
+        return [componentNode];
+      }
       if (ref) {
         if (state.componentExpansionCount >= state.maxComponentExpansions) {
           throw new Error(`native_gui_layout_surface_component_budget_exceeded:${state.maxComponentExpansions}`);
@@ -787,7 +2191,12 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
         const cycleKey = `${ref.modulePath}#${ref.componentName}`;
         if (!stack.has(cycleKey)) {
           stack.add(cycleKey);
-          componentNode.children.push(...buildComponentChildren(ref.modulePath, ref.componentName, stack));
+          componentNode.children.push(...buildComponentChildren(
+            ref.modulePath,
+            ref.componentName,
+            stack,
+            buildPropsEnv(parsed, attrExpressions, env),
+          ));
           stack.delete(cycleKey);
         }
       }
@@ -813,11 +2222,19 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
       return node ? [node] : [];
     }
     if (ts.isJsxExpression(expr)) {
-      return buildNodes(expr.expression, parsed, ownerComponentName, stack);
+      return buildNodes(expr.expression, parsed, ownerComponentName, stack, env);
     }
     if (ts.isConditionalExpression(expr)) {
-      const thenNodes = buildNodes(expr.whenTrue, parsed, ownerComponentName, stack);
-      const elseNodes = buildNodes(expr.whenFalse, parsed, ownerComponentName, stack);
+      const conditionValue = evaluateStaticValue(ts, repo, parsed, expr.condition, env, sourceCache, state, importCache, valueCache);
+      const truthiness = resolveStaticTruthiness(conditionValue);
+      if (truthiness === true) {
+        return buildNodes(expr.whenTrue, parsed, ownerComponentName, stack, env);
+      }
+      if (truthiness === false) {
+        return buildNodes(expr.whenFalse, parsed, ownerComponentName, stack, env);
+      }
+      const thenNodes = buildNodes(expr.whenTrue, parsed, ownerComponentName, stack, env);
+      const elseNodes = buildNodes(expr.whenFalse, parsed, ownerComponentName, stack, env);
       if (thenNodes.length > 0 && elseNodes.length === 0) return thenNodes;
       if (elseNodes.length > 0 && thenNodes.length === 0) return elseNodes;
       if (thenNodes.length === 0 && elseNodes.length === 0) return [];
@@ -828,16 +2245,24 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
     }
     if (ts.isBinaryExpression(expr)) {
       if (expr.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
-        return buildBranchChildren('&&', buildNodes(expr.right, parsed, ownerComponentName, stack));
+        const conditionValue = evaluateStaticValue(ts, repo, parsed, expr.left, env, sourceCache, state, importCache, valueCache);
+        const truthiness = resolveStaticTruthiness(conditionValue);
+        if (truthiness === false) return [];
+        if (truthiness === true) return buildNodes(expr.right, parsed, ownerComponentName, stack, env);
+        return buildBranchChildren('&&', buildNodes(expr.right, parsed, ownerComponentName, stack, env));
       }
       if (expr.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
-        return buildBranchChildren('||', buildNodes(expr.right, parsed, ownerComponentName, stack));
+        const conditionValue = evaluateStaticValue(ts, repo, parsed, expr.left, env, sourceCache, state, importCache, valueCache);
+        const truthiness = resolveStaticTruthiness(conditionValue);
+        if (truthiness === true) return [];
+        if (truthiness === false) return buildNodes(expr.right, parsed, ownerComponentName, stack, env);
+        return buildBranchChildren('||', buildNodes(expr.right, parsed, ownerComponentName, stack, env));
       }
     }
     if (ts.isArrayLiteralExpression(expr)) {
       const out = [];
       for (const element of expr.elements) {
-        out.push(...buildNodes(element, parsed, ownerComponentName, stack));
+        out.push(...buildNodes(element, parsed, ownerComponentName, stack, env));
       }
       return out;
     }
@@ -847,9 +2272,20 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
       && expr.arguments.length > 0
       && (ts.isArrowFunction(expr.arguments[0]) || ts.isFunctionExpression(expr.arguments[0]))) {
       const callback = expr.arguments[0];
-      const callbackBody = ts.isBlock(callback.body)
-        ? (collectReturnExpressions(ts, callback.body).slice(-1)[0] || null)
-        : callback.body;
+      const collectionValue = evaluateStaticValue(
+        ts,
+        repo,
+        parsed,
+        expr.expression.expression,
+        env,
+        sourceCache,
+        state,
+        importCache,
+        valueCache,
+      );
+      const items = Array.isArray(collectionValue) && collectionValue.length > 0
+        ? collectionValue.slice(0, DEFAULT_LAYOUT_SURFACE_MAP_EXPANSION_LIMIT)
+        : [UNKNOWN_STATIC_VALUE];
       const repeatNode = allocateNode({
         kind: 'tree_repeat',
         label: '{map()}',
@@ -865,43 +2301,151 @@ function createOutlineBuilder(ts, repo, sourceCache, uniqueComponents) {
       });
       if (!repeatNode) return [];
       repeatNode.detail_text = buildNodeDetailText(repeatNode);
-      repeatNode.children.push(...buildNodes(callbackBody, parsed, ownerComponentName, stack));
+      for (let index = 0; index < items.length; index += 1) {
+        const itemValue = items[index];
+        const callbackEnv = new Map(env);
+        for (let paramIndex = 0; paramIndex < (callback.parameters || []).length; paramIndex += 1) {
+          const param = callback.parameters[paramIndex];
+          const argValue = paramIndex === 0
+            ? itemValue
+            : paramIndex === 1
+              ? index
+              : collectionValue;
+          bindPatternStaticValue(ts, param.name, argValue, callbackEnv);
+        }
+        const callbackBody = ts.isBlock(callback.body)
+          ? resolveVisibleReturnedJsxExpression(ts, repo, parsed, callback.body, callbackEnv, sourceCache, state, importCache, valueCache)
+          : callback.body;
+        repeatNode.children.push(...buildNodes(callbackBody, parsed, ownerComponentName, stack, callbackEnv));
+      }
       return [repeatNode];
+    }
+    if (ts.isCallExpression(expr)
+      && ts.isIdentifier(expr.expression)
+      && expr.arguments.length === 0) {
+      const helperName = String(expr.expression.text || '').trim();
+      if (helperName) {
+        const declaration = findComponentDeclaration(ts, parsed.sourceFile, ownerComponentName);
+        const helperBody = findLocalRenderHelperBody(ts, declaration?.body || null, helperName);
+        if (helperBody) {
+          const helperKey = `${parsed.modulePath}#${ownerComponentName}#helper:${helperName}`;
+          if (stack.has(helperKey)) return [];
+          stack.add(helperKey);
+          const helperExpr = resolveVisibleReturnedJsxExpression(ts, repo, parsed, helperBody, env, sourceCache, state, importCache, valueCache);
+          const helperNodes = helperExpr
+            ? buildNodes(helperExpr, parsed, ownerComponentName, stack, env)
+            : [];
+          stack.delete(helperKey);
+          return helperNodes;
+        }
+      }
     }
     return [];
   };
 
   return {
-    buildComponentTree(modulePath, componentName) {
+    buildComponentTree(modulePath, componentName, initialEnv = new Map()) {
       state.nextId = 0;
       state.truncated = false;
       state.componentExpansionCount = 0;
       state.parsedModuleCount = 0;
       const parsed = parseSourceModule(ts, repo, modulePath, sourceCache, state);
-      if (!parsed?.sourceFile) return { nodes: [], truncated: false };
+      if (!parsed?.sourceFile) return { nodes: [], truncated: false, reason: 'parsed_module_missing' };
       const declaration = findComponentDeclaration(ts, parsed.sourceFile, componentName);
-      if (!declaration) return { nodes: [], truncated: false };
-      const returns = collectReturnExpressions(ts, declaration.body);
-      const expr = returns[returns.length - 1] || null;
-      if (!expr) return { nodes: [], truncated: false };
+      if (!declaration) return { nodes: [], truncated: false, reason: 'component_declaration_missing' };
+      const { env, expr } = resolveComponentRenderExpr(parsed, declaration, new Map(initialEnv));
+      if (!expr) return { nodes: [], truncated: false, reason: 'visible_returned_jsx_missing' };
       const stack = new Set([`${modulePath}#${componentName}`]);
-      const nodes = buildNodes(expr, parsed, componentName, stack);
+      const nodes = buildNodes(expr, parsed, componentName, stack, env);
       return {
         nodes,
         truncated: state.truncated,
         component_expansion_count: state.componentExpansionCount,
         parsed_module_count: state.parsedModuleCount,
+        reason: nodes.length > 0 ? 'ok' : 'outline_empty',
       };
     },
   };
 }
 
-function flattenLayoutTree(nodes, depth = 0, out = []) {
+function isPureImplementationWrapperNode(node) {
+  if (!node || String(node.kind || '') !== 'tree_element') return false;
+  if (String(node.tag || '').trim() !== 'div') return false;
+  const componentName = String(node.component_name || '').trim();
+  if (componentName !== 'VirtualizedMasonry' && componentName !== 'HeightReporter') return false;
+  if (String(node.class_preview || '').trim()) return false;
+  if (String(node.label || '').trim() !== '<div>') return false;
+  const attrNames = Array.isArray(node.attr_names) ? node.attr_names.map((item) => String(item || '').trim()).filter(Boolean) : [];
+  if (attrNames.length <= 0) return true;
+  return attrNames.every((name) => name === 'style' || name === 'key' || name === 'ref');
+}
+
+function buildSpeculativeRepeatNodeKey(node) {
+  return [
+    String(node?.kind || ''),
+    String(node?.tag || ''),
+    String(node?.module_path || ''),
+    String(node?.component_name || ''),
+    String(node?.line || 0),
+    String(node?.class_preview || ''),
+    String(node?.label || ''),
+    String(node?.text_preview || ''),
+  ].join('|');
+}
+
+function flattenLayoutTree(nodes, depth = 0, out = [], context = null) {
+  const state = context || {
+    repeatStack: [],
+    speculativeBranchDepth: 0,
+  };
   for (const node of nodes || []) {
-    out.push({ ...node, depth });
-    flattenLayoutTree(node.children, depth + 1, out);
+    const kind = String(node?.kind || '');
+    if (!node) continue;
+    if (isPureImplementationWrapperNode(node)) {
+      flattenLayoutTree(node.children, depth, out, state);
+      continue;
+    }
+    const entersRepeat = kind === 'tree_repeat';
+    const entersSpeculativeBranch = kind === 'tree_branch' && state.repeatStack.length > 0;
+    if (entersRepeat) {
+      state.repeatStack.push(new Set());
+    }
+    if (entersSpeculativeBranch) {
+      state.speculativeBranchDepth += 1;
+    }
+    let skipNode = false;
+    if (kind === 'tree_text') {
+      skipNode = true;
+    } else if (state.repeatStack.length > 0 && state.speculativeBranchDepth > 0) {
+      const dedupeSet = state.repeatStack[state.repeatStack.length - 1];
+      const dedupeKey = buildSpeculativeRepeatNodeKey(node);
+      if (dedupeSet.has(dedupeKey)) {
+        skipNode = true;
+      } else {
+        dedupeSet.add(dedupeKey);
+      }
+    }
+    if (!skipNode) {
+      out.push({ ...node, depth });
+    }
+    flattenLayoutTree(node.children, skipNode ? depth : depth + 1, out, state);
+    if (entersSpeculativeBranch) {
+      state.speculativeBranchDepth -= 1;
+    }
+    if (entersRepeat) {
+      state.repeatStack.pop();
+    }
   }
   return out;
+}
+
+function needsSyntheticMountRoot(flatNodes) {
+  if (!Array.isArray(flatNodes) || flatNodes.length === 0) return false;
+  return !flatNodes.some((node) =>
+    String(node?.kind || '') === 'tree_element'
+    && String(node?.tag || '') === 'div'
+    && String(node?.class_preview || '') === ''
+    && Number(node?.depth || 0) === 0);
 }
 
 function treeNodeStyle(theme, node) {
@@ -1539,14 +3083,38 @@ function buildLayoutSurfaceDoc(repo, codegenManifest, execSnapshot, routeCatalog
     ? (Array.isArray(moduleDoc?.components) ? moduleDoc.components.find((item) => String(item?.name || '') === resolved.componentName) : null)
     : pickPreferredComponent(moduleDoc);
   const componentName = String(chosenComponent?.name || resolved.componentName || '').trim();
-  if (!resolved.modulePath || !componentName) return null;
+  if (!resolved.modulePath || !componentName) {
+    throw new Error(`native_gui_layout_surface_component_missing:${routeState}:${resolved.modulePath || '<module>'}:${componentName || '<component>'}`);
+  }
 
   const ts = loadTypeScriptForRepo(repo);
   const sourceCache = new Map();
   const uniqueComponents = buildUniqueComponentRegistry(tsxAstDoc);
-  const outline = createOutlineBuilder(ts, repo, sourceCache, uniqueComponents).buildComponentTree(resolved.modulePath, componentName);
+  const routeStaticEnv = buildRouteStaticEvalEnv(resolved.modulePath, componentName, routeState);
+  const outline = createOutlineBuilder(ts, repo, sourceCache, uniqueComponents)
+    .buildComponentTree(resolved.modulePath, componentName, routeStaticEnv);
   const flatNodes = flattenLayoutTree(outline.nodes);
-  if (flatNodes.length <= 0) return null;
+  if (needsSyntheticMountRoot(flatNodes)) {
+    flatNodes.unshift({
+      id: 'node_mount_root',
+      kind: 'tree_element',
+      label: '<div>',
+      detail_text: 'element',
+      tag: 'div',
+      line: 0,
+      depth: 0,
+      module_path: '',
+      component_name: '',
+      layout_role: 'element',
+      style_traits: [],
+      class_preview: '',
+      class_tokens: [],
+      attr_names: [],
+    });
+  }
+  if (flatNodes.length <= 0) {
+    throw new Error(`native_gui_layout_surface_empty:${routeState}:${resolved.modulePath}:${componentName}:${outline.reason || 'unknown'}:${Array.isArray(outline.nodes) ? outline.nodes.length : 0}`);
+  }
   const styledNodeCount = flatNodes.filter((node) => Array.isArray(node.style_traits) && node.style_traits.length > 0).length;
   const interactiveNodeCount = flatNodes.filter((node) =>
     (Array.isArray(node.attr_names) && node.attr_names.some((name) => /^on[A-Z]/.test(String(name || ''))))
@@ -2063,8 +3631,9 @@ function main() {
   const nativeRuntimeStatePath = path.resolve(path.join(outDir, 'native_gui_runtime_state_v1.json'));
 
   requireFile(codegenManifestPath, 'codegen manifest');
-  const codegenManifest = readJson(codegenManifestPath);
-  requireFormat(codegenManifest, 'cheng_codegen_v1', 'codegen manifest');
+  const rawCodegenManifest = readJson(codegenManifestPath);
+  requireFormat(rawCodegenManifest, 'cheng_codegen_v1', 'codegen manifest');
+  const codegenManifest = normalizeCodegenManifestPaths(rawCodegenManifest, outDir);
   const routeCatalogPath = path.resolve(
     args.routeCatalogPath
     || String(codegenManifest.route_catalog_path || '')

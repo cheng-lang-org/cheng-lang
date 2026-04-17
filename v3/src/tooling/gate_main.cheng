@@ -28,6 +28,13 @@ type
         proposalPort: int32
         commitPort: int32
         votePort: int32
+        statePort: int32
+        proposerIntervalMs: int32
+        followerIntervalMs: int32
+        proposalWindowMs: int32
+        voteWindowMs: int32
+        commitWindowMs: int32
+        defaultMaxTxs: int32
         assetId: int32
         aliceId: int32
         bobId: int32
@@ -95,9 +102,12 @@ fn v3GateUsageLines(): str[] =
     add(out, "  profile-run [seed-flags...]")
     add(out, "  crash-report --in:<raw-log> [--out:<final-report>]")
     add(out, "  verify-orphan-guard")
+    add(out, "  verify-backend-driver-command-surface")
+    add(out, "  verify-r2c-react-v3-surface")
     add(out, "  verify-debug-tools")
     add(out, "  verify-debug-runtime")
     add(out, "  verify-debug-profile")
+    add(out, "  verify-diloco")
     add(out, "  verify-windows-builtin")
     add(out, "  verify-riscv64-builtin")
     add(out, "  run-cross-target-smokes")
@@ -112,6 +122,7 @@ fn v3GateUsageLines(): str[] =
     add(out, "  build-ffi-handle")
     add(out, "  build-bft-state-machine")
     add(out, "  deploy-bft-validator-three-node")
+    add(out, "  verify-bft-validator-three-node")
     add(out, "  status-bft-validator-three-node")
     add(out, "  stop-bft-validator-three-node")
     add(out, "  bench-bft-validator-three-node [--tx-count:<n>] [--transfer-amount:<n>] [--max-txs-per-block:<n>]")
@@ -123,6 +134,7 @@ fn v3GateUsageLines(): str[] =
     add(out, "  build-rwad-bft-linux")
     add(out, "  run-linux-object-smokes")
     add(out, "  run-tcp-twoproc-smoke")
+    add(out, "  run-quic-twoproc-smoke")
     add(out, "  run-udp-importc-smoke")
     add(out, "  run-wasm-smokes")
     add(out, "  run-browser-host-wasm-smoke")
@@ -130,7 +142,6 @@ fn v3GateUsageLines(): str[] =
     add(out, "  run-chain-node-process-smoke")
     add(out, "  run-chain-node-three-node-smoke")
     add(out, "  run-tailnet-control-smoke")
-    add(out, "  run-v2-selfhost-gate")
     add(out, "  run-fresh-node-selfhost-gate")
     add(out, "  run-migration-gate")
     add(out, "  run-browser-webrtc-smokes")
@@ -761,6 +772,21 @@ fn v3GateEnsureBackendDriverReady(root: str, outCompiler: var str): int32 =
         return 0
     return v3GateBuildBackendDriver(root)
 
+fn v3GateVerifyX86LinuxRemote(root: str): int32 =
+    var compiler = ""
+    if v3GateEnsureBackendDriverReady(root, compiler) != 0:
+        return 1
+    let run = v3GateRunBinary(root,
+                              "verify_x86_linux_remote",
+                              compiler,
+                              ["verify-x86-linux-remote"],
+                              1800,
+                              "artifacts/v3_gate/verify_x86_linux_remote.log")
+    v3GateMaybePrintRunOutput(run)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    return 0
+
 fn v3GateEnsureCompilerReady(root: str, compilerPath: str, outCompiler: var str): int32 =
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
     outCompiler = v3path.v3PathAbsolute(root, compilerPath)
@@ -820,6 +846,10 @@ fn v3GateCompileExeEnv(root: str,
                                       root,
                                       timeoutSec,
                                       logRelPath)
+    if hostops.v3LoggedRunOk(run) && !os.fileExists(outPath):
+        let outputText = run.output + "v3 gate: compile missing output: " + outPath + "\n"
+        let _logged: bool = v3path.v3WriteTextFile(root, logAbs, outputText)
+        return hostops.v3LoggedRunZero(label, compilerAbs, logAbs, 1, outputText)
     return run
 
 fn v3GateCompileExe(root: str,
@@ -830,6 +860,52 @@ fn v3GateCompileExe(root: str,
                     target: str,
                     logRelPath: str): hostops.V3LoggedRun =
     return v3GateCompileExeEnv(root, label, compilerPath, sourcePath, outPath, target, logRelPath, [])
+
+fn v3GateCompileExeEnvAtRoot(root: str,
+                             label: str,
+                             compilerPath: str,
+                             packageRoot: str,
+                             sourcePath: str,
+                             outPath: str,
+                             target: str,
+                             logRelPath: str,
+                             envOverrides: str[]): hostops.V3LoggedRun =
+    var compilerAbs: str = ""
+    let outParts: os.SplitFileResult = os.splitFile(outPath)
+    if len(outParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, outParts.dir)
+    let logAbs: str = v3path.v3PathAbsolute(root, logRelPath)
+    let logParts: os.SplitFileResult = os.splitFile(logAbs)
+    if len(logParts.dir) > 0:
+        let _ = v3path.v3MkdirP(root, logParts.dir)
+    if v3GateEnsureCompilerReady(root, compilerPath, compilerAbs) != 0:
+        return hostops.v3LoggedRunZero(label,
+                                       compilerAbs,
+                                       logAbs,
+                                       1,
+                                       "v3 gate: compiler missing during compile: " + compilerAbs + "\n")
+    let timeoutText = os.getEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
+    let timeoutSec = int32(strutil.parseInt(timeoutText))
+    let run = hostops.v3RunFileLogged(root,
+                                      label,
+                                      compilerAbs,
+                                      [
+                                          "system-link-exec",
+                                          "--root", packageRoot,
+                                          "--in", sourcePath,
+                                          "--emit", "exe",
+                                          "--target", target,
+                                          "--out", outPath
+                                      ],
+                                      envOverrides,
+                                      root,
+                                      timeoutSec,
+                                      logRelPath)
+    if hostops.v3LoggedRunOk(run) && !os.fileExists(outPath):
+        let outputText = run.output + "v3 gate: compile missing output: " + outPath + "\n"
+        let _logged: bool = v3path.v3WriteTextFile(root, logAbs, outputText)
+        return hostops.v3LoggedRunZero(label, compilerAbs, logAbs, 1, outputText)
+    return run
 
 fn v3GateCompileExeSpawnEnv(root: str,
                             label: str,
@@ -1010,6 +1086,26 @@ fn v3GateRunShellLogged(root: str,
                                       timeoutSec,
                                       logPath)
 
+fn v3GateRemoteTransportRetryable(text: str): bool =
+    let trimmed = strutil.strip(text)
+    return strutil.contains(trimmed, "Connection timed out during banner exchange") ||
+           (strutil.contains(trimmed, "Connection to ") && strutil.contains(trimmed, " timed out")) ||
+           strutil.contains(trimmed, "No route to host") ||
+           strutil.contains(trimmed, "Connection reset by peer") ||
+           strutil.contains(trimmed, "kex_exchange_identification") ||
+           strutil.contains(trimmed, "Connection closed by remote host")
+
+fn v3GateRemoteSshArgv(sshHost: str, remoteCmd: str): str[] =
+    return [
+        "-n",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
+        sshHost,
+        remoteCmd
+    ]
+
 fn v3GateRunRemoteShellLogged(root: str,
                               label: str,
                               sshHost: str,
@@ -1017,14 +1113,24 @@ fn v3GateRunRemoteShellLogged(root: str,
                               logPath: str,
                               timeoutSec: int32): hostops.V3LoggedRun =
     let remoteCmd = "sh -lc " + os.quoteShell(command)
-    return hostops.v3RunProgramLogged(root,
-                                      label,
-                                      "ssh",
-                                      [sshHost, remoteCmd],
-                                      [],
-                                      root,
-                                      timeoutSec,
-                                      logPath)
+    var lastRun = hostops.v3LoggedRunZero(label, "ssh", logPath, 255, "")
+    for attempt in 0..<3:
+        let run = hostops.v3RunProgramLogged(root,
+                                             label,
+                                             "ssh",
+                                             v3GateRemoteSshArgv(sshHost, remoteCmd),
+                                             [],
+                                             root,
+                                             timeoutSec,
+                                             logPath)
+        lastRun = run
+        if !v3GateRunFailed(run):
+            return run
+        if attempt >= 2 || !v3GateRemoteTransportRetryable(run.output):
+            return run
+        v3GatePrintLine("[v3 gate] remote ssh retry " + intToStr(attempt + 1) + " " + label)
+        os.sleepMs((attempt + 1) * 1000)
+    return lastRun
 
 fn v3GateShellCheckOk(root: str, command: str): bool =
     let res = os.execCmdEx("sh -lc " + os.quoteShell(command), uint64(7), root)
@@ -1068,6 +1174,19 @@ fn v3GateBftThreeNodeConfig(root: str): V3BftThreeNodeDeploy =
         proposalPort: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_PROPOSAL_PORT", "42061"))),
         commitPort: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_COMMIT_PORT", "42062"))),
         votePort: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_VOTE_PORT", "42063"))),
+        statePort: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_STATE_PORT", "42064"))),
+        proposerIntervalMs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_PROPOSER_INTERVAL_MS",
+                                                                    "20"))),
+        followerIntervalMs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_FOLLOWER_INTERVAL_MS",
+                                                                    "20"))),
+        proposalWindowMs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_PROPOSAL_WINDOW_MS",
+                                                                  "1000"))),
+        voteWindowMs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_VOTE_WINDOW_MS",
+                                                              "1000"))),
+        commitWindowMs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_COMMIT_WINDOW_MS",
+                                                                "1000"))),
+        defaultMaxTxs: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_DEFAULT_MAX_TXS",
+                                                               "128"))),
         assetId: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_ASSET_ID", "7"))),
         aliceId: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_ALICE_ID", "1001"))),
         bobId: int32(strutil.parseInt(os.getEnvDefault("CHENG_V3_BFT_BOB_ID", "2002"))),
@@ -1101,6 +1220,13 @@ fn v3GateBftManifestText(cfg: V3BftThreeNodeDeploy): str =
     out = out + "proposal_port=" + intToStr(cfg.proposalPort) + "\n"
     out = out + "commit_port=" + intToStr(cfg.commitPort) + "\n"
     out = out + "vote_port=" + intToStr(cfg.votePort) + "\n"
+    out = out + "state_port=" + intToStr(cfg.statePort) + "\n"
+    out = out + "proposer_interval_ms=" + intToStr(cfg.proposerIntervalMs) + "\n"
+    out = out + "follower_interval_ms=" + intToStr(cfg.followerIntervalMs) + "\n"
+    out = out + "proposal_window_ms=" + intToStr(cfg.proposalWindowMs) + "\n"
+    out = out + "vote_window_ms=" + intToStr(cfg.voteWindowMs) + "\n"
+    out = out + "commit_window_ms=" + intToStr(cfg.commitWindowMs) + "\n"
+    out = out + "default_max_txs=" + intToStr(cfg.defaultMaxTxs) + "\n"
     out = out + "asset_id=" + intToStr(cfg.assetId) + "\n"
     out = out + "alice_id=" + intToStr(cfg.aliceId) + "\n"
     out = out + "bob_id=" + intToStr(cfg.bobId) + "\n"
@@ -1147,6 +1273,27 @@ fn v3GateBftConfigLoad(root: str): V3BftThreeNodeDeploy =
     let votePort = v3GateTextValue(text, "vote_port")
     if len(votePort) > 0:
         cfg.votePort = int32(strutil.parseInt(votePort))
+    let statePort = v3GateTextValue(text, "state_port")
+    if len(statePort) > 0:
+        cfg.statePort = int32(strutil.parseInt(statePort))
+    let proposerIntervalMs = v3GateTextValue(text, "proposer_interval_ms")
+    if len(proposerIntervalMs) > 0:
+        cfg.proposerIntervalMs = int32(strutil.parseInt(proposerIntervalMs))
+    let followerIntervalMs = v3GateTextValue(text, "follower_interval_ms")
+    if len(followerIntervalMs) > 0:
+        cfg.followerIntervalMs = int32(strutil.parseInt(followerIntervalMs))
+    let proposalWindowMs = v3GateTextValue(text, "proposal_window_ms")
+    if len(proposalWindowMs) > 0:
+        cfg.proposalWindowMs = int32(strutil.parseInt(proposalWindowMs))
+    let voteWindowMs = v3GateTextValue(text, "vote_window_ms")
+    if len(voteWindowMs) > 0:
+        cfg.voteWindowMs = int32(strutil.parseInt(voteWindowMs))
+    let commitWindowMs = v3GateTextValue(text, "commit_window_ms")
+    if len(commitWindowMs) > 0:
+        cfg.commitWindowMs = int32(strutil.parseInt(commitWindowMs))
+    let defaultMaxTxs = v3GateTextValue(text, "default_max_txs")
+    if len(defaultMaxTxs) > 0:
+        cfg.defaultMaxTxs = int32(strutil.parseInt(defaultMaxTxs))
     let assetId = v3GateTextValue(text, "asset_id")
     if len(assetId) > 0:
         cfg.assetId = int32(strutil.parseInt(assetId))
@@ -1288,6 +1435,59 @@ fn v3GateBftPrintNodeStatus(status: V3BftNodeStatus) =
     v3GatePrintLine("alice_balance=" + status.aliceBalance)
     v3GatePrintLine("bob_balance=" + status.bobBalance)
 
+fn v3GateBftClusterMatches(serverStatus: V3BftNodeStatus,
+                           relayStatus: V3BftNodeStatus,
+                           localStatus: V3BftNodeStatus,
+                           wantHeight: str,
+                           wantAlice: str,
+                           wantBob: str): bool =
+    return serverStatus.height == wantHeight &&
+           relayStatus.height == wantHeight &&
+           localStatus.height == wantHeight &&
+           len(serverStatus.appHash) > 0 &&
+           serverStatus.appHash == relayStatus.appHash &&
+           serverStatus.appHash == localStatus.appHash &&
+           serverStatus.aliceBalance == wantAlice &&
+           relayStatus.aliceBalance == wantAlice &&
+           localStatus.aliceBalance == wantAlice &&
+           serverStatus.bobBalance == wantBob &&
+           relayStatus.bobBalance == wantBob &&
+           localStatus.bobBalance == wantBob
+
+fn v3GateBftVerifyReportPath(root: str): str =
+    return v3path.v3PathAbsolute(root, "artifacts/v3_gate/verify_bft_validator_three_node.report.txt")
+
+fn v3GateBftVerifyReportAppendNode(out: var str,
+                                   prefix: str,
+                                   status: V3BftNodeStatus) =
+    out = out + prefix + "_name=" + status.name + "\n"
+    out = out + prefix + "_height=" + status.height + "\n"
+    out = out + prefix + "_app_hash=" + status.appHash + "\n"
+    out = out + prefix + "_alice_balance=" + status.aliceBalance + "\n"
+    out = out + prefix + "_bob_balance=" + status.bobBalance + "\n"
+
+fn v3GateBftVerifyReportText(cfg: V3BftThreeNodeDeploy,
+                             verified: bool,
+                             serverStatus: V3BftNodeStatus,
+                             relayStatus: V3BftNodeStatus,
+                             localStatus: V3BftNodeStatus): str =
+    let wantHeight = "1"
+    let wantAlice = strings.int64ToStr(cfg.mintAmount - cfg.transferAmount)
+    let wantBob = strings.int64ToStr(cfg.transferAmount)
+    var out = ""
+    out = out + "version=v3.bft_three_node_verify.v1\n"
+    out = out + "app_id=" + cfg.appId + "\n"
+    out = out + "server_ssh=" + cfg.serverSsh + "\n"
+    out = out + "relay_ssh=" + cfg.relaySsh + "\n"
+    out = out + "want_height=" + wantHeight + "\n"
+    out = out + "want_alice_balance=" + wantAlice + "\n"
+    out = out + "want_bob_balance=" + wantBob + "\n"
+    v3GateBftVerifyReportAppendNode(out, "server", serverStatus)
+    v3GateBftVerifyReportAppendNode(out, "relay", relayStatus)
+    v3GateBftVerifyReportAppendNode(out, "local", localStatus)
+    out = out + "verified=" + (verified ? "true" : "false") + "\n"
+    return out
+
 fn v3GateFormatMilli(valueMilli: int64): str =
     let whole = valueMilli / int64(1000)
     let frac = valueMilli % int64(1000)
@@ -1298,15 +1498,15 @@ fn v3GateFormatMilli(valueMilli: int64): str =
         fracText = "0" + fracText
     return strings.int64ToStr(whole) + "." + fracText
 
-fn v3GateBftDaemonMaxTxs(): int32 =
+fn v3GateBftDaemonMaxTxs(cfg: V3BftThreeNodeDeploy): int32 =
     var text = ""
-    text = os.getEnvDefault("CHENG_V3_BFT_MAX_TXS", "16")
+    text = os.getEnvDefault("CHENG_V3_BFT_MAX_TXS", intToStr(cfg.defaultMaxTxs))
     if len(text) <= 0:
-        return 16
+        return cfg.defaultMaxTxs
     let value = int32(strutil.parseInt(text))
     if value > 0:
         return value
-    return 16
+    return cfg.defaultMaxTxs
 
 fn v3GateBftWaitClusterState(root: str,
                              cfg: V3BftThreeNodeDeploy,
@@ -1353,18 +1553,12 @@ fn v3GateBftWaitClusterState(root: str,
         serverStatus = Value(serverRes)
         relayStatus = Value(relayRes)
         localStatus = Value(localRes)
-        if serverStatus.height == wantHeight &&
-           relayStatus.height == wantHeight &&
-           localStatus.height == wantHeight &&
-           len(serverStatus.appHash) > 0 &&
-           serverStatus.appHash == relayStatus.appHash &&
-           serverStatus.appHash == localStatus.appHash &&
-           serverStatus.aliceBalance == wantAlice &&
-           relayStatus.aliceBalance == wantAlice &&
-           localStatus.aliceBalance == wantAlice &&
-           serverStatus.bobBalance == wantBob &&
-           relayStatus.bobBalance == wantBob &&
-           localStatus.bobBalance == wantBob:
+        if v3GateBftClusterMatches(serverStatus,
+                                   relayStatus,
+                                   localStatus,
+                                   wantHeight,
+                                   wantAlice,
+                                   wantBob):
             return true
         os.sleepMs(200)
     return false
@@ -1433,24 +1627,33 @@ fn v3GateBftSyncRemoteRepo(root: str,
                                                20)
     if v3GateRunFailed(ensureRun):
         return ensureRun.exitCode
-    let run = hostops.v3RunProgramLogged(root,
-                                         "bft_remote_rsync",
-                                         "rsync",
-                                         ["-az",
-                                          "--delete",
-                                          "--exclude", ".git",
-                                          "--exclude", "artifacts",
-                                          "--exclude", "chengcache",
-                                          "--exclude", "node_modules",
-                                          root + "/",
-                                          sshHost + ":" + remoteRoot + "/"],
-                                         [],
-                                         root,
-                                         0,
-                                         logPath)
-    if v3GateRunFailed(run):
-        return run.exitCode
-    return 0
+    let remoteShell = "ssh -o BatchMode=yes -o ConnectTimeout=8 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
+    var lastRun = hostops.v3LoggedRunZero("bft_remote_rsync", "rsync", logPath, 255, "")
+    for attempt in 0..<3:
+        let run = hostops.v3RunProgramLogged(root,
+                                             "bft_remote_rsync",
+                                             "rsync",
+                                             ["-az",
+                                              "-e", remoteShell,
+                                              "--delete",
+                                              "--exclude", ".git",
+                                              "--exclude", "artifacts",
+                                              "--exclude", "chengcache",
+                                              "--exclude", "node_modules",
+                                              root + "/",
+                                              sshHost + ":" + remoteRoot + "/"],
+                                             [],
+                                             root,
+                                             0,
+                                             logPath)
+        lastRun = run
+        if !v3GateRunFailed(run):
+            return 0
+        if attempt >= 2 || !v3GateRemoteTransportRetryable(run.output):
+            return run.exitCode
+        v3GatePrintLine("[v3 gate] remote rsync retry " + intToStr(attempt + 1) + " " + sshHost)
+        os.sleepMs((attempt + 1) * 1000)
+    return lastRun.exitCode
 
 fn v3GateBftBuildRemote(root: str,
                         sshHost: str,
@@ -1468,7 +1671,12 @@ fn v3GateBftBuildRemote(root: str,
     command = command + " fi; sleep 0.1; done"
     command = command + " && printf '%s\\n' \"$$\" > \"$lock_pid\""
     command = command + " && trap 'rm -f \"$lock_pid\" 2>/dev/null || true; rmdir \"$lock_dir\" 2>/dev/null || true' EXIT INT TERM"
-    command = command + " && sh v3/tooling/bootstrap_bridge_v3.sh >/dev/null"
+    command = command + " && mkdir -p artifacts/v3_bootstrap"
+    command = command + " && cc -std=c11 -O2 -Wall -Wextra -pedantic"
+    command = command + " v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0"
+    command = command + " && CHENG_V3_ROOT=" + os.quoteShell(remoteRoot)
+    command = command + " CHENG_V3_TARGET=x86_64-unknown-linux-gnu"
+    command = command + " artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge >/dev/null"
     command = command + " && BFT_STATE_TARGET=x86_64-unknown-linux-gnu"
     command = command + " BFT_STATE_RUN_SELF_TEST=1"
     command = command + " artifacts/v3_bootstrap/cheng.stage3 build-bft-state-machine"
@@ -1529,19 +1737,13 @@ fn v3GateStopBftValidatorThreeNode(root: str): int32 =
                                                "bft_stop_server",
                                                cfg.serverSsh,
                                                v3GateBftStopShell([
-                                                   os.joinPath(serverDir, "server_proposal.pid"),
-                                                   os.joinPath(serverDir, "server_commit.pid"),
-                                                   os.joinPath(serverDir, "server_vote.pid"),
-                                                   os.joinPath(serverDir, "server_proposer.pid")
+                                                   os.joinPath(serverDir, "server_proposer.pid"),
+                                                   os.joinPath(serverDir, "server_state.pid")
                                                ], [
-                                                   "[p]roposal-serve-daemon --file:" +
-                                                       os.joinPath(serverDir, "server.proposal.hex"),
-                                                   "[c]ommit-serve-daemon --file:" +
-                                                       os.joinPath(serverDir, "server.commit.hex"),
-                                                   "[v]ote-capture-daemon --file:" +
-                                                       os.joinPath(serverDir, "server.votes"),
                                                    "[v]alidator-proposer-daemon --state:" +
-                                                       os.joinPath(serverDir, "server.state")
+                                                       os.joinPath(serverDir, "server.state"),
+                                                   "[s]tate-serve-daemon --file:" +
+                                                       os.joinPath(serverDir, "server.machine.hex")
                                                ]),
                                                "artifacts/v3_gate/bft_stop_server.log",
                                                30)
@@ -1616,9 +1818,17 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                 cfg.serverSsh,
                                                 "set -eu && mkdir -p " + os.quoteShell(serverDir) +
                                                 " && rm -f " +
-                                                    os.quoteShell(os.joinPath(serverDir, "server.proposal.ready")) +
+                                                os.quoteShell(os.joinPath(serverDir, "server.proposal.ready")) +
                                                 " " + os.quoteShell(os.joinPath(serverDir, "server.commit.ready")) +
                                                 " " + os.quoteShell(os.joinPath(serverDir, "server.vote.ready")) +
+                                                " " + os.quoteShell(os.joinPath(serverDir, "server.state.ready")) +
+                                                " " + os.quoteShell(os.joinPath(serverDir, "server.state.vote_lock")) +
+                                                " " + os.quoteShell(os.joinPath(serverDir, "server.queue.cursor")) +
+                                                " " + os.quoteShell(os.joinPath(serverDir, "server.machine.hex")) +
+                                                " " + os.quoteShell(os.joinPath(serverDir, "server_state.pid")) +
+                                                " && rm -rf " +
+                                                    os.quoteShell(os.joinPath(serverDir,
+                                                                              "server.machine.hex.snapshots")) +
                                                 " && : > " + os.quoteShell(os.joinPath(serverDir, "server.queue")) +
                                                 " && : > " +
                                                     os.quoteShell(os.joinPath(serverDir, "server.proposal.hex")) +
@@ -1664,92 +1874,28 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                          30)
     if v3GateRunFailed(localInit):
         return localInit.exitCode
-    let serverProposalRun = v3GateRunRemoteShellLogged(root,
-                                                       "bft_start_server_proposal",
-                                                       cfg.serverSsh,
-                                                       v3GateBftStartDetachedShell(serverBin,
-                                                                                ["proposal-serve-daemon",
-                                                                                 "--file:" +
-                                                                                     os.joinPath(serverDir,
-                                                                                                 "server.proposal." +
-                                                                                                     "hex"),
-                                                                                 "--host:0.0.0.0",
-                                                                                 "--port:" +
-                                                                                     intToStr(cfg.proposalPort),
-                                                                                 "--ready-path:" +
-                                                                                     os.joinPath(serverDir,
-                                                                                                 "server.proposal." +
-                                                                                                     "ready"),
-                                                                                 "--interval-ms:100"],
-                                                                                os.joinPath(serverDir,
-                                                                                            "server_proposal.pid"),
-                                                                                os.joinPath(serverDir,
-                                                                                            "server.proposal.log"),
-                                                                                os.joinPath(serverDir,
-                                                                                            "server.proposal.ready"),
-                                                                                true),
-                                                       "artifacts/v3_gate/bft_start_server_proposal.log",
-                                                       30)
-    if v3GateRunFailed(serverProposalRun):
-        return serverProposalRun.exitCode
-    let serverCommitRun = v3GateRunRemoteShellLogged(root,
-                                                     "bft_start_server_commit",
-                                                     cfg.serverSsh,
-                                                     v3GateBftStartDetachedShell(serverBin,
-                                                                              ["commit-serve-daemon",
-                                                                               "--file:" +
-                                                                                   os.joinPath(serverDir,
-                                                                                               "server.commit.hex"),
-                                                                               "--host:0.0.0.0",
-                                                                               "--port:" + intToStr(cfg.commitPort),
-                                                                               "--ready-path:" +
-                                                                                   os.joinPath(serverDir,
-                                                                                               "server.commit.ready"),
-                                                                               "--interval-ms:100"],
-                                                                              os.joinPath(serverDir,
-                                                                                          "server_commit.pid"),
-                                                                              os.joinPath(serverDir,
-                                                                                          "server.commit.log"),
-                                                                              os.joinPath(serverDir,
-                                                                                          "server.commit.ready"),
-                                                                              true),
-                                                     "artifacts/v3_gate/bft_start_server_commit.log",
-                                                     30)
-    if v3GateRunFailed(serverCommitRun):
-        return serverCommitRun.exitCode
-    let serverVoteRun = v3GateRunRemoteShellLogged(root,
-                                                   "bft_start_server_vote",
-                                                   cfg.serverSsh,
-                                                   v3GateBftStartDetachedShell(serverBin,
-                                                                            ["vote-capture-daemon",
-                                                                             "--file:" +
-                                                                                 os.joinPath(serverDir,
-                                                                                             "server.votes"),
-                                                                             "--host:0.0.0.0",
-                                                                             "--port:" + intToStr(cfg.votePort),
-                                                                             "--ready-path:" +
-                                                                                 os.joinPath(serverDir,
-                                                                                             "server.vote.ready"),
-                                                                             "--interval-ms:100"],
-                                                                            os.joinPath(serverDir, "server_vote.pid"),
-                                                                            os.joinPath(serverDir, "server.vote.log"),
-                                                                            os.joinPath(serverDir,
-                                                                                        "server.vote.ready"),
-                                                                            true),
-                                                   "artifacts/v3_gate/bft_start_server_vote.log",
-                                                   30)
-    if v3GateRunFailed(serverVoteRun):
-        return serverVoteRun.exitCode
-    let readyRun = v3GateRunRemoteShellLogged(root,
-                                              "bft_wait_server_ready",
+    let queueRun = v3GateRunRemoteShellLogged(root,
+                                              "bft_seed_queue",
                                               cfg.serverSsh,
-                                              v3GateBftWaitReadyShell([
-                                                  os.joinPath(serverDir, "server.vote.ready")
-                                              ], 90),
-                                              "artifacts/v3_gate/bft_wait_server_ready.log",
-                                              100)
-    if v3GateRunFailed(readyRun):
-        return readyRun.exitCode
+                                              "set -eu && " +
+                                              v3GateShellArgv([serverBin,
+                                                               "submit-mint",
+                                                               "--queue:" + os.joinPath(serverDir, "server.queue"),
+                                                               "--asset:" + intToStr(cfg.assetId),
+                                                               "--account:" + intToStr(cfg.aliceId),
+                                                               "--amount:" + strings.int64ToStr(cfg.mintAmount)]) +
+                                              " && " +
+                                              v3GateShellArgv([serverBin,
+                                                               "submit-transfer",
+                                                               "--queue:" + os.joinPath(serverDir, "server.queue"),
+                                                               "--asset:" + intToStr(cfg.assetId),
+                                                               "--from:" + intToStr(cfg.aliceId),
+                                                               "--to:" + intToStr(cfg.bobId),
+                                                               "--amount:" + strings.int64ToStr(cfg.transferAmount)]),
+                                              "artifacts/v3_gate/bft_seed_queue.log",
+                                              30)
+    if v3GateRunFailed(queueRun):
+        return queueRun.exitCode
     let serverProposerRun = v3GateRunRemoteShellLogged(root,
                                                        "bft_start_server_proposer",
                                                        cfg.serverSsh,
@@ -1761,6 +1907,15 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                                                  "--queue:" +
                                                                                      os.joinPath(serverDir,
                                                                                                  "server.queue"),
+                                                                                 "--proposal-host:0.0.0.0",
+                                                                                 "--proposal-port:" +
+                                                                                     intToStr(cfg.proposalPort),
+                                                                                 "--vote-host:0.0.0.0",
+                                                                                 "--vote-port:" +
+                                                                                     intToStr(cfg.votePort),
+                                                                                 "--commit-host:0.0.0.0",
+                                                                                 "--commit-port:" +
+                                                                                     intToStr(cfg.commitPort),
                                                                                  "--proposal-file:" +
                                                                                      os.joinPath(serverDir,
                                                                                                  "server.proposal." +
@@ -1768,23 +1923,76 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                                                  "--commit-file:" +
                                                                                      os.joinPath(serverDir,
                                                                                                  "server.commit.hex"),
-                                                                                 "--votes-file:" +
+                                                                                 "--state-sync-file:" +
                                                                                      os.joinPath(serverDir,
-                                                                                                 "server.votes"),
-                                                                                 "--interval-ms:100",
+                                                                                                 "server.machine.hex"),
+                                                                                 "--proposal-ready-path:" +
+                                                                                     os.joinPath(serverDir,
+                                                                                                 "server.proposal.ready"),
+                                                                                 "--vote-ready-path:" +
+                                                                                     os.joinPath(serverDir,
+                                                                                                 "server.vote.ready"),
+                                                                                 "--commit-ready-path:" +
+                                                                                     os.joinPath(serverDir,
+                                                                                                 "server.commit.ready"),
+                                                                                 "--interval-ms:" +
+                                                                                     intToStr(cfg.proposerIntervalMs),
+                                                                                 "--proposal-window-ms:" +
+                                                                                     intToStr(cfg.proposalWindowMs),
+                                                                                 "--vote-window-ms:" +
+                                                                                     intToStr(cfg.voteWindowMs),
+                                                                                 "--commit-window-ms:" +
+                                                                                     intToStr(cfg.commitWindowMs),
                                                                                  "--max-txs:" +
                                                                                      intToStr(
-                                                                                         v3GateBftDaemonMaxTxs())],
+                                                                                         v3GateBftDaemonMaxTxs(cfg))],
                                                                                 os.joinPath(serverDir,
                                                                                             "server_proposer.pid"),
                                                                                 os.joinPath(serverDir,
                                                                                             "server.proposer.log"),
-                                                                                "",
+                                                                                os.joinPath(serverDir,
+                                                                                            "server.proposal.ready"),
                                                                                 true),
                                                        "artifacts/v3_gate/bft_start_server_proposer.log",
                                                        30)
     if v3GateRunFailed(serverProposerRun):
         return serverProposerRun.exitCode
+    let serverStateRun = v3GateRunRemoteShellLogged(root,
+                                                    "bft_start_server_state",
+                                                    cfg.serverSsh,
+                                                    v3GateBftStartDetachedShell(serverBin,
+                                                                             ["state-serve-daemon",
+                                                                              "--file:" +
+                                                                                  os.joinPath(serverDir,
+                                                                                              "server.machine.hex"),
+                                                                              "--host:0.0.0.0",
+                                                                              "--port:" +
+                                                                                  intToStr(cfg.statePort),
+                                                                              "--interval-ms:" +
+                                                                                  intToStr(cfg.followerIntervalMs)],
+                                                                             os.joinPath(serverDir,
+                                                                                         "server_state.pid"),
+                                                                             os.joinPath(serverDir,
+                                                                                         "server.state.log"),
+                                                                             "",
+                                                                             true),
+                                                    "artifacts/v3_gate/bft_start_server_state.log",
+                                                    30)
+    if v3GateRunFailed(serverStateRun):
+        return serverStateRun.exitCode
+    let serverProbeRun = v3GateRunShellLogged(root,
+                                              "bft_probe_server_proposal",
+                                              v3GateShellArgv([localBin,
+                                                               "probe-proposal",
+                                                               "--host:" + cfg.serverAddress,
+                                                               "--port:" + intToStr(cfg.proposalPort),
+                                                               "--attempts:3",
+                                                               "--interval-ms:100",
+                                                               "--handshake-only:1"]),
+                                              "artifacts/v3_gate/bft_probe_server_proposal.log",
+                                              30)
+    if v3GateRunFailed(serverProbeRun):
+        return serverProbeRun.exitCode
     let relayFollowerRun = v3GateRunRemoteShellLogged(root,
                                                       "bft_start_relay_follower",
                                                       cfg.relaySsh,
@@ -1802,7 +2010,11 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                                                 "--commit-host:" + cfg.serverAddress,
                                                                                 "--commit-port:" +
                                                                                     intToStr(cfg.commitPort),
-                                                                                "--interval-ms:100"],
+                                                                                "--sync-host:" + cfg.serverAddress,
+                                                                                "--sync-port:" +
+                                                                                    intToStr(cfg.statePort),
+                                                                                "--interval-ms:" +
+                                                                                    intToStr(cfg.followerIntervalMs)],
                                                                                os.joinPath(relayDir,
                                                                                            "relay_follower.pid"),
                                                                                os.joinPath(relayDir,
@@ -1826,7 +2038,11 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                                           "--vote-port:" + intToStr(cfg.votePort),
                                                                           "--commit-host:" + cfg.serverAddress,
                                                                           "--commit-port:" + intToStr(cfg.commitPort),
-                                                                          "--interval-ms:100"],
+                                                                          "--sync-host:" + cfg.serverAddress,
+                                                                          "--sync-port:" +
+                                                                              intToStr(cfg.statePort),
+                                                                          "--interval-ms:" +
+                                                                              intToStr(cfg.followerIntervalMs)],
                                                                          os.joinPath(localDir, "local_follower.pid"),
                                                                          os.joinPath(localDir, "local.follower.log"),
                                                                          "",
@@ -1835,28 +2051,6 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
                                                 30)
     if v3GateRunFailed(localFollowerRun):
         return localFollowerRun.exitCode
-    let queueRun = v3GateRunRemoteShellLogged(root,
-                                              "bft_seed_queue",
-                                              cfg.serverSsh,
-                                              "set -eu && " +
-                                              v3GateShellArgv([serverBin,
-                                                               "submit-mint",
-                                                               "--queue:" + os.joinPath(serverDir, "server.queue"),
-                                                               "--asset:" + intToStr(cfg.assetId),
-                                                               "--account:" + intToStr(cfg.aliceId),
-                                                               "--amount:" + strings.int64ToStr(cfg.mintAmount)]) +
-                                              " && " +
-                                              v3GateShellArgv([serverBin,
-                                                               "submit-transfer",
-                                                               "--queue:" + os.joinPath(serverDir, "server.queue"),
-                                                               "--asset:" + intToStr(cfg.assetId),
-                                                               "--from:" + intToStr(cfg.aliceId),
-                                                               "--to:" + intToStr(cfg.bobId),
-                                                               "--amount:" + strings.int64ToStr(cfg.transferAmount)]),
-                                              "artifacts/v3_gate/bft_seed_queue.log",
-                                              30)
-    if v3GateRunFailed(queueRun):
-        return queueRun.exitCode
     let wantHeight = "1"
     let wantAlice = strings.int64ToStr(cfg.mintAmount - cfg.transferAmount)
     let wantBob = strings.int64ToStr(cfg.transferAmount)
@@ -1938,6 +2132,90 @@ fn v3GateDeployBftValidatorThreeNode(root: str): int32 =
         v3GatePrintErr("v3 bft deploy: unexpected UE process")
         v3GatePrintErr(ueText)
         return 1
+    return 0
+
+fn v3GateVerifyBftValidatorThreeNode(root: str): int32 =
+    if v3GateDeployBftValidatorThreeNode(root) != 0:
+        return 1
+    let cfg = v3GateBftConfigLoad(root)
+    let serverDir = v3GateBftRemoteDeployDir(cfg.serverRepoRoot, cfg)
+    let relayDir = v3GateBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
+    let localDir = cfg.localDeployDir
+    let wantHeight = "1"
+    let wantAlice = strings.int64ToStr(cfg.mintAmount - cfg.transferAmount)
+    let wantBob = strings.int64ToStr(cfg.transferAmount)
+    var serverStatus = v3GateBftNodeStatusZero("server")
+    var relayStatus = v3GateBftNodeStatusZero("relay")
+    var localStatus = v3GateBftNodeStatusZero("local")
+    var verified = false
+    let serverRes = v3GateBftCollectRemoteNodeStatus(root,
+                                                     cfg,
+                                                     "server",
+                                                     cfg.serverSsh,
+                                                     cfg.serverRepoRoot,
+                                                     os.joinPath(serverDir, "server.state"),
+                                                     "artifacts/v3_gate/bft_verify_server")
+    let relayRes = v3GateBftCollectRemoteNodeStatus(root,
+                                                    cfg,
+                                                    "relay",
+                                                    cfg.relaySsh,
+                                                    cfg.relayRepoRoot,
+                                                    os.joinPath(relayDir, "relay.state"),
+                                                    "artifacts/v3_gate/bft_verify_relay")
+    let localRes = v3GateBftCollectLocalNodeStatus(root,
+                                                   cfg,
+                                                   "local",
+                                                   os.joinPath(localDir, "local.state"),
+                                                   "artifacts/v3_gate/bft_verify_local")
+    if !IsErr(serverRes):
+        serverStatus = Value(serverRes)
+    if !IsErr(relayRes):
+        relayStatus = Value(relayRes)
+    if !IsErr(localRes):
+        localStatus = Value(localRes)
+    if !IsErr(serverRes) && !IsErr(relayRes) && !IsErr(localRes):
+        verified = v3GateBftClusterMatches(serverStatus,
+                                           relayStatus,
+                                           localStatus,
+                                           wantHeight,
+                                           wantAlice,
+                                           wantBob)
+    let reportPath = v3GateBftVerifyReportPath(root)
+    let reportText = v3GateBftVerifyReportText(cfg,
+                                               verified,
+                                               serverStatus,
+                                               relayStatus,
+                                               localStatus)
+    if !v3path.v3WriteTextFile(root, reportPath, reportText):
+        v3GatePrintErr("v3 bft verify: failed to write report: " + reportPath)
+        let _ = v3GateStopBftValidatorThreeNode(root)
+        return 1
+    let stopCode = v3GateStopBftValidatorThreeNode(root)
+    if IsErr(serverRes):
+        v3GatePrintErr("v3 bft verify: server status failed")
+        v3GatePrintErr(strutil.strip(Error(serverRes)))
+        return 1
+    if IsErr(relayRes):
+        v3GatePrintErr("v3 bft verify: relay status failed")
+        v3GatePrintErr(strutil.strip(Error(relayRes)))
+        return 1
+    if IsErr(localRes):
+        v3GatePrintErr("v3 bft verify: local status failed")
+        v3GatePrintErr(strutil.strip(Error(localRes)))
+        return 1
+    if !verified:
+        v3GatePrintErr("v3 bft verify: three-node cluster drifted")
+        v3GateBftPrintNodeStatus(serverStatus)
+        v3GatePrintLine("---")
+        v3GateBftPrintNodeStatus(relayStatus)
+        v3GatePrintLine("---")
+        v3GateBftPrintNodeStatus(localStatus)
+        return 1
+    if stopCode != 0:
+        v3GatePrintErr("v3 bft verify: stop failed after verification")
+        return stopCode
+    v3GatePrintLine("v3 bft verify ok")
+    v3GatePrintLine("report=" + reportPath)
     return 0
 
 fn v3GateBenchBftValidatorThreeNode(root: str,
@@ -2183,8 +2461,61 @@ fn v3GateTextContainsAny(text: str, needles: str[]): bool =
 
 fn v3GateVerifyOrphanGuard(root: str): int32 =
     let toolingDir: str = v3path.v3PathAbsolute(root, "v3/tooling")
-    let bannedText: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh", "failfast_parallel.sh"]
-    let bannedNames: str[] = ["guarded_exec_v3.py", "orphan_guard_run.sh", "failfast_parallel.sh"]
+    let bannedEntries: str[] = [
+        "guarded_exec_v3.py",
+        "orphan_guard_run.sh",
+        "failfast_parallel.sh",
+        "bootstrap_bridge_v3.sh",
+        "build_bft_state_machine_v3.sh",
+        "build_backend_driver_v3.sh",
+        "build_bounds_trace_v3.sh",
+        "build_browser_host_wasm_v3.sh",
+        "build_call_chain_v3.sh",
+        "build_chain_node_linux_obj_v3.sh",
+        "build_chain_node_linux_v3.sh",
+        "build_chain_node_v3.sh",
+        "build_ffi_handle_v3.sh",
+        "build_linux_nolibc_exe_v3.sh",
+        "build_panic_trace_v3.sh",
+        "build_program_selfhost_v3.sh",
+        "build_rwad_bft_state_machine_linux_obj_v3.sh",
+        "build_rwad_bft_state_machine_linux_v3.sh",
+        "build_rwad_bft_state_machine_v3.sh",
+        "build_signal_trace_v3.sh",
+        "build_twoway_search_smoke_v3.sh",
+        "build_zero_exit_v3.sh",
+        "cheng_tooling_repo_dispatch.sh",
+        "cheng_v3.sh",
+        "compare_bench.sh",
+        "profile_run_v3.sh",
+        "r2c_react_v3_fresh_clean_gate.sh",
+        "run_slice_gate.sh",
+        "run_v3_browser_host_wasm_smoke.sh",
+        "run_v3_browser_webrtc_smokes.sh",
+        "run_v3_chain_node_cli_smoke.sh",
+        "run_v3_chain_node_process_smoke.sh",
+        "run_v3_chain_node_three_node_smoke.sh",
+        "run_v3_compile_exe.sh",
+        "run_v3_fresh_node_selfhost_gate.sh",
+        "run_v3_host_smokes.sh",
+        "run_v3_linux_object_smokes.sh",
+        "run_v3_migration_gate.sh",
+        "run_v3_single_smoke.sh",
+        "run_v3_stage23_libp2p_smokes.sh",
+        "run_v3_tailnet_control_smoke.sh",
+        "run_v3_tcp_twoproc_smoke.sh",
+        "run_v3_quic_twoproc_smoke.sh",
+        "run_v3_udp_importc_smoke.sh",
+        "run_v3_wasm_smokes.sh",
+        "run_v3_windows_riscv_builtin_smokes.sh",
+        "scan_forbidden_hotpath.sh",
+        "verify_debug_profile_v3.sh",
+        "verify_debug_runtime_v3.sh",
+        "verify_debug_tools_v3.sh",
+        "verify_orphan_guard_v3.sh",
+        "verify_riscv64_builtin_linker_v3.sh",
+        "verify_windows_builtin_linker_v3.sh"
+    ]
     let entries: str[] = os.walkDir(toolingDir)
     for i in 0..<entries.len:
         let entry: os.WalkDirEntry = os.walkDirEntry(entries, i)
@@ -2194,14 +2525,17 @@ fn v3GateVerifyOrphanGuard(root: str): int32 =
             continue
         let path: str = os.walkDirEntryPath(entry)
         let parts: os.SplitFileResult = os.splitFile(path)
-        if parts.ext != ".sh" && parts.ext != ".py":
+        if parts.ext == ".sh":
+            v3GatePrintErr("verify_orphan_guard_v3: shell tooling entry not allowed: " + path)
+            return 1
+        if parts.ext != ".py":
             continue
         let fileName: str = parts.name + parts.ext
-        if v3GateTextContainsAny(fileName, bannedNames):
+        if v3GateTextContainsAny(fileName, bannedEntries):
             v3GatePrintErr("verify_orphan_guard_v3: banned tooling entry name: " + path)
             return 1
         let text: str = v3path.v3ReadTextFile("", path)
-        if v3GateTextContainsAny(text, bannedText):
+        if v3GateTextContainsAny(text, bannedEntries):
             v3GatePrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
             return 1
     v3GatePrintLine("verify_orphan_guard_v3 ok")
@@ -2213,6 +2547,9 @@ fn v3GateDefaultHostSmokes(): str[] =
         "fixed256_curve25519_smoke",
         "fixedbytes32_seq_index_smoke",
         "compiler_runtime_smoke",
+        "backend_driver_command_surface_smoke",
+        "composite_default_init_smoke",
+        "composite_default_init_negative_smoke",
         "global_fixed_array_composite_smoke",
         "multiline_header_indent_smoke",
         "rwad_serial_state_machine_smoke",
@@ -2255,16 +2592,28 @@ fn v3GateDefaultHostSmokes(): str[] =
         "bio_did_chain_node_smoke",
         "bio_did_mobile_biometric_smoke",
         "native_client_hello_wire_smoke",
+        "msquic_bindtext_expr_smoke",
+        "protocol_validation_smoke",
+        "platform_release_validation_smoke",
+        "congestion_validation_smoke",
+        "msquic_platform_smoke",
         "quic_tls_transport_ecdsa_smoke",
         "quic_transport_loopback_smoke",
         "quic_transport_sequential_accept_smoke",
         "libp2p_quic_tls_smoke",
+        "quic_feature_matrix_smoke",
+        "quic_close_order_smoke",
+        "bft_daemon_quic_close_order_smoke",
         "libp2p_tailnet_policy_smoke",
         "libp2p_tailnet_visibility_smoke",
         "libp2p_tailnet_transport_smoke",
         "libp2p_tailnet_derp_smoke",
         "libp2p_resource_smoke",
         "libp2p_scheduler_smoke",
+        "libp2p_quic_tls_smoke",
+        "quic_feature_matrix_smoke",
+        "quic_close_order_smoke",
+        "bft_daemon_quic_close_order_smoke",
         "tailnet_control_core_smoke",
         "tailnet_train_island_smoke",
         "webrtc_signal_codec_smoke",
@@ -2309,6 +2658,10 @@ fn v3GateDefaultStage23Smokes(): str[] =
         "libp2p_tailnet_derp_smoke",
         "libp2p_resource_smoke",
         "libp2p_scheduler_smoke",
+        "libp2p_quic_tls_smoke",
+        "quic_feature_matrix_smoke",
+        "quic_close_order_smoke",
+        "bft_daemon_quic_close_order_smoke",
         "tailnet_control_core_smoke",
         "tailnet_train_island_smoke",
         "webrtc_signal_codec_smoke",
@@ -2461,6 +2814,228 @@ fn v3GateRunTcpTwoprocSmoke(root: str,
         return serverRun.exitCode
     v3GateMaybePrintRunOutput(clientRun)
     v3GatePrintLine("v3 libp2p_tcp_twoproc_smoke ok")
+    return 0
+
+fn v3GateRunQuicTwoprocSmoke(root: str,
+                             compilerPath: str,
+                             stageName: str,
+                             envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_quic_twoproc")
+    let serverSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/libp2p_quic_twoproc_server_smoke.cheng")
+    let clientSrc: str = v3path.v3PathAbsolute(root, "v3/src/tests/libp2p_quic_twoproc_client_smoke.cheng")
+    let serverBin: str = os.joinPath(outDir, "libp2p_quic_twoproc_server." + stageName)
+    let clientBin: str = os.joinPath(outDir, "libp2p_quic_twoproc_client." + stageName)
+    let readyPath: str = os.joinPath(outDir, "libp2p_quic_twoproc_server." + stageName + ".ready")
+    let _ = os.removeFile(readyPath)
+    if !os.fileExists(serverSrc) || !os.fileExists(clientSrc):
+        v3GatePrintErr("v3 libp2p quic twoproc: missing source fixture")
+        return 1
+    let serverCompile = v3GateCompileExeEnv(root,
+                                            "v3 libp2p quic twoproc compile " + stageName + " server",
+                                            compilerPath,
+                                            serverSrc,
+                                            serverBin,
+                                            "arm64-apple-darwin",
+                                            serverBin + ".compile.log",
+                                            envOverrides)
+    if v3GateRunFailed(serverCompile):
+        return serverCompile.exitCode
+    let clientCompile = v3GateCompileExeEnv(root,
+                                            "v3 libp2p quic twoproc compile " + stageName + " client",
+                                            compilerPath,
+                                            clientSrc,
+                                            clientBin,
+                                            "arm64-apple-darwin",
+                                            clientBin + ".compile.log",
+                                            envOverrides)
+    if v3GateRunFailed(clientCompile):
+        return clientCompile.exitCode
+    let serverSpawn = hostops.v3SpawnFile(root,
+                                          "v3 libp2p quic twoproc server " + stageName,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        v3GatePrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !v3GateWaitReadyPort(root, readyPath, serverProc, port):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, serverBin + ".run.log", 1)
+        v3GatePrintErr("v3 libp2p quic twoproc: invalid ready port: " + port)
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = v3GateRunBinary(root,
+                                    "v3 libp2p quic twoproc client " + stageName,
+                                    clientBin,
+                                    ["--port:" + port],
+                                    20,
+                                    clientBin + ".run.log")
+    if v3GateRunFailed(clientRun):
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, serverBin + ".run.log")
+        v3GateMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, serverBin + ".run.log")
+    v3GateMaybePrintRunOutput(serverRun)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    v3GateMaybePrintRunOutput(clientRun)
+    v3GatePrintLine("v3 libp2p_quic_twoproc_smoke ok")
+    return 0
+
+fn v3GateRunDiLoCoSingleSmoke(root: str,
+                              compilerPath: str,
+                              stageName: str,
+                              packageRoot: str,
+                              smokeName: str,
+                              envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_diloco")
+    let src: str = v3path.v3PathAbsolute(root, "v3/DiLoCo/src/tests/" + smokeName + ".cheng")
+    let outBin: str = os.joinPath(outDir, smokeName + "." + stageName)
+    if !os.fileExists(src):
+        v3GatePrintErr("v3 diloco verify: missing source: " + src)
+        return 1
+    let compileRun = v3GateCompileExeEnvAtRoot(root,
+                                               "v3 diloco compile " + smokeName + " " + stageName,
+                                               compilerPath,
+                                               packageRoot,
+                                               src,
+                                               outBin,
+                                               "arm64-apple-darwin",
+                                               outBin + ".compile.log",
+                                               envOverrides)
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    let runRun = v3GateRunBinary(root,
+                                 "v3 diloco run " + smokeName + " " + stageName,
+                                 outBin,
+                                 [],
+                                 v3GateSmokeRunTimeoutSec(),
+                                 outBin + ".run.log")
+    v3GateMaybePrintRunOutput(runRun)
+    if v3GateRunFailed(runRun):
+        return runRun.exitCode
+    return 0
+
+fn v3GateRunDiLoCoQuicTwoprocSmoke(root: str,
+                                   compilerPath: str,
+                                   stageName: str,
+                                   packageRoot: str,
+                                   envOverrides: str[]): int32 =
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_diloco")
+    let serverSrc: str = v3path.v3PathAbsolute(root, "v3/DiLoCo/src/tests/diloco_quic_twoproc_server_smoke.cheng")
+    let clientSrc: str = v3path.v3PathAbsolute(root, "v3/DiLoCo/src/tests/diloco_quic_twoproc_client_smoke.cheng")
+    let serverBin: str = os.joinPath(outDir, "diloco_quic_twoproc_server." + stageName)
+    let clientBin: str = os.joinPath(outDir, "diloco_quic_twoproc_client." + stageName)
+    let readyPath: str = os.joinPath(outDir, "diloco_quic_twoproc_server." + stageName + ".ready")
+    let _ = os.removeFile(readyPath)
+    if !os.fileExists(serverSrc) || !os.fileExists(clientSrc):
+        v3GatePrintErr("v3 diloco quic twoproc: missing source fixture")
+        return 1
+    let serverCompile = v3GateCompileExeEnvAtRoot(root,
+                                                  "v3 diloco quic twoproc compile " + stageName + " server",
+                                                  compilerPath,
+                                                  packageRoot,
+                                                  serverSrc,
+                                                  serverBin,
+                                                  "arm64-apple-darwin",
+                                                  serverBin + ".compile.log",
+                                                  envOverrides)
+    if v3GateRunFailed(serverCompile):
+        return serverCompile.exitCode
+    let clientCompile = v3GateCompileExeEnvAtRoot(root,
+                                                  "v3 diloco quic twoproc compile " + stageName + " client",
+                                                  compilerPath,
+                                                  packageRoot,
+                                                  clientSrc,
+                                                  clientBin,
+                                                  "arm64-apple-darwin",
+                                                  clientBin + ".compile.log",
+                                                  envOverrides)
+    if v3GateRunFailed(clientCompile):
+        return clientCompile.exitCode
+    let serverSpawn = hostops.v3SpawnFile(root,
+                                          "v3 diloco quic twoproc server " + stageName,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          root)
+    if IsErr(serverSpawn):
+        v3GatePrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !v3GateWaitReadyPort(root, readyPath, serverProc, port):
+        let serverRun = v3GateWriteProcessSnapshot(root, serverProc, serverBin + ".run.log", 1)
+        v3GatePrintErr("v3 diloco quic twoproc: invalid ready port: " + port)
+        v3GateMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun = v3GateRunBinary(root,
+                                    "v3 diloco quic twoproc client " + stageName,
+                                    clientBin,
+                                    ["--port:" + port],
+                                    20,
+                                    clientBin + ".run.log")
+    if v3GateRunFailed(clientRun):
+        let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 1, serverBin + ".run.log")
+        v3GateMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun = hostops.v3SpawnedProcessWaitLogged(root, serverProc, 20, serverBin + ".run.log")
+    v3GateMaybePrintRunOutput(serverRun)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    v3GateMaybePrintRunOutput(clientRun)
+    v3GatePrintLine("v3 diloco_quic_twoproc_smoke ok (" + stageName + ")")
+    return 0
+
+fn v3GateVerifyDiLoCoStage(root: str,
+                           compilerPath: str,
+                           stageName: str,
+                           packageRoot: str,
+                           envOverrides: str[]): int32 =
+    let singleSmokes = ["diloco_state_smoke", "diloco_wire_smoke"]
+    for i in 0..<singleSmokes.len:
+        let smokeName = singleSmokes[i]
+        if v3GateRunDiLoCoSingleSmoke(root,
+                                      compilerPath,
+                                      stageName,
+                                      packageRoot,
+                                      smokeName,
+                                      envOverrides) != 0:
+            return 1
+    return v3GateRunDiLoCoQuicTwoprocSmoke(root,
+                                           compilerPath,
+                                           stageName,
+                                           packageRoot,
+                                           envOverrides)
+
+fn v3GateVerifyDiLoCo(root: str): int32 =
+    if v3GateEnsureBootstrapBridge(root) != 0:
+        return 1
+    let packageRoot: str = v3path.v3PathAbsolute(root, "v3/DiLoCo")
+    if !os.fileExists(os.joinPath(packageRoot, "cheng-package.toml")):
+        v3GatePrintErr("v3 diloco verify: missing package root: " + packageRoot)
+        return 1
+    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v3_diloco")
+    if !v3path.v3MkdirP(root, outDir):
+        v3GatePrintErr("v3 diloco verify: failed to create out dir")
+        return 1
+    let stage2: str = contracts.v3BootstrapStage2Path(root)
+    let stage3: str = contracts.v3BootstrapStage3Path(root)
+    if !os.fileExists(stage2) || !os.fileExists(stage3):
+        v3GatePrintErr("v3 diloco verify: missing bootstrap compiler")
+        return 1
+    if v3GateVerifyDiLoCoStage(root, stage3, "host", packageRoot, []) != 0:
+        return 1
+    let stage23Env: str[] = v3GateStage23EnvOverrides()
+    if v3GateVerifyDiLoCoStage(root, stage2, "stage2", packageRoot, stage23Env) != 0:
+        return 1
+    if v3GateVerifyDiLoCoStage(root, stage3, "stage3", packageRoot, stage23Env) != 0:
+        return 1
+    v3GatePrintLine("v3 verify-diloco ok")
     return 0
 
 fn v3GateWriteHelperScript(root: str,
@@ -3629,6 +4204,9 @@ fn v3GateRunHostSmokes(root: str, args: str[]): int32 =
         if smokeName == "chain_node_libp2p_smoke":
             if v3GateRunTcpTwoprocSmoke(root, compiler, "host", []) != 0:
                 return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if v3GateRunQuicTwoprocSmoke(root, compiler, "host", []) != 0:
+                return 1
     if runTail:
         if v3GateRunChainNodeCliSmoke(root, compiler, "host", []) != 0:
             return 1
@@ -3681,6 +4259,9 @@ fn v3GateRunStage23Libp2pSmokes(root: str, args: str[]): int32 =
         if smokeName == "libp2p_tcp_smoke":
             if v3GateRunTcpTwoprocSmoke(root, stage2, "stage2", envOverrides) != 0:
                 return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if v3GateRunQuicTwoprocSmoke(root, stage2, "stage2", envOverrides) != 0:
+                return 1
         let stage3Bin: str = os.joinPath(outDir, smokeName + ".stage3")
         if v3GateRunSingleFixtureSmoke(root,
                                        "v3 stage2/stage3 libp2p",
@@ -3692,6 +4273,9 @@ fn v3GateRunStage23Libp2pSmokes(root: str, args: str[]): int32 =
             return 1
         if smokeName == "libp2p_tcp_smoke":
             if v3GateRunTcpTwoprocSmoke(root, stage3, "stage3", envOverrides) != 0:
+                return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if v3GateRunQuicTwoprocSmoke(root, stage3, "stage3", envOverrides) != 0:
                 return 1
     if runTail:
         if v3GateRunChainNodeCliSmoke(root, stage2, "stage2", envOverrides) != 0:
@@ -3808,76 +4392,6 @@ fn v3GateBuildProgramSelfhost(root: str): int32 =
     v3GateMaybePrintRunOutput(run)
     if v3GateRunFailed(run):
         return run.exitCode
-    return 0
-
-fn v3GateRunV2SelfhostGate(root: str): int32 =
-    let compiler: str = v3path.v3PathAbsolute(root, "v2/artifacts/bootstrap/cheng_v2c")
-    if !os.fileExists(compiler):
-        v3GatePrintErr("v2 selfhost gate: missing compiler: " + compiler)
-        return 1
-    let outDir: str = v3path.v3PathAbsolute(root, "artifacts/v2_selfhost_gate")
-    if !v3path.v3MkdirP(root, outDir):
-        v3GatePrintErr("v2 selfhost gate: mkdir failed: " + outDir)
-        return 1
-    let toolingRun = hostops.v3RunFileLogged(root,
-                                             "v2_tooling_selfhost_check",
-                                             compiler,
-                                             ["tooling-selfhost-check",
-                                              "--root", "v2/examples",
-                                              "--in", "v2/examples/network_distribution_module.cheng"],
-                                             [],
-                                             root,
-                                             0,
-                                             "artifacts/v2_selfhost_gate/tooling-selfhost-check.log")
-    if v3GateRunFailed(toolingRun):
-        return toolingRun.exitCode
-    v3GateMaybePrintRunOutput(toolingRun)
-    if !v3GateRequireOutput(toolingRun, "tooling_selfhost_ok=1", "v2 tooling selfhost"):
-        return 1
-    let programRun = hostops.v3RunFileLogged(root,
-                                             "v2_program_selfhost_check",
-                                             compiler,
-                                             ["program-selfhost-check",
-                                              "--compiler", compiler,
-                                              "--out-dir", os.joinPath(outDir, "program_selfhost")],
-                                             [],
-                                             root,
-                                             0,
-                                             "artifacts/v2_selfhost_gate/program-selfhost-check.log")
-    if v3GateRunFailed(programRun):
-        return programRun.exitCode
-    v3GateMaybePrintRunOutput(programRun)
-    if !v3GateRequireOutput(programRun, "program_selfhost_ok=1", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_quic_tls_transport_ecdsa_smoke_ok=1", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_quic_tls_transport_ecdsa_report_version=v2_network_smoke_report_v1", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_quic_tls_transport_ecdsa_stage_total=12", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_msquic_chain_smoke_ok=1", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_msquic_chain_report_version=v2_network_smoke_report_v1", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_msquic_chain_stage_total=60", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_chain_node_process_shell_orchestration=0", "v2 program selfhost") ||
-       !v3GateRequireOutput(programRun, "stage2_program_runtime_bridge_shell_exec_used=0", "v2 program selfhost"):
-        return 1
-    let quicReport: str = v3GateOutputLineValue(programRun.output, "stage2_quic_tls_transport_ecdsa_report_path")
-    let msquicReport: str = v3GateOutputLineValue(programRun.output, "stage2_msquic_chain_report_path")
-    if quicReport.len <= 0 || !os.fileExists(quicReport):
-        v3GatePrintErr("v2 program selfhost: missing quic report: " + quicReport)
-        return 1
-    if msquicReport.len <= 0 || !os.fileExists(msquicReport):
-        v3GatePrintErr("v2 program selfhost: missing msquic report: " + msquicReport)
-        return 1
-    let quicReportText: str = v3path.v3ReadTextFile("", quicReport)
-    if !v3GateOutputContains(quicReportText, "v2_network_smoke_report_v1") ||
-       !v3GateOutputContains(quicReportText, "smoke=quic_tls_transport_ecdsa_smoke") ||
-       !v3GateOutputContains(quicReportText, "stage_total=12"):
-        v3GatePrintErr("v2 program selfhost: invalid quic report: " + quicReport)
-        return 1
-    let msquicReportText: str = v3path.v3ReadTextFile("", msquicReport)
-    if !v3GateOutputContains(msquicReportText, "v2_network_smoke_report_v1") ||
-       !v3GateOutputContains(msquicReportText, "smoke=msquic_chain_smoke") ||
-       !v3GateOutputContains(msquicReportText, "stage_total=60"):
-        v3GatePrintErr("v2 program selfhost: invalid msquic report: " + msquicReport)
-        return 1
-    v3GatePrintLine("v2 selfhost gate: ok")
     return 0
 
 fn v3GateBuildFfiHandle(root: str): int32 =
@@ -4610,9 +5124,6 @@ fn v3GateSlice(root: str): int32 =
     v3GatePrintLine("[v3 gate] chain_node")
     if v3GateBuildChainNode(root) != 0:
         return 1
-    v3GatePrintLine("[v3 gate] v2 selfhost gate")
-    if v3GateRunV2SelfhostGate(root) != 0:
-        return 1
     if v3GateVerifyTcpBioLinuxRegression(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] bootstrap subset self-checks")
@@ -4623,6 +5134,9 @@ fn v3GateSlice(root: str): int32 =
         return 1
     v3GatePrintLine("[v3 gate] host default-init literals smoke")
     if v3GateRunHostSmokes(root, ["default_init_literals_smoke"]) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] backend_driver command surface")
+    if v3GateRunHostSmokes(root, ["backend_driver_command_surface_smoke"]) != 0:
         return 1
     v3GatePrintLine("[v3 gate] cross-target builtin smokes")
     if v3GateRunStage3Command(root,
@@ -4637,6 +5151,12 @@ fn v3GateSlice(root: str): int32 =
         return 1
     v3GatePrintLine("[v3 gate] stage2/stage3 libp2p smokes")
     if v3GateRunStage23Libp2pSmokes(root, []) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] remote x86 linux release gate")
+    if v3GateVerifyX86LinuxRemote(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] bft three-node verify")
+    if v3GateVerifyBftValidatorThreeNode(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] ok")
     return 0
@@ -4660,9 +5180,12 @@ fn v3GateHandlesCommandBase(cmd: str): bool =
            cmd == "profile-run" ||
            cmd == "crash-report" ||
            cmd == "verify-orphan-guard" ||
+           cmd == "verify-backend-driver-command-surface" ||
+           cmd == "verify-r2c-react-v3-surface" ||
            cmd == "verify-debug-tools" ||
            cmd == "verify-debug-runtime" ||
            cmd == "verify-debug-profile" ||
+           cmd == "verify-diloco" ||
            cmd == "verify-windows-builtin" ||
            cmd == "verify-riscv64-builtin" ||
            cmd == "run-cross-target-smokes" ||
@@ -4679,6 +5202,7 @@ fn v3GateHandlesCommandBuild(cmd: str): bool =
            cmd == "build-ffi-handle" ||
            cmd == "build-bft-state-machine" ||
            cmd == "deploy-bft-validator-three-node" ||
+           cmd == "verify-bft-validator-three-node" ||
            cmd == "status-bft-validator-three-node" ||
            cmd == "stop-bft-validator-three-node" ||
            cmd == "bench-bft-validator-three-node" ||
@@ -4692,6 +5216,7 @@ fn v3GateHandlesCommandBuild(cmd: str): bool =
 fn v3GateHandlesCommandRuntime(cmd: str): bool =
     return cmd == "run-linux-object-smokes" ||
            cmd == "run-tcp-twoproc-smoke" ||
+           cmd == "run-quic-twoproc-smoke" ||
            cmd == "run-udp-importc-smoke" ||
            cmd == "run-wasm-smokes" ||
            cmd == "run-browser-host-wasm-smoke" ||
@@ -4699,7 +5224,6 @@ fn v3GateHandlesCommandRuntime(cmd: str): bool =
            cmd == "run-chain-node-process-smoke" ||
            cmd == "run-chain-node-three-node-smoke" ||
            cmd == "run-tailnet-control-smoke" ||
-           cmd == "run-v2-selfhost-gate" ||
            cmd == "run-fresh-node-selfhost-gate" ||
            cmd == "run-migration-gate" ||
            cmd == "run-browser-webrtc-smokes" ||
@@ -4768,12 +5292,18 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return v3GateRunStage3Command(root, "crash_report", cmd, args, "crash-report.log", false)
     if cmd == "verify-orphan-guard":
         return v3GateVerifyOrphanGuard(root)
+    if cmd == "verify-backend-driver-command-surface":
+        return v3GateRunHostSmokes(root, ["backend_driver_command_surface_smoke"])
+    if cmd == "verify-r2c-react-v3-surface":
+        return v3GateRunHostSmokes(root, ["r2c_react_v3_surface_smoke"])
     if cmd == "verify-debug-tools":
         return v3GateRunStage3Command(root, "verify_debug_tools", cmd, args, "verify-debug-tools.log", false)
     if cmd == "verify-debug-runtime":
         return v3GateVerifyDebugRuntime(root)
     if cmd == "verify-debug-profile":
         return v3GateVerifyDebugProfile(root)
+    if cmd == "verify-diloco":
+        return v3GateVerifyDiLoCo(root)
     if cmd == "verify-windows-builtin":
         return v3GateRunStage3Command(root, "verify_windows_builtin", cmd, args, "verify-windows-builtin.log", false)
     if cmd == "verify-riscv64-builtin":
@@ -4802,6 +5332,8 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return v3GateBuildBftStateMachine(root)
     if cmd == "deploy-bft-validator-three-node":
         return v3GateDeployBftValidatorThreeNode(root)
+    if cmd == "verify-bft-validator-three-node":
+        return v3GateVerifyBftValidatorThreeNode(root)
     if cmd == "status-bft-validator-three-node":
         return v3GateStatusBftValidatorThreeNode(root)
     if cmd == "stop-bft-validator-three-node":
@@ -4841,6 +5373,13 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
             return 1
         let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_SMOKE_LABEL", "host")
         return v3GateRunTcpTwoprocSmoke(root, compiler, label, [])
+    if cmd == "run-quic-twoproc-smoke":
+        let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
+        var compiler = ""
+        if v3GateResolveSmokeCompiler(root, explicitCompiler, "CHENG_V3_SMOKE_COMPILER", "", compiler) != 0:
+            return 1
+        let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_SMOKE_LABEL", "host")
+        return v3GateRunQuicTwoprocSmoke(root, compiler, label, [])
     if cmd == "run-udp-importc-smoke":
         return v3GateRunUdpImportcSmoke(root, args)
     if cmd == "run-wasm-smokes":
@@ -4891,8 +5430,6 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
             return 1
         let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_TAILNET_LABEL", "host")
         return v3GateRunTailnetControlSmoke(root, compiler, label, [])
-    if cmd == "run-v2-selfhost-gate":
-        return v3GateRunV2SelfhostGate(root)
     if cmd == "run-fresh-node-selfhost-gate":
         let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
         var compiler = ""

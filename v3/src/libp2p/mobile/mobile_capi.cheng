@@ -12,12 +12,12 @@ import cheng/v3/std/bytes_layout as layout
 import cheng/v3/project/bio_same_person as bio
 import cheng/v3/project/bio_did_chain_node as bio_did
 
-@importc("cheng_free")
-fn cheng_free_raw(p: ptr)
-@importc("driver_c_new_string_copy_n")
-fn driver_c_new_string_copy_n(raw: ptr, n: int32): ptr
 @importc("cheng_v3_buffer_handle_from_raw_bridge")
 fn cheng_v3_buffer_handle_from_raw_bridge(data: ptr, n: int32): uint64
+@importc("malloc")
+fn c_malloc(size: int64): ptr
+@importc("free")
+fn c_free(p: ptr)
 
 fn v3MobileCapiPeerIdFromSeed(seed: str): str =
     var peerValue = types.v3Libp2pPeerIdZero()
@@ -25,10 +25,13 @@ fn v3MobileCapiPeerIdFromSeed(seed: str): str =
     return peer_id.v3Libp2pPeerIdText(peerValue)
 
 fn v3MobileCapiDidFromRootSeed(rootSeed: str): str =
-    return did.v3DidFromRootSeed(rootSeed)
+    let out = did.v3DidFromRootSeed(rootSeed)
+    return out
 
 fn v3MobileCapiDidDevicePeerIdFromSeed(deviceSeed: str): str =
-    return peer_id.v3Libp2pPeerIdText(did.v3DidDevicePeerIdFromSeed(deviceSeed))
+    let peerValue = did.v3DidDevicePeerIdFromSeed(deviceSeed)
+    let out = peer_id.v3Libp2pPeerIdText(peerValue)
+    return out
 
 fn v3MobileCapiPeerIdNormalize(peerText: str): str =
     var peerValue = types.v3Libp2pPeerIdZero()
@@ -53,7 +56,10 @@ fn v3MobileCapiDialableAddr(addrText: str, peerText: str): str =
         return ""
     if strContains(base, "/p2p/") || strContains(base, "/ipfs/"):
         return base
-    return base + "/p2p/" + peer
+    var out = base
+    out = out + "/p2p/"
+    out = out + peer
+    return out
 
 fn v3MobileCapiBioDidCapture(requestId: str,
                              feature32Hex: str,
@@ -78,13 +84,16 @@ fn v3MobileCapiBioDidCapture(requestId: str,
     return Ok[bio_did.V3BioDidHardwareCapture](capture)
 
 fn v3MobileCapiTextHex(value: str): str =
-    return bytesToHex(bytesFromString(value))
+    let raw = bytesFromString(value)
+    let out = bytesToHex(raw)
+    return out
 
 fn v3MobileCapiDecodeWireText(text: str): Result[str] =
     let bytesRes = did.v3DidStoreDecodeBytes(text)
     if IsErr(bytesRes):
         return Err[str](Error(bytesRes))
-    return Ok[str](bytesToString(Value(bytesRes)))
+    let decoded = bytesToString(Value(bytesRes))
+    return Ok[str](decoded)
 
 fn v3MobileCapiWireFindValue(wire: str, key: str): Result[str] =
     let prefix = key + "="
@@ -108,12 +117,13 @@ fn v3MobileCapiWireDecodedValue(wire: str, key: str): Result[str] =
     let rawRes = v3MobileCapiWireFindValue(wire, key)
     if IsErr(rawRes):
         return Err[str](Error(rawRes))
-    return v3MobileCapiDecodeWireText(Value(rawRes))
+    let decodedRes = v3MobileCapiDecodeWireText(Value(rawRes))
+    return decodedRes
 
 fn v3MobileCapiBioDidErrorJson(errorText: str): str =
     var out = ""
-    out = out + "ok=0\n"
-    out = out + "error=" + errorText + "\n"
+    out = did.v3DidStoreAppendLine(out, "ok", "0")
+    out = did.v3DidStoreAppendLine(out, "error", errorText)
     return out
 
 fn v3MobileCapiTextBufferHandle(text: str): uint64 =
@@ -129,95 +139,46 @@ fn v3MobileCapiTextBufferHandle(text: str): uint64 =
 
 fn v3MobileCapiTextCString(text: str): ptr =
     let textLen = len(text)
-    if textLen <= 0:
-        return driver_c_new_string_copy_n("", 0)
-    let raw = bytesAlloc(textLen)
-    if raw.data == nil || raw.len != textLen:
+    let raw = c_malloc(int64(textLen + 1))
+    if raw == nil:
         return nil
+    var out = bytesView(raw, textLen + 1)
     for i in 0..<textLen:
-        bytesSet(raw, i, int32(text[i]) & 255)
-    return driver_c_new_string_copy_n(raw.data, textLen)
+        bytesSet(out, i, int32(text[i]) & 255)
+    bytesSet(out, textLen, 0)
+    return raw
 
 fn v3MobileCapiStringFree(text: ptr) =
-    cheng_free_raw(text)
+    c_free(text)
 
 fn v3MobileCapiCopyRawText(raw: ptr): str =
-    return raw == nil ? "" : strFromCStringCopy(cstring(raw))
-
-fn v3MobileCapiBioDidRecordLines(record: bio.V3BioEnrollmentRecord): str =
-    var out = ""
-    out = out + "record.version=" + strings.intToStr(record.version) + "\n"
-    out = out + "record.helper=" + layout.fixedBytes32Hex(record.helper) + "\n"
-    out = out + "record.pubKey=" + layout.fixedBytes65Hex(record.pubKey) + "\n"
-    out = out + "record.codeN=" + strings.intToStr(record.codeN) + "\n"
-    out = out + "record.codeK=" + strings.intToStr(record.codeK) + "\n"
-    out = out + "record.maxCorrectable=" + strings.intToStr(record.maxCorrectable) + "\n"
-    out = out + "record.recordCid=" + layout.fixedBytes32Hex(record.recordCid) + "\n"
+    if raw == nil:
+        return ""
+    let out = strFromCStringCopy(cstring(raw))
     return out
 
-fn v3MobileCapiBioDidAssertionLines(assertion: bio.V3BioAssertion): str =
+fn v3MobileCapiBioDidProvisionJson(didText: str,
+                                   rootSeed: str,
+                                   deviceSeed: str,
+                                   documentText: str,
+                                   bundleText: str): str =
     var out = ""
-    out = out + "assertion.recordCid=" + layout.fixedBytes32Hex(assertion.recordCid) + "\n"
-    out = out + "assertion.challengeNonce=" + layout.fixedBytes32Hex(assertion.challengeNonce) + "\n"
-    out = out + "assertion.commitA=" + layout.fixedBytes65Hex(assertion.commitA) + "\n"
-    out = out + "assertion.responseZ=" + layout.fixedBytes32Hex(assertion.responseZ) + "\n"
-    out = out + "assertion.proofCid=" + layout.fixedBytes32Hex(assertion.proofCid) + "\n"
-    return out
-
-fn v3MobileCapiBioDidProvisionAppendBase(out: var str,
-                                         outcome: bio_did.V3BioDidProvisionResult) =
-    out = out + "did=" + outcome.document.did + "\n"
-    out = out + "peerId=" + peer_id.v3Libp2pPeerIdText(outcome.identity.selfDevice.devicePeerId) + "\n"
-    out = out + "rootSeed=" + outcome.identity.rootSeed + "\n"
-    out = out + "deviceSeed=" + outcome.identity.deviceSeed + "\n"
-    out = out + "deviceLabelHex=" + v3MobileCapiTextHex(outcome.identity.selfDevice.deviceLabel) + "\n"
-    out = out + "documentTextHex=" + v3MobileCapiTextHex(outcome.bundle.documentText) + "\n"
-    out = out + "documentVersion=" + did.v3DidStoreWord64Hex(outcome.document.version) + "\n"
-    out = out + "bundleTextHex=" + v3MobileCapiTextHex(bio_did.v3BioDidChainBundleText(outcome.bundle)) + "\n"
-    out = out + "bundleAction=" + outcome.bundle.action + "\n"
-    out = out + "bundleSeq=" + strings.intToStr(outcome.bundle.bundleSeq) + "\n"
-    out = out + "bundleCid=" + layout.fixedBytes32Hex(outcome.bundle.bundleCid) + "\n"
-    out = out + "devicePeerId=" + peer_id.v3Libp2pPeerIdText(outcome.bundle.devicePeerId) + "\n"
-
-fn v3MobileCapiBioDidProvisionAppendHardware(out: var str,
-                                             outcome: bio_did.V3BioDidProvisionResult,
-                                             parsedAttestation: bio_did.V3BioDidParsedHardwareAttestation) =
-    out = out + "hardware.requestIdHex=" + v3MobileCapiTextHex(outcome.bundle.hardware.requestId) + "\n"
-    out = out + "hardware.sensorIdHex=" + v3MobileCapiTextHex(outcome.bundle.hardware.sensorId) + "\n"
-    out = out + "hardware.verifiedAt=" + did.v3DidStoreWord64Hex(outcome.bundle.hardware.verifiedAtEpochSeconds) + "\n"
-    out = out + "hardware.deviceBindingSeedHash=" + layout.fixedBytes32Hex(outcome.bundle.hardware.deviceBindingSeedHash) + "\n"
-    out = out + "hardware.attestationTextHex=" + v3MobileCapiTextHex(outcome.bundle.hardware.attestationText) + "\n"
-    out = out + "hardware.attestationCid=" + layout.fixedBytes32Hex(outcome.bundle.hardware.attestationCid) + "\n"
-    out = out + "hardware.bindingCid=" + layout.fixedBytes32Hex(outcome.bundle.hardware.bindingCid) + "\n"
-    out = out + "hardware.attestationVersion=" + strings.intToStr(parsedAttestation.version) + "\n"
-    out = out + "hardware.platform=" + strings.intToStr(parsedAttestation.platform) + "\n"
-    out = out + "hardware.attestationKind=" + strings.intToStr(parsedAttestation.attestationKind) + "\n"
-    out = out + "hardware.rootKeyIdHex=" + v3MobileCapiTextHex(parsedAttestation.rootKeyId) + "\n"
-    out = out + "hardware.certChainCid=" + layout.fixedBytes32Hex(parsedAttestation.certChainCid) + "\n"
-    out = out + "hardware.livenessCid=" + layout.fixedBytes32Hex(parsedAttestation.livenessCid) + "\n"
-
-fn v3MobileCapiBioDidProvisionAppendProof(out: var str,
-                                          outcome: bio_did.V3BioDidProvisionResult) =
-    out = out + v3MobileCapiBioDidRecordLines(outcome.bundle.record)
-    out = out + v3MobileCapiBioDidAssertionLines(outcome.bundle.assertion)
-
-fn v3MobileCapiBioDidProvisionJson(outcome: bio_did.V3BioDidProvisionResult): str =
-    var out = "ok=1\n"
-    v3MobileCapiBioDidProvisionAppendBase(out, outcome)
-    let parsedAttestationRes = bio_did.v3BioDidParseHardwareAttestation(outcome.bundle.hardware.attestationText)
-    if IsErr(parsedAttestationRes):
-        return v3MobileCapiBioDidErrorJson(Error(parsedAttestationRes))
-    let parsedAttestation = Value(parsedAttestationRes)
-    v3MobileCapiBioDidProvisionAppendHardware(out, outcome, parsedAttestation)
-    v3MobileCapiBioDidProvisionAppendProof(out, outcome)
+    out = did.v3DidStoreAppendLine(out, "ok", "1")
+    out = did.v3DidStoreAppendLine(out, "did", didText)
+    out = did.v3DidStoreAppendLine(out, "rootSeed", rootSeed)
+    out = did.v3DidStoreAppendLine(out, "deviceSeed", deviceSeed)
+    out = did.v3DidStoreAppendLine(out, "documentTextHex", v3MobileCapiTextHex(documentText))
+    out = did.v3DidStoreAppendLine(out, "bundleTextHex", v3MobileCapiTextHex(bundleText))
     return out
 
 fn v3MobileCapiBioDidSetTrustedAttestorRoot(pubKeyHex: str,
                                             rootKeyId: str): str =
     let setRes = bio_did.v3BioDidSetTrustedAttestorRootHex(pubKeyHex, rootKeyId)
     if IsErr(setRes):
-        return v3MobileCapiBioDidErrorJson(Error(setRes))
-    return "ok=1\n"
+        let errorText = v3MobileCapiBioDidErrorJson(Error(setRes))
+        return errorText
+    let out = "ok=1\n"
+    return out
 
 fn v3MobileCapiBioDidCreateRequestWire(requestId: str,
                                        feature32Hex: str,
@@ -226,12 +187,12 @@ fn v3MobileCapiBioDidCreateRequestWire(requestId: str,
                                        sensorId: str,
                                        hardwareAttestation: str): str =
     var out = ""
-    out = out + "request_id=" + v3MobileCapiTextHex(requestId) + "\n"
-    out = out + "feature32_hex=" + feature32Hex + "\n"
-    out = out + "device_binding_seed=" + v3MobileCapiTextHex(deviceBindingSeed) + "\n"
-    out = out + "device_label=" + v3MobileCapiTextHex(deviceLabel) + "\n"
-    out = out + "sensor_id=" + v3MobileCapiTextHex(sensorId) + "\n"
-    out = out + "hardware_attestation=" + v3MobileCapiTextHex(hardwareAttestation) + "\n"
+    out = did.v3DidStoreAppendLine(out, "request_id", v3MobileCapiTextHex(requestId))
+    out = did.v3DidStoreAppendLine(out, "feature32_hex", feature32Hex)
+    out = did.v3DidStoreAppendLine(out, "device_binding_seed", v3MobileCapiTextHex(deviceBindingSeed))
+    out = did.v3DidStoreAppendLine(out, "device_label", v3MobileCapiTextHex(deviceLabel))
+    out = did.v3DidStoreAppendLine(out, "sensor_id", v3MobileCapiTextHex(sensorId))
+    out = did.v3DidStoreAppendLine(out, "hardware_attestation", v3MobileCapiTextHex(hardwareAttestation))
     return out
 
 fn v3MobileCapiBioDidImportRequestWire(latestBundleText: str,
@@ -242,13 +203,14 @@ fn v3MobileCapiBioDidImportRequestWire(latestBundleText: str,
                                        sensorId: str,
                                        hardwareAttestation: str): str =
     var out = ""
-    out = out + "latest_bundle_text=" + v3MobileCapiTextHex(latestBundleText) + "\n"
-    out = out + v3MobileCapiBioDidCreateRequestWire(requestId,
-                                                    feature32Hex,
-                                                    deviceBindingSeed,
-                                                    deviceLabel,
-                                                    sensorId,
-                                                    hardwareAttestation)
+    out = did.v3DidStoreAppendLine(out, "latest_bundle_text", v3MobileCapiTextHex(latestBundleText))
+    let createWire = v3MobileCapiBioDidCreateRequestWire(requestId,
+                                                         feature32Hex,
+                                                         deviceBindingSeed,
+                                                         deviceLabel,
+                                                         sensorId,
+                                                         hardwareAttestation)
+    out = out + createWire
     return out
 
 fn v3MobileCapiBioDidCreate(requestId: str,
@@ -264,50 +226,169 @@ fn v3MobileCapiBioDidCreate(requestId: str,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return v3MobileCapiBioDidErrorJson(Error(captureRes))
-    let createRes = bio_did.v3BioDidCreateBundleWithHardwareCapture(Value(captureRes),
-                                                                    times.epochTimeSeconds())
-    if IsErr(createRes):
-        return v3MobileCapiBioDidErrorJson(Error(createRes))
-    return v3MobileCapiBioDidProvisionJson(Value(createRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(captureRes))
+        return errorText
+    let capture = Value(captureRes)
+    let epochSeconds = times.epochTimeSeconds()
+    let captureOk = bio_did.v3BioDidCaptureValidate(capture)
+    if IsErr(captureOk):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(captureOk))
+        return errorText
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(attestationOk))
+        return errorText
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(recordRes))
+        return errorText
+    let record = Value(recordRes)
+    let rootSecretRes = bio.v3BioRecoverRoot(capture.feature32, record.helper)
+    if IsErr(rootSecretRes):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(rootSecretRes))
+        return errorText
+    let rootSecret = Value(rootSecretRes)
+    let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
+    let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, epochSeconds)
+    var document = did.v3DidDocumentZero()
+    let documentRes = did.v3DidIdentityDocumentFill(document, identity)
+    if IsErr(documentRes):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(documentRes))
+        return errorText
+    let bundleSeq = 1
+    let challengeNonce = bio_did.v3BioDidChallengeNonce("create",
+                                                        document.did,
+                                                        identity.selfDevice.devicePeerId,
+                                                        document.version,
+                                                        bundleSeq)
+    let hardware = bio_did.v3BioDidHardwareAttestationMake(capture,
+                                                           "create",
+                                                           document.did,
+                                                           identity.selfDevice.devicePeerId,
+                                                           document.version,
+                                                           bundleSeq,
+                                                           challengeNonce,
+                                                           epochSeconds)
+    let assertionRes = bio.v3BioProve(capture.feature32, record, challengeNonce)
+    if IsErr(assertionRes):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(assertionRes))
+        return errorText
+    let assertion = Value(assertionRes)
+    let bundleRes = bio_did.v3BioDidChainBundleMake("create",
+                                                    bundleSeq,
+                                                    document,
+                                                    identity.selfDevice.devicePeerId,
+                                                    record,
+                                                    assertion,
+                                                    hardware)
+    if IsErr(bundleRes):
+        let errorText = v3MobileCapiBioDidErrorJson(Error(bundleRes))
+        return errorText
+    let bundle = Value(bundleRes)
+    let devicePeerIdText = peer_id.v3Libp2pPeerIdText(bundle.devicePeerId)
+    let bundleSeqText = strings.intToStr(bundle.bundleSeq)
+    let recordVersionText = strings.intToStr(bundle.record.version)
+    let recordHelperText = layout.fixedBytes32Hex(bundle.record.helper)
+    let recordPubKeyText = layout.fixedBytes65Hex(bundle.record.pubKey)
+    let recordCodeNText = strings.intToStr(bundle.record.codeN)
+    let recordCodeKText = strings.intToStr(bundle.record.codeK)
+    let recordMaxCorrectableText = strings.intToStr(bundle.record.maxCorrectable)
+    let recordCidText = layout.fixedBytes32Hex(bundle.record.recordCid)
+    let challengeNonceText = layout.fixedBytes32Hex(bundle.assertion.challengeNonce)
+    let assertionCommitAText = layout.fixedBytes65Hex(bundle.assertion.commitA)
+    let assertionResponseZText = layout.fixedBytes32Hex(bundle.assertion.responseZ)
+    let assertionProofCidText = layout.fixedBytes32Hex(bundle.assertion.proofCid)
+    let hardwareVersionText = strings.intToStr(bundle.hardware.version)
+    let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(bundle.hardware.verifiedAtEpochSeconds)
+    let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(bundle.hardware.deviceBindingSeedHash)
+    let hardwareAttestationCidText = layout.fixedBytes32Hex(bundle.hardware.attestationCid)
+    let hardwareBindingCidText = layout.fixedBytes32Hex(bundle.hardware.bindingCid)
+    var bundleText = ""
+    bundleText = did.v3DidStoreAppendLine(bundleText, "v3_bio_did_bundle_version", bio_did.v3BioDidBundleVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "action", bundle.action)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "bundle_seq", bundleSeqText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "did", document.did)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "device_peer_id", devicePeerIdText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "document_text", did.v3DidStoreEncodeText(bundle.documentText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_version", recordVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_helper", recordHelperText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_pub_key", recordPubKeyText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_n", recordCodeNText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_k", recordCodeKText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_max_correctable", recordMaxCorrectableText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_cid", recordCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "challenge_nonce", challengeNonceText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_commit_a", assertionCommitAText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_response_z", assertionResponseZText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_proof_cid", assertionProofCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_version", hardwareVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_request_id", did.v3DidStoreEncodeText(bundle.hardware.requestId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_sensor_id", did.v3DidStoreEncodeText(bundle.hardware.sensorId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_verified_at", hardwareVerifiedAtText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_device_binding_seed_hash", hardwareDeviceBindingSeedHashText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_text", did.v3DidStoreEncodeText(bundle.hardware.attestationText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_cid", hardwareAttestationCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_binding_cid", hardwareBindingCidText)
+    let out = v3MobileCapiBioDidProvisionJson(document.did,
+                                              identity.rootSeed,
+                                              identity.deviceSeed,
+                                              bundle.documentText,
+                                              bundleText)
+    return out
 
 fn v3MobileCapiBioDidCreateWire(requestWire: str): str =
     let requestIdRes = v3MobileCapiWireDecodedValue(requestWire, "request_id")
     if IsErr(requestIdRes):
-        return v3MobileCapiBioDidErrorJson(Error(requestIdRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(requestIdRes))
+        return errorText
     let feature32HexRes = v3MobileCapiWireFindValue(requestWire, "feature32_hex")
     if IsErr(feature32HexRes):
-        return v3MobileCapiBioDidErrorJson(Error(feature32HexRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(feature32HexRes))
+        return errorText
     let deviceBindingSeedRes = v3MobileCapiWireDecodedValue(requestWire, "device_binding_seed")
     if IsErr(deviceBindingSeedRes):
-        return v3MobileCapiBioDidErrorJson(Error(deviceBindingSeedRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(deviceBindingSeedRes))
+        return errorText
     let deviceLabelRes = v3MobileCapiWireDecodedValue(requestWire, "device_label")
     if IsErr(deviceLabelRes):
-        return v3MobileCapiBioDidErrorJson(Error(deviceLabelRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(deviceLabelRes))
+        return errorText
     let sensorIdRes = v3MobileCapiWireDecodedValue(requestWire, "sensor_id")
     if IsErr(sensorIdRes):
-        return v3MobileCapiBioDidErrorJson(Error(sensorIdRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(sensorIdRes))
+        return errorText
     let hardwareAttestationRes = v3MobileCapiWireDecodedValue(requestWire, "hardware_attestation")
     if IsErr(hardwareAttestationRes):
-        return v3MobileCapiBioDidErrorJson(Error(hardwareAttestationRes))
-    return v3MobileCapiBioDidCreate(Value(requestIdRes),
-                                    Value(feature32HexRes),
-                                    Value(deviceBindingSeedRes),
-                                    Value(deviceLabelRes),
-                                    Value(sensorIdRes),
-                                    Value(hardwareAttestationRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(hardwareAttestationRes))
+        return errorText
+    let out = v3MobileCapiBioDidCreate(Value(requestIdRes),
+                                       Value(feature32HexRes),
+                                       Value(deviceBindingSeedRes),
+                                       Value(deviceLabelRes),
+                                       Value(sensorIdRes),
+                                       Value(hardwareAttestationRes))
+    return out
 
 fn v3MobileCapiBioDidCreateWireHandle(requestWire: str): uint64 =
-    return v3MobileCapiTextBufferHandle(v3MobileCapiBioDidCreateWire(requestWire))
+    let out = v3MobileCapiBioDidCreateWire(requestWire)
+    let handle = v3MobileCapiTextBufferHandle(out)
+    return handle
 
 fn v3MobileCapiBioDidCreateWireCString(requestWire: str): ptr =
-    return v3MobileCapiTextCString(v3MobileCapiBioDidCreateWire(requestWire))
+    let out = v3MobileCapiBioDidCreateWire(requestWire)
+    let ctext = v3MobileCapiTextCString(out)
+    return ctext
 
 fn v3MobileCapiBioDidCreateWireHandleRaw(requestWireRaw: ptr): uint64 =
-    return v3MobileCapiBioDidCreateWireHandle(v3MobileCapiCopyRawText(requestWireRaw))
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let handle = v3MobileCapiBioDidCreateWireHandle(requestWire)
+    return handle
 
 fn v3MobileCapiBioDidCreateWireCStringRaw(requestWireRaw: ptr): ptr =
-    return v3MobileCapiBioDidCreateWireCString(v3MobileCapiCopyRawText(requestWireRaw))
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let ctext = v3MobileCapiBioDidCreateWireCString(requestWire)
+    return ctext
 
 fn v3MobileCapiBioDidCreateHandle(requestId: str,
                                   feature32Hex: str,
@@ -315,12 +396,14 @@ fn v3MobileCapiBioDidCreateHandle(requestId: str,
                                   deviceLabel: str,
                                   sensorId: str,
                                   hardwareAttestation: str): uint64 =
-    return v3MobileCapiTextBufferHandle(v3MobileCapiBioDidCreate(requestId,
-                                                                 feature32Hex,
-                                                                 deviceBindingSeed,
-                                                                 deviceLabel,
-                                                                 sensorId,
-                                                                 hardwareAttestation))
+    let out = v3MobileCapiBioDidCreate(requestId,
+                                       feature32Hex,
+                                       deviceBindingSeed,
+                                       deviceLabel,
+                                       sensorId,
+                                       hardwareAttestation)
+    let handle = v3MobileCapiTextBufferHandle(out)
+    return handle
 
 fn v3MobileCapiBioDidCreateCString(requestId: str,
                                    feature32Hex: str,
@@ -328,12 +411,14 @@ fn v3MobileCapiBioDidCreateCString(requestId: str,
                                    deviceLabel: str,
                                    sensorId: str,
                                    hardwareAttestation: str): ptr =
-    return v3MobileCapiTextCString(v3MobileCapiBioDidCreate(requestId,
-                                                            feature32Hex,
-                                                            deviceBindingSeed,
-                                                            deviceLabel,
-                                                            sensorId,
-                                                            hardwareAttestation))
+    let out = v3MobileCapiBioDidCreate(requestId,
+                                       feature32Hex,
+                                       deviceBindingSeed,
+                                       deviceLabel,
+                                       sensorId,
+                                       hardwareAttestation)
+    let ctext = v3MobileCapiTextCString(out)
+    return ctext
 
 fn v3MobileCapiBioDidCreateHandleRaw(requestIdRaw: ptr,
                                      feature32HexRaw: ptr,
@@ -341,12 +426,19 @@ fn v3MobileCapiBioDidCreateHandleRaw(requestIdRaw: ptr,
                                      deviceLabelRaw: ptr,
                                      sensorIdRaw: ptr,
                                      hardwareAttestationRaw: ptr): uint64 =
-    return v3MobileCapiBioDidCreateHandle(v3MobileCapiCopyRawText(requestIdRaw),
-                                          v3MobileCapiCopyRawText(feature32HexRaw),
-                                          v3MobileCapiCopyRawText(deviceBindingSeedRaw),
-                                          v3MobileCapiCopyRawText(deviceLabelRaw),
-                                          v3MobileCapiCopyRawText(sensorIdRaw),
-                                          v3MobileCapiCopyRawText(hardwareAttestationRaw))
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let handle = v3MobileCapiBioDidCreateHandle(requestId,
+                                                feature32Hex,
+                                                deviceBindingSeed,
+                                                deviceLabel,
+                                                sensorId,
+                                                hardwareAttestation)
+    return handle
 
 fn v3MobileCapiBioDidCreateCStringRaw(requestIdRaw: ptr,
                                       feature32HexRaw: ptr,
@@ -354,12 +446,375 @@ fn v3MobileCapiBioDidCreateCStringRaw(requestIdRaw: ptr,
                                       deviceLabelRaw: ptr,
                                       sensorIdRaw: ptr,
                                       hardwareAttestationRaw: ptr): ptr =
-    return v3MobileCapiBioDidCreateCString(v3MobileCapiCopyRawText(requestIdRaw),
-                                           v3MobileCapiCopyRawText(feature32HexRaw),
-                                           v3MobileCapiCopyRawText(deviceBindingSeedRaw),
-                                           v3MobileCapiCopyRawText(deviceLabelRaw),
-                                           v3MobileCapiCopyRawText(sensorIdRaw),
-                                           v3MobileCapiCopyRawText(hardwareAttestationRaw))
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let ctext = v3MobileCapiBioDidCreateCString(requestId,
+                                                feature32Hex,
+                                                deviceBindingSeed,
+                                                deviceLabel,
+                                                sensorId,
+                                                hardwareAttestation)
+    return ctext
+
+fn v3MobileCapiBioDidCreateIdentityFieldsCStringRaw(requestIdRaw: ptr,
+                                                    feature32HexRaw: ptr,
+                                                    deviceBindingSeedRaw: ptr,
+                                                    deviceLabelRaw: ptr,
+                                                    sensorIdRaw: ptr,
+                                                    hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString("")
+    let createRes = bio_did.v3BioDidCreateBundleWithHardwareCapture(Value(captureRes),
+                                                                    times.epochTimeSeconds())
+    if IsErr(createRes):
+        return v3MobileCapiTextCString("")
+    let outcome = Value(createRes)
+    var out = ""
+    out = did.v3DidStoreAppendLine(out, "did", outcome.document.did)
+    out = did.v3DidStoreAppendLine(out, "rootSeed", outcome.identity.rootSeed)
+    out = did.v3DidStoreAppendLine(out, "deviceSeed", outcome.identity.deviceSeed)
+    return v3MobileCapiTextCString(out)
+
+fn v3MobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
+                                            feature32HexRaw: ptr,
+                                            deviceBindingSeedRaw: ptr,
+                                            deviceLabelRaw: ptr,
+                                            sensorIdRaw: ptr,
+                                            hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString("")
+    let createRes = bio_did.v3BioDidCreateBundleWithHardwareCapture(Value(captureRes),
+                                                                    times.epochTimeSeconds())
+    if IsErr(createRes):
+        return v3MobileCapiTextCString("")
+    let outcome = Value(createRes)
+    let devicePeerIdText = peer_id.v3Libp2pPeerIdText(outcome.bundle.devicePeerId)
+    let bundleSeqText = strings.intToStr(outcome.bundle.bundleSeq)
+    let recordVersionText = strings.intToStr(outcome.bundle.record.version)
+    let recordHelperText = layout.fixedBytes32Hex(outcome.bundle.record.helper)
+    let recordPubKeyText = layout.fixedBytes65Hex(outcome.bundle.record.pubKey)
+    let recordCodeNText = strings.intToStr(outcome.bundle.record.codeN)
+    let recordCodeKText = strings.intToStr(outcome.bundle.record.codeK)
+    let recordMaxCorrectableText = strings.intToStr(outcome.bundle.record.maxCorrectable)
+    let recordCidText = layout.fixedBytes32Hex(outcome.bundle.record.recordCid)
+    let challengeNonceText = layout.fixedBytes32Hex(outcome.bundle.assertion.challengeNonce)
+    let assertionCommitAText = layout.fixedBytes65Hex(outcome.bundle.assertion.commitA)
+    let assertionResponseZText = layout.fixedBytes32Hex(outcome.bundle.assertion.responseZ)
+    let assertionProofCidText = layout.fixedBytes32Hex(outcome.bundle.assertion.proofCid)
+    let hardwareVersionText = strings.intToStr(outcome.bundle.hardware.version)
+    let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(outcome.bundle.hardware.verifiedAtEpochSeconds)
+    let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(outcome.bundle.hardware.deviceBindingSeedHash)
+    let hardwareAttestationCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.attestationCid)
+    let hardwareBindingCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.bindingCid)
+    var bundleText = ""
+    bundleText = did.v3DidStoreAppendLine(bundleText, "v3_bio_did_bundle_version", bio_did.v3BioDidBundleVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "action", outcome.bundle.action)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "bundle_seq", bundleSeqText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "did", outcome.document.did)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "device_peer_id", devicePeerIdText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "document_text", did.v3DidStoreEncodeText(outcome.bundle.documentText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_version", recordVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_helper", recordHelperText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_pub_key", recordPubKeyText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_n", recordCodeNText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_k", recordCodeKText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_max_correctable", recordMaxCorrectableText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_cid", recordCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "challenge_nonce", challengeNonceText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_commit_a", assertionCommitAText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_response_z", assertionResponseZText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_proof_cid", assertionProofCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_version", hardwareVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_request_id", did.v3DidStoreEncodeText(outcome.bundle.hardware.requestId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_sensor_id", did.v3DidStoreEncodeText(outcome.bundle.hardware.sensorId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_verified_at", hardwareVerifiedAtText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_device_binding_seed_hash", hardwareDeviceBindingSeedHashText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_text", did.v3DidStoreEncodeText(outcome.bundle.hardware.attestationText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_cid", hardwareAttestationCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_binding_cid", hardwareBindingCidText)
+    return v3MobileCapiTextCString(bundleText)
+
+fn v3MobileCapiBioDidDiagOkCString(stage: str): ptr =
+    var out = ""
+    out = did.v3DidStoreAppendLine(out, "ok", "1")
+    out = did.v3DidStoreAppendLine(out, "stage", stage)
+    return v3MobileCapiTextCString(out)
+
+fn v3MobileCapiBioDidCreateDiagCaptureCStringRaw(requestIdRaw: ptr,
+                                                 feature32HexRaw: ptr,
+                                                 deviceBindingSeedRaw: ptr,
+                                                 deviceLabelRaw: ptr,
+                                                 sensorIdRaw: ptr,
+                                                 hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    return v3MobileCapiBioDidDiagOkCString("capture")
+
+fn v3MobileCapiBioDidCreateDiagEnrollCStringRaw(requestIdRaw: ptr,
+                                                feature32HexRaw: ptr,
+                                                deviceBindingSeedRaw: ptr,
+                                                deviceLabelRaw: ptr,
+                                                sensorIdRaw: ptr,
+                                                hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    let capture = Value(captureRes)
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(attestationOk)))
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(recordRes)))
+    return v3MobileCapiBioDidDiagOkCString("enroll")
+
+fn v3MobileCapiBioDidCreateDiagRecoverCStringRaw(requestIdRaw: ptr,
+                                                 feature32HexRaw: ptr,
+                                                 deviceBindingSeedRaw: ptr,
+                                                 deviceLabelRaw: ptr,
+                                                 sensorIdRaw: ptr,
+                                                 hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    let capture = Value(captureRes)
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(attestationOk)))
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(recordRes)))
+    let rootSecretRes = bio.v3BioRecoverRoot(capture.feature32, Value(recordRes).helper)
+    if IsErr(rootSecretRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+    return v3MobileCapiBioDidDiagOkCString("recover")
+
+fn v3MobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
+                                                  feature32HexRaw: ptr,
+                                                  deviceBindingSeedRaw: ptr,
+                                                  deviceLabelRaw: ptr,
+                                                  sensorIdRaw: ptr,
+                                                  hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    let capture = Value(captureRes)
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(attestationOk)))
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(recordRes)))
+    let rootSecretRes = bio.v3BioRecoverRoot(capture.feature32, Value(recordRes).helper)
+    if IsErr(rootSecretRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+    let rootSecret = Value(rootSecretRes)
+    let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
+    let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    var document = did.v3DidDocumentZero()
+    let documentRes = did.v3DidIdentityDocumentFill(document, identity)
+    if IsErr(documentRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(documentRes)))
+    return v3MobileCapiBioDidDiagOkCString("identity")
+
+fn v3MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
+                                                   feature32HexRaw: ptr,
+                                                   deviceBindingSeedRaw: ptr,
+                                                   deviceLabelRaw: ptr,
+                                                   sensorIdRaw: ptr,
+                                                   hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    let capture = Value(captureRes)
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(attestationOk)))
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(recordRes)))
+    let record = Value(recordRes)
+    let rootSecretRes = bio.v3BioRecoverRoot(capture.feature32, record.helper)
+    if IsErr(rootSecretRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+    let rootSecret = Value(rootSecretRes)
+    let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
+    let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    var document = did.v3DidDocumentZero()
+    let documentRes = did.v3DidIdentityDocumentFill(document, identity)
+    if IsErr(documentRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(documentRes)))
+    let bundleSeq = 1
+    let challengeNonce = bio_did.v3BioDidChallengeNonce("create",
+                                                        document.did,
+                                                        identity.selfDevice.devicePeerId,
+                                                        document.version,
+                                                        bundleSeq)
+    let hardware = bio_did.v3BioDidHardwareAttestationMake(capture,
+                                                           "create",
+                                                           document.did,
+                                                           identity.selfDevice.devicePeerId,
+                                                           document.version,
+                                                           bundleSeq,
+                                                           challengeNonce,
+                                                           times.epochTimeSeconds())
+    let assertionRes = bio.v3BioProve(capture.feature32, record, challengeNonce)
+    if IsErr(assertionRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(assertionRes)))
+    return v3MobileCapiBioDidDiagOkCString("assertion")
+
+fn v3MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
+                                                feature32HexRaw: ptr,
+                                                deviceBindingSeedRaw: ptr,
+                                                deviceLabelRaw: ptr,
+                                                sensorIdRaw: ptr,
+                                                hardwareAttestationRaw: ptr): ptr =
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let captureRes = v3MobileCapiBioDidCapture(requestId,
+                                               feature32Hex,
+                                               deviceBindingSeed,
+                                               deviceLabel,
+                                               sensorId,
+                                               hardwareAttestation)
+    if IsErr(captureRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(captureRes)))
+    let capture = Value(captureRes)
+    let attestationOk = bio_did.v3BioDidCaptureAttestationValidate(capture, "create")
+    if IsErr(attestationOk):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(attestationOk)))
+    let recordRes = bio.v3BioEnroll(capture.feature32)
+    if IsErr(recordRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(recordRes)))
+    let record = Value(recordRes)
+    let rootSecretRes = bio.v3BioRecoverRoot(capture.feature32, record.helper)
+    if IsErr(rootSecretRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(rootSecretRes)))
+    let rootSecret = Value(rootSecretRes)
+    let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
+    let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    var document = did.v3DidDocumentZero()
+    let documentRes = did.v3DidIdentityDocumentFill(document, identity)
+    if IsErr(documentRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(documentRes)))
+    let bundleSeq = 1
+    let challengeNonce = bio_did.v3BioDidChallengeNonce("create",
+                                                        document.did,
+                                                        identity.selfDevice.devicePeerId,
+                                                        document.version,
+                                                        bundleSeq)
+    let hardware = bio_did.v3BioDidHardwareAttestationMake(capture,
+                                                           "create",
+                                                           document.did,
+                                                           identity.selfDevice.devicePeerId,
+                                                           document.version,
+                                                           bundleSeq,
+                                                           challengeNonce,
+                                                           times.epochTimeSeconds())
+    let assertionRes = bio.v3BioProve(capture.feature32, record, challengeNonce)
+    if IsErr(assertionRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(assertionRes)))
+    let bundleRes = bio_did.v3BioDidChainBundleMake("create",
+                                                    bundleSeq,
+                                                    document,
+                                                    identity.selfDevice.devicePeerId,
+                                                    record,
+                                                    Value(assertionRes),
+                                                    hardware)
+    if IsErr(bundleRes):
+        return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(bundleRes)))
+    return v3MobileCapiBioDidDiagOkCString("bundle")
 
 fn v3MobileCapiBioDidImport(latestBundleText: str,
                             requestId: str,
@@ -370,7 +825,8 @@ fn v3MobileCapiBioDidImport(latestBundleText: str,
                             hardwareAttestation: str): str =
     let latestBundleRes = bio_did.v3BioDidChainBundleParseText(latestBundleText)
     if IsErr(latestBundleRes):
-        return v3MobileCapiBioDidErrorJson(Error(latestBundleRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(latestBundleRes))
+        return errorText
     let captureRes = v3MobileCapiBioDidCapture(requestId,
                                                feature32Hex,
                                                deviceBindingSeed,
@@ -378,55 +834,123 @@ fn v3MobileCapiBioDidImport(latestBundleText: str,
                                                sensorId,
                                                hardwareAttestation)
     if IsErr(captureRes):
-        return v3MobileCapiBioDidErrorJson(Error(captureRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(captureRes))
+        return errorText
     let importRes = bio_did.v3BioDidImportFromLatestBundleWithHardwareCapture(Value(latestBundleRes),
                                                                               Value(captureRes),
                                                                               times.epochTimeSeconds())
     if IsErr(importRes):
-        return v3MobileCapiBioDidErrorJson(Error(importRes))
-    return v3MobileCapiBioDidProvisionJson(Value(importRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(importRes))
+        return errorText
+    let outcome = Value(importRes)
+    let devicePeerIdText = peer_id.v3Libp2pPeerIdText(outcome.bundle.devicePeerId)
+    let bundleSeqText = strings.intToStr(outcome.bundle.bundleSeq)
+    let recordVersionText = strings.intToStr(outcome.bundle.record.version)
+    let recordHelperText = layout.fixedBytes32Hex(outcome.bundle.record.helper)
+    let recordPubKeyText = layout.fixedBytes65Hex(outcome.bundle.record.pubKey)
+    let recordCodeNText = strings.intToStr(outcome.bundle.record.codeN)
+    let recordCodeKText = strings.intToStr(outcome.bundle.record.codeK)
+    let recordMaxCorrectableText = strings.intToStr(outcome.bundle.record.maxCorrectable)
+    let recordCidText = layout.fixedBytes32Hex(outcome.bundle.record.recordCid)
+    let challengeNonceText = layout.fixedBytes32Hex(outcome.bundle.assertion.challengeNonce)
+    let assertionCommitAText = layout.fixedBytes65Hex(outcome.bundle.assertion.commitA)
+    let assertionResponseZText = layout.fixedBytes32Hex(outcome.bundle.assertion.responseZ)
+    let assertionProofCidText = layout.fixedBytes32Hex(outcome.bundle.assertion.proofCid)
+    let hardwareVersionText = strings.intToStr(outcome.bundle.hardware.version)
+    let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(outcome.bundle.hardware.verifiedAtEpochSeconds)
+    let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(outcome.bundle.hardware.deviceBindingSeedHash)
+    let hardwareAttestationCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.attestationCid)
+    let hardwareBindingCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.bindingCid)
+    var bundleText = ""
+    bundleText = did.v3DidStoreAppendLine(bundleText, "v3_bio_did_bundle_version", bio_did.v3BioDidBundleVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "action", outcome.bundle.action)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "bundle_seq", bundleSeqText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "did", outcome.document.did)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "device_peer_id", devicePeerIdText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "document_text", did.v3DidStoreEncodeText(outcome.bundle.documentText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_version", recordVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_helper", recordHelperText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_pub_key", recordPubKeyText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_n", recordCodeNText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_code_k", recordCodeKText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_max_correctable", recordMaxCorrectableText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "record_cid", recordCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "challenge_nonce", challengeNonceText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_commit_a", assertionCommitAText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_response_z", assertionResponseZText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "assert_proof_cid", assertionProofCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_version", hardwareVersionText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_request_id", did.v3DidStoreEncodeText(outcome.bundle.hardware.requestId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_sensor_id", did.v3DidStoreEncodeText(outcome.bundle.hardware.sensorId))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_verified_at", hardwareVerifiedAtText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_device_binding_seed_hash", hardwareDeviceBindingSeedHashText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_text", did.v3DidStoreEncodeText(outcome.bundle.hardware.attestationText))
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_attestation_cid", hardwareAttestationCidText)
+    bundleText = did.v3DidStoreAppendLine(bundleText, "hardware_binding_cid", hardwareBindingCidText)
+    let out = v3MobileCapiBioDidProvisionJson(outcome.document.did,
+                                              outcome.identity.rootSeed,
+                                              outcome.identity.deviceSeed,
+                                              outcome.bundle.documentText,
+                                              bundleText)
+    return out
 
 fn v3MobileCapiBioDidImportWire(requestWire: str): str =
     let latestBundleTextRes = v3MobileCapiWireDecodedValue(requestWire, "latest_bundle_text")
     if IsErr(latestBundleTextRes):
-        return v3MobileCapiBioDidErrorJson(Error(latestBundleTextRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(latestBundleTextRes))
+        return errorText
     let requestIdRes = v3MobileCapiWireDecodedValue(requestWire, "request_id")
     if IsErr(requestIdRes):
-        return v3MobileCapiBioDidErrorJson(Error(requestIdRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(requestIdRes))
+        return errorText
     let feature32HexRes = v3MobileCapiWireFindValue(requestWire, "feature32_hex")
     if IsErr(feature32HexRes):
-        return v3MobileCapiBioDidErrorJson(Error(feature32HexRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(feature32HexRes))
+        return errorText
     let deviceBindingSeedRes = v3MobileCapiWireDecodedValue(requestWire, "device_binding_seed")
     if IsErr(deviceBindingSeedRes):
-        return v3MobileCapiBioDidErrorJson(Error(deviceBindingSeedRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(deviceBindingSeedRes))
+        return errorText
     let deviceLabelRes = v3MobileCapiWireDecodedValue(requestWire, "device_label")
     if IsErr(deviceLabelRes):
-        return v3MobileCapiBioDidErrorJson(Error(deviceLabelRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(deviceLabelRes))
+        return errorText
     let sensorIdRes = v3MobileCapiWireDecodedValue(requestWire, "sensor_id")
     if IsErr(sensorIdRes):
-        return v3MobileCapiBioDidErrorJson(Error(sensorIdRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(sensorIdRes))
+        return errorText
     let hardwareAttestationRes = v3MobileCapiWireDecodedValue(requestWire, "hardware_attestation")
     if IsErr(hardwareAttestationRes):
-        return v3MobileCapiBioDidErrorJson(Error(hardwareAttestationRes))
-    return v3MobileCapiBioDidImport(Value(latestBundleTextRes),
-                                    Value(requestIdRes),
-                                    Value(feature32HexRes),
-                                    Value(deviceBindingSeedRes),
-                                    Value(deviceLabelRes),
-                                    Value(sensorIdRes),
-                                    Value(hardwareAttestationRes))
+        let errorText = v3MobileCapiBioDidErrorJson(Error(hardwareAttestationRes))
+        return errorText
+    let out = v3MobileCapiBioDidImport(Value(latestBundleTextRes),
+                                       Value(requestIdRes),
+                                       Value(feature32HexRes),
+                                       Value(deviceBindingSeedRes),
+                                       Value(deviceLabelRes),
+                                       Value(sensorIdRes),
+                                       Value(hardwareAttestationRes))
+    return out
 
 fn v3MobileCapiBioDidImportWireHandle(requestWire: str): uint64 =
-    return v3MobileCapiTextBufferHandle(v3MobileCapiBioDidImportWire(requestWire))
+    let out = v3MobileCapiBioDidImportWire(requestWire)
+    let handle = v3MobileCapiTextBufferHandle(out)
+    return handle
 
 fn v3MobileCapiBioDidImportWireCString(requestWire: str): ptr =
-    return v3MobileCapiTextCString(v3MobileCapiBioDidImportWire(requestWire))
+    let out = v3MobileCapiBioDidImportWire(requestWire)
+    let ctext = v3MobileCapiTextCString(out)
+    return ctext
 
 fn v3MobileCapiBioDidImportWireHandleRaw(requestWireRaw: ptr): uint64 =
-    return v3MobileCapiBioDidImportWireHandle(v3MobileCapiCopyRawText(requestWireRaw))
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let handle = v3MobileCapiBioDidImportWireHandle(requestWire)
+    return handle
 
 fn v3MobileCapiBioDidImportWireCStringRaw(requestWireRaw: ptr): ptr =
-    return v3MobileCapiBioDidImportWireCString(v3MobileCapiCopyRawText(requestWireRaw))
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let ctext = v3MobileCapiBioDidImportWireCString(requestWire)
+    return ctext
 
 fn v3MobileCapiBioDidImportHandle(latestBundleText: str,
                                   requestId: str,
@@ -435,13 +959,15 @@ fn v3MobileCapiBioDidImportHandle(latestBundleText: str,
                                   deviceLabel: str,
                                   sensorId: str,
                                   hardwareAttestation: str): uint64 =
-    return v3MobileCapiTextBufferHandle(v3MobileCapiBioDidImport(latestBundleText,
-                                                                 requestId,
-                                                                 feature32Hex,
-                                                                 deviceBindingSeed,
-                                                                 deviceLabel,
-                                                                 sensorId,
-                                                                 hardwareAttestation))
+    let out = v3MobileCapiBioDidImport(latestBundleText,
+                                       requestId,
+                                       feature32Hex,
+                                       deviceBindingSeed,
+                                       deviceLabel,
+                                       sensorId,
+                                       hardwareAttestation)
+    let handle = v3MobileCapiTextBufferHandle(out)
+    return handle
 
 fn v3MobileCapiBioDidImportCString(latestBundleText: str,
                                    requestId: str,
@@ -450,13 +976,15 @@ fn v3MobileCapiBioDidImportCString(latestBundleText: str,
                                    deviceLabel: str,
                                    sensorId: str,
                                    hardwareAttestation: str): ptr =
-    return v3MobileCapiTextCString(v3MobileCapiBioDidImport(latestBundleText,
-                                                            requestId,
-                                                            feature32Hex,
-                                                            deviceBindingSeed,
-                                                            deviceLabel,
-                                                            sensorId,
-                                                            hardwareAttestation))
+    let out = v3MobileCapiBioDidImport(latestBundleText,
+                                       requestId,
+                                       feature32Hex,
+                                       deviceBindingSeed,
+                                       deviceLabel,
+                                       sensorId,
+                                       hardwareAttestation)
+    let ctext = v3MobileCapiTextCString(out)
+    return ctext
 
 fn v3MobileCapiBioDidImportHandleRaw(latestBundleTextRaw: ptr,
                                      requestIdRaw: ptr,
@@ -465,13 +993,21 @@ fn v3MobileCapiBioDidImportHandleRaw(latestBundleTextRaw: ptr,
                                      deviceLabelRaw: ptr,
                                      sensorIdRaw: ptr,
                                      hardwareAttestationRaw: ptr): uint64 =
-    return v3MobileCapiBioDidImportHandle(v3MobileCapiCopyRawText(latestBundleTextRaw),
-                                          v3MobileCapiCopyRawText(requestIdRaw),
-                                          v3MobileCapiCopyRawText(feature32HexRaw),
-                                          v3MobileCapiCopyRawText(deviceBindingSeedRaw),
-                                          v3MobileCapiCopyRawText(deviceLabelRaw),
-                                          v3MobileCapiCopyRawText(sensorIdRaw),
-                                          v3MobileCapiCopyRawText(hardwareAttestationRaw))
+    let latestBundleText = v3MobileCapiCopyRawText(latestBundleTextRaw)
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let handle = v3MobileCapiBioDidImportHandle(latestBundleText,
+                                                requestId,
+                                                feature32Hex,
+                                                deviceBindingSeed,
+                                                deviceLabel,
+                                                sensorId,
+                                                hardwareAttestation)
+    return handle
 
 fn v3MobileCapiBioDidImportCStringRaw(latestBundleTextRaw: ptr,
                                       requestIdRaw: ptr,
@@ -480,10 +1016,18 @@ fn v3MobileCapiBioDidImportCStringRaw(latestBundleTextRaw: ptr,
                                       deviceLabelRaw: ptr,
                                       sensorIdRaw: ptr,
                                       hardwareAttestationRaw: ptr): ptr =
-    return v3MobileCapiBioDidImportCString(v3MobileCapiCopyRawText(latestBundleTextRaw),
-                                           v3MobileCapiCopyRawText(requestIdRaw),
-                                           v3MobileCapiCopyRawText(feature32HexRaw),
-                                           v3MobileCapiCopyRawText(deviceBindingSeedRaw),
-                                           v3MobileCapiCopyRawText(deviceLabelRaw),
-                                           v3MobileCapiCopyRawText(sensorIdRaw),
-                                           v3MobileCapiCopyRawText(hardwareAttestationRaw))
+    let latestBundleText = v3MobileCapiCopyRawText(latestBundleTextRaw)
+    let requestId = v3MobileCapiCopyRawText(requestIdRaw)
+    let feature32Hex = v3MobileCapiCopyRawText(feature32HexRaw)
+    let deviceBindingSeed = v3MobileCapiCopyRawText(deviceBindingSeedRaw)
+    let deviceLabel = v3MobileCapiCopyRawText(deviceLabelRaw)
+    let sensorId = v3MobileCapiCopyRawText(sensorIdRaw)
+    let hardwareAttestation = v3MobileCapiCopyRawText(hardwareAttestationRaw)
+    let ctext = v3MobileCapiBioDidImportCString(latestBundleText,
+                                                requestId,
+                                                feature32Hex,
+                                                deviceBindingSeed,
+                                                deviceLabel,
+                                                sensorId,
+                                                hardwareAttestation)
+    return ctext

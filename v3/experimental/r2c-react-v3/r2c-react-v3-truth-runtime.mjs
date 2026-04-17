@@ -13,7 +13,7 @@ function parseArgs(argv) {
     width: 360,
     height: 800,
     truthFlag: '1',
-    debugPort: 9223,
+    debugPort: 0,
     waitMs: 20000,
     summaryOut: '',
   }
@@ -75,6 +75,54 @@ async function waitForTarget(port, baseUrl, waitMs) {
   throw new Error('cdp_target_not_found')
 }
 
+async function waitForDevToolsPort(userDataDir, chromeProc, waitMs, chromeStderrRef) {
+  const deadline = Date.now() + waitMs
+  const activePortPath = path.join(userDataDir, 'DevToolsActivePort')
+  while (Date.now() < deadline) {
+    if (chromeProc.exitCode !== null) {
+      const extra = chromeStderrRef.value ? ` ${chromeStderrRef.value}` : ''
+      throw new Error(`chrome_exited_before_devtools${extra}`.trim())
+    }
+    try {
+      const raw = fs.readFileSync(activePortPath, 'utf8')
+      const lines = raw.split(/\r?\n/)
+      const parsed = Number(lines[0] || 0)
+      if (parsed > 0) return parsed
+    } catch {
+    }
+    await sleep(100)
+  }
+  const extra = chromeStderrRef.value ? ` ${chromeStderrRef.value}` : ''
+  throw new Error(`devtools_active_port_missing${extra}`.trim())
+}
+
+async function waitForProcessExit(proc, waitMs) {
+  if (proc.exitCode !== null) return true
+  const exitPromise = new Promise((resolve) => {
+    proc.once('exit', () => resolve(true))
+  })
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => resolve(false), waitMs)
+  })
+  return await Promise.race([exitPromise, timeoutPromise])
+}
+
+async function shutdownChrome(proc) {
+  if (proc.exitCode !== null) return
+  try {
+    proc.kill('SIGTERM')
+  } catch {
+  }
+  const exited = await waitForProcessExit(proc, 1500)
+  if (exited) return
+  if (proc.exitCode !== null) return
+  try {
+    proc.kill('SIGKILL')
+  } catch {
+  }
+  await waitForProcessExit(proc, 1500)
+}
+
 async function captureRuntime(args) {
   if (!args.route) throw new Error('missing --route')
   if (!args.outDir) throw new Error('missing --out-dir')
@@ -84,7 +132,7 @@ async function captureRuntime(args) {
   const url = buildUrl(args.baseUrl, args.route, args.truthFlag)
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'r2c-truth-runtime-'))
   const chromeProc = spawn(args.chrome, [
-    `--remote-debugging-port=${args.debugPort}`,
+    `--remote-debugging-port=${args.debugPort > 0 ? args.debugPort : 0}`,
     '--headless=new',
     '--disable-gpu',
     '--hide-scrollbars',
@@ -94,13 +142,18 @@ async function captureRuntime(args) {
     url,
   ], { stdio: ['ignore', 'ignore', 'pipe'] })
   let chromeStderr = ''
+  const chromeStderrRef = { value: '' }
   chromeProc.stderr.on('data', (chunk) => {
     chromeStderr += chunk.toString()
+    chromeStderrRef.value = chromeStderr
   })
 
   let ws = null
   try {
-    const target = await waitForTarget(args.debugPort, args.baseUrl, args.waitMs)
+    const debugPort = args.debugPort > 0
+      ? args.debugPort
+      : await waitForDevToolsPort(userDataDir, chromeProc, args.waitMs, chromeStderrRef)
+    const target = await waitForTarget(debugPort, args.baseUrl, args.waitMs)
     ws = new WebSocket(target.webSocketDebuggerUrl)
     let seq = 0
     const pending = new Map()
@@ -128,6 +181,7 @@ async function captureRuntime(args) {
     let runtimeState = null
     let domHtml = ''
     let semanticNodeCount = 0
+    let semanticNodesDoc = null
     let documentNodeCount = 0
     let locationDoc = null
     const deadline = Date.now() + args.waitMs
@@ -152,6 +206,59 @@ async function captureRuntime(args) {
         if (semanticNodeCount < 0) {
           throw new Error('missing_root_container')
         }
+        const semanticNodesRes = await call('Runtime.evaluate', {
+          expression: `(() => {
+            const root = document.getElementById("root");
+            if (!root) return "";
+            const preview = (text, maxLen) => {
+              const normalized = String(text || "").replace(/\\s+/g, " ").trim();
+              if (!normalized) return "";
+              return normalized.length > maxLen ? normalized.slice(0, maxLen) : normalized;
+            };
+            const classPreview = (element) => {
+              const raw = String(element.getAttribute("class") || "").trim();
+              if (!raw) return "";
+              return raw.split(/\\s+/).filter(Boolean).slice(0, 3).join(" ");
+            };
+            const makeLabel = (tag, classText) => {
+              if (!classText) return "<" + tag + ">";
+              return "<" + tag + "> ." + classText.split(/\\s+/).join(".");
+            };
+            const nodes = [];
+            const walk = (element, depth, pathText) => {
+              if (!(element instanceof Element)) return;
+              const tag = String(element.tagName || "").toLowerCase();
+              const classes = classPreview(element);
+              nodes.push({
+                kind: "element",
+                tag,
+                depth,
+                path: pathText,
+                classPreview: classes,
+                textPreview: preview(element.textContent || "", 96),
+                label: makeLabel(tag, classes),
+              });
+              const children = Array.from(element.children || []);
+              for (let index = 0; index < children.length; index += 1) {
+                walk(children[index], depth + 1, pathText + "." + String(index));
+              }
+            };
+            walk(root, 0, "0");
+            return JSON.stringify({
+              format: "semantic_dom_nodes_v1",
+              route_state: ${JSON.stringify(args.route)},
+              node_count: nodes.length,
+              source: "dom_root_elements_v1",
+              nodes,
+            });
+          })()`,
+          returnByValue: true,
+        })
+        const semanticNodesText = semanticNodesRes?.result?.value
+        semanticNodesDoc = semanticNodesText ? JSON.parse(semanticNodesText) : null
+        if (!semanticNodesDoc || Number(semanticNodesDoc.node_count || 0) !== semanticNodeCount) {
+          throw new Error('semantic_dom_nodes_missing')
+        }
         const documentCountRes = await call('Runtime.evaluate', {
           expression: 'document.querySelectorAll(\"*\").length',
           returnByValue: true,
@@ -173,10 +280,47 @@ async function captureRuntime(args) {
     const runtimeStatePath = path.join(args.outDir, `${args.route}.runtime_state.json`)
     const domPath = path.join(args.outDir, `${args.route}.dom.html`)
     const metaPath = path.join(args.outDir, `${args.route}.runtime_meta.json`)
+    const truthTracePath = path.join(args.outDir, `${args.route}.truth_trace_v2.json`)
+    const semanticNodesPath = path.join(args.outDir, `${args.route}.semantic_dom_nodes_v1.json`)
     const crypto = await import('node:crypto')
     const domHash = crypto.createHash('sha256').update(domHtml, 'utf8').digest('hex')
+    const locationDocResolved = locationDoc || { pathname: '/', search: '', hash: '' }
+    const timestampMs = Date.now()
+    const capturedAt = new Date(timestampMs).toISOString()
+    const truthTraceDoc = {
+      format: 'truth_trace_v2',
+      traceId: `capture_truth_${args.route}`,
+      platform: 'browser_chrome_headless',
+      capturedAt,
+      sourceRoot: args.baseUrl,
+      states: [args.route],
+      snapshots: [
+        {
+          stateId: args.route,
+          route: {
+            routeId: args.route,
+            pathname: String(locationDocResolved.pathname || '/'),
+            search: String(locationDocResolved.search || ''),
+            hash: String(locationDocResolved.hash || ''),
+            width: args.width,
+            height: args.height,
+          },
+          domPath,
+          domHash,
+          runtimeStatePath,
+          semanticNodesPath,
+          semanticNodesCount: semanticNodeCount,
+          renderReady: true,
+          storage: [],
+          hostEvents: [],
+          timestampMs,
+        },
+      ],
+      sideEffects: [],
+    }
     fs.writeFileSync(runtimeStatePath, `${JSON.stringify(runtimeState, null, 2)}\n`, 'utf8')
     fs.writeFileSync(domPath, domHtml, 'utf8')
+    fs.writeFileSync(semanticNodesPath, `${JSON.stringify(semanticNodesDoc, null, 2)}\n`, 'utf8')
     fs.writeFileSync(metaPath, `${JSON.stringify({
         route: args.route,
         url,
@@ -185,40 +329,49 @@ async function captureRuntime(args) {
         runtime_state_path: runtimeStatePath,
         dom_path: domPath,
         dom_hash: domHash,
+        semantic_nodes_path: semanticNodesPath,
         semantic_nodes_count: semanticNodeCount,
         document_nodes_count: documentNodeCount,
-        location: locationDoc || { pathname: '/', search: '', hash: '' },
+        location: locationDocResolved,
       }, null, 2)}\n`, 'utf8')
+    fs.writeFileSync(truthTracePath, `${JSON.stringify(truthTraceDoc, null, 2)}\n`, 'utf8')
     writeSidecarSummary(args.summaryOut ? path.resolve(args.summaryOut) : '', {
       ok: true,
       route: args.route,
+      truth_trace_path: truthTracePath,
+      truth_trace_format: 'truth_trace_v2',
+      truth_trace_state_count: 1,
       runtime_state_path: runtimeStatePath,
       dom_path: domPath,
+      semantic_nodes_path: semanticNodesPath,
       runtime_meta_path: metaPath,
       dom_hash: domHash,
       semantic_nodes_count: semanticNodeCount,
       document_nodes_count: documentNodeCount,
-      pathname: (locationDoc && locationDoc.pathname) || '/',
-      search: (locationDoc && locationDoc.search) || '',
-      hash: (locationDoc && locationDoc.hash) || '',
+      pathname: String(locationDocResolved.pathname || '/'),
+      search: String(locationDocResolved.search || ''),
+      hash: String(locationDocResolved.hash || ''),
+      debug_port: debugPort,
     })
     console.log(JSON.stringify({
       ok: true,
       route: args.route,
+      truth_trace_path: truthTracePath,
       runtime_state_path: runtimeStatePath,
       dom_path: domPath,
+      semantic_nodes_path: semanticNodesPath,
       dom_hash: domHash,
       semantic_nodes_count: semanticNodeCount,
       document_nodes_count: documentNodeCount,
-      location: locationDoc || { pathname: '/', search: '', hash: '' },
+      debug_port: debugPort,
+      location: locationDocResolved,
     }))
   } finally {
     try {
       if (ws) ws.close()
     } catch {
     }
-    chromeProc.kill('SIGTERM')
-    await sleep(250)
+    await shutdownChrome(chromeProc)
     fs.rmSync(userDataDir, { recursive: true, force: true })
   }
 }

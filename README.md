@@ -310,11 +310,11 @@ Cheng 当前最有辨识度的编译器特性包括：
 
 当前几个关键入口是：
 
-- `artifacts/tooling_cmd/cheng_tooling`
-- `artifacts/backend_driver/cheng`
-- `verify_backend_closedloop`
-- `backend_prod_closure`
-- `backend-prod-publish`
+- `v3/tooling/cheng_v3.sh`
+- `artifacts/v3_backend_driver/cheng`
+- `artifacts/v3_bootstrap/cheng.stage3`
+- `cheng_v3.sh status / build-backend-driver / run-smokes`
+- `cheng_v3.sh system-link-exec`
 
 ## 性能目标与当前状态
 
@@ -329,18 +329,16 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 ## 快速上手
 
 ```sh
-TOOLING=artifacts/tooling_cmd/cheng_tooling
-
-$TOOLING cheng --in:examples/hello.cheng --out:artifacts/chengc/hello.dev
-$TOOLING release-compile --in:examples/hello.cheng --out:artifacts/chengc/hello.rel
-$TOOLING verify_backend_closedloop
+sh v3/tooling/cheng_v3.sh bootstrap-bridge
+sh v3/tooling/cheng_v3.sh build-backend-driver
+sh v3/tooling/cheng_v3.sh status
 ```
 
 可以把它们理解成三类入口：
 
-- `cheng`：开发态快速编译
-- `release-compile`：发布态编译
-- `verify_*` / `backend_prod_closure`：校验闭环和稳定性
+- `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
+- `build-backend-driver` / `system-link-exec`：生成并使用当前 v3 编译器
+- `run-smokes` / `status`：校验闭环和查看当前主线状态
 
 ## Cheng 适合什么
 

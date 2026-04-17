@@ -173,6 +173,8 @@ var
     msquicTls13Debug: bool = false
     msquicTls13ClientState: MsQuicTls13HandshakeState
     msquicTls13ServerState: MsQuicTls13HandshakeState
+    msquicTls13PeerChainScratch: X509CertList
+    msquicTls13TrustRootsScratch: X509CertList
 
 fn msquicTls13SetDebug(enabled: bool) =
     msquicTls13Debug = enabled
@@ -2183,8 +2185,8 @@ fn msquicTls13PeerVerifyFinalizeCertificate(
     return Ok[bool](true)
 
 fn msquicTls13ParseCertificate(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
-    var peerChain: X509CertList = initX509CertList()
-    var trustRoots: X509CertList = initX509CertList()
+    initX509CertListInto(msquicTls13PeerChainScratch)
+    initX509CertListInto(msquicTls13TrustRootsScratch)
     msquicTls13PeerVerifyResetRuntime(state.peer)
     var offset: int32 = 0
     let ctxLenRes: Result[TlsInt32Next] = tlsReadUint8(data, offset)
@@ -2213,12 +2215,17 @@ fn msquicTls13ParseCertificate(state: var MsQuicTls13HandshakeState, data: Bytes
                 return Err[bool](ErrorText(leafRes))
             hasLeaf = true
         else:
-            let chainRes: Result[bool] = msquicTls13PeerVerifyAddChainCert(state, peerChain, entry.certDer, entry.extData)
+            let chainRes: Result[bool] = msquicTls13PeerVerifyAddChainCert(state,
+                                                                            msquicTls13PeerChainScratch,
+                                                                            entry.certDer,
+                                                                            entry.extData)
             if IsErr(chainRes):
                 return Err[bool](ErrorText(chainRes))
     if state.requireCert && ! hasLeaf:
         return Err[bool]("tls13: certificate missing")
-    let finalizeRes: Result[bool] = msquicTls13PeerVerifyFinalizeCertificate(state, peerChain, trustRoots)
+    let finalizeRes: Result[bool] = msquicTls13PeerVerifyFinalizeCertificate(state,
+                                                                             msquicTls13PeerChainScratch,
+                                                                             msquicTls13TrustRootsScratch)
     if IsErr(finalizeRes):
         return Err[bool](ErrorText(finalizeRes))
     return Ok[bool](true)

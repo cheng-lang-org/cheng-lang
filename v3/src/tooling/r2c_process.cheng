@@ -3,8 +3,16 @@ import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/path as v3path
 
-importc fn cheng_v3_exec_program_capture_bridge(programName: cstring, argvSeq: str[], workingDir: cstring, exitCode: var int64): cstring
+importc fn cheng_v3_exec_program_capture_bridge(programName: cstring, argvWire: str, workingDir: cstring, exitCode: var int64): cstring
 importc fn cheng_v3_exec_program_capture_bridge_dispose(raw: cstring)
+
+fn r2cProcessEncodeArgvWire(argv: str[]): str =
+    var out = ""
+    let sep = strings.charToStr('\0')
+    for i in 0..<argv.len:
+        out = out + argv[i]
+        out = out + sep
+    return out
 
 fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
     let name: str = strutil.strip(nameRaw)
@@ -18,13 +26,17 @@ fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
     let pathEnv: str = os.getEnv("PATH")
     let total: int32 = strings.len(pathEnv)
     var start: int32 = 0
-    for i in 0..total:
+    var i: int32 = 0
+    while i <= total:
         var endHit = false
         if i == total:
             endHit = true
-        elif pathEnv[i] == ':':
-            endHit = true
+        else:
+            let ch = pathEnv[i]
+            if ch == char(58):
+                endHit = true
         if !endHit:
+            i = i + 1
             continue
         let itemLen: int32 = i - start
         if itemLen > 0:
@@ -33,6 +45,7 @@ fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
             if v3path.v3FileExistsNonEmpty(root, candidate):
                 return candidate
         start = i + 1
+        i = i + 1
     return ""
 
 fn r2cProcessCapture(filePath: str,
@@ -45,8 +58,9 @@ fn r2cProcessCapture(filePath: str,
     if strings.len(filePath) <= 0:
         return -1
     var exitCode64: int64 = -1
+    let argvWire = r2cProcessEncodeArgvWire(argv)
     let rawOutput: cstring = cheng_v3_exec_program_capture_bridge(strToCStringTemp(filePath),
-                                                                  argv,
+                                                                  argvWire,
                                                                   strToCStringTemp(workingDir),
                                                                   exitCode64)
     outputOut = strFromCStringCopy(rawOutput)

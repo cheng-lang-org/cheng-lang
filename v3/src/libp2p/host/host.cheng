@@ -1404,21 +1404,44 @@ fn v3Libp2pRelayLeaseServePayload(host: var V3Libp2pHost,
                                        selected.serviceKind,
                                        selected.region,
                                        now)
-    var lease = types.v3Libp2pRelayLeaseZero()
-    let issueRes = relay_provider.v3Libp2pRelayProviderIssueLeaseFill(lease,
-                                                                      host.relayProviders[providerPos],
-                                                                      host.selfPeerId,
-                                                                      requesterPeerId,
-                                                                      peer_id.v3Libp2pPeerIdText(requesterPeerId),
-                                                                      request.region,
-                                                                      now,
-                                                                      30,
-                                                                      nonce)
-    if IsErr(issueRes):
+    let requesterPeerText = peer_id.v3Libp2pPeerIdText(requesterPeerId)
+    let payloadRes = relay_provider.v3Libp2pRelayProviderIssueLeasePayload(host.relayProviders[providerPos].handle,
+                                                                           requesterPeerText,
+                                                                           request.region,
+                                                                           now,
+                                                                           30,
+                                                                           nonce)
+    if IsErr(payloadRes):
         v3Libp2pHostRelayRemoveLocalDescriptor(host,
                                                selected.serviceKind,
                                                selected.endpointText)
-        return Err[Bytes](Error(issueRes))
+        return Err[Bytes](Error(payloadRes))
+    let payload = Value(payloadRes)
+    if !relay_provider.v3Libp2pRelayProviderBoolText(relay_provider.v3Libp2pRelayProviderLineValue(payload, "ok")):
+        let errText = relay_provider.v3Libp2pRelayProviderLineValue(payload, "error")
+        v3Libp2pHostRelayRemoveLocalDescriptor(host,
+                                               selected.serviceKind,
+                                               selected.endpointText)
+        return Err[Bytes](len(errText) > 0 ? errText : "v3 libp2p host: relay lease issue failed")
+    var lease = types.v3Libp2pRelayLeaseZero()
+    lease.relayPeerId = host.selfPeerId
+    lease.requesterPeerId = requesterPeerId
+    lease.serviceKind = host.relayProviders[providerPos].serviceKind
+    lease.region = v3Libp2pHostRelayOwnedText(host.relayProviders[providerPos].region)
+    let regionText = relay_provider.v3Libp2pRelayProviderLineValue(payload, "region")
+    if len(regionText) > 0:
+        lease.region = v3Libp2pHostRelayOwnedText(regionText)
+    if len(lease.region) <= 0:
+        lease.region = v3Libp2pHostRelayOwnedText(request.region)
+    lease.endpointText = v3Libp2pHostRelayOwnedText(host.relayProviders[providerPos].endpointText)
+    lease.username = v3Libp2pHostRelayOwnedText(relay_provider.v3Libp2pRelayProviderLineValue(payload, "username"))
+    lease.credential = v3Libp2pHostRelayOwnedText(relay_provider.v3Libp2pRelayProviderLineValue(payload, "credential"))
+    if lease.serviceKind == types.v3Libp2pRelayServiceStun:
+        lease.username = ""
+        lease.credential = ""
+    lease.issuedAtEpochSeconds = now
+    lease.expiresAtEpochSeconds = now + int64(30)
+    lease.nonce = nonce
     return Ok[Bytes](relay_plane.v3Libp2pRelayLeaseEncode(lease))
 
 fn v3Libp2pServePayloadFromPeer(host: var V3Libp2pHost,
@@ -1689,18 +1712,17 @@ fn v3Libp2pRelayDescribeRequest(host: var V3Libp2pHost,
         v3Libp2pObservePeerRelayDescriptor(host, remotePeerId, out[i])
     return Ok[bool](true)
 
-fn v3Libp2pRelayLeaseRequest(host: var V3Libp2pHost,
-                             remoteHost: var V3Libp2pHost,
-                             remotePeerId: types.V3Libp2pPeerId,
-                             serviceKind: types.V3Libp2pRelayServiceKind,
-                             region: str,
-                             out: var types.V3Libp2pRelayLease): Result[bool] =
+fn v3Libp2pRelayLeaseRequestFetch(host: var V3Libp2pHost,
+                                  remoteHost: var V3Libp2pHost,
+                                  remotePeerId: types.V3Libp2pPeerId,
+                                  serviceKind: types.V3Libp2pRelayServiceKind,
+                                  region: str): Result[types.V3Libp2pRelayLease] =
     if !types.v3Libp2pPeerIdEqual(remoteHost.selfPeerId, remotePeerId):
-        return Err[bool]("v3 libp2p host: relay lease peer mismatch")
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p host: relay lease peer mismatch")
     if !v3Libp2pProtocolRegistered(host, types.v3Libp2pProtocolRelayLease):
-        return Err[bool]("v3 libp2p host: local relay lease handler missing")
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p host: local relay lease handler missing")
     if !v3Libp2pProtocolRegistered(remoteHost, types.v3Libp2pProtocolRelayLease):
-        return Err[bool]("v3 libp2p host: remote relay lease handler missing")
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p host: remote relay lease handler missing")
     let requestPayload = relay_plane.v3Libp2pRelayLeaseRequestEncode(host.selfPeerId,
                                                                      serviceKind,
                                                                      region)
@@ -1712,14 +1734,15 @@ fn v3Libp2pRelayLeaseRequest(host: var V3Libp2pHost,
                                              requestPayload,
                                              responsePayload)
     if IsErr(requestRes):
-        return Err[bool](Error(requestRes))
+        return Err[types.V3Libp2pRelayLease](Error(requestRes))
+    var out = types.v3Libp2pRelayLeaseZero()
     let decodeRes = relay_plane.v3Libp2pRelayLeaseDecodeFill(out, responsePayload)
     if IsErr(decodeRes):
-        return Err[bool](Error(decodeRes))
+        return Err[types.V3Libp2pRelayLease](Error(decodeRes))
     if !types.v3Libp2pPeerIdEqual(out.relayPeerId, remotePeerId):
-        return Err[bool]("v3 libp2p host: relay lease relay peer mismatch")
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p host: relay lease relay peer mismatch")
     if !types.v3Libp2pPeerIdEqual(out.requesterPeerId, host.selfPeerId):
-        return Err[bool]("v3 libp2p host: relay lease requester mismatch")
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p host: relay lease requester mismatch")
     let pos = ps.v3Libp2pPeerstorePos(host.peers, remotePeerId)
     if pos >= 0:
         var record = host.peers.peers[pos]
@@ -1729,6 +1752,22 @@ fn v3Libp2pRelayLeaseRequest(host: var V3Libp2pHost,
                                                  out.endpointText,
                                                  times.epochTimeSeconds())
         ps.v3Libp2pPeerstoreUpsert(host.peers, record)
+    return Ok[types.V3Libp2pRelayLease](out)
+
+fn v3Libp2pRelayLeaseRequest(host: var V3Libp2pHost,
+                             remoteHost: var V3Libp2pHost,
+                             remotePeerId: types.V3Libp2pPeerId,
+                             serviceKind: types.V3Libp2pRelayServiceKind,
+                             region: str,
+                             out: var types.V3Libp2pRelayLease): Result[bool] =
+    let fetchRes = v3Libp2pRelayLeaseRequestFetch(host,
+                                                  remoteHost,
+                                                  remotePeerId,
+                                                  serviceKind,
+                                                  region)
+    if IsErr(fetchRes):
+        return Err[bool](Error(fetchRes))
+    out = Value(fetchRes)
     return Ok[bool](true)
 
 fn v3Libp2pPinServePayload(host: var V3Libp2pHost,

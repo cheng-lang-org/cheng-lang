@@ -1,0 +1,349 @@
+import std/system
+import std/os
+import std/result
+import std/rawbytes
+import std/strutils as strutil
+import std/cmdline as cmdline
+import cheng/v3/quic/native_runtime as qnative
+import cheng/v3/quic/tls/handshake13
+import cheng/v3/project/bft_state_machine as bft
+import cheng/v3/project/bft_validator_host as host
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/path as v3path
+
+fn bftDaemonCloseOrderAppId(): str =
+    return "v3.bft.daemon.close.order"
+
+fn bftDaemonCloseOrderMintWire(): Bytes =
+    return bft.v3BftEncodeTx(bft.v3BftTxMint(9, 1001, int64(88)))
+
+fn bftDaemonCloseOrderTransferWire(): Bytes =
+    return bft.v3BftEncodeTx(bft.v3BftTxTransfer(9, 1001, 2002, int64(33)))
+
+fn bftDaemonCloseOrderProposal(): host.V3BftProposal =
+    var txs: Bytes[]
+    txs = []
+    add(txs, bftDaemonCloseOrderMintWire())
+    add(txs, bftDaemonCloseOrderTransferWire())
+    let proposalRes = host.v3BftValidatorProposalFromTxs(bftDaemonCloseOrderAppId(),
+                                                         int64(1),
+                                                         1,
+                                                         txs)
+    assert(IsOk(proposalRes), "v3 bft daemon close order: build proposal")
+    return Value(proposalRes)
+
+fn bftDaemonCloseOrderMachine(): bft.V3BftStateMachine =
+    var machine = bft.v3BftStateMachineInit(bftDaemonCloseOrderAppId())
+    var block: bft.V3BftTx[]
+    block = []
+    add(block, bft.v3BftTxMint(9, 1001, int64(88)))
+    add(block, bft.v3BftTxTransfer(9, 1001, 2002, int64(33)))
+    var summary = bft.v3BftBlockSummaryZero(int64(0))
+    bft.v3BftStateMachineFinalizeBlockSummary(machine, int64(1), block, summary)
+    return machine
+
+fn bftDaemonCloseOrderDebugEnabled(): bool =
+    return cmdline.hasFlag("--debug-tls13")
+
+fn bftDaemonCloseOrderLog(text: str) =
+    if bftDaemonCloseOrderDebugEnabled():
+        os.writeLine(os.get_stderr(), text)
+
+fn bftDaemonCloseOrderArtifactDir(root: str): str =
+    return v3path.v3PathAbsolute(root, "artifacts/v3_bft_daemon_quic_close_order_smoke")
+
+fn bftDaemonCloseOrderPath(root: str, leaf: str): str =
+    return v3path.v3PathJoin(bftDaemonCloseOrderArtifactDir(root), leaf)
+
+fn bftDaemonCloseOrderEnsureDir(root: str): Result[bool] =
+    if !v3path.v3MkdirP(root, bftDaemonCloseOrderArtifactDir(root)):
+        return Err[bool]("v3 bft daemon close order: mkdir artifact dir failed")
+    return Ok[bool](true)
+
+fn bftDaemonCloseOrderRemoveFile(pathRaw: str) =
+    if v3path.v3PathFileExists(pathRaw):
+        os.removeFile(pathRaw)
+
+fn bftDaemonCloseOrderParsePort(textRaw: str): Result[int32] =
+    let text = strutil.strip(textRaw)
+    if len(text) <= 0:
+        return Err[int32]("v3 bft daemon close order: empty port text")
+    var value = int32(0)
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int32]("v3 bft daemon close order: invalid port text")
+        value = value * 10 + (int32(ch) - int32('0'))
+    if value <= 0:
+        return Err[int32]("v3 bft daemon close order: invalid ready port")
+    return Ok[int32](value)
+
+fn bftDaemonCloseOrderWaitReadyPort(root: str,
+                                    readyPath: str,
+                                    proc: var hostops.V3SpawnedProcess,
+                                    portOut: var int32): Result[bool] =
+    portOut = 0
+    for attempt in 0..<500:
+        if v3path.v3FileExistsNonEmpty(root, readyPath):
+            let parseRes = bftDaemonCloseOrderParsePort(v3path.v3ReadTextFile("", readyPath))
+            if IsOk(parseRes):
+                portOut = Value(parseRes)
+                return Ok[bool](true)
+        if !hostops.v3SpawnedProcessRunning(proc):
+            return Err[bool]("v3 bft daemon close order: server exited before ready: " + proc.output)
+        if attempt + 1 < 500:
+            os.sleepMs(10)
+    return Err[bool]("v3 bft daemon close order: ready timeout")
+
+fn bftDaemonCloseOrderResolveDriver(root: str): Result[str] =
+    let stage3 = v3path.v3PathAbsolute(root, "artifacts/v3_bootstrap/cheng.stage3")
+    if v3path.v3FileExistsNonEmpty(root, stage3):
+        return Ok[str](stage3)
+    let stage0 = v3path.v3PathAbsolute(root, "artifacts/v3_bootstrap/cheng.stage0")
+    if v3path.v3FileExistsNonEmpty(root, stage0):
+        return Ok[str](stage0)
+    let backendDriver = v3path.v3PathAbsolute(root, "artifacts/v3_backend_driver/cheng")
+    if v3path.v3FileExistsNonEmpty(root, backendDriver):
+        return Ok[str](backendDriver)
+    return Err[str]("v3 bft daemon close order: missing build driver")
+
+fn bftDaemonCloseOrderEnsureBftBinary(root: str): Result[str] =
+    let dirRes = bftDaemonCloseOrderEnsureDir(root)
+    if IsErr(dirRes):
+        return Err[str](Error(dirRes))
+    let driverRes = bftDaemonCloseOrderResolveDriver(root)
+    if IsErr(driverRes):
+        return Err[str](Error(driverRes))
+    let outDir = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine")
+    if !v3path.v3MkdirP(root, outDir):
+        return Err[str]("v3 bft daemon close order: mkdir bft out dir failed")
+    let outBin = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine/bft_state_machine")
+    let src = v3path.v3PathAbsolute(root, "v3/src/project/bft_state_machine_main.cheng")
+    let buildLog = v3path.v3PathAbsolute(root, "artifacts/v3_bft_state_machine/bft_state_machine.compile.log")
+    let buildRun = hostops.v3RunFileLogged(root,
+                                           "build_bft_state_machine",
+                                           Value(driverRes),
+                                           ["system-link-exec",
+                                            "--root:" + root,
+                                            "--in:" + src,
+                                            "--emit:exe",
+                                            "--target:arm64-apple-darwin",
+                                            "--out:" + outBin,
+                                            "--report-out:" + bftDaemonCloseOrderPath(root,
+                                                                                      "build_bft_state_machine.report.txt")],
+                                           [],
+                                           root,
+                                           300,
+                                           buildLog)
+    if !hostops.v3LoggedRunOk(buildRun):
+        return Err[str]("v3 bft daemon close order: system-link-exec bft_state_machine failed: " + buildRun.output)
+    if !v3path.v3FileExistsNonEmpty(root, outBin):
+        return Err[str]("v3 bft daemon close order: missing bft_state_machine binary")
+    return Ok[str](outBin)
+
+fn bftDaemonCloseOrderPrepareFiles(root: str): Result[bool] =
+    let dirRes = bftDaemonCloseOrderEnsureDir(root)
+    if IsErr(dirRes):
+        return Err[bool](Error(dirRes))
+    let proposal = bftDaemonCloseOrderProposal()
+    let machine = bftDaemonCloseOrderMachine()
+    let proposalFile = bftDaemonCloseOrderPath(root, "proposal.hex")
+    let stateFile = bftDaemonCloseOrderPath(root, "state_sync.hex")
+    let snapshotDir = host.v3BftValidatorDefaultStateSyncDir(stateFile)
+    let votesFile = bftDaemonCloseOrderPath(root, "votes.hex")
+    if !host.v3BftValidatorWriteHexFile(proposalFile, host.v3BftValidatorEncodeProposal(proposal)):
+        return Err[bool]("v3 bft daemon close order: write proposal file failed")
+    if !host.v3BftValidatorWriteHexFile(stateFile, host.v3BftValidatorEncodeMachine(machine)):
+        return Err[bool]("v3 bft daemon close order: write state file failed")
+    if !host.v3BftValidatorWriteStateSnapshot(snapshotDir, machine):
+        return Err[bool]("v3 bft daemon close order: write state snapshot failed")
+    if !v3path.v3WriteTextFile(root, votesFile, ""):
+        return Err[bool]("v3 bft daemon close order: write votes file failed")
+    return Ok[bool](true)
+
+fn bftDaemonCloseOrderDaemonArgv(cmd: str,
+                                 filePath: str,
+                                 readyPath: str,
+                                 snapshotDir: str): str[] =
+    var argv: str[]
+    argv = []
+    add(argv, cmd)
+    add(argv, "--file:" + filePath)
+    add(argv, "--host:127.0.0.1")
+    add(argv, "--port:0")
+    add(argv, "--ready-path:" + readyPath)
+    if len(snapshotDir) > 0:
+        add(argv, "--snapshot-dir:" + snapshotDir)
+    if cmd == "vote-capture-daemon":
+        add(argv, "--max-vote-count:1")
+    else:
+        add(argv, "--max-serve-count:1")
+    if bftDaemonCloseOrderDebugEnabled():
+        add(argv, "--debug-tls13")
+    return argv
+
+fn bftDaemonCloseOrderRunProposalCase(root: str, bftBin: str): Result[bool] =
+    let readyPath = bftDaemonCloseOrderPath(root, "proposal.ready")
+    let logPath = bftDaemonCloseOrderPath(root, "proposal.log")
+    bftDaemonCloseOrderRemoveFile(readyPath)
+    bftDaemonCloseOrderRemoveFile(logPath)
+    let proposalFile = bftDaemonCloseOrderPath(root, "proposal.hex")
+    let spawnRes = hostops.v3SpawnFile(root,
+                                       "bft_daemon_close_order_proposal",
+                                       bftBin,
+                                       bftDaemonCloseOrderDaemonArgv("proposal-serve-daemon",
+                                                                     proposalFile,
+                                                                     readyPath,
+                                                                     ""),
+                                       [],
+                                       root)
+    if IsErr(spawnRes):
+        return Err[bool](Error(spawnRes))
+    var proc = Value(spawnRes)
+    var port = 0
+    let waitRes = bftDaemonCloseOrderWaitReadyPort(root, readyPath, proc, port)
+    if IsErr(waitRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(waitRes))
+    let proposalRes = host.v3BftValidatorRecvProposal("127.0.0.1", port)
+    if IsErr(proposalRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(proposalRes))
+    let proposal = Value(proposalRes)
+    if proposal.height != int64(1):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: proposal height mismatch")
+    if proposal.proposerSlot != 1:
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: proposal slot mismatch")
+    if proposal.txs.len != 2:
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: proposal tx count mismatch")
+    let run = hostops.v3SpawnedProcessWaitLogged(root, proc, 20, logPath)
+    if !hostops.v3LoggedRunOk(run):
+        return Err[bool]("v3 bft daemon close order: proposal daemon failed: " + run.output)
+    return Ok[bool](true)
+
+fn bftDaemonCloseOrderRunStateCase(root: str, bftBin: str): Result[bool] =
+    let readyPath = bftDaemonCloseOrderPath(root, "state.ready")
+    let logPath = bftDaemonCloseOrderPath(root, "state.log")
+    bftDaemonCloseOrderRemoveFile(readyPath)
+    bftDaemonCloseOrderRemoveFile(logPath)
+    let stateFile = bftDaemonCloseOrderPath(root, "state_sync.hex")
+    let snapshotDir = host.v3BftValidatorDefaultStateSyncDir(stateFile)
+    let spawnRes = hostops.v3SpawnFile(root,
+                                       "bft_daemon_close_order_state",
+                                       bftBin,
+                                       bftDaemonCloseOrderDaemonArgv("state-serve-daemon",
+                                                                     stateFile,
+                                                                     readyPath,
+                                                                     snapshotDir),
+                                       [],
+                                       root)
+    if IsErr(spawnRes):
+        return Err[bool](Error(spawnRes))
+    var proc = Value(spawnRes)
+    var port = 0
+    let waitRes = bftDaemonCloseOrderWaitReadyPort(root, readyPath, proc, port)
+    if IsErr(waitRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(waitRes))
+    let machineRes = host.v3BftValidatorRecvStateMachine("127.0.0.1", port, int64(1))
+    if IsErr(machineRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(machineRes))
+    var machine = Value(machineRes)
+    if machine.lastFinalizedHeight != int64(1):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: state height mismatch")
+    let alice = bft.v3BftStateMachineQueryBalance(machine, 9, 1001)
+    let bob = bft.v3BftStateMachineQueryBalance(machine, 9, 2002)
+    if alice.code != bft.v3BftCodeOk || bob.code != bft.v3BftCodeOk:
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: state balance query failed")
+    if alice.balance != int64(55) || bob.balance != int64(33):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool]("v3 bft daemon close order: state balance mismatch")
+    let run = hostops.v3SpawnedProcessWaitLogged(root, proc, 20, logPath)
+    if !hostops.v3LoggedRunOk(run):
+        return Err[bool]("v3 bft daemon close order: state daemon failed: " + run.output)
+    return Ok[bool](true)
+
+fn bftDaemonCloseOrderRunVoteCase(root: str, bftBin: str): Result[bool] =
+    let readyPath = bftDaemonCloseOrderPath(root, "vote.ready")
+    let logPath = bftDaemonCloseOrderPath(root, "vote.log")
+    bftDaemonCloseOrderRemoveFile(readyPath)
+    bftDaemonCloseOrderRemoveFile(logPath)
+    let votesFile = bftDaemonCloseOrderPath(root, "votes.hex")
+    let spawnRes = hostops.v3SpawnFile(root,
+                                       "bft_daemon_close_order_vote",
+                                       bftBin,
+                                       bftDaemonCloseOrderDaemonArgv("vote-capture-daemon",
+                                                                     votesFile,
+                                                                     readyPath,
+                                                                     ""),
+                                       [],
+                                       root)
+    if IsErr(spawnRes):
+        return Err[bool](Error(spawnRes))
+    var proc = Value(spawnRes)
+    var port = 0
+    let waitRes = bftDaemonCloseOrderWaitReadyPort(root, readyPath, proc, port)
+    if IsErr(waitRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(waitRes))
+    let stateRes = host.v3BftValidatorStateInit(bftDaemonCloseOrderAppId(), 2)
+    if IsErr(stateRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(stateRes))
+    let voteRes = host.v3BftValidatorBuildVote(Value(stateRes), bftDaemonCloseOrderProposal())
+    if IsErr(voteRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(voteRes))
+    let sendRes = host.v3BftValidatorSendVote("127.0.0.1", port, Value(voteRes))
+    if IsErr(sendRes):
+        hostops.v3SpawnedProcessKill(proc)
+        return Err[bool](Error(sendRes))
+    let run = hostops.v3SpawnedProcessWaitLogged(root, proc, 20, logPath)
+    if !hostops.v3LoggedRunOk(run):
+        return Err[bool]("v3 bft daemon close order: vote daemon failed: " + run.output)
+    let votesRes = host.v3BftValidatorVoteInboxLoad(votesFile)
+    if IsErr(votesRes):
+        return Err[bool](Error(votesRes))
+    let votes = Value(votesRes)
+    if votes.len != 1:
+        return Err[bool]("v3 bft daemon close order: vote capture count mismatch")
+    if votes[0].validatorSlot != 2 || votes[0].height != int64(1):
+        return Err[bool]("v3 bft daemon close order: vote payload mismatch")
+    return Ok[bool](true)
+
+fn main(): int32 =
+    let debugTls13 = bftDaemonCloseOrderDebugEnabled()
+    qnative.msquicNativeSetDebugTls13(debugTls13)
+    handshake13.msquicTls13SetDebug(debugTls13)
+    let root = os.getCurrentDir()
+    let buildRes = bftDaemonCloseOrderEnsureBftBinary(root)
+    if IsErr(buildRes):
+        os.writeLine(os.get_stderr(), Error(buildRes))
+        return 1
+    let prepRes = bftDaemonCloseOrderPrepareFiles(root)
+    if IsErr(prepRes):
+        os.writeLine(os.get_stderr(), Error(prepRes))
+        return 1
+    bftDaemonCloseOrderLog("bft_daemon_close_order proposal begin")
+    let proposalRes = bftDaemonCloseOrderRunProposalCase(root, Value(buildRes))
+    if IsErr(proposalRes):
+        os.writeLine(os.get_stderr(), Error(proposalRes))
+        return 1
+    bftDaemonCloseOrderLog("bft_daemon_close_order state begin")
+    let stateRes = bftDaemonCloseOrderRunStateCase(root, Value(buildRes))
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 1
+    bftDaemonCloseOrderLog("bft_daemon_close_order vote begin")
+    let voteRes = bftDaemonCloseOrderRunVoteCase(root, Value(buildRes))
+    if IsErr(voteRes):
+        os.writeLine(os.get_stderr(), Error(voteRes))
+        return 1
+    echo("v3 bft_daemon_quic_close_order_smoke ok")
+    return 0

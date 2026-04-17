@@ -100,22 +100,30 @@ fn v3Libp2pRelayProviderPayloadText(handle: uint64,
     tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
     return Ok[str](bytesToString(out))
 
+fn v3Libp2pRelayProviderIssueLeasePayload(handle: uint64,
+                                          requesterPeerIdText: str,
+                                          requestedRegion: str,
+                                          issuedAtEpochSeconds: int64,
+                                          ttlSeconds: int32,
+                                          nonce: layout.FixedBytes32): Result[str] =
+    if handle == uint64(0):
+        return Err[str]("v3 libp2p relay provider: handle missing")
+    if len(requesterPeerIdText) <= 0:
+        return Err[str]("v3 libp2p relay provider: requester missing")
+    if ttlSeconds <= 0:
+        return Err[str]("v3 libp2p relay provider: ttl invalid")
+    return v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(handle,
+                                                                                               requesterPeerIdText,
+                                                                                               requestedRegion,
+                                                                                               layout.fixedBytes32Hex(nonce),
+                                                                                               issuedAtEpochSeconds,
+                                                                                               ttlSeconds),
+                                            "v3 libp2p relay provider: lease empty")
+
 fn v3Libp2pRelayProviderOwnedText(text: str): str =
     if strLenFast(text) <= 0:
         return ""
     return newStringCopy(strDataPtr(text), strLenFast(text))
-
-fn v3Libp2pRelayLeaseReset(out: var types.V3Libp2pRelayLease) =
-    out.relayPeerId = types.v3Libp2pPeerIdZero()
-    out.requesterPeerId = types.v3Libp2pPeerIdZero()
-    out.serviceKind = types.v3Libp2pRelayServiceNone
-    out.region = ""
-    out.endpointText = ""
-    out.username = ""
-    out.credential = ""
-    out.issuedAtEpochSeconds = int64(0)
-    out.expiresAtEpochSeconds = int64(0)
-    out.nonce = layout.fixedBytes32Zero()
 
 fn v3Libp2pRelayProviderOpenFill(out: var V3Libp2pRelayProvider,
                                  serviceKind: types.V3Libp2pRelayServiceKind,
@@ -184,7 +192,10 @@ fn v3Libp2pRelayProviderProbeHealth(provider: V3Libp2pRelayProvider,
     return Ok[types.V3Libp2pRelayHealth](out)
 
 fn v3Libp2pRelayProviderIssueLeaseFill(out: var types.V3Libp2pRelayLease,
-                                       provider: V3Libp2pRelayProvider,
+                                       providerHandle: uint64,
+                                       providerServiceKind: types.V3Libp2pRelayServiceKind,
+                                       providerRegion: str,
+                                       providerEndpointText: str,
                                        relayPeerId: types.V3Libp2pPeerId,
                                        requesterPeerId: types.V3Libp2pPeerId,
                                        requesterPeerIdText: str,
@@ -192,14 +203,13 @@ fn v3Libp2pRelayProviderIssueLeaseFill(out: var types.V3Libp2pRelayLease,
                                        issuedAtEpochSeconds: int64,
                                        ttlSeconds: int32,
                                        nonce: layout.FixedBytes32): Result[bool] =
-    v3Libp2pRelayLeaseReset(out)
-    if provider.handle == uint64(0):
+    if providerHandle == uint64(0):
         return Err[bool]("v3 libp2p relay provider: handle missing")
     if len(requesterPeerIdText) <= 0:
         return Err[bool]("v3 libp2p relay provider: requester missing")
     if ttlSeconds <= 0:
         return Err[bool]("v3 libp2p relay provider: ttl invalid")
-    let payloadRes = v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(provider.handle,
+    let payloadRes = v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
                                                                                                          requesterPeerIdText,
                                                                                                          requestedRegion,
                                                                                                          layout.fixedBytes32Hex(nonce),
@@ -216,28 +226,25 @@ fn v3Libp2pRelayProviderIssueLeaseFill(out: var types.V3Libp2pRelayLease,
         return Err[bool](len(errText) > 0 ? errText : "v3 libp2p relay provider: lease failed")
     out.relayPeerId = relayPeerId
     out.requesterPeerId = requesterPeerId
-    out.serviceKind = provider.serviceKind
-    out.region = v3Libp2pRelayProviderOwnedText(provider.region)
+    out.serviceKind = providerServiceKind
+    out.region = v3Libp2pRelayProviderOwnedText(providerRegion)
     let regionText = v3Libp2pRelayProviderLineValue(payload, "region")
     if len(regionText) > 0:
         out.region = v3Libp2pRelayProviderOwnedText(regionText)
     if len(out.region) <= 0:
         out.region = v3Libp2pRelayProviderOwnedText(requestedRegion)
-    out.endpointText = v3Libp2pRelayProviderOwnedText(provider.endpointText)
-    let endpointText = v3Libp2pRelayProviderLineValue(payload, "endpoint")
-    if len(endpointText) > 0:
-        out.endpointText = v3Libp2pRelayProviderOwnedText(endpointText)
+    out.endpointText = v3Libp2pRelayProviderOwnedText(providerEndpointText)
     out.username = v3Libp2pRelayProviderOwnedText(v3Libp2pRelayProviderLineValue(payload, "username"))
     out.credential = v3Libp2pRelayProviderOwnedText(v3Libp2pRelayProviderLineValue(payload, "credential"))
     out.issuedAtEpochSeconds = issuedAtEpochSeconds
     out.expiresAtEpochSeconds = issuedAtEpochSeconds + int64(ttlSeconds)
-    let expiresText = v3Libp2pRelayProviderLineValue(payload, "expiresAtEpochSeconds")
-    if len(expiresText) > 0:
-        out.expiresAtEpochSeconds = v3Libp2pRelayProviderParseI64(expiresText)
     out.nonce = nonce
     return Ok[bool](true)
 
-fn v3Libp2pRelayProviderIssueLease(provider: V3Libp2pRelayProvider,
+fn v3Libp2pRelayProviderIssueLease(providerHandle: uint64,
+                                   providerServiceKind: types.V3Libp2pRelayServiceKind,
+                                   providerRegion: str,
+                                   providerEndpointText: str,
                                    relayPeerId: types.V3Libp2pPeerId,
                                    requesterPeerId: types.V3Libp2pPeerId,
                                    requesterPeerIdText: str,
@@ -246,18 +253,42 @@ fn v3Libp2pRelayProviderIssueLease(provider: V3Libp2pRelayProvider,
                                    ttlSeconds: int32,
                                    nonce: layout.FixedBytes32): Result[types.V3Libp2pRelayLease] =
     var out: types.V3Libp2pRelayLease
-    v3Libp2pRelayLeaseReset(out)
-    let fillRes = v3Libp2pRelayProviderIssueLeaseFill(out,
-                                                      provider,
-                                                      relayPeerId,
-                                                      requesterPeerId,
-                                                      requesterPeerIdText,
-                                                      requestedRegion,
-                                                      issuedAtEpochSeconds,
-                                                      ttlSeconds,
-                                                      nonce)
-    if IsErr(fillRes):
-        return Err[types.V3Libp2pRelayLease](Error(fillRes))
+    if providerHandle == uint64(0):
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: handle missing")
+    if len(requesterPeerIdText) <= 0:
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: requester missing")
+    if ttlSeconds <= 0:
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: ttl invalid")
+    let payloadRes = v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
+                                                                                                         requesterPeerIdText,
+                                                                                                         requestedRegion,
+                                                                                                         layout.fixedBytes32Hex(nonce),
+                                                                                                         issuedAtEpochSeconds,
+                                                                                                         ttlSeconds),
+                                                      "v3 libp2p relay provider: lease empty")
+    if IsErr(payloadRes):
+        return Err[types.V3Libp2pRelayLease](Error(payloadRes))
+    let payload = Value(payloadRes)
+    if len(payload) <= 0:
+        return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: lease empty")
+    if !v3Libp2pRelayProviderBoolText(v3Libp2pRelayProviderLineValue(payload, "ok")):
+        let errText = v3Libp2pRelayProviderLineValue(payload, "error")
+        return Err[types.V3Libp2pRelayLease](len(errText) > 0 ? errText : "v3 libp2p relay provider: lease failed")
+    out.relayPeerId = relayPeerId
+    out.requesterPeerId = requesterPeerId
+    out.serviceKind = providerServiceKind
+    out.region = v3Libp2pRelayProviderOwnedText(providerRegion)
+    let regionText = v3Libp2pRelayProviderLineValue(payload, "region")
+    if len(regionText) > 0:
+        out.region = v3Libp2pRelayProviderOwnedText(regionText)
+    if len(out.region) <= 0:
+        out.region = v3Libp2pRelayProviderOwnedText(requestedRegion)
+    out.endpointText = v3Libp2pRelayProviderOwnedText(providerEndpointText)
+    out.username = v3Libp2pRelayProviderOwnedText(v3Libp2pRelayProviderLineValue(payload, "username"))
+    out.credential = v3Libp2pRelayProviderOwnedText(v3Libp2pRelayProviderLineValue(payload, "credential"))
+    out.issuedAtEpochSeconds = issuedAtEpochSeconds
+    out.expiresAtEpochSeconds = issuedAtEpochSeconds + int64(ttlSeconds)
+    out.nonce = nonce
     return Ok[types.V3Libp2pRelayLease](out)
 
 fn v3Libp2pRelayProviderClose(provider: var V3Libp2pRelayProvider): bool =

@@ -58,7 +58,139 @@ fn v3CompilerReadFlagOrDefault(args: str[],
             return strings.dropPrefix(arg, key + ":")
         if strutil.startsWith(arg, key + "="):
             return strings.dropPrefix(arg, key + "=")
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
     return defaultValue
+
+fn v3CompilerReadFlagAliasOrDefault(args: str[],
+                                    key: str,
+                                    aliasKey: str,
+                                    defaultValue: str): str =
+    let value = v3CompilerReadFlagOrDefault(args, key, "")
+    if len(value) > 0:
+        return value
+    if len(aliasKey) > 0:
+        let aliasValue = v3CompilerReadFlagOrDefault(args, aliasKey, "")
+        if len(aliasValue) > 0:
+            return aliasValue
+    return defaultValue
+
+fn v3CompilerReadEnvPair(primaryKey: str,
+                         aliasKey: str): str =
+    let primaryValue = os.getEnv(primaryKey)
+    if len(primaryValue) > 0:
+        return primaryValue
+    if len(aliasKey) > 0:
+        return os.getEnv(aliasKey)
+    return ""
+
+fn v3CompilerTextStartsWith(text: str,
+                            prefix: str): bool =
+    if len(prefix) <= 0:
+        return true
+    if len(text) < len(prefix):
+        return false
+    return strings.sliceBytes(text, 0, len(prefix)) == prefix
+
+fn v3CompilerFlagMatches(arg: str,
+                         key: str): bool =
+    if arg == key:
+        return true
+    if v3CompilerTextStartsWith(arg, key + ":"):
+        return true
+    if v3CompilerTextStartsWith(arg, key + "="):
+        return true
+    return false
+
+fn v3CompilerLegacyBackendCompatLooksLikeCompile(args: str[]): bool =
+    let envInput = v3CompilerReadEnvPair("BACKEND_INPUT", "CHENG_BACKEND_INPUT")
+    if len(envInput) > 0:
+        return true
+    for i in 0..<args.len:
+        let arg = args[i]
+        if strings.hasSuffix(arg, ".cheng"):
+            return true
+        if v3CompilerFlagMatches(arg, "--in") ||
+           v3CompilerFlagMatches(arg, "--out") ||
+           v3CompilerFlagMatches(arg, "--output") ||
+           v3CompilerFlagMatches(arg, "--emit") ||
+           v3CompilerFlagMatches(arg, "--target") ||
+           v3CompilerFlagMatches(arg, "--report-out") ||
+           v3CompilerFlagMatches(arg, "--report") ||
+           v3CompilerFlagMatches(arg, "--root"):
+            return true
+    return false
+
+fn v3CompilerLegacyBackendCompatIgnoredFlag(arg: str): bool =
+    if v3CompilerFlagMatches(arg, "--frontend") ||
+       v3CompilerFlagMatches(arg, "--linker") ||
+       v3CompilerFlagMatches(arg, "--build-track") ||
+       v3CompilerFlagMatches(arg, "--mm") ||
+       v3CompilerFlagMatches(arg, "--generic-mode") ||
+       v3CompilerFlagMatches(arg, "--generic-spec-budget") ||
+       v3CompilerFlagMatches(arg, "--generic-lowering") ||
+       v3CompilerFlagMatches(arg, "--jobs") ||
+       v3CompilerFlagMatches(arg, "--fn-jobs") ||
+       v3CompilerFlagMatches(arg, "--opt-level") ||
+       v3CompilerFlagMatches(arg, "--runtime-obj") ||
+       v3CompilerFlagMatches(arg, "--sidecar-mode") ||
+       v3CompilerFlagMatches(arg, "--sidecar-bundle") ||
+       v3CompilerFlagMatches(arg, "--sidecar-compiler") ||
+       v3CompilerFlagMatches(arg, "--sidecar-child-mode") ||
+       v3CompilerFlagMatches(arg, "--sidecar-outer-compiler") ||
+       v3CompilerFlagMatches(arg, "--module-cache") ||
+       v3CompilerFlagMatches(arg, "--multi-module-cache") ||
+       v3CompilerFlagMatches(arg, "--module-cache-unstable-allow"):
+        return true
+    if arg == "--allow-no-main" ||
+       arg == "--whole-program" ||
+       arg == "--no-whole-program" ||
+       arg == "--multi" ||
+       arg == "--no-multi" ||
+       arg == "--multi-force" ||
+       arg == "--no-multi-force" ||
+       arg == "--incremental" ||
+       arg == "--no-incremental" ||
+       arg == "--opt" ||
+       arg == "--no-opt" ||
+       arg == "--opt2" ||
+       arg == "--no-opt2":
+        return true
+    return false
+
+fn v3CompilerLegacyBackendCompatAllowedFlag(arg: str): bool =
+    if v3CompilerFlagMatches(arg, "--in") ||
+       v3CompilerFlagMatches(arg, "--root") ||
+       v3CompilerFlagMatches(arg, "--out") ||
+       v3CompilerFlagMatches(arg, "--output") ||
+       v3CompilerFlagMatches(arg, "--emit") ||
+       v3CompilerFlagMatches(arg, "--target") ||
+       v3CompilerFlagMatches(arg, "--report-out") ||
+       v3CompilerFlagMatches(arg, "--report"):
+        return true
+    return v3CompilerLegacyBackendCompatIgnoredFlag(arg)
+
+fn v3CompilerReadArgFlagValue(args: str[],
+                              index: int32,
+                              key: str,
+                              outValue: var str,
+                              outNextIndex: var int32): bool =
+    outValue = ""
+    outNextIndex = index
+    if index < 0 || index >= args.len:
+        return false
+    let arg = args[index]
+    if v3CompilerTextStartsWith(arg, key + ":"):
+        outValue = strings.dropPrefix(arg, key + ":")
+        return true
+    if v3CompilerTextStartsWith(arg, key + "="):
+        outValue = strings.dropPrefix(arg, key + "=")
+        return true
+    if arg == key && index + 1 < args.len:
+        outValue = args[index + 1]
+        outNextIndex = index + 1
+        return true
+    return false
 
 fn v3CompilerEmitText(kind: V3CompilerEmit): str =
     if kind == v3EmitExe:
@@ -93,19 +225,51 @@ fn v3CompilerPathIsWithinDir(pathRaw: str,
         return true
     return strutil.startsWith(path, dir + "/")
 
+fn v3CompilerPackageManifestExists(dirRaw: str): bool =
+    let dir = v3path.v3PathTrim(dirRaw)
+    if len(dir) <= 0:
+        return false
+    return v3path.v3PathFileExists(v3path.v3PathJoin(dir, "cheng-package.toml"))
+
+fn v3CompilerFindNearestPackageRoot(baseRootRaw: str,
+                                    sourcePathRaw: str): str =
+    let baseRoot = v3path.v3PathTrim(baseRootRaw)
+    let sourcePath = v3path.v3PathTrim(sourcePathRaw)
+    if len(baseRoot) <= 0 || len(sourcePath) <= 0:
+        return ""
+    var cursor = v3path.v3PathParentDir(sourcePath)
+    while len(cursor) > 0:
+        if cursor != baseRoot && !v3CompilerPathIsWithinDir(cursor, baseRoot):
+            break
+        if v3CompilerPackageManifestExists(cursor):
+            return cursor
+        let parent = v3path.v3PathParentDir(cursor)
+        if len(parent) <= 0 || parent == cursor:
+            break
+        cursor = parent
+    if v3CompilerPackageManifestExists(baseRoot):
+        return baseRoot
+    return ""
+
 fn v3CompilerResolvePackageRoot(workspaceRoot: str,
                                 sourcePathRaw: str,
                                 packageRootRaw: str): str =
     let packageRoot = v3path.v3PathAbsolute(workspaceRoot, packageRootRaw)
-    if len(packageRoot) <= 0 || strings.hasSuffix(packageRoot, "/v3"):
+    if len(packageRoot) <= 0:
         return packageRoot
-    if len(sourcePathRaw) <= 0:
-        return packageRoot
+    var baseRoot = packageRoot
     let sourcePath = v3path.v3PathAbsolute(workspaceRoot, sourcePathRaw)
-    let v3PackageRoot = v3path.v3PathJoin(packageRoot, "v3")
-    if v3CompilerPathIsWithinDir(sourcePath, v3PackageRoot):
-        return v3PackageRoot
-    return packageRoot
+    if !strings.hasSuffix(baseRoot, "/v3"):
+        let v3PackageRoot = v3path.v3PathJoin(baseRoot, "v3")
+        if v3CompilerPathIsWithinDir(sourcePath, v3PackageRoot) &&
+           v3CompilerPackageManifestExists(v3PackageRoot):
+            baseRoot = v3PackageRoot
+    if len(sourcePath) <= 0 || !v3CompilerPathIsWithinDir(sourcePath, baseRoot):
+        return baseRoot
+    let nearestPackageRoot = v3CompilerFindNearestPackageRoot(baseRoot, sourcePath)
+    if len(nearestPackageRoot) > 0:
+        return nearestPackageRoot
+    return baseRoot
 
 fn v3CompilerWorldHeadFromArgs(args: str[]): str =
     return v3CompilerReadFlagOrDefault(args, "--world-head", "")
@@ -126,7 +290,10 @@ fn v3CompilerLegacyInPathFromArgs(args: str[]): str =
     return v3CompilerReadFlagOrDefault(args, "--legacy-in", "")
 
 fn v3CompilerChannelFromArgs(args: str[]): str =
-    return v3CompilerReadFlagOrDefault(args, "--channel", "stable")
+    let channel = v3CompilerReadFlagOrDefault(args, "--channel", "")
+    if len(channel) > 0:
+        return channel
+    return "stable"
 
 fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
                                        args: str[],
@@ -134,13 +301,19 @@ fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
     let sourcePath = v3CompilerReadFlagOrDefault(args, "--in", "")
     if len(sourcePath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --in")
-    let packageRootRaw = v3CompilerReadFlagOrDefault(args, "--root", v3CompilerDefaultPackageRoot(workspaceRoot))
+    var packageRootRaw = v3CompilerReadFlagOrDefault(args, "--root", "")
+    if len(packageRootRaw) <= 0:
+        packageRootRaw = v3CompilerDefaultPackageRoot(workspaceRoot)
     let packageRoot = v3CompilerResolvePackageRoot(workspaceRoot, sourcePath, packageRootRaw)
     let outputPath = v3CompilerReadFlagOrDefault(args, "--out", "")
     if requireOutput && len(outputPath) <= 0:
         return Err[V3CompilerRequest]("v3 compiler: missing --out")
-    let targetTriple = v3CompilerReadFlagOrDefault(args, "--target", contracts.v3BootstrapDefaultTarget())
-    let emitText = v3CompilerReadFlagOrDefault(args, "--emit", "exe")
+    var targetTriple = v3CompilerReadFlagOrDefault(args, "--target", "")
+    if len(targetTriple) <= 0:
+        targetTriple = contracts.v3BootstrapDefaultTarget()
+    var emitText = v3CompilerReadFlagOrDefault(args, "--emit", "")
+    if len(emitText) <= 0:
+        emitText = "exe"
     let emitKindRes = v3CompilerEmitFromText(emitText)
     if IsErr(emitKindRes):
         return Err[V3CompilerRequest](Error(emitKindRes))
@@ -157,3 +330,109 @@ fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
 fn v3CompilerRequestFromArgs(workspaceRoot: str,
                              args: str[]): Result[V3CompilerRequest] =
     return v3CompilerRequestFromArgsForCommand(workspaceRoot, args, true)
+
+fn v3CompilerLegacyBackendCompatRequest(workspaceRoot: str,
+                                        args: str[]): Result[V3CompilerRequest] =
+    var sourcePath = ""
+    var packageRootRaw = ""
+    var outputPath = ""
+    var emitText = ""
+    var targetTriple = ""
+    var reportPath = ""
+    var i = 0
+    while i < args.len:
+        let arg = args[i]
+        if len(arg) <= 0:
+            i = i + 1
+            continue
+        var value = ""
+        var nextIndex = i
+        if v3CompilerReadArgFlagValue(args, i, "--in", value, nextIndex):
+            if len(sourcePath) > 0:
+                return Err[V3CompilerRequest]("[backend_driver_exec] multiple input paths are not supported: " + value)
+            sourcePath = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--root", value, nextIndex):
+            packageRootRaw = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--out", value, nextIndex):
+            outputPath = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--output", value, nextIndex):
+            outputPath = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--emit", value, nextIndex):
+            emitText = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--target", value, nextIndex):
+            targetTriple = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--report-out", value, nextIndex):
+            reportPath = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerReadArgFlagValue(args, i, "--report", value, nextIndex):
+            reportPath = value
+            i = nextIndex + 1
+            continue
+        if v3CompilerTextStartsWith(arg, "--"):
+            if v3CompilerLegacyBackendCompatAllowedFlag(arg):
+                i = i + 1
+                continue
+            return Err[V3CompilerRequest]("[backend_driver_exec] unsupported legacy flag after old backend_driver removal: " + arg)
+        if len(sourcePath) > 0:
+            return Err[V3CompilerRequest]("[backend_driver_exec] multiple input paths are not supported: " + arg)
+        sourcePath = arg
+        i = i + 1
+    if len(sourcePath) <= 0:
+        let envSourcePath = v3CompilerReadEnvPair("BACKEND_INPUT", "CHENG_BACKEND_INPUT")
+        sourcePath = envSourcePath
+    if len(sourcePath) <= 0:
+        return Err[V3CompilerRequest]("[backend_driver_exec] missing input source")
+    if len(packageRootRaw) <= 0:
+        packageRootRaw = v3CompilerDefaultPackageRoot(workspaceRoot)
+    let packageRoot = v3CompilerResolvePackageRoot(workspaceRoot, sourcePath, packageRootRaw)
+    let envOutputPath = v3CompilerReadEnvPair("BACKEND_OUTPUT", "CHENG_BACKEND_OUTPUT")
+    if len(outputPath) <= 0:
+        outputPath = envOutputPath
+    if len(outputPath) <= 0:
+        return Err[V3CompilerRequest]("[backend_driver_exec] missing output path")
+    let envEmitText = v3CompilerReadEnvPair("BACKEND_EMIT", "CHENG_BACKEND_EMIT")
+    if len(emitText) <= 0:
+        emitText = envEmitText
+    if len(emitText) <= 0:
+        emitText = "exe"
+    let emitKindRes = v3CompilerEmitFromText(emitText)
+    if IsErr(emitKindRes):
+        return Err[V3CompilerRequest](Error(emitKindRes))
+    let envTargetTriple = v3CompilerReadEnvPair("BACKEND_TARGET", "CHENG_BACKEND_TARGET")
+    if len(targetTriple) <= 0:
+        targetTriple = envTargetTriple
+    if len(targetTriple) <= 0 || targetTriple == "auto":
+        targetTriple = contracts.v3BootstrapDefaultTarget()
+    let envReportPath = v3CompilerReadEnvPair("BACKEND_REPORT_OUT", "CHENG_BACKEND_REPORT_OUT")
+    if len(reportPath) <= 0:
+        reportPath = envReportPath
+    return Ok[V3CompilerRequest](v3CompilerRequestNew(packageRoot,
+                                                     sourcePath,
+                                                     outputPath,
+                                                     targetTriple,
+                                                     Value(emitKindRes),
+                                                     reportPath))
+
+fn v3CompilerSystemLinkCompatArgs(req: V3CompilerRequest): str[] =
+    var out: str[] = []
+    add(out, "--root:" + req.rootDir)
+    add(out, "--in:" + req.sourcePath)
+    add(out, "--emit:" + v3CompilerEmitText(req.emitKind))
+    add(out, "--target:" + req.targetTriple)
+    add(out, "--out:" + req.outputPath)
+    if len(req.reportPath) > 0:
+        add(out, "--report-out:" + req.reportPath)
+    return out

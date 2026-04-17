@@ -1132,7 +1132,8 @@ fn v3BftValidatorRetryableStateSyncRecvError(err: str): bool =
     return v3path.v3TextStartsWith(err, "v3 libp2p quic: dial") ||
            v3path.v3TextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
            v3path.v3TextStartsWith(err, "msquic native: pipe read timeout") ||
-           v3path.v3TextStartsWith(err, "msquic: pipe closed")
+           v3path.v3TextStartsWith(err, "msquic native: handshake ! ready") ||
+           v3path.v3TextStartsWith(err, "msquic native: session ! ready")
 
 fn v3BftValidatorQueueLoad(pathRaw: str): Result[Bytes[]] =
     let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
@@ -1496,15 +1497,23 @@ fn v3BftValidatorRecvCommit(host: str,
 fn v3BftValidatorRecvStateMachine(host: str,
                                   port: int32,
                                   height: int64): Result[bft.V3BftStateMachine] =
-    let ackRes = quic_transport.v3Libp2pQuicRequestResponseNamed(host,
-                                                                 port,
-                                                                 v3BftValidatorPublicTransportServerName(),
-                                                                 v3BftValidatorStateSyncProtocol(),
-                                                                 v3BftValidatorEncodeStateSyncRequest(height))
-    if IsErr(ackRes):
-        return Err[bft.V3BftStateMachine](Error(ackRes))
-    if strutil.strip(bytesToString(Value(ackRes))) != v3BftValidatorStateSyncAck:
-        return Err[bft.V3BftStateMachine]("v3 bft validator: state sync ack mismatch")
+    var ackOk = false
+    for attempt in 0..<512:
+        let ackRes = quic_transport.v3Libp2pQuicRequestResponseNamed(host,
+                                                                     port,
+                                                                     v3BftValidatorPublicTransportServerName(),
+                                                                     v3BftValidatorStateSyncProtocol(),
+                                                                     v3BftValidatorEncodeStateSyncRequest(height))
+        if IsOk(ackRes):
+            if strutil.strip(bytesToString(Value(ackRes))) != v3BftValidatorStateSyncAck:
+                return Err[bft.V3BftStateMachine]("v3 bft validator: state sync ack mismatch")
+            ackOk = true
+            break
+        if !v3BftValidatorRetryableStateSyncRecvError(Error(ackRes)):
+            return Err[bft.V3BftStateMachine](Error(ackRes))
+        attempt
+    if !ackOk:
+        return Err[bft.V3BftStateMachine]("v3 bft validator: state sync ack unavailable")
     for attempt in 0..<512:
         let payloadRes = quic_transport.v3Libp2pQuicRecvPayloadOnceNamed(host,
                                                                          port,

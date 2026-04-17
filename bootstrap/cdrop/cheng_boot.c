@@ -9,14 +9,14 @@ static const char* cdrop_pick_delegate(void) {
     if (env != NULL && env[0] != '\0') {
         return env;
     }
-    if (access("artifacts/backend_driver/cheng", X_OK) == 0) {
-        return "artifacts/backend_driver/cheng";
+    if (access("artifacts/v3_backend_driver/cheng", X_OK) == 0) {
+        return "artifacts/v3_backend_driver/cheng";
     }
-    if (access("dist/releases/current/cheng", X_OK) == 0) {
-        return "dist/releases/current/cheng";
+    if (access("artifacts/v3_bootstrap/cheng.stage3", X_OK) == 0) {
+        return "artifacts/v3_bootstrap/cheng.stage3";
     }
-    if (access("artifacts/backend_seed/cheng.stage2", X_OK) == 0) {
-        return "artifacts/backend_seed/cheng.stage2";
+    if (access("artifacts/v3_bootstrap/cheng.stage0", X_OK) == 0) {
+        return "artifacts/v3_bootstrap/cheng.stage0";
     }
     return NULL;
 }
@@ -27,7 +27,9 @@ int main(int argc, char** argv) {
     if (delegate == NULL) {
         fprintf(stderr,
                 "cheng_boot.c emergency seed: no delegate driver found. "
-                "Set CHENG_CDROP_DELEGATE to a runnable cheng backend driver.\n");
+                "Set CHENG_CDROP_DELEGATE to a runnable v3-compatible delegate "
+                "(for example artifacts/v3_backend_driver/cheng or "
+                "artifacts/v3_bootstrap/cheng.stage3).\n");
         return 1;
     }
 

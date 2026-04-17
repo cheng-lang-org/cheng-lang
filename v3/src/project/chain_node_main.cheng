@@ -6,6 +6,7 @@ import std/strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/anti_entropy as anti
+import cheng/v3/project/bio_did_chain_node as bio_did
 import cheng/v3/project/chain_node as node
 import cheng/v3/project/chain_node_libp2p as net
 import cheng/v3/libp2p/core/types
@@ -27,6 +28,7 @@ fn v3ChainNodeUsage() =
     os.writeLine(os.get_stdout(), "  mint --state:<file> --asset:<id> --account:<id> --amount:<n>")
     os.writeLine(os.get_stdout(), "  transfer --state:<file> --asset:<id> --from:<id> --to:<id> --amount:<n>")
     os.writeLine(os.get_stdout(), "  balance --state:<file> --asset:<id> --account:<id>")
+    os.writeLine(os.get_stdout(), "  bio-did-operator-lookup --state:<file> --operator-id:<hex32> [--preferred-kinds:<kindA,kindB>]")
     os.writeLine(os.get_stdout(), "  show-state --state:<file>")
     os.writeLine(os.get_stdout(), "  dump-snapshot --state:<file>")
     os.writeLine(os.get_stdout(), "  serve-once --state:<file> [--host:<ip>] [--port:<n>] [--ready-path:<file>]")
@@ -230,6 +232,12 @@ fn v3ChainNodeLoadOrInitForSync(statePath: str): Result[node.V3ChainNode] =
         return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
     return Ok[node.V3ChainNode](node.v3ChainNodeInit(nodeId, addressSeed))
 
+fn v3ChainNodeLoadBioDidState(pathRaw: str): Result[bio_did.V3BioDidChainState] =
+    let loadRes = v3ChainNodeLoadState(pathRaw)
+    if IsErr(loadRes):
+        return Err[bio_did.V3BioDidChainState](Error(loadRes))
+    return bio_did.v3BioDidChainStateFromNode(Value(loadRes))
+
 fn v3ChainNodeMainSelfTest(): int32 =
     var server = node.v3ChainNodeInit("node-a", "chain-node-a")
     var client = node.v3ChainNodeInit("node-b", "chain-node-b")
@@ -390,6 +398,37 @@ fn v3ChainNodeBalanceCommand(): int32 =
     os.writeLine(os.get_stdout(), "forest_cid=" + layout.fixedBytes32Hex(node.v3ChainNodeForestCid(state)))
     return 0
 
+fn v3ChainNodeBioDidOperatorLookupCommand(): int32 =
+    var statePath = ""
+    let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
+    if IsErr(statePathRes):
+        os.writeLine(os.get_stderr(), Error(statePathRes))
+        return 2
+    var operatorIdHex = ""
+    let readRes = v3ChainNodeReadRequiredFlag("--operator-id", operatorIdHex)
+    if IsErr(readRes):
+        os.writeLine(os.get_stderr(), Error(readRes))
+        return 2
+    let stateRes = v3ChainNodeLoadBioDidState(statePath)
+    if IsErr(stateRes):
+        os.writeLine(os.get_stderr(), Error(stateRes))
+        return 2
+    var state = Value(stateRes)
+    var preferredKinds: str[]
+    preferredKinds.len = 0
+    var preferredKindsText = ""
+    if cmdline.readFirstFlagValue("--preferred-kinds", preferredKindsText):
+        let parts = strutil.split(preferredKindsText, ',')
+        for i in 0..<parts.len:
+            let trimmed = strutil.strip(parts[i])
+            if len(trimmed) > 0:
+                add(preferredKinds, trimmed)
+    os.writeLine(os.get_stdout(),
+                 bio_did.v3BioDidOperatorLookupJsonFromStateWithKinds(state,
+                                                                      operatorIdHex,
+                                                                      preferredKinds))
+    return 0
+
 fn v3ChainNodeShowStateCommand(): int32 =
     var statePath = ""
     let statePathRes = v3ChainNodeReadRequiredStatePath(statePath)
@@ -536,6 +575,8 @@ fn main(argc: int32, argv: ptr): int32 =
         return v3ChainNodeTransferCommand()
     if cmd == "balance":
         return v3ChainNodeBalanceCommand()
+    if cmd == "bio-did-operator-lookup":
+        return v3ChainNodeBioDidOperatorLookupCommand()
     if cmd == "show-state":
         return v3ChainNodeShowStateCommand()
     if cmd == "dump-snapshot":

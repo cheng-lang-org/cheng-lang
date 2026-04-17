@@ -14,8 +14,8 @@ subcommands:
   help
   status [--out <file>]
   frontend --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]
-  static-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--asset-root <dir> ...]
-  semantic-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>]
+  static-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]
+  semantic-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...]
   codegen-surface --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--truth-trace <file>]
   exec-surface --repo <path> [--out-dir <dir>] [--codegen-manifest <file>]
   native-gui-bundle --repo <path> [--out-dir <dir>] [--codegen-manifest <file>] [--exec-snapshot <file>]
@@ -33,6 +33,15 @@ EOF
 }
 
 maybe_exec_stage3() {
+  cmd_name="$1"
+  shift
+  case "$cmd_name" in
+    help|-h|--help|status|frontend|static-surface|semantic-surface|codegen-surface|discover-truth-routes|capture-truth|compare-truth|exec-route-matrix|compare-truth-matrix|native-gui-bundle|native-gui-runtime|run-native-gui|replay-hit-inspector|compile)
+      ;;
+    *)
+      return 1
+      ;;
+  esac
   if [ "${R2C_REACT_V3_NO_STAGE3_HANDOFF:-0}" = "1" ]; then
     return 1
   fi
@@ -42,7 +51,7 @@ maybe_exec_stage3() {
   # shellcheck disable=SC1090
   . "$bridge_env"
   if [ -n "${V3_BOOTSTRAP_STAGE3:-}" ] && "$V3_BOOTSTRAP_STAGE3" r2c-react-v3 help >/dev/null 2>&1; then
-    exec "$V3_BOOTSTRAP_STAGE3" r2c-react-v3 "$@"
+    exec "$V3_BOOTSTRAP_STAGE3" r2c-react-v3 "$cmd_name" "$@"
   fi
   return 1
 }
@@ -74,302 +83,10 @@ read_flag() {
   printf '%s\n' "$default_value"
 }
 
-collect_flag_values() {
-  key="$1"
-  shift
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      "$key")
-        shift
-        if [ "$#" -gt 0 ]; then
-          printf '%s\n' "$1"
-        fi
-        ;;
-      "$key":*)
-        printf '%s\n' "${1#"$key:"}"
-        ;;
-      "$key"=*)
-        printf '%s\n' "${1#"$key="}"
-        ;;
-    esac
-    shift
-  done
-}
-
-has_flag() {
-  key="$1"
-  shift
-  while [ "$#" -gt 0 ]; do
-    case "$1" in
-      "$key")
-        return 0
-        ;;
-    esac
-    shift
-  done
-  return 1
-}
-
 abs_path() {
   base="$1"
   target="$2"
   node -e 'const path=require("node:path"); console.log(path.resolve(process.argv[1], process.argv[2]));' "$base" "$target"
-}
-
-read_summary_value() {
-  summary_path="$1"
-  key="$2"
-  default_value="$3"
-  if [ ! -f "$summary_path" ]; then
-    printf '%s\n' "$default_value"
-    return 0
-  fi
-  value="$(awk -F= -v want="$key" '$1 == want { sub(/^[^=]*=/, ""); print; exit }' "$summary_path")"
-  if [ -n "$value" ]; then
-    printf '%s\n' "$value"
-  else
-    printf '%s\n' "$default_value"
-  fi
-}
-
-write_report() {
-  report_path="$1"
-  command_name="$2"
-  ok_value="$3"
-  reason_value="$4"
-  repo_root="$5"
-  out_dir="$6"
-  helper_script="$7"
-  helper_summary_path="$8"
-  helper_log_path="$9"
-  primary_artifact_path="${10}"
-  primary_artifact_format="${11}"
-  module_count="${12}"
-  route_count="${13}"
-  semantic_nodes_count="${14}"
-  typescript_version="${15}"
-  asset_count="${16:-0}"
-  tailwind_token_count="${17:-0}"
-  required_host_group_count="${18:-0}"
-  required_host_groups="${19:-}"
-  rsg_node_count="${20:-0}"
-  rsg_edge_count="${21:-0}"
-  blocker_count="${22:-0}"
-  blocked="${23:-false}"
-  extra_helper_summary_path="${24:-}"
-  mkdir -p "$(dirname "$report_path")"
-  REPORT_PATH="$report_path" \
-  REPORT_COMMAND="$command_name" \
-  REPORT_OK="$ok_value" \
-  REPORT_REASON="$reason_value" \
-  REPORT_WORKSPACE_ROOT="$root" \
-  REPORT_EXPERIMENTAL_ROOT="$exp_root" \
-  REPORT_REPO_ROOT="$repo_root" \
-  REPORT_OUT_DIR="$out_dir" \
-  REPORT_HELPER_SCRIPT="$helper_script" \
-  REPORT_HELPER_SUMMARY="$helper_summary_path" \
-  REPORT_HELPER_LOG="$helper_log_path" \
-  REPORT_PRIMARY_ARTIFACT="$primary_artifact_path" \
-  REPORT_PRIMARY_FORMAT="$primary_artifact_format" \
-  REPORT_MODULE_COUNT="$module_count" \
-  REPORT_ROUTE_COUNT="$route_count" \
-  REPORT_SEMANTIC_NODES_COUNT="$semantic_nodes_count" \
-  REPORT_TYPESCRIPT_VERSION="$typescript_version" \
-  REPORT_ASSET_COUNT="$asset_count" \
-  REPORT_TAILWIND_TOKEN_COUNT="$tailwind_token_count" \
-  REPORT_REQUIRED_HOST_GROUP_COUNT="$required_host_group_count" \
-  REPORT_REQUIRED_HOST_GROUPS="$required_host_groups" \
-  REPORT_RSG_NODE_COUNT="$rsg_node_count" \
-  REPORT_RSG_EDGE_COUNT="$rsg_edge_count" \
-  REPORT_BLOCKER_COUNT="$blocker_count" \
-  REPORT_BLOCKED="$blocked" \
-  REPORT_EXTRA_HELPER_SUMMARY="$extra_helper_summary_path" \
-  REPORT_LEGACY_PROTOTYPE="$exp_root/r2c-react-v3.py" \
-  REPORT_CONTROLLER="$controller_name" \
-  node <<'EOF'
-const fs = require('node:fs');
-const path = require('node:path');
-const requiredHostGroups = (process.env.REPORT_REQUIRED_HOST_GROUPS || '').split(',').map((item) => item.trim()).filter(Boolean);
-const parseSummaryEnv = (filePath) => {
-  const out = {};
-  if (!filePath || !fs.existsSync(filePath)) return out;
-  for (const line of fs.readFileSync(filePath, 'utf8').split(/\r?\n/)) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const pivot = trimmed.indexOf('=');
-    if (pivot <= 0) continue;
-    out[trimmed.slice(0, pivot)] = trimmed.slice(pivot + 1);
-  }
-  return out;
-};
-const helperSummary = {
-  ...parseSummaryEnv(process.env.REPORT_HELPER_SUMMARY),
-  ...parseSummaryEnv(process.env.REPORT_EXTRA_HELPER_SUMMARY),
-};
-const parseBool = (value) => {
-  if (value === 'true') return true;
-  if (value === 'false') return false;
-  return null;
-};
-const parseNumber = (value) => {
-  if (value == null) return null;
-  const text = String(value).trim();
-  if (!text) return null;
-  const num = Number(text);
-  return Number.isFinite(num) ? num : null;
-};
-const out = {
-  format: 'controller_report_v1',
-  controller: process.env.REPORT_CONTROLLER,
-  command: process.env.REPORT_COMMAND,
-  ok: process.env.REPORT_OK === 'true',
-  reason: process.env.REPORT_REASON,
-  workspace_root: process.env.REPORT_WORKSPACE_ROOT,
-  experimental_root: process.env.REPORT_EXPERIMENTAL_ROOT,
-  repo_root: process.env.REPORT_REPO_ROOT,
-  out_dir: process.env.REPORT_OUT_DIR,
-  node_program: 'node',
-  python_program: 'python3',
-  helper_script: process.env.REPORT_HELPER_SCRIPT,
-  helper_summary_path: process.env.REPORT_HELPER_SUMMARY,
-  helper_log_path: process.env.REPORT_HELPER_LOG,
-  primary_artifact_path: process.env.REPORT_PRIMARY_ARTIFACT,
-  primary_artifact_format: process.env.REPORT_PRIMARY_FORMAT,
-  module_count: Number(process.env.REPORT_MODULE_COUNT || 0),
-  route_count: Number(process.env.REPORT_ROUTE_COUNT || 0),
-  semantic_nodes_count: Number(process.env.REPORT_SEMANTIC_NODES_COUNT || 0),
-  asset_count: Number(process.env.REPORT_ASSET_COUNT || 0),
-  tailwind_token_count: Number(process.env.REPORT_TAILWIND_TOKEN_COUNT || 0),
-  required_host_group_count: Number(process.env.REPORT_REQUIRED_HOST_GROUP_COUNT || 0),
-  required_host_groups: requiredHostGroups,
-  rsg_node_count: Number(process.env.REPORT_RSG_NODE_COUNT || 0),
-  rsg_edge_count: Number(process.env.REPORT_RSG_EDGE_COUNT || 0),
-  blocker_count: Number(process.env.REPORT_BLOCKER_COUNT || 0),
-  blocked: process.env.REPORT_BLOCKED === 'true',
-  typescript_version: process.env.REPORT_TYPESCRIPT_VERSION || '',
-  legacy_prototype_path: process.env.REPORT_LEGACY_PROTOTYPE,
-  truth_compare_ok: parseBool(helperSummary.truth_compare_ok),
-  truth_compare_reason: helperSummary.truth_compare_reason || null,
-  truth_compare_matrix_ok: parseBool(helperSummary.truth_compare_matrix_ok),
-  truth_compare_matrix_reason: helperSummary.truth_compare_matrix_reason || null,
-  native_gui_bundle_path: helperSummary.native_gui_bundle_path || null,
-  native_gui_launcher_module: helperSummary.native_gui_launcher_module || null,
-  native_gui_host_ready: parseBool(helperSummary.native_gui_host_ready),
-  native_gui_renderer_ready: parseBool(helperSummary.native_gui_renderer_ready),
-  native_gui_session_path: helperSummary.native_gui_session_path || null,
-  native_gui_session_preview_ready: parseBool(helperSummary.native_gui_session_preview_ready),
-  native_gui_session_preview_mode: helperSummary.native_gui_session_preview_mode || null,
-  native_gui_layout_surface_path: helperSummary.native_gui_layout_surface_path || null,
-  native_gui_layout_surface_ready: parseBool(helperSummary.native_gui_layout_surface_ready),
-  native_gui_layout_surface_node_count: Number(helperSummary.native_gui_layout_surface_node_count || 0),
-  native_gui_layout_surface_source_module: helperSummary.native_gui_layout_surface_source_module || null,
-  native_gui_layout_surface_source_component: helperSummary.native_gui_layout_surface_source_component || null,
-  native_gui_layout_surface_strategy: helperSummary.native_gui_layout_surface_strategy || null,
-  native_gui_layout_surface_component_expansion_count: Number(helperSummary.native_gui_layout_surface_component_expansion_count || 0),
-  native_gui_layout_surface_parsed_module_count: Number(helperSummary.native_gui_layout_surface_parsed_module_count || 0),
-  native_gui_layout_surface_styled_node_count: Number(helperSummary.native_gui_layout_surface_styled_node_count || 0),
-  native_gui_layout_surface_interactive_node_count: Number(helperSummary.native_gui_layout_surface_interactive_node_count || 0),
-  native_gui_style_layout_surface_path: helperSummary.native_gui_style_layout_surface_path || null,
-  native_gui_style_layout_surface_ready: parseBool(helperSummary.native_gui_style_layout_surface_ready),
-  native_gui_style_layout_surface_node_count: Number(helperSummary.native_gui_style_layout_surface_node_count || 0),
-  native_gui_style_layout_overlay_node_count: Number(helperSummary.native_gui_style_layout_overlay_node_count || 0),
-  native_gui_style_layout_surface_surface_node_count: Number(helperSummary.native_gui_style_layout_surface_surface_node_count || 0),
-  native_gui_style_layout_surface_control_node_count: Number(helperSummary.native_gui_style_layout_surface_control_node_count || 0),
-  native_gui_native_layout_plan_path: helperSummary.native_gui_native_layout_plan_path || null,
-  native_gui_native_layout_plan_ready: parseBool(helperSummary.native_gui_native_layout_plan_ready),
-  native_gui_native_layout_plan_policy_source: helperSummary.native_gui_native_layout_plan_policy_source || null,
-  native_gui_native_layout_plan_item_count: Number(helperSummary.native_gui_native_layout_plan_item_count || 0),
-  native_gui_native_layout_plan_viewport_item_count: Number(helperSummary.native_gui_native_layout_plan_viewport_item_count || 0),
-  native_gui_native_layout_plan_clipped_item_count: Number(helperSummary.native_gui_native_layout_plan_clipped_item_count || 0),
-  native_gui_native_layout_plan_interactive_item_count: Number(helperSummary.native_gui_native_layout_plan_interactive_item_count || 0),
-  native_gui_native_layout_plan_source_backed_item_count: Number(helperSummary.native_gui_native_layout_plan_source_backed_item_count || 0),
-  native_gui_native_layout_plan_scroll_height: Number(helperSummary.native_gui_native_layout_plan_scroll_height || 0),
-  native_gui_initial_render_plan_path: helperSummary.native_gui_initial_render_plan_path || null,
-  native_gui_initial_render_plan_ready: parseBool(helperSummary.native_gui_initial_render_plan_ready),
-  native_gui_initial_render_plan_command_count: Number(helperSummary.native_gui_initial_render_plan_command_count || 0),
-  native_gui_initial_render_plan_visible_layout_item_count: Number(helperSummary.native_gui_initial_render_plan_visible_layout_item_count || 0),
-  native_gui_render_plan_path: helperSummary.native_gui_render_plan_path || null,
-  native_gui_render_plan_ready: parseBool(helperSummary.native_gui_render_plan_ready),
-  native_gui_render_plan_command_count: Number(helperSummary.native_gui_render_plan_command_count || 0),
-  native_gui_render_plan_visible_layout_item_count: Number(helperSummary.native_gui_render_plan_visible_layout_item_count || 0),
-  native_gui_runtime_path: helperSummary.native_gui_runtime_path || null,
-  native_gui_runtime_ready: parseBool(helperSummary.native_gui_runtime_ready),
-  native_gui_runtime_error: helperSummary.native_gui_runtime_error || null,
-  native_gui_runtime_exe_path: helperSummary.native_gui_runtime_exe_path || null,
-  native_gui_initial_runtime_state_path: helperSummary.native_gui_initial_runtime_state_path || null,
-  native_gui_runtime_state_path: helperSummary.native_gui_runtime_state_path || null,
-  native_gui_host_exe_path: helperSummary.native_gui_host_exe_path || null,
-  native_gui_window_opened: parseBool(helperSummary.native_gui_window_opened),
-  native_gui_window_title: helperSummary.native_gui_window_title || null,
-  native_gui_route_state: helperSummary.native_gui_route_state || null,
-  native_gui_entry_module: helperSummary.native_gui_entry_module || null,
-  native_gui_layout_item_count: Number(helperSummary.native_gui_layout_item_count || 0),
-  native_gui_visible_layout_item_count: Number(helperSummary.native_gui_visible_layout_item_count || 0),
-  native_gui_click_count: Number(helperSummary.native_gui_click_count || 0),
-  native_gui_resize_count: Number(helperSummary.native_gui_resize_count || 0),
-  native_gui_scroll_count: Number(helperSummary.native_gui_scroll_count || 0),
-  native_gui_focus_count: Number(helperSummary.native_gui_focus_count || 0),
-  native_gui_key_count: Number(helperSummary.native_gui_key_count || 0),
-  native_gui_text_count: Number(helperSummary.native_gui_text_count || 0),
-  native_gui_last_click_x: parseNumber(helperSummary.native_gui_last_click_x),
-  native_gui_last_click_y: parseNumber(helperSummary.native_gui_last_click_y),
-  native_gui_scroll_offset_y: parseNumber(helperSummary.native_gui_scroll_offset_y),
-  native_gui_focused_item_id: helperSummary.native_gui_focused_item_id || null,
-  native_gui_typed_text: helperSummary.native_gui_typed_text || null,
-  native_gui_last_key: helperSummary.native_gui_last_key || null,
-  native_gui_hit_item_id: helperSummary.native_gui_hit_item_id || null,
-  native_gui_hit_source_node_id: helperSummary.native_gui_hit_source_node_id || null,
-  native_gui_hit_source_module_path: helperSummary.native_gui_hit_source_module_path || null,
-  native_gui_hit_source_component_name: helperSummary.native_gui_hit_source_component_name || null,
-  native_gui_hit_source_line: Number(helperSummary.native_gui_hit_source_line || 0),
-  native_gui_hit_item_interactive: parseBool(helperSummary.native_gui_hit_item_interactive),
-  native_gui_hit_inspector_path: helperSummary.native_gui_hit_inspector_path || null,
-  native_gui_hit_inspector_ready: parseBool(helperSummary.native_gui_hit_inspector_ready),
-  native_gui_inspector_state_path: helperSummary.native_gui_inspector_state_path || null,
-  native_gui_inspector_state_ready: parseBool(helperSummary.native_gui_inspector_state_ready),
-  native_gui_inspector_replay_path: helperSummary.native_gui_inspector_replay_path || null,
-  native_gui_inspector_replay_ready: parseBool(helperSummary.native_gui_inspector_replay_ready),
-  native_gui_inspector_replay_panel_title: helperSummary.native_gui_inspector_replay_panel_title || null,
-  native_gui_inspector_replay_panel_line_count: Number(helperSummary.native_gui_inspector_replay_panel_line_count || 0),
-  native_gui_source_jump_enabled: parseBool(helperSummary.native_gui_source_jump_enabled),
-  native_gui_source_jump_attempted: parseBool(helperSummary.native_gui_source_jump_attempted),
-  native_gui_source_jump_ok: parseBool(helperSummary.native_gui_source_jump_ok),
-  native_gui_source_jump_target_path: helperSummary.native_gui_source_jump_target_path || null,
-  native_gui_source_jump_target_line: Number(helperSummary.native_gui_source_jump_target_line || 0),
-  native_gui_source_jump_command: helperSummary.native_gui_source_jump_command || null,
-  native_gui_source_jump_error: helperSummary.native_gui_source_jump_error || null,
-  native_gui_replay_source_open_requested: parseBool(helperSummary.native_gui_replay_source_open_requested),
-  native_gui_replay_source_open_ok: parseBool(helperSummary.native_gui_replay_source_open_ok),
-  native_gui_replay_source_open_target_path: helperSummary.native_gui_replay_source_open_target_path || null,
-  native_gui_replay_source_open_target_line: Number(helperSummary.native_gui_replay_source_open_target_line || 0),
-  native_gui_replay_source_open_command: helperSummary.native_gui_replay_source_open_command || null,
-  native_gui_replay_source_open_error: helperSummary.native_gui_replay_source_open_error || null,
-  native_gui_window_width: parseNumber(helperSummary.native_gui_window_width),
-  native_gui_window_height: parseNumber(helperSummary.native_gui_window_height),
-  native_gui_screenshot_path: helperSummary.native_gui_screenshot_path || null,
-  native_gui_screenshot_written: parseBool(helperSummary.native_gui_screenshot_written),
-  commands: [
-    'status',
-    'frontend',
-    'static-surface',
-    'semantic-surface',
-    'codegen-surface',
-    'exec-surface',
-    'native-gui-bundle',
-    'run-native-gui',
-    'replay-hit-inspector',
-    'exec-route-matrix',
-    'compile',
-    'discover-truth-routes',
-    'capture-truth',
-    'compare-truth',
-    'compare-truth-matrix',
-    'prototype',
-  ],
-};
-fs.mkdirSync(path.dirname(process.env.REPORT_PATH), { recursive: true });
-fs.writeFileSync(process.env.REPORT_PATH, JSON.stringify(out, null, 2) + '\n', 'utf8');
-EOF
 }
 
 status_cmd() {
@@ -396,35 +113,50 @@ const out = {
   static_surface_helper: '',
   semantic_surface_helper: '',
   codegen_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-codegen-surface.mjs'),
-  exec_surface_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-exec-surface.mjs'),
+  exec_surface_helper: '',
   truth_route_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-discover-truth-routes.mjs'),
   truth_runtime_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-runtime.mjs'),
   native_gui_bundle_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-native-gui-bundle.mjs'),
   native_gui_runtime_helper: '',
   native_gui_runtime_mode: 'cheng_controller_compiled_json_v1',
   native_gui_run_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-native-gui-run.mjs'),
-  native_gui_replay_hit_inspector_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-replay-hit-inspector.mjs'),
+  native_gui_replay_hit_inspector_helper: '',
   exec_route_matrix_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-exec-route-matrix.mjs'),
-  truth_compare_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-compare.mjs'),
-  truth_compare_matrix_helper: path.join(process.env.REPORT_EXPERIMENTAL_ROOT, 'r2c-react-v3-truth-compare-matrix.mjs'),
+  truth_compare_helper: '',
+  truth_compare_matrix_helper: '',
   node_helper_surface_mode: 'cheng_controller_min_surface_v1',
   legacy_wrapper_required: false,
   legacy_prototype_required: false,
-  active_node_helper_count: 9,
-  retired_node_helper_count: 3,
-  retired_node_helpers: ['native_gui_runtime_helper', 'semantic_surface_helper', 'static_surface_helper'],
+  active_node_helper_count: 6,
+  retired_node_helper_count: 7,
+  retired_node_helpers: ['native_gui_runtime_helper', 'native_gui_replay_hit_inspector_helper', 'semantic_surface_helper', 'static_surface_helper', 'exec_surface_helper', 'truth_compare_helper', 'truth_compare_matrix_helper'],
   standalone_node_helper_count: 1,
-  standalone_node_helpers: ['exec_surface_helper'],
+  standalone_node_helpers: ['truth_runtime_helper'],
   active_node_helpers: [
     'tsx_frontend_helper',
     'codegen_surface_helper',
     'native_gui_bundle_helper',
     'native_gui_run_helper',
-    'native_gui_replay_hit_inspector_helper',
     'exec_route_matrix_helper',
     'truth_route_helper',
-    'truth_compare_helper',
-    'truth_compare_matrix_helper',
+  ],
+  commands: [
+    'status',
+    'frontend',
+    'static-surface',
+    'semantic-surface',
+    'codegen-surface',
+    'exec-surface',
+    'native-gui-bundle',
+    'run-native-gui',
+    'replay-hit-inspector',
+    'exec-route-matrix',
+    'compile',
+    'discover-truth-routes',
+    'capture-truth',
+    'compare-truth',
+    'compare-truth-matrix',
+    'prototype',
   ],
 };
 fs.mkdirSync(path.dirname(process.env.REPORT_PATH), { recursive: true });
@@ -445,554 +177,71 @@ console.log(JSON.stringify({
   static_surface_helper: '',
   semantic_surface_helper: '',
   codegen_surface_helper: '$exp_root/r2c-react-v3-codegen-surface.mjs',
-  exec_surface_helper: '$exp_root/r2c-react-v3-exec-surface.mjs',
+  exec_surface_helper: '',
   truth_route_helper: '$exp_root/r2c-react-v3-discover-truth-routes.mjs',
   truth_runtime_helper: '$exp_root/r2c-react-v3-truth-runtime.mjs',
   native_gui_bundle_helper: '$exp_root/r2c-react-v3-native-gui-bundle.mjs',
   native_gui_runtime_helper: '',
   native_gui_runtime_mode: 'cheng_controller_compiled_json_v1',
   native_gui_run_helper: '$exp_root/r2c-react-v3-native-gui-run.mjs',
-  native_gui_replay_hit_inspector_helper: '$exp_root/r2c-react-v3-replay-hit-inspector.mjs',
+  native_gui_replay_hit_inspector_helper: '',
   exec_route_matrix_helper: '$exp_root/r2c-react-v3-exec-route-matrix.mjs',
-  truth_compare_helper: '$exp_root/r2c-react-v3-truth-compare.mjs',
-  truth_compare_matrix_helper: '$exp_root/r2c-react-v3-truth-compare-matrix.mjs',
+  truth_compare_helper: '',
+  truth_compare_matrix_helper: '',
   node_helper_surface_mode: 'cheng_controller_min_surface_v1',
   legacy_wrapper_required: false,
   legacy_prototype_required: false,
-  active_node_helper_count: 9,
-  retired_node_helper_count: 3,
-  retired_node_helpers: ['native_gui_runtime_helper', 'semantic_surface_helper', 'static_surface_helper'],
+  active_node_helper_count: 6,
+  retired_node_helper_count: 7,
+  retired_node_helpers: ['native_gui_runtime_helper', 'native_gui_replay_hit_inspector_helper', 'semantic_surface_helper', 'static_surface_helper', 'exec_surface_helper', 'truth_compare_helper', 'truth_compare_matrix_helper'],
   standalone_node_helper_count: 1,
-  standalone_node_helpers: ['exec_surface_helper'],
+  standalone_node_helpers: ['truth_runtime_helper'],
   active_node_helpers: [
     'tsx_frontend_helper',
     'codegen_surface_helper',
     'native_gui_bundle_helper',
     'native_gui_run_helper',
-    'native_gui_replay_hit_inspector_helper',
     'exec_route_matrix_helper',
     'truth_route_helper',
-    'truth_compare_helper',
-    'truth_compare_matrix_helper',
+  ],
+  commands: [
+    'status',
+    'frontend',
+    'static-surface',
+    'semantic-surface',
+    'codegen-surface',
+    'exec-surface',
+    'native-gui-bundle',
+    'run-native-gui',
+    'replay-hit-inspector',
+    'exec-route-matrix',
+    'compile',
+    'discover-truth-routes',
+    'capture-truth',
+    'compare-truth',
+    'compare-truth-matrix',
+    'prototype',
   ],
 }, null, 2))
 EOF
 }
 
-frontend_like_cmd() {
+require_live_controller_cmd() {
   command_name="$1"
-  hard_fail_after_frontend="$2"
-  shift 2
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  asset_values="$(collect_flag_values --asset-root "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
-  artifact_path="$out_dir/tsx_ast_v1.json"
-  summary_path="$out_dir/tsx_ast_v1.summary.env"
-  static_helper_script="$exp_root/r2c-react-v3-static-surface.mjs"
-  static_summary_path="$out_dir/static_surface.summary.env"
-  static_log_path="$out_dir/static_surface.log"
-  semantic_helper_script="$exp_root/r2c-react-v3-semantic-surface.mjs"
-  semantic_summary_path="$out_dir/semantic_surface.summary.env"
-  semantic_log_path="$out_dir/semantic_surface.log"
-  codegen_helper_script="$exp_root/r2c-react-v3-codegen-surface.mjs"
-  codegen_summary_path="$out_dir/codegen_surface.summary.env"
-  codegen_log_path="$out_dir/codegen_surface.log"
-  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
-  truth_state="$(read_flag --truth-state "" "$@")"
-  truth_routes_file_raw="$(read_flag --truth-routes-file "" "$@")"
-  truth_routes_discover=false
-  if has_flag --truth-routes-discover "$@"; then
-    truth_routes_discover=true
-  fi
-  truth_route_helper_script="$exp_root/r2c-react-v3-discover-truth-routes.mjs"
-  truth_routes_summary_path="$out_dir/truth_routes_v1.summary.env"
-  truth_routes_log_path="$out_dir/truth_routes.log"
-  truth_routes_path="$out_dir/truth_routes_v1.json"
-  exec_route_matrix_helper_script="$exp_root/r2c-react-v3-exec-route-matrix.mjs"
-  exec_route_matrix_summary_path="$out_dir/exec_route_matrix.summary.env"
-  exec_route_matrix_log_path="$out_dir/exec_route_matrix.log"
-  exec_route_matrix_path="$out_dir/cheng_codegen_exec_route_matrix_v1.json"
-  truth_compare_helper_script="$exp_root/r2c-react-v3-truth-compare.mjs"
-  truth_compare_summary_path="$out_dir/truth_compare.summary.env"
-  truth_compare_log_path="$out_dir/truth_compare.log"
-  truth_compare_path="$out_dir/truth_compare_v1.json"
-  truth_compare_matrix_helper_script="$exp_root/r2c-react-v3-truth-compare-matrix.mjs"
-  truth_compare_matrix_summary_path="$out_dir/truth_compare_matrix.summary.env"
-  truth_compare_matrix_log_path="$out_dir/truth_compare_matrix.log"
-  truth_compare_matrix_path="$out_dir/truth_compare_matrix_v1.json"
-  native_gui_bundle_helper_script="$exp_root/r2c-react-v3-native-gui-bundle.mjs"
-  native_gui_bundle_summary_path="$out_dir/native_gui_bundle.summary.env"
-  native_gui_bundle_log_path="$out_dir/native_gui_bundle.log"
-  native_gui_bundle_path="$out_dir/native_gui_bundle_v1.json"
-  truth_trace_path=""
-  if [ -n "$truth_trace_raw" ]; then
-    truth_trace_path="$(abs_path "$repo" "$truth_trace_raw")"
-    if [ ! -f "$truth_trace_path" ]; then
-      write_report "$report_path" "$command_name" false missing_truth_trace "$repo" "$out_dir" "$codegen_helper_script" "$codegen_summary_path" "$codegen_log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-      echo "r2c-react-v3: missing truth trace: $truth_trace_path" >&2
-      return 1
-    fi
-  fi
-  module_inventory_path="$out_dir/module_inventory_v1.json"
-  rsg_path="$out_dir/rsg_v1.json"
-  codegen_manifest_path="$out_dir/cheng_codegen_v1.json"
-  exec_snapshot_path="$out_dir/cheng_codegen_exec_snapshot_v1.json"
-  log_path="$out_dir/tsx_frontend.log"
-  if [ "$hard_fail_after_frontend" = "true" ]; then
-    report_path="$out_dir/compile_report_v1.json"
-  else
-    report_path="$out_dir/frontend_report_v1.json"
-  fi
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --repo "$repo" --out "$artifact_path" --summary-out "$summary_path"
-  if [ -n "$runtime_values" ]; then
-    OLD_IFS="${IFS}"
-    IFS='
-'
-    for runtime_root in $runtime_values; do
-      set -- "$@" --runtime-root "$runtime_root"
-    done
-    IFS="${OLD_IFS}"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" tsx_ast_v1 0 0 0 ""
-    echo "r2c-react-v3: tsx frontend helper failed" >&2
-    tail -n 80 "$log_path" >&2 || true
-    return 1
-  fi
-  module_count="$(read_summary_value "$summary_path" module_count 0)"
-  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
-  if [ "$hard_fail_after_frontend" = "true" ]; then
-    set -- "$static_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$static_summary_path"
-    if [ -n "$asset_values" ]; then
-      OLD_IFS="${IFS}"
-      IFS='
-'
-      for asset_root in $asset_values; do
-        set -- "$@" --asset-root "$asset_root"
-      done
-      IFS="${OLD_IFS}"
-    fi
-    if ! node "$@" >"$static_log_path" 2>&1; then
-      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$static_helper_script" "$static_summary_path" "$static_log_path" "$module_inventory_path" module_inventory_v1 "$module_count" 0 0 "$typescript_version"
-      echo "r2c-react-v3: static surface helper failed" >&2
-      tail -n 80 "$static_log_path" >&2 || true
-      return 1
-    fi
-    asset_count="$(read_summary_value "$static_summary_path" asset_count 0)"
-    tailwind_token_count="$(read_summary_value "$static_summary_path" tailwind_token_count 0)"
-    required_host_group_count="$(read_summary_value "$static_summary_path" required_host_group_count 0)"
-    required_host_groups="$(read_summary_value "$static_summary_path" required_host_groups '')"
-    module_inventory_path="$(read_summary_value "$static_summary_path" module_inventory_path "$module_inventory_path")"
-    typescript_version="$(read_summary_value "$static_summary_path" typescript_version "$typescript_version")"
-    set -- "$semantic_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$semantic_summary_path"
-    if ! node "$@" >"$semantic_log_path" 2>&1; then
-      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$semantic_helper_script" "$semantic_summary_path" "$semantic_log_path" "$rsg_path" rsg_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
-      echo "r2c-react-v3: semantic surface helper failed" >&2
-      tail -n 80 "$semantic_log_path" >&2 || true
-      return 1
-    fi
-    rsg_node_count="$(read_summary_value "$semantic_summary_path" rsg_node_count 0)"
-    rsg_edge_count="$(read_summary_value "$semantic_summary_path" rsg_edge_count 0)"
-    blocker_count="$(read_summary_value "$semantic_summary_path" blocker_count 0)"
-    blocked="$(read_summary_value "$semantic_summary_path" blocked false)"
-    rsg_path="$(read_summary_value "$semantic_summary_path" rsg_path "$rsg_path")"
-    typescript_version="$(read_summary_value "$semantic_summary_path" typescript_version "$typescript_version")"
-    set -- "$codegen_helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$artifact_path" --summary-out "$codegen_summary_path"
-    if [ -n "$truth_trace_path" ]; then
-      set -- "$@" --truth-trace "$truth_trace_path"
-    fi
-    if ! node "$@" >"$codegen_log_path" 2>&1; then
-      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$codegen_helper_script" "$codegen_summary_path" "$codegen_log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-      echo "r2c-react-v3: codegen surface helper failed" >&2
-      tail -n 80 "$codegen_log_path" >&2 || true
-      return 1
-    fi
-    codegen_manifest_path="$(read_summary_value "$codegen_summary_path" codegen_manifest_path "$codegen_manifest_path")"
-    route_catalog_path="$(read_summary_value "$codegen_summary_path" route_catalog_path "$out_dir/cheng_codegen_route_catalog_v1.json")"
-    typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$typescript_version")"
-    set -- "$native_gui_bundle_helper_script" --repo "$repo" --out-dir "$out_dir" --codegen-manifest "$codegen_manifest_path" --exec-snapshot "$exec_snapshot_path" --host-contract "$out_dir/unimaker_host_v1.json" --asset-manifest "$out_dir/asset_manifest_v1.json" --tailwind-manifest "$out_dir/tailwind_style_manifest_v1.json" --route-catalog "$route_catalog_path" --out "$native_gui_bundle_path" --summary-out "$native_gui_bundle_summary_path"
-    if ! node "$@" >"$native_gui_bundle_log_path" 2>&1; then
-      write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$native_gui_bundle_helper_script" "$native_gui_bundle_summary_path" "$native_gui_bundle_log_path" "$native_gui_bundle_path" native_gui_bundle_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-      echo "r2c-react-v3: native gui bundle helper failed" >&2
-      tail -n 120 "$native_gui_bundle_log_path" >&2 || true
-      return 1
-    fi
-    exec_semantic_nodes_count="$(read_summary_value "$native_gui_bundle_summary_path" initial_semantic_nodes_count 0)"
-    exec_snapshot_path="$(read_summary_value "$native_gui_bundle_summary_path" native_gui_exec_snapshot_path "$exec_snapshot_path")"
-    route_catalog_path="$(read_summary_value "$native_gui_bundle_summary_path" native_gui_route_catalog_path "$route_catalog_path")"
-    native_gui_bundle_path="$(read_summary_value "$native_gui_bundle_summary_path" native_gui_bundle_path "$native_gui_bundle_path")"
-    if [ -z "$truth_trace_raw" ]; then
-      write_report "$report_path" "$command_name" false truth_compare_input_missing "$repo" "$out_dir" "$native_gui_bundle_helper_script" "$native_gui_bundle_summary_path" "$native_gui_bundle_log_path" "$native_gui_bundle_path" native_gui_bundle_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-      echo "r2c-react-v3: compile 现在已经 lift 到 native-gui-bundle 主链；要完成真值验收请显式传 --truth-trace 和可选 --truth-state" >&2
-      return 2
-    fi
-    set -- "$truth_compare_helper_script" --exec-snapshot "$exec_snapshot_path" --truth-trace "$truth_trace_path" --codegen-manifest "$codegen_manifest_path" --out "$truth_compare_path" --summary-out "$truth_compare_summary_path"
-    if [ -n "$truth_state" ]; then
-      set -- "$@" --truth-state "$truth_state"
-    fi
-    if ! node "$@" >"$truth_compare_log_path" 2>&1; then
-      truth_compare_reason="$(read_summary_value "$truth_compare_summary_path" truth_compare_reason helper_failed)"
-      truth_compare_path="$(read_summary_value "$truth_compare_summary_path" truth_compare_path "$truth_compare_path")"
-      write_report "$report_path" "$command_name" false "$truth_compare_reason" "$repo" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 "$module_count" 1 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-      echo "r2c-react-v3: truth compare failed" >&2
-      tail -n 120 "$truth_compare_log_path" >&2 || true
-      return 2
-    fi
-    truth_compare_path="$(read_summary_value "$truth_compare_summary_path" truth_compare_path "$truth_compare_path")"
-    route_count=1
-    if [ "$truth_routes_discover" = "true" ]; then
-      set -- "$truth_route_helper_script" --repo "$repo" --out "$truth_routes_path" --summary-out "$truth_routes_summary_path"
-      if [ -n "$runtime_values" ]; then
-        OLD_IFS="${IFS}"
-        IFS='
-'
-        for runtime_root in $runtime_values; do
-          set -- "$@" --runtime-root "$runtime_root"
-        done
-        IFS="${OLD_IFS}"
-      fi
-      if ! node "$@" >"$truth_routes_log_path" 2>&1; then
-        write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$truth_route_helper_script" "$truth_routes_summary_path" "$truth_routes_log_path" "$truth_routes_path" truth_routes_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-        echo "r2c-react-v3: truth route helper failed" >&2
-        tail -n 120 "$truth_routes_log_path" >&2 || true
-        return 1
-      fi
-      truth_routes_path="$(read_summary_value "$truth_routes_summary_path" out_path "$truth_routes_path")"
-    elif [ -n "$truth_routes_file_raw" ]; then
-      truth_routes_path="$(abs_path "$repo" "$truth_routes_file_raw")"
-      if [ ! -f "$truth_routes_path" ]; then
-        write_report "$report_path" "$command_name" false missing_truth_routes "$repo" "$out_dir" "$exec_route_matrix_helper_script" "$exec_route_matrix_summary_path" "$exec_route_matrix_log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-        echo "r2c-react-v3: missing truth routes: $truth_routes_path" >&2
-        return 1
-      fi
-    fi
-    if [ "$truth_routes_discover" = "true" ] || [ -n "$truth_routes_file_raw" ]; then
-      set -- "$exec_route_matrix_helper_script" --route-catalog "$route_catalog_path" --exec-snapshot "$exec_snapshot_path" --truth-routes-file "$truth_routes_path" --codegen-manifest "$codegen_manifest_path" --truth-trace "$truth_trace_path" --out "$exec_route_matrix_path" --summary-out "$exec_route_matrix_summary_path"
-      if ! node "$@" >"$exec_route_matrix_log_path" 2>&1; then
-        write_report "$report_path" "$command_name" false helper_failed "$repo" "$out_dir" "$exec_route_matrix_helper_script" "$exec_route_matrix_summary_path" "$exec_route_matrix_log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 "$module_count" 0 "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-        echo "r2c-react-v3: exec route matrix helper failed" >&2
-        tail -n 120 "$exec_route_matrix_log_path" >&2 || true
-        return 1
-      fi
-      route_count="$(read_summary_value "$exec_route_matrix_summary_path" route_count 0)"
-      exec_route_matrix_path="$(read_summary_value "$exec_route_matrix_summary_path" route_matrix_path "$exec_route_matrix_path")"
-      set -- "$truth_compare_matrix_helper_script" --exec-route-matrix "$exec_route_matrix_path" --truth-trace "$truth_trace_path" --codegen-manifest "$codegen_manifest_path" --out "$truth_compare_matrix_path" --summary-out "$truth_compare_matrix_summary_path"
-      if ! node "$@" >"$truth_compare_matrix_log_path" 2>&1; then
-        truth_compare_matrix_reason="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_reason helper_failed)"
-        route_count="$(read_summary_value "$truth_compare_matrix_summary_path" route_count "$route_count")"
-        truth_compare_matrix_path="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_path "$truth_compare_matrix_path")"
-        write_report "$report_path" "$command_name" false "$truth_compare_matrix_reason" "$repo" "$out_dir" "$truth_compare_matrix_helper_script" "$truth_compare_matrix_summary_path" "$truth_compare_matrix_log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked" "$truth_compare_summary_path"
-        echo "r2c-react-v3: truth compare matrix failed" >&2
-        tail -n 120 "$truth_compare_matrix_log_path" >&2 || true
-        return 2
-      fi
-      route_count="$(read_summary_value "$truth_compare_matrix_summary_path" route_count "$route_count")"
-      truth_compare_matrix_path="$(read_summary_value "$truth_compare_matrix_summary_path" truth_compare_matrix_path "$truth_compare_matrix_path")"
-      write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$truth_compare_matrix_helper_script" "$truth_compare_matrix_summary_path" "$truth_compare_matrix_log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked" "$truth_compare_summary_path"
-      printf '%s\n' "$report_path"
-      return 0
-    fi
-    write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 "$module_count" "$route_count" "$exec_semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-    printf '%s\n' "$report_path"
-    return 0
-  fi
-  write_report "$report_path" "$command_name" true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" tsx_ast_v1 "$module_count" 0 0 "$typescript_version"
-  printf '%s\n' "$report_path"
-}
-
-static_surface_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
-  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  asset_values="$(collect_flag_values --asset-root "$@")"
-  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
-  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
-  frontend_log_path="$out_dir/tsx_frontend.log"
-  helper_script="$exp_root/r2c-react-v3-static-surface.mjs"
-  summary_path="$out_dir/static_surface.summary.env"
-  report_path="$out_dir/static_surface_report_v1.json"
-  log_path="$out_dir/static_surface.log"
-  module_inventory_path="$out_dir/module_inventory_v1.json"
-  mkdir -p "$out_dir"
-  if [ ! -f "$tsx_ast_path" ]; then
-    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
-    if [ -n "$runtime_values" ]; then
-      OLD_IFS="${IFS}"
-      IFS='
-'
-      for runtime_root in $runtime_values; do
-        set -- "$@" --runtime-root "$runtime_root"
-      done
-      IFS="${OLD_IFS}"
-    fi
-    if ! node "$@" >"$frontend_log_path" 2>&1; then
-      write_report "$report_path" static-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
-      echo "r2c-react-v3: tsx frontend helper failed" >&2
-      tail -n 80 "$frontend_log_path" >&2 || true
-      return 1
-    fi
-  fi
-  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
-  if [ -n "$asset_values" ]; then
-    OLD_IFS="${IFS}"
-    IFS='
-'
-    for asset_root in $asset_values; do
-      set -- "$@" --asset-root "$asset_root"
-    done
-    IFS="${OLD_IFS}"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" static-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$module_inventory_path" module_inventory_v1 0 0 0 ""
-    echo "r2c-react-v3: static surface helper failed" >&2
-    tail -n 80 "$log_path" >&2 || true
-    return 1
-  fi
-  module_count="$(read_summary_value "$summary_path" module_count 0)"
-  asset_count="$(read_summary_value "$summary_path" asset_count 0)"
-  tailwind_token_count="$(read_summary_value "$summary_path" tailwind_token_count 0)"
-  required_host_group_count="$(read_summary_value "$summary_path" required_host_group_count 0)"
-  required_host_groups="$(read_summary_value "$summary_path" required_host_groups '')"
-  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
-  module_inventory_path="$(read_summary_value "$summary_path" module_inventory_path "$module_inventory_path")"
-  write_report "$report_path" static-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$module_inventory_path" module_inventory_v1 "$module_count" 0 0 "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
-  printf '%s\n' "$report_path"
-}
-
-semantic_surface_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
-  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
-  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
-  frontend_log_path="$out_dir/tsx_frontend.log"
-  helper_script="$exp_root/r2c-react-v3-semantic-surface.mjs"
-  summary_path="$out_dir/semantic_surface.summary.env"
-  report_path="$out_dir/semantic_surface_report_v1.json"
-  log_path="$out_dir/semantic_surface.log"
-  rsg_path="$out_dir/rsg_v1.json"
-  mkdir -p "$out_dir"
-  if [ ! -f "$tsx_ast_path" ]; then
-    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
-    if [ -n "$runtime_values" ]; then
-      OLD_IFS="${IFS}"
-      IFS='
-'
-      for runtime_root in $runtime_values; do
-        set -- "$@" --runtime-root "$runtime_root"
-      done
-      IFS="${OLD_IFS}"
-    fi
-    if ! node "$@" >"$frontend_log_path" 2>&1; then
-      write_report "$report_path" semantic-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
-      echo "r2c-react-v3: tsx frontend helper failed" >&2
-      tail -n 80 "$frontend_log_path" >&2 || true
-      return 1
-    fi
-  fi
-  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" semantic-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$rsg_path" rsg_v1 0 0 0 ""
-    echo "r2c-react-v3: semantic surface helper failed" >&2
-    tail -n 80 "$log_path" >&2 || true
-    return 1
-  fi
-  module_count="$(read_summary_value "$summary_path" module_count 0)"
-  rsg_node_count="$(read_summary_value "$summary_path" rsg_node_count 0)"
-  rsg_edge_count="$(read_summary_value "$summary_path" rsg_edge_count 0)"
-  blocker_count="$(read_summary_value "$summary_path" blocker_count 0)"
-  blocked="$(read_summary_value "$summary_path" blocked false)"
-  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
-  rsg_path="$(read_summary_value "$summary_path" rsg_path "$rsg_path")"
-  write_report "$report_path" semantic-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$rsg_path" rsg_v1 "$module_count" 0 0 "$typescript_version" 0 0 0 "" "$rsg_node_count" "$rsg_edge_count" "$blocker_count" "$blocked"
-  printf '%s\n' "$report_path"
-}
-
-codegen_surface_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  tsx_ast_raw="$(read_flag --tsx-ast "$out_dir/tsx_ast_v1.json" "$@")"
-  tsx_ast_path="$(abs_path "$repo" "$tsx_ast_raw")"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  frontend_helper_script="$exp_root/r2c-react-v3-ts-frontend.mjs"
-  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
-  frontend_log_path="$out_dir/tsx_frontend.log"
-  helper_script="$exp_root/r2c-react-v3-codegen-surface.mjs"
-  summary_path="$out_dir/codegen_surface.summary.env"
-  report_path="$out_dir/codegen_surface_report_v1.json"
-  log_path="$out_dir/codegen_surface.log"
-  codegen_manifest_path="$out_dir/cheng_codegen_v1.json"
-  mkdir -p "$out_dir"
-  if [ ! -f "$tsx_ast_path" ]; then
-    set -- "$frontend_helper_script" --repo "$repo" --out "$tsx_ast_path" --summary-out "$frontend_summary_path"
-    if [ -n "$runtime_values" ]; then
-      OLD_IFS="${IFS}"
-      IFS='
-'
-      for runtime_root in $runtime_values; do
-        set -- "$@" --runtime-root "$runtime_root"
-      done
-      IFS="${OLD_IFS}"
-    fi
-    if ! node "$@" >"$frontend_log_path" 2>&1; then
-      write_report "$report_path" codegen-surface false helper_failed "$repo" "$out_dir" "$frontend_helper_script" "$frontend_summary_path" "$frontend_log_path" "$tsx_ast_path" tsx_ast_v1 0 0 0 ""
-      echo "r2c-react-v3: tsx frontend helper failed" >&2
-      tail -n 80 "$frontend_log_path" >&2 || true
-      return 1
-    fi
-  fi
-  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --tsx-ast "$tsx_ast_path" --summary-out "$summary_path"
-  if [ -n "$runtime_values" ]; then
-    OLD_IFS="${IFS}"
-    IFS='
-'
-    for runtime_root in $runtime_values; do
-      set -- "$@" --runtime-root "$runtime_root"
-    done
-    IFS="${OLD_IFS}"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" codegen-surface false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 0 0 0 ""
-    echo "r2c-react-v3: codegen surface helper failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  module_count="$(read_summary_value "$summary_path" module_count 0)"
-  route_count="$(read_summary_value "$summary_path" route_count 0)"
-  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
-  codegen_manifest_path="$(read_summary_value "$summary_path" codegen_manifest_path "$codegen_manifest_path")"
-  write_report "$report_path" codegen-surface true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$codegen_manifest_path" cheng_codegen_v1 "$module_count" "$route_count" 0 "$typescript_version"
-  printf '%s\n' "$report_path"
+  echo "r2c-react-v3: $command_name now requires the live Cheng controller; use artifacts/v3_bootstrap/cheng.stage3 r2c-react-v3 $command_name ..." >&2
+  return 1
 }
 
 exec_surface_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  codegen_manifest_raw="$(read_flag --codegen-manifest "$out_dir/cheng_codegen_v1.json" "$@")"
-  codegen_manifest_path="$(abs_path "$repo" "$codegen_manifest_raw")"
-  exec_helper_script="$exp_root/r2c-react-v3-exec-surface.mjs"
-  exec_summary_path="$out_dir/exec_surface.summary.env"
-  exec_report_path="$out_dir/exec_surface_report_v1.json"
-  exec_log_path="$out_dir/exec_surface.log"
-  exec_snapshot_path="$out_dir/cheng_codegen_exec_snapshot_v1.json"
-  codegen_summary_path="$out_dir/codegen_surface.summary.env"
-  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
-  mkdir -p "$out_dir"
-  if [ ! -f "$codegen_manifest_path" ]; then
-    if ! (codegen_surface_cmd --repo "$repo" --out-dir "$out_dir" >/dev/null); then
-      write_report "$exec_report_path" exec-surface false helper_failed "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 0 0 0 ""
-      echo "r2c-react-v3: codegen surface helper failed" >&2
-      return 1
-    fi
-  fi
-  set -- "$exec_helper_script" --repo "$repo" --out-dir "$out_dir" --codegen-manifest "$codegen_manifest_path" --summary-out "$exec_summary_path"
-  if ! node "$@" >"$exec_log_path" 2>&1; then
-    write_report "$exec_report_path" exec-surface false helper_failed "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 0 0 0 ""
-      echo "r2c-react-v3: exec surface helper failed" >&2
-    tail -n 120 "$exec_log_path" >&2 || true
-      return 1
-    fi
-  module_count="$(read_summary_value "$codegen_summary_path" module_count "$(read_summary_value "$frontend_summary_path" module_count 0)")"
-  route_count="$(read_summary_value "$codegen_summary_path" route_count 0)"
-  typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$(read_summary_value "$frontend_summary_path" typescript_version '')")"
-  semantic_nodes_count="$(read_summary_value "$exec_summary_path" snapshot_semantic_nodes_count 0)"
-  exec_snapshot_path="$(read_summary_value "$exec_summary_path" snapshot_path "$exec_snapshot_path")"
-  write_report "$exec_report_path" exec-surface true ok "$repo" "$out_dir" "$exec_helper_script" "$exec_summary_path" "$exec_log_path" "$exec_snapshot_path" cheng_codegen_exec_snapshot_v1 "$module_count" "$route_count" "$semantic_nodes_count" "$typescript_version"
-  printf '%s\n' "$exec_report_path"
-}
-
-native_gui_bundle_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  route_state="$(read_flag --route-state "" "$@")"
-  codegen_manifest_raw="$(read_flag --codegen-manifest "$out_dir/cheng_codegen_v1.json" "$@")"
-  exec_snapshot_raw="$(read_flag --exec-snapshot "$out_dir/cheng_codegen_exec_snapshot_v1.json" "$@")"
-  codegen_manifest_path="$(abs_path "$repo" "$codegen_manifest_raw")"
-  exec_snapshot_path="$(abs_path "$repo" "$exec_snapshot_raw")"
-  helper_script="$exp_root/r2c-react-v3-native-gui-bundle.mjs"
-  summary_path="$out_dir/native_gui_bundle.summary.env"
-  report_path="$out_dir/native_gui_bundle_report_v1.json"
-  log_path="$out_dir/native_gui_bundle.log"
-  bundle_path="$out_dir/native_gui_bundle_v1.json"
-  static_summary_path="$out_dir/static_surface.summary.env"
-  codegen_summary_path="$out_dir/codegen_surface.summary.env"
-  frontend_summary_path="$out_dir/tsx_ast_v1.summary.env"
-  host_contract_path="$out_dir/unimaker_host_v1.json"
-  asset_manifest_path="$out_dir/asset_manifest_v1.json"
-  tailwind_manifest_path="$out_dir/tailwind_style_manifest_v1.json"
-  route_catalog_path="$out_dir/cheng_codegen_route_catalog_v1.json"
-  mkdir -p "$out_dir"
-  if [ ! -f "$host_contract_path" ] || [ ! -f "$asset_manifest_path" ] || [ ! -f "$tailwind_manifest_path" ]; then
-    if ! (static_surface_cmd --repo "$repo" --out-dir "$out_dir" >/dev/null); then
-      write_report "$report_path" native-gui-bundle false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$bundle_path" native_gui_bundle_v1 0 0 0 ""
-      echo "r2c-react-v3: static surface helper failed" >&2
-      return 1
-    fi
-  fi
-  if [ ! -f "$codegen_manifest_path" ]; then
-    if ! (codegen_surface_cmd --repo "$repo" --out-dir "$out_dir" >/dev/null); then
-      write_report "$report_path" native-gui-bundle false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$bundle_path" native_gui_bundle_v1 0 0 0 ""
-      echo "r2c-react-v3: codegen surface helper failed" >&2
-      return 1
-    fi
-  fi
-  if [ -f "$codegen_summary_path" ]; then
-    route_catalog_path="$(read_summary_value "$codegen_summary_path" route_catalog_path "$route_catalog_path")"
-  fi
-  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --codegen-manifest "$codegen_manifest_path" --exec-snapshot "$exec_snapshot_path" --host-contract "$host_contract_path" --asset-manifest "$asset_manifest_path" --tailwind-manifest "$tailwind_manifest_path" --route-catalog "$route_catalog_path" --out "$bundle_path" --summary-out "$summary_path"
-  if [ -n "$route_state" ]; then
-    set -- "$@" --route-state "$route_state"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    module_count="$(read_summary_value "$codegen_summary_path" module_count "$(read_summary_value "$frontend_summary_path" module_count 0)")"
-    route_count="$(read_summary_value "$codegen_summary_path" route_count 0)"
-    typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$(read_summary_value "$frontend_summary_path" typescript_version '')")"
-    asset_count="$(read_summary_value "$static_summary_path" asset_count 0)"
-    tailwind_token_count="$(read_summary_value "$static_summary_path" tailwind_token_count 0)"
-    required_host_group_count="$(read_summary_value "$static_summary_path" required_host_group_count 0)"
-    required_host_groups="$(read_summary_value "$static_summary_path" required_host_groups '')"
-    semantic_nodes_count="$(read_summary_value "$summary_path" initial_semantic_nodes_count 0)"
-    write_report "$report_path" native-gui-bundle false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$bundle_path" native_gui_bundle_v1 "$module_count" "$route_count" "$semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
-    echo "r2c-react-v3: native gui bundle helper failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  module_count="$(read_summary_value "$codegen_summary_path" module_count "$(read_summary_value "$frontend_summary_path" module_count 0)")"
-  route_count="$(read_summary_value "$summary_path" route_count "$(read_summary_value "$codegen_summary_path" route_count 0)")"
-  typescript_version="$(read_summary_value "$codegen_summary_path" typescript_version "$(read_summary_value "$frontend_summary_path" typescript_version '')")"
-  asset_count="$(read_summary_value "$summary_path" asset_count "$(read_summary_value "$static_summary_path" asset_count 0)")"
-  tailwind_token_count="$(read_summary_value "$summary_path" tailwind_token_count "$(read_summary_value "$static_summary_path" tailwind_token_count 0)")"
-  required_host_group_count="$(read_summary_value "$summary_path" required_host_group_count "$(read_summary_value "$static_summary_path" required_host_group_count 0)")"
-  required_host_groups="$(read_summary_value "$summary_path" required_host_groups "$(read_summary_value "$static_summary_path" required_host_groups '')")"
-  semantic_nodes_count="$(read_summary_value "$summary_path" initial_semantic_nodes_count 0)"
-  exec_snapshot_path="$(read_summary_value "$summary_path" native_gui_exec_snapshot_path "$exec_snapshot_path")"
-  route_catalog_path="$(read_summary_value "$summary_path" native_gui_route_catalog_path "$route_catalog_path")"
-  bundle_path="$(read_summary_value "$summary_path" native_gui_bundle_path "$bundle_path")"
-  write_report "$report_path" native-gui-bundle true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$bundle_path" native_gui_bundle_v1 "$module_count" "$route_count" "$semantic_nodes_count" "$typescript_version" "$asset_count" "$tailwind_token_count" "$required_host_group_count" "$required_host_groups"
-  printf '%s\n' "$report_path"
+  echo "r2c-react-v3: exec-surface is retired; exec snapshot now comes from native-gui-bundle / exec-route-matrix mainline." >&2
+  return 1
 }
 
 native_gui_runtime_cmd() {
   runtime_contract_raw="$(read_flag --runtime-contract "" "$@")"
+  if [ -z "$runtime_contract_raw" ]; then
+    runtime_contract_raw="$(read_flag --runtime-contract-path "" "$@")"
+  fi
   if [ -z "$runtime_contract_raw" ]; then
     echo "r2c-react-v3: native-gui-runtime missing --runtime-contract" >&2
     return 1
@@ -1015,321 +264,6 @@ native_gui_runtime_cmd() {
   exec "$runtime_exe_path" "$@"
 }
 
-run_native_gui_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  session_raw="$(read_flag --session-path "$out_dir/native_gui_session_v1.json" "$@")"
-  bundle_raw="$(read_flag --bundle-path "$out_dir/native_gui_bundle_v1.json" "$@")"
-  auto_close_ms="$(read_flag --auto-close-ms 1200 "$@")"
-  screenshot_raw="$(read_flag --screenshot-out "$out_dir/native_gui_session.png" "$@")"
-  click_value="$(read_flag --click "" "$@")"
-  resize_value="$(read_flag --resize "" "$@")"
-  scroll_y="$(read_flag --scroll-y "" "$@")"
-  wait_after_click_ms="$(read_flag --wait-after-click-ms "" "$@")"
-  focus_item_id="$(read_flag --focus-item-id "" "$@")"
-  type_text="$(read_flag --type-text "" "$@")"
-  send_key="$(read_flag --send-key "" "$@")"
-  route_state="$(read_flag --route-state "" "$@")"
-  inspector_state_raw="$(read_flag --inspector-state-out "$out_dir/native_gui_inspector_state_v1.json" "$@")"
-  open_source_on_click=false
-  if has_flag --open-source-on-click "$@"; then
-    open_source_on_click=true
-  fi
-  helper_script="$exp_root/r2c-react-v3-native-gui-run.mjs"
-  summary_path="$out_dir/native_gui_run.summary.env"
-  report_path="$out_dir/native_gui_run_report_v1.json"
-  log_path="$out_dir/native_gui_run.log"
-  session_path="$(abs_path "$out_dir" "$session_raw")"
-  bundle_path="$(abs_path "$out_dir" "$bundle_raw")"
-  screenshot_path="$(abs_path "$out_dir" "$screenshot_raw")"
-  inspector_state_path="$(abs_path "$out_dir" "$inspector_state_raw")"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --repo "$repo" --out-dir "$out_dir" --session-path "$session_path" --bundle-path "$bundle_path" --auto-close-ms "$auto_close_ms" --screenshot-out "$screenshot_path" --inspector-state-out "$inspector_state_path" --summary-out "$summary_path"
-  if [ -n "$click_value" ]; then
-    set -- "$@" --click "$click_value"
-  fi
-  if [ -n "$resize_value" ]; then
-    set -- "$@" --resize "$resize_value"
-  fi
-  if [ -n "$scroll_y" ]; then
-    set -- "$@" --scroll-y "$scroll_y"
-  fi
-  if [ -n "$wait_after_click_ms" ]; then
-    set -- "$@" --wait-after-click-ms "$wait_after_click_ms"
-  fi
-  if [ -n "$focus_item_id" ]; then
-    set -- "$@" --focus-item-id "$focus_item_id"
-  fi
-  if [ -n "$type_text" ]; then
-    set -- "$@" --type-text "$type_text"
-  fi
-  if [ -n "$send_key" ]; then
-    set -- "$@" --send-key "$send_key"
-  fi
-  if [ -n "$route_state" ]; then
-    set -- "$@" --route-state "$route_state"
-  fi
-  if [ "$open_source_on_click" = true ]; then
-    set -- "$@" --open-source-on-click
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" run-native-gui false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$session_path" native_gui_session_v1 0 0 0 ""
-    echo "r2c-react-v3: native gui run helper failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  session_path="$(read_summary_value "$summary_path" native_gui_session_path "$session_path")"
-  write_report "$report_path" run-native-gui true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$session_path" native_gui_session_v1 0 0 0 ""
-  printf '%s\n' "$report_path"
-}
-
-replay_hit_inspector_cmd() {
-  open_source=false
-  if has_flag --open-source "$@"; then
-    open_source=true
-  fi
-  inspector_state_raw="$(read_flag --inspector-state "" "$@")"
-  if [ -z "$inspector_state_raw" ]; then
-    echo "r2c-react-v3: replay-hit-inspector missing --inspector-state" >&2
-    return 1
-  fi
-  inspector_state_path="$(abs_path "$PWD" "$inspector_state_raw")"
-  out_raw="$(read_flag --out "$(dirname "$inspector_state_path")/native_gui_inspector_replay_v1.json" "$@")"
-  out_path="$(abs_path "$PWD" "$out_raw")"
-  out_dir="$(dirname "$out_path")"
-  helper_script="$exp_root/r2c-react-v3-replay-hit-inspector.mjs"
-  summary_path="$out_dir/native_gui_inspector_replay.summary.env"
-  report_path="$out_dir/native_gui_inspector_replay_report_v1.json"
-  log_path="$out_dir/native_gui_inspector_replay.log"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --inspector-state "$inspector_state_path" --out "$out_path" --summary-out "$summary_path"
-  if [ "$open_source" = true ]; then
-    set -- "$@" --open-source
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" replay-hit-inspector false helper_failed "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$out_path" native_gui_inspector_replay_v1 0 0 0 ""
-    echo "r2c-react-v3: replay-hit-inspector failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  write_report "$report_path" replay-hit-inspector true ok "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$out_path" native_gui_inspector_replay_v1 0 0 0 ""
-  printf '%s\n' "$report_path"
-}
-
-compare_truth_cmd() {
-  exec_snapshot_raw="$(read_flag --exec-snapshot "" "$@")"
-  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
-  codegen_manifest_raw="$(read_flag --codegen-manifest "" "$@")"
-  truth_state="$(read_flag --truth-state "" "$@")"
-  if [ -z "$exec_snapshot_raw" ] || [ -z "$truth_trace_raw" ]; then
-    echo "r2c-react-v3: compare-truth missing --exec-snapshot or --truth-trace" >&2
-    return 1
-  fi
-  exec_snapshot_path="$(abs_path "$PWD" "$exec_snapshot_raw")"
-  truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
-  out_raw="$(read_flag --out "$(dirname "$exec_snapshot_path")/truth_compare_v1.json" "$@")"
-  truth_compare_path="$(abs_path "$PWD" "$out_raw")"
-  out_dir="$(dirname "$truth_compare_path")"
-  truth_compare_helper_script="$exp_root/r2c-react-v3-truth-compare.mjs"
-  truth_compare_summary_path="$out_dir/truth_compare.summary.env"
-  truth_compare_log_path="$out_dir/truth_compare.log"
-  compare_report_path="$out_dir/compare_truth_report_v1.json"
-  mkdir -p "$out_dir"
-  set -- "$truth_compare_helper_script" --exec-snapshot "$exec_snapshot_path" --truth-trace "$truth_trace_path" --out "$truth_compare_path" --summary-out "$truth_compare_summary_path"
-  if [ -n "$codegen_manifest_raw" ]; then
-    set -- "$@" --codegen-manifest "$(abs_path "$PWD" "$codegen_manifest_raw")"
-  fi
-  if [ -n "$truth_state" ]; then
-    set -- "$@" --truth-state "$truth_state"
-  fi
-  if ! node "$@" >"$truth_compare_log_path" 2>&1; then
-    truth_compare_reason="$(read_summary_value "$truth_compare_summary_path" truth_compare_reason helper_failed)"
-    write_report "$compare_report_path" compare-truth false "$truth_compare_reason" "$PWD" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 0 1 0 ""
-    echo "r2c-react-v3: compare-truth failed" >&2
-    tail -n 120 "$truth_compare_log_path" >&2 || true
-    return 2
-  fi
-  semantic_nodes_count="$(read_summary_value "$truth_compare_summary_path" exec_semantic_nodes_count 0)"
-  write_report "$compare_report_path" compare-truth true ok "$PWD" "$out_dir" "$truth_compare_helper_script" "$truth_compare_summary_path" "$truth_compare_log_path" "$truth_compare_path" truth_compare_v1 0 1 "$semantic_nodes_count" ""
-  printf '%s\n' "$compare_report_path"
-}
-
-exec_route_matrix_cmd() {
-  tsx_ast_raw="$(read_flag --tsx-ast "" "$@")"
-  route_catalog_raw="$(read_flag --route-catalog "" "$@")"
-  exec_snapshot_raw="$(read_flag --exec-snapshot "" "$@")"
-  truth_routes_raw="$(read_flag --truth-routes-file "" "$@")"
-  codegen_manifest_raw="$(read_flag --codegen-manifest "" "$@")"
-  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
-  if { [ -z "$route_catalog_raw" ] && [ -z "$tsx_ast_raw" ]; } || [ -z "$exec_snapshot_raw" ] || [ -z "$truth_routes_raw" ]; then
-    echo "r2c-react-v3: exec-route-matrix missing (--route-catalog or --tsx-ast), --exec-snapshot, or --truth-routes-file" >&2
-    return 1
-  fi
-  tsx_ast_path=""
-  if [ -n "$tsx_ast_raw" ]; then
-    tsx_ast_path="$(abs_path "$PWD" "$tsx_ast_raw")"
-  fi
-  route_catalog_path=""
-  if [ -n "$route_catalog_raw" ]; then
-    route_catalog_path="$(abs_path "$PWD" "$route_catalog_raw")"
-  fi
-  exec_snapshot_path="$(abs_path "$PWD" "$exec_snapshot_raw")"
-  truth_routes_path="$(abs_path "$PWD" "$truth_routes_raw")"
-  codegen_manifest_path=""
-  if [ -n "$codegen_manifest_raw" ]; then
-    codegen_manifest_path="$(abs_path "$PWD" "$codegen_manifest_raw")"
-  fi
-  truth_trace_path=""
-  if [ -n "$truth_trace_raw" ]; then
-    truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
-  fi
-  out_raw="$(read_flag --out "$(dirname "$exec_snapshot_path")/cheng_codegen_exec_route_matrix_v1.json" "$@")"
-  exec_route_matrix_path="$(abs_path "$PWD" "$out_raw")"
-  out_dir="$(dirname "$exec_route_matrix_path")"
-  helper_script="$exp_root/r2c-react-v3-exec-route-matrix.mjs"
-  summary_path="$out_dir/exec_route_matrix.summary.env"
-  log_path="$out_dir/exec_route_matrix.log"
-  report_path="$out_dir/exec_route_matrix_report_v1.json"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --exec-snapshot "$exec_snapshot_path" --truth-routes-file "$truth_routes_path" --out "$exec_route_matrix_path" --summary-out "$summary_path"
-  if [ -n "$route_catalog_path" ]; then
-    set -- "$@" --route-catalog "$route_catalog_path"
-  else
-    set -- "$@" --tsx-ast "$tsx_ast_path"
-  fi
-  if [ -n "$codegen_manifest_path" ]; then
-    set -- "$@" --codegen-manifest "$codegen_manifest_path"
-  fi
-  if [ -n "$truth_trace_path" ]; then
-    set -- "$@" --truth-trace "$truth_trace_path"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    route_count="$(read_summary_value "$summary_path" route_count 0)"
-    write_report "$report_path" exec-route-matrix false helper_failed "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 0 "$route_count" 0 ""
-    echo "r2c-react-v3: exec-route-matrix failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  route_count="$(read_summary_value "$summary_path" route_count 0)"
-  write_report "$report_path" exec-route-matrix true ok "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$exec_route_matrix_path" cheng_codegen_exec_route_matrix_v1 0 "$route_count" 0 ""
-  printf '%s\n' "$report_path"
-}
-
-compare_truth_matrix_cmd() {
-  exec_route_matrix_raw="$(read_flag --exec-route-matrix "" "$@")"
-  truth_trace_raw="$(read_flag --truth-trace "" "$@")"
-  codegen_manifest_raw="$(read_flag --codegen-manifest "" "$@")"
-  if [ -z "$exec_route_matrix_raw" ] || [ -z "$truth_trace_raw" ]; then
-    echo "r2c-react-v3: compare-truth-matrix missing --exec-route-matrix or --truth-trace" >&2
-    return 1
-  fi
-  exec_route_matrix_path="$(abs_path "$PWD" "$exec_route_matrix_raw")"
-  truth_trace_path="$(abs_path "$PWD" "$truth_trace_raw")"
-  out_raw="$(read_flag --out "$(dirname "$exec_route_matrix_path")/truth_compare_matrix_v1.json" "$@")"
-  truth_compare_matrix_path="$(abs_path "$PWD" "$out_raw")"
-  out_dir="$(dirname "$truth_compare_matrix_path")"
-  helper_script="$exp_root/r2c-react-v3-truth-compare-matrix.mjs"
-  summary_path="$out_dir/truth_compare_matrix.summary.env"
-  log_path="$out_dir/truth_compare_matrix.log"
-  report_path="$out_dir/compare_truth_matrix_report_v1.json"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --exec-route-matrix "$exec_route_matrix_path" --truth-trace "$truth_trace_path" --out "$truth_compare_matrix_path" --summary-out "$summary_path"
-  if [ -n "$codegen_manifest_raw" ]; then
-    set -- "$@" --codegen-manifest "$(abs_path "$PWD" "$codegen_manifest_raw")"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    truth_compare_matrix_reason="$(read_summary_value "$summary_path" truth_compare_matrix_reason helper_failed)"
-    route_count="$(read_summary_value "$summary_path" route_count 0)"
-    write_report "$report_path" compare-truth-matrix false "$truth_compare_matrix_reason" "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 0 "$route_count" 0 ""
-    echo "r2c-react-v3: compare-truth-matrix failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 2
-  fi
-  route_count="$(read_summary_value "$summary_path" route_count 0)"
-  write_report "$report_path" compare-truth-matrix true ok "$PWD" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$truth_compare_matrix_path" truth_compare_matrix_v1 0 "$route_count" 0 ""
-  printf '%s\n' "$report_path"
-}
-
-discover_truth_routes_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  out_dir_raw="$(read_flag --out-dir "$repo/build/r2c_react_v3_cheng" "$@")"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  helper_script="$exp_root/r2c-react-v3-discover-truth-routes.mjs"
-  artifact_path="$out_dir/truth_routes_v1.json"
-  summary_path="$out_dir/truth_routes_v1.summary.env"
-  report_path="$out_dir/truth_routes_report_v1.json"
-  log_path="$out_dir/truth_routes.log"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --repo "$repo" --out "$artifact_path" --summary-out "$summary_path"
-  runtime_values="$(collect_flag_values --runtime-root "$@")"
-  if [ -n "$runtime_values" ]; then
-    OLD_IFS="${IFS}"
-    IFS='
-'
-    for runtime_root in $runtime_values; do
-      set -- "$@" --runtime-root "$runtime_root"
-    done
-    IFS="${OLD_IFS}"
-  fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" discover-truth-routes false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" truth_routes_v1 0 0 0 ""
-    echo "r2c-react-v3: truth route helper failed" >&2
-    tail -n 80 "$log_path" >&2 || true
-    return 1
-  fi
-  route_count="$(read_summary_value "$summary_path" route_count 0)"
-  typescript_version="$(read_summary_value "$summary_path" typescript_version '')"
-  write_report "$report_path" discover-truth-routes true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$artifact_path" truth_routes_v1 0 "$route_count" 0 "$typescript_version"
-  printf '%s\n' "$report_path"
-}
-
-capture_truth_cmd() {
-  repo_raw="$(read_flag --repo "$PWD" "$@")"
-  repo="$(cd "$repo_raw" && pwd)"
-  route="$(read_flag --route "" "$@")"
-  if [ -z "$route" ]; then
-    echo "r2c-react-v3: capture-truth missing --route" >&2
-    return 1
-  fi
-  default_out_dir="$repo/build/r2c_react_v3_cheng/truth/$route"
-  out_dir_raw="$(read_flag --out-dir "$default_out_dir" "$@")"
-  base_url="$(read_flag --base-url "" "$@")"
-  chrome_path="$(read_flag --chrome "" "$@")"
-  width="$(read_flag --width "" "$@")"
-  height="$(read_flag --height "" "$@")"
-  truth_flag="$(read_flag --truth-flag "" "$@")"
-  debug_port="$(read_flag --debug-port "" "$@")"
-  wait_ms="$(read_flag --wait-ms "" "$@")"
-  out_dir="$(abs_path "$repo" "$out_dir_raw")"
-  helper_script="$exp_root/r2c-react-v3-truth-runtime.mjs"
-  summary_path="$out_dir/$route.summary.env"
-  report_path="$out_dir/capture_truth_report_v1.json"
-  log_path="$out_dir/truth_runtime.log"
-  mkdir -p "$out_dir"
-  set -- "$helper_script" --route "$route" --out-dir "$out_dir" --summary-out "$summary_path"
-  if [ -n "$base_url" ]; then set -- "$@" --base-url "$base_url"; fi
-  if [ -n "$chrome_path" ]; then set -- "$@" --chrome "$chrome_path"; fi
-  if [ -n "$width" ]; then set -- "$@" --width "$width"; fi
-  if [ -n "$height" ]; then set -- "$@" --height "$height"; fi
-  if [ -n "$truth_flag" ]; then set -- "$@" --truth-flag "$truth_flag"; fi
-  if [ -n "$debug_port" ]; then set -- "$@" --debug-port "$debug_port"; fi
-  if [ -n "$wait_ms" ]; then set -- "$@" --wait-ms "$wait_ms"; fi
-  if ! node "$@" >"$log_path" 2>&1; then
-    write_report "$report_path" capture-truth false helper_failed "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "" truth_runtime_v1 0 0 0 ""
-    echo "r2c-react-v3: truth runtime helper failed" >&2
-    tail -n 120 "$log_path" >&2 || true
-    return 1
-  fi
-  semantic_nodes_count="$(read_summary_value "$summary_path" semantic_nodes_count 0)"
-  runtime_state_path="$(read_summary_value "$summary_path" runtime_state_path '')"
-  write_report "$report_path" capture-truth true ok "$repo" "$out_dir" "$helper_script" "$summary_path" "$log_path" "$runtime_state_path" truth_runtime_v1 0 1 "$semantic_nodes_count" ""
-  printf '%s\n' "$report_path"
-}
-
 cmd="${1:-help}"
 if [ "$#" -gt 0 ]; then
   shift
@@ -1345,49 +279,49 @@ case "$cmd" in
     status_cmd "$@"
     ;;
   frontend)
-    frontend_like_cmd frontend false "$@"
+    require_live_controller_cmd frontend
     ;;
   static-surface)
-    static_surface_cmd "$@"
+    require_live_controller_cmd static-surface
     ;;
   semantic-surface)
-    semantic_surface_cmd "$@"
+    require_live_controller_cmd semantic-surface
     ;;
   codegen-surface)
-    codegen_surface_cmd "$@"
+    require_live_controller_cmd codegen-surface
     ;;
   exec-surface)
-    exec_surface_cmd "$@"
+    exec_surface_cmd
     ;;
   native-gui-bundle)
-    native_gui_bundle_cmd "$@"
+    require_live_controller_cmd native-gui-bundle
     ;;
   native-gui-runtime)
     native_gui_runtime_cmd "$@"
     ;;
   run-native-gui)
-    run_native_gui_cmd "$@"
+    require_live_controller_cmd run-native-gui
     ;;
   replay-hit-inspector)
-    replay_hit_inspector_cmd "$@"
+    require_live_controller_cmd replay-hit-inspector
     ;;
   exec-route-matrix)
-    exec_route_matrix_cmd "$@"
+    require_live_controller_cmd exec-route-matrix
     ;;
   compare-truth)
-    compare_truth_cmd "$@"
+    require_live_controller_cmd compare-truth
     ;;
   compare-truth-matrix)
-    compare_truth_matrix_cmd "$@"
+    require_live_controller_cmd compare-truth-matrix
     ;;
   compile)
-    frontend_like_cmd compile true "$@"
+    require_live_controller_cmd compile
     ;;
   discover-truth-routes)
-    discover_truth_routes_cmd "$@"
+    require_live_controller_cmd discover-truth-routes
     ;;
   capture-truth)
-    capture_truth_cmd "$@"
+    require_live_controller_cmd capture-truth
     ;;
   prototype)
     exec python3 "$exp_root/r2c-react-v3.py" "$@"

@@ -1216,14 +1216,41 @@ fn v3CompilerExportSurfaceReportLine(surface: V3CsgExportSurface,
     out = out + intToStr(surface.exportedCapabilities[index])
     return out
 
+fn v3CompilerCsgTextStartsWith(text: str,
+                               prefix: str): bool =
+    if prefix.len <= 0:
+        return true
+    if text.len < prefix.len:
+        return false
+    for i in 0..<prefix.len:
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn v3CompilerCsgParseUintText(text: str,
+                              outOk: var bool): int32 =
+    outOk = false
+    if text.len <= 0:
+        return 0
+    var value = int32(0)
+    for i in 0..<text.len:
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return 0
+        value = value * 10 + (int32(ch) - int32('0'))
+    outOk = true
+    return value
+
 fn v3CompilerExportSurfaceFromReportText(text: str,
                                          out: var V3CsgExportSurface): Result[bool] =
-    out.version = 1
-    out.packageId = v3CompilerWorldLineValue(text, "package_id")
+    let packageId = v3CompilerWorldLineValue(text, "package_id")
     let countText = v3CompilerWorldLineValue(text, "exported_count")
     if len(countText) <= 0:
         return Err[bool]("v3 compiler csg: exported_count missing")
-    out.exportedSymbolCount = int32(parseInt(countText))
+    var countOk = false
+    let exportedCount = v3CompilerCsgParseUintText(countText, countOk)
+    if !countOk:
+        return Err[bool]("v3 compiler csg: invalid exported_count: " + countText)
     out.exportedSymbols = []
     out.exportedLayouts = []
     out.exportedEffects = []
@@ -1231,24 +1258,72 @@ fn v3CompilerExportSurfaceFromReportText(text: str,
     let surfaceCidRes = layout.fixedBytes32FromHex(v3CompilerWorldLineValue(text, "surface_cid"))
     if IsErr(surfaceCidRes):
         return Err[bool]("v3 compiler csg: invalid surface cid")
-    out.surfaceCid = Value(surfaceCidRes)
+    let surfaceCid = Value(surfaceCidRes)
     let lines = strutil.split(text, '\n')
     for i in 0..<lines.len:
         let line = strutil.strip(lines[i])
-        if !strutil.startsWith(line, "export["):
+        if !v3CompilerCsgTextStartsWith(line, "export["):
             continue
-        let eqPosText = strutil.split(line, '=')
-        if eqPosText.len < 2:
+        var eqPos = -1
+        for j in 0..<line.len:
+            if line[j] == '=':
+                eqPos = j
+                break
+        if eqPos < 0 || eqPos + 1 >= line.len:
             continue
-        let parts = strutil.split(eqPosText[1], '|')
-        if parts.len != 4:
-            return Err[bool]("v3 compiler csg: malformed export row")
-        add(out.exportedSymbols, parts[0])
-        add(out.exportedLayouts, int32(parseInt(parts[1])))
-        add(out.exportedEffects, int32(parseInt(parts[2])))
-        add(out.exportedCapabilities, int32(parseInt(parts[3])))
-    if out.exportedSymbols.len != out.exportedSymbolCount:
-        return Err[bool]("v3 compiler csg: export count mismatch")
+        let payload = strutil.sliceStr(line, eqPos + 1, line.len - 1)
+        var firstSep = -1
+        var secondSep = -1
+        var thirdSep = -1
+        for j in 0..<payload.len:
+            if payload[j] != '|':
+                continue
+            if firstSep < 0:
+                firstSep = j
+                continue
+            if secondSep < 0:
+                secondSep = j
+                continue
+            if thirdSep < 0:
+                thirdSep = j
+                continue
+            return Err[bool]("v3 compiler csg: export row has too many separators")
+        if firstSep <= 0 || secondSep <= firstSep + 1 || thirdSep <= secondSep + 1 || thirdSep >= payload.len - 1:
+            return Err[bool]("v3 compiler csg: export row separator positions invalid first=" +
+                             intToStr(firstSep) +
+                             " second=" +
+                             intToStr(secondSep) +
+                             " third=" +
+                             intToStr(thirdSep) +
+                             " len=" +
+                             intToStr(payload.len) +
+                             " payload=" +
+                             payload +
+                             " line=" +
+                             line)
+        add(out.exportedSymbols, strutil.sliceStr(payload, 0, firstSep - 1))
+        var layoutOk = false
+        var effectOk = false
+        var capabilityOk = false
+        let layoutValue = v3CompilerCsgParseUintText(strutil.sliceStr(payload, firstSep + 1, secondSep - 1), layoutOk)
+        let effectValue = v3CompilerCsgParseUintText(strutil.sliceStr(payload, secondSep + 1, thirdSep - 1), effectOk)
+        let capabilityValue = v3CompilerCsgParseUintText(strutil.sliceStr(payload, thirdSep + 1, payload.len - 1), capabilityOk)
+        if !layoutOk || !effectOk || !capabilityOk:
+            return Err[bool]("v3 compiler csg: export row numeric field invalid")
+        add(out.exportedLayouts, layoutValue)
+        add(out.exportedEffects, effectValue)
+        add(out.exportedCapabilities, capabilityValue)
+    if out.exportedSymbols.len != exportedCount:
+        return Err[bool]("v3 compiler csg: export count mismatch parsed=" +
+                         intToStr(out.exportedSymbols.len) +
+                         " expected=" +
+                         intToStr(exportedCount) +
+                         " countText=" +
+                         countText)
+    out.version = 1
+    out.packageId = packageId
+    out.exportedSymbolCount = exportedCount
+    out.surfaceCid = surfaceCid
     return Ok[bool](true)
 
 fn v3CompilerCsgGraphCidFromReportText(text: str): Result[layout.FixedBytes32] =
@@ -1325,10 +1400,18 @@ fn v3CompileReceiptFromReportText(text: str,
     out.canonicalOutputDigest = Value(canonicalDigestRes)
     out.bootstrapStage = v3CompilerWorldLineValue(text, "bootstrap_stage")
     out.runtimeProviderSet = []
+    let providerPrefix = "runtime_provider["
     let lines = strutil.split(text, '\n')
     for i in 0..<lines.len:
         let line = strutil.strip(lines[i])
-        if !strutil.startsWith(line, "runtime_provider["):
+        var providerLine = false
+        if line.len >= providerPrefix.len:
+            providerLine = true
+            for j in 0..<providerPrefix.len:
+                if line[j] != providerPrefix[j]:
+                    providerLine = false
+                    break
+        if !providerLine:
             continue
         let parts = strutil.split(line, '=')
         if parts.len < 2:
@@ -1364,11 +1447,18 @@ fn v3CompilerWorldLineValue(text: str, key: str): str =
     let lines = strutil.split(text, '\n')
     for i in 0..<lines.len:
         let line = strutil.strip(lines[i])
-        let parts = strutil.split(line, '=')
-        if parts.len < 2:
+        var matchedPrefix = false
+        if line.len > key.len:
+            if int32(line[key.len]) == 61:
+                matchedPrefix = true
+        if !matchedPrefix:
             continue
-        if strutil.strip(parts[0]) != key:
+        var matched = true
+        for j in 0..<key.len:
+            if line[j] != key[j]:
+                matched = false
+                break
+        if !matched:
             continue
-        let value = strutil.strip(parts[1])
-        return value
+        return strutil.strip(strutil.sliceStr(line, key.len + 1, line.len - 1))
     return ""

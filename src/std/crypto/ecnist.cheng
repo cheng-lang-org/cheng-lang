@@ -1262,88 +1262,49 @@ fn p256FixedWindowNibble(scalar: pfix.P256Fixed, baseBit: int32): int32 =
 
 fn pointJacobianBatchToAffineWindow16Into(table: EcPointJacobianFixed[16],
                                          outTable: var EcPointFixed[16]): Result[bool] =
-    var prefixes: pfix.P256Fixed[16]
-    prefixes[0] = p256FieldFixedOne()
-    prefixes[1] = table[1].z
-    var i: int32 = 2
+    outTable[0] = pointInfinityFixed()
+    var i: int32 = 1
     while i < 16:
-        let prefixRes: Result[pfix.P256Fixed] = p256FieldFixedMul(prefixes[i - 1], table[i].z)
-        if IsErr(prefixRes):
-            return Err[bool](Error(prefixRes))
-        prefixes[i] = Value(prefixRes)
-        i = i + 1
-    let invRes: Result[pfix.P256Fixed] = p256FieldFixedInv(prefixes[15])
-    if IsErr(invRes):
-        return Err[bool](Error(invRes))
-    var suffixInv: pfix.P256Fixed = Value(invRes)
-    i = 15
-    while i >= 2:
-        let ziInvRes: Result[pfix.P256Fixed] = p256FieldFixedMul(prefixes[i - 1], suffixInv)
+        if table[i].inf:
+            outTable[i] = pointInfinityFixed()
+            i = i + 1
+            continue
+        let ziInvRes: Result[pfix.P256Fixed] = p256FieldFixedInv(table[i].z)
         if IsErr(ziInvRes):
             return Err[bool](Error(ziInvRes))
         let ziInv: pfix.P256Fixed = Value(ziInvRes)
         let ziInv2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(ziInv)
         if IsErr(ziInv2Res):
             return Err[bool](Error(ziInv2Res))
-        let ziInv3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(Value(ziInv2Res), ziInv)
+        let ziInv2: pfix.P256Fixed = Value(ziInv2Res)
+        let ziInv3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(ziInv2, ziInv)
         if IsErr(ziInv3Res):
             return Err[bool](Error(ziInv3Res))
-        let xRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].x, Value(ziInv2Res))
+        let ziInv3: pfix.P256Fixed = Value(ziInv3Res)
+        let xRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].x, ziInv2)
         if IsErr(xRes):
             return Err[bool](Error(xRes))
-        let yRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].y, Value(ziInv3Res))
+        let yRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[i].y, ziInv3)
         if IsErr(yRes):
             return Err[bool](Error(yRes))
         outTable[i] = EcPointFixed(x: Value(xRes), y: Value(yRes), inf: false)
-        let nextSuffixRes: Result[pfix.P256Fixed] = p256FieldFixedMul(suffixInv, table[i].z)
-        if IsErr(nextSuffixRes):
-            return Err[bool](Error(nextSuffixRes))
-        suffixInv = Value(nextSuffixRes)
-        i = i - 1
-    let ziInv: pfix.P256Fixed = suffixInv
-    let ziInv2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(ziInv)
-    if IsErr(ziInv2Res):
-        return Err[bool](Error(ziInv2Res))
-    let ziInv3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(Value(ziInv2Res), ziInv)
-    if IsErr(ziInv3Res):
-        return Err[bool](Error(ziInv3Res))
-    let xRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[1].x, Value(ziInv2Res))
-    if IsErr(xRes):
-        return Err[bool](Error(xRes))
-    let yRes: Result[pfix.P256Fixed] = p256FieldFixedMul(table[1].y, Value(ziInv3Res))
-    if IsErr(yRes):
-        return Err[bool](Error(yRes))
-    outTable[1] = EcPointFixed(x: Value(xRes), y: Value(yRes), inf: false)
-    outTable[0] = pointInfinityFixed()
+        i = i + 1
+    while i < 16:
+        outTable[i] = pointInfinityFixed()
+        i = i + 1
     return Ok[bool](true)
 
 fn pointJacobianBatchToAffineWindow16(table: EcPointJacobianFixed[16]): Result[bool] =
     return pointJacobianBatchToAffineWindow16Into(table, p256GWindow4)
 
 fn pointMulFixedWindowed(scalar: pfix.P256Fixed, p: EcPointFixed): Result[EcPointFixed] =
-    var table: EcPointJacobianFixed[16]
-    var affineTable: EcPointFixed[16]
-    var tableIdx: int32 = 2
-    var windowBase: int32 = (8 * 32) - 4
-    var nibble: int32 = 0
-    table[0] = pointJacobianInfinityFixed()
-    table[1] = pointJacobianFromAffineFixed(p)
-    while tableIdx < 16:
-        table[tableIdx] = pointJacobianAddFixed(table[tableIdx - 1], table[1])
-        tableIdx = tableIdx + 1
-    let affineRes: Result[bool] = pointJacobianBatchToAffineWindow16Into(table, affineTable)
-    if IsErr(affineRes):
-        return Err[EcPointFixed](Error(affineRes))
+    var windowBase: int32 = (8 * 32) - 1
     var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
     while windowBase >= 0:
-        var dblCount: int32 = 0
-        while dblCount < 4:
-            pointJacobianDoubleFixedInPlace(result)
-            dblCount = dblCount + 1
-        nibble = p256FixedWindowNibble(scalar, windowBase)
-        if nibble != 0:
-            pointJacobianAddAffineFixedInPlace(result, affineTable[nibble])
-        windowBase = windowBase - 4
+        pointJacobianDoubleFixedInPlace(result)
+        if pfix.p256FixedGetBit(scalar, windowBase) != 0:
+            pointJacobianAddAffineFixedInPlace(result, p)
+        windowBase = windowBase - 1
     let affineRes: Result[EcPointFixed] = pointJacobianToAffineFixed(result)
     if IsErr(affineRes):
         return Err[EcPointFixed](Error(affineRes))
@@ -1351,31 +1312,12 @@ fn pointMulFixedWindowed(scalar: pfix.P256Fixed, p: EcPointFixed): Result[EcPoin
     return Ok[EcPointFixed](affine)
 
 fn pointMulGeneratorAndFixedShamir(u1: pfix.P256Fixed, u2: pfix.P256Fixed, p: EcPointFixed): Result[EcPointJacobianFixed] =
-    var table: EcPointJacobianFixed[16]
-    var affineTable: EcPointFixed[16]
-    var tableIdx: int32 = 2
-    var windowBase: int32 = (8 * 32) - 4
-    table[0] = pointJacobianInfinityFixed()
-    table[1] = pointJacobianFromAffineFixed(p)
-    while tableIdx < 16:
-        table[tableIdx] = pointJacobianAddFixed(table[tableIdx - 1], table[1])
-        tableIdx = tableIdx + 1
-    let affineRes: Result[bool] = pointJacobianBatchToAffineWindow16Into(table, affineTable)
-    if IsErr(affineRes):
-        return Err[EcPointJacobianFixed](Error(affineRes))
-    var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
-    while windowBase >= 0:
-        var dblCount: int32 = 0
-        while dblCount < 4:
-            pointJacobianDoubleFixedInPlace(result)
-            dblCount = dblCount + 1
-        let nibble1: int32 = p256FixedWindowNibble(u1, windowBase)
-        let nibble2: int32 = p256FixedWindowNibble(u2, windowBase)
-        if nibble1 != 0:
-            pointJacobianAddAffineFixedInPlace(result, p256GWindow4[nibble1])
-        if nibble2 != 0:
-            pointJacobianAddAffineFixedInPlace(result, affineTable[nibble2])
-        windowBase = windowBase - 4
+    var result: EcPointJacobianFixed
+    pointMulGeneratorJacobianComb6FixedInto(result, u1)
+    let fixedRes: Result[EcPointFixed] = pointMulFixedWindowed(u2, p)
+    if IsErr(fixedRes):
+        return Err[EcPointJacobianFixed](Error(fixedRes))
+    pointJacobianAddAffineFixedInPlace(result, Value(fixedRes))
     return Ok[EcPointJacobianFixed](result)
 
 fn pointAffineNegateFixed(p: EcPointFixed): Result[EcPointFixed] =

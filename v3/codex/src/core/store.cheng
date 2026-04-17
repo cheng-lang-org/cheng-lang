@@ -1,0 +1,612 @@
+import std/os
+import std/result
+import std/strings
+import std/times
+import std/strutils as strutil
+import cheng/codex/core/text as textutil
+import cheng/codex/protocol/types
+
+const
+    codexSessionFormat: str = "codex_session_v1"
+
+fn codexStorePathNonEmpty(path: str): bool =
+    return textutil.codexTextNonEmpty(path)
+
+fn codexStorePathAbsolute(path: str): str =
+    if os.isAbsolute(path):
+        return path
+    return os.joinPath(os.getCurrentDir(), path)
+
+fn codexStoreParentDir(path: str): str =
+    return os.parentDir(path)
+
+fn codexStoreEnsureDir(path: str): bool =
+    if !codexStorePathNonEmpty(path):
+        return false
+    if os.dirExists(path):
+        return true
+    let parent = codexStoreParentDir(path)
+    if codexStorePathNonEmpty(parent) && parent != path && !os.dirExists(parent):
+        if !codexStoreEnsureDir(parent):
+            return false
+    if !os.dirExists(path):
+        os.createDir(path)
+    return os.dirExists(path)
+
+fn codexStoreWriteText(path: str, value: str): bool =
+    let absolute = codexStorePathAbsolute(path)
+    let parent = codexStoreParentDir(absolute)
+    if codexStorePathNonEmpty(parent):
+        if !codexStoreEnsureDir(parent):
+            return false
+    os.writeFile(absolute, value)
+    return codexStoreFileExists(absolute)
+
+fn codexStoreReadText(path: str): str =
+    let absolute = codexStorePathAbsolute(path)
+    if !codexStoreFileExists(absolute):
+        return ""
+    return os.readFile(absolute)
+
+fn codexStoreHome(overridePath: str): str =
+    if textutil.codexTextNonEmpty(overridePath):
+        return codexStorePathAbsolute(overridePath)
+    let envHome = os.getEnv("CODEX_HOME")
+    if textutil.codexTextNonEmpty(envHome):
+        return codexStorePathAbsolute(envHome)
+    let userHome = os.getEnv("HOME")
+    if textutil.codexTextNonEmpty(userHome):
+        return os.joinPath(userHome, ".codex-cheng")
+    return os.joinPath(os.getCurrentDir(), ".codex-cheng")
+
+fn codexSessionsDir(home: str): str =
+    return os.joinPath(home, "sessions")
+
+fn codexAuthPath(home: str): str =
+    return os.joinPath(home, "auth.env")
+
+fn codexPluginsDir(home: str): str =
+    return os.joinPath(home, "plugins")
+
+fn codexMcpPath(home: str): str =
+    return os.joinPath(home, "mcp_servers.env")
+
+fn codexLastSessionPath(home: str): str =
+    return os.joinPath(home, "last_session")
+
+fn codexSessionIndexPath(home: str): str =
+    return os.joinPath(home, "sessions.index")
+
+fn codexPluginIndexPath(home: str): str =
+    return os.joinPath(codexPluginsDir(home), "plugins.index")
+
+fn codexStoreAppendKv(out: str, key: str, value: str): str =
+    return out + key + "=" + value + "\n"
+
+fn codexStoreTurnText(turn: types.CodexTurn, idx: int32, out: var str) =
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_prompt", textutil.codexHexEncode(turn.promptText))
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_command", textutil.codexHexEncode(turn.commandText))
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_output", textutil.codexHexEncode(turn.outputText))
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_assistant", textutil.codexHexEncode(turn.assistantText))
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_exit_code", intToStr(turn.exitCode))
+    out = codexStoreAppendKv(out, "turn_" + intToStr(idx) + "_approved", textutil.codexBoolText(turn.approved))
+
+fn codexStoreSessionText(session: types.CodexSession): str =
+    var out = ""
+    out = codexStoreAppendKv(out, "format", codexSessionFormat)
+    out = codexStoreAppendKv(out, "session_id", textutil.codexHexEncode(session.sessionId))
+    out = codexStoreAppendKv(out, "title", textutil.codexHexEncode(session.title))
+    out = codexStoreAppendKv(out, "cwd", textutil.codexHexEncode(session.cwd))
+    out = codexStoreAppendKv(out, "created_at", strings.int64ToStr(session.createdAt))
+    out = codexStoreAppendKv(out, "updated_at", strings.int64ToStr(session.updatedAt))
+    out = codexStoreAppendKv(out, "last_exit_code", intToStr(session.lastExitCode))
+    out = codexStoreAppendKv(out, "turn_count", intToStr(session.turns.len))
+    for i in 0..<session.turns.len:
+        codexStoreTurnText(session.turns[i], i, out)
+    return out
+
+fn codexStoreSessionPath(home: str, sessionId: str): str =
+    return os.joinPath(codexSessionsDir(home), sessionId + ".session")
+
+fn codexStoreSummaryFromSession(session: types.CodexSession): types.CodexSessionSummary =
+    var out = types.codexSessionSummaryZero()
+    out.sessionId = session.sessionId
+    out.title = session.title
+    out.cwd = session.cwd
+    out.updatedAt = session.updatedAt
+    out.lastExitCode = session.lastExitCode
+    out.turnCount = session.turns.len
+    return out
+
+fn codexStoreSummaryLine(summary: types.CodexSessionSummary): str =
+    return textutil.codexHexEncode(summary.sessionId) + "|" +
+        textutil.codexHexEncode(summary.title) + "|" +
+        textutil.codexHexEncode(summary.cwd) + "|" +
+        strings.int64ToStr(summary.updatedAt) + "|" +
+        intToStr(summary.lastExitCode) + "|" +
+        intToStr(summary.turnCount)
+
+fn codexStoreSummaryFromLine(line: str, outSummary: var types.CodexSessionSummary): bool =
+    outSummary = types.codexSessionSummaryZero()
+    let parts = strutil.split(line, '|')
+    if parts.len != 6:
+        return false
+    if !textutil.codexHexDecode(parts[0], outSummary.sessionId):
+        return false
+    if !textutil.codexHexDecode(parts[1], outSummary.title):
+        return false
+    if !textutil.codexHexDecode(parts[2], outSummary.cwd):
+        return false
+    if !textutil.codexParseInt64Text(parts[3], outSummary.updatedAt):
+        return false
+    if !textutil.codexParseInt32Text(parts[4], outSummary.lastExitCode):
+        return false
+    if !textutil.codexParseInt32Text(parts[5], outSummary.turnCount):
+        return false
+    return true
+
+fn codexStoreSessionIndexText(items: types.CodexSessionSummary[]): str =
+    var out = ""
+    for i in 0..<items.len:
+        out = out + codexStoreSummaryLine(items[i]) + "\n"
+    return out
+
+fn codexStoreLineIndexText(items: str[]): str =
+    var out = ""
+    for i in 0..<items.len:
+        out = out + items[i] + "\n"
+    return out
+
+fn codexStoreFileExists(path: str): bool =
+    let f = os.openRead(path)
+    if f == nil:
+        return false
+    let closeRc = os.c_fclose(f)
+    closeRc
+    return true
+
+fn codexStoreReadNonEmptyLines(path: str): str[] =
+    var out: str[]
+    if !codexStoreFileExists(path):
+        return out
+    let text = codexStoreReadText(path)
+    let lines = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let line = textutil.codexTextTrim(lines[i])
+        if !textutil.codexTextNonEmpty(line):
+            continue
+        add(out, line)
+    return out
+
+fn codexStoreHasLine(lines: str[], value: str): bool =
+    for i in 0..<lines.len:
+        if lines[i] == value:
+            return true
+    return false
+
+fn codexStoreAddUniqueLine(path: str, rawValue: str): Result[bool] =
+    let value = textutil.codexTextTrim(rawValue)
+    if !textutil.codexTextNonEmpty(value):
+        return Err[bool]("codex store: empty line value")
+    let current = codexStoreReadNonEmptyLines(path)
+    if codexStoreHasLine(current, value):
+        return Ok[bool](false)
+    var next: str[]
+    for i in 0..<current.len:
+        add(next, current[i])
+    add(next, value)
+    if !codexStoreWriteText(path, codexStoreLineIndexText(next)):
+        return Err[bool]("codex store: failed to write line index: " + path)
+    return Ok[bool](true)
+
+fn codexStoreRemoveLine(path: str, rawValue: str): Result[bool] =
+    let value = textutil.codexTextTrim(rawValue)
+    if !textutil.codexTextNonEmpty(value):
+        return Err[bool]("codex store: empty line value")
+    let current = codexStoreReadNonEmptyLines(path)
+    if current.len <= 0:
+        return Ok[bool](false)
+    var next: str[]
+    var removed = false
+    for i in 0..<current.len:
+        let item = current[i]
+        if item == value:
+            removed = true
+            continue
+        add(next, item)
+    if !removed:
+        return Ok[bool](false)
+    if !codexStoreWriteText(path, codexStoreLineIndexText(next)):
+        return Err[bool]("codex store: failed to write line index: " + path)
+    return Ok[bool](true)
+
+fn codexStoreSessionWrite(home: str, session: types.CodexSession): Result[bool] =
+    let sessionsDir = codexSessionsDir(home)
+    if !codexStoreEnsureDir(sessionsDir):
+        return Err[bool]("codex store: failed to create sessions dir: " + sessionsDir)
+    let sessionPath = codexStoreSessionPath(home, session.sessionId)
+    if !codexStoreWriteText(sessionPath, codexStoreSessionText(session)):
+        return Err[bool]("codex store: failed to write session: " + sessionPath)
+    let lastSessionPath = codexLastSessionPath(home)
+    if !codexStoreWriteText(lastSessionPath, session.sessionId + "\n"):
+        return Err[bool]("codex store: failed to write last session: " + lastSessionPath)
+    let summary = codexStoreSummaryFromSession(session)
+    let current = codexStoreListSessions(home)
+    var next: types.CodexSessionSummary[]
+    for i in 0..<current.len:
+        let item = current[i]
+        if item.sessionId == summary.sessionId:
+            continue
+        add(next, item)
+    add(next, summary)
+    let indexPath = codexSessionIndexPath(home)
+    if !codexStoreWriteText(indexPath, codexStoreSessionIndexText(next)):
+        return Err[bool]("codex store: failed to write session index: " + indexPath)
+    return Ok[bool](true)
+
+fn codexStoreFindValue(lines: str[], key: str, outValue: var str): bool =
+    outValue = ""
+    for i in 0..<lines.len:
+        let line = textutil.codexTextTrim(lines[i])
+        if !textutil.codexTextNonEmpty(line):
+            continue
+        var left = ""
+        var right = ""
+        if !textutil.codexTextSplitFirst(line, '=', left, right):
+            continue
+        if left == key:
+            outValue = right
+            return true
+    return false
+
+fn codexStoreReadHexField(lines: str[], key: str, outValue: var str): bool =
+    outValue = ""
+    var raw = ""
+    if !codexStoreFindValue(lines, key, raw):
+        return false
+    return textutil.codexHexDecode(raw, outValue)
+
+fn codexStoreReadInt32Field(lines: str[], key: str, outValue: var int32): bool =
+    var raw = ""
+    if !codexStoreFindValue(lines, key, raw):
+        return false
+    return textutil.codexParseInt32Text(raw, outValue)
+
+fn codexStoreReadInt64Field(lines: str[], key: str, outValue: var int64): bool =
+    var raw = ""
+    if !codexStoreFindValue(lines, key, raw):
+        return false
+    return textutil.codexParseInt64Text(raw, outValue)
+
+fn codexStoreReadBoolField(lines: str[], key: str, outValue: var bool): bool =
+    var raw = ""
+    if !codexStoreFindValue(lines, key, raw):
+        return false
+    return textutil.codexParseBoolText(raw, outValue)
+
+fn codexStoreLoadTurn(lines: str[], idx: int32, outTurn: var types.CodexTurn): bool =
+    outTurn = types.codexTurnZero()
+    if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_prompt", outTurn.promptText):
+        return false
+    if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_command", outTurn.commandText):
+        return false
+    if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_output", outTurn.outputText):
+        return false
+    if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_assistant", outTurn.assistantText):
+        return false
+    if !codexStoreReadInt32Field(lines, "turn_" + intToStr(idx) + "_exit_code", outTurn.exitCode):
+        return false
+    if !codexStoreReadBoolField(lines, "turn_" + intToStr(idx) + "_approved", outTurn.approved):
+        return false
+    return true
+
+fn codexStoreSessionFromText(path: str, text: str): Result[types.CodexSession] =
+    let lines = strutil.split(text, '\n')
+    var format = ""
+    if !codexStoreFindValue(lines, "format", format) || format != codexSessionFormat:
+        return Err[types.CodexSession]("codex store: invalid session format: " + path)
+    var out = types.codexSessionZero()
+    if !codexStoreReadHexField(lines, "session_id", out.sessionId):
+        return Err[types.CodexSession]("codex store: missing session_id: " + path)
+    if !codexStoreReadHexField(lines, "title", out.title):
+        return Err[types.CodexSession]("codex store: missing title: " + path)
+    if !codexStoreReadHexField(lines, "cwd", out.cwd):
+        return Err[types.CodexSession]("codex store: missing cwd: " + path)
+    if !codexStoreReadInt64Field(lines, "created_at", out.createdAt):
+        return Err[types.CodexSession]("codex store: missing created_at: " + path)
+    if !codexStoreReadInt64Field(lines, "updated_at", out.updatedAt):
+        return Err[types.CodexSession]("codex store: missing updated_at: " + path)
+    if !codexStoreReadInt32Field(lines, "last_exit_code", out.lastExitCode):
+        return Err[types.CodexSession]("codex store: missing last_exit_code: " + path)
+    var turnCount = 0
+    if !codexStoreReadInt32Field(lines, "turn_count", turnCount):
+        return Err[types.CodexSession]("codex store: missing turn_count: " + path)
+    out.turns = []
+    for i in 0..<turnCount:
+        var turn = types.codexTurnZero()
+        if !codexStoreLoadTurn(lines, i, turn):
+            return Err[types.CodexSession]("codex store: invalid turn " + intToStr(i) + ": " + path)
+        add(out.turns, turn)
+    return Ok[types.CodexSession](out)
+
+fn codexStoreSessionRead(home: str, sessionId: str): Result[types.CodexSession] =
+    let path = codexStoreSessionPath(home, sessionId)
+    if !codexStoreFileExists(path):
+        return Err[types.CodexSession]("codex store: missing session: " + sessionId)
+    let text = codexStoreReadText(path)
+    if !textutil.codexTextNonEmpty(text):
+        return Err[types.CodexSession]("codex store: empty session: " + path)
+    return codexStoreSessionFromText(path, text)
+
+fn codexStoreCountSessions(home: str): int32 =
+    let sessions = codexStoreListSessions(home)
+    return sessions.len
+
+fn codexStoreListSessions(home: str): types.CodexSessionSummary[] =
+    var out: types.CodexSessionSummary[]
+    let lines = codexStoreReadNonEmptyLines(codexSessionIndexPath(home))
+    for i in 0..<lines.len:
+        var item = types.codexSessionSummaryZero()
+        if !codexStoreSummaryFromLine(lines[i], item):
+            continue
+        add(out, item)
+    return out
+
+fn codexStoreLoadLastSession(home: str): Result[types.CodexSession] =
+    let lastSessionId = textutil.codexTextTrim(codexStoreReadText(codexLastSessionPath(home)))
+    if textutil.codexTextNonEmpty(lastSessionId):
+        return codexStoreSessionRead(home, lastSessionId)
+    let sessions = codexStoreListSessions(home)
+    if sessions.len <= 0:
+        return Err[types.CodexSession]("codex store: no sessions")
+    return codexStoreSessionRead(home, sessions[sessions.len - 1].sessionId)
+
+fn codexStoreSaveApiKey(home: str, apiKey: str): Result[bool] =
+    let authPath = codexAuthPath(home)
+    let payload = "api_key_hex=" + textutil.codexHexEncode(apiKey) + "\n" +
+        "saved_at=" + strings.int64ToStr(times.epochTimeSeconds()) + "\n"
+    if !codexStoreWriteText(authPath, payload):
+        return Err[bool]("codex store: failed to write auth: " + authPath)
+    return Ok[bool](true)
+
+fn codexStoreReadApiKey(home: str): str =
+    let authPath = codexAuthPath(home)
+    if !codexStoreFileExists(authPath):
+        return ""
+    let text = codexStoreReadText(authPath)
+    let lines = strutil.split(text, '\n')
+    var value = ""
+    if !codexStoreReadHexField(lines, "api_key_hex", value):
+        return ""
+    return value
+
+fn codexStoreClearApiKey(home: str): bool =
+    let authPath = codexAuthPath(home)
+    if !codexStoreFileExists(authPath):
+        return true
+    return os.removeFile(authPath)
+
+fn codexStorePluginSpecLine(spec: types.CodexPluginSpec): str =
+    return textutil.codexHexEncode(spec.name) + "|" +
+        textutil.codexHexEncode(spec.path) + "|" +
+        textutil.codexBoolText(spec.enabled)
+
+fn codexStorePluginSpecFromLine(line: str, outSpec: var types.CodexPluginSpec): bool =
+    outSpec = types.codexPluginSpecZero()
+    let parts = strutil.split(line, '|')
+    if parts.len == 1:
+        outSpec.name = textutil.codexTextTrim(parts[0])
+        outSpec.path = ""
+        outSpec.enabled = true
+        return textutil.codexTextNonEmpty(outSpec.name)
+    if parts.len != 3:
+        return false
+    if !textutil.codexHexDecode(parts[0], outSpec.name):
+        return false
+    if !textutil.codexHexDecode(parts[1], outSpec.path):
+        return false
+    if !textutil.codexParseBoolText(parts[2], outSpec.enabled):
+        return false
+    return textutil.codexTextNonEmpty(outSpec.name)
+
+fn codexStorePluginIndexText(items: types.CodexPluginSpec[]): str =
+    var out = ""
+    for i in 0..<items.len:
+        out = out + codexStorePluginSpecLine(items[i]) + "\n"
+    return out
+
+fn codexStoreListPluginSpecs(home: str): types.CodexPluginSpec[] =
+    var out: types.CodexPluginSpec[]
+    let lines = codexStoreReadNonEmptyLines(codexPluginIndexPath(home))
+    for i in 0..<lines.len:
+        var item = types.codexPluginSpecZero()
+        if !codexStorePluginSpecFromLine(lines[i], item):
+            continue
+        add(out, item)
+    return out
+
+fn codexStoreListPlugins(home: str): str[] =
+    let specs = codexStoreListPluginSpecs(home)
+    var out: str[]
+    for i in 0..<specs.len:
+        add(out, specs[i].name)
+    return out
+
+fn codexStoreGetPluginSpec(home: str, name: str): Result[types.CodexPluginSpec] =
+    let target = textutil.codexTextTrim(name)
+    if !textutil.codexTextNonEmpty(target):
+        return Err[types.CodexPluginSpec]("codex store: missing plugin name")
+    let specs = codexStoreListPluginSpecs(home)
+    for i in 0..<specs.len:
+        if specs[i].name == target:
+            return Ok[types.CodexPluginSpec](specs[i])
+    return Err[types.CodexPluginSpec]("codex store: missing plugin: " + target)
+
+fn codexStoreSavePluginSpec(home: str, spec: types.CodexPluginSpec): Result[bool] =
+    if !textutil.codexTextNonEmpty(spec.name):
+        return Err[bool]("codex store: missing plugin name")
+    let current = codexStoreListPluginSpecs(home)
+    var next: types.CodexPluginSpec[]
+    var replaced = false
+    for i in 0..<current.len:
+        let item = current[i]
+        if item.name == spec.name:
+            add(next, spec)
+            replaced = true
+            continue
+        add(next, item)
+    if !replaced:
+        add(next, spec)
+    let path = codexPluginIndexPath(home)
+    if !codexStoreWriteText(path, codexStorePluginIndexText(next)):
+        return Err[bool]("codex store: failed to write plugin index: " + path)
+    return Ok[bool](!replaced)
+
+fn codexStoreAddPlugin(home: str, name: str): Result[bool] =
+    var spec = types.codexPluginSpecZero()
+    spec.name = textutil.codexTextTrim(name)
+    spec.path = ""
+    spec.enabled = true
+    return codexStoreSavePluginSpec(home, spec)
+
+fn codexStoreSaveNamedPlugin(home: str, name: str, path: str): Result[bool] =
+    var spec = types.codexPluginSpecZero()
+    spec.name = textutil.codexTextTrim(name)
+    spec.path = textutil.codexTextTrim(path)
+    spec.enabled = true
+    return codexStoreSavePluginSpec(home, spec)
+
+fn codexStoreRemovePlugin(home: str, name: str): Result[bool] =
+    let target = textutil.codexTextTrim(name)
+    if !textutil.codexTextNonEmpty(target):
+        return Err[bool]("codex store: missing plugin name")
+    let current = codexStoreListPluginSpecs(home)
+    var next: types.CodexPluginSpec[]
+    var removed = false
+    for i in 0..<current.len:
+        let item = current[i]
+        if item.name == target:
+            removed = true
+            continue
+        add(next, item)
+    if !removed:
+        return Ok[bool](false)
+    let path = codexPluginIndexPath(home)
+    if !codexStoreWriteText(path, codexStorePluginIndexText(next)):
+        return Err[bool]("codex store: failed to write plugin index: " + path)
+    return Ok[bool](true)
+
+fn codexStoreMcpServerSpecLine(spec: types.CodexMcpServerSpec): str =
+    return textutil.codexHexEncode(spec.name) + "|" +
+        textutil.codexHexEncode(spec.transportKind) + "|" +
+        textutil.codexHexEncode(spec.launchCommand) + "|" +
+        textutil.codexHexEncode(spec.cwd) + "|" +
+        textutil.codexHexEncode(spec.url) + "|" +
+        textutil.codexHexEncode(spec.bearerTokenEnvVar) + "|" +
+        textutil.codexBoolText(spec.enabled)
+
+fn codexStoreMcpServerSpecFromLine(line: str, outSpec: var types.CodexMcpServerSpec): bool =
+    outSpec = types.codexMcpServerSpecZero()
+    let parts = strutil.split(line, '|')
+    if parts.len == 1:
+        outSpec.name = textutil.codexTextTrim(parts[0])
+        outSpec.transportKind = "legacy"
+        outSpec.enabled = true
+        return textutil.codexTextNonEmpty(outSpec.name)
+    if parts.len != 7:
+        return false
+    if !textutil.codexHexDecode(parts[0], outSpec.name):
+        return false
+    if !textutil.codexHexDecode(parts[1], outSpec.transportKind):
+        return false
+    if !textutil.codexHexDecode(parts[2], outSpec.launchCommand):
+        return false
+    if !textutil.codexHexDecode(parts[3], outSpec.cwd):
+        return false
+    if !textutil.codexHexDecode(parts[4], outSpec.url):
+        return false
+    if !textutil.codexHexDecode(parts[5], outSpec.bearerTokenEnvVar):
+        return false
+    if !textutil.codexParseBoolText(parts[6], outSpec.enabled):
+        return false
+    return textutil.codexTextNonEmpty(outSpec.name)
+
+fn codexStoreMcpServerIndexText(items: types.CodexMcpServerSpec[]): str =
+    var out = ""
+    for i in 0..<items.len:
+        out = out + codexStoreMcpServerSpecLine(items[i]) + "\n"
+    return out
+
+fn codexStoreListMcpServerSpecs(home: str): types.CodexMcpServerSpec[] =
+    var out: types.CodexMcpServerSpec[]
+    let lines = codexStoreReadNonEmptyLines(codexMcpPath(home))
+    for i in 0..<lines.len:
+        var item = types.codexMcpServerSpecZero()
+        if !codexStoreMcpServerSpecFromLine(lines[i], item):
+            continue
+        add(out, item)
+    return out
+
+fn codexStoreListMcpServers(home: str): str[] =
+    let specs = codexStoreListMcpServerSpecs(home)
+    var out: str[]
+    for i in 0..<specs.len:
+        add(out, specs[i].name)
+    return out
+
+fn codexStoreGetMcpServerSpec(home: str, name: str): Result[types.CodexMcpServerSpec] =
+    let target = textutil.codexTextTrim(name)
+    if !textutil.codexTextNonEmpty(target):
+        return Err[types.CodexMcpServerSpec]("codex store: missing mcp server name")
+    let specs = codexStoreListMcpServerSpecs(home)
+    for i in 0..<specs.len:
+        if specs[i].name == target:
+            return Ok[types.CodexMcpServerSpec](specs[i])
+    return Err[types.CodexMcpServerSpec]("codex store: missing mcp server: " + target)
+
+fn codexStoreSaveMcpServerSpec(home: str, spec: types.CodexMcpServerSpec): Result[bool] =
+    if !textutil.codexTextNonEmpty(spec.name):
+        return Err[bool]("codex store: missing mcp server name")
+    let current = codexStoreListMcpServerSpecs(home)
+    var next: types.CodexMcpServerSpec[]
+    var replaced = false
+    for i in 0..<current.len:
+        let item = current[i]
+        if item.name == spec.name:
+            add(next, spec)
+            replaced = true
+            continue
+        add(next, item)
+    if !replaced:
+        add(next, spec)
+    let path = codexMcpPath(home)
+    if !codexStoreWriteText(path, codexStoreMcpServerIndexText(next)):
+        return Err[bool]("codex store: failed to write mcp server index: " + path)
+    return Ok[bool](!replaced)
+
+fn codexStoreAddMcpServer(home: str, value: str): Result[bool] =
+    var spec = types.codexMcpServerSpecZero()
+    spec.name = textutil.codexTextTrim(value)
+    spec.transportKind = "legacy"
+    spec.enabled = true
+    return codexStoreSaveMcpServerSpec(home, spec)
+
+fn codexStoreRemoveMcpServer(home: str, name: str): Result[bool] =
+    let target = textutil.codexTextTrim(name)
+    if !textutil.codexTextNonEmpty(target):
+        return Err[bool]("codex store: missing mcp server name")
+    let current = codexStoreListMcpServerSpecs(home)
+    var next: types.CodexMcpServerSpec[]
+    var removed = false
+    for i in 0..<current.len:
+        let item = current[i]
+        if item.name == target:
+            removed = true
+            continue
+        add(next, item)
+    if !removed:
+        return Ok[bool](false)
+    let path = codexMcpPath(home)
+    if !codexStoreWriteText(path, codexStoreMcpServerIndexText(next)):
+        return Err[bool]("codex store: failed to write mcp server index: " + path)
+    return Ok[bool](true)
