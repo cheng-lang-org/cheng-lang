@@ -1,4 +1,79 @@
+import std/cmdline as cmdline
+import std/result
 import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node as node
+import cheng/v3/project/chain_node_libp2p as net
+import cheng/v3/libp2p/core/types
+import cheng/v3/libp2p/transports/tcp_transport
 
-fn main(): int32 =
-    return cli.v3ChainNodeCmdSyncOnceMain()
+fn v3ChainNodeCliSyncOnceCommand(): int32 =
+    var stateRaw = ""
+    stateRaw = cli.V3ChainNodeCliReadFlag("--state", "")
+    var statePath = ""
+    let statePathReq = cli.V3ChainNodeCliRequireTextInto(statePath, stateRaw, "--state")
+    if IsErr(statePathReq):
+        let errText: str = Error(statePathReq)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var portRaw = ""
+    portRaw = cli.V3ChainNodeCliReadFlag("--port", "")
+    let portRes = cli.V3ChainNodeCliRequirePositiveInt32(portRaw, "--port")
+    if IsErr(portRes):
+        let errText: str = Error(portRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var nodeIdRaw = ""
+    nodeIdRaw = cli.V3ChainNodeCliReadFlag("--node-id", "")
+    var addressSeedRaw = ""
+    addressSeedRaw = cli.V3ChainNodeCliReadFlag("--address-seed", "")
+    var state: node.V3ChainNode
+    let loadRes = cli.V3ChainNodeCliLoadOrInitForSyncWithIdentityInto(state,
+                                                                      statePath,
+                                                                      nodeIdRaw,
+                                                                      addressSeedRaw)
+    if IsErr(loadRes):
+        let errText: str = Error(loadRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var hostText = ""
+    hostText = cli.V3ChainNodeCliReadFlag("--host", "127.0.0.1")
+    let payloadRes = tcp_transport.V3Libp2pTcpRecvPayloadOnce(hostText,
+                                                              Value(portRes),
+                                                              types.V3Libp2pProtocolSync)
+    if !payloadRes.ok:
+        let errText = ErrorText(payloadRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var incoming: node.V3ChainNodeServeSnapshot
+    let payload = payloadRes.value
+    let snapshotRes = net.V3ChainNodeLibp2pDecodeSnapshotInto(payload, incoming)
+    if IsErr(snapshotRes):
+        let errText: str = Error(snapshotRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    let syncRes = node.V3ChainNodeSyncOnce(state, incoming)
+    if IsErr(syncRes):
+        let errText: str = Error(syncRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var snapshot: node.V3ChainNodeServeSnapshot
+    node.V3ChainNodeServeOnceInto(snapshot, state)
+    if !cli.V3ChainNodeCliWriteState(statePath, snapshot):
+        let absolutePath = cli.V3ChainNodeCliAbsolutePath(statePath)
+        let errText = "v3 chain_node: failed to persist state: " + absolutePath
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    if Value(syncRes):
+        cli.V3ChainNodeCliPrintLine("changed=1")
+        cli.V3ChainNodeCliPrintSnapshotReport(snapshot)
+        return 0
+    cli.V3ChainNodeCliPrintLine("changed=0")
+    cli.V3ChainNodeCliPrintSnapshotReport(snapshot)
+    return 0
+
+fn V3ChainNodeCliSyncOnceCommand(): int32 =
+    return v3ChainNodeCliSyncOnceCommand()
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.CaptureCmdLine(argc, argv)
+    return v3ChainNodeCliSyncOnceCommand()

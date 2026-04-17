@@ -1,0 +1,830 @@
+import std/rawbytes
+import std/result
+import std/strings
+import std/strutils
+import std/crypto/sha256
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
+
+type V3Libp2pMoqDroplet = object
+    objectIndex: int32
+    dropletIndex: int32
+    kindCode: int32
+    key: str
+    peerId: str
+    cid: str
+    degree: int32
+    blockIndexes: int32[]
+    payload: Bytes
+
+type V3Libp2pMoqObject = object
+    objectIndex: int32
+    groupId: str
+    objectId: str
+    priority: int32
+    byteOffset: int32
+    byteLength: int32
+    objectCid: str
+    sourceBlockBytes: int32
+    sourceBlockCount: int32
+    repairDropletCount: int32
+    droplets: V3Libp2pMoqDroplet[]
+
+type V3Libp2pMoqEquation = object
+    coeffs: int32[]
+    payload: Bytes
+
+type V3Libp2pMoqBuildResult = object
+    ownerPeerId: str
+    mimeType: str
+    bundleCid: str
+    blobCid: str
+    catalogKey: str
+    blobByteLen: int32
+    objectTargetBytes: int32
+    sourceBlockBytes: int32
+    objectCount: int32
+    remoteAckPeerIds: str[]
+    objects: V3Libp2pMoqObject[]
+    droplets: V3Libp2pMoqDroplet[]
+
+type V3Libp2pMoqRebuildResult = object
+    blob: Bytes
+    blobCid: str
+    blobByteLen: int32
+
+const v3Libp2pMoqCatalogMagic = "unimaker.moq.fountain.catalog.v1"
+const v3Libp2pMoqTransport = "native_media_rpc"
+const v3Libp2pMoqLayout = "lt_xor_v1"
+const v3Libp2pMoqDropletKindSource = 1
+const v3Libp2pMoqDropletKindRepair = 2
+
+fn v3Libp2pMoqErrorWire(errorText: str): str =
+    var out = ""
+    out = out + "ok=0\n"
+    out = out + "error=" + errorText + "\n"
+    return out
+
+fn v3Libp2pMoqMaxInt32(left: int32, right: int32): int32 =
+    if left >= right:
+        return left
+    return right
+
+fn v3Libp2pMoqMinInt32(left: int32, right: int32): int32 =
+    if left <= right:
+        return left
+    return right
+
+fn v3Libp2pMoqNormalizePositiveInt(value: int32, fallback: int32): int32 =
+    var out = value
+    if out <= 0:
+        out = fallback
+    if out <= 0:
+        return 1
+    return out
+
+fn v3Libp2pMoqHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3Libp2pMoqBytesFromHex(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](bytesAlloc(0))
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("moq_fountain_invalid_hex_length")
+    var out = bytesAlloc(len(text) / 2)
+    var i: int32 = 0
+    while i < len(text):
+        let hi = v3Libp2pMoqHexValue(text[i])
+        let lo = v3Libp2pMoqHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("moq_fountain_invalid_hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3Libp2pMoqSha256HexBytes(data: Bytes): str =
+    return bytesToHex(sha256.sha256Digest(data))
+
+fn v3Libp2pMoqSha256HexText(text: str): str =
+    return v3Libp2pMoqSha256HexBytes(bytesFromString(text))
+
+fn v3Libp2pMoqAsciiTrimLeft(text: str): int32 =
+    var idx: int32 = 0
+    while idx < len(text):
+        let code = int32(text[idx])
+        if code == 32 || code == 10 || code == 13 || code == 9:
+            idx = idx + 1
+            continue
+        break
+    return idx
+
+fn v3Libp2pMoqAsciiTrimRight(text: str): int32 =
+    var idx: int32 = len(text)
+    while idx > 0:
+        let code = int32(text[idx - 1])
+        if code == 32 || code == 10 || code == 13 || code == 9:
+            idx = idx - 1
+            continue
+        break
+    return idx
+
+fn v3Libp2pMoqTrimAscii(text: str): str =
+    let start = v3Libp2pMoqAsciiTrimLeft(text)
+    let stop = v3Libp2pMoqAsciiTrimRight(text)
+    if stop <= start:
+        return ""
+    return strings.SliceBytes(text, start, stop - start)
+
+fn v3Libp2pMoqSplitCsv(text: str): str[] =
+    var out: str[]
+    out = []
+    if len(text) <= 0:
+        return out
+    var start: int32 = 0
+    var idx: int32 = 0
+    while idx <= len(text):
+        let atEnd = idx >= len(text)
+        if atEnd || text[idx] == ',':
+            var item = ""
+            if idx > start:
+                item = strings.SliceBytes(text, start, idx - start)
+            add(out, item)
+            start = idx + 1
+        idx = idx + 1
+    return out
+
+fn v3Libp2pMoqNormalizePeerCsv(peerCsv: str): str[] =
+    let parts = v3Libp2pMoqSplitCsv(peerCsv)
+    var out: str[]
+    out = []
+    var i: int32 = 0
+    while i < parts.len:
+        let candidate = v3Libp2pMoqTrimAscii(parts[i])
+        if len(candidate) <= 0:
+            i = i + 1
+            continue
+        var exists = false
+        var j: int32 = 0
+        while j < out.len:
+            if out[j] == candidate:
+                exists = true
+                break
+            j = j + 1
+        if !exists:
+            add(out, candidate)
+        i = i + 1
+    return out
+
+fn v3Libp2pMoqJoinCsv(values: str[]): str =
+    if values.len <= 0:
+        return ""
+    return strutils.Join(values, ",")
+
+fn v3Libp2pMoqJoinIntCsv(values: int32[]): str =
+    var rows: str[]
+    rows = []
+    for i in 0..<values.len:
+        add(rows, strings.IntToStr(values[i]))
+    return strutils.Join(rows, ",")
+
+fn v3Libp2pMoqHexDigitCode(value: int32): int32 =
+    if value < 10:
+        return int32('0') + value
+    return int32('a') + value - 10
+
+fn v3Libp2pMoqHex4(value: int32): str =
+    var out = bytesAlloc(4)
+    bytesSet(out, 0, v3Libp2pMoqHexDigitCode((value >> 12) & 15))
+    bytesSet(out, 1, v3Libp2pMoqHexDigitCode((value >> 8) & 15))
+    bytesSet(out, 2, v3Libp2pMoqHexDigitCode((value >> 4) & 15))
+    bytesSet(out, 3, v3Libp2pMoqHexDigitCode(value & 15))
+    return bytesToString(out)
+
+fn v3Libp2pMoqJsonQuote(text: str): str =
+    var out = "\""
+    var idx: int32 = 0
+    while idx < len(text):
+        let code = int32(text[idx]) & 255
+        if code == 34:
+            out = out + "\\\""
+        elif code == 92:
+            out = out + "\\\\"
+        elif code == 8:
+            out = out + "\\b"
+        elif code == 12:
+            out = out + "\\f"
+        elif code == 10:
+            out = out + "\\n"
+        elif code == 13:
+            out = out + "\\r"
+        elif code == 9:
+            out = out + "\\t"
+        elif code < 32:
+            out = out + "\\u"
+            out = out + v3Libp2pMoqHex4(code)
+        else:
+            out = out + strings.SliceBytes(text, idx, 1)
+        idx = idx + 1
+    out = out + "\""
+    return out
+
+fn v3Libp2pMoqJoinIntJson(values: int32[]): str =
+    if values.len <= 0:
+        return "[]"
+    var rows: str[]
+    rows = []
+    for i in 0..<values.len:
+        add(rows, strings.IntToStr(values[i]))
+    return "[" + strutils.Join(rows, ",") + "]"
+
+fn v3Libp2pMoqContainsInt(values: int32[], want: int32): bool =
+    for i in 0..<values.len:
+        if values[i] == want:
+            return true
+    return false
+
+fn v3Libp2pMoqSortInts(values0: int32[]): int32[] =
+    var values = values0
+    var i: int32 = 0
+    while i < values.len:
+        var j: int32 = i + 1
+        while j < values.len:
+            if values[j] < values[i]:
+                let tmp = values[i]
+                values[i] = values[j]
+                values[j] = tmp
+            j = j + 1
+        i = i + 1
+    return values
+
+fn v3Libp2pMoqHashSeed(text: str): int32 =
+    let digestHex = v3Libp2pMoqSha256HexText(text)
+    if len(digestHex) < 8:
+        return 1
+    var out: int32 = 0
+    var i: int32 = 0
+    while i < 8:
+        let nibble = v3Libp2pMoqHexValue(digestHex[i])
+        if nibble < 0:
+            return 1
+        out = (out << 4) | nibble
+        i = i + 1
+    if out == 0:
+        return 1
+    return out
+
+fn v3Libp2pMoqDropletKindText(kindCode: int32): str =
+    if kindCode == v3Libp2pMoqDropletKindSource:
+        return "source"
+    if kindCode == v3Libp2pMoqDropletKindRepair:
+        return "repair"
+    return "unknown"
+
+fn v3Libp2pMoqDropletJson(droplet: V3Libp2pMoqDroplet): str =
+    var row = "{"
+    row = row + "\"objectIndex\":" + strings.IntToStr(droplet.objectIndex) + ","
+    row = row + "\"dropletIndex\":" + strings.IntToStr(droplet.dropletIndex) + ","
+    row = row + "\"kind\":" + v3Libp2pMoqJsonQuote(v3Libp2pMoqDropletKindText(droplet.kindCode)) + ","
+    row = row + "\"key\":" + v3Libp2pMoqJsonQuote(droplet.key) + ","
+    row = row + "\"peerId\":" + v3Libp2pMoqJsonQuote(droplet.peerId) + ","
+    row = row + "\"cid\":" + v3Libp2pMoqJsonQuote(droplet.cid) + ","
+    row = row + "\"degree\":" + strings.IntToStr(droplet.degree) + ","
+    row = row + "\"blockIndexes\":" + v3Libp2pMoqJoinIntJson(droplet.blockIndexes)
+    row = row + "}"
+    return row
+
+fn v3Libp2pMoqDropletsJson(droplets: V3Libp2pMoqDroplet[]): str =
+    var rows: str[]
+    rows = []
+    var idx: int32 = 0
+    while idx < droplets.len:
+        add(rows, v3Libp2pMoqDropletJson(droplets[idx]))
+        idx = idx + 1
+    return strutils.Join(rows, ",")
+
+fn v3Libp2pMoqObjectJson(item: V3Libp2pMoqObject): str =
+    var row = "{"
+    row = row + "\"objectIndex\":" + strings.IntToStr(item.objectIndex) + ","
+    row = row + "\"groupId\":" + v3Libp2pMoqJsonQuote(item.groupId) + ","
+    row = row + "\"objectId\":" + v3Libp2pMoqJsonQuote(item.objectId) + ","
+    row = row + "\"priority\":" + strings.IntToStr(item.priority) + ","
+    row = row + "\"byteOffset\":" + strings.IntToStr(item.byteOffset) + ","
+    row = row + "\"byteLength\":" + strings.IntToStr(item.byteLength) + ","
+    row = row + "\"objectCid\":" + v3Libp2pMoqJsonQuote(item.objectCid) + ","
+    row = row + "\"sourceBlockBytes\":" + strings.IntToStr(item.sourceBlockBytes) + ","
+    row = row + "\"sourceBlockCount\":" + strings.IntToStr(item.sourceBlockCount) + ","
+    row = row + "\"repairDropletCount\":" + strings.IntToStr(item.repairDropletCount) + ","
+    row = row + "\"droplets\":[" + v3Libp2pMoqDropletsJson(item.droplets) + "]"
+    row = row + "}"
+    return row
+
+fn v3Libp2pMoqParseInt32Text(text: str): int32 =
+    return int32(strutils.ParseInt(text))
+
+fn v3Libp2pMoqParseInt32Wire(requestWire: str, key: str): Result[int32] =
+    let rawRes = v3Libp2pMoqWireFindValue(requestWire, key)
+    if IsErr(rawRes):
+        return Err[int32](Error(rawRes))
+    return Ok[int32](v3Libp2pMoqParseInt32Text(Value(rawRes)))
+
+fn v3Libp2pMoqAppendDroplets(out: var V3Libp2pMoqDroplet[],
+                             droplets: V3Libp2pMoqDroplet[]) =
+    var idx: int32 = 0
+    while idx < droplets.len:
+        add(out, droplets[idx])
+        idx = idx + 1
+
+fn v3Libp2pMoqNextSeed(state0: int32): int32 =
+    var state = state0
+    if state == 0:
+        state = 1
+    state = state ^ (state << 13)
+    state = state ^ (state >> 17)
+    state = state ^ (state << 5)
+    if state == 0:
+        return 1
+    return state
+
+fn v3Libp2pMoqPositiveMod(value: int32, modBy: int32): int32 =
+    if modBy <= 0:
+        return 0
+    let normalized = int64(value & 2147483647)
+    return int32(normalized % int64(modBy))
+
+fn v3Libp2pMoqChooseUniqueBlockIndexes(blockCount: int32,
+                                       degree0: int32,
+                                       seedText: str): int32[] =
+    var out: int32[]
+    out = []
+    if blockCount <= 0:
+        return out
+    let degree = v3Libp2pMoqMinInt32(blockCount, v3Libp2pMoqMaxInt32(1, degree0))
+    var seed = v3Libp2pMoqHashSeed(seedText)
+    while out.len < degree:
+        seed = v3Libp2pMoqNextSeed(seed)
+        let candidate = v3Libp2pMoqPositiveMod(seed, blockCount)
+        if !v3Libp2pMoqContainsInt(out, candidate):
+            add(out, candidate)
+    return v3Libp2pMoqSortInts(out)
+
+fn v3Libp2pMoqPadBlock(data: Bytes, blockBytes: int32): Bytes =
+    if bytesLen(data) == blockBytes:
+        return bytesSlice(data, 0, bytesLen(data))
+    var out = bytesAlloc(blockBytes)
+    let copyLen = v3Libp2pMoqMinInt32(bytesLen(data), blockBytes)
+    for i in 0..<copyLen:
+        bytesSet(out, i, bytesGet(data, i))
+    return out
+
+fn v3Libp2pMoqXorInto(target: var Bytes, source: Bytes): Result[bool] =
+    if bytesLen(target) != bytesLen(source):
+        return Err[bool]("moq_fountain_xor_length_mismatch")
+    for i in 0..<bytesLen(target):
+        bytesSet(target, i, bytesGet(target, i) ^ bytesGet(source, i))
+    return Ok[bool](true)
+
+fn v3Libp2pMoqXorBytes(left: Bytes, right: Bytes): Result[Bytes] =
+    if bytesLen(left) != bytesLen(right):
+        return Err[Bytes]("moq_fountain_xor_length_mismatch")
+    var out = bytesAlloc(bytesLen(left))
+    for i in 0..<bytesLen(left):
+        bytesSet(out, i, bytesGet(left, i) ^ bytesGet(right, i))
+    return Ok[Bytes](out)
+
+fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
+                          objectIndex: int32,
+                          byteOffset: int32,
+                          peers: str[],
+                          bundleCid: str,
+                          sourceBlockBytes: int32,
+                          repairDropletCount: int32): Result[V3Libp2pMoqObject] =
+    let objectByteLen = bytesLen(objectBytes)
+    let objectCid = v3Libp2pMoqSha256HexBytes(objectBytes)
+    let sourceBlockCount = (objectByteLen + sourceBlockBytes - 1) / sourceBlockBytes
+    var blocks: Bytes[]
+    blocks = []
+    var blockIndex: int32 = 0
+    while blockIndex < sourceBlockCount:
+        let blockOffset = blockIndex * sourceBlockBytes
+        let blockLen = v3Libp2pMoqMinInt32(sourceBlockBytes, objectByteLen - blockOffset)
+        let blockBytes = bytesSlice(objectBytes, blockOffset, blockLen)
+        add(blocks, v3Libp2pMoqPadBlock(blockBytes, sourceBlockBytes))
+        blockIndex = blockIndex + 1
+    var objectDroplets: V3Libp2pMoqDroplet[]
+    objectDroplets = []
+    blockIndex = 0
+    while blockIndex < sourceBlockCount:
+        var indexes: int32[]
+        indexes = []
+        add(indexes, blockIndex)
+        let peerId = peers[(objectIndex + blockIndex) % peers.len]
+        let payload = blocks[blockIndex]
+        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-s" + strings.IntToStr(blockIndex)
+        let droplet = V3Libp2pMoqDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: blockIndex,
+            kindCode: v3Libp2pMoqDropletKindSource,
+            key: key,
+            peerId: peerId,
+            cid: v3Libp2pMoqSha256HexBytes(payload),
+            degree: 1,
+            blockIndexes: indexes,
+            payload: payload
+        )
+        add(objectDroplets, droplet)
+        blockIndex = blockIndex + 1
+    var repairIndex: int32 = 0
+    while repairIndex < repairDropletCount:
+        var degreeBase: int32 = 1
+        if sourceBlockCount > 1:
+            let seedText = bundleCid + "|o" + strings.IntToStr(objectIndex) + "|r" + strings.IntToStr(repairIndex)
+            degreeBase = 2 + v3Libp2pMoqPositiveMod(v3Libp2pMoqHashSeed(seedText), sourceBlockCount - 1)
+        let repairSeed = bundleCid + "|repair|" + strings.IntToStr(objectIndex) + "|" + strings.IntToStr(repairIndex)
+        let blockIndexes = v3Libp2pMoqChooseUniqueBlockIndexes(sourceBlockCount, degreeBase, repairSeed)
+        var payload = bytesAlloc(sourceBlockBytes)
+        var blockPick: int32 = 0
+        while blockPick < blockIndexes.len:
+            let xorOk = v3Libp2pMoqXorInto(payload, blocks[blockIndexes[blockPick]])
+            if IsErr(xorOk):
+                return Err[V3Libp2pMoqObject](Error(xorOk))
+            blockPick = blockPick + 1
+        let dropletIndex = sourceBlockCount + repairIndex
+        let peerId = peers[(objectIndex + dropletIndex) % peers.len]
+        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-r" + strings.IntToStr(repairIndex)
+        let droplet = V3Libp2pMoqDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: dropletIndex,
+            kindCode: v3Libp2pMoqDropletKindRepair,
+            key: key,
+            peerId: peerId,
+            cid: v3Libp2pMoqSha256HexBytes(payload),
+            degree: blockIndexes.len,
+            blockIndexes: blockIndexes,
+            payload: payload
+        )
+        add(objectDroplets, droplet)
+        repairIndex = repairIndex + 1
+    let objectOut = V3Libp2pMoqObject(
+        objectIndex: objectIndex,
+        groupId: bundleCid,
+        objectId: "object-" + strings.IntToStr(objectIndex),
+        priority: objectIndex,
+        byteOffset: byteOffset,
+        byteLength: objectByteLen,
+        objectCid: objectCid,
+        sourceBlockBytes: sourceBlockBytes,
+        sourceBlockCount: sourceBlockCount,
+        repairDropletCount: repairDropletCount,
+        droplets: objectDroplets
+    )
+    return Ok[V3Libp2pMoqObject](objectOut)
+
+fn v3Libp2pMoqBuild(blobBytes: Bytes,
+                    ownerPeerId: str,
+                    remotePeersCsv: str,
+                    mimeType0: str,
+                    objectTargetBytes0: int32,
+                    sourceBlockBytes0: int32,
+                    repairDropletCount0: int32): Result[V3Libp2pMoqBuildResult] =
+    if bytesLen(blobBytes) <= 0:
+        return Err[V3Libp2pMoqBuildResult]("moq_fountain_empty_blob")
+    let peers = v3Libp2pMoqNormalizePeerCsv(remotePeersCsv)
+    if peers.len <= 0:
+        return Err[V3Libp2pMoqBuildResult]("video_publish_insufficient_storage_peers")
+    let objectTargetBytes = v3Libp2pMoqNormalizePositiveInt(objectTargetBytes0, 512 * 1024)
+    let sourceBlockBytes = v3Libp2pMoqNormalizePositiveInt(sourceBlockBytes0, 128 * 1024)
+    let repairDropletCount = v3Libp2pMoqNormalizePositiveInt(repairDropletCount0, 2)
+    let mimeType = if len(mimeType0) > 0: mimeType0 else: "video/mp4"
+    let blobCid = v3Libp2pMoqSha256HexBytes(blobBytes)
+    var bundleSeed = ownerPeerId + "|" + blobCid + "|" + mimeType + "|" + v3Libp2pMoqJoinCsv(peers)
+    bundleSeed = bundleSeed + "|" + strings.IntToStr(objectTargetBytes)
+    bundleSeed = bundleSeed + "|" + strings.IntToStr(sourceBlockBytes)
+    bundleSeed = bundleSeed + "|" + strings.IntToStr(repairDropletCount)
+    let bundleCid = v3Libp2pMoqSha256HexText(bundleSeed)
+    var objects: V3Libp2pMoqObject[]
+    objects = []
+    var allDroplets: V3Libp2pMoqDroplet[]
+    allDroplets = []
+    var byteOffset: int32 = 0
+    var objectIndex: int32 = 0
+    while byteOffset < bytesLen(blobBytes):
+        let objectByteLen = v3Libp2pMoqMinInt32(objectTargetBytes, bytesLen(blobBytes) - byteOffset)
+        let objectBytes = bytesSlice(blobBytes, byteOffset, objectByteLen)
+        let objectRes = v3Libp2pMoqBuildObject(objectBytes,
+                                               objectIndex,
+                                               byteOffset,
+                                               peers,
+                                               bundleCid,
+                                               sourceBlockBytes,
+                                               repairDropletCount)
+        if IsErr(objectRes):
+            return Err[V3Libp2pMoqBuildResult](Error(objectRes))
+        let objectOut = Value(objectRes)
+        add(objects, objectOut)
+        v3Libp2pMoqAppendDroplets(allDroplets, objectOut.droplets)
+        byteOffset = byteOffset + objectByteLen
+        objectIndex = objectIndex + 1
+    let out = V3Libp2pMoqBuildResult(
+        ownerPeerId: ownerPeerId,
+        mimeType: mimeType,
+        bundleCid: bundleCid,
+        blobCid: blobCid,
+        catalogKey: "moqcatalog-" + bundleCid,
+        blobByteLen: bytesLen(blobBytes),
+        objectTargetBytes: objectTargetBytes,
+        sourceBlockBytes: sourceBlockBytes,
+        objectCount: objects.len,
+        remoteAckPeerIds: peers,
+        objects: objects,
+        droplets: allDroplets
+    )
+    return Ok[V3Libp2pMoqBuildResult](out)
+
+fn v3Libp2pMoqBuildResultToWire(result: V3Libp2pMoqBuildResult): str =
+    var out = ""
+    out = out + "ok=1\n"
+    out = out + "owner_peer_id=" + result.ownerPeerId + "\n"
+    out = out + "mime_type=" + result.mimeType + "\n"
+    out = out + "bundle_cid=" + result.bundleCid + "\n"
+    out = out + "blob_cid=" + result.blobCid + "\n"
+    out = out + "catalog_key=" + result.catalogKey + "\n"
+    out = out + "blob_byte_len=" + strings.IntToStr(result.blobByteLen) + "\n"
+    out = out + "object_target_bytes=" + strings.IntToStr(result.objectTargetBytes) + "\n"
+    out = out + "source_block_bytes=" + strings.IntToStr(result.sourceBlockBytes) + "\n"
+    out = out + "object_count=" + strings.IntToStr(result.objectCount) + "\n"
+    out = out + "remote_ack_peer_ids=" + v3Libp2pMoqJoinCsv(result.remoteAckPeerIds) + "\n"
+    for i in 0..<result.objects.len:
+        let item = result.objects[i]
+        let prefix = "object." + strings.IntToStr(i) + "."
+        out = out + prefix + "object_index=" + strings.IntToStr(item.objectIndex) + "\n"
+        out = out + prefix + "group_id=" + item.groupId + "\n"
+        out = out + prefix + "object_id=" + item.objectId + "\n"
+        out = out + prefix + "priority=" + strings.IntToStr(item.priority) + "\n"
+        out = out + prefix + "byte_offset=" + strings.IntToStr(item.byteOffset) + "\n"
+        out = out + prefix + "byte_length=" + strings.IntToStr(item.byteLength) + "\n"
+        out = out + prefix + "object_cid=" + item.objectCid + "\n"
+        out = out + prefix + "source_block_bytes=" + strings.IntToStr(item.sourceBlockBytes) + "\n"
+        out = out + prefix + "source_block_count=" + strings.IntToStr(item.sourceBlockCount) + "\n"
+        out = out + prefix + "repair_droplet_count=" + strings.IntToStr(item.repairDropletCount) + "\n"
+    out = out + "droplet_count=" + strings.IntToStr(result.droplets.len) + "\n"
+    for i in 0..<result.droplets.len:
+        let droplet = result.droplets[i]
+        let prefix = "droplet." + strings.IntToStr(i) + "."
+        out = out + prefix + "object_index=" + strings.IntToStr(droplet.objectIndex) + "\n"
+        out = out + prefix + "droplet_index=" + strings.IntToStr(droplet.dropletIndex) + "\n"
+        out = out + prefix + "kind=" + v3Libp2pMoqDropletKindText(droplet.kindCode) + "\n"
+        out = out + prefix + "key=" + droplet.key + "\n"
+        out = out + prefix + "peer_id=" + droplet.peerId + "\n"
+        out = out + prefix + "cid=" + droplet.cid + "\n"
+        out = out + prefix + "degree=" + strings.IntToStr(droplet.degree) + "\n"
+        out = out + prefix + "block_indexes=" + v3Libp2pMoqJoinIntCsv(droplet.blockIndexes) + "\n"
+        out = out + prefix + "payload_hex=" + bytesToHex(droplet.payload) + "\n"
+    return out
+
+fn v3Libp2pMoqBuildToWire(blobBytes: Bytes,
+                          ownerPeerId: str,
+                          remotePeersCsv: str,
+                          mimeType0: str,
+                          objectTargetBytes0: int32,
+                          sourceBlockBytes0: int32,
+                          repairDropletCount0: int32): str =
+    let buildRes = v3Libp2pMoqBuild(blobBytes,
+                                    ownerPeerId,
+                                    remotePeersCsv,
+                                    mimeType0,
+                                    objectTargetBytes0,
+                                    sourceBlockBytes0,
+                                    repairDropletCount0)
+    if IsErr(buildRes):
+        return v3Libp2pMoqErrorWire(Error(buildRes))
+    return v3Libp2pMoqBuildResultToWire(Value(buildRes))
+
+fn v3Libp2pMoqWireFindValue(wire: str, key: str): Result[str] =
+    let prefix = key + "="
+    var lineStart: int32 = 0
+    let n = strings.Len(wire)
+    while lineStart < n:
+        var lineEnd: int32 = lineStart
+        while lineEnd < n:
+            if wire[lineEnd] == '\n':
+                break
+            lineEnd = lineEnd + 1
+        var line = ""
+        if lineEnd > lineStart:
+            line = strutils.SliceStr(wire, lineStart, lineEnd - 1)
+        if strutils.StartsWith(line, prefix):
+            return Ok[str](strutils.SliceStr(line, strings.Len(prefix), strings.Len(line) - 1))
+        lineStart = lineEnd + 1
+    return Err[str]("moq_fountain_missing_wire_field:" + key)
+
+fn v3Libp2pMoqDecodeBlockIndexes(csv: str): int32[] =
+    let parts = v3Libp2pMoqSplitCsv(csv)
+    var out: int32[]
+    out = []
+    var i: int32 = 0
+    while i < parts.len:
+        let item = v3Libp2pMoqTrimAscii(parts[i])
+        if len(item) <= 0:
+            i = i + 1
+            continue
+        add(out, v3Libp2pMoqParseInt32Text(item))
+        i = i + 1
+    return out
+
+fn v3Libp2pMoqSolveObject(sourceBlockCount: int32,
+                          blockBytes: int32,
+                          equations0: V3Libp2pMoqEquation[]): Result[Bytes[]] =
+    if sourceBlockCount <= 0:
+        return Err[Bytes[]]("moq_fountain_invalid_object")
+    var equations = equations0
+    var pivotCols: int32[]
+    pivotCols = []
+    var pivotRow: int32 = 0
+    for col in 0..<sourceBlockCount:
+        var found: int32 = -1
+        for row in pivotRow..<equations.len:
+            if equations[row].coeffs[col] != 0:
+                found = row
+                break
+        if found < 0:
+            continue
+        if found != pivotRow:
+            let temp = equations[pivotRow]
+            equations[pivotRow] = equations[found]
+            equations[found] = temp
+        for row in 0..<equations.len:
+            if row == pivotRow || equations[row].coeffs[col] == 0:
+                continue
+            for coeffIndex in 0..<sourceBlockCount:
+                equations[row].coeffs[coeffIndex] = equations[row].coeffs[coeffIndex] ^ equations[pivotRow].coeffs[coeffIndex]
+            let xorOk = v3Libp2pMoqXorInto(equations[row].payload, equations[pivotRow].payload)
+            if IsErr(xorOk):
+                return Err[Bytes[]](Error(xorOk))
+        add(pivotCols, col)
+        pivotRow = pivotRow + 1
+        if pivotRow >= sourceBlockCount:
+            break
+    if pivotCols.len < sourceBlockCount:
+        return Err[Bytes[]]("moq_fountain_insufficient_droplets")
+    var solved: Bytes[]
+    solved = []
+    for i in 0..<sourceBlockCount:
+        add(solved, bytesAlloc(blockBytes))
+    for row in 0..<sourceBlockCount:
+        solved[pivotCols[row]] = equations[row].payload
+    return Ok[Bytes[]](solved)
+
+fn v3Libp2pMoqRebuildFromWire(requestWire: str): Result[V3Libp2pMoqRebuildResult] =
+    let blobCidRes = v3Libp2pMoqWireFindValue(requestWire, "blob_cid")
+    if IsErr(blobCidRes):
+        return Err[V3Libp2pMoqRebuildResult](Error(blobCidRes))
+    let blobByteLenRes = v3Libp2pMoqParseInt32Wire(requestWire, "blob_byte_len")
+    if IsErr(blobByteLenRes):
+        return Err[V3Libp2pMoqRebuildResult](Error(blobByteLenRes))
+    let objectCountRes = v3Libp2pMoqParseInt32Wire(requestWire, "object_count")
+    if IsErr(objectCountRes):
+        return Err[V3Libp2pMoqRebuildResult](Error(objectCountRes))
+    let dropletCountRes = v3Libp2pMoqParseInt32Wire(requestWire, "droplet_count")
+    if IsErr(dropletCountRes):
+        return Err[V3Libp2pMoqRebuildResult](Error(dropletCountRes))
+    let blobCid = Value(blobCidRes)
+    let blobByteLen = Value(blobByteLenRes)
+    let objectCount = Value(objectCountRes)
+    let dropletCount = Value(dropletCountRes)
+    var objectBytesList: Bytes[]
+    objectBytesList = []
+    var objectIndex: int32 = 0
+    while objectIndex < objectCount:
+        let objectPrefix = "object." + strings.IntToStr(objectIndex) + "."
+        let byteLengthRes = v3Libp2pMoqParseInt32Wire(requestWire, objectPrefix + "byte_length")
+        if IsErr(byteLengthRes):
+            return Err[V3Libp2pMoqRebuildResult](Error(byteLengthRes))
+        let sourceBlockBytesRes = v3Libp2pMoqParseInt32Wire(requestWire, objectPrefix + "source_block_bytes")
+        if IsErr(sourceBlockBytesRes):
+            return Err[V3Libp2pMoqRebuildResult](Error(sourceBlockBytesRes))
+        let sourceBlockCountRes = v3Libp2pMoqParseInt32Wire(requestWire, objectPrefix + "source_block_count")
+        if IsErr(sourceBlockCountRes):
+            return Err[V3Libp2pMoqRebuildResult](Error(sourceBlockCountRes))
+        let objectCidRes = v3Libp2pMoqWireFindValue(requestWire, objectPrefix + "object_cid")
+        if IsErr(objectCidRes):
+            return Err[V3Libp2pMoqRebuildResult](Error(objectCidRes))
+        let byteLength = Value(byteLengthRes)
+        let sourceBlockBytes = Value(sourceBlockBytesRes)
+        let sourceBlockCount = Value(sourceBlockCountRes)
+        let objectCid = Value(objectCidRes)
+        var equations: V3Libp2pMoqEquation[]
+        equations = []
+        var dropletRow: int32 = 0
+        while dropletRow < dropletCount:
+            let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
+            let candidateObjectIndexRes = v3Libp2pMoqParseInt32Wire(requestWire, prefix + "object_index")
+            if IsErr(candidateObjectIndexRes):
+                return Err[V3Libp2pMoqRebuildResult](Error(candidateObjectIndexRes))
+            let candidateObjectIndex = Value(candidateObjectIndexRes)
+            if candidateObjectIndex != objectIndex:
+                dropletRow = dropletRow + 1
+                continue
+            let payloadHexRes = v3Libp2pMoqWireFindValue(requestWire, prefix + "payload_hex")
+            if IsErr(payloadHexRes):
+                return Err[V3Libp2pMoqRebuildResult](Error(payloadHexRes))
+            let payloadRes = v3Libp2pMoqBytesFromHex(Value(payloadHexRes))
+            if IsErr(payloadRes):
+                return Err[V3Libp2pMoqRebuildResult](Error(payloadRes))
+            let payload = Value(payloadRes)
+            if bytesLen(payload) != sourceBlockBytes:
+                return Err[V3Libp2pMoqRebuildResult]("moq_fountain_payload_size_mismatch")
+            let cidRes = v3Libp2pMoqWireFindValue(requestWire, prefix + "cid")
+            if IsErr(cidRes):
+                return Err[V3Libp2pMoqRebuildResult](Error(cidRes))
+            let cid = Value(cidRes)
+            if len(cid) > 0 && cid != v3Libp2pMoqSha256HexBytes(payload):
+                return Err[V3Libp2pMoqRebuildResult]("moq_fountain_payload_cid_mismatch")
+            let blockIndexesRes = v3Libp2pMoqWireFindValue(requestWire, prefix + "block_indexes")
+            if IsErr(blockIndexesRes):
+                return Err[V3Libp2pMoqRebuildResult](Error(blockIndexesRes))
+            let blockIndexes = v3Libp2pMoqDecodeBlockIndexes(Value(blockIndexesRes))
+            var coeffs: int32[]
+            coeffs = []
+            var coeffIndex: int32 = 0
+            while coeffIndex < sourceBlockCount:
+                add(coeffs, 0)
+                coeffIndex = coeffIndex + 1
+            var blockIndex: int32 = 0
+            while blockIndex < blockIndexes.len:
+                let idx = blockIndexes[blockIndex]
+                if idx < 0 || idx >= sourceBlockCount:
+                    return Err[V3Libp2pMoqRebuildResult]("moq_fountain_block_index_out_of_range")
+                coeffs[idx] = coeffs[idx] ^ 1
+                blockIndex = blockIndex + 1
+            add(equations, V3Libp2pMoqEquation(coeffs: coeffs, payload: payload))
+            dropletRow = dropletRow + 1
+        let solvedRes = v3Libp2pMoqSolveObject(sourceBlockCount, sourceBlockBytes, equations)
+        if IsErr(solvedRes):
+            return Err[V3Libp2pMoqRebuildResult](Error(solvedRes))
+        let solved = Value(solvedRes)
+        var objectBytes = bytesAlloc(byteLength)
+        var writeOffset: int32 = 0
+        var solvedIndex: int32 = 0
+        while solvedIndex < solved.len:
+            if writeOffset >= byteLength:
+                break
+            let copyLen = v3Libp2pMoqMinInt32(sourceBlockBytes, byteLength - writeOffset)
+            var copyIndex: int32 = 0
+            while copyIndex < copyLen:
+                bytesSet(objectBytes, writeOffset + copyIndex, bytesGet(solved[solvedIndex], copyIndex))
+                copyIndex = copyIndex + 1
+            writeOffset = writeOffset + copyLen
+            solvedIndex = solvedIndex + 1
+        if objectCid != v3Libp2pMoqSha256HexBytes(objectBytes):
+            return Err[V3Libp2pMoqRebuildResult]("moq_fountain_object_cid_mismatch")
+        add(objectBytesList, objectBytes)
+        objectIndex = objectIndex + 1
+    var rebuilt = bytesAlloc(blobByteLen)
+    var blobOffset: int32 = 0
+    objectIndex = 0
+    while objectIndex < objectBytesList.len:
+        let objectBytes = objectBytesList[objectIndex]
+        var copyIndex: int32 = 0
+        while copyIndex < bytesLen(objectBytes):
+            if blobOffset + copyIndex >= blobByteLen:
+                break
+            bytesSet(rebuilt, blobOffset + copyIndex, bytesGet(objectBytes, copyIndex))
+            copyIndex = copyIndex + 1
+        blobOffset = blobOffset + bytesLen(objectBytes)
+        objectIndex = objectIndex + 1
+    if blobCid != v3Libp2pMoqSha256HexBytes(rebuilt):
+        return Err[V3Libp2pMoqRebuildResult]("moq_fountain_blob_cid_mismatch")
+    return Ok[V3Libp2pMoqRebuildResult](V3Libp2pMoqRebuildResult(
+        blob: rebuilt,
+        blobCid: blobCid,
+        blobByteLen: blobByteLen
+    ))
+
+fn v3Libp2pMoqRebuildResultToWire(outputPath: str,
+                                  result: V3Libp2pMoqRebuildResult): str =
+    var out = ""
+    out = out + "ok=1\n"
+    out = out + "output_path=" + outputPath + "\n"
+    out = out + "blob_cid=" + result.blobCid + "\n"
+    out = out + "blob_byte_len=" + strings.IntToStr(result.blobByteLen) + "\n"
+    return out
+
+fn v3Libp2pMoqBrowserRebuildResultToWire(result: V3Libp2pMoqRebuildResult): str =
+    var out = ""
+    out = out + "ok=1\n"
+    out = out + "blob_cid=" + result.blobCid + "\n"
+    out = out + "blob_byte_len=" + strings.IntToStr(result.blobByteLen) + "\n"
+    out = out + "blob_hex=" + bytesToHex(result.blob) + "\n"
+    return out
+
+fn v3Libp2pMoqRebuildToWire(requestWire: str): str =
+    let rebuiltRes = v3Libp2pMoqRebuildFromWire(requestWire)
+    if IsErr(rebuiltRes):
+        return v3Libp2pMoqErrorWire(Error(rebuiltRes))
+    return v3Libp2pMoqBrowserRebuildResultToWire(Value(rebuiltRes))

@@ -8,16 +8,19 @@ import cheng/v3/project/chain_node as node
 import cheng/v3/project/chain_node_libp2p as net
 
 fn main(): int32 =
-    let port = cmdline.readInt32FlagOrDefault("--port", -1)
+    let port = cmdline.ReadInt32FlagOrDefault("--port", -1)
     assert(port > 0, "v3 libp2p tcp twoproc: client port")
-    var client = node.v3ChainNodeInit("tcp.twoproc.client", "tcp.twoproc")
+    var client: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(client, "tcp.twoproc.client", "tcp.twoproc")),
+           "v3 chain_node: init")
     let recvRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce("127.0.0.1",
                                                            port,
                                                            types.v3Libp2pProtocolSync)
     assert(recvRes.ok, "v3 libp2p tcp twoproc: client recv")
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(recvRes.value)
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(recvRes.value, snapshot)
     assert(snapshotRes.ok, "v3 libp2p tcp twoproc: client decode")
-    let syncRes = node.v3ChainNodeSyncOnce(client, snapshotRes.value)
+    let syncRes = node.v3ChainNodeSyncOnce(client, snapshot)
     assert(syncRes.ok, "v3 libp2p tcp twoproc: client sync")
     assert(syncRes.value, "v3 libp2p tcp twoproc: client changed")
     let aliceRes = node.v3ChainNodeBalance(client, 9, 1001)
@@ -26,12 +29,13 @@ fn main(): int32 =
     assert(bobRes.ok, "v3 libp2p tcp twoproc: client bob")
     assert(aliceRes.value == int64(55), "v3 libp2p tcp twoproc: alice 55")
     assert(bobRes.value == int64(33), "v3 libp2p tcp twoproc: bob 33")
-    let clientSnapshot = node.v3ChainNodeServeOnce(client)
-    assert(layout.fixedBytes32Equal(clientSnapshot.tipEventCid, snapshotRes.value.tipEventCid),
+    var clientSnapshot: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(clientSnapshot, client)
+    assert(layout.fixedBytes32Equal(clientSnapshot.tipEventCid, snapshot.tipEventCid),
         "v3 libp2p tcp twoproc: tip cid")
-    assert(layout.fixedBytes32Equal(clientSnapshot.forest.forestCid, snapshotRes.value.forest.forestCid),
+    assert(layout.fixedBytes32Equal(clientSnapshot.forest.forestCid, snapshot.forest.forestCid),
         "v3 libp2p tcp twoproc: forest cid")
-    assert(anti.v3AntiEntropySignatureEqual(clientSnapshot.signature, snapshotRes.value.signature),
+    assert(anti.v3AntiEntropySignatureEqual(clientSnapshot.signature, snapshot.signature),
         "v3 libp2p tcp twoproc: signature")
     echo("v3 libp2p_tcp_twoproc_client ok")
     return 0

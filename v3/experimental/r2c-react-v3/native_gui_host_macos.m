@@ -604,7 +604,702 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     return stateDoc;
 }
 
+- (BOOL)isHomeShellSurfaceForRouteState:(NSString *)routeState {
+    NSString *route = [R2CTrimmedText(routeState) lowercaseString];
+    if (![route hasPrefix:@"home_"]) return NO;
+    if ([route isEqualToString:@"home_bazi_overlay_open"]) return NO;
+    if ([route isEqualToString:@"home_ziwei_overlay_open"]) return NO;
+    if ([route isEqualToString:@"home_ecom_overlay_open"]) return NO;
+    return YES;
+}
+
+- (NSString *)homeActiveCategoryForRouteState:(NSString *)routeState {
+    NSString *route = [R2CTrimmedText(routeState) lowercaseString];
+    if ([route isEqualToString:@"home_app_channel"]) return @"app";
+    return @"content";
+}
+
+- (NSDictionary *)buildHomeShellRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    NSString *routeState = R2CString(stateDoc[@"route_state"]);
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth > 0.0 ? self.sessionWidth : 390.0);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight > 0.0 ? self.sessionHeight : 844.0);
+    CGFloat headerHeight = 56.0;
+    CGFloat tabsHeight = 46.0;
+    BOOL showSearch = [routeState isEqualToString:@"home_search_open"];
+    BOOL showSort = [routeState isEqualToString:@"home_sort_open"];
+    BOOL showChannelManager = [routeState isEqualToString:@"home_channel_manager_open"];
+    BOOL showContentDetail = [routeState isEqualToString:@"home_content_detail_open"];
+    BOOL isAppChannel = [[self homeActiveCategoryForRouteState:routeState] isEqualToString:@"app"];
+    CGFloat searchHeight = showSearch ? 56.0 : 0.0;
+    CGFloat sortHeight = showSort ? 46.0 : 0.0;
+    CGFloat navHeight = 68.0;
+    CGFloat contentTop = headerHeight + tabsHeight + searchHeight + sortHeight;
+    CGFloat contentBottom = MAX(contentTop, windowHeight - navHeight);
+    CGFloat contentHeight = MAX(0.0, contentBottom - contentTop);
+    CGFloat (^surfaceY)(CGFloat, CGFloat) = ^CGFloat(CGFloat top, CGFloat height) {
+        (void)height;
+        return MAX(0.0, top);
+    };
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @0,
+    }];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(0.0, headerHeight)),
+        @"width": @(windowWidth),
+        @"height": @(headerHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(headerHeight - 1.0, 1.0)),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"menu",
+        @"x": @16,
+        @"y": @(surfaceY(17.0, 22.0)),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"search",
+        @"x": @(windowWidth - 72.0),
+        @"y": @(surfaceY(17.0, 22.0)),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"sliders-horizontal",
+        @"x": @(windowWidth - 38.0),
+        @"y": @(surfaceY(17.0, 22.0)),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(headerHeight, tabsHeight)),
+        @"width": @(windowWidth),
+        @"height": @(tabsHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#f9fafb",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(headerHeight + tabsHeight - 1.0, 1.0)),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+
+    NSArray<NSDictionary *> *tabSpecs = @[
+        @{@"key": @"app", @"label": @"应用"},
+        @{@"key": @"content", @"label": @"内容"},
+        @{@"key": @"product", @"label": @"电商"},
+        @{@"key": @"live", @"label": @"直播"},
+        @{@"key": @"food", @"label": @"外卖"},
+        @{@"key": @"ride", @"label": @"顺风车"},
+    ];
+    NSString *activeCategory = [self homeActiveCategoryForRouteState:routeState];
+    CGFloat chipX = 10.0;
+    CGFloat chipTop = headerHeight + 8.0;
+    CGFloat chipHeight = 30.0;
+    CGFloat chipReservedRight = 54.0;
+    CGFloat chipFontSize = 12.0;
+    for (NSDictionary *tabSpec in tabSpecs) {
+        NSString *key = R2CString(tabSpec[@"key"]);
+        NSString *label = R2CString(tabSpec[@"label"]);
+        BOOL showBadge = [key isEqualToString:@"app"] && !isAppChannel;
+        CGFloat chipWidth = MAX(42.0, [self measuredTextWidth:label fontSize:chipFontSize weightText:@"medium"] + 18.0 + (showBadge ? 18.0 : 0.0));
+        if (chipX + chipWidth > windowWidth - chipReservedRight) break;
+        BOOL active = [key isEqualToString:activeCategory];
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @(chipX),
+            @"y": @(surfaceY(chipTop, chipHeight)),
+            @"width": @(chipWidth),
+            @"height": @(chipHeight),
+            @"corner_radius": @15,
+            @"background_color": active ? @"#a855f7" : @"#ffffff",
+            @"border_color": active ? @"#a855f7" : @"#e5e7eb",
+            @"line_width": @1.0,
+            @"z_index": @3,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": label,
+            @"x": @(chipX),
+            @"y": @(surfaceY(chipTop, chipHeight)),
+            @"width": @(showBadge ? chipWidth - 12.0 : chipWidth),
+            @"height": @(chipHeight),
+            @"font_size": @(chipFontSize),
+            @"font_weight": @"medium",
+            @"text_color": active ? @"#ffffff" : @"#6b7280",
+            @"align": @"center",
+            @"z_index": @4,
+        }];
+        if (showBadge) {
+            CGFloat badgeSize = 18.0;
+            CGFloat badgeX = chipX + chipWidth - badgeSize - 6.0;
+            CGFloat badgeTop = chipTop + 6.0;
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @(badgeX),
+                @"y": @(surfaceY(badgeTop, badgeSize)),
+                @"width": @(badgeSize),
+                @"height": @(badgeSize),
+                @"corner_radius": @(badgeSize * 0.5),
+                @"background_color": @"#ef4444",
+                @"z_index": @5,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": @"7",
+                @"x": @(badgeX),
+                @"y": @(surfaceY(badgeTop, badgeSize)),
+                @"width": @(badgeSize),
+                @"height": @(badgeSize),
+                @"font_size": @10,
+                @"font_weight": @"bold",
+                @"text_color": @"#ffffff",
+                @"align": @"center",
+                @"z_index": @6,
+            }];
+        }
+        chipX += chipWidth + 8.0;
+    }
+
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"↻",
+        @"x": @(windowWidth - 62.0),
+        @"y": @(surfaceY(chipTop + 1.0, 28.0)),
+        @"width": @24,
+        @"height": @28,
+        @"font_size": @16,
+        @"font_weight": @"medium",
+        @"text_color": @"#9ca3af",
+        @"align": @"center",
+        @"z_index": @4,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"⚙",
+        @"x": @(windowWidth - 34.0),
+        @"y": @(surfaceY(chipTop + 1.0, 28.0)),
+        @"width": @24,
+        @"height": @28,
+        @"font_size": @14,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"center",
+        @"z_index": @4,
+    }];
+
+    CGFloat cursorTop = headerHeight + tabsHeight;
+    if (showSearch) {
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @0,
+            @"y": @(surfaceY(cursorTop, searchHeight)),
+            @"width": @(windowWidth),
+            @"height": @(searchHeight),
+            @"corner_radius": @0,
+            @"background_color": @"#f9fafb",
+            @"z_index": @1,
+        }];
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @16,
+            @"y": @(surfaceY(cursorTop + 10.0, 36.0)),
+            @"width": @(windowWidth - 32.0),
+            @"height": @36,
+            @"corner_radius": @18,
+            @"background_color": @"#ffffff",
+            @"border_color": @"#d1d5db",
+            @"line_width": @1.0,
+            @"z_index": @3,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"搜索内容...",
+            @"x": @30,
+            @"y": @(surfaceY(cursorTop + 10.0, 36.0)),
+            @"width": @(windowWidth - 60.0),
+            @"height": @36,
+            @"font_size": @14,
+            @"font_weight": @"regular",
+            @"text_color": @"#9ca3af",
+            @"align": @"left",
+            @"z_index": @4,
+        }];
+        cursorTop += searchHeight;
+    }
+
+    if (showSort) {
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @0,
+            @"y": @(surfaceY(cursorTop, sortHeight)),
+            @"width": @(windowWidth),
+            @"height": @(sortHeight),
+            @"corner_radius": @0,
+            @"background_color": @"#f9fafb",
+            @"z_index": @1,
+        }];
+        NSArray<NSDictionary *> *sortSpecs = @[
+            @{@"label": @"最热", @"active": @YES},
+            @{@"label": @"最新", @"active": @NO},
+            @{@"label": @"距离最近", @"active": @NO},
+        ];
+        CGFloat sortX = 16.0;
+        for (NSDictionary *sortSpec in sortSpecs) {
+            NSString *label = R2CString(sortSpec[@"label"]);
+            BOOL active = R2CBool(sortSpec[@"active"], NO);
+            CGFloat buttonWidth = [self measuredTextWidth:label fontSize:13.0 weightText:@"medium"] + 28.0;
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @(sortX),
+                @"y": @(surfaceY(cursorTop + 6.0, 32.0)),
+                @"width": @(buttonWidth),
+                @"height": @32,
+                @"corner_radius": @16,
+                @"background_color": active ? @"#a855f7" : @"#ffffff",
+                @"border_color": active ? @"#a855f7" : @"#d1d5db",
+                @"line_width": @1.0,
+                @"z_index": @3,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": label,
+                @"x": @(sortX),
+                @"y": @(surfaceY(cursorTop + 6.0, 32.0)),
+                @"width": @(buttonWidth),
+                @"height": @32,
+                @"font_size": @13,
+                @"font_weight": @"medium",
+                @"text_color": active ? @"#ffffff" : @"#374151",
+                @"align": @"center",
+                @"z_index": @4,
+            }];
+            sortX += buttonWidth + 8.0;
+        }
+        cursorTop += sortHeight;
+    }
+
+    if (isAppChannel) {
+        NSArray<NSDictionary *> *appCards = @[
+            @{@"title": @"应用市场", @"detail": @"发现、安装与管理原生应用", @"accent": @"#3b82f6"},
+            @{@"title": @"交易", @"detail": @"查看行情、买卖深度与钱包联动", @"accent": @"#059669"},
+        ];
+        CGFloat cardTop = cursorTop + 12.0;
+        CGFloat cardWidth = windowWidth - 24.0;
+        for (NSDictionary *card in appCards) {
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @12,
+                @"y": @(surfaceY(cardTop, 82.0)),
+                @"width": @(cardWidth),
+                @"height": @82,
+                @"corner_radius": @18,
+                @"background_color": @"#ffffff",
+                @"border_color": @"#edeef2",
+                @"line_width": @1.0,
+                @"z_index": @3,
+            }];
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @24,
+                @"y": @(surfaceY(cardTop + 12.0, 58.0)),
+                @"width": @58,
+                @"height": @58,
+                @"corner_radius": @14,
+                @"background_color": @"#f5f5f8",
+                @"z_index": @4,
+            }];
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @42,
+                @"y": @(surfaceY(cardTop + 29.0, 24.0)),
+                @"width": @24,
+                @"height": @24,
+                @"corner_radius": @12,
+                @"background_color": R2CString(card[@"accent"]),
+                @"z_index": @5,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": R2CString(card[@"title"]),
+                @"x": @96,
+                @"y": @(surfaceY(cardTop + 16.0, 22.0)),
+                @"width": @(cardWidth - 112.0),
+                @"height": @22,
+                @"font_size": @17,
+                @"font_weight": @"semibold",
+                @"text_color": @"#111827",
+                @"align": @"left",
+                @"z_index": @5,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": R2CString(card[@"detail"]),
+                @"x": @96,
+                @"y": @(surfaceY(cardTop + 42.0, 18.0)),
+                @"width": @(cardWidth - 112.0),
+                @"height": @18,
+                @"font_size": @13,
+                @"font_weight": @"regular",
+                @"text_color": @"#9aa1b2",
+                @"align": @"left",
+                @"z_index": @5,
+            }];
+            cardTop += 94.0;
+        }
+    } else if (showContentDetail) {
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @12,
+            @"y": @(surfaceY(cursorTop + 16.0, 132.0)),
+            @"width": @(windowWidth - 24.0),
+            @"height": @132,
+            @"corner_radius": @20,
+            @"background_color": @"#ffffff",
+            @"border_color": @"#eceff3",
+            @"line_width": @1.0,
+            @"z_index": @3,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"内容详情",
+            @"x": @28,
+            @"y": @(surfaceY(cursorTop + 34.0, 24.0)),
+            @"width": @(windowWidth - 56.0),
+            @"height": @24,
+            @"font_size": @20,
+            @"font_weight": @"semibold",
+            @"text_color": @"#111827",
+            @"align": @"left",
+            @"z_index": @4,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"当前原生壳已切到内容页入口",
+            @"x": @28,
+            @"y": @(surfaceY(cursorTop + 66.0, 20.0)),
+            @"width": @(windowWidth - 56.0),
+            @"height": @20,
+            @"font_size": @14,
+            @"font_weight": @"regular",
+            @"text_color": @"#9ca3af",
+            @"align": @"left",
+            @"z_index": @4,
+        }];
+    } else {
+        NSString *emptyLabel = isAppChannel ? @"暂无应用" : @"内容";
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": emptyLabel,
+            @"x": @0,
+            @"y": @(surfaceY(cursorTop + MIN(84.0, MAX(36.0, contentHeight * 0.20)), 24.0)),
+            @"width": @(windowWidth),
+            @"height": @24,
+            @"font_size": @15,
+            @"font_weight": @"regular",
+            @"text_color": @"#9ca3af",
+            @"align": @"center",
+            @"z_index": @3,
+        }];
+    }
+
+    CGFloat navTop = windowHeight - navHeight;
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(navTop, navHeight)),
+        @"width": @(windowWidth),
+        @"height": @(navHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(surfaceY(navTop, 1.0)),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @6,
+    }];
+
+    CGFloat columnWidth = floor(windowWidth / 5.0);
+    NSArray<NSDictionary *> *navSpecs = @[
+        @{@"label": @"首页", @"index": @0, @"active": @YES},
+        @{@"label": @"消息", @"index": @1, @"active": @NO},
+        @{@"label": @"节点", @"index": @3, @"active": @NO},
+        @{@"label": @"我", @"index": @4, @"active": @NO},
+    ];
+    for (NSDictionary *navSpec in navSpecs) {
+        NSInteger index = R2CInteger(navSpec[@"index"], 0);
+        CGFloat navX = columnWidth * index;
+        BOOL active = R2CBool(navSpec[@"active"], NO);
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": R2CString(navSpec[@"label"]),
+            @"x": @(navX),
+            @"y": @(surfaceY(navTop + 11.0, 42.0)),
+            @"width": @(columnWidth),
+            @"height": @42,
+            @"font_size": @18,
+            @"font_weight": @"regular",
+            @"text_color": active ? @"#a855f7" : @"#4b5563",
+            @"align": @"center",
+            @"z_index": @7,
+        }];
+    }
+
+    CGFloat plusColumnX = columnWidth * 2;
+    CGFloat plusCircleX = plusColumnX + floor((columnWidth - 40.0) * 0.5);
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @(plusCircleX),
+        @"y": @(surfaceY(navTop + 6.0, 40.0)),
+        @"width": @40,
+        @"height": @40,
+        @"corner_radius": @20,
+        @"background_color": @"#a855f7",
+        @"z_index": @7,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"plus",
+        @"x": @(plusCircleX + 9.0),
+        @"y": @(surfaceY(navTop + 15.0, 22.0)),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#ffffff",
+        @"stroke_width": @3.0,
+        @"z_index": @8,
+    }];
+
+    if (showChannelManager) {
+        CGFloat overlayHeight = windowHeight;
+        CGFloat sheetHeight = MIN(MAX(420.0, windowHeight * 0.70), windowHeight - 24.0);
+        CGFloat sheetTop = windowHeight - sheetHeight;
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @0,
+            @"y": @0,
+            @"width": @(windowWidth),
+            @"height": @(overlayHeight),
+            @"corner_radius": @0,
+            @"background_color": @"#00000080",
+            @"z_index": @20,
+        }];
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @0,
+            @"y": @(surfaceY(sheetTop, sheetHeight)),
+            @"width": @(windowWidth),
+            @"height": @(sheetHeight),
+            @"corner_radius": @22,
+            @"background_color": @"#ffffff",
+            @"z_index": @21,
+        }];
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @0,
+            @"y": @(surfaceY(sheetTop + 54.0, 1.0)),
+            @"width": @(windowWidth),
+            @"height": @1,
+            @"corner_radius": @0,
+            @"background_color": @"#f3f4f6",
+            @"z_index": @22,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"频道管理",
+            @"x": @16,
+            @"y": @(surfaceY(sheetTop + 14.0, 24.0)),
+            @"width": @(windowWidth - 64.0),
+            @"height": @24,
+            @"font_size": @18,
+            @"font_weight": @"bold",
+            @"text_color": @"#1f2937",
+            @"align": @"left",
+            @"z_index": @23,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"×",
+            @"x": @(windowWidth - 38.0),
+            @"y": @(surfaceY(sheetTop + 14.0, 24.0)),
+            @"width": @22,
+            @"height": @24,
+            @"font_size": @20,
+            @"font_weight": @"regular",
+            @"text_color": @"#9ca3af",
+            @"align": @"center",
+            @"z_index": @23,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": @"长按拖动排序，点击进入频道",
+            @"x": @18,
+            @"y": @(surfaceY(sheetTop + 68.0, 18.0)),
+            @"width": @(windowWidth - 36.0),
+            @"height": @18,
+            @"font_size": @12,
+            @"font_weight": @"regular",
+            @"text_color": @"#9ca3af",
+            @"align": @"left",
+            @"z_index": @23,
+        }];
+        NSArray<NSDictionary *> *managerTabs = @[
+            @{@"key": @"app", @"label": @"应用"},
+            @{@"key": @"content", @"label": @"内容"},
+            @{@"key": @"product", @"label": @"电商"},
+            @{@"key": @"live", @"label": @"直播"},
+            @{@"key": @"food", @"label": @"外卖"},
+            @{@"key": @"ride", @"label": @"顺风车"},
+            @{@"key": @"job", @"label": @"求职"},
+            @{@"key": @"hire", @"label": @"招聘"},
+            @{@"key": @"rent", @"label": @"出租"},
+            @{@"key": @"sell", @"label": @"出售"},
+            @{@"key": @"secondhand", @"label": @"二手"},
+            @{@"key": @"crowdfunding", @"label": @"众筹"},
+        ];
+        CGFloat gridGap = 12.0;
+        CGFloat cellWidth = floor((windowWidth - 16.0 * 2.0 - gridGap * 3.0) / 4.0);
+        CGFloat cellHeight = 74.0;
+        CGFloat gridTop = sheetTop + 96.0;
+        for (NSUInteger index = 0; index < [managerTabs count]; index += 1) {
+            NSDictionary *tabSpec = managerTabs[index];
+            NSUInteger row = index / 4;
+            NSUInteger column = index % 4;
+            CGFloat cellX = 16.0 + (cellWidth + gridGap) * column;
+            CGFloat cellTop = gridTop + (cellHeight + gridGap) * row;
+            BOOL active = [R2CString(tabSpec[@"key"]) isEqualToString:activeCategory];
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @(cellX),
+                @"y": @(surfaceY(cellTop, cellHeight)),
+                @"width": @(cellWidth),
+                @"height": @(cellHeight),
+                @"corner_radius": @14,
+                @"background_color": active ? @"#faf5ff" : @"#f9fafb",
+                @"border_color": active ? @"#e9d5ff" : @"#f3f4f6",
+                @"line_width": @1.0,
+                @"z_index": @22,
+            }];
+            if (active) {
+                [commands addObject:@{
+                    @"type": @"rounded_rect",
+                    @"x": @(cellX + cellWidth - 12.0),
+                    @"y": @(surfaceY(cellTop + 8.0, 6.0)),
+                    @"width": @6,
+                    @"height": @6,
+                    @"corner_radius": @3,
+                    @"background_color": @"#a855f7",
+                    @"z_index": @23,
+                }];
+            }
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": R2CString(tabSpec[@"label"]),
+                @"x": @(cellX + 6.0),
+                @"y": @(surfaceY(cellTop + 20.0, 20.0)),
+                @"width": @(cellWidth - 12.0),
+                @"height": @20,
+                @"font_size": @12,
+                @"font_weight": @"medium",
+                @"text_color": active ? @"#9333ea" : @"#4b5563",
+                @"align": @"center",
+                @"z_index": @23,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"text": @"⋮",
+                @"x": @(cellX + (cellWidth - 12.0) * 0.5),
+                @"y": @(surfaceY(cellTop + 44.0, 14.0)),
+                @"width": @12,
+                @"height": @14,
+                @"font_size": @12,
+                @"font_weight": @"regular",
+                @"text_color": @"#d1d5db",
+                @"align": @"center",
+                @"z_index": @23,
+            }];
+        }
+    }
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": routeState ?: @"",
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(MAX(windowHeight, contentBottom)),
+        @"scroll_height": @(MAX(0.0, windowHeight - contentBottom)),
+        @"scroll_offset_y": @(0),
+        @"visible_layout_item_count": @0,
+        @"selected_item_id": @"",
+        @"focused_item_id": @"",
+        @"typed_text": @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
 - (NSDictionary *)buildRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSString *routeState = R2CString(stateDoc[@"route_state"]);
+    if ([self isHomeShellSurfaceForRouteState:routeState]) {
+        return [self buildHomeShellRenderPlanDocForState:stateDoc];
+    }
+    return [self buildDebugRenderPlanDocForState:stateDoc];
+}
+
+- (NSDictionary *)buildDebugRenderPlanDocForState:(NSDictionary *)stateDoc {
     NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
     CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
     CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
@@ -1035,6 +1730,7 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
 }
 
 - (void)drawInspectorPanel {
+    if ([R2CString(self.selectedItemId) length] <= 0) return;
     NSRect panelRect = [self inspectorPanelFrame];
     NSBezierPath *panel = [NSBezierPath bezierPathWithRoundedRect:panelRect xRadius:18.0 yRadius:18.0];
     [[self themeColor:@"panel_background" fallback:[NSColor colorWithCalibratedWhite:1.0 alpha:0.96]] setFill];
@@ -1125,6 +1821,153 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         NSFontAttributeName: [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular],
         NSForegroundColorAttributeName: color
     };
+}
+
+- (NSFont *)fontForSize:(CGFloat)fontSize weightText:(NSString *)weightText {
+    CGFloat resolvedSize = fontSize > 0.0 ? fontSize : 14.0;
+    return [NSFont systemFontOfSize:resolvedSize weight:R2CFontWeightFromText(weightText, NSFontWeightRegular)];
+}
+
+- (CGFloat)measuredTextWidth:(NSString *)text fontSize:(CGFloat)fontSize weightText:(NSString *)weightText {
+    NSString *value = R2CString(text);
+    if ([value length] <= 0) return 0.0;
+    NSDictionary *attrs = @{
+        NSFontAttributeName: [self fontForSize:fontSize weightText:weightText],
+    };
+    return ceil([value sizeWithAttributes:attrs].width);
+}
+
+- (void)drawRoundedRectCommand:(NSDictionary *)command frame:(NSRect)frame {
+    CGFloat radius = R2CCGFloat(command[@"corner_radius"], 0.0);
+    NSBezierPath *shape = radius > 0.0
+        ? [NSBezierPath bezierPathWithRoundedRect:frame xRadius:radius yRadius:radius]
+        : [NSBezierPath bezierPathWithRect:frame];
+    NSString *backgroundText = R2CTrimmedText(command[@"background_color"]);
+    if ([backgroundText length] > 0) {
+        [R2CColorFromHexString(backgroundText, [NSColor clearColor]) setFill];
+        [shape fill];
+    }
+    CGFloat lineWidth = R2CCGFloat(command[@"line_width"], 0.0);
+    NSString *borderText = R2CTrimmedText(command[@"border_color"]);
+    if (lineWidth > 0.0 && [borderText length] > 0) {
+        [R2CColorFromHexString(borderText, [NSColor clearColor]) setStroke];
+        [shape setLineWidth:lineWidth];
+        [shape stroke];
+    }
+}
+
+- (void)drawTextLabelCommand:(NSDictionary *)command frame:(NSRect)frame {
+    NSString *text = R2CString(command[@"text"]);
+    if ([text length] <= 0) return;
+    CGFloat fontSize = R2CCGFloat(command[@"font_size"], 14.0);
+    NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
+    NSString *alignText = [[R2CString(command[@"align"]) lowercaseString] copy];
+    if ([alignText isEqualToString:@"center"]) style.alignment = NSTextAlignmentCenter;
+    else if ([alignText isEqualToString:@"right"]) style.alignment = NSTextAlignmentRight;
+    else style.alignment = NSTextAlignmentLeft;
+    style.lineBreakMode = NSLineBreakByTruncatingTail;
+    NSMutableDictionary *attrs = [@{
+        NSFontAttributeName: [self fontForSize:fontSize weightText:R2CString(command[@"font_weight"])],
+        NSForegroundColorAttributeName: R2CColorFromHexString(command[@"text_color"],
+                                                              [self themeColor:@"text_primary"
+                                                                      fallback:[NSColor colorWithCalibratedRed:0.15 green:0.20 blue:0.27 alpha:1.0]]),
+    } mutableCopy];
+    attrs[NSParagraphStyleAttributeName] = style;
+    NSRect insetRect = NSInsetRect(frame, R2CCGFloat(command[@"padding_x"], 0.0), 0.0);
+    NSRect textBounds = [text boundingRectWithSize:insetRect.size
+                                           options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
+                                        attributes:attrs];
+    CGFloat drawY = insetRect.origin.y + MAX(0.0, floor((insetRect.size.height - textBounds.size.height) * 0.5));
+    NSRect drawRect = NSMakeRect(insetRect.origin.x, drawY, insetRect.size.width, MAX(textBounds.size.height, insetRect.size.height));
+    [text drawInRect:drawRect withAttributes:attrs];
+}
+
+- (void)drawIconSymbolCommand:(NSDictionary *)command frame:(NSRect)frame {
+    NSString *symbol = [[R2CString(command[@"symbol"]) lowercaseString] copy];
+    if ([symbol length] <= 0) return;
+    NSColor *color = R2CColorFromHexString(command[@"color"],
+                                           [self themeColor:@"text_primary"
+                                                   fallback:[NSColor colorWithCalibratedRed:0.15 green:0.20 blue:0.27 alpha:1.0]]);
+    CGFloat strokeWidth = R2CCGFloat(command[@"stroke_width"], 2.0);
+    NSBezierPath *path = [NSBezierPath bezierPath];
+    [path setLineCapStyle:NSRoundLineCapStyle];
+    [path setLineJoinStyle:NSRoundLineJoinStyle];
+    [path setLineWidth:strokeWidth];
+    CGFloat minX = NSMinX(frame);
+    CGFloat minY = NSMinY(frame);
+    CGFloat width = NSWidth(frame);
+    CGFloat height = NSHeight(frame);
+    if ([symbol isEqualToString:@"menu"]) {
+        CGFloat y1 = minY + height * 0.28;
+        CGFloat y2 = minY + height * 0.50;
+        CGFloat y3 = minY + height * 0.72;
+        CGFloat x0 = minX + width * 0.18;
+        CGFloat x1 = minX + width * 0.82;
+        [path moveToPoint:NSMakePoint(x0, y1)];
+        [path lineToPoint:NSMakePoint(x1, y1)];
+        [path moveToPoint:NSMakePoint(x0, y2)];
+        [path lineToPoint:NSMakePoint(x1, y2)];
+        [path moveToPoint:NSMakePoint(x0, y3)];
+        [path lineToPoint:NSMakePoint(x1, y3)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"plus"]) {
+        CGFloat cx = NSMidX(frame);
+        CGFloat cy = NSMidY(frame);
+        CGFloat radius = MIN(width, height) * 0.28;
+        [path moveToPoint:NSMakePoint(cx - radius, cy)];
+        [path lineToPoint:NSMakePoint(cx + radius, cy)];
+        [path moveToPoint:NSMakePoint(cx, cy - radius)];
+        [path lineToPoint:NSMakePoint(cx, cy + radius)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"search"]) {
+        CGFloat radius = MIN(width, height) * 0.26;
+        NSRect circleRect = NSMakeRect(NSMidX(frame) - radius - width * 0.06,
+                                       NSMidY(frame) - radius + height * 0.02,
+                                       radius * 2.0,
+                                       radius * 2.0);
+        [path appendBezierPathWithOvalInRect:circleRect];
+        [path moveToPoint:NSMakePoint(NSMidX(frame) + radius * 0.48, NSMidY(frame) - radius * 0.48)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.84, minY + height * 0.18)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"sliders-horizontal"]) {
+        CGFloat x0 = minX + width * 0.18;
+        CGFloat x1 = minX + width * 0.82;
+        CGFloat y1 = minY + height * 0.26;
+        CGFloat y2 = minY + height * 0.50;
+        CGFloat y3 = minY + height * 0.74;
+        [path moveToPoint:NSMakePoint(x0, y1)];
+        [path lineToPoint:NSMakePoint(x1, y1)];
+        [path moveToPoint:NSMakePoint(x0, y2)];
+        [path lineToPoint:NSMakePoint(x1, y2)];
+        [path moveToPoint:NSMakePoint(x0, y3)];
+        [path lineToPoint:NSMakePoint(x1, y3)];
+        [color setStroke];
+        [path stroke];
+        NSArray<NSValue *> *centers = @[
+            [NSValue valueWithPoint:NSMakePoint(minX + width * 0.62, y1)],
+            [NSValue valueWithPoint:NSMakePoint(minX + width * 0.38, y2)],
+            [NSValue valueWithPoint:NSMakePoint(minX + width * 0.70, y3)],
+        ];
+        CGFloat knob = MAX(3.0, MIN(width, height) * 0.10);
+        for (NSValue *value in centers) {
+            NSPoint center = [value pointValue];
+            NSBezierPath *circle = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(center.x - knob, center.y - knob, knob * 2.0, knob * 2.0)];
+            [[NSColor whiteColor] setFill];
+            [circle fill];
+            [color setStroke];
+            [circle setLineWidth:strokeWidth];
+            [circle stroke];
+        }
+    }
 }
 
 - (void)drawRoundedPanelCommand:(NSDictionary *)command frame:(NSRect)frame {
@@ -1234,6 +2077,12 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         if (!NSIntersectsRect(frame, self.bounds) && ![type isEqualToString:@"rounded_panel"]) continue;
         if ([type isEqualToString:@"rounded_panel"]) {
             [self drawRoundedPanelCommand:command frame:frame];
+        } else if ([type isEqualToString:@"rounded_rect"]) {
+            [self drawRoundedRectCommand:command frame:frame];
+        } else if ([type isEqualToString:@"text_label"]) {
+            [self drawTextLabelCommand:command frame:frame];
+        } else if ([type isEqualToString:@"icon_symbol"]) {
+            [self drawIconSymbolCommand:command frame:frame];
         } else if ([type isEqualToString:@"item_card"]) {
             [self drawItemCardCommand:command frame:frame];
         } else if ([type isEqualToString:@"focus_ring"]) {
@@ -1544,14 +2393,58 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
 
     R2CSessionView *view = [[R2CSessionView alloc] initWithFrame:rect];
     NSDictionary *planDoc = [self.sessionDoc[@"native_layout_plan"] isKindOfClass:[NSDictionary class]] ? self.sessionDoc[@"native_layout_plan"] : @{};
-    NSDictionary *renderPlanDoc = [self.sessionDoc[@"native_render_plan"] isKindOfClass:[NSDictionary class]] ? self.sessionDoc[@"native_render_plan"] : @{};
+    NSDictionary *sessionRenderPlanDoc = [self.sessionDoc[@"native_render_plan"] isKindOfClass:[NSDictionary class]] ? self.sessionDoc[@"native_render_plan"] : @{};
     NSDictionary *runtimeStateDoc = [self.sessionDoc[@"native_gui_runtime_state"] isKindOfClass:[NSDictionary class]] ? self.sessionDoc[@"native_gui_runtime_state"] : @{};
     NSDictionary *runtimeDoc = [self.sessionDoc[@"native_gui_runtime"] isKindOfClass:[NSDictionary class]] ? self.sessionDoc[@"native_gui_runtime"] : @{};
+    if (![runtimeStateDoc isKindOfClass:[NSDictionary class]] || [runtimeStateDoc count] <= 0) {
+        runtimeStateDoc = @{
+            @"window_title": title ?: @"",
+            @"route_state": R2CString(windowDoc[@"route_state"]),
+            @"entry_module": R2CString(windowDoc[@"entry_module"]),
+            @"window_width": @(width),
+            @"window_height": @(height),
+            @"content_height": @(MAX(height, R2CCGFloat(planDoc[@"content_height"], R2CCGFloat(windowDoc[@"content_height"], height)))),
+            @"scroll_height": @0,
+            @"scroll_offset_y": @0,
+            @"click_count": @0,
+            @"resize_count": @0,
+            @"scroll_count": @0,
+            @"key_count": @0,
+            @"text_count": @0,
+            @"focus_count": @0,
+            @"has_last_click": @NO,
+            @"last_click_x": @0,
+            @"last_click_y": @0,
+            @"selected_item_id": @"",
+            @"selected_source_node_id": @"",
+            @"selected_source_module_path": @"",
+            @"selected_source_component_name": @"",
+            @"selected_source_line": @0,
+            @"selected_item_interactive": @NO,
+            @"focused_item_id": @"",
+            @"typed_text": @"",
+            @"last_key": @"",
+            @"visible_layout_item_count": @0,
+            @"selected_item": @{
+                @"ready": @NO,
+                @"id": @"",
+                @"source_node_id": @"",
+                @"source_module_path": @"",
+                @"source_component_name": @"",
+                @"source_line": @0,
+                @"interactive": @NO,
+                @"kind": @"",
+                @"plan_role": @"",
+                @"visual_role": @"",
+                @"x": @0,
+                @"y": @0,
+                @"width": @0,
+                @"height": @0,
+            },
+        };
+    }
     view.sessionDoc = self.sessionDoc;
     view.theme = self.sessionDoc[@"theme"];
-    view.renderPlanDoc = renderPlanDoc;
-    view.runtimeStateDoc = runtimeStateDoc;
-    view.renderCommands = [renderPlanDoc[@"commands"] isKindOfClass:[NSArray class]] ? renderPlanDoc[@"commands"] : @[];
     view.sessionWidth = width;
     view.sessionHeight = height;
     view.contentHeight = MAX(height, R2CCGFloat(planDoc[@"content_height"], R2CCGFloat(windowDoc[@"content_height"], height)));
@@ -1562,6 +2455,10 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     view.repoRoot = self.repoRoot ?: @"";
     view.openSourceOnClick = self.openSourceOnClick;
     [view clearSourceJumpState];
+    NSDictionary *renderPlanDoc = [view buildRenderPlanDocForState:runtimeStateDoc];
+    if (![renderPlanDoc isKindOfClass:[NSDictionary class]] || ![renderPlanDoc[@"commands"] isKindOfClass:[NSArray class]]) {
+        renderPlanDoc = sessionRenderPlanDoc;
+    }
     [view applyRuntimeStateDoc:runtimeStateDoc];
     [view applyRenderPlanDoc:renderPlanDoc];
     view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;

@@ -8,6 +8,8 @@ fn raw_libc_free(p: ptr)
 fn raw_libc_puts_runtime(text: ptr): int32
 @importc("exit")
 fn raw_libc_exit_runtime(code: int32)
+@importc("getenv")
+fn raw_libc_getenv(name: ptr): ptr
 @importc("fopen")
 fn raw_libc_fopen(path: ptr, mode: ptr): ptr
 @importc("fdopen")
@@ -26,16 +28,22 @@ fn raw_libc_fclose(stream: ptr): int32
 fn raw_libc_fflush(stream: ptr): int32
 @importc("fgetc")
 fn raw_libc_fgetc(stream: ptr): int32
+@importc("fgets")
+fn raw_libc_fgets(buf: ptr, size: int32, stream: ptr): ptr
 @importc("getcwd")
 fn raw_libc_getcwd(buf: ptr, size: int64): ptr
 @importc("getentropy")
 fn raw_libc_getentropy(buf: ptr, size: int32): int32
+@importc("sysconf")
+fn raw_libc_sysconf(name: int32): int64
 @importc("usleep")
 fn raw_libc_usleep(value: uint32): int32
 @importc("mkdir")
 fn raw_libc_mkdir(path: ptr, mode: int32): int32
 @importc("opendir")
 fn raw_libc_opendir(path: ptr): ptr
+@importc("readdir")
+fn raw_libc_readdir(dir: ptr): ptr
 @importc("closedir")
 fn raw_libc_closedir(dir: ptr): int32
 @importc("popen")
@@ -50,6 +58,8 @@ fn raw_libc_time(out: ptr): int64
 fn raw_libc_clock_gettime(clockId: int32, out: ptr): int32
 @importc("stat")
 fn raw_libc_stat(path: ptr, out: ptr): int32
+@importc("statfs")
+fn raw_libc_statfs(path: ptr, out: ptr): int32
 @importc("pipe")
 fn raw_libc_pipe_runtime(fds: ptr): int32
 @importc("fork")
@@ -119,6 +129,78 @@ fn raw_libc_execvp(file: ptr, argv: ptr): int32
 @importc("strerror")
 fn raw_libc_strerror(err: int32): ptr
 
+const
+    chengHostStdInFd: int32 = 0
+    chengHostStdOutFd: int32 = 1
+    chengHostStdErrFd: int32 = 2
+
+type
+    Int32Ptr = int32 *
+    UInt8Ptr = uint8 *
+    VoidPtrPtr = ptr *
+    DarwinDirent =
+        d_ino: uint64
+        d_seekoff: uint64
+        d_reclen: uint16
+        d_namlen: uint16
+        d_type: uint8
+    DarwinDirentPtr = DarwinDirent *
+
+const
+    chengHostDirentNameOff: int32 = 21
+
+fn cheng_host_ptr_plus(base: ptr, off: int32): ptr =
+    if base == nil:
+        return nil
+    return ptr(uint64(int64(uint64(base)) + int64(off)))
+
+fn cheng_host_bytes_copy(dst: ptr, src: ptr, n0: int32) =
+    if dst == nil || src == nil || n0 <= 0:
+        return
+    for i in 0..<n0:
+        *(UInt8Ptr(cheng_host_ptr_plus(dst, i))) = *(UInt8Ptr(cheng_host_ptr_plus(src, i)))
+
+fn cheng_host_bytes_set(dst: ptr, value: int32, n0: int32) =
+    if dst == nil || n0 <= 0:
+        return
+    let byteValue: uint8 = uint8(value & 255)
+    for i in 0..<n0:
+        *(UInt8Ptr(cheng_host_ptr_plus(dst, i))) = byteValue
+
+fn cheng_host_fd_at(fds: ptr, idx: int32): int32 =
+    if fds == nil:
+        return -1
+    return *(Int32Ptr(cheng_host_ptr_plus(fds, idx * int32(sizeof int32))))
+
+fn cheng_host_close_fd_if_valid(fd: int32) =
+    if fd >= 0:
+        let ignoredClose = raw_libc_close(fd)
+
+fn cheng_host_build_shell_argv(command: ptr): ptr =
+    if command == nil || *UInt8Ptr(command) == uint8(0):
+        return nil
+    let argv: ptr = raw_libc_malloc(int64(int32(sizeof ptr) * 4))
+    if argv == nil:
+        return nil
+    cheng_host_bytes_set(argv, 0, int32(sizeof ptr) * 4)
+    *(VoidPtrPtr(cheng_host_ptr_plus(argv, 0 * int32(sizeof ptr)))) = "sh"
+    *(VoidPtrPtr(cheng_host_ptr_plus(argv, 1 * int32(sizeof ptr)))) = "-c"
+    *(VoidPtrPtr(cheng_host_ptr_plus(argv, 2 * int32(sizeof ptr)))) = command
+    *(VoidPtrPtr(cheng_host_ptr_plus(argv, 3 * int32(sizeof ptr)))) = nil
+    return argv
+
+fn cheng_host_free_shell_argv(argv: ptr) =
+    if argv != nil:
+        raw_libc_free(argv)
+
+fn cheng_host_exec_shell(command: ptr): int32 =
+    let argv: ptr = cheng_host_build_shell_argv(command)
+    if argv == nil:
+        return -1
+    let rc: int32 = raw_libc_execvp("/bin/sh", argv)
+    cheng_host_free_shell_argv(argv)
+    return rc
+
 fn chengProgramSupportHostRuntimeReady(): int32 =
     return 1
 
@@ -145,6 +227,10 @@ fn cheng_host_puts_runtime_export(text: ptr): int32 =
 @exportc("cheng_host_exit_runtime")
 fn cheng_host_exit_runtime_export(code: int32) =
     raw_libc_exit_runtime(code)
+
+@exportc("cheng_host_getenv")
+fn cheng_host_getenv_export(name: ptr): ptr =
+    return raw_libc_getenv(name)
 
 @exportc("cheng_host_fopen")
 fn cheng_host_fopen_export(path: ptr, mode: ptr): ptr =
@@ -182,9 +268,17 @@ fn cheng_host_fflush_export(stream: ptr): int32 =
 fn cheng_host_fgetc_export(stream: ptr): int32 =
     return raw_libc_fgetc(stream)
 
+@exportc("cheng_host_fgets")
+fn cheng_host_fgets_export(buf: ptr, size: int32, stream: ptr): ptr =
+    return raw_libc_fgets(buf, size, stream)
+
 @exportc("cheng_host_getcwd")
 fn cheng_host_getcwd_export(buf: ptr, size: int64): ptr =
     return raw_libc_getcwd(buf, size)
+
+@exportc("cheng_host_sysconf")
+fn cheng_host_sysconf_export(name: int32): int64 =
+    return raw_libc_sysconf(name)
 
 @exportc("cheng_host_getentropy")
 fn cheng_host_getentropy_export(buf: ptr, size: int32): int32 =
@@ -205,6 +299,58 @@ fn cheng_host_opendir_export(path: ptr): ptr =
 @exportc("cheng_host_closedir")
 fn cheng_host_closedir_export(dir: ptr): int32 =
     return raw_libc_closedir(dir)
+
+@exportc("cheng_host_list_dir")
+fn cheng_host_list_dir_export(path: ptr): ptr =
+    let emptyOut: ptr = raw_libc_malloc(1)
+    if emptyOut != nil:
+        *(UInt8Ptr(emptyOut)) = uint8(0)
+    if path == nil || *UInt8Ptr(path) == uint8(0):
+        return emptyOut
+    let dir: ptr = raw_libc_opendir(path)
+    if dir == nil:
+        return emptyOut
+    var cap: int32 = 256
+    var lenOut: int32 = 0
+    var out: ptr = raw_libc_malloc(cap)
+    if out == nil:
+        raw_libc_closedir(dir)
+        return nil
+    *(UInt8Ptr(out)) = uint8(0)
+    if emptyOut != nil:
+        raw_libc_free(emptyOut)
+    while true:
+        let entRaw: ptr = raw_libc_readdir(dir)
+        if entRaw == nil:
+            break
+        let ent: DarwinDirentPtr = DarwinDirentPtr(entRaw)
+        let nameLen: int32 = int32(ent->d_namlen)
+        if nameLen <= 0:
+            continue
+        let namePtr: ptr = cheng_host_ptr_plus(entRaw, chengHostDirentNameOff)
+        if nameLen == 1 && *UInt8Ptr(namePtr) == uint8(46):
+            continue
+        if nameLen == 2 &&
+           *UInt8Ptr(namePtr) == uint8(46) &&
+           *UInt8Ptr(cheng_host_ptr_plus(namePtr, 1)) == uint8(46):
+            continue
+        var need: int32 = lenOut + nameLen + 2
+        if need > cap:
+            var newCap: int32 = cap
+            while newCap < need:
+                newCap = newCap * 2
+            let next: ptr = raw_libc_realloc(out, newCap)
+            if next == nil:
+                break
+            out = next
+            cap = newCap
+        cheng_host_bytes_copy(cheng_host_ptr_plus(out, lenOut), namePtr, nameLen)
+        lenOut = lenOut + nameLen
+        *(UInt8Ptr(cheng_host_ptr_plus(out, lenOut))) = uint8(10)
+        lenOut = lenOut + 1
+        *(UInt8Ptr(cheng_host_ptr_plus(out, lenOut))) = uint8(0)
+    raw_libc_closedir(dir)
+    return out
 
 @exportc("cheng_host_popen")
 fn cheng_host_popen_export(command: ptr, mode: ptr): ptr =
@@ -229,6 +375,10 @@ fn cheng_host_clock_gettime_export(clockId: int32, out: ptr): int32 =
 @exportc("cheng_host_stat")
 fn cheng_host_stat_export(path: ptr, out: ptr): int32 =
     return raw_libc_stat(path, out)
+
+@exportc("cheng_host_statfs")
+fn cheng_host_statfs_export(path: ptr, out: ptr): int32 =
+    return raw_libc_statfs(path, out)
 
 @exportc("cheng_host_pipe_runtime")
 fn cheng_host_pipe_runtime_export(fds: ptr): int32 =

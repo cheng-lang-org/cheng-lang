@@ -23,6 +23,26 @@ const
     v3BftValidatorCount: int32 = 3
     v3BftValidatorQuorum: int32 = 2
 
+fn v3BftValidatorCurrentDir(): str =
+    let cwd = os.GetCurrentDir()
+    return cwd
+
+fn v3BftValidatorReadTextFile(pathRaw: str): str =
+    let cwd = v3BftValidatorCurrentDir()
+    return v3path.V3ReadTextFile(cwd, pathRaw)
+
+fn v3BftValidatorWriteTextFile(pathRaw: str, text: str): bool =
+    let cwd = v3BftValidatorCurrentDir()
+    return v3path.V3WriteTextFile(cwd, pathRaw, text)
+
+fn v3BftValidatorFileExistsNonEmpty(pathRaw: str): bool =
+    let cwd = v3BftValidatorCurrentDir()
+    return v3path.V3FileExistsNonEmpty(cwd, pathRaw)
+
+fn v3BftValidatorAbsolutePath(pathRaw: str): str =
+    let cwd = v3BftValidatorCurrentDir()
+    return v3path.V3PathAbsolute(cwd, pathRaw)
+
 type
     V3BftValidatorState =
         validatorSlot: int32
@@ -78,7 +98,7 @@ type
         pendingTxs: Bytes[]
 
 fn v3BftValidatorInt64Text(value: int64): str =
-    return strings.int64ToStr(value)
+    return strings.Int64ToStr(value)
 
 fn v3BftValidatorHexValue(ch: char): int32 =
     if ch >= '0' && ch <= '9':
@@ -90,7 +110,7 @@ fn v3BftValidatorHexValue(ch: char): int32 =
     return -1
 
 fn v3BftValidatorBytesFromHex(textRaw: str): Result[Bytes] =
-    let text = strutil.strip(textRaw)
+    let text = strutil.Strip(textRaw)
     if len(text) <= 0:
         return Ok[Bytes](emptyBytes())
     if (len(text) % 2) != 0:
@@ -107,7 +127,7 @@ fn v3BftValidatorBytesFromHex(textRaw: str): Result[Bytes] =
     return Ok[Bytes](out)
 
 fn v3BftValidatorParseInt64Text(raw: str): Result[int64] =
-    let text = strutil.strip(raw)
+    let text = strutil.Strip(raw)
     if len(text) <= 0:
         return Err[int64]("v3 bft validator: invalid integer: " + raw)
     var sign = int64(1)
@@ -887,7 +907,8 @@ fn v3BftValidatorStateText(state: V3BftValidatorState): str =
 
 fn v3BftValidatorWriteState(pathRaw: str,
                             state: V3BftValidatorState): bool =
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorStateText(state))
+    let text = v3BftValidatorStateText(state)
+    return v3BftValidatorWriteTextFile(pathRaw, text)
 
 fn v3BftValidatorVoteLockText(state: V3BftValidatorState): str =
     var out = ""
@@ -913,46 +934,53 @@ fn v3BftValidatorDefaultStateSyncDir(stateSyncFilePathRaw: str): str =
 
 fn v3BftValidatorWriteVoteLock(pathRaw: str,
                                state: V3BftValidatorState): bool =
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorVoteLockText(state))
+    let text = v3BftValidatorVoteLockText(state)
+    return v3BftValidatorWriteTextFile(pathRaw, text)
 
 fn v3BftValidatorWriteQueueCursor(pathRaw: str,
                                   consumedLineCount: int32): bool =
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, v3BftValidatorQueueCursorText(consumedLineCount))
+    let text = v3BftValidatorQueueCursorText(consumedLineCount)
+    return v3BftValidatorWriteTextFile(pathRaw, text)
 
 fn v3BftValidatorLoadState(pathRaw: str): Result[V3BftValidatorState] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let trimmed = strutil.strip(text)
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let trimmed = strutil.Strip(text)
     if len(trimmed) <= 0:
         return Err[V3BftValidatorState]("v3 bft validator: missing state file")
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     var sawMagic = false
     var validatorSlot = 0
     var lastVotedHeight = int64(0)
     var lastVotedProposalHash = layout.fixedBytes32Zero()
     var machineHex = ""
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         if line == v3BftValidatorStateMagic:
             sawMagic = true
-        elif v3path.v3TextStartsWith(line, "validator_slot="):
-            let slotRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 15, len(line) - 15))
+        elif v3path.V3TextStartsWith(line, "validator_slot="):
+            let slotText = v3path.V3TextSlice(line, 15, len(line) - 15)
+            let slotRes = v3BftValidatorParseInt64Text(slotText)
             if IsErr(slotRes):
                 return Err[V3BftValidatorState](Error(slotRes))
             validatorSlot = int32(Value(slotRes))
-        elif v3path.v3TextStartsWith(line, "last_voted_height="):
-            let heightRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 18, len(line) - 18))
+        elif v3path.V3TextStartsWith(line, "last_voted_height="):
+            let heightText = v3path.V3TextSlice(line, 18, len(line) - 18)
+            let heightRes = v3BftValidatorParseInt64Text(heightText)
             if IsErr(heightRes):
                 return Err[V3BftValidatorState](Error(heightRes))
             lastVotedHeight = Value(heightRes)
-        elif v3path.v3TextStartsWith(line, "last_voted_proposal_hash="):
-            let hashRes = layout.fixedBytes32FromHex(v3path.v3TextSlice(line, 25, len(line) - 25))
+        elif v3path.V3TextStartsWith(line, "last_voted_proposal_hash="):
+            let hashText = v3path.V3TextSlice(line, 25, len(line) - 25)
+            let hashRes = layout.fixedBytes32FromHex(hashText)
             if IsErr(hashRes):
                 return Err[V3BftValidatorState](Error(hashRes))
             lastVotedProposalHash = Value(hashRes)
-        elif v3path.v3TextStartsWith(line, "machine_hex="):
-            machineHex = strutil.strip(v3path.v3TextSlice(line, 12, len(line) - 12))
+        elif v3path.V3TextStartsWith(line, "machine_hex="):
+            let machineHexRaw = v3path.V3TextSlice(line, 12, len(line) - 12)
+            machineHex = strutil.Strip(machineHexRaw)
     if !sawMagic:
         return Err[V3BftValidatorState]("v3 bft validator: bad state magic")
     if !v3BftValidatorSlotValid(validatorSlot):
@@ -972,30 +1000,33 @@ fn v3BftValidatorLoadState(pathRaw: str): Result[V3BftValidatorState] =
 
 fn v3BftValidatorLoadVoteLock(pathRaw: str,
                               state: var V3BftValidatorState): Result[bool] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let trimmed = strutil.strip(text)
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let trimmed = strutil.Strip(text)
     if len(trimmed) <= 0:
         return Ok[bool](false)
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     var sawMagic = false
     var sawHeight = false
     var sawHash = false
     var lastVotedHeight = int64(0)
     var lastVotedProposalHash = layout.fixedBytes32Zero()
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         if line == v3BftValidatorVoteLockMagic:
             sawMagic = true
-        elif v3path.v3TextStartsWith(line, "last_voted_height="):
-            let heightRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 18, len(line) - 18))
+        elif v3path.V3TextStartsWith(line, "last_voted_height="):
+            let heightText = v3path.V3TextSlice(line, 18, len(line) - 18)
+            let heightRes = v3BftValidatorParseInt64Text(heightText)
             if IsErr(heightRes):
                 return Err[bool](Error(heightRes))
             lastVotedHeight = Value(heightRes)
             sawHeight = true
-        elif v3path.v3TextStartsWith(line, "last_voted_proposal_hash="):
-            let hashRes = layout.fixedBytes32FromHex(v3path.v3TextSlice(line, 25, len(line) - 25))
+        elif v3path.V3TextStartsWith(line, "last_voted_proposal_hash="):
+            let hashText = v3path.V3TextSlice(line, 25, len(line) - 25)
+            let hashRes = layout.fixedBytes32FromHex(hashText)
             if IsErr(hashRes):
                 return Err[bool](Error(hashRes))
             lastVotedProposalHash = Value(hashRes)
@@ -1009,22 +1040,24 @@ fn v3BftValidatorLoadVoteLock(pathRaw: str,
     return Ok[bool](true)
 
 fn v3BftValidatorLoadQueueCursor(pathRaw: str): Result[int32] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let trimmed = strutil.strip(text)
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let trimmed = strutil.Strip(text)
     if len(trimmed) <= 0:
         return Ok[int32](0)
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     var sawMagic = false
     var sawCount = false
     var consumedLineCount = 0
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         if line == v3BftValidatorQueueCursorMagic:
             sawMagic = true
-        elif v3path.v3TextStartsWith(line, "consumed_line_count="):
-            let countRes = v3BftValidatorParseInt64Text(v3path.v3TextSlice(line, 20, len(line) - 20))
+        elif v3path.V3TextStartsWith(line, "consumed_line_count="):
+            let countText = v3path.V3TextSlice(line, 20, len(line) - 20)
+            let countRes = v3BftValidatorParseInt64Text(countText)
             if IsErr(countRes):
                 return Err[int32](Error(countRes))
             consumedLineCount = int32(Value(countRes))
@@ -1048,29 +1081,36 @@ fn v3BftValidatorLoadLiveState(statePathRaw: str,
 
 fn v3BftValidatorWriteHexFile(pathRaw: str,
                               data: Bytes): bool =
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, bytesToHex(data) + "\n")
+    let cwd = os.GetCurrentDir()
+    let hexText = bytesToHex(data)
+    let outText = hexText + "\n"
+    return v3path.V3WriteTextFile(cwd, pathRaw, outText)
 
 fn v3BftValidatorReadHexFile(pathRaw: str): Result[Bytes] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
+    let text = v3BftValidatorReadTextFile(pathRaw)
     return v3BftValidatorBytesFromHex(text)
 
 fn v3BftValidatorStateSnapshotPath(snapshotDirRaw: str,
                                    height: int64): str =
-    return v3path.v3PathJoin(snapshotDirRaw, v3BftValidatorInt64Text(height) + ".hex")
+    let fileName = v3BftValidatorInt64Text(height) + ".hex"
+    let pathRaw = v3path.V3PathJoin(snapshotDirRaw, fileName)
+    return pathRaw
 
 fn v3BftValidatorReadStateSnapshot(snapshotDirRaw: str,
                                    height: int64): Result[Bytes] =
     let pathRaw = v3BftValidatorStateSnapshotPath(snapshotDirRaw, height)
-    if !v3path.v3FileExistsNonEmpty(os.getCurrentDir(), pathRaw):
+    if !v3BftValidatorFileExistsNonEmpty(pathRaw):
         return Err[Bytes]("v3 bft validator: missing state snapshot")
     return v3BftValidatorReadHexFile(pathRaw)
 
 fn v3BftValidatorWriteStateSnapshot(snapshotDirRaw: str,
                                     machine: bft.V3BftStateMachine): bool =
-    if !v3path.v3MkdirP(os.getCurrentDir(), snapshotDirRaw):
+    let cwd = os.GetCurrentDir()
+    if !v3path.V3MkdirP(cwd, snapshotDirRaw):
         return false
-    return v3BftValidatorWriteHexFile(v3BftValidatorStateSnapshotPath(snapshotDirRaw, machine.lastFinalizedHeight),
-                                      v3BftValidatorEncodeMachine(machine))
+    let snapshotPath = v3BftValidatorStateSnapshotPath(snapshotDirRaw, machine.lastFinalizedHeight)
+    let machineBytes = v3BftValidatorEncodeMachine(machine)
+    return v3BftValidatorWriteHexFile(snapshotPath, machineBytes)
 
 fn v3BftValidatorEncodeStateSyncRequest(height: int64): Bytes =
     var out = ""
@@ -1080,10 +1120,12 @@ fn v3BftValidatorEncodeStateSyncRequest(height: int64): Bytes =
     return bytesFromString(out)
 
 fn v3BftValidatorDecodeStateSyncRequest(data: Bytes): Result[int64] =
-    let text = strutil.strip(bytesToString(data))
-    if !v3path.v3TextStartsWith(text, "height="):
+    let textRaw = bytesToString(data)
+    let text = strutil.Strip(textRaw)
+    if !v3path.V3TextStartsWith(text, "height="):
         return Err[int64]("v3 bft validator: bad state sync request")
-    return v3BftValidatorParseInt64Text(v3path.v3TextSlice(text, 7, len(text) - 7))
+    let heightText = v3path.V3TextSlice(text, 7, len(text) - 7)
+    return v3BftValidatorParseInt64Text(heightText)
 
 fn v3BftValidatorEncodeStateSyncPayload(machineBytes: Bytes): Bytes =
     var out = ""
@@ -1101,17 +1143,20 @@ fn v3BftValidatorEncodeStateSyncError(err: str): Bytes =
 
 fn v3BftValidatorDecodeStateSyncPayload(data: Bytes): Result[bft.V3BftStateMachine] =
     let text = bytesToString(data)
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     var machineHex = ""
     var errText = ""
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
-        if v3path.v3TextStartsWith(line, "machine_hex="):
-            machineHex = strutil.strip(v3path.v3TextSlice(line, 12, len(line) - 12))
-        elif v3path.v3TextStartsWith(line, "error="):
-            errText = strutil.strip(v3path.v3TextSlice(line, 6, len(line) - 6))
+        if v3path.V3TextStartsWith(line, "machine_hex="):
+            let machineHexRaw = v3path.V3TextSlice(line, 12, len(line) - 12)
+            machineHex = strutil.Strip(machineHexRaw)
+        elif v3path.V3TextStartsWith(line, "error="):
+            let errTextRaw = v3path.V3TextSlice(line, 6, len(line) - 6)
+            errText = strutil.Strip(errTextRaw)
     if len(errText) > 0:
         return Err[bft.V3BftStateMachine](errText)
     if len(machineHex) <= 0:
@@ -1129,22 +1174,23 @@ fn v3BftValidatorStateSyncPayloadForHeight(snapshotDirRaw: str,
     return v3BftValidatorEncodeStateSyncPayload(Value(snapshotRes))
 
 fn v3BftValidatorRetryableStateSyncRecvError(err: str): bool =
-    return v3path.v3TextStartsWith(err, "v3 libp2p quic: dial") ||
-           v3path.v3TextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
-           v3path.v3TextStartsWith(err, "msquic native: pipe read timeout") ||
-           v3path.v3TextStartsWith(err, "msquic native: handshake ! ready") ||
-           v3path.v3TextStartsWith(err, "msquic native: session ! ready")
+    return v3path.V3TextStartsWith(err, "v3 libp2p quic: dial") ||
+           v3path.V3TextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
+           v3path.V3TextStartsWith(err, "msquic native: pipe read timeout") ||
+           v3path.V3TextStartsWith(err, "msquic native: handshake ! ready") ||
+           v3path.V3TextStartsWith(err, "msquic native: session ! ready")
 
 fn v3BftValidatorQueueLoad(pathRaw: str): Result[Bytes[]] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let trimmed = strutil.strip(text)
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let trimmed = strutil.Strip(text)
     var out: Bytes[]
     out = []
     if len(trimmed) <= 0:
         return Ok[Bytes[]](out)
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         let bytesRes = v3BftValidatorBytesFromHex(line)
@@ -1161,7 +1207,7 @@ fn v3BftValidatorQueueWrite(pathRaw: str,
     var out = ""
     for i in 0..<txs.len:
         out = out + bytesToHex(txs[i]) + "\n"
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, out)
+    return v3BftValidatorWriteTextFile(pathRaw, out)
 
 fn v3BftValidatorQueueAppend(pathRaw: str,
                              txWire: Bytes): bool =
@@ -1177,14 +1223,16 @@ fn v3BftValidatorQueueTrackerInit(pathRaw: str,
     let consumedRes = v3BftValidatorLoadQueueCursor(cursorPathRaw)
     if IsErr(consumedRes):
         return Err[V3BftValidatorQueueTracker](Error(consumedRes))
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let lines = strutil.split(text, '\n')
-    let knownFileSize = v3path.v3PathFileSize(v3path.v3PathAbsolute(os.getCurrentDir(), pathRaw))
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let lines = strutil.Split(text, '\n')
+    let queuePath = v3BftValidatorAbsolutePath(pathRaw)
+    let knownFileSize = v3path.V3PathFileSize(queuePath)
     var knownLineCount = 0
     var pendingTxs: Bytes[]
     pendingTxs = []
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         let bytesRes = v3BftValidatorBytesFromHex(line)
@@ -1207,18 +1255,19 @@ fn v3BftValidatorQueueTrackerInit(pathRaw: str,
 
 fn v3BftValidatorQueueTrackerRefresh(pathRaw: str,
                                      tracker: var V3BftValidatorQueueTracker): Result[int32] =
-    let queuePath = v3path.v3PathAbsolute(os.getCurrentDir(), pathRaw)
-    let fileSize = v3path.v3PathFileSize(queuePath)
+    let queuePath = v3BftValidatorAbsolutePath(pathRaw)
+    let fileSize = v3path.V3PathFileSize(queuePath)
     if fileSize == tracker.knownFileSize:
         return Ok[int32](0)
     if fileSize < tracker.knownFileSize:
         return Err[int32]("v3 bft validator: queue file shrank")
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let lines = strutil.split(text, '\n')
+    let text = v3BftValidatorReadTextFile(pathRaw)
+    let lines = strutil.Split(text, '\n')
     var seenLineCount = 0
     var newCount = 0
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         if seenLineCount >= tracker.knownLineCount:
@@ -1282,15 +1331,17 @@ fn v3BftValidatorVoteSetAdd(out: var V3BftVote[],
     return Ok[bool](true)
 
 fn v3BftValidatorVoteInboxLoad(pathRaw: str): Result[V3BftVote[]] =
-    let text = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    let trimmed = strutil.strip(text)
+    let cwd = os.GetCurrentDir()
+    let text = v3path.V3ReadTextFile(cwd, pathRaw)
+    let trimmed = strutil.Strip(text)
     var out: V3BftVote[]
     out = []
     if len(trimmed) <= 0:
         return Ok[V3BftVote[]](out)
-    let lines = strutil.split(text, '\n')
+    let lines = strutil.Split(text, '\n')
     for i in 0..<lines.len:
-        let line = strutil.strip(lines[i])
+        let lineRaw = lines[i]
+        let line = strutil.Strip(lineRaw)
         if len(line) <= 0:
             continue
         let bytesRes = v3BftValidatorBytesFromHex(line)
@@ -1304,8 +1355,9 @@ fn v3BftValidatorVoteInboxLoad(pathRaw: str): Result[V3BftVote[]] =
 
 fn v3BftValidatorVoteInboxAppend(pathRaw: str,
                                  voteWire: Bytes): bool =
-    let existing = v3path.v3ReadTextFile(os.getCurrentDir(), pathRaw)
-    return v3path.v3WriteTextFile(os.getCurrentDir(), pathRaw, existing + bytesToHex(voteWire) + "\n")
+    let existing = v3BftValidatorReadTextFile(pathRaw)
+    let outText = existing + bytesToHex(voteWire) + "\n"
+    return v3BftValidatorWriteTextFile(pathRaw, outText)
 
 fn v3BftValidatorVoteSetForProposal(pathRaw: str,
                                     proposal: V3BftProposal,
@@ -1505,7 +1557,9 @@ fn v3BftValidatorRecvStateMachine(host: str,
                                                                      v3BftValidatorStateSyncProtocol(),
                                                                      v3BftValidatorEncodeStateSyncRequest(height))
         if IsOk(ackRes):
-            if strutil.strip(bytesToString(Value(ackRes))) != v3BftValidatorStateSyncAck:
+            let ackRaw = bytesToString(Value(ackRes))
+            let ackText = strutil.Strip(ackRaw)
+            if ackText != v3BftValidatorStateSyncAck:
                 return Err[bft.V3BftStateMachine]("v3 bft validator: state sync ack mismatch")
             ackOk = true
             break

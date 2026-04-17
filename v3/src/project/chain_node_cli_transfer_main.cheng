@@ -1,4 +1,77 @@
+import std/cmdline as cmdline
+import std/result
 import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node as node
+import cheng/v3/std/bytes_layout as layout
 
-fn main(): int32 =
-    return cli.v3ChainNodeCmdTransferMain()
+fn v3ChainNodeCliTransferCommand(): int32 =
+    var stateRaw = ""
+    stateRaw = cli.V3ChainNodeCliReadFlag("--state", "")
+    var statePath = ""
+    let statePathReq = cli.V3ChainNodeCliRequireTextInto(statePath, stateRaw, "--state")
+    if IsErr(statePathReq):
+        let errText: str = Error(statePathReq)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var assetRaw = ""
+    assetRaw = cli.V3ChainNodeCliReadFlag("--asset", "")
+    let assetRes = cli.V3ChainNodeCliRequirePositiveInt32(assetRaw, "--asset")
+    if IsErr(assetRes):
+        let errText: str = Error(assetRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var fromRaw = ""
+    fromRaw = cli.V3ChainNodeCliReadFlag("--from", "")
+    let fromRes = cli.V3ChainNodeCliRequirePositiveInt32(fromRaw, "--from")
+    if IsErr(fromRes):
+        let errText: str = Error(fromRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var toRaw = ""
+    toRaw = cli.V3ChainNodeCliReadFlag("--to", "")
+    let toRes = cli.V3ChainNodeCliRequirePositiveInt32(toRaw, "--to")
+    if IsErr(toRes):
+        let errText: str = Error(toRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var amountRaw = ""
+    amountRaw = cli.V3ChainNodeCliReadFlag("--amount", "")
+    let amountRes = cli.V3ChainNodeCliRequireInt64(amountRaw, "--amount")
+    if IsErr(amountRes):
+        let errText: str = Error(amountRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var state: node.V3ChainNode
+    let loadRes = cli.V3ChainNodeCliLoadStateInto(state, statePath)
+    if IsErr(loadRes):
+        let errText: str = Error(loadRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    let transferRes = node.V3ChainNodeTransfer(state,
+                                               Value(assetRes),
+                                               Value(fromRes),
+                                               Value(toRes),
+                                               Value(amountRes))
+    if !transferRes.ok:
+        let errText = ErrorText(transferRes)
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    var snapshot: node.V3ChainNodeServeSnapshot
+    node.V3ChainNodeServeOnceInto(snapshot, state)
+    if !cli.V3ChainNodeCliWriteState(statePath, snapshot):
+        let absolutePath = cli.V3ChainNodeCliAbsolutePath(statePath)
+        let errText = "v3 chain_node: failed to persist state: " + absolutePath
+        cli.V3ChainNodeCliPrintErr(errText)
+        return 2
+    let eventCid = transferRes.value
+    let eventCidText = "event_cid=" + layout.FixedBytes32Hex(eventCid)
+    cli.V3ChainNodeCliPrintLine(eventCidText)
+    cli.V3ChainNodeCliPrintSnapshotReport(snapshot)
+    return 0
+
+fn V3ChainNodeCliTransferCommand(): int32 =
+    return v3ChainNodeCliTransferCommand()
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.CaptureCmdLine(argc, argv)
+    return v3ChainNodeCliTransferCommand()

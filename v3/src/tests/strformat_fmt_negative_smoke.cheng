@@ -1,0 +1,93 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/strings as strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn currentExecutablePath(root: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return os.JoinPath(root, raw)
+
+fn compileNegativeFixture(compiler: str,
+                          root: str,
+                          inputPath: str,
+                          outputPath: str,
+                          logPath: str): os.ExecCmdResult =
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    var compileArgv: str[] = []
+    add(compileArgv, "system-link-exec")
+    add(compileArgv, "--root")
+    add(compileArgv, root)
+    add(compileArgv, "--in")
+    add(compileArgv, inputPath)
+    add(compileArgv, "--emit")
+    add(compileArgv, "exe")
+    add(compileArgv, "--target")
+    add(compileArgv, target)
+    add(compileArgv, "--out")
+    add(compileArgv, outputPath)
+    var compileEnv: str[] = []
+    let compileRes = hostos.ExecFileCapture(compiler, compileArgv, compileEnv, root, true, 60)
+    let compileOutput = os.ExecCmdResultOutput(compileRes)
+    os.WriteFile(logPath, compileOutput)
+    return compileRes
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let exePath = currentExecutablePath(root)
+    assert(len(exePath) > 0 && os.FileExists(exePath),
+           "v3 strformat fmt negative: executable path")
+    let exeParts = os.SplitFile(exePath)
+    let exeDir = exeParts.dir
+    let exeName = exeParts.name
+    let workspaceName = exeName + ".workspace"
+    let outDir = os.JoinPath(exeDir, workspaceName)
+    ensureDir(outDir)
+    assert(os.DirExists(outDir), "v3 strformat fmt negative: mkdir")
+
+    let compilerEnv = os.GetEnv("CHENG_V3_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/v3_bootstrap/cheng.stage3"
+    if len(compilerEnv) > 0:
+        compilerRaw = compilerEnv
+    var compiler = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        compiler = os.JoinPath(root, compilerRaw)
+    assert(os.FileExists(compiler),
+           "v3 strformat fmt negative: compiler exists")
+
+    let missingLog = os.JoinPath(outDir, "missing_right_brace.compile.log")
+    let missingIn = os.JoinPath(root, "v3/src/tests/strformat_fmt_negative_missing_right_brace.cheng")
+    let missingOut = os.JoinPath(outDir, "missing_right_brace")
+    let missingRes = compileNegativeFixture(compiler, root, missingIn, missingOut, missingLog)
+    let missingOutput = os.ExecCmdResultOutput(missingRes)
+    assert(os.ExecCmdResultExitCode(missingRes) != 0, "v3 strformat fmt negative: missing right brace rejected")
+    assert(strings.StrContains(missingOutput, "fmt placeholder missing '}'"),
+           "v3 strformat fmt negative: missing right brace diagnostic")
+
+    let emptyLog = os.JoinPath(outDir, "empty_placeholder.compile.log")
+    let emptyIn = os.JoinPath(root, "v3/src/tests/strformat_fmt_negative_empty_placeholder.cheng")
+    let emptyOut = os.JoinPath(outDir, "empty_placeholder")
+    let emptyRes = compileNegativeFixture(compiler, root, emptyIn, emptyOut, emptyLog)
+    let emptyOutput = os.ExecCmdResultOutput(emptyRes)
+    assert(os.ExecCmdResultExitCode(emptyRes) != 0, "v3 strformat fmt negative: empty placeholder rejected")
+    assert(strings.StrContains(emptyOutput, "fmt placeholder empty"),
+           "v3 strformat fmt negative: empty placeholder diagnostic")
+
+    let unmatchedLog = os.JoinPath(outDir, "unmatched_right_brace.compile.log")
+    let unmatchedIn = os.JoinPath(root, "v3/src/tests/strformat_fmt_negative_unmatched_right_brace.cheng")
+    let unmatchedOut = os.JoinPath(outDir, "unmatched_right_brace")
+    let unmatchedRes = compileNegativeFixture(compiler, root, unmatchedIn, unmatchedOut, unmatchedLog)
+    let unmatchedOutput = os.ExecCmdResultOutput(unmatchedRes)
+    assert(os.ExecCmdResultExitCode(unmatchedRes) != 0, "v3 strformat fmt negative: unmatched right brace rejected")
+    assert(strings.StrContains(unmatchedOutput, "fmt literal has unmatched '}'"),
+           "v3 strformat fmt negative: unmatched right brace diagnostic")
+
+    echo("v3 strformat_fmt_negative_smoke ok")
+    return 0

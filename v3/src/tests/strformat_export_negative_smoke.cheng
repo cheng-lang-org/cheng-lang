@@ -1,0 +1,112 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/strings as strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn currentExecutablePath(root: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return os.JoinPath(root, raw)
+
+fn compileFixture(compiler: str,
+                  root: str,
+                  packageRoot: str,
+                  inputPath: str,
+                  outputPath: str,
+                  logPath: str): os.ExecCmdResult =
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    var argv: str[]
+    add(argv, "system-link-exec")
+    add(argv, "--root")
+    add(argv, packageRoot)
+    add(argv, "--in")
+    add(argv, inputPath)
+    add(argv, "--emit")
+    add(argv, "exe")
+    add(argv, "--target")
+    add(argv, target)
+    add(argv, "--out")
+    add(argv, outputPath)
+    var envv: str[]
+    let res = hostos.ExecFileCapture(compiler, argv, envv, root, true, 60)
+    let resOutput = os.ExecCmdResultOutput(res)
+    os.WriteFile(logPath, resOutput)
+    return res
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let exePath = currentExecutablePath(root)
+    assert(len(exePath) > 0 && os.FileExists(exePath),
+           "v3 strformat export negative: executable path")
+    let exeParts = os.SplitFile(exePath)
+    let exeDir = exeParts.dir
+    let exeName = exeParts.name
+    let outDirName = exeName + ".workspace"
+    let outDir = os.JoinPath(exeDir, outDirName)
+    ensureDir(outDir)
+
+    let workspaceDir = os.JoinPath(outDir, "workspace")
+    let pkgRoot = os.JoinPath(workspaceDir, "consumer_pkg")
+    let srcDir = os.JoinPath(pkgRoot, "src")
+    ensureDir(workspaceDir)
+    ensureDir(pkgRoot)
+    ensureDir(srcDir)
+    let pkgManifestPath = os.JoinPath(pkgRoot, "cheng-package.toml")
+    os.WriteFile(pkgManifestPath,
+                 "package_id = \"pkg://cheng/strformat_negative_pkg\"\nmodule_prefix = \"strformat_negative_pkg\"\n")
+
+    let compilerEnv = os.GetEnv("CHENG_V3_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/v3_bootstrap/cheng.stage3"
+    if len(compilerEnv) > 0:
+        compilerRaw = compilerEnv
+    var compiler = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        compiler = os.JoinPath(root, compilerRaw)
+    assert(os.FileExists(compiler),
+           "v3 strformat export negative: compiler exists")
+
+    let fmtSrc = os.JoinPath(srcDir, "fmt_private_main.cheng")
+    os.WriteFile(fmtSrc,
+                 "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.fmt\"bad\"\n    echo(text)\n    return 0\n")
+    let fmtOutPath = os.JoinPath(outDir, "fmt_private")
+    let fmtLogPath = os.JoinPath(outDir, "fmt_private.compile.log")
+    let fmtRes = compileFixture(compiler,
+                                root,
+                                pkgRoot,
+                                fmtSrc,
+                                fmtOutPath,
+                                fmtLogPath)
+    let fmtOutput = os.ExecCmdResultOutput(fmtRes)
+    assert(os.ExecCmdResultExitCode(fmtRes) != 0,
+           "v3 strformat export negative: lowercase fmt rejected")
+    assert(strings.StrContains(fmtOutput,
+                               "imported private symbol 'fmt' is not exported"),
+           "v3 strformat export negative: lowercase fmt diagnostic")
+
+    let linesSrc = os.JoinPath(srcDir, "lines_private_main.cheng")
+    os.WriteFile(linesSrc,
+                 "import std/strformat as strfmt\n\nfn main(): int32 =\n    let text = strfmt.lines([\"a\", \"b\"])\n    echo(text)\n    return 0\n")
+    let linesOutPath = os.JoinPath(outDir, "lines_private")
+    let linesLogPath = os.JoinPath(outDir, "lines_private.compile.log")
+    let linesRes = compileFixture(compiler,
+                                  root,
+                                  pkgRoot,
+                                  linesSrc,
+                                  linesOutPath,
+                                  linesLogPath)
+    let linesOutput = os.ExecCmdResultOutput(linesRes)
+    assert(os.ExecCmdResultExitCode(linesRes) != 0,
+           "v3 strformat export negative: lowercase lines rejected")
+    assert(strings.StrContains(linesOutput,
+                               "imported private symbol 'lines' is not exported"),
+           "v3 strformat export negative: lowercase lines diagnostic")
+
+    echo("v3 strformat_export_negative_smoke ok")
+    return 0

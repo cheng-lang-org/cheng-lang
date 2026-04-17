@@ -11,8 +11,12 @@ import cheng/v3/project/chain_node as node
 import cheng/v3/project/chain_node_libp2p as net
 
 fn main(): int32 =
-    var server = node.v3ChainNodeInit("tailnet.node.a", "tailnet-chain")
-    var client = node.v3ChainNodeInit("tailnet.node.b", "tailnet-chain")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "tailnet.node.a", "tailnet-chain")),
+           "v3 chain_node: init")
+    var client: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(client, "tailnet.node.b", "tailnet-chain")),
+           "v3 chain_node: init")
     var serverHost = host.v3Libp2pHostInit("tailnet.server")
     var clientHost = host.v3Libp2pHostInit("tailnet.client")
     host.v3Libp2pHostSetTrustedInfra(serverHost, true)
@@ -77,7 +81,15 @@ fn main(): int32 =
 
     let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
     assert(serveRes.ok, "v3 chain_node tailnet: serve once")
-    let syncRes = net.v3ChainNodeLibp2pSyncOnce(client, clientHost, serverHost, serverHost.selfPeerId)
+    var query: overlay.V3StoreQuery
+    net.v3ChainNodeLibp2pSnapshotQueryFill(query, server.address)
+    var entries: overlay.V3IngressEnvelope[]
+    let entriesRes = host.v3Libp2pSyncRequest(clientHost, serverHost, serverHost.selfPeerId, query, entries)
+    assert(entriesRes.ok, "v3 chain_node tailnet: sync request")
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let decodeRes = net.v3ChainNodeLibp2pDecodeLatestSnapshotFill(entries, server.address, snapshot)
+    assert(decodeRes.ok, "v3 chain_node tailnet: decode snapshot")
+    let syncRes = node.v3ChainNodeSyncOnce(client, snapshot)
     assert(syncRes.ok, "v3 chain_node tailnet: sync once")
     assert(syncRes.value, "v3 chain_node tailnet: sync changed")
 
@@ -97,8 +109,10 @@ fn main(): int32 =
     assert(aliceRes.value == int64(65), "v3 chain_node tailnet: alice 65")
     assert(bobRes.value == int64(12), "v3 chain_node tailnet: bob 12")
 
-    let serverServed = node.v3ChainNodeServeOnce(server)
-    let clientServed = node.v3ChainNodeServeOnce(client)
+    var serverServed: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(serverServed, server)
+    var clientServed: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(clientServed, client)
     assert(layout.fixedBytes32Equal(serverServed.forest.forestCid, clientServed.forest.forestCid),
         "v3 chain_node tailnet: forest cid")
     assert(anti.v3AntiEntropySignatureEqual(serverServed.signature, clientServed.signature),

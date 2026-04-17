@@ -43,6 +43,14 @@
 #define CHENG_MINRT_MAYBE_UNUSED
 #endif
 
+#if defined(__APPLE__)
+#define CHENG_MINRT_WEAK_IMPORT extern __attribute__((weak_import))
+#elif defined(__GNUC__) || defined(__clang__)
+#define CHENG_MINRT_WEAK_IMPORT extern __attribute__((weak))
+#else
+#define CHENG_MINRT_WEAK_IMPORT extern
+#endif
+
 #if defined(__GNUC__) || defined(__clang__)
 #define CHENG_THREAD_LOCAL __thread
 #elif defined(_MSC_VER)
@@ -72,6 +80,8 @@ int32_t driver_c_str_has_suffix(const char *s, const char *suffix);
 int32_t driver_c_str_contains_char(const char *s, int32_t value);
 int32_t driver_c_str_contains_str(const char *s, const char *sub);
 char *driver_c_char_to_str(int32_t value);
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_self_path(char *out, size_t out_cap);
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_repo_root(char *out, size_t out_cap);
 
 static bool cheng_probably_valid_ptr(const void *p) {
   uintptr_t raw = (uintptr_t)p;
@@ -854,26 +864,26 @@ typedef int32_t (*cheng_build_emit_obj_stage1_target_fn)(const char *input_path,
 typedef void *(*cheng_build_active_module_ptrs_fn)(void *inputRaw, void *targetRaw);
 typedef void *(*cheng_build_module_stage1_fn)(const char *path, const char *target);
 
-CHENG_MINRT_WEAK int32_t driver_emit_obj_from_module_default_impl(void *module, const char *target,
-                                                                  const char *path);
-CHENG_MINRT_WEAK int32_t driver_export_emit_obj_from_module_default_impl(void *module,
-                                                                         const char *target,
+CHENG_MINRT_WEAK_IMPORT int32_t driver_emit_obj_from_module_default_impl(void *module, const char *target,
                                                                          const char *path);
-CHENG_MINRT_WEAK int32_t driver_build_emit_obj_from_file_stage1_target_impl(
+CHENG_MINRT_WEAK_IMPORT int32_t driver_export_emit_obj_from_module_default_impl(void *module,
+                                                                                const char *target,
+                                                                                const char *path);
+CHENG_MINRT_WEAK_IMPORT int32_t driver_build_emit_obj_from_file_stage1_target_impl(
     const char *input_path, const char *target, const char *output_path);
-CHENG_MINRT_WEAK int32_t driver_export_build_emit_obj_from_file_stage1_target_impl(
+CHENG_MINRT_WEAK_IMPORT int32_t driver_export_build_emit_obj_from_file_stage1_target_impl(
     const char *input_path, const char *target, const char *output_path);
-CHENG_MINRT_WEAK void *driver_buildActiveModulePtrs(void *inputRaw, void *targetRaw);
-CHENG_MINRT_WEAK void *driver_buildModuleFromFileStage1TargetRetained(const char *path,
-                                                                      const char *target);
-CHENG_MINRT_WEAK void *driver_export_buildModuleFromFileStage1TargetRetained(
+CHENG_MINRT_WEAK_IMPORT void *driver_buildActiveModulePtrs(void *inputRaw, void *targetRaw);
+CHENG_MINRT_WEAK_IMPORT void *driver_buildModuleFromFileStage1TargetRetained(const char *path,
+                                                                             const char *target);
+CHENG_MINRT_WEAK_IMPORT void *driver_export_buildModuleFromFileStage1TargetRetained(
     const char *path, const char *target);
-CHENG_MINRT_WEAK void *driver_seed_bridge_buildModuleFromFileStage1TargetRetained_impl(
+CHENG_MINRT_WEAK_IMPORT void *driver_seed_bridge_buildModuleFromFileStage1TargetRetained_impl(
     const char *path, const char *target);
-CHENG_MINRT_WEAK int32_t driver_seed_bridge_emit_obj_from_module_default_impl(
+CHENG_MINRT_WEAK_IMPORT int32_t driver_seed_bridge_emit_obj_from_module_default_impl(
     void *module, const char *target, const char *output_path);
-CHENG_MINRT_WEAK void *uirCoreBuildModuleFromFileStage1OrPanic(const char *path,
-                                                               const char *target);
+CHENG_MINRT_WEAK_IMPORT void *uirCoreBuildModuleFromFileStage1OrPanic(const char *path,
+                                                                      const char *target);
 
 typedef struct ChengStrMetaEntry {
   const char *ptr;
@@ -1618,6 +1628,27 @@ static CHENG_MINRT_MAYBE_UNUSED int driver_c_arg_is_help(const char *arg) {
   return strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0;
 }
 
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_arg_is_removed_runtime_flag(const char *arg) {
+  if (arg == NULL) return 0;
+  if (strcmp(arg, "--no-runtime-c") == 0) return 1;
+  if (strncmp(arg, "--no-runtime-c:", strlen("--no-runtime-c:")) == 0) return 1;
+  if (strncmp(arg, "--no-runtime-c=", strlen("--no-runtime-c=")) == 0) return 1;
+  if (strcmp(arg, "--runtime-c") == 0) return 1;
+  if (strncmp(arg, "--runtime-c:", strlen("--runtime-c:")) == 0) return 1;
+  if (strncmp(arg, "--runtime-c=", strlen("--runtime-c=")) == 0) return 1;
+  return 0;
+}
+
+static CHENG_MINRT_MAYBE_UNUSED const char *driver_c_removed_runtime_flag_name(const char *arg) {
+  if (arg != NULL &&
+      (strcmp(arg, "--runtime-c") == 0 ||
+       strncmp(arg, "--runtime-c:", strlen("--runtime-c:")) == 0 ||
+       strncmp(arg, "--runtime-c=", strlen("--runtime-c=")) == 0)) {
+    return "--runtime-c";
+  }
+  return "--no-runtime-c";
+}
+
 __attribute__((weak)) int32_t driver_c_backend_usage(void) {
   fputs("Usage:\n", stderr);
   fputs("  backend_driver [--input:<file>|<file>] [--output:<out>] [options]\n", stderr);
@@ -1628,7 +1659,7 @@ __attribute__((weak)) int32_t driver_c_backend_usage(void) {
   fputs("  --opt-level:<N> --opt2 --no-opt2 --opt --no-opt\n", stderr);
   fputs("  --multi --no-multi --multi-force --no-multi-force\n", stderr);
   fputs("  --incremental --no-incremental --allow-no-main\n", stderr);
-  fputs("  --skip-global-init --runtime-obj:<path> --runtime-c:<path> --no-runtime-c\n", stderr);
+  fputs("  --skip-global-init --runtime-obj:<path>\n", stderr);
   fputs("  --generic-mode:<dict> --generic-spec-budget:<N>\n", stderr);
   fputs("  --borrow-ir:<mir|stage1> --generic-lowering:<mir_dict>\n", stderr);
   fputs("  --android-api:<N> --compile-stamp-out:<path>\n", stderr);
@@ -1680,6 +1711,12 @@ int main(int argc, char **argv) {
   for (int i = 1; i < argc; ++i) {
     if (driver_c_arg_is_help(argv[i])) {
       return driver_c_backend_usage();
+    }
+    if (driver_c_arg_is_removed_runtime_flag(argv[i])) {
+      fprintf(stderr,
+              "backend_driver: removed flag %s, system-link always uses runtime object\n",
+              driver_c_removed_runtime_flag_name(argv[i]));
+      return 2;
     }
   }
   return driver_c_run_default();
@@ -2113,6 +2150,10 @@ static int32_t driver_c_reject_removed_stage1_skip_envs(void) {
   }
   if (driver_c_env_present_nonempty("STAGE1_SKIP_OWNERSHIP")) {
     fprintf(stderr, "backend_driver: removed env STAGE1_SKIP_OWNERSHIP, use STAGE1_OWNERSHIP_FIXED_0=0\n");
+    return 2;
+  }
+  if (driver_c_env_present_nonempty("BACKEND_NO_RUNTIME_C")) {
+    fprintf(stderr, "backend_driver: removed env BACKEND_NO_RUNTIME_C, system-link always uses runtime object\n");
     return 2;
   }
   fixed_sem_raw = getenv("STAGE1_SEM_FIXED_0");
@@ -2599,6 +2640,151 @@ static int32_t driver_c_target_is_darwin_alias(const char *raw) {
          strcmp(raw, "darwin_aarch64") == 0;
 }
 
+static const char *driver_c_runtime_cache_target(const char *target_text) {
+  if (driver_c_target_is_darwin_alias(target_text)) {
+    return "arm64-apple-darwin";
+  }
+  return (target_text != NULL) ? target_text : "";
+}
+
+static size_t driver_c_shell_quote_bytes(const char *value) {
+  size_t need = 3u;
+  size_t i;
+  if (value == NULL) return need;
+  for (i = 0u; value[i] != '\0'; ++i) {
+    need += (value[i] == '\'') ? 5u : 1u;
+  }
+  return need;
+}
+
+static int driver_c_shell_quote_append(char *dst,
+                                       size_t cap,
+                                       size_t *io_len,
+                                       const char *value) {
+  size_t pos;
+  size_t i;
+  if (dst == NULL || io_len == NULL || cap == 0u) return 0;
+  pos = *io_len;
+  if (pos + 2u >= cap) return 0;
+  dst[pos++] = '\'';
+  if (value != NULL) {
+    for (i = 0u; value[i] != '\0'; ++i) {
+      if (value[i] == '\'') {
+        if (pos + 5u >= cap) return 0;
+        memcpy(dst + pos, "'\"'\"'", 5u);
+        pos += 5u;
+      } else {
+        if (pos + 1u >= cap) return 0;
+        dst[pos++] = value[i];
+      }
+    }
+  }
+  if (pos + 1u >= cap) return 0;
+  dst[pos++] = '\'';
+  dst[pos] = '\0';
+  *io_len = pos;
+  return 1;
+}
+
+static int driver_c_runtime_materialize_program_runtime_obj(const char *repo_root,
+                                                            const char *target_text,
+                                                            char *out_path,
+                                                            size_t out_cap) {
+  static const char *PROGRAM_RUNTIME_SPLIT_NAMES[] = {
+      "system_helpers_compat_bridge.o",
+      "system_helpers_host_stdio_fs_bridge.o",
+      "system_helpers_io_time_bridge.o",
+      "system_helpers_machine_target_bridge.o",
+      "system_helpers_program_runtime_bridge.o"};
+  char split_paths[5][PATH_MAX];
+  char tmp_path[PATH_MAX];
+  const char *cache_target = driver_c_runtime_cache_target(target_text);
+  const char *host_target = driver_c_host_target_default();
+  size_t need = 0u;
+  size_t len = 0u;
+  size_t i;
+  char *cmd = NULL;
+  if (repo_root == NULL || repo_root[0] == '\0' || out_path == NULL || out_cap == 0u) return 0;
+  if (snprintf(out_path,
+               out_cap,
+               "%s/chengcache/runtime_selflink/program_runtime.combined.%s.o",
+               repo_root,
+               cache_target) <= 0 ||
+      strlen(out_path) >= out_cap) {
+    return 0;
+  }
+  if (access(out_path, R_OK) == 0) {
+    return 1;
+  }
+  if (cache_target[0] == '\0' || host_target == NULL || host_target[0] == '\0' ||
+      strcmp(cache_target, host_target) != 0) {
+    return 0;
+  }
+  for (i = 0u; i < (sizeof(PROGRAM_RUNTIME_SPLIT_NAMES) / sizeof(PROGRAM_RUNTIME_SPLIT_NAMES[0]));
+       ++i) {
+    if (snprintf(split_paths[i],
+                 sizeof(split_paths[i]),
+                 "%s/chengcache/runtime_selflink/probe_split/%s",
+                 repo_root,
+                 PROGRAM_RUNTIME_SPLIT_NAMES[i]) <= 0 ||
+        strlen(split_paths[i]) >= sizeof(split_paths[i]) ||
+        access(split_paths[i], R_OK) != 0) {
+      return 0;
+    }
+  }
+  if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld", out_path, (long)getpid()) <= 0 ||
+      strlen(tmp_path) >= sizeof(tmp_path)) {
+    return 0;
+  }
+  unlink(tmp_path);
+  need = strlen("ld -r -o ") + driver_c_shell_quote_bytes(tmp_path) + strlen(" && mv ") +
+         driver_c_shell_quote_bytes(tmp_path) + driver_c_shell_quote_bytes(out_path) + 1u;
+  for (i = 0u; i < (sizeof(PROGRAM_RUNTIME_SPLIT_NAMES) / sizeof(PROGRAM_RUNTIME_SPLIT_NAMES[0]));
+       ++i) {
+    need += driver_c_shell_quote_bytes(split_paths[i]) + 1u;
+  }
+  cmd = (char *)malloc(need);
+  if (cmd == NULL) return 0;
+  cmd[0] = '\0';
+  memcpy(cmd + len, "ld -r -o ", strlen("ld -r -o "));
+  len += strlen("ld -r -o ");
+  cmd[len] = '\0';
+  if (!driver_c_shell_quote_append(cmd, need, &len, tmp_path)) {
+    free(cmd);
+    return 0;
+  }
+  for (i = 0u; i < (sizeof(PROGRAM_RUNTIME_SPLIT_NAMES) / sizeof(PROGRAM_RUNTIME_SPLIT_NAMES[0]));
+       ++i) {
+    cmd[len++] = ' ';
+    cmd[len] = '\0';
+    if (!driver_c_shell_quote_append(cmd, need, &len, split_paths[i])) {
+      free(cmd);
+      return 0;
+    }
+  }
+  memcpy(cmd + len, " && mv ", strlen(" && mv "));
+  len += strlen(" && mv ");
+  cmd[len] = '\0';
+  if (!driver_c_shell_quote_append(cmd, need, &len, tmp_path)) {
+    free(cmd);
+    return 0;
+  }
+  cmd[len++] = ' ';
+  cmd[len] = '\0';
+  if (!driver_c_shell_quote_append(cmd, need, &len, out_path)) {
+    free(cmd);
+    return 0;
+  }
+  if (system(cmd) != 0) {
+    free(cmd);
+    unlink(tmp_path);
+    return 0;
+  }
+  free(cmd);
+  unlink(tmp_path);
+  return access(out_path, R_OK) == 0 ? 1 : 0;
+}
+
 static char *driver_c_resolve_input_path(void) {
   char *cli = driver_c_cli_input_copy();
   if (cli != NULL && cli[0] != '\0') return cli;
@@ -2750,14 +2936,15 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
                                                        const char *target, const char *linker) {
   const char *target_text = (target != NULL) ? target : "";
   const char *linker_text = (linker != NULL && linker[0] != '\0') ? linker : "system";
-  const char *runtime_c = "/Users/lbcheng/cheng-lang/src/runtime/native/system_helpers.c";
   const char *runtime_obj = getenv("BACKEND_RUNTIME_OBJ");
-  const char *runtime_input = runtime_c;
+  const char *runtime_input = NULL;
   const char *cflags = getenv("BACKEND_CFLAGS");
   const char *ldflags = getenv("BACKEND_LDFLAGS");
   const char *cflags_text = (cflags != NULL) ? cflags : "";
   const char *ldflags_text = (ldflags != NULL) ? ldflags : "";
   const char *fast_darwin_adhoc_raw = getenv("BACKEND_DARWIN_FAST_ADHOC");
+  char runtime_input_buf[PATH_MAX];
+  char repo_root[PATH_MAX];
   char full_ldflags[512];
   char extra_ldflags[96];
   full_ldflags[0] = '\0';
@@ -2765,10 +2952,38 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
   if (output_path == NULL || output_path[0] == '\0') return -20;
   if (obj_path == NULL || obj_path[0] == '\0') return -21;
   if (strcmp(linker_text, "system") != 0) return -22;
-  if (driver_c_env_bool("BACKEND_NO_RUNTIME_C", 0) != 0 &&
-      runtime_obj != NULL && runtime_obj[0] != '\0' &&
-      access(runtime_obj, R_OK) == 0) {
+  runtime_input_buf[0] = '\0';
+  repo_root[0] = '\0';
+  if (runtime_obj != NULL && runtime_obj[0] != '\0') {
+    if (access(runtime_obj, R_OK) != 0) {
+      fprintf(stderr, "[driver_c_link_tmp_obj_default] missing_runtime_obj_env=%s\n", runtime_obj);
+      fflush(stderr);
+      return -29;
+    }
     runtime_input = runtime_obj;
+  } else if (driver_c_runtime_resolve_repo_root(repo_root, sizeof(repo_root)) &&
+             driver_c_runtime_materialize_program_runtime_obj(repo_root,
+                                                              target_text,
+                                                              runtime_input_buf,
+                                                              sizeof(runtime_input_buf))) {
+    runtime_input = runtime_input_buf;
+  } else {
+    if (repo_root[0] != '\0') {
+      if (runtime_input_buf[0] != '\0') {
+        fprintf(stderr,
+                "[driver_c_link_tmp_obj_default] missing_runtime_obj_default=%s\n",
+                runtime_input_buf);
+      } else {
+        fprintf(stderr,
+                "[driver_c_link_tmp_obj_default] missing_runtime_obj_default=%s/chengcache/runtime_selflink/program_runtime.combined.%s.o\n",
+                repo_root,
+                driver_c_runtime_cache_target(target_text));
+      }
+    } else {
+      fprintf(stderr, "[driver_c_link_tmp_obj_default] runtime_repo_root_unresolved=1\n");
+    }
+    fflush(stderr);
+    return -29;
   }
   const char *base = strrchr(obj_path, '/');
   const char *obj_name = (base != NULL) ? (base + 1) : obj_path;
@@ -2808,6 +3023,7 @@ CHENG_MINRT_WEAK int32_t driver_c_link_tmp_obj_default(const char *output_path, 
   if (getenv("BACKEND_DEBUG_LINK_CMD") != NULL) {
     fprintf(stderr, "[driver_c_link_tmp_obj_default] obj=%s out=%s target=%s sidecar=<bundle-only>\n",
             obj_path, output_path, target_text);
+    fprintf(stderr, "[driver_c_link_tmp_obj_default] runtime_input=%s\n", runtime_input);
     fprintf(stderr, "[driver_c_link_tmp_obj_default] cmd=%s\n", cmd);
     fprintf(stderr, "[driver_c_link_tmp_obj_default] darwin_fast_adhoc=%d needs_codesign=%d\n",
             fast_darwin_adhoc, needs_darwin_codesign);
@@ -2862,6 +3078,74 @@ typedef int32_t (*cheng_driver_bool_dummy_fn)(int32_t);
 
 static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_path_contains(const char *path, const char *needle) {
   return path != NULL && needle != NULL && strstr(path, needle) != NULL;
+}
+
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_repo_root_has_markers(const char *path) {
+  char authority_path[PATH_MAX];
+  char cache_dir[PATH_MAX];
+  struct stat st;
+  if (path == NULL || path[0] == '\0') return 0;
+  if (snprintf(authority_path, sizeof(authority_path), "%s/src/std/system_helpers_backend.cheng", path) <= 0 ||
+      strlen(authority_path) >= sizeof(authority_path) ||
+      access(authority_path, R_OK) != 0) {
+    return 0;
+  }
+  if (snprintf(cache_dir, sizeof(cache_dir), "%s/chengcache/runtime_selflink", path) <= 0 ||
+      strlen(cache_dir) >= sizeof(cache_dir) ||
+      stat(cache_dir, &st) != 0) {
+    return 0;
+  }
+  return S_ISDIR(st.st_mode) ? 1 : 0;
+}
+
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_repo_root_from_path(const char *start,
+                                                                                  char *out,
+                                                                                  size_t out_cap) {
+  char cursor[PATH_MAX];
+  char *slash = NULL;
+  size_t n = 0u;
+  if (start == NULL || start[0] == '\0' || out == NULL || out_cap == 0u) return 0;
+  n = strlen(start);
+  if (n >= sizeof(cursor)) return 0;
+  snprintf(cursor, sizeof(cursor), "%s", start);
+  while (cursor[0] != '\0') {
+    if (driver_c_runtime_repo_root_has_markers(cursor)) {
+      snprintf(out, out_cap, "%s", cursor);
+      return 1;
+    }
+    slash = strrchr(cursor, '/');
+    if (slash == NULL) break;
+    if (slash == cursor) {
+      cursor[1] = '\0';
+      if (driver_c_runtime_repo_root_has_markers(cursor)) {
+        snprintf(out, out_cap, "%s", cursor);
+        return 1;
+      }
+      break;
+    }
+    *slash = '\0';
+  }
+  return 0;
+}
+
+static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_repo_root(char *out, size_t out_cap) {
+  char cwd[PATH_MAX];
+  char exe_path[PATH_MAX];
+  char *slash = NULL;
+  if (out == NULL || out_cap == 0u) return 0;
+  out[0] = '\0';
+  if (getcwd(cwd, sizeof(cwd)) != NULL &&
+      driver_c_runtime_resolve_repo_root_from_path(cwd, out, out_cap)) {
+    return 1;
+  }
+  if (!driver_c_runtime_resolve_self_path(exe_path, sizeof(exe_path))) {
+    return 0;
+  }
+  slash = strrchr(exe_path, '/');
+  if (slash != NULL && slash != exe_path) {
+    *slash = '\0';
+  }
+  return driver_c_runtime_resolve_repo_root_from_path(exe_path, out, out_cap);
 }
 
 static CHENG_MINRT_MAYBE_UNUSED int driver_c_runtime_resolve_self_path(char *out, size_t out_cap) {

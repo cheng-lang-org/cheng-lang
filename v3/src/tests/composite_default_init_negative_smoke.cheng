@@ -1,174 +1,110 @@
-import std/os
-import cheng/v3/tooling/host_ops as hostops
-import cheng/v3/tooling/path as v3path
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/strings as strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn currentExecutablePath(root: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return os.JoinPath(root, raw)
+
+fn compileNegativeFixture(compiler: str,
+                          root: str,
+                          inputPath: str,
+                          outputPath: str,
+                          logPath: str): os.ExecCmdResult =
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    var compileArgv: str[] = []
+    add(compileArgv, "system-link-exec")
+    add(compileArgv, "--root")
+    add(compileArgv, root)
+    add(compileArgv, "--in")
+    add(compileArgv, inputPath)
+    add(compileArgv, "--emit")
+    add(compileArgv, "exe")
+    add(compileArgv, "--target")
+    add(compileArgv, target)
+    add(compileArgv, "--out")
+    add(compileArgv, outputPath)
+    var compileEnv: str[] = []
+    let compileRes = hostos.ExecFileCapture(compiler, compileArgv, compileEnv, root, true, 60)
+    let compileOutput = os.ExecCmdResultOutput(compileRes)
+    os.WriteFile(logPath, compileOutput)
+    return compileRes
 
 fn main(): int32 =
-    let root = os.getCurrentDir()
-    let outDir = v3path.v3PathAbsolute(root, "artifacts/v3_composite_default_negative_smoke")
-    assert(v3path.v3MkdirP(root, outDir), "v3 composite default negative: mkdir")
+    let root = os.GetCurrentDir()
+    let exePath = currentExecutablePath(root)
+    assert(len(exePath) > 0 && os.FileExists(exePath),
+           "v3 composite default negative: executable path")
+    let exeParts = os.SplitFile(exePath)
+    let exeDir = exeParts.dir
+    let exeName = exeParts.name
+    let workspaceName = exeName + ".workspace"
+    let outDir = os.JoinPath(exeDir, workspaceName)
+    ensureDir(outDir)
+    assert(os.DirExists(outDir), "v3 composite default negative: mkdir")
 
-    let compilerEnv = os.getEnv("CHENG_V3_SMOKE_COMPILER")
-    var compilerRaw = "artifacts/v3_backend_driver/cheng"
+    let compilerEnv = os.GetEnv("CHENG_V3_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/v3_bootstrap/cheng.stage3"
     if len(compilerEnv) > 0:
         compilerRaw = compilerEnv
-    let compiler = v3path.v3PathAbsolute(root, compilerRaw)
-    let pkgRoot = v3path.v3PathAbsolute(root, "v3")
-    assert(v3path.v3FileExistsNonEmpty(root, compiler),
+    var compiler = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        compiler = os.JoinPath(root, compilerRaw)
+    assert(os.FileExists(compiler),
            "v3 composite default negative: compiler exists")
 
-    let duplicateLog = v3path.v3PathJoin(outDir, "duplicate_field.compile.log")
-    let duplicateOut = v3path.v3PathJoin(outDir, "duplicate_field")
-    if v3path.v3PathFileExists(duplicateLog):
-        os.removeFile(duplicateLog)
-    if v3path.v3PathFileExists(duplicateOut):
-        os.removeFile(duplicateOut)
-    let duplicateRun = hostops.v3RunFileLogged(root,
-                                               "duplicate_field",
-                                               compiler,
-                                               [
-                                                   "system-link-exec",
-                                                   "--root",
-                                                   pkgRoot,
-                                                   "--in",
-                                                   v3path.v3PathAbsolute(root,
-                                                                         "v3/src/tests/composite_default_init_negative_duplicate_field.cheng"),
-                                                   "--emit",
-                                                   "exe",
-                                                   "--target",
-                                                   "arm64-apple-darwin",
-                                                   "--out",
-                                                   duplicateOut
-                                               ],
-                                               [],
-                                               root,
-                                               120,
-                                               duplicateLog)
-    assert(!hostops.v3LoggedRunOk(duplicateRun), "v3 composite default negative: duplicate field rejected")
-    assert(v3path.v3TextContains(duplicateRun.output, "duplicate constructor field"),
+    let duplicateLog = os.JoinPath(outDir, "duplicate_field.compile.log")
+    let duplicateIn = os.JoinPath(root, "v3/src/tests/composite_default_init_negative_duplicate_field.cheng")
+    let duplicateOut = os.JoinPath(outDir, "duplicate_field")
+    let duplicateRes = compileNegativeFixture(compiler, root, duplicateIn, duplicateOut, duplicateLog)
+    let duplicateOutput = os.ExecCmdResultOutput(duplicateRes)
+    assert(os.ExecCmdResultExitCode(duplicateRes) != 0, "v3 composite default negative: duplicate field rejected")
+    assert(strings.StrContains(duplicateOutput, "duplicate constructor field"),
            "v3 composite default negative: duplicate field diagnostic")
 
-    let siblingLog = v3path.v3PathJoin(outDir, "sibling_default.compile.log")
-    let siblingOut = v3path.v3PathJoin(outDir, "sibling_default")
-    if v3path.v3PathFileExists(siblingLog):
-        os.removeFile(siblingLog)
-    if v3path.v3PathFileExists(siblingOut):
-        os.removeFile(siblingOut)
-    let siblingRun = hostops.v3RunFileLogged(root,
-                                             "sibling_default",
-                                             compiler,
-                                             [
-                                                 "system-link-exec",
-                                                 "--root",
-                                                 pkgRoot,
-                                                 "--in",
-                                                 v3path.v3PathAbsolute(root,
-                                                                       "v3/src/tests/composite_default_init_negative_sibling_default.cheng"),
-                                                 "--emit",
-                                                 "exe",
-                                                 "--target",
-                                                 "arm64-apple-darwin",
-                                                 "--out",
-                                                 siblingOut
-                                             ],
-                                             [],
-                                             root,
-                                             120,
-                                             siblingLog)
-    assert(!hostops.v3LoggedRunOk(siblingRun), "v3 composite default negative: sibling field rejected")
-    assert(v3path.v3TextContains(siblingRun.output, "field default references sibling field"),
+    let siblingLog = os.JoinPath(outDir, "sibling_default.compile.log")
+    let siblingIn = os.JoinPath(root, "v3/src/tests/composite_default_init_negative_sibling_default.cheng")
+    let siblingOut = os.JoinPath(outDir, "sibling_default")
+    let siblingRes = compileNegativeFixture(compiler, root, siblingIn, siblingOut, siblingLog)
+    let siblingOutput = os.ExecCmdResultOutput(siblingRes)
+    assert(os.ExecCmdResultExitCode(siblingRes) != 0, "v3 composite default negative: sibling field rejected")
+    assert(strings.StrContains(siblingOutput, "field default references sibling field"),
            "v3 composite default negative: sibling field diagnostic")
 
-    let sideLog = v3path.v3PathJoin(outDir, "side_effect_default.compile.log")
-    let sideOut = v3path.v3PathJoin(outDir, "side_effect_default")
-    if v3path.v3PathFileExists(sideLog):
-        os.removeFile(sideLog)
-    if v3path.v3PathFileExists(sideOut):
-        os.removeFile(sideOut)
-    let sideRun = hostops.v3RunFileLogged(root,
-                                          "side_effect_default",
-                                          compiler,
-                                          [
-                                              "system-link-exec",
-                                              "--root",
-                                              pkgRoot,
-                                              "--in",
-                                              v3path.v3PathAbsolute(root,
-                                                                    "v3/src/tests/composite_default_init_negative_side_effect_default.cheng"),
-                                              "--emit",
-                                              "exe",
-                                              "--target",
-                                              "arm64-apple-darwin",
-                                              "--out",
-                                              sideOut
-                                          ],
-                                          [],
-                                          root,
-                                          120,
-                                          sideLog)
-    assert(!hostops.v3LoggedRunOk(sideRun), "v3 composite default negative: side effect rejected")
-    assert(v3path.v3TextContains(sideRun.output, "field default call unsupported"),
+    let sideLog = os.JoinPath(outDir, "side_effect_default.compile.log")
+    let sideIn = os.JoinPath(root, "v3/src/tests/composite_default_init_negative_side_effect_default.cheng")
+    let sideOut = os.JoinPath(outDir, "side_effect_default")
+    let sideRes = compileNegativeFixture(compiler, root, sideIn, sideOut, sideLog)
+    let sideOutput = os.ExecCmdResultOutput(sideRes)
+    assert(os.ExecCmdResultExitCode(sideRes) != 0, "v3 composite default negative: side effect rejected")
+    assert(strings.StrContains(sideOutput, "field default call unsupported"),
            "v3 composite default negative: side effect diagnostic")
 
-    let tupleLog = v3path.v3PathJoin(outDir, "tuple_omit.compile.log")
-    let tupleOut = v3path.v3PathJoin(outDir, "tuple_omit")
-    if v3path.v3PathFileExists(tupleLog):
-        os.removeFile(tupleLog)
-    if v3path.v3PathFileExists(tupleOut):
-        os.removeFile(tupleOut)
-    let tupleRun = hostops.v3RunFileLogged(root,
-                                           "tuple_omit",
-                                           compiler,
-                                           [
-                                               "system-link-exec",
-                                               "--root",
-                                               pkgRoot,
-                                               "--in",
-                                               v3path.v3PathAbsolute(root,
-                                                                     "v3/src/tests/composite_default_init_negative_tuple_omit.cheng"),
-                                               "--emit",
-                                               "exe",
-                                               "--target",
-                                               "arm64-apple-darwin",
-                                               "--out",
-                                               tupleOut
-                                           ],
-                                           [],
-                                           root,
-                                           120,
-                                           tupleLog)
-    assert(!hostops.v3LoggedRunOk(tupleRun), "v3 composite default negative: tuple omission rejected")
-    assert(v3path.v3TextContains(tupleRun.output, "tuple literal omission unsupported"),
+    let tupleLog = os.JoinPath(outDir, "tuple_omit.compile.log")
+    let tupleIn = os.JoinPath(root, "v3/src/tests/composite_default_init_negative_tuple_omit.cheng")
+    let tupleOut = os.JoinPath(outDir, "tuple_omit")
+    let tupleRes = compileNegativeFixture(compiler, root, tupleIn, tupleOut, tupleLog)
+    let tupleOutput = os.ExecCmdResultOutput(tupleRes)
+    assert(os.ExecCmdResultExitCode(tupleRes) != 0, "v3 composite default negative: tuple omission rejected")
+    assert(strings.StrContains(tupleOutput, "tuple literal omission unsupported"),
            "v3 composite default negative: tuple omission diagnostic")
 
-    let tupleCtorLog = v3path.v3PathJoin(outDir, "tuple_ctor_omit.compile.log")
-    let tupleCtorOut = v3path.v3PathJoin(outDir, "tuple_ctor_omit")
-    if v3path.v3PathFileExists(tupleCtorLog):
-        os.removeFile(tupleCtorLog)
-    if v3path.v3PathFileExists(tupleCtorOut):
-        os.removeFile(tupleCtorOut)
-    let tupleCtorRun = hostops.v3RunFileLogged(root,
-                                               "tuple_ctor_omit",
-                                               compiler,
-                                               [
-                                                   "system-link-exec",
-                                                   "--root",
-                                                   pkgRoot,
-                                                   "--in",
-                                                   v3path.v3PathAbsolute(root,
-                                                                         "v3/src/tests/composite_default_init_negative_tuple_ctor_omit.cheng"),
-                                                   "--emit",
-                                                   "exe",
-                                                   "--target",
-                                                   "arm64-apple-darwin",
-                                                   "--out",
-                                                   tupleCtorOut
-                                               ],
-                                               [],
-                                               root,
-                                               120,
-                                               tupleCtorLog)
-    assert(!hostops.v3LoggedRunOk(tupleCtorRun), "v3 composite default negative: tuple ctor omission rejected")
-    assert(v3path.v3TextContains(tupleCtorRun.output, "tuple literal omission unsupported"),
+    let tupleCtorLog = os.JoinPath(outDir, "tuple_ctor_omit.compile.log")
+    let tupleCtorIn = os.JoinPath(root, "v3/src/tests/composite_default_init_negative_tuple_ctor_omit.cheng")
+    let tupleCtorOut = os.JoinPath(outDir, "tuple_ctor_omit")
+    let tupleCtorRes = compileNegativeFixture(compiler, root, tupleCtorIn, tupleCtorOut, tupleCtorLog)
+    let tupleCtorOutput = os.ExecCmdResultOutput(tupleCtorRes)
+    assert(os.ExecCmdResultExitCode(tupleCtorRes) != 0, "v3 composite default negative: tuple ctor omission rejected")
+    assert(strings.StrContains(tupleCtorOutput, "tuple literal omission unsupported"),
            "v3 composite default negative: tuple ctor omission diagnostic")
 
     echo("v3 composite_default_init_negative_smoke ok")

@@ -1,0 +1,96 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/strings as strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn currentExecutablePath(root: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return os.JoinPath(root, raw)
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let exePath = currentExecutablePath(root)
+    assert(len(exePath) > 0 && os.FileExists(exePath),
+           "v3 export visibility negative: executable path")
+    let exeParts = os.SplitFile(exePath)
+    let exeDir = exeParts.dir
+    let exeName = exeParts.name
+    let outDirName = exeName + ".workspace"
+    let outDir = os.JoinPath(exeDir, outDirName)
+    ensureDir(outDir)
+    assert(os.DirExists(outDir), "v3 export visibility negative: mkdir")
+
+    let workspaceDir = os.JoinPath(outDir, "workspace")
+    let helperRoot = os.JoinPath(workspaceDir, "private_helper_pkg")
+    let helperSrcDir = os.JoinPath(helperRoot, "src")
+    let consumerRoot = os.JoinPath(workspaceDir, "private_consumer_pkg")
+    let consumerSrcDir = os.JoinPath(consumerRoot, "src")
+    let helperPkgFile = os.JoinPath(helperRoot, "cheng-package.toml")
+    let consumerPkgFile = os.JoinPath(consumerRoot, "cheng-package.toml")
+    let helperSrcFile = os.JoinPath(helperSrcDir, "helper.cheng")
+    let consumerSrcFile = os.JoinPath(consumerSrcDir, "main.cheng")
+    let helperPkgText = "package_id = \"pkg://cheng/private_helper_pkg\"\nmodule_prefix = \"private_helper_pkg\"\n"
+    let consumerPkgText = "package_id = \"pkg://cheng/private_consumer_pkg\"\nmodule_prefix = \"private_consumer_pkg\"\n"
+    let helperSrcText = "fn privateFn(): int32 =\n    return 1\n\nfn PublicFn(): int32 =\n    return 2\n"
+    let consumerSrcText = "import cheng/private_helper_pkg/helper as helper\n\nfn main(): int32 =\n    let x = helper.privateFn()\n    return x\n"
+    ensureDir(workspaceDir)
+    ensureDir(helperRoot)
+    ensureDir(helperSrcDir)
+    ensureDir(consumerRoot)
+    ensureDir(consumerSrcDir)
+    os.WriteFile(helperPkgFile, helperPkgText)
+    os.WriteFile(consumerPkgFile, consumerPkgText)
+    os.WriteFile(helperSrcFile, helperSrcText)
+    os.WriteFile(consumerSrcFile, consumerSrcText)
+
+    let compilerEnv = os.GetEnv("CHENG_V3_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/v3_bootstrap/cheng.stage3"
+    if len(compilerEnv) > 0:
+        compilerRaw = compilerEnv
+    var compiler = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        compiler = os.JoinPath(root, compilerRaw)
+    assert(os.FileExists(compiler),
+           "v3 export visibility negative: compiler exists")
+
+    let compileLog = os.JoinPath(outDir, "private_fn.compile.log")
+    let inputPath = consumerSrcFile
+    let outPath = os.JoinPath(outDir, "private_fn")
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    var compileArgv: str[] = []
+    add(compileArgv, "system-link-exec")
+    add(compileArgv, "--root")
+    add(compileArgv, consumerRoot)
+    add(compileArgv, "--in")
+    add(compileArgv, inputPath)
+    add(compileArgv, "--emit")
+    add(compileArgv, "exe")
+    add(compileArgv, "--target")
+    add(compileArgv, target)
+    add(compileArgv, "--out")
+    add(compileArgv, outPath)
+    var compileEnv: str[] = []
+    let compileRes = hostos.ExecFileCapture(
+        compiler,
+        compileArgv,
+        compileEnv,
+        root,
+        true,
+        60)
+    let compileOutput = os.ExecCmdResultOutput(compileRes)
+    os.WriteFile(compileLog, compileOutput)
+    assert(os.ExecCmdResultExitCode(compileRes) != 0, "v3 export visibility negative: private symbol rejected")
+    assert(strings.StrContains(compileOutput,
+                               "imported private symbol 'privateFn' is not exported"),
+           "v3 export visibility negative: diagnostic")
+
+    echo("v3 export_visibility_negative_smoke ok")
+    return 0

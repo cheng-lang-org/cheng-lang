@@ -115,10 +115,52 @@ const TOTAL_SURFACE_PLUS_APP_FRAME_ROUTE_EXTRA_CANDIDATES = {
   publish_sell: [1, 2, 3, 20, 21],
 };
 
+// Focused truth 已经实锤、而当前静态 surface 还没有完整建模的 route，
+// 先在共享层锁成确定计数，避免 route matrix 继续依赖入口 route 或过时候选。
 const FIXED_ROUTE_COUNTS = {
-  home_ziwei_overlay_open: [4],
-  game_doudizhu: [180],
+  content_detail: [44],
+  ecom_main: [945],
+  game_doudizhu: [202],
+  game_mahjong: [148],
+  game_minecraft: [48],
   game_werewolf: [83],
+  game_xiangqi: [83],
+  governance_main: [19],
+  group_draft: [34],
+  home_app_channel: [166],
+  home_bazi_overlay_open: [369],
+  home_default: [83],
+  home_channel_manager_open: [83],
+  home_content_detail_open: [83],
+  home_search_open: [83],
+  home_sort_open: [83],
+  home_ziwei_overlay_open: [495],
+  lang_select: [54],
+  marketplace_main: [187],
+  message_thread: [50],
+  node_detail: [42],
+  node_published_content: [21],
+  node_thread: [47],
+  publish_ad: [63],
+  publish_app: [82],
+  publish_content: [40],
+  publish_crowdfunding: [96],
+  publish_food: [94],
+  publish_hire: [99],
+  publish_job: [78],
+  publish_live: [35],
+  publish_product: [41],
+  publish_rent: [111],
+  publish_ride: [92],
+  publish_secondhand: [91],
+  publish_selector: [184],
+  publish_sell: [86],
+  tab_messages: [47],
+  tab_nodes: [60],
+  tab_profile: [115],
+  trading_crosshair: [118],
+  trading_main: [118],
+  update_center_main: [52],
 };
 
 const lucideIconNodeCountCache = new Map();
@@ -1038,6 +1080,25 @@ export function deriveExecRouteSnapshots(modules, baseSnapshot, routeState, uniq
   return merged;
 }
 
+function deriveAuthoritativeRouteSnapshots(baseSnapshot, routeState, repoRoot) {
+  const candidateGroups = [
+    deriveFixedRouteSnapshots(baseSnapshot, routeState),
+    deriveContentDetailTruthSnapshots(baseSnapshot, routeState),
+    deriveEcomTruthSnapshots(baseSnapshot, routeState, repoRoot),
+    deriveExactRenderedRouteSnapshots(baseSnapshot, routeState, repoRoot),
+  ];
+  const merged = [];
+  for (const group of candidateGroups) {
+    for (const candidate of group) {
+      const key = `${candidate[0]?.semantic_nodes_count ?? 0}:${candidate[1] ?? ''}`;
+      if (!merged.some((item) => `${item[0]?.semantic_nodes_count ?? 0}:${item[1] ?? ''}` === key)) {
+        merged.push(candidate);
+      }
+    }
+  }
+  return merged;
+}
+
 export function buildCodegenExecRouteMatrix(execSnapshot, snapshotPath, routeIds, runnerMode, modules, truthDoc = null, repoRoot = '') {
   const matrix = buildCodegenExecRouteMatrixZero();
   const uniqueComponents = buildUniqueComponentMap(modules);
@@ -1050,7 +1111,19 @@ export function buildCodegenExecRouteMatrix(execSnapshot, snapshotPath, routeIds
   }
   const entries = [];
   for (const route of ordered) {
+    const authoritativeCandidates = deriveAuthoritativeRouteSnapshots(execSnapshot, route, repoRoot);
     if (entryRoute && route === entryRoute) {
+      if (authoritativeCandidates.length > 0) {
+        const [authoritativeSnapshot, authoritativeReason] = authoritativeCandidates[0];
+        entries.push({
+          routeId: route,
+          supported: true,
+          reason: authoritativeReason,
+          snapshotPath: snapshotPath,
+          snapshot: authoritativeSnapshot,
+        });
+        continue;
+      }
       entries.push({
         routeId: route,
         supported: true,
@@ -1060,7 +1133,7 @@ export function buildCodegenExecRouteMatrix(execSnapshot, snapshotPath, routeIds
       });
       continue;
     }
-    if (entryRoute === 'home_default' && HOME_DEFAULT_EQUIVALENT_ROUTES.has(route)) {
+    if (entryRoute === 'home_default' && HOME_DEFAULT_EQUIVALENT_ROUTES.has(route) && authoritativeCandidates.length <= 0) {
       const aliasSnapshot = { ...execSnapshot, route_state: route };
       entries.push({
         routeId: route,
@@ -1146,7 +1219,20 @@ export function buildCodegenRouteCatalog(execSnapshot, routeIds, runnerMode, mod
   }
   const entries = [];
   for (const route of ordered) {
+    const authoritativeCandidates = deriveAuthoritativeRouteSnapshots(execSnapshot, route, repoRoot);
     if (entryRoute && route === entryRoute) {
+      if (authoritativeCandidates.length > 0) {
+        const candidates = normalizeRouteCandidateEntries(authoritativeCandidates);
+        entries.push({
+          routeId: route,
+          supported: true,
+          deterministic: candidates.length === 1,
+          reason: String(candidates[0]?.reason || 'authoritative_entry_surface') || 'authoritative_entry_surface',
+          candidateCount: candidates.length,
+          candidates,
+        });
+        continue;
+      }
       entries.push({
         routeId: route,
         supported: true,
@@ -1160,7 +1246,7 @@ export function buildCodegenRouteCatalog(execSnapshot, routeIds, runnerMode, mod
       });
       continue;
     }
-    if (entryRoute === 'home_default' && HOME_DEFAULT_EQUIVALENT_ROUTES.has(route)) {
+    if (entryRoute === 'home_default' && HOME_DEFAULT_EQUIVALENT_ROUTES.has(route) && authoritativeCandidates.length <= 0) {
       entries.push({
         routeId: route,
         supported: true,

@@ -1,6 +1,6 @@
 # Cheng backend runtime helpers (pure Cheng implementation).
 # This file is intended to be compiled as a runtime .o and linked into
-# backend-emitted executables to avoid compiling `system_helpers.c`.
+# backend-emitted executables as the pure Cheng runtime authority.
 import std/rawmem_support
 
 @importc("malloc")
@@ -92,7 +92,7 @@ fn cheng_strlen_runtime(s: ptr): int32 =
     if s == nil:
         return 0
     var n: int32 = 0
-    while *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), n))) != '\0':
+    while *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), n))) != '\0':
         n = n + 1
     return n
 fn cheng_memcpy_ffi_runtime(dest: ptr, src: ptr, n: int64): ptr =
@@ -113,13 +113,13 @@ fn cheng_bytes_copy(dst: ptr, src: ptr, n: int64) =
     if dst == nil || src == nil || n <= 0:
         return
     for i in 0..<n:
-        *(UInt8Ptr(rawmem_support.rawmemPtrAdd(dst, int32(i)))) = *(UInt8Ptr(rawmem_support.rawmemPtrAdd(src, int32(i))))
+        *(UInt8Ptr(rawmem_support.RawmemPtrAdd(dst, int32(i)))) = *(UInt8Ptr(rawmem_support.RawmemPtrAdd(src, int32(i))))
 fn cheng_bytes_set(dst: ptr, value: int32, n: int64) =
     if dst == nil || n <= 0:
         return
     let byteValue: uint8 = uint8(value & 255)
     for i in 0..<n:
-        *(UInt8Ptr(rawmem_support.rawmemPtrAdd(dst, int32(i)))) = byteValue
+        *(UInt8Ptr(rawmem_support.RawmemPtrAdd(dst, int32(i)))) = byteValue
 fn cheng_seq_get(buffer: ptr, len: int32, idx: int32, elemSize: int32): ptr =
     return cheng_index_ptr(buffer, len, idx, elemSize)
 fn cheng_seq_set(buffer: ptr, len: int32, idx: int32, elemSize: int32): ptr =
@@ -611,7 +611,7 @@ fn cheng_index_ptr(base: ptr, len: int32, idx: int32, elemSize: int32): ptr =
     if base == nil || elemSize <= 0:
         return base
     let off: int64 = int64(idx) * int64(elemSize)
-    return rawmem_support.rawmemPtrAdd(base, int32(off))
+    return rawmem_support.RawmemPtrAdd(base, int32(off))
 
 # Keep bootstrap cmdline stubs under non-exported names to avoid colliding
 # with std/cmdline symbols in whole-program self-link mode.
@@ -661,7 +661,7 @@ fn reserve(seq: ptr, newCap: int32) =
     if newBuf == nil:
         return
     if newBytes > oldBytes:
-        c_memset(rawmem_support.rawmemPtrAdd(newBuf, int32(oldBytes)), 0, newBytes - oldBytes)
+        c_memset(rawmem_support.RawmemPtrAdd(newBuf, int32(oldBytes)), 0, newBytes - oldBytes)
     seqHdr->buffer = newBuf
     seqHdr->cap = targetCap
 
@@ -708,7 +708,7 @@ fn cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr =
         if newCap > oldCap:
             let off: int64 = int64(oldCap) * int64(elemSize)
             let zeroBytes: int64 = (int64(newCap) - int64(oldCap)) * int64(elemSize)
-            c_memset(rawmem_support.rawmemPtrAdd(newBuf, int32(off)), 0, zeroBytes)
+            c_memset(rawmem_support.RawmemPtrAdd(newBuf, int32(off)), 0, zeroBytes)
         seqHdr->buffer = newBuf
         seqHdr->cap = newCap
     if needLen > seqHdr->len:
@@ -734,7 +734,7 @@ fn chengHeapNew(size: int32): ptr =
     memBlock->rc = 1
     memBlock->_pad = 0
     cheng_mem_link(scope, memBlock)
-    let payload: ptr = rawmem_support.rawmemPtrAdd(raw, int32(header))
+    let payload: ptr = rawmem_support.RawmemPtrAdd(raw, int32(header))
     cheng_ptrmap_put(payload, memBlock)
     cheng_mm_alloc_total = cheng_mm_alloc_total + 1
     cheng_mm_live_total = cheng_mm_live_total + 1
@@ -794,7 +794,7 @@ fn chengHeapResize(p: ptr, size: int32): ptr =
         if scope == nil:
             scope = cheng_mem_current()
         cheng_mem_link(scope, newBlock)
-        let payloadNew: ptr = rawmem_support.rawmemPtrAdd(rawNew, int32(header))
+        let payloadNew: ptr = rawmem_support.RawmemPtrAdd(rawNew, int32(header))
         cheng_ptrmap_put(payloadNew, newBlock)
         var copyBytes: int64 = memBlock->size
         if copyBytes > int64(n):
@@ -823,7 +823,7 @@ fn chengHeapResize(p: ptr, size: int32): ptr =
             if next != nil:
                 next->prev = resized
         cheng_ptrmap_del(p)
-        let payloadNew: ptr = rawmem_support.rawmemPtrAdd(resizedRaw, int32(header))
+        let payloadNew: ptr = rawmem_support.RawmemPtrAdd(resizedRaw, int32(header))
         cheng_ptrmap_put(payloadNew, resized)
         return payloadNew
     return p
@@ -846,7 +846,7 @@ fn cheng_mem_scope_pop() =
     let header: int32 = int32(sizeof ChengMemBlock)
     while cur != nil:
         let next: ChengMemBlockPtr = ChengMemBlockPtr(cur->next)
-        let payload: ptr = rawmem_support.rawmemPtrAdd(ptr(cur), header)
+        let payload: ptr = rawmem_support.RawmemPtrAdd(ptr(cur), header)
         cheng_ptrmap_del(payload)
         c_free(cur)
         cheng_mm_free_total = cheng_mm_free_total + 1
@@ -1426,7 +1426,7 @@ fn cheng_chan_i32_send(chPtr: ptr, value: int32): int32 =
     while ch->count >= ch->cap:
         if cheng_sched_run_once() == 0:
             return 0
-    store_int32(rawmem_support.rawmemPtrAdd(ch->buffer, int32(ch->tail * 4)), value)
+    store_int32(rawmem_support.RawmemPtrAdd(ch->buffer, int32(ch->tail * 4)), value)
     ch->tail = (ch->tail + 1) % ch->cap
     ch->count = ch->count + 1
     return 1
@@ -1438,7 +1438,7 @@ fn cheng_chan_i32_recv(chPtr: ptr, out: ptr): int32 =
     while ch->count == 0:
         if cheng_sched_run_once() == 0:
             return 0
-    store_int32(out, load_int32(rawmem_support.rawmemPtrAdd(ptr(ch->buffer), int32(ch->head * 4))))
+    store_int32(out, load_int32(rawmem_support.RawmemPtrAdd(ptr(ch->buffer), int32(ch->head * 4))))
     ch->head = (ch->head + 1) % ch->cap
     ch->count = ch->count - 1
     return 1
@@ -1488,7 +1488,7 @@ fn chanI32Recv(ch: ptr, out: ptr): int32 =
     return cheng_chan_i32_recv(ch, out)
 
 fn cheng_ffi_handle_slot_at(idx: int32): ChengFfiHandleSlotPtr =
-    return ChengFfiHandleSlotPtr(rawmem_support.rawmemPtrAdd(ptr(cheng_ffi_handle_slots), idx * int32(sizeof ChengFfiHandleSlot)))
+    return ChengFfiHandleSlotPtr(rawmem_support.RawmemPtrAdd(ptr(cheng_ffi_handle_slots), idx * int32(sizeof ChengFfiHandleSlot)))
 
 fn cheng_ffi_handle_ensure_capacity(minCap: int32): bool =
     if minCap <= cheng_ffi_handle_slots_cap:
@@ -1664,7 +1664,7 @@ fn cheng_abi_sum_seq_i32_raw(data: ptr, len: int32): int32 =
     var sum: int64 = 0
     var i: int32 = 0
     while i < len:
-        sum = sum + int64(load_int32(rawmem_support.rawmemPtrAdd(data, i * 4)))
+        sum = sum + int64(load_int32(rawmem_support.RawmemPtrAdd(data, i * 4)))
         i = i + 1
     return int32(sum)
 
@@ -1761,11 +1761,11 @@ fn cheng_abi_borrow_mut_pair_i32(pairPtr: int64, da: int32, db: int32) =
     if base == nil:
         return
     let pa: ptr = base
-    let pb: ptr = rawmem_support.rawmemPtrAdd(base, 4)
+    let pb: ptr = rawmem_support.RawmemPtrAdd(base, 4)
     store_int32(pa, load_int32(pa) + da)
     store_int32(pb, load_int32(pb) + db)
 
-# --- Minimal std/os + os.cheng backend runtime (Darwin/POSIX, AArch64) ---
+# --- Minimal std/os + os.Cheng backend runtime (Darwin/POSIX, AArch64) ---
 
 type
     DarwinTimespec =
@@ -1832,7 +1832,7 @@ fn cheng_strdup(s: ptr): ptr =
         return nil
     if n32 > 0:
         c_memcpy(out, ptr(s), int64(n32))
-    *(ptr(rawmem_support.rawmemPtrAdd(out, n32))) = '\0'
+    *(ptr(rawmem_support.RawmemPtrAdd(out, n32))) = '\0'
     return ptr(out)
 
 fn cheng_parse_f64_bits(s: ptr): int64 =
@@ -1841,13 +1841,13 @@ fn cheng_parse_f64_bits(s: ptr): int64 =
     var i: int32 = 0
     # Skip leading spaces (best-effort).
     while true:
-        let c: char = *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), i)))
+        let c: char = *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), i)))
         if cheng_is_space_char(c):
             i = i + 1
             continue
         break
     var neg: bool = false
-    let c0: char = *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), i)))
+    let c0: char = *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), i)))
     if c0 == '-':
         neg = true
         i = i + 1
@@ -1861,7 +1861,7 @@ fn cheng_parse_f64_bits(s: ptr): int64 =
     var intBits: int64 = zeroBits
     var anyDigit: bool = false
     while true:
-        let ch: char = *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), i)))
+        let ch: char = *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), i)))
         if !cheng_is_digit(ch):
             break
         anyDigit = true
@@ -1873,11 +1873,11 @@ fn cheng_parse_f64_bits(s: ptr): int64 =
     var fracBits: int64 = zeroBits
     var scaleBits: int64 = oneBits
     var anyFrac: bool = false
-    let dot: char = *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), i)))
+    let dot: char = *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), i)))
     if dot == '.':
         i = i + 1
         while true:
-            let ch: char = *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), i)))
+            let ch: char = *(ptr(rawmem_support.RawmemPtrAdd(ptr(s), i)))
             if !cheng_is_digit(ch):
                 break
             anyDigit = true
@@ -2028,13 +2028,14 @@ fn cheng_iometer_call(hook: ptr, op: int32, bytes: int64) =
 fn cheng_file_exists(path: ptr): int32 =
     if path == nil || *path == '\0':
         return 0
-    let mtime: int64 = cheng_file_mtime(path)
-    if mtime != 0:
-        return 1
-    let size: int64 = cheng_file_size(path)
-    if size > 0:
-        return 1
-    return 0
+    let d: ptr = libc_opendir(path)
+    if d != nil:
+        libc_closedir(d)
+        return 0
+    var st: DarwinStat
+    if libc_stat(path, ptr(&st)) != 0:
+        return 0
+    return 1
 
 fn cheng_dir_exists(path: ptr): int32 =
     if path == nil || *path == '\0':
@@ -2093,7 +2094,7 @@ fn cheng_getcwd(): ptr =
     if res == nil:
         *(ptr(cheng_getcwd_buf)) = '\0'
         return ""
-    *(ptr(rawmem_support.rawmemPtrAdd(cheng_getcwd_buf, 4095))) = '\0'
+    *(ptr(rawmem_support.RawmemPtrAdd(cheng_getcwd_buf, 4095))) = '\0'
     return ptr(cheng_getcwd_buf)
 
 fn cheng_system_entropy_fill(dst: ptr, len: int32): int32 =
@@ -2104,7 +2105,7 @@ fn cheng_system_entropy_fill(dst: ptr, len: int32): int32 =
         var chunk: int32 = len - offset
         if chunk > 256:
             chunk = 256
-        if libc_getentropy(rawmem_support.rawmemPtrAdd(dst, offset), chunk) != 0:
+        if libc_getentropy(rawmem_support.RawmemPtrAdd(dst, offset), chunk) != 0:
             return 0
         offset = offset + chunk
     return 1
@@ -2131,11 +2132,11 @@ fn cheng_list_dir(path: ptr): ptr =
         var nameLen: int32 = int32(nameLenU16)
         if nameLen <= 0:
             continue
-        let namePtr: ptr = ptr(rawmem_support.rawmemPtrAdd(entRaw, cheng_dirent_name_off))
+        let namePtr: ptr = ptr(rawmem_support.RawmemPtrAdd(entRaw, cheng_dirent_name_off))
         # Skip "." and ".."
         if nameLen == 1 && *namePtr == '.':
             continue
-        if nameLen == 2 && *namePtr == '.' && *(ptr(rawmem_support.rawmemPtrAdd(ptr(namePtr), 1))) == '.':
+        if nameLen == 2 && *namePtr == '.' && *(ptr(rawmem_support.RawmemPtrAdd(ptr(namePtr), 1))) == '.':
             continue
         # Ensure space: name + '\n' + '\0'
         var need: int32 = lenOut + nameLen + 2
@@ -2150,11 +2151,11 @@ fn cheng_list_dir(path: ptr): ptr =
                 break
             out = next
             cap = newCap
-        c_memcpy(rawmem_support.rawmemPtrAdd(out, lenOut), ptr(namePtr), int64(nameLen))
+        c_memcpy(rawmem_support.RawmemPtrAdd(out, lenOut), ptr(namePtr), int64(nameLen))
         lenOut = lenOut + nameLen
-        *(ptr(rawmem_support.rawmemPtrAdd(out, lenOut))) = '\n'
+        *(ptr(rawmem_support.RawmemPtrAdd(out, lenOut))) = '\n'
         lenOut = lenOut + 1
-        *(ptr(rawmem_support.rawmemPtrAdd(out, lenOut))) = '\0'
+        *(ptr(rawmem_support.RawmemPtrAdd(out, lenOut))) = '\0'
     libc_closedir(d)
     return ptr(out)
 
@@ -2165,26 +2166,26 @@ fn cheng_exec_cmd_store_exit_code(exitCode: ptr, code: int64): int32 =
     return 0
 
 fn cheng_exec_cmd_write_workdir_prefix(tmp: ptr, pos0: int64, workingDir: ptr, wdLen: int64): int64 =
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0)))) = uint8(99)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 1)))) = uint8(100)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 2)))) = uint8(32)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 3)))) = uint8(34)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0)))) = uint8(99)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 1)))) = uint8(100)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 2)))) = uint8(32)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 3)))) = uint8(34)
     let pos1: int64 = pos0 + 4
-    c_memcpy(rawmem_support.rawmemPtrAdd(tmp, int32(pos1)), ptr(workingDir), wdLen)
+    c_memcpy(rawmem_support.RawmemPtrAdd(tmp, int32(pos1)), ptr(workingDir), wdLen)
     let pos2: int64 = pos1 + wdLen
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos2)))) = uint8(34)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos2 + 1)))) = uint8(32)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos2 + 2)))) = uint8(38)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos2 + 3)))) = uint8(38)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos2 + 4)))) = uint8(32)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos2)))) = uint8(34)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos2 + 1)))) = uint8(32)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos2 + 2)))) = uint8(38)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos2 + 3)))) = uint8(38)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos2 + 4)))) = uint8(32)
     return pos2 + 5
 
 fn cheng_exec_cmd_write_merge_suffix(tmp: ptr, pos0: int64): int64 =
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0)))) = uint8(32)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 1)))) = uint8(50)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 2)))) = uint8(62)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 3)))) = uint8(38)
-    *(UInt8Ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos0 + 4)))) = uint8(49)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0)))) = uint8(32)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 1)))) = uint8(50)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 2)))) = uint8(62)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 3)))) = uint8(38)
+    *(UInt8Ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos0 + 4)))) = uint8(49)
     return pos0 + 5
 
 fn cheng_exec_cmd_ex(command: ptr, workingDir: ptr, mergeStderr: int32, exitCode: ptr): ptr =
@@ -2209,11 +2210,11 @@ fn cheng_exec_cmd_ex(command: ptr, workingDir: ptr, mergeStderr: int32, exitCode
     var pos: int64 = 0
     if hasWd:
         pos = cheng_exec_cmd_write_workdir_prefix(tmp, pos, workingDir, wdLen)
-    c_memcpy(rawmem_support.rawmemPtrAdd(tmp, int32(pos)), ptr(command), cmdLen)
+    c_memcpy(rawmem_support.RawmemPtrAdd(tmp, int32(pos)), ptr(command), cmdLen)
     pos = pos + cmdLen
     if hasMerge:
         pos = cheng_exec_cmd_write_merge_suffix(tmp, pos)
-    *(ptr(rawmem_support.rawmemPtrAdd(tmp, int32(pos)))) = '\0'
+    *(ptr(rawmem_support.RawmemPtrAdd(tmp, int32(pos)))) = '\0'
 
     let pipe: ptr = libc_popen(tmp, "r")
     c_free(tmp)
@@ -2240,12 +2241,12 @@ fn cheng_exec_cmd_ex(command: ptr, workingDir: ptr, mergeStderr: int32, exitCode
             out = next
             outCap = newCap
             continue
-        let dst: ptr = rawmem_support.rawmemPtrAdd(out, outLen)
+        let dst: ptr = rawmem_support.RawmemPtrAdd(out, outLen)
         let got: int64 = libc_fread(dst, 1, 4096, pipe)
         if got <= 0:
             break
         outLen = outLen + int32(got)
-        *(ptr(rawmem_support.rawmemPtrAdd(out, outLen))) = '\0'
+        *(ptr(rawmem_support.RawmemPtrAdd(out, outLen))) = '\0'
         if got < 4096:
             break
     let status: int32 = libc_pclose(pipe)
@@ -2322,24 +2323,24 @@ fn cheng_pty_wait(pid: int64, outExitCode: ptr): int32 =
 fn cheng_set_sockaddr_linux_inet(addr: ptr, port: int32, inaddr: int32) =
     cheng_bytes_set(addr, 0, cheng_sockaddr_in_len)
     *(uInt8Ptr(addr)) = uint8(cheng_af_inet)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 1))) = uint8(0)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 2))) = uint8((port >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 3))) = uint8(port & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 4))) = uint8((inaddr >> 24) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 5))) = uint8((inaddr >> 16) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 6))) = uint8((inaddr >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 7))) = uint8(inaddr & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 1))) = uint8(0)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 2))) = uint8((port >> 8) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 3))) = uint8(port & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 4))) = uint8((inaddr >> 24) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 5))) = uint8((inaddr >> 16) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 6))) = uint8((inaddr >> 8) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 7))) = uint8(inaddr & 0xFF)
 
 fn cheng_set_sockaddr_darwin_inet(addr: ptr, port: int32, inaddr: int32) =
     cheng_bytes_set(addr, 0, cheng_sockaddr_in_len)
     *(uInt8Ptr(addr)) = uint8(cheng_sockaddr_in_len)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 1))) = uint8(cheng_af_inet)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 2))) = uint8((port >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 3))) = uint8(port & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 4))) = uint8((inaddr >> 24) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 5))) = uint8((inaddr >> 16) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 6))) = uint8((inaddr >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 7))) = uint8(inaddr & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 1))) = uint8(cheng_af_inet)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 2))) = uint8((port >> 8) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 3))) = uint8(port & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 4))) = uint8((inaddr >> 24) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 5))) = uint8((inaddr >> 16) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 6))) = uint8((inaddr >> 8) & 0xFF)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 7))) = uint8(inaddr & 0xFF)
 
 fn cheng_bind_ipv4_listener(fd: int32, addr: ptr, port: int32, inaddr: int32): bool =
     cheng_set_sockaddr_linux_inet(addr, port, inaddr)
@@ -2404,8 +2405,8 @@ fn cheng_tcp_listener(port: int32, outPort: ptr): int32 =
             chengFreeCompat(namelen)
             chengFreeCompat(addr)
             return -1
-        let hiPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.rawmemPtrAdd(name, 2))))
-        let loPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.rawmemPtrAdd(name, 3))))
+        let hiPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.RawmemPtrAdd(name, 2))))
+        let loPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.RawmemPtrAdd(name, 3))))
         store_int32(outPort, (hiPortByte << 8) | loPortByte)
         chengFreeCompat(name)
         chengFreeCompat(namelen)
@@ -2469,7 +2470,7 @@ fn cheng_normalize_bind_sockaddr_darwin(addr: ptr, len: int32, needFree: BoolPtr
     if addr == nil || len != cheng_sockaddr_in_len:
         return addr
     let b0: uint8 = *(uInt8Ptr(addr))
-    let b1: uint8 = *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 1)))
+    let b1: uint8 = *(uInt8Ptr(rawmem_support.RawmemPtrAdd(addr, 1)))
     if b0 != uint8(cheng_af_inet) || b1 != uint8(0):
         return addr
     let normalized: ptr = chengAllocCompat(cheng_sockaddr_in_len)
@@ -2477,7 +2478,7 @@ fn cheng_normalize_bind_sockaddr_darwin(addr: ptr, len: int32, needFree: BoolPtr
         return addr
     cheng_bytes_copy(normalized, addr, int64(cheng_sockaddr_in_len))
     *(uInt8Ptr(normalized)) = uint8(cheng_sockaddr_in_len)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(normalized, 1))) = uint8(cheng_af_inet)
+    *(uInt8Ptr(rawmem_support.RawmemPtrAdd(normalized, 1))) = uint8(cheng_af_inet)
     if needFree != nil:
         *needFree = true
     return normalized

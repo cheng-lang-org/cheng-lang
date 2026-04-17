@@ -234,30 +234,43 @@ fn v3Libp2pStoreQueryFirst(entries: V3Libp2pStoreEntry[],
 fn v3Libp2pStoreQuery(entries: V3Libp2pStoreEntry[],
                       query: overlay.V3StoreQuery): overlay.V3IngressEnvelope[] =
     var out: overlay.V3IngressEnvelope[]
+    v3Libp2pStoreQueryFill(entries, query, out)
+    return out
+
+fn v3Libp2pAppendIngressClone(out: var overlay.V3IngressEnvelope[],
+                              ingress: overlay.V3IngressEnvelope) =
+    add(out, overlay.v3OverlayIngressEnvelopeZero())
+    let pos = out.len - 1
+    out[pos].sourcePeerId = ingress.sourcePeerId
+    out[pos].topicScope = ingress.topicScope
+    out[pos].address = ingress.address
+    out[pos].payloadKind = ingress.payloadKind
+    out[pos].payload = ingress.payload
+    out[pos].payloadCid = ingress.payloadCid
+    out[pos].payloadLen = ingress.payloadLen
+    out[pos].stampEpoch = ingress.stampEpoch
+    out[pos].stampGanzhi = ingress.stampGanzhi
+
+fn v3Libp2pStoreQueryFill(entries: V3Libp2pStoreEntry[],
+                          query: overlay.V3StoreQuery,
+                          out: var overlay.V3IngressEnvelope[]) =
     out = []
     for i in 0..<entries.len:
-        let entry = entries[i]
-        let ingress = entry.ingress
-        let ingressAddress = ingress.address
-        let queryAddress = query.address
-        let queryPrefix = query.prefix
-        let wantEventCid = query.wantEventCid
         let zeroCid = layout.fixedBytes32Zero()
-        let ingressPayloadCid = ingress.payloadCid
+        let ingress = entries[i].ingress
         if ingress.topicScope != query.topicScope:
             continue
-        if !types.v3LsmrAddressEqual(ingressAddress, queryAddress):
+        if !types.v3LsmrAddressEqual(ingress.address, query.address):
             continue
-        if queryPrefix.prefixDepth > 0:
-            if !v3Libp2pAddressMatchesPrefix(ingressAddress, queryPrefix):
+        if query.prefix.prefixDepth > 0:
+            if !v3Libp2pAddressMatchesPrefix(ingress.address, query.prefix):
                 continue
-        if !layout.fixedBytes32Equal(wantEventCid, zeroCid):
-            if !layout.fixedBytes32Equal(wantEventCid, ingressPayloadCid):
+        if !layout.fixedBytes32Equal(query.wantEventCid, zeroCid):
+            if !layout.fixedBytes32Equal(query.wantEventCid, ingress.payloadCid):
                 continue
-        add(out, ingress)
+        v3Libp2pAppendIngressClone(out, ingress)
         if query.rangeLimit > 0 && out.len >= query.rangeLimit:
             break
-    return out
 
 fn v3Libp2pSyncDigestFillFromEntries(out: var overlay.V3SyncDigest,
                                      sourcePeerId: core.V3Libp2pPeerId,
@@ -419,50 +432,57 @@ fn v3Libp2pStoreQueryEncode(query: overlay.V3StoreQuery): Bytes =
     return layout.byteBufToBytes(buf)
 
 fn v3Libp2pStoreQueryDecode(payload: Bytes): Result[overlay.V3StoreQuery] =
+    var out: overlay.V3StoreQuery
+    let fillRes = v3Libp2pStoreQueryDecodeFill(payload, out)
+    if IsErr(fillRes):
+        return Err[overlay.V3StoreQuery](Error(fillRes))
+    return Ok[overlay.V3StoreQuery](out)
+
+fn v3Libp2pStoreQueryDecodeFill(payload: Bytes,
+                                out: var overlay.V3StoreQuery): Result[bool] =
     if !v3Libp2pSyncPayloadHasQueryMagic(payload):
-        return Err[overlay.V3StoreQuery]("v3 libp2p sync: invalid query magic")
+        return Err[bool]("v3 libp2p sync: invalid query magic")
     let magicLen = v3Libp2pSyncQueryMagicLen
     let span = layout.byteSpanFromBytes(payload)
     let versionRes = codec.v3ReadU32BE(span, magicLen)
     if IsErr(versionRes):
-        return Err[overlay.V3StoreQuery](Error(versionRes))
+        return Err[bool](Error(versionRes))
     if int32(Value(versionRes)) != v3Libp2pStoreSyncCodecVersion:
-        return Err[overlay.V3StoreQuery]("v3 libp2p sync: unsupported query version")
+        return Err[bool]("v3 libp2p sync: unsupported query version")
     var next = magicLen + 4
     let sourcePeerRes = codec.v3ReadFixed32(span, next)
     if IsErr(sourcePeerRes):
-        return Err[overlay.V3StoreQuery](Error(sourcePeerRes))
+        return Err[bool](Error(sourcePeerRes))
     next = next + 32
     let scopeRes = codec.v3ReadU32BE(span, next)
     if IsErr(scopeRes):
-        return Err[overlay.V3StoreQuery](Error(scopeRes))
+        return Err[bool](Error(scopeRes))
     next = next + 4
     var address: types.V3LsmrAddress
     let addressNextRes = v3StoreSyncReadAddress(payload, next, address)
     if IsErr(addressNextRes):
-        return Err[overlay.V3StoreQuery](Error(addressNextRes))
+        return Err[bool](Error(addressNextRes))
     next = Value(addressNextRes)
     var prefix: lt.V3PrefixRef
     let prefixNextRes = v3StoreSyncReadPrefix(payload, next, prefix)
     if IsErr(prefixNextRes):
-        return Err[overlay.V3StoreQuery](Error(prefixNextRes))
+        return Err[bool](Error(prefixNextRes))
     next = Value(prefixNextRes)
     let forestCidRes = codec.v3ReadFixed32(span, next)
     if IsErr(forestCidRes):
-        return Err[overlay.V3StoreQuery](Error(forestCidRes))
+        return Err[bool](Error(forestCidRes))
     next = next + 32
     let eventCidRes = codec.v3ReadFixed32(span, next)
     if IsErr(eventCidRes):
-        return Err[overlay.V3StoreQuery](Error(eventCidRes))
+        return Err[bool](Error(eventCidRes))
     next = next + 32
     let rangeStartRes = codec.v3ReadU32BE(span, next)
     if IsErr(rangeStartRes):
-        return Err[overlay.V3StoreQuery](Error(rangeStartRes))
+        return Err[bool](Error(rangeStartRes))
     next = next + 4
     let rangeLimitRes = codec.v3ReadU32BE(span, next)
     if IsErr(rangeLimitRes):
-        return Err[overlay.V3StoreQuery](Error(rangeLimitRes))
-    var out: overlay.V3StoreQuery
+        return Err[bool](Error(rangeLimitRes))
     out = overlay.v3OverlayStoreQueryZero()
     out.sourcePeerId = Value(sourcePeerRes)
     out.topicScope = int32(Value(scopeRes))
@@ -472,7 +492,7 @@ fn v3Libp2pStoreQueryDecode(payload: Bytes): Result[overlay.V3StoreQuery] =
     out.wantEventCid = Value(eventCidRes)
     out.rangeStart = int32(Value(rangeStartRes))
     out.rangeLimit = int32(Value(rangeLimitRes))
-    return Ok[overlay.V3StoreQuery](out)
+    return Ok[bool](true)
 
 fn v3Libp2pStoreEntriesEncode(entries: overlay.V3IngressEnvelope[]): Bytes =
     var buf: layout.ByteBuf
@@ -510,7 +530,7 @@ fn v3Libp2pStoreEntriesDecodeFill(payload: Bytes,
         if IsErr(nextRes):
             return Err[bool](Error(nextRes))
         next = Value(nextRes)
-        add(out, ingress)
+        v3Libp2pAppendIngressClone(out, ingress)
     return Ok[bool](true)
 
 fn v3Libp2pStoreEntriesDecode(payload: Bytes): Result[overlay.V3IngressEnvelope[]] =
@@ -522,8 +542,10 @@ fn v3Libp2pStoreEntriesDecode(payload: Bytes): Result[overlay.V3IngressEnvelope[
 
 fn v3Libp2pSyncServePayload(entries: V3Libp2pStoreEntry[],
                             requestPayload: Bytes): Result[Bytes] =
-    let queryRes = v3Libp2pStoreQueryDecode(requestPayload)
+    var query: overlay.V3StoreQuery
+    let queryRes = v3Libp2pStoreQueryDecodeFill(requestPayload, query)
     if IsErr(queryRes):
         return Err[Bytes](Error(queryRes))
-    let responseEntries = v3Libp2pStoreQuery(entries, Value(queryRes))
+    var responseEntries: overlay.V3IngressEnvelope[]
+    v3Libp2pStoreQueryFill(entries, query, responseEntries)
     return Ok[Bytes](v3Libp2pStoreEntriesEncode(responseEntries))

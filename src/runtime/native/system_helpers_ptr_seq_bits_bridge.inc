@@ -12,7 +12,7 @@
 
 /*
  * compiler-core support objects link a minimal native closure, so keep these
- * small runtime helpers available without pulling in the full system_helpers.c.
+ * small runtime helpers available without pulling in the full legacy helper bundle.
  */
 CHENG_PTR_SEQ_BITS_WEAK void *cheng_ptr_seq_get_compat(ChengSeqHeader seq, int32_t idx) {
   void *out = NULL;

@@ -16,6 +16,7 @@ function parseArgs(argv) {
     debugPort: 0,
     waitMs: 20000,
     summaryOut: '',
+    screenshotOut: '',
   }
   for (let i = 2; i < argv.length; i += 1) {
     const a = argv[i]
@@ -29,11 +30,12 @@ function parseArgs(argv) {
     else if (a === '--debug-port') out.debugPort = Number(argv[++i] || out.debugPort)
     else if (a === '--wait-ms') out.waitMs = Number(argv[++i] || out.waitMs)
     else if (a === '--summary-out') out.summaryOut = String(argv[++i] || '')
+    else if (a === '--screenshot-out') out.screenshotOut = String(argv[++i] || '')
     else if (a === '-h' || a === '--help') {
       console.log(
         'Usage: r2c-react-v3-truth-runtime.mjs --route <state> --out-dir <dir> ' +
         '[--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] ' +
-        '[--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>] [--summary-out <file>]'
+        '[--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>] [--summary-out <file>] [--screenshot-out <file>]'
       )
       process.exit(0)
     }
@@ -157,8 +159,34 @@ async function captureRuntime(args) {
     ws = new WebSocket(target.webSocketDebuggerUrl)
     let seq = 0
     const pending = new Map()
+    const consoleMessages = []
+    const exceptionMessages = []
     ws.onmessage = (event) => {
       const msg = JSON.parse(event.data)
+      if (msg.method === 'Runtime.consoleAPICalled') {
+        consoleMessages.push({
+          type: msg.params?.type || '',
+          args: Array.isArray(msg.params?.args)
+            ? msg.params.args.map((entry) => ({
+                type: entry?.type || '',
+                value: Object.prototype.hasOwnProperty.call(entry || {}, 'value') ? entry.value : null,
+                description: entry?.description || '',
+              }))
+            : [],
+          timestamp: msg.params?.timestamp || 0,
+        })
+        return
+      }
+      if (msg.method === 'Runtime.exceptionThrown') {
+        exceptionMessages.push({
+          text: msg.params?.exceptionDetails?.text || '',
+          url: msg.params?.exceptionDetails?.url || '',
+          lineNumber: msg.params?.exceptionDetails?.lineNumber ?? -1,
+          columnNumber: msg.params?.exceptionDetails?.columnNumber ?? -1,
+          description: msg.params?.exceptionDetails?.exception?.description || '',
+        })
+        return
+      }
       if (!msg.id) return
       const entry = pending.get(msg.id)
       if (!entry) return
@@ -177,13 +205,73 @@ async function captureRuntime(args) {
     }
     await call('Page.enable')
     await call('Runtime.enable')
+    await call('Emulation.setDeviceMetricsOverride', {
+      width: args.width,
+      height: args.height,
+      deviceScaleFactor: 1,
+      mobile: false,
+      screenWidth: args.width,
+      screenHeight: args.height,
+    })
+    await call('Page.navigate', {
+      url,
+    })
 
     let runtimeState = null
     let domHtml = ''
+    let screenshotPng = null
     let semanticNodeCount = 0
     let semanticNodesDoc = null
     let documentNodeCount = 0
     let locationDoc = null
+    const collectFailureContext = async () => {
+      const evaluateText = async (expression) => {
+        try {
+          const result = await call('Runtime.evaluate', {
+            expression,
+            returnByValue: true,
+          })
+          return result?.result?.value ?? null
+        } catch (error) {
+          return `cdp_eval_failed:${error instanceof Error ? error.message : String(error)}`
+        }
+      }
+      const debugContext = {
+        route: args.route,
+        url,
+        readyState: await evaluateText('document.readyState'),
+        location: await evaluateText('JSON.stringify({ pathname: window.location.pathname, search: window.location.search, hash: window.location.hash, href: window.location.href })'),
+        title: await evaluateText('document.title'),
+        rootState: await evaluateText(`(() => {
+          const root = document.getElementById("root");
+          if (!root) {
+            return JSON.stringify({
+              exists: false,
+              bodyChildCount: document.body ? document.body.children.length : -1,
+              bodyTextPreview: String(document.body?.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 512),
+              bodyHtmlPreview: String(document.body?.innerHTML || "").slice(0, 1024),
+            });
+          }
+          return JSON.stringify({
+            exists: true,
+            childCount: root.children.length,
+            textPreview: String(root.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 512),
+            htmlPreview: String(root.innerHTML || "").slice(0, 2048),
+          });
+        })()`),
+        runtimeStateText: await evaluateText('JSON.stringify(window.__UNIMAKER_R2C_RUNTIME_STATE || null)'),
+        consoleMessages,
+        exceptionMessages,
+      }
+      const debugPath = path.join(args.outDir, `${args.route}.runtime_failure_v1.json`)
+      fs.writeFileSync(debugPath, `${JSON.stringify(debugContext, null, 2)}\n`, 'utf8')
+      writeSidecarSummary(args.summaryOut ? path.resolve(args.summaryOut) : '', {
+        ok: false,
+        route: args.route,
+        runtime_failure_path: debugPath,
+      })
+      return debugPath
+    }
     const deadline = Date.now() + args.waitMs
     while (Date.now() < deadline) {
       const stateRes = await call('Runtime.evaluate', {
@@ -198,6 +286,12 @@ async function captureRuntime(args) {
           returnByValue: true,
         })
         domHtml = String(domRes?.result?.value || '')
+        const screenshotRes = await call('Page.captureScreenshot', {
+          format: 'png',
+          fromSurface: true,
+        })
+        const screenshotBase64 = String(screenshotRes?.data || '')
+        screenshotPng = screenshotBase64 ? Buffer.from(screenshotBase64, 'base64') : null
         const semanticCountRes = await call('Runtime.evaluate', {
           expression: '(() => { const root = document.getElementById(\"root\"); if (!root) return -1; return root.querySelectorAll(\"*\").length + 1; })()',
           returnByValue: true,
@@ -275,15 +369,23 @@ async function captureRuntime(args) {
       await sleep(250)
     }
     if (!runtimeState) {
-      throw new Error(`runtime_state_missing ${chromeStderr}`.trim())
+      const debugPath = await collectFailureContext()
+      throw new Error(`runtime_state_missing debug=${debugPath} ${chromeStderr}`.trim())
     }
     const runtimeStatePath = path.join(args.outDir, `${args.route}.runtime_state.json`)
     const domPath = path.join(args.outDir, `${args.route}.dom.html`)
     const metaPath = path.join(args.outDir, `${args.route}.runtime_meta.json`)
     const truthTracePath = path.join(args.outDir, `${args.route}.truth_trace_v2.json`)
     const semanticNodesPath = path.join(args.outDir, `${args.route}.semantic_dom_nodes_v1.json`)
+    const screenshotPath = path.resolve(args.screenshotOut || path.join(args.outDir, `${args.route}.screenshot.png`))
     const crypto = await import('node:crypto')
     const domHash = crypto.createHash('sha256').update(domHtml, 'utf8').digest('hex')
+    let screenshotHash = ''
+    if (screenshotPng && screenshotPng.length > 0) {
+      fs.mkdirSync(path.dirname(screenshotPath), { recursive: true })
+      fs.writeFileSync(screenshotPath, screenshotPng)
+      screenshotHash = crypto.createHash('sha256').update(screenshotPng).digest('hex')
+    }
     const locationDocResolved = locationDoc || { pathname: '/', search: '', hash: '' }
     const timestampMs = Date.now()
     const capturedAt = new Date(timestampMs).toISOString()
@@ -308,11 +410,13 @@ async function captureRuntime(args) {
           domPath,
           domHash,
           runtimeStatePath,
-          semanticNodesPath,
-          semanticNodesCount: semanticNodeCount,
-          renderReady: true,
-          storage: [],
-          hostEvents: [],
+        semanticNodesPath,
+        semanticNodesCount: semanticNodeCount,
+        screenshotPath,
+        screenshotHash,
+        renderReady: true,
+        storage: [],
+        hostEvents: [],
           timestampMs,
         },
       ],
@@ -329,6 +433,8 @@ async function captureRuntime(args) {
         runtime_state_path: runtimeStatePath,
         dom_path: domPath,
         dom_hash: domHash,
+        screenshot_path: screenshotPath,
+        screenshot_hash: screenshotHash,
         semantic_nodes_path: semanticNodesPath,
         semantic_nodes_count: semanticNodeCount,
         document_nodes_count: documentNodeCount,
@@ -343,6 +449,8 @@ async function captureRuntime(args) {
       truth_trace_state_count: 1,
       runtime_state_path: runtimeStatePath,
       dom_path: domPath,
+      screenshot_path: screenshotPath,
+      screenshot_sha256: screenshotHash,
       semantic_nodes_path: semanticNodesPath,
       runtime_meta_path: metaPath,
       dom_hash: domHash,
@@ -359,6 +467,8 @@ async function captureRuntime(args) {
       truth_trace_path: truthTracePath,
       runtime_state_path: runtimeStatePath,
       dom_path: domPath,
+      screenshot_path: screenshotPath,
+      screenshot_sha256: screenshotHash,
       semantic_nodes_path: semanticNodesPath,
       dom_hash: domHash,
       semantic_nodes_count: semanticNodeCount,

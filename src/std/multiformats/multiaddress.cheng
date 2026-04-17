@@ -145,10 +145,15 @@ fn readSegment(text: str, start: int32): Result[SegmentRead] =
     if start >= len(text):
         return Err[SegmentRead]("multiaddress: trailing slash")
     var i: int32 = start
-    while i < len(text) && text[i] != '/':
+    while i < len(text):
+        if text[i] == '/':
+            break
         i = i + 1
-    let seg: str = ustrings.sliceBytes(text, start, i - start)
-    let next: int32 = if i < len(text) && text[i] == '/': i + 1 else: i
+    let seg: str = ustrings.SliceBytes(text, start, i - start)
+    var next: int32 = i
+    if i < len(text):
+        if text[i] == '/':
+            next = i + 1
     var out: SegmentRead
     out.seg = seg
     out.next = next
@@ -170,7 +175,12 @@ fn parseIPv4(text: str): Result[Bytes] =
     var start: int32 = 0
     var parts: int32 = 0
     for i in 0..len(text):
-        if i == len(text) || text[i] == '.':
+        var partEnd: bool = false
+        if i == len(text):
+            partEnd = true
+        elif text[i] == '.':
+            partEnd = true
+        if partEnd:
             let count: int32 = i - start
             let partRes: Result[int32] = parseUIntRange(text, start, count)
             if IsErr(partRes):
@@ -223,10 +233,18 @@ fn parseIPv6(text: str): Result[Bytes] =
     var segmentStart: int32 = 0
     while i <= len(text):
         let atEnd: bool = i == len(text)
-        let isColon: bool = (! atEnd) && text[i] == ':'
+        var isColon: bool = false
+        if !atEnd:
+            if text[i] == ':':
+                isColon = true
         if atEnd || isColon:
             if i == segmentStart:
-                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                var isDoubleColon: bool = false
+                if isColon:
+                    if i + 1 < len(text):
+                        if text[i + 1] == ':':
+                            isDoubleColon = true
+                if isDoubleColon:
                     if seenCompress:
                         return Err[Bytes]("multiaddress: ip6 multiple ::")
                     seenCompress = true
@@ -251,7 +269,12 @@ fn parseIPv6(text: str): Result[Bytes] =
                         return Err[Bytes]("multiaddress: ip6 parts")
                     writeHextet(tail, tailCount, value)
                     tailCount = tailCount + 1
-                if isColon && i + 1 < len(text) && text[i + 1] == ':':
+                var isDoubleColon: bool = false
+                if isColon:
+                    if i + 1 < len(text):
+                        if text[i + 1] == ':':
+                            isDoubleColon = true
+                if isDoubleColon:
                     if seenCompress:
                         return Err[Bytes]("multiaddress: ip6 multiple ::")
                     seenCompress = true
@@ -314,8 +337,8 @@ fn splitHostPort(text: str): Result[HostPortPair] =
             colon = i
     if colon <= 0 || colon >= len(text) - 1:
         return Err[HostPortPair]("multiaddress: invalid onion")
-    let host: str = ustrings.sliceBytes(text, 0, colon)
-    let port: str = ustrings.sliceBytes(text, colon + 1, len(text) - colon - 1)
+    let host: str = ustrings.SliceBytes(text, 0, colon)
+    let port: str = ustrings.SliceBytes(text, colon + 1, len(text) - colon - 1)
     let out: HostPortPair = HostPortPair(host: host, port: port)
     return Ok[HostPortPair](out)
 
@@ -364,7 +387,12 @@ fn parsePort(text: str): Result[Bytes] =
 fn parsePeerIdBytes(text: str): Result[Bytes] =
     if len(text) <= 0:
         return Err[Bytes]("multiaddress: empty peer id")
-    if len(text) >= 2 && text[0] == 'Q' && text[1] == 'm':
+    var isLegacyBase58: bool = false
+    if len(text) >= 2:
+        if text[0] == 'Q':
+            if text[1] == 'm':
+                isLegacyBase58 = true
+    if isLegacyBase58:
         let b58Res: Result[Bytes] = decodeBase58(text)
         if IsErr(b58Res):
             return Err[Bytes](Error(b58Res))
@@ -515,7 +543,11 @@ fn ipv6ToString(data: Bytes): str =
             let hi: int32 = bytesGet(data, i * 2)
             let lo: int32 = bytesGet(data, i * 2 + 1)
             let value: int32 = (hi << 8) + lo
-            if len(out) > 0 && out[len(out) - 1] != ':':
+            var needsSep: bool = false
+            if len(out) > 0:
+                if out[len(out) - 1] != ':':
+                    needsSep = true
+            if needsSep:
                 out = out + ":"
             out = out + hextetToString(value)
             i = i + 1

@@ -18,6 +18,17 @@ fn cheng_pipe_spawn_bridge_last_read_fd(): int32
 fn cheng_pipe_spawn_bridge_last_write_fd(): int32
 @importc("cheng_pipe_spawn_bridge_last_pid_i32")
 fn cheng_pipe_spawn_bridge_last_pid_i32(): int32
+@importc("cheng_v3_exec_file_pipe_spawn_bridge")
+fn cheng_v3_exec_file_pipe_spawn_bridge(filePath: cstring,
+                                        argvWire: str,
+                                        envWire: str,
+                                        workingDir: cstring): int32
+@importc("cheng_v3_exec_file_pipe_spawn_bridge_last_read_fd")
+fn cheng_v3_exec_file_pipe_spawn_bridge_last_read_fd(): int32
+@importc("cheng_v3_exec_file_pipe_spawn_bridge_last_write_fd")
+fn cheng_v3_exec_file_pipe_spawn_bridge_last_write_fd(): int32
+@importc("cheng_v3_exec_file_pipe_spawn_bridge_last_pid_i32")
+fn cheng_v3_exec_file_pipe_spawn_bridge_last_pid_i32(): int32
 @importc("cheng_pty_read_bridge")
 fn cheng_pty_read_bridge(fd: int32, maxBytes: int32): cstring
 @importc("cheng_pty_read_bridge_last_eof")
@@ -30,6 +41,16 @@ fn cheng_fd_read_bridge_last_eof(): int32
 fn cheng_fd_read_wait_bridge(fd: int32, maxBytes: int32, timeoutMs: int32): cstring
 @importc("cheng_fd_read_wait_bridge_last_eof")
 fn cheng_fd_read_wait_bridge_last_eof(): int32
+@importc("cheng_v3_exec_program_capture_timeout_bridge")
+fn cheng_v3_exec_program_capture_timeout_bridge(programName: cstring,
+                                                argvWire: str,
+                                                envWire: str,
+                                                workingDir: cstring,
+                                                mergeStderr: int32,
+                                                timeoutSec: int32,
+                                                exitCode: var int64): cstring
+@importc("cheng_v3_exec_program_capture_bridge_dispose")
+fn cheng_v3_exec_program_capture_bridge_dispose(raw: cstring)
 @importc("cheng_pty_write_bridge")
 fn cheng_pty_write_bridge(fd: int32, data: cstring, len: int32): int32
 @importc("cheng_pty_close_bridge")
@@ -49,20 +70,28 @@ fn osHostProcessCommandText(filePath: str, argv: str[], envOverrides: str[]): st
         out = "env"
         for i in 0..<envOverrides.len:
             let envText = envOverrides[i]
-            if strings.len(envText) > 0:
+            if strings.Len(envText) > 0:
                 out = out + " "
-                out = out + os.quoteShell(envText)
-    if strings.len(filePath) > 0:
-        if strings.len(out) > 0:
+                out = out + os.QuoteShell(envText)
+    if strings.Len(filePath) > 0:
+        if strings.Len(out) > 0:
             out = out + " "
-        out = out + os.quoteShell(filePath)
+        out = out + os.QuoteShell(filePath)
     for i in 0..<argv.len:
         out = out + " "
-        out = out + os.quoteShell(argv[i])
+        out = out + os.QuoteShell(argv[i])
     return out
 
 fn osHostProcessStdoutOnlyCommand(command: str): str =
     return command + " 2>/dev/null"
+
+fn osHostProcessEncodeWire(items: str[]): str =
+    var out = ""
+    let sep = strings.CharToStr('\0')
+    for i in 0..<items.len:
+        out = out + items[i]
+        out = out + sep
+    return out
 
 fn osHostProcessCloseFd(fd: var int32) =
     if fd >= 0:
@@ -75,7 +104,7 @@ fn osHostProcessDrainReadFd(readFd: var int32, output: var str, timeoutMs: int32
     var waitMs = timeoutMs
     while readFd >= 0:
         let readRes = fdReadWait(readFd, 65536, waitMs)
-        if strings.len(readRes.text) > 0:
+        if strings.Len(readRes.text) > 0:
             output = output + readRes.text
             waitMs = 0
             continue
@@ -84,7 +113,7 @@ fn osHostProcessDrainReadFd(readFd: var int32, output: var str, timeoutMs: int32
         break
 
 fn osHostProcessPipeSpawnCommand(command: str, workingDir: str): os.ExecFilePipeSpawnResult =
-    if strings.len(command) == 0:
+    if strings.Len(command) == 0:
         return os.ExecFilePipeSpawnResult(ok: false, readFd: -1, writeFd: -1, pid: -1)
     var readFd: int32 = -1
     var writeFd: int32 = -1
@@ -105,7 +134,7 @@ fn osHostProcessPipeSpawnCommandFill(command: str, workingDir: str,
     outWriteFd = -1
     outPid = -1
     outOk = false
-    if strings.len(command) == 0:
+    if strings.Len(command) == 0:
         return
     let commandText: cstring = strToCStringTemp(command)
     let workingDirText: cstring = strToCStringTemp(workingDir)
@@ -117,129 +146,56 @@ fn osHostProcessPipeSpawnCommandFill(command: str, workingDir: str,
 
 fn osHostProcessExecFilePipeSpawn(filePath: str, argv: str[], envOverrides: str[],
                                   workingDir: str): os.ExecFilePipeSpawnResult =
-    if strings.len(filePath) == 0:
+    if strings.Len(filePath) == 0:
         return os.ExecFilePipeSpawnResult(ok: false, readFd: -1, writeFd: -1, pid: -1)
-    let command: str = osHostProcessCommandText(filePath, argv, envOverrides)
-    return osHostProcessPipeSpawnCommand(command, workingDir)
+    let argvWire = osHostProcessEncodeWire(argv)
+    let envWire = osHostProcessEncodeWire(envOverrides)
+    let status: int32 = cheng_v3_exec_file_pipe_spawn_bridge(strToCStringTemp(filePath),
+                                                             argvWire,
+                                                             envWire,
+                                                             strToCStringTemp(workingDir))
+    let readFd: int32 = cheng_v3_exec_file_pipe_spawn_bridge_last_read_fd()
+    let writeFd: int32 = cheng_v3_exec_file_pipe_spawn_bridge_last_write_fd()
+    let pid: int64 = int64(cheng_v3_exec_file_pipe_spawn_bridge_last_pid_i32())
+    let ok: bool = status != 0
+    return os.ExecFilePipeSpawnResult(ok: ok, readFd: readFd, writeFd: writeFd, pid: pid)
 
 fn osHostProcessExecFileCaptureFill(filePath: str, argv: str[], envOverrides: str[],
                                     workingDir: str, mergeStderr: bool, timeoutSec: int32,
                                     outOutput: var str, outExitCode: var int32) =
-    outOutput = ""
-    outExitCode = -1
-    if strings.len(filePath) == 0:
-        return
-    var command: str = osHostProcessCommandText(filePath, argv, envOverrides)
-    if !mergeStderr:
-        command = osHostProcessStdoutOnlyCommand(command)
-    var readFd: int32 = -1
-    var writeFd: int32 = -1
-    var pid: int64 = -1
-    var spawnOk = false
-    osHostProcessPipeSpawnCommandFill(command, workingDir, readFd, writeFd, pid, spawnOk)
-    if !spawnOk:
-        outExitCode = -11
-        return
-    if pid <= 0:
-        outExitCode = -13
-        return
-    osHostProcessCloseFd(writeFd)
-    let start = monotimes.getMonoTime()
-    let timeoutNs: int64 = int64(timeoutSec) * int64(1000000000)
-    var timedOut = false
-    var termSent = false
-    var termAtNs: int64 = 0
-    var output = ""
-    var exitCode = -1
-    while pid > 0:
-        osHostProcessDrainReadFd(readFd, output, 20)
-        let waitRes = ptyWait(pid)
-        if waitRes.waitStatus == 1:
-            exitCode = waitRes.exitCode
-            pid = 0
-            break
-        if waitRes.waitStatus < 0:
-            exitCode = -12
-            pid = 0
-            break
-        if timeoutSec > 0:
-            let nowNs: int64 = monotimes.monoTimeNs(monotimes.getMonoTime()) - monotimes.monoTimeNs(start)
-            if nowNs >= timeoutNs:
-                timedOut = true
-                if !termSent:
-                    let _term = processSignal(pid, 15)
-                    termSent = true
-                    termAtNs = nowNs
-                elif nowNs - termAtNs >= int64(500000000):
-                    let _kill = processSignal(pid, 9)
-                os.sleepMs(20)
-                continue
-        os.sleepMs(10)
-    osHostProcessDrainReadFd(readFd, output, 0)
-    osHostProcessCloseFd(writeFd)
-    osHostProcessCloseFd(readFd)
-    if timedOut:
-        exitCode = 124
-    outOutput = output
-    outExitCode = exitCode
+    let res: os.ExecCmdResult = execFileCapture(filePath,
+                                                argv,
+                                                envOverrides,
+                                                workingDir,
+                                                mergeStderr,
+                                                timeoutSec)
+    outOutput = os.ExecCmdResultOutput(res)
+    outExitCode = os.ExecCmdResultExitCode(res)
 
 fn execFileCapture(filePath: str, argv: str[], envOverrides: str[],
                    workingDir: str, mergeStderr: bool, timeoutSec: int32): os.ExecCmdResult =
-    if strings.len(filePath) == 0:
+    if strings.Len(filePath) == 0:
         return os.ExecCmdResult(output: "", exitCode: -1)
-    var command: str = osHostProcessCommandText(filePath, argv, envOverrides)
-    if !mergeStderr:
-        command = osHostProcessStdoutOnlyCommand(command)
-    let spawnRes: os.ExecFilePipeSpawnResult = osHostProcessPipeSpawnCommand(command, workingDir)
-    if !spawnRes.ok:
-        return os.ExecCmdResult(output: "", exitCode: -11)
-    if spawnRes.pid <= 0:
-        return os.ExecCmdResult(output: "", exitCode: -13)
-    var readFd: int32 = spawnRes.readFd
-    var writeFd: int32 = spawnRes.writeFd
-    var pid: int64 = spawnRes.pid
-    osHostProcessCloseFd(writeFd)
-    let start = monotimes.getMonoTime()
-    let timeoutNs: int64 = int64(timeoutSec) * int64(1000000000)
-    var timedOut = false
-    var termSent = false
-    var termAtNs: int64 = 0
-    var output = ""
-    var exitCode = -1
-    while pid > 0:
-        osHostProcessDrainReadFd(readFd, output, 20)
-        let waitRes = ptyWait(pid)
-        if waitRes.waitStatus == 1:
-            exitCode = waitRes.exitCode
-            pid = 0
-            break
-        if waitRes.waitStatus < 0:
-            exitCode = -12
-            pid = 0
-            break
-        if timeoutSec > 0:
-            let nowNs: int64 = monotimes.monoTimeNs(monotimes.getMonoTime()) - monotimes.monoTimeNs(start)
-            if nowNs >= timeoutNs:
-                timedOut = true
-                if !termSent:
-                    let _term = processSignal(pid, 15)
-                    termSent = true
-                    termAtNs = nowNs
-                elif nowNs - termAtNs >= int64(500000000):
-                    let _kill = processSignal(pid, 9)
-                os.sleepMs(20)
-                continue
-        os.sleepMs(10)
-    osHostProcessDrainReadFd(readFd, output, 0)
-    osHostProcessCloseFd(writeFd)
-    osHostProcessCloseFd(readFd)
-    if timedOut:
-        exitCode = 124
-    return os.ExecCmdResult(output: output, exitCode: exitCode)
+    var exitCode64: int64 = -1
+    var mergeStderrI32: int32 = 0
+    if mergeStderr:
+        mergeStderrI32 = 1
+    let argvWire = osHostProcessEncodeWire(argv)
+    let envWire = osHostProcessEncodeWire(envOverrides)
+    let rawOutput: cstring = cheng_v3_exec_program_capture_timeout_bridge(strToCStringTemp(filePath),
+                                                                          argvWire,
+                                                                          envWire,
+                                                                          strToCStringTemp(workingDir),
+                                                                          mergeStderrI32,
+                                                                          timeoutSec,
+                                                                          exitCode64)
+    let output: str = strFromCStringCopy(rawOutput)
+    cheng_v3_exec_program_capture_bridge_dispose(rawOutput)
+    return os.ExecCmdResult(output: output, exitCode: int32(exitCode64))
 
 fn execFileStatus(filePath: str, argv: str[], envOverrides: str[],
                   workingDir: str, timeoutSec: int32): int32 =
-    if strings.len(filePath) == 0:
+    if strings.Len(filePath) == 0:
         return -1
     let res: os.ExecCmdResult = execFileCapture(filePath, argv, envOverrides, workingDir, true, timeoutSec)
     return res.exitCode
@@ -298,7 +254,7 @@ fn fdReadWait(fd: int32, maxBytes: int32, timeoutMs: int32): os.TextReadResult =
 
 fn ptyWrite(fd: int32, data: str): int32 =
     let dataText: cstring = strToCStringTemp(data)
-    return cheng_pty_write_bridge(fd, dataText, strings.len(data))
+    return cheng_pty_write_bridge(fd, dataText, strings.Len(data))
 
 fn ptyClose(fd: int32) =
     cheng_pty_close_bridge fd
@@ -316,3 +272,53 @@ fn processSignal(pid: int64, signalCode: int32): bool =
     if libc_kill(groupPid, signalCode) == 0:
         return true
     return libc_kill(targetPid, signalCode) == 0
+
+fn processExists(pid: int64): bool =
+    if pid <= 0:
+        return false
+    return libc_kill(int32(pid), 0) == 0
+
+fn FdReadWait(fd: int32, maxBytes: int32, timeoutMs: int32): os.TextReadResult =
+    return fdReadWait(fd, maxBytes, timeoutMs)
+
+fn OsHostProcessCommandText(filePath: str, argv: str[], envOverrides: str[]): str =
+    return osHostProcessCommandText(filePath, argv, envOverrides)
+
+fn PipeSpawn(command: str, workingDir: str): os.PipeSpawnResult =
+    return pipeSpawn(command, workingDir)
+
+fn ProcessExists(pid: int64): bool =
+    return processExists(pid)
+
+fn ProcessSignal(pid: int64, signalCode: int32): bool =
+    return processSignal(pid, signalCode)
+
+fn PtyClose(fd: int32) =
+    ptyClose(fd)
+
+fn PtyWait(pid: int64): os.PtyWaitResult =
+    return ptyWait(pid)
+
+fn ExecFileCapture(filePath: str, argv: str[], envOverrides: str[],
+                   workingDir: str, mergeStderr: bool, timeoutSec: int32): os.ExecCmdResult =
+    return execFileCapture(filePath, argv, envOverrides, workingDir, mergeStderr, timeoutSec)
+
+fn ExecFileStatus(filePath: str, argv: str[], envOverrides: str[],
+                  workingDir: str, timeoutSec: int32): int32 =
+    return execFileStatus(filePath, argv, envOverrides, workingDir, timeoutSec)
+
+fn ExecFilePipeSpawn(filePath: str, argv: str[], envOverrides: str[],
+                     workingDir: str): os.ExecFilePipeSpawnResult =
+    return execFilePipeSpawn(filePath, argv, envOverrides, workingDir)
+
+fn OsHostProcessExecFileCaptureFill(filePath: str, argv: str[], envOverrides: str[],
+                                    workingDir: str, mergeStderr: bool, timeoutSec: int32,
+                                    outOutput: var str, outExitCode: var int32) =
+    osHostProcessExecFileCaptureFill(filePath,
+                                     argv,
+                                     envOverrides,
+                                     workingDir,
+                                     mergeStderr,
+                                     timeoutSec,
+                                     outOutput,
+                                     outExitCode)

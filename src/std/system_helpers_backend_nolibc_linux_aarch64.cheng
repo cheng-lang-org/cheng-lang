@@ -1,5 +1,5 @@
-
-import std/rawmem_support
+@importc("ptr_add")
+fn cheng_rawmem_ptr_add(p: ptr, off: int32): ptr
 
 @importc("__cheng_linux_syscall0")
 fn cheng_linux_syscall0(nr: int64): int64
@@ -273,11 +273,13 @@ var
     cheng_errno_code: int32
     cheng_saved_argc: int32
     cheng_saved_argv: ptr
+    cheng_saved_envp: ptr
     cheng_getcwd_buf: ptr
     cheng_getcwd_buf_cap: int32
     cheng_stdio_stdin_token: int32
     cheng_stdio_stdout_token: int32
     cheng_stdio_stderr_token: int32
+    cheng_tcp_bridge_last_error: str
     cheng_webrtc_bridge_last_error: str
 
 fn puts_runtime(text: ptr): int32 =
@@ -286,7 +288,7 @@ fn cheng_strlen_runtime(s: ptr): int32 =
     if s == nil:
         return 0
     var n: int32 = 0
-    while *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), n))) != '\0':
+    while *(ptr(cheng_rawmem_ptr_add(ptr(s), n))) != '\0':
         n = n + 1
     return n
 fn cheng_memcpy_ffi_runtime(dest: ptr, src: ptr, n: int64): ptr =
@@ -354,22 +356,22 @@ fn cheng_bytes_copy(dst: ptr, src: ptr, n: int64) =
     if dst == nil || src == nil || n <= 0:
         return
     for i in 0..<n:
-        let b: uint8 = *(uInt8Ptr(rawmem_support.rawmemPtrAdd(src, int32(i))))
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(dst, int32(i)))) = b
+        let b: uint8 = *(uInt8Ptr(cheng_rawmem_ptr_add(src, int32(i))))
+        *(uInt8Ptr(cheng_rawmem_ptr_add(dst, int32(i)))) = b
 
 fn cheng_bytes_set(dst: ptr, value: int32, n: int64) =
     if dst == nil || n <= 0:
         return
     let b: uint8 = uint8(value & 0xFF)
     for i in 0..<n:
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(dst, int32(i)))) = b
+        *(uInt8Ptr(cheng_rawmem_ptr_add(dst, int32(i)))) = b
 
 fn cheng_bytes_cmp(a: ptr, b: ptr, n: int64): int32 =
     if n <= 0:
         return 0
     for i in 0..<n:
-        let av: uint8 = *(uInt8Ptr(rawmem_support.rawmemPtrAdd(a, int32(i))))
-        let bv: uint8 = *(uInt8Ptr(rawmem_support.rawmemPtrAdd(b, int32(i))))
+        let av: uint8 = *(uInt8Ptr(cheng_rawmem_ptr_add(a, int32(i))))
+        let bv: uint8 = *(uInt8Ptr(cheng_rawmem_ptr_add(b, int32(i))))
         if av < bv:
             return -1
         if av > bv:
@@ -380,7 +382,7 @@ fn cheng_strlen(s: ptr): int32 =
     if s == nil:
         return 0
     var n: int32 = 0
-    while *(ptr(rawmem_support.rawmemPtrAdd(ptr(s), n))) != '\0':
+    while *(ptr(cheng_rawmem_ptr_add(ptr(s), n))) != '\0':
         n = n + 1
     return n
 
@@ -395,8 +397,8 @@ fn cheng_strcmp(a: ptr, b: ptr): int32 =
         pb = ""
     var i: int32 = 0
     while true:
-        let ca: uint8 = uint8(int32(*(ptr(rawmem_support.rawmemPtrAdd(ptr(pa), i)))) & 0xFF)
-        let cb: uint8 = uint8(int32(*(ptr(rawmem_support.rawmemPtrAdd(ptr(pb), i)))) & 0xFF)
+        let ca: uint8 = uint8(int32(*(ptr(cheng_rawmem_ptr_add(ptr(pa), i)))) & 0xFF)
+        let cb: uint8 = uint8(int32(*(ptr(cheng_rawmem_ptr_add(ptr(pb), i)))) & 0xFF)
         if ca < cb:
             return -1
         if ca > cb:
@@ -445,13 +447,13 @@ fn chengRawBytes(size: int64): ptr =
         return nil
     let hdr: ChengRawHdrPtr = ChengRawHdrPtr(raw)
     hdr->mapSize = total
-    return rawmem_support.rawmemPtrAdd(raw, int32(header))
+    return cheng_rawmem_ptr_add(raw, int32(header))
 
 fn cheng_raw_free(p: ptr) =
     if p == nil:
         return
     let header: int32 = int32(sizeof ChengRawHdr)
-    let raw: ptr = rawmem_support.rawmemPtrAdd(p, -header)
+    let raw: ptr = cheng_rawmem_ptr_add(p, -header)
     let hdr: ChengRawHdrPtr = ChengRawHdrPtr(raw)
     let total: int64 = hdr->mapSize
     cheng_munmap_region(raw, total)
@@ -679,7 +681,7 @@ fn chengHeapNew(size: int32): ptr =
     memBlock->rc = 1
     memBlock->_pad = 0
     cheng_mem_link(scope, memBlock)
-    let payload: ptr = rawmem_support.rawmemPtrAdd(raw, int32(header))
+    let payload: ptr = cheng_rawmem_ptr_add(raw, int32(header))
     cheng_ptrmap_put(payload, memBlock)
     cheng_mm_alloc_total = cheng_mm_alloc_total + 1
     cheng_mm_live_total = cheng_mm_live_total + 1
@@ -739,7 +741,7 @@ fn cheng_mem_scope_pop() =
     var cur: ChengMemBlockPtr = ChengMemBlockPtr(scope->head)
     while cur != nil:
         let next: ChengMemBlockPtr = ChengMemBlockPtr(cur->next)
-        let payload: ptr = rawmem_support.rawmemPtrAdd(ptr(cur), int32(sizeof ChengMemBlock))
+        let payload: ptr = cheng_rawmem_ptr_add(ptr(cur), int32(sizeof ChengMemBlock))
         cheng_ptrmap_del(payload)
         cheng_munmap_region(ptr(cur), cur->mapSize)
         cheng_mm_free_total = cheng_mm_free_total + 1
@@ -846,7 +848,7 @@ fn cheng_write_all(fd: int32, data: ptr, len: int64): int32 =
     while off < len:
         let n: int64 = cheng_linux_syscall3(cheng_sys_write,
                                             int64(fd),
-                                            int64(uint64(rawmem_support.rawmemPtrAdd(data, int32(off)))),
+                                            int64(uint64(cheng_rawmem_ptr_add(data, int32(off)))),
                                             len - off)
         if n == -4:
             continue
@@ -895,7 +897,7 @@ fn cheng_index_ptr(base: ptr, len: int32, idx: int32, elemSize: int32): ptr =
     if base == nil || elemSize <= 0:
         return base
     let off: int64 = int64(idx) * int64(elemSize)
-    return rawmem_support.rawmemPtrAdd(base, int32(off))
+    return cheng_rawmem_ptr_add(base, int32(off))
 
 fn cheng_seq_get(buffer: ptr, len: int32, idx: int32, elemSize: int32): ptr =
     return cheng_index_ptr(buffer, len, idx, elemSize)
@@ -941,6 +943,33 @@ fn cheng_runtime_param_copy_raw(i: int32): ptr =
     if out == nil:
         return ""
     return out
+
+fn cheng_env_name_matches(entry: ptr, name: ptr, nameLen: int32): bool =
+    if entry == nil || name == nil || nameLen <= 0:
+        return false
+    var i: int32 = 0
+    while i < nameLen:
+        if *(uInt8Ptr(cheng_rawmem_ptr_add(entry, i))) != *(uInt8Ptr(cheng_rawmem_ptr_add(name, i))):
+            return false
+        i = i + 1
+    return *(uInt8Ptr(cheng_rawmem_ptr_add(entry, nameLen))) == uint8(int32('='))
+
+@exportc("getenv")
+fn cheng_getenv_export(name: ptr): ptr =
+    if name == nil || cheng_saved_envp == nil:
+        return nil
+    let nameLen: int32 = cheng_strlen_runtime(name)
+    if nameLen <= 0:
+        return nil
+    var slot: VoidPtrPtr = VoidPtrPtr(cheng_saved_envp)
+    while slot != nil:
+        let entry: ptr = *slot
+        if entry == nil:
+            return nil
+        if cheng_env_name_matches(entry, name, nameLen):
+            return cheng_rawmem_ptr_add(entry, nameLen + 1)
+        slot = VoidPtrPtr(cheng_rawmem_ptr_add(ptr(slot), cheng_ptr_size()))
+    return nil
 
 fn __cheng_next_cap(curCap: int32, need: int32): int32 =
     if need <= 0:
@@ -1018,7 +1047,7 @@ fn cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr =
         if newCap > oldCap:
             let off: int64 = int64(oldCap) * int64(elemSize)
             let zeroBytes: int64 = (int64(newCap) - int64(oldCap)) * int64(elemSize)
-            cheng_bytes_set(rawmem_support.rawmemPtrAdd(newBuf, int32(off)), 0, zeroBytes)
+            cheng_bytes_set(cheng_rawmem_ptr_add(newBuf, int32(off)), 0, zeroBytes)
         seqHdr->buffer = newBuf
         seqHdr->cap = newCap
     if needLen > seqHdr->len:
@@ -1312,7 +1341,9 @@ fn cheng_file_exists(path: ptr): int32 =
     var st: ChengLinuxStat
     if path == nil || cheng_strlen_runtime(path) <= 0:
         return 0
-    return cheng_runtime_stat_path(path, &st) ? 1 : 0
+    if !cheng_runtime_stat_path(path, &st):
+        return 0
+    return cheng_runtime_mode_is_dir(st.stMode) ? 0 : 1
 fn cheng_dir_exists(path: ptr): int32 =
     var st: ChengLinuxStat
     if path == nil || cheng_strlen_runtime(path) <= 0:
@@ -1507,7 +1538,7 @@ fn cheng_normalize_bind_sockaddr_linux(addr: ptr, len: int32, needFree: BoolPtr)
     if addr == nil || len != cheng_sockaddr_in_len:
         return addr
     let b0: uint8 = *(uInt8Ptr(addr))
-    let b1: uint8 = *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 1)))
+    let b1: uint8 = *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 1)))
     if b0 == uint8(cheng_af_inet) && b1 == 0:
         return addr
     if b0 != uint8(cheng_sockaddr_in_len) || b1 != uint8(cheng_af_inet):
@@ -1517,7 +1548,7 @@ fn cheng_normalize_bind_sockaddr_linux(addr: ptr, len: int32, needFree: BoolPtr)
         return addr
     cheng_bytes_copy(normalized, addr, int64(cheng_sockaddr_in_len))
     *(uInt8Ptr(normalized)) = uint8(cheng_af_inet)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(normalized, 1))) = uint8(0)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(normalized, 1))) = uint8(0)
     if needFree != nil:
         *needFree = true
     return normalized
@@ -1537,13 +1568,13 @@ fn cheng_tcp_listener(port: int32, outPort: ptr): int32 =
         return -1
     cheng_bytes_set(addr, 0, cheng_sockaddr_in_len)
     *(uInt8Ptr(addr)) = uint8(cheng_af_inet)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 1))) = uint8(0)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 2))) = uint8((port >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 3))) = uint8(port & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 4))) = uint8((cheng_inaddr_loopback >> 24) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 5))) = uint8((cheng_inaddr_loopback >> 16) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 6))) = uint8((cheng_inaddr_loopback >> 8) & 0xFF)
-    *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 7))) = uint8(cheng_inaddr_loopback & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 1))) = uint8(0)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 2))) = uint8((port >> 8) & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 3))) = uint8(port & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 4))) = uint8((cheng_inaddr_loopback >> 24) & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 5))) = uint8((cheng_inaddr_loopback >> 16) & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 6))) = uint8((cheng_inaddr_loopback >> 8) & 0xFF)
+    *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 7))) = uint8(cheng_inaddr_loopback & 0xFF)
 
     let bindRes: int32 = bind(fd, addr, cheng_sockaddr_in_len)
     if bindRes < 0:
@@ -1553,10 +1584,10 @@ fn cheng_tcp_listener(port: int32, outPort: ptr): int32 =
             close(fd)
             chengFreeCompat(addr)
             return -1
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 4))) = uint8(0)
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 5))) = uint8(0)
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 6))) = uint8(0)
-        *(uInt8Ptr(rawmem_support.rawmemPtrAdd(addr, 7))) = uint8(0)
+        *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 4))) = uint8(0)
+        *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 5))) = uint8(0)
+        *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 6))) = uint8(0)
+        *(uInt8Ptr(cheng_rawmem_ptr_add(addr, 7))) = uint8(0)
         if bind(fd, addr, cheng_sockaddr_in_len) < 0:
             close(fd)
             chengFreeCompat(addr)
@@ -1589,8 +1620,8 @@ fn cheng_tcp_listener(port: int32, outPort: ptr): int32 =
             chengFreeCompat(namelen)
             chengFreeCompat(addr)
             return -1
-        let hiPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.rawmemPtrAdd(name, 2))))
-        let loPortByte: int32 = int32(*(uInt8Ptr(rawmem_support.rawmemPtrAdd(name, 3))))
+        let hiPortByte: int32 = int32(*(uInt8Ptr(cheng_rawmem_ptr_add(name, 2))))
+        let loPortByte: int32 = int32(*(uInt8Ptr(cheng_rawmem_ptr_add(name, 3))))
         store(outPort, (hiPortByte << 8) | loPortByte)
         chengFreeCompat(name)
         chengFreeCompat(namelen)
@@ -2314,9 +2345,11 @@ fn __cheng_setCmdLine_export(argc: int32, argv: ptr) =
     if argc <= 0 || argc > 4096 || argv == nil:
         cheng_saved_argc = 0
         cheng_saved_argv = nil
+        cheng_saved_envp = nil
         return
     cheng_saved_argc = argc
     cheng_saved_argv = argv
+    cheng_saved_envp = cheng_rawmem_ptr_add(argv, (argc + 1) * cheng_ptr_size())
 
 @exportc("__cheng_rt_paramCount")
 fn __cheng_rt_paramCount_export(): int32 =
@@ -2452,6 +2485,41 @@ fn driver_c_str_contains_str_bridge_export(s: str, sub: str): int32 =
 @exportc("cheng_v3_str_strip_bridge")
 fn cheng_v3_str_strip_bridge_export(s: str): str =
     return cheng_runtime_str_strip_ascii(s)
+
+fn cheng_v3_strformat_join_runtime(parts: str[], sep: str): str =
+    if parts.len <= 0:
+        return cheng_runtime_str_empty()
+    let sepLen: int32 = cheng_runtime_str_len(sep)
+    let sepData: ptr = cheng_runtime_str_data(sep)
+    var total: int32 = 0
+    for i in 0..<parts.len:
+        if i > 0:
+            total = total + sepLen
+        total = total + cheng_runtime_str_len(parts[i])
+    let outRaw: ptr = driver_c_new_string_export(total)
+    if outRaw == nil:
+        return cheng_runtime_str_empty()
+    var writeAt: int32 = 0
+    for i in 0..<parts.len:
+        if i > 0 && sepLen > 0:
+            cheng_bytes_copy(cheng_rawmem_ptr_add(outRaw, writeAt), sepData, int64(sepLen))
+            writeAt = writeAt + sepLen
+        let part: str = parts[i]
+        let partLen: int32 = cheng_runtime_str_len(part)
+        if partLen > 0:
+            cheng_bytes_copy(cheng_rawmem_ptr_add(outRaw, writeAt),
+                             cheng_runtime_str_data(part),
+                             int64(partLen))
+            writeAt = writeAt + partLen
+    return cheng_runtime_str_view_owned(outRaw, total)
+
+@exportc("cheng_v3_strformat_fmt_bridge")
+fn cheng_v3_strformat_fmt_bridge_export(parts: str[]): str =
+    return cheng_v3_strformat_join_runtime(parts, "")
+
+@exportc("cheng_v3_strformat_lines_bridge")
+fn cheng_v3_strformat_lines_bridge_export(parts: str[]): str =
+    return cheng_v3_strformat_join_runtime(parts, "\n")
 
 @exportc("cheng_v3_os_is_absolute_bridge")
 fn cheng_v3_os_is_absolute_bridge_export(path: str): int32 =
@@ -3410,6 +3478,64 @@ fn cheng_v3_tcp_buffer_handle_release_raw_bridge_export(handle: uint64): int32 =
         return -1
     chengFreeCompat(raw)
     return 0
+
+fn cheng_runtime_tcp_last_error_clear() =
+    cheng_runtime_str_dispose(cheng_tcp_bridge_last_error)
+    cheng_tcp_bridge_last_error = cheng_runtime_str_empty()
+
+fn cheng_runtime_tcp_last_error_set(value: str) =
+    cheng_runtime_str_dispose(cheng_tcp_bridge_last_error)
+    cheng_tcp_bridge_last_error = cheng_runtime_str_copy(cheng_runtime_str_data(value),
+                                                         cheng_runtime_str_len(value))
+
+fn cheng_runtime_tcp_last_error_set_ptr(text: ptr) =
+    cheng_runtime_str_dispose(cheng_tcp_bridge_last_error)
+    cheng_tcp_bridge_last_error = cheng_runtime_error_str(text)
+
+fn cheng_runtime_tcp_last_error_apply(value: str, fallbackText: ptr) =
+    if cheng_runtime_str_len(value) > 0:
+        cheng_runtime_tcp_last_error_set(value)
+    else:
+        cheng_runtime_tcp_last_error_set_ptr(fallbackText)
+
+fn cheng_runtime_tcp_last_error_request_hex_decode(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: request hex decode failed")
+
+fn cheng_runtime_tcp_last_error_response_hex_decode(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: response hex decode failed")
+
+fn cheng_runtime_tcp_last_error_loopback_request_response(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: loopback request-response failed")
+
+fn cheng_runtime_tcp_last_error_loopback_response_handle(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: loopback response handle failed")
+
+fn cheng_runtime_tcp_last_error_invalid_input_handle() =
+    cheng_runtime_tcp_last_error_set_ptr("v3 libp2p tcp: invalid input handle")
+
+fn cheng_runtime_tcp_last_error_loopback_handle_bridge(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: loopback handle bridge failed")
+
+fn cheng_runtime_tcp_last_error_loopback_input_handle(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: loopback input handle failed")
+
+fn cheng_runtime_tcp_last_error_payload_hex_decode(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: payload hex decode failed")
+
+fn cheng_runtime_tcp_last_error_serve_payload_once(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: serve payload once failed")
+
+fn cheng_runtime_tcp_last_error_recv_payload_bridge(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: recv payload bridge failed")
+
+fn cheng_runtime_tcp_last_error_recv_payload_handle(value: str) =
+    cheng_runtime_tcp_last_error_apply(value, "v3 libp2p tcp: recv payload handle failed")
+
+@exportc("cheng_v3_tcp_last_error_handle_bridge")
+fn cheng_v3_tcp_last_error_handle_bridge_export(): uint64 =
+    if cheng_runtime_str_len(cheng_tcp_bridge_last_error) == 0:
+        return uint64(0)
+    return cheng_v3_buffer_handle_new_from_str(cheng_tcp_bridge_last_error)
 @exportc("cheng_v3_buffer_handle_len_bridge")
 fn cheng_v3_buffer_handle_len_bridge_export(handle: uint64): int32 =
     return cheng_v3_buffer_handle_len(ptr(handle))
@@ -3580,11 +3706,13 @@ fn cheng_v3_tcp_loopback_request_response_bridge_export(protocolText: str,
     if !cheng_v3_tcp_hex_decode_str(requestHex, requestWire, decodeErr):
         cheng_runtime_str_dispose(requestWire)
         cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_tcp_last_error_request_hex_decode(decodeErr)
         cheng_runtime_str_dispose(decodeErr)
         return uint64(0)
     if !cheng_v3_tcp_hex_decode_str(responseHex, responseWire, decodeErr):
         cheng_runtime_str_dispose(requestWire)
         cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_tcp_last_error_response_hex_decode(decodeErr)
         cheng_runtime_str_dispose(decodeErr)
         return uint64(0)
     var clientResponseWire: str = cheng_runtime_str_empty()
@@ -3599,9 +3727,14 @@ fn cheng_v3_tcp_loopback_request_response_bridge_export(protocolText: str,
     cheng_runtime_str_dispose(decodeErr)
     if ok == 0:
         cheng_runtime_str_dispose(clientResponseWire)
+        cheng_runtime_tcp_last_error_loopback_request_response(errWire)
         cheng_runtime_str_dispose(errWire)
         return uint64(0)
     let handle: uint64 = cheng_v3_buffer_handle_new_from_str(clientResponseWire)
+    if handle == uint64(0):
+        cheng_runtime_tcp_last_error_loopback_response_handle(errWire)
+    else:
+        cheng_runtime_tcp_last_error_clear()
     cheng_runtime_str_dispose(clientResponseWire)
     cheng_runtime_str_dispose(errWire)
     return handle
@@ -3614,6 +3747,7 @@ fn cheng_v3_tcp_loopback_request_response_handle_bridge_export(protocolText: str
     let requestLen: int32 = cheng_v3_buffer_handle_len(requestRaw)
     let responseLen: int32 = cheng_v3_buffer_handle_len(responseRaw)
     if requestLen < 0 || responseLen < 0:
+        cheng_runtime_tcp_last_error_invalid_input_handle()
         return uint64(0)
     let requestWire: str = cheng_runtime_str_copy(cheng_v3_buffer_handle_payload_ptr(requestRaw), requestLen)
     let responseWire: str = cheng_runtime_str_copy(cheng_v3_buffer_handle_payload_ptr(responseRaw), responseLen)
@@ -3628,9 +3762,14 @@ fn cheng_v3_tcp_loopback_request_response_handle_bridge_export(protocolText: str
     cheng_runtime_str_dispose(responseWire)
     if ok == 0:
         cheng_runtime_str_dispose(clientResponseWire)
+        cheng_runtime_tcp_last_error_loopback_handle_bridge(errWire)
         cheng_runtime_str_dispose(errWire)
         return uint64(0)
     let handle: uint64 = cheng_v3_buffer_handle_new_from_str(clientResponseWire)
+    if handle == uint64(0):
+        cheng_runtime_tcp_last_error_loopback_input_handle(errWire)
+    else:
+        cheng_runtime_tcp_last_error_clear()
     cheng_runtime_str_dispose(clientResponseWire)
     cheng_runtime_str_dispose(errWire)
     return handle
@@ -3726,6 +3865,7 @@ fn cheng_v3_tcp_serve_payload_once_bridge_export(hostText: str,
     var errWire: str = cheng_runtime_str_empty()
     if !cheng_v3_tcp_hex_decode_str(payloadHex, payloadWire, errWire):
         cheng_runtime_str_dispose(payloadWire)
+        cheng_runtime_tcp_last_error_payload_hex_decode(errWire)
         cheng_runtime_str_dispose(errWire)
         return 0
     let ok: int32 = cheng_v3_tcp_serve_payload_once_fill(hostText,
@@ -3734,6 +3874,10 @@ fn cheng_v3_tcp_serve_payload_once_bridge_export(hostText: str,
                                                          payloadWire,
                                                          readyPath,
                                                          errWire)
+    if ok != 0:
+        cheng_runtime_tcp_last_error_clear()
+    else:
+        cheng_runtime_tcp_last_error_serve_payload_once(errWire)
     cheng_runtime_str_dispose(payloadWire)
     cheng_runtime_str_dispose(errWire)
     return ok
@@ -3822,9 +3966,14 @@ fn cheng_v3_tcp_recv_payload_once_bridge_export(hostText: str,
                                                                       errWire)
     if ok == 0:
         cheng_runtime_str_dispose(responseWire)
+        cheng_runtime_tcp_last_error_recv_payload_bridge(errWire)
         cheng_runtime_str_dispose(errWire)
         return uint64(0)
     let handle: uint64 = cheng_v3_buffer_handle_new_from_str(responseWire)
+    if handle == uint64(0):
+        cheng_runtime_tcp_last_error_recv_payload_handle(errWire)
+    else:
+        cheng_runtime_tcp_last_error_clear()
     cheng_runtime_str_dispose(responseWire)
     cheng_runtime_str_dispose(errWire)
     return handle

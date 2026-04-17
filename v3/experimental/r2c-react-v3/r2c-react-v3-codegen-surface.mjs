@@ -76,6 +76,13 @@ function writeSummary(filePath, values) {
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
 }
 
+function writeCodegenSurfaceReport(filePath, payload) {
+  writeJson(filePath, {
+    format: 'codegen_surface_report_v1',
+    ...payload,
+  });
+}
+
 function resolveDefaultToolingBin(workspaceRoot) {
   const explicit = String(process.env.R2C_REACT_V3_TOOLING_BIN || '').trim();
   if (explicit) return explicit;
@@ -1421,6 +1428,9 @@ function main() {
   const workspaceRoot = resolveWorkspaceRoot();
   const repo = path.resolve(args.repo);
   const outDir = path.resolve(args.outDir || path.join(repo, 'build', 'r2c_react_v3_cheng'));
+  const summaryPath = path.resolve(args.summaryOut || path.join(outDir, 'codegen_surface.summary.env'));
+  const reportPath = path.resolve(path.join(outDir, 'codegen_surface_report_v1.json'));
+  const helperScriptPath = path.resolve(process.argv[1]);
   const tsxAstPath = path.resolve(args.tsxAstPath || path.join(outDir, 'tsx_ast_v1.json'));
   const truthTracePath = args.truthTracePath ? path.resolve(args.truthTracePath) : '';
   const doc = readJson(tsxAstPath);
@@ -1451,10 +1461,34 @@ function main() {
   writePackage(manifest, modules, routeCatalog);
   const smoke = runCodegenSmoke(workspaceRoot, manifest);
   if (!smoke.ok) {
-    writeJson(path.join(outDir, 'cheng_codegen_v1.json'), manifest);
-    writeJson(path.join(outDir, 'cheng_codegen_route_catalog_v1.json'), routeCatalog);
-    writeJson(path.join(outDir, 'cheng_codegen_smoke_v1.json'), smoke);
-    writeSummary(args.summaryOut, {
+    const manifestPath = path.join(outDir, 'cheng_codegen_v1.json');
+    const routeCatalogPath = path.join(outDir, 'cheng_codegen_route_catalog_v1.json');
+    const smokePath = path.join(outDir, 'cheng_codegen_smoke_v1.json');
+    writeJson(manifestPath, manifest);
+    writeJson(routeCatalogPath, routeCatalog);
+    writeJson(smokePath, smoke);
+    writeCodegenSurfaceReport(reportPath, {
+      controller: 'node.codegen_surface',
+      command: 'codegen-surface',
+      ok: false,
+      reason: String(smoke.reason || 'smoke_failed'),
+      workspace_root: workspaceRoot,
+      repo_root: repo,
+      out_dir: outDir,
+      helper_script: helperScriptPath,
+      helper_summary_path: summaryPath,
+      helper_log_path: String(smoke.log_path || ''),
+      primary_artifact_path: manifestPath,
+      primary_artifact_format: 'cheng_codegen_v1',
+      module_count: modules.length,
+      codegen_module_count: manifest.modules.length,
+      route_count: routeCatalog.routeCount,
+      typescript_version: String(doc.typescript_version || ''),
+      smoke_ok: false,
+      smoke_report_path: String(smoke.report_path || ''),
+      smoke_log_path: String(smoke.log_path || ''),
+    });
+    writeSummary(summaryPath, {
       module_count: modules.length,
       codegen_module_count: manifest.modules.length,
       route_count: routeCatalog.routeCount,
@@ -1467,7 +1501,8 @@ function main() {
       smoke_report_path: smoke.report_path,
       smoke_log_path: smoke.log_path,
       typescript_version: String(doc.typescript_version || ''),
-      codegen_manifest_path: path.join(outDir, 'cheng_codegen_v1.json'),
+      codegen_manifest_path: manifestPath,
+      codegen_smoke_path: smokePath,
     });
     process.exit(1);
   }
@@ -1477,7 +1512,30 @@ function main() {
   writeJson(manifestPath, manifest);
   writeJson(routeCatalogPath, routeCatalog);
   writeJson(smokePath, smoke);
-  writeSummary(args.summaryOut, {
+  writeCodegenSurfaceReport(reportPath, {
+    controller: 'node.codegen_surface',
+    command: 'codegen-surface',
+    ok: true,
+    reason: String(smoke.reason || 'ok'),
+    workspace_root: workspaceRoot,
+    repo_root: repo,
+    out_dir: outDir,
+    helper_script: helperScriptPath,
+    helper_summary_path: summaryPath,
+    helper_log_path: String(smoke.log_path || ''),
+    primary_artifact_path: manifestPath,
+    primary_artifact_format: 'cheng_codegen_v1',
+    module_count: modules.length,
+    codegen_module_count: manifest.modules.length,
+    route_count: routeCatalog.routeCount,
+    typescript_version: String(doc.typescript_version || ''),
+    smoke_ok: true,
+    smoke_report_path: String(smoke.report_path || ''),
+    smoke_log_path: String(smoke.log_path || ''),
+    smoke_node_count: smoke.node_count,
+    smoke_edge_count: smoke.edge_count,
+  });
+  writeSummary(summaryPath, {
     module_count: modules.length,
     codegen_module_count: manifest.modules.length,
     route_count: routeCatalog.routeCount,
@@ -1500,6 +1558,8 @@ function main() {
     ok: true,
     repo_root: repo,
     out_dir: outDir,
+    report_path: reportPath,
+    summary_path: summaryPath,
     module_count: modules.length,
     codegen_module_count: manifest.modules.length,
     route_count: routeCatalog.routeCount,

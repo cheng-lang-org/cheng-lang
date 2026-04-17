@@ -144,21 +144,31 @@ fn v3BufAppendAddress(buf: var layout.ByteBuf, addr: types.V3LsmrAddress) =
         layout.byteBufAppendByte(buf, addr.digits[i] & 255)
 
 fn v3ReadAddress(span: layout.ByteSpan, offset: int32): Result[types.V3LsmrAddress] =
+    var out: types.V3LsmrAddress
+    let fillRes = v3ReadAddressFill(span, offset, out)
+    if IsErr(fillRes):
+        return Err[types.V3LsmrAddress](Error(fillRes))
+    return Ok[types.V3LsmrAddress](out)
+
+fn v3ReadAddressFill(span: layout.ByteSpan,
+                     offset: int32,
+                     out: var types.V3LsmrAddress): Result[bool] =
     if offset < 0 || offset + 4 + types.v3LsmrMaxDepth > layout.byteSpanLen(span):
-        return Err[types.V3LsmrAddress]("v3 chain codec: short address")
+        return Err[bool]("v3 chain codec: short address")
     let depthRes: Result[int64] = v3ReadU32BE(span, offset)
     if IsErr(depthRes):
-        return Err[types.V3LsmrAddress](Error(depthRes))
+        return Err[bool](Error(depthRes))
     let depth: int32 = int32(Value(depthRes))
     if depth < 0 || depth > types.v3LsmrMaxDepth:
-        return Err[types.V3LsmrAddress]("v3 chain codec: invalid address depth")
-    var digits: int32[] = []
+        return Err[bool]("v3 chain codec: invalid address depth")
+    out = types.v3LsmrAddressZero()
+    out.depth = depth
     for i in 0..<depth:
         let digit: int32 = layout.byteSpanAt(span, offset + 4 + i)
         if !types.v3LsmrDigitOk(digit):
-            return Err[types.V3LsmrAddress]("v3 chain codec: invalid address digit")
-        add(digits, digit)
-    return types.v3LsmrAddressFromDigits(digits)
+            return Err[bool]("v3 chain codec: invalid address digit")
+        out.digits[i] = digit
+    return Ok[bool](true)
 
 fn v3BufAppendStateSummary(buf: var layout.ByteBuf, summary: types.V3StateRootSummary) =
     v3BufAppendFixed32(buf, summary.stateForestCid)

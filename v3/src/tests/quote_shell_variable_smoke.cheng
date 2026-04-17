@@ -1,0 +1,72 @@
+import std/os
+import std/os_host_process as hostos
+import std/strutils as strutil
+import std/strings
+
+type
+    DrainResult = object
+        output: str
+        exitCode: int32
+
+fn drainReadFd(readFd0: int32, pid: int64): DrainResult =
+    var readFd: int32 = readFd0
+    var output = ""
+    var eof = false
+    var spins: int32 = 0
+    var exitCode: int32 = -1
+    var waited = false
+    while !eof && spins < 200:
+        spins = spins + 1
+        let readRes: os.TextReadResult = hostos.FdReadWait(readFd, 65536, 20)
+        let text: str = readRes.text
+        if strings.Len(text) > 0:
+            output = output + text
+        eof = readRes.eof
+        if !eof:
+            let waitRes: os.PtyWaitResult = hostos.PtyWait(pid)
+            if waitRes.waitStatus < 0:
+                assert(false, "quote shell wait failed")
+            if waitRes.waitStatus == 1:
+                exitCode = waitRes.exitCode
+                waited = true
+                break
+        os.SleepMs(10)
+    hostos.PtyClose(readFd)
+    if !waited:
+        var waitSpins: int32 = 0
+        while waitSpins < 200:
+            waitSpins = waitSpins + 1
+            let waitRes: os.PtyWaitResult = hostos.PtyWait(pid)
+            if waitRes.waitStatus < 0:
+                assert(false, "quote shell final wait failed")
+            if waitRes.waitStatus == 1:
+                exitCode = waitRes.exitCode
+                waited = true
+                break
+            os.SleepMs(10)
+    assert(waited, "quote shell wait timeout")
+    return DrainResult(output: output, exitCode: exitCode)
+
+fn main(): int32 =
+    let arg0 = "two words"
+    let arg1 = "O'Hara"
+    let env0 = "KEY=O'Hara value"
+    let q = os.QuoteShell(arg1)
+    assert(q == "'O'\"'\"'Hara'", "v3 ordinary os.QuoteShell variable apostrophe")
+
+    let cmd = hostos.OsHostProcessCommandText("/bin/echo", [arg0, arg1], [env0])
+    let expected = "env 'KEY=O'\"'\"'Hara value' '/bin/echo' 'two words' 'O'\"'\"'Hara'"
+    assert(cmd == expected, "v3 ordinary hostos command text variable quoting")
+
+    let spawnRes: os.ExecFilePipeSpawnResult = hostos.ExecFilePipeSpawn("/bin/echo", [arg0, arg1], [], "")
+    assert(spawnRes.ok, "v3 ordinary execFilePipeSpawn quoted args ok")
+    assert(spawnRes.readFd >= 0, "v3 ordinary execFilePipeSpawn quoted args read fd")
+    assert(spawnRes.writeFd >= 0, "v3 ordinary execFilePipeSpawn quoted args write fd")
+    assert(spawnRes.pid > 0, "v3 ordinary execFilePipeSpawn quoted args pid")
+    hostos.PtyClose(spawnRes.writeFd)
+    let drain = drainReadFd(spawnRes.readFd, spawnRes.pid)
+    assert(drain.exitCode == 0, "v3 ordinary execFilePipeSpawn quoted args exit")
+    assert(strutil.Strip(drain.output) == "two words O'Hara",
+           "v3 ordinary execFilePipeSpawn quoted args output")
+    echo("v3 quote_shell_variable_smoke ok")
+    return 0

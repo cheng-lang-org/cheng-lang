@@ -4,8 +4,13 @@ import std/strutils as strutil
 import std/strings
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/libp2p/core/types
-import cheng/v3/runtime/tcp_bridge_abi as tcpabi
 
+@importc("cheng_v3_buffer_handle_len_bridge")
+fn v3Libp2pRelayProviderBufferHandleLenBridge(handle: uint64): int32
+@importc("cheng_v3_buffer_handle_byte_bridge")
+fn v3Libp2pRelayProviderBufferHandleByteBridge(handle: uint64, idx: int32): int32
+@importc("cheng_v3_buffer_handle_release_bridge")
+fn v3Libp2pRelayProviderBufferHandleReleaseBridge(handle: uint64): int32
 importc fn cheng_v3_relay_provider_open_bridge(serviceKindText: str,
                                                endpointText: str,
                                                regionText: str,
@@ -74,9 +79,9 @@ fn v3Libp2pRelayProviderLineValue(payload: str,
             continue
         let lineLen = i - lineStart
         if lineLen >= len(prefix):
-            let line = strings.sliceBytes(payload, lineStart, lineLen)
-            if strutil.startsWith(line, prefix):
-                let value = strings.sliceBytes(line, len(prefix), len(line) - len(prefix))
+            let line = strings.SliceBytes(payload, lineStart, lineLen)
+            if strutil.StartsWith(line, prefix):
+                let value = strings.SliceBytes(line, len(prefix), len(line) - len(prefix))
                 return value
         lineStart = i + 1
         i = i + 1
@@ -86,18 +91,25 @@ fn v3Libp2pRelayProviderPayloadText(handle: uint64,
                                     fallback: str): Result[str] =
     if handle == uint64(0):
         return Err[str](fallback)
-    let n = tcpabi.cheng_v3_buffer_handle_len_bridge(handle)
+    var n: int32 = 0
+    n = v3Libp2pRelayProviderBufferHandleLenBridge(handle)
     if n < 0:
-        tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        var releaseRc: int32 = 0
+        releaseRc = v3Libp2pRelayProviderBufferHandleReleaseBridge(handle)
         return Err[str](fallback)
     var out = bytesAlloc(n)
-    for i in 0..<n:
-        let b = tcpabi.cheng_v3_buffer_handle_byte_bridge(handle, i)
+    var i = 0
+    while i < n:
+        var b: int32 = 0
+        b = v3Libp2pRelayProviderBufferHandleByteBridge(handle, i)
         if b < 0:
-            tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+            var releaseRc: int32 = 0
+            releaseRc = v3Libp2pRelayProviderBufferHandleReleaseBridge(handle)
             return Err[str](fallback)
         bytesSet(out, i, b)
-    tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        i = i + 1
+    var releaseRc: int32 = 0
+    releaseRc = v3Libp2pRelayProviderBufferHandleReleaseBridge(handle)
     return Ok[str](bytesToString(out))
 
 fn v3Libp2pRelayProviderIssueLeasePayload(handle: uint64,
@@ -112,12 +124,14 @@ fn v3Libp2pRelayProviderIssueLeasePayload(handle: uint64,
         return Err[str]("v3 libp2p relay provider: requester missing")
     if ttlSeconds <= 0:
         return Err[str]("v3 libp2p relay provider: ttl invalid")
-    return v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(handle,
-                                                                                               requesterPeerIdText,
-                                                                                               requestedRegion,
-                                                                                               layout.fixedBytes32Hex(nonce),
-                                                                                               issuedAtEpochSeconds,
-                                                                                               ttlSeconds),
+    let nonceHex = layout.fixedBytes32Hex(nonce)
+    let leaseHandle = cheng_v3_relay_provider_issue_lease_handle_bridge(handle,
+                                                                        requesterPeerIdText,
+                                                                        requestedRegion,
+                                                                        nonceHex,
+                                                                        issuedAtEpochSeconds,
+                                                                        ttlSeconds)
+    return v3Libp2pRelayProviderPayloadText(leaseHandle,
                                             "v3 libp2p relay provider: lease empty")
 
 fn v3Libp2pRelayProviderOwnedText(text: str): str =
@@ -209,12 +223,14 @@ fn v3Libp2pRelayProviderIssueLeaseFill(out: var types.V3Libp2pRelayLease,
         return Err[bool]("v3 libp2p relay provider: requester missing")
     if ttlSeconds <= 0:
         return Err[bool]("v3 libp2p relay provider: ttl invalid")
-    let payloadRes = v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
-                                                                                                         requesterPeerIdText,
-                                                                                                         requestedRegion,
-                                                                                                         layout.fixedBytes32Hex(nonce),
-                                                                                                         issuedAtEpochSeconds,
-                                                                                                         ttlSeconds),
+    let nonceHex = layout.fixedBytes32Hex(nonce)
+    let leaseHandle = cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
+                                                                        requesterPeerIdText,
+                                                                        requestedRegion,
+                                                                        nonceHex,
+                                                                        issuedAtEpochSeconds,
+                                                                        ttlSeconds)
+    let payloadRes = v3Libp2pRelayProviderPayloadText(leaseHandle,
                                                       "v3 libp2p relay provider: lease empty")
     if IsErr(payloadRes):
         return Err[bool](Error(payloadRes))
@@ -259,12 +275,14 @@ fn v3Libp2pRelayProviderIssueLease(providerHandle: uint64,
         return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: requester missing")
     if ttlSeconds <= 0:
         return Err[types.V3Libp2pRelayLease]("v3 libp2p relay provider: ttl invalid")
-    let payloadRes = v3Libp2pRelayProviderPayloadText(cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
-                                                                                                         requesterPeerIdText,
-                                                                                                         requestedRegion,
-                                                                                                         layout.fixedBytes32Hex(nonce),
-                                                                                                         issuedAtEpochSeconds,
-                                                                                                         ttlSeconds),
+    let nonceHex = layout.fixedBytes32Hex(nonce)
+    let leaseHandle = cheng_v3_relay_provider_issue_lease_handle_bridge(providerHandle,
+                                                                        requesterPeerIdText,
+                                                                        requestedRegion,
+                                                                        nonceHex,
+                                                                        issuedAtEpochSeconds,
+                                                                        ttlSeconds)
+    let payloadRes = v3Libp2pRelayProviderPayloadText(leaseHandle,
                                                       "v3 libp2p relay provider: lease empty")
     if IsErr(payloadRes):
         return Err[types.V3Libp2pRelayLease](Error(payloadRes))

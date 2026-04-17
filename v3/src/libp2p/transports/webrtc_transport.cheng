@@ -8,6 +8,12 @@ import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/protocols/webrtc_signal as signal
 import cheng/v3/runtime/tcp_bridge_abi as tcpabi
 
+@importc("cheng_v3_buffer_handle_len_bridge")
+fn v3Libp2pWebrtcBufferHandleLenBridge(handle: uint64): int32
+@importc("cheng_v3_buffer_handle_byte_bridge")
+fn v3Libp2pWebrtcBufferHandleByteBridge(handle: uint64, idx: int32): int32
+@importc("cheng_v3_buffer_handle_release_bridge")
+fn v3Libp2pWebrtcBufferHandleReleaseBridge(handle: uint64): int32
 importc fn cheng_v3_webrtc_last_error_handle_bridge(): uint64
 importc fn cheng_v3_webrtc_datachannel_request_response_handle_bridge(protocolText: str, signalWire: str, requestWire: str, responseWire: str): uint64
 importc fn cheng_v3_webrtc_browser_session_open_handle_bridge(policyText: str, labelText: str): uint64
@@ -31,18 +37,22 @@ fn v3Libp2pWebrtcOwnedBytesFromString(text: str): Bytes =
 fn v3Libp2pWebrtcBytesFromHandle(handle: uint64): Result[Bytes] =
     if handle == uint64(0):
         return Err[Bytes]("v3 libp2p webrtc: bridge failed")
-    let n = tcpabi.cheng_v3_buffer_handle_len_bridge(handle)
+    var n: int32 = 0
+    n = v3Libp2pWebrtcBufferHandleLenBridge(handle)
     if n < 0:
-        tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        let _ = v3Libp2pWebrtcBufferHandleReleaseBridge(handle)
         return Err[Bytes]("v3 libp2p webrtc: bridge handle len failed")
     var out = bytesAlloc(n)
-    for i in 0..<n:
-        let b = tcpabi.cheng_v3_buffer_handle_byte_bridge(handle, i)
+    var i = 0
+    while i < n:
+        var b: int32 = 0
+        b = v3Libp2pWebrtcBufferHandleByteBridge(handle, i)
         if b < 0:
-            tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+            let _ = v3Libp2pWebrtcBufferHandleReleaseBridge(handle)
             return Err[Bytes]("v3 libp2p webrtc: bridge handle byte failed")
         bytesSet(out, i, b)
-    tcpabi.cheng_v3_buffer_handle_release_bridge(handle)
+        i = i + 1
+    let _ = v3Libp2pWebrtcBufferHandleReleaseBridge(handle)
     return Ok[Bytes](out)
 
 fn v3Libp2pWebrtcLastErrorText(fallback: str): str =
@@ -92,7 +102,7 @@ fn v3Libp2pWebrtcTransportConfigZero(): V3Libp2pWebrtcTransportConfig =
 
 fn v3Libp2pWebrtcTransportConfigApplyRelayLease(cfg: var V3Libp2pWebrtcTransportConfig,
                                                 lease: types.V3Libp2pRelayLease): Result[bool] =
-    if !types.v3Libp2pRelayLeaseActiveAt(lease, times.epochTimeSeconds()):
+    if !types.v3Libp2pRelayLeaseActiveAt(lease, times.EpochTimeSeconds()):
         return Err[bool]("v3 libp2p webrtc: relay lease inactive")
     if lease.serviceKind == types.v3Libp2pRelayServiceStun:
         if len(lease.endpointText) <= 0:

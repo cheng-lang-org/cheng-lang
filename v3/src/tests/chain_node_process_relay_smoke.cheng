@@ -8,24 +8,25 @@ import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/transports/tcp_transport
 
 fn main(): int32 =
-    let upstreamPort = cmdline.readInt32FlagOrDefault("--upstream-port", -1)
+    let upstreamPort = cmdline.ReadInt32FlagOrDefault("--upstream-port", -1)
     assert(upstreamPort > 0, "v3 chain_node process relay: invalid upstream port")
 
-    let port = cmdline.readInt32FlagOrDefault("--port", 0)
-    var ready_path: str = ""
-    let has_ready = cmdline.readFirstFlagValue("--ready-path", ready_path)
-    let ready_path_value = if has_ready: ready_path else: ""
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let ready_path_value = cmdline.ReadFlagOrDefault("--ready-path", "")
 
-    var relay = node.v3ChainNodeInit("process.relay", "process.loopback")
+    var relay: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(relay, "process.relay", "process.loopback")),
+           "v3 chain_node: init")
     let payloadRes = tcp_transport.v3Libp2pTcpRecvPayloadOnce("127.0.0.1",
                                                               upstreamPort,
                                                               types.v3Libp2pProtocolSync)
     assert(payloadRes.ok, "v3 chain_node process relay: recv payload")
 
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(payloadRes.value)
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(payloadRes.value, snapshot)
     assert(snapshotRes.ok, "v3 chain_node process relay: decode snapshot")
 
-    let syncRes = node.v3ChainNodeSyncOnce(relay, snapshotRes.value)
+    let syncRes = node.v3ChainNodeSyncOnce(relay, snapshot)
     assert(syncRes.ok, "v3 chain_node process relay: sync")
     assert(syncRes.value, "v3 chain_node process relay: sync changed")
 
@@ -36,12 +37,13 @@ fn main(): int32 =
     assert(aliceRes.value == int64(55), "v3 chain_node process relay: alice 55")
     assert(bobRes.value == int64(33), "v3 chain_node process relay: bob 33")
 
-    let relaySnapshot = node.v3ChainNodeServeOnce(relay)
-    assert(layout.fixedBytes32Equal(relaySnapshot.tipEventCid, snapshotRes.value.tipEventCid),
+    var relaySnapshot: node.V3ChainNodeServeSnapshot
+    node.v3ChainNodeServeOnceInto(relaySnapshot, relay)
+    assert(layout.fixedBytes32Equal(relaySnapshot.tipEventCid, snapshot.tipEventCid),
         "v3 chain_node process relay: tip cid")
-    assert(layout.fixedBytes32Equal(relaySnapshot.forest.forestCid, snapshotRes.value.forest.forestCid),
+    assert(layout.fixedBytes32Equal(relaySnapshot.forest.forestCid, snapshot.forest.forestCid),
         "v3 chain_node process relay: forest cid")
-    assert(anti.v3AntiEntropySignatureEqual(relaySnapshot.signature, snapshotRes.value.signature),
+    assert(anti.v3AntiEntropySignatureEqual(relaySnapshot.signature, snapshot.signature),
         "v3 chain_node process relay: signature")
 
     let relayPayload = net.v3ChainNodeLibp2pEncodeSnapshot(relaySnapshot)

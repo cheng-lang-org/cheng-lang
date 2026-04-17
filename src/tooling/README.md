@@ -145,8 +145,9 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - 注册中心元数据：当提供 `--package/--channel` 时，会写入 `[snapshot]`（`cid/author_id/signature/pub_key`）。
 - 构建期校验：可加 `--verify`（可选 `--ledger:<path>`）自动校验 buildmeta/lock/pkgmeta/snapshot。
 - `cheng` 入口（canonical）支持 `--emit:exe`；`--emit-obj/--obj-out/--backend:obj` 已在生产链路移除并会直接报错。`compile/chengc` 已移除并返回 `rc=2`；`cheng` 固定 dev-only：固定注入 `BACKEND_BUILD_TRACK=dev`、`BACKEND_FAST_DEV_PROFILE=1`、`BACKEND_STAGE1_PARSE_MODE=outline`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=1`、`BACKEND_LINKERLESS_INMEM=1`、`BACKEND_FAST_FALLBACK_ALLOW=0`，并显式透传 `BACKEND_JOBS/BACKEND_FN_JOBS`（未设置时走 host 并行默认），同时拒绝 `--release` 与 `BACKEND_BUILD_TRACK=release` 抬升。
-- 发布编译入口改为 `release-compile`：固定 `BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`、`BACKEND_FAST_FALLBACK_ALLOW=0`、`BACKEND_NO_RUNTIME_C=0`、`BACKEND_OPT_LEVEL=3`（默认 `BACKEND_RELEASE_CFLAGS/BACKEND_RELEASE_LDFLAGS=-O3 -flto`），并显式透传 `BACKEND_JOBS/BACKEND_FN_JOBS`。
+- 发布编译入口改为 `release-compile`：固定 `BACKEND_BUILD_TRACK=release`、`BACKEND_LINKER=system`、`BACKEND_STAGE1_PARSE_MODE=full`、`BACKEND_FN_SCHED=ws`、`BACKEND_DIRECT_EXE=0`、`BACKEND_LINKERLESS_INMEM=0`、`BACKEND_FAST_FALLBACK_ALLOW=0`、`BACKEND_OPT_LEVEL=3`（默认 `BACKEND_RELEASE_CFLAGS/BACKEND_RELEASE_LDFLAGS=-O3 -flto`），并显式透传 `BACKEND_JOBS/BACKEND_FN_JOBS`。system-link 默认只链接纯 Cheng runtime object：优先吃显式 `BACKEND_RUNTIME_OBJ`，否则自动解析 `chengcache/runtime_selflink/program_runtime.combined.<target>.o`；如果这份组合物不存在，就从 `chengcache/runtime_selflink/probe_split/` 下的程序 runtime 五件套现场合成，再直接使用；仍然找不到就直接失败。
 - `release-compile` 支持 `--emit:exe|shared|static`。其中 `shared/static` 走 release object-first 打包链（后端先产 `obj`，再由系统工具链打包库；默认附带 runtime C object，可用 `BACKEND_RELEASE_LIBRARY_INCLUDE_RUNTIME=0` 关闭）。
+- `verify-export-visibility` 会扫描仓内 `src/`、`v2/src/`、`v3/src/`、`v3/codex/src/` 的 Cheng 源文件，硬失败任何跨包小写私有符号访问；`build-backend-driver` 与 `run-host-smokes` 现在都会先强制跑这条门禁。
 - `cheng/release-compile` 都不接受 `--linker:*`，也不接受 `BACKEND_LINKER` 环境覆盖；`cheng` 固定 `self-link + direct-exe`，`release-compile` 固定 `system-link`。
 - 并发公开契约：`BACKEND_JOBS` 是唯一公开 worker 数控制面；`BACKEND_FN_SCHED=serial` 仅保留给内部诊断、perf 对照与低内存 bring-up。
 - `--emit:shared|static` 不允许 `--run/--run:*`；违规返回 `rc=2`。
@@ -191,7 +192,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
   - `string_abi_contract.closure=required`
   - 本项当前验证 selector-owned cstring lowering 与 hard-fail guard；default verify 与 `backend_prod_closure` 共同负责日常漂移检查。
 - STRLIT-01 String literal regression gate：`cheng_tooling verify_backend_string_literal_regression` 复跑 canonical `artifacts/backend_driver/cheng` 的 4 个字符串字面量 runtime probe，并保留 `60s timeout + sample` 诊断报告到 `artifacts/backend_string_literal_regression/backend_string_literal_regression.report.txt`。
-- STRFMT-01 Std strformat gate：`cheng_tooling verify_std_strformat` 分别编译并运行 `fmt(singleton str[])`、`fmt(str[])`、`fmt"...{expr}..."` 稳态单占位 probe、`lines(str[])` probe，报告到 `artifacts/std_strformat/std_strformat.report.txt`。
+- STRFMT-01 Std strformat gate：`cheng_tooling verify_std_strformat` 分别编译并运行 `Fmt(singleton str[])`、`Fmt(str[])`、`Fmt"...{expr}..."` 稳态单占位 probe、`Lines(str[])` probe，报告到 `artifacts/std_strformat/std_strformat.report.txt`。
 - OUTSAFE-01 Backend default output safety gate：`cheng_tooling verify_backend_default_output_safety` 校验 canonical driver 在未显式指定输出路径时不会改写输入 `.cheng` 源文件，且默认 exe / obj 输出路径都可用；报告到 `artifacts/backend_default_output_safety/backend_default_output_safety.report.txt`。
   - 本项用于阻断 sidecar/object cstring payload 回退，不进入 `backend_prod_closure` required。
 - DOTLOW-01 dot-lowering 契约冻结：`cheng_tooling build_backend_dot_lowering_contract` 生成 `src/tooling/backend_dot_lowering_contract.env`；`cheng_tooling verify_backend_dot_lowering_contract` 校验 `docs/backend-dot-lowering-contract.md` + `docs/UIR.md` + `src/tooling/README.md` + `docs/backend-techdebt-matrix.md` 的漂移，输出 `artifacts/backend_dot_lowering_contract/*.report.txt`。
@@ -217,7 +218,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
 - PAR-08 生产收口：`cheng_tooling backend_prod_closure --no-publish` 执行 dev required gates 收口；发布产物改由 `cheng_tooling backend-prod-publish` 统一生成并发布。
 - PAR-05 兼容执行门禁：`cheng_tooling verify_backend_hotpatch` 持续覆盖 host-runner E2E（v1->v2 append 生效、编译失败保活、max-growth/layout-change 触发受控重启），并输出 `artifacts/backend_hotpatch/hotpatch.<target>.report.txt`。
 - PAR-03 DOD/SoA：`cheng_tooling verify_backend_dod_soa` 校验 `stage1(nodeArena) + uir(int32 index)` 结构标记、`stage1/backend/uir` profile 事件与吞吐门禁（相对 `src/tooling/backend_dod_soa_baseline.env` 基线提升），并生成 `artifacts/backend_dod_soa/*.report.txt`。
-- PAR-06 Release System-Link：`cheng_tooling verify_backend_release_c_o3_lto`（兼容脚本名）以 required 口径校验 release `system-link + O3/LTO`：强制 `BACKEND_LINKER=system`、`BACKEND_NO_RUNTIME_C=0`、`mold->lld->default` 解析，并输出 `artifacts/backend_release_c_o3_lto/backend_release_c_o3_lto.report.txt`（`gate=backend.release_system_link`）。
+- PAR-06 Release System-Link：`cheng_tooling verify_backend_release_c_o3_lto`（兼容脚本名）以 required 口径校验 release `system-link + O3/LTO`：强制 `BACKEND_LINKER=system`、纯 Cheng runtime object 解析、`mold->lld->default` 解析，并输出 `artifacts/backend_release_c_o3_lto/backend_release_c_o3_lto.report.txt`（`gate=backend.release_system_link`）。
   - 并行实现：`emit=exe + BACKEND_MULTI=1` 时按单元编译并链接；优先使用 `fork` worker（`BACKEND_MULTI_FORK`，`stage1` 默认开启），不可用时回退到串行单元编译。
   - 单单元 fast-path：`emit=exe + multi` 仅在单元数 `>1` 时启用 `.objs` 多单元路径；单单元输入会走 `single.emit_obj + single.link`（避免无收益拆分与额外链接复杂度）。
   - module-cache（`.objs/.build.module.cache`；`BACKEND_MULTI_MODULE_CACHE`）在 `emit=exe + multi` 路径读写，复用模块建图结果；当前 stable 口径默认禁用，且对 load 路径做硬禁用防护（显式 unstable override 仅用于排障请求记录，不会在 stable driver 上启用 load）。
@@ -335,7 +336,7 @@ cheng_tooling backend_link_env --driver:artifacts/backend_driver/cheng --target:
 ```
 说明：
 - `--linker:self`：自动构建/复用 `chengcache/system_helpers.backend.cheng.<target>.o` 并输出  
-  `BACKEND_LINKER=self BACKEND_NO_RUNTIME_C=1 BACKEND_RUNTIME_OBJ=<...>`。
+  `BACKEND_LINKER=self BACKEND_RUNTIME_OBJ=<...>`。
 - `--linker:auto`（默认）或未设置：按目标自动选择（支持 self-link 的目标默认 `self`，否则回退 `system`）；生产主链建议固定 `self`。
 
 纯 Cheng（不走 C 后端）生成/更新固定 seed（stage2 driver）：
@@ -743,7 +744,7 @@ cheng_tooling verify_stage1_seed_layout
 - `verify.sh` 默认把 `verify.tooling_cmdline` 作为必跑 gate（`cheng_tooling verify_tooling_cmdline`）。
 - `verify.sh` 默认把 `verify.backend_stage1_fixed0_envs` 作为必跑 gate，阻断 `STAGE1_SKIP_SEM/STAGE1_SKIP_OWNERSHIP` 回流，并要求 `STAGE1_SEM_FIXED_0/STAGE1_OWNERSHIP_FIXED_0` 保持 `fixed=0`。
 - `verify.sh` 默认把 `verify.backend_string_literal_regression` 作为必跑 gate，复跑 canonical driver 的 4 个字符串字面量 probe，并保留超时采样报告。
-- `verify.sh` 默认把 `verify.std_strformat` 作为必跑 gate，锁定 `std/strformat` 的 `fmt(str[]) / fmt"...{expr}..." / lines(str[])` 基本行为。
+- `verify.sh` 默认把 `verify.std_strformat` 作为必跑 gate，锁定 `std/strformat` 的 `Fmt(str[]) / Fmt"...{expr}..." / Lines(str[])` 基本行为。
 - `verify.sh` 默认把 `verify.backend_default_output_safety` 作为必跑 gate，阻断 canonical driver 在无显式输出路径时覆盖输入源码的回归。
 - `verify.sh` 默认优先使用 `bundle full` 入口运行 `chengc/verify_backend_closedloop/backend_prod_closure`（缺失时自动构建）：
   - `VERIFY_USE_TOOLING_BUNDLE_FULL=1`（默认开启）

@@ -3,17 +3,24 @@ import std/rawbytes
 import std/system
 import std/strings
 import std/strutils
+import std/os as os
 import std/times
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/peer_id
 import cheng/v3/libp2p/core/multiaddr
 import cheng/v3/libp2p/identity/did
+import cheng/v3/libp2p/content/moq_fountain as moq
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
 import cheng/v3/project/bio_same_person as bio
 import cheng/v3/project/bio_did_chain_node as bio_did
 
 @importc("cheng_v3_buffer_handle_from_raw_bridge")
 fn cheng_v3_buffer_handle_from_raw_bridge(data: ptr, n: int32): uint64
+@importc("cheng_v3_sha256_hex_bridge")
+fn cheng_v3_sha256_hex_bridge(text: str): str
+@importc("cheng_v3_quote_json_text_bridge")
+fn cheng_v3_quote_json_text_bridge(text: str): str
 @importc("malloc")
 fn c_malloc(size: int64): ptr
 @importc("free")
@@ -98,7 +105,7 @@ fn v3MobileCapiDecodeWireText(text: str): Result[str] =
 fn v3MobileCapiWireFindValue(wire: str, key: str): Result[str] =
     let prefix = key + "="
     var lineStart: int32 = 0
-    let n = strings.len(wire)
+    let n = strings.Len(wire)
     while lineStart < n:
         var lineEnd = lineStart
         while lineEnd < n:
@@ -107,9 +114,9 @@ fn v3MobileCapiWireFindValue(wire: str, key: str): Result[str] =
             lineEnd = lineEnd + 1
         var line = ""
         if lineEnd > lineStart:
-            line = strutils.sliceStr(wire, lineStart, lineEnd - 1)
-        if strutils.startsWith(line, prefix):
-            return Ok[str](strutils.sliceStr(line, strings.len(prefix), strings.len(line) - 1))
+            line = strutils.SliceStr(wire, lineStart, lineEnd - 1)
+        if strutils.StartsWith(line, prefix):
+            return Ok[str](strutils.SliceStr(line, strings.Len(prefix), strings.Len(line) - 1))
         lineStart = lineEnd + 1
     return Err[str]("v3 mobile capi: missing wire field " + key)
 
@@ -156,6 +163,588 @@ fn v3MobileCapiCopyRawText(raw: ptr): str =
         return ""
     let out = strFromCStringCopy(cstring(raw))
     return out
+
+type V3MobileMoqDroplet = object
+    objectIndex: int32
+    dropletIndex: int32
+    kindCode: int32
+    key: str
+    peerId: str
+    cid: str
+    degree: int32
+    blockIndexes: int32[]
+    payload: Bytes
+
+type V3MobileMoqObject = object
+    objectIndex: int32
+    groupId: str
+    objectId: str
+    priority: int32
+    byteOffset: int32
+    byteLength: int32
+    objectCid: str
+    sourceBlockBytes: int32
+    sourceBlockCount: int32
+    repairDropletCount: int32
+    droplets: V3MobileMoqDroplet[]
+
+type V3MobileMoqEquation = object
+    coeffs: int32[]
+    payload: Bytes
+
+const v3MobileMoqCatalogMagic = "unimaker.moq.fountain.catalog.v1"
+const v3MobileMoqTransport = "native_media_rpc"
+const v3MobileMoqLayout = "lt_xor_v1"
+const v3MobileMoqDropletKindSource = 1
+const v3MobileMoqDropletKindRepair = 2
+
+fn v3MobileCapiWireAppendRaw(out0: str, key: str, value: str): str =
+    return out0 + key + "=" + value + "\n"
+
+fn v3MobileCapiWireAppendInt(out0: str, key: str, value: int32): str =
+    return v3MobileCapiWireAppendRaw(out0, key, strings.IntToStr(value))
+
+fn v3MobileCapiMoqDropletKindText(kindCode: int32): str =
+    if kindCode == v3MobileMoqDropletKindSource:
+        return "source"
+    if kindCode == v3MobileMoqDropletKindRepair:
+        return "repair"
+    return "unknown"
+
+fn v3MobileCapiMoqError(errorText: str): str =
+    var out = ""
+    out = v3MobileCapiWireAppendRaw(out, "ok", "0")
+    out = v3MobileCapiWireAppendRaw(out, "error", errorText)
+    return out
+
+fn v3MobileCapiMaxInt32(left: int32, right: int32): int32 =
+    if left >= right:
+        return left
+    return right
+
+fn v3MobileCapiMinInt32(left: int32, right: int32): int32 =
+    if left <= right:
+        return left
+    return right
+
+fn v3MobileCapiNormalizePositiveInt(value: int32, fallback: int32): int32 =
+    var out = value
+    if out <= 0:
+        out = fallback
+    if out <= 0:
+        return 1
+    return out
+
+fn v3MobileCapiHexValue(ch: char): int32 =
+    if ch >= '0' && ch <= '9':
+        return int32(ch) - int32('0')
+    if ch >= 'a' && ch <= 'f':
+        return 10 + int32(ch) - int32('a')
+    if ch >= 'A' && ch <= 'F':
+        return 10 + int32(ch) - int32('A')
+    return -1
+
+fn v3MobileCapiBytesFromHex(text: str): Result[Bytes] =
+    if len(text) <= 0:
+        return Ok[Bytes](emptyBytes())
+    if (len(text) % 2) != 0:
+        return Err[Bytes]("v3 mobile capi: invalid hex length")
+    var out = bytesAlloc(len(text) / 2)
+    var i = 0
+    while i < len(text):
+        let hi = v3MobileCapiHexValue(text[i])
+        let lo = v3MobileCapiHexValue(text[i + 1])
+        if hi < 0 || lo < 0:
+            return Err[Bytes]("v3 mobile capi: invalid hex")
+        bytesSet(out, i / 2, (hi << 4) | lo)
+        i = i + 2
+    return Ok[Bytes](out)
+
+fn v3MobileCapiSha256HexBytes(data: Bytes): str =
+    let text = bytesToString(data)
+    let digest = cheng_v3_sha256_hex_bridge(text)
+    return digest
+
+fn v3MobileCapiSha256HexText(text: str): str =
+    return v3MobileCapiSha256HexBytes(bytesFromString(text))
+
+fn v3MobileCapiAsciiTrimLeft(text: str): int32 =
+    var idx: int32 = 0
+    while idx < len(text):
+        let ch = text[idx]
+        let code = int32(ch)
+        if code == 32:
+            idx = idx + 1
+            continue
+        if code == 10:
+            idx = idx + 1
+            continue
+        if code == 13:
+            idx = idx + 1
+            continue
+        if code == 9:
+            idx = idx + 1
+            continue
+        break
+    return idx
+
+fn v3MobileCapiAsciiTrimRight(text: str): int32 =
+    var idx: int32 = len(text)
+    while idx > 0:
+        let ch = text[idx - 1]
+        let code = int32(ch)
+        if code == 32:
+            idx = idx - 1
+            continue
+        if code == 10:
+            idx = idx - 1
+            continue
+        if code == 13:
+            idx = idx - 1
+            continue
+        if code == 9:
+            idx = idx - 1
+            continue
+        break
+    return idx
+
+fn v3MobileCapiTrimAscii(text: str): str =
+    let start = v3MobileCapiAsciiTrimLeft(text)
+    let stop = v3MobileCapiAsciiTrimRight(text)
+    if stop <= start:
+        return ""
+    return strings.SliceBytes(text, start, stop - start)
+
+fn v3MobileCapiSplitCsv(text: str): str[] =
+    var out: str[]
+    out = []
+    if len(text) <= 0:
+        return out
+    var start: int32 = 0
+    var idx: int32 = 0
+    while idx <= len(text):
+        let atEnd = idx >= len(text)
+        if atEnd || text[idx] == ',':
+            var item = ""
+            if idx > start:
+                item = strings.SliceBytes(text, start, idx - start)
+            add(out, item)
+            start = idx + 1
+        idx = idx + 1
+    return out
+
+fn v3MobileCapiNormalizePeerCsv(peerCsv: str): str[] =
+    let parts = v3MobileCapiSplitCsv(peerCsv)
+    var out: str[]
+    out = []
+    var i: int32 = 0
+    while i < parts.len:
+        let part = parts[i]
+        let candidate = v3MobileCapiTrimAscii(part)
+        if len(candidate) <= 0:
+            i = i + 1
+            continue
+        var exists = false
+        var j: int32 = 0
+        while j < out.len:
+            if out[j] == candidate:
+                exists = true
+                break
+            j = j + 1
+        if !exists:
+            add(out, candidate)
+        i = i + 1
+    return out
+
+fn v3MobileCapiJoinCsv(values: str[]): str =
+    if values.len <= 0:
+        return ""
+    return strutils.Join(values, ",")
+
+fn v3MobileCapiJoinIntCsv(values: int32[]): str =
+    var rows: str[]
+    rows = []
+    for i in 0..<values.len:
+        add(rows, strings.IntToStr(values[i]))
+    return strutils.Join(rows, ",")
+
+fn v3MobileCapiJsonEscape(text: str): str =
+    let quoted = cheng_v3_quote_json_text_bridge(text)
+    if len(quoted) <= 2:
+        return ""
+    return strings.SliceBytes(quoted, 1, len(quoted) - 2)
+
+fn v3MobileCapiJsonQuote(text: str): str =
+    let quoted = cheng_v3_quote_json_text_bridge(text)
+    return quoted
+
+fn v3MobileCapiJoinIntJson(values: int32[]): str =
+    if values.len <= 0:
+        return "[]"
+    var rows: str[]
+    rows = []
+    for i in 0..<values.len:
+        add(rows, strings.IntToStr(values[i]))
+    return "[" + strutils.Join(rows, ",") + "]"
+
+fn v3MobileCapiContainsInt(values: int32[], want: int32): bool =
+    for i in 0..<values.len:
+        if values[i] == want:
+            return true
+    return false
+
+fn v3MobileCapiSortInts(values0: int32[]): int32[] =
+    var values = values0
+    var i = 0
+    while i < values.len:
+        var j = i + 1
+        while j < values.len:
+            if values[j] < values[i]:
+                let tmp = values[i]
+                values[i] = values[j]
+                values[j] = tmp
+            j = j + 1
+        i = i + 1
+    return values
+
+fn v3MobileCapiHashSeed(text: str): int32 =
+    let digestHex = cheng_v3_sha256_hex_bridge(text)
+    if len(digestHex) < 8:
+        return 1
+    var out: int32 = 0
+    var i: int32 = 0
+    while i < 8:
+        let nibble = v3MobileCapiHexValue(digestHex[i])
+        if nibble < 0:
+            return 1
+        out = (out << 4) | nibble
+        i = i + 1
+    if out == 0:
+        return 1
+    return out
+
+fn v3MobileCapiMoqDropletJson(droplet: V3MobileMoqDroplet): str =
+    let kindText = v3MobileCapiMoqDropletKindText(droplet.kindCode)
+    var row = "{"
+    row = row + "\"objectIndex\":" + strings.IntToStr(droplet.objectIndex) + ","
+    row = row + "\"dropletIndex\":" + strings.IntToStr(droplet.dropletIndex) + ","
+    row = row + "\"kind\":" + v3MobileCapiJsonQuote(kindText) + ","
+    row = row + "\"key\":" + v3MobileCapiJsonQuote(droplet.key) + ","
+    row = row + "\"peerId\":" + v3MobileCapiJsonQuote(droplet.peerId) + ","
+    row = row + "\"cid\":" + v3MobileCapiJsonQuote(droplet.cid) + ","
+    row = row + "\"degree\":" + strings.IntToStr(droplet.degree) + ","
+    row = row + "\"blockIndexes\":" + v3MobileCapiJoinIntJson(droplet.blockIndexes)
+    row = row + "}"
+    return row
+
+fn v3MobileCapiMoqDropletsJson(droplets: V3MobileMoqDroplet[]): str =
+    var rows: str[]
+    rows = []
+    var idx: int32 = 0
+    while idx < droplets.len:
+        add(rows, v3MobileCapiMoqDropletJson(droplets[idx]))
+        idx = idx + 1
+    return strutils.Join(rows, ",")
+
+fn v3MobileCapiMoqObjectJson(item: V3MobileMoqObject): str =
+    var row = "{"
+    row = row + "\"objectIndex\":" + strings.IntToStr(item.objectIndex) + ","
+    row = row + "\"groupId\":" + v3MobileCapiJsonQuote(item.groupId) + ","
+    row = row + "\"objectId\":" + v3MobileCapiJsonQuote(item.objectId) + ","
+    row = row + "\"priority\":" + strings.IntToStr(item.priority) + ","
+    row = row + "\"byteOffset\":" + strings.IntToStr(item.byteOffset) + ","
+    row = row + "\"byteLength\":" + strings.IntToStr(item.byteLength) + ","
+    row = row + "\"objectCid\":" + v3MobileCapiJsonQuote(item.objectCid) + ","
+    row = row + "\"sourceBlockBytes\":" + strings.IntToStr(item.sourceBlockBytes) + ","
+    row = row + "\"sourceBlockCount\":" + strings.IntToStr(item.sourceBlockCount) + ","
+    row = row + "\"repairDropletCount\":" + strings.IntToStr(item.repairDropletCount) + ","
+    row = row + "\"droplets\":[" + v3MobileCapiMoqDropletsJson(item.droplets) + "]"
+    row = row + "}"
+    return row
+
+fn v3MobileCapiParseInt32Text(text: str): int32 =
+    return int32(strutils.ParseInt(text))
+
+fn v3MobileCapiParseInt32Wire(requestWire: str, key: str): Result[int32] =
+    let rawRes = v3MobileCapiWireFindValue(requestWire, key)
+    if IsErr(rawRes):
+        return Err[int32](Error(rawRes))
+    let rawText = Value(rawRes)
+    return Ok[int32](v3MobileCapiParseInt32Text(rawText))
+
+fn v3MobileCapiMoqAppendDroplets(out: var V3MobileMoqDroplet[],
+                                 droplets: V3MobileMoqDroplet[]) =
+    var idx: int32 = 0
+    while idx < droplets.len:
+        add(out, droplets[idx])
+        idx = idx + 1
+
+fn v3MobileCapiMoqBuildObject(objectBytes: Bytes,
+                              objectIndex: int32,
+                              byteOffset: int32,
+                              peers: str[],
+                              bundleCid: str,
+                              sourceBlockBytes: int32,
+                              repairDropletCount: int32): Result[V3MobileMoqObject] =
+    let objectByteLen = bytesLen(objectBytes)
+    let objectCid = v3MobileCapiSha256HexBytes(objectBytes)
+    let sourceBlockCount = (objectByteLen + sourceBlockBytes - 1) / sourceBlockBytes
+    var blocks: Bytes[]
+    blocks = []
+    var blockIndex: int32 = 0
+    while blockIndex < sourceBlockCount:
+        let blockOffset = blockIndex * sourceBlockBytes
+        let blockLen = v3MobileCapiMinInt32(sourceBlockBytes, objectByteLen - blockOffset)
+        let blockBytes = bytesSlice(objectBytes, blockOffset, blockLen)
+        add(blocks, v3MobileCapiPadBlock(blockBytes, sourceBlockBytes))
+        blockIndex = blockIndex + 1
+    var objectDroplets: V3MobileMoqDroplet[]
+    objectDroplets = []
+    blockIndex = 0
+    while blockIndex < sourceBlockCount:
+        var indexes: int32[]
+        indexes = []
+        add(indexes, blockIndex)
+        let peerId = peers[(objectIndex + blockIndex) % peers.len]
+        let payload = blocks[blockIndex]
+        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-s" + strings.IntToStr(blockIndex)
+        let droplet = V3MobileMoqDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: blockIndex,
+            kindCode: v3MobileMoqDropletKindSource,
+            key: key,
+            peerId: peerId,
+            cid: v3MobileCapiSha256HexBytes(payload),
+            degree: 1,
+            blockIndexes: indexes,
+            payload: payload
+        )
+        add(objectDroplets, droplet)
+        blockIndex = blockIndex + 1
+    var repairIndex: int32 = 0
+    while repairIndex < repairDropletCount:
+        var degreeBase: int32 = 1
+        if sourceBlockCount > 1:
+            let seedText = bundleCid + "|o" + strings.IntToStr(objectIndex) + "|r" + strings.IntToStr(repairIndex)
+            degreeBase = 2 + v3MobileCapiPositiveMod(v3MobileCapiHashSeed(seedText), sourceBlockCount - 1)
+        let repairSeed = bundleCid + "|repair|" + strings.IntToStr(objectIndex) + "|" + strings.IntToStr(repairIndex)
+        let blockIndexes = v3MobileCapiChooseUniqueBlockIndexes(
+            sourceBlockCount,
+            degreeBase,
+            repairSeed
+        )
+        var payload = bytesAlloc(sourceBlockBytes)
+        var blockPick: int32 = 0
+        while blockPick < blockIndexes.len:
+            let xorOk = v3MobileCapiXorInto(payload, blocks[blockIndexes[blockPick]])
+            if IsErr(xorOk):
+                return Err[V3MobileMoqObject](Error(xorOk))
+            blockPick = blockPick + 1
+        let dropletIndex = sourceBlockCount + repairIndex
+        let peerId = peers[(objectIndex + dropletIndex) % peers.len]
+        let key = "moqdrop-" + bundleCid + "-o" + strings.IntToStr(objectIndex) + "-r" + strings.IntToStr(repairIndex)
+        let droplet = V3MobileMoqDroplet(
+            objectIndex: objectIndex,
+            dropletIndex: dropletIndex,
+            kindCode: v3MobileMoqDropletKindRepair,
+            key: key,
+            peerId: peerId,
+            cid: v3MobileCapiSha256HexBytes(payload),
+            degree: blockIndexes.len,
+            blockIndexes: blockIndexes,
+            payload: payload
+        )
+        add(objectDroplets, droplet)
+        repairIndex = repairIndex + 1
+    let objectOut = V3MobileMoqObject(
+        objectIndex: objectIndex,
+        groupId: bundleCid,
+        objectId: "object-" + strings.IntToStr(objectIndex),
+        priority: objectIndex,
+        byteOffset: byteOffset,
+        byteLength: objectByteLen,
+        objectCid: objectCid,
+        sourceBlockBytes: sourceBlockBytes,
+        sourceBlockCount: sourceBlockCount,
+        repairDropletCount: repairDropletCount,
+        droplets: objectDroplets
+    )
+    return Ok[V3MobileMoqObject](objectOut)
+
+fn v3MobileCapiNextSeed(state0: int32): int32 =
+    var state = state0
+    if state == 0:
+        state = 1
+    state = state ^ (state << 13)
+    state = state ^ (state >> 17)
+    state = state ^ (state << 5)
+    if state == 0:
+        return 1
+    return state
+
+fn v3MobileCapiPositiveMod(value: int32, modBy: int32): int32 =
+    if modBy <= 0:
+        return 0
+    let normalized = int64(value & 2147483647)
+    return int32(normalized % int64(modBy))
+
+fn v3MobileCapiChooseUniqueBlockIndexes(blockCount: int32, degree0: int32, seedText: str): int32[] =
+    var out: int32[]
+    out = []
+    if blockCount <= 0:
+        return out
+    let degree = v3MobileCapiMinInt32(blockCount, v3MobileCapiMaxInt32(1, degree0))
+    var seed = v3MobileCapiHashSeed(seedText)
+    while out.len < degree:
+        seed = v3MobileCapiNextSeed(seed)
+        let candidate = v3MobileCapiPositiveMod(seed, blockCount)
+        if !v3MobileCapiContainsInt(out, candidate):
+            add(out, candidate)
+    return v3MobileCapiSortInts(out)
+
+fn v3MobileCapiPadBlock(data: Bytes, blockBytes: int32): Bytes =
+    if bytesLen(data) == blockBytes:
+        return bytesSlice(data, 0, bytesLen(data))
+    var out = bytesAlloc(blockBytes)
+    let copyLen = v3MobileCapiMinInt32(bytesLen(data), blockBytes)
+    for i in 0..<copyLen:
+        bytesSet(out, i, bytesGet(data, i))
+    return out
+
+fn v3MobileCapiXorInto(target: var Bytes, source: Bytes): Result[bool] =
+    if bytesLen(target) != bytesLen(source):
+        return Err[bool]("v3 mobile capi: xor length mismatch")
+    for i in 0..<bytesLen(target):
+        bytesSet(target, i, bytesGet(target, i) ^ bytesGet(source, i))
+    return Ok[bool](true)
+
+fn v3MobileCapiXorBytes(left: Bytes, right: Bytes): Result[Bytes] =
+    if bytesLen(left) != bytesLen(right):
+        return Err[Bytes]("v3 mobile capi: xor length mismatch")
+    var out = bytesAlloc(bytesLen(left))
+    for i in 0..<bytesLen(left):
+        bytesSet(out, i, bytesGet(left, i) ^ bytesGet(right, i))
+    return Ok[Bytes](out)
+
+fn v3MobileCapiMoqBuildCatalogJson(ownerPeerId: str,
+                                   mimeType: str,
+                                   blobCid: str,
+                                   blobByteLen: int32,
+                                   bundleCid: str,
+                                   objectTargetBytes: int32,
+                                   sourceBlockBytes: int32,
+                                   objects: V3MobileMoqObject[]): str =
+    var objectRows: str[]
+    objectRows = []
+    var objectIndex: int32 = 0
+    while objectIndex < objects.len:
+        add(objectRows, v3MobileCapiMoqObjectJson(objects[objectIndex]))
+        objectIndex = objectIndex + 1
+    var out = "{"
+    out = out + "\"magic\":\"unimaker.moq.fountain.catalog.v1\","
+    out = out + "\"version\":1,"
+    out = out + "\"transport\":\"native_media_rpc\","
+    out = out + "\"fountainLayout\":\"lt_xor_v1\","
+    out = out + "\"ownerPeerId\":" + v3MobileCapiJsonQuote(ownerPeerId) + ","
+    out = out + "\"mimeType\":" + v3MobileCapiJsonQuote(mimeType) + ","
+    out = out + "\"blobCid\":" + v3MobileCapiJsonQuote(blobCid) + ","
+    out = out + "\"blobByteLen\":" + strings.IntToStr(blobByteLen) + ","
+    out = out + "\"trackId\":" + v3MobileCapiJsonQuote("track:" + bundleCid) + ","
+    out = out + "\"bundleCid\":" + v3MobileCapiJsonQuote(bundleCid) + ","
+    out = out + "\"objectTargetBytes\":" + strings.IntToStr(objectTargetBytes) + ","
+    out = out + "\"sourceBlockBytes\":" + strings.IntToStr(sourceBlockBytes) + ","
+    out = out + "\"objectCount\":" + strings.IntToStr(objects.len) + ","
+    out = out + "\"objects\":[" + strutils.Join(objectRows, ",") + "]"
+    out = out + "}"
+    return out
+
+fn v3MobileCapiMoqFountainBuild(blobText: str,
+                                ownerPeerId: str,
+                                remotePeersCsv: str,
+                                mimeType0: str,
+                                objectTargetBytes0: int32,
+                                sourceBlockBytes0: int32,
+                                repairDropletCount0: int32): str =
+    let buildRes = moq.v3Libp2pMoqBuild(bytesFromString(blobText),
+                                        ownerPeerId,
+                                        remotePeersCsv,
+                                        mimeType0,
+                                        objectTargetBytes0,
+                                        sourceBlockBytes0,
+                                        repairDropletCount0)
+    if IsErr(buildRes):
+        return v3MobileCapiMoqError(Error(buildRes))
+    return moq.v3Libp2pMoqBuildResultToWire(Value(buildRes))
+
+fn v3MobileCapiMoqDecodeBlockIndexes(csv: str): int32[] =
+    let parts = v3MobileCapiSplitCsv(csv)
+    var out: int32[]
+    out = []
+    var i: int32 = 0
+    while i < parts.len:
+        let part = parts[i]
+        let item = v3MobileCapiTrimAscii(part)
+        if len(item) <= 0:
+            i = i + 1
+            continue
+        add(out, v3MobileCapiParseInt32Text(item))
+        i = i + 1
+    return out
+
+fn v3MobileCapiMoqSolveObject(sourceBlockCount: int32,
+                              blockBytes: int32,
+                              equations0: V3MobileMoqEquation[]): Result[Bytes[]] =
+    if sourceBlockCount <= 0:
+        return Err[Bytes[]]("moq_fountain_invalid_object")
+    var equations = equations0
+    var pivotCols: int32[]
+    pivotCols = []
+    var pivotRow = 0
+    for col in 0..<sourceBlockCount:
+        var found = -1
+        for row in pivotRow..<equations.len:
+            if equations[row].coeffs[col] != 0:
+                found = row
+                break
+        if found < 0:
+            continue
+        if found != pivotRow:
+            let temp = equations[pivotRow]
+            equations[pivotRow] = equations[found]
+            equations[found] = temp
+        for row in 0..<equations.len:
+            if row == pivotRow || equations[row].coeffs[col] == 0:
+                continue
+            for coeffIndex in 0..<sourceBlockCount:
+                equations[row].coeffs[coeffIndex] = equations[row].coeffs[coeffIndex] ^ equations[pivotRow].coeffs[coeffIndex]
+            let xorOk = v3MobileCapiXorInto(equations[row].payload, equations[pivotRow].payload)
+            if IsErr(xorOk):
+                return Err[Bytes[]](Error(xorOk))
+        add(pivotCols, col)
+        pivotRow = pivotRow + 1
+        if pivotRow >= sourceBlockCount:
+            break
+    if pivotCols.len < sourceBlockCount:
+        return Err[Bytes[]]("moq_fountain_insufficient_droplets")
+    var solved: Bytes[]
+    solved = []
+    for i in 0..<sourceBlockCount:
+        add(solved, bytesAlloc(blockBytes))
+    for row in 0..<sourceBlockCount:
+        solved[pivotCols[row]] = equations[row].payload
+    return Ok[Bytes[]](solved)
+
+fn v3MobileCapiMoqFountainRebuild(requestWire: str): str =
+    let outputPathRes = v3MobileCapiWireDecodedValue(requestWire, "output_path")
+    if IsErr(outputPathRes):
+        return v3MobileCapiMoqError(Error(outputPathRes))
+    let outputPath = Value(outputPathRes)
+    let rebuiltRes = moq.v3Libp2pMoqRebuildFromWire(requestWire)
+    if IsErr(rebuiltRes):
+        return v3MobileCapiMoqError(Error(rebuiltRes))
+    let rebuilt = Value(rebuiltRes)
+    os.WriteFile(outputPath, bytesToString(rebuilt.blob))
+    return moq.v3Libp2pMoqRebuildResultToWire(outputPath, rebuilt)
 
 fn v3MobileCapiBioDidProvisionJson(didText: str,
                                    rootSeed: str,
@@ -229,7 +818,7 @@ fn v3MobileCapiBioDidCreate(requestId: str,
         let errorText = v3MobileCapiBioDidErrorJson(Error(captureRes))
         return errorText
     let capture = Value(captureRes)
-    let epochSeconds = times.epochTimeSeconds()
+    let epochSeconds = times.EpochTimeSeconds()
     let captureOk = bio_did.v3BioDidCaptureValidate(capture)
     if IsErr(captureOk):
         let errorText = v3MobileCapiBioDidErrorJson(Error(captureOk))
@@ -287,19 +876,19 @@ fn v3MobileCapiBioDidCreate(requestId: str,
         return errorText
     let bundle = Value(bundleRes)
     let devicePeerIdText = peer_id.v3Libp2pPeerIdText(bundle.devicePeerId)
-    let bundleSeqText = strings.intToStr(bundle.bundleSeq)
-    let recordVersionText = strings.intToStr(bundle.record.version)
+    let bundleSeqText = strings.IntToStr(bundle.bundleSeq)
+    let recordVersionText = strings.IntToStr(bundle.record.version)
     let recordHelperText = layout.fixedBytes32Hex(bundle.record.helper)
     let recordPubKeyText = layout.fixedBytes65Hex(bundle.record.pubKey)
-    let recordCodeNText = strings.intToStr(bundle.record.codeN)
-    let recordCodeKText = strings.intToStr(bundle.record.codeK)
-    let recordMaxCorrectableText = strings.intToStr(bundle.record.maxCorrectable)
+    let recordCodeNText = strings.IntToStr(bundle.record.codeN)
+    let recordCodeKText = strings.IntToStr(bundle.record.codeK)
+    let recordMaxCorrectableText = strings.IntToStr(bundle.record.maxCorrectable)
     let recordCidText = layout.fixedBytes32Hex(bundle.record.recordCid)
     let challengeNonceText = layout.fixedBytes32Hex(bundle.assertion.challengeNonce)
     let assertionCommitAText = layout.fixedBytes65Hex(bundle.assertion.commitA)
     let assertionResponseZText = layout.fixedBytes32Hex(bundle.assertion.responseZ)
     let assertionProofCidText = layout.fixedBytes32Hex(bundle.assertion.proofCid)
-    let hardwareVersionText = strings.intToStr(bundle.hardware.version)
+    let hardwareVersionText = strings.IntToStr(bundle.hardware.version)
     let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(bundle.hardware.verifiedAtEpochSeconds)
     let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(bundle.hardware.deviceBindingSeedHash)
     let hardwareAttestationCidText = layout.fixedBytes32Hex(bundle.hardware.attestationCid)
@@ -481,7 +1070,7 @@ fn v3MobileCapiBioDidCreateIdentityFieldsCStringRaw(requestIdRaw: ptr,
     if IsErr(captureRes):
         return v3MobileCapiTextCString("")
     let createRes = bio_did.v3BioDidCreateBundleWithHardwareCapture(Value(captureRes),
-                                                                    times.epochTimeSeconds())
+                                                                    times.EpochTimeSeconds())
     if IsErr(createRes):
         return v3MobileCapiTextCString("")
     let outcome = Value(createRes)
@@ -512,24 +1101,24 @@ fn v3MobileCapiBioDidCreateBundleCStringRaw(requestIdRaw: ptr,
     if IsErr(captureRes):
         return v3MobileCapiTextCString("")
     let createRes = bio_did.v3BioDidCreateBundleWithHardwareCapture(Value(captureRes),
-                                                                    times.epochTimeSeconds())
+                                                                    times.EpochTimeSeconds())
     if IsErr(createRes):
         return v3MobileCapiTextCString("")
     let outcome = Value(createRes)
     let devicePeerIdText = peer_id.v3Libp2pPeerIdText(outcome.bundle.devicePeerId)
-    let bundleSeqText = strings.intToStr(outcome.bundle.bundleSeq)
-    let recordVersionText = strings.intToStr(outcome.bundle.record.version)
+    let bundleSeqText = strings.IntToStr(outcome.bundle.bundleSeq)
+    let recordVersionText = strings.IntToStr(outcome.bundle.record.version)
     let recordHelperText = layout.fixedBytes32Hex(outcome.bundle.record.helper)
     let recordPubKeyText = layout.fixedBytes65Hex(outcome.bundle.record.pubKey)
-    let recordCodeNText = strings.intToStr(outcome.bundle.record.codeN)
-    let recordCodeKText = strings.intToStr(outcome.bundle.record.codeK)
-    let recordMaxCorrectableText = strings.intToStr(outcome.bundle.record.maxCorrectable)
+    let recordCodeNText = strings.IntToStr(outcome.bundle.record.codeN)
+    let recordCodeKText = strings.IntToStr(outcome.bundle.record.codeK)
+    let recordMaxCorrectableText = strings.IntToStr(outcome.bundle.record.maxCorrectable)
     let recordCidText = layout.fixedBytes32Hex(outcome.bundle.record.recordCid)
     let challengeNonceText = layout.fixedBytes32Hex(outcome.bundle.assertion.challengeNonce)
     let assertionCommitAText = layout.fixedBytes65Hex(outcome.bundle.assertion.commitA)
     let assertionResponseZText = layout.fixedBytes32Hex(outcome.bundle.assertion.responseZ)
     let assertionProofCidText = layout.fixedBytes32Hex(outcome.bundle.assertion.proofCid)
-    let hardwareVersionText = strings.intToStr(outcome.bundle.hardware.version)
+    let hardwareVersionText = strings.IntToStr(outcome.bundle.hardware.version)
     let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(outcome.bundle.hardware.verifiedAtEpochSeconds)
     let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(outcome.bundle.hardware.deviceBindingSeedHash)
     let hardwareAttestationCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.attestationCid)
@@ -684,7 +1273,7 @@ fn v3MobileCapiBioDidCreateDiagIdentityCStringRaw(requestIdRaw: ptr,
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
-    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.EpochTimeSeconds())
     var document = did.v3DidDocumentZero()
     let documentRes = did.v3DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
@@ -725,7 +1314,7 @@ fn v3MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
-    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.EpochTimeSeconds())
     var document = did.v3DidDocumentZero()
     let documentRes = did.v3DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
@@ -743,7 +1332,7 @@ fn v3MobileCapiBioDidCreateDiagAssertionCStringRaw(requestIdRaw: ptr,
                                                            document.version,
                                                            bundleSeq,
                                                            challengeNonce,
-                                                           times.epochTimeSeconds())
+                                                           times.EpochTimeSeconds())
     let assertionRes = bio.v3BioProve(capture.feature32, record, challengeNonce)
     if IsErr(assertionRes):
         return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(assertionRes)))
@@ -783,7 +1372,7 @@ fn v3MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
     let rootSecret = Value(rootSecretRes)
     let rootSeed = bio_did.v3BioDidRootSeedFromRootSecret(rootSecret)
     let deviceSeed = bio_did.v3BioDidDeviceSeedFromRootSecret(rootSecret, capture.deviceBindingSeed)
-    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.epochTimeSeconds())
+    let identity = did.v3DidIdentityMake(rootSeed, deviceSeed, capture.deviceLabel, times.EpochTimeSeconds())
     var document = did.v3DidDocumentZero()
     let documentRes = did.v3DidIdentityDocumentFill(document, identity)
     if IsErr(documentRes):
@@ -801,7 +1390,7 @@ fn v3MobileCapiBioDidCreateDiagBundleCStringRaw(requestIdRaw: ptr,
                                                            document.version,
                                                            bundleSeq,
                                                            challengeNonce,
-                                                           times.epochTimeSeconds())
+                                                           times.EpochTimeSeconds())
     let assertionRes = bio.v3BioProve(capture.feature32, record, challengeNonce)
     if IsErr(assertionRes):
         return v3MobileCapiTextCString(v3MobileCapiBioDidErrorJson(Error(assertionRes)))
@@ -838,25 +1427,25 @@ fn v3MobileCapiBioDidImport(latestBundleText: str,
         return errorText
     let importRes = bio_did.v3BioDidImportFromLatestBundleWithHardwareCapture(Value(latestBundleRes),
                                                                               Value(captureRes),
-                                                                              times.epochTimeSeconds())
+                                                                              times.EpochTimeSeconds())
     if IsErr(importRes):
         let errorText = v3MobileCapiBioDidErrorJson(Error(importRes))
         return errorText
     let outcome = Value(importRes)
     let devicePeerIdText = peer_id.v3Libp2pPeerIdText(outcome.bundle.devicePeerId)
-    let bundleSeqText = strings.intToStr(outcome.bundle.bundleSeq)
-    let recordVersionText = strings.intToStr(outcome.bundle.record.version)
+    let bundleSeqText = strings.IntToStr(outcome.bundle.bundleSeq)
+    let recordVersionText = strings.IntToStr(outcome.bundle.record.version)
     let recordHelperText = layout.fixedBytes32Hex(outcome.bundle.record.helper)
     let recordPubKeyText = layout.fixedBytes65Hex(outcome.bundle.record.pubKey)
-    let recordCodeNText = strings.intToStr(outcome.bundle.record.codeN)
-    let recordCodeKText = strings.intToStr(outcome.bundle.record.codeK)
-    let recordMaxCorrectableText = strings.intToStr(outcome.bundle.record.maxCorrectable)
+    let recordCodeNText = strings.IntToStr(outcome.bundle.record.codeN)
+    let recordCodeKText = strings.IntToStr(outcome.bundle.record.codeK)
+    let recordMaxCorrectableText = strings.IntToStr(outcome.bundle.record.maxCorrectable)
     let recordCidText = layout.fixedBytes32Hex(outcome.bundle.record.recordCid)
     let challengeNonceText = layout.fixedBytes32Hex(outcome.bundle.assertion.challengeNonce)
     let assertionCommitAText = layout.fixedBytes65Hex(outcome.bundle.assertion.commitA)
     let assertionResponseZText = layout.fixedBytes32Hex(outcome.bundle.assertion.responseZ)
     let assertionProofCidText = layout.fixedBytes32Hex(outcome.bundle.assertion.proofCid)
-    let hardwareVersionText = strings.intToStr(outcome.bundle.hardware.version)
+    let hardwareVersionText = strings.IntToStr(outcome.bundle.hardware.version)
     let hardwareVerifiedAtText = did.v3DidStoreWord64Hex(outcome.bundle.hardware.verifiedAtEpochSeconds)
     let hardwareDeviceBindingSeedHashText = layout.fixedBytes32Hex(outcome.bundle.hardware.deviceBindingSeedHash)
     let hardwareAttestationCidText = layout.fixedBytes32Hex(outcome.bundle.hardware.attestationCid)

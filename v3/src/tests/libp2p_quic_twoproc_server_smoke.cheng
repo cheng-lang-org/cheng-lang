@@ -1,5 +1,6 @@
 import std/system
 import std/cmdline as cmdline
+import cheng/v3/overlay/contracts as overlay
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/host/host
 import cheng/v3/libp2p/transports/quic_transport
@@ -7,11 +8,11 @@ import cheng/v3/project/chain_node as node
 import cheng/v3/project/chain_node_libp2p as net
 
 fn main(): int32 =
-    let port = cmdline.readInt32FlagOrDefault("--port", 0)
-    var ready_path: str = ""
-    let has_ready = cmdline.readFirstFlagValue("--ready-path", ready_path)
-    let ready_path_value = if has_ready: ready_path else: ""
-    var server = node.v3ChainNodeInit("quic.twoproc.server", "quic.twoproc")
+    let port = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let ready_path_value = cmdline.ReadFlagOrDefault("--ready-path", "")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "quic.twoproc.server", "quic.twoproc")),
+           "v3 chain_node: init")
     var serverHost = host.v3Libp2pHostInit("quic.twoproc.server")
     let mintRes = node.v3ChainNodeMint(server, 9, 1001, int64(88))
     assert(mintRes.ok, "v3 libp2p quic twoproc: server mint")
@@ -19,12 +20,15 @@ fn main(): int32 =
     assert(transferRes.ok, "v3 libp2p quic twoproc: server transfer")
     let serveRes = net.v3ChainNodeLibp2pServeOnce(server, serverHost)
     assert(serveRes.ok, "v3 libp2p quic twoproc: server serve once")
-    let latestRes = net.v3ChainNodeLibp2pLatestSnapshot(serverHost, server.address)
+    var latest: overlay.V3IngressEnvelope
+    let latestRes = net.v3ChainNodeLibp2pLatestSnapshotInto(serverHost,
+                                                            server.address,
+                                                            latest)
     assert(latestRes.ok, "v3 libp2p quic twoproc: server latest snapshot")
     let quicServeRes = quic_transport.v3Libp2pQuicServePayloadOnce("127.0.0.1",
                                                                    port,
                                                                    types.v3Libp2pProtocolSync,
-                                                                   latestRes.value.payload,
+                                                                   latest.payload,
                                                                    ready_path_value)
     assert(quicServeRes.ok, "v3 libp2p quic twoproc: server quic serve")
     echo("v3 libp2p_quic_twoproc_server ok")

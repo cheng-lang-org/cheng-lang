@@ -1,8 +1,6 @@
 import std/system
 import std/result
-import std/rawbytes
-import std/crypto/rand
-import std/strutils as strutil
+import std/strings
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/chain/consensus as consensus
 import cheng/v3/libp2p/core/types
@@ -11,44 +9,32 @@ import cheng/v3/mobile/hardware/biometric
 import cheng/v3/project/chain_node as chain
 import cheng/v3/project/bio_did_chain_node as flow
 
-fn bioDidChainSmokeFeature(seed: int32): layout.FixedBytes32 =
-    let raw: Bytes = bytesAlloc(32)
+fn bioDidChainSmokeFeatureInto(out: var layout.FixedBytes32, seed: int32) =
     for i in 0..<32:
-        bytesSet(raw, i, ((seed * 29) + (i * 17) + 11) & 255)
-    let res = layout.fixedBytes32FromBytes(raw)
-    assert(IsOk(res), "v3 bio did chain smoke: feature build")
-    return Value(res)
+        out.data[i] = uint8(((seed * 29) + (i * 17) + 11) & 255)
 
-fn bioDidChainSmokeCorrupt(feature: layout.FixedBytes32,
-                           positions: int32[]): layout.FixedBytes32 =
-    var raw: Bytes = layout.fixedBytes32ToBytes(feature)
+fn bioDidChainSmokeCorruptInto(out: var layout.FixedBytes32,
+                               feature: layout.FixedBytes32,
+                               positions: int32[]) =
+    out = feature
     for i in 0..<positions.len:
         let pos = positions[i]
-        bytesSet(raw, pos, bytesGet(raw, pos) ^ ((0x5a + i) & 255))
-    let res = layout.fixedBytes32FromBytes(raw)
-    assert(IsOk(res), "v3 bio did chain smoke: corrupt fixed32")
-    return Value(res)
+        out.data[pos] = uint8((int32(out.data[pos]) ^ ((0x5a + i) & 255)) & 255)
 
-fn bioDidChainSmokeAttestorPrivHex(): str =
-    return "60d71049a0cafe01faa9948dc77ee5bc4bd5e05b8e328fdb9cc4c38237250a05"
-
-fn bioDidChainSmokeAttestorPubKeyHex(): str =
-    return "04963c1356849b8478030a6eb572581063ccedf53fda0bc7241247eba977e3b0666e4bf0c12caa47487c2927f83b17d6f9f332481cd2ab0c4885f91fc2a6c547d5"
-
-fn bioDidChainSmokeCapture(feature: layout.FixedBytes32,
-                           bindingSeed: str,
-                           label: str,
-                           requestId: str,
-                           purpose: int32,
-                           verified: bool): flow.V3BioDidHardwareCapture =
-    var out = flow.v3BioDidHardwareCaptureZero()
+fn bioDidChainSmokeCaptureInto(out: var flow.V3BioDidHardwareCapture,
+                               feature: layout.FixedBytes32,
+                               bindingSeed: str,
+                               label: str,
+                               requestId: str,
+                               purpose: int32,
+                               verified: bool) =
     out.verified = verified
     out.feature32 = feature
     out.requestId = requestId
     out.sensorId = "sensor|" + bindingSeed
     out.deviceBindingSeed = bindingSeed
     out.deviceLabel = label
-    var req = biometric.v3BiometricFingerprintAuthorizeReqZero()
+    var req = biometric.V3BiometricFingerprintAuthorizeReqZero()
     req.requestId = requestId
     req.purpose = purpose
     req.didText = ""
@@ -56,227 +42,278 @@ fn bioDidChainSmokeCapture(feature: layout.FixedBytes32,
     req.promptReason = "bio did chain smoke"
     req.deviceBindingSeedHint = bindingSeed
     req.deviceLabelHint = label
-    let attestationRes = biometric.v3BiometricFingerprintAttestationBuildSigned(req,
+    let sensorId = out.sensorId
+    var attestorPrivHex: str = "60d71049a0cafe01faa9948dc77ee5bc4bd5e05b8e328fdb9cc4c38237250a05"
+    let attestationRes = biometric.V3BiometricFingerprintAttestationBuildSigned(req,
                                                                                 feature,
                                                                                 bindingSeed,
                                                                                 label,
-                                                                                out.sensorId,
-                                                                                bioDidChainSmokeAttestorPrivHex())
+                                                                                sensorId,
+                                                                                attestorPrivHex)
     assert(IsOk(attestationRes), "v3 bio did chain smoke: signed attestation")
     out.hardwareAttestation = Value(attestationRes)
-    return out
 
-fn bioDidChainSmokeAppendBrokenOperatorAnchor(node: var chain.V3ChainNode,
-                                              text: str): Result[layout.FixedBytes32] =
+fn bioDidChainSmokeAppendBrokenOperatorAnchorInto(outCid: var layout.FixedBytes32,
+                                                  node: var chain.V3ChainNode,
+                                                  text: str): Result[bool] =
     let payload = bytesFromString(text)
-    let chunkCount = flow.v3BioDidChunkCount(payload.len)
-    var lastEventCid = layout.fixedBytes32Zero()
+    let chunkCount = flow.V3BioDidChunkCount(payload.len)
+    outCid = layout.FixedBytes32Zero()
     for chunkIndex in 0..<chunkCount:
-        let parentCid = chain.v3ChainNodeAccountHead(node.index,
-                                                     flow.v3BioDidOperatorAnchorAssetId,
-                                                     flow.v3BioDidOperatorAnchorAccountId)
-        var event = consensus.v3ChainEventMint(flow.v3BioDidOperatorAnchorAssetId,
-                                               flow.v3BioDidOperatorAnchorAccountId,
+        let parentCid = chain.V3ChainNodeAccountHeadFromNode(node,
+                                                             flow.V3BioDidOperatorAnchorAssetId,
+                                                             flow.V3BioDidOperatorAnchorAccountId)
+        var event = consensus.V3ChainEventMint(flow.V3BioDidOperatorAnchorAssetId,
+                                               flow.V3BioDidOperatorAnchorAccountId,
                                                parentCid,
                                                int64(chunkIndex + 1),
                                                node.nextEpoch,
                                                node.nextGanzhi,
-                                               chain.v3ChainNodeSpaceSlot(flow.v3BioDidOperatorAnchorAccountId,
-                                                                          flow.v3BioDidOperatorAnchorAccountId),
+                                               chain.V3ChainNodeSpaceSlot(flow.V3BioDidOperatorAnchorAccountId,
+                                                                          flow.V3BioDidOperatorAnchorAccountId),
                                                node.nextTick)
         event.fromAccount = 1
-        event.fromParentCid = flow.v3BioDidChunkFixed(payload, chunkIndex)
-        event.bodyCid = consensus.v3ChainEventBodyCid(event)
-        let applyRes = chain.v3ChainNodeApplyEvent(node, event)
+        event.fromParentCid = flow.V3BioDidChunkFixed(payload, chunkIndex)
+        event.bodyCid = consensus.V3ChainEventBodyCid(event)
+        let applyRes = chain.V3ChainNodeApplyEvent(node, event)
         if IsErr(applyRes):
-            return Err[layout.FixedBytes32](Error(applyRes))
-        lastEventCid = Value(applyRes)
-    return Ok[layout.FixedBytes32](lastEventCid)
+            return Err[bool](Error(applyRes))
+        outCid = Value(applyRes)
+    return Ok[bool](true)
 
 fn main(): int32 =
-    assert(rand.setRandomSeed(bytesFromString("v3.bio.did.chain.seed")),
-           "v3 bio did chain smoke: seed")
-    let trustRes = flow.v3BioDidSetTrustedAttestorRootHex(bioDidChainSmokeAttestorPubKeyHex(),
-                                                          biometric.v3BiometricScriptedRootKeyId)
+    var rootKeyId: str = "cheng.scripted.root"
+    let trustRes = flow.V3BioDidSetTrustedAttestorRootHex(
+        "04963c1356849b8478030a6eb572581063ccedf53fda0bc7241247eba977e3b0666e4bf0c12caa47487c2927f83b17d6f9f332481cd2ab0c4885f91fc2a6c547d5",
+                                                          rootKeyId)
     assert(IsOk(trustRes), "v3 bio did chain smoke: add trusted attestor")
-    let feature = bioDidChainSmokeFeature(5)
-    let matchFeature = bioDidChainSmokeCorrupt(feature, [1, 9, 22])
-    let badFeature = bioDidChainSmokeCorrupt(feature, [0, 2, 4, 6, 8, 10, 12, 14, 16])
-    let operatorIdRes = flow.v3BioDidOperatorIdFromRecoverySecretHex(
+    var feature: layout.FixedBytes32
+    bioDidChainSmokeFeatureInto(feature, 5)
+    var matchFeature: layout.FixedBytes32
+    bioDidChainSmokeCorruptInto(matchFeature, feature, [1, 9, 22])
+    var badFeature: layout.FixedBytes32
+    bioDidChainSmokeCorruptInto(badFeature, feature, [0, 2, 4, 6, 8, 10, 12, 14, 16])
+    let operatorIdRes = flow.V3BioDidOperatorIdFromRecoverySecretHex(
         "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
     )
     assert(IsOk(operatorIdRes), "v3 bio did chain smoke: operator id")
     let operatorId = Value(operatorIdRes)
 
     var node: chain.V3ChainNode
-    assert(IsOk(chain.v3ChainNodeInitInto(node, "bio.did.chain", "bio.did.chain.addr")),
+    assert(IsOk(chain.V3ChainNodeInitInto(node, "bio.did.chain", "bio.did.chain.addr")),
            "v3 bio did chain smoke: init node")
-    let createRes = flow.v3BioDidCreateWithHardwareCapture(
-        node,
-        bioDidChainSmokeCapture(feature,
+    var createCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(createCapture,
+                                feature,
                                 "device.phone.secure",
                                 "phone",
                                 "create-phone-1",
-                                biometric.v3BiometricPurposeDidCreate,
-                                true),
-        int64(1000)
-    )
+                                biometric.V3BiometricPurposeDidCreate,
+                                true)
+    let createRes = flow.V3BioDidCreateWithHardwareCapture(node, createCapture, int64(1000))
     assert(IsOk(createRes), "v3 bio did chain smoke: create did")
     let created = Value(createRes)
-    let didText = created.document.did
-    assert(didText == did.v3DidIdentityDid(created.identity),
+    let createdIdentity = created.identity
+    let createdSelfDevice = createdIdentity.selfDevice
+    let createdPeerId = createdSelfDevice.devicePeerId
+    let createdBundle = created.bundle
+    let createdBundleHardware = createdBundle.hardware
+    let createdBundleRecord = createdBundle.record
+    let createdDocument = created.document
+    let createdDidText = did.V3DidIdentityDid(createdIdentity)
+    let didText = createdDocument.did
+    let zeroCid = layout.FixedBytes32Zero()
+    assert(didText == createdDidText,
            "v3 bio did chain smoke: created did stable")
-    assert(created.bundle.bundleSeq == 1,
+    assert(createdBundle.bundleSeq == 1,
            "v3 bio did chain smoke: create bundle seq")
-    assert(created.document.devices.len == 1,
+    assert(createdDocument.devices.len == 1,
            "v3 bio did chain smoke: create device count")
-    assert(!layout.fixedBytes32Equal(created.bundle.hardware.attestationCid,
-                                     layout.fixedBytes32Zero()),
+    let createdAttestationCid = createdBundleHardware.attestationCid
+    assert(!layout.FixedBytes32Equal(createdAttestationCid,
+                                     zeroCid),
            "v3 bio did chain smoke: create hardware attestation cid")
-    assert(!layout.fixedBytes32Equal(created.bundle.hardware.bindingCid,
-                                     layout.fixedBytes32Zero()),
+    let createdBindingCid = createdBundleHardware.bindingCid
+    assert(!layout.FixedBytes32Equal(createdBindingCid,
+                                     zeroCid),
            "v3 bio did chain smoke: create hardware binding cid")
-    let anchorCreateRes = flow.v3BioDidChainAppendOperatorBundleAnchor(node,
+    let anchorCreateRes = flow.V3BioDidChainAppendOperatorBundleAnchor(node,
                                                                        operatorId,
-                                                                       created.bundle,
+                                                                       createdBundle,
                                                                        "anchor-create-1")
     assert(IsOk(anchorCreateRes), "v3 bio did chain smoke: anchor create")
 
-    let latestCreateBundleRes = flow.v3BioDidChainLoadLatest(node, didText)
+    let latestCreateBundleRes = flow.V3BioDidChainLoadLatest(node, didText)
     assert(IsOk(latestCreateBundleRes), "v3 bio did chain smoke: load create bundle")
-    let latestCreateDocumentRes = flow.v3BioDidChainBundleVerify(Value(latestCreateBundleRes))
+    let latestCreateBundle = Value(latestCreateBundleRes)
+    let latestCreateDocumentRes = flow.V3BioDidChainBundleVerify(latestCreateBundle)
     assert(IsOk(latestCreateDocumentRes), "v3 bio did chain smoke: verify create bundle")
-    assert(Value(latestCreateDocumentRes).devices.len == 1,
+    let latestCreateDocument = Value(latestCreateDocumentRes)
+    assert(latestCreateDocument.devices.len == 1,
            "v3 bio did chain smoke: create chain document")
 
-    let phoneImportRes = flow.v3BioDidImportWithHardwareCapture(
-        node,
-        didText,
-        bioDidChainSmokeCapture(matchFeature,
+    var phoneCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(phoneCapture,
+                                matchFeature,
                                 "device.phone.secure",
                                 "phone-renamed",
                                 "import-phone-1",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1010)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let phoneImportRes = flow.V3BioDidImportWithHardwareCapture(node,
+                                                                didText,
+                                                                phoneCapture,
+                                                                int64(1010))
     assert(IsOk(phoneImportRes), "v3 bio did chain smoke: same device import")
     let phoneImport = Value(phoneImportRes)
-    assert(phoneImport.bundle.bundleSeq == 2,
+    let phoneImportIdentity = phoneImport.identity
+    let phoneImportSelfDevice = phoneImportIdentity.selfDevice
+    let phoneImportPeerId = phoneImportSelfDevice.devicePeerId
+    let phoneImportBundle = phoneImport.bundle
+    let phoneImportBundleHardware = phoneImportBundle.hardware
+    let phoneImportDocument = phoneImport.document
+    assert(phoneImportBundle.bundleSeq == 2,
            "v3 bio did chain smoke: same device bundle seq")
-    assert(types.v3Libp2pPeerIdEqual(created.identity.selfDevice.devicePeerId,
-                                     phoneImport.identity.selfDevice.devicePeerId),
+    assert(types.V3Libp2pPeerIdEqual(createdPeerId,
+                                     phoneImportPeerId),
            "v3 bio did chain smoke: same device stable peer id")
-    assert(phoneImport.document.devices.len == 1,
+    assert(phoneImportDocument.devices.len == 1,
            "v3 bio did chain smoke: same device no duplicate")
-    assert(did.v3DidWord64Value(phoneImport.document.version) == int64(1),
+    let phoneImportVersion = phoneImportDocument.version
+    assert(did.V3DidWord64Value(phoneImportVersion) == int64(1),
            "v3 bio did chain smoke: same device version stable")
-    assert(phoneImport.bundle.hardware.requestId != created.bundle.hardware.requestId,
+    let phoneImportRequestId = phoneImportBundleHardware.requestId
+    let createdRequestId = createdBundleHardware.requestId
+    assert(phoneImportRequestId != createdRequestId,
            "v3 bio did chain smoke: same device request refresh")
-    let anchorPhoneRes = flow.v3BioDidChainAppendOperatorBundleAnchor(node,
+    let anchorPhoneRes = flow.V3BioDidChainAppendOperatorBundleAnchor(node,
                                                                       operatorId,
-                                                                      phoneImport.bundle,
+                                                                      phoneImportBundle,
                                                                       "anchor-import-phone-1")
     assert(IsOk(anchorPhoneRes), "v3 bio did chain smoke: anchor phone import")
 
-    let replayImportRes = flow.v3BioDidImportWithHardwareCapture(
-        node,
-        didText,
-        bioDidChainSmokeCapture(matchFeature,
+    var replayCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(replayCapture,
+                                matchFeature,
                                 "device.phone.secure",
                                 "phone-renamed",
                                 "import-phone-1",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1015)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let replayImportRes = flow.V3BioDidImportWithHardwareCapture(node,
+                                                                 didText,
+                                                                 replayCapture,
+                                                                 int64(1015))
     assert(IsErr(replayImportRes), "v3 bio did chain smoke: request replay reject")
 
-    let laptopImportRes = flow.v3BioDidImportWithHardwareCapture(
-        node,
-        didText,
-        bioDidChainSmokeCapture(matchFeature,
+    var laptopCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(laptopCapture,
+                                matchFeature,
                                 "device.laptop.secure",
                                 "laptop",
                                 "import-laptop-1",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1020)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let laptopImportRes = flow.V3BioDidImportWithHardwareCapture(node,
+                                                                 didText,
+                                                                 laptopCapture,
+                                                                 int64(1020))
     assert(IsOk(laptopImportRes), "v3 bio did chain smoke: new device import")
     let laptopImport = Value(laptopImportRes)
-    assert(laptopImport.bundle.bundleSeq == 3,
+    let laptopImportIdentity = laptopImport.identity
+    let laptopImportSelfDevice = laptopImportIdentity.selfDevice
+    let laptopImportPeerId = laptopImportSelfDevice.devicePeerId
+    let laptopImportBundle = laptopImport.bundle
+    let laptopImportBundleRecord = laptopImportBundle.record
+    let laptopImportBundleHardware = laptopImportBundle.hardware
+    let laptopImportDocument = laptopImport.document
+    assert(laptopImportBundle.bundleSeq == 3,
            "v3 bio did chain smoke: new device bundle seq")
-    assert(!types.v3Libp2pPeerIdEqual(created.identity.selfDevice.devicePeerId,
-                                      laptopImport.identity.selfDevice.devicePeerId),
+    assert(!types.V3Libp2pPeerIdEqual(createdPeerId,
+                                      laptopImportPeerId),
            "v3 bio did chain smoke: new device new peer id")
-    assert(laptopImport.document.devices.len == 2,
+    assert(laptopImportDocument.devices.len == 2,
            "v3 bio did chain smoke: new device count")
-    assert(did.v3DidWord64Value(laptopImport.document.version) == int64(2),
+    let laptopImportVersion = laptopImportDocument.version
+    assert(did.V3DidWord64Value(laptopImportVersion) == int64(2),
            "v3 bio did chain smoke: new device bumps version")
-    assert(layout.fixedBytes32Equal(created.bundle.record.recordCid,
-                                    laptopImport.bundle.record.recordCid),
+    let createdRecordCid = createdBundleRecord.recordCid
+    let laptopImportRecordCid = laptopImportBundleRecord.recordCid
+    assert(layout.FixedBytes32Equal(createdRecordCid,
+                                    laptopImportRecordCid),
            "v3 bio did chain smoke: record reused")
-    assert(!layout.fixedBytes32Equal(phoneImport.bundle.hardware.bindingCid,
-                                     laptopImport.bundle.hardware.bindingCid),
+    let phoneImportBindingCid = phoneImportBundleHardware.bindingCid
+    let laptopImportBindingCid = laptopImportBundleHardware.bindingCid
+    assert(!layout.FixedBytes32Equal(phoneImportBindingCid,
+                                     laptopImportBindingCid),
            "v3 bio did chain smoke: different bundle different hardware binding")
-    let anchorLaptopRes = flow.v3BioDidChainAppendOperatorBundleAnchor(node,
+    let anchorLaptopRes = flow.V3BioDidChainAppendOperatorBundleAnchor(node,
                                                                        operatorId,
-                                                                       laptopImport.bundle,
+                                                                       laptopImportBundle,
                                                                        "anchor-import-laptop-1")
     assert(IsOk(anchorLaptopRes), "v3 bio did chain smoke: anchor laptop import")
 
-    let laptopImportAgainRes = flow.v3BioDidImportWithHardwareCapture(
-        node,
-        didText,
-        bioDidChainSmokeCapture(matchFeature,
+    var laptopAgainCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(laptopAgainCapture,
+                                matchFeature,
                                 "device.laptop.secure",
                                 "laptop-renamed",
                                 "import-laptop-2",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1030)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let laptopImportAgainRes = flow.V3BioDidImportWithHardwareCapture(node,
+                                                                      didText,
+                                                                      laptopAgainCapture,
+                                                                      int64(1030))
     assert(IsOk(laptopImportAgainRes), "v3 bio did chain smoke: repeat laptop import")
     let laptopImportAgain = Value(laptopImportAgainRes)
-    assert(laptopImportAgain.bundle.bundleSeq == 4,
+    let laptopImportAgainIdentity = laptopImportAgain.identity
+    let laptopImportAgainSelfDevice = laptopImportAgainIdentity.selfDevice
+    let laptopImportAgainPeerId = laptopImportAgainSelfDevice.devicePeerId
+    let laptopImportAgainBundle = laptopImportAgain.bundle
+    let laptopImportAgainDocument = laptopImportAgain.document
+    assert(laptopImportAgainBundle.bundleSeq == 4,
            "v3 bio did chain smoke: repeat laptop bundle seq")
-    assert(types.v3Libp2pPeerIdEqual(laptopImport.identity.selfDevice.devicePeerId,
-                                     laptopImportAgain.identity.selfDevice.devicePeerId),
+    assert(types.V3Libp2pPeerIdEqual(laptopImportPeerId,
+                                     laptopImportAgainPeerId),
            "v3 bio did chain smoke: repeat laptop stable peer id")
-    assert(laptopImportAgain.document.devices.len == 2,
+    assert(laptopImportAgainDocument.devices.len == 2,
            "v3 bio did chain smoke: repeat laptop no duplicate")
-    assert(did.v3DidWord64Value(laptopImportAgain.document.version) == int64(2),
+    let laptopImportAgainVersion = laptopImportAgainDocument.version
+    assert(did.V3DidWord64Value(laptopImportAgainVersion) == int64(2),
            "v3 bio did chain smoke: repeat laptop version stable")
-    let anchorLaptopAgainRes = flow.v3BioDidChainAppendOperatorBundleAnchor(node,
+    let anchorLaptopAgainRes = flow.V3BioDidChainAppendOperatorBundleAnchor(node,
                                                                             operatorId,
-                                                                            laptopImportAgain.bundle,
+                                                                            laptopImportAgainBundle,
                                                                             "anchor-import-laptop-2")
     assert(IsOk(anchorLaptopAgainRes), "v3 bio did chain smoke: anchor repeat laptop import")
 
-    let latestBundleRes = flow.v3BioDidChainLoadLatest(node, didText)
+    let latestBundleRes = flow.V3BioDidChainLoadLatest(node, didText)
     assert(IsOk(latestBundleRes), "v3 bio did chain smoke: load latest bundle")
     let latestBundle = Value(latestBundleRes)
     assert(latestBundle.bundleSeq == 4,
            "v3 bio did chain smoke: latest seq")
-    assert(flow.v3BioDidChainCurrentBundleSeq(node, didText) == 4,
+    assert(flow.V3BioDidChainCurrentBundleSeq(node, didText) == 4,
            "v3 bio did chain smoke: chain seq tracker")
-    let latestDocumentRes = flow.v3BioDidChainBundleVerify(latestBundle)
+    let latestDocumentRes = flow.V3BioDidChainBundleVerify(latestBundle)
     assert(IsOk(latestDocumentRes), "v3 bio did chain smoke: verify latest bundle")
     let latestDocument = Value(latestDocumentRes)
     assert(latestDocument.devices.len == 2,
            "v3 bio did chain smoke: latest device count")
-    assert(did.v3DidDocumentFindDevicePos(latestDocument,
-                                          created.identity.selfDevice.devicePeerId) >= 0,
+    let latestDocumentPhonePos = did.V3DidDocumentFindDevicePos(latestDocument,
+                                                                createdPeerId)
+    let latestDocumentLaptopPos = did.V3DidDocumentFindDevicePos(latestDocument,
+                                                                 laptopImportPeerId)
+    assert(latestDocumentPhonePos >= 0,
            "v3 bio did chain smoke: phone present")
-    assert(did.v3DidDocumentFindDevicePos(latestDocument,
-                                          laptopImport.identity.selfDevice.devicePeerId) >= 0,
+    assert(latestDocumentLaptopPos >= 0,
            "v3 bio did chain smoke: laptop present")
-    let operatorIndexRes = flow.v3BioDidOperatorIndexRebuild(node)
+    var operatorIndex: flow.V3BioDidOperatorIndex
+    let operatorIndexRes = flow.V3BioDidOperatorIndexRebuildInto(operatorIndex, node)
     assert(IsOk(operatorIndexRes), "v3 bio did chain smoke: rebuild operator index")
-    let operatorIndex = Value(operatorIndexRes)
-    let operatorLookupRes = flow.v3BioDidOperatorIndexLookup(operatorIndex,
-                                                             layout.fixedBytes32Hex(operatorId))
+    let operatorIdHex = layout.FixedBytes32Hex(operatorId)
+    let operatorLookupRes = flow.V3BioDidOperatorIndexLookup(operatorIndex,
+                                                             operatorIdHex)
     assert(IsOk(operatorLookupRes), "v3 bio did chain smoke: operator lookup")
     let operatorLookup = Value(operatorLookupRes)
     assert(operatorLookup.didText == didText,
@@ -285,151 +322,171 @@ fn main(): int32 =
            "v3 bio did chain smoke: operator subject did")
     assert(operatorLookup.deviceDidText == didText,
            "v3 bio did chain smoke: operator device did")
-    assert(operatorLookup.bundleKind == flow.v3BioDidOperatorBundleKindAndroidBioV1,
+    assert(operatorLookup.bundleKind == flow.V3BioDidOperatorBundleKindAndroidBioV1,
            "v3 bio did chain smoke: operator bundle kind")
     assert(operatorLookup.bundleSeq == 4,
            "v3 bio did chain smoke: operator latest seq")
     assert(operatorLookup.eventId == "anchor-import-laptop-2",
            "v3 bio did chain smoke: operator latest event id")
-    assert(operatorLookup.bundleText == flow.v3BioDidChainBundleText(laptopImportAgain.bundle),
+    let laptopImportAgainBundleText = flow.V3BioDidChainBundleText(laptopImportAgainBundle)
+    assert(operatorLookup.bundleText == laptopImportAgainBundleText,
            "v3 bio did chain smoke: operator latest bundle text")
     var state: flow.V3BioDidChainState
-    let stateRes = flow.v3BioDidChainStateFromNodeInto(state, node)
+    let stateRes = flow.V3BioDidChainStateFromNodeInto(state, node)
     assert(IsOk(stateRes), "v3 bio did chain smoke: state from node")
     var preferredKinds: str[]
-    preferredKinds = [flow.v3BioDidOperatorBundleKindAndroidBioV1]
-    let operatorJson = flow.v3BioDidOperatorLookupJson(operatorIndex,
-                                                       state.operatorKindIndex,
-                                                       layout.fixedBytes32Hex(operatorId),
+    let androidBundleKind = flow.V3BioDidOperatorBundleKindAndroidBioV1
+    preferredKinds = [androidBundleKind]
+    let stateOperatorKindIndex = state.operatorKindIndex
+    let operatorJson = flow.V3BioDidOperatorLookupJson(operatorIndex,
+                                                       stateOperatorKindIndex,
+                                                       operatorIdHex,
                                                        preferredKinds)
-    assert(strutil.contains(operatorJson, "\"found\":true"),
+    assert(strings.StrContains(operatorJson, "\"found\":true"),
            "v3 bio did chain smoke: operator json hit")
-    assert(IsOk(flow.v3BioDidOperatorKindIndexLookup(state.operatorKindIndex,
+    let operatorKindLookupRes = flow.V3BioDidOperatorKindIndexLookup(stateOperatorKindIndex,
                                                      operatorId,
-                                                     flow.v3BioDidOperatorBundleKindAndroidBioV1)),
-           "v3 bio did chain smoke: operator kind lookup")
-    let operatorStateJson = flow.v3BioDidOperatorLookupJsonFromState(state,
-                                                                     layout.fixedBytes32Hex(operatorId))
-    assert(strutil.contains(operatorStateJson, "\"found\":true"),
+                                                     androidBundleKind)
+    assert(IsOk(operatorKindLookupRes), "v3 bio did chain smoke: operator kind lookup")
+    let operatorStateJson = flow.V3BioDidOperatorLookupJsonFromState(state,
+                                                                     operatorIdHex)
+    assert(strings.StrContains(operatorStateJson, "\"found\":true"),
            "v3 bio did chain smoke: operator state json hit")
     var emptyKinds: str[]
     emptyKinds.len = 0
-    let missJson = flow.v3BioDidOperatorLookupJson(operatorIndex,
-                                                   state.operatorKindIndex,
+    let missJson = flow.V3BioDidOperatorLookupJson(operatorIndex,
+                                                   stateOperatorKindIndex,
                                                    "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
                                                    emptyKinds)
-    assert(strutil.contains(missJson, "\"found\":false"),
+    assert(strings.StrContains(missJson, "\"found\":false"),
            "v3 bio did chain smoke: operator json miss")
-    let missStateJson = flow.v3BioDidOperatorLookupJsonFromState(
+    let missStateJson = flow.V3BioDidOperatorLookupJsonFromState(
         state,
         "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
     )
-    assert(strutil.contains(missStateJson, "\"found\":false"),
+    assert(strings.StrContains(missStateJson, "\"found\":false"),
            "v3 bio did chain smoke: operator state json miss")
-    let snapshot = flow.v3BioDidChainStateServeOnce(state)
+    var snapshot: chain.V3ChainNodeServeSnapshot
+    flow.V3BioDidChainStateServeOnceInto(snapshot, state)
     let replayNodeId = "bio.did.chain.replay"
     let replayNodeAddr = "bio.did.chain.addr.replay"
     var replayState: flow.V3BioDidChainState
-    let replayStateRes = flow.v3BioDidChainStateReplayFromSnapshotInto(replayState,
+    let replayStateRes = flow.V3BioDidChainStateReplayFromSnapshotInto(replayState,
                                                                        replayNodeId,
                                                                        replayNodeAddr,
                                                                        snapshot)
     assert(IsOk(replayStateRes), "v3 bio did chain smoke: replay snapshot")
-    let replayLookupRes = flow.v3BioDidOperatorIndexLookup(replayState.operatorIndex,
-                                                           layout.fixedBytes32Hex(operatorId))
+    let replayOperatorIndex = replayState.operatorIndex
+    let replayLookupRes = flow.V3BioDidOperatorIndexLookup(replayOperatorIndex,
+                                                           operatorIdHex)
     assert(IsOk(replayLookupRes), "v3 bio did chain smoke: replay operator lookup")
-    assert(Value(replayLookupRes).bundleSeq == 4,
+    let replayLookup = Value(replayLookupRes)
+    assert(replayLookup.bundleSeq == 4,
            "v3 bio did chain smoke: replay operator latest seq")
     var brokenNode: chain.V3ChainNode
-    assert(IsOk(chain.v3ChainNodeInitInto(brokenNode,
+    assert(IsOk(chain.V3ChainNodeInitInto(brokenNode,
                                           "bio.did.chain.broken",
                                           "bio.did.chain.addr.broken")),
            "v3 bio did chain smoke: init broken node")
-    let brokenAppendRes = bioDidChainSmokeAppendBrokenOperatorAnchor(
+    var brokenCid: layout.FixedBytes32
+    let brokenAppendRes = bioDidChainSmokeAppendBrokenOperatorAnchorInto(
+        brokenCid,
         brokenNode,
         "v3_bio_did_operator_anchor_version=1\noperator_id=not_hex\n"
     )
     assert(IsOk(brokenAppendRes), "v3 bio did chain smoke: append broken operator payload")
     var brokenState: flow.V3BioDidChainState
-    let brokenStateRes = flow.v3BioDidChainStateFromNodeInto(brokenState, brokenNode)
+    let brokenStateRes = flow.V3BioDidChainStateFromNodeInto(brokenState, brokenNode)
     assert(IsErr(brokenStateRes), "v3 bio did chain smoke: broken state rebuild reject")
-    let brokenJson = flow.v3BioDidOperatorLookupJsonFromNode(brokenNode,
-                                                             layout.fixedBytes32Hex(operatorId))
-    assert(strutil.contains(brokenJson, "\"ok\":false"),
+    let brokenErrorText = Error(brokenStateRes)
+    let brokenJson = flow.V3BioDidOperatorLookupErrorJson(operatorIdHex,
+                                                          brokenErrorText)
+    assert(strings.StrContains(brokenJson, "\"ok\":false"),
            "v3 bio did chain smoke: operator json broken payload")
 
-    let ensureOperatorIdRes = flow.v3BioDidOperatorIdFromRecoverySecretHex(
+    let ensureOperatorIdRes = flow.V3BioDidOperatorIdFromRecoverySecretHex(
         "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
     )
     assert(IsOk(ensureOperatorIdRes), "v3 bio did chain smoke: ensure operator id")
     let ensureOperatorId = Value(ensureOperatorIdRes)
     var ensureState: flow.V3BioDidChainState
-    assert(IsOk(flow.v3BioDidChainStateInitInto(ensureState,
+    assert(IsOk(flow.V3BioDidChainStateInitInto(ensureState,
                                                 "bio.did.chain.ensure",
                                                 "bio.did.chain.ensure.addr")),
            "v3 bio did chain smoke: init ensure state")
-    let ensureCreateRes = flow.v3BioDidEnsureWithHardwareCapture(
-        ensureState,
-        ensureOperatorId,
-        bioDidChainSmokeCapture(feature,
+    var ensureCreateCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(ensureCreateCapture,
+                                feature,
                                 "device.ensure.phone",
                                 "ensure-phone",
                                 "ensure-create-1",
-                                biometric.v3BiometricPurposeDidCreate,
-                                true),
-        int64(1060)
-    )
+                                biometric.V3BiometricPurposeDidCreate,
+                                true)
+    let ensureCreateRes = flow.V3BioDidEnsureWithHardwareCapture(ensureState,
+                                                                 ensureOperatorId,
+                                                                 ensureCreateCapture,
+                                                                 int64(1060))
     assert(IsOk(ensureCreateRes), "v3 bio did chain smoke: ensure create")
-    assert(Value(ensureCreateRes).bundle.action == "create",
+    let ensureCreate = Value(ensureCreateRes)
+    let ensureCreateBundle = ensureCreate.bundle
+    assert(ensureCreateBundle.action == "create",
            "v3 bio did chain smoke: ensure create action")
-    let ensureImportRes = flow.v3BioDidEnsureWithHardwareCapture(
-        ensureState,
-        ensureOperatorId,
-        bioDidChainSmokeCapture(matchFeature,
+    var ensureImportCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(ensureImportCapture,
+                                matchFeature,
                                 "device.ensure.tablet",
                                 "ensure-tablet",
                                 "ensure-import-1",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1070)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let ensureImportRes = flow.V3BioDidEnsureWithHardwareCapture(ensureState,
+                                                                 ensureOperatorId,
+                                                                 ensureImportCapture,
+                                                                 int64(1070))
     assert(IsOk(ensureImportRes), "v3 bio did chain smoke: ensure import")
-    assert(Value(ensureImportRes).bundle.action == "import",
+    let ensureImport = Value(ensureImportRes)
+    let ensureImportBundle = ensureImport.bundle
+    assert(ensureImportBundle.action == "import",
            "v3 bio did chain smoke: ensure import action")
-    let ensureLookupRes = flow.v3BioDidOperatorIndexLookup(ensureState.operatorIndex,
-                                                           layout.fixedBytes32Hex(ensureOperatorId))
+    let ensureOperatorIdHex = layout.FixedBytes32Hex(ensureOperatorId)
+    let ensureOperatorIndex = ensureState.operatorIndex
+    let ensureLookupRes = flow.V3BioDidOperatorIndexLookup(ensureOperatorIndex,
+                                                           ensureOperatorIdHex)
     assert(IsOk(ensureLookupRes), "v3 bio did chain smoke: ensure lookup")
-    assert(Value(ensureLookupRes).bundleSeq == 2,
+    let ensureLookup = Value(ensureLookupRes)
+    assert(ensureLookup.bundleSeq == 2,
            "v3 bio did chain smoke: ensure latest seq")
 
-    let badImportRes = flow.v3BioDidImportWithHardwareCapture(
-        node,
-        didText,
-        bioDidChainSmokeCapture(badFeature,
+    var badImportCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(badImportCapture,
+                                badFeature,
                                 "device.tablet.secure",
                                 "tablet",
                                 "import-tablet-bad",
-                                biometric.v3BiometricPurposeDidImport,
-                                true),
-        int64(1040)
-    )
+                                biometric.V3BiometricPurposeDidImport,
+                                true)
+    let badImportRes = flow.V3BioDidImportWithHardwareCapture(node,
+                                                              didText,
+                                                              badImportCapture,
+                                                              int64(1040))
     assert(IsErr(badImportRes), "v3 bio did chain smoke: bad fingerprint reject")
 
     var unverifiedNodeVar: chain.V3ChainNode
-    assert(IsOk(chain.v3ChainNodeInitInto(unverifiedNodeVar,
+    assert(IsOk(chain.V3ChainNodeInitInto(unverifiedNodeVar,
                                           "bio.did.chain.unverified",
                                           "bio.did.chain.addr.2")),
            "v3 bio did chain smoke: init unverified node")
-    let unverifiedCreateRes = flow.v3BioDidCreateWithHardwareCapture(
-        unverifiedNodeVar,
-        bioDidChainSmokeCapture(feature,
+    var unverifiedCapture: flow.V3BioDidHardwareCapture
+    bioDidChainSmokeCaptureInto(unverifiedCapture,
+                                feature,
                                 "device.phone.secure",
                                 "phone",
                                 "create-phone-unverified",
-                                biometric.v3BiometricPurposeDidCreate,
-                                false),
-        int64(1050)
-    )
+                                biometric.V3BiometricPurposeDidCreate,
+                                false)
+    let unverifiedCreateRes = flow.V3BioDidCreateWithHardwareCapture(unverifiedNodeVar,
+                                                                     unverifiedCapture,
+                                                                     int64(1050))
     assert(IsErr(unverifiedCreateRes), "v3 bio did chain smoke: unverified reject")
 
     echo("v3 bio_did_chain_node_smoke ok")

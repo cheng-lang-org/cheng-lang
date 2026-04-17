@@ -95,7 +95,7 @@ fn jsonString(value: str): JsonNode =
 
 fn jsonAppendNode(seqInst: var JsonNode[], value: JsonNode) =
     let idx: int32 = seqInst.len
-    seqs.setLen(seqInst, idx + 1)
+    seqs.SetLen(seqInst, idx + 1)
     seqInst[idx] = value
 
 fn jsonAppendStr(seqInst: var str[], value: str) =
@@ -164,6 +164,17 @@ fn jsonSetField(node: var JsonNode, key: str, value: JsonNode) =
     jsonAppendStr(node.okeys, key)
     jsonAppendNode(node.ovalues, value)
 
+fn jsonObjectFieldSlot(node: var JsonNode, key: str): int32 =
+    if node.kind != JObject:
+        return -1
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] == key:
+            return i
+    let idx: int32 = node.okeys.len
+    jsonAppendStr(node.okeys, key)
+    seqs.SetLen(node.ovalues, idx + 1)
+    return idx
+
 fn `[]`(node: JsonNode, key: str): JsonNode =
     return jsonGetField(node, key)
 
@@ -171,22 +182,28 @@ fn `[]=`(node: var JsonNode, key: str, value: JsonNode) =
     jsonSetField(node, key, value)
 
 fn `[]=`(node: var JsonNode, key: str, value: str) =
-    jsonSetField(node, key, newJString(value))
+    var boxed: JsonNode = newJString(value)
+    jsonSetField(node, key, boxed)
 
 fn `[]=`(node: var JsonNode, key: str, value: bool) =
-    jsonSetField(node, key, newJBool(value))
+    var boxed: JsonNode = newJBool(value)
+    jsonSetField(node, key, boxed)
 
 fn `[]=`(node: var JsonNode, key: str, value: int) =
-    jsonSetField(node, key, newJInt(int64(value)))
+    var boxed: JsonNode = newJInt(int64(value))
+    jsonSetField(node, key, boxed)
 
 fn `[]=`(node: var JsonNode, key: str, value: int32) =
-    jsonSetField(node, key, newJInt(int64(value)))
+    var boxed: JsonNode = newJInt(int64(value))
+    jsonSetField(node, key, boxed)
 
 fn `[]=`(node: var JsonNode, key: str, value: int64) =
-    jsonSetField(node, key, newJInt(value))
+    var boxed: JsonNode = newJInt(value)
+    jsonSetField(node, key, boxed)
 
 fn `[]=`(node: var JsonNode, key: str, value: float64) =
-    jsonSetField(node, key, newJFloat(value))
+    var boxed: JsonNode = newJFloat(value)
+    jsonSetField(node, key, boxed)
 
 fn getInt(node: JsonNode): int64 =
     if node.kind == JInt:
@@ -230,6 +247,66 @@ fn getStr(node: JsonNode, fallback: str): str =
         return node.s
     return fallback
 
+fn jsonTryGetStr(node: JsonNode, key: str, out: var str): bool =
+    if node.kind != JObject:
+        return false
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] != key:
+            continue
+        if node.ovalues[i].kind != JString:
+            return false
+        out = node.ovalues[i].s
+        return true
+    return false
+
+fn jsonTryGetBool(node: JsonNode, key: str, out: var bool): bool =
+    if node.kind != JObject:
+        return false
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] != key:
+            continue
+        if node.ovalues[i].kind != JBool:
+            return false
+        out = node.ovalues[i].b
+        return true
+    return false
+
+fn jsonTryGetInt64(node: JsonNode, key: str, out: var int64): bool =
+    if node.kind != JObject:
+        return false
+    for i in 0..<node.okeys.len:
+        if node.okeys[i] != key:
+            continue
+        if node.ovalues[i].kind == JInt:
+            out = node.ovalues[i].i
+            return true
+        if node.ovalues[i].kind == JFloat:
+            out = int64(node.ovalues[i].f)
+            return true
+        return false
+    return false
+
+fn jsonNodeTryGetStr(node: JsonNode, out: var str): bool =
+    if node.kind != JString:
+        return false
+    out = node.s
+    return true
+
+fn jsonNodeTryGetBool(node: JsonNode, out: var bool): bool =
+    if node.kind != JBool:
+        return false
+    out = node.b
+    return true
+
+fn jsonNodeTryGetInt64(node: JsonNode, out: var int64): bool =
+    if node.kind == JInt:
+        out = node.i
+        return true
+    if node.kind == JFloat:
+        out = int64(node.f)
+        return true
+    return false
+
 fn getStrArray(node: JsonNode): str[] =
     var out: str[]
     if node.kind != JArray:
@@ -237,7 +314,7 @@ fn getStrArray(node: JsonNode): str[] =
     for i in 0..<node.a.len:
         let value: str = getStr(node.a[i], "")
         if len(value) > 0:
-            seqs.add(out, value)
+            seqs.Add(out, value)
     return out
 
 fn getStrArray(node: JsonNode, key: str): str[] =
@@ -322,19 +399,20 @@ fn escapeJsonString(value: str): str =
     var parts: str[]
     for i in 0..<len(value):
         let ch: char = value[i]
-        if ch == '\\':
+        let chCode: int32 = int32(ch)
+        if chCode == 92:
             jsonAppendStr(parts, "\\\\")
-        elif ch == '"':
+        elif chCode == 34:
             jsonAppendStr(parts, "\\\"")
-        elif ch == '\n':
+        elif chCode == 10:
             jsonAppendStr(parts, "\\n")
-        elif ch == '\r':
+        elif chCode == 13:
             jsonAppendStr(parts, "\\r")
-        elif ch == '\t':
+        elif chCode == 9:
             jsonAppendStr(parts, "\\t")
         else:
             jsonAppendStr(parts, charToStr(ch))
-    return strutils.join(parts, "")
+    return strutils.Join(parts, "")
 
 fn pretty(node: JsonNode, indent: int): str =
     indent
@@ -345,10 +423,10 @@ fn pretty(node: JsonNode, indent: int): str =
     if node.kind == JInt:
         return int64ToStr(node.i)
     if node.kind == JFloat:
-        return strutils.formatFloat(node.f)
+        return strutils.FormatFloat(node.f)
     if node.kind == JString:
         let quotedParts: str[] = ["\"", escapeJsonString(node.s), "\""]
-        return strutils.join(quotedParts, "")
+        return strutils.Join(quotedParts, "")
     if node.kind == JArray:
         var parts: str[]
         jsonAppendStr(parts, "[")
@@ -357,7 +435,7 @@ fn pretty(node: JsonNode, indent: int): str =
                 jsonAppendStr(parts, ",")
             jsonAppendStr(parts, pretty(node.a[i], indent))
         jsonAppendStr(parts, "]")
-        return strutils.join(parts, "")
+        return strutils.Join(parts, "")
     if node.kind == JObject:
         var parts: str[]
         jsonAppendStr(parts, "{")
@@ -369,7 +447,7 @@ fn pretty(node: JsonNode, indent: int): str =
             jsonAppendStr(parts, "\":")
             jsonAppendStr(parts, pretty(node.ovalues[i], indent))
         jsonAppendStr(parts, "}")
-        return strutils.join(parts, "")
+        return strutils.Join(parts, "")
     return "null"
 
 fn pretty(node: JsonNode): str =
@@ -433,3 +511,129 @@ fn jsonObjectLit(fields: CompatJsonPair[]): JsonNode =
 
 fn jsonArrayLit(items: JsonNode[]): JsonNode =
     return jsonArray(items)
+
+fn GetBool(node: JsonNode): bool =
+    return getBool(node)
+
+fn GetBool(node: JsonNode, fallback: bool): bool =
+    return getBool(node, fallback)
+
+fn GetInt(node: JsonNode): int64 =
+    return getInt(node)
+
+fn GetInt64(node: JsonNode): int64 =
+    return getInt64(node)
+
+fn GetInt64(node: JsonNode, fallback: int64): int64 =
+    return getInt64(node, fallback)
+
+fn GetStr(node: JsonNode): str =
+    return getStr(node)
+
+fn GetStr(node: JsonNode, fallback: str): str =
+    return getStr(node, fallback)
+
+fn HasKey(node: JsonNode, key: str): bool =
+    return hasKey(node, key)
+
+fn JsonSetField(node: var JsonNode, key: str, value: JsonNode) =
+    jsonSetField(node, key, value)
+
+fn JsonSetField(node: var JsonNode, key: str, value: str) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JString
+    boxed.s = value
+    node.ovalues[slot] = boxed
+
+fn JsonSetField(node: var JsonNode, key: str, value: bool) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JBool
+    boxed.b = value
+    node.ovalues[slot] = boxed
+
+fn JsonSetField(node: var JsonNode, key: str, value: int) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JInt
+    boxed.i = int64(value)
+    node.ovalues[slot] = boxed
+
+fn JsonSetField(node: var JsonNode, key: str, value: int32) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JInt
+    boxed.i = int64(value)
+    node.ovalues[slot] = boxed
+
+fn JsonSetField(node: var JsonNode, key: str, value: int64) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JInt
+    boxed.i = value
+    node.ovalues[slot] = boxed
+
+fn JsonSetField(node: var JsonNode, key: str, value: float64) =
+    let slot: int32 = jsonObjectFieldSlot(node, key)
+    if slot < 0:
+        return
+    var boxed: JsonNode = node.ovalues[slot]
+    boxed.kind = JFloat
+    boxed.f = value
+    node.ovalues[slot] = boxed
+
+fn NewJBool(value: bool): JsonNode =
+    return newJBool(value)
+
+fn NewJInt(value: int64): JsonNode =
+    return newJInt(value)
+
+fn NewJObject(): JsonNode =
+    return newJObject()
+
+fn NewJString(value: str): JsonNode =
+    return newJString(value)
+
+fn ParseJsonSafe(content: str): JsonParseResult =
+    return parseJsonSafe(content)
+
+fn JsonTryGetStr(node: JsonNode, key: str, out: var str): bool =
+    return jsonTryGetStr(node, key, out)
+
+fn JsonTryGetBool(node: JsonNode, key: str, out: var bool): bool =
+    return jsonTryGetBool(node, key, out)
+
+fn JsonTryGetInt64(node: JsonNode, key: str, out: var int64): bool =
+    return jsonTryGetInt64(node, key, out)
+
+fn JsonNodeTryGetStr(node: JsonNode, out: var str): bool =
+    return jsonNodeTryGetStr(node, out)
+
+fn JsonNodeTryGetBool(node: JsonNode, out: var bool): bool =
+    return jsonNodeTryGetBool(node, out)
+
+fn JsonNodeTryGetInt64(node: JsonNode, out: var int64): bool =
+    return jsonNodeTryGetInt64(node, out)
+
+fn Pretty(node: JsonNode, indent: int): str =
+    return pretty(node, indent)
+
+fn Pretty(node: JsonNode): str =
+    return pretty(node)
+
+fn ToPretty(node: JsonNode, indent: int): str =
+    return toPretty(node, indent)
+
+fn ToPretty(node: JsonNode): str =
+    return toPretty(node)

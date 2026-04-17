@@ -82,6 +82,51 @@ function writeSummary(filePath, values) {
   fs.writeFileSync(filePath, `${lines.join('\n')}\n`, 'utf8');
 }
 
+function readJsonIfExists(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  return readJson(filePath);
+}
+
+function uniqueStrings(values) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of values || []) {
+    const value = String(raw || '').trim();
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+function enrichHostContractFromCompileReport(hostContract, outDir) {
+  const compileReportPath = path.resolve(path.join(outDir, 'compile_report_v1.json'));
+  const compileReport = readJsonIfExists(compileReportPath);
+  if (!compileReport) return hostContract;
+  const featureTotals = compileReport && typeof compileReport.feature_totals === 'object' && compileReport.feature_totals
+    ? compileReport.feature_totals
+    : {};
+  const featureHits = uniqueStrings([
+    ...(Array.isArray(hostContract?.feature_hits) ? hostContract.feature_hits : []),
+    ...Object.entries(featureTotals)
+      .filter(([, value]) => Number(value || 0) > 0)
+      .map(([key]) => key),
+  ]);
+  const methodGroups = Array.isArray(hostContract?.methods)
+    ? hostContract.methods.filter((item) => item && item.required).map((item) => String(item.group || ''))
+    : [];
+  const requiredGroups = uniqueStrings([
+    ...(Array.isArray(hostContract?.required_groups) ? hostContract.required_groups : []),
+    ...(Array.isArray(compileReport?.required_host_groups) ? compileReport.required_host_groups : []),
+    ...methodGroups,
+  ]);
+  return {
+    ...hostContract,
+    feature_hits: featureHits,
+    required_groups: requiredGroups,
+  };
+}
+
 function shQuote(text) {
   return `'${String(text ?? '').replace(/'/g, `'\"'\"'`)}'`;
 }
@@ -3382,15 +3427,13 @@ function compileAndRunEntry(tool, packageRoot, mainPath, exePath, compileReportP
   };
 }
 
-function runNativeGuiRuntimeViaController(tool, workspaceRoot, runtimeContractPath, controllerLogPath) {
-  const result = spawnForExec(tool, [
-    'r2c-react-v3',
-    'native-gui-runtime',
+function runNativeGuiRuntimeDirect(runtimeExePath, runtimeContractPath, controllerLogPath) {
+  const result = spawnForExec(runtimeExePath, [
     '--runtime-contract',
     runtimeContractPath,
   ], {
     timeout: NATIVE_GUI_RUNTIME_CONTROLLER_TIMEOUT_MS,
-    cwd: workspaceRoot,
+    cwd: path.dirname(runtimeExePath),
   });
   const stdoutText = String(result.stdout || '');
   const stderrText = String(result.stderr || '');
@@ -3402,21 +3445,21 @@ function runNativeGuiRuntimeViaController(tool, workspaceRoot, runtimeContractPa
   writeText(controllerLogPath, logText);
   const exitCode = exitCodeOf(result);
   if (exitCode !== 0) {
-    throw new Error(`native_gui_runtime_controller_failed:${exitCode}`);
+    throw new Error(`native_gui_runtime_direct_failed:${exitCode}`);
   }
   const trimmed = stdoutText.trim();
   if (!trimmed) {
-    throw new Error('native_gui_runtime_controller_empty');
+    throw new Error('native_gui_runtime_direct_empty');
   }
   let doc = null;
   try {
     doc = JSON.parse(trimmed);
   } catch (error) {
     const message = String(error?.message || error || 'unknown');
-    throw new Error(`native_gui_runtime_controller_json_parse_failed:${message}`);
+    throw new Error(`native_gui_runtime_direct_json_parse_failed:${message}`);
   }
   if (String(doc?.format || '') !== 'native_gui_runtime_v1') {
-    throw new Error(`native_gui_runtime_controller_format_mismatch:${String(doc?.format || '')}`);
+    throw new Error(`native_gui_runtime_direct_format_mismatch:${String(doc?.format || '')}`);
   }
   return {
     exitCode,
@@ -3623,6 +3666,7 @@ function main() {
   const tsxAstPath = path.resolve(path.join(outDir, 'tsx_ast_v1.json'));
   const bundlePath = path.resolve(args.outPath || path.join(outDir, 'native_gui_bundle_v1.json'));
   const summaryPath = path.resolve(args.summaryOut || path.join(outDir, 'native_gui_bundle.summary.env'));
+  const reportPath = path.resolve(path.join(outDir, 'native_gui_bundle_report_v1.json'));
   const layoutSurfacePath = path.resolve(path.join(outDir, 'layout_surface_v1.json'));
   const styleLayoutSurfacePath = path.resolve(path.join(outDir, 'style_layout_surface_v1.json'));
   const nativeLayoutPlanPath = path.resolve(path.join(outDir, 'native_layout_plan_v1.json'));
@@ -3645,7 +3689,7 @@ function main() {
   requireFile(routeCatalogPath, 'route catalog');
   requireFile(tsxAstPath, 'tsx ast');
 
-  const hostContract = readJson(hostContractPath);
+  let hostContract = readJson(hostContractPath);
   const assetManifest = readJson(assetManifestPath);
   const tailwindManifest = readJson(tailwindManifestPath);
   const routeCatalog = readJson(routeCatalogPath);
@@ -3656,6 +3700,8 @@ function main() {
   requireFormat(tailwindManifest, 'tailwind_style_manifest_v1', 'tailwind manifest');
   requireFormat(routeCatalog, 'cheng_codegen_route_catalog_v1', 'route catalog');
   requireFormat(tsxAstDoc, 'tsx_ast_v1', 'tsx ast');
+  hostContract = enrichHostContractFromCompileReport(hostContract, outDir);
+  writeJson(hostContractPath, hostContract);
 
   const packageRoot = String(codegenManifest.package_root || '');
   const packageId = String(codegenManifest.package_id || '');
@@ -3815,9 +3861,8 @@ function main() {
   if (runtimeRun.runReturnCode !== 0) {
     throw new Error(`native_gui_runtime_run_failed:${runtimeRun.runReturnCode}`);
   }
-  const runtimeControllerRun = runNativeGuiRuntimeViaController(
-    tool,
-    workspaceRoot,
+  const runtimeControllerRun = runNativeGuiRuntimeDirect(
+    runtimeCompiledExePath,
     runtimeContractPath,
     runtimeControllerLogPath,
   );
@@ -4056,7 +4101,63 @@ function main() {
   };
 
   writeJson(bundlePath, bundle);
+  writeJson(reportPath, {
+    format: 'controller_report_v1',
+    controller: 'node.native_gui_bundle',
+    command: 'native-gui-bundle',
+    ok: true,
+    reason: 'ok',
+    repo_root: repo,
+    out_dir: outDir,
+    primary_artifact_path: bundlePath,
+    primary_artifact_format: 'native_gui_bundle_v1',
+    module_count: Array.isArray(tsxAstDoc?.modules) ? tsxAstDoc.modules.length : 0,
+    route_count: Number(routeCatalog.routeCount || 0),
+    semantic_nodes_count: Number(execSnapshot.semantic_nodes_count || 0),
+    asset_count: Array.isArray(assetManifest.entries) ? assetManifest.entries.length : 0,
+    tailwind_token_count: Array.isArray(tailwindManifest.tokens) ? tailwindManifest.tokens.length : 0,
+    required_host_group_count: requiredGroups.length,
+    required_host_groups: requiredGroups,
+    typescript_version: String(tsxAstDoc?.typescript_version || ''),
+    native_gui_launcher_module: launcherModule,
+    native_gui_session_path: sessionPath,
+    native_gui_session_preview_mode: String(sessionDoc?.preview_mode || 'cheng_ui_host_preview_v1'),
+    native_gui_route_state: targetRouteState,
+    native_gui_layout_surface_path: layoutSurfacePath,
+    native_gui_layout_surface_node_count: Number(layoutSurface.node_count || 0),
+    native_gui_layout_surface_source_module: String(layoutSurface.source_module_path || ''),
+    native_gui_layout_surface_source_component: String(layoutSurface.source_component_name || ''),
+    native_gui_layout_surface_strategy: String(layoutSurface.source_strategy || ''),
+    native_gui_layout_surface_component_expansion_count: Number(layoutSurface.component_expansion_count || 0),
+    native_gui_layout_surface_parsed_module_count: Number(layoutSurface.parsed_module_count || 0),
+    native_gui_layout_surface_styled_node_count: Number(layoutSurface.styled_node_count || 0),
+    native_gui_layout_surface_interactive_node_count: Number(layoutSurface.interactive_node_count || 0),
+    native_gui_style_layout_surface_path: styleLayoutSurfacePath,
+    native_gui_style_layout_surface_node_count: Number(styleLayoutSurface.node_count || 0),
+    native_gui_style_layout_overlay_node_count: Number(styleLayoutSurface.overlay_node_count || 0),
+    native_gui_style_layout_surface_surface_node_count: Number(styleLayoutSurface.surface_node_count || 0),
+    native_gui_style_layout_surface_control_node_count: Number(styleLayoutSurface.control_node_count || 0),
+    native_gui_native_layout_plan_path: nativeLayoutPlanPath,
+    native_gui_native_layout_plan_policy_source: String(nativeLayoutPlan.layout_policy_source || ''),
+    native_gui_native_layout_plan_item_count: Number(nativeLayoutPlan.item_count || 0),
+    native_gui_native_layout_plan_viewport_item_count: Number(nativeLayoutPlan.viewport_item_count || 0),
+    native_gui_native_layout_plan_clipped_item_count: Number(nativeLayoutPlan.clipped_item_count || 0),
+    native_gui_native_layout_plan_interactive_item_count: Number(nativeLayoutPlan.interactive_item_count || 0),
+    native_gui_native_layout_plan_source_backed_item_count: Number(nativeLayoutPlan.source_backed_item_count || 0),
+    native_gui_native_layout_plan_scroll_height: Number(nativeLayoutPlan.scroll_height || 0),
+    native_gui_host_abi_feature_hits: hostAbi.feature_hits,
+    native_gui_host_abi_first_batch_features: Array.isArray(hostAbi.first_batch?.detected_features) ? hostAbi.first_batch.detected_features : [],
+    native_gui_host_abi_first_batch_missing_features: Array.isArray(hostAbi.first_batch?.missing_features) ? hostAbi.first_batch.missing_features : [],
+    native_gui_host_abi_first_batch_ready: hostAbiFirstBatchReady,
+    native_gui_host_ready: nativeGuiHostReady,
+    native_gui_renderer_ready: nativeGuiRendererReady,
+    native_gui_session_preview_ready: nativeGuiSessionPreviewReady,
+    native_gui_layout_surface_ready: true,
+    native_gui_style_layout_surface_ready: true,
+    native_gui_native_layout_plan_ready: true,
+  });
   writeSummary(summaryPath, {
+    native_gui_report_path: reportPath,
     native_gui_bundle_path: bundlePath,
     native_gui_launcher_module: launcherModule,
     native_gui_launcher_module_path: launcherModulePath,
@@ -4150,6 +4251,7 @@ function main() {
     ok: true,
     repo_root: repo,
     out_dir: outDir,
+    report_path: reportPath,
     native_gui_bundle_path: bundlePath,
     native_gui_launcher_module: launcherModule,
     native_gui_session_path: sessionPath,

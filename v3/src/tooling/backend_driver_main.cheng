@@ -1,0 +1,2202 @@
+import std/cmdline as cmdline
+import std/monotimes
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/path as v3path
+import cheng/v3/backend/build_plan as buildplan
+import cheng/v3/backend/system_link_plan as slplan
+
+@importc("get_stdout")
+fn v3BackendDriverStdoutBridge(): os.File
+@importc("get_stderr")
+fn v3BackendDriverStderrBridge(): os.File
+@importc("paramCount")
+fn v3BackendDriverParamCountBridge(): int32
+
+fn v3BackendDriverPrintLine(text: str) =
+    os.WriteLine(v3BackendDriverStdoutBridge(), text)
+
+fn v3BackendDriverPrintErr(text: str) =
+    os.WriteLine(v3BackendDriverStderrBridge(), text)
+
+fn v3BackendDriverPrintBlock(file: os.File,
+                             text: str) =
+    var start: int32 = 0
+    var i: int32 = 0
+    while i < text.len:
+        if text[i] == '\n':
+            let line: str = strings.SliceBytes(text, start, i - start)
+            os.WriteLine(file, line)
+            start = i + 1
+        i = i + 1
+    if start < text.len:
+        let line: str = strings.SliceBytes(text, start, text.len - start)
+        os.WriteLine(file, line)
+
+fn v3BackendDriverPrintStdoutBlock(text: str) =
+    v3BackendDriverPrintBlock(v3BackendDriverStdoutBridge(), text)
+
+fn v3BackendDriverPrintStderrBlock(text: str) =
+    v3BackendDriverPrintBlock(v3BackendDriverStderrBridge(), text)
+
+fn v3BackendDriverRoot(): str =
+    let envRoot: str = os.GetEnv("CHENG_V3_ROOT")
+    if len(envRoot) > 0:
+        return envRoot
+    let cwd: str = os.GetCurrentDir()
+    let rootSeed: str = os.JoinPath(cwd, "v3/bootstrap/cheng_v3_seed.c")
+    if v3path.V3PathFileExists(rootSeed):
+        return cwd
+    let v3Seed: str = os.JoinPath(cwd, "bootstrap/cheng_v3_seed.c")
+    if v3path.V3PathFileExists(v3Seed):
+        let parts = os.SplitFile(cwd)
+        if len(parts.dir) > 0:
+            return parts.dir
+    return cwd
+
+fn v3BackendDriverEntrySource(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir, "v3/src/tooling/backend_driver_main.cheng")
+
+fn v3BackendDriverStage3Path(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
+
+fn v3BackendDriverSelfPath(rootDir: str): str =
+    let resolved: str = hostops.v3ResolveProgram(rootDir, cmdline.ProgramName())
+    if len(resolved) > 0:
+        return resolved
+    let raw: str = cmdline.ProgramName()
+    if len(raw) > 0:
+        return v3path.V3PathAbsolute(rootDir, raw)
+    return ""
+
+fn v3BackendDriverVerifyExportLabel(selfPath: str): str =
+    if len(selfPath) > 0 && strings.StrContains(selfPath, "cheng.next"):
+        return "verify_export_backend_driver_candidate"
+    return "verify_export_backend_driver"
+
+fn v3BackendDriverVerifyExportParallelLabel(selfPath: str): str =
+    if len(selfPath) > 0 && strings.StrContains(selfPath, "cheng.next"):
+        return "verify_export_parallel_backend_driver_candidate"
+    return "verify_export_parallel_backend_driver"
+
+fn v3BackendDriverUsage(rootDir: str) =
+    let lines: str[] = crun.v3CompilerUsageLines(rootDir)
+    for i in 0..<lines.len:
+        let line: str = lines[i]
+        if len(line) >= 15 && strings.SliceBytes(line, 0, 15) == "compiler_entry=":
+            v3BackendDriverPrintLine("compiler_entry=" + v3BackendDriverEntrySource(rootDir))
+        else:
+            v3BackendDriverPrintLine(line)
+
+fn v3BackendDriverStatus(rootDir: str) =
+    let contract = crun.v3CompilerRuntimeContract(rootDir)
+    v3BackendDriverPrintLine("cheng_v3c")
+    v3BackendDriverPrintLine("version=" + contract.version)
+    v3BackendDriverPrintLine("execution=" + contract.executionModel)
+    v3BackendDriverPrintLine("bootstrap_mode=" + contract.bootstrapMode)
+    v3BackendDriverPrintLine("compiler_entry=" + v3BackendDriverEntrySource(rootDir))
+    v3BackendDriverPrintLine("ordinary_command=" + contract.ordinaryCommand)
+    v3BackendDriverPrintLine("ordinary_pipeline=" + contract.ordinaryPipelineState)
+
+fn v3BackendDriverRequestedTarget(count: int32): str =
+    let defaultTarget: str = contracts.v3BootstrapDefaultTarget()
+    var targetRaw: str = defaultTarget
+    var i: int32 = 2
+    while i <= count:
+        let arg: str = cmdline.ParamStr(i)
+        let colonPrefix: str = "--target:"
+        let equalPrefix: str = "--target="
+        if arg.len >= colonPrefix.len:
+            if strings.SliceBytes(arg, 0, colonPrefix.len) == colonPrefix:
+                targetRaw = strings.SliceBytes(arg, colonPrefix.len, arg.len - colonPrefix.len)
+        if arg.len >= equalPrefix.len:
+            if strings.SliceBytes(arg, 0, equalPrefix.len) == equalPrefix:
+                targetRaw = strings.SliceBytes(arg, equalPrefix.len, arg.len - equalPrefix.len)
+        i = i + 1
+    let trimmed: str = strutil.Strip(targetRaw)
+    if len(trimmed) > 0:
+        return trimmed
+    return defaultTarget
+
+fn v3BackendDriverPrintBuildPlan(rootDir: str,
+                                 count: int32): int32 =
+    let targetTriple: str = v3BackendDriverRequestedTarget(count)
+    let plan: buildplan.V3BackendBuildPlan = buildplan.v3BackendBuildPlanBackendDriverForTarget(rootDir, targetTriple)
+    let reportRaw: str = buildplan.v3BackendBuildPlanReport(plan)
+    let report: str = strutil.Strip(reportRaw)
+    v3BackendDriverPrintLine(report)
+    return 0
+
+fn v3BackendDriverSharedEmitExtension(targetTriple: str): str =
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return ".dll"
+    if targetTriple == "arm64-apple-darwin":
+        return ".dylib"
+    return ".so"
+
+fn v3BackendDriverSharedEmitFileHint(targetTriple: str): str =
+    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+        return "PE32+"
+    if targetTriple == "arm64-apple-darwin":
+        return "shared library"
+    return "shared object"
+
+fn v3BackendDriverHostTarget(): str =
+    let detected: str = contracts.v3BootstrapDetectHostTarget()
+    if detected == "arm64-apple-darwin" ||
+       detected == "x86_64-apple-darwin" ||
+       detected == "x86_64-unknown-linux-gnu" ||
+       detected == "aarch64-unknown-linux-gnu":
+        return detected
+    return ""
+
+fn v3BackendDriverResolveVerifyTarget(count: int32,
+                                      context: str,
+                                      outTarget: var str): bool =
+    let requested: str = v3BackendDriverRequestedTarget(count)
+    let defaultTarget: str = contracts.v3BootstrapDefaultTarget()
+    if requested != defaultTarget:
+        v3BackendDriverPrintErr("v3 backend driver: " + context + " only supports host backend_driver target")
+        outTarget = ""
+        return false
+    let hostTarget: str = v3BackendDriverHostTarget()
+    if len(hostTarget) > 0:
+        outTarget = hostTarget
+        return true
+    outTarget = defaultTarget
+    return true
+
+fn v3BackendDriverPrintRunFailure(context: str,
+                                  run: hostops.V3LoggedRun): bool =
+    if run.exitCode == 0:
+        return false
+    v3BackendDriverPrintErr(context + " rc=" + intToStr(run.exitCode) + " log=" + run.logPath)
+    let outputRaw: str = run.output
+    let outputText: str = strutil.Strip(outputRaw)
+    if len(outputText) > 0:
+        v3BackendDriverPrintErr(outputText)
+    return true
+
+fn v3BackendDriverRunSelftest(rootDir: str,
+                              selfPath: str,
+                              targetTriple: str,
+                              sourcePath: str,
+                              stem: str,
+                              expectedOutput: str): bool =
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    let outBinRelRaw: str = "artifacts/v3_backend_driver/" + stem + ".selftest"
+    let outReportRelRaw: str = outBinRelRaw + ".report.txt"
+    let outCompileLogRelRaw: str = "artifacts/v3_backend_driver/" + stem + ".selftest.compile.log"
+    let outRunLogRelRaw: str = "artifacts/v3_backend_driver/" + stem + ".selftest.run.log"
+    let outBinRel: str = newStringCopy(strDataPtr(outBinRelRaw), strLenFast(outBinRelRaw))
+    let outReportRel: str = newStringCopy(strDataPtr(outReportRelRaw), strLenFast(outReportRelRaw))
+    let outCompileLogRel: str = newStringCopy(strDataPtr(outCompileLogRelRaw), strLenFast(outCompileLogRelRaw))
+    let outRunLogRel: str = newStringCopy(strDataPtr(outRunLogRelRaw), strLenFast(outRunLogRelRaw))
+    let outBin: str = v3path.V3PathAbsolute(rootDir, outBinRel)
+    let outReportPath: str = v3path.V3PathAbsolute(rootDir, outReportRel)
+    let outCompileLogPath: str = v3path.V3PathAbsolute(rootDir, outCompileLogRel)
+    let outRunLogPath: str = v3path.V3PathAbsolute(rootDir, outRunLogRel)
+    let compileArgs: str[] = [
+        "system-link-exec",
+        "--root:" + packageRoot,
+        "--in:" + sourcePath,
+        "--emit:exe",
+        "--target:" + targetTriple,
+        "--out:" + outBin,
+        "--report-out:" + outReportPath
+    ]
+    let compileRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "backend_driver_selftest_compile",
+                                                                  selfPath,
+                                                                  compileArgs,
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  outCompileLogPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: selftest compile", compileRun):
+        return false
+    let compileText: str = v3path.V3ReadTextFile("", outCompileLogPath)
+    if strutil.Contains(compileText, "[cheng_v3_seed]"):
+        v3BackendDriverPrintErr("v3 backend driver: selftest emitted internal seed diagnostics")
+        return false
+    let lineMapPathRaw: str = outBin + ".v3.map"
+    let lineMapPath: str = newStringCopy(strDataPtr(lineMapPathRaw), strLenFast(lineMapPathRaw))
+    if !v3path.V3FileExistsNonEmpty(rootDir, outBin):
+        v3BackendDriverPrintErr("v3 backend driver: selftest missing output: " + outBin)
+        return false
+    if !v3path.V3PathFileExists(lineMapPath):
+        v3BackendDriverPrintErr("v3 backend driver: selftest missing line map: " + lineMapPath)
+        return false
+    let runArgs: str[] = []
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                           "backend_driver_selftest_run",
+                                                           outBin,
+                                                           runArgs,
+                                                           [],
+                                                           rootDir,
+                                                           0,
+                                                           outRunLogPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: selftest run", run):
+        return false
+    let runTextRaw: str = v3path.V3ReadTextFile("", outRunLogPath)
+    let runText: str = strutil.Strip(runTextRaw)
+    if len(expectedOutput) <= 0:
+        if len(runText) > 0:
+            v3BackendDriverPrintErr("v3 backend driver: selftest expected empty stdout")
+            return false
+    elif runText != expectedOutput:
+        v3BackendDriverPrintErr("v3 backend driver: selftest output drifted")
+        if len(runText) > 0:
+            v3BackendDriverPrintErr(runText)
+        return false
+    return true
+
+fn v3BackendDriverVerifyLiveSmoke(rootDir: str,
+                                  count: int32,
+                                  sourceRel: str,
+                                  stem: str,
+                                  expectedOutput: str,
+                                  successText: str): int32 =
+    var targetTriple: str = ""
+    if !v3BackendDriverResolveVerifyTarget(count, successText, targetTriple):
+        return 1
+    var selfPath: str = ""
+    selfPath = v3BackendDriverSelfPath(rootDir)
+    if len(selfPath) <= 0:
+        v3BackendDriverPrintErr("v3 backend driver: missing self path for " + successText)
+        return 2
+    let sourcePath: str = v3path.V3PathAbsolute(rootDir, sourceRel)
+    if !v3BackendDriverRunSelftest(rootDir,
+                                   selfPath,
+                                   targetTriple,
+                                   sourcePath,
+                                   stem,
+                                   expectedOutput):
+        return 1
+    v3BackendDriverPrintLine(successText)
+    return 0
+
+fn v3BackendDriverSharedEmitRunDirRel(): str =
+    var now: monotimes.MonoTime
+    now = monotimes.GetMonoTime()
+    let nowNs: int64 = monotimes.MonoTimeNs(now)
+    return "artifacts/v3_shared_emit_smokes/" + int64ToStr(nowNs)
+
+fn v3BackendDriverRunSharedEmitSmokes(rootDir: str,
+                                      count: int32): int32 =
+    var selfPath: str = ""
+    selfPath = v3BackendDriverSelfPath(rootDir)
+    if len(selfPath) <= 0:
+        v3BackendDriverPrintErr("v3 backend driver: missing self path for run-shared-emit-smokes")
+        return 2
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    let fixtureSource: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/shared_emit_fixture.cheng")
+    let targetTriple: str = v3BackendDriverRequestedTarget(count)
+    let extension: str = v3BackendDriverSharedEmitExtension(targetTriple)
+    let outDirRelRaw: str = v3BackendDriverSharedEmitRunDirRel()
+    let outDirRel: str = newStringCopy(strDataPtr(outDirRelRaw), strLenFast(outDirRelRaw))
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let outLibRelRaw: str = outDirRel + "/shared_emit_fixture" + extension
+    let outLibRel: str = newStringCopy(strDataPtr(outLibRelRaw), strLenFast(outLibRelRaw))
+    let outLib: str = v3path.V3PathAbsolute(rootDir, outLibRel)
+    let reportRelRaw: str = outDirRel + "/shared_emit_fixture.report.txt"
+    let compileLogRelRaw: str = outDirRel + "/shared_emit_fixture.compile.log"
+    let fileLogRelRaw: str = outDirRel + "/shared_emit_fixture.file.txt"
+    let reportRel: str = newStringCopy(strDataPtr(reportRelRaw), strLenFast(reportRelRaw))
+    let compileLogRel: str = newStringCopy(strDataPtr(compileLogRelRaw), strLenFast(compileLogRelRaw))
+    let fileLogRel: str = newStringCopy(strDataPtr(fileLogRelRaw), strLenFast(fileLogRelRaw))
+    let reportPath: str = v3path.V3PathAbsolute(rootDir, reportRel)
+    let compileLogPath: str = v3path.V3PathAbsolute(rootDir, compileLogRel)
+    let fileLogPath: str = v3path.V3PathAbsolute(rootDir, fileLogRel)
+    if !v3path.V3MkdirP(rootDir, outDir):
+        v3BackendDriverPrintErr("v3 backend driver: failed to create shared emit smoke dir")
+        return 2
+    if v3path.V3PathFileExists(outLib):
+        os.RemoveFile(outLib)
+    if v3path.V3PathFileExists(reportPath):
+        os.RemoveFile(reportPath)
+    let compileArgs: str[] = [
+        "system-link-exec",
+        "--root:" + packageRoot,
+        "--in:" + fixtureSource,
+        "--emit:shared",
+        "--target:" + targetTriple,
+        "--out:" + outLib,
+        "--report-out:" + reportPath
+    ]
+    let compileRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "backend_driver_shared_emit_compile",
+                                                                  selfPath,
+                                                                  compileArgs,
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  compileLogPath)
+    if compileRun.exitCode != 0:
+        v3BackendDriverPrintErr("backend_driver_shared_emit_compile rc=" + intToStr(compileRun.exitCode) + " log=" + compileRun.logPath)
+        let compileOutputRaw: str = compileRun.output
+        let compileOutput: str = strutil.Strip(compileOutputRaw)
+        if len(compileOutput) > 0:
+            v3BackendDriverPrintErr(compileOutput)
+        else:
+            v3BackendDriverPrintErr("v3 backend driver: run-shared-emit-smokes compile failed")
+        return 2
+    if !v3path.V3FileExistsNonEmpty(rootDir, outLib):
+        v3BackendDriverPrintErr("v3 backend driver: shared emit smoke missing output: " + outLib)
+        return 2
+    if !v3path.V3FileExistsNonEmpty(rootDir, reportPath):
+        v3BackendDriverPrintErr("v3 backend driver: shared emit smoke missing report: " + reportPath)
+        return 2
+    let reportText: str = v3path.V3ReadTextFile("", reportPath)
+    if !v3path.V3TextContains(reportText, "emit=shared") ||
+       !v3path.V3TextContains(reportText, "main_function_present=0") ||
+       !v3path.V3TextContains(reportText, "missing_reasons=-") ||
+       !v3path.V3TextContains(reportText, "native_link_missing_reasons=-"):
+        v3BackendDriverPrintErr("v3 backend driver: shared emit smoke report shape mismatch: " + reportPath)
+        return 2
+    let fileRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(rootDir,
+                                                                  "backend_driver_shared_emit_file",
+                                                                  "file",
+                                                                  [outLib],
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  fileLogPath)
+    if fileRun.exitCode != 0:
+        v3BackendDriverPrintErr("backend_driver_shared_emit_file rc=" + intToStr(fileRun.exitCode) + " log=" + fileRun.logPath)
+        let fileOutputRaw: str = fileRun.output
+        let fileOutput: str = strutil.Strip(fileOutputRaw)
+        if len(fileOutput) > 0:
+            v3BackendDriverPrintErr(fileOutput)
+        else:
+            v3BackendDriverPrintErr("v3 backend driver: run-shared-emit-smokes file failed")
+        return 2
+    let fileText: str = v3path.V3ReadTextFile("", fileLogPath)
+    let expectedHint: str = v3BackendDriverSharedEmitFileHint(targetTriple)
+    if len(expectedHint) > 0:
+        if !v3path.V3TextContains(fileText, expectedHint):
+            v3BackendDriverPrintErr("v3 backend driver: shared emit smoke expected `" + expectedHint + "` in file output")
+            let trimmedFileText: str = strutil.Strip(fileText)
+            if len(trimmedFileText) > 0:
+                v3BackendDriverPrintErr(trimmedFileText)
+            return 2
+    v3BackendDriverPrintLine("v3 shared emit smokes: ok")
+    v3BackendDriverPrintLine("target=" + targetTriple)
+    v3BackendDriverPrintLine("out=" + outLib)
+    v3BackendDriverPrintLine("report=" + reportPath)
+    return 0
+
+fn v3BackendDriverEnvLineValue(text: str,
+                               key: str): str =
+    let prefix: str = key + "="
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= text.len:
+        var lineEnd: bool = false
+        if i == text.len:
+            lineEnd = true
+        elif text[i] == '\n':
+            lineEnd = true
+        if lineEnd:
+            let line: str = strings.SliceBytes(text, start, i - start)
+            if line.len >= prefix.len:
+                if strings.SliceBytes(line, 0, prefix.len) == prefix:
+                    return strings.SliceBytes(line, prefix.len, line.len - prefix.len)
+            start = i + 1
+        i = i + 1
+    return ""
+
+fn v3BackendDriverRuntimeAbiContractText(rootDir: str): str =
+    let relPath: str = "v3/tooling/backend_runtime_abi_contract.env"
+    let absPath: str = v3path.V3PathAbsolute(rootDir, relPath)
+    return v3path.V3ReadTextFile("", absPath)
+
+fn v3BackendDriverRuntimeAbiPath(rootDir: str,
+                                 contractText: str,
+                                 key: str,
+                                 fallbackRel: str): str =
+    var relPath: str = v3BackendDriverEnvLineValue(contractText, key)
+    relPath = strutil.Strip(relPath)
+    if len(relPath) > 0:
+        return v3path.V3PathAbsolute(rootDir, relPath)
+    return v3path.V3PathAbsolute(rootDir, fallbackRel)
+
+fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
+    let stdOsPath = v3path.V3PathAbsolute(rootDir, "src/std/os.Cheng")
+    let hostProcessPath = v3path.V3PathAbsolute(rootDir, "src/std/os_host_process.cheng")
+    let backendPath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng")
+    let hostRuntimePath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_host_runtime_v3.cheng")
+    let debugRuntimePath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/debug_runtime_stub_v3.cheng")
+    let coreRuntimeDarwinPath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng")
+    let coreRuntimeLinuxPath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/core_runtime_provider_linux_v3.cheng")
+    let peerIdPath = v3path.V3PathAbsolute(rootDir, "v3/src/libp2p/core/peer_id.cheng")
+    let systemLinkExecPath = v3path.V3PathAbsolute(rootDir, "v3/src/backend/system_link_exec.cheng")
+    let runtimeContractText = v3BackendDriverRuntimeAbiContractText(rootDir)
+    let runtimeAuthorityPath = v3BackendDriverRuntimeAbiPath(rootDir,
+                                                             runtimeContractText,
+                                                             "BACKEND_RUNTIME_ABI_AUTHORITY",
+                                                             "src/std/system_helpers_backend.cheng")
+    let expectedRuntimeAuthorityPath = v3path.V3PathAbsolute(rootDir, "src/std/system_helpers_backend.cheng")
+    let runtimeCompatHeaderPath = v3BackendDriverRuntimeAbiPath(rootDir,
+                                                                runtimeContractText,
+                                                                "BACKEND_RUNTIME_ABI_COMPAT_HEADER",
+                                                                "v3/src/runtime/v3_runtime_abi.h")
+    let stdOsText = v3path.V3ReadTextFile("", stdOsPath)
+    let hostProcessText = v3path.V3ReadTextFile("", hostProcessPath)
+    let backendText = v3path.V3ReadTextFile("", backendPath)
+    let hostRuntimeText = v3path.V3ReadTextFile("", hostRuntimePath)
+    let debugRuntimeText = v3path.V3ReadTextFile("", debugRuntimePath)
+    let coreRuntimeDarwinText = v3path.V3ReadTextFile("", coreRuntimeDarwinPath)
+    let coreRuntimeLinuxText = v3path.V3ReadTextFile("", coreRuntimeLinuxPath)
+    let peerIdText = v3path.V3ReadTextFile("", peerIdPath)
+    let systemLinkExecText = v3path.V3ReadTextFile("", systemLinkExecPath)
+    let legacyExecFileCaptureBridge = strutil.Contains(hostProcessText, "@importc(\"cheng_exec_file_capture_bridge\")") ||
+                                      strutil.Contains(backendText, "@exportc(\"cheng_exec_file_capture_bridge\")")
+    let legacyExecFilePipeBridge = strutil.Contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge")
+    let legacyExecFilePipeImport = strutil.Contains(backendText, "@importc(\"cheng_exec_file_pipe_spawn\")")
+    let legacyExecCmdFileRaw = strutil.Contains(stdOsText, "cheng_exec_file_capture_raw")
+    let directProgramRuntimeC = strutil.Contains(backendText, "system_helpers_program_runtime_bridge.c")
+    let legacyRuntimeNativePathPresent = strutil.Contains(runtimeContractText, "v3/runtime/native/") ||
+                                         strutil.Contains(systemLinkExecText, "v3/runtime/native/")
+    let pureChengRuntimeAuthority = runtimeAuthorityPath == expectedRuntimeAuthorityPath
+    let programSupportDirectLibcImportsPresent = strutil.Contains(backendText, "@importc(\"malloc\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"fopen\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"getcwd\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"getentropy\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"pipe\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"fork\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"socket\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"poll\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"recvfrom\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"clock_gettime\")") ||
+                                                 strutil.Contains(backendText, "@importc(\"strerror\")")
+    let programSupportHostRuntimeReady = strutil.Contains(backendText, "@importc(\"cheng_host_malloc\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_fopen\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_getcwd\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_socket\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.Contains(backendText, "@importc(\"cheng_host_strerror\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_v3_program_support_host_trace\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_malloc\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_getenv\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_fopen\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_fgets\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_sysconf\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_statfs\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_getcwd\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_socket\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.Contains(hostRuntimeText, "@exportc(\"cheng_host_strerror\")")
+    let debugRuntimeDirectLibcImportsPresent = strutil.Contains(debugRuntimeText, "@importc(\"puts\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"exit\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"getenv\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fopen\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fclose\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fflush\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fgets\")") ||
+                                               strutil.Contains(debugRuntimeText, "@importc(\"fwrite\")")
+    let debugRuntimeHostRuntimeReady = strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_puts_runtime\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_exit_runtime\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_getenv\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fopen\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fclose\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fflush\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fgets\")") &&
+                                       strutil.Contains(debugRuntimeText, "@importc(\"cheng_host_fwrite\")")
+    let coreRuntimeCommonDirectLibcImportsPresent = strutil.Contains(coreRuntimeDarwinText, "@importc(\"malloc\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"free\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"sysconf\")") ||
+                                                    strutil.Contains(coreRuntimeDarwinText, "@importc(\"statfs\")") ||
+                                                    strutil.Contains(coreRuntimeLinuxText, "@importc(\"malloc\")") ||
+                                                    strutil.Contains(coreRuntimeLinuxText, "@importc(\"statfs\")")
+    let coreRuntimeDarwinAllocatorReady = (strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_malloc\")") &&
+                                           strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_free\")")) ||
+                                          (strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_malloc\")") &&
+                                           strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_free\")"))
+    let coreRuntimeLinuxAllocatorReady = strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_host_malloc\")") ||
+                                         strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_malloc\")")
+    let coreRuntimeCommonHostRuntimeReady = coreRuntimeDarwinAllocatorReady &&
+                                            strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_sysconf\")") &&
+                                            strutil.Contains(coreRuntimeDarwinText, "@importc(\"cheng_host_statfs\")") &&
+                                            coreRuntimeLinuxAllocatorReady &&
+                                            strutil.Contains(coreRuntimeLinuxText, "@importc(\"cheng_host_statfs\")")
+    let legacyPeerIdBase58Bridge = strutil.Contains(peerIdText, "cheng_v3_base58btc_encode_bridge") ||
+                                   strutil.Contains(peerIdText, "cheng_v3_base58btc_decode_bridge") ||
+                                   strutil.Contains(backendText, "@exportc(\"cheng_v3_base58btc_encode_bridge\")") ||
+                                   strutil.Contains(backendText, "@exportc(\"cheng_v3_base58btc_decode_bridge\")") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_value(") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_encode_raw(") ||
+                                   strutil.Contains(backendText, "fn cheng_base58btc_decode_raw(")
+    let pureFsReady = strutil.Contains(backendText, "@exportc(\"cheng_getcwd\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_exists\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_dir_exists\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_mkdir1\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_size\")") &&
+                      strutil.Contains(backendText, "@exportc(\"cheng_file_mtime\")")
+    let pureSocketReady = strutil.Contains(backendText, "@exportc(\"libc_socket\")") &&
+                          strutil.Contains(backendText, "@exportc(\"libc_bind\")") &&
+                          strutil.Contains(backendText, "@exportc(\"libc_getsockname\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_recvfrom_fd_ex\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_v3_udp_recvfrom_addr_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_v3_udp_bind_fd_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_v3_udp_bound_port_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_v3_udp_platform_use_len_field_bridge\")") &&
+                          strutil.Contains(backendText, "@exportc(\"cheng_v3_udp_platform_msg_dontwait_bridge\")")
+    let pureEntropyReady = strutil.Contains(backendText, "@exportc(\"cheng_system_entropy_fill\")")
+    let legacyProcessImportsRaw = strutil.Contains(hostProcessText, "@importc(\"cheng_pipe_spawn\")") ||
+                                  strutil.Contains(backendText, "@importc(\"cheng_pipe_spawn\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_spawn\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_read\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_wait\")") ||
+                                  strutil.Contains(hostProcessText, "@importc(\"cheng_pty_wait\")")
+    let processBridgeImportsReady = strutil.Contains(hostProcessText, "@importc(\"cheng_pty_is_supported_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pipe_spawn_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_spawn_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_read_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_fd_read_wait_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_write_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_close_bridge\")") &&
+                                    strutil.Contains(hostProcessText, "@importc(\"cheng_pty_wait_bridge\")")
+    let processBridgeExportsReady = strutil.Contains(backendText, "@exportc(\"cheng_pty_is_supported_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge_last_master_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_spawn_bridge_last_pid\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_read_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_write_fd\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pipe_spawn_bridge_last_pid\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_read_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_read_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_wait_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_fd_read_wait_bridge_last_eof\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_write_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_close_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge\")") &&
+                                    strutil.Contains(backendText, "@exportc(\"cheng_pty_wait_bridge_last_exit_code\")")
+    let pureProcessReady = !legacyProcessImportsRaw && processBridgeImportsReady && processBridgeExportsReady
+    var remainingBoundary = ""
+    if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+        remainingBoundary = "program_support_host_abi"
+    if !pureProcessReady:
+        remainingBoundary = "process"
+        if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+            remainingBoundary = remainingBoundary + "_program_support_host_abi"
+    if !pureFsReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "fs"
+    if !pureSocketReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "socket"
+    if !pureEntropyReady:
+        if len(remainingBoundary) > 0:
+            remainingBoundary = remainingBoundary + "_"
+        remainingBoundary = remainingBoundary + "entropy"
+    if len(remainingBoundary) == 0:
+        remainingBoundary = "none"
+    var out = ""
+    out = out + "v3_host_bridge_audit_v1\n"
+    out = out + "std_os_path=" + stdOsPath + "\n"
+    out = out + "host_process_path=" + hostProcessPath + "\n"
+    out = out + "peer_id_path=" + peerIdPath + "\n"
+    out = out + "program_support_backend_path=" + backendPath + "\n"
+    out = out + "program_support_host_runtime_path=" + hostRuntimePath + "\n"
+    out = out + "debug_runtime_path=" + debugRuntimePath + "\n"
+    out = out + "core_runtime_darwin_path=" + coreRuntimeDarwinPath + "\n"
+    out = out + "core_runtime_linux_path=" + coreRuntimeLinuxPath + "\n"
+    out = out + "runtime_authority_path=" + runtimeAuthorityPath + "\n"
+    out = out + "runtime_compat_header_path=" + runtimeCompatHeaderPath + "\n"
+    if pureChengRuntimeAuthority:
+        out = out + "runtime_authority_is_pure_cheng=1\n"
+    else:
+        out = out + "runtime_authority_is_pure_cheng=0\n"
+    if legacyExecCmdFileRaw:
+        out = out + "legacy_exec_file_capture_raw_present=1\n"
+    else:
+        out = out + "legacy_exec_file_capture_raw_present=0\n"
+    if legacyExecFileCaptureBridge:
+        out = out + "legacy_exec_file_capture_bridge_present=1\n"
+    else:
+        out = out + "legacy_exec_file_capture_bridge_present=0\n"
+    if legacyExecFilePipeBridge:
+        out = out + "legacy_exec_file_pipe_bridge_present=1\n"
+    else:
+        out = out + "legacy_exec_file_pipe_bridge_present=0\n"
+    if legacyExecFilePipeImport:
+        out = out + "legacy_exec_file_pipe_import_present=1\n"
+    else:
+        out = out + "legacy_exec_file_pipe_import_present=0\n"
+    if directProgramRuntimeC:
+        out = out + "direct_program_runtime_c_path_present=1\n"
+    else:
+        out = out + "direct_program_runtime_c_path_present=0\n"
+    if legacyRuntimeNativePathPresent:
+        out = out + "legacy_runtime_native_path_present=1\n"
+    else:
+        out = out + "legacy_runtime_native_path_present=0\n"
+    if programSupportDirectLibcImportsPresent:
+        out = out + "program_support_direct_libc_imports_present=1\n"
+    else:
+        out = out + "program_support_direct_libc_imports_present=0\n"
+    if programSupportHostRuntimeReady:
+        out = out + "program_support_host_runtime_ready=1\n"
+    else:
+        out = out + "program_support_host_runtime_ready=0\n"
+    if debugRuntimeDirectLibcImportsPresent:
+        out = out + "debug_runtime_direct_libc_imports_present=1\n"
+    else:
+        out = out + "debug_runtime_direct_libc_imports_present=0\n"
+    if debugRuntimeHostRuntimeReady:
+        out = out + "debug_runtime_host_runtime_ready=1\n"
+    else:
+        out = out + "debug_runtime_host_runtime_ready=0\n"
+    if coreRuntimeCommonDirectLibcImportsPresent:
+        out = out + "core_runtime_common_direct_libc_imports_present=1\n"
+    else:
+        out = out + "core_runtime_common_direct_libc_imports_present=0\n"
+    if coreRuntimeCommonHostRuntimeReady:
+        out = out + "core_runtime_common_host_runtime_ready=1\n"
+    else:
+        out = out + "core_runtime_common_host_runtime_ready=0\n"
+    if legacyPeerIdBase58Bridge:
+        out = out + "legacy_peer_id_base58_bridge_present=1\n"
+        out = out + "libp2p_peer_id_pure_cheng_ready=0\n"
+    else:
+        out = out + "legacy_peer_id_base58_bridge_present=0\n"
+        out = out + "libp2p_peer_id_pure_cheng_ready=1\n"
+    if pureFsReady:
+        out = out + "pure_cheng_fs_ready=1\n"
+    else:
+        out = out + "pure_cheng_fs_ready=0\n"
+    if pureSocketReady:
+        out = out + "pure_cheng_socket_ready=1\n"
+    else:
+        out = out + "pure_cheng_socket_ready=0\n"
+    if pureEntropyReady:
+        out = out + "pure_cheng_entropy_ready=1\n"
+    else:
+        out = out + "pure_cheng_entropy_ready=0\n"
+    if pureProcessReady:
+        out = out + "pure_cheng_process_ready=1\n"
+    else:
+        out = out + "pure_cheng_process_ready=0\n"
+    out = out + "remaining_non_pure_cheng_boundary=" + remainingBoundary + "\n"
+    if remainingBoundary == "none":
+        out = out + "pure_cheng_zero_c_ready=1\n"
+    else:
+        out = out + "pure_cheng_zero_c_ready=0\n"
+    return strutil.Strip(out)
+
+fn v3BackendDriverHostBridgeAudit(rootDir: str): int32 =
+    let out: str = v3BackendDriverHostBridgeAuditText(rootDir)
+    v3BackendDriverPrintStdoutBlock(out)
+    if strutil.Contains(out, "legacy_exec_file_capture_raw_present=1") ||
+       strutil.Contains(out, "legacy_exec_file_capture_bridge_present=1") ||
+       strutil.Contains(out, "legacy_exec_file_pipe_bridge_present=1") ||
+       strutil.Contains(out, "legacy_exec_file_pipe_import_present=1") ||
+       strutil.Contains(out, "runtime_authority_is_pure_cheng=0") ||
+       strutil.Contains(out, "legacy_runtime_native_path_present=1") ||
+       strutil.Contains(out, "program_support_direct_libc_imports_present=1") ||
+       strutil.Contains(out, "program_support_host_runtime_ready=0") ||
+       strutil.Contains(out, "debug_runtime_direct_libc_imports_present=1") ||
+       strutil.Contains(out, "debug_runtime_host_runtime_ready=0") ||
+       strutil.Contains(out, "core_runtime_common_direct_libc_imports_present=1") ||
+       strutil.Contains(out, "core_runtime_common_host_runtime_ready=0") ||
+       strutil.Contains(out, "legacy_peer_id_base58_bridge_present=1"):
+        return 2
+    return 0
+
+fn v3BackendDriverCollectArgsFrom(startIndex: int32,
+                                  count: int32): str[] =
+    var out: str[] = []
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        let arg: str = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(out, arg)
+    return out
+
+fn v3BackendDriverForward(rootDir: str,
+                          args: str[]): int32 =
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    if !v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
+        v3BackendDriverPrintErr("v3 backend driver: missing stage3 compiler: " + stage3Path)
+        return 2
+    let logDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_forward")
+    let _made: bool = v3path.V3MkdirP(rootDir, logDir)
+    let logPath: str = os.JoinPath(logDir, "backend_driver.forward.log")
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                           "backend_driver_forward",
+                                                           stage3Path,
+                                                           args,
+                                                           ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                                           rootDir,
+                                                           0,
+                                                           logPath)
+    var outputText: str = run.output
+    if len(outputText) > 0:
+        if run.exitCode == 0:
+            v3BackendDriverPrintStdoutBlock(outputText)
+        else:
+            v3BackendDriverPrintStderrBlock(outputText)
+    elif run.exitCode != 0:
+        v3BackendDriverPrintErr("v3 backend driver: forward failed")
+    return run.exitCode
+
+fn v3BackendDriverRunHostSmokesArgs(compilerPath: str,
+                                    label: str,
+                                    smokes: str[]): str[] =
+    var out: str[] = []
+    add(out, "run-host-smokes")
+    add(out, "--compiler:" + compilerPath)
+    add(out, "--label:" + label)
+    for i in 0..<smokes.len:
+        add(out, smokes[i])
+    return out
+
+fn v3BackendDriverRunHostSmokesLogged(rootDir: str,
+                                      runnerPath: str,
+                                      compilerPath: str,
+                                      label: str,
+                                      smokes: str[],
+                                      logPath: str): hostops.V3LoggedRun =
+    let args: str[] = v3BackendDriverRunHostSmokesArgs(compilerPath, label, smokes)
+    return hostops.v3RunFileLogged(rootDir,
+                                   "backend_driver_run_host_smokes",
+                                   runnerPath,
+                                   args,
+                                   ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                   rootDir,
+                                   0,
+                                   logPath)
+
+fn v3BackendDriverReadFlagOrDefault(count: int32,
+                                    flagName: str,
+                                    defaultValue: str): str =
+    let colonPrefix: str = flagName + ":"
+    let equalPrefix: str = flagName + "="
+    var i: int32 = 2
+    while i <= count:
+        let arg: str = cmdline.ParamStr(i)
+        if arg == flagName:
+            if i < count:
+                let nextValue: str = cmdline.ParamStr(i + 1)
+                if len(nextValue) > 0:
+                    return nextValue
+            return defaultValue
+        if arg.len >= colonPrefix.len:
+            if strings.SliceBytes(arg, 0, colonPrefix.len) == colonPrefix:
+                return strings.SliceBytes(arg, colonPrefix.len, arg.len - colonPrefix.len)
+        if arg.len >= equalPrefix.len:
+            if strings.SliceBytes(arg, 0, equalPrefix.len) == equalPrefix:
+                return strings.SliceBytes(arg, equalPrefix.len, arg.len - equalPrefix.len)
+        i = i + 1
+    return defaultValue
+
+fn v3BackendDriverTextContainsAll(text: str,
+                                  needles: str[]): bool =
+    var i: int32 = 0
+    while i < needles.len:
+        let needle: str = needles[i]
+        if !v3path.V3TextContains(text, needle):
+            return false
+        i = i + 1
+    return true
+
+fn v3BackendDriverRunStage3Logged(rootDir: str,
+                                  label: str,
+                                  args: str[],
+                                  logPath: str): hostops.V3LoggedRun =
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    return hostops.v3RunFileLogged(rootDir,
+                                   label,
+                                   stage3Path,
+                                   args,
+                                   ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                   rootDir,
+                                   0,
+                                   logPath)
+
+fn v3BackendDriverR2cExperimentalRoot(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir, "v3/experimental/r2c-react-v3")
+
+fn v3BackendDriverR2cWrapperPath(rootDir: str): str =
+    let expRoot: str = v3BackendDriverR2cExperimentalRoot(rootDir)
+    return os.JoinPath(expRoot, "r2c-react-v3")
+
+fn v3BackendDriverR2cCodegenSurfaceScript(rootDir: str): str =
+    let expRoot: str = v3BackendDriverR2cExperimentalRoot(rootDir)
+    return os.JoinPath(expRoot, "r2c-react-v3-codegen-surface.mjs")
+
+fn v3BackendDriverR2cTsFrontendScript(rootDir: str): str =
+    let expRoot: str = v3BackendDriverR2cExperimentalRoot(rootDir)
+    return os.JoinPath(expRoot, "r2c-react-v3-ts-frontend.mjs")
+
+fn v3BackendDriverR2cNativeGuiBundleScript(rootDir: str): str =
+    let expRoot: str = v3BackendDriverR2cExperimentalRoot(rootDir)
+    return os.JoinPath(expRoot, "r2c-react-v3-native-gui-bundle.mjs")
+
+fn v3BackendDriverR2cPrototypeScript(rootDir: str): str =
+    let expRoot: str = v3BackendDriverR2cExperimentalRoot(rootDir)
+    return os.JoinPath(expRoot, "r2c-react-v3.py")
+
+fn v3BackendDriverMaybePrintRunOutput(run: hostops.V3LoggedRun) =
+    let outputRaw: str = run.output
+    let outputText: str = strutil.Strip(outputRaw)
+    if len(outputText) > 0:
+        v3BackendDriverPrintLine(outputText)
+
+fn v3BackendDriverRunFailed(context: str,
+                            run: hostops.V3LoggedRun): bool =
+    if run.exitCode == 0:
+        return false
+    return v3BackendDriverPrintRunFailure(context, run)
+
+fn v3BackendDriverOutputContains(text: str,
+                                 needle: str): bool =
+    return strutil.Contains(text, needle)
+
+fn v3BackendDriverRequireOutput(run: hostops.V3LoggedRun,
+                                needle: str,
+                                context: str): bool =
+    if v3BackendDriverOutputContains(run.output, needle):
+        return true
+    v3BackendDriverPrintErr(context + ": missing output: " + needle)
+    let outputRaw: str = run.output
+    let outputText: str = strutil.Strip(outputRaw)
+    if len(outputText) > 0:
+        v3BackendDriverPrintErr(outputText)
+    return false
+
+fn v3BackendDriverIsDigits(text: str): bool =
+    if len(text) <= 0:
+        return false
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn v3BackendDriverTextValue(text: str,
+                            key: str): str =
+    let prefixRaw: str = key + "="
+    let prefix: str = newStringCopy(strDataPtr(prefixRaw), strLenFast(prefixRaw))
+    var start: int32 = 0
+    while start < len(text):
+        var stop: int32 = start
+        while stop < len(text):
+            if text[stop] == '\n':
+                break
+            if text[stop] == '\r':
+                break
+            stop = stop + 1
+        let line: str = strings.SliceBytes(text, start, stop - start)
+        if line.len >= prefix.len:
+            let head: str = strings.SliceBytes(line, 0, prefix.len)
+            if head == prefix:
+                return strings.SliceBytes(line, prefix.len, line.len - prefix.len)
+        start = stop + 1
+        while start < len(text):
+            if text[start] != '\n':
+                if text[start] != '\r':
+                    break
+            start = start + 1
+    return ""
+
+fn v3BackendDriverRequireTextValue(text: str,
+                                   key: str,
+                                   expected: str,
+                                   context: str): bool =
+    let rawValue: str = v3BackendDriverTextValue(text, key)
+    let actual: str = strutil.Strip(rawValue)
+    if actual == expected:
+        return true
+    v3BackendDriverPrintErr(context + ": expected " + key + "=" + expected + ", got " + actual)
+    return false
+
+fn v3BackendDriverRequireRunValue(run: hostops.V3LoggedRun,
+                                  key: str,
+                                  expected: str,
+                                  context: str): bool =
+    return v3BackendDriverRequireTextValue(run.output, key, expected, context)
+
+fn v3BackendDriverRequireMatchingRunValue(leftRun: hostops.V3LoggedRun,
+                                          rightRun: hostops.V3LoggedRun,
+                                          key: str,
+                                          context: str): bool =
+    let leftRaw: str = v3BackendDriverTextValue(leftRun.output, key)
+    let rightRaw: str = v3BackendDriverTextValue(rightRun.output, key)
+    let leftValue: str = strutil.Strip(leftRaw)
+    let rightValue: str = strutil.Strip(rightRaw)
+    if len(leftValue) > 0:
+        if leftValue == rightValue:
+            return true
+    v3BackendDriverPrintErr(context + ": mismatched " + key + ": left=" + leftValue + " right=" + rightValue)
+    return false
+
+fn v3BackendDriverRequireStateParity(authorRun: hostops.V3LoggedRun,
+                                     replicaRun: hostops.V3LoggedRun,
+                                     context: str): bool =
+    if !v3BackendDriverRequireMatchingRunValue(authorRun, replicaRun, "event_count", context):
+        return false
+    if !v3BackendDriverRequireMatchingRunValue(authorRun, replicaRun, "tip_event_cid", context):
+        return false
+    if !v3BackendDriverRequireMatchingRunValue(authorRun, replicaRun, "forest_cid", context):
+        return false
+    return true
+
+fn v3BackendDriverReadFlag(args: str[],
+                           key: str,
+                           defaultValue: str): str =
+    let colonPrefixRaw: str = key + ":"
+    let equalPrefixRaw: str = key + "="
+    let colonPrefix: str = newStringCopy(strDataPtr(colonPrefixRaw), strLenFast(colonPrefixRaw))
+    let equalPrefix: str = newStringCopy(strDataPtr(equalPrefixRaw), strLenFast(equalPrefixRaw))
+    var i: int32 = 0
+    while i < args.len:
+        let arg: str = args[i]
+        if arg == key:
+            let nextIndex: int32 = i + 1
+            if nextIndex < args.len:
+                return args[nextIndex]
+        if arg.len >= colonPrefix.len:
+            let prefix: str = strings.SliceBytes(arg, 0, colonPrefix.len)
+            if prefix == colonPrefix:
+                return strings.SliceBytes(arg, colonPrefix.len, arg.len - colonPrefix.len)
+        if arg.len >= equalPrefix.len:
+            let prefix: str = strings.SliceBytes(arg, 0, equalPrefix.len)
+            if prefix == equalPrefix:
+                return strings.SliceBytes(arg, equalPrefix.len, arg.len - equalPrefix.len)
+        i = i + 1
+    return defaultValue
+
+fn v3BackendDriverResolveSmokeLabel(args: str[],
+                                    envKey: str,
+                                    defaultLabel: str): str =
+    let explicitRaw: str = v3BackendDriverReadFlag(args, "--label", "")
+    let explicit: str = strutil.Strip(explicitRaw)
+    if len(explicit) > 0:
+        return explicit
+    let envValueRaw: str = os.GetEnvDefault(envKey, defaultLabel)
+    let envValue: str = strutil.Strip(envValueRaw)
+    if len(envValue) > 0:
+        return envValue
+    return defaultLabel
+
+fn v3BackendDriverResolveChainNodeCompiler(rootDir: str,
+                                           args: str[],
+                                           outCompiler: var str): bool =
+    let explicitRaw: str = v3BackendDriverReadFlag(args, "--compiler", "")
+    let explicit: str = strutil.Strip(explicitRaw)
+    if len(explicit) > 0:
+        outCompiler = v3path.V3PathAbsolute(rootDir, explicit)
+        return true
+    let selfPath: str = v3BackendDriverSelfPath(rootDir)
+    if len(selfPath) > 0:
+        outCompiler = selfPath
+        return true
+    outCompiler = ""
+    v3BackendDriverPrintErr("v3 chain_node resilience smoke: missing compiler path")
+    return false
+
+fn v3BackendDriverCompileExe(rootDir: str,
+                             label: str,
+                             compilerPath: str,
+                             sourcePath: str,
+                             outPath: str,
+                             target: str,
+                             logPath: str): hostops.V3LoggedRun =
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    let outParts: os.SplitFileResult = os.SplitFile(outPath)
+    if len(outParts.dir) > 0:
+        let outDirPath: str = outParts.dir
+        let _made: bool = v3path.V3MkdirP(rootDir, outDirPath)
+    let logParts: os.SplitFileResult = os.SplitFile(logPath)
+    if len(logParts.dir) > 0:
+        let logDirPath: str = logParts.dir
+        let _made: bool = v3path.V3MkdirP(rootDir, logDirPath)
+    let timeoutText: str = os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
+    let timeoutSec: int32 = int32(strutil.ParseInt(timeoutText))
+    var compileArgs: str[] = []
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root")
+    add(compileArgs, packageRoot)
+    add(compileArgs, "--in")
+    add(compileArgs, sourcePath)
+    add(compileArgs, "--emit")
+    add(compileArgs, "exe")
+    add(compileArgs, "--target")
+    add(compileArgs, target)
+    add(compileArgs, "--out")
+    add(compileArgs, outPath)
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                           label,
+                                                           compilerPath,
+                                                           compileArgs,
+                                                           [],
+                                                           rootDir,
+                                                           timeoutSec,
+                                                           logPath)
+    if run.exitCode == 0:
+        if !os.FileExists(outPath):
+            let outputText: str = run.output + "v3 backend driver: compile missing output: " + outPath + "\n"
+            let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, outputText)
+            return hostops.v3LoggedRunZero(label, compilerPath, logPath, 1, outputText)
+    return run
+
+fn v3BackendDriverRunBinary(rootDir: str,
+                            label: str,
+                            binPath: str,
+                            args: str[],
+                            timeoutSec: int32,
+                            logPath: str): hostops.V3LoggedRun =
+    let logParts: os.SplitFileResult = os.SplitFile(logPath)
+    if len(logParts.dir) > 0:
+        let logDirPath: str = logParts.dir
+        let _made: bool = v3path.V3MkdirP(rootDir, logDirPath)
+    return hostops.v3RunFileLogged(rootDir, label, binPath, args, [], rootDir, timeoutSec, logPath)
+
+fn v3BackendDriverBuildChainNodeBinary(rootDir: str,
+                                       compilerPath: str,
+                                       outDir: str,
+                                       label: str,
+                                       outBin: var str): int32 =
+    let sourcePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/project/chain_node_main.cheng")
+    outBin = os.JoinPath(outDir, "chain_node")
+    var targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        targetTriple = contracts.v3BootstrapDefaultTarget()
+    let compileLog: str = os.JoinPath(outDir, "chain_node.compile.log")
+    let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                    label,
+                                                                    compilerPath,
+                                                                    sourcePath,
+                                                                    outBin,
+                                                                    targetTriple,
+                                                                    compileLog)
+    if v3BackendDriverRunFailed("v3 chain_node resilience compile", compileRun):
+        return compileRun.exitCode
+    if !os.FileExists(outBin):
+        v3BackendDriverPrintErr("v3 chain_node resilience smoke: missing chain_node binary: " + outBin)
+        return 1
+    return 0
+
+fn v3BackendDriverWaitReadyPort(rootDir: str,
+                                readyPath: str,
+                                proc: var hostops.V3SpawnedProcess,
+                                outPort: var str): bool =
+    rootDir
+    outPort = ""
+    for i in 0..<400:
+        i
+        hostops.v3SpawnedProcessDrain(proc, 0)
+        if os.FileExists(readyPath):
+            let candidateRaw: str = v3path.V3ReadTextFile("", readyPath)
+            let candidate: str = strutil.Strip(candidateRaw)
+            if v3BackendDriverIsDigits(candidate):
+                outPort = candidate
+                return true
+        if !hostops.v3SpawnedProcessRunning(proc):
+            return false
+        os.SleepMs(50)
+    return false
+
+fn v3BackendDriverRunChainNodeServeAndSync(rootDir: str,
+                                           label: str,
+                                           chainNodeBin: str,
+                                           serverState: str,
+                                           clientState: str,
+                                           clientNodeId: str,
+                                           clientAddressSeed: str,
+                                           outDir: str,
+                                           roundTag: str,
+                                           expectChanged: bool): int32 =
+    let readyNameRaw: str = roundTag + ".ready"
+    let readyName: str = newStringCopy(strDataPtr(readyNameRaw), strLenFast(readyNameRaw))
+    let readyPath: str = os.JoinPath(outDir, readyName)
+    let serverLogNameRaw: str = roundTag + ".server.log"
+    let serverLogName: str = newStringCopy(strDataPtr(serverLogNameRaw), strLenFast(serverLogNameRaw))
+    let serverLog: str = os.JoinPath(outDir, serverLogName)
+    let syncLogNameRaw: str = roundTag + ".sync.log"
+    let syncLogName: str = newStringCopy(strDataPtr(syncLogNameRaw), strLenFast(syncLogNameRaw))
+    let syncLog: str = os.JoinPath(outDir, syncLogName)
+    let _ = os.RemoveFile(readyPath)
+    var serveArgs: str[] = []
+    add(serveArgs, "daemon-serve")
+    add(serveArgs, "--state:" + serverState)
+    add(serveArgs, "--port:0")
+    add(serveArgs, "--ready-path:" + readyPath)
+    let serverSpawn = hostops.v3SpawnFile(rootDir,
+                                          "v3 chain_node resilience serve " + label + " " + roundTag,
+                                          chainNodeBin,
+                                          serveArgs,
+                                          [],
+                                          rootDir)
+    if IsErr(serverSpawn):
+        v3BackendDriverPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var serverPort = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, serverPort):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverLog)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return 1
+    var syncArgs: str[] = []
+    add(syncArgs, "daemon-sync")
+    add(syncArgs, "--state:" + clientState)
+    if len(clientNodeId) > 0:
+        add(syncArgs, "--node-id:" + clientNodeId)
+    if len(clientAddressSeed) > 0:
+        add(syncArgs, "--address-seed:" + clientAddressSeed)
+    add(syncArgs, "--host:127.0.0.1")
+    add(syncArgs, "--port:" + serverPort)
+    let syncRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 chain_node resilience sync " + label + " " + roundTag,
+                                                                chainNodeBin,
+                                                                syncArgs,
+                                                                20,
+                                                                syncLog)
+    if v3BackendDriverRunFailed("v3 chain_node resilience sync", syncRun):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverLog)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return syncRun.exitCode
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, serverLog)
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(syncRun)
+    if v3BackendDriverRunFailed("v3 chain_node resilience serve", serverRun):
+        return serverRun.exitCode
+    if expectChanged:
+        if !v3BackendDriverRequireOutput(syncRun, "changed=1", "v3 chain_node resilience smoke"):
+            return 1
+    else:
+        if !v3BackendDriverRequireOutput(syncRun, "changed=0", "v3 chain_node resilience smoke"):
+            return 1
+    return 0
+
+fn v3BackendDriverChainNodeLogPath(outDir: str,
+                                   stem: str,
+                                   label: str): str =
+    let nameRaw: str = stem + "." + label + ".log"
+    let name: str = newStringCopy(strDataPtr(nameRaw), strLenFast(nameRaw))
+    return os.JoinPath(outDir, name)
+
+fn v3BackendDriverChainNodeRun(rootDir: str,
+                               runLabel: str,
+                               chainNodeBin: str,
+                               args: str[],
+                               outDir: str,
+                               logStem: str,
+                               label: str): hostops.V3LoggedRun =
+    let logPath: str = v3BackendDriverChainNodeLogPath(outDir, logStem, label)
+    return v3BackendDriverRunBinary(rootDir, runLabel, chainNodeBin, args, 20, logPath)
+
+fn v3BackendDriverChainNodeInitRun(rootDir: str,
+                                   chainNodeBin: str,
+                                   statePath: str,
+                                   nodeId: str,
+                                   addressSeed: str,
+                                   outDir: str,
+                                   logStem: str,
+                                   label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "init")
+    add(args, "--state:" + statePath)
+    add(args, "--node-id:" + nodeId)
+    add(args, "--address-seed:" + addressSeed)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node init " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverChainNodeMintRun(rootDir: str,
+                                   chainNodeBin: str,
+                                   statePath: str,
+                                   account: str,
+                                   amount: str,
+                                   outDir: str,
+                                   logStem: str,
+                                   label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "mint")
+    add(args, "--state:" + statePath)
+    add(args, "--asset:7")
+    add(args, "--account:" + account)
+    add(args, "--amount:" + amount)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node mint " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverChainNodeTransferRun(rootDir: str,
+                                       chainNodeBin: str,
+                                       statePath: str,
+                                       fromAccount: str,
+                                       toAccount: str,
+                                       amount: str,
+                                       outDir: str,
+                                       logStem: str,
+                                       label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "transfer")
+    add(args, "--state:" + statePath)
+    add(args, "--asset:7")
+    add(args, "--from:" + fromAccount)
+    add(args, "--to:" + toAccount)
+    add(args, "--amount:" + amount)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node transfer " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverChainNodeBalanceRun(rootDir: str,
+                                      chainNodeBin: str,
+                                      statePath: str,
+                                      account: str,
+                                      outDir: str,
+                                      logStem: str,
+                                      label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "balance")
+    add(args, "--state:" + statePath)
+    add(args, "--asset:7")
+    add(args, "--account:" + account)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node balance " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverChainNodeShowRun(rootDir: str,
+                                   chainNodeBin: str,
+                                   statePath: str,
+                                   outDir: str,
+                                   logStem: str,
+                                   label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "show-state")
+    add(args, "--state:" + statePath)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node show-state " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverChainNodeDumpSnapshotRun(rootDir: str,
+                                           chainNodeBin: str,
+                                           statePath: str,
+                                           outDir: str,
+                                           logStem: str,
+                                           label: str): hostops.V3LoggedRun =
+    var args: str[] = []
+    add(args, "dump-snapshot")
+    add(args, "--state:" + statePath)
+    return v3BackendDriverChainNodeRun(rootDir,
+                                       "v3 chain_node dump-snapshot " + label + " " + logStem,
+                                       chainNodeBin,
+                                       args,
+                                       outDir,
+                                       logStem,
+                                       label)
+
+fn v3BackendDriverRunChainNodeResilienceScenario(rootDir: str,
+                                                 args: str[],
+                                                 defaultLabel: str,
+                                                 successText: str): int32 =
+    let label: str = v3BackendDriverResolveSmokeLabel(args,
+                                                      "CHENG_V3_CHAIN_NODE_RESILIENCE_LABEL",
+                                                      defaultLabel)
+    let outDirRelRaw: str = "artifacts/v3_chain_node_resilience/" + label
+    let outDirRel: str = newStringCopy(strDataPtr(outDirRelRaw), strLenFast(outDirRelRaw))
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let tmpDir: str = os.JoinPath(outDir, "resilience_gate")
+    if !v3path.V3MkdirP(rootDir, tmpDir):
+        v3BackendDriverPrintErr("v3 chain_node resilience smoke: failed to create tmp dir: " + tmpDir)
+        return 1
+    var compilerPath = ""
+    if !v3BackendDriverResolveChainNodeCompiler(rootDir, args, compilerPath):
+        return 2
+    var chainNodeBin = ""
+    if v3BackendDriverBuildChainNodeBinary(rootDir,
+                                           compilerPath,
+                                           outDir,
+                                           "v3 chain_node resilience compile " + label,
+                                           chainNodeBin) != 0:
+        return 1
+    let serverState: str = os.JoinPath(tmpDir, "server.state")
+    let relayState: str = os.JoinPath(tmpDir, "relay.state")
+    let clientState: str = os.JoinPath(tmpDir, "client.state")
+    let observerState: str = os.JoinPath(tmpDir, "observer.state")
+    let _ = os.RemoveFile(serverState)
+    let _ = os.RemoveFile(relayState)
+    let _ = os.RemoveFile(clientState)
+    let _ = os.RemoveFile(observerState)
+
+    let initRun = v3BackendDriverChainNodeInitRun(rootDir,
+                                                  chainNodeBin,
+                                                  serverState,
+                                                  "node-a",
+                                                  "chain-node-a",
+                                                  outDir,
+                                                  "init",
+                                                  label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience init", initRun):
+        return initRun.exitCode
+    if !v3BackendDriverRequireOutput(initRun, "node_id=node-a", "v3 chain_node resilience smoke"):
+        return 1
+
+    let round1MintRun = v3BackendDriverChainNodeMintRun(rootDir, chainNodeBin, serverState, "1001", "100", outDir, "round1_mint", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 mint", round1MintRun):
+        return round1MintRun.exitCode
+    let round1TransferRun = v3BackendDriverChainNodeTransferRun(rootDir, chainNodeBin, serverState, "1001", "2002", "40", outDir, "round1_transfer", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 transfer", round1TransferRun):
+        return round1TransferRun.exitCode
+    let serverShowRound1 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, serverState, outDir, "round1_server_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 server show", serverShowRound1):
+        return serverShowRound1.exitCode
+    let serverAliceRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "1001", outDir, "round1_server_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 server alice", serverAliceRound1):
+        return serverAliceRound1.exitCode
+    let serverBobRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "2002", outDir, "round1_server_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 server bob", serverBobRound1):
+        return serverBobRound1.exitCode
+    let serverSnapshotRound1 = v3BackendDriverChainNodeDumpSnapshotRun(rootDir, chainNodeBin, serverState, outDir, "round1_server_snapshot", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 server snapshot", serverSnapshotRound1):
+        return serverSnapshotRound1.exitCode
+    if !v3BackendDriverRequireRunValue(serverShowRound1, "node_id", "node-a", "v3 chain_node resilience round1 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverShowRound1, "event_count", "2", "v3 chain_node resilience round1 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverAliceRound1, "balance", "60", "v3 chain_node resilience round1 server alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverBobRound1, "balance", "40", "v3 chain_node resilience round1 server bob"):
+        return 1
+    if !v3BackendDriverRequireOutput(serverSnapshotRound1, "payload_hex=", "v3 chain_node resilience smoke"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round1_server_to_relay", true) != 0:
+        return 1
+    let relayShowRound1 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, relayState, outDir, "round1_relay_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 relay show", relayShowRound1):
+        return relayShowRound1.exitCode
+    let relayAliceRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "1001", outDir, "round1_relay_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 relay alice", relayAliceRound1):
+        return relayAliceRound1.exitCode
+    let relayBobRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "2002", outDir, "round1_relay_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 relay bob", relayBobRound1):
+        return relayBobRound1.exitCode
+    if !v3BackendDriverRequireRunValue(relayShowRound1, "node_id", "node-b", "v3 chain_node resilience round1 relay show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayAliceRound1, "balance", "60", "v3 chain_node resilience round1 relay alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayBobRound1, "balance", "40", "v3 chain_node resilience round1 relay bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound1, relayShowRound1, "v3 chain_node resilience round1 server relay parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round1_server_to_relay_idle", false) != 0:
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round1_relay_to_client", true) != 0:
+        return 1
+    let clientShowRound1 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, clientState, outDir, "round1_client_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 client show", clientShowRound1):
+        return clientShowRound1.exitCode
+    let clientAliceRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "1001", outDir, "round1_client_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 client alice", clientAliceRound1):
+        return clientAliceRound1.exitCode
+    let clientBobRound1 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "2002", outDir, "round1_client_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round1 client bob", clientBobRound1):
+        return clientBobRound1.exitCode
+    if !v3BackendDriverRequireRunValue(clientShowRound1, "node_id", "node-c", "v3 chain_node resilience round1 client show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientAliceRound1, "balance", "60", "v3 chain_node resilience round1 client alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientBobRound1, "balance", "40", "v3 chain_node resilience round1 client bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(relayShowRound1, clientShowRound1, "v3 chain_node resilience round1 relay client parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round1_relay_to_client_idle", false) != 0:
+        return 1
+
+    let round2MintRun = v3BackendDriverChainNodeMintRun(rootDir, chainNodeBin, serverState, "2002", "25", outDir, "round2_mint", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 mint", round2MintRun):
+        return round2MintRun.exitCode
+    let round2TransferRun = v3BackendDriverChainNodeTransferRun(rootDir, chainNodeBin, serverState, "2002", "1001", "15", outDir, "round2_transfer", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 transfer", round2TransferRun):
+        return round2TransferRun.exitCode
+    let serverShowRound2 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, serverState, outDir, "round2_server_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 server show", serverShowRound2):
+        return serverShowRound2.exitCode
+    let serverAliceRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "1001", outDir, "round2_server_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 server alice", serverAliceRound2):
+        return serverAliceRound2.exitCode
+    let serverBobRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "2002", outDir, "round2_server_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 server bob", serverBobRound2):
+        return serverBobRound2.exitCode
+    if !v3BackendDriverRequireRunValue(serverShowRound2, "event_count", "4", "v3 chain_node resilience round2 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverAliceRound2, "balance", "75", "v3 chain_node resilience round2 server alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverBobRound2, "balance", "50", "v3 chain_node resilience round2 server bob"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round2_server_to_relay", true) != 0:
+        return 1
+    let relayShowRound2 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, relayState, outDir, "round2_relay_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 relay show", relayShowRound2):
+        return relayShowRound2.exitCode
+    let relayAliceRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "1001", outDir, "round2_relay_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 relay alice", relayAliceRound2):
+        return relayAliceRound2.exitCode
+    let relayBobRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "2002", outDir, "round2_relay_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 relay bob", relayBobRound2):
+        return relayBobRound2.exitCode
+    if !v3BackendDriverRequireRunValue(relayAliceRound2, "balance", "75", "v3 chain_node resilience round2 relay alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayBobRound2, "balance", "50", "v3 chain_node resilience round2 relay bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound2, relayShowRound2, "v3 chain_node resilience round2 server relay parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round2_server_to_relay_idle", false) != 0:
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round2_relay_to_client", true) != 0:
+        return 1
+    let clientShowRound2 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, clientState, outDir, "round2_client_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 client show", clientShowRound2):
+        return clientShowRound2.exitCode
+    let clientAliceRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "1001", outDir, "round2_client_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 client alice", clientAliceRound2):
+        return clientAliceRound2.exitCode
+    let clientBobRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "2002", outDir, "round2_client_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 client bob", clientBobRound2):
+        return clientBobRound2.exitCode
+    if !v3BackendDriverRequireRunValue(clientAliceRound2, "balance", "75", "v3 chain_node resilience round2 client alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientBobRound2, "balance", "50", "v3 chain_node resilience round2 client bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(relayShowRound2, clientShowRound2, "v3 chain_node resilience round2 relay client parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round2_relay_to_client_idle", false) != 0:
+        return 1
+    let _round2ObserverReset = os.RemoveFile(observerState)
+    _round2ObserverReset
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, observerState, "node-d", "chain-node-d", outDir, "round2_server_to_observer_recover", true) != 0:
+        return 1
+    let observerShowRound2 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, observerState, outDir, "round2_observer_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 observer show", observerShowRound2):
+        return observerShowRound2.exitCode
+    let observerAliceRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, observerState, "1001", outDir, "round2_observer_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 observer alice", observerAliceRound2):
+        return observerAliceRound2.exitCode
+    let observerBobRound2 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, observerState, "2002", outDir, "round2_observer_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round2 observer bob", observerBobRound2):
+        return observerBobRound2.exitCode
+    if !v3BackendDriverRequireRunValue(observerShowRound2, "node_id", "node-d", "v3 chain_node resilience round2 observer show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(observerAliceRound2, "balance", "75", "v3 chain_node resilience round2 observer alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(observerBobRound2, "balance", "50", "v3 chain_node resilience round2 observer bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound2, observerShowRound2, "v3 chain_node resilience round2 server observer parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, observerState, "node-d", "chain-node-d", outDir, "round2_server_to_observer_idle", false) != 0:
+        return 1
+
+    let round3TransferRun = v3BackendDriverChainNodeTransferRun(rootDir, chainNodeBin, serverState, "1001", "2002", "20", outDir, "round3_transfer", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 transfer", round3TransferRun):
+        return round3TransferRun.exitCode
+    let round3MintRun = v3BackendDriverChainNodeMintRun(rootDir, chainNodeBin, serverState, "1001", "30", outDir, "round3_mint", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 mint", round3MintRun):
+        return round3MintRun.exitCode
+    let serverShowRound3 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, serverState, outDir, "round3_server_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 server show", serverShowRound3):
+        return serverShowRound3.exitCode
+    let serverAliceRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "1001", outDir, "round3_server_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 server alice", serverAliceRound3):
+        return serverAliceRound3.exitCode
+    let serverBobRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "2002", outDir, "round3_server_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 server bob", serverBobRound3):
+        return serverBobRound3.exitCode
+    let serverSnapshotRound3 = v3BackendDriverChainNodeDumpSnapshotRun(rootDir, chainNodeBin, serverState, outDir, "round3_server_snapshot", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 server snapshot", serverSnapshotRound3):
+        return serverSnapshotRound3.exitCode
+    if !v3BackendDriverRequireRunValue(serverShowRound3, "event_count", "6", "v3 chain_node resilience round3 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverAliceRound3, "balance", "85", "v3 chain_node resilience round3 server alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverBobRound3, "balance", "70", "v3 chain_node resilience round3 server bob"):
+        return 1
+    if !v3BackendDriverRequireOutput(serverSnapshotRound3, "payload_hex=", "v3 chain_node resilience smoke"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round3_server_to_relay", true) != 0:
+        return 1
+    let relayShowRound3 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, relayState, outDir, "round3_relay_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 relay show", relayShowRound3):
+        return relayShowRound3.exitCode
+    let relayAliceRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "1001", outDir, "round3_relay_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 relay alice", relayAliceRound3):
+        return relayAliceRound3.exitCode
+    let relayBobRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "2002", outDir, "round3_relay_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 relay bob", relayBobRound3):
+        return relayBobRound3.exitCode
+    if !v3BackendDriverRequireRunValue(relayAliceRound3, "balance", "85", "v3 chain_node resilience round3 relay alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayBobRound3, "balance", "70", "v3 chain_node resilience round3 relay bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound3, relayShowRound3, "v3 chain_node resilience round3 server relay parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round3_server_to_relay_idle", false) != 0:
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round3_relay_to_client", true) != 0:
+        return 1
+    let clientShowRound3 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, clientState, outDir, "round3_client_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 client show", clientShowRound3):
+        return clientShowRound3.exitCode
+    let clientAliceRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "1001", outDir, "round3_client_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 client alice", clientAliceRound3):
+        return clientAliceRound3.exitCode
+    let clientBobRound3 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "2002", outDir, "round3_client_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round3 client bob", clientBobRound3):
+        return clientBobRound3.exitCode
+    if !v3BackendDriverRequireRunValue(clientAliceRound3, "balance", "85", "v3 chain_node resilience round3 client alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientBobRound3, "balance", "70", "v3 chain_node resilience round3 client bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(relayShowRound3, clientShowRound3, "v3 chain_node resilience round3 relay client parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round3_relay_to_client_idle", false) != 0:
+        return 1
+
+    let round4MintRun = v3BackendDriverChainNodeMintRun(rootDir, chainNodeBin, serverState, "1001", "5", outDir, "round4_mint", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 mint", round4MintRun):
+        return round4MintRun.exitCode
+    let round4TransferRun = v3BackendDriverChainNodeTransferRun(rootDir, chainNodeBin, serverState, "2002", "1001", "10", outDir, "round4_transfer", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 transfer", round4TransferRun):
+        return round4TransferRun.exitCode
+    let serverShowRound4 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, serverState, outDir, "round4_server_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 server show", serverShowRound4):
+        return serverShowRound4.exitCode
+    let serverAliceRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "1001", outDir, "round4_server_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 server alice", serverAliceRound4):
+        return serverAliceRound4.exitCode
+    let serverBobRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "2002", outDir, "round4_server_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 server bob", serverBobRound4):
+        return serverBobRound4.exitCode
+    if !v3BackendDriverRequireRunValue(serverShowRound4, "event_count", "8", "v3 chain_node resilience round4 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverAliceRound4, "balance", "100", "v3 chain_node resilience round4 server alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverBobRound4, "balance", "60", "v3 chain_node resilience round4 server bob"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round4_server_to_relay", true) != 0:
+        return 1
+    let relayShowRound4 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, relayState, outDir, "round4_relay_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 relay show", relayShowRound4):
+        return relayShowRound4.exitCode
+    let relayAliceRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "1001", outDir, "round4_relay_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 relay alice", relayAliceRound4):
+        return relayAliceRound4.exitCode
+    let relayBobRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "2002", outDir, "round4_relay_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 relay bob", relayBobRound4):
+        return relayBobRound4.exitCode
+    if !v3BackendDriverRequireRunValue(relayAliceRound4, "balance", "100", "v3 chain_node resilience round4 relay alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayBobRound4, "balance", "60", "v3 chain_node resilience round4 relay bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound4, relayShowRound4, "v3 chain_node resilience round4 server relay parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round4_server_to_relay_idle", false) != 0:
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round4_relay_to_client", true) != 0:
+        return 1
+    let clientShowRound4 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, clientState, outDir, "round4_client_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 client show", clientShowRound4):
+        return clientShowRound4.exitCode
+    let clientAliceRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "1001", outDir, "round4_client_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 client alice", clientAliceRound4):
+        return clientAliceRound4.exitCode
+    let clientBobRound4 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "2002", outDir, "round4_client_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round4 client bob", clientBobRound4):
+        return clientBobRound4.exitCode
+    if !v3BackendDriverRequireRunValue(clientAliceRound4, "balance", "100", "v3 chain_node resilience round4 client alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientBobRound4, "balance", "60", "v3 chain_node resilience round4 client bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(relayShowRound4, clientShowRound4, "v3 chain_node resilience round4 relay client parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round4_relay_to_client_idle", false) != 0:
+        return 1
+
+    let round5TransferRun = v3BackendDriverChainNodeTransferRun(rootDir, chainNodeBin, serverState, "1001", "2002", "8", outDir, "round5_transfer", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 transfer", round5TransferRun):
+        return round5TransferRun.exitCode
+    let round5MintRun = v3BackendDriverChainNodeMintRun(rootDir, chainNodeBin, serverState, "2002", "20", outDir, "round5_mint", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 mint", round5MintRun):
+        return round5MintRun.exitCode
+    let serverShowRound5 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, serverState, outDir, "round5_server_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 server show", serverShowRound5):
+        return serverShowRound5.exitCode
+    let serverAliceRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "1001", outDir, "round5_server_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 server alice", serverAliceRound5):
+        return serverAliceRound5.exitCode
+    let serverBobRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, serverState, "2002", outDir, "round5_server_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 server bob", serverBobRound5):
+        return serverBobRound5.exitCode
+    let serverSnapshotRound5 = v3BackendDriverChainNodeDumpSnapshotRun(rootDir, chainNodeBin, serverState, outDir, "round5_server_snapshot", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 server snapshot", serverSnapshotRound5):
+        return serverSnapshotRound5.exitCode
+    if !v3BackendDriverRequireRunValue(serverShowRound5, "event_count", "10", "v3 chain_node resilience round5 server show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverAliceRound5, "balance", "92", "v3 chain_node resilience round5 server alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(serverBobRound5, "balance", "88", "v3 chain_node resilience round5 server bob"):
+        return 1
+    if !v3BackendDriverRequireOutput(serverSnapshotRound5, "payload_hex=", "v3 chain_node resilience smoke"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round5_server_to_relay", true) != 0:
+        return 1
+    let relayShowRound5 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, relayState, outDir, "round5_relay_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 relay show", relayShowRound5):
+        return relayShowRound5.exitCode
+    let relayAliceRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "1001", outDir, "round5_relay_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 relay alice", relayAliceRound5):
+        return relayAliceRound5.exitCode
+    let relayBobRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, relayState, "2002", outDir, "round5_relay_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 relay bob", relayBobRound5):
+        return relayBobRound5.exitCode
+    if !v3BackendDriverRequireRunValue(relayAliceRound5, "balance", "92", "v3 chain_node resilience round5 relay alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(relayBobRound5, "balance", "88", "v3 chain_node resilience round5 relay bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(serverShowRound5, relayShowRound5, "v3 chain_node resilience round5 server relay parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, serverState, relayState, "node-b", "chain-node-b", outDir, "round5_server_to_relay_idle", false) != 0:
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round5_relay_to_client", true) != 0:
+        return 1
+    let clientShowRound5 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, clientState, outDir, "round5_client_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 client show", clientShowRound5):
+        return clientShowRound5.exitCode
+    let clientAliceRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "1001", outDir, "round5_client_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 client alice", clientAliceRound5):
+        return clientAliceRound5.exitCode
+    let clientBobRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, clientState, "2002", outDir, "round5_client_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 client bob", clientBobRound5):
+        return clientBobRound5.exitCode
+    let clientSnapshotRound5 = v3BackendDriverChainNodeDumpSnapshotRun(rootDir, chainNodeBin, clientState, outDir, "round5_client_snapshot", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 client snapshot", clientSnapshotRound5):
+        return clientSnapshotRound5.exitCode
+    if !v3BackendDriverRequireRunValue(clientAliceRound5, "balance", "92", "v3 chain_node resilience round5 client alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(clientBobRound5, "balance", "88", "v3 chain_node resilience round5 client bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(relayShowRound5, clientShowRound5, "v3 chain_node resilience round5 relay client parity"):
+        return 1
+    if !v3BackendDriverRequireOutput(clientSnapshotRound5, "payload_hex=", "v3 chain_node resilience smoke"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, relayState, clientState, "node-c", "chain-node-c", outDir, "round5_relay_to_client_idle", false) != 0:
+        return 1
+    let _round5ObserverReset = os.RemoveFile(observerState)
+    _round5ObserverReset
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, clientState, observerState, "node-d", "chain-node-d", outDir, "round5_client_to_observer_recover", true) != 0:
+        return 1
+    let observerShowRound5 = v3BackendDriverChainNodeShowRun(rootDir, chainNodeBin, observerState, outDir, "round5_observer_show", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 observer show", observerShowRound5):
+        return observerShowRound5.exitCode
+    let observerAliceRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, observerState, "1001", outDir, "round5_observer_alice", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 observer alice", observerAliceRound5):
+        return observerAliceRound5.exitCode
+    let observerBobRound5 = v3BackendDriverChainNodeBalanceRun(rootDir, chainNodeBin, observerState, "2002", outDir, "round5_observer_bob", label)
+    if v3BackendDriverRunFailed("v3 chain_node resilience round5 observer bob", observerBobRound5):
+        return observerBobRound5.exitCode
+    if !v3BackendDriverRequireRunValue(observerShowRound5, "node_id", "node-d", "v3 chain_node resilience round5 observer show"):
+        return 1
+    if !v3BackendDriverRequireRunValue(observerAliceRound5, "balance", "92", "v3 chain_node resilience round5 observer alice"):
+        return 1
+    if !v3BackendDriverRequireRunValue(observerBobRound5, "balance", "88", "v3 chain_node resilience round5 observer bob"):
+        return 1
+    if !v3BackendDriverRequireStateParity(clientShowRound5, observerShowRound5, "v3 chain_node resilience round5 client observer parity"):
+        return 1
+    if v3BackendDriverRunChainNodeServeAndSync(rootDir, label, chainNodeBin, clientState, observerState, "node-d", "chain-node-d", outDir, "round5_client_to_observer_idle", false) != 0:
+        return 1
+
+    v3BackendDriverPrintLine(successText + " (" + label + ")")
+    return 0
+
+fn v3BackendDriverRunChainNodeResilienceSmoke(rootDir: str,
+                                              args: str[]): int32 =
+    return v3BackendDriverRunChainNodeResilienceScenario(rootDir,
+                                                         args,
+                                                         "host_resilience",
+                                                         "v3 chain_node resilience smoke ok")
+
+fn v3BackendDriverVerifyChainNodeResilience(rootDir: str,
+                                            args: str[]): int32 =
+    return v3BackendDriverRunChainNodeResilienceScenario(rootDir,
+                                                         args,
+                                                         "host_resilience_gate",
+                                                         "verify-chain-node-resilience: ok")
+
+fn v3BackendDriverR2cCodegenSurfaceSmokeAt(rootDir: str,
+                                           repo: str,
+                                           outDir: str,
+                                           printSummary: bool): bool =
+    let tsxAstPath: str = os.JoinPath(outDir, "tsx_ast_v1.json")
+    let tsxSummaryPath: str = os.JoinPath(outDir, "tsx_ast_v1.summary.env")
+    let frontendLogPath: str = v3path.V3PathAbsolute(rootDir,
+                                                     "artifacts/v3_backend_driver/r2c_react_v3_ts_frontend.log")
+    let frontendScriptPath: str = v3BackendDriverR2cTsFrontendScript(rootDir)
+    let frontendRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(rootDir,
+                                                                      "r2c_react_v3_ts_frontend",
+                                                                      "node",
+                                                                      [
+                                                                          frontendScriptPath,
+                                                                          "--repo", repo,
+                                                                          "--out", tsxAstPath,
+                                                                          "--summary-out", tsxSummaryPath
+                                                                      ],
+                                                                      [],
+                                                                      rootDir,
+                                                                      0,
+                                                                      frontendLogPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: r2c-react-v3-ts-frontend", frontendRun):
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, tsxAstPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing tsx ast: " + tsxAstPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, tsxSummaryPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing tsx summary: " + tsxSummaryPath)
+        return false
+    let logPath: str = v3path.V3PathAbsolute(rootDir,
+                                             "artifacts/v3_backend_driver/r2c_react_v3_codegen_surface_smoke.log")
+    let scriptPath: str = v3BackendDriverR2cCodegenSurfaceScript(rootDir)
+    let summaryPath: str = os.JoinPath(outDir, "codegen_surface.summary.env")
+    let run: hostops.V3LoggedRun = hostops.v3RunProgramLogged(rootDir,
+                                                              "r2c_react_v3_codegen_surface_smoke",
+                                                              "node",
+                                                              [
+                                                                  scriptPath,
+                                                                  "--repo", repo,
+                                                                  "--out-dir", outDir,
+                                                                  "--summary-out", summaryPath
+                                                              ],
+                                                              [],
+                                                              rootDir,
+                                                              0,
+                                                              logPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: r2c-react-v3-codegen-surface-smoke", run):
+        return false
+    let reportPath: str = os.JoinPath(outDir, "codegen_surface_report_v1.json")
+    let manifestPath: str = os.JoinPath(outDir, "cheng_codegen_v1.json")
+    let routeCatalogPath: str = os.JoinPath(outDir, "cheng_codegen_route_catalog_v1.json")
+    let smokePath: str = os.JoinPath(outDir, "cheng_codegen_smoke_v1.json")
+    if !v3path.V3FileExistsNonEmpty(rootDir, reportPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing codegen surface report: " + reportPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, summaryPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing codegen surface summary: " + summaryPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, manifestPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing codegen manifest: " + manifestPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, routeCatalogPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing codegen route catalog: " + routeCatalogPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, smokePath):
+        v3BackendDriverPrintErr("v3 backend driver: missing codegen smoke artifact: " + smokePath)
+        return false
+    let reportText: str = v3path.V3ReadTextFile("", reportPath)
+    let summaryText: str = v3path.V3ReadTextFile("", summaryPath)
+    let manifestText: str = v3path.V3ReadTextFile("", manifestPath)
+    let routeCatalogText: str = v3path.V3ReadTextFile("", routeCatalogPath)
+    let reportCommandNeedle: str = "\"command\": \"codegen-surface\""
+    let reportOkNeedle: str = "\"ok\": true"
+    let summarySmokeNeedle: str = "smoke_ok=true"
+    let summaryManifestNeedle: str = "codegen_manifest_path=" + manifestPath
+    let summaryCatalogNeedle: str = "route_catalog_path=" + routeCatalogPath
+    let summarySmokePathNeedle: str = "codegen_smoke_path=" + smokePath
+    if !v3path.V3TextContains(reportText, reportCommandNeedle) ||
+       !v3path.V3TextContains(reportText, reportOkNeedle):
+        v3BackendDriverPrintErr("v3 backend driver: codegen surface report drifted: " + reportPath)
+        return false
+    if !v3path.V3TextContains(summaryText, summarySmokeNeedle) ||
+       !v3path.V3TextContains(summaryText, summaryManifestNeedle) ||
+       !v3path.V3TextContains(summaryText, summaryCatalogNeedle) ||
+       !v3path.V3TextContains(summaryText, summarySmokePathNeedle):
+        v3BackendDriverPrintErr("v3 backend driver: codegen surface summary drifted: " + summaryPath)
+        return false
+    if !v3path.V3TextContains(manifestText, "\"format\": \"cheng_codegen_v1\"") ||
+       !v3path.V3TextContains(routeCatalogText, "\"format\": \"cheng_codegen_route_catalog_v1\""):
+        v3BackendDriverPrintErr("v3 backend driver: codegen surface JSON contract drifted")
+        return false
+    if printSummary:
+        v3BackendDriverPrintLine("r2c-react-v3 codegen surface smoke: ok")
+        v3BackendDriverPrintLine("tsx_ast=" + tsxAstPath)
+        v3BackendDriverPrintLine("codegen_summary=" + summaryPath)
+        v3BackendDriverPrintLine("codegen_manifest=" + manifestPath)
+        v3BackendDriverPrintLine("route_catalog=" + routeCatalogPath)
+        v3BackendDriverPrintLine("codegen_smoke=" + smokePath)
+    return true
+
+fn v3BackendDriverR2cNativeGuiBundleSmokeAt(rootDir: str,
+                                            repo: str,
+                                            routeState: str,
+                                            outDir: str,
+                                            printSummary: bool): bool =
+    let compileLogPath: str = v3path.V3PathAbsolute(rootDir,
+                                                    "artifacts/v3_backend_driver/r2c_react_v3_compile_smoke.log")
+    let prototypePath: str = v3BackendDriverR2cPrototypeScript(rootDir)
+    let compileRun: hostops.V3LoggedRun = hostops.v3RunProgramLogged(rootDir,
+                                                                     "r2c_react_v3_compile_smoke",
+                                                                     "python3",
+                                                                     [
+                                                                         prototypePath,
+                                                                         "compile",
+                                                                         repo,
+                                                                         "--out-dir", outDir,
+                                                                         "--allow-blockers"
+                                                                     ],
+                                                                     [],
+                                                                     rootDir,
+                                                                     0,
+                                                                     compileLogPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: r2c-react-v3 compile", compileRun):
+        return false
+    let hostContractPath: str = os.JoinPath(outDir, "unimaker_host_v1.json")
+    let assetManifestPath: str = os.JoinPath(outDir, "asset_manifest_v1.json")
+    let tailwindManifestPath: str = os.JoinPath(outDir, "tailwind_style_manifest_v1.json")
+    let compileReportPath: str = os.JoinPath(outDir, "compile_report_v1.json")
+    if !v3path.V3FileExistsNonEmpty(rootDir, hostContractPath) ||
+       !v3path.V3FileExistsNonEmpty(rootDir, assetManifestPath) ||
+       !v3path.V3FileExistsNonEmpty(rootDir, tailwindManifestPath) ||
+       !v3path.V3FileExistsNonEmpty(rootDir, compileReportPath):
+        v3BackendDriverPrintErr("v3 backend driver: r2c-react-v3 compile missing bundle prerequisites")
+        return false
+    if !v3BackendDriverR2cCodegenSurfaceSmokeAt(rootDir, repo, outDir, false):
+        return false
+    let logPath: str = v3path.V3PathAbsolute(rootDir,
+                                             "artifacts/v3_backend_driver/r2c_react_v3_native_gui_bundle_smoke.log")
+    let scriptPath: str = v3BackendDriverR2cNativeGuiBundleScript(rootDir)
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    let run: hostops.V3LoggedRun = hostops.v3RunProgramLogged(rootDir,
+                                                              "r2c_react_v3_native_gui_bundle_smoke",
+                                                              "node",
+                                                              [
+                                                                  scriptPath,
+                                                                  "--repo", repo,
+                                                                  "--route-state", routeState,
+                                                                  "--out-dir", outDir
+                                                              ],
+                                                              [
+                                                                  "R2C_REACT_V3_TOOLING_BIN=" + stage3Path,
+                                                                  "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"
+                                                              ],
+                                                              rootDir,
+                                                              0,
+                                                              logPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: r2c-react-v3-native-gui-bundle-smoke", run):
+        return false
+    let reportPath: str = os.JoinPath(outDir, "native_gui_bundle_report_v1.json")
+    let summaryPath: str = os.JoinPath(outDir, "native_gui_bundle.summary.env")
+    let bundleJsonPath: str = os.JoinPath(outDir, "native_gui_bundle_v1.json")
+    if !v3path.V3FileExistsNonEmpty(rootDir, reportPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing native gui bundle report: " + reportPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, summaryPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing native gui bundle summary: " + summaryPath)
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, bundleJsonPath):
+        v3BackendDriverPrintErr("v3 backend driver: missing native gui bundle json: " + bundleJsonPath)
+        return false
+    let reportText: str = v3path.V3ReadTextFile("", reportPath)
+    let summaryText: str = v3path.V3ReadTextFile("", summaryPath)
+    if !v3path.V3TextContains(reportText, "\"ok\": true") ||
+       !v3path.V3TextContains(reportText, "\"native_gui_host_ready\": true") ||
+       !v3path.V3TextContains(reportText, "\"native_gui_renderer_ready\": true"):
+        v3BackendDriverPrintErr("v3 backend driver: native gui bundle report drifted: " + reportPath)
+        return false
+    let runtimeModeNeedle: str = "native_gui_runtime_mode=cheng_compiled_json_v1"
+    let routeStateNeedle: str = "native_gui_route_state=" + routeState
+    let execSnapshotNeedle: str = "native_gui_exec_snapshot_path="
+    let routeCatalogNeedle: str = "native_gui_route_catalog_path="
+    if !v3path.V3TextContains(summaryText, runtimeModeNeedle):
+        v3BackendDriverPrintErr("v3 backend driver: native gui bundle summary drifted: " + summaryPath)
+        return false
+    if !v3path.V3TextContains(summaryText, routeStateNeedle):
+        v3BackendDriverPrintErr("v3 backend driver: native gui bundle summary drifted: " + summaryPath)
+        return false
+    if !v3path.V3TextContains(summaryText, execSnapshotNeedle) ||
+       !v3path.V3TextContains(summaryText, routeCatalogNeedle):
+        v3BackendDriverPrintErr("v3 backend driver: native gui bundle summary drifted: " + summaryPath)
+        return false
+    if printSummary:
+        v3BackendDriverPrintLine("r2c-react-v3 native gui bundle smoke: ok")
+        v3BackendDriverPrintLine("route_state=" + routeState)
+        v3BackendDriverPrintLine("bundle_report=" + reportPath)
+        v3BackendDriverPrintLine("bundle_summary=" + summaryPath)
+        v3BackendDriverPrintLine("bundle_json=" + bundleJsonPath)
+    return true
+
+fn v3BackendDriverR2cReactV3CodegenSurfaceSmoke(rootDir: str,
+                                                count: int32): int32 =
+    let repoRaw: str = v3BackendDriverReadFlagOrDefault(count, "--repo", "/Users/lbcheng/UniMaker/React.js")
+    let outDirRaw: str = v3BackendDriverReadFlagOrDefault(count, "--out-dir", "/tmp/r2c-codegen-surface-smoke")
+    let repo: str = v3path.V3PathAbsolute(rootDir, repoRaw)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRaw)
+    if !os.DirExists(repo):
+        v3BackendDriverPrintErr("v3 backend driver: missing React.js repo: " + repo)
+        return 2
+    if !v3BackendDriverR2cCodegenSurfaceSmokeAt(rootDir, repo, outDir, true):
+        return 1
+    return 0
+
+fn v3BackendDriverR2cReactV3NativeGuiBundleSmoke(rootDir: str,
+                                                 count: int32): int32 =
+    let repoRaw: str = v3BackendDriverReadFlagOrDefault(count, "--repo", "/Users/lbcheng/UniMaker/React.js")
+    let routeStateRaw: str = v3BackendDriverReadFlagOrDefault(count, "--route-state", "home_default")
+    let outDirRaw: str = v3BackendDriverReadFlagOrDefault(count, "--out-dir", "/tmp/r2c-native-gui-bundle-smoke")
+    let repo: str = v3path.V3PathAbsolute(rootDir, repoRaw)
+    let routeState: str = strutil.Strip(routeStateRaw)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRaw)
+    if !os.DirExists(repo):
+        v3BackendDriverPrintErr("v3 backend driver: missing React.js repo: " + repo)
+        return 2
+    if len(routeState) <= 0:
+        v3BackendDriverPrintErr("v3 backend driver: missing --route-state for native gui bundle smoke")
+        return 2
+    if !v3BackendDriverR2cNativeGuiBundleSmokeAt(rootDir, repo, routeState, outDir, true):
+        return 1
+    return 0
+
+fn v3BackendDriverR2cReactV3FreshCleanGate(rootDir: str,
+                                           count: int32): int32 =
+    let repoRaw: str = v3BackendDriverReadFlagOrDefault(count, "--repo", "/Users/lbcheng/UniMaker/React.js")
+    let repo: str = v3path.V3PathAbsolute(rootDir, repoRaw)
+    if !os.DirExists(repo):
+        v3BackendDriverPrintErr("v3 backend driver: missing React.js repo: " + repo)
+        return 2
+    let statusOut: str = "/tmp/r2c-status-fresh-clean-gate.json"
+    let codegenOutDir: str = "/tmp/r2c-codegen-surface-fresh-clean-gate"
+    let routeStates: str[] = ["home_default", "content_detail", "publish_selector"]
+    let hostAuditText: str = v3BackendDriverHostBridgeAuditText(rootDir)
+    v3BackendDriverPrintStdoutBlock(hostAuditText)
+    if !v3path.V3TextContains(hostAuditText, "pure_cheng_zero_c_ready=1") ||
+       !v3path.V3TextContains(hostAuditText, "remaining_non_pure_cheng_boundary=none"):
+        v3BackendDriverPrintErr("v3 backend driver: host bridge audit not ready for r2c fresh clean gate")
+        return 2
+    let statusLogPath: str = v3path.V3PathAbsolute(rootDir,
+                                                   "artifacts/v3_backend_driver/r2c_react_v3_fresh_clean_gate.status.log")
+    let wrapperPath: str = v3BackendDriverR2cWrapperPath(rootDir)
+    let statusRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                 "r2c_react_v3_status",
+                                                                 wrapperPath,
+                                                                 [
+                                                                     "status",
+                                                                     "--out", statusOut
+                                                                 ],
+                                                                 ["R2C_REACT_V3_NO_STAGE3_HANDOFF=1"],
+                                                                 rootDir,
+                                                                 0,
+                                                                 statusLogPath)
+    if v3BackendDriverPrintRunFailure("v3 backend driver: r2c-react-v3-fresh-clean-gate status", statusRun):
+        return 1
+    if !v3path.V3FileExistsNonEmpty(rootDir, statusOut):
+        v3BackendDriverPrintErr("v3 backend driver: missing r2c status report: " + statusOut)
+        return 1
+    let statusText: str = v3path.V3ReadTextFile("", statusOut)
+    if !v3path.V3TextContains(statusText, "\"static_surface_helper\": \"\"") ||
+       !v3path.V3TextContains(statusText, "\"semantic_surface_helper\": \"\"") ||
+       !v3path.V3TextContains(statusText, "r2c-react-v3-truth-runtime.mjs") ||
+       !v3path.V3TextContains(statusText, "\"exec_surface_helper\": \"\"") ||
+       !v3path.V3TextContains(statusText, "\"native_gui_runtime_helper\": \"\"") ||
+       !v3path.V3TextContains(statusText, "\"native_gui_replay_hit_inspector_helper\": \"\"") ||
+       !v3path.V3TextContains(statusText, "\"legacy_wrapper_required\": false") ||
+       !v3path.V3TextContains(statusText, "\"active_node_helper_count\": 6") ||
+       !v3path.V3TextContains(statusText, "\"retired_node_helper_count\": 7") ||
+       !v3path.V3TextContains(statusText, "\"standalone_node_helper_count\": 1") ||
+       !v3path.V3TextContains(statusText, "\"truth_compare_helper\"") ||
+       !v3path.V3TextContains(statusText, "\"truth_compare_matrix_helper\"") ||
+       !v3path.V3TextContains(statusText, "\"standalone_node_helpers\": [") ||
+       !v3path.V3TextContains(statusText, "\"truth_runtime_helper\""):
+        v3BackendDriverPrintErr("v3 backend driver: r2c status report drifted: " + statusOut)
+        return 1
+    if !v3BackendDriverR2cCodegenSurfaceSmokeAt(rootDir, repo, codegenOutDir, false):
+        return 1
+    for i in 0..<routeStates.len:
+        let routeState: str = routeStates[i]
+        let bundleOutDir: str = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeState
+        if !v3BackendDriverR2cNativeGuiBundleSmokeAt(rootDir, repo, routeState, bundleOutDir, false):
+            return 1
+    v3BackendDriverPrintLine("r2c-react-v3 fresh clean gate: ok")
+    v3BackendDriverPrintLine("status_report=" + statusOut)
+    for i in 0..<routeStates.len:
+        let routeState: str = routeStates[i]
+        let bundleReportPath: str = "/tmp/r2c-native-gui-fresh-clean-gate-" + routeState +
+            "/native_gui_bundle_report_v1.json"
+        v3BackendDriverPrintLine("bundle_report_" + routeState + "=" + bundleReportPath)
+    return 0
+
+
+fn v3BackendDriverVerifyExportVisibility(rootDir: str): int32 =
+    let selfPath: str = v3BackendDriverSelfPath(rootDir)
+    if len(selfPath) <= 0:
+        v3BackendDriverPrintErr("v3 backend driver: missing self path for verify-export-visibility")
+        return 2
+    let label: str = v3BackendDriverVerifyExportLabel(selfPath)
+    let smokes: str[] = ["export_visibility_smoke", "export_visibility_negative_smoke", "strformat_export_negative_smoke"]
+    let logPath: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/verify_export_visibility.log")
+    let run: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
+                                                                      v3BackendDriverStage3Path(rootDir),
+                                                                      selfPath,
+                                                                      label,
+                                                                      smokes,
+                                                                      logPath)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility", run):
+        return run.exitCode
+    return 0
+
+fn v3BackendDriverVerifyExportVisibilityParallel(rootDir: str): int32 =
+    let selfPath: str = v3BackendDriverSelfPath(rootDir)
+    if len(selfPath) <= 0:
+        v3BackendDriverPrintErr("v3 backend driver: missing self path for verify-export-visibility-parallel")
+        return 2
+    let label: str = v3BackendDriverVerifyExportParallelLabel(selfPath)
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    if !v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
+        v3BackendDriverPrintErr("v3 backend driver: missing stage3 compiler for verify-export-visibility-parallel")
+        return 2
+    let smokes: str[] = ["export_visibility_smoke", "export_visibility_negative_smoke", "strformat_export_negative_smoke"]
+    let stage3Label: str = "verify_export_stage3_parallel"
+    let backendLabel: str = "verify_export_backend_driver_parallel"
+    let stage3Log: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/verify_export_visibility_parallel.stage3.log")
+    let backendLog: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/verify_export_visibility_parallel.backend.log")
+    let stage3Run: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
+                                                                            stage3Path,
+                                                                            stage3Path,
+                                                                            stage3Label,
+                                                                            smokes,
+                                                                            stage3Log)
+    v3BackendDriverMaybePrintRunOutput(stage3Run)
+    if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility-parallel stage3", stage3Run):
+        return stage3Run.exitCode
+    let backendRun: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
+                                                                              stage3Path,
+                                                                              selfPath,
+                                                                              backendLabel,
+                                                                              smokes,
+                                                                              backendLog)
+    v3BackendDriverMaybePrintRunOutput(backendRun)
+    if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility-parallel backend", backendRun):
+        return backendRun.exitCode
+    let stage3TextRaw: str = v3path.V3ReadTextFile("", stage3Log)
+    let stage3Text: str = strutil.Strip(stage3TextRaw)
+    let backendTextRaw: str = v3path.V3ReadTextFile("", backendLog)
+    let backendText: str = strutil.Strip(backendTextRaw)
+    if !v3path.V3TextContains(stage3Text, "v3 host smokes: ok") ||
+       !v3path.V3TextContains(backendText, "v3 host smokes: ok"):
+        v3BackendDriverPrintErr("v3 backend driver: verify-export-visibility-parallel output drift")
+        return 1
+    v3BackendDriverPrintLine("v3 host smokes: ok")
+    return 0
+
+fn v3BackendDriverVerifyDebugTools(rootDir: str,
+                                   count: int32): int32 =
+    return v3BackendDriverVerifyLiveSmoke(rootDir,
+                                          count,
+                                          "v3/src/tests/debug_tools_surface_smoke.cheng",
+                                          "debug_tools_surface_smoke",
+                                          "v3 debug_tools_surface_smoke ok",
+                                          "v3 debug tools: ok")
+
+fn v3BackendDriverVerifyBackendDriverCommandSurface(rootDir: str,
+                                                    count: int32): int32 =
+    return v3BackendDriverVerifyLiveSmoke(rootDir,
+                                          count,
+                                          "v3/src/tests/backend_driver_command_surface_smoke.cheng",
+                                          "backend_driver_command_surface_smoke",
+                                          "v3 backend_driver_command_surface_smoke ok",
+                                          "verify-backend-driver-command-surface: ok")
+
+fn v3BackendDriverVerifyChainNodeResilienceSurface(rootDir: str,
+                                                   count: int32): int32 =
+    count
+    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+    return v3BackendDriverVerifyChainNodeResilience(rootDir, args)
+
+fn v3BackendDriverVerifyR2cReactV3Surface(rootDir: str,
+                                          count: int32): int32 =
+    return v3BackendDriverVerifyLiveSmoke(rootDir,
+                                          count,
+                                          "v3/src/tests/r2c_react_v3_surface_smoke.cheng",
+                                          "r2c_react_v3_surface_smoke",
+                                          "v3 r2c_react_v3_surface_smoke ok",
+                                          "verify-r2c-react-v3-surface: ok")
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let rootDir: str = v3BackendDriverRoot()
+    let count: int32 = v3BackendDriverParamCountBridge()
+    if count <= 0:
+        v3BackendDriverUsage(rootDir)
+        return 0
+    let cmd: str = cmdline.ParamStr(1)
+    if cmd == "--help" || cmd == "-h" || cmd == "help":
+        v3BackendDriverUsage(rootDir)
+        return 0
+    if cmd == "status":
+        v3BackendDriverStatus(rootDir)
+        return 0
+    if cmd == "print-build-plan":
+        return v3BackendDriverPrintBuildPlan(rootDir, count)
+    if cmd == "host-bridge-audit":
+        return v3BackendDriverHostBridgeAudit(rootDir)
+    if cmd == "run-shared-emit-smokes":
+        return v3BackendDriverRunSharedEmitSmokes(rootDir, count)
+    if cmd == "verify-export-visibility":
+        return v3BackendDriverVerifyExportVisibility(rootDir)
+    if cmd == "verify-export-visibility-parallel":
+        return v3BackendDriverVerifyExportVisibilityParallel(rootDir)
+    if cmd == "verify-debug-tools":
+        return v3BackendDriverVerifyDebugTools(rootDir, count)
+    if cmd == "verify-backend-driver-command-surface":
+        return v3BackendDriverVerifyBackendDriverCommandSurface(rootDir, count)
+    if cmd == "verify-chain-node-resilience":
+        return v3BackendDriverVerifyChainNodeResilienceSurface(rootDir, count)
+    if cmd == "verify-r2c-react-v3-surface":
+        return v3BackendDriverVerifyR2cReactV3Surface(rootDir, count)
+    if cmd == "r2c-react-v3-codegen-surface-smoke":
+        return v3BackendDriverR2cReactV3CodegenSurfaceSmoke(rootDir, count)
+    if cmd == "r2c-react-v3-native-gui-bundle-smoke":
+        return v3BackendDriverR2cReactV3NativeGuiBundleSmoke(rootDir, count)
+    if cmd == "r2c-react-v3-fresh-clean-gate":
+        return v3BackendDriverR2cReactV3FreshCleanGate(rootDir, count)
+    if cmd == "run-chain-node-resilience-smoke":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverRunChainNodeResilienceSmoke(rootDir, args)
+    let args: str[] = v3BackendDriverCollectArgsFrom(1, count)
+    return v3BackendDriverForward(rootDir, args)

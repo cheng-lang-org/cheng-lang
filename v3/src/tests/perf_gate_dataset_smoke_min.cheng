@@ -1,0 +1,83 @@
+import std/system
+import std/strutils as strutil
+import cheng/v3/lang/intern as langintern
+import cheng/v3/tooling/perf_gate as perfgate
+
+fn loadStatic(pool: langintern.V3InternPool): perfgate.V3BenchDataset =
+    var samples: perfgate.V3BenchSample[] = []
+    add(samples, perfgate.V3BenchSample(
+        benchId: langintern.v3Intern(pool, "sha256"),
+        nsPerOpMilli: 10000))
+    add(samples, perfgate.V3BenchSample(
+        benchId: langintern.v3Intern(pool, "x25519"),
+        nsPerOpMilli: 20500))
+    assert(samples.len == 2, "perf gate dataset local rows")
+    var out: perfgate.V3BenchDataset
+    out.samples.len = samples.len
+    out.samples.cap = samples.cap
+    out.samples.buffer = samples.buffer
+    return out
+
+fn main() =
+    let pool: langintern.V3InternPool = langintern.v3InternPoolNew()
+    let staticData: perfgate.V3BenchDataset = loadStatic(pool)
+    assert(staticData.samples.len == 2, "perf gate dataset static rows")
+    let text: str = "sha256 ns_per_op=10.000\nx25519 ns_per_op=20.500\n"
+    let lines: str[] = strutil.Split(text, '\n')
+    assert(lines.len == 3, "perf gate dataset split rows")
+    var loopSamples: perfgate.V3BenchSample[] = []
+    var j: int32 = 0
+    while j < 2:
+        add(loopSamples, perfgate.V3BenchSample(
+            benchId: langintern.v3Intern(pool, "loop"),
+            nsPerOpMilli: int64(j + 1)))
+        j = j + 1
+    assert(loopSamples.len == 2, "perf gate dataset loop static rows")
+    var samples: perfgate.V3BenchSample[] = []
+    var i: int32 = 0
+    while i < lines.len:
+        if i == 0:
+            assert(lines[i] == "sha256 ns_per_op=10.000", "perf gate dataset raw0")
+        elif i == 1:
+            assert(lines[i] == "x25519 ns_per_op=20.500", "perf gate dataset raw1")
+        let line: str = strutil.Strip(lines[i])
+        if i == 0:
+            assert(line == "sha256 ns_per_op=10.000", "perf gate dataset strip0")
+            assert(!strutil.StartsWith(line, "sink="), "perf gate dataset sink0")
+        elif i == 1:
+            assert(line == "x25519 ns_per_op=20.500", "perf gate dataset strip1")
+            assert(!strutil.StartsWith(line, "sink="), "perf gate dataset sink1")
+        if len(line) <= 0:
+            i = i + 1
+            continue
+        if strutil.StartsWith(line, "sink="):
+            i = i + 1
+            continue
+        let name: str = perfgate.v3BenchFirstField(line)
+        let nsText: str = perfgate.v3BenchFindValue(line, "ns_per_op=")
+        let nsMilli: int64 = perfgate.v3BenchParseDecimalMilli(nsText)
+        if len(name) <= 0 || nsMilli < int64(0):
+            i = i + 1
+            continue
+        if i == 0:
+            assert(line == "sha256 ns_per_op=10.000", "perf gate dataset line0")
+            assert(name == "sha256", "perf gate dataset name0")
+            assert(nsText == "10.000", "perf gate dataset ns0")
+            assert(nsMilli == int64(10000), "perf gate dataset milli0")
+        elif i == 1:
+            assert(line == "x25519 ns_per_op=20.500", "perf gate dataset line1")
+            assert(name == "x25519", "perf gate dataset name1")
+            assert(nsText == "20.500", "perf gate dataset ns1")
+            assert(nsMilli == int64(20500), "perf gate dataset milli1")
+        let benchId: langintern.V3InternId = langintern.v3Intern(pool, name)
+        add(samples, perfgate.V3BenchSample(benchId: benchId, nsPerOpMilli: nsMilli))
+        if i == 0:
+            assert(samples.len == 1, "perf gate dataset add0")
+        elif i == 1:
+            assert(samples.len == 2, "perf gate dataset add1")
+        i = i + 1
+    assert(samples.len == 2, "perf gate dataset inline rows")
+    let data: perfgate.V3BenchDataset = perfgate.v3BenchDatasetLoadText(
+        pool,
+        text)
+    assert(data.samples.len == 2, "perf gate dataset rows")

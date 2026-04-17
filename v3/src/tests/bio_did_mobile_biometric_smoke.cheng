@@ -10,7 +10,13 @@ import cheng/v3/project/chain_node as chain
 import cheng/v3/mobile/hardware/biometric
 import cheng/v3/project/bio_did_chain_node as flow
 import cheng/v3/project/bio_did_mobile_biometric as mobileflow
-import cheng/v3/runtime/tcp_bridge_abi as handleabi
+
+@importc("cheng_v3_buffer_handle_len_bridge")
+fn bioDidMobileSmokeBufferHandleLenBridge(handle: uint64): int32
+@importc("cheng_v3_buffer_handle_byte_bridge")
+fn bioDidMobileSmokeBufferHandleByteBridge(handle: uint64, idx: int32): int32
+@importc("cheng_v3_buffer_handle_release_bridge")
+fn bioDidMobileSmokeBufferHandleReleaseBridge(handle: uint64): int32
 
 var bioDidMobileSmokeFeatureCurrent: layout.FixedBytes32 = layout.fixedBytes32Zero()
 var bioDidMobileSmokeFeatureBad: layout.FixedBytes32 = layout.fixedBytes32Zero()
@@ -62,17 +68,23 @@ fn bioDidMobileSmokeScriptAuthorize(feature: layout.FixedBytes32,
                                                                 bioDidMobileSmokeAttestorPrivHex())
 
 fn bioDidMobileSmokeBytesFromHandle(handle: uint64): Bytes =
-    let n = handleabi.cheng_v3_buffer_handle_len_bridge(handle)
+    var n: int32 = 0
+    n = bioDidMobileSmokeBufferHandleLenBridge(handle)
     if n <= 0:
-        let _ = handleabi.cheng_v3_buffer_handle_release_bridge(handle)
+        var releaseRc: int32 = 0
+        releaseRc = bioDidMobileSmokeBufferHandleReleaseBridge(handle)
         return emptyBytes()
-    let raw: Bytes = bytesAlloc(n)
-    for i in 0..<n:
-        let byteVal = handleabi.cheng_v3_buffer_handle_byte_bridge(handle, i)
+    var raw: Bytes = bytesAlloc(n)
+    var i = 0
+    while i < n:
+        var byteVal: int32 = 0
+        byteVal = bioDidMobileSmokeBufferHandleByteBridge(handle, i)
         assert(byteVal >= 0 && byteVal <= 255,
                "v3 bio did mobile smoke: handle byte range")
         bytesSet(raw, i, byteVal)
-    let _ = handleabi.cheng_v3_buffer_handle_release_bridge(handle)
+        i = i + 1
+    var releaseRc: int32 = 0
+    releaseRc = bioDidMobileSmokeBufferHandleReleaseBridge(handle)
     return raw
 
 fn main(): int32 =
@@ -84,7 +96,9 @@ fn main(): int32 =
 
     biometric.v3BiometricClearScriptedFingerprintAuthorize()
 
-    var missingNode = chain.v3ChainNodeInit("bio.did.mobile.missing", "bio.did.mobile.addr.1")
+    var missingNode: chain.V3ChainNode
+    assert(IsOk(chain.v3ChainNodeInitInto(missingNode, "bio.did.mobile.missing", "bio.did.mobile.addr.1")),
+           "v3 chain_node: init")
     let missingRes = mobileflow.v3BioDidMobileCreateWithFingerprint(
         missingNode,
         bioDidMobileSmokeRequest("missing-create", "", "device.phone.secure", "phone"),
@@ -92,7 +106,9 @@ fn main(): int32 =
     )
     assert(IsErr(missingRes), "v3 bio did mobile smoke: missing impl reject")
 
-    var noTrustNode = chain.v3ChainNodeInit("bio.did.mobile.notrust", "bio.did.mobile.addr.0")
+    var noTrustNode: chain.V3ChainNode
+    assert(IsOk(chain.v3ChainNodeInitInto(noTrustNode, "bio.did.mobile.notrust", "bio.did.mobile.addr.0")),
+           "v3 chain_node: init")
     bioDidMobileSmokeScriptAuthorize(bioDidMobileSmokeFeatureCurrent,
                                      "device.phone.secure",
                                      "phone")
@@ -192,7 +208,9 @@ fn main(): int32 =
     assert(bytesLen(createWireRawCStringPayloadBytes) > 32,
            "v3 bio did mobile smoke: create wire raw cstring payload len")
 
-    var node = chain.v3ChainNodeInit("bio.did.mobile", "bio.did.mobile.addr")
+    var node: chain.V3ChainNode
+    assert(IsOk(chain.v3ChainNodeInitInto(node, "bio.did.mobile", "bio.did.mobile.addr")),
+           "v3 chain_node: init")
     bioDidMobileSmokeScriptAuthorize(bioDidMobileSmokeFeatureCurrent,
                                      "device.phone.secure",
                                      "phone")
