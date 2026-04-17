@@ -211,9 +211,20 @@ fn v3CompilerQuoteShell(value: str): str =
     if len(value) <= 0:
         return "''"
     var out = "'"
-    out = out + value
+    for i in 0..<len(value):
+        if value[i] == '\'':
+            out = out + "'\"'\"'"
+        else:
+            out = out + strings.charToStr(value[i])
     out = out + "'"
     return out
+
+fn v3CompilerFileCommand(filePath: str,
+                         argv: str[]): str =
+    var command = v3CompilerQuoteShell(filePath)
+    for i in 0..<argv.len:
+        command = command + " " + v3CompilerQuoteShell(argv[i])
+    return command
 
 fn v3CompilerEnvLineValue(text: str, key: str): str =
     let prefix = key + "="
@@ -1702,7 +1713,10 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     add(compileArgs, "--target:" + targetTriple)
     add(compileArgs, "--out:" + backendDriverCandidateOut)
     add(compileArgs, "--report-out:" + compileReportPath)
-    if !v3CompilerRunFileLogged(rootDir, currentCompiler, compileArgs, compileLogPath, "build-backend-driver compile"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(currentCompiler, compileArgs),
+                                   compileLogPath,
+                                   "build-backend-driver compile"):
         return 2
     if !v3path.v3PathFileExists(backendDriverCandidateOut):
         v3CompilerPrintErr("v3 compiler: missing backend driver candidate output: " + backendDriverCandidateOut)
@@ -1711,26 +1725,34 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
         v3CompilerPrintErr("v3 compiler: missing backend driver candidate map: " + backendDriverCandidateMapOut)
         return 2
     let statusArgs = ["status"]
-    if !v3CompilerRunFileLogged(rootDir, backendDriverCandidateOut, statusArgs, statusLogPath, "build-backend-driver status"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(backendDriverCandidateOut, statusArgs),
+                                   statusLogPath,
+                                   "build-backend-driver status"):
         return 2
     let planArgs = ["print-build-plan", "--target:" + targetTriple]
-    if !v3CompilerRunFileLogged(rootDir, backendDriverCandidateOut, planArgs, planLogPath, "build-backend-driver plan"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(backendDriverCandidateOut, planArgs),
+                                   planLogPath,
+                                   "build-backend-driver plan"):
         return 2
     let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
     var referenceCompiler = currentCompiler
     let referencePlanArgs = ["print-build-plan", "--target:" + targetTriple]
-    if !v3CompilerRunFileLogged(rootDir, referenceCompiler, referencePlanArgs, referencePlanLogPath, "build-backend-driver reference-plan"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(referenceCompiler, referencePlanArgs),
+                                   referencePlanLogPath,
+                                   "build-backend-driver reference-plan"):
         return 2
     let currentPlanText = v3path.v3ReadTextFile("", referencePlanLogPath)
     if !v3CompilerTextContainsAll(currentPlanText, ["target=" + targetTriple]):
         let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
         if len(bootstrapReference) > 0 && bootstrapReference != currentCompiler:
             referenceCompiler = bootstrapReference
-            if !v3CompilerRunFileLogged(rootDir,
-                                        referenceCompiler,
-                                        referencePlanArgs,
-                                        referencePlanLogPath,
-                                        "build-backend-driver reference-plan"):
+            if !v3CompilerRunCommandLogged(rootDir,
+                                           v3CompilerFileCommand(referenceCompiler, referencePlanArgs),
+                                           referencePlanLogPath,
+                                           "build-backend-driver reference-plan"):
                 return 2
     let referencePlanText = v3path.v3ReadTextFile("", referencePlanLogPath)
     var referencePlanCheck = "skip_target_mismatch"
@@ -1764,17 +1786,19 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     add(smokeCompileArgs, "--target:" + targetTriple)
     add(smokeCompileArgs, "--out:" + smokeOut)
     add(smokeCompileArgs, "--report-out:" + smokeCompileReportPath)
-    if !v3CompilerRunFileLogged(rootDir,
-                                backendDriverCandidateOut,
-                                smokeCompileArgs,
-                                smokeCompileLogPath,
-                                "build-backend-driver zero-exit compile"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(backendDriverCandidateOut, smokeCompileArgs),
+                                   smokeCompileLogPath,
+                                   "build-backend-driver zero-exit compile"):
         return 2
     if !v3path.v3PathFileExists(smokeOut) || !v3path.v3PathFileExists(smokeOut + ".v3.map"):
         v3CompilerPrintErr("v3 compiler: backend driver zero-exit smoke missing output: " + smokeOut)
         return 2
     let smokeRunArgs: str[] = []
-    if !v3CompilerRunFileLogged(rootDir, smokeOut, smokeRunArgs, smokeRunLogPath, "build-backend-driver zero-exit run"):
+    if !v3CompilerRunCommandLogged(rootDir,
+                                   v3CompilerFileCommand(smokeOut, smokeRunArgs),
+                                   smokeRunLogPath,
+                                   "build-backend-driver zero-exit run"):
         return 2
     let smokeRunText = strutil.strip(v3path.v3ReadTextFile("", smokeRunLogPath))
     if len(smokeRunText) > 0:
@@ -1951,14 +1975,32 @@ fn v3CompilerBootstrapBridgeFresh(rootDir: str,
 
 fn v3CompilerBootstrapMaterializeStage0Candidate(rootDir: str,
                                                  compilerPath: str,
+                                                 finalPath: str,
                                                  candidatePath: str): bool =
     let logPath = v3CompilerBootstrapLog(rootDir, "cheng.stage0.materialize.log")
+    let buildLogPath = v3CompilerBootstrapLog(rootDir, "cheng.stage0.build.log")
+    let _ = os.removeFile(candidatePath)
+    if compilerPath == finalPath:
+        let copied = os.readFile(compilerPath)
+        if len(copied) <= 0:
+            return false
+        if !v3path.v3WriteTextFile(rootDir, candidatePath, copied):
+            return false
+        let chmodCommand = "chmod 755 " + v3CompilerQuoteShell(candidatePath)
+        if !v3CompilerRunCommandLogged(rootDir,
+                                      chmodCommand,
+                                      logPath,
+                                      "bootstrap-bridge stage0-chmod"):
+            return false
+        return v3path.v3WriteTextFile(rootDir,
+                                      buildLogPath,
+                                      "stage0_candidate_copied_from=" + compilerPath + "\n")
     let linkCommand = "rm -f " + v3CompilerQuoteShell(candidatePath) + " && ln -s " +
                       v3CompilerQuoteShell(compilerPath) + " " + v3CompilerQuoteShell(candidatePath)
     if !v3CompilerRunCommandLogged(rootDir, linkCommand, logPath, "bootstrap-bridge stage0-symlink"):
         return false
     if !v3path.v3WriteTextFile(rootDir,
-                               v3CompilerBootstrapLog(rootDir, "cheng.stage0.build.log"),
+                               buildLogPath,
                                "stage0_symlinked_from=" + compilerPath + "\n"):
         return false
     return v3path.v3PathFileExists(candidatePath)
@@ -2016,7 +2058,10 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
     let stage2ReportPath = v3CompilerBootstrapLog(rootDir, "cheng.stage2.report.txt")
     let stage3ReportPath = v3CompilerBootstrapLog(rootDir, "cheng.stage3.report.txt")
     let installLogPath = v3CompilerBootstrapLog(rootDir, "bootstrap_bridge_v3.install.txt")
-    if !v3CompilerBootstrapMaterializeStage0Candidate(rootDir, bootstrapCompiler, stage0Candidate):
+    if !v3CompilerBootstrapMaterializeStage0Candidate(rootDir,
+                                                      bootstrapCompiler,
+                                                      snapshot.stage0Compiler.path,
+                                                      stage0Candidate):
         v3CompilerPrintErr("v3 compiler: failed to materialize stage0 candidate: " + stage0Candidate)
         return 2
     if !v3CompilerBootstrapStageRun(rootDir,
@@ -2094,14 +2139,22 @@ fn v3CompilerBootstrapBridge(rootDir: str): int32 =
         v3CompilerPrintErr("v3 compiler: fixed point mismatch stage2/stage3 contract drift")
         return 2
     var installReport = ""
-    if !v3CompilerBootstrapInstallCandidate(rootDir,
-                                            stage0Candidate,
-                                            snapshot.stage0Compiler.path,
-                                            installLogPath,
-                                            "stage0",
-                                            installReport):
-        v3CompilerPrintErr("v3 compiler: failed to install bootstrap stage0: " + snapshot.stage0Compiler.path)
-        return 2
+    if bootstrapCompiler == snapshot.stage0Compiler.path:
+        if v3path.v3PathFileExists(stage0Candidate) && !os.removeFile(stage0Candidate):
+            installReport = installReport + "stage0_reuse=cleanup_failed\n"
+            let ignoredWriteInstallLog = v3path.v3WriteTextFile(rootDir, installLogPath, installReport)
+            v3CompilerPrintErr("v3 compiler: failed to discard bootstrap stage0 candidate: " + stage0Candidate)
+            return 2
+        installReport = installReport + "stage0_reuse=ok\n"
+    else:
+        if !v3CompilerBootstrapInstallCandidate(rootDir,
+                                                stage0Candidate,
+                                                snapshot.stage0Compiler.path,
+                                                installLogPath,
+                                                "stage0",
+                                                installReport):
+            v3CompilerPrintErr("v3 compiler: failed to install bootstrap stage0: " + snapshot.stage0Compiler.path)
+            return 2
     if !v3CompilerBootstrapInstallCandidate(rootDir,
                                             stage1Candidate,
                                             snapshot.stage1Compiler.path,
@@ -2142,7 +2195,9 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let stdOsPath = v3path.v3PathAbsolute(rootDir, "src/std/os.cheng")
     let hostProcessPath = v3path.v3PathAbsolute(rootDir, "src/std/os_host_process.cheng")
     let backendPath = v3path.v3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng")
+    let hostRuntimePath = v3path.v3PathAbsolute(rootDir, "v3/src/runtime/program_support_host_runtime_v3.cheng")
     let peerIdPath = v3path.v3PathAbsolute(rootDir, "v3/src/libp2p/core/peer_id.cheng")
+    let systemLinkExecPath = v3path.v3PathAbsolute(rootDir, "v3/src/backend/system_link_exec.cheng")
     let runtimeContractText = v3CompilerRuntimeAbiContractText(rootDir)
     let runtimeAuthorityPath = v3CompilerRuntimeAbiPath(
         rootDir,
@@ -2150,16 +2205,54 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
         "BACKEND_RUNTIME_ABI_AUTHORITY",
         "src/std/system_helpers_backend.cheng"
     )
+    let runtimeCompatHeaderPath = v3CompilerRuntimeAbiPath(
+        rootDir,
+        runtimeContractText,
+        "BACKEND_RUNTIME_ABI_COMPAT_HEADER",
+        "v3/src/runtime/v3_runtime_abi.h"
+    )
     let stdOsText = v3path.v3ReadTextFile("", stdOsPath)
     let hostProcessText = v3path.v3ReadTextFile("", hostProcessPath)
     let backendText = v3path.v3ReadTextFile("", backendPath)
+    let hostRuntimeText = v3path.v3ReadTextFile("", hostRuntimePath)
     let peerIdText = v3path.v3ReadTextFile("", peerIdPath)
+    let systemLinkExecText = v3path.v3ReadTextFile("", systemLinkExecPath)
     let legacyExecFileCaptureBridge = strutil.contains(hostProcessText, "@importc(\"cheng_exec_file_capture_bridge\")") ||
                                       strutil.contains(backendText, "@exportc(\"cheng_exec_file_capture_bridge\")")
     let legacyExecFilePipeBridge = strutil.contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge")
     let legacyExecFilePipeImport = strutil.contains(backendText, "@importc(\"cheng_exec_file_pipe_spawn\")")
     let legacyExecCmdFileRaw = strutil.contains(stdOsText, "cheng_exec_file_capture_raw")
     let directProgramRuntimeC = strutil.contains(backendText, "system_helpers_program_runtime_bridge.c")
+    let legacyRuntimeNativePathPresent = strutil.contains(runtimeContractText, "v3/runtime/native/") ||
+                                         strutil.contains(systemLinkExecText, "v3/runtime/native/")
+    let legacySystemHelpersSourcePathPresent = strutil.contains(runtimeContractText, "src/runtime/native/system_helpers.c") ||
+                                               strutil.contains(systemLinkExecText, "src/runtime/native/system_helpers.c")
+    let programSupportDirectLibcImportsPresent = strutil.contains(backendText, "@importc(\"malloc\")") ||
+                                                 strutil.contains(backendText, "@importc(\"fopen\")") ||
+                                                 strutil.contains(backendText, "@importc(\"getcwd\")") ||
+                                                 strutil.contains(backendText, "@importc(\"getentropy\")") ||
+                                                 strutil.contains(backendText, "@importc(\"pipe\")") ||
+                                                 strutil.contains(backendText, "@importc(\"fork\")") ||
+                                                 strutil.contains(backendText, "@importc(\"socket\")") ||
+                                                 strutil.contains(backendText, "@importc(\"poll\")") ||
+                                                 strutil.contains(backendText, "@importc(\"recvfrom\")") ||
+                                                 strutil.contains(backendText, "@importc(\"clock_gettime\")") ||
+                                                 strutil.contains(backendText, "@importc(\"strerror\")")
+    let programSupportHostRuntimeReady = strutil.contains(backendText, "@importc(\"cheng_host_malloc\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_fopen\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_getcwd\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_socket\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.contains(backendText, "@importc(\"cheng_host_strerror\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_v3_program_support_host_trace\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_malloc\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_fopen\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_getcwd\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_pipe_runtime\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_socket\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_clock_gettime\")") &&
+                                         strutil.contains(hostRuntimeText, "@exportc(\"cheng_host_strerror\")")
     let legacyPeerIdBase58Bridge = strutil.contains(peerIdText, "cheng_v3_base58btc_encode_bridge") ||
                                    strutil.contains(peerIdText, "cheng_v3_base58btc_decode_bridge") ||
                                    strutil.contains(backendText, "@exportc(\"cheng_v3_base58btc_encode_bridge\")") ||
@@ -2184,6 +2277,7 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
                           strutil.contains(backendText, "@exportc(\"cheng_v3_udp_platform_msg_dontwait_bridge\")")
     let pureEntropyReady = strutil.contains(backendText, "@exportc(\"cheng_system_entropy_fill\")")
     let legacyProcessImportsRaw = strutil.contains(hostProcessText, "@importc(\"cheng_pipe_spawn\")") ||
+                                  strutil.contains(backendText, "@importc(\"cheng_pipe_spawn\")") ||
                                   strutil.contains(hostProcessText, "@importc(\"cheng_pty_spawn\")") ||
                                   strutil.contains(hostProcessText, "@importc(\"cheng_pty_read\")") ||
                                   strutil.contains(hostProcessText, "@importc(\"cheng_fd_read\")") ||
@@ -2218,8 +2312,12 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
                                     strutil.contains(backendText, "@exportc(\"cheng_pty_wait_bridge_last_exit_code\")")
     let pureProcessReady = !legacyProcessImportsRaw && processBridgeImportsReady && processBridgeExportsReady
     var remainingBoundary = ""
+    if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+        remainingBoundary = "program_support_host_abi"
     if !pureProcessReady:
         remainingBoundary = "process"
+        if programSupportDirectLibcImportsPresent || !programSupportHostRuntimeReady:
+            remainingBoundary = remainingBoundary + "_program_support_host_abi"
     if !pureFsReady:
         if len(remainingBoundary) > 0:
             remainingBoundary = remainingBoundary + "_"
@@ -2240,7 +2338,9 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     out = out + "host_process_path=" + hostProcessPath + "\n"
     out = out + "peer_id_path=" + peerIdPath + "\n"
     out = out + "program_support_backend_path=" + backendPath + "\n"
+    out = out + "program_support_host_runtime_path=" + hostRuntimePath + "\n"
     out = out + "runtime_authority_path=" + runtimeAuthorityPath + "\n"
+    out = out + "runtime_compat_header_path=" + runtimeCompatHeaderPath + "\n"
     if legacyExecCmdFileRaw:
         out = out + "legacy_exec_file_capture_raw_present=1\n"
     else:
@@ -2261,6 +2361,22 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
         out = out + "direct_program_runtime_c_path_present=1\n"
     else:
         out = out + "direct_program_runtime_c_path_present=0\n"
+    if legacyRuntimeNativePathPresent:
+        out = out + "legacy_runtime_native_path_present=1\n"
+    else:
+        out = out + "legacy_runtime_native_path_present=0\n"
+    if legacySystemHelpersSourcePathPresent:
+        out = out + "legacy_system_helpers_source_path_present=1\n"
+    else:
+        out = out + "legacy_system_helpers_source_path_present=0\n"
+    if programSupportDirectLibcImportsPresent:
+        out = out + "program_support_direct_libc_imports_present=1\n"
+    else:
+        out = out + "program_support_direct_libc_imports_present=0\n"
+    if programSupportHostRuntimeReady:
+        out = out + "program_support_host_runtime_ready=1\n"
+    else:
+        out = out + "program_support_host_runtime_ready=0\n"
     if legacyPeerIdBase58Bridge:
         out = out + "legacy_peer_id_base58_bridge_present=1\n"
         out = out + "libp2p_peer_id_pure_cheng_ready=0\n"
@@ -2297,6 +2413,10 @@ fn v3CompilerHostBridgeAudit(rootDir: str): int32 =
        strutil.contains(out, "legacy_exec_file_capture_bridge_present=1") ||
        strutil.contains(out, "legacy_exec_file_pipe_bridge_present=1") ||
        strutil.contains(out, "legacy_exec_file_pipe_import_present=1") ||
+       strutil.contains(out, "legacy_runtime_native_path_present=1") ||
+       strutil.contains(out, "legacy_system_helpers_source_path_present=1") ||
+       strutil.contains(out, "program_support_direct_libc_imports_present=1") ||
+       strutil.contains(out, "program_support_host_runtime_ready=0") ||
        strutil.contains(out, "legacy_peer_id_base58_bridge_present=1"):
         return 2
     return 0

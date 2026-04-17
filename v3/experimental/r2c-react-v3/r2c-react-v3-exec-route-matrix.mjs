@@ -542,6 +542,16 @@ function buildRouteMatrixByRuntimeExecution({
           .map((candidate, index) => ({ index, semanticNodesCount: Math.max(0, Number(candidate?.semanticNodesCount || 0)) }))
           .filter((item) => item.semanticNodesCount === truthSemanticNodesCount)
           .map((item) => item.index);
+      if (truthSemanticNodesCount !== null && matchingIndexes.length === 0) {
+        entries.push({
+          routeId: route,
+          supported: false,
+          reason: `${firstReason}_truth_count_miss_${truthSemanticNodesCount}`,
+          snapshotPath: '',
+          snapshot: buildCodegenExecSnapshotZero(),
+        });
+        continue;
+      }
       candidateIndexes = matchingIndexes.length > 0
         ? matchingIndexes
         : candidateDocs.map((_, index) => index);

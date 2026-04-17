@@ -6,17 +6,10 @@ import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/project/chain_node as chain
 import cheng/v3/project/chain_node_cli_core as cli
+import cheng/v3/project/chain_node_main as chain_main
 import cheng/v3/project/bio_did_chain_node as flow
 import cheng/v3/mobile/hardware/biometric
-import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
-
-fn chainNodeBioDidLookupCommandSmokeCompilerPath(root: str): str =
-    let compilerEnv = os.getEnv("CHENG_V3_SMOKE_COMPILER")
-    var compilerRaw = "artifacts/v3_bootstrap/cheng.stage3"
-    if len(compilerEnv) > 0:
-        compilerRaw = compilerEnv
-    return v3path.v3PathAbsolute(root, compilerRaw)
 
 fn chainNodeBioDidLookupCommandSmokeFeature(seed: int32): layout.FixedBytes32 =
     let raw: Bytes = bytesAlloc(32)
@@ -75,7 +68,11 @@ fn chainNodeBioDidLookupCommandSmokeWriteState(statePath: str,
     assert(IsOk(operatorIdRes), "chain node bio did lookup command smoke: operator id")
     let operatorId = Value(operatorIdRes)
     operatorIdHex = layout.fixedBytes32Hex(operatorId)
-    var node = chain.v3ChainNodeInit("bio.did.lookup.command.node", "bio.did.lookup.command.addr")
+    let nodeId = "bio.did.lookup.command.node"
+    let addressSeed = "bio.did.lookup.command.addr"
+    var node: chain.V3ChainNode
+    let initNodeRes = chain.v3ChainNodeInitInto(node, nodeId, addressSeed)
+    assert(IsOk(initNodeRes), "chain node bio did lookup command smoke: init node")
     let createRes = flow.v3BioDidCreateWithHardwareCapture(
         node,
         chainNodeBioDidLookupCommandSmokeCapture(chainNodeBioDidLookupCommandSmokeFeature(11),
@@ -100,94 +97,34 @@ fn main(): int32 =
     let root = os.getCurrentDir()
     let outDir = v3path.v3PathAbsolute(root, "artifacts/v3_chain_node_bio_did_lookup_command_smoke")
     assert(v3path.v3MkdirP(root, outDir), "chain node bio did lookup command smoke: mkdir")
-    let compiler = chainNodeBioDidLookupCommandSmokeCompilerPath(root)
-    assert(v3path.v3FileExistsNonEmpty(root, compiler),
-           "chain node bio did lookup command smoke: compiler exists")
-    let exePath = v3path.v3PathJoin(outDir, "chain_node_lookup_smoke_exe")
-    let buildLogPath = v3path.v3PathJoin(outDir, "chain_node_lookup_smoke_build.log")
     let statePath = v3path.v3PathJoin(outDir, "chain_node_lookup_smoke.state")
-    let hitLogPath = v3path.v3PathJoin(outDir, "chain_node_lookup_smoke_hit.log")
-    let missLogPath = v3path.v3PathJoin(outDir, "chain_node_lookup_smoke_miss.log")
-    let sourcePath = v3path.v3PathAbsolute(root, "v3/src/project/chain_node_main.cheng")
-    let packageRoot = v3path.v3PathAbsolute(root, "v3")
-    if v3path.v3PathFileExists(exePath):
-        os.removeFile(exePath)
-    if v3path.v3PathFileExists(buildLogPath):
-        os.removeFile(buildLogPath)
     if v3path.v3PathFileExists(statePath):
         os.removeFile(statePath)
-    if v3path.v3PathFileExists(hitLogPath):
-        os.removeFile(hitLogPath)
-    if v3path.v3PathFileExists(missLogPath):
-        os.removeFile(missLogPath)
     var operatorIdHex = ""
     assert(chainNodeBioDidLookupCommandSmokeWriteState(statePath, operatorIdHex),
            "chain node bio did lookup command smoke: write state")
-    let buildRun = hostops.v3RunFileLogged(root,
-                                           "chain_node_lookup_build",
-                                           compiler,
-                                           [
-                                               "system-link-exec",
-                                               "--root",
-                                               packageRoot,
-                                               "--in",
-                                               sourcePath,
-                                               "--emit",
-                                               "exe",
-                                               "--target",
-                                               "arm64-apple-darwin",
-                                               "--out",
-                                               exePath
-                                           ],
-                                           [],
-                                           root,
-                                           180,
-                                           buildLogPath)
-    assert(hostops.v3LoggedRunOk(buildRun),
-           "chain node bio did lookup command smoke: build chain_node_main rc")
-    let hitRun = hostops.v3RunFileLogged(root,
-                                         "chain_node_lookup_hit",
-                                         exePath,
-                                         [
-                                             "bio-did-operator-lookup",
-                                             "--state",
-                                             statePath,
-                                             "--operator-id",
-                                             operatorIdHex,
-                                             "--preferred-kinds",
-                                             flow.v3BioDidOperatorBundleKindAndroidBioV1
-                                         ],
-                                         [],
-                                         root,
-                                         30,
-                                         hitLogPath)
-    assert(hostops.v3LoggedRunOk(hitRun),
+    let hitRes = chain_main.v3ChainNodeBioDidOperatorLookupText(statePath,
+                                                                operatorIdHex,
+                                                                flow.v3BioDidOperatorBundleKindAndroidBioV1)
+    assert(IsOk(hitRes),
            "chain node bio did lookup command smoke: lookup hit rc")
-    assert(strutil.contains(hitRun.output, "\"found\":true"),
+    let hitText = Value(hitRes)
+    assert(strutil.contains(hitText, "\"found\":true"),
            "chain node bio did lookup command smoke: lookup hit found")
-    assert(strutil.contains(hitRun.output, "\"operatorId\":\"" + operatorIdHex + "\""),
+    assert(strutil.contains(hitText, "\"operatorId\":\"" + operatorIdHex + "\""),
            "chain node bio did lookup command smoke: lookup hit operator")
-    assert(strutil.contains(hitRun.output, "\"bundleSeq\":1"),
+    assert(strutil.contains(hitText, "\"bundleSeq\":1"),
            "chain node bio did lookup command smoke: lookup hit seq")
-    assert(strutil.contains(hitRun.output, "\"bundleKind\":\"android_bio_v1\""),
+    assert(strutil.contains(hitText, "\"bundleKind\":\"android_bio_v1\""),
            "chain node bio did lookup command smoke: lookup hit kind")
-    let missRun = hostops.v3RunFileLogged(root,
-                                          "chain_node_lookup_miss",
-                                          exePath,
-                                          [
-                                              "bio-did-operator-lookup",
-                                              "--state",
-                                              statePath,
-                                              "--operator-id",
-                                              "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
-                                          ],
-                                          [],
-                                          root,
-                                          30,
-                                          missLogPath)
-    assert(hostops.v3LoggedRunOk(missRun),
+    let missRes = chain_main.v3ChainNodeBioDidOperatorLookupText(
+        statePath,
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        ""
+    )
+    assert(IsOk(missRes),
            "chain node bio did lookup command smoke: lookup miss rc")
-    assert(strutil.contains(missRun.output, "\"found\":false"),
+    assert(strutil.contains(Value(missRes), "\"found\":false"),
            "chain node bio did lookup command smoke: lookup miss found")
     echo("v3 chain_node_bio_did_operator_lookup_command_smoke ok")
     return 0

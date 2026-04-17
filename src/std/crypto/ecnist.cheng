@@ -72,6 +72,7 @@ var
     p256NCtxFixed: pfix.P256FixedMontgomeryContext
     p256PMinus2Fixed: pfix.P256Fixed
     p256NMinus2Fixed: pfix.P256Fixed
+    p256BFixed: pfix.P256Fixed
     p256GWindow4: EcPointFixed[16]
     p256GWindow4Neg: EcPointFixed[16]
     p256GWindow4J: EcPointJacobianFixed[16]
@@ -701,8 +702,16 @@ fn p256EnsureInit(): Result[bool] =
     let nMinus2FixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(nMinus2Big)
     if IsErr(nMinus2FixedRes):
         return Err[bool](Error(nMinus2FixedRes))
+    var bBig: BigInt = p256B
+    let bFixedRes: Result[pfix.P256Fixed] = pfix.p256FixedFromBigInt(bBig)
+    if IsErr(bFixedRes):
+        return Err[bool](Error(bFixedRes))
+    let bMontRes: Result[pfix.P256Fixed] = p256FieldFixedToMont(Value(bFixedRes))
+    if IsErr(bMontRes):
+        return Err[bool](Error(bMontRes))
     p256PMinus2Fixed = Value(pMinus2FixedRes)
     p256NMinus2Fixed = Value(nMinus2FixedRes)
+    p256BFixed = Value(bMontRes)
     p256InitGeneratorWindow4Table()
     p256InitGeneratorWindow4NegTable()
     p256InitGeneratorWindow4JacobianTable()
@@ -1299,17 +1308,14 @@ fn pointJacobianBatchToAffineWindow16(table: EcPointJacobianFixed[16]): Result[b
 
 fn pointMulFixedWindowed(scalar: pfix.P256Fixed, p: EcPointFixed): Result[EcPointFixed] =
     var windowBase: int32 = (8 * 32) - 1
-    var result: EcPointJacobianFixed = pointJacobianInfinityFixed()
+    var result: EcPointJacobianFixed
+    pointJacobianSetInfinityFixed(result)
     while windowBase >= 0:
         pointJacobianDoubleFixedInPlace(result)
         if pfix.p256FixedGetBit(scalar, windowBase) != 0:
             pointJacobianAddAffineFixedInPlace(result, p)
         windowBase = windowBase - 1
-    let affineRes: Result[EcPointFixed] = pointJacobianToAffineFixed(result)
-    if IsErr(affineRes):
-        return Err[EcPointFixed](Error(affineRes))
-    let affine: EcPointFixed = Value(affineRes)
-    return Ok[EcPointFixed](affine)
+    return pointJacobianToAffineFixed(result)
 
 fn pointMulGeneratorAndFixedShamir(u1: pfix.P256Fixed, u2: pfix.P256Fixed, p: EcPointFixed): Result[EcPointJacobianFixed] =
     var result: EcPointJacobianFixed
@@ -1905,6 +1911,69 @@ fn pointIsOnCurve(p: EcPoint): Result[bool] =
         return Err[bool](Error(rhsRes))
     return Ok[bool](bigCmp(Value(y2Res), Value(rhsRes)) == 0)
 
+fn pointIsOnCurveFixed(p: EcPointFixed): Result[bool] =
+    if p.inf:
+        return Ok[bool](false)
+    let y2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(p.y)
+    if IsErr(y2Res):
+        return Err[bool](Error(y2Res))
+    let x2Res: Result[pfix.P256Fixed] = p256FieldFixedSquare(p.x)
+    if IsErr(x2Res):
+        return Err[bool](Error(x2Res))
+    let x3Res: Result[pfix.P256Fixed] = p256FieldFixedMul(Value(x2Res), p.x)
+    if IsErr(x3Res):
+        return Err[bool](Error(x3Res))
+    let threeXRes: Result[pfix.P256Fixed] = p256FieldFixedTriple(p.x)
+    if IsErr(threeXRes):
+        return Err[bool](Error(threeXRes))
+    let rhsBaseRes: Result[pfix.P256Fixed] = p256FieldFixedSub(Value(x3Res), Value(threeXRes))
+    if IsErr(rhsBaseRes):
+        return Err[bool](Error(rhsBaseRes))
+    let rhsRes: Result[pfix.P256Fixed] = p256FieldFixedAdd(Value(rhsBaseRes), p256BFixed)
+    if IsErr(rhsRes):
+        return Err[bool](Error(rhsRes))
+    var lhs: pfix.P256Fixed = Value(y2Res)
+    var rhs: pfix.P256Fixed = Value(rhsRes)
+    let same: bool = pfix.p256FixedCmp(lhs, rhs) == 0
+    var out: Result[bool] = Ok[bool](same)
+    return out
+
+fn ecdsaParsePublicKeyPointFixedBytes(data: Bytes,
+                                      requireCurveCheck: bool,
+                                      out: var EcPointFixed): Result[bool] =
+    let initRes: Result[bool] = p256EnsureInit()
+    if IsErr(initRes):
+        return Err[bool](Error(initRes))
+    if bytesLen(data) != p256PublicSize:
+        return Err[bool]("ecdsa: invalid public key length")
+    if bytesGet(data, 0) != 0x04:
+        return Err[bool]("ecdsa: invalid public key prefix")
+    let xNormRes: Result[pfix.P256Fixed] = pfix.p256FixedReadBytesBE32(data, 1)
+    if IsErr(xNormRes):
+        return Err[bool](Error(xNormRes))
+    let yNormRes: Result[pfix.P256Fixed] = pfix.p256FixedReadBytesBE32(data, 1 + p256ScalarSize)
+    if IsErr(yNormRes):
+        return Err[bool](Error(yNormRes))
+    var xNorm: pfix.P256Fixed = Value(xNormRes)
+    var yNorm: pfix.P256Fixed = Value(yNormRes)
+    var modulus: pfix.P256Fixed = pfix.p256FieldModulus()
+    if pfix.p256FixedCmp(xNorm, modulus) >= 0 || pfix.p256FixedCmp(yNorm, modulus) >= 0:
+        return Err[bool]("ecdsa: point out of range")
+    let xMontRes: Result[pfix.P256Fixed] = p256FieldFixedToMont(xNorm)
+    if IsErr(xMontRes):
+        return Err[bool](Error(xMontRes))
+    let yMontRes: Result[pfix.P256Fixed] = p256FieldFixedToMont(yNorm)
+    if IsErr(yMontRes):
+        return Err[bool](Error(yMontRes))
+    out.x = Value(xMontRes)
+    out.y = Value(yMontRes)
+    out.inf = false
+    if requireCurveCheck:
+        let onCurveRes: Result[bool] = pointIsOnCurveFixed(out)
+        if IsErr(onCurveRes) || ! Value(onCurveRes):
+            return Err[bool]("ecdsa: point ! on curve")
+    return Ok[bool](true)
+
 fn pointSetInfinityInto(out: var EcPoint) =
     out.x.count = 0
     for i in 0..<maxBigIntLimbs:
@@ -2380,30 +2449,11 @@ fn ecdsaVerifyTrustedPublicKey(pub: EcPublicKey, msg: Bytes, sig: EcSignature): 
 fn ecdsaParsePublicKeyPointBytes(data: Bytes,
                                  requireCurveCheck: bool,
                                  out: var EcPoint): Result[bool] =
-    let initRes: Result[bool] = p256EnsureInit()
-    if IsErr(initRes):
-        return Err[bool](Error(initRes))
-    if bytesLen(data) != p256PublicSize:
-        return Err[bool]("ecdsa: invalid public key length")
-    if bytesGet(data, 0) != 0x04:
-        return Err[bool]("ecdsa: invalid public key prefix")
-    let xRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, 1, p256ScalarSize))
-    if IsErr(xRes):
-        return Err[bool](Error(xRes))
-    let yRes: Result[BigInt] = bigFromBytes(bytesSliceView(data, 1 + p256ScalarSize, p256ScalarSize))
-    if IsErr(yRes):
-        return Err[bool](Error(yRes))
-    let x: BigInt = Value(xRes)
-    let y: BigInt = Value(yRes)
-    if bigCmp(x, p256P) >= 0 || bigCmp(y, p256P) >= 0:
-        return Err[bool]("ecdsa: point out of range")
-    out.x = x
-    out.y = y
-    out.inf = false
-    if requireCurveCheck:
-        let onCurveRes: Result[bool] = pointIsOnCurve(out)
-        if IsErr(onCurveRes) || ! Value(onCurveRes):
-            return Err[bool]("ecdsa: point ! on curve")
+    var fixedPoint: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(data, requireCurveCheck, fixedPoint)
+    if IsErr(pointRes):
+        return Err[bool](Error(pointRes))
+    pointBigFromFixedInto(out, fixedPoint)
     return Ok[bool](true)
 
 fn ecdsaParsePrivateScalarBytes(data: Bytes, out: var BigInt): Result[bool] =
@@ -2489,8 +2539,8 @@ fn ecdsaVerifyTrustedPublicKeyBytes(pubBytes: Bytes, msg: Bytes, sig: EcSignatur
     return Ok[bool](ecdsaVerifyPointScalars(point, false, msg, sig.r, sig.s))
 
 fn ecdsaPublicKeyBytesValid(pubBytes: Bytes): bool =
-    var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(pubBytes, true, point)
+    var point: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(pubBytes, true, point)
     return IsOk(pointRes)
 
 fn ecdsaPublicKeyToBytes(pub: EcPublicKey): Bytes =
@@ -2503,18 +2553,18 @@ fn ecdsaSignatureToBytes(sig: EcSignature): Bytes =
     return ecdsaSignatureScalarsToBytes(sig.r, sig.s)
 
 fn ecdsaPublicKeyFromBytes(data: Bytes): Result[EcPublicKey] =
-    var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(data, true, point)
+    var point: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(data, true, point)
     if IsErr(pointRes):
         return Err[EcPublicKey](Error(pointRes))
-    return Ok[EcPublicKey](EcPublicKey(point: point))
+    return Ok[EcPublicKey](EcPublicKey(point: pointBigFromFixed(point)))
 
 fn ecdsaTrustedPublicKeyFromBytes(data: Bytes): Result[EcPublicKey] =
-    var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(data, false, point)
+    var point: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(data, false, point)
     if IsErr(pointRes):
         return Err[EcPublicKey](Error(pointRes))
-    return Ok[EcPublicKey](EcPublicKey(point: point))
+    return Ok[EcPublicKey](EcPublicKey(point: pointBigFromFixed(point)))
 
 fn ecdsaPrivateKeyFromBytes(data: Bytes): Result[EcPrivateKey] =
     var d: BigInt
@@ -2532,13 +2582,13 @@ fn ecdsaSignatureFromBytes(data: Bytes): Result[EcSignature] =
     return Ok[EcSignature](EcSignature(r: r, s: s))
 
 fn validateEcdsaPublicKeyBytes(data: Bytes): bool =
-    var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(data, true, point)
+    var point: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(data, true, point)
     return IsOk(pointRes)
 
 fn validateEcdsaTrustedPublicKeyBytes(data: Bytes): bool =
-    var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(data, false, point)
+    var point: EcPointFixed
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointFixedBytes(data, false, point)
     return IsOk(pointRes)
 
 fn validateEcdsaPrivateKeyBytes(data: Bytes): bool =
@@ -2565,8 +2615,9 @@ fn ecdsaSignBytes(privData: Bytes, msg: Bytes): Result[Bytes] =
     return Ok[Bytes](sigBytes)
 
 fn ecdsaVerifyBytes(pubData: Bytes, msg: Bytes, sig: Bytes): bool =
+    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(pubBytes, true, point)
     var point: EcPoint
-    let pointRes: Result[bool] = ecdsaParsePublicKeyPointBytes(pubData, true, point)
+    let pointRes = ecdsaParsePublicKeyPointBytes(pubData, true, point)
     if IsErr(pointRes):
         return false
     var r: BigInt

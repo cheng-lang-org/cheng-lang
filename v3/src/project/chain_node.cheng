@@ -35,12 +35,63 @@ type
         forest: lt.V3StateLayerForest
         signature: lt.V3AntiEntropySignature
 
+fn v3ChainNodeCopyAddress(out: var types.V3LsmrAddress, address: types.V3LsmrAddress) =
+    out.depth = address.depth
+    for i in 0..<types.v3LsmrMaxDepth:
+        out.digits[i] = address.digits[i]
+
+fn v3ChainNodeCopySignature(out: var lt.V3AntiEntropySignature, signature: lt.V3AntiEntropySignature) =
+    out.stampEpoch = signature.stampEpoch
+    out.stampGanzhi = signature.stampGanzhi
+    out.eventCount = signature.eventCount
+    out.accountCount = signature.accountCount
+    out.stateForestCid = signature.stateForestCid
+    out.layerCount = signature.layerCount
+    for i in 0..<3:
+        out.layerSummaries[i].layerId = signature.layerSummaries[i].layerId
+        out.layerSummaries[i].treeCid = signature.layerSummaries[i].treeCid
+        out.layerSummaries[i].nodeCount = signature.layerSummaries[i].nodeCount
+        out.layerSummaries[i].entryCount = signature.layerSummaries[i].entryCount
+    out.rootCount = signature.rootCount
+    for i in 0..<lt.v3BaguaRootSummaryMax:
+        out.rootSummaries[i].layerId = signature.rootSummaries[i].layerId
+        out.rootSummaries[i].baguaId = signature.rootSummaries[i].baguaId
+        out.rootSummaries[i].nodeCid = signature.rootSummaries[i].nodeCid
+        out.rootSummaries[i].entryDescCount = signature.rootSummaries[i].entryDescCount
+
+fn v3ChainNodeCopyInto(out: var V3ChainNode, node: V3ChainNode) =
+    out.nodeId = node.nodeId
+    v3ChainNodeCopyAddress(out.address, node.address)
+    out.nextEpoch = node.nextEpoch
+    out.nextGanzhi = node.nextGanzhi
+    out.nextTick = node.nextTick
+    out.servedCount = node.servedCount
+    out.index.eventCids = node.index.eventCids
+    out.index.eventKinds = node.index.eventKinds
+    out.index.logOffsets = node.index.logOffsets
+    out.index.accountAssetIds = node.index.accountAssetIds
+    out.index.accountIds = node.index.accountIds
+    out.index.accountHeads = node.index.accountHeads
+    out.index.balances = node.index.balances
+    out.index.clockEpochs = node.index.clockEpochs
+    out.index.clockGanzhi = node.index.clockGanzhi
+    out.index.diverged = node.index.diverged
+    out.index.stateTreeDirty = node.index.stateTreeDirty
+    out.eventCids = node.eventCids
+    out.events = node.events
+    out.forest = node.forest
+    v3ChainNodeCopySignature(out.signature, node.signature)
+    out.tipEventCid = node.tipEventCid
+
 fn v3ChainNodeZero(nodeId: str, address: types.V3LsmrAddress): V3ChainNode =
-    var nextEpoch = 1
     var out: V3ChainNode
+    v3ChainNodeZeroInto(out, nodeId, address)
+    return out
+
+fn v3ChainNodeZeroInto(out: var V3ChainNode, nodeId: str, address: types.V3LsmrAddress) =
     out.nodeId = nodeId
-    out.address = address
-    out.nextEpoch = nextEpoch
+    v3ChainNodeCopyAddress(out.address, address)
+    out.nextEpoch = 1
     out.nextGanzhi = 1
     out.nextTick = int64(1)
     out.servedCount = 0
@@ -57,7 +108,9 @@ fn v3ChainNodeZero(nodeId: str, address: types.V3LsmrAddress): V3ChainNode =
     out.index.stateTreeDirty = false
     out.eventCids = []
     out.events = []
-    return out
+    lt.v3StateLayerForestZeroInto(out.forest)
+    lt.v3AntiEntropySignatureZeroInto(out.signature)
+    out.tipEventCid = layout.fixedBytes32Zero()
 
 fn v3ChainNodeStampLess(left: V3ChainNodeStamp, right: V3ChainNodeStamp): bool =
     if left.epoch != right.epoch:
@@ -213,14 +266,29 @@ fn v3ChainNodeRebuildDerived(node: var V3ChainNode) =
     node.nextTick = int64(node.eventCids.len + 1)
 
 fn v3ChainNodeInit(nodeId: str, addressSeed: str): V3ChainNode =
-    let addrRes = lsmr.v3LsmrAddressFromSeed(addressSeed, 3)
-    if IsErr(addrRes):
-        panic(Error(addrRes))
-    var out = v3ChainNodeZero(nodeId, Value(addrRes))
-    v3ChainNodeRebuildDerived(out)
+    var out: V3ChainNode
+    let initRes = v3ChainNodeInitInto(out, nodeId, addressSeed)
+    if IsErr(initRes):
+        panic(Error(initRes))
     return out
 
+fn v3ChainNodeInitInto(out: var V3ChainNode, nodeId: str, addressSeed: str): Result[bool] =
+    let addrRes = v3ChainNodeAddressFromSeed(addressSeed)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    v3ChainNodeZeroInto(out, nodeId, Value(addrRes))
+    v3ChainNodeRebuildDerived(out)
+    return Ok[bool](true)
+
+fn v3ChainNodeAddressFromSeed(addressSeed: str): Result[types.V3LsmrAddress] =
+    return lsmr.v3LsmrAddressFromSeed(addressSeed, 3)
+
 fn v3ChainNodeApplyEvent(node: var V3ChainNode, event: var consensus.V3ChainEvent): Result[layout.FixedBytes32] =
+    return v3ChainNodeApplyEventWithDerived(node, event, true)
+
+fn v3ChainNodeApplyEventWithDerived(node: var V3ChainNode,
+                                    event: var consensus.V3ChainEvent,
+                                    rebuildDerived: bool): Result[layout.FixedBytes32] =
     let eventCid = consensus.v3ChainEventCid(event)
     var nextIndex: consensus.V3ChainIndex
     nextIndex = node.index
@@ -232,7 +300,8 @@ fn v3ChainNodeApplyEvent(node: var V3ChainNode, event: var consensus.V3ChainEven
     if decision.applied:
         add(node.eventCids, eventCid)
         add(node.events, event)
-        v3ChainNodeRebuildDerived(node)
+        if rebuildDerived:
+            v3ChainNodeRebuildDerived(node)
     return Ok[layout.FixedBytes32](eventCid)
 
 fn v3ChainNodeMint(node: var V3ChainNode,
@@ -311,40 +380,50 @@ fn v3ChainNodeBalance(node: V3ChainNode, assetId: int32, accountId: int32): Resu
 fn v3ChainNodeServeOnce(node: var V3ChainNode): V3ChainNodeServeSnapshot =
     v3ChainNodeRebuildDerived(node)
     node.servedCount = node.servedCount + 1
-    return V3ChainNodeServeSnapshot(
-        nodeId: node.nodeId,
-        address: node.address,
-        serveCount: node.servedCount,
-        tipEventCid: node.tipEventCid,
-        eventCids: node.eventCids,
-        events: node.events,
-        forest: node.forest,
-        signature: node.signature
-    )
+    var out: V3ChainNodeServeSnapshot
+    out.nodeId = node.nodeId
+    v3ChainNodeCopyAddress(out.address, node.address)
+    out.serveCount = node.servedCount
+    out.tipEventCid = node.tipEventCid
+    out.eventCids = node.eventCids
+    out.events = node.events
+    out.forest = node.forest
+    v3ChainNodeCopySignature(out.signature, node.signature)
+    return out
 
 fn v3ChainNodeReplayFromSnapshot(nodeId: str,
                                  address: types.V3LsmrAddress,
                                  snapshot: V3ChainNodeServeSnapshot): Result[V3ChainNode] =
+    var rebuilt: V3ChainNode
+    let replayRes = v3ChainNodeReplayFromSnapshotInto(rebuilt, nodeId, address, snapshot)
+    if IsErr(replayRes):
+        return Err[V3ChainNode](Error(replayRes))
+    return Ok[V3ChainNode](rebuilt)
+
+fn v3ChainNodeReplayFromSnapshotInto(out: var V3ChainNode,
+                                     nodeId: str,
+                                     address: types.V3LsmrAddress,
+                                     snapshot: V3ChainNodeServeSnapshot): Result[bool] =
     if snapshot.eventCids.len != snapshot.events.len:
-        return Err[V3ChainNode]("v3 chain_node: snapshot length mismatch")
-    var rebuilt = v3ChainNodeZero(nodeId, address)
+        return Err[bool]("v3 chain_node: snapshot length mismatch")
+    v3ChainNodeZeroInto(out, nodeId, address)
     for i in 0..<snapshot.events.len:
         var event = snapshot.events[i]
         event.stem = event.ganzhiIndex % 10
         event.branch = event.ganzhiIndex % 12
         event.bodyCid = consensus.v3ChainEventBodyCid(event)
-        let applyRes = v3ChainNodeApplyEvent(rebuilt, event)
+        let applyRes = v3ChainNodeApplyEventWithDerived(out, event, false)
         if IsErr(applyRes):
-            return Err[V3ChainNode](Error(applyRes))
+            return Err[bool](Error(applyRes))
         if !layout.fixedBytes32Equal(Value(applyRes), snapshot.eventCids[i]):
-            return Err[V3ChainNode]("v3 chain_node: snapshot cid mismatch")
-    v3ChainNodeRebuildDerived(rebuilt)
-    if !layout.fixedBytes32Equal(rebuilt.forest.forestCid, snapshot.forest.forestCid):
-        return Err[V3ChainNode]("v3 chain_node: snapshot forest mismatch")
-    if !anti.v3AntiEntropySignatureEqual(rebuilt.signature, snapshot.signature):
-        return Err[V3ChainNode]("v3 chain_node: snapshot signature mismatch")
-    rebuilt.servedCount = snapshot.serveCount
-    return Ok[V3ChainNode](rebuilt)
+            return Err[bool]("v3 chain_node: snapshot cid mismatch")
+    v3ChainNodeRebuildDerived(out)
+    if !layout.fixedBytes32Equal(out.forest.forestCid, snapshot.forest.forestCid):
+        return Err[bool]("v3 chain_node: snapshot forest mismatch")
+    if !anti.v3AntiEntropySignatureEqual(out.signature, snapshot.signature):
+        return Err[bool]("v3 chain_node: snapshot signature mismatch")
+    out.servedCount = snapshot.serveCount
+    return Ok[bool](true)
 
 fn v3ChainNodeSyncOnce(node: var V3ChainNode, remote: V3ChainNodeServeSnapshot): Result[bool] =
     v3ChainNodeRebuildDerived(node)

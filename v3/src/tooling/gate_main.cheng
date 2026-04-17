@@ -2459,6 +2459,76 @@ fn v3GateTextContainsAny(text: str, needles: str[]): bool =
             return true
     return false
 
+fn v3GateAsciiSpace(ch: char): bool =
+    return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
+
+fn v3GateOrphanSnapshotKey(lineRaw: str): str =
+    let line = strutil.strip(lineRaw)
+    if len(line) <= 0:
+        return ""
+    let total = len(line)
+    var cursor = 0
+    while cursor < total && v3GateAsciiSpace(line[cursor]):
+        cursor = cursor + 1
+    let pidStart = cursor
+    while cursor < total && !v3GateAsciiSpace(line[cursor]):
+        cursor = cursor + 1
+    if cursor <= pidStart:
+        return ""
+    let pidText = v3path.v3TextSlice(line, pidStart, cursor - pidStart)
+    for skip in 0..<3:
+        let _ = skip
+        while cursor < total && v3GateAsciiSpace(line[cursor]):
+            cursor = cursor + 1
+        let fieldStart = cursor
+        while cursor < total && !v3GateAsciiSpace(line[cursor]):
+            cursor = cursor + 1
+        if cursor <= fieldStart:
+            return ""
+    while cursor < total && v3GateAsciiSpace(line[cursor]):
+        cursor = cursor + 1
+    if cursor >= total:
+        return ""
+    let commandText = v3path.v3TextSlice(line, cursor, total - cursor)
+    return pidText + "|" + commandText
+
+fn v3GateNormalizeOrphanSnapshot(text: str): str[] =
+    var out: str[] = []
+    let lines = strutil.split(text, '\n')
+    for i in 0..<lines.len:
+        let key = v3GateOrphanSnapshotKey(lines[i])
+        if len(key) > 0:
+            add(out, key)
+    return out
+
+fn v3GateSeqContainsStr(items: str[], value: str): bool =
+    for i in 0..<items.len:
+        if items[i] == value:
+            return true
+    return false
+
+fn v3GateCollectNewOrphanKeys(before: str[], after: str[]): str[] =
+    var out: str[] = []
+    for i in 0..<after.len:
+        let key = after[i]
+        if !v3GateSeqContainsStr(before, key) && !v3GateSeqContainsStr(out, key):
+            add(out, key)
+    return out
+
+fn v3GateReadChengOrphanSnapshot(root: str,
+                                 label: str,
+                                 logPath: str,
+                                 outLines: var str[]): int32 =
+    let command = "ps -Ao pid=,ppid=,state=,etime=,command= | " +
+                  "awk -v root=" + os.quoteShell(root) +
+                  " '$2==1 && $3 ~ /^U/ && index($0, root) > 0'"
+    let run = v3GateRunShellLogged(root, label, command, logPath, 10)
+    if v3GateRunFailed(run):
+        outLines = []
+        return run.exitCode
+    outLines = v3GateNormalizeOrphanSnapshot(run.output)
+    return 0
+
 fn v3GateVerifyOrphanGuard(root: str): int32 =
     let toolingDir: str = v3path.v3PathAbsolute(root, "v3/tooling")
     let bannedEntries: str[] = [
@@ -2538,6 +2608,28 @@ fn v3GateVerifyOrphanGuard(root: str): int32 =
         if v3GateTextContainsAny(text, bannedEntries):
             v3GatePrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
             return 1
+    var orphanBefore: str[] = []
+    if v3GateReadChengOrphanSnapshot(root,
+                                     "orphan_guard_before",
+                                     "artifacts/v3_gate/orphan_guard_before.log",
+                                     orphanBefore) != 0:
+        return 1
+    if v3GateBootstrapBridge(root) != 0:
+        return 1
+    if v3GateBuildBackendDriver(root) != 0:
+        return 1
+    var orphanAfter: str[] = []
+    if v3GateReadChengOrphanSnapshot(root,
+                                     "orphan_guard_after",
+                                     "artifacts/v3_gate/orphan_guard_after.log",
+                                     orphanAfter) != 0:
+        return 1
+    let orphanDelta = v3GateCollectNewOrphanKeys(orphanBefore, orphanAfter)
+    if orphanDelta.len > 0:
+        v3GatePrintErr("verify_orphan_guard_v3: new Cheng U/UE process leaked after bootstrap/build")
+        for i in 0..<orphanDelta.len:
+            v3GatePrintErr(orphanDelta[i])
+        return 1
     v3GatePrintLine("verify_orphan_guard_v3 ok")
     return 0
 
@@ -4893,6 +4985,8 @@ fn v3GateVerifyDebugRuntime(root: str): int32 =
     let expectedDebugSource: str = v3path.v3PathAbsolute(root, "v3/src/runtime/debug_runtime_stub_v3.cheng")
     let expectedProgramSupportSource: str =
         v3path.v3PathAbsolute(root, "v3/src/runtime/program_support_backend_v3.cheng")
+    let expectedProgramSupportHostSource: str =
+        v3path.v3PathAbsolute(root, "v3/src/runtime/program_support_host_runtime_v3.cheng")
     let expectedProgramArgvSource: str =
         v3path.v3PathAbsolute(root, "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng")
     let expectedToolingArgvSource: str =
@@ -4906,7 +5000,8 @@ fn v3GateVerifyDebugRuntime(root: str): int32 =
                                               expectedProgramArgvSource,
                                               expectedCoreSource,
                                               expectedDebugSource,
-                                              expectedProgramSupportSource
+                                              expectedProgramSupportSource,
+                                              expectedProgramSupportHostSource
                                           ]):
         return 1
     if !v3GateVerifyPureChengProviderPlan(root,
@@ -4918,7 +5013,8 @@ fn v3GateVerifyDebugRuntime(root: str): int32 =
                                               expectedToolingArgvSource,
                                               expectedCoreSource,
                                               expectedDebugSource,
-                                              expectedProgramSupportSource
+                                              expectedProgramSupportSource,
+                                              expectedProgramSupportHostSource
                                           ]):
         return 1
     if v3GateBuildPanicTrace(root) != 0:
@@ -5077,11 +5173,8 @@ fn v3GateSlice(root: str): int32 =
         v3GatePrintLine("[v3 gate] frozen-vs-latest C baseline")
         if v3GateCompareBench(root, baselinePath, candidatePath, int64(0)) != 0:
             return 1
-    v3GatePrintLine("[v3 gate] bootstrap bridge")
-    if v3GateBootstrapBridge(root) != 0:
-        return 1
-    v3GatePrintLine("[v3 gate] canonical backend driver")
-    if v3GateBuildBackendDriver(root) != 0:
+    v3GatePrintLine("[v3 gate] orphan guard + bootstrap path")
+    if v3GateVerifyOrphanGuard(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] zero-exit ordinary compile")
     if v3GateBuildZeroExit(root) != 0:
@@ -5094,9 +5187,6 @@ fn v3GateSlice(root: str): int32 =
         return 1
     v3GatePrintLine("[v3 gate] signal-trace ordinary compile")
     if v3GateBuildSignalTrace(root) != 0:
-        return 1
-    v3GatePrintLine("[v3 gate] orphan guard")
-    if v3GateVerifyOrphanGuard(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] debug tools")
     if v3GateRunStage3Command(root,
@@ -5154,6 +5244,9 @@ fn v3GateSlice(root: str): int32 =
         return 1
     v3GatePrintLine("[v3 gate] remote x86 linux release gate")
     if v3GateVerifyX86LinuxRemote(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] chain_node three-node smoke")
+    if v3GateRunChainNodeThreeNodeSmoke(root, []) != 0:
         return 1
     v3GatePrintLine("[v3 gate] bft three-node verify")
     if v3GateVerifyBftValidatorThreeNode(root) != 0:

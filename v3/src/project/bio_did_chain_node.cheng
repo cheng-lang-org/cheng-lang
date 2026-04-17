@@ -327,14 +327,32 @@ fn v3BioDidOperatorKindIndexZero(): V3BioDidOperatorKindIndex =
 
 fn v3BioDidChainStateZero(node: chain.V3ChainNode): V3BioDidChainState =
     var out: V3BioDidChainState
-    out.node = node
+    v3BioDidChainStateZeroInto(out, node)
+    return out
+
+fn v3BioDidChainStateZeroInto(out: var V3BioDidChainState, node: chain.V3ChainNode) =
+    chain.v3ChainNodeCopyInto(out.node, node)
     out.operatorIndex = v3BioDidOperatorIndexZero()
     out.operatorKindIndex = v3BioDidOperatorKindIndexZero()
     out.operatorAnchorSeq = 0
-    return out
 
 fn v3BioDidChainStateInit(nodeId: str, addressSeed: str): V3BioDidChainState =
-    return v3BioDidChainStateZero(chain.v3ChainNodeInit(nodeId, addressSeed))
+    var out: V3BioDidChainState
+    let initRes = v3BioDidChainStateInitInto(out, nodeId, addressSeed)
+    if IsErr(initRes):
+        panic(Error(initRes))
+    return out
+
+fn v3BioDidChainStateInitInto(out: var V3BioDidChainState,
+                              nodeId: str,
+                              addressSeed: str): Result[bool] =
+    let initRes = chain.v3ChainNodeInitInto(out.node, nodeId, addressSeed)
+    if IsErr(initRes):
+        return Err[bool](Error(initRes))
+    out.operatorIndex = v3BioDidOperatorIndexZero()
+    out.operatorKindIndex = v3BioDidOperatorKindIndexZero()
+    out.operatorAnchorSeq = 0
+    return Ok[bool](true)
 
 fn v3BioDidOperatorIndexRoundUpPow2(x0: int32): int32 =
     if x0 < 2:
@@ -1996,21 +2014,48 @@ fn v3BioDidChainStateSyncOperatorIndex(state: var V3BioDidChainState): Result[bo
     return Ok[bool](changed)
 
 fn v3BioDidChainStateFromNode(node: chain.V3ChainNode): Result[V3BioDidChainState] =
-    var out = v3BioDidChainStateZero(node)
+    var out: V3BioDidChainState
+    let buildRes = v3BioDidChainStateFromNodeInto(out, node)
+    if IsErr(buildRes):
+        return Err[V3BioDidChainState](Error(buildRes))
+    return Ok[V3BioDidChainState](out)
+
+fn v3BioDidChainStateFromNodeInto(out: var V3BioDidChainState,
+                                  node: chain.V3ChainNode): Result[bool] =
+    v3BioDidChainStateZeroInto(out, node)
     let syncRes = v3BioDidChainStateSyncOperatorIndex(out)
     if IsErr(syncRes):
-        return Err[V3BioDidChainState](Error(syncRes))
-    return Ok[V3BioDidChainState](out)
+        return Err[bool](Error(syncRes))
+    return Ok[bool](true)
 
 fn v3BioDidChainStateReplayFromSnapshot(nodeId: str,
                                         addressSeed: str,
                                         snapshot: chain.V3ChainNodeServeSnapshot):
                                         Result[V3BioDidChainState] =
-    let initNode = chain.v3ChainNodeInit(nodeId, addressSeed)
-    let nodeRes = chain.v3ChainNodeReplayFromSnapshot(nodeId, initNode.address, snapshot)
-    if IsErr(nodeRes):
-        return Err[V3BioDidChainState](Error(nodeRes))
-    return v3BioDidChainStateFromNode(Value(nodeRes))
+    var out: V3BioDidChainState
+    let replayRes = v3BioDidChainStateReplayFromSnapshotInto(out, nodeId, addressSeed, snapshot)
+    if IsErr(replayRes):
+        return Err[V3BioDidChainState](Error(replayRes))
+    return Ok[V3BioDidChainState](out)
+
+fn v3BioDidChainStateReplayFromSnapshotInto(out: var V3BioDidChainState,
+                                            nodeId: str,
+                                            addressSeed: str,
+                                            snapshot: chain.V3ChainNodeServeSnapshot):
+                                            Result[bool] =
+    let addressRes = chain.v3ChainNodeAddressFromSeed(addressSeed)
+    if IsErr(addressRes):
+        return Err[bool](Error(addressRes))
+    let replayRes = chain.v3ChainNodeReplayFromSnapshotInto(out.node,
+                                                            nodeId,
+                                                            Value(addressRes),
+                                                            snapshot)
+    if IsErr(replayRes):
+        return Err[bool](Error(replayRes))
+    out.operatorIndex = v3BioDidOperatorIndexZero()
+    out.operatorKindIndex = v3BioDidOperatorKindIndexZero()
+    out.operatorAnchorSeq = 0
+    return v3BioDidChainStateSyncOperatorIndex(out)
 
 fn v3BioDidOperatorLookupJsonFromState(state: var V3BioDidChainState,
                                        operatorIdHex: str): str =

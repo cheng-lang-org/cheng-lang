@@ -203,16 +203,16 @@ fn v3ChainNodeLibp2pDecodeSignature(span: layout.ByteSpan,
         return Err[int32](Error(layerCountRes))
     offset = offset + 4
 
-    var signature: lt.V3AntiEntropySignature
-    signature.stampEpoch = int32(Value(epochRes))
-    signature.stampGanzhi = int32(Value(ganzhiRes))
-    signature.eventCount = int32(Value(eventCountRes))
-    signature.accountCount = int32(Value(accountCountRes))
-    signature.stateForestCid = Value(forestCidRes)
-    signature.layerCount = int32(Value(layerCountRes))
-    if signature.layerCount < 0 || signature.layerCount > 3:
+    out = lt.v3AntiEntropySignatureZero()
+    out.stampEpoch = int32(Value(epochRes))
+    out.stampGanzhi = int32(Value(ganzhiRes))
+    out.eventCount = int32(Value(eventCountRes))
+    out.accountCount = int32(Value(accountCountRes))
+    out.stateForestCid = Value(forestCidRes)
+    out.layerCount = int32(Value(layerCountRes))
+    if out.layerCount < 0 || out.layerCount > 3:
         return Err[int32]("v3 chain_node libp2p: invalid signature layer count")
-    for i in 0..<signature.layerCount:
+    for i in 0..<out.layerCount:
         let layerIdRes = codec.v3ReadU32BE(span, offset)
         if IsErr(layerIdRes):
             return Err[int32](Error(layerIdRes))
@@ -234,15 +234,15 @@ fn v3ChainNodeLibp2pDecodeSignature(span: layout.ByteSpan,
         summary.treeCid = Value(treeCidRes)
         summary.nodeCount = int32(Value(nodeCountRes))
         summary.entryCount = int32(Value(entryCountRes))
-        signature.layerSummaries[i] = summary
+        out.layerSummaries[i] = summary
     let rootCountRes = codec.v3ReadU32BE(span, offset)
     if IsErr(rootCountRes):
         return Err[int32](Error(rootCountRes))
     offset = offset + 4
-    signature.rootCount = int32(Value(rootCountRes))
-    if signature.rootCount < 0 || signature.rootCount > lt.v3BaguaRootSummaryMax:
+    out.rootCount = int32(Value(rootCountRes))
+    if out.rootCount < 0 || out.rootCount > lt.v3BaguaRootSummaryMax:
         return Err[int32]("v3 chain_node libp2p: invalid signature root count")
-    for i in 0..<signature.rootCount:
+    for i in 0..<out.rootCount:
         let layerIdRes = codec.v3ReadU32BE(span, offset)
         if IsErr(layerIdRes):
             return Err[int32](Error(layerIdRes))
@@ -264,8 +264,7 @@ fn v3ChainNodeLibp2pDecodeSignature(span: layout.ByteSpan,
         root.baguaId = int32(Value(baguaIdRes))
         root.nodeCid = Value(nodeCidRes)
         root.entryDescCount = int32(Value(entryDescCountRes))
-        signature.rootSummaries[i] = root
-    out = signature
+        out.rootSummaries[i] = root
     return Ok[int32](offset)
 
 fn v3ChainNodeLibp2pAppendEvent(buf: var layout.ByteBuf,
@@ -424,8 +423,7 @@ fn v3ChainNodeLibp2pDecodeSnapshotFill(payload: Bytes,
     if IsErr(tipEventCidRes):
         return Err[bool](Error(tipEventCidRes))
     offset = offset + 32
-    var signature: lt.V3AntiEntropySignature
-    let signatureNextOffsetRes = v3ChainNodeLibp2pDecodeSignature(span, offset, signature)
+    let signatureNextOffsetRes = v3ChainNodeLibp2pDecodeSignature(span, offset, out.signature)
     if IsErr(signatureNextOffsetRes):
         return Err[bool](Error(signatureNextOffsetRes))
     offset = int32(Value(signatureNextOffsetRes))
@@ -436,10 +434,8 @@ fn v3ChainNodeLibp2pDecodeSnapshotFill(payload: Bytes,
     let eventCount = int32(Value(eventCountRes))
     if eventCount < 0:
         return Err[bool]("v3 chain_node libp2p: invalid event count")
-    var eventCids: layout.FixedBytes32[]
-    var events: consensus.V3ChainEvent[]
-    eventCids = []
-    events = []
+    out.eventCids = []
+    out.events = []
     for i in 0..<eventCount:
         var eventCid: layout.FixedBytes32
         var event: consensus.V3ChainEvent
@@ -447,23 +443,23 @@ fn v3ChainNodeLibp2pDecodeSnapshotFill(payload: Bytes,
         if IsErr(eventNextOffsetRes):
             return Err[bool](Error(eventNextOffsetRes))
         offset = int32(Value(eventNextOffsetRes))
-        add(eventCids, eventCid)
-        add(events, event)
-    var forest: lt.V3StateLayerForest
-    forest.forestCid = signature.stateForestCid
+        add(out.eventCids, eventCid)
+        add(out.events, event)
     out.nodeId = ""
     out.address = Value(addressRes)
     out.serveCount = int32(Value(serveCountRes))
     out.tipEventCid = Value(tipEventCidRes)
-    out.eventCids = eventCids
-    out.events = events
-    out.forest = forest
-    out.signature = signature
+    out.forest = lt.v3StateLayerForestZero()
+    out.forest.forestCid = out.signature.stateForestCid
     return Ok[bool](true)
+
+fn v3ChainNodeLibp2pDecodeSnapshotInto(payload: Bytes,
+                                       out: var chain_node.V3ChainNodeServeSnapshot): Result[bool] =
+    return v3ChainNodeLibp2pDecodeSnapshotFill(payload, out)
 
 fn v3ChainNodeLibp2pDecodeSnapshot(payload: Bytes): Result[chain_node.V3ChainNodeServeSnapshot] =
     var out: chain_node.V3ChainNodeServeSnapshot
-    let fillRes = v3ChainNodeLibp2pDecodeSnapshotFill(payload, out)
+    let fillRes = v3ChainNodeLibp2pDecodeSnapshotInto(payload, out)
     if IsErr(fillRes):
         return Err[chain_node.V3ChainNodeServeSnapshot](Error(fillRes))
     return Ok[chain_node.V3ChainNodeServeSnapshot](out)

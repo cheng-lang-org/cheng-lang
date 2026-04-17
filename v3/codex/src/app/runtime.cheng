@@ -1,6 +1,7 @@
 import std/os
 import std/os_host_process as hostos
 import std/result
+import std/strformat as strfmt
 import std/strings
 import std/times
 import cheng/codex/core/argv as argvutil
@@ -312,17 +313,19 @@ fn codexMcpAddCommand(home: str): int32 =
     let url = argvutil.codexReadFlagOrDefault("--url", "")
     let commandFlag = argvutil.codexReadFlagOrDefault("--command", "")
     let tailCommand = codexBuildShellCommandAfterMarker(4, "--")
-    var spec = types.codexMcpServerSpecZero()
+    let cwd = argvutil.codexReadFlagOrDefault("--cwd", "")
+    let bearerTokenEnvVar = argvutil.codexReadFlagOrDefault("--bearer-token-env-var", "")
+    var spec: types.CodexMcpServerSpec
     spec.name = name
-    spec.cwd = argvutil.codexReadFlagOrDefault("--cwd", "")
-    spec.bearerTokenEnvVar = argvutil.codexReadFlagOrDefault("--bearer-token-env-var", "")
+    spec.cwd = cwd
+    spec.bearerTokenEnvVar = bearerTokenEnvVar
     spec.enabled = true
     if textutil.codexTextNonEmpty(url):
-        spec.transportKind = "streamable_http"
-        spec.url = url
         if textutil.codexTextNonEmpty(commandFlag) || textutil.codexTextNonEmpty(tailCommand):
             codexPrintErr("codex mcp add: choose either --url or a command after --")
             return 1
+        spec.transportKind = "streamable_http"
+        spec.url = url
     else:
         var launchCommand = commandFlag
         if !textutil.codexTextNonEmpty(launchCommand):
@@ -353,7 +356,7 @@ fn codexMcpRemoveCommand(home: str): int32 =
     return 0
 
 fn codexExecCommand(home: str): int32 =
-    var req = types.codexExecRequestZero()
+    var req: types.CodexExecRequest
     req.sessionId = codexResolveSessionFlag()
     req.title = argvutil.codexReadFlagOrDefault("--title", "")
     req.cwd = codexResolveCwd()
@@ -387,11 +390,12 @@ fn codexSessionListText(home: str): str =
     let sessions = store.codexStoreListSessions(home)
     if sessions.len <= 0:
         return "(no sessions)"
-    var out = ""
+    var lines: str[]
     for i in 0..<sessions.len:
         let item = sessions[i]
-        out = out + item.sessionId + " | " + item.title + " | rc=" + intToStr(item.lastExitCode) + "\n"
-    return out
+        add(lines, strfmt.fmt"{item.sessionId} | {item.title} | rc={intToStr(item.lastExitCode)}")
+    add(lines, "")
+    return strfmt.lines(lines)
 
 fn codexScreenClearText(): str =
     let esc = strings.charToStr(char(27))
@@ -413,14 +417,15 @@ fn codexStdinReadLine(prompt: str): str =
     return out
 
 fn codexTuiHeader(session: types.CodexSession): str =
-    var out = ""
-    out = out + "Codex v3\n"
-    out = out + "session: " + session.sessionId + "\n"
-    out = out + "title:   " + session.title + "\n"
-    out = out + "cwd:     " + session.cwd + "\n"
-    out = out + "help: /shell <cmd> | /sessions | /resume <id> | /title <text> | /quit\n"
-    out = out + "------------------------------------------------------------\n"
-    return out
+    return strfmt.lines([
+        "Codex v3",
+        strfmt.fmt"session: {session.sessionId}",
+        strfmt.fmt"title:   {session.title}",
+        strfmt.fmt"cwd:     {session.cwd}",
+        "help: /shell <cmd> | /sessions | /resume <id> | /title <text> | /quit",
+        "------------------------------------------------------------",
+        ""
+    ])
 
 fn codexTuiRender(session: types.CodexSession) =
     os.write(os.get_stdout(), codexScreenClearText())
@@ -442,7 +447,7 @@ fn codexTuiExec(home: str,
             engine.codexAppendTurn(session, promptText, commandText, "approval denied", 126, false)
             let saveRes = store.codexStoreSessionWrite(home, session)
             return false
-    var req = types.codexExecRequestZero()
+    var req: types.CodexExecRequest
     req.sessionId = session.sessionId
     req.title = session.title
     req.cwd = session.cwd
@@ -468,7 +473,7 @@ fn codexLoadResumeTarget(home: str): Result[types.CodexSession] =
     return store.codexStoreLoadLastSession(home)
 
 fn codexTuiRun(home: str, createIfMissing: bool): int32 =
-    var session = types.codexSessionZero()
+    var session: types.CodexSession
     let resumeRes = codexLoadResumeTarget(home)
     if IsOk(resumeRes):
         session = Value(resumeRes)

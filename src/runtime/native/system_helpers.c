@@ -80,7 +80,7 @@
 #define CHENG_TARGET_APPLE_MOBILE 0
 #endif
 #include "cheng_sidecar_loader.h"
-#include "../../../v3/runtime/native/v3_str_twoway_search.h"
+#include "cheng_twoway_search.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
@@ -11821,25 +11821,29 @@ int32_t cheng_pty_spawn(const char* command, const char* workingDir, int32_t* ou
 #endif
 }
 
-int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid) {
+static int32_t cheng_pipe_spawn_fork(const char* command, const char* workingDir,
+                                     int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid) {
 #if defined(_WIN32)
+    (void)command;
+    (void)workingDir;
     if (outReadFd) *outReadFd = -1;
     if (outWriteFd) *outWriteFd = -1;
     if (outPid) *outPid = -1;
     return 0;
 #else
+    int in_pipe[2];
+    int out_pipe[2];
+    pid_t pid = -1;
     if (outReadFd) *outReadFd = -1;
     if (outWriteFd) *outWriteFd = -1;
     if (outPid) *outPid = -1;
-    int in_pipe[2];
-    int out_pipe[2];
     if (pipe(in_pipe) != 0) return 0;
     if (pipe(out_pipe) != 0) {
         close(in_pipe[0]);
         close(in_pipe[1]);
         return 0;
     }
-    pid_t pid = fork();
+    pid = fork();
     if (pid < 0) {
         close(in_pipe[0]);
         close(in_pipe[1]);
@@ -11867,13 +11871,107 @@ int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* o
     }
     close(in_pipe[0]);
     close(out_pipe[1]);
-    int flags = fcntl(out_pipe[0], F_GETFL);
-    if (flags != -1) {
-        fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    {
+        int flags = fcntl(out_pipe[0], F_GETFL);
+        if (flags != -1) {
+            fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        flags = fcntl(in_pipe[1], F_GETFL);
+        if (flags != -1) {
+            fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
     }
-    flags = fcntl(in_pipe[1], F_GETFL);
-    if (flags != -1) {
-        fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    if (outReadFd) *outReadFd = out_pipe[0];
+    if (outWriteFd) *outWriteFd = in_pipe[1];
+    if (outPid) *outPid = (int64_t)pid;
+    return 1;
+#endif
+}
+
+int32_t cheng_pipe_spawn(const char* command, const char* workingDir, int32_t* outReadFd, int32_t* outWriteFd, int64_t* outPid) {
+#if defined(_WIN32)
+    if (outReadFd) *outReadFd = -1;
+    if (outWriteFd) *outWriteFd = -1;
+    if (outPid) *outPid = -1;
+    return 0;
+#elif defined(__ANDROID__)
+    return cheng_pipe_spawn_fork(command, workingDir, outReadFd, outWriteFd, outPid);
+#else
+    if (outReadFd) *outReadFd = -1;
+    if (outWriteFd) *outWriteFd = -1;
+    if (outPid) *outPid = -1;
+    int in_pipe[2];
+    int out_pipe[2];
+    posix_spawn_file_actions_t actions;
+    pid_t pid = -1;
+    int spawnRc = 0;
+    char* shellArgv[3];
+    char* commandArgv[4];
+    const char* shell = getenv("SHELL");
+    if (workingDir && workingDir[0] && !cheng_exec_spawn_addchdir_supported()) {
+        return cheng_pipe_spawn_fork(command, workingDir, outReadFd, outWriteFd, outPid);
+    }
+    if (!shell || !shell[0]) shell = "/bin/sh";
+    if (pipe(in_pipe) != 0) return 0;
+    if (pipe(out_pipe) != 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        return 0;
+    }
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        return 0;
+    }
+    if (cheng_exec_spawn_addchdir(&actions, workingDir) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, in_pipe[0], STDIN_FILENO) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDOUT_FILENO) != 0 ||
+        posix_spawn_file_actions_adddup2(&actions, out_pipe[1], STDERR_FILENO) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, in_pipe[0]) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, in_pipe[1]) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, out_pipe[0]) != 0 ||
+        posix_spawn_file_actions_addclose(&actions, out_pipe[1]) != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        return 0;
+    }
+    if (command && command[0]) {
+        commandArgv[0] = (char*)"sh";
+        commandArgv[1] = (char*)"-lc";
+        commandArgv[2] = (char*)command;
+        commandArgv[3] = NULL;
+        spawnRc = posix_spawn(&pid, "/bin/sh", &actions, NULL, commandArgv, environ);
+    } else {
+        shellArgv[0] = (char*)shell;
+        shellArgv[1] = (char*)"-l";
+        shellArgv[2] = NULL;
+        spawnRc = posix_spawnp(&pid, shell, &actions, NULL, shellArgv, environ);
+    }
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawnRc != 0) {
+        close(in_pipe[0]);
+        close(in_pipe[1]);
+        close(out_pipe[0]);
+        close(out_pipe[1]);
+        return 0;
+    }
+    close(in_pipe[0]);
+    close(out_pipe[1]);
+    (void)setpgid(pid, pid);
+    {
+        int flags = fcntl(out_pipe[0], F_GETFL);
+        if (flags != -1) {
+            fcntl(out_pipe[0], F_SETFL, flags | O_NONBLOCK);
+        }
+        flags = fcntl(in_pipe[1], F_GETFL);
+        if (flags != -1) {
+            fcntl(in_pipe[1], F_SETFL, flags | O_NONBLOCK);
+        }
     }
     if (outReadFd) *outReadFd = out_pipe[0];
     if (outWriteFd) *outWriteFd = in_pipe[1];

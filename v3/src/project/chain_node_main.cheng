@@ -195,52 +195,123 @@ fn v3ChainNodeExtractStateText(text: str,
     return true
 
 fn v3ChainNodeLoadState(pathRaw: str): Result[node.V3ChainNode] =
+    var out: node.V3ChainNode
+    let loadRes = v3ChainNodeLoadStateInto(out, pathRaw)
+    if IsErr(loadRes):
+        return Err[node.V3ChainNode](Error(loadRes))
+    return Ok[node.V3ChainNode](out)
+
+fn v3ChainNodeLoadStateInto(out: var node.V3ChainNode, pathRaw: str): Result[bool] =
     let currentDir = os.getCurrentDir()
     let absolutePath = v3path.v3PathAbsolute(currentDir, pathRaw)
     let text = v3path.v3ReadTextFile(currentDir, pathRaw)
     let trimmedText = strutil.strip(text)
     if len(trimmedText) <= 0:
-        return Err[node.V3ChainNode]("v3 chain_node: missing or empty state file: " + absolutePath)
+        return Err[bool]("v3 chain_node: missing or empty state file: " + absolutePath)
     var nodeId = ""
     var payloadHex = ""
     if !v3ChainNodeExtractStateText(text, nodeId, payloadHex):
-        return Err[node.V3ChainNode]("v3 chain_node: invalid state file: " + absolutePath)
+        return Err[bool]("v3 chain_node: invalid state file: " + absolutePath)
     let payloadRes = v3ChainNodeBytesFromHex(payloadHex)
     if IsErr(payloadRes):
-        return Err[node.V3ChainNode](Error(payloadRes))
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(Value(payloadRes))
+        return Err[bool](Error(payloadRes))
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), snapshot)
     if IsErr(snapshotRes):
-        return Err[node.V3ChainNode](Error(snapshotRes))
-    let snapshot = Value(snapshotRes)
-    let replayRes = node.v3ChainNodeReplayFromSnapshot(nodeId,
-                                                       snapshot.address,
-                                                       snapshot)
+        return Err[bool](Error(snapshotRes))
+    let replayRes = node.v3ChainNodeReplayFromSnapshotInto(out,
+                                                           nodeId,
+                                                           snapshot.address,
+                                                           snapshot)
     if IsErr(replayRes):
-        return Err[node.V3ChainNode](Error(replayRes))
-    return Ok[node.V3ChainNode](Value(replayRes))
+        return Err[bool](Error(replayRes))
+    return Ok[bool](true)
 
 fn v3ChainNodeLoadOrInitForSync(statePath: str): Result[node.V3ChainNode] =
+    var out: node.V3ChainNode
+    let loadRes = v3ChainNodeLoadOrInitForSyncInto(out, statePath)
+    if IsErr(loadRes):
+        return Err[node.V3ChainNode](Error(loadRes))
+    return Ok[node.V3ChainNode](out)
+
+fn v3ChainNodeLoadOrInitForSyncInto(out: var node.V3ChainNode, statePath: str): Result[bool] =
     if v3path.v3PathFileExists(v3path.v3PathAbsolute(os.getCurrentDir(), statePath)):
-        return v3ChainNodeLoadState(statePath)
+        return v3ChainNodeLoadStateInto(out, statePath)
     var nodeId = ""
     let nodeIdRes = v3ChainNodeReadRequiredFlag("--node-id", nodeId)
     if IsErr(nodeIdRes):
-        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
     var addressSeed = ""
     let seedRes = v3ChainNodeReadRequiredFlag("--address-seed", addressSeed)
     if IsErr(seedRes):
-        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
-    return Ok[node.V3ChainNode](node.v3ChainNodeInit(nodeId, addressSeed))
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    return node.v3ChainNodeInitInto(out, nodeId, addressSeed)
 
 fn v3ChainNodeLoadBioDidState(pathRaw: str): Result[bio_did.V3BioDidChainState] =
-    let loadRes = v3ChainNodeLoadState(pathRaw)
+    var out: bio_did.V3BioDidChainState
+    let loadRes = v3ChainNodeLoadBioDidStateInto(out, pathRaw)
     if IsErr(loadRes):
         return Err[bio_did.V3BioDidChainState](Error(loadRes))
-    return bio_did.v3BioDidChainStateFromNode(Value(loadRes))
+    return Ok[bio_did.V3BioDidChainState](out)
+
+fn v3ChainNodeLoadBioDidStateInto(out: var bio_did.V3BioDidChainState,
+                                  pathRaw: str): Result[bool] =
+    let loadRes = v3ChainNodeLoadStateInto(out.node, pathRaw)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    out.operatorIndex = bio_did.v3BioDidOperatorIndexZero()
+    out.operatorKindIndex = bio_did.v3BioDidOperatorKindIndexZero()
+    out.operatorAnchorSeq = 0
+    return bio_did.v3BioDidChainStateSyncOperatorIndex(out)
+
+fn v3ChainNodeAppendCsvKinds(out: var str[], csvText: str) =
+    let total = strings.len(csvText)
+    var start = 0
+    for i in 0..total:
+        var stop = false
+        if i == total:
+            stop = true
+        elif csvText[i] == ',':
+            stop = true
+        if !stop:
+            continue
+        let part = strutil.strip(strings.sliceBytes(csvText, start, i - start))
+        if len(part) > 0:
+            add(out, part)
+        start = i + 1
+
+fn v3ChainNodeBioDidOperatorLookupText(statePath: str,
+                                       operatorIdHex: str,
+                                       preferredKindsText: str): Result[str] =
+    var trimmedStatePath = ""
+    trimmedStatePath = strutil.strip(statePath)
+    if len(trimmedStatePath) <= 0:
+        return Err[str]("v3 chain_node: missing --state")
+    var trimmedOperatorId = ""
+    trimmedOperatorId = strutil.strip(operatorIdHex)
+    if len(trimmedOperatorId) <= 0:
+        return Err[str]("v3 chain_node: missing --operator-id")
+    let stateRes = v3ChainNodeLoadBioDidState(trimmedStatePath)
+    if IsErr(stateRes):
+        return Err[str](Error(stateRes))
+    var state = Value(stateRes)
+    var preferredKinds: str[]
+    preferredKinds.len = 0
+    var trimmedPreferredKindsText = ""
+    trimmedPreferredKindsText = strutil.strip(preferredKindsText)
+    if len(trimmedPreferredKindsText) > 0:
+        v3ChainNodeAppendCsvKinds(preferredKinds, trimmedPreferredKindsText)
+    return Ok[str](bio_did.v3BioDidOperatorLookupJsonFromStateWithKinds(state,
+                                                                        trimmedOperatorId,
+                                                                        preferredKinds))
 
 fn v3ChainNodeMainSelfTest(): int32 =
-    var server = node.v3ChainNodeInit("node-a", "chain-node-a")
-    var client = node.v3ChainNodeInit("node-b", "chain-node-b")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "node-a", "chain-node-a")),
+           "v3 chain_node main: init server")
+    var client: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(client, "node-b", "chain-node-b")),
+           "v3 chain_node main: init client")
 
     let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
     assert(mintCidRes.ok, "v3 chain_node main: mint")
@@ -299,7 +370,11 @@ fn v3ChainNodeInitCommand(): int32 =
     if IsErr(seedRes):
         os.writeLine(os.get_stderr(), Error(seedRes))
         return 2
-    var state = node.v3ChainNodeInit(nodeId, addressSeed)
+    var state: node.V3ChainNode
+    let initRes = node.v3ChainNodeInitInto(state, nodeId, addressSeed)
+    if IsErr(initRes):
+        os.writeLine(os.get_stderr(), Error(initRes))
+        return 2
     let snapshot = node.v3ChainNodeServeOnce(state)
     if !v3ChainNodeWriteSnapshotState(statePath, snapshot):
         os.writeLine(os.get_stderr(), "v3 chain_node: failed to write state: " + absoluteStatePath)
@@ -409,24 +484,13 @@ fn v3ChainNodeBioDidOperatorLookupCommand(): int32 =
     if IsErr(readRes):
         os.writeLine(os.get_stderr(), Error(readRes))
         return 2
-    let stateRes = v3ChainNodeLoadBioDidState(statePath)
-    if IsErr(stateRes):
-        os.writeLine(os.get_stderr(), Error(stateRes))
-        return 2
-    var state = Value(stateRes)
-    var preferredKinds: str[]
-    preferredKinds.len = 0
     var preferredKindsText = ""
-    if cmdline.readFirstFlagValue("--preferred-kinds", preferredKindsText):
-        let parts = strutil.split(preferredKindsText, ',')
-        for i in 0..<parts.len:
-            let trimmed = strutil.strip(parts[i])
-            if len(trimmed) > 0:
-                add(preferredKinds, trimmed)
-    os.writeLine(os.get_stdout(),
-                 bio_did.v3BioDidOperatorLookupJsonFromStateWithKinds(state,
-                                                                      operatorIdHex,
-                                                                      preferredKinds))
+    cmdline.readFirstFlagValue("--preferred-kinds", preferredKindsText)
+    let lookupRes = v3ChainNodeBioDidOperatorLookupText(statePath, operatorIdHex, preferredKindsText)
+    if IsErr(lookupRes):
+        os.writeLine(os.get_stderr(), Error(lookupRes))
+        return 2
+    os.writeLine(os.get_stdout(), Value(lookupRes))
     return 0
 
 fn v3ChainNodeShowStateCommand(): int32 =
@@ -511,11 +575,12 @@ fn v3ChainNodeSyncOnceCommand(): int32 =
     if IsErr(payloadRes):
         os.writeLine(os.get_stderr(), Error(payloadRes))
         return 2
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(Value(payloadRes))
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), snapshot)
     if IsErr(snapshotRes):
         os.writeLine(os.get_stderr(), Error(snapshotRes))
         return 2
-    let syncRes = node.v3ChainNodeSyncOnce(state, Value(snapshotRes))
+    let syncRes = node.v3ChainNodeSyncOnce(state, snapshot)
     if IsErr(syncRes):
         os.writeLine(os.get_stderr(), Error(syncRes))
         return 2

@@ -2,6 +2,7 @@ import std/monotimes
 import std/os
 import std/os_host_process as hostos
 import std/result
+import std/strformat as strfmt
 import std/strings
 import std/times
 import cheng/codex/core/store
@@ -27,12 +28,11 @@ fn codexDefaultTitle(promptText: str, commandText: str, sessionId: str): str =
     return sessionId
 
 fn codexNewSession(cwd: str, title: str, promptText: str, commandText: str): types.CodexSession =
-    var out = types.codexSessionZero()
+    var out: types.CodexSession
     out.sessionId = codexSessionId()
     out.cwd = cwd
     out.createdAt = codexNowUnix()
     out.updatedAt = out.createdAt
-    out.lastExitCode = -1
     if textutil.codexTextNonEmpty(title):
         out.title = title
     else:
@@ -65,13 +65,13 @@ fn codexAppendTurn(session: var types.CodexSession,
                    outputText: str,
                    exitCode: int32,
                    approved: bool) =
-    var turn = types.codexTurnZero()
+    var turn: types.CodexTurn
     turn.promptText = promptText
     turn.commandText = commandText
     turn.outputText = outputText
+    turn.assistantText = codexAssistantSummary(exitCode, outputText)
     turn.exitCode = exitCode
     turn.approved = approved
-    turn.assistantText = codexAssistantSummary(exitCode, outputText)
     add(session.turns, turn)
     session.updatedAt = codexNowUnix()
     session.lastExitCode = exitCode
@@ -94,20 +94,20 @@ fn codexSandboxAllowWriteRule(path: str): str =
         codexSandboxProfilePathText(path) + "))\n"
 
 fn codexSandboxProfileText(writableRoot: str): str =
-    var out = ""
-    out = out + "(version 1)\n"
-    out = out + "(deny default)\n"
-    out = out + "(allow process*)\n"
-    out = out + "(allow file-read*)\n"
-    out = out + "(allow file-read* file-test-existence file-write-data (literal \"/dev/null\"))\n"
-    out = out + "(allow file-read-data file-test-existence file-write-data (subpath \"/dev/fd\"))\n"
-    out = out + "(allow file-read* file-test-existence file-write* (subpath \"/tmp\"))\n"
-    out = out + "(allow file-read* file-write* (subpath \"/private/tmp\"))\n"
-    out = out + "(allow file-read* file-write* (subpath \"/var/tmp\"))\n"
-    out = out + "(allow file-read* file-write* (subpath \"/private/var/tmp\"))\n"
+    var parts: str[]
+    add(parts, "(version 1)\n")
+    add(parts, "(deny default)\n")
+    add(parts, "(allow process*)\n")
+    add(parts, "(allow file-read*)\n")
+    add(parts, "(allow file-read* file-test-existence file-write-data (literal \"/dev/null\"))\n")
+    add(parts, "(allow file-read-data file-test-existence file-write-data (subpath \"/dev/fd\"))\n")
+    add(parts, "(allow file-read* file-test-existence file-write* (subpath \"/tmp\"))\n")
+    add(parts, "(allow file-read* file-write* (subpath \"/private/tmp\"))\n")
+    add(parts, "(allow file-read* file-write* (subpath \"/var/tmp\"))\n")
+    add(parts, "(allow file-read* file-write* (subpath \"/private/var/tmp\"))\n")
     if textutil.codexTextNonEmpty(writableRoot):
-        out = out + codexSandboxAllowWriteRule(writableRoot)
-    return out
+        add(parts, codexSandboxAllowWriteRule(writableRoot))
+    return strfmt.fmt(parts)
 
 fn codexSandboxWritableRoot(cwd: str, writableRoot: str): str =
     if !textutil.codexTextNonEmpty(writableRoot):
@@ -136,7 +136,7 @@ fn codexExecuteShell(home: str,
     let saveRes = store.codexStoreSessionWrite(home, session)
     if IsErr(saveRes):
         return Err[types.CodexExecResult](Error(saveRes))
-    var out = types.codexExecResultZero()
+    var out: types.CodexExecResult
     out.ok = exitCode == 0
     out.exitCode = exitCode
     out.outputText = outputText
@@ -144,13 +144,13 @@ fn codexExecuteShell(home: str,
     return Ok[types.CodexExecResult](out)
 
 fn codexSessionRenderSummary(session: types.CodexSession): str =
-    var out = ""
-    out = out + "session_id=" + session.sessionId + "\n"
-    out = out + "title=" + session.title + "\n"
-    out = out + "cwd=" + session.cwd + "\n"
-    out = out + "turn_count=" + intToStr(session.turns.len) + "\n"
-    out = out + "last_exit_code=" + intToStr(session.lastExitCode)
-    return out
+    return strfmt.lines([
+        strfmt.fmt"session_id={session.sessionId}",
+        strfmt.fmt"title={session.title}",
+        strfmt.fmt"cwd={session.cwd}",
+        strfmt.fmt"turn_count={intToStr(session.turns.len)}",
+        strfmt.fmt"last_exit_code={intToStr(session.lastExitCode)}"
+    ])
 
 fn codexSessionHistoryText(session: types.CodexSession, maxTurns: int32): str =
     if session.turns.len <= 0:
@@ -158,26 +158,26 @@ fn codexSessionHistoryText(session: types.CodexSession, maxTurns: int32): str =
     var start = 0
     if maxTurns > 0 && session.turns.len > maxTurns:
         start = session.turns.len - maxTurns
-    var out = ""
+    var parts: str[]
     for i in start..<session.turns.len:
         let turn = session.turns[i]
-        out = out + "[" + intToStr(i + 1) + "] "
+        add(parts, strfmt.fmt"[{intToStr(i + 1)}] ")
         if textutil.codexTextNonEmpty(turn.promptText):
-            out = out + "prompt: " + turn.promptText + "\n"
+            add(parts, strfmt.fmt"prompt: {turn.promptText}\n")
         if textutil.codexTextNonEmpty(turn.commandText):
-            out = out + "$ " + turn.commandText + "\n"
+            add(parts, strfmt.fmt"$ {turn.commandText}\n")
         if textutil.codexTextNonEmpty(turn.outputText):
-            out = out + turn.outputText
+            add(parts, turn.outputText)
             if len(turn.outputText) <= 0 || turn.outputText[len(turn.outputText) - 1] != '\n':
-                out = out + "\n"
-        out = out + turn.assistantText + "\n"
-    return out
+                add(parts, "\n")
+        add(parts, strfmt.fmt"{turn.assistantText}\n")
+    return strfmt.fmt(parts)
 
 fn codexApplyPatch(cwd: str, patchPath: str): Result[types.CodexExecResult] =
     if !textutil.codexTextNonEmpty(patchPath):
         return Err[types.CodexExecResult]("codex apply: missing --patch")
     let command = "git apply " + os.quoteShell(patchPath)
-    var out = types.codexExecResultZero()
+    var out: types.CodexExecResult
     codexShellCapture(command, cwd, out.outputText, out.exitCode)
     out.ok = out.exitCode == 0
     out.assistantText = codexAssistantSummary(out.exitCode, out.outputText)
@@ -197,7 +197,7 @@ fn codexRunInSandbox(cwd: str, writableRoot: str, commandText: str): Result[type
         strings.int64ToStr(codexNowMonoNs()) + ".sb"
     if !store.codexStoreWriteText(profilePath, codexSandboxProfileText(writeRoot)):
         return Err[types.CodexExecResult]("codex sandbox: failed to write profile")
-    var out = types.codexExecResultZero()
+    var out: types.CodexExecResult
     hostos.osHostProcessExecFileCaptureFill(sandboxExec,
                                             ["-f", profilePath, "/bin/sh", "-lc", commandText],
                                             [],

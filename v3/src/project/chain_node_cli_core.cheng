@@ -182,50 +182,76 @@ fn v3ChainNodeCliExtractStateText(text: str,
     return true
 
 fn v3ChainNodeCliLoadState(pathRaw: str): Result[node.V3ChainNode] =
+    var out: node.V3ChainNode
+    let loadRes = v3ChainNodeCliLoadStateInto(out, pathRaw)
+    if IsErr(loadRes):
+        return Err[node.V3ChainNode](Error(loadRes))
+    return Ok[node.V3ChainNode](out)
+
+fn v3ChainNodeCliLoadStateInto(out: var node.V3ChainNode, pathRaw: str): Result[bool] =
     let path = v3ChainNodeCliAbsolutePath(pathRaw)
     let text = v3path.v3ReadTextFile(v3ChainNodeCliCurrentDir(), pathRaw)
     if len(text) <= 0:
-        return Err[node.V3ChainNode]("v3 chain_node: missing or empty state file: " + path)
+        return Err[bool]("v3 chain_node: missing or empty state file: " + path)
     var nodeId: str
     var payloadHex: str
     nodeId = ""
     payloadHex = ""
     if !v3ChainNodeCliExtractStateText(text, nodeId, payloadHex):
-        return Err[node.V3ChainNode]("v3 chain_node: invalid state file: " + path)
+        return Err[bool]("v3 chain_node: invalid state file: " + path)
     let payloadRes = v3ChainNodeCliBytesFromHex(payloadHex)
     if IsErr(payloadRes):
-        return Err[node.V3ChainNode](Error(payloadRes))
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(Value(payloadRes))
+        return Err[bool](Error(payloadRes))
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(Value(payloadRes), snapshot)
     if IsErr(snapshotRes):
-        return Err[node.V3ChainNode](Error(snapshotRes))
-    let snapshot = Value(snapshotRes)
-    let replayRes = node.v3ChainNodeReplayFromSnapshot(nodeId,
-                                                       snapshot.address,
-                                                       snapshot)
+        return Err[bool](Error(snapshotRes))
+    let replayRes = node.v3ChainNodeReplayFromSnapshotInto(out,
+                                                           nodeId,
+                                                           snapshot.address,
+                                                           snapshot)
     if IsErr(replayRes):
-        return Err[node.V3ChainNode](Error(replayRes))
-    return Ok[node.V3ChainNode](Value(replayRes))
+        return Err[bool](Error(replayRes))
+    return Ok[bool](true)
 
 fn v3ChainNodeCliLoadOrInitForSync(statePath: str): Result[node.V3ChainNode] =
+    var out: node.V3ChainNode
+    let loadRes = v3ChainNodeCliLoadOrInitForSyncInto(out, statePath)
+    if IsErr(loadRes):
+        return Err[node.V3ChainNode](Error(loadRes))
+    return Ok[node.V3ChainNode](out)
+
+fn v3ChainNodeCliLoadOrInitForSyncInto(out: var node.V3ChainNode, statePath: str): Result[bool] =
     if v3ChainNodeCliFileExists(statePath):
-        return v3ChainNodeCliLoadState(statePath)
+        return v3ChainNodeCliLoadStateInto(out, statePath)
     var nodeId: str
     nodeId = ""
     let nodeIdRes = v3ChainNodeCliReadRequiredFlag("--node-id", nodeId)
     if IsErr(nodeIdRes):
-        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
     var addressSeed: str
     addressSeed = ""
     let seedRes = v3ChainNodeCliReadRequiredFlag("--address-seed", addressSeed)
     if IsErr(seedRes):
-        return Err[node.V3ChainNode]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
-    return Ok[node.V3ChainNode](node.v3ChainNodeInit(nodeId, addressSeed))
+        return Err[bool]("v3 chain_node: sync-once missing state; require --node-id and --address-seed")
+    return node.v3ChainNodeInitInto(out, nodeId, addressSeed)
 
 fn v3ChainNodeCliLoadBioDidState(pathRaw: str): Result[bio_did.V3BioDidChainState] =
-    let loadRes = v3ChainNodeCliLoadState(pathRaw)
+    var out: bio_did.V3BioDidChainState
+    let loadRes = v3ChainNodeCliLoadBioDidStateInto(out, pathRaw)
     if IsErr(loadRes):
         return Err[bio_did.V3BioDidChainState](Error(loadRes))
-    return bio_did.v3BioDidChainStateFromNode(Value(loadRes))
+    return Ok[bio_did.V3BioDidChainState](out)
+
+fn v3ChainNodeCliLoadBioDidStateInto(out: var bio_did.V3BioDidChainState,
+                                     pathRaw: str): Result[bool] =
+    let loadRes = v3ChainNodeCliLoadStateInto(out.node, pathRaw)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    out.operatorIndex = bio_did.v3BioDidOperatorIndexZero()
+    out.operatorKindIndex = bio_did.v3BioDidOperatorKindIndexZero()
+    out.operatorAnchorSeq = 0
+    return bio_did.v3BioDidChainStateSyncOperatorIndex(out)
 
 fn v3ChainNodeCliBioDidOperatorLookupJson(statePath: str,
                                           operatorIdHex: str): Result[str] =
@@ -236,10 +262,10 @@ fn v3ChainNodeCliBioDidOperatorLookupJson(statePath: str,
 fn v3ChainNodeCliBioDidOperatorLookupJsonWithKinds(statePath: str,
                                                    operatorIdHex: str,
                                                    preferredKinds: str[]): Result[str] =
-    let stateRes = v3ChainNodeCliLoadBioDidState(statePath)
+    var state: bio_did.V3BioDidChainState
+    let stateRes = v3ChainNodeCliLoadBioDidStateInto(state, statePath)
     if IsErr(stateRes):
         return Err[str](Error(stateRes))
-    var state = Value(stateRes)
     return Ok[str](bio_did.v3BioDidOperatorLookupJsonFromStateWithKinds(state,
                                                                         operatorIdHex,
                                                                         preferredKinds))
@@ -257,8 +283,12 @@ fn v3ChainNodeCliSnapshotReport(snapshot: node.V3ChainNodeServeSnapshot): str =
     return out
 
 fn v3ChainNodeCmdSelfTestMain(): int32 =
-    var server = node.v3ChainNodeInit("node-a", "chain-node-a")
-    var client = node.v3ChainNodeInit("node-b", "chain-node-b")
+    var server: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(server, "node-a", "chain-node-a")),
+           "v3 chain_node cli: init server")
+    var client: node.V3ChainNode
+    assert(IsOk(node.v3ChainNodeInitInto(client, "node-b", "chain-node-b")),
+           "v3 chain_node cli: init client")
     let mintCidRes = node.v3ChainNodeMint(server, 7, 1001, int64(100))
     assert(mintCidRes.ok, "v3 chain_node cli: mint")
     let transferCidRes = node.v3ChainNodeTransfer(server, 7, 1001, 2002, int64(40))
@@ -298,7 +328,11 @@ fn v3ChainNodeCmdInitRun(statePath: str): int32 =
     if len(addressSeed) <= 0:
         echo("v3 chain_node: missing --address-seed")
         return 2
-    var state = node.v3ChainNodeInit(nodeId, addressSeed)
+    var state: node.V3ChainNode
+    let initRes = node.v3ChainNodeInitInto(state, nodeId, addressSeed)
+    if IsErr(initRes):
+        echo(Error(initRes))
+        return 2
     let snapshot = node.v3ChainNodeServeOnce(state)
     if !v3ChainNodeCliWriteState(statePath, snapshot):
         echo("v3 chain_node: failed to write state: " +
@@ -494,11 +528,12 @@ fn v3ChainNodeCmdSyncOnceRun(statePath: str): int32 =
     if !payloadRes.ok:
         echo(payloadRes.error)
         return 2
-    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshot(payloadRes.value)
+    var snapshot: node.V3ChainNodeServeSnapshot
+    let snapshotRes = net.v3ChainNodeLibp2pDecodeSnapshotInto(payloadRes.value, snapshot)
     if IsErr(snapshotRes):
         echo(Error(snapshotRes))
         return 2
-    let syncRes = node.v3ChainNodeSyncOnce(state, Value(snapshotRes))
+    let syncRes = node.v3ChainNodeSyncOnce(state, snapshot)
     if IsErr(syncRes):
         echo(Error(syncRes))
         return 2

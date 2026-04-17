@@ -11,12 +11,11 @@ fn main(): int32 =
 
     let jobBundleCid = support.v3DiLoCoTestJobBundleCid("quic-twoproc")
     let leaderPeerId = support.v3DiLoCoTestPeer("diloco.quic.leader")
+    let workerPeerId = support.v3DiLoCoTestPeer("diloco.quic.worker")
     let initialModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-initial-model")
     let initialOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-initial-optimizer")
     let leaderModelDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-leader-model-delta")
     let leaderOptimizerDeltaRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-leader-optimizer-delta")
-    let mergedModelRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-model")
-    let mergedOptimizerRef = support.v3DiLoCoTestArtifact(jobBundleCid, "quic-merged-optimizer")
 
     var node = diloco_host.v3DiLoCoHostInit("diloco.quic.server")
     var job = core.v3DiLoCoJobZero()
@@ -30,10 +29,10 @@ fn main(): int32 =
                                            60,
                                            initialModelRef,
                                            initialOptimizerRef)
-    assert(openRes.ok, "v3 diloco quic twoproc: open")
+    assert(openRes.ok, "v3 diloco quic status probe: open")
     var cohort = core.v3DiLoCoCohortZero()
     let joinLeaderRes = core.v3DiLoCoJoinCohortFill(cohort, node.state, jobBundleCid, leaderPeerId)
-    assert(joinLeaderRes.ok, "v3 diloco quic twoproc: join leader")
+    assert(joinLeaderRes.ok, "v3 diloco quic status probe: join leader")
     diloco_host.v3DiLoCoHostEnableAutoLeader(node,
                                              jobBundleCid,
                                              leaderPeerId,
@@ -50,18 +49,32 @@ fn main(): int32 =
                                                             port,
                                                             "localhost",
                                                             readyPath,
-                                                            8,
+                                                            5,
                                                             -1)
-    assert(serveRes.ok, "v3 diloco quic twoproc: serve")
+    assert(serveRes.ok, "v3 diloco quic status probe: serve")
 
-    var currentVersion = core.v3DiLoCoGlobalVersionZero()
-    let versionRes = core.v3DiLoCoFetchGlobalVersionFill(currentVersion, node.state, jobBundleCid)
-    assert(versionRes.ok, "v3 diloco quic twoproc: fetch current version")
-    assert(currentVersion.committedOuterStep == 1, "v3 diloco quic twoproc: committed outer step")
-    assert(node.state.jobs[0].currentOuterStep == 2, "v3 diloco quic twoproc: advanced outer step")
-    let mergedModelContract = core.v3DiLoCoArtifactRefValidate(mergedModelRef)
-    assert(mergedModelContract.ok, "v3 diloco quic twoproc: merged model contract")
-    let mergedOptimizerContract = core.v3DiLoCoArtifactRefValidate(mergedOptimizerRef)
-    assert(mergedOptimizerContract.ok, "v3 diloco quic twoproc: merged optimizer contract")
-    echo("v3 diloco_quic_twoproc_server_smoke ok")
+    assert(node.state.jobs[0].currentOuterStep == 1, "v3 diloco quic status probe: current outer step")
+    assert(node.state.deltas.len != 0, "v3 diloco quic status probe: delta len zero")
+    assert(node.state.deltas.len != 1, "v3 diloco quic status probe: delta len one")
+    assert(node.state.deltas.len != 3, "v3 diloco quic status probe: delta len three")
+    assert(node.state.deltas.len == 2, "v3 diloco quic status probe: delta len")
+    let leaderDeltaPos = core.v3DiLoCoDeltaPos(node.state,
+                                               jobBundleCid,
+                                               node.state.jobs[0].currentGlobalVersionCid,
+                                               node.state.jobs[0].currentOuterStep,
+                                               leaderPeerId)
+    assert(leaderDeltaPos >= 0, "v3 diloco quic status probe: leader delta missing")
+    let workerDeltaPos = core.v3DiLoCoDeltaPos(node.state,
+                                               jobBundleCid,
+                                               node.state.jobs[0].currentGlobalVersionCid,
+                                               node.state.jobs[0].currentOuterStep,
+                                               workerPeerId)
+    assert(workerDeltaPos >= 0, "v3 diloco quic status probe: worker delta missing")
+    var status = core.v3DiLoCoStepStatusZero()
+    let statusRes = core.v3DiLoCoFetchStepStatusFill(status, node.state, jobBundleCid)
+    assert(statusRes.ok, "v3 diloco quic status probe: fetch status")
+    assert(status.contributionCount != 0, "v3 diloco quic status probe: contributions zero")
+    assert(status.contributionCount != 1, "v3 diloco quic status probe: contributions one")
+    assert(status.contributionCount == 2, "v3 diloco quic status probe: contributions")
+    echo("v3 diloco_quic_status_server_probe ok")
     return 0

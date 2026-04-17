@@ -191,7 +191,7 @@ cheng_tooling cheng examples/stage1_codegen_fullspec.cheng --jobs:8
   - `string_abi_contract.closure=required`
   - 本项当前验证 selector-owned cstring lowering 与 hard-fail guard；default verify 与 `backend_prod_closure` 共同负责日常漂移检查。
 - STRLIT-01 String literal regression gate：`cheng_tooling verify_backend_string_literal_regression` 复跑 canonical `artifacts/backend_driver/cheng` 的 4 个字符串字面量 runtime probe，并保留 `60s timeout + sample` 诊断报告到 `artifacts/backend_string_literal_regression/backend_string_literal_regression.report.txt`。
-- STRFMT-01 Std strformat gate：`cheng_tooling verify_std_strformat` 分别编译并运行 `fmt(singleton str[])`、`fmt(str[])`、`lines(str[])` probe，报告到 `artifacts/std_strformat/std_strformat.report.txt`。
+- STRFMT-01 Std strformat gate：`cheng_tooling verify_std_strformat` 分别编译并运行 `fmt(singleton str[])`、`fmt(str[])`、`fmt"...{expr}..."` 稳态单占位 probe、`lines(str[])` probe，报告到 `artifacts/std_strformat/std_strformat.report.txt`。
 - OUTSAFE-01 Backend default output safety gate：`cheng_tooling verify_backend_default_output_safety` 校验 canonical driver 在未显式指定输出路径时不会改写输入 `.cheng` 源文件，且默认 exe / obj 输出路径都可用；报告到 `artifacts/backend_default_output_safety/backend_default_output_safety.report.txt`。
   - 本项用于阻断 sidecar/object cstring payload 回退，不进入 `backend_prod_closure` required。
 - DOTLOW-01 dot-lowering 契约冻结：`cheng_tooling build_backend_dot_lowering_contract` 生成 `src/tooling/backend_dot_lowering_contract.env`；`cheng_tooling verify_backend_dot_lowering_contract` 校验 `docs/backend-dot-lowering-contract.md` + `docs/UIR.md` + `src/tooling/README.md` + `docs/backend-techdebt-matrix.md` 的漂移，输出 `artifacts/backend_dot_lowering_contract/*.report.txt`。
@@ -709,7 +709,7 @@ cheng_tooling verify_libp2p_prod_closure
 cheng_tooling verify_backend_runtime_abi
 ```
 说明：
-- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 ABI 头 [v3_runtime_abi.h](/Users/lbcheng/cheng-lang/v3/runtime/native/v3_runtime_abi.h) 形成的 runtime 合同与兼容 surface 一致性。
+- 校验 [system_helpers_backend.cheng](/Users/lbcheng/cheng-lang/src/std/system_helpers_backend.cheng) 加最小 ABI 头 [v3_runtime_abi.h](/Users/lbcheng/cheng-lang/v3/src/runtime/v3_runtime_abi.h) 形成的 runtime 合同与兼容 surface 一致性。
 - 统一权威路径现在固定写在 [backend_runtime_abi_contract.env](/Users/lbcheng/cheng-lang/src/tooling/backend_runtime_abi_contract.env)，对应的脚本入口是 [backend_runtime_abi_contract.sh](/Users/lbcheng/cheng-lang/src/tooling/cheng_tooling_embedded_scripts/backend_runtime_abi_contract.sh)；`verify_backend_runtime_abi`、`verify_backend_ffi_handle_sandbox`、`verify_backend_pure_cheng_surface`、`build_mobile_export` 与 `verify_backend_selfhost_bootstrap_self_obj` 都从这里取 live 路径。
 - `verify.sh`、`verify_backend_closedloop` 与 CI（Linux amd64 / macOS arm64）会执行此检查。
 
@@ -743,7 +743,7 @@ cheng_tooling verify_stage1_seed_layout
 - `verify.sh` 默认把 `verify.tooling_cmdline` 作为必跑 gate（`cheng_tooling verify_tooling_cmdline`）。
 - `verify.sh` 默认把 `verify.backend_stage1_fixed0_envs` 作为必跑 gate，阻断 `STAGE1_SKIP_SEM/STAGE1_SKIP_OWNERSHIP` 回流，并要求 `STAGE1_SEM_FIXED_0/STAGE1_OWNERSHIP_FIXED_0` 保持 `fixed=0`。
 - `verify.sh` 默认把 `verify.backend_string_literal_regression` 作为必跑 gate，复跑 canonical driver 的 4 个字符串字面量 probe，并保留超时采样报告。
-- `verify.sh` 默认把 `verify.std_strformat` 作为必跑 gate，锁定 `std/strformat` 的 `fmt(str[]) / lines(str[])` 基本行为。
+- `verify.sh` 默认把 `verify.std_strformat` 作为必跑 gate，锁定 `std/strformat` 的 `fmt(str[]) / fmt"...{expr}..." / lines(str[])` 基本行为。
 - `verify.sh` 默认把 `verify.backend_default_output_safety` 作为必跑 gate，阻断 canonical driver 在无显式输出路径时覆盖输入源码的回归。
 - `verify.sh` 默认优先使用 `bundle full` 入口运行 `chengc/verify_backend_closedloop/backend_prod_closure`（缺失时自动构建）：
   - `VERIFY_USE_TOOLING_BUNDLE_FULL=1`（默认开启）

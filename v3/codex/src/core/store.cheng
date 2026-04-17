@@ -1,5 +1,6 @@
 import std/os
 import std/result
+import std/strformat as strfmt
 import std/strings
 import std/times
 import std/strutils as strutil
@@ -109,7 +110,7 @@ fn codexStoreSessionPath(home: str, sessionId: str): str =
     return os.joinPath(codexSessionsDir(home), sessionId + ".session")
 
 fn codexStoreSummaryFromSession(session: types.CodexSession): types.CodexSessionSummary =
-    var out = types.codexSessionSummaryZero()
+    var out: types.CodexSessionSummary
     out.sessionId = session.sessionId
     out.title = session.title
     out.cwd = session.cwd
@@ -127,7 +128,7 @@ fn codexStoreSummaryLine(summary: types.CodexSessionSummary): str =
         intToStr(summary.turnCount)
 
 fn codexStoreSummaryFromLine(line: str, outSummary: var types.CodexSessionSummary): bool =
-    outSummary = types.codexSessionSummaryZero()
+    outSummary = default[types.CodexSessionSummary]
     let parts = strutil.split(line, '|')
     if parts.len != 6:
         return false
@@ -146,16 +147,18 @@ fn codexStoreSummaryFromLine(line: str, outSummary: var types.CodexSessionSummar
     return true
 
 fn codexStoreSessionIndexText(items: types.CodexSessionSummary[]): str =
-    var out = ""
+    var parts: str[]
     for i in 0..<items.len:
-        out = out + codexStoreSummaryLine(items[i]) + "\n"
-    return out
+        add(parts, codexStoreSummaryLine(items[i]))
+        add(parts, "\n")
+    return strfmt.fmt(parts)
 
 fn codexStoreLineIndexText(items: str[]): str =
-    var out = ""
+    var parts: str[]
     for i in 0..<items.len:
-        out = out + items[i] + "\n"
-    return out
+        add(parts, items[i])
+        add(parts, "\n")
+    return strfmt.fmt(parts)
 
 fn codexStoreFileExists(path: str): bool =
     let f = os.openRead(path)
@@ -285,7 +288,7 @@ fn codexStoreReadBoolField(lines: str[], key: str, outValue: var bool): bool =
     return textutil.codexParseBoolText(raw, outValue)
 
 fn codexStoreLoadTurn(lines: str[], idx: int32, outTurn: var types.CodexTurn): bool =
-    outTurn = types.codexTurnZero()
+    outTurn = default[types.CodexTurn]
     if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_prompt", outTurn.promptText):
         return false
     if !codexStoreReadHexField(lines, "turn_" + intToStr(idx) + "_command", outTurn.commandText):
@@ -305,7 +308,7 @@ fn codexStoreSessionFromText(path: str, text: str): Result[types.CodexSession] =
     var format = ""
     if !codexStoreFindValue(lines, "format", format) || format != codexSessionFormat:
         return Err[types.CodexSession]("codex store: invalid session format: " + path)
-    var out = types.codexSessionZero()
+    var out: types.CodexSession
     if !codexStoreReadHexField(lines, "session_id", out.sessionId):
         return Err[types.CodexSession]("codex store: missing session_id: " + path)
     if !codexStoreReadHexField(lines, "title", out.title):
@@ -321,9 +324,8 @@ fn codexStoreSessionFromText(path: str, text: str): Result[types.CodexSession] =
     var turnCount = 0
     if !codexStoreReadInt32Field(lines, "turn_count", turnCount):
         return Err[types.CodexSession]("codex store: missing turn_count: " + path)
-    out.turns = []
     for i in 0..<turnCount:
-        var turn = types.codexTurnZero()
+        var turn: types.CodexTurn
         if !codexStoreLoadTurn(lines, i, turn):
             return Err[types.CodexSession]("codex store: invalid turn " + intToStr(i) + ": " + path)
         add(out.turns, turn)
@@ -346,7 +348,7 @@ fn codexStoreListSessions(home: str): types.CodexSessionSummary[] =
     var out: types.CodexSessionSummary[]
     let lines = codexStoreReadNonEmptyLines(codexSessionIndexPath(home))
     for i in 0..<lines.len:
-        var item = types.codexSessionSummaryZero()
+        var item: types.CodexSessionSummary
         if !codexStoreSummaryFromLine(lines[i], item):
             continue
         add(out, item)
@@ -392,7 +394,7 @@ fn codexStorePluginSpecLine(spec: types.CodexPluginSpec): str =
         textutil.codexBoolText(spec.enabled)
 
 fn codexStorePluginSpecFromLine(line: str, outSpec: var types.CodexPluginSpec): bool =
-    outSpec = types.codexPluginSpecZero()
+    outSpec = default[types.CodexPluginSpec]
     let parts = strutil.split(line, '|')
     if parts.len == 1:
         outSpec.name = textutil.codexTextTrim(parts[0])
@@ -410,16 +412,17 @@ fn codexStorePluginSpecFromLine(line: str, outSpec: var types.CodexPluginSpec): 
     return textutil.codexTextNonEmpty(outSpec.name)
 
 fn codexStorePluginIndexText(items: types.CodexPluginSpec[]): str =
-    var out = ""
+    var parts: str[]
     for i in 0..<items.len:
-        out = out + codexStorePluginSpecLine(items[i]) + "\n"
-    return out
+        add(parts, codexStorePluginSpecLine(items[i]))
+        add(parts, "\n")
+    return strfmt.fmt(parts)
 
 fn codexStoreListPluginSpecs(home: str): types.CodexPluginSpec[] =
     var out: types.CodexPluginSpec[]
     let lines = codexStoreReadNonEmptyLines(codexPluginIndexPath(home))
     for i in 0..<lines.len:
-        var item = types.codexPluginSpecZero()
+        var item: types.CodexPluginSpec
         if !codexStorePluginSpecFromLine(lines[i], item):
             continue
         add(out, item)
@@ -463,14 +466,13 @@ fn codexStoreSavePluginSpec(home: str, spec: types.CodexPluginSpec): Result[bool
     return Ok[bool](!replaced)
 
 fn codexStoreAddPlugin(home: str, name: str): Result[bool] =
-    var spec = types.codexPluginSpecZero()
+    var spec: types.CodexPluginSpec
     spec.name = textutil.codexTextTrim(name)
-    spec.path = ""
     spec.enabled = true
     return codexStoreSavePluginSpec(home, spec)
 
 fn codexStoreSaveNamedPlugin(home: str, name: str, path: str): Result[bool] =
-    var spec = types.codexPluginSpecZero()
+    var spec: types.CodexPluginSpec
     spec.name = textutil.codexTextTrim(name)
     spec.path = textutil.codexTextTrim(path)
     spec.enabled = true
@@ -506,7 +508,7 @@ fn codexStoreMcpServerSpecLine(spec: types.CodexMcpServerSpec): str =
         textutil.codexBoolText(spec.enabled)
 
 fn codexStoreMcpServerSpecFromLine(line: str, outSpec: var types.CodexMcpServerSpec): bool =
-    outSpec = types.codexMcpServerSpecZero()
+    outSpec = default[types.CodexMcpServerSpec]
     let parts = strutil.split(line, '|')
     if parts.len == 1:
         outSpec.name = textutil.codexTextTrim(parts[0])
@@ -532,16 +534,17 @@ fn codexStoreMcpServerSpecFromLine(line: str, outSpec: var types.CodexMcpServerS
     return textutil.codexTextNonEmpty(outSpec.name)
 
 fn codexStoreMcpServerIndexText(items: types.CodexMcpServerSpec[]): str =
-    var out = ""
+    var parts: str[]
     for i in 0..<items.len:
-        out = out + codexStoreMcpServerSpecLine(items[i]) + "\n"
-    return out
+        add(parts, codexStoreMcpServerSpecLine(items[i]))
+        add(parts, "\n")
+    return strfmt.fmt(parts)
 
 fn codexStoreListMcpServerSpecs(home: str): types.CodexMcpServerSpec[] =
     var out: types.CodexMcpServerSpec[]
     let lines = codexStoreReadNonEmptyLines(codexMcpPath(home))
     for i in 0..<lines.len:
-        var item = types.codexMcpServerSpecZero()
+        var item: types.CodexMcpServerSpec
         if !codexStoreMcpServerSpecFromLine(lines[i], item):
             continue
         add(out, item)
@@ -585,7 +588,7 @@ fn codexStoreSaveMcpServerSpec(home: str, spec: types.CodexMcpServerSpec): Resul
     return Ok[bool](!replaced)
 
 fn codexStoreAddMcpServer(home: str, value: str): Result[bool] =
-    var spec = types.codexMcpServerSpecZero()
+    var spec: types.CodexMcpServerSpec
     spec.name = textutil.codexTextTrim(value)
     spec.transportKind = "legacy"
     spec.enabled = true

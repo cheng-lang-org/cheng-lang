@@ -1,5 +1,5 @@
-#ifndef CHENG_V3_STR_TWOWAY_SEARCH_H
-#define CHENG_V3_STR_TWOWAY_SEARCH_H
+#ifndef CHENG_TWOWAY_SEARCH_H
+#define CHENG_TWOWAY_SEARCH_H
 
 #include <stddef.h>
 #include <stdint.h>

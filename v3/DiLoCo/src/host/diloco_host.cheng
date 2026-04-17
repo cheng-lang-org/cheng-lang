@@ -1,4 +1,5 @@
 import std/result
+import std/os
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/host/host as host_base
@@ -61,20 +62,22 @@ fn v3DiLoCoHostEnableAutoLeader(node: var V3DiLoCoHostNode,
     node.autoLeaderWeightNumerator = weightNumerator
     node.autoLeaderWeightDenominator = weightDenominator
 
-fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode) =
+fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode): Result[bool] =
     if !node.autoLeaderEnabled:
-        return
+        return Ok[bool](false)
     let jobPos = core.v3DiLoCoJobPos(node.state, node.autoLeaderJobBundleCid)
     if jobPos < 0:
-        return
+        return Err[bool]("v3 diloco host: auto leader job missing")
     let job = node.state.jobs[jobPos]
     if !job.sealed:
-        return
+        return Ok[bool](false)
     var leaderLease = core.v3DiLoCoLeaseZero()
-    let _leaderLeaseRes = core.v3DiLoCoFetchLeaseFill(leaderLease,
-                                                      node.state,
-                                                      node.autoLeaderJobBundleCid,
-                                                      node.autoLeaderPeerId)
+    let leaderLeaseRes = core.v3DiLoCoFetchLeaseFill(leaderLease,
+                                                     node.state,
+                                                     node.autoLeaderJobBundleCid,
+                                                     node.autoLeaderPeerId)
+    if IsErr(leaderLeaseRes):
+        return Err[bool](Error(leaderLeaseRes))
     let barrierPos = core.v3DiLoCoBarrierPos(node.state,
                                              node.autoLeaderJobBundleCid,
                                              job.currentGlobalVersionCid,
@@ -84,39 +87,44 @@ fn v3DiLoCoHostMaybeAdvanceAutoLeader(node: var V3DiLoCoHostNode) =
         if barrier.completedPeerIds.len > 0 &&
            !core.v3DiLoCoBarrierHasPeer(barrier, node.autoLeaderPeerId):
             var barrierOut = core.v3DiLoCoBarrierZero()
-            let _barrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrierOut,
-                                                                   node.state,
-                                                                   node.autoLeaderJobBundleCid,
-                                                                   node.autoLeaderPeerId)
+            let barrierRes = core.v3DiLoCoReportInnerStepDoneFill(barrierOut,
+                                                                  node.state,
+                                                                  node.autoLeaderJobBundleCid,
+                                                                  node.autoLeaderPeerId)
+            if IsErr(barrierRes):
+                return Err[bool](Error(barrierRes))
     let readyBarrierPos = core.v3DiLoCoBarrierPos(node.state,
                                                   node.autoLeaderJobBundleCid,
                                                   job.currentGlobalVersionCid,
                                                   job.currentOuterStep)
     if readyBarrierPos < 0:
-        return
+        return Ok[bool](false)
     let readyBarrier = node.state.barriers[readyBarrierPos]
     if !readyBarrier.sealed:
-        return
+        return Ok[bool](false)
     if core.v3DiLoCoDeltaPos(node.state,
                              node.autoLeaderJobBundleCid,
                              job.currentGlobalVersionCid,
                              job.currentOuterStep,
                              node.autoLeaderPeerId) >= 0:
-        return
+        return Ok[bool](false)
     var leaderDelta = core.v3DiLoCoOuterDeltaZero()
-    let _leaderDeltaRes = core.v3DiLoCoSubmitOuterDeltaFill(leaderDelta,
-                                                            node.state,
-                                                            node.autoLeaderJobBundleCid,
-                                                            job.currentGlobalVersionCid,
-                                                            job.currentOuterStep,
-                                                            node.autoLeaderPeerId,
-                                                            node.autoLeaderModelDeltaRef,
-                                                            node.autoLeaderOptimizerDeltaRef,
-                                                            node.autoLeaderSampleCount,
-                                                            node.autoLeaderTokenCount,
-                                                            node.autoLeaderInnerStepCount,
-                                                            node.autoLeaderWeightNumerator,
-                                                            node.autoLeaderWeightDenominator)
+    let leaderDeltaRes = core.v3DiLoCoSubmitOuterDeltaFill(leaderDelta,
+                                                           node.state,
+                                                           node.autoLeaderJobBundleCid,
+                                                           job.currentGlobalVersionCid,
+                                                           job.currentOuterStep,
+                                                           node.autoLeaderPeerId,
+                                                           node.autoLeaderModelDeltaRef,
+                                                           node.autoLeaderOptimizerDeltaRef,
+                                                           node.autoLeaderSampleCount,
+                                                           node.autoLeaderTokenCount,
+                                                           node.autoLeaderInnerStepCount,
+                                                           node.autoLeaderWeightNumerator,
+                                                           node.autoLeaderWeightDenominator)
+    if IsErr(leaderDeltaRes):
+        return Err[bool](Error(leaderDeltaRes))
+    return Ok[bool](true)
 
 fn v3DiLoCoHostServeOpenJob(out: var Bytes,
                             node: var V3DiLoCoHostNode,
@@ -369,6 +377,7 @@ fn v3DiLoCoHostServeWindowNamed(node: var V3DiLoCoHostNode,
         if IsErr(acceptRes):
             if ErrorText(acceptRes) == "msquic: accept timeout":
                 break
+            os.writeLine(os.get_stderr(), "v3 diloco host accept error: " + ErrorText(acceptRes))
             qtransport.stop(listener)
             return Err[bool]("v3 diloco host: accept: " + ErrorText(acceptRes))
         var conn = Value(acceptRes)
@@ -388,7 +397,11 @@ fn v3DiLoCoHostServeWindowNamed(node: var V3DiLoCoHostNode,
                 if IsErr(serveRes):
                     dropConn = true
                 else:
-                    v3DiLoCoHostMaybeAdvanceAutoLeader(node)
+                    let autoLeaderRes = v3DiLoCoHostMaybeAdvanceAutoLeader(node)
+                    if IsErr(autoLeaderRes):
+                        qconn.connClose(conn)
+                        qtransport.stop(listener)
+                        return Err[bool]("v3 diloco host: auto leader: " + Error(autoLeaderRes))
         if !dropConn:
             let writeRes = quic_transport.v3Libp2pQuicWriteExact(listener,
                                                                  conn,

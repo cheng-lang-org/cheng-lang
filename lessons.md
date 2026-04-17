@@ -1,4 +1,18 @@
 2026-04-17
+- `UE` 孤儿如果采样已经卡在 `dyld_start`，就不要再继续怀疑业务命令本身；先回到 macOS 的启动链，优先把 `fork/exec` 热路径改成 `posix_spawn` 或复用稳定的 `popen/system` 路径。
+- seed C 和 selfhost Cheng 的执行面要一起收。只修 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 不够，像这轮 [program_support_backend_v3.cheng](/Users/lbcheng/cheng-lang/v3/src/runtime/program_support_backend_v3.cheng) 的 direct capture 如果还保留旧 `fork/execvp`，live 主线后面还会继续造同类问题。
+- `quoteShell` 只包一层单引号不算完成，只要参数里有 `'` 就会坏。后面凡是再碰命令拼接，默认先检查 [compiler_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng)、[os.cheng](/Users/lbcheng/cheng-lang/src/std/os.cheng) 和 runtime 内部 helper 是不是都用了真转义。
+- 这类 orphan 问题验收时，不只看命令 `exit 0`；至少要在完整复验后再跑一次 `ps -Ao pid=,ppid=,state=,etime=,command= | awk '$2==1 && $3 ~ /^U/'`，确认没有新增 Cheng `UE`，再下“已止血”的结论。
+- 用户已明确：模板插值如果目标是接近 Nim 的使用感，优先收成 `strfmt.fmt"…{expr}…"` 这类 Nim 风格入口，不要停在 Python 式 `format(template, args)` 调用面。
+- 用户已明确：`std/strformat.fmt(parts)` 只是 `join`，不能拿来冒充 Nim/Python 风格格式化；如果目标是模板插值，就要补真正的模板接口语义，而不是只把 `out = out + ...` 改成 `fmt([...])`。
+- 用户已明确：字段默认值只在“偏离隐式默认值”时才写；`bool=false`、整数=`0`、`str=""` 这些和隐式默认值一致的字段，一律不要再写成 `= false` / `= 0` / `= ""`。
+- 用户已明确：`T[]/T[N]` 字段默认空值走隐式初始化，文档和业务类型定义不要再写 `tags: str[] = []` 这种重复默认值；统一写成 `tags: str[]`。
+- `r2c-react-v3` 这种全量 truth capture 绝不能再抢固定 CDP 端口。像这轮 full matrix，旧 `9223` 只要被残留 headless Chrome 占住，第一条 route 就会假报 `Address already in use (48)`；最稳口径是 `--remote-debugging-port=0`，再从 `DevToolsActivePort` 回读真实端口，并在 helper 退出时做确定性的进程回收。
+- `exec-route-matrix` 只要 truth `semantic_nodes_count` 根本不在候选集合里，就不准再把所有 candidate 白编一遍。像这轮 `game_minecraft/game_mahjong/group_draft`，继续枚举只会浪费很多分钟；最稳口径是直接 fail-fast 标 `truth_count_miss_*`，把问题明确留给 route candidate 生成层。
+- `bootstrap-bridge` 里 `stage0` 不能再原地物料化最终 `cheng.stage0`。正式口径已经坐实：先落 `cheng.stage0.next`，`stage0 self-check` 和 `stage1 compile` 只跑候选；如果 live bootstrap compiler 就是最终 `cheng.stage0`，成功后直接丢弃候选，绝不把正式 `cheng.stage0` 安装成指向自己的软链。
+- 只修 seed 或只修 Cheng 侧 bootstrap 都不够。`stage0.next` 候选执行和 `compiler==stage0` 的复用规则必须在 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 和 [compiler_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng) 两边同时追平，不然 live `stage3/backend_driver` 很快又会和 seed 分叉。
+- 大 report 文件不要在命令还没退时就下结论。像这轮 `/tmp/compiler_main_probe.report.txt`，半写状态会先露出 `primary_object_machine_words_missing` 这种 stub 残片；至少等 `system-link-exec` 真退出，再判断是不是 regression。
+- 这台桌面环境里如果 `ps` 还留着 `PPID=1` 的 `UE` 条目，就不要把 orphan 问题写成“解决了”。这轮 `artifacts/v3_bootstrap/cheng.stage0 self-check` 前台虽然 `exit 0`，但 3 条 `UE` 仍然留在系统里且 `kill -9` 清不掉；主线 gate 成功和 orphan cleanup 必须分开记账。
 - 当前 focused truth 模板已经可以直接拿去扫更多正式业务页，不用总从简单 tab 面试探。`node_thread/node_published_content/trading_main` 这轮都已经直接收绿；下一步更值的是系统扫剩余 route matrix，而不是继续手工挑最简单页面。
 - `cheng.stage3 r2c-react-v3 compare-truth` 这种正式入口别只看 route compare 本身，先想清楚它会不会 freshness 重编 controller。只要 controller/provider 里还有 ordinary 不稳形状，正式入口就会在“业务 route 已经绿了”的情况下仍然炸掉。
 - 当前 ordinary lowering 里，`&&` 复合条件、循环体内层层嵌套 `if`、以及 `uint8(int32(':'))` 这种字符转换比较都别再往 live controller/provider 里放。最稳口径是拆成局部变量、逐层 `if/while`，并直接用字节值 `58/61/47/92`。
@@ -449,3 +463,4 @@
 - arm64 call lowering 里只要先调整了 `sp`，后续所有基于旧 SP 的 register spill reload、隐藏返回地址回读都必须同步重算偏移。不要只修显眼的一处；最稳做法是统一走同一个 `stack_arg_bytes` 校正口径，再补 smoke 把“大对象返回 + 嵌套字段直传”这类形状钉死。
 - seed 递归 helper 只要还背着 `V3ImportAlias[CHENG_V3_MAX_IMPORT_ALIASES]` 这类大栈 scratch，就还不算真正收稳。像这轮 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 的 `v3_normalize_type_text_with_params(...)`、`v3_const_value_set_implicit_default(...)`、`v3_emit_implicit_default_into_address(...)`，把 alias scratch 也挪到堆上之后，`bootstrap-bridge -> build-backend-driver -> compiler_main` 这条链才彻底不再被递归栈帧放大。
 - 改完 [cheng_v3_seed.c](/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c) 之后，不要直接拿旧 `cheng.stage3` 的报错判断新补丁成败。最稳顺序是先 `cc` 重编 `cheng.stage0`，再跑 `bootstrap-bridge` 把 `stage3` 追平源码，最后再复验 `system-link-exec/build-backend-driver/gate`；否则很容易被旧产物和旧日志带偏。
+- 收纯 Cheng 主线时，不能只看真正的 link input。`runtime ABI contract`、seed 辅助构建路径、freshness 输入、debug gate 和 host audit 只要还点名旧 C 路径，就都要一起追平；否则执行面明明已经切掉，辅助链路还会继续把人带回“还有活依赖”的假结论。

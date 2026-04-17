@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "v3_str_twoway_search.h"
+#include "cheng_twoway_search.h"
 
 static ptrdiff_t smoke_naive_find(const unsigned char* haystack,
                                   size_t haystack_len,

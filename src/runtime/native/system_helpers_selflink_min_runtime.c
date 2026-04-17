@@ -33,7 +33,7 @@
 #include <mach-o/dyld.h>
 #endif
 #include "cheng_sidecar_loader.h"
-#include "../../../v3/runtime/native/v3_str_twoway_search.h"
+#include "cheng_twoway_search.h"
 
 #if defined(__GNUC__) || defined(__clang__)
 #define CHENG_MINRT_WEAK __attribute__((weak))
