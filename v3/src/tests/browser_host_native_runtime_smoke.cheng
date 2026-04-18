@@ -6,25 +6,23 @@ import std/strutils as strutil
 import cheng/v3/libp2p/browser/browser_host_wasm_probe as probe
 
 var browserHostNativeBuffers: Bytes[] = []
-var browserHostNativeInputs: Bytes[] = []
+var browserHostSetLenProbeBuffers: Bytes[] = []
 var browserHostNativeLastError: str = ""
 
 fn browserHostFail(label: str): int32 =
     echo("v3 browser host native smoke failed: " + label)
     return 1
 
-fn browserHostCloneBytes(payload: Bytes): Bytes =
-    return bytesSlice(payload, 0, bytesLen(payload))
+fn browserHostBytesSeqSetLenProbe(): int32 =
+    setLen(browserHostSetLenProbeBuffers, 2)
+    return browserHostSetLenProbeBuffers.len
 
 fn browserHostBufferHandleStore(payload: Bytes): int32 =
-    let cloned = browserHostCloneBytes(payload)
-    add(browserHostNativeBuffers, cloned)
+    add(browserHostNativeBuffers, bytesSlice(payload, 0, bytesLen(payload)))
     return browserHostNativeBuffers.len
 
 fn browserHostInputHandleStore(payload: Bytes): int32 =
-    let cloned = browserHostCloneBytes(payload)
-    add(browserHostNativeInputs, cloned)
-    return browserHostNativeInputs.len
+    return browserHostBufferHandleStore(payload)
 
 fn browserHostBufferHandleLookup(handle: int32): Result[Bytes] =
     let idx = handle - 1
@@ -33,10 +31,10 @@ fn browserHostBufferHandleLookup(handle: int32): Result[Bytes] =
     return Ok[Bytes](browserHostNativeBuffers[idx])
 
 fn browserHostInputHandleLookup(handle: int32): Result[Bytes] =
-    let idx = handle - 1
-    if idx < 0 || idx >= browserHostNativeInputs.len:
+    let bytesRes = browserHostBufferHandleLookup(handle)
+    if IsErr(bytesRes):
         return Err[Bytes]("browser_native_invalid_input_handle")
-    return Ok[Bytes](browserHostNativeInputs[idx])
+    return bytesRes
 
 fn browserHostBufferHandleText(handle: int32): str =
     let bytesRes = browserHostBufferHandleLookup(handle)
@@ -166,6 +164,8 @@ fn cheng_v3_browser_moq_fountain_last_error_handle_bridge_export(): int32 =
 fn main(): int32 =
     if probe.main() != 0:
         return browserHostFail("main")
+    if browserHostBytesSeqSetLenProbe() != 2:
+        return browserHostFail("browserHostBytesSeqSetLenProbe")
     if probe.browserNowMs() != 24680:
         return browserHostFail("browserNowMs")
     if probe.browserEchoI32(31337) != 31337:
@@ -291,5 +291,15 @@ fn main(): int32 =
         return browserHostFail("browserMoqFountainBuild.kind")
     if !strutil.Contains(externalWire, "droplet.0.block_indexes=0"):
         return browserHostFail("browserMoqFountainBuild.blockIndexes")
+    if probe.browserMoqFountainBuild(0, ownerHandle, remoteHandle, mimeTypeHandle, 1024, 8, 2) != 0:
+        return browserHostFail("browserMoqFountainBuild.missingBlob.rc")
+    let missingBlobErrorHandle = probe.browserMoqFountainLastErrorHandle()
+    if !strutil.Contains(browserHostBufferHandleText(missingBlobErrorHandle), "moq_fountain_missing_blob"):
+        return browserHostFail("browserMoqFountainBuild.missingBlob.error")
+    if probe.browserMoqFountainRebuild(0) != 0:
+        return browserHostFail("browserMoqFountainRebuild.missingRequestWire.rc")
+    let missingRequestWireErrorHandle = probe.browserMoqFountainLastErrorHandle()
+    if !strutil.Contains(browserHostBufferHandleText(missingRequestWireErrorHandle), "moq_fountain_missing_request_wire"):
+        return browserHostFail("browserMoqFountainRebuild.missingRequestWire.error")
     echo("v3 browser host wasm smoke: ok")
     return 0

@@ -11,6 +11,17 @@ type V3BrowserCodecOutputSchema = object
     kind: int32
     handleError: str
 
+type V3BrowserMoqFountainPeerInput = object
+    ownerPeerId: str
+    remotePeersCsv: str
+    mimeType: str
+
+type V3BrowserMoqFountainBuildRequest = object
+    blobBytes: Bytes
+    ownerPeerId: str
+    remotePeersCsv: str
+    mimeType: str
+
 const v3BrowserCodecInputBytesRequired = 1
 const v3BrowserCodecInputTextRequired = 2
 const v3BrowserCodecInputTextOptional = 3
@@ -235,24 +246,63 @@ fn browserMoqFountainBuildWireBytes(blobBytes: Bytes,
         return Err[Bytes](Error(wireOk))
     return Ok[Bytes](bytesSlice(bytesFromString(wireText), 0, len(wireText)))
 
+fn browserMoqFountainPeerInputFill(out: var V3BrowserMoqFountainPeerInput,
+                                   ownerPeerHandle: int32,
+                                   remotePeersHandle: int32,
+                                   mimeTypeHandle: int32): Result[bool] =
+    let ownerPeerSchema = browserCodecInputTextRequiredSchema("moq_fountain_missing_owner_peer",
+                                                              "moq_fountain_copy_owner_peer_failed")
+    let remotePeersSchema = browserCodecInputTextRequiredSchema("moq_fountain_missing_remote_peers",
+                                                                "moq_fountain_copy_remote_peers_failed")
+    let mimeTypeSchema = browserCodecInputTextOptionalSchema("moq_fountain_copy_mime_type_failed")
+    let ownerPeerRes = browserCodecReadInputText(ownerPeerHandle, ownerPeerSchema)
+    if IsErr(ownerPeerRes):
+        return Err[bool](Error(ownerPeerRes))
+    let remotePeersRes = browserCodecReadInputText(remotePeersHandle, remotePeersSchema)
+    if IsErr(remotePeersRes):
+        return Err[bool](Error(remotePeersRes))
+    let mimeTypeRes = browserCodecReadInputText(mimeTypeHandle, mimeTypeSchema)
+    if IsErr(mimeTypeRes):
+        return Err[bool](Error(mimeTypeRes))
+    out.ownerPeerId = Value(ownerPeerRes)
+    out.remotePeersCsv = Value(remotePeersRes)
+    out.mimeType = Value(mimeTypeRes)
+    return Ok[bool](true)
+
+fn browserMoqFountainBuildRequestFill(out: var V3BrowserMoqFountainBuildRequest,
+                                      blobHandle: int32,
+                                      ownerPeerHandle: int32,
+                                      remotePeersHandle: int32,
+                                      mimeTypeHandle: int32): Result[bool] =
+    let blobSchema = browserCodecInputBytesRequiredSchema("moq_fountain_missing_blob",
+                                                          "moq_fountain_copy_blob_failed")
+    let blobBytesRes = browserCodecReadInputBytes(blobHandle, blobSchema)
+    if IsErr(blobBytesRes):
+        return Err[bool](Error(blobBytesRes))
+    var peerInput: V3BrowserMoqFountainPeerInput
+    let peerOk = browserMoqFountainPeerInputFill(peerInput,
+                                                 ownerPeerHandle,
+                                                 remotePeersHandle,
+                                                 mimeTypeHandle)
+    if IsErr(peerOk):
+        return Err[bool](Error(peerOk))
+    out.blobBytes = Value(blobBytesRes)
+    out.ownerPeerId = peerInput.ownerPeerId
+    out.remotePeersCsv = peerInput.remotePeersCsv
+    out.mimeType = peerInput.mimeType
+    return Ok[bool](true)
+
 fn browserMoqFountainInputRemotePeerCount(ownerPeerHandle: int32,
                                           remotePeersHandle: int32,
                                           mimeTypeHandle: int32): int32 =
-    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
-                                                "moq_fountain_missing_owner_peer",
-                                                "moq_fountain_copy_owner_peer_failed")
-    if IsErr(ownerPeerRes):
+    var peerInput: V3BrowserMoqFountainPeerInput
+    let peerOk = browserMoqFountainPeerInputFill(peerInput,
+                                                 ownerPeerHandle,
+                                                 remotePeersHandle,
+                                                 mimeTypeHandle)
+    if IsErr(peerOk):
         return -1
-    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
-                                                  "moq_fountain_missing_remote_peers",
-                                                  "moq_fountain_copy_remote_peers_failed")
-    if IsErr(remotePeersRes):
-        return -2
-    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
-                                               "moq_fountain_copy_mime_type_failed")
-    if IsErr(mimeTypeRes):
-        return -3
-    let peers = moq.v3Libp2pMoqNormalizePeerCsv(Value(remotePeersRes))
+    let peers = moq.v3Libp2pMoqNormalizePeerCsv(peerInput.remotePeersCsv)
     return peers.len
 
 fn browserMoqFountainBuildRemotePeerCount(blobHandle: int32,
@@ -262,34 +312,23 @@ fn browserMoqFountainBuildRemotePeerCount(blobHandle: int32,
                                           objectTargetBytes: int32,
                                           sourceBlockBytes: int32,
                                           repairDropletCount: int32): int32 =
-    let blobBytesRes = browserInputBytesRequired(blobHandle,
-                                                 "moq_fountain_missing_blob",
-                                                 "moq_fountain_copy_blob_failed")
-    if IsErr(blobBytesRes):
+    var request: V3BrowserMoqFountainBuildRequest
+    let requestOk = browserMoqFountainBuildRequestFill(request,
+                                                       blobHandle,
+                                                       ownerPeerHandle,
+                                                       remotePeersHandle,
+                                                       mimeTypeHandle)
+    if IsErr(requestOk):
         return -1
-    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
-                                                "moq_fountain_missing_owner_peer",
-                                                "moq_fountain_copy_owner_peer_failed")
-    if IsErr(ownerPeerRes):
-        return -2
-    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
-                                                  "moq_fountain_missing_remote_peers",
-                                                  "moq_fountain_copy_remote_peers_failed")
-    if IsErr(remotePeersRes):
-        return -3
-    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
-                                               "moq_fountain_copy_mime_type_failed")
-    if IsErr(mimeTypeRes):
-        return -4
-    let buildRes = moq.v3Libp2pMoqBuild(Value(blobBytesRes),
-                                        Value(ownerPeerRes),
-                                        Value(remotePeersRes),
-                                        Value(mimeTypeRes),
+    let buildRes = moq.v3Libp2pMoqBuild(request.blobBytes,
+                                        request.ownerPeerId,
+                                        request.remotePeersCsv,
+                                        request.mimeType,
                                         objectTargetBytes,
                                         sourceBlockBytes,
                                         repairDropletCount)
     if IsErr(buildRes):
-        return -5
+        return -2
     return Value(buildRes).remoteAckPeerIds.len
 
 fn browserMoqFountainBuildWireRemotePeerCsvLen(blobHandle: int32,
@@ -299,39 +338,28 @@ fn browserMoqFountainBuildWireRemotePeerCsvLen(blobHandle: int32,
                                                objectTargetBytes: int32,
                                                sourceBlockBytes: int32,
                                                repairDropletCount: int32): int32 =
-    let blobBytesRes = browserInputBytesRequired(blobHandle,
-                                                 "moq_fountain_missing_blob",
-                                                 "moq_fountain_copy_blob_failed")
-    if IsErr(blobBytesRes):
+    var request: V3BrowserMoqFountainBuildRequest
+    let requestOk = browserMoqFountainBuildRequestFill(request,
+                                                       blobHandle,
+                                                       ownerPeerHandle,
+                                                       remotePeersHandle,
+                                                       mimeTypeHandle)
+    if IsErr(requestOk):
         return -1
-    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
-                                                "moq_fountain_missing_owner_peer",
-                                                "moq_fountain_copy_owner_peer_failed")
-    if IsErr(ownerPeerRes):
-        return -2
-    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
-                                                  "moq_fountain_missing_remote_peers",
-                                                  "moq_fountain_copy_remote_peers_failed")
-    if IsErr(remotePeersRes):
-        return -3
-    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
-                                               "moq_fountain_copy_mime_type_failed")
-    if IsErr(mimeTypeRes):
-        return -4
     var wireText = ""
     let wireOk = browserMoqFountainBuildWireFill(wireText,
-                                                 Value(blobBytesRes),
-                                                 Value(ownerPeerRes),
-                                                 Value(remotePeersRes),
-                                                 Value(mimeTypeRes),
+                                                 request.blobBytes,
+                                                 request.ownerPeerId,
+                                                 request.remotePeersCsv,
+                                                 request.mimeType,
                                                  objectTargetBytes,
                                                  sourceBlockBytes,
                                                  repairDropletCount)
     if IsErr(wireOk):
-        return -5
+        return -2
     let csvRes = moq.v3Libp2pMoqWireFindValue(wireText, "remote_ack_peer_ids")
     if IsErr(csvRes):
-        return -6
+        return -3
     return Value(csvRes).len
 
 fn browserMoqFountainBuild(blobHandle: int32,
@@ -342,35 +370,21 @@ fn browserMoqFountainBuild(blobHandle: int32,
                            sourceBlockBytes: int32,
                            repairDropletCount: int32): int32 =
     browserMoqFountainSetLastError("")
-    let blobBytesRes = browserInputBytesRequired(blobHandle,
-                                                 "moq_fountain_missing_blob",
-                                                 "moq_fountain_copy_blob_failed")
-    if IsErr(blobBytesRes):
-        browserMoqFountainSetLastError(Error(blobBytesRes))
-        return 0
-    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
-                                                "moq_fountain_missing_owner_peer",
-                                                "moq_fountain_copy_owner_peer_failed")
-    if IsErr(ownerPeerRes):
-        browserMoqFountainSetLastError(Error(ownerPeerRes))
-        return 0
-    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
-                                                  "moq_fountain_missing_remote_peers",
-                                                  "moq_fountain_copy_remote_peers_failed")
-    if IsErr(remotePeersRes):
-        browserMoqFountainSetLastError(Error(remotePeersRes))
-        return 0
-    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
-                                               "moq_fountain_copy_mime_type_failed")
-    if IsErr(mimeTypeRes):
-        browserMoqFountainSetLastError(Error(mimeTypeRes))
+    var request: V3BrowserMoqFountainBuildRequest
+    let requestOk = browserMoqFountainBuildRequestFill(request,
+                                                       blobHandle,
+                                                       ownerPeerHandle,
+                                                       remotePeersHandle,
+                                                       mimeTypeHandle)
+    if IsErr(requestOk):
+        browserMoqFountainSetLastError(Error(requestOk))
         return 0
     var wireText = ""
     let wireOk = browserMoqFountainBuildWireFill(wireText,
-                                                 Value(blobBytesRes),
-                                                 Value(ownerPeerRes),
-                                                 Value(remotePeersRes),
-                                                 Value(mimeTypeRes),
+                                                 request.blobBytes,
+                                                 request.ownerPeerId,
+                                                 request.remotePeersCsv,
+                                                 request.mimeType,
                                                  objectTargetBytes,
                                                  sourceBlockBytes,
                                                  repairDropletCount)

@@ -17,8 +17,13 @@
 ## ABI 与复合值
 
 - `str/rawbytes/seq/result` 当前统一按“显式地址优先 + region copy”收。
+- `Bytes[] add/setLen` 这种序列能力缺口要直接修进编译器，不要再在 host/browser 业务代码里兜桥或换数据结构绕过去。
+- `xor` 这种关键字二元运算要成套收进 `const/infer/prepare/native/wasm`，不能只在某一层临时认一下，不然会被误判成 prefix-call。
+- `len(str/Bytes/seq)` 不要只为局部变量写特判；统一走 lvalue/global 地址再按 ABI 布局取长度槽更稳。
 - browser wasm ABI 不要长期手写 `input_len/copy/raw_handle/text_handle`；先抽 schema/helper，再走自动生成。
 - browser codec 第一刀先收 `bytes/text/optional/handle` 这四类最常见桥，不要一上来就试图在业务函数里直接内联所有 browser ABI 细节。
+- `exe` 路径下的显式 `@exportc` 也必须进入 reachable roots；否则会伪装成“外部桥未定义”，把真问题藏住。
+- runtime provider 遇到入口源码同名显式导出时，provider 那份外部符号要主动退掉，不能靠 duplicate symbol 再让链接器替你判。
 - `stage0` 不是 live host smoke compiler，host/browser smoke 优先用 `stage3` 或 live backend driver。
 
 ## 记录与流程

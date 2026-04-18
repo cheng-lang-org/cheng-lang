@@ -1147,19 +1147,30 @@ fn v3BackendDriverRunVpnProxy(rootDir: str,
 
 fn v3BackendDriverRunMobileShell(rootDir: str,
                                  count: int32): int32 =
-    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
-    var compilerPath: str = ""
-    if !v3BackendDriverResolveToolCompiler(rootDir, "mobile-shell", compilerPath):
-        return 1
-    let envOverrides: str[] = [
-        "CHENG_V3_ROOT=" + rootDir
-    ]
-    return v3BackendDriverRunToolFromSourceWithCompiler(rootDir,
-                                                        "mobile_shell_tool",
-                                                        "v3/src/tooling/mobile_shell_tool_main.cheng",
-                                                        compilerPath,
-                                                        args,
-                                                        envOverrides)
+    let outDirRel: str = "artifacts/v3_mobile_shell"
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let toolPath: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver_tools/mobile_shell_tool/mobile_shell_tool")
+    if !v3path.V3FileExistsNonEmpty(rootDir, toolPath):
+        v3BackendDriverPrintErr("v3 mobile-shell: missing tool binary: " + toolPath)
+        return 2
+    let logPath: str = os.JoinPath(outDir, "mobile_shell.forward.log")
+    var forwardArgs: str[] = []
+    var i: int32 = 2
+    while i <= count:
+        let arg: str = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(forwardArgs, arg)
+        i = i + 1
+    let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                            "v3 mobile-shell",
+                                                            toolPath,
+                                                            forwardArgs,
+                                                            120,
+                                                            logPath)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed("v3 mobile-shell", run):
+        return run.exitCode
+    return 0
 
 fn v3BackendDriverRunGateTool(rootDir: str,
                               count: int32): int32 =
@@ -1458,6 +1469,107 @@ fn v3BackendDriverBuildChainNodeCliCommandBinary(rootDir: str,
         return 1
     return 0
 
+fn v3BackendDriverRunChainNodeCliSyncBinary(rootDir: str,
+                                            label: str,
+                                            syncBin: str,
+                                            clientState: str,
+                                            serverPort: str,
+                                            syncLog: str): hostops.V3LoggedRun =
+    return v3BackendDriverRunBinary(rootDir,
+                                    "v3 chain_node cli daemon-sync " + label,
+                                    syncBin,
+                                    ["--state:" + clientState, "--node-id:node-b", "--address-seed:chain-node-b", "--host:127.0.0.1", "--port:" + serverPort],
+                                    20,
+                                    syncLog)
+
+fn v3BackendDriverRunChainNodeCliBalanceBinary(rootDir: str,
+                                               runLabel: str,
+                                               balanceBin: str,
+                                               statePath: str,
+                                               account: str,
+                                               logPath: str): hostops.V3LoggedRun =
+    return v3BackendDriverRunBinary(rootDir,
+                                    runLabel,
+                                    balanceBin,
+                                    ["--state:" + statePath, "--asset:7", "--account:" + account],
+                                    20,
+                                    logPath)
+
+fn v3BackendDriverRunChainNodeCliShowBinary(rootDir: str,
+                                            runLabel: str,
+                                            showBin: str,
+                                            statePath: str,
+                                            logPath: str): hostops.V3LoggedRun =
+    return v3BackendDriverRunBinary(rootDir,
+                                    runLabel,
+                                    showBin,
+                                    ["--state:" + statePath],
+                                    20,
+                                    logPath)
+
+fn v3BackendDriverRunChainNodeCliSyncCheck(rootDir: str,
+                                           label: str,
+                                           syncBin: str,
+                                           clientState: str,
+                                           serverPort: str,
+                                           syncLog: str): int32 =
+    let run: hostops.V3LoggedRun = v3BackendDriverRunChainNodeCliSyncBinary(rootDir,
+                                                                             label,
+                                                                             syncBin,
+                                                                             clientState,
+                                                                             serverPort,
+                                                                             syncLog)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed("v3 chain_node cli daemon-sync", run):
+        return run.exitCode
+    if !v3BackendDriverRequireOutput(run, "changed=1", "v3 chain_node cli smoke"):
+        return 1
+    return 0
+
+fn v3BackendDriverRunChainNodeCliBalanceCheck(rootDir: str,
+                                              label: str,
+                                              stageName: str,
+                                              balanceBin: str,
+                                              statePath: str,
+                                              account: str,
+                                              logPath: str,
+                                              expectedText: str): int32 =
+    let runLabelBase: str = v3BackendDriverConcat3("v3 chain_node cli ", stageName, " ")
+    let runLabel: str = v3BackendDriverConcat2(runLabelBase, label)
+    let run: hostops.V3LoggedRun = v3BackendDriverRunChainNodeCliBalanceBinary(rootDir,
+                                                                                runLabel,
+                                                                                balanceBin,
+                                                                                statePath,
+                                                                                account,
+                                                                                logPath)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed(runLabel, run):
+        return run.exitCode
+    if !v3BackendDriverRequireOutput(run, expectedText, "v3 chain_node cli smoke"):
+        return 1
+    return 0
+
+fn v3BackendDriverRunChainNodeCliShowCheck(rootDir: str,
+                                           label: str,
+                                           stageName: str,
+                                           showBin: str,
+                                           statePath: str,
+                                           logPath: str,
+                                           expectedText: str): int32 =
+    let runLabelBase: str = v3BackendDriverConcat3("v3 chain_node cli ", stageName, " ")
+    let runLabel: str = v3BackendDriverConcat2(runLabelBase, label)
+    let run: hostops.V3LoggedRun = v3BackendDriverRunChainNodeCliShowBinary(rootDir,
+                                                                             runLabel,
+                                                                             showBin,
+                                                                             statePath,
+                                                                             logPath)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed(runLabel, run):
+        return run.exitCode
+    if !v3BackendDriverRequireOutput(run, expectedText, "v3 chain_node cli smoke"):
+        return 1
+    return 0
+
 fn v3BackendDriverRunTcpTwoprocSmoke(rootDir: str,
                                      compilerPath: str,
                                      label: str): int32 =
@@ -1605,239 +1717,23 @@ fn v3BackendDriverRunChainNodeCliSmoke(rootDir: str,
                                        label: str): int32 =
     let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_chain_node_cli/", label)
     let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
-    let tmpDir: str = os.JoinPath(outDir, "cli_smoke")
-    if !v3path.V3MkdirP(rootDir, tmpDir):
-        v3BackendDriverPrintErr("v3 chain_node cli smoke: failed to create tmp dir: " + tmpDir)
-        return 1
-    var initBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli init compile " + label, "chain_node_cli_init_main", initBin) != 0:
-        return 1
-    var mintBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli mint compile " + label, "chain_node_cli_mint_main", mintBin) != 0:
-        return 1
-    var transferBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli transfer compile " + label, "chain_node_cli_transfer_main", transferBin) != 0:
-        return 1
-    var balanceBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli balance compile " + label, "chain_node_cli_balance_main", balanceBin) != 0:
-        return 1
-    var showBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli show compile " + label, "chain_node_cli_show_state_main", showBin) != 0:
-        return 1
-    var snapshotBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli snapshot compile " + label, "chain_node_cli_dump_snapshot_main", snapshotBin) != 0:
-        return 1
-    var serveBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli serve compile " + label, "chain_node_cli_serve_once_main", serveBin) != 0:
-        return 1
-    var syncBin = ""
-    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli sync compile " + label, "chain_node_cli_sync_once_main", syncBin) != 0:
-        return 1
-    let serverState: str = os.JoinPath(tmpDir, "server.state")
-    let clientState: str = os.JoinPath(tmpDir, "client.state")
-    let readyPath: str = os.JoinPath(tmpDir, "server.ready")
-    let serverLogName: str = v3BackendDriverConcat3("server.", label, ".log")
-    let serverLog: str = os.JoinPath(outDir, serverLogName)
-    let syncLogName: str = v3BackendDriverConcat3("sync.", label, ".log")
-    let syncLog: str = os.JoinPath(outDir, syncLogName)
-    let _ = os.RemoveFile(serverState)
-    let _ = os.RemoveFile(clientState)
-    let _ = os.RemoveFile(readyPath)
-    var initArgs: str[] = []
-    add(initArgs, "--state:" + serverState)
-    add(initArgs, "--node-id:node-a")
-    add(initArgs, "--address-seed:chain-node-a")
-    let initLogName: str = v3BackendDriverConcat3("init.", label, ".log")
-    let initLogPath: str = os.JoinPath(outDir, initLogName)
-    let initRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                "v3 chain_node cli init " + label,
-                                                                initBin,
-                                                                initArgs,
-                                                                20,
-                                                                initLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli init", initRun):
-        return initRun.exitCode
-    var mintArgs: str[] = []
-    add(mintArgs, "--state:" + serverState)
-    add(mintArgs, "--asset:7")
-    add(mintArgs, "--account:1001")
-    add(mintArgs, "--amount:100")
-    let mintLogName: str = v3BackendDriverConcat3("mint.", label, ".log")
-    let mintLogPath: str = os.JoinPath(outDir, mintLogName)
-    let mintRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                "v3 chain_node cli mint " + label,
-                                                                mintBin,
-                                                                mintArgs,
-                                                                20,
-                                                                mintLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli mint", mintRun):
-        return mintRun.exitCode
-    var transferArgs: str[] = []
-    add(transferArgs, "--state:" + serverState)
-    add(transferArgs, "--asset:7")
-    add(transferArgs, "--from:1001")
-    add(transferArgs, "--to:2002")
-    add(transferArgs, "--amount:40")
-    let transferLogName: str = v3BackendDriverConcat3("transfer.", label, ".log")
-    let transferLogPath: str = os.JoinPath(outDir, transferLogName)
-    let transferRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                    "v3 chain_node cli transfer " + label,
-                                                                    transferBin,
-                                                                    transferArgs,
-                                                                    20,
-                                                                    transferLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli transfer", transferRun):
-        return transferRun.exitCode
-    var balanceAArgs: str[] = []
-    add(balanceAArgs, "--state:" + serverState)
-    add(balanceAArgs, "--asset:7")
-    add(balanceAArgs, "--account:1001")
-    let balanceALogName: str = v3BackendDriverConcat3("balance_a.", label, ".log")
-    let balanceALogPath: str = os.JoinPath(outDir, balanceALogName)
-    let balanceARun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                    "v3 chain_node cli balance-a " + label,
-                                                                    balanceBin,
-                                                                    balanceAArgs,
-                                                                    20,
-                                                                    balanceALogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli balance-a", balanceARun):
-        return balanceARun.exitCode
-    var balanceBArgs: str[] = []
-    add(balanceBArgs, "--state:" + serverState)
-    add(balanceBArgs, "--asset:7")
-    add(balanceBArgs, "--account:2002")
-    let balanceBLogName: str = v3BackendDriverConcat3("balance_b.", label, ".log")
-    let balanceBLogPath: str = os.JoinPath(outDir, balanceBLogName)
-    let balanceBRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                    "v3 chain_node cli balance-b " + label,
-                                                                    balanceBin,
-                                                                    balanceBArgs,
-                                                                    20,
-                                                                    balanceBLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli balance-b", balanceBRun):
-        return balanceBRun.exitCode
-    var showArgs: str[] = []
-    add(showArgs, "--state:" + serverState)
-    let showLogName: str = v3BackendDriverConcat3("show.", label, ".log")
-    let showLogPath: str = os.JoinPath(outDir, showLogName)
-    let showRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                "v3 chain_node cli show-state " + label,
-                                                                showBin,
-                                                                showArgs,
-                                                                20,
-                                                                showLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli show-state", showRun):
-        return showRun.exitCode
-    var snapshotArgs: str[] = []
-    add(snapshotArgs, "--state:" + serverState)
-    let snapshotLogName: str = v3BackendDriverConcat3("snapshot.", label, ".log")
-    let snapshotLogPath: str = os.JoinPath(outDir, snapshotLogName)
-    let snapshotRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                    "v3 chain_node cli dump-snapshot " + label,
-                                                                    snapshotBin,
-                                                                    snapshotArgs,
-                                                                    20,
-                                                                    snapshotLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli dump-snapshot", snapshotRun):
-        return snapshotRun.exitCode
-    var serveArgs: str[] = []
-    add(serveArgs, "--state:" + serverState)
-    add(serveArgs, "--port:0")
-    add(serveArgs, "--ready-path:" + readyPath)
-    let serverSpawn = hostops.v3SpawnFile(rootDir,
-                                          "v3 chain_node cli daemon-serve " + label,
-                                          serveBin,
-                                          serveArgs,
-                                          [],
-                                          rootDir)
-    if IsErr(serverSpawn):
-        v3BackendDriverPrintErr(Error(serverSpawn))
-        return 1
-    var serverProc = Value(serverSpawn)
-    var serverPort = ""
-    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, serverPort):
-        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, serverLog, 1)
-        v3BackendDriverMaybePrintRunOutput(serverRun)
-        hostops.v3SpawnedProcessKill(serverProc)
-        return 1
-    let syncRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                "v3 chain_node cli daemon-sync " + label,
-                                                                syncBin,
-                                                                ["--state:" + clientState, "--node-id:node-b", "--address-seed:chain-node-b", "--host:127.0.0.1", "--port", serverPort],
-                                                                20,
-                                                                syncLog)
-    if v3BackendDriverRunFailed("v3 chain_node cli daemon-sync", syncRun):
-        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverLog)
-        v3BackendDriverMaybePrintRunOutput(serverRun)
-        return syncRun.exitCode
-    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, serverLog)
-    v3BackendDriverMaybePrintRunOutput(serverRun)
-    if serverRun.exitCode != 0:
-        return serverRun.exitCode
-    var clientBalanceAArgs: str[] = []
-    add(clientBalanceAArgs, "--state:" + clientState)
-    add(clientBalanceAArgs, "--asset:7")
-    add(clientBalanceAArgs, "--account:1001")
-    let clientBalanceALogName: str = v3BackendDriverConcat3("client_balance_a.", label, ".log")
-    let clientBalanceALogPath: str = os.JoinPath(outDir, clientBalanceALogName)
-    let clientBalanceARun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                          "v3 chain_node cli client-balance-a " + label,
-                                                                          balanceBin,
-                                                                          clientBalanceAArgs,
-                                                                          20,
-                                                                          clientBalanceALogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli client-balance-a", clientBalanceARun):
-        return clientBalanceARun.exitCode
-    var clientBalanceBArgs: str[] = []
-    add(clientBalanceBArgs, "--state:" + clientState)
-    add(clientBalanceBArgs, "--asset:7")
-    add(clientBalanceBArgs, "--account:2002")
-    let clientBalanceBLogName: str = v3BackendDriverConcat3("client_balance_b.", label, ".log")
-    let clientBalanceBLogPath: str = os.JoinPath(outDir, clientBalanceBLogName)
-    let clientBalanceBRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                          "v3 chain_node cli client-balance-b " + label,
-                                                                          balanceBin,
-                                                                          clientBalanceBArgs,
-                                                                          20,
-                                                                          clientBalanceBLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli client-balance-b", clientBalanceBRun):
-        return clientBalanceBRun.exitCode
-    var clientShowArgs: str[] = []
-    add(clientShowArgs, "--state:" + clientState)
-    let clientShowLogName: str = v3BackendDriverConcat3("client_show.", label, ".log")
-    let clientShowLogPath: str = os.JoinPath(outDir, clientShowLogName)
-    let clientShowRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                                      "v3 chain_node cli client-show " + label,
-                                                                      showBin,
-                                                                      clientShowArgs,
-                                                                      20,
-                                                                      clientShowLogPath)
-    if v3BackendDriverRunFailed("v3 chain_node cli client-show", clientShowRun):
-        return clientShowRun.exitCode
-    if !v3BackendDriverRequireOutput(initRun, "node_id=node-a", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(balanceARun, "balance=60", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(balanceBRun, "balance=40", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(showRun, "node_id=node-a", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(snapshotRun, "payload_hex=", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(syncRun, "changed=1", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(clientBalanceARun, "balance=60", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(clientBalanceBRun, "balance=40", "v3 chain_node cli smoke") ||
-       !v3BackendDriverRequireOutput(clientShowRun, "node_id=node-b", "v3 chain_node cli smoke"):
-        return 1
-    v3BackendDriverMaybePrintRunOutput(initRun)
-    v3BackendDriverMaybePrintRunOutput(mintRun)
-    v3BackendDriverMaybePrintRunOutput(transferRun)
-    v3BackendDriverMaybePrintRunOutput(balanceARun)
-    v3BackendDriverMaybePrintRunOutput(balanceBRun)
-    v3BackendDriverMaybePrintRunOutput(showRun)
-    v3BackendDriverMaybePrintRunOutput(snapshotRun)
-    v3BackendDriverMaybePrintRunOutput(serverRun)
-    v3BackendDriverMaybePrintRunOutput(syncRun)
-    v3BackendDriverMaybePrintRunOutput(clientBalanceARun)
-    v3BackendDriverMaybePrintRunOutput(clientBalanceBRun)
-    v3BackendDriverMaybePrintRunOutput(clientShowRun)
+    let logName: str = v3BackendDriverConcat3("forward.", label, ".log")
+    let logPath: str = os.JoinPath(outDir, logName)
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    let compilerArg: str = v3BackendDriverConcat2("--compiler:", compilerPath)
+    let labelArg: str = v3BackendDriverConcat2("--label:", label)
+    let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                            "v3 chain_node cli smoke " + label,
+                                                            stage3Path,
+                                                            ["run-chain-node-cli-smoke", compilerArg, labelArg],
+                                                            120,
+                                                            logPath)
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed("v3 chain_node cli smoke", run):
+        return run.exitCode
     let okText: str = v3BackendDriverConcat3("v3 chain_node cli smoke ok (", label, ")")
-    v3BackendDriverPrintLine(okText)
+    if !v3BackendDriverRequireOutput(run, okText, "v3 chain_node cli smoke"):
+        return 1
     return 0
 
 fn v3BackendDriverRunChainNodeProcessSmoke(rootDir: str,
@@ -3879,17 +3775,17 @@ fn v3BackendDriverVerifyExportVisibility(rootDir: str): int32 =
         v3BackendDriverPrintErr("v3 backend driver: missing self path for verify-export-visibility")
         return 2
     let label: str = v3BackendDriverVerifyExportLabel(selfPath)
-    let smokes: str[] = ["export_visibility_smoke", "export_visibility_negative_smoke", "strformat_export_negative_smoke"]
     let logPath: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/verify_export_visibility.log")
-    let run: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
-                                                                      selfPath,
-                                                                      selfPath,
-                                                                      label,
-                                                                      smokes,
-                                                                      logPath)
-    v3BackendDriverMaybePrintRunOutput(run)
-    if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility", run):
-        return run.exitCode
+    var args: str[] = []
+    add(args, "--compiler:" + selfPath)
+    add(args, "--label:" + label)
+    add(args, "export_visibility_smoke")
+    add(args, "export_visibility_negative_smoke")
+    add(args, "strformat_export_negative_smoke")
+    let runCode: int32 = v3BackendDriverRunHostSmokesLocal(rootDir, args)
+    if runCode != 0:
+        return runCode
+    let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, "v3 host smokes: ok\n")
     return 0
 
 fn v3BackendDriverVerifyExportVisibilityParallel(rootDir: str): int32 =
@@ -3916,15 +3812,16 @@ fn v3BackendDriverVerifyExportVisibilityParallel(rootDir: str): int32 =
     v3BackendDriverMaybePrintRunOutput(stage3Run)
     if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility-parallel stage3", stage3Run):
         return stage3Run.exitCode
-    let backendRun: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
-                                                                              selfPath,
-                                                                              selfPath,
-                                                                              backendLabel,
-                                                                              smokes,
-                                                                              backendLog)
-    v3BackendDriverMaybePrintRunOutput(backendRun)
-    if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility-parallel backend", backendRun):
-        return backendRun.exitCode
+    var backendArgs: str[] = []
+    add(backendArgs, "--compiler:" + selfPath)
+    add(backendArgs, "--label:" + backendLabel)
+    add(backendArgs, "export_visibility_smoke")
+    add(backendArgs, "export_visibility_negative_smoke")
+    add(backendArgs, "strformat_export_negative_smoke")
+    let backendCode: int32 = v3BackendDriverRunHostSmokesLocal(rootDir, backendArgs)
+    if backendCode != 0:
+        return backendCode
+    let _logged: bool = v3path.V3WriteTextFile(rootDir, backendLog, "v3 host smokes: ok\n")
     let stage3TextRaw: str = v3path.V3ReadTextFile("", stage3Log)
     let stage3Text: str = strutil.Strip(stage3TextRaw)
     let backendTextRaw: str = v3path.V3ReadTextFile("", backendLog)
