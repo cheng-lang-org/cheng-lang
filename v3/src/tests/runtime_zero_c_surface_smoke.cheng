@@ -1,3 +1,4 @@
+import std/cmdline as cmdline
 import std/os
 import std/buffer
 import std/rawbytes
@@ -12,24 +13,45 @@ fn runtimeZeroCPrefix(prefix: str, value: str): str =
     buffer.AppendBytes(out, value)
     return rawbytes.bytesToString(buffer.ToBytes(out))
 
+fn runtimeZeroCSurfaceTag(): str =
+    let programPath = cmdline.ProgramName()
+    let programParts = os.SplitFile(programPath)
+    if len(programParts.dir) > 0:
+        let dirParts = os.SplitFile(programParts.dir)
+        if len(dirParts.name) > 0:
+            return dirParts.name
+    if len(programParts.name) > 0:
+        return programParts.name
+    return "host"
+
 fn main(): int32 =
     let root = os.GetCurrentDir()
     let driver = os.JoinPath(root, "artifacts/v3_backend_driver/cheng")
     let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_runtime_zero_c_surface_smoke")
     let auditLog = os.JoinPath(outDir, "host_bridge_audit.log")
-    let browserLabel = "runtime_zero_script_surface"
+    let smokeTag = runtimeZeroCSurfaceTag()
+    let browserLabel = runtimeZeroCPrefix("runtime_zero_script_surface_", smokeTag)
     let browserLog = os.JoinPath(outDir, "browser_host_wasm.log")
+    let wasmLabel = runtimeZeroCPrefix("runtime_zero_script_wasm_", smokeTag)
+    let wasmLog = os.JoinPath(outDir, "wasm_smokes.log")
     let browserRunnerBase = runtimeZeroCPrefix("artifacts/v3_browser_host_wasm/browser_host_wasm_runner.",
                                                browserLabel)
     let browserRunnerRel = runtimeZeroCPrefix(browserRunnerBase, ".js")
     let browserRunnerPath = v3path.V3PathAbsolute(root, browserRunnerRel)
+    let wasmRunnerBase = runtimeZeroCPrefix("artifacts/v3_wasm_smokes/run_wasm_smokes.", wasmLabel)
+    let wasmRunnerRel = runtimeZeroCPrefix(wasmRunnerBase, ".js")
+    let wasmRunnerPath = v3path.V3PathAbsolute(root, wasmRunnerRel)
     assert(v3path.V3MkdirP(root, outDir), "v3 runtime zero c surface: mkdir")
     if v3path.V3PathFileExists(auditLog):
         os.RemoveFile(auditLog)
     if v3path.V3PathFileExists(browserLog):
         os.RemoveFile(browserLog)
+    if v3path.V3PathFileExists(wasmLog):
+        os.RemoveFile(wasmLog)
     if v3path.V3PathFileExists(browserRunnerPath):
         os.RemoveFile(browserRunnerPath)
+    if v3path.V3PathFileExists(wasmRunnerPath):
+        os.RemoveFile(wasmRunnerPath)
     let run = hostops.v3RunFileLogged(root,
                                       "runtime_zero_c_surface_audit",
                                       driver,
@@ -76,5 +98,23 @@ fn main(): int32 =
            "v3 runtime zero c surface: browser host wasm ok")
     assert(!v3path.V3PathFileExists(browserRunnerPath),
            "v3 runtime zero c surface: no browser host wasm temp js")
+    var wasmArgs: str[]
+    wasmArgs = []
+    add(wasmArgs, "run-wasm-smokes")
+    add(wasmArgs, runtimeZeroCPrefix("--compiler:", driver))
+    add(wasmArgs, runtimeZeroCPrefix("--label:", wasmLabel))
+    let wasmRun = hostops.v3RunFileLogged(root,
+                                          "runtime_zero_script_wasm_smokes",
+                                          driver,
+                                          wasmArgs,
+                                          [],
+                                          root,
+                                          0,
+                                          wasmLog)
+    assert(wasmRun.exitCode == 0, "v3 runtime zero c surface: wasm smokes rc")
+    assert(strings.StrContains(wasmRun.output, "v3 wasm smokes: ok"),
+           "v3 runtime zero c surface: wasm smokes ok")
+    assert(!v3path.V3PathFileExists(wasmRunnerPath),
+           "v3 runtime zero c surface: no wasm smokes temp js")
     echo("v3 runtime_zero_c_surface_smoke ok")
     return 0

@@ -1,0 +1,115 @@
+import std/result
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/backend/lowering_plan as lower
+
+fn buildLinkPlan(workspaceRoot: str,
+                 packageRoot: str,
+                 sourcePath: str,
+                 outputPath: str,
+                 emitKind: int32): slplan.V3SystemLinkPlanStub =
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        emitKind,
+        ""
+    )
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err),
+           "v3 lowering matrix: link plan")
+    return linkPlan
+
+fn main(): int32 =
+    let workspaceRoot: str = v3path.V3PathCurrentDir()
+    let packageRoot: str = v3path.V3PathJoin(workspaceRoot, "v3")
+    let fixturePath: str = v3path.V3PathJoin(packageRoot, "src/tests/lowering_matrix_fixture.cheng")
+    let outputPath: str = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_lowering_matrix/lowering_matrix_fixture")
+    let linkPlan = buildLinkPlan(workspaceRoot,
+                                 packageRoot,
+                                 fixturePath,
+                                 outputPath,
+                                 creq.v3EmitShared)
+    var err = ""
+    var plan: lower.V3LoweringPlanStub
+    assert(lower.v3BuildLoweringPlanStub(linkPlan, plan, err),
+           "v3 lowering matrix: lowering plan")
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(csgRes), "v3 lowering matrix: compiler csg")
+    let csg = ccsg.v3CompilerCsgClone(Value(csgRes))
+    let fixtureFacts = ccsg.v3TypedExprFactsForSource(csg.typedExprFacts, fixturePath)
+    let fixtureRules = ccsg.v3TypedExprLoweringRulesFromFacts(fixtureFacts)
+    var argAddressCount: int32 = 0
+    var argCallResultAddressCount: int32 = 0
+    var argValueCount: int32 = 0
+    var resultRegCount: int32 = 0
+    var resultLocalAddressCount: int32 = 0
+    var resultSretCount: int32 = 0
+    var materializeRegisterCount: int32 = 0
+    var materializeLocalSlotCount: int32 = 0
+    var materializeCallResultLocalCount: int32 = 0
+    var materializeDestAddressCount: int32 = 0
+    var copyScalarStoreCount: int32 = 0
+    var copyRegionCount: int32 = 0
+    var importBuiltinAddressCount: int32 = 0
+    var importValueSlotCount: int32 = 0
+    var importAddressSlotCount: int32 = 0
+    let planRules = lower.v3LoweringPlanRulesForSource(plan, fixturePath)
+    assert(fixtureRules.len > 0, "v3 lowering matrix: fixture rules")
+    assert(ccsg.v3TypedExprLoweringRulesEqual(fixtureRules, planRules),
+           "v3 lowering matrix: compiler csg vs lowering plan")
+    for i in 0..<fixtureRules.len:
+        let rule = fixtureRules[i]
+        if rule.argPassKindText == "address":
+            argAddressCount = argAddressCount + 1
+        if rule.argPassKindText == "call_result_address":
+            argCallResultAddressCount = argCallResultAddressCount + 1
+        if rule.argPassKindText == "value":
+            argValueCount = argValueCount + 1
+        if rule.resultPassKindText == "reg":
+            resultRegCount = resultRegCount + 1
+        if rule.resultPassKindText == "local_address":
+            resultLocalAddressCount = resultLocalAddressCount + 1
+        if rule.resultPassKindText == "sret":
+            resultSretCount = resultSretCount + 1
+        if rule.materializeKindText == "register":
+            materializeRegisterCount = materializeRegisterCount + 1
+        if rule.materializeKindText == "local_slot":
+            materializeLocalSlotCount = materializeLocalSlotCount + 1
+        if rule.materializeKindText == "call_result_local":
+            materializeCallResultLocalCount = materializeCallResultLocalCount + 1
+        if rule.materializeKindText == "dest_address":
+            materializeDestAddressCount = materializeDestAddressCount + 1
+        if rule.copyKindText == "scalar_store":
+            copyScalarStoreCount = copyScalarStoreCount + 1
+        if rule.copyKindText == "region_copy":
+            copyRegionCount = copyRegionCount + 1
+        if rule.importKindText == "builtin_address_slot":
+            importBuiltinAddressCount = importBuiltinAddressCount + 1
+        if rule.importKindText == "i32_value_slot":
+            importValueSlotCount = importValueSlotCount + 1
+        if rule.importKindText == "i32_address_slot":
+            importAddressSlotCount = importAddressSlotCount + 1
+    assert(argAddressCount > 0, "v3 lowering matrix: address arg rule")
+    assert(argCallResultAddressCount > 0, "v3 lowering matrix: call-result address arg rule")
+    assert(argValueCount > 0, "v3 lowering matrix: value arg rule")
+    assert(resultRegCount > 0, "v3 lowering matrix: reg result rule")
+    assert(resultLocalAddressCount > 0, "v3 lowering matrix: local-address result rule")
+    assert(resultSretCount > 0, "v3 lowering matrix: sret result rule")
+    assert(materializeRegisterCount > 0, "v3 lowering matrix: register materialize rule")
+    assert(materializeLocalSlotCount > 0, "v3 lowering matrix: local-slot materialize rule")
+    assert(materializeCallResultLocalCount > 0, "v3 lowering matrix: call-result local materialize rule")
+    assert(materializeDestAddressCount > 0, "v3 lowering matrix: dest-address materialize rule")
+    assert(copyScalarStoreCount > 0, "v3 lowering matrix: scalar-store copy rule")
+    assert(copyRegionCount > 0, "v3 lowering matrix: region-copy rule")
+    assert(importBuiltinAddressCount > 0, "v3 lowering matrix: builtin address import rule")
+    assert(importValueSlotCount > 0, "v3 lowering matrix: value-slot import rule")
+    assert(importAddressSlotCount > 0, "v3 lowering matrix: address-slot import rule")
+    echo("v3 lowering_matrix_smoke ok")
+    return 0

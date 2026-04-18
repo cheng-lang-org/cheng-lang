@@ -5,6 +5,7 @@ import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/lang/intern as langintern
 import cheng/v3/lang/parser
+import cheng/v3/lang/typed_expr as texpr
 import cheng/v3/backend/system_link_plan as slplan
 
 type
@@ -18,6 +19,7 @@ type
         compilerCsgCid: layout.FixedBytes32
         exprLayer: parser.V3NormalizedExprLayer
         typedExprFacts: ccsg.V3TypedExprFact[]
+        loweringRules: texpr.V3TypedExprLoweringRule[]
         functionSourcePaths: str[]
         functionOwnerModulePaths: str[]
         functionNames: str[]
@@ -147,6 +149,7 @@ fn v3BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
     plan.functionCallConvs = []
     plan.functionResultLayoutKinds = []
     plan.typedExprFacts = []
+    plan.loweringRules = []
     let workspaceRoot = slplan.v3SystemLinkPlanWorkspaceRoot(linkPlan)
     let packageRoot = slplan.v3SystemLinkPlanPackageRoot(linkPlan)
     let packageId = slplan.v3SystemLinkPlanPackageId(linkPlan)
@@ -181,6 +184,7 @@ fn v3BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
     plan.compilerCsgCid = compilerCsg.graphCid
     plan.exprLayer = parser.v3NormalizedExprLayerClone(compilerCsg.exprLayer)
     plan.typedExprFacts = ccsg.v3CompilerCsgCloneTypedExprFacts(compilerCsg.typedExprFacts)
+    plan.loweringRules = texpr.v3TypedExprLoweringRulesFromFacts(plan.typedExprFacts)
     plan.missingReasons = missingReasons
     plan.pipelineStage = "canonical_csg_to_lowering_plan_stub"
     err = ""
@@ -194,6 +198,16 @@ fn v3LoweringPlanFunctionNameIds(plan: V3LoweringPlanStub): langintern.V3InternI
 
 fn v3LoweringPlanFunctionNamesField(plan: V3LoweringPlanStub): str[] =
     return plan.functionNames
+
+fn v3LoweringPlanRulesForSource(plan: V3LoweringPlanStub,
+                                sourcePathRaw: str): texpr.V3TypedExprLoweringRule[] =
+    let sourcePath = parser.v3ParserNormalizePath(sourcePathRaw)
+    var out: texpr.V3TypedExprLoweringRule[] = []
+    for i in 0..<plan.loweringRules.len:
+        if plan.loweringRules[i].sourcePath != sourcePath:
+            continue
+        add(out, texpr.v3TypedExprLoweringRuleClone(plan.loweringRules[i]))
+    return out
 
 fn v3LoweringPlanFunctionEntryFlagsField(plan: V3LoweringPlanStub): int32[] =
     return plan.functionEntryFlags
@@ -226,6 +240,7 @@ fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     let missingReasons = slplan.v3SystemLinkPlanListText(missingField)
     let pipelineStage = v3LoweringPlanPipelineStage(plan)
     let typedExprFacts = plan.typedExprFacts
+    let loweringRules = plan.loweringRules
     if len(entryFunction) <= 0:
         entryFunction = "-"
     v3LoweringAppendLine(out, "lowering_function_count", functionCount)
@@ -259,6 +274,17 @@ fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     v3LoweringAppendLine(out, "typed_expr_lower_sret_count", intToStr(ccsg.v3TypedExprLowerSretCount(typedExprFacts)))
     v3LoweringAppendLine(out, "typed_expr_lower_import_buffer_count", intToStr(ccsg.v3TypedExprLowerImportBufferCount(typedExprFacts)))
     v3LoweringAppendLine(out, "typed_expr_lower_deferred_count", intToStr(ccsg.v3TypedExprLowerDeferredCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_call_none_count", intToStr(ccsg.v3TypedExprCallNoneCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_call_builtin_count", intToStr(ccsg.v3TypedExprCallBuiltinCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_call_result_intrinsic_count", intToStr(ccsg.v3TypedExprCallResultIntrinsicCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_call_projection_count", intToStr(ccsg.v3TypedExprCallProjectionCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_return_reg_count", intToStr(ccsg.v3TypedExprReturnRegCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_return_composite_local_count", intToStr(ccsg.v3TypedExprReturnCompositeLocalCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_return_sret_count", intToStr(ccsg.v3TypedExprReturnSretCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_return_import_buffer_count", intToStr(ccsg.v3TypedExprReturnImportBufferCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "typed_expr_return_deferred_count", intToStr(ccsg.v3TypedExprReturnDeferredCount(typedExprFacts)))
+    v3LoweringAppendLine(out, "lowering_rule_count", intToStr(loweringRules.len))
+    v3LoweringAppendLine(out, "lowering_rule_unique_key_count", intToStr(texpr.v3TypedExprLoweringRuleUniqueKeyCount(loweringRules)))
     v3LoweringAppendLine(out, "lowering_source_bundle_cid", layout.fixedBytes32Hex(plan.sourceBundleCid))
     v3LoweringAppendLine(out, "lowering_compiler_csg_cid", layout.fixedBytes32Hex(plan.compilerCsgCid))
     v3LoweringAppendLine(out, "lowering_missing_reasons", missingReasons)

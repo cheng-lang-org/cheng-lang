@@ -2,6 +2,8 @@ import std/cmdline as cmdline
 import std/monotimes
 import std/os
 import std/result
+import std/buffer
+import std/rawbytes
 import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
@@ -44,6 +46,24 @@ fn v3BackendDriverPrintStdoutBlock(text: str) =
 
 fn v3BackendDriverPrintStderrBlock(text: str) =
     v3BackendDriverPrintBlock(v3BackendDriverStderrBridge(), text)
+
+fn v3BackendDriverConcat2(a: str, b: str): str =
+    var out: buffer.ByteBuffer
+    out.data = rawbytes.emptyBytes()
+    buffer.AppendBytes(out, a)
+    buffer.AppendBytes(out, b)
+    return rawbytes.bytesToString(buffer.ToBytes(out))
+
+fn v3BackendDriverConcat3(a: str, b: str, c: str): str =
+    var out: buffer.ByteBuffer
+    out.data = rawbytes.emptyBytes()
+    buffer.AppendBytes(out, a)
+    buffer.AppendBytes(out, b)
+    buffer.AppendBytes(out, c)
+    return rawbytes.bytesToString(buffer.ToBytes(out))
+
+fn v3BackendDriverAppendAssign(out: var str, part: str) =
+    out = v3BackendDriverConcat2(out, part)
 
 fn v3BackendDriverRoot(): str =
     let envRoot: str = os.GetEnv("CHENG_V3_ROOT")
@@ -187,8 +207,8 @@ fn v3BackendDriverWriteR2cReactV3StatusReport(reportPath: str,
     report = report + "  \"standalone_node_helpers\": [\"truth_runtime_helper\"],\n"
     report = report + "  \"active_node_helpers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"exec_route_matrix_helper\", \"truth_route_helper\"],\n"
     report = report + "  \"commands\": [\"status\", \"frontend\", \"static-surface\", \"semantic-surface\", \"codegen-surface\", \"exec-surface\", \"native-gui-bundle\", \"run-native-gui\", \"replay-hit-inspector\", \"exec-route-matrix\", \"compile\", \"discover-truth-routes\", \"capture-truth\", \"compare-truth\", \"compare-truth-matrix\", \"prototype\"]\n"
-    report = report + "}\n"
-    return v3path.V3WriteTextFile("", reportPath, report)
+    v3BackendDriverAppendAssign(report, "}\n")
+    return v3path.V3WriteTextFile(rootDir, reportPath, report)
 
 fn v3BackendDriverR2cReactV3Status(rootDir: str,
                                    count: int32): int32 =
@@ -268,7 +288,9 @@ fn v3BackendDriverResolveVerifyTarget(count: int32,
     let requested: str = v3BackendDriverRequestedTarget(count)
     let defaultTarget: str = contracts.v3BootstrapDefaultTarget()
     if requested != defaultTarget:
-        v3BackendDriverPrintErr("v3 backend driver: " + context + " only supports host backend_driver target")
+        v3BackendDriverPrintErr(v3BackendDriverConcat3("v3 backend driver: ",
+                                                       context,
+                                                       " only supports host backend_driver target"))
         outTarget = ""
         return false
     let hostTarget: str = v3BackendDriverHostTarget()
@@ -487,7 +509,9 @@ fn v3BackendDriverRunSharedEmitSmokes(rootDir: str,
     let expectedHint: str = v3BackendDriverSharedEmitFileHint(targetTriple)
     if len(expectedHint) > 0:
         if !v3path.V3TextContains(fileText, expectedHint):
-            v3BackendDriverPrintErr("v3 backend driver: shared emit smoke expected `" + expectedHint + "` in file output")
+            v3BackendDriverPrintErr(v3BackendDriverConcat3("v3 backend driver: shared emit smoke expected `",
+                                                           expectedHint,
+                                                           "` in file output"))
             let trimmedFileText: str = strutil.Strip(fileText)
             if len(trimmedFileText) > 0:
                 v3BackendDriverPrintErr(trimmedFileText)
@@ -965,13 +989,14 @@ fn v3BackendDriverResolveToolCompiler(rootDir: str,
     v3BackendDriverPrintErr("v3 backend driver: missing compiler path for " + toolName)
     return false
 
-fn v3BackendDriverCompileExe(rootDir: str,
-                             label: str,
-                             compilerPath: str,
-                             sourcePath: str,
-                             outPath: str,
-                             target: str,
-                             logPath: str): hostops.V3LoggedRun =
+fn v3BackendDriverCompileEmit(rootDir: str,
+                              label: str,
+                              compilerPath: str,
+                              sourcePath: str,
+                              emitKind: str,
+                              outPath: str,
+                              target: str,
+                              logPath: str): hostops.V3LoggedRun =
     let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
     let outParts: os.SplitFileResult = os.SplitFile(outPath)
     if len(outParts.dir) > 0:
@@ -990,7 +1015,7 @@ fn v3BackendDriverCompileExe(rootDir: str,
     add(compileArgs, "--in")
     add(compileArgs, sourcePath)
     add(compileArgs, "--emit")
-    add(compileArgs, "exe")
+    add(compileArgs, emitKind)
     add(compileArgs, "--target")
     add(compileArgs, target)
     add(compileArgs, "--out")
@@ -1009,6 +1034,22 @@ fn v3BackendDriverCompileExe(rootDir: str,
             let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, outputText)
             return hostops.v3LoggedRunZero(label, compilerPath, logPath, 1, outputText)
     return run
+
+fn v3BackendDriverCompileExe(rootDir: str,
+                             label: str,
+                             compilerPath: str,
+                             sourcePath: str,
+                             outPath: str,
+                             target: str,
+                             logPath: str): hostops.V3LoggedRun =
+    return v3BackendDriverCompileEmit(rootDir,
+                                      label,
+                                      compilerPath,
+                                      sourcePath,
+                                      "exe",
+                                      outPath,
+                                      target,
+                                      logPath)
 
 fn v3BackendDriverRunBinary(rootDir: str,
                             label: str,
@@ -1045,24 +1086,28 @@ fn v3BackendDriverRunToolFromSourceWithCompiler(rootDir: str,
     let outBin: str = os.JoinPath(outDir, toolName)
     let compileLogPath: str = os.JoinPath(outDir, toolName + ".compile.log")
     let runLogPath: str = os.JoinPath(outDir, toolName + ".run.log")
+    let compileLabel: str = v3BackendDriverConcat3("backend_driver_", toolName, "_compile")
     let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
-                                                                    "backend_driver_" + toolName + "_compile",
+                                                                    compileLabel,
                                                                     compilerPath,
                                                                     sourcePath,
                                                                     outBin,
                                                                     v3BackendDriverToolTarget(),
                                                                     compileLogPath)
-    if v3BackendDriverRunFailed("v3 backend driver: " + toolName + " compile", compileRun):
+    let compileContext: str = v3BackendDriverConcat3("v3 backend driver: ", toolName, " compile")
+    if v3BackendDriverRunFailed(compileContext, compileRun):
         return compileRun.exitCode
+    let runLabel: str = v3BackendDriverConcat3("backend_driver_", toolName, "_run")
     let run: hostops.V3LoggedRun = v3BackendDriverRunBinaryEnv(rootDir,
-                                                               "backend_driver_" + toolName + "_run",
+                                                               runLabel,
                                                                outBin,
                                                                args,
                                                                envOverrides,
                                                                0,
                                                                runLogPath)
     if run.exitCode != 0:
-        let _printed: bool = v3BackendDriverPrintRunFailure("v3 backend driver: " + toolName, run)
+        let runContext: str = v3BackendDriverConcat2("v3 backend driver: ", toolName)
+        let _printed: bool = v3BackendDriverPrintRunFailure(runContext, run)
         return run.exitCode
     let outputText: str = strutil.Strip(run.output)
     if len(outputText) > 0:
@@ -1196,31 +1241,20 @@ fn v3BackendDriverResolveBrowserHostWasmCompiler(rootDir: str,
     return v3BackendDriverResolveToolCompiler(rootDir, "browser-host-wasm", outCompiler)
 
 fn v3BackendDriverBuildBrowserHostWasmArtifact(rootDir: str,
+                                               compilerPath: str,
                                                outWasm: str,
                                                logPath: str,
                                                label: str): int32 =
-    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
-    if !v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
-        v3BackendDriverPrintErr("v3 backend driver: missing stage3 compiler: " + stage3Path)
-        return 2
-    let timeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")))
-    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
-                                                           label,
-                                                           stage3Path,
-                                                           ["build-browser-host-wasm", outWasm],
-                                                           ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
-                                                           rootDir,
-                                                           timeoutSec,
-                                                           logPath)
-    let outputText: str = strutil.Strip(run.output)
-    if len(outputText) > 0:
-        if run.exitCode == 0:
-            v3BackendDriverPrintStdoutBlock(outputText)
-        else:
-            v3BackendDriverPrintStderrBlock(outputText)
-    if run.exitCode != 0:
-        v3BackendDriverPrintErr("v3 browser host wasm build rc=" +
-                                intToStr(run.exitCode) + " log=" + run.logPath)
+    let sourcePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/libp2p/browser/browser_host_wasm_probe.cheng")
+    let run: hostops.V3LoggedRun = v3BackendDriverCompileEmit(rootDir,
+                                                              label,
+                                                              compilerPath,
+                                                              sourcePath,
+                                                              "shared",
+                                                              outWasm,
+                                                              "wasm32-unknown-unknown",
+                                                              logPath)
+    if v3BackendDriverRunFailed("v3 browser host wasm build", run):
         return run.exitCode
     if !os.FileExists(outWasm):
         v3BackendDriverPrintErr("v3 browser host wasm: missing wasm output: " + outWasm)
@@ -1229,6 +1263,9 @@ fn v3BackendDriverBuildBrowserHostWasmArtifact(rootDir: str,
 
 fn v3BackendDriverBuildBrowserHostWasm(rootDir: str,
                                        args: str[]): int32 =
+    var compilerPath: str = ""
+    if !v3BackendDriverResolveBrowserHostWasmCompiler(rootDir, args, compilerPath):
+        return 2
     let filteredArgs: str[] = v3BackendDriverArgsWithoutFlag(args, "--compiler")
     let positionals: str[] = v3BackendDriverCollectPositionals(filteredArgs)
     let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_browser_host_wasm")
@@ -1240,22 +1277,123 @@ fn v3BackendDriverBuildBrowserHostWasm(rootDir: str,
     else:
         outWasm = v3path.V3PathAbsolute(rootDir, outWasm)
     return v3BackendDriverBuildBrowserHostWasmArtifact(rootDir,
+                                                       compilerPath,
                                                        outWasm,
                                                        os.JoinPath(outDir, "cheng_browser_host_abi.compile.log"),
                                                        "build_browser_host_wasm")
 
+fn v3BackendDriverRunWasmSmokes(rootDir: str,
+                                args: str[]): int32 =
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_wasm_smokes")
+    if !v3path.V3MkdirP(rootDir, outDir):
+        v3BackendDriverPrintErr("v3 wasm smokes: failed to create out dir")
+        return 2
+    var compilerPath: str = ""
+    if !v3BackendDriverResolveBrowserHostWasmCompiler(rootDir, args, compilerPath):
+        return 2
+    let label: str = v3BackendDriverResolveSmokeLabel(args, "CHENG_V3_WASM_LABEL", "host")
+    let hostTarget: str = v3BackendDriverHostTarget()
+    if len(hostTarget) <= 0:
+        v3BackendDriverPrintErr("v3 wasm smokes: unsupported host target")
+        return 2
+    let smokeNames: str[] = [
+        "wasm_zero_smoke",
+        "wasm_internal_call_smoke",
+        "wasm_importc_noarg_i32_smoke"
+    ]
+    for i in 0..<smokeNames.len:
+        let smokeName: str = smokeNames[i]
+        let wasmSourceRel: str = v3BackendDriverConcat3("v3/src/tests/", smokeName, ".cheng")
+        let wasmSource: str = v3path.V3PathAbsolute(rootDir, wasmSourceRel)
+        let smokeLabelBase: str = v3BackendDriverConcat3(smokeName, ".", label)
+        let wasmName: str = v3BackendDriverConcat2(smokeLabelBase, ".wasm")
+        let wasmPath: str = os.JoinPath(outDir, wasmName)
+        let compileLogName: str = v3BackendDriverConcat2(smokeLabelBase, ".compile.log")
+        let compileLogPath: str = os.JoinPath(outDir, compileLogName)
+        let compileLabelBase: str = v3BackendDriverConcat3("v3_wasm_smokes_compile_", smokeName, "_")
+        let compileLabel: str = v3BackendDriverConcat2(compileLabelBase, label)
+        let wasmTarget: str = "wasm32-unknown-unknown"
+        let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                        compileLabel,
+                                                                        compilerPath,
+                                                                        wasmSource,
+                                                                        wasmPath,
+                                                                        wasmTarget,
+                                                                        compileLogPath)
+        let compileContext: str = v3BackendDriverConcat3("v3 wasm smokes compile ", smokeName, "")
+        if v3BackendDriverRunFailed(compileContext, compileRun):
+            return compileRun.exitCode
+        if !os.FileExists(wasmPath):
+            v3BackendDriverPrintErr("v3 wasm smokes: missing wasm output: " + wasmPath)
+            return 1
+        var expectedExports: str[] = []
+        add(expectedExports, "main")
+        var expectedImports: str[] = []
+        if smokeName == "wasm_importc_noarg_i32_smoke":
+            add(expectedImports, "env.cheng_test_zero")
+        let wasmAuditLabel: str = v3BackendDriverConcat3("v3 wasm audit ", smokeName, "")
+        if !v3BackendDriverRequireWasmAudit(wasmAuditLabel,
+                                            wasmPath,
+                                            expectedExports,
+                                            expectedImports,
+                                            1):
+            return 1
+        if smokeName == "wasm_importc_noarg_i32_smoke":
+            let okText: str = v3BackendDriverConcat3(smokeName, ": ok", "")
+            v3BackendDriverPrintLine(okText)
+            continue
+        var hostSource: str = wasmSource
+        let hostBinName: str = v3BackendDriverConcat2(smokeLabelBase, ".host")
+        let hostBinPath: str = os.JoinPath(outDir, hostBinName)
+        let hostCompileLogName: str = v3BackendDriverConcat2(smokeLabelBase, ".host.compile.log")
+        let hostCompileLogPath: str = os.JoinPath(outDir, hostCompileLogName)
+        let hostCompileLabelBase: str = v3BackendDriverConcat3("v3_wasm_smokes_host_compile_", smokeName, "_")
+        let hostCompileLabel: str = v3BackendDriverConcat2(hostCompileLabelBase, label)
+        let hostCompileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                            hostCompileLabel,
+                                                                            compilerPath,
+                                                                            hostSource,
+                                                                            hostBinPath,
+                                                                            hostTarget,
+                                                                            hostCompileLogPath)
+        let hostCompileContext: str = v3BackendDriverConcat3("v3 wasm host compile ", smokeName, "")
+        if v3BackendDriverRunFailed(hostCompileContext, hostCompileRun):
+            return hostCompileRun.exitCode
+        let hostRunLogName: str = v3BackendDriverConcat2(smokeLabelBase, ".host.run.log")
+        let hostRunLogPath: str = os.JoinPath(outDir, hostRunLogName)
+        let hostRunLabelBase: str = v3BackendDriverConcat3("v3_wasm_smokes_host_run_", smokeName, "_")
+        let hostRunLabel: str = v3BackendDriverConcat2(hostRunLabelBase, label)
+        let hostRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                    hostRunLabel,
+                                                                    hostBinPath,
+                                                                    [],
+                                                                    0,
+                                                                    hostRunLogPath)
+        let hostRunContext: str = v3BackendDriverConcat3("v3 wasm host run ", smokeName, "")
+        if v3BackendDriverRunFailed(hostRunContext, hostRun):
+            return hostRun.exitCode
+        let okText: str = v3BackendDriverConcat3(smokeName, ": ok", "")
+        v3BackendDriverPrintLine(okText)
+    v3BackendDriverPrintLine("v3 wasm smokes: ok")
+    return 0
+
 fn v3BackendDriverRunBrowserHostWasmSmoke(rootDir: str,
                                           args: str[]): int32 =
+    var compilerPath = ""
+    if !v3BackendDriverResolveBrowserHostWasmCompiler(rootDir, args, compilerPath):
+        return 1
     let filteredArgs: str[] = v3BackendDriverArgsWithoutFlag(args, "--compiler")
     let label: str = v3BackendDriverResolveSmokeLabel(filteredArgs, "CHENG_V3_WASM_LABEL", "host")
     let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_browser_host_wasm")
-    let outWasm: str = os.JoinPath(outDir, "cheng_browser_host_abi." + label + ".wasm")
+    let outWasmName: str = v3BackendDriverConcat3("cheng_browser_host_abi.", label, ".wasm")
+    let outWasm: str = os.JoinPath(outDir, outWasmName)
+    let compileLogName: str = v3BackendDriverConcat3("cheng_browser_host_abi.", label, ".compile.log")
+    let compileLabel: str = v3BackendDriverConcat2("v3_browser_host_wasm_compile_", label)
     let buildCode: int32 = v3BackendDriverBuildBrowserHostWasmArtifact(rootDir,
+                                                                       compilerPath,
                                                                        outWasm,
-                                                                       os.JoinPath(outDir,
-                                                                                   "cheng_browser_host_abi." + label +
-                                                                                       ".compile.log"),
-                                                                       "v3_browser_host_wasm_compile_" + label)
+                                                                       os.JoinPath(outDir, compileLogName),
+                                                                       compileLabel)
     if buildCode != 0:
         return buildCode
     var expectedExports: str[] = []
@@ -1295,31 +1433,32 @@ fn v3BackendDriverRunBrowserHostWasmSmoke(rootDir: str,
                                         expectedImports,
                                         40):
         return 1
-    var compilerPath = ""
-    if !v3BackendDriverResolveBrowserHostWasmCompiler(rootDir, args, compilerPath):
-        return 1
     let hostTarget: str = v3BackendDriverHostTarget()
     if len(hostTarget) <= 0:
         v3BackendDriverPrintErr("v3 browser host wasm smoke: unsupported host target")
         return 1
     let hostSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/browser_host_native_contract_smoke.cheng")
-    let hostBin: str = os.JoinPath(outDir, "browser_host_native_contract_smoke." + label)
+    let hostBinName: str = v3BackendDriverConcat2("browser_host_native_contract_smoke.", label)
+    let hostBin: str = os.JoinPath(outDir, hostBinName)
+    let hostCompileLabel: str = v3BackendDriverConcat2("v3 browser host native compile ", label)
+    let hostCompileLogName: str = v3BackendDriverConcat3("browser_host_native_contract_smoke.", label, ".compile.log")
     let hostCompile = v3BackendDriverCompileExe(rootDir,
-                                                "v3 browser host native compile " + label,
+                                                hostCompileLabel,
                                                 compilerPath,
                                                 hostSrc,
                                                 hostBin,
                                                 hostTarget,
-                                                os.JoinPath(outDir, "browser_host_native_contract_smoke." + label + ".compile.log"))
+                                                os.JoinPath(outDir, hostCompileLogName))
     if v3BackendDriverRunFailed("v3 browser host native compile", hostCompile):
         return hostCompile.exitCode
+    let runLabel: str = v3BackendDriverConcat2("v3 browser host wasm smoke run ", label)
+    let runLogName: str = v3BackendDriverConcat3("browser_host_wasm.", label, ".run.log")
     let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                            "v3 browser host wasm smoke run " + label,
+                                                            runLabel,
                                                             hostBin,
                                                             [],
                                                             0,
-                                                            os.JoinPath(outDir,
-                                                                        "browser_host_wasm." + label + ".run.log"))
+                                                            os.JoinPath(outDir, runLogName))
     v3BackendDriverMaybePrintRunOutput(run)
     if v3BackendDriverRunFailed("v3 browser host wasm smoke", run):
         return run.exitCode
@@ -2608,6 +2747,9 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "build-browser-host-wasm" ||
        cmd == "run-browser-host-wasm-smoke":
         return v3BackendDriverRunBrowserHostWasmCommand(rootDir, count, cmd)
+    if cmd == "run-wasm-smokes":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverRunWasmSmokes(rootDir, args)
     if cmd == "verify-backend-driver-command-surface":
         return v3BackendDriverVerifyBackendDriverCommandSurface(rootDir, count)
     if cmd == "verify-mobile-shell-build-probe":

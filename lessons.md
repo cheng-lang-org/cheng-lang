@@ -1,6 +1,10 @@
 2026-04-18
+- `run-wasm-smokes` 这种正式命令不要再做 `backend_driver <-> stage3` 双向转发。现场已经坐实：两边都以为“对方更适合执行”时，live 入口会直接递归自繁殖；最稳口径是 live `backend_driver` 本地实现，seed/stage0 只做 passthrough。
+- `runtime_zero_c_surface_smoke` 这类会自己再拉 browser/wasm smoke 的验收，label 不能写死成一组常量。backend/stage0 并跑时必须按当前可执行目录或调用面派生唯一 label，不然会互踩同一组 `artifacts/v3_browser_host_wasm` / `artifacts/v3_wasm_smokes` 输出路径。
+- browser/wasm 零脚本主线已经切干净后，历史 `artifacts/*.js` helper 残留也要物理删除。否则 `find *.js` 还会把旧时代跑出来的 helper 误判成当前主线仍依赖脚本。
 - `Fmt"..."` 这种语法级模板不要再降成链式 `str + str + ...`。这轮已经现场坐实：最稳口径是编译期先拆成静态片段和占位表达式，多段时统一改写成单次 `Fmt([piece...])` 调用，让 native/wasm 都走一次总长预计算和一次分配；同时要补一条像 [strformat_fmt_lowering_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/strformat_fmt_lowering_smoke.cheng) 这样的符号级 smoke，硬卡 `primary.o` 只能引用 `_cheng_v3_strformat_fmt_bridge`，不能回退到 `_driver_c_str_concat_bridge`。
 - 手写字符串链 `"a" + x + "b" + y` 不能再和 `Fmt"..."` 走两套 lowering。最稳口径就是两边统一改写成 `Fmt([piece...])`，把 native/wasm 的分配形状收成一次总长计算、一次分配，并用 [str_concat_lowering_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/str_concat_lowering_smoke.cheng) 这种符号级 smoke 硬卡不得再引用 `_driver_c_str_concat_bridge`。
+- `std/strformat` 和 `std/strutils` 这层显式拼接接口也不能再各走各的。像这轮已经现场坐实：`sf.Fmt(parts)`、`sf.Lines(parts)`、`strutil.Join(parts, "")`、`strutil.Join(parts, "\n")` 都要在编译期先统一收成 bare `Fmt/Lines`，这样 native/wasm 才只剩同一条桥接和同一套分配形状。
 - `cheng_node` 这类统一宿主只要要把轻节点 proof/query 真持久化，就不能只写链快照。像这轮 [cheng_node_state.cheng](/Users/lbcheng/cheng-lang/v3/src/project/cheng_node_state.cheng) 已经现场坐实：正式状态最少要同时写 `chain snapshot + object store + ledger event log`，加载时再按事件日志重放统一账本，不然 `manifest/proof/snapshot segment` 会全漂。
 - ordinary 里别再把 `bytesFromHex(...)` 直接塞进 `let` 或 `return` 里的复合表达式。像这轮 `cheng_node_state` 已现场坐实：`bytesToString(bytesFromHex(raw))` 这种形状会直接卡在 `primary_object` lowering；最稳口径是本地手写最小 hex 解码，再拆成显式 `Bytes -> str` 中间变量。
 - `cheng_node` 的 DID/operator 验收不要再借 `bio_did_chain_node` 高层 helper 证明自己没问题。最稳口径是像这轮 [cheng_node_chain_did_smoke.cheng](/Users/lbcheng/cheng-lang/v3/src/tests/cheng_node_chain_did_smoke.cheng) 这样直接按链事件原语造 chunk：`assetId/toAccount/amount=ordinal/fromAccount=seq/fromParentCid=chunk`，这样验证到的就是节点真正消费的链事实。
@@ -659,3 +663,10 @@
 - `2026-04-18 22:53 +0800`：typed expr 这类“全闭包统计”验收不要直接对整条 source closure 做零值断言。closure 里只要混进 std/runtime/compiler 自身源码，全量 `typed_expr_abi_polymorphic_count=0 / typed_expr_lower_deferred_count=0` 就会被无关路径污染；最稳口径是先按目标 fixture 的 `sourcePath` 切片，再验那一片自己的 typed facts。 |
 - `2026-04-18 22:53 +0800`：ordinary 编译器控制面里，`setLen(seq, 0)`、把复合字符串直接拼进调用参数、以及 smoke 里手写长串 `+` 都还是高风险形状。后面默认直接用“显式空序列赋值 + concat helper + 单字符串 literal”，不要再反复踩同一个坑。 |
 - `2026-04-18 22:53 +0800`：为了先让 ordinary 通过，不要把前端错误信息永久降成模糊常量。像这轮 `func` alias 拒绝，走稳定 concat helper 后，既能保住精确文本 `unsupported top-level function alias 'func'`，又不会把控制面重新打红；以后遇到同类情况，优先恢复精确错误。 |
+- `2026-04-18 22:59 +0800`：ordinary/stage0 热路径里的字符串 `+` 链不要再手写。只要是 wire key、bundle seed、错误文本、HTTP/relay/tailnet/webrtc 这类热路径，直接上稳定 helper，像 `concat_assign/prefix_key/lines_with_newline/build_bundle_seed` 这种小函数，比到处写 `a + b + c` 稳得多。 |
+- `2026-04-18 22:59 +0800`：碰到 browser host native contract / wasm ABI 这类崩点，先切最小 probe，再用 `lldb` 把崩点钉到单个 helper 或单个 lowering 形状，别一上来就在整条 smoke 里盲修。 |
+- `2026-04-18 22:59 +0800`：host smoke 行为一旦和最新源码对不上，先清 `artifacts/v3_hostrun/<label>` 再复跑；旧 label 目录会把很多已经修掉的问题伪装成还没修。 |
+- `2026-04-18 23:08 +0800`：typed lowering 只要开始给后端当真 contract，就不要只停在 `type/abi/place/lowering` 这种浅标签。最稳口径是把 `call_kind + return_kind` 一起写进共享 fact，让 `compiler_csg/lowering_plan` 和后面所有消费者都吃同一份 key。 |
+- `2026-04-18 23:08 +0800`：`str/rawbytes/seq/result` 这类复合值的地址/返回语义别再散在 native/wasm 各处手写判断。先收成 `type_prefers_address / function_return_prefers_address` 这种共享 helper，再把显式 `return`、隐式 `return`、静态返回槽、复合 call-return 这些总入口统一接过去，后面才不会继续 target 分叉。 |
+- `2026-04-19 04:37 +0800`：只要新 helper 被插到 seed 前半段，就先把后面才定义的 C 符号一并补前置声明。像这轮 `v3_emit_address_call_arg_spill(...)` 一进来就会用到 `v3_emit_slot_address / v3_emit_local_value_address / v3_emit_call_arg_spill_store / v3_materialize_composite_expr_into_*`；不先补 prototype，`-std=c11 -pedantic` 会直接把它们全打成 implicit declaration。 |
+- `2026-04-19 04:37 +0800`：wasm 参数分析和发射不要再分别写“是不是 composite”判断。最稳口径是像这轮一样先收一个 `call_arg_prefers_address`，再让 analyze path、statement path、builtin path、emit path 都吃这同一个判断；否则 native/wasm 刚收平，wasm 内部自己又会重新分叉。 |

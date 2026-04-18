@@ -30,6 +30,19 @@ type
         v3TypedExprLowerImportBuffer
         v3TypedExprLowerDeferred
 
+    V3TypedExprCallKind = enum
+        v3TypedExprCallNone
+        v3TypedExprCallBuiltin
+        v3TypedExprCallResultIntrinsic
+        v3TypedExprCallProjection
+
+    V3TypedExprReturnKind = enum
+        v3TypedExprReturnReg
+        v3TypedExprReturnCompositeLocal
+        v3TypedExprReturnSret
+        v3TypedExprReturnImportBuffer
+        v3TypedExprReturnDeferred
+
     V3TypedExprFact =
         exprId: str
         sourcePath: str
@@ -43,6 +56,27 @@ type
         valueKind: V3TypedExprValueKind
         placeKind: V3TypedExprPlaceKind
         loweringMode: V3TypedExprLoweringMode
+        callKind: V3TypedExprCallKind
+        returnKind: V3TypedExprReturnKind
+
+    V3TypedExprLoweringRule =
+        exprId: str
+        sourcePath: str
+        lineNumber: int32
+        columnNumber: int32
+        typeText: str
+        abiClassText: str
+        valueKindText: str
+        placeKindText: str
+        loweringModeText: str
+        callKindText: str
+        returnKindText: str
+        argPassKindText: str
+        resultPassKindText: str
+        materializeKindText: str
+        copyKindText: str
+        importKindText: str
+        ruleKey: str
 
     V3TypedExprSourceText =
         sourcePath: str
@@ -116,6 +150,112 @@ fn v3TypedExprLoweringModeText(loweringMode: V3TypedExprLoweringMode): str =
         return "import_buffer"
     return "deferred"
 
+fn v3TypedExprCallKindText(callKind: V3TypedExprCallKind): str =
+    if callKind == v3TypedExprCallBuiltin:
+        return "builtin"
+    if callKind == v3TypedExprCallResultIntrinsic:
+        return "result_intrinsic"
+    if callKind == v3TypedExprCallProjection:
+        return "projection"
+    return "none"
+
+fn v3TypedExprReturnKindText(returnKind: V3TypedExprReturnKind): str =
+    if returnKind == v3TypedExprReturnReg:
+        return "reg"
+    if returnKind == v3TypedExprReturnCompositeLocal:
+        return "composite_local"
+    if returnKind == v3TypedExprReturnSret:
+        return "sret"
+    if returnKind == v3TypedExprReturnImportBuffer:
+        return "import_buffer"
+    return "deferred"
+
+fn v3TypedExprArgPassKindText(abiClass: V3TypedExprAbiClass,
+                              placeKind: V3TypedExprPlaceKind,
+                              loweringMode: V3TypedExprLoweringMode): str =
+    if loweringMode == v3TypedExprLowerDeferred || abiClass == v3TypedExprAbiPolymorphic:
+        return "deferred"
+    if abiClass == v3TypedExprAbiComposite:
+        if placeKind == v3TypedExprPlaceCallResult:
+            return "call_result_address"
+        return "address"
+    return "value"
+
+fn v3TypedExprResultPassKindText(returnKind: V3TypedExprReturnKind): str =
+    if returnKind == v3TypedExprReturnReg:
+        return "reg"
+    if returnKind == v3TypedExprReturnCompositeLocal:
+        return "local_address"
+    if returnKind == v3TypedExprReturnSret:
+        return "sret"
+    if returnKind == v3TypedExprReturnImportBuffer:
+        return "import_buffer"
+    return "deferred"
+
+fn v3TypedExprMaterializeKindText(valueKind: V3TypedExprValueKind,
+                                  placeKind: V3TypedExprPlaceKind,
+                                  loweringMode: V3TypedExprLoweringMode): str =
+    if loweringMode == v3TypedExprLowerDeferred || valueKind == v3TypedExprValuePolymorphic:
+        return "deferred"
+    if loweringMode == v3TypedExprLowerSret:
+        return "dest_address"
+    if loweringMode == v3TypedExprLowerImportBuffer:
+        return "import_buffer"
+    if valueKind == v3TypedExprValueComposite:
+        if placeKind == v3TypedExprPlaceCallResult:
+            return "call_result_local"
+        return "local_slot"
+    if loweringMode == v3TypedExprLowerReg:
+        return "register"
+    return "none"
+
+fn v3TypedExprCopyKindText(valueKind: V3TypedExprValueKind,
+                           abiClass: V3TypedExprAbiClass): str =
+    if abiClass == v3TypedExprAbiPolymorphic || valueKind == v3TypedExprValuePolymorphic:
+        return "deferred"
+    if valueKind == v3TypedExprValueComposite:
+        return "region_copy"
+    if valueKind == v3TypedExprValueScalar || valueKind == v3TypedExprValuePointerLike:
+        return "scalar_store"
+    return "none"
+
+fn v3TypedExprImportKindText(callKind: V3TypedExprCallKind,
+                             abiClass: V3TypedExprAbiClass,
+                             loweringMode: V3TypedExprLoweringMode,
+                             returnKind: V3TypedExprReturnKind): str =
+    if loweringMode == v3TypedExprLowerDeferred || abiClass == v3TypedExprAbiPolymorphic:
+        return "deferred"
+    if loweringMode == v3TypedExprLowerImportBuffer || returnKind == v3TypedExprReturnImportBuffer:
+        return "import_buffer"
+    if callKind == v3TypedExprCallBuiltin:
+        if abiClass == v3TypedExprAbiComposite:
+            return "builtin_address_slot"
+        return "builtin_value_slot"
+    if abiClass == v3TypedExprAbiComposite:
+        return "i32_address_slot"
+    return "i32_value_slot"
+
+fn v3TypedExprCallKindForExpr(expr: parser.V3NormalizedExpr): V3TypedExprCallKind =
+    if expr.kind == parser.v3NormalizedExprStrFormat:
+        return v3TypedExprCallBuiltin
+    if expr.kind == parser.v3NormalizedExprResultIntrinsic:
+        return v3TypedExprCallResultIntrinsic
+    if expr.kind == parser.v3NormalizedExprTry:
+        return v3TypedExprCallProjection
+    return v3TypedExprCallNone
+
+fn v3TypedExprReturnKindForResolved(abiClass: V3TypedExprAbiClass,
+                                    loweringMode: V3TypedExprLoweringMode): V3TypedExprReturnKind =
+    if loweringMode == v3TypedExprLowerSret:
+        return v3TypedExprReturnSret
+    if loweringMode == v3TypedExprLowerImportBuffer:
+        return v3TypedExprReturnImportBuffer
+    if loweringMode == v3TypedExprLowerDeferred || abiClass == v3TypedExprAbiPolymorphic:
+        return v3TypedExprReturnDeferred
+    if abiClass == v3TypedExprAbiComposite:
+        return v3TypedExprReturnCompositeLocal
+    return v3TypedExprReturnReg
+
 fn v3TypedExprFactClone(fact: V3TypedExprFact): V3TypedExprFact =
     var out: V3TypedExprFact
     out.exprId = fact.exprId
@@ -130,6 +270,8 @@ fn v3TypedExprFactClone(fact: V3TypedExprFact): V3TypedExprFact =
     out.valueKind = fact.valueKind
     out.placeKind = fact.placeKind
     out.loweringMode = fact.loweringMode
+    out.callKind = fact.callKind
+    out.returnKind = fact.returnKind
     return out
 
 fn v3TypedExprFactsClone(facts: V3TypedExprFact[]): V3TypedExprFact[] =
@@ -162,7 +304,11 @@ fn v3TypedExprFactEqual(lhs: V3TypedExprFact,
         return false
     if lhs.placeKind != rhs.placeKind:
         return false
-    return lhs.loweringMode == rhs.loweringMode
+    if lhs.loweringMode != rhs.loweringMode:
+        return false
+    if lhs.callKind != rhs.callKind:
+        return false
+    return lhs.returnKind == rhs.returnKind
 
 fn v3TypedExprFactsEqual(lhs: V3TypedExprFact[],
                          rhs: V3TypedExprFact[]): bool =
@@ -203,6 +349,163 @@ fn v3TypedExprFactCountLoweringMode(facts: V3TypedExprFact[],
     for i in 0..<facts.len:
         if facts[i].loweringMode == loweringMode:
             count = count + 1
+    return count
+
+fn v3TypedExprFactCountCallKind(facts: V3TypedExprFact[],
+                                callKind: V3TypedExprCallKind): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].callKind == callKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprFactCountReturnKind(facts: V3TypedExprFact[],
+                                  returnKind: V3TypedExprReturnKind): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].returnKind == returnKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprLoweringRuleKey(typeTextRaw: str,
+                              abiClass: V3TypedExprAbiClass,
+                              valueKind: V3TypedExprValueKind,
+                              placeKind: V3TypedExprPlaceKind,
+                              loweringMode: V3TypedExprLoweringMode,
+                              callKind: V3TypedExprCallKind,
+                              returnKind: V3TypedExprReturnKind): str =
+    let typeText = v3TypedExprNormalizeTypeText(typeTextRaw)
+    var out = typeText
+    out = out + "|abi=" + v3TypedExprAbiClassText(abiClass)
+    out = out + "|value=" + v3TypedExprValueKindText(valueKind)
+    out = out + "|place=" + v3TypedExprPlaceKindText(placeKind)
+    out = out + "|lower=" + v3TypedExprLoweringModeText(loweringMode)
+    out = out + "|call=" + v3TypedExprCallKindText(callKind)
+    out = out + "|return=" + v3TypedExprReturnKindText(returnKind)
+    out = out + "|arg=" + v3TypedExprArgPassKindText(abiClass, placeKind, loweringMode)
+    out = out + "|result=" + v3TypedExprResultPassKindText(returnKind)
+    out = out + "|materialize=" + v3TypedExprMaterializeKindText(valueKind, placeKind, loweringMode)
+    out = out + "|copy=" + v3TypedExprCopyKindText(valueKind, abiClass)
+    out = out + "|import=" + v3TypedExprImportKindText(callKind, abiClass, loweringMode, returnKind)
+    return out
+
+fn v3TypedExprLoweringRuleFromFact(fact: V3TypedExprFact): V3TypedExprLoweringRule =
+    var out: V3TypedExprLoweringRule
+    out.exprId = fact.exprId
+    out.sourcePath = fact.sourcePath
+    out.lineNumber = fact.lineNumber
+    out.columnNumber = fact.columnNumber
+    out.typeText = v3TypedExprNormalizeTypeText(fact.typeText)
+    out.abiClassText = v3TypedExprAbiClassText(fact.abiClass)
+    out.valueKindText = v3TypedExprValueKindText(fact.valueKind)
+    out.placeKindText = v3TypedExprPlaceKindText(fact.placeKind)
+    out.loweringModeText = v3TypedExprLoweringModeText(fact.loweringMode)
+    out.callKindText = v3TypedExprCallKindText(fact.callKind)
+    out.returnKindText = v3TypedExprReturnKindText(fact.returnKind)
+    out.argPassKindText = v3TypedExprArgPassKindText(fact.abiClass, fact.placeKind, fact.loweringMode)
+    out.resultPassKindText = v3TypedExprResultPassKindText(fact.returnKind)
+    out.materializeKindText = v3TypedExprMaterializeKindText(fact.valueKind, fact.placeKind, fact.loweringMode)
+    out.copyKindText = v3TypedExprCopyKindText(fact.valueKind, fact.abiClass)
+    out.importKindText = v3TypedExprImportKindText(fact.callKind, fact.abiClass, fact.loweringMode, fact.returnKind)
+    out.ruleKey = v3TypedExprLoweringRuleKey(fact.typeText,
+                                             fact.abiClass,
+                                             fact.valueKind,
+                                             fact.placeKind,
+                                             fact.loweringMode,
+                                             fact.callKind,
+                                             fact.returnKind)
+    return out
+
+fn v3TypedExprLoweringRuleClone(rule: V3TypedExprLoweringRule): V3TypedExprLoweringRule =
+    var out: V3TypedExprLoweringRule
+    out.exprId = rule.exprId
+    out.sourcePath = rule.sourcePath
+    out.lineNumber = rule.lineNumber
+    out.columnNumber = rule.columnNumber
+    out.typeText = rule.typeText
+    out.abiClassText = rule.abiClassText
+    out.valueKindText = rule.valueKindText
+    out.placeKindText = rule.placeKindText
+    out.loweringModeText = rule.loweringModeText
+    out.callKindText = rule.callKindText
+    out.returnKindText = rule.returnKindText
+    out.argPassKindText = rule.argPassKindText
+    out.resultPassKindText = rule.resultPassKindText
+    out.materializeKindText = rule.materializeKindText
+    out.copyKindText = rule.copyKindText
+    out.importKindText = rule.importKindText
+    out.ruleKey = rule.ruleKey
+    return out
+
+fn v3TypedExprLoweringRulesClone(rules: V3TypedExprLoweringRule[]): V3TypedExprLoweringRule[] =
+    var out: V3TypedExprLoweringRule[] = []
+    for i in 0..<rules.len:
+        add(out, v3TypedExprLoweringRuleClone(rules[i]))
+    return out
+
+fn v3TypedExprLoweringRuleEqual(lhs: V3TypedExprLoweringRule,
+                                rhs: V3TypedExprLoweringRule): bool =
+    if lhs.exprId != rhs.exprId:
+        return false
+    if lhs.sourcePath != rhs.sourcePath:
+        return false
+    if lhs.lineNumber != rhs.lineNumber:
+        return false
+    if lhs.columnNumber != rhs.columnNumber:
+        return false
+    if lhs.typeText != rhs.typeText:
+        return false
+    if lhs.abiClassText != rhs.abiClassText:
+        return false
+    if lhs.valueKindText != rhs.valueKindText:
+        return false
+    if lhs.placeKindText != rhs.placeKindText:
+        return false
+    if lhs.loweringModeText != rhs.loweringModeText:
+        return false
+    if lhs.callKindText != rhs.callKindText:
+        return false
+    if lhs.returnKindText != rhs.returnKindText:
+        return false
+    if lhs.argPassKindText != rhs.argPassKindText:
+        return false
+    if lhs.resultPassKindText != rhs.resultPassKindText:
+        return false
+    if lhs.materializeKindText != rhs.materializeKindText:
+        return false
+    if lhs.copyKindText != rhs.copyKindText:
+        return false
+    if lhs.importKindText != rhs.importKindText:
+        return false
+    return lhs.ruleKey == rhs.ruleKey
+
+fn v3TypedExprLoweringRulesEqual(lhs: V3TypedExprLoweringRule[],
+                                 rhs: V3TypedExprLoweringRule[]): bool =
+    if lhs.len != rhs.len:
+        return false
+    for i in 0..<lhs.len:
+        if !v3TypedExprLoweringRuleEqual(lhs[i], rhs[i]):
+            return false
+    return true
+
+fn v3TypedExprLoweringRulesFromFacts(facts: V3TypedExprFact[]): V3TypedExprLoweringRule[] =
+    var out: V3TypedExprLoweringRule[] = []
+    for i in 0..<facts.len:
+        add(out, v3TypedExprLoweringRuleFromFact(facts[i]))
+    return out
+
+fn v3TypedExprLoweringRuleUniqueKeyCount(rules: V3TypedExprLoweringRule[]): int32 =
+    var count: int32 = 0
+    var keys: str[] = []
+    for i in 0..<rules.len:
+        var seen = false
+        for j in 0..<keys.len:
+            if keys[j] == rules[i].ruleKey:
+                seen = true
+        if seen:
+            continue
+        add(keys, rules[i].ruleKey)
+        count = count + 1
     return count
 
 fn v3TypedExprConcat3(a: str, b: str, c: str): str =
@@ -769,14 +1072,18 @@ fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
         fact.placeKind = v3TypedExprPlaceTemporary
     if fact.abiClass == v3TypedExprAbiPolymorphic:
         fact.loweringMode = v3TypedExprLowerDeferred
+        fact.returnKind = v3TypedExprReturnDeferred
         return
     if sink.returnRoot && sink.sinkType == typeText:
         fact.loweringMode = fact.abiClass == v3TypedExprAbiComposite ? v3TypedExprLowerSret : v3TypedExprLowerReg
+        fact.returnKind = v3TypedExprReturnKindForResolved(fact.abiClass, fact.loweringMode)
         return
     if fact.abiClass == v3TypedExprAbiComposite:
         fact.loweringMode = v3TypedExprLowerLocalAddress
+        fact.returnKind = v3TypedExprReturnKindForResolved(fact.abiClass, fact.loweringMode)
         return
     fact.loweringMode = v3TypedExprLowerReg
+    fact.returnKind = v3TypedExprReturnKindForResolved(fact.abiClass, fact.loweringMode)
 
 fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
                         exprLayer: parser.V3NormalizedExprLayer,
@@ -794,6 +1101,8 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
     fact.valueKind = v3TypedExprValuePolymorphic
     fact.placeKind = v3TypedExprPlaceTemporary
     fact.loweringMode = v3TypedExprLowerDeferred
+    fact.callKind = v3TypedExprCallKindForExpr(expr)
+    fact.returnKind = v3TypedExprReturnDeferred
     let sink = v3TypedExprSinkForExpr(ctx, expr, exprLayer)
     let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
     let sourceResultType = v3TypedExprInferredResultInputType(ctx, scopeIndex, expr)
