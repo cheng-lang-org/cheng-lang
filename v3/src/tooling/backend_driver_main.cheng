@@ -1169,6 +1169,11 @@ fn v3BackendDriverRunGateTool(rootDir: str,
                                             "v3/src/tooling/gate_main.cheng",
                                             args)
 
+fn v3BackendDriverRunHostSmokes(rootDir: str,
+                                count: int32): int32 =
+    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+    return v3BackendDriverRunHostSmokesLocal(rootDir, args)
+
 fn v3BackendDriverArgsWithoutFlag(args: str[],
                                   key: str): str[] =
     let colonPrefixRaw: str = key + ":"
@@ -1206,6 +1211,1339 @@ fn v3BackendDriverCollectPositionals(args: str[]): str[] =
             continue
         add(out, arg)
     return out
+
+fn v3BackendDriverResolveHostSmokeCompiler(rootDir: str,
+                                           args: str[],
+                                           outCompiler: var str): bool =
+    let explicitRaw: str = v3BackendDriverReadFlag(args, "--compiler", "")
+    let explicit: str = strutil.Strip(explicitRaw)
+    if len(explicit) > 0:
+        outCompiler = v3path.V3PathAbsolute(rootDir, explicit)
+        return true
+    return v3BackendDriverResolveToolCompiler(rootDir, "run-host-smokes", outCompiler)
+
+fn v3BackendDriverWriteProcessSnapshot(rootDir: str,
+                                       proc: hostops.V3SpawnedProcess,
+                                       logPath: str,
+                                       exitCode: int32): hostops.V3LoggedRun =
+    let logParts: os.SplitFileResult = os.SplitFile(logPath)
+    if len(logParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, logParts.dir)
+    let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, proc.output)
+    return hostops.V3LoggedRun(label: proc.label,
+                               filePath: proc.filePath,
+                               logPath: logPath,
+                               exitCode: exitCode,
+                               output: proc.output)
+
+fn v3BackendDriverRequireFileContains(path: str,
+                                      needle: str,
+                                      context: str): bool =
+    if !os.FileExists(path):
+        v3BackendDriverPrintErr(context + ": missing artifact: " + path)
+        return false
+    let text: str = v3path.V3ReadTextFile("", path)
+    if v3BackendDriverOutputContains(text, needle):
+        return true
+    v3BackendDriverPrintErr(context + ": missing text in " + path + ": " + needle)
+    return false
+
+fn v3BackendDriverRequirePrefixArtifacts(prefix: str,
+                                         suffixes: str[],
+                                         context: str): bool =
+    for i in 0..<suffixes.len:
+        let path: str = prefix + suffixes[i]
+        if !os.FileExists(path):
+            v3BackendDriverPrintErr(context + ": missing artifact: " + path)
+            return false
+    return true
+
+fn v3BackendDriverRequireAnyOutput(text: str,
+                                   needles: str[],
+                                   context: str): bool =
+    for i in 0..<needles.len:
+        if v3BackendDriverOutputContains(text, needles[i]):
+            return true
+    v3BackendDriverPrintErr(context + ": missing expected output")
+    return false
+
+fn v3BackendDriverRunSingleFixtureSmoke(rootDir: str,
+                                        suiteLabel: str,
+                                        compilerPath: str,
+                                        smokeName: str,
+                                        outBin: str,
+                                        stageLabel: str): int32 =
+    let srcRel: str = v3BackendDriverConcat3("v3/src/tests/", smokeName, ".cheng")
+    let src: str = v3path.V3PathAbsolute(rootDir, srcRel)
+    if !os.FileExists(src):
+        v3BackendDriverPrintErr(suiteLabel + ": missing source: " + src)
+        return 1
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr(suiteLabel + ": unsupported host target")
+        return 2
+    let compileLabel: str = suiteLabel + " compile " + stageLabel + " " + smokeName
+    let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                    compileLabel,
+                                                                    compilerPath,
+                                                                    src,
+                                                                    outBin,
+                                                                    targetTriple,
+                                                                    outBin + ".compile.log")
+    if v3BackendDriverRunFailed(suiteLabel + " compile " + smokeName, compileRun):
+        return compileRun.exitCode
+    let runLabel: str = suiteLabel + " run " + stageLabel + " " + smokeName
+    let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                            runLabel,
+                                                            outBin,
+                                                            [],
+                                                            int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_SMOKE_RUN_TIMEOUT_SEC", "60"))),
+                                                            outBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed(suiteLabel + " run " + smokeName, run):
+        return run.exitCode
+    return 0
+
+fn v3BackendDriverDefaultHostSmokes(): str[] =
+    var out: str[] = []
+    add(out, "ref10_ashr_smoke")
+    add(out, "fixed256_curve25519_smoke")
+    add(out, "fixedbytes32_seq_index_smoke")
+    add(out, "compiler_runtime_smoke")
+    add(out, "artifact_isolation_audit_smoke")
+    add(out, "backend_driver_command_surface_smoke")
+    add(out, "backend_driver_candidate_output_smoke")
+    add(out, "runtime_link_input_surface_smoke")
+    add(out, "runtime_zero_c_surface_smoke")
+    add(out, "composite_default_init_smoke")
+    add(out, "composite_default_init_negative_smoke")
+    add(out, "chain_node_snapshot_return_boundary_smoke")
+    add(out, "chain_node_snapshot_write_return_boundary_smoke")
+    add(out, "chain_node_snapshot_print_return_boundary_smoke")
+    add(out, "chain_node_cli_return_boundary_smoke")
+    add(out, "export_visibility_smoke")
+    add(out, "export_visibility_negative_smoke")
+    add(out, "strformat_export_negative_smoke")
+    add(out, "json_bracket_assign_smoke")
+    add(out, "strings_char_to_str_smoke")
+    add(out, "vpn_proxy_cli_smoke")
+    add(out, "vpn_proxy_config_smoke")
+    add(out, "vpn_proxy_json_smoke")
+    add(out, "vpn_proxy_listen_smoke")
+    add(out, "vpn_proxy_protocol_smoke")
+    add(out, "vpn_proxy_routing_smoke")
+    add(out, "vpn_proxy_socks_smoke")
+    add(out, "os_dir_exists_smoke")
+    add(out, "os_file_exists_smoke")
+    add(out, "os_file_size_smoke")
+    add(out, "os_get_current_dir_smoke")
+    add(out, "os_rename_file_smoke")
+    add(out, "os_remove_dir_smoke")
+    add(out, "os_walk_dir_smoke")
+    add(out, "str_concat_lowering_smoke")
+    add(out, "strformat_fmt_lowering_smoke")
+    add(out, "strformat_fmt_smoke")
+    add(out, "strformat_fmt_negative_smoke")
+    add(out, "global_fixed_array_composite_smoke")
+    add(out, "multiline_header_indent_smoke")
+    add(out, "rwad_serial_state_machine_smoke")
+    add(out, "rwad_bft_state_machine_smoke")
+    add(out, "parser_path_smoke")
+    add(out, "compiler_pipeline_stub_smoke")
+    add(out, "lowering_plan_smoke")
+    add(out, "compiler_equivalence_smoke")
+    add(out, "compiler_publish_smoke")
+    add(out, "bft_three_replica_smoke")
+    add(out, "primary_object_plan_smoke")
+    add(out, "object_native_link_plan_smoke")
+    add(out, "ffi_handle_smoke")
+    add(out, "program_selfhost_smoke")
+    add(out, "csg_smoke")
+    add(out, "consensus_smoke")
+    add(out, "chain_node_smoke")
+    add(out, "chain_node_zero_snapshot_replay_smoke")
+    add(out, "chain_node_tailnet_smoke")
+    add(out, "chain_node_libp2p_smoke")
+    add(out, "bft_finalize_summary_smoke")
+    add(out, "bft_state_machine_smoke")
+    add(out, "oracle_plane_smoke")
+    add(out, "oracle_bft_state_machine_smoke")
+    add(out, "oracle_bft_three_replica_smoke")
+    add(out, "oracle_runtime_host_smoke")
+    add(out, "overlay_contracts_smoke")
+    add(out, "pubsub_smoke")
+    add(out, "dag_mempool_smoke")
+    add(out, "plumtree_smoke")
+    add(out, "erasure_swarm_smoke")
+    add(out, "pin_plane_smoke")
+    add(out, "pin_scheduler_smoke")
+    add(out, "pin_runtime_host_smoke")
+    add(out, "pin_runtime_quic_smoke")
+    add(out, "content_codec_smoke")
+    add(out, "content_runtime_smoke")
+    add(out, "bio_reed_solomon_smoke")
+    add(out, "bio_same_person_smoke")
+    add(out, "bio_did_chain_node_smoke")
+    add(out, "bio_did_mobile_biometric_smoke")
+    add(out, "native_client_hello_wire_smoke")
+    add(out, "msquic_bindtext_expr_smoke")
+    add(out, "protocol_validation_smoke")
+    add(out, "platform_release_validation_smoke")
+    add(out, "congestion_validation_smoke")
+    add(out, "msquic_platform_smoke")
+    add(out, "quic_tls_transport_ecdsa_smoke")
+    add(out, "quic_transport_loopback_smoke")
+    add(out, "quic_transport_sequential_accept_smoke")
+    add(out, "libp2p_quic_tls_smoke")
+    add(out, "quic_feature_matrix_smoke")
+    add(out, "quic_close_order_smoke")
+    add(out, "bft_daemon_quic_close_order_smoke")
+    add(out, "libp2p_tailnet_policy_smoke")
+    add(out, "libp2p_tailnet_visibility_smoke")
+    add(out, "libp2p_tailnet_transport_smoke")
+    add(out, "libp2p_tailnet_derp_smoke")
+    add(out, "libp2p_resource_smoke")
+    add(out, "libp2p_scheduler_smoke")
+    add(out, "libp2p_quic_tls_smoke")
+    add(out, "quic_feature_matrix_smoke")
+    add(out, "quic_close_order_smoke")
+    add(out, "bft_daemon_quic_close_order_smoke")
+    add(out, "tailnet_control_core_smoke")
+    add(out, "tailnet_train_island_smoke")
+    add(out, "webrtc_signal_codec_smoke")
+    add(out, "webrtc_signal_session_smoke")
+    add(out, "webrtc_turn_fallback_smoke")
+    add(out, "libp2p_webrtc_sync_smoke")
+    add(out, "content_quic_smoke")
+    add(out, "webrtc_datachannel_content_smoke")
+    add(out, "content_stub_smoke")
+    add(out, "libp2p_protocols_smoke")
+    add(out, "location_proof_smoke")
+    add(out, "chain_codec_binary_smoke")
+    add(out, "anti_entropy_smoke")
+    add(out, "anti_entropy_signature_fields_smoke")
+    add(out, "lsmr_types_smoke")
+    add(out, "lsmr_locality_storage_smoke")
+    add(out, "lsmr_bagua_prefix_tree_smoke")
+    add(out, "udp_importc_smoke")
+    add(out, "mobile_bridge_smoke")
+    add(out, "mobile_sdk_smoke")
+    add(out, "did_identity_smoke")
+    return out
+
+fn v3BackendDriverBuildChainNodeCliCommandBinary(rootDir: str,
+                                                 compilerPath: str,
+                                                 outDir: str,
+                                                 label: str,
+                                                 moduleStem: str,
+                                                 outBin: var str): int32 =
+    let srcRel: str = v3BackendDriverConcat3("v3/src/project/", moduleStem, ".cheng")
+    let src: str = v3path.V3PathAbsolute(rootDir, srcRel)
+    outBin = os.JoinPath(outDir, moduleStem)
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 chain_node cli smoke: unsupported host target")
+        return 2
+    let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                    label,
+                                                                    compilerPath,
+                                                                    src,
+                                                                    outBin,
+                                                                    targetTriple,
+                                                                    os.JoinPath(outDir, moduleStem + ".compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node cli compile " + moduleStem, compileRun):
+        return compileRun.exitCode
+    if !os.FileExists(outBin):
+        v3BackendDriverPrintErr("v3 chain_node cli smoke: missing command binary: " + outBin)
+        return 1
+    return 0
+
+fn v3BackendDriverRunTcpTwoprocSmoke(rootDir: str,
+                                     compilerPath: str,
+                                     label: str): int32 =
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_tcp_twoproc")
+    let serverSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/libp2p_tcp_twoproc_server_smoke.cheng")
+    let clientSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/libp2p_tcp_twoproc_client_smoke.cheng")
+    let serverBin: str = os.JoinPath(outDir, "libp2p_tcp_twoproc_server." + label)
+    let clientBin: str = os.JoinPath(outDir, "libp2p_tcp_twoproc_client." + label)
+    let readyName: str = v3BackendDriverConcat3("libp2p_tcp_twoproc_server.", label, ".ready")
+    let readyPath: str = os.JoinPath(outDir, readyName)
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 libp2p tcp twoproc: unsupported host target")
+        return 2
+    let _ = os.RemoveFile(readyPath)
+    let serverCompileLabel: str = v3BackendDriverConcat3("v3 libp2p tcp twoproc compile ", label, " server")
+    let serverCompileLog: str = v3BackendDriverConcat2(serverBin, ".compile.log")
+    let serverCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       serverCompileLabel,
+                                                                       compilerPath,
+                                                                       serverSrc,
+                                                                       serverBin,
+                                                                       targetTriple,
+                                                                       serverCompileLog)
+    if v3BackendDriverRunFailed("v3 libp2p tcp twoproc server compile", serverCompile):
+        return serverCompile.exitCode
+    let clientCompileLabel: str = v3BackendDriverConcat3("v3 libp2p tcp twoproc compile ", label, " client")
+    let clientCompileLog: str = v3BackendDriverConcat2(clientBin, ".compile.log")
+    let clientCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       clientCompileLabel,
+                                                                       compilerPath,
+                                                                       clientSrc,
+                                                                       clientBin,
+                                                                       targetTriple,
+                                                                       clientCompileLog)
+    if v3BackendDriverRunFailed("v3 libp2p tcp twoproc client compile", clientCompile):
+        return clientCompile.exitCode
+    let serverSpawn = hostops.v3SpawnFile(rootDir,
+                                          "v3 libp2p tcp twoproc server " + label,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          rootDir)
+    if IsErr(serverSpawn):
+        v3BackendDriverPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, port):
+        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, serverBin + ".run.log", 1)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                  "v3 libp2p tcp twoproc client " + label,
+                                                                  clientBin,
+                                                                  ["--port:" + port],
+                                                                  20,
+                                                                  clientBin + ".run.log")
+    if v3BackendDriverRunFailed("v3 libp2p tcp twoproc client run", clientRun):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverBin + ".run.log")
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, serverBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(clientRun)
+    if v3BackendDriverRunFailed("v3 libp2p tcp twoproc server run", serverRun):
+        return serverRun.exitCode
+    v3BackendDriverPrintLine("v3 libp2p_tcp_twoproc_smoke ok")
+    return 0
+
+fn v3BackendDriverRunQuicTwoprocSmoke(rootDir: str,
+                                      compilerPath: str,
+                                      label: str): int32 =
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_quic_twoproc")
+    let serverSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/libp2p_quic_twoproc_server_smoke.cheng")
+    let clientSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/libp2p_quic_twoproc_client_smoke.cheng")
+    let serverBin: str = os.JoinPath(outDir, "libp2p_quic_twoproc_server." + label)
+    let clientBin: str = os.JoinPath(outDir, "libp2p_quic_twoproc_client." + label)
+    let readyName: str = v3BackendDriverConcat3("libp2p_quic_twoproc_server.", label, ".ready")
+    let readyPath: str = os.JoinPath(outDir, readyName)
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 libp2p quic twoproc: unsupported host target")
+        return 2
+    let _ = os.RemoveFile(readyPath)
+    let serverCompileLabel: str = v3BackendDriverConcat3("v3 libp2p quic twoproc compile ", label, " server")
+    let serverCompileLog: str = v3BackendDriverConcat2(serverBin, ".compile.log")
+    let serverCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       serverCompileLabel,
+                                                                       compilerPath,
+                                                                       serverSrc,
+                                                                       serverBin,
+                                                                       targetTriple,
+                                                                       serverCompileLog)
+    if v3BackendDriverRunFailed("v3 libp2p quic twoproc server compile", serverCompile):
+        return serverCompile.exitCode
+    let clientCompileLabel: str = v3BackendDriverConcat3("v3 libp2p quic twoproc compile ", label, " client")
+    let clientCompileLog: str = v3BackendDriverConcat2(clientBin, ".compile.log")
+    let clientCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       clientCompileLabel,
+                                                                       compilerPath,
+                                                                       clientSrc,
+                                                                       clientBin,
+                                                                       targetTriple,
+                                                                       clientCompileLog)
+    if v3BackendDriverRunFailed("v3 libp2p quic twoproc client compile", clientCompile):
+        return clientCompile.exitCode
+    let serverSpawn = hostops.v3SpawnFile(rootDir,
+                                          "v3 libp2p quic twoproc server " + label,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + readyPath],
+                                          [],
+                                          rootDir)
+    if IsErr(serverSpawn):
+        v3BackendDriverPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var port = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, port):
+        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, serverBin + ".run.log", 1)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                  "v3 libp2p quic twoproc client " + label,
+                                                                  clientBin,
+                                                                  ["--port:" + port],
+                                                                  20,
+                                                                  clientBin + ".run.log")
+    if v3BackendDriverRunFailed("v3 libp2p quic twoproc client run", clientRun):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverBin + ".run.log")
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, serverBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(clientRun)
+    if v3BackendDriverRunFailed("v3 libp2p quic twoproc server run", serverRun):
+        return serverRun.exitCode
+    v3BackendDriverPrintLine("v3 libp2p_quic_twoproc_smoke ok")
+    return 0
+
+fn v3BackendDriverRunChainNodeCliSmoke(rootDir: str,
+                                       compilerPath: str,
+                                       label: str): int32 =
+    let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_chain_node_cli/", label)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let tmpDir: str = os.JoinPath(outDir, "cli_smoke")
+    if !v3path.V3MkdirP(rootDir, tmpDir):
+        v3BackendDriverPrintErr("v3 chain_node cli smoke: failed to create tmp dir: " + tmpDir)
+        return 1
+    var initBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli init compile " + label, "chain_node_cli_init_main", initBin) != 0:
+        return 1
+    var mintBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli mint compile " + label, "chain_node_cli_mint_main", mintBin) != 0:
+        return 1
+    var transferBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli transfer compile " + label, "chain_node_cli_transfer_main", transferBin) != 0:
+        return 1
+    var balanceBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli balance compile " + label, "chain_node_cli_balance_main", balanceBin) != 0:
+        return 1
+    var showBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli show compile " + label, "chain_node_cli_show_state_main", showBin) != 0:
+        return 1
+    var snapshotBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli snapshot compile " + label, "chain_node_cli_dump_snapshot_main", snapshotBin) != 0:
+        return 1
+    var serveBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli serve compile " + label, "chain_node_cli_serve_once_main", serveBin) != 0:
+        return 1
+    var syncBin = ""
+    if v3BackendDriverBuildChainNodeCliCommandBinary(rootDir, compilerPath, outDir, "v3 chain_node cli sync compile " + label, "chain_node_cli_sync_once_main", syncBin) != 0:
+        return 1
+    let serverState: str = os.JoinPath(tmpDir, "server.state")
+    let clientState: str = os.JoinPath(tmpDir, "client.state")
+    let readyPath: str = os.JoinPath(tmpDir, "server.ready")
+    let serverLogName: str = v3BackendDriverConcat3("server.", label, ".log")
+    let serverLog: str = os.JoinPath(outDir, serverLogName)
+    let syncLogName: str = v3BackendDriverConcat3("sync.", label, ".log")
+    let syncLog: str = os.JoinPath(outDir, syncLogName)
+    let _ = os.RemoveFile(serverState)
+    let _ = os.RemoveFile(clientState)
+    let _ = os.RemoveFile(readyPath)
+    var initArgs: str[] = []
+    add(initArgs, "--state:" + serverState)
+    add(initArgs, "--node-id:node-a")
+    add(initArgs, "--address-seed:chain-node-a")
+    let initLogName: str = v3BackendDriverConcat3("init.", label, ".log")
+    let initLogPath: str = os.JoinPath(outDir, initLogName)
+    let initRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 chain_node cli init " + label,
+                                                                initBin,
+                                                                initArgs,
+                                                                20,
+                                                                initLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli init", initRun):
+        return initRun.exitCode
+    var mintArgs: str[] = []
+    add(mintArgs, "--state:" + serverState)
+    add(mintArgs, "--asset:7")
+    add(mintArgs, "--account:1001")
+    add(mintArgs, "--amount:100")
+    let mintLogName: str = v3BackendDriverConcat3("mint.", label, ".log")
+    let mintLogPath: str = os.JoinPath(outDir, mintLogName)
+    let mintRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 chain_node cli mint " + label,
+                                                                mintBin,
+                                                                mintArgs,
+                                                                20,
+                                                                mintLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli mint", mintRun):
+        return mintRun.exitCode
+    var transferArgs: str[] = []
+    add(transferArgs, "--state:" + serverState)
+    add(transferArgs, "--asset:7")
+    add(transferArgs, "--from:1001")
+    add(transferArgs, "--to:2002")
+    add(transferArgs, "--amount:40")
+    let transferLogName: str = v3BackendDriverConcat3("transfer.", label, ".log")
+    let transferLogPath: str = os.JoinPath(outDir, transferLogName)
+    let transferRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                    "v3 chain_node cli transfer " + label,
+                                                                    transferBin,
+                                                                    transferArgs,
+                                                                    20,
+                                                                    transferLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli transfer", transferRun):
+        return transferRun.exitCode
+    var balanceAArgs: str[] = []
+    add(balanceAArgs, "--state:" + serverState)
+    add(balanceAArgs, "--asset:7")
+    add(balanceAArgs, "--account:1001")
+    let balanceALogName: str = v3BackendDriverConcat3("balance_a.", label, ".log")
+    let balanceALogPath: str = os.JoinPath(outDir, balanceALogName)
+    let balanceARun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                    "v3 chain_node cli balance-a " + label,
+                                                                    balanceBin,
+                                                                    balanceAArgs,
+                                                                    20,
+                                                                    balanceALogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli balance-a", balanceARun):
+        return balanceARun.exitCode
+    var balanceBArgs: str[] = []
+    add(balanceBArgs, "--state:" + serverState)
+    add(balanceBArgs, "--asset:7")
+    add(balanceBArgs, "--account:2002")
+    let balanceBLogName: str = v3BackendDriverConcat3("balance_b.", label, ".log")
+    let balanceBLogPath: str = os.JoinPath(outDir, balanceBLogName)
+    let balanceBRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                    "v3 chain_node cli balance-b " + label,
+                                                                    balanceBin,
+                                                                    balanceBArgs,
+                                                                    20,
+                                                                    balanceBLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli balance-b", balanceBRun):
+        return balanceBRun.exitCode
+    var showArgs: str[] = []
+    add(showArgs, "--state:" + serverState)
+    let showLogName: str = v3BackendDriverConcat3("show.", label, ".log")
+    let showLogPath: str = os.JoinPath(outDir, showLogName)
+    let showRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 chain_node cli show-state " + label,
+                                                                showBin,
+                                                                showArgs,
+                                                                20,
+                                                                showLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli show-state", showRun):
+        return showRun.exitCode
+    var snapshotArgs: str[] = []
+    add(snapshotArgs, "--state:" + serverState)
+    let snapshotLogName: str = v3BackendDriverConcat3("snapshot.", label, ".log")
+    let snapshotLogPath: str = os.JoinPath(outDir, snapshotLogName)
+    let snapshotRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                    "v3 chain_node cli dump-snapshot " + label,
+                                                                    snapshotBin,
+                                                                    snapshotArgs,
+                                                                    20,
+                                                                    snapshotLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli dump-snapshot", snapshotRun):
+        return snapshotRun.exitCode
+    var serveArgs: str[] = []
+    add(serveArgs, "--state:" + serverState)
+    add(serveArgs, "--port:0")
+    add(serveArgs, "--ready-path:" + readyPath)
+    let serverSpawn = hostops.v3SpawnFile(rootDir,
+                                          "v3 chain_node cli daemon-serve " + label,
+                                          serveBin,
+                                          serveArgs,
+                                          [],
+                                          rootDir)
+    if IsErr(serverSpawn):
+        v3BackendDriverPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var serverPort = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, serverPort):
+        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, serverLog, 1)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let syncRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 chain_node cli daemon-sync " + label,
+                                                                syncBin,
+                                                                ["--state:" + clientState, "--node-id:node-b", "--address-seed:chain-node-b", "--host:127.0.0.1", "--port", serverPort],
+                                                                20,
+                                                                syncLog)
+    if v3BackendDriverRunFailed("v3 chain_node cli daemon-sync", syncRun):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, serverLog)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return syncRun.exitCode
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, serverLog)
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    if serverRun.exitCode != 0:
+        return serverRun.exitCode
+    var clientBalanceAArgs: str[] = []
+    add(clientBalanceAArgs, "--state:" + clientState)
+    add(clientBalanceAArgs, "--asset:7")
+    add(clientBalanceAArgs, "--account:1001")
+    let clientBalanceALogName: str = v3BackendDriverConcat3("client_balance_a.", label, ".log")
+    let clientBalanceALogPath: str = os.JoinPath(outDir, clientBalanceALogName)
+    let clientBalanceARun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                          "v3 chain_node cli client-balance-a " + label,
+                                                                          balanceBin,
+                                                                          clientBalanceAArgs,
+                                                                          20,
+                                                                          clientBalanceALogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli client-balance-a", clientBalanceARun):
+        return clientBalanceARun.exitCode
+    var clientBalanceBArgs: str[] = []
+    add(clientBalanceBArgs, "--state:" + clientState)
+    add(clientBalanceBArgs, "--asset:7")
+    add(clientBalanceBArgs, "--account:2002")
+    let clientBalanceBLogName: str = v3BackendDriverConcat3("client_balance_b.", label, ".log")
+    let clientBalanceBLogPath: str = os.JoinPath(outDir, clientBalanceBLogName)
+    let clientBalanceBRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                          "v3 chain_node cli client-balance-b " + label,
+                                                                          balanceBin,
+                                                                          clientBalanceBArgs,
+                                                                          20,
+                                                                          clientBalanceBLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli client-balance-b", clientBalanceBRun):
+        return clientBalanceBRun.exitCode
+    var clientShowArgs: str[] = []
+    add(clientShowArgs, "--state:" + clientState)
+    let clientShowLogName: str = v3BackendDriverConcat3("client_show.", label, ".log")
+    let clientShowLogPath: str = os.JoinPath(outDir, clientShowLogName)
+    let clientShowRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                      "v3 chain_node cli client-show " + label,
+                                                                      showBin,
+                                                                      clientShowArgs,
+                                                                      20,
+                                                                      clientShowLogPath)
+    if v3BackendDriverRunFailed("v3 chain_node cli client-show", clientShowRun):
+        return clientShowRun.exitCode
+    if !v3BackendDriverRequireOutput(initRun, "node_id=node-a", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(balanceARun, "balance=60", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(balanceBRun, "balance=40", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(showRun, "node_id=node-a", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(snapshotRun, "payload_hex=", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(syncRun, "changed=1", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(clientBalanceARun, "balance=60", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(clientBalanceBRun, "balance=40", "v3 chain_node cli smoke") ||
+       !v3BackendDriverRequireOutput(clientShowRun, "node_id=node-b", "v3 chain_node cli smoke"):
+        return 1
+    v3BackendDriverMaybePrintRunOutput(initRun)
+    v3BackendDriverMaybePrintRunOutput(mintRun)
+    v3BackendDriverMaybePrintRunOutput(transferRun)
+    v3BackendDriverMaybePrintRunOutput(balanceARun)
+    v3BackendDriverMaybePrintRunOutput(balanceBRun)
+    v3BackendDriverMaybePrintRunOutput(showRun)
+    v3BackendDriverMaybePrintRunOutput(snapshotRun)
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(syncRun)
+    v3BackendDriverMaybePrintRunOutput(clientBalanceARun)
+    v3BackendDriverMaybePrintRunOutput(clientBalanceBRun)
+    v3BackendDriverMaybePrintRunOutput(clientShowRun)
+    let okText: str = v3BackendDriverConcat3("v3 chain_node cli smoke ok (", label, ")")
+    v3BackendDriverPrintLine(okText)
+    return 0
+
+fn v3BackendDriverRunChainNodeProcessSmoke(rootDir: str,
+                                           compilerPath: str,
+                                           label: str): int32 =
+    let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_chain_node_process/", label)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let serverSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/chain_node_process_server_smoke.cheng")
+    let clientSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/chain_node_process_client_smoke.cheng")
+    let serverBin: str = os.JoinPath(outDir, "chain_node_process_server")
+    let clientBin: str = os.JoinPath(outDir, "chain_node_process_client")
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 chain_node process smoke: unsupported host target")
+        return 2
+    let serverCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       "run_chain_node_process_server_build " + label,
+                                                                       compilerPath,
+                                                                       serverSrc,
+                                                                       serverBin,
+                                                                       targetTriple,
+                                                                       os.JoinPath(outDir, "chain_node_process_server.compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node process server compile", serverCompile):
+        return serverCompile.exitCode
+    let clientCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       "run_chain_node_process_client_build " + label,
+                                                                       compilerPath,
+                                                                       clientSrc,
+                                                                       clientBin,
+                                                                       targetTriple,
+                                                                       os.JoinPath(outDir, "chain_node_process_client.compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node process client compile", clientCompile):
+        return clientCompile.exitCode
+    let readyPath: str = os.JoinPath(outDir, "server.ready")
+    let _ = os.RemoveFile(readyPath)
+    let spawnRes = hostops.v3SpawnFile(rootDir,
+                                       "chain_node_process_server " + label,
+                                       serverBin,
+                                       ["--port:0", "--ready-path:" + readyPath],
+                                       [],
+                                       rootDir)
+    if IsErr(spawnRes):
+        v3BackendDriverPrintErr(Error(spawnRes))
+        return 1
+    var serverProc = Value(spawnRes)
+    var port = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, readyPath, serverProc, port):
+        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, os.JoinPath(outDir, "server.log"), 1)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                  "chain_node_process_client " + label,
+                                                                  clientBin,
+                                                                  ["--port:" + port],
+                                                                  20,
+                                                                  os.JoinPath(outDir, "client.log"))
+    if v3BackendDriverRunFailed("v3 chain_node process client run", clientRun):
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, os.JoinPath(outDir, "server.log"))
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        return clientRun.exitCode
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, os.JoinPath(outDir, "server.log"))
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(clientRun)
+    if v3BackendDriverRunFailed("v3 chain_node process server run", serverRun):
+        return serverRun.exitCode
+    let okText: str = v3BackendDriverConcat3("v3 chain_node process smoke ok (", label, ")")
+    v3BackendDriverPrintLine(okText)
+    return 0
+
+fn v3BackendDriverRunChainNodeThreeNodeSmoke(rootDir: str,
+                                             compilerPath: str,
+                                             label: str): int32 =
+    let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_chain_node_three_node/", label)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let serverSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/chain_node_process_server_smoke.cheng")
+    let relaySrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/chain_node_process_relay_smoke.cheng")
+    let clientSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/chain_node_process_client_smoke.cheng")
+    let serverBin: str = os.JoinPath(outDir, "chain_node_process_server")
+    let relayBin: str = os.JoinPath(outDir, "chain_node_process_relay")
+    let clientBin: str = os.JoinPath(outDir, "chain_node_process_client")
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 chain_node three-node smoke: unsupported host target")
+        return 2
+    let serverCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       "run_chain_node_three_node_server_build " + label,
+                                                                       compilerPath,
+                                                                       serverSrc,
+                                                                       serverBin,
+                                                                       targetTriple,
+                                                                       os.JoinPath(outDir, "chain_node_process_server.compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node three-node server compile", serverCompile):
+        return serverCompile.exitCode
+    let relayCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                      "run_chain_node_three_node_relay_build " + label,
+                                                                      compilerPath,
+                                                                      relaySrc,
+                                                                      relayBin,
+                                                                      targetTriple,
+                                                                      os.JoinPath(outDir, "chain_node_process_relay.compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node three-node relay compile", relayCompile):
+        return relayCompile.exitCode
+    let clientCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                       "run_chain_node_three_node_client_build " + label,
+                                                                       compilerPath,
+                                                                       clientSrc,
+                                                                       clientBin,
+                                                                       targetTriple,
+                                                                       os.JoinPath(outDir, "chain_node_process_client.compile.log"))
+    if v3BackendDriverRunFailed("v3 chain_node three-node client compile", clientCompile):
+        return clientCompile.exitCode
+    let serverReady: str = os.JoinPath(outDir, "server.ready")
+    let relayReady: str = os.JoinPath(outDir, "relay.ready")
+    let _ = os.RemoveFile(serverReady)
+    let _ = os.RemoveFile(relayReady)
+    let serverSpawn = hostops.v3SpawnFile(rootDir,
+                                          "chain_node_three_node_server " + label,
+                                          serverBin,
+                                          ["--port:0", "--ready-path:" + serverReady],
+                                          [],
+                                          rootDir)
+    if IsErr(serverSpawn):
+        v3BackendDriverPrintErr(Error(serverSpawn))
+        return 1
+    var serverProc = Value(serverSpawn)
+    var serverPort = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, serverReady, serverProc, serverPort):
+        let serverRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, serverProc, os.JoinPath(outDir, "server.log"), 1)
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let relaySpawn = hostops.v3SpawnFile(rootDir,
+                                         "chain_node_three_node_relay " + label,
+                                         relayBin,
+                                         ["--upstream-port:" + serverPort, "--port:0", "--ready-path:" + relayReady],
+                                         [],
+                                         rootDir)
+    if IsErr(relaySpawn):
+        v3BackendDriverPrintErr(Error(relaySpawn))
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    var relayProc = Value(relaySpawn)
+    var relayPort = ""
+    if !v3BackendDriverWaitReadyPort(rootDir, relayReady, relayProc, relayPort):
+        let relayRun: hostops.V3LoggedRun = v3BackendDriverWriteProcessSnapshot(rootDir, relayProc, os.JoinPath(outDir, "relay.log"), 1)
+        v3BackendDriverMaybePrintRunOutput(relayRun)
+        hostops.v3SpawnedProcessKill(relayProc)
+        hostops.v3SpawnedProcessKill(serverProc)
+        return 1
+    let clientRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                  "chain_node_three_node_client " + label,
+                                                                  clientBin,
+                                                                  ["--port:" + relayPort],
+                                                                  20,
+                                                                  os.JoinPath(outDir, "client.log"))
+    if v3BackendDriverRunFailed("v3 chain_node three-node client run", clientRun):
+        let relayRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, relayProc, 1, os.JoinPath(outDir, "relay.log"))
+        let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 1, os.JoinPath(outDir, "server.log"))
+        v3BackendDriverMaybePrintRunOutput(serverRun)
+        v3BackendDriverMaybePrintRunOutput(relayRun)
+        return clientRun.exitCode
+    let relayRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, relayProc, 20, os.JoinPath(outDir, "relay.log"))
+    let serverRun: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(rootDir, serverProc, 20, os.JoinPath(outDir, "server.log"))
+    v3BackendDriverMaybePrintRunOutput(serverRun)
+    v3BackendDriverMaybePrintRunOutput(relayRun)
+    v3BackendDriverMaybePrintRunOutput(clientRun)
+    if v3BackendDriverRunFailed("v3 chain_node three-node relay run", relayRun):
+        return relayRun.exitCode
+    if v3BackendDriverRunFailed("v3 chain_node three-node server run", serverRun):
+        return serverRun.exitCode
+    let okText: str = v3BackendDriverConcat3("v3 chain_node three-node smoke ok (", label, ")")
+    v3BackendDriverPrintLine(okText)
+    return 0
+
+fn v3BackendDriverRunTailnetControlSmoke(rootDir: str,
+                                         compilerPath: str,
+                                         label: str): int32 =
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_tailnet_control")
+    let controlProbeEndpoint: str = v3path.V3PathAbsolute(rootDir, "v3/testdata/tailnet/headscale_control_ready.json")
+    let relayProbeEndpoint: str = v3path.V3PathAbsolute(rootDir, "v3/testdata/tailnet/derp_ready.json")
+    let baselineSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/libp2p_tailnet_transport_smoke.cheng")
+    let baselineBin: str = os.JoinPath(outDir, "libp2p_tailnet_transport_smoke." + label)
+    let targetTriple: str = v3BackendDriverHostTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 tailnet control: unsupported host target")
+        return 2
+    let baselineRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                     "v3 tailnet control compile baseline " + label,
+                                                                     compilerPath,
+                                                                     baselineSrc,
+                                                                     baselineBin,
+                                                                     targetTriple,
+                                                                     baselineBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 tailnet control baseline compile", baselineRun):
+        return baselineRun.exitCode
+    let baselineRunLogName: str = v3BackendDriverConcat3("libp2p_tailnet_transport_smoke.", label, ".run.log")
+    let baselineRunLogPath: str = os.JoinPath(outDir, baselineRunLogName)
+    let baselineExec: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                     "v3 tailnet control run baseline " + label,
+                                                                     baselineBin,
+                                                                     [],
+                                                                     20,
+                                                                     baselineRunLogPath)
+    if v3BackendDriverRunFailed("v3 tailnet control baseline run", baselineExec):
+        return baselineExec.exitCode
+    let coreSmokeSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/tailnet_control_core_smoke.cheng")
+    let coreSmokeBin: str = os.JoinPath(outDir, "tailnet_control_core_smoke." + label)
+    let coreSmokeCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                          "v3 tailnet control compile decode smoke " + label,
+                                                                          compilerPath,
+                                                                          coreSmokeSrc,
+                                                                          coreSmokeBin,
+                                                                          targetTriple,
+                                                                          coreSmokeBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 tailnet control core smoke compile", coreSmokeCompile):
+        return coreSmokeCompile.exitCode
+    let coreSmokeRunLogName: str = v3BackendDriverConcat3("tailnet_control_core_smoke.", label, ".run.log")
+    let coreSmokeRunLogPath: str = os.JoinPath(outDir, coreSmokeRunLogName)
+    let coreSmokeRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                     "v3 tailnet control run decode smoke " + label,
+                                                                     coreSmokeBin,
+                                                                     [],
+                                                                     20,
+                                                                     coreSmokeRunLogPath)
+    if v3BackendDriverRunFailed("v3 tailnet control core smoke run", coreSmokeRun):
+        return coreSmokeRun.exitCode
+    let coreSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/project/tailnet_control_core.cheng")
+    let coreBin: str = os.JoinPath(outDir, "tailnet_control_core." + label)
+    let coreCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                     "v3 tailnet control compile core " + label,
+                                                                     compilerPath,
+                                                                     coreSrc,
+                                                                     coreBin,
+                                                                     targetTriple,
+                                                                     coreBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 tailnet control core compile", coreCompile):
+        return coreCompile.exitCode
+    var configureArgs: str[] = []
+    add(configureArgs, "--command")
+    add(configureArgs, "configure")
+    add(configureArgs, "--provider-headscale")
+    add(configureArgs, "1")
+    add(configureArgs, "--control-url")
+    add(configureArgs, "https://headscale.example")
+    add(configureArgs, "--control-endpoint")
+    add(configureArgs, "https://headscale.example/control")
+    add(configureArgs, "--relay-endpoint")
+    add(configureArgs, "https://derp.sfo.example:443")
+    add(configureArgs, "--control-probe-endpoint")
+    add(configureArgs, controlProbeEndpoint)
+    add(configureArgs, "--relay-probe-endpoint")
+    add(configureArgs, relayProbeEndpoint)
+    add(configureArgs, "--namespace")
+    add(configureArgs, "infra")
+    add(configureArgs, "--noise-public-key")
+    add(configureArgs, "noise-pub-cli")
+    add(configureArgs, "--derp-region-code")
+    add(configureArgs, "sfo")
+    add(configureArgs, "--derp-region-name")
+    add(configureArgs, "SanFrancisco")
+    add(configureArgs, "--derp-hostname")
+    add(configureArgs, "derp.sfo.example")
+    add(configureArgs, "--synthetic-ipv4")
+    add(configureArgs, "100.64.0.44")
+    add(configureArgs, "--synthetic-ipv6")
+    add(configureArgs, "fd7a:115c:a1e0::44")
+    add(configureArgs, "--local-peer-id")
+    add(configureArgs, "tailnet-control-test")
+    add(configureArgs, "--exact-routing")
+    add(configureArgs, "1")
+    add(configureArgs, "--provider-ready")
+    add(configureArgs, "1")
+    add(configureArgs, "--proxy-ready")
+    add(configureArgs, "1")
+    let configureLogName: str = v3BackendDriverConcat3("tailnet_control_configure.", label, ".run.log")
+    let configureLogPath: str = os.JoinPath(outDir, configureLogName)
+    let configureRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                     "v3 tailnet control configure " + label,
+                                                                     coreBin,
+                                                                     configureArgs,
+                                                                     20,
+                                                                     configureLogPath)
+    if v3BackendDriverRunFailed("v3 tailnet control configure", configureRun):
+        return configureRun.exitCode
+    if !v3BackendDriverRequireOutput(configureRun, "configured=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "providerKind=headscale", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "controlProbeEndpoint=" + controlProbeEndpoint, "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "controlPlane=headscale", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "providerReady=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "proxyListenersReady=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(configureRun, "providerRuntimeActive=1", "v3 tailnet control"):
+        return 1
+    var listenArgs: str[] = []
+    add(listenArgs, "--command")
+    add(listenArgs, "listen")
+    add(listenArgs, "--provider-headscale")
+    add(listenArgs, "1")
+    add(listenArgs, "--control-url")
+    add(listenArgs, "https://headscale.example")
+    add(listenArgs, "--control-endpoint")
+    add(listenArgs, "https://headscale.example/control")
+    add(listenArgs, "--relay-endpoint")
+    add(listenArgs, "https://derp.sfo.example:443")
+    add(listenArgs, "--control-probe-endpoint")
+    add(listenArgs, controlProbeEndpoint)
+    add(listenArgs, "--relay-probe-endpoint")
+    add(listenArgs, relayProbeEndpoint)
+    add(listenArgs, "--namespace")
+    add(listenArgs, "infra")
+    add(listenArgs, "--noise-public-key")
+    add(listenArgs, "noise-pub-cli")
+    add(listenArgs, "--derp-region-code")
+    add(listenArgs, "sfo")
+    add(listenArgs, "--derp-region-name")
+    add(listenArgs, "SanFrancisco")
+    add(listenArgs, "--derp-hostname")
+    add(listenArgs, "derp.sfo.example")
+    add(listenArgs, "--synthetic-ipv4")
+    add(listenArgs, "100.64.0.44")
+    add(listenArgs, "--synthetic-ipv6")
+    add(listenArgs, "fd7a:115c:a1e0::44")
+    add(listenArgs, "--local-peer-id")
+    add(listenArgs, "tailnet-control-test")
+    add(listenArgs, "--exact-routing")
+    add(listenArgs, "1")
+    add(listenArgs, "--provider-ready")
+    add(listenArgs, "1")
+    add(listenArgs, "--proxy-ready")
+    add(listenArgs, "1")
+    add(listenArgs, "--host")
+    add(listenArgs, "127.0.0.1")
+    add(listenArgs, "--port")
+    add(listenArgs, "7101")
+    add(listenArgs, "--transport")
+    add(listenArgs, "tcp")
+    let listenLogName: str = v3BackendDriverConcat3("tailnet_control_listen.", label, ".run.log")
+    let listenLogPath: str = os.JoinPath(outDir, listenLogName)
+    let listenRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                  "v3 tailnet control listen " + label,
+                                                                  coreBin,
+                                                                  listenArgs,
+                                                                  20,
+                                                                  listenLogPath)
+    if v3BackendDriverRunFailed("v3 tailnet control listen", listenRun):
+        return listenRun.exitCode
+    if !v3BackendDriverRequireOutput(listenRun, "publishedAddr=/ip4/100.64.0.44/tcp/7101", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(listenRun, "listener.0.raw=/ip4/127.0.0.1/tcp/7101", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(listenRun, "providerKind=headscale", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(listenRun, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(listenRun, "providerRuntimeActive=1", "v3 tailnet control"):
+        return 1
+    var dialArgs: str[] = []
+    add(dialArgs, "--command")
+    add(dialArgs, "dial-plan")
+    add(dialArgs, "--provider-headscale")
+    add(dialArgs, "1")
+    add(dialArgs, "--control-url")
+    add(dialArgs, "https://headscale.example")
+    add(dialArgs, "--control-endpoint")
+    add(dialArgs, "https://headscale.example/control")
+    add(dialArgs, "--relay-endpoint")
+    add(dialArgs, "https://derp.sfo.example:443")
+    add(dialArgs, "--control-probe-endpoint")
+    add(dialArgs, controlProbeEndpoint)
+    add(dialArgs, "--relay-probe-endpoint")
+    add(dialArgs, relayProbeEndpoint)
+    add(dialArgs, "--namespace")
+    add(dialArgs, "infra")
+    add(dialArgs, "--noise-public-key")
+    add(dialArgs, "noise-pub-cli")
+    add(dialArgs, "--derp-region-code")
+    add(dialArgs, "sfo")
+    add(dialArgs, "--derp-region-name")
+    add(dialArgs, "SanFrancisco")
+    add(dialArgs, "--derp-hostname")
+    add(dialArgs, "derp.sfo.example")
+    add(dialArgs, "--synthetic-ipv4")
+    add(dialArgs, "100.64.0.44")
+    add(dialArgs, "--synthetic-ipv6")
+    add(dialArgs, "fd7a:115c:a1e0::44")
+    add(dialArgs, "--local-peer-id")
+    add(dialArgs, "tailnet-control-test")
+    add(dialArgs, "--exact-routing")
+    add(dialArgs, "1")
+    add(dialArgs, "--provider-ready")
+    add(dialArgs, "1")
+    add(dialArgs, "--proxy-ready")
+    add(dialArgs, "1")
+    add(dialArgs, "--derp-healthy")
+    add(dialArgs, "1")
+    add(dialArgs, "--bootstrap-listen-count")
+    add(dialArgs, "1")
+    add(dialArgs, "--bootstrap-listen-raw-0")
+    add(dialArgs, "/ip4/127.0.0.1/tcp/7101")
+    add(dialArgs, "--bootstrap-peer-count")
+    add(dialArgs, "1")
+    add(dialArgs, "--bootstrap-peer-id-0")
+    add(dialArgs, "peer-direct")
+    add(dialArgs, "--bootstrap-peer-remote-tailnet-ip-0")
+    add(dialArgs, "100.64.0.88")
+    add(dialArgs, "--bootstrap-peer-direct-reachable-0")
+    add(dialArgs, "1")
+    add(dialArgs, "--bootstrap-peer-relay-allowed-0")
+    add(dialArgs, "1")
+    add(dialArgs, "--bootstrap-peer-relay-only-0")
+    add(dialArgs, "0")
+    add(dialArgs, "--bootstrap-peer-derp-region-code-0")
+    add(dialArgs, "sfo")
+    add(dialArgs, "--bootstrap-peer-signed-preface-0")
+    add(dialArgs, "test-preface")
+    add(dialArgs, "--bootstrap-peer-bound-addr-text-0")
+    add(dialArgs, "/ip4/127.0.0.1/tcp/7101")
+    add(dialArgs, "--bootstrap-peer-last-path-0")
+    add(dialArgs, "direct")
+    add(dialArgs, "--bootstrap-peer-last-error-0")
+    add(dialArgs, "")
+    add(dialArgs, "--peer-id")
+    add(dialArgs, "peer-direct")
+    add(dialArgs, "--addr")
+    add(dialArgs, "/ip4/100.64.0.44/tcp/7101")
+    let dialLogName: str = v3BackendDriverConcat3("tailnet_control_dial.", label, ".run.log")
+    let dialLogPath: str = os.JoinPath(outDir, dialLogName)
+    let dialRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "v3 tailnet control dial-plan " + label,
+                                                                coreBin,
+                                                                dialArgs,
+                                                                20,
+                                                                dialLogPath)
+    if v3BackendDriverRunFailed("v3 tailnet control dial", dialRun):
+        return dialRun.exitCode
+    if !v3BackendDriverRequireOutput(dialRun, "dial.pathKind=direct", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "dial.routeText=/ip4/127.0.0.1/tcp/7101", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "sessionCount=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "relayHealthy=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "startupStage=derp-ready", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "tailnetDerpMapSummary=headscale/infra@https://headscale.example#sfo/derp.sfo.example", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "peer.0.lastPath=direct", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "providerRuntimeActive=1", "v3 tailnet control") ||
+       !v3BackendDriverRequireOutput(dialRun, "providerRuntimeCommands=3", "v3 tailnet control"):
+        return 1
+    v3BackendDriverMaybePrintRunOutput(baselineExec)
+    v3BackendDriverMaybePrintRunOutput(coreSmokeRun)
+    v3BackendDriverMaybePrintRunOutput(configureRun)
+    v3BackendDriverMaybePrintRunOutput(listenRun)
+    v3BackendDriverMaybePrintRunOutput(dialRun)
+    v3BackendDriverPrintLine("v3 tailnet_control_smoke ok")
+    return 0
+
+fn v3BackendDriverRunFreshNodeSelfhostGate(rootDir: str,
+                                           compilerPath: str,
+                                           label: str): int32 =
+    let src: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/program_selfhost_smoke.cheng")
+    let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_fresh_node_gate/", label)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let syncPrefix: str = os.JoinPath(outDir, "program_selfhost_smoke.sync")
+    let freshPrefix: str = os.JoinPath(outDir, "program_selfhost_smoke.fresh")
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    if !os.FileExists(src):
+        v3BackendDriverPrintErr("v3 fresh-node selfhost gate: missing source: " + src)
+        return 1
+    let syncRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                               "v3 fresh-node selfhost world-sync " + label,
+                                                               compilerPath,
+                                                               ["world-sync",
+                                                                "--root:" + packageRoot,
+                                                                "--in:" + src,
+                                                                "--target:arm64-apple-darwin",
+                                                                "--out:" + syncPrefix,
+                                                                "--channel:stable"],
+                                                               [],
+                                                               rootDir,
+                                                               0,
+                                                               os.JoinPath(outDir, "world_sync.log"))
+    if v3BackendDriverRunFailed("v3 fresh-node selfhost world-sync", syncRun):
+        return syncRun.exitCode
+    if !v3BackendDriverRequirePrefixArtifacts(syncPrefix,
+                                              [".world.txt",
+                                               ".compiler.snapshot.txt",
+                                               ".std.snapshot.txt",
+                                               ".runtime.snapshot.txt",
+                                               ".csg.txt",
+                                               ".surface.txt",
+                                               ".receipt.txt",
+                                               ".lock.toml"],
+                                              "v3 fresh-node selfhost gate"):
+        return 1
+    var freshArgs: str[] = []
+    add(freshArgs, "fresh-node-selfhost")
+    add(freshArgs, "--root:" + packageRoot)
+    add(freshArgs, "--in:" + src)
+    add(freshArgs, "--target:arm64-apple-darwin")
+    add(freshArgs, "--out:" + freshPrefix)
+    add(freshArgs, "--channel:stable")
+    add(freshArgs, v3BackendDriverConcat3("--baseline-csg:", syncPrefix, ".csg.txt"))
+    add(freshArgs, v3BackendDriverConcat3("--baseline-surface:", syncPrefix, ".surface.txt"))
+    add(freshArgs, v3BackendDriverConcat3("--baseline-receipt:", syncPrefix, ".receipt.txt"))
+    let freshRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                "v3 fresh-node selfhost fresh " + label,
+                                                                compilerPath,
+                                                                freshArgs,
+                                                                [],
+                                                                rootDir,
+                                                                0,
+                                                                os.JoinPath(outDir, "fresh_node.log"))
+    if v3BackendDriverRunFailed("v3 fresh-node selfhost fresh", freshRun):
+        return freshRun.exitCode
+    if !v3BackendDriverRequireOutput(freshRun, "equivalence_passed=1", "v3 fresh-node selfhost gate") ||
+       !v3BackendDriverRequireOutput(freshRun, "publish_allowed=1", "v3 fresh-node selfhost gate") ||
+       !v3BackendDriverRequireOutput(freshRun, "receipt_equivalent=1", "v3 fresh-node selfhost gate") ||
+       !v3BackendDriverRequireOutput(freshRun, "receipt_cid_match=1", "v3 fresh-node selfhost gate") ||
+       !v3BackendDriverRequireFileContains(freshPrefix + ".fresh.txt", "receipt_equivalent=1", "v3 fresh-node selfhost gate") ||
+       !v3BackendDriverRequireFileContains(freshPrefix + ".fresh.txt", "receipt_cid_match=1", "v3 fresh-node selfhost gate"):
+        return 1
+    v3BackendDriverMaybePrintRunOutput(syncRun)
+    v3BackendDriverMaybePrintRunOutput(freshRun)
+    let okText: str = v3BackendDriverConcat3("v3 fresh-node selfhost gate ok (", label, ")")
+    v3BackendDriverPrintLine(okText)
+    return 0
+
+fn v3BackendDriverRunMigrationGate(rootDir: str,
+                                   compilerPath: str,
+                                   label: str): int32 =
+    let currentSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/compiler_migration_fixture.cheng")
+    let legacySrc: str = v3path.V3PathAbsolute(rootDir, "v3/testdata/compiler_migration/compiler_migration_fixture_legacy.cheng")
+    let outDirRel: str = v3BackendDriverConcat2("artifacts/v3_migration_gate/", label)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
+    let migratePrefix: str = os.JoinPath(outDir, "compiler_migration_fixture.migrate")
+    let proofPrefix: str = os.JoinPath(outDir, "compiler_migration_fixture.prove")
+    let blockedPrefix: str = os.JoinPath(outDir, "compiler_migration_fixture.blocked")
+    let publishPrefix: str = os.JoinPath(outDir, "compiler_migration_fixture.publish")
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    if !os.FileExists(currentSrc) || !os.FileExists(legacySrc):
+        v3BackendDriverPrintErr("v3 migration gate: missing fixture sources")
+        return 1
+    let migrateRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "v3 migration gate migrate-csg " + label,
+                                                                  compilerPath,
+                                                                  ["migrate-csg",
+                                                                   "--root:" + packageRoot,
+                                                                   "--in:" + currentSrc,
+                                                                   "--legacy-in:" + legacySrc,
+                                                                   "--out:" + migratePrefix],
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  os.JoinPath(outDir, "migrate_csg.log"))
+    if v3BackendDriverRunFailed("v3 migration gate migrate-csg", migrateRun):
+        return migrateRun.exitCode
+    if !v3BackendDriverRequirePrefixArtifacts(migratePrefix,
+                                              [".migration.txt", ".migration.csg.txt", ".migration.surface.txt", ".migration.receipt.txt"],
+                                              "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(migrateRun, "canonical_graph_cid=", "v3 migration gate"):
+        return 1
+    let proveRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                "v3 migration gate prove-migration " + label,
+                                                                compilerPath,
+                                                                ["prove-migration",
+                                                                 "--root:" + packageRoot,
+                                                                 "--in:" + currentSrc,
+                                                                 "--legacy-in:" + legacySrc,
+                                                                 "--target:arm64-apple-darwin",
+                                                                 "--channel:stable",
+                                                                 "--out:" + proofPrefix],
+                                                                [],
+                                                                rootDir,
+                                                                0,
+                                                                os.JoinPath(outDir, "prove_migration.log"))
+    if v3BackendDriverRunFailed("v3 migration gate prove-migration", proveRun):
+        return proveRun.exitCode
+    if !v3BackendDriverRequirePrefixArtifacts(proofPrefix,
+                                              [".migration.txt", ".migration.csg.txt", ".migration.surface.txt", ".migration.receipt.txt", ".proof.txt"],
+                                              "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(proveRun, "equivalence_kind=canonical_semantic_identity", "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(proveRun, "graph_equivalent=1", "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(proveRun, "export_surface_compatible=1", "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(proveRun, "compile_receipt_equivalent=1", "v3 migration gate"):
+        return 1
+    let blockedRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "v3 migration gate publish-blocked " + label,
+                                                                  compilerPath,
+                                                                  ["publish-world",
+                                                                   "--root:" + packageRoot,
+                                                                   "--in:" + currentSrc,
+                                                                   "--target:arm64-apple-darwin",
+                                                                   "--out:" + blockedPrefix,
+                                                                   "--channel:stable"],
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  os.JoinPath(outDir, "publish_blocked.log"))
+    if blockedRun.exitCode == 0:
+        v3BackendDriverPrintErr("v3 migration gate: stable publish unexpectedly passed without proof")
+        return 1
+    if !v3BackendDriverRequireAnyOutput(blockedRun.output,
+                                        ["stable requires", "publish blocked", "missing --baseline"],
+                                        "v3 migration gate"):
+        return 1
+    let publishRun: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                                  "v3 migration gate publish-world " + label,
+                                                                  compilerPath,
+                                                                  ["publish-world",
+                                                                   "--root:" + packageRoot,
+                                                                   "--in:" + currentSrc,
+                                                                   "--legacy-in:" + legacySrc,
+                                                                   "--target:arm64-apple-darwin",
+                                                                   "--out:" + publishPrefix,
+                                                                   "--channel:stable"],
+                                                                  [],
+                                                                  rootDir,
+                                                                  0,
+                                                                  os.JoinPath(outDir, "publish_migration.log"))
+    if v3BackendDriverRunFailed("v3 migration gate publish-world", publishRun):
+        return publishRun.exitCode
+    if !v3BackendDriverRequirePrefixArtifacts(publishPrefix,
+                                              [".world.txt",
+                                               ".compiler.snapshot.txt",
+                                               ".std.snapshot.txt",
+                                               ".runtime.snapshot.txt",
+                                               ".csg.txt",
+                                               ".surface.txt",
+                                               ".receipt.txt",
+                                               ".lock.toml",
+                                               ".migration.txt",
+                                               ".migration.csg.txt",
+                                               ".migration.surface.txt",
+                                               ".migration.receipt.txt",
+                                               ".proof.txt",
+                                               ".publish.txt"],
+                                              "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(publishRun, "proof_mode=migration", "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(publishRun, "equivalence_passed=1", "v3 migration gate") ||
+       !v3BackendDriverRequireOutput(publishRun, "publish_allowed=1", "v3 migration gate"):
+        return 1
+    v3BackendDriverMaybePrintRunOutput(migrateRun)
+    v3BackendDriverMaybePrintRunOutput(proveRun)
+    v3BackendDriverMaybePrintRunOutput(blockedRun)
+    v3BackendDriverMaybePrintRunOutput(publishRun)
+    let okText: str = v3BackendDriverConcat3("v3 migration gate ok (", label, ")")
+    v3BackendDriverPrintLine(okText)
+    return 0
+
+fn v3BackendDriverRunHostSmokesLocal(rootDir: str,
+                                     args: str[]): int32 =
+    var compilerPath = ""
+    if !v3BackendDriverResolveHostSmokeCompiler(rootDir, args, compilerPath):
+        return 1
+    let tailOnly: str = strutil.Strip(v3BackendDriverReadFlag(args, "--tail-only", ""))
+    let positionals: str[] = v3BackendDriverCollectPositionals(args)
+    let label: str = v3BackendDriverResolveSmokeLabel(args, "CHENG_V3_SMOKE_LABEL", "host")
+    let hostrunRoot: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_hostrun")
+    var outDir: str = hostrunRoot
+    if label != "host":
+        outDir = os.JoinPath(hostrunRoot, label)
+    if len(tailOnly) > 0:
+        if tailOnly == "wasm":
+            return v3BackendDriverRunWasmSmokes(rootDir, args)
+        if tailOnly == "browser_host_wasm":
+            return v3BackendDriverRunBrowserHostWasmSmoke(rootDir, args)
+        if tailOnly == "chain_node_cli":
+            return v3BackendDriverRunChainNodeCliSmoke(rootDir, compilerPath, label)
+        if tailOnly == "chain_node_process":
+            return v3BackendDriverRunChainNodeProcessSmoke(rootDir, compilerPath, label)
+        if tailOnly == "chain_node_three_node":
+            return v3BackendDriverRunChainNodeThreeNodeSmoke(rootDir, compilerPath, label)
+        if tailOnly == "chain_node_resilience":
+            return v3BackendDriverRunChainNodeResilienceSmoke(rootDir, args)
+        if tailOnly == "tailnet_control":
+            return v3BackendDriverRunTailnetControlSmoke(rootDir, compilerPath, label)
+        if tailOnly == "fresh_node_selfhost":
+            return v3BackendDriverRunFreshNodeSelfhostGate(rootDir, compilerPath, label)
+        if tailOnly == "migration":
+            return v3BackendDriverRunMigrationGate(rootDir, compilerPath, label)
+        v3BackendDriverPrintErr("v3 host smokes: unknown --tail-only: " + tailOnly)
+        return 1
+    var tests: str[] = v3BackendDriverDefaultHostSmokes()
+    var runTail: bool = true
+    if positionals.len > 0:
+        tests = positionals
+        runTail = false
+    for i in 0..<tests.len:
+        let smokeName: str = tests[i]
+        let outBin: str = os.JoinPath(outDir, smokeName)
+        if v3BackendDriverRunSingleFixtureSmoke(rootDir, "v3 host smokes", compilerPath, smokeName, outBin, label) != 0:
+            return 1
+        if smokeName == "chain_node_libp2p_smoke":
+            if v3BackendDriverRunTcpTwoprocSmoke(rootDir, compilerPath, label) != 0:
+                return 1
+        if smokeName == "libp2p_quic_tls_smoke":
+            if v3BackendDriverRunQuicTwoprocSmoke(rootDir, compilerPath, label) != 0:
+                return 1
+    if runTail:
+        if v3BackendDriverRunChainNodeCliSmoke(rootDir, compilerPath, label) != 0:
+            return 1
+        if v3BackendDriverRunChainNodeProcessSmoke(rootDir, compilerPath, label) != 0:
+            return 1
+        if v3BackendDriverRunChainNodeThreeNodeSmoke(rootDir, compilerPath, label) != 0:
+            return 1
+        if v3BackendDriverRunTailnetControlSmoke(rootDir, compilerPath, label) != 0:
+            return 1
+        if v3BackendDriverRunFreshNodeSelfhostGate(rootDir, compilerPath, label) != 0:
+            return 1
+        if v3BackendDriverRunMigrationGate(rootDir, compilerPath, label) != 0:
+            return 1
+    v3BackendDriverPrintLine("v3 host smokes: ok")
+    return 0
 
 fn v3BackendDriverRequireWasmAudit(label: str,
                                    wasmPath: str,
@@ -2544,7 +3882,7 @@ fn v3BackendDriverVerifyExportVisibility(rootDir: str): int32 =
     let smokes: str[] = ["export_visibility_smoke", "export_visibility_negative_smoke", "strformat_export_negative_smoke"]
     let logPath: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/verify_export_visibility.log")
     let run: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
-                                                                      v3BackendDriverStage3Path(rootDir),
+                                                                      selfPath,
                                                                       selfPath,
                                                                       label,
                                                                       smokes,
@@ -2579,7 +3917,7 @@ fn v3BackendDriverVerifyExportVisibilityParallel(rootDir: str): int32 =
     if v3BackendDriverRunFailed("v3 backend driver: verify-export-visibility-parallel stage3", stage3Run):
         return stage3Run.exitCode
     let backendRun: hostops.V3LoggedRun = v3BackendDriverRunHostSmokesLogged(rootDir,
-                                                                              stage3Path,
+                                                                              selfPath,
                                                                               selfPath,
                                                                               backendLabel,
                                                                               smokes,
@@ -2750,6 +4088,8 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "run-wasm-smokes":
         let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
         return v3BackendDriverRunWasmSmokes(rootDir, args)
+    if cmd == "run-host-smokes":
+        return v3BackendDriverRunHostSmokes(rootDir, count)
     if cmd == "verify-backend-driver-command-surface":
         return v3BackendDriverVerifyBackendDriverCommandSurface(rootDir, count)
     if cmd == "verify-mobile-shell-build-probe":

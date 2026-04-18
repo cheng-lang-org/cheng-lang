@@ -2600,6 +2600,14 @@ typedef struct {
     char missing_reasons[CHENG_V3_MAX_PLAN_REASONS][128];
 } V3LoweringPlanStub;
 
+static bool v3_resolve_field_meta(const V3LoweringPlanStub *lowering,
+                                  const char *type_text,
+                                  const char *field_name,
+                                  char *field_type_out,
+                                  size_t field_type_cap,
+                                  char *field_abi_out,
+                                  size_t field_abi_cap,
+                                  int32_t *field_offset_out);
 static bool v3_type_prefers_address(const char *type_text);
 static bool v3_emit_slot_address(char *out,
                                  size_t cap,
@@ -5012,6 +5020,85 @@ static bool v3_type_prefers_address(const char *type_text) {
         return true;
     }
     return v3_abi_class_prefers_address(v3_type_abi_class(type_text));
+}
+
+static bool v3_type_prefers_region_copy(const char *type_text,
+                                        const char *abi_class) {
+    if (type_text != NULL && type_text[0] != '\0' &&
+        v3_type_prefers_address(type_text)) {
+        return true;
+    }
+    return v3_abi_class_prefers_address(abi_class);
+}
+
+static bool v3_resolve_field_meta(const V3LoweringPlanStub *lowering,
+                                  const char *base_type,
+                                  const char *field_name,
+                                  char *field_type,
+                                  size_t field_type_cap,
+                                  char *field_abi,
+                                  size_t field_abi_cap,
+                                  int32_t *field_offset);
+
+static bool v3_result_intrinsic_projection_prefers_region_copy(const V3LoweringPlanStub *lowering,
+                                                               V3ResultIntrinsicKind kind,
+                                                               const char *result_type) {
+    char field_type[256];
+    char field_abi[32];
+    char err_type[256];
+    char err_abi[32];
+    char msg_type[256];
+    char msg_abi[32];
+    int32_t field_offset = 0;
+    int32_t err_offset = 0;
+    int32_t msg_offset = 0;
+    if (lowering == NULL || result_type == NULL || result_type[0] == '\0') {
+        return false;
+    }
+    if (kind == V3_RESULT_INTRINSIC_VALUE) {
+        return v3_resolve_field_meta(lowering,
+                                     result_type,
+                                     "value",
+                                     field_type,
+                                     sizeof(field_type),
+                                     field_abi,
+                                     sizeof(field_abi),
+                                     &field_offset) &&
+               v3_type_prefers_region_copy(field_type, field_abi);
+    }
+    if (kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) {
+        return v3_resolve_field_meta(lowering,
+                                     result_type,
+                                     "err",
+                                     field_type,
+                                     sizeof(field_type),
+                                     field_abi,
+                                     sizeof(field_abi),
+                                     &field_offset) &&
+               v3_type_prefers_region_copy(field_type, field_abi);
+    }
+    if (kind != V3_RESULT_INTRINSIC_ERROR &&
+        kind != V3_RESULT_INTRINSIC_ERROR_TEXT) {
+        return false;
+    }
+    return v3_resolve_field_meta(lowering,
+                                 result_type,
+                                 "err",
+                                 err_type,
+                                 sizeof(err_type),
+                                 err_abi,
+                                 sizeof(err_abi),
+                                 &err_offset) &&
+           v3_type_prefers_region_copy(err_type, err_abi) &&
+           v3_resolve_field_meta(lowering,
+                                 err_type,
+                                 "msg",
+                                 msg_type,
+                                 sizeof(msg_type),
+                                 msg_abi,
+                                 sizeof(msg_abi),
+                                 &msg_offset) &&
+           v3_type_prefers_region_copy(msg_type, msg_abi);
 }
 
 static bool v3_function_return_prefers_address(const V3LoweredFunctionStub *function) {
@@ -39337,6 +39424,15 @@ static bool v3_wasm_prepare_composite_expr(const V3SystemLinkPlanStub *plan,
                                            V3WasmImportStub *imports,
                                            size_t *import_count);
 
+static bool v3_wasm_prepare_list_literal_expr(const V3SystemLinkPlanStub *plan,
+                                              const V3LoweringPlanStub *lowering,
+                                              const V3LoweredFunctionStub *function,
+                                              V3WasmFunctionContext *ctx,
+                                              const char *expr_text,
+                                              const char *dest_type_text,
+                                              V3WasmImportStub *imports,
+                                              size_t *import_count);
+
 static bool v3_wasm_emit_str_literal_into_local_address(const V3WasmFunctionContext *ctx,
                                                         V3WasmBuffer *body,
                                                         uint32_t dest_addr_local_index,
@@ -39361,6 +39457,17 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                                            const V3WasmImportStub *imports,
                                                            size_t import_count,
                                                            V3WasmBuffer *body);
+
+static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         const V3LoweredFunctionStub *function,
+                                                         const V3WasmFunctionContext *ctx,
+                                                         const char *expr_text,
+                                                         const char *dest_type_text,
+                                                         uint32_t dest_addr_local_index,
+                                                         const V3WasmImportStub *imports,
+                                                         size_t import_count,
+                                                         V3WasmBuffer *body);
 
 static bool v3_wasm_emit_call_target(const V3LoweringPlanStub *lowering,
                                      const V3AsmCallTarget *target,
@@ -39517,9 +39624,40 @@ static bool v3_wasm_prepare_composite_expr(const V3SystemLinkPlanStub *plan,
         (strcmp(expr, "\"\"") == 0 && strcmp(normalized_dest_type, "str") == 0)) {
         return true;
     }
+    if (strcmp(expr, "[]") != 0 && v3_is_list_literal_text(expr, NULL)) {
+        return v3_wasm_prepare_list_literal_expr(plan,
+                                                 lowering,
+                                                 function,
+                                                 ctx,
+                                                 expr,
+                                                 normalized_dest_type,
+                                                 imports,
+                                                 import_count);
+    }
     if (strcmp(normalized_dest_type, "str") == 0) {
+        char expanded_expr[32768];
+        char fmt_error[256];
+        bool changed = false;
         char literal[4096];
         int32_t plus_index = -1;
+        if (!v3_expand_strformat_fmt_expr(expr,
+                                          expanded_expr,
+                                          sizeof(expanded_expr),
+                                          &changed,
+                                          fmt_error,
+                                          sizeof(fmt_error))) {
+            return false;
+        }
+        if (changed) {
+            return v3_wasm_prepare_composite_expr(plan,
+                                                  lowering,
+                                                  function,
+                                                  ctx,
+                                                  expanded_expr,
+                                                  "str",
+                                                  imports,
+                                                  import_count);
+        }
         if (v3_parse_string_literal_text(expr, literal, sizeof(literal))) {
             return true;
         }
@@ -40422,7 +40560,7 @@ static bool v3_wasm_analyze_result_intrinsic_expr(const V3SystemLinkPlanStub *pl
                             sizeof(arg_type),
                             arg_abi,
                             sizeof(arg_abi)) ||
-        strcmp(arg_abi, "composite") != 0 ||
+        !v3_type_prefers_region_copy(arg_type, arg_abi) ||
         !v3_startswith(arg_type, "Result[")) {
         return false;
     }
@@ -40474,7 +40612,7 @@ static bool v3_wasm_emit_result_intrinsic_expr(const V3SystemLinkPlanStub *plan,
                             sizeof(arg_type),
                             arg_abi,
                             sizeof(arg_abi)) ||
-        strcmp(arg_abi, "composite") != 0 ||
+        !v3_type_prefers_region_copy(arg_type, arg_abi) ||
         !v3_startswith(arg_type, "Result[") ||
         !v3_wasm_emit_expr(plan, lowering, function, ctx, arg_expr, imports, import_count, body)) {
         return false;
@@ -40517,7 +40655,7 @@ static bool v3_wasm_emit_result_intrinsic_expr(const V3SystemLinkPlanStub *plan,
                                      field_abi,
                                      sizeof(field_abi),
                                      &field_offset) &&
-               strcmp(field_abi, "composite") == 0 &&
+               v3_type_prefers_region_copy(field_type, field_abi) &&
                v3_wasm_emit_field_access_from_base(body, field_abi, field_offset);
     }
     if (kind != V3_RESULT_INTRINSIC_ERROR && kind != V3_RESULT_INTRINSIC_ERROR_TEXT) {
@@ -40531,7 +40669,7 @@ static bool v3_wasm_emit_result_intrinsic_expr(const V3SystemLinkPlanStub *plan,
                                err_abi,
                                sizeof(err_abi),
                                &err_offset) ||
-        strcmp(err_abi, "composite") != 0 ||
+        !v3_type_prefers_region_copy(err_type, err_abi) ||
         !v3_wasm_emit_field_access_from_base(body, err_abi, err_offset) ||
         !v3_resolve_field_meta(lowering,
                                err_type,
@@ -40541,7 +40679,7 @@ static bool v3_wasm_emit_result_intrinsic_expr(const V3SystemLinkPlanStub *plan,
                                msg_abi,
                                sizeof(msg_abi),
                                &msg_offset) ||
-        strcmp(msg_abi, "composite") != 0) {
+        !v3_type_prefers_region_copy(msg_type, msg_abi)) {
         return false;
     }
     return v3_wasm_emit_field_access_from_base(body, msg_abi, msg_offset);
@@ -40621,7 +40759,24 @@ static bool v3_wasm_emit_composite_result_intrinsic_into_local_address(const V3S
                                                                        const V3WasmImportStub *imports,
                                                                        size_t import_count,
                                                                        V3WasmBuffer *body) {
-    return v3_wasm_emit_result_intrinsic_expr(plan,
+    char arg_type[256];
+    char arg_abi[32];
+    return v3_infer_expr_type(plan,
+                              lowering,
+                              function,
+                              ctx->aliases,
+                              ctx->alias_count,
+                              ctx->locals,
+                              ctx->local_count,
+                              arg_expr,
+                              arg_type,
+                              sizeof(arg_type),
+                              arg_abi,
+                              sizeof(arg_abi)) &&
+           v3_type_prefers_region_copy(arg_type, arg_abi) &&
+           v3_startswith(arg_type, "Result[") &&
+           v3_result_intrinsic_projection_prefers_region_copy(lowering, kind, arg_type) &&
+           v3_wasm_emit_result_intrinsic_expr(plan,
                                               lowering,
                                               function,
                                               ctx,
@@ -40767,6 +40922,269 @@ static bool v3_wasm_register_builtin_add_import(V3WasmImportStub *imports,
     return v3_wasm_register_import("wasm_builtin_add", &target, imports, import_count);
 }
 
+static bool v3_wasm_prepare_list_literal_expr(const V3SystemLinkPlanStub *plan,
+                                              const V3LoweringPlanStub *lowering,
+                                              const V3LoweredFunctionStub *function,
+                                              V3WasmFunctionContext *ctx,
+                                              const char *expr_text,
+                                              const char *dest_type_text,
+                                              V3WasmImportStub *imports,
+                                              size_t *import_count) {
+    char normalized_dest_type[CHENG_V3_MAX_TYPE_TEXT];
+    char elem_type[256];
+    char elem_abi[32];
+    char (*args)[4096] = NULL;
+    size_t arg_count = 0U;
+    size_t i;
+    int32_t fixed_len = 0;
+    if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
+        expr_text == NULL || dest_type_text == NULL) {
+        return false;
+    }
+    args = v3_alloc_call_arg_scratch();
+    if (!v3_parse_list_literal_text(expr_text, args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
+        !v3_normalize_type_text(lowering,
+                                function->owner_module_path,
+                                ctx->aliases,
+                                ctx->alias_count,
+                                dest_type_text,
+                                normalized_dest_type,
+                                sizeof(normalized_dest_type))) {
+        free(args);
+        return false;
+    }
+    if (v3_parse_fixed_array_type(normalized_dest_type,
+                                  elem_type,
+                                  sizeof(elem_type),
+                                  &fixed_len)) {
+        if ((int32_t)arg_count != fixed_len) {
+            free(args);
+            return false;
+        }
+    } else if (arg_count > 0U &&
+               strlen(normalized_dest_type) > 2U &&
+               strcmp(normalized_dest_type + strlen(normalized_dest_type) - 2U, "[]") == 0) {
+        snprintf(elem_type,
+                 sizeof(elem_type),
+                 "%.*s",
+                 (int)(strlen(normalized_dest_type) - 2U),
+                 normalized_dest_type);
+        if (!v3_wasm_register_builtin_add_import(imports, import_count)) {
+            free(args);
+            return false;
+        }
+    } else {
+        free(args);
+        return false;
+    }
+    snprintf(elem_abi, sizeof(elem_abi), "%s", v3_type_abi_class(elem_type));
+    for (i = 0U; i < arg_count; ++i) {
+        bool ok = strcmp(elem_abi, "composite") == 0
+                  ? v3_wasm_prepare_composite_expr(plan,
+                                                   lowering,
+                                                   function,
+                                                   ctx,
+                                                   args[i],
+                                                   elem_type,
+                                                   imports,
+                                                   import_count)
+                  : v3_wasm_analyze_expr(plan,
+                                         lowering,
+                                         function,
+                                         ctx,
+                                         args[i],
+                                         imports,
+                                         import_count);
+        if (!ok) {
+            free(args);
+            return false;
+        }
+    }
+    free(args);
+    return true;
+}
+
+static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         const V3LoweredFunctionStub *function,
+                                                         const V3WasmFunctionContext *ctx,
+                                                         const char *expr_text,
+                                                         const char *dest_type_text,
+                                                         uint32_t dest_addr_local_index,
+                                                         const V3WasmImportStub *imports,
+                                                         size_t import_count,
+                                                         V3WasmBuffer *body) {
+    V3TypeLayoutStub layout;
+    V3TypeLayoutStub elem_layout;
+    V3AsmCallTarget grow_target;
+    char normalized_dest_type[CHENG_V3_MAX_TYPE_TEXT];
+    char elem_type[256];
+    char elem_abi[32];
+    char (*args)[4096] = NULL;
+    size_t arg_count = 0U;
+    size_t i;
+    int32_t fixed_len = 0;
+    int32_t elem_size = 0;
+    uint32_t elem_addr_local_index = 0U;
+    if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
+        expr_text == NULL || dest_type_text == NULL || body == NULL || !ctx->has_scratch_locals ||
+        !v3_compute_type_layout_impl(lowering, dest_type_text, &layout, 0U) ||
+        !v3_normalize_type_text(lowering,
+                                function->owner_module_path,
+                                ctx->aliases,
+                                ctx->alias_count,
+                                dest_type_text,
+                                normalized_dest_type,
+                                sizeof(normalized_dest_type))) {
+        return false;
+    }
+    args = v3_alloc_call_arg_scratch();
+    if (!v3_parse_list_literal_text(expr_text, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        free(args);
+        return false;
+    }
+    if (v3_parse_fixed_array_type(normalized_dest_type,
+                                  elem_type,
+                                  sizeof(elem_type),
+                                  &fixed_len)) {
+        if ((int32_t)arg_count != fixed_len) {
+            free(args);
+            return false;
+        }
+    } else if (arg_count > 0U &&
+               strlen(normalized_dest_type) > 2U &&
+               strcmp(normalized_dest_type + strlen(normalized_dest_type) - 2U, "[]") == 0) {
+        snprintf(elem_type,
+                 sizeof(elem_type),
+                 "%.*s",
+                 (int)(strlen(normalized_dest_type) - 2U),
+                 normalized_dest_type);
+    } else {
+        free(args);
+        return false;
+    }
+    snprintf(elem_abi, sizeof(elem_abi), "%s", v3_type_abi_class(elem_type));
+    if (strcmp(elem_abi, "i8") == 0 ||
+        strcmp(elem_abi, "u8") == 0 ||
+        strcmp(elem_abi, "bool") == 0) {
+        elem_size = 1;
+    } else if (strcmp(elem_abi, "i16") == 0 ||
+               strcmp(elem_abi, "u16") == 0) {
+        elem_size = 2;
+    } else if (strcmp(elem_abi, "i32") == 0 ||
+               strcmp(elem_abi, "u32") == 0) {
+        elem_size = 4;
+    } else if (strcmp(elem_abi, "i64") == 0 || strcmp(elem_abi, "ptr") == 0) {
+        elem_size = 8;
+    } else if (!v3_compute_type_layout_impl(lowering, elem_type, &elem_layout, 0U)) {
+        free(args);
+        return false;
+    } else {
+        elem_size = elem_layout.size;
+    }
+    if (elem_size <= 0 ||
+        !v3_wasm_emit_zero_region_from_local(body, dest_addr_local_index, layout.size)) {
+        free(args);
+        return false;
+    }
+    elem_addr_local_index = v3_wasm_pick_temp_local_excluding(ctx, dest_addr_local_index);
+    if (elem_addr_local_index == 0U) {
+        free(args);
+        return false;
+    }
+    if (v3_parse_fixed_array_type(normalized_dest_type,
+                                  elem_type,
+                                  sizeof(elem_type),
+                                  &fixed_len)) {
+        for (i = 0U; i < arg_count; ++i) {
+            int32_t elem_offset = elem_size * (int32_t)i;
+            bool ok = false;
+            if (!v3_wasm_emit_local_get(body, dest_addr_local_index) ||
+                (elem_offset != 0 &&
+                 (!v3_wasm_emit_i32_const(body, elem_offset) ||
+                  !v3_wasm_emit_i32_add(body))) ||
+                !v3_wasm_emit_local_set(body, elem_addr_local_index)) {
+                free(args);
+                return false;
+            }
+            ok = strcmp(elem_abi, "composite") == 0
+                 ? v3_wasm_emit_composite_expr_into_local_address(plan,
+                                                                  lowering,
+                                                                  function,
+                                                                  ctx,
+                                                                  args[i],
+                                                                  elem_type,
+                                                                  elem_addr_local_index,
+                                                                  imports,
+                                                                  import_count,
+                                                                  body)
+                 : (v3_wasm_emit_local_get(body, elem_addr_local_index) &&
+                    v3_wasm_emit_expr(plan,
+                                      lowering,
+                                      function,
+                                      ctx,
+                                      args[i],
+                                      imports,
+                                      import_count,
+                                      body) &&
+                    v3_wasm_emit_store_scalar_to_top_address(body, elem_abi));
+            if (!ok) {
+                free(args);
+                return false;
+            }
+        }
+        free(args);
+        return true;
+    }
+    memset(&grow_target, 0, sizeof(grow_target));
+    grow_target.external = true;
+    grow_target.param_count = 3U;
+    snprintf(grow_target.symbol_name, sizeof(grow_target.symbol_name), "%s", "cheng_seq_set_grow");
+    snprintf(grow_target.return_type, sizeof(grow_target.return_type), "%s", "ptr");
+    snprintf(grow_target.return_abi_class, sizeof(grow_target.return_abi_class), "%s", "ptr");
+    snprintf(grow_target.param_abi_classes[0], sizeof(grow_target.param_abi_classes[0]), "%s", "ptr");
+    snprintf(grow_target.param_abi_classes[1], sizeof(grow_target.param_abi_classes[1]), "%s", "i32");
+    snprintf(grow_target.param_abi_classes[2], sizeof(grow_target.param_abi_classes[2]), "%s", "i32");
+    for (i = 0U; i < arg_count; ++i) {
+        bool ok = false;
+        if (!v3_wasm_emit_local_get(body, dest_addr_local_index) ||
+            !v3_wasm_emit_i32_const(body, (int32_t)i) ||
+            !v3_wasm_emit_i32_const(body, elem_size) ||
+            !v3_wasm_emit_call_target(lowering, &grow_target, imports, import_count, body) ||
+            !v3_wasm_emit_local_set(body, elem_addr_local_index)) {
+            free(args);
+            return false;
+        }
+        ok = strcmp(elem_abi, "composite") == 0
+             ? v3_wasm_emit_composite_expr_into_local_address(plan,
+                                                              lowering,
+                                                              function,
+                                                              ctx,
+                                                              args[i],
+                                                              elem_type,
+                                                              elem_addr_local_index,
+                                                              imports,
+                                                              import_count,
+                                                              body)
+             : (v3_wasm_emit_local_get(body, elem_addr_local_index) &&
+                v3_wasm_emit_expr(plan,
+                                  lowering,
+                                  function,
+                                  ctx,
+                                  args[i],
+                                  imports,
+                                  import_count,
+                                  body) &&
+                v3_wasm_emit_store_scalar_to_top_address(body, elem_abi));
+        if (!ok) {
+            free(args);
+            return false;
+        }
+    }
+    free(args);
+    return true;
+}
+
 static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                               const V3LoweringPlanStub *lowering,
                                               const V3LoweredFunctionStub *function,
@@ -40778,6 +41196,7 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                               size_t *import_count,
                                               bool *handled_out) {
     V3AsmCallTarget target;
+    const char *assert_message_expr = "\"assert failed\"";
     char seq_type[256];
     char seq_abi[32];
     char elem_type[256];
@@ -40832,12 +41251,14 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
             !v3_wasm_analyze_expr(plan, lowering, function, ctx, args[0], imports, import_count)) {
             return false;
         }
-        if (arg_count == 2U &&
-            !v3_wasm_analyze_builtin_message_ptr(plan,
+        if (arg_count == 2U) {
+            assert_message_expr = args[1];
+        }
+        if (!v3_wasm_analyze_builtin_message_ptr(plan,
                                                  lowering,
                                                  function,
                                                  ctx,
-                                                 args[1],
+                                                 assert_message_expr,
                                                  imports,
                                                  import_count)) {
             return false;
@@ -40910,6 +41331,7 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                            size_t import_count,
                                            V3WasmBuffer *body,
                                            bool *handled_out) {
+    const char *assert_message_expr = "\"assert failed\"";
     char seq_type[256];
     char seq_abi[32];
     char elem_type[256];
@@ -40924,6 +41346,61 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
         return false;
     }
     *handled_out = false;
+    if ((strcmp(callee, "panic") == 0 || strcmp(callee, "system.panic") == 0) && arg_count == 1U) {
+        *handled_out = true;
+        return v3_wasm_emit_builtin_message_ptr(plan,
+                                                lowering,
+                                                function,
+                                                ctx,
+                                                args[0],
+                                                imports,
+                                                import_count,
+                                                body) &&
+               v3_wasm_build_panic_cstring_target(plan, &target) &&
+               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body);
+    }
+    if (strcmp(callee, "echo") == 0 && arg_count == 1U) {
+        *handled_out = true;
+        return v3_wasm_emit_builtin_message_ptr(plan,
+                                                lowering,
+                                                function,
+                                                ctx,
+                                                args[0],
+                                                imports,
+                                                import_count,
+                                                body) &&
+               v3_wasm_build_puts_target(plan, &target) &&
+               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x1aU);
+    }
+    if (strcmp(callee, "assert") == 0 && (arg_count == 1U || arg_count == 2U)) {
+        *handled_out = true;
+        if (arg_count == 2U) {
+            assert_message_expr = args[1];
+        }
+        return v3_wasm_emit_expr(plan,
+                                 lowering,
+                                 function,
+                                 ctx,
+                                 args[0],
+                                 imports,
+                                 import_count,
+                                 body) &&
+               v3_wasm_append_u8(body, 0x45U) &&
+               v3_wasm_append_u8(body, 0x04U) &&
+               v3_wasm_append_u8(body, 0x40U) &&
+               v3_wasm_emit_builtin_message_ptr(plan,
+                                                lowering,
+                                                function,
+                                                ctx,
+                                                assert_message_expr,
+                                                imports,
+                                                import_count,
+                                                body) &&
+               v3_wasm_build_panic_cstring_target(plan, &target) &&
+               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) &&
+               v3_wasm_append_u8(body, 0x0bU);
+    }
     if (strcmp(callee, "add") != 0 || arg_count != 2U) {
         return true;
     }
@@ -43418,9 +43895,44 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
         (strcmp(expr, "\"\"") == 0 && strcmp(normalized_dest_type, "str") == 0)) {
         return v3_wasm_emit_zero_region_from_local(body, dest_addr_local_index, layout.size);
     }
+    if (strcmp(expr, "[]") != 0 && v3_is_list_literal_text(expr, NULL)) {
+        return v3_wasm_emit_list_literal_into_local_address(plan,
+                                                            lowering,
+                                                            function,
+                                                            ctx,
+                                                            expr,
+                                                            normalized_dest_type,
+                                                            dest_addr_local_index,
+                                                            imports,
+                                                            import_count,
+                                                            body);
+    }
     if (strcmp(normalized_dest_type, "str") == 0) {
+        char expanded_expr[32768];
+        char fmt_error[256];
+        bool changed = false;
         char literal[4096];
         int32_t plus_index = -1;
+        if (!v3_expand_strformat_fmt_expr(expr,
+                                          expanded_expr,
+                                          sizeof(expanded_expr),
+                                          &changed,
+                                          fmt_error,
+                                          sizeof(fmt_error))) {
+            return false;
+        }
+        if (changed) {
+            return v3_wasm_emit_composite_expr_into_local_address(plan,
+                                                                  lowering,
+                                                                  function,
+                                                                  ctx,
+                                                                  expanded_expr,
+                                                                  "str",
+                                                                  dest_addr_local_index,
+                                                                  imports,
+                                                                  import_count,
+                                                                  body);
+        }
         if (v3_parse_string_literal_text(expr, literal, sizeof(literal))) {
             return v3_wasm_emit_str_literal_into_local_address(ctx,
                                                                body,
@@ -43586,10 +44098,6 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
             }
             {
                 V3AsmCallTarget target;
-                uint32_t result_local_index =
-                    dest_addr_local_index == ctx->scratch3_local_index
-                    ? ctx->scratch2_local_index
-                    : ctx->scratch3_local_index;
                 if (v3_resolve_call_target_with_args(plan,
                                                      lowering,
                                                      function,
@@ -43619,7 +44127,10 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                            imports,
                                            import_count,
                                            body) ||
-                        !v3_wasm_emit_local_set(body, result_local_index)) {
+                        !v3_wasm_emit_composite_pointer_value_into_local_address(ctx,
+                                                                                 dest_addr_local_index,
+                                                                                 layout.size,
+                                                                                 body)) {
                         fprintf(stderr,
                                 "[cheng_v3_seed] wasm composite call emit failed function=%s callee=%s expr=%s\n",
                                 function->symbol_text,
@@ -43629,10 +44140,7 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                         return false;
                     }
                     free(args);
-                    return v3_wasm_emit_copy_region_between_locals(body,
-                                                                   dest_addr_local_index,
-                                                                   result_local_index,
-                                                                   layout.size);
+                    return true;
                 }
                 if (v3_callee_is_constructor_like(lowering,
                                                   function->owner_module_path,
@@ -61701,6 +62209,7 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
         "parser_path_smoke",
         "compiler_pipeline_stub_smoke",
         "lowering_plan_smoke",
+        "lowering_matrix_smoke",
         "compiler_equivalence_smoke",
         "compiler_publish_smoke",
         "bft_three_replica_smoke",
@@ -61987,6 +62496,7 @@ static int v3_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv) {
         "compiler_runtime_smoke",
         "compiler_pipeline_stub_smoke",
         "lowering_plan_smoke",
+        "lowering_matrix_smoke",
         "compiler_equivalence_smoke",
         "compiler_publish_smoke",
         "bft_three_replica_smoke",

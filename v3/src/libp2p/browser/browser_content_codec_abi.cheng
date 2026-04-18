@@ -2,6 +2,21 @@ import std/rawbytes
 import std/strings
 import cheng/v3/libp2p/content/moq_fountain as moq
 
+type V3BrowserCodecInputSchema = object
+    kind: int32
+    missingError: str
+    copyError: str
+
+type V3BrowserCodecOutputSchema = object
+    kind: int32
+    handleError: str
+
+const v3BrowserCodecInputBytesRequired = 1
+const v3BrowserCodecInputTextRequired = 2
+const v3BrowserCodecInputTextOptional = 3
+const v3BrowserCodecOutputBytesHandle = 1
+const v3BrowserCodecOutputTextHandle = 2
+
 importc fn cheng_v3_browser_distributed_video_build_bridge(blobHandle: int32,
                                                            ownerPeerHandle: int32,
                                                            remotePeersHandle: int32,
@@ -83,50 +98,102 @@ fn browserInputRemotePeerCount(handle: int32): int32 =
     let peers = moq.v3Libp2pMoqNormalizePeerCsv(text)
     return peers.len
 
-fn browserInputBytesRequired(handle: int32,
+fn v3BrowserCodecInputSchema(kind: int32,
                              missingError: str,
-                             copyError: str): Result[Bytes] =
+                             copyError: str): V3BrowserCodecInputSchema =
+    var out: V3BrowserCodecInputSchema
+    out.kind = kind
+    out.missingError = missingError
+    out.copyError = copyError
+    return out
+
+fn v3BrowserCodecOutputSchema(kind: int32,
+                              handleError: str): V3BrowserCodecOutputSchema =
+    var out: V3BrowserCodecOutputSchema
+    out.kind = kind
+    out.handleError = handleError
+    return out
+
+fn browserCodecInputBytesRequiredSchema(missingError: str,
+                                        copyError: str): V3BrowserCodecInputSchema =
+    return v3BrowserCodecInputSchema(v3BrowserCodecInputBytesRequired, missingError, copyError)
+
+fn browserCodecInputTextRequiredSchema(missingError: str,
+                                       copyError: str): V3BrowserCodecInputSchema =
+    return v3BrowserCodecInputSchema(v3BrowserCodecInputTextRequired, missingError, copyError)
+
+fn browserCodecInputTextOptionalSchema(copyError: str): V3BrowserCodecInputSchema =
+    return v3BrowserCodecInputSchema(v3BrowserCodecInputTextOptional, "", copyError)
+
+fn browserCodecOutputBytesHandleSchema(handleError: str): V3BrowserCodecOutputSchema =
+    return v3BrowserCodecOutputSchema(v3BrowserCodecOutputBytesHandle, handleError)
+
+fn browserCodecOutputTextHandleSchema(handleError: str): V3BrowserCodecOutputSchema =
+    return v3BrowserCodecOutputSchema(v3BrowserCodecOutputTextHandle, handleError)
+
+fn browserCodecReadInputBytes(handle: int32,
+                              schema: V3BrowserCodecInputSchema): Result[Bytes] =
     let inputLen = cheng_v3_browser_input_len_bridge(handle)
     if handle <= 0 || inputLen <= 0:
-        return Err[Bytes](missingError)
+        if schema.kind == v3BrowserCodecInputTextOptional:
+            return Ok[Bytes](bytesAlloc(0))
+        return Err[Bytes](schema.missingError)
     var inputBytes = bytesAlloc(inputLen)
     if cheng_v3_browser_input_copy_bridge(handle, inputBytes.data, inputLen) <= 0:
-        return Err[Bytes](copyError)
+        return Err[Bytes](schema.copyError)
     return Ok[Bytes](inputBytes)
 
-fn browserInputTextRequired(handle: int32,
-                            missingError: str,
-                            copyError: str): Result[str] =
-    let bytesRes = browserInputBytesRequired(handle, missingError, copyError)
+fn browserCodecReadInputText(handle: int32,
+                             schema: V3BrowserCodecInputSchema): Result[str] =
+    let bytesRes = browserCodecReadInputBytes(handle, schema)
     if IsErr(bytesRes):
         return Err[str](Error(bytesRes))
     return Ok[str](bytesToString(Value(bytesRes)))
 
+fn browserCodecWriteOutputBytesHandle(payload: Bytes,
+                                      schema: V3BrowserCodecOutputSchema): Result[int32] =
+    if schema.kind != v3BrowserCodecOutputBytesHandle:
+        return Err[int32](schema.handleError)
+    let handle = cheng_v3_buffer_handle_from_raw_bridge(payload.data, bytesLen(payload))
+    if handle <= 0:
+        return Err[int32](schema.handleError)
+    return Ok[int32](handle)
+
+fn browserCodecWriteOutputTextHandle(text: str,
+                                     schema: V3BrowserCodecOutputSchema): Result[int32] =
+    if schema.kind != v3BrowserCodecOutputTextHandle || len(text) <= 0:
+        return Err[int32](schema.handleError)
+    let handle = cheng_v3_buffer_handle_from_text_bridge(text)
+    if handle <= 0:
+        return Err[int32](schema.handleError)
+    return Ok[int32](handle)
+
+fn browserInputBytesRequired(handle: int32,
+                             missingError: str,
+                             copyError: str): Result[Bytes] =
+    let schema = browserCodecInputBytesRequiredSchema(missingError, copyError)
+    return browserCodecReadInputBytes(handle, schema)
+
+fn browserInputTextRequired(handle: int32,
+                            missingError: str,
+                            copyError: str): Result[str] =
+    let schema = browserCodecInputTextRequiredSchema(missingError, copyError)
+    return browserCodecReadInputText(handle, schema)
+
 fn browserInputTextOptional(handle: int32,
                             copyError: str): Result[str] =
-    let inputLen = cheng_v3_browser_input_len_bridge(handle)
-    if handle <= 0 || inputLen <= 0:
-        return Ok[str]("")
-    var inputBytes = bytesAlloc(inputLen)
-    if cheng_v3_browser_input_copy_bridge(handle, inputBytes.data, inputLen) <= 0:
-        return Err[str](copyError)
-    return Ok[str](bytesToString(inputBytes))
+    let schema = browserCodecInputTextOptionalSchema(copyError)
+    return browserCodecReadInputText(handle, schema)
 
 fn browserBufferHandleFromBytesRequired(payload: Bytes,
                                         handleError: str): Result[int32] =
-    let handle = cheng_v3_buffer_handle_from_raw_bridge(payload.data, bytesLen(payload))
-    if handle <= 0:
-        return Err[int32](handleError)
-    return Ok[int32](handle)
+    let schema = browserCodecOutputBytesHandleSchema(handleError)
+    return browserCodecWriteOutputBytesHandle(payload, schema)
 
 fn browserBufferHandleFromTextRequired(text: str,
                                        handleError: str): Result[int32] =
-    if len(text) <= 0:
-        return Err[int32](handleError)
-    let handle = cheng_v3_buffer_handle_from_text_bridge(text)
-    if handle <= 0:
-        return Err[int32](handleError)
-    return Ok[int32](handle)
+    let schema = browserCodecOutputTextHandleSchema(handleError)
+    return browserCodecWriteOutputTextHandle(text, schema)
 
 fn browserMoqFountainBuildWireFill(out: var str,
                                    blobBytes: Bytes,
