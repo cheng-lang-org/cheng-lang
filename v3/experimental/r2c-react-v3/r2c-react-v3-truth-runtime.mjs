@@ -54,6 +54,24 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function assertBaseUrlReachable(baseUrl, waitMs) {
+  const timeoutMs = Math.max(1000, Math.min(Number(waitMs) || 0, 5000))
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  try {
+    await fetch(baseUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      signal: controller.signal,
+    })
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    throw new Error(`truth_base_url_unreachable:${baseUrl}:${reason}`)
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 function buildUrl(baseUrl, route, truthFlag) {
   const query = new URLSearchParams({
     r2c_truth: truthFlag,
@@ -130,6 +148,7 @@ async function captureRuntime(args) {
   if (!args.outDir) throw new Error('missing --out-dir')
   if (!fs.existsSync(args.chrome)) throw new Error(`chrome not found: ${args.chrome}`)
   fs.mkdirSync(args.outDir, { recursive: true })
+  await assertBaseUrlReachable(args.baseUrl, args.waitMs)
 
   const url = buildUrl(args.baseUrl, args.route, args.truthFlag)
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'r2c-truth-runtime-'))

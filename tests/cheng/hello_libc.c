@@ -2,7 +2,7 @@
 
 extern int puts(const char* s);
 
-int main() {
+int main(void) {
   puts("Hello from C");
   return 0;
 }

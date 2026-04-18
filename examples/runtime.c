@@ -82,6 +82,6 @@ int c_fgetc_0(void* stream) {
     return fgetc((FILE*)stream);
 }
 
-void* get_stdin_0() { return stdin; }
-void* get_stdout_0() { return stdout; }
-void* get_stderr_0() { return stderr; }
+void* get_stdin_0(void) { return stdin; }
+void* get_stdout_0(void) { return stdout; }
+void* get_stderr_0(void) { return stderr; }

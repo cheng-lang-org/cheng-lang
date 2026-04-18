@@ -8,7 +8,7 @@
 
 extern void init(void); // Just in case we need to reference it, but likely not needed if constructor.
 
-int main() {
+int main(void) {
     // printf("Running main...\n");
     return 0;
 }

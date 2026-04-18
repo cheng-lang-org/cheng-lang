@@ -22,6 +22,7 @@ const
     tlsHandshakeServerHello = 2
     tlsHandshakeNewSessionTicket = 4
     tlsHandshakeEncryptedExtensions = 8
+    tlsHandshakeCertificateRequest = 13
     tlsHandshakeCertificate = 11
     tlsHandshakeCertificateVerify = 15
     tlsHandshakeFinished = 20
@@ -99,6 +100,7 @@ type
     MsQuicTls13HandshakeState =
         role: MsQuicTls13HandshakeRole
         requireCert: bool
+        peerRequestedCertificate: bool
         serverName: str
         peerServerName: str
         cipherSuiteId: int32
@@ -298,6 +300,7 @@ fn initMsQuicTls13PeerVerifyStateInto(out: var MsQuicTls13PeerVerifyState) =
 fn initMsQuicTls13HandshakeStateInto(out: var MsQuicTls13HandshakeState, role: MsQuicTls13HandshakeRole) =
     out.role = role
     out.requireCert = true
+    out.peerRequestedCertificate = false
     out.serverName = ""
     out.peerServerName = ""
     out.cipherSuiteId = 0
@@ -559,6 +562,12 @@ fn msquicTls13ClientFinishedOk(): bool =
 
 fn msquicTls13ServerFinishedOk(): bool =
     return msquicTls13ServerState.peer.finishedOk
+
+fn msquicTls13ClientPeerRequestedCertificate(): bool =
+    return msquicTls13ClientState.peerRequestedCertificate
+
+fn msquicTls13ServerPeerRequestedCertificate(): bool =
+    return msquicTls13ServerState.peerRequestedCertificate
 
 fn msquicTls13SideReset(side: int32, role: MsQuicTls13HandshakeRole, requireCert: bool) =
     if side == msQuicTls13SideClient:
@@ -1298,20 +1307,66 @@ fn msquicTls13BuildEncryptedExtensions(
     let body: Bytes = toBytes(buf)
     return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeEncryptedExtensions, body))
 
-fn msquicTls13BuildCertificate(leafDer: Bytes): Result[Bytes] =
-    if bytesLen(leafDer) <= 0:
-        return Err[Bytes]("tls13: leaf certificate missing")
-    var entry: ByteBuffer = newByteBuffer()
-    tlsAppendUint24(entry, bytesLen(leafDer))
-    appendBytes(entry, leafDer)
-    tlsAppendUint16(entry, 0)
-    let entryBytes: Bytes = toBytes(entry)
+fn msquicTls13BuildCertificateRequest(): Result[Bytes] =
+    var sigList: ByteBuffer = newByteBuffer()
+    tlsAppendUint16(sigList, tlsSigRsaPssRsaeSha256)
+    tlsAppendUint16(sigList, tlsSigRsaPssRsaeSha384)
+    tlsAppendUint16(sigList, tlsSigEcdsaSecp256r1Sha256)
+    let sigListBytes: Bytes = toBytes(sigList)
+    var sigBody: ByteBuffer = newByteBuffer()
+    tlsAppendUint16(sigBody, bytesLen(sigListBytes))
+    appendBytes(sigBody, sigListBytes)
+    var ext: ByteBuffer = newByteBuffer()
+    msquicTls13AppendExtension(ext, tlsExtSignatureAlgorithms, toBytes(sigBody))
+    let extBytes: Bytes = toBytes(ext)
+    var body: ByteBuffer = newByteBuffer()
+    appendByte(body, 0)
+    tlsAppendUint16(body, bytesLen(extBytes))
+    appendBytes(body, extBytes)
+    return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeCertificateRequest, toBytes(body)))
 
+fn msquicTls13AppendCertificateEntry(out: var ByteBuffer, certDer: Bytes): Result[bool] =
+    if bytesLen(certDer) <= 0:
+        return Err[bool]("tls13: empty certificate entry")
+    tlsAppendUint24(out, bytesLen(certDer))
+    appendBytes(out, certDer)
+    tlsAppendUint16(out, 0)
+    return Ok[bool](true)
+
+fn msquicTls13BuildCertificateChain(
+    certCount: int32,
+    cert0: Bytes,
+    cert1: Bytes,
+    cert2: Bytes,
+    cert3: Bytes
+): Result[Bytes] =
+    if certCount <= 0 || bytesLen(cert0) <= 0:
+        return Err[Bytes]("tls13: leaf certificate missing")
+    var entries: ByteBuffer = newByteBuffer()
+    let add0Res: Result[bool] = msquicTls13AppendCertificateEntry(entries, cert0)
+    if IsErr(add0Res):
+        return Err[Bytes](ErrorText(add0Res))
+    if certCount > 1:
+        let add1Res: Result[bool] = msquicTls13AppendCertificateEntry(entries, cert1)
+        if IsErr(add1Res):
+            return Err[Bytes](ErrorText(add1Res))
+    if certCount > 2:
+        let add2Res: Result[bool] = msquicTls13AppendCertificateEntry(entries, cert2)
+        if IsErr(add2Res):
+            return Err[Bytes](ErrorText(add2Res))
+    if certCount > 3:
+        let add3Res: Result[bool] = msquicTls13AppendCertificateEntry(entries, cert3)
+        if IsErr(add3Res):
+            return Err[Bytes](ErrorText(add3Res))
+    let entryBytes: Bytes = toBytes(entries)
     var body: ByteBuffer = newByteBuffer()
     appendByte(body, 0)
     tlsAppendUint24(body, bytesLen(entryBytes))
     appendBytes(body, entryBytes)
     return Ok[Bytes](msquicTls13BuildHandshakeMessage(tlsHandshakeCertificate, toBytes(body)))
+
+fn msquicTls13BuildCertificate(leafDer: Bytes): Result[Bytes] =
+    return msquicTls13BuildCertificateChain(1, leafDer, emptyBytes(), emptyBytes(), emptyBytes())
 
 fn msquicTls13BuildCertificateVerify(
     cipher: MsQuicCipherSuite,
@@ -2230,6 +2285,37 @@ fn msquicTls13ParseCertificate(state: var MsQuicTls13HandshakeState, data: Bytes
         return Err[bool](ErrorText(finalizeRes))
     return Ok[bool](true)
 
+fn msquicTls13ParseCertificateRequest(state: var MsQuicTls13HandshakeState, data: Bytes): Result[bool] =
+    var offset: int32 = 0
+    let ctxLenRes: Result[TlsInt32Next] = tlsReadUint8(data, offset)
+    if IsErr(ctxLenRes):
+        return Err[bool](ErrorText(ctxLenRes))
+    let ctxLen: int32 = Value(ctxLenRes).value
+    offset = Value(ctxLenRes).next
+    let ctxRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, ctxLen)
+    if IsErr(ctxRes):
+        return Err[bool](ErrorText(ctxRes))
+    offset = Value(ctxRes).next
+    let extLenRes: Result[TlsInt32Next] = tlsReadUint16(data, offset)
+    if IsErr(extLenRes):
+        return Err[bool](ErrorText(extLenRes))
+    let extLen: int32 = Value(extLenRes).value
+    offset = Value(extLenRes).next
+    let extRes: Result[TlsBytesNext] = tlsReadBytes(data, offset, extLen)
+    if IsErr(extRes):
+        return Err[bool](ErrorText(extRes))
+    let extData: Bytes = Value(extRes).value
+    var extOffset: int32 = 0
+    while extOffset < bytesLen(extData):
+        let nextRes: Result[TlsExtensionNext] = msquicTls13ReadNextExtension(extData, extOffset)
+        if IsErr(nextRes):
+            return Err[bool](ErrorText(nextRes))
+        extOffset = Value(nextRes).next
+    if extOffset != bytesLen(extData):
+        return Err[bool]("tls13: certificate request trailing bytes")
+    state.peerRequestedCertificate = true
+    return Ok[bool](true)
+
 fn msquicTls13CertVerifyMessage(transcriptHash: Bytes, forServer: bool): Bytes =
     let context: str = if forServer: "TLS 1.3, server CertificateVerify" else: "TLS 1.3, client CertificateVerify"
     let prefix: Bytes = bytesAlloc(64)
@@ -2462,6 +2548,12 @@ fn msquicTls13HandshakeHandleMessage(
         return Ok[bool](true)
     if kind == tlsHandshakeEncryptedExtensions:
         let res: Result[bool] = msquicTls13ParseEncryptedExtensions(state, body)
+        if IsErr(res):
+            return Err[bool](msquicTls13HandshakeError(kind, ErrorText(res)))
+        msquicTls13HandshakeAppendTranscript(state, raw)
+        return Ok[bool](true)
+    if kind == tlsHandshakeCertificateRequest:
+        let res: Result[bool] = msquicTls13ParseCertificateRequest(state, body)
         if IsErr(res):
             return Err[bool](msquicTls13HandshakeError(kind, ErrorText(res)))
         msquicTls13HandshakeAppendTranscript(state, raw)

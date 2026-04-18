@@ -1,0 +1,53 @@
+import std/os
+import std/strings
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/bootstrap_contracts as contracts
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let driver = os.JoinPath(root, "artifacts/v3_backend_driver/cheng")
+    let source = os.JoinPath(root, "v3/src/tests/ordinary_zero_exit_fixture.cheng")
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_runtime_link_input_surface_smoke")
+    let outBin = os.JoinPath(outDir, "ordinary_zero_exit_fixture")
+    let reportPath = os.JoinPath(outDir, "ordinary_zero_exit_fixture.compile.report.txt")
+    let compileLog = os.JoinPath(outDir, "ordinary_zero_exit_fixture.compile.log")
+    assert(v3path.V3MkdirP(root, outDir), "v3 runtime link input surface: mkdir")
+    if v3path.V3PathFileExists(outBin):
+        os.RemoveFile(outBin)
+    if v3path.V3PathFileExists(reportPath):
+        os.RemoveFile(reportPath)
+    if v3path.V3PathFileExists(compileLog):
+        os.RemoveFile(compileLog)
+    let compileRun = hostops.v3RunFileLogged(root,
+                                             "runtime_link_input_surface_build",
+                                             driver,
+                                             [
+                                                 "system-link-exec",
+                                                 "--root:" + root,
+                                                 "--in:" + source,
+                                                 "--emit:exe",
+                                                 "--target:" + contracts.v3BootstrapDefaultTarget(),
+                                                 "--out:" + outBin,
+                                                 "--report-out:" + reportPath
+                                             ],
+                                             [],
+                                             root,
+                                             0,
+                                             compileLog)
+    assert(compileRun.exitCode == 0, "v3 runtime link input surface: compile rc")
+    assert(os.FileExists(outBin), "v3 runtime link input surface: output exists")
+    assert(os.FileExists(reportPath), "v3 runtime link input surface: report exists")
+    let reportText = os.ReadFile(reportPath)
+    assert(strings.StrContains(reportText, "object_link_input_count=6"),
+           "v3 runtime link input surface: object count")
+    assert(strings.StrContains(reportText, "native_link_input_count=6"),
+           "v3 runtime link input surface: native count")
+    assert(strings.StrContains(reportText, "provider.runtime_program_support_host_v3.o"),
+           "v3 runtime link input surface: host provider present")
+    assert(!strings.StrContains(reportText, "program_runtime.combined"),
+           "v3 runtime link input surface: no combined runtime obj")
+    assert(!strings.StrContains(reportText, "system_helpers_compat_bridge"),
+           "v3 runtime link input surface: no compat split")
+    echo("v3 runtime_link_input_surface_smoke ok")
+    return 0

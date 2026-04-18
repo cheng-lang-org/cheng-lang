@@ -1096,6 +1096,34 @@ fn v3BftValidatorStateSnapshotPath(snapshotDirRaw: str,
     let pathRaw = v3path.V3PathJoin(snapshotDirRaw, fileName)
     return pathRaw
 
+fn v3BftValidatorTextEndsWith(text: str, suffix: str): bool =
+    if len(suffix) > len(text):
+        return false
+    let start = len(text) - len(suffix)
+    return v3path.V3TextSlice(text, start, len(suffix)) == suffix
+
+fn v3BftValidatorLatestStateSnapshotHeight(snapshotDirRaw: str): Result[int64] =
+    let entries = os.ListDir(snapshotDirRaw)
+    var sawHeight = false
+    var latestHeight = int64(0)
+    for i in 0..<entries.len:
+        let name = strutil.Strip(entries[i])
+        if len(name) <= 4 || !v3BftValidatorTextEndsWith(name, ".hex"):
+            continue
+        let stem = v3path.V3TextSlice(name, 0, len(name) - 4)
+        if len(stem) <= 0:
+            continue
+        let heightRes = v3BftValidatorParseInt64Text(stem)
+        if IsErr(heightRes):
+            continue
+        let height = Value(heightRes)
+        if !sawHeight || height > latestHeight:
+            latestHeight = height
+            sawHeight = true
+    if !sawHeight:
+        return Err[int64]("v3 bft validator: missing state snapshot")
+    return Ok[int64](latestHeight)
+
 fn v3BftValidatorReadStateSnapshot(snapshotDirRaw: str,
                                    height: int64): Result[Bytes] =
     let pathRaw = v3BftValidatorStateSnapshotPath(snapshotDirRaw, height)
@@ -1168,7 +1196,13 @@ fn v3BftValidatorDecodeStateSyncPayload(data: Bytes): Result[bft.V3BftStateMachi
 
 fn v3BftValidatorStateSyncPayloadForHeight(snapshotDirRaw: str,
                                            height: int64): Bytes =
-    let snapshotRes = v3BftValidatorReadStateSnapshot(snapshotDirRaw, height)
+    var targetHeight = height
+    if targetHeight <= int64(0):
+        let latestRes = v3BftValidatorLatestStateSnapshotHeight(snapshotDirRaw)
+        if IsErr(latestRes):
+            return v3BftValidatorEncodeStateSyncError(Error(latestRes))
+        targetHeight = Value(latestRes)
+    let snapshotRes = v3BftValidatorReadStateSnapshot(snapshotDirRaw, targetHeight)
     if IsErr(snapshotRes):
         return v3BftValidatorEncodeStateSyncError(Error(snapshotRes))
     return v3BftValidatorEncodeStateSyncPayload(Value(snapshotRes))
@@ -1176,6 +1210,7 @@ fn v3BftValidatorStateSyncPayloadForHeight(snapshotDirRaw: str,
 fn v3BftValidatorRetryableStateSyncRecvError(err: str): bool =
     return v3path.V3TextStartsWith(err, "v3 libp2p quic: dial") ||
            v3path.V3TextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
+           v3path.V3TextStartsWith(err, "msquic: pipe closed") ||
            v3path.V3TextStartsWith(err, "msquic native: pipe read timeout") ||
            v3path.V3TextStartsWith(err, "msquic native: handshake ! ready") ||
            v3path.V3TextStartsWith(err, "msquic native: session ! ready")
@@ -1603,6 +1638,23 @@ fn v3BftValidatorSyncMachineFromCommit(state: var V3BftValidatorState,
         return Err[bool]("v3 bft validator: state sync commit mismatch")
     state.machine = machine
     return Ok[bool](true)
+
+fn v3BftValidatorSyncMachineLatest(state: var V3BftValidatorState,
+                                   syncHost: str,
+                                   syncPort: int32): Result[int64] =
+    if len(syncHost) <= 0 || syncPort <= 0:
+        return Err[int64]("v3 bft validator: missing state sync endpoint")
+    let currentHeight = state.machine.lastFinalizedHeight
+    let machineRes = v3BftValidatorRecvStateMachine(syncHost, syncPort, int64(0))
+    if IsErr(machineRes):
+        return Err[int64](Error(machineRes))
+    let machine = Value(machineRes)
+    if machine.appId != state.machine.appId:
+        return Err[int64]("v3 bft validator: state sync app id mismatch")
+    if machine.lastFinalizedHeight <= currentHeight:
+        return Ok[int64](currentHeight)
+    state.machine = machine
+    return Ok[int64](machine.lastFinalizedHeight)
 
 fn v3BftValidatorQueryBalance(state: V3BftValidatorState,
                               assetId: int32,

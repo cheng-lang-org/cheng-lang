@@ -1,0 +1,868 @@
+import std/buffer
+import std/bytes as filebytes
+import std/cmdline as cmdline
+import std/monotimes
+import std/os
+import std/result
+import std/rawbytes
+import std/strings
+import std/strutils as strutil
+import std/tls/x509
+import std/net/transports/tcp_syscall as tcp
+import cheng/v3/libp2p/transports/quic_transport as quic_transport
+import cheng/v3/quic/connection as qconn
+import cheng/v3/quic/msquicruntime as qruntime
+import cheng/v3/quic/msquictransport_native as qtransport
+import cheng/v3/tooling/vpn_proxy_cli as cli
+import cheng/v3/quic/tls/policy as qpolicy
+import cheng/v3/tooling/vpn_proxy_listen as listen
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/vpn_proxy_config as config
+import cheng/v3/tooling/vpn_proxy_protocol as proto
+import cheng/v3/tooling/vpn_proxy_routing as routing
+import cheng/v3/tooling/vpn_proxy_socks as socks
+
+type
+    V3VpnProxyIdentityConfig = config.V3VpnProxyIdentityConfig
+    V3VpnProxyExitConfig = config.V3VpnProxyExitConfig
+    V3VpnProxyConfig = config.V3VpnProxyConfig
+
+    V3VpnProxyLoadedIdentity =
+        certs: Bytes[]
+        privateKey: Bytes
+        leafKeyKind: x509.X509PublicKeyKind
+        trustRoots: Bytes[]
+
+    V3VpnProxyExitState = routing.V3VpnProxyExitState
+
+    V3VpnProxyCliOptions = cli.V3VpnProxyCliOptions
+
+    V3VpnProxyQuicLink =
+        transport: qtransport.MsQuicTransport
+        conn: qconn.Connection
+        exitIndex: int32
+
+    V3VpnProxyTarget = socks.V3VpnProxyTarget
+
+const
+    v3VpnProxySocksVersion = 5
+    v3VpnProxySocksCmdConnect = 1
+    v3VpnProxySocksCmdBind = 2
+    v3VpnProxySocksCmdUdpAssoc = 3
+    v3VpnProxySocksAtypIpv4 = 1
+    v3VpnProxySocksAtypDomain = 3
+    v3VpnProxySocksAtypIpv6 = 4
+    v3VpnProxySocksReplyGeneralFailure = 1
+    v3VpnProxySocksReplyConnectionRefused = 5
+    v3VpnProxySocksReplyCommandUnsupported = 7
+    v3VpnProxySocksReplyAddressUnsupported = 8
+    v3VpnProxyRelayChunkBytes = 32768
+    v3VpnProxyConnectTimeoutMs = 5000
+
+fn v3VpnProxyPrintLine(text: str) =
+    os.WriteLine(os.Get_stdout(), text)
+
+fn v3VpnProxyPrintErr(text: str) =
+    os.WriteLine(os.Get_stderr(), text)
+
+fn v3VpnProxyUsage() =
+    v3VpnProxyPrintLine("usage: cheng vpn-proxy <local|exit|status> --config:<path>")
+    v3VpnProxyPrintLine("local flags: --ready-path:<path> --accept-count:<n> --probe-interval-ms:<n> --probe-timeout-ms:<n>")
+    v3VpnProxyPrintLine("exit flags: --ready-path:<path> --accept-count:<n>")
+    v3VpnProxyPrintLine("status flags: --probe-timeout-ms:<n>")
+
+fn v3VpnProxyMonoNowMs(): int64 =
+    return monotimes.MonoTimeNs(monotimes.GetMonoTime()) / 1000000
+
+fn v3VpnProxyBytesAppend(dst: var Bytes, extra: Bytes) =
+    if bytesLen(extra) <= 0:
+        return
+    dst = bytesConcat(dst, extra)
+
+fn v3VpnProxyBytesDropPrefix(data: Bytes, count: int32): Bytes =
+    let total: int32 = bytesLen(data)
+    var start: int32 = 0
+    if count > 0:
+        if count < total:
+            start = count
+        else:
+            start = total
+    return bytesSlice(data, start, total - start)
+
+fn v3VpnProxyTextSlice(text: str, start: int32, count: int32): str =
+    if count <= 0:
+        return ""
+    return strings.SliceBytes(text, start, count)
+
+fn v3VpnProxyEnsureParentDir(path: str): bool =
+    if len(path) <= 0:
+        return true
+    let parts: os.SplitFileResult = os.SplitFile(path)
+    if len(parts.dir) <= 0:
+        return true
+    return v3path.V3MkdirP("", parts.dir)
+
+fn v3VpnProxyWriteReadyPort(path: str, port: int32): bool =
+    if len(path) <= 0:
+        return true
+    if !v3VpnProxyEnsureParentDir(path):
+        return false
+    return v3path.V3WriteTextFile("", path, intToStr(port) + "\n")
+
+fn v3VpnProxyWriteBytesFile(path: str, data: Bytes): bool =
+    if !v3VpnProxyEnsureParentDir(path):
+        return false
+    let file: os.File = os.Open(path, os.FmWrite)
+    if file == nil:
+        return false
+    let total: int32 = bytesLen(data)
+    if total <= 0:
+        os.Close(file)
+        return true
+    let wrote: int32 = os.C_fwrite(data.data, 1, int64(total), file)
+    os.Close(file)
+    return wrote == total
+
+fn v3VpnProxyLoadBytesFile(path: str): Result[Bytes] =
+    let raw = filebytes.ReadFileBytes(path)
+    if raw.len <= 0 || raw.data == nil:
+        return Err[Bytes]("vpn proxy: failed to read file: " + path)
+    let out: Bytes = bytesAlloc(raw.len)
+    for i in 0..<raw.len:
+        bytesSet(out, i, filebytes.BufByteAt(raw, i))
+    return Ok[Bytes](out)
+
+fn V3VpnProxyParseConfigTextForTest(configText: str): Result[V3VpnProxyConfig] =
+    return config.V3VpnProxyParseConfigTextForTest(configText)
+
+fn v3VpnProxyLoadConfig(configPathRaw: str): Result[V3VpnProxyConfig] =
+    return config.V3VpnProxyLoadConfig(configPathRaw)
+
+fn v3VpnProxyResolvePath(baseDir: str, pathRaw: str): str =
+    let trimmed: str = strutil.Strip(pathRaw)
+    if len(trimmed) <= 0:
+        return ""
+    return v3path.V3PathAbsolute(baseDir, trimmed)
+
+fn v3VpnProxyLoadLeafKeyKind(certDer: Bytes): Result[x509.X509PublicKeyKind] =
+    var cert = x509.initX509Certificate()
+    let parseRes: Result[bool] = x509.x509ParseCertificateInto(cert, certDer)
+    if IsErr(parseRes):
+        return Err[x509.X509PublicKeyKind](ErrorText(parseRes))
+    if cert.publicKey.kind == x509.X509KeyUnknown:
+        return Err[x509.X509PublicKeyKind]("vpn proxy: certificate public key kind missing")
+    return Ok[x509.X509PublicKeyKind](cert.publicKey.kind)
+
+fn v3VpnProxyLoadedIdentityZero(): V3VpnProxyLoadedIdentity =
+    var out: V3VpnProxyLoadedIdentity
+    out.leafKeyKind = x509.X509KeyUnknown
+    return out
+
+fn v3VpnProxyLoadIdentity(baseDir: str,
+                          cfg: V3VpnProxyIdentityConfig,
+                          requireListen: bool): Result[V3VpnProxyLoadedIdentity] =
+    if requireListen && len(cfg.listen) <= 0:
+        return Err[V3VpnProxyLoadedIdentity]("vpn proxy config: listen missing")
+    if len(cfg.certDer) <= 0 || len(cfg.keyPk8Der) <= 0 || len(cfg.trustRootDer) <= 0:
+        return Err[V3VpnProxyLoadedIdentity]("vpn proxy config: cert_der/key_pk8_der/trust_root_der required")
+    var out = v3VpnProxyLoadedIdentityZero()
+    let leafPath: str = v3VpnProxyResolvePath(baseDir, cfg.certDer)
+    let leafRes: Result[Bytes] = v3VpnProxyLoadBytesFile(leafPath)
+    if IsErr(leafRes):
+        return Err[V3VpnProxyLoadedIdentity](ErrorText(leafRes))
+    add(out.certs, Value(leafRes))
+    for i in 0..<cfg.certChainDer.len:
+        let path: str = v3VpnProxyResolvePath(baseDir, cfg.certChainDer[i])
+        let certRes: Result[Bytes] = v3VpnProxyLoadBytesFile(path)
+        if IsErr(certRes):
+            return Err[V3VpnProxyLoadedIdentity](ErrorText(certRes))
+        add(out.certs, Value(certRes))
+    let keyPath: str = v3VpnProxyResolvePath(baseDir, cfg.keyPk8Der)
+    let keyRes: Result[Bytes] = v3VpnProxyLoadBytesFile(keyPath)
+    if IsErr(keyRes):
+        return Err[V3VpnProxyLoadedIdentity](ErrorText(keyRes))
+    out.privateKey = Value(keyRes)
+    let kindRes: Result[x509.X509PublicKeyKind] = v3VpnProxyLoadLeafKeyKind(out.certs[0])
+    if IsErr(kindRes):
+        return Err[V3VpnProxyLoadedIdentity](ErrorText(kindRes))
+    out.leafKeyKind = Value(kindRes)
+    let trustPath: str = v3VpnProxyResolvePath(baseDir, cfg.trustRootDer)
+    let trustRes: Result[Bytes] = v3VpnProxyLoadBytesFile(trustPath)
+    if IsErr(trustRes):
+        return Err[V3VpnProxyLoadedIdentity](ErrorText(trustRes))
+    add(out.trustRoots, Value(trustRes))
+    for i in 0..<cfg.trustRootsDer.len:
+        let path: str = v3VpnProxyResolvePath(baseDir, cfg.trustRootsDer[i])
+        let rootRes: Result[Bytes] = v3VpnProxyLoadBytesFile(path)
+        if IsErr(rootRes):
+            return Err[V3VpnProxyLoadedIdentity](ErrorText(rootRes))
+        add(out.trustRoots, Value(rootRes))
+    return Ok[V3VpnProxyLoadedIdentity](out)
+
+fn v3VpnProxyBuildPolicy(identity: V3VpnProxyLoadedIdentity,
+                         serverName: str): Result[qpolicy.MsQuicTlsPolicy] =
+    var out = qpolicy.initMsQuicTlsPolicy()
+    qpolicy.msquicTlsPolicySetServerName(out, serverName)
+    out.certPrivateKey = identity.privateKey
+    out.certLeafKeyKind = identity.leafKeyKind
+    for i in 0..<identity.certs.len:
+        let addRes: Result[bool] = qpolicy.msquicTlsPolicyAddCert(out, identity.certs[i])
+        if IsErr(addRes):
+            return Err[qpolicy.MsQuicTlsPolicy](ErrorText(addRes))
+    for i in 0..<identity.trustRoots.len:
+        let addRes: Result[bool] = qpolicy.msquicTlsPolicyAddTrustRoot(out, identity.trustRoots[i])
+        if IsErr(addRes):
+            return Err[qpolicy.MsQuicTlsPolicy](ErrorText(addRes))
+    return Ok[qpolicy.MsQuicTlsPolicy](out)
+
+fn v3VpnProxyLoadedIdentityPresent(identity: V3VpnProxyLoadedIdentity): bool =
+    return identity.certs.len > 0 &&
+           bytesLen(identity.privateKey) > 0 &&
+           identity.leafKeyKind != x509.X509KeyUnknown &&
+           identity.trustRoots.len > 0
+
+fn v3VpnProxyCloseQuicLink(link: var V3VpnProxyQuicLink) =
+    if link.conn.open:
+        qconn.connClose(link.conn)
+    link.exitIndex = -1
+
+fn v3VpnProxyDialExit(exitCfg: V3VpnProxyExitConfig,
+                      identity: V3VpnProxyLoadedIdentity,
+                      handshakeTimeoutMs: int32,
+                      exitIndex: int32): Result[V3VpnProxyQuicLink] =
+    let addrRes = quic_transport.v3Libp2pQuicAddrFromHostPort(exitCfg.host, exitCfg.port)
+    if IsErr(addrRes):
+        return Err[V3VpnProxyQuicLink](ErrorText(addrRes))
+    let policyRes: Result[qpolicy.MsQuicTlsPolicy] = v3VpnProxyBuildPolicy(identity, exitCfg.serverName)
+    if IsErr(policyRes):
+        return Err[V3VpnProxyQuicLink](ErrorText(policyRes))
+    var settings = qruntime.initMsQuicSettings()
+    settings.handshakeIdleTimeoutMs = int64(handshakeTimeoutMs)
+    var transport = qtransport.initMsQuicTransport()
+    let settingsRes: Result[bool] = qtransport.setMsQuicTransportSettings(transport, settings)
+    if IsErr(settingsRes):
+        return Err[V3VpnProxyQuicLink](ErrorText(settingsRes))
+    let tlsRes: Result[bool] = qtransport.setMsQuicTransportTlsPolicy(transport, Value(policyRes))
+    if IsErr(tlsRes):
+        return Err[V3VpnProxyQuicLink](ErrorText(tlsRes))
+    let dialRes = qtransport.dial(transport, Value(addrRes))
+    if IsErr(dialRes):
+        return Err[V3VpnProxyQuicLink](ErrorText(dialRes))
+    var conn = Value(dialRes)
+    let selectRes = quic_transport.v3Libp2pQuicClientSelectProtocol(transport, conn, proto.v3VpnProxyProtocolId())
+    if IsErr(selectRes):
+        qconn.connClose(conn)
+        return Err[V3VpnProxyQuicLink](ErrorText(selectRes))
+    var out: V3VpnProxyQuicLink
+    out.transport = transport
+    out.conn = conn
+    out.exitIndex = exitIndex
+    return Ok[V3VpnProxyQuicLink](out)
+
+fn v3VpnProxyQuicWriteFrame(transport: var qtransport.MsQuicTransport,
+                            conn: var qconn.Connection,
+                            frame: proto.V3VpnProxyFrame): Result[bool] =
+    let wireRes: Result[Bytes] = proto.v3VpnProxyEncodeWire(frame)
+    if IsErr(wireRes):
+        return Err[bool](ErrorText(wireRes))
+    return quic_transport.v3Libp2pQuicWriteExact(transport, conn, Value(wireRes))
+
+fn v3VpnProxyTryTakeFrame(rxBuf: var Bytes,
+                          out: var proto.V3VpnProxyFrame): Result[bool] =
+    let parseRes: Result[proto.V3VpnProxyFrameTry] = proto.v3VpnProxyTryParseWire(rxBuf)
+    if IsErr(parseRes):
+        return Err[bool](ErrorText(parseRes))
+    let parsed = Value(parseRes)
+    if !parsed.ready:
+        return Ok[bool](false)
+    out = parsed.frame
+    rxBuf = v3VpnProxyBytesDropPrefix(rxBuf, parsed.usedBytes)
+    return Ok[bool](true)
+
+fn v3VpnProxyWouldBlockQuic(err: str): bool =
+    return err == "msquic udp: queue empty" || err == "pipe: empty" || err == "connection: empty"
+
+fn v3VpnProxyWaitFrameWithTimeout(transport: var qtransport.MsQuicTransport,
+                                  conn: var qconn.Connection,
+                                  rxBuf: var Bytes,
+                                  timeoutMs: int32,
+                                  out: var proto.V3VpnProxyFrame): Result[bool] =
+    let startMs: int64 = v3VpnProxyMonoNowMs()
+    while v3VpnProxyMonoNowMs() - startMs <= int64(timeoutMs):
+        let parseRes: Result[bool] = v3VpnProxyTryTakeFrame(rxBuf, out)
+        if IsErr(parseRes):
+            return Err[bool](ErrorText(parseRes))
+        if Value(parseRes):
+            return Ok[bool](true)
+        let readRes = qtransport.msquicTransportReadNonblocking(transport, conn, v3VpnProxyRelayChunkBytes)
+        if IsErr(readRes):
+            if v3VpnProxyWouldBlockQuic(ErrorText(readRes)):
+                os.SleepMs(10)
+                continue
+            return Err[bool](ErrorText(readRes))
+        let chunk = Value(readRes)
+        if bytesLen(chunk) > 0:
+            v3VpnProxyBytesAppend(rxBuf, chunk)
+            continue
+        os.SleepMs(10)
+    return Err[bool]("vpn proxy: wait frame timeout")
+
+fn v3VpnProxyTcpReadExact(conn: var tcp.TcpConnectionHandle, count: int32): Result[Bytes] =
+    let out: Bytes = bytesAlloc(count)
+    var filled: int32 = 0
+    while filled < count:
+        let readRes = tcp.TcpRecv(conn, count - filled)
+        if IsErr(readRes):
+            return Err[Bytes](ErrorText(readRes))
+        let chunk = Value(readRes)
+        if bytesLen(chunk) <= 0:
+            return Err[Bytes]("vpn proxy: unexpected tcp eof")
+        for i in 0..<bytesLen(chunk):
+            bytesSet(out, filled + i, bytesGet(chunk, i))
+        filled = filled + bytesLen(chunk)
+    return Ok[Bytes](out)
+
+fn v3VpnProxySocksReply(code: int32): Bytes =
+    return socks.V3VpnProxySocksReply(code)
+
+fn V3VpnProxySocksReply(code: int32): Bytes =
+    return v3VpnProxySocksReply(code)
+
+fn V3VpnProxySocksMethodReplyFor(request: Bytes): Result[Bytes] =
+    return socks.V3VpnProxySocksMethodReplyFor(request)
+
+fn V3VpnProxySocksParseTargetWire(request: Bytes): Result[V3VpnProxyTarget] =
+    return socks.V3VpnProxySocksParseTargetWire(request)
+
+fn v3VpnProxySocksMethodHandshake(conn: var tcp.TcpConnectionHandle): Result[bool] =
+    let headerRes: Result[Bytes] = v3VpnProxyTcpReadExact(conn, 2)
+    if IsErr(headerRes):
+        return Err[bool](ErrorText(headerRes))
+    let header = Value(headerRes)
+    let methodCount: int32 = bytesGet(header, 1)
+    let methodsRes: Result[Bytes] = v3VpnProxyTcpReadExact(conn, methodCount)
+    if IsErr(methodsRes):
+        return Err[bool](ErrorText(methodsRes))
+    let methods = Value(methodsRes)
+    let request: Bytes = bytesConcat(header, methods)
+    let replyRes: Result[Bytes] = V3VpnProxySocksMethodReplyFor(request)
+    if IsErr(replyRes):
+        if ErrorText(replyRes) == "vpn proxy socks5: no supported auth method":
+            let _ = tcp.TcpSend(conn, bytesFromString("\x05\xff"))
+        return Err[bool](ErrorText(replyRes))
+    let writeRes = tcp.TcpSend(conn, Value(replyRes))
+    if IsErr(writeRes):
+        return Err[bool](ErrorText(writeRes))
+    return Ok[bool](true)
+
+fn v3VpnProxySocksReadTarget(conn: var tcp.TcpConnectionHandle): Result[V3VpnProxyTarget] =
+    let headRes: Result[Bytes] = v3VpnProxyTcpReadExact(conn, 4)
+    if IsErr(headRes):
+        return Err[V3VpnProxyTarget](ErrorText(headRes))
+    let head = Value(headRes)
+    let atyp: int32 = bytesGet(head, 3)
+    var tail: Bytes = bytesAlloc(0)
+    if atyp == v3VpnProxySocksAtypIpv4:
+        let addrRes = v3VpnProxyTcpReadExact(conn, 4)
+        if IsErr(addrRes):
+            return Err[V3VpnProxyTarget](ErrorText(addrRes))
+        tail = Value(addrRes)
+    elif atyp == v3VpnProxySocksAtypDomain:
+        let lenRes = v3VpnProxyTcpReadExact(conn, 1)
+        if IsErr(lenRes):
+            return Err[V3VpnProxyTarget](ErrorText(lenRes))
+        let hostLenByte: Bytes = Value(lenRes)
+        let hostLen: int32 = bytesGet(hostLenByte, 0)
+        let hostRes = v3VpnProxyTcpReadExact(conn, hostLen)
+        if IsErr(hostRes):
+            return Err[V3VpnProxyTarget](ErrorText(hostRes))
+        tail = bytesConcat(hostLenByte, Value(hostRes))
+    elif atyp == v3VpnProxySocksAtypIpv6:
+        let addrRes = v3VpnProxyTcpReadExact(conn, 16)
+        if IsErr(addrRes):
+            return Err[V3VpnProxyTarget](ErrorText(addrRes))
+        tail = Value(addrRes)
+    else:
+        let _ = tcp.TcpSend(conn, v3VpnProxySocksReply(v3VpnProxySocksReplyAddressUnsupported))
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: unsupported address type")
+    let portRes = v3VpnProxyTcpReadExact(conn, 2)
+    if IsErr(portRes):
+        return Err[V3VpnProxyTarget](ErrorText(portRes))
+    let wire: Bytes = bytesConcat3(head, tail, Value(portRes))
+    let parseRes: Result[V3VpnProxyTarget] = V3VpnProxySocksParseTargetWire(wire)
+    if IsErr(parseRes):
+        let err: str = ErrorText(parseRes)
+        if err == "vpn proxy socks5: unsupported command" ||
+           err == "vpn proxy socks5: invalid command":
+            let _ = tcp.TcpSend(conn, v3VpnProxySocksReply(v3VpnProxySocksReplyCommandUnsupported))
+        elif err == "vpn proxy socks5: unsupported address type":
+            let _ = tcp.TcpSend(conn, v3VpnProxySocksReply(v3VpnProxySocksReplyAddressUnsupported))
+        return Err[V3VpnProxyTarget](err)
+    return parseRes
+
+fn v3VpnProxyProbeExit(state: var V3VpnProxyExitState,
+                       identity: V3VpnProxyLoadedIdentity,
+                       timeoutMs: int32): bool =
+    let beginMs: int64 = v3VpnProxyMonoNowMs()
+    let dialRes: Result[V3VpnProxyQuicLink] = v3VpnProxyDialExit(state.cfg, identity, timeoutMs, -1)
+    if IsErr(dialRes):
+        routing.V3VpnProxyMarkProbeFailure(state, beginMs, ErrorText(dialRes))
+        return false
+    var link = Value(dialRes)
+    var rxBuf: Bytes = bytesAlloc(0)
+    let token: int32 = int32(beginMs & int64(0x7fffffff))
+    let pingRes: Result[bool] = v3VpnProxyQuicWriteFrame(link.transport, link.conn, proto.v3VpnProxyFramePing(token))
+    if IsErr(pingRes):
+        v3VpnProxyCloseQuicLink(link)
+        routing.V3VpnProxyMarkProbeFailure(state, beginMs, ErrorText(pingRes))
+        return false
+    var frame = proto.v3VpnProxyFrameZero()
+    let waitRes: Result[bool] = v3VpnProxyWaitFrameWithTimeout(link.transport, link.conn, rxBuf, timeoutMs, frame)
+    if IsErr(waitRes):
+        v3VpnProxyCloseQuicLink(link)
+        routing.V3VpnProxyMarkProbeFailure(state, beginMs, ErrorText(waitRes))
+        return false
+    v3VpnProxyCloseQuicLink(link)
+    if frame.kind != proto.V3VpnProxyFramePong || frame.token != token:
+        routing.V3VpnProxyMarkProbeFailure(state, beginMs, "vpn proxy: invalid pong")
+        return false
+    let endMs: int64 = v3VpnProxyMonoNowMs()
+    routing.V3VpnProxyMarkSuccess(state, endMs, endMs - beginMs)
+    return true
+
+fn v3VpnProxyProbeAll(states: var V3VpnProxyExitState[],
+                      identity: V3VpnProxyLoadedIdentity,
+                      timeoutMs: int32) =
+    for i in 0..<states.len:
+        let _ok: bool = v3VpnProxyProbeExit(states[i], identity, timeoutMs)
+
+fn v3VpnProxyEnsureFreshExits(states: var V3VpnProxyExitState[],
+                              identity: V3VpnProxyLoadedIdentity,
+                              probeIntervalMs: int32,
+                              probeTimeoutMs: int32) =
+    let nowMs: int64 = v3VpnProxyMonoNowMs()
+    for i in 0..<states.len:
+        let state: V3VpnProxyExitState = states[i]
+        if state.lastProbeMs <= 0 || nowMs - state.lastProbeMs >= int64(probeIntervalMs):
+            let _ok: bool = v3VpnProxyProbeExit(states[i], identity, probeTimeoutMs)
+
+fn v3VpnProxyOpenRemoteAttempt(states: var V3VpnProxyExitState[],
+                               identity: V3VpnProxyLoadedIdentity,
+                               target: V3VpnProxyTarget,
+                               idx: int32): Result[V3VpnProxyQuicLink] =
+    if idx < 0 || idx >= states.len:
+        return Err[V3VpnProxyQuicLink]("vpn proxy: invalid exit index")
+    let dialRes: Result[V3VpnProxyQuicLink] = v3VpnProxyDialExit(states[idx].cfg,
+                                                                 identity,
+                                                                 v3VpnProxyConnectTimeoutMs,
+                                                                 idx)
+    if IsErr(dialRes):
+        routing.V3VpnProxyRecordOpenFailure(states[idx], v3VpnProxyMonoNowMs(), ErrorText(dialRes))
+        return Err[V3VpnProxyQuicLink](ErrorText(dialRes))
+    var link = Value(dialRes)
+    let openRes: Result[bool] = v3VpnProxyQuicWriteFrame(link.transport,
+                                                         link.conn,
+                                                         proto.v3VpnProxyFrameOpen(target.host, target.port))
+    if IsErr(openRes):
+        v3VpnProxyCloseQuicLink(link)
+        routing.V3VpnProxyRecordOpenFailure(states[idx], v3VpnProxyMonoNowMs(), ErrorText(openRes))
+        return Err[V3VpnProxyQuicLink](ErrorText(openRes))
+    var rxBuf: Bytes = bytesAlloc(0)
+    var frame = proto.v3VpnProxyFrameZero()
+    let waitRes: Result[bool] = v3VpnProxyWaitFrameWithTimeout(link.transport,
+                                                               link.conn,
+                                                               rxBuf,
+                                                               v3VpnProxyConnectTimeoutMs,
+                                                               frame)
+    if IsErr(waitRes):
+        v3VpnProxyCloseQuicLink(link)
+        routing.V3VpnProxyRecordOpenFailure(states[idx], v3VpnProxyMonoNowMs(), ErrorText(waitRes))
+        return Err[V3VpnProxyQuicLink](ErrorText(waitRes))
+    if frame.kind == proto.V3VpnProxyFrameOpenOk:
+        link.exitIndex = idx
+        return Ok[V3VpnProxyQuicLink](link)
+    v3VpnProxyCloseQuicLink(link)
+    if frame.kind == proto.V3VpnProxyFrameError:
+        routing.V3VpnProxyRecordOpenFailure(states[idx], v3VpnProxyMonoNowMs(), frame.text)
+        return Err[V3VpnProxyQuicLink](frame.text)
+    routing.V3VpnProxyRecordOpenFailure(states[idx], v3VpnProxyMonoNowMs(), "vpn proxy: expected OPEN_OK")
+    return Err[V3VpnProxyQuicLink]("vpn proxy: expected OPEN_OK")
+
+fn v3VpnProxyOpenRemote(states: var V3VpnProxyExitState[],
+                        identity: V3VpnProxyLoadedIdentity,
+                        target: V3VpnProxyTarget,
+                        probeIntervalMs: int32,
+                        probeTimeoutMs: int32): Result[V3VpnProxyQuicLink] =
+    v3VpnProxyEnsureFreshExits(states, identity, probeIntervalMs, probeTimeoutMs)
+    let firstIndex: int32 = routing.V3VpnProxyBestHealthyExit(states, -1)
+    if firstIndex < 0:
+        return Err[V3VpnProxyQuicLink]("vpn proxy: no healthy exit")
+    let secondIndex: int32 = routing.V3VpnProxyBestHealthyExit(states, firstIndex)
+    let firstRes: Result[V3VpnProxyQuicLink] = v3VpnProxyOpenRemoteAttempt(states, identity, target, firstIndex)
+    if IsOk(firstRes):
+        return firstRes
+    if secondIndex >= 0:
+        let secondRes: Result[V3VpnProxyQuicLink] = v3VpnProxyOpenRemoteAttempt(states, identity, target, secondIndex)
+        if IsOk(secondRes):
+            return secondRes
+    return Err[V3VpnProxyQuicLink]("vpn proxy: open failed on all exits")
+
+fn v3VpnProxyRelayTcpQuic(conn: var tcp.TcpConnectionHandle,
+                          transport: var qtransport.MsQuicTransport,
+                          quicConn: var qconn.Connection): Result[bool] =
+    let nbRes = tcp.TcpSetNonblocking(conn, true)
+    if IsErr(nbRes):
+        return Err[bool](ErrorText(nbRes))
+    var quicRx: Bytes = bytesAlloc(0)
+    var tcpPendingWrite: Bytes = bytesAlloc(0)
+    var tcpReadClosed = false
+    var quicReadClosed = false
+    var quicWriteClosed = false
+    while true:
+        var progressed = false
+        if !tcpReadClosed:
+            let readRes = tcp.TcpRecvNonblocking(conn, v3VpnProxyRelayChunkBytes)
+            if IsErr(readRes):
+                if ErrorText(readRes) != "tcp syscall: would block":
+                    return Err[bool](ErrorText(readRes))
+            else:
+                let chunk = Value(readRes)
+                if bytesLen(chunk) <= 0:
+                    tcpReadClosed = true
+                    if !quicWriteClosed:
+                        let closeRes = v3VpnProxyQuicWriteFrame(transport, quicConn, proto.v3VpnProxyFrameClose())
+                        if IsErr(closeRes):
+                            return Err[bool](ErrorText(closeRes))
+                        quicWriteClosed = true
+                    progressed = true
+                else:
+                    let writeRes = v3VpnProxyQuicWriteFrame(transport, quicConn, proto.v3VpnProxyFrameData(chunk))
+                    if IsErr(writeRes):
+                        return Err[bool](ErrorText(writeRes))
+                    progressed = true
+        while true:
+            var frame = proto.v3VpnProxyFrameZero()
+            let parseRes: Result[bool] = v3VpnProxyTryTakeFrame(quicRx, frame)
+            if IsErr(parseRes):
+                return Err[bool](ErrorText(parseRes))
+            if Value(parseRes):
+                progressed = true
+                if frame.kind == proto.V3VpnProxyFrameData:
+                    v3VpnProxyBytesAppend(tcpPendingWrite, frame.payload)
+                    continue
+                if frame.kind == proto.V3VpnProxyFrameClose:
+                    quicReadClosed = true
+                    let _ = tcp.TcpShutdownWrite(conn)
+                    continue
+                if frame.kind == proto.V3VpnProxyFramePing:
+                    let pongRes = v3VpnProxyQuicWriteFrame(transport, quicConn, proto.v3VpnProxyFramePong(frame.token))
+                    if IsErr(pongRes):
+                        return Err[bool](ErrorText(pongRes))
+                    continue
+                if frame.kind == proto.V3VpnProxyFramePong:
+                    continue
+                if frame.kind == proto.V3VpnProxyFrameError:
+                    return Err[bool](frame.text)
+                return Err[bool]("vpn proxy: unexpected relay frame: " + proto.v3VpnProxyFrameKindText(frame.kind))
+            let readRes = qtransport.msquicTransportReadNonblocking(transport, quicConn, v3VpnProxyRelayChunkBytes)
+            if IsErr(readRes):
+                if v3VpnProxyWouldBlockQuic(ErrorText(readRes)):
+                    break
+                if ErrorText(readRes) == "msquic: pipe closed":
+                    quicReadClosed = true
+                    let _ = tcp.TcpShutdownWrite(conn)
+                    break
+                return Err[bool](ErrorText(readRes))
+            let chunk = Value(readRes)
+            if bytesLen(chunk) <= 0:
+                break
+            v3VpnProxyBytesAppend(quicRx, chunk)
+            progressed = true
+        if bytesLen(tcpPendingWrite) > 0:
+            let sendRes = tcp.TcpSendNonblocking(conn, tcpPendingWrite)
+            if IsErr(sendRes):
+                return Err[bool](ErrorText(sendRes))
+            let sent: int32 = Value(sendRes)
+            if sent > 0:
+                tcpPendingWrite = v3VpnProxyBytesDropPrefix(tcpPendingWrite, sent)
+                progressed = true
+        if tcpReadClosed && quicReadClosed && bytesLen(tcpPendingWrite) <= 0:
+            return Ok[bool](true)
+        if !progressed:
+            os.SleepMs(10)
+        if !conn.open || !quicConn.open:
+            if bytesLen(tcpPendingWrite) <= 0:
+                return Ok[bool](true)
+        if quicReadClosed && bytesLen(tcpPendingWrite) <= 0 && tcpReadClosed:
+            return Ok[bool](true)
+    return Ok[bool](true)
+
+fn v3VpnProxyHandleLocalClient(states: var V3VpnProxyExitState[],
+                               identity: V3VpnProxyLoadedIdentity,
+                               probeIntervalMs: int32,
+                               probeTimeoutMs: int32,
+                               conn: var tcp.TcpConnectionHandle): Result[bool] =
+    let methodRes = v3VpnProxySocksMethodHandshake(conn)
+    if IsErr(methodRes):
+        return Err[bool](ErrorText(methodRes))
+    let targetRes: Result[V3VpnProxyTarget] = v3VpnProxySocksReadTarget(conn)
+    if IsErr(targetRes):
+        return Err[bool](ErrorText(targetRes))
+    let openRes: Result[V3VpnProxyQuicLink] = v3VpnProxyOpenRemote(states,
+                                                                   identity,
+                                                                   Value(targetRes),
+                                                                   probeIntervalMs,
+                                                                   probeTimeoutMs)
+    if IsErr(openRes):
+        let _ = tcp.TcpSend(conn, v3VpnProxySocksReply(v3VpnProxySocksReplyConnectionRefused))
+        return Err[bool](ErrorText(openRes))
+    var link = Value(openRes)
+    let okRes = tcp.TcpSend(conn, v3VpnProxySocksReply(0))
+    if IsErr(okRes):
+        v3VpnProxyCloseQuicLink(link)
+        return Err[bool](ErrorText(okRes))
+    let relayRes = v3VpnProxyRelayTcpQuic(conn, link.transport, link.conn)
+    v3VpnProxyCloseQuicLink(link)
+    if IsErr(relayRes):
+        return Err[bool](ErrorText(relayRes))
+    return Ok[bool](true)
+
+fn v3VpnProxyLocal(rootDir: str, args: str[]): int32 =
+    rootDir
+    let opts: V3VpnProxyCliOptions = cli.V3VpnProxyOptions(args)
+    let configRes: Result[V3VpnProxyConfig] = v3VpnProxyLoadConfig(opts.configPath)
+    if IsErr(configRes):
+        v3VpnProxyPrintErr(ErrorText(configRes))
+        return 1
+    let config = Value(configRes)
+    if config.exits.len <= 0:
+        v3VpnProxyPrintErr("vpn proxy config: exits[] missing")
+        return 1
+    let identityRes = v3VpnProxyLoadIdentity(config.configDir, config.client, true)
+    if IsErr(identityRes):
+        v3VpnProxyPrintErr(ErrorText(identityRes))
+        return 1
+    let identity = Value(identityRes)
+    var listenHost = ""
+    var listenPort: int32 = 0
+    let listenText: str = strutil.Strip(config.client.listen)
+    if len(listenText) <= 0:
+        v3VpnProxyPrintErr("vpn proxy: empty listen address")
+        return 1
+    let listenParsedRes: Result[listen.V3VpnProxyListenAddress] = listen.V3VpnProxyParseListenAddress(listenText)
+    if IsErr(listenParsedRes):
+        v3VpnProxyPrintErr(ErrorText(listenParsedRes))
+        return 1
+    let listenParsed: listen.V3VpnProxyListenAddress = Value(listenParsedRes)
+    listenHost = listenParsed.host
+    listenPort = listenParsed.port
+    var states: V3VpnProxyExitState[]
+    states = routing.V3VpnProxyInitExitStates(config.exits)
+    let listenTcpRes = tcp.TcpListen(listenHost, listenPort, strings.StrContains(listenHost, ":"))
+    if IsErr(listenTcpRes):
+        v3VpnProxyPrintErr(ErrorText(listenTcpRes))
+        return 1
+    var listener = Value(listenTcpRes)
+    let nbRes = tcp.TcpListenerSetNonblocking(listener, true)
+    if IsErr(nbRes):
+        v3VpnProxyPrintErr(ErrorText(nbRes))
+        tcp.TcpListenerClose(listener)
+        return 1
+    if !v3VpnProxyWriteReadyPort(opts.readyPath, listener.addr.port):
+        v3VpnProxyPrintErr("vpn proxy: failed to write ready path")
+        tcp.TcpListenerClose(listener)
+        return 1
+    v3VpnProxyProbeAll(states, identity, opts.probeTimeoutMs)
+    v3VpnProxyPrintLine("vpn-proxy local listening " + listenHost + ":" + intToStr(listener.addr.port))
+    var served: int32 = 0
+    var lastIdleProbeMs: int64 = v3VpnProxyMonoNowMs()
+    while opts.acceptCount <= 0 || served < opts.acceptCount:
+        let nowMs: int64 = v3VpnProxyMonoNowMs()
+        if opts.probeIntervalMs > 0 && nowMs - lastIdleProbeMs >= int64(opts.probeIntervalMs):
+            v3VpnProxyProbeAll(states, identity, opts.probeTimeoutMs)
+            lastIdleProbeMs = nowMs
+        let acceptRes = tcp.TcpAcceptNonblocking(listener)
+        if IsErr(acceptRes):
+            if ErrorText(acceptRes) == "tcp syscall: would block":
+                os.SleepMs(10)
+                continue
+            v3VpnProxyPrintErr(ErrorText(acceptRes))
+            tcp.TcpListenerClose(listener)
+            return 1
+        var conn = Value(acceptRes)
+        let handleRes = v3VpnProxyHandleLocalClient(states,
+                                                    identity,
+                                                    opts.probeIntervalMs,
+                                                    opts.probeTimeoutMs,
+                                                    conn)
+        tcp.TcpClose(conn)
+        if IsErr(handleRes):
+            v3VpnProxyPrintErr(ErrorText(handleRes))
+        served = served + 1
+    tcp.TcpListenerClose(listener)
+    return 0
+
+fn v3VpnProxyHandleExitConn(listener: var qtransport.MsQuicTransport,
+                            conn: var qconn.Connection): Result[bool] =
+    let selectRes = quic_transport.v3Libp2pQuicServerSelectProtocol(listener, conn, proto.v3VpnProxyProtocolId())
+    if IsErr(selectRes):
+        return Err[bool](ErrorText(selectRes))
+    var rxBuf: Bytes = bytesAlloc(0)
+    var first = proto.v3VpnProxyFrameZero()
+    let firstRes = v3VpnProxyWaitFrameWithTimeout(listener, conn, rxBuf, v3VpnProxyConnectTimeoutMs, first)
+    if IsErr(firstRes):
+        return Err[bool](ErrorText(firstRes))
+    if first.kind == proto.V3VpnProxyFramePing:
+        let pongRes = v3VpnProxyQuicWriteFrame(listener, conn, proto.v3VpnProxyFramePong(first.token))
+        if IsErr(pongRes):
+            return Err[bool](ErrorText(pongRes))
+        return Ok[bool](true)
+    if first.kind != proto.V3VpnProxyFrameOpen:
+        let _ = v3VpnProxyQuicWriteFrame(listener, conn, proto.v3VpnProxyFrameError("expected OPEN"))
+        return Err[bool]("vpn proxy exit: expected OPEN")
+    let targetRes = tcp.TcpConnectResolved(first.host, first.port)
+    if IsErr(targetRes):
+        let _ = v3VpnProxyQuicWriteFrame(listener, conn, proto.v3VpnProxyFrameError(ErrorText(targetRes)))
+        return Err[bool](ErrorText(targetRes))
+    var targetConn = Value(targetRes)
+    let okRes = v3VpnProxyQuicWriteFrame(listener, conn, proto.v3VpnProxyFrameOpenOk())
+    if IsErr(okRes):
+        tcp.TcpClose(targetConn)
+        return Err[bool](ErrorText(okRes))
+    let relayRes = v3VpnProxyRelayTcpQuic(targetConn, listener, conn)
+    tcp.TcpClose(targetConn)
+    if IsErr(relayRes):
+        return Err[bool](ErrorText(relayRes))
+    return Ok[bool](true)
+
+fn v3VpnProxyExit(rootDir: str, args: str[]): int32 =
+    rootDir
+    let opts: V3VpnProxyCliOptions = cli.V3VpnProxyOptions(args)
+    let configRes: Result[V3VpnProxyConfig] = v3VpnProxyLoadConfig(opts.configPath)
+    if IsErr(configRes):
+        v3VpnProxyPrintErr(ErrorText(configRes))
+        return 1
+    let config = Value(configRes)
+    let identityRes = v3VpnProxyLoadIdentity(config.configDir, config.server, true)
+    if IsErr(identityRes):
+        v3VpnProxyPrintErr(ErrorText(identityRes))
+        return 1
+    let identity = Value(identityRes)
+    if !v3VpnProxyLoadedIdentityPresent(identity):
+        v3VpnProxyPrintErr("vpn proxy: server identity incomplete")
+        return 1
+    var listenHost = ""
+    var listenPort: int32 = 0
+    let listenText: str = strutil.Strip(config.server.listen)
+    if len(listenText) <= 0:
+        v3VpnProxyPrintErr("vpn proxy: empty listen address")
+        return 1
+    let listenParsedRes: Result[listen.V3VpnProxyListenAddress] = listen.V3VpnProxyParseListenAddress(listenText)
+    if IsErr(listenParsedRes):
+        v3VpnProxyPrintErr(ErrorText(listenParsedRes))
+        return 1
+    let listenParsed: listen.V3VpnProxyListenAddress = Value(listenParsedRes)
+    listenHost = listenParsed.host
+    listenPort = listenParsed.port
+    let policyRes = v3VpnProxyBuildPolicy(identity, "vpn-proxy.exit")
+    if IsErr(policyRes):
+        v3VpnProxyPrintErr(ErrorText(policyRes))
+        return 1
+    let addrRes = quic_transport.v3Libp2pQuicAddrFromHostPort(listenHost, listenPort)
+    if IsErr(addrRes):
+        v3VpnProxyPrintErr(ErrorText(addrRes))
+        return 1
+    var listener = qtransport.initMsQuicTransport()
+    let tlsRes = qtransport.setMsQuicTransportTlsPolicy(listener, Value(policyRes))
+    if IsErr(tlsRes):
+        v3VpnProxyPrintErr(ErrorText(tlsRes))
+        return 1
+    qtransport.start(listener, Value(addrRes))
+    if !listener.running:
+        v3VpnProxyPrintErr(listener.lastError)
+        return 1
+    let boundPort: int32 = quic_transport.v3Libp2pQuicBoundPort(listener.listenAddr)
+    if !v3VpnProxyWriteReadyPort(opts.readyPath, boundPort):
+        v3VpnProxyPrintErr("vpn proxy: failed to write ready path")
+        qtransport.stop(listener)
+        return 1
+    v3VpnProxyPrintLine("vpn-proxy exit listening " + listenHost + ":" + intToStr(boundPort))
+    var served: int32 = 0
+    while opts.acceptCount <= 0 || served < opts.acceptCount:
+        let acceptRes = qtransport.acceptTimed(listener, 1000)
+        if IsErr(acceptRes):
+            let err: str = ErrorText(acceptRes)
+            if err == "msquic: accept timeout" ||
+               strutil.StartsWith(err, "msquic native: accept handshake ! ready") ||
+               strutil.StartsWith(err, "msquic native: handshake ! ready") ||
+               strutil.StartsWith(err, "msquic native: session ! ready") ||
+               strutil.StartsWith(err, "msquic native: pipe read timeout"):
+                continue
+            v3VpnProxyPrintErr(err)
+            qtransport.stop(listener)
+            return 1
+        var conn = Value(acceptRes)
+        let handleRes = v3VpnProxyHandleExitConn(listener, conn)
+        qconn.connClose(conn)
+        if IsErr(handleRes):
+            v3VpnProxyPrintErr(ErrorText(handleRes))
+        served = served + 1
+    qtransport.stop(listener)
+    return 0
+
+fn v3VpnProxyStatus(rootDir: str, args: str[]): int32 =
+    rootDir
+    let opts: V3VpnProxyCliOptions = cli.V3VpnProxyOptions(args)
+    let configRes: Result[V3VpnProxyConfig] = v3VpnProxyLoadConfig(opts.configPath)
+    if IsErr(configRes):
+        v3VpnProxyPrintErr(ErrorText(configRes))
+        return 1
+    let config = Value(configRes)
+    v3VpnProxyPrintLine("vpn-proxy status")
+    if config.exits.len > 0:
+        let identityRes = v3VpnProxyLoadIdentity(config.configDir, config.client, false)
+        if IsErr(identityRes):
+            v3VpnProxyPrintErr(ErrorText(identityRes))
+            return 1
+        let identity = Value(identityRes)
+        var states: V3VpnProxyExitState[]
+        states = routing.V3VpnProxyInitExitStates(config.exits)
+        v3VpnProxyProbeAll(states, identity, opts.probeTimeoutMs)
+        let bestIndex: int32 = routing.V3VpnProxyBestHealthyExit(states, -1)
+        if len(config.client.listen) > 0:
+            v3VpnProxyPrintLine("client.listen=" + config.client.listen)
+        if bestIndex >= 0:
+            v3VpnProxyPrintLine("best_exit=" + states[bestIndex].cfg.name)
+        else:
+            v3VpnProxyPrintLine("best_exit=")
+        for i in 0..<states.len:
+            let state: V3VpnProxyExitState = states[i]
+            v3VpnProxyPrintLine("exit." + intToStr(i) + ".name=" + state.cfg.name)
+            v3VpnProxyPrintLine("exit." + intToStr(i) + ".healthy=" + (state.healthy ? "true" : "false"))
+            v3VpnProxyPrintLine("exit." + intToStr(i) + ".ewma_ms=" + int64ToStr(state.ewmaMs))
+            v3VpnProxyPrintLine("exit." + intToStr(i) + ".last_error=" + state.lastError)
+        return 0
+    if len(config.server.listen) > 0:
+        v3VpnProxyPrintLine("server.listen=" + config.server.listen)
+        return 0
+    v3VpnProxyPrintErr("vpn proxy status: config missing client exits or server.listen")
+    return 1
+
+fn v3VpnProxyMain(rootDir: str, args: str[]): int32 =
+    if args.len <= 0:
+        v3VpnProxyUsage()
+        return 1
+    let cmd: str = args[0]
+    let rest: str[] = cli.V3VpnProxyCollectArgsFrom(args, 1)
+    if cmd == "help" || cmd == "--help" || cmd == "-h":
+        v3VpnProxyUsage()
+        return 0
+    if cmd == "local":
+        return v3VpnProxyLocal(rootDir, rest)
+    if cmd == "exit":
+        return v3VpnProxyExit(rootDir, rest)
+    if cmd == "status":
+        return v3VpnProxyStatus(rootDir, rest)
+    v3VpnProxyPrintErr("vpn proxy: unknown subcommand: " + cmd)
+    v3VpnProxyUsage()
+    return 1

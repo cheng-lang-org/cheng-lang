@@ -1,4 +1,5 @@
 import std/rawbytes
+import std/strings
 import cheng/v3/libp2p/content/moq_fountain as moq
 
 importc fn cheng_v3_browser_distributed_video_build_bridge(blobHandle: int32,
@@ -19,9 +20,16 @@ fn cheng_v3_browser_input_len_bridge(handle: int32): int32
 fn cheng_v3_browser_input_copy_bridge(handle: int32, data: ptr, n: int32): int32
 @importc("cheng_v3_buffer_handle_from_raw_bridge")
 fn cheng_v3_buffer_handle_from_raw_bridge(data: ptr, n: int32): int32
+@importc("cheng_v3_buffer_handle_from_text_bridge")
+fn cheng_v3_buffer_handle_from_text_bridge(text: str): int32
 importc fn cheng_v3_browser_buffer_handle_len_bridge(handle: int32): int32
 importc fn cheng_v3_browser_buffer_handle_byte_bridge(handle: int32, idx: int32): int32
 importc fn cheng_v3_browser_buffer_handle_release_bridge(handle: int32): int32
+importc fn cheng_v3_browser_moq_fountain_last_error_store_bridge(text: str): int32
+importc fn cheng_v3_browser_moq_fountain_last_error_handle_bridge(): int32
+
+fn browserMoqFountainSetLastError(text: str) =
+    cheng_v3_browser_moq_fountain_last_error_store_bridge(text)
 
 fn browserDistributedVideoBuild(blobHandle: int32,
                                 ownerPeerHandle: int32,
@@ -56,6 +64,209 @@ fn browserInputBytes(handle: int32): int32 =
 fn browserInputText(handle: int32): int32 =
     return handle
 
+fn browserInputTextRoundtripLen(handle: int32): int32 =
+    let textRes = browserInputTextRequired(handle,
+                                           "browser_input_missing_text",
+                                           "browser_input_copy_text_failed")
+    if IsErr(textRes):
+        return if Error(textRes) == "browser_input_copy_text_failed": -2 else: -1
+    let text = Value(textRes)
+    return text.len
+
+fn browserInputRemotePeerCount(handle: int32): int32 =
+    let textRes = browserInputTextRequired(handle,
+                                           "browser_input_missing_remote_peers",
+                                           "browser_input_copy_remote_peers_failed")
+    if IsErr(textRes):
+        return if Error(textRes) == "browser_input_copy_remote_peers_failed": -2 else: -1
+    let text = Value(textRes)
+    let peers = moq.v3Libp2pMoqNormalizePeerCsv(text)
+    return peers.len
+
+fn browserInputBytesRequired(handle: int32,
+                             missingError: str,
+                             copyError: str): Result[Bytes] =
+    let inputLen = cheng_v3_browser_input_len_bridge(handle)
+    if handle <= 0 || inputLen <= 0:
+        return Err[Bytes](missingError)
+    var inputBytes = bytesAlloc(inputLen)
+    if cheng_v3_browser_input_copy_bridge(handle, inputBytes.data, inputLen) <= 0:
+        return Err[Bytes](copyError)
+    return Ok[Bytes](inputBytes)
+
+fn browserInputTextRequired(handle: int32,
+                            missingError: str,
+                            copyError: str): Result[str] =
+    let bytesRes = browserInputBytesRequired(handle, missingError, copyError)
+    if IsErr(bytesRes):
+        return Err[str](Error(bytesRes))
+    return Ok[str](bytesToString(Value(bytesRes)))
+
+fn browserInputTextOptional(handle: int32,
+                            copyError: str): Result[str] =
+    let inputLen = cheng_v3_browser_input_len_bridge(handle)
+    if handle <= 0 || inputLen <= 0:
+        return Ok[str]("")
+    var inputBytes = bytesAlloc(inputLen)
+    if cheng_v3_browser_input_copy_bridge(handle, inputBytes.data, inputLen) <= 0:
+        return Err[str](copyError)
+    return Ok[str](bytesToString(inputBytes))
+
+fn browserBufferHandleFromBytesRequired(payload: Bytes,
+                                        handleError: str): Result[int32] =
+    let handle = cheng_v3_buffer_handle_from_raw_bridge(payload.data, bytesLen(payload))
+    if handle <= 0:
+        return Err[int32](handleError)
+    return Ok[int32](handle)
+
+fn browserBufferHandleFromTextRequired(text: str,
+                                       handleError: str): Result[int32] =
+    if len(text) <= 0:
+        return Err[int32](handleError)
+    let handle = cheng_v3_buffer_handle_from_text_bridge(text)
+    if handle <= 0:
+        return Err[int32](handleError)
+    return Ok[int32](handle)
+
+fn browserMoqFountainBuildWireFill(out: var str,
+                                   blobBytes: Bytes,
+                                   ownerPeerId: str,
+                                   remotePeersCsv: str,
+                                   mimeType: str,
+                                   objectTargetBytes: int32,
+                                   sourceBlockBytes: int32,
+                                   repairDropletCount: int32): Result[bool] =
+    let wireText = moq.v3Libp2pMoqBuildToWire(blobBytes,
+                                              ownerPeerId,
+                                              remotePeersCsv,
+                                              mimeType,
+                                              objectTargetBytes,
+                                              sourceBlockBytes,
+                                              repairDropletCount)
+    if len(wireText) <= 0:
+        return Err[bool]("moq_fountain_build_returned_empty_wire")
+    out = wireText
+    return Ok[bool](true)
+
+fn browserMoqFountainBuildWireBytes(blobBytes: Bytes,
+                                    ownerPeerId: str,
+                                    remotePeersCsv: str,
+                                    mimeType: str,
+                                    objectTargetBytes: int32,
+                                    sourceBlockBytes: int32,
+                                    repairDropletCount: int32): Result[Bytes] =
+    var wireText = ""
+    let wireOk = browserMoqFountainBuildWireFill(wireText,
+                                                 blobBytes,
+                                                 ownerPeerId,
+                                                 remotePeersCsv,
+                                                 mimeType,
+                                                 objectTargetBytes,
+                                                 sourceBlockBytes,
+                                                 repairDropletCount)
+    if IsErr(wireOk):
+        return Err[Bytes](Error(wireOk))
+    return Ok[Bytes](bytesSlice(bytesFromString(wireText), 0, len(wireText)))
+
+fn browserMoqFountainInputRemotePeerCount(ownerPeerHandle: int32,
+                                          remotePeersHandle: int32,
+                                          mimeTypeHandle: int32): int32 =
+    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
+                                                "moq_fountain_missing_owner_peer",
+                                                "moq_fountain_copy_owner_peer_failed")
+    if IsErr(ownerPeerRes):
+        return -1
+    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
+                                                  "moq_fountain_missing_remote_peers",
+                                                  "moq_fountain_copy_remote_peers_failed")
+    if IsErr(remotePeersRes):
+        return -2
+    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
+                                               "moq_fountain_copy_mime_type_failed")
+    if IsErr(mimeTypeRes):
+        return -3
+    let peers = moq.v3Libp2pMoqNormalizePeerCsv(Value(remotePeersRes))
+    return peers.len
+
+fn browserMoqFountainBuildRemotePeerCount(blobHandle: int32,
+                                          ownerPeerHandle: int32,
+                                          remotePeersHandle: int32,
+                                          mimeTypeHandle: int32,
+                                          objectTargetBytes: int32,
+                                          sourceBlockBytes: int32,
+                                          repairDropletCount: int32): int32 =
+    let blobBytesRes = browserInputBytesRequired(blobHandle,
+                                                 "moq_fountain_missing_blob",
+                                                 "moq_fountain_copy_blob_failed")
+    if IsErr(blobBytesRes):
+        return -1
+    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
+                                                "moq_fountain_missing_owner_peer",
+                                                "moq_fountain_copy_owner_peer_failed")
+    if IsErr(ownerPeerRes):
+        return -2
+    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
+                                                  "moq_fountain_missing_remote_peers",
+                                                  "moq_fountain_copy_remote_peers_failed")
+    if IsErr(remotePeersRes):
+        return -3
+    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
+                                               "moq_fountain_copy_mime_type_failed")
+    if IsErr(mimeTypeRes):
+        return -4
+    let buildRes = moq.v3Libp2pMoqBuild(Value(blobBytesRes),
+                                        Value(ownerPeerRes),
+                                        Value(remotePeersRes),
+                                        Value(mimeTypeRes),
+                                        objectTargetBytes,
+                                        sourceBlockBytes,
+                                        repairDropletCount)
+    if IsErr(buildRes):
+        return -5
+    return Value(buildRes).remoteAckPeerIds.len
+
+fn browserMoqFountainBuildWireRemotePeerCsvLen(blobHandle: int32,
+                                               ownerPeerHandle: int32,
+                                               remotePeersHandle: int32,
+                                               mimeTypeHandle: int32,
+                                               objectTargetBytes: int32,
+                                               sourceBlockBytes: int32,
+                                               repairDropletCount: int32): int32 =
+    let blobBytesRes = browserInputBytesRequired(blobHandle,
+                                                 "moq_fountain_missing_blob",
+                                                 "moq_fountain_copy_blob_failed")
+    if IsErr(blobBytesRes):
+        return -1
+    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
+                                                "moq_fountain_missing_owner_peer",
+                                                "moq_fountain_copy_owner_peer_failed")
+    if IsErr(ownerPeerRes):
+        return -2
+    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
+                                                  "moq_fountain_missing_remote_peers",
+                                                  "moq_fountain_copy_remote_peers_failed")
+    if IsErr(remotePeersRes):
+        return -3
+    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
+                                               "moq_fountain_copy_mime_type_failed")
+    if IsErr(mimeTypeRes):
+        return -4
+    var wireText = ""
+    let wireOk = browserMoqFountainBuildWireFill(wireText,
+                                                 Value(blobBytesRes),
+                                                 Value(ownerPeerRes),
+                                                 Value(remotePeersRes),
+                                                 Value(mimeTypeRes),
+                                                 objectTargetBytes,
+                                                 sourceBlockBytes,
+                                                 repairDropletCount)
+    if IsErr(wireOk):
+        return -5
+    let csvRes = moq.v3Libp2pMoqWireFindValue(wireText, "remote_ack_peer_ids")
+    if IsErr(csvRes):
+        return -6
+    return Value(csvRes).len
+
 fn browserMoqFountainBuild(blobHandle: int32,
                            ownerPeerHandle: int32,
                            remotePeersHandle: int32,
@@ -63,58 +274,68 @@ fn browserMoqFountainBuild(blobHandle: int32,
                            objectTargetBytes: int32,
                            sourceBlockBytes: int32,
                            repairDropletCount: int32): int32 =
-    let blobLen = cheng_v3_browser_input_len_bridge(blobHandle)
-    if blobHandle <= 0 || blobLen <= 0:
+    browserMoqFountainSetLastError("")
+    let blobBytesRes = browserInputBytesRequired(blobHandle,
+                                                 "moq_fountain_missing_blob",
+                                                 "moq_fountain_copy_blob_failed")
+    if IsErr(blobBytesRes):
+        browserMoqFountainSetLastError(Error(blobBytesRes))
         return 0
-    var blobBytes = bytesAlloc(blobLen)
-    if cheng_v3_browser_input_copy_bridge(blobHandle, blobBytes.data, blobLen) <= 0:
+    let ownerPeerRes = browserInputTextRequired(ownerPeerHandle,
+                                                "moq_fountain_missing_owner_peer",
+                                                "moq_fountain_copy_owner_peer_failed")
+    if IsErr(ownerPeerRes):
+        browserMoqFountainSetLastError(Error(ownerPeerRes))
         return 0
-    let ownerLen = cheng_v3_browser_input_len_bridge(ownerPeerHandle)
-    if ownerPeerHandle <= 0 || ownerLen <= 0:
+    let remotePeersRes = browserInputTextRequired(remotePeersHandle,
+                                                  "moq_fountain_missing_remote_peers",
+                                                  "moq_fountain_copy_remote_peers_failed")
+    if IsErr(remotePeersRes):
+        browserMoqFountainSetLastError(Error(remotePeersRes))
         return 0
-    var ownerBytes = bytesAlloc(ownerLen)
-    if cheng_v3_browser_input_copy_bridge(ownerPeerHandle, ownerBytes.data, ownerLen) <= 0:
+    let mimeTypeRes = browserInputTextOptional(mimeTypeHandle,
+                                               "moq_fountain_copy_mime_type_failed")
+    if IsErr(mimeTypeRes):
+        browserMoqFountainSetLastError(Error(mimeTypeRes))
         return 0
-    let remoteLen = cheng_v3_browser_input_len_bridge(remotePeersHandle)
-    if remotePeersHandle <= 0 || remoteLen <= 0:
+    var wireText = ""
+    let wireOk = browserMoqFountainBuildWireFill(wireText,
+                                                 Value(blobBytesRes),
+                                                 Value(ownerPeerRes),
+                                                 Value(remotePeersRes),
+                                                 Value(mimeTypeRes),
+                                                 objectTargetBytes,
+                                                 sourceBlockBytes,
+                                                 repairDropletCount)
+    if IsErr(wireOk):
+        browserMoqFountainSetLastError(Error(wireOk))
         return 0
-    var remoteBytes = bytesAlloc(remoteLen)
-    if cheng_v3_browser_input_copy_bridge(remotePeersHandle, remoteBytes.data, remoteLen) <= 0:
+    let handleRes = browserBufferHandleFromTextRequired(wireText,
+                                                        "moq_fountain_build_buffer_handle_failed")
+    if IsErr(handleRes):
+        browserMoqFountainSetLastError(Error(handleRes))
         return 0
-    let mimeLen = cheng_v3_browser_input_len_bridge(mimeTypeHandle)
-    var mimeType = ""
-    if mimeTypeHandle > 0 && mimeLen > 0:
-        var mimeBytes = bytesAlloc(mimeLen)
-        if cheng_v3_browser_input_copy_bridge(mimeTypeHandle, mimeBytes.data, mimeLen) <= 0:
-            return 0
-        mimeType = bytesToString(mimeBytes)
-    let wireText = moq.v3Libp2pMoqBuildToWire(blobBytes,
-                                              bytesToString(ownerBytes),
-                                              bytesToString(remoteBytes),
-                                              mimeType,
-                                              objectTargetBytes,
-                                              sourceBlockBytes,
-                                              repairDropletCount)
-    let wireBytes = bytesFromString(wireText)
-    if bytesLen(wireBytes) <= 0:
-        return 0
-    return cheng_v3_buffer_handle_from_raw_bridge(wireBytes.data, bytesLen(wireBytes))
+    return Value(handleRes)
 
 fn browserMoqFountainRebuild(requestWireHandle: int32): int32 =
-    let requestLen = cheng_v3_browser_input_len_bridge(requestWireHandle)
-    if requestWireHandle <= 0 || requestLen <= 0:
+    browserMoqFountainSetLastError("")
+    let requestWireRes = browserInputTextRequired(requestWireHandle,
+                                                  "moq_fountain_missing_request_wire",
+                                                  "moq_fountain_copy_request_wire_failed")
+    if IsErr(requestWireRes):
+        browserMoqFountainSetLastError(Error(requestWireRes))
         return 0
-    var requestBytes = bytesAlloc(requestLen)
-    if cheng_v3_browser_input_copy_bridge(requestWireHandle, requestBytes.data, requestLen) <= 0:
+    let requestWire = Value(requestWireRes)
+    let wireText = moq.v3Libp2pMoqRebuildToWire(requestWire)
+    let handleRes = browserBufferHandleFromTextRequired(wireText,
+                                                        "moq_fountain_rebuild_buffer_handle_failed")
+    if IsErr(handleRes):
+        browserMoqFountainSetLastError(Error(handleRes))
         return 0
-    let wireText = moq.v3Libp2pMoqRebuildToWire(bytesToString(requestBytes))
-    let wireBytes = bytesFromString(wireText)
-    if bytesLen(wireBytes) <= 0:
-        return 0
-    return cheng_v3_buffer_handle_from_raw_bridge(wireBytes.data, bytesLen(wireBytes))
+    return Value(handleRes)
 
 fn browserMoqFountainLastErrorHandle(): int32 =
-    return 0
+    return cheng_v3_browser_moq_fountain_last_error_handle_bridge()
 
 fn browserBufferHandleLen(handle: int32): int32 =
     return cheng_v3_browser_buffer_handle_len_bridge(handle)

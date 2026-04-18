@@ -46,6 +46,8 @@ type
         capabilityKind: int32
         callConv: int32
         entryFlag: int32
+        exportedFlag: int32
+        exportSymbolName: str
         factCid: layout.FixedBytes32
 
     V3CompilerCsgEdge =
@@ -71,6 +73,7 @@ type
         packageId: str
         exportedSymbolCount: int32
         exportedSymbols: str[]
+        exportedTargetNames: str[]
         exportedLayouts: int32[]
         exportedEffects: int32[]
         exportedCapabilities: int32[]
@@ -127,7 +130,9 @@ fn v3CompilerCsgHashNode(nodeKind: int32,
                          effectKind: int32,
                          capabilityKind: int32,
                          callConv: int32,
-                         entryFlag: int32): layout.FixedBytes32 =
+                         entryFlag: int32,
+                         exportedFlag: int32,
+                         exportSymbolName: str): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(256)
     v3CompilerCsgAppendText(buf, "v3.compiler.csg.node")
     lt.v3AppendU32BE(buf, nodeKind)
@@ -140,6 +145,8 @@ fn v3CompilerCsgHashNode(nodeKind: int32,
     lt.v3AppendU32BE(buf, capabilityKind)
     lt.v3AppendU32BE(buf, callConv)
     lt.v3AppendU32BE(buf, entryFlag)
+    lt.v3AppendU32BE(buf, exportedFlag)
+    v3CompilerCsgAppendText(buf, exportSymbolName)
     return lt.v3FixedCidFromBuf(buf)
 
 fn v3CompilerCsgHashEdge(fromNodeId: int32,
@@ -174,6 +181,8 @@ fn v3CompilerCsgGraphCid(packageId: str,
         lt.v3AppendU32BE(buf, node.capabilityKind)
         lt.v3AppendU32BE(buf, node.callConv)
         lt.v3AppendU32BE(buf, node.entryFlag)
+        lt.v3AppendU32BE(buf, node.exportedFlag)
+        v3CompilerCsgAppendText(buf, node.exportSymbolName)
         lt.v3AppendFixed32(buf, node.factCid)
     lt.v3AppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
@@ -205,6 +214,8 @@ fn v3CompilerCsgCanonicalGraphCid(packageId: str,
         lt.v3AppendU32BE(buf, node.capabilityKind)
         lt.v3AppendU32BE(buf, node.callConv)
         lt.v3AppendU32BE(buf, node.entryFlag)
+        lt.v3AppendU32BE(buf, node.exportedFlag)
+        v3CompilerCsgAppendText(buf, node.exportSymbolName)
         lt.v3AppendFixed32(buf, node.factCid)
     lt.v3AppendU32BE(buf, edges.len)
     for i in 0..<edges.len:
@@ -320,12 +331,85 @@ fn v3CompilerCsgModuleNodeId(nodes: V3CompilerCsgNode[],
 
 fn v3CompilerCsgSymbolExported(functionName: str,
                                entryFlag: int32): bool =
-    if entryFlag != 0:
-        return true
+    let _ = entryFlag
     if len(functionName) <= 0:
         return false
     let ch = functionName[0]
     return ch >= 'A' && ch <= 'Z'
+
+fn v3CompilerCsgFindText(text: str,
+                         needle: str): int32 =
+    if needle.len <= 0:
+        return 0
+    if text.len < needle.len:
+        return -1
+    for i in 0..<(text.len - needle.len + 1):
+        var matched = true
+        for j in 0..<needle.len:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn v3CompilerCsgExportNameFromAnnotation(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if !v3path.V3TextStartsWith(line, "@compiler_top_level("):
+        return ""
+    let exportPos = v3CompilerCsgFindText(line, "export_name")
+    if exportPos < 0:
+        return ""
+    let quoteStart = v3CompilerCsgFindText(v3path.V3TextSlice(line, exportPos, line.len - exportPos), "\"")
+    if quoteStart < 0:
+        return ""
+    let valueStart = exportPos + quoteStart + 1
+    let tail = v3path.V3TextSlice(line, valueStart, line.len - valueStart)
+    let quoteEnd = v3CompilerCsgFindText(tail, "\"")
+    if quoteEnd <= 0:
+        return ""
+    return v3path.V3TextSlice(line, valueStart, quoteEnd)
+
+fn v3CompilerCsgExportcNameFromAnnotation(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if !v3path.V3TextStartsWith(line, "@exportc("):
+        return ""
+    let quoteStart = v3CompilerCsgFindText(line, "\"")
+    if quoteStart < 0:
+        return ""
+    let tail = v3path.V3TextSlice(line, quoteStart + 1, line.len - (quoteStart + 1))
+    let quoteEnd = v3CompilerCsgFindText(tail, "\"")
+    if quoteEnd <= 0:
+        return ""
+    return v3path.V3TextSlice(line, quoteStart + 1, quoteEnd)
+
+fn v3CompilerCsgTargetExportName(symbolText: str,
+                                 explicitExportName: str,
+                                 functionName: str): str =
+    if len(explicitExportName) > 0:
+        return explicitExportName
+    if len(functionName) > 0:
+        return functionName
+    let suffixPos = v3CompilerCsgFindText(symbolText, "::")
+    if suffixPos < 0:
+        return symbolText
+    return v3path.V3TextSlice(symbolText, suffixPos + 2, symbolText.len - (suffixPos + 2))
+
+fn v3CompilerCsgShouldExportSymbol(emitKind: creq.V3CompilerEmit,
+                                   entrySourceFlag: bool,
+                                   entryHasExplicitExports: bool,
+                                   explicitExportName: str,
+                                   functionName: str,
+                                   entryFlag: int32): bool =
+    if emitKind != creq.v3EmitShared && emitKind != creq.v3EmitObj:
+        if len(explicitExportName) > 0:
+            return true
+        return v3CompilerCsgSymbolExported(functionName, entryFlag)
+    if !entrySourceFlag:
+        return false
+    if entryHasExplicitExports:
+        return len(explicitExportName) > 0
+    return true
 
 fn v3CompilerCsgSourceTextLookup(overrides: V3CompilerCsgSourceText[],
                                  sourcePath: str,
@@ -773,7 +857,9 @@ fn v3CompilerCsgAddNode(nodes: var V3CompilerCsgNode[],
                         effectKind: int32,
                         capabilityKind: int32,
                         callConv: int32,
-                        entryFlag: int32): int32 =
+                        entryFlag: int32,
+                        exportedFlag: int32,
+                        exportSymbolName: str): int32 =
     var node: V3CompilerCsgNode
     node.nodeId = nodes.len + 1
     node.nodeKind = nodeKind
@@ -786,6 +872,8 @@ fn v3CompilerCsgAddNode(nodes: var V3CompilerCsgNode[],
     node.capabilityKind = capabilityKind
     node.callConv = callConv
     node.entryFlag = entryFlag
+    node.exportedFlag = exportedFlag
+    node.exportSymbolName = exportSymbolName
     node.factCid = v3CompilerCsgHashNode(nodeKind,
                                          ownerNodeId,
                                          modulePath,
@@ -795,7 +883,9 @@ fn v3CompilerCsgAddNode(nodes: var V3CompilerCsgNode[],
                                          effectKind,
                                          capabilityKind,
                                          callConv,
-                                         entryFlag)
+                                         entryFlag,
+                                         exportedFlag,
+                                         exportSymbolName)
     add(nodes, node)
     return node.nodeId
 
@@ -841,6 +931,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     packageNode.capabilityKind = 0
     packageNode.callConv = 0
     packageNode.entryFlag = 0
+    packageNode.exportedFlag = 0
+    packageNode.exportSymbolName = ""
     var packageBuf: layout.ByteBuf = layout.byteBufInit(256)
     v3CompilerCsgAppendText(packageBuf, "v3.compiler.csg.node")
     lt.v3AppendU32BE(packageBuf, packageNode.nodeKind)
@@ -853,6 +945,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     lt.v3AppendU32BE(packageBuf, packageNode.capabilityKind)
     lt.v3AppendU32BE(packageBuf, packageNode.callConv)
     lt.v3AppendU32BE(packageBuf, packageNode.entryFlag)
+    lt.v3AppendU32BE(packageBuf, packageNode.exportedFlag)
+    v3CompilerCsgAppendText(packageBuf, packageNode.exportSymbolName)
     packageNode.factCid = lt.v3FixedCidFromBuf(packageBuf)
     add(nodes, packageNode)
     let packageNodeId = packageNode.nodeId
@@ -869,6 +963,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         moduleNode.capabilityKind = 0
         moduleNode.callConv = 0
         moduleNode.entryFlag = 0
+        moduleNode.exportedFlag = 0
+        moduleNode.exportSymbolName = ""
         var moduleBuf: layout.ByteBuf = layout.byteBufInit(256)
         v3CompilerCsgAppendText(moduleBuf, "v3.compiler.csg.node")
         lt.v3AppendU32BE(moduleBuf, moduleNode.nodeKind)
@@ -881,6 +977,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         lt.v3AppendU32BE(moduleBuf, moduleNode.capabilityKind)
         lt.v3AppendU32BE(moduleBuf, moduleNode.callConv)
         lt.v3AppendU32BE(moduleBuf, moduleNode.entryFlag)
+        lt.v3AppendU32BE(moduleBuf, moduleNode.exportedFlag)
+        v3CompilerCsgAppendText(moduleBuf, moduleNode.exportSymbolName)
         moduleNode.factCid = lt.v3FixedCidFromBuf(moduleBuf)
         add(nodes, moduleNode)
         let moduleNodeId = moduleNode.nodeId
@@ -910,17 +1008,43 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             text = v3path.V3ReadTextFile("", sourcePath)
         let lines = parser.v3ParserSplitChar(text, '\n')
         var pendingImportc = false
+        var pendingExportName = ""
+        let entrySourceFlag = sourcePath == linkPlan.entryPath
+        var entryHasExplicitExports = false
+        if entrySourceFlag && (linkPlan.emitKind == creq.v3EmitShared || linkPlan.emitKind == creq.v3EmitObj):
+            for scanIndex in 0..<lines.len:
+                if len(v3CompilerCsgExportNameFromAnnotation(lines[scanIndex])) > 0:
+                    entryHasExplicitExports = true
+                    break
+                if len(v3CompilerCsgExportcNameFromAnnotation(lines[scanIndex])) > 0:
+                    entryHasExplicitExports = true
+                    break
         for lineIndex in 0..<lines.len:
             let line = lines[lineIndex]
+            let trimmed = v3path.V3PathTrim(line)
+            let compilerExportName = v3CompilerCsgExportNameFromAnnotation(trimmed)
+            if len(compilerExportName) > 0:
+                pendingExportName = compilerExportName
+                continue
+            let exportcName = v3CompilerCsgExportcNameFromAnnotation(trimmed)
+            if len(exportcName) > 0:
+                pendingExportName = exportcName
+                continue
             if v3CompilerCsgIsImportcAnnotation(line):
                 pendingImportc = true
+                pendingExportName = ""
+                continue
+            if pendingImportc && v3path.V3TextStartsWith(trimmed, "@"):
                 continue
             let functionName = v3CompilerCsgFunctionNameFromLine(line)
             if len(functionName) <= 0:
                 pendingImportc = false
+                if trimmed != "":
+                    pendingExportName = ""
                 continue
             if pendingImportc:
                 pendingImportc = false
+                pendingExportName = ""
                 continue
             let entryFlag = sourcePath == linkPlan.entryPath && functionName == linkPlan.entrySymbol ? 1 : 0
             let resultLayoutKind = functionName == "main" ? 5 : 0
@@ -928,6 +1052,17 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             let capabilityKind = entryFlag != 0 ? v3CompilerCsgCapabilityEntrypoint : v3CompilerCsgCapabilityInternal
             let callConv = 1
             let symbolText = ownerModulePath + "::" + functionName
+            let exportedFlag = v3CompilerCsgShouldExportSymbol(linkPlan.emitKind,
+                                                               entrySourceFlag,
+                                                               entryHasExplicitExports,
+                                                               pendingExportName,
+                                                               functionName,
+                                                               entryFlag) ? 1 : 0
+            let exportSymbolName = exportedFlag != 0 ?
+                                       v3CompilerCsgTargetExportName(symbolText,
+                                                                     pendingExportName,
+                                                                     functionName) :
+                                       ""
             var symbolNode: V3CompilerCsgNode
             symbolNode.nodeId = nodes.len + 1
             symbolNode.nodeKind = v3CompilerCsgNodeKindSymbol
@@ -940,6 +1075,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             symbolNode.capabilityKind = capabilityKind
             symbolNode.callConv = callConv
             symbolNode.entryFlag = entryFlag
+            symbolNode.exportedFlag = exportedFlag
+            symbolNode.exportSymbolName = exportSymbolName
             var symbolBuf: layout.ByteBuf = layout.byteBufInit(256)
             v3CompilerCsgAppendText(symbolBuf, "v3.compiler.csg.node")
             lt.v3AppendU32BE(symbolBuf, symbolNode.nodeKind)
@@ -952,6 +1089,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             lt.v3AppendU32BE(symbolBuf, symbolNode.capabilityKind)
             lt.v3AppendU32BE(symbolBuf, symbolNode.callConv)
             lt.v3AppendU32BE(symbolBuf, symbolNode.entryFlag)
+            lt.v3AppendU32BE(symbolBuf, symbolNode.exportedFlag)
+            v3CompilerCsgAppendText(symbolBuf, symbolNode.exportSymbolName)
             symbolNode.factCid = lt.v3FixedCidFromBuf(symbolBuf)
             add(nodes, symbolNode)
             let symbolNodeId = symbolNode.nodeId
@@ -968,6 +1107,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             layoutNode.capabilityKind = 0
             layoutNode.callConv = callConv
             layoutNode.entryFlag = entryFlag
+            layoutNode.exportedFlag = 0
+            layoutNode.exportSymbolName = ""
             var layoutBuf: layout.ByteBuf = layout.byteBufInit(256)
             v3CompilerCsgAppendText(layoutBuf, "v3.compiler.csg.node")
             lt.v3AppendU32BE(layoutBuf, layoutNode.nodeKind)
@@ -980,6 +1121,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             lt.v3AppendU32BE(layoutBuf, layoutNode.capabilityKind)
             lt.v3AppendU32BE(layoutBuf, layoutNode.callConv)
             lt.v3AppendU32BE(layoutBuf, layoutNode.entryFlag)
+            lt.v3AppendU32BE(layoutBuf, layoutNode.exportedFlag)
+            v3CompilerCsgAppendText(layoutBuf, layoutNode.exportSymbolName)
             layoutNode.factCid = lt.v3FixedCidFromBuf(layoutBuf)
             add(nodes, layoutNode)
             let layoutNodeId = layoutNode.nodeId
@@ -996,6 +1139,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             effectNode.capabilityKind = 0
             effectNode.callConv = callConv
             effectNode.entryFlag = entryFlag
+            effectNode.exportedFlag = 0
+            effectNode.exportSymbolName = ""
             var effectBuf: layout.ByteBuf = layout.byteBufInit(256)
             v3CompilerCsgAppendText(effectBuf, "v3.compiler.csg.node")
             lt.v3AppendU32BE(effectBuf, effectNode.nodeKind)
@@ -1008,6 +1153,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             lt.v3AppendU32BE(effectBuf, effectNode.capabilityKind)
             lt.v3AppendU32BE(effectBuf, effectNode.callConv)
             lt.v3AppendU32BE(effectBuf, effectNode.entryFlag)
+            lt.v3AppendU32BE(effectBuf, effectNode.exportedFlag)
+            v3CompilerCsgAppendText(effectBuf, effectNode.exportSymbolName)
             effectNode.factCid = lt.v3FixedCidFromBuf(effectBuf)
             add(nodes, effectNode)
             let effectNodeId = effectNode.nodeId
@@ -1024,6 +1171,8 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             capabilityNode.capabilityKind = capabilityKind
             capabilityNode.callConv = callConv
             capabilityNode.entryFlag = entryFlag
+            capabilityNode.exportedFlag = 0
+            capabilityNode.exportSymbolName = ""
             var capabilityBuf: layout.ByteBuf = layout.byteBufInit(256)
             v3CompilerCsgAppendText(capabilityBuf, "v3.compiler.csg.node")
             lt.v3AppendU32BE(capabilityBuf, capabilityNode.nodeKind)
@@ -1036,10 +1185,13 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             lt.v3AppendU32BE(capabilityBuf, capabilityNode.capabilityKind)
             lt.v3AppendU32BE(capabilityBuf, capabilityNode.callConv)
             lt.v3AppendU32BE(capabilityBuf, capabilityNode.entryFlag)
+            lt.v3AppendU32BE(capabilityBuf, capabilityNode.exportedFlag)
+            v3CompilerCsgAppendText(capabilityBuf, capabilityNode.exportSymbolName)
             capabilityNode.factCid = lt.v3FixedCidFromBuf(capabilityBuf)
             add(nodes, capabilityNode)
             let capabilityNodeId = capabilityNode.nodeId
             v3CompilerCsgAddEdge(edges, symbolNodeId, capabilityNodeId, v3CompilerCsgEdgeKindHasCapability)
+            pendingExportName = ""
         pendingImportc = false
     var out: V3CompilerCsg
     out.version = 1
@@ -1064,6 +1216,7 @@ fn v3CompilerExportSurfaceFromCsg(csg: V3CompilerCsg): V3CsgExportSurface =
     out.version = 1
     out.packageId = csg.packageId
     out.exportedSymbols = []
+    out.exportedTargetNames = []
     out.exportedLayouts = []
     out.exportedEffects = []
     out.exportedCapabilities = []
@@ -1071,9 +1224,10 @@ fn v3CompilerExportSurfaceFromCsg(csg: V3CompilerCsg): V3CsgExportSurface =
         let node = csg.nodes[i]
         if node.nodeKind != v3CompilerCsgNodeKindSymbol:
             continue
-        if !v3CompilerCsgSymbolExported(node.factText, node.entryFlag):
+        if node.exportedFlag == 0:
             continue
         add(out.exportedSymbols, node.symbolText)
+        add(out.exportedTargetNames, node.exportSymbolName)
         add(out.exportedLayouts, node.resultLayoutKind)
         add(out.exportedEffects, node.effectKind)
         add(out.exportedCapabilities, node.capabilityKind)
@@ -1084,6 +1238,7 @@ fn v3CompilerExportSurfaceFromCsg(csg: V3CompilerCsg): V3CsgExportSurface =
     lt.v3AppendU32BE(buf, out.exportedSymbolCount)
     for i in 0..<out.exportedSymbols.len:
         v3CompilerCsgAppendText(buf, out.exportedSymbols[i])
+        v3CompilerCsgAppendText(buf, out.exportedTargetNames[i])
         lt.v3AppendU32BE(buf, out.exportedLayouts[i])
         lt.v3AppendU32BE(buf, out.exportedEffects[i])
         lt.v3AppendU32BE(buf, out.exportedCapabilities[i])
@@ -1098,6 +1253,8 @@ fn v3CompilerExportSurfaceCompatible(base: V3CsgExportSurface,
         return false
     for i in 0..<base.exportedSymbolCount:
         if base.exportedSymbols[i] != next.exportedSymbols[i]:
+            return false
+        if base.exportedTargetNames[i] != next.exportedTargetNames[i]:
             return false
         if base.exportedLayouts[i] != next.exportedLayouts[i]:
             return false
@@ -1183,6 +1340,8 @@ fn v3CompilerCsgNodeReportLine(index: int32,
     out = out + intToStr(node.capabilityKind) + "|"
     out = out + intToStr(node.callConv) + "|"
     out = out + intToStr(node.entryFlag) + "|"
+    out = out + intToStr(node.exportedFlag) + "|"
+    out = out + node.exportSymbolName + "|"
     out = out + layout.fixedBytes32Hex(node.factCid)
     return out
 
@@ -1211,6 +1370,7 @@ fn v3CompilerExportSurfaceReportLine(surface: V3CsgExportSurface,
     var out = ""
     out = out + "export[" + intToStr(index) + "]="
     out = out + surface.exportedSymbols[index] + "|"
+    out = out + surface.exportedTargetNames[index] + "|"
     out = out + intToStr(surface.exportedLayouts[index]) + "|"
     out = out + intToStr(surface.exportedEffects[index]) + "|"
     out = out + intToStr(surface.exportedCapabilities[index])
@@ -1252,6 +1412,7 @@ fn v3CompilerExportSurfaceFromReportText(text: str,
     if !countOk:
         return Err[bool]("v3 compiler csg: invalid exported_count: " + countText)
     out.exportedSymbols = []
+    out.exportedTargetNames = []
     out.exportedLayouts = []
     out.exportedEffects = []
     out.exportedCapabilities = []
@@ -1275,6 +1436,7 @@ fn v3CompilerExportSurfaceFromReportText(text: str,
         var firstSep = -1
         var secondSep = -1
         var thirdSep = -1
+        var fourthSep = -1
         for j in 0..<payload.len:
             if payload[j] != '|':
                 continue
@@ -1287,29 +1449,38 @@ fn v3CompilerExportSurfaceFromReportText(text: str,
             if thirdSep < 0:
                 thirdSep = j
                 continue
+            if fourthSep < 0:
+                fourthSep = j
+                continue
             return Err[bool]("v3 compiler csg: export row has too many separators")
         if firstSep <= 0 || secondSep <= firstSep + 1 || thirdSep <= secondSep + 1 || thirdSep >= payload.len - 1:
-            return Err[bool]("v3 compiler csg: export row separator positions invalid first=" +
-                             intToStr(firstSep) +
-                             " second=" +
-                             intToStr(secondSep) +
-                             " third=" +
-                             intToStr(thirdSep) +
-                             " len=" +
-                             intToStr(payload.len) +
-                             " payload=" +
-                             payload +
-                             " line=" +
-                             line)
+            return Err[bool]("v3 compiler csg: export row separator positions invalid")
         add(out.exportedSymbols, strutil.SliceStr(payload, 0, firstSep - 1))
+        var targetName = ""
         var layoutOk = false
         var effectOk = false
         var capabilityOk = false
-        let layoutValue = v3CompilerCsgParseUintText(strutil.SliceStr(payload, firstSep + 1, secondSep - 1), layoutOk)
-        let effectValue = v3CompilerCsgParseUintText(strutil.SliceStr(payload, secondSep + 1, thirdSep - 1), effectOk)
-        let capabilityValue = v3CompilerCsgParseUintText(strutil.SliceStr(payload, thirdSep + 1, payload.len - 1), capabilityOk)
+        var layoutText = ""
+        var effectText = ""
+        var capabilityText = ""
+        if fourthSep >= 0:
+            if fourthSep <= thirdSep + 1 || fourthSep >= payload.len - 1:
+                return Err[bool]("v3 compiler csg: export row target separator invalid")
+            targetName = strutil.SliceStr(payload, firstSep + 1, secondSep - 1)
+            layoutText = strutil.SliceStr(payload, secondSep + 1, thirdSep - 1)
+            effectText = strutil.SliceStr(payload, thirdSep + 1, fourthSep - 1)
+            capabilityText = strutil.SliceStr(payload, fourthSep + 1, payload.len - 1)
+        else:
+            targetName = v3CompilerCsgTargetExportName(out.exportedSymbols[out.exportedSymbols.len - 1], "", "")
+            layoutText = strutil.SliceStr(payload, firstSep + 1, secondSep - 1)
+            effectText = strutil.SliceStr(payload, secondSep + 1, thirdSep - 1)
+            capabilityText = strutil.SliceStr(payload, thirdSep + 1, payload.len - 1)
+        let layoutValue = v3CompilerCsgParseUintText(layoutText, layoutOk)
+        let effectValue = v3CompilerCsgParseUintText(effectText, effectOk)
+        let capabilityValue = v3CompilerCsgParseUintText(capabilityText, capabilityOk)
         if !layoutOk || !effectOk || !capabilityOk:
             return Err[bool]("v3 compiler csg: export row numeric field invalid")
+        add(out.exportedTargetNames, targetName)
         add(out.exportedLayouts, layoutValue)
         add(out.exportedEffects, effectValue)
         add(out.exportedCapabilities, capabilityValue)

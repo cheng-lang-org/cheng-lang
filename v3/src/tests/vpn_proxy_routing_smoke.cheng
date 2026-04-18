@@ -1,0 +1,54 @@
+import cheng/v3/tooling/vpn_proxy_config as config
+import cheng/v3/tooling/vpn_proxy_routing as routing
+
+fn exitCfg(name: str, host: str, port: int32, serverName: str): config.V3VpnProxyExitConfig =
+    var out: config.V3VpnProxyExitConfig
+    out.name = name
+    out.host = host
+    out.port = port
+    out.serverName = serverName
+    return out
+
+fn main(): int32 =
+    var states: routing.V3VpnProxyExitState[]
+    states = routing.V3VpnProxyInitExitStates([
+        exitCfg("64", "64.176.84.12", 7443, "edge-64.internal"),
+        exitCfg("dmit", "154.26.191.226", 7443, "edge-dmit.internal")
+    ])
+    assert(states.len == 2, "v3 vpn proxy routing init len")
+    assert(states[0].healthy, "v3 vpn proxy routing init healthy")
+    assert(states[0].ewmaMs == 0, "v3 vpn proxy routing init ewma")
+
+    routing.V3VpnProxyMarkSuccess(states[0], 1000, 100)
+    assert(states[0].healthy, "v3 vpn proxy routing first success healthy")
+    assert(states[0].ewmaMs == 100, "v3 vpn proxy routing first success ewma")
+
+    routing.V3VpnProxyMarkSuccess(states[0], 2000, 50)
+    assert(states[0].ewmaMs == 90, "v3 vpn proxy routing ewma update")
+
+    routing.V3VpnProxyMarkProbeFailure(states[0], 3000, "timeout-1")
+    routing.V3VpnProxyMarkProbeFailure(states[0], 4000, "timeout-2")
+    assert(states[0].healthy, "v3 vpn proxy routing two probe failures still healthy")
+    routing.V3VpnProxyMarkProbeFailure(states[0], 5000, "timeout-3")
+    assert(!states[0].healthy, "v3 vpn proxy routing three probe failures unhealthy")
+
+    routing.V3VpnProxyMarkSuccess(states[0], 6000, 70)
+    assert(!states[0].healthy, "v3 vpn proxy routing one recovery success not enough")
+    routing.V3VpnProxyMarkSuccess(states[0], 7000, 60)
+    assert(states[0].healthy, "v3 vpn proxy routing two recovery successes healthy")
+
+    routing.V3VpnProxyRecordOpenFailure(states[1], 10000, "dial-1")
+    assert(states[1].healthy, "v3 vpn proxy routing one open failure still healthy")
+    routing.V3VpnProxyRecordOpenFailure(states[1], 20000, "dial-2")
+    assert(!states[1].healthy, "v3 vpn proxy routing two recent open failures unhealthy")
+
+    routing.V3VpnProxyMarkSuccess(states[1], 21000, 40)
+    routing.V3VpnProxyMarkSuccess(states[1], 22000, 30)
+    assert(states[1].healthy, "v3 vpn proxy routing recover after open failure")
+    assert(states[1].ewmaMs == 38, "v3 vpn proxy routing second ewma")
+
+    assert(routing.V3VpnProxyBestHealthyExit(states, -1) == 1, "v3 vpn proxy routing pick lower ewma")
+    assert(routing.V3VpnProxyBestHealthyExit(states, 1) == 0, "v3 vpn proxy routing exclude first choice")
+
+    echo("v3 vpn_proxy_routing_smoke ok")
+    return 0

@@ -1,7 +1,10 @@
 # std/json (minimal, self-contained)
+import std/system
 import std/strings
 import std/strutils
-import std/seqs
+
+@importc("cheng_seq_set_grow")
+fn json_cheng_seq_set_grow(seqPtr: ptr, idx: int32, elemSize: int32): ptr
 
 type
     JsonNodeKind = enum
@@ -94,9 +97,11 @@ fn jsonString(value: str): JsonNode =
     return newJString(value)
 
 fn jsonAppendNode(seqInst: var JsonNode[], value: JsonNode) =
-    let idx: int32 = seqInst.len
-    seqs.SetLen(seqInst, idx + 1)
-    seqInst[idx] = value
+    let writeAt: int32 = seqInst.len
+    let slot: ptr = json_cheng_seq_set_grow(&seqInst, writeAt, elemSize[JsonNode]())
+    if slot == nil:
+        return
+    store(slot, value)
 
 fn jsonAppendStr(seqInst: var str[], value: str) =
     strutilsAppendStr(seqInst, value)
@@ -172,7 +177,7 @@ fn jsonObjectFieldSlot(node: var JsonNode, key: str): int32 =
             return i
     let idx: int32 = node.okeys.len
     jsonAppendStr(node.okeys, key)
-    seqs.SetLen(node.ovalues, idx + 1)
+    jsonAppendNode(node.ovalues, newJNull())
     return idx
 
 fn `[]`(node: JsonNode, key: str): JsonNode =
@@ -450,17 +455,11 @@ fn pretty(node: JsonNode, indent: int): str =
         return strutils.Join(parts, "")
     return "null"
 
-fn pretty(node: JsonNode): str =
-    return pretty(node, 2)
-
 fn toPretty(node: JsonNode, indent: int): str =
     return pretty(node, indent)
 
-fn toPretty(node: JsonNode): str =
-    return pretty(node, 2)
-
 fn `$`(node: JsonNode): str =
-    return pretty(node)
+    return pretty(node, 2)
 
 fn parseJson(content: str): JsonNode =
     content
@@ -536,62 +535,35 @@ fn GetStr(node: JsonNode, fallback: str): str =
 fn HasKey(node: JsonNode, key: str): bool =
     return hasKey(node, key)
 
+fn JsonGetField(node: JsonNode, key: str): JsonNode =
+    return jsonGetField(node, key)
+
 fn JsonSetField(node: var JsonNode, key: str, value: JsonNode) =
     jsonSetField(node, key, value)
 
-fn JsonSetField(node: var JsonNode, key: str, value: str) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JString
-    boxed.s = value
-    node.ovalues[slot] = boxed
+fn JsonSetFieldStr(node: var JsonNode, key: str, value: str) =
+    var boxed: JsonNode = newJString(value)
+    jsonSetField(node, key, boxed)
 
-fn JsonSetField(node: var JsonNode, key: str, value: bool) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JBool
-    boxed.b = value
-    node.ovalues[slot] = boxed
+fn JsonSetFieldBool(node: var JsonNode, key: str, value: bool) =
+    var boxed: JsonNode = newJBool(value)
+    jsonSetField(node, key, boxed)
 
-fn JsonSetField(node: var JsonNode, key: str, value: int) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JInt
-    boxed.i = int64(value)
-    node.ovalues[slot] = boxed
+fn JsonSetFieldInt(node: var JsonNode, key: str, value: int) =
+    var boxed: JsonNode = newJInt(int64(value))
+    jsonSetField(node, key, boxed)
 
-fn JsonSetField(node: var JsonNode, key: str, value: int32) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JInt
-    boxed.i = int64(value)
-    node.ovalues[slot] = boxed
+fn JsonSetFieldInt32(node: var JsonNode, key: str, value: int32) =
+    var boxed: JsonNode = newJInt(int64(value))
+    jsonSetField(node, key, boxed)
 
-fn JsonSetField(node: var JsonNode, key: str, value: int64) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JInt
-    boxed.i = value
-    node.ovalues[slot] = boxed
+fn JsonSetFieldInt64(node: var JsonNode, key: str, value: int64) =
+    var boxed: JsonNode = newJInt(value)
+    jsonSetField(node, key, boxed)
 
-fn JsonSetField(node: var JsonNode, key: str, value: float64) =
-    let slot: int32 = jsonObjectFieldSlot(node, key)
-    if slot < 0:
-        return
-    var boxed: JsonNode = node.ovalues[slot]
-    boxed.kind = JFloat
-    boxed.f = value
-    node.ovalues[slot] = boxed
+fn JsonSetFieldFloat64(node: var JsonNode, key: str, value: float64) =
+    var boxed: JsonNode = newJFloat(value)
+    jsonSetField(node, key, boxed)
 
 fn NewJBool(value: bool): JsonNode =
     return newJBool(value)
@@ -629,11 +601,5 @@ fn JsonNodeTryGetInt64(node: JsonNode, out: var int64): bool =
 fn Pretty(node: JsonNode, indent: int): str =
     return pretty(node, indent)
 
-fn Pretty(node: JsonNode): str =
-    return pretty(node)
-
 fn ToPretty(node: JsonNode, indent: int): str =
     return toPretty(node, indent)
-
-fn ToPretty(node: JsonNode): str =
-    return toPretty(node)

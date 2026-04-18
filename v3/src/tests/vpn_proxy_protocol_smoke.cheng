@@ -1,0 +1,54 @@
+import std/result
+import std/rawbytes
+import cheng/v3/libp2p/core/types
+import cheng/v3/tooling/vpn_proxy_protocol as proto
+
+fn main(): int32 =
+    assert(proto.V3VpnProxyProtocolId() == types.v3Libp2pProtocolProxyTcp,
+           "v3 vpn proxy protocol id")
+
+    let openWireRes: Result[Bytes] = proto.V3VpnProxyEncodeWire(proto.V3VpnProxyMakeOpenFrame("example.com", 443))
+    assert(!IsErr(openWireRes), "v3 vpn proxy open encode")
+    let openWire: Bytes = Value(openWireRes)
+    let openTryRes: Result[proto.V3VpnProxyFrameTry] = proto.V3VpnProxyTryParseWire(openWire)
+    assert(!IsErr(openTryRes), "v3 vpn proxy open parse")
+    let openTry: proto.V3VpnProxyFrameTry = Value(openTryRes)
+    assert(openTry.ready, "v3 vpn proxy open ready")
+    assert(openTry.usedBytes == bytesLen(openWire), "v3 vpn proxy open used bytes")
+    assert(openTry.frame.kind == proto.V3VpnProxyFrameOpen, "v3 vpn proxy open kind")
+    assert(openTry.frame.host == "example.com", "v3 vpn proxy open host")
+    assert(openTry.frame.port == 443, "v3 vpn proxy open port")
+
+    let partialTryRes: Result[proto.V3VpnProxyFrameTry] = proto.V3VpnProxyTryParseWire(bytesSlice(openWire, 0, 3))
+    assert(!IsErr(partialTryRes), "v3 vpn proxy partial parse")
+    assert(!Value(partialTryRes).ready, "v3 vpn proxy partial not ready")
+
+    let payload: Bytes = bytesFromString("hello")
+    let dataWireRes: Result[Bytes] = proto.V3VpnProxyEncodeWire(proto.V3VpnProxyMakeDataFrame(payload))
+    assert(!IsErr(dataWireRes), "v3 vpn proxy data encode")
+    let dataTryRes: Result[proto.V3VpnProxyFrameTry] = proto.V3VpnProxyTryParseWire(Value(dataWireRes))
+    assert(!IsErr(dataTryRes), "v3 vpn proxy data parse")
+    let dataTry: proto.V3VpnProxyFrameTry = Value(dataTryRes)
+    assert(dataTry.ready, "v3 vpn proxy data ready")
+    assert(dataTry.frame.kind == proto.V3VpnProxyFrameData, "v3 vpn proxy data kind")
+    assert(bytesEqual(dataTry.frame.payload, payload), "v3 vpn proxy data payload")
+
+    let pingWireRes: Result[Bytes] = proto.V3VpnProxyEncodeWire(proto.V3VpnProxyMakePingFrame(123456789))
+    assert(!IsErr(pingWireRes), "v3 vpn proxy ping encode")
+    let pingTryRes: Result[proto.V3VpnProxyFrameTry] = proto.V3VpnProxyTryParseWire(Value(pingWireRes))
+    assert(!IsErr(pingTryRes), "v3 vpn proxy ping parse")
+    let pingTry: proto.V3VpnProxyFrameTry = Value(pingTryRes)
+    assert(pingTry.frame.kind == proto.V3VpnProxyFramePing, "v3 vpn proxy ping kind")
+    assert(pingTry.frame.token == 123456789, "v3 vpn proxy ping token")
+    assert(proto.V3VpnProxyFrameKindText(pingTry.frame.kind) == "PING", "v3 vpn proxy ping text")
+
+    let errWireRes: Result[Bytes] = proto.V3VpnProxyEncodeWire(proto.V3VpnProxyMakeErrorFrame("boom"))
+    assert(!IsErr(errWireRes), "v3 vpn proxy error encode")
+    let errTryRes: Result[proto.V3VpnProxyFrameTry] = proto.V3VpnProxyTryParseWire(Value(errWireRes))
+    assert(!IsErr(errTryRes), "v3 vpn proxy error parse")
+    let errTry: proto.V3VpnProxyFrameTry = Value(errTryRes)
+    assert(errTry.frame.kind == proto.V3VpnProxyFrameError, "v3 vpn proxy error kind")
+    assert(errTry.frame.text == "boom", "v3 vpn proxy error text")
+
+    echo("v3 vpn_proxy_protocol_smoke ok")
+    return 0

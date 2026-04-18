@@ -1,8 +1,8 @@
 import std/result
-import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/path as v3path
 import cheng/v3/lang/parser as parser
 import cheng/v3/backend/build_plan as buildplan
 
@@ -213,6 +213,21 @@ fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
         add(missing, "runtime_provider_modules_not_selected")
     return missing
 
+fn v3SystemLinkPlanSourceHasLegacyFuncAlias(sourcePath: str): bool =
+    if len(sourcePath) <= 0 || !parser.v3ParserSourceExists(sourcePath):
+        return false
+    let lines = strutil.Split(v3path.V3ReadTextFile("", sourcePath), '\n')
+    for i in 0..<lines.len:
+        if strutil.StartsWith(strutil.Strip(lines[i]), "func "):
+            return true
+    return false
+
+fn v3SystemLinkPlanClosureHasLegacyFuncAlias(sourceClosurePaths: str[]): bool =
+    for i in 0..<sourceClosurePaths.len:
+        if v3SystemLinkPlanSourceHasLegacyFuncAlias(sourceClosurePaths[i]):
+            return true
+    return false
+
 fn v3BuildSystemLinkPlanStub(rootDir: str,
                              req: creq.V3CompilerRequest,
                              plan: var V3SystemLinkPlanStub,
@@ -244,12 +259,14 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
         else:
             crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackProgram, providerModules)
     let entrySymbol = v3SystemLinkPlanDeriveEntrySymbol(parsed, requestEmitKind)
-    let missing = v3SystemLinkPlanMissingReasons(parsed,
+    var missing = v3SystemLinkPlanMissingReasons(parsed,
                                                  requestEmitKind,
                                                  requestTargetTriple,
                                                  runtimeTargets,
                                                  providerModules,
                                                  entrySymbol)
+    if v3SystemLinkPlanClosureHasLegacyFuncAlias(parsed.orderedClosureSourcePaths):
+        add(missing, "legacy_func_alias_unsupported")
     let linkMode = buildplan.v3BackendBuildPlanDefaultLinkMode()
     let buildSourceUnitCount = buildplan.v3BackendBuildPlanDefaultSourceUnitCount()
     let parsedWorkspaceRoot = parser.v3ParsedSourceWorkspaceRoot(parsed)

@@ -1,17 +1,22 @@
 # TCP syscall helpers (minimal loopback client/server transport).
 
-import std/system as sys
 import std/result
 import std/rawbytes
 import std/os as os
 import std/strings
 import std/net/transports/udp_syscall as udp
 
+@importc("cheng_v3_tcp_connect_host_port_bridge")
+fn cheng_v3_tcp_connect_host_port_bridge(hostText: str, port: int32): int32
+@importc("cheng_v3_fd_set_nonblocking_bridge")
+fn cheng_v3_fd_set_nonblocking_bridge(fd: int32, enabled: int32): int32
+
 const
     tcpAfInet = 2
     tcpAfInet6Linux = 10
     tcpAfInet6Bsd = 30
     tcpSockStream = 1
+    tcpShutdownWr = 1
     tcpShutdownRdWr = 2
 
 type
@@ -31,22 +36,26 @@ fn tcpErrno(): int32 =
     return os.UdpErrno()
 
 fn tcpErrText(code: int32): str =
-    return os.UdpErrText(code)
+    let text: str = os.udpErrText(code)
+    return text
+
+fn tcpWouldBlock(code: int32): bool =
+    return code == 11 || code == 35
 
 fn tcpSocketOpenStream(isV6: bool): Result[int32] =
     if !isV6:
-        let fd: int32 = sys.socket(tcpAfInet, tcpSockStream, 0)
+        let fd: int32 = os.UdpOpenSocket(tcpAfInet, tcpSockStream, 0)
         if fd < 0:
             let errCode: int32 = tcpErrno()
             return Err[int32]("tcp syscall: socket failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
         return Ok[int32](fd)
 
-    let fdLinux: int32 = sys.socket(tcpAfInet6Linux, tcpSockStream, 0)
+    let fdLinux: int32 = os.UdpOpenSocket(tcpAfInet6Linux, tcpSockStream, 0)
     if fdLinux >= 0:
         return Ok[int32](fdLinux)
     let errLinux: int32 = tcpErrno()
 
-    let fdBsd: int32 = sys.socket(tcpAfInet6Bsd, tcpSockStream, 0)
+    let fdBsd: int32 = os.UdpOpenSocket(tcpAfInet6Bsd, tcpSockStream, 0)
     if fdBsd >= 0:
         return Ok[int32](fdBsd)
     let errBsd: int32 = tcpErrno()
@@ -76,7 +85,7 @@ fn tcpGetSockName(fd: int32, out: var TcpSockAddr): Result[bool] =
         return Err[bool]("tcp syscall: invalid socket")
     let rawAddr: Bytes = bytesAlloc(128)
     var rawLen: int32 = bytesLen(rawAddr)
-    let rc: int32 = sys.getsockname(fd, rawAddr.data, &rawLen)
+    let rc: int32 = os.udpGetSockNameFd(fd, rawAddr, rawLen)
     if rc != 0 || rawLen <= 0:
         let errCode: int32 = tcpErrno()
         return Err[bool]("tcp syscall: getsockname failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
@@ -94,12 +103,12 @@ fn tcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHand
     if IsErr(addrRes):
         let _ = os.UdpCloseFd(fd)
         return Err[TcpListenerHandle](Error(addrRes))
-    let bindRes: int32 = sys.bind(fd, addr.data, addr.len)
+    let bindRes: int32 = os.udpBindFd(fd, addr.data, addr.len)
     if bindRes != 0:
         let errCode: int32 = tcpErrno()
         let _ = os.UdpCloseFd(fd)
         return Err[TcpListenerHandle]("tcp syscall: bind failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
-    let listenRes: int32 = sys.listen(fd, 16)
+    let listenRes: int32 = os.TcpListenFd(fd, 16)
     if listenRes != 0:
         let errCode: int32 = tcpErrno()
         let _ = os.UdpCloseFd(fd)
@@ -116,14 +125,56 @@ fn tcpListenerClose(listener: var TcpListenerHandle) =
         let _ = os.UdpCloseFd(listener.fd)
         listener.fd = -1
 
+fn tcpListenerSetNonblocking(listener: TcpListenerHandle, enabled: bool): Result[bool] =
+    if listener.fd < 0:
+        return Err[bool]("tcp syscall: invalid listener")
+    let enabledCode: int32 = if enabled: 1 else: 0
+    let rc: int32 = cheng_v3_fd_set_nonblocking_bridge(listener.fd, enabledCode)
+    if rc != 0:
+        let errCode: int32 = tcpErrno()
+        return Err[bool]("tcp syscall: listener nonblocking failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    return Ok[bool](true)
+
 fn tcpAccept(listener: TcpListenerHandle): Result[TcpConnectionHandle] =
     if listener.fd < 0:
         return Err[TcpConnectionHandle]("tcp syscall: invalid listener")
     let rawAddr: Bytes = bytesAlloc(128)
     var rawLen: int32 = bytesLen(rawAddr)
-    let fd: int32 = sys.accept(listener.fd, rawAddr.data, &rawLen)
+    let fd: int32 = os.TcpAcceptFd(listener.fd, rawAddr, rawLen)
     if fd < 0:
         let errCode: int32 = tcpErrno()
+        return Err[TcpConnectionHandle]("tcp syscall: accept failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    if rawLen > bytesLen(rawAddr):
+        rawLen = bytesLen(rawAddr)
+    var remoteAddr: TcpSockAddr
+    let remoteRes: Result[bool] = tcpSockAddrDecode(rawAddr, rawLen, remoteAddr)
+    if IsErr(remoteRes):
+        let _ = os.UdpCloseFd(fd)
+        return Err[TcpConnectionHandle](Error(remoteRes))
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
+    if IsErr(localRes):
+        let _ = os.UdpCloseFd(fd)
+        return Err[TcpConnectionHandle](Error(localRes))
+    return Ok[TcpConnectionHandle](
+        TcpConnectionHandle(
+            fd: fd,
+            localAddr: localAddr,
+            remoteAddr: remoteAddr,
+            open: true
+        )
+    )
+
+fn tcpAcceptNonblocking(listener: TcpListenerHandle): Result[TcpConnectionHandle] =
+    if listener.fd < 0:
+        return Err[TcpConnectionHandle]("tcp syscall: invalid listener")
+    let rawAddr: Bytes = bytesAlloc(128)
+    var rawLen: int32 = bytesLen(rawAddr)
+    let fd: int32 = os.TcpAcceptFd(listener.fd, rawAddr, rawLen)
+    if fd < 0:
+        let errCode: int32 = tcpErrno()
+        if tcpWouldBlock(errCode):
+            return Err[TcpConnectionHandle]("tcp syscall: would block")
         return Err[TcpConnectionHandle]("tcp syscall: accept failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
     if rawLen > bytesLen(rawAddr):
         rawLen = bytesLen(rawAddr)
@@ -155,8 +206,8 @@ fn tcpConnect(host: str, port: int32, isV6: bool = false): Result[TcpConnectionH
     let remoteRes: Result[bool] = tcpSockAddrFromHostPort(host, port, remoteAddr, isV6)
     if IsErr(remoteRes):
         let _ = os.UdpCloseFd(fd)
-        return Err[TcpConnectionHandle](Error(remoteRes))
-    let connectRes: int32 = sys.connect(fd, remoteAddr.data, remoteAddr.len)
+        return tcpConnectResolved(host, port)
+    let connectRes: int32 = os.TcpConnectFd(fd, remoteAddr.data, remoteAddr.len)
     if connectRes != 0:
         let errCode: int32 = tcpErrno()
         let _ = os.UdpCloseFd(fd)
@@ -175,6 +226,31 @@ fn tcpConnect(host: str, port: int32, isV6: bool = false): Result[TcpConnectionH
         )
     )
 
+fn tcpConnectResolved(host: str, port: int32): Result[TcpConnectionHandle] =
+    let fd: int32 = cheng_v3_tcp_connect_host_port_bridge(host, port)
+    if fd < 0:
+        return Err[TcpConnectionHandle]("tcp syscall: resolve connect failed: " + host + ":" + intToStr(port))
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
+    if IsErr(localRes):
+        let _ = os.UdpCloseFd(fd)
+        return Err[TcpConnectionHandle](Error(localRes))
+    var remoteAddr: TcpSockAddr
+    remoteAddr.data = emptyBytes()
+    remoteAddr.len = 0
+    remoteAddr.family = 0
+    remoteAddr.isV6 = strings.StrContains(host, ":")
+    remoteAddr.host = host
+    remoteAddr.port = port
+    return Ok[TcpConnectionHandle](
+        TcpConnectionHandle(
+            fd: fd,
+            localAddr: localAddr,
+            remoteAddr: remoteAddr,
+            open: true
+        )
+    )
+
 fn tcpSend(conn: var TcpConnectionHandle, data: Bytes): Result[int32] =
     if !conn.open || conn.fd < 0:
         return Err[int32]("tcp syscall: connection closed")
@@ -184,12 +260,26 @@ fn tcpSend(conn: var TcpConnectionHandle, data: Bytes): Result[int32] =
     var sentTotal: int32 = 0
     while sentTotal < totalLen:
         let chunk: Bytes = bytesSliceView(data, sentTotal, totalLen - sentTotal)
-        let sent: int32 = sys.send(conn.fd, chunk.data, bytesLen(chunk), 0)
+        let sent: int32 = os.TcpSendFd(conn.fd, chunk, 0)
         if sent <= 0:
             let errCode: int32 = tcpErrno()
             return Err[int32]("tcp syscall: send failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
         sentTotal = sentTotal + sent
     return Ok[int32](sentTotal)
+
+fn tcpSendNonblocking(conn: var TcpConnectionHandle, data: Bytes): Result[int32] =
+    if !conn.open || conn.fd < 0:
+        return Err[int32]("tcp syscall: connection closed")
+    let totalLen: int32 = bytesLen(data)
+    if totalLen <= 0:
+        return Ok[int32](0)
+    let sent: int32 = os.TcpSendFd(conn.fd, data, 0)
+    if sent < 0:
+        let errCode: int32 = tcpErrno()
+        if tcpWouldBlock(errCode):
+            return Ok[int32](0)
+        return Err[int32]("tcp syscall: send failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    return Ok[int32](sent)
 
 fn tcpRecv(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
     if !conn.open || conn.fd < 0:
@@ -197,7 +287,7 @@ fn tcpRecv(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
     if maxBytes <= 0:
         return Ok[Bytes](emptyBytes())
     let out: Bytes = bytesAlloc(maxBytes)
-    let got: int32 = sys.recv(conn.fd, out.data, maxBytes, 0)
+    let got: int32 = os.TcpRecvFd(conn.fd, out, 0)
     if got < 0:
         let errCode: int32 = tcpErrno()
         return Err[Bytes]("tcp syscall: recv failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
@@ -205,9 +295,45 @@ fn tcpRecv(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
         return Ok[Bytes](emptyBytes())
     return Ok[Bytes](bytesSlice(out, 0, got))
 
+fn tcpRecvNonblocking(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
+    if !conn.open || conn.fd < 0:
+        return Err[Bytes]("tcp syscall: connection closed")
+    if maxBytes <= 0:
+        return Ok[Bytes](emptyBytes())
+    let out: Bytes = bytesAlloc(maxBytes)
+    let got: int32 = os.TcpRecvFd(conn.fd, out, 0)
+    if got < 0:
+        let errCode: int32 = tcpErrno()
+        if tcpWouldBlock(errCode):
+            return Err[Bytes]("tcp syscall: would block")
+        return Err[Bytes]("tcp syscall: recv failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    if got == 0:
+        return Ok[Bytes](emptyBytes())
+    return Ok[Bytes](bytesSlice(out, 0, got))
+
+fn tcpSetNonblocking(conn: TcpConnectionHandle, enabled: bool): Result[bool] =
+    if conn.fd < 0:
+        return Err[bool]("tcp syscall: invalid connection")
+    let enabledCode: int32 = if enabled: 1 else: 0
+    let rc: int32 = cheng_v3_fd_set_nonblocking_bridge(conn.fd, enabledCode)
+    if rc != 0:
+        let errCode: int32 = tcpErrno()
+        return Err[bool]("tcp syscall: connection nonblocking failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    return Ok[bool](true)
+
+fn tcpShutdownWrite(conn: var TcpConnectionHandle): Result[bool] =
+    if !conn.open || conn.fd < 0:
+        return Err[bool]("tcp syscall: connection closed")
+    let rc: int32 = os.TcpShutdownFd(conn.fd, tcpShutdownWr)
+    if rc != 0:
+        let errCode: int32 = tcpErrno()
+        return Err[bool]("tcp syscall: shutdown write failed: " + tcpErrText(errCode) + " (" + intToStr(errCode) + ")")
+    return Ok[bool](true)
+
 fn tcpClose(conn: var TcpConnectionHandle) =
     if conn.fd >= 0:
-        let _ = sys.shutdown(conn.fd, tcpShutdownRdWr)
+        let closeRc: int32 = os.TcpShutdownFd(conn.fd, tcpShutdownRdWr)
+        closeRc
         let _ = os.UdpCloseFd(conn.fd)
     conn.fd = -1
     conn.open = false
@@ -215,8 +341,41 @@ fn tcpClose(conn: var TcpConnectionHandle) =
 fn TcpConnect(host: str, port: int32, isV6: bool = false): Result[TcpConnectionHandle] =
     return tcpConnect(host, port, isV6)
 
+fn TcpConnectResolved(host: str, port: int32): Result[TcpConnectionHandle] =
+    return tcpConnectResolved(host, port)
+
 fn TcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHandle] =
     return tcpListen(host, port, isV6)
 
 fn TcpListenerClose(listener: var TcpListenerHandle) =
     tcpListenerClose(listener)
+
+fn TcpListenerSetNonblocking(listener: TcpListenerHandle, enabled: bool): Result[bool] =
+    return tcpListenerSetNonblocking(listener, enabled)
+
+fn TcpAccept(listener: TcpListenerHandle): Result[TcpConnectionHandle] =
+    return tcpAccept(listener)
+
+fn TcpAcceptNonblocking(listener: TcpListenerHandle): Result[TcpConnectionHandle] =
+    return tcpAcceptNonblocking(listener)
+
+fn TcpSetNonblocking(conn: TcpConnectionHandle, enabled: bool): Result[bool] =
+    return tcpSetNonblocking(conn, enabled)
+
+fn TcpSend(conn: var TcpConnectionHandle, data: Bytes): Result[int32] =
+    return tcpSend(conn, data)
+
+fn TcpSendNonblocking(conn: var TcpConnectionHandle, data: Bytes): Result[int32] =
+    return tcpSendNonblocking(conn, data)
+
+fn TcpRecv(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
+    return tcpRecv(conn, maxBytes)
+
+fn TcpRecvNonblocking(conn: var TcpConnectionHandle, maxBytes: int32): Result[Bytes] =
+    return tcpRecvNonblocking(conn, maxBytes)
+
+fn TcpClose(conn: var TcpConnectionHandle) =
+    tcpClose(conn)
+
+fn TcpShutdownWrite(conn: var TcpConnectionHandle): Result[bool] =
+    return tcpShutdownWrite(conn)

@@ -1,0 +1,199 @@
+import std/os
+import std/result
+import std/strutils as strutil
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/vpn_proxy_json as json
+
+type
+    V3VpnProxyIdentityConfig =
+        listen: str
+        certDer: str
+        certChainDer: str[]
+        keyPk8Der: str
+        trustRootDer: str
+        trustRootsDer: str[]
+
+    V3VpnProxyExitConfig =
+        name: str
+        host: str
+        port: int32
+        serverName: str
+
+    V3VpnProxyConfig =
+        configPath: str
+        configDir: str
+        client: V3VpnProxyIdentityConfig
+        server: V3VpnProxyIdentityConfig
+        exits: V3VpnProxyExitConfig[]
+
+fn v3VpnProxyIdentityZero(): V3VpnProxyIdentityConfig =
+    var out: V3VpnProxyIdentityConfig
+    out.listen = ""
+    out.certDer = ""
+    out.certChainDer = []
+    out.keyPk8Der = ""
+    out.trustRootDer = ""
+    out.trustRootsDer = []
+    return out
+
+fn v3VpnProxyExitZero(): V3VpnProxyExitConfig =
+    var out: V3VpnProxyExitConfig
+    out.name = ""
+    out.host = ""
+    out.port = 0
+    out.serverName = ""
+    return out
+
+fn v3VpnProxyConfigZero(): V3VpnProxyConfig =
+    var out: V3VpnProxyConfig
+    out.configPath = ""
+    out.configDir = ""
+    out.client = v3VpnProxyIdentityZero()
+    out.server = v3VpnProxyIdentityZero()
+    out.exits = []
+    return out
+
+fn v3VpnProxyJsonRequiredStr(node: json.JsonNode, key: str): Result[str] =
+    if !json.IsObject(node):
+        return Err[str]("vpn proxy config: missing string field: " + key)
+    if !json.HasKey(node, key):
+        return Err[str]("vpn proxy config: missing string field: " + key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
+    if !json.IsString(value):
+        return Err[str]("vpn proxy config: missing string field: " + key)
+    let text: str = strutil.Strip(json.GetStr(value))
+    if len(text) <= 0:
+        return Err[str]("vpn proxy config: empty string field: " + key)
+    return Ok[str](text)
+
+fn v3VpnProxyJsonOptionalStr(node: json.JsonNode, key: str): Result[str] =
+    if !json.IsObject(node):
+        return Ok[str]("")
+    if !json.HasKey(node, key):
+        return Ok[str]("")
+    let value: json.JsonNode = json.JsonGetField(node, key)
+    if !json.IsString(value):
+        return Err[str]("vpn proxy config: invalid string field: " + key)
+    return Ok[str](strutil.Strip(json.GetStr(value)))
+
+fn v3VpnProxyJsonRequiredInt(node: json.JsonNode, key: str): Result[int32] =
+    if !json.IsObject(node):
+        return Err[int32]("vpn proxy config: missing integer field: " + key)
+    if !json.HasKey(node, key):
+        return Err[int32]("vpn proxy config: missing integer field: " + key)
+    let value: json.JsonNode = json.JsonGetField(node, key)
+    if !json.IsInt(value):
+        return Err[int32]("vpn proxy config: missing integer field: " + key)
+    return Ok[int32](int32(json.GetInt(value)))
+
+fn v3VpnProxyJsonOptionalStringArray(node: json.JsonNode, key: str): str[] =
+    var out: str[] = []
+    if !json.IsObject(node):
+        return out
+    if !json.HasKey(node, key):
+        return out
+    let arr: json.JsonNode = json.JsonGetField(node, key)
+    if !json.IsArray(arr):
+        return out
+    for i in 0..<arr.a.len:
+        let item: json.JsonNode = arr.a[i]
+        if !json.IsString(item):
+            continue
+        let text: str = strutil.Strip(json.GetStr(item))
+        if len(text) > 0:
+            add(out, text)
+    return out
+
+fn v3VpnProxyParseIdentity(node: json.JsonNode,
+                           key: str): Result[V3VpnProxyIdentityConfig] =
+    if !json.IsObject(node):
+        return Ok[V3VpnProxyIdentityConfig](v3VpnProxyIdentityZero())
+    if !json.HasKey(node, key):
+        return Ok[V3VpnProxyIdentityConfig](v3VpnProxyIdentityZero())
+    let child: json.JsonNode = json.JsonGetField(node, key)
+    if !json.IsObject(child):
+        return Err[V3VpnProxyIdentityConfig]("vpn proxy config: invalid object field: " + key)
+    var out: V3VpnProxyIdentityConfig = v3VpnProxyIdentityZero()
+    let listenRes: Result[str] = v3VpnProxyJsonOptionalStr(child, "listen")
+    if IsErr(listenRes):
+        return Err[V3VpnProxyIdentityConfig](ErrorText(listenRes))
+    out.listen = Value(listenRes)
+    let certRes: Result[str] = v3VpnProxyJsonOptionalStr(child, "cert_der")
+    if IsErr(certRes):
+        return Err[V3VpnProxyIdentityConfig](ErrorText(certRes))
+    out.certDer = Value(certRes)
+    let keyRes: Result[str] = v3VpnProxyJsonOptionalStr(child, "key_pk8_der")
+    if IsErr(keyRes):
+        return Err[V3VpnProxyIdentityConfig](ErrorText(keyRes))
+    out.keyPk8Der = Value(keyRes)
+    let trustRootRes: Result[str] = v3VpnProxyJsonOptionalStr(child, "trust_root_der")
+    if IsErr(trustRootRes):
+        return Err[V3VpnProxyIdentityConfig](ErrorText(trustRootRes))
+    out.trustRootDer = Value(trustRootRes)
+    out.certChainDer = v3VpnProxyJsonOptionalStringArray(child, "cert_chain_der")
+    out.trustRootsDer = v3VpnProxyJsonOptionalStringArray(child, "trust_roots_der")
+    return Ok[V3VpnProxyIdentityConfig](out)
+
+fn v3VpnProxyParseConfigText(configPath: str,
+                             configText: str): Result[V3VpnProxyConfig] =
+    let parseRes: json.ParseResult = json.ParseJsonSafe(configText)
+    if !parseRes.ok:
+        return Err[V3VpnProxyConfig]("vpn proxy config: " + parseRes.error)
+    let root: json.JsonNode = parseRes.value
+    if !json.IsObject(root):
+        return Err[V3VpnProxyConfig]("vpn proxy config: root must be object")
+    var out: V3VpnProxyConfig = v3VpnProxyConfigZero()
+    out.configPath = configPath
+    let parts: os.SplitFileResult = os.SplitFile(configPath)
+    out.configDir = parts.dir
+    let clientRes: Result[V3VpnProxyIdentityConfig] = v3VpnProxyParseIdentity(root, "client")
+    if IsErr(clientRes):
+        return Err[V3VpnProxyConfig](ErrorText(clientRes))
+    out.client = Value(clientRes)
+    let serverRes: Result[V3VpnProxyIdentityConfig] = v3VpnProxyParseIdentity(root, "server")
+    if IsErr(serverRes):
+        return Err[V3VpnProxyConfig](ErrorText(serverRes))
+    out.server = Value(serverRes)
+    if json.HasKey(root, "exits"):
+        let exitsNode: json.JsonNode = json.JsonGetField(root, "exits")
+        if !json.IsArray(exitsNode):
+            return Err[V3VpnProxyConfig]("vpn proxy config: exits must be array")
+        for i in 0..<exitsNode.a.len:
+            let item: json.JsonNode = exitsNode.a[i]
+            if !json.IsObject(item):
+                return Err[V3VpnProxyConfig]("vpn proxy config: invalid exits[] entry")
+            var entry: V3VpnProxyExitConfig = v3VpnProxyExitZero()
+            let nameRes: Result[str] = v3VpnProxyJsonRequiredStr(item, "name")
+            if IsErr(nameRes):
+                return Err[V3VpnProxyConfig](ErrorText(nameRes))
+            entry.name = Value(nameRes)
+            let hostRes: Result[str] = v3VpnProxyJsonRequiredStr(item, "host")
+            if IsErr(hostRes):
+                return Err[V3VpnProxyConfig](ErrorText(hostRes))
+            entry.host = Value(hostRes)
+            let portRes: Result[int32] = v3VpnProxyJsonRequiredInt(item, "port")
+            if IsErr(portRes):
+                return Err[V3VpnProxyConfig](ErrorText(portRes))
+            entry.port = Value(portRes)
+            let serverNameRes: Result[str] = v3VpnProxyJsonRequiredStr(item, "server_name")
+            if IsErr(serverNameRes):
+                return Err[V3VpnProxyConfig](ErrorText(serverNameRes))
+            entry.serverName = Value(serverNameRes)
+            add(out.exits, entry)
+    for i in 0..<out.exits.len:
+        let entry: V3VpnProxyExitConfig = out.exits[i]
+        if len(entry.name) <= 0 || len(entry.host) <= 0 || entry.port <= 0 || len(entry.serverName) <= 0:
+            return Err[V3VpnProxyConfig]("vpn proxy config: invalid exits[] entry")
+    return Ok[V3VpnProxyConfig](out)
+
+fn V3VpnProxyParseConfigTextForTest(configText: str): Result[V3VpnProxyConfig] =
+    return v3VpnProxyParseConfigText("/tmp/vpn_proxy_config_test.json", configText)
+
+fn V3VpnProxyLoadConfig(configPathRaw: str): Result[V3VpnProxyConfig] =
+    if len(configPathRaw) <= 0:
+        return Err[V3VpnProxyConfig]("vpn proxy: missing --config")
+    let configPath: str = v3path.V3PathAbsolute("", configPathRaw)
+    let configText: str = v3path.V3ReadTextFile("", configPath)
+    if len(configText) <= 0:
+        return Err[V3VpnProxyConfig]("vpn proxy: failed to read config: " + configPath)
+    return v3VpnProxyParseConfigText(configPath, configText)

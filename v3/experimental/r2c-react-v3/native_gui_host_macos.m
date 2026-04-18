@@ -6,6 +6,7 @@
 @property(nonatomic, strong) NSDictionary *renderPlanDoc;
 @property(nonatomic, strong) NSDictionary *runtimeStateDoc;
 @property(nonatomic, strong) NSArray *renderCommands;
+@property(nonatomic, strong) NSMutableDictionary *imageCache;
 @property(nonatomic, assign) CGFloat sessionWidth;
 @property(nonatomic, assign) CGFloat sessionHeight;
 @property(nonatomic, assign) CGFloat contentHeight;
@@ -118,6 +119,91 @@ static BOOL R2CParsePairSpec(NSString *text, NSString *separator, CGFloat *outA,
 
 static NSString *R2CTrimmedText(NSString *text) {
     return [R2CString(text) stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+}
+
+static NSString *R2CClipText(NSString *text, NSUInteger limit) {
+    NSString *value = R2CTrimmedText(text);
+    if ([value length] <= limit) return value;
+    if (limit <= 1) return @"";
+    return [[value substringToIndex:limit - 1] stringByAppendingString:@"…"];
+}
+
+static NSString *R2CExtractAngleTagLabel(NSString *text) {
+    NSString *value = R2CTrimmedText(text);
+    if (![value hasPrefix:@"<"]) return @"";
+    NSRange close = [value rangeOfString:@">"];
+    if (close.location == NSNotFound || close.location <= 1) return @"";
+    NSString *tag = [value substringWithRange:NSMakeRange(1, close.location - 1)];
+    NSRange space = [tag rangeOfString:@" "];
+    if (space.location != NSNotFound) {
+        tag = [tag substringToIndex:space.location];
+    }
+    if ([tag hasPrefix:@"/"]) tag = [tag substringFromIndex:1];
+    return R2CTrimmedText(tag);
+}
+
+static NSString *R2CExtractNodeTrailingText(NSString *text) {
+    NSString *value = R2CTrimmedText(text);
+    NSRange close = [value rangeOfString:@">"];
+    if (close.location == NSNotFound) return @"";
+    return R2CTrimmedText([value substringFromIndex:close.location + 1]);
+}
+
+static BOOL R2COnlyBooleanTokens(NSString *text) {
+    NSString *value = R2CTrimmedText(text);
+    if ([value length] == 0) return NO;
+    NSArray<NSString *> *tokens = [value componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    BOOL sawToken = NO;
+    NSSet<NSString *> *allowed = [NSSet setWithArray:@[@"false", @"true", @"null", @"undefined"]];
+    for (NSString *rawToken in tokens) {
+        NSString *token = [[R2CTrimmedText(rawToken) lowercaseString] copy];
+        if ([token length] == 0) continue;
+        sawToken = YES;
+        if (![allowed containsObject:token]) return NO;
+    }
+    return sawToken;
+}
+
+static BOOL R2CLooksLikeDisplayText(NSString *text) {
+    NSString *value = R2CTrimmedText(text);
+    if ([value length] == 0) return NO;
+    if ([value isEqualToString:@"false"] || [value isEqualToString:@"true"]) return NO;
+    if (R2COnlyBooleanTokens(value)) return NO;
+    if ([value hasPrefix:@"."]) return NO;
+    if ([value hasPrefix:@"@"]) return NO;
+    if ([value hasPrefix:@"<"]) return NO;
+    return YES;
+}
+
+static NSString *R2CCompactDebugDetailText(NSString *text) {
+    NSString *value = R2CTrimmedText(text);
+    if ([value length] == 0) return @"";
+    NSArray<NSString *> *tokens = [value componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSMutableArray<NSString *> *kept = [NSMutableArray array];
+    NSSet<NSString *> *drop = [NSSet setWithArray:@[@"component", @"element", @"event", @"inline", @"scroll", @"button"]];
+    for (NSString *rawToken in tokens) {
+        NSString *token = R2CTrimmedText(rawToken);
+        if ([token length] == 0) continue;
+        if ([drop containsObject:[token lowercaseString]]) continue;
+        [kept addObject:token];
+        if ([kept count] >= 4) break;
+    }
+    if ([kept count] == 0) return @"";
+    return R2CClipText([kept componentsJoinedByString:@" · "], 42);
+}
+
+static CGFloat R2CDeterministicWidthFraction(NSString *seedText, NSInteger index) {
+    NSString *seed = R2CString(seedText);
+    unsigned long long hash = 1469598103934665603ULL;
+    NSData *data = [seed dataUsingEncoding:NSUTF8StringEncoding];
+    const unsigned char *bytes = (const unsigned char *)[data bytes];
+    for (NSUInteger i = 0; i < [data length]; i += 1) {
+        hash ^= (unsigned long long)bytes[i];
+        hash *= 1099511628211ULL;
+    }
+    hash ^= (unsigned long long)(index + 1) * 97ULL;
+    CGFloat frac = 0.52 + (CGFloat)(hash % 33ULL) / 100.0;
+    return R2CClamp(frac, 0.52, 0.84);
 }
 
 static NSString *R2CJoinedPreview(NSArray *items, NSUInteger limit) {
@@ -619,6 +705,32 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     return @"content";
 }
 
+- (NSString *)homeTruthContentTimestampLabel {
+    NSDate *date = [NSDate dateWithTimeIntervalSinceNow:-(15.0 * 60.0)];
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [[NSLocale alloc] initWithLocaleIdentifier:@"zh_CN"];
+    formatter.dateFormat = @"M月d日 HH:mm";
+    return [formatter stringFromDate:date] ?: @"";
+}
+
+- (NSString *)homeTruthContentPosterSVGText {
+    return [
+        @"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"960\" height=\"1280\" viewBox=\"0 0 960 1280\">"
+         "<defs>"
+         "<linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">"
+         "<stop offset=\"0%\" stop-color=\"#8B5CF6\"/>"
+         "<stop offset=\"100%\" stop-color=\"#111827\"/>"
+         "</linearGradient>"
+         "</defs>"
+         "<rect width=\"960\" height=\"1280\" fill=\"url(#bg)\"/>"
+         "<circle cx=\"760\" cy=\"220\" r=\"180\" fill=\"rgba(255,255,255,0.12)\"/>"
+         "<circle cx=\"240\" cy=\"980\" r=\"220\" fill=\"rgba(255,255,255,0.08)\"/>"
+         "<text x=\"96\" y=\"1040\" fill=\"#ffffff\" font-family=\"Arial, sans-serif\" font-size=\"88\" font-weight=\"700\">"
+         "UniMaker Content"
+         "</text>"
+         "</svg>" copy];
+}
+
 - (NSDictionary *)buildHomeShellRenderPlanDocForState:(NSDictionary *)stateDoc {
     NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
     NSString *routeState = R2CString(stateDoc[@"route_state"]);
@@ -738,16 +850,15 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         @{@"key": @"ride", @"label": @"顺风车"},
     ];
     NSString *activeCategory = [self homeActiveCategoryForRouteState:routeState];
-    CGFloat chipX = 10.0;
+    CGFloat chipX = 12.0;
     CGFloat chipTop = headerHeight + 8.0;
     CGFloat chipHeight = 30.0;
-    CGFloat chipReservedRight = 54.0;
-    CGFloat chipFontSize = 12.0;
+    CGFloat chipReservedRight = 70.0;
     for (NSDictionary *tabSpec in tabSpecs) {
         NSString *key = R2CString(tabSpec[@"key"]);
         NSString *label = R2CString(tabSpec[@"label"]);
         BOOL showBadge = [key isEqualToString:@"app"] && !isAppChannel;
-        CGFloat chipWidth = MAX(42.0, [self measuredTextWidth:label fontSize:chipFontSize weightText:@"medium"] + 18.0 + (showBadge ? 18.0 : 0.0));
+        CGFloat chipWidth = MAX(44.0, [self measuredTextWidth:label fontSize:13.0 weightText:@"medium"] + (showBadge ? 36.0 : 22.0));
         if (chipX + chipWidth > windowWidth - chipReservedRight) break;
         BOOL active = [key isEqualToString:activeCategory];
         [commands addObject:@{
@@ -767,35 +878,32 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
             @"text": label,
             @"x": @(chipX),
             @"y": @(surfaceY(chipTop, chipHeight)),
-            @"width": @(showBadge ? chipWidth - 12.0 : chipWidth),
+            @"width": @(chipWidth),
             @"height": @(chipHeight),
-            @"font_size": @(chipFontSize),
+            @"font_size": @13,
             @"font_weight": @"medium",
             @"text_color": active ? @"#ffffff" : @"#6b7280",
             @"align": @"center",
             @"z_index": @4,
         }];
         if (showBadge) {
-            CGFloat badgeSize = 18.0;
-            CGFloat badgeX = chipX + chipWidth - badgeSize - 6.0;
-            CGFloat badgeTop = chipTop + 6.0;
             [commands addObject:@{
                 @"type": @"rounded_rect",
-                @"x": @(badgeX),
-                @"y": @(surfaceY(badgeTop, badgeSize)),
-                @"width": @(badgeSize),
-                @"height": @(badgeSize),
-                @"corner_radius": @(badgeSize * 0.5),
+                @"x": @(chipX + chipWidth - 22.0),
+                @"y": @(surfaceY(chipTop + 4.0, 18.0)),
+                @"width": @18,
+                @"height": @18,
+                @"corner_radius": @9,
                 @"background_color": @"#ef4444",
                 @"z_index": @5,
             }];
             [commands addObject:@{
                 @"type": @"text_label",
                 @"text": @"7",
-                @"x": @(badgeX),
-                @"y": @(surfaceY(badgeTop, badgeSize)),
-                @"width": @(badgeSize),
-                @"height": @(badgeSize),
+                @"x": @(chipX + chipWidth - 22.0),
+                @"y": @(surfaceY(chipTop + 4.0, 18.0)),
+                @"width": @18,
+                @"height": @18,
                 @"font_size": @10,
                 @"font_weight": @"bold",
                 @"text_color": @"#ffffff",
@@ -1194,10 +1302,10 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
             @"z_index": @23,
         }];
         NSArray<NSDictionary *> *managerTabs = @[
-            @{@"key": @"app", @"label": @"应用"},
             @{@"key": @"content", @"label": @"内容"},
             @{@"key": @"product", @"label": @"电商"},
             @{@"key": @"live", @"label": @"直播"},
+            @{@"key": @"app", @"label": @"应用"},
             @{@"key": @"food", @"label": @"外卖"},
             @{@"key": @"ride", @"label": @"顺风车"},
             @{@"key": @"job", @"label": @"求职"},
@@ -1206,6 +1314,7 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
             @{@"key": @"sell", @"label": @"出售"},
             @{@"key": @"secondhand", @"label": @"二手"},
             @{@"key": @"crowdfunding", @"label": @"众筹"},
+            @{@"key": @"ad", @"label": @"广告"},
         ];
         CGFloat gridGap = 12.0;
         CGFloat cellWidth = floor((windowWidth - 16.0 * 2.0 - gridGap * 3.0) / 4.0);
@@ -1291,10 +1400,1844 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     };
 }
 
+- (NSDictionary *)buildHomeContentDetailRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth > 0.0 ? self.sessionWidth : 390.0);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight > 0.0 ? self.sessionHeight : 844.0);
+    CGFloat headerHeight = 56.0;
+    CGFloat heroHeight = floor(MIN(windowWidth * (1280.0 / 960.0), windowHeight * 0.60));
+    CGFloat detailTop = headerHeight + heroHeight;
+    CGFloat bottomBarHeight = 56.0;
+    NSString *timestampLabel = [self homeTruthContentTimestampLabel];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @0,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(headerHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"svg_image",
+        @"x": @0,
+        @"y": @(headerHeight),
+        @"width": @(windowWidth),
+        @"height": @(heroHeight),
+        @"svg_text": [self homeTruthContentPosterSVGText],
+        @"content_mode": @"cover",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(detailTop),
+        @"width": @(windowWidth),
+        @"height": @(MAX(0.0, windowHeight - detailTop)),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"arrow-left",
+        @"x": @16,
+        @"y": @17,
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @52,
+        @"y": @18,
+        @"width": @(windowWidth - 140.0),
+        @"height": @20,
+        @"text": @"UniMaker 节点",
+        @"font_size": @14,
+        @"font_weight": @"medium",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @(windowWidth - 78.0),
+        @"y": @16,
+        @"width": @62,
+        @"height": @24,
+        @"corner_radius": @12,
+        @"background_color": @"#ef4444",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"user-plus",
+        @"x": @(windowWidth - 70.0),
+        @"y": @22,
+        @"width": @12,
+        @"height": @12,
+        @"color": @"#ffffff",
+        @"stroke_width": @1.7,
+        @"z_index": @4,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"关注",
+        @"x": @(windowWidth - 55.0),
+        @"y": @17,
+        @"width": @34,
+        @"height": @24,
+        @"font_size": @12,
+        @"font_weight": @"medium",
+        @"text_color": @"#ffffff",
+        @"align": @"left",
+        @"z_index": @4,
+    }];
+
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @(detailTop + 16.0),
+        @"width": @(windowWidth - 32.0),
+        @"height": @50,
+        @"text": @"通过 cheng-libp2p 发布的示例内容，用于原生\nAndroid 与 React 真值截图对齐。",
+        @"font_size": @15,
+        @"font_weight": @"regular",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @(detailTop + 74.0),
+        @"width": @(windowWidth - 32.0),
+        @"height": @16,
+        @"text": timestampLabel,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @(detailTop + 105.0),
+        @"width": @(windowWidth - 32.0),
+        @"height": @16,
+        @"text": @"128 点赞    32 评论",
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(detailTop + 128.0),
+        @"width": @(windowWidth),
+        @"height": @8,
+        @"corner_radius": @0,
+        @"background_color": @"#f9fafb",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @(detailTop + 156.0),
+        @"width": @(windowWidth - 32.0),
+        @"height": @20,
+        @"text": @"评论区",
+        @"font_size": @14,
+        @"font_weight": @"medium",
+        @"text_color": @"#1f2937",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(windowHeight - bottomBarHeight),
+        @"width": @(windowWidth),
+        @"height": @(bottomBarHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(windowHeight - bottomBarHeight),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @6,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @14,
+        @"y": @(windowHeight - 44.0),
+        @"width": @(windowWidth - 136.0),
+        @"height": @34,
+        @"corner_radius": @17,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @6,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"说点什么...",
+        @"x": @30,
+        @"y": @(windowHeight - 44.0),
+        @"width": @(windowWidth - 168.0),
+        @"height": @34,
+        @"font_size": @14,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"left",
+        @"z_index": @7,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"heart",
+        @"x": @(windowWidth - 82.0),
+        @"y": @(windowHeight - 42.0),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#6b7280",
+        @"stroke_width": @1.8,
+        @"z_index": @7,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"128",
+        @"x": @(windowWidth - 86.0),
+        @"y": @(windowHeight - 18.0),
+        @"width": @30,
+        @"height": @12,
+        @"font_size": @10,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"center",
+        @"z_index": @7,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"flag",
+        @"x": @(windowWidth - 42.0),
+        @"y": @(windowHeight - 42.0),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#6b7280",
+        @"stroke_width": @1.8,
+        @"z_index": @7,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"举报",
+        @"x": @(windowWidth - 48.0),
+        @"y": @(windowHeight - 18.0),
+        @"width": @34,
+        @"height": @12,
+        @"font_size": @10,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"center",
+        @"z_index": @7,
+    }];
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": R2CString(stateDoc[@"route_state"]),
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(windowHeight),
+        @"scroll_height": @(0),
+        @"scroll_offset_y": @(0),
+        @"visible_layout_item_count": @0,
+        @"selected_item_id": @"",
+        @"focused_item_id": @"",
+        @"typed_text": @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
+- (BOOL)isGenericPreviewChromeItem:(NSDictionary *)item {
+    NSString *itemId = R2CString(item[@"id"]);
+    return [itemId isEqualToString:@"root"]
+        || [itemId isEqualToString:@"header"]
+        || [itemId isEqualToString:@"meta_component"]
+        || [itemId isEqualToString:@"meta_surface"];
+}
+
+- (NSString *)genericSurfaceTitleForLayoutItem:(NSDictionary *)item {
+    NSString *text = R2CString(item[@"text"]);
+    NSString *trailing = R2CExtractNodeTrailingText(text);
+    if (R2CLooksLikeDisplayText(trailing)) return R2CClipText(trailing, 32);
+    if (R2CLooksLikeDisplayText(text)) return R2CClipText(text, 32);
+    NSString *tag = R2CExtractAngleTagLabel(text);
+    if ([tag length] > 0) return R2CClipText(tag, 32);
+    NSString *detail = R2CCompactDebugDetailText(item[@"detail_text"]);
+    if ([detail length] > 0) return R2CClipText(detail, 32);
+    return R2CClipText(R2CString(item[@"kind"]), 32);
+}
+
+- (NSString *)genericSurfaceSubtitleForLayoutItem:(NSDictionary *)item title:(NSString *)title {
+    NSString *detail = R2CCompactDebugDetailText(item[@"detail_text"]);
+    NSString *visualRole = R2CTrimmedText(item[@"visual_role"]);
+    NSString *tag = R2CExtractAngleTagLabel(item[@"text"]);
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if ([detail length] > 0) [parts addObject:detail];
+    if ([parts count] == 0 && [visualRole length] > 0 && ![[visualRole lowercaseString] isEqualToString:@"inline"]) {
+        [parts addObject:visualRole];
+    }
+    if ([parts count] == 0
+        && [tag length] > 0
+        && ![[[tag lowercaseString] copy] isEqualToString:[[R2CString(title) lowercaseString] copy]]) {
+        [parts addObject:tag];
+    }
+    if ([parts count] == 0) return @"";
+    return R2CClipText([parts componentsJoinedByString:@" · "], 48);
+}
+
+- (BOOL)shouldSkipGenericSurfaceItem:(NSDictionary *)item {
+    if ([self isGenericPreviewChromeItem:item]) return YES;
+    NSString *itemId = R2CString(item[@"id"]);
+    if ([itemId isEqualToString:@"node_mount_root"]) return YES;
+    if (R2CBool(item[@"interactive"], NO)) return NO;
+    NSString *kind = [[R2CString(item[@"kind"]) lowercaseString] copy];
+    NSString *visualRole = [[R2CString(item[@"visual_role"]) lowercaseString] copy];
+    NSString *title = [self genericSurfaceTitleForLayoutItem:item];
+    NSString *subtitle = [self genericSurfaceSubtitleForLayoutItem:item title:title];
+    NSString *tag = [[R2CExtractAngleTagLabel(item[@"text"]) lowercaseString] copy];
+    NSSet<NSString *> *wrapperTags = [NSSet setWithArray:@[@"div", @"span", @"main", @"section", @"article", @"header", @"footer"]];
+    NSSet<NSString *> *primitiveTags = [NSSet setWithArray:@[@"svg", @"line", @"path", @"circle", @"rect", @"g", @"defs", @"stop", @"polygon", @"polyline", @"use"]];
+    if ([kind isEqualToString:@"tree_fragment"]) return YES;
+    if ([primitiveTags containsObject:tag]) return YES;
+    if ([tag isEqualToString:@"button"]
+        && [[[R2CString(title) lowercaseString] copy] isEqualToString:@"button"]
+        && [subtitle length] == 0) {
+        return YES;
+    }
+    if ([visualRole isEqualToString:@"inline"] && [title length] == 0 && [subtitle length] == 0) return YES;
+    if ([wrapperTags containsObject:tag]
+        && [subtitle length] == 0) {
+        return YES;
+    }
+    return NO;
+}
+
+- (CGFloat)genericSurfaceTopTrim {
+    CGFloat firstContentY = CGFLOAT_MAX;
+    for (id rawItem in [self nativeLayoutItems]) {
+        if (![rawItem isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *item = (NSDictionary *)rawItem;
+        if ([self isGenericPreviewChromeItem:item]) continue;
+        if ([self shouldSkipGenericSurfaceItem:item]) continue;
+        CGFloat itemY = R2CCGFloat(item[@"y"], 0.0);
+        if (itemY < firstContentY) firstContentY = itemY;
+    }
+    if (firstContentY == CGFLOAT_MAX) return 0.0;
+    CGFloat desiredTop = 74.0;
+    if (firstContentY <= desiredTop) return 0.0;
+    return firstContentY - desiredTop;
+}
+
+- (BOOL)isGenericPlaceholderTitle:(NSString *)title {
+    NSString *trimmed = [[R2CTrimmedText(title) lowercaseString] copy];
+    if ([trimmed length] == 0) return YES;
+    NSSet<NSString *> *placeholders = [NSSet setWithArray:@[
+        @"div", @"span", @"section", @"article", @"header", @"footer", @"main",
+        @"button", @"input", @"img", @"audio", @"svg", @"path", @"circle",
+        @"line", @"polygon", @"polyline", @"rect", @"g", @"defs", @"stop",
+        @"map()", @"&&", @"<>"
+    ]];
+    return [placeholders containsObject:trimmed];
+}
+
+- (NSString *)meaningfulTitleForLayoutItem:(NSDictionary *)item {
+    NSString *title = [self genericSurfaceTitleForLayoutItem:item];
+    if ([self isGenericPlaceholderTitle:title]) return @"";
+    return title;
+}
+
+- (NSArray<NSString *> *)visibleMeaningfulControlTitlesForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSString *> *titles = [NSMutableArray array];
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    for (id rawItem in [self nativeLayoutItems]) {
+        if (![rawItem isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *item = (NSDictionary *)rawItem;
+        if (![self itemVisibleForState:stateDoc item:item]) continue;
+        if (!R2CBool(item[@"interactive"], NO)) continue;
+        NSString *kind = [[R2CString(item[@"kind"]) lowercaseString] copy];
+        NSString *visualRole = [[R2CString(item[@"visual_role"]) lowercaseString] copy];
+        BOOL controlLike = [visualRole isEqualToString:@"control"]
+            || [visualRole isEqualToString:@"overlay"]
+            || [kind containsString:@"button"]
+            || [kind containsString:@"input"];
+        if (!controlLike) continue;
+        NSString *title = [self meaningfulTitleForLayoutItem:item];
+        if ([title length] == 0) continue;
+        if ([seen containsObject:title]) continue;
+        [seen addObject:title];
+        [titles addObject:title];
+    }
+    return titles;
+}
+
+- (NSString *)firstVisibleMeaningfulTextForState:(NSDictionary *)stateDoc
+                                 preferredNeedles:(NSArray<NSString *> *)preferredNeedles
+                                         fallback:(NSString *)fallback {
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    for (id rawItem in [self nativeLayoutItems]) {
+        if (![rawItem isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *item = (NSDictionary *)rawItem;
+        if (![self itemVisibleForState:stateDoc item:item]) continue;
+        NSString *title = [self meaningfulTitleForLayoutItem:item];
+        if ([title length] == 0) continue;
+        [candidates addObject:title];
+    }
+    for (NSString *needle in preferredNeedles) {
+        NSString *lowerNeedle = [[R2CString(needle) lowercaseString] copy];
+        if ([lowerNeedle length] == 0) continue;
+        for (NSString *candidate in candidates) {
+            NSString *lowerCandidate = [[candidate lowercaseString] copy];
+            if ([lowerCandidate containsString:lowerNeedle]) return candidate;
+        }
+    }
+    if ([preferredNeedles count] == 0 && [candidates count] > 0) return candidates[0];
+    return R2CString(fallback);
+}
+
+- (NSString *)chatPlaceholderSVGText {
+    return @"<svg width=\"88\" height=\"88\" xmlns=\"http://www.w3.org/2000/svg\" stroke=\"#000\" stroke-linejoin=\"round\" opacity=\".3\" fill=\"none\" stroke-width=\"3.7\"><rect x=\"16\" y=\"16\" width=\"56\" height=\"56\" rx=\"6\"/><path d=\"m16 58 16-18 32 32\"/><circle cx=\"53\" cy=\"35\" r=\"7\"/></svg>";
+}
+
+- (NSString *)currentShortTimeLabel {
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    formatter.timeZone = [NSTimeZone localTimeZone];
+    formatter.dateFormat = @"HH:mm";
+    return R2CString([formatter stringFromDate:[NSDate date]]);
+}
+
+- (void)appendPrimaryBottomNavCommandsForActiveLabel:(NSString *)activeLabel
+                                         windowWidth:(CGFloat)windowWidth
+                                        windowHeight:(CGFloat)windowHeight
+                                            commands:(NSMutableArray<NSDictionary *> *)commands {
+    CGFloat navHeight = 68.0;
+    CGFloat navTop = windowHeight - navHeight;
+    CGFloat columnWidth = floor(windowWidth / 5.0);
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(navTop),
+        @"width": @(windowWidth),
+        @"height": @(navHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @20,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(navTop),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @21,
+    }];
+    NSArray<NSDictionary *> *navSpecs = @[
+        @{@"label": @"首页", @"index": @0},
+        @{@"label": @"消息", @"index": @1},
+        @{@"label": @"节点", @"index": @3},
+        @{@"label": @"我", @"index": @4},
+    ];
+    NSString *active = R2CString(activeLabel);
+    for (NSDictionary *navSpec in navSpecs) {
+        NSInteger index = R2CInteger(navSpec[@"index"], 0);
+        NSString *label = R2CString(navSpec[@"label"]);
+        CGFloat navX = columnWidth * index;
+        BOOL isActive = [label isEqualToString:active];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": label,
+            @"x": @(navX),
+            @"y": @(navTop + 10.0),
+            @"width": @(columnWidth),
+            @"height": @42,
+            @"font_size": @18,
+            @"font_weight": @"regular",
+            @"text_color": isActive ? @"#a855f7" : @"#4b5563",
+            @"align": @"center",
+            @"z_index": @22,
+        }];
+    }
+    CGFloat plusColumnX = columnWidth * 2.0;
+    CGFloat plusCircleX = plusColumnX + floor((columnWidth - 40.0) * 0.5);
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @(plusCircleX),
+        @"y": @(navTop + 6.0),
+        @"width": @40,
+        @"height": @40,
+        @"corner_radius": @20,
+        @"background_color": @"#a855f7",
+        @"z_index": @23,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"plus",
+        @"x": @(plusCircleX + 9.0),
+        @"y": @(navTop + 15.0),
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#ffffff",
+        @"stroke_width": @3.0,
+        @"z_index": @24,
+    }];
+}
+
+- (NSDictionary *)buildMessagesTabShellRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
+    CGFloat contentHeight = R2CCGFloat(stateDoc[@"content_height"], self.contentHeight);
+    CGFloat scrollHeight = R2CCGFloat(stateDoc[@"scroll_height"], [self maxScrollOffset]);
+    CGFloat scrollOffsetY = R2CCGFloat(stateDoc[@"scroll_offset_y"], self.scrollOffsetY);
+    NSString *selectedItemId = R2CString(stateDoc[@"selected_item_id"]);
+    NSString *focusedItemId = R2CString(stateDoc[@"focused_item_id"]);
+    NSString *typedText = R2CString(stateDoc[@"typed_text"]);
+
+    NSString *pageTitle = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                   preferredNeedles:@[@"消息"]
+                                                           fallback:@"消息"];
+    NSArray<NSString *> *controlTitles = [self visibleMeaningfulControlTitlesForState:stateDoc];
+    NSMutableArray<NSString *> *chipLabels = [NSMutableArray array];
+    for (NSString *title in controlTitles) {
+        if ([title isEqualToString:@"展开侧边栏"]) continue;
+        if ([title isEqualToString:@"删除"]) continue;
+        [chipLabels addObject:title];
+        if ([chipLabels count] >= 4) break;
+    }
+    if ([chipLabels count] == 0) {
+        [chipLabels addObjectsFromArray:@[@"会话", @"通讯录", @"朋友圈", @"通知"]];
+    }
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @0,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @98,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"menu",
+        @"x": @16,
+        @"y": @14,
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": pageTitle,
+        @"x": @56,
+        @"y": @12,
+        @"width": @(windowWidth - 72.0),
+        @"height": @24,
+        @"font_size": @16,
+        @"font_weight": @"semibold",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @16,
+        @"y": @56,
+        @"width": @(windowWidth - 32.0),
+        @"height": @34,
+        @"corner_radius": @12,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @2,
+    }];
+
+    CGFloat chipAreaX = 20.0;
+    CGFloat chipAreaY = 60.0;
+    CGFloat chipAreaWidth = windowWidth - 40.0;
+    CGFloat chipWidth = floor(chipAreaWidth / MAX(1.0, (CGFloat)[chipLabels count]));
+    for (NSUInteger index = 0; index < [chipLabels count]; index += 1) {
+        BOOL active = index == 0;
+        CGFloat x = chipAreaX + chipWidth * (CGFloat)index;
+        CGFloat width = (index == [chipLabels count] - 1) ? (chipAreaX + chipAreaWidth - x) : chipWidth;
+        if (active) {
+            [commands addObject:@{
+                @"type": @"rounded_rect",
+                @"x": @(x),
+                @"y": @(chipAreaY),
+                @"width": @(width),
+                @"height": @26,
+                @"corner_radius": @10,
+                @"background_color": @"#ffffff",
+                @"z_index": @3,
+            }];
+        }
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": chipLabels[index],
+            @"x": @(x),
+            @"y": @(chipAreaY),
+            @"width": @(width),
+            @"height": @26,
+            @"font_size": @12,
+            @"font_weight": @"medium",
+            @"text_color": active ? @"#a855f7" : @"#6b7280",
+            @"align": @"center",
+            @"z_index": @4,
+        }];
+    }
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @98,
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+
+    CGFloat rowTop = 99.0;
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(rowTop),
+        @"width": @(windowWidth),
+        @"height": @64,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"ASI 助手",
+        @"x": @16,
+        @"y": @(rowTop + 10.0),
+        @"width": @(windowWidth - 96.0),
+        @"height": @18,
+        @"font_size": @14,
+        @"font_weight": @"medium",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @78,
+        @"y": @(rowTop + 10.0),
+        @"width": @18,
+        @"height": @18,
+        @"corner_radius": @9,
+        @"background_color": @"#ef4444",
+        @"z_index": @4,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"1",
+        @"x": @78,
+        @"y": @(rowTop + 10.0),
+        @"width": @18,
+        @"height": @18,
+        @"font_size": @10,
+        @"font_weight": @"medium",
+        @"text_color": @"#ffffff",
+        @"align": @"center",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"1分钟前",
+        @"x": @(windowWidth - 82.0),
+        @"y": @(rowTop + 10.0),
+        @"width": @54,
+        @"height": @18,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"right",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"我是 ASI (Artificial Super Intelligence) 助手。我可以帮助您处理各种任务，请随时吩咐。",
+        @"x": @16,
+        @"y": @(rowTop + 30.0),
+        @"width": @(windowWidth - 48.0),
+        @"height": @18,
+        @"font_size": @13,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @">",
+        @"x": @(windowWidth - 24.0),
+        @"y": @(rowTop + 18.0),
+        @"width": @12,
+        @"height": @20,
+        @"font_size": @18,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"center",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(rowTop + 63.0),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @2,
+    }];
+
+    [self appendPrimaryBottomNavCommandsForActiveLabel:@"消息"
+                                           windowWidth:windowWidth
+                                          windowHeight:windowHeight
+                                              commands:commands];
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": R2CString(stateDoc[@"route_state"]),
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(contentHeight),
+        @"scroll_height": @(scrollHeight),
+        @"scroll_offset_y": @(scrollOffsetY),
+        @"visible_layout_item_count": @((NSInteger)R2CInteger(stateDoc[@"visible_layout_item_count"], 0)),
+        @"selected_item_id": selectedItemId ?: @"",
+        @"focused_item_id": focusedItemId ?: @"",
+        @"typed_text": typedText ?: @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
+- (NSDictionary *)buildNodesTabShellRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
+    CGFloat contentHeight = R2CCGFloat(stateDoc[@"content_height"], self.contentHeight);
+    CGFloat scrollHeight = R2CCGFloat(stateDoc[@"scroll_height"], [self maxScrollOffset]);
+    CGFloat scrollOffsetY = R2CCGFloat(stateDoc[@"scroll_offset_y"], self.scrollOffsetY);
+    NSString *selectedItemId = R2CString(stateDoc[@"selected_item_id"]);
+    NSString *focusedItemId = R2CString(stateDoc[@"focused_item_id"]);
+    NSString *typedText = R2CString(stateDoc[@"typed_text"]);
+
+    NSString *statusTitle = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                     preferredNeedles:@[@"在网计算资源"]
+                                                             fallback:@"在网计算资源"];
+    NSString *statusCount = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                     preferredNeedles:@[@"在线节点:"]
+                                                             fallback:@"在线节点: 1"];
+    NSString *emptyTitle = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                    preferredNeedles:@[@"暂无可展示节点"]
+                                                            fallback:@"暂无可展示节点"];
+    NSString *emptySubtitle = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                       preferredNeedles:@[@"节点将从网络自动发现"]
+                                                               fallback:@"节点将从网络自动发现或从聊天自动沉淀"];
+    NSString *runtimeErrorText = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                          preferredNeedles:@[@"attempt_"]
+                                                                  fallback:@""];
+    NSString *runtimeStartingText = [self firstVisibleMeaningfulTextForState:stateDoc
+                                                             preferredNeedles:@[@"runtime starting"]
+                                                                     fallback:@""];
+    NSArray<NSString *> *controlTitles = [self visibleMeaningfulControlTitlesForState:stateDoc];
+    NSMutableArray<NSString *> *filterLabels = [NSMutableArray array];
+    for (NSString *title in controlTitles) {
+        if ([title isEqualToString:@"展开侧边栏"]) continue;
+        if ([title isEqualToString:@"搜索节点"]) continue;
+        if ([title isEqualToString:@"多选建群"]) continue;
+        [filterLabels addObject:title];
+        if ([filterLabels count] >= 6) break;
+    }
+    if ([filterLabels count] == 0) {
+        [filterLabels addObjectsFromArray:@[@"全部", @"mDNS", @"DHT", @"直连", @"LAN", @"WAN"]];
+    }
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @0,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @58,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @57,
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"menu",
+        @"x": @16,
+        @"y": @14,
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"search",
+        @"x": @(windowWidth - 72.0),
+        @"y": @14,
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"users",
+        @"x": @(windowWidth - 40.0),
+        @"y": @14,
+        @"width": @22,
+        @"height": @22,
+        @"color": @"#111827",
+        @"stroke_width": @1.8,
+        @"z_index": @3,
+    }];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @16,
+        @"y": @64,
+        @"width": @(windowWidth - 32.0),
+        @"height": @42,
+        @"corner_radius": @14,
+        @"background_color": @"#f5f3ff",
+        @"border_color": @"#ede9fe",
+        @"line_width": @1.0,
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": statusTitle,
+        @"x": @28,
+        @"y": @76,
+        @"width": @(windowWidth - 156.0),
+        @"height": @16,
+        @"font_size": @14,
+        @"font_weight": @"semibold",
+        @"text_color": @"#1f2937",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": statusCount,
+        @"x": @(windowWidth - 140.0),
+        @"y": @76,
+        @"width": @92,
+        @"height": @16,
+        @"font_size": @12,
+        @"font_weight": @"medium",
+        @"text_color": @"#a855f7",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @">",
+        @"x": @(windowWidth - 28.0),
+        @"y": @75,
+        @"width": @12,
+        @"height": @18,
+        @"font_size": @18,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"center",
+        @"z_index": @3,
+    }];
+
+    CGFloat chipX = 16.0;
+    CGFloat chipY = 116.0;
+    for (NSUInteger index = 0; index < [filterLabels count]; index += 1) {
+        NSString *label = filterLabels[index];
+        BOOL active = index == 0;
+        CGFloat width = [self measuredTextWidth:label fontSize:12.0 weightText:@"medium"] + 22.0;
+        if (chipX + width > windowWidth - 16.0) break;
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @(chipX),
+            @"y": @(chipY),
+            @"width": @(width),
+            @"height": @24,
+            @"corner_radius": @12,
+            @"background_color": active ? @"#a855f7" : @"#f3f4f6",
+            @"z_index": @2,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": label,
+            @"x": @(chipX),
+            @"y": @(chipY),
+            @"width": @(width),
+            @"height": @24,
+            @"font_size": @12,
+            @"font_weight": @"medium",
+            @"text_color": active ? @"#ffffff" : @"#6b7280",
+            @"align": @"center",
+            @"z_index": @3,
+        }];
+        chipX += width + 8.0;
+    }
+
+    CGFloat bannerTop = 148.0;
+    if ([runtimeErrorText length] > 0) {
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @16,
+            @"y": @(bannerTop),
+            @"width": @(windowWidth - 32.0),
+            @"height": @32,
+            @"corner_radius": @8,
+            @"background_color": @"#fef2f2",
+            @"border_color": @"#fee2e2",
+            @"line_width": @1.0,
+            @"z_index": @2,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": runtimeErrorText,
+            @"x": @24,
+            @"y": @(bannerTop + 6.0),
+            @"width": @(windowWidth - 48.0),
+            @"height": @20,
+            @"font_size": @12,
+            @"font_weight": @"regular",
+            @"text_color": @"#dc2626",
+            @"align": @"left",
+            @"z_index": @3,
+        }];
+        bannerTop += 42.0;
+    }
+    if ([runtimeStartingText length] > 0) {
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @16,
+            @"y": @(bannerTop),
+            @"width": @(windowWidth - 32.0),
+            @"height": @32,
+            @"corner_radius": @8,
+            @"background_color": @"#fffbeb",
+            @"border_color": @"#fef3c7",
+            @"line_width": @1.0,
+            @"z_index": @2,
+        }];
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"text": runtimeStartingText,
+            @"x": @24,
+            @"y": @(bannerTop + 6.0),
+            @"width": @(windowWidth - 48.0),
+            @"height": @20,
+            @"font_size": @12,
+            @"font_weight": @"regular",
+            @"text_color": @"#b45309",
+            @"align": @"left",
+            @"z_index": @3,
+        }];
+        bannerTop += 42.0;
+    }
+
+    CGFloat emptyStateTop = MAX(360.0, bannerTop + 156.0);
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"activity",
+        @"x": @(floor((windowWidth - 48.0) * 0.5)),
+        @"y": @(emptyStateTop),
+        @"width": @48,
+        @"height": @48,
+        @"color": @"#d1d5db",
+        @"stroke_width": @2.4,
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": emptyTitle,
+        @"x": @32,
+        @"y": @(emptyStateTop + 60.0),
+        @"width": @(windowWidth - 64.0),
+        @"height": @22,
+        @"font_size": @14,
+        @"font_weight": @"medium",
+        @"text_color": @"#9ca3af",
+        @"align": @"center",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": emptySubtitle,
+        @"x": @40,
+        @"y": @(emptyStateTop + 87.0),
+        @"width": @(windowWidth - 80.0),
+        @"height": @18,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#c0c4cc",
+        @"align": @"center",
+        @"z_index": @2,
+    }];
+
+    [self appendPrimaryBottomNavCommandsForActiveLabel:@"节点"
+                                           windowWidth:windowWidth
+                                          windowHeight:windowHeight
+                                              commands:commands];
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": R2CString(stateDoc[@"route_state"]),
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(contentHeight),
+        @"scroll_height": @(scrollHeight),
+        @"scroll_offset_y": @(scrollOffsetY),
+        @"visible_layout_item_count": @((NSInteger)R2CInteger(stateDoc[@"visible_layout_item_count"], 0)),
+        @"selected_item_id": selectedItemId ?: @"",
+        @"focused_item_id": focusedItemId ?: @"",
+        @"typed_text": typedText ?: @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
+- (NSDictionary *)buildMessageThreadShellRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
+    CGFloat contentHeight = R2CCGFloat(stateDoc[@"content_height"], self.contentHeight);
+    CGFloat scrollHeight = R2CCGFloat(stateDoc[@"scroll_height"], [self maxScrollOffset]);
+    CGFloat scrollOffsetY = R2CCGFloat(stateDoc[@"scroll_offset_y"], self.scrollOffsetY);
+    NSString *selectedItemId = R2CString(stateDoc[@"selected_item_id"]);
+    NSString *focusedItemId = R2CString(stateDoc[@"focused_item_id"]);
+    NSString *typedText = R2CString(stateDoc[@"typed_text"]);
+    NSString *inputPlaceholder = @"输入消息...";
+    NSString *timeLabel = [self currentShortTimeLabel];
+    NSString *placeholderSVG = [self chatPlaceholderSVGText];
+    CGFloat bubbleWidth = MIN(windowWidth - 88.0, 222.0);
+    CGFloat appCardWidth = MIN(windowWidth - 88.0, 226.0);
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @0,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @64,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @63,
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"arrow-left",
+        @"x": @14,
+        @"y": @19,
+        @"width": @24,
+        @"height": @24,
+        @"color": @"#111827",
+        @"stroke_width": @2.0,
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @50,
+        @"y": @12,
+        @"width": @40,
+        @"height": @40,
+        @"corner_radius": @20,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"svg_image",
+        @"x": @58,
+        @"y": @20,
+        @"width": @24,
+        @"height": @24,
+        @"svg_text": placeholderSVG,
+        @"content_mode": @"fit",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"ASI 助手",
+        @"x": @102,
+        @"y": @11,
+        @"width": @(windowWidth - 118.0),
+        @"height": @18,
+        @"font_size": @16,
+        @"font_weight": @"semibold",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"节点直连会话",
+        @"x": @102,
+        @"y": @30,
+        @"width": @(windowWidth - 118.0),
+        @"height": @14,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"等待建链",
+        @"x": @102,
+        @"y": @44,
+        @"width": @(windowWidth - 118.0),
+        @"height": @14,
+        @"font_size": @11,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @16,
+        @"y": @80,
+        @"width": @40,
+        @"height": @40,
+        @"corner_radius": @20,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"svg_image",
+        @"x": @24,
+        @"y": @88,
+        @"width": @24,
+        @"height": @24,
+        @"svg_text": placeholderSVG,
+        @"content_mode": @"fit",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @64,
+        @"y": @80,
+        @"width": @(bubbleWidth),
+        @"height": @70,
+        @"corner_radius": @20,
+        @"background_color": @"#ffffff",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"我是 ASI (Artificial Super Intelligence) 助手。我可以帮助您处理各种任务，请随时吩咐。",
+        @"x": @76,
+        @"y": @92,
+        @"width": @(bubbleWidth - 24.0),
+        @"height": @46,
+        @"font_size": @13,
+        @"font_weight": @"regular",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"line_break_mode": @"word_wrap",
+        @"vertical_align": @"top",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": timeLabel,
+        @"x": @64,
+        @"y": @153,
+        @"width": @42,
+        @"height": @16,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"left",
+        @"z_index": @2,
+    }];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @16,
+        @"y": @184,
+        @"width": @40,
+        @"height": @40,
+        @"corner_radius": @20,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"svg_image",
+        @"x": @24,
+        @"y": @192,
+        @"width": @24,
+        @"height": @24,
+        @"svg_text": placeholderSVG,
+        @"content_mode": @"fit",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @64,
+        @"y": @184,
+        @"width": @(appCardWidth),
+        @"height": @174,
+        @"corner_radius": @14,
+        @"background_color": @"#ffffff",
+        @"border_color": @"#e5e7eb",
+        @"line_width": @1.0,
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"linear_gradient_rect",
+        @"x": @64,
+        @"y": @184,
+        @"width": @(appCardWidth),
+        @"height": @80,
+        @"start_color": @"#eef2ff",
+        @"end_color": @"#faf5ff",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"🀄",
+        @"x": @(64.0 + floor((appCardWidth - 44.0) * 0.5)),
+        @"y": @202,
+        @"width": @44,
+        @"height": @44,
+        @"font_size": @34,
+        @"font_weight": @"regular",
+        @"text_color": @"#111827",
+        @"align": @"center",
+        @"z_index": @4,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"中国象棋",
+        @"x": @82,
+        @"y": @278,
+        @"width": @96,
+        @"height": @18,
+        @"font_size": @14,
+        @"font_weight": @"medium",
+        @"text_color": @"#111827",
+        @"align": @"left",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"[应用邀请] 中国象棋",
+        @"x": @82,
+        @"y": @298,
+        @"width": @(appCardWidth - 32.0),
+        @"height": @18,
+        @"font_size": @11,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"房间ID：truth-room",
+        @"x": @82,
+        @"y": @320,
+        @"width": @(appCardWidth - 32.0),
+        @"height": @14,
+        @"font_size": @11,
+        @"font_weight": @"regular",
+        @"text_color": @"#6b7280",
+        @"align": @"left",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @82,
+        @"y": @340,
+        @"width": @(appCardWidth - 36.0),
+        @"height": @32,
+        @"corner_radius": @10,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @4,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": @"房间已关闭",
+        @"x": @82,
+        @"y": @340,
+        @"width": @(appCardWidth - 36.0),
+        @"height": @32,
+        @"font_size": @12,
+        @"font_weight": @"medium",
+        @"text_color": @"#6b7280",
+        @"align": @"center",
+        @"z_index": @5,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": timeLabel,
+        @"x": @64,
+        @"y": @364,
+        @"width": @42,
+        @"height": @16,
+        @"font_size": @12,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"left",
+        @"z_index": @2,
+    }];
+
+    CGFloat composerTop = windowHeight - 72.0;
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(composerTop),
+        @"width": @(windowWidth),
+        @"height": @72,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @20,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @(composerTop),
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @21,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"mic",
+        @"x": @16,
+        @"y": @(composerTop + 21.0),
+        @"width": @24,
+        @"height": @24,
+        @"color": @"#4b5563",
+        @"stroke_width": @2.0,
+        @"z_index": @22,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @48,
+        @"y": @(composerTop + 14.0),
+        @"width": @(windowWidth - 108.0),
+        @"height": @36,
+        @"corner_radius": @18,
+        @"background_color": @"#f3f4f6",
+        @"z_index": @21,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"text": inputPlaceholder,
+        @"x": @64,
+        @"y": @(composerTop + 14.0),
+        @"width": @(windowWidth - 140.0),
+        @"height": @36,
+        @"font_size": @14,
+        @"font_weight": @"regular",
+        @"text_color": @"#9ca3af",
+        @"align": @"left",
+        @"z_index": @22,
+    }];
+    [commands addObject:@{
+        @"type": @"icon_symbol",
+        @"symbol": @"plus",
+        @"x": @(windowWidth - 38.0),
+        @"y": @(composerTop + 21.0),
+        @"width": @24,
+        @"height": @24,
+        @"color": @"#4b5563",
+        @"stroke_width": @2.5,
+        @"z_index": @22,
+    }];
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": R2CString(stateDoc[@"route_state"]),
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(contentHeight),
+        @"scroll_height": @(scrollHeight),
+        @"scroll_offset_y": @(scrollOffsetY),
+        @"visible_layout_item_count": @((NSInteger)R2CInteger(stateDoc[@"visible_layout_item_count"], 0)),
+        @"selected_item_id": selectedItemId ?: @"",
+        @"focused_item_id": focusedItemId ?: @"",
+        @"typed_text": typedText ?: @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
+- (void)appendGenericSurfaceCommandsForItem:(NSDictionary *)item
+                                      state:(NSDictionary *)stateDoc
+                                    topTrim:(CGFloat)topTrim
+                                   commands:(NSMutableArray<NSDictionary *> *)commands {
+    if ([self shouldSkipGenericSurfaceItem:item]) return;
+
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
+    CGFloat rawX = R2CCGFloat(item[@"x"], 0.0);
+    CGFloat width = [self itemRenderWidthForState:stateDoc item:item];
+    CGFloat height = [self itemRenderHeightForState:stateDoc item:item];
+    CGFloat viewportY = [self itemViewportYForState:stateDoc item:item];
+    CGFloat y = viewportY - topTrim;
+    if (width <= 6.0 || height <= 6.0) return;
+    if (y + height <= 0.0 || y >= windowHeight) return;
+
+    CGFloat x = R2CClamp(rawX, 12.0, MAX(12.0, windowWidth - 48.0));
+    CGFloat maxWidth = MAX(36.0, windowWidth - x - 12.0);
+    width = MIN(width, maxWidth);
+
+    NSString *itemId = R2CString(item[@"id"]);
+    NSString *kind = [[R2CString(item[@"kind"]) lowercaseString] copy];
+    NSString *visualRole = [[R2CString(item[@"visual_role"]) lowercaseString] copy];
+    NSString *title = [self genericSurfaceTitleForLayoutItem:item];
+    NSString *subtitle = [self genericSurfaceSubtitleForLayoutItem:item title:title];
+    BOOL selected = [itemId isEqualToString:R2CString(stateDoc[@"selected_item_id"])];
+    BOOL focused = [itemId isEqualToString:R2CString(stateDoc[@"focused_item_id"])];
+    NSString *typedText = focused ? R2CTrimmedText(stateDoc[@"typed_text"]) : @"";
+    if ([typedText length] > 0) {
+        NSString *inputText = [NSString stringWithFormat:@"输入 %@", R2CClipText(typedText, 18)];
+        subtitle = [subtitle length] > 0 ? [NSString stringWithFormat:@"%@ · %@", subtitle, inputText] : inputText;
+    }
+
+    BOOL component = [visualRole isEqualToString:@"component"] || [kind rangeOfString:@"component"].location != NSNotFound;
+    BOOL overlay = [visualRole isEqualToString:@"overlay"];
+    BOOL surface = overlay
+        || component
+        || [visualRole isEqualToString:@"surface"]
+        || [visualRole isEqualToString:@"scroll_area"];
+    BOOL control = R2CBool(item[@"interactive"], NO)
+        || [visualRole isEqualToString:@"control"]
+        || [kind rangeOfString:@"button"].location != NSNotFound
+        || [kind rangeOfString:@"input"].location != NSNotFound;
+
+    NSString *background = R2CTrimmedText(item[@"background_color"]);
+    NSString *border = R2CTrimmedText(item[@"border_color"]);
+    NSString *titleColor = R2CTrimmedText(item[@"text_color"]);
+    NSString *detailColor = R2CTrimmedText(item[@"detail_color"]);
+    NSString *skeletonColor = @"#e5e7eb";
+
+    if (component) {
+        if ([background length] == 0) background = @"#eef4ff";
+        if ([border length] == 0) border = @"#bfd7f6";
+        if ([titleColor length] == 0) titleColor = @"#102a43";
+        if ([detailColor length] == 0) detailColor = @"#486581";
+        skeletonColor = @"#dbeafe";
+    } else if (overlay) {
+        if ([background length] == 0) background = @"#fff7ed";
+        if ([border length] == 0) border = @"#fdba74";
+        if ([titleColor length] == 0) titleColor = @"#9a3412";
+        if ([detailColor length] == 0) detailColor = @"#c2410c";
+        skeletonColor = @"#fed7aa";
+    } else if (control) {
+        if ([background length] == 0) background = @"#ffffff";
+        if ([border length] == 0) border = @"#cbd5e1";
+        if ([titleColor length] == 0) titleColor = @"#0f172a";
+        if ([detailColor length] == 0) detailColor = @"#475569";
+        skeletonColor = @"#dbeafe";
+    } else if (surface) {
+        if ([background length] == 0) background = @"#ffffff";
+        if ([border length] == 0) border = @"#e2e8f0";
+        if ([titleColor length] == 0) titleColor = @"#0f172a";
+        if ([detailColor length] == 0) detailColor = @"#64748b";
+        skeletonColor = @"#e5e7eb";
+    } else {
+        if ([background length] == 0) background = @"#f8fafc";
+        if ([border length] == 0) border = @"#e2e8f0";
+        if ([titleColor length] == 0) titleColor = @"#334155";
+        if ([detailColor length] == 0) detailColor = @"#64748b";
+        skeletonColor = @"#e2e8f0";
+    }
+
+    CGFloat lineWidth = 1.0;
+    if (selected) {
+        border = @"#2563eb";
+        lineWidth = 2.0;
+        if ([background isEqualToString:@"#ffffff"]) background = @"#eff6ff";
+    } else if (focused) {
+        border = @"#f59e0b";
+        lineWidth = 2.0;
+    }
+
+    CGFloat cornerRadius = control ? MIN(18.0, MAX(10.0, floor(height * 0.40))) : MIN(22.0, MAX(12.0, floor(height * 0.25)));
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @(x),
+        @"y": @(MAX(0.0, y)),
+        @"width": @(width),
+        @"height": @(height),
+        @"corner_radius": @(cornerRadius),
+        @"background_color": background,
+        @"border_color": border,
+        @"line_width": @(lineWidth),
+        @"z_index": @2,
+    }];
+
+    CGFloat innerX = x + 14.0;
+    CGFloat innerWidth = MAX(28.0, width - 28.0);
+    if (control) {
+        if ([subtitle length] > 0 && height >= 54.0) {
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"x": @(innerX),
+                @"y": @(y + 10.0),
+                @"width": @(innerWidth),
+                @"height": @18,
+                @"text": title,
+                @"font_size": @14,
+                @"font_weight": @"semibold",
+                @"text_color": titleColor,
+                @"align": @"left",
+                @"z_index": @3,
+            }];
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"x": @(innerX),
+                @"y": @(y + 30.0),
+                @"width": @(innerWidth),
+                @"height": @14,
+                @"text": subtitle,
+                @"font_size": @11,
+                @"font_weight": @"regular",
+                @"text_color": detailColor,
+                @"align": @"left",
+                @"z_index": @3,
+            }];
+        } else {
+            [commands addObject:@{
+                @"type": @"text_label",
+                @"x": @(innerX),
+                @"y": @(y + MAX(0.0, floor((height - 20.0) * 0.5))),
+                @"width": @(innerWidth),
+                @"height": @20,
+                @"text": title,
+                @"font_size": @14,
+                @"font_weight": @"semibold",
+                @"text_color": titleColor,
+                @"align": width <= 120.0 ? @"center" : @"left",
+                @"z_index": @3,
+            }];
+        }
+        return;
+    }
+
+    NSString *surfaceTitle = title;
+    NSString *surfaceSubtitle = subtitle;
+    if ([surfaceTitle length] == 0 && [surfaceSubtitle length] > 0) {
+        surfaceTitle = surfaceSubtitle;
+        surfaceSubtitle = @"";
+    }
+
+    CGFloat cursorY = y + 12.0;
+    if ([surfaceTitle length] > 0) {
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"x": @(innerX),
+            @"y": @(cursorY),
+            @"width": @(innerWidth),
+            @"height": @18,
+            @"text": surfaceTitle,
+            @"font_size": @(surface ? 14 : 12),
+            @"font_weight": surface ? @"semibold" : @"medium",
+            @"text_color": titleColor,
+            @"align": @"left",
+            @"z_index": @3,
+        }];
+        cursorY += 20.0;
+    }
+    if ([surfaceSubtitle length] > 0 && height >= 52.0) {
+        [commands addObject:@{
+            @"type": @"text_label",
+            @"x": @(innerX),
+            @"y": @(cursorY),
+            @"width": @(innerWidth),
+            @"height": @14,
+            @"text": surfaceSubtitle,
+            @"font_size": @11,
+            @"font_weight": @"regular",
+            @"text_color": detailColor,
+            @"align": @"left",
+            @"z_index": @3,
+        }];
+        cursorY += 18.0;
+    }
+
+    CGFloat remainingHeight = y + height - cursorY - 12.0;
+    NSInteger skeletonCount = 0;
+    if (remainingHeight >= 42.0) skeletonCount = 3;
+    else if (remainingHeight >= 26.0) skeletonCount = 2;
+    else if (remainingHeight >= 12.0) skeletonCount = 1;
+    NSString *seed = [NSString stringWithFormat:@"%@:%@", itemId, surfaceTitle];
+    for (NSInteger index = 0; index < skeletonCount; index += 1) {
+        CGFloat fraction = R2CDeterministicWidthFraction(seed, index);
+        CGFloat barWidth = MAX(40.0, floor(innerWidth * fraction));
+        [commands addObject:@{
+            @"type": @"rounded_rect",
+            @"x": @(innerX),
+            @"y": @(cursorY + (CGFloat)index * 14.0),
+            @"width": @(MIN(innerWidth, barWidth)),
+            @"height": @8,
+            @"corner_radius": @4,
+            @"background_color": skeletonColor,
+            @"z_index": @3,
+        }];
+    }
+}
+
+- (NSDictionary *)buildGenericSurfaceRenderPlanDocForState:(NSDictionary *)stateDoc {
+    NSArray *layoutItems = [self nativeLayoutItems];
+    if ([layoutItems count] == 0) {
+        return [self buildDebugRenderPlanDocForState:stateDoc];
+    }
+
+    NSMutableArray<NSDictionary *> *commands = [NSMutableArray array];
+    CGFloat windowWidth = R2CCGFloat(stateDoc[@"window_width"], self.sessionWidth);
+    CGFloat windowHeight = R2CCGFloat(stateDoc[@"window_height"], self.sessionHeight);
+    CGFloat contentHeight = R2CCGFloat(stateDoc[@"content_height"], self.contentHeight);
+    CGFloat scrollHeight = R2CCGFloat(stateDoc[@"scroll_height"], [self maxScrollOffset]);
+    CGFloat scrollOffsetY = R2CCGFloat(stateDoc[@"scroll_offset_y"], self.scrollOffsetY);
+    NSString *selectedItemId = R2CString(stateDoc[@"selected_item_id"]);
+    NSString *focusedItemId = R2CString(stateDoc[@"focused_item_id"]);
+    NSString *typedText = R2CString(stateDoc[@"typed_text"]);
+
+    NSString *routeTitle = R2CString(stateDoc[@"route_state"]);
+    if ([routeTitle length] == 0) routeTitle = R2CString(stateDoc[@"window_title"]);
+    if ([routeTitle length] == 0) routeTitle = @"native_gui";
+    routeTitle = [routeTitle stringByReplacingOccurrencesOfString:@"_" withString:@" · "];
+    NSString *entryModule = R2CClipText(R2CString(stateDoc[@"entry_module"]), 28);
+    NSString *metaText = [NSString stringWithFormat:@"%@ · visible %ld",
+                          [entryModule length] > 0 ? entryModule : @"compiled surface",
+                          (long)R2CInteger(stateDoc[@"visible_layout_item_count"], 0)];
+
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @(windowHeight),
+        @"corner_radius": @0,
+        @"background_color": @"#f8fafc",
+        @"z_index": @0,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @0,
+        @"width": @(windowWidth),
+        @"height": @56,
+        @"corner_radius": @0,
+        @"background_color": @"#ffffff",
+        @"z_index": @1,
+    }];
+    [commands addObject:@{
+        @"type": @"rounded_rect",
+        @"x": @0,
+        @"y": @55,
+        @"width": @(windowWidth),
+        @"height": @1,
+        @"corner_radius": @0,
+        @"background_color": @"#e5e7eb",
+        @"z_index": @2,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @12,
+        @"width": @(windowWidth - 32.0),
+        @"height": @18,
+        @"text": routeTitle,
+        @"font_size": @16,
+        @"font_weight": @"semibold",
+        @"text_color": @"#0f172a",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+    [commands addObject:@{
+        @"type": @"text_label",
+        @"x": @16,
+        @"y": @31,
+        @"width": @(windowWidth - 32.0),
+        @"height": @14,
+        @"text": metaText,
+        @"font_size": @11,
+        @"font_weight": @"regular",
+        @"text_color": @"#64748b",
+        @"align": @"left",
+        @"z_index": @3,
+    }];
+
+    CGFloat topTrim = [self genericSurfaceTopTrim];
+    NSInteger appendedSurfaceCount = 0;
+    for (id rawItem in layoutItems) {
+        if (![rawItem isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *item = (NSDictionary *)rawItem;
+        if (![self itemVisibleForState:stateDoc item:item]) continue;
+        NSUInteger beforeCount = [commands count];
+        [self appendGenericSurfaceCommandsForItem:item state:stateDoc topTrim:topTrim commands:commands];
+        if ([commands count] > beforeCount) appendedSurfaceCount += 1;
+    }
+
+    if (appendedSurfaceCount == 0) {
+        return [self buildDebugRenderPlanDocForState:stateDoc];
+    }
+
+    if (R2CBool(stateDoc[@"has_last_click"], NO)) {
+        [commands addObject:@{
+            @"type": @"interaction_marker",
+            @"x": @((NSInteger)R2CInteger(stateDoc[@"last_click_x"], 0)),
+            @"y": @((NSInteger)R2CInteger(stateDoc[@"last_click_y"], 0)),
+            @"accent_color": @"#2563eb",
+            @"z_index": @999,
+        }];
+    }
+
+    return @{
+        @"format": @"native_render_plan_v1",
+        @"ready": @YES,
+        @"window_title": R2CString(stateDoc[@"window_title"]),
+        @"route_state": R2CString(stateDoc[@"route_state"]),
+        @"entry_module": R2CString(stateDoc[@"entry_module"]),
+        @"window_width": @(windowWidth),
+        @"window_height": @(windowHeight),
+        @"content_height": @(contentHeight),
+        @"scroll_height": @(scrollHeight),
+        @"scroll_offset_y": @(scrollOffsetY),
+        @"visible_layout_item_count": @((NSInteger)R2CInteger(stateDoc[@"visible_layout_item_count"], 0)),
+        @"selected_item_id": selectedItemId ?: @"",
+        @"focused_item_id": focusedItemId ?: @"",
+        @"typed_text": typedText ?: @"",
+        @"commands": commands,
+        @"command_count": @((NSInteger)[commands count]),
+    };
+}
+
 - (NSDictionary *)buildRenderPlanDocForState:(NSDictionary *)stateDoc {
     NSString *routeState = R2CString(stateDoc[@"route_state"]);
+    if ([routeState isEqualToString:@"home_content_detail_open"]) {
+        return [self buildHomeContentDetailRenderPlanDocForState:stateDoc];
+    }
+    if ([routeState isEqualToString:@"tab_messages"]) {
+        return [self buildMessagesTabShellRenderPlanDocForState:stateDoc];
+    }
+    if ([routeState isEqualToString:@"tab_nodes"]) {
+        return [self buildNodesTabShellRenderPlanDocForState:stateDoc];
+    }
+    if ([routeState isEqualToString:@"message_thread"]) {
+        return [self buildMessageThreadShellRenderPlanDocForState:stateDoc];
+    }
     if ([self isHomeShellSurfaceForRouteState:routeState]) {
         return [self buildHomeShellRenderPlanDocForState:stateDoc];
+    }
+    if ([[self nativeLayoutItems] count] > 0) {
+        return [self buildGenericSurfaceRenderPlanDocForState:stateDoc];
     }
     return [self buildDebugRenderPlanDocForState:stateDoc];
 }
@@ -1862,10 +3805,15 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     CGFloat fontSize = R2CCGFloat(command[@"font_size"], 14.0);
     NSMutableParagraphStyle *style = [[NSMutableParagraphStyle alloc] init];
     NSString *alignText = [[R2CString(command[@"align"]) lowercaseString] copy];
+    NSString *lineBreakText = [[R2CString(command[@"line_break_mode"]) lowercaseString] copy];
     if ([alignText isEqualToString:@"center"]) style.alignment = NSTextAlignmentCenter;
     else if ([alignText isEqualToString:@"right"]) style.alignment = NSTextAlignmentRight;
     else style.alignment = NSTextAlignmentLeft;
-    style.lineBreakMode = NSLineBreakByTruncatingTail;
+    if ([lineBreakText isEqualToString:@"word_wrap"] || [lineBreakText isEqualToString:@"wrap"]) {
+        style.lineBreakMode = NSLineBreakByWordWrapping;
+    } else {
+        style.lineBreakMode = NSLineBreakByTruncatingTail;
+    }
     NSMutableDictionary *attrs = [@{
         NSFontAttributeName: [self fontForSize:fontSize weightText:R2CString(command[@"font_weight"])],
         NSForegroundColorAttributeName: R2CColorFromHexString(command[@"text_color"],
@@ -1873,11 +3821,19 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
                                                                       fallback:[NSColor colorWithCalibratedRed:0.15 green:0.20 blue:0.27 alpha:1.0]]),
     } mutableCopy];
     attrs[NSParagraphStyleAttributeName] = style;
-    NSRect insetRect = NSInsetRect(frame, R2CCGFloat(command[@"padding_x"], 0.0), 0.0);
+    NSRect insetRect = NSInsetRect(frame,
+                                   R2CCGFloat(command[@"padding_x"], 0.0),
+                                   R2CCGFloat(command[@"padding_y"], 0.0));
     NSRect textBounds = [text boundingRectWithSize:insetRect.size
                                            options:NSStringDrawingUsesLineFragmentOrigin | NSStringDrawingUsesFontLeading
                                         attributes:attrs];
     CGFloat drawY = insetRect.origin.y + MAX(0.0, floor((insetRect.size.height - textBounds.size.height) * 0.5));
+    NSString *verticalAlign = [[R2CString(command[@"vertical_align"]) lowercaseString] copy];
+    if ([verticalAlign isEqualToString:@"top"]) {
+        drawY = insetRect.origin.y;
+    } else if ([verticalAlign isEqualToString:@"bottom"]) {
+        drawY = insetRect.origin.y + MAX(0.0, insetRect.size.height - textBounds.size.height);
+    }
     NSRect drawRect = NSMakeRect(insetRect.origin.x, drawY, insetRect.size.width, MAX(textBounds.size.height, insetRect.size.height));
     [text drawInRect:drawRect withAttributes:attrs];
 }
@@ -1890,13 +3846,28 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
                                                    fallback:[NSColor colorWithCalibratedRed:0.15 green:0.20 blue:0.27 alpha:1.0]]);
     CGFloat strokeWidth = R2CCGFloat(command[@"stroke_width"], 2.0);
     NSBezierPath *path = [NSBezierPath bezierPath];
-    [path setLineCapStyle:NSRoundLineCapStyle];
-    [path setLineJoinStyle:NSRoundLineJoinStyle];
+    [path setLineCapStyle:NSLineCapStyleRound];
+    [path setLineJoinStyle:NSLineJoinStyleRound];
     [path setLineWidth:strokeWidth];
     CGFloat minX = NSMinX(frame);
     CGFloat minY = NSMinY(frame);
     CGFloat width = NSWidth(frame);
     CGFloat height = NSHeight(frame);
+    if ([symbol isEqualToString:@"arrow-left"]) {
+        CGFloat cy = NSMidY(frame);
+        CGFloat tailX = minX + width * 0.78;
+        CGFloat headX = minX + width * 0.26;
+        CGFloat wingY = height * 0.26;
+        [path moveToPoint:NSMakePoint(tailX, cy)];
+        [path lineToPoint:NSMakePoint(headX, cy)];
+        [path moveToPoint:NSMakePoint(headX, cy)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.50, minY + wingY)];
+        [path moveToPoint:NSMakePoint(headX, cy)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.50, minY + height - wingY)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
     if ([symbol isEqualToString:@"menu"]) {
         CGFloat y1 = minY + height * 0.28;
         CGFloat y2 = minY + height * 0.50;
@@ -1925,6 +3896,57 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         [path stroke];
         return;
     }
+    if ([symbol isEqualToString:@"user-plus"]) {
+        CGFloat headRadius = MIN(width, height) * 0.16;
+        NSRect headRect = NSMakeRect(minX + width * 0.16,
+                                     minY + height * 0.52,
+                                     headRadius * 2.0,
+                                     headRadius * 2.0);
+        [path appendBezierPathWithOvalInRect:headRect];
+        CGFloat shoulderY = minY + height * 0.34;
+        [path moveToPoint:NSMakePoint(minX + width * 0.10, shoulderY)];
+        [path curveToPoint:NSMakePoint(minX + width * 0.56, shoulderY)
+             controlPoint1:NSMakePoint(minX + width * 0.16, minY + height * 0.14)
+             controlPoint2:NSMakePoint(minX + width * 0.50, minY + height * 0.14)];
+        CGFloat plusCX = minX + width * 0.78;
+        CGFloat plusCY = minY + height * 0.52;
+        CGFloat plusRadius = MIN(width, height) * 0.15;
+        [path moveToPoint:NSMakePoint(plusCX - plusRadius, plusCY)];
+        [path lineToPoint:NSMakePoint(plusCX + plusRadius, plusCY)];
+        [path moveToPoint:NSMakePoint(plusCX, plusCY - plusRadius)];
+        [path lineToPoint:NSMakePoint(plusCX, plusCY + plusRadius)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"users"]) {
+        NSBezierPath *front = [NSBezierPath bezierPath];
+        NSBezierPath *back = [NSBezierPath bezierPath];
+        CGFloat frontRadius = MIN(width, height) * 0.15;
+        CGFloat backRadius = MIN(width, height) * 0.13;
+        [front appendBezierPathWithOvalInRect:NSMakeRect(minX + width * 0.16,
+                                                         minY + height * 0.50,
+                                                         frontRadius * 2.0,
+                                                         frontRadius * 2.0)];
+        [front moveToPoint:NSMakePoint(minX + width * 0.12, minY + height * 0.28)];
+        [front curveToPoint:NSMakePoint(minX + width * 0.58, minY + height * 0.28)
+              controlPoint1:NSMakePoint(minX + width * 0.16, minY + height * 0.10)
+              controlPoint2:NSMakePoint(minX + width * 0.54, minY + height * 0.10)];
+        [back appendBezierPathWithOvalInRect:NSMakeRect(minX + width * 0.52,
+                                                        minY + height * 0.56,
+                                                        backRadius * 2.0,
+                                                        backRadius * 2.0)];
+        [back moveToPoint:NSMakePoint(minX + width * 0.52, minY + height * 0.38)];
+        [back curveToPoint:NSMakePoint(minX + width * 0.88, minY + height * 0.38)
+             controlPoint1:NSMakePoint(minX + width * 0.56, minY + height * 0.22)
+             controlPoint2:NSMakePoint(minX + width * 0.84, minY + height * 0.22)];
+        [color setStroke];
+        [front setLineWidth:strokeWidth];
+        [front stroke];
+        [back setLineWidth:strokeWidth];
+        [back stroke];
+        return;
+    }
     if ([symbol isEqualToString:@"search"]) {
         CGFloat radius = MIN(width, height) * 0.26;
         NSRect circleRect = NSMakeRect(NSMidX(frame) - radius - width * 0.06,
@@ -1934,6 +3956,90 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         [path appendBezierPathWithOvalInRect:circleRect];
         [path moveToPoint:NSMakePoint(NSMidX(frame) + radius * 0.48, NSMidY(frame) - radius * 0.48)];
         [path lineToPoint:NSMakePoint(minX + width * 0.84, minY + height * 0.18)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"activity"]) {
+        CGFloat left = minX + width * 0.14;
+        CGFloat right = minX + width * 0.86;
+        CGFloat midY = NSMidY(frame);
+        [path moveToPoint:NSMakePoint(left, midY)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.32, midY)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.44, minY + height * 0.22)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.58, minY + height * 0.78)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.70, midY)];
+        [path lineToPoint:NSMakePoint(right, midY)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"mic"]) {
+        CGFloat bodyWidth = width * 0.30;
+        CGFloat bodyHeight = height * 0.42;
+        CGFloat bodyX = NSMidX(frame) - bodyWidth * 0.5;
+        CGFloat bodyY = minY + height * 0.36;
+        NSBezierPath *body = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(bodyX, bodyY, bodyWidth, bodyHeight)
+                                                             xRadius:bodyWidth * 0.5
+                                                             yRadius:bodyWidth * 0.5];
+        [body setLineWidth:strokeWidth];
+        [color setStroke];
+        [body stroke];
+        [path moveToPoint:NSMakePoint(minX + width * 0.22, minY + height * 0.46)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.22, minY + height * 0.36)];
+        [path moveToPoint:NSMakePoint(minX + width * 0.78, minY + height * 0.46)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.78, minY + height * 0.36)];
+        [path moveToPoint:NSMakePoint(minX + width * 0.22, minY + height * 0.36)];
+        [path curveToPoint:NSMakePoint(minX + width * 0.78, minY + height * 0.36)
+             controlPoint1:NSMakePoint(minX + width * 0.26, minY + height * 0.18)
+             controlPoint2:NSMakePoint(minX + width * 0.74, minY + height * 0.18)];
+        [path moveToPoint:NSMakePoint(NSMidX(frame), minY + height * 0.18)];
+        [path lineToPoint:NSMakePoint(NSMidX(frame), minY + height * 0.08)];
+        [path moveToPoint:NSMakePoint(NSMidX(frame) - width * 0.14, minY + height * 0.06)];
+        [path lineToPoint:NSMakePoint(NSMidX(frame) + width * 0.14, minY + height * 0.06)];
+        [color setStroke];
+        [path stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"heart"]) {
+        CGFloat inset = MIN(width, height) * 0.16;
+        NSBezierPath *heart = [NSBezierPath bezierPath];
+        [heart setLineCapStyle:NSLineCapStyleRound];
+        [heart setLineJoinStyle:NSLineJoinStyleRound];
+        [heart setLineWidth:strokeWidth];
+        CGFloat left = minX + inset;
+        CGFloat right = minX + width - inset;
+        CGFloat bottom = minY + inset;
+        CGFloat top = minY + height - inset;
+        CGFloat midX = NSMidX(frame);
+        CGFloat midY = minY + height * 0.36;
+        [heart moveToPoint:NSMakePoint(midX, bottom)];
+        [heart curveToPoint:NSMakePoint(left, minY + height * 0.56)
+              controlPoint1:NSMakePoint(midX - width * 0.20, minY + height * 0.18)
+              controlPoint2:NSMakePoint(left, minY + height * 0.30)];
+        [heart curveToPoint:NSMakePoint(midX, top)
+              controlPoint1:NSMakePoint(left, minY + height * 0.82)
+              controlPoint2:NSMakePoint(midX - width * 0.18, top)];
+        [heart curveToPoint:NSMakePoint(right, minY + height * 0.56)
+              controlPoint1:NSMakePoint(midX + width * 0.18, top)
+              controlPoint2:NSMakePoint(right, minY + height * 0.82)];
+        [heart curveToPoint:NSMakePoint(midX, bottom)
+              controlPoint1:NSMakePoint(right, minY + height * 0.30)
+              controlPoint2:NSMakePoint(midX + width * 0.20, minY + height * 0.18)];
+        [color setStroke];
+        [heart stroke];
+        return;
+    }
+    if ([symbol isEqualToString:@"flag"]) {
+        CGFloat poleX = minX + width * 0.30;
+        CGFloat topY = minY + height * 0.82;
+        CGFloat bottomY = minY + height * 0.18;
+        [path moveToPoint:NSMakePoint(poleX, bottomY)];
+        [path lineToPoint:NSMakePoint(poleX, topY)];
+        [path moveToPoint:NSMakePoint(poleX, topY - height * 0.04)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.76, topY - height * 0.10)];
+        [path lineToPoint:NSMakePoint(minX + width * 0.62, minY + height * 0.48)];
+        [path lineToPoint:NSMakePoint(poleX, minY + height * 0.54)];
         [color setStroke];
         [path stroke];
         return;
@@ -1988,6 +4094,122 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
     [R2CColorFromHexString(command[@"border_color"], [self themeColor:@"border_color" fallback:[NSColor lightGrayColor]]) setStroke];
     [panel setLineWidth:1.0];
     [panel stroke];
+}
+
+- (void)drawTruthContentPosterCommand:(NSDictionary *)command frame:(NSRect)frame {
+    CGFloat sourceWidth = 960.0;
+    CGFloat sourceHeight = 1280.0;
+    CGFloat scale = MAX(NSWidth(frame) / sourceWidth, NSHeight(frame) / sourceHeight);
+    CGFloat contentWidth = sourceWidth * scale;
+    CGFloat contentHeight = sourceHeight * scale;
+    CGFloat originX = NSMinX(frame) + (NSWidth(frame) - contentWidth) * 0.5;
+    CGFloat originY = NSMinY(frame) + (NSHeight(frame) - contentHeight) * 0.5;
+    NSRect contentRect = NSMakeRect(originX, originY, contentWidth, contentHeight);
+    NSColor *startColor = R2CColorFromHexString(command[@"accent_color"], [NSColor colorWithCalibratedRed:0.545 green:0.361 blue:0.965 alpha:1.0]);
+    NSColor *endColor = R2CColorFromHexString(command[@"end_color"], [NSColor colorWithCalibratedRed:0.067 green:0.094 blue:0.153 alpha:1.0]);
+    NSString *label = R2CString(command[@"label"]);
+
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip(frame);
+
+    NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:startColor endingColor:endColor];
+    [gradient drawFromPoint:NSMakePoint(NSMinX(contentRect), NSMaxY(contentRect))
+                    toPoint:NSMakePoint(NSMaxX(contentRect), NSMinY(contentRect))
+                    options:0];
+
+    NSBezierPath *circleA = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(originX + 580.0 * scale,
+                                                                              NSMaxY(contentRect) - 400.0 * scale,
+                                                                              360.0 * scale,
+                                                                              360.0 * scale)];
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.12] setFill];
+    [circleA fill];
+
+    NSBezierPath *circleB = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(originX + 20.0 * scale,
+                                                                              NSMaxY(contentRect) - 1200.0 * scale,
+                                                                              440.0 * scale,
+                                                                              440.0 * scale)];
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.08] setFill];
+    [circleB fill];
+
+    CGFloat fontSize = 88.0 * scale;
+    NSFont *font = [NSFont fontWithName:@"Arial-BoldMT" size:fontSize];
+    if (font == nil) {
+        font = [NSFont systemFontOfSize:fontSize weight:NSFontWeightBold];
+    }
+    NSDictionary *attrs = @{
+        NSFontAttributeName: font,
+        NSForegroundColorAttributeName: [NSColor whiteColor],
+    };
+    CGFloat textX = originX + 96.0 * scale;
+    CGFloat textTop = NSMaxY(contentRect) - 1116.0 * scale;
+    NSRect textRect = NSMakeRect(textX,
+                                 textTop,
+                                 MAX(0.0, NSMaxX(contentRect) - textX - 48.0 * scale),
+                                 120.0 * scale);
+    [label drawInRect:textRect withAttributes:attrs];
+
+    [NSGraphicsContext restoreGraphicsState];
+}
+
+- (NSImage *)cachedImageForSVGText:(NSString *)svgText {
+    NSString *cacheKey = R2CString(svgText);
+    if ([cacheKey length] == 0) return nil;
+    if (self.imageCache == nil) {
+        self.imageCache = [NSMutableDictionary dictionary];
+    }
+    NSImage *cached = self.imageCache[cacheKey];
+    if (cached != nil) return cached;
+    NSData *data = [cacheKey dataUsingEncoding:NSUTF8StringEncoding];
+    if (data == nil) return nil;
+    NSImage *image = [[NSImage alloc] initWithData:data];
+    if (image != nil) {
+        self.imageCache[cacheKey] = image;
+    }
+    return image;
+}
+
+- (void)drawSVGImageCommand:(NSDictionary *)command frame:(NSRect)frame {
+    NSImage *image = [self cachedImageForSVGText:command[@"svg_text"]];
+    if (image == nil) return;
+    NSSize size = [image size];
+    CGFloat sourceWidth = size.width > 0.0 ? size.width : 1.0;
+    CGFloat sourceHeight = size.height > 0.0 ? size.height : 1.0;
+    NSString *contentMode = [[R2CString(command[@"content_mode"]) lowercaseString] copy];
+    NSRect sourceRect = NSMakeRect(0.0, 0.0, sourceWidth, sourceHeight);
+    if ([contentMode isEqualToString:@"cover"]) {
+        CGFloat frameRatio = NSWidth(frame) / MAX(NSHeight(frame), 1.0);
+        CGFloat sourceRatio = sourceWidth / MAX(sourceHeight, 1.0);
+        if (sourceRatio > frameRatio) {
+            CGFloat cropWidth = sourceHeight * frameRatio;
+            sourceRect.origin.x = floor((sourceWidth - cropWidth) * 0.5);
+            sourceRect.size.width = cropWidth;
+        } else {
+            CGFloat cropHeight = sourceWidth / frameRatio;
+            sourceRect.origin.y = floor((sourceHeight - cropHeight) * 0.5);
+            sourceRect.size.height = cropHeight;
+        }
+    }
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip(frame);
+    [image drawInRect:frame
+             fromRect:sourceRect
+            operation:NSCompositingOperationSourceOver
+             fraction:1.0
+       respectFlipped:YES
+                hints:@{NSImageHintInterpolation: @(NSImageInterpolationHigh)}];
+    [NSGraphicsContext restoreGraphicsState];
+}
+
+- (void)drawLinearGradientRectCommand:(NSDictionary *)command frame:(NSRect)frame {
+    NSColor *startColor = R2CColorFromHexString(command[@"start_color"], [NSColor whiteColor]);
+    NSColor *endColor = R2CColorFromHexString(command[@"end_color"], [NSColor blackColor]);
+    NSGradient *gradient = [[NSGradient alloc] initWithStartingColor:startColor endingColor:endColor];
+    [NSGraphicsContext saveGraphicsState];
+    NSRectClip(frame);
+    [gradient drawFromPoint:NSMakePoint(NSMinX(frame), NSMaxY(frame))
+                    toPoint:NSMakePoint(NSMaxX(frame), NSMinY(frame))
+                    options:0];
+    [NSGraphicsContext restoreGraphicsState];
 }
 
 - (void)drawItemCardCommand:(NSDictionary *)command frame:(NSRect)frame {
@@ -2077,6 +4299,12 @@ static NSFontWeight R2CFontWeightFromText(NSString *text, NSFontWeight fallback)
         if (!NSIntersectsRect(frame, self.bounds) && ![type isEqualToString:@"rounded_panel"]) continue;
         if ([type isEqualToString:@"rounded_panel"]) {
             [self drawRoundedPanelCommand:command frame:frame];
+        } else if ([type isEqualToString:@"svg_image"]) {
+            [self drawSVGImageCommand:command frame:frame];
+        } else if ([type isEqualToString:@"truth_content_poster"]) {
+            [self drawTruthContentPosterCommand:command frame:frame];
+        } else if ([type isEqualToString:@"linear_gradient_rect"]) {
+            [self drawLinearGradientRectCommand:command frame:frame];
         } else if ([type isEqualToString:@"rounded_rect"]) {
             [self drawRoundedRectCommand:command frame:frame];
         } else if ([type isEqualToString:@"text_label"]) {

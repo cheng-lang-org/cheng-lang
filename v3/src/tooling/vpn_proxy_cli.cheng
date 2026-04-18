@@ -1,0 +1,71 @@
+import std/result
+import std/strings
+import std/strutils as strutil
+
+type
+    V3VpnProxyCliOptions =
+        configPath: str
+        readyPath: str
+        acceptCount: int32
+        probeIntervalMs: int32
+        probeTimeoutMs: int32
+
+fn V3VpnProxyParseInt32(textRaw: str): Result[int32] =
+    let text: str = strutil.Strip(textRaw)
+    if len(text) <= 0:
+        return Err[int32]("vpn proxy: empty integer")
+    var sign: int32 = 1
+    var cursor: int32 = 0
+    if text[0] == '-':
+        sign = -1
+        cursor = 1
+    if cursor >= len(text):
+        return Err[int32]("vpn proxy: invalid integer")
+    var value: int32 = 0
+    while cursor < len(text):
+        let ch = text[cursor]
+        if ch < '0' || ch > '9':
+            return Err[int32]("vpn proxy: invalid integer")
+        value = value * 10 + (int32(ch) - int32('0'))
+        cursor = cursor + 1
+    return Ok[int32](value * sign)
+
+fn v3VpnProxyReadFlag(args: str[], key: str, defaultValue: str): str =
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.StartsWith(arg, key + ":"):
+            return strings.DropPrefix(arg, key + ":")
+        if strutil.StartsWith(arg, key + "="):
+            return strings.DropPrefix(arg, key + "=")
+        if arg == key && i + 1 < args.len:
+            return args[i + 1]
+    return defaultValue
+
+fn v3VpnProxyReadIntFlag(args: str[], key: str, defaultValue: int32): int32 =
+    let raw: str = v3VpnProxyReadFlag(args, key, intToStr(defaultValue))
+    let parseRes: Result[int32] = V3VpnProxyParseInt32(raw)
+    if IsErr(parseRes):
+        return defaultValue
+    return Value(parseRes)
+
+fn V3VpnProxyCollectArgsFrom(args: str[], start: int32): str[] =
+    var out: str[]
+    out = []
+    if start < 0 || start >= args.len:
+        return out
+    for i in start..<args.len:
+        add(out, args[i])
+    return out
+
+fn V3VpnProxyOptions(args: str[]): V3VpnProxyCliOptions =
+    var out: V3VpnProxyCliOptions
+    out.configPath = strutil.Strip(v3VpnProxyReadFlag(args, "--config", ""))
+    out.readyPath = strutil.Strip(v3VpnProxyReadFlag(args, "--ready-path", ""))
+    out.acceptCount = v3VpnProxyReadIntFlag(args, "--accept-count", 0)
+    out.probeIntervalMs = v3VpnProxyReadIntFlag(args, "--probe-interval-ms", 3000)
+    out.probeTimeoutMs = v3VpnProxyReadIntFlag(args, "--probe-timeout-ms", 1000)
+    if out.probeIntervalMs < 0:
+        out.probeIntervalMs = 0
+    if out.probeTimeoutMs <= 0:
+        out.probeTimeoutMs = 1000
+    return out

@@ -1,0 +1,100 @@
+import std/result
+import std/rawbytes
+import std/strings
+
+type
+    V3VpnProxyTarget =
+        host: str
+        port: int32
+
+const
+    v3VpnProxySocksVersion = 5
+    v3VpnProxySocksCmdConnect = 1
+    v3VpnProxySocksCmdBind = 2
+    v3VpnProxySocksCmdUdpAssoc = 3
+    v3VpnProxySocksAtypIpv4 = 1
+    v3VpnProxySocksAtypDomain = 3
+    v3VpnProxySocksAtypIpv6 = 4
+
+fn v3VpnProxySocksReply(code: int32): Bytes =
+    let out: Bytes = bytesAlloc(10)
+    bytesSet(out, 0, v3VpnProxySocksVersion)
+    bytesSet(out, 1, code)
+    bytesSet(out, 2, 0)
+    bytesSet(out, 3, v3VpnProxySocksAtypIpv4)
+    return out
+
+fn V3VpnProxySocksReply(code: int32): Bytes =
+    return v3VpnProxySocksReply(code)
+
+fn V3VpnProxySocksMethodReplyFor(request: Bytes): Result[Bytes] =
+    if bytesLen(request) < 2:
+        return Err[Bytes]("vpn proxy socks5: request too short")
+    if bytesGet(request, 0) != v3VpnProxySocksVersion:
+        return Err[Bytes]("vpn proxy socks5: version invalid")
+    let methodCount: int32 = bytesGet(request, 1)
+    if 2 + methodCount > bytesLen(request):
+        return Err[Bytes]("vpn proxy socks5: methods truncated")
+    var supportsNoAuth: bool = false
+    for i in 0..<methodCount:
+        if bytesGet(request, 2 + i) == 0:
+            supportsNoAuth = true
+    if !supportsNoAuth:
+        return Err[Bytes]("vpn proxy socks5: no supported auth method")
+    let reply: Bytes = bytesAlloc(2)
+    bytesSet(reply, 0, 5)
+    bytesSet(reply, 1, 0)
+    return Ok[Bytes](reply)
+
+fn V3VpnProxySocksParseTargetWire(request: Bytes): Result[V3VpnProxyTarget] =
+    if bytesLen(request) < 4:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: request too short")
+    if bytesGet(request, 0) != v3VpnProxySocksVersion:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: request version invalid")
+    let cmd: int32 = bytesGet(request, 1)
+    if cmd == v3VpnProxySocksCmdBind || cmd == v3VpnProxySocksCmdUdpAssoc:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: unsupported command")
+    if cmd != v3VpnProxySocksCmdConnect:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: invalid command")
+    let atyp: int32 = bytesGet(request, 3)
+    var cursor: int32 = 4
+    var host = ""
+    if atyp == v3VpnProxySocksAtypIpv4:
+        if cursor + 4 + 2 > bytesLen(request):
+            return Err[V3VpnProxyTarget]("vpn proxy socks5: truncated ipv4 target")
+        host = intToStr(bytesGet(request, cursor)) + "." +
+               intToStr(bytesGet(request, cursor + 1)) + "." +
+               intToStr(bytesGet(request, cursor + 2)) + "." +
+               intToStr(bytesGet(request, cursor + 3))
+        cursor = cursor + 4
+    elif atyp == v3VpnProxySocksAtypDomain:
+        if cursor + 1 > bytesLen(request):
+            return Err[V3VpnProxyTarget]("vpn proxy socks5: truncated domain target")
+        let hostLen: int32 = bytesGet(request, cursor)
+        cursor = cursor + 1
+        if hostLen <= 0 || cursor + hostLen + 2 > bytesLen(request):
+            return Err[V3VpnProxyTarget]("vpn proxy socks5: invalid domain target")
+        host = bytesToString(bytesSlice(request, cursor, hostLen))
+        cursor = cursor + hostLen
+    elif atyp == v3VpnProxySocksAtypIpv6:
+        if cursor + 16 + 2 > bytesLen(request):
+            return Err[V3VpnProxyTarget]("vpn proxy socks5: truncated ipv6 target")
+        var text = ""
+        for i in 0..<8:
+            let part: int32 = (bytesGet(request, cursor + i * 2) << 8) | bytesGet(request, cursor + i * 2 + 1)
+            if i > 0:
+                text = text + ":"
+            text = text + intToStr(part)
+        host = text
+        cursor = cursor + 16
+    else:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: unsupported address type")
+    if cursor + 2 > bytesLen(request):
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: missing target port")
+    let port: int32 = (bytesGet(request, cursor) << 8) | bytesGet(request, cursor + 1)
+    if len(host) <= 0 || port <= 0 || port > 65535:
+        return Err[V3VpnProxyTarget]("vpn proxy socks5: invalid target")
+    var out: V3VpnProxyTarget
+    out.host = host
+    out.port = port
+    return Ok[V3VpnProxyTarget](out)

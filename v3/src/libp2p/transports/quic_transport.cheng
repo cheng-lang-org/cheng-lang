@@ -23,6 +23,11 @@ type
         outbound: qconn.Connection
         inbound: qconn.Connection
 
+const
+    v3Libp2pQuicOneShotHandshakeTimeoutMs = 500
+    v3Libp2pQuicOneShotIdleTimeoutMs = 1000
+    v3Libp2pQuicOneShotDisconnectTimeoutMs = 500
+
 fn v3Libp2pQuicTransportConfigDefault(): V3Libp2pQuicTransportConfig =
     return V3Libp2pQuicTransportConfig(
         secure: types.v3Libp2pSecureTls,
@@ -125,6 +130,12 @@ fn v3Libp2pQuicWriteStderr(text: str) =
     let stderrOut = os.Get_stderr()
     os.WriteLine(stderrOut, text)
 
+fn v3Libp2pQuicRetryableAcceptError(err: str): bool =
+    return v3path.V3TextStartsWith(err, "msquic native: accept handshake ! ready") ||
+           v3path.V3TextStartsWith(err, "msquic native: handshake ! ready") ||
+           v3path.V3TextStartsWith(err, "msquic native: session ! ready") ||
+           v3path.V3TextStartsWith(err, "msquic native: pipe read timeout")
+
 fn v3Libp2pQuicAddrFromHostPort(host: str, port: int32): Result[qaddr.MultiAddress] =
     if port < 0 || port > 65535:
         return Err[qaddr.MultiAddress]("v3 libp2p quic: invalid port")
@@ -153,6 +164,34 @@ fn v3Libp2pQuicConfigureTlsWithServerName(t: var qtransport.MsQuicTransport,
         return v3Libp2pQuicConfigureTlsWithPolicy(t, policy)
     let policy: qpolicy.MsQuicTlsPolicy = testpki.msquicMakeLocalhostTransportTlsPolicy()
     return v3Libp2pQuicConfigureTlsWithPolicy(t, policy)
+
+fn v3Libp2pQuicConfigureOneShotClientSettings(t: var qtransport.MsQuicTransport): Result[bool] =
+    var settings = qtransport.msquicTransportSettings(t)
+    settings.handshakeIdleTimeoutMs = int64(v3Libp2pQuicOneShotHandshakeTimeoutMs)
+    settings.idleTimeoutMs = int64(v3Libp2pQuicOneShotIdleTimeoutMs)
+    settings.disconnectTimeoutMs = v3Libp2pQuicOneShotDisconnectTimeoutMs
+    return qtransport.setMsQuicTransportSettings(t, settings)
+
+fn v3Libp2pQuicDialOneShotClientNamed(client: var qtransport.MsQuicTransport,
+                                      conn: var qconn.Connection,
+                                      host: str,
+                                      port: int32,
+                                      serverName: str): Result[bool] =
+    let addrRes = v3Libp2pQuicAddrFromHostPort(host, port)
+    if IsErr(addrRes):
+        return Err[bool](ErrorText(addrRes))
+    client = qtransport.initMsQuicTransport()
+    let settingsRes = v3Libp2pQuicConfigureOneShotClientSettings(client)
+    if IsErr(settingsRes):
+        return Err[bool]("v3 libp2p quic: client settings: " + ErrorText(settingsRes))
+    let tlsRes = v3Libp2pQuicConfigureTlsWithServerName(client, serverName)
+    if IsErr(tlsRes):
+        return Err[bool]("v3 libp2p quic: client tls: " + ErrorText(tlsRes))
+    let dialRes = qtransport.dial(client, Value(addrRes))
+    if IsErr(dialRes):
+        return Err[bool]("v3 libp2p quic: dial: " + ErrorText(dialRes))
+    conn = Value(dialRes)
+    return Ok[bool](true)
 
 fn v3Libp2pQuicStartListenerNamed(listener: var qtransport.MsQuicTransport,
                                   host: str,
@@ -340,7 +379,7 @@ fn v3Libp2pQuicRecvPayloadOnceNamed(host: str,
                                     protocol: types.V3Libp2pProtocolId): Result[Bytes] =
     var client = qtransport.initMsQuicTransport()
     var conn: qconn.Connection
-    let dialRes = v3Libp2pQuicDialClientNamed(client, conn, host, port, serverName)
+    let dialRes = v3Libp2pQuicDialOneShotClientNamed(client, conn, host, port, serverName)
     if IsErr(dialRes):
         return Err[Bytes](ErrorText(dialRes))
     let selectRes = v3Libp2pQuicClientSelectProtocol(client, conn, protocol)
@@ -366,7 +405,7 @@ fn v3Libp2pQuicRequestResponseNamed(host: str,
                                     requestPayload: Bytes): Result[Bytes] =
     var client = qtransport.initMsQuicTransport()
     var conn: qconn.Connection
-    let dialRes = v3Libp2pQuicDialClientNamed(client, conn, host, port, serverName)
+    let dialRes = v3Libp2pQuicDialOneShotClientNamed(client, conn, host, port, serverName)
     if IsErr(dialRes):
         return Err[Bytes](ErrorText(dialRes))
     let selectRes = v3Libp2pQuicClientSelectProtocol(client, conn, protocol)
@@ -451,7 +490,8 @@ fn v3Libp2pQuicServePayloadWindowNamed(host: str,
     while maxServeCount <= 0 || servedCount < maxServeCount:
         let acceptRes = qtransport.acceptTimed(listener, waitMs)
         if IsErr(acceptRes):
-            if ErrorText(acceptRes) == "msquic: accept timeout":
+            if ErrorText(acceptRes) == "msquic: accept timeout" ||
+               v3Libp2pQuicRetryableAcceptError(ErrorText(acceptRes)):
                 break
             qtransport.stop(listener)
             return Err[bool]("v3 libp2p quic: accept: " + ErrorText(acceptRes))
@@ -511,7 +551,8 @@ fn v3Libp2pQuicServeRequestCaptureWindowNamed(host: str,
     while maxCaptureCount <= 0 || captured.len < maxCaptureCount:
         let acceptRes = qtransport.acceptTimed(listener, waitMs)
         if IsErr(acceptRes):
-            if ErrorText(acceptRes) == "msquic: accept timeout":
+            if ErrorText(acceptRes) == "msquic: accept timeout" ||
+               v3Libp2pQuicRetryableAcceptError(ErrorText(acceptRes)):
                 break
             qtransport.stop(listener)
             return Err[Bytes[]]("v3 libp2p quic: accept: " + ErrorText(acceptRes))

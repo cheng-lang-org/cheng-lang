@@ -158,12 +158,22 @@ fn v3BftMainSleepMs(value: int32) =
         return
     cheng_v3_sleep_ms_bridge(value)
 
+fn v3BftMainFollowerVoteRetryLimit(): int32 =
+    return 4
+
 fn v3BftMainFollowerRetryableRecvError(err: str): bool =
     return v3BftMainTextStartsWith(err, "v3 libp2p quic: dial") ||
            v3BftMainTextStartsWith(err, "v3 libp2p quic: unexpected eof") ||
+           v3BftMainTextStartsWith(err, "msquic: pipe closed") ||
            v3BftMainTextStartsWith(err, "msquic native: pipe read timeout") ||
            v3BftMainTextStartsWith(err, "msquic native: handshake ! ready") ||
            v3BftMainTextStartsWith(err, "msquic native: session ! ready")
+
+fn v3BftMainFollowerRetryableLatestSyncError(err: str): bool =
+    return v3BftMainFollowerRetryableRecvError(err) ||
+           err == "v3 bft validator: missing state snapshot" ||
+           err == "v3 bft validator: state sync ack unavailable" ||
+           err == "v3 bft validator: state sync payload unavailable"
 
 fn v3BftMainSelfTest(): int32 =
     let appId = "bft-validator-self-test"
@@ -1115,14 +1125,14 @@ fn v3BftMainFollowerVoteStep(voteLockPath: str,
     let voteRes = host.v3BftValidatorBuildVote(state, proposal)
     if IsOk(voteRes):
         var voteSent = false
-        for attempt in 0..<512:
+        for attempt in 0..<v3BftMainFollowerVoteRetryLimit():
             let sendRes = host.v3BftValidatorSendVote(voteHost, votePort, Value(voteRes))
             if IsOk(sendRes):
                 voteSent = true
                 break
             if !v3BftMainFollowerRetryableRecvError(Error(sendRes)):
                 return Err[bool](Error(sendRes))
-            if attempt + 1 < 512:
+            if attempt + 1 < v3BftMainFollowerVoteRetryLimit():
                 v3BftMainSleepMs(20)
         if !voteSent:
             return Ok[bool](false)
@@ -1438,6 +1448,7 @@ fn v3BftMainFollowerDaemonCommand(): int32 =
     var state = Value(loadRes)
     var appliedRounds = 0
     while maxRounds <= 0 || appliedRounds < maxRounds:
+        let beforeHeight = state.machine.lastFinalizedHeight
         let voteStepRes = v3BftMainFollowerVoteStep(voteLockPath,
                                                     state,
                                                     proposalHost,
@@ -1458,9 +1469,36 @@ fn v3BftMainFollowerDaemonCommand(): int32 =
             v3BftMainPrintErr(Error(commitStepRes))
             return 2
         if Value(commitStepRes) > int64(0):
-            appliedRounds = appliedRounds + 1
-        if Value(commitStepRes) <= int64(0) && !Value(voteStepRes) &&
-           (maxRounds <= 0 || appliedRounds < maxRounds):
+            let delta = state.machine.lastFinalizedHeight - beforeHeight
+            if delta > int64(0):
+                appliedRounds = appliedRounds + int32(delta)
+            else:
+                appliedRounds = appliedRounds + 1
+            continue
+        if Value(commitStepRes) <= int64(0) && !Value(voteStepRes):
+            let syncLatestRes = host.v3BftValidatorSyncMachineLatest(state, syncHost, syncPort)
+            if IsOk(syncLatestRes):
+                let syncedHeight = Value(syncLatestRes)
+                if syncedHeight > beforeHeight:
+                    if !host.v3BftValidatorWriteState(statePath, state):
+                        v3BftMainPrintErr("v3 bft main: failed to persist follower state")
+                        return 2
+                    if !host.v3BftValidatorWriteVoteLock(voteLockPath, state):
+                        v3BftMainPrintErr("v3 bft main: failed to persist vote lock")
+                        return 2
+                    let commit = bft.v3BftStateMachineCommit(state.machine)
+                    v3BftMainPrintOut("synced_height=" + host.v3BftValidatorInt64Text(commit.height))
+                    v3BftMainPrintOut("app_hash=" + layout.fixedBytes32Hex(commit.appHash))
+                    let delta = syncedHeight - beforeHeight
+                    if delta > int64(0):
+                        appliedRounds = appliedRounds + int32(delta)
+                    else:
+                        appliedRounds = appliedRounds + 1
+                    continue
+            elif !v3BftMainFollowerRetryableLatestSyncError(Error(syncLatestRes)):
+                v3BftMainPrintErr(Error(syncLatestRes))
+                return 2
+        if maxRounds <= 0 || appliedRounds < maxRounds:
             v3BftMainSleepMs(intervalMs)
     return 0
 

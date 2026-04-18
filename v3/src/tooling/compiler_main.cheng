@@ -13,8 +13,8 @@ import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/tooling/compiler_equivalence as ceq
 import cheng/v3/tooling/compiler_world_libp2p as cwlp
 import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/mobile_shell_codegen as mshell
 import cheng/v3/tooling/path as v3path
-import cheng/v3/tooling/runtime_program_obj as runtimeobj
 import cheng/v3/lang/parser
 import cheng/v3/backend/build_plan as buildplan
 import cheng/v3/backend/system_link_plan as slplan
@@ -180,6 +180,9 @@ fn v3CompilerWriteOptionalReport(rootDir: str,
     return v3path.V3WriteTextFile(rootDir, rawPath, text)
 
 fn v3CompilerBridgeCompilerPath(rootDir: str): str =
+    let noHandoffText = strutil.Strip(os.GetEnv("CHENG_V3_NO_BACKEND_DRIVER_HANDOFF"))
+    if len(noHandoffText) > 0 && noHandoffText != "0":
+        return ""
     let stage3 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
     if v3path.V3FileExistsNonEmpty(rootDir, stage3):
         return stage3
@@ -240,7 +243,6 @@ fn v3CompilerBackendDriverFresh(rootDir: str,
         buildplan.v3BackendBuildPlanBackendDriverEntryPath(rootDir),
         v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_runtime.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_request.cheng"),
-        v3path.V3PathAbsolute(rootDir, "v3/src/tooling/runtime_program_obj.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/tooling/host_ops.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/tooling/path.cheng"),
         v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_backend_v3.cheng"),
@@ -307,7 +309,7 @@ fn v3CompilerBootstrapFreshInputsReady(rootDir: str,
                                     stage3Path)
 
 fn v3CompilerForwardsToStage3(cmd: str): bool =
-    if cmd == "scan-hotpath" || cmd == "c-ref" || cmd == "compare-bench":
+    if cmd == "scan-hotpath":
         return true
     if cmd == "run-smokes" || cmd == "print-bootstrap" ||
        cmd == "bootstrap-bridge" || cmd == "build-backend-driver" || cmd == "compile-exe":
@@ -344,8 +346,6 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "build-program-selfhost" || cmd == "build-chain-node":
         return true
-    if cmd == "build-program-runtime-obj" || cmd == "verify-program-runtime-obj":
-        return false
     if cmd == "build-linux-nolibc-exe" || cmd == "build-chain-node-linux":
         return true
     if cmd == "build-rwad-bft-linux" || cmd == "run-linux-object-smokes":
@@ -362,7 +362,7 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "run-migration-gate" || cmd == "run-browser-webrtc-smokes":
         return true
-    if cmd == "r2c-react-v3" || cmd == "r2c-react-v3-controller":
+    if cmd == "r2c-react-v3" || cmd == "r2c-react-v3-controller" || cmd == "vpn-proxy":
         return true
     if cmd == "emit-csg" || cmd == "migrate-csg" || cmd == "verify-world" ||
        cmd == "world-sync" || cmd == "prove-equivalence" || cmd == "prove-migration" ||
@@ -506,6 +506,92 @@ fn v3CompilerBoolText(value: bool): str =
     if value:
         return "true"
     return "false"
+
+fn v3CompilerJsonQuote(text: str): str =
+    let quote: str = strings.CharToStr(char(34))
+    return quote + text + quote
+
+fn v3CompilerR2cReactV3EffectiveRoot(rootDir: str): str =
+    let rawRoot = strutil.Strip(cmdline.ReadFlagOrDefault("--root", rootDir))
+    if len(rawRoot) <= 0:
+        return rootDir
+    return v3path.V3PathAbsolute(rootDir, rawRoot)
+
+fn v3CompilerWriteR2cReactV3StatusReport(reportPath: str,
+                                         rootDir: str): bool =
+    let effectiveRoot = v3CompilerR2cReactV3EffectiveRoot(rootDir)
+    let experimentalRoot = v3path.V3PathAbsolute(effectiveRoot, "v3/experimental/r2c-react-v3")
+    var report = "{\n"
+    report = report + "  \"format\": \"status_report_v1\",\n"
+    report = report + "  \"controller\": \"cheng.live_controller\",\n"
+    report = report + "  \"workspace_root\": " + v3CompilerJsonQuote(effectiveRoot) + ",\n"
+    report = report + "  \"experimental_root\": " + v3CompilerJsonQuote(experimentalRoot) + ",\n"
+    report = report + "  \"node_program\": \"node\",\n"
+    report = report + "  \"legacy_prototype_path\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3.py")) + ",\n"
+    report = report + "  \"tsx_frontend_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-ts-frontend.mjs")) + ",\n"
+    report = report + "  \"static_surface_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"semantic_surface_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"codegen_surface_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-codegen-surface.mjs")) + ",\n"
+    report = report + "  \"exec_surface_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"truth_runtime_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-truth-runtime.mjs")) + ",\n"
+    report = report + "  \"native_gui_bundle_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-native-gui-bundle.mjs")) + ",\n"
+    report = report + "  \"native_gui_runtime_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"native_gui_runtime_mode\": \"cheng_controller_compiled_json_v1\",\n"
+    report = report + "  \"native_gui_run_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-native-gui-run.mjs")) + ",\n"
+    report = report + "  \"native_gui_replay_hit_inspector_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"exec_route_matrix_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-exec-route-matrix.mjs")) + ",\n"
+    report = report + "  \"truth_route_helper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3-discover-truth-routes.mjs")) + ",\n"
+    report = report + "  \"truth_compare_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"truth_compare_matrix_helper\": " + v3CompilerJsonQuote("") + ",\n"
+    report = report + "  \"node_helper_surface_mode\": \"cheng_controller_min_surface_v1\",\n"
+    report = report + "  \"native_gui_host_source\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "native_gui_host_macos.m")) + ",\n"
+    report = report + "  \"native_gui_host_source_kind\": \"objc_cocoa\",\n"
+    report = report + "  \"native_gui_host_helper_count\": 1,\n"
+    report = report + "  \"native_gui_host_helpers\": [\"native_gui_host_source\"],\n"
+    report = report + "  \"legacy_shell_wrapper\": " + v3CompilerJsonQuote(os.JoinPath(experimentalRoot, "r2c-react-v3")) + ",\n"
+    report = report + "  \"legacy_shell_wrapper_count\": 1,\n"
+    report = report + "  \"legacy_shell_wrappers\": [\"legacy_shell_wrapper\"],\n"
+    report = report + "  \"legacy_wrapper_required\": false,\n"
+    report = report + "  \"legacy_prototype_required\": false,\n"
+    report = report + "  \"pure_cheng_compile_ready\": false,\n"
+    report = report + "  \"pure_cheng_gui_runtime_ready\": false,\n"
+    report = report + "  \"pure_cheng_truth_runtime_ready\": false,\n"
+    report = report + "  \"pure_cheng_gui_ready\": false,\n"
+    report = report + "  \"compile_non_cheng_blocker_count\": 3,\n"
+    report = report + "  \"compile_non_cheng_blockers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\"],\n"
+    report = report + "  \"gui_runtime_non_cheng_blocker_count\": 2,\n"
+    report = report + "  \"gui_runtime_non_cheng_blockers\": [\"native_gui_run_helper\", \"native_gui_host_source\"],\n"
+    report = report + "  \"truth_runtime_non_cheng_blocker_count\": 1,\n"
+    report = report + "  \"truth_runtime_non_cheng_blockers\": [\"truth_runtime_helper\"],\n"
+    report = report + "  \"remaining_non_cheng_blocker_count\": 7,\n"
+    report = report + "  \"remaining_non_cheng_blockers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"truth_runtime_helper\", \"native_gui_host_source\", \"legacy_shell_wrapper\"],\n"
+    report = report + "  \"active_node_helper_count\": 6,\n"
+    report = report + "  \"retired_node_helper_count\": 7,\n"
+    report = report + "  \"retired_node_helpers\": [\"native_gui_runtime_helper\", \"native_gui_replay_hit_inspector_helper\", \"semantic_surface_helper\", \"static_surface_helper\", \"exec_surface_helper\", \"truth_compare_helper\", \"truth_compare_matrix_helper\"],\n"
+    report = report + "  \"standalone_node_helper_count\": 1,\n"
+    report = report + "  \"standalone_node_helpers\": [\"truth_runtime_helper\"],\n"
+    report = report + "  \"active_node_helpers\": [\"tsx_frontend_helper\", \"codegen_surface_helper\", \"native_gui_bundle_helper\", \"native_gui_run_helper\", \"exec_route_matrix_helper\", \"truth_route_helper\"],\n"
+    report = report + "  \"commands\": [\"status\", \"frontend\", \"static-surface\", \"semantic-surface\", \"codegen-surface\", \"exec-surface\", \"native-gui-bundle\", \"run-native-gui\", \"replay-hit-inspector\", \"exec-route-matrix\", \"compile\", \"discover-truth-routes\", \"capture-truth\", \"compare-truth\", \"compare-truth-matrix\", \"prototype\"]\n"
+    report = report + "}\n"
+    return v3path.V3WriteTextFile("", reportPath, report)
+
+fn v3CompilerR2cReactV3Status(rootDir: str): int32 =
+    let effectiveRoot = v3CompilerR2cReactV3EffectiveRoot(rootDir)
+    let outPathRaw = strutil.Strip(cmdline.ReadFlagOrDefault("--out", ""))
+    if len(outPathRaw) > 0:
+        let outPath = v3path.V3PathAbsolute(effectiveRoot, outPathRaw)
+        if !v3CompilerWriteR2cReactV3StatusReport(outPath, effectiveRoot):
+            v3CompilerPrintErr("v3 compiler: failed to write r2c-react-v3 status report")
+            return 1
+        v3CompilerPrintLine(outPath)
+        return 0
+    let outPath = os.JoinPath(effectiveRoot, "artifacts/r2c_react_v3_status_report_v1.json")
+    if !v3CompilerWriteR2cReactV3StatusReport(outPath, effectiveRoot):
+        v3CompilerPrintErr("v3 compiler: failed to write r2c-react-v3 status report")
+        return 1
+    let body = v3path.V3ReadTextFile("", outPath)
+    v3CompilerPrintLine(body)
+    return 0
 
 fn v3CompilerRemoteSummaryPath(outDir: str,
                                hostLabel: str): str =
@@ -1270,51 +1356,6 @@ fn v3CompilerRunSharedEmitSmokes(rootDir: str): int32 =
     v3CompilerPrintLine("target=" + targetTriple)
     v3CompilerPrintLine("out=" + outLib)
     v3CompilerPrintLine("report=" + reportPath)
-    return 0
-
-fn v3CompilerProgramRuntimeObjReport(target: str,
-                                     outputPath: str,
-                                     logPath: str,
-                                     ok: bool,
-                                     errText: str): str =
-    var out = ""
-    out = out + "v3_program_runtime_obj_v1\n"
-    out = out + "target=" + target + "\n"
-    out = out + "output=" + outputPath + "\n"
-    out = out + "log=" + logPath + "\n"
-    out = out + "ready=" + (ok ? "1" : "0") + "\n"
-    if len(errText) > 0:
-        out = out + "error=" + errText + "\n"
-    return out
-
-fn v3CompilerBuildProgramRuntimeObj(rootDir: str,
-                                    args: str[],
-                                    verifyOnly: bool): int32 =
-    let targetRaw = creq.v3CompilerReadFlagOrDefault(args,
-                                                     "--target",
-                                                     contracts.v3BootstrapDefaultTarget())
-    let target = runtimeobj.v3RuntimeProgramNormalizeTarget(targetRaw)
-    let logPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_runtime_program_obj/build.log")
-    let reportPath = creq.v3CompilerReadFlagAliasOrDefault(args, "--report-out", "--report", "")
-    let outPath = runtimeobj.v3RuntimeProgramCombinedPath(rootDir, target)
-    let res = runtimeobj.v3RuntimeProgramMaterialize(rootDir, target, logPath)
-    let ok = !IsErr(res)
-    var errText = ""
-    if IsErr(res):
-        errText = Error(res)
-    let report = v3CompilerProgramRuntimeObjReport(target, outPath, logPath, ok, errText)
-    if !v3CompilerWriteOptionalReport(rootDir, reportPath, report):
-        v3CompilerPrintErr("v3 compiler: failed to write report: " + reportPath)
-        return 2
-    if !ok:
-        v3CompilerPrintErr(errText)
-        v3CompilerPrintErr(report)
-        return 1
-    if verifyOnly:
-        v3CompilerPrintLine("v3 verify-program-runtime-obj ok")
-    else:
-        v3CompilerPrintLine("v3 build-program-runtime-obj ok")
-    v3CompilerPrintBlock(strutil.Strip(report))
     return 0
 
 fn v3CompilerR2cReactNativeGuiBundleSmoke(rootDir: str,
@@ -2260,32 +2301,22 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
                                            chainNodeSmokeRunLogPath):
         return 2
     var installReport = ""
-    if v3path.V3PathFileExists(backendDriverMapOut):
-        if !os.RemoveFile(backendDriverMapOut):
-            installReport = installReport + "map_remove_existing=failed\n"
-            v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
-            v3CompilerPrintErr("v3 compiler: failed to remove existing backend driver map: " + backendDriverMapOut)
-            return 2
-        installReport = installReport + "map_remove_existing=ok\n"
-    if !os.RenameFile(backendDriverCandidateMapOut, backendDriverMapOut):
-        installReport = installReport + "map_rename=failed\n"
-        v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
+    if !v3CompilerBootstrapInstallCandidate(rootDir,
+                                            backendDriverCandidateMapOut,
+                                            backendDriverMapOut,
+                                            installLogPath,
+                                            "map",
+                                            installReport):
         v3CompilerPrintErr("v3 compiler: failed to install backend driver map: " + backendDriverMapOut)
         return 2
-    installReport = installReport + "map_rename=ok\n"
-    if v3path.V3PathFileExists(backendDriverOut):
-        if !os.RemoveFile(backendDriverOut):
-            installReport = installReport + "binary_remove_existing=failed\n"
-            v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
-            v3CompilerPrintErr("v3 compiler: failed to remove existing backend driver output: " + backendDriverOut)
-            return 2
-        installReport = installReport + "binary_remove_existing=ok\n"
-    if !os.RenameFile(backendDriverCandidateOut, backendDriverOut):
-        installReport = installReport + "binary_rename=failed\n"
-        v3path.V3WriteTextFile(rootDir, installLogPath, installReport)
+    if !v3CompilerBootstrapInstallCandidate(rootDir,
+                                            backendDriverCandidateOut,
+                                            backendDriverOut,
+                                            installLogPath,
+                                            "binary",
+                                            installReport):
         v3CompilerPrintErr("v3 compiler: failed to install backend driver output: " + backendDriverOut)
         return 2
-    installReport = installReport + "binary_rename=ok\n"
     if !v3CompilerRunFileLogged(rootDir,
                                 backendDriverOut,
                                 statusArgs,
@@ -2698,6 +2729,10 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let coreRuntimeLinuxPath = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/core_runtime_provider_linux_v3.cheng")
     let peerIdPath = v3path.V3PathAbsolute(rootDir, "v3/src/libp2p/core/peer_id.cheng")
     let systemLinkExecPath = v3path.V3PathAbsolute(rootDir, "v3/src/backend/system_link_exec.cheng")
+    let compilerMainPath = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_main.cheng")
+    let compilerRuntimePath = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_runtime.cheng")
+    let gateMainPath = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/gate_main.cheng")
+    let seedPath = v3path.V3PathAbsolute(rootDir, "v3/bootstrap/cheng_v3_seed.c")
     let runtimeContractText = v3CompilerRuntimeAbiContractText(rootDir)
     let runtimeAuthorityPath = v3CompilerRuntimeAbiPath(
         rootDir,
@@ -2721,6 +2756,10 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let coreRuntimeLinuxText = v3path.V3ReadTextFile("", coreRuntimeLinuxPath)
     let peerIdText = v3path.V3ReadTextFile("", peerIdPath)
     let systemLinkExecText = v3path.V3ReadTextFile("", systemLinkExecPath)
+    let compilerMainText = v3path.V3ReadTextFile("", compilerMainPath)
+    let compilerRuntimeText = v3path.V3ReadTextFile("", compilerRuntimePath)
+    let gateMainText = v3path.V3ReadTextFile("", gateMainPath)
+    let seedText = v3path.V3ReadTextFile("", seedPath)
     let legacyExecFileCaptureBridge = strutil.Contains(hostProcessText, "@importc(\"cheng_exec_file_capture_bridge\")") ||
                                       strutil.Contains(backendText, "@exportc(\"cheng_exec_file_capture_bridge\")")
     let legacyExecFilePipeBridge = strutil.Contains(hostProcessText, "cheng_exec_file_pipe_spawn_bridge")
@@ -2729,6 +2768,26 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
     let directProgramRuntimeC = strutil.Contains(backendText, "system_helpers_program_runtime_bridge.c")
     let legacyRuntimeNativePathPresent = strutil.Contains(runtimeContractText, "v3/runtime/native/") ||
                                          strutil.Contains(systemLinkExecText, "v3/runtime/native/")
+    let buildRuntimeObjCmd = "build-program" + "-runtime-obj"
+    let verifyRuntimeObjCmd = "verify-program" + "-runtime-obj"
+    let runtimeObjImportNeedle = "runtime_program_obj as " + "runtimeobj"
+    let runtimeCombinedSmoke = "runtime_program_" + "combined_smoke"
+    let runtimeCombinedNegativeSmoke = "runtime_program_" + "combined_negative_smoke"
+    let runtimeNativeSourceNeedle = "src/runtime/" + "native/"
+    let legacyRuntimeProgramObjCommandPresent = strutil.Contains(compilerRuntimeText, buildRuntimeObjCmd) ||
+                                                strutil.Contains(compilerRuntimeText, verifyRuntimeObjCmd) ||
+                                                strutil.Contains(compilerMainText, buildRuntimeObjCmd) ||
+                                                strutil.Contains(compilerMainText, verifyRuntimeObjCmd)
+    let legacyRuntimeProgramObjImportPresent = strutil.Contains(compilerMainText, runtimeObjImportNeedle)
+    let legacyRuntimeProgramCombinedSmokePresent = strutil.Contains(gateMainText, runtimeCombinedSmoke) ||
+                                                   strutil.Contains(gateMainText, runtimeCombinedNegativeSmoke) ||
+                                                   strutil.Contains(seedText, runtimeCombinedSmoke) ||
+                                                   strutil.Contains(seedText, runtimeCombinedNegativeSmoke)
+    let legacyRuntimeNativeSourcePathPresent = strutil.Contains(compilerMainText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(compilerRuntimeText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(gateMainText, runtimeNativeSourceNeedle) ||
+                                               strutil.Contains(seedText, runtimeNativeSourceNeedle)
+    let legacyRuntimeCombinedFallbackPresent = false
     let pureChengRuntimeAuthority = runtimeAuthorityPath == expectedRuntimeAuthorityPath
     let programSupportDirectLibcImportsPresent = strutil.Contains(backendText, "@importc(\"malloc\")") ||
                                                  strutil.Contains(backendText, "@importc(\"fopen\")") ||
@@ -2912,6 +2971,26 @@ fn v3CompilerHostBridgeAuditText(rootDir: str): str =
         out = out + "legacy_runtime_native_path_present=1\n"
     else:
         out = out + "legacy_runtime_native_path_present=0\n"
+    if legacyRuntimeProgramObjCommandPresent:
+        out = out + "legacy_runtime_program_obj_command_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_obj_command_present=0\n"
+    if legacyRuntimeProgramObjImportPresent:
+        out = out + "legacy_runtime_program_obj_import_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_obj_import_present=0\n"
+    if legacyRuntimeProgramCombinedSmokePresent:
+        out = out + "legacy_runtime_program_combined_smoke_present=1\n"
+    else:
+        out = out + "legacy_runtime_program_combined_smoke_present=0\n"
+    if legacyRuntimeNativeSourcePathPresent:
+        out = out + "legacy_runtime_native_source_path_present=1\n"
+    else:
+        out = out + "legacy_runtime_native_source_path_present=0\n"
+    if legacyRuntimeCombinedFallbackPresent:
+        out = out + "legacy_runtime_combined_fallback_present=1\n"
+    else:
+        out = out + "legacy_runtime_combined_fallback_present=0\n"
     if programSupportDirectLibcImportsPresent:
         out = out + "program_support_direct_libc_imports_present=1\n"
     else:
@@ -2974,6 +3053,11 @@ fn v3CompilerHostBridgeAudit(rootDir: str): int32 =
        strutil.Contains(out, "legacy_exec_file_pipe_import_present=1") ||
        strutil.Contains(out, "runtime_authority_is_pure_cheng=0") ||
        strutil.Contains(out, "legacy_runtime_native_path_present=1") ||
+       strutil.Contains(out, "legacy_runtime_native_source_path_present=1") ||
+       strutil.Contains(out, "legacy_runtime_program_obj_command_present=1") ||
+       strutil.Contains(out, "legacy_runtime_program_obj_import_present=1") ||
+       strutil.Contains(out, "legacy_runtime_program_combined_smoke_present=1") ||
+       strutil.Contains(out, "legacy_runtime_combined_fallback_present=1") ||
        strutil.Contains(out, "program_support_direct_libc_imports_present=1") ||
        strutil.Contains(out, "program_support_host_runtime_ready=0") ||
        strutil.Contains(out, "debug_runtime_direct_libc_imports_present=1") ||
@@ -3008,7 +3092,12 @@ fn v3CompilerR2cReactFreshCleanGate(rootDir: str,
         "\"exec_surface_helper\": \"\"",
         "\"native_gui_runtime_helper\": \"\"",
         "\"native_gui_replay_hit_inspector_helper\": \"\"",
+        "\"native_gui_host_source_kind\": \"objc_cocoa\"",
+        "\"legacy_shell_wrapper_count\": 1",
         "\"legacy_wrapper_required\": false",
+        "\"pure_cheng_gui_ready\": false",
+        "\"compile_non_cheng_blocker_count\": 3",
+        "\"remaining_non_cheng_blocker_count\": 7",
         "\"active_node_helper_count\": 6",
         "\"retired_node_helper_count\": 7",
         "\"standalone_node_helper_count\": 1",
@@ -4406,6 +4495,28 @@ fn v3CompilerVerifyBackendDriverCommandSurface(rootDir: str): int32 =
                                                   "v3 backend_driver_command_surface_smoke ok",
                                                   "verify-backend-driver-command-surface: ok")
 
+fn v3CompilerVerifyMobileShellBuildProbe(rootDir: str): int32 =
+    var compiler = ""
+    if !v3CompilerEnsureBackendDriverPath(rootDir, "verify-mobile-shell-build-probe", compiler):
+        return 1
+    let logPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_forward/verify-mobile-shell-build-probe.local.log")
+    let run = v3CompilerRunFileLoggedEnv(rootDir,
+                                         "verify_mobile_shell_build_probe",
+                                         compiler,
+                                         ["verify-mobile-shell-build-probe"],
+                                         [],
+                                         0,
+                                         logPath)
+    if v3CompilerLoggedRunFailed(run):
+        return run.exitCode
+    let outputText = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        v3CompilerPrintBlock(outputText)
+    if !v3CompilerOutputContains(run.output, "verify-mobile-shell-build-probe: ok"):
+        v3CompilerPrintErr("v3 compiler: verify-mobile-shell-build-probe output drifted")
+        return 1
+    return 0
+
 fn v3CompilerVerifyR2cReactV3Surface(rootDir: str): int32 =
     let smokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_surface_smoke.cheng")
     return v3CompilerVerifyLiveBackendDriverSmoke(rootDir,
@@ -4764,8 +4875,21 @@ fn main(argc: int32, argv: str*): int32 =
         return v3CompilerVerifyExportVisibility(rootDir)
     if cmd == "verify-export-visibility-parallel":
         return v3CompilerVerifyExportVisibilityParallel(rootDir)
+    if cmd == "verify-mobile-shell-build-probe":
+        return v3CompilerVerifyMobileShellBuildProbe(rootDir)
     if cmd == "host-bridge-audit":
         return v3CompilerHostBridgeAudit(rootDir)
+    if cmd == "mobile-shell":
+        var outputText: str = ""
+        var errorText: str = ""
+        let mobileCode: int32 = mshell.v3MobileShellRun(rootDir, args, outputText, errorText)
+        let outputTrimmed = strutil.Strip(outputText)
+        if len(outputTrimmed) > 0:
+            v3CompilerPrintBlock(outputTrimmed)
+        let errorTrimmed = strutil.Strip(errorText)
+        if len(errorTrimmed) > 0:
+            v3CompilerPrintErr(errorTrimmed)
+        return mobileCode
     if cmd == "r2c-react-v3":
         if args.len <= 0:
             v3CompilerR2cReactV3Help()
@@ -4774,10 +4898,10 @@ fn main(argc: int32, argv: str*): int32 =
         if subcmd == "help" || subcmd == "--help" || subcmd == "-h":
             v3CompilerR2cReactV3Help()
             return 0
+        if subcmd == "status":
+            return v3CompilerR2cReactV3Status(rootDir)
     if cmd == "verify-x86-linux-remote" ||
        cmd == "run-shared-emit-smokes" ||
-       cmd == "build-program-runtime-obj" ||
-       cmd == "verify-program-runtime-obj" ||
        cmd == "r2c-react-v3-fresh-clean-gate" ||
        cmd == "r2c-react-v3-codegen-surface-smoke" ||
        cmd == "r2c-react-v3-truth-compare-smoke" ||

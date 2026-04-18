@@ -143,6 +143,70 @@ fn v3RunProgramLogged(root: str, label: str, programName: str, argv: str[], envO
         return v3LoggedRunMake(label, programName, logPath, 127, missingText)
     return v3RunFileLogged(root, label, programPath, argv, envOverrides, workingDirRaw, timeoutSec, logPathRaw)
 
+fn v3RunFileLoggedWithInputText(root: str,
+                                label: str,
+                                filePathRaw: str,
+                                argv: str[],
+                                envOverrides: str[],
+                                workingDirRaw: str,
+                                timeoutSec: int32,
+                                logPathRaw: str,
+                                inputText: str): V3LoggedRun =
+    let filePath: str = v3path.V3PathAbsolute(root, filePathRaw)
+    var workingDir: str = v3path.V3PathAbsolute(root, workingDirRaw)
+    if !v3path.V3PathNonEmpty(workingDirRaw):
+        workingDir = root
+    let logPath: str = v3path.V3PathAbsolute(root, logPathRaw)
+    if !v3path.V3FileExistsNonEmpty(root, filePath):
+        let missingText = v3HostOpsMissingExecutableText(filePath)
+        let _logged: bool = v3path.V3WriteTextFile(root, logPath, missingText)
+        return v3LoggedRunMake(label, filePath, logPath, 127, missingText)
+    let spawnRes = hostos.ExecFilePipeSpawn(filePath, argv, envOverrides, workingDir)
+    if !spawnRes.ok || spawnRes.pid <= 0 || spawnRes.readFd < 0:
+        let outputText = "spawn pid missing: " + filePath + "\n"
+        let _logged: bool = v3path.V3WriteTextFile(root, logPath, outputText)
+        return v3LoggedRunMake(label, filePath, logPath, 1, outputText)
+    var proc = v3SpawnedProcessMake(label,
+                                    filePath,
+                                    spawnRes.readFd,
+                                    spawnRes.writeFd,
+                                    spawnRes.pid,
+                                    "",
+                                    "",
+                                    0)
+    let writeOk: bool = v3SpawnedProcessWriteAll(proc, inputText)
+    v3SpawnedProcessCloseWrite(proc)
+    if !writeOk:
+        proc.output = proc.output + "write stdin failed\n"
+        v3SpawnedProcessKill(proc)
+        return v3SpawnedProcessFinalize(root, proc, logPathRaw, 1)
+    return v3SpawnedProcessWaitLogged(root, proc, timeoutSec, logPathRaw)
+
+fn v3RunProgramLoggedWithInputText(root: str,
+                                   label: str,
+                                   programName: str,
+                                   argv: str[],
+                                   envOverrides: str[],
+                                   workingDirRaw: str,
+                                   timeoutSec: int32,
+                                   logPathRaw: str,
+                                   inputText: str): V3LoggedRun =
+    let programPath: str = v3ResolveProgram(root, programName)
+    if !v3path.V3PathNonEmpty(programPath):
+        let logPath: str = v3path.V3PathAbsolute(root, logPathRaw)
+        let missingText = v3HostOpsMissingExecutableText(programName)
+        let _logged: bool = v3path.V3WriteTextFile(root, logPath, missingText)
+        return v3LoggedRunMake(label, programName, logPath, 127, missingText)
+    return v3RunFileLoggedWithInputText(root,
+                                        label,
+                                        programPath,
+                                        argv,
+                                        envOverrides,
+                                        workingDirRaw,
+                                        timeoutSec,
+                                        logPathRaw,
+                                        inputText)
+
 fn v3LoggedRunOk(run: V3LoggedRun): bool =
     return run.exitCode == 0
 
@@ -192,6 +256,21 @@ fn v3SpawnedProcessCloseWrite(proc: var V3SpawnedProcess) =
     if proc.writeFd >= 0:
         hostos.PtyClose(proc.writeFd)
         proc.writeFd = -1
+
+fn v3SpawnedProcessWriteAll(proc: var V3SpawnedProcess, data: str): bool =
+    if len(data) <= 0:
+        return true
+    if proc.writeFd < 0:
+        return false
+    var cursor: int32 = 0
+    let total: int32 = len(data)
+    while cursor < total:
+        let chunk: str = strings.SliceBytes(data, cursor, total - cursor)
+        let wrote: int32 = hostos.ptyWrite(proc.writeFd, chunk)
+        if wrote <= 0:
+            return false
+        cursor = cursor + wrote
+    return true
 
 fn v3SpawnedProcessCleanup(proc: var V3SpawnedProcess) =
     v3SpawnedProcessCloseRead(proc)

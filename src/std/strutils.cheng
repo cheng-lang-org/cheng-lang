@@ -18,7 +18,16 @@ type
         ffDefault, ffDecimal
 
 fn strutilsAppendStr(seqInst: var str[], val: str) =
-    add(seqInst, val)
+    let writeAt: int32 = seqInst.len
+    if seqInst.buffer == nil || writeAt >= seqInst.cap:
+        let nextLen: int32 = writeAt + 1
+        strutils_cheng_seq_set_grow(&seqInst, nextLen, strutils_cheng_seq_string_elem_bytes_compat())
+        strutils_cheng_seq_string_register_compat(&seqInst)
+        if seqInst.buffer != nil:
+            strutils_cheng_seq_string_buffer_register_compat(seqInst.buffer)
+    seqInst.len = writeAt + 1
+    let slotPtr: ptr = rawmem_support.RawmemPtrAdd(seqInst.buffer, writeAt * strutils_cheng_seq_string_elem_bytes_compat())
+    store(slotPtr, val)
 
 fn isStripDefaultChar(ch: char): bool =
     let chCode: int32 = int32(ch)
@@ -70,9 +79,7 @@ fn contains(s: str, sub: str): bool =
     while i + m <= n:
         var j: int32 = 0
         var matched: bool = true
-        let __for_start_j_1 = j
-        for __for_j_1 in __for_start_j_1..<m:
-            j = __for_j_1
+        while j < m:
             if s[i + j] != sub[j]:
                 matched = false
                 break
@@ -89,12 +96,14 @@ fn toLowerAscii(s: str): str =
     let out: str = newStringOfCap(n)
     if strings.Len(out) != n:
         return s
-    for i in 0..<n:
+    var i: int32 = 0
+    while i < n:
         var ch = s[i]
         if ch >= 'A' && ch <= 'Z':
             let oc: int32 = int32(ch) + 32
             ch = char(oc)
         out[i] = ch
+        i = i + 1
     return out
 
 fn toUpperAscii(s: str): str =
@@ -104,12 +113,14 @@ fn toUpperAscii(s: str): str =
     let out: str = newStringOfCap(n)
     if strings.Len(out) != n:
         return s
-    for i in 0..<n:
+    var i: int32 = 0
+    while i < n:
         var ch = s[i]
         if ch >= 'a' && ch <= 'z':
             let oc: int32 = int32(ch) - 32
             ch = char(oc)
         out[i] = ch
+        i = i + 1
     return out
 
 fn strip(s: str): str =
@@ -117,16 +128,12 @@ fn strip(s: str): str =
         return s
     var start = 0
     var stop = strings.Len(s) - 1
-    let __for_start_start_4 = start
-    for __for_start_4 in __for_start_start_4..stop:
-        start = __for_start_4
-        if ! (start <= stop && isStripDefaultChar(s[start])):
+    while start <= stop:
+        if !isStripDefaultChar(s[start]):
             break
         start = start + 1
-    let __for_start_stop_5 = stop
-    for __for_stop_5 in 0..(__for_start_stop_5 - (start)):
-        stop = __for_start_stop_5 - __for_stop_5
-        if ! (stop >= start && isStripDefaultChar(s[stop])):
+    while stop >= start:
+        if !isStripDefaultChar(s[stop]):
             break
         stop = stop - 1
     if stop < start:
@@ -174,23 +181,17 @@ fn splitInto(s: str, sep: char, out: var str[]) =
 fn splitWhitespace(s: str): str[] =
     var out: str[]
     var i = 0
-    let __for_guard_start_i_1 = i
-    for __for_guard_i_1 in __for_guard_start_i_1..<strings.Len(s):
-        if ! (i < strings.Len(s)):
-            break
-        let __for_start_i_6 = i
-        for __for_i_6 in __for_start_i_6..<strings.Len(s):
-            i = __for_i_6
-            if ! (i < strings.Len(s) && isStripDefaultChar(s[i])):
+    let n = strings.Len(s)
+    while i < n:
+        while i < n:
+            if !isStripDefaultChar(s[i]):
                 break
             i = i + 1
-        if i >= strings.Len(s):
+        if i >= n:
             break
         var start = i
-        let __for_start_i_7 = i
-        for __for_i_7 in __for_start_i_7..<strings.Len(s):
-            i = __for_i_7
-            if ! (i < strings.Len(s) && ! isStripDefaultChar(s[i])):
+        while i < n:
+            if isStripDefaultChar(s[i]):
                 break
             i = i + 1
         if i > start:
@@ -205,11 +206,13 @@ fn join(parts: str[], sep: str): str =
         return parts[0]
     let sepLen: int32 = strings.Len(sep)
     var totalLen: int32 = 0
-    for i in 0..<parts.len:
+    var i: int32 = 0
+    while i < parts.len:
         let part = parts[i]
         totalLen = totalLen + strings.Len(part)
         if i > 0:
             totalLen = totalLen + sepLen
+        i = i + 1
     if totalLen <= 0:
         return ""
     let out: str = newStringAlloc(totalLen)
@@ -217,7 +220,8 @@ fn join(parts: str[], sep: str): str =
     if outPtr == nil:
         return ""
     var writePos: int32 = 0
-    for i in 0..<parts.len:
+    i = 0
+    while i < parts.len:
         let part = parts[i]
         if i > 0 && sepLen > 0:
             rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, writePos), rawmemAsVoid(sep), sepLen)
@@ -226,6 +230,7 @@ fn join(parts: str[], sep: str): str =
         if partLen > 0:
             rawmem_support.RawmemCopy(rawmem_support.RawmemPtrAdd(outPtr, writePos), rawmemAsVoid(part), partLen)
             writePos = writePos + partLen
+        i = i + 1
     return out
 
 fn replace(s: str, oldSub: str, newSub: str): str =
@@ -237,17 +242,16 @@ fn replace(s: str, oldSub: str, newSub: str): str =
     var i: int32 = 0
     let n: int32 = strings.Len(s)
     let m: int32 = strings.Len(oldSub)
-    let __for_guard_start_i_2 = i
-    for __for_guard_i_2 in __for_guard_start_i_2..<n:
-        if ! (i < n):
-            break
+    while i < n:
         var matched: bool = false
         if i + m <= n:
             matched = true
-            for j in 0..<m:
+            var j: int32 = 0
+            while j < m:
                 if s[i + j] != oldSub[j]:
                     matched = false
                     break
+                j = j + 1
         if matched:
             add(pieces, newSub)
             i = i + m
@@ -260,9 +264,12 @@ fn countLines(s: str): int =
     if strings.Len(s) == 0:
         return 0
     var count = 1
-    for i in 0..<strings.Len(s):
+    var i: int32 = 0
+    let n = strings.Len(s)
+    while i < n:
         if s[i] == '\n':
             count = count + 1
+        i = i + 1
     return count
 
 fn parseInt(s: str): int =
@@ -277,9 +284,8 @@ fn parseInt(s: str): int =
         i = 1
     var val = 0
     var hadDigit = false
-    let __for_start_i_8 = i
-    for __for_i_8 in __for_start_i_8..<strings.Len(s):
-        i = __for_i_8
+    let n = strings.Len(s)
+    while i < n:
         let ch = s[i]
         if ch < '0' || ch > '9':
             break
@@ -346,10 +352,13 @@ fn ParseInt(s: str): int =
     return parseInt(s)
 
 fn FormatFloat(value: float64): str =
-    return formatFloat(value)
+    let out: str = formatFloat(value)
+    return out
 
 fn FormatFloat(value: float64, mode: FloatFormatMode): str =
-    return formatFloat(value, mode)
+    let out: str = formatFloat(value, mode)
+    return out
 
 fn FormatFloat(value: float64, mode: FloatFormatMode, precision: int): str =
-    return formatFloat(value, mode, precision)
+    let out: str = formatFloat(value, mode, precision)
+    return out
