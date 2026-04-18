@@ -61,6 +61,7 @@ type
         version: int32
         packageId: str
         sourceBundleCid: layout.FixedBytes32
+        exprLayer: parser.V3NormalizedExprLayer
         nodeCount: int32
         edgeCount: int32
         nodes: V3CompilerCsgNode[]
@@ -116,10 +117,118 @@ type
         exportSurface: V3CsgExportSurface
         migrationCid: layout.FixedBytes32
 
+fn v3CompilerCsgCloneStrSeq(items: str[]): str[] =
+    var out: str[] = []
+    for i in 0..<items.len:
+        add(out, items[i])
+    return out
+
+fn v3CompilerCsgCloneInt32Seq(items: int32[]): int32[] =
+    var out: int32[] = []
+    for i in 0..<items.len:
+        add(out, items[i])
+    return out
+
+fn v3CompilerCsgCloneNode(node: V3CompilerCsgNode): V3CompilerCsgNode =
+    var out: V3CompilerCsgNode
+    out.nodeId = node.nodeId
+    out.nodeKind = node.nodeKind
+    out.ownerNodeId = node.ownerNodeId
+    out.modulePath = node.modulePath
+    out.symbolText = node.symbolText
+    out.factText = node.factText
+    out.resultLayoutKind = node.resultLayoutKind
+    out.effectKind = node.effectKind
+    out.capabilityKind = node.capabilityKind
+    out.callConv = node.callConv
+    out.entryFlag = node.entryFlag
+    out.exportedFlag = node.exportedFlag
+    out.exportSymbolName = node.exportSymbolName
+    out.factCid = node.factCid
+    return out
+
+fn v3CompilerCsgCloneNodes(nodes: V3CompilerCsgNode[]): V3CompilerCsgNode[] =
+    var out: V3CompilerCsgNode[] = []
+    for i in 0..<nodes.len:
+        add(out, v3CompilerCsgCloneNode(nodes[i]))
+    return out
+
+fn v3CompilerCsgCloneEdge(edge: V3CompilerCsgEdge): V3CompilerCsgEdge =
+    var out: V3CompilerCsgEdge
+    out.edgeId = edge.edgeId
+    out.fromNodeId = edge.fromNodeId
+    out.toNodeId = edge.toNodeId
+    out.edgeKind = edge.edgeKind
+    out.edgeCid = edge.edgeCid
+    return out
+
+fn v3CompilerCsgCloneEdges(edges: V3CompilerCsgEdge[]): V3CompilerCsgEdge[] =
+    var out: V3CompilerCsgEdge[] = []
+    for i in 0..<edges.len:
+        add(out, v3CompilerCsgCloneEdge(edges[i]))
+    return out
+
+fn v3CompilerCsgClone(csg: V3CompilerCsg): V3CompilerCsg =
+    var out: V3CompilerCsg
+    out.version = csg.version
+    out.packageId = csg.packageId
+    out.sourceBundleCid = csg.sourceBundleCid
+    out.exprLayer = parser.v3NormalizedExprLayerClone(csg.exprLayer)
+    out.nodeCount = csg.nodeCount
+    out.edgeCount = csg.edgeCount
+    out.nodes = v3CompilerCsgCloneNodes(csg.nodes)
+    out.edges = v3CompilerCsgCloneEdges(csg.edges)
+    out.canonicalGraphCid = csg.canonicalGraphCid
+    out.graphCid = csg.graphCid
+    return out
+
+fn v3CompilerExportSurfaceClone(surface: V3CsgExportSurface): V3CsgExportSurface =
+    var out: V3CsgExportSurface
+    out.version = surface.version
+    out.packageId = surface.packageId
+    out.exportedSymbolCount = surface.exportedSymbolCount
+    out.exportedSymbols = v3CompilerCsgCloneStrSeq(surface.exportedSymbols)
+    out.exportedTargetNames = v3CompilerCsgCloneStrSeq(surface.exportedTargetNames)
+    out.exportedLayouts = v3CompilerCsgCloneInt32Seq(surface.exportedLayouts)
+    out.exportedEffects = v3CompilerCsgCloneInt32Seq(surface.exportedEffects)
+    out.exportedCapabilities = v3CompilerCsgCloneInt32Seq(surface.exportedCapabilities)
+    out.surfaceCid = surface.surfaceCid
+    return out
+
+fn v3CompilerLegacyMigrationClone(migration: V3CompilerLegacyMigration): V3CompilerLegacyMigration =
+    var out: V3CompilerLegacyMigration
+    out.version = migration.version
+    out.packageId = migration.packageId
+    out.entrySourcePath = migration.entrySourcePath
+    out.entryModulePath = migration.entryModulePath
+    out.unitCount = migration.unitCount
+    out.appliedRuleCount = migration.appliedRuleCount
+    out.appliedRules = v3CompilerCsgCloneStrSeq(migration.appliedRules)
+    out.legacySourceBundleCid = migration.legacySourceBundleCid
+    out.migratedSourceBundleCid = migration.migratedSourceBundleCid
+    out.compilerCsg = v3CompilerCsgClone(migration.compilerCsg)
+    out.exportSurface = v3CompilerExportSurfaceClone(migration.exportSurface)
+    out.migrationCid = migration.migrationCid
+    return out
+
 fn v3CompilerCsgAppendText(buf: var layout.ByteBuf, text: str) =
     lt.v3AppendU32BE(buf, len(text))
     for i in 0..<len(text):
         layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn v3CompilerCsgAppendExprLayer(buf: var layout.ByteBuf,
+                                layer: parser.V3NormalizedExprLayer) =
+    lt.v3AppendU32BE(buf, layer.sourceCount)
+    lt.v3AppendU32BE(buf, layer.exprs.len)
+    lt.v3AppendU32BE(buf, layer.questionResidualCount)
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        v3CompilerCsgAppendText(buf, expr.sourcePath)
+        lt.v3AppendU32BE(buf, expr.lineNumber)
+        lt.v3AppendU32BE(buf, expr.columnNumber)
+        v3CompilerCsgAppendText(buf, parser.v3NormalizedExprKindText(expr.kind))
+        v3CompilerCsgAppendText(buf, expr.detail)
+        v3CompilerCsgAppendText(buf, expr.surfaceText)
 
 fn v3CompilerCsgHashNode(nodeKind: int32,
                          ownerNodeId: int32,
@@ -161,12 +270,14 @@ fn v3CompilerCsgHashEdge(fromNodeId: int32,
 
 fn v3CompilerCsgGraphCid(packageId: str,
                          sourceBundleCid: layout.FixedBytes32,
+                         exprLayer: parser.V3NormalizedExprLayer,
                          nodes: V3CompilerCsgNode[],
                          edges: V3CompilerCsgEdge[]): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(512)
     v3CompilerCsgAppendText(buf, "v3.compiler.csg.graph")
     v3CompilerCsgAppendText(buf, packageId)
     lt.v3AppendFixed32(buf, sourceBundleCid)
+    v3CompilerCsgAppendExprLayer(buf, exprLayer)
     lt.v3AppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
         let node = nodes[i]
@@ -195,11 +306,13 @@ fn v3CompilerCsgGraphCid(packageId: str,
     return lt.v3FixedCidFromBuf(buf)
 
 fn v3CompilerCsgCanonicalGraphCid(packageId: str,
+                                  exprLayer: parser.V3NormalizedExprLayer,
                                   nodes: V3CompilerCsgNode[],
                                   edges: V3CompilerCsgEdge[]): layout.FixedBytes32 =
     var buf: layout.ByteBuf = layout.byteBufInit(512)
     v3CompilerCsgAppendText(buf, "v3.compiler.csg.canonical_graph")
     v3CompilerCsgAppendText(buf, packageId)
+    let _ = exprLayer
     lt.v3AppendU32BE(buf, nodes.len)
     for i in 0..<nodes.len:
         let node = nodes[i]
@@ -296,28 +409,10 @@ fn v3CompilerCsgSortImportPairs(pairs: var V3CompilerCsgImportPair[]) =
         i = i + 1
 
 fn v3CompilerCsgFunctionNameFromLine(lineRaw: str): str =
-    let line = v3path.V3PathTrim(lineRaw)
-    if !v3path.V3TextStartsWith(line, "fn "):
-        return ""
-    let tail = v3path.V3TextSlice(line, len("fn "), len(line) - len("fn "))
-    let firstToken = parser.v3ParserFirstToken(tail)
-    var stop: int32 = 0
-    for i in 0..<len(firstToken):
-        let ch = firstToken[i]
-        let digit = ch >= '0' && ch <= '9'
-        let upper = ch >= 'A' && ch <= 'Z'
-        let lower = ch >= 'a' && ch <= 'z'
-        if digit || upper || lower || ch == '_':
-            stop = i + 1
-        else:
-            break
-    if stop <= 0:
-        return ""
-    return v3path.V3TextSlice(firstToken, 0, stop)
+    return parser.v3ParserFunctionNameFromLine(lineRaw)
 
 fn v3CompilerCsgIsImportcAnnotation(lineRaw: str): bool =
-    let line = v3path.V3PathTrim(lineRaw)
-    return v3path.V3TextStartsWith(line, "@importc")
+    return parser.v3ParserIsImportcAnnotation(lineRaw)
 
 fn v3CompilerCsgModuleNodeId(nodes: V3CompilerCsgNode[],
                              modulePath: str): int32 =
@@ -354,34 +449,10 @@ fn v3CompilerCsgFindText(text: str,
     return -1
 
 fn v3CompilerCsgExportNameFromAnnotation(lineRaw: str): str =
-    let line = v3path.V3PathTrim(lineRaw)
-    if !v3path.V3TextStartsWith(line, "@compiler_top_level("):
-        return ""
-    let exportPos = v3CompilerCsgFindText(line, "export_name")
-    if exportPos < 0:
-        return ""
-    let quoteStart = v3CompilerCsgFindText(v3path.V3TextSlice(line, exportPos, line.len - exportPos), "\"")
-    if quoteStart < 0:
-        return ""
-    let valueStart = exportPos + quoteStart + 1
-    let tail = v3path.V3TextSlice(line, valueStart, line.len - valueStart)
-    let quoteEnd = v3CompilerCsgFindText(tail, "\"")
-    if quoteEnd <= 0:
-        return ""
-    return v3path.V3TextSlice(line, valueStart, quoteEnd)
+    return parser.v3ParserCompilerTopLevelExportName(lineRaw)
 
 fn v3CompilerCsgExportcNameFromAnnotation(lineRaw: str): str =
-    let line = v3path.V3PathTrim(lineRaw)
-    if !v3path.V3TextStartsWith(line, "@exportc("):
-        return ""
-    let quoteStart = v3CompilerCsgFindText(line, "\"")
-    if quoteStart < 0:
-        return ""
-    let tail = v3path.V3TextSlice(line, quoteStart + 1, line.len - (quoteStart + 1))
-    let quoteEnd = v3CompilerCsgFindText(tail, "\"")
-    if quoteEnd <= 0:
-        return ""
-    return v3path.V3TextSlice(line, quoteStart + 1, quoteEnd)
+    return parser.v3ParserExportcNameFromAnnotation(lineRaw)
 
 fn v3CompilerCsgTargetExportName(symbolText: str,
                                  explicitExportName: str,
@@ -801,8 +872,8 @@ fn v3BuildCompilerLegacyMigration(workspaceRoot: str,
     let csgRes = v3BuildCompilerCsgWithOverrides(plan, Value(migratedBundleRes), overrides)
     if IsErr(csgRes):
         return Err[V3CompilerLegacyMigration](Error(csgRes))
-    let csg = Value(csgRes)
-    let surface = v3CompilerExportSurfaceFromCsg(csg)
+    let csg = v3CompilerCsgClone(Value(csgRes))
+    let surface = v3CompilerExportSurfaceClone(v3CompilerExportSurfaceFromCsg(csg))
     var migBuf: layout.ByteBuf = layout.byteBufInit(256)
     v3CompilerCsgAppendText(migBuf, "v3.compiler.legacy_migration")
     v3CompilerCsgAppendText(migBuf, packageId)
@@ -824,8 +895,8 @@ fn v3BuildCompilerLegacyMigration(workspaceRoot: str,
     out.appliedRules = appliedRules
     out.legacySourceBundleCid = Value(legacyBundleRes)
     out.migratedSourceBundleCid = Value(migratedBundleRes)
-    out.compilerCsg = csg
-    out.exportSurface = surface
+    out.compilerCsg = v3CompilerCsgClone(csg)
+    out.exportSurface = v3CompilerExportSurfaceClone(surface)
     out.migrationCid = lt.v3FixedCidFromBuf(migBuf)
     return Ok[V3CompilerLegacyMigration](out)
 
@@ -901,6 +972,14 @@ fn v3CompilerCsgAddEdge(edges: var V3CompilerCsgEdge[],
     edge.edgeCid = v3CompilerCsgHashEdge(fromNodeId, toNodeId, edgeKind)
     add(edges, edge)
 
+fn v3CompilerCsgExprLayerForText(sourcePath: str,
+                                 text: str,
+                                 layer: var parser.V3NormalizedExprLayer): Result[bool] =
+    var err = ""
+    if !parser.v3ParserReadNormalizedExprLayerFromText(sourcePath, text, layer, err):
+        return Err[bool]("v3 compiler csg: " + sourcePath + ": " + err)
+    return Ok[bool](true)
+
 fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
                                    sourceBundleCid: layout.FixedBytes32,
                                    sourceTextOverrides: V3CompilerCsgSourceText[]): Result[V3CompilerCsg] =
@@ -919,6 +998,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     v3CompilerCsgSortImportPairs(importPairs)
     var nodes: V3CompilerCsgNode[] = []
     var edges: V3CompilerCsgEdge[] = []
+    var exprLayer = parser.v3NormalizedExprLayerZero()
     var packageNode: V3CompilerCsgNode
     packageNode.nodeId = nodes.len + 1
     packageNode.nodeKind = v3CompilerCsgNodeKindPackage
@@ -1006,63 +1086,57 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         var text = ""
         if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, text):
             text = v3path.V3ReadTextFile("", sourcePath)
-        let lines = parser.v3ParserSplitChar(text, '\n')
-        var pendingImportc = false
-        var pendingExportName = ""
+        var sourceExprLayer = parser.v3NormalizedExprLayerZero()
+        let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath, text, sourceExprLayer)
+        if IsErr(sourceExprRes):
+            return Err[V3CompilerCsg](Error(sourceExprRes))
+        parser.v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
+        var decls: parser.V3NormalizedFunctionDecl[] = []
+        var declErr = ""
+        if !parser.v3ParserReadNormalizedFunctionDecls(text, decls, declErr):
+            return Err[V3CompilerCsg]("v3 compiler csg: " + sourcePath + ": " + declErr)
         let entrySourceFlag = sourcePath == linkPlan.entryPath
         var entryHasExplicitExports = false
         if entrySourceFlag && (linkPlan.emitKind == creq.v3EmitShared || linkPlan.emitKind == creq.v3EmitObj):
-            for scanIndex in 0..<lines.len:
-                if len(v3CompilerCsgExportNameFromAnnotation(lines[scanIndex])) > 0:
+            for scanIndex in 0..<decls.len:
+                if decls[scanIndex].importc:
+                    continue
+                if len(decls[scanIndex].explicitExportName) > 0:
                     entryHasExplicitExports = true
                     break
-                if len(v3CompilerCsgExportcNameFromAnnotation(lines[scanIndex])) > 0:
-                    entryHasExplicitExports = true
-                    break
-        for lineIndex in 0..<lines.len:
-            let line = lines[lineIndex]
-            let trimmed = v3path.V3PathTrim(line)
-            let compilerExportName = v3CompilerCsgExportNameFromAnnotation(trimmed)
-            if len(compilerExportName) > 0:
-                pendingExportName = compilerExportName
+        for declIndex in 0..<decls.len:
+            let decl = decls[declIndex]
+            let functionName = decl.name
+            if decl.importc:
                 continue
-            let exportcName = v3CompilerCsgExportcNameFromAnnotation(trimmed)
-            if len(exportcName) > 0:
-                pendingExportName = exportcName
-                continue
-            if v3CompilerCsgIsImportcAnnotation(line):
-                pendingImportc = true
-                pendingExportName = ""
-                continue
-            if pendingImportc && v3path.V3TextStartsWith(trimmed, "@"):
-                continue
-            let functionName = v3CompilerCsgFunctionNameFromLine(line)
-            if len(functionName) <= 0:
-                pendingImportc = false
-                if trimmed != "":
-                    pendingExportName = ""
-                continue
-            if pendingImportc:
-                pendingImportc = false
-                pendingExportName = ""
-                continue
-            let entryFlag = sourcePath == linkPlan.entryPath && functionName == linkPlan.entrySymbol ? 1 : 0
-            let resultLayoutKind = functionName == "main" ? 5 : 0
-            let effectKind = entryFlag != 0 ? v3CompilerCsgEffectProgramEntry : v3CompilerCsgEffectPure
-            let capabilityKind = entryFlag != 0 ? v3CompilerCsgCapabilityEntrypoint : v3CompilerCsgCapabilityInternal
+            let pendingExportName = decl.explicitExportName
+            var entryFlag = 0
+            if sourcePath == linkPlan.entryPath && functionName == linkPlan.entrySymbol:
+                entryFlag = 1
+            var resultLayoutKind = 0
+            if functionName == "main":
+                resultLayoutKind = 5
+            var effectKind = v3CompilerCsgEffectPure
+            if entryFlag != 0:
+                effectKind = v3CompilerCsgEffectProgramEntry
+            var capabilityKind = v3CompilerCsgCapabilityInternal
+            if entryFlag != 0:
+                capabilityKind = v3CompilerCsgCapabilityEntrypoint
             let callConv = 1
             let symbolText = ownerModulePath + "::" + functionName
-            let exportedFlag = v3CompilerCsgShouldExportSymbol(linkPlan.emitKind,
-                                                               entrySourceFlag,
-                                                               entryHasExplicitExports,
-                                                               pendingExportName,
-                                                               functionName,
-                                                               entryFlag) ? 1 : 0
-            let exportSymbolName = exportedFlag != 0 ?
-                                       v3CompilerCsgTargetExportName(symbolText,
-                                                                     pendingExportName,
-                                                                     functionName) :
-                                       ""
+            var exportedFlag = 0
+            if v3CompilerCsgShouldExportSymbol(linkPlan.emitKind,
+                                               entrySourceFlag,
+                                               entryHasExplicitExports,
+                                               pendingExportName,
+                                               functionName,
+                                               entryFlag):
+                exportedFlag = 1
+            var exportSymbolName = ""
+            if exportedFlag != 0:
+                exportSymbolName = v3CompilerCsgTargetExportName(symbolText,
+                                                                 pendingExportName,
+                                                                 functionName)
             var symbolNode: V3CompilerCsgNode
             symbolNode.nodeId = nodes.len + 1
             symbolNode.nodeKind = v3CompilerCsgNodeKindSymbol
@@ -1191,18 +1265,17 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             add(nodes, capabilityNode)
             let capabilityNodeId = capabilityNode.nodeId
             v3CompilerCsgAddEdge(edges, symbolNodeId, capabilityNodeId, v3CompilerCsgEdgeKindHasCapability)
-            pendingExportName = ""
-        pendingImportc = false
     var out: V3CompilerCsg
     out.version = 1
     out.packageId = linkPlan.packageId
     out.sourceBundleCid = sourceBundleCid
+    out.exprLayer = parser.v3NormalizedExprLayerClone(exprLayer)
     out.nodes = nodes
     out.edges = edges
     out.nodeCount = nodes.len
     out.edgeCount = edges.len
-    out.canonicalGraphCid = v3CompilerCsgCanonicalGraphCid(out.packageId, out.nodes, out.edges)
-    out.graphCid = v3CompilerCsgGraphCid(out.packageId, out.sourceBundleCid, out.nodes, out.edges)
+    out.canonicalGraphCid = v3CompilerCsgCanonicalGraphCid(out.packageId, out.exprLayer, out.nodes, out.edges)
+    out.graphCid = v3CompilerCsgGraphCid(out.packageId, out.sourceBundleCid, out.exprLayer, out.nodes, out.edges)
     return Ok[V3CompilerCsg](out)
 
 fn v3BuildCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
@@ -1316,6 +1389,15 @@ fn v3CompilerCsgReport(csg: V3CompilerCsg): str =
     out = out + "version=1\n"
     out = out + "package_id=" + csg.packageId + "\n"
     out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(csg.sourceBundleCid) + "\n"
+    out = out + "expr_surface_source_count=" + intToStr(csg.exprLayer.sourceCount) + "\n"
+    out = out + "expr_surface_expr_count=" + intToStr(parser.v3NormalizedExprLayerExprCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_if_count=" + intToStr(parser.v3NormalizedExprLayerIfCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_range_count=" + intToStr(parser.v3NormalizedExprLayerRangeCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_comprehension_count=" + intToStr(parser.v3NormalizedExprLayerComprehensionCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_fmt_count=" + intToStr(parser.v3NormalizedExprLayerStrFormatCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_result_intrinsic_count=" + intToStr(parser.v3NormalizedExprLayerResultIntrinsicCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_try_count=" + intToStr(parser.v3NormalizedExprLayerTryCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_question_residual_count=" + intToStr(csg.exprLayer.questionResidualCount) + "\n"
     out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
     out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
     out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"

@@ -5,6 +5,7 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/browser_host_wasm_runner_source as browserhostwasm
 import cheng/v3/tooling/compiler_runtime as crun
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
@@ -547,6 +548,9 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
     let runtimeCombinedSmoke = "runtime_program_" + "combined_smoke"
     let runtimeCombinedNegativeSmoke = "runtime_program_" + "combined_negative_smoke"
     let runtimeNativeSourceNeedle = "src/runtime/" + "native/"
+    let browserHostWasmRunnerPathRel: str = "v3/tooling/browser_host_" + "wasm_runner.js"
+    let browserHostWasmRunnerPath: str = v3path.V3PathAbsolute(rootDir, browserHostWasmRunnerPathRel)
+    let browserHostWasmRunnerPathNeedle: str = "tooling/browser_host_" + "wasm_runner.js"
     let legacyRuntimeProgramObjCommandPresent = strutil.Contains(compilerRuntimeText, buildRuntimeObjCmd) ||
                                                 strutil.Contains(compilerRuntimeText, verifyRuntimeObjCmd) ||
                                                 strutil.Contains(compilerMainText, buildRuntimeObjCmd) ||
@@ -561,6 +565,11 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
                                                strutil.Contains(gateMainText, runtimeNativeSourceNeedle) ||
                                                strutil.Contains(seedText, runtimeNativeSourceNeedle)
     let legacyRuntimeCombinedFallbackPresent = false
+    let legacyBrowserHostWasmRunnerPresent: bool = v3path.V3PathFileExists(browserHostWasmRunnerPath) ||
+                                                   strutil.Contains(compilerMainText, browserHostWasmRunnerPathNeedle) ||
+                                                   strutil.Contains(compilerRuntimeText, browserHostWasmRunnerPathNeedle) ||
+                                                   strutil.Contains(gateMainText, browserHostWasmRunnerPathNeedle) ||
+                                                   strutil.Contains(seedText, browserHostWasmRunnerPathNeedle)
     var remainingBoundary: str = "none"
     if legacyRuntimeProgramObjCommandPresent:
         remainingBoundary = "runtime_program_obj_command_surface"
@@ -572,6 +581,8 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
         remainingBoundary = "runtime_native_source_surface"
     elif legacyRuntimeCombinedFallbackPresent:
         remainingBoundary = "runtime_combined_fallback_surface"
+    elif legacyBrowserHostWasmRunnerPresent:
+        remainingBoundary = "browser_host_wasm_runner_surface"
     var out = ""
     if legacyRuntimeProgramObjCommandPresent:
         out = out + "legacy_runtime_program_obj_command_present=1\n"
@@ -593,6 +604,10 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
         out = out + "legacy_runtime_combined_fallback_present=1\n"
     else:
         out = out + "legacy_runtime_combined_fallback_present=0\n"
+    if legacyBrowserHostWasmRunnerPresent:
+        out = out + "legacy_browser_host_wasm_runner_present=1\n"
+    else:
+        out = out + "legacy_browser_host_wasm_runner_present=0\n"
     out = out + "remaining_non_pure_cheng_boundary=" + remainingBoundary + "\n"
     if remainingBoundary == "none":
         out = out + "pure_cheng_zero_c_ready=1\n"
@@ -1094,6 +1109,173 @@ fn v3BackendDriverRunGateTool(rootDir: str,
                                             "gate_tool",
                                             "v3/src/tooling/gate_main.cheng",
                                             args)
+
+fn v3BackendDriverArgsWithoutFlag(args: str[],
+                                  key: str): str[] =
+    let colonPrefixRaw: str = key + ":"
+    let equalPrefixRaw: str = key + "="
+    let colonPrefix: str = newStringCopy(strDataPtr(colonPrefixRaw), strLenFast(colonPrefixRaw))
+    let equalPrefix: str = newStringCopy(strDataPtr(equalPrefixRaw), strLenFast(equalPrefixRaw))
+    var out: str[] = []
+    var i: int32 = 0
+    while i < args.len:
+        let arg: str = args[i]
+        if arg == key:
+            i = i + 1
+            if i < args.len:
+                i = i + 1
+            continue
+        if arg.len >= colonPrefix.len:
+            let prefix: str = strings.SliceBytes(arg, 0, colonPrefix.len)
+            if prefix == colonPrefix:
+                i = i + 1
+                continue
+        if arg.len >= equalPrefix.len:
+            let prefix: str = strings.SliceBytes(arg, 0, equalPrefix.len)
+            if prefix == equalPrefix:
+                i = i + 1
+                continue
+        add(out, arg)
+        i = i + 1
+    return out
+
+fn v3BackendDriverCollectPositionals(args: str[]): str[] =
+    var out: str[] = []
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if arg.len >= 2 && arg[0] == '-' && arg[1] == '-':
+            continue
+        add(out, arg)
+    return out
+
+fn v3BackendDriverNodeTimeoutSec(): int32 =
+    return int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_NODE_TIMEOUT_SEC", "120")))
+
+fn v3BackendDriverRunNodeSource(rootDir: str,
+                                label: str,
+                                sourceText: str,
+                                args: str[],
+                                logPath: str): hostops.V3LoggedRun =
+    if len(sourceText) <= 0:
+        let outputText = "missing node source\n"
+        let _logged = v3path.V3WriteTextFile(rootDir, logPath, outputText)
+        return hostops.v3LoggedRunZero(label, "node", logPath, 1, outputText)
+    var nodeArgs: str[] = ["-"]
+    for i in 0..<args.len:
+        add(nodeArgs, args[i])
+    return hostops.v3RunProgramLoggedWithInputText(rootDir,
+                                                   label,
+                                                   "node",
+                                                   nodeArgs,
+                                                   [],
+                                                   rootDir,
+                                                   v3BackendDriverNodeTimeoutSec(),
+                                                   logPath,
+                                                   sourceText)
+
+fn v3BackendDriverResolveBrowserHostWasmCompiler(rootDir: str,
+                                                 args: str[],
+                                                 outCompiler: var str): bool =
+    let explicitRaw: str = v3BackendDriverReadFlag(args, "--compiler", "")
+    let explicit: str = strutil.Strip(explicitRaw)
+    if len(explicit) > 0:
+        outCompiler = v3path.V3PathAbsolute(rootDir, explicit)
+        return true
+    return v3BackendDriverResolveToolCompiler(rootDir, "browser-host-wasm", outCompiler)
+
+fn v3BackendDriverBuildBrowserHostWasmArtifact(rootDir: str,
+                                               outWasm: str,
+                                               logPath: str,
+                                               label: str): int32 =
+    let stage3Path: str = v3BackendDriverStage3Path(rootDir)
+    if !v3path.V3FileExistsNonEmpty(rootDir, stage3Path):
+        v3BackendDriverPrintErr("v3 backend driver: missing stage3 compiler: " + stage3Path)
+        return 2
+    let timeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")))
+    let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(rootDir,
+                                                           label,
+                                                           stage3Path,
+                                                           ["build-browser-host-wasm", outWasm],
+                                                           ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                                           rootDir,
+                                                           timeoutSec,
+                                                           logPath)
+    let outputText: str = strutil.Strip(run.output)
+    if len(outputText) > 0:
+        if run.exitCode == 0:
+            v3BackendDriverPrintStdoutBlock(outputText)
+        else:
+            v3BackendDriverPrintStderrBlock(outputText)
+    if run.exitCode != 0:
+        v3BackendDriverPrintErr("v3 browser host wasm build rc=" +
+                                intToStr(run.exitCode) + " log=" + run.logPath)
+        return run.exitCode
+    if !os.FileExists(outWasm):
+        v3BackendDriverPrintErr("v3 browser host wasm: missing wasm output: " + outWasm)
+        return 1
+    return 0
+
+fn v3BackendDriverBuildBrowserHostWasm(rootDir: str,
+                                       args: str[]): int32 =
+    let filteredArgs: str[] = v3BackendDriverArgsWithoutFlag(args, "--compiler")
+    let positionals: str[] = v3BackendDriverCollectPositionals(filteredArgs)
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_browser_host_wasm")
+    var outWasm: str = os.GetEnvDefault("CHENG_V3_BROWSER_HOST_WASM_OUT", "")
+    if len(outWasm) <= 0 && positionals.len > 0:
+        outWasm = positionals[0]
+    if len(outWasm) <= 0:
+        outWasm = os.JoinPath(outDir, "cheng_browser_host_abi.wasm")
+    else:
+        outWasm = v3path.V3PathAbsolute(rootDir, outWasm)
+    return v3BackendDriverBuildBrowserHostWasmArtifact(rootDir,
+                                                       outWasm,
+                                                       os.JoinPath(outDir, "cheng_browser_host_abi.compile.log"),
+                                                       "build_browser_host_wasm")
+
+fn v3BackendDriverRunBrowserHostWasmSmoke(rootDir: str,
+                                          args: str[]): int32 =
+    let filteredArgs: str[] = v3BackendDriverArgsWithoutFlag(args, "--compiler")
+    let label: str = v3BackendDriverResolveSmokeLabel(filteredArgs, "CHENG_V3_WASM_LABEL", "host")
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_browser_host_wasm")
+    let outWasm: str = os.JoinPath(outDir, "cheng_browser_host_abi." + label + ".wasm")
+    let buildCode: int32 = v3BackendDriverBuildBrowserHostWasmArtifact(rootDir,
+                                                                       outWasm,
+                                                                       os.JoinPath(outDir,
+                                                                                   "cheng_browser_host_abi." + label +
+                                                                                       ".compile.log"),
+                                                                       "v3_browser_host_wasm_compile_" + label)
+    if buildCode != 0:
+        return buildCode
+    let runnerSource: str = browserhostwasm.v3BrowserHostWasmRunnerSource()
+    if len(runnerSource) <= 0:
+        v3BackendDriverPrintErr("v3 browser host wasm smoke: failed to decode helper source")
+        return 1
+    let run: hostops.V3LoggedRun = v3BackendDriverRunNodeSource(rootDir,
+                                                                "v3_browser_host_wasm_run_" + label,
+                                                                runnerSource,
+                                                                [outWasm],
+                                                                os.JoinPath(outDir,
+                                                                            "browser_host_wasm." + label +
+                                                                                ".run.log"))
+    v3BackendDriverMaybePrintRunOutput(run)
+    if v3BackendDriverRunFailed("v3 browser host wasm smoke", run):
+        return run.exitCode
+    if !v3BackendDriverRequireOutput(run,
+                                     "v3 browser host wasm smoke: ok",
+                                     "v3 browser host wasm smoke"):
+        return 1
+    return 0
+
+fn v3BackendDriverRunBrowserHostWasmCommand(rootDir: str,
+                                            count: int32,
+                                            commandName: str): int32 =
+    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+    if commandName == "build-browser-host-wasm":
+        return v3BackendDriverBuildBrowserHostWasm(rootDir, args)
+    if commandName == "run-browser-host-wasm-smoke":
+        return v3BackendDriverRunBrowserHostWasmSmoke(rootDir, args)
+    v3BackendDriverPrintErr("v3 backend driver: unknown browser host wasm command: " + commandName)
+    return 2
 
 fn v3BackendDriverBuildChainNodeBinary(rootDir: str,
                                        compilerPath: str,
@@ -2360,6 +2542,9 @@ fn main(argc: int32, argv: str*): int32 =
        cmd == "verify-bft-validator-three-node" ||
        cmd == "bench-bft-validator-three-node":
         return v3BackendDriverRunGateTool(rootDir, count)
+    if cmd == "build-browser-host-wasm" ||
+       cmd == "run-browser-host-wasm-smoke":
+        return v3BackendDriverRunBrowserHostWasmCommand(rootDir, count, cmd)
     if cmd == "verify-backend-driver-command-surface":
         return v3BackendDriverVerifyBackendDriverCommandSurface(rootDir, count)
     if cmd == "verify-mobile-shell-build-probe":

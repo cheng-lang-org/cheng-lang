@@ -1,4 +1,6 @@
 2026-04-18
+- ordinary 控制面里，帮助文本或状态文本别再写成长串直接 `return "a" + "b" + "c"`。这轮 `cheng_node ctl` 已现场坐实：这种形状会把返回边界踩坏，`lr` 直接跳进 `__cstring` 常量区；最稳收法是像这轮这样用 `var out` 逐段 `out = out + ...`，尤其是 usage/help/report 这类高频字符串拼装函数。
+- ordinary 新模块里，只要初始化阶段要造小型 `seq` backing store，第一刀不要直接赌 `reserve/setLen`。这轮 [cheng_node_map.cheng](/Users/lbcheng/cheng-lang/v3/src/project/cheng_node_map.cheng) 已经现场坐实：`V3ChengNodeStrIntMapInitInPlace(...)` 直接调这两个 helper 会卡在 `primary_object` lowering；最稳口径是先按槽位 `add` 出固定容量，等编译器把 helper 调用边界补稳后再回收。
 - `program_runtime.combined` 这类历史 runtime link input 从主线退场后，别只看一次 [build_backend_driver_v3.log](/Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/build_backend_driver_v3.log) 就算完成。最稳口径是补 host smoke，真实再编一条 ordinary fixture，并硬卡 report 不得出现 `program_runtime.combined` 或 `system_helpers_compat_bridge`；否则 seed/default smoke 列表一漂，旧 runtime input 很容易悄悄挂回来。
 - `std/crypto/sha256` 这类需要严格 32 位环绕语义的实现，别在没补齐运算语义验证前直接从 `int64+显式 u32 截断` 改写成裸 `uint32` 版。像这轮 `sha256_runtime_smoke/fixed256_sha256_smoke` 已经现场坐实：源码看起来更“直”，但当前运行时的 `uint32` 算术/位运算链并没有等价守住，结果直接把标准向量算坏；最稳口径是先保留已通过 smoke 的 `int64 + u32(...)` 实现，再单独补一个逐轮中间态对拍后再谈收窄类型。
 - formal spec 已经把跨模块可见性定成“首字母大写才导出”，`std/strformat` 不能再留 `strfmt.fmt / strfmt.lines` 这种小写兼容层；如果用户要语法级模板，就直接把 `Fmt / Lines` 下沉成裸 special form，公开文档和仓内示例统一写 `Fmt"..."`、`Fmt(parts)`、`Lines(parts)`。
@@ -628,3 +630,22 @@
 - `2026-04-18 23:59 +0800`：wasm 里只要是“先拿目标地址，再去算复合 lvalue/member/index 源值”的路径，都不要把目标地址放进 `emit_lvalue_address(...)` 自己会复用的 scratch。像这轮 `expr_surface_abi`，`return values[0]` 和 `add(rows, droplets[idx])` 都是同一类串写：目标地址先落 `scratch_local/scratch2`，子表达式求值再把它覆盖。最稳口径是进入这类 lowering 前先把目标地址转存到独占 scratch，再做 copy/store。 |
 - `2026-04-18 23:59 +0800`：删旧运行时目录时，顺序必须是“先迁仍存活的旧链路 source list，再清活动源码里的旧路径字面，最后物理删目录”。直接先删目录，只会把审计和 seed 死链一起炸出来，真假混在一团。 |
 - `2026-04-18 23:59 +0800`：源码审计里不要把自己要查的旧路径完整字面写回源码。像这轮 `src/runtime/native/` 如果不拆成拼接常量，`legacy_runtime_native_source_path_present` 就会稳定自报自己命中自己。 |
+- `2026-04-18 06:16 +0800`：删旧版本目录前，先查包键归一化和私有可见性是不是还把它当内部宇宙成员。像这轮 `v2` 真剩下的活口不在 build/runtime 主链，而在 seed 的 `v3_module_package_key(...)`/`v3_module_paths_share_package(...)` 和 stage1 的 `frontend_lib/semantics`；这几处不先摘，物理删目录也只是表面干净。 |
+- `2026-04-18 06:16 +0800`：判断“旧版本是否还依赖着”时，优先看非文档活动源码和 fresh 验收，不要被 Markdown 历史记录带偏。像这轮 `v2` 目录删完后，文档里还会继续出现 `v2/...`，但真正该看的信号是 `rg` 在非文档源码里已经空、fresh `stage0/build-backend-driver/zero-c smokes` 继续全绿。 |
+- `2026-04-18 20:30 +0800`：验证编译器源码改动时，先确认入口是不是会偷偷转发到旧 `stage3`。像这轮 live `backend_driver cheng.new run-host-smokes` 实际只会 forward 给现有 `artifacts/v3_bootstrap/cheng.stage3`，根本测不到新源码；真正要验 parser/csg/lowering 变化，必须直接跑 `cheng.stage3 run-host-smokes` 让它现编新的 smoke 二进制。 |
+- `2026-04-18 20:30 +0800`：parser/语义 smoke 不要再在测试体里手拼超长源码字符串。像这轮 `parser_normalized_source_smoke` 最先炸的就是长串 `+` 拼接把运行时字符串桥压坏；最稳口径是把待解析源码落成 repo fixture 文件，再由 smoke 读文件去验 parser 逻辑。 |
+- `2026-04-18 20:30 +0800`：当前 seed 还扛不住控制面源码里某些局部 `?:` 绑定推断，尤其是 `let name = cond ? a : ""` 这种字符串分支。只要目标是让 selfhost/stage3 现编稳定通过，编译器控制面代码优先写显式 `var + if`，不要继续给 seed 留推断空间。 |
+- `2026-04-18 21:15 +0800`：`canonicalGraphCid` 只能承载规范化后的语义信息，不能混进 `exprSummary` 这类源码表面统计。否则像 `proc/else if` 迁到 `fn/elif` 这种语义等价、表面不同的迁移，会被误判成 canonical graph 漂移。 |
+- `2026-04-18 21:15 +0800`：`Result[复合值]` 里只要装的是带 `seq/str[]` 的大结构，就不要直接跨后续调用长期拿着 `Value(...)` 用。最稳口径是先 clone 成自有对象，再继续传给 export surface、migration report、system link 这些后续链路。 |
+- `2026-04-18 21:33 +0800`：browser host wasm 这条零脚本主线不能再把 helper 作为仓内 `.js` 源文件保留。最稳口径是把 helper payload 收进 Cheng 源码，在运行时临时物化；zero-c/zero-script 审计也要直接守这条活动源码面。 |
+- `2026-04-18 21:33 +0800`：当前 ordinary 子集里，用独立 helper 模块走 `os.Open/os.WriteLine` 还不是稳形状。这类小写文件工具如果直接打红，就别继续耗在那条路上，先换成现有 ordinary 能稳定过的 `os.WriteFile(...)` 形状。 |
+- `2026-04-18 21:33 +0800`：控制面不要在 Cheng 里逐行拼超长 helper 文本。像这轮 browser wasm runner，只要走大串拼接，`stage3 system-link-exec ... backend_driver_main.cheng` 就会撞 `RC:139`；最稳口径是分块编码，再在运行时解码落盘。 |
+- `2026-04-18 21:33 +0800`：browser wasm smoke 的正确 build 入口是正式 `build-browser-host-wasm` 命令，不要为了方便把 [gate_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/gate_main.cheng) 整块编成 ordinary probe。先走权威产物链，再补 smoke 自己的最小运行面。 |
+- `2026-04-18 21:33 +0800`：`build-backend-driver` 这类长链看起来长时间无输出时，先查子进程和日志，不要先判成挂死。verify-export 并行阶段本来就会安静很久，这轮最终就是这么跑完的。 |
+- `2026-04-18 21:51 +0800`：`ExecFilePipeSpawn` 这条桥的 `writeFd` 必须真连到子进程 stdin，不能再偷懒复用 stdout 管道。像这轮 `node -` 直喂脚本时，旧实现会把整段源码原样写回自己的 run log；最稳口径就是双管道：父进程拿 `stdout read fd + stdin write fd`，子进程 `dup2(stdinReadFd, 0)`、`dup2(stdoutWriteFd, 1/2)`。 |
+- `2026-04-18 21:51 +0800`：browser/wasm 运行面要清掉临时 helper 文件时，优先用 `node -` + stdin 直喂源码，不要再物化 `.js` 文件。只要 stdin pipe 是真的，这条路比“写一个临时 JS 文件再执行”更短也更稳。 |
+- `2026-04-18 21:51 +0800`：给 `os_host_process` 增能力时，别只改内部 helper，公开包装也要一起补。像这轮 `PtyWrite` 没公开出来，第一条 stdin 回归 smoke 就直接编不过。 |
+- `2026-04-18 21:51 +0800`：zero-c/zero-script 审计不能只看源码面。要真证明“运行时也不落 helper 文件”，就得像这轮一样在 smoke 里顺手跑真命令，再断言目标 `.js` 路径不存在。 |
+- `2026-04-18 21:51 +0800`：现场若已经有旧的长跑 `run-host-smokes` 挂着，`build-backend-driver` wrapper 可能会被拖很久。这种时候不要硬等它当唯一安装通道；先把 fresh 候选验绿，再按同目录候选文件原子替换 live 二进制，并用 `shasum` 对平。 |
+- `2026-04-18 21:50 +0800`：parser 里凡是会做 `line[i - 1]`、`line[rightPos]` 这类索引的边界判断，都不要再写成 `i <= 0 || ...`、`rightPos >= len || ...` 这种短路赌法。当前 ordinary/selfhost 这层不值得信任短路副作用，最稳口径是先落 `leftOk/rightOk` 局部，再显式 `if i > 0`、`if rightPos < len`。 |
+- `2026-04-18 21:50 +0800`：表达式规范化改动不能只靠小 fixture 验。像这轮真正把 bug 钉出来的是 `compiler_pipeline_stub_smoke` 在真实 closure 里扫到 [os.cheng](/Users/lbcheng/cheng-lang/src/std/os.cheng) 的 `return defaultValue`；以后 parser/lowering 这种前端基础层改动，至少再带一条真实 source closure smoke 一起跑。 |

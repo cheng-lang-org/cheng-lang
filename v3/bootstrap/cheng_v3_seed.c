@@ -58190,67 +58190,7 @@ static int v3_cmd_run_wasm_smokes_impl(int argc, char **argv) {
 }
 
 static int v3_cmd_run_browser_host_wasm_smoke_impl(int argc, char **argv) {
-    V3BootstrapPaths paths;
-    char root_v3[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char wasm_path[PATH_MAX];
-    char build_log[PATH_MAX];
-    char js_path[PATH_MAX];
-    char run_log[PATH_MAX];
-    char saved_compiler[PATH_MAX];
-    char *build_argv[3];
-    bool had_compiler = false;
-    const char *compiler_bin;
-    const char *label;
-    char *run_argv[5];
-    int status = 0;
-    if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
-        return 1;
-    }
-    compiler_bin = v3_leaf_resolve_compiler_bin(argc,
-                                                argv,
-                                                "CHENG_V3_WASM_COMPILER",
-                                                "CHENG_V3_SMOKE_COMPILER",
-                                                paths.backend_driver_out);
-    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_WASM_LABEL", "host");
-    if (!v3_leaf_expect_compiler("run-browser-host-wasm-smoke", compiler_bin)) {
-        return 1;
-    }
-    v3_join_path(out_dir, sizeof(out_dir), paths.root, "artifacts/v3_browser_host_wasm");
-    if (!v3_mkdir_p(out_dir)) {
-        return 1;
-    }
-    snprintf(wasm_path, sizeof(wasm_path), "%s/cheng_browser_host_abi.%s.wasm", out_dir, label);
-    snprintf(build_log, sizeof(build_log), "%s/cheng_browser_host_abi.compile.log", out_dir);
-    snprintf(js_path, sizeof(js_path), "%s/tooling/browser_host_wasm_runner.js", root_v3);
-    snprintf(run_log, sizeof(run_log), "%s/cheng_browser_host_abi.%s.run.log", out_dir, label);
-    v3_save_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
-    setenv("CHENG_V3_WASM_COMPILER", compiler_bin, 1);
-    build_argv[0] = (char *)"cheng_v3_seed";
-    build_argv[1] = (char *)"build-browser-host-wasm";
-    build_argv[2] = wasm_path;
-    if (v3_cmd_build_browser_host_wasm_impl(3, build_argv) != 0) {
-        v3_restore_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, had_compiler);
-        return 1;
-    }
-    v3_restore_env_value("CHENG_V3_WASM_COMPILER", saved_compiler, had_compiler);
-    if (!v3_expect_file_exists_nonempty("run-browser-host-wasm-smoke wasm", wasm_path)) {
-        return 1;
-    }
-    if (!v3_expect_file_exists_nonempty("run-browser-host-wasm-smoke runner", js_path)) {
-        return 1;
-    }
-    run_argv[0] = "/usr/bin/env";
-    run_argv[1] = "node";
-    run_argv[2] = js_path;
-    run_argv[3] = wasm_path;
-    run_argv[4] = NULL;
-    if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
-        !v3_status_is_exit_code(status, 0)) {
-        fprintf(stderr, "[cheng_v3_seed] run-browser-host-wasm-smoke node failed log=%s build=%s\n", run_log, build_log);
-        return 1;
-    }
-    return v3_dump_file_stdout(run_log) ? 0 : 1;
+    return v3_require_backend_driver_cli_passthrough("run-browser-host-wasm-smoke", argc, argv);
 }
 
 static int v3_cmd_run_fresh_node_selfhost_gate_impl(int argc, char **argv) {
@@ -59845,6 +59785,7 @@ static int v3_cmd_verify_orphan_guard_impl(int argc, char **argv) {
         "build_backend_driver_v3.sh",
         "build_bounds_trace_v3.sh",
         "build_browser_host_wasm_v3.sh",
+        "browser_host_wasm_runner.js",
         "build_call_chain_v3.sh",
         "build_chain_node_linux_obj_v3.sh",
         "build_chain_node_linux_v3.sh",

@@ -1,0 +1,123 @@
+import std/rawbytes
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/project/cheng_node as node
+import cheng/v3/project/cheng_node_identity as identity
+import cheng/v3/project/cheng_node_index as cindex
+import cheng/v3/project/cheng_node_ctl_main as ctl
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/libp2p/content/moq_fountain as moq
+
+fn main(): int32 =
+    let identityRes = identity.V3ChengNodeIdentityDerive("cheng-node-smoke-root")
+    assert(IsOk(identityRes), "cheng_node core smoke: identity derive")
+    let id = Value(identityRes)
+    assert(identity.v3ChengNodeIdentityDomainCount() == 9, "cheng_node core smoke: identity domain count")
+    assert(!layout.fixedBytes32Equal(id.chainKey, id.didKey), "cheng_node core smoke: chain/did distinct")
+    assert(!layout.fixedBytes32Equal(id.compilerKey, id.adminKey), "cheng_node core smoke: compiler/admin distinct")
+    let nodeRes = node.V3ChengNodeInit("cheng-node-smoke-root")
+    assert(IsOk(nodeRes), "cheng_node core smoke: init")
+    var core = Value(nodeRes)
+    assert(node.V3ChengNodeRequiredIndexCount(core) == 12, "cheng_node core smoke: required indexes")
+    assert(node.V3ChengNodeCapabilityActorCount(core) == 11, "cheng_node core smoke: actor count")
+
+    let compilerSourceCid = node.v3ChengNodeHashTextCid("compiler-source", "pkg://cheng/demo")
+    let compilerCsgCid = node.v3ChengNodeHashTextCid("compiler-csg", "demo")
+    let compilerExportCid = node.v3ChengNodeHashTextCid("compiler-export", "demo")
+    let pkg = cworld.v3CompilerPackageSnapshotMake("pkg://cheng/demo",
+                                                   "stable",
+                                                   compilerSourceCid,
+                                                   compilerCsgCid,
+                                                   compilerExportCid,
+                                                   "stage3_local")
+    let pkgProofRes = node.V3ChengNodeAnchorCompilerPackage(core, pkg)
+    assert(IsOk(pkgProofRes), "cheng_node core smoke: compiler package anchor")
+    let pkgEntryRes = cindex.V3ChengNodeIndexGet(core.indices, "compiler", "package", pkg.packageId)
+    assert(IsOk(pkgEntryRes), "cheng_node core smoke: compiler package query")
+    let pkgEntry = Value(pkgEntryRes)
+    assert(layout.fixedBytes32Equal(pkgEntry.valueCid, pkg.snapshotCid), "cheng_node core smoke: compiler package cid")
+
+    let worldHead = cworld.v3CompilerWorldHeadMake("stable",
+                                                   1,
+                                                   layout.fixedBytes32Zero(),
+                                                   compilerCsgCid,
+                                                   pkg.snapshotCid,
+                                                   pkg.snapshotCid,
+                                                   pkg.snapshotCid,
+                                                   "stage3_local")
+    let worldProofRes = node.V3ChengNodeAnchorCompilerWorldHead(core, worldHead)
+    assert(IsOk(worldProofRes), "cheng_node core smoke: compiler world head anchor")
+    let worldEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                   "compiler",
+                                                   "world_head",
+                                                   layout.fixedBytes32Hex(worldHead.headCid))
+    assert(IsOk(worldEntryRes), "cheng_node core smoke: compiler world head query")
+
+    let balanceKey = cindex.v3ChengNodeBalanceKey(1, 42)
+    let balanceCidA = node.v3ChengNodeHashTextCid("balance", "10")
+    let balanceCidB = node.v3ChengNodeHashTextCid("balance", "25")
+    let balanceProofA = node.V3ChengNodeAnchorIndexedObject(core,
+                                                            "chain",
+                                                            "balance",
+                                                            "asset_account",
+                                                            balanceKey,
+                                                            "balance_cell",
+                                                            balanceCidA)
+    assert(IsOk(balanceProofA), "cheng_node core smoke: balance create")
+    let balanceProofB = node.V3ChengNodeAnchorIndexedObject(core,
+                                                            "chain",
+                                                            "balance",
+                                                            "asset_account",
+                                                            balanceKey,
+                                                            "balance_cell",
+                                                            balanceCidB)
+    assert(IsOk(balanceProofB), "cheng_node core smoke: balance update")
+    let balanceEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                     "balance",
+                                                     "asset_account",
+                                                     balanceKey)
+    assert(IsOk(balanceEntryRes), "cheng_node core smoke: balance query")
+    assert(layout.fixedBytes32Equal(Value(balanceEntryRes).valueCid, balanceCidB),
+           "cheng_node core smoke: balance latest cid")
+    let balanceDropRes = node.V3ChengNodeTombstoneIndexedObject(core,
+                                                                "chain",
+                                                                "balance",
+                                                                "asset_account",
+                                                                balanceKey)
+    assert(IsOk(balanceDropRes), "cheng_node core smoke: balance delete")
+    let balanceGoneRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                    "balance",
+                                                    "asset_account",
+                                                    balanceKey)
+    assert(IsErr(balanceGoneRes), "cheng_node core smoke: balance tombstoned")
+
+    let moqBuildRes = moq.v3Libp2pMoqBuild(bytesFromString("moq-fountain-smoke"),
+                                           "peer-alpha",
+                                           "peer-bravo,peer-charlie",
+                                           "video/mp4",
+                                           8,
+                                           4,
+                                           2)
+    assert(IsOk(moqBuildRes), "cheng_node core smoke: moq build")
+    let moqProofRes = node.V3ChengNodeAnchorMoqBuild(core, Value(moqBuildRes))
+    assert(IsOk(moqProofRes), "cheng_node core smoke: moq anchor")
+    let moqTopicEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                      "discovery",
+                                                      "topic",
+                                                      Value(moqBuildRes).catalogKey)
+    assert(IsOk(moqTopicEntryRes), "cheng_node core smoke: moq topic query")
+    let moqCapabilityEntryRes = cindex.V3ChengNodeIndexGet(core.indices,
+                                                           "discovery",
+                                                           "capability",
+                                                           "content.moq_fountain")
+    assert(IsOk(moqCapabilityEntryRes), "cheng_node core smoke: moq capability query")
+
+    let usageText = ctl.v3ChengNodeCtlUsageText()
+    assert(strutil.Contains(usageText, "required-surface"), "cheng_node core smoke: ctl usage")
+    let bootstrapTextRes = ctl.v3ChengNodeCtlBootstrapText("cheng-node-smoke-root")
+    assert(IsOk(bootstrapTextRes), "cheng_node core smoke: ctl bootstrap")
+    let bootstrapText = Value(bootstrapTextRes)
+    assert(strutil.Contains(bootstrapText, "actor_count=11"), "cheng_node core smoke: ctl actor count")
+    assert(strutil.Contains(bootstrapText, "required_index_count=12"), "cheng_node core smoke: ctl index count")
+    echo("v3 cheng_node_core_smoke ok")
+    return 0

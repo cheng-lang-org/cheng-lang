@@ -1509,6 +1509,11 @@ fn v3BioDidChainLoadTextForSeq(node: var chain.V3ChainNode,
                                didText: str,
                                bundleSeq: int32): Result[str] =
     let accountId = v3BioDidChainAccountId(didText)
+    return v3BioDidChainLoadTextForAccountSeq(node, accountId, bundleSeq)
+
+fn v3BioDidChainLoadTextForAccountSeq(node: var chain.V3ChainNode,
+                                      accountId: int32,
+                                      bundleSeq: int32): Result[str] =
     var maxOrdinal = 0
     for i in 0..<node.events.len:
         let event = node.events[i]
@@ -1554,6 +1559,45 @@ fn v3BioDidChainLoadTextForSeq(node: var chain.V3ChainNode,
     if IsErr(payloadRes):
         return Err[str](Error(payloadRes))
     return Ok[str](bytesToString(Value(payloadRes)))
+
+fn v3BioDidChainLatestBundles(node: var chain.V3ChainNode): Result[V3BioDidChainBundle[]] =
+    var accountIds: int32[]
+    accountIds = []
+    var maxSeqs: int32[]
+    maxSeqs = []
+    for i in 0..<node.events.len:
+        let event = node.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
+            continue
+        if event.assetId != v3BioDidChainAssetId:
+            continue
+        let accountId = event.toAccount
+        let bundleSeq = event.fromAccount
+        var slot = -1
+        for j in 0..<accountIds.len:
+            if accountIds[j] == accountId:
+                slot = j
+                break
+        if slot < 0:
+            add(accountIds, accountId)
+            add(maxSeqs, bundleSeq)
+            continue
+        if bundleSeq > maxSeqs[slot]:
+            maxSeqs[slot] = bundleSeq
+    var out: V3BioDidChainBundle[]
+    out = []
+    for i in 0..<accountIds.len:
+        let textRes = v3BioDidChainLoadTextForAccountSeq(node, accountIds[i], maxSeqs[i])
+        if IsErr(textRes):
+            return Err[V3BioDidChainBundle[]](Error(textRes))
+        let bundleRes = v3BioDidChainBundleParseText(Value(textRes))
+        if IsErr(bundleRes):
+            return Err[V3BioDidChainBundle[]](Error(bundleRes))
+        let bundle = Value(bundleRes)
+        if bundle.bundleSeq != maxSeqs[i]:
+            return Err[V3BioDidChainBundle[]]("v3 bio did: latest bundle seq mismatch")
+        add(out, bundle)
+    return Ok[V3BioDidChainBundle[]](out)
 
 fn v3BioDidChainLoadLatest(node: var chain.V3ChainNode,
                            didText: str): Result[V3BioDidChainBundle] =
@@ -2544,6 +2588,9 @@ fn V3BioDidImportWithHardwareCapture(node: var chain.V3ChainNode,
 fn V3BioDidChainLoadLatest(node: var chain.V3ChainNode,
                            didText: str): Result[V3BioDidChainBundle] =
     return v3BioDidChainLoadLatest(node, didText)
+
+fn V3BioDidChainLatestBundles(node: var chain.V3ChainNode): Result[V3BioDidChainBundle[]] =
+    return v3BioDidChainLatestBundles(node)
 
 fn V3BioDidChainBundleVerify(bundle: V3BioDidChainBundle): Result[did.V3DidDocument] =
     return v3BioDidChainBundleVerify(bundle)

@@ -1,0 +1,84 @@
+import std/result
+import std/system as system
+import cheng/v3/project/cheng_node_map as cmap
+
+type
+    V3ChengNodeActor =
+        name: str
+        layerName: str
+        mailboxDepth: int32
+        dispatchCount: int32
+        lastEventSeq: int32
+        memoryLimitMb: int32
+        workerCount: int32
+        cancellable: bool
+
+    V3ChengNodeActorDispatch =
+        actorName: str
+        topic: str
+        eventSeq: int32
+
+    V3ChengNodeActorBus =
+        actors: V3ChengNodeActor[]
+        actorIndex: cmap.V3ChengNodeStrIntMap
+        dispatchLog: V3ChengNodeActorDispatch[]
+
+fn v3ChengNodeActorOwnText(text: str): str =
+    return system.SystemToStringStr(text)
+
+fn v3ChengNodeActorRegister(bus: var V3ChengNodeActorBus,
+                            name: str,
+                            layerName: str,
+                            mailboxDepth: int32,
+                            memoryLimitMb: int32,
+                            workerCount: int32,
+                            cancellable: bool) =
+    let actor = V3ChengNodeActor(name: v3ChengNodeActorOwnText(name),
+                                 layerName: v3ChengNodeActorOwnText(layerName),
+                                 mailboxDepth: mailboxDepth,
+                                 dispatchCount: 0,
+                                 lastEventSeq: 0,
+                                 memoryLimitMb: memoryLimitMb,
+                                 workerCount: workerCount,
+                                 cancellable: cancellable)
+    add(bus.actors, actor)
+    cmap.V3ChengNodeStrIntMapPut(bus.actorIndex, name, bus.actors.len)
+
+fn v3ChengNodeActorRegisterDefaults(bus: var V3ChengNodeActorBus) =
+    v3ChengNodeActorRegister(bus, "identity_root", "identity_root", 32, 64, 1, false)
+    v3ChengNodeActorRegister(bus, "event_ledger", "event_ledger", 256, 256, 1, false)
+    v3ChengNodeActorRegister(bus, "transport_discovery", "transport_discovery", 256, 256, 2, true)
+    v3ChengNodeActorRegister(bus, "chain", "capability_domain", 256, 512, 2, true)
+    v3ChengNodeActorRegister(bus, "did", "capability_domain", 128, 256, 1, true)
+    v3ChengNodeActorRegister(bus, "oracle", "capability_domain", 128, 256, 2, true)
+    v3ChengNodeActorRegister(bus, "diloco", "capability_domain", 256, 1024, 4, true)
+    v3ChengNodeActorRegister(bus, "vpn", "capability_domain", 256, 1024, 4, true)
+    v3ChengNodeActorRegister(bus, "compiler", "compiler_domain", 512, 2048, 4, true)
+    v3ChengNodeActorRegister(bus, "content_moq_fountain", "content_plane", 256, 1024, 4, true)
+    v3ChengNodeActorRegister(bus, "admin", "management_control_plane", 128, 128, 1, false)
+
+fn V3ChengNodeActorBusInitInPlace(out: var V3ChengNodeActorBus) =
+    out.actors = []
+    out.dispatchLog = []
+    cmap.V3ChengNodeStrIntMapInitInPlace(out.actorIndex, 32)
+    v3ChengNodeActorRegisterDefaults(out)
+
+fn V3ChengNodeActorBusDispatch(bus: var V3ChengNodeActorBus,
+                               actorName: str,
+                               topic: str,
+                               eventSeq: int32): Result[bool] =
+    var found = false
+    let raw = cmap.V3ChengNodeStrIntMapGet(bus.actorIndex, actorName, found)
+    if !found || raw <= 0:
+        return Err[bool]("cheng_node actor: unknown actor")
+    let slot = raw - 1
+    bus.actors[slot].dispatchCount = bus.actors[slot].dispatchCount + 1
+    bus.actors[slot].lastEventSeq = eventSeq
+    let dispatch = V3ChengNodeActorDispatch(actorName: v3ChengNodeActorOwnText(actorName),
+                                            topic: v3ChengNodeActorOwnText(topic),
+                                            eventSeq: eventSeq)
+    add(bus.dispatchLog, dispatch)
+    return Ok[bool](true)
+
+fn V3ChengNodeActorCount(bus: V3ChengNodeActorBus): int32 =
+    return bus.actors.len

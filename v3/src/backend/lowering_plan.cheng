@@ -16,6 +16,7 @@ type
         entrySymbol: str
         sourceBundleCid: layout.FixedBytes32
         compilerCsgCid: layout.FixedBytes32
+        exprLayer: parser.V3NormalizedExprLayer
         functionSourcePaths: str[]
         functionOwnerModulePaths: str[]
         functionNames: str[]
@@ -51,30 +52,8 @@ fn v3LoweringListText(items: str[]): str =
         out = out + items[i]
     return out
 
-fn v3LoweringIdentPrefix(text: str): str =
-    var stop: int32 = 0
-    for i in 0..<text.len:
-        let ch = text[i]
-        let digit = ch >= '0' && ch <= '9'
-        let upper = ch >= 'A' && ch <= 'Z'
-        let lower = ch >= 'a' && ch <= 'z'
-        if digit || upper || lower || ch == '_':
-            stop = i + 1
-        else:
-            break
-    if stop <= 0:
-        return ""
-    return v3path.V3TextSlice(text, 0, stop)
-
 fn v3LoweringFunctionNameFromLine(lineRaw: str): str =
-    let line = v3path.V3PathTrim(lineRaw)
-    if !v3path.V3TextStartsWith(line, "fn "):
-        return ""
-    let prefixLen = len("fn ")
-    let tailCount = len(line) - prefixLen
-    let tail = v3path.V3TextSlice(line, prefixLen, tailCount)
-    let firstToken = parser.v3ParserFirstToken(tail)
-    return v3LoweringIdentPrefix(firstToken)
+    return parser.v3ParserFunctionNameFromLine(lineRaw)
 
 fn v3LoweringFunctionSymbolText(ownerModulePath: str, functionName: str): str =
     return ownerModulePath + "::" + functionName
@@ -106,22 +85,14 @@ fn v3LoweringCollectFunctionsFromSource(workspaceRoot: str,
         return false
     let ownerModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
     let text = v3path.V3ReadTextFile("", sourcePath)
-    let lines = parser.v3ParserSplitChar(text, '\n')
-    var pendingImportc = false
-    for i in 0..<lines.len:
-        let line = lines[i]
-        let trimmed = v3path.V3PathTrim(line)
-        if trimmed == "":
-            continue
-        if v3LoweringIsImportcAnnotation(trimmed):
-            pendingImportc = true
-            continue
-        let functionName = v3LoweringFunctionNameFromLine(line)
-        if len(functionName) <= 0:
-            pendingImportc = false
-            continue
-        if pendingImportc:
-            pendingImportc = false
+    var decls: parser.V3NormalizedFunctionDecl[] = []
+    var err = ""
+    if !parser.v3ParserReadNormalizedFunctionDecls(text, decls, err):
+        return false
+    for i in 0..<decls.len:
+        let decl = decls[i]
+        let functionName = decl.name
+        if decl.importc:
             continue
         let symbolText = v3LoweringFunctionSymbolText(ownerModulePath, functionName)
         var entryFlag: int32 = 0
@@ -206,6 +177,7 @@ fn v3BuildLoweringPlanStubFromCompilerCsg(linkPlan: slplan.V3SystemLinkPlanStub,
     plan.entrySymbol = entrySymbol
     plan.sourceBundleCid = compilerCsg.sourceBundleCid
     plan.compilerCsgCid = compilerCsg.graphCid
+    plan.exprLayer = parser.v3NormalizedExprLayerClone(compilerCsg.exprLayer)
     plan.missingReasons = missingReasons
     plan.pipelineStage = "canonical_csg_to_lowering_plan_stub"
     err = ""
@@ -238,7 +210,8 @@ fn v3BuildLoweringPlanStub(linkPlan: slplan.V3SystemLinkPlanStub,
     if IsErr(csgRes):
         err = Error(csgRes)
         return false
-    return v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, Value(csgRes), plan, err)
+    let csg = ccsg.v3CompilerCsgClone(Value(csgRes))
+    return v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, csg, plan, err)
 
 fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     var out: str = ""
@@ -254,6 +227,15 @@ fn v3LoweringPlanStubReport(plan: V3LoweringPlanStub): str =
     v3LoweringAppendLine(out, "lowering_function_count", functionCount)
     v3LoweringAppendLine(out, "lowering_functions", functionList)
     v3LoweringAppendLine(out, "lowering_entry_function", entryFunction)
+    v3LoweringAppendLine(out, "expr_surface_source_count", intToStr(plan.exprLayer.sourceCount))
+    v3LoweringAppendLine(out, "expr_surface_expr_count", intToStr(parser.v3NormalizedExprLayerExprCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_if_count", intToStr(parser.v3NormalizedExprLayerIfCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_range_count", intToStr(parser.v3NormalizedExprLayerRangeCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_comprehension_count", intToStr(parser.v3NormalizedExprLayerComprehensionCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_fmt_count", intToStr(parser.v3NormalizedExprLayerStrFormatCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_result_intrinsic_count", intToStr(parser.v3NormalizedExprLayerResultIntrinsicCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_try_count", intToStr(parser.v3NormalizedExprLayerTryCount(plan.exprLayer)))
+    v3LoweringAppendLine(out, "expr_surface_question_residual_count", intToStr(plan.exprLayer.questionResidualCount))
     v3LoweringAppendLine(out, "lowering_source_bundle_cid", layout.fixedBytes32Hex(plan.sourceBundleCid))
     v3LoweringAppendLine(out, "lowering_compiler_csg_cid", layout.fixedBytes32Hex(plan.compilerCsgCid))
     v3LoweringAppendLine(out, "lowering_missing_reasons", missingReasons)

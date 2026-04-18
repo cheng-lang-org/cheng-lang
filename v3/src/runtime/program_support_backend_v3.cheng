@@ -1037,37 +1037,62 @@ fn cheng_exec_program_spawn_pipe_argv(argvRaw: ptr,
     let program = *(VoidPtrPtr(argvRaw))
     if program == nil || *UInt8Ptr(program) == uint8(0):
         return 0
-    let fds: ptr = cheng_malloc_export(2 * int32(sizeof int32))
-    if fds == nil:
+    let stdoutFds: ptr = cheng_malloc_export(2 * int32(sizeof int32))
+    if stdoutFds == nil:
         return 0
-    cheng_bytes_set(fds, 0, 2 * int32(sizeof int32))
-    if libc_pipe_runtime(fds) != 0:
-        cheng_free_export(fds)
+    cheng_bytes_set(stdoutFds, 0, 2 * int32(sizeof int32))
+    if libc_pipe_runtime(stdoutFds) != 0:
+        cheng_free_export(stdoutFds)
         return 0
-    var readFd: int32 = cheng_host_fd_at(fds, 0)
-    var writeFd: int32 = cheng_host_fd_at(fds, 1)
+    var stdoutReadFd: int32 = cheng_host_fd_at(stdoutFds, 0)
+    var stdoutWriteFd: int32 = cheng_host_fd_at(stdoutFds, 1)
+    let stdinFds: ptr = cheng_malloc_export(2 * int32(sizeof int32))
+    if stdinFds == nil:
+        cheng_host_close_fd_if_valid(stdoutReadFd)
+        cheng_host_close_fd_if_valid(stdoutWriteFd)
+        cheng_free_export(stdoutFds)
+        return 0
+    cheng_bytes_set(stdinFds, 0, 2 * int32(sizeof int32))
+    if libc_pipe_runtime(stdinFds) != 0:
+        cheng_host_close_fd_if_valid(stdoutReadFd)
+        cheng_host_close_fd_if_valid(stdoutWriteFd)
+        cheng_free_export(stdoutFds)
+        cheng_free_export(stdinFds)
+        return 0
+    var stdinReadFd: int32 = cheng_host_fd_at(stdinFds, 0)
+    var stdinWriteFd: int32 = cheng_host_fd_at(stdinFds, 1)
     let pid32: int32 = libc_fork_runtime()
     if pid32 < 0:
-        cheng_host_close_fd_if_valid(readFd)
-        cheng_host_close_fd_if_valid(writeFd)
-        cheng_free_export(fds)
+        cheng_host_close_fd_if_valid(stdoutReadFd)
+        cheng_host_close_fd_if_valid(stdoutWriteFd)
+        cheng_host_close_fd_if_valid(stdinReadFd)
+        cheng_host_close_fd_if_valid(stdinWriteFd)
+        cheng_free_export(stdoutFds)
+        cheng_free_export(stdinFds)
         return 0
     if pid32 == 0:
         let _setpgid = libc_setpgid_runtime(0, 0)
         if workingDir != nil && *UInt8Ptr(workingDir) != uint8(0):
             let _chdir = libc_chdir_runtime(workingDir)
-        let _dupOut = libc_dup2_runtime(writeFd, 1)
+        let _dupIn = libc_dup2_runtime(stdinReadFd, 0)
+        let _dupOut = libc_dup2_runtime(stdoutWriteFd, 1)
         if mergeStderr != 0:
-            let _dupErr = libc_dup2_runtime(writeFd, 2)
-        cheng_host_close_fd_if_valid(readFd)
-        cheng_host_close_fd_if_valid(writeFd)
+            let _dupErr = libc_dup2_runtime(stdoutWriteFd, 2)
+        cheng_host_close_fd_if_valid(stdoutReadFd)
+        cheng_host_close_fd_if_valid(stdoutWriteFd)
+        cheng_host_close_fd_if_valid(stdinReadFd)
+        cheng_host_close_fd_if_valid(stdinWriteFd)
         let _exec = libc_execvp(program, argvRaw)
         libc__exit_runtime(127)
         return 0
-    cheng_free_export(fds)
-    cheng_host_set_nonblock(readFd)
-    outReadFd = readFd
-    outWriteFd = writeFd
+    cheng_free_export(stdoutFds)
+    cheng_free_export(stdinFds)
+    cheng_host_close_fd_if_valid(stdoutWriteFd)
+    cheng_host_close_fd_if_valid(stdinReadFd)
+    cheng_host_set_nonblock(stdoutReadFd)
+    cheng_host_set_nonblock(stdinWriteFd)
+    outReadFd = stdoutReadFd
+    outWriteFd = stdinWriteFd
     outPid = int64(pid32)
     return 1
 

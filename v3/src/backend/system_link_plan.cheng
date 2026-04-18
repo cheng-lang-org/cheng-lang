@@ -26,6 +26,7 @@ type
         importEdges: parser.V3ImportEdge[]
         importEdgeCount: int32
         unresolvedImportCount: int32
+        exprLayer: parser.V3NormalizedExprLayer
         hasCompilerTopLevel: bool
         mainFunctionPresent: bool
         runtimeTargets: str[]
@@ -151,6 +152,9 @@ fn v3SystemLinkPlanImportEdgeCount(plan: V3SystemLinkPlanStub): int32 =
 fn v3SystemLinkPlanUnresolvedImportCount(plan: V3SystemLinkPlanStub): int32 =
     return plan.unresolvedImportCount
 
+fn v3SystemLinkPlanExprLayer(plan: V3SystemLinkPlanStub): parser.V3NormalizedExprLayer =
+    return plan.exprLayer
+
 fn v3SystemLinkPlanHasCompilerTopLevel(plan: V3SystemLinkPlanStub): bool =
     return plan.hasCompilerTopLevel
 
@@ -213,21 +217,6 @@ fn v3SystemLinkPlanMissingReasons(parsed: parser.V3ParsedSourceStub,
         add(missing, "runtime_provider_modules_not_selected")
     return missing
 
-fn v3SystemLinkPlanSourceHasLegacyFuncAlias(sourcePath: str): bool =
-    if len(sourcePath) <= 0 || !parser.v3ParserSourceExists(sourcePath):
-        return false
-    let lines = strutil.Split(v3path.V3ReadTextFile("", sourcePath), '\n')
-    for i in 0..<lines.len:
-        if strutil.StartsWith(strutil.Strip(lines[i]), "func "):
-            return true
-    return false
-
-fn v3SystemLinkPlanClosureHasLegacyFuncAlias(sourceClosurePaths: str[]): bool =
-    for i in 0..<sourceClosurePaths.len:
-        if v3SystemLinkPlanSourceHasLegacyFuncAlias(sourceClosurePaths[i]):
-            return true
-    return false
-
 fn v3BuildSystemLinkPlanStub(rootDir: str,
                              req: creq.V3CompilerRequest,
                              plan: var V3SystemLinkPlanStub,
@@ -265,8 +254,6 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
                                                  runtimeTargets,
                                                  providerModules,
                                                  entrySymbol)
-    if v3SystemLinkPlanClosureHasLegacyFuncAlias(parsed.orderedClosureSourcePaths):
-        add(missing, "legacy_func_alias_unsupported")
     let linkMode = buildplan.v3BackendBuildPlanDefaultLinkMode()
     let buildSourceUnitCount = buildplan.v3BackendBuildPlanDefaultSourceUnitCount()
     let parsedWorkspaceRoot = parser.v3ParsedSourceWorkspaceRoot(parsed)
@@ -287,6 +274,7 @@ fn v3BuildSystemLinkPlanStub(rootDir: str,
     plan.importEdges = parsed.importEdges
     plan.importEdgeCount = parsed.importEdges.len
     plan.unresolvedImportCount = parsed.unresolvedImportCount
+    plan.exprLayer = parser.v3NormalizedExprLayerClone(parsed.normalizedExprLayer)
     plan.hasCompilerTopLevel = parsed.hasCompilerTopLevel
     plan.mainFunctionPresent = parsed.mainFunctionPresent
     plan.runtimeTargets = runtimeTargets
@@ -322,6 +310,7 @@ fn v3SystemLinkPlanStubReport(plan: V3SystemLinkPlanStub): str =
     let ownerModuleList = v3SystemLinkPlanListText(ownerModulePaths)
     let importEdgeCount = intToStr(v3SystemLinkPlanImportEdgeCount(plan))
     let unresolvedImportCount = intToStr(v3SystemLinkPlanUnresolvedImportCount(plan))
+    let exprLayer = v3SystemLinkPlanExprLayer(plan)
     let hasCompilerTopLevel = v3SystemLinkPlanHasCompilerTopLevel(plan) ? "1" : "0"
     let mainFunctionPresent = v3SystemLinkPlanMainFunctionPresent(plan) ? "1" : "0"
     let runtimeTargets = v3SystemLinkPlanRuntimeTargets(plan)
@@ -354,6 +343,15 @@ fn v3SystemLinkPlanStubReport(plan: V3SystemLinkPlanStub): str =
     v3SystemLinkPlanAppendLine(out, "owner_modules", ownerModuleList)
     v3SystemLinkPlanAppendLine(out, "import_edge_count", importEdgeCount)
     v3SystemLinkPlanAppendLine(out, "unresolved_import_count", unresolvedImportCount)
+    v3SystemLinkPlanAppendLine(out, "expr_surface_source_count", intToStr(exprLayer.sourceCount))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_expr_count", intToStr(parser.v3NormalizedExprLayerExprCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_if_count", intToStr(parser.v3NormalizedExprLayerIfCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_range_count", intToStr(parser.v3NormalizedExprLayerRangeCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_comprehension_count", intToStr(parser.v3NormalizedExprLayerComprehensionCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_fmt_count", intToStr(parser.v3NormalizedExprLayerStrFormatCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_result_intrinsic_count", intToStr(parser.v3NormalizedExprLayerResultIntrinsicCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_try_count", intToStr(parser.v3NormalizedExprLayerTryCount(exprLayer)))
+    v3SystemLinkPlanAppendLine(out, "expr_surface_question_residual_count", intToStr(exprLayer.questionResidualCount))
     v3SystemLinkPlanAppendLine(out, "has_compiler_top_level", hasCompilerTopLevel)
     v3SystemLinkPlanAppendLine(out, "main_function_present", mainFunctionPresent)
     v3SystemLinkPlanAppendLine(out, "runtime_targets", runtimeTargetList)

@@ -1,0 +1,669 @@
+import std/result
+import std/rawbytes
+import std/strings as strings
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/project/cheng_node_identity as identity
+import cheng/v3/project/cheng_node_index as cindex
+import cheng/v3/project/cheng_node_object as cobject
+import cheng/v3/project/cheng_node_ledger as ledger
+import cheng/v3/project/cheng_node_actor as actor
+import cheng/v3/project/chain_node as chain
+import cheng/v3/project/chain_node_cli_core as legacy
+import cheng/v3/project/bio_did_chain_node as bio
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/libp2p/content/moq_fountain as moq
+
+type
+    V3ChengNode =
+        version: int32
+        identity: identity.V3ChengNodeIdentity
+        indices: cindex.V3ChengNodeIndexRegistry
+        objects: cobject.V3ChengNodeObjectStore
+        ledger: ledger.V3ChengNodeLedger
+        actors: actor.V3ChengNodeActorBus
+        chainState: chain.V3ChainNode
+
+fn v3ChengNodeAppendText(buf: var layout.ByteBuf, text: str) =
+    lt.v3AppendU32BE(buf, len(text))
+    for i in 0..<len(text):
+        layout.byteBufAppendByte(buf, int32(text[i]) & 255)
+
+fn v3ChengNodeHashTextCid(tag: str, text: str): layout.FixedBytes32 =
+    var buf = layout.byteBufInit(128)
+    v3ChengNodeAppendText(buf, tag)
+    v3ChengNodeAppendText(buf, text)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ChengNodeSyntheticSnapshotCid(event: ledger.V3ChengNodeEventRecord,
+                                   nextSnapshotVersion: int32): layout.FixedBytes32 =
+    var buf = layout.byteBufInit(192)
+    v3ChengNodeAppendText(buf, "cheng_node.snapshot")
+    lt.v3AppendU32BE(buf, nextSnapshotVersion)
+    v3ChengNodeAppendText(buf, event.objectKind)
+    v3ChengNodeAppendText(buf, event.indexGroup)
+    v3ChengNodeAppendText(buf, event.lookupKind)
+    v3ChengNodeAppendText(buf, event.keyText)
+    lt.v3AppendU32BE(buf, event.seq)
+    lt.v3AppendFixed32(buf, event.payloadCid)
+    lt.v3AppendFixed32(buf, event.eventCid)
+    return lt.v3FixedCidFromBuf(buf)
+
+fn v3ChengNodeDispatchForEvent(node: var V3ChengNode,
+                               actorName: str,
+                               event: ledger.V3ChengNodeEventRecord) =
+    let topic = event.indexGroup + "/" + event.lookupKind
+    let ledgerDispatchRes = actor.V3ChengNodeActorBusDispatch(node.actors, "event_ledger", topic, event.seq)
+    if IsErr(ledgerDispatchRes):
+        let ledgerErr = Error(ledgerDispatchRes)
+        panic ledgerErr
+    if event.indexGroup == "discovery":
+        let transportDispatchRes = actor.V3ChengNodeActorBusDispatch(node.actors, "transport_discovery", topic, event.seq)
+        if IsErr(transportDispatchRes):
+            let transportErr = Error(transportDispatchRes)
+            panic transportErr
+    let actorDispatchRes = actor.V3ChengNodeActorBusDispatch(node.actors, actorName, topic, event.seq)
+    if IsErr(actorDispatchRes):
+        let actorErr = Error(actorDispatchRes)
+        panic actorErr
+
+fn v3ChengNodeRegisterObjectText(node: var V3ChengNode,
+                                 payloadCid: layout.FixedBytes32,
+                                 objectKind: str,
+                                 objectText: str): Result[bool] =
+    if layout.fixedBytes32Equal(payloadCid, layout.fixedBytes32Zero()):
+        return Err[bool]("cheng_node: zero payload cid")
+    return cobject.V3ChengNodeObjectStorePut(node.objects, payloadCid, objectKind, objectText)
+
+fn v3ChengNodeAnchorIndexedCid(node: var V3ChengNode,
+                               actorName: str,
+                               indexGroup: str,
+                               lookupKind: str,
+                               keyText: str,
+                               objectKind: str,
+                               payloadCid: layout.FixedBytes32): Result[ledger.V3ChengNodeProofBundle] =
+    let eventRes = ledger.V3ChengNodeLedgerAppend(node.ledger,
+                                                  actorName,
+                                                  objectKind,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid)
+    if IsErr(eventRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(eventRes))
+    let event = Value(eventRes)
+    v3ChengNodeDispatchForEvent(node, actorName, event)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = v3ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.V3ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotRes))
+    let proofRes = ledger.V3ChengNodeLedgerBuildProof(node.ledger,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      payloadCid,
+                                                      event.eventCid)
+    if IsErr(proofRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(proofRes))
+    let proof = Value(proofRes)
+    let upsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(upsertRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(upsertRes))
+    let snapshotHeadKey = layout.fixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotHeadUpsertRes))
+    let snapshotVersionKey = intToStr(snapshotVersion)
+    let snapshotVersionUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 snapshotVersionKey,
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotVersionUpsertRes))
+    return Ok[ledger.V3ChengNodeProofBundle](proof)
+
+fn v3ChengNodePayloadFromText(objectKind: str,
+                              objectText: str): layout.FixedBytes32 =
+    return v3ChengNodeHashTextCid(objectKind, objectText)
+
+fn v3ChengNodeLineValue(text: str,
+                        key: str): str =
+    let prefix = key + "="
+    var lineStart: int32 = 0
+    let n = strings.Len(text)
+    while lineStart < n:
+        var lineEnd: int32 = lineStart
+        while lineEnd < n:
+            if text[lineEnd] == '\n':
+                break
+            lineEnd = lineEnd + 1
+        let lineLen = lineEnd - lineStart
+        if lineLen >= strings.Len(prefix):
+            let line = strings.SliceBytes(text, lineStart, lineLen)
+            if strings.SliceBytes(line, 0, strings.Len(prefix)) == prefix:
+                return strings.SliceBytes(line, strings.Len(prefix), strings.Len(line) - strings.Len(prefix))
+        lineStart = lineEnd + 1
+    return ""
+
+fn v3ChengNodeBalanceObjectText(assetId: int32,
+                                accountId: int32,
+                                balance: int64,
+                                headCid: layout.FixedBytes32): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "asset_id=" + intToStr(assetId) + "\n"
+    out = out + "account_id=" + intToStr(accountId) + "\n"
+    out = out + "balance=" + int64ToStr(balance) + "\n"
+    out = out + "head_cid=" + layout.fixedBytes32Hex(headCid)
+    return out
+
+fn v3ChengNodeBalanceValueFromText(text: str): int64 =
+    let balanceText = v3ChengNodeLineValue(text, "balance")
+    if len(balanceText) <= 0:
+        return int64(0)
+    return int64(parseInt(balanceText))
+
+fn v3ChengNodeDidOperatorText(record: bio.V3BioDidOperatorRecord): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "operator_id=" + layout.fixedBytes32Hex(record.operatorId) + "\n"
+    out = out + "bundle_kind=" + record.bundleKind + "\n"
+    out = out + "did_text=" + record.didText + "\n"
+    out = out + "subject_did_text=" + record.subjectDidText + "\n"
+    out = out + "device_did_text=" + record.deviceDidText + "\n"
+    out = out + "bundle_seq=" + intToStr(record.bundleSeq) + "\n"
+    out = out + "bundle_cid=" + layout.fixedBytes32Hex(record.bundleCid) + "\n"
+    out = out + "event_id=" + record.eventId + "\n"
+    out = out + "bundle_text_hex=" + bytesToHex(bytesFromString(record.bundleText))
+    return out
+
+fn v3ChengNodeCompilerBuildReceiptText(receiptKey: str,
+                                       receiptCid: layout.FixedBytes32): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "receipt_key=" + receiptKey + "\n"
+    out = out + "receipt_cid=" + layout.fixedBytes32Hex(receiptCid)
+    return out
+
+fn v3ChengNodeMoqBuildText(build: moq.V3Libp2pMoqBuildResult): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "owner_peer_id=" + build.ownerPeerId + "\n"
+    out = out + "mime_type=" + build.mimeType + "\n"
+    out = out + "bundle_cid=" + build.bundleCid + "\n"
+    out = out + "blob_cid=" + build.blobCid + "\n"
+    out = out + "catalog_key=" + build.catalogKey + "\n"
+    out = out + "blob_byte_len=" + intToStr(build.blobByteLen) + "\n"
+    out = out + "object_target_bytes=" + intToStr(build.objectTargetBytes) + "\n"
+    out = out + "source_block_bytes=" + intToStr(build.sourceBlockBytes) + "\n"
+    out = out + "object_count=" + intToStr(build.objectCount)
+    return out
+
+fn V3ChengNodeInit(rootSeed: str): Result[V3ChengNode] =
+    let identityRes = identity.V3ChengNodeIdentityDerive(rootSeed)
+    if IsErr(identityRes):
+        return Err[V3ChengNode](Error(identityRes))
+    var out: V3ChengNode
+    out.version = 1
+    out.identity = Value(identityRes)
+    cindex.V3ChengNodeIndexRegistryInitInPlace(out.indices)
+    cobject.V3ChengNodeObjectStoreInitInPlace(out.objects)
+    out.ledger = ledger.V3ChengNodeLedgerInit()
+    actor.V3ChengNodeActorBusInitInPlace(out.actors)
+    let chainInitRes = chain.V3ChainNodeInitInto(out.chainState,
+                                                 "cheng_node.chain",
+                                                 rootSeed)
+    if IsErr(chainInitRes):
+        return Err[V3ChengNode](Error(chainInitRes))
+    return Ok[V3ChengNode](out)
+
+fn V3ChengNodeAnchorIndexedObject(node: var V3ChengNode,
+                                  actorName: str,
+                                  indexGroup: str,
+                                  lookupKind: str,
+                                  keyText: str,
+                                  objectKind: str,
+                                  payloadCid: layout.FixedBytes32): Result[ledger.V3ChengNodeProofBundle] =
+    return v3ChengNodeAnchorIndexedCid(node,
+                                       actorName,
+                                       indexGroup,
+                                       lookupKind,
+                                       keyText,
+                                       objectKind,
+                                       payloadCid)
+
+fn V3ChengNodeAnchorIndexedText(node: var V3ChengNode,
+                                actorName: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                objectKind: str,
+                                objectText: str): Result[ledger.V3ChengNodeProofBundle] =
+    let payloadCid = v3ChengNodePayloadFromText(objectKind, objectText)
+    let storeRes = v3ChengNodeRegisterObjectText(node, payloadCid, objectKind, objectText)
+    if IsErr(storeRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(storeRes))
+    return v3ChengNodeAnchorIndexedCid(node,
+                                       actorName,
+                                       indexGroup,
+                                       lookupKind,
+                                       keyText,
+                                       objectKind,
+                                       payloadCid)
+
+fn V3ChengNodeUpsertIndexedText(node: var V3ChengNode,
+                                actorName: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                objectKind: str,
+                                objectText: str): Result[bool] =
+    let payloadCid = v3ChengNodePayloadFromText(objectKind, objectText)
+    let storeRes = v3ChengNodeRegisterObjectText(node, payloadCid, objectKind, objectText)
+    if IsErr(storeRes):
+        return Err[bool](Error(storeRes))
+    let currentRes = cindex.V3ChengNodeIndexGet(node.indices, indexGroup, lookupKind, keyText)
+    if IsOk(currentRes):
+        let current = Value(currentRes)
+        if layout.fixedBytes32Equal(current.valueCid, payloadCid):
+            return Ok[bool](false)
+    let proofRes = v3ChengNodeAnchorIndexedCid(node,
+                                               actorName,
+                                               indexGroup,
+                                               lookupKind,
+                                               keyText,
+                                               objectKind,
+                                               payloadCid)
+    if IsErr(proofRes):
+        return Err[bool](Error(proofRes))
+    return Ok[bool](true)
+
+fn V3ChengNodeTombstoneIndexedObject(node: var V3ChengNode,
+                                     actorName: str,
+                                     indexGroup: str,
+                                     lookupKind: str,
+                                     keyText: str): Result[ledger.V3ChengNodeProofBundle] =
+    let zeroCid = layout.fixedBytes32Zero()
+    let eventRes = ledger.V3ChengNodeLedgerAppend(node.ledger,
+                                                  actorName,
+                                                  "index_tombstone",
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  zeroCid)
+    if IsErr(eventRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(eventRes))
+    let event = Value(eventRes)
+    v3ChengNodeDispatchForEvent(node, actorName, event)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = v3ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.V3ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotRes))
+    let proofRes = ledger.V3ChengNodeLedgerBuildProof(node.ledger,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      zeroCid,
+                                                      event.eventCid)
+    if IsErr(proofRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(proofRes))
+    let proof = Value(proofRes)
+    let removeRes = cindex.V3ChengNodeIndexRemove(node.indices,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(removeRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(removeRes))
+    let snapshotHeadKey = layout.fixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotHeadUpsertRes))
+    let snapshotVersionUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 intToStr(snapshotVersion),
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(snapshotVersionUpsertRes))
+    return Ok[ledger.V3ChengNodeProofBundle](proof)
+
+fn v3ChengNodeRefreshBalanceKey(node: var V3ChengNode,
+                                assetId: int32,
+                                accountId: int32): Result[bool] =
+    let balanceRes = chain.V3ChainNodeBalance(node.chainState, assetId, accountId)
+    if IsErr(balanceRes):
+        return Err[bool](Error(balanceRes))
+    let balance = Value(balanceRes)
+    let headCid = chain.V3ChainNodeAccountHeadFromNode(node.chainState, assetId, accountId)
+    let balanceKey = cindex.v3ChengNodeBalanceKey(assetId, accountId)
+    let objectText = v3ChengNodeBalanceObjectText(assetId, accountId, balance, headCid)
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "chain",
+                                        "balance",
+                                        "asset_account",
+                                        balanceKey,
+                                        "balance_cell",
+                                        objectText)
+
+fn V3ChengNodeChainMint(node: var V3ChengNode,
+                        assetId: int32,
+                        accountId: int32,
+                        amount: int64): Result[bool] =
+    let mintRes = chain.V3ChainNodeMint(node.chainState, assetId, accountId, amount)
+    if IsErr(mintRes):
+        return Err[bool](Error(mintRes))
+    return v3ChengNodeRefreshBalanceKey(node, assetId, accountId)
+
+fn V3ChengNodeChainTransfer(node: var V3ChengNode,
+                            assetId: int32,
+                            fromAccount: int32,
+                            toAccount: int32,
+                            amount: int64): Result[bool] =
+    let transferRes = chain.V3ChainNodeTransfer(node.chainState,
+                                                assetId,
+                                                fromAccount,
+                                                toAccount,
+                                                amount)
+    if IsErr(transferRes):
+        return Err[bool](Error(transferRes))
+    let fromRefreshRes = v3ChengNodeRefreshBalanceKey(node, assetId, fromAccount)
+    if IsErr(fromRefreshRes):
+        return Err[bool](Error(fromRefreshRes))
+    let toRefreshRes = v3ChengNodeRefreshBalanceKey(node, assetId, toAccount)
+    if IsErr(toRefreshRes):
+        return Err[bool](Error(toRefreshRes))
+    return Ok[bool](true)
+
+fn V3ChengNodeSyncDidIndexes(node: var V3ChengNode): Result[bool] =
+    var changed = false
+    let bundlesRes = bio.V3BioDidChainLatestBundles(node.chainState)
+    if IsErr(bundlesRes):
+        return Err[bool](Error(bundlesRes))
+    let bundles = Value(bundlesRes)
+    for i in 0..<bundles.len:
+        let bundle = bundles[i]
+        let objectText = bio.V3BioDidChainBundleText(bundle)
+        let upsertRes = V3ChengNodeUpsertIndexedText(node,
+                                                     "did",
+                                                     "did",
+                                                     "subject",
+                                                     bundle.didText,
+                                                     "did_bundle",
+                                                     objectText)
+        if IsErr(upsertRes):
+            return Err[bool](Error(upsertRes))
+        if Value(upsertRes):
+            changed = true
+    var state: bio.V3BioDidChainState
+    let stateRes = bio.V3BioDidChainStateFromNodeInto(state, node.chainState)
+    if IsErr(stateRes):
+        return Err[bool](Error(stateRes))
+    for i in 0..<state.operatorIndex.vals.len:
+        let record = state.operatorIndex.vals[i]
+        if layout.fixedBytes32Equal(record.operatorId, layout.fixedBytes32Zero()):
+            continue
+        let keyText = layout.fixedBytes32Hex(record.operatorId)
+        let objectText = v3ChengNodeDidOperatorText(record)
+        let upsertRes = V3ChengNodeUpsertIndexedText(node,
+                                                     "did",
+                                                     "did_operator",
+                                                     "operator",
+                                                     keyText,
+                                                     "did_operator_record",
+                                                     objectText)
+        if IsErr(upsertRes):
+            return Err[bool](Error(upsertRes))
+        if Value(upsertRes):
+            changed = true
+    return Ok[bool](changed)
+
+fn V3ChengNodeImportLegacyChainState(node: var V3ChengNode,
+                                     statePath: str): Result[bool] =
+    var legacyNode: chain.V3ChainNode
+    let loadRes = legacy.V3ChainNodeCliLoadStateInto(legacyNode, statePath)
+    if IsErr(loadRes):
+        return Err[bool](Error(loadRes))
+    node.chainState = legacyNode
+    var changed = false
+    for i in 0..<node.chainState.index.accountAssetIds.len:
+        let assetId = node.chainState.index.accountAssetIds[i]
+        let accountId = node.chainState.index.accountIds[i]
+        let refreshRes = v3ChengNodeRefreshBalanceKey(node, assetId, accountId)
+        if IsErr(refreshRes):
+            return Err[bool](Error(refreshRes))
+        if Value(refreshRes):
+            changed = true
+    let didRes = V3ChengNodeSyncDidIndexes(node)
+    if IsErr(didRes):
+        return Err[bool](Error(didRes))
+    if Value(didRes):
+        changed = true
+    return Ok[bool](changed)
+
+fn V3ChengNodeAnchorCompilerPackage(node: var V3ChengNode,
+                                    snapshot: cworld.V3CompilerPackageSnapshot): Result[ledger.V3ChengNodeProofBundle] =
+    return V3ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "package",
+                                        snapshot.packageId,
+                                        "compiler_package_snapshot",
+                                        cworld.v3CompilerPackageSnapshotReport(snapshot))
+
+fn V3ChengNodeAnchorCompilerWorldHead(node: var V3ChengNode,
+                                      head: cworld.V3CompilerWorldHead): Result[ledger.V3ChengNodeProofBundle] =
+    return V3ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "world_head",
+                                        layout.fixedBytes32Hex(head.headCid),
+                                        "compiler_world_head",
+                                        cworld.v3CompilerWorldHeadReport(head))
+
+fn V3ChengNodeAnchorCompilerBuildReceipt(node: var V3ChengNode,
+                                         receiptKey: str,
+                                         receiptCid: layout.FixedBytes32): Result[ledger.V3ChengNodeProofBundle] =
+    return V3ChengNodeAnchorIndexedText(node,
+                                        "compiler",
+                                        "compiler",
+                                        "build_receipt",
+                                        receiptKey,
+                                        "compiler_build_receipt",
+                                        v3ChengNodeCompilerBuildReceiptText(receiptKey, receiptCid))
+
+fn v3ChengNodeBundleCidFromMoqBuild(build: moq.V3Libp2pMoqBuildResult): layout.FixedBytes32 =
+    let bundleCidRes = layout.fixedBytes32FromHex(build.bundleCid)
+    if IsOk(bundleCidRes):
+        return Value(bundleCidRes)
+    return v3ChengNodeHashTextCid("content.moq_fountain.bundle", build.bundleCid)
+
+fn V3ChengNodeAnchorMoqBuild(node: var V3ChengNode,
+                             build: moq.V3Libp2pMoqBuildResult): Result[ledger.V3ChengNodeProofBundle] =
+    let buildText = v3ChengNodeMoqBuildText(build)
+    let capabilityProofRes = V3ChengNodeAnchorIndexedText(node,
+                                                          "content_moq_fountain",
+                                                          "discovery",
+                                                          "capability",
+                                                          "content.moq_fountain",
+                                                          "moq_fountain_capability",
+                                                          buildText)
+    if IsErr(capabilityProofRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(capabilityProofRes))
+    return V3ChengNodeAnchorIndexedText(node,
+                                        "content_moq_fountain",
+                                        "discovery",
+                                        "topic",
+                                        build.catalogKey,
+                                        "moq_fountain_catalog",
+                                        buildText)
+
+fn V3ChengNodeRequiredIndexCount(node: V3ChengNode): int32 =
+    return cindex.V3ChengNodeIndexRequiredGroupCount(node.indices)
+
+fn V3ChengNodeCapabilityActorCount(node: V3ChengNode): int32 =
+    return actor.V3ChengNodeActorCount(node.actors)
+
+fn V3ChengNodeActiveIndexCount(node: V3ChengNode,
+                               groupName: str): int32 =
+    var count = 0
+    for i in 0..<node.indices.entries.len:
+        let entry = node.indices.entries[i]
+        if entry.active && entry.groupName == groupName:
+            count = count + 1
+    return count
+
+fn v3ChengNodeProofBundleByCid(node: V3ChengNode,
+                               proofCid: layout.FixedBytes32): Result[ledger.V3ChengNodeProofBundle] =
+    for i in 0..<node.ledger.proofs.len:
+        let proof = node.ledger.proofs[i]
+        if layout.fixedBytes32Equal(proof.proofCid, proofCid):
+            return Ok[ledger.V3ChengNodeProofBundle](proof)
+    return Err[ledger.V3ChengNodeProofBundle]("cheng_node: proof not found")
+
+fn v3ChengNodeSnapshotSegmentByVersion(node: V3ChengNode,
+                                       snapshotVersion: int32): Result[ledger.V3ChengNodeSnapshotSegment] =
+    for i in 0..<node.ledger.segments.len:
+        let segment = node.ledger.segments[i]
+        if segment.snapshotVersion == snapshotVersion:
+            return Ok[ledger.V3ChengNodeSnapshotSegment](segment)
+    return Err[ledger.V3ChengNodeSnapshotSegment]("cheng_node: snapshot segment not found")
+
+fn V3ChengNodeHeadManifestText(node: V3ChengNode): str =
+    var out = ""
+    out = out + "version=" + intToStr(node.ledger.manifest.version) + "\n"
+    out = out + "head_seq=" + intToStr(node.ledger.manifest.headSeq) + "\n"
+    out = out + "head_event_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.headEventCid) + "\n"
+    out = out + "snapshot_version=" + intToStr(node.ledger.manifest.snapshotVersion) + "\n"
+    out = out + "snapshot_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.snapshotCid) + "\n"
+    out = out + "manifest_head_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.headCid)
+    return out
+
+fn V3ChengNodeKeyedQueryText(node: V3ChengNode,
+                             indexGroup: str,
+                             lookupKind: str,
+                             keyText: str,
+                             withDelta: bool): Result[str] =
+    var out = ""
+    out = out + "manifest_head_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.headCid) + "\n"
+    out = out + "index_group=" + indexGroup + "\n"
+    out = out + "lookup_kind=" + lookupKind + "\n"
+    out = out + "key_text_hex=" + bytesToHex(bytesFromString(keyText)) + "\n"
+    let entryRes = cindex.V3ChengNodeIndexGet(node.indices, indexGroup, lookupKind, keyText)
+    if IsErr(entryRes):
+        out = out + "found=0\n"
+        if withDelta:
+            out = out + "delta_count=0\n"
+        return Ok[str](out)
+    let entry = Value(entryRes)
+    let proofRes = v3ChengNodeProofBundleByCid(node, entry.proofCid)
+    if IsErr(proofRes):
+        return Err[str](Error(proofRes))
+    let proof = Value(proofRes)
+    out = out + "found=1\n"
+    out = out + "event_seq=" + intToStr(entry.eventSeq) + "\n"
+    out = out + "value_cid=" + layout.fixedBytes32Hex(entry.valueCid) + "\n"
+    out = out + "proof_cid=" + layout.fixedBytes32Hex(entry.proofCid) + "\n"
+    out = out + "event_cid=" + layout.fixedBytes32Hex(proof.eventCid) + "\n"
+    out = out + "snapshot_version=" + intToStr(proof.snapshotVersion) + "\n"
+    out = out + "snapshot_cid=" + layout.fixedBytes32Hex(proof.snapshotCid) + "\n"
+    let objectRes = cobject.V3ChengNodeObjectStoreGet(node.objects, entry.valueCid)
+    if IsOk(objectRes):
+        let objectEntry = Value(objectRes)
+        out = out + "payload_present=1\n"
+        out = out + "payload_kind=" + objectEntry.objectKind + "\n"
+        out = out + "payload_text_hex=" + bytesToHex(bytesFromString(objectEntry.text)) + "\n"
+    else:
+        out = out + "payload_present=0\n"
+    if withDelta:
+        let segmentRes = v3ChengNodeSnapshotSegmentByVersion(node, proof.snapshotVersion)
+        if IsErr(segmentRes):
+            return Err[str](Error(segmentRes))
+        let segment = Value(segmentRes)
+        out = out + "delta_count=1\n"
+        out = out + "delta.segment_snapshot_version=" + intToStr(segment.snapshotVersion) + "\n"
+        out = out + "delta.segment_start_seq=" + intToStr(segment.startSeq) + "\n"
+        out = out + "delta.segment_end_seq=" + intToStr(segment.endSeq) + "\n"
+        out = out + "delta.segment_cid=" + layout.fixedBytes32Hex(segment.segmentCid) + "\n"
+    return Ok[str](out)
+
+fn V3ChengNodeBalanceQueryText(node: V3ChengNode,
+                               assetId: int32,
+                               accountId: int32,
+                               withDelta: bool): Result[str] =
+    let keyText = cindex.v3ChengNodeBalanceKey(assetId, accountId)
+    let queryRes = V3ChengNodeKeyedQueryText(node,
+                                             "balance",
+                                             "asset_account",
+                                             keyText,
+                                             withDelta)
+    if IsErr(queryRes):
+        return Err[str](Error(queryRes))
+    var out = ""
+    out = out + "asset_id=" + intToStr(assetId) + "\n"
+    out = out + "account_id=" + intToStr(accountId) + "\n"
+    let entryRes = cindex.V3ChengNodeIndexGet(node.indices, "balance", "asset_account", keyText)
+    if IsErr(entryRes):
+        out = out + "balance=0\n"
+        out = out + Value(queryRes)
+        return Ok[str](out)
+    let entry = Value(entryRes)
+    let objectRes = cobject.V3ChengNodeObjectStoreGet(node.objects, entry.valueCid)
+    if IsErr(objectRes):
+        return Err[str](Error(objectRes))
+    let balance = v3ChengNodeBalanceValueFromText(Value(objectRes).text)
+    out = out + "balance=" + int64ToStr(balance) + "\n"
+    out = out + Value(queryRes)
+    return Ok[str](out)
+
+fn V3ChengNodeRequiredSurfaceText(node: V3ChengNode): str =
+    var out = ""
+    out = out + "required_indexes=" + intToStr(node.indices.specs.len) + "\n"
+    for i in 0..<node.indices.specs.len:
+        out = out + "index." + intToStr(i) + "=" + node.indices.specs[i].groupName + "\n"
+    out = out + "actors=" + intToStr(node.actors.actors.len) + "\n"
+    for i in 0..<node.actors.actors.len:
+        out = out + "actor." + intToStr(i) + "=" + node.actors.actors[i].name + "\n"
+    return out
+
+fn V3ChengNodeBootstrapSummaryText(node: V3ChengNode): str =
+    var out = ""
+    out = out + "root_id=" + layout.fixedBytes32Hex(node.identity.rootId) + "\n"
+    out = out + "required_index_count=" + intToStr(V3ChengNodeRequiredIndexCount(node)) + "\n"
+    out = out + "actor_count=" + intToStr(V3ChengNodeCapabilityActorCount(node)) + "\n"
+    out = out + "object_count=" + intToStr(cobject.V3ChengNodeObjectCount(node.objects)) + "\n"
+    out = out + "balance_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "balance")) + "\n"
+    out = out + "did_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did")) + "\n"
+    out = out + "did_operator_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did_operator")) + "\n"
+    out = out + "manifest_head_seq=" + intToStr(node.ledger.manifest.headSeq) + "\n"
+    out = out + "manifest_head_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.headCid) + "\n"
+    out = out + "chain_tip_event_cid=" + layout.fixedBytes32Hex(node.chainState.tipEventCid) + "\n"
+    out = out + "chain_event_count=" + intToStr(node.chainState.events.len)
+    return out

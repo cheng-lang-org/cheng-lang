@@ -11,6 +11,27 @@ type
         targetSourcePath: str
         resolved: bool
 
+    V3NormalizedExprKind = enum
+        v3NormalizedExprIf
+        v3NormalizedExprRange
+        v3NormalizedExprComprehension
+        v3NormalizedExprStrFormat
+        v3NormalizedExprResultIntrinsic
+        v3NormalizedExprTry
+
+    V3NormalizedExpr =
+        sourcePath: str
+        lineNumber: int32
+        columnNumber: int32
+        kind: V3NormalizedExprKind
+        detail: str
+        surfaceText: str
+
+    V3NormalizedExprLayer =
+        sourceCount: int32
+        exprs: V3NormalizedExpr[]
+        questionResidualCount: int32
+
     V3ParsedSourceStub =
         workspaceRoot: str
         packageRoot: str
@@ -23,9 +44,17 @@ type
         ownerModulePaths: str[]
         importEdges: V3ImportEdge[]
         orderedClosureSourcePaths: str[]
+        normalizedExprLayer: V3NormalizedExprLayer
         hasCompilerTopLevel: bool
         mainFunctionPresent: bool
         unresolvedImportCount: int32
+
+    V3NormalizedFunctionDecl =
+        name: str
+        lineIndex: int32
+        importc: bool
+        explicitExportName: str
+        surfaceKeyword: str
 
 fn v3ParsedSourceKindText(kind: V3ParsedSourceKind): str =
     if kind == v3ParsedOrdinarySource:
@@ -34,6 +63,115 @@ fn v3ParsedSourceKindText(kind: V3ParsedSourceKind): str =
 
 fn v3ParsedSourceWorkspaceRoot(parsed: V3ParsedSourceStub): str =
     return parsed.workspaceRoot
+
+fn v3NormalizedExprKindText(kind: V3NormalizedExprKind): str =
+    if kind == v3NormalizedExprIf:
+        return "IfExpr"
+    if kind == v3NormalizedExprRange:
+        return "RangeExpr"
+    if kind == v3NormalizedExprComprehension:
+        return "ComprehensionExpr"
+    if kind == v3NormalizedExprStrFormat:
+        return "StrFormatExpr"
+    if kind == v3NormalizedExprResultIntrinsic:
+        return "ResultIntrinsic"
+    if kind == v3NormalizedExprTry:
+        return "TryExpr"
+    return "UnknownExpr"
+
+fn v3NormalizedExprClone(expr: V3NormalizedExpr): V3NormalizedExpr =
+    var out: V3NormalizedExpr
+    out.sourcePath = expr.sourcePath
+    out.lineNumber = expr.lineNumber
+    out.columnNumber = expr.columnNumber
+    out.kind = expr.kind
+    out.detail = expr.detail
+    out.surfaceText = expr.surfaceText
+    return out
+
+fn v3NormalizedExprLayerClone(layer: V3NormalizedExprLayer): V3NormalizedExprLayer =
+    var out: V3NormalizedExprLayer
+    out.sourceCount = 0
+    out.exprs = []
+    out.questionResidualCount = layer.questionResidualCount
+    out.sourceCount = layer.sourceCount
+    for i in 0..<layer.exprs.len:
+        add(out.exprs, v3NormalizedExprClone(layer.exprs[i]))
+    return out
+
+fn v3NormalizedExprLayerZero(): V3NormalizedExprLayer =
+    var out: V3NormalizedExprLayer
+    out.sourceCount = 0
+    out.exprs = []
+    out.questionResidualCount = 0
+    return out
+
+fn v3NormalizedExprLayerAppend(layer: var V3NormalizedExprLayer,
+                               sourcePath: str,
+                               lineNumber: int32,
+                               columnNumber: int32,
+                               kind: V3NormalizedExprKind,
+                               detail: str,
+                               surfaceText: str) =
+    var expr: V3NormalizedExpr
+    expr.sourcePath = sourcePath
+    expr.lineNumber = lineNumber
+    expr.columnNumber = columnNumber
+    expr.kind = kind
+    expr.detail = detail
+    expr.surfaceText = surfaceText
+    add(layer.exprs, expr)
+
+fn v3NormalizedExprLayerAdd(total: var V3NormalizedExprLayer,
+                            delta: V3NormalizedExprLayer) =
+    total.sourceCount = total.sourceCount + delta.sourceCount
+    total.questionResidualCount = total.questionResidualCount + delta.questionResidualCount
+    for i in 0..<delta.exprs.len:
+        add(total.exprs, v3NormalizedExprClone(delta.exprs[i]))
+
+fn v3NormalizedExprLayerExprCount(layer: V3NormalizedExprLayer): int32 =
+    return layer.exprs.len
+
+fn v3NormalizedExprLayerCountKind(layer: V3NormalizedExprLayer,
+                                  kind: V3NormalizedExprKind): int32 =
+    var count: int32 = 0
+    for i in 0..<layer.exprs.len:
+        if layer.exprs[i].kind == kind:
+            count = count + 1
+    return count
+
+fn v3NormalizedExprLayerIfCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprIf)
+
+fn v3NormalizedExprLayerRangeCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprRange)
+
+fn v3NormalizedExprLayerComprehensionCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprComprehension)
+
+fn v3NormalizedExprLayerStrFormatCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprStrFormat)
+
+fn v3NormalizedExprLayerResultIntrinsicCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprResultIntrinsic)
+
+fn v3NormalizedExprLayerTryCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprTry)
+
+fn v3NormalizedExprLayerHasExpr(layer: V3NormalizedExprLayer,
+                                kind: V3NormalizedExprKind,
+                                detail: str,
+                                lineNumber: int32): bool =
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        if expr.kind != kind:
+            continue
+        if expr.detail != detail:
+            continue
+        if expr.lineNumber != lineNumber:
+            continue
+        return true
+    return false
 
 fn v3ParserNormalizePath(pathRaw: str): str =
     var path = v3path.V3PathTrim(pathRaw)
@@ -134,6 +272,473 @@ fn v3ParserSourceExists(path: str): bool =
     let size: int64 = v3path.V3PathFileSize(path)
     return size > int64(0)
 
+fn v3ParserExprIsResultIntrinsicName(name: str): bool =
+    if name == "Ok" || name == "Err":
+        return true
+    if name == "Value" || name == "Error":
+        return true
+    if name == "IsOk" || name == "IsErr":
+        return true
+    if name == "ErrorInfoOf":
+        return true
+    return false
+
+fn v3ParserResultIntrinsicDetail(name: str): str =
+    if name == "Ok":
+        return "ok"
+    if name == "Err":
+        return "err"
+    if name == "Value":
+        return "value"
+    if name == "Error":
+        return "error"
+    if name == "IsOk":
+        return "is_ok"
+    if name == "IsErr":
+        return "is_err"
+    if name == "ErrorInfoOf":
+        return "error_info_of"
+    return name
+
+fn v3ParserIsIdentChar(ch: char): bool =
+    let digit = ch >= '0' && ch <= '9'
+    let upper = ch >= 'A' && ch <= 'Z'
+    let lower = ch >= 'a' && ch <= 'z'
+    return digit || upper || lower || ch == '_'
+
+fn v3ParserPreviousToken(lineRaw: str,
+                         stopExclusive: int32): str =
+    if stopExclusive <= 0:
+        return ""
+    var end = stopExclusive - 1
+    while end >= 0 && v3ParserIsInlineSpace(lineRaw[end]):
+        end = end - 1
+    if end < 0:
+        return ""
+    var start = end
+    while start >= 0 && v3ParserIsIdentChar(lineRaw[start]):
+        start = start - 1
+    return v3path.V3TextSlice(lineRaw, start + 1, end - start)
+
+fn v3ParserNextNonSpaceChar(lineRaw: str,
+                            start: int32): char =
+    var cursor = start
+    while cursor < lineRaw.len:
+        if !v3ParserIsInlineSpace(lineRaw[cursor]):
+            return lineRaw[cursor]
+        cursor = cursor + 1
+    return char(0)
+
+fn v3ParserStripLineComment(lineRaw: str): str =
+    let hashPos = v3ParserFindText(lineRaw, "#")
+    if hashPos < 0:
+        return lineRaw
+    return v3path.V3TextSlice(lineRaw, 0, hashPos)
+
+fn v3ParserLineKeywordPositions(lineRaw: str,
+                                keyword: str): int32[] =
+    var out: int32[] = []
+    if keyword == "":
+        return out
+    if lineRaw.len < keyword.len:
+        return out
+    for i in 0..<(lineRaw.len - keyword.len + 1):
+        var matched = true
+        for j in 0..<keyword.len:
+            if lineRaw[i + j] != keyword[j]:
+                matched = false
+                break
+        if !matched:
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + keyword.len
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        add(out, i)
+    return out
+
+fn v3ParserAppendIfExprsLine(sourcePath: str,
+                             lineNumber: int32,
+                             lineRaw: str,
+                             layer: var V3NormalizedExprLayer) =
+    let positions = v3ParserLineKeywordPositions(lineRaw, "if")
+    for i in 0..<positions.len:
+        v3NormalizedExprLayerAppend(layer,
+                                    sourcePath,
+                                    lineNumber,
+                                    positions[i] + 1,
+                                    v3NormalizedExprIf,
+                                    "keyword_if",
+                                    "if")
+
+fn v3ParserAppendFmtExprsLine(sourcePath: str,
+                              lineNumber: int32,
+                              lineRaw: str,
+                              layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 3:
+        return
+    for i in 0..<(lineRaw.len - 2):
+        if lineRaw[i] != 'F' || lineRaw[i + 1] != 'm' || lineRaw[i + 2] != 't':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 3
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        let prevToken = v3ParserPreviousToken(lineRaw, i)
+        if prevToken == "fn" || prevToken == "func" || prevToken == "proc" ||
+           prevToken == "method" || prevToken == "converter":
+            continue
+        let nextChar = v3ParserNextNonSpaceChar(lineRaw, rightPos)
+        if nextChar == '"' || nextChar == '(' || nextChar == '[' || v3ParserIsIdentChar(nextChar):
+            var detail = "fmt_call"
+            if nextChar == '"':
+                detail = "fmt_literal"
+            v3NormalizedExprLayerAppend(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        v3NormalizedExprStrFormat,
+                                        detail,
+                                        "Fmt")
+    return
+
+fn v3ParserAppendResultIntrinsicExprsLine(sourcePath: str,
+                                          lineNumber: int32,
+                                          lineRaw: str,
+                                          layer: var V3NormalizedExprLayer) =
+    v3ParserAppendResultIntrinsicOkExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicErrExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicValueExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicErrorExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicIsOkExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicIsErrExprsLine(sourcePath, lineNumber, lineRaw, layer)
+    v3ParserAppendResultIntrinsicErrorInfoOfExprsLine(sourcePath, lineNumber, lineRaw, layer)
+
+fn v3ParserAppendResultIntrinsicOkExprsLine(sourcePath: str,
+                                            lineNumber: int32,
+                                            lineRaw: str,
+                                            layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 2:
+        return
+    for i in 0..<(lineRaw.len - 1):
+        if lineRaw[i] != 'O':
+            continue
+        if lineRaw[i + 1] != 'k':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 2
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "ok", "Ok")
+    return
+
+fn v3ParserAppendResultIntrinsicErrExprsLine(sourcePath: str,
+                                             lineNumber: int32,
+                                             lineRaw: str,
+                                             layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 3:
+        return
+    for i in 0..<(lineRaw.len - 2):
+        if lineRaw[i] != 'E':
+            continue
+        if lineRaw[i + 1] != 'r':
+            continue
+        if lineRaw[i + 2] != 'r':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 3
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "err", "Err")
+    return
+
+fn v3ParserAppendResultIntrinsicValueExprsLine(sourcePath: str,
+                                               lineNumber: int32,
+                                               lineRaw: str,
+                                               layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 5:
+        return
+    for i in 0..<(lineRaw.len - 4):
+        if lineRaw[i] != 'V':
+            continue
+        if lineRaw[i + 1] != 'a':
+            continue
+        if lineRaw[i + 2] != 'l':
+            continue
+        if lineRaw[i + 3] != 'u':
+            continue
+        if lineRaw[i + 4] != 'e':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 5
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "value", "Value")
+    return
+
+fn v3ParserAppendResultIntrinsicErrorExprsLine(sourcePath: str,
+                                               lineNumber: int32,
+                                               lineRaw: str,
+                                               layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 5:
+        return
+    for i in 0..<(lineRaw.len - 4):
+        if lineRaw[i] != 'E':
+            continue
+        if lineRaw[i + 1] != 'r':
+            continue
+        if lineRaw[i + 2] != 'r':
+            continue
+        if lineRaw[i + 3] != 'o':
+            continue
+        if lineRaw[i + 4] != 'r':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 5
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "error", "Error")
+    return
+
+fn v3ParserAppendResultIntrinsicIsOkExprsLine(sourcePath: str,
+                                              lineNumber: int32,
+                                              lineRaw: str,
+                                              layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 4:
+        return
+    for i in 0..<(lineRaw.len - 3):
+        if lineRaw[i] != 'I':
+            continue
+        if lineRaw[i + 1] != 's':
+            continue
+        if lineRaw[i + 2] != 'O':
+            continue
+        if lineRaw[i + 3] != 'k':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 4
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "is_ok", "IsOk")
+    return
+
+fn v3ParserAppendResultIntrinsicIsErrExprsLine(sourcePath: str,
+                                               lineNumber: int32,
+                                               lineRaw: str,
+                                               layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 5:
+        return
+    for i in 0..<(lineRaw.len - 4):
+        if lineRaw[i] != 'I':
+            continue
+        if lineRaw[i + 1] != 's':
+            continue
+        if lineRaw[i + 2] != 'E':
+            continue
+        if lineRaw[i + 3] != 'r':
+            continue
+        if lineRaw[i + 4] != 'r':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 5
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "is_err", "IsErr")
+    return
+
+fn v3ParserAppendResultIntrinsicErrorInfoOfExprsLine(sourcePath: str,
+                                                     lineNumber: int32,
+                                                     lineRaw: str,
+                                                     layer: var V3NormalizedExprLayer) =
+    if lineRaw.len < 11:
+        return
+    for i in 0..<(lineRaw.len - 10):
+        if lineRaw[i] != 'E':
+            continue
+        if lineRaw[i + 1] != 'r':
+            continue
+        if lineRaw[i + 2] != 'r':
+            continue
+        if lineRaw[i + 3] != 'o':
+            continue
+        if lineRaw[i + 4] != 'r':
+            continue
+        if lineRaw[i + 5] != 'I':
+            continue
+        if lineRaw[i + 6] != 'n':
+            continue
+        if lineRaw[i + 7] != 'f':
+            continue
+        if lineRaw[i + 8] != 'o':
+            continue
+        if lineRaw[i + 9] != 'O':
+            continue
+        if lineRaw[i + 10] != 'f':
+            continue
+        var leftOk = true
+        if i > 0:
+            leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+        let rightPos = i + 11
+        var rightOk = true
+        if rightPos < lineRaw.len:
+            rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+        if !leftOk || !rightOk:
+            continue
+        v3NormalizedExprLayerAppend(layer, sourcePath, lineNumber, i + 1, v3NormalizedExprResultIntrinsic, "error_info_of", "ErrorInfoOf")
+    return
+
+fn v3ParserAppendRangeExprsLine(sourcePath: str,
+                                lineNumber: int32,
+                                lineRaw: str,
+                                layer: var V3NormalizedExprLayer) =
+    var i: int32 = 0
+    while i + 1 < lineRaw.len:
+        if lineRaw[i] == '.' && lineRaw[i + 1] == '.':
+            if i + 2 < lineRaw.len && lineRaw[i + 2] == '<':
+                v3NormalizedExprLayerAppend(layer,
+                                            sourcePath,
+                                            lineNumber,
+                                            i + 1,
+                                            v3NormalizedExprRange,
+                                            "exclusive",
+                                            "..<")
+                i = i + 3
+                continue
+            v3NormalizedExprLayerAppend(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        v3NormalizedExprRange,
+                                        "inclusive",
+                                        "..")
+            i = i + 2
+            continue
+        i = i + 1
+
+fn v3ParserAppendQuestionExprsLine(sourcePath: str,
+                                   lineNumber: int32,
+                                   lineRaw: str,
+                                   layer: var V3NormalizedExprLayer) =
+    for i in 0..<lineRaw.len:
+        if lineRaw[i] != '?':
+            continue
+        let nextChar = v3ParserNextNonSpaceChar(lineRaw, i + 1)
+        if nextChar == char(0) || nextChar == ',' || nextChar == ';' ||
+           nextChar == ':' || nextChar == ')' || nextChar == ']' || nextChar == '}':
+            v3NormalizedExprLayerAppend(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        v3NormalizedExprTry,
+                                        "postfix_question",
+                                        "?")
+        else:
+            v3NormalizedExprLayerAppend(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        v3NormalizedExprIf,
+                                        "ternary",
+                                        "?")
+
+fn v3ParserAppendComprehensionExprsLine(sourcePath: str,
+                                        lineNumber: int32,
+                                        lineRaw: str,
+                                        layer: var V3NormalizedExprLayer) =
+    let openPos = v3ParserFindText(lineRaw, "[")
+    if openPos < 0:
+        return
+    let forPositions = v3ParserLineKeywordPositions(lineRaw, "for")
+    let inPositions = v3ParserLineKeywordPositions(lineRaw, "in")
+    if forPositions.len <= 0 || inPositions.len <= 0:
+        return
+    v3NormalizedExprLayerAppend(layer,
+                                sourcePath,
+                                lineNumber,
+                                openPos + 1,
+                                v3NormalizedExprComprehension,
+                                "list_comprehension",
+                                "[for in]")
+
+fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
+                                           text: str,
+                                           layer: var V3NormalizedExprLayer,
+                                           err: var str): bool =
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "":
+        err = "missing source path"
+        return false
+    layer = v3NormalizedExprLayerZero()
+    layer.sourceCount = 1
+    let lines = v3ParserSplitChar(text, '\n')
+    for i in 0..<lines.len:
+        let line = v3ParserStripLineComment(lines[i])
+        if v3path.V3PathTrim(line) == "":
+            continue
+        let lineNumber = i + 1
+        v3ParserAppendIfExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendQuestionExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendResultIntrinsicExprsLine(sourcePath, lineNumber, line, layer)
+    layer.questionResidualCount = 0
+    err = ""
+    return true
+
+fn v3ParserReadNormalizedExprLayerFromPath(sourcePathRaw: str,
+                                           layer: var V3NormalizedExprLayer,
+                                           err: var str): bool =
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    if !v3ParserSourceExists(sourcePath):
+        err = "source file missing: " + sourcePath
+        return false
+    let text = v3path.V3ReadTextFile("", sourcePath)
+    if text == "":
+        err = "failed to read source: " + sourcePath
+        return false
+    return v3ParserReadNormalizedExprLayerFromText(sourcePath, text, layer, err)
+
 fn v3ParserStringSeqContains(items: str[], targetRaw: str): bool =
     let target = v3path.V3PathTrim(targetRaw)
     for i in 0..<items.len:
@@ -166,6 +771,21 @@ fn v3ParserFirstToken(textRaw: str): str =
     if stop <= start:
         return ""
     return v3path.V3TextSlice(text, start, stop - start)
+
+fn v3ParserIdentPrefix(text: str): str =
+    var stop: int32 = 0
+    for i in 0..<text.len:
+        let ch = text[i]
+        let digit = ch >= '0' && ch <= '9'
+        let upper = ch >= 'A' && ch <= 'Z'
+        let lower = ch >= 'a' && ch <= 'z'
+        if digit || upper || lower || ch == '_':
+            stop = i + 1
+        else:
+            break
+    if stop <= 0:
+        return ""
+    return v3path.V3TextSlice(text, 0, stop)
     
 fn v3ParserSplitChar(textRaw: str, sep: char): str[] =
     let text = textRaw
@@ -202,13 +822,151 @@ fn v3ParserStartsWith(textRaw: str, prefixRaw: str): bool =
 fn v3ParserLineStartsWith(lineRaw: str, prefix: str): bool =
     return v3ParserStartsWith(lineRaw, prefix)
 
+fn v3ParserFindText(text: str, needle: str): int32 =
+    if needle.len <= 0:
+        return 0
+    if text.len < needle.len:
+        return -1
+    for i in 0..<(text.len - needle.len + 1):
+        var matched = true
+        for j in 0..<needle.len:
+            if text[i + j] != needle[j]:
+                matched = false
+                break
+        if matched:
+            return i
+    return -1
+
+fn v3ParserCompilerTopLevelExportName(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if !v3ParserStartsWith(line, "@compiler_top_level("):
+        return ""
+    let exportPos = v3ParserFindText(line, "export_name")
+    if exportPos < 0:
+        return ""
+    let quoteStart = v3ParserFindText(v3path.V3TextSlice(line, exportPos, line.len - exportPos), "\"")
+    if quoteStart < 0:
+        return ""
+    let valueStart = exportPos + quoteStart + 1
+    let tail = v3path.V3TextSlice(line, valueStart, line.len - valueStart)
+    let quoteEnd = v3ParserFindText(tail, "\"")
+    if quoteEnd <= 0:
+        return ""
+    return v3path.V3TextSlice(line, valueStart, quoteEnd)
+
+fn v3ParserExportcNameFromAnnotation(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if !v3ParserStartsWith(line, "@exportc("):
+        return ""
+    let quoteStart = v3ParserFindText(line, "\"")
+    if quoteStart < 0:
+        return ""
+    let tail = v3path.V3TextSlice(line, quoteStart + 1, line.len - (quoteStart + 1))
+    let quoteEnd = v3ParserFindText(tail, "\"")
+    if quoteEnd <= 0:
+        return ""
+    return v3path.V3TextSlice(line, quoteStart + 1, quoteEnd)
+
+fn v3ParserIsImportcAnnotation(lineRaw: str): bool =
+    return v3ParserStartsWith(lineRaw, "@importc(")
+
+fn v3ParserTopLevelFunctionKeyword(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if v3ParserStartsWith(line, "importc fn "):
+        return "fn"
+    if v3ParserStartsWith(line, "fn "):
+        return "fn"
+    if v3ParserStartsWith(line, "func "):
+        return "func"
+    if v3ParserStartsWith(line, "proc "):
+        return "proc"
+    if v3ParserStartsWith(line, "method "):
+        return "method"
+    if v3ParserStartsWith(line, "converter "):
+        return "converter"
+    return ""
+
+fn v3ParserFunctionNameFromLine(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    var prefixLen: int32 = 0
+    if v3ParserStartsWith(line, "importc fn "):
+        prefixLen = len("importc fn ")
+    elif v3ParserStartsWith(line, "fn "):
+        prefixLen = len("fn ")
+    elif v3ParserStartsWith(line, "func "):
+        prefixLen = len("func ")
+    elif v3ParserStartsWith(line, "proc "):
+        prefixLen = len("proc ")
+    elif v3ParserStartsWith(line, "method "):
+        prefixLen = len("method ")
+    elif v3ParserStartsWith(line, "converter "):
+        prefixLen = len("converter ")
+    if prefixLen <= 0:
+        return ""
+    if prefixLen >= line.len:
+        return ""
+    let tail = v3path.V3TextSlice(line, prefixLen, line.len - prefixLen)
+    let firstToken = v3ParserFirstToken(tail)
+    return v3ParserIdentPrefix(firstToken)
+
+fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
+                                       decls: var V3NormalizedFunctionDecl[],
+                                       err: var str): bool =
+    decls = []
+    let lines = v3ParserSplitChar(textRaw, '\n')
+    var pendingImportc = false
+    var pendingExplicitExportName = ""
+    for i in 0..<lines.len:
+        let trimmed = v3path.V3PathTrim(lines[i])
+        if trimmed == "":
+            continue
+        let compilerExportName = v3ParserCompilerTopLevelExportName(trimmed)
+        if compilerExportName != "":
+            pendingExplicitExportName = compilerExportName
+            continue
+        let exportcName = v3ParserExportcNameFromAnnotation(trimmed)
+        if exportcName != "":
+            pendingExplicitExportName = exportcName
+            continue
+        if v3ParserIsImportcAnnotation(trimmed):
+            pendingImportc = true
+            pendingExplicitExportName = ""
+            continue
+        if v3ParserStartsWith(trimmed, "@"):
+            continue
+        let keyword = v3ParserTopLevelFunctionKeyword(trimmed)
+        if keyword == "":
+            pendingImportc = false
+            pendingExplicitExportName = ""
+            continue
+        if keyword != "fn":
+            err = "unsupported top-level function alias '" + keyword + "' at line " + intToStr(i + 1)
+            return false
+        let functionName = v3ParserFunctionNameFromLine(trimmed)
+        if functionName == "":
+            pendingImportc = false
+            pendingExplicitExportName = ""
+            continue
+        let inlineImportc = v3ParserStartsWith(trimmed, "importc fn ")
+        var decl: V3NormalizedFunctionDecl
+        decl.name = functionName
+        decl.lineIndex = i + 1
+        decl.importc = pendingImportc || inlineImportc
+        decl.explicitExportName = decl.importc ? "" : pendingExplicitExportName
+        decl.surfaceKeyword = inlineImportc ? "importc fn" : "fn"
+        add(decls, decl)
+        pendingImportc = false
+        pendingExplicitExportName = ""
+    err = ""
+    return true
+
 fn v3ParserContainsCompilerPrefix(lineRaw: str): bool =
     let line = v3path.V3PathTrim(lineRaw)
     if v3ParserStartsWith(line, "import "):
         return true
     if v3ParserStartsWith(line, "type"):
         return true
-    if v3ParserStartsWith(line, "fn "):
+    if v3ParserTopLevelFunctionKeyword(line) != "":
         return true
     if v3ParserStartsWith(line, "iterator "):
         return true
@@ -300,18 +1058,26 @@ fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, so
     return v3ParserFileStem(sourcePath)
 
 fn v3ParserHasCompilerTopLevel(textRaw: str): bool =
+    var decls: V3NormalizedFunctionDecl[] = []
+    var err = ""
+    if v3ParserReadNormalizedFunctionDecls(textRaw, decls, err):
+        if decls.len > 0:
+            return true
     let lines = v3ParserSplitChar(textRaw, '\n')
     for i in 0..<lines.len:
-        let line = lines[i]
-        if v3ParserContainsCompilerPrefix(line):
+        if v3ParserContainsCompilerPrefix(lines[i]):
             return true
     return false
 
 fn v3ParserMainFunctionPresent(textRaw: str): bool =
-    let lines = v3ParserSplitChar(textRaw, '\n')
-    for i in 0..<lines.len:
-        let line = lines[i]
-        if v3ParserLineStartsWith(line, "fn main("):
+    var decls: V3NormalizedFunctionDecl[] = []
+    var err = ""
+    if !v3ParserReadNormalizedFunctionDecls(textRaw, decls, err):
+        return false
+    for i in 0..<decls.len:
+        if decls[i].importc:
+            continue
+        if decls[i].name == "main":
             return true
     return false
 
@@ -347,11 +1113,32 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
 fn v3ImportEdgeTargetSourcePath(edge: V3ImportEdge): str =
     return edge.targetSourcePath
 
+fn v3ParserAddUniqueImportEdge(edges: var V3ImportEdge[],
+                               edge: V3ImportEdge) =
+    for i in 0..<edges.len:
+        if edges[i].ownerModulePath != edge.ownerModulePath:
+            continue
+        if edges[i].targetModulePath != edge.targetModulePath:
+            continue
+        return
+    add(edges, edge)
+
+fn v3ParserAddUniqueText(items: var str[],
+                         text: str) =
+    let value = v3path.V3PathTrim(text)
+    if value == "":
+        return
+    for i in 0..<items.len:
+        if items[i] == value:
+            return
+    add(items, value)
+
 fn v3ParserCollectClosure(workspaceRoot: str,
                           packageRoot: str,
                           sourcePathRaw: str,
                           seen: var str[],
                           ordered: var str[],
+                          importEdges: var V3ImportEdge[],
                           unresolved: var int32,
                           err: var str): bool =
     let sourcePath = v3path.V3PathTrim(sourcePathRaw)
@@ -372,11 +1159,17 @@ fn v3ParserCollectClosure(workspaceRoot: str,
         let currentSourcePath = ordered[scanPos]
         scanPos = scanPos + 1
         let text = v3path.V3ReadTextFile("", currentSourcePath)
+        var normalizedDecls: V3NormalizedFunctionDecl[] = []
+        var normalizedErr = ""
+        if !v3ParserReadNormalizedFunctionDecls(text, normalizedDecls, normalizedErr):
+            err = "v3 parser: " + currentSourcePath + ": " + normalizedErr
+            return false
         let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
         var edges: V3ImportEdge[]
         if !v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, text, edges, err):
             return false
         for i in 0..<edges.len:
+            v3ParserAddUniqueImportEdge(importEdges, edges[i])
             let childSourcePath = edges[i].targetSourcePath
             if !edges[i].resolved:
                 unresolved = unresolved + 1
@@ -403,34 +1196,50 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     let workspaceRoot = v3ParserWorkspaceRoot(packageRoot)
     let packageId = v3ParserPackageId(packageRoot)
     let moduleStem = v3ParserFileStem(sourcePath)
-    let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, sourcePath)
     let rootText = v3path.V3ReadTextFile("", sourcePath)
     if rootText == "":
         err = "v3 parser: failed to read source: " + sourcePath
         return false
-    var importEdges: V3ImportEdge[]
-    if !v3ParserReadImportEdges(workspaceRoot, packageRoot, ownerModulePath, rootText, importEdges, err):
+    var rootDecls: V3NormalizedFunctionDecl[] = []
+    if !v3ParserReadNormalizedFunctionDecls(rootText, rootDecls, err):
+        err = "v3 parser: " + sourcePath + ": " + err
         return false
     var seen: str[] = []
     var ordered: str[] = []
+    var importEdges: V3ImportEdge[] = []
     var unresolved: int32 = 0
-    if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, unresolved, err):
+    if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, importEdges, unresolved, err):
         return false
+    var exprLayer = v3NormalizedExprLayerZero()
+    for i in 0..<ordered.len:
+        var sourceExprLayer = v3NormalizedExprLayerZero()
+        if !v3ParserReadNormalizedExprLayerFromPath(ordered[i], sourceExprLayer, err):
+            err = "v3 parser: " + ordered[i] + ": " + err
+            return false
+        v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
     var ownerModulePaths: str[] = []
-    add(ownerModulePaths, ownerModulePath)
+    for i in 0..<ordered.len:
+        v3ParserAddUniqueText(ownerModulePaths,
+                              v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, ordered[i]))
     parsed.workspaceRoot = workspaceRoot
     parsed.packageRoot = packageRoot
     parsed.packageId = packageId
     parsed.entrySourcePath = sourcePath
     parsed.sourcePath = sourcePath
     parsed.moduleStem = moduleStem
-    parsed.syntaxTag = "v3_source_stub_v1"
+    parsed.syntaxTag = "v3_normalized_source_stub_v3"
     parsed.sourceKind = v3ParsedOrdinarySource
     parsed.ownerModulePaths = ownerModulePaths
     parsed.importEdges = importEdges
     parsed.orderedClosureSourcePaths = ordered
+    parsed.normalizedExprLayer = exprLayer
     parsed.hasCompilerTopLevel = v3ParserHasCompilerTopLevel(rootText)
-    parsed.mainFunctionPresent = v3ParserMainFunctionPresent(rootText)
+    parsed.mainFunctionPresent = false
+    for i in 0..<rootDecls.len:
+        if rootDecls[i].importc:
+            continue
+        if rootDecls[i].name == "main":
+            parsed.mainFunctionPresent = true
     parsed.unresolvedImportCount = unresolved
     err = ""
     return true
