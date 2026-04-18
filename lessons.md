@@ -625,3 +625,6 @@
 - `2026-04-18 23:58 +0800`：live `backend_driver` 上的零 C 审计别再递归现编 [compiler_main.cheng](/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_main.cheng)。这轮已经坐实，它会直接撞回 ordinary `primary_object_body_semantics_missing`；最稳口径是把当前真要守的零 C 面收成 `backend_driver_main` 自己的本地最小扫描。 |
 - `2026-04-18 23:58 +0800`：删除旧命令面时，默认 smoke 列表必须同步换掉。像这轮 `runtime_program_obj` 入口已经删掉，如果还留着 `runtime_program_combined_*` 默认 smoke，就会继续替退场路径续命。 |
 - `2026-04-18 23:58 +0800`：legacy native 路径只要还会在缺 `BACKEND_RUNTIME_OBJ` 时自动物化 combined runtime，零 C 主线就是假绿。最稳口径只能是显式 runtime obj 或直接硬失败，不能再偷偷补一个 `program_runtime.combined`。 |
+- `2026-04-18 23:59 +0800`：wasm 里只要是“先拿目标地址，再去算复合 lvalue/member/index 源值”的路径，都不要把目标地址放进 `emit_lvalue_address(...)` 自己会复用的 scratch。像这轮 `expr_surface_abi`，`return values[0]` 和 `add(rows, droplets[idx])` 都是同一类串写：目标地址先落 `scratch_local/scratch2`，子表达式求值再把它覆盖。最稳口径是进入这类 lowering 前先把目标地址转存到独占 scratch，再做 copy/store。 |
+- `2026-04-18 23:59 +0800`：删旧运行时目录时，顺序必须是“先迁仍存活的旧链路 source list，再清活动源码里的旧路径字面，最后物理删目录”。直接先删目录，只会把审计和 seed 死链一起炸出来，真假混在一团。 |
+- `2026-04-18 23:59 +0800`：源码审计里不要把自己要查的旧路径完整字面写回源码。像这轮 `src/runtime/native/` 如果不拆成拼接常量，`legacy_runtime_native_source_path_present` 就会稳定自报自己命中自己。 |

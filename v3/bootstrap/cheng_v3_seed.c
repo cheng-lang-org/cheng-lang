@@ -11744,19 +11744,11 @@ static void v3_module_package_key(const char *module_path,
             v3_copy_text(out, cap, "cheng/v3");
             return;
         }
-        if (strcmp(normalized_path, "v2") == 0) {
-            v3_copy_text(out, cap, "cheng/v2");
-            return;
-        }
         v3_copy_text(out, cap, normalized_path);
         return;
     }
     if (strncmp(normalized_path, "v3/", 3U) == 0) {
         v3_copy_text(out, cap, "cheng/v3");
-        return;
-    }
-    if (strncmp(normalized_path, "v2/", 3U) == 0) {
-        v3_copy_text(out, cap, "cheng/v2");
         return;
     }
     if (strncmp(normalized_path, "cheng/", 6U) == 0) {
@@ -11781,11 +11773,9 @@ static bool v3_module_paths_share_package(const char *left_module_path,
         return false;
     }
     if ((strcmp(left_key, "cheng/v3") == 0 ||
-         strcmp(left_key, "cheng/v2") == 0 ||
          strcmp(left_key, "std") == 0 ||
          strcmp(left_key, "stage1") == 0) &&
         (strcmp(right_key, "cheng/v3") == 0 ||
-         strcmp(right_key, "cheng/v2") == 0 ||
          strcmp(right_key, "std") == 0 ||
          strcmp(right_key, "stage1") == 0)) {
         return true;
@@ -42746,6 +42736,7 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                         sizeof(base_expr),
                                         index_expr,
                                         sizeof(index_expr)))) {
+            /* Index/member lvalue lowering reuses scratch0/scratch1 internally. */
             if ((dest_addr_local_index == ctx->scratch_local_index ||
                  dest_addr_local_index == ctx->scratch2_local_index) &&
                 ((copy_dest_local_index =

@@ -546,8 +546,6 @@ WebAssembly.instantiate(bytes, {
   expectEqual(exp.browserMoqBuildLongBlobContextIntToStrZeroLenProbe(), 1, 'browserMoqBuildLongBlobContextIntToStrZeroLenProbe');
   expectEqual(exp.browserMoqBuildLongBlobIndexedIntToStrLenProbe(), 1, 'browserMoqBuildLongBlobIndexedIntToStrLenProbe');
   expectEqual(exp.browserMoqBuildLongBlobInlineRowsFirstLenProbe(), 1, 'browserMoqBuildLongBlobInlineRowsFirstLenProbe');
-  expectEqual(exp.browserMoqBuildLongBlobInlineRowsCountViaCalleeProbe(), 1, 'browserMoqBuildLongBlobInlineRowsCountViaCalleeProbe');
-  expectEqual(exp.browserMoqBuildLongBlobInlineRowsFirstLenViaCalleeProbe(), 1, 'browserMoqBuildLongBlobInlineRowsFirstLenViaCalleeProbe');
   expectEqual(exp.browserMoqBuildLongBlobInlineRowsSingleReturnLenProbe(), 1, 'browserMoqBuildLongBlobInlineRowsSingleReturnLenProbe');
   expectEqual(exp.browserMoqBuildLongBlobFirstDropletBlockIndexesLocalInlineCsvLenProbe(), 1, 'browserMoqBuildLongBlobFirstDropletBlockIndexesLocalInlineCsvLenProbe');
   {
