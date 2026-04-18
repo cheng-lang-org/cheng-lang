@@ -3,17 +3,27 @@ import std/rawbytes
 import std/strings as strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/consensus as consensus
 import cheng/v3/chain/lsmr_types as lt
 import cheng/v3/project/cheng_node_identity as identity
 import cheng/v3/project/cheng_node_index as cindex
 import cheng/v3/project/cheng_node_object as cobject
 import cheng/v3/project/cheng_node_ledger as ledger
 import cheng/v3/project/cheng_node_actor as actor
+import cheng/v3/project/cheng_node_transport as ctransport
 import cheng/v3/project/chain_node as chain
-import cheng/v3/project/chain_node_cli_core as legacy
-import cheng/v3/project/bio_did_chain_node as bio
 import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/vpn_proxy_config as vpncfg
+import cheng/v3/tooling/vpn_proxy_routing as vpnrouting
+import cheng/v3/libp2p/core/types as libtypes
+import cheng/v3/libp2p/host/host as libhost
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
 import cheng/v3/libp2p/content/moq_fountain as moq
+
+const
+    v3ChengNodeDidBundleAssetId: int32 = 930001
+    v3ChengNodeDidOperatorAnchorAssetId: int32 = 930002
+    v3ChengNodeDidOperatorAnchorAccountId: int32 = 1
 
 type
     V3ChengNode =
@@ -24,6 +34,8 @@ type
         ledger: ledger.V3ChengNodeLedger
         actors: actor.V3ChengNodeActorBus
         chainState: chain.V3ChainNode
+        transport: ctransport.V3ChengNodeTransportState
+        vpn: ctransport.V3ChengNodeVpnState
 
 fn v3ChengNodeAppendText(buf: var layout.ByteBuf, text: str) =
     lt.v3AppendU32BE(buf, len(text))
@@ -58,7 +70,7 @@ fn v3ChengNodeDispatchForEvent(node: var V3ChengNode,
     if IsErr(ledgerDispatchRes):
         let ledgerErr = Error(ledgerDispatchRes)
         panic ledgerErr
-    if event.indexGroup == "discovery":
+    if event.indexGroup == "discovery" && actorName != "transport_discovery":
         let transportDispatchRes = actor.V3ChengNodeActorBusDispatch(node.actors, "transport_discovery", topic, event.seq)
         if IsErr(transportDispatchRes):
             let transportErr = Error(transportDispatchRes)
@@ -180,19 +192,100 @@ fn v3ChengNodeBalanceValueFromText(text: str): int64 =
         return int64(0)
     return int64(parseInt(balanceText))
 
-fn v3ChengNodeDidOperatorText(record: bio.V3BioDidOperatorRecord): str =
-    var out = ""
-    out = out + "version=1\n"
-    out = out + "operator_id=" + layout.fixedBytes32Hex(record.operatorId) + "\n"
-    out = out + "bundle_kind=" + record.bundleKind + "\n"
-    out = out + "did_text=" + record.didText + "\n"
-    out = out + "subject_did_text=" + record.subjectDidText + "\n"
-    out = out + "device_did_text=" + record.deviceDidText + "\n"
-    out = out + "bundle_seq=" + intToStr(record.bundleSeq) + "\n"
-    out = out + "bundle_cid=" + layout.fixedBytes32Hex(record.bundleCid) + "\n"
-    out = out + "event_id=" + record.eventId + "\n"
-    out = out + "bundle_text_hex=" + bytesToHex(bytesFromString(record.bundleText))
-    return out
+fn v3ChengNodeMaxInt32(left: int32,
+                       right: int32): int32 =
+    if left >= right:
+        return left
+    return right
+
+fn v3ChengNodeChunkCount(payloadLen: int32): int32 =
+    if payloadLen <= 28:
+        return 1
+    return 1 + ((payloadLen - 28 + 31) / 32)
+
+fn v3ChengNodeChunksToPayload(chunks: layout.FixedBytes32[]): Result[Bytes] =
+    if chunks.len <= 0:
+        return Err[Bytes]("cheng_node: missing chunks")
+    let head = layout.fixedBytes32ToBytes(chunks[0])
+    let payloadLen = int32(
+        int64(bytesGet(head, 0) & 255) * int64(16777216) +
+        int64(bytesGet(head, 1) & 255) * int64(65536) +
+        int64(bytesGet(head, 2) & 255) * int64(256) +
+        int64(bytesGet(head, 3) & 255)
+    )
+    if payloadLen < 0:
+        return Err[Bytes]("cheng_node: invalid chunk length")
+    let wantChunkCount = v3ChengNodeChunkCount(payloadLen)
+    if wantChunkCount != chunks.len:
+        return Err[Bytes]("cheng_node: chunk count mismatch")
+    let out = bytesAlloc(payloadLen)
+    var copied = 0
+    var headPos = 4
+    while headPos < 32 && copied < payloadLen:
+        bytesSet(out, copied, bytesGet(head, headPos))
+        copied = copied + 1
+        headPos = headPos + 1
+    for i in 1..<chunks.len:
+        let chunkBytes = layout.fixedBytes32ToBytes(chunks[i])
+        var j = 0
+        while j < 32 && copied < payloadLen:
+            bytesSet(out, copied, bytesGet(chunkBytes, j))
+            copied = copied + 1
+            j = j + 1
+    if copied != payloadLen:
+        return Err[Bytes]("cheng_node: payload size mismatch")
+    return Ok[Bytes](out)
+
+fn v3ChengNodeLoadChunkedText(node: var chain.V3ChainNode,
+                              assetId: int32,
+                              accountId: int32,
+                              seqId: int32): Result[str] =
+    var maxOrdinal = 0
+    for i in 0..<node.events.len:
+        let event = node.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
+            continue
+        if event.assetId != assetId:
+            continue
+        if event.toAccount != accountId:
+            continue
+        if event.fromAccount != seqId:
+            continue
+        let ordinal = int32(event.amount)
+        if int64(ordinal) != event.amount:
+            return Err[str]("cheng_node: chunk ordinal overflow")
+        if ordinal > maxOrdinal:
+            maxOrdinal = ordinal
+    if maxOrdinal <= 0:
+        return Err[str]("cheng_node: chunk seq missing")
+    var chunks: layout.FixedBytes32[]
+    chunks = []
+    var ordinal = 1
+    while ordinal <= maxOrdinal:
+        var foundCount = 0
+        var chunk = layout.fixedBytes32Zero()
+        for i in 0..<node.events.len:
+            let event = node.events[i]
+            if event.kind != consensus.v3ConsensusKindMint:
+                continue
+            if event.assetId != assetId:
+                continue
+            if event.toAccount != accountId:
+                continue
+            if event.fromAccount != seqId:
+                continue
+            if event.amount != int64(ordinal):
+                continue
+            foundCount = foundCount + 1
+            chunk = event.fromParentCid
+        if foundCount != 1:
+            return Err[str]("cheng_node: chunk multiplicity mismatch")
+        add(chunks, chunk)
+        ordinal = ordinal + 1
+    let payloadRes = v3ChengNodeChunksToPayload(chunks)
+    if IsErr(payloadRes):
+        return Err[str](Error(payloadRes))
+    return Ok[str](bytesToString(Value(payloadRes)))
 
 fn v3ChengNodeCompilerBuildReceiptText(receiptKey: str,
                                        receiptCid: layout.FixedBytes32): str =
@@ -216,6 +309,79 @@ fn v3ChengNodeMoqBuildText(build: moq.V3Libp2pMoqBuildResult): str =
     out = out + "object_count=" + intToStr(build.objectCount)
     return out
 
+fn v3ChengNodeDiscoveryObjectKind(lookupKind: str): str =
+    if lookupKind == "topic":
+        return "discovery_topic"
+    if lookupKind == "capability":
+        return "discovery_capability"
+    return "discovery_peer"
+
+fn v3ChengNodeApplyRuntimeObject(node: var V3ChengNode,
+                                 objectKind: str,
+                                 keyText: str,
+                                 payloadCid: layout.FixedBytes32): Result[bool] =
+    let objectRes = cobject.V3ChengNodeObjectStoreGet(node.objects, payloadCid)
+    if IsErr(objectRes):
+        return Err[bool](Error(objectRes))
+    let objectText = Value(objectRes).text
+    if objectKind == "discovery_peer" ||
+       objectKind == "discovery_topic" ||
+       objectKind == "discovery_capability":
+        let applyRes = ctransport.V3ChengNodeTransportApplyDiscoveryText(node.transport, objectText)
+        if IsErr(applyRes):
+            return Err[bool](Error(applyRes))
+        var lookupKind = "peer"
+        if objectKind == "discovery_topic":
+            lookupKind = "topic"
+        elif objectKind == "discovery_capability":
+            lookupKind = "capability"
+        let publishRes = ctransport.V3ChengNodeTransportPublishDiscovery(node.transport,
+                                                                         lookupKind,
+                                                                         keyText,
+                                                                         objectText,
+                                                                         payloadCid,
+                                                                         node.ledger.manifest.headSeq,
+                                                                         node.ledger.manifest.snapshotVersion)
+        if IsErr(publishRes):
+            return Err[bool](Error(publishRes))
+        return Ok[bool](true)
+    if objectKind == "vpn_peer_session":
+        return ctransport.V3ChengNodeVpnApplyPeerText(node.vpn, objectText)
+    if objectKind == "vpn_overlay_route":
+        return ctransport.V3ChengNodeVpnApplyOverlayRouteText(node.vpn, objectText)
+    if objectKind == "vpn_exit_route":
+        return ctransport.V3ChengNodeVpnApplyExitRouteText(node.vpn, objectText)
+    return Ok[bool](false)
+
+fn v3ChengNodeAnnounceDiscoveryText(node: var V3ChengNode,
+                                    lookupKind: str,
+                                    keyText: str,
+                                    objectText: str): Result[bool] =
+    let objectKind = v3ChengNodeDiscoveryObjectKind(lookupKind)
+    let upsertRes = V3ChengNodeUpsertIndexedText(node,
+                                                 "transport_discovery",
+                                                 "discovery",
+                                                 lookupKind,
+                                                 keyText,
+                                                 objectKind,
+                                                 objectText)
+    if IsErr(upsertRes):
+        return Err[bool](Error(upsertRes))
+    let payloadCid = v3ChengNodePayloadFromText(objectKind, objectText)
+    let applyRes = ctransport.V3ChengNodeTransportApplyDiscoveryText(node.transport, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    let publishRes = ctransport.V3ChengNodeTransportPublishDiscovery(node.transport,
+                                                                     lookupKind,
+                                                                     keyText,
+                                                                     objectText,
+                                                                     payloadCid,
+                                                                     node.ledger.manifest.headSeq,
+                                                                     node.ledger.manifest.snapshotVersion)
+    if IsErr(publishRes):
+        return Err[bool](Error(publishRes))
+    return Ok[bool](Value(upsertRes))
+
 fn V3ChengNodeInit(rootSeed: str): Result[V3ChengNode] =
     let identityRes = identity.V3ChengNodeIdentityDerive(rootSeed)
     if IsErr(identityRes):
@@ -232,6 +398,9 @@ fn V3ChengNodeInit(rootSeed: str): Result[V3ChengNode] =
                                                  rootSeed)
     if IsErr(chainInitRes):
         return Err[V3ChengNode](Error(chainInitRes))
+    out.transport = ctransport.V3ChengNodeTransportStateInit(layout.fixedBytes32Hex(out.identity.libp2pKey))
+    out.vpn = ctransport.V3ChengNodeVpnStateInit(layout.fixedBytes32Hex(out.identity.vpnKey),
+                                                 ctransport.V3ChengNodeTransportPeerIdText(out.transport))
     return Ok[V3ChengNode](out)
 
 fn V3ChengNodeAnchorIndexedObject(node: var V3ChengNode,
@@ -404,54 +573,93 @@ fn V3ChengNodeChainTransfer(node: var V3ChengNode,
 
 fn V3ChengNodeSyncDidIndexes(node: var V3ChengNode): Result[bool] =
     var changed = false
-    let bundlesRes = bio.V3BioDidChainLatestBundles(node.chainState)
-    if IsErr(bundlesRes):
-        return Err[bool](Error(bundlesRes))
-    let bundles = Value(bundlesRes)
-    for i in 0..<bundles.len:
-        let bundle = bundles[i]
-        let objectText = bio.V3BioDidChainBundleText(bundle)
+    var didAccountIds: int32[]
+    didAccountIds = []
+    var didMaxSeqs: int32[]
+    didMaxSeqs = []
+    for i in 0..<node.chainState.events.len:
+        let event = node.chainState.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
+            continue
+        if event.assetId != v3ChengNodeDidBundleAssetId:
+            continue
+        var slot = -1
+        for j in 0..<didAccountIds.len:
+            if didAccountIds[j] == event.toAccount:
+                slot = j
+                break
+        if slot < 0:
+            add(didAccountIds, event.toAccount)
+            add(didMaxSeqs, event.fromAccount)
+            continue
+        didMaxSeqs[slot] = v3ChengNodeMaxInt32(didMaxSeqs[slot], event.fromAccount)
+    for i in 0..<didAccountIds.len:
+        let textRes = v3ChengNodeLoadChunkedText(node.chainState,
+                                                 v3ChengNodeDidBundleAssetId,
+                                                 didAccountIds[i],
+                                                 didMaxSeqs[i])
+        if IsErr(textRes):
+            return Err[bool](Error(textRes))
+        let objectText = Value(textRes)
+        let didText = v3ChengNodeLineValue(objectText, "did")
+        if len(didText) <= 0:
+            return Err[bool]("cheng_node: did bundle missing did")
         let upsertRes = V3ChengNodeUpsertIndexedText(node,
                                                      "did",
                                                      "did",
                                                      "subject",
-                                                     bundle.didText,
+                                                     didText,
                                                      "did_bundle",
                                                      objectText)
         if IsErr(upsertRes):
             return Err[bool](Error(upsertRes))
         if Value(upsertRes):
             changed = true
-    var state: bio.V3BioDidChainState
-    let stateRes = bio.V3BioDidChainStateFromNodeInto(state, node.chainState)
-    if IsErr(stateRes):
-        return Err[bool](Error(stateRes))
-    for i in 0..<state.operatorIndex.vals.len:
-        let record = state.operatorIndex.vals[i]
-        if layout.fixedBytes32Equal(record.operatorId, layout.fixedBytes32Zero()):
+    var maxAnchorSeq = 0
+    for i in 0..<node.chainState.events.len:
+        let event = node.chainState.events[i]
+        if event.kind != consensus.v3ConsensusKindMint:
             continue
-        let keyText = layout.fixedBytes32Hex(record.operatorId)
-        let objectText = v3ChengNodeDidOperatorText(record)
+        if event.assetId != v3ChengNodeDidOperatorAnchorAssetId:
+            continue
+        if event.toAccount != v3ChengNodeDidOperatorAnchorAccountId:
+            continue
+        if event.fromAccount > maxAnchorSeq:
+            maxAnchorSeq = event.fromAccount
+    var anchorSeq = 1
+    while anchorSeq <= maxAnchorSeq:
+        let textRes = v3ChengNodeLoadChunkedText(node.chainState,
+                                                 v3ChengNodeDidOperatorAnchorAssetId,
+                                                 v3ChengNodeDidOperatorAnchorAccountId,
+                                                 anchorSeq)
+        if IsErr(textRes):
+            return Err[bool](Error(textRes))
+        let objectText = Value(textRes)
+        let keyText = v3ChengNodeLineValue(objectText, "operator_id")
+        if len(keyText) <= 0:
+            return Err[bool]("cheng_node: operator anchor missing operator_id")
         let upsertRes = V3ChengNodeUpsertIndexedText(node,
                                                      "did",
                                                      "did_operator",
                                                      "operator",
                                                      keyText,
-                                                     "did_operator_record",
+                                                     "did_operator_anchor",
                                                      objectText)
         if IsErr(upsertRes):
             return Err[bool](Error(upsertRes))
         if Value(upsertRes):
             changed = true
+        anchorSeq = anchorSeq + 1
     return Ok[bool](changed)
 
-fn V3ChengNodeImportLegacyChainState(node: var V3ChengNode,
-                                     statePath: str): Result[bool] =
-    var legacyNode: chain.V3ChainNode
-    let loadRes = legacy.V3ChainNodeCliLoadStateInto(legacyNode, statePath)
-    if IsErr(loadRes):
-        return Err[bool](Error(loadRes))
-    node.chainState = legacyNode
+fn V3ChengNodeImportChainSnapshot(node: var V3ChengNode,
+                                  snapshot: chain.V3ChainNodeServeSnapshot): Result[bool] =
+    let replayRes = chain.v3ChainNodeReplayFromSnapshotInto(node.chainState,
+                                                            snapshot.nodeId,
+                                                            snapshot.address,
+                                                            snapshot)
+    if IsErr(replayRes):
+        return Err[bool](Error(replayRes))
     var changed = false
     for i in 0..<node.chainState.index.accountAssetIds.len:
         let assetId = node.chainState.index.accountAssetIds[i]
@@ -467,6 +675,179 @@ fn V3ChengNodeImportLegacyChainState(node: var V3ChengNode,
     if Value(didRes):
         changed = true
     return Ok[bool](changed)
+
+fn V3ChengNodeReplayStoredEvent(node: var V3ChengNode,
+                                actorName: str,
+                                objectKind: str,
+                                indexGroup: str,
+                                lookupKind: str,
+                                keyText: str,
+                                payloadCid: layout.FixedBytes32): Result[bool] =
+    if objectKind == "index_tombstone":
+        let proofRes = V3ChengNodeTombstoneIndexedObject(node,
+                                                         actorName,
+                                                         indexGroup,
+                                                         lookupKind,
+                                                         keyText)
+        if IsErr(proofRes):
+            return Err[bool](Error(proofRes))
+        return Ok[bool](true)
+    let proofRes = v3ChengNodeAnchorIndexedCid(node,
+                                               actorName,
+                                               indexGroup,
+                                               lookupKind,
+                                               keyText,
+                                               objectKind,
+                                               payloadCid)
+    if IsErr(proofRes):
+        return Err[bool](Error(proofRes))
+    let runtimeRes = v3ChengNodeApplyRuntimeObject(node, objectKind, keyText, payloadCid)
+    if IsErr(runtimeRes):
+        return Err[bool](Error(runtimeRes))
+    return Ok[bool](true)
+
+fn V3ChengNodeLocalPeerIdText(node: V3ChengNode): str =
+    return ctransport.V3ChengNodeTransportPeerIdText(node.transport)
+
+fn V3ChengNodeAnnounceDiscovery(node: var V3ChengNode,
+                                lookupKind: str,
+                                keyText: str,
+                                transportKind: str,
+                                hostText: str,
+                                port: int32,
+                                networkDomain: str,
+                                visibility: str,
+                                priority: int32): Result[bool] =
+    let addrRes = ctransport.V3ChengNodeTransportListenAddr(transportKind,
+                                                            hostText,
+                                                            port,
+                                                            networkDomain,
+                                                            visibility,
+                                                            priority)
+    if IsErr(addrRes):
+        return Err[bool](Error(addrRes))
+    let objectText = ctransport.V3ChengNodeTransportDiscoveryObjectText(lookupKind,
+                                                                        keyText,
+                                                                        ctransport.V3ChengNodeTransportPeerIdText(node.transport),
+                                                                        Value(addrRes))
+    return v3ChengNodeAnnounceDiscoveryText(node, lookupKind, keyText, objectText)
+
+fn V3ChengNodeAnnouncePeer(node: var V3ChengNode,
+                           transportKind: str,
+                           hostText: str,
+                           port: int32): Result[bool] =
+    var networkDomain = "public"
+    if transportKind == "webrtc":
+        networkDomain = "browser-webrtc"
+    return V3ChengNodeAnnounceDiscovery(node,
+                                        "peer",
+                                        ctransport.V3ChengNodeTransportPeerIdText(node.transport),
+                                        transportKind,
+                                        hostText,
+                                        port,
+                                        networkDomain,
+                                        "public",
+                                        100)
+
+fn V3ChengNodeSyncDiscoveryFromRemote(node: var V3ChengNode,
+                                      remote: var V3ChengNode,
+                                      lookupKind: str,
+                                      keyText: str): Result[bool] =
+    var objectText = ""
+    let syncRes = ctransport.V3ChengNodeTransportSyncDiscoveryText(node.transport,
+                                                                   remote.transport,
+                                                                   lookupKind,
+                                                                   keyText,
+                                                                   objectText)
+    if IsErr(syncRes):
+        return Err[bool](Error(syncRes))
+    return v3ChengNodeAnnounceDiscoveryText(node, lookupKind, keyText, objectText)
+
+fn V3ChengNodeStreamText(node: var V3ChengNode,
+                         remote: var V3ChengNode,
+                         protocolText: str): Result[str] =
+    if protocolText == "identify":
+        return ctransport.V3ChengNodeTransportIdentifyText(node.transport, remote.transport)
+    let protocolRes = ctransport.V3ChengNodeTransportProtocolId(protocolText)
+    if IsErr(protocolRes):
+        return Err[str](Error(protocolRes))
+    if remote.transport.host.listenAddrs.len <= 0:
+        return Err[str]("cheng_node: remote transport has no listen addr")
+    let remoteAddr = remote.transport.host.listenAddrs[0]
+    let dialRes = libhost.v3Libp2pDial(node.transport.host,
+                                       remote.transport.host.selfPeerId,
+                                       remoteAddr,
+                                       2)
+    if IsErr(dialRes):
+        return Err[str](Error(dialRes))
+    let streamRes = libhost.v3Libp2pOpenStream(node.transport.host,
+                                               remote.transport.host.selfPeerId,
+                                               Value(protocolRes))
+    if IsErr(streamRes):
+        return Err[str](Error(streamRes))
+    var out = ""
+    out = out + "peer_id=" + ctransport.V3ChengNodeTransportPeerIdText(remote.transport) + "\n"
+    out = out + "transport=" + libtypes.v3Libp2pTransportText(remoteAddr.transport) + "\n"
+    out = out + "protocol=" + protocolText + "\n"
+    out = out + "stream_id=" + intToStr(Value(streamRes)) + "\n"
+    out = out + "open_stream_count=" + intToStr(node.transport.host.openStreamPeers.len)
+    return Ok[str](out)
+
+fn V3ChengNodeVpnUpsertPeer(node: var V3ChengNode,
+                            session: tsnet.V3Libp2pTailnetPeerSession): Result[bool] =
+    let objectText = ctransport.V3ChengNodeVpnPeerObjectText(session)
+    let applyRes = ctransport.V3ChengNodeVpnApplyPeerText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_peer",
+                                        "peer",
+                                        session.peerId,
+                                        "vpn_peer_session",
+                                        objectText)
+
+fn V3ChengNodeVpnUpsertOverlayRoute(node: var V3ChengNode,
+                                    routeKey: str,
+                                    rawAddr: libtypes.V3Libp2pMultiaddr): Result[bool] =
+    let listenRes = tsnet.v3Libp2pTailnetListen(node.vpn.overlay, rawAddr)
+    if IsErr(listenRes):
+        return Err[bool](Error(listenRes))
+    let objectText = ctransport.V3ChengNodeVpnOverlayRouteObjectText(routeKey,
+                                                                     ctransport.V3ChengNodeTransportPeerIdText(node.transport),
+                                                                     rawAddr,
+                                                                     Value(listenRes))
+    let applyRes = ctransport.V3ChengNodeVpnApplyOverlayRouteText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_route",
+                                        "route",
+                                        routeKey,
+                                        "vpn_overlay_route",
+                                        objectText)
+
+fn V3ChengNodeVpnUpsertExitRoute(node: var V3ChengNode,
+                                 routeKey: str,
+                                 cfg: vpncfg.V3VpnProxyExitConfig): Result[bool] =
+    var exits = vpnrouting.V3VpnProxyInitExitStates([cfg])
+    if exits.len <= 0:
+        return Err[bool]("cheng_node: exit state init failed")
+    let objectText = ctransport.V3ChengNodeVpnExitRouteObjectText(routeKey, cfg, exits[0])
+    let applyRes = ctransport.V3ChengNodeVpnApplyExitRouteText(node.vpn, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "vpn",
+                                        "vpn_route",
+                                        "route",
+                                        routeKey,
+                                        "vpn_exit_route",
+                                        objectText)
+
+fn V3ChengNodeVpnStatusReportText(node: V3ChengNode): str =
+    return ctransport.V3ChengNodeVpnStatusText(node.vpn)
 
 fn V3ChengNodeAnchorCompilerPackage(node: var V3ChengNode,
                                     snapshot: cworld.V3CompilerPackageSnapshot): Result[ledger.V3ChengNodeProofBundle] =
@@ -662,8 +1043,12 @@ fn V3ChengNodeBootstrapSummaryText(node: V3ChengNode): str =
     out = out + "balance_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "balance")) + "\n"
     out = out + "did_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did")) + "\n"
     out = out + "did_operator_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did_operator")) + "\n"
+    out = out + "discovery_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "discovery")) + "\n"
+    out = out + "vpn_peer_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "vpn_peer")) + "\n"
+    out = out + "vpn_route_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "vpn_route")) + "\n"
     out = out + "manifest_head_seq=" + intToStr(node.ledger.manifest.headSeq) + "\n"
     out = out + "manifest_head_cid=" + layout.fixedBytes32Hex(node.ledger.manifest.headCid) + "\n"
     out = out + "chain_tip_event_cid=" + layout.fixedBytes32Hex(node.chainState.tipEventCid) + "\n"
-    out = out + "chain_event_count=" + intToStr(node.chainState.events.len)
+    out = out + "chain_event_count=" + intToStr(node.chainState.events.len) + "\n"
+    out = out + "transport_peer_id=" + ctransport.V3ChengNodeTransportPeerIdText(node.transport)
     return out

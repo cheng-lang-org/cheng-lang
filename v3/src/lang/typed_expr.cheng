@@ -1,0 +1,955 @@
+import std/buffer
+import std/rawbytes
+import cheng/v3/tooling/path as v3path
+import cheng/v3/lang/parser
+
+type
+    V3TypedExprAbiClass = enum
+        v3TypedExprAbiScalar
+        v3TypedExprAbiComposite
+        v3TypedExprAbiPointerLike
+        v3TypedExprAbiPolymorphic
+
+    V3TypedExprValueKind = enum
+        v3TypedExprValueScalar
+        v3TypedExprValueComposite
+        v3TypedExprValuePointerLike
+        v3TypedExprValuePolymorphic
+
+    V3TypedExprPlaceKind = enum
+        v3TypedExprPlaceLocal
+        v3TypedExprPlaceGlobal
+        v3TypedExprPlaceField
+        v3TypedExprPlaceTemporary
+        v3TypedExprPlaceCallResult
+
+    V3TypedExprLoweringMode = enum
+        v3TypedExprLowerReg
+        v3TypedExprLowerLocalAddress
+        v3TypedExprLowerSret
+        v3TypedExprLowerImportBuffer
+        v3TypedExprLowerDeferred
+
+    V3TypedExprFact =
+        exprId: str
+        sourcePath: str
+        lineNumber: int32
+        columnNumber: int32
+        endLineNumber: int32
+        endColumnNumber: int32
+        kind: parser.V3NormalizedExprKind
+        typeText: str
+        abiClass: V3TypedExprAbiClass
+        valueKind: V3TypedExprValueKind
+        placeKind: V3TypedExprPlaceKind
+        loweringMode: V3TypedExprLoweringMode
+
+    V3TypedExprSourceText =
+        sourcePath: str
+        text: str
+
+    V3TypedExprFunctionScope =
+        sourcePath: str
+        name: str
+        startLine: int32
+        endLine: int32
+        returnType: str
+
+    V3TypedExprBinding =
+        sourcePath: str
+        functionName: str
+        globalFlag: bool
+        lineNumber: int32
+        name: str
+        typeText: str
+
+    V3TypedExprSourceContext =
+        sourcePath: str
+        lines: str[]
+        scopes: V3TypedExprFunctionScope[]
+        bindings: V3TypedExprBinding[]
+
+    V3TypedExprSinkInfo =
+        sinkType: str
+        sinkPlaceKind: V3TypedExprPlaceKind
+        hasSink: bool
+        returnRoot: bool
+        functionReturnType: str
+
+fn v3TypedExprAbiClassText(abiClass: V3TypedExprAbiClass): str =
+    if abiClass == v3TypedExprAbiScalar:
+        return "scalar"
+    if abiClass == v3TypedExprAbiComposite:
+        return "composite"
+    if abiClass == v3TypedExprAbiPointerLike:
+        return "pointer_like"
+    return "polymorphic"
+
+fn v3TypedExprValueKindText(valueKind: V3TypedExprValueKind): str =
+    if valueKind == v3TypedExprValueScalar:
+        return "scalar"
+    if valueKind == v3TypedExprValueComposite:
+        return "composite"
+    if valueKind == v3TypedExprValuePointerLike:
+        return "pointer_like"
+    return "polymorphic"
+
+fn v3TypedExprPlaceKindText(placeKind: V3TypedExprPlaceKind): str =
+    if placeKind == v3TypedExprPlaceLocal:
+        return "local"
+    if placeKind == v3TypedExprPlaceGlobal:
+        return "global"
+    if placeKind == v3TypedExprPlaceField:
+        return "field"
+    if placeKind == v3TypedExprPlaceCallResult:
+        return "call_result"
+    return "temporary"
+
+fn v3TypedExprLoweringModeText(loweringMode: V3TypedExprLoweringMode): str =
+    if loweringMode == v3TypedExprLowerReg:
+        return "reg"
+    if loweringMode == v3TypedExprLowerLocalAddress:
+        return "local_address"
+    if loweringMode == v3TypedExprLowerSret:
+        return "sret"
+    if loweringMode == v3TypedExprLowerImportBuffer:
+        return "import_buffer"
+    return "deferred"
+
+fn v3TypedExprFactClone(fact: V3TypedExprFact): V3TypedExprFact =
+    var out: V3TypedExprFact
+    out.exprId = fact.exprId
+    out.sourcePath = fact.sourcePath
+    out.lineNumber = fact.lineNumber
+    out.columnNumber = fact.columnNumber
+    out.endLineNumber = fact.endLineNumber
+    out.endColumnNumber = fact.endColumnNumber
+    out.kind = fact.kind
+    out.typeText = fact.typeText
+    out.abiClass = fact.abiClass
+    out.valueKind = fact.valueKind
+    out.placeKind = fact.placeKind
+    out.loweringMode = fact.loweringMode
+    return out
+
+fn v3TypedExprFactsClone(facts: V3TypedExprFact[]): V3TypedExprFact[] =
+    var out: V3TypedExprFact[] = []
+    for i in 0..<facts.len:
+        add(out, v3TypedExprFactClone(facts[i]))
+    return out
+
+fn v3TypedExprFactEqual(lhs: V3TypedExprFact,
+                        rhs: V3TypedExprFact): bool =
+    if lhs.exprId != rhs.exprId:
+        return false
+    if lhs.sourcePath != rhs.sourcePath:
+        return false
+    if lhs.lineNumber != rhs.lineNumber:
+        return false
+    if lhs.columnNumber != rhs.columnNumber:
+        return false
+    if lhs.endLineNumber != rhs.endLineNumber:
+        return false
+    if lhs.endColumnNumber != rhs.endColumnNumber:
+        return false
+    if lhs.kind != rhs.kind:
+        return false
+    if lhs.typeText != rhs.typeText:
+        return false
+    if lhs.abiClass != rhs.abiClass:
+        return false
+    if lhs.valueKind != rhs.valueKind:
+        return false
+    if lhs.placeKind != rhs.placeKind:
+        return false
+    return lhs.loweringMode == rhs.loweringMode
+
+fn v3TypedExprFactsEqual(lhs: V3TypedExprFact[],
+                         rhs: V3TypedExprFact[]): bool =
+    if lhs.len != rhs.len:
+        return false
+    for i in 0..<lhs.len:
+        if !v3TypedExprFactEqual(lhs[i], rhs[i]):
+            return false
+    return true
+
+fn v3TypedExprFactCountAbiClass(facts: V3TypedExprFact[],
+                                abiClass: V3TypedExprAbiClass): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].abiClass == abiClass:
+            count = count + 1
+    return count
+
+fn v3TypedExprFactCountValueKind(facts: V3TypedExprFact[],
+                                 valueKind: V3TypedExprValueKind): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].valueKind == valueKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprFactCountPlaceKind(facts: V3TypedExprFact[],
+                                 placeKind: V3TypedExprPlaceKind): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].placeKind == placeKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprFactCountLoweringMode(facts: V3TypedExprFact[],
+                                    loweringMode: V3TypedExprLoweringMode): int32 =
+    var count: int32 = 0
+    for i in 0..<facts.len:
+        if facts[i].loweringMode == loweringMode:
+            count = count + 1
+    return count
+
+fn v3TypedExprConcat3(a: str, b: str, c: str): str =
+    var buf = buffer.NewByteBuffer()
+    if a != "":
+        buffer.AppendBytes(buf, a)
+    if b != "":
+        buffer.AppendBytes(buf, b)
+    if c != "":
+        buffer.AppendBytes(buf, c)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
+
+fn v3TypedExprConcat4(a: str, b: str, c: str, d: str): str =
+    var buf = buffer.NewByteBuffer()
+    if a != "":
+        buffer.AppendBytes(buf, a)
+    if b != "":
+        buffer.AppendBytes(buf, b)
+    if c != "":
+        buffer.AppendBytes(buf, c)
+    if d != "":
+        buffer.AppendBytes(buf, d)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
+
+fn v3TypedExprNormalizeTypeText(typeRaw: str): str =
+    let trimmed: str = v3path.V3PathTrim(typeRaw)
+    if trimmed == "":
+        return ""
+    var out = buffer.NewByteBuffer()
+    for i in 0..<trimmed.len:
+        let piece = v3path.V3TextSlice(trimmed, i, 1)
+        if piece == " ":
+            continue
+        if piece == "\t":
+            continue
+        if piece == "\n":
+            continue
+        if piece == "\r":
+            continue
+        buffer.AppendBytes(out, piece)
+    return rawbytes.bytesToString(buffer.ToBytes(out))
+
+fn v3TypedExprSourceTextNew(sourcePath: str,
+                            text: str): V3TypedExprSourceText =
+    var out: V3TypedExprSourceText
+    out.sourcePath = parser.v3ParserNormalizePath(sourcePath)
+    out.text = text
+    return out
+
+fn v3TypedExprResultType(innerTypeRaw: str): str =
+    let innerType = v3TypedExprNormalizeTypeText(innerTypeRaw)
+    if innerType == "":
+        return ""
+    return v3TypedExprConcat3("Result[", innerType, "]")
+
+fn v3TypedExprResultSuccessType(typeRaw: str): str =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if !parser.v3ParserStartsWith(typeText, "Result["):
+        return ""
+    if typeText.len <= 8:
+        return ""
+    if v3path.V3TextSlice(typeText, typeText.len - 1, 1) != "]":
+        return ""
+    return v3path.V3TextSlice(typeText, len("Result["), typeText.len - len("Result[") - 1)
+
+fn v3TypedExprTypeIsScalar(typeRaw: str): bool =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return false
+    if typeText == "bool" || typeText == "char":
+        return true
+    if typeText == "int" || typeText == "uint":
+        return true
+    if typeText == "int8" || typeText == "uint8" || typeText == "u8":
+        return true
+    if typeText == "int16" || typeText == "uint16" || typeText == "u16":
+        return true
+    if typeText == "int32" || typeText == "uint32" || typeText == "u32":
+        return true
+    if typeText == "int64" || typeText == "uint64" || typeText == "u64":
+        return true
+    if typeText == "float32" || typeText == "float64":
+        return true
+    return false
+
+fn v3TypedExprTypeIsPointerLike(typeRaw: str): bool =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "cstring":
+        return true
+    if typeText == "ptr":
+        return true
+    return parser.v3ParserStartsWith(typeText, "ptr[") || parser.v3ParserStartsWith(typeText, "Pointer[")
+
+fn v3TypedExprTypeIsComposite(typeRaw: str): bool =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return false
+    if typeText == "str" || typeText == "Bytes" || typeText == "bytes.Bytes":
+        return true
+    if typeText == "rawbytes" || typeText == "ErrorInfo" || typeText == "range":
+        return true
+    if parser.v3ParserStartsWith(typeText, "Result["):
+        return true
+    if parser.v3ParserStartsWith(typeText, "seq["):
+        return true
+    if parser.v3ParserStartsWith(typeText, "tuple["):
+        return true
+    if parser.v3ParserStartsWith(typeText, "array["):
+        return true
+    if parser.v3ParserStartsWith(typeText, "object["):
+        return true
+    if typeText.len >= 2 && v3path.V3TextSlice(typeText, typeText.len - 2, 2) == "[]":
+        return true
+    return false
+
+fn v3TypedExprAbiClassForType(typeRaw: str): V3TypedExprAbiClass =
+    if v3TypedExprTypeIsScalar(typeRaw):
+        return v3TypedExprAbiScalar
+    if v3TypedExprTypeIsPointerLike(typeRaw):
+        return v3TypedExprAbiPointerLike
+    if v3TypedExprTypeIsComposite(typeRaw):
+        return v3TypedExprAbiComposite
+    return v3TypedExprAbiPolymorphic
+
+fn v3TypedExprValueKindForAbiClass(abiClass: V3TypedExprAbiClass): V3TypedExprValueKind =
+    if abiClass == v3TypedExprAbiScalar:
+        return v3TypedExprValueScalar
+    if abiClass == v3TypedExprAbiComposite:
+        return v3TypedExprValueComposite
+    if abiClass == v3TypedExprAbiPointerLike:
+        return v3TypedExprValuePointerLike
+    return v3TypedExprValuePolymorphic
+
+fn v3TypedExprSkipInlineSpaces(lineRaw: str,
+                               start: int32): int32 =
+    var cursor = start
+    var scanning = true
+    while cursor < lineRaw.len && scanning:
+        if parser.v3ParserIsInlineSpace(lineRaw[cursor]):
+            cursor = cursor + 1
+        else:
+            scanning = false
+    return cursor
+
+fn v3TypedExprFindMatchingPair(lineRaw: str,
+                               openPos: int32,
+                               openText: str,
+                               closeText: str): int32 =
+    if openPos < 0:
+        return -1
+    if openPos >= lineRaw.len:
+        return -1
+    if v3path.V3TextSlice(lineRaw, openPos, 1) != openText:
+        return -1
+    var depth: int32 = 0
+    for i in openPos..<lineRaw.len:
+        let piece = v3path.V3TextSlice(lineRaw, i, 1)
+        if piece == openText:
+            depth = depth + 1
+        elif piece == closeText:
+            depth = depth - 1
+            if depth == 0:
+                return i
+    return -1
+
+fn v3TypedExprFindMatchingParen(lineRaw: str,
+                                openPos: int32): int32 =
+    return v3TypedExprFindMatchingPair(lineRaw, openPos, "(", ")")
+
+fn v3TypedExprFindMatchingBracket(lineRaw: str,
+                                  openPos: int32): int32 =
+    return v3TypedExprFindMatchingPair(lineRaw, openPos, "[", "]")
+
+fn v3TypedExprSliceTrim(textRaw: str,
+                        start: int32,
+                        count: int32): str =
+    if start < 0 || count <= 0:
+        return ""
+    return v3path.V3PathTrim(v3path.V3TextSlice(textRaw, start, count))
+
+fn v3TypedExprFindTopLevelToken(textRaw: str,
+                                target: str): int32 =
+    var bracketDepth: int32 = 0
+    var parenDepth: int32 = 0
+    var braceDepth: int32 = 0
+    for i in 0..<textRaw.len:
+        let piece = v3path.V3TextSlice(textRaw, i, 1)
+        if piece == "[":
+            bracketDepth = bracketDepth + 1
+        elif piece == "]":
+            bracketDepth = bracketDepth - 1
+        elif piece == "(":
+            parenDepth = parenDepth + 1
+        elif piece == ")":
+            parenDepth = parenDepth - 1
+        elif piece == "{":
+            braceDepth = braceDepth + 1
+        elif piece == "}":
+            braceDepth = braceDepth - 1
+        elif piece == target && bracketDepth == 0 && parenDepth == 0 && braceDepth == 0:
+            return i
+    return -1
+
+fn v3TypedExprParseFunctionReturnType(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    let openPos = parser.v3ParserFindText(line, "(")
+    if openPos < 0:
+        return ""
+    let closePos = v3TypedExprFindMatchingParen(line, openPos)
+    if closePos < 0:
+        return ""
+    let cursor0 = v3TypedExprSkipInlineSpaces(line, closePos + 1)
+    var cursor = cursor0
+    if cursor >= line.len:
+        return ""
+    if v3path.V3TextSlice(line, cursor, 1) != ":":
+        return ""
+    cursor = v3TypedExprSkipInlineSpaces(line, cursor + 1)
+    let tail = v3path.V3TextSlice(line, cursor, line.len - cursor)
+    let eqPos = v3TypedExprFindTopLevelToken(tail, "=")
+    if eqPos >= 0:
+        return v3TypedExprNormalizeTypeText(v3path.V3TextSlice(tail, 0, eqPos))
+    return v3TypedExprNormalizeTypeText(tail)
+
+fn v3TypedExprSplitTopLevelCsv(itemsRaw: str): str[] =
+    var out: str[] = []
+    var start: int32 = 0
+    var bracketDepth: int32 = 0
+    var parenDepth: int32 = 0
+    var braceDepth: int32 = 0
+    for i in 0..<itemsRaw.len:
+        let piece = v3path.V3TextSlice(itemsRaw, i, 1)
+        if piece == "[":
+            bracketDepth = bracketDepth + 1
+        elif piece == "]":
+            bracketDepth = bracketDepth - 1
+        elif piece == "(":
+            parenDepth = parenDepth + 1
+        elif piece == ")":
+            parenDepth = parenDepth - 1
+        elif piece == "{":
+            braceDepth = braceDepth + 1
+        elif piece == "}":
+            braceDepth = braceDepth - 1
+        elif piece == "," && bracketDepth == 0 && parenDepth == 0 && braceDepth == 0:
+            add(out, v3TypedExprSliceTrim(itemsRaw, start, i - start))
+            start = i + 1
+    add(out, v3TypedExprSliceTrim(itemsRaw, start, itemsRaw.len - start))
+    return out
+
+fn v3TypedExprMaybeAddBinding(bindings: var V3TypedExprBinding[],
+                              sourcePath: str,
+                              functionName: str,
+                              globalFlag: bool,
+                              lineNumber: int32,
+                              nameRaw: str,
+                              typeRaw: str) =
+    let name = parser.v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if name == "" || typeText == "":
+        return
+    var binding: V3TypedExprBinding
+    binding.sourcePath = sourcePath
+    binding.functionName = functionName
+    binding.globalFlag = globalFlag
+    binding.lineNumber = lineNumber
+    binding.name = name
+    binding.typeText = typeText
+    add(bindings, binding)
+
+fn v3TypedExprAppendParamBindings(bindings: var V3TypedExprBinding[],
+                                  scope: V3TypedExprFunctionScope,
+                                  lineRaw: str) =
+    let line = v3path.V3PathTrim(lineRaw)
+    let openPos = parser.v3ParserFindText(line, "(")
+    if openPos < 0:
+        return
+    let closePos = v3TypedExprFindMatchingParen(line, openPos)
+    if closePos <= openPos:
+        return
+    let paramsText = v3path.V3TextSlice(line, openPos + 1, closePos - openPos - 1)
+    let params = v3TypedExprSplitTopLevelCsv(paramsText)
+    for i in 0..<params.len:
+        var item = params[i]
+        if parser.v3ParserStartsWith(item, "var "):
+            item = v3path.V3TextSlice(item, 4, item.len - 4)
+        let colonPos = v3TypedExprFindTopLevelToken(item, ":")
+        if colonPos <= 0:
+            continue
+        let nameText = v3path.V3TextSlice(item, 0, colonPos)
+        var typeText = v3path.V3TextSlice(item, colonPos + 1, item.len - colonPos - 1)
+        let eqPos = v3TypedExprFindTopLevelToken(typeText, "=")
+        if eqPos >= 0:
+            typeText = v3path.V3TextSlice(typeText, 0, eqPos)
+        v3TypedExprMaybeAddBinding(bindings,
+                                   scope.sourcePath,
+                                   scope.name,
+                                   false,
+                                   scope.startLine,
+                                   nameText,
+                                   typeText)
+
+fn v3TypedExprScopeIndexForLine(scopes: V3TypedExprFunctionScope[],
+                                lineNumber: int32): int32 =
+    for i in 0..<scopes.len:
+        if lineNumber < scopes[i].startLine:
+            continue
+        if lineNumber > scopes[i].endLine:
+            continue
+        return i
+    return -1
+
+fn v3TypedExprParseBindingLine(lineRaw: str,
+                               name: var str,
+                               typeText: var str,
+                               rhsStartColumn: var int32): bool =
+    name = ""
+    typeText = ""
+    rhsStartColumn = -1
+    let trimmed = v3path.V3PathTrim(lineRaw)
+    var prefix = ""
+    if parser.v3ParserStartsWith(trimmed, "let "):
+        prefix = "let "
+    elif parser.v3ParserStartsWith(trimmed, "var "):
+        prefix = "var "
+    elif parser.v3ParserStartsWith(trimmed, "const "):
+        prefix = "const "
+    if prefix == "":
+        return false
+    let tail = v3path.V3TextSlice(trimmed, len(prefix), trimmed.len - len(prefix))
+    let rawName = parser.v3ParserFirstToken(tail)
+    let bindingName = parser.v3ParserIdentPrefix(rawName)
+    if bindingName == "":
+        return false
+    let colonPos = v3TypedExprFindTopLevelToken(tail, ":")
+    let eqPos = v3TypedExprFindTopLevelToken(tail, "=")
+    if colonPos < 0 || eqPos < 0 || eqPos <= colonPos:
+        return false
+    name = bindingName
+    typeText = v3TypedExprNormalizeTypeText(v3path.V3TextSlice(tail, colonPos + 1, eqPos - colonPos - 1))
+    let originalEqPos = parser.v3ParserFindText(lineRaw, "=")
+    if originalEqPos < 0:
+        return false
+    rhsStartColumn = originalEqPos + 2
+    var scanning = true
+    while rhsStartColumn <= lineRaw.len && scanning:
+        if parser.v3ParserIsInlineSpace(lineRaw[rhsStartColumn - 1]):
+            rhsStartColumn = rhsStartColumn + 1
+        else:
+            scanning = false
+    return name != "" && typeText != ""
+
+fn v3TypedExprSourceContextLookup(sourceContexts: V3TypedExprSourceContext[],
+                                  sourcePathRaw: str): int32 =
+    let sourcePath = parser.v3ParserNormalizePath(sourcePathRaw)
+    for i in 0..<sourceContexts.len:
+        if sourceContexts[i].sourcePath == sourcePath:
+            return i
+    return -1
+
+fn v3TypedExprSourceLine(ctx: V3TypedExprSourceContext,
+                         lineNumber: int32): str =
+    if lineNumber <= 0 || lineNumber > ctx.lines.len:
+        return ""
+    return ctx.lines[lineNumber - 1]
+
+fn v3TypedExprLookupBindingType(ctx: V3TypedExprSourceContext,
+                                scopeIndex: int32,
+                                lineNumber: int32,
+                                nameRaw: str): str =
+    let name = parser.v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return ""
+    var bestLine: int32 = -1
+    var bestType = ""
+    var scopeName = ""
+    if scopeIndex >= 0:
+        scopeName = ctx.scopes[scopeIndex].name
+    for i in 0..<ctx.bindings.len:
+        let binding = ctx.bindings[i]
+        if binding.name != name:
+            continue
+        if binding.lineNumber > lineNumber:
+            continue
+        if scopeName != "":
+            if !binding.globalFlag && binding.functionName == scopeName && binding.lineNumber >= bestLine:
+                bestLine = binding.lineNumber
+                bestType = binding.typeText
+                continue
+            if binding.globalFlag && bestLine < 0:
+                bestLine = binding.lineNumber
+                bestType = binding.typeText
+            continue
+        if !binding.globalFlag:
+            continue
+        if binding.lineNumber >= bestLine:
+            bestLine = binding.lineNumber
+            bestType = binding.typeText
+    return bestType
+
+fn v3TypedExprFirstExprColumnAfter(exprLayer: parser.V3NormalizedExprLayer,
+                                   sourcePathRaw: str,
+                                   lineNumber: int32,
+                                   minColumn: int32): int32 =
+    let sourcePath = parser.v3ParserNormalizePath(sourcePathRaw)
+    var best: int32 = -1
+    for i in 0..<exprLayer.exprs.len:
+        let expr = exprLayer.exprs[i]
+        if expr.sourcePath != sourcePath:
+            continue
+        if expr.lineNumber != lineNumber:
+            continue
+        if expr.columnNumber < minColumn:
+            continue
+        if best < 0 || expr.columnNumber < best:
+            best = expr.columnNumber
+    return best
+
+fn v3TypedExprLineHasRootReturn(lineRaw: str,
+                                expr: parser.V3NormalizedExpr,
+                                exprLayer: parser.V3NormalizedExprLayer): bool =
+    let firstToken = parser.v3ParserFirstToken(v3path.V3PathTrim(lineRaw))
+    if firstToken != "return":
+        return false
+    let returnPos = parser.v3ParserFindText(lineRaw, "return")
+    if returnPos < 0:
+        return false
+    let exprStart = returnPos + len("return") + 1
+    let rootExprColumn = v3TypedExprFirstExprColumnAfter(exprLayer,
+                                                         expr.sourcePath,
+                                                         expr.lineNumber,
+                                                         exprStart)
+    return rootExprColumn == expr.columnNumber
+
+fn v3TypedExprComprehensionFilterIf(lineRaw: str,
+                                    expr: parser.V3NormalizedExpr): bool =
+    if expr.kind != parser.v3NormalizedExprIf || expr.detail != "keyword_if":
+        return false
+    let openPos = parser.v3ParserFindText(lineRaw, "[")
+    if openPos < 0:
+        return false
+    let forPositions = parser.v3ParserLineKeywordPositions(lineRaw, "for")
+    if forPositions.len <= 0:
+        return false
+    let exprPos = expr.columnNumber - 1
+    if exprPos <= openPos:
+        return false
+    return forPositions[0] < exprPos
+
+fn v3TypedExprExtractGenericArg(lineRaw: str,
+                                columnNumber: int32,
+                                callName: str): str =
+    let start = columnNumber - 1
+    if start < 0 || start + len(callName) > lineRaw.len:
+        return ""
+    if v3path.V3TextSlice(lineRaw, start, len(callName)) != callName:
+        return ""
+    let cursor0 = v3TypedExprSkipInlineSpaces(lineRaw, start + len(callName))
+    var cursor = cursor0
+    if cursor >= lineRaw.len:
+        return ""
+    if v3path.V3TextSlice(lineRaw, cursor, 1) != "[":
+        return ""
+    let closePos = v3TypedExprFindMatchingBracket(lineRaw, cursor)
+    if closePos <= cursor:
+        return ""
+    return v3TypedExprNormalizeTypeText(v3path.V3TextSlice(lineRaw, cursor + 1, closePos - cursor - 1))
+
+fn v3TypedExprExtractFirstArg(lineRaw: str,
+                              columnNumber: int32,
+                              callName: str): str =
+    let start = columnNumber - 1
+    if start < 0 || start + len(callName) > lineRaw.len:
+        return ""
+    if v3path.V3TextSlice(lineRaw, start, len(callName)) != callName:
+        return ""
+    var cursor = v3TypedExprSkipInlineSpaces(lineRaw, start + len(callName))
+    if cursor < lineRaw.len && v3path.V3TextSlice(lineRaw, cursor, 1) == "[":
+        let closeBracket = v3TypedExprFindMatchingBracket(lineRaw, cursor)
+        if closeBracket < 0:
+            return ""
+        cursor = closeBracket + 1
+    cursor = v3TypedExprSkipInlineSpaces(lineRaw, cursor)
+    if cursor >= lineRaw.len:
+        return ""
+    if v3path.V3TextSlice(lineRaw, cursor, 1) != "(":
+        return ""
+    let closeParen = v3TypedExprFindMatchingParen(lineRaw, cursor)
+    if closeParen <= cursor:
+        return ""
+    var argsText = v3path.V3TextSlice(lineRaw, cursor + 1, closeParen - cursor - 1)
+    let commaPos = v3TypedExprFindTopLevelToken(argsText, ",")
+    if commaPos >= 0:
+        argsText = v3path.V3TextSlice(argsText, 0, commaPos)
+    return v3path.V3PathTrim(argsText)
+
+fn v3TypedExprInferredResultInputType(ctx: V3TypedExprSourceContext,
+                                      scopeIndex: int32,
+                                      expr: parser.V3NormalizedExpr): str =
+    let lineRaw = v3TypedExprSourceLine(ctx, expr.lineNumber)
+    if lineRaw == "":
+        return ""
+    if expr.kind == parser.v3NormalizedExprTry:
+        let token = parser.v3ParserPreviousToken(lineRaw, expr.columnNumber - 1)
+        return v3TypedExprLookupBindingType(ctx, scopeIndex, expr.lineNumber, token)
+    if expr.kind != parser.v3NormalizedExprResultIntrinsic:
+        return ""
+    let callName = expr.surfaceText
+    let argText = v3TypedExprExtractFirstArg(lineRaw, expr.columnNumber, callName)
+    let argName = parser.v3ParserIdentPrefix(argText)
+    if argName == "":
+        return ""
+    return v3TypedExprLookupBindingType(ctx, scopeIndex, expr.lineNumber, argName)
+
+fn v3TypedExprSinkForExpr(ctx: V3TypedExprSourceContext,
+                          expr: parser.V3NormalizedExpr,
+                          exprLayer: parser.V3NormalizedExprLayer): V3TypedExprSinkInfo =
+    var sink: V3TypedExprSinkInfo
+    sink.sinkType = ""
+    sink.sinkPlaceKind = v3TypedExprPlaceTemporary
+    sink.hasSink = false
+    sink.returnRoot = false
+    sink.functionReturnType = ""
+    let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
+    if scopeIndex >= 0:
+        sink.functionReturnType = ctx.scopes[scopeIndex].returnType
+    let lineRaw = v3TypedExprSourceLine(ctx, expr.lineNumber)
+    if lineRaw == "":
+        return sink
+    var bindingName = ""
+    var bindingType = ""
+    var rhsStartColumn: int32 = -1
+    if v3TypedExprParseBindingLine(lineRaw, bindingName, bindingType, rhsStartColumn):
+        let bindingRoot = v3TypedExprFirstExprColumnAfter(exprLayer,
+                                                          expr.sourcePath,
+                                                          expr.lineNumber,
+                                                          rhsStartColumn)
+        if bindingRoot == expr.columnNumber:
+            sink.sinkType = bindingType
+            sink.sinkPlaceKind = scopeIndex >= 0 ? v3TypedExprPlaceLocal : v3TypedExprPlaceGlobal
+            sink.hasSink = true
+    if v3TypedExprLineHasRootReturn(lineRaw, expr, exprLayer) && sink.functionReturnType != "":
+        sink.sinkType = sink.functionReturnType
+        sink.sinkPlaceKind = v3TypedExprPlaceTemporary
+        sink.hasSink = true
+        sink.returnRoot = true
+    return sink
+
+fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
+                                typeRaw: str,
+                                sink: V3TypedExprSinkInfo,
+                                forceCallResult: bool) =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return
+    fact.typeText = typeText
+    fact.abiClass = v3TypedExprAbiClassForType(typeText)
+    fact.valueKind = v3TypedExprValueKindForAbiClass(fact.abiClass)
+    if forceCallResult:
+        fact.placeKind = v3TypedExprPlaceCallResult
+    elif sink.hasSink:
+        fact.placeKind = sink.sinkPlaceKind
+    else:
+        fact.placeKind = v3TypedExprPlaceTemporary
+    if fact.abiClass == v3TypedExprAbiPolymorphic:
+        fact.loweringMode = v3TypedExprLowerDeferred
+        return
+    if sink.returnRoot && sink.sinkType == typeText:
+        fact.loweringMode = fact.abiClass == v3TypedExprAbiComposite ? v3TypedExprLowerSret : v3TypedExprLowerReg
+        return
+    if fact.abiClass == v3TypedExprAbiComposite:
+        fact.loweringMode = v3TypedExprLowerLocalAddress
+        return
+    fact.loweringMode = v3TypedExprLowerReg
+
+fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
+                        exprLayer: parser.V3NormalizedExprLayer,
+                        expr: parser.V3NormalizedExpr): V3TypedExprFact =
+    var fact: V3TypedExprFact
+    fact.exprId = expr.exprId
+    fact.sourcePath = expr.sourcePath
+    fact.lineNumber = expr.lineNumber
+    fact.columnNumber = expr.columnNumber
+    fact.endLineNumber = expr.endLineNumber
+    fact.endColumnNumber = expr.endColumnNumber
+    fact.kind = expr.kind
+    fact.typeText = "unknown"
+    fact.abiClass = v3TypedExprAbiPolymorphic
+    fact.valueKind = v3TypedExprValuePolymorphic
+    fact.placeKind = v3TypedExprPlaceTemporary
+    fact.loweringMode = v3TypedExprLowerDeferred
+    let sink = v3TypedExprSinkForExpr(ctx, expr, exprLayer)
+    let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
+    let sourceResultType = v3TypedExprInferredResultInputType(ctx, scopeIndex, expr)
+    if expr.kind == parser.v3NormalizedExprRange:
+        v3TypedExprApplyResolvedType(fact, "range", sink, false)
+        return fact
+    if expr.kind == parser.v3NormalizedExprComprehension:
+        let sinkType = sink.sinkType
+        if parser.v3ParserStartsWith(sinkType, "seq[") || (sinkType.len >= 2 && v3path.V3TextSlice(sinkType, sinkType.len - 2, 2) == "[]"):
+            v3TypedExprApplyResolvedType(fact, sinkType, sink, false)
+            return fact
+        v3TypedExprApplyResolvedType(fact, "seq[unknown]", sink, false)
+        return fact
+    if expr.kind == parser.v3NormalizedExprStrFormat:
+        v3TypedExprApplyResolvedType(fact, "str", sink, false)
+        return fact
+    if expr.kind == parser.v3NormalizedExprIf:
+        if sink.hasSink && sink.sinkType != "":
+            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, false)
+            return fact
+        let lineRaw = v3TypedExprSourceLine(ctx, expr.lineNumber)
+        let trimmed = v3path.V3PathTrim(lineRaw)
+        if parser.v3ParserStartsWith(trimmed, "if ") || v3TypedExprComprehensionFilterIf(lineRaw, expr):
+            v3TypedExprApplyResolvedType(fact, "bool", sink, false)
+            return fact
+        fact.typeText = "branch_join"
+        return fact
+    if expr.kind == parser.v3NormalizedExprTry:
+        let innerType = v3TypedExprResultSuccessType(sourceResultType)
+        if innerType != "":
+            v3TypedExprApplyResolvedType(fact, innerType, sink, true)
+            return fact
+        let returnInnerType = v3TypedExprResultSuccessType(sink.functionReturnType)
+        if returnInnerType != "":
+            v3TypedExprApplyResolvedType(fact, returnInnerType, sink, true)
+            return fact
+        if sink.hasSink && sink.sinkType != "":
+            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, true)
+            return fact
+        fact.typeText = "result_projection"
+        fact.placeKind = v3TypedExprPlaceCallResult
+        return fact
+    if expr.kind == parser.v3NormalizedExprResultIntrinsic:
+        let lineRaw = v3TypedExprSourceLine(ctx, expr.lineNumber)
+        if expr.detail == "ok" || expr.detail == "err":
+            let genericInner = v3TypedExprExtractGenericArg(lineRaw, expr.columnNumber, expr.surfaceText)
+            if genericInner != "":
+                v3TypedExprApplyResolvedType(fact, v3TypedExprResultType(genericInner), sink, false)
+                return fact
+            if sink.hasSink && parser.v3ParserStartsWith(sink.sinkType, "Result["):
+                v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, false)
+                return fact
+            let returnResult = sink.functionReturnType
+            if parser.v3ParserStartsWith(returnResult, "Result["):
+                v3TypedExprApplyResolvedType(fact, returnResult, sink, false)
+                return fact
+            v3TypedExprApplyResolvedType(fact, "Result[unknown]", sink, false)
+            return fact
+        if expr.detail == "is_ok" || expr.detail == "is_err":
+            v3TypedExprApplyResolvedType(fact, "bool", sink, true)
+            return fact
+        if expr.detail == "error":
+            v3TypedExprApplyResolvedType(fact, "str", sink, true)
+            return fact
+        if expr.detail == "error_info_of":
+            v3TypedExprApplyResolvedType(fact, "ErrorInfo", sink, true)
+            return fact
+        let genericInner = v3TypedExprExtractGenericArg(lineRaw, expr.columnNumber, expr.surfaceText)
+        if genericInner != "":
+            v3TypedExprApplyResolvedType(fact, genericInner, sink, true)
+            return fact
+        let innerType = v3TypedExprResultSuccessType(sourceResultType)
+        if innerType != "":
+            v3TypedExprApplyResolvedType(fact, innerType, sink, true)
+            return fact
+        if sink.hasSink && sink.sinkType != "":
+            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, true)
+            return fact
+        fact.typeText = "result_projection"
+        fact.placeKind = v3TypedExprPlaceCallResult
+        return fact
+    return fact
+
+fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
+                                 ctx: var V3TypedExprSourceContext,
+                                 err: var str): bool =
+    ctx.sourcePath = source.sourcePath
+    ctx.lines = parser.v3ParserSplitChar(source.text, '\n')
+    ctx.scopes = []
+    ctx.bindings = []
+    var decls: parser.V3NormalizedFunctionDecl[] = []
+    if !parser.v3ParserReadNormalizedFunctionDecls(source.text, decls, err):
+        return false
+    for i in 0..<decls.len:
+        let decl = decls[i]
+        if decl.importc:
+            continue
+        if decl.lineIndex <= 0 || decl.lineIndex > ctx.lines.len:
+            continue
+        var scope: V3TypedExprFunctionScope
+        scope.sourcePath = source.sourcePath
+        scope.name = decl.name
+        scope.startLine = decl.lineIndex
+        if i + 1 < decls.len:
+            scope.endLine = decls[i + 1].lineIndex - 1
+        else:
+            scope.endLine = ctx.lines.len
+        scope.returnType = v3TypedExprParseFunctionReturnType(ctx.lines[decl.lineIndex - 1])
+        add(ctx.scopes, scope)
+        v3TypedExprAppendParamBindings(ctx.bindings, scope, ctx.lines[decl.lineIndex - 1])
+    for i in 0..<ctx.lines.len:
+        var bindingName = ""
+        var bindingType = ""
+        var rhsStartColumn: int32 = -1
+        if !v3TypedExprParseBindingLine(ctx.lines[i], bindingName, bindingType, rhsStartColumn):
+            continue
+        let lineNumber = i + 1
+        let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, lineNumber)
+        if scopeIndex >= 0:
+            v3TypedExprMaybeAddBinding(ctx.bindings,
+                                       source.sourcePath,
+                                       ctx.scopes[scopeIndex].name,
+                                       false,
+                                       lineNumber,
+                                       bindingName,
+                                       bindingType)
+        else:
+            v3TypedExprMaybeAddBinding(ctx.bindings,
+                                       source.sourcePath,
+                                       "",
+                                       true,
+                                       lineNumber,
+                                       bindingName,
+                                       bindingType)
+    err = ""
+    return true
+
+fn v3TypedExprBuildFacts(sourceTexts: V3TypedExprSourceText[],
+                         exprLayer: parser.V3NormalizedExprLayer,
+                         facts: var V3TypedExprFact[],
+                         err: var str): bool =
+    var emptyFacts: V3TypedExprFact[] = []
+    facts = emptyFacts
+    var contexts: V3TypedExprSourceContext[] = []
+    for i in 0..<sourceTexts.len:
+        var ctx: V3TypedExprSourceContext
+        if !v3TypedExprBuildSourceContext(sourceTexts[i], ctx, err):
+            err = "v3 typed expr: build source context failed"
+            return false
+        add(contexts, ctx)
+    for i in 0..<exprLayer.exprs.len:
+        let expr = exprLayer.exprs[i]
+        let ctxIndex = v3TypedExprSourceContextLookup(contexts, expr.sourcePath)
+        if ctxIndex < 0:
+            err = "v3 typed expr: missing source context"
+            return false
+        add(facts, v3TypedExprBuildFact(contexts[ctxIndex], exprLayer, expr))
+    err = ""
+    return true

@@ -1,0 +1,151 @@
+import std/strutils as strutil
+import cheng/v3/project/cheng_node as node
+import cheng/v3/project/cheng_node_index as cindex
+import cheng/v3/project/cheng_node_state as state
+import cheng/v3/libp2p/core/multiaddr
+import cheng/v3/libp2p/core/types as libtypes
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
+import cheng/v3/tooling/vpn_proxy_config as vpncfg
+
+fn main(): int32 =
+    let statePath = "/tmp/cheng_node_transport_vpn_smoke.state"
+
+    let alphaRes = node.V3ChengNodeInit("cheng-node-alpha")
+    let bravoRes = node.V3ChengNodeInit("cheng-node-bravo")
+    let charlieRes = node.V3ChengNodeInit("cheng-node-charlie")
+    assert(IsOk(alphaRes), "cheng_node transport vpn smoke: alpha init")
+    assert(IsOk(bravoRes), "cheng_node transport vpn smoke: bravo init")
+    assert(IsOk(charlieRes), "cheng_node transport vpn smoke: charlie init")
+
+    var alpha = Value(alphaRes)
+    var bravo = Value(bravoRes)
+    var charlie = Value(charlieRes)
+
+    let alphaPeerAnnounceRes = node.V3ChengNodeAnnouncePeer(alpha, "tcp", "127.0.0.1", 6311)
+    assert(IsOk(alphaPeerAnnounceRes), "cheng_node transport vpn smoke: alpha peer announce")
+    let alphaTopicAnnounceRes = node.V3ChengNodeAnnounceDiscovery(alpha,
+                                                                  "topic",
+                                                                  "content.demo",
+                                                                  "tcp",
+                                                                  "127.0.0.1",
+                                                                  6311,
+                                                                  "public",
+                                                                  "public",
+                                                                  100)
+    assert(IsOk(alphaTopicAnnounceRes), "cheng_node transport vpn smoke: alpha topic announce")
+
+    let bravoPeerAnnounceRes = node.V3ChengNodeAnnouncePeer(bravo, "webrtc", "203.0.113.10", 9777)
+    assert(IsOk(bravoPeerAnnounceRes), "cheng_node transport vpn smoke: bravo peer announce")
+    let bravoCapabilityAnnounceRes = node.V3ChengNodeAnnounceDiscovery(bravo,
+                                                                       "capability",
+                                                                       "vpn.overlay",
+                                                                       "webrtc",
+                                                                       "203.0.113.10",
+                                                                       9777,
+                                                                       "browser-webrtc",
+                                                                       "public",
+                                                                       100)
+    assert(IsOk(bravoCapabilityAnnounceRes), "cheng_node transport vpn smoke: bravo capability announce")
+
+    let charliePeerAnnounceRes = node.V3ChengNodeAnnouncePeer(charlie, "quic", "127.0.0.1", 6313)
+    assert(IsOk(charliePeerAnnounceRes), "cheng_node transport vpn smoke: charlie peer announce")
+    let charlieTopicAnnounceRes = node.V3ChengNodeAnnounceDiscovery(charlie,
+                                                                    "topic",
+                                                                    "compiler.world",
+                                                                    "quic",
+                                                                    "127.0.0.1",
+                                                                    6313,
+                                                                    "public",
+                                                                    "public",
+                                                                    100)
+    assert(IsOk(charlieTopicAnnounceRes), "cheng_node transport vpn smoke: charlie topic announce")
+
+    let bravoSyncAlphaRes = node.V3ChengNodeSyncDiscoveryFromRemote(bravo, alpha, "topic", "content.demo")
+    assert(IsOk(bravoSyncAlphaRes), "cheng_node transport vpn smoke: bravo sync alpha topic")
+    let bravoTopicEntryRes = cindex.V3ChengNodeIndexGet(bravo.indices, "discovery", "topic", "content.demo")
+    assert(IsOk(bravoTopicEntryRes), "cheng_node transport vpn smoke: bravo topic query")
+
+    let alphaSyncBravoRes = node.V3ChengNodeSyncDiscoveryFromRemote(alpha, bravo, "capability", "vpn.overlay")
+    assert(IsOk(alphaSyncBravoRes), "cheng_node transport vpn smoke: alpha sync bravo capability")
+    let alphaCapabilityEntryRes = cindex.V3ChengNodeIndexGet(alpha.indices, "discovery", "capability", "vpn.overlay")
+    assert(IsOk(alphaCapabilityEntryRes), "cheng_node transport vpn smoke: alpha capability query")
+    assert(alpha.transport.host.openStreamPeers.len >= 2, "cheng_node transport vpn smoke: alpha webrtc streams")
+
+    let alphaSyncCharlieRes = node.V3ChengNodeSyncDiscoveryFromRemote(alpha, charlie, "topic", "compiler.world")
+    assert(IsOk(alphaSyncCharlieRes), "cheng_node transport vpn smoke: alpha sync charlie topic")
+    let alphaCharlieTopicEntryRes = cindex.V3ChengNodeIndexGet(alpha.indices, "discovery", "topic", "compiler.world")
+    assert(IsOk(alphaCharlieTopicEntryRes), "cheng_node transport vpn smoke: alpha charlie topic query")
+
+    let identifyTextRes = node.V3ChengNodeStreamText(charlie, bravo, "identify")
+    assert(IsOk(identifyTextRes), "cheng_node transport vpn smoke: identify stream")
+    assert(strutil.Contains(Value(identifyTextRes), "peer_id="), "cheng_node transport vpn smoke: identify peer")
+
+    let contentStreamRes = node.V3ChengNodeStreamText(bravo, alpha, "content")
+    assert(IsOk(contentStreamRes), "cheng_node transport vpn smoke: content stream")
+    assert(strutil.Contains(Value(contentStreamRes), "protocol=content"),
+           "cheng_node transport vpn smoke: content stream protocol")
+
+    var session = tsnet.v3Libp2pTailnetPeerSessionZero()
+    session.peerId = node.V3ChengNodeLocalPeerIdText(bravo)
+    session.remoteTailnetIp = "100.64.9.88"
+    session.directReachable = true
+    session.relayAllowed = true
+    session.derpRegionCode = "sfo"
+    session.boundAddrText = "/ip4/127.0.0.1/tcp/7101"
+    let vpnPeerRes = node.V3ChengNodeVpnUpsertPeer(alpha, session)
+    assert(IsOk(vpnPeerRes), "cheng_node transport vpn smoke: vpn peer")
+
+    var overlayAddr: libtypes.V3Libp2pMultiaddr
+    multiaddr.v3Libp2pMultiaddrFillTcp(overlayAddr, "127.0.0.1", 7101)
+    let vpnOverlayRes = node.V3ChengNodeVpnUpsertOverlayRoute(alpha, "overlay/main", overlayAddr)
+    assert(IsOk(vpnOverlayRes), "cheng_node transport vpn smoke: vpn overlay route")
+
+    var exitCfg: vpncfg.V3VpnProxyExitConfig
+    exitCfg.name = "edge-a"
+    exitCfg.host = "203.0.113.200"
+    exitCfg.port = 7443
+    exitCfg.serverName = "edge-a.internal"
+    let vpnExitRes = node.V3ChengNodeVpnUpsertExitRoute(alpha, "exit/edge-a", exitCfg)
+    assert(IsOk(vpnExitRes), "cheng_node transport vpn smoke: vpn exit route")
+
+    let vpnPeerEntryRes = cindex.V3ChengNodeIndexGet(alpha.indices,
+                                                     "vpn_peer",
+                                                     "peer",
+                                                     session.peerId)
+    assert(IsOk(vpnPeerEntryRes), "cheng_node transport vpn smoke: vpn peer query")
+    let vpnOverlayEntryRes = cindex.V3ChengNodeIndexGet(alpha.indices,
+                                                        "vpn_route",
+                                                        "route",
+                                                        "overlay/main")
+    assert(IsOk(vpnOverlayEntryRes), "cheng_node transport vpn smoke: vpn overlay query")
+    let vpnExitEntryRes = cindex.V3ChengNodeIndexGet(alpha.indices,
+                                                     "vpn_route",
+                                                     "route",
+                                                     "exit/edge-a")
+    assert(IsOk(vpnExitEntryRes), "cheng_node transport vpn smoke: vpn exit query")
+
+    let vpnStatusText = node.V3ChengNodeVpnStatusReportText(alpha)
+    assert(strutil.Contains(vpnStatusText, "published_count=1"),
+           "cheng_node transport vpn smoke: vpn published count")
+    assert(strutil.Contains(vpnStatusText, "session_count=1"),
+           "cheng_node transport vpn smoke: vpn session count")
+    assert(strutil.Contains(vpnStatusText, "exit_count=1"),
+           "cheng_node transport vpn smoke: vpn exit count")
+
+    let writeRes = state.V3ChengNodeWriteState(statePath, alpha)
+    assert(IsOk(writeRes), "cheng_node transport vpn smoke: write state")
+    var restored: node.V3ChengNode
+    let loadRestoredRes = state.V3ChengNodeLoadStateInto(restored, statePath, "cheng-node-alpha")
+    assert(IsOk(loadRestoredRes), "cheng_node transport vpn smoke: load state")
+    let restoredCapabilityEntryRes = cindex.V3ChengNodeIndexGet(restored.indices,
+                                                                "discovery",
+                                                                "capability",
+                                                                "vpn.overlay")
+    assert(IsOk(restoredCapabilityEntryRes), "cheng_node transport vpn smoke: restored capability")
+    assert(restored.transport.host.listenAddrs.len == 1, "cheng_node transport vpn smoke: restored listen")
+    assert(restored.vpn.overlay.listenerMappings.len == 1, "cheng_node transport vpn smoke: restored overlay route")
+    assert(restored.vpn.overlay.peerSessions.len == 1, "cheng_node transport vpn smoke: restored peer session")
+    assert(restored.vpn.exits.len == 1, "cheng_node transport vpn smoke: restored exit")
+
+    echo("v3 cheng_node_transport_vpn_smoke ok")
+    return 0

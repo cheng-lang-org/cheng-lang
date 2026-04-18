@@ -16780,11 +16780,15 @@ static bool v3_strformat_fmt_append_piece(char *out,
                                           size_t cap,
                                           const char *piece_text,
                                           bool quoted,
-                                          bool *has_piece_io) {
+                                          bool *has_piece_io,
+                                          size_t *piece_count_io,
+                                          char *single_piece_text,
+                                          size_t single_piece_cap,
+                                          bool *single_piece_quoted_io) {
     if (!piece_text || piece_text[0] == '\0') {
         return true;
     }
-    if (*has_piece_io && !v3_str_append_text(out, cap, " + ")) {
+    if (*has_piece_io && !v3_str_append_text(out, cap, ", ")) {
         return false;
     }
     if (quoted) {
@@ -16798,8 +16802,140 @@ static bool v3_strformat_fmt_append_piece(char *out,
             return false;
         }
     }
+    if (piece_count_io != NULL) {
+        if (*piece_count_io == 0U &&
+            single_piece_text != NULL &&
+            single_piece_cap > 0U &&
+            single_piece_quoted_io != NULL) {
+            snprintf(single_piece_text, single_piece_cap, "%s", piece_text);
+            *single_piece_quoted_io = quoted;
+        }
+        *piece_count_io += 1U;
+    }
     *has_piece_io = true;
     return true;
+}
+
+static bool v3_trim_wrapping_parens_text(const char *text,
+                                         char *out,
+                                         size_t cap) {
+    char trimmed[4096];
+    bool changed = false;
+    v3_trim_copy_text(text, trimmed, sizeof(trimmed));
+    while (trimmed[0] == '(') {
+        size_t len = strlen(trimmed);
+        size_t i;
+        int32_t paren_depth = 0;
+        bool in_string = false;
+        bool wraps = len > 1U && trimmed[len - 1U] == ')';
+        if (!wraps) {
+            break;
+        }
+        for (i = 0U; i < len; ++i) {
+            char ch = trimmed[i];
+            if (ch == '"' && !v3_quote_is_escaped(trimmed, i)) {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) {
+                continue;
+            }
+            if (ch == '(') {
+                paren_depth += 1;
+            } else if (ch == ')') {
+                paren_depth -= 1;
+                if (paren_depth == 0 && i + 1U < len) {
+                    wraps = false;
+                    break;
+                }
+            }
+        }
+        if (!wraps || paren_depth != 0) {
+            break;
+        }
+        snprintf(trimmed, sizeof(trimmed), "%.*s", (int)(len - 2U), trimmed + 1);
+        v3_trim_copy_text(trimmed, trimmed, sizeof(trimmed));
+        changed = true;
+    }
+    snprintf(out, cap, "%s", trimmed);
+    return changed || out[0] != '\0';
+}
+
+static bool v3_flatten_str_concat_terms(const char *expr_text,
+                                        char terms[][4096],
+                                        size_t *count_io,
+                                        size_t term_cap) {
+    char expr[4096];
+    int32_t plus_index = -1;
+    if (expr_text == NULL || terms == NULL || count_io == NULL || term_cap == 0U) {
+        return false;
+    }
+    v3_trim_wrapping_parens_text(expr_text, expr, sizeof(expr));
+    plus_index = v3_find_top_level_binary_op_last(expr, "+");
+    if (plus_index < 0) {
+        if (*count_io >= term_cap) {
+            return false;
+        }
+        snprintf(terms[*count_io], 4096, "%s", expr);
+        *count_io += 1U;
+        return true;
+    }
+    {
+        char left_expr[4096];
+        char right_expr[4096];
+        snprintf(left_expr, sizeof(left_expr), "%.*s", plus_index, expr);
+        snprintf(right_expr, sizeof(right_expr), "%s", expr + plus_index + 1);
+        v3_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
+        v3_trim_copy_text(right_expr, right_expr, sizeof(right_expr));
+        return v3_flatten_str_concat_terms(left_expr, terms, count_io, term_cap) &&
+               v3_flatten_str_concat_terms(right_expr, terms, count_io, term_cap);
+    }
+}
+
+static bool v3_build_str_concat_fmt_call(const char *expr_text,
+                                         char *rewritten_out,
+                                         size_t rewritten_cap,
+                                         char *error_out,
+                                         size_t error_cap) {
+    char terms[32][4096];
+    size_t term_count = 0U;
+    size_t i = 0U;
+    if (rewritten_out != NULL && rewritten_cap > 0U) {
+        rewritten_out[0] = '\0';
+    }
+    if (error_out != NULL && error_cap > 0U) {
+        error_out[0] = '\0';
+    }
+    if (expr_text == NULL || rewritten_out == NULL || rewritten_cap == 0U) {
+        return false;
+    }
+    if (!v3_flatten_str_concat_terms(expr_text,
+                                     terms,
+                                     &term_count,
+                                     sizeof(terms) / sizeof(terms[0]))) {
+        if (error_out != NULL && error_cap > 0U) {
+            snprintf(error_out, error_cap, "str concat lowering failed");
+        }
+        return false;
+    }
+    if (term_count == 0U) {
+        if (error_out != NULL && error_cap > 0U) {
+            snprintf(error_out, error_cap, "str concat lowering produced no terms");
+        }
+        return false;
+    }
+    if (!v3_str_append_text(rewritten_out, rewritten_cap, "Fmt([")) {
+        return false;
+    }
+    for (i = 0U; i < term_count; ++i) {
+        if (i > 0U && !v3_str_append_text(rewritten_out, rewritten_cap, ", ")) {
+            return false;
+        }
+        if (!v3_str_append_text(rewritten_out, rewritten_cap, terms[i])) {
+            return false;
+        }
+    }
+    return v3_str_append_text(rewritten_out, rewritten_cap, "])");
 }
 
 static bool v3_expand_strformat_fmt_expr(const char *expr_text,
@@ -16814,12 +16950,16 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
     char expr_buf[8192];
     char expr_piece[4096];
     char literal_piece[4096];
+    char rewritten_pieces[8192];
+    char single_piece[4096];
     char (*args)[4096] = NULL;
     size_t arg_count = 0U;
     size_t i = 0U;
     size_t literal_len = 0U;
+    size_t piece_count = 0U;
     bool changed = false;
     bool has_piece = false;
+    bool single_piece_quoted = false;
     const char *format_arg = NULL;
     const char *base = NULL;
     if (expanded_out && expanded_cap > 0U) {
@@ -16834,6 +16974,8 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
     if (!expr_text || !expanded_out || expanded_cap == 0U) {
         return false;
     }
+    rewritten_pieces[0] = '\0';
+    single_piece[0] = '\0';
     args = v3_alloc_call_arg_scratch();
     callee[0] = '\0';
     arg_text[0] = '\0';
@@ -16877,11 +17019,15 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
                 continue;
             }
             literal_piece[literal_len] = '\0';
-            if (!v3_strformat_fmt_append_piece(expanded_out,
-                                               expanded_cap,
+            if (!v3_strformat_fmt_append_piece(rewritten_pieces,
+                                               sizeof(rewritten_pieces),
                                                literal_piece,
                                                true,
-                                               &has_piece)) {
+                                               &has_piece,
+                                               &piece_count,
+                                               single_piece,
+                                               sizeof(single_piece),
+                                               &single_piece_quoted)) {
                 if (error_out && error_cap > 0U) {
                     snprintf(error_out, error_cap, "fmt expansion too large");
                 }
@@ -16971,11 +17117,15 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
                     free(args);
                     return false;
                 }
-                if (!v3_strformat_fmt_append_piece(expanded_out,
-                                                   expanded_cap,
+                if (!v3_strformat_fmt_append_piece(rewritten_pieces,
+                                                   sizeof(rewritten_pieces),
                                                    expr_piece,
                                                    false,
-                                                   &has_piece)) {
+                                                   &has_piece,
+                                                   &piece_count,
+                                                   single_piece,
+                                                   sizeof(single_piece),
+                                                   &single_piece_quoted)) {
                     if (error_out && error_cap > 0U) {
                         snprintf(error_out, error_cap, "fmt expansion too large");
                     }
@@ -17019,11 +17169,15 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
         i += 1U;
     }
     literal_piece[literal_len] = '\0';
-    if (!v3_strformat_fmt_append_piece(expanded_out,
-                                       expanded_cap,
+    if (!v3_strformat_fmt_append_piece(rewritten_pieces,
+                                       sizeof(rewritten_pieces),
                                        literal_piece,
                                        true,
-                                       &has_piece)) {
+                                       &has_piece,
+                                       &piece_count,
+                                       single_piece,
+                                       sizeof(single_piece),
+                                       &single_piece_quoted)) {
         if (error_out && error_cap > 0U) {
             snprintf(error_out, error_cap, "fmt expansion too large");
         }
@@ -17034,12 +17188,45 @@ static bool v3_expand_strformat_fmt_expr(const char *expr_text,
         free(args);
         return true;
     }
-    if (!has_piece && !v3_str_append_text(expanded_out, expanded_cap, "\"\"")) {
-        if (error_out && error_cap > 0U) {
-            snprintf(error_out, error_cap, "fmt expansion too large");
+    if (piece_count == 0U) {
+        if (!v3_str_append_text(expanded_out, expanded_cap, "\"\"")) {
+            if (error_out && error_cap > 0U) {
+                snprintf(error_out, error_cap, "fmt expansion too large");
+            }
+            free(args);
+            return false;
         }
-        free(args);
-        return false;
+    } else if (piece_count == 1U) {
+        if (single_piece_quoted) {
+            if (!v3_str_append_quoted_literal(expanded_out, expanded_cap, single_piece)) {
+                if (error_out && error_cap > 0U) {
+                    snprintf(error_out, error_cap, "fmt expansion too large");
+                }
+                free(args);
+                return false;
+            }
+        } else {
+            if (!v3_str_append_text(expanded_out, expanded_cap, "(") ||
+                !v3_str_append_text(expanded_out, expanded_cap, single_piece) ||
+                !v3_str_append_text(expanded_out, expanded_cap, ")")) {
+                if (error_out && error_cap > 0U) {
+                    snprintf(error_out, error_cap, "fmt expansion too large");
+                }
+                free(args);
+                return false;
+            }
+        }
+    } else {
+        if (!v3_str_append_text(expanded_out, expanded_cap, callee) ||
+            !v3_str_append_text(expanded_out, expanded_cap, "([") ||
+            !v3_str_append_text(expanded_out, expanded_cap, rewritten_pieces) ||
+            !v3_str_append_text(expanded_out, expanded_cap, "])")) {
+            if (error_out && error_cap > 0U) {
+                snprintf(error_out, error_cap, "fmt expansion too large");
+            }
+            free(args);
+            return false;
+        }
     }
     if (changed_out) {
         *changed_out = true;
@@ -17436,6 +17623,7 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
     bool list_nonempty = false;
     char fixed_elem_type[256];
     char list_items[CHENG_V3_MAX_CALL_ARGS][4096];
+    const char *callee_base = NULL;
     size_t list_item_count = 0U;
     int32_t fixed_len = 0;
     const char *value_expr = arg_expr;
@@ -17457,6 +17645,14 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                           sizeof(temp_name));
     if (v3_find_local_slot(locals, *local_count, temp_name) >= 0) {
         return true;
+    }
+    callee_base = strrchr(callee, '.');
+    callee_base = callee_base ? callee_base + 1 : callee;
+    if ((!preferred_type || preferred_type[0] == '\0' ||
+         !preferred_abi || preferred_abi[0] == '\0') &&
+        v3_is_strformat_join_name(callee_base)) {
+        preferred_type = "str[]";
+        preferred_abi = "composite";
     }
     if (preferred_type &&
         preferred_abi &&
@@ -17541,6 +17737,17 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                 inferred_type,
                 inferred_abi);
         return false;
+    }
+    if (v3_is_strformat_join_name(callee_base)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] prepare composite arg added caller=%s callee=%s arg_index=%zu expr=%s temp=%s inferred_type=%s inferred_abi=%s\n",
+                current_function->symbol_text,
+                callee,
+                arg_index,
+                value_expr,
+                temp_name,
+                inferred_type,
+                inferred_abi);
     }
     return true;
 }
@@ -22409,7 +22616,46 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         if (op_index >= 0) {
             char left[4096];
             char right[4096];
+            char concat_type[256];
+            char concat_abi[32];
+            char rewritten_concat_expr[8192];
+            char concat_error[256];
             int next_call_depth = call_depth + 1;
+            if (strcmp(OPS[i], "+") == 0 &&
+                v3_infer_expr_type(plan,
+                                   lowering,
+                                   current_function,
+                                   aliases,
+                                   alias_count,
+                                   locals,
+                                   *local_count,
+                                   expr,
+                                   concat_type,
+                                   sizeof(concat_type),
+                                   concat_abi,
+                                   sizeof(concat_abi)) &&
+                strcmp(concat_type, "str") == 0 &&
+                strcmp(concat_abi, "composite") == 0) {
+                if (!v3_build_str_concat_fmt_call(expr,
+                                                  rewritten_concat_expr,
+                                                  sizeof(rewritten_concat_expr),
+                                                  concat_error,
+                                                  sizeof(concat_error))) {
+                    return false;
+                }
+                return v3_prepare_expr_call_state(plan,
+                                                  lowering,
+                                                  current_function,
+                                                  aliases,
+                                                  alias_count,
+                                                  locals,
+                                                  local_count,
+                                                  local_cap,
+                                                  next_offset_io,
+                                                  rewritten_concat_expr,
+                                                  call_depth,
+                                                  max_call_depth_io);
+            }
             snprintf(left, sizeof(left), "%.*s", op_index, expr);
             snprintf(right, sizeof(right), "%s", expr + op_index + strlen(OPS[i]));
             v3_trim_copy_text(left, left, sizeof(left));
@@ -29812,8 +30058,6 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
     char expr[4096];
     char normalized_dest_type[256];
     char literal[4096];
-    char left_expr[4096];
-    char right_expr[4096];
     char inner_callee[PATH_MAX];
     char arg_text[4096] = {0};
     char surface_error[256];
@@ -30065,116 +30309,32 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
     if (strcmp(normalized_dest_type, "str") == 0) {
         int32_t plus_index = v3_find_top_level_binary_op_last(expr, "+");
         if (plus_index >= 0) {
-            V3AsmLocalSlot left_slot;
-            V3AsmLocalSlot right_slot;
-            V3AsmCallTarget concat_target;
-            snprintf(left_expr, sizeof(left_expr), "%.*s", plus_index, expr);
-            snprintf(right_expr, sizeof(right_expr), "%s", expr + plus_index + 1);
-            v3_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
-            v3_trim_copy_text(right_expr, right_expr, sizeof(right_expr));
-            if (string_temp_stride < 48) {
+            char rewritten_concat_expr[8192];
+            char concat_error[256];
+            if (!v3_build_str_concat_fmt_call(expr,
+                                              rewritten_concat_expr,
+                                              sizeof(rewritten_concat_expr),
+                                              concat_error,
+                                              sizeof(concat_error))) {
                 return false;
             }
-            memset(&left_slot, 0, sizeof(left_slot));
-            memset(&right_slot, 0, sizeof(right_slot));
-            snprintf(left_slot.name, sizeof(left_slot.name), "%s", "__v3_str_concat_lhs");
-            snprintf(left_slot.type_text, sizeof(left_slot.type_text), "%s", "str");
-            snprintf(left_slot.abi_class, sizeof(left_slot.abi_class), "%s", "composite");
-            left_slot.stack_offset = string_temp_base + call_depth * string_temp_stride;
-            left_slot.stack_size = v3_active_target_str_size_i32();
-            left_slot.stack_align = v3_active_target_pointer_align_i32();
-            snprintf(right_slot.name, sizeof(right_slot.name), "%s", "__v3_str_concat_rhs");
-            snprintf(right_slot.type_text, sizeof(right_slot.type_text), "%s", "str");
-            snprintf(right_slot.abi_class, sizeof(right_slot.abi_class), "%s", "composite");
-            right_slot.stack_offset = left_slot.stack_offset + v3_active_target_str_size_i32();
-            right_slot.stack_size = v3_active_target_str_size_i32();
-            right_slot.stack_align = v3_active_target_pointer_align_i32();
-            v3_emit_call_dest_spill_store(out,
-                                          cap,
-                                          call_arg_base,
-                                          call_depth,
-                                          dest_addr_reg);
-            if (!v3_emit_slot_address(out, cap, &left_slot, 15) ||
-                !v3_materialize_composite_expr_into_address(plan,
-                                                            lowering,
-                                                            current_function,
-                                                            aliases,
-                                                            alias_count,
-                                                            locals,
-                                                            local_count,
-                                                            left_expr,
-                                                            "str",
-                                                            15,
-                                                            call_arg_base,
-                                                            string_temp_base,
-                                                            string_temp_stride,
-                                                            string_label_index_io,
-                                                            call_depth + 1,
-                                                            out,
-                                                            cap) ||
-                !v3_emit_slot_address(out, cap, &right_slot, 15) ||
-                !v3_materialize_composite_expr_into_address(plan,
-                                                            lowering,
-                                                            current_function,
-                                                            aliases,
-                                                            alias_count,
-                                                            locals,
-                                                            local_count,
-                                                            right_expr,
-                                                            "str",
-                                                            15,
-                                                            call_arg_base,
-                                                            string_temp_base,
-                                                            string_temp_stride,
-                                                            string_label_index_io,
-                                                            call_depth + 1,
-                                                            out,
-                                                            cap)) {
-                return false;
-            }
-            memset(&concat_target, 0, sizeof(concat_target));
-            concat_target.external = true;
-            concat_target.param_count = 2U;
-            snprintf(concat_target.callee_name, sizeof(concat_target.callee_name), "%s", "driver_c_str_concat_bridge");
-            v3_copy_target_symbol_name(plan,
-                                       "driver_c_str_concat_bridge",
-                                       concat_target.symbol_name,
-                                       sizeof(concat_target.symbol_name));
-            snprintf(concat_target.return_type, sizeof(concat_target.return_type), "%s", "str");
-            snprintf(concat_target.return_abi_class, sizeof(concat_target.return_abi_class), "%s", "composite");
-            snprintf(concat_target.param_types[0], sizeof(concat_target.param_types[0]), "%s", "str");
-            snprintf(concat_target.param_types[1], sizeof(concat_target.param_types[1]), "%s", "str");
-            snprintf(concat_target.param_abi_classes[0], sizeof(concat_target.param_abi_classes[0]), "%s", "composite");
-            snprintf(concat_target.param_abi_classes[1], sizeof(concat_target.param_abi_classes[1]), "%s", "composite");
-            if (!v3_emit_local_value_address(out, cap, &left_slot, 15) ||
-                !v3_emit_local_value_address(out, cap, &right_slot, 9)) {
-                return false;
-            }
-            v3_emit_call_arg_spill_store(out,
-                                         cap,
-                                         call_arg_base,
-                                         call_depth,
-                                         0U,
-                                         "ptr",
-                                         15);
-            v3_emit_call_arg_spill_store(out,
-                                         cap,
-                                         call_arg_base,
-                                         call_depth,
-                                         1U,
-                                         "ptr",
-                                         9);
-            return v3_emit_call_from_spills(plan,
-                                            lowering,
-                                            current_function,
-                                            aliases,
-                                            alias_count,
-                                            &concat_target,
-                                            true,
-                                            call_arg_base,
-                                            call_depth,
-                                            out,
-                                            cap);
+            return v3_materialize_composite_expr_into_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              locals,
+                                                              local_count,
+                                                              rewritten_concat_expr,
+                                                              "str",
+                                                              dest_addr_reg,
+                                                              call_arg_base,
+                                                              string_temp_base,
+                                                              string_temp_stride,
+                                                              string_label_index_io,
+                                                              call_depth + 1,
+                                                              out,
+                                                              cap);
         }
     }
     if (strcmp(expr, "[]") == 0) {
@@ -38430,37 +38590,6 @@ static bool v3_wasm_trim_wrapping_parens(const char *text,
     return changed || out[0] != '\0';
 }
 
-static bool v3_wasm_flatten_str_concat_terms(const char *expr_text,
-                                             char terms[][4096],
-                                             size_t *count_io,
-                                             size_t term_cap) {
-    char expr[4096];
-    int32_t plus_index = -1;
-    if (expr_text == NULL || terms == NULL || count_io == NULL || term_cap == 0U) {
-        return false;
-    }
-    v3_wasm_trim_wrapping_parens(expr_text, expr, sizeof(expr));
-    plus_index = v3_find_top_level_binary_op_last(expr, "+");
-    if (plus_index < 0) {
-        if (*count_io >= term_cap) {
-            return false;
-        }
-        snprintf(terms[*count_io], 4096, "%s", expr);
-        *count_io += 1U;
-        return true;
-    }
-    {
-        char left_expr[4096];
-        char right_expr[4096];
-        snprintf(left_expr, sizeof(left_expr), "%.*s", plus_index, expr);
-        snprintf(right_expr, sizeof(right_expr), "%s", expr + plus_index + 1);
-        v3_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
-        v3_trim_copy_text(right_expr, right_expr, sizeof(right_expr));
-        return v3_wasm_flatten_str_concat_terms(left_expr, terms, count_io, term_cap) &&
-               v3_wasm_flatten_str_concat_terms(right_expr, terms, count_io, term_cap);
-    }
-}
-
 static int32_t v3_wasm_find_local_slot_index(const V3WasmFunctionContext *ctx,
                                              const char *name) {
     size_t i;
@@ -38752,28 +38881,6 @@ static bool v3_wasm_emit_frame_temp_address(const V3WasmFunctionContext *ctx,
            v3_wasm_emit_local_set(body, target_local_index);
 }
 
-static bool v3_wasm_build_str_concat_target(const V3SystemLinkPlanStub *plan,
-                                            V3AsmCallTarget *target) {
-    if (plan == NULL || target == NULL) {
-        return false;
-    }
-    memset(target, 0, sizeof(*target));
-    target->external = true;
-    target->param_count = 2U;
-    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "driver_c_str_concat_bridge");
-    v3_copy_target_symbol_name(plan,
-                               "driver_c_str_concat_bridge",
-                               target->symbol_name,
-                               sizeof(target->symbol_name));
-    snprintf(target->return_type, sizeof(target->return_type), "%s", "str");
-    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "composite");
-    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "str");
-    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "str");
-    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "composite");
-    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "composite");
-    return true;
-}
-
 static bool v3_wasm_build_str_eq_target(const V3SystemLinkPlanStub *plan,
                                         V3AsmCallTarget *target) {
     if (plan == NULL || target == NULL) {
@@ -38833,32 +38940,23 @@ static bool v3_wasm_prepare_composite_expr(const V3SystemLinkPlanStub *plan,
         }
         plus_index = v3_find_top_level_binary_op_last(expr, "+");
         if (plus_index >= 0) {
-            char left_expr[4096];
-            char right_expr[4096];
-            V3AsmCallTarget target;
-            snprintf(left_expr, sizeof(left_expr), "%.*s", plus_index, expr);
-            snprintf(right_expr, sizeof(right_expr), "%s", expr + plus_index + 1);
-            v3_trim_copy_text(left_expr, left_expr, sizeof(left_expr));
-            v3_trim_copy_text(right_expr, right_expr, sizeof(right_expr));
-            ctx->needs_str_temps = true;
+            char rewritten_concat_expr[8192];
+            char concat_error[256];
+            if (!v3_build_str_concat_fmt_call(expr,
+                                              rewritten_concat_expr,
+                                              sizeof(rewritten_concat_expr),
+                                              concat_error,
+                                              sizeof(concat_error))) {
+                return false;
+            }
             return v3_wasm_prepare_composite_expr(plan,
                                                   lowering,
                                                   function,
                                                   ctx,
-                                                  left_expr,
+                                                  rewritten_concat_expr,
                                                   "str",
                                                   imports,
-                                                  import_count) &&
-                   v3_wasm_prepare_composite_expr(plan,
-                                                  lowering,
-                                                  function,
-                                                  ctx,
-                                                  right_expr,
-                                                  "str",
-                                                  imports,
-                                                  import_count) &&
-                   v3_wasm_build_str_concat_target(plan, &target) &&
-                   v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+                                                  import_count);
         }
     }
     return v3_wasm_analyze_expr(plan, lowering, function, ctx, expr, imports, import_count);
@@ -40338,6 +40436,7 @@ static bool v3_wasm_ensure_composite_call_arg_local(const V3SystemLinkPlanStub *
     char temp_name[128];
     char value_type[CHENG_V3_MAX_TYPE_TEXT];
     char value_abi[32];
+    const char *callee_base = NULL;
     const char *value_expr = arg_expr;
     if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
         callee == NULL || arg_expr == NULL) {
@@ -40361,6 +40460,14 @@ static bool v3_wasm_ensure_composite_call_arg_local(const V3SystemLinkPlanStub *
                           sizeof(temp_name));
     if (v3_wasm_find_local_slot_index(ctx, temp_name) >= 0) {
         return true;
+    }
+    callee_base = strrchr(callee, '.');
+    callee_base = callee_base ? callee_base + 1 : callee;
+    if ((preferred_type == NULL || preferred_type[0] == '\0' ||
+         preferred_abi == NULL || preferred_abi[0] == '\0') &&
+        v3_is_strformat_join_name(callee_base)) {
+        preferred_type = "str[]";
+        preferred_abi = "composite";
     }
     if (preferred_type != NULL && preferred_type[0] != '\0' &&
         preferred_abi != NULL && preferred_abi[0] != '\0' &&
@@ -42626,81 +42733,25 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
         }
         plus_index = v3_find_top_level_binary_op_last(expr, "+");
         if (plus_index >= 0) {
-            char concat_terms[32][4096];
-            size_t term_count = 0U;
-            size_t term_index = 0U;
-            V3AsmCallTarget target;
-            uint32_t term_addr_local_index = ctx->scratch3_local_index;
-            uint32_t accum_local_index = ctx->scratch4_local_index;
-            if (!v3_wasm_flatten_str_concat_terms(expr,
-                                                  concat_terms,
-                                                  &term_count,
-                                                  sizeof(concat_terms) / sizeof(concat_terms[0]))) {
+            char rewritten_concat_expr[8192];
+            char concat_error[256];
+            if (!v3_build_str_concat_fmt_call(expr,
+                                              rewritten_concat_expr,
+                                              sizeof(rewritten_concat_expr),
+                                              concat_error,
+                                              sizeof(concat_error))) {
                 return false;
             }
-            if (term_count == 0U) {
-                return v3_wasm_emit_zero_region_from_local(body, dest_addr_local_index, layout.size);
-            }
-            if (term_count == 1U) {
-                return v3_wasm_emit_composite_expr_into_local_address(plan,
-                                                                      lowering,
-                                                                      function,
-                                                                      ctx,
-                                                                      concat_terms[0],
-                                                                      "str",
-                                                                      dest_addr_local_index,
-                                                                      imports,
-                                                                      import_count,
-                                                                      body);
-            }
-            if (!ctx->has_frame_base_local ||
-                ctx->str_temp0_offset < 0 ||
-                ctx->str_temp1_offset < 0 ||
-                !v3_wasm_build_str_concat_target(plan, &target) ||
-                !v3_wasm_emit_frame_temp_address(ctx,
-                                                 body,
-                                                 term_addr_local_index,
-                                                 ctx->str_temp0_offset) ||
-                !v3_wasm_emit_composite_expr_into_local_address(plan,
-                                                                lowering,
-                                                                function,
-                                                                ctx,
-                                                                concat_terms[0],
-                                                                "str",
-                                                                term_addr_local_index,
-                                                                imports,
-                                                                import_count,
-                                                                body) ||
-                !v3_wasm_emit_local_get(body, term_addr_local_index) ||
-                !v3_wasm_emit_local_set(body, accum_local_index)) {
-                return false;
-            }
-            for (term_index = 1U; term_index < term_count; ++term_index) {
-                if (!v3_wasm_emit_frame_temp_address(ctx,
-                                                     body,
-                                                     term_addr_local_index,
-                                                     ctx->str_temp1_offset) ||
-                    !v3_wasm_emit_composite_expr_into_local_address(plan,
-                                                                    lowering,
-                                                                    function,
-                                                                    ctx,
-                                                                    concat_terms[term_index],
-                                                                    "str",
-                                                                    term_addr_local_index,
-                                                                    imports,
-                                                                    import_count,
-                                                                    body) ||
-                    !v3_wasm_emit_local_get(body, accum_local_index) ||
-                    !v3_wasm_emit_local_get(body, term_addr_local_index) ||
-                    !v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) ||
-                    !v3_wasm_emit_local_set(body, accum_local_index)) {
-                    return false;
-                }
-            }
-            return v3_wasm_emit_copy_region_between_locals(body,
-                                                           dest_addr_local_index,
-                                                           accum_local_index,
-                                                           layout.size);
+            return v3_wasm_emit_composite_expr_into_local_address(plan,
+                                                                  lowering,
+                                                                  function,
+                                                                  ctx,
+                                                                  rewritten_concat_expr,
+                                                                  "str",
+                                                                  dest_addr_local_index,
+                                                                  imports,
+                                                                  import_count,
+                                                                  body);
         }
     }
     if (v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
@@ -61115,6 +61166,8 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
         "os_rename_file_smoke",
         "os_remove_dir_smoke",
         "os_walk_dir_smoke",
+        "str_concat_lowering_smoke",
+        "strformat_fmt_lowering_smoke",
         "strformat_fmt_smoke",
         "strformat_fmt_negative_smoke",
         "global_fixed_array_composite_smoke",

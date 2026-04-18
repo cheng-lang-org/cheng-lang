@@ -1,4 +1,6 @@
 import std/result
+import std/buffer
+import std/rawbytes
 import cheng/v3/tooling/path as v3path
 
 type
@@ -20,9 +22,12 @@ type
         v3NormalizedExprTry
 
     V3NormalizedExpr =
+        exprId: str
         sourcePath: str
         lineNumber: int32
         columnNumber: int32
+        endLineNumber: int32
+        endColumnNumber: int32
         kind: V3NormalizedExprKind
         detail: str
         surfaceText: str
@@ -81,13 +86,74 @@ fn v3NormalizedExprKindText(kind: V3NormalizedExprKind): str =
 
 fn v3NormalizedExprClone(expr: V3NormalizedExpr): V3NormalizedExpr =
     var out: V3NormalizedExpr
+    out.exprId = expr.exprId
     out.sourcePath = expr.sourcePath
     out.lineNumber = expr.lineNumber
     out.columnNumber = expr.columnNumber
+    out.endLineNumber = expr.endLineNumber
+    out.endColumnNumber = expr.endColumnNumber
     out.kind = expr.kind
     out.detail = expr.detail
     out.surfaceText = expr.surfaceText
     return out
+
+fn v3NormalizedExprEndColumn(columnNumber: int32,
+                             surfaceText: str): int32 =
+    if len(surfaceText) <= 0:
+        return columnNumber
+    return columnNumber + len(surfaceText) - 1
+
+fn v3ParserConcat2(a: str, b: str): str =
+    var buf = buffer.NewByteBuffer()
+    if a != "":
+        buffer.AppendBytes(buf, a)
+    if b != "":
+        buffer.AppendBytes(buf, b)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
+
+fn v3ParserConcat3(a: str, b: str, c: str): str =
+    var buf = buffer.NewByteBuffer()
+    if a != "":
+        buffer.AppendBytes(buf, a)
+    if b != "":
+        buffer.AppendBytes(buf, b)
+    if c != "":
+        buffer.AppendBytes(buf, c)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
+
+fn v3ParserConcat4(a: str, b: str, c: str, d: str): str =
+    var buf = buffer.NewByteBuffer()
+    if a != "":
+        buffer.AppendBytes(buf, a)
+    if b != "":
+        buffer.AppendBytes(buf, b)
+    if c != "":
+        buffer.AppendBytes(buf, c)
+    if d != "":
+        buffer.AppendBytes(buf, d)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
+
+fn v3NormalizedExprMakeId(sourcePath: str,
+                          lineNumber: int32,
+                          columnNumber: int32,
+                          kind: V3NormalizedExprKind,
+                          detail: str): str =
+    var buf = buffer.NewByteBuffer()
+    let hash: str = "#"
+    let colon: str = ":"
+    let lineText: str = intToStr(lineNumber)
+    let columnText: str = intToStr(columnNumber)
+    let kindText: str = v3NormalizedExprKindText(kind)
+    buffer.AppendBytes(buf, sourcePath)
+    buffer.AppendBytes(buf, hash)
+    buffer.AppendBytes(buf, lineText)
+    buffer.AppendBytes(buf, colon)
+    buffer.AppendBytes(buf, columnText)
+    buffer.AppendBytes(buf, colon)
+    buffer.AppendBytes(buf, kindText)
+    buffer.AppendBytes(buf, colon)
+    buffer.AppendBytes(buf, detail)
+    return rawbytes.bytesToString(buffer.ToBytes(buf))
 
 fn v3NormalizedExprLayerClone(layer: V3NormalizedExprLayer): V3NormalizedExprLayer =
     var out: V3NormalizedExprLayer
@@ -114,9 +180,12 @@ fn v3NormalizedExprLayerAppend(layer: var V3NormalizedExprLayer,
                                detail: str,
                                surfaceText: str) =
     var expr: V3NormalizedExpr
+    expr.exprId = v3NormalizedExprMakeId(sourcePath, lineNumber, columnNumber, kind, detail)
     expr.sourcePath = sourcePath
     expr.lineNumber = lineNumber
     expr.columnNumber = columnNumber
+    expr.endLineNumber = lineNumber
+    expr.endColumnNumber = v3NormalizedExprEndColumn(columnNumber, surfaceText)
     expr.kind = kind
     expr.detail = detail
     expr.surfaceText = surfaceText
@@ -248,21 +317,21 @@ fn v3ParserWorkspaceRoot(packageRootRaw: str): str =
     return packageRoot
 
 fn v3ParserPackageId(packageRootRaw: str): str =
-    let packageRoot = v3ParserNormalizePath(packageRootRaw)
+    let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
     if packageRoot == "":
         return ""
     var lastSep: int32 = -1
     for i in 0..<packageRoot.len:
         if packageRoot[i] == '/' || packageRoot[i] == '\\':
             lastSep = i
-    var name = packageRoot
+    var name: str = packageRoot
     if lastSep >= 0:
         name = v3path.V3TextSlice(packageRoot, lastSep + 1, packageRoot.len - lastSep - 1)
     if name == "v3":
         return "cheng/v3"
     if name == "":
         return ""
-    return "cheng/" + name
+    return v3ParserConcat2("cheng/", name)
 
 fn v3ParserSourceExists(path: str): bool =
     if path == "":
@@ -729,13 +798,13 @@ fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
 fn v3ParserReadNormalizedExprLayerFromPath(sourcePathRaw: str,
                                            layer: var V3NormalizedExprLayer,
                                            err: var str): bool =
-    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    let sourcePath: str = v3ParserNormalizePath(sourcePathRaw)
     if !v3ParserSourceExists(sourcePath):
-        err = "source file missing: " + sourcePath
+        err = "source file missing"
         return false
-    let text = v3path.V3ReadTextFile("", sourcePath)
+    let text: str = v3path.V3ReadTextFile("", sourcePath)
     if text == "":
-        err = "failed to read source: " + sourcePath
+        err = "failed to read source"
         return false
     return v3ParserReadNormalizedExprLayerFromText(sourcePath, text, layer, err)
 
@@ -800,14 +869,17 @@ fn v3ParserSplitChar(textRaw: str, sep: char): str[] =
     return out
 
 fn v3ParserJoinSlash(items: str[]): str =
-    var out: str = ""
+    var out = buffer.NewByteBuffer()
+    let slash: str = "/"
+    var wrote = false
     for i in 0..<items.len:
         if items[i] == "":
             continue
-        if out != "":
-            out = out + "/"
-        out = out + items[i]
-    return out
+        if wrote:
+            buffer.AppendBytes(out, slash)
+        buffer.AppendBytes(out, items[i])
+        wrote = true
+    return rawbytes.bytesToString(buffer.ToBytes(out))
 
 fn v3ParserStartsWith(textRaw: str, prefixRaw: str): bool =
     let text = v3path.V3PathTrim(textRaw)
@@ -912,10 +984,11 @@ fn v3ParserFunctionNameFromLine(lineRaw: str): str =
 fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
                                        decls: var V3NormalizedFunctionDecl[],
                                        err: var str): bool =
-    decls = []
-    let lines = v3ParserSplitChar(textRaw, '\n')
+    var emptyDecls: V3NormalizedFunctionDecl[] = []
+    decls = emptyDecls
+    let lines: str[] = v3ParserSplitChar(textRaw, '\n')
     var pendingImportc = false
-    var pendingExplicitExportName = ""
+    var pendingExplicitExportName: str = ""
     for i in 0..<lines.len:
         let trimmed = v3path.V3PathTrim(lines[i])
         if trimmed == "":
@@ -940,7 +1013,7 @@ fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
             pendingExplicitExportName = ""
             continue
         if keyword != "fn":
-            err = "unsupported top-level function alias '" + keyword + "' at line " + intToStr(i + 1)
+            err = v3ParserConcat3("unsupported top-level function alias '", keyword, "'")
             return false
         let functionName = v3ParserFunctionNameFromLine(trimmed)
         if functionName == "":
@@ -1008,53 +1081,57 @@ fn v3ParserSharedV3PackageRoot(workspaceRootRaw: str): str =
     return ""
 
 fn v3ParserModulePathToSourcePath(workspaceRootRaw: str, packageRootRaw: str, modulePathRaw: str): str =
-    let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
-    let packageRoot = v3ParserNormalizePath(packageRootRaw)
-    let modulePath = v3path.V3PathTrim(modulePathRaw)
+    let workspaceRoot: str = v3ParserNormalizePath(workspaceRootRaw)
+    let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
+    let modulePath: str = v3path.V3PathTrim(modulePathRaw)
     if modulePath == "":
         return ""
     if v3ParserStartsWith(modulePath, "std/") && modulePath.len > 4:
-        return workspaceRoot + "/src/std/" + v3ParserModulePathTail(modulePath, 1) + ".cheng"
-    let sharedV3PackageRoot = v3ParserSharedV3PackageRoot(workspaceRoot)
+        let rel: str = v3ParserModulePathTail(modulePath, 1)
+        return v3ParserConcat3(v3ParserConcat2(workspaceRoot, "/src/std/"), rel, ".cheng")
+    let sharedV3PackageRoot: str = v3ParserSharedV3PackageRoot(workspaceRoot)
     if sharedV3PackageRoot != "" &&
        v3ParserStartsWith(modulePath, "cheng/v3/") &&
        modulePath.len > 9:
-        return sharedV3PackageRoot + "/src/" + v3ParserModulePathTail(modulePath, 2) + ".cheng"
-    let packageId = v3ParserPackageId(packageRoot)
-    if packageId != "" && modulePath.len > packageId.len && v3ParserStartsWith(modulePath, packageId + "/"):
-        return packageRoot + "/src/" + v3ParserModulePathTail(modulePath, 2) + ".cheng"
+        let rel: str = v3ParserModulePathTail(modulePath, 2)
+        return v3ParserConcat3(v3ParserConcat2(sharedV3PackageRoot, "/src/"), rel, ".cheng")
+    let packageId: str = v3ParserPackageId(packageRoot)
+    let packagePrefix: str = v3ParserConcat2(packageId, "/")
+    if packageId != "" && modulePath.len > packageId.len && v3ParserStartsWith(modulePath, packagePrefix):
+        let rel: str = v3ParserModulePathTail(modulePath, 2)
+        return v3ParserConcat3(v3ParserConcat2(packageRoot, "/src/"), rel, ".cheng")
     return ""
 
 fn v3ParserSourcePathToModulePath(workspaceRootRaw: str, packageRootRaw: str, sourcePathRaw: str): str =
-    let workspaceRoot = v3ParserNormalizePath(workspaceRootRaw)
-    let packageRoot = v3ParserNormalizePath(packageRootRaw)
-    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
-    let packagePrefix = packageRoot + "/src/"
+    let workspaceRoot: str = v3ParserNormalizePath(workspaceRootRaw)
+    let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
+    let sourcePath: str = v3ParserNormalizePath(sourcePathRaw)
+    let packagePrefix: str = v3ParserConcat2(packageRoot, "/src/")
     if v3ParserStartsWith(sourcePath, packagePrefix):
-        let rel = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
-                                                           packagePrefix.len,
-                                                           sourcePath.len - packagePrefix.len))
-        let packageId = v3ParserPackageId(packageRoot)
+        let rel: str = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
+                                                                packagePrefix.len,
+                                                                sourcePath.len - packagePrefix.len))
+        let packageId: str = v3ParserPackageId(packageRoot)
         if rel == "":
             return packageId
-        return packageId + "/" + rel
-    let sharedV3PackageRoot = v3ParserSharedV3PackageRoot(workspaceRoot)
-    let sharedV3Prefix = sharedV3PackageRoot + "/src/"
+        return v3ParserConcat3(packageId, "/", rel)
+    let sharedV3PackageRoot: str = v3ParserSharedV3PackageRoot(workspaceRoot)
+    let sharedV3Prefix: str = v3ParserConcat2(sharedV3PackageRoot, "/src/")
     if sharedV3PackageRoot != "" && v3ParserStartsWith(sourcePath, sharedV3Prefix):
-        let rel = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
-                                                           sharedV3Prefix.len,
-                                                           sourcePath.len - sharedV3Prefix.len))
+        let rel: str = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
+                                                                sharedV3Prefix.len,
+                                                                sourcePath.len - sharedV3Prefix.len))
         if rel == "":
             return "cheng/v3"
-        return "cheng/v3/" + rel
-    let stdPrefix = workspaceRoot + "/src/std/"
+        return v3ParserConcat2("cheng/v3/", rel)
+    let stdPrefix: str = v3ParserConcat2(workspaceRoot, "/src/std/")
     if v3ParserStartsWith(sourcePath, stdPrefix):
-        let rel = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
-                                                           stdPrefix.len,
-                                                           sourcePath.len - stdPrefix.len))
+        let rel: str = v3ParserRelWithoutExt(v3path.V3TextSlice(sourcePath,
+                                                                stdPrefix.len,
+                                                                sourcePath.len - stdPrefix.len))
         if rel == "":
             return "std"
-        return "std/" + rel
+        return v3ParserConcat2("std/", rel)
     return v3ParserFileStem(sourcePath)
 
 fn v3ParserHasCompilerTopLevel(textRaw: str): bool =
@@ -1087,7 +1164,7 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
                            textRaw: str,
                            edges: var V3ImportEdge[],
                            err: var str): bool =
-    let lines = v3ParserSplitChar(textRaw, '\n')
+    let lines: str[] = v3ParserSplitChar(textRaw, '\n')
     edges = []
     for i in 0..<lines.len:
         let rawLine = lines[i]
@@ -1097,7 +1174,7 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
         let importTail = v3path.V3TextSlice(line, 7, line.len - 7)
         let modulePath = v3ParserFirstToken(importTail)
         if modulePath == "":
-            err = "v3 parser: malformed import at line " + intToStr(i + 1)
+            err = "v3 parser: malformed import"
             return false
         let sourcePath = v3ParserModulePathToSourcePath(workspaceRoot, packageRoot, modulePath)
         let resolved = v3ParserSourceExists(sourcePath)
@@ -1141,7 +1218,7 @@ fn v3ParserCollectClosure(workspaceRoot: str,
                           importEdges: var V3ImportEdge[],
                           unresolved: var int32,
                           err: var str): bool =
-    let sourcePath = v3path.V3PathTrim(sourcePathRaw)
+    let sourcePath: str = v3path.V3PathTrim(sourcePathRaw)
     if sourcePath == "":
         err = "v3 parser: missing closure source path"
         return false
@@ -1149,7 +1226,7 @@ fn v3ParserCollectClosure(workspaceRoot: str,
         err = ""
         return true
     if !v3ParserSourceExists(sourcePath):
-        err = "v3 parser: missing source: " + sourcePath
+        err = "v3 parser: missing source"
         return false
     if !v3ParserStringSeqContains(seen, sourcePath):
         add(seen, sourcePath)
@@ -1162,7 +1239,7 @@ fn v3ParserCollectClosure(workspaceRoot: str,
         var normalizedDecls: V3NormalizedFunctionDecl[] = []
         var normalizedErr = ""
         if !v3ParserReadNormalizedFunctionDecls(text, normalizedDecls, normalizedErr):
-            err = "v3 parser: " + currentSourcePath + ": " + normalizedErr
+            err = normalizedErr
             return false
         let ownerModulePath = v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
         var edges: V3ImportEdge[]
@@ -1185,24 +1262,23 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
                              sourcePathRaw: str,
                              parsed: var V3ParsedSourceStub,
                              err: var str): bool =
-    let packageRoot = v3ParserNormalizePath(packageRootRaw)
-    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    let packageRoot: str = v3ParserNormalizePath(packageRootRaw)
+    let sourcePath: str = v3ParserNormalizePath(sourcePathRaw)
     if sourcePath == "":
         err = "v3 parser: missing source path"
         return false
     if !v3ParserSourceExists(sourcePath):
-        err = "v3 parser: source file missing: " + sourcePath
+        err = "v3 parser: source file missing"
         return false
-    let workspaceRoot = v3ParserWorkspaceRoot(packageRoot)
-    let packageId = v3ParserPackageId(packageRoot)
-    let moduleStem = v3ParserFileStem(sourcePath)
-    let rootText = v3path.V3ReadTextFile("", sourcePath)
+    let workspaceRoot: str = v3ParserWorkspaceRoot(packageRoot)
+    let packageId: str = v3ParserPackageId(packageRoot)
+    let moduleStem: str = v3ParserFileStem(sourcePath)
+    let rootText: str = v3path.V3ReadTextFile("", sourcePath)
     if rootText == "":
-        err = "v3 parser: failed to read source: " + sourcePath
+        err = "v3 parser: failed to read source"
         return false
     var rootDecls: V3NormalizedFunctionDecl[] = []
     if !v3ParserReadNormalizedFunctionDecls(rootText, rootDecls, err):
-        err = "v3 parser: " + sourcePath + ": " + err
         return false
     var seen: str[] = []
     var ordered: str[] = []
@@ -1214,7 +1290,7 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     for i in 0..<ordered.len:
         var sourceExprLayer = v3NormalizedExprLayerZero()
         if !v3ParserReadNormalizedExprLayerFromPath(ordered[i], sourceExprLayer, err):
-            err = "v3 parser: " + ordered[i] + ": " + err
+            err = v3ParserConcat4("v3 parser: ", ordered[i], ": ", err)
             return false
         v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
     var ownerModulePaths: str[] = []

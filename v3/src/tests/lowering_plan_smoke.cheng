@@ -1,31 +1,50 @@
 import std/result
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
+import cheng/v3/lang/parser
 
-fn main(): int32 =
-    let workspaceRoot = v3path.V3PathCurrentDir()
-    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
-    let sourcePath = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
-    let outputPath = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+fn buildLinkPlan(workspaceRoot: str,
+                 packageRoot: str,
+                 sourcePath: str,
+                 outputPath: str,
+                 emitKind: int32): slplan.V3SystemLinkPlanStub =
     let req = creq.v3CompilerRequestNew(
         packageRoot,
         sourcePath,
         outputPath,
         "arm64-apple-darwin",
-        creq.v3EmitExe,
+        emitKind,
         ""
     )
     var linkPlan: slplan.V3SystemLinkPlanStub
     var err = ""
-    assert(slplan.v3BuildSystemLinkPlanStub(packageRoot, req, linkPlan, err), "v3 lowering plan: build link plan")
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 lowering plan: build link plan")
+    return linkPlan
+
+fn main(): int32 =
+    let workspaceRoot: str = v3path.V3PathCurrentDir()
+    let packageRoot: str = v3path.V3PathJoin(workspaceRoot, "v3")
+    let sourcePath: str = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath: str = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke")
+    let linkPlan = buildLinkPlan(workspaceRoot,
+                                 packageRoot,
+                                 sourcePath,
+                                 outputPath,
+                                 creq.v3EmitExe)
+    var err = ""
     assert(linkPlan.missingReasons.len == 0, "v3 lowering plan: link plan ready")
     var plan: lower.V3LoweringPlanStub
     assert(lower.v3BuildLoweringPlanStub(linkPlan, plan, err), "v3 lowering plan: build lowering plan")
     assert(plan.functionNames.len >= 1, "v3 lowering plan: function count")
     assert(plan.functionNameIds[0] >= 0, "v3 lowering plan: intern id")
     assert(plan.functionCallConvs[0] == lower.v3LoweringCallConvInternal(), "v3 lowering plan: callconv")
+    assert(plan.typedExprFacts.len == parser.v3NormalizedExprLayerExprCount(plan.exprLayer),
+           "v3 lowering plan: typed expr fact count")
+    assert(plan.typedExprFacts[0].exprId != "", "v3 lowering plan: typed expr id")
     var sawMain = false
     for i in 0..<plan.functionNames.len:
         assert(!(plan.functionOwnerModulePaths[i] == "std/system" && plan.functionNames[i] == "mulCompat"),
@@ -35,17 +54,42 @@ fn main(): int32 =
             assert(plan.functionNames[i] == "main", "v3 lowering plan: entry name")
             assert(plan.functionResultLayoutKinds[i] == lower.v3LoweringLayoutKindI32(), "v3 lowering plan: entry layout")
     assert(sawMain, "v3 lowering plan: saw entry")
-    let report = lower.v3LoweringPlanStubReport(plan)
-    assert(v3path.V3TextContains(report, "lowering_function_count="), "v3 lowering plan: report function count")
-    assert(v3path.V3TextContains(report, "expr_surface_source_count="), "v3 lowering plan: expr surface count")
-    assert(v3path.V3TextContains(report, "expr_surface_expr_count="), "v3 lowering plan: expr node count")
-    assert(v3path.V3TextContains(report, "expr_surface_try_count="), "v3 lowering plan: try count")
-    assert(v3path.V3TextContains(report, "expr_surface_question_residual_count=0"),
-           "v3 lowering plan: question normalized")
-    assert(v3path.V3TextContains(report, "lowering_source_bundle_cid="), "v3 lowering plan: report source bundle")
-    assert(v3path.V3TextContains(report, "lowering_compiler_csg_cid="), "v3 lowering plan: report compiler csg")
-    assert(v3path.V3TextContains(report, "lowering_missing_reasons=-"), "v3 lowering plan: no lowering blockers")
-    assert(v3path.V3TextContains(report, "exec_pipeline_stage=canonical_csg_to_lowering_plan_stub"),
+    assert(plan.exprLayer.sourceCount > 0, "v3 lowering plan: expr surface count")
+    assert(parser.v3NormalizedExprLayerExprCount(plan.exprLayer) > 0, "v3 lowering plan: expr node count")
+    assert(parser.v3NormalizedExprLayerTryCount(plan.exprLayer) >= 0, "v3 lowering plan: try count")
+    assert(plan.exprLayer.questionResidualCount == 0, "v3 lowering plan: question normalized")
+    assert(ccsg.v3TypedExprLowerLocalAddressCount(plan.typedExprFacts) > 0,
+           "v3 lowering plan: typed lowering mode")
+    assert(plan.missingReasons.len == 0, "v3 lowering plan: no lowering blockers")
+    assert(lower.v3LoweringPlanPipelineStage(plan) == "canonical_csg_to_lowering_plan_stub",
            "v3 lowering plan: report stage")
+
+    let typedFixturePath: str = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let typedOutputPath: str = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_program_selfhost/typed_expr_fact_fixture")
+    let typedLinkPlan = buildLinkPlan(workspaceRoot,
+                                      packageRoot,
+                                      typedFixturePath,
+                                      typedOutputPath,
+                                      creq.v3EmitShared)
+    var typedPlan: lower.V3LoweringPlanStub
+    err = ""
+    assert(lower.v3BuildLoweringPlanStub(typedLinkPlan, typedPlan, err),
+           "v3 lowering plan: typed fixture plan")
+    let typedSourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(typedLinkPlan.packageId, typedLinkPlan.sourceClosurePaths)
+    let typedCsgRes = ccsg.v3BuildCompilerCsg(typedLinkPlan, typedSourceBundleCid)
+    assert(IsOk(typedCsgRes), "v3 lowering plan: typed fixture csg")
+    let typedCsg = ccsg.v3CompilerCsgClone(Value(typedCsgRes))
+    assert(ccsg.v3TypedExprFactsEqual(typedCsg.typedExprFacts, typedPlan.typedExprFacts),
+           "v3 lowering plan: typed facts match compiler csg")
+    let typedFixtureFacts = ccsg.v3TypedExprFactsForSource(typedPlan.typedExprFacts, typedFixturePath)
+    assert(typedFixtureFacts.len > 0, "v3 lowering plan: typed fixture fact slice")
+    assert(ccsg.v3TypedExprAbiPolymorphicCount(typedFixtureFacts) == 0,
+           "v3 lowering plan: typed fixture no abi polymorphic")
+    assert(ccsg.v3TypedExprLowerDeferredCount(typedFixtureFacts) == 0,
+           "v3 lowering plan: typed fixture no deferred lowering")
+    assert(ccsg.v3TypedExprPlaceLocalCount(typedFixtureFacts) > 0,
+           "v3 lowering plan: typed fixture local place count")
+    assert(ccsg.v3TypedExprLowerSretCount(typedFixtureFacts) > 0,
+           "v3 lowering plan: typed fixture sret count")
     echo("v3 lowering_plan_smoke ok")
     return 0

@@ -4,18 +4,19 @@ import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/lang/parser
 
-fn main(): int32 =
-    let workspaceRoot = v3path.V3PathCurrentDir()
-    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
-    let sourcePath = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
-    let outputPath = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_compiler_csg/program_selfhost_smoke")
+fn buildCsg(workspaceRoot: str,
+            packageRoot: str,
+            sourcePath: str,
+            outputPath: str,
+            emitKind: int32): ccsg.V3CompilerCsg =
     let req = creq.v3CompilerRequestNew(
         packageRoot,
         sourcePath,
         outputPath,
         "arm64-apple-darwin",
-        creq.v3EmitExe,
+        emitKind,
         ""
     )
     var linkPlan: slplan.V3SystemLinkPlanStub
@@ -24,19 +25,47 @@ fn main(): int32 =
     let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
     let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
     assert(IsOk(csgRes), "v3 compiler csg: build")
-    let csg = ccsg.v3CompilerCsgClone(Value(csgRes))
+    return ccsg.v3CompilerCsgClone(Value(csgRes))
+
+fn main(): int32 =
+    let workspaceRoot: str = v3path.V3PathCurrentDir()
+    let packageRoot: str = v3path.V3PathJoin(workspaceRoot, "v3")
+    let sourcePath: str = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath: str = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_compiler_csg/program_selfhost_smoke")
+    let csg = buildCsg(workspaceRoot,
+                       packageRoot,
+                       sourcePath,
+                       outputPath,
+                       creq.v3EmitExe)
     assert(csg.nodeCount > 0, "v3 compiler csg: node count")
     assert(csg.edgeCount > 0, "v3 compiler csg: edge count")
+    assert(csg.typedExprFacts.len == parser.v3NormalizedExprLayerExprCount(csg.exprLayer),
+           "v3 compiler csg: typed expr fact count")
+    assert(csg.typedExprFacts[0].exprId != "", "v3 compiler csg: typed expr id")
     let surface = ccsg.v3CompilerExportSurfaceFromCsg(csg)
     assert(surface.exportedSymbolCount > 0, "v3 compiler csg: export count")
-    let report = ccsg.v3CompilerCsgReport(csg)
-    assert(v3path.V3TextContains(report, "canonical_graph_cid="), "v3 compiler csg: canonical cid")
-    assert(v3path.V3TextContains(report, "graph_cid="), "v3 compiler csg: report cid")
-    assert(v3path.V3TextContains(report, "expr_surface_source_count="), "v3 compiler csg: expr surface count")
-    assert(v3path.V3TextContains(report, "expr_surface_expr_count="), "v3 compiler csg: expr node count")
-    assert(v3path.V3TextContains(report, "expr_surface_try_count="), "v3 compiler csg: try count")
-    assert(v3path.V3TextContains(report, "expr_surface_question_residual_count=0"),
-           "v3 compiler csg: question normalized")
-    assert(v3path.V3TextContains(report, "node_count="), "v3 compiler csg: report node count")
+    assert(csg.exprLayer.sourceCount > 0, "v3 compiler csg: expr surface count")
+    assert(parser.v3NormalizedExprLayerTryCount(csg.exprLayer) >= 0, "v3 compiler csg: try count")
+    assert(csg.exprLayer.questionResidualCount == 0, "v3 compiler csg: question normalized")
+    assert(ccsg.v3TypedExprLowerLocalAddressCount(csg.typedExprFacts) > 0,
+           "v3 compiler csg: lowering mode count")
+
+    let typedFixturePath: str = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let typedOutputPath: str = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_compiler_csg/typed_expr_fact_fixture")
+    let typedCsg = buildCsg(workspaceRoot,
+                            packageRoot,
+                            typedFixturePath,
+                            typedOutputPath,
+                            creq.v3EmitShared)
+    let typedFixtureFacts = ccsg.v3TypedExprFactsForSource(typedCsg.typedExprFacts, typedFixturePath)
+    assert(typedFixtureFacts.len > 0, "v3 compiler csg: typed fixture fact slice")
+    assert(ccsg.v3TypedExprAbiPolymorphicCount(typedFixtureFacts) == 0,
+           "v3 compiler csg: typed fixture no abi polymorphic")
+    assert(ccsg.v3TypedExprLowerDeferredCount(typedFixtureFacts) == 0,
+           "v3 compiler csg: typed fixture no deferred lowering")
+    assert(ccsg.v3TypedExprPlaceLocalCount(typedFixtureFacts) > 0,
+           "v3 compiler csg: typed fixture local place count")
+    assert(ccsg.v3TypedExprLowerSretCount(typedFixtureFacts) > 0,
+           "v3 compiler csg: typed fixture sret count")
     echo("v3 compiler_csg_smoke ok")
     return 0

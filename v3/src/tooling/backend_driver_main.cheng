@@ -5,10 +5,10 @@ import std/result
 import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
-import cheng/v3/tooling/browser_host_wasm_runner_source as browserhostwasm
 import cheng/v3/tooling/compiler_runtime as crun
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/wasm_binary_audit as wasmaudit
 import cheng/v3/backend/build_plan as buildplan
 import cheng/v3/backend/system_link_plan as slplan
 
@@ -534,10 +534,12 @@ fn v3BackendDriverRuntimeAbiPath(rootDir: str,
     return v3path.V3PathAbsolute(rootDir, fallbackRel)
 
 fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
+    let backendDriverMainPath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/backend_driver_main.cheng")
     let compilerMainPath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_main.cheng")
     let compilerRuntimePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_runtime.cheng")
     let gateMainPath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/gate_main.cheng")
     let seedPath: str = v3path.V3PathAbsolute(rootDir, "v3/bootstrap/cheng_v3_seed.c")
+    let backendDriverMainText: str = v3path.V3ReadTextFile("", backendDriverMainPath)
     let compilerMainText: str = v3path.V3ReadTextFile("", compilerMainPath)
     let compilerRuntimeText: str = v3path.V3ReadTextFile("", compilerRuntimePath)
     let gateMainText: str = v3path.V3ReadTextFile("", gateMainPath)
@@ -548,6 +550,9 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
     let runtimeCombinedSmoke = "runtime_program_" + "combined_smoke"
     let runtimeCombinedNegativeSmoke = "runtime_program_" + "combined_negative_smoke"
     let runtimeNativeSourceNeedle = "src/runtime/" + "native/"
+    let backendDriverNodeHostNeedle = "v3BackendDriverRun" + "NodeSource("
+    let gateNodeHostNeedle = "v3GateRun" + "NodeSource("
+    let gateWasmRunnerNeedle = "v3GateWasmSmokes" + "RunnerSource("
     let browserHostWasmRunnerPathRel: str = "v3/tooling/browser_host_" + "wasm_runner.js"
     let browserHostWasmRunnerPath: str = v3path.V3PathAbsolute(rootDir, browserHostWasmRunnerPathRel)
     let browserHostWasmRunnerPathNeedle: str = "tooling/browser_host_" + "wasm_runner.js"
@@ -570,6 +575,9 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
                                                    strutil.Contains(compilerRuntimeText, browserHostWasmRunnerPathNeedle) ||
                                                    strutil.Contains(gateMainText, browserHostWasmRunnerPathNeedle) ||
                                                    strutil.Contains(seedText, browserHostWasmRunnerPathNeedle)
+    let legacyNodeWasmHostPresent: bool = strutil.Contains(backendDriverMainText, backendDriverNodeHostNeedle) ||
+                                           strutil.Contains(gateMainText, gateNodeHostNeedle) ||
+                                           strutil.Contains(gateMainText, gateWasmRunnerNeedle)
     var remainingBoundary: str = "none"
     if legacyRuntimeProgramObjCommandPresent:
         remainingBoundary = "runtime_program_obj_command_surface"
@@ -581,6 +589,8 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
         remainingBoundary = "runtime_native_source_surface"
     elif legacyRuntimeCombinedFallbackPresent:
         remainingBoundary = "runtime_combined_fallback_surface"
+    elif legacyNodeWasmHostPresent:
+        remainingBoundary = "node_wasm_host_surface"
     elif legacyBrowserHostWasmRunnerPresent:
         remainingBoundary = "browser_host_wasm_runner_surface"
     var out = ""
@@ -604,6 +614,10 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
         out = out + "legacy_runtime_combined_fallback_present=1\n"
     else:
         out = out + "legacy_runtime_combined_fallback_present=0\n"
+    if legacyNodeWasmHostPresent:
+        out = out + "legacy_node_wasm_host_present=1\n"
+    else:
+        out = out + "legacy_node_wasm_host_present=0\n"
     if legacyBrowserHostWasmRunnerPresent:
         out = out + "legacy_browser_host_wasm_runner_present=1\n"
     else:
@@ -1148,30 +1162,28 @@ fn v3BackendDriverCollectPositionals(args: str[]): str[] =
         add(out, arg)
     return out
 
-fn v3BackendDriverNodeTimeoutSec(): int32 =
-    return int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_NODE_TIMEOUT_SEC", "120")))
-
-fn v3BackendDriverRunNodeSource(rootDir: str,
-                                label: str,
-                                sourceText: str,
-                                args: str[],
-                                logPath: str): hostops.V3LoggedRun =
-    if len(sourceText) <= 0:
-        let outputText = "missing node source\n"
-        let _logged = v3path.V3WriteTextFile(rootDir, logPath, outputText)
-        return hostops.v3LoggedRunZero(label, "node", logPath, 1, outputText)
-    var nodeArgs: str[] = ["-"]
-    for i in 0..<args.len:
-        add(nodeArgs, args[i])
-    return hostops.v3RunProgramLoggedWithInputText(rootDir,
-                                                   label,
-                                                   "node",
-                                                   nodeArgs,
-                                                   [],
-                                                   rootDir,
-                                                   v3BackendDriverNodeTimeoutSec(),
-                                                   logPath,
-                                                   sourceText)
+fn v3BackendDriverRequireWasmAudit(label: str,
+                                   wasmPath: str,
+                                   expectedExports: str[],
+                                   expectedImports: str[],
+                                   minExportCount: int32): bool =
+    let infoRes = wasmaudit.v3WasmBinaryInspect(wasmPath)
+    if IsErr(infoRes):
+        v3BackendDriverPrintErr(label + ": " + Error(infoRes))
+        return false
+    let info = Value(infoRes)
+    if info.exportNames.len < minExportCount:
+        v3BackendDriverPrintErr(label + ": wasm export count too small: " + strings.IntToStr(info.exportNames.len))
+        return false
+    for i in 0..<expectedExports.len:
+        if !wasmaudit.v3WasmBinaryHasExport(info, expectedExports[i]):
+            v3BackendDriverPrintErr(label + ": missing wasm export: " + expectedExports[i])
+            return false
+    for i in 0..<expectedImports.len:
+        if !wasmaudit.v3WasmBinaryHasImport(info, expectedImports[i]):
+            v3BackendDriverPrintErr(label + ": missing wasm import: " + expectedImports[i])
+            return false
+    return true
 
 fn v3BackendDriverResolveBrowserHostWasmCompiler(rootDir: str,
                                                  args: str[],
@@ -1246,17 +1258,68 @@ fn v3BackendDriverRunBrowserHostWasmSmoke(rootDir: str,
                                                                        "v3_browser_host_wasm_compile_" + label)
     if buildCode != 0:
         return buildCode
-    let runnerSource: str = browserhostwasm.v3BrowserHostWasmRunnerSource()
-    if len(runnerSource) <= 0:
-        v3BackendDriverPrintErr("v3 browser host wasm smoke: failed to decode helper source")
+    var expectedExports: str[] = []
+    add(expectedExports, "main")
+    add(expectedExports, "browserNowMs")
+    add(expectedExports, "browserEchoI32")
+    add(expectedExports, "browserPeerHandle")
+    add(expectedExports, "browserDistributedVideoBuild")
+    add(expectedExports, "browserDistributedVideoRebuild")
+    add(expectedExports, "browserMoqFountainBuild")
+    add(expectedExports, "browserMoqFountainRebuild")
+    add(expectedExports, "browserMoqBuildLongBlobComputedBundleCidLenProbe")
+    add(expectedExports, "browserMoqPeerCsvCountProbe")
+    var expectedImports: str[] = []
+    add(expectedImports, "env.cheng_v3_browser_now_ms_bridge")
+    add(expectedImports, "env.cheng_v3_browser_echo_i32_bridge")
+    add(expectedImports, "env.cheng_v3_browser_peer_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_did_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_active_count_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_connect_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_wait_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_send_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_build_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_rebuild_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_last_error_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_input_len_bridge")
+    add(expectedImports, "env.cheng_v3_browser_input_copy_bridge")
+    add(expectedImports, "env.cheng_v3_buffer_handle_from_text_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_len_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_byte_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_release_bridge")
+    add(expectedImports, "env.cheng_v3_browser_moq_fountain_last_error_store_bridge")
+    add(expectedImports, "env.cheng_v3_browser_moq_fountain_last_error_handle_bridge")
+    if !v3BackendDriverRequireWasmAudit("v3 browser host wasm audit",
+                                        outWasm,
+                                        expectedExports,
+                                        expectedImports,
+                                        40):
         return 1
-    let run: hostops.V3LoggedRun = v3BackendDriverRunNodeSource(rootDir,
-                                                                "v3_browser_host_wasm_run_" + label,
-                                                                runnerSource,
-                                                                [outWasm],
-                                                                os.JoinPath(outDir,
-                                                                            "browser_host_wasm." + label +
-                                                                                ".run.log"))
+    var compilerPath = ""
+    if !v3BackendDriverResolveBrowserHostWasmCompiler(rootDir, args, compilerPath):
+        return 1
+    let hostTarget: str = v3BackendDriverHostTarget()
+    if len(hostTarget) <= 0:
+        v3BackendDriverPrintErr("v3 browser host wasm smoke: unsupported host target")
+        return 1
+    let hostSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/browser_host_native_contract_smoke.cheng")
+    let hostBin: str = os.JoinPath(outDir, "browser_host_native_contract_smoke." + label)
+    let hostCompile = v3BackendDriverCompileExe(rootDir,
+                                                "v3 browser host native compile " + label,
+                                                compilerPath,
+                                                hostSrc,
+                                                hostBin,
+                                                hostTarget,
+                                                os.JoinPath(outDir, "browser_host_native_contract_smoke." + label + ".compile.log"))
+    if v3BackendDriverRunFailed("v3 browser host native compile", hostCompile):
+        return hostCompile.exitCode
+    let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                            "v3 browser host wasm smoke run " + label,
+                                                            hostBin,
+                                                            [],
+                                                            0,
+                                                            os.JoinPath(outDir,
+                                                                        "browser_host_wasm." + label + ".run.log"))
     v3BackendDriverMaybePrintRunOutput(run)
     if v3BackendDriverRunFailed("v3 browser host wasm smoke", run):
         return run.exitCode

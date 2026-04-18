@@ -1023,6 +1023,16 @@ fn cheng_exec_program_close_fd_if_valid(fd: var int32) =
         let _close = libc_close(fd)
         fd = -1
 
+fn cheng_runtime_concat_assign(out: var str, part: str) =
+    let next = driver_c_str_concat_bridge_export(out, part)
+    cheng_str_dispose(out)
+    out = next
+
+fn cheng_runtime_concat_assign_cstring(out: var str, part: ptr) =
+    let text = cheng_str_copy_cstring(part)
+    cheng_runtime_concat_assign(out, text)
+    cheng_str_dispose(text)
+
 fn cheng_exec_program_spawn_pipe_argv(argvRaw: ptr,
                                       workingDir: ptr,
                                       mergeStderr: int32,
@@ -1108,7 +1118,7 @@ fn cheng_exec_program_drain_capture_fd(fd: var int32,
         let chunkText: str = cheng_str_copy_cstring(rawChunk)
         cheng_free_export(rawChunk)
         if cheng_str_len(chunkText) > 0:
-            output = output + chunkText
+            cheng_runtime_concat_assign(output, chunkText)
             timeoutMs = 0
             continue
         if eofFlag != 0:
@@ -2615,16 +2625,17 @@ fn cheng_ffi_handle_decode_generation(handle: uint64): uint32 =
 
 fn cheng_ffi_handle_abort_invalid(op: ptr, handle: uint64, detail: ptr) =
     let handleRaw = cheng_u64_to_string(handle)
-    var line = "[cheng] ffi handle invalid: op="
-    line = line + cheng_str_copy_cstring(op)
-    line = line + " detail="
-    line = line + cheng_str_copy_cstring(detail)
-    line = line + " handle="
-    line = line + cheng_str_copy_cstring(handleRaw)
+    var line = cheng_str_copy_cstring("[cheng] ffi handle invalid: op=")
+    cheng_runtime_concat_assign_cstring(line, op)
+    cheng_runtime_concat_assign_cstring(line, " detail=")
+    cheng_runtime_concat_assign_cstring(line, detail)
+    cheng_runtime_concat_assign_cstring(line, " handle=")
+    cheng_runtime_concat_assign_cstring(line, handleRaw)
     let rawLine = cheng_copy_cstring_from_str(line)
     if rawLine != nil:
         c_puts_runtime(rawLine)
         cheng_free_export(rawLine)
+    cheng_str_dispose(line)
     if handleRaw != nil:
         cheng_free_export(handleRaw)
     native_cheng_v3_dump_backtrace_and_exit_runtime("ffi_handle", 86)
@@ -3253,20 +3264,20 @@ fn cheng_http_load_endpoint_payload_ex(endpoint: str, outErr: var str): str =
         cheng_str_dispose(host)
         cheng_str_dispose(path)
         return cheng_str_empty()
-    var request = ""
-    request = request + "GET "
-    request = request + path
-    request = request + " HTTP/1.0\r\n"
-    request = request + "Host: "
-    request = request + host
-    request = request + "\r\n"
-    request = request + "Connection: close\r\n"
-    request = request + "Accept: application/json\r\n\r\n"
+    var request = cheng_str_copy_cstring("GET ")
+    cheng_runtime_concat_assign(request, path)
+    cheng_runtime_concat_assign_cstring(request, " HTTP/1.0\r\n")
+    cheng_runtime_concat_assign_cstring(request, "Host: ")
+    cheng_runtime_concat_assign(request, host)
+    cheng_runtime_concat_assign_cstring(request, "\r\n")
+    cheng_runtime_concat_assign_cstring(request, "Connection: close\r\n")
+    cheng_runtime_concat_assign_cstring(request, "Accept: application/json\r\n\r\n")
     let sentOk = cheng_send_all(fd, cheng_str_data(request), cheng_str_len(request))
     var response = cheng_str_empty()
     if sentOk:
         response = cheng_http_recv_all(fd)
     cheng_close_if_open(fd)
+    cheng_str_dispose(request)
     cheng_str_dispose(host)
     cheng_str_dispose(path)
     if !sentOk:
@@ -3507,11 +3518,14 @@ fn cheng_tailnet_provider_sync_control(runtime: ChengV3TailnetProviderRuntimePtr
         payload = cheng_tailnet_load_endpoint_payload_cstring(runtime->controlEndpoint)
     if cheng_str_len(payload) <= 0:
         if cheng_str_len(loadErr) > 0:
-            let errText = "tailnet provider: " + loadErr
+            var errText = cheng_str_copy_cstring("tailnet provider: ")
+            cheng_runtime_concat_assign(errText, loadErr)
             cheng_tailnet_provider_set_error(runtime, errText)
+            cheng_str_dispose(errText)
             cheng_str_dispose(loadErr)
             return false
         cheng_tailnet_provider_set_error_cstring(runtime, "tailnet provider: control probe load failed")
+        cheng_str_dispose(loadErr)
         return false
     var providerReady = false
     var proxyReady = false
@@ -3552,11 +3566,14 @@ fn cheng_tailnet_provider_sync_derp(runtime: ChengV3TailnetProviderRuntimePtr): 
         payload = cheng_tailnet_load_endpoint_payload_cstring(runtime->relayEndpoint)
     if cheng_str_len(payload) <= 0:
         if cheng_str_len(loadErr) > 0:
-            let errText = "tailnet provider: " + loadErr
+            var errText = cheng_str_copy_cstring("tailnet provider: ")
+            cheng_runtime_concat_assign(errText, loadErr)
             cheng_tailnet_provider_set_error(runtime, errText)
+            cheng_str_dispose(errText)
             cheng_str_dispose(loadErr)
             return false
         cheng_tailnet_provider_set_error_cstring(runtime, "tailnet provider: derp probe load failed")
+        cheng_str_dispose(loadErr)
         return false
     var derpHealthy = false
     var startupStage = cheng_str_empty()
@@ -3613,14 +3630,19 @@ fn cheng_relay_provider_set_error(runtime: ChengV3RelayProviderRuntimePtr, text:
 fn cheng_relay_provider_probe_payload(runtime: ChengV3RelayProviderRuntimePtr): str =
     if runtime == nil:
         return cheng_str_empty()
-    let healthyText = runtime->healthy != 0 ? "1" : "0"
+    let healthyText = runtime->healthy != 0 ? cheng_str_copy_cstring("1") : cheng_str_copy_cstring("0")
     var errorText = cheng_str_copy_cstring(runtime->lastError)
-    let out = "ok=1\n" +
-              "healthy=" + healthyText + "\n" +
-              "successPermille=1000\n" +
-              "loadPermille=0\n" +
-              "capacityPermille=1000\n" +
-              "error=" + errorText + "\n"
+    var out = cheng_str_copy_cstring("ok=1\n")
+    cheng_runtime_concat_assign_cstring(out, "healthy=")
+    cheng_runtime_concat_assign(out, healthyText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "successPermille=1000\n")
+    cheng_runtime_concat_assign_cstring(out, "loadPermille=0\n")
+    cheng_runtime_concat_assign_cstring(out, "capacityPermille=1000\n")
+    cheng_runtime_concat_assign_cstring(out, "error=")
+    cheng_runtime_concat_assign(out, errorText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_str_dispose(healthyText)
     cheng_str_dispose(errorText)
     return out
 
@@ -3632,9 +3654,9 @@ fn cheng_relay_provider_issue_lease_payload(runtime: ChengV3RelayProviderRuntime
         return cheng_str_empty()
     if runtime->healthy == 0:
         var errorText = cheng_str_copy_cstring(runtime->lastError)
-        var out = "ok=0\nerror="
-        out = out + errorText
-        out = out + "\n"
+        var out = cheng_str_copy_cstring("ok=0\nerror=")
+        cheng_runtime_concat_assign(out, errorText)
+        cheng_runtime_concat_assign_cstring(out, "\n")
         cheng_str_dispose(errorText)
         return out
     if runtime->requiresLease != 0 && cheng_str_len(requesterPeerIdText) <= 0:
@@ -3649,33 +3671,33 @@ fn cheng_relay_provider_issue_lease_payload(runtime: ChengV3RelayProviderRuntime
     if runtime->requiresLease != 0:
         var serviceText = cheng_str_copy_cstring(runtime->serviceKind)
         var scopeText = cheng_str_copy_cstring(runtime->authScope)
-        usernameText = serviceText
-        usernameText = usernameText + ":"
-        usernameText = usernameText + requesterPeerIdText
-        usernameText = usernameText + ":"
-        usernameText = usernameText + nonceHex
-        credentialText = "scope="
-        credentialText = credentialText + scopeText
-        credentialText = credentialText + "|peer="
-        credentialText = credentialText + requesterPeerIdText
-        credentialText = credentialText + "|nonce="
-        credentialText = credentialText + nonceHex
+        usernameText = cheng_str_dup(serviceText)
+        cheng_runtime_concat_assign_cstring(usernameText, ":")
+        cheng_runtime_concat_assign(usernameText, requesterPeerIdText)
+        cheng_runtime_concat_assign_cstring(usernameText, ":")
+        cheng_runtime_concat_assign(usernameText, nonceHex)
+        credentialText = cheng_str_copy_cstring("scope=")
+        cheng_runtime_concat_assign(credentialText, scopeText)
+        cheng_runtime_concat_assign_cstring(credentialText, "|peer=")
+        cheng_runtime_concat_assign(credentialText, requesterPeerIdText)
+        cheng_runtime_concat_assign_cstring(credentialText, "|nonce=")
+        cheng_runtime_concat_assign(credentialText, nonceHex)
         cheng_str_dispose(serviceText)
         cheng_str_dispose(scopeText)
-    var out = "ok=1\n"
-    out = out + "region="
-    out = out + regionText
-    out = out + "\n"
-    out = out + "endpoint="
-    out = out + endpointText
-    out = out + "\n"
-    out = out + "username="
-    out = out + usernameText
-    out = out + "\n"
-    out = out + "credential="
-    out = out + credentialText
-    out = out + "\n"
-    out = out + "error=\n"
+    var out = cheng_str_copy_cstring("ok=1\n")
+    cheng_runtime_concat_assign_cstring(out, "region=")
+    cheng_runtime_concat_assign(out, regionText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "endpoint=")
+    cheng_runtime_concat_assign(out, endpointText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "username=")
+    cheng_runtime_concat_assign(out, usernameText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "credential=")
+    cheng_runtime_concat_assign(out, credentialText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "error=\n")
     cheng_str_dispose(endpointText)
     cheng_str_dispose(regionText)
     cheng_str_dispose(usernameText)
@@ -3690,7 +3712,10 @@ fn cheng_error_with_errno(prefix: ptr): str =
     let prefixText = cheng_str_copy_cstring(prefix)
     if reason == nil || cheng_cstrlen_raw(reason) <= 0:
         return prefixText
-    return prefixText + ": " + cheng_str_copy_cstring(reason)
+    var out = prefixText
+    cheng_runtime_concat_assign_cstring(out, ": ")
+    cheng_runtime_concat_assign_cstring(out, reason)
+    return out
 
 fn cheng_sockaddr_ipv4_make(port: int32, inaddr: int32): ptr =
     let addr = cheng_malloc_export(chengSockaddrInLen)
@@ -4779,29 +4804,45 @@ fn cheng_webrtc_signal_build_message(kind: int32,
     return out
 
 fn cheng_webrtc_browser_offer_sdp(sessionId: ChengFixedBytes32, labelText: str): str =
-    return "v=0\no=- 1 1 IN IP4 127.0.0.1\n" +
-           "s=cheng-v3-browser-webrtc\n" +
-           "t=0 0\n" +
-           "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n" +
-           "a=mid:0\n" +
-           "a=setup:actpass\n" +
-           "a=dcmap:0 label=" + labelText + "\n" +
-           "a=x-session-id:" + cheng_fixed32_hex(sessionId)
+    var out = cheng_str_copy_cstring("v=0\no=- 1 1 IN IP4 127.0.0.1\n")
+    let sessionHex = cheng_fixed32_hex(sessionId)
+    cheng_runtime_concat_assign_cstring(out, "s=cheng-v3-browser-webrtc\n")
+    cheng_runtime_concat_assign_cstring(out, "t=0 0\n")
+    cheng_runtime_concat_assign_cstring(out, "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n")
+    cheng_runtime_concat_assign_cstring(out, "a=mid:0\n")
+    cheng_runtime_concat_assign_cstring(out, "a=setup:actpass\n")
+    cheng_runtime_concat_assign_cstring(out, "a=dcmap:0 label=")
+    cheng_runtime_concat_assign(out, labelText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "a=x-session-id:")
+    cheng_runtime_concat_assign(out, sessionHex)
+    cheng_str_dispose(sessionHex)
+    return out
 
 fn cheng_webrtc_browser_answer_sdp(sessionId: ChengFixedBytes32, labelText: str): str =
-    return "v=0\no=- 2 2 IN IP4 127.0.0.1\n" +
-           "s=cheng-v3-browser-webrtc-answer\n" +
-           "t=0 0\n" +
-           "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n" +
-           "a=mid:0\n" +
-           "a=setup:active\n" +
-           "a=dcmap:0 label=" + labelText + "\n" +
-           "a=x-session-id:" + cheng_fixed32_hex(sessionId)
+    var out = cheng_str_copy_cstring("v=0\no=- 2 2 IN IP4 127.0.0.1\n")
+    let sessionHex = cheng_fixed32_hex(sessionId)
+    cheng_runtime_concat_assign_cstring(out, "s=cheng-v3-browser-webrtc-answer\n")
+    cheng_runtime_concat_assign_cstring(out, "t=0 0\n")
+    cheng_runtime_concat_assign_cstring(out, "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n")
+    cheng_runtime_concat_assign_cstring(out, "a=mid:0\n")
+    cheng_runtime_concat_assign_cstring(out, "a=setup:active\n")
+    cheng_runtime_concat_assign_cstring(out, "a=dcmap:0 label=")
+    cheng_runtime_concat_assign(out, labelText)
+    cheng_runtime_concat_assign_cstring(out, "\n")
+    cheng_runtime_concat_assign_cstring(out, "a=x-session-id:")
+    cheng_runtime_concat_assign(out, sessionHex)
+    cheng_str_dispose(sessionHex)
+    return out
 
 fn cheng_webrtc_browser_candidate_text(relayOnly: bool, side: str): str =
+    var out = cheng_str_empty()
     if relayOnly:
-        return "candidate:1 1 udp 2130706431 127.0.0.1 9 typ relay generation 0 ufrag " + side
-    return "candidate:1 1 udp 2130706431 127.0.0.1 9 typ host generation 0 ufrag " + side
+        out = cheng_str_copy_cstring("candidate:1 1 udp 2130706431 127.0.0.1 9 typ relay generation 0 ufrag ")
+    else:
+        out = cheng_str_copy_cstring("candidate:1 1 udp 2130706431 127.0.0.1 9 typ host generation 0 ufrag ")
+    cheng_runtime_concat_assign(out, side)
+    return out
 
 fn cheng_webrtc_browser_session_runtime_new(sessionId: ChengFixedBytes32,
                                             relayOnly: bool): ChengV3WebrtcBrowserSessionStatePtr =
@@ -6070,8 +6111,9 @@ fn cheng_v3_tcp_serve_request_capture_window_bridge_export(hostText: str, port: 
             continue
         let requestHex = cheng_bytes_hex_str(cheng_str_data(requestText), cheng_str_len(requestText))
         if capturedCount > 0:
-            capturedWire = capturedWire + "\n"
-        capturedWire = capturedWire + requestHex
+            cheng_runtime_concat_assign_cstring(capturedWire, "\n")
+        cheng_runtime_concat_assign(capturedWire, requestHex)
+        cheng_str_dispose(requestHex)
         capturedCount = capturedCount + 1
     if addrLenMem != nil:
         cheng_free_export(addrLenMem)

@@ -1,11 +1,76 @@
 import std/cmdline as cmdline
+import std/os as os
 import std/result
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/project/cheng_node as node
 import cheng/v3/project/cheng_node_identity as identity
+import cheng/v3/project/cheng_node_state as state
+import cheng/v3/project/chain_node as chain
+import cheng/v3/libp2p/core/multiaddr as multiaddr
+import cheng/v3/libp2p/core/types as libtypes
+import cheng/v3/libp2p/transports/tailnet_transport as tsnet
+import cheng/v3/tooling/vpn_proxy_config as vpncfg
 
 fn v3ChengNodeCtlRootSeed(): str =
     return cmdline.readFlagOrDefault("--root", "cheng_node.devroot")
+
+fn v3ChengNodeCtlStatePath(): str =
+    return cmdline.readFlagOrDefault("--state", "artifacts/cheng_node.state")
+
+fn v3ChengNodeCtlOutPath(): str =
+    return cmdline.readFlagOrDefault("--out", v3ChengNodeCtlStatePath())
+
+fn v3ChengNodeCtlWithDelta(): bool =
+    return cmdline.hasFlag("--with-delta")
+
+fn v3ChengNodeCtlRemoteRootSeed(): str =
+    return cmdline.readFlagOrDefault("--remote-root", v3ChengNodeCtlRootSeed())
+
+fn v3ChengNodeCtlRequireTextFlag(flagName: str): Result[str] =
+    let raw = cmdline.readFlagOrDefault(flagName, "")
+    if len(raw) <= 0:
+        return Err[str]("cheng_node ctl: missing " + flagName)
+    return Ok[str](raw)
+
+fn v3ChengNodeCtlRequireInt32Flag(flagName: str): Result[int32] =
+    let rawRes = v3ChengNodeCtlRequireTextFlag(flagName)
+    if IsErr(rawRes):
+        return Err[int32](Error(rawRes))
+    let value = int32(parseInt(Value(rawRes)))
+    if value <= 0:
+        return Err[int32]("cheng_node ctl: invalid positive int32 for " + flagName)
+    return Ok[int32](value)
+
+fn v3ChengNodeCtlRequireInt64Flag(flagName: str): Result[int64] =
+    let rawRes = v3ChengNodeCtlRequireTextFlag(flagName)
+    if IsErr(rawRes):
+        return Err[int64](Error(rawRes))
+    return Ok[int64](int64(parseInt(Value(rawRes))))
+
+fn v3ChengNodeCtlFlagOrDefault(flagName: str,
+                               defaultValue: str): str =
+    return cmdline.readFlagOrDefault(flagName, defaultValue)
+
+fn v3ChengNodeCtlPathIsAbsolute(pathRaw: str): bool =
+    let path = pathRaw
+    if len(path) <= 0:
+        return false
+    if path[0] == '/':
+        return true
+    if len(path) > 1 && path[1] == char(58):
+        return true
+    return false
+
+fn v3ChengNodeCtlAbsolutePath(pathRaw: str): str =
+    let path = pathRaw
+    if len(path) <= 0:
+        return ""
+    if v3ChengNodeCtlPathIsAbsolute(path):
+        return path
+    let cwd = os.GetCurrentDir()
+    if len(cwd) <= 0:
+        return path
+    return os.JoinPath(cwd, path)
 
 fn v3ChengNodeCtlUsageText(): str =
     var out = ""
@@ -14,6 +79,21 @@ fn v3ChengNodeCtlUsageText(): str =
     out = out + "  identity --root:<seed>\n"
     out = out + "  bootstrap --root:<seed>\n"
     out = out + "  required-surface\n"
+    out = out + "  head --root:<seed> --state:<path>\n"
+    out = out + "  announce --root:<seed> --state:<path> --transport:<tcp|quic|webrtc> --host:<text> --port:<int> [--topic:<text>] [--capability:<text>]\n"
+    out = out + "  discover --root:<seed> --state:<path> [--peer:<id>|--topic:<text>|--capability:<text>] [--remote-state:<path>] [--remote-root:<seed>] [--with-delta]\n"
+    out = out + "  stream --root:<seed> --state:<path> --remote-state:<path> [--remote-root:<seed>] --protocol:<identify|sync|store|content|proxy_tcp>\n"
+    out = out + "  query --root:<seed> --state:<path> --group:<name> --kind:<name> --key:<text> [--with-delta]\n"
+    out = out + "  balance --root:<seed> --state:<path> --asset:<id> --account:<id> [--with-delta]\n"
+    out = out + "  did --root:<seed> --state:<path> --subject:<did> [--with-delta]\n"
+    out = out + "  did-operator --root:<seed> --state:<path> --operator:<hex> [--with-delta]\n"
+    out = out + "  mint --root:<seed> --state:<path> --asset:<id> --account:<id> --amount:<int64>\n"
+    out = out + "  transfer --root:<seed> --state:<path> --asset:<id> --from:<id> --to:<id> --amount:<int64>\n"
+    out = out + "  sync-did --root:<seed> --state:<path>\n"
+    out = out + "  vpn-peer --root:<seed> --state:<path> --peer:<id> [--tailnet-ip:<ip>] [--direct:<0|1>] [--relay:<0|1>] [--relay-only:<0|1>] [--derp-region:<text>] [--bound-addr:<multiaddr>]\n"
+    out = out + "  vpn-route --root:<seed> --state:<path> --mode:<overlay|exit> --key:<text> [--addr:<multiaddr>] [--name:<text> --host:<text> --port:<int> --server-name:<text>]\n"
+    out = out + "  vpn-status --root:<seed> --state:<path>\n"
+    out = out + "  import-legacy-chain --root:<seed> --legacy-state:<path> --out:<path>\n"
     return out
 
 fn v3ChengNodeCtlIdentityText(rootSeed: str): Result[str] =
@@ -46,6 +126,354 @@ fn v3ChengNodeCtlRequiredSurfaceText(): Result[str] =
         return Err[str](Error(nodeRes))
     return Ok[str](node.V3ChengNodeRequiredSurfaceText(Value(nodeRes)))
 
+fn v3ChengNodeCtlHeadText(rootSeed: str,
+                          statePath: str): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    var out = ""
+    out = out + "state_path=" + v3ChengNodeCtlAbsolutePath(statePath) + "\n"
+    out = out + node.V3ChengNodeHeadManifestText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlQueryText(rootSeed: str,
+                           statePath: str,
+                           indexGroup: str,
+                           lookupKind: str,
+                           keyText: str,
+                           withDelta: bool): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    return node.V3ChengNodeKeyedQueryText(core,
+                                          indexGroup,
+                                          lookupKind,
+                                          keyText,
+                                          withDelta)
+
+fn v3ChengNodeCtlBalanceText(rootSeed: str,
+                             statePath: str,
+                             assetId: int32,
+                             accountId: int32,
+                             withDelta: bool): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    return node.V3ChengNodeBalanceQueryText(core, assetId, accountId, withDelta)
+
+fn v3ChengNodeCtlMintText(rootSeed: str,
+                          statePath: str,
+                          assetId: int32,
+                          accountId: int32,
+                          amount: int64): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let mintRes = node.V3ChengNodeChainMint(core, assetId, accountId, amount)
+    if IsErr(mintRes):
+        return Err[str](Error(mintRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    let balanceRes = node.V3ChengNodeBalanceQueryText(core, assetId, accountId, false)
+    if IsErr(balanceRes):
+        return Err[str](Error(balanceRes))
+    out = out + Value(balanceRes)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlTransferText(rootSeed: str,
+                              statePath: str,
+                              assetId: int32,
+                              fromAccount: int32,
+                              toAccount: int32,
+                              amount: int64): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let transferRes = node.V3ChengNodeChainTransfer(core,
+                                                    assetId,
+                                                    fromAccount,
+                                                    toAccount,
+                                                    amount)
+    if IsErr(transferRes):
+        return Err[str](Error(transferRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    let fromBalanceRes = node.V3ChengNodeBalanceQueryText(core, assetId, fromAccount, false)
+    if IsErr(fromBalanceRes):
+        return Err[str](Error(fromBalanceRes))
+    let toBalanceRes = node.V3ChengNodeBalanceQueryText(core, assetId, toAccount, false)
+    if IsErr(toBalanceRes):
+        return Err[str](Error(toBalanceRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + "from_result_begin\n"
+    out = out + Value(fromBalanceRes) + "\n"
+    out = out + "from_result_end\n"
+    out = out + "to_result_begin\n"
+    out = out + Value(toBalanceRes) + "\n"
+    out = out + "to_result_end"
+    return Ok[str](out)
+
+fn v3ChengNodeCtlSyncDidText(rootSeed: str,
+                             statePath: str): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let syncRes = node.V3ChengNodeSyncDidIndexes(core)
+    if IsErr(syncRes):
+        return Err[str](Error(syncRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + node.V3ChengNodeBootstrapSummaryText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlImportLegacyChainText(rootSeed: str,
+                                       legacyStatePath: str,
+                                       outPath: str): Result[str] =
+    let nodeRes = node.V3ChengNodeInit(rootSeed)
+    if IsErr(nodeRes):
+        return Err[str](Error(nodeRes))
+    var core = Value(nodeRes)
+    var snapshot: chain.V3ChainNodeServeSnapshot
+    let loadRes = state.V3ChengNodeLoadLegacyChainSnapshotInto(snapshot, legacyStatePath)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let importRes = node.V3ChengNodeImportChainSnapshot(core, snapshot)
+    if IsErr(importRes):
+        return Err[str](Error(importRes))
+    let writeRes = state.V3ChengNodeWriteState(outPath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "legacy_state_path=" + v3ChengNodeCtlAbsolutePath(legacyStatePath) + "\n"
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + node.V3ChengNodeBootstrapSummaryText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlLoadRemoteNode(remoteRootSeed: str,
+                                remoteStatePath: str): Result[node.V3ChengNode] =
+    var remote: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(remote, remoteStatePath, remoteRootSeed)
+    if IsErr(loadRes):
+        return Err[node.V3ChengNode](Error(loadRes))
+    return Ok[node.V3ChengNode](remote)
+
+fn v3ChengNodeCtlAnnounceText(rootSeed: str,
+                              statePath: str): Result[str] =
+    let transportRes = v3ChengNodeCtlRequireTextFlag("--transport")
+    if IsErr(transportRes):
+        return Err[str](Error(transportRes))
+    let hostRes = v3ChengNodeCtlRequireTextFlag("--host")
+    if IsErr(hostRes):
+        return Err[str](Error(hostRes))
+    let portRes = v3ChengNodeCtlRequireInt32Flag("--port")
+    if IsErr(portRes):
+        return Err[str](Error(portRes))
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let announcePeerRes = node.V3ChengNodeAnnouncePeer(core,
+                                                       Value(transportRes),
+                                                       Value(hostRes),
+                                                       Value(portRes))
+    if IsErr(announcePeerRes):
+        return Err[str](Error(announcePeerRes))
+    let topicText = v3ChengNodeCtlFlagOrDefault("--topic", "")
+    if len(topicText) > 0:
+        let announceTopicRes = node.V3ChengNodeAnnounceDiscovery(core,
+                                                                 "topic",
+                                                                 topicText,
+                                                                 Value(transportRes),
+                                                                 Value(hostRes),
+                                                                 Value(portRes),
+                                                                 "public",
+                                                                 "public",
+                                                                 100)
+        if IsErr(announceTopicRes):
+            return Err[str](Error(announceTopicRes))
+    let capabilityText = v3ChengNodeCtlFlagOrDefault("--capability", "")
+    if len(capabilityText) > 0:
+        let announceCapabilityRes = node.V3ChengNodeAnnounceDiscovery(core,
+                                                                      "capability",
+                                                                      capabilityText,
+                                                                      Value(transportRes),
+                                                                      Value(hostRes),
+                                                                      Value(portRes),
+                                                                      "public",
+                                                                      "public",
+                                                                      100)
+        if IsErr(announceCapabilityRes):
+            return Err[str](Error(announceCapabilityRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + "peer_id=" + node.V3ChengNodeLocalPeerIdText(core) + "\n"
+    out = out + node.V3ChengNodeBootstrapSummaryText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlDiscoverKindAndKey(): Result[str[]] =
+    let peerText = v3ChengNodeCtlFlagOrDefault("--peer", "")
+    if len(peerText) > 0:
+        return Ok[str[]](["peer", peerText])
+    let topicText = v3ChengNodeCtlFlagOrDefault("--topic", "")
+    if len(topicText) > 0:
+        return Ok[str[]](["topic", topicText])
+    let capabilityText = v3ChengNodeCtlFlagOrDefault("--capability", "")
+    if len(capabilityText) > 0:
+        return Ok[str[]](["capability", capabilityText])
+    return Err[str[]]("cheng_node ctl: missing --peer or --topic or --capability")
+
+fn v3ChengNodeCtlDiscoverText(rootSeed: str,
+                              statePath: str): Result[str] =
+    let kindKeyRes = v3ChengNodeCtlDiscoverKindAndKey()
+    if IsErr(kindKeyRes):
+        return Err[str](Error(kindKeyRes))
+    let kindKey = Value(kindKeyRes)
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let remoteStatePath = v3ChengNodeCtlFlagOrDefault("--remote-state", "")
+    if len(remoteStatePath) > 0:
+        let remoteRes = v3ChengNodeCtlLoadRemoteNode(v3ChengNodeCtlRemoteRootSeed(), remoteStatePath)
+        if IsErr(remoteRes):
+            return Err[str](Error(remoteRes))
+        var remote = Value(remoteRes)
+        let syncRes = node.V3ChengNodeSyncDiscoveryFromRemote(core, remote, kindKey[0], kindKey[1])
+        if IsErr(syncRes):
+            return Err[str](Error(syncRes))
+        let writeRes = state.V3ChengNodeWriteState(statePath, core)
+        if IsErr(writeRes):
+            return Err[str](Error(writeRes))
+    return node.V3ChengNodeKeyedQueryText(core,
+                                          "discovery",
+                                          kindKey[0],
+                                          kindKey[1],
+                                          v3ChengNodeCtlWithDelta())
+
+fn v3ChengNodeCtlStreamText(rootSeed: str,
+                            statePath: str): Result[str] =
+    let protocolRes = v3ChengNodeCtlRequireTextFlag("--protocol")
+    if IsErr(protocolRes):
+        return Err[str](Error(protocolRes))
+    let remoteStateRes = v3ChengNodeCtlRequireTextFlag("--remote-state")
+    if IsErr(remoteStateRes):
+        return Err[str](Error(remoteStateRes))
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let remoteRes = v3ChengNodeCtlLoadRemoteNode(v3ChengNodeCtlRemoteRootSeed(), Value(remoteStateRes))
+    if IsErr(remoteRes):
+        return Err[str](Error(remoteRes))
+    var remote = Value(remoteRes)
+    return node.V3ChengNodeStreamText(core, remote, Value(protocolRes))
+
+fn v3ChengNodeCtlVpnPeerText(rootSeed: str,
+                             statePath: str): Result[str] =
+    let peerRes = v3ChengNodeCtlRequireTextFlag("--peer")
+    if IsErr(peerRes):
+        return Err[str](Error(peerRes))
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    var session = tsnet.v3Libp2pTailnetPeerSessionZero()
+    session.peerId = Value(peerRes)
+    session.remoteTailnetIp = v3ChengNodeCtlFlagOrDefault("--tailnet-ip", "")
+    session.directReachable = v3ChengNodeCtlFlagOrDefault("--direct", "0") == "1"
+    session.relayAllowed = v3ChengNodeCtlFlagOrDefault("--relay", "0") == "1"
+    session.relayOnly = v3ChengNodeCtlFlagOrDefault("--relay-only", "0") == "1"
+    session.derpRegionCode = v3ChengNodeCtlFlagOrDefault("--derp-region", "")
+    session.signedPreface = v3ChengNodeCtlFlagOrDefault("--signed-preface", "")
+    session.boundAddrText = v3ChengNodeCtlFlagOrDefault("--bound-addr", "")
+    session.lastError = v3ChengNodeCtlFlagOrDefault("--last-error", "")
+    let upsertRes = node.V3ChengNodeVpnUpsertPeer(core, session)
+    if IsErr(upsertRes):
+        return Err[str](Error(upsertRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + node.V3ChengNodeVpnStatusReportText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlVpnRouteText(rootSeed: str,
+                              statePath: str): Result[str] =
+    let modeRes = v3ChengNodeCtlRequireTextFlag("--mode")
+    if IsErr(modeRes):
+        return Err[str](Error(modeRes))
+    let keyRes = v3ChengNodeCtlRequireTextFlag("--key")
+    if IsErr(keyRes):
+        return Err[str](Error(keyRes))
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    if Value(modeRes) == "overlay":
+        let addrTextRes = v3ChengNodeCtlRequireTextFlag("--addr")
+        if IsErr(addrTextRes):
+            return Err[str](Error(addrTextRes))
+        let addrRes = multiaddr.v3Libp2pMultiaddrParse(Value(addrTextRes))
+        if IsErr(addrRes):
+            return Err[str](Error(addrRes))
+        let upsertRes = node.V3ChengNodeVpnUpsertOverlayRoute(core, Value(keyRes), Value(addrRes))
+        if IsErr(upsertRes):
+            return Err[str](Error(upsertRes))
+    else:
+        let nameRes = v3ChengNodeCtlRequireTextFlag("--name")
+        if IsErr(nameRes):
+            return Err[str](Error(nameRes))
+        let hostRes = v3ChengNodeCtlRequireTextFlag("--host")
+        if IsErr(hostRes):
+            return Err[str](Error(hostRes))
+        let portRes = v3ChengNodeCtlRequireInt32Flag("--port")
+        if IsErr(portRes):
+            return Err[str](Error(portRes))
+        let serverNameRes = v3ChengNodeCtlRequireTextFlag("--server-name")
+        if IsErr(serverNameRes):
+            return Err[str](Error(serverNameRes))
+        var cfg: vpncfg.V3VpnProxyExitConfig
+        cfg.name = Value(nameRes)
+        cfg.host = Value(hostRes)
+        cfg.port = Value(portRes)
+        cfg.serverName = Value(serverNameRes)
+        let upsertRes = node.V3ChengNodeVpnUpsertExitRoute(core, Value(keyRes), cfg)
+        if IsErr(upsertRes):
+            return Err[str](Error(upsertRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + node.V3ChengNodeVpnStatusReportText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlVpnStatusText(rootSeed: str,
+                               statePath: str): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadStateInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    return Ok[str](node.V3ChengNodeVpnStatusReportText(core))
+
 fn v3ChengNodeCtlPrintUsageAndReturn(code: int32): int32 =
     echo(v3ChengNodeCtlUsageText())
     return code
@@ -73,6 +501,209 @@ fn V3ChengNodeCtlCommand(): int32 =
         return 0
     if subcmd == "required-surface":
         let textRes = v3ChengNodeCtlRequiredSurfaceText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "head":
+        let textRes = v3ChengNodeCtlHeadText(v3ChengNodeCtlRootSeed(),
+                                             v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "announce":
+        let textRes = v3ChengNodeCtlAnnounceText(v3ChengNodeCtlRootSeed(),
+                                                 v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "discover":
+        let textRes = v3ChengNodeCtlDiscoverText(v3ChengNodeCtlRootSeed(),
+                                                 v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "stream":
+        let textRes = v3ChengNodeCtlStreamText(v3ChengNodeCtlRootSeed(),
+                                               v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "query":
+        let groupRes = v3ChengNodeCtlRequireTextFlag("--group")
+        if IsErr(groupRes):
+            echo(Error(groupRes))
+            return 1
+        let kindRes = v3ChengNodeCtlRequireTextFlag("--kind")
+        if IsErr(kindRes):
+            echo(Error(kindRes))
+            return 1
+        let keyRes = v3ChengNodeCtlRequireTextFlag("--key")
+        if IsErr(keyRes):
+            echo(Error(keyRes))
+            return 1
+        let textRes = v3ChengNodeCtlQueryText(v3ChengNodeCtlRootSeed(),
+                                              v3ChengNodeCtlStatePath(),
+                                              Value(groupRes),
+                                              Value(kindRes),
+                                              Value(keyRes),
+                                              v3ChengNodeCtlWithDelta())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "balance":
+        let assetRes = v3ChengNodeCtlRequireInt32Flag("--asset")
+        if IsErr(assetRes):
+            echo(Error(assetRes))
+            return 1
+        let accountRes = v3ChengNodeCtlRequireInt32Flag("--account")
+        if IsErr(accountRes):
+            echo(Error(accountRes))
+            return 1
+        let textRes = v3ChengNodeCtlBalanceText(v3ChengNodeCtlRootSeed(),
+                                                v3ChengNodeCtlStatePath(),
+                                                Value(assetRes),
+                                                Value(accountRes),
+                                                v3ChengNodeCtlWithDelta())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "did":
+        let subjectRes = v3ChengNodeCtlRequireTextFlag("--subject")
+        if IsErr(subjectRes):
+            echo(Error(subjectRes))
+            return 1
+        let textRes = v3ChengNodeCtlQueryText(v3ChengNodeCtlRootSeed(),
+                                              v3ChengNodeCtlStatePath(),
+                                              "did",
+                                              "subject",
+                                              Value(subjectRes),
+                                              v3ChengNodeCtlWithDelta())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "did-operator":
+        let operatorRes = v3ChengNodeCtlRequireTextFlag("--operator")
+        if IsErr(operatorRes):
+            echo(Error(operatorRes))
+            return 1
+        let textRes = v3ChengNodeCtlQueryText(v3ChengNodeCtlRootSeed(),
+                                              v3ChengNodeCtlStatePath(),
+                                              "did_operator",
+                                              "operator",
+                                              Value(operatorRes),
+                                              v3ChengNodeCtlWithDelta())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "mint":
+        let assetRes = v3ChengNodeCtlRequireInt32Flag("--asset")
+        if IsErr(assetRes):
+            echo(Error(assetRes))
+            return 1
+        let accountRes = v3ChengNodeCtlRequireInt32Flag("--account")
+        if IsErr(accountRes):
+            echo(Error(accountRes))
+            return 1
+        let amountRes = v3ChengNodeCtlRequireInt64Flag("--amount")
+        if IsErr(amountRes):
+            echo(Error(amountRes))
+            return 1
+        let textRes = v3ChengNodeCtlMintText(v3ChengNodeCtlRootSeed(),
+                                             v3ChengNodeCtlStatePath(),
+                                             Value(assetRes),
+                                             Value(accountRes),
+                                             Value(amountRes))
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "transfer":
+        let assetRes = v3ChengNodeCtlRequireInt32Flag("--asset")
+        if IsErr(assetRes):
+            echo(Error(assetRes))
+            return 1
+        let fromRes = v3ChengNodeCtlRequireInt32Flag("--from")
+        if IsErr(fromRes):
+            echo(Error(fromRes))
+            return 1
+        let toRes = v3ChengNodeCtlRequireInt32Flag("--to")
+        if IsErr(toRes):
+            echo(Error(toRes))
+            return 1
+        let amountRes = v3ChengNodeCtlRequireInt64Flag("--amount")
+        if IsErr(amountRes):
+            echo(Error(amountRes))
+            return 1
+        let textRes = v3ChengNodeCtlTransferText(v3ChengNodeCtlRootSeed(),
+                                                 v3ChengNodeCtlStatePath(),
+                                                 Value(assetRes),
+                                                 Value(fromRes),
+                                                 Value(toRes),
+                                                 Value(amountRes))
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "sync-did":
+        let textRes = v3ChengNodeCtlSyncDidText(v3ChengNodeCtlRootSeed(),
+                                                v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "vpn-peer":
+        let textRes = v3ChengNodeCtlVpnPeerText(v3ChengNodeCtlRootSeed(),
+                                                v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "vpn-route":
+        let textRes = v3ChengNodeCtlVpnRouteText(v3ChengNodeCtlRootSeed(),
+                                                 v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "vpn-status":
+        let textRes = v3ChengNodeCtlVpnStatusText(v3ChengNodeCtlRootSeed(),
+                                                  v3ChengNodeCtlStatePath())
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "import-legacy-chain":
+        let legacyPathRes = v3ChengNodeCtlRequireTextFlag("--legacy-state")
+        if IsErr(legacyPathRes):
+            echo(Error(legacyPathRes))
+            return 1
+        let textRes = v3ChengNodeCtlImportLegacyChainText(v3ChengNodeCtlRootSeed(),
+                                                          Value(legacyPathRes),
+                                                          v3ChengNodeCtlOutPath())
         if IsErr(textRes):
             echo(Error(textRes))
             return 1

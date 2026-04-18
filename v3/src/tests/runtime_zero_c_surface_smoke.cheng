@@ -1,7 +1,16 @@
 import std/os
+import std/buffer
+import std/rawbytes
 import std/strings
 import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/host_ops as hostops
+
+fn runtimeZeroCPrefix(prefix: str, value: str): str =
+    var out: buffer.ByteBuffer
+    out.data = rawbytes.emptyBytes()
+    buffer.AppendBytes(out, prefix)
+    buffer.AppendBytes(out, value)
+    return rawbytes.bytesToString(buffer.ToBytes(out))
 
 fn main(): int32 =
     let root = os.GetCurrentDir()
@@ -10,9 +19,10 @@ fn main(): int32 =
     let auditLog = os.JoinPath(outDir, "host_bridge_audit.log")
     let browserLabel = "runtime_zero_script_surface"
     let browserLog = os.JoinPath(outDir, "browser_host_wasm.log")
-    let browserRunnerPath = v3path.V3PathAbsolute(root,
-                                                  "artifacts/v3_browser_host_wasm/browser_host_wasm_runner." +
-                                                      browserLabel + ".js")
+    let browserRunnerBase = runtimeZeroCPrefix("artifacts/v3_browser_host_wasm/browser_host_wasm_runner.",
+                                               browserLabel)
+    let browserRunnerRel = runtimeZeroCPrefix(browserRunnerBase, ".js")
+    let browserRunnerPath = v3path.V3PathAbsolute(root, browserRunnerRel)
     assert(v3path.V3MkdirP(root, outDir), "v3 runtime zero c surface: mkdir")
     if v3path.V3PathFileExists(auditLog):
         os.RemoveFile(auditLog)
@@ -44,16 +54,19 @@ fn main(): int32 =
            "v3 runtime zero c surface: no native source path")
     assert(strings.StrContains(auditText, "legacy_runtime_combined_fallback_present=0"),
            "v3 runtime zero c surface: no combined fallback")
+    assert(strings.StrContains(auditText, "legacy_node_wasm_host_present=0"),
+           "v3 runtime zero c surface: no node wasm host")
     assert(strings.StrContains(auditText, "legacy_browser_host_wasm_runner_present=0"),
            "v3 runtime zero c surface: no browser host wasm repo runner")
+    var browserArgs: str[]
+    browserArgs = []
+    add(browserArgs, "run-browser-host-wasm-smoke")
+    add(browserArgs, runtimeZeroCPrefix("--compiler:", driver))
+    add(browserArgs, runtimeZeroCPrefix("--label:", browserLabel))
     let browserRun = hostops.v3RunFileLogged(root,
                                              "runtime_zero_script_browser_host_wasm",
                                              driver,
-                                             [
-                                                 "run-browser-host-wasm-smoke",
-                                                 "--compiler:" + driver,
-                                                 "--label:" + browserLabel
-                                             ],
+                                             browserArgs,
                                              [],
                                              root,
                                              0,

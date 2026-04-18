@@ -10,7 +10,7 @@ import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/hotpath_scan as hotscan
 import cheng/v3/tooling/bootstrap_contracts as contracts
-import cheng/v3/tooling/browser_host_wasm_runner_source as browserhostwasm
+import cheng/v3/tooling/wasm_binary_audit as wasmaudit
 import cheng/v3/tooling/r2c_react_v3 as r2c
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/backend/build_plan as buildplan
@@ -3292,6 +3292,8 @@ fn v3GateDefaultHostSmokes(): str[] =
         "os_rename_file_smoke",
         "os_remove_dir_smoke",
         "os_walk_dir_smoke",
+        "str_concat_lowering_smoke",
+        "strformat_fmt_lowering_smoke",
         "strformat_fmt_smoke",
         "strformat_fmt_negative_smoke",
         "global_fixed_array_composite_smoke",
@@ -3782,59 +3784,28 @@ fn v3GateVerifyDiLoCo(root: str): int32 =
     v3GatePrintLine("v3 verify-diloco ok")
     return 0
 
-fn v3GateNodeTimeoutSec(): int32 =
-    return int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_NODE_TIMEOUT_SEC", "120")))
-
-fn v3GateRunNodeSource(root: str,
-                       label: str,
-                       sourceText: str,
-                       args: str[],
-                       logRelPath: str): hostops.V3LoggedRun =
-    if len(sourceText) <= 0:
-        let outputText = "missing node source\n"
-        let _logged = v3path.V3WriteTextFile(root, logRelPath, outputText)
-        return hostops.v3LoggedRunZero(label, "node", logRelPath, 1, outputText)
-    var nodeArgs: str[] = ["-"]
-    for i in 0..<args.len:
-        add(nodeArgs, args[i])
-    return hostops.v3RunProgramLoggedWithInputText(root,
-                                                   label,
-                                                   "node",
-                                                   nodeArgs,
-                                                   [],
-                                                   root,
-                                                   v3GateNodeTimeoutSec(),
-                                                   logRelPath,
-                                                   sourceText)
-
-fn v3GateWasmSmokesRunnerSource(): str =
-    return (
-        "const fs = require('fs');\n" +
-        "const outDir = process.argv[2];\n" +
-        "const label = process.argv[3] || 'host';\n" +
-        "async function run(name, imports) {\n" +
-        "  const wasm = fs.readFileSync(outDir + '/' + name + '.' + label + '.wasm');\n" +
-        "  const instanceRes = await WebAssembly.instantiate(wasm, imports);\n" +
-        "  const exp = instanceRes.instance.exports;\n" +
-        "  if (typeof exp.main !== 'function') {\n" +
-        "    throw new Error(name + ' missing export: main');\n" +
-        "  }\n" +
-        "  const rc = exp.main() | 0;\n" +
-        "  if (rc !== 0) {\n" +
-        "    throw new Error(name + ' returned ' + rc);\n" +
-        "  }\n" +
-        "  console.log(name + ': ok');\n" +
-        "}\n" +
-        "(async () => {\n" +
-        "  await run('wasm_zero_smoke', { env: {} });\n" +
-        "  await run('wasm_internal_call_smoke', { env: {} });\n" +
-        "  await run('wasm_importc_noarg_i32_smoke', { env: { cheng_test_zero: () => 0 } });\n" +
-        "  console.log('v3 wasm smokes: ok');\n" +
-        "})().catch((err) => {\n" +
-        "  console.error(err);\n" +
-        "  process.exit(1);\n" +
-        "});\n"
-    )
+fn v3GateRequireWasmAudit(label: str,
+                          wasmPath: str,
+                          expectedExports: str[],
+                          expectedImports: str[],
+                          minExportCount: int32): bool =
+    let infoRes = wasmaudit.v3WasmBinaryInspect(wasmPath)
+    if IsErr(infoRes):
+        v3GatePrintErr(label + ": " + Error(infoRes))
+        return false
+    let info = Value(infoRes)
+    if info.exportNames.len < minExportCount:
+        v3GatePrintErr(label + ": wasm export count too small: " + strings.IntToStr(info.exportNames.len))
+        return false
+    for i in 0..<expectedExports.len:
+        if !wasmaudit.v3WasmBinaryHasExport(info, expectedExports[i]):
+            v3GatePrintErr(label + ": missing wasm export: " + expectedExports[i])
+            return false
+    for i in 0..<expectedImports.len:
+        if !wasmaudit.v3WasmBinaryHasImport(info, expectedImports[i]):
+            v3GatePrintErr(label + ": missing wasm import: " + expectedImports[i])
+            return false
+    return true
 
 fn v3GateRunWasmSmokes(root: str,
                        compilerPath: str,
@@ -3880,16 +3851,58 @@ fn v3GateRunWasmSmokes(root: str,
         if !os.FileExists(outWasm):
             v3GatePrintErr("v3 wasm smokes: missing wasm output: " + outWasm)
             return 1
-    let run = v3GateRunNodeSource(root,
-                                  "v3 wasm smokes run " + label,
-                                  v3GateWasmSmokesRunnerSource(),
-                                  [outDir, label],
-                                  os.JoinPath(outDir, "wasm_smokes." + label + ".run.log"))
-    v3GateMaybePrintRunOutput(run)
-    if v3GateRunFailed(run):
-        return run.exitCode
-    if !v3GateRequireOutput(run, "v3 wasm smokes: ok", "v3 wasm smokes"):
+    var expectedExports: str[] = []
+    add(expectedExports, "main")
+    if !v3GateRequireWasmAudit("v3 wasm audit zero",
+                               os.JoinPath(outDir, "wasm_zero_smoke." + label + ".wasm"),
+                               expectedExports,
+                               [],
+                               1):
         return 1
+    if !v3GateRequireWasmAudit("v3 wasm audit internal",
+                               os.JoinPath(outDir, "wasm_internal_call_smoke." + label + ".wasm"),
+                               expectedExports,
+                               [],
+                               1):
+        return 1
+    if !v3GateRequireWasmAudit("v3 wasm audit importc",
+                               os.JoinPath(outDir, "wasm_importc_noarg_i32_smoke." + label + ".wasm"),
+                               expectedExports,
+                               ["env.cheng_test_zero"],
+                               1):
+        return 1
+    let hostTarget = v3GateHostTarget(root)
+    if len(hostTarget) <= 0:
+        v3GatePrintErr("v3 wasm smokes: unsupported host target")
+        return 1
+    for i in 0..<names.len:
+        let smokeName: str = names[i]
+        var hostSrc: str = v3path.V3PathAbsolute(root, "v3/src/tests/" + smokeName + ".cheng")
+        if smokeName == "wasm_importc_noarg_i32_smoke":
+            hostSrc = v3path.V3PathAbsolute(root, "v3/src/tests/wasm_importc_noarg_i32_native_smoke.cheng")
+        let hostBin = os.JoinPath(outDir, smokeName + "." + label + ".host")
+        let hostCompile = v3GateCompileExeEnv(root,
+                                              "v3 wasm host compile " + smokeName + " " + label,
+                                              compilerPath,
+                                              hostSrc,
+                                              hostBin,
+                                              hostTarget,
+                                              os.JoinPath(outDir, smokeName + "." + label + ".host.compile.log"),
+                                              envOverrides)
+        if v3GateRunFailed(hostCompile):
+            return hostCompile.exitCode
+        let run = hostops.v3RunFileLogged(root,
+                                          "v3 wasm host run " + smokeName + " " + label,
+                                          hostBin,
+                                          [],
+                                          [],
+                                          root,
+                                          0,
+                                          os.JoinPath(outDir, smokeName + "." + label + ".host.run.log"))
+        if v3GateRunFailed(run):
+            return run.exitCode
+        v3GatePrintLine(smokeName + ": ok")
+    v3GatePrintLine("v3 wasm smokes: ok")
     return 0
 
 fn v3GateRunBrowserHostWasmSmoke(root: str,
@@ -3912,15 +3925,67 @@ fn v3GateRunBrowserHostWasmSmoke(root: str,
     if !os.FileExists(outWasm):
         v3GatePrintErr("v3 browser host wasm smoke: missing wasm output: " + outWasm)
         return 1
-    let runnerSource: str = browserhostwasm.v3BrowserHostWasmRunnerSource()
-    if len(runnerSource) <= 0:
-        v3GatePrintErr("v3 browser host wasm smoke: failed to decode helper source")
+    var expectedExports: str[] = []
+    add(expectedExports, "main")
+    add(expectedExports, "browserNowMs")
+    add(expectedExports, "browserEchoI32")
+    add(expectedExports, "browserPeerHandle")
+    add(expectedExports, "browserDistributedVideoBuild")
+    add(expectedExports, "browserDistributedVideoRebuild")
+    add(expectedExports, "browserMoqFountainBuild")
+    add(expectedExports, "browserMoqFountainRebuild")
+    add(expectedExports, "browserMoqBuildLongBlobComputedBundleCidLenProbe")
+    add(expectedExports, "browserMoqPeerCsvCountProbe")
+    var expectedImports: str[] = []
+    add(expectedImports, "env.cheng_v3_browser_now_ms_bridge")
+    add(expectedImports, "env.cheng_v3_browser_echo_i32_bridge")
+    add(expectedImports, "env.cheng_v3_browser_peer_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_did_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_active_count_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_connect_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_wait_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_dm_send_start_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_build_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_rebuild_bridge")
+    add(expectedImports, "env.cheng_v3_browser_distributed_video_last_error_handle_bridge")
+    add(expectedImports, "env.cheng_v3_browser_input_len_bridge")
+    add(expectedImports, "env.cheng_v3_browser_input_copy_bridge")
+    add(expectedImports, "env.cheng_v3_buffer_handle_from_text_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_len_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_byte_bridge")
+    add(expectedImports, "env.cheng_v3_browser_buffer_handle_release_bridge")
+    add(expectedImports, "env.cheng_v3_browser_moq_fountain_last_error_store_bridge")
+    add(expectedImports, "env.cheng_v3_browser_moq_fountain_last_error_handle_bridge")
+    if !v3GateRequireWasmAudit("v3 browser host wasm audit",
+                               outWasm,
+                               expectedExports,
+                               expectedImports,
+                               40):
         return 1
-    let run = v3GateRunNodeSource(root,
-                                  "v3 browser host wasm smoke run " + label,
-                                  runnerSource,
-                                  [outWasm],
-                                  os.JoinPath(outDir, "browser_host_wasm." + label + ".run.log"))
+    let hostTarget = v3GateHostTarget(root)
+    if len(hostTarget) <= 0:
+        v3GatePrintErr("v3 browser host wasm smoke: unsupported host target")
+        return 1
+    let hostSrc = v3path.V3PathAbsolute(root, "v3/src/tests/browser_host_native_contract_smoke.cheng")
+    let hostBin = os.JoinPath(outDir, "browser_host_native_contract_smoke." + label)
+    let hostCompile = v3GateCompileExeEnv(root,
+                                          "v3 browser host native compile " + label,
+                                          compilerPath,
+                                          hostSrc,
+                                          hostBin,
+                                          hostTarget,
+                                          os.JoinPath(outDir, "browser_host_native_contract_smoke." + label + ".compile.log"),
+                                          envOverrides)
+    if v3GateRunFailed(hostCompile):
+        return hostCompile.exitCode
+    let run = hostops.v3RunFileLogged(root,
+                                      "v3 browser host wasm smoke run " + label,
+                                      hostBin,
+                                      [],
+                                      [],
+                                      root,
+                                      0,
+                                      os.JoinPath(outDir, "browser_host_wasm." + label + ".run.log"))
     v3GateMaybePrintRunOutput(run)
     if v3GateRunFailed(run):
         return run.exitCode

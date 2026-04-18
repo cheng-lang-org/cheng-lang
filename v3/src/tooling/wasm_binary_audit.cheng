@@ -1,0 +1,207 @@
+import std/result
+import std/rawbytes
+import std/os
+import std/strings
+import std/strutils as strutil
+import std/varint
+
+type
+    V3WasmNameNext =
+        value: str
+        next: int32
+
+    V3WasmBinaryInfo =
+        importNames: str[]
+        exportNames: str[]
+
+fn v3WasmReadFileBytes(path: str): Result[Bytes] =
+    let file = os.OpenRead(path)
+    if file == nil:
+        return Err[Bytes]("wasm: open failed")
+    var cap: int32 = 4096
+    var lenRead: int32 = 0
+    var buf: Bytes = bytesAlloc(cap)
+    if bytesLen(buf) < cap:
+        os.Close(file)
+        return Err[Bytes]("wasm: alloc failed")
+    while true:
+        let ch: int32 = os.C_fgetc(file)
+        if ch < 0:
+            break
+        if lenRead >= cap:
+            let nextCap: int32 = cap * 2
+            var nextBuf: Bytes = bytesAlloc(nextCap)
+            if bytesLen(nextBuf) < nextCap:
+                os.Close(file)
+                return Err[Bytes]("wasm: realloc failed")
+            for i in 0..<lenRead:
+                bytesSet(nextBuf, i, bytesGet(buf, i))
+            buf = nextBuf
+            cap = nextCap
+        bytesSet(buf, lenRead, ch)
+        lenRead = lenRead + 1
+    os.Close(file)
+    if lenRead <= 0:
+        return Ok[Bytes](emptyBytes())
+    buf.len = lenRead
+    return Ok[Bytes](buf)
+
+fn v3WasmReadName(data: Bytes, offset: int32): Result[V3WasmNameNext] =
+    let lenRes = varint.decodeUVarint(data, offset)
+    if IsErr(lenRes):
+        return Err[V3WasmNameNext](Error(lenRes))
+    let decoded = Value(lenRes)
+    if decoded.value < 0 || decoded.value > int64(2147483647):
+        return Err[V3WasmNameNext]("wasm: name too large")
+    let textLen = int32(decoded.value)
+    if decoded.next < 0 || decoded.next + textLen > bytesLen(data):
+        return Err[V3WasmNameNext]("wasm: name truncated")
+    let textBytes = bytesSliceView(data, decoded.next, textLen)
+    return Ok[V3WasmNameNext](V3WasmNameNext(value: bytesToString(textBytes), next: decoded.next + textLen))
+
+fn v3WasmSkipLimits(data: Bytes, offset: int32): Result[int32] =
+    if offset < 0 || offset >= bytesLen(data):
+        return Err[int32]("wasm: limits truncated")
+    let kind = bytesGet(data, offset)
+    let minRes = varint.decodeUVarint(data, offset + 1)
+    if IsErr(minRes):
+        return Err[int32](Error(minRes))
+    let minDec = Value(minRes)
+    if kind == 0:
+        return Ok[int32](minDec.next)
+    if kind == 1:
+        let maxRes = varint.decodeUVarint(data, minDec.next)
+        if IsErr(maxRes):
+            return Err[int32](Error(maxRes))
+        return Ok[int32](Value(maxRes).next)
+    return Err[int32]("wasm: unsupported limits kind")
+
+fn v3WasmSkipImportDesc(data: Bytes, offset: int32, kind: int32): Result[int32] =
+    if kind == 0:
+        let typeRes = varint.decodeUVarint(data, offset)
+        if IsErr(typeRes):
+            return Err[int32](Error(typeRes))
+        return Ok[int32](Value(typeRes).next)
+    if kind == 1:
+        if offset >= bytesLen(data):
+            return Err[int32]("wasm: table desc truncated")
+        return v3WasmSkipLimits(data, offset + 1)
+    if kind == 2:
+        return v3WasmSkipLimits(data, offset)
+    if kind == 3:
+        if offset + 2 > bytesLen(data):
+            return Err[int32]("wasm: global desc truncated")
+        return Ok[int32](offset + 2)
+    return Err[int32]("wasm: unsupported import kind")
+
+fn v3WasmBinaryInspect(path: str): Result[V3WasmBinaryInfo] =
+    let readRes = v3WasmReadFileBytes(path)
+    if IsErr(readRes):
+        return Err[V3WasmBinaryInfo](Error(readRes))
+    let data = Value(readRes)
+    if bytesLen(data) < 8:
+        return Err[V3WasmBinaryInfo]("wasm: file too small")
+    if bytesGet(data, 0) != 0 ||
+       bytesGet(data, 1) != int32('a') ||
+       bytesGet(data, 2) != int32('s') ||
+       bytesGet(data, 3) != int32('m'):
+        return Err[V3WasmBinaryInfo]("wasm: bad magic")
+    if bytesGet(data, 4) != 1 ||
+       bytesGet(data, 5) != 0 ||
+       bytesGet(data, 6) != 0 ||
+       bytesGet(data, 7) != 0:
+        return Err[V3WasmBinaryInfo]("wasm: bad version")
+    var out = V3WasmBinaryInfo(importNames: [], exportNames: [])
+    var offset: int32 = 8
+    while offset < bytesLen(data):
+        let sectionId = bytesGet(data, offset)
+        let sizeRes = varint.decodeUVarint(data, offset + 1)
+        if IsErr(sizeRes):
+            return Err[V3WasmBinaryInfo](Error(sizeRes))
+        let sizeDec = Value(sizeRes)
+        if sizeDec.value < 0 || sizeDec.value > int64(2147483647):
+            return Err[V3WasmBinaryInfo]("wasm: section too large")
+        let sectionSize = int32(sizeDec.value)
+        let payloadStart = sizeDec.next
+        let payloadEnd = payloadStart + sectionSize
+        if payloadStart < 0 || payloadEnd < payloadStart || payloadEnd > bytesLen(data):
+            return Err[V3WasmBinaryInfo]("wasm: section truncated")
+        if sectionId == 2:
+            let sectionBytes = bytesSliceView(data, payloadStart, sectionSize)
+            let countRes = varint.decodeUVarint(sectionBytes, 0)
+            if IsErr(countRes):
+                return Err[V3WasmBinaryInfo](Error(countRes))
+            let countDec = Value(countRes)
+            var cursor = countDec.next
+            var i: int64 = 0
+            while i < countDec.value:
+                let modRes = v3WasmReadName(sectionBytes, cursor)
+                if IsErr(modRes):
+                    return Err[V3WasmBinaryInfo](Error(modRes))
+                let modDec = Value(modRes)
+                let fieldRes = v3WasmReadName(sectionBytes, modDec.next)
+                if IsErr(fieldRes):
+                    return Err[V3WasmBinaryInfo](Error(fieldRes))
+                let fieldDec = Value(fieldRes)
+                if fieldDec.next >= bytesLen(sectionBytes):
+                    return Err[V3WasmBinaryInfo]("wasm: import desc truncated")
+                let kind = bytesGet(sectionBytes, fieldDec.next)
+                let descRes = v3WasmSkipImportDesc(sectionBytes, fieldDec.next + 1, kind)
+                if IsErr(descRes):
+                    return Err[V3WasmBinaryInfo](Error(descRes))
+                add(out.importNames, modDec.value + "." + fieldDec.value)
+                cursor = Value(descRes)
+                i = i + 1
+            if cursor != bytesLen(sectionBytes):
+                return Err[V3WasmBinaryInfo]("wasm: import section trailing bytes")
+        elif sectionId == 7:
+            let sectionBytes = bytesSliceView(data, payloadStart, sectionSize)
+            let countRes = varint.decodeUVarint(sectionBytes, 0)
+            if IsErr(countRes):
+                return Err[V3WasmBinaryInfo](Error(countRes))
+            let countDec = Value(countRes)
+            var cursor = countDec.next
+            var i: int64 = 0
+            while i < countDec.value:
+                let nameRes = v3WasmReadName(sectionBytes, cursor)
+                if IsErr(nameRes):
+                    return Err[V3WasmBinaryInfo](Error(nameRes))
+                let nameDec = Value(nameRes)
+                if nameDec.next >= bytesLen(sectionBytes):
+                    return Err[V3WasmBinaryInfo]("wasm: export desc truncated")
+                let indexRes = varint.decodeUVarint(sectionBytes, nameDec.next + 1)
+                if IsErr(indexRes):
+                    return Err[V3WasmBinaryInfo](Error(indexRes))
+                add(out.exportNames, nameDec.value)
+                cursor = Value(indexRes).next
+                i = i + 1
+            if cursor != bytesLen(sectionBytes):
+                return Err[V3WasmBinaryInfo]("wasm: export section trailing bytes")
+        offset = payloadEnd
+    return Ok[V3WasmBinaryInfo](out)
+
+fn v3WasmBinaryHasImport(info: V3WasmBinaryInfo, name: str): bool =
+    for i in 0..<info.importNames.len:
+        if info.importNames[i] == name:
+            return true
+    return false
+
+fn v3WasmBinaryHasExport(info: V3WasmBinaryInfo, name: str): bool =
+    for i in 0..<info.exportNames.len:
+        if info.exportNames[i] == name:
+            return true
+    return false
+
+fn v3WasmBinarySummary(info: V3WasmBinaryInfo): str =
+    var out = ""
+    out = out + "wasm_import_count=" + strings.IntToStr(info.importNames.len) + "\n"
+    out = out + "wasm_export_count=" + strings.IntToStr(info.exportNames.len) + "\n"
+    if info.importNames.len > 0:
+        out = out + "wasm_imports=" + strutil.Join(info.importNames, ",") + "\n"
+    else:
+        out = out + "wasm_imports=\n"
+    if info.exportNames.len > 0:
+        out = out + "wasm_exports=" + strutil.Join(info.exportNames, ",") + "\n"
+    else:
+        out = out + "wasm_exports=\n"
+    return strutil.Strip(out)
