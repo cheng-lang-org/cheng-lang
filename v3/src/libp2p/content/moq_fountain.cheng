@@ -6,6 +6,11 @@ import std/strutils
 import cheng/v3/std/bytes_layout as layout
 
 importc fn cheng_v3_sha256_hex_bridge(text: str): str
+@importc("cheng_mobile_host_emit_log")
+fn cheng_mobile_host_emit_log(message: str)
+
+fn v3Libp2pMoqEmitLog(message: str) =
+    cheng_mobile_host_emit_log(message)
 
 type V3Libp2pMoqDroplet = object
     objectIndex: int32
@@ -719,8 +724,11 @@ fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
                           sourceBlockBytes: int32,
                           repairDropletCount: int32): Result[V3Libp2pMoqObject] =
     let objectByteLen = bytesLen(objectBytes)
+    v3Libp2pMoqEmitLog("moq_build_object:start")
     let objectCid = v3Libp2pMoqSha256HexBytes(objectBytes)
+    v3Libp2pMoqEmitLog("moq_build_object:object_cid")
     let sourceBlockCount = (objectByteLen + sourceBlockBytes - 1) / sourceBlockBytes
+    v3Libp2pMoqEmitLog("moq_build_object:source_block_count")
     var blocks: Bytes[]
     blocks = []
     var blockIndex: int32 = 0
@@ -730,6 +738,7 @@ fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
         let blockBytes = bytesSlice(objectBytes, blockOffset, blockLen)
         add(blocks, v3Libp2pMoqPadBlock(blockBytes, sourceBlockBytes))
         blockIndex = blockIndex + 1
+    v3Libp2pMoqEmitLog("moq_build_object:blocks_ready")
     var objectDroplets: V3Libp2pMoqDroplet[]
     objectDroplets = []
     var sourceDropletIndex: int32 = 0
@@ -760,6 +769,7 @@ fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
         )
         add(objectDroplets, droplet)
         sourceDropletIndex = sourceDropletIndex + 1
+    v3Libp2pMoqEmitLog("moq_build_object:source_droplets_ready")
     var repairIndex: int32 = 0
     while repairIndex < repairDropletCount:
         var degreeBase: int32 = 1
@@ -806,6 +816,7 @@ fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
         )
         add(objectDroplets, droplet)
         repairIndex = repairIndex + 1
+    v3Libp2pMoqEmitLog("moq_build_object:repair_ready")
     let objectOut = V3Libp2pMoqObject(
         objectIndex: objectIndex,
         groupId: bundleCid,
@@ -819,6 +830,7 @@ fn v3Libp2pMoqBuildObject(objectBytes: Bytes,
         repairDropletCount: repairDropletCount,
         droplets: objectDroplets
     )
+    v3Libp2pMoqEmitLog("moq_build_object:done")
     return Ok[V3Libp2pMoqObject](objectOut)
 
 fn v3Libp2pMoqBuildResultFillFromParts(out: var V3Libp2pMoqBuildResult,
@@ -832,6 +844,7 @@ fn v3Libp2pMoqBuildResultFillFromParts(out: var V3Libp2pMoqBuildResult,
                                        remoteAckPeerIds: str[],
                                        objects: V3Libp2pMoqObject[],
                                        droplets: V3Libp2pMoqDroplet[]) =
+    v3Libp2pMoqEmitLog("moq_build_fill:start")
     let catalogPayload = v3Libp2pMoqCatalogBytes(ownerPeerId,
                                                  mimeType,
                                                  blobCid,
@@ -840,6 +853,7 @@ fn v3Libp2pMoqBuildResultFillFromParts(out: var V3Libp2pMoqBuildResult,
                                                  objectTargetBytes,
                                                  sourceBlockBytes,
                                                  objects)
+    v3Libp2pMoqEmitLog("moq_build_fill:catalog_ready")
     var rebuildRows: str[]
     rebuildRows = []
     let blobByteLenText = strings.IntToStr(blobByteLen)
@@ -915,6 +929,7 @@ fn v3Libp2pMoqBuildResultFillFromParts(out: var V3Libp2pMoqBuildResult,
         add(rebuildRows, dropletBlockIndexesLine)
         rebuildDropletRow = rebuildDropletRow + 1
     let rebuildTemplatePayload = bytesFromString(v3Libp2pMoqLinesWithNewline(rebuildRows))
+    v3Libp2pMoqEmitLog("moq_build_fill:rebuild_template_ready")
     out.ownerPeerId = ownerPeerId
     out.mimeType = mimeType
     out.bundleCid = bundleCid
@@ -934,6 +949,7 @@ fn v3Libp2pMoqBuildResultFillFromParts(out: var V3Libp2pMoqBuildResult,
     out.remoteAckPeerIds = remoteAckPeerIds
     out.objects = objects
     out.droplets = droplets
+    v3Libp2pMoqEmitLog("moq_build_fill:done")
 
 fn v3Libp2pMoqBuild(blobBytes: Bytes,
                     ownerPeerId: str,
@@ -942,16 +958,22 @@ fn v3Libp2pMoqBuild(blobBytes: Bytes,
                     objectTargetBytes0: int32,
                     sourceBlockBytes0: int32,
                     repairDropletCount0: int32): Result[V3Libp2pMoqBuildResult] =
+    v3Libp2pMoqEmitLog("moq_build:enter")
     if bytesLen(blobBytes) <= 0:
         return Err[V3Libp2pMoqBuildResult]("moq_fountain_empty_blob")
     let peers = v3Libp2pMoqNormalizePeerCsv(remotePeersCsv)
+    v3Libp2pMoqEmitLog("moq_build:peers_ready")
     if peers.len <= 0:
         return Err[V3Libp2pMoqBuildResult]("video_publish_insufficient_storage_peers")
     let objectTargetBytes = v3Libp2pMoqNormalizePositiveInt(objectTargetBytes0, 512 * 1024)
     let sourceBlockBytes = v3Libp2pMoqNormalizePositiveInt(sourceBlockBytes0, 128 * 1024)
     let repairDropletCount = v3Libp2pMoqNormalizePositiveInt(repairDropletCount0, 2)
     let mimeType = if len(mimeType0) > 0: mimeType0 else: "video/mp4"
+    v3Libp2pMoqEmitLog("moq_build:params_ready")
+    v3Libp2pMoqEmitLog("moq_build:blob_cid_begin")
     let blobCid = v3Libp2pMoqSha256HexBytes(blobBytes)
+    v3Libp2pMoqEmitLog("moq_build:blob_cid_done")
+    v3Libp2pMoqEmitLog("moq_build:bundle_seed_begin")
     let bundleSeed = v3Libp2pMoqBuildBundleSeed(ownerPeerId,
                                                 blobCid,
                                                 mimeType,
@@ -959,15 +981,20 @@ fn v3Libp2pMoqBuild(blobBytes: Bytes,
                                                 objectTargetBytes,
                                                 sourceBlockBytes,
                                                 repairDropletCount)
+    v3Libp2pMoqEmitLog("moq_build:bundle_seed_done")
+    v3Libp2pMoqEmitLog("moq_build:bundle_cid_begin")
     let bundleCid = v3Libp2pMoqSha256HexText(bundleSeed)
+    v3Libp2pMoqEmitLog("moq_build:bundle_cid_done")
     var objects: V3Libp2pMoqObject[]
     objects = []
     var allDroplets: V3Libp2pMoqDroplet[]
     allDroplets = []
     var byteOffset: int32 = 0
     var objectIndex: int32 = 0
+    v3Libp2pMoqEmitLog("moq_build:object_loop_begin")
     while byteOffset < bytesLen(blobBytes):
         let objectByteLen = v3Libp2pMoqMinInt32(objectTargetBytes, bytesLen(blobBytes) - byteOffset)
+        v3Libp2pMoqEmitLog("moq_build:object_begin")
         let objectBytes = bytesSlice(blobBytes, byteOffset, objectByteLen)
         let objectRes = v3Libp2pMoqBuildObject(objectBytes,
                                                objectIndex,
@@ -977,13 +1004,16 @@ fn v3Libp2pMoqBuild(blobBytes: Bytes,
                                                sourceBlockBytes,
                                                repairDropletCount)
         if IsErr(objectRes):
+            v3Libp2pMoqEmitLog("moq_build:object_error")
             return Err[V3Libp2pMoqBuildResult](Error(objectRes))
         let objectOut = Value(objectRes)
         add(objects, objectOut)
         v3Libp2pMoqAppendDroplets(allDroplets, objectOut.droplets)
+        v3Libp2pMoqEmitLog("moq_build:object_done")
         byteOffset = byteOffset + objectByteLen
         objectIndex = objectIndex + 1
     var out: V3Libp2pMoqBuildResult
+    v3Libp2pMoqEmitLog("moq_build:fill_begin")
     v3Libp2pMoqBuildResultFillFromParts(out,
                                         ownerPeerId,
                                         mimeType,
@@ -995,6 +1025,7 @@ fn v3Libp2pMoqBuild(blobBytes: Bytes,
                                         peers,
                                         objects,
                                         allDroplets)
+    v3Libp2pMoqEmitLog("moq_build:fill_done")
     return Ok[V3Libp2pMoqBuildResult](out)
 
 fn v3Libp2pMoqAppendWireLine(out: var str, line: str) =

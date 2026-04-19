@@ -13,6 +13,10 @@ import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/wasm_binary_audit as wasmaudit
 import cheng/v3/backend/build_plan as buildplan
 import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/oracle_types as oracle_types
+import cheng/v3/project/oracle_bft_state_machine as oracle_bft
+import cheng/v3/project/oracle_fixture as oracle_fixture
 
 @importc("get_stdout")
 fn v3BackendDriverStdoutBridge(): os.File
@@ -1234,18 +1238,18 @@ fn v3BackendDriverResolveHostSmokeCompiler(rootDir: str,
     return v3BackendDriverResolveToolCompiler(rootDir, "run-host-smokes", outCompiler)
 
 fn v3BackendDriverWriteProcessSnapshot(rootDir: str,
-                                       proc: hostops.V3SpawnedProcess,
+                                       spawned: hostops.V3SpawnedProcess,
                                        logPath: str,
                                        exitCode: int32): hostops.V3LoggedRun =
     let logParts: os.SplitFileResult = os.SplitFile(logPath)
     if len(logParts.dir) > 0:
         let _made: bool = v3path.V3MkdirP(rootDir, logParts.dir)
-    let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, proc.output)
-    return hostops.V3LoggedRun(label: proc.label,
-                               filePath: proc.filePath,
+    let _logged: bool = v3path.V3WriteTextFile(rootDir, logPath, spawned.output)
+    return hostops.V3LoggedRun(label: spawned.label,
+                               filePath: spawned.filePath,
                                logPath: logPath,
                                exitCode: exitCode,
-                               output: proc.output)
+                               output: spawned.output)
 
 fn v3BackendDriverRequireFileContains(path: str,
                                       needle: str,
@@ -1350,9 +1354,18 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "vpn_proxy_config_smoke")
     add(out, "vpn_proxy_json_smoke")
     add(out, "vpn_proxy_listen_smoke")
-    add(out, "vpn_proxy_protocol_smoke")
+    add(out, "vpn_proxy_main_hysteria2_smoke")
+    add(out, "vpn_proxy_hysteria2_session_smoke")
+    add(out, "vpn_proxy_hysteria2_tcp_stream_smoke")
+    add(out, "vpn_proxy_tcp_control_bytes_smoke")
+    add(out, "vpn_proxy_end_to_end_smoke")
+    add(out, "vpn_proxy_udp_end_to_end_smoke")
     add(out, "vpn_proxy_routing_smoke")
     add(out, "vpn_proxy_socks_smoke")
+    add(out, "quic_stream_fin_smoke")
+    add(out, "qpack_min_smoke")
+    add(out, "http3_frame_smoke")
+    add(out, "hysteria2_protocol_smoke")
     add(out, "os_dir_exists_smoke")
     add(out, "os_file_exists_smoke")
     add(out, "os_file_size_smoke")
@@ -1373,7 +1386,15 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "lowering_plan_smoke")
     add(out, "browser_content_codec_rule_schema_smoke")
     add(out, "browser_content_codec_codegen_smoke")
+    add(out, "browser_host_probe_rule_schema_smoke")
+    add(out, "browser_host_probe_codegen_smoke")
+    add(out, "browser_host_probe_abi_rule_smoke")
+    add(out, "browser_host_probe_bridge_plan_report_smoke")
     add(out, "browser_abi_rule_smoke")
+    add(out, "browser_bridge_object_plan_smoke")
+    add(out, "browser_bridge_artifact_write_smoke")
+    add(out, "browser_bridge_compiler_object_surface_smoke")
+    add(out, "browser_bridge_link_input_surface_smoke")
     add(out, "compiler_equivalence_smoke")
     add(out, "compiler_publish_smoke")
     add(out, "bft_three_replica_smoke")
@@ -1419,6 +1440,8 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "quic_transport_sequential_accept_smoke")
     add(out, "libp2p_quic_tls_smoke")
     add(out, "quic_feature_matrix_smoke")
+    add(out, "quic_multistream_smoke")
+    add(out, "quic_multistream_smoke")
     add(out, "quic_close_order_smoke")
     add(out, "bft_daemon_quic_close_order_smoke")
     add(out, "libp2p_tailnet_policy_smoke")
@@ -1429,6 +1452,7 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "libp2p_scheduler_smoke")
     add(out, "libp2p_quic_tls_smoke")
     add(out, "quic_feature_matrix_smoke")
+    add(out, "quic_multistream_smoke")
     add(out, "quic_close_order_smoke")
     add(out, "bft_daemon_quic_close_order_smoke")
     add(out, "tailnet_control_core_smoke")
@@ -3474,6 +3498,1320 @@ fn v3BackendDriverVerifyChainNodeResilience(rootDir: str,
                                                          "host_resilience_gate",
                                                          "verify-chain-node-resilience: ok")
 
+fn v3BackendDriverOracleAssetIdFromText(text: str): int32 =
+    if text == "BTC" || text == "btc":
+        return oracle_types.v3OracleAssetBtc
+    if text == "ETH" || text == "eth":
+        return oracle_types.v3OracleAssetEth
+    if text == "SOL" || text == "sol":
+        return oracle_types.v3OracleAssetSol
+    if text == "BNB" || text == "bnb":
+        return oracle_types.v3OracleAssetBnb
+    if text == "XAU" || text == "xau":
+        return oracle_types.v3OracleAssetXau
+    if text == "XAG" || text == "xag":
+        return oracle_types.v3OracleAssetXag
+    if text == "XPT" || text == "xpt":
+        return oracle_types.v3OracleAssetXpt
+    if text == "XPD" || text == "xpd":
+        return oracle_types.v3OracleAssetXpd
+    return 0
+
+fn v3BackendDriverOracleQuoteIdFromText(text: str): int32 =
+    if text == "USD" || text == "usd":
+        return oracle_types.v3OracleQuoteUsd
+    if text == "CNY" || text == "cny":
+        return oracle_types.v3OracleQuoteCny
+    if text == "EUR" || text == "eur":
+        return oracle_types.v3OracleQuoteEur
+    if text == "HKD" || text == "hkd":
+        return oracle_types.v3OracleQuoteHkd
+    return 0
+
+fn v3BackendDriverOraclePairName(assetId: int32,
+                                 quoteId: int32): str =
+    var asset = ""
+    if assetId == oracle_types.v3OracleAssetBtc:
+        asset = "BTC"
+    elif assetId == oracle_types.v3OracleAssetEth:
+        asset = "ETH"
+    elif assetId == oracle_types.v3OracleAssetSol:
+        asset = "SOL"
+    elif assetId == oracle_types.v3OracleAssetBnb:
+        asset = "BNB"
+    elif assetId == oracle_types.v3OracleAssetXau:
+        asset = "XAU"
+    elif assetId == oracle_types.v3OracleAssetXag:
+        asset = "XAG"
+    elif assetId == oracle_types.v3OracleAssetXpt:
+        asset = "XPT"
+    elif assetId == oracle_types.v3OracleAssetXpd:
+        asset = "XPD"
+    var quote = ""
+    if quoteId == oracle_types.v3OracleQuoteUsd:
+        quote = "USD"
+    elif quoteId == oracle_types.v3OracleQuoteCny:
+        quote = "CNY"
+    elif quoteId == oracle_types.v3OracleQuoteEur:
+        quote = "EUR"
+    elif quoteId == oracle_types.v3OracleQuoteHkd:
+        quote = "HKD"
+    return asset + "/" + quote
+
+fn v3BackendDriverOracleResolvePair(args: str[],
+                                    outPairId: var int32,
+                                    outPairName: var str): bool =
+    let pairTextRaw: str = strutil.Strip(v3BackendDriverReadFlag(args, "--pair", "BTC/USD"))
+    var slashPos: int32 = -1
+    var i: int32 = 0
+    while i < len(pairTextRaw):
+        if pairTextRaw[i] == '/':
+            slashPos = i
+            break
+        i = i + 1
+    if slashPos <= 0 || slashPos >= len(pairTextRaw) - 1:
+        v3BackendDriverPrintErr("v3 oracle: invalid pair, expected ASSET/QUOTE")
+        return false
+    let assetText: str = strings.SliceBytes(pairTextRaw, 0, slashPos)
+    let quoteText: str = strings.SliceBytes(pairTextRaw, slashPos + 1, len(pairTextRaw) - slashPos - 1)
+    let assetId = v3BackendDriverOracleAssetIdFromText(assetText)
+    let quoteId = v3BackendDriverOracleQuoteIdFromText(quoteText)
+    if assetId <= 0 || quoteId <= 0:
+        v3BackendDriverPrintErr("v3 oracle: unsupported pair " + pairTextRaw)
+        return false
+    let pairRes = oracle_types.v3OraclePairIdFromAssetQuote(assetId, quoteId)
+    if IsErr(pairRes):
+        v3BackendDriverPrintErr("v3 oracle: pair resolve failed " + pairTextRaw)
+        return false
+    outPairId = Value(pairRes)
+    outPairName = v3BackendDriverOraclePairName(assetId, quoteId)
+    return true
+
+fn v3BackendDriverOracleReadWindowRounds(args: str[],
+                                         defaultValue: int32): int32 =
+    let textRaw: str = strutil.Strip(v3BackendDriverReadFlag(args, "--window-rounds", intToStr(defaultValue)))
+    if !v3BackendDriverIsDigits(textRaw):
+        return -1
+    return int32(strutil.ParseInt(textRaw))
+
+fn v3BackendDriverOracleReadNowRound(args: str[],
+                                     key: str,
+                                     defaultValue: int64): int64 =
+    let textRaw: str = strutil.Strip(v3BackendDriverReadFlag(args, key, int64ToStr(defaultValue)))
+    if !v3BackendDriverIsDigits(textRaw):
+        return int64(-1)
+    return int64(strutil.ParseInt(textRaw))
+
+fn v3BackendDriverOracleAppendReportLine(report: var str,
+                                         key: str,
+                                         value: str) =
+    report = report + key + "=" + value + "\n"
+
+fn v3BackendDriverOracleAppendBatch(batch: var oracle_bft.V3OracleBftTxBatch,
+                                    roundId: int64,
+                                    reporterStart: int32,
+                                    reporterEnd: int32) =
+    var reporter = reporterStart
+    while reporter <= reporterEnd:
+        oracle_bft.v3OracleBftTxBatchAdd(batch, oracle_fixture.oracleSmokeBatch(roundId, reporter))
+        reporter = reporter + 1
+
+fn v3BackendDriverOracleFinalize(machine: var oracle_bft.V3OracleBftStateMachine,
+                                 height: int64,
+                                 roundId: int64,
+                                 reporterStart: int32,
+                                 reporterEnd: int32,
+                                 timeHint: int64,
+                                 out: var oracle_bft.V3OracleBftBlockSummary) =
+    var batch = oracle_bft.v3OracleBftTxBatchZero()
+    v3BackendDriverOracleAppendBatch(batch, roundId, reporterStart, reporterEnd)
+    let context = oracle_bft.v3OracleBftBlockContextMake(height,
+                                                         0,
+                                                         timeHint,
+                                                         layout.fixedBytes32Zero())
+    oracle_bft.v3OracleBftStateMachineFinalizeBatchSummaryWithContext(machine, context, batch, out)
+
+fn v3BackendDriverOracleBuildFixtureMachineWithAppId(outMachine: var oracle_bft.V3OracleBftStateMachine,
+                                                     appId: str) =
+    let committee = oracle_fixture.oracleSmokeCommittee()
+    outMachine = oracle_bft.v3OracleBftStateMachineInit(appId, committee)
+    var summary: oracle_bft.V3OracleBftBlockSummary
+    v3BackendDriverOracleFinalize(outMachine,
+                                  int64(1),
+                                  int64(20),
+                                  1,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1),
+                                  summary)
+    v3BackendDriverOracleFinalize(outMachine,
+                                  int64(2),
+                                  int64(21),
+                                  1,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(21)) + int64(1),
+                                  summary)
+    v3BackendDriverOracleFinalize(outMachine,
+                                  int64(3),
+                                  int64(22),
+                                  1,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1),
+                                  summary)
+
+fn v3BackendDriverOracleBuildFixtureMachine(outMachine: var oracle_bft.V3OracleBftStateMachine) =
+    v3BackendDriverOracleBuildFixtureMachineWithAppId(outMachine, "oracle.fixture.query")
+
+fn v3BackendDriverOracleFixtureQuery(rootDir: str,
+                                     args: str[]): int32 =
+    var pairId: int32 = 0
+    var pairName = ""
+    if !v3BackendDriverOracleResolvePair(args, pairId, pairName):
+        return 1
+    let windowRounds = v3BackendDriverOracleReadWindowRounds(args, 3)
+    if windowRounds <= 0 || windowRounds > oracle_types.v3OracleHistoryMax:
+        v3BackendDriverPrintErr("v3 oracle: invalid window-rounds")
+        return 1
+    let nowRound = v3BackendDriverOracleReadNowRound(args, "--now-round", int64(22))
+    let staleRound = v3BackendDriverOracleReadNowRound(args, "--stale-round", int64(24))
+    if nowRound < 0 || staleRound < 0:
+        v3BackendDriverPrintErr("v3 oracle: invalid round flag")
+        return 1
+    var machine: oracle_bft.V3OracleBftStateMachine
+    v3BackendDriverOracleBuildFixtureMachine(machine)
+    let latest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                               pairId,
+                                                               oracle_types.v3OracleRoundEndMs(nowRound) + int64(1))
+    let twap = oracle_bft.v3OracleBftStateMachineQueryTwap(machine,
+                                                           pairId,
+                                                           windowRounds,
+                                                           oracle_types.v3OracleRoundEndMs(nowRound) + int64(1))
+    let staleLatest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                                    pairId,
+                                                                    oracle_types.v3OracleRoundStartMs(staleRound))
+    var report = ""
+    v3BackendDriverOracleAppendReportLine(report, "format", "v3_oracle_fixture_query_v1")
+    v3BackendDriverOracleAppendReportLine(report, "pair", pairName)
+    v3BackendDriverOracleAppendReportLine(report, "pair_id", intToStr(pairId))
+    v3BackendDriverOracleAppendReportLine(report, "latest_code", intToStr(latest.code))
+    v3BackendDriverOracleAppendReportLine(report, "latest_round_id", int64ToStr(latest.roundId))
+    v3BackendDriverOracleAppendReportLine(report, "latest_price_e8", int64ToStr(latest.priceE8))
+    v3BackendDriverOracleAppendReportLine(report, "twap_window_rounds", intToStr(windowRounds))
+    v3BackendDriverOracleAppendReportLine(report, "twap_code", intToStr(twap.code))
+    v3BackendDriverOracleAppendReportLine(report, "twap_round_id", int64ToStr(twap.roundId))
+    v3BackendDriverOracleAppendReportLine(report, "twap_price_e8", int64ToStr(twap.priceE8))
+    v3BackendDriverOracleAppendReportLine(report, "stale_round", int64ToStr(staleRound))
+    v3BackendDriverOracleAppendReportLine(report, "stale_code", intToStr(staleLatest.code))
+    v3BackendDriverOracleAppendReportLine(report, "height", int64ToStr(latest.height))
+    v3BackendDriverOracleAppendReportLine(report, "app_hash", layout.fixedBytes32Hex(latest.appHash))
+    let outRaw: str = strutil.Strip(v3BackendDriverReadFlag(args, "--out", ""))
+    if len(outRaw) > 0:
+        let outPath = v3path.V3PathAbsolute(rootDir, outRaw)
+        if !v3path.V3WriteTextFile(rootDir, outPath, report):
+            v3BackendDriverPrintErr("v3 oracle: failed to write query report")
+            return 1
+    v3BackendDriverPrintStdoutBlock(strutil.Strip(report))
+    return 0
+
+fn v3BackendDriverRunOracleResilienceScenario(rootDir: str,
+                                              args: str[],
+                                              defaultLabel: str,
+                                              successText: str): int32 =
+    let label: str = v3BackendDriverResolveSmokeLabel(args, "CHENG_V3_ORACLE_LABEL", defaultLabel)
+    let outDirBase: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_oracle_resilience")
+    var outDir = outDirBase
+    if label != defaultLabel:
+        outDir = os.JoinPath(outDirBase, label)
+    if !v3path.V3MkdirP(rootDir, outDir):
+        v3BackendDriverPrintErr("v3 oracle resilience: mkdir failed")
+        return 1
+    let committee = oracle_fixture.oracleSmokeCommittee()
+    var machine = oracle_bft.v3OracleBftStateMachineInit("oracle.resilience." + label, committee)
+    let pairId = oracle_fixture.oracleSmokePairId(oracle_types.v3OracleAssetBtc, oracle_types.v3OracleQuoteUsd)
+    let pairIndex = oracle_types.v3OraclePairIndex(pairId)
+
+    var summary1: oracle_bft.V3OracleBftBlockSummary
+    v3BackendDriverOracleFinalize(machine,
+                                  int64(1),
+                                  int64(20),
+                                  1,
+                                  4,
+                                  oracle_types.v3OracleRoundEndMs(int64(20)),
+                                  summary1)
+    if summary1.acceptedCount != 4 || summary1.finalizedRoundCount != 0:
+        v3BackendDriverPrintErr("v3 oracle resilience: round20 pre-quorum drift")
+        return 1
+
+    var summary2: oracle_bft.V3OracleBftBlockSummary
+    v3BackendDriverOracleFinalize(machine,
+                                  int64(2),
+                                  int64(20),
+                                  5,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(20)) + int64(1),
+                                  summary2)
+    if summary2.acceptedCount != 1 || summary2.finalizedRoundCount != 1 || summary2.lastFinalizedRoundId != int64(20):
+        v3BackendDriverPrintErr("v3 oracle resilience: round20 finalize drift")
+        return 1
+
+    var summary3: oracle_bft.V3OracleBftBlockSummary
+    v3BackendDriverOracleFinalize(machine,
+                                  int64(3),
+                                  int64(21),
+                                  1,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(21)) + int64(1),
+                                  summary3)
+    if summary3.acceptedCount != 5 || summary3.finalizedRoundCount != 1 || summary3.lastFinalizedRoundId != int64(21):
+        v3BackendDriverPrintErr("v3 oracle resilience: round21 finalize drift")
+        return 1
+
+    var summary4: oracle_bft.V3OracleBftBlockSummary
+    v3BackendDriverOracleFinalize(machine,
+                                  int64(4),
+                                  int64(22),
+                                  1,
+                                  5,
+                                  oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1),
+                                  summary4)
+    if summary4.acceptedCount != 5 || summary4.finalizedRoundCount != 1 || summary4.lastFinalizedRoundId != int64(22):
+        v3BackendDriverPrintErr("v3 oracle resilience: round22 finalize drift")
+        return 1
+
+    let latest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                               pairId,
+                                                               oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1))
+    let expectedLatest = oracle_fixture.oracleSmokePrice(int64(22), pairIndex, 3)
+    if latest.code != oracle_bft.v3OracleBftCodeOk || latest.roundId != int64(22) || latest.priceE8 != expectedLatest:
+        v3BackendDriverPrintErr("v3 oracle resilience: latest drift")
+        return 1
+
+    let twap = oracle_bft.v3OracleBftStateMachineQueryTwap(machine,
+                                                           pairId,
+                                                           3,
+                                                           oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1))
+    let expectedTwap = (oracle_fixture.oracleSmokePrice(int64(20), pairIndex, 3) +
+                        oracle_fixture.oracleSmokePrice(int64(21), pairIndex, 3) +
+                        oracle_fixture.oracleSmokePrice(int64(22), pairIndex, 3)) / int64(3)
+    if twap.code != oracle_bft.v3OracleBftCodeOk || twap.priceE8 != expectedTwap:
+        v3BackendDriverPrintErr("v3 oracle resilience: twap drift")
+        return 1
+
+    let staleLatest = oracle_bft.v3OracleBftStateMachineQueryLatest(machine,
+                                                                    pairId,
+                                                                    oracle_types.v3OracleRoundStartMs(int64(24)))
+    if staleLatest.code != oracle_bft.v3OracleBftCodeStale:
+        v3BackendDriverPrintErr("v3 oracle resilience: stale latest drift")
+        return 1
+
+    let window4 = oracle_bft.v3OracleBftStateMachineQueryTwap(machine,
+                                                              pairId,
+                                                              4,
+                                                              oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1))
+    if window4.code != oracle_bft.v3OracleBftCodeNotFinalized:
+        v3BackendDriverPrintErr("v3 oracle resilience: window4 drift")
+        return 1
+
+    let oldRoundCheck = oracle_bft.v3OracleBftStateMachineCheckTxWithContext(machine,
+                                                                              oracle_bft.v3OracleBftBlockContextMake(
+                                                                                  int64(5),
+                                                                                  0,
+                                                                                  oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1),
+                                                                                  layout.fixedBytes32Zero()
+                                                                              ),
+                                                                              oracle_fixture.oracleSmokeBatch(int64(22), 6))
+    if oldRoundCheck.code != oracle_bft.v3OracleBftCodeBadRound:
+        v3BackendDriverPrintErr("v3 oracle resilience: old round drift")
+        return 1
+
+    let futureRoundCheck = oracle_bft.v3OracleBftStateMachineCheckTxWithContext(machine,
+                                                                                 oracle_bft.v3OracleBftBlockContextMake(
+                                                                                     int64(5),
+                                                                                     0,
+                                                                                     oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1),
+                                                                                     layout.fixedBytes32Zero()
+                                                                                 ),
+                                                                                 oracle_fixture.oracleSmokeBatch(int64(25), 1))
+    if futureRoundCheck.code != oracle_bft.v3OracleBftCodeBadRound:
+        v3BackendDriverPrintErr("v3 oracle resilience: future round drift")
+        return 1
+
+    var duplicateMachine = oracle_bft.v3OracleBftStateMachineInit("oracle.resilience.dup." + label, committee)
+    var duplicateBatch = oracle_bft.v3OracleBftTxBatchZero()
+    let dupTx = oracle_fixture.oracleSmokeBatch(int64(22), 1)
+    oracle_bft.v3OracleBftTxBatchAdd(duplicateBatch, dupTx)
+    oracle_bft.v3OracleBftTxBatchAdd(duplicateBatch, dupTx)
+    var duplicateSummary: oracle_bft.V3OracleBftBlockSummary
+    oracle_bft.v3OracleBftStateMachineFinalizeBatchSummaryWithContext(duplicateMachine,
+                                                                      oracle_bft.v3OracleBftBlockContextMake(
+                                                                          int64(1),
+                                                                          0,
+                                                                          oracle_types.v3OracleRoundEndMs(int64(22)) + int64(1),
+                                                                          layout.fixedBytes32Zero()
+                                                                      ),
+                                                                      duplicateBatch,
+                                                                      duplicateSummary)
+    if duplicateSummary.acceptedCount != 1 || duplicateSummary.rejectedCount != 1:
+        v3BackendDriverPrintErr("v3 oracle resilience: duplicate drift")
+        return 1
+
+    var report = ""
+    v3BackendDriverOracleAppendReportLine(report, "format", "v3_oracle_resilience_smoke_v1")
+    v3BackendDriverOracleAppendReportLine(report, "label", label)
+    v3BackendDriverOracleAppendReportLine(report, "pair", "BTC/USD")
+    v3BackendDriverOracleAppendReportLine(report, "last_finalized_round_id", int64ToStr(machine.lastFinalizedRoundId))
+    v3BackendDriverOracleAppendReportLine(report, "latest_round_id", int64ToStr(latest.roundId))
+    v3BackendDriverOracleAppendReportLine(report, "latest_price_e8", int64ToStr(latest.priceE8))
+    v3BackendDriverOracleAppendReportLine(report, "twap_window_rounds", "3")
+    v3BackendDriverOracleAppendReportLine(report, "twap_price_e8", int64ToStr(twap.priceE8))
+    v3BackendDriverOracleAppendReportLine(report, "stale_code", intToStr(staleLatest.code))
+    v3BackendDriverOracleAppendReportLine(report, "window4_code", intToStr(window4.code))
+    v3BackendDriverOracleAppendReportLine(report, "old_round_code", intToStr(oldRoundCheck.code))
+    v3BackendDriverOracleAppendReportLine(report, "future_round_code", intToStr(futureRoundCheck.code))
+    v3BackendDriverOracleAppendReportLine(report, "duplicate_rejected", intToStr(duplicateSummary.rejectedCount))
+    v3BackendDriverOracleAppendReportLine(report, "height", int64ToStr(machine.lastFinalizedHeight))
+    v3BackendDriverOracleAppendReportLine(report, "app_hash", layout.fixedBytes32Hex(oracle_bft.v3OracleBftStateMachineQueryAppHash(machine)))
+    let reportPath = os.JoinPath(outDir, "oracle_resilience.report.txt")
+    if !v3path.V3WriteTextFile(rootDir, reportPath, report):
+        v3BackendDriverPrintErr("v3 oracle resilience: write report failed")
+        return 1
+    v3BackendDriverPrintStdoutBlock(strutil.Strip(report))
+    v3BackendDriverPrintLine(successText + " (" + label + ")")
+    return 0
+
+fn v3BackendDriverRunOracleResilienceSmoke(rootDir: str,
+                                           args: str[]): int32 =
+    return v3BackendDriverRunOracleResilienceScenario(rootDir,
+                                                      args,
+                                                      "oracle_resilience",
+                                                      "v3 oracle resilience smoke ok")
+
+fn v3BackendDriverVerifyOracleResilience(rootDir: str,
+                                         args: str[]): int32 =
+    return v3BackendDriverRunOracleResilienceScenario(rootDir,
+                                                      args,
+                                                      "oracle_resilience_gate",
+                                                      "verify-oracle-resilience: ok")
+
+fn v3BackendDriverOracleBftLabel(args: str[],
+                                 defaultLabel: str): str =
+    return v3BackendDriverResolveSmokeLabel(args,
+                                            "CHENG_V3_ORACLE_BFT_LABEL",
+                                            defaultLabel)
+
+fn v3BackendDriverOracleBftResolveCompiler(rootDir: str,
+                                           args: str[],
+                                           outCompiler: var str): bool =
+    let explicitRaw: str = v3BackendDriverReadFlag(args, "--compiler", "")
+    let explicit: str = strutil.Strip(explicitRaw)
+    if len(explicit) > 0:
+        outCompiler = v3path.V3PathAbsolute(rootDir, explicit)
+        return true
+    return v3BackendDriverResolveToolCompiler(rootDir,
+                                              "oracle-bft-three-node",
+                                              outCompiler)
+
+fn v3BackendDriverOracleBftAppId(): str =
+    return os.GetEnvDefault("CHENG_V3_ORACLE_BFT_APP_ID",
+                            "cheng-oracle-live-20260419")
+
+fn v3BackendDriverOracleBftServerSsh(): str =
+    return os.GetEnvDefault("CHENG_V3_ORACLE_BFT_SERVER_SSH",
+                            "root@64.176.84.12")
+
+fn v3BackendDriverOracleBftRelaySsh(): str =
+    return os.GetEnvDefault("CHENG_V3_ORACLE_BFT_RELAY_SSH",
+                            "dmit")
+
+fn v3BackendDriverOracleBftServerRoot(): str =
+    return os.GetEnvDefault("CHENG_V3_ORACLE_BFT_SERVER_ROOT",
+                            "/root/cheng-lang-deploy")
+
+fn v3BackendDriverOracleBftRelayRoot(): str =
+    return os.GetEnvDefault("CHENG_V3_ORACLE_BFT_RELAY_ROOT",
+                            "/root/cheng-lang-deploy")
+
+fn v3BackendDriverOracleBftLocalBin(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir,
+                                 "artifacts/v3_oracle_bft_state_machine/oracle_bft_state_machine")
+
+fn v3BackendDriverOracleBftLocalReportPath(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir,
+                                 "artifacts/v3_oracle_bft_state_machine/oracle_bft_state_machine.report.txt")
+
+fn v3BackendDriverOracleBftLocalCompileLogPath(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir,
+                                 "artifacts/v3_oracle_bft_state_machine/oracle_bft_state_machine.compile.log")
+
+fn v3BackendDriverOracleBftRemoteBin(repoRoot: str): str =
+    return repoRoot +
+        "/artifacts/v3_oracle_bft_state_machine/x86_64-unknown-linux-gnu/oracle_bft_state_machine"
+
+fn v3BackendDriverOracleBftRemoteReportPath(repoRoot: str): str =
+    return repoRoot +
+        "/artifacts/v3_oracle_bft_state_machine/x86_64-unknown-linux-gnu/oracle_bft_state_machine.report.txt"
+
+fn v3BackendDriverOracleBftSourcePath(rootDir: str): str =
+    return v3path.V3PathAbsolute(rootDir,
+                                 "v3/src/project/oracle_bft_state_machine_main.cheng")
+
+fn v3BackendDriverOracleBftLocalDeployDir(rootDir: str,
+                                          label: str): str =
+    let relPath: str = "artifacts/v3_oracle_bft_three_node/" + label + "/local"
+    return v3path.V3PathAbsolute(rootDir, relPath)
+
+fn v3BackendDriverOracleBftRemoteDeployDir(repoRoot: str,
+                                           label: str,
+                                           nodeName: str): str =
+    return repoRoot +
+        "/artifacts/v3_oracle_bft_three_node/" +
+        label +
+        "/" +
+        nodeName
+
+fn v3BackendDriverOracleBftStatePath(nodeDir: str): str =
+    return os.JoinPath(nodeDir, "oracle.state")
+
+fn v3BackendDriverOracleBftRunProgram(rootDir: str,
+                                      label: str,
+                                      program: str,
+                                      args: str[],
+                                      timeoutSec: int32,
+                                      logPath: str): hostops.V3LoggedRun =
+    let logParts = os.SplitFile(logPath)
+    if len(logParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, logParts.dir)
+    return hostops.v3RunProgramLogged(rootDir,
+                                      label,
+                                      program,
+                                      args,
+                                      [],
+                                      rootDir,
+                                      timeoutSec,
+                                      logPath)
+
+fn v3BackendDriverOracleBftRunSsh(rootDir: str,
+                                  label: str,
+                                  sshHost: str,
+                                  args: str[],
+                                  timeoutSec: int32,
+                                  logPath: str): hostops.V3LoggedRun =
+    var sshArgs: str[] = []
+    add(sshArgs, "-o")
+    add(sshArgs, "BatchMode=yes")
+    add(sshArgs, "-o")
+    add(sshArgs, "ConnectTimeout=20")
+    add(sshArgs, "-o")
+    add(sshArgs, "ServerAliveInterval=5")
+    add(sshArgs, "-o")
+    add(sshArgs, "ServerAliveCountMax=3")
+    add(sshArgs, sshHost)
+    for i in 0..<args.len:
+        add(sshArgs, args[i])
+    return v3BackendDriverOracleBftRunProgram(rootDir,
+                                              label,
+                                              "ssh",
+                                              sshArgs,
+                                              timeoutSec,
+                                              logPath)
+
+fn v3BackendDriverOracleBftRunScp(rootDir: str,
+                                  label: str,
+                                  localPath: str,
+                                  sshHost: str,
+                                  remotePath: str,
+                                  timeoutSec: int32,
+                                  logPath: str): hostops.V3LoggedRun =
+    return v3BackendDriverOracleBftRunProgram(rootDir,
+                                              label,
+                                              "scp",
+                                              [
+                                                  "-o", "BatchMode=yes",
+                                                  "-o", "ConnectTimeout=20",
+                                                  localPath,
+                                                  sshHost + ":" + remotePath
+                                              ],
+                                              timeoutSec,
+                                              logPath)
+
+fn v3BackendDriverOracleBftRemoteMkdir(rootDir: str,
+                                       label: str,
+                                       sshHost: str,
+                                       remoteDir: str,
+                                       logPath: str): bool =
+    let run = v3BackendDriverOracleBftRunSsh(rootDir,
+                                             label,
+                                             sshHost,
+                                             ["mkdir", "-p", remoteDir],
+                                             60,
+                                             logPath)
+    return !v3BackendDriverRunFailed("v3 oracle bft remote mkdir", run)
+
+fn v3BackendDriverOracleBftRemoteRmRf(rootDir: str,
+                                      label: str,
+                                      sshHost: str,
+                                      remoteDir: str,
+                                      logPath: str): bool =
+    let run = v3BackendDriverOracleBftRunSsh(rootDir,
+                                             label,
+                                             sshHost,
+                                             ["rm", "-rf", remoteDir],
+                                             60,
+                                             logPath)
+    return !v3BackendDriverRunFailed("v3 oracle bft remote rm", run)
+
+fn v3BackendDriverOracleBftLocalRmRf(rootDir: str,
+                                     dirPath: str,
+                                     logPath: str): bool =
+    let run = v3BackendDriverOracleBftRunProgram(rootDir,
+                                                 "oracle_bft_local_rm",
+                                                 "rm",
+                                                 ["-rf", dirPath],
+                                                 30,
+                                                 logPath)
+    return !v3BackendDriverRunFailed("v3 oracle bft local rm", run)
+
+fn v3BackendDriverOracleBftLocalMkdir(rootDir: str,
+                                      dirPath: str,
+                                      logPath: str): bool =
+    let run = v3BackendDriverOracleBftRunProgram(rootDir,
+                                                 "oracle_bft_local_mkdir",
+                                                 "mkdir",
+                                                 ["-p", dirPath],
+                                                 30,
+                                                 logPath)
+    return !v3BackendDriverRunFailed("v3 oracle bft local mkdir", run)
+
+fn v3BackendDriverOracleBftCompileLocal(rootDir: str,
+                                        compilerPath: str,
+                                        outBin: str,
+                                        reportPath: str,
+                                        logPath: str): hostops.V3LoggedRun =
+    let packageRoot: str = v3path.V3PathAbsolute(rootDir, "v3")
+    let sourcePath: str = v3BackendDriverOracleBftSourcePath(rootDir)
+    let outParts = os.SplitFile(outBin)
+    if len(outParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, outParts.dir)
+    let reportParts = os.SplitFile(reportPath)
+    if len(reportParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, reportParts.dir)
+    let logParts = os.SplitFile(logPath)
+    if len(logParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, logParts.dir)
+    let run = hostops.v3RunFileLogged(rootDir,
+                                      "oracle_bft_compile_local",
+                                      compilerPath,
+                                      [
+                                          "system-link-exec",
+                                          "--root", packageRoot,
+                                          "--in", sourcePath,
+                                          "--emit", "exe",
+                                          "--target", v3BackendDriverHostTarget(),
+                                          "--out", outBin,
+                                          "--report-out", reportPath
+                                      ],
+                                      [],
+                                      rootDir,
+                                      300,
+                                      logPath)
+    return run
+
+fn v3BackendDriverOracleBftSourceClosureSync(rootDir: str,
+                                             label: str,
+                                             sshHost: str,
+                                             repoRoot: str,
+                                             reportPath: str,
+                                             logStem: str): bool =
+    let reportText: str = v3path.V3ReadTextFile("", reportPath)
+    let closureRaw: str = v3BackendDriverTextValue(reportText, "source_closure_paths")
+    let closureText: str = strutil.Strip(closureRaw)
+    if len(closureText) <= 0:
+        v3BackendDriverPrintErr("v3 oracle bft: missing source closure report")
+        return false
+    let rootPrefix: str = rootDir + "/"
+    var relPaths: str[] = []
+    var start: int32 = 0
+    while start < len(closureText):
+        var stop: int32 = start
+        while stop < len(closureText):
+            if closureText[stop] == ',':
+                break
+            stop = stop + 1
+        let localPath: str = strings.SliceBytes(closureText, start, stop - start)
+        let trimmedPath: str = strutil.Strip(localPath)
+        if len(trimmedPath) > 0:
+            if len(trimmedPath) <= len(rootPrefix):
+                v3BackendDriverPrintErr("v3 oracle bft: bad source closure path: " + trimmedPath)
+                return false
+            let localPrefix: str = strings.SliceBytes(trimmedPath, 0, len(rootPrefix))
+            if localPrefix != rootPrefix:
+                v3BackendDriverPrintErr("v3 oracle bft: source outside root: " + trimmedPath)
+                return false
+            let relPath: str = strings.SliceBytes(trimmedPath,
+                                                  len(rootPrefix),
+                                                  len(trimmedPath) - len(rootPrefix))
+            add(relPaths, relPath)
+        start = stop + 1
+    if relPaths.len <= 0:
+        v3BackendDriverPrintErr("v3 oracle bft: empty source closure")
+        return false
+    let archiveRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".source_closure.tar"
+    let archivePath: str = v3path.V3PathAbsolute(rootDir, archiveRel)
+    let archiveParts = os.SplitFile(archivePath)
+    if len(archiveParts.dir) > 0:
+        let _made: bool = v3path.V3MkdirP(rootDir, archiveParts.dir)
+    var tarArgs: str[] = []
+    add(tarArgs, "-cf")
+    add(tarArgs, archivePath)
+    add(tarArgs, "-C")
+    add(tarArgs, rootDir)
+    for i in 0..<relPaths.len:
+        add(tarArgs, relPaths[i])
+    let tarLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".source_closure.tar.log"
+    let tarLogPath: str = v3path.V3PathAbsolute(rootDir, tarLogRel)
+    let tarRun = v3BackendDriverOracleBftRunProgram(rootDir,
+                                                    "oracle_bft_source_closure_tar",
+                                                    "tar",
+                                                    tarArgs,
+                                                    300,
+                                                    tarLogPath)
+    if v3BackendDriverRunFailed("v3 oracle bft source closure tar", tarRun):
+        return false
+    let remoteSyncDir: str = repoRoot + "/artifacts/v3_oracle_bft_three_node/" + label
+    let remoteArchivePath: str = remoteSyncDir + "/" + logStem + ".source_closure.tar"
+    let mkdirLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".src_mkdir.log"
+    let mkdirLogPath: str = v3path.V3PathAbsolute(rootDir, mkdirLogRel)
+    if !v3BackendDriverOracleBftRemoteMkdir(rootDir,
+                                            label,
+                                            sshHost,
+                                            remoteSyncDir,
+                                            mkdirLogPath):
+        return false
+    let scpLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".src_scp.log"
+    let scpLogPath: str = v3path.V3PathAbsolute(rootDir, scpLogRel)
+    let scpRun = v3BackendDriverOracleBftRunScp(rootDir,
+                                                "oracle_bft_remote_src_scp",
+                                                archivePath,
+                                                sshHost,
+                                                remoteArchivePath,
+                                                300,
+                                                scpLogPath)
+    if v3BackendDriverRunFailed("v3 oracle bft remote source scp", scpRun):
+        return false
+    let extractLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".src_extract.log"
+    let extractLogPath: str = v3path.V3PathAbsolute(rootDir, extractLogRel)
+    let extractRun = v3BackendDriverOracleBftRunSsh(rootDir,
+                                                    "oracle_bft_remote_src_extract",
+                                                    sshHost,
+                                                    ["tar", "-xf", remoteArchivePath, "-C", repoRoot],
+                                                    300,
+                                                    extractLogPath)
+    if v3BackendDriverRunFailed("v3 oracle bft remote source extract", extractRun):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftBuildRemote(rootDir: str,
+                                       label: str,
+                                       sshHost: str,
+                                       repoRoot: str,
+                                       reportPath: str,
+                                       logStem: str): bool =
+    if !v3BackendDriverOracleBftSourceClosureSync(rootDir,
+                                                  label,
+                                                  sshHost,
+                                                  repoRoot,
+                                                  reportPath,
+                                                  logStem):
+        return false
+    let remoteBin: str = v3BackendDriverOracleBftRemoteBin(repoRoot)
+    let remoteReport: str = v3BackendDriverOracleBftRemoteReportPath(repoRoot)
+    let outParts = os.SplitFile(remoteBin)
+    let outDir: str = outParts.dir
+    let stage3Path: str = repoRoot + "/artifacts/v3_bootstrap/cheng.stage3"
+    let sourcePath: str = repoRoot + "/v3/src/project/oracle_bft_state_machine_main.cheng"
+    let mkdirLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".mkdir.log"
+    let mkdirLogPath: str = v3path.V3PathAbsolute(rootDir, mkdirLogRel)
+    if !v3BackendDriverOracleBftRemoteMkdir(rootDir,
+                                            "oracle_bft_remote_bin_mkdir",
+                                            sshHost,
+                                            outDir,
+                                            mkdirLogPath):
+        return false
+    let compileLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".compile.log"
+    let compileLogPath: str = v3path.V3PathAbsolute(rootDir, compileLogRel)
+    let run = v3BackendDriverOracleBftRunSsh(rootDir,
+                                             "oracle_bft_remote_build",
+                                             sshHost,
+                                             [
+                                                 stage3Path,
+                                                 "system-link-exec",
+                                                 "--root", repoRoot + "/v3",
+                                                 "--in", sourcePath,
+                                                 "--emit", "exe",
+                                                 "--target", "x86_64-unknown-linux-gnu",
+                                                 "--out", remoteBin,
+                                                 "--report-out", remoteReport
+                                             ],
+                                             600,
+                                             compileLogPath)
+    if v3BackendDriverRunFailed("v3 oracle bft remote compile", run):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftBuildLocalAndRemote(rootDir: str,
+                                               args: str[]): bool =
+    let label: str = v3BackendDriverOracleBftLabel(args, "oracle_bft_three_node")
+    var compilerPath = ""
+    if !v3BackendDriverOracleBftResolveCompiler(rootDir, args, compilerPath):
+        return false
+    let localBin: str = v3BackendDriverOracleBftLocalBin(rootDir)
+    let localReport: str = v3BackendDriverOracleBftLocalReportPath(rootDir)
+    let localCompileLog: str = v3BackendDriverOracleBftLocalCompileLogPath(rootDir)
+    let localCompile = v3BackendDriverOracleBftCompileLocal(rootDir,
+                                                            compilerPath,
+                                                            localBin,
+                                                            localReport,
+                                                            localCompileLog)
+    if v3BackendDriverRunFailed("v3 oracle bft local compile", localCompile):
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, localBin) ||
+       !v3path.V3FileExistsNonEmpty(rootDir, localReport):
+        v3BackendDriverPrintErr("v3 oracle bft: local build artifacts missing")
+        return false
+    if !v3BackendDriverOracleBftBuildRemote(rootDir,
+                                            label,
+                                            v3BackendDriverOracleBftServerSsh(),
+                                            v3BackendDriverOracleBftServerRoot(),
+                                            localReport,
+                                            "server"):
+        return false
+    if !v3BackendDriverOracleBftBuildRemote(rootDir,
+                                            label,
+                                            v3BackendDriverOracleBftRelaySsh(),
+                                            v3BackendDriverOracleBftRelayRoot(),
+                                            localReport,
+                                            "relay"):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftLocalRun(rootDir: str,
+                                    label: str,
+                                    logStem: str,
+                                    args: str[]): hostops.V3LoggedRun =
+    let logRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".log"
+    let logPath: str = v3path.V3PathAbsolute(rootDir, logRel)
+    return v3BackendDriverRunBinary(rootDir,
+                                    "oracle_bft_local_run",
+                                    v3BackendDriverOracleBftLocalBin(rootDir),
+                                    args,
+                                    120,
+                                    logPath)
+
+fn v3BackendDriverOracleBftRemoteRun(rootDir: str,
+                                     label: str,
+                                     sshHost: str,
+                                     repoRoot: str,
+                                     logStem: str,
+                                     args: str[]): hostops.V3LoggedRun =
+    var remoteArgs: str[] = []
+    add(remoteArgs, v3BackendDriverOracleBftRemoteBin(repoRoot))
+    for i in 0..<args.len:
+        add(remoteArgs, args[i])
+    let logRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/" + logStem + ".log"
+    let logPath: str = v3path.V3PathAbsolute(rootDir, logRel)
+    return v3BackendDriverOracleBftRunSsh(rootDir,
+                                          "oracle_bft_remote_run",
+                                          sshHost,
+                                          remoteArgs,
+                                          120,
+                                          logPath)
+
+fn v3BackendDriverOracleBftFinalizeNodeLocal(rootDir: str,
+                                             label: str,
+                                             statePath: str): bool =
+    let initRun = v3BackendDriverOracleBftLocalRun(rootDir,
+                                                   label,
+                                                   "local.init",
+                                                   ["init",
+                                                    "--state:" + statePath,
+                                                    "--app-id:" + v3BackendDriverOracleBftAppId(),
+                                                    "--force"])
+    if v3BackendDriverRunFailed("v3 oracle bft local init", initRun):
+        return false
+    for roundId in 20..22:
+        let finalizeRun = v3BackendDriverOracleBftLocalRun(rootDir,
+                                                           label,
+                                                           "local.round" + intToStr(roundId),
+                                                           ["fixture-finalize",
+                                                            "--state:" + statePath,
+                                                            "--height:" + intToStr(roundId - 19),
+                                                            "--round:" + intToStr(roundId),
+                                                            "--reporter-start:1",
+                                                            "--reporter-end:5"])
+        if v3BackendDriverRunFailed("v3 oracle bft local finalize", finalizeRun):
+            return false
+    return true
+
+fn v3BackendDriverOracleBftFinalizeNodeRemote(rootDir: str,
+                                              label: str,
+                                              sshHost: str,
+                                              repoRoot: str,
+                                              logPrefix: str,
+                                              statePath: str): bool =
+    let initRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                    label,
+                                                    sshHost,
+                                                    repoRoot,
+                                                    logPrefix + ".init",
+                                                    ["init",
+                                                     "--state:" + statePath,
+                                                     "--app-id:" + v3BackendDriverOracleBftAppId(),
+                                                     "--force"])
+    if v3BackendDriverRunFailed("v3 oracle bft remote init", initRun):
+        return false
+    for roundId in 20..22:
+        let roundLogPrefix = logPrefix + ".round" + intToStr(roundId)
+        let heightText = intToStr(roundId - 19)
+        let roundText = intToStr(roundId)
+        let finalizeArgs = ["fixture-finalize",
+                            "--state:" + statePath,
+                            "--height:" + heightText,
+                            "--round:" + roundText,
+                            "--reporter-start:1",
+                            "--reporter-end:5"]
+        let finalizeRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                            label,
+                                                            sshHost,
+                                                            repoRoot,
+                                                            roundLogPrefix,
+                                                            finalizeArgs)
+        if finalizeRun.exitCode != 0:
+            let verifyRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                              label,
+                                                              sshHost,
+                                                              repoRoot,
+                                                              roundLogPrefix + ".verify",
+                                                              ["show-state",
+                                                               "--state:" + statePath])
+            if verifyRun.exitCode == 0:
+                let heightOk = strutil.Strip(v3BackendDriverTextValue(verifyRun.output, "height")) == heightText
+                let roundOk = strutil.Strip(v3BackendDriverTextValue(verifyRun.output, "last_finalized_round_id")) == roundText
+                if heightOk && roundOk:
+                    continue
+            if finalizeRun.exitCode == 255:
+                let retryRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                                 label,
+                                                                 sshHost,
+                                                                 repoRoot,
+                                                                 roundLogPrefix + ".retry",
+                                                                 finalizeArgs)
+                if retryRun.exitCode == 0:
+                    continue
+                let retryVerifyRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                                       label,
+                                                                       sshHost,
+                                                                       repoRoot,
+                                                                       roundLogPrefix + ".retry_verify",
+                                                                       ["show-state",
+                                                                        "--state:" + statePath])
+                if retryVerifyRun.exitCode == 0:
+                    let retryHeightOk = strutil.Strip(v3BackendDriverTextValue(retryVerifyRun.output, "height")) == heightText
+                    let retryRoundOk = strutil.Strip(v3BackendDriverTextValue(retryVerifyRun.output, "last_finalized_round_id")) == roundText
+                    if retryHeightOk && retryRoundOk:
+                        continue
+            if v3BackendDriverRunFailed("v3 oracle bft remote finalize", finalizeRun):
+                return false
+    return true
+
+fn v3BackendDriverOracleBftExpectedLatestPrice(): int64 =
+    let pairId = oracle_fixture.oracleSmokePairId(oracle_types.v3OracleAssetBtc,
+                                                  oracle_types.v3OracleQuoteUsd)
+    let pairIndex = oracle_types.v3OraclePairIndex(pairId)
+    return oracle_fixture.oracleSmokePrice(int64(22), pairIndex, 3)
+
+fn v3BackendDriverOracleBftExpectedTwapPrice(): int64 =
+    let pairId = oracle_fixture.oracleSmokePairId(oracle_types.v3OracleAssetBtc,
+                                                  oracle_types.v3OracleQuoteUsd)
+    let pairIndex = oracle_types.v3OraclePairIndex(pairId)
+    return (oracle_fixture.oracleSmokePrice(int64(20), pairIndex, 3) +
+            oracle_fixture.oracleSmokePrice(int64(21), pairIndex, 3) +
+            oracle_fixture.oracleSmokePrice(int64(22), pairIndex, 3)) / int64(3)
+
+fn v3BackendDriverOracleBftExpectedAppHash(): str =
+    var machine: oracle_bft.V3OracleBftStateMachine
+    v3BackendDriverOracleBuildFixtureMachineWithAppId(machine, v3BackendDriverOracleBftAppId())
+    return layout.fixedBytes32Hex(oracle_bft.v3OracleBftStateMachineQueryAppHash(machine))
+
+fn v3BackendDriverOracleBftAppendNodeReport(report: var str,
+                                            prefix: str,
+                                            showRun: hostops.V3LoggedRun,
+                                            latestRun: hostops.V3LoggedRun,
+                                            twapRun: hostops.V3LoggedRun) =
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_height",
+                                          strutil.Strip(v3BackendDriverTextValue(showRun.output, "height")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_last_finalized_round_id",
+                                          strutil.Strip(v3BackendDriverTextValue(showRun.output, "last_finalized_round_id")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_pair_count_finalized",
+                                          strutil.Strip(v3BackendDriverTextValue(showRun.output, "pair_count_finalized")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_has_pending",
+                                          strutil.Strip(v3BackendDriverTextValue(showRun.output, "has_pending")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_app_hash",
+                                          strutil.Strip(v3BackendDriverTextValue(showRun.output, "app_hash")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_latest_code",
+                                          strutil.Strip(v3BackendDriverTextValue(latestRun.output, "code")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_latest_round_id",
+                                          strutil.Strip(v3BackendDriverTextValue(latestRun.output, "round_id")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_latest_price_e8",
+                                          strutil.Strip(v3BackendDriverTextValue(latestRun.output, "price_e8")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_twap_code",
+                                          strutil.Strip(v3BackendDriverTextValue(twapRun.output, "code")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_twap_round_id",
+                                          strutil.Strip(v3BackendDriverTextValue(twapRun.output, "round_id")))
+    v3BackendDriverOracleAppendReportLine(report,
+                                          prefix + "_twap_price_e8",
+                                          strutil.Strip(v3BackendDriverTextValue(twapRun.output, "price_e8")))
+
+fn v3BackendDriverOracleBftRunStatusQueries(rootDir: str,
+                                            label: str,
+                                            statePath: str,
+                                            showRun: var hostops.V3LoggedRun,
+                                            latestRun: var hostops.V3LoggedRun,
+                                            twapRun: var hostops.V3LoggedRun): bool =
+    showRun = v3BackendDriverOracleBftLocalRun(rootDir,
+                                               label,
+                                               "local.show_state",
+                                               ["show-state",
+                                                "--state:" + statePath])
+    if v3BackendDriverRunFailed("v3 oracle bft local show-state", showRun):
+        return false
+    latestRun = v3BackendDriverOracleBftLocalRun(rootDir,
+                                                 label,
+                                                 "local.query_latest",
+                                                 ["query-latest",
+                                                  "--state:" + statePath,
+                                                  "--pair:BTC/USD",
+                                                  "--now-round:22"])
+    if v3BackendDriverRunFailed("v3 oracle bft local query-latest", latestRun):
+        return false
+    twapRun = v3BackendDriverOracleBftLocalRun(rootDir,
+                                               label,
+                                               "local.query_twap",
+                                               ["query-twap",
+                                                "--state:" + statePath,
+                                                "--pair:BTC/USD",
+                                                "--window-rounds:3",
+                                                "--now-round:22"])
+    if v3BackendDriverRunFailed("v3 oracle bft local query-twap", twapRun):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftRunRemoteStatusQueries(rootDir: str,
+                                                  label: str,
+                                                  sshHost: str,
+                                                  repoRoot: str,
+                                                  logPrefix: str,
+                                                  statePath: str,
+                                                  showRun: var hostops.V3LoggedRun,
+                                                  latestRun: var hostops.V3LoggedRun,
+                                                  twapRun: var hostops.V3LoggedRun): bool =
+    showRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                label,
+                                                sshHost,
+                                                repoRoot,
+                                                logPrefix + ".show_state",
+                                                ["show-state",
+                                                 "--state:" + statePath])
+    if v3BackendDriverRunFailed("v3 oracle bft remote show-state", showRun):
+        return false
+    latestRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                  label,
+                                                  sshHost,
+                                                  repoRoot,
+                                                  logPrefix + ".query_latest",
+                                                  ["query-latest",
+                                                   "--state:" + statePath,
+                                                   "--pair:BTC/USD",
+                                                   "--now-round:22"])
+    if v3BackendDriverRunFailed("v3 oracle bft remote query-latest", latestRun):
+        return false
+    twapRun = v3BackendDriverOracleBftRemoteRun(rootDir,
+                                                label,
+                                                sshHost,
+                                                repoRoot,
+                                                logPrefix + ".query_twap",
+                                                ["query-twap",
+                                                 "--state:" + statePath,
+                                                 "--pair:BTC/USD",
+                                                 "--window-rounds:3",
+                                                 "--now-round:22"])
+    if v3BackendDriverRunFailed("v3 oracle bft remote query-twap", twapRun):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftCheckNode(showRun: hostops.V3LoggedRun,
+                                     latestRun: hostops.V3LoggedRun,
+                                     twapRun: hostops.V3LoggedRun,
+                                     context: str): bool =
+    let expectedLatest: str = int64ToStr(v3BackendDriverOracleBftExpectedLatestPrice())
+    let expectedTwap: str = int64ToStr(v3BackendDriverOracleBftExpectedTwapPrice())
+    let expectedHash: str = v3BackendDriverOracleBftExpectedAppHash()
+    if !v3BackendDriverRequireRunValue(showRun, "height", "3", context):
+        return false
+    if !v3BackendDriverRequireRunValue(showRun, "last_finalized_round_id", "22", context):
+        return false
+    if !v3BackendDriverRequireRunValue(showRun, "pair_count_finalized", "32", context):
+        return false
+    if !v3BackendDriverRequireRunValue(showRun, "has_pending", "0", context):
+        return false
+    if !v3BackendDriverRequireRunValue(showRun, "app_hash", expectedHash, context):
+        return false
+    if !v3BackendDriverRequireRunValue(latestRun, "code", "0", context):
+        return false
+    if !v3BackendDriverRequireRunValue(latestRun, "round_id", "22", context):
+        return false
+    if !v3BackendDriverRequireRunValue(latestRun, "price_e8", expectedLatest, context):
+        return false
+    if !v3BackendDriverRequireRunValue(latestRun, "height", "3", context):
+        return false
+    if !v3BackendDriverRequireRunValue(twapRun, "code", "0", context):
+        return false
+    if !v3BackendDriverRequireRunValue(twapRun, "round_id", "22", context):
+        return false
+    if !v3BackendDriverRequireRunValue(twapRun, "price_e8", expectedTwap, context):
+        return false
+    if !v3BackendDriverRequireRunValue(twapRun, "height", "3", context):
+        return false
+    return true
+
+fn v3BackendDriverOracleBftBuild(rootDir: str,
+                                 args: str[]): int32 =
+    if !v3BackendDriverOracleBftBuildLocalAndRemote(rootDir, args):
+        return 1
+    v3BackendDriverPrintLine("v3 oracle bft build ok")
+    v3BackendDriverPrintLine("local_bin=" + v3BackendDriverOracleBftLocalBin(rootDir))
+    v3BackendDriverPrintLine("server_bin=" + v3BackendDriverOracleBftRemoteBin(v3BackendDriverOracleBftServerRoot()))
+    v3BackendDriverPrintLine("relay_bin=" + v3BackendDriverOracleBftRemoteBin(v3BackendDriverOracleBftRelayRoot()))
+    return 0
+
+fn v3BackendDriverOracleBftStop(rootDir: str,
+                                args: str[]): int32 =
+    let label: str = v3BackendDriverOracleBftLabel(args, "oracle_bft_three_node")
+    let localDir: str = v3BackendDriverOracleBftLocalDeployDir(rootDir, label)
+    let localRmLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/local.rm.log"
+    let localRmLog: str = v3path.V3PathAbsolute(rootDir, localRmLogRel)
+    if !v3BackendDriverOracleBftLocalRmRf(rootDir,
+                                          localDir,
+                                          localRmLog):
+        return 1
+    let serverRmLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/server.rm.log"
+    let serverRmLog: str = v3path.V3PathAbsolute(rootDir, serverRmLogRel)
+    if !v3BackendDriverOracleBftRemoteRmRf(rootDir,
+                                           label,
+                                           v3BackendDriverOracleBftServerSsh(),
+                                           v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftServerRoot(),
+                                                                                   label,
+                                                                                   "server"),
+                                           serverRmLog):
+        return 1
+    let relayRmLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/relay.rm.log"
+    let relayRmLog: str = v3path.V3PathAbsolute(rootDir, relayRmLogRel)
+    if !v3BackendDriverOracleBftRemoteRmRf(rootDir,
+                                           label,
+                                           v3BackendDriverOracleBftRelaySsh(),
+                                           v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftRelayRoot(),
+                                                                                   label,
+                                                                                   "relay"),
+                                           relayRmLog):
+        return 1
+    v3BackendDriverPrintLine("v3 oracle bft stop ok")
+    return 0
+
+fn v3BackendDriverOracleBftDeploy(rootDir: str,
+                                  args: str[]): int32 =
+    let label: str = v3BackendDriverOracleBftLabel(args, "oracle_bft_three_node")
+    let stopCode: int32 = v3BackendDriverOracleBftStop(rootDir, args)
+    if stopCode != 0:
+        return stopCode
+    if !v3BackendDriverOracleBftBuildLocalAndRemote(rootDir, args):
+        return 1
+    let localDir: str = v3BackendDriverOracleBftLocalDeployDir(rootDir, label)
+    let serverDir: str = v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftServerRoot(),
+                                                                 label,
+                                                                 "server")
+    let relayDir: str = v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftRelayRoot(),
+                                                                label,
+                                                                "relay")
+    let localMkdirLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/local.mkdir.log"
+    let localMkdirLog: str = v3path.V3PathAbsolute(rootDir, localMkdirLogRel)
+    if !v3BackendDriverOracleBftLocalMkdir(rootDir,
+                                           localDir,
+                                           localMkdirLog):
+        return 1
+    let serverMkdirLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/server.deploy.mkdir.log"
+    let serverMkdirLog: str = v3path.V3PathAbsolute(rootDir, serverMkdirLogRel)
+    if !v3BackendDriverOracleBftRemoteMkdir(rootDir,
+                                            label,
+                                            v3BackendDriverOracleBftServerSsh(),
+                                            serverDir,
+                                            serverMkdirLog):
+        return 1
+    let relayMkdirLogRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/relay.deploy.mkdir.log"
+    let relayMkdirLog: str = v3path.V3PathAbsolute(rootDir, relayMkdirLogRel)
+    if !v3BackendDriverOracleBftRemoteMkdir(rootDir,
+                                            label,
+                                            v3BackendDriverOracleBftRelaySsh(),
+                                            relayDir,
+                                            relayMkdirLog):
+        return 1
+    let localState: str = v3BackendDriverOracleBftStatePath(localDir)
+    let serverState: str = v3BackendDriverOracleBftStatePath(serverDir)
+    let relayState: str = v3BackendDriverOracleBftStatePath(relayDir)
+    if !v3BackendDriverOracleBftFinalizeNodeLocal(rootDir, label, localState):
+        return 1
+    if !v3BackendDriverOracleBftFinalizeNodeRemote(rootDir,
+                                                   label,
+                                                   v3BackendDriverOracleBftServerSsh(),
+                                                   v3BackendDriverOracleBftServerRoot(),
+                                                   "server",
+                                                   serverState):
+        return 1
+    if !v3BackendDriverOracleBftFinalizeNodeRemote(rootDir,
+                                                   label,
+                                                   v3BackendDriverOracleBftRelaySsh(),
+                                                   v3BackendDriverOracleBftRelayRoot(),
+                                                   "relay",
+                                                   relayState):
+        return 1
+    v3BackendDriverPrintLine("v3 oracle bft deploy ok")
+    v3BackendDriverPrintLine("label=" + label)
+    return 0
+
+fn v3BackendDriverOracleBftStatus(rootDir: str,
+                                  args: str[],
+                                  outReport: var str): int32 =
+    let label: str = v3BackendDriverOracleBftLabel(args, "oracle_bft_three_node")
+    let localState: str = v3BackendDriverOracleBftStatePath(v3BackendDriverOracleBftLocalDeployDir(rootDir, label))
+    let serverState: str = v3BackendDriverOracleBftStatePath(v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftServerRoot(),
+                                                                                                      label,
+                                                                                                      "server"))
+    let relayState: str = v3BackendDriverOracleBftStatePath(v3BackendDriverOracleBftRemoteDeployDir(v3BackendDriverOracleBftRelayRoot(),
+                                                                                                     label,
+                                                                                                     "relay"))
+    var localShow: hostops.V3LoggedRun
+    var localLatest: hostops.V3LoggedRun
+    var localTwap: hostops.V3LoggedRun
+    if !v3BackendDriverOracleBftRunStatusQueries(rootDir,
+                                                 label,
+                                                 localState,
+                                                 localShow,
+                                                 localLatest,
+                                                 localTwap):
+        outReport = ""
+        return 1
+    var serverShow: hostops.V3LoggedRun
+    var serverLatest: hostops.V3LoggedRun
+    var serverTwap: hostops.V3LoggedRun
+    if !v3BackendDriverOracleBftRunRemoteStatusQueries(rootDir,
+                                                       label,
+                                                       v3BackendDriverOracleBftServerSsh(),
+                                                       v3BackendDriverOracleBftServerRoot(),
+                                                       "server",
+                                                       serverState,
+                                                       serverShow,
+                                                       serverLatest,
+                                                       serverTwap):
+        outReport = ""
+        return 1
+    var relayShow: hostops.V3LoggedRun
+    var relayLatest: hostops.V3LoggedRun
+    var relayTwap: hostops.V3LoggedRun
+    if !v3BackendDriverOracleBftRunRemoteStatusQueries(rootDir,
+                                                       label,
+                                                       v3BackendDriverOracleBftRelaySsh(),
+                                                       v3BackendDriverOracleBftRelayRoot(),
+                                                       "relay",
+                                                       relayState,
+                                                       relayShow,
+                                                       relayLatest,
+                                                       relayTwap):
+        outReport = ""
+        return 1
+    var report = ""
+    v3BackendDriverOracleAppendReportLine(report, "format", "v3_oracle_bft_three_node_status_v1")
+    v3BackendDriverOracleAppendReportLine(report, "label", label)
+    v3BackendDriverOracleAppendReportLine(report, "pair", "BTC/USD")
+    v3BackendDriverOracleAppendReportLine(report, "window_rounds", "3")
+    v3BackendDriverOracleBftAppendNodeReport(report, "local", localShow, localLatest, localTwap)
+    v3BackendDriverOracleBftAppendNodeReport(report, "server", serverShow, serverLatest, serverTwap)
+    v3BackendDriverOracleBftAppendNodeReport(report, "relay", relayShow, relayLatest, relayTwap)
+    outReport = strutil.Strip(report)
+    return 0
+
+fn v3BackendDriverOracleBftStatusCommand(rootDir: str,
+                                         args: str[]): int32 =
+    var report = ""
+    let statusCode = v3BackendDriverOracleBftStatus(rootDir, args, report)
+    if statusCode != 0:
+        return statusCode
+    v3BackendDriverPrintStdoutBlock(report)
+    return 0
+
+fn v3BackendDriverVerifyOracleBftThreeNode(rootDir: str,
+                                           args: str[]): int32 =
+    let deployCode: int32 = v3BackendDriverOracleBftDeploy(rootDir, args)
+    if deployCode != 0:
+        return deployCode
+    let label: str = v3BackendDriverOracleBftLabel(args, "oracle_bft_three_node")
+    var report = ""
+    let statusCode = v3BackendDriverOracleBftStatus(rootDir, args, report)
+    if statusCode != 0:
+        return statusCode
+    if !v3BackendDriverRequireTextValue(report, "local_height", "3", "v3 oracle bft local"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "server_height", "3", "v3 oracle bft server"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "relay_height", "3", "v3 oracle bft relay"):
+        return 1
+    let expectedLatest = int64ToStr(v3BackendDriverOracleBftExpectedLatestPrice())
+    let expectedTwap = int64ToStr(v3BackendDriverOracleBftExpectedTwapPrice())
+    let expectedHash = v3BackendDriverOracleBftExpectedAppHash()
+    if !v3BackendDriverRequireTextValue(report, "local_latest_price_e8", expectedLatest, "v3 oracle bft local"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "server_latest_price_e8", expectedLatest, "v3 oracle bft server"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "relay_latest_price_e8", expectedLatest, "v3 oracle bft relay"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "local_twap_price_e8", expectedTwap, "v3 oracle bft local"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "server_twap_price_e8", expectedTwap, "v3 oracle bft server"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "relay_twap_price_e8", expectedTwap, "v3 oracle bft relay"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "local_app_hash", expectedHash, "v3 oracle bft local"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "server_app_hash", expectedHash, "v3 oracle bft server"):
+        return 1
+    if !v3BackendDriverRequireTextValue(report, "relay_app_hash", expectedHash, "v3 oracle bft relay"):
+        return 1
+    let reportRel: str = "artifacts/v3_oracle_bft_three_node/" + label + "/verify_oracle_bft_three_node.report.txt"
+    let reportPath: str = v3path.V3PathAbsolute(rootDir, reportRel)
+    if !v3path.V3WriteTextFile(rootDir, reportPath, report + "\n"):
+        v3BackendDriverPrintErr("v3 oracle bft: failed to write verify report")
+        return 1
+    v3BackendDriverPrintStdoutBlock(report)
+    let successText: str = "verify-oracle-bft-three-node: ok (" + label + ")"
+    v3BackendDriverPrintLine(successText)
+    return 0
+
 fn v3BackendDriverR2cCodegenSurfaceSmokeAt(rootDir: str,
                                            repo: str,
                                            outDir: str,
@@ -3994,6 +5332,21 @@ fn main(argc: int32, argv: str*): int32 =
        cmd == "verify-bft-validator-three-node" ||
        cmd == "bench-bft-validator-three-node":
         return v3BackendDriverRunGateTool(rootDir, count)
+    if cmd == "build-oracle-bft-state-machine":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverOracleBftBuild(rootDir, args)
+    if cmd == "deploy-oracle-bft-three-node":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverOracleBftDeploy(rootDir, args)
+    if cmd == "status-oracle-bft-three-node":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverOracleBftStatusCommand(rootDir, args)
+    if cmd == "stop-oracle-bft-three-node":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverOracleBftStop(rootDir, args)
+    if cmd == "verify-oracle-bft-three-node":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverVerifyOracleBftThreeNode(rootDir, args)
     if cmd == "build-browser-host-wasm" ||
        cmd == "run-browser-host-wasm-smoke":
         return v3BackendDriverRunBrowserHostWasmCommand(rootDir, count, cmd)
@@ -4008,6 +5361,9 @@ fn main(argc: int32, argv: str*): int32 =
         return v3BackendDriverVerifyMobileShellBuildProbe(rootDir)
     if cmd == "verify-chain-node-resilience":
         return v3BackendDriverVerifyChainNodeResilienceSurface(rootDir, count)
+    if cmd == "verify-oracle-resilience":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverVerifyOracleResilience(rootDir, args)
     if cmd == "verify-r2c-react-v3-surface":
         return v3BackendDriverVerifyR2cReactV3Surface(rootDir, count)
     if cmd == "r2c-react-v3-codegen-surface-smoke":
@@ -4019,5 +5375,11 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "run-chain-node-resilience-smoke":
         let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
         return v3BackendDriverRunChainNodeResilienceSmoke(rootDir, args)
+    if cmd == "run-oracle-resilience-smoke":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverRunOracleResilienceSmoke(rootDir, args)
+    if cmd == "oracle-fixture-query":
+        let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+        return v3BackendDriverOracleFixtureQuery(rootDir, args)
     let args: str[] = v3BackendDriverCollectArgsFrom(1, count)
     return v3BackendDriverForward(rootDir, args)

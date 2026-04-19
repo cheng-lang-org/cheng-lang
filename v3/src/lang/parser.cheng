@@ -380,12 +380,16 @@ fn v3ParserPreviousToken(lineRaw: str,
     if stopExclusive <= 0:
         return ""
     var end = stopExclusive - 1
-    while end >= 0 && v3ParserIsInlineSpace(lineRaw[end]):
+    while end >= 0:
+        if !v3ParserIsInlineSpace(lineRaw[end]):
+            break
         end = end - 1
     if end < 0:
         return ""
     var start = end
-    while start >= 0 && v3ParserIsIdentChar(lineRaw[start]):
+    while start >= 0:
+        if !v3ParserIsIdentChar(lineRaw[start]):
+            break
         start = start - 1
     return v3path.V3TextSlice(lineRaw, start + 1, end - start)
 
@@ -702,16 +706,30 @@ fn v3ParserAppendRangeExprsLine(sourcePath: str,
                                 layer: var V3NormalizedExprLayer) =
     var i: int32 = 0
     while i + 1 < lineRaw.len:
-        if lineRaw[i] == '.' && lineRaw[i + 1] == '.':
-            if i + 2 < lineRaw.len && lineRaw[i + 2] == '<':
+        if lineRaw[i] == '.':
+            if lineRaw[i + 1] != '.':
+                i = i + 1
+                continue
+            if i + 2 < lineRaw.len:
+                if lineRaw[i + 2] == '<':
+                    v3NormalizedExprLayerAppend(layer,
+                                                sourcePath,
+                                                lineNumber,
+                                                i + 1,
+                                                v3NormalizedExprRange,
+                                                "exclusive",
+                                                "..<")
+                    i = i + 3
+                    continue
+            else:
                 v3NormalizedExprLayerAppend(layer,
                                             sourcePath,
                                             lineNumber,
                                             i + 1,
                                             v3NormalizedExprRange,
-                                            "exclusive",
-                                            "..<")
-                i = i + 3
+                                            "inclusive",
+                                            "..")
+                i = i + 2
                 continue
             v3NormalizedExprLayerAppend(layer,
                                         sourcePath,
@@ -942,7 +960,15 @@ fn v3ParserExportcNameFromAnnotation(lineRaw: str): str =
 fn v3ParserIsImportcAnnotation(lineRaw: str): bool =
     return v3ParserStartsWith(lineRaw, "@importc(")
 
+fn v3ParserHasLeadingIndent(lineRaw: str): bool =
+    if len(lineRaw) <= 0:
+        return false
+    let head = int32(lineRaw[0])
+    return head == 32 || head == 9
+
 fn v3ParserTopLevelFunctionKeyword(lineRaw: str): str =
+    if v3ParserHasLeadingIndent(lineRaw):
+        return ""
     let line = v3path.V3PathTrim(lineRaw)
     if v3ParserStartsWith(line, "importc fn "):
         return "fn"
@@ -959,6 +985,8 @@ fn v3ParserTopLevelFunctionKeyword(lineRaw: str): str =
     return ""
 
 fn v3ParserFunctionNameFromLine(lineRaw: str): str =
+    if v3ParserHasLeadingIndent(lineRaw):
+        return ""
     let line = v3path.V3PathTrim(lineRaw)
     var prefixLen: int32 = 0
     if v3ParserStartsWith(line, "importc fn "):
@@ -990,8 +1018,11 @@ fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
     var pendingImportc = false
     var pendingExplicitExportName: str = ""
     for i in 0..<lines.len:
-        let trimmed = v3path.V3PathTrim(lines[i])
+        let lineRaw = lines[i]
+        let trimmed = v3path.V3PathTrim(lineRaw)
         if trimmed == "":
+            continue
+        if v3ParserHasLeadingIndent(lineRaw):
             continue
         let compilerExportName = v3ParserCompilerTopLevelExportName(trimmed)
         if compilerExportName != "":
@@ -1007,7 +1038,7 @@ fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
             continue
         if v3ParserStartsWith(trimmed, "@"):
             continue
-        let keyword = v3ParserTopLevelFunctionKeyword(trimmed)
+        let keyword = v3ParserTopLevelFunctionKeyword(lineRaw)
         if keyword == "":
             pendingImportc = false
             pendingExplicitExportName = ""
@@ -1015,7 +1046,7 @@ fn v3ParserReadNormalizedFunctionDecls(textRaw: str,
         if keyword != "fn":
             err = v3ParserConcat3("unsupported top-level function alias '", keyword, "'")
             return false
-        let functionName = v3ParserFunctionNameFromLine(trimmed)
+        let functionName = v3ParserFunctionNameFromLine(lineRaw)
         if functionName == "":
             pendingImportc = false
             pendingExplicitExportName = ""

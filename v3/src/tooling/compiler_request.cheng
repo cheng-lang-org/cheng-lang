@@ -18,6 +18,24 @@ type
         targetTriple: str
         emitKind: V3CompilerEmit
         reportPath: str
+        symbolVisibility: str
+        browserBridgeObjectPath: str
+
+fn v3CompilerSymbolVisibilityPublic(): str =
+    return "public"
+
+fn v3CompilerSymbolVisibilityInternal(): str =
+    return "internal"
+
+fn v3CompilerSymbolVisibilityFromText(raw: str): Result[str] =
+    let trimmed = strutil.Strip(raw)
+    if len(trimmed) <= 0:
+        return Ok[str](v3CompilerSymbolVisibilityPublic())
+    if trimmed == v3CompilerSymbolVisibilityPublic():
+        return Ok[str](trimmed)
+    if trimmed == v3CompilerSymbolVisibilityInternal():
+        return Ok[str](trimmed)
+    return Err[str]("v3 compiler: unsupported --symbol-visibility: " + trimmed)
 
 fn v3CompilerRequestNew(rootDir: str,
                         sourcePath: str,
@@ -31,8 +49,22 @@ fn v3CompilerRequestNew(rootDir: str,
         outputPath: outputPath,
         targetTriple: targetTriple,
         emitKind: emitKind,
-        reportPath: reportPath
+        reportPath: reportPath,
+        symbolVisibility: v3CompilerSymbolVisibilityPublic(),
+        browserBridgeObjectPath: ""
     )
+
+fn v3CompilerRequestWithSymbolVisibility(req: V3CompilerRequest,
+                                         symbolVisibility: str): V3CompilerRequest =
+    var out = req
+    out.symbolVisibility = symbolVisibility
+    return out
+
+fn v3CompilerRequestWithBrowserBridgeObject(req: V3CompilerRequest,
+                                            browserBridgeObjectPath: str): V3CompilerRequest =
+    var out = req
+    out.browserBridgeObjectPath = strutil.Strip(browserBridgeObjectPath)
+    return out
 
 fn v3CompilerRequestSourcePath(req: V3CompilerRequest): str =
     return req.sourcePath
@@ -48,6 +80,12 @@ fn v3CompilerRequestTargetTriple(req: V3CompilerRequest): str =
 
 fn v3CompilerRequestEmitKind(req: V3CompilerRequest): V3CompilerEmit =
     return req.emitKind
+
+fn v3CompilerRequestSymbolVisibility(req: V3CompilerRequest): str =
+    return req.symbolVisibility
+
+fn v3CompilerRequestBrowserBridgeObjectPath(req: V3CompilerRequest): str =
+    return req.browserBridgeObjectPath
 
 fn v3CompilerReadFlagOrDefault(args: str[],
                                key: str,
@@ -165,6 +203,8 @@ fn v3CompilerLegacyBackendCompatAllowedFlag(arg: str): bool =
        v3CompilerFlagMatches(arg, "--output") ||
        v3CompilerFlagMatches(arg, "--emit") ||
        v3CompilerFlagMatches(arg, "--target") ||
+       v3CompilerFlagMatches(arg, "--browser-bridge-object") ||
+       v3CompilerFlagMatches(arg, "--symbol-visibility") ||
        v3CompilerFlagMatches(arg, "--report-out") ||
        v3CompilerFlagMatches(arg, "--report"):
         return true
@@ -320,14 +360,22 @@ fn v3CompilerRequestFromArgsForCommand(workspaceRoot: str,
     if IsErr(emitKindRes):
         return Err[V3CompilerRequest](Error(emitKindRes))
     let reportPath = v3CompilerReadFlagOrDefault(args, "--report-out", "")
-    return Ok[V3CompilerRequest](v3CompilerRequestNew(
+    let symbolVisibilityRes = v3CompilerSymbolVisibilityFromText(v3CompilerReadFlagOrDefault(args,
+                                                                                             "--symbol-visibility",
+                                                                                             ""))
+    if IsErr(symbolVisibilityRes):
+        return Err[V3CompilerRequest](Error(symbolVisibilityRes))
+    let browserBridgeObjectPath = v3CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
+    return Ok[V3CompilerRequest](v3CompilerRequestWithBrowserBridgeObject(v3CompilerRequestWithSymbolVisibility(v3CompilerRequestNew(
         packageRoot,
         sourcePath,
         outputPath,
         targetTriple,
         Value(emitKindRes),
         reportPath
-))
+    ),
+    Value(symbolVisibilityRes)),
+    browserBridgeObjectPath))
 
 fn v3CompilerRequestFromArgs(workspaceRoot: str,
                              args: str[]): Result[V3CompilerRequest] =
@@ -421,12 +469,20 @@ fn v3CompilerLegacyBackendCompatRequest(workspaceRoot: str,
     let envReportPath = v3CompilerReadEnvPair("BACKEND_REPORT_OUT", "CHENG_BACKEND_REPORT_OUT")
     if len(reportPath) <= 0:
         reportPath = envReportPath
-    return Ok[V3CompilerRequest](v3CompilerRequestNew(packageRoot,
+    let symbolVisibilityRes = v3CompilerSymbolVisibilityFromText(v3CompilerReadFlagOrDefault(args,
+                                                                                             "--symbol-visibility",
+                                                                                             ""))
+    if IsErr(symbolVisibilityRes):
+        return Err[V3CompilerRequest](Error(symbolVisibilityRes))
+    let browserBridgeObjectPath = v3CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
+    return Ok[V3CompilerRequest](v3CompilerRequestWithBrowserBridgeObject(v3CompilerRequestWithSymbolVisibility(v3CompilerRequestNew(packageRoot,
                                                      sourcePath,
                                                      outputPath,
                                                      targetTriple,
                                                      Value(emitKindRes),
-                                                     reportPath))
+                                                     reportPath),
+                                                     Value(symbolVisibilityRes)),
+                                                     browserBridgeObjectPath))
 
 fn v3CompilerSystemLinkCompatArgs(req: V3CompilerRequest): str[] =
     var out: str[] = []
@@ -437,4 +493,8 @@ fn v3CompilerSystemLinkCompatArgs(req: V3CompilerRequest): str[] =
     add(out, "--out:" + req.outputPath)
     if len(req.reportPath) > 0:
         add(out, "--report-out:" + req.reportPath)
+    if len(req.browserBridgeObjectPath) > 0:
+        add(out, "--browser-bridge-object:" + req.browserBridgeObjectPath)
+    if req.symbolVisibility == v3CompilerSymbolVisibilityInternal():
+        add(out, "--symbol-visibility:" + req.symbolVisibility)
     return out

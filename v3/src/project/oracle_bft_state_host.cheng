@@ -1,0 +1,310 @@
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/oracle_types as oracle_types
+import cheng/v3/project/oracle_bft_state_machine as oracle_bft
+import cheng/v3/tooling/path as v3path
+
+const
+    v3OracleBftStateMagic: str = "v3.oracle.bft.state.v1"
+
+fn v3OracleBftStateCurrentDir(): str =
+    return os.GetCurrentDir()
+
+fn v3OracleBftStateReadTextFile(pathRaw: str): str =
+    let rootDir = v3OracleBftStateCurrentDir()
+    let text = v3path.V3ReadTextFile(rootDir, pathRaw)
+    return text
+
+fn v3OracleBftStateWriteTextFile(pathRaw: str, text: str): bool =
+    let rootDir = v3OracleBftStateCurrentDir()
+    let ok = v3path.V3WriteTextFile(rootDir, pathRaw, text)
+    return ok
+
+fn v3OracleBftStateTextValue(text: str, key: str): str =
+    let prefix = key + "="
+    var start = 0
+    while start < len(text):
+        var end = start
+        while end < len(text):
+            if text[end] == '\n' || text[end] == '\r':
+                break
+            end = end + 1
+        let line = v3path.V3TextSlice(text, start, end - start)
+        if v3path.V3TextStartsWith(line, prefix):
+            return v3path.V3TextSlice(line, len(prefix), len(line) - len(prefix))
+        start = end + 1
+        while start < len(text):
+            if text[start] != '\n' && text[start] != '\r':
+                break
+            start = start + 1
+    return ""
+
+fn v3OracleBftStateParseBool(key: str, raw: str): Result[bool] =
+    let text = strutil.Strip(raw)
+    if text == "1" || text == "true":
+        return Ok[bool](true)
+    if text == "0" || text == "false":
+        return Ok[bool](false)
+    return Err[bool]("v3 oracle state: invalid bool " + key)
+
+fn v3OracleBftStateParseInt64(key: str, raw: str): Result[int64] =
+    let text = strutil.Strip(raw)
+    if len(text) <= 0:
+        return Err[int64]("v3 oracle state: empty integer " + key)
+    var sign = int64(1)
+    var i = 0
+    if text[0] == '+':
+        i = 1
+    elif text[0] == '-':
+        sign = int64(-1)
+        i = 1
+    if i >= len(text):
+        return Err[int64]("v3 oracle state: invalid integer " + key)
+    var value = int64(0)
+    while i < len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int64]("v3 oracle state: invalid integer " + key)
+        value = value * int64(10) + int64(int32(ch) - int32('0'))
+        i = i + 1
+    return Ok[int64](value * sign)
+
+fn v3OracleBftStateParseInt32(key: str, raw: str): Result[int32] =
+    let valueRes = v3OracleBftStateParseInt64(key, raw)
+    if IsErr(valueRes):
+        return Err[int32](Error(valueRes))
+    if Value(valueRes) < int64(-2147483648) || Value(valueRes) > int64(2147483647):
+        return Err[int32]("v3 oracle state: integer overflow " + key)
+    return Ok[int32](int32(Value(valueRes)))
+
+fn v3OracleBftStateHistoryStart(state: oracle_types.V3OraclePairState): int32 =
+    let raw = state.historyHead - state.historyLen
+    if raw >= 0:
+        return raw
+    return raw + oracle_types.v3OracleHistoryMax
+
+fn v3OracleBftStatePushHistory(state: var oracle_types.V3OraclePairState,
+                               roundId: int64,
+                               priceE8: int64) =
+    let writePos = state.historyHead
+    state.historyRoundIds[writePos] = roundId
+    state.historyPricesE8[writePos] = priceE8
+    state.historyHead = (writePos + 1) % oracle_types.v3OracleHistoryMax
+    if state.historyLen < oracle_types.v3OracleHistoryMax:
+        state.historyLen = state.historyLen + 1
+    state.available = true
+    state.latestRoundId = roundId
+    state.latestPriceE8 = priceE8
+
+fn v3OracleBftStateHistoryText(state: oracle_types.V3OraclePairState): str =
+    if state.historyLen <= 0:
+        return ""
+    let start = v3OracleBftStateHistoryStart(state)
+    var out = ""
+    var i = 0
+    while i < state.historyLen:
+        let idx = (start + i) % oracle_types.v3OracleHistoryMax
+        if i > 0:
+            out = out + ","
+        out = out +
+            strings.Int64ToStr(state.historyRoundIds[idx]) +
+            ":" +
+            strings.Int64ToStr(state.historyPricesE8[idx])
+        i = i + 1
+    return out
+
+fn v3OracleBftStateParseHistoryItem(item: str,
+                                    outRoundId: var int64,
+                                    outPriceE8: var int64): Result[bool] =
+    outRoundId = int64(0)
+    outPriceE8 = int64(0)
+    var colonPos = -1
+    var i = 0
+    while i < len(item):
+        if item[i] == ':':
+            colonPos = i
+            break
+        i = i + 1
+    if colonPos <= 0 || colonPos >= len(item) - 1:
+        return Err[bool]("v3 oracle state: invalid history item")
+    let roundText = strings.SliceBytes(item, 0, colonPos)
+    let priceText = strings.SliceBytes(item, colonPos + 1, len(item) - colonPos - 1)
+    let roundRes = v3OracleBftStateParseInt64("history_round", roundText)
+    if IsErr(roundRes):
+        return Err[bool](Error(roundRes))
+    let priceRes = v3OracleBftStateParseInt64("history_price", priceText)
+    if IsErr(priceRes):
+        return Err[bool](Error(priceRes))
+    outRoundId = Value(roundRes)
+    outPriceE8 = Value(priceRes)
+    return Ok[bool](true)
+
+fn v3OracleBftStateParseHistory(raw: str,
+                                outState: var oracle_types.V3OraclePairState): Result[bool] =
+    outState = oracle_types.v3OraclePairStateZero()
+    let text = strutil.Strip(raw)
+    if len(text) <= 0:
+        return Ok[bool](true)
+    var start = 0
+    while start < len(text):
+        var end = start
+        while end < len(text):
+            if text[end] == ',':
+                break
+            end = end + 1
+        let item = strings.SliceBytes(text, start, end - start)
+        if len(item) > 0:
+            var roundId = int64(0)
+            var priceE8 = int64(0)
+            let itemRes = v3OracleBftStateParseHistoryItem(item, roundId, priceE8)
+            if IsErr(itemRes):
+                return Err[bool](Error(itemRes))
+            v3OracleBftStatePushHistory(outState, roundId, priceE8)
+        start = end + 1
+    return Ok[bool](true)
+
+fn v3OracleBftMachineHasPending(machine: oracle_bft.V3OracleBftStateMachine): bool =
+    for i in 0..<oracle_types.v3OraclePendingRoundMax:
+        if machine.pendingRounds[i].active:
+            return true
+    return false
+
+fn v3OracleBftStateLineAppend(out: var str, key: str, value: str) =
+    out = out + key + "=" + value + "\n"
+
+fn v3OracleBftWriteState(pathRaw: str,
+                         machine: oracle_bft.V3OracleBftStateMachine): Result[bool] =
+    if v3OracleBftMachineHasPending(machine):
+        return Err[bool]("v3 oracle state: pending rounds must be finalized before write")
+    let appHash = oracle_bft.v3OracleBftStateMachineQueryAppHash(machine)
+    var out = ""
+    v3OracleBftStateLineAppend(out, "magic", v3OracleBftStateMagic)
+    v3OracleBftStateLineAppend(out, "app_id", machine.appId)
+    v3OracleBftStateLineAppend(out, "committee_set_id", intToStr(machine.committee.committeeSetId))
+    v3OracleBftStateLineAppend(out, "reporter_count", intToStr(machine.committee.reporterCount))
+    v3OracleBftStateLineAppend(out, "quorum", intToStr(machine.committee.quorum))
+    for i in 0..<machine.committee.reporterCount:
+        v3OracleBftStateLineAppend(out,
+                                   "reporter_pubkey_" + intToStr(i + 1),
+                                   layout.fixedBytes65Hex(machine.committee.reporterPubKeys[i]))
+    v3OracleBftStateLineAppend(out, "has_finalized", machine.hasFinalized ? "1" : "0")
+    v3OracleBftStateLineAppend(out, "last_finalized_round_id", strings.Int64ToStr(machine.lastFinalizedRoundId))
+    v3OracleBftStateLineAppend(out, "last_finalized_height", strings.Int64ToStr(machine.lastFinalizedHeight))
+    v3OracleBftStateLineAppend(out, "last_commit_app_hash", layout.fixedBytes32Hex(appHash))
+    for pairIndex in 0..<oracle_types.v3OraclePairCount:
+        let pairState = machine.pairStates[pairIndex]
+        let pairId = pairIndex + 1
+        let prefix = "pair_" + intToStr(pairId) + "_"
+        v3OracleBftStateLineAppend(out, prefix + "available", pairState.available ? "1" : "0")
+        v3OracleBftStateLineAppend(out, prefix + "latest_round_id", strings.Int64ToStr(pairState.latestRoundId))
+        v3OracleBftStateLineAppend(out, prefix + "latest_price_e8", strings.Int64ToStr(pairState.latestPriceE8))
+        v3OracleBftStateLineAppend(out, prefix + "history_len", intToStr(pairState.historyLen))
+        v3OracleBftStateLineAppend(out, prefix + "history", v3OracleBftStateHistoryText(pairState))
+    if !v3OracleBftStateWriteTextFile(pathRaw, out):
+        return Err[bool]("v3 oracle state: write failed")
+    return Ok[bool](true)
+
+fn v3OracleBftLoadState(pathRaw: str,
+                        outMachine: var oracle_bft.V3OracleBftStateMachine): Result[bool] =
+    let text = v3OracleBftStateReadTextFile(pathRaw)
+    if len(text) <= 0:
+        return Err[bool]("v3 oracle state: missing state file")
+    if v3OracleBftStateTextValue(text, "magic") != v3OracleBftStateMagic:
+        return Err[bool]("v3 oracle state: bad state magic")
+    let appId = v3OracleBftStateTextValue(text, "app_id")
+    if len(appId) <= 0:
+        return Err[bool]("v3 oracle state: missing app id")
+    let committeeSetIdRes = v3OracleBftStateParseInt32("committee_set_id",
+                                                       v3OracleBftStateTextValue(text, "committee_set_id"))
+    if IsErr(committeeSetIdRes):
+        return Err[bool](Error(committeeSetIdRes))
+    let reporterCountRes = v3OracleBftStateParseInt32("reporter_count",
+                                                      v3OracleBftStateTextValue(text, "reporter_count"))
+    if IsErr(reporterCountRes):
+        return Err[bool](Error(reporterCountRes))
+    let quorumRes = v3OracleBftStateParseInt32("quorum",
+                                               v3OracleBftStateTextValue(text, "quorum"))
+    if IsErr(quorumRes):
+        return Err[bool](Error(quorumRes))
+    var pubKeys: layout.FixedBytes65[]
+    pubKeys = []
+    for i in 0..<Value(reporterCountRes):
+        let pubRes = layout.fixedBytes65FromHex(v3OracleBftStateTextValue(text, "reporter_pubkey_" + intToStr(i + 1)))
+        if IsErr(pubRes):
+            return Err[bool]("v3 oracle state: bad reporter pubkey")
+        add(pubKeys, Value(pubRes))
+    let committeeRes = oracle_types.v3OracleCommitteeConfigMake(Value(committeeSetIdRes), pubKeys, Value(quorumRes))
+    if IsErr(committeeRes):
+        return Err[bool](Error(committeeRes))
+    outMachine = oracle_bft.v3OracleBftStateMachineInit(appId, Value(committeeRes))
+    let hasFinalizedRes = v3OracleBftStateParseBool("has_finalized", v3OracleBftStateTextValue(text, "has_finalized"))
+    if IsErr(hasFinalizedRes):
+        return Err[bool](Error(hasFinalizedRes))
+    let lastRoundRes = v3OracleBftStateParseInt64("last_finalized_round_id",
+                                                  v3OracleBftStateTextValue(text, "last_finalized_round_id"))
+    if IsErr(lastRoundRes):
+        return Err[bool](Error(lastRoundRes))
+    let lastHeightRes = v3OracleBftStateParseInt64("last_finalized_height",
+                                                   v3OracleBftStateTextValue(text, "last_finalized_height"))
+    if IsErr(lastHeightRes):
+        return Err[bool](Error(lastHeightRes))
+    let storedHashRes = layout.fixedBytes32FromHex(v3OracleBftStateTextValue(text, "last_commit_app_hash"))
+    if IsErr(storedHashRes):
+        return Err[bool]("v3 oracle state: bad app hash")
+    outMachine.hasFinalized = Value(hasFinalizedRes)
+    outMachine.lastFinalizedRoundId = Value(lastRoundRes)
+    outMachine.lastFinalizedHeight = Value(lastHeightRes)
+    for pairIndex in 0..<oracle_types.v3OraclePairCount:
+        let pairId = pairIndex + 1
+        let prefix = "pair_" + intToStr(pairId) + "_"
+        let availableRes = v3OracleBftStateParseBool(prefix + "available",
+                                                     v3OracleBftStateTextValue(text, prefix + "available"))
+        if IsErr(availableRes):
+            return Err[bool](Error(availableRes))
+        let latestRoundRes = v3OracleBftStateParseInt64(prefix + "latest_round_id",
+                                                        v3OracleBftStateTextValue(text, prefix + "latest_round_id"))
+        if IsErr(latestRoundRes):
+            return Err[bool](Error(latestRoundRes))
+        let latestPriceRes = v3OracleBftStateParseInt64(prefix + "latest_price_e8",
+                                                        v3OracleBftStateTextValue(text, prefix + "latest_price_e8"))
+        if IsErr(latestPriceRes):
+            return Err[bool](Error(latestPriceRes))
+        let historyLenRes = v3OracleBftStateParseInt32(prefix + "history_len",
+                                                       v3OracleBftStateTextValue(text, prefix + "history_len"))
+        if IsErr(historyLenRes):
+            return Err[bool](Error(historyLenRes))
+        var pairState = oracle_types.v3OraclePairStateZero()
+        let parseRes = v3OracleBftStateParseHistory(v3OracleBftStateTextValue(text, prefix + "history"), pairState)
+        if IsErr(parseRes):
+            return Err[bool](Error(parseRes))
+        if pairState.historyLen != Value(historyLenRes):
+            return Err[bool]("v3 oracle state: history length mismatch")
+        if Value(availableRes):
+            if !pairState.available:
+                return Err[bool]("v3 oracle state: missing pair history")
+            if pairState.latestRoundId != Value(latestRoundRes) || pairState.latestPriceE8 != Value(latestPriceRes):
+                return Err[bool]("v3 oracle state: latest pair mismatch")
+        else:
+            if pairState.historyLen != 0:
+                return Err[bool]("v3 oracle state: unexpected pair history")
+            if Value(latestRoundRes) != int64(0) || Value(latestPriceRes) != int64(0):
+                return Err[bool]("v3 oracle state: unexpected pair latest")
+        outMachine.pairStates[pairIndex] = pairState
+    if outMachine.hasFinalized:
+        if outMachine.lastFinalizedRoundId <= int64(0) || outMachine.lastFinalizedHeight <= int64(0):
+            return Err[bool]("v3 oracle state: bad finalized head")
+        for pairIndex in 0..<oracle_types.v3OraclePairCount:
+            let pairState = outMachine.pairStates[pairIndex]
+            if !pairState.available || pairState.latestRoundId != outMachine.lastFinalizedRoundId:
+                return Err[bool]("v3 oracle state: finalized pair drift")
+    else:
+        if outMachine.lastFinalizedRoundId != int64(0) || outMachine.lastFinalizedHeight != int64(0):
+            return Err[bool]("v3 oracle state: unexpected empty head")
+    let computedHash = oracle_bft.v3OracleBftStateMachineQueryAppHash(outMachine)
+    if !layout.fixedBytes32Equal(computedHash, Value(storedHashRes)):
+        return Err[bool]("v3 oracle state: app hash drift")
+    outMachine.lastCommitAppHash = computedHash
+    return Ok[bool](true)

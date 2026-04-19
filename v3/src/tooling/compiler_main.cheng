@@ -33,6 +33,11 @@ fn v3CompilerPrintLine(text: str) =
 fn v3CompilerPrintErr(text: str) =
     os.WriteLine(v3CompilerStderrBridge(), text)
 
+fn v3CompilerConcat3(left: str, middle: str, right: str): str =
+    var out = left + middle
+    out = out + right
+    return out
+
 fn v3CompilerPrintBlock(text: str) =
     var start: int32 = 0
     var i: int32 = 0
@@ -200,6 +205,238 @@ fn v3CompilerBridgeCompilerPath(rootDir: str): str =
         return stage0
     return ""
 
+fn v3CompilerBootstrapBridgePath(rootDir: str,
+                                 context: str): str =
+    let snapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage2Compiler.path):
+        return snapshot.stage2Compiler.path
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage1Compiler.path):
+        return snapshot.stage1Compiler.path
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage0Compiler.path):
+        return snapshot.stage0Compiler.path
+    if !v3CompilerEnsureBootstrapBridge(rootDir, context):
+        return ""
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage2Compiler.path):
+        return snapshot.stage2Compiler.path
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage1Compiler.path):
+        return snapshot.stage1Compiler.path
+    if v3path.V3FileExistsNonEmpty(rootDir, snapshot.stage0Compiler.path):
+        return snapshot.stage0Compiler.path
+    v3CompilerPrintErr("v3 compiler: missing bootstrap bridge inside " + context)
+    return ""
+
+fn v3CompilerArgsWithoutReportOut(args: str[]): str[] =
+    var out: str[] = []
+    var i: int32 = 0
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == "--report-out":
+            i = i + 2
+            continue
+        if strutil.StartsWith(arg, "--report-out:") || strutil.StartsWith(arg, "--report-out="):
+            i = i + 1
+            continue
+        add(out, args[i])
+        i = i + 1
+    return out
+
+fn v3CompilerPlanNeedsBootstrapBridge(plan: sexec.V3SystemLinkExecPlan): bool =
+    if plan.systemLinkPlan.missingReasons.len > 0:
+        return false
+    if plan.loweringPlan.missingReasons.len > 0:
+        return false
+    return plan.primaryObjectPlan.missingReasons.len > 0
+
+fn v3CompilerArgsWithReportOut(args: str[],
+                               reportPath: str): str[] =
+    var out = v3CompilerArgsWithoutReportOut(args)
+    if len(reportPath) > 0:
+        add(out, "--report-out:" + reportPath)
+    return out
+
+fn v3CompilerArgsWithoutBrowserBridgeObject(args: str[]): str[] =
+    var out: str[] = []
+    var i: int32 = 0
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == "--browser-bridge-object":
+            i = i + 2
+            continue
+        if strutil.StartsWith(arg, "--browser-bridge-object:") || strutil.StartsWith(arg, "--browser-bridge-object="):
+            i = i + 1
+            continue
+        add(out, args[i])
+        i = i + 1
+    return out
+
+fn v3CompilerArgsWithBrowserBridgeObject(args: str[],
+                                         browserBridgeObjectPath: str): Result[str[]] =
+    let explicitBrowserBridgeObject = creq.v3CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
+    let explicitLinkInput = creq.v3CompilerReadFlagOrDefault(args, "--link-input", "")
+    if len(browserBridgeObjectPath) > 0 && explicitLinkInput == browserBridgeObjectPath:
+        return Err[str[]]("v3 compiler: explicit --link-input conflicts with compiler-owned browser bridge object")
+    if len(explicitBrowserBridgeObject) > 0 &&
+       len(browserBridgeObjectPath) > 0 &&
+       explicitBrowserBridgeObject != browserBridgeObjectPath:
+        return Err[str[]]("v3 compiler: explicit --browser-bridge-object conflicts with compiler-owned browser bridge object")
+    var out = v3CompilerArgsWithoutBrowserBridgeObject(args)
+    if len(explicitBrowserBridgeObject) > 0:
+        add(out, "--browser-bridge-object:" + explicitBrowserBridgeObject)
+    elif len(browserBridgeObjectPath) > 0:
+        add(out, "--browser-bridge-object:" + browserBridgeObjectPath)
+    return Ok[str[]](out)
+
+fn v3CompilerBridgeTempReportPath(req: creq.V3CompilerRequest,
+                                  label: str): str =
+    if len(req.reportPath) <= 0:
+        return ""
+    return req.reportPath + "." + label + ".tmp"
+
+fn v3CompilerAppendReportLine(out: var str,
+                              line: str) =
+    if len(line) <= 0:
+        return
+    if len(out) > 0 && out[len(out) - 1] != '\n':
+        out = out + "\n"
+    out = out + line
+
+fn v3CompilerLinesWithPrefix(text: str,
+                             prefix: str): str[] =
+    var lines: str[] = []
+    var start: int32 = 0
+    var i: int32 = 0
+    while i <= text.len:
+        var lineEnd = false
+        if i == text.len:
+            lineEnd = true
+        elif text[i] == '\n':
+            lineEnd = true
+        if !lineEnd:
+            i = i + 1
+            continue
+        let line = strings.SliceBytes(text, start, i - start)
+        if strutil.StartsWith(line, prefix):
+            add(lines, line)
+        start = i + 1
+        i = i + 1
+    return lines
+
+fn v3CompilerMergeBridgeReport(sourceReport: str,
+                               bridgeReport: str): str =
+    let browserLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_plan")
+    let artifactLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_artifact")
+    let sourceLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_source")
+    let objectLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_object")
+    if browserLines.len <= 0:
+        if artifactLines.len <= 0:
+            if sourceLines.len <= 0:
+                if objectLines.len <= 0:
+                    return bridgeReport
+    var merged = bridgeReport
+    for i in 0..<artifactLines.len:
+        v3CompilerAppendReportLine(merged, artifactLines[i])
+    for i in 0..<sourceLines.len:
+        v3CompilerAppendReportLine(merged, sourceLines[i])
+    for i in 0..<objectLines.len:
+        v3CompilerAppendReportLine(merged, objectLines[i])
+    for i in 0..<browserLines.len:
+        v3CompilerAppendReportLine(merged, browserLines[i])
+    return merged
+
+fn v3CompilerBrowserBridgeCompilerPath(rootDir: str,
+                                       plan: sexec.V3SystemLinkExecPlan): str =
+    let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
+    if len(bridgeCompiler) > 0:
+        return bridgeCompiler
+    if v3CompilerPlanNeedsBootstrapBridge(plan):
+        let bootstrapBridge = v3CompilerBootstrapBridgePath(rootDir, "browser bridge object")
+        if len(bootstrapBridge) > 0:
+            return bootstrapBridge
+    return v3CompilerCurrentExecutablePath(rootDir)
+
+fn v3CompilerWriteBrowserBridgeArtifacts(rootDir: str,
+                                         plan: sexec.V3SystemLinkExecPlan): bool =
+    if !sexec.v3SystemLinkExecWriteBrowserBridgeArtifact(rootDir, plan):
+        return false
+    if !sexec.v3SystemLinkExecWriteBrowserBridgeSource(rootDir, plan):
+        return false
+    return true
+
+fn v3CompilerMaterializeBrowserBridgeObject(rootDir: str,
+                                            plan: sexec.V3SystemLinkExecPlan): bool =
+    let bridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
+    let bridgeObjectBasePath = sexec.v3SystemLinkExecBrowserBridgeObjectBasePath(plan.systemLinkPlan.outputPath)
+    if len(bridgeObjectBasePath) > 0 && len(bridgeObjectPath) <= 0:
+        if os.FileExists(bridgeObjectBasePath):
+            let _ = os.RemoveFile(bridgeObjectBasePath)
+        return true
+    if len(bridgeObjectPath) <= 0:
+        return true
+    let bridgeSourcePath = sexec.v3SystemLinkExecBrowserBridgeSourcePath(plan)
+    if len(bridgeSourcePath) <= 0 || !v3path.V3FileExistsNonEmpty(rootDir, bridgeSourcePath):
+        return false
+    let compilerPath = v3CompilerBrowserBridgeCompilerPath(rootDir, plan)
+    if len(compilerPath) <= 0:
+        return false
+    if os.FileExists(bridgeObjectPath):
+        let _ = os.RemoveFile(bridgeObjectPath)
+    let logPath = bridgeObjectPath + ".compile.log"
+    let compileArgs = [
+        "system-link-exec",
+        "--root:" + plan.systemLinkPlan.packageRoot,
+        "--in:" + bridgeSourcePath,
+        "--emit:obj",
+        "--target:" + plan.systemLinkPlan.targetTriple,
+        "--symbol-visibility:" + creq.v3CompilerSymbolVisibilityInternal(),
+        "--out:" + bridgeObjectPath
+    ]
+    if !v3CompilerRunFileEnvLogged(rootDir,
+                                   compilerPath,
+                                   compileArgs,
+                                   ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                   logPath,
+                                   "browser bridge object compile"):
+        return false
+    return v3path.V3FileExistsNonEmpty(rootDir, bridgeObjectPath)
+
+fn v3CompilerMaterializeBrowserBridgeOutputs(rootDir: str,
+                                             plan: sexec.V3SystemLinkExecPlan): bool =
+    if !v3CompilerWriteBrowserBridgeArtifacts(rootDir, plan):
+        return false
+    return v3CompilerMaterializeBrowserBridgeObject(rootDir, plan)
+
+fn v3CompilerForwardBootstrapBridge(rootDir: str,
+                                    bridgeCompiler: str,
+                                    cmd: str,
+                                    req: creq.V3CompilerRequest,
+                                    args: str[],
+                                    sourceReport: str,
+                                    browserBridgeObjectPath: str): int32 =
+    let bridgeReportPath = v3CompilerBridgeTempReportPath(req, "bootstrap_bridge")
+    if len(bridgeReportPath) > 0 && os.FileExists(bridgeReportPath):
+        let _ = os.RemoveFile(bridgeReportPath)
+    let bridgeArgsRes = v3CompilerArgsWithBrowserBridgeObject(v3CompilerArgsWithReportOut(args, bridgeReportPath),
+                                                              browserBridgeObjectPath)
+    if IsErr(bridgeArgsRes):
+        v3CompilerPrintErr(Error(bridgeArgsRes))
+        return 2
+    let bridgeArgs = Value(bridgeArgsRes)
+    let rc = v3CompilerForwardToBridge(rootDir, bridgeCompiler, cmd, bridgeArgs)
+    if rc != 0:
+        return rc
+    if len(req.reportPath) <= 0:
+        return 0
+    if !os.FileExists(bridgeReportPath):
+        v3CompilerPrintErr("v3 compiler: bootstrap bridge report missing: " + bridgeReportPath)
+        return 2
+    let bridgeReport = v3path.V3ReadTextFile("", bridgeReportPath)
+    let mergedReport = v3CompilerMergeBridgeReport(sourceReport, bridgeReport)
+    if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, mergedReport):
+        v3CompilerPrintErr("v3 compiler: failed to write merged report: " + req.reportPath)
+        return 2
+    let _ = os.RemoveFile(bridgeReportPath)
+    return 0
+
 fn v3CompilerCurrentExecutablePath(rootDir: str): str =
     let raw = strutil.Strip(cmdline.ProgramName())
     if len(raw) <= 0:
@@ -320,6 +557,8 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "verify-backend-driver-command-surface" ||
        cmd == "verify-chain-node-resilience" ||
+       cmd == "verify-oracle-resilience" ||
+       cmd == "oracle-fixture-query" ||
        cmd == "verify-r2c-react-v3-surface" ||
        cmd == "verify-debug-tools" ||
        cmd == "verify-orphan-guard" ||
@@ -342,6 +581,12 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "stop-bft-validator-three-node" || cmd == "bench-bft-validator-three-node":
         return true
+    if cmd == "build-oracle-bft-state-machine" || cmd == "deploy-oracle-bft-three-node":
+        return true
+    if cmd == "verify-oracle-bft-three-node" || cmd == "status-oracle-bft-three-node":
+        return true
+    if cmd == "stop-oracle-bft-three-node":
+        return true
     if cmd == "build-browser-host-wasm" || cmd == "build-rwad-bft-state-machine":
         return true
     if cmd == "build-program-selfhost" || cmd == "build-chain-node":
@@ -358,6 +603,8 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
         return true
     if cmd == "run-chain-node-resilience-smoke":
         return true
+    if cmd == "run-oracle-resilience-smoke":
+        return true
     if cmd == "run-tailnet-control-smoke" || cmd == "run-fresh-node-selfhost-gate":
         return true
     if cmd == "run-migration-gate" || cmd == "run-browser-webrtc-smokes":
@@ -367,8 +614,6 @@ fn v3CompilerForwardsToStage3(cmd: str): bool =
     if cmd == "emit-csg" || cmd == "migrate-csg" || cmd == "verify-world" ||
        cmd == "world-sync" || cmd == "prove-equivalence" || cmd == "prove-migration" ||
        cmd == "publish-world" || cmd == "fresh-node-selfhost" || cmd == "selfhost-build":
-        return true
-    if cmd == "system-link-exec":
         return true
     if cmd == "run-tcp-twoproc-smoke" || cmd == "run-quic-twoproc-smoke":
         return true
@@ -1233,7 +1478,8 @@ fn v3CompilerRunFileEnvLogged(rootDir: str,
     if len(output) > 0:
         v3CompilerPrintErr(output)
     else:
-        v3CompilerPrintErr("v3 compiler: " + context + " failed")
+        let failText = v3CompilerConcat3("v3 compiler: ", context, " failed")
+        v3CompilerPrintErr(failText)
     return false
 
 fn v3CompilerRunFileLogged(rootDir: str,
@@ -1256,7 +1502,8 @@ fn v3CompilerRunProgramLogged(rootDir: str,
     if len(output) > 0:
         v3CompilerPrintErr(output)
     else:
-        v3CompilerPrintErr("v3 compiler: " + context + " failed")
+        let failText = v3CompilerConcat3("v3 compiler: ", context, " failed")
+        v3CompilerPrintErr(failText)
     return false
 
 fn v3CompilerSharedEmitExtension(targetTriple: str): str =
@@ -1730,12 +1977,16 @@ fn v3CompilerRequestFromRuntimeFlags(workspaceRoot: str,
     if IsErr(emitKindRes):
         return Err[creq.V3CompilerRequest](Error(emitKindRes))
     let reportPath = cmdline.ReadFlagOrDefault("--report-out", "")
-    return Ok[creq.V3CompilerRequest](creq.v3CompilerRequestNew(packageRoot,
+    let symbolVisibilityRes = creq.v3CompilerSymbolVisibilityFromText(cmdline.ReadFlagOrDefault("--symbol-visibility", ""))
+    if IsErr(symbolVisibilityRes):
+        return Err[creq.V3CompilerRequest](Error(symbolVisibilityRes))
+    return Ok[creq.V3CompilerRequest](creq.v3CompilerRequestWithSymbolVisibility(creq.v3CompilerRequestNew(packageRoot,
                                                                 sourcePath,
                                                                 outputPath,
                                                                 targetTriple,
                                                                 Value(emitKindRes),
-                                                                reportPath))
+                                                                reportPath),
+                                                                Value(symbolVisibilityRes)))
 
 fn v3CompilerBuildSystemPlanFromRuntimeFlags(rootDir: str,
                                              req: creq.V3CompilerRequest): Result[sexec.V3SystemLinkExecPlan] =
@@ -1788,9 +2039,40 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
+    if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+        v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
+        return 2
+    let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
+    let forwardArgsRes = v3CompilerArgsWithBrowserBridgeObject(args, browserBridgeObjectPath)
+    if IsErr(forwardArgsRes):
+        v3CompilerPrintErr(Error(forwardArgsRes))
+        return 2
+    let forwardArgs = Value(forwardArgsRes)
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
-        return v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", args)
+        let rc = v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", forwardArgs)
+        if rc != 0:
+            return rc
+        if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+            v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
+            return 2
+        return 0
+    if v3CompilerPlanNeedsBootstrapBridge(plan):
+        let bootstrapBridge = v3CompilerBootstrapBridgePath(rootDir, "system-link-exec")
+        if len(bootstrapBridge) > 0:
+            let rc = v3CompilerForwardBootstrapBridge(rootDir,
+                                                      bootstrapBridge,
+                                                      "system-link-exec",
+                                                      req,
+                                                      forwardArgs,
+                                                      report,
+                                                      browserBridgeObjectPath)
+            if rc != 0:
+                return rc
+            if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+                v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
+                return 2
+            return 0
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for system-link-exec")
         v3CompilerPrintErr(report)
@@ -1821,9 +2103,24 @@ fn v3CompilerRunLegacyCompatSystemLinkExec(rootDir: str,
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
+    if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+        v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
+        return 2
+    let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
+    let compatArgsRes = v3CompilerArgsWithBrowserBridgeObject(compatArgs, browserBridgeObjectPath)
+    if IsErr(compatArgsRes):
+        v3CompilerPrintErr(Error(compatArgsRes))
+        return 2
+    let forwardCompatArgs = Value(compatArgsRes)
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
-        return v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", compatArgs)
+        let rc = v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", forwardCompatArgs)
+        if rc != 0:
+            return rc
+        if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
+            v3CompilerPrintErr("v3 compiler: failed to restore browser bridge outputs")
+            return 2
+        return 0
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for system-link-exec")
         v3CompilerPrintErr(report)
@@ -2035,10 +2332,26 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
                                       outReportPath: var str,
                                       outCompileLogPath: var str,
                                       outRunLogPath: var str): bool =
-    outBin = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/" + stem + ".selftest")
+    var outBinRel = "artifacts/v3_backend_driver/"
+    outBinRel = outBinRel + stem
+    outBinRel = outBinRel + ".selftest"
+    outBin = v3path.V3PathAbsolute(rootDir, outBinRel)
     outReportPath = outBin + ".report.txt"
-    outCompileLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/" + stem + ".selftest.compile.log")
-    outRunLogPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/" + stem + ".selftest.run.log")
+    var outCompileLogRel = "artifacts/v3_backend_driver/"
+    outCompileLogRel = outCompileLogRel + stem
+    outCompileLogRel = outCompileLogRel + ".selftest.compile.log"
+    var outRunLogRel = "artifacts/v3_backend_driver/"
+    outRunLogRel = outRunLogRel + stem
+    outRunLogRel = outRunLogRel + ".selftest.run.log"
+    outCompileLogPath = v3path.V3PathAbsolute(rootDir, outCompileLogRel)
+    outRunLogPath = v3path.V3PathAbsolute(rootDir, outRunLogRel)
+    let compileContext = v3CompilerConcat3("build-backend-driver ", stem, " compile")
+    let runContext = v3CompilerConcat3("build-backend-driver ", stem, " run")
+    let seedDiagText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest emitted internal seed diagnostics")
+    let emptyStdoutText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest expected empty stdout")
+    let driftText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest output drifted")
+    let missingOutputPrefix = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest missing output: ")
+    let missingOutputText = missingOutputPrefix + outBin
     var compileArgs: str[] = []
     add(compileArgs, "system-link-exec")
     add(compileArgs, "--root:" + packageRoot)
@@ -2051,29 +2364,29 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
                                 compilerPath,
                                 compileArgs,
                                 outCompileLogPath,
-                                "build-backend-driver " + stem + " compile"):
+                                compileContext):
         return false
     let compileText = v3path.V3ReadTextFile("", outCompileLogPath)
     if strutil.Contains(compileText, "[cheng_v3_seed]"):
-        v3CompilerPrintErr("v3 compiler: backend driver " + stem + " selftest emitted internal seed diagnostics")
+        v3CompilerPrintErr(seedDiagText)
         return false
     if !v3path.V3PathFileExists(outBin) || !v3path.V3PathFileExists(outBin + ".v3.map"):
-        v3CompilerPrintErr("v3 compiler: backend driver " + stem + " selftest missing output: " + outBin)
+        v3CompilerPrintErr(missingOutputText)
         return false
     let runArgs: str[] = []
     if !v3CompilerRunFileLogged(rootDir,
                                 outBin,
                                 runArgs,
                                 outRunLogPath,
-                                "build-backend-driver " + stem + " run"):
+                                runContext):
         return false
     let runText = strutil.Strip(v3path.V3ReadTextFile("", outRunLogPath))
     if len(expectedOutput) <= 0:
         if len(runText) > 0:
-            v3CompilerPrintErr("v3 compiler: backend driver " + stem + " selftest expected empty stdout")
+            v3CompilerPrintErr(emptyStdoutText)
             return false
     elif runText != expectedOutput:
-        v3CompilerPrintErr("v3 compiler: backend driver " + stem + " selftest output drifted")
+        v3CompilerPrintErr(driftText)
         if len(runText) > 0:
             v3CompilerPrintErr(runText)
         return false
@@ -2493,6 +2806,8 @@ fn v3CompilerBootstrapBridgeFresh(rootDir: str,
         return false
     if !v3path.V3PathFileExists(snapshot.bootstrapEnv.path):
         return false
+    if !v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage2Compiler.path):
+        return false
     if !v3CompilerBootstrapFreshInputsReady(rootDir, snapshot.stage3Compiler.path):
         return false
     return true
@@ -2516,9 +2831,10 @@ fn v3CompilerBootstrapMaterializeStage0Candidate(rootDir: str,
                                        logPath,
                                        "bootstrap-bridge stage0-chmod"):
             return false
+        let buildText = v3CompilerConcat3("stage0_candidate_copied_from=", compilerPath, "\n")
         return v3path.V3WriteTextFile(rootDir,
                                       buildLogPath,
-                                      "stage0_candidate_copied_from=" + compilerPath + "\n")
+                                      buildText)
     if v3path.V3PathFileExists(candidatePath):
         os.RemoveFile(candidatePath)
     if !v3CompilerRunProgramLogged(rootDir,
@@ -2527,9 +2843,10 @@ fn v3CompilerBootstrapMaterializeStage0Candidate(rootDir: str,
                                    logPath,
                                    "bootstrap-bridge stage0-symlink"):
         return false
+    let buildText = v3CompilerConcat3("stage0_symlinked_from=", compilerPath, "\n")
     if !v3path.V3WriteTextFile(rootDir,
                                buildLogPath,
-                               "stage0_symlinked_from=" + compilerPath + "\n"):
+                               buildText):
         return false
     return v3path.V3PathFileExists(candidatePath)
 
@@ -3928,6 +4245,15 @@ fn v3CompilerSelfhostBuild(rootDir: str,
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
         return v3CompilerForwardToBridge(rootDir, bridgeCompiler, "selfhost-build", args)
+    if v3CompilerPlanNeedsBootstrapBridge(plan):
+        let bootstrapBridge = v3CompilerBootstrapBridgePath(rootDir, "selfhost-build")
+        if len(bootstrapBridge) > 0:
+            return v3CompilerForwardBootstrapBridge(rootDir,
+                                                    bootstrapBridge,
+                                                    "selfhost-build",
+                                                    req,
+                                                    args,
+                                                    report)
     if sexec.v3SystemLinkExecPlanReady(plan):
         v3CompilerPrintErr("v3 compiler: missing live Cheng bridge for selfhost-build")
         v3CompilerPrintErr(report)
@@ -4918,6 +5244,12 @@ fn main(argc: int32, argv: str*): int32 =
             return 0
         if subcmd == "status":
             return v3CompilerR2cReactV3Status(rootDir)
+    if cmd == "system-link-exec":
+        let reqRes = v3CompilerRequestFromRuntimeFlags(rootDir, true)
+        if IsErr(reqRes):
+            v3CompilerPrintErr(Error(reqRes))
+            return 2
+        return v3CompilerRunSystemLinkExec(rootDir, Value(reqRes), args)
     if cmd == "verify-x86-linux-remote" ||
        cmd == "run-shared-emit-smokes" ||
        cmd == "r2c-react-v3-fresh-clean-gate" ||

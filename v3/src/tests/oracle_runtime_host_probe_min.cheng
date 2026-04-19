@@ -14,6 +14,27 @@ import cheng/v3/libp2p/core/types
 import cheng/v3/libp2p/core/multiaddr
 import cheng/v3/libp2p/host/host
 
+fn oracleProbeVerifyLocal(batch: var oracle_plane.V3OracleSignedBatch, pubBytes: Bytes): bool =
+    echo("probe: local structural start")
+    let okRes = oracle_plane.v3OracleSignedBatchStructuralValidate(batch)
+    echo("probe: local structural done")
+    if IsErr(okRes):
+        return false
+    echo("probe: local signable start")
+    let signableRes = oracle_plane.v3OracleSignedBatchSignableBytes(batch)
+    echo("probe: local signable done")
+    if IsErr(signableRes):
+        return false
+    echo("probe: local sig bytes start")
+    let sigBytes = layout.fixedBytes64ToBytes(batch.sig)
+    echo("probe: local sig bytes done")
+    echo("probe: local verify start")
+    let verifyOk = ecnist.ecdsaVerifyTrustedBytes(pubBytes, Value(signableRes), sigBytes)
+    echo("probe: local verify done")
+    if !verifyOk:
+        return false
+    return true
+
 fn main(): int32 =
     echo("probe: start")
     let committee = support.oracleSmokeCommittee()
@@ -60,31 +81,56 @@ fn main(): int32 =
     let scope = overlay.v3OverlayScopeRegion
     echo("probe: address done")
 
-    let batch = support.oracleSmokeBatch(int64(12), 1)
-    echo("probe: batch")
-    let structuralRes = oracle_plane.v3OracleSignedBatchStructuralValidate(batch)
-    assert(IsOk(structuralRes), "probe: structural")
-    echo("probe: structural")
-    let signableRes = oracle_plane.v3OracleSignedBatchSignableBytes(batch)
-    assert(IsOk(signableRes), "probe: signable")
-    echo("probe: signable")
-    let pubKey = committee.reporterPubKeys[batch.reporterSlot - 1]
-    echo("probe: pubkey")
-    let pubBytes = layout.fixedBytes65ToBytes(pubKey)
-    echo("probe: pub bytes")
-    let sigBytes = layout.fixedBytes64ToBytes(batch.sig)
-    echo("probe: sig bytes")
-    let pubTrustedOk = ecnist.validateEcdsaTrustedPublicKeyBytes(pubBytes)
-    assert(pubTrustedOk, "probe: validate trusted pub")
-    echo("probe: validate trusted pub")
-    let sigShapeOk = ecnist.validateEcdsaSignatureBytes(sigBytes)
-    assert(sigShapeOk, "probe: validate sig")
-    echo("probe: validate sig")
-    let verifyTrusted = ecnist.ecdsaVerifyTrustedBytes(pubBytes, Value(signableRes), sigBytes)
-    assert(verifyTrusted, "probe: verify trusted")
-    echo("probe: verify trusted")
-    let verifyDirectRes = fixed256.p256VerifyMessageFixed64(pubKey, Value(signableRes), batch.sig)
-    assert(IsOk(verifyDirectRes), "probe: verify direct")
-    echo("probe: verify direct")
+    for reporterSlot in 1..<6:
+        echo("probe: reporter")
+        var batch = support.oracleSmokeBatch(int64(12), reporterSlot)
+        echo("probe: batch")
+        let structuralRes = oracle_plane.v3OracleSignedBatchStructuralValidate(batch)
+        assert(IsOk(structuralRes), "probe: structural")
+        echo("probe: structural")
+        let signableRes = oracle_plane.v3OracleSignedBatchSignableBytes(batch)
+        assert(IsOk(signableRes), "probe: signable")
+        echo("probe: signable")
+        let pubKey = committee.reporterPubKeys[batch.reporterSlot - 1]
+        echo("probe: pubkey")
+        let pubBytes = layout.fixedBytes65ToBytes(pubKey)
+        echo("probe: pub bytes")
+        let sigBytes = layout.fixedBytes64ToBytes(batch.sig)
+        echo("probe: sig bytes")
+        let pubTrustedOk = ecnist.validateEcdsaTrustedPublicKeyBytes(pubBytes)
+        assert(pubTrustedOk, "probe: validate trusted pub")
+        echo("probe: validate trusted pub")
+        let sigShapeOk = ecnist.validateEcdsaSignatureBytes(sigBytes)
+        assert(sigShapeOk, "probe: validate sig")
+        echo("probe: validate sig")
+        let verifyTrusted = ecnist.ecdsaVerifyTrustedBytes(pubBytes, Value(signableRes), sigBytes)
+        assert(verifyTrusted, "probe: assert verify trusted")
+        echo("probe: echo verify trusted")
+        return 0
+        echo("probe: before verify local")
+        let verifyLocalOk = oracleProbeVerifyLocal(batch, pubBytes)
+        if !verifyLocalOk:
+            echo("probe: verify local err")
+            return 1
+        echo("probe: verify local")
+        echo("probe: before verify direct")
+        let verifyDirectRes = oracle_plane.v3OracleSignedBatchVerify(batch, pubBytes)
+        if IsErr(verifyDirectRes):
+            let directErr = Error(verifyDirectRes)
+            echo("probe: verify direct err")
+            echo(directErr)
+            return 1
+        echo("probe: verify direct")
+        echo("probe: before verify against committee")
+        let verifyRes = oracle_plane.v3OracleSignedBatchVerifyAgainstCommittee(batch, committee)
+        if IsErr(verifyRes):
+            let errText = Error(verifyRes)
+            echo("probe: verify against committee err")
+            echo(errText)
+            return 1
+        echo("probe: verify against committee")
+        let storeGossipRes = oracle_host.v3OracleFastRuntimeStoreBatch(gossipRuntime, batch)
+        assert(IsOk(storeGossipRes), "probe: store gossip")
+        echo("probe: store gossip")
     echo("probe: done")
     return 0

@@ -1,0 +1,185 @@
+import std/buffer
+import std/result
+import std/rawbytes
+
+type
+    V3QpackHeaderField =
+        name: str
+        value: str
+        sensitive: bool
+
+    V3QpackFieldSection =
+        fields: V3QpackHeaderField[]
+
+    V3QpackIntegerDecoded =
+        value: int64
+        next: int32
+
+const
+    v3QpackFieldSectionPrefixRequiredInsertCountZero = 0
+    v3QpackFieldSectionPrefixBaseZero = 0
+    v3QpackLiteralFieldLineWithLiteralNameBits = 0x20
+    v3QpackLiteralFieldLineNeverIndexBit = 0x10
+    v3QpackLiteralFieldLineNameHuffmanBit = 0x08
+    v3QpackStringHuffmanBit = 0x80
+
+fn v3QpackHeaderField(name: str, value: str, sensitive: bool): V3QpackHeaderField =
+    return V3QpackHeaderField(name: name, value: value, sensitive: sensitive)
+
+fn v3QpackFieldSectionZero(): V3QpackFieldSection =
+    var out: V3QpackFieldSection
+    out.fields = []
+    return out
+
+fn v3QpackPrefixMask(prefixBits: int32): int32 =
+    if prefixBits <= 0:
+        return 0
+    if prefixBits >= 8:
+        return 255
+    var out: int32 = 1
+    var i: int32 = 0
+    while i < prefixBits:
+        out = out * 2
+        i = i + 1
+    return out - 1
+
+fn v3QpackAppendPrefixedInt(out: var buffer.ByteBuffer,
+                            firstMask: int32,
+                            prefixBits: int32,
+                            value: int64): Result[bool] =
+    if value < 0:
+        return Err[bool]("qpack: negative integer")
+    let mask: int32 = v3QpackPrefixMask(prefixBits)
+    if mask <= 0:
+        return Err[bool]("qpack: invalid prefix")
+    if value < int64(mask):
+        buffer.appendByte(out, firstMask | int32(value))
+        return Ok[bool](true)
+    buffer.appendByte(out, firstMask | mask)
+    var remain: int64 = value - int64(mask)
+    while remain >= 128:
+        buffer.appendByte(out, int32(remain % 128) + 128)
+        remain = remain / 128
+    buffer.appendByte(out, int32(remain))
+    return Ok[bool](true)
+
+fn v3QpackDecodePrefixedInt(data: Bytes,
+                            offset: int32,
+                            prefixBits: int32): Result[V3QpackIntegerDecoded] =
+    if offset < 0 || offset >= bytesLen(data):
+        return Err[V3QpackIntegerDecoded]("qpack: truncated integer")
+    let mask: int32 = v3QpackPrefixMask(prefixBits)
+    if mask <= 0:
+        return Err[V3QpackIntegerDecoded]("qpack: invalid prefix")
+    let first: int32 = bytesGet(data, offset)
+    let prefixValue: int32 = first & mask
+    if prefixValue < mask:
+        return Ok[V3QpackIntegerDecoded](V3QpackIntegerDecoded(value: int64(prefixValue),
+                                                               next: offset + 1))
+    var result: int64 = int64(mask)
+    var mul: int64 = 1
+    var idx: int32 = offset + 1
+    while idx < bytesLen(data):
+        let b: int32 = bytesGet(data, idx)
+        result = result + (int64(b & 0x7f) * mul)
+        idx = idx + 1
+        if (b & 0x80) == 0:
+            return Ok[V3QpackIntegerDecoded](V3QpackIntegerDecoded(value: result, next: idx))
+        mul = mul * 128
+        if mul <= 0:
+            return Err[V3QpackIntegerDecoded]("qpack: integer overflow")
+    return Err[V3QpackIntegerDecoded]("qpack: truncated integer")
+
+fn v3QpackAppendString(out: var buffer.ByteBuffer,
+                       firstMask: int32,
+                       prefixBits: int32,
+                       text: str): Result[bool] =
+    let data: Bytes = bytesFromString(text)
+    let lenRes: Result[bool] = v3QpackAppendPrefixedInt(out, firstMask, prefixBits, int64(bytesLen(data)))
+    if IsErr(lenRes):
+        return Err[bool](ErrorText(lenRes))
+    if bytesLen(data) > 0:
+        buffer.appendBytes(out, data)
+    return Ok[bool](true)
+
+fn v3QpackDecodeString(data: Bytes,
+                       offset: int32,
+                       prefixBits: int32,
+                       huffmanBit: int32): Result[V3QpackIntegerDecoded] =
+    if offset < 0 || offset >= bytesLen(data):
+        return Err[V3QpackIntegerDecoded]("qpack: truncated string")
+    let first: int32 = bytesGet(data, offset)
+    if (first & huffmanBit) != 0:
+        return Err[V3QpackIntegerDecoded]("qpack: huffman unsupported")
+    let lenRes: Result[V3QpackIntegerDecoded] = v3QpackDecodePrefixedInt(data, offset, prefixBits)
+    if IsErr(lenRes):
+        return Err[V3QpackIntegerDecoded](ErrorText(lenRes))
+    let length: int32 = int32(Value(lenRes).value)
+    let start: int32 = Value(lenRes).next
+    if length < 0 || start + length > bytesLen(data):
+        return Err[V3QpackIntegerDecoded]("qpack: truncated string")
+    return Ok[V3QpackIntegerDecoded](V3QpackIntegerDecoded(value: int64(start), next: start + length))
+
+fn v3QpackEncodeLiteralFieldLine(out: var buffer.ByteBuffer,
+                                 field: V3QpackHeaderField): Result[bool] =
+    var firstMask: int32 = v3QpackLiteralFieldLineWithLiteralNameBits
+    if field.sensitive:
+        firstMask = firstMask + v3QpackLiteralFieldLineNeverIndexBit
+    let nameRes: Result[bool] = v3QpackAppendString(out, firstMask, 3, field.name)
+    if IsErr(nameRes):
+        return Err[bool](ErrorText(nameRes))
+    return v3QpackAppendString(out, 0, 7, field.value)
+
+fn v3QpackEncodeLiteralFieldSection(fields: V3QpackHeaderField[]): Result[Bytes] =
+    var out = buffer.newByteBuffer()
+    buffer.appendByte(out, v3QpackFieldSectionPrefixRequiredInsertCountZero)
+    buffer.appendByte(out, v3QpackFieldSectionPrefixBaseZero)
+    for i in 0..<fields.len:
+        let lineRes: Result[bool] = v3QpackEncodeLiteralFieldLine(out, fields[i])
+        if IsErr(lineRes):
+            return Err[Bytes](ErrorText(lineRes))
+    return Ok[Bytes](buffer.toBytes(out))
+
+fn v3QpackDecodeLiteralFieldSection(data: Bytes): Result[V3QpackFieldSection] =
+    if bytesLen(data) < 2:
+        return Err[V3QpackFieldSection]("qpack: field section truncated")
+    if bytesGet(data, 0) != 0 || bytesGet(data, 1) != 0:
+        return Err[V3QpackFieldSection]("qpack: dynamic table unsupported")
+    var out: V3QpackFieldSection = v3QpackFieldSectionZero()
+    var idx: int32 = 2
+    while idx < bytesLen(data):
+        let first: int32 = bytesGet(data, idx)
+        if (first & 0xe0) != v3QpackLiteralFieldLineWithLiteralNameBits:
+            return Err[V3QpackFieldSection]("qpack: unsupported field line")
+        let sensitive: bool = (first & v3QpackLiteralFieldLineNeverIndexBit) != 0
+        let nameSpanRes: Result[V3QpackIntegerDecoded] = v3QpackDecodeString(data, idx, 3, v3QpackLiteralFieldLineNameHuffmanBit)
+        if IsErr(nameSpanRes):
+            return Err[V3QpackFieldSection](ErrorText(nameSpanRes))
+        let nameStart: int32 = int32(Value(nameSpanRes).value)
+        let nameLen: int32 = Value(nameSpanRes).next - nameStart
+        let valueSpanRes: Result[V3QpackIntegerDecoded] = v3QpackDecodeString(data, Value(nameSpanRes).next, 7, v3QpackStringHuffmanBit)
+        if IsErr(valueSpanRes):
+            return Err[V3QpackFieldSection](ErrorText(valueSpanRes))
+        let valueStart: int32 = int32(Value(valueSpanRes).value)
+        let valueLen: int32 = Value(valueSpanRes).next - valueStart
+        add(out.fields,
+            V3QpackHeaderField(name: bytesToString(bytesSlice(data, nameStart, nameLen)),
+                               value: bytesToString(bytesSlice(data, valueStart, valueLen)),
+                               sensitive: sensitive))
+        idx = Value(valueSpanRes).next
+    return Ok[V3QpackFieldSection](out)
+
+fn V3QpackMakeHeaderField(name: str, value: str): V3QpackHeaderField =
+    return v3QpackHeaderField(name, value, false)
+
+fn V3QpackMakeSensitiveHeaderField(name: str, value: str): V3QpackHeaderField =
+    return v3QpackHeaderField(name, value, true)
+
+fn V3QpackFieldSectionZero(): V3QpackFieldSection =
+    return v3QpackFieldSectionZero()
+
+fn V3QpackEncodeLiteralFieldSection(fields: V3QpackHeaderField[]): Result[Bytes] =
+    return v3QpackEncodeLiteralFieldSection(fields)
+
+fn V3QpackDecodeLiteralFieldSection(data: Bytes): Result[V3QpackFieldSection] =
+    return v3QpackDecodeLiteralFieldSection(data)

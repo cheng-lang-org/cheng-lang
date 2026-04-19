@@ -29,6 +29,11 @@ fn cheng_fopen(filename, mode: cstring): ptr
 fn cheng_fclose(stream: ptr): int32
 @importc("cheng_fwrite")
 fn cheng_fwrite(buf: ptr, size: int64, n: int64, stream: ptr): int32
+@importc("cheng_mobile_host_emit_log")
+fn cheng_mobile_host_emit_log(message: str)
+
+fn v3MobileCapiEmitLog(message: str) =
+    cheng_mobile_host_emit_log(message)
 
 fn v3MobileCapiPeerIdFromSeed(seed: str): str =
     var peerValue = types.v3Libp2pPeerIdZero()
@@ -148,6 +153,12 @@ fn v3MobileCapiTextBufferHandle(text: str): uint64 =
         bytesSet(raw, i, int32(text[i]) & 255)
     return cheng_v3_buffer_handle_from_raw_bridge(raw.data, textLen)
 
+fn v3MobileCapiBytesBufferHandle(payload: Bytes): int32 =
+    let payloadLen = bytesLen(payload)
+    if payloadLen <= 0:
+        return 0
+    return int32(cheng_v3_buffer_handle_from_raw_bridge(payload.data, payloadLen))
+
 fn v3MobileCapiTextCString(text: str): ptr =
     let textLen = len(text)
     let raw = c_malloc(int64(textLen + 1))
@@ -167,6 +178,11 @@ fn v3MobileCapiCopyRawText(raw: ptr): str =
         return ""
     let out = strFromCStringCopy(cstring(raw))
     return out
+
+fn v3MobileCapiCopyRawTextLen(raw: ptr, textLen: int32): str =
+    if raw == nil || textLen <= 0:
+        return ""
+    return bytesToString(bytesView(raw, textLen))
 
 type V3MobileMoqDroplet = object
     objectIndex: int32
@@ -219,6 +235,218 @@ fn v3MobileCapiMoqError(errorText: str): str =
     var out = ""
     out = v3MobileCapiWireAppendRaw(out, "ok", "0")
     out = v3MobileCapiWireAppendRaw(out, "error", errorText)
+    return out
+
+fn v3MobileCapiPathJoin(dirPath: str, fileName: str): str =
+    if len(dirPath) <= 0:
+        return fileName
+    if dirPath[len(dirPath) - 1] == '/':
+        return dirPath + fileName
+    return dirPath + "/" + fileName
+
+fn v3MobileCapiWriteBytesFile(path: str, payload: Bytes): Result[bool] =
+    let outFile = cheng_fopen(strToCStringTemp(path), "wb")
+    if outFile == nil:
+        return Err[bool]("moq_fountain_write_open_failed")
+    let payloadLen = bytesLen(payload)
+    if payloadLen > 0:
+        let wrote: int32 = cheng_fwrite(payload.data, 1, payloadLen, outFile)
+        if wrote != payloadLen:
+            cheng_fclose(outFile)
+            return Err[bool]("moq_fountain_write_failed")
+    cheng_fclose(outFile)
+    return Ok[bool](true)
+
+fn v3MobileCapiWriteTraceLine(path: str, line: str): Result[bool] =
+    v3MobileCapiWriteBytesFile(path, bytesFromString(line + "\n"))
+
+fn v3MobileCapiMoqBuildPersistWire(result: moq.V3Libp2pMoqBuildResult,
+                                   outputDir: str,
+                                   fileNameStem: str): Result[str] =
+    let catalogPath = v3MobileCapiPathJoin(outputDir, fileNameStem + ".catalog.json")
+    let catalogWriteRes = v3MobileCapiWriteBytesFile(catalogPath, result.catalogPayload)
+    if IsErr(catalogWriteRes):
+        return Err[str](Error(catalogWriteRes))
+    let rebuildPath = v3MobileCapiPathJoin(outputDir, fileNameStem + ".rebuild.txt")
+    let rebuildWriteRes = v3MobileCapiWriteBytesFile(rebuildPath, result.rebuildTemplatePayload)
+    if IsErr(rebuildWriteRes):
+        return Err[str](Error(rebuildWriteRes))
+    var out = ""
+    out = v3MobileCapiWireAppendRaw(out, "ok", "1")
+    out = v3MobileCapiWireAppendRaw(out, "owner_peer_id", result.ownerPeerId)
+    out = v3MobileCapiWireAppendRaw(out, "mime_type", result.mimeType)
+    out = v3MobileCapiWireAppendRaw(out, "bundle_cid", result.bundleCid)
+    out = v3MobileCapiWireAppendRaw(out, "blob_cid", result.blobCid)
+    out = v3MobileCapiWireAppendRaw(out, "catalog_key", result.catalogKey)
+    out = v3MobileCapiWireAppendRaw(out, "catalog_cid", result.catalogCid)
+    out = v3MobileCapiWireAppendInt(out, "catalog_size_bytes", result.catalogSizeBytes)
+    out = v3MobileCapiWireAppendRaw(out, "catalog_path", catalogPath)
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_key", result.rebuildTemplateKey)
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_cid", result.rebuildTemplateCid)
+    out = v3MobileCapiWireAppendInt(out, "rebuild_template_size_bytes", result.rebuildTemplateSizeBytes)
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_path", rebuildPath)
+    out = v3MobileCapiWireAppendInt(out, "blob_byte_len", result.blobByteLen)
+    out = v3MobileCapiWireAppendInt(out, "object_target_bytes", result.objectTargetBytes)
+    out = v3MobileCapiWireAppendInt(out, "source_block_bytes", result.sourceBlockBytes)
+    out = v3MobileCapiWireAppendInt(out, "object_count", result.objectCount)
+    out = v3MobileCapiWireAppendRaw(out, "remote_ack_peer_ids", moq.v3Libp2pMoqJoinCsv(result.remoteAckPeerIds))
+    var objectRow: int32 = 0
+    while objectRow < result.objects.len:
+        let item = result.objects[objectRow]
+        let prefix = "object." + strings.IntToStr(objectRow) + "."
+        out = v3MobileCapiWireAppendInt(out, prefix + "object_index", item.objectIndex)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "group_id", item.groupId)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "object_id", item.objectId)
+        out = v3MobileCapiWireAppendInt(out, prefix + "priority", item.priority)
+        out = v3MobileCapiWireAppendInt(out, prefix + "byte_offset", item.byteOffset)
+        out = v3MobileCapiWireAppendInt(out, prefix + "byte_length", item.byteLength)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "object_cid", item.objectCid)
+        out = v3MobileCapiWireAppendInt(out, prefix + "source_block_bytes", item.sourceBlockBytes)
+        out = v3MobileCapiWireAppendInt(out, prefix + "source_block_count", item.sourceBlockCount)
+        out = v3MobileCapiWireAppendInt(out, prefix + "repair_droplet_count", item.repairDropletCount)
+        objectRow = objectRow + 1
+    out = v3MobileCapiWireAppendInt(out, "droplet_count", result.droplets.len)
+    var dropletRow: int32 = 0
+    while dropletRow < result.droplets.len:
+        let droplet = result.droplets[dropletRow]
+        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
+        let dropletPath = v3MobileCapiPathJoin(outputDir,
+                                               fileNameStem + "." +
+                                                   strings.IntToStr(droplet.objectIndex) + "." +
+                                                   moq.v3Libp2pMoqDropletIndexTextOf(droplet) +
+                                                   ".droplet")
+        let dropletWriteRes = v3MobileCapiWriteBytesFile(dropletPath, droplet.payload)
+        if IsErr(dropletWriteRes):
+            return Err[str](Error(dropletWriteRes))
+        out = v3MobileCapiWireAppendInt(out, prefix + "object_index", droplet.objectIndex)
+        out = v3MobileCapiWireAppendInt(out, prefix + "droplet_index", droplet.dropletIndex)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "kind", moq.v3Libp2pMoqDropletKindText(droplet.kindCode))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "key", moq.v3Libp2pMoqDropletKeyOf(droplet))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "peer_id", moq.v3Libp2pMoqDropletPeerIdOf(droplet))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "cid", moq.v3Libp2pMoqDropletCidOf(droplet))
+        out = v3MobileCapiWireAppendInt(out, prefix + "degree", droplet.degree)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "block_indexes", moq.v3Libp2pMoqDropletBlockIndexesTextOf(droplet))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "path", dropletPath)
+        dropletRow = dropletRow + 1
+    return Ok[str](out)
+
+fn v3MobileCapiMoqPersistWire(requestWire: str,
+                              outputDir: str,
+                              fileNameStem: str): Result[str] =
+    if len(outputDir) <= 0:
+        return Err[str]("moq_fountain_missing_output_dir")
+    if len(fileNameStem) <= 0:
+        return Err[str]("moq_fountain_missing_file_stem")
+    let catalogPayloadHexRes = moq.v3Libp2pMoqWireFindValue(requestWire, "catalog_payload_hex")
+    if IsErr(catalogPayloadHexRes):
+        return Err[str](Error(catalogPayloadHexRes))
+    let rebuildPayloadHexRes = moq.v3Libp2pMoqWireFindValue(requestWire, "rebuild_template_payload_hex")
+    if IsErr(rebuildPayloadHexRes):
+        return Err[str](Error(rebuildPayloadHexRes))
+    let catalogPayloadRes = moq.v3Libp2pMoqBytesFromHex(Value(catalogPayloadHexRes))
+    if IsErr(catalogPayloadRes):
+        return Err[str](Error(catalogPayloadRes))
+    let rebuildPayloadRes = moq.v3Libp2pMoqBytesFromHex(Value(rebuildPayloadHexRes))
+    if IsErr(rebuildPayloadRes):
+        return Err[str](Error(rebuildPayloadRes))
+    let catalogPath = v3MobileCapiPathJoin(outputDir, fileNameStem + ".catalog.json")
+    let catalogWriteRes = v3MobileCapiWriteBytesFile(catalogPath, Value(catalogPayloadRes))
+    if IsErr(catalogWriteRes):
+        return Err[str](Error(catalogWriteRes))
+    let rebuildPath = v3MobileCapiPathJoin(outputDir, fileNameStem + ".rebuild.txt")
+    let rebuildWriteRes = v3MobileCapiWriteBytesFile(rebuildPath, Value(rebuildPayloadRes))
+    if IsErr(rebuildWriteRes):
+        return Err[str](Error(rebuildWriteRes))
+    let dropletCountRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, "droplet_count")
+    if IsErr(dropletCountRes):
+        return Err[str](Error(dropletCountRes))
+    let dropletCount = Value(dropletCountRes)
+    var out = requestWire
+    if len(out) > 0 && out[len(out) - 1] != '\n':
+        out = out + "\n"
+    out = v3MobileCapiWireAppendRaw(out, "catalog_path", catalogPath)
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_path", rebuildPath)
+    var dropletRow: int32 = 0
+    while dropletRow < dropletCount:
+        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
+        let objectIndexRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, prefix + "object_index")
+        if IsErr(objectIndexRes):
+            return Err[str](Error(objectIndexRes))
+        let dropletIndexRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, prefix + "droplet_index")
+        if IsErr(dropletIndexRes):
+            return Err[str](Error(dropletIndexRes))
+        let kindRes = moq.v3Libp2pMoqWireFindValue(requestWire, prefix + "kind")
+        if IsErr(kindRes):
+            return Err[str](Error(kindRes))
+        let payloadHexRes = moq.v3Libp2pMoqWireFindValue(requestWire, prefix + "payload_hex")
+        if IsErr(payloadHexRes):
+            return Err[str](Error(payloadHexRes))
+        let payloadRes = moq.v3Libp2pMoqBytesFromHex(Value(payloadHexRes))
+        if IsErr(payloadRes):
+            return Err[str](Error(payloadRes))
+        let dropletPath = v3MobileCapiPathJoin(outputDir,
+                                               fileNameStem + "." +
+                                                   strings.IntToStr(Value(objectIndexRes)) + "." +
+                                                   Value(kindRes) + "." +
+                                                   strings.IntToStr(Value(dropletIndexRes)) +
+                                                   ".droplet")
+        let dropletWriteRes = v3MobileCapiWriteBytesFile(dropletPath, Value(payloadRes))
+        if IsErr(dropletWriteRes):
+            return Err[str](Error(dropletWriteRes))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "path", dropletPath)
+        dropletRow = dropletRow + 1
+    return Ok[str](out)
+
+fn v3MobileCapiMoqBuildHandleWire(result: moq.V3Libp2pMoqBuildResult): str =
+    var out = ""
+    out = v3MobileCapiWireAppendRaw(out, "ok", "1")
+    out = v3MobileCapiWireAppendRaw(out, "owner_peer_id", result.ownerPeerId)
+    out = v3MobileCapiWireAppendRaw(out, "mime_type", result.mimeType)
+    out = v3MobileCapiWireAppendRaw(out, "bundle_cid", result.bundleCid)
+    out = v3MobileCapiWireAppendRaw(out, "blob_cid", result.blobCid)
+    out = v3MobileCapiWireAppendRaw(out, "catalog_key", result.catalogKey)
+    out = v3MobileCapiWireAppendRaw(out, "catalog_cid", result.catalogCid)
+    out = v3MobileCapiWireAppendInt(out, "catalog_size_bytes", result.catalogSizeBytes)
+    out = v3MobileCapiWireAppendInt(out, "catalog_handle", v3MobileCapiBytesBufferHandle(result.catalogPayload))
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_key", result.rebuildTemplateKey)
+    out = v3MobileCapiWireAppendRaw(out, "rebuild_template_cid", result.rebuildTemplateCid)
+    out = v3MobileCapiWireAppendInt(out, "rebuild_template_size_bytes", result.rebuildTemplateSizeBytes)
+    out = v3MobileCapiWireAppendInt(out, "rebuild_template_handle", v3MobileCapiBytesBufferHandle(result.rebuildTemplatePayload))
+    out = v3MobileCapiWireAppendInt(out, "blob_byte_len", result.blobByteLen)
+    out = v3MobileCapiWireAppendInt(out, "object_target_bytes", result.objectTargetBytes)
+    out = v3MobileCapiWireAppendInt(out, "source_block_bytes", result.sourceBlockBytes)
+    out = v3MobileCapiWireAppendInt(out, "object_count", result.objectCount)
+    out = v3MobileCapiWireAppendRaw(out, "remote_ack_peer_ids", moq.v3Libp2pMoqJoinCsv(result.remoteAckPeerIds))
+    var objectRow: int32 = 0
+    while objectRow < result.objects.len:
+        let item = result.objects[objectRow]
+        let prefix = "object." + strings.IntToStr(objectRow) + "."
+        out = v3MobileCapiWireAppendInt(out, prefix + "object_index", item.objectIndex)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "group_id", item.groupId)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "object_id", item.objectId)
+        out = v3MobileCapiWireAppendInt(out, prefix + "priority", item.priority)
+        out = v3MobileCapiWireAppendInt(out, prefix + "byte_offset", item.byteOffset)
+        out = v3MobileCapiWireAppendInt(out, prefix + "byte_length", item.byteLength)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "object_cid", item.objectCid)
+        out = v3MobileCapiWireAppendInt(out, prefix + "source_block_bytes", item.sourceBlockBytes)
+        out = v3MobileCapiWireAppendInt(out, prefix + "source_block_count", item.sourceBlockCount)
+        out = v3MobileCapiWireAppendInt(out, prefix + "repair_droplet_count", item.repairDropletCount)
+        objectRow = objectRow + 1
+    out = v3MobileCapiWireAppendInt(out, "droplet_count", result.droplets.len)
+    var dropletRow: int32 = 0
+    while dropletRow < result.droplets.len:
+        let droplet = result.droplets[dropletRow]
+        let prefix = "droplet." + strings.IntToStr(dropletRow) + "."
+        out = v3MobileCapiWireAppendInt(out, prefix + "object_index", droplet.objectIndex)
+        out = v3MobileCapiWireAppendInt(out, prefix + "droplet_index", droplet.dropletIndex)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "kind", moq.v3Libp2pMoqDropletKindText(droplet.kindCode))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "key", moq.v3Libp2pMoqDropletKeyOf(droplet))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "peer_id", moq.v3Libp2pMoqDropletPeerIdOf(droplet))
+        out = v3MobileCapiWireAppendRaw(out, prefix + "cid", moq.v3Libp2pMoqDropletCidOf(droplet))
+        out = v3MobileCapiWireAppendInt(out, prefix + "degree", droplet.degree)
+        out = v3MobileCapiWireAppendRaw(out, prefix + "block_indexes", moq.v3Libp2pMoqDropletBlockIndexesTextOf(droplet))
+        out = v3MobileCapiWireAppendInt(out, prefix + "handle", v3MobileCapiBytesBufferHandle(droplet.payload))
+        dropletRow = dropletRow + 1
     return out
 
 fn v3MobileCapiMaxInt32(left: int32, right: int32): int32 =
@@ -713,6 +941,263 @@ fn v3MobileCapiMoqFountainBuild(blobText: str,
         return v3MobileCapiMoqError(Error(buildRes))
     return moq.v3Libp2pMoqBuildResultToWire(Value(buildRes))
 
+@exportc("v3MobileCapiMoqFountainBuildRaw")
+fn v3MobileCapiMoqFountainBuildRaw(blobPtr: ptr,
+                                   blobLen: int32,
+                                   ownerPeerIdRaw: ptr,
+                                   remotePeersCsvRaw: ptr,
+                                   mimeType0Raw: ptr,
+                                   objectTargetBytes0: int32,
+                                   sourceBlockBytes0: int32,
+                                   repairDropletCount0: int32): str =
+    if blobPtr == nil || blobLen <= 0:
+        return v3MobileCapiMoqError("moq_fountain_empty_blob")
+    let ownerPeerId = v3MobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = v3MobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = v3MobileCapiCopyRawText(mimeType0Raw)
+    let buildRes = moq.v3Libp2pMoqBuild(bytesView(blobPtr, blobLen),
+                                        ownerPeerId,
+                                        remotePeersCsv,
+                                        mimeType0,
+                                        objectTargetBytes0,
+                                        sourceBlockBytes0,
+                                        repairDropletCount0)
+    if IsErr(buildRes):
+        return v3MobileCapiMoqError(Error(buildRes))
+    return moq.v3Libp2pMoqBuildResultToWire(Value(buildRes))
+
+@exportc("v3MobileCapiMoqFountainBuildCStringRaw")
+fn v3MobileCapiMoqFountainBuildCStringRaw(blobPtr: ptr,
+                                          blobLen: int32,
+                                          ownerPeerIdRaw: ptr,
+                                          remotePeersCsvRaw: ptr,
+                                          mimeType0Raw: ptr,
+                                          objectTargetBytes0: int32,
+                                          sourceBlockBytes0: int32,
+                                          repairDropletCount0: int32): ptr =
+    let out = v3MobileCapiMoqFountainBuildRaw(blobPtr,
+                                              blobLen,
+                                              ownerPeerIdRaw,
+                                              remotePeersCsvRaw,
+                                              mimeType0Raw,
+                                              objectTargetBytes0,
+                                              sourceBlockBytes0,
+                                              repairDropletCount0)
+    return v3MobileCapiTextCString(out)
+
+@exportc("v3MobileCapiMoqFountainBuildHandleWireRaw")
+fn v3MobileCapiMoqFountainBuildHandleWireRaw(blobPtr: ptr,
+                                             blobLen: int32,
+                                             ownerPeerIdRaw: ptr,
+                                             remotePeersCsvRaw: ptr,
+                                             mimeType0Raw: ptr,
+                                             objectTargetBytes0: int32,
+                                             sourceBlockBytes0: int32,
+                                             repairDropletCount0: int32): str =
+    if blobPtr == nil || blobLen <= 0:
+        return v3MobileCapiMoqError("moq_fountain_empty_blob")
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_raw_enter")
+    let ownerPeerId = v3MobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = v3MobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = v3MobileCapiCopyRawText(mimeType0Raw)
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_raw_before_build")
+    let buildRes = moq.v3Libp2pMoqBuild(bytesView(blobPtr, blobLen),
+                                        ownerPeerId,
+                                        remotePeersCsv,
+                                        mimeType0,
+                                        objectTargetBytes0,
+                                        sourceBlockBytes0,
+                                        repairDropletCount0)
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_raw_after_build")
+    if IsErr(buildRes):
+        v3MobileCapiEmitLog("mobile_moq:handle_wire_raw_build_error")
+        return v3MobileCapiMoqError(Error(buildRes))
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_raw_ok")
+    return v3MobileCapiMoqBuildHandleWire(Value(buildRes))
+
+@exportc("v3MobileCapiMoqFountainBuildHandleWireCStringRaw")
+fn v3MobileCapiMoqFountainBuildHandleWireCStringRaw(blobPtr: ptr,
+                                                    blobLen: int32,
+                                                    ownerPeerIdRaw: ptr,
+                                                    remotePeersCsvRaw: ptr,
+                                                    mimeType0Raw: ptr,
+                                                    objectTargetBytes0: int32,
+                                                    sourceBlockBytes0: int32,
+                                                    repairDropletCount0: int32): ptr =
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_cstring_enter")
+    let out = v3MobileCapiMoqFountainBuildHandleWireRaw(blobPtr,
+                                                        blobLen,
+                                                        ownerPeerIdRaw,
+                                                        remotePeersCsvRaw,
+                                                        mimeType0Raw,
+                                                        objectTargetBytes0,
+                                                        sourceBlockBytes0,
+                                                        repairDropletCount0)
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_cstring_after_raw")
+    return v3MobileCapiTextCString(out)
+
+@exportc("v3MobileCapiMoqFountainBuildHandleWireRequestCStringRaw")
+fn v3MobileCapiMoqFountainBuildHandleWireRequestCStringRaw(blobPtr: ptr,
+                                                           blobLen: int32,
+                                                           requestWireRaw: ptr,
+                                                           requestWireLen: int32): ptr =
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_request_enter")
+    if blobPtr == nil || blobLen <= 0:
+        return v3MobileCapiTextCString(v3MobileCapiMoqError("moq_fountain_empty_blob"))
+    let requestWire = v3MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let ownerPeerIdRes = moq.v3Libp2pMoqWireFindValue(requestWire, "owner_peer_id")
+    if IsErr(ownerPeerIdRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(ownerPeerIdRes)))
+    let remotePeersCsvRes = moq.v3Libp2pMoqWireFindValue(requestWire, "remote_peers_csv")
+    if IsErr(remotePeersCsvRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(remotePeersCsvRes)))
+    let mimeTypeRes = moq.v3Libp2pMoqWireFindValue(requestWire, "mime_type")
+    if IsErr(mimeTypeRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(mimeTypeRes)))
+    let objectTargetBytesRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, "object_target_bytes")
+    if IsErr(objectTargetBytesRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(objectTargetBytesRes)))
+    let sourceBlockBytesRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, "source_block_bytes")
+    if IsErr(sourceBlockBytesRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(sourceBlockBytesRes)))
+    let repairDropletCountRes = moq.v3Libp2pMoqParseInt32Wire(requestWire, "repair_droplet_count")
+    if IsErr(repairDropletCountRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(repairDropletCountRes)))
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_request_before_build")
+    let buildRes = moq.v3Libp2pMoqBuild(bytesView(blobPtr, blobLen),
+                                        Value(ownerPeerIdRes),
+                                        Value(remotePeersCsvRes),
+                                        Value(mimeTypeRes),
+                                        Value(objectTargetBytesRes),
+                                        Value(sourceBlockBytesRes),
+                                        Value(repairDropletCountRes))
+    v3MobileCapiEmitLog("mobile_moq:handle_wire_request_after_build")
+    if IsErr(buildRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(buildRes)))
+    let out = v3MobileCapiMoqBuildHandleWire(Value(buildRes))
+    return v3MobileCapiTextCString(out)
+
+@exportc("v3MobileCapiMoqFountainBuildPersistRaw")
+fn v3MobileCapiMoqFountainBuildPersistRaw(blobPtr: ptr,
+                                          blobLen: int32,
+                                          ownerPeerIdRaw: ptr,
+                                          remotePeersCsvRaw: ptr,
+                                          mimeType0Raw: ptr,
+                                          objectTargetBytes0: int32,
+                                          sourceBlockBytes0: int32,
+                                          repairDropletCount0: int32,
+                                          outputDirRaw: ptr,
+                                          fileNameStemRaw: ptr): str =
+    if blobPtr == nil || blobLen <= 0:
+        return v3MobileCapiMoqError("moq_fountain_empty_blob")
+    let ownerPeerId = v3MobileCapiCopyRawText(ownerPeerIdRaw)
+    let remotePeersCsv = v3MobileCapiCopyRawText(remotePeersCsvRaw)
+    let mimeType0 = v3MobileCapiCopyRawText(mimeType0Raw)
+    let outputDir = v3MobileCapiCopyRawText(outputDirRaw)
+    let fileNameStem = v3MobileCapiCopyRawText(fileNameStemRaw)
+    if len(outputDir) <= 0:
+        return v3MobileCapiMoqError("moq_fountain_missing_output_dir")
+    if len(fileNameStem) <= 0:
+        return v3MobileCapiMoqError("moq_fountain_missing_file_stem")
+    let tracePath = v3MobileCapiPathJoin(outputDir, fileNameStem + ".trace.txt")
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_enter")
+    let _traceEnter = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:enter")
+    let _traceBlobLen = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:blob_len=" + strings.IntToStr(blobLen))
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_before_build")
+    let buildRes = moq.v3Libp2pMoqBuild(bytesView(blobPtr, blobLen),
+                                        ownerPeerId,
+                                        remotePeersCsv,
+                                        mimeType0,
+                                        objectTargetBytes0,
+                                        sourceBlockBytes0,
+                                        repairDropletCount0)
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_after_build")
+    let _traceBuildReturned = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:build_returned")
+    if IsErr(buildRes):
+        v3MobileCapiEmitLog("mobile_moq:persist_raw_build_error")
+        let _traceBuildError = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:build_error=" + Error(buildRes))
+        return v3MobileCapiMoqError(Error(buildRes))
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_build_ok")
+    let _traceBuildOk = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:build_ok")
+    let wireRes = v3MobileCapiMoqBuildPersistWire(Value(buildRes), outputDir, fileNameStem)
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_after_persist")
+    let _tracePersistReturned = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:persist_returned")
+    if IsErr(wireRes):
+        v3MobileCapiEmitLog("mobile_moq:persist_raw_persist_error")
+        let _tracePersistError = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:persist_error=" + Error(wireRes))
+        return v3MobileCapiMoqError(Error(wireRes))
+    v3MobileCapiEmitLog("mobile_moq:persist_raw_ok")
+    let _traceOk = v3MobileCapiWriteTraceLine(tracePath, "persist_raw:ok")
+    return Value(wireRes)
+
+@exportc("v3MobileCapiMoqFountainBuildPersistCStringRaw")
+fn v3MobileCapiMoqFountainBuildPersistCStringRaw(blobPtr: ptr,
+                                                 blobLen: int32,
+                                                 ownerPeerIdRaw: ptr,
+                                                 remotePeersCsvRaw: ptr,
+                                                 mimeType0Raw: ptr,
+                                                 objectTargetBytes0: int32,
+                                                 sourceBlockBytes0: int32,
+                                                 repairDropletCount0: int32,
+                                                 outputDirRaw: ptr,
+                                                 fileNameStemRaw: ptr): ptr =
+    let out = v3MobileCapiMoqFountainBuildPersistRaw(blobPtr,
+                                                     blobLen,
+                                                     ownerPeerIdRaw,
+                                                     remotePeersCsvRaw,
+                                                     mimeType0Raw,
+                                                     objectTargetBytes0,
+                                                     sourceBlockBytes0,
+                                                     repairDropletCount0,
+                                                     outputDirRaw,
+                                                     fileNameStemRaw)
+    return v3MobileCapiTextCString(out)
+
+@exportc("v3MobileCapiMoqFountainPersistWireRaw")
+fn v3MobileCapiMoqFountainPersistWireRaw(requestWireRaw: ptr,
+                                         outputDirRaw: ptr,
+                                         fileNameStemRaw: ptr): str =
+    v3MobileCapiEmitLog("mobile_moq:persist_wire_raw_enter")
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let outputDir = v3MobileCapiCopyRawText(outputDirRaw)
+    let fileNameStem = v3MobileCapiCopyRawText(fileNameStemRaw)
+    if len(requestWire) <= 0:
+        return v3MobileCapiMoqError("moq_fountain_missing_build_wire")
+    let persistRes = v3MobileCapiMoqPersistWire(requestWire, outputDir, fileNameStem)
+    if IsErr(persistRes):
+        v3MobileCapiEmitLog("mobile_moq:persist_wire_raw_error")
+        return v3MobileCapiMoqError(Error(persistRes))
+    v3MobileCapiEmitLog("mobile_moq:persist_wire_raw_ok")
+    return Value(persistRes)
+
+@exportc("v3MobileCapiMoqFountainPersistWireCStringRaw")
+fn v3MobileCapiMoqFountainPersistWireCStringRaw(requestWireRaw: ptr,
+                                                outputDirRaw: ptr,
+                                                fileNameStemRaw: ptr): ptr =
+    v3MobileCapiEmitLog("mobile_moq:persist_wire_cstring_enter")
+    let out = v3MobileCapiMoqFountainPersistWireRaw(requestWireRaw, outputDirRaw, fileNameStemRaw)
+    v3MobileCapiEmitLog("mobile_moq:persist_wire_cstring_after_raw")
+    return v3MobileCapiTextCString(out)
+
+@exportc("v3MobileCapiMoqFountainPersistWireRequestCStringRaw")
+fn v3MobileCapiMoqFountainPersistWireRequestCStringRaw(buildWireRaw: ptr,
+                                                       buildWireLen: int32,
+                                                       requestWireRaw: ptr,
+                                                       requestWireLen: int32): ptr =
+    v3MobileCapiEmitLog("mobile_moq:persist_wire_request_enter")
+    let buildWire = v3MobileCapiCopyRawTextLen(buildWireRaw, buildWireLen)
+    let requestWire = v3MobileCapiCopyRawTextLen(requestWireRaw, requestWireLen)
+    let outputDirRes = moq.v3Libp2pMoqWireFindValue(requestWire, "output_dir")
+    if IsErr(outputDirRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(outputDirRes)))
+    let fileNameStemRes = moq.v3Libp2pMoqWireFindValue(requestWire, "file_name_stem")
+    if IsErr(fileNameStemRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(fileNameStemRes)))
+    let persistRes = v3MobileCapiMoqPersistWire(buildWire, Value(outputDirRes), Value(fileNameStemRes))
+    if IsErr(persistRes):
+        return v3MobileCapiTextCString(v3MobileCapiMoqError(Error(persistRes)))
+    return v3MobileCapiTextCString(Value(persistRes))
+
 fn v3MobileCapiMoqDecodeBlockIndexes(csv: str): int32[] =
     let parts = v3MobileCapiSplitCsv(csv)
     var out: int32[]
@@ -794,6 +1279,12 @@ fn v3MobileCapiMoqFountainRebuild(requestWire: str): str =
             return v3MobileCapiMoqError("moq_fountain_write_failed")
     cheng_fclose(outFile)
     return moq.v3Libp2pMoqRebuildResultToWire(outputPath, rebuilt)
+
+@exportc("v3MobileCapiMoqFountainRebuildCStringRaw")
+fn v3MobileCapiMoqFountainRebuildCStringRaw(requestWireRaw: ptr): ptr =
+    let requestWire = v3MobileCapiCopyRawText(requestWireRaw)
+    let out = v3MobileCapiMoqFountainRebuild(requestWire)
+    return v3MobileCapiTextCString(out)
 
 fn v3MobileCapiBioDidProvisionJson(didText: str,
                                    rootSeed: str,

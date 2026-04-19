@@ -1,6 +1,7 @@
 import std/result
 import std/system
 import std/rawbytes
+import std/crypto/ecnist
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/std/crypto/fixed256
 import cheng/v3/chain/lsmr_types as lt
@@ -75,7 +76,7 @@ fn v3OracleReadFixed64(span: layout.ByteSpan, offset: int32): Result[layout.Fixe
                                                                                     offset,
                                                                                     layout.fixedBytes64Size)))
 
-fn v3OracleSignedBatchShapeValidate(batch: V3OracleSignedBatch): Result[bool] =
+fn v3OracleSignedBatchShapeValidate(batch: var V3OracleSignedBatch): Result[bool] =
     if batch.version != oracle_types.v3OracleVersion:
         return Err[bool]("v3 oracle plane: bad version")
     if batch.committeeSetId <= 0:
@@ -94,7 +95,7 @@ fn v3OracleSignedBatchShapeValidate(batch: V3OracleSignedBatch): Result[bool] =
             return Err[bool]("v3 oracle plane: bad price")
     return Ok[bool](true)
 
-fn v3OracleSignedBatchSignableBytes(batch: V3OracleSignedBatch): Result[Bytes] =
+fn v3OracleSignedBatchSignableBytes(batch: var V3OracleSignedBatch): Result[Bytes] =
     let shapeRes = v3OracleSignedBatchShapeValidate(batch)
     if IsErr(shapeRes):
         return Err[Bytes](Error(shapeRes))
@@ -109,7 +110,7 @@ fn v3OracleSignedBatchSignableBytes(batch: V3OracleSignedBatch): Result[Bytes] =
         v3OracleAppendI64BE(buf, batch.pricesE8[i])
     return Ok[Bytes](layout.byteBufToBytes(buf))
 
-fn v3OracleSignedBatchCid(batch: V3OracleSignedBatch): Result[layout.FixedBytes32] =
+fn v3OracleSignedBatchCid(batch: var V3OracleSignedBatch): Result[layout.FixedBytes32] =
     let signableRes = v3OracleSignedBatchSignableBytes(batch)
     if IsErr(signableRes):
         return Err[layout.FixedBytes32](Error(signableRes))
@@ -119,7 +120,7 @@ fn v3OracleSignedBatchCid(batch: V3OracleSignedBatch): Result[layout.FixedBytes3
     layout.byteBufAppendBytes(buf, layout.fixedBytes64ToBytes(batch.sig))
     return Ok[layout.FixedBytes32](lt.v3FixedCidFromBuf(buf))
 
-fn v3OracleSignedBatchStructuralValidate(batch: V3OracleSignedBatch): Result[bool] =
+fn v3OracleSignedBatchStructuralValidate(batch: var V3OracleSignedBatch): Result[bool] =
     let shapeRes = v3OracleSignedBatchShapeValidate(batch)
     if IsErr(shapeRes):
         return Err[bool](Error(shapeRes))
@@ -130,28 +131,28 @@ fn v3OracleSignedBatchStructuralValidate(batch: V3OracleSignedBatch): Result[boo
         return Err[bool]("v3 oracle plane: bad batch cid")
     return Ok[bool](true)
 
-fn v3OracleSignedBatchVerify(batch: V3OracleSignedBatch,
-                             pubKey: layout.FixedBytes65): Result[bool] =
+fn v3OracleSignedBatchVerify(batch: var V3OracleSignedBatch,
+                             pubBytes: Bytes): Result[bool] =
     let okRes = v3OracleSignedBatchStructuralValidate(batch)
     if IsErr(okRes):
         return Err[bool](Error(okRes))
     let signableRes = v3OracleSignedBatchSignableBytes(batch)
     if IsErr(signableRes):
         return Err[bool](Error(signableRes))
-    let verifyRes = fixed256.p256VerifyMessageFixed64(pubKey, Value(signableRes), batch.sig)
-    if IsErr(verifyRes):
-        return Err[bool](Error(verifyRes))
-    if !Value(verifyRes):
+    let sigBytes = layout.fixedBytes64ToBytes(batch.sig)
+    let verifyOk = ecnist.ecdsaVerifyTrustedBytes(pubBytes, Value(signableRes), sigBytes)
+    if !verifyOk:
         return Err[bool]("v3 oracle plane: bad signature")
     return Ok[bool](true)
 
-fn v3OracleSignedBatchVerifyAgainstCommittee(batch: V3OracleSignedBatch,
-                                             committee: oracle_types.V3OracleCommitteeConfig): Result[bool] =
+fn v3OracleSignedBatchVerifyAgainstCommittee(batch: var V3OracleSignedBatch,
+                                             committee: var oracle_types.V3OracleCommitteeConfig): Result[bool] =
     if committee.committeeSetId != batch.committeeSetId:
         return Err[bool]("v3 oracle plane: wrong committee set")
     if batch.reporterSlot <= 0 || batch.reporterSlot > committee.reporterCount:
         return Err[bool]("v3 oracle plane: reporter outside committee")
-    return v3OracleSignedBatchVerify(batch, committee.reporterPubKeys[batch.reporterSlot - 1])
+    let pubBytes = layout.fixedBytes65ToBytes(committee.reporterPubKeys[batch.reporterSlot - 1])
+    return v3OracleSignedBatchVerify(batch, pubBytes)
 
 fn v3OracleSignedBatchMake(priv: fixed256.Scalar256,
                            committeeSetId: int32,
@@ -183,7 +184,7 @@ fn v3OracleSignedBatchMake(priv: fixed256.Scalar256,
         return Err[V3OracleSignedBatch](Error(okRes))
     return Ok[V3OracleSignedBatch](out)
 
-fn v3OracleSignedBatchEncode(batch: V3OracleSignedBatch): Bytes =
+fn v3OracleSignedBatchEncode(batch: var V3OracleSignedBatch): Bytes =
     let okRes = v3OracleSignedBatchStructuralValidate(batch)
     if IsErr(okRes):
         system.panic(Error(okRes))

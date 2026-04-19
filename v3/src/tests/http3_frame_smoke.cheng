@@ -1,0 +1,43 @@
+import std/result
+import cheng/v3/http3/frame as http3
+import cheng/v3/qpack/min as qpack
+
+fn main(): int32 =
+    var settings: http3.V3Http3Setting[] = []
+    add(settings, http3.V3Http3MakeSetting(http3.v3Http3SettingQpackMaxTableCapacity, 0))
+    add(settings, http3.V3Http3MakeSetting(http3.v3Http3SettingQpackBlockedStreams, 0))
+
+    let settingsFrameRes: Result[Bytes] = http3.V3Http3EncodeSettingsFrame(settings)
+    assert(IsOk(settingsFrameRes), "v3 http3 frame: settings encode")
+    let settingsFrameWire: Bytes = Value(settingsFrameRes)
+    let settingsDecRes: Result[http3.V3Http3FrameDecoded] = http3.V3Http3DecodeFrame(settingsFrameWire, 0)
+    assert(IsOk(settingsDecRes), "v3 http3 frame: settings decode frame")
+    let settingsFrame: http3.V3Http3Frame = Value(settingsDecRes).frame
+    assert(settingsFrame.kind == http3.v3Http3FrameSettings, "v3 http3 frame: settings kind")
+    let settingsPayloadRes: Result[http3.V3Http3Setting[]] = http3.V3Http3DecodeSettingsFramePayload(settingsFrame.payload)
+    assert(IsOk(settingsPayloadRes), "v3 http3 frame: settings payload decode")
+    assert(Value(settingsPayloadRes).len == 2, "v3 http3 frame: settings count")
+
+    var headers: qpack.V3QpackHeaderField[] = []
+    add(headers, qpack.V3QpackMakeHeaderField(":method", "POST"))
+    add(headers, qpack.V3QpackMakeHeaderField(":path", "/auth"))
+    add(headers, qpack.V3QpackMakeHeaderField("host", "hysteria"))
+    let headersFrameRes: Result[Bytes] = http3.V3Http3EncodeHeadersFrame(headers)
+    assert(IsOk(headersFrameRes), "v3 http3 frame: headers encode")
+    let headersDecRes: Result[http3.V3Http3FrameDecoded] = http3.V3Http3DecodeFrame(Value(headersFrameRes), 0)
+    assert(IsOk(headersDecRes), "v3 http3 frame: headers decode frame")
+    let headersFrame: http3.V3Http3Frame = Value(headersDecRes).frame
+    assert(headersFrame.kind == http3.v3Http3FrameHeaders, "v3 http3 frame: headers kind")
+    let headerFieldsRes: Result[qpack.V3QpackFieldSection] = http3.V3Http3DecodeHeadersFramePayload(headersFrame.payload)
+    assert(IsOk(headerFieldsRes), "v3 http3 frame: headers payload decode")
+    assert(Value(headerFieldsRes).fields.len == 3, "v3 http3 frame: headers field len")
+
+    let preambleRes: Result[http3.V3Http3Preamble] = http3.V3Http3EncodeClientPreamble(settings)
+    assert(IsOk(preambleRes), "v3 http3 frame: preamble encode")
+    let preamble: http3.V3Http3Preamble = Value(preambleRes)
+    assert(bytesLen(preamble.control) > 0, "v3 http3 frame: control stream bytes")
+    assert(bytesLen(preamble.qpackEncoder) > 0, "v3 http3 frame: encoder stream bytes")
+    assert(bytesLen(preamble.qpackDecoder) > 0, "v3 http3 frame: decoder stream bytes")
+
+    echo("v3 http3_frame_smoke ok")
+    return 0

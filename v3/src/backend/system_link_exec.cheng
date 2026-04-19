@@ -1,5 +1,6 @@
 import std/result
 import std/strings
+import std/os
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
@@ -35,6 +36,85 @@ type
         primaryObjectPlan: pobj.V3PrimaryObjectPlan
         objectPlan: objplan.V3ObjectPlanStub
         nativeLinkPlan: nplan.V3NativeLinkPlanStub
+
+fn v3SystemLinkExecBrowserBridgeArtifactBasePath(outputPath: str): str =
+    if len(outputPath) <= 0:
+        return ""
+    return outputPath + ".browser_bridge_plan.txt"
+
+fn v3SystemLinkExecBrowserBridgeSourceBasePath(outputPath: str): str =
+    if len(outputPath) <= 0:
+        return ""
+    return outputPath + ".browser_bridge.generated.cheng"
+
+fn v3SystemLinkExecBrowserBridgeObjectBasePath(outputPath: str): str =
+    if len(outputPath) <= 0:
+        return ""
+    return outputPath + ".browser_bridge.generated.o"
+
+fn v3SystemLinkExecBrowserBridgePlans(plan: V3SystemLinkExecPlan): ccsg.V3BrowserAbiBridgePlan[] =
+    return ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
+
+fn v3SystemLinkExecBrowserBridgeObjectPathForLinkPlan(linkPlan: slplan.V3SystemLinkPlanStub): str =
+    let explicitPath = slplan.v3SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
+    if len(explicitPath) > 0:
+        return explicitPath
+    let bridgePlans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(linkPlan)
+    if bridgePlans.len <= 0:
+        return ""
+    return v3SystemLinkExecBrowserBridgeObjectBasePath(linkPlan.outputPath)
+
+fn v3SystemLinkExecBrowserBridgeArtifactPath(plan: V3SystemLinkExecPlan): str =
+    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    if plans.len <= 0:
+        return ""
+    return v3SystemLinkExecBrowserBridgeArtifactBasePath(plan.systemLinkPlan.outputPath)
+
+fn v3SystemLinkExecBrowserBridgeArtifactText(plan: V3SystemLinkExecPlan): str =
+    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    return ccsg.v3BrowserAbiBridgePlanManifestText(plans)
+
+fn v3SystemLinkExecBrowserBridgeSourcePath(plan: V3SystemLinkExecPlan): str =
+    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    if plans.len <= 0:
+        return ""
+    return v3SystemLinkExecBrowserBridgeSourceBasePath(plan.systemLinkPlan.outputPath)
+
+fn v3SystemLinkExecBrowserBridgeObjectPath(plan: V3SystemLinkExecPlan): str =
+    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    if plans.len <= 0:
+        return ""
+    return v3SystemLinkExecBrowserBridgeObjectBasePath(plan.systemLinkPlan.outputPath)
+
+fn v3SystemLinkExecBrowserBridgeSourceText(plan: V3SystemLinkExecPlan): str =
+    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    return ccsg.v3BrowserAbiBridgeSourceText(plans)
+
+fn v3SystemLinkExecWriteBrowserBridgeArtifact(rootDir: str,
+                                              plan: V3SystemLinkExecPlan): bool =
+    let artifactBasePath = v3SystemLinkExecBrowserBridgeArtifactBasePath(plan.systemLinkPlan.outputPath)
+    if len(artifactBasePath) <= 0:
+        return true
+    let artifactPath = v3SystemLinkExecBrowserBridgeArtifactPath(plan)
+    if len(artifactPath) <= 0:
+        if os.FileExists(artifactBasePath):
+            let _ = os.RemoveFile(artifactBasePath)
+        return true
+    let artifactText = v3SystemLinkExecBrowserBridgeArtifactText(plan) + "\n"
+    return v3path.V3WriteTextFile(rootDir, artifactPath, artifactText)
+
+fn v3SystemLinkExecWriteBrowserBridgeSource(rootDir: str,
+                                            plan: V3SystemLinkExecPlan): bool =
+    let sourceBasePath = v3SystemLinkExecBrowserBridgeSourceBasePath(plan.systemLinkPlan.outputPath)
+    if len(sourceBasePath) <= 0:
+        return true
+    let sourcePath = v3SystemLinkExecBrowserBridgeSourcePath(plan)
+    if len(sourcePath) <= 0:
+        if os.FileExists(sourceBasePath):
+            let _ = os.RemoveFile(sourceBasePath)
+        return true
+    let sourceText = v3SystemLinkExecBrowserBridgeSourceText(plan) + "\n"
+    return v3path.V3WriteTextFile(rootDir, sourcePath, sourceText)
 
 fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub): Result[str[]] =
     var out: str[]
@@ -165,8 +245,11 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     let primaryPlan = Value(primaryRes)
     providerSourcePaths = Value(providerSourcesRes)
     let primaryObjectPath = primaryPlan.outputPath
+    let browserBridgeObjectPath = v3SystemLinkExecBrowserBridgeObjectPathForLinkPlan(linkPlan)
     if len(primaryObjectPath) > 0:
         add(linkInputs, primaryObjectPath)
+    if len(browserBridgeObjectPath) > 0:
+        add(linkInputs, browserBridgeObjectPath)
     var linuxNolibcSupportEnabled = false
     var linuxNolibcRuntimeSourcePath = ""
     var linuxNolibcRuntimeObjectPath = ""
@@ -227,6 +310,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     objectPlan.outputPath = linkPlan.outputPath
     objectPlan.targetTriple = linkPlan.targetTriple
     objectPlan.primaryObjectPath = primaryObjectPath
+    objectPlan.browserBridgeObjectPath = browserBridgeObjectPath
     objectPlan.linuxNolibcSupportEnabled = linuxNolibcSupportEnabled
     objectPlan.linuxNolibcRuntimeSourcePath = linuxNolibcRuntimeSourcePath
     objectPlan.linuxNolibcRuntimeObjectPath = linuxNolibcRuntimeObjectPath
@@ -264,6 +348,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     nativePlan.outputKind = outputKind
     nativePlan.entrySymbol = linkPlan.entrySymbol
     nativePlan.primaryObjectPath = objectPlan.primaryObjectPath
+    nativePlan.browserBridgeObjectPath = objectPlan.browserBridgeObjectPath
     nativePlan.linkInputPaths = objectPlan.linkInputPaths
     nativePlan.missingReasons = nativeMissing
     nativePlan.pipelineStage = "object_plan_to_native_link_plan_stub"
@@ -349,6 +434,44 @@ fn v3SystemLinkExecPlanReady(plan: V3SystemLinkExecPlan): bool =
            plan.objectPlan.missingReasons.len <= 0 &&
            plan.nativeLinkPlan.missingReasons.len <= 0
 
+fn v3SystemLinkExecBrowserBridgeReport(plan: V3SystemLinkExecPlan): str =
+    let bridgePlans = v3SystemLinkExecBrowserBridgePlans(plan)
+    let bridgeArtifactPath = v3SystemLinkExecBrowserBridgeArtifactPath(plan)
+    let bridgeSourcePath = v3SystemLinkExecBrowserBridgeSourcePath(plan)
+    let bridgeObjectPath = v3SystemLinkExecBrowserBridgeObjectPath(plan)
+    var bridgeArtifactPathText = "-"
+    var bridgeSourcePathText = "-"
+    var bridgeObjectPathText = "-"
+    var bridgeObjectCount: int32 = 0
+    if len(bridgeArtifactPath) > 0:
+        bridgeArtifactPathText = bridgeArtifactPath
+    if len(bridgeSourcePath) > 0:
+        bridgeSourcePathText = bridgeSourcePath
+    if len(bridgeObjectPath) > 0:
+        bridgeObjectPathText = bridgeObjectPath
+        bridgeObjectCount = 1
+    var lines = ""
+    for i in 0..<bridgePlans.len:
+        lines = lines + "browser_bridge_plan["
+        lines = lines + intToStr(i)
+        lines = lines + "]="
+        lines = lines + ccsg.v3BrowserAbiBridgePlanEmitLine(bridgePlans[i])
+        lines = lines + "\n"
+    var out = ""
+    out = out + "browser_bridge_artifact_path=" + bridgeArtifactPathText + "\n"
+    out = out + "browser_bridge_artifact_format=" + ccsg.v3BrowserAbiBridgePlanManifestFormat() + "\n"
+    out = out + "browser_bridge_artifact_count=" + intToStr(bridgePlans.len) + "\n"
+    out = out + "browser_bridge_artifact_unique_key_count=" + intToStr(ccsg.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
+    out = out + "browser_bridge_source_path=" + bridgeSourcePathText + "\n"
+    out = out + "browser_bridge_source_format=" + ccsg.v3BrowserAbiBridgeSourceFormat() + "\n"
+    out = out + "browser_bridge_source_count=" + intToStr(bridgePlans.len) + "\n"
+    out = out + "browser_bridge_object_path=" + bridgeObjectPathText + "\n"
+    out = out + "browser_bridge_object_count=" + intToStr(bridgeObjectCount) + "\n"
+    out = out + "browser_bridge_plan_count=" + intToStr(bridgePlans.len) + "\n"
+    out = out + "browser_bridge_plan_unique_key_count=" + intToStr(ccsg.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
+    out = out + lines
+    return out
+
 fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     var worldHeadPinned = "0"
     var lockCheckEnabled = "0"
@@ -360,6 +483,7 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     var primaryObjectPath = "-"
     var nativeOutputKind = "artifact"
     var nativePrimaryObject = "-"
+    var browserBridgeObject = "-"
     var nativeEntrySymbol = "-"
     if plan.worldHeadPinned:
         worldHeadPinned = "1"
@@ -381,6 +505,8 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
         nativeOutputKind = "executable"
     if len(plan.nativeLinkPlan.primaryObjectPath) > 0:
         nativePrimaryObject = plan.nativeLinkPlan.primaryObjectPath
+    if len(plan.nativeLinkPlan.browserBridgeObjectPath) > 0:
+        browserBridgeObject = plan.nativeLinkPlan.browserBridgeObjectPath
     if len(plan.nativeLinkPlan.entrySymbol) > 0:
         nativeEntrySymbol = plan.nativeLinkPlan.entrySymbol
     var linuxNolibcSupportEnabled = "0"
@@ -398,6 +524,7 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
         linuxNolibcStartupSource = plan.objectPlan.linuxNolibcStartupSourcePath
     if len(plan.objectPlan.linuxNolibcStartupObjectPath) > 0:
         linuxNolibcStartupObject = plan.objectPlan.linuxNolibcStartupObjectPath
+    let browserBridgeReport = v3SystemLinkExecBrowserBridgeReport(plan)
     var out = ""
     out = out + "entry=" + plan.compilerEntrySource + "\n"
     out = out + "source_bundle_cid=" + layout.fixedBytes32Hex(plan.sourceBundleCid) + "\n"
@@ -424,6 +551,7 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     out = out + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage + "\n"
     out = out + slplan.v3SystemLinkPlanStubReport(plan.systemLinkPlan) + "\n"
     out = out + lower.v3LoweringPlanStubReport(plan.loweringPlan) + "\n"
+    out = out + browserBridgeReport
     out = out + pobj.v3PrimaryObjectPlanReport(plan.primaryObjectPlan) + "\n"
     out = out + "primary_object_path=" + primaryObjectPath + "\n"
     out = out + "provider_object_count=" + intToStr(plan.objectPlan.providerObjectPaths.len) + "\n"
@@ -434,6 +562,7 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     out = out + "linux_nolibc_runtime_object=" + linuxNolibcRuntimeObject + "\n"
     out = out + "linux_nolibc_startup_source=" + linuxNolibcStartupSource + "\n"
     out = out + "linux_nolibc_startup_object=" + linuxNolibcStartupObject + "\n"
+    out = out + "browser_bridge_object=" + browserBridgeObject + "\n"
     out = out + "object_link_input_count=" + intToStr(plan.objectPlan.linkInputPaths.len) + "\n"
     out = out + "object_link_inputs=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.linkInputPaths) + "\n"
     out = out + "object_missing_reasons=" + slplan.v3SystemLinkPlanListText(plan.objectPlan.missingReasons) + "\n"

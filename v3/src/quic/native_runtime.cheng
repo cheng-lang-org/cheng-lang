@@ -55,6 +55,7 @@ const
     msquicNativeFrameAckCode = 0x02
     msquicNativeFrameCryptoCode = 0x06
     msquicNativeFrameDataCode = 0x0e
+    msquicNativeFrameDataFinCode = 0x0f
     msquicNativeFrameMaxDataCode = 0x10
     msquicNativeFrameMaxStreamDataCode = 0x11
     msquicNativeFrameConnectionCloseCode = 0x1c
@@ -62,6 +63,7 @@ const
     msquicNativeFrameHandshakeDoneCode = 0x1e
     msquicNativeFrameDatagramCode = 0x30
     msquicNativeAppRecvMaxChunks = 64
+    msquicNativeAppStreamSlotCount = 16
 
 type
     MsQuicNativeEndpoint =
@@ -70,6 +72,23 @@ type
         ready: bool
         maxDataSent: bool
         maxStreamDataSent: bool
+
+    MsQuicNativeAppRecvChunk =
+        used: bool
+        offset: int64
+        data: Bytes
+
+    MsQuicNativeAppStreamSlot =
+        used: bool
+        streamId: int64
+        sendOffset: int64
+        writeClosed: bool
+        ready: Bytes
+        nextOffset: int64
+        peerClosed: bool
+        peerFinalOffset: int64
+        pendingCount: int32
+        pending: MsQuicNativeAppRecvChunk[msquicNativeAppRecvMaxChunks]
 
     MsQuicNativeSession =
         active: bool
@@ -414,16 +433,44 @@ fn msquicNativeResetServerDatagrams() =
         msquicNativeServerDatagramSet(i, emptyBytes())
 
 fn msquicNativeResetClientEndpointState() =
-    msquicNativeClientSendOffset = 0
     msquicNativeClientReady = 0
     msquicNativeClientMaxDataSent = false
     msquicNativeClientMaxStreamDataSent = false
 
 fn msquicNativeResetServerEndpointState() =
-    msquicNativeServerSendOffset = 0
     msquicNativeServerReady = 0
     msquicNativeServerMaxDataSent = false
     msquicNativeServerMaxStreamDataSent = false
+
+fn msquicNativeAppRecvChunkZero(): MsQuicNativeAppRecvChunk =
+    var out: MsQuicNativeAppRecvChunk
+    out.used = false
+    out.offset = 0
+    out.data = emptyBytes()
+    return out
+
+fn msquicNativeAppStreamSlotZero(): MsQuicNativeAppStreamSlot =
+    var out: MsQuicNativeAppStreamSlot
+    out.used = false
+    out.streamId = 0
+    out.sendOffset = 0
+    out.writeClosed = false
+    out.ready = emptyBytes()
+    out.nextOffset = 0
+    out.peerClosed = false
+    out.peerFinalOffset = 0
+    out.pendingCount = 0
+    for i in 0..<msquicNativeAppRecvMaxChunks:
+        out.pending[i] = msquicNativeAppRecvChunkZero()
+    return out
+
+fn msquicNativeResetClientAppStreams() =
+    for i in 0..<msquicNativeAppStreamSlotCount:
+        msquicNativeClientAppStreams[i] = msquicNativeAppStreamSlotZero()
+
+fn msquicNativeResetServerAppStreams() =
+    for i in 0..<msquicNativeAppStreamSlotCount:
+        msquicNativeServerAppStreams[i] = msquicNativeAppStreamSlotZero()
 
 fn msquicNativeResetClientEndpoint(
     settings: var MsQuicSettings,
@@ -440,13 +487,7 @@ fn msquicNativeResetClientEndpoint(
                        msquicNativeInitialWindowPackets(settings))
     initMsQuicCryptoStreamInto(msquicNativeClientInitialCrypto)
     initMsQuicCryptoStreamInto(msquicNativeClientHandshakeCrypto)
-    msquicNativeClientAppRecvReady = emptyBytes()
-    msquicNativeClientAppRecvNextOffset = 0
-    msquicNativeClientAppRecvPendingCount = 0
-    for i in 0..<msquicNativeAppRecvMaxChunks:
-        msquicNativeClientAppRecvUsed[i] = false
-        msquicNativeClientAppRecvOffset[i] = 0
-        msquicNativeClientAppRecvData[i] = emptyBytes()
+    msquicNativeResetClientAppStreams()
     msquicNativeResetClientDatagrams()
     msquicNativeResetClientEndpointState()
 
@@ -465,13 +506,7 @@ fn msquicNativeResetServerEndpoint(
                        msquicNativeInitialWindowPackets(settings))
     initMsQuicCryptoStreamInto(msquicNativeServerInitialCrypto)
     initMsQuicCryptoStreamInto(msquicNativeServerHandshakeCrypto)
-    msquicNativeServerAppRecvReady = emptyBytes()
-    msquicNativeServerAppRecvNextOffset = 0
-    msquicNativeServerAppRecvPendingCount = 0
-    for i in 0..<msquicNativeAppRecvMaxChunks:
-        msquicNativeServerAppRecvUsed[i] = false
-        msquicNativeServerAppRecvOffset[i] = 0
-        msquicNativeServerAppRecvData[i] = emptyBytes()
+    msquicNativeResetServerAppStreams()
     msquicNativeResetServerDatagrams()
     msquicNativeResetServerEndpointState()
 
@@ -544,195 +579,243 @@ fn msquicNativeCryptoStreamAddByCode(side: int32, packetTypeCode: int32, offset:
         return Ok[bool](true)
     return Err[bool]("msquic native: invalid side")
 
-fn msquicNativeAppRecvAvailable(side: int32): int32 =
+fn msquicNativeFindAppStreamSlot(side: int32, streamId: int64): int32 =
     if side == msquicNativeClientSide:
-        return bytesLen(msquicNativeClientAppRecvReady)
+        for i in 0..<msquicNativeAppStreamSlotCount:
+            if msquicNativeClientAppStreams[i].used && msquicNativeClientAppStreams[i].streamId == streamId:
+                return i
+        return -1
     if side == msquicNativeServerSide:
-        return bytesLen(msquicNativeServerAppRecvReady)
+        for i in 0..<msquicNativeAppStreamSlotCount:
+            if msquicNativeServerAppStreams[i].used && msquicNativeServerAppStreams[i].streamId == streamId:
+                return i
+        return -1
+    return -1
+
+fn msquicNativeEnsureAppStreamSlot(side: int32, streamId: int64): Result[int32] =
+    let existing: int32 = msquicNativeFindAppStreamSlot(side, streamId)
+    if existing >= 0:
+        return Ok[int32](existing)
+    if side == msquicNativeClientSide:
+        for i in 0..<msquicNativeAppStreamSlotCount:
+            if ! msquicNativeClientAppStreams[i].used:
+                msquicNativeClientAppStreams[i] = msquicNativeAppStreamSlotZero()
+                msquicNativeClientAppStreams[i].used = true
+                msquicNativeClientAppStreams[i].streamId = streamId
+                return Ok[int32](i)
+        return Err[int32]("msquic native: app stream slot full")
+    if side == msquicNativeServerSide:
+        for i in 0..<msquicNativeAppStreamSlotCount:
+            if ! msquicNativeServerAppStreams[i].used:
+                msquicNativeServerAppStreams[i] = msquicNativeAppStreamSlotZero()
+                msquicNativeServerAppStreams[i].used = true
+                msquicNativeServerAppStreams[i].streamId = streamId
+                return Ok[int32](i)
+        return Err[int32]("msquic native: app stream slot full")
+    return Err[int32]("msquic native: invalid side")
+
+fn msquicNativeAppRecvAvailable(side: int32, streamId: int64): int32 =
+    let slotIdx: int32 = msquicNativeFindAppStreamSlot(side, streamId)
+    if slotIdx < 0:
+        return 0
+    if side == msquicNativeClientSide:
+        return bytesLen(msquicNativeClientAppStreams[slotIdx].ready)
+    if side == msquicNativeServerSide:
+        return bytesLen(msquicNativeServerAppStreams[slotIdx].ready)
     return 0
 
-fn msquicNativeAppRecvConsume(side: int32, length: int32): Bytes =
+fn msquicNativeAppRecvConsume(side: int32, streamId: int64, length: int32): Bytes =
+    let slotIdx: int32 = msquicNativeFindAppStreamSlot(side, streamId)
+    if slotIdx < 0:
+        return emptyBytes()
     if side == msquicNativeClientSide:
-        return msquicNativeBytesTakePrefix(msquicNativeClientAppRecvReady, length)
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+        let out: Bytes = msquicNativeBytesTakePrefix(slot.ready, length)
+        msquicNativeClientAppStreams[slotIdx] = slot
+        return out
     if side == msquicNativeServerSide:
-        return msquicNativeBytesTakePrefix(msquicNativeServerAppRecvReady, length)
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+        let out: Bytes = msquicNativeBytesTakePrefix(slot.ready, length)
+        msquicNativeServerAppStreams[slotIdx] = slot
+        return out
     return emptyBytes()
 
-fn msquicNativeClientAppRecvNormalize() =
+fn msquicNativeAppRecvPeerClosed(side: int32, streamId: int64): bool =
+    let slotIdx: int32 = msquicNativeFindAppStreamSlot(side, streamId)
+    if slotIdx < 0:
+        return false
+    if side == msquicNativeClientSide:
+        let slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+        return slot.peerClosed &&
+               bytesLen(slot.ready) <= 0 &&
+               slot.pendingCount <= 0 &&
+               slot.nextOffset >= slot.peerFinalOffset
+    if side == msquicNativeServerSide:
+        let slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+        return slot.peerClosed &&
+               bytesLen(slot.ready) <= 0 &&
+               slot.pendingCount <= 0 &&
+               slot.nextOffset >= slot.peerFinalOffset
+    return false
+
+fn msquicNativeAppStreamNormalize(slot: var MsQuicNativeAppStreamSlot) =
     for i in 0..<msquicNativeAppRecvMaxChunks:
-        if msquicNativeClientAppRecvUsed[i] &&
-           msquicNativeClientAppRecvOffset[i] < msquicNativeClientAppRecvNextOffset:
-            let trim64: int64 = msquicNativeClientAppRecvNextOffset - msquicNativeClientAppRecvOffset[i]
-            if trim64 >= int64(bytesLen(msquicNativeClientAppRecvData[i])):
-                msquicNativeClientAppRecvUsed[i] = false
-                msquicNativeClientAppRecvOffset[i] = 0
-                msquicNativeClientAppRecvData[i] = emptyBytes()
-                msquicNativeClientAppRecvPendingCount = msquicNativeClientAppRecvPendingCount - 1
+        if slot.pending[i].used && slot.pending[i].offset < slot.nextOffset:
+            let trim64: int64 = slot.nextOffset - slot.pending[i].offset
+            if trim64 >= int64(bytesLen(slot.pending[i].data)):
+                slot.pending[i] = msquicNativeAppRecvChunkZero()
+                slot.pendingCount = slot.pendingCount - 1
             else:
                 let trim: int32 = int32(trim64)
-                msquicNativeClientAppRecvData[i] = bytesSlice(msquicNativeClientAppRecvData[i],
-                                                              trim,
-                                                              bytesLen(msquicNativeClientAppRecvData[i]) - trim)
-                msquicNativeClientAppRecvOffset[i] = msquicNativeClientAppRecvNextOffset
+                slot.pending[i].data = bytesSlice(slot.pending[i].data,
+                                                  trim,
+                                                  bytesLen(slot.pending[i].data) - trim)
+                slot.pending[i].offset = slot.nextOffset
 
-fn msquicNativeServerAppRecvNormalize() =
-    for i in 0..<msquicNativeAppRecvMaxChunks:
-        if msquicNativeServerAppRecvUsed[i] &&
-           msquicNativeServerAppRecvOffset[i] < msquicNativeServerAppRecvNextOffset:
-            let trim64: int64 = msquicNativeServerAppRecvNextOffset - msquicNativeServerAppRecvOffset[i]
-            if trim64 >= int64(bytesLen(msquicNativeServerAppRecvData[i])):
-                msquicNativeServerAppRecvUsed[i] = false
-                msquicNativeServerAppRecvOffset[i] = 0
-                msquicNativeServerAppRecvData[i] = emptyBytes()
-                msquicNativeServerAppRecvPendingCount = msquicNativeServerAppRecvPendingCount - 1
-            else:
-                let trim: int32 = int32(trim64)
-                msquicNativeServerAppRecvData[i] = bytesSlice(msquicNativeServerAppRecvData[i],
-                                                              trim,
-                                                              bytesLen(msquicNativeServerAppRecvData[i]) - trim)
-                msquicNativeServerAppRecvOffset[i] = msquicNativeServerAppRecvNextOffset
-
-fn msquicNativeClientAppRecvDrain() =
-    var advanced = true
+fn msquicNativeAppStreamDrain(slot: var MsQuicNativeAppStreamSlot) =
+    var advanced: bool = true
     while advanced:
         advanced = false
-        msquicNativeClientAppRecvNormalize()
+        msquicNativeAppStreamNormalize(slot)
         for i in 0..<msquicNativeAppRecvMaxChunks:
-            if msquicNativeClientAppRecvUsed[i] &&
-               msquicNativeClientAppRecvOffset[i] == msquicNativeClientAppRecvNextOffset:
-                let data: Bytes = msquicNativeClientAppRecvData[i]
-                msquicNativeBytesAppend(msquicNativeClientAppRecvReady, data)
-                msquicNativeClientAppRecvNextOffset = msquicNativeClientAppRecvNextOffset + int64(bytesLen(data))
-                msquicNativeClientAppRecvUsed[i] = false
-                msquicNativeClientAppRecvOffset[i] = 0
-                msquicNativeClientAppRecvData[i] = emptyBytes()
-                msquicNativeClientAppRecvPendingCount = msquicNativeClientAppRecvPendingCount - 1
+            if slot.pending[i].used && slot.pending[i].offset == slot.nextOffset:
+                let data: Bytes = slot.pending[i].data
+                msquicNativeBytesAppend(slot.ready, data)
+                slot.nextOffset = slot.nextOffset + int64(bytesLen(data))
+                slot.pending[i] = msquicNativeAppRecvChunkZero()
+                slot.pendingCount = slot.pendingCount - 1
                 advanced = true
                 break
 
-fn msquicNativeServerAppRecvDrain() =
-    var advanced = true
-    while advanced:
-        advanced = false
-        msquicNativeServerAppRecvNormalize()
-        for i in 0..<msquicNativeAppRecvMaxChunks:
-            if msquicNativeServerAppRecvUsed[i] &&
-               msquicNativeServerAppRecvOffset[i] == msquicNativeServerAppRecvNextOffset:
-                let data: Bytes = msquicNativeServerAppRecvData[i]
-                msquicNativeBytesAppend(msquicNativeServerAppRecvReady, data)
-                msquicNativeServerAppRecvNextOffset = msquicNativeServerAppRecvNextOffset + int64(bytesLen(data))
-                msquicNativeServerAppRecvUsed[i] = false
-                msquicNativeServerAppRecvOffset[i] = 0
-                msquicNativeServerAppRecvData[i] = emptyBytes()
-                msquicNativeServerAppRecvPendingCount = msquicNativeServerAppRecvPendingCount - 1
-                advanced = true
-                break
-
-fn msquicNativeLogAppRecv(side: int32, offset: int64, data: Bytes) =
+fn msquicNativeLogAppRecv(side: int32,
+                          streamId: int64,
+                          offset: int64,
+                          data: Bytes,
+                          slot: MsQuicNativeAppStreamSlot) =
     if ! msquicNativeDebugTls13:
         return
     var msg = "msquic_native_debug app_recv_add side="
     if side == msquicNativeClientSide:
         msg = msg + "client"
-        msg = msg + " offset=" + int64ToStr(offset)
-        msg = msg + " len=" + intToStr(bytesLen(data))
-        msg = msg + " avail=" + intToStr(bytesLen(msquicNativeClientAppRecvReady))
-        msg = msg + " next=" + int64ToStr(msquicNativeClientAppRecvNextOffset)
-        msg = msg + " pending=" + intToStr(msquicNativeClientAppRecvPendingCount)
-        os.WriteLine(os.Get_stderr(), msg)
-        return
-    if side == msquicNativeServerSide:
+    elif side == msquicNativeServerSide:
         msg = msg + "server"
-        msg = msg + " offset=" + int64ToStr(offset)
-        msg = msg + " len=" + intToStr(bytesLen(data))
-        msg = msg + " avail=" + intToStr(bytesLen(msquicNativeServerAppRecvReady))
-        msg = msg + " next=" + int64ToStr(msquicNativeServerAppRecvNextOffset)
-        msg = msg + " pending=" + intToStr(msquicNativeServerAppRecvPendingCount)
-        os.WriteLine(os.Get_stderr(), msg)
+    else:
+        msg = msg + "unknown"
+    msg = msg + " stream=" + int64ToStr(streamId)
+    msg = msg + " offset=" + int64ToStr(offset)
+    msg = msg + " len=" + intToStr(bytesLen(data))
+    msg = msg + " avail=" + intToStr(bytesLen(slot.ready))
+    msg = msg + " next=" + int64ToStr(slot.nextOffset)
+    if slot.peerClosed:
+        msg = msg + " fin=" + int64ToStr(slot.peerFinalOffset)
+    msg = msg + " pending=" + intToStr(slot.pendingCount)
+    os.WriteLine(os.Get_stderr(), msg)
 
-fn msquicNativeAppRecvAdd(side: int32, offset: int64, data: Bytes): Result[bool] =
+fn msquicNativeAppRecvMarkFinInto(slot: var MsQuicNativeAppStreamSlot,
+                                  finalOffset: int64): Result[bool] =
+    if finalOffset < 0:
+        return Err[bool]("msquic native: negative app final offset")
+    if slot.peerClosed:
+        if slot.peerFinalOffset != finalOffset:
+            return Err[bool]("msquic native: conflicting app final offset")
+        return Ok[bool](true)
+    if finalOffset < slot.nextOffset:
+        return Err[bool]("msquic native: app final offset before next offset")
+    for i in 0..<msquicNativeAppRecvMaxChunks:
+        if slot.pending[i].used &&
+           slot.pending[i].offset + int64(bytesLen(slot.pending[i].data)) > finalOffset:
+            return Err[bool]("msquic native: app final offset truncates pending data")
+    slot.peerClosed = true
+    slot.peerFinalOffset = finalOffset
+    return Ok[bool](true)
+
+fn msquicNativeAppRecvAddInto(slot: var MsQuicNativeAppStreamSlot,
+                              offset: int64,
+                              data: Bytes): Result[bool] =
     if offset < 0:
         return Err[bool]("msquic native: negative app recv offset")
+    if slot.peerClosed &&
+       offset + int64(bytesLen(data)) > slot.peerFinalOffset:
+        return Err[bool]("msquic native: app data past final offset")
     if bytesLen(data) <= 0:
         return Ok[bool](true)
+    var off: int64 = offset
+    var payload: Bytes = data
+    if off < slot.nextOffset:
+        let trim64: int64 = slot.nextOffset - off
+        if trim64 >= int64(bytesLen(payload)):
+            return Ok[bool](true)
+        let trim: int32 = int32(trim64)
+        payload = bytesSlice(payload, trim, bytesLen(payload) - trim)
+        off = slot.nextOffset
+    if off == slot.nextOffset:
+        msquicNativeBytesAppend(slot.ready, payload)
+        slot.nextOffset = slot.nextOffset + int64(bytesLen(payload))
+        msquicNativeAppStreamDrain(slot)
+        return Ok[bool](true)
+    var freeIdx: int32 = -1
+    for i in 0..<msquicNativeAppRecvMaxChunks:
+        if slot.pending[i].used:
+            if slot.pending[i].offset == off:
+                if bytesLen(slot.pending[i].data) >= bytesLen(payload):
+                    return Ok[bool](true)
+                slot.pending[i].data = payload
+                msquicNativeAppStreamDrain(slot)
+                return Ok[bool](true)
+        elif freeIdx < 0:
+            freeIdx = i
+    if freeIdx < 0:
+        return Err[bool]("msquic native: app recv chunk list full")
+    slot.pending[freeIdx].used = true
+    slot.pending[freeIdx].offset = off
+    slot.pending[freeIdx].data = payload
+    slot.pendingCount = slot.pendingCount + 1
+    msquicNativeAppStreamDrain(slot)
+    return Ok[bool](true)
+
+fn msquicNativeAppRecvAdd(side: int32,
+                          streamId: int64,
+                          offset: int64,
+                          data: Bytes): Result[bool] =
+    let slotRes: Result[int32] = msquicNativeEnsureAppStreamSlot(side, streamId)
+    if IsErr(slotRes):
+        return Err[bool](ErrorText(slotRes))
+    let slotIdx: int32 = Value(slotRes)
     if side == msquicNativeClientSide:
-        var off: int64 = offset
-        var payload: Bytes = data
-        if off < msquicNativeClientAppRecvNextOffset:
-            let trim64: int64 = msquicNativeClientAppRecvNextOffset - off
-            if trim64 >= int64(bytesLen(payload)):
-                msquicNativeLogAppRecv(side, offset, data)
-                return Ok[bool](true)
-            let trim: int32 = int32(trim64)
-            payload = bytesSlice(payload, trim, bytesLen(payload) - trim)
-            off = msquicNativeClientAppRecvNextOffset
-        if off == msquicNativeClientAppRecvNextOffset:
-            msquicNativeBytesAppend(msquicNativeClientAppRecvReady, payload)
-            msquicNativeClientAppRecvNextOffset = msquicNativeClientAppRecvNextOffset + int64(bytesLen(payload))
-            msquicNativeClientAppRecvDrain()
-            msquicNativeLogAppRecv(side, offset, data)
-            return Ok[bool](true)
-        var freeIdx: int32 = -1
-        for i in 0..<msquicNativeAppRecvMaxChunks:
-            if msquicNativeClientAppRecvUsed[i]:
-                if msquicNativeClientAppRecvOffset[i] == off:
-                    if bytesLen(msquicNativeClientAppRecvData[i]) >= bytesLen(payload):
-                        msquicNativeLogAppRecv(side, offset, data)
-                        return Ok[bool](true)
-                    msquicNativeClientAppRecvData[i] = payload
-                    msquicNativeClientAppRecvDrain()
-                    msquicNativeLogAppRecv(side, offset, data)
-                    return Ok[bool](true)
-            elif freeIdx < 0:
-                freeIdx = i
-        if freeIdx < 0:
-            return Err[bool]("msquic native: app recv chunk list full")
-        msquicNativeClientAppRecvUsed[freeIdx] = true
-        msquicNativeClientAppRecvOffset[freeIdx] = off
-        msquicNativeClientAppRecvData[freeIdx] = payload
-        msquicNativeClientAppRecvPendingCount = msquicNativeClientAppRecvPendingCount + 1
-        msquicNativeClientAppRecvDrain()
-        msquicNativeLogAppRecv(side, offset, data)
-        return Ok[bool](true)
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+        let addRes: Result[bool] = msquicNativeAppRecvAddInto(slot, offset, data)
+        msquicNativeClientAppStreams[slotIdx] = slot
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+        msquicNativeLogAppRecv(side, streamId, offset, data, slot)
+        return addRes
     if side == msquicNativeServerSide:
-        var off: int64 = offset
-        var payload: Bytes = data
-        if off < msquicNativeServerAppRecvNextOffset:
-            let trim64: int64 = msquicNativeServerAppRecvNextOffset - off
-            if trim64 >= int64(bytesLen(payload)):
-                msquicNativeLogAppRecv(side, offset, data)
-                return Ok[bool](true)
-            let trim: int32 = int32(trim64)
-            payload = bytesSlice(payload, trim, bytesLen(payload) - trim)
-            off = msquicNativeServerAppRecvNextOffset
-        if off == msquicNativeServerAppRecvNextOffset:
-            msquicNativeBytesAppend(msquicNativeServerAppRecvReady, payload)
-            msquicNativeServerAppRecvNextOffset = msquicNativeServerAppRecvNextOffset + int64(bytesLen(payload))
-            msquicNativeServerAppRecvDrain()
-            msquicNativeLogAppRecv(side, offset, data)
-            return Ok[bool](true)
-        var freeIdx: int32 = -1
-        for i in 0..<msquicNativeAppRecvMaxChunks:
-            if msquicNativeServerAppRecvUsed[i]:
-                if msquicNativeServerAppRecvOffset[i] == off:
-                    if bytesLen(msquicNativeServerAppRecvData[i]) >= bytesLen(payload):
-                        msquicNativeLogAppRecv(side, offset, data)
-                        return Ok[bool](true)
-                    msquicNativeServerAppRecvData[i] = payload
-                    msquicNativeServerAppRecvDrain()
-                    msquicNativeLogAppRecv(side, offset, data)
-                    return Ok[bool](true)
-            elif freeIdx < 0:
-                freeIdx = i
-        if freeIdx < 0:
-            return Err[bool]("msquic native: app recv chunk list full")
-        msquicNativeServerAppRecvUsed[freeIdx] = true
-        msquicNativeServerAppRecvOffset[freeIdx] = off
-        msquicNativeServerAppRecvData[freeIdx] = payload
-        msquicNativeServerAppRecvPendingCount = msquicNativeServerAppRecvPendingCount + 1
-        msquicNativeServerAppRecvDrain()
-        msquicNativeLogAppRecv(side, offset, data)
-        return Ok[bool](true)
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+        let addRes: Result[bool] = msquicNativeAppRecvAddInto(slot, offset, data)
+        msquicNativeServerAppStreams[slotIdx] = slot
+        if IsErr(addRes):
+            return Err[bool](ErrorText(addRes))
+        msquicNativeLogAppRecv(side, streamId, offset, data, slot)
+        return addRes
+    return Err[bool]("msquic native: invalid side")
+
+fn msquicNativeAppRecvMarkFin(side: int32,
+                              streamId: int64,
+                              finalOffset: int64): Result[bool] =
+    let slotRes: Result[int32] = msquicNativeEnsureAppStreamSlot(side, streamId)
+    if IsErr(slotRes):
+        return Err[bool](ErrorText(slotRes))
+    let slotIdx: int32 = Value(slotRes)
+    if side == msquicNativeClientSide:
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+        let finRes: Result[bool] = msquicNativeAppRecvMarkFinInto(slot, finalOffset)
+        msquicNativeClientAppStreams[slotIdx] = slot
+        return finRes
+    if side == msquicNativeServerSide:
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+        let finRes: Result[bool] = msquicNativeAppRecvMarkFinInto(slot, finalOffset)
+        msquicNativeServerAppStreams[slotIdx] = slot
+        return finRes
     return Err[bool]("msquic native: invalid side")
 
 fn msquicNativeDrainCryptoStream(side: int32, packetTypeCode: int32): Result[bool] =
@@ -918,8 +1001,6 @@ var
     msquicNativeServerDatagram13: Bytes
     msquicNativeServerDatagram14: Bytes
     msquicNativeServerDatagram15: Bytes
-    msquicNativeClientSendOffset: int64 = 0
-    msquicNativeServerSendOffset: int64 = 0
     msquicNativeClientReady: int32 = 0
     msquicNativeServerReady: int32 = 0
     msquicNativeClientMaxDataSent: bool = false
@@ -948,18 +1029,8 @@ var
     msquicNativeServerInitialCrypto: MsQuicCryptoStream
     msquicNativeClientHandshakeCrypto: MsQuicCryptoStream
     msquicNativeServerHandshakeCrypto: MsQuicCryptoStream
-    msquicNativeClientAppRecvReady: Bytes
-    msquicNativeServerAppRecvReady: Bytes
-    msquicNativeClientAppRecvNextOffset: int64 = 0
-    msquicNativeServerAppRecvNextOffset: int64 = 0
-    msquicNativeClientAppRecvPendingCount: int32 = 0
-    msquicNativeServerAppRecvPendingCount: int32 = 0
-    msquicNativeClientAppRecvUsed: bool[msquicNativeAppRecvMaxChunks]
-    msquicNativeServerAppRecvUsed: bool[msquicNativeAppRecvMaxChunks]
-    msquicNativeClientAppRecvOffset: int64[msquicNativeAppRecvMaxChunks]
-    msquicNativeServerAppRecvOffset: int64[msquicNativeAppRecvMaxChunks]
-    msquicNativeClientAppRecvData: Bytes[msquicNativeAppRecvMaxChunks]
-    msquicNativeServerAppRecvData: Bytes[msquicNativeAppRecvMaxChunks]
+    msquicNativeClientAppStreams: MsQuicNativeAppStreamSlot[msquicNativeAppStreamSlotCount]
+    msquicNativeServerAppStreams: MsQuicNativeAppStreamSlot[msquicNativeAppStreamSlotCount]
     msquicNativeClientCidCache: Bytes
     msquicNativeServerCidCache: Bytes
     msquicNativeClientServerNameCache: str = ""
@@ -2113,19 +2184,29 @@ fn msquicNativeHandleAppFrame(recvSide: int32, frame: MsQuicFrame): Result[bool]
         else:
             msquicConnImplAck(msquicNativeServerImpl, frame.value, 0)
         return Ok[bool](true)
-    if frameKind == int64(msquicNativeFrameDataCode):
+    if frameKind == int64(msquicNativeFrameDataCode) ||
+       frameKind == int64(msquicNativeFrameDataFinCode):
         if msquicNativeDebugTls13:
             var msg = "msquic_native_debug data_frame side="
             if recvSide == msquicNativeClientSide:
                 msg = msg + "client"
             else:
                 msg = msg + "server"
+            msg = msg + " stream=" + int64ToStr(frame.streamId)
             msg = msg + " len=" + intToStr(bytesLen(frame.data))
             msg = msg + " offset=" + int64ToStr(frame.offset)
+            if frameKind == int64(msquicNativeFrameDataFinCode):
+                msg = msg + " fin=true"
             os.WriteLine(os.Get_stderr(), msg)
-        let addRes: Result[bool] = msquicNativeAppRecvAdd(recvSide, frame.offset, frame.data)
+        let addRes: Result[bool] = msquicNativeAppRecvAdd(recvSide, frame.streamId, frame.offset, frame.data)
         if IsErr(addRes):
             return Err[bool](ErrorText(addRes))
+        if frameKind == int64(msquicNativeFrameDataFinCode):
+            let finRes: Result[bool] = msquicNativeAppRecvMarkFin(recvSide,
+                                                                  frame.streamId,
+                                                                  frame.offset + int64(bytesLen(frame.data)))
+            if IsErr(finRes):
+                return Err[bool](ErrorText(finRes))
         return Ok[bool](true)
     if frameKind == int64(msquicNativeFrameDatagramCode):
         if recvSide == msquicNativeClientSide:
@@ -2867,17 +2948,22 @@ fn msquicNativePipeIsClosed(pipeIdx: int32): bool =
         return true
     return msquicNativeSession.closed
 
-fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32] =
+fn msquicNativePipeWrite(pipeIdx: int32, side: int32, streamId: int64, data: Bytes): Result[int32] =
     if ! msquicNativeIsPipeIdx(pipeIdx):
         return Err[int32]("msquic native: invalid pipe")
     if ! msquicNativeSideReady(side):
         return Err[int32]("msquic native: session ! ready")
+    let slotRes: Result[int32] = msquicNativeEnsureAppStreamSlot(side, streamId)
+    if IsErr(slotRes):
+        return Err[int32](ErrorText(slotRes))
+    let slotIdx: int32 = Value(slotRes)
     if msquicNativeDebugTls13:
         var msg = "msquic_native_debug pipe_write side="
         if side == msquicNativeClientSide:
             msg = msg + "client"
         else:
             msg = msg + "server"
+        msg = msg + " stream=" + int64ToStr(streamId)
         msg = msg + " len=" + intToStr(bytesLen(data))
         os.WriteLine(os.Get_stderr(), msg)
     var remaining: int32 = bytesLen(data)
@@ -2885,6 +2971,9 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
     while remaining > 0:
         var batchLen: int32 = 0
         if side == msquicNativeClientSide:
+            var slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+            if slot.writeClosed:
+                return Err[int32]("msquic native: stream write closed")
             let frameBudget: int32 = msquicConnImplFrameBudget(msquicNativeClientImpl)
             let batchCap: int32 = if frameBudget > 32: frameBudget - 32 else: 0
             if batchCap <= 0:
@@ -2892,8 +2981,8 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
             batchLen = if remaining < batchCap: remaining else: batchCap
             let chunk: Bytes = bytesSlice(data, cursor, batchLen)
             let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeClientImpl,
-                                                              msquicFrameData(msquicNativeStreamClient,
-                                                                              msquicNativeClientSendOffset,
+                                                              msquicFrameData(streamId,
+                                                                              slot.sendOffset,
                                                                               chunk))
             if IsErr(qRes):
                 return Err[int32](ErrorText(qRes))
@@ -2911,11 +3000,15 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
                 else:
                     dbg = dbg + "false"
                 os.WriteLine(os.Get_stderr(), dbg)
-            msquicNativeClientSendOffset = msquicNativeClientSendOffset + int64(batchLen)
+            slot.sendOffset = slot.sendOffset + int64(batchLen)
+            msquicNativeClientAppStreams[slotIdx] = slot
             let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeClientSide)
             if IsErr(flushRes):
                 return Err[int32](ErrorText(flushRes))
         elif side == msquicNativeServerSide:
+            var slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+            if slot.writeClosed:
+                return Err[int32]("msquic native: stream write closed")
             let frameBudget: int32 = msquicConnImplFrameBudget(msquicNativeServerImpl)
             let batchCap: int32 = if frameBudget > 32: frameBudget - 32 else: 0
             if batchCap <= 0:
@@ -2923,8 +3016,8 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
             batchLen = if remaining < batchCap: remaining else: batchCap
             let chunk: Bytes = bytesSlice(data, cursor, batchLen)
             let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeServerImpl,
-                                                              msquicFrameData(msquicNativeStreamServer,
-                                                                              msquicNativeServerSendOffset,
+                                                              msquicFrameData(streamId,
+                                                                              slot.sendOffset,
                                                                               chunk))
             if IsErr(qRes):
                 return Err[int32](ErrorText(qRes))
@@ -2942,7 +3035,8 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
                 else:
                     dbg = dbg + "false"
                 os.WriteLine(os.Get_stderr(), dbg)
-            msquicNativeServerSendOffset = msquicNativeServerSendOffset + int64(batchLen)
+            slot.sendOffset = slot.sendOffset + int64(batchLen)
+            msquicNativeServerAppStreams[slotIdx] = slot
             let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeServerSide)
             if IsErr(flushRes):
                 return Err[int32](ErrorText(flushRes))
@@ -2958,14 +3052,60 @@ fn msquicNativePipeWrite(pipeIdx: int32, side: int32, data: Bytes): Result[int32
         return Err[int32](ErrorText(pumpTailRes))
     return Ok[int32](bytesLen(data))
 
-fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes] =
+fn msquicNativePipeCloseWrite(pipeIdx: int32, side: int32, streamId: int64): Result[bool] =
+    if ! msquicNativeIsPipeIdx(pipeIdx):
+        return Err[bool]("msquic native: invalid pipe")
+    if ! msquicNativeSideReady(side):
+        return Err[bool]("msquic native: session ! ready")
+    let slotRes: Result[int32] = msquicNativeEnsureAppStreamSlot(side, streamId)
+    if IsErr(slotRes):
+        return Err[bool](ErrorText(slotRes))
+    let slotIdx: int32 = Value(slotRes)
+    if side == msquicNativeClientSide:
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeClientAppStreams[slotIdx]
+        if slot.writeClosed:
+            return Ok[bool](true)
+        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeClientImpl,
+                                                          msquicFrameDataFin(streamId,
+                                                                             slot.sendOffset,
+                                                                             emptyBytes()))
+        if IsErr(qRes):
+            return Err[bool](ErrorText(qRes))
+        slot.writeClosed = true
+        msquicNativeClientAppStreams[slotIdx] = slot
+        let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeClientSide)
+        if IsErr(flushRes):
+            return Err[bool](ErrorText(flushRes))
+    elif side == msquicNativeServerSide:
+        var slot: MsQuicNativeAppStreamSlot = msquicNativeServerAppStreams[slotIdx]
+        if slot.writeClosed:
+            return Ok[bool](true)
+        let qRes: Result[bool] = msquicConnImplQueueFrame(msquicNativeServerImpl,
+                                                          msquicFrameDataFin(streamId,
+                                                                             slot.sendOffset,
+                                                                             emptyBytes()))
+        if IsErr(qRes):
+            return Err[bool](ErrorText(qRes))
+        slot.writeClosed = true
+        msquicNativeServerAppStreams[slotIdx] = slot
+        let flushRes: Result[bool] = msquicNativeFlushShortPackets(msquicNativeServerSide)
+        if IsErr(flushRes):
+            return Err[bool](ErrorText(flushRes))
+    else:
+        return Err[bool]("msquic native: local role ! ready")
+    let pumpRes: Result[int32] = msquicNativePump(msquicNativePumpBudget)
+    if IsErr(pumpRes):
+        return Err[bool](ErrorText(pumpRes))
+    return Ok[bool](true)
+
+fn msquicNativePipeRead(pipeIdx: int32, side: int32, streamId: int64, count: int32): Result[Bytes] =
     if ! msquicNativeIsPipeIdx(pipeIdx):
         return Err[Bytes]("msquic native: invalid pipe")
     if ! msquicNativeSession.active:
         return Err[Bytes]("msquic native: session ! active")
     if count <= 0:
         return Ok[Bytes](emptyBytes())
-    let buffered: Bytes = msquicNativeAppRecvConsume(side, count)
+    let buffered: Bytes = msquicNativeAppRecvConsume(side, streamId, count)
     if bytesLen(buffered) > 0:
         if msquicNativeDebugTls13:
             var msg = "msquic_native_debug pipe_read_ready side="
@@ -2973,17 +3113,21 @@ fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes
                 msg = msg + "client"
             else:
                 msg = msg + "server"
+            msg = msg + " stream=" + int64ToStr(streamId)
             msg = msg + " avail=" + intToStr(bytesLen(buffered))
             os.WriteLine(os.Get_stderr(), msg)
         return Ok[Bytes](buffered)
+    if msquicNativeAppRecvPeerClosed(side, streamId):
+        return Err[Bytes]("msquic: stream closed")
     if msquicNativeDebugTls13:
         var enter = "msquic_native_debug pipe_read_enter side="
         if side == msquicNativeClientSide:
             enter = enter + "client"
         else:
             enter = enter + "server"
+        enter = enter + " stream=" + int64ToStr(streamId)
         enter = enter + " count=" + intToStr(count)
-        enter = enter + " avail=" + intToStr(msquicNativeAppRecvAvailable(side))
+        enter = enter + " avail=" + intToStr(msquicNativeAppRecvAvailable(side, streamId))
         os.WriteLine(os.Get_stderr(), enter)
     let deadlineMs: int64 = msquicNowMs() + int64(msquicNativePipeReadTimeoutMs)
     while msquicNowMs() <= deadlineMs:
@@ -3003,7 +3147,7 @@ fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes
         let pumpRes: Result[int32] = msquicNativePump(msquicNativePumpBudget)
         if IsErr(pumpRes):
             return Err[Bytes](ErrorText(pumpRes))
-        let chunk: Bytes = msquicNativeAppRecvConsume(side, count)
+        let chunk: Bytes = msquicNativeAppRecvConsume(side, streamId, count)
         if bytesLen(chunk) > 0:
             if msquicNativeDebugTls13:
                 var msg = "msquic_native_debug pipe_read_ready side="
@@ -3011,9 +3155,12 @@ fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes
                     msg = msg + "client"
                 else:
                     msg = msg + "server"
+                msg = msg + " stream=" + int64ToStr(streamId)
                 msg = msg + " avail=" + intToStr(bytesLen(chunk))
                 os.WriteLine(os.Get_stderr(), msg)
             return Ok[Bytes](chunk)
+        if msquicNativeAppRecvPeerClosed(side, streamId):
+            return Err[Bytes]("msquic: stream closed")
         if msquicNativeSession.closed:
             return Err[Bytes]("msquic: pipe closed")
         if msquicNowMs() <= deadlineMs:
@@ -3021,22 +3168,26 @@ fn msquicNativePipeRead(pipeIdx: int32, side: int32, count: int32): Result[Bytes
             continue
     return Err[Bytes]("msquic native: pipe read timeout")
 
-fn msquicNativePipeReadNonblocking(pipeIdx: int32, side: int32, count: int32): Result[Bytes] =
+fn msquicNativePipeReadNonblocking(pipeIdx: int32, side: int32, streamId: int64, count: int32): Result[Bytes] =
     if ! msquicNativeIsPipeIdx(pipeIdx):
         return Err[Bytes]("msquic native: invalid pipe")
     if ! msquicNativeSession.active:
         return Err[Bytes]("msquic native: session ! active")
     if count <= 0:
         return Ok[Bytes](emptyBytes())
-    let buffered: Bytes = msquicNativeAppRecvConsume(side, count)
+    let buffered: Bytes = msquicNativeAppRecvConsume(side, streamId, count)
     if bytesLen(buffered) > 0:
         return Ok[Bytes](buffered)
+    if msquicNativeAppRecvPeerClosed(side, streamId):
+        return Err[Bytes]("msquic: stream closed")
     let pumpRes: Result[int32] = msquicNativePump(msquicNativePumpBudget)
     if IsErr(pumpRes):
         return Err[Bytes](ErrorText(pumpRes))
-    let chunk: Bytes = msquicNativeAppRecvConsume(side, count)
+    let chunk: Bytes = msquicNativeAppRecvConsume(side, streamId, count)
     if bytesLen(chunk) > 0:
         return Ok[Bytes](chunk)
+    if msquicNativeAppRecvPeerClosed(side, streamId):
+        return Err[Bytes]("msquic: stream closed")
     if msquicNativeSession.closed:
         return Err[Bytes]("msquic: pipe closed")
     return Err[Bytes]("msquic udp: queue empty")

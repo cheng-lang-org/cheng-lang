@@ -48,6 +48,40 @@ fn main(): int32 =
     assert(ErrorText(bindRes) == "vpn proxy socks5: unsupported command",
            "v3 vpn proxy socks bind reject text")
 
+    let udpAssocWire: Bytes = testBytes([5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+    let udpAssocRes: Result[vpn.V3VpnProxySocksRequest] = vpn.V3VpnProxySocksParseRequestWire(udpAssocWire)
+    assert(IsOk(udpAssocRes), "v3 vpn proxy socks udp associate parse")
+    assert(Value(udpAssocRes).cmd == 3, "v3 vpn proxy socks udp associate cmd")
+    assert(Value(udpAssocRes).target.host == "0.0.0.0", "v3 vpn proxy socks udp associate host")
+    assert(Value(udpAssocRes).target.port == 0, "v3 vpn proxy socks udp associate port")
+
+    var bindTarget: vpn.V3VpnProxyTarget
+    bindTarget.host = "127.0.0.1"
+    bindTarget.port = 5300
+    let replyRes: Result[Bytes] = vpn.V3VpnProxySocksReplyForTarget(0, bindTarget)
+    assert(IsOk(replyRes), "v3 vpn proxy socks reply target")
+    let replyWire: Bytes = Value(replyRes)
+    assert(bytesGet(replyWire, 0) == 5 && bytesGet(replyWire, 1) == 0 && bytesGet(replyWire, 2) == 0,
+           "v3 vpn proxy socks reply target wire")
+    let replyReqWire: Bytes = bytesConcat(testBytes([5, 1, 0]), bytesSlice(replyWire, 3, bytesLen(replyWire) - 3))
+    let replyReqRes: Result[vpn.V3VpnProxySocksRequest] = vpn.V3VpnProxySocksParseRequestWire(replyReqWire)
+    assert(IsOk(replyReqRes), "v3 vpn proxy socks reply target parse")
+    assert(Value(replyReqRes).target.host == "127.0.0.1", "v3 vpn proxy socks reply target host")
+    assert(Value(replyReqRes).target.port == 5300, "v3 vpn proxy socks reply target port")
+
+    var udpDatagram: vpn.V3VpnProxySocksUdpDatagram
+    udpDatagram.fragmentId = 0
+    udpDatagram.target = bindTarget
+    udpDatagram.payload = bytesFromString("hello-udp")
+    let udpWireRes: Result[Bytes] = vpn.V3VpnProxySocksEncodeUdpDatagram(udpDatagram)
+    assert(IsOk(udpWireRes), "v3 vpn proxy socks udp encode")
+    let udpDecRes: Result[vpn.V3VpnProxySocksUdpDatagram] = vpn.V3VpnProxySocksDecodeUdpDatagram(Value(udpWireRes))
+    assert(IsOk(udpDecRes), "v3 vpn proxy socks udp decode")
+    assert(Value(udpDecRes).target.host == "127.0.0.1", "v3 vpn proxy socks udp host")
+    assert(Value(udpDecRes).target.port == 5300, "v3 vpn proxy socks udp port")
+    assert(bytesEqual(Value(udpDecRes).payload, bytesFromString("hello-udp")),
+           "v3 vpn proxy socks udp payload")
+
     var atypRes: Result[vpn.V3VpnProxyTarget]
     atypRes = vpn.V3VpnProxySocksParseTargetWire(testBytes([5, 1, 0, 9]))
     assert(IsErr(atypRes), "v3 vpn proxy socks atyp reject")

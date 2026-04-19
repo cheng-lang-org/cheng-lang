@@ -2,42 +2,29 @@
 
 | 项目 | 结论 |
 |---|---|
-| 前端真源 | `cheng v3` 真正的稳定点不是继续加语法，而是“单一规范化前端 + typed HIR/metadata 真源”。`parser -> compiler_csg -> lowering_plan` 现在必须共享同一份表达式身份和 lowering 标签。 |
-| 语法表面 | `func/fn` 双表面、`Fmt/?:/range/result intrinsic` 这种分散表面会持续制造漂移；正式口径必须是一处规范化，其它层不再扫源码字符串猜语义。 |
-| typed lowering | 在完整类型检查补齐前，未知路径必须明确写成 `polymorphic/deferred`，不能伪造“已经全类型化”。 |
-| lowering rule | `ruleKey` 不够，真正稳定的是显式规则字段：`arg/result/materialize/copy/import`。报表、smoke、后端都该围着这组规则转。 |
-| 复合值规则 | `str/rawbytes/seq/result` 当前最稳规则是“标量走寄存器，复合值走显式地址，复合 copy 走 region copy”。native/wasm 必须共用这套规则。 |
-| 局部作用域真根 | 这轮坐实了：flat local table + first-match 查找就是错根。只要同名 `let item` 在不同块里复用，后面的字段推导就会串到前一个槽上。正确规则是“局部槽带 `source line` 可见区间，并在 `dedent / elif / else` 切换时封口”。 |
-| native/wasm 一致性 | `V3AsmLocalSlot` 一旦新增字段，native 和 wasm 必须同时初始化和消费；只修一边，很快就会在另一边读到脏 `scope`。 |
-| browser ABI | browser wasm 侧当前最大重复面仍是手写 `input_len/copy/text/raw_handle`。下一步最值的是先抽统一 schema/helper，再逐步过渡到编译器生成桥。 |
-| browser ABI rule 验收 | `v3CompilerBrowserAbiRulesForLinkPlan` 这类规则 helper 的第一性最小验收，不该再走真实 `v3BuildSystemLinkPlanStub`。真正需要的输入只有 `workspaceRoot/packageRoot/sourceClosurePaths`；手工最小 `V3SystemLinkPlanStub` 更稳，也能避开无关 parser bounds 噪声。 |
-| browser ABI 首刀 | 这轮已经坐实：先把 `bytes/text/optional/handle` 收成显式 `input/output schema`，比继续堆 `Required/Optional/Handle` 平行 helper 稳得多；这样后面才能把更多 browser ABI 模块接到同一套规则上。 |
-| browser codegen 下一层 | browser ABI 再往前推时，先把“canonical ruleName -> typed schema”抽成共享 codegen，比直接在业务 ABI 文件里写 kind 常量稳得多。这样业务层只绑定 ruleName，不再维护第二套数字真源。 |
-| browser codegen 收口 | 只抽 schema 还不够；`input_len/copy/raw_handle/text_handle` 这些 generic bridge、以及读输入/写输出/lift/error/export 模板也必须一起进共享 codegen。否则业务 ABI 文件会长期停在“半共享半手写”的尴尬状态，第二套真源还是会回长。 |
-| browser bridge spec | 真正能把 `compiler_csg/lowering_plan/codegen` 串成一条线的，不是继续共享几组 schema helper，而是显式的 `rule -> bridge spec`。先把 stage、input schema、output schema、error schema 这些生成结果固定成对象，再让 codegen 和后续 emitter 去消费，会比继续散着按 `ruleName` 写 if 分支稳得多。 |
-| browser bridge owner identity | `bridge key` 不含 source，所以只看 key 很容易误以为 codegen 和 compiler 已对齐；真到 emitter 行时，`modulePath` 和源码绝对路径会马上分叉。bridge emitter 必须显式接收 `sourcePath`，不能偷用模块常量。 |
-| browser ABI 导出模板 | 只抽 `input/output schema` 还不够；真正会反复冒洞的是成功导出、错误发布、out-buffer handle 三段逻辑各写一份。现在应固定成统一 `export handle result` 模板，再让 text/bytes 只是不同 lift。 |
-| 编译器 smoke 并跑隔离 | 会自己物化 `artifacts/...`、写 probe 文件或占本地 TCP 端口的 smoke，不能再假设“输出路径固定也没事”。live/stage0 一起跑时，固定目录会互相覆盖，固定端口会互相抢占，表面上就会长成完全无关的编译/运行时错误。正确做法是统一按 `CHENG_V3_SMOKE_LABEL` 分目录，固定端口也按 label 派生。 |
-| libp2p smoke 端口隔离 | 默认 host smoke 里真正会互撞的不是一条，而是一串：`6201/6211/6307/6308/6316/6317/6321/6322/6421-6429/6431/7101/7102/7202`。最稳解法不是手工给 live/stage0 分两套新端口，而是统一从 `CHENG_V3_SMOKE_LABEL` 派生本地端口，让每条 smoke 保留原始相对布局。 |
-| `oracle_runtime_host_smoke` | 这条现在仍然会在单跑时直接 `bounds idx=256 len=256`，不是本轮端口隔离引入的回归。它需要单独查真根，不能再混进“并跑互踩”这一类问题里。 |
-| `Bytes[]` 真状态 | `Bytes[] add/setLen` 这条不能继续留在业务侧绕开，必须修在编译器里。当前最小 host smoke 已证明这条链不再被它本身卡死。 |
-| 显式导出规则 | `@exportc` 不能只在 `shared/obj` 保活；`exe` 里只要入口源码显式声明导出，也必须进 reachable roots，否则会出现“同源定义却被当成外部未定义符号”的假链接错误。 |
-| provider 冲突 | runtime provider 的默认 bridge 不能和入口源码显式导出同名共存。正确规则是入口显式导出优先，provider 自动退成内部符号，而不是靠弱符号或链接顺序碰运气。 |
-| 关键字运算 | `xor` 这种关键字二元运算不能只在某一层偷偷支持；至少 `const/infer/prepare/native/wasm` 这些热路径要同时认，否则就会退化成假 prefix-call。 |
-| 全局 len | `len(str/Bytes/seq)` 不能只认局部或字段；真正稳的规则是统一走 lvalue/global 地址，再按 ABI 布局取长度槽。 |
-| 已收平真洞 | 把 `Bytes[]`、`@exportc bridge`、`xor return_expr`、全局 `len(str)` 收平后，browser host native/runtime 与 wasm 验收已经重新一致。 |
-| 新回归面 | `wasm_shadowed_local_scope_smoke` 这种最小块级遮蔽用例比只盯 `moq_fountain` 更稳，因为它直接守住了“同名局部换类型换字段”这个根，而不是守某一个业务症状。 |
-| 验收方式 | 不要再靠单点 smoke 补洞。`lowering_matrix_smoke` 这种矩阵验收比症状回归更可靠。 |
-| stage0 使用面 | 裸 `cheng.stage0` 不能直接当 host smoke 编译器；它缺 `embedded bootstrap contract`，适合做 bootstrap/cc 自检，不适合当 live host smoke compiler。 |
-| 命令面收口 | live `backend_driver` 的命令面不能继续靠自递归转发凑合。`mobile-shell` 要直连稳定 helper，export-visibility 要本地直接跑 host smoke，不然很容易在 capture/tail 上挂住。 |
-| browser wasm 收口 | `moq_fountain` 这类 browser wasm 热路径，先把构建逻辑收成稳定 helper/getter，再复用已编绿的 build result 填充规则，比在大函数里继续堆 `Fmt + IntToStr + member access` 混合循环稳得多。 |
-| `std/os::splitFile` | 这类基础 helper 一旦同时混入复合局部、倒序索引回写和 loop 变量复用，就很容易踩 ordinary lowering 旧红点。更稳的形状是只保留整数索引，再直接 `return SplitFileResult(...)`。 |
-| host smoke timeout | `runtime_zero_c_surface_smoke` 这种会套跑 audit、browser、wasm 的重型 smoke，不能跟普通 unit smoke 共用 60 秒统一上限；正确做法是保留默认紧口径，再给已坐实的重型 smoke 单独显式 timeout。 |
-| browser export schema | `result/error/out-buffer` 这层真正该固定的不是更多平行 helper，而是“一个 error schema + 一个 output kind + 一个最终 export helper”。先把 `moq_fountain` 的 text/bytes 导出收成这套，后面扩到别的 browser 模块会稳得多。 |
-| browser probe 层 | `browser_host_wasm_probe` 这种探针层也不能继续直接碰裸 `text_handle bridge`。一旦 probe 直接 import bridge，后面就很容易绕开刚收好的 codec schema。正确做法是 probe 也统一走 codec helper，再让 smoke 直接守 probe handle 真值。 |
-| browser 规则表 | `browser_content_codec_rule_schema` 不能长期挂旧 helper 名。规则表哪怕现在主要用来报表和后续生成桥，只要名字落后于源码，就会再次制造“双真源”。正确做法是把 canonical ruleName 始终追到当前 helper。 |
-| browser 规则消费面 | browser ABI rule 最稳的结构是“两层真源”：`browser_abi_rule` 负责规则字段与计数/equality，`browser_content_codec_rule_schema` 负责某一模块的 canonical 规则列表；`compiler_csg` 和 `lowering_plan` 只做消费与转发，不再把规则塞回大对象里。 |
-| wasm codegen 限制 | browser wasm 热路径里，模块级 `const` 访问在部分 prepare 路径上还不稳。共享真源仍应保留在 codegen 模块里，但运行时判断优先走共享 getter 函数，不要直接在热路径里比模块 `const`。 |
-| 最小 ABI smoke | `browser_content_codec_abi_min` 这种最小回归也不能留一套手写裸桥流程。最小 smoke 最适合直接复用正式 codec helper，再补上 bytes/text 两条最小 handle 断言，这样才能真守住“没有第二套 ABI 口径”。 |
-| ruleName 回归 | 只守 `browser abi` 数量和 kind 计数不够，`ruleName` 漂回旧名字也能蒙混过关。最稳做法是单独补一条最小 `rule schema smoke`，直接检查 canonical ruleName 是否存在。 |
-| 文档记录 | 长流水账会掩盖真实状态。账本应该只保留当前主线、最近里程碑、耐久结论和下一步。 |
+| HIR 总体状态 | 现在完成的是“规范化声明 + 规范化表达式层 + typed fact + lowering rule”，还没到“seed/native/wasm 直接共吃完整 typed HIR”。 |
+| 当前真卡点 | 真缺口不在 parser，而在 `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 还残着很多按 `composite` 和 target 形状猜的热分支。 |
+| 本轮收口点 | 最先该收的是 call arg 主链，因为它同时覆盖 native spill、wasm prepare 和 wasm emit，是最热也最容易反复冒错的地方。 |
+| 第二刀主线 | `call arg` 收完后，最值的是顺手把 `seq/local/field/materialize` 同构分支一起接到 `v3_expr_materializes_to_address(...)`，这样不会又从 wasm local/builtin 旁路重新长出第二套判定。 |
+| 第三刀主线 | `seq/local/field/materialize` 收完后，最值的是继续扫 `result intrinsic / str equality / constructor field`，因为它们本质上也都只是在问“这个值是不是必须按地址物化”；不一起收，native compare、wasm result、constructor 写入会继续平行残留第二套 `composite` 判断。 |
+| 第四刀主线 | `result intrinsic / equality / constructor field` 收完后，最值的是顺着同一条规则继续扫 `result field/global/member/list elem copy`；这些路径表面是投影、复制、列表元素落位，但底层仍然只是在复用“这个值是不是必须按地址物化”，不一起收，materialize 和 wasm literal 会继续残留并行 ABI 文本判断。 |
+| 第五刀主线 | `result field/global/member/list elem copy` 收完后，最值的是继续扫 `param ABI / builtin str bridge`。这些地方虽然看起来像 C ABI 或消息桥，但本质上仍然在问“这个参数是不是必须按地址传/物化”，如果不一起收，native/wasm 的 `panic/echo` 和 external call path 还是会残留一截并行文本规则。 |
+| 当前尾巴 | 现在剩下的裸 `composite` 文本只剩 descriptor helper 自身一处，不再是功能热路径问题；继续清它的收益已经明显低于把同一套 lowering rule 往更高层 dispatch 真接进去。 |
+| 第六刀主线 | 真正更高收益的下一步是把 `call target` 级 dispatch 口也收进 rule helper，而不是继续清 descriptor 尾巴。参数加载 ABI、临时参数准备、scalar call、call-into-address、wasm composite call return 这些地方一旦各自猜，typed lowering 的单一真源又会在上层被冲散。 |
+| 第七刀主线 | `call target` 收完后，最值的不是停住，而是继续把 `call arg temp / expr temp / Result.Ok(...) / wasm call arg temp` 这层物化入口也一起切到地址规则；否则临时槽分配和结果物化很快又会重新长出第二套 ABI 猜测。 |
+| 第八刀主线 | 临时槽入口收完后，最值的是继续扫 `field/global/default/setitem` 这批已经拿到了完整 `type + abi` 的高层分发口；这些地方如果还只看 ABI class，就会在字段默认值、构造器字段写入、local/global copy 和 `[]=` 写值上重新长出一层平行判断。 |
+| 第九刀主线 | `field/global/default/setitem` 收完后，最值的是把 `Result.Value(...)`、local binding/local assignment/module global init 这批同样已经拿到完整 `type + abi` 的入口也一起切掉；否则 native 语句发码会在另一层继续保留一排平行的 `abi_class` 判断。 |
+| 第十刀主线 | `Result.Value(...)` 和 native 语句发码入口收完后，最值的是把 `v3_add_local_slot_for_type(...)`、scalar global load、`seq add` 元素写入、expr statement prepare/codegen、param-slot `indirect_value` 这批低层同构入口也一起切到 `v3_expr_materializes_to_address(...)`；不顺手扫完，低层会继续残留一截 `scalar_or_ptr` 分发。 |
+| 第十一刀主线 | 当 `scalar_or_ptr` 在低层分发里也退干净后，剩下的命中基本就是纯标量语义检查；下一步收益更大的方向不是再抠这些尾巴，而是把 return dispatch 也补成显式 rule helper，让 function/call-target 的返回路径和 arg/materialize 一样归一到同一套规则名。 |
+| 第十二刀主线 | return dispatch 收完后，最值的是把 `Result projection / wasm region-copy` 这批热路径也补成显式 `copy kind`，不要继续让它们直接吃 `prefers_region_copy` 布尔值；不然 `copy/materialize/import` 这条线还是缺一块稳定规则名。 |
+| 第十三刀主线 | `copy kind` 收完后，最值的是把 `call-into-address / composite call-result / wasm static return slot` 也补成显式 `call result kind` 和统一 helper；这些路径本质上都在问“结果是按值走，还是先得到地址/静态返回槽”，如果继续散着写布尔判断，后面 wasm fallback 和 native composite call 很快又会漂。 |
+| 第十四刀主线 | `call result kind` 和 static return slot 收完后，最值的是把 `wasm composite pointer result` 这条链也统一成单一入口；不然 result intrinsic、call-result 和 generic fallback 还会各自维护一份 `emit expr -> local_set -> copy`。 |
+| 第十五刀主线 | pointer-result fallback 收完后，最值的是把 wasm `builtin message ptr` 这条 import/emit 热链也补成显式 mode；`panic/echo/assert` 看起来只是 builtin，但 analyze/emit 两边如果都各写一份 `literal / ptr / str-address bridge` 三叉分支，import 规则很快又会漂成第二份真源。 |
+| 第十六刀主线 | wasm `builtin message ptr` 收完后，最值的是回到 native importc `ffi_handle` 参数链；只把 scalar call 修成规则化还不够，`call-into-address` 这条复合返回入口如果还把 handle 参当普通标量过，importc 行为会在第二条主链上重新漂。 |
+| 第十七刀主线 | native importc `ffi_handle` 收口时，不能只再加一层布尔 helper；更稳的是直接补显式 `arg kind`，把 `var / ffi_handle resolve / ffi_handle consume / value / address` 收成同一规则名，然后一次性切掉 `arg load abi`、prepare、scalar call、call-into-address 这几条入口。 |
+| 第十八刀主线 | 参数链收完后，下一刀最值的是把 importc 返回也一起规则化；只把参数做成显式枚举还不够，`ffi_handle register` 如果继续只靠 `ffi_handle_return_is_handle` 裸布尔特判，`return pass / call result / return fixup` 这条返回链还会保留第二份真源。 |
+| 第十九刀主线 | importc `ffi_handle` arg/return 收完后，下一刀最值的是把 wasm call/import 上那层 `i32 param slot / i32 return slot / void` 也补成显式 `slot kind`；不然 analyze/emit/signature 三条 call 主链还会继续各写一份 slot 布尔判断，import 规则还是会在 wasm 侧留第二份真源。 |
+| 第二十刀主线 | wasm call/import 的 `slot kind` 收完后，下一刀最值的是把 `type_index / import_index / local callee index` 这层 import 分发表也收回共享 helper；不然 `register_import / emit_call_target / collect_imports / encode return_call_*` 还是会继续手抄同一套签名解析和索引查找。 |
+| 第二十一刀主线 | `type_index / import_index / local callee index` 收完后，紧接着最值的是把 function-side `signature/type_index` 这一半也一起收回共享 helper；只修 call target 还不够，`context_init / collect_imports / module type section` 如果还各自手抄 `return_supported + param i32-slot`，wasm import 这一列仍然有两份签名真源。 |
+| 第二十二刀主线 | `signature/type_index` 收完后，最值的已经不是再抠签名，而是把 wasm composite copy 的“数据搬运入口”收成单一 helper；只要 `pointer-result / seq add / lvalue copy / static return slot` 还各写一份 `local_set + copy_region_between_locals`，import/copy-materialize 这一列还是会在更低层保留第二份真源。 |
+| fresh 验收面 | C bootstrap 改动不能直接拿 stage0 本体跑 ordinary smoke，因为它会先报 `missing embedded bootstrap contract`；稳定做法是 `stage0 bootstrap-bridge` 后，用 fresh `stage2` no-handoff 跑真 smoke。 |

@@ -1,0 +1,102 @@
+import std/result
+import cheng/v3/quic/connection as qconn
+import cheng/v3/quic/msquicruntime as qruntime
+import cheng/v3/quic/msquictransport_native as qtransport
+import cheng/v3/libp2p/transports/quic_transport
+
+fn quicMultistreamBytesEq(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn main(): int32 =
+    var settings = qruntime.initMsQuicSettings()
+    settings.allowDatagram = true
+
+    var listener = qtransport.initMsQuicTransport()
+    assert(IsOk(qtransport.setMsQuicTransportSettings(listener, settings)),
+        "v3 quic multistream: listener settings")
+    assert(IsOk(quic_transport.v3Libp2pQuicConfigureTls(listener)),
+        "v3 quic multistream: listener tls")
+    let listenAddrRes = quic_transport.v3Libp2pQuicAddrFromHostPort("127.0.0.1", 0)
+    assert(IsOk(listenAddrRes), "v3 quic multistream: listen addr")
+    qtransport.start(listener, Value(listenAddrRes))
+
+    var client = qtransport.initMsQuicTransport()
+    assert(IsOk(qtransport.setMsQuicTransportSettings(client, settings)),
+        "v3 quic multistream: client settings")
+    assert(IsOk(quic_transport.v3Libp2pQuicConfigureTls(client)),
+        "v3 quic multistream: client tls")
+    let dialRes = qtransport.dial(client, listener.listenAddr)
+    assert(IsOk(dialRes), "v3 quic multistream: dial")
+    var clientLegacy = Value(dialRes)
+    let acceptRes = qtransport.accept(listener)
+    assert(IsOk(acceptRes), "v3 quic multistream: accept")
+    var serverLegacy = Value(acceptRes)
+
+    let stream4PairRes = qconn.newNativeConnectionPairForStreams(clientLegacy.localAddr,
+                                                                 clientLegacy.remoteAddr,
+                                                                 serverLegacy.localAddr,
+                                                                 serverLegacy.remoteAddr,
+                                                                 4,
+                                                                 4,
+                                                                 4,
+                                                                 4)
+    assert(IsOk(stream4PairRes), "v3 quic multistream: stream4 pair")
+    var stream4Client = Value(stream4PairRes).outbound
+    var stream4Server = Value(stream4PairRes).inbound
+
+    let stream8PairRes = qconn.newNativeConnectionPairForStreams(clientLegacy.localAddr,
+                                                                 clientLegacy.remoteAddr,
+                                                                 serverLegacy.localAddr,
+                                                                 serverLegacy.remoteAddr,
+                                                                 8,
+                                                                 8,
+                                                                 8,
+                                                                 8)
+    assert(IsOk(stream8PairRes), "v3 quic multistream: stream8 pair")
+    var stream8Client = Value(stream8PairRes).outbound
+    var stream8Server = Value(stream8PairRes).inbound
+
+    let clientPayload4: Bytes = bytesFromString("client-stream-4")
+    let clientPayload8: Bytes = bytesFromString("client-stream-8-larger")
+    assert(IsOk(qconn.connWrite(stream8Client, clientPayload8)),
+        "v3 quic multistream: client write stream8")
+    assert(IsOk(qconn.connWrite(stream4Client, clientPayload4)),
+        "v3 quic multistream: client write stream4")
+    let serverRead4 = qconn.connRead(stream4Server, bytesLen(clientPayload4))
+    assert(IsOk(serverRead4), "v3 quic multistream: server read stream4")
+    assert(quicMultistreamBytesEq(Value(serverRead4), clientPayload4),
+        "v3 quic multistream: server payload stream4")
+    let serverRead8 = qconn.connRead(stream8Server, bytesLen(clientPayload8))
+    assert(IsOk(serverRead8), "v3 quic multistream: server read stream8")
+    assert(quicMultistreamBytesEq(Value(serverRead8), clientPayload8),
+        "v3 quic multistream: server payload stream8")
+
+    let serverPayload4: Bytes = bytesFromString("server-stream-4")
+    let serverPayload8: Bytes = bytesFromString("server-stream-8-larger")
+    assert(IsOk(qconn.connWrite(stream4Server, serverPayload4)),
+        "v3 quic multistream: server write stream4")
+    assert(IsOk(qconn.connWrite(stream8Server, serverPayload8)),
+        "v3 quic multistream: server write stream8")
+    let clientRead8 = qconn.connRead(stream8Client, bytesLen(serverPayload8))
+    assert(IsOk(clientRead8), "v3 quic multistream: client read stream8")
+    assert(quicMultistreamBytesEq(Value(clientRead8), serverPayload8),
+        "v3 quic multistream: client payload stream8")
+    let clientRead4 = qconn.connRead(stream4Client, bytesLen(serverPayload4))
+    assert(IsOk(clientRead4), "v3 quic multistream: client read stream4")
+    assert(quicMultistreamBytesEq(Value(clientRead4), serverPayload4),
+        "v3 quic multistream: client payload stream4")
+
+    qconn.connClose(stream8Server)
+    qconn.connClose(stream8Client)
+    qconn.connClose(stream4Server)
+    qconn.connClose(stream4Client)
+    qconn.connClose(serverLegacy)
+    qconn.connClose(clientLegacy)
+    qtransport.stop(listener)
+    echo("v3 quic_multistream_smoke ok")
+    return 0

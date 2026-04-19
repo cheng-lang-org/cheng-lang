@@ -1,0 +1,54 @@
+import std/system
+import std/cmdline
+import std/bytes as filebytes
+import cheng/v3/libp2p/content/moq_fountain as moq
+import cheng/v3/libp2p/mobile/mobile_capi as capi
+
+fn usage(): int32 =
+    echo("usage: mobile_moq_fountain_build_probe <core|raw> <sample-path> [remote-peers-csv]")
+    return 2
+
+fn main(argc: int32, argv: str*): int32 =
+    cmdline.CaptureCmdLine(argc, argv)
+    if cmdline.ParamCount() < 3:
+        return usage()
+    let mode = cmdline.ParamStr(1)
+    let samplePath = cmdline.ParamStr(2)
+    let remotePeersCsv = if cmdline.ParamCount() >= 4: cmdline.ParamStr(3) else: "peer-harmony"
+    let buf = filebytes.ReadFileBytes(samplePath)
+    assert(buf.data != nil && buf.len > 0, "mobile_moq probe: sample bytes")
+    echo("probe:sample_loaded")
+    echo("probe:sample_len=" + intToStr(buf.len))
+    if mode == "core":
+        let buildRes = moq.v3Libp2pMoqBuild(bytesView(buf.data, buf.len),
+                                            "peer-android",
+                                            remotePeersCsv,
+                                            "video/mp4",
+                                            512 * 1024,
+                                            128 * 1024,
+                                            2)
+        assert(IsOk(buildRes), "mobile_moq probe: core build")
+        let out = Value(buildRes)
+        echo("probe:core_ok")
+        echo("probe:bundle=" + out.bundleCid)
+        echo("probe:objects=" + intToStr(out.objectCount))
+        echo("probe:droplets=" + intToStr(out.droplets.len))
+        return 0
+    if mode == "raw":
+        let wire = capi.v3MobileCapiMoqFountainBuildRaw(buf.data,
+                                                        buf.len,
+                                                        "peer-android",
+                                                        remotePeersCsv,
+                                                        "video/mp4",
+                                                        512 * 1024,
+                                                        128 * 1024,
+                                                        2)
+        assert(len(wire) > 0, "mobile_moq probe: raw wire")
+        echo("probe:raw_ok")
+        echo("probe:wire_len=" + intToStr(len(wire)))
+        if strContains(wire, "ok=1"):
+            echo("probe:wire_ok=1")
+        else:
+            echo("probe:wire_ok=0")
+        return 0
+    return usage()

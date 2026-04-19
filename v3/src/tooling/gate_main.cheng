@@ -15,6 +15,9 @@ import cheng/v3/tooling/r2c_react_v3 as r2c
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/backend/build_plan as buildplan
 import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/chain/oracle_types as oracle_types
+import cheng/v3/project/oracle_fixture
 
 type
     V3BftThreeNodeDeploy =
@@ -51,6 +54,29 @@ type
         appHash: str
         aliceBalance: str
         bobBalance: str
+
+    V3OracleBftThreeNodeDeploy =
+        appId: str
+        serverSsh: str
+        relaySsh: str
+        serverRepoRoot: str
+        relayRepoRoot: str
+        localDeployDir: str
+        remoteDeployRel: str
+
+    V3OracleBftNodeStatus =
+        name: str
+        summary: str
+        latestQuery: str
+        twapQuery: str
+        height: str
+        lastFinalizedRoundId: str
+        appHash: str
+        latestCode: str
+        latestRoundId: str
+        latestPriceE8: str
+        twapCode: str
+        twapPriceE8: str
 
 fn v3GatePrintLine(text: str) =
     os.WriteLine(os.Get_stdout(), text)
@@ -167,6 +193,11 @@ fn v3GateUsageLines(): str[] =
     add(out, "  status-bft-validator-three-node")
     add(out, "  stop-bft-validator-three-node")
     add(out, "  bench-bft-validator-three-node [--tx-count:<n>] [--wave-count:<n>] [--transfer-amount:<n>] [--max-txs-per-block:<n>] [--restart-node:none|server|relay|local] [--restart-wave:<n>] [--restart-pause-ms:<n>]")
+    add(out, "  build-oracle-bft-state-machine")
+    add(out, "  deploy-oracle-bft-three-node")
+    add(out, "  verify-oracle-bft-three-node")
+    add(out, "  status-oracle-bft-three-node")
+    add(out, "  stop-oracle-bft-three-node")
     add(out, "  build-rwad-bft-state-machine")
     add(out, "  build-program-selfhost")
     add(out, "  build-chain-node")
@@ -3301,9 +3332,17 @@ fn v3GateDefaultHostSmokes(): str[] =
         "vpn_proxy_config_smoke",
         "vpn_proxy_json_smoke",
         "vpn_proxy_listen_smoke",
-        "vpn_proxy_protocol_smoke",
+        "vpn_proxy_main_hysteria2_smoke",
+        "vpn_proxy_hysteria2_session_smoke",
+        "vpn_proxy_hysteria2_tcp_stream_smoke",
+        "vpn_proxy_tcp_control_bytes_smoke",
+        "vpn_proxy_end_to_end_smoke",
         "vpn_proxy_routing_smoke",
         "vpn_proxy_socks_smoke",
+        "quic_stream_fin_smoke",
+        "qpack_min_smoke",
+        "http3_frame_smoke",
+        "hysteria2_protocol_smoke",
         "os_dir_exists_smoke",
         "os_file_exists_smoke",
         "os_file_size_smoke",
@@ -3324,7 +3363,15 @@ fn v3GateDefaultHostSmokes(): str[] =
         "lowering_plan_smoke",
         "browser_content_codec_rule_schema_smoke",
         "browser_content_codec_codegen_smoke",
+        "browser_host_probe_rule_schema_smoke",
+        "browser_host_probe_codegen_smoke",
+        "browser_host_probe_abi_rule_smoke",
+        "browser_host_probe_bridge_plan_report_smoke",
         "browser_abi_rule_smoke",
+        "browser_bridge_object_plan_smoke",
+        "browser_bridge_artifact_write_smoke",
+        "browser_bridge_compiler_object_surface_smoke",
+        "browser_bridge_link_input_surface_smoke",
         "compiler_equivalence_smoke",
         "compiler_publish_smoke",
         "bft_three_replica_smoke",
@@ -3370,6 +3417,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "quic_transport_sequential_accept_smoke",
         "libp2p_quic_tls_smoke",
         "quic_feature_matrix_smoke",
+        "quic_multistream_smoke",
         "quic_close_order_smoke",
         "bft_daemon_quic_close_order_smoke",
         "libp2p_tailnet_policy_smoke",
@@ -3380,6 +3428,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "libp2p_scheduler_smoke",
         "libp2p_quic_tls_smoke",
         "quic_feature_matrix_smoke",
+        "quic_multistream_smoke",
         "quic_close_order_smoke",
         "bft_daemon_quic_close_order_smoke",
         "tailnet_control_core_smoke",
@@ -3413,7 +3462,12 @@ fn v3GateDefaultStage23Smokes(): str[] =
         "lowering_plan_smoke",
         "browser_content_codec_rule_schema_smoke",
         "browser_content_codec_codegen_smoke",
+        "browser_host_probe_rule_schema_smoke",
+        "browser_host_probe_codegen_smoke",
+        "browser_host_probe_abi_rule_smoke",
+        "browser_host_probe_bridge_plan_report_smoke",
         "browser_abi_rule_smoke",
+        "browser_bridge_artifact_write_smoke",
         "compiler_equivalence_smoke",
         "compiler_publish_smoke",
         "bft_three_replica_smoke",
@@ -3431,6 +3485,7 @@ fn v3GateDefaultStage23Smokes(): str[] =
         "libp2p_scheduler_smoke",
         "libp2p_quic_tls_smoke",
         "quic_feature_matrix_smoke",
+        "quic_multistream_smoke",
         "quic_close_order_smoke",
         "bft_daemon_quic_close_order_smoke",
         "tailnet_control_core_smoke",
@@ -6098,6 +6153,737 @@ fn v3GateBuildBftStateMachine(root: str): int32 =
         v3GatePrintLine("v3 bft_state_machine: build ok target=" + target + " out=" + outBin)
     return 0
 
+fn v3GateOracleBftPairText(): str =
+    return "BTC/USD"
+
+fn v3GateOracleBftQueryNowRound(): int64 =
+    return int64(22)
+
+fn v3GateOracleBftTwapWindowRounds(): int32 =
+    return 3
+
+fn v3GateOracleBftExpectedRound(): int64 =
+    return int64(22)
+
+fn v3GateOracleBftPairId(): int32 =
+    return oracle_fixture.oracleSmokePairId(oracle_types.v3OracleAssetBtc, oracle_types.v3OracleQuoteUsd)
+
+fn v3GateOracleBftExpectedLatestPrice(): int64 =
+    let pairIndex = oracle_types.v3OraclePairIndex(v3GateOracleBftPairId())
+    return oracle_fixture.oracleSmokePrice(v3GateOracleBftExpectedRound(), pairIndex, 3)
+
+fn v3GateOracleBftExpectedTwapPrice(): int64 =
+    let pairIndex = oracle_types.v3OraclePairIndex(v3GateOracleBftPairId())
+    return (oracle_fixture.oracleSmokePrice(int64(20), pairIndex, 3) +
+            oracle_fixture.oracleSmokePrice(int64(21), pairIndex, 3) +
+            oracle_fixture.oracleSmokePrice(int64(22), pairIndex, 3)) / int64(3)
+
+fn v3GateOracleBftThreeNodeConfig(root: str): V3OracleBftThreeNodeDeploy =
+    var deployRel = ""
+    var remoteDeployRel = ""
+    var out: V3OracleBftThreeNodeDeploy
+    deployRel = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_DEPLOY_DIR", "artifacts/v3_oracle_bft_deploy")
+    remoteDeployRel = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_REMOTE_DEPLOY_REL", "artifacts/v3_oracle_bft_deploy")
+    out.appId = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_APP_ID", "cheng-oracle-live-20260419")
+    out.serverSsh = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_SERVER_SSH", "root@64.176.84.12")
+    out.relaySsh = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_RELAY_SSH", "dmit")
+    out.serverRepoRoot = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_SERVER_ROOT", "/root/cheng-lang-deploy")
+    out.relayRepoRoot = os.GetEnvDefault("CHENG_V3_ORACLE_BFT_RELAY_ROOT", "/root/cheng-lang-deploy")
+    out.localDeployDir = v3path.V3PathAbsolute(root, deployRel)
+    out.remoteDeployRel = remoteDeployRel
+    return out
+
+fn v3GateOracleBftManifestPath(cfg: V3OracleBftThreeNodeDeploy): str =
+    return os.JoinPath(cfg.localDeployDir, "deploy.env")
+
+fn v3GateOracleBftManifestText(cfg: V3OracleBftThreeNodeDeploy): str =
+    var out = ""
+    out = out + "app_id=" + cfg.appId + "\n"
+    out = out + "server_ssh=" + cfg.serverSsh + "\n"
+    out = out + "relay_ssh=" + cfg.relaySsh + "\n"
+    out = out + "server_root=" + cfg.serverRepoRoot + "\n"
+    out = out + "relay_root=" + cfg.relayRepoRoot + "\n"
+    out = out + "local_deploy_dir=" + cfg.localDeployDir + "\n"
+    out = out + "remote_deploy_rel=" + cfg.remoteDeployRel + "\n"
+    return out
+
+fn v3GateOracleBftConfigLoad(root: str): V3OracleBftThreeNodeDeploy =
+    var cfg = v3GateOracleBftThreeNodeConfig(root)
+    let manifestPath = v3GateOracleBftManifestPath(cfg)
+    if !os.FileExists(manifestPath):
+        return cfg
+    let text = v3path.V3ReadTextFile("", manifestPath)
+    let appId = v3GateTextValue(text, "app_id")
+    if len(appId) > 0:
+        cfg.appId = appId
+    let serverSsh = v3GateTextValue(text, "server_ssh")
+    if len(serverSsh) > 0:
+        cfg.serverSsh = serverSsh
+    let relaySsh = v3GateTextValue(text, "relay_ssh")
+    if len(relaySsh) > 0:
+        cfg.relaySsh = relaySsh
+    let serverRoot = v3GateTextValue(text, "server_root")
+    if len(serverRoot) > 0:
+        cfg.serverRepoRoot = serverRoot
+    let relayRoot = v3GateTextValue(text, "relay_root")
+    if len(relayRoot) > 0:
+        cfg.relayRepoRoot = relayRoot
+    let localDir = v3GateTextValue(text, "local_deploy_dir")
+    if len(localDir) > 0:
+        cfg.localDeployDir = localDir
+    let remoteRel = v3GateTextValue(text, "remote_deploy_rel")
+    if len(remoteRel) > 0:
+        cfg.remoteDeployRel = remoteRel
+    return cfg
+
+fn v3GateOracleBftRemoteDeployDir(repoRoot: str, cfg: V3OracleBftThreeNodeDeploy): str =
+    return v3path.V3PathAbsolute(repoRoot, cfg.remoteDeployRel)
+
+fn v3GateOracleBftRemoteBin(repoRoot: str): str =
+    return os.JoinPath(os.JoinPath(os.JoinPath(repoRoot, "artifacts"), "v3_oracle_bft_state_machine"),
+                       os.JoinPath("x86_64-unknown-linux-gnu", "oracle_bft_state_machine"))
+
+fn v3GateOracleBftLocalBin(root: str): str =
+    return v3path.V3PathAbsolute(root, "artifacts/v3_oracle_bft_state_machine/oracle_bft_state_machine")
+
+fn v3GateOracleBftRemoteRunLog(repoRoot: str): str =
+    let outDir = os.JoinPath(os.JoinPath(os.JoinPath(repoRoot, "artifacts"), "v3_oracle_bft_state_machine"),
+                             "x86_64-unknown-linux-gnu")
+    return os.JoinPath(outDir, "oracle_bft_state_machine.self-test.log")
+
+fn v3GateOracleBftBuildReady(root: str,
+                             compiler: str,
+                             src: str,
+                             outBin: str,
+                             runLog: str,
+                             runSelfTest: str): bool =
+    if !os.FileExists(outBin):
+        return false
+    var command = "test -x " + os.QuoteShell(outBin) +
+                  " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin) +
+                  " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin)
+    if runSelfTest != "0":
+        if !os.FileExists(runLog):
+            return false
+        command = command +
+                  " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
+                  " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
+                  " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
+                  " && grep -q " + os.QuoteShell("v3 oracle_bft_state_machine self-test ok") + " " + os.QuoteShell(runLog)
+    return v3GateShellCheckOk(root, command)
+
+fn v3GateBuildOracleBftStateMachine(root: str): int32 =
+    var compiler = ""
+    if v3GateResolveSmokeCompiler(root, "", "CHENG_V3_ORACLE_BFT_COMPILER", "", compiler) != 0:
+        return 1
+    let target = os.GetEnvDefault("ORACLE_BFT_STATE_TARGET", "arm64-apple-darwin")
+    var defaultOutDir = v3path.V3PathAbsolute(root, "artifacts/v3_oracle_bft_state_machine")
+    if target != "arm64-apple-darwin":
+        defaultOutDir = os.JoinPath(defaultOutDir, target)
+    let outDir = os.GetEnvDefault("ORACLE_BFT_STATE_OUT_DIR", defaultOutDir)
+    let src = v3path.V3PathAbsolute(root, "v3/src/project/oracle_bft_state_machine_main.cheng")
+    let outBin = os.GetEnvDefault("ORACLE_BFT_STATE_OUT_BIN", os.JoinPath(outDir, "oracle_bft_state_machine"))
+    var runSelfTestDefault = "0"
+    if target == v3GateHostTarget(root):
+        runSelfTestDefault = "1"
+    let runSelfTest = os.GetEnvDefault("ORACLE_BFT_STATE_RUN_SELF_TEST", runSelfTestDefault)
+    let runLog = os.JoinPath(outDir, "oracle_bft_state_machine.self-test.log")
+    if v3GateOracleBftBuildReady(root, compiler, src, outBin, runLog, runSelfTest):
+        if runSelfTest != "0":
+            let cached = v3path.V3ReadTextFile("", runLog)
+            if len(cached) > 0:
+                v3GatePrintLine(strutil.Strip(cached))
+            else:
+                v3GatePrintLine("v3 oracle_bft_state_machine self-test ok")
+        else:
+            v3GatePrintLine("v3 oracle_bft_state_machine: build ok target=" + target + " out=" + outBin)
+        return 0
+    let compileRun = v3GateCompileExe(root,
+                                      "build_oracle_bft_state_machine",
+                                      compiler,
+                                      src,
+                                      outBin,
+                                      target,
+                                      os.JoinPath(outDir, "oracle_bft_state_machine.compile.log"))
+    if v3GateRunFailed(compileRun):
+        return compileRun.exitCode
+    if runSelfTest != "0":
+        let run = v3GateRunBinary(root,
+                                  "build_oracle_bft_state_machine_run",
+                                  outBin,
+                                  ["self-test"],
+                                  60,
+                                  runLog)
+        v3GateMaybePrintRunOutput(run)
+        if v3GateRunFailed(run):
+            return run.exitCode
+    else:
+        v3GatePrintLine("v3 oracle_bft_state_machine: build ok target=" + target + " out=" + outBin)
+    return 0
+
+fn v3GateOracleBftRemoteBuildReadyCommand(repoRoot: str): str =
+    let compiler = v3GateBftRemoteBackendDriver(repoRoot)
+    let src = os.JoinPath(repoRoot, "v3/src/project/oracle_bft_state_machine_main.cheng")
+    let outBin = v3GateOracleBftRemoteBin(repoRoot)
+    let runLog = v3GateOracleBftRemoteRunLog(repoRoot)
+    return "test -x " + os.QuoteShell(outBin) +
+           " && test -x " + os.QuoteShell(compiler) +
+           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin) +
+           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin) +
+           " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
+           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
+           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
+           " && grep -qF " + os.QuoteShell("v3 oracle_bft_state_machine self-test ok") +
+           " " + os.QuoteShell(runLog)
+
+fn v3GateOracleBftBuildRemote(root: str,
+                              sshHost: str,
+                              remoteRoot: str,
+                              logPath: str): int32 =
+    let readyRun = v3GateRunRemoteShellLogged(root,
+                                              "oracle_bft_remote_ready",
+                                              sshHost,
+                                              "set -eu && " + v3GateOracleBftRemoteBuildReadyCommand(remoteRoot),
+                                              logPath + ".ready.log",
+                                              30)
+    if !v3GateRunFailed(readyRun):
+        v3GatePrintLine("[v3 gate] remote oracle bft reuse " + sshHost)
+        return 0
+    let stage3FreshRun = v3GateRunRemoteShellLogged(root,
+                                                    "oracle_bft_remote_stage3_fresh",
+                                                    sshHost,
+                                                    "set -eu && " + v3GateBftRemoteStage3FreshCommand(remoteRoot),
+                                                    logPath + ".stage3.log",
+                                                    30)
+    if !v3GateRunFailed(stage3FreshRun):
+        let incrementalCommand = v3GateBftRemoteLockedShell(
+            remoteRoot,
+            "ORACLE_BFT_STATE_TARGET=x86_64-unknown-linux-gnu" +
+            " ORACLE_BFT_STATE_RUN_SELF_TEST=1" +
+            " artifacts/v3_bootstrap/cheng.stage3 build-oracle-bft-state-machine")
+        let incrementalRun = v3GateRunRemoteShellLogged(root,
+                                                        "oracle_bft_remote_build_incremental",
+                                                        sshHost,
+                                                        incrementalCommand,
+                                                        logPath,
+                                                        900)
+        if v3GateRunFailed(incrementalRun):
+            return incrementalRun.exitCode
+        v3GatePrintLine("[v3 gate] remote oracle bft incremental " + sshHost)
+        return 0
+    let fullCommand = v3GateBftRemoteLockedShell(
+        remoteRoot,
+        "mkdir -p artifacts/v3_bootstrap" +
+        " && cc -std=c11 -O2 -Wall -Wextra -pedantic" +
+        " v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0" +
+        " && CHENG_V3_ROOT=" + os.QuoteShell(remoteRoot) +
+        " CHENG_V3_TARGET=x86_64-unknown-linux-gnu" +
+        " artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge >/dev/null" +
+        " && ORACLE_BFT_STATE_TARGET=x86_64-unknown-linux-gnu" +
+        " ORACLE_BFT_STATE_RUN_SELF_TEST=1" +
+        " artifacts/v3_bootstrap/cheng.stage3 build-oracle-bft-state-machine")
+    let run = v3GateRunRemoteShellLogged(root, "oracle_bft_remote_build", sshHost, fullCommand, logPath, 900)
+    if v3GateRunFailed(run):
+        return run.exitCode
+    v3GatePrintLine("[v3 gate] remote oracle bft rebuild " + sshHost)
+    return 0
+
+fn v3GateOracleBftNodeStatusZero(name: str): V3OracleBftNodeStatus =
+    var out: V3OracleBftNodeStatus
+    out.name = name
+    out.summary = ""
+    out.latestQuery = ""
+    out.twapQuery = ""
+    out.height = ""
+    out.lastFinalizedRoundId = ""
+    out.appHash = ""
+    out.latestCode = ""
+    out.latestRoundId = ""
+    out.latestPriceE8 = ""
+    out.twapCode = ""
+    out.twapPriceE8 = ""
+    return out
+
+fn v3GateOracleBftCollectLocalNodeStatus(root: str,
+                                         nodeName: str,
+                                         statePath: str,
+                                         logPrefix: str): Result[V3OracleBftNodeStatus] =
+    let binPath = v3GateOracleBftLocalBin(root)
+    let summaryRun = hostops.v3RunFileLogged(root,
+                                             nodeName + "_oracle_show_state",
+                                             binPath,
+                                             ["show-state", "--state:" + statePath],
+                                             [],
+                                             root,
+                                             20,
+                                             logPrefix + ".show.log")
+    if !hostops.v3LoggedRunOk(summaryRun):
+        return Err[V3OracleBftNodeStatus](summaryRun.output)
+    let latestRun = hostops.v3RunFileLogged(root,
+                                            nodeName + "_oracle_latest",
+                                            binPath,
+                                            ["query-latest",
+                                             "--state:" + statePath,
+                                             "--pair:" + v3GateOracleBftPairText(),
+                                             "--now-round:" + strings.Int64ToStr(v3GateOracleBftQueryNowRound())],
+                                            [],
+                                            root,
+                                            20,
+                                            logPrefix + ".latest.log")
+    if !hostops.v3LoggedRunOk(latestRun):
+        return Err[V3OracleBftNodeStatus](latestRun.output)
+    let twapRun = hostops.v3RunFileLogged(root,
+                                          nodeName + "_oracle_twap",
+                                          binPath,
+                                          ["query-twap",
+                                           "--state:" + statePath,
+                                           "--pair:" + v3GateOracleBftPairText(),
+                                           "--window-rounds:" + intToStr(v3GateOracleBftTwapWindowRounds()),
+                                           "--now-round:" + strings.Int64ToStr(v3GateOracleBftQueryNowRound())],
+                                          [],
+                                          root,
+                                          20,
+                                          logPrefix + ".twap.log")
+    if !hostops.v3LoggedRunOk(twapRun):
+        return Err[V3OracleBftNodeStatus](twapRun.output)
+    return Ok[V3OracleBftNodeStatus](V3OracleBftNodeStatus(
+        name: nodeName,
+        summary: summaryRun.output,
+        latestQuery: latestRun.output,
+        twapQuery: twapRun.output,
+        height: strutil.Strip(v3GateTextValue(summaryRun.output, "height")),
+        lastFinalizedRoundId: strutil.Strip(v3GateTextValue(summaryRun.output, "last_finalized_round_id")),
+        appHash: strutil.Strip(v3GateTextValue(summaryRun.output, "app_hash")),
+        latestCode: strutil.Strip(v3GateTextValue(latestRun.output, "code")),
+        latestRoundId: strutil.Strip(v3GateTextValue(latestRun.output, "round_id")),
+        latestPriceE8: strutil.Strip(v3GateTextValue(latestRun.output, "price_e8")),
+        twapCode: strutil.Strip(v3GateTextValue(twapRun.output, "code")),
+        twapPriceE8: strutil.Strip(v3GateTextValue(twapRun.output, "price_e8"))
+    ))
+
+fn v3GateOracleBftCollectRemoteNodeStatus(root: str,
+                                          nodeName: str,
+                                          sshHost: str,
+                                          repoRoot: str,
+                                          statePath: str,
+                                          logPrefix: str): Result[V3OracleBftNodeStatus] =
+    let binPath = v3GateOracleBftRemoteBin(repoRoot)
+    let summaryRun = v3GateRunRemoteShellLogged(root,
+                                                nodeName + "_oracle_show_state",
+                                                sshHost,
+                                                "set -eu && " + v3GateShellArgv([binPath,
+                                                                                 "show-state",
+                                                                                 "--state:" + statePath]),
+                                                logPrefix + ".show.log",
+                                                20)
+    if !hostops.v3LoggedRunOk(summaryRun):
+        return Err[V3OracleBftNodeStatus](summaryRun.output)
+    let latestRun = v3GateRunRemoteShellLogged(root,
+                                               nodeName + "_oracle_latest",
+                                               sshHost,
+                                               "set -eu && " + v3GateShellArgv([binPath,
+                                                                                "query-latest",
+                                                                                "--state:" + statePath,
+                                                                                "--pair:" + v3GateOracleBftPairText(),
+                                                                                "--now-round:" + strings.Int64ToStr(v3GateOracleBftQueryNowRound())]),
+                                               logPrefix + ".latest.log",
+                                               20)
+    if !hostops.v3LoggedRunOk(latestRun):
+        return Err[V3OracleBftNodeStatus](latestRun.output)
+    let twapRun = v3GateRunRemoteShellLogged(root,
+                                             nodeName + "_oracle_twap",
+                                             sshHost,
+                                             "set -eu && " + v3GateShellArgv([binPath,
+                                                                              "query-twap",
+                                                                              "--state:" + statePath,
+                                                                              "--pair:" + v3GateOracleBftPairText(),
+                                                                              "--window-rounds:" + intToStr(v3GateOracleBftTwapWindowRounds()),
+                                                                              "--now-round:" + strings.Int64ToStr(v3GateOracleBftQueryNowRound())]),
+                                             logPrefix + ".twap.log",
+                                             20)
+    if !hostops.v3LoggedRunOk(twapRun):
+        return Err[V3OracleBftNodeStatus](twapRun.output)
+    return Ok[V3OracleBftNodeStatus](V3OracleBftNodeStatus(
+        name: nodeName,
+        summary: summaryRun.output,
+        latestQuery: latestRun.output,
+        twapQuery: twapRun.output,
+        height: strutil.Strip(v3GateTextValue(summaryRun.output, "height")),
+        lastFinalizedRoundId: strutil.Strip(v3GateTextValue(summaryRun.output, "last_finalized_round_id")),
+        appHash: strutil.Strip(v3GateTextValue(summaryRun.output, "app_hash")),
+        latestCode: strutil.Strip(v3GateTextValue(latestRun.output, "code")),
+        latestRoundId: strutil.Strip(v3GateTextValue(latestRun.output, "round_id")),
+        latestPriceE8: strutil.Strip(v3GateTextValue(latestRun.output, "price_e8")),
+        twapCode: strutil.Strip(v3GateTextValue(twapRun.output, "code")),
+        twapPriceE8: strutil.Strip(v3GateTextValue(twapRun.output, "price_e8"))
+    ))
+
+fn v3GateOracleBftPrintNodeStatus(status: V3OracleBftNodeStatus) =
+    v3GatePrintLine("node=" + status.name)
+    v3GatePrintLine("height=" + status.height)
+    v3GatePrintLine("last_finalized_round_id=" + status.lastFinalizedRoundId)
+    v3GatePrintLine("app_hash=" + status.appHash)
+    v3GatePrintLine("latest_code=" + status.latestCode)
+    v3GatePrintLine("latest_round_id=" + status.latestRoundId)
+    v3GatePrintLine("latest_price_e8=" + status.latestPriceE8)
+    v3GatePrintLine("twap_code=" + status.twapCode)
+    v3GatePrintLine("twap_price_e8=" + status.twapPriceE8)
+
+fn v3GateOracleBftClusterMatches(serverStatus: V3OracleBftNodeStatus,
+                                 relayStatus: V3OracleBftNodeStatus,
+                                 localStatus: V3OracleBftNodeStatus): bool =
+    let wantHeight = "3"
+    let wantRound = strings.Int64ToStr(v3GateOracleBftExpectedRound())
+    let wantLatestPrice = strings.Int64ToStr(v3GateOracleBftExpectedLatestPrice())
+    let wantTwapPrice = strings.Int64ToStr(v3GateOracleBftExpectedTwapPrice())
+    return serverStatus.height == wantHeight &&
+           relayStatus.height == wantHeight &&
+           localStatus.height == wantHeight &&
+           serverStatus.lastFinalizedRoundId == wantRound &&
+           relayStatus.lastFinalizedRoundId == wantRound &&
+           localStatus.lastFinalizedRoundId == wantRound &&
+           len(serverStatus.appHash) > 0 &&
+           serverStatus.appHash == relayStatus.appHash &&
+           serverStatus.appHash == localStatus.appHash &&
+           serverStatus.latestCode == "0" &&
+           relayStatus.latestCode == "0" &&
+           localStatus.latestCode == "0" &&
+           serverStatus.latestRoundId == wantRound &&
+           relayStatus.latestRoundId == wantRound &&
+           localStatus.latestRoundId == wantRound &&
+           serverStatus.latestPriceE8 == wantLatestPrice &&
+           relayStatus.latestPriceE8 == wantLatestPrice &&
+           localStatus.latestPriceE8 == wantLatestPrice &&
+           serverStatus.twapCode == "0" &&
+           relayStatus.twapCode == "0" &&
+           localStatus.twapCode == "0" &&
+           serverStatus.twapPriceE8 == wantTwapPrice &&
+           relayStatus.twapPriceE8 == wantTwapPrice &&
+           localStatus.twapPriceE8 == wantTwapPrice
+
+fn v3GateOracleBftStatePath(dir: str): str =
+    return os.JoinPath(dir, "oracle.state")
+
+fn v3GateOracleBftInitCommand(binPath: str,
+                              statePath: str,
+                              appId: str): str =
+    return v3GateShellArgv([binPath,
+                            "init",
+                            "--state:" + statePath,
+                            "--app-id:" + appId,
+                            "--force"])
+
+fn v3GateOracleBftFixtureFinalizeCommand(binPath: str,
+                                         statePath: str,
+                                         height: int64,
+                                         roundId: int64): str =
+    return v3GateShellArgv([binPath,
+                            "fixture-finalize",
+                            "--state:" + statePath,
+                            "--height:" + strings.Int64ToStr(height),
+                            "--round:" + strings.Int64ToStr(roundId),
+                            "--reporter-start:1",
+                            "--reporter-end:5",
+                            "--time-hint-ms:" + strings.Int64ToStr(oracle_types.v3OracleRoundEndMs(roundId) + int64(1))])
+
+fn v3GateOracleBftDeployShell(binPath: str,
+                              dir: str,
+                              appId: str): str =
+    let statePath = v3GateOracleBftStatePath(dir)
+    return "set -eu && mkdir -p " + os.QuoteShell(dir) +
+           " && " + v3GateOracleBftInitCommand(binPath, statePath, appId) +
+           " && " + v3GateOracleBftFixtureFinalizeCommand(binPath, statePath, int64(1), int64(20)) +
+           " && " + v3GateOracleBftFixtureFinalizeCommand(binPath, statePath, int64(2), int64(21)) +
+           " && " + v3GateOracleBftFixtureFinalizeCommand(binPath, statePath, int64(3), int64(22))
+
+fn v3GateOracleBftVerifyReportPath(root: str): str =
+    return v3path.V3PathAbsolute(root, "artifacts/v3_gate/verify_oracle_bft_three_node.report.txt")
+
+fn v3GateOracleBftVerifyReportAppendNode(out: var str,
+                                         prefix: str,
+                                         status: V3OracleBftNodeStatus) =
+    out = out + prefix + "_name=" + status.name + "\n"
+    out = out + prefix + "_height=" + status.height + "\n"
+    out = out + prefix + "_last_finalized_round_id=" + status.lastFinalizedRoundId + "\n"
+    out = out + prefix + "_app_hash=" + status.appHash + "\n"
+    out = out + prefix + "_latest_code=" + status.latestCode + "\n"
+    out = out + prefix + "_latest_round_id=" + status.latestRoundId + "\n"
+    out = out + prefix + "_latest_price_e8=" + status.latestPriceE8 + "\n"
+    out = out + prefix + "_twap_code=" + status.twapCode + "\n"
+    out = out + prefix + "_twap_price_e8=" + status.twapPriceE8 + "\n"
+
+fn v3GateOracleBftVerifyReportText(cfg: V3OracleBftThreeNodeDeploy,
+                                   verified: bool,
+                                   serverStatus: V3OracleBftNodeStatus,
+                                   relayStatus: V3OracleBftNodeStatus,
+                                   localStatus: V3OracleBftNodeStatus): str =
+    var out = ""
+    out = out + "version=v3.oracle_bft_three_node_verify.v1\n"
+    out = out + "app_id=" + cfg.appId + "\n"
+    out = out + "pair=" + v3GateOracleBftPairText() + "\n"
+    out = out + "want_height=3\n"
+    out = out + "want_round=" + strings.Int64ToStr(v3GateOracleBftExpectedRound()) + "\n"
+    out = out + "want_latest_price_e8=" + strings.Int64ToStr(v3GateOracleBftExpectedLatestPrice()) + "\n"
+    out = out + "want_twap_price_e8=" + strings.Int64ToStr(v3GateOracleBftExpectedTwapPrice()) + "\n"
+    v3GateOracleBftVerifyReportAppendNode(out, "server", serverStatus)
+    v3GateOracleBftVerifyReportAppendNode(out, "relay", relayStatus)
+    v3GateOracleBftVerifyReportAppendNode(out, "local", localStatus)
+    if verified:
+        out = out + "verified=true\n"
+    else:
+        out = out + "verified=false\n"
+    return out
+
+fn v3GateStopOracleBftThreeNode(root: str): int32 =
+    let cfg = v3GateOracleBftConfigLoad(root)
+    let serverDir = v3GateOracleBftRemoteDeployDir(cfg.serverRepoRoot, cfg)
+    let relayDir = v3GateOracleBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
+    let localDir = cfg.localDeployDir
+    let serverRun = v3GateRunRemoteShellLogged(root,
+                                               "oracle_bft_stop_server",
+                                               cfg.serverSsh,
+                                               "set -eu && rm -rf " + os.QuoteShell(serverDir),
+                                               "artifacts/v3_gate/oracle_bft_stop_server.log",
+                                               30)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    let relayRun = v3GateRunRemoteShellLogged(root,
+                                              "oracle_bft_stop_relay",
+                                              cfg.relaySsh,
+                                              "set -eu && rm -rf " + os.QuoteShell(relayDir),
+                                              "artifacts/v3_gate/oracle_bft_stop_relay.log",
+                                              30)
+    if v3GateRunFailed(relayRun):
+        return relayRun.exitCode
+    let localRun = v3GateRunShellLogged(root,
+                                        "oracle_bft_stop_local",
+                                        "set -eu && rm -rf " + os.QuoteShell(localDir),
+                                        "artifacts/v3_gate/oracle_bft_stop_local.log",
+                                        30)
+    if v3GateRunFailed(localRun):
+        return localRun.exitCode
+    v3GatePrintLine("v3 oracle bft deploy: stopped")
+    return 0
+
+fn v3GateDeployOracleBftThreeNode(root: str): int32 =
+    let cfg = v3GateOracleBftThreeNodeConfig(root)
+    if v3GateStopOracleBftThreeNode(root) != 0:
+        return 1
+    if !v3path.V3MkdirP(root, cfg.localDeployDir):
+        v3GatePrintErr("v3 oracle bft deploy: failed to create local deploy dir")
+        return 1
+    if !v3path.V3WriteTextFile(root, v3GateOracleBftManifestPath(cfg), v3GateOracleBftManifestText(cfg)):
+        v3GatePrintErr("v3 oracle bft deploy: failed to write manifest")
+        return 1
+    if v3GateBftSyncRemoteRepo(root,
+                               cfg.serverSsh,
+                               cfg.serverRepoRoot,
+                               "artifacts/v3_gate/oracle_bft_sync_server.log") != 0:
+        return 1
+    if v3GateBftSyncRemoteRepo(root,
+                               cfg.relaySsh,
+                               cfg.relayRepoRoot,
+                               "artifacts/v3_gate/oracle_bft_sync_relay.log") != 0:
+        return 1
+    if v3GateBuildOracleBftStateMachine(root) != 0:
+        return 1
+    if v3GateOracleBftBuildRemote(root,
+                                  cfg.serverSsh,
+                                  cfg.serverRepoRoot,
+                                  "artifacts/v3_gate/oracle_bft_build_server.log") != 0:
+        return 1
+    if v3GateOracleBftBuildRemote(root,
+                                  cfg.relaySsh,
+                                  cfg.relayRepoRoot,
+                                  "artifacts/v3_gate/oracle_bft_build_relay.log") != 0:
+        return 1
+    let serverDir = v3GateOracleBftRemoteDeployDir(cfg.serverRepoRoot, cfg)
+    let relayDir = v3GateOracleBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
+    let localDir = cfg.localDeployDir
+    let serverBin = v3GateOracleBftRemoteBin(cfg.serverRepoRoot)
+    let relayBin = v3GateOracleBftRemoteBin(cfg.relayRepoRoot)
+    let localBin = v3GateOracleBftLocalBin(root)
+    let serverRun = v3GateRunRemoteShellLogged(root,
+                                               "oracle_bft_deploy_server",
+                                               cfg.serverSsh,
+                                               v3GateOracleBftDeployShell(serverBin, serverDir, cfg.appId),
+                                               "artifacts/v3_gate/oracle_bft_deploy_server.log",
+                                               30)
+    if v3GateRunFailed(serverRun):
+        return serverRun.exitCode
+    let relayRun = v3GateRunRemoteShellLogged(root,
+                                              "oracle_bft_deploy_relay",
+                                              cfg.relaySsh,
+                                              v3GateOracleBftDeployShell(relayBin, relayDir, cfg.appId),
+                                              "artifacts/v3_gate/oracle_bft_deploy_relay.log",
+                                              30)
+    if v3GateRunFailed(relayRun):
+        return relayRun.exitCode
+    let localRun = v3GateRunShellLogged(root,
+                                        "oracle_bft_deploy_local",
+                                        v3GateOracleBftDeployShell(localBin, localDir, cfg.appId),
+                                        "artifacts/v3_gate/oracle_bft_deploy_local.log",
+                                        30)
+    if v3GateRunFailed(localRun):
+        return localRun.exitCode
+    var serverStatus = v3GateOracleBftNodeStatusZero("server")
+    var relayStatus = v3GateOracleBftNodeStatusZero("relay")
+    var localStatus = v3GateOracleBftNodeStatusZero("local")
+    let serverRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                           "server",
+                                                           cfg.serverSsh,
+                                                           cfg.serverRepoRoot,
+                                                           v3GateOracleBftStatePath(serverDir),
+                                                           "artifacts/v3_gate/oracle_bft_server_status")
+    if IsErr(serverRes):
+        v3GatePrintErr("v3 oracle bft deploy: server status failed")
+        v3GatePrintErr(strutil.Strip(Error(serverRes)))
+        return 1
+    serverStatus = Value(serverRes)
+    let relayRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                          "relay",
+                                                          cfg.relaySsh,
+                                                          cfg.relayRepoRoot,
+                                                          v3GateOracleBftStatePath(relayDir),
+                                                          "artifacts/v3_gate/oracle_bft_relay_status")
+    if IsErr(relayRes):
+        v3GatePrintErr("v3 oracle bft deploy: relay status failed")
+        v3GatePrintErr(strutil.Strip(Error(relayRes)))
+        return 1
+    relayStatus = Value(relayRes)
+    let localRes = v3GateOracleBftCollectLocalNodeStatus(root,
+                                                         "local",
+                                                         v3GateOracleBftStatePath(localDir),
+                                                         "artifacts/v3_gate/oracle_bft_local_status")
+    if IsErr(localRes):
+        v3GatePrintErr("v3 oracle bft deploy: local status failed")
+        v3GatePrintErr(strutil.Strip(Error(localRes)))
+        return 1
+    localStatus = Value(localRes)
+    if !v3GateOracleBftClusterMatches(serverStatus, relayStatus, localStatus):
+        v3GatePrintErr("v3 oracle bft deploy: three-node cluster drifted")
+        v3GateOracleBftPrintNodeStatus(serverStatus)
+        v3GatePrintLine("---")
+        v3GateOracleBftPrintNodeStatus(relayStatus)
+        v3GatePrintLine("---")
+        v3GateOracleBftPrintNodeStatus(localStatus)
+        return 1
+    v3GateOracleBftPrintNodeStatus(serverStatus)
+    v3GatePrintLine("---")
+    v3GateOracleBftPrintNodeStatus(relayStatus)
+    v3GatePrintLine("---")
+    v3GateOracleBftPrintNodeStatus(localStatus)
+    return 0
+
+fn v3GateStatusOracleBftThreeNode(root: str): int32 =
+    let cfg = v3GateOracleBftConfigLoad(root)
+    let serverDir = v3GateOracleBftRemoteDeployDir(cfg.serverRepoRoot, cfg)
+    let relayDir = v3GateOracleBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
+    let localDir = cfg.localDeployDir
+    let serverRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                           "server",
+                                                           cfg.serverSsh,
+                                                           cfg.serverRepoRoot,
+                                                           v3GateOracleBftStatePath(serverDir),
+                                                           "artifacts/v3_gate/oracle_bft_server_live")
+    if IsErr(serverRes):
+        v3GatePrintErr("v3 oracle bft status: server failed")
+        v3GatePrintErr(strutil.Strip(Error(serverRes)))
+        return 1
+    let relayRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                          "relay",
+                                                          cfg.relaySsh,
+                                                          cfg.relayRepoRoot,
+                                                          v3GateOracleBftStatePath(relayDir),
+                                                          "artifacts/v3_gate/oracle_bft_relay_live")
+    if IsErr(relayRes):
+        v3GatePrintErr("v3 oracle bft status: relay failed")
+        v3GatePrintErr(strutil.Strip(Error(relayRes)))
+        return 1
+    let localRes = v3GateOracleBftCollectLocalNodeStatus(root,
+                                                         "local",
+                                                         v3GateOracleBftStatePath(localDir),
+                                                         "artifacts/v3_gate/oracle_bft_local_live")
+    if IsErr(localRes):
+        v3GatePrintErr("v3 oracle bft status: local failed")
+        v3GatePrintErr(strutil.Strip(Error(localRes)))
+        return 1
+    v3GateOracleBftPrintNodeStatus(Value(serverRes))
+    v3GatePrintLine("---")
+    v3GateOracleBftPrintNodeStatus(Value(relayRes))
+    v3GatePrintLine("---")
+    v3GateOracleBftPrintNodeStatus(Value(localRes))
+    return 0
+
+fn v3GateVerifyOracleBftThreeNode(root: str): int32 =
+    if v3GateDeployOracleBftThreeNode(root) != 0:
+        return 1
+    let cfg = v3GateOracleBftConfigLoad(root)
+    let serverDir = v3GateOracleBftRemoteDeployDir(cfg.serverRepoRoot, cfg)
+    let relayDir = v3GateOracleBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
+    let localDir = cfg.localDeployDir
+    var serverStatus = v3GateOracleBftNodeStatusZero("server")
+    var relayStatus = v3GateOracleBftNodeStatusZero("relay")
+    var localStatus = v3GateOracleBftNodeStatusZero("local")
+    let serverRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                           "server",
+                                                           cfg.serverSsh,
+                                                           cfg.serverRepoRoot,
+                                                           v3GateOracleBftStatePath(serverDir),
+                                                           "artifacts/v3_gate/oracle_bft_verify_server")
+    let relayRes = v3GateOracleBftCollectRemoteNodeStatus(root,
+                                                          "relay",
+                                                          cfg.relaySsh,
+                                                          cfg.relayRepoRoot,
+                                                          v3GateOracleBftStatePath(relayDir),
+                                                          "artifacts/v3_gate/oracle_bft_verify_relay")
+    let localRes = v3GateOracleBftCollectLocalNodeStatus(root,
+                                                         "local",
+                                                         v3GateOracleBftStatePath(localDir),
+                                                         "artifacts/v3_gate/oracle_bft_verify_local")
+    if !IsErr(serverRes):
+        serverStatus = Value(serverRes)
+    if !IsErr(relayRes):
+        relayStatus = Value(relayRes)
+    if !IsErr(localRes):
+        localStatus = Value(localRes)
+    var verified = false
+    if !IsErr(serverRes) && !IsErr(relayRes) && !IsErr(localRes):
+        verified = v3GateOracleBftClusterMatches(serverStatus, relayStatus, localStatus)
+    let reportPath = v3GateOracleBftVerifyReportPath(root)
+    let reportText = v3GateOracleBftVerifyReportText(cfg, verified, serverStatus, relayStatus, localStatus)
+    if !v3path.V3WriteTextFile(root, reportPath, reportText):
+        v3GatePrintErr("v3 oracle bft verify: failed to write report")
+        let _ = v3GateStopOracleBftThreeNode(root)
+        return 1
+    let stopCode = v3GateStopOracleBftThreeNode(root)
+    if IsErr(serverRes):
+        v3GatePrintErr("v3 oracle bft verify: server status failed")
+        v3GatePrintErr(strutil.Strip(Error(serverRes)))
+        return 1
+    if IsErr(relayRes):
+        v3GatePrintErr("v3 oracle bft verify: relay status failed")
+        v3GatePrintErr(strutil.Strip(Error(relayRes)))
+        return 1
+    if IsErr(localRes):
+        v3GatePrintErr("v3 oracle bft verify: local status failed")
+        v3GatePrintErr(strutil.Strip(Error(localRes)))
+        return 1
+    if !verified:
+        v3GatePrintErr("v3 oracle bft verify: three-node cluster drifted")
+        v3GateOracleBftPrintNodeStatus(serverStatus)
+        v3GatePrintLine("---")
+        v3GateOracleBftPrintNodeStatus(relayStatus)
+        v3GatePrintLine("---")
+        v3GateOracleBftPrintNodeStatus(localStatus)
+        return 1
+    if stopCode != 0:
+        v3GatePrintErr("v3 oracle bft verify: stop failed after verification")
+        return stopCode
+    v3GatePrintLine("v3 oracle bft verify ok")
+    v3GatePrintLine("report=" + reportPath)
+    return 0
+
 fn v3GateBuildBrowserHostWasm(root: str, args: str[]): int32 =
     let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
     var compiler = ""
@@ -6653,6 +7439,8 @@ fn v3GateHandlesCommandBase(cmd: str): bool =
            cmd == "verify-backend-driver-command-surface" ||
            cmd == "verify-mobile-shell-build-probe" ||
            cmd == "verify-chain-node-resilience" ||
+           cmd == "verify-oracle-resilience" ||
+           cmd == "verify-oracle-bft-three-node" ||
            cmd == "verify-r2c-react-v3-surface" ||
            cmd == "verify-debug-tools" ||
            cmd == "verify-debug-runtime" ||
@@ -6678,6 +7466,10 @@ fn v3GateHandlesCommandBuild(cmd: str): bool =
            cmd == "status-bft-validator-three-node" ||
            cmd == "stop-bft-validator-three-node" ||
            cmd == "bench-bft-validator-three-node" ||
+           cmd == "build-oracle-bft-state-machine" ||
+           cmd == "deploy-oracle-bft-three-node" ||
+           cmd == "status-oracle-bft-three-node" ||
+           cmd == "stop-oracle-bft-three-node" ||
            cmd == "build-rwad-bft-state-machine" ||
            cmd == "build-program-selfhost" ||
            cmd == "build-chain-node" ||
@@ -6696,6 +7488,8 @@ fn v3GateHandlesCommandRuntime(cmd: str): bool =
            cmd == "run-chain-node-process-smoke" ||
            cmd == "run-chain-node-three-node-smoke" ||
            cmd == "run-chain-node-resilience-smoke" ||
+           cmd == "run-oracle-resilience-smoke" ||
+           cmd == "oracle-fixture-query" ||
            cmd == "run-tailnet-control-smoke" ||
            cmd == "run-fresh-node-selfhost-gate" ||
            cmd == "run-migration-gate" ||
@@ -6783,6 +7577,15 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
             return 1
         let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host_resilience_gate")
         return v3GateRunChainNodeResilienceSmoke(root, compiler, label, [])
+    if cmd == "verify-oracle-resilience":
+        return v3GateRunStage3Command(root,
+                                      "verify_oracle_resilience",
+                                      cmd,
+                                      args,
+                                      "verify-oracle-resilience.log",
+                                      true)
+    if cmd == "verify-oracle-bft-three-node":
+        return v3GateVerifyOracleBftThreeNode(root)
     if cmd == "verify-r2c-react-v3-surface":
         return v3GateRunHostSmokes(root, ["r2c_react_v3_surface_smoke"])
     if cmd == "verify-debug-tools":
@@ -6829,6 +7632,14 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return v3GateStopBftValidatorThreeNode(root)
     if cmd == "bench-bft-validator-three-node":
         return v3GateBenchBftValidatorThreeNode(root, args)
+    if cmd == "build-oracle-bft-state-machine":
+        return v3GateBuildOracleBftStateMachine(root)
+    if cmd == "deploy-oracle-bft-three-node":
+        return v3GateDeployOracleBftThreeNode(root)
+    if cmd == "status-oracle-bft-three-node":
+        return v3GateStatusOracleBftThreeNode(root)
+    if cmd == "stop-oracle-bft-three-node":
+        return v3GateStopOracleBftThreeNode(root)
     if cmd == "build-browser-host-wasm":
         return v3GateBuildBrowserHostWasm(root, args)
     if cmd == "build-rwad-bft-state-machine":
@@ -6919,6 +7730,20 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
             return 1
         let label: str = v3GateResolveSmokeLabel(args, "CHENG_V3_CHAIN_NODE_LABEL", "host")
         return v3GateRunChainNodeResilienceSmoke(root, compiler, label, [])
+    if cmd == "run-oracle-resilience-smoke":
+        return v3GateRunStage3Command(root,
+                                      "run_oracle_resilience_smoke",
+                                      cmd,
+                                      args,
+                                      "run-oracle-resilience-smoke.log",
+                                      true)
+    if cmd == "oracle-fixture-query":
+        return v3GateRunStage3Command(root,
+                                      "oracle_fixture_query",
+                                      cmd,
+                                      args,
+                                      "oracle-fixture-query.log",
+                                      true)
     if cmd == "run-tailnet-control-smoke":
         let explicitCompiler: str = v3GateReadFlag(args, "--compiler", "")
         var compiler = ""

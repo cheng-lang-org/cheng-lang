@@ -1,0 +1,478 @@
+import std/cmdline as cmdline
+import std/os
+import std/rawbytes
+import std/rawmem_support
+import std/result
+import std/strutils as strutil
+import std/net/transports/tcp_syscall as tcp
+import cheng/v3/quic/tls/test_pki as testpki
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/vpn_proxy_main as vpn
+
+const
+    vpnProxyE2eArtifactRel = "artifacts/v3_vpn_proxy_end_to_end_smoke"
+    vpnProxyE2eAuth = "shared-secret"
+    vpnProxyE2eAuthority = "localhost"
+    vpnProxyE2eTargetHost = "127.0.0.1"
+    vpnProxyE2eRequestText = "vpn-proxy-e2e-request"
+    vpnProxyE2eResponseText = "vpn-proxy-e2e-response"
+
+fn vpnProxyE2eBytesEq(left: Bytes, right: Bytes): bool =
+    if bytesLen(left) != bytesLen(right):
+        return false
+    for i in 0..<bytesLen(left):
+        if bytesGet(left, i) != bytesGet(right, i):
+            return false
+    return true
+
+fn vpnProxyE2eArtifactDir(root: str): str =
+    return v3path.V3PathAbsolute(root, vpnProxyE2eArtifactRel)
+
+fn vpnProxyE2ePath(root: str, name: str): str =
+    return v3path.V3PathAbsolute(root, vpnProxyE2eArtifactRel + "/" + name)
+
+fn vpnProxyE2eReadyPath(root: str, name: str): str =
+    return vpnProxyE2ePath(root, name + ".ready")
+
+fn vpnProxyE2eLogPath(root: str, name: str): str =
+    return vpnProxyE2ePath(root, name + ".log")
+
+fn vpnProxyE2eParsePort(textRaw: str): Result[int32] =
+    let text: str = strutil.Strip(textRaw)
+    if len(text) <= 0:
+        return Err[int32]("v3 vpn proxy e2e: empty port text")
+    var value: int32 = 0
+    for i in 0..<len(text):
+        let ch = text[i]
+        if ch < '0' || ch > '9':
+            return Err[int32]("v3 vpn proxy e2e: invalid port text")
+        value = value * 10 + (int32(ch) - int32('0'))
+    if value <= 0:
+        return Err[int32]("v3 vpn proxy e2e: invalid port")
+    return Ok[int32](value)
+
+fn vpnProxyE2eRemoveFile(path: str) =
+    if os.FileExists(path):
+        let _ = os.RemoveFile(path)
+
+fn vpnProxyE2eWriteBytes(path: str, data: Bytes): bool =
+    let parent: str = os.ParentDir(path)
+    if len(parent) > 0:
+        if !v3path.V3MkdirP("", parent):
+            return false
+    let file = os.Open(path, os.fmWrite)
+    if file == nil:
+        return false
+    let total: int32 = bytesLen(data)
+    if total <= 0:
+        os.Close(file)
+        return true
+    let wrote: int32 = os.C_fwrite(data.data, 1, int64(total), file)
+    os.Close(file)
+    if wrote != total:
+        return false
+    return os.FileExists(path) && os.FileSize(path) == int64(total)
+
+fn vpnProxyE2eWriteMaterials(root: str): Result[bool] =
+    let artifactDir: str = vpnProxyE2eArtifactDir(root)
+    if !v3path.V3MkdirP(root, artifactDir):
+        return Err[bool]("v3 vpn proxy e2e: mkdir failed")
+    let rootPath: str = vpnProxyE2ePath(root, "transport.root.der")
+    let certPath: str = vpnProxyE2ePath(root, "transport.cert.der")
+    let keyPath: str = vpnProxyE2ePath(root, "transport.key.pk8")
+    var trustRoot: Bytes
+    testpki.msquicLocalhostTransportTrustRootDerInto(trustRoot)
+    if bytesLen(trustRoot) <= 0:
+        return Err[bool]("v3 vpn proxy e2e: trust root bytes empty")
+    if !vpnProxyE2eWriteBytes(rootPath, trustRoot):
+        return Err[bool]("v3 vpn proxy e2e: write trust root failed")
+    var certDer: Bytes
+    testpki.msquicLocalhostTransportCertDerInto(certDer)
+    if bytesLen(certDer) <= 0:
+        return Err[bool]("v3 vpn proxy e2e: cert bytes empty")
+    if !vpnProxyE2eWriteBytes(certPath, certDer):
+        return Err[bool]("v3 vpn proxy e2e: write cert failed")
+    var keyPk8: Bytes
+    testpki.msquicLocalhostTransportKeyPkcs8DerInto(keyPk8)
+    if bytesLen(keyPk8) <= 0:
+        return Err[bool]("v3 vpn proxy e2e: key bytes empty")
+    if !vpnProxyE2eWriteBytes(keyPath, keyPk8):
+        return Err[bool]("v3 vpn proxy e2e: write key failed")
+    return Ok[bool](true)
+
+fn vpnProxyE2eExitConfigText(): str =
+    var out = ""
+    out = out + "{\"server\":{"
+    out = out + "\"listen\":\"127.0.0.1:0\","
+    out = out + "\"cert_der\":\"transport.cert.der\","
+    out = out + "\"key_pk8_der\":\"transport.key.pk8\","
+    out = out + "\"trust_root_der\":\"transport.root.der\","
+    out = out + "\"expected_auth\":\"" + vpnProxyE2eAuth + "\","
+    out = out + "\"expected_authority\":\"" + vpnProxyE2eAuthority + "\","
+    out = out + "\"cc_rx_text\":\"auto\""
+    out = out + "}}"
+    return out
+
+fn vpnProxyE2eLocalConfigText(exitPort: int32): str =
+    var out = ""
+    out = out + "{\"client\":{"
+    out = out + "\"listen\":\"127.0.0.1:0\","
+    out = out + "\"cert_der\":\"transport.cert.der\","
+    out = out + "\"key_pk8_der\":\"transport.key.pk8\","
+    out = out + "\"trust_root_der\":\"transport.root.der\""
+    out = out + "},\"exits\":[{"
+    out = out + "\"name\":\"edge\","
+    out = out + "\"host\":\"127.0.0.1\","
+    out = out + "\"port\":" + intToStr(exitPort) + ","
+    out = out + "\"server_name\":\"localhost\","
+    out = out + "\"authority\":\"" + vpnProxyE2eAuthority + "\","
+    out = out + "\"auth\":\"" + vpnProxyE2eAuth + "\","
+    out = out + "\"cc_rx\":65535"
+    out = out + "}]}"
+    return out
+
+fn vpnProxyE2eWaitReadyPort(root: str,
+                            readyPath: str,
+                            proc: var hostops.V3SpawnedProcess,
+                            portOut: var int32): Result[bool] =
+    portOut = 0
+    for attempt in 0..<500:
+        if v3path.V3FileExistsNonEmpty(root, readyPath):
+            let textRaw: str = v3path.V3ReadTextFile("", readyPath)
+            let parseRes: Result[int32] = vpnProxyE2eParsePort(textRaw)
+            if IsOk(parseRes):
+                portOut = Value(parseRes)
+                return Ok[bool](true)
+        if !hostops.v3SpawnedProcessRunning(proc):
+            return Err[bool]("v3 vpn proxy e2e: process exited before ready: " + proc.output)
+        if attempt + 1 < 500:
+            os.SleepMs(10)
+    return Err[bool]("v3 vpn proxy e2e: ready timeout")
+
+fn vpnProxyE2eTcpReadExact(conn: var tcp.TcpConnectionHandle, count: int32): Result[Bytes] =
+    let out: Bytes = bytesAlloc(count)
+    var filled: int32 = 0
+    while filled < count:
+        let dstPtr: ptr = rawmem_support.RawmemPtrAdd(out.data, filled)
+        let readRes: Result[int32] = tcp.TcpRecvRaw(conn, dstPtr, count - filled)
+        if IsErr(readRes):
+            return Err[Bytes](ErrorText(readRes))
+        let got: int32 = Value(readRes)
+        if got <= 0:
+            return Err[Bytes]("v3 vpn proxy e2e: unexpected eof")
+        filled = filled + got
+    return Ok[Bytes](out)
+
+fn vpnProxyE2eTcpWriteAll(conn: var tcp.TcpConnectionHandle, data: var Bytes): Result[int32] =
+    return tcp.TcpSendRaw(conn, data.data, bytesLen(data))
+
+fn vpnProxyE2eTargetRequest(): Bytes =
+    return bytesFromString(vpnProxyE2eRequestText)
+
+fn vpnProxyE2eTargetResponse(): Bytes =
+    return bytesFromString(vpnProxyE2eResponseText)
+
+fn vpnProxyE2eTargetConnectWireInto(out: var Bytes, port: int32) =
+    out = bytesAlloc(10)
+    bytesSet(out, 0, 5)
+    bytesSet(out, 1, 1)
+    bytesSet(out, 2, 0)
+    bytesSet(out, 3, 1)
+    bytesSet(out, 4, 127)
+    bytesSet(out, 5, 0)
+    bytesSet(out, 6, 0)
+    bytesSet(out, 7, 1)
+    bytesSet(out, 8, (port >> 8) & 0xff)
+    bytesSet(out, 9, port & 0xff)
+
+fn vpnProxyE2eSocksMethodWireInto(out: var Bytes) =
+    out = bytesAlloc(3)
+    bytesSet(out, 0, 5)
+    bytesSet(out, 1, 1)
+    bytesSet(out, 2, 0)
+
+fn vpnProxyE2eRunClient(localPort: int32, targetPort: int32): Result[bool] =
+    let connectRes: Result[tcp.TcpConnectionHandle] = tcp.TcpConnect("127.0.0.1", localPort, false)
+    if IsErr(connectRes):
+        return Err[bool](ErrorText(connectRes))
+    var conn = Value(connectRes)
+    var methodWire: Bytes
+    vpnProxyE2eSocksMethodWireInto(methodWire)
+    let methodRes: Result[int32] = vpnProxyE2eTcpWriteAll(conn, methodWire)
+    if IsErr(methodRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(methodRes))
+    let methodReplyRes: Result[Bytes] = vpnProxyE2eTcpReadExact(conn, 2)
+    if IsErr(methodReplyRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(methodReplyRes))
+    let methodReply: Bytes = Value(methodReplyRes)
+    if bytesGet(methodReply, 0) != 5 || bytesGet(methodReply, 1) != 0:
+        tcp.TcpClose(conn)
+        return Err[bool]("v3 vpn proxy e2e: socks method rejected")
+    var connectWire: Bytes
+    vpnProxyE2eTargetConnectWireInto(connectWire, targetPort)
+    let connectWriteRes: Result[int32] = vpnProxyE2eTcpWriteAll(conn, connectWire)
+    if IsErr(connectWriteRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(connectWriteRes))
+    let replyRes: Result[Bytes] = vpnProxyE2eTcpReadExact(conn, 10)
+    if IsErr(replyRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(replyRes))
+    let reply: Bytes = Value(replyRes)
+    if bytesGet(reply, 0) != 5 || bytesGet(reply, 1) != 0:
+        tcp.TcpClose(conn)
+        return Err[bool]("v3 vpn proxy e2e: socks connect rejected")
+    var request: Bytes = vpnProxyE2eTargetRequest()
+    let requestWriteRes: Result[int32] = vpnProxyE2eTcpWriteAll(conn, request)
+    if IsErr(requestWriteRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(requestWriteRes))
+    let responseRes: Result[Bytes] = vpnProxyE2eTcpReadExact(conn, bytesLen(vpnProxyE2eTargetResponse()))
+    if IsErr(responseRes):
+        tcp.TcpClose(conn)
+        return Err[bool](ErrorText(responseRes))
+    let response: Bytes = Value(responseRes)
+    tcp.TcpClose(conn)
+    if !vpnProxyE2eBytesEq(response, vpnProxyE2eTargetResponse()):
+        return Err[bool]("v3 vpn proxy e2e: response mismatch")
+    return Ok[bool](true)
+
+fn vpnProxyE2eWaitRunOk(root: str,
+                        proc: var hostops.V3SpawnedProcess,
+                        logPath: str,
+                        label: str): Result[bool] =
+    let run: hostops.V3LoggedRun = hostops.v3SpawnedProcessWaitLogged(root, proc, 20, logPath)
+    if !hostops.v3LoggedRunOk(run):
+        return Err[bool]("v3 vpn proxy e2e: " + label + " failed: " + run.output)
+    return Ok[bool](true)
+
+fn vpnProxyE2eAppendLog(out: var str, root: str, logPath: str, label: str) =
+    out = out + "\n["
+    out = out + label
+    out = out + "]\n"
+    if v3path.V3FileExistsNonEmpty(root, logPath):
+        out = out + v3path.V3ReadTextFile("", logPath)
+        return
+    out = out + "<empty>"
+
+fn vpnProxyE2eWriteFailure(root: str,
+                           message: str,
+                           targetLog: str,
+                           localLog: str,
+                           exitLog: str) =
+    var out: str = message
+    vpnProxyE2eAppendLog(out, root, targetLog, "target")
+    vpnProxyE2eAppendLog(out, root, localLog, "local")
+    vpnProxyE2eAppendLog(out, root, exitLog, "exit")
+    os.WriteLine(os.Get_stderr(), out)
+
+fn vpnProxyE2eKillAndFinalize(root: str,
+                              proc: var hostops.V3SpawnedProcess,
+                              logPath: str) =
+    hostops.v3SpawnedProcessKill(proc)
+    let _ = hostops.v3SpawnedProcessFinalize(root, proc, logPath, 124)
+
+fn vpnProxyE2eRunDefault(): int32 =
+    let root: str = os.GetCurrentDir()
+    let selfPath: str = cmdline.ProgramName()
+    assert(len(selfPath) > 0, "v3 vpn proxy e2e: self path")
+    let materialRes: Result[bool] = vpnProxyE2eWriteMaterials(root)
+    if IsErr(materialRes):
+        os.WriteLine(os.Get_stderr(), ErrorText(materialRes))
+        return 1
+
+    let targetReady: str = vpnProxyE2eReadyPath(root, "target")
+    let targetLog: str = vpnProxyE2eLogPath(root, "target")
+    let exitReady: str = vpnProxyE2eReadyPath(root, "exit")
+    let exitLog: str = vpnProxyE2eLogPath(root, "exit")
+    let localReady: str = vpnProxyE2eReadyPath(root, "local")
+    let localLog: str = vpnProxyE2eLogPath(root, "local")
+    let exitConfigPath: str = vpnProxyE2ePath(root, "exit.config.json")
+    let localConfigPath: str = vpnProxyE2ePath(root, "local.config.json")
+
+    vpnProxyE2eRemoveFile(targetReady)
+    vpnProxyE2eRemoveFile(targetLog)
+    vpnProxyE2eRemoveFile(exitReady)
+    vpnProxyE2eRemoveFile(exitLog)
+    vpnProxyE2eRemoveFile(localReady)
+    vpnProxyE2eRemoveFile(localLog)
+
+    assert(v3path.V3WriteTextFile("", exitConfigPath, vpnProxyE2eExitConfigText()),
+           "v3 vpn proxy e2e: write exit config")
+
+    let targetSpawnRes = hostops.v3SpawnFile(root,
+                                             "vpn_proxy_e2e_target",
+                                             selfPath,
+                                             ["--role:target", "--port:0", "--ready-path:" + targetReady],
+                                             [],
+                                             root)
+    if IsErr(targetSpawnRes):
+        os.WriteLine(os.Get_stderr(), Error(targetSpawnRes))
+        return 1
+    var targetProc = Value(targetSpawnRes)
+
+    var targetPort: int32 = 0
+    let targetReadyRes = vpnProxyE2eWaitReadyPort(root, targetReady, targetProc, targetPort)
+    if IsErr(targetReadyRes):
+        hostops.v3SpawnedProcessKill(targetProc)
+        os.WriteLine(os.Get_stderr(), ErrorText(targetReadyRes))
+        return 1
+
+    let exitSpawnRes = hostops.v3SpawnFile(root,
+                                           "vpn_proxy_e2e_exit",
+                                           selfPath,
+                                           ["--role:proxy-exit",
+                                            "--config:" + exitConfigPath,
+                                            "--ready-path:" + exitReady,
+                                            "--accept-count:2"],
+                                           [],
+                                           root)
+    if IsErr(exitSpawnRes):
+        hostops.v3SpawnedProcessKill(targetProc)
+        os.WriteLine(os.Get_stderr(), Error(exitSpawnRes))
+        return 1
+    var exitProc = Value(exitSpawnRes)
+
+    var exitPort: int32 = 0
+    let exitReadyRes = vpnProxyE2eWaitReadyPort(root, exitReady, exitProc, exitPort)
+    if IsErr(exitReadyRes):
+        hostops.v3SpawnedProcessKill(exitProc)
+        hostops.v3SpawnedProcessKill(targetProc)
+        os.WriteLine(os.Get_stderr(), ErrorText(exitReadyRes))
+        return 1
+    assert(v3path.V3WriteTextFile("", localConfigPath, vpnProxyE2eLocalConfigText(exitPort)),
+           "v3 vpn proxy e2e: write local config")
+
+    let localSpawnRes = hostops.v3SpawnFile(root,
+                                            "vpn_proxy_e2e_local",
+                                            selfPath,
+                                            ["--role:proxy-local",
+                                             "--config:" + localConfigPath,
+                                             "--ready-path:" + localReady,
+                                             "--accept-count:1",
+                                             "--probe-timeout-ms:500"],
+                                            [],
+                                            root)
+    if IsErr(localSpawnRes):
+        hostops.v3SpawnedProcessKill(exitProc)
+        hostops.v3SpawnedProcessKill(targetProc)
+        os.WriteLine(os.Get_stderr(), Error(localSpawnRes))
+        return 1
+    var localProc = Value(localSpawnRes)
+
+    var localPort: int32 = 0
+    let localReadyRes = vpnProxyE2eWaitReadyPort(root, localReady, localProc, localPort)
+    if IsErr(localReadyRes):
+        hostops.v3SpawnedProcessKill(localProc)
+        hostops.v3SpawnedProcessKill(exitProc)
+        hostops.v3SpawnedProcessKill(targetProc)
+        os.WriteLine(os.Get_stderr(), ErrorText(localReadyRes))
+        return 1
+
+    let clientRes: Result[bool] = vpnProxyE2eRunClient(localPort, targetPort)
+    if IsErr(clientRes):
+        vpnProxyE2eKillAndFinalize(root, localProc, localLog)
+        vpnProxyE2eKillAndFinalize(root, exitProc, exitLog)
+        vpnProxyE2eKillAndFinalize(root, targetProc, targetLog)
+        vpnProxyE2eWriteFailure(root, ErrorText(clientRes), targetLog, localLog, exitLog)
+        return 1
+
+    let targetWaitRes: Result[bool] = vpnProxyE2eWaitRunOk(root, targetProc, targetLog, "target")
+    if IsErr(targetWaitRes):
+        vpnProxyE2eKillAndFinalize(root, localProc, localLog)
+        vpnProxyE2eKillAndFinalize(root, exitProc, exitLog)
+        vpnProxyE2eWriteFailure(root, ErrorText(targetWaitRes), targetLog, localLog, exitLog)
+        return 1
+    let localWaitRes: Result[bool] = vpnProxyE2eWaitRunOk(root, localProc, localLog, "local")
+    if IsErr(localWaitRes):
+        vpnProxyE2eKillAndFinalize(root, exitProc, exitLog)
+        vpnProxyE2eWriteFailure(root, ErrorText(localWaitRes), targetLog, localLog, exitLog)
+        return 1
+    let exitWaitRes: Result[bool] = vpnProxyE2eWaitRunOk(root, exitProc, exitLog, "exit")
+    if IsErr(exitWaitRes):
+        vpnProxyE2eWriteFailure(root, ErrorText(exitWaitRes), targetLog, localLog, exitLog)
+        return 1
+
+    echo("v3 vpn_proxy_end_to_end_smoke ok")
+    return 0
+
+fn vpnProxyE2eRunTarget(): int32 =
+    let port: int32 = cmdline.ReadInt32FlagOrDefault("--port", 0)
+    let readyPath: str = cmdline.ReadFlagOrDefault("--ready-path", "")
+    let listenRes: Result[tcp.TcpListenerHandle] = tcp.TcpListen(vpnProxyE2eTargetHost, port, false)
+    if IsErr(listenRes):
+        os.WriteLine(os.Get_stderr(), ErrorText(listenRes))
+        return 1
+    var listener = Value(listenRes)
+    if len(readyPath) > 0:
+        if !v3path.V3WriteTextFile("", readyPath, intToStr(listener.addr.port)):
+            tcp.TcpListenerClose(listener)
+            os.WriteLine(os.Get_stderr(), "v3 vpn proxy e2e: write target ready failed")
+            return 1
+    let acceptRes: Result[tcp.TcpConnectionHandle] = tcp.TcpAccept(listener)
+    if IsErr(acceptRes):
+        tcp.TcpListenerClose(listener)
+        os.WriteLine(os.Get_stderr(), ErrorText(acceptRes))
+        return 1
+    var conn = Value(acceptRes)
+    let requestRes: Result[Bytes] = vpnProxyE2eTcpReadExact(conn, bytesLen(vpnProxyE2eTargetRequest()))
+    if IsErr(requestRes):
+        tcp.TcpClose(conn)
+        tcp.TcpListenerClose(listener)
+        os.WriteLine(os.Get_stderr(), ErrorText(requestRes))
+        return 1
+    if !vpnProxyE2eBytesEq(Value(requestRes), vpnProxyE2eTargetRequest()):
+        tcp.TcpClose(conn)
+        tcp.TcpListenerClose(listener)
+        os.WriteLine(os.Get_stderr(), "v3 vpn proxy e2e: target request mismatch")
+        return 1
+    var response: Bytes = vpnProxyE2eTargetResponse()
+    let sendRes: Result[int32] = vpnProxyE2eTcpWriteAll(conn, response)
+    if IsErr(sendRes):
+        tcp.TcpClose(conn)
+        tcp.TcpListenerClose(listener)
+        os.WriteLine(os.Get_stderr(), ErrorText(sendRes))
+        return 1
+    tcp.TcpClose(conn)
+    tcp.TcpListenerClose(listener)
+    echo("v3 vpn_proxy_end_to_end_smoke target ok")
+    return 0
+
+fn vpnProxyE2eRunProxyRole(mode: str): int32 =
+    let root: str = os.GetCurrentDir()
+    let configPath: str = cmdline.ReadFlagOrDefault("--config", "")
+    let readyPath: str = cmdline.ReadFlagOrDefault("--ready-path", "")
+    let acceptCount: int32 = cmdline.ReadInt32FlagOrDefault("--accept-count", 0)
+    let probeTimeoutMs: int32 = cmdline.ReadInt32FlagOrDefault("--probe-timeout-ms", 1000)
+    var args: str[]
+    args = [mode,
+            "--config:" + configPath,
+            "--ready-path:" + readyPath,
+            "--accept-count:" + intToStr(acceptCount),
+            "--probe-timeout-ms:" + intToStr(probeTimeoutMs)]
+    return vpn.v3VpnProxyMain(root, args)
+
+fn vpnProxyE2eRunClientRole(): int32 =
+    let localPort: int32 = cmdline.ReadInt32FlagOrDefault("--local-port", 0)
+    let targetPort: int32 = cmdline.ReadInt32FlagOrDefault("--target-port", 0)
+    let runRes: Result[bool] = vpnProxyE2eRunClient(localPort, targetPort)
+    if IsErr(runRes):
+        os.WriteLine(os.Get_stderr(), ErrorText(runRes))
+        return 1
+    echo("v3 vpn_proxy_end_to_end_smoke client ok")
+    return 0
+
+fn main(): int32 =
+    let role: str = cmdline.ReadFlagOrDefault("--role", "")
+    if role == "target":
+        return vpnProxyE2eRunTarget()
+    if role == "proxy-exit":
+        return vpnProxyE2eRunProxyRole("exit")
+    if role == "proxy-local":
+        return vpnProxyE2eRunProxyRole("local")
+    if role == "client":
+        return vpnProxyE2eRunClientRole()
+    return vpnProxyE2eRunDefault()
