@@ -1,22 +1,6 @@
 import std/rawbytes
-import std/strings
+import cheng/v3/libp2p/browser/browser_content_codec_codegen as codegen
 import cheng/v3/libp2p/content/moq_fountain as moq
-
-type V3BrowserCodecInputSchema = object
-    kind: int32
-    missingError: str
-    copyError: str
-
-type V3BrowserCodecOutputSchema = object
-    kind: int32
-    handleError: str
-
-type V3BrowserCodecErrorSchema = object
-    kind: int32
-
-type V3BrowserCodecExportSchema = object
-    output: V3BrowserCodecOutputSchema
-    error: V3BrowserCodecErrorSchema
 
 type V3BrowserMoqFountainPeerInput = object
     ownerPeerId: str
@@ -28,13 +12,6 @@ type V3BrowserMoqFountainBuildRequest = object
     ownerPeerId: str
     remotePeersCsv: str
     mimeType: str
-
-const v3BrowserCodecInputBytesRequired = 1
-const v3BrowserCodecInputTextRequired = 2
-const v3BrowserCodecInputTextOptional = 3
-const v3BrowserCodecOutputBytesHandle = 1
-const v3BrowserCodecOutputTextHandle = 2
-const v3BrowserCodecErrorMoqFountainLastError = 1
 
 importc fn cheng_v3_browser_distributed_video_build_bridge(blobHandle: int32,
                                                            ownerPeerHandle: int32,
@@ -48,23 +25,6 @@ importc fn cheng_v3_browser_distributed_video_rebuild_bridge(manifestPayloadHand
                                                              parityShardCount: int32,
                                                              shardPayloadBytes: int32): int32
 importc fn cheng_v3_browser_distributed_video_last_error_handle_bridge(): int32
-@importc("cheng_v3_browser_input_len_bridge")
-fn cheng_v3_browser_input_len_bridge(handle: int32): int32
-@importc("cheng_v3_browser_input_copy_bridge")
-fn cheng_v3_browser_input_copy_bridge(handle: int32, data: ptr, n: int32): int32
-@importc("cheng_v3_buffer_handle_from_raw_bridge")
-fn cheng_v3_buffer_handle_from_raw_bridge(data: ptr, n: int32): int32
-@importc("cheng_v3_buffer_handle_from_text_bridge")
-fn cheng_v3_buffer_handle_from_text_bridge(text: str): int32
-importc fn cheng_v3_browser_buffer_handle_len_bridge(handle: int32): int32
-importc fn cheng_v3_browser_buffer_handle_byte_bridge(handle: int32, idx: int32): int32
-importc fn cheng_v3_browser_buffer_handle_release_bridge(handle: int32): int32
-importc fn cheng_v3_browser_moq_fountain_last_error_store_bridge(text: str): int32
-importc fn cheng_v3_browser_moq_fountain_last_error_handle_bridge(): int32
-
-fn browserMoqFountainSetLastError(text: str) =
-    cheng_v3_browser_moq_fountain_last_error_store_bridge(text)
-
 fn browserDistributedVideoBuild(blobHandle: int32,
                                 ownerPeerHandle: int32,
                                 remotePeersHandle: int32,
@@ -117,170 +77,35 @@ fn browserInputRemotePeerCount(handle: int32): int32 =
     let peers = moq.v3Libp2pMoqNormalizePeerCsv(text)
     return peers.len
 
-fn v3BrowserCodecInputSchema(kind: int32,
-                             missingError: str,
-                             copyError: str): V3BrowserCodecInputSchema =
-    var out: V3BrowserCodecInputSchema
-    out.kind = kind
-    out.missingError = missingError
-    out.copyError = copyError
-    return out
-
-fn v3BrowserCodecOutputSchema(kind: int32,
-                              handleError: str): V3BrowserCodecOutputSchema =
-    var out: V3BrowserCodecOutputSchema
-    out.kind = kind
-    out.handleError = handleError
-    return out
-
-fn v3BrowserCodecErrorSchema(kind: int32): V3BrowserCodecErrorSchema =
-    var out: V3BrowserCodecErrorSchema
-    out.kind = kind
-    return out
-
-fn v3BrowserCodecExportSchema(output: V3BrowserCodecOutputSchema,
-                              error: V3BrowserCodecErrorSchema): V3BrowserCodecExportSchema =
-    var out: V3BrowserCodecExportSchema
-    out.output = output
-    out.error = error
-    return out
-
-fn browserCodecInputBytesRequiredSchema(missingError: str,
-                                        copyError: str): V3BrowserCodecInputSchema =
-    return v3BrowserCodecInputSchema(v3BrowserCodecInputBytesRequired, missingError, copyError)
-
-fn browserCodecInputTextRequiredSchema(missingError: str,
-                                       copyError: str): V3BrowserCodecInputSchema =
-    return v3BrowserCodecInputSchema(v3BrowserCodecInputTextRequired, missingError, copyError)
-
-fn browserCodecInputTextOptionalSchema(copyError: str): V3BrowserCodecInputSchema =
-    return v3BrowserCodecInputSchema(v3BrowserCodecInputTextOptional, "", copyError)
-
-fn browserCodecOutputBytesHandleSchema(handleError: str): V3BrowserCodecOutputSchema =
-    return v3BrowserCodecOutputSchema(v3BrowserCodecOutputBytesHandle, handleError)
-
-fn browserCodecOutputTextHandleSchema(handleError: str): V3BrowserCodecOutputSchema =
-    return v3BrowserCodecOutputSchema(v3BrowserCodecOutputTextHandle, handleError)
-
-fn browserCodecMoqFountainErrorSchema(): V3BrowserCodecErrorSchema =
-    return v3BrowserCodecErrorSchema(v3BrowserCodecErrorMoqFountainLastError)
-
-fn browserCodecMoqFountainExportSchema(outputKind: int32,
-                                       handleError: str): V3BrowserCodecExportSchema =
-    return v3BrowserCodecExportSchema(v3BrowserCodecOutputSchema(outputKind, handleError),
-                                      browserCodecMoqFountainErrorSchema())
-
-fn browserCodecPublishError(text: str,
-                            schema: V3BrowserCodecErrorSchema) =
-    if schema.kind == v3BrowserCodecErrorMoqFountainLastError:
-        browserMoqFountainSetLastError(text)
-
-fn browserCodecClearError(schema: V3BrowserCodecErrorSchema) =
-    browserCodecPublishError("", schema)
-
-fn browserCodecReadInputBytes(handle: int32,
-                              schema: V3BrowserCodecInputSchema): Result[Bytes] =
-    let inputLen = cheng_v3_browser_input_len_bridge(handle)
-    if handle <= 0 || inputLen <= 0:
-        if schema.kind == v3BrowserCodecInputTextOptional:
-            return Ok[Bytes](bytesAlloc(0))
-        return Err[Bytes](schema.missingError)
-    var inputBytes = bytesAlloc(inputLen)
-    if cheng_v3_browser_input_copy_bridge(handle, inputBytes.data, inputLen) <= 0:
-        return Err[Bytes](schema.copyError)
-    return Ok[Bytes](inputBytes)
-
-fn browserCodecReadInputText(handle: int32,
-                             schema: V3BrowserCodecInputSchema): Result[str] =
-    let bytesRes = browserCodecReadInputBytes(handle, schema)
-    if IsErr(bytesRes):
-        return Err[str](Error(bytesRes))
-    return Ok[str](bytesToString(Value(bytesRes)))
-
-fn browserCodecWriteOutputBytesHandle(payload: Bytes,
-                                      schema: V3BrowserCodecOutputSchema): Result[int32] =
-    if schema.kind != v3BrowserCodecOutputBytesHandle:
-        return Err[int32](schema.handleError)
-    let handle = cheng_v3_buffer_handle_from_raw_bridge(payload.data, bytesLen(payload))
-    if handle <= 0:
-        return Err[int32](schema.handleError)
-    return Ok[int32](handle)
-
-fn browserCodecWriteOutputTextHandle(text: str,
-                                     schema: V3BrowserCodecOutputSchema): Result[int32] =
-    if schema.kind != v3BrowserCodecOutputTextHandle || len(text) <= 0:
-        return Err[int32](schema.handleError)
-    let handle = cheng_v3_buffer_handle_from_text_bridge(text)
-    if handle <= 0:
-        return Err[int32](schema.handleError)
-    return Ok[int32](handle)
-
-fn browserCodecLiftTextHandle(textRes: Result[str],
-                              schema: V3BrowserCodecOutputSchema): Result[int32] =
-    if IsErr(textRes):
-        return Err[int32](Error(textRes))
-    return browserCodecWriteOutputTextHandle(Value(textRes), schema)
-
-fn browserCodecLiftBytesHandle(bytesRes: Result[Bytes],
-                               schema: V3BrowserCodecOutputSchema): Result[int32] =
-    if IsErr(bytesRes):
-        return Err[int32](Error(bytesRes))
-    return browserCodecWriteOutputBytesHandle(Value(bytesRes), schema)
-
-fn browserCodecExportHandleResult(handleRes: Result[int32],
-                                  schema: V3BrowserCodecExportSchema): int32 =
-    browserCodecClearError(schema.error)
-    if IsErr(handleRes):
-        browserCodecPublishError(Error(handleRes), schema.error)
-        return 0
-    return Value(handleRes)
-
-fn browserCodecExportTextResult(textRes: Result[str],
-                                schema: V3BrowserCodecExportSchema): int32 =
-    let handleRes = browserCodecLiftTextHandle(textRes, schema.output)
-    return browserCodecExportHandleResult(handleRes, schema)
-
-fn browserCodecExportBytesResult(bytesRes: Result[Bytes],
-                                 schema: V3BrowserCodecExportSchema): int32 =
-    let handleRes = browserCodecLiftBytesHandle(bytesRes, schema.output)
-    return browserCodecExportHandleResult(handleRes, schema)
-
 fn browserCodecExportMoqFountainTextResult(textRes: Result[str],
                                            handleError: str): int32 =
-    let schema = browserCodecMoqFountainExportSchema(v3BrowserCodecOutputTextHandle, handleError)
-    return browserCodecExportTextResult(textRes, schema)
+    return codegen.v3BrowserCodecExportMoqFountainTextResult(textRes, handleError)
 
 fn browserCodecExportMoqFountainBytesResult(bytesRes: Result[Bytes],
                                             handleError: str): int32 =
-    let schema = browserCodecMoqFountainExportSchema(v3BrowserCodecOutputBytesHandle, handleError)
-    return browserCodecExportBytesResult(bytesRes, schema)
+    return codegen.v3BrowserCodecExportMoqFountainBytesResult(bytesRes, handleError)
 
 fn browserInputBytesRequired(handle: int32,
                              missingError: str,
                              copyError: str): Result[Bytes] =
-    let schema = browserCodecInputBytesRequiredSchema(missingError, copyError)
-    return browserCodecReadInputBytes(handle, schema)
+    return codegen.v3BrowserCodecReadInputBytesRequired(handle, missingError, copyError)
 
 fn browserInputTextRequired(handle: int32,
                             missingError: str,
                             copyError: str): Result[str] =
-    let schema = browserCodecInputTextRequiredSchema(missingError, copyError)
-    return browserCodecReadInputText(handle, schema)
+    return codegen.v3BrowserCodecReadInputTextRequired(handle, missingError, copyError)
 
 fn browserInputTextOptional(handle: int32,
                             copyError: str): Result[str] =
-    let schema = browserCodecInputTextOptionalSchema(copyError)
-    return browserCodecReadInputText(handle, schema)
+    return codegen.v3BrowserCodecReadInputTextOptional(handle, copyError)
 
 fn browserBufferHandleFromBytesRequired(payload: Bytes,
                                         handleError: str): Result[int32] =
-    let schema = browserCodecOutputBytesHandleSchema(handleError)
-    return browserCodecWriteOutputBytesHandle(payload, schema)
+    return codegen.v3BrowserCodecWriteOutputBytesHandleRequired(payload, handleError)
 
 fn browserBufferHandleFromTextRequired(text: str,
                                        handleError: str): Result[int32] =
-    let schema = browserCodecOutputTextHandleSchema(handleError)
-    return browserCodecWriteOutputTextHandle(text, schema)
+    return codegen.v3BrowserCodecWriteOutputTextHandleRequired(text, handleError)
 
 fn browserMoqFountainBuildWireText(blobBytes: Bytes,
                                    ownerPeerId: str,
@@ -322,18 +147,18 @@ fn browserMoqFountainBuildWireBytes(blobBytes: Bytes,
 fn browserMoqFountainPeerInput(ownerPeerHandle: int32,
                                remotePeersHandle: int32,
                                mimeTypeHandle: int32): Result[V3BrowserMoqFountainPeerInput] =
-    let ownerPeerSchema = browserCodecInputTextRequiredSchema("moq_fountain_missing_owner_peer",
-                                                              "moq_fountain_copy_owner_peer_failed")
-    let remotePeersSchema = browserCodecInputTextRequiredSchema("moq_fountain_missing_remote_peers",
-                                                                "moq_fountain_copy_remote_peers_failed")
-    let mimeTypeSchema = browserCodecInputTextOptionalSchema("moq_fountain_copy_mime_type_failed")
-    let ownerPeerRes = browserCodecReadInputText(ownerPeerHandle, ownerPeerSchema)
+    let ownerPeerRes = codegen.v3BrowserCodecReadInputTextRequired(ownerPeerHandle,
+                                                                   "moq_fountain_missing_owner_peer",
+                                                                   "moq_fountain_copy_owner_peer_failed")
     if IsErr(ownerPeerRes):
         return Err[V3BrowserMoqFountainPeerInput](Error(ownerPeerRes))
-    let remotePeersRes = browserCodecReadInputText(remotePeersHandle, remotePeersSchema)
+    let remotePeersRes = codegen.v3BrowserCodecReadInputTextRequired(remotePeersHandle,
+                                                                     "moq_fountain_missing_remote_peers",
+                                                                     "moq_fountain_copy_remote_peers_failed")
     if IsErr(remotePeersRes):
         return Err[V3BrowserMoqFountainPeerInput](Error(remotePeersRes))
-    let mimeTypeRes = browserCodecReadInputText(mimeTypeHandle, mimeTypeSchema)
+    let mimeTypeRes = codegen.v3BrowserCodecReadInputTextOptional(mimeTypeHandle,
+                                                                  "moq_fountain_copy_mime_type_failed")
     if IsErr(mimeTypeRes):
         return Err[V3BrowserMoqFountainPeerInput](Error(mimeTypeRes))
     var out: V3BrowserMoqFountainPeerInput
@@ -346,9 +171,9 @@ fn browserMoqFountainBuildRequest(blobHandle: int32,
                                   ownerPeerHandle: int32,
                                   remotePeersHandle: int32,
                                   mimeTypeHandle: int32): Result[V3BrowserMoqFountainBuildRequest] =
-    let blobSchema = browserCodecInputBytesRequiredSchema("moq_fountain_missing_blob",
-                                                          "moq_fountain_copy_blob_failed")
-    let blobBytesRes = browserCodecReadInputBytes(blobHandle, blobSchema)
+    let blobBytesRes = codegen.v3BrowserCodecReadInputBytesRequired(blobHandle,
+                                                                    "moq_fountain_missing_blob",
+                                                                    "moq_fountain_copy_blob_failed")
     if IsErr(blobBytesRes):
         return Err[V3BrowserMoqFountainBuildRequest](Error(blobBytesRes))
     let peerInputRes = browserMoqFountainPeerInput(ownerPeerHandle,
@@ -533,13 +358,13 @@ fn browserMoqFountainRebuildBytes(requestWireHandle: int32): int32 =
                                                     "moq_fountain_rebuild_raw_buffer_handle_failed")
 
 fn browserMoqFountainLastErrorHandle(): int32 =
-    return cheng_v3_browser_moq_fountain_last_error_handle_bridge()
+    return codegen.v3BrowserCodecMoqFountainLastErrorHandle()
 
 fn browserBufferHandleLen(handle: int32): int32 =
-    return cheng_v3_browser_buffer_handle_len_bridge(handle)
+    return codegen.v3BrowserBufferHandleLen(handle)
 
 fn browserBufferHandleByte(handle: int32, idx: int32): int32 =
-    return cheng_v3_browser_buffer_handle_byte_bridge(handle, idx)
+    return codegen.v3BrowserBufferHandleByte(handle, idx)
 
 fn browserBufferHandleRelease(handle: int32): int32 =
-    return cheng_v3_browser_buffer_handle_release_bridge(handle)
+    return codegen.v3BrowserBufferHandleRelease(handle)

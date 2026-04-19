@@ -2,13 +2,13 @@
 
 | 项目 | 内容 |
 |---|---|
-| 目标 | 继续把 `cheng v3` 收成“单一规范化前端 + typed lowering 真源 + 统一复合值/ABI 规则”。当前主攻两条主线：browser ABI schema 收口，以及把这套 schema 继续推向编译器生成桥。 |
-| 状态 | 进行中。`normalized expr`、`typed expr fact`、`lowering rule`、复合值地址优先规则已落地；`Bytes[] add/setLen`、`exe @exportc`、`xor`、全局 `len(str/Bytes/seq)` 已打通；browser codec 这轮又把 `text/bytes + result/error/out-buffer` 收进了统一导出模板。 |
-| 当前主线 | 1. 前端已统一到单一规范化声明/表达式层。2. `compiler_csg + lowering_plan` 已共用 `typed fact + lowering rule`。3. seed/native/wasm 已开始共用“复合值显式地址 + region copy”规则。4. browser `content codec` 现已把 `bytes/text/optional/handle/result/error` 收进统一 schema/helper 与导出模板。5. native 与 wasm 的局部槽都按 `source line + block end` 控制可见性，不再平铺 first-match。 |
-| 本轮动作 | 在 `browser_content_codec_abi` 新增统一 `browserCodecExportHandleResult`、`browserCodecExportTextResult`、`browserCodecExportBytesResult`，把 `moq_fountain build/rebuild` 的 text/bytes 导出都接到同一套 schema；同时把 `browser_host_wasm_probe` 和 runtime/browser wasm smoke 一起追平。 |
-| 涉及文件 | `task_plan.md` `progress.md` `findings.md` `lessons.md` `v3/src/libp2p/browser/browser_content_codec_abi.cheng` `v3/src/libp2p/browser/browser_host_wasm_probe.cheng` `v3/src/tests/browser_host_native_runtime_smoke.cheng` `v3/src/tooling/backend_driver_main.cheng` `v3/src/tooling/gate_main.cheng` |
+| 目标 | 继续把 `cheng v3` 收成“单一规范化前端 + typed lowering 真源 + 统一复合值/ABI 规则”。当前主攻已经推进到 browser ABI 的 `rule -> bridge spec -> source-aware emitter`。 |
+| 状态 | 进行中。`normalized expr`、`typed expr fact`、`lowering rule`、复合值地址优先规则已落地；`Bytes[] add/setLen`、`exe @exportc`、`xor`、全局 `len(str/Bytes/seq)` 已打通；browser codec 现已把 schema、generic bridge、export/error 模板和 source-aware bridge emitter 都收进共享 codegen，并且 `compiler_csg/lowering_plan/codegen` 已共用同一份 browser ABI 真源。 |
+| 当前主线 | 1. 前端已统一到单一规范化声明/表达式层。2. `compiler_csg + lowering_plan` 已共用 `typed fact + lowering rule`。3. seed/native/wasm 已开始共用“复合值显式地址 + region copy”规则。4. browser `content codec` 现已把 `bytes/text/optional/handle/result/error` 的 schema、读输入、写输出、error/export 和 source-aware bridge emitter 都收进共享 codegen。5. browser ABI 现已新增通用 `bridge spec` 生成层，`compiler_csg/lowering_plan/codegen` 都吃这同一份生成结果。 |
+| 本轮动作 | 在 `browser_abi_rule` 里新增 per-bridge emitter 行；`browser_content_codec_codegen` 新增 `sourcePath + ruleName` 的标量 bridge key/helper/emit API；`browser_abi_rule_smoke` 改成通过 source-aware emitter 对齐 `compiler_csg`，不再直接搬复合 bridge spec。 |
+| 涉及文件 | `task_plan.md` `progress.md` `findings.md` `lessons.md` `v3/src/lang/browser_abi_rule.cheng` `v3/src/libp2p/browser/browser_content_codec_rule_schema.cheng` `v3/src/libp2p/browser/browser_content_codec_codegen.cheng` `v3/src/tooling/compiler_csg.cheng` `v3/src/backend/lowering_plan.cheng` `v3/src/tests/browser_content_codec_rule_schema_smoke.cheng` `v3/src/tests/browser_content_codec_codegen_smoke.cheng` `v3/src/tests/browser_abi_rule_smoke.cheng` |
 | 不做 | 不新开 worktree；不碰无关脏改；不把 browser ABI 假装成“已自动生成”；不把 `Bytes[]` 缺口继续留在业务侧绕开。 |
-| 验收 | `artifacts/v3_bootstrap/cheng.stage3 build-backend-driver`、`artifacts/v3_backend_driver/cheng run-host-smokes --compiler:artifacts/v3_bootstrap/cheng.stage3 --label:browser_codec_request browser_host_native_runtime_smoke browser_host_native_contract_smoke`、`artifacts/v3_backend_driver/cheng run-browser-host-wasm-smoke --compiler:artifacts/v3_bootstrap/cheng.stage3 --label:expr_surface_abi`、`git diff --check` |
+| 验收 | `artifacts/v3_bootstrap/cheng.stage3 run-host-smokes --compiler:artifacts/v3_bootstrap/cheng.stage3 --label:browser_codegen browser_content_codec_rule_schema_smoke browser_content_codec_codegen_smoke browser_abi_rule_smoke`、`artifacts/v3_bootstrap/cheng.stage3 run-host-smokes --compiler:artifacts/v3_bootstrap/cheng.stage3 --label:browser_codec_contract browser_host_native_contract_smoke`、`artifacts/v3_bootstrap/cheng.stage3 run-browser-host-wasm-smoke --compiler:artifacts/v3_bootstrap/cheng.stage3 --label:expr_surface_abi`、`git diff --check` |
 
 # 最近完成
 
@@ -35,12 +35,19 @@
 | `2026-04-19 07:xx +0800` | `browser_content_codec_rule_schema` 的 canonical ruleName 已追到当前源码：`export_moq_fountain_text_result`、`export_moq_fountain_bytes_result`、`moq_fountain_last_error_handle`；live/stage0 browser smoke 重新通过。 |
 | `2026-04-19 07:xx +0800` | `browser_content_codec_abi_min` 已不再自己拼裸 browser bridge 流程，而是直接复用 codec helper；最小 browser smoke 现已补上 text handle 路径，并在 live/stage0 两边重新通过。 |
 | `2026-04-19 07:xx +0800` | 新增 `browser_content_codec_rule_schema_smoke`，开始直接硬卡 `browser_content_codec_rule_schema` 的 canonical ruleName，不再只看数量；live/stage0 host smoke 重新通过。 |
+| `2026-04-19 08:xx +0800` | browser ABI 规则已正式拆成 `browser_abi_rule + browser_content_codec_rule_schema` 两层；`compiler_csg` 已补齐 `ruleName` wrapper，`compiler_csg_smoke/lowering_plan_smoke + browser_content_codec_rule_schema_smoke + browser_abi_rule_smoke` 已一起跑绿。 |
+| `2026-04-19 08:xx +0800` | `browser_abi_rule_smoke` 现改成手工最小 `V3SystemLinkPlanStub` 验收，不再走真实 `v3BuildSystemLinkPlanStub`；browser ABI 规则验证已与 parser bounds 噪声解耦。 |
+| `2026-04-19 08:xx +0800` | `browser_content_codec_codegen` 已落地，`browser_content_codec_abi` 通过 canonical `ruleName` 绑定 `input/output/error/export schema`，不再自己维护 kind 常量和本地 schema constructor。 |
+| `2026-04-19 09:xx +0800` | `browser_content_codec_codegen` 已继续收进 generic bridge：`input_len/copy/raw_handle/text_handle`、读输入、写输出、lift、error/export 全部进入共享 codegen；`browser_content_codec_abi` 现在只剩业务逻辑和兼容 wrapper。 |
+| `2026-04-19 09:xx +0800` | `compiler_csg_smoke` 与 `lowering_plan_smoke` 的输出目录已按 `CHENG_V3_SMOKE_LABEL` 隔离；live/stage0 现可并跑，不再互踩 `artifacts/v3_compiler_csg` 与 `artifacts/v3_program_selfhost`。 |
+| `2026-04-19 09:xx +0800` | `compiler_pipeline_stub`、`compiler_world`、`compiler_migration`、`lowering_matrix` 这批编译器 smoke 的输出目录也已按 `CHENG_V3_SMOKE_LABEL` 隔离；`compiler_world_libp2p/head/receipt` 的本地 probe 端口也已按 label 派生，live/stage0 并跑重新通过。 |
+| `2026-04-19 09:xx +0800` | `tests/smoke_ports` 已落地；`chain_node_tailnet/libp2p`、`pin_runtime_host`、`content_runtime`、`libp2p_tailnet_transport/derp`、`libp2p_resource/scheduler`、`tailnet_control_core`、`content_stub`、`libp2p_protocols` 这批默认 host smoke 的本地端口现已按 label 派生，live/stage0 并跑重新通过。 |
 | `2026-04-18` | 规范化前端、typed expr fact、lowering rule、runtime zero-c、shared wasm/browser smoke、`cheng_node` 第二阶段等主线已收平。 |
 
 # 下一步
 
 | 顺序 | 事项 |
 |---|---|
-| 1 | 把这套 browser ABI schema 从 `moq_fountain` 扩到更多模块，继续减少业务侧手写 `input_len/copy/raw_handle/text_handle`。 |
-| 2 | 开始把 browser ABI schema 往“编译器生成桥”推进，而不是长期停在手写 helper 层。 |
-| 3 | 把这套 `MoqFountain export schema` 继续扩到更多 browser 模块，再往编译器生成桥推进。 |
+| 1 | 把这套 `browser abi rule -> bridge spec -> source-aware emitter` 从 `browser_content_codec` 扩到更多 browser 模块，继续清掉模块侧 ABI wrapper。 |
+| 2 | 把当前按模块调用的 shared codegen 再往编译器输出层推进，让 bridge emitter 真正落到导入/导出桥产物，而不只停在 helper API。 |
+| 3 | 让 browser 模块只声明 rule/schema，不再自己写 `codegen` helper。 |
