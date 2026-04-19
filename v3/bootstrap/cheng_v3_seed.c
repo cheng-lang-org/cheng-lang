@@ -2443,7 +2443,7 @@ static const char *v3_flag_value(int argc, char **argv, const char *flag) {
 #define CHENG_V3_CONST_MAX_BINDINGS 64
 #define CHENG_V3_CONST_MAX_ECHOS 8
 #define CHENG_V3_MAX_TOP_LEVEL_CONSTS 2048
-#define CHENG_V3_MAX_ASM_LOCALS 256
+#define CHENG_V3_MAX_ASM_LOCALS 1024
 #define CHENG_V3_MAX_TYPE_TEXT 512
 #define CHENG_V3_MAX_DEFAULT_EXPR 4096
 
@@ -2548,6 +2548,8 @@ typedef struct {
     int32_t stack_size;
     int32_t stack_align;
     bool indirect_value;
+    size_t scope_start_line;
+    size_t scope_end_line;
 } V3AsmLocalSlot;
 
 typedef enum {
@@ -4477,6 +4479,16 @@ static int32_t v3_line_indent(const char *line) {
     return indent;
 }
 
+static size_t v3_current_source_line_number = 0U;
+
+static void v3_set_current_source_line(size_t line_number) {
+    v3_current_source_line_number = line_number;
+}
+
+static size_t v3_current_source_line(void) {
+    return v3_current_source_line_number;
+}
+
 static bool v3_collect_statement_from_lines(char **lines,
                                             size_t line_count,
                                             size_t *index_io,
@@ -4488,6 +4500,7 @@ static bool v3_collect_statement_from_lines(char **lines,
     int32_t bracket_depth = 0;
     int32_t brace_depth = 0;
     bool in_string = false;
+    bool saw_statement_line = false;
     if (index >= line_count) {
         return false;
     }
@@ -4524,6 +4537,10 @@ static bool v3_collect_statement_from_lines(char **lines,
                 break;
             }
             continue;
+        }
+        if (!saw_statement_line) {
+            v3_set_current_source_line(index + 1U);
+            saw_statement_line = true;
         }
         snprintf(out + used, out_cap - used, "%s", piece);
         used = strlen(out);
@@ -18662,13 +18679,30 @@ static const char *v3_resolved_type_abi_class(const V3LoweringPlanStub *lowering
 static int32_t v3_find_local_slot(const V3AsmLocalSlot *locals,
                                   size_t local_count,
                                   const char *name) {
-    size_t i;
-    for (i = 0; i < local_count; ++i) {
-        if (strcmp(locals[i].name, name) == 0) {
-            return (int32_t)i;
+    size_t i = local_count;
+    size_t line_number = v3_current_source_line();
+    while (i > 0U) {
+        size_t index = i - 1U;
+        if (strcmp(locals[index].name, name) == 0 &&
+            locals[index].scope_start_line <= line_number &&
+            line_number <= locals[index].scope_end_line) {
+            return (int32_t)index;
         }
+        i -= 1U;
     }
     return -1;
+}
+
+static void v3_limit_local_scope_end(V3AsmLocalSlot *locals,
+                                     size_t start_index,
+                                     size_t local_count,
+                                     size_t end_line) {
+    size_t i;
+    for (i = start_index; i < local_count; ++i) {
+        if (locals[i].scope_end_line > end_line) {
+            locals[i].scope_end_line = end_line;
+        }
+    }
 }
 
 static bool v3_is_noop_local_reference_statement(const V3AsmLocalSlot *locals,
@@ -18699,6 +18733,12 @@ static bool v3_add_local_slot_sized(V3AsmLocalSlot *locals,
     int32_t align = slot_align > 0 ? slot_align : 1;
     int32_t size = slot_size > 0 ? slot_size : 8;
     if (*local_count >= local_cap) {
+        fprintf(stderr,
+                "[cheng_v3_seed] asm local cap exceeded local_cap=%zu name=%s type=%s abi=%s\n",
+                local_cap,
+                name ? name : "",
+                type_text ? type_text : "",
+                abi_class ? abi_class : "");
         return false;
     }
     snprintf(locals[*local_count].name, sizeof(locals[*local_count].name), "%s", name);
@@ -18707,6 +18747,8 @@ static bool v3_add_local_slot_sized(V3AsmLocalSlot *locals,
     locals[*local_count].indirect_value = indirect_value;
     locals[*local_count].stack_align = align;
     locals[*local_count].stack_size = size;
+    locals[*local_count].scope_start_line = v3_current_source_line();
+    locals[*local_count].scope_end_line = (size_t)-1;
     *next_offset_io = v3_align_up_i32(*next_offset_io, align);
     locals[*local_count].stack_offset = *next_offset_io;
     *next_offset_io += v3_align_up_i32(size, 8);
@@ -33127,6 +33169,9 @@ static bool v3_prepare_if_statement_state(const V3SystemLinkPlanStub *plan,
     char current_stmt[8192];
     snprintf(current_stmt, sizeof(current_stmt), "%s", statement);
     for (;;) {
+        size_t clause_local_start = *local_count;
+        size_t clause_line = v3_current_source_line();
+        size_t clause_end_line = clause_line;
         char cond[4096];
         char inline_stmt[8192];
         char next_clause[8192];
@@ -33203,6 +33248,7 @@ static bool v3_prepare_if_statement_state(const V3SystemLinkPlanStub *plan,
                                                    max_string_literal_temps_io)) {
                 return false;
             }
+            v3_limit_local_scope_end(locals, clause_local_start, *local_count, clause_line);
         } else {
             while (*index_io < line_count) {
                 char raw_copy[4096];
@@ -33221,6 +33267,7 @@ static bool v3_prepare_if_statement_state(const V3SystemLinkPlanStub *plan,
                 }
                 if (indent == parent_indent &&
                     (v3_startswith(trimmed, "elif ") || v3_startswith(trimmed, "else"))) {
+                    size_t next_clause_line = *index_io + 1U;
                     if (!v3_collect_statement_from_lines(lines,
                                                          line_count,
                                                          index_io,
@@ -33229,9 +33276,11 @@ static bool v3_prepare_if_statement_state(const V3SystemLinkPlanStub *plan,
                         return false;
                     }
                     has_next_clause = true;
+                    clause_end_line = next_clause_line > 0U ? next_clause_line - 1U : 0U;
                     break;
                 }
                 if (indent <= parent_indent) {
+                    clause_end_line = *index_io;
                     break;
                 }
                 if (!v3_collect_statement_from_lines(lines, line_count, index_io, nested_stmt, sizeof(nested_stmt))) {
@@ -33335,6 +33384,10 @@ static bool v3_prepare_if_statement_state(const V3SystemLinkPlanStub *plan,
                     return false;
                 }
             }
+            if (!has_next_clause) {
+                clause_end_line = *index_io;
+            }
+            v3_limit_local_scope_end(locals, clause_local_start, *local_count, clause_end_line);
         }
         if (!has_next_clause) {
             break;
@@ -33416,19 +33469,24 @@ static bool v3_prepare_case_const_table_statement(const V3SystemLinkPlanStub *pl
         if (v3_call_expr_string_literal_count(inline_stmt) > *max_string_literal_temps_io) {
             *max_string_literal_temps_io = v3_call_expr_string_literal_count(inline_stmt);
         }
-        if (!v3_prepare_non_if_statement_state(plan,
-                                               lowering,
-                                               function,
-                                               aliases,
-                                               alias_count,
-                                               locals,
-                                               local_count,
-                                               local_cap,
-                                               next_offset_io,
-                                               inline_stmt,
-                                               max_call_depth_io,
-                                               max_string_literal_temps_io)) {
-            return false;
+        {
+            size_t arm_local_start = *local_count;
+            size_t arm_line = v3_current_source_line();
+            if (!v3_prepare_non_if_statement_state(plan,
+                                                   lowering,
+                                                   function,
+                                                   aliases,
+                                                   alias_count,
+                                                   locals,
+                                                   local_count,
+                                                   local_cap,
+                                                   next_offset_io,
+                                                   inline_stmt,
+                                                   max_call_depth_io,
+                                                   max_string_literal_temps_io)) {
+                return false;
+            }
+            v3_limit_local_scope_end(locals, arm_local_start, *local_count, arm_line);
         }
     }
     return true;
@@ -33450,6 +33508,9 @@ static bool v3_prepare_while_statement_state(const V3SystemLinkPlanStub *plan,
                                              const char *statement,
                                              int32_t *max_call_depth_io,
                                              int32_t *max_string_literal_temps_io) {
+    size_t block_local_start = *local_count;
+    size_t block_line = v3_current_source_line();
+    size_t block_end_line = block_line;
     char cond[4096];
     char inline_stmt[8192];
     if (!v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
@@ -33505,6 +33566,7 @@ static bool v3_prepare_while_statement_state(const V3SystemLinkPlanStub *plan,
                     inline_stmt);
             return false;
         }
+        v3_limit_local_scope_end(locals, block_local_start, *local_count, block_line);
         return true;
     }
     while (*index_io < line_count) {
@@ -33520,6 +33582,7 @@ static bool v3_prepare_while_statement_state(const V3SystemLinkPlanStub *plan,
         }
         indent = v3_line_indent(lines[*index_io]);
         if (indent <= parent_indent) {
+            block_end_line = *index_io;
             break;
         }
         if (!v3_collect_statement_from_lines(lines, line_count, index_io, nested_stmt, sizeof(nested_stmt))) {
@@ -33623,6 +33686,10 @@ static bool v3_prepare_while_statement_state(const V3SystemLinkPlanStub *plan,
             return false;
         }
     }
+    if (block_end_line < *index_io) {
+        block_end_line = *index_io;
+    }
+    v3_limit_local_scope_end(locals, block_local_start, *local_count, block_end_line);
     return true;
 }
 
@@ -33642,6 +33709,9 @@ static bool v3_prepare_for_statement_state(const V3SystemLinkPlanStub *plan,
                                            const char *statement,
                                            int32_t *max_call_depth_io,
                                            int32_t *max_string_literal_temps_io) {
+    size_t block_local_start = *local_count;
+    size_t block_line = v3_current_source_line();
+    size_t block_end_line = block_line;
     char iter_name[128];
     char start_expr[4096];
     char end_expr[4096];
@@ -33740,6 +33810,7 @@ static bool v3_prepare_for_statement_state(const V3SystemLinkPlanStub *plan,
                     inline_stmt);
             return false;
         }
+        v3_limit_local_scope_end(locals, block_local_start, *local_count, block_line);
         return true;
     }
     while (*index_io < line_count) {
@@ -33755,6 +33826,7 @@ static bool v3_prepare_for_statement_state(const V3SystemLinkPlanStub *plan,
         }
         indent = v3_line_indent(lines[*index_io]);
         if (indent <= parent_indent) {
+            block_end_line = *index_io;
             break;
         }
         if (!v3_collect_statement_from_lines(lines, line_count, index_io, nested_stmt, sizeof(nested_stmt))) {
@@ -33858,6 +33930,10 @@ static bool v3_prepare_for_statement_state(const V3SystemLinkPlanStub *plan,
             return false;
         }
     }
+    if (block_end_line < *index_io) {
+        block_end_line = *index_io;
+    }
+    v3_limit_local_scope_end(locals, block_local_start, *local_count, block_end_line);
     return true;
 }
 
@@ -34064,11 +34140,24 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
                                     sizeof(inferred_type),
                                     inferred_abi,
                                     sizeof(inferred_abi))) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] emit let infer failed function=%s name=%s expr=%s stmt=%s\n",
+                        function->symbol_text,
+                        name,
+                        expr,
+                        statement);
                 return false;
             }
             snprintf(type_text, sizeof(type_text), "%s", inferred_type);
         }
         if (!v3_tuple_binding_expr_complete(type_text, expr)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] emit let tuple binding incomplete function=%s name=%s type=%s expr=%s stmt=%s\n",
+                    function->symbol_text,
+                    name,
+                    type_text,
+                    expr,
+                    statement);
             return false;
         }
         abi_class = v3_resolved_type_abi_class(lowering,
@@ -34079,6 +34168,13 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
                                                normalized_type,
                                                sizeof(normalized_type));
         if (local_index < 0 || locals[local_index].stack_offset < 0) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] emit let local missing function=%s name=%s type=%s expr=%s stmt=%s\n",
+                    function->symbol_text,
+                    name,
+                    type_text,
+                    expr,
+                    statement);
             return false;
         }
         if (v3_abi_class_scalar_or_ptr(abi_class)) {
@@ -34098,29 +34194,46 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
                                         0,
                                         out,
                                         cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] emit let scalar expr failed function=%s name=%s abi=%s expr=%s stmt=%s\n",
+                        function->symbol_text,
+                        name,
+                        abi_class,
+                        expr,
+                        statement);
                 return false;
             }
             v3_emit_store_slot(out, cap, &locals[local_index], 9);
             return true;
         }
-        return v3_materialize_composite_expr_into_slot(plan,
-                                                       lowering,
-                                                       function,
-                                                       aliases,
-                                                       alias_count,
-                                                       locals,
-                                                       local_count,
-                                                       name,
-                                                       0U,
-                                                       expr,
-                                                       &locals[local_index],
-                                                       call_arg_base,
-                                                       string_temp_base,
-                                                       string_temp_stride,
-                                                       string_label_index_io,
-                                                       0,
-                                                       out,
-                                                       cap);
+        if (!v3_materialize_composite_expr_into_slot(plan,
+                                                     lowering,
+                                                     function,
+                                                     aliases,
+                                                     alias_count,
+                                                     locals,
+                                                     local_count,
+                                                     name,
+                                                     0U,
+                                                     expr,
+                                                     &locals[local_index],
+                                                     call_arg_base,
+                                                     string_temp_base,
+                                                     string_temp_stride,
+                                                     string_label_index_io,
+                                                     0,
+                                                     out,
+                                                     cap)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] emit let composite materialize failed function=%s name=%s type=%s expr=%s stmt=%s\n",
+                    function->symbol_text,
+                    name,
+                    locals[local_index].type_text,
+                    expr,
+                    statement);
+            return false;
+        }
+        return true;
     }
     if (v3_parse_assignment_meta(statement,
                                  name,
@@ -34814,6 +34927,10 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
     bool branch_terminated = false;
     int32_t label_id = v3_next_expr_label_id();
     if (!v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
+        fprintf(stderr,
+                "[cheng_v3_seed] emit while parse header failed function=%s stmt=%s\n",
+                function->symbol_text,
+                statement);
         return false;
     }
     snprintf(start_label, sizeof(start_label), "L_v3_while_start_%d", label_id);
@@ -34838,6 +34955,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                 0,
                                 out,
                                 cap)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] emit while cond failed function=%s stmt=%s cond=%s\n",
+                function->symbol_text,
+                statement,
+                cond);
         return false;
     }
     v3_emit_branch_zero(out, cap, 9, false, end_label);
@@ -34865,6 +34987,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                       out,
                                       cap,
                                       &branch_terminated)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] emit while inline stmt failed function=%s parent=%s nested=%s\n",
+                    function->symbol_text,
+                    statement,
+                    inline_stmt);
             v3_pop_loop_labels();
             return false;
         }
@@ -34918,6 +35045,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                       sret_local_index,
                                       out,
                                       cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] emit while nested if failed function=%s parent=%s nested=%s\n",
+                        function->symbol_text,
+                        statement,
+                        nested_stmt);
                 v3_pop_loop_labels();
                 return false;
             }
@@ -34945,6 +35077,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                          sret_local_index,
                                          out,
                                          cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] emit while nested while failed function=%s parent=%s nested=%s\n",
+                        function->symbol_text,
+                        statement,
+                        nested_stmt);
                 v3_pop_loop_labels();
                 return false;
             }
@@ -34972,6 +35109,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                        sret_local_index,
                                        out,
                                        cap)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] emit while nested for failed function=%s parent=%s nested=%s\n",
+                        function->symbol_text,
+                        statement,
+                        nested_stmt);
                 v3_pop_loop_labels();
                 return false;
             }
@@ -34995,6 +35137,11 @@ static bool v3_emit_while_statement(const V3SystemLinkPlanStub *plan,
                                       out,
                                       cap,
                                       &branch_terminated)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] emit while nested stmt failed function=%s parent=%s nested=%s\n",
+                    function->symbol_text,
+                    statement,
+                    nested_stmt);
             v3_pop_loop_labels();
             return false;
         }
@@ -35602,6 +35749,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
     memset(locals, 0, sizeof(locals));
     memset(effective_param_types, 0, sizeof(effective_param_types));
     memset(effective_param_abis, 0, sizeof(effective_param_abis));
+    v3_set_current_source_line(0U);
     for (i = 0; i < function->param_count; ++i) {
         char effective_param_type[CHENG_V3_MAX_TYPE_TEXT];
         char effective_param_abi[32];
@@ -36319,6 +36467,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         free(owned_lines);
         return false;
     }
+    v3_set_current_source_line(0U);
     out[0] = '\0';
     v3_text_appendf(out, cap,
                     ".globl ");
@@ -37569,6 +37718,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
     snprintf(synthetic_function.return_type, sizeof(synthetic_function.return_type), "%s", "void");
     snprintf(synthetic_function.return_abi_class, sizeof(synthetic_function.return_abi_class), "%s", "void");
     memset(locals, 0, sizeof(locals));
+    v3_set_current_source_line(0U);
 
     for (i = 0; i < line_count; ++i) {
         char line_copy[4096];
@@ -37616,6 +37766,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
                                     sizeof(normalized_type))) {
             continue;
         }
+        v3_set_current_source_line(i + 1U);
         saw_init = true;
         if (v3_call_expr_string_literal_count(expr) > max_string_literal_temps) {
             max_string_literal_temps = v3_call_expr_string_literal_count(expr);
@@ -37730,6 +37881,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
     }
 
     in_var_block = false;
+    v3_set_current_source_line(0U);
     for (i = 0; i < line_count; ++i) {
         char line_copy[4096];
         char name[128];
@@ -37778,6 +37930,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
                                     sizeof(normalized_type))) {
             continue;
         }
+        v3_set_current_source_line(i + 1U);
         abi_class = v3_type_abi_class(normalized_type);
         v3_global_var_symbol_name(plan, owner_module_path, name, global_symbol, sizeof(global_symbol));
         if (v3_abi_class_scalar_or_ptr(abi_class)) {
@@ -39324,13 +39477,19 @@ static bool v3_wasm_trim_wrapping_parens(const char *text,
 static int32_t v3_wasm_find_local_slot_index(const V3WasmFunctionContext *ctx,
                                              const char *name) {
     size_t i;
+    size_t line_number = v3_current_source_line();
     if (ctx == NULL || name == NULL || name[0] == '\0') {
         return -1;
     }
-    for (i = 0U; i < ctx->local_count; ++i) {
-        if (strcmp(ctx->locals[i].name, name) == 0) {
-            return (int32_t)i;
+    i = ctx->local_count;
+    while (i > 0U) {
+        size_t index = i - 1U;
+        if (strcmp(ctx->locals[index].name, name) == 0 &&
+            ctx->locals[index].scope_start_line <= line_number &&
+            line_number <= ctx->locals[index].scope_end_line) {
+            return (int32_t)index;
         }
+        i -= 1U;
     }
     return -1;
 }
@@ -39363,6 +39522,8 @@ static bool v3_wasm_context_add_local(V3WasmFunctionContext *ctx,
     ctx->locals[ctx->local_count].stack_offset = stack_offset;
     ctx->locals[ctx->local_count].stack_size = stack_size;
     ctx->locals[ctx->local_count].stack_align = stack_align;
+    ctx->locals[ctx->local_count].scope_start_line = v3_current_source_line();
+    ctx->locals[ctx->local_count].scope_end_line = (size_t)-1;
     ctx->local_indices[ctx->local_count] = local_index;
     ctx->local_count += 1U;
     return true;
@@ -42990,6 +43151,75 @@ static bool v3_wasm_prepare_statement(const V3SystemLinkPlanStub *plan,
     return v3_wasm_analyze_expr(plan, lowering, function, ctx, statement, imports, import_count);
 }
 
+static bool v3_wasm_statement_scope_meta(const char *statement,
+                                         bool *opens_block_out,
+                                         bool *has_inline_body_out) {
+    char cond[4096];
+    char inline_stmt[8192];
+    char iter_name[128];
+    char start_expr[4096];
+    char end_expr[4096];
+    bool end_inclusive = false;
+    if (opens_block_out == NULL || has_inline_body_out == NULL) {
+        return false;
+    }
+    *opens_block_out = false;
+    *has_inline_body_out = false;
+    if (statement == NULL) {
+        return true;
+    }
+    if (v3_startswith(statement, "if ")) {
+        if (!v3_parse_if_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
+            return false;
+        }
+        *opens_block_out = true;
+        *has_inline_body_out = inline_stmt[0] != '\0';
+        return true;
+    }
+    if (v3_startswith(statement, "elif ")) {
+        if (!v3_parse_elif_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
+            return false;
+        }
+        *opens_block_out = true;
+        *has_inline_body_out = inline_stmt[0] != '\0';
+        return true;
+    }
+    if (v3_startswith(statement, "else")) {
+        if (!v3_parse_else_header(statement, inline_stmt, sizeof(inline_stmt))) {
+            return false;
+        }
+        *opens_block_out = true;
+        *has_inline_body_out = inline_stmt[0] != '\0';
+        return true;
+    }
+    if (v3_startswith(statement, "while ")) {
+        if (!v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
+            return false;
+        }
+        *opens_block_out = true;
+        *has_inline_body_out = inline_stmt[0] != '\0';
+        return true;
+    }
+    if (v3_startswith(statement, "for ")) {
+        if (!v3_parse_for_header(statement,
+                                 iter_name,
+                                 sizeof(iter_name),
+                                 start_expr,
+                                 sizeof(start_expr),
+                                 end_expr,
+                                 sizeof(end_expr),
+                                 &end_inclusive,
+                                 inline_stmt,
+                                 sizeof(inline_stmt))) {
+            return false;
+        }
+        *opens_block_out = true;
+        *has_inline_body_out = inline_stmt[0] != '\0';
+        return true;
+    }
+    return true;
+}
+
 static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
                                              const V3LoweringPlanStub *lowering,
                                              const V3LoweredFunctionStub *function,
@@ -43005,7 +43235,11 @@ static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
     char owned_path[PATH_MAX];
     char inline_signature_body[8192];
     bool has_inline_signature_body = false;
+    int32_t scope_indents[CHENG_V3_MAX_ASM_LOCALS];
+    size_t scope_local_starts[CHENG_V3_MAX_ASM_LOCALS];
+    size_t scope_count = 0U;
     size_t i;
+    v3_set_current_source_line(0U);
     if (!v3_wasm_context_init(plan, lowering, function, ctx) ||
         !v3_load_function_source_lines(function,
                                        &lines,
@@ -43029,6 +43263,7 @@ static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
         }
     }
     if (has_inline_signature_body) {
+        v3_set_current_source_line(0U);
         bool ok = v3_wasm_prepare_statement(plan,
                                             lowering,
                                             function,
@@ -43056,10 +43291,16 @@ static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
         }
         indent = v3_line_indent(lines[i]);
         if (indent <= 0 && v3_is_top_level_decl_start(trimmed)) {
+            while (scope_count > 0U) {
+                v3_limit_local_scope_end(ctx->locals,
+                                         scope_local_starts[scope_count - 1U],
+                                         ctx->local_count,
+                                         i);
+                scope_count -= 1U;
+            }
             break;
         }
-        if (!v3_collect_statement_from_lines(lines, line_count, &i, statement, sizeof(statement)) ||
-            !v3_wasm_prepare_statement(plan, lowering, function, ctx, statement, imports, import_count)) {
+        if (!v3_collect_statement_from_lines(lines, line_count, &i, statement, sizeof(statement))) {
             fprintf(stderr,
                     "[cheng_v3_seed] wasm prepare statement failed function=%s stmt=%s\n",
                     function->symbol_text,
@@ -43068,6 +43309,53 @@ static bool v3_wasm_prepare_function_context(const V3SystemLinkPlanStub *plan,
             free(owned_lines);
             return false;
         }
+        while (scope_count > 0U && indent <= scope_indents[scope_count - 1U]) {
+            size_t end_line = v3_current_source_line() > 0U ? (v3_current_source_line() - 1U) : 0U;
+            v3_limit_local_scope_end(ctx->locals,
+                                     scope_local_starts[scope_count - 1U],
+                                     ctx->local_count,
+                                     end_line);
+            scope_count -= 1U;
+        }
+        {
+            size_t stmt_local_start = ctx->local_count;
+            bool opens_block = false;
+            bool has_inline_body = false;
+            if (!v3_wasm_prepare_statement(plan, lowering, function, ctx, statement, imports, import_count) ||
+                !v3_wasm_statement_scope_meta(statement, &opens_block, &has_inline_body)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] wasm prepare statement failed function=%s stmt=%s\n",
+                        function->symbol_text,
+                        statement);
+                free(lines);
+                free(owned_lines);
+                return false;
+            }
+            if (opens_block) {
+                if (has_inline_body) {
+                    v3_limit_local_scope_end(ctx->locals,
+                                             stmt_local_start,
+                                             ctx->local_count,
+                                             v3_current_source_line());
+                } else {
+                    if (scope_count >= CHENG_V3_MAX_ASM_LOCALS) {
+                        free(lines);
+                        free(owned_lines);
+                        return false;
+                    }
+                    scope_indents[scope_count] = indent;
+                    scope_local_starts[scope_count] = stmt_local_start;
+                    scope_count += 1U;
+                }
+            }
+        }
+    }
+    while (scope_count > 0U) {
+        v3_limit_local_scope_end(ctx->locals,
+                                 scope_local_starts[scope_count - 1U],
+                                 ctx->local_count,
+                                 line_count);
+        scope_count -= 1U;
     }
     if (!v3_wasm_context_finalize(ctx)) {
         free(lines);
@@ -62457,251 +62745,7 @@ static int v3_run_stage23_browser_webrtc_script(const char *root,
 }
 
 static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
-    V3BootstrapPaths paths;
-    char root_v3[PATH_MAX];
-    char out_dir[PATH_MAX];
-    char hostrun_root[PATH_MAX];
-    char out_bin[PATH_MAX];
-    const char *tail_only;
-    const char *explicit_compiler;
-    const char *env_compiler;
-    const char *compiler_bin;
-    const char *label;
-    const char *positionals[256];
-    size_t positional_count;
-    size_t i;
-    bool run_tail = true;
-    static const char *DEFAULT_SMOKES[] = {
-        "ref10_ashr_smoke",
-        "fixed256_curve25519_smoke",
-        "fixedbytes32_seq_index_smoke",
-        "compiler_runtime_smoke",
-        "artifact_isolation_audit_smoke",
-        "backend_driver_command_surface_smoke",
-        "backend_driver_candidate_output_smoke",
-        "runtime_link_input_surface_smoke",
-        "runtime_zero_c_surface_smoke",
-        "composite_default_init_smoke",
-        "composite_default_init_negative_smoke",
-        "chain_node_snapshot_return_boundary_smoke",
-        "chain_node_snapshot_write_return_boundary_smoke",
-        "chain_node_snapshot_print_return_boundary_smoke",
-        "chain_node_cli_return_boundary_smoke",
-        "export_visibility_smoke",
-        "export_visibility_negative_smoke",
-        "strformat_export_negative_smoke",
-        "func_range_loop_smoke",
-        "json_bracket_assign_smoke",
-        "os_dir_exists_smoke",
-        "os_file_exists_smoke",
-        "os_file_size_smoke",
-        "os_get_current_dir_smoke",
-        "os_rename_file_smoke",
-        "os_remove_dir_smoke",
-        "os_walk_dir_smoke",
-        "str_concat_lowering_smoke",
-        "strformat_fmt_lowering_smoke",
-        "strformat_fmt_smoke",
-        "strformat_fmt_negative_smoke",
-        "global_fixed_array_composite_smoke",
-        "multiline_header_indent_smoke",
-        "rwad_serial_state_machine_smoke",
-        "rwad_bft_state_machine_smoke",
-        "parser_path_smoke",
-        "compiler_pipeline_stub_smoke",
-        "lowering_plan_smoke",
-        "lowering_matrix_smoke",
-        "compiler_equivalence_smoke",
-        "compiler_publish_smoke",
-        "bft_three_replica_smoke",
-        "primary_object_plan_smoke",
-        "object_native_link_plan_smoke",
-        "ffi_handle_smoke",
-        "program_selfhost_smoke",
-        "csg_smoke",
-        "consensus_smoke",
-        "chain_node_smoke",
-        "chain_node_zero_snapshot_replay_smoke",
-        "chain_node_tailnet_smoke",
-        "chain_node_libp2p_smoke",
-        "bft_finalize_summary_smoke",
-        "bft_state_machine_smoke",
-        "oracle_plane_smoke",
-        "oracle_bft_state_machine_smoke",
-        "oracle_bft_three_replica_smoke",
-        "oracle_runtime_host_smoke",
-        "overlay_contracts_smoke",
-        "pubsub_smoke",
-        "dag_mempool_smoke",
-        "plumtree_smoke",
-        "erasure_swarm_smoke",
-        "pin_plane_smoke",
-        "pin_scheduler_smoke",
-        "pin_runtime_host_smoke",
-        "pin_runtime_quic_smoke",
-        "content_codec_smoke",
-        "content_runtime_smoke",
-        "bio_reed_solomon_smoke",
-        "bio_same_person_smoke",
-        "bio_did_chain_node_smoke",
-        "bio_did_mobile_biometric_smoke",
-        "native_client_hello_wire_smoke",
-        "msquic_bindtext_expr_smoke",
-        "protocol_validation_smoke",
-        "platform_release_validation_smoke",
-        "congestion_validation_smoke",
-        "msquic_platform_smoke",
-        "quic_tls_transport_ecdsa_smoke",
-        "quic_transport_loopback_smoke",
-        "quic_transport_sequential_accept_smoke",
-        "libp2p_quic_tls_smoke",
-        "quic_feature_matrix_smoke",
-        "quic_close_order_smoke",
-        "bft_daemon_quic_close_order_smoke",
-        "libp2p_tailnet_policy_smoke",
-        "libp2p_tailnet_visibility_smoke",
-        "libp2p_tailnet_transport_smoke",
-        "libp2p_tailnet_derp_smoke",
-        "libp2p_resource_smoke",
-        "libp2p_scheduler_smoke",
-        "tailnet_control_core_smoke",
-        "tailnet_train_island_smoke",
-        "webrtc_signal_codec_smoke",
-        "webrtc_signal_session_smoke",
-        "webrtc_turn_fallback_smoke",
-        "libp2p_webrtc_sync_smoke",
-        "content_quic_smoke",
-        "webrtc_datachannel_content_smoke",
-        "content_stub_smoke",
-        "libp2p_protocols_smoke",
-        "location_proof_smoke",
-        "chain_codec_binary_smoke",
-        "anti_entropy_smoke",
-        "anti_entropy_signature_fields_smoke",
-        "lsmr_types_smoke",
-        "lsmr_locality_storage_smoke",
-        "lsmr_bagua_prefix_tree_smoke",
-        "udp_importc_smoke",
-        "mobile_bridge_smoke",
-        "mobile_sdk_smoke",
-        "did_identity_smoke"
-    };
-    v3_bootstrap_paths_init(&paths);
-    v3_join_path(root_v3, sizeof(root_v3), paths.root, "v3");
-    explicit_compiler = v3_flag_value(argc, argv, "--compiler");
-    env_compiler = getenv("CHENG_V3_SMOKE_COMPILER");
-    compiler_bin = (explicit_compiler != NULL && explicit_compiler[0] != '\0') ?
-                       explicit_compiler :
-                       ((env_compiler != NULL && env_compiler[0] != '\0') ? env_compiler : paths.backend_driver_out);
-    if ((explicit_compiler == NULL || explicit_compiler[0] == '\0') &&
-        (env_compiler == NULL || env_compiler[0] == '\0')) {
-        if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
-            return 1;
-        }
-        compiler_bin = paths.backend_driver_out;
-    }
-    if (access(compiler_bin, X_OK) != 0) {
-        fprintf(stderr, "[cheng_v3_seed] run-host-smokes missing compiler: %s\n", compiler_bin);
-        return 1;
-    }
-    label = v3_leaf_resolve_label(argc, argv, "CHENG_V3_SMOKE_LABEL", "host");
-    tail_only = v3_flag_value(argc, argv, "--tail-only");
-    if (tail_only != NULL && tail_only[0] != '\0') {
-        if (strcmp(tail_only, "wasm") == 0) {
-            return v3_run_host_leaf_command("wasm", compiler_bin, label);
-        }
-        if (strcmp(tail_only, "browser_host_wasm") == 0) {
-            return v3_run_host_leaf_command("browser_host_wasm", compiler_bin, label);
-        }
-        if (strcmp(tail_only, "chain_node_cli") == 0) {
-            return v3_run_host_leaf_command("chain_node_cli", compiler_bin, label);
-        }
-        if (strcmp(tail_only, "chain_node_process") == 0) {
-            return v3_run_chain_node_process_smoke_with_env(compiler_bin, label, false);
-        }
-        if (strcmp(tail_only, "chain_node_three_node") == 0) {
-            return v3_run_chain_node_three_node_smoke_with_env(compiler_bin, label, false);
-        }
-        if (strcmp(tail_only, "tailnet_control") == 0) {
-            return v3_run_host_leaf_command("tailnet_control", compiler_bin, label);
-        }
-        if (strcmp(tail_only, "fresh_node_selfhost") == 0) {
-            return v3_run_host_leaf_command("fresh_node_selfhost", compiler_bin, label);
-        }
-        if (strcmp(tail_only, "migration") == 0) {
-            return v3_run_host_leaf_command("migration", compiler_bin, label);
-        }
-        fprintf(stderr, "[cheng_v3_seed] run-host-smokes unknown --tail-only: %s\n", tail_only);
-        return 1;
-    }
-    positional_count = v3_collect_smoke_positionals(argc, argv, positionals, sizeof(positionals) / sizeof(positionals[0]));
-    if (positional_count > 0U) {
-        run_tail = false;
-    }
-    v3_join_path(hostrun_root, sizeof(hostrun_root), paths.root, "artifacts/v3_hostrun");
-    if (label != NULL && label[0] != '\0' && strcmp(label, "host") != 0) {
-        v3_join_path(out_dir, sizeof(out_dir), hostrun_root, label);
-    } else {
-        v3_copy_text(out_dir, sizeof(out_dir), hostrun_root);
-    }
-    if (!v3_mkdir_p(out_dir)) {
-        return 1;
-    }
-    if (positional_count > 0U) {
-        for (i = 0U; i < positional_count; ++i) {
-            v3_join_path(out_bin, sizeof(out_bin), out_dir, positionals[i]);
-            if (!v3_run_fixture_smoke_direct("v3 host smokes",
-                                             positionals[i],
-                                             compiler_bin,
-                                             paths.root,
-                                             root_v3,
-                                             positionals[i],
-                                             out_bin)) {
-                return 1;
-            }
-            if (strcmp(positionals[i], "chain_node_libp2p_smoke") == 0 &&
-                v3_run_host_leaf_command("tcp_twoproc", compiler_bin, label) != 0) {
-                return 1;
-            }
-            if (strcmp(positionals[i], "libp2p_quic_tls_smoke") == 0 &&
-                v3_run_host_leaf_command("quic_twoproc", compiler_bin, label) != 0) {
-                return 1;
-            }
-        }
-    } else {
-        for (i = 0U; i < sizeof(DEFAULT_SMOKES) / sizeof(DEFAULT_SMOKES[0]); ++i) {
-            v3_join_path(out_bin, sizeof(out_bin), out_dir, DEFAULT_SMOKES[i]);
-            if (!v3_run_fixture_smoke_direct("v3 host smokes",
-                                             DEFAULT_SMOKES[i],
-                                             compiler_bin,
-                                             paths.root,
-                                             root_v3,
-                                             DEFAULT_SMOKES[i],
-                                             out_bin)) {
-                return 1;
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "chain_node_libp2p_smoke") == 0 &&
-                v3_run_host_leaf_command("tcp_twoproc", compiler_bin, label) != 0) {
-                return 1;
-            }
-            if (strcmp(DEFAULT_SMOKES[i], "libp2p_quic_tls_smoke") == 0 &&
-                v3_run_host_leaf_command("quic_twoproc", compiler_bin, label) != 0) {
-                return 1;
-            }
-        }
-    }
-    if (run_tail) {
-        if (v3_run_host_leaf_command("chain_node_cli", compiler_bin, label) != 0 ||
-            v3_run_chain_node_process_smoke_with_env(compiler_bin, label, false) != 0 ||
-            v3_run_chain_node_three_node_smoke_with_env(compiler_bin, label, false) != 0 ||
-            v3_run_host_leaf_command("tailnet_control", compiler_bin, label) != 0 ||
-            v3_run_host_leaf_command("fresh_node_selfhost", compiler_bin, label) != 0 ||
-            v3_run_host_leaf_command("migration", compiler_bin, label) != 0) {
-            return 1;
-        }
-    }
-    puts("v3 host smokes: ok");
-    return 0;
+    return v3_require_backend_driver_cli_passthrough("run-host-smokes", argc, argv);
 }
 
 static int v3_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv) {
