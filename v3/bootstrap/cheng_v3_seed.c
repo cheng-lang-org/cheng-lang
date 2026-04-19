@@ -3335,6 +3335,20 @@ typedef enum {
 } V3WasmCallReturnSlotKind;
 
 typedef enum {
+    V3_WASM_CALL_RESULT_UNSUPPORTED = 0,
+    V3_WASM_CALL_RESULT_VOID,
+    V3_WASM_CALL_RESULT_I32_VALUE,
+    V3_WASM_CALL_RESULT_I32_ADDRESS
+} V3WasmCallResultKind;
+
+typedef enum {
+    V3_WASM_IMPORT_UNSUPPORTED = 0,
+    V3_WASM_IMPORT_VOID,
+    V3_WASM_IMPORT_I32_VALUE_SLOT,
+    V3_WASM_IMPORT_I32_ADDRESS_SLOT
+} V3WasmImportKind;
+
+typedef enum {
     V3_WASM_COMPOSITE_COPY_FROM_LOCAL_ADDRESS = 0,
     V3_WASM_COMPOSITE_COPY_FROM_POINTER_RESULT
 } V3WasmCompositeCopyKind;
@@ -40385,6 +40399,10 @@ static V3WasmCallArgSlotKind v3_wasm_call_arg_slot_kind(const char *param_type,
 
 static V3WasmCallReturnSlotKind v3_wasm_call_target_return_slot_kind(const V3AsmCallTarget *target);
 
+static V3WasmCallResultKind v3_wasm_call_target_result_kind(const V3AsmCallTarget *target);
+
+static V3WasmImportKind v3_wasm_call_target_import_kind(const V3AsmCallTarget *target);
+
 static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
                                            uint32_t *type_index_out);
 
@@ -40875,13 +40893,13 @@ static bool v3_wasm_register_import(const char *function_symbol,
 
 static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
                                            uint32_t *type_index_out) {
-    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmImportKind import_kind;
     size_t i;
     if (target == NULL || type_index_out == NULL || target->param_count > CHENG_V3_MAX_CALL_ARGS) {
         return false;
     }
-    return_slot_kind = v3_wasm_call_target_return_slot_kind(target);
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED) {
+    import_kind = v3_wasm_call_target_import_kind(target);
+    if (import_kind == V3_WASM_IMPORT_UNSUPPORTED) {
         return false;
     }
     for (i = 0U; i < target->param_count; ++i) {
@@ -40891,7 +40909,7 @@ static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
         }
     }
     *type_index_out = v3_wasm_signature_type_slot(target->param_count,
-                                                  return_slot_kind != V3_WASM_CALL_RETURN_SLOT_VOID);
+                                                  import_kind != V3_WASM_IMPORT_VOID);
     return true;
 }
 
@@ -41838,7 +41856,7 @@ static bool v3_wasm_emit_composite_call_result_into_local_address(const V3System
                                                                   size_t import_count,
                                                                   V3WasmBuffer *body) {
     return target != NULL &&
-           v3_call_target_result_uses_address(target) &&
+           v3_wasm_call_target_result_kind(target) == V3_WASM_CALL_RESULT_I32_ADDRESS &&
            v3_wasm_emit_pointer_result_expr_into_local_address(plan,
                                                                lowering,
                                                                function,
@@ -42848,6 +42866,38 @@ static V3WasmCallReturnSlotKind v3_wasm_call_target_return_slot_kind(const V3Asm
         : V3_WASM_CALL_RETURN_SLOT_VALUE;
 }
 
+static V3WasmCallResultKind v3_wasm_call_target_result_kind(const V3AsmCallTarget *target) {
+    V3WasmCallReturnSlotKind slot_kind = v3_wasm_call_target_return_slot_kind(target);
+    if (slot_kind == V3_WASM_CALL_RETURN_SLOT_VOID) {
+        return V3_WASM_CALL_RESULT_VOID;
+    }
+    if (slot_kind == V3_WASM_CALL_RETURN_SLOT_VALUE) {
+        return V3_WASM_CALL_RESULT_I32_VALUE;
+    }
+    if (slot_kind == V3_WASM_CALL_RETURN_SLOT_ADDRESS) {
+        return V3_WASM_CALL_RESULT_I32_ADDRESS;
+    }
+    return V3_WASM_CALL_RESULT_UNSUPPORTED;
+}
+
+static V3WasmImportKind v3_wasm_call_target_import_kind(const V3AsmCallTarget *target) {
+    V3WasmCallResultKind result_kind;
+    if (target == NULL || !target->external) {
+        return V3_WASM_IMPORT_UNSUPPORTED;
+    }
+    result_kind = v3_wasm_call_target_result_kind(target);
+    if (result_kind == V3_WASM_CALL_RESULT_VOID) {
+        return V3_WASM_IMPORT_VOID;
+    }
+    if (result_kind == V3_WASM_CALL_RESULT_I32_VALUE) {
+        return V3_WASM_IMPORT_I32_VALUE_SLOT;
+    }
+    if (result_kind == V3_WASM_CALL_RESULT_I32_ADDRESS) {
+        return V3_WASM_IMPORT_I32_ADDRESS_SLOT;
+    }
+    return V3_WASM_IMPORT_UNSUPPORTED;
+}
+
 static bool v3_wasm_prepare_call_arg_state(const V3SystemLinkPlanStub *plan,
                                            const V3LoweringPlanStub *lowering,
                                            const V3LoweredFunctionStub *function,
@@ -43002,7 +43052,7 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
                                  V3WasmImportStub *imports,
                                  size_t *import_count) {
     V3AsmCallTarget target;
-    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -43034,9 +43084,9 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
                 callee);
         return false;
     }
-    return_slot_kind = v3_wasm_call_target_return_slot_kind(&target);
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_VOID ||
-        return_slot_kind == V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED ||
+    result_kind = v3_wasm_call_target_result_kind(&target);
+    if (result_kind == V3_WASM_CALL_RESULT_VOID ||
+        result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED ||
         target.param_count != arg_count) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm call signature reject function=%s callee=%s ret=%s argc=%zu expected=%zu\n",
@@ -43076,7 +43126,7 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
                                            size_t *import_count) {
     bool handled = false;
     V3AsmCallTarget target;
-    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -43133,8 +43183,8 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
                 target.param_count);
         return false;
     }
-    return_slot_kind = v3_wasm_call_target_return_slot_kind(&target);
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED) {
+    result_kind = v3_wasm_call_target_result_kind(&target);
+    if (result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm statement call ret reject function=%s callee=%s ret=%s\n",
                 function->symbol_text,
@@ -44292,7 +44342,7 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
                                    size_t import_count,
                                    V3WasmBuffer *body) {
     V3AsmCallTarget target;
-    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -44325,9 +44375,9 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
                 arg_count);
         return false;
     }
-    return_slot_kind = v3_wasm_call_target_return_slot_kind(&target);
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_VOID ||
-        return_slot_kind == V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED ||
+    result_kind = v3_wasm_call_target_result_kind(&target);
+    if (result_kind == V3_WASM_CALL_RESULT_VOID ||
+        result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED ||
         target.param_count != arg_count) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm emit call signature reject function=%s callee=%s ret=%s argc=%zu expected=%zu\n",
@@ -44378,7 +44428,7 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
                                         V3WasmBuffer *body) {
     bool handled = false;
     V3AsmCallTarget target;
-    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -44423,8 +44473,8 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
         target.param_count != arg_count) {
         return false;
     }
-    return_slot_kind = v3_wasm_call_target_return_slot_kind(&target);
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED) {
+    result_kind = v3_wasm_call_target_result_kind(&target);
+    if (result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED) {
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
@@ -44448,7 +44498,7 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
     if (!v3_wasm_emit_call_target(lowering, &target, imports, import_count, body)) {
         return false;
     }
-    if (return_slot_kind == V3_WASM_CALL_RETURN_SLOT_VOID) {
+    if (result_kind == V3_WASM_CALL_RESULT_VOID) {
         return true;
     }
     return v3_wasm_append_u8(body, 0x1aU);

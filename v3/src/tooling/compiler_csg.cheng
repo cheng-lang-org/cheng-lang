@@ -1521,9 +1521,10 @@ fn v3CompilerCsgAddEdge(edges: var V3CompilerCsgEdge[],
 
 fn v3CompilerCsgExprLayerForText(sourcePath: str,
                                  text: str,
+                                 knownCallNames: str[],
                                  layer: var parser.V3NormalizedExprLayer): Result[bool] =
     var err: str = ""
-    if !parser.v3ParserReadNormalizedExprLayerFromText(sourcePath, text, layer, err):
+    if !parser.v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePath, text, knownCallNames, layer, err):
         return Err[bool]("v3 compiler csg: expr layer read failed")
     return Ok[bool](true)
 
@@ -1622,6 +1623,20 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     for i in 0..<linkPlan.sourceClosurePaths.len:
         add(orderedSources, linkPlan.sourceClosurePaths[i])
     v3CompilerCsgSortStrs(orderedSources)
+    var knownCallNames: str[] = []
+    for sourceIndex in 0..<orderedSources.len:
+        let sourcePath = orderedSources[sourceIndex]
+        var sourceText = ""
+        if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, sourceText):
+            sourceText = v3path.V3ReadTextFile("", sourcePath)
+        var decls: parser.V3NormalizedFunctionDecl[] = []
+        var declErr = ""
+        if !parser.v3ParserReadNormalizedFunctionDecls(sourceText, decls, declErr):
+            return Err[V3CompilerCsg]("v3 compiler csg: normalized decl read failed")
+        var sourceKnownCalls: str[] = []
+        parser.v3ParserKnownCallNamesFromDecls(decls, sourceKnownCalls)
+        for callIndex in 0..<sourceKnownCalls.len:
+            v3CompilerCsgAddUnique(knownCallNames, sourceKnownCalls[callIndex])
     for sourceIndex in 0..<orderedSources.len:
         let sourcePath = orderedSources[sourceIndex]
         let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
@@ -1636,7 +1651,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             text = v3path.V3ReadTextFile("", sourcePath)
         add(typedSourceTexts, v3CompilerCsgTypedSourceText(sourcePath, text))
         var sourceExprLayer = parser.v3NormalizedExprLayerZero()
-        let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath, text, sourceExprLayer)
+        let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath, text, knownCallNames, sourceExprLayer)
         if IsErr(sourceExprRes):
             return Err[V3CompilerCsg](Error(sourceExprRes))
         parser.v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)

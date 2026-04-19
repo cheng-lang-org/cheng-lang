@@ -51,6 +51,12 @@
 - wasm `slot kind` 收完后，还要继续把 `type_index / import_index / local callee index` 收回共享 helper；只要 `register_import / emit_call_target / collect_imports / encode return_call_*` 还各自手抄签名解析和索引查找，import 这一列就还没真正只有一份真源。
 - `type_index / import_index / local callee index` 收完后，不要只停在 call target 这一半；function-side 的 `signature/type_index` 也必须立刻一起收回共享 helper。只修 target 不修 function，`context_init / collect_imports / module type section` 还是会继续各抄一份 slot/signature 规则。
 - `signature/type_index` 收完后，就不要继续在签名层打转；下一步最值的是把 wasm composite copy 的数据搬运入口也收成单一 helper。`pointer-result / seq add / lvalue copy / static return slot` 如果继续各写一份 `local_set + copy_region_between_locals`，import/copy-materialize 这条线还是会在更低层留第二份真源。
+- composite copy 收完后，紧跟着就该把“地址返回值写进 static return slot”压成单一 helper。显式 `return x` 和 implicit return 如果一条直接物化、一条先 `emit_expr` 再 copy，caller-side 的 import buffer 语义还是会残留双轨。
+- static return slot 收完后，不要让 wasm `call expr / call statement / composite call-result materialize` 继续各自解释 `return_slot_kind`；它们共享的是更高一层的“call result 到底是 `void / i32 value / i32 address`”语义，直接补显式 `wasm call result kind` 更稳。
+- `wasm call result kind` 收完后，external import 这一列也要立刻补显式 `import kind`，不要继续让 `type_index` 靠 `return_slot_kind != void` 这种影子语义选签名。
+- 如果 typed/lowering 里已经暴露了 `import_buffer` 这样的枚举和报表字段，但 fact builder 从来不赋值，就必须明确记成“还没接通”，不要把报表口当成真能力。
+- `import_buffer` 这类调用归因要真落地，前提是 expr 层先有最小 `CallExpr`；没有 call 节点，就不要假装 typed builder 能凭空推导调用返回语义。
+- 补 `CallExpr` 时先走最小闭环最稳：先只抓“同文件 importc fn 的 call”，把 builder 和 smoke 跑通，再扩到通用 call HIR。
 - 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。
 
 ## 记录与流程

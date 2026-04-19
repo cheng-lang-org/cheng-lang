@@ -19,6 +19,7 @@ type
         v3NormalizedExprComprehension
         v3NormalizedExprStrFormat
         v3NormalizedExprResultIntrinsic
+        v3NormalizedExprCall
         v3NormalizedExprTry
 
     V3NormalizedExpr =
@@ -80,6 +81,8 @@ fn v3NormalizedExprKindText(kind: V3NormalizedExprKind): str =
         return "StrFormatExpr"
     if kind == v3NormalizedExprResultIntrinsic:
         return "ResultIntrinsic"
+    if kind == v3NormalizedExprCall:
+        return "CallExpr"
     if kind == v3NormalizedExprTry:
         return "TryExpr"
     return "UnknownExpr"
@@ -226,6 +229,9 @@ fn v3NormalizedExprLayerResultIntrinsicCount(layer: V3NormalizedExprLayer): int3
 
 fn v3NormalizedExprLayerTryCount(layer: V3NormalizedExprLayer): int32 =
     return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprTry)
+
+fn v3NormalizedExprLayerCallCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprCall)
 
 fn v3NormalizedExprLayerHasExpr(layer: V3NormalizedExprLayer,
                                 kind: V3NormalizedExprKind,
@@ -401,6 +407,17 @@ fn v3ParserNextNonSpaceChar(lineRaw: str,
             return lineRaw[cursor]
         cursor = cursor + 1
     return char(0)
+
+fn v3ParserSkipInlineSpaces(lineRaw: str,
+                            start: int32): int32 =
+    var cursor = start
+    var scanning = true
+    while cursor < lineRaw.len && scanning:
+        if v3ParserIsInlineSpace(lineRaw[cursor]):
+            cursor = cursor + 1
+        else:
+            scanning = false
+    return cursor
 
 fn v3ParserStripLineComment(lineRaw: str): str =
     let hashPos = v3ParserFindText(lineRaw, "#")
@@ -768,6 +785,47 @@ fn v3ParserAppendQuestionExprsLine(sourcePath: str,
                                         "ternary",
                                         "?")
 
+fn v3ParserAppendImportcCallExprsLine(sourcePath: str,
+                                      lineNumber: int32,
+                                      lineRaw: str,
+                                      knownCallNames: str[],
+                                      layer: var V3NormalizedExprLayer) =
+    for nameIndex in 0..<knownCallNames.len:
+        let callName = knownCallNames[nameIndex]
+        if callName == "":
+            continue
+        if lineRaw.len < len(callName):
+            continue
+        for i in 0..<(lineRaw.len - len(callName) + 1):
+            if v3path.V3TextSlice(lineRaw, i, len(callName)) != callName:
+                continue
+            var leftOk = true
+            if i > 0:
+                leftOk = !v3ParserIsIdentChar(lineRaw[i - 1])
+            let rightPos = i + len(callName)
+            var rightOk = true
+            if rightPos < lineRaw.len:
+                rightOk = !v3ParserIsIdentChar(lineRaw[rightPos])
+            if !leftOk || !rightOk:
+                continue
+            let prevToken = v3ParserPreviousToken(lineRaw, i)
+            if prevToken == "fn" || prevToken == "func" || prevToken == "proc" ||
+               prevToken == "method" || prevToken == "converter" || prevToken == "importc":
+                continue
+            let nextPos = v3ParserSkipInlineSpaces(lineRaw, rightPos)
+            if nextPos >= lineRaw.len:
+                continue
+            if v3path.V3TextSlice(lineRaw, nextPos, 1) != "(":
+                continue
+            v3NormalizedExprLayerAppend(layer,
+                                        sourcePath,
+                                        lineNumber,
+                                        i + 1,
+                                        v3NormalizedExprCall,
+                                        "known_call",
+                                        callName)
+    return
+
 fn v3ParserAppendComprehensionExprsLine(sourcePath: str,
                                         lineNumber: int32,
                                         lineRaw: str,
@@ -787,10 +845,20 @@ fn v3ParserAppendComprehensionExprsLine(sourcePath: str,
                                 "list_comprehension",
                                 "[for in]")
 
-fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
-                                           text: str,
-                                           layer: var V3NormalizedExprLayer,
-                                           err: var str): bool =
+fn v3ParserKnownCallNamesFromDecls(decls: V3NormalizedFunctionDecl[],
+                                   names: var str[]) =
+    var out: str[] = []
+    for i in 0..<decls.len:
+        if decls[i].name == "":
+            continue
+        v3ParserAddUniqueText(out, decls[i].name)
+    names = out
+
+fn v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
+                                                         text: str,
+                                                         knownCallNames: str[],
+                                                         layer: var V3NormalizedExprLayer,
+                                                         err: var str): bool =
     let sourcePath = v3ParserNormalizePath(sourcePathRaw)
     if sourcePath == "":
         err = "missing source path"
@@ -809,9 +877,31 @@ fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
         v3ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendResultIntrinsicExprsLine(sourcePath, lineNumber, line, layer)
+        v3ParserAppendImportcCallExprsLine(sourcePath, lineNumber, line, knownCallNames, layer)
     layer.questionResidualCount = 0
     err = ""
     return true
+
+fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
+                                           text: str,
+                                           layer: var V3NormalizedExprLayer,
+                                           err: var str): bool =
+    let sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    if sourcePath == "":
+        err = "missing source path"
+        return false
+    var decls: V3NormalizedFunctionDecl[] = []
+    var declErr = ""
+    if !v3ParserReadNormalizedFunctionDecls(text, decls, declErr):
+        err = declErr
+        return false
+    var knownCallNames: str[] = []
+    v3ParserKnownCallNamesFromDecls(decls, knownCallNames)
+    return v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePath,
+                                                                 text,
+                                                                 knownCallNames,
+                                                                 layer,
+                                                                 err)
 
 fn v3ParserReadNormalizedExprLayerFromPath(sourcePathRaw: str,
                                            layer: var V3NormalizedExprLayer,
@@ -1317,10 +1407,27 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     var unresolved: int32 = 0
     if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, importEdges, unresolved, err):
         return false
+    var closureCallNames: str[] = []
+    for i in 0..<ordered.len:
+        let sourceText = v3path.V3ReadTextFile("", ordered[i])
+        var sourceDecls: V3NormalizedFunctionDecl[] = []
+        var declErr = ""
+        if !v3ParserReadNormalizedFunctionDecls(sourceText, sourceDecls, declErr):
+            err = declErr
+            return false
+        for declIndex in 0..<sourceDecls.len:
+            if sourceDecls[declIndex].name == "":
+                continue
+            v3ParserAddUniqueText(closureCallNames, sourceDecls[declIndex].name)
     var exprLayer = v3NormalizedExprLayerZero()
     for i in 0..<ordered.len:
         var sourceExprLayer = v3NormalizedExprLayerZero()
-        if !v3ParserReadNormalizedExprLayerFromPath(ordered[i], sourceExprLayer, err):
+        let sourceText = v3path.V3ReadTextFile("", ordered[i])
+        if !v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(ordered[i],
+                                                                  sourceText,
+                                                                  closureCallNames,
+                                                                  sourceExprLayer,
+                                                                  err):
             err = v3ParserConcat4("v3 parser: ", ordered[i], ": ", err)
             return false
         v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)

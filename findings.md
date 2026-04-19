@@ -27,4 +27,10 @@
 | 第二十刀主线 | wasm call/import 的 `slot kind` 收完后，下一刀最值的是把 `type_index / import_index / local callee index` 这层 import 分发表也收回共享 helper；不然 `register_import / emit_call_target / collect_imports / encode return_call_*` 还是会继续手抄同一套签名解析和索引查找。 |
 | 第二十一刀主线 | `type_index / import_index / local callee index` 收完后，紧接着最值的是把 function-side `signature/type_index` 这一半也一起收回共享 helper；只修 call target 还不够，`context_init / collect_imports / module type section` 如果还各自手抄 `return_supported + param i32-slot`，wasm import 这一列仍然有两份签名真源。 |
 | 第二十二刀主线 | `signature/type_index` 收完后，最值的已经不是再抠签名，而是把 wasm composite copy 的“数据搬运入口”收成单一 helper；只要 `pointer-result / seq add / lvalue copy / static return slot` 还各写一份 `local_set + copy_region_between_locals`，import/copy-materialize 这一列还是会在更低层保留第二份真源。 |
+| 第二十三刀主线 | composite copy 收完后，下一步最值的是把“地址返回值写进 static return slot”也压成单一 helper；只要显式 `return x` 和 implicit return 还保留一条“直接物化”和一条“先 emit_expr 再 copy”的双轨，caller-side 的 import buffer 语义就还没有真正只剩一份分发。 |
+| 第二十四刀主线 | static return slot 收完后，下一步最值的不是再让 wasm `call expr / call statement / composite call-result` 各自解释 `return_slot_kind`；这三条入口其实共享同一套“结果到底是 void、i32 value 还是 i32 address”语义，必须补成显式 `wasm call result kind`。 |
+| 第二十六刀主线 | `wasm call result kind` 收完后，最值的是把 external import 这一列也补成显式 `import kind`，至少先把 `void / i32 value slot / i32 address slot` 从 `type_index` 侧面推断改成单点规则；不然 import 签名还是会继续借 `return_slot_kind` 影射。 |
+| 第二十七刀主线 | `typed_expr` 里的 `import_buffer` 要真落地，前提不是再堆 seed helper，而是补最小 `CallExpr` 规范化；没有 call 节点，builder 根本没有地方把 importc 返回值打上 `import_buffer`。 |
+| 当前真进展 | 现在已经补了最小 `CallExpr`，而且 composite importc call 已经能在 `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 里真落成 `lower=import_buffer / return=import_buffer`。 |
+| 当前剩余缺口 | 这条新路径目前只覆盖“同文件 importc fn 的 call expr”。只要还没有通用 call HIR，跨文件/跨模块的普通函数调用就还不能共吃同一套 typed call 归因。 |
 | fresh 验收面 | C bootstrap 改动不能直接拿 stage0 本体跑 ordinary smoke，因为它会先报 `missing embedded bootstrap contract`；稳定做法是 `stage0 bootstrap-bridge` 后，用 fresh `stage2` no-handoff 跑真 smoke。 |
