@@ -118,12 +118,20 @@ fn raw_libc_setsockopt(fd: int32, level: int32, optname: int32, optval: ptr, opt
 fn raw_libc_inet_pton_native(family: int32, src: ptr, dst: ptr): int32
 @importc("inet_ntop")
 fn raw_libc_inet_ntop_native(family: int32, src: ptr, dst: ptr, size: int32): ptr
+@importc("gethostbyname2")
+fn raw_libc_gethostbyname2(name: ptr, family: int32): ptr
 @importc("close")
 fn raw_libc_close(fd: int32): int32
 @importc("execvp")
 fn raw_libc_execvp(file: ptr, argv: ptr): int32
 @importc("strerror")
 fn raw_libc_strerror(err: int32): ptr
+@importc("cheng_v3_native_af_inet_bridge")
+fn raw_native_af_inet_bridge(): int32
+@importc("cheng_v3_native_af_inet6_bridge")
+fn raw_native_af_inet6_bridge(): int32
+@importc("cheng_v3_native_sockaddr_use_len_field_bridge")
+fn raw_native_sockaddr_use_len_field_bridge(): int32
 
 const
     chengHostStdInFd: int32 = 0
@@ -134,6 +142,13 @@ type
     Int32Ptr = int32 *
     UInt8Ptr = uint8 *
     VoidPtrPtr = ptr *
+    HostEnt =
+        h_name: ptr
+        h_aliases: ptr
+        h_addrtype: int32
+        h_length: int32
+        h_addr_list: ptr
+    HostEntPtr = HostEnt *
     DarwinDirent =
         d_ino: uint64
         d_seekoff: uint64
@@ -144,6 +159,9 @@ type
 
 const
     chengHostDirentNameOff: int32 = 21
+    chengHostSockaddrInLen: int32 = 16
+    chengHostSockaddrIn6Len: int32 = 28
+    chengHostSockStream: int32 = 1
 
 fn cheng_host_ptr_plus(base: ptr, off: int32): ptr =
     if base == nil:
@@ -171,6 +189,93 @@ fn cheng_host_fd_at(fds: ptr, idx: int32): int32 =
 fn cheng_host_close_fd_if_valid(fd: int32) =
     if fd >= 0:
         let ignoredClose = raw_libc_close(fd)
+
+fn cheng_host_af_inet(): int32 =
+    return raw_native_af_inet_bridge()
+
+fn cheng_host_af_inet6(): int32 =
+    return raw_native_af_inet6_bridge()
+
+fn cheng_host_sockaddr_use_len_field(): bool =
+    return raw_native_sockaddr_use_len_field_bridge() != 0
+
+fn cheng_host_copy_cstring_from_str(text: str): ptr =
+    let n: int32 = len(text)
+    let out: ptr = raw_libc_malloc(int64(n + 1))
+    if out == nil:
+        return nil
+    cheng_host_bytes_set(out, 0, n + 1)
+    for i in 0..<n:
+        *(UInt8Ptr(cheng_host_ptr_plus(out, i))) = uint8(int32(text[i]) & 255)
+    return out
+
+fn cheng_host_sockaddr_ipv4_from_raw(port: int32, rawAddr: ptr): ptr =
+    let addr = raw_libc_malloc(chengHostSockaddrInLen)
+    if addr == nil:
+        return nil
+    cheng_host_bytes_set(addr, 0, chengHostSockaddrInLen)
+    let family = cheng_host_af_inet()
+    if cheng_host_sockaddr_use_len_field():
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 0))) = uint8(chengHostSockaddrInLen)
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 1))) = uint8(family & 255)
+    else:
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 0))) = uint8(family & 255)
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 1))) = uint8((family >> 8) & 255)
+    *(UInt8Ptr(cheng_host_ptr_plus(addr, 2))) = uint8((port >> 8) & 255)
+    *(UInt8Ptr(cheng_host_ptr_plus(addr, 3))) = uint8(port & 255)
+    if rawAddr != nil:
+        cheng_host_bytes_copy(cheng_host_ptr_plus(addr, 4), rawAddr, 4)
+    return addr
+
+fn cheng_host_sockaddr_ipv6_from_raw(port: int32, rawAddr: ptr): ptr =
+    let addr = raw_libc_malloc(chengHostSockaddrIn6Len)
+    if addr == nil:
+        return nil
+    cheng_host_bytes_set(addr, 0, chengHostSockaddrIn6Len)
+    let family = cheng_host_af_inet6()
+    if cheng_host_sockaddr_use_len_field():
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 0))) = uint8(chengHostSockaddrIn6Len)
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 1))) = uint8(family & 255)
+    else:
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 0))) = uint8(family & 255)
+        *(UInt8Ptr(cheng_host_ptr_plus(addr, 1))) = uint8((family >> 8) & 255)
+    *(UInt8Ptr(cheng_host_ptr_plus(addr, 2))) = uint8((port >> 8) & 255)
+    *(UInt8Ptr(cheng_host_ptr_plus(addr, 3))) = uint8(port & 255)
+    if rawAddr != nil:
+        cheng_host_bytes_copy(cheng_host_ptr_plus(addr, 8), rawAddr, 16)
+    return addr
+
+fn cheng_host_tcp_connect_first_resolved(entry: HostEntPtr, port: int32): int32 =
+    if entry == nil || entry->h_addr_list == nil:
+        return -1
+    let family: int32 = entry->h_addrtype
+    let rawLen: int32 = entry->h_length
+    var idx: int32 = 0
+    while true:
+        let slot: ptr = cheng_host_ptr_plus(entry->h_addr_list, idx * int32(sizeof ptr))
+        if slot == nil:
+            return -1
+        let rawAddr: ptr = *(VoidPtrPtr(slot))
+        if rawAddr == nil:
+            return -1
+        var sockaddrLen: int32 = 0
+        var sockaddrRaw: ptr = nil
+        if family == cheng_host_af_inet() && rawLen >= 4:
+            sockaddrRaw = cheng_host_sockaddr_ipv4_from_raw(port, rawAddr)
+            sockaddrLen = chengHostSockaddrInLen
+        elif family == cheng_host_af_inet6() && rawLen >= 16:
+            sockaddrRaw = cheng_host_sockaddr_ipv6_from_raw(port, rawAddr)
+            sockaddrLen = chengHostSockaddrIn6Len
+        if sockaddrRaw != nil:
+            let fd: int32 = raw_libc_socket(family, chengHostSockStream, 0)
+            if fd >= 0:
+                if raw_libc_connect(fd, sockaddrRaw, sockaddrLen) == 0:
+                    raw_libc_free(sockaddrRaw)
+                    return fd
+                cheng_host_close_fd_if_valid(fd)
+            raw_libc_free(sockaddrRaw)
+        idx = idx + 1
+    return -1
 
 fn chengProgramSupportHostRuntimeReady(): int32 =
     return 1
@@ -470,6 +575,28 @@ fn cheng_host_inet_ntop_export(family: int32, src: ptr, dst: ptr, size: int32): 
 @exportc("cheng_host_close")
 fn cheng_host_close_export(fd: int32): int32 =
     return raw_libc_close(fd)
+
+@exportc("cheng_v3_tcp_connect_host_port_bridge")
+fn cheng_v3_tcp_connect_host_port_bridge_export(host: str, port: int32): int32 =
+    if port <= 0 || port > 65535:
+        return -22
+    let hostText: ptr = cheng_host_copy_cstring_from_str(host)
+    if hostText == nil:
+        return -12
+    let v4Ent: HostEntPtr = HostEntPtr(raw_libc_gethostbyname2(hostText, cheng_host_af_inet()))
+    if v4Ent != nil:
+        let fd: int32 = cheng_host_tcp_connect_first_resolved(v4Ent, port)
+        if fd >= 0:
+            raw_libc_free(hostText)
+            return fd
+    let v6Ent: HostEntPtr = HostEntPtr(raw_libc_gethostbyname2(hostText, cheng_host_af_inet6()))
+    if v6Ent != nil:
+        let fd: int32 = cheng_host_tcp_connect_first_resolved(v6Ent, port)
+        if fd >= 0:
+            raw_libc_free(hostText)
+            return fd
+    raw_libc_free(hostText)
+    return -1
 
 @exportc("cheng_host_execvp")
 fn cheng_host_execvp_export(file: ptr, argv: ptr): int32 =

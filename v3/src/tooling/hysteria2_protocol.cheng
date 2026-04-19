@@ -392,15 +392,28 @@ fn v3Hysteria2FragmentUdpMessage(msg: V3Hysteria2UdpMessage,
         idx = idx + 1
     return Ok[V3Hysteria2UdpMessage[]](out)
 
-fn v3Hysteria2ReassembleUdpMessages(fragments: V3Hysteria2UdpMessage[]): Result[V3Hysteria2UdpMessage] =
+fn v3Hysteria2UdpMessageAssign(out: var V3Hysteria2UdpMessage,
+                               msg: V3Hysteria2UdpMessage) =
+    out.sessionId = msg.sessionId
+    out.packetId = msg.packetId
+    out.fragmentId = msg.fragmentId
+    out.fragmentCount = msg.fragmentCount
+    out.address = msg.address
+    out.payload = msg.payload
+
+fn V3Hysteria2ReassembleUdpMessagesFill(fragments: V3Hysteria2UdpMessage[],
+                                        out: var V3Hysteria2UdpMessage): Result[bool] =
     if fragments.len <= 0:
-        return Err[V3Hysteria2UdpMessage]("hysteria2: fragments missing")
+        return Err[bool]("hysteria2: fragments missing")
     let first: V3Hysteria2UdpMessage = fragments[0]
     if first.fragmentCount <= 0:
-        return Err[V3Hysteria2UdpMessage]("hysteria2: fragment count invalid")
+        return Err[bool]("hysteria2: fragment count invalid")
     if fragments.len != first.fragmentCount:
-        return Err[V3Hysteria2UdpMessage]("hysteria2: fragment count mismatch")
-    var assembled: Bytes = emptyBytes()
+        return Err[bool]("hysteria2: fragment count mismatch")
+    v3Hysteria2UdpMessageAssign(out, first)
+    out.fragmentId = 0
+    out.fragmentCount = 1
+    out.payload = emptyBytes()
     for idx in 0..<first.fragmentCount:
         var found: bool = false
         for j in 0..<fragments.len:
@@ -409,17 +422,20 @@ fn v3Hysteria2ReassembleUdpMessages(fragments: V3Hysteria2UdpMessage[]): Result[
                item.packetId != first.packetId ||
                item.fragmentCount != first.fragmentCount ||
                item.address != first.address:
-                return Err[V3Hysteria2UdpMessage]("hysteria2: fragment metadata mismatch")
+                return Err[bool]("hysteria2: fragment metadata mismatch")
             if item.fragmentId == idx:
-                v3Hysteria2BytesAppend(assembled, item.payload)
+                out.payload = bytesConcat(out.payload, item.payload)
                 found = true
                 break
         if !found:
-            return Err[V3Hysteria2UdpMessage]("hysteria2: fragment missing")
-    var out: V3Hysteria2UdpMessage = first
-    out.fragmentId = 0
-    out.fragmentCount = 1
-    out.payload = assembled
+            return Err[bool]("hysteria2: fragment missing")
+    return Ok[bool](true)
+
+fn v3Hysteria2ReassembleUdpMessages(fragments: V3Hysteria2UdpMessage[]): Result[V3Hysteria2UdpMessage] =
+    var out: V3Hysteria2UdpMessage
+    let fillRes = V3Hysteria2ReassembleUdpMessagesFill(fragments, out)
+    if IsErr(fillRes):
+        return Err[V3Hysteria2UdpMessage](Error(fillRes))
     return Ok[V3Hysteria2UdpMessage](out)
 
 fn V3Hysteria2MakeAuthRequest(authority: str,

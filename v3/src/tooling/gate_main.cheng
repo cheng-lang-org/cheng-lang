@@ -107,9 +107,15 @@ fn v3GateRoot(): str =
         rootDir = envRoot
     return rootDir
 
+fn v3GateJoin2(a: str, b: str): str =
+    return a + b
+
+fn v3GateJoin3(a: str, b: str, c: str): str =
+    return a + b + c
+
 fn v3GateVerifyExportVisibility(root: str): int32 =
     var report = ""
-    let ok: bool = frontend.Stage1VerifyExportVisibility(root, report)
+    let ok: bool = frontend.stage1VerifyExportVisibilityCompat(root, report)
     let trimmed: str = strutil.Strip(report)
     if len(trimmed) > 0:
         if ok:
@@ -402,9 +408,10 @@ fn v3GateBootstrapMaterializeStage0(root: str,
         return false
     if compilerPath == snapshot.stage0Compiler.path &&
        contracts.v3BootstrapArtifactReady(snapshot.stage0Compiler):
+        let reusedText: str = v3GateJoin3("stage0_reused_from=", compilerPath, "\n")
         return v3path.V3WriteTextFile(root,
                                       "artifacts/v3_bootstrap/cheng.stage0.build.log",
-                                      "stage0_reused_from=" + compilerPath + "\n")
+                                      reusedText)
     let copyRun = hostops.v3RunProgramLogged(root,
                                              "bootstrap_stage0_copy",
                                              "cp",
@@ -427,9 +434,10 @@ fn v3GateBootstrapMaterializeStage0(root: str,
         return false
     if !contracts.v3BootstrapArtifactReady(snapshot.stage0Compiler):
         return false
+    let materializedText: str = v3GateJoin3("stage0_materialized_from=", compilerPath, "\n")
     return v3path.V3WriteTextFile(root,
                                   "artifacts/v3_bootstrap/cheng.stage0.build.log",
-                                  "stage0_materialized_from=" + compilerPath + "\n")
+                                  materializedText)
 
 fn v3GateBootstrapBridge(root: str): int32 =
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
@@ -563,20 +571,13 @@ fn v3GateBuildBackendDriver(root: str): int32 =
     let outDir: str = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver")
     let packageRoot: str = v3path.V3PathAbsolute(root, "v3")
     let compilerEntrySource: str = contracts.v3BootstrapBackendDriverEntrySourcePath(root)
-    let compileReportPath: str =
-        v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt")
-    let compileLogPath: str =
-        "artifacts/v3_backend_driver/build_backend_driver_v3.log"
-    let statusLogPath: str =
-        "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt"
-    let verifyExportLogPath: str =
-        "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility.txt"
-    let verifyExportParallelLogPath: str =
-        "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility_parallel.txt"
-    let planLogPath: str =
-        "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt"
-    let referencePlanLogPath: str =
-        "artifacts/v3_backend_driver/reference_stage3.plan.txt"
+    let compileReportPath: str = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/build_backend_driver_v3.compile.report.txt")
+    let compileLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.log"
+    let statusLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.status.txt"
+    let verifyExportLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility.txt"
+    let verifyExportParallelLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.verify_export_visibility_parallel.txt"
+    let planLogPath: str = "artifacts/v3_backend_driver/build_backend_driver_v3.plan.txt"
+    let referencePlanLogPath: str = "artifacts/v3_backend_driver/reference_stage3.plan.txt"
     let smokeSource: str = v3path.V3PathAbsolute(root, "v3/src/tests/ordinary_zero_exit_fixture.cheng")
     let smokeOut: str = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/ordinary_zero_exit_fixture.selftest")
     let smokeCompileReportPath: str = smokeOut + ".report.txt"
@@ -805,7 +806,8 @@ fn v3GateRunSmokes(root: str): int32 =
             v3GatePrintErr("v3 gate: missing bootstrap compiler: " + binPath)
             return 1
         let binParts: os.SplitFileResult = os.SplitFile(binPath)
-        let logPath: str = v3path.V3PathAbsolute(root, "artifacts/v3_gate/" + binParts.name + ".self-check.log")
+        let logRelPath: str = v3GateJoin3("artifacts/v3_gate/", binParts.name, ".self-check.log")
+        let logPath: str = v3path.V3PathAbsolute(root, logRelPath)
         var args: str[] = []
         add(args, "self-check")
         add(args, "--in:" + stage1Source)
@@ -898,11 +900,12 @@ fn v3GateCompileEmitEnv(root: str,
     if len(logParts.dir) > 0:
         let _ = v3path.V3MkdirP(root, logParts.dir)
     if v3GateEnsureCompilerReady(root, compilerPath, compilerAbs) != 0:
+        let missingText: str = v3GateJoin3("v3 gate: compiler missing during compile: ", compilerAbs, "\n")
         return hostops.v3LoggedRunZero(label,
                                        compilerAbs,
                                        logAbs,
                                        1,
-                                       "v3 gate: compiler missing during compile: " + compilerAbs + "\n")
+                                       missingText)
     let timeoutText = os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
     let timeoutSec = int32(strutil.ParseInt(timeoutText))
     let run = hostops.v3RunFileLogged(root,
@@ -971,11 +974,12 @@ fn v3GateCompileExeEnvAtRoot(root: str,
     if len(logParts.dir) > 0:
         let _ = v3path.V3MkdirP(root, logParts.dir)
     if v3GateEnsureCompilerReady(root, compilerPath, compilerAbs) != 0:
+        let missingText: str = v3GateJoin3("v3 gate: compiler missing during compile: ", compilerAbs, "\n")
         return hostops.v3LoggedRunZero(label,
                                        compilerAbs,
                                        logAbs,
                                        1,
-                                       "v3 gate: compiler missing during compile: " + compilerAbs + "\n")
+                                       missingText)
     let timeoutText = os.GetEnvDefault("CHENG_V3_COMPILE_TIMEOUT_SEC", "300")
     let timeoutSec = int32(strutil.ParseInt(timeoutText))
     let run = hostops.v3RunFileLogged(root,
@@ -1260,11 +1264,12 @@ fn v3GateRunRemoteShellLogged(root: str,
     let localScript = v3GateRemoteScriptLocalPath(root, logPath)
     let scriptText = "#!/bin/sh\n" + command + "\n"
     if !v3path.V3WriteTextFile(root, localScript, scriptText):
+        let writeFailText: str = v3GateJoin3("v3 gate: remote script write failed: ", localScript, "\n")
         return hostops.v3LoggedRunZero(label,
                                        "ssh",
                                        v3path.V3PathAbsolute(root, logPath),
                                        1,
-                                       "v3 gate: remote script write failed: " + localScript + "\n")
+                                       writeFailText)
     var lastRun = hostops.v3LoggedRunZero(label, "ssh", logPath, 255, "")
     for attempt in 0..<3:
         let run = hostops.v3RunProgramLoggedWithInputText(root,
@@ -1318,11 +1323,11 @@ fn v3GateBftBuildReady(root: str,
     if runSelfTest != "0":
         if !os.FileExists(runLog):
             return false
-        command = command +
-                  " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
-                  " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
-                  " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
-                  " && grep -q " + os.QuoteShell("v3 bft_state_machine self-test ok") + " " + os.QuoteShell(runLog)
+        command = command + " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog)
+        command = command + " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog)
+        command = command + " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog)
+        command = command + " && grep -q " + os.QuoteShell("v3 bft_state_machine self-test ok")
+        command = command + " " + os.QuoteShell(runLog)
     return v3GateShellCheckOk(root, command)
 
 fn v3GateBftThreeNodeConfig(root: str): V3BftThreeNodeDeploy =
@@ -1330,37 +1335,31 @@ fn v3GateBftThreeNodeConfig(root: str): V3BftThreeNodeDeploy =
     var remoteDeployRel = ""
     deployRel = os.GetEnvDefault("CHENG_V3_BFT_DEPLOY_DIR", "artifacts/v3_bft_validator_deploy")
     remoteDeployRel = os.GetEnvDefault("CHENG_V3_BFT_REMOTE_DEPLOY_REL", "artifacts/v3_bft_validator_deploy")
-    return V3BftThreeNodeDeploy(
-        appId: os.GetEnvDefault("CHENG_V3_BFT_APP_ID", "cheng-bft-live-20260415"),
-        serverSsh: os.GetEnvDefault("CHENG_V3_BFT_SERVER_SSH", "root@64.176.84.12"),
-        relaySsh: os.GetEnvDefault("CHENG_V3_BFT_RELAY_SSH", "dmit"),
-        serverAddress: os.GetEnvDefault("CHENG_V3_BFT_SERVER_ADDR", "64.176.84.12"),
-        serverRepoRoot: os.GetEnvDefault("CHENG_V3_BFT_SERVER_ROOT", "/root/cheng-lang-deploy"),
-        relayRepoRoot: os.GetEnvDefault("CHENG_V3_BFT_RELAY_ROOT", "/root/cheng-lang-deploy"),
-        localDeployDir: v3path.V3PathAbsolute(root, deployRel),
-        remoteDeployRel: remoteDeployRel,
-        proposalPort: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSAL_PORT", "42061"))),
-        commitPort: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_COMMIT_PORT", "42062"))),
-        votePort: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_VOTE_PORT", "42063"))),
-        statePort: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_STATE_PORT", "42064"))),
-        proposerIntervalMs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSER_INTERVAL_MS",
-                                                                    "20"))),
-        followerIntervalMs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_FOLLOWER_INTERVAL_MS",
-                                                                    "20"))),
-        proposalWindowMs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSAL_WINDOW_MS",
-                                                                  "1000"))),
-        voteWindowMs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_VOTE_WINDOW_MS",
-                                                              "1000"))),
-        commitWindowMs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_COMMIT_WINDOW_MS",
-                                                                "1000"))),
-        defaultMaxTxs: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_DEFAULT_MAX_TXS",
-                                                               "128"))),
-        assetId: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_ASSET_ID", "7"))),
-        aliceId: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_ALICE_ID", "1001"))),
-        bobId: int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_BOB_ID", "2002"))),
-        mintAmount: int64(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_MINT_AMOUNT", "100"))),
-        transferAmount: int64(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_TRANSFER_AMOUNT", "33")))
-    )
+    var out: V3BftThreeNodeDeploy
+    out.appId = os.GetEnvDefault("CHENG_V3_BFT_APP_ID", "cheng-bft-live-20260415")
+    out.serverSsh = os.GetEnvDefault("CHENG_V3_BFT_SERVER_SSH", "root@64.176.84.12")
+    out.relaySsh = os.GetEnvDefault("CHENG_V3_BFT_RELAY_SSH", "dmit")
+    out.serverAddress = os.GetEnvDefault("CHENG_V3_BFT_SERVER_ADDR", "64.176.84.12")
+    out.serverRepoRoot = os.GetEnvDefault("CHENG_V3_BFT_SERVER_ROOT", "/root/cheng-lang-deploy")
+    out.relayRepoRoot = os.GetEnvDefault("CHENG_V3_BFT_RELAY_ROOT", "/root/cheng-lang-deploy")
+    out.localDeployDir = v3path.V3PathAbsolute(root, deployRel)
+    out.remoteDeployRel = remoteDeployRel
+    out.proposalPort = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSAL_PORT", "42061")))
+    out.commitPort = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_COMMIT_PORT", "42062")))
+    out.votePort = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_VOTE_PORT", "42063")))
+    out.statePort = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_STATE_PORT", "42064")))
+    out.proposerIntervalMs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSER_INTERVAL_MS", "20")))
+    out.followerIntervalMs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_FOLLOWER_INTERVAL_MS", "20")))
+    out.proposalWindowMs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_PROPOSAL_WINDOW_MS", "1000")))
+    out.voteWindowMs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_VOTE_WINDOW_MS", "1000")))
+    out.commitWindowMs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_COMMIT_WINDOW_MS", "1000")))
+    out.defaultMaxTxs = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_DEFAULT_MAX_TXS", "128")))
+    out.assetId = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_ASSET_ID", "7")))
+    out.aliceId = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_ALICE_ID", "1001")))
+    out.bobId = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_BOB_ID", "2002")))
+    out.mintAmount = int64(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_MINT_AMOUNT", "100")))
+    out.transferAmount = int64(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_BFT_TRANSFER_AMOUNT", "33")))
+    return out
 
 fn v3GateBftManifestPath(cfg: V3BftThreeNodeDeploy): str =
     return os.JoinPath(cfg.localDeployDir, "deploy.env")
@@ -1394,15 +1393,17 @@ fn v3GateBftRemoteBuildReadyCommand(repoRoot: str): str =
     let src = os.JoinPath(repoRoot, "v3/src/project/bft_state_machine_main.cheng")
     let outBin = v3GateBftRemoteBin(repoRoot)
     let runLog = v3GateBftRemoteRunLog(repoRoot)
-    return "test -x " + os.QuoteShell(outBin) +
-           " && test -x " + os.QuoteShell(compiler) +
-           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin) +
-           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin) +
-           " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog) +
-           " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog) +
-           " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog) +
-           " && grep -qF " + os.QuoteShell("v3 bft_state_machine self-test ok") +
-           " " + os.QuoteShell(runLog)
+    var command = ""
+    command = command + "test -x " + os.QuoteShell(outBin)
+    command = command + " && test -x " + os.QuoteShell(compiler)
+    command = command + " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(outBin)
+    command = command + " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(outBin)
+    command = command + " && test " + os.QuoteShell(outBin) + " -ot " + os.QuoteShell(runLog)
+    command = command + " && test " + os.QuoteShell(compiler) + " -ot " + os.QuoteShell(runLog)
+    command = command + " && test " + os.QuoteShell(src) + " -ot " + os.QuoteShell(runLog)
+    command = command + " && grep -qF " + os.QuoteShell("v3 bft_state_machine self-test ok")
+    command = command + " " + os.QuoteShell(runLog)
+    return command
 
 fn v3GateBftRemoteStage3FreshCommand(repoRoot: str): str =
     let stage3 = v3GateBftRemoteStage3(repoRoot)
@@ -3335,6 +3336,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "vpn_proxy_main_hysteria2_smoke",
         "vpn_proxy_hysteria2_session_smoke",
         "vpn_proxy_hysteria2_tcp_stream_smoke",
+        "vpn_proxy_udp_fragment_guard_smoke",
         "vpn_proxy_tcp_control_bytes_smoke",
         "vpn_proxy_end_to_end_smoke",
         "vpn_proxy_routing_smoke",
@@ -3451,7 +3453,10 @@ fn v3GateDefaultHostSmokes(): str[] =
         "udp_importc_smoke",
         "mobile_bridge_smoke",
         "mobile_sdk_smoke",
-        "did_identity_smoke"
+        "did_identity_smoke",
+        "unimaker_edge_agent_smoke",
+        "unimaker_edge_agent_sync_smoke",
+        "unimaker_edge_agent_recovery_smoke"
     ]
 
 fn v3GateDefaultStage23Smokes(): str[] =

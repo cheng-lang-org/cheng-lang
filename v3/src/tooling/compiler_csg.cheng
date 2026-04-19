@@ -494,9 +494,11 @@ fn v3TypedExprFactsForSource(facts: V3TypedExprFact[],
         add(out, v3CompilerCsgCloneTypedExprFact(facts[i]))
     return out
 
-fn v3CompilerCsgTypedSourceText(sourcePath: str,
+fn v3CompilerCsgTypedSourceText(workspaceRoot: str,
+                                packageRoot: str,
+                                sourcePath: str,
                                 text: str): V3TypedExprSourceText =
-    return texpr.v3TypedExprSourceTextNew(sourcePath, text)
+    return texpr.v3TypedExprSourceTextNew(workspaceRoot, packageRoot, sourcePath, text)
 
 fn v3CompilerCsgBuildTypedExprFacts(sourceTexts: V3TypedExprSourceText[],
                                     exprLayer: parser.V3NormalizedExprLayer,
@@ -1224,6 +1226,8 @@ fn v3CompilerCsgAddUniqueImportEdge(edges: var parser.V3ImportEdge[],
             continue
         if edges[i].targetModulePath != edge.targetModulePath:
             continue
+        if edges[i].importAlias != edge.importAlias:
+            continue
         return
     add(edges, edge)
 
@@ -1521,10 +1525,18 @@ fn v3CompilerCsgAddEdge(edges: var V3CompilerCsgEdge[],
 
 fn v3CompilerCsgExprLayerForText(sourcePath: str,
                                  text: str,
-                                 knownCallNames: str[],
+                                 importcCallNames: str[],
+                                 localCallNames: str[],
+                                 externalCallNames: str[],
                                  layer: var parser.V3NormalizedExprLayer): Result[bool] =
     var err: str = ""
-    if !parser.v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePath, text, knownCallNames, layer, err):
+    if !parser.v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePath,
+                                                                     text,
+                                                                     importcCallNames,
+                                                                     localCallNames,
+                                                                     externalCallNames,
+                                                                     layer,
+                                                                     err):
         return Err[bool]("v3 compiler csg: expr layer read failed")
     return Ok[bool](true)
 
@@ -1620,23 +1632,10 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         v3CompilerCsgAddEdge(edges, fromNodeId, toNodeId, v3CompilerCsgEdgeKindImports)
     var orderedSources: str[] = []
     var typedSourceTexts: V3TypedExprSourceText[] = []
+    var exprCallProfiles: parser.V3NormalizedExprCallProfile[] = []
     for i in 0..<linkPlan.sourceClosurePaths.len:
         add(orderedSources, linkPlan.sourceClosurePaths[i])
     v3CompilerCsgSortStrs(orderedSources)
-    var knownCallNames: str[] = []
-    for sourceIndex in 0..<orderedSources.len:
-        let sourcePath = orderedSources[sourceIndex]
-        var sourceText = ""
-        if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, sourceText):
-            sourceText = v3path.V3ReadTextFile("", sourcePath)
-        var decls: parser.V3NormalizedFunctionDecl[] = []
-        var declErr = ""
-        if !parser.v3ParserReadNormalizedFunctionDecls(sourceText, decls, declErr):
-            return Err[V3CompilerCsg]("v3 compiler csg: normalized decl read failed")
-        var sourceKnownCalls: str[] = []
-        parser.v3ParserKnownCallNamesFromDecls(decls, sourceKnownCalls)
-        for callIndex in 0..<sourceKnownCalls.len:
-            v3CompilerCsgAddUnique(knownCallNames, sourceKnownCalls[callIndex])
     for sourceIndex in 0..<orderedSources.len:
         let sourcePath = orderedSources[sourceIndex]
         let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
@@ -1649,16 +1648,44 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         var text = ""
         if !v3CompilerCsgSourceTextLookup(sourceTextOverrides, sourcePath, text):
             text = v3path.V3ReadTextFile("", sourcePath)
-        add(typedSourceTexts, v3CompilerCsgTypedSourceText(sourcePath, text))
+        add(typedSourceTexts, v3CompilerCsgTypedSourceText(linkPlan.workspaceRoot,
+                                                          linkPlan.packageRoot,
+                                                          sourcePath,
+                                                          text))
+        var profile: parser.V3NormalizedExprCallProfile
+        var profileErr = ""
+        if !parser.v3ParserBuildExprCallProfile(linkPlan.workspaceRoot,
+                                                linkPlan.packageRoot,
+                                                sourcePath,
+                                                text,
+                                                profile,
+                                                profileErr):
+            return Err[V3CompilerCsg]("v3 compiler csg: normalized decl read failed")
+        add(exprCallProfiles, profile)
+    for sourceIndex in 0..<exprCallProfiles.len:
+        let profile = exprCallProfiles[sourceIndex]
+        let sourcePath = profile.sourcePath
+        let text = profile.text
+        let decls = profile.decls
+        let ownerModulePath = v3CompilerCsgSourceModulePath(linkPlan.workspaceRoot,
+                                                            linkPlan.packageRoot,
+                                                            sourceTextOverrides,
+                                                            sourcePath)
+        let ownerModuleNodeId = v3CompilerCsgModuleNodeId(nodes, ownerModulePath)
+        if ownerModuleNodeId <= 0:
+            continue
+        var sourceExternalCalls: str[] = []
+        parser.v3ParserCollectExternalCallNames(exprCallProfiles, sourceIndex, sourceExternalCalls)
         var sourceExprLayer = parser.v3NormalizedExprLayerZero()
-        let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath, text, knownCallNames, sourceExprLayer)
+        let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath,
+                                                          text,
+                                                          profile.importcCallNames,
+                                                          profile.localCallNames,
+                                                          sourceExternalCalls,
+                                                          sourceExprLayer)
         if IsErr(sourceExprRes):
             return Err[V3CompilerCsg](Error(sourceExprRes))
         parser.v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
-        var decls: parser.V3NormalizedFunctionDecl[] = []
-        var declErr = ""
-        if !parser.v3ParserReadNormalizedFunctionDecls(text, decls, declErr):
-            return Err[V3CompilerCsg]("v3 compiler csg: normalized decl read failed")
         let entrySourceFlag = sourcePath == linkPlan.entryPath
         var entryHasExplicitExports = false
         if entrySourceFlag && (linkPlan.emitKind == creq.v3EmitShared || linkPlan.emitKind == creq.v3EmitObj):

@@ -63,6 +63,9 @@ type
         sessionId: int64
         packetId: int32
         address: str
+        firstSeenMs: int64
+        lastSeenMs: int64
+        payloadBytes: int32
         fragments: V3Hysteria2UdpMessage[]
 
     V3VpnProxyUdpSocketPair =
@@ -92,6 +95,8 @@ const
     v3VpnProxyHy2UdpSessionId = 1
     v3VpnProxyUdpRelayChunkBytes = 65535
     v3VpnProxyUdpRelaySleepMs = 10
+    v3VpnProxyUdpFragExpiryMs = 30000
+    v3VpnProxyUdpFragMaxPendingPackets = 64
 
 fn v3VpnProxyPrintLine(text: str) =
     os.WriteLine(os.Get_stdout(), text)
@@ -160,6 +165,17 @@ fn v3VpnProxyUdpPacketNext(nextId: var int32): int32 =
         nextId = 0
     return out
 
+fn v3VpnProxyUdpFragSweepExpired(states: var V3VpnProxyUdpFragState[],
+                                 nowMs: int64) =
+    var kept: V3VpnProxyUdpFragState[] = []
+    for i in 0..<states.len:
+        let state = states[i]
+        if state.lastSeenMs <= 0:
+            continue
+        if nowMs - state.lastSeenMs < int64(v3VpnProxyUdpFragExpiryMs):
+            add(kept, state)
+    states = kept
+
 fn v3VpnProxyUdpFragStatesRemove(states: var V3VpnProxyUdpFragState[],
                                  dropIdx: int32) =
     var kept: V3VpnProxyUdpFragState[] = []
@@ -168,14 +184,30 @@ fn v3VpnProxyUdpFragStatesRemove(states: var V3VpnProxyUdpFragState[],
             add(kept, states[i])
     states = kept
 
-fn v3VpnProxyUdpFragFeed(states: var V3VpnProxyUdpFragState[],
-                         msg: V3Hysteria2UdpMessage,
-                         out: var V3Hysteria2UdpMessage): Result[bool] =
+fn v3VpnProxyUdpMessageAssign(out: var V3Hysteria2UdpMessage,
+                              msg: V3Hysteria2UdpMessage) =
+    out.sessionId = msg.sessionId
+    out.packetId = msg.packetId
+    out.fragmentId = msg.fragmentId
+    out.fragmentCount = msg.fragmentCount
+    out.address = msg.address
+    out.payload = msg.payload
+
+fn v3VpnProxyUdpFragFeedAt(states: var V3VpnProxyUdpFragState[],
+                           msg: V3Hysteria2UdpMessage,
+                           nowMs: int64,
+                           out: var V3Hysteria2UdpMessage): Result[bool] =
     if msg.fragmentCount <= 1:
-        out = msg
+        v3VpnProxyUdpMessageAssign(out, msg)
         return Ok[bool](true)
     if msg.fragmentId < 0 || msg.fragmentId >= msg.fragmentCount:
         return Err[bool]("vpn proxy: udp fragment invalid")
+    v3VpnProxyUdpFragSweepExpired(states, nowMs)
+    let msgBytes: int32 = bytesLen(msg.payload)
+    if msgBytes < 0:
+        return Err[bool]("vpn proxy: udp fragment payload invalid")
+    if msgBytes > v3VpnProxyUdpRelayChunkBytes:
+        return Err[bool]("vpn proxy: udp fragment payload too large")
     var stateIdx: int32 = -1
     for i in 0..<states.len:
         if states[i].sessionId == msg.sessionId &&
@@ -184,15 +216,21 @@ fn v3VpnProxyUdpFragFeed(states: var V3VpnProxyUdpFragState[],
             stateIdx = i
             break
     if stateIdx < 0:
+        if states.len >= v3VpnProxyUdpFragMaxPendingPackets:
+            return Err[bool]("vpn proxy: udp fragment state overflow")
         var state: V3VpnProxyUdpFragState
         state.sessionId = msg.sessionId
         state.packetId = msg.packetId
         state.address = msg.address
+        state.firstSeenMs = nowMs
+        state.lastSeenMs = nowMs
+        state.payloadBytes = msgBytes
         add(state.fragments, msg)
         add(states, state)
         return Ok[bool](false)
-    for i in 0..<states[stateIdx].fragments.len:
-        let item: V3Hysteria2UdpMessage = states[stateIdx].fragments[i]
+    var state = states[stateIdx]
+    for i in 0..<state.fragments.len:
+        let item: V3Hysteria2UdpMessage = state.fragments[i]
         if item.fragmentCount != msg.fragmentCount:
             return Err[bool]("vpn proxy: udp fragment count mismatch")
         if item.fragmentId == msg.fragmentId:
@@ -201,15 +239,26 @@ fn v3VpnProxyUdpFragFeed(states: var V3VpnProxyUdpFragState[],
            item.packetId != msg.packetId ||
            item.address != msg.address:
             return Err[bool]("vpn proxy: udp fragment metadata mismatch")
-    add(states[stateIdx].fragments, msg)
-    if states[stateIdx].fragments.len != msg.fragmentCount:
+    if state.payloadBytes + msgBytes > v3VpnProxyUdpRelayChunkBytes:
+        return Err[bool]("vpn proxy: udp fragment payload exceeds datagram limit")
+    var nextFragments = state.fragments
+    add(nextFragments, msg)
+    state.fragments = nextFragments
+    state.lastSeenMs = nowMs
+    state.payloadBytes = state.payloadBytes + msgBytes
+    if state.fragments.len != msg.fragmentCount:
+        states[stateIdx] = state
         return Ok[bool](false)
-    let fullRes: Result[V3Hysteria2UdpMessage] = hy2.V3Hysteria2ReassembleUdpMessages(states[stateIdx].fragments)
-    if IsErr(fullRes):
-        return Err[bool](ErrorText(fullRes))
-    out = Value(fullRes)
+    let fillRes = hy2.V3Hysteria2ReassembleUdpMessagesFill(state.fragments, out)
+    if IsErr(fillRes):
+        return Err[bool](Error(fillRes))
     v3VpnProxyUdpFragStatesRemove(states, stateIdx)
     return Ok[bool](true)
+
+fn v3VpnProxyUdpFragFeed(states: var V3VpnProxyUdpFragState[],
+                         msg: V3Hysteria2UdpMessage,
+                         out: var V3Hysteria2UdpMessage): Result[bool] =
+    return v3VpnProxyUdpFragFeedAt(states, msg, v3VpnProxyMonoNowMs(), out)
 
 fn v3VpnProxyUdpLiteralTarget(target: V3VpnProxyTarget,
                               family: int32,

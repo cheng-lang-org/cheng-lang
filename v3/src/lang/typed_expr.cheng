@@ -79,6 +79,8 @@ type
         ruleKey: str
 
     V3TypedExprSourceText =
+        workspaceRoot: str
+        packageRoot: str
         sourcePath: str
         text: str
 
@@ -102,12 +104,17 @@ type
         name: str
         returnType: str
 
+    V3TypedExprImportedModule =
+        qualifier: str
+        targetSourcePath: str
+
     V3TypedExprSourceContext =
         sourcePath: str
         lines: str[]
         scopes: V3TypedExprFunctionScope[]
         bindings: V3TypedExprBinding[]
         importcFunctions: V3TypedExprImportcFunction[]
+        importedModules: V3TypedExprImportedModule[]
 
     V3TypedExprSinkInfo =
         sinkType: str
@@ -594,9 +601,13 @@ fn v3TypedExprNormalizeTypeText(typeRaw: str): str =
         buffer.AppendBytes(out, piece)
     return rawbytes.bytesToString(buffer.ToBytes(out))
 
-fn v3TypedExprSourceTextNew(sourcePath: str,
+fn v3TypedExprSourceTextNew(workspaceRoot: str,
+                            packageRoot: str,
+                            sourcePath: str,
                             text: str): V3TypedExprSourceText =
     var out: V3TypedExprSourceText
+    out.workspaceRoot = parser.v3ParserNormalizePath(workspaceRoot)
+    out.packageRoot = parser.v3ParserNormalizePath(packageRoot)
     out.sourcePath = parser.v3ParserNormalizePath(sourcePath)
     out.text = text
     return out
@@ -973,6 +984,91 @@ fn v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts: V3TypedExprSou
             return found
     return ""
 
+fn v3TypedExprQualifiedCallDot(nameRaw: str): int32 =
+    let name = v3path.V3PathTrim(nameRaw)
+    var dotPos: int32 = -1
+    for i in 0..<name.len:
+        if name[i] == '.':
+            dotPos = i
+    return dotPos
+
+fn v3TypedExprQualifiedCallQualifier(nameRaw: str): str =
+    let name = v3path.V3PathTrim(nameRaw)
+    let dotPos = v3TypedExprQualifiedCallDot(name)
+    if dotPos <= 0:
+        return ""
+    return parser.v3ParserIdentPrefix(v3path.V3TextSlice(name, 0, dotPos))
+
+fn v3TypedExprQualifiedCallLeaf(nameRaw: str): str =
+    let name = v3path.V3PathTrim(nameRaw)
+    let dotPos = v3TypedExprQualifiedCallDot(name)
+    if dotPos < 0:
+        return parser.v3ParserIdentPrefix(name)
+    if dotPos + 1 >= name.len:
+        return ""
+    return parser.v3ParserIdentPrefix(v3path.V3TextSlice(name, dotPos + 1, name.len - dotPos - 1))
+
+fn v3TypedExprLookupLocalFunctionReturnType(ctx: V3TypedExprSourceContext,
+                                            nameRaw: str): str =
+    let name = parser.v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return ""
+    for i in 0..<ctx.scopes.len:
+        if ctx.scopes[i].name == name:
+            return ctx.scopes[i].returnType
+    return ""
+
+fn v3TypedExprLookupImportedModuleSourcePath(ctx: V3TypedExprSourceContext,
+                                             qualifierRaw: str): str =
+    let qualifier = parser.v3ParserIdentPrefix(v3path.V3PathTrim(qualifierRaw))
+    if qualifier == "":
+        return ""
+    for i in 0..<ctx.importedModules.len:
+        if ctx.importedModules[i].qualifier == qualifier:
+            return ctx.importedModules[i].targetSourcePath
+    return ""
+
+fn v3TypedExprLookupQualifiedExternalReturnType(currentCtx: V3TypedExprSourceContext,
+                                                sourceContexts: V3TypedExprSourceContext[],
+                                                nameRaw: str): str =
+    let qualifier = v3TypedExprQualifiedCallQualifier(nameRaw)
+    let functionName = v3TypedExprQualifiedCallLeaf(nameRaw)
+    if qualifier == "" || functionName == "":
+        return ""
+    let targetSourcePath = v3TypedExprLookupImportedModuleSourcePath(currentCtx, qualifier)
+    if targetSourcePath == "":
+        return ""
+    let targetIndex = v3TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
+    if targetIndex < 0:
+        return ""
+    let localReturnType = v3TypedExprLookupLocalFunctionReturnType(sourceContexts[targetIndex], functionName)
+    if localReturnType != "":
+        return localReturnType
+    return v3TypedExprLookupImportcReturnType(sourceContexts[targetIndex], functionName)
+
+fn v3TypedExprLookupExternalFunctionReturnTypeFromContexts(currentCtx: V3TypedExprSourceContext,
+                                                           sourceContexts: V3TypedExprSourceContext[],
+                                                           nameRaw: str): str =
+    let qualifiedReturnType = v3TypedExprLookupQualifiedExternalReturnType(currentCtx, sourceContexts, nameRaw)
+    if qualifiedReturnType != "":
+        return qualifiedReturnType
+    if v3TypedExprQualifiedCallQualifier(nameRaw) != "":
+        return ""
+    let sourcePath = currentCtx.sourcePath
+    let name = v3TypedExprQualifiedCallLeaf(nameRaw)
+    if name == "":
+        return ""
+    for i in 0..<sourceContexts.len:
+        if sourceContexts[i].sourcePath == sourcePath:
+            continue
+        let found = v3TypedExprLookupLocalFunctionReturnType(sourceContexts[i], name)
+        if found != "":
+            return found
+        let importcFound = v3TypedExprLookupImportcReturnType(sourceContexts[i], name)
+        if importcFound != "":
+            return importcFound
+    return ""
+
 fn v3TypedExprFirstExprColumnAfter(exprLayer: parser.V3NormalizedExprLayer,
                                    sourcePathRaw: str,
                                    lineNumber: int32,
@@ -1253,13 +1349,38 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         fact.placeKind = v3TypedExprPlaceCallResult
         return fact
     if expr.kind == parser.v3NormalizedExprCall:
-        let importReturnType = v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts, expr.surfaceText)
-        if importReturnType != "":
-            v3TypedExprApplyResolvedType(fact, importReturnType, sink, true)
-            if fact.abiClass == v3TypedExprAbiComposite:
-                fact.loweringMode = v3TypedExprLowerImportBuffer
-                fact.returnKind = v3TypedExprReturnImportBuffer
-            return fact
+        if expr.detail == "importc_call":
+            let importReturnType = v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts, expr.surfaceText)
+            if importReturnType != "":
+                v3TypedExprApplyResolvedType(fact, importReturnType, sink, true)
+                if fact.abiClass == v3TypedExprAbiComposite:
+                    fact.loweringMode = v3TypedExprLowerImportBuffer
+                    fact.returnKind = v3TypedExprReturnImportBuffer
+                return fact
+        elif expr.detail == "local_call":
+            let localReturnType = v3TypedExprLookupLocalFunctionReturnType(ctx, expr.surfaceText)
+            if localReturnType != "":
+                v3TypedExprApplyResolvedType(fact, localReturnType, sink, true)
+                return fact
+        elif expr.detail == "external_call":
+            let externalReturnType = v3TypedExprLookupExternalFunctionReturnTypeFromContexts(ctx,
+                                                                                             sourceContexts,
+                                                                                             expr.surfaceText)
+            if externalReturnType != "":
+                v3TypedExprApplyResolvedType(fact, externalReturnType, sink, true)
+                return fact
+        else:
+            let localReturnType = v3TypedExprLookupLocalFunctionReturnType(ctx, expr.surfaceText)
+            if localReturnType != "":
+                v3TypedExprApplyResolvedType(fact, localReturnType, sink, true)
+                return fact
+            let importReturnType = v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts, expr.surfaceText)
+            if importReturnType != "":
+                v3TypedExprApplyResolvedType(fact, importReturnType, sink, true)
+                if fact.abiClass == v3TypedExprAbiComposite:
+                    fact.loweringMode = v3TypedExprLowerImportBuffer
+                    fact.returnKind = v3TypedExprReturnImportBuffer
+                return fact
         fact.typeText = "call_expr"
         fact.placeKind = v3TypedExprPlaceCallResult
         return fact
@@ -1273,6 +1394,7 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
     ctx.scopes = []
     ctx.bindings = []
     ctx.importcFunctions = []
+    ctx.importedModules = []
     var decls: parser.V3NormalizedFunctionDecl[] = []
     if !parser.v3ParserReadNormalizedFunctionDecls(source.text, decls, err):
         return false
@@ -1323,6 +1445,28 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
                                        lineNumber,
                                        bindingName,
                                        bindingType)
+    if source.workspaceRoot != "" && source.packageRoot != "":
+        let ownerModulePath = parser.v3ParserSourcePathToModulePath(source.workspaceRoot,
+                                                                    source.packageRoot,
+                                                                    source.sourcePath)
+        var importEdges: parser.V3ImportEdge[] = []
+        if !parser.v3ParserReadImportEdges(source.workspaceRoot,
+                                           source.packageRoot,
+                                           ownerModulePath,
+                                           source.text,
+                                           importEdges,
+                                           err):
+            return false
+        for i in 0..<importEdges.len:
+            if !importEdges[i].resolved:
+                continue
+            let qualifier = parser.v3ParserImportEdgeQualifier(importEdges[i])
+            if qualifier == "":
+                continue
+            var importedModule: V3TypedExprImportedModule
+            importedModule.qualifier = qualifier
+            importedModule.targetSourcePath = parser.v3ParserNormalizePath(importEdges[i].targetSourcePath)
+            add(ctx.importedModules, importedModule)
     err = ""
     return true
 

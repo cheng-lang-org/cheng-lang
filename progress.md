@@ -65,5 +65,10 @@
 | `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule26`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule26`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule26` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
 | `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 新增 `v3NormalizedExprCall`，先只收同文件 `importc fn` 的 call expr，避免把整个调用面一起炸开。 |
 | `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 新增 importc 返回类型上下文，composite importc call 现在会真落成 `v3TypedExprLowerImportBuffer / v3TypedExprReturnImportBuffer`，不再只是枚举和报表口。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer` 标签下重新通过。 |
+| `2026-04-20` | 已完成 | importc `CallExpr` 的 parser 扫描已收回 importc-only 的 token 线性扫描，不再按所有名字逐行切片匹配；同时把会触发负索引的短路边界判断改回显式分支。 |
+| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer_parser` 和 `typed_import_buffer_csg` 标签下重新通过。 |
+| `2026-04-20` | 已完成 | `CallExpr` 已继续安全扩到“同文件 importc + 同文件 local function”；parser 仍然只按 per-source token 扫描识别 call，typed 则开始读取同文件函数返回类型。 |
+| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer6` 标签下再次通过，证明 local call 扩面没有把 typed/lowering 链拉坏。 |
+| `2026-04-20` | 已完成 | `CallExpr` 已继续扩到同包跨文件已知函数，`v3ParserCollectExternalCallNames(...)` 也改成“本地快照 + while”以避开复合字段嵌套索引的 `idx=len` 真越界。 |
+| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer7` 标签下重新通过，说明 cross-file call HIR 和 typed import_buffer 这条主链已经重新站稳。 |
 | `2026-04-19` | 已完成 | `git -C /Users/lbcheng/cheng-lang diff --check` 通过。 |

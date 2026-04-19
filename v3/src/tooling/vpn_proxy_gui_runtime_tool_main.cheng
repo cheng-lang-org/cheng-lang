@@ -1,0 +1,85 @@
+import std/cmdline as cmdline
+import std/os
+import std/result
+import std/strings
+import std/strutils as strutil
+import std/net/transports/tcp_syscall as tcp
+import cheng/v3/tooling/vpn_proxy_gui as gui
+
+fn v3VpnProxyGuiRuntimeRoot(): str =
+    let envRoot: str = os.GetEnv("CHENG_V3_ROOT")
+    if len(envRoot) > 0:
+        return envRoot
+    return os.GetCurrentDir()
+
+fn v3VpnProxyGuiRuntimeCollectArgsFrom(startIndex: int32,
+                                       count: int32): str[] =
+    var out: str[] = []
+    if startIndex > count:
+        return out
+    for i in startIndex..count:
+        let arg: str = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(out, arg)
+    return out
+
+fn v3VpnProxyGuiRuntimeReadFlag(args: str[],
+                                key: str,
+                                defaultValue: str): str =
+    let colonPrefix: str = key + ":"
+    let eqPrefix: str = key + "="
+    for i in 0..<args.len:
+        let arg: str = args[i]
+        if strutil.StartsWith(arg, colonPrefix):
+            return strutil.Strip(strings.SliceBytes(arg, len(colonPrefix), len(arg) - len(colonPrefix)))
+        if strutil.StartsWith(arg, eqPrefix):
+            return strutil.Strip(strings.SliceBytes(arg, len(eqPrefix), len(arg) - len(eqPrefix)))
+        if arg == key && i + 1 < args.len:
+            return strutil.Strip(args[i + 1])
+    return defaultValue
+
+fn v3VpnProxyGuiRuntimeRun(rootDir: str,
+                           runtimeToolPath: str,
+                           configPath: str): int32 =
+    var state = gui.V3VpnProxyGuiStateForTest(rootDir, runtimeToolPath, configPath)
+    let listenRes: Result[tcp.TcpListenerHandle] = tcp.TcpListen("127.0.0.1", 0, false)
+    if IsErr(listenRes):
+        gui.v3VpnGuiPrintLine("vpn gui: " + ErrorText(listenRes))
+        return 1
+    var listener: tcp.TcpListenerHandle = Value(listenRes)
+    let port: int32 = listener.addr.port
+    let url: str = "http://127.0.0.1:" + intToStr(port) + "/"
+    state.statusText = "web ready"
+    state.noticeText = "open browser at " + url
+    gui.v3VpnGuiPrintLine("vpn gui: " + url)
+    gui.v3VpnGuiTryOpenBrowser(rootDir, url)
+    while !state.quitRequested:
+        gui.v3VpnGuiProcPoll(state)
+        let waitRes: Result[bool] = tcp.TcpListenerWaitReadable(listener, 200)
+        if IsErr(waitRes):
+            tcp.TcpListenerClose(listener)
+            gui.v3VpnGuiPrintLine("vpn gui: " + ErrorText(waitRes))
+            return 1
+        if !Value(waitRes):
+            continue
+        let acceptRes: Result[tcp.TcpConnectionHandle] = tcp.TcpAccept(listener)
+        if IsErr(acceptRes):
+            state.errorText = ErrorText(acceptRes)
+            continue
+        var conn: tcp.TcpConnectionHandle = Value(acceptRes)
+        gui.v3VpnGuiHandleHttp(state, conn, port, url)
+        tcp.TcpClose(conn)
+    tcp.TcpListenerClose(listener)
+    if state.proc.running:
+        gui.v3VpnGuiPrintLine("vpn gui: ui closed, local proxy still running pid=" + intToStr(int32(state.proc.pid)))
+    return 0
+
+fn main(argc: int32, argv: str*): int32 =
+    argc
+    argv
+    cmdline.__cheng_captureCmdLine(argc, argv)
+    let rootDir: str = v3VpnProxyGuiRuntimeRoot()
+    let args: str[] = v3VpnProxyGuiRuntimeCollectArgsFrom(1, cmdline.ParamCount())
+    let runtimeToolPath: str = v3VpnProxyGuiRuntimeReadFlag(args, "--runtime-tool", "")
+    let configPath: str = v3VpnProxyGuiRuntimeReadFlag(args, "--config", "")
+    return v3VpnProxyGuiRuntimeRun(rootDir, runtimeToolPath, configPath)

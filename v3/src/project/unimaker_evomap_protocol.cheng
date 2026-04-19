@@ -1,0 +1,726 @@
+import std/result
+import std/strings as strings
+import std/strutils as strutil
+import cheng/v3/tooling/vpn_proxy_json as vjson
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/project/unimaker_edge_types as types
+
+type
+    V3EvoMapA2AHello =
+        version: int32
+        identity: types.V3AgentIdentity
+        cursor: types.V3SyncCursor
+        genes: types.V3EvoGene[]
+
+    V3EvoMapA2ATask =
+        version: int32
+        requesterPeerIdText: str
+        task: types.V3AgentTask
+        contextCapsuleCids: layout.FixedBytes32[]
+
+    V3EvoMapA2AResult =
+        version: int32
+        taskId: str
+        actionKind: str
+        planText: str
+        headCid: layout.FixedBytes32
+        selectedCapsuleCids: layout.FixedBytes32[]
+        memoryHitCount: int32
+        confidenceScore: int32
+        geneCid: layout.FixedBytes32
+
+    V3EvoMapGeppush =
+        version: int32
+        cursor: types.V3SyncCursor
+        capsules: types.V3EvoCapsule[]
+
+    V3EvoMapGeppull =
+        version: int32
+        cursor: types.V3SyncCursor
+
+fn v3UnimakerProtocolHelloPath(): str =
+    return "/a2a/hello"
+
+fn v3UnimakerProtocolTaskPath(): str =
+    return "/a2a/task"
+
+fn v3UnimakerProtocolPushPath(): str =
+    return "/gep/push"
+
+fn v3UnimakerProtocolPullPath(): str =
+    return "/gep/pull"
+
+fn v3UnimakerProtocolHelloZero(): V3EvoMapA2AHello =
+    var out: V3EvoMapA2AHello
+    out.version = types.v3UnimakerProtocolVersion
+    out.identity = types.v3UnimakerAgentIdentityZero()
+    out.cursor = types.v3UnimakerCursorZero()
+    out.genes = []
+    return out
+
+fn v3UnimakerProtocolTaskZero(): V3EvoMapA2ATask =
+    var out: V3EvoMapA2ATask
+    out.version = types.v3UnimakerProtocolVersion
+    out.requesterPeerIdText = ""
+    out.task = types.v3UnimakerAgentTaskZero()
+    out.contextCapsuleCids = []
+    return out
+
+fn v3UnimakerProtocolResultZero(): V3EvoMapA2AResult =
+    var out: V3EvoMapA2AResult
+    out.version = types.v3UnimakerProtocolVersion
+    out.taskId = ""
+    out.actionKind = ""
+    out.planText = ""
+    out.headCid = layout.fixedBytes32Zero()
+    out.selectedCapsuleCids = []
+    out.memoryHitCount = 0
+    out.confidenceScore = 0
+    out.geneCid = layout.fixedBytes32Zero()
+    return out
+
+fn v3UnimakerProtocolPushZero(): V3EvoMapGeppush =
+    var out: V3EvoMapGeppush
+    out.version = types.v3UnimakerProtocolVersion
+    out.cursor = types.v3UnimakerCursorZero()
+    out.capsules = []
+    return out
+
+fn v3UnimakerProtocolPullZero(): V3EvoMapGeppull =
+    var out: V3EvoMapGeppull
+    out.version = types.v3UnimakerProtocolVersion
+    out.cursor = types.v3UnimakerCursorZero()
+    return out
+
+fn v3UnimakerProtocolOwnText(text: str): str =
+    if strLenFast(text) <= 0:
+        return ""
+    return newStringCopy(strDataPtr(text), strLenFast(text))
+
+fn v3UnimakerProtocolEscapeText(value: str): str =
+    var out = v3UnimakerProtocolOwnText(value)
+    out = strutil.Replace(out, "\\", "\\\\")
+    out = strutil.Replace(out, "\"", "\\\"")
+    out = strutil.Replace(out, "\n", "\\n")
+    out = strutil.Replace(out, "\r", "\\r")
+    out = strutil.Replace(out, "\t", "\\t")
+    return out
+
+fn v3UnimakerProtocolQuoteText(value: str): str =
+    return "\"" + v3UnimakerProtocolEscapeText(value) + "\""
+
+fn v3UnimakerProtocolStringArrayText(values: str[]): str =
+    var out = "["
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + ","
+        out = out + v3UnimakerProtocolQuoteText(values[i])
+    out = out + "]"
+    return out
+
+fn v3UnimakerProtocolFixed32HexArray(values: layout.FixedBytes32[]): str =
+    var out = "["
+    for i in 0..<values.len:
+        if i > 0:
+            out = out + ","
+        out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(values[i]))
+    out = out + "]"
+    return out
+
+fn v3UnimakerProtocolEncodeCursorNode(cursor: types.V3SyncCursor): str =
+    var out = "{"
+    out = out + "\"event_count\":"
+    out = out + strings.IntToStr(cursor.eventCount)
+    out = out + ",\"head_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(cursor.headCid))
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodeGeneNode(gene: types.V3EvoGene): str =
+    var out = "{"
+    out = out + "\"capability\":"
+    out = out + v3UnimakerProtocolQuoteText(gene.capability)
+    out = out + ",\"strategy\":"
+    out = out + v3UnimakerProtocolQuoteText(gene.strategy)
+    out = out + ",\"condition\":"
+    out = out + v3UnimakerProtocolQuoteText(gene.condition)
+    out = out + ",\"gene_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(gene.geneCid))
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodeCapsuleNode(capsule: types.V3EvoCapsule): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(capsule.version)
+    out = out + ",\"sequence\":"
+    out = out + strings.IntToStr(capsule.sequence)
+    out = out + ",\"capsule_kind\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.capsuleKind)
+    out = out + ",\"task_id\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.taskId)
+    out = out + ",\"content_text\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.contentText)
+    out = out + ",\"keywords\":"
+    out = out + v3UnimakerProtocolStringArrayText(capsule.keywords)
+    out = out + ",\"parent_cids\":"
+    out = out + v3UnimakerProtocolFixed32HexArray(capsule.parentCids)
+    out = out + ",\"relation_kind\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.relationKind)
+    out = out + ",\"source_did\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.sourceDidText)
+    out = out + ",\"source_peer_id\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.sourcePeerIdText)
+    out = out + ",\"source_device_label\":"
+    out = out + v3UnimakerProtocolQuoteText(capsule.sourceDeviceLabel)
+    out = out + ",\"created_at\":"
+    out = out + strings.Int64ToStr(capsule.createdAtEpochSeconds)
+    out = out + ",\"content_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(capsule.contentCid))
+    out = out + ",\"capsule_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(capsule.capsuleCid))
+    out = out + ",\"signature\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(capsule.signatureCid))
+    out = out + ",\"gene_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(capsule.geneCid))
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodeHello(hello: V3EvoMapA2AHello): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(hello.version)
+    out = out + ",\"path\":"
+    out = out + v3UnimakerProtocolQuoteText(v3UnimakerProtocolHelloPath())
+    out = out + ",\"did\":"
+    out = out + v3UnimakerProtocolQuoteText(hello.identity.didText)
+    out = out + ",\"peer_id\":"
+    out = out + v3UnimakerProtocolQuoteText(hello.identity.peerIdText)
+    out = out + ",\"device_label\":"
+    out = out + v3UnimakerProtocolQuoteText(hello.identity.deviceLabel)
+    out = out + ",\"agent_id\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(hello.identity.identityCid))
+    out = out + ",\"identity_signature\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(hello.identity.signatureCid))
+    out = out + ",\"cursor\":"
+    out = out + v3UnimakerProtocolEncodeCursorNode(hello.cursor)
+    out = out + ",\"genes\":["
+    for i in 0..<hello.genes.len:
+        if i > 0:
+            out = out + ","
+        out = out + v3UnimakerProtocolEncodeGeneNode(hello.genes[i])
+    out = out + "]"
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodeTask(taskValue: V3EvoMapA2ATask): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(taskValue.version)
+    out = out + ",\"path\":"
+    out = out + v3UnimakerProtocolQuoteText(v3UnimakerProtocolTaskPath())
+    out = out + ",\"requester_peer_id\":"
+    out = out + v3UnimakerProtocolQuoteText(taskValue.requesterPeerIdText)
+    out = out + ",\"task_id\":"
+    out = out + v3UnimakerProtocolQuoteText(taskValue.task.taskId)
+    out = out + ",\"prompt\":"
+    out = out + v3UnimakerProtocolQuoteText(taskValue.task.promptText)
+    out = out + ",\"keywords\":"
+    out = out + v3UnimakerProtocolStringArrayText(taskValue.task.keywords)
+    out = out + ",\"context_capsules\":"
+    out = out + v3UnimakerProtocolFixed32HexArray(taskValue.contextCapsuleCids)
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodeResult(resultValue: V3EvoMapA2AResult): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(resultValue.version)
+    out = out + ",\"kind\":\"result\""
+    out = out + ",\"task_id\":"
+    out = out + v3UnimakerProtocolQuoteText(resultValue.taskId)
+    out = out + ",\"action_kind\":"
+    out = out + v3UnimakerProtocolQuoteText(resultValue.actionKind)
+    out = out + ",\"plan_text\":"
+    out = out + v3UnimakerProtocolQuoteText(resultValue.planText)
+    out = out + ",\"head_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(resultValue.headCid))
+    out = out + ",\"selected_capsules\":"
+    out = out + v3UnimakerProtocolFixed32HexArray(resultValue.selectedCapsuleCids)
+    out = out + ",\"memory_hit_count\":"
+    out = out + strings.IntToStr(resultValue.memoryHitCount)
+    out = out + ",\"confidence_score\":"
+    out = out + strings.IntToStr(resultValue.confidenceScore)
+    out = out + ",\"gene_cid\":"
+    out = out + v3UnimakerProtocolQuoteText(layout.fixedBytes32Hex(resultValue.geneCid))
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodePush(push: V3EvoMapGeppush): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(push.version)
+    out = out + ",\"path\":"
+    out = out + v3UnimakerProtocolQuoteText(v3UnimakerProtocolPushPath())
+    out = out + ",\"cursor\":"
+    out = out + v3UnimakerProtocolEncodeCursorNode(push.cursor)
+    out = out + ",\"capsules\":["
+    for i in 0..<push.capsules.len:
+        if i > 0:
+            out = out + ","
+        out = out + v3UnimakerProtocolEncodeCapsuleNode(push.capsules[i])
+    out = out + "]"
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolEncodePull(pull: V3EvoMapGeppull): str =
+    var out = "{"
+    out = out + "\"version\":"
+    out = out + strings.IntToStr(pull.version)
+    out = out + ",\"path\":"
+    out = out + v3UnimakerProtocolQuoteText(v3UnimakerProtocolPullPath())
+    out = out + ",\"cursor\":"
+    out = out + v3UnimakerProtocolEncodeCursorNode(pull.cursor)
+    out = out + "}"
+    return out
+
+fn v3UnimakerProtocolParseText(text: str): Result[vjson.JsonNode] =
+    let parseRes = vjson.ParseJsonSafe(text)
+    if !parseRes.ok:
+        return Err[vjson.JsonNode]("v3 unimaker protocol: " + parseRes.error)
+    return Ok[vjson.JsonNode](parseRes.value)
+
+fn v3UnimakerProtocolReadRequiredString(node: vjson.JsonNode,
+                                        key: str): Result[str] =
+    if !vjson.HasKey(node, key):
+        return Err[str]("v3 unimaker protocol: missing field: " + key)
+    let value = vjson.JsonGetField(node, key)
+    if !vjson.IsString(value):
+        return Err[str]("v3 unimaker protocol: field is not string: " + key)
+    return Ok[str](v3UnimakerProtocolOwnText(vjson.GetStr(value)))
+
+fn v3UnimakerProtocolReadRequiredInt(node: vjson.JsonNode,
+                                     key: str): Result[int32] =
+    if !vjson.HasKey(node, key):
+        return Err[int32]("v3 unimaker protocol: missing field: " + key)
+    let value = vjson.JsonGetField(node, key)
+    if !vjson.IsInt(value):
+        return Err[int32]("v3 unimaker protocol: field is not int: " + key)
+    return Ok[int32](int32(vjson.GetInt(value)))
+
+fn v3UnimakerProtocolReadRequiredInt64(node: vjson.JsonNode,
+                                       key: str): Result[int64] =
+    if !vjson.HasKey(node, key):
+        return Err[int64]("v3 unimaker protocol: missing field: " + key)
+    let value = vjson.JsonGetField(node, key)
+    if !vjson.IsInt(value):
+        return Err[int64]("v3 unimaker protocol: field is not int: " + key)
+    return Ok[int64](vjson.GetInt(value))
+
+fn v3UnimakerProtocolReadFixed32(text: str,
+                                 label: str): Result[layout.FixedBytes32] =
+    let fixedRes = layout.fixedBytes32FromHex(text)
+    if IsErr(fixedRes):
+        return Err[layout.FixedBytes32]("v3 unimaker protocol: invalid fixed32 for " + label)
+    return Ok[layout.FixedBytes32](Value(fixedRes))
+
+fn v3UnimakerProtocolReadFixed32Array(node: vjson.JsonNode,
+                                      key: str): Result[layout.FixedBytes32[]] =
+    let value = vjson.JsonGetField(node, key)
+    if !vjson.IsArray(value):
+        return Err[layout.FixedBytes32[]]("v3 unimaker protocol: field is not array: " + key)
+    var out: layout.FixedBytes32[] = []
+    for i in 0..<value.a.len:
+        if !vjson.IsString(value.a[i]):
+            return Err[layout.FixedBytes32[]]("v3 unimaker protocol: array item is not string: " + key)
+        let fixedRes = v3UnimakerProtocolReadFixed32(vjson.GetStr(value.a[i]), key)
+        if IsErr(fixedRes):
+            return Err[layout.FixedBytes32[]](Error(fixedRes))
+        add(out, Value(fixedRes))
+    return Ok[layout.FixedBytes32[]](out)
+
+fn v3UnimakerProtocolReadStringArray(node: vjson.JsonNode,
+                                     key: str): Result[str[]] =
+    let value = vjson.JsonGetField(node, key)
+    if !vjson.IsArray(value):
+        return Err[str[]]("v3 unimaker protocol: field is not array: " + key)
+    var out: str[] = []
+    for i in 0..<value.a.len:
+        if !vjson.IsString(value.a[i]):
+            return Err[str[]]("v3 unimaker protocol: array item is not string: " + key)
+        add(out, v3UnimakerProtocolOwnText(vjson.GetStr(value.a[i])))
+    return Ok[str[]](out)
+
+fn v3UnimakerProtocolDecodeCursorNode(node: vjson.JsonNode): Result[types.V3SyncCursor] =
+    if !vjson.IsObject(node):
+        return Err[types.V3SyncCursor]("v3 unimaker protocol: cursor must be object")
+    let eventCountRes = v3UnimakerProtocolReadRequiredInt(node, "event_count")
+    if IsErr(eventCountRes):
+        return Err[types.V3SyncCursor](Error(eventCountRes))
+    let headTextRes = v3UnimakerProtocolReadRequiredString(node, "head_cid")
+    if IsErr(headTextRes):
+        return Err[types.V3SyncCursor](Error(headTextRes))
+    let headCidRes = v3UnimakerProtocolReadFixed32(Value(headTextRes), "head_cid")
+    if IsErr(headCidRes):
+        return Err[types.V3SyncCursor](Error(headCidRes))
+    return Ok[types.V3SyncCursor](types.v3UnimakerCursorMake(Value(eventCountRes), Value(headCidRes)))
+
+fn v3UnimakerProtocolDecodeGeneNode(node: vjson.JsonNode): Result[types.V3EvoGene] =
+    if !vjson.IsObject(node):
+        return Err[types.V3EvoGene]("v3 unimaker protocol: gene must be object")
+    let capabilityRes = v3UnimakerProtocolReadRequiredString(node, "capability")
+    if IsErr(capabilityRes):
+        return Err[types.V3EvoGene](Error(capabilityRes))
+    let strategyRes = v3UnimakerProtocolReadRequiredString(node, "strategy")
+    if IsErr(strategyRes):
+        return Err[types.V3EvoGene](Error(strategyRes))
+    let conditionRes = v3UnimakerProtocolReadRequiredString(node, "condition")
+    if IsErr(conditionRes):
+        return Err[types.V3EvoGene](Error(conditionRes))
+    let geneCidTextRes = v3UnimakerProtocolReadRequiredString(node, "gene_cid")
+    if IsErr(geneCidTextRes):
+        return Err[types.V3EvoGene](Error(geneCidTextRes))
+    let gene = types.v3UnimakerGeneMake(Value(capabilityRes),
+                                        Value(strategyRes),
+                                        Value(conditionRes))
+    let cidRes = v3UnimakerProtocolReadFixed32(Value(geneCidTextRes), "gene_cid")
+    if IsErr(cidRes):
+        return Err[types.V3EvoGene](Error(cidRes))
+    if !layout.fixedBytes32Equal(gene.geneCid, Value(cidRes)):
+        return Err[types.V3EvoGene]("v3 unimaker protocol: gene cid mismatch")
+    return Ok[types.V3EvoGene](gene)
+
+fn v3UnimakerProtocolDecodeCapsuleNode(node: vjson.JsonNode): Result[types.V3EvoCapsule] =
+    if !vjson.IsObject(node):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: capsule must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(node, "version")
+    if IsErr(versionRes):
+        return Err[types.V3EvoCapsule](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerCapsuleVersion:
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: unsupported capsule version")
+    let sequenceRes = v3UnimakerProtocolReadRequiredInt(node, "sequence")
+    if IsErr(sequenceRes):
+        return Err[types.V3EvoCapsule](Error(sequenceRes))
+    let capsuleKindRes = v3UnimakerProtocolReadRequiredString(node, "capsule_kind")
+    if IsErr(capsuleKindRes):
+        return Err[types.V3EvoCapsule](Error(capsuleKindRes))
+    if !types.v3UnimakerCapsuleKindValid(Value(capsuleKindRes)):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: invalid capsule kind")
+    let taskIdRes = v3UnimakerProtocolReadRequiredString(node, "task_id")
+    if IsErr(taskIdRes):
+        return Err[types.V3EvoCapsule](Error(taskIdRes))
+    let contentTextRes = v3UnimakerProtocolReadRequiredString(node, "content_text")
+    if IsErr(contentTextRes):
+        return Err[types.V3EvoCapsule](Error(contentTextRes))
+    let keywordsRes = v3UnimakerProtocolReadStringArray(node, "keywords")
+    if IsErr(keywordsRes):
+        return Err[types.V3EvoCapsule](Error(keywordsRes))
+    let parentsRes = v3UnimakerProtocolReadFixed32Array(node, "parent_cids")
+    if IsErr(parentsRes):
+        return Err[types.V3EvoCapsule](Error(parentsRes))
+    let relationKindRes = v3UnimakerProtocolReadRequiredString(node, "relation_kind")
+    if IsErr(relationKindRes):
+        return Err[types.V3EvoCapsule](Error(relationKindRes))
+    if !types.v3UnimakerEdgeKindValid(Value(relationKindRes)):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: invalid relation kind")
+    let sourceDidRes = v3UnimakerProtocolReadRequiredString(node, "source_did")
+    if IsErr(sourceDidRes):
+        return Err[types.V3EvoCapsule](Error(sourceDidRes))
+    let sourcePeerRes = v3UnimakerProtocolReadRequiredString(node, "source_peer_id")
+    if IsErr(sourcePeerRes):
+        return Err[types.V3EvoCapsule](Error(sourcePeerRes))
+    let sourceLabelRes = v3UnimakerProtocolReadRequiredString(node, "source_device_label")
+    if IsErr(sourceLabelRes):
+        return Err[types.V3EvoCapsule](Error(sourceLabelRes))
+    let createdAtRes = v3UnimakerProtocolReadRequiredInt64(node, "created_at")
+    if IsErr(createdAtRes):
+        return Err[types.V3EvoCapsule](Error(createdAtRes))
+    let contentCidTextRes = v3UnimakerProtocolReadRequiredString(node, "content_cid")
+    if IsErr(contentCidTextRes):
+        return Err[types.V3EvoCapsule](Error(contentCidTextRes))
+    let capsuleCidTextRes = v3UnimakerProtocolReadRequiredString(node, "capsule_cid")
+    if IsErr(capsuleCidTextRes):
+        return Err[types.V3EvoCapsule](Error(capsuleCidTextRes))
+    let signatureTextRes = v3UnimakerProtocolReadRequiredString(node, "signature")
+    if IsErr(signatureTextRes):
+        return Err[types.V3EvoCapsule](Error(signatureTextRes))
+    let geneCidTextRes = v3UnimakerProtocolReadRequiredString(node, "gene_cid")
+    if IsErr(geneCidTextRes):
+        return Err[types.V3EvoCapsule](Error(geneCidTextRes))
+    let contentCidRes = v3UnimakerProtocolReadFixed32(Value(contentCidTextRes), "content_cid")
+    if IsErr(contentCidRes):
+        return Err[types.V3EvoCapsule](Error(contentCidRes))
+    let capsuleCidRes = v3UnimakerProtocolReadFixed32(Value(capsuleCidTextRes), "capsule_cid")
+    if IsErr(capsuleCidRes):
+        return Err[types.V3EvoCapsule](Error(capsuleCidRes))
+    let signatureCidRes = v3UnimakerProtocolReadFixed32(Value(signatureTextRes), "signature")
+    if IsErr(signatureCidRes):
+        return Err[types.V3EvoCapsule](Error(signatureCidRes))
+    let geneCidRes = v3UnimakerProtocolReadFixed32(Value(geneCidTextRes), "gene_cid")
+    if IsErr(geneCidRes):
+        return Err[types.V3EvoCapsule](Error(geneCidRes))
+    var out = types.v3UnimakerCapsuleZero()
+    out.version = Value(versionRes)
+    out.sequence = Value(sequenceRes)
+    out.capsuleKind = Value(capsuleKindRes)
+    out.taskId = Value(taskIdRes)
+    out.contentText = Value(contentTextRes)
+    out.keywords = Value(keywordsRes)
+    out.parentCids = Value(parentsRes)
+    out.relationKind = Value(relationKindRes)
+    out.sourceDidText = Value(sourceDidRes)
+    out.sourcePeerIdText = Value(sourcePeerRes)
+    out.sourceDeviceLabel = Value(sourceLabelRes)
+    out.createdAtEpochSeconds = Value(createdAtRes)
+    out.contentCid = Value(contentCidRes)
+    out.capsuleCid = Value(capsuleCidRes)
+    out.signatureCid = Value(signatureCidRes)
+    out.geneCid = Value(geneCidRes)
+    let expectedContentCid = types.v3UnimakerCapsuleContentCid(out.capsuleKind,
+                                                               out.taskId,
+                                                               out.contentText,
+                                                               out.keywords,
+                                                               out.parentCids,
+                                                               out.relationKind,
+                                                               out.createdAtEpochSeconds)
+    if !layout.fixedBytes32Equal(expectedContentCid, out.contentCid):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: content cid mismatch")
+    var identity = types.v3UnimakerAgentIdentityZero()
+    identity.didText = out.sourceDidText
+    identity.peerIdText = out.sourcePeerIdText
+    identity.deviceLabel = out.sourceDeviceLabel
+    let expectedSignature = types.v3UnimakerCapsuleSignatureCid(identity,
+                                                                out.contentCid,
+                                                                out.parentCids,
+                                                                out.createdAtEpochSeconds)
+    if !layout.fixedBytes32Equal(expectedSignature, out.signatureCid):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: signature mismatch")
+    let expectedCapsuleCid = types.v3UnimakerCapsuleCid(out)
+    if !layout.fixedBytes32Equal(expectedCapsuleCid, out.capsuleCid):
+        return Err[types.V3EvoCapsule]("v3 unimaker protocol: capsule cid mismatch")
+    return Ok[types.V3EvoCapsule](out)
+
+fn v3UnimakerProtocolDecodeHello(text: str): Result[V3EvoMapA2AHello] =
+    let nodeRes = v3UnimakerProtocolParseText(text)
+    if IsErr(nodeRes):
+        return Err[V3EvoMapA2AHello](Error(nodeRes))
+    let root = Value(nodeRes)
+    if !vjson.IsObject(root):
+        return Err[V3EvoMapA2AHello]("v3 unimaker protocol: hello root must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(root, "version")
+    if IsErr(versionRes):
+        return Err[V3EvoMapA2AHello](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerProtocolVersion:
+        return Err[V3EvoMapA2AHello]("v3 unimaker protocol: unsupported hello version")
+    let pathRes = v3UnimakerProtocolReadRequiredString(root, "path")
+    if IsErr(pathRes):
+        return Err[V3EvoMapA2AHello](Error(pathRes))
+    if Value(pathRes) != v3UnimakerProtocolHelloPath():
+        return Err[V3EvoMapA2AHello]("v3 unimaker protocol: wrong hello path")
+    let didRes = v3UnimakerProtocolReadRequiredString(root, "did")
+    if IsErr(didRes):
+        return Err[V3EvoMapA2AHello](Error(didRes))
+    let peerRes = v3UnimakerProtocolReadRequiredString(root, "peer_id")
+    if IsErr(peerRes):
+        return Err[V3EvoMapA2AHello](Error(peerRes))
+    let labelRes = v3UnimakerProtocolReadRequiredString(root, "device_label")
+    if IsErr(labelRes):
+        return Err[V3EvoMapA2AHello](Error(labelRes))
+    let agentIdRes = v3UnimakerProtocolReadRequiredString(root, "agent_id")
+    if IsErr(agentIdRes):
+        return Err[V3EvoMapA2AHello](Error(agentIdRes))
+    let signatureRes = v3UnimakerProtocolReadRequiredString(root, "identity_signature")
+    if IsErr(signatureRes):
+        return Err[V3EvoMapA2AHello](Error(signatureRes))
+    let cursorRes = v3UnimakerProtocolDecodeCursorNode(vjson.JsonGetField(root, "cursor"))
+    if IsErr(cursorRes):
+        return Err[V3EvoMapA2AHello](Error(cursorRes))
+    let agentCidRes = v3UnimakerProtocolReadFixed32(Value(agentIdRes), "agent_id")
+    if IsErr(agentCidRes):
+        return Err[V3EvoMapA2AHello](Error(agentCidRes))
+    let identitySigRes = v3UnimakerProtocolReadFixed32(Value(signatureRes), "identity_signature")
+    if IsErr(identitySigRes):
+        return Err[V3EvoMapA2AHello](Error(identitySigRes))
+    var identity = types.v3UnimakerAgentIdentityZero()
+    identity.didText = Value(didRes)
+    identity.peerIdText = Value(peerRes)
+    identity.deviceLabel = Value(labelRes)
+    identity.signatureCid = Value(identitySigRes)
+    let signatureHex = layout.fixedBytes32Hex(identity.signatureCid)
+    identity.identityCid = types.v3UnimakerHashText("v3.unimaker.identity",
+                                                    [identity.didText,
+                                                     identity.peerIdText,
+                                                     identity.deviceLabel,
+                                                     signatureHex])
+    if !layout.fixedBytes32Equal(identity.identityCid, Value(agentCidRes)):
+        return Err[V3EvoMapA2AHello]("v3 unimaker protocol: identity cid mismatch")
+    let genesNode = vjson.JsonGetField(root, "genes")
+    if !vjson.IsArray(genesNode):
+        return Err[V3EvoMapA2AHello]("v3 unimaker protocol: genes must be array")
+    var genes: types.V3EvoGene[] = []
+    for i in 0..<genesNode.a.len:
+        let geneRes = v3UnimakerProtocolDecodeGeneNode(genesNode.a[i])
+        if IsErr(geneRes):
+            return Err[V3EvoMapA2AHello](Error(geneRes))
+        add(genes, Value(geneRes))
+    var out = v3UnimakerProtocolHelloZero()
+    out.identity = identity
+    out.cursor = Value(cursorRes)
+    out.genes = genes
+    return Ok[V3EvoMapA2AHello](out)
+
+fn v3UnimakerProtocolDecodeTask(text: str): Result[V3EvoMapA2ATask] =
+    let nodeRes = v3UnimakerProtocolParseText(text)
+    if IsErr(nodeRes):
+        return Err[V3EvoMapA2ATask](Error(nodeRes))
+    let root = Value(nodeRes)
+    if !vjson.IsObject(root):
+        return Err[V3EvoMapA2ATask]("v3 unimaker protocol: task root must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(root, "version")
+    if IsErr(versionRes):
+        return Err[V3EvoMapA2ATask](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerProtocolVersion:
+        return Err[V3EvoMapA2ATask]("v3 unimaker protocol: unsupported task version")
+    let pathRes = v3UnimakerProtocolReadRequiredString(root, "path")
+    if IsErr(pathRes):
+        return Err[V3EvoMapA2ATask](Error(pathRes))
+    if Value(pathRes) != v3UnimakerProtocolTaskPath():
+        return Err[V3EvoMapA2ATask]("v3 unimaker protocol: wrong task path")
+    let requesterRes = v3UnimakerProtocolReadRequiredString(root, "requester_peer_id")
+    if IsErr(requesterRes):
+        return Err[V3EvoMapA2ATask](Error(requesterRes))
+    let taskIdRes = v3UnimakerProtocolReadRequiredString(root, "task_id")
+    if IsErr(taskIdRes):
+        return Err[V3EvoMapA2ATask](Error(taskIdRes))
+    let promptRes = v3UnimakerProtocolReadRequiredString(root, "prompt")
+    if IsErr(promptRes):
+        return Err[V3EvoMapA2ATask](Error(promptRes))
+    let keywordsRes = v3UnimakerProtocolReadStringArray(root, "keywords")
+    if IsErr(keywordsRes):
+        return Err[V3EvoMapA2ATask](Error(keywordsRes))
+    let contextRes = v3UnimakerProtocolReadFixed32Array(root, "context_capsules")
+    if IsErr(contextRes):
+        return Err[V3EvoMapA2ATask](Error(contextRes))
+    var out = v3UnimakerProtocolTaskZero()
+    out.requesterPeerIdText = Value(requesterRes)
+    out.task.taskId = Value(taskIdRes)
+    out.task.promptText = Value(promptRes)
+    out.task.keywords = Value(keywordsRes)
+    out.contextCapsuleCids = Value(contextRes)
+    return Ok[V3EvoMapA2ATask](out)
+
+fn v3UnimakerProtocolDecodeResult(text: str): Result[V3EvoMapA2AResult] =
+    let nodeRes = v3UnimakerProtocolParseText(text)
+    if IsErr(nodeRes):
+        return Err[V3EvoMapA2AResult](Error(nodeRes))
+    let root = Value(nodeRes)
+    if !vjson.IsObject(root):
+        return Err[V3EvoMapA2AResult]("v3 unimaker protocol: result root must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(root, "version")
+    if IsErr(versionRes):
+        return Err[V3EvoMapA2AResult](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerProtocolVersion:
+        return Err[V3EvoMapA2AResult]("v3 unimaker protocol: unsupported result version")
+    let kindRes = v3UnimakerProtocolReadRequiredString(root, "kind")
+    if IsErr(kindRes):
+        return Err[V3EvoMapA2AResult](Error(kindRes))
+    if Value(kindRes) != "result":
+        return Err[V3EvoMapA2AResult]("v3 unimaker protocol: wrong result kind")
+    let taskIdRes = v3UnimakerProtocolReadRequiredString(root, "task_id")
+    if IsErr(taskIdRes):
+        return Err[V3EvoMapA2AResult](Error(taskIdRes))
+    let actionKindRes = v3UnimakerProtocolReadRequiredString(root, "action_kind")
+    if IsErr(actionKindRes):
+        return Err[V3EvoMapA2AResult](Error(actionKindRes))
+    let planTextRes = v3UnimakerProtocolReadRequiredString(root, "plan_text")
+    if IsErr(planTextRes):
+        return Err[V3EvoMapA2AResult](Error(planTextRes))
+    let headTextRes = v3UnimakerProtocolReadRequiredString(root, "head_cid")
+    if IsErr(headTextRes):
+        return Err[V3EvoMapA2AResult](Error(headTextRes))
+    let selectedRes = v3UnimakerProtocolReadFixed32Array(root, "selected_capsules")
+    if IsErr(selectedRes):
+        return Err[V3EvoMapA2AResult](Error(selectedRes))
+    let memoryHitRes = v3UnimakerProtocolReadRequiredInt(root, "memory_hit_count")
+    if IsErr(memoryHitRes):
+        return Err[V3EvoMapA2AResult](Error(memoryHitRes))
+    let confidenceRes = v3UnimakerProtocolReadRequiredInt(root, "confidence_score")
+    if IsErr(confidenceRes):
+        return Err[V3EvoMapA2AResult](Error(confidenceRes))
+    let geneCidTextRes = v3UnimakerProtocolReadRequiredString(root, "gene_cid")
+    if IsErr(geneCidTextRes):
+        return Err[V3EvoMapA2AResult](Error(geneCidTextRes))
+    let headCidRes = v3UnimakerProtocolReadFixed32(Value(headTextRes), "head_cid")
+    if IsErr(headCidRes):
+        return Err[V3EvoMapA2AResult](Error(headCidRes))
+    let geneCidRes = v3UnimakerProtocolReadFixed32(Value(geneCidTextRes), "gene_cid")
+    if IsErr(geneCidRes):
+        return Err[V3EvoMapA2AResult](Error(geneCidRes))
+    var out = v3UnimakerProtocolResultZero()
+    out.taskId = Value(taskIdRes)
+    out.actionKind = Value(actionKindRes)
+    out.planText = Value(planTextRes)
+    out.headCid = Value(headCidRes)
+    out.selectedCapsuleCids = Value(selectedRes)
+    out.memoryHitCount = Value(memoryHitRes)
+    out.confidenceScore = Value(confidenceRes)
+    out.geneCid = Value(geneCidRes)
+    return Ok[V3EvoMapA2AResult](out)
+
+fn v3UnimakerProtocolDecodePush(text: str): Result[V3EvoMapGeppush] =
+    let nodeRes = v3UnimakerProtocolParseText(text)
+    if IsErr(nodeRes):
+        return Err[V3EvoMapGeppush](Error(nodeRes))
+    let root = Value(nodeRes)
+    if !vjson.IsObject(root):
+        return Err[V3EvoMapGeppush]("v3 unimaker protocol: push root must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(root, "version")
+    if IsErr(versionRes):
+        return Err[V3EvoMapGeppush](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerProtocolVersion:
+        return Err[V3EvoMapGeppush]("v3 unimaker protocol: unsupported push version")
+    let pathRes = v3UnimakerProtocolReadRequiredString(root, "path")
+    if IsErr(pathRes):
+        return Err[V3EvoMapGeppush](Error(pathRes))
+    if Value(pathRes) != v3UnimakerProtocolPushPath():
+        return Err[V3EvoMapGeppush]("v3 unimaker protocol: wrong push path")
+    let cursorRes = v3UnimakerProtocolDecodeCursorNode(vjson.JsonGetField(root, "cursor"))
+    if IsErr(cursorRes):
+        return Err[V3EvoMapGeppush](Error(cursorRes))
+    let capsulesNode = vjson.JsonGetField(root, "capsules")
+    if !vjson.IsArray(capsulesNode):
+        return Err[V3EvoMapGeppush]("v3 unimaker protocol: capsules must be array")
+    var capsules: types.V3EvoCapsule[] = []
+    for i in 0..<capsulesNode.a.len:
+        let capsuleRes = v3UnimakerProtocolDecodeCapsuleNode(capsulesNode.a[i])
+        if IsErr(capsuleRes):
+            return Err[V3EvoMapGeppush](Error(capsuleRes))
+        add(capsules, Value(capsuleRes))
+    var out = v3UnimakerProtocolPushZero()
+    out.cursor = Value(cursorRes)
+    out.capsules = capsules
+    return Ok[V3EvoMapGeppush](out)
+
+fn v3UnimakerProtocolDecodePull(text: str): Result[V3EvoMapGeppull] =
+    let nodeRes = v3UnimakerProtocolParseText(text)
+    if IsErr(nodeRes):
+        return Err[V3EvoMapGeppull](Error(nodeRes))
+    let root = Value(nodeRes)
+    if !vjson.IsObject(root):
+        return Err[V3EvoMapGeppull]("v3 unimaker protocol: pull root must be object")
+    let versionRes = v3UnimakerProtocolReadRequiredInt(root, "version")
+    if IsErr(versionRes):
+        return Err[V3EvoMapGeppull](Error(versionRes))
+    if Value(versionRes) != types.v3UnimakerProtocolVersion:
+        return Err[V3EvoMapGeppull]("v3 unimaker protocol: unsupported pull version")
+    let pathRes = v3UnimakerProtocolReadRequiredString(root, "path")
+    if IsErr(pathRes):
+        return Err[V3EvoMapGeppull](Error(pathRes))
+    if Value(pathRes) != v3UnimakerProtocolPullPath():
+        return Err[V3EvoMapGeppull]("v3 unimaker protocol: wrong pull path")
+    let cursorRes = v3UnimakerProtocolDecodeCursorNode(vjson.JsonGetField(root, "cursor"))
+    if IsErr(cursorRes):
+        return Err[V3EvoMapGeppull](Error(cursorRes))
+    var out = v3UnimakerProtocolPullZero()
+    out.cursor = Value(cursorRes)
+    return Ok[V3EvoMapGeppull](out)

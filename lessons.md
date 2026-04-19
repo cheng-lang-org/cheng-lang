@@ -19,6 +19,7 @@
 ## ABI 与复合值
 
 - `str/rawbytes/seq/result` 当前统一按“显式地址优先 + region copy”收。
+- 分片重组这类热路径不要直接依赖 `Result[复合]` 再 `Value(...).field` 继续往下跑；先补 `Fill(out)` 主实现，再让包装函数复用它。
 - `Bytes[] add/setLen` 这种序列能力缺口要直接修进编译器，不要再在 host/browser 业务代码里兜桥或换数据结构绕过去。
 - `xor` 这种关键字二元运算要成套收进 `const/infer/prepare/native/wasm`，不能只在某一层临时认一下。
 - `len(str/Bytes/seq)` 不要只为局部变量写特判；统一走 lvalue/global 地址再按 ABI 布局取长度槽更稳。
@@ -57,6 +58,10 @@
 - 如果 typed/lowering 里已经暴露了 `import_buffer` 这样的枚举和报表字段，但 fact builder 从来不赋值，就必须明确记成“还没接通”，不要把报表口当成真能力。
 - `import_buffer` 这类调用归因要真落地，前提是 expr 层先有最小 `CallExpr`；没有 call 节点，就不要假装 typed builder 能凭空推导调用返回语义。
 - 补 `CallExpr` 时先走最小闭环最稳：先只抓“同文件 importc fn 的 call”，把 builder 和 smoke 跑通，再扩到通用 call HIR。
+- call 规范化绝不能回到“名字表 × 行文本”的切片扫描；正确形状是逐行 token 扫描，看到 `ident(` 再查名表，不然 `compiler_csg` 这类 closure 级 smoke 会被字符串复制直接拖死。
+- `CallExpr` 真扩面时，也不要立刻把 closure 里所有函数名灌成全局名表；先坚持 per-source 名表最稳，先收“同文件 importc + local function”，再扩同包/跨文件。
+- parser 里任何带索引的边界判断都不要依赖短路，像 `i > 0 && line[i - 1]`、`pos < len && line[pos]` 这种写法都必须拆成显式分支；这类坑已经多次重演成 `idx=-1`。
+- parser 里也不要长期保留 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引；一旦热路径里既要取 `.len` 又要按相同索引取元素，最稳的形状是先快照到本地 seq，再用显式 `while` 走索引，不要赌 compiler 一定能把这类组合安全 lowering。
 - 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。
 
 ## 记录与流程

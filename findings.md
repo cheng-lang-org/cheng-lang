@@ -32,5 +32,9 @@
 | 第二十六刀主线 | `wasm call result kind` 收完后，最值的是把 external import 这一列也补成显式 `import kind`，至少先把 `void / i32 value slot / i32 address slot` 从 `type_index` 侧面推断改成单点规则；不然 import 签名还是会继续借 `return_slot_kind` 影射。 |
 | 第二十七刀主线 | `typed_expr` 里的 `import_buffer` 要真落地，前提不是再堆 seed helper，而是补最小 `CallExpr` 规范化；没有 call 节点，builder 根本没有地方把 importc 返回值打上 `import_buffer`。 |
 | 当前真进展 | 现在已经补了最小 `CallExpr`，而且 composite importc call 已经能在 `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 里真落成 `lower=import_buffer / return=import_buffer`。 |
-| 当前剩余缺口 | 这条新路径目前只覆盖“同文件 importc fn 的 call expr”。只要还没有通用 call HIR，跨文件/跨模块的普通函数调用就还不能共吃同一套 typed call 归因。 |
+| 本轮真坑 | `compiler_csg_smoke` / `lowering_plan_smoke` 这次重新炸的根因不是 runtime，而是 `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 的 `v3ParserCollectExternalCallNames(...)` 还保留了 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引，直接把 compiler 顶到 `idx=len`。 |
+| 本轮真修法 | 这类复合字段嵌套索引不能继续依赖 compiler 自动发码；最稳形状是先把 profile 和 `localCallNames` 快照到本地，再用显式 `while` 走索引。这样 parser/csg/lowering 三条 smoke 才会稳定。 |
+| 当前剩余缺口 | 这条新路径现在已经覆盖“同文件 importc + 同文件 local function + 同包跨文件已知函数”的 call expr；剩下的缺口是更通用的 call HIR，还没补到 import 别名和更一般的 closure 可见函数。 |
+| 本轮额外发现 | call 规范化不能再走“名字表 × 行文本”切片扫描；哪怕只剩 importc 名表，这条路也会在 `compiler_csg_smoke` 里把 parser 拖进高成本字符串复制。正确形状必须是逐行 token 扫描，看到 `ident(` 再查当前源码自己的 call 名表。 |
+| 本轮真坑 | parser 里任何带索引的边界判断都不能依赖短路，像 `i > 0 && line[i - 1]` 这种写法会直接重演 `idx=-1`。这里必须始终写成显式边界分支。 |
 | fresh 验收面 | C bootstrap 改动不能直接拿 stage0 本体跑 ordinary smoke，因为它会先报 `missing embedded bootstrap contract`；稳定做法是 `stage0 bootstrap-bridge` 后，用 fresh `stage2` no-handoff 跑真 smoke。 |
