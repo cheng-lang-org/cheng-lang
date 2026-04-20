@@ -1,7 +1,7 @@
 # 当前任务
 
-- 目标：把 `CallExpr -> typed fact -> lowering plan` 这条链收成真 gate；已解析调用必须有 target，未解析调用必须有明确 reason。
-- 当前状态：`parser_normalized_expr_smoke`、`parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke`、`call_hir_matrix_smoke` 已重新跑绿；同文件、本地函数、direct import、grouped import、nested qualified、imported `importc`、ambiguous external、ambiguous qualified、alias 可见性、本地遮蔽、unknown member fallback 都已经进同一条事实链。
+- 目标：把 typed lowering 的 `arg/result/materialize/copy/import` 真接进 seed caller-side dispatch，不再让 native/importc/wasm 各自重算一份调用语义。
+- 当前状态：`CallExpr -> typed fact -> lowering plan` 这条 gate 已经站稳；`parser_normalized_expr_smoke`、`parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke`、`call_hir_matrix_smoke` 都是绿的。
 - 本轮真修复：
   - `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 现在会给 unresolved known call 写入明确 `reason`，direct import 的 external call 同时收 qualified 和 unqualified 名。
   - unqualified external resolve 不再扫描整个 closure，只认当前 source 的无 alias direct import。
@@ -19,6 +19,11 @@
   - `v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(...)` 已切回统一 `CallAndMember` 主链，不再保留旧的 `local/external/importc/member` 分裂扫描路径。
   - qualified target 现在也会看见自己 aliasless direct-import closure 里的可见函数：`mid.Foo(...)` 不再只认 `mid` 本地声明，也能继续落到 `mid` 闭包里可见的 leaf local/importc target。
   - 新增 `call_hir_qualified_closure_visible_*` fixture，把 qualified closure-visible local/importc 两条路径一起钉进 call 矩阵。
+  - `typed lowering rule` 现在补成了稳定 `key/entry text` 真源：`type/abi/value/place/lower/call/return/arg/result/materialize/copy/import` 会收成同一串 canonical rule key。
+  - `compiler_csg report` 和 `lowering_plan report` 现在都会写 `lowering_rule_unique_key_count` 和逐条 `lowering_rule_entry[i]`，不再只有计数没有真规则文本。
+  - `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 里的 wasm call 高层分发现在补成了显式 `V3WasmCallLoweringRule`：`arg slot / return slot / result / import` 会一次算好，`analyze/emit/register_import/type_index` 共吃这份 rule，不再各自现猜。
+  - `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 里的 native/importc caller-side 分发现在也补成了显式 `V3NativeCallLoweringRule`：`prepare/scalar call/call-into-address/call-from-spills/ffi_handle return fixup` 会共吃同一份 `arg/return/result` 规则，不再各自重算 `var/address/ffi_handle/value` 和返回值语义。
+  - `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 里的 composite return caller 入口现在也补成了显式 `V3NativeCompositeCallLoweringRule`：普通 composite return 和 import-buffer 式 composite return 会先收成统一规则，再由 `call_into_address` 和复合值物化入口共吃，不再各自单独 resolve 后只看一个 `result_uses_address` 布尔值。
   - `compiler_csg_smoke` 和 `lowering_plan_smoke` 不再自己直接 import/解释 lowering rule 枚举；改成直接读 `compiler_csg report / lowering plan report` 里的规则计数真源，并补齐 `lowering_rule_import_import_buffer_count`。
   - `call_hir_matrix_smoke` 已接进默认 host smoke 列表。
-- 下一步：继续把 `CallExpr` 扩到更一般的 qualified target 和更宽的 closure 可见函数，但保持 `per-source token scan + direct import edge + qualifier 精确归属 + unknown reason + 统一 CallAndMember 主链` 这条真源。
+- 下一步：继续把 native/importc 更高层的 import buffer 和 composite materialize 分发往同一套 typed rule key 推，不再让 caller-side 入口只在 seed 本地 helper 里闭环。

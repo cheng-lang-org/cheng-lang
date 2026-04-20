@@ -83,6 +83,10 @@
 - `v3ParserReadNormalizedExprLayerFromPath(...)` 只适合本地文本级 expr 统计，不适合拿来验 external/qualified/imported call 归因；这类回归必须走 `v3ParseOrdinarySourceStub(...)` 或 profile-aware reader，才能带上 import edge 和 target source。
 - call HIR 扩面时，`CollectExternalCallNames`、`ResolveUnqualifiedExternalCallTarget`、`ReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles` 三个真入口必须一起走同一条 `CallAndMember` 主链；只修名字收集或只修 resolve 都会留下半通不通的 closure-visible 调用。
 - qualified target 不能只看 target source 的直接声明；如果 unqualified target 已经能看见 aliasless direct-import closure，`ResolveQualifiedCallTarget` 和 qualified external name 收集也必须补上同一层 closure-visible 语义，不然 `Foo(...)` 和 `mid.Foo(...)` 会分叉成两套真相。
+- `typed lowering rule` 不能只停在计数字段；一旦要把规则继续往 seed/后端真接线，必须先给它稳定 `key/entry text`，让 `compiler_csg`、`lowering_plan`、smoke 和后端消费侧都对着同一串规则名工作，而不是各自再解释结构体。
+- seed 真接线时，不要再让 `register_import / type_index / analyze / emit` 各自重算一遍 wasm call 语义；最稳的是先补一份显式 `call lowering rule struct`，把 `arg slot / return slot / result / import` 一次算好，再让这些高层入口共用它。
+- wasm call rule 收完后，native/importc caller-side 也要立刻补同样的显式 rule struct；`prepare / scalar call / call-into-address / call-from-spills / ffi_handle return fixup` 必须共吃同一份 `arg/return/result`，不能继续靠入口各自重算。
+- native/importc caller-side rule 收完后，不要停在“一个 `result_uses_address` 布尔值”这一层；composite return caller 入口也必须立刻补显式 composite-result rule，把普通复合返回和 import-buffer 式复合返回先命名，再让 `call_into_address` 和复合值物化入口共吃。
 - parser 里任何 `nextPos >= len || line[nextPos] == ...` 这种短路边界判断都不要再留；profile-aware call 读取和 import 行扫描尤其容易被这类写法炸成 `idx=len`。
 - `compiler_csg_smoke / lowering_plan_smoke` 这类规则矩阵回归，不要在测试里直接 import lowering rule 枚举再自己解释一遍；最稳的是直接读 `compiler_csg report / lowering plan report` 里的计数字段，不然 ordinary compile 很容易被测试闭包自己拖到超时。
 - 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。

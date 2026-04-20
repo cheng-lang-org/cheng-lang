@@ -24,3 +24,11 @@
   - `ResolveQualifiedCallTarget(...)` 之前只看 target profile 的直接 local/importc 声明，不看 target 自己 aliasless direct-import closure，所以 `mid.Foo(...)` 这类 qualified target 会比 unqualified target 少一整层可见函数。
 - 与它配套的名字面真根也一起补了：
   - `CollectExternalCallNamesRecursive(...)` 之前只会为 qualified target 追加 `mid.direct_decl(...)` 和 `mid.leaf.Func(...)`，不会补 `mid` 自己 closure-visible 的 unqualified 名，所以 parser 连 `mid.Foo(...)` 这层入口都识别不到。
+- 这轮又钉住了一个 lowering 真根：
+  - `typed lowering rule` 之前只有计数和结构体，没有稳定文本 key；`compiler_csg` 和 `lowering_plan` 虽然都能算规则，但 report 面上看不到“到底是哪条规则”，后面 seed 想真接线时还是会逼着消费侧自己再解释一遍。
+- 这轮继续钉住的 seed 真根：
+  - wasm call 这条高层分发之前虽然已经有 `arg slot / result kind / import kind` helper，但 `register_import / type_index / analyze / emit` 还是各自现算一遍。只要其中一处晚一步改，wasm caller-side 语义就会重新分叉。
+- 这轮再补上的 caller-side 真根：
+  - native/importc 这条链之前虽然已经有 `arg kind / return kind / result kind` helper，但 `prepare/scalar call/call-into-address/call-from-spills/ffi_handle return fixup` 还是各自现场重算一遍。只要其中一处晚一步改，caller-side 语义就会重新分叉。
+- 这轮继续补上的 caller-side 真根：
+  - composite return caller 入口之前还是“resolve target/rule 成功后，只看 `result_uses_address` 这个单布尔值”再各处各自决定怎么落到目标地址。这样普通 composite return 和 import-buffer 式 composite return 在更高层还是没有单独规则名，后面一旦有人只修其中一条，很快又会分叉。

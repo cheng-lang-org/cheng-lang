@@ -3321,6 +3321,12 @@ typedef enum {
 } V3CallResultKind;
 
 typedef enum {
+    V3_NATIVE_IMPORT_NONE = 0,
+    V3_NATIVE_IMPORT_C_ABI_VALUE,
+    V3_NATIVE_IMPORT_C_ABI_ADDRESS
+} V3NativeImportKind;
+
+typedef enum {
     V3_WASM_SLOT_UNSUPPORTED = 0,
     V3_WASM_SLOT_VOID,
     V3_WASM_SLOT_I32
@@ -3357,6 +3363,37 @@ typedef enum {
     V3_WASM_COMPOSITE_COPY_FROM_LOCAL_ADDRESS = 0,
     V3_WASM_COMPOSITE_COPY_FROM_POINTER_RESULT
 } V3WasmCompositeCopyKind;
+
+typedef struct {
+    size_t param_count;
+    V3WasmCallArgSlotKind arg_slot_kinds[CHENG_V3_MAX_CALL_ARGS];
+    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
+    V3WasmImportKind import_kind;
+    bool supported;
+} V3WasmCallLoweringRule;
+
+typedef struct {
+    size_t param_count;
+    V3CallTargetArgKind arg_kinds[CHENG_V3_MAX_CALL_ARGS];
+    V3CallTargetReturnKind return_kind;
+    V3ReturnPassKind return_pass_kind;
+    V3CallResultKind result_kind;
+    V3NativeImportKind import_kind;
+    bool supported;
+} V3NativeCallLoweringRule;
+
+typedef enum {
+    V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED = 0,
+    V3_NATIVE_COMPOSITE_RESULT_DEST_ADDRESS,
+    V3_NATIVE_COMPOSITE_RESULT_IMPORT_BUFFER
+} V3NativeCompositeResultKind;
+
+typedef struct {
+    V3NativeCallLoweringRule call_rule;
+    V3NativeCompositeResultKind composite_result_kind;
+    bool supported;
+} V3NativeCompositeCallLoweringRule;
 
 typedef enum {
     V3_FFI_HANDLE_ARG_NONE = 0,
@@ -5391,6 +5428,17 @@ static bool v3_resolve_field_meta(const V3LoweringPlanStub *lowering,
                                   char *field_abi,
                                   size_t field_abi_cap,
                                   int32_t *field_offset);
+static bool v3_resolve_call_target_with_args(const V3SystemLinkPlanStub *plan,
+                                             const V3LoweringPlanStub *lowering,
+                                             const V3LoweredFunctionStub *current_function,
+                                             const V3ImportAlias *aliases,
+                                             size_t alias_count,
+                                             const V3AsmLocalSlot *locals,
+                                             size_t local_count,
+                                             const char *callee,
+                                             const char args[][4096],
+                                             size_t arg_count,
+                                             V3AsmCallTarget *target);
 
 static V3CopyKind v3_result_intrinsic_projection_copy_kind(const V3LoweringPlanStub *lowering,
                                                            V3ResultIntrinsicKind kind,
@@ -5538,6 +5586,160 @@ static V3CallResultKind v3_call_target_result_kind(const V3AsmCallTarget *target
 
 static bool v3_call_target_result_uses_address(const V3AsmCallTarget *target) {
     return v3_call_target_result_kind(target) == V3_CALL_RESULT_ADDRESS;
+}
+
+static void v3_native_call_lowering_rule_init(V3NativeCallLoweringRule *rule) {
+    if (rule == NULL) {
+        return;
+    }
+    memset(rule, 0, sizeof(*rule));
+    rule->supported = false;
+}
+
+static V3NativeImportKind v3_native_call_target_import_kind(const V3AsmCallTarget *target) {
+    if (target == NULL || !target->external || !target->c_abi) {
+        return V3_NATIVE_IMPORT_NONE;
+    }
+    return v3_call_target_result_uses_address(target)
+        ? V3_NATIVE_IMPORT_C_ABI_ADDRESS
+        : V3_NATIVE_IMPORT_C_ABI_VALUE;
+}
+
+static bool v3_build_native_call_lowering_rule(const V3AsmCallTarget *target,
+                                               V3NativeCallLoweringRule *rule) {
+    size_t i;
+    if (target == NULL || rule == NULL || target->param_count > CHENG_V3_MAX_CALL_ARGS) {
+        return false;
+    }
+    v3_native_call_lowering_rule_init(rule);
+    rule->param_count = target->param_count;
+    for (i = 0U; i < target->param_count; ++i) {
+        rule->arg_kinds[i] = v3_call_target_arg_kind(target, i);
+    }
+    rule->return_kind = v3_call_target_return_kind(target);
+    rule->return_pass_kind = v3_call_target_return_pass_kind(target);
+    rule->result_kind = v3_call_target_result_kind(target);
+    rule->import_kind = v3_native_call_target_import_kind(target);
+    rule->supported = true;
+    return true;
+}
+
+static bool v3_native_call_rule_result_uses_address(const V3NativeCallLoweringRule *rule) {
+    return rule != NULL && rule->result_kind == V3_CALL_RESULT_ADDRESS;
+}
+
+static void v3_native_composite_call_lowering_rule_init(V3NativeCompositeCallLoweringRule *rule) {
+    if (rule == NULL) {
+        return;
+    }
+    memset(rule, 0, sizeof(*rule));
+    rule->supported = false;
+}
+
+static V3NativeCompositeResultKind v3_native_composite_result_kind_for_call_rule(const V3NativeCallLoweringRule *rule) {
+    if (rule == NULL || !rule->supported || !v3_native_call_rule_result_uses_address(rule)) {
+        return V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED;
+    }
+    return rule->import_kind == V3_NATIVE_IMPORT_C_ABI_ADDRESS
+        ? V3_NATIVE_COMPOSITE_RESULT_IMPORT_BUFFER
+        : V3_NATIVE_COMPOSITE_RESULT_DEST_ADDRESS;
+}
+
+static bool v3_build_native_composite_call_lowering_rule(const V3AsmCallTarget *target,
+                                                         V3NativeCompositeCallLoweringRule *rule) {
+    if (rule == NULL) {
+        return false;
+    }
+    v3_native_composite_call_lowering_rule_init(rule);
+    if (!v3_build_native_call_lowering_rule(target, &rule->call_rule)) {
+        return false;
+    }
+    rule->composite_result_kind =
+        v3_native_composite_result_kind_for_call_rule(&rule->call_rule);
+    rule->supported = rule->composite_result_kind != V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED;
+    return rule->supported;
+}
+
+static const char *v3_native_call_rule_arg_load_abi(const V3AsmCallTarget *target,
+                                                    const V3NativeCallLoweringRule *rule,
+                                                    size_t arg_index) {
+    V3CallTargetArgKind kind;
+    if (target == NULL || rule == NULL ||
+        arg_index >= CHENG_V3_MAX_CALL_ARGS ||
+        arg_index >= target->param_count ||
+        arg_index >= rule->param_count) {
+        abort();
+    }
+    kind = rule->arg_kinds[arg_index];
+    if (kind == V3_CALL_TARGET_ARG_VAR_LVALUE ||
+        kind == V3_CALL_TARGET_ARG_ADDRESS ||
+        kind == V3_CALL_TARGET_ARG_FFI_HANDLE_RESOLVE ||
+        kind == V3_CALL_TARGET_ARG_FFI_HANDLE_RESOLVE_CONSUME) {
+        return "ptr";
+    }
+    return target->param_abi_classes[arg_index];
+}
+
+static bool v3_resolve_native_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+                                                           const V3LoweringPlanStub *lowering,
+                                                           const V3LoweredFunctionStub *current_function,
+                                                           const V3ImportAlias *aliases,
+                                                           size_t alias_count,
+                                                           const V3AsmLocalSlot *locals,
+                                                           size_t local_count,
+                                                           const char *callee,
+                                                           const char args[][4096],
+                                                           size_t arg_count,
+                                                           V3AsmCallTarget *target,
+                                                           V3NativeCallLoweringRule *rule) {
+    if (target == NULL || rule == NULL) {
+        return false;
+    }
+    if (!v3_resolve_call_target_with_args(plan,
+                                          lowering,
+                                          current_function,
+                                          aliases,
+                                          alias_count,
+                                          locals,
+                                          local_count,
+                                          callee,
+                                          args,
+                                          arg_count,
+                                          target)) {
+        return false;
+    }
+    return v3_build_native_call_lowering_rule(target, rule);
+}
+
+static bool v3_resolve_native_composite_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+                                                                     const V3LoweringPlanStub *lowering,
+                                                                     const V3LoweredFunctionStub *current_function,
+                                                                     const V3ImportAlias *aliases,
+                                                                     size_t alias_count,
+                                                                     const V3AsmLocalSlot *locals,
+                                                                     size_t local_count,
+                                                                     const char *callee,
+                                                                     const char args[][4096],
+                                                                     size_t arg_count,
+                                                                     V3AsmCallTarget *target,
+                                                                     V3NativeCompositeCallLoweringRule *rule) {
+    if (target == NULL || rule == NULL) {
+        return false;
+    }
+    if (!v3_resolve_call_target_with_args(plan,
+                                          lowering,
+                                          current_function,
+                                          aliases,
+                                          alias_count,
+                                          locals,
+                                          local_count,
+                                          callee,
+                                          args,
+                                          arg_count,
+                                          target)) {
+        return false;
+    }
+    return v3_build_native_composite_call_lowering_rule(target, rule);
 }
 
 static bool v3_is_internal_ref_type(const char *type_text) {
@@ -19400,7 +19602,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                      const V3ImportAlias *aliases,
                                      size_t alias_count,
                                      const V3AsmCallTarget *target,
-                                     bool composite_return,
+                                     const V3NativeCallLoweringRule *rule,
                                      int32_t call_arg_base,
                                      int call_depth,
                                      char *out,
@@ -21250,22 +21452,6 @@ static void v3_emit_call_arg_spill_load_adjusted(char *out,
     }
 }
 
-static const char *v3_call_arg_load_abi(const V3AsmCallTarget *target, size_t arg_index) {
-    V3CallTargetArgKind kind;
-    if (target == NULL || arg_index >= CHENG_V3_MAX_CALL_ARGS ||
-        arg_index >= target->param_count) {
-        return "ptr";
-    }
-    kind = v3_call_target_arg_kind(target, arg_index);
-    if (kind == V3_CALL_TARGET_ARG_VAR_LVALUE ||
-        kind == V3_CALL_TARGET_ARG_ADDRESS ||
-        kind == V3_CALL_TARGET_ARG_FFI_HANDLE_RESOLVE ||
-        kind == V3_CALL_TARGET_ARG_FFI_HANDLE_RESOLVE_CONSUME) {
-        return "ptr";
-    }
-    return target->param_abi_classes[arg_index];
-}
-
 static void v3_emit_call_dest_spill_store_abi(char *out,
                                               size_t cap,
                                               int32_t call_arg_base,
@@ -21386,16 +21572,15 @@ static bool v3_emit_scalar_call_ffi_handle_arg(const V3SystemLinkPlanStub *plan,
 
 static void v3_emit_scalar_call_ffi_handle_return_fixups(const V3SystemLinkPlanStub *plan,
                                                          const V3AsmCallTarget *target,
+                                                         const V3NativeCallLoweringRule *rule,
                                                          int32_t call_arg_base,
                                                          int call_depth,
                                                          char *out,
                                                          size_t cap) {
-    V3CallTargetReturnKind return_kind;
     size_t consume_index = 0U;
     if (plan == NULL || target == NULL || out == NULL) {
         return;
     }
-    return_kind = v3_call_target_return_kind(target);
     if (target->ffi_handle_consume_index >= 0) {
         consume_index = (size_t)target->ffi_handle_consume_index;
         if (strcmp(target->return_abi_class, "void") != 0) {
@@ -21431,7 +21616,8 @@ static void v3_emit_scalar_call_ffi_handle_return_fixups(const V3SystemLinkPlanS
                                         target->return_abi_class);
         }
     }
-    if (return_kind == V3_CALL_TARGET_RETURN_FFI_HANDLE_REGISTER) {
+    if (rule != NULL &&
+        rule->return_kind == V3_CALL_TARGET_RETURN_FFI_HANDLE_REGISTER) {
         v3_emit_unary_helper_call(plan,
                                   out,
                                   cap,
@@ -21994,16 +22180,20 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                      const V3ImportAlias *aliases,
                                      size_t alias_count,
                                      const V3AsmCallTarget *target,
-                                     bool composite_return,
+                                     const V3NativeCallLoweringRule *rule,
                                      int32_t call_arg_base,
                                      int call_depth,
                                      char *out,
                                      size_t cap) {
     size_t i;
-    if (!target) {
+    bool composite_return;
+    if (!target || rule == NULL || !rule->supported ||
+        rule->param_count != target->param_count) {
         return false;
     }
-    if (v3_active_target_is_linux_x86_64() && target->external && target->c_abi) {
+    composite_return = v3_native_call_rule_result_uses_address(rule);
+    if (v3_active_target_is_linux_x86_64() &&
+        rule->import_kind != V3_NATIVE_IMPORT_NONE) {
         int call_reg_count = v3_call_arg_reg_count_for_target(plan, composite_return);
         int gp_arg_index = 0;
         int32_t raw_stack_bytes = 0;
@@ -22038,7 +22228,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
         gp_arg_index = 0;
         stack_offset = 0;
         for (i = 0; i < target->param_count; ++i) {
-            const char *arg_abi = v3_call_arg_load_abi(target, i);
+            const char *arg_abi = v3_native_call_rule_arg_load_abi(target, rule, i);
             int32_t composite_stack_bytes = 0;
             if (!v3_x64_external_memory_arg_stack_bytes(lowering,
                                                         current_function,
@@ -22119,7 +22309,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                                  call_depth,
                                                  i,
                                                  v3_x64_call_arg_virtual_reg((size_t)gp_arg_index, composite_return),
-                                                 v3_call_arg_load_abi(target, i),
+                                                 v3_native_call_rule_arg_load_abi(target, rule, i),
                                                  stack_arg_bytes);
             gp_arg_index += 1;
         }
@@ -22149,7 +22339,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                 v3_text_appendf(out, cap, "  sub sp, sp, #%d\n", stack_arg_bytes);
             }
             for (i = (size_t)call_reg_count; i < target->param_count; ++i) {
-                const char *stack_abi = v3_call_arg_load_abi(target, i);
+                const char *stack_abi = v3_native_call_rule_arg_load_abi(target, rule, i);
                 int32_t offset = (int32_t)(i - (size_t)call_reg_count) * 8;
                 v3_emit_call_arg_spill_load_adjusted(out,
                                                      cap,
@@ -22186,7 +22376,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                                  call_depth,
                                                  i,
                                                  dest_reg,
-                                                 v3_call_arg_load_abi(target, i),
+                                                 v3_native_call_rule_arg_load_abi(target, rule, i),
                                                  stack_arg_bytes);
         }
         if (composite_return) {
@@ -24270,6 +24460,7 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
         v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
         V3AsmCallTarget target;
+        V3NativeCallLoweringRule rule;
         bool has_target = false;
         bool is_constructor_call = false;
         V3ResultIntrinsicKind result_kind;
@@ -24400,10 +24591,17 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                       (const char (*)[4096])args,
                                                       arg_count,
                                                       &target);
+        if (has_target && !v3_build_native_call_lowering_rule(&target, &rule)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] prepare call lowering rule failed caller=%s callee=%s\n",
+                    current_function->symbol_text,
+                    callee);
+            return false;
+        }
         for (i = 0; i < arg_count; ++i) {
             V3CallTargetArgKind arg_kind =
-                has_target && i < target.param_count
-                    ? v3_call_target_arg_kind(&target, i)
+                has_target && i < rule.param_count
+                    ? rule.arg_kinds[i]
                     : V3_CALL_TARGET_ARG_VALUE;
             if (!has_target &&
                 i == 0U &&
@@ -24460,10 +24658,10 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                     callee,
                                                     i,
                                                     args[i],
-                                                    has_target && i < target.param_count
+                                                    has_target && i < rule.param_count
                                                         ? target.param_types[i]
                                                         : "",
-                                                    has_target && i < target.param_count
+                                                    has_target && i < rule.param_count
                                                         ? target.param_abi_classes[i]
                                                         : "")) {
                 fprintf(stderr,
@@ -26394,6 +26592,7 @@ static bool v3_try_prepare_index_assignment_call_state(const V3SystemLinkPlanStu
     char normalized_base_type[256];
     char fixed_elem_type[256];
     V3AsmCallTarget target;
+    V3NativeCallLoweringRule rule;
     size_t i;
     int next_call_depth = call_depth + 1;
     bool has_target = false;
@@ -26471,9 +26670,12 @@ static bool v3_try_prepare_index_assignment_call_state(const V3SystemLinkPlanStu
     if (!has_target) {
         return true;
     }
+    if (!v3_build_native_call_lowering_rule(&target, &rule)) {
+        return false;
+    }
     for (i = 0U; i < 3U; ++i) {
-        if (i < target.param_count) {
-            V3CallTargetArgKind arg_kind = v3_call_target_arg_kind(&target, i);
+        if (i < rule.param_count) {
+            V3CallTargetArgKind arg_kind = rule.arg_kinds[i];
             if (arg_kind != V3_CALL_TARGET_ARG_ADDRESS) {
                 continue;
             }
@@ -26524,6 +26726,7 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
                                             char *out,
                                             size_t cap) {
     V3AsmCallTarget target;
+    V3NativeCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
     bool call_rewritten = false;
     size_t i;
@@ -26541,24 +26744,25 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
     callee = canonical_callee;
     if (resolved_target != NULL && !call_rewritten) {
         memcpy(&target, resolved_target, sizeof(target));
-    } else if (!v3_resolve_call_target_with_args(plan,
-                                                 lowering,
-                                                 current_function,
-                                                 aliases,
-                                                 alias_count,
-                                                 locals,
-                                                 local_count,
-                                                 callee,
-                                                 (const char (*)[4096])args,
-                                                 arg_count,
-                                                 &target)) {
+    } else if (!v3_resolve_native_call_lowering_rule_with_args(plan,
+                                                               lowering,
+                                                               current_function,
+                                                               aliases,
+                                                               alias_count,
+                                                               locals,
+                                                               local_count,
+                                                               callee,
+                                                               (const char (*)[4096])args,
+                                                               arg_count,
+                                                               &target,
+                                                               &rule)) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call resolve failed caller=%s callee=%s\n",
                 current_function->symbol_text,
                 callee);
         return false;
     }
-    if (v3_call_target_result_uses_address(&target)) {
+    if (v3_native_call_rule_result_uses_address(&rule)) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call non-scalar return caller=%s callee=%s ret_abi=%s\n",
                 current_function->symbol_text,
@@ -26566,17 +26770,17 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
                 target.return_abi_class);
         return false;
     }
-    if (target.param_count != arg_count || target.param_count > CHENG_V3_MAX_CALL_ARGS) {
+    if (rule.param_count != arg_count || rule.param_count > CHENG_V3_MAX_CALL_ARGS) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call param mismatch caller=%s callee=%s expected=%zu got=%zu\n",
                 current_function->symbol_text,
                 callee,
-                target.param_count,
+                rule.param_count,
                 arg_count);
         return false;
     }
     for (i = 0; i < arg_count; ++i) {
-        V3CallTargetArgKind arg_kind = v3_call_target_arg_kind(&target, i);
+        V3CallTargetArgKind arg_kind = rule.arg_kinds[i];
         if (arg_kind == V3_CALL_TARGET_ARG_VAR_LVALUE) {
             char lvalue_type[256];
             char lvalue_abi[32];
@@ -26714,7 +26918,7 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
                                       aliases,
                                       alias_count,
                                       &target,
-                                      false,
+                                      &rule,
                                       call_arg_base,
                                       call_depth,
                                       out,
@@ -26723,6 +26927,7 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
         }
         v3_emit_scalar_call_ffi_handle_return_fixups(plan,
                                                      &target,
+                                                     &rule,
                                                      call_arg_base,
                                                      call_depth,
                                                      out,
@@ -27571,6 +27776,7 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
         }
         if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
             V3AsmCallTarget str_eq_target;
+            V3NativeCallLoweringRule str_eq_rule;
             memset(&str_eq_target, 0, sizeof(str_eq_target));
             str_eq_target.external = true;
             str_eq_target.param_count = 2U;
@@ -27603,13 +27809,16 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
                                          1U,
                                          "ptr",
                                          9);
+            if (!v3_build_native_call_lowering_rule(&str_eq_target, &str_eq_rule)) {
+                return false;
+            }
             if (!v3_emit_call_from_spills(plan,
                                           lowering,
                                           current_function,
                                           aliases,
                                           alias_count,
                                           &str_eq_target,
-                                          false,
+                                          &str_eq_rule,
                                           call_arg_base,
                                           call_depth,
                                           out,
@@ -30742,6 +30951,8 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                          char *out,
                                          size_t cap) {
     V3AsmCallTarget target;
+    V3NativeCompositeCallLoweringRule composite_rule;
+    const V3NativeCallLoweringRule *rule = &composite_rule.call_rule;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -30756,22 +30967,23 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
         return false;
     }
     callee = canonical_callee;
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          current_function,
-                                          aliases,
-                                          alias_count,
-                                          locals,
-                                          local_count,
-                                          callee,
-                                          (const char (*)[4096])args,
-                                          arg_count,
-                                          &target)) {
+    if (!v3_resolve_native_composite_call_lowering_rule_with_args(plan,
+                                                                  lowering,
+                                                                  current_function,
+                                                                  aliases,
+                                                                  alias_count,
+                                                                  locals,
+                                                                  local_count,
+                                                                  callee,
+                                                                  (const char (*)[4096])args,
+                                                                  arg_count,
+                                                                  &target,
+                                                                  &composite_rule)) {
         return false;
     }
-    if (!v3_call_target_result_uses_address(&target) ||
-        target.param_count != arg_count ||
-        target.param_count > CHENG_V3_MAX_CALL_ARGS) {
+    if (!composite_rule.supported ||
+        rule->param_count != arg_count ||
+        rule->param_count > CHENG_V3_MAX_CALL_ARGS) {
         return false;
     }
     v3_emit_call_dest_spill_store(out,
@@ -30780,7 +30992,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                   call_depth,
                                   dest_addr_reg);
     for (i = 0; i < arg_count; ++i) {
-        V3CallTargetArgKind arg_kind = v3_call_target_arg_kind(&target, i);
+        V3CallTargetArgKind arg_kind = rule->arg_kinds[i];
         if (arg_kind == V3_CALL_TARGET_ARG_VAR_LVALUE) {
             char lvalue_type[256];
             char lvalue_abi[32];
@@ -30898,7 +31110,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                     aliases,
                                     alias_count,
                                     &target,
-                                    true,
+                                    rule,
                                     call_arg_base,
                                     call_depth,
                                     out,
@@ -32084,6 +32296,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         char (*args)[4096] = v3_alloc_call_arg_scratch();
         if (v3_parse_call_text(expr, inner_callee, sizeof(inner_callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
             V3AsmCallTarget target;
+            V3NativeCompositeCallLoweringRule composite_rule;
             V3ResultIntrinsicKind result_kind =
                 v3_resolve_result_intrinsic_kind(lowering,
                                                  current_function->owner_module_path,
@@ -32114,21 +32327,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                 free(args);
                 return ok;
             }
-            if (v3_resolve_call_target_with_args(plan,
-                                                 lowering,
-                                                 current_function,
-                                                 aliases,
-                                                 alias_count,
-                                                 locals,
-                                                 local_count,
-                                                 inner_callee,
-                                                 args,
-                                                 arg_count,
-                                                 &target)) {
-                if (!v3_call_target_result_uses_address(&target)) {
-                    free(args);
-                    return false;
-                }
+            if (v3_resolve_native_composite_call_lowering_rule_with_args(plan,
+                                                                         lowering,
+                                                                         current_function,
+                                                                         aliases,
+                                                                         alias_count,
+                                                                         locals,
+                                                                         local_count,
+                                                                         inner_callee,
+                                                                         args,
+                                                                         arg_count,
+                                                                         &target,
+                                                                         &composite_rule)) {
                 if (!v3_codegen_call_into_address(plan,
                                                   lowering,
                                                   current_function,
@@ -32187,6 +32397,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
     }
     if (v3_parse_prefix_single_arg_call(expr, inner_callee, sizeof(inner_callee), arg_text, sizeof(arg_text))) {
         V3AsmCallTarget target;
+        V3NativeCompositeCallLoweringRule composite_rule;
         V3ResultIntrinsicKind result_kind =
             v3_resolve_result_intrinsic_kind(lowering,
                                              current_function->owner_module_path,
@@ -32221,18 +32432,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
             free(args);
             return ok;
         }
-        if (!v3_resolve_call_target_with_args(plan,
-                                              lowering,
-                                              current_function,
-                                              aliases,
-                                              alias_count,
-                                              locals,
-                                              local_count,
-                                              inner_callee,
-                                              (const char (*)[4096])args,
-                                              1U,
-                                              &target) ||
-            !v3_call_target_result_uses_address(&target)) {
+        if (!v3_resolve_native_composite_call_lowering_rule_with_args(plan,
+                                                                      lowering,
+                                                                      current_function,
+                                                                      aliases,
+                                                                      alias_count,
+                                                                      locals,
+                                                                      local_count,
+                                                                      inner_callee,
+                                                                      (const char (*)[4096])args,
+                                                                      1U,
+                                                                      &target,
+                                                                      &composite_rule)) {
             free(args);
             return false;
         }
@@ -32457,6 +32668,7 @@ static bool v3_emit_builtin_str_to_cstring_bridge(const V3SystemLinkPlanStub *pl
                                                   char *out,
                                                   size_t cap) {
     V3AsmCallTarget target;
+    V3NativeCallLoweringRule rule;
     memset(&target, 0, sizeof(target));
     target.external = true;
     target.param_count = 1U;
@@ -32476,13 +32688,16 @@ static bool v3_emit_builtin_str_to_cstring_bridge(const V3SystemLinkPlanStub *pl
                                  0U,
                                  "ptr",
                                  addr_reg);
+    if (!v3_build_native_call_lowering_rule(&target, &rule)) {
+        return false;
+    }
     return v3_emit_call_from_spills(plan,
                                     lowering,
                                     current_function,
                                     aliases,
                                     alias_count,
                                     &target,
-                                    false,
+                                    &rule,
                                     call_arg_base,
                                     call_depth,
                                     out,
@@ -40819,6 +41034,9 @@ static V3WasmCallResultKind v3_wasm_call_target_result_kind(const V3AsmCallTarge
 
 static V3WasmImportKind v3_wasm_call_target_import_kind(const V3AsmCallTarget *target);
 
+static bool v3_wasm_build_call_lowering_rule(const V3AsmCallTarget *target,
+                                             V3WasmCallLoweringRule *rule);
+
 static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
                                            uint32_t *type_index_out);
 
@@ -41276,10 +41494,12 @@ static bool v3_wasm_register_import(const char *function_symbol,
                                     V3WasmImportStub *imports,
                                     size_t *import_count) {
     uint32_t type_index = 0U;
+    V3WasmCallLoweringRule rule;
     if (target == NULL || !target->external) {
         return true;
     }
-    if (!v3_wasm_call_target_type_index(target, &type_index)) {
+    if (!v3_wasm_build_call_lowering_rule(target, &rule) ||
+        !v3_wasm_call_target_type_index(target, &type_index)) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm unsupported external call signature function=%s symbol=%s ret=%s argc=%zu\n",
                 function_symbol,
@@ -41309,23 +41529,15 @@ static bool v3_wasm_register_import(const char *function_symbol,
 
 static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
                                            uint32_t *type_index_out) {
-    V3WasmImportKind import_kind;
-    size_t i;
+    V3WasmCallLoweringRule rule;
     if (target == NULL || type_index_out == NULL || target->param_count > CHENG_V3_MAX_CALL_ARGS) {
         return false;
     }
-    import_kind = v3_wasm_call_target_import_kind(target);
-    if (import_kind == V3_WASM_IMPORT_UNSUPPORTED) {
+    if (!v3_wasm_build_call_lowering_rule(target, &rule) || !rule.supported) {
         return false;
     }
-    for (i = 0U; i < target->param_count; ++i) {
-        if (v3_wasm_call_arg_slot_kind(target->param_types[i],
-                                       target->param_abi_classes[i]) == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED) {
-            return false;
-        }
-    }
-    *type_index_out = v3_wasm_signature_type_slot(target->param_count,
-                                                  import_kind != V3_WASM_IMPORT_VOID);
+    *type_index_out = v3_wasm_signature_type_slot(rule.param_count,
+                                                  rule.import_kind != V3_WASM_IMPORT_VOID);
     return true;
 }
 
@@ -43252,6 +43464,21 @@ static bool v3_wasm_call_arg_prefers_address(const char *param_type,
     return v3_call_arg_passes_by_address(param_type, param_abi);
 }
 
+static void v3_wasm_call_lowering_rule_init(V3WasmCallLoweringRule *rule) {
+    size_t i;
+    if (rule == NULL) {
+        return;
+    }
+    memset(rule, 0, sizeof(*rule));
+    for (i = 0U; i < CHENG_V3_MAX_CALL_ARGS; ++i) {
+        rule->arg_slot_kinds[i] = V3_WASM_CALL_ARG_SLOT_UNSUPPORTED;
+    }
+    rule->return_slot_kind = V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED;
+    rule->result_kind = V3_WASM_CALL_RESULT_UNSUPPORTED;
+    rule->import_kind = V3_WASM_IMPORT_UNSUPPORTED;
+    rule->supported = false;
+}
+
 static V3WasmCallArgSlotKind v3_wasm_call_arg_slot_kind(const char *param_type,
                                                         const char *param_abi) {
     if (v3_wasm_param_slot_kind(param_abi) != V3_WASM_SLOT_I32) {
@@ -43310,6 +43537,36 @@ static V3WasmImportKind v3_wasm_call_target_import_kind(const V3AsmCallTarget *t
         return V3_WASM_IMPORT_I32_ADDRESS_SLOT;
     }
     return V3_WASM_IMPORT_UNSUPPORTED;
+}
+
+static bool v3_wasm_build_call_lowering_rule(const V3AsmCallTarget *target,
+                                             V3WasmCallLoweringRule *rule) {
+    size_t i;
+    if (target == NULL || rule == NULL || target->param_count > CHENG_V3_MAX_CALL_ARGS) {
+        return false;
+    }
+    v3_wasm_call_lowering_rule_init(rule);
+    rule->param_count = target->param_count;
+    for (i = 0U; i < target->param_count; ++i) {
+        rule->arg_slot_kinds[i] = v3_wasm_call_arg_slot_kind(target->param_types[i],
+                                                             target->param_abi_classes[i]);
+        if (rule->arg_slot_kinds[i] == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED) {
+            return false;
+        }
+    }
+    rule->return_slot_kind = v3_wasm_call_target_return_slot_kind(target);
+    rule->result_kind = v3_wasm_call_target_result_kind(target);
+    if (rule->result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED) {
+        return false;
+    }
+    if (target->external) {
+        rule->import_kind = v3_wasm_call_target_import_kind(target);
+        if (rule->import_kind == V3_WASM_IMPORT_UNSUPPORTED) {
+            return false;
+        }
+    }
+    rule->supported = true;
+    return true;
 }
 
 static bool v3_wasm_prepare_call_arg_state(const V3SystemLinkPlanStub *plan,
@@ -43466,7 +43723,7 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
                                  V3WasmImportStub *imports,
                                  size_t *import_count) {
     V3AsmCallTarget target;
-    V3WasmCallResultKind result_kind;
+    V3WasmCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -43498,9 +43755,9 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
                 callee);
         return false;
     }
-    result_kind = v3_wasm_call_target_result_kind(&target);
-    if (result_kind == V3_WASM_CALL_RESULT_VOID ||
-        result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED ||
+    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
+        !rule.supported ||
+        rule.result_kind == V3_WASM_CALL_RESULT_VOID ||
         target.param_count != arg_count) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm call signature reject function=%s callee=%s ret=%s argc=%zu expected=%zu\n",
@@ -43512,6 +43769,9 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
+        if (rule.arg_slot_kinds[i] == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED) {
+            return false;
+        }
         if (!v3_wasm_prepare_call_arg_state(plan,
                                             lowering,
                                             function,
@@ -43540,7 +43800,7 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
                                            size_t *import_count) {
     bool handled = false;
     V3AsmCallTarget target;
-    V3WasmCallResultKind result_kind;
+    V3WasmCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -43597,8 +43857,8 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
                 target.param_count);
         return false;
     }
-    result_kind = v3_wasm_call_target_result_kind(&target);
-    if (result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED) {
+    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
+        !rule.supported) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm statement call ret reject function=%s callee=%s ret=%s\n",
                 function->symbol_text,
@@ -43607,6 +43867,15 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
+        if (rule.arg_slot_kinds[i] == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] wasm statement call arg reject function=%s callee=%s index=%zu abi=%s\n",
+                    function->symbol_text,
+                    callee,
+                    i,
+                    target.param_abi_classes[i]);
+            return false;
+        }
         if (!v3_wasm_prepare_call_arg_state(plan,
                                             lowering,
                                             function,
@@ -44756,7 +45025,7 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
                                    size_t import_count,
                                    V3WasmBuffer *body) {
     V3AsmCallTarget target;
-    V3WasmCallResultKind result_kind;
+    V3WasmCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -44789,9 +45058,9 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
                 arg_count);
         return false;
     }
-    result_kind = v3_wasm_call_target_result_kind(&target);
-    if (result_kind == V3_WASM_CALL_RESULT_VOID ||
-        result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED ||
+    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
+        !rule.supported ||
+        rule.result_kind == V3_WASM_CALL_RESULT_VOID ||
         target.param_count != arg_count) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm emit call signature reject function=%s callee=%s ret=%s argc=%zu expected=%zu\n",
@@ -44803,8 +45072,7 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
-        if (v3_wasm_call_arg_slot_kind(target.param_types[i],
-                                       target.param_abi_classes[i]) == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED ||
+        if (rule.arg_slot_kinds[i] == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED ||
             !v3_wasm_emit_call_arg_value(plan,
                                          lowering,
                                          function,
@@ -44842,7 +45110,7 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
                                         V3WasmBuffer *body) {
     bool handled = false;
     V3AsmCallTarget target;
-    V3WasmCallResultKind result_kind;
+    V3WasmCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
@@ -44887,13 +45155,12 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
         target.param_count != arg_count) {
         return false;
     }
-    result_kind = v3_wasm_call_target_result_kind(&target);
-    if (result_kind == V3_WASM_CALL_RESULT_UNSUPPORTED) {
+    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
+        !rule.supported) {
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
-        if (v3_wasm_call_arg_slot_kind(target.param_types[i],
-                                       target.param_abi_classes[i]) == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED ||
+        if (rule.arg_slot_kinds[i] == V3_WASM_CALL_ARG_SLOT_UNSUPPORTED ||
             !v3_wasm_emit_call_arg_value(plan,
                                          lowering,
                                          function,
@@ -44912,7 +45179,7 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
     if (!v3_wasm_emit_call_target(lowering, &target, imports, import_count, body)) {
         return false;
     }
-    if (result_kind == V3_WASM_CALL_RESULT_VOID) {
+    if (rule.result_kind == V3_WASM_CALL_RESULT_VOID) {
         return true;
     }
     return v3_wasm_append_u8(body, 0x1aU);

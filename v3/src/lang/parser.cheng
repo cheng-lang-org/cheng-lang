@@ -84,6 +84,22 @@ type
         targetProfileIndex: int32
         reason: str
 
+    V3ParserTextSeqCacheEntry =
+        profileIndex: int32
+        items: str[]
+
+    V3ParserTextLookupBucket =
+        keyLen: int32
+        firstCode: int32
+        lastCode: int32
+        dotCount: int32
+        items: str[]
+
+    V3ParserTextLookup =
+        slots: int32[]
+        buckets: V3ParserTextLookupBucket[]
+        totalCount: int32
+
 fn v3ParsedSourceKindText(kind: V3ParsedSourceKind): str =
     if kind == v3ParsedOrdinarySource:
         return "ordinary_cheng_source"
@@ -1039,8 +1055,13 @@ fn v3ParserQualifierRoot(qualifierRaw: str): str =
 fn v3ParserQualifiedTargetShadowReason(currentProfile: V3NormalizedExprCallProfile,
                                        lineNumber: int32,
                                        targetRaw: str): str =
-    let qualifier = v3path.V3PathTrim(v3ParserCallExprDetailQualifier("", targetRaw))
-    let rootQualifier = v3ParserQualifierRoot(qualifier)
+    let target = v3path.V3PathTrim(targetRaw)
+    if target == "":
+        return ""
+    let dotPos = v3ParserFindText(target, ".")
+    if dotPos <= 0:
+        return ""
+    let rootQualifier = v3ParserIdentPrefix(target)
     if rootQualifier == "":
         return ""
     let visibleBindings = v3ParserVisibleLocalBindingNames(currentProfile, lineNumber)
@@ -1147,12 +1168,12 @@ fn v3ParserCallExprDetailTargetImportc(detailRaw: str): bool =
 fn v3ParserAppendCallExprsLine(sourcePath: str,
                                lineNumber: int32,
                                lineRaw: str,
-                               callNames: str[],
+                               callLookup: V3ParserTextLookup,
                                detailKind: str,
                                currentProfile: V3NormalizedExprCallProfile,
                                profiles: V3NormalizedExprCallProfile[],
                                layer: var V3NormalizedExprLayer) =
-    if callNames.len <= 0:
+    if callLookup.totalCount <= 0:
         return
     var i: int32 = 0
     while i < lineRaw.len:
@@ -1213,15 +1234,13 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
         let nextPos = v3ParserSkipInlineSpaces(lineRaw, stop)
         var hasCallParen = false
         if nextPos < lineRaw.len:
-            hasCallParen = v3path.V3TextSlice(lineRaw, nextPos, 1) == "("
+            hasCallParen = lineRaw[nextPos] == '('
         var matchedSurfaceText = ""
         if hasCallParen && !v3ParserCallExprUsesDedicatedNormalization(callName):
-            if dottedCallName != callName && v3ParserStringSeqContainsExact(callNames, dottedCallName):
-                matchedSurfaceText = dottedCallName
-            elif qualifiedCallName != callName && v3ParserStringSeqContainsExact(callNames, qualifiedCallName):
-                matchedSurfaceText = qualifiedCallName
-            elif v3ParserStringSeqContainsExact(callNames, callName):
-                matchedSurfaceText = callName
+            matchedSurfaceText = v3ParserMatchKnownCallSurfaceText(callLookup,
+                                                                  callName,
+                                                                  qualifiedCallName,
+                                                                  dottedCallName)
         if detailKind == "external_call" && matchedSurfaceText != "":
             let shadowReason = v3ParserQualifiedTargetShadowReason(currentProfile, lineNumber, matchedSurfaceText)
             if shadowReason != "":
@@ -1254,10 +1273,10 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
 fn v3ParserAppendMemberCallExprsLine(sourcePath: str,
                                      lineNumber: int32,
                                      lineRaw: str,
-                                     knownCallNames: str[],
+                                     knownCallLookup: V3ParserTextLookup,
                                      currentProfile: V3NormalizedExprCallProfile,
                                      layer: var V3NormalizedExprLayer) =
-    if knownCallNames.len <= 0:
+    if knownCallLookup.totalCount <= 0:
         return
     var i: int32 = 0
     while i < lineRaw.len:
@@ -1312,12 +1331,13 @@ fn v3ParserAppendMemberCallExprsLine(sourcePath: str,
         let nextPos = v3ParserSkipInlineSpaces(lineRaw, stop)
         var hasCallParen = false
         if nextPos < lineRaw.len:
-            hasCallParen = v3path.V3TextSlice(lineRaw, nextPos, 1) == "("
+            hasCallParen = lineRaw[nextPos] == '('
         if hasCallParen && dottedCallName != callName && !v3ParserCallExprUsesDedicatedNormalization(callName):
             let shadowReason = v3ParserQualifiedTargetShadowReason(currentProfile, lineNumber, dottedCallName)
-            let knownCall = v3ParserStringSeqContainsExact(knownCallNames, dottedCallName) ||
-                            v3ParserStringSeqContainsExact(knownCallNames, qualifiedCallName) ||
-                            v3ParserStringSeqContainsExact(knownCallNames, callName)
+            let knownCall = v3ParserMatchKnownCallSurfaceText(knownCallLookup,
+                                                              callName,
+                                                              qualifiedCallName,
+                                                              dottedCallName) != ""
             if shadowReason != "" || !knownCall:
                 var qualifier = ""
                 let dotPos = v3ParserCallExprLastDot(dottedCallName)
@@ -1682,24 +1702,29 @@ fn v3ParserQualifiedCallDepth(prefixRaw: str): int32 =
     return depth
 
 fn v3ParserAppendQualifiedCallNames(out: var str[],
+                                    seen: var V3ParserTextLookup,
                                     prefixRaw: str,
                                     callNames: str[]) =
     let prefix = v3path.V3PathTrim(prefixRaw)
     if prefix == "":
         return
     for i in 0..<callNames.len:
-        if callNames[i] == "":
+        let callName = callNames[i]
+        if callName == "":
             continue
-        v3ParserAddUniqueText(out, v3ParserConcat3(prefix, ".", callNames[i]))
+        v3ParserAppendUniqueLookupText(out, seen, v3ParserConcat3(prefix, ".", callName))
 
 fn v3ParserAppendDirectExternalCallNames(out: var str[],
+                                         seen: var V3ParserTextLookup,
                                          callNames: str[]) =
     for i in 0..<callNames.len:
-        if callNames[i] == "":
+        let callName = callNames[i]
+        if callName == "":
             continue
-        v3ParserAddUniqueText(out, callNames[i])
+        v3ParserAppendUniqueLookupText(out, seen, callName)
 
 fn v3ParserAppendVisibleDirectExternalCallNames(out: var str[],
+                                                seen: var V3ParserTextLookup,
                                                 callNames: str[],
                                                 currentProfile: V3NormalizedExprCallProfile) =
     for i in 0..<callNames.len:
@@ -1710,7 +1735,7 @@ fn v3ParserAppendVisibleDirectExternalCallNames(out: var str[],
             continue
         if v3ParserStringSeqContainsExact(currentProfile.importcCallNames, callName):
             continue
-        v3ParserAddUniqueText(out, callName)
+        v3ParserAppendUniqueLookupText(out, seen, callName)
 
 fn v3ParserCloneTextSeq(items: str[]): str[] =
     var out: str[] = []
@@ -1722,6 +1747,7 @@ fn v3ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(rootProfile: V3No
                                                                profiles: V3NormalizedExprCallProfile[],
                                                                profileIndex: int32,
                                                                activeSourcePaths: str[],
+                                                               seen: var V3ParserTextLookup,
                                                                out: var str[]) =
     if profileIndex < 0 || profileIndex >= profiles.len:
         return
@@ -1744,8 +1770,8 @@ fn v3ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(rootProfile: V3No
             if targetProfileIndex < 0:
                 continue
             let targetProfile = profiles[targetProfileIndex]
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.localCallNames, rootProfile)
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.importcCallNames, rootProfile)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.localCallNames, rootProfile)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.importcCallNames, rootProfile)
             if v3ParserStringSeqContainsExact(visited, targetProfile.sourcePath):
                 continue
             add(visited, targetProfile.sourcePath)
@@ -1791,11 +1817,43 @@ fn v3ParserCollectResolvedUnqualifiedExternalTargetsRecursive(profiles: V3Normal
             add(visited, targetProfile.sourcePath)
             add(pending, targetProfileIndex)
 
+fn v3ParserCachedVisibleUnqualifiedExternalCallNames(profiles: V3NormalizedExprCallProfile[],
+                                                     profileIndex: int32,
+                                                     cache: var V3ParserTextSeqCacheEntry[]): str[] =
+    var i: int32 = 0
+    while i < cache.len:
+        if cache[i].profileIndex == profileIndex:
+            return cache[i].items
+        i = i + 1
+    var out: str[] = []
+    if profileIndex < 0 || profileIndex >= profiles.len:
+        return out
+    let rootProfile = profiles[profileIndex]
+    var activeSourcePaths: str[] = []
+    add(activeSourcePaths, rootProfile.sourcePath)
+    var seen: V3ParserTextLookup
+    seen.slots = []
+    seen.buckets = []
+    seen.totalCount = 0
+    v3ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(rootProfile,
+                                                                profiles,
+                                                                profileIndex,
+                                                                activeSourcePaths,
+                                                                seen,
+                                                                out)
+    var entry: V3ParserTextSeqCacheEntry
+    entry.profileIndex = profileIndex
+    entry.items = out
+    add(cache, entry)
+    return out
+
 fn v3ParserCollectExternalCallNamesRecursive(profiles: V3NormalizedExprCallProfile[],
                                              profileIndex: int32,
                                              prefixRaw: str,
                                              maxQualifiedCallDepth: int32,
                                              activeSourcePaths: str[],
+                                             visibleNameCache: var V3ParserTextSeqCacheEntry[],
+                                             seen: var V3ParserTextLookup,
                                              out: var str[]) =
     if profileIndex < 0 || profileIndex >= profiles.len:
         return
@@ -1813,23 +1871,18 @@ fn v3ParserCollectExternalCallNamesRecursive(profiles: V3NormalizedExprCallProfi
             continue
         let targetProfile = profiles[targetProfileIndex]
         if prefix == "" && v3ParserImportEdgeAllowsUnqualifiedCall(edge):
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.localCallNames, current)
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.importcCallNames, current)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.localCallNames, current)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.importcCallNames, current)
         let nextPrefix = v3ParserQualifiedCallPrefix(prefix, qualifier)
         let nextDepth = v3ParserQualifiedCallDepth(nextPrefix)
         if nextDepth > maxQualifiedCallDepth:
             continue
-        v3ParserAppendQualifiedCallNames(out, nextPrefix, targetProfile.localCallNames)
-        v3ParserAppendQualifiedCallNames(out, nextPrefix, targetProfile.importcCallNames)
-        var visibleNames: str[] = []
-        var targetActiveSourcePaths: str[] = []
-        add(targetActiveSourcePaths, targetProfile.sourcePath)
-        v3ParserCollectVisibleUnqualifiedExternalCallNamesRecursive(targetProfile,
-                                                                    profiles,
-                                                                    targetProfileIndex,
-                                                                    targetActiveSourcePaths,
-                                                                    visibleNames)
-        v3ParserAppendQualifiedCallNames(out, nextPrefix, visibleNames)
+        v3ParserAppendQualifiedCallNames(out, seen, nextPrefix, targetProfile.localCallNames)
+        v3ParserAppendQualifiedCallNames(out, seen, nextPrefix, targetProfile.importcCallNames)
+        let visibleNames = v3ParserCachedVisibleUnqualifiedExternalCallNames(profiles,
+                                                                             targetProfileIndex,
+                                                                             visibleNameCache)
+        v3ParserAppendQualifiedCallNames(out, seen, nextPrefix, visibleNames)
         if nextDepth >= maxQualifiedCallDepth:
             continue
         if v3ParserStringSeqContainsExact(activeSourcePaths, targetProfile.sourcePath):
@@ -1841,6 +1894,8 @@ fn v3ParserCollectExternalCallNamesRecursive(profiles: V3NormalizedExprCallProfi
                                                   nextPrefix,
                                                   maxQualifiedCallDepth,
                                                   nextActive,
+                                                  visibleNameCache,
+                                                  seen,
                                                   out)
 
 fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
@@ -1853,6 +1908,10 @@ fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
     let rootProfile = profiles[profileIndex]
     var activeSourcePaths: str[] = []
     add(activeSourcePaths, rootProfile.sourcePath)
+    var seen: V3ParserTextLookup
+    seen.slots = []
+    seen.buckets = []
+    seen.totalCount = 0
     var pending: int32[] = []
     add(pending, profileIndex)
     var pendingIndex: int32 = 0
@@ -1868,17 +1927,20 @@ fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
             if targetProfileIndex < 0:
                 continue
             let targetProfile = profiles[targetProfileIndex]
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.localCallNames, rootProfile)
-            v3ParserAppendVisibleDirectExternalCallNames(out, targetProfile.importcCallNames, rootProfile)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.localCallNames, rootProfile)
+            v3ParserAppendVisibleDirectExternalCallNames(out, seen, targetProfile.importcCallNames, rootProfile)
             if v3ParserStringSeqContainsExact(activeSourcePaths, targetProfile.sourcePath):
                 continue
             add(activeSourcePaths, targetProfile.sourcePath)
             add(pending, targetProfileIndex)
+    var visibleNameCache: V3ParserTextSeqCacheEntry[] = []
     v3ParserCollectExternalCallNamesRecursive(profiles,
                                               profileIndex,
                                               "",
                                               profiles[profileIndex].maxQualifiedCallDepth,
                                               activeSourcePaths,
+                                              visibleNameCache,
+                                              seen,
                                               out)
     names = out
 
@@ -1897,13 +1959,15 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         return false
     layer = v3NormalizedExprLayerZero()
     layer.sourceCount = 1
-    var knownCallNames: str[] = []
-    for i in 0..<localCallNames.len:
-        v3ParserAddUniqueText(knownCallNames, localCallNames[i])
-    for i in 0..<externalCallNames.len:
-        v3ParserAddUniqueText(knownCallNames, externalCallNames[i])
-    for i in 0..<importcCallNames.len:
-        v3ParserAddUniqueText(knownCallNames, importcCallNames[i])
+    let localCallLookup = v3ParserTextLookupBuild(localCallNames)
+    let externalCallLookup = v3ParserTextLookupBuild(externalCallNames)
+    let importcCallLookup = v3ParserTextLookupBuild(importcCallNames)
+    var knownCallLookup = v3ParserTextLookupInit(localCallNames.len +
+                                                 externalCallNames.len +
+                                                 importcCallNames.len + 8)
+    v3ParserTextLookupAddAll(knownCallLookup, localCallNames)
+    v3ParserTextLookupAddAll(knownCallLookup, externalCallNames)
+    v3ParserTextLookupAddAll(knownCallLookup, importcCallNames)
     let lines = v3ParserSplitChar(text, '\n')
     for i in 0..<lines.len:
         let line = v3ParserStripLineComment(lines[i])
@@ -1919,7 +1983,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    localCallNames,
+                                    localCallLookup,
                                     "local_call",
                                     currentProfile,
                                     profiles,
@@ -1927,7 +1991,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    externalCallNames,
+                                    externalCallLookup,
                                     "external_call",
                                     currentProfile,
                                     profiles,
@@ -1935,7 +1999,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
-                                    importcCallNames,
+                                    importcCallLookup,
                                     "importc_call",
                                     currentProfile,
                                     profiles,
@@ -1943,7 +2007,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendMemberCallExprsLine(sourcePath,
                                           lineNumber,
                                           line,
-                                          knownCallNames,
+                                          knownCallLookup,
                                           currentProfile,
                                           layer)
     layer.questionResidualCount = 0
@@ -2022,6 +2086,200 @@ fn v3ParserStringSeqContains(items: str[], targetRaw: str): bool =
         if items[i] == target:
             return true
     return false
+
+fn v3ParserTextLookupDotCount(text: str): int32 =
+    var count: int32 = 0
+    var i: int32 = 0
+    while i < text.len:
+        if text[i] == '.':
+            count = count + 1
+        i = i + 1
+    return count
+
+fn v3ParserTextLookupInit(minCap: int32): V3ParserTextLookup =
+    var lookup: V3ParserTextLookup
+    lookup.slots = []
+    lookup.buckets = []
+    lookup.totalCount = 0
+    var cap: int32 = 32
+    while cap < minCap:
+        cap = cap * 2
+    var i: int32 = 0
+    while i < cap:
+        add(lookup.slots, 0)
+        i = i + 1
+    return lookup
+
+fn v3ParserTextLookupHash(keyLen: int32,
+                          firstCode: int32,
+                          lastCode: int32,
+                          dotCount: int32): int64 =
+    var h: int64 = int64(keyLen)
+    h = h * 131 + int64(firstCode)
+    h = h * 131 + int64(lastCode)
+    h = h * 131 + int64(dotCount)
+    if h < 0:
+        h = -h
+    return h
+
+fn v3ParserTextLookupSlotForParts(lookup: V3ParserTextLookup,
+                                  keyLen: int32,
+                                  firstCode: int32,
+                                  lastCode: int32,
+                                  dotCount: int32): int32 =
+    if lookup.slots.len <= 0:
+        return -1
+    let mask = lookup.slots.len - 1
+    var probe: int32 = int32(v3ParserTextLookupHash(keyLen,
+                                                    firstCode,
+                                                    lastCode,
+                                                    dotCount) & int64(mask))
+    var scanned: int32 = 0
+    while scanned <= mask:
+        let bucketIndexPlus1 = lookup.slots[probe]
+        if bucketIndexPlus1 == 0:
+            return probe
+        let bucket = lookup.buckets[bucketIndexPlus1 - 1]
+        if bucket.keyLen == keyLen &&
+           bucket.firstCode == firstCode &&
+           bucket.lastCode == lastCode &&
+           bucket.dotCount == dotCount:
+            return probe
+        probe = (probe + 1) & mask
+        scanned = scanned + 1
+    return -1
+
+fn v3ParserTextLookupRehash(lookup: var V3ParserTextLookup,
+                            newCap: int32) =
+    var slots: int32[] = []
+    var i: int32 = 0
+    while i < newCap:
+        add(slots, 0)
+        i = i + 1
+    lookup.slots = slots
+    var bucketIndex: int32 = 0
+    while bucketIndex < lookup.buckets.len:
+        let bucket = lookup.buckets[bucketIndex]
+        let slot = v3ParserTextLookupSlotForParts(lookup,
+                                                  bucket.keyLen,
+                                                  bucket.firstCode,
+                                                  bucket.lastCode,
+                                                  bucket.dotCount)
+        if slot >= 0:
+            lookup.slots[slot] = bucketIndex + 1
+        bucketIndex = bucketIndex + 1
+
+fn v3ParserTextLookupGrow(lookup: var V3ParserTextLookup) =
+    var nextCap: int32 = lookup.slots.len * 2
+    if nextCap < 32:
+        nextCap = 32
+    v3ParserTextLookupRehash(lookup, nextCap)
+
+fn v3ParserTextLookupBucketIndexExact(lookup: V3ParserTextLookup,
+                                      text: str): int32 =
+    if text == "":
+        return -1
+    let keyLen = text.len
+    let firstCode = int32(text[0])
+    let lastCode = int32(text[keyLen - 1])
+    let dotCount = v3ParserTextLookupDotCount(text)
+    let slot = v3ParserTextLookupSlotForParts(lookup, keyLen, firstCode, lastCode, dotCount)
+    if slot < 0:
+        return -1
+    let bucketIndexPlus1 = lookup.slots[slot]
+    if bucketIndexPlus1 > 0:
+        return bucketIndexPlus1 - 1
+    return -1
+
+fn v3ParserTextLookupEnsureBucket(lookup: var V3ParserTextLookup,
+                                  text: str): int32 =
+    if lookup.slots.len <= 0:
+        lookup = v3ParserTextLookupInit(32)
+    if (lookup.buckets.len + 1) * 10 >= lookup.slots.len * 7:
+        v3ParserTextLookupGrow(lookup)
+    let keyLen = text.len
+    let firstCode = int32(text[0])
+    let lastCode = int32(text[keyLen - 1])
+    let dotCount = v3ParserTextLookupDotCount(text)
+    let slot = v3ParserTextLookupSlotForParts(lookup, keyLen, firstCode, lastCode, dotCount)
+    if slot < 0:
+        return -1
+    let existing = lookup.slots[slot]
+    if existing > 0:
+        return existing - 1
+    var bucket: V3ParserTextLookupBucket
+    bucket.keyLen = keyLen
+    bucket.firstCode = firstCode
+    bucket.lastCode = lastCode
+    bucket.dotCount = dotCount
+    bucket.items = []
+    add(lookup.buckets, bucket)
+    lookup.slots[slot] = lookup.buckets.len
+    return lookup.buckets.len - 1
+
+fn v3ParserTextLookupAddExact(lookup: var V3ParserTextLookup,
+                              value: str) =
+    if value == "":
+        return
+    let bucketIndex = v3ParserTextLookupEnsureBucket(lookup, value)
+    var bucket = lookup.buckets[bucketIndex]
+    for i in 0..<bucket.items.len:
+        if bucket.items[i] == value:
+            return
+    add(bucket.items, value)
+    lookup.buckets[bucketIndex] = bucket
+    lookup.totalCount = lookup.totalCount + 1
+
+fn v3ParserTextLookupAdd(lookup: var V3ParserTextLookup,
+                         text: str) =
+    let value = v3path.V3PathTrim(text)
+    v3ParserTextLookupAddExact(lookup, value)
+
+fn v3ParserTextLookupAddAll(lookup: var V3ParserTextLookup,
+                            items: str[]) =
+    for i in 0..<items.len:
+        v3ParserTextLookupAdd(lookup, items[i])
+
+fn v3ParserTextLookupBuild(items: str[]): V3ParserTextLookup =
+    var lookup = v3ParserTextLookupInit(items.len * 2 + 8)
+    v3ParserTextLookupAddAll(lookup, items)
+    return lookup
+
+fn v3ParserTextLookupContainsExact(lookup: V3ParserTextLookup,
+                                   target: str): bool =
+    if target == "":
+        return false
+    let bucketIndex = v3ParserTextLookupBucketIndexExact(lookup, target)
+    if bucketIndex < 0:
+        return false
+    let bucket = lookup.buckets[bucketIndex]
+    for i in 0..<bucket.items.len:
+        if bucket.items[i] == target:
+            return true
+    return false
+
+fn v3ParserAppendUniqueLookupText(out: var str[],
+                                  seen: var V3ParserTextLookup,
+                                  text: str) =
+    let value = v3path.V3PathTrim(text)
+    if value == "":
+        return
+    if v3ParserTextLookupContainsExact(seen, value):
+        return
+    add(out, value)
+    v3ParserTextLookupAddExact(seen, value)
+
+fn v3ParserMatchKnownCallSurfaceText(callLookup: V3ParserTextLookup,
+                                     callName: str,
+                                     qualifiedCallName: str,
+                                     dottedCallName: str): str =
+    if dottedCallName != callName && v3ParserTextLookupContainsExact(callLookup, dottedCallName):
+        return dottedCallName
+    if qualifiedCallName != callName && v3ParserTextLookupContainsExact(callLookup, qualifiedCallName):
+        return qualifiedCallName
+    if v3ParserTextLookupContainsExact(callLookup, callName):
+        return callName
+    return ""
 
 fn v3ParserStringSeqContainsExact(items: str[], target: str): bool =
     for i in 0..<items.len:
@@ -2549,6 +2807,10 @@ fn v3ParserAddUniqueImportEdge(edges: var V3ImportEdge[],
 fn v3ParserAddUniqueText(items: var str[],
                          text: str) =
     let value = v3path.V3PathTrim(text)
+    v3ParserAddUniqueTextExact(items, value)
+
+fn v3ParserAddUniqueTextExact(items: var str[],
+                              value: str) =
     if value == "":
         return
     for i in 0..<items.len:

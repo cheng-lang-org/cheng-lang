@@ -24,6 +24,22 @@
   - module 自己 aliasless direct-import closure 里可见的 local/importc 目标也能真解析
   - imported `importc` 在这条 qualified 路径上仍会继续落成 `lower=import_buffer / ret=import_buffer`
 - expr layer 的真实入口已经统一回 `CallAndMember` 主链；旧的分裂 call 扫描路径不再参与 profile-aware expr 读取。
+- `typed lowering rule` 现在有稳定文本真源了：
+  - `v3TypedExprLoweringRuleKey(...)` 会把 `type/abi/value/place/lower/call/return/arg/result/materialize/copy/import` 收成 canonical key
+  - `v3TypedExprLoweringRuleEntryText(...)` 会把 `source/line/column/expr/key` 收成逐条 entry
+  - `compiler_csg report` 和 `lowering_plan report` 都会产出 `lowering_rule_unique_key_count` 与 `lowering_rule_entry[i]`
+- seed 里的 wasm call 高层分发也开始真接这条 rule 面了：
+  - 新增 `V3WasmCallLoweringRule`
+  - `register_import / type_index / analyze_call / analyze_call_statement / emit_call_expr / emit_call_statement` 现在会共用同一份 `arg slot / return slot / result / import` 规则
+  - 这条链不再各处临时重算 `v3_wasm_call_arg_slot_kind(...)` 和 `v3_wasm_call_target_result_kind(...)`
+- seed 里的 native/importc caller-side 分发也开始真接这条 rule 面了：
+  - 新增 `V3NativeCallLoweringRule`
+  - `v3_prepare_expr_call_state_impl(...)`、`v3_try_prepare_index_assignment_call_state(...)`、`v3_codegen_call_scalar_resolved(...)`、`v3_codegen_call_into_address(...)`、`v3_emit_call_from_spills(...)`、`v3_emit_scalar_call_ffi_handle_return_fixups(...)` 现在会共用同一份 `arg/return/result` 规则
+  - `call_from_spills` 的 load ABI 也已经改成直接读 rule，不再自己重算 `var/address/ffi_handle/value`
+- native composite return caller 入口也开始真接这条 rule 面了：
+  - 新增 `V3NativeCompositeCallLoweringRule`
+  - `v3_codegen_call_into_address(...)`、`v3_materialize_composite_expr_into_address(...)` 里普通 call 和 prefix call 的复合返回路径，都会先把 `dest_address / import_buffer` 收成同一份 composite-result rule，再决定 caller 侧怎么落位
+  - 这条链不再是“先 resolve target/rule，再各处只看一个 `result_uses_address` 布尔值”
 - lowering rule 计数 smoke 已收回 report 真源：
   - `compiler_csg_smoke` 直接读 `v3CompilerCsgReport(...)`
   - `lowering_plan_smoke` 直接读 `v3LoweringPlanStubReport(...)`
@@ -35,4 +51,10 @@
 - 本轮验收已通过：
   - `CHENG_V3_SMOKE_LABEL=call_hir_closure_visible_clean ... parser_path_smoke parser_normalized_expr_smoke compiler_csg_smoke lowering_plan_smoke call_hir_matrix_smoke`
   - `CHENG_V3_SMOKE_LABEL=call_hir_qualified_closure ... call_hir_matrix_smoke`
+  - `CHENG_V3_SMOKE_LABEL=typed_rule_key ... compiler_csg_smoke lowering_plan_smoke lowering_matrix_smoke call_hir_matrix_smoke`
+  - `cc .../cheng_v3_seed.c -> .../cheng.stage0`
+  - `.../cheng.stage0 bootstrap-bridge`
+  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_wasm_call_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
+  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_native_call_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
+  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_native_composite_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
   - `git -C /Users/lbcheng/cheng-lang diff --check`

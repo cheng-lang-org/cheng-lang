@@ -7,6 +7,20 @@ import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
 
+fn reportFieldValue(report: str, key: str): str =
+    let prefix = key + "="
+    var lineStart: int32 = 0
+    while lineStart < report.len:
+        var lineEnd = lineStart
+        while lineEnd < report.len && report[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        let lineLen = lineEnd - lineStart
+        if lineLen >= prefix.len &&
+           v3path.V3TextSlice(report, lineStart, prefix.len) == prefix:
+            return v3path.V3TextSlice(report, lineStart + prefix.len, lineLen - prefix.len)
+        lineStart = lineEnd + 1
+    return ""
+
 fn buildLinkPlan(workspaceRoot: str,
                  packageRoot: str,
                  sourcePath: str,
@@ -55,10 +69,16 @@ fn main(): int32 =
     assert(fixtureRules.len > 0, "v3 lowering matrix: fixture rules")
     assert(ccsg.v3TypedExprLoweringRulesEqual(fixtureRules, planRules),
            "v3 lowering matrix: compiler csg vs lowering plan")
+    assert(ccsg.v3TypedExprLoweringRuleUniqueShapeCount(fixtureRules) ==
+           ccsg.v3TypedExprLoweringRuleUniqueKeyCount(fixtureRules),
+           "v3 lowering matrix: rule shape count vs key count")
     assert(v3path.V3TextContains(csgReport, "lowering_rule_arg_address_count="),
            "v3 lowering matrix: csg address arg key")
     assert(v3path.V3TextContains(planReport, "lowering_rule_arg_address_count="),
            "v3 lowering matrix: plan address arg key")
+    assert(reportFieldValue(csgReport, "lowering_rule_unique_key_count") ==
+           reportFieldValue(planReport, "lowering_rule_unique_key_count"),
+           "v3 lowering matrix: report unique key count")
     assert(!v3path.V3TextContains(planReport, "lowering_rule_arg_address_count=0\n"),
            "v3 lowering matrix: address arg rule")
     assert(!v3path.V3TextContains(planReport, "lowering_rule_arg_call_result_address_count=0\n"),
@@ -89,5 +109,14 @@ fn main(): int32 =
            "v3 lowering matrix: value-slot import rule")
     assert(!v3path.V3TextContains(planReport, "lowering_rule_import_i32_address_slot_count=0\n"),
            "v3 lowering matrix: address-slot import rule")
+    for i in 0..<fixtureRules.len:
+        let key = "lowering_rule_entry[" + intToStr(i) + "]"
+        let csgEntry = reportFieldValue(csgReport, key)
+        let planEntry = reportFieldValue(planReport, key)
+        assert(csgEntry != "", "v3 lowering matrix: csg rule entry")
+        assert(planEntry != "", "v3 lowering matrix: plan rule entry")
+        assert(csgEntry == planEntry, "v3 lowering matrix: rule entry text match")
+        assert(v3path.V3TextContains(csgEntry, "key=type="),
+               "v3 lowering matrix: rule entry carries key text")
     echo("v3 lowering_matrix_smoke ok")
     return 0
