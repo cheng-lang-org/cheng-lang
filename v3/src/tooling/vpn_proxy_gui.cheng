@@ -85,6 +85,7 @@ const
     v3VpnGuiMaxLogChars = 16000
     v3VpnGuiHttpMaxChars = 65536
     v3VpnGuiListenHost = "127.0.0.1"
+    v3VpnGuiWebPort = 18443
     v3VpnGuiWaitMs = 200
 
 fn v3VpnGuiPrintLine(text: str) =
@@ -840,13 +841,12 @@ fn v3VpnGuiTryOpenBrowser(rootDir: str,
     if v3path.V3PathFileExists(linuxOpen):
         let _ = hostos.ExecFileStatus(linuxOpen, [url], [], rootDir, 5)
 
-fn v3VpnGuiOpenGlobalListener(outPort: var int32): Result[bool] =
-    outPort = 0
-    let listenRes: Result[tcp.TcpListenerHandle] = tcp.TcpListen(v3VpnGuiListenHost, 0, false)
+fn v3VpnGuiOpenGlobalListener(): Result[bool] =
+    var listener: tcp.TcpListenerHandle = v3VpnGuiListenerZero()
+    let listenRes: Result[bool] = tcp.TcpListenFill(v3VpnGuiListenHost, v3VpnGuiWebPort, listener, false)
     if IsErr(listenRes):
         return Err[bool](ErrorText(listenRes))
-    v3VpnGuiGlobalListener = Value(listenRes)
-    outPort = v3VpnGuiGlobalListener.addr.port
+    v3VpnGuiGlobalListener = listener
     return Ok[bool](true)
 
 fn v3VpnGuiCloseGlobalListener() =
@@ -868,30 +868,38 @@ fn V3VpnProxyGuiRun(rootDir: str,
                     runtimeToolPathRaw: str,
                     configPathRaw: str): int32 =
     v3VpnGuiInitGlobalState(rootDir, runtimeToolPathRaw, configPathRaw)
-    var port: int32 = 0
-    let openRes: Result[bool] = v3VpnGuiOpenGlobalListener(port)
+    let openRes: Result[bool] = v3VpnGuiOpenGlobalListener()
     if IsErr(openRes):
-        v3VpnGuiPrintLine("vpn gui: " + ErrorText(openRes))
+        v3VpnGuiPrintLine(ErrorText(openRes))
         return 1
+    let nonblockingRes: Result[bool] = tcp.TcpListenerSetNonblocking(v3VpnGuiGlobalListener, true)
+    if IsErr(nonblockingRes):
+        let errText: str = ErrorText(nonblockingRes)
+        v3VpnGuiCloseGlobalListener()
+        v3VpnGuiPrintLine(errText)
+        return 1
+    let port: int32 = if v3VpnGuiGlobalListener.addr.port > 0: v3VpnGuiGlobalListener.addr.port else: v3VpnGuiWebPort
     let url: str = "http://" + v3VpnGuiListenHost + ":" + intToStr(port) + "/"
-    v3VpnGuiGlobalState.statusText = "web ready"
-    v3VpnGuiGlobalState.noticeText = "open browser at " + url
-    v3VpnGuiPrintLine("vpn gui: " + url)
+    v3VpnGuiPrintLine("vpn gui: open " + url)
     v3VpnGuiTryOpenBrowser(rootDir, url)
+    var exitCode: int32 = 0
     while !v3VpnGuiGlobalState.quitRequested:
         v3VpnGuiProcPoll(v3VpnGuiGlobalState)
-        let waitRes: Result[bool] = tcp.TcpListenerWaitReadable(v3VpnGuiGlobalListener, v3VpnGuiWaitMs)
-        if IsErr(waitRes):
-            v3VpnGuiCloseGlobalListener()
-            v3VpnGuiPrintLine("vpn gui: " + ErrorText(waitRes))
-            return 1
-        if !Value(waitRes):
+        let readyRes: Result[bool] = tcp.TcpListenerWaitReadable(v3VpnGuiGlobalListener, v3VpnGuiWaitMs)
+        if IsErr(readyRes):
+            v3VpnGuiGlobalState.errorText = ErrorText(readyRes)
+            exitCode = 1
+            break
+        if !Value(readyRes):
             continue
         let serveRes: Result[bool] = v3VpnGuiServeReadyOnce(port, url)
         if IsErr(serveRes):
             v3VpnGuiGlobalState.errorText = ErrorText(serveRes)
-            continue
+            exitCode = 1
+            break
     v3VpnGuiCloseGlobalListener()
+    if exitCode != 0 && len(v3VpnGuiGlobalState.errorText) > 0:
+        v3VpnGuiPrintLine(v3VpnGuiGlobalState.errorText)
     if v3VpnGuiGlobalState.proc.running:
         v3VpnGuiPrintLine("vpn gui: ui closed, local proxy still running pid=" + intToStr(int32(v3VpnGuiGlobalState.proc.pid)))
-    return 0
+    return exitCode

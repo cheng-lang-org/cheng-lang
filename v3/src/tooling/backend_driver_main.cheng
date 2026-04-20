@@ -8,6 +8,7 @@ import std/strings
 import std/strutils as strutil
 import cheng/v3/tooling/bootstrap_contracts as contracts
 import cheng/v3/tooling/compiler_runtime as crun
+import cheng/v3/tooling/support_matrix as smatrix
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/wasm_binary_audit as wasmaudit
@@ -127,6 +128,9 @@ fn v3BackendDriverStatus(rootDir: str) =
     v3BackendDriverPrintLine("compiler_entry=" + v3BackendDriverEntrySource(rootDir))
     v3BackendDriverPrintLine("ordinary_command=" + contract.ordinaryCommand)
     v3BackendDriverPrintLine("ordinary_pipeline=" + contract.ordinaryPipelineState)
+
+fn v3BackendDriverSupportMatrix(rootDir: str) =
+    v3BackendDriverPrintStdoutBlock(smatrix.v3SupportMatrixReport(rootDir))
 
 fn v3BackendDriverR2cReactV3Help() =
     v3BackendDriverPrintLine("usage: cheng r2c-react-v3 <subcommand> [args]")
@@ -567,10 +571,12 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
     let compilerRuntimePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/compiler_runtime.cheng")
     let gateMainPath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/gate_main.cheng")
     let seedPath: str = v3path.V3PathAbsolute(rootDir, "v3/bootstrap/cheng_v3_seed.c")
+    let supportMatrixPath: str = v3path.V3PathAbsolute(rootDir, "v3/src/tooling/support_matrix.cheng")
     let backendDriverMainText: str = v3path.V3ReadTextFile("", backendDriverMainPath)
     let compilerMainText: str = v3path.V3ReadTextFile("", compilerMainPath)
     let compilerRuntimeText: str = v3path.V3ReadTextFile("", compilerRuntimePath)
     let gateMainText: str = v3path.V3ReadTextFile("", gateMainPath)
+    let supportMatrixText: str = v3path.V3ReadTextFile("", supportMatrixPath)
     let seedText: str = v3path.V3ReadTextFile("", seedPath)
     let buildRuntimeObjCmd = "build-program" + "-runtime-obj"
     let verifyRuntimeObjCmd = "verify-program" + "-runtime-obj"
@@ -599,10 +605,11 @@ fn v3BackendDriverHostBridgeAuditText(rootDir: str): str =
                                                strutil.Contains(seedText, runtimeNativeSourceNeedle)
     let legacyRuntimeCombinedFallbackPresent = false
     let legacyBrowserHostWasmRunnerPresent: bool = v3path.V3PathFileExists(browserHostWasmRunnerPath) ||
-                                                   strutil.Contains(compilerMainText, browserHostWasmRunnerPathNeedle) ||
-                                                   strutil.Contains(compilerRuntimeText, browserHostWasmRunnerPathNeedle) ||
-                                                   strutil.Contains(gateMainText, browserHostWasmRunnerPathNeedle) ||
-                                                   strutil.Contains(seedText, browserHostWasmRunnerPathNeedle)
+                                                    strutil.Contains(compilerMainText, browserHostWasmRunnerPathNeedle) ||
+                                                    strutil.Contains(compilerRuntimeText, browserHostWasmRunnerPathNeedle) ||
+                                                    strutil.Contains(supportMatrixText, browserHostWasmRunnerPathNeedle) ||
+                                                    strutil.Contains(gateMainText, browserHostWasmRunnerPathNeedle) ||
+                                                    strutil.Contains(seedText, browserHostWasmRunnerPathNeedle)
     let legacyNodeWasmHostPresent: bool = strutil.Contains(backendDriverMainText, backendDriverNodeHostNeedle) ||
                                            strutil.Contains(gateMainText, gateNodeHostNeedle) ||
                                            strutil.Contains(gateMainText, gateWasmRunnerNeedle)
@@ -1145,6 +1152,23 @@ fn v3BackendDriverRunVpnProxy(rootDir: str,
     return v3BackendDriverRunToolFromSourceWithCompiler(rootDir,
                                                         "vpn_proxy_tool",
                                                         "v3/src/tooling/vpn_proxy_tool_main.cheng",
+                                                        compilerPath,
+                                                        args,
+                                                        envOverrides)
+
+fn v3BackendDriverRunVpnGui(rootDir: str,
+                            count: int32): int32 =
+    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+    var compilerPath: str = ""
+    if !v3BackendDriverResolveToolCompiler(rootDir, "vpn-gui", compilerPath):
+        return 1
+    let envOverrides: str[] = [
+        "CHENG_V3_ROOT=" + rootDir,
+        "CHENG_V3_VPN_PROXY_COMPILER=" + compilerPath
+    ]
+    return v3BackendDriverRunToolFromSourceWithCompiler(rootDir,
+                                                        "vpn_proxy_gui_tool",
+                                                        "v3/src/tooling/vpn_proxy_gui_tool_main.cheng",
                                                         compilerPath,
                                                         args,
                                                         envOverrides)
@@ -5303,6 +5327,9 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "status":
         v3BackendDriverStatus(rootDir)
         return 0
+    if cmd == "support-matrix":
+        v3BackendDriverSupportMatrix(rootDir)
+        return 0
     if cmd == "mobile-shell":
         return v3BackendDriverRunMobileShell(rootDir, count)
     if cmd == "r2c-react-v3":
@@ -5315,6 +5342,8 @@ fn main(argc: int32, argv: str*): int32 =
             return 0
         if subcmd == "status":
             return v3BackendDriverR2cReactV3Status(rootDir, count)
+    if cmd == "vpn-gui":
+        return v3BackendDriverRunVpnGui(rootDir, count)
     if cmd == "vpn-proxy":
         return v3BackendDriverRunVpnProxy(rootDir, count)
     if cmd == "print-build-plan":

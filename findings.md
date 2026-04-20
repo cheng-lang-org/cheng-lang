@@ -34,7 +34,21 @@
 | 当前真进展 | 现在已经补了最小 `CallExpr`，而且 composite importc call 已经能在 `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 里真落成 `lower=import_buffer / return=import_buffer`。 |
 | 本轮真坑 | `compiler_csg_smoke` / `lowering_plan_smoke` 这次重新炸的根因不是 runtime，而是 `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 的 `v3ParserCollectExternalCallNames(...)` 还保留了 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引，直接把 compiler 顶到 `idx=len`。 |
 | 本轮真修法 | 这类复合字段嵌套索引不能继续依赖 compiler 自动发码；最稳形状是先把 profile 和 `localCallNames` 快照到本地，再用显式 `while` 走索引。这样 parser/csg/lowering 三条 smoke 才会稳定。 |
-| 当前剩余缺口 | 这条新路径现在已经覆盖“同文件 importc + 同文件 local function + 同包跨文件已知函数”的 call expr；剩下的缺口是更通用的 call HIR，还没补到 import 别名和更一般的 closure 可见函数。 |
+| 本轮新修法 | qualified external call 最稳的真源不是“把 closure 里所有函数名都灌进外部名表”，而是“当前 source 的 direct import edge + alias/module-stem qualifier + 目标 source decl”。这次已经按这条形状接通了 parser 和 typed。 |
+| 本轮新坑 | grouped import 之前直接吃 `FirstToken(importTail)`，遇到 `import std/[strings, hashmaps]` 会在第一个空格处把路径截成 `std/[strings,`，所以 direct import qualifier 虽然已经成了真源，grouped import 却完全进不了 import edge。 |
+| 本轮额外真坑 | `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 里的 `v3_materialize_provider_objects(...)` 把 `V3PlanPath suppressed_export_symbols[8192]` 放在栈上，fresh `stage2` 在 provider object 阶段会直接栈炸，表面像 parser 新改动把编译器打坏，其实是真正的 provider materialize 栈缺口。 |
+| 本轮额外真修法 | grouped import 现在先 strip comment，再按 `prefix/[items]` 显式展开成多条 `V3ImportEdge`；provider materialize 则改成堆分配并在所有返回路径显式 `free(...)`，fresh `stage2` no-handoff 已经能稳定编过并跑通 grouped import 版 `parser_path_smoke`。 |
+| 本轮新坑 | `member_call` 如果直接混在 `local_call / external_call / importc_call` 三路扫描里补 fallback，qualified external call 会先被记成 `external_call`，再被另一轮扫成 `member_call`，typed fact 就会平白多出一条 `call_expr / abi=polymorphic`。 |
+| 本轮新修法 | 未知 dotted call 的真形状必须是“先跑 local/external/importc 三路已知 call 识别，最后再按全量已知 call 名单单独补 `member_call`”。这样 unknown member call 能留下来，但 qualified external/importc/local 不会双记。 |
+| 本轮新真坑 | nested qualified external call 不能直接按整条 import 闭包递归展开 external call name；一旦把 std 依赖树也一起抄进来，`parser_path_smoke` 这类普通 source 会直接卡死在 parser 递归收集。 |
+| 本轮新真修法 | external call 递归展开必须由当前源码真实出现的 dotted call 深度裁剪；parser 只需要为源码里真正会出现的 qualifier 层数产名字，不需要预生成整棵 import 闭包。 |
+| 本轮新发现 | qualified external call 如果只把“返回类型字符串”传给 typed fact，就会把 imported `importc` 误判成普通 external local call；真正的真源必须把“目标是否 importc”也一起带回来。 |
+| 本轮新修法 | unknown dotted fallback 不能只留 `resolved=0`；至少要在 `CallExpr.detail` 里显式记 `reason=unknown_qualified_target`，这样 parser/typed/report 才不会出现“知道没解析，但不知道为什么没解析”的灰区。 |
+| 本轮新坑 | resolved call 的硬 gate 一上，第一批露出来的真根不是 parser，而是 typed 返回类型归属：空返回、imported unqualified type、泛型占位符这三类原来都被糊在同一个 `polymorphic/deferred` 里。 |
+| 本轮新修法 | local/importc 空返回必须显式记成 `void`，不能继续和“查无返回类型”共用空串；否则 resolved void call 会被误炸成 `call_expr/deferred`。 |
+| 本轮额外真修法 | `preferredSourcePath` 不能再当“类型一定定义在这里”的硬覆盖；正确做法是先切到 callee source context，再按“当前 source 声明 + 无 alias 的 direct import”解析 unqualified type，这样 `DateTime` 这类 imported return type 才能真落 ABI。 |
+| 本轮额外发现 | `T/refT` 这类显式泛型占位符和真正的“无解释回退”不是一回事；前者应该保留 deferred，但不能再把整条 resolved call gate 一起打红。 |
+| 当前剩余缺口 | 这条新路径现在已经覆盖“同文件 importc + 同文件 local function + direct import 的 alias/module-stem qualified call + 未知 dotted member call”；剩下的缺口是更通用的 call HIR，还没补到更一般的 qualified target 和更宽的 closure 可见函数。 |
 | 本轮额外发现 | call 规范化不能再走“名字表 × 行文本”切片扫描；哪怕只剩 importc 名表，这条路也会在 `compiler_csg_smoke` 里把 parser 拖进高成本字符串复制。正确形状必须是逐行 token 扫描，看到 `ident(` 再查当前源码自己的 call 名表。 |
 | 本轮真坑 | parser 里任何带索引的边界判断都不能依赖短路，像 `i > 0 && line[i - 1]` 这种写法会直接重演 `idx=-1`。这里必须始终写成显式边界分支。 |
 | fresh 验收面 | C bootstrap 改动不能直接拿 stage0 本体跑 ordinary smoke，因为它会先报 `missing embedded bootstrap contract`；稳定做法是 `stage0 bootstrap-bridge` 后，用 fresh `stage2` no-handoff 跑真 smoke。 |

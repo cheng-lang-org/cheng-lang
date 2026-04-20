@@ -143,6 +143,39 @@ fn tcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHand
         return Err[TcpListenerHandle](Error(localRes))
     return Ok[TcpListenerHandle](TcpListenerHandle(fd: fd, addr: localAddr))
 
+fn tcpListenFill(host: str,
+                 port: int32,
+                 out: var TcpListenerHandle,
+                 isV6: bool = false): Result[bool] =
+    out.fd = -1
+    let openRes: Result[int32] = tcpSocketOpenStream(isV6)
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    let fd: int32 = Value(openRes)
+    var addr: TcpSockAddr
+    let addrRes: Result[bool] = tcpSockAddrFromHostPort(host, port, addr, isV6)
+    if IsErr(addrRes):
+        let _ = os.UdpCloseFd(fd)
+        return Err[bool](Error(addrRes))
+    let bindRes: int32 = os.udpBindFd(fd, addr.data, addr.len)
+    if bindRes != 0:
+        let errCode: int32 = tcpErrno()
+        let _ = os.UdpCloseFd(fd)
+        return Err[bool](tcpErrMessage("tcp syscall: bind failed: ", errCode))
+    let listenRes: int32 = os.TcpListenFd(fd, 16)
+    if listenRes != 0:
+        let errCode: int32 = tcpErrno()
+        let _ = os.UdpCloseFd(fd)
+        return Err[bool](tcpErrMessage("tcp syscall: listen failed: ", errCode))
+    var localAddr: TcpSockAddr
+    let localRes: Result[bool] = tcpGetSockName(fd, localAddr)
+    if IsErr(localRes):
+        let _ = os.UdpCloseFd(fd)
+        return Err[bool](Error(localRes))
+    out.fd = fd
+    out.addr = localAddr
+    return Ok[bool](true)
+
 fn tcpListenerClose(listener: var TcpListenerHandle) =
     if listener.fd >= 0:
         let _ = os.UdpCloseFd(listener.fd)
@@ -455,6 +488,12 @@ fn TcpConnectResolved(host: str, port: int32): Result[TcpConnectionHandle] =
 
 fn TcpListen(host: str, port: int32, isV6: bool = false): Result[TcpListenerHandle] =
     return tcpListen(host, port, isV6)
+
+fn TcpListenFill(host: str,
+                 port: int32,
+                 out: var TcpListenerHandle,
+                 isV6: bool = false): Result[bool] =
+    return tcpListenFill(host, port, out, isV6)
 
 fn TcpListenerClose(listener: var TcpListenerHandle) =
     tcpListenerClose(listener)

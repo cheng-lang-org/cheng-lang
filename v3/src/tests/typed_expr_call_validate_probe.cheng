@@ -1,0 +1,41 @@
+import std/result
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/lang/parser
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
+    let fixturePath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let outputPath = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_compiler_csg/typed_expr_call_validate_probe")
+    let req = creq.v3CompilerRequestNew(packageRoot, fixturePath, outputPath, "arm64-apple-darwin", creq.v3EmitShared, "")
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "typed expr call validate probe: link plan")
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(csgRes), "typed expr call validate probe: build csg")
+    let csg = ccsg.v3CompilerCsgClone(Value(csgRes))
+    var callErr = ""
+    let ok = ccsg.v3TypedExprFactsValidateCallResolution(csg.exprLayer, csg.typedExprFacts, callErr)
+    echo("validate_ok=" + (if ok: "1" else: "0"))
+    echo("validate_err=" + callErr)
+    for i in 0..<csg.exprLayer.exprs.len:
+        let expr = csg.exprLayer.exprs[i]
+        if expr.kind != parser.v3NormalizedExprCall:
+            continue
+        let fact = csg.typedExprFacts[i]
+        echo("line=" + intToStr(expr.lineNumber) +
+             " kind=" + parser.v3ParserCallExprDetailKind(expr.detail) +
+             " resolved=" + (if parser.v3ParserCallExprDetailResolved(expr.detail): "1" else: "0") +
+             " reason=" + parser.v3ParserCallExprDetailReason(expr.detail) +
+             " target_source=" + parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) +
+             " target_importc=" + (if parser.v3ParserCallExprDetailTargetImportc(expr.detail): "1" else: "0") +
+             " type=" + fact.typeText +
+             " abi=" + ccsg.v3TypedExprAbiClassText(fact.abiClass) +
+             " lower=" + ccsg.v3TypedExprLoweringModeText(fact.loweringMode) +
+             " ret=" + ccsg.v3TypedExprReturnKindText(fact.returnKind))
+    return 0

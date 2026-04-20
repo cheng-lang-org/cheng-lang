@@ -61,7 +61,7 @@ extern char **environ;
 #endif
 
 #define CHENG_V3_MAX_FIELDS 40
-#define CHENG_V3_MAX_CALL_ARGS 16
+#define CHENG_V3_MAX_CALL_ARGS 32
 #define CHENG_V3_CALL_ARG_REGS 8
 #define CHENG_V3_CALL_ARG_SPILL_STRIDE ((CHENG_V3_MAX_CALL_ARGS + 4) * 8)
 #define CHENG_V3_MAX_UNSUPPORTED_DETAILS 64
@@ -2451,7 +2451,7 @@ static const char *v3_flag_value(int argc, char **argv, const char *flag) {
 #define CHENG_V3_MAX_PLAN_REASONS 16
 #define CHENG_V3_MAX_RUNTIME_TARGETS 8
 #define CHENG_V3_MAX_PROVIDER_MODULES 8
-#define CHENG_V3_MAX_PLAN_FUNCTIONS 4096
+#define CHENG_V3_MAX_PLAN_FUNCTIONS 8192
 #define CHENG_V3_MAX_SOURCE_LINES 16384
 #define CHENG_V3_MAX_IMPORT_ALIASES 128
 #define CHENG_V3_MAX_CALLEES 64
@@ -2471,6 +2471,10 @@ static void v3_plan_path_add_unique(V3PlanPath *items,
                                     size_t *len,
                                     size_t cap,
                                     const char *text);
+static bool v3_load_source_lines(const char *source_path,
+                                 char ***lines_out,
+                                 char **owned_out,
+                                 size_t *line_count_out);
 
 typedef struct {
     char owner_module_path[PATH_MAX];
@@ -2569,6 +2573,10 @@ typedef struct {
     size_t scope_start_line;
     size_t scope_end_line;
 } V3AsmLocalSlot;
+
+/* Seed compiler is single-threaded; keep these large work buffers out of the default 8MB stack. */
+static V3AsmLocalSlot g_v3_scalar_emit_locals[CHENG_V3_MAX_ASM_LOCALS];
+static V3AsmLocalSlot g_v3_module_init_locals[CHENG_V3_MAX_ASM_LOCALS];
 
 typedef enum {
     V3_TYPE_DEF_NONE = 0,
@@ -3255,9 +3263,6 @@ typedef struct {
     char cond[4096];
     char when_true[4096];
     char when_false[4096];
-    char callee[PATH_MAX];
-    char args[CHENG_V3_MAX_CALL_ARGS][4096];
-    size_t arg_count;
 } V3ExprSurface;
 
 typedef enum {
@@ -3840,6 +3845,110 @@ static bool v3_split_top_level_args(const char *text,
     return true;
 }
 
+static bool v3_count_top_level_args(const char *text,
+                                    size_t *item_count_out) {
+    bool in_string = false;
+    bool in_char = false;
+    int32_t paren_depth = 0;
+    int32_t bracket_depth = 0;
+    int32_t brace_depth = 0;
+    const char *start = text;
+    size_t item_count = 0U;
+    size_t i;
+    if (item_count_out == NULL) {
+        return false;
+    }
+    for (i = 0U; ; ++i) {
+        char ch = text[i];
+        if (!in_char && ch == '"' && !v3_quote_is_escaped(text, i)) {
+            in_string = !in_string;
+        } else if (!in_string && ch == '\'' && !v3_quote_is_escaped(text, i)) {
+            in_char = !in_char;
+        } else if (!in_string && !in_char && ch == '(') {
+            paren_depth += 1;
+        } else if (!in_string && !in_char && ch == ')') {
+            paren_depth -= 1;
+        } else if (!in_string && !in_char && ch == '[') {
+            bracket_depth += 1;
+        } else if (!in_string && !in_char && ch == ']') {
+            bracket_depth -= 1;
+        } else if (!in_string && !in_char && ch == '{') {
+            brace_depth += 1;
+        } else if (!in_string && !in_char && ch == '}') {
+            brace_depth -= 1;
+        }
+        if ((!in_string &&
+             !in_char &&
+             paren_depth == 0 &&
+             bracket_depth == 0 &&
+             brace_depth == 0 &&
+             ch == ',') || ch == '\0') {
+            char piece[4096];
+            snprintf(piece, sizeof(piece), "%.*s", (int)(text + i - start), start);
+            v3_trim_copy_text(piece, piece, sizeof(piece));
+            item_count += 1U;
+            start = text + i + 1U;
+        }
+        if (ch == '\0') {
+            break;
+        }
+    }
+    if (item_count == 1U) {
+        char only_item[4096];
+        snprintf(only_item, sizeof(only_item), "%s", text);
+        v3_trim_copy_text(only_item, only_item, sizeof(only_item));
+        if (only_item[0] == '\0') {
+            item_count = 0U;
+        }
+    }
+    *item_count_out = item_count;
+    return !in_string &&
+           !in_char &&
+           paren_depth == 0 &&
+           bracket_depth == 0 &&
+           brace_depth == 0;
+}
+
+static bool v3_parse_list_literal_text_alloc(const char *text,
+                                             char (**items_out)[4096],
+                                             size_t *item_count_out) {
+    char trimmed[8192];
+    char inner[8192];
+    char (*items)[4096];
+    size_t item_count = 0U;
+    size_t alloc_count = 0U;
+    size_t len;
+    if (items_out == NULL || item_count_out == NULL) {
+        return false;
+    }
+    *items_out = NULL;
+    *item_count_out = 0U;
+    v3_trim_copy_text(text, trimmed, sizeof(trimmed));
+    len = strlen(trimmed);
+    if (len < 2U || trimmed[0] != '[' || trimmed[len - 1U] != ']') {
+        return false;
+    }
+    snprintf(inner, sizeof(inner), "%.*s", (int)(len - 2U), trimmed + 1);
+    if (!v3_count_top_level_args(inner, &item_count)) {
+        return false;
+    }
+    alloc_count = item_count > 0U ? item_count : 1U;
+    items = (char (*)[4096])v3_xmalloc(alloc_count * sizeof(char[4096]));
+    if (!v3_split_top_level_args(inner, items, &item_count, alloc_count)) {
+        free(items);
+        return false;
+    }
+    *items_out = items;
+    *item_count_out = item_count;
+    return true;
+}
+
+static bool v3_parse_prefix_single_arg_call(const char *expr_text,
+                                            char *callee,
+                                            size_t callee_cap,
+                                            char *arg_text,
+                                            size_t arg_cap);
+
 static bool v3_parse_call_text(const char *text,
                                char *callee,
                                size_t callee_cap,
@@ -4190,6 +4299,10 @@ static bool v3_classify_expr_surface(const char *expr_text,
     char fmt_error[256];
     char start_expr[4096];
     char end_expr[4096];
+    char callee[PATH_MAX];
+    char arg_text[4096] = {0};
+    char (*args)[4096] = NULL;
+    size_t arg_count = 0U;
     bool fmt_changed = false;
     size_t i;
     if (surface == NULL) {
@@ -4268,17 +4381,23 @@ static bool v3_classify_expr_surface(const char *expr_text,
         snprintf(surface->when_false, sizeof(surface->when_false), "%s", end_expr);
         return true;
     }
+    args = v3_alloc_call_arg_scratch();
     if (v3_parse_call_text(surface->text,
-                           surface->callee,
-                           sizeof(surface->callee),
-                           surface->args,
-                           &surface->arg_count,
-                           CHENG_V3_MAX_CALL_ARGS)) {
-        const char *base = strrchr(surface->callee, '.');
+                           callee,
+                           sizeof(callee),
+                           args,
+                           &arg_count,
+                           CHENG_V3_MAX_CALL_ARGS) ||
+        v3_parse_prefix_single_arg_call(surface->text,
+                                        callee,
+                                        sizeof(callee),
+                                        arg_text,
+                                        sizeof(arg_text))) {
+        const char *base = strrchr(callee, '.');
         if (base != NULL) {
             base += 1;
         } else {
-            base = surface->callee;
+            base = callee;
             {
                 const char *scope = strrchr(base, ':');
                 if (scope && scope != base && scope[-1] == ':') {
@@ -4288,8 +4407,10 @@ static bool v3_classify_expr_surface(const char *expr_text,
         }
         surface->kind = V3_EXPR_SURFACE_CALL;
         surface->result_hint = v3_result_intrinsic_kind_from_name(base);
+        free(args);
         return true;
     }
+    free(args);
     return true;
 }
 
@@ -4604,6 +4725,7 @@ static bool v3_collect_statement_from_lines(char **lines,
     int32_t bracket_depth = 0;
     int32_t brace_depth = 0;
     bool in_string = false;
+    bool in_char = false;
     bool saw_statement_line = false;
     if (index >= line_count) {
         return false;
@@ -4649,11 +4771,15 @@ static bool v3_collect_statement_from_lines(char **lines,
         snprintf(out + used, out_cap - used, "%s", piece);
         used = strlen(out);
         for (i = 0; piece[i] != '\0'; ++i) {
-            if (piece[i] == '"' && !v3_quote_is_escaped(piece, i)) {
+            if (!in_char && piece[i] == '"' && !v3_quote_is_escaped(piece, i)) {
                 in_string = !in_string;
                 continue;
             }
-            if (in_string) {
+            if (!in_string && piece[i] == '\'' && !v3_quote_is_escaped(piece, i)) {
+                in_char = !in_char;
+                continue;
+            }
+            if (in_string || in_char) {
                 continue;
             }
             if (piece[i] == '(') {
@@ -4692,7 +4818,8 @@ static bool v3_collect_statement_from_lines(char **lines,
                out[used - 1U] == '*' ||
                out[used - 1U] == '/' ||
                out[used - 1U] == '%' ||
-               out[used - 1U] == ','))) {
+               out[used - 1U] == ',' ||
+               out[used - 1U] == '='))) {
             if (v3_statement_has_incomplete_if_expr(out)) {
                 continue;
             }
@@ -5974,9 +6101,7 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
     size_t i;
     bool in_const_block = false;
@@ -5986,19 +6111,9 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
                                   source_path,
                                   owner_module_path,
                                   sizeof(owner_module_path));
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         fprintf(stderr, "[cheng_v3_seed] type scan read failed: %s\n", source_path);
         return false;
-    }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            fprintf(stderr, "[cheng_v3_seed] type scan line overflow: %s\n", source_path);
-            free(owned);
-            return false;
-        }
-        lines[line_count++] = line;
     }
     v3_parse_import_aliases_from_lines(lines,
                                        line_count,
@@ -6038,6 +6153,7 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
                 continue;
             }
             if (lowering->const_count >= CHENG_V3_MAX_TOP_LEVEL_CONSTS) {
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -6102,6 +6218,7 @@ static bool v3_collect_top_level_consts_from_source(const V3SystemLinkPlanStub *
             continue;
         }
         if (lowering->const_count >= CHENG_V3_MAX_TOP_LEVEL_CONSTS) {
+            free(lines);
             free(owned);
             return false;
         }
@@ -7284,9 +7401,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
     size_t i = 0U;
     bool in_type_block = false;
@@ -7296,17 +7411,8 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                   source_path,
                                   owner_module_path,
                                   sizeof(owner_module_path));
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
-    }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            free(owned);
-            return false;
-        }
-        lines[line_count++] = line;
     }
     v3_parse_import_aliases_from_lines(lines,
                                        line_count,
@@ -7377,6 +7483,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                         source_path,
                         i + 1U,
                         lines[i]);
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -7423,6 +7530,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                         }
                         if (enum_member_name[0] != '\0') {
                             if (lowering->const_count >= CHENG_V3_MAX_TOP_LEVEL_CONSTS) {
+                                free(lines);
                                 free(owned);
                                 return false;
                             }
@@ -7479,6 +7587,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                 source_path,
                                 i + 1U,
                                 lines[i]);
+                        free(lines);
                         free(owned);
                         return false;
                     }
@@ -7511,6 +7620,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                             source_path,
                             i + 1U,
                             lines[i]);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7522,6 +7632,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                     fprintf(stderr, "[cheng_v3_seed] empty type field name: %s line=%zu\n",
                             source_path,
                             i + 1U);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7550,6 +7661,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                             source_path,
                             i + 1U,
                             lines[i]);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7560,6 +7672,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                                  type_def->type_name,
                                                  type_def->fields,
                                                  type_def->field_count)) {
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -7570,6 +7683,7 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                 source_path,
                 i + 1U,
                 lines[i]);
+        free(lines);
         free(owned);
         return false;
     }
@@ -7584,9 +7698,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
     size_t i = 0U;
     bool in_type_block = false;
@@ -7596,17 +7708,8 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                   source_path,
                                   owner_module_path,
                                   sizeof(owner_module_path));
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
-    }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            free(owned);
-            return false;
-        }
-        lines[line_count++] = line;
     }
     v3_parse_import_aliases_from_lines(lines,
                                        line_count,
@@ -7676,6 +7779,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                         source_path,
                         name,
                         i + 1U);
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -7686,6 +7790,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                         source_path,
                         name,
                         i + 1U);
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -7742,6 +7847,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                 source_path,
                                 i + 1U,
                                 lines[i]);
+                        free(lines);
                         free(owned);
                         return false;
                     }
@@ -7775,6 +7881,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                             source_path,
                             i + 1U,
                             lines[i]);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7787,6 +7894,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                             "[cheng_v3_seed] refresh empty type field name: %s line=%zu\n",
                             source_path,
                             i + 1U);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7816,6 +7924,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                             source_path,
                             i + 1U,
                             lines[i]);
+                    free(lines);
                     free(owned);
                     return false;
                 }
@@ -7826,6 +7935,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                                                  type_def->type_name,
                                                  type_def->fields,
                                                  type_def->field_count)) {
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -7833,6 +7943,7 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
         }
         i += 1U;
     }
+    free(lines);
     free(owned);
     return true;
 }
@@ -7844,9 +7955,7 @@ static bool v3_refresh_function_abis_from_source(const V3SystemLinkPlanStub *pla
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
     size_t i;
     v3_source_path_to_module_path(plan->workspace_root,
@@ -7855,17 +7964,8 @@ static bool v3_refresh_function_abis_from_source(const V3SystemLinkPlanStub *pla
                                   source_path,
                                   owner_module_path,
                                   sizeof(owner_module_path));
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
-    }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            free(owned);
-            return false;
-        }
-        lines[line_count++] = line;
     }
     v3_parse_import_aliases_from_lines(lines,
                                        line_count,
@@ -8581,7 +8681,7 @@ static bool v3_collect_function_signature(char **lines,
                  signature_cap - strlen(signature_out),
                  "%s",
                  trimmed);
-        if (strchr(trimmed, '=') != NULL) {
+        if (v3_find_top_level_assignment_eq(trimmed) >= 0) {
             *signature_end_index_out = i;
             return true;
         }
@@ -11862,6 +11962,13 @@ static void v3_source_path_to_module_path(const char *workspace_root,
         snprintf(out, cap, "core/%s", rel);
         return;
     }
+    snprintf(prefix, sizeof(prefix), "%s/src/stage1/", workspace_root);
+    if (v3_startswith(source_path, prefix)) {
+        snprintf(rel, sizeof(rel), "%s", source_path + strlen(prefix));
+        v3_strip_ext(rel);
+        snprintf(out, cap, "stage1/%s", rel);
+        return;
+    }
     snprintf(prefix, sizeof(prefix), "%s/src/", package_root);
     if (v3_startswith(source_path, prefix)) {
         snprintf(rel, sizeof(rel), "%s", source_path + strlen(prefix));
@@ -11900,6 +12007,12 @@ static void v3_module_path_to_source_path(const char *workspace_root,
         return;
     }
     if (v3_startswith(module_path, "core/")) {
+        char rel[PATH_MAX];
+        snprintf(rel, sizeof(rel), "src/%s.cheng", module_path);
+        v3_join_path(out, cap, workspace_root, rel);
+        return;
+    }
+    if (v3_startswith(module_path, "stage1/")) {
         char rel[PATH_MAX];
         snprintf(rel, sizeof(rel), "src/%s.cheng", module_path);
         v3_join_path(out, cap, workspace_root, rel);
@@ -12124,23 +12237,13 @@ static bool v3_load_import_aliases_from_source_path(const char *source_path,
                                                     size_t *alias_count,
                                                     size_t alias_cap) {
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
     }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            free(owned);
-            return false;
-        }
-        lines[line_count++] = line;
-    }
     v3_parse_import_aliases_from_lines(lines, line_count, aliases, alias_count, alias_cap);
+    free(lines);
     free(owned);
     return true;
 }
@@ -14348,6 +14451,28 @@ static void v3_lowering_classify_single_statement(const char *trimmed,
         snprintf(body_kind, body_kind_cap, "%s", "stmt_case");
         return;
     }
+    {
+        char arg_text[4096];
+        char (*call_args)[4096] = v3_alloc_call_arg_scratch();
+        size_t parsed_arg_count = 0U;
+        bool parsed_call =
+            v3_parse_call_text(trimmed,
+                               call_name,
+                               sizeof(call_name),
+                               call_args,
+                               &parsed_arg_count,
+                               CHENG_V3_MAX_CALL_ARGS) ||
+            v3_parse_prefix_single_arg_call(trimmed,
+                                            call_name,
+                                            sizeof(call_name),
+                                            arg_text,
+                                            sizeof(arg_text));
+        free(call_args);
+        if (parsed_call) {
+            snprintf(body_kind, body_kind_cap, "%s", "stmt_call");
+            return;
+        }
+    }
     if (strchr(trimmed, '(') != NULL && trimmed[strlen(trimmed) - 1U] == ')') {
         snprintf(body_kind, body_kind_cap, "%s", "stmt_call");
         return;
@@ -14602,9 +14727,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     char *owned;
-    char *cursor;
-    char *line;
-    char *lines[CHENG_V3_MAX_SOURCE_LINES];
+    char **lines;
     size_t line_count = 0U;
     size_t i;
     v3_source_path_to_module_path(plan->workspace_root,
@@ -14613,18 +14736,8 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
                                   source_path,
                                   owner_module_path,
                                   sizeof(owner_module_path));
-    owned = v3_read_file(source_path);
-    if (!owned) {
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
-    }
-    cursor = owned;
-    while ((line = strsep(&cursor, "\n")) != NULL) {
-        if (line_count >= CHENG_V3_MAX_SOURCE_LINES) {
-            free(owned);
-            fprintf(stderr, "[cheng_v3_seed] lowering source line inventory too large\n");
-            return false;
-        }
-        lines[line_count++] = line;
     }
     v3_parse_import_aliases_from_lines(lines,
                                        line_count,
@@ -14654,8 +14767,14 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
             continue;
         }
         if (lowering->function_count >= CHENG_V3_MAX_PLAN_FUNCTIONS) {
+            free(lines);
             free(owned);
-            fprintf(stderr, "[cheng_v3_seed] lowering function inventory too large\n");
+            fprintf(stderr,
+                    "[cheng_v3_seed] lowering function inventory too large source=%s line=%zu count=%zu cap=%d\n",
+                    source_path,
+                    i + 1U,
+                    lowering->function_count,
+                    CHENG_V3_MAX_PLAN_FUNCTIONS);
             return false;
         }
         snprintf(lowering->functions[lowering->function_count].source_path,
@@ -14684,8 +14803,14 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
         if (!v3_parse_function_signature_meta(signature_text,
                                               function_name,
                                               &lowering->functions[lowering->function_count])) {
+            free(lines);
             free(owned);
-            fprintf(stderr, "[cheng_v3_seed] malformed function signature metadata\n");
+            fprintf(stderr,
+                    "[cheng_v3_seed] malformed function signature metadata source=%s line=%zu function=%s signature=%s\n",
+                    source_path,
+                    i + 1U,
+                    function_name,
+                    signature_text);
             return false;
         }
         for (size_t param_i = 0; param_i < lowering->functions[lowering->function_count].param_count; ++param_i) {
@@ -14797,6 +14922,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
                         "[cheng_v3_seed] tuple literal omission unsupported function=%s stmt=%s\n",
                         lowering->functions[lowering->function_count].symbol_text,
                         bad_statement);
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -14824,6 +14950,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
                         bad_callee,
                         bad_field,
                         bad_statement);
+                free(lines);
                 free(owned);
                 return false;
             }
@@ -14869,6 +14996,7 @@ static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub
         }
         lowering->function_count += 1U;
     }
+    free(lines);
     free(owned);
     return true;
 }
@@ -16587,16 +16715,21 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
                                             size_t arg_cap) {
     char expr[8192];
     bool in_string = false;
+    bool in_char = false;
     int32_t depth = 0;
     size_t i;
     v3_trim_copy_text(expr_text, expr, sizeof(expr));
     for (i = 0; expr[i] != '\0'; ++i) {
         char ch = expr[i];
-        if (ch == '"' && !v3_quote_is_escaped(expr, i)) {
+        if (!in_char && ch == '"' && !v3_quote_is_escaped(expr, i)) {
             in_string = !in_string;
             continue;
         }
-        if (in_string) {
+        if (!in_string && ch == '\'' && !v3_quote_is_escaped(expr, i)) {
+            in_char = !in_char;
+            continue;
+        }
+        if (in_string || in_char) {
             continue;
         }
         if (ch == '(') {
@@ -16617,6 +16750,30 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
                 strchr(callee, '[') != NULL ||
                 strchr(callee, ']') != NULL) {
                 return false;
+            }
+            {
+                size_t j = 0U;
+                bool need_ident = true;
+                for (j = 0U; callee[j] != '\0'; ++j) {
+                    unsigned char cj = (unsigned char)callee[j];
+                    if (need_ident) {
+                        if (!(isalpha(cj) || cj == '_')) {
+                            return false;
+                        }
+                        need_ident = false;
+                        continue;
+                    }
+                    if (cj == '.') {
+                        need_ident = true;
+                        continue;
+                    }
+                    if (!(isalnum(cj) || cj == '_')) {
+                        return false;
+                    }
+                }
+                if (need_ident) {
+                    return false;
+                }
             }
             if (arg_text[0] == '<' ||
                 arg_text[0] == '>' ||
@@ -16643,7 +16800,7 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
         int32_t brace_depth = 0;
         for (i = 0; expr[i] != '\0'; ++i) {
             char ch = expr[i];
-            if (ch == '"' && !v3_quote_is_escaped(expr, i)) {
+            if (!in_char && ch == '"' && !v3_quote_is_escaped(expr, i)) {
                 if (!in_string &&
                     paren_depth == 0 &&
                     bracket_depth == 0 &&
@@ -16669,7 +16826,11 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
                 in_string = !in_string;
                 continue;
             }
-            if (in_string) {
+            if (!in_string && ch == '\'' && !v3_quote_is_escaped(expr, i)) {
+                in_char = !in_char;
+                continue;
+            }
+            if (in_string || in_char) {
                 continue;
             }
             if (ch == '(') {
@@ -16688,6 +16849,24 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
         }
     }
     return false;
+}
+
+static bool v3_parse_discard_statement(const char *statement,
+                                       char *expr_out,
+                                       size_t expr_cap) {
+    char trimmed[8192];
+    if (expr_out != NULL && expr_cap > 0U) {
+        expr_out[0] = '\0';
+    }
+    if (statement == NULL) {
+        return false;
+    }
+    v3_trim_copy_text(statement, trimmed, sizeof(trimmed));
+    if (!v3_startswith(trimmed, "discard ")) {
+        return false;
+    }
+    v3_trim_copy_text(trimmed + 8, expr_out, expr_cap);
+    return expr_out != NULL && expr_out[0] != '\0';
 }
 
 static bool v3_parse_address_of_expr(const char *expr_text,
@@ -18266,9 +18445,9 @@ static int32_t v3_call_expr_string_literal_count_slow(const char *expr_text, int
         return base_count > index_count ? base_count : index_count;
     }
     {
-        char (*args)[4096] = v3_alloc_call_arg_scratch();
+        char (*args)[4096] = NULL;
         size_t arg_count = 0U;
-        if (v3_parse_list_literal_text(expr, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        if (v3_parse_list_literal_text_alloc(expr, &args, &arg_count)) {
             for (i = 0; i < arg_count; ++i) {
                 int32_t arg_count_value = 0;
                 if (strcmp(args[i], expr) != 0 && strlen(args[i]) < expr_len) {
@@ -18318,19 +18497,34 @@ static int32_t v3_call_expr_string_literal_count(const char *expr_text) {
     return v3_call_expr_string_literal_count_inner(expr_text, 0);
 }
 
+static void v3_copy_expr_temp_key_text(const char *expr_text,
+                                       char *out,
+                                       size_t cap) {
+    V3ExprSurface surface;
+    char surface_error[256];
+    if (out == NULL || cap == 0U) {
+        return;
+    }
+    out[0] = '\0';
+    if (expr_text == NULL) {
+        return;
+    }
+    if (!v3_classify_expr_surface(expr_text, &surface, surface_error, sizeof(surface_error))) {
+        v3_trim_copy_text(expr_text, out, cap);
+        return;
+    }
+    v3_trim_copy_text(surface.text, out, cap);
+}
+
 static bool v3_is_trivial_prepare_literal_text(const char *expr_text) {
     char trimmed[4096];
     char literal_text[4096];
     int32_t char_value = 0;
-    size_t expr_len;
     if (!expr_text) {
         return false;
     }
     v3_trim_copy_text(expr_text, trimmed, sizeof(trimmed));
-    expr_len = strlen(trimmed);
-    return (expr_len >= 2U && trimmed[0] == '"' && trimmed[expr_len - 1U] == '"') ||
-           (expr_len >= 3U && trimmed[0] == '\'' && trimmed[expr_len - 1U] == '\'') ||
-           v3_parse_string_literal_text(trimmed, literal_text, sizeof(literal_text)) ||
+    return v3_parse_string_literal_text(trimmed, literal_text, sizeof(literal_text)) ||
            v3_parse_char_literal_text(trimmed, &char_value) ||
            v3_parse_int_literal_text(trimmed, NULL) ||
            strcmp(trimmed, "true") == 0 ||
@@ -18344,17 +18538,17 @@ static void v3_call_arg_temp_name(const V3LoweredFunctionStub *function,
                                   const char *expr_text,
                                   char *out,
                                   size_t cap) {
-    char trimmed_expr[4096];
+    char canonical_expr[4096];
     char key[4608];
     uint64_t hash;
-    v3_trim_copy_text(expr_text, trimmed_expr, sizeof(trimmed_expr));
+    v3_copy_expr_temp_key_text(expr_text, canonical_expr, sizeof(canonical_expr));
     snprintf(key,
              sizeof(key),
              "%s|%s|%zu|%s",
              function->symbol_text,
              callee,
              arg_index,
-             trimmed_expr);
+             canonical_expr);
     hash = v3_fnv1a64(key);
     snprintf(out, cap, "__v3_calltmp_%016llx", (unsigned long long)hash);
 }
@@ -18363,15 +18557,15 @@ static void v3_expr_temp_name(const V3LoweredFunctionStub *function,
                               const char *expr_text,
                               char *out,
                               size_t cap) {
-    char trimmed_expr[4096];
+    char canonical_expr[4096];
     char key[4608];
     uint64_t hash;
-    v3_trim_copy_text(expr_text, trimmed_expr, sizeof(trimmed_expr));
+    v3_copy_expr_temp_key_text(expr_text, canonical_expr, sizeof(canonical_expr));
     snprintf(key,
              sizeof(key),
              "%s|expr|%s",
              function->symbol_text,
-             trimmed_expr);
+             canonical_expr);
     hash = v3_fnv1a64(key);
     snprintf(out, cap, "__v3_exprtmp_%016llx", (unsigned long long)hash);
 }
@@ -18472,6 +18666,23 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                        int call_depth,
                                                        char *out,
                                                        size_t cap);
+static bool v3_codegen_binary_expr_into_address(const V3SystemLinkPlanStub *plan,
+                                                const V3LoweringPlanStub *lowering,
+                                                const V3LoweredFunctionStub *current_function,
+                                                const V3ImportAlias *aliases,
+                                                size_t alias_count,
+                                                const V3AsmLocalSlot *locals,
+                                                size_t local_count,
+                                                const char *expr_text,
+                                                const char *op,
+                                                int dest_addr_reg,
+                                                int32_t call_arg_base,
+                                                int32_t string_temp_base,
+                                                int32_t string_temp_stride,
+                                                int32_t *string_label_index_io,
+                                                int call_depth,
+                                                char *out,
+                                                size_t cap);
 
 static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                                                const V3LoweringPlanStub *lowering,
@@ -18487,6 +18698,7 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                                                const char *arg_expr,
                                                const char *preferred_type,
                                                const char *preferred_abi) {
+    const char *trace_arg_kind = getenv("CHENG_V3_TRACE_ARG_KIND");
     char named_field[128];
     char named_expr[4096];
     char temp_name[128];
@@ -18610,6 +18822,22 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
                 inferred_abi);
         return false;
     }
+    if (trace_arg_kind != NULL &&
+        trace_arg_kind[0] != '\0' &&
+        (strcmp(trace_arg_kind, "1") == 0 ||
+         strcmp(trace_arg_kind, callee) == 0 ||
+         strstr(current_function->symbol_text, trace_arg_kind) != NULL)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] prepare composite arg temp caller=%s callee=%s arg_index=%zu temp=%s expr=%s inferred_type=%s inferred_abi=%s line=%zu\n",
+                current_function->symbol_text,
+                callee,
+                arg_index,
+                temp_name,
+                arg_expr,
+                inferred_type,
+                inferred_abi,
+                v3_current_source_line());
+    }
     return true;
 }
 
@@ -18623,13 +18851,15 @@ static bool v3_prepare_composite_expr_temp(const V3SystemLinkPlanStub *plan,
                                            size_t local_cap,
                                            int32_t *next_offset_io,
                                            const char *expr_text) {
+    char canonical_expr[8192];
     char temp_name[128];
     char inferred_type[256];
     char inferred_abi[32];
-    if (v3_find_local_slot(locals, *local_count, expr_text) >= 0) {
+    v3_copy_expr_temp_key_text(expr_text, canonical_expr, sizeof(canonical_expr));
+    if (v3_find_local_slot(locals, *local_count, canonical_expr) >= 0) {
         return true;
     }
-    v3_expr_temp_name(current_function, expr_text, temp_name, sizeof(temp_name));
+    v3_expr_temp_name(current_function, canonical_expr, temp_name, sizeof(temp_name));
     if (v3_find_local_slot(locals, *local_count, temp_name) >= 0) {
         return true;
     }
@@ -18640,7 +18870,7 @@ static bool v3_prepare_composite_expr_temp(const V3SystemLinkPlanStub *plan,
                             alias_count,
                             locals,
                             *local_count,
-                            expr_text,
+                            canonical_expr,
                             inferred_type,
                             sizeof(inferred_type),
                             inferred_abi,
@@ -23686,6 +23916,7 @@ typedef struct {
     char callee[PATH_MAX];
     char arg_text[4096];
     char args[CHENG_V3_MAX_CALL_ARGS][4096];
+    V3ExprSurface surface;
 } V3ExprPrepScratch;
 
 static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
@@ -23733,8 +23964,16 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
 #define callee (scratch->callee)
 #define arg_text (scratch->arg_text)
 #define args (scratch->args)
+#define surface (scratch->surface)
+    if (call_depth > 128) {
+        fprintf(stderr,
+                "[cheng_v3_seed] prepare expr recursion overflow function=%s depth=%d expr=%s\n",
+                current_function ? current_function->symbol_text : "-",
+                call_depth,
+                expr_text ? expr_text : "-");
+        return false;
+    }
     char surface_error[256];
-    V3ExprSurface surface;
     size_t arg_count = 0U;
     size_t i;
     bool parsed_call_expr = false;
@@ -23996,25 +24235,30 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                               call_depth,
                                               max_call_depth_io);
     }
-    if (!parsed_call_expr &&
-        v3_parse_list_literal_text(expr, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
-        for (i = 0; i < arg_count; ++i) {
-            if (!v3_prepare_expr_call_state(plan,
-                                            lowering,
-                                            current_function,
-                                            aliases,
-                                            alias_count,
-                                            locals,
-                                            local_count,
-                                            local_cap,
-                                            next_offset_io,
-                                            args[i],
-                                            call_depth,
-                                            max_call_depth_io)) {
-                return false;
+    if (!parsed_call_expr) {
+        char (*list_items)[4096] = NULL;
+        size_t list_item_count = 0U;
+        if (v3_parse_list_literal_text_alloc(expr, &list_items, &list_item_count)) {
+            for (i = 0; i < list_item_count; ++i) {
+                if (!v3_prepare_expr_call_state(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                local_cap,
+                                                next_offset_io,
+                                                list_items[i],
+                                                call_depth,
+                                                max_call_depth_io)) {
+                    free(list_items);
+                    return false;
+                }
             }
+            free(list_items);
+            return true;
         }
-        return true;
     }
     {
         char default_type[CHENG_V3_MAX_TYPE_TEXT];
@@ -24029,6 +24273,7 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         bool has_target = false;
         bool is_constructor_call = false;
         V3ResultIntrinsicKind result_kind;
+        const char *callee_base = NULL;
         int next_call_depth = call_depth + 1;
         if (arg_count == 0U && arg_text[0] != '\0') {
             snprintf(args[0], sizeof(args[0]), "%s", arg_text);
@@ -24142,6 +24387,8 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                        aliases,
                                                        alias_count,
                                                        callee);
+        callee_base = strrchr(callee, '.');
+        callee_base = callee_base ? callee_base + 1 : callee;
         has_target = v3_resolve_call_target_with_args(plan,
                                                       lowering,
                                                       current_function,
@@ -24158,6 +24405,11 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                 has_target && i < target.param_count
                     ? v3_call_target_arg_kind(&target, i)
                     : V3_CALL_TARGET_ARG_VALUE;
+            if (!has_target &&
+                i == 0U &&
+                v3_is_strformat_join_name(callee_base)) {
+                arg_kind = V3_CALL_TARGET_ARG_ADDRESS;
+            }
             if (!v3_is_trivial_prepare_literal_text(args[i]) &&
                 !v3_prepare_expr_call_state(plan,
                                             lowering,
@@ -24260,6 +24512,7 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
 #undef callee
 #undef arg_text
 #undef args
+#undef surface
     return true;
 }
 
@@ -25206,8 +25459,8 @@ static bool v3_infer_expr_type(const V3SystemLinkPlanStub *plan,
     }
     {
         size_t arg_count = 0U;
-        char (*args)[4096] = v3_alloc_call_arg_scratch();
-        if (v3_parse_list_literal_text(expr, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        char (*args)[4096] = NULL;
+        if (v3_parse_list_literal_text_alloc(expr, &args, &arg_count)) {
             char elem_type[256];
             char elem_abi[32];
             char normalized_elem_type[256];
@@ -30916,7 +31169,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                        int call_depth,
                                                        char *out,
                                                        size_t cap) {
-    char expr[4096];
+    char expr[32768];
     char normalized_dest_type[256];
     char literal[4096];
     char inner_callee[PATH_MAX];
@@ -31205,9 +31458,36 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                v3_emit_zero_address_range(out, cap, dest_addr_reg, layout.size);
     }
     {
+        static const char *OPS[] = {
+            "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "xor", "&", "+", "-", "*", "/", "%"
+        };
+        size_t i;
+        for (i = 0U; i < sizeof(OPS) / sizeof(OPS[0]); ++i) {
+            if (v3_codegen_binary_expr_into_address(plan,
+                                                    lowering,
+                                                    current_function,
+                                                    aliases,
+                                                    alias_count,
+                                                    locals,
+                                                    local_count,
+                                                    expr,
+                                                    OPS[i],
+                                                    dest_addr_reg,
+                                                    call_arg_base,
+                                                    string_temp_base,
+                                                    string_temp_stride,
+                                                    string_label_index_io,
+                                                    call_depth + 1,
+                                                    out,
+                                                    cap)) {
+                return true;
+            }
+        }
+    }
+    {
         size_t arg_count = 0U;
-        char (*args)[4096] = v3_alloc_call_arg_scratch();
-        if (v3_parse_list_literal_text(expr, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        char (*args)[4096] = NULL;
+        if (v3_parse_list_literal_text_alloc(expr, &args, &arg_count)) {
             char elem_type[256];
             char elem_abi[32];
             int32_t elem_size = 0;
@@ -32024,6 +32304,55 @@ static bool v3_materialize_composite_expr_into_slot(const V3SystemLinkPlanStub *
                                                       cap);
 }
 
+static bool v3_codegen_binary_expr_into_address(const V3SystemLinkPlanStub *plan,
+                                                const V3LoweringPlanStub *lowering,
+                                                const V3LoweredFunctionStub *current_function,
+                                                const V3ImportAlias *aliases,
+                                                size_t alias_count,
+                                                const V3AsmLocalSlot *locals,
+                                                size_t local_count,
+                                                const char *expr_text,
+                                                const char *op,
+                                                int dest_addr_reg,
+                                                int32_t call_arg_base,
+                                                int32_t string_temp_base,
+                                                int32_t string_temp_stride,
+                                                int32_t *string_label_index_io,
+                                                int call_depth,
+                                                char *out,
+                                                size_t cap) {
+    int32_t op_index = v3_find_top_level_binary_op_last(expr_text, op);
+    char args[2][4096];
+    if (op_index <= 0) {
+        return false;
+    }
+    snprintf(args[0], sizeof(args[0]), "%.*s", op_index, expr_text);
+    snprintf(args[1], sizeof(args[1]), "%s", expr_text + op_index + strlen(op));
+    v3_trim_copy_text(args[0], args[0], sizeof(args[0]));
+    v3_trim_copy_text(args[1], args[1], sizeof(args[1]));
+    if (args[0][0] == '\0' || args[1][0] == '\0') {
+        return false;
+    }
+    return v3_codegen_call_into_address(plan,
+                                        lowering,
+                                        current_function,
+                                        aliases,
+                                        alias_count,
+                                        locals,
+                                        local_count,
+                                        op,
+                                        args,
+                                        2U,
+                                        dest_addr_reg,
+                                        call_arg_base,
+                                        string_temp_base,
+                                        string_temp_stride,
+                                        string_label_index_io,
+                                        call_depth,
+                                        out,
+                                        cap);
+}
+
 static bool v3_emit_builtin_str_expr_address(const V3SystemLinkPlanStub *plan,
                                              const V3LoweringPlanStub *lowering,
                                              const V3LoweredFunctionStub *current_function,
@@ -32830,10 +33159,12 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                           size_t cap,
                                           bool *handled_out) {
     char callee[PATH_MAX];
+    char arg_text[4096];
     size_t arg_count = 0U;
     char (*args)[4096] = v3_alloc_call_arg_scratch();
     bool ok = true;
     callee[0] = '\0';
+    arg_text[0] = '\0';
     *handled_out = false;
     if (v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
         ok = v3_try_emit_builtin_statement_impl(plan,
@@ -32846,6 +33177,30 @@ static bool v3_try_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                 callee,
                                                 args,
                                                 arg_count,
+                                                call_arg_base,
+                                                string_temp_base,
+                                                string_temp_stride,
+                                                string_label_index_io,
+                                                control_label_index_io,
+                                                out,
+                                                cap,
+                                                handled_out);
+    } else if (v3_parse_prefix_single_arg_call(statement,
+                                               callee,
+                                               sizeof(callee),
+                                               arg_text,
+                                               sizeof(arg_text))) {
+        snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+        ok = v3_try_emit_builtin_statement_impl(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                callee,
+                                                args,
+                                                1U,
                                                 call_arg_base,
                                                 string_temp_base,
                                                 string_temp_stride,
@@ -33489,6 +33844,49 @@ static bool v3_prepare_non_if_statement_state(const V3SystemLinkPlanStub *plan,
             return false;
         }
         return true;
+    }
+    {
+        char callee[PATH_MAX];
+        char arg_text[4096];
+        char (*call_args)[4096] = v3_alloc_call_arg_scratch();
+        size_t call_arg_count = 0U;
+        bool parsed_call =
+            v3_parse_call_text(statement,
+                               callee,
+                               sizeof(callee),
+                               call_args,
+                               &call_arg_count,
+                               CHENG_V3_MAX_CALL_ARGS) ||
+            v3_parse_prefix_single_arg_call(statement,
+                                            callee,
+                                            sizeof(callee),
+                                            arg_text,
+                                            sizeof(arg_text));
+        free(call_args);
+        if (parsed_call) {
+            if (v3_call_expr_string_literal_count(statement) > *max_string_literal_temps_io) {
+                *max_string_literal_temps_io = v3_call_expr_string_literal_count(statement);
+            }
+            if (!v3_prepare_expr_call_state(plan,
+                                            lowering,
+                                            function,
+                                            aliases,
+                                            alias_count,
+                                            locals,
+                                            local_count,
+                                            local_cap,
+                                            next_offset_io,
+                                            statement,
+                                            0,
+                                            max_call_depth_io)) {
+                fprintf(stderr,
+                        "[cheng_v3_seed] prepare stmt call state failed function=%s stmt=%s\n",
+                        function->symbol_text,
+                        statement);
+                return false;
+            }
+            return true;
+        }
     }
     if (strchr(statement, '(') != NULL) {
         if (v3_call_expr_string_literal_count(statement) > *max_string_literal_temps_io) {
@@ -34892,14 +35290,24 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
         *terminated_out = true;
         return true;
     }
-    if (strchr(statement, '(') != NULL) {
+    {
         bool handled = false;
         char callee[PATH_MAX];
+        char arg_text[4096];
         char (*args)[4096] = v3_alloc_call_arg_scratch();
         size_t arg_count = 0U;
+        bool parsed_call = false;
         callee[0] = '\0';
-        v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
-        if (!v3_try_emit_builtin_statement(plan,
+        arg_text[0] = '\0';
+        parsed_call = v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
+        if (!parsed_call &&
+            v3_parse_prefix_single_arg_call(statement, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+            snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+            arg_count = 1U;
+            parsed_call = true;
+        }
+        if (parsed_call &&
+            !v3_try_emit_builtin_statement(plan,
                                            lowering,
                                            function,
                                            aliases,
@@ -34918,18 +35326,16 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
             free(args);
             return false;
         }
-        if (handled) {
+        if (parsed_call && handled) {
             if (strcmp(callee, "panic") == 0 || strcmp(callee, "system.panic") == 0) {
                 *terminated_out = true;
             }
             free(args);
             return true;
         }
-        if (!v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+        if (!parsed_call) {
             free(args);
-            return false;
-        }
-        {
+        } else {
             bool ok = v3_codegen_call_scalar(plan,
                                              lowering,
                                              function,
@@ -36079,7 +36485,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
     char owned_path[PATH_MAX];
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
-    V3AsmLocalSlot locals[CHENG_V3_MAX_ASM_LOCALS];
+    V3AsmLocalSlot *locals = g_v3_scalar_emit_locals;
     size_t local_count = 0U;
     int32_t next_offset = 0;
     int32_t max_call_depth = 0;
@@ -36147,7 +36553,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
             has_inline_signature_body = inline_signature_body[0] != '\0';
         }
     }
-    memset(locals, 0, sizeof(locals));
+    memset(locals, 0, sizeof(g_v3_scalar_emit_locals));
     memset(effective_param_types, 0, sizeof(effective_param_types));
     memset(effective_param_abis, 0, sizeof(effective_param_abis));
     v3_set_current_source_line(0U);
@@ -37899,29 +38305,39 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         if (v3_is_noop_local_reference_statement(locals, local_count, statement)) {
             continue;
         }
-        if (strchr(statement, '(') != NULL) {
+        {
         bool handled = false;
         char callee[PATH_MAX];
+        char arg_text[4096];
         char (*args)[4096] = v3_alloc_call_arg_scratch();
         size_t arg_count = 0U;
+        bool parsed_call = false;
         callee[0] = '\0';
-        v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
-        if (!v3_try_emit_builtin_statement(plan,
+        arg_text[0] = '\0';
+        parsed_call = v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
+        if (!parsed_call &&
+            v3_parse_prefix_single_arg_call(statement, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+            snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+            arg_count = 1U;
+            parsed_call = true;
+        }
+        if (parsed_call &&
+            !v3_try_emit_builtin_statement(plan,
                                            lowering,
                                            function,
                                            aliases,
-                                               alias_count,
-                                               locals,
-                                               local_count,
-                                               statement,
-                                               call_arg_base,
-                                               string_temp_base,
-                                               string_temp_stride,
-                                               &string_label_index,
-                                               &control_label_index,
-                                               out,
-                                               cap,
-                                               &handled)) {
+                                           alias_count,
+                                           locals,
+                                           local_count,
+                                           statement,
+                                           call_arg_base,
+                                           string_temp_base,
+                                           string_temp_stride,
+                                           &string_label_index,
+                                           &control_label_index,
+                                           out,
+                                           cap,
+                                           &handled)) {
                 fprintf(stderr,
                         "[cheng_v3_seed] emit builtin statement failed function=%s stmt=%s\n",
                         function->symbol_text,
@@ -37931,7 +38347,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                 free(owned_lines);
                 return false;
             }
-            if (handled) {
+            if (parsed_call && handled) {
                 if (strcmp(callee, "panic") == 0 || strcmp(callee, "system.panic") == 0) {
                     saw_return = true;
                     free(args);
@@ -37940,7 +38356,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                 free(args);
                 continue;
             }
-            if (!v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
+            if (!parsed_call ||
                 !v3_codegen_call_scalar(plan,
                                         lowering,
                                         function,
@@ -38063,7 +38479,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
     size_t line_count = 0U;
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
-    V3AsmLocalSlot locals[CHENG_V3_MAX_ASM_LOCALS];
+    V3AsmLocalSlot *locals = g_v3_module_init_locals;
     size_t local_count = 0U;
     int32_t next_offset = 0;
     int32_t max_call_depth = 0;
@@ -38116,7 +38532,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
              owner_module_path);
     snprintf(synthetic_function.return_type, sizeof(synthetic_function.return_type), "%s", "void");
     snprintf(synthetic_function.return_abi_class, sizeof(synthetic_function.return_abi_class), "%s", "void");
-    memset(locals, 0, sizeof(locals));
+    memset(locals, 0, sizeof(g_v3_module_init_locals));
     v3_set_current_source_line(0U);
 
     for (i = 0; i < line_count; ++i) {
@@ -42144,8 +42560,7 @@ static bool v3_wasm_prepare_list_literal_expr(const V3SystemLinkPlanStub *plan,
         expr_text == NULL || dest_type_text == NULL) {
         return false;
     }
-    args = v3_alloc_call_arg_scratch();
-    if (!v3_parse_list_literal_text(expr_text, args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
+    if (!v3_parse_list_literal_text_alloc(expr_text, &args, &arg_count) ||
         !v3_normalize_type_text(lowering,
                                 function->owner_module_path,
                                 ctx->aliases,
@@ -42241,8 +42656,7 @@ static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanS
                                 sizeof(normalized_dest_type))) {
         return false;
     }
-    args = v3_alloc_call_arg_scratch();
-    if (!v3_parse_list_literal_text(expr_text, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
+    if (!v3_parse_list_literal_text_alloc(expr_text, &args, &arg_count)) {
         free(args);
         return false;
     }
@@ -47370,7 +47784,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                    bool compile_object) {
     size_t i;
     char asm_path[PATH_MAX];
-    char module_init_symbols[CHENG_V3_MAX_PLAN_PATHS][PATH_MAX];
+    char (*module_init_symbols)[PATH_MAX];
     size_t module_init_count = 0U;
     size_t cap = 65536U + lowering->function_count * 32768U + plan->source_closure_count * 16384U;
     char *text;
@@ -47392,12 +47806,14 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
         }
         return true;
     }
+    module_init_symbols = (char (*)[PATH_MAX])v3_xmalloc(sizeof(*module_init_symbols) * CHENG_V3_MAX_PLAN_PATHS);
     snprintf(asm_path, sizeof(asm_path), "%s.s", primary->output_path);
     if (primary->consteval_entry_ready) {
         const V3LoweredFunctionStub *entry_function = v3_find_entry_lowered_function(lowering);
         char entry_symbol[PATH_MAX];
         char bridge_symbol[PATH_MAX];
         if (!entry_function) {
+            free(module_init_symbols);
             return false;
         }
         cap = 4096U + primary->consteval_echo_count * (PATH_MAX * 2U);
@@ -47410,6 +47826,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                  text,
                                                  cap)) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
         }
@@ -47439,6 +47856,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                        cap,
                                                        &emitted_init)) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
             if (emitted_init) {
@@ -47466,6 +47884,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
             snprintf(label, sizeof(label), "L_v3_const_echo_%zu", i);
             if (!v3_emit_symbol_address_for_target(plan, text, cap, 0, label)) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
             v3_emit_call_named_symbol(plan, text, cap, "puts");
@@ -47510,18 +47929,23 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
         }
         if (!v3_append_embedded_line_map(text, cap, plan, lowering, entry_function)) {
             free(text);
+            free(module_init_symbols);
             return false;
         }
         v3_append_symbol_trailer_for_target(plan, text, cap);
         if (!v3_ensure_parent_dir(asm_path) || !v3_write_text_file(asm_path, text)) {
             free(text);
+            free(module_init_symbols);
             return false;
         }
         free(text);
         if (!compile_object) {
+            free(module_init_symbols);
             return true;
         }
-        return v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path);
+        i = v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path) ? 1U : 0U;
+        free(module_init_symbols);
+        return i != 0U;
     }
     text = (char *)v3_xmalloc(cap);
     text[0] = '\0';
@@ -47532,6 +47956,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                              text,
                                              cap)) {
             free(text);
+            free(module_init_symbols);
             return false;
         }
     }
@@ -47548,6 +47973,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                    cap,
                                                    &emitted_init)) {
             free(text);
+            free(module_init_symbols);
             return false;
         }
         if (emitted_init) {
@@ -47576,6 +48002,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                              NULL)) {
                 free(scalar_chunk);
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
             v3_text_append(text, cap, scalar_chunk);
@@ -47595,6 +48022,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                       chunk,
                                                       sizeof(chunk))) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
         } else if (strcmp(lowering->functions[i].body_kind, "return_call_noarg_i32") == 0) {
@@ -47610,6 +48038,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                         lowering->functions[i].return_type,
                         lowering->functions[i].source_path);
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
             if (!v3_emit_simple_return_call_chunk(plan,
@@ -47620,6 +48049,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                   chunk,
                                                   sizeof(chunk))) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
         } else {
@@ -47635,6 +48065,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                         lowering->functions[i].return_type,
                         lowering->functions[i].source_path);
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
             if (!v3_emit_simple_return_call_chunk(plan,
@@ -47645,6 +48076,7 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                                                   chunk,
                                                   sizeof(chunk))) {
                 free(text);
+                free(module_init_symbols);
                 return false;
             }
         }
@@ -47673,18 +48105,23 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
     if (!v3_streq(plan->emit_kind, "obj") &&
         !v3_append_embedded_line_map(text, cap, plan, lowering, NULL)) {
         free(text);
+        free(module_init_symbols);
         return false;
     }
     v3_append_symbol_trailer_for_target(plan, text, cap);
     if (!v3_ensure_parent_dir(asm_path) || !v3_write_text_file(asm_path, text)) {
         free(text);
+        free(module_init_symbols);
         return false;
     }
     free(text);
     if (!compile_object) {
+        free(module_init_symbols);
         return true;
     }
-    return v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path);
+    i = v3_compile_asm_object(plan->target_triple, plan->emit_kind, asm_path, primary->output_path) ? 1U : 0U;
+    free(module_init_symbols);
+    return i != 0U;
 }
 
 static bool v3_materialize_primary_object(const V3SystemLinkPlanStub *plan,
@@ -47702,16 +48139,23 @@ static bool v3_materialize_primary_asm_only(const V3SystemLinkPlanStub *plan,
 static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
                                             const V3SystemLinkPlanStub *plan,
                                             const V3ObjectPlanStub *object_plan) {
-    V3PlanPath suppressed_export_symbols[CHENG_V3_MAX_PLAN_FUNCTIONS];
+    V3PlanPath *suppressed_export_symbols = NULL;
     size_t suppressed_export_symbol_count = 0U;
     size_t i;
+    suppressed_export_symbols =
+        (V3PlanPath *)calloc(CHENG_V3_MAX_PLAN_FUNCTIONS, sizeof(V3PlanPath));
+    if (suppressed_export_symbols == NULL) {
+        return false;
+    }
     if (object_plan->provider_source_count != object_plan->provider_object_count) {
+        free(suppressed_export_symbols);
         return false;
     }
     if (!v3_collect_explicit_export_symbols_from_source(plan->entry_path,
                                                         suppressed_export_symbols,
                                                         &suppressed_export_symbol_count,
                                                         CHENG_V3_MAX_PLAN_FUNCTIONS)) {
+        free(suppressed_export_symbols);
         return false;
     }
     for (i = 0; i < object_plan->provider_source_count; ++i) {
@@ -47725,6 +48169,7 @@ static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
                                              object_plan->provider_object_paths[i].text,
                                              suppressed_export_symbols,
                                              suppressed_export_symbol_count)) {
+                free(suppressed_export_symbols);
                 return false;
             }
         } else {
@@ -47732,10 +48177,12 @@ static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
                                      plan->emit_kind,
                                      source_path,
                                      object_plan->provider_object_paths[i].text)) {
+                free(suppressed_export_symbols);
                 return false;
             }
         }
     }
+    free(suppressed_export_symbols);
     return true;
 }
 
@@ -49652,18 +50099,16 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     const char *package_root_flag = v3_flag_value(argc, argv, "--root");
     const char *link_input_path = v3_flag_value(argc, argv, "--link-input");
     const char *browser_bridge_object_path = v3_flag_value(argc, argv, "--browser-bridge-object");
-    char seen_paths[1][1];
-    V3PlanPath seen[CHENG_V3_MAX_PLAN_PATHS];
+    V3PlanPath *seen = NULL;
     size_t seen_len = 0U;
     char *text;
-    V3PlanImportEdge direct_edges[CHENG_V3_MAX_PLAN_PATHS];
+    V3PlanImportEdge *direct_edges = NULL;
     size_t direct_edge_len = 0U;
     char owner_module_path[PATH_MAX];
     char compiler_entry[PATH_MAX];
     char last_component[PATH_MAX];
     const char *slash;
     memset(plan, 0, sizeof(*plan));
-    (void)seen_paths;
     if (!source_path || *source_path == '\0') {
         fprintf(stderr, "[cheng_v3_seed] missing --in:<path>\n");
         return false;
@@ -49692,6 +50137,8 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
         fprintf(stderr, "[cheng_v3_seed] unsupported --symbol-visibility (only public/internal)\n");
         return false;
     }
+    seen = (V3PlanPath *)v3_xmalloc(sizeof(*seen) * CHENG_V3_MAX_PLAN_PATHS);
+    direct_edges = (V3PlanImportEdge *)v3_xmalloc(sizeof(*direct_edges) * CHENG_V3_MAX_PLAN_PATHS);
     v3_resolve_effective_package_root(contract,
                                       package_root_flag,
                                       source_path,
@@ -49713,11 +50160,15 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     if (plan->extra_link_input_path[0] != '\0' &&
         !v3_path_exists_nonempty(plan->extra_link_input_path)) {
         fprintf(stderr, "[cheng_v3_seed] explicit link input missing: %s\n", plan->extra_link_input_path);
+        free(direct_edges);
+        free(seen);
         return false;
     }
     if (plan->browser_bridge_object_path[0] != '\0' &&
         !v3_path_exists_nonempty(plan->browser_bridge_object_path)) {
         fprintf(stderr, "[cheng_v3_seed] browser bridge object missing: %s\n", plan->browser_bridge_object_path);
+        free(direct_edges);
+        free(seen);
         return false;
     }
     if (!v3_target_supports_requested_emit(plan->target_triple, plan->emit_kind)) {
@@ -49730,10 +50181,14 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     v3_copy_text(plan->module_kind, sizeof(plan->module_kind), "ordinary_program");
     if (!v3_path_exists_nonempty(source_path)) {
         fprintf(stderr, "[cheng_v3_seed] source file missing: %s\n", source_path);
+        free(direct_edges);
+        free(seen);
         return false;
     }
     text = v3_read_file(source_path);
     if (!text) {
+        free(direct_edges);
+        free(seen);
         return false;
     }
     plan->has_compiler_top_level = v3_source_has_top_level(text);
@@ -49765,6 +50220,8 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
                                CHENG_V3_MAX_PLAN_PATHS)) {
         free(text);
         fprintf(stderr, "[cheng_v3_seed] malformed import in %s\n", source_path);
+        free(direct_edges);
+        free(seen);
         return false;
     }
     free(text);
@@ -49777,6 +50234,8 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
                                    source_path,
                                    seen,
                                    &seen_len)) {
+        free(direct_edges);
+        free(seen);
         return false;
     }
     if (plan->source_closure_count <= 0U) {
@@ -49801,6 +50260,8 @@ static bool v3_build_system_link_plan_stub(const V3BootstrapContract *contract,
     }
     v3_resolve_contract_path(contract, "compiler_entry_source", compiler_entry, sizeof(compiler_entry));
     (void)compiler_entry;
+    free(direct_edges);
+    free(seen);
     return true;
 }
 
@@ -51947,7 +52408,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                                                              const V3CompilerSourceOverride *overrides,
                                                              size_t override_count,
                                                              V3CompilerWorldArtifacts *out) {
-    V3PlanPath modules[CHENG_V3_MAX_PLAN_PATHS];
+    V3PlanPath *modules = (V3PlanPath *)v3_xmalloc(sizeof(V3PlanPath) * CHENG_V3_MAX_PLAN_PATHS);
     size_t module_count = 0U;
     size_t function_count = 0U;
     size_t i;
@@ -51969,6 +52430,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
     edge_report[0] = '\0';
     memset(out, 0, sizeof(*out));
     if (!v3_compiler_normalize_channel(channel_raw, out->channel, sizeof(out->channel))) {
+        free(modules);
         free(node_report);
         free(edge_report);
         return false;
@@ -51981,6 +52443,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                                    entry_module_path,
                                    sizeof(entry_module_path));
     if (!v3_compiler_source_bundle_cid_with_overrides(plan, overrides, override_count, &out->source_bundle_cid)) {
+        free(modules);
         free(node_report);
         free(edge_report);
         return false;
@@ -52003,6 +52466,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             text = owned;
         }
         if (!text) {
+            free(modules);
             free(node_report);
             free(edge_report);
             return false;
@@ -52177,7 +52641,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
         char *text = NULL;
         char *cursor;
         char *line;
-        char *lines[CHENG_V3_MAX_SOURCE_LINES];
+        char **lines = (char **)v3_xmalloc(sizeof(char *) * CHENG_V3_MAX_SOURCE_LINES);
         size_t line_count = 0U;
         size_t line_index;
         bool pending_importc = false;
@@ -52196,6 +52660,8 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             v3_bytebuf_free(&graph_buf);
             v3_bytebuf_free(&canonical_buf);
             v3_bytebuf_free(&edge_buf);
+            free(lines);
+            free(modules);
             free(node_report);
             free(edge_report);
             v3_compiler_world_artifacts_free(out);
@@ -52209,6 +52675,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                                        sizeof(module_path));
         owner_module_index = v3_plan_path_find_index(modules, module_count, module_path);
         if (owner_module_index < 0) {
+            free(lines);
             free(owned);
             continue;
         }
@@ -52226,6 +52693,8 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                 v3_bytebuf_free(&graph_buf);
                 v3_bytebuf_free(&canonical_buf);
                 v3_bytebuf_free(&edge_buf);
+                free(lines);
+                free(modules);
                 free(node_report);
                 free(edge_report);
                 v3_compiler_world_artifacts_free(out);
@@ -52472,6 +52941,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                 out->exported_count += 1U;
             }
         }
+        free(lines);
         free(owned);
     }
     v3_bytebuf_append_u32_be(&graph_buf, (uint32_t)out->edge_count);
@@ -52637,6 +53107,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             v3_bytebuf_free(&graph_buf);
             v3_bytebuf_free(&canonical_buf);
             v3_bytebuf_free(&edge_buf);
+            free(modules);
             free(node_report);
             free(edge_report);
             v3_compiler_world_artifacts_free(out);
@@ -52652,6 +53123,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             v3_bytebuf_free(&graph_buf);
             v3_bytebuf_free(&canonical_buf);
             v3_bytebuf_free(&edge_buf);
+            free(modules);
             free(node_report);
             free(edge_report);
             v3_compiler_world_artifacts_free(out);
@@ -52667,6 +53139,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
             v3_bytebuf_free(&graph_buf);
             v3_bytebuf_free(&canonical_buf);
             v3_bytebuf_free(&edge_buf);
+            free(modules);
             free(node_report);
             free(edge_report);
             v3_compiler_world_artifacts_free(out);
@@ -52677,6 +53150,7 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
     v3_bytebuf_free(&graph_buf);
     v3_bytebuf_free(&canonical_buf);
     v3_bytebuf_free(&edge_buf);
+    free(modules);
     free(node_report);
     free(edge_report);
     return true;

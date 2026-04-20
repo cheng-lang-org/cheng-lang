@@ -11,6 +11,9 @@ fn main(): int32 =
     let codexSourcePath = v3path.V3PathJoin(codexPackageRoot, "src/tests/session_exec_smoke.cheng")
     let codexEngineSourcePath = v3path.V3PathJoin(codexPackageRoot, "src/core/engine.cheng")
     let typedFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let typedHelperPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_helper.cheng")
+    let typedHelperPlainPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_helper_plain.cheng")
+    let typedImportcHelperPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_importc_helper.cheng")
     assert(parser.v3ParserPackageId(packageRoot) == "cheng/v3", "v3 parser path: package id")
     assert(v3path.V3TextSlice("std/strutils", 4, 8) == "strutils",
            "v3 parser path: std slice helper literal")
@@ -68,23 +71,81 @@ fn main(): int32 =
            "v3 parser path: nested package parse stub")
     assert(parsed.workspaceRoot == workspaceRoot, "v3 parser path: parsed nested workspace root")
     assert(parsed.packageRoot == codexPackageRoot, "v3 parser path: parsed nested package root")
-    assert(parsed.ownerModulePaths.len == 1 &&
-           parsed.ownerModulePaths[0] == "cheng/codex/tests/session_exec_smoke",
+    assert(parsed.ownerModulePaths.len >= 1 &&
+           parser.v3ParserStringSeqContains(parsed.ownerModulePaths, "cheng/codex/tests/session_exec_smoke"),
            "v3 parser path: parsed nested owner module")
     assert(parsed.unresolvedImportCount == 0, "v3 parser path: parsed nested imports resolved")
     var typedParsed: parser.V3ParsedSourceStub
     err = ""
     assert(parser.v3ParseOrdinarySourceStub(packageRoot, typedFixturePath, typedParsed, err),
            "v3 parser path: typed fixture parse stub")
+    var foundGroupedImport = false
+    for i in 0..<typedParsed.importEdges.len:
+        if typedParsed.importEdges[i].targetModulePath == "cheng/v3/tests/typed_expr_fact_helper_plain":
+            foundGroupedImport = true
+    assert(foundGroupedImport, "v3 parser path: grouped import edge")
     assert(parser.v3NormalizedExprLayerHasExpr(typedParsed.normalizedExprLayer,
                                                parser.v3NormalizedExprCall,
                                                "external_call",
-                                               25),
+                                               28),
            "v3 parser path: alias external call")
     assert(parser.v3NormalizedExprLayerHasExpr(typedParsed.normalizedExprLayer,
                                                parser.v3NormalizedExprCall,
                                                "external_call",
-                                               26),
+                                               29),
            "v3 parser path: module stem external call")
+    assert(parser.v3NormalizedExprLayerHasExpr(typedParsed.normalizedExprLayer,
+                                               parser.v3NormalizedExprCall,
+                                               "external_call",
+                                               30),
+           "v3 parser path: nested qualified external call")
+    assert(parser.v3NormalizedExprLayerHasExpr(typedParsed.normalizedExprLayer,
+                                               parser.v3NormalizedExprCall,
+                                               "external_call",
+                                               32),
+           "v3 parser path: alias importc external call")
+    assert(parser.v3NormalizedExprLayerHasExpr(typedParsed.normalizedExprLayer,
+                                               parser.v3NormalizedExprCall,
+                                               "external_call",
+                                               33),
+           "v3 parser path: nested importc external call")
+    var sawAliasExternalTarget = false
+    var sawNestedExternalTarget = false
+    var sawAliasImportcTarget = false
+    var sawNestedImportcTarget = false
+    for i in 0..<typedParsed.normalizedExprLayer.exprs.len:
+        let expr = typedParsed.normalizedExprLayer.exprs[i]
+        if expr.kind != parser.v3NormalizedExprCall:
+            continue
+        if !parser.v3ParserCallExprDetailResolved(expr.detail):
+            continue
+        if expr.lineNumber == 28:
+            assert(parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) == typedHelperPath,
+                   "v3 parser path: alias external target source")
+            assert(!parser.v3ParserCallExprDetailTargetImportc(expr.detail),
+                   "v3 parser path: alias external target importc")
+            sawAliasExternalTarget = true
+        elif expr.lineNumber == 30:
+            assert(parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) == typedHelperPlainPath,
+                   "v3 parser path: nested external target source")
+            assert(!parser.v3ParserCallExprDetailTargetImportc(expr.detail),
+                   "v3 parser path: nested external target importc")
+            sawNestedExternalTarget = true
+        elif expr.lineNumber == 32:
+            assert(parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) == typedImportcHelperPath,
+                   "v3 parser path: alias importc target source")
+            assert(parser.v3ParserCallExprDetailTargetImportc(expr.detail),
+                   "v3 parser path: alias importc target importc")
+            sawAliasImportcTarget = true
+        elif expr.lineNumber == 33:
+            assert(parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) == typedImportcHelperPath,
+                   "v3 parser path: nested importc target source")
+            assert(parser.v3ParserCallExprDetailTargetImportc(expr.detail),
+                   "v3 parser path: nested importc target importc")
+            sawNestedImportcTarget = true
+    assert(sawAliasExternalTarget, "v3 parser path: saw alias external target")
+    assert(sawNestedExternalTarget, "v3 parser path: saw nested external target")
+    assert(sawAliasImportcTarget, "v3 parser path: saw alias importc target")
+    assert(sawNestedImportcTarget, "v3 parser path: saw nested importc target")
     echo("v3 parser_path_smoke ok")
     return 0

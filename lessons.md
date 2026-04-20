@@ -60,9 +60,19 @@
 - 补 `CallExpr` 时先走最小闭环最稳：先只抓“同文件 importc fn 的 call”，把 builder 和 smoke 跑通，再扩到通用 call HIR。
 - call 规范化绝不能回到“名字表 × 行文本”的切片扫描；正确形状是逐行 token 扫描，看到 `ident(` 再查名表，不然 `compiler_csg` 这类 closure 级 smoke 会被字符串复制直接拖死。
 - `CallExpr` 真扩面时，也不要立刻把 closure 里所有函数名灌成全局名表；先坚持 per-source 名表最稳，先收“同文件 importc + local function”，再扩同包/跨文件。
+- qualified external call 的真源应该是“当前 source 的 direct import edge + alias/module-stem qualifier + 目标 source decl”，不是“整包 closure 里所有函数名”。只看最后那个函数名会把 alias/模块前缀信息丢掉，也很容易在同名函数上误归因。
+- nested qualified external call 也不能按“整条 import 闭包”无上限展开；external call name 递归必须按当前源码里真实出现的 dotted call 深度裁剪，不然普通 source 会把 std/import 闭包整棵跑进 parser。
+- grouped import 不能走 `FirstToken` 这种按空白截断的老路；`prefix/[a, b]` 必须先 strip comment，再显式展开成多条 direct import edge，不然 direct import qualifier 这条真源到了 grouped import 就会断掉。
+- unknown dotted call 的 `member_call` fallback 不能混在 `local/external/importc` 三路扫描里补；必须最后按全量已知 call 名单单独跑一遍，不然 qualified external/importc/local 会被双记，typed fact 会平白长出 `call_expr / abi=polymorphic`。
+- unknown dotted call 不能只留 `resolved=0`；`CallExpr.detail` 至少要显式带 `reason`，不然后面的 typed/report 只能看到“没解析”，看不到“为什么没解析”。
+- qualified external lookup 不能只回传“返回类型字符串”；只要目标可能是 imported `importc`，就必须把“目标是否 importc”一起带回来，否则 composite imported importc call 会被误压成 `local_address/composite_local`，进不了 `import_buffer`。
+- resolved call 的硬 gate 不能只盯 parser；local/importc 空返回如果继续和“没找到返回类型”共用空串，第一时间就会把 resolved void call 误炸成 `call_expr/deferred`。
+- 处理返回类型 ABI 时，`preferredSourcePath` 不能当成硬覆盖；正确形状是“先切到 callee source context，再按当前 source 声明和无 alias direct import 解析 unqualified type”。像 `DateTime` 这种 imported return type，不这么做一定会回退成 `abi=polymorphic`。
+- `T/refT` 这类显式泛型占位符和真正的“无解释回退”不是一回事；resolved call gate 要拦的是漏归因，不是把 generic wrapper 一起打红。
 - parser 里任何带索引的边界判断都不要依赖短路，像 `i > 0 && line[i - 1]`、`pos < len && line[pos]` 这种写法都必须拆成显式分支；这类坑已经多次重演成 `idx=-1`。
 - parser 里也不要长期保留 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引；一旦热路径里既要取 `.len` 又要按相同索引取元素，最稳的形状是先快照到本地 seq，再用显式 `while` 走索引，不要赌 compiler 一定能把这类组合安全 lowering。
 - 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。
+- seed 里任何 `8192 * PATH_MAX` 这类 plan 数组都不能再上栈；像 `v3_materialize_provider_objects(...)` 这种 provider 编译热口，必须直接用堆分配并在所有返回路径显式释放，不要等到 fresh stage2/provider compile 时再炸栈。
 
 ## 记录与流程
 

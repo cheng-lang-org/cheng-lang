@@ -37,6 +37,9 @@ fn uirCoreDefaultStr(value0: str, fallback0: str): str =
         return value0
     return fallback0
 
+const
+    uirCoreChengStrFlagOwned: int32 = 1
+
 fn uirCoreSeqObjName(): str =
     return "seq"
 
@@ -53,6 +56,203 @@ fn uirCoreSeqElemObjTypeName(module: UirCoreModule, elemTypeNode: Node, elemKey:
 
 fn uirCoreObjLenFieldName(baseName: str): str =
     return baseName + ".len"
+
+fn uirCoreObjFieldAddr(basePtr: UirExprId, offset: int32): UirExprId =
+    if offset == 0:
+        return basePtr
+    return uirCoreBin(mbAdd, basePtr, uirCoreConstI64(int64(offset)))
+
+fn uirCoreEmitRuntimeCall1(b: BlockBuilder, symbolName: str, value: UirExprId) =
+    var args: UirExprId[]
+    builderExprSeqAppend(args, value)
+    blockBuilderAddStmt(b, uirCoreStmtExpr(uirCoreCall(symbolName, args)))
+
+fn uirCoreObjTopFieldName(fieldName0: str): str =
+    let fieldName: str = backendStripSpaces(fieldName0)
+    let dotAt: int32 = uirCoreStrIndexOf(fieldName, ".")
+    if dotAt > 0:
+        return uirCoreStrTake(fieldName, dotAt)
+    return fieldName
+
+fn uirCoreObjTopFieldMinOffset(ot: UirCoreObjType, topFieldName0: str): int32 =
+    let topFieldName: str = backendStripSpaces(topFieldName0)
+    if len(topFieldName) == 0:
+        return -1
+    let prefix: str = uirCoreAppendChar(topFieldName, '.')
+    var minOff: int32 = 2147483647
+    for fi in 0..<ot.fields.len:
+        let field: UirCoreObjField = ot.fields[fi]
+        if field.name == topFieldName || uirCoreStrStartsWith(field.name, prefix):
+            if field.offset < minOff:
+                minOff = field.offset
+    if minOff == 2147483647:
+        return -1
+    return minOff
+
+fn emitObjOwnedStrCall(b: BlockBuilder,
+                       basePtr: UirExprId,
+                       ot: UirCoreObjType,
+                       callName: str): Result[bool] =
+    let dataOff: int32 = uirCoreObjTopFieldMinOffset(ot, "data")
+    let flagsOff: int32 = uirCoreObjTopFieldMinOffset(ot, "flags")
+    if dataOff < 0 || flagsOff < 0:
+        return Ok[bool](false)
+    let dataExpr: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, dataOff), uirCoreTypeI64())
+    let flagsExpr: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, flagsOff), uirCoreTypeI32())
+    let ownedBits: UirExprId = uirCoreBin(mbAnd, flagsExpr, uirCoreConstI64(int64(uirCoreChengStrFlagOwned)))
+    let doLabel: str = blockBuilderNextLabel(b, "obj_owned_str_call")
+    let joinLabel: str = blockBuilderNextLabel(b, "obj_owned_str_join")
+    let owned: UirExprId = uirCoreCmp(mcNe, ownedBits, uirCoreConstI64(0))
+    blockBuilderFinish(b, uirCoreTermCbr(owned, doLabel, joinLabel))
+    blockBuilderStart(b, doLabel)
+    uirCoreEmitRuntimeCall1(b, callName, dataExpr)
+    blockBuilderFinish(b, uirCoreTermBr(joinLabel))
+    blockBuilderStart(b, joinLabel)
+    return Ok[bool](false)
+
+fn emitObjRetainOwnedPtrs(b: BlockBuilder, basePtr: UirExprId, objTypeName0: str): Result[bool] =
+    let objTypeName: str = backendStripSpaces(objTypeName0)
+    if (b == nil) || blockBuilderModule(b) == nil || len(objTypeName) == 0:
+        return Ok[bool](false)
+    if objTypeName == "Bytes":
+        let idx0: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx0 < 0:
+            return Ok[bool](false)
+        let ot0: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx0)
+        let dataOff0: int32 = uirCoreObjTopFieldMinOffset(ot0, "data")
+        if dataOff0 < 0:
+            return Ok[bool](false)
+        let dataExpr0: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, dataOff0), uirCoreTypeI64())
+        uirCoreEmitRuntimeCall1(b, "cheng_mem_retain", dataExpr0)
+        return Ok[bool](false)
+    if objTypeName == "seq":
+        let idx1: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx1 < 0:
+            return Ok[bool](false)
+        let ot1: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx1)
+        let bufOff1: int32 = uirCoreObjTopFieldMinOffset(ot1, "buffer")
+        if bufOff1 < 0:
+            return Ok[bool](false)
+        let bufExpr1: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, bufOff1), uirCoreTypeI64())
+        uirCoreEmitRuntimeCall1(b, "cheng_mem_retain", bufExpr1)
+        return Ok[bool](false)
+    if objTypeName == "str":
+        let idx2: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx2 < 0:
+            return Ok[bool](false)
+        return emitObjOwnedStrCall(b,
+                                   basePtr,
+                                   uirCoreModuleObjTypeAt(blockBuilderModule(b), idx2),
+                                   "cheng_mem_retain")
+
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+    if idx < 0:
+        return Ok[bool](false)
+    let ot: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx)
+    var seenTopFields: str[]
+    for fi in 0..<ot.fields.len:
+        let topFieldName: str = uirCoreObjTopFieldName(ot.fields[fi].name)
+        if len(topFieldName) == 0:
+            continue
+        var alreadySeen: bool = false
+        for si in 0..<seenTopFields.len:
+            if seenTopFields[si] == topFieldName:
+                alreadySeen = true
+                break
+        if alreadySeen:
+            continue
+        uir_core_builder_object_runtime_helpers_add(seenTopFields, topFieldName)
+
+        let fieldTypeKey: str = backendStripSpaces(uirCoreObjFieldTypeKeyGet(objTypeName, topFieldName))
+        if len(fieldTypeKey) > 0 && isPtrRefVarLikeKey(fieldTypeKey):
+            continue
+        var childObjName: str = uirCoreInlineObjFieldTypeGet(objTypeName, topFieldName)
+        if len(childObjName) == 0 && isSemanticStrKey(fieldTypeKey):
+            childObjName = uirCoreSemanticStrObjTypeName(blockBuilderModule(b), fieldTypeKey)
+        if len(childObjName) == 0 && len(fieldTypeKey) > 0:
+            childObjName = uirCoreObjTypeFromTypeKey(blockBuilderModule(b), fieldTypeKey)
+        if len(childObjName) == 0:
+            continue
+        let childOff: int32 = uirCoreObjTopFieldMinOffset(ot, topFieldName)
+        if childOff < 0:
+            continue
+        let childPtr: UirExprId = uirCoreObjFieldAddr(basePtr, childOff)
+        let retainRes: Result[bool] = emitObjRetainOwnedPtrs(b, childPtr, childObjName)
+        if !uirCoreResultBoolIsOk(retainRes):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(retainRes))
+    return Ok[bool](false)
+
+fn emitObjReleaseOwnedPtrs(b: BlockBuilder, basePtr: UirExprId, objTypeName0: str): Result[bool] =
+    let objTypeName: str = backendStripSpaces(objTypeName0)
+    if (b == nil) || blockBuilderModule(b) == nil || len(objTypeName) == 0:
+        return Ok[bool](false)
+    if objTypeName == "Bytes":
+        let idx0: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx0 < 0:
+            return Ok[bool](false)
+        let ot0: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx0)
+        let dataOff0: int32 = uirCoreObjTopFieldMinOffset(ot0, "data")
+        if dataOff0 < 0:
+            return Ok[bool](false)
+        let dataExpr0: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, dataOff0), uirCoreTypeI64())
+        uirCoreEmitRuntimeCall1(b, "cheng_mem_release", dataExpr0)
+        return Ok[bool](false)
+    if objTypeName == "seq":
+        let idx1: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx1 < 0:
+            return Ok[bool](false)
+        let ot1: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx1)
+        let bufOff1: int32 = uirCoreObjTopFieldMinOffset(ot1, "buffer")
+        if bufOff1 < 0:
+            return Ok[bool](false)
+        let bufExpr1: UirExprId = uirCoreLoad(uirCoreObjFieldAddr(basePtr, bufOff1), uirCoreTypeI64())
+        uirCoreEmitRuntimeCall1(b, "cheng_mem_release", bufExpr1)
+        return Ok[bool](false)
+    if objTypeName == "str":
+        let idx2: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+        if idx2 < 0:
+            return Ok[bool](false)
+        return emitObjOwnedStrCall(b,
+                                   basePtr,
+                                   uirCoreModuleObjTypeAt(blockBuilderModule(b), idx2),
+                                   "cheng_mem_release")
+
+    let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
+    if idx < 0:
+        return Ok[bool](false)
+    let ot: UirCoreObjType = uirCoreModuleObjTypeAt(blockBuilderModule(b), idx)
+    var seenTopFields: str[]
+    for fi in 0..<ot.fields.len:
+        let topFieldName: str = uirCoreObjTopFieldName(ot.fields[fi].name)
+        if len(topFieldName) == 0:
+            continue
+        var alreadySeen: bool = false
+        for si in 0..<seenTopFields.len:
+            if seenTopFields[si] == topFieldName:
+                alreadySeen = true
+                break
+        if alreadySeen:
+            continue
+        uir_core_builder_object_runtime_helpers_add(seenTopFields, topFieldName)
+
+        let fieldTypeKey: str = backendStripSpaces(uirCoreObjFieldTypeKeyGet(objTypeName, topFieldName))
+        if len(fieldTypeKey) > 0 && isPtrRefVarLikeKey(fieldTypeKey):
+            continue
+        var childObjName: str = uirCoreInlineObjFieldTypeGet(objTypeName, topFieldName)
+        if len(childObjName) == 0 && isSemanticStrKey(fieldTypeKey):
+            childObjName = uirCoreSemanticStrObjTypeName(blockBuilderModule(b), fieldTypeKey)
+        if len(childObjName) == 0 && len(fieldTypeKey) > 0:
+            childObjName = uirCoreObjTypeFromTypeKey(blockBuilderModule(b), fieldTypeKey)
+        if len(childObjName) == 0:
+            continue
+        let childOff: int32 = uirCoreObjTopFieldMinOffset(ot, topFieldName)
+        if childOff < 0:
+            continue
+        let childPtr: UirExprId = uirCoreObjFieldAddr(basePtr, childOff)
+        let releaseRes: Result[bool] = emitObjReleaseOwnedPtrs(b, childPtr, childObjName)
+        if !uirCoreResultBoolIsOk(releaseRes):
+            return ErrInfo[bool](uirCoreResultBoolErrorInfo(releaseRes))
+    return Ok[bool](false)
 
 fn allocObjValueLocal(b: BlockBuilder, slot: int32, objTypeName: str): Result[bool] =
     let fref0: UirCoreFunc = blockBuilderFuncRef(b)
@@ -408,6 +608,12 @@ fn lowerSemanticStrLiteralValue(b: BlockBuilder, value: str,
 fn emitObjCopyPtrs(b: BlockBuilder, dstBasePtr: UirExprId, objTypeName: str, srcBasePtr: UirExprId): Result[bool] =
     if (b == nil) || blockBuilderModule(b) == nil:
         return Err[bool]("uirCore_builder: object copy missing builder/module")
+    let retainRes: Result[bool] = emitObjRetainOwnedPtrs(b, srcBasePtr, objTypeName)
+    if !uirCoreResultBoolIsOk(retainRes):
+        return ErrInfo[bool](uirCoreResultBoolErrorInfo(retainRes))
+    let releaseRes: Result[bool] = emitObjReleaseOwnedPtrs(b, dstBasePtr, objTypeName)
+    if !uirCoreResultBoolIsOk(releaseRes):
+        return ErrInfo[bool](uirCoreResultBoolErrorInfo(releaseRes))
     let idx: int32 = uirCoreFindObjType(blockBuilderModule(b), objTypeName)
     if idx < 0:
         return Err[bool]("uirCore_builder: unknown object type")

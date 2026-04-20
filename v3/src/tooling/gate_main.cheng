@@ -10,6 +10,7 @@ import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/hotpath_scan as hotscan
 import cheng/v3/tooling/bootstrap_contracts as contracts
+import cheng/v3/tooling/support_matrix as smatrix
 import cheng/v3/tooling/wasm_binary_audit as wasmaudit
 import cheng/v3/tooling/r2c_react_v3 as r2c
 import cheng/v3/tooling/compiler_request as creq
@@ -160,6 +161,7 @@ fn v3GateUsageLines(): str[] =
     add(out, "  build-backend-driver")
     add(out, "  run-smokes")
     add(out, "  print-bootstrap")
+    add(out, "  support-matrix")
     add(out, "  print-build-plan")
     add(out, "  slice-gate")
     add(out, "  debug-report [seed-flags...]")
@@ -225,6 +227,7 @@ fn v3GateUsageLines(): str[] =
     add(out, "  run-migration-gate")
     add(out, "  run-browser-webrtc-smokes")
     add(out, "  r2c-react-v3 <subcommand> [args]")
+    add(out, "  vpn-gui [--config:<path>] [--runtime-tool:<path>]")
     add(out, "  vpn-proxy <subcommand> [args]")
     return out
 
@@ -2817,6 +2820,8 @@ fn v3GateBenchBftValidatorThreeNode(root: str,
     let relayDir = v3GateBftRemoteDeployDir(cfg.relayRepoRoot, cfg)
     let localDir = cfg.localDeployDir
     let serverBin = v3GateBftRemoteBin(cfg.serverRepoRoot)
+    let relayBin = v3GateBftRemoteBin(cfg.relayRepoRoot)
+    let localBin = v3GateBftLocalBin(root)
     var baseServer = v3GateBftNodeStatusZero("server")
     var baseRelay = v3GateBftNodeStatusZero("relay")
     var baseLocal = v3GateBftNodeStatusZero("local")
@@ -2963,7 +2968,8 @@ fn v3GateBenchBftValidatorThreeNode(root: str,
             v3GatePrintErr("v3 bft bench: benchmark transactions did not converge")
             v3GatePrintErr("wave=" + intToStr(waveIndex))
             return 1
-        var waveElapsed = monotimes.InMilliseconds(monotimes.GetMonoTime() - waveStart)
+        var waveElapsedNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(waveStart)
+        var waveElapsed = waveElapsedNs / 1000000
         if waveElapsed <= int64(0):
             waveElapsed = int64(1)
         let waveTps = queuedCount * int64(1000000) / waveElapsed
@@ -2971,7 +2977,8 @@ fn v3GateBenchBftValidatorThreeNode(root: str,
         add(waveTpsMilli, waveTps)
         add(waveBlockCounts, blocksNeeded)
         add(waveRestarted, restarted)
-    var elapsedMs = monotimes.InMilliseconds(monotimes.GetMonoTime() - benchStart)
+    var elapsedNs: int64 = monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(benchStart)
+    var elapsedMs = elapsedNs / 1000000
     if elapsedMs <= int64(0):
         elapsedMs = int64(1)
     let tpsMilli = totalQueuedCount * int64(1000000) / elapsedMs
@@ -7428,6 +7435,7 @@ fn v3GateHandlesCommandBase(cmd: str): bool =
            cmd == "build-backend-driver" ||
            cmd == "run-smokes" ||
            cmd == "print-bootstrap" ||
+           cmd == "support-matrix" ||
            cmd == "print-build-plan" ||
            cmd == "slice-gate" ||
            cmd == "debug-report" ||
@@ -7501,6 +7509,7 @@ fn v3GateHandlesCommandRuntime(cmd: str): bool =
            cmd == "run-browser-webrtc-smokes" ||
            cmd == "r2c-react-v3" ||
            cmd == "r2c-react-v3-controller" ||
+           cmd == "vpn-gui" ||
            cmd == "vpn-proxy"
 
 fn v3GateHandlesCommand(cmd: str): bool =
@@ -7533,6 +7542,9 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
     if cmd == "print-bootstrap":
         let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
         v3GatePrintLine(strutil.Strip(contracts.v3BootstrapSnapshotReport(snapshot)))
+        return 0
+    if cmd == "support-matrix":
+        v3GatePrintLine(strutil.Strip(smatrix.v3SupportMatrixReport(root)))
         return 0
     if cmd == "print-build-plan":
         let plan: buildplan.V3BackendBuildPlan = buildplan.v3BackendBuildPlanDefault(root)
@@ -7788,6 +7800,8 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return r2c.v3R2cReactV3Main(root, args)
     if cmd == "r2c-react-v3-controller":
         return r2c.v3R2cReactV3Main(root, args)
+    if cmd == "vpn-gui":
+        return v3GateRunStage3Command(root, "vpn-gui", cmd, args, "vpn_gui.log", false)
     if cmd == "vpn-proxy":
         return v3GateRunStage3Command(root, "vpn-proxy", cmd, args, "vpn_proxy.log", false)
     v3GateUsage()

@@ -71,6 +71,11 @@ type
         importcCallNames: str[]
         localCallNames: str[]
         importEdges: V3ImportEdge[]
+        maxQualifiedCallDepth: int32
+
+    V3NormalizedExprResolvedCallTarget =
+        sourcePath: str
+        importc: bool
 
 fn v3ParsedSourceKindText(kind: V3ParsedSourceKind): str =
     if kind == v3ParsedOrdinarySource:
@@ -192,6 +197,20 @@ fn v3NormalizedExprLayerAppend(layer: var V3NormalizedExprLayer,
                                kind: V3NormalizedExprKind,
                                detail: str,
                                surfaceText: str) =
+    for i in 0..<layer.exprs.len:
+        if layer.exprs[i].sourcePath != sourcePath:
+            continue
+        if layer.exprs[i].lineNumber != lineNumber:
+            continue
+        if layer.exprs[i].columnNumber != columnNumber:
+            continue
+        if layer.exprs[i].kind != kind:
+            continue
+        if layer.exprs[i].detail != detail:
+            continue
+        if layer.exprs[i].surfaceText != surfaceText:
+            continue
+        return
     var expr: V3NormalizedExpr
     expr.exprId = v3NormalizedExprMakeId(sourcePath, lineNumber, columnNumber, kind, detail)
     expr.sourcePath = sourcePath
@@ -251,7 +270,10 @@ fn v3NormalizedExprLayerHasExpr(layer: V3NormalizedExprLayer,
         let expr = layer.exprs[i]
         if expr.kind != kind:
             continue
-        if expr.detail != detail:
+        if kind == v3NormalizedExprCall:
+            if v3ParserCallExprDetailKind(expr.detail) != detail:
+                continue
+        elif expr.detail != detail:
             continue
         if expr.lineNumber != lineNumber:
             continue
@@ -409,19 +431,56 @@ fn v3ParserPreviousToken(lineRaw: str,
                          stopExclusive: int32): str =
     if stopExclusive <= 0:
         return ""
-    var end = stopExclusive - 1
-    while end >= 0:
-        if !v3ParserIsInlineSpace(lineRaw[end]):
+    var cursor = stopExclusive
+    while cursor > 0:
+        let prevPos = cursor - 1
+        if !v3ParserIsInlineSpace(lineRaw[prevPos]):
             break
-        end = end - 1
+        cursor = prevPos
+    if cursor <= 0:
+        return ""
+    let end = cursor - 1
     if end < 0:
         return ""
-    var start = end
-    while start >= 0:
-        if !v3ParserIsIdentChar(lineRaw[start]):
+    var start = end + 1
+    while start > 0:
+        let prevPos = start - 1
+        if !v3ParserIsIdentChar(lineRaw[prevPos]):
             break
-        start = start - 1
-    return v3path.V3TextSlice(lineRaw, start + 1, end - start)
+        start = prevPos
+    if start > end:
+        return ""
+    return v3path.V3TextSlice(lineRaw, start, end - start + 1)
+
+fn v3ParserDottedQualifierDepth(lineRaw: str,
+                                identStart: int32): int32 =
+    if identStart <= 1:
+        return 0
+    let qualifierStop = identStart - 1
+    if lineRaw[qualifierStop] != '.':
+        return 0
+    var depth: int32 = 0
+    var segmentStart: int32 = identStart
+    var scanning = true
+    while scanning && segmentStart > 1:
+        let dotPos = segmentStart - 1
+        if lineRaw[dotPos] != '.':
+            break
+        var identPos = dotPos
+        while identPos > 0:
+            let prevPos = identPos - 1
+            if !v3ParserIsIdentChar(lineRaw[prevPos]):
+                break
+            identPos = prevPos
+        if identPos >= dotPos:
+            break
+        depth = depth + 1
+        segmentStart = identPos
+        if segmentStart <= 1:
+            break
+        if lineRaw[segmentStart - 1] != '.':
+            scanning = false
+    return depth
 
 fn v3ParserNextNonSpaceChar(lineRaw: str,
                             start: int32): char =
@@ -829,11 +888,117 @@ fn v3ParserCallExprUsesDedicatedNormalization(callNameRaw: str): bool =
         return true
     return false
 
+fn v3ParserCallExprLastDot(textRaw: str): int32 =
+    let text = v3path.V3PathTrim(textRaw)
+    var dotPos: int32 = -1
+    for i in 0..<text.len:
+        if text[i] == '.':
+            dotPos = i
+    return dotPos
+
+fn v3ParserCallExprDetail(kindRaw: str,
+                          calleeRaw: str,
+                          qualifierRaw: str,
+                          targetRaw: str,
+                          resolved: bool,
+                          reasonRaw: str,
+                          targetSourcePathRaw: str,
+                          targetImportc: bool): str =
+    let kind = v3path.V3PathTrim(kindRaw)
+    let callee = v3path.V3PathTrim(calleeRaw)
+    let qualifier = v3path.V3PathTrim(qualifierRaw)
+    let target = v3path.V3PathTrim(targetRaw)
+    let reason = v3path.V3PathTrim(reasonRaw)
+    let targetSourcePath = v3ParserNormalizePath(targetSourcePathRaw)
+    var detail = v3ParserConcat3("kind=", kind, ";")
+    detail = v3ParserConcat3(detail, "callee=", callee)
+    detail = v3ParserConcat3(detail, ";qualifier=", qualifier)
+    detail = v3ParserConcat3(detail, ";target=", target)
+    if resolved:
+        detail = detail + ";resolved=1"
+    else:
+        detail = detail + ";resolved=0"
+    if reason != "":
+        detail = v3ParserConcat3(detail, ";reason=", reason)
+    if targetSourcePath != "":
+        detail = v3ParserConcat3(detail, ";target_source_path=", targetSourcePath)
+    if targetImportc:
+        detail = detail + ";target_importc=1"
+    else:
+        detail = detail + ";target_importc=0"
+    return detail
+
+fn v3ParserCallExprDetailField(detailRaw: str,
+                               keyRaw: str): str =
+    let detail = v3path.V3PathTrim(detailRaw)
+    let key = v3path.V3PathTrim(keyRaw)
+    if detail == "" || key == "":
+        return ""
+    let prefix = v3ParserConcat2(key, "=")
+    let parts = v3ParserSplitChar(detail, ';')
+    for i in 0..<parts.len:
+        let part = v3path.V3PathTrim(parts[i])
+        if !v3ParserStartsWith(part, prefix):
+            continue
+        return v3path.V3PathTrim(v3path.V3TextSlice(part, prefix.len, part.len - prefix.len))
+    return ""
+
+fn v3ParserCallExprDetailKind(detailRaw: str): str =
+    let kind = v3ParserCallExprDetailField(detailRaw, "kind")
+    if kind != "":
+        return kind
+    let detail = v3path.V3PathTrim(detailRaw)
+    if detail == "local_call" || detail == "external_call" || detail == "importc_call" || detail == "member_call":
+        return detail
+    return ""
+
+fn v3ParserCallExprDetailCallee(detailRaw: str,
+                                surfaceTextRaw: str): str =
+    let callee = v3ParserCallExprDetailField(detailRaw, "callee")
+    if callee != "":
+        return callee
+    return v3path.V3PathTrim(surfaceTextRaw)
+
+fn v3ParserCallExprDetailQualifier(detailRaw: str,
+                                   surfaceTextRaw: str): str =
+    let qualifier = v3ParserCallExprDetailField(detailRaw, "qualifier")
+    if qualifier != "":
+        return qualifier
+    let surfaceText = v3path.V3PathTrim(surfaceTextRaw)
+    var dotPos: int32 = -1
+    for i in 0..<surfaceText.len:
+        if surfaceText[i] == '.':
+            dotPos = i
+    if dotPos <= 0:
+        return ""
+    return v3path.V3PathTrim(v3path.V3TextSlice(surfaceText, 0, dotPos))
+
+fn v3ParserCallExprDetailTarget(detailRaw: str,
+                                surfaceTextRaw: str): str =
+    let target = v3ParserCallExprDetailField(detailRaw, "target")
+    if target != "":
+        return target
+    return v3path.V3PathTrim(surfaceTextRaw)
+
+fn v3ParserCallExprDetailResolved(detailRaw: str): bool =
+    return v3ParserCallExprDetailField(detailRaw, "resolved") == "1"
+
+fn v3ParserCallExprDetailReason(detailRaw: str): str =
+    return v3ParserCallExprDetailField(detailRaw, "reason")
+
+fn v3ParserCallExprDetailTargetSourcePath(detailRaw: str): str =
+    return v3ParserNormalizePath(v3ParserCallExprDetailField(detailRaw, "target_source_path"))
+
+fn v3ParserCallExprDetailTargetImportc(detailRaw: str): bool =
+    return v3ParserCallExprDetailField(detailRaw, "target_importc") == "1"
+
 fn v3ParserAppendCallExprsLine(sourcePath: str,
                                lineNumber: int32,
                                lineRaw: str,
                                callNames: str[],
-                               detail: str,
+                               detailKind: str,
+                               currentProfile: V3NormalizedExprCallProfile,
+                               profiles: V3NormalizedExprCallProfile[],
                                layer: var V3NormalizedExprLayer) =
     if callNames.len <= 0:
         return
@@ -855,17 +1020,39 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
             stop = stop + 1
         let callName = v3path.V3TextSlice(lineRaw, i, stop - i)
         var qualifiedCallName = callName
-        if i > 1 && lineRaw[i - 1] == '.':
-            var qualifierStop: int32 = i - 1
-            var qualifierStart: int32 = qualifierStop - 1
-            while qualifierStart >= 0:
-                if !v3ParserIsIdentChar(lineRaw[qualifierStart]):
-                    break
-                qualifierStart = qualifierStart - 1
-            qualifierStart = qualifierStart + 1
-            if qualifierStart < qualifierStop:
-                let qualifier = v3path.V3TextSlice(lineRaw, qualifierStart, qualifierStop - qualifierStart)
-                qualifiedCallName = v3ParserConcat3(qualifier, ".", callName)
+        var dottedCallName = callName
+        var qualifier = ""
+        if i > 1:
+            let qualifierStop: int32 = i - 1
+            if lineRaw[qualifierStop] == '.':
+                var qualifierStart: int32 = qualifierStop
+                while qualifierStart > 0:
+                    let prevPos = qualifierStart - 1
+                    if !v3ParserIsIdentChar(lineRaw[prevPos]):
+                        break
+                    qualifierStart = prevPos
+                if qualifierStart < qualifierStop:
+                    qualifier = v3path.V3TextSlice(lineRaw, qualifierStart, qualifierStop - qualifierStart)
+                    qualifiedCallName = v3ParserConcat3(qualifier, ".", callName)
+                var dottedStart: int32 = qualifierStart
+                var scanningQualifierChain = true
+                while scanningQualifierChain && dottedStart > 1:
+                    let prevDot = dottedStart - 1
+                    if lineRaw[prevDot] != '.':
+                        scanningQualifierChain = false
+                    else:
+                        var prevStart = prevDot
+                        while prevStart > 0:
+                            let prevPos = prevStart - 1
+                            if !v3ParserIsIdentChar(lineRaw[prevPos]):
+                                break
+                            prevStart = prevPos
+                        if prevStart < prevDot:
+                            dottedStart = prevStart
+                        else:
+                            scanningQualifierChain = false
+                if dottedStart < stop:
+                    dottedCallName = v3path.V3TextSlice(lineRaw, dottedStart, stop - dottedStart)
         let prevToken = v3ParserPreviousToken(lineRaw, i)
         if prevToken == "fn" || prevToken == "func" || prevToken == "proc" ||
            prevToken == "method" || prevToken == "converter" || prevToken == "importc":
@@ -877,11 +1064,26 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
             hasCallParen = v3path.V3TextSlice(lineRaw, nextPos, 1) == "("
         var matchedSurfaceText = ""
         if hasCallParen && !v3ParserCallExprUsesDedicatedNormalization(callName):
-            if qualifiedCallName != callName && v3ParserStringSeqContainsExact(callNames, qualifiedCallName):
+            if dottedCallName != callName && v3ParserStringSeqContainsExact(callNames, dottedCallName):
+                matchedSurfaceText = dottedCallName
+            elif qualifiedCallName != callName && v3ParserStringSeqContainsExact(callNames, qualifiedCallName):
                 matchedSurfaceText = qualifiedCallName
             elif v3ParserStringSeqContainsExact(callNames, callName):
                 matchedSurfaceText = callName
         if matchedSurfaceText != "":
+            let resolvedTarget = v3ParserResolveCallTarget(currentProfile,
+                                                           profiles,
+                                                           detailKind,
+                                                           matchedSurfaceText,
+                                                           callName)
+            let detail = v3ParserCallExprDetail(detailKind,
+                                                callName,
+                                                qualifier,
+                                                matchedSurfaceText,
+                                                true,
+                                                "",
+                                                resolvedTarget.sourcePath,
+                                                resolvedTarget.importc)
             v3NormalizedExprLayerAppend(layer,
                                         sourcePath,
                                         lineNumber,
@@ -891,6 +1093,127 @@ fn v3ParserAppendCallExprsLine(sourcePath: str,
                                         matchedSurfaceText)
         i = stop
     return
+
+fn v3ParserAppendMemberCallExprsLine(sourcePath: str,
+                                     lineNumber: int32,
+                                     lineRaw: str,
+                                     knownCallNames: str[],
+                                     layer: var V3NormalizedExprLayer) =
+    var i: int32 = 0
+    while i < lineRaw.len:
+        if !v3ParserIsIdentChar(lineRaw[i]):
+            i = i + 1
+            continue
+        let start = i
+        var stop = i
+        while stop < lineRaw.len:
+            if !v3ParserIsIdentChar(lineRaw[stop]):
+                break
+            stop = stop + 1
+        let callName = v3path.V3TextSlice(lineRaw, start, stop - start)
+        var qualifiedCallName = callName
+        var dottedCallName = callName
+        if start > 1:
+            let qualifierStop: int32 = start - 1
+            if lineRaw[qualifierStop] == '.':
+                var qualifierStart: int32 = qualifierStop
+                while qualifierStart > 0:
+                    let prevPos = qualifierStart - 1
+                    if !v3ParserIsIdentChar(lineRaw[prevPos]):
+                        break
+                    qualifierStart = prevPos
+                if qualifierStart < qualifierStop:
+                    let qualifier = v3path.V3TextSlice(lineRaw, qualifierStart, qualifierStop - qualifierStart)
+                    qualifiedCallName = v3ParserConcat3(qualifier, ".", callName)
+                var dottedStart: int32 = qualifierStart
+                var scanningQualifierChain = true
+                while scanningQualifierChain && dottedStart > 1:
+                    let prevDot = dottedStart - 1
+                    if lineRaw[prevDot] != '.':
+                        scanningQualifierChain = false
+                    else:
+                        var prevStart = prevDot
+                        while prevStart > 0:
+                            let prevPos = prevStart - 1
+                            if !v3ParserIsIdentChar(lineRaw[prevPos]):
+                                break
+                            prevStart = prevPos
+                        if prevStart < prevDot:
+                            dottedStart = prevStart
+                        else:
+                            scanningQualifierChain = false
+                if dottedStart < stop:
+                    dottedCallName = v3path.V3TextSlice(lineRaw, dottedStart, stop - dottedStart)
+        let prevToken = v3ParserPreviousToken(lineRaw, start)
+        if prevToken == "fn" || prevToken == "func" || prevToken == "proc" ||
+           prevToken == "method" || prevToken == "converter" || prevToken == "importc":
+            i = stop
+            continue
+        let nextPos = v3ParserSkipInlineSpaces(lineRaw, stop)
+        var hasCallParen = false
+        if nextPos < lineRaw.len:
+            hasCallParen = v3path.V3TextSlice(lineRaw, nextPos, 1) == "("
+        if hasCallParen && dottedCallName != callName && !v3ParserCallExprUsesDedicatedNormalization(callName):
+            if !v3ParserStringSeqContainsExact(knownCallNames, dottedCallName) &&
+               !v3ParserStringSeqContainsExact(knownCallNames, qualifiedCallName) &&
+               !v3ParserStringSeqContainsExact(knownCallNames, callName):
+                var qualifier = ""
+                let dotPos = v3ParserCallExprLastDot(dottedCallName)
+                if dotPos > 0:
+                    qualifier = v3path.V3PathTrim(v3path.V3TextSlice(dottedCallName, 0, dotPos))
+                let detail = v3ParserCallExprDetail("member_call",
+                                                    callName,
+                                                    qualifier,
+                                                    dottedCallName,
+                                                    false,
+                                                    "unknown_qualified_target",
+                                                    "",
+                                                    false)
+                v3NormalizedExprLayerAppend(layer,
+                                            sourcePath,
+                                            lineNumber,
+                                            start + 1,
+                                            v3NormalizedExprCall,
+                                            detail,
+                                            dottedCallName)
+        i = stop
+    return
+
+fn v3ParserMaxQualifiedCallDepth(text: str): int32 =
+    let lines = v3ParserSplitChar(text, '\n')
+    var maxDepth: int32 = 0
+    for i in 0..<lines.len:
+        let lineRaw = v3ParserStripLineComment(lines[i])
+        if v3path.V3PathTrim(lineRaw) == "":
+            continue
+        var pos: int32 = 0
+        while pos < lineRaw.len:
+            if !v3ParserIsIdentChar(lineRaw[pos]):
+                pos = pos + 1
+                continue
+            let start = pos
+            var stop = pos
+            while stop < lineRaw.len:
+                if !v3ParserIsIdentChar(lineRaw[stop]):
+                    break
+                stop = stop + 1
+            let prevToken = v3ParserPreviousToken(lineRaw, start)
+            let nextPos = v3ParserSkipInlineSpaces(lineRaw, stop)
+            var hasCallParen = false
+            if nextPos < lineRaw.len:
+                hasCallParen = v3path.V3TextSlice(lineRaw, nextPos, 1) == "("
+            if hasCallParen &&
+               prevToken != "fn" &&
+               prevToken != "func" &&
+               prevToken != "proc" &&
+               prevToken != "method" &&
+               prevToken != "converter" &&
+               prevToken != "importc":
+                let depth = v3ParserDottedQualifierDepth(lineRaw, start)
+                if depth > maxDepth:
+                    maxDepth = depth
+            pos = stop
+    return maxDepth
 
 fn v3ParserAppendComprehensionExprsLine(sourcePath: str,
                                         lineNumber: int32,
@@ -952,6 +1275,7 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
     profile.importcCallNames = []
     profile.localCallNames = []
     profile.importEdges = []
+    profile.maxQualifiedCallDepth = 0
     if !v3ParserReadNormalizedFunctionDecls(text, profile.decls, err):
         return false
     if workspaceRoot != "" && packageRoot != "":
@@ -964,6 +1288,7 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
             return false
     v3ParserImportcCallNamesFromDecls(profile.decls, profile.importcCallNames)
     v3ParserLocalCallNamesFromDecls(profile.decls, profile.localCallNames)
+    profile.maxQualifiedCallDepth = v3ParserMaxQualifiedCallDepth(text)
     err = ""
     return true
 
@@ -984,14 +1309,162 @@ fn v3ParserImportEdgeQualifier(edge: V3ImportEdge): str =
         return sourceStem
     return v3ParserLastPathPiece(edge.targetModulePath)
 
-fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
-                                    profileIndex: int32,
-                                    names: var str[]) =
+fn v3ParserQualifiedCallPrefix(prefixRaw: str,
+                               qualifierRaw: str): str =
+    let prefix = v3path.V3PathTrim(prefixRaw)
+    let qualifier = v3path.V3PathTrim(qualifierRaw)
+    if prefix == "":
+        return qualifier
+    if qualifier == "":
+        return prefix
+    return v3ParserConcat3(prefix, ".", qualifier)
+
+fn v3ParserResolvedCallTargetNew(sourcePathRaw: str,
+                                 importc: bool): V3NormalizedExprResolvedCallTarget =
+    var out: V3NormalizedExprResolvedCallTarget
+    out.sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    out.importc = importc
+    return out
+
+fn v3ParserResolvedCallTargetEmpty(): V3NormalizedExprResolvedCallTarget =
+    return v3ParserResolvedCallTargetNew("", false)
+
+fn v3ParserCallProfileHasImportcCall(profile: V3NormalizedExprCallProfile,
+                                     nameRaw: str): bool =
+    let name = v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return false
+    return v3ParserStringSeqContainsExact(profile.importcCallNames, name)
+
+fn v3ParserCallProfileHasLocalCall(profile: V3NormalizedExprCallProfile,
+                                   nameRaw: str): bool =
+    let name = v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return false
+    return v3ParserStringSeqContainsExact(profile.localCallNames, name)
+
+fn v3ParserImportedTargetProfileIndex(currentProfile: V3NormalizedExprCallProfile,
+                                      profiles: V3NormalizedExprCallProfile[],
+                                      qualifierChainRaw: str): int32 =
+    let qualifierChain = v3path.V3PathTrim(qualifierChainRaw)
+    if qualifierChain == "":
+        return -1
+    let qualifierParts = v3ParserSplitChar(qualifierChain, '.')
+    var ctx = currentProfile
+    var targetProfileIndex: int32 = -1
+    for i in 0..<qualifierParts.len:
+        let qualifier = v3ParserIdentPrefix(v3path.V3PathTrim(qualifierParts[i]))
+        if qualifier == "":
+            return -1
+        targetProfileIndex = -1
+        for edgeIndex in 0..<ctx.importEdges.len:
+            let edge = ctx.importEdges[edgeIndex]
+            if !edge.resolved:
+                continue
+            if v3ParserImportEdgeQualifier(edge) != qualifier:
+                continue
+            targetProfileIndex = v3ParserCallProfileIndexForSourcePath(profiles, edge.targetSourcePath)
+            break
+        if targetProfileIndex < 0:
+            return -1
+        if i + 1 >= qualifierParts.len:
+            return targetProfileIndex
+        ctx = profiles[targetProfileIndex]
+    return targetProfileIndex
+
+fn v3ParserResolveQualifiedCallTarget(currentProfile: V3NormalizedExprCallProfile,
+                                      profiles: V3NormalizedExprCallProfile[],
+                                      targetRaw: str,
+                                      calleeRaw: str): V3NormalizedExprResolvedCallTarget =
+    let qualifier = v3path.V3PathTrim(v3ParserCallExprDetailQualifier("", targetRaw))
+    let callee = v3ParserIdentPrefix(v3path.V3PathTrim(calleeRaw))
+    if qualifier == "" || callee == "":
+        return v3ParserResolvedCallTargetEmpty()
+    let targetProfileIndex = v3ParserImportedTargetProfileIndex(currentProfile, profiles, qualifier)
+    if targetProfileIndex < 0:
+        return v3ParserResolvedCallTargetEmpty()
+    let targetProfile = profiles[targetProfileIndex]
+    if v3ParserCallProfileHasImportcCall(targetProfile, callee):
+        return v3ParserResolvedCallTargetNew(targetProfile.sourcePath, true)
+    if v3ParserCallProfileHasLocalCall(targetProfile, callee):
+        return v3ParserResolvedCallTargetNew(targetProfile.sourcePath, false)
+    return v3ParserResolvedCallTargetEmpty()
+
+fn v3ParserResolveUnqualifiedExternalCallTarget(currentProfile: V3NormalizedExprCallProfile,
+                                                profiles: V3NormalizedExprCallProfile[],
+                                                calleeRaw: str): V3NormalizedExprResolvedCallTarget =
+    let callee = v3ParserIdentPrefix(v3path.V3PathTrim(calleeRaw))
+    if callee == "":
+        return v3ParserResolvedCallTargetEmpty()
+    var found = v3ParserResolvedCallTargetEmpty()
+    for i in 0..<profiles.len:
+        if profiles[i].sourcePath == currentProfile.sourcePath:
+            continue
+        let hasImportc = v3ParserCallProfileHasImportcCall(profiles[i], callee)
+        let hasLocal = v3ParserCallProfileHasLocalCall(profiles[i], callee)
+        if !hasImportc && !hasLocal:
+            continue
+        let nextFound = v3ParserResolvedCallTargetNew(profiles[i].sourcePath, hasImportc)
+        if found.sourcePath != "" &&
+           (found.sourcePath != nextFound.sourcePath || found.importc != nextFound.importc):
+            return v3ParserResolvedCallTargetEmpty()
+        found = nextFound
+    return found
+
+fn v3ParserResolveCallTarget(currentProfile: V3NormalizedExprCallProfile,
+                             profiles: V3NormalizedExprCallProfile[],
+                             detailKindRaw: str,
+                             targetRaw: str,
+                             calleeRaw: str): V3NormalizedExprResolvedCallTarget =
+    let detailKind = v3path.V3PathTrim(detailKindRaw)
+    if detailKind == "local_call":
+        return v3ParserResolvedCallTargetNew(currentProfile.sourcePath, false)
+    if detailKind == "importc_call":
+        return v3ParserResolvedCallTargetNew(currentProfile.sourcePath, true)
+    if detailKind != "external_call":
+        return v3ParserResolvedCallTargetEmpty()
+    let target = v3path.V3PathTrim(targetRaw)
+    if v3ParserCallExprLastDot(target) >= 0:
+        return v3ParserResolveQualifiedCallTarget(currentProfile, profiles, target, calleeRaw)
+    return v3ParserResolveUnqualifiedExternalCallTarget(currentProfile, profiles, calleeRaw)
+
+fn v3ParserQualifiedCallDepth(prefixRaw: str): int32 =
+    let prefix = v3path.V3PathTrim(prefixRaw)
+    if prefix == "":
+        return 0
+    var depth: int32 = 1
+    for i in 0..<prefix.len:
+        if prefix[i] == '.':
+            depth = depth + 1
+    return depth
+
+fn v3ParserAppendQualifiedCallNames(out: var str[],
+                                    prefixRaw: str,
+                                    callNames: str[]) =
+    let prefix = v3path.V3PathTrim(prefixRaw)
+    if prefix == "":
+        return
+    for i in 0..<callNames.len:
+        if callNames[i] == "":
+            continue
+        v3ParserAddUniqueText(out, v3ParserConcat3(prefix, ".", callNames[i]))
+
+fn v3ParserCloneTextSeq(items: str[]): str[] =
     var out: str[] = []
+    for i in 0..<items.len:
+        add(out, items[i])
+    return out
+
+fn v3ParserCollectExternalCallNamesRecursive(profiles: V3NormalizedExprCallProfile[],
+                                             profileIndex: int32,
+                                             prefixRaw: str,
+                                             maxQualifiedCallDepth: int32,
+                                             activeSourcePaths: str[],
+                                             out: var str[]) =
     if profileIndex < 0 || profileIndex >= profiles.len:
-        names = out
         return
     let current = profiles[profileIndex]
+    let prefix = v3path.V3PathTrim(prefixRaw)
     for edgeIndex in 0..<current.importEdges.len:
         let edge = current.importEdges[edgeIndex]
         if !edge.resolved:
@@ -1002,31 +1475,65 @@ fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
         let qualifier = v3ParserImportEdgeQualifier(edge)
         if qualifier == "":
             continue
+        let nextPrefix = v3ParserQualifiedCallPrefix(prefix, qualifier)
+        let nextDepth = v3ParserQualifiedCallDepth(nextPrefix)
+        if nextDepth > maxQualifiedCallDepth:
+            continue
         let targetProfile = profiles[targetProfileIndex]
-        let targetLocalCallNames = targetProfile.localCallNames
-        var callIndex: int32 = 0
-        while callIndex < targetLocalCallNames.len:
-            v3ParserAddUniqueText(out, v3ParserConcat3(qualifier, ".", targetLocalCallNames[callIndex]))
-            callIndex = callIndex + 1
-        callIndex = 0
-        while callIndex < targetProfile.importcCallNames.len:
-            v3ParserAddUniqueText(out, v3ParserConcat3(qualifier, ".", targetProfile.importcCallNames[callIndex]))
-            callIndex = callIndex + 1
+        v3ParserAppendQualifiedCallNames(out, nextPrefix, targetProfile.localCallNames)
+        v3ParserAppendQualifiedCallNames(out, nextPrefix, targetProfile.importcCallNames)
+        if nextDepth >= maxQualifiedCallDepth:
+            continue
+        if v3ParserStringSeqContainsExact(activeSourcePaths, targetProfile.sourcePath):
+            continue
+        var nextActive = v3ParserCloneTextSeq(activeSourcePaths)
+        add(nextActive, targetProfile.sourcePath)
+        v3ParserCollectExternalCallNamesRecursive(profiles,
+                                                  targetProfileIndex,
+                                                  nextPrefix,
+                                                  maxQualifiedCallDepth,
+                                                  nextActive,
+                                                  out)
+
+fn v3ParserCollectExternalCallNames(profiles: V3NormalizedExprCallProfile[],
+                                    profileIndex: int32,
+                                    names: var str[]) =
+    var out: str[] = []
+    if profileIndex < 0 || profileIndex >= profiles.len:
+        names = out
+        return
+    var activeSourcePaths: str[] = []
+    add(activeSourcePaths, profiles[profileIndex].sourcePath)
+    v3ParserCollectExternalCallNamesRecursive(profiles,
+                                              profileIndex,
+                                              "",
+                                              profiles[profileIndex].maxQualifiedCallDepth,
+                                              activeSourcePaths,
+                                              out)
     names = out
 
-fn v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
-                                                         text: str,
-                                                         importcCallNames: str[],
-                                                         localCallNames: str[],
-                                                         externalCallNames: str[],
-                                                         layer: var V3NormalizedExprLayer,
-                                                         err: var str): bool =
+fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw: str,
+                                                                    text: str,
+                                                                    importcCallNames: str[],
+                                                                    localCallNames: str[],
+                                                                    externalCallNames: str[],
+                                                                    currentProfile: V3NormalizedExprCallProfile,
+                                                                    profiles: V3NormalizedExprCallProfile[],
+                                                                    layer: var V3NormalizedExprLayer,
+                                                                    err: var str): bool =
     let sourcePath = v3ParserNormalizePath(sourcePathRaw)
     if sourcePath == "":
         err = "missing source path"
         return false
     layer = v3NormalizedExprLayerZero()
     layer.sourceCount = 1
+    var knownCallNames: str[] = []
+    for i in 0..<localCallNames.len:
+        v3ParserAddUniqueText(knownCallNames, localCallNames[i])
+    for i in 0..<externalCallNames.len:
+        v3ParserAddUniqueText(knownCallNames, externalCallNames[i])
+    for i in 0..<importcCallNames.len:
+        v3ParserAddUniqueText(knownCallNames, importcCallNames[i])
     let lines = v3ParserSplitChar(text, '\n')
     for i in 0..<lines.len:
         let line = v3ParserStripLineComment(lines[i])
@@ -1039,12 +1546,40 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
         v3ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendResultIntrinsicExprsLine(sourcePath, lineNumber, line, layer)
-        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, localCallNames, "local_call", layer)
-        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, externalCallNames, "external_call", layer)
-        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, importcCallNames, "importc_call", layer)
+        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, localCallNames, "local_call", currentProfile, profiles, layer)
+        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, externalCallNames, "external_call", currentProfile, profiles, layer)
+        v3ParserAppendCallExprsLine(sourcePath, lineNumber, line, importcCallNames, "importc_call", currentProfile, profiles, layer)
+        v3ParserAppendMemberCallExprsLine(sourcePath, lineNumber, line, knownCallNames, layer)
     layer.questionResidualCount = 0
     err = ""
     return true
+
+fn v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
+                                                         text: str,
+                                                         importcCallNames: str[],
+                                                         localCallNames: str[],
+                                                         externalCallNames: str[],
+                                                         layer: var V3NormalizedExprLayer,
+                                                         err: var str): bool =
+    var currentProfile: V3NormalizedExprCallProfile
+    currentProfile.sourcePath = v3ParserNormalizePath(sourcePathRaw)
+    currentProfile.ownerModulePath = ""
+    currentProfile.text = text
+    currentProfile.decls = []
+    currentProfile.importcCallNames = v3ParserCloneTextSeq(importcCallNames)
+    currentProfile.localCallNames = v3ParserCloneTextSeq(localCallNames)
+    currentProfile.importEdges = []
+    currentProfile.maxQualifiedCallDepth = v3ParserMaxQualifiedCallDepth(text)
+    var profiles: V3NormalizedExprCallProfile[] = []
+    return v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw,
+                                                                            text,
+                                                                            importcCallNames,
+                                                                            localCallNames,
+                                                                            externalCallNames,
+                                                                            currentProfile,
+                                                                            profiles,
+                                                                            layer,
+                                                                            err)
 
 fn v3ParserReadNormalizedExprLayerFromText(sourcePathRaw: str,
                                            text: str,
@@ -1453,6 +1988,29 @@ fn v3ParserMainFunctionPresent(textRaw: str): bool =
             return true
     return false
 
+fn v3ParserAppendImportEdge(workspaceRoot: str,
+                            packageRoot: str,
+                            ownerModulePath: str,
+                            modulePathRaw: str,
+                            importAliasRaw: str,
+                            edges: var V3ImportEdge[],
+                            err: var str): bool =
+    let modulePath = v3path.V3PathTrim(modulePathRaw)
+    if modulePath == "":
+        err = "v3 parser: malformed import"
+        return false
+    let sourcePath = v3ParserModulePathToSourcePath(workspaceRoot, packageRoot, modulePath)
+    let resolved = v3ParserSourceExists(sourcePath)
+    var edge: V3ImportEdge
+    edge.ownerModulePath = ownerModulePath
+    edge.targetModulePath = modulePath
+    edge.targetSourcePath = sourcePath
+    edge.importAlias = v3path.V3PathTrim(importAliasRaw)
+    edge.resolved = resolved
+    add(edges, edge)
+    err = ""
+    return true
+
 fn v3ParserReadImportEdges(workspaceRoot: str,
                            packageRoot: str,
                            ownerModulePath: str,
@@ -1463,16 +2021,16 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
     edges = []
     for i in 0..<lines.len:
         let rawLine = lines[i]
-        let line = v3path.V3PathTrim(rawLine)
+        let line = v3path.V3PathTrim(v3ParserStripLineComment(rawLine))
         if !v3path.V3TextStartsWith(line, "import "):
             continue
-        let importTail = v3path.V3TextSlice(line, 7, line.len - 7)
+        let importTail = v3path.V3PathTrim(v3path.V3TextSlice(line, 7, line.len - 7))
         let asMarker = " as "
         let asPos = v3ParserFindText(importTail, asMarker)
-        var modulePath = ""
+        var importSpec = ""
         var importAlias = ""
         if asPos >= 0:
-            modulePath = v3ParserFirstToken(v3path.V3TextSlice(importTail, 0, asPos))
+            importSpec = v3path.V3PathTrim(v3path.V3TextSlice(importTail, 0, asPos))
             let aliasTailStart = asPos + len(asMarker)
             if aliasTailStart < importTail.len:
                 let aliasTail = v3path.V3TextSlice(importTail,
@@ -1480,19 +2038,62 @@ fn v3ParserReadImportEdges(workspaceRoot: str,
                                                    importTail.len - aliasTailStart)
                 importAlias = v3ParserIdentPrefix(v3ParserFirstToken(aliasTail))
         else:
-            modulePath = v3ParserFirstToken(importTail)
-        if modulePath == "":
-            err = "v3 parser: malformed import"
+            importSpec = v3path.V3PathTrim(importTail)
+        let groupedOpenPos = v3ParserFindText(importSpec, "/[")
+        if groupedOpenPos >= 0:
+            if importAlias != "":
+                err = "v3 parser: grouped import alias unsupported"
+                return false
+            let groupedClosePos = v3ParserFindText(importSpec, "]")
+            if groupedClosePos < 0 || groupedClosePos != importSpec.len - 1:
+                err = "v3 parser: malformed grouped import"
+                return false
+            let groupPrefix = v3path.V3PathTrim(v3path.V3TextSlice(importSpec, 0, groupedOpenPos))
+            let groupItemsText = v3path.V3TextSlice(importSpec,
+                                                    groupedOpenPos + 2,
+                                                    groupedClosePos - (groupedOpenPos + 2))
+            if groupPrefix == "" || groupItemsText == "":
+                err = "v3 parser: malformed grouped import"
+                return false
+            var appended = false
+            var start: int32 = 0
+            var itemPos: int32 = 0
+            while itemPos <= len(groupItemsText):
+                let atEnd = itemPos >= len(groupItemsText)
+                var stop = false
+                if atEnd:
+                    stop = true
+                elif groupItemsText[itemPos] == ',':
+                    stop = true
+                if !stop:
+                    itemPos = itemPos + 1
+                    continue
+                let itemRaw = v3path.V3TextSlice(groupItemsText, start, itemPos - start)
+                let item = v3path.V3PathTrim(itemRaw)
+                if len(item) > 0:
+                    if !v3ParserAppendImportEdge(workspaceRoot,
+                                                 packageRoot,
+                                                 ownerModulePath,
+                                                 v3ParserConcat3(groupPrefix, "/", item),
+                                                 "",
+                                                 edges,
+                                                 err):
+                        return false
+                    appended = true
+                start = itemPos + 1
+                itemPos = itemPos + 1
+            if !appended:
+                err = "v3 parser: malformed grouped import"
+                return false
+            continue
+        if !v3ParserAppendImportEdge(workspaceRoot,
+                                     packageRoot,
+                                     ownerModulePath,
+                                     importSpec,
+                                     importAlias,
+                                     edges,
+                                     err):
             return false
-        let sourcePath = v3ParserModulePathToSourcePath(workspaceRoot, packageRoot, modulePath)
-        let resolved = v3ParserSourceExists(sourcePath)
-        var edge: V3ImportEdge
-        edge.ownerModulePath = ownerModulePath
-        edge.targetModulePath = modulePath
-        edge.targetSourcePath = sourcePath
-        edge.importAlias = importAlias
-        edge.resolved = resolved
-        add(edges, edge)
     err = ""
     return true
 
@@ -1611,13 +2212,15 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
         var sourceExprLayer = v3NormalizedExprLayerZero()
         var sourceExternalCallNames: str[] = []
         v3ParserCollectExternalCallNames(sourceProfiles, i, sourceExternalCallNames)
-        if !v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourceProfiles[i].sourcePath,
-                                                                  sourceProfiles[i].text,
-                                                                  sourceProfiles[i].importcCallNames,
-                                                                  sourceProfiles[i].localCallNames,
-                                                                  sourceExternalCallNames,
-                                                                  sourceExprLayer,
-                                                                  err):
+        if !v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourceProfiles[i].sourcePath,
+                                                                             sourceProfiles[i].text,
+                                                                             sourceProfiles[i].importcCallNames,
+                                                                             sourceProfiles[i].localCallNames,
+                                                                             sourceExternalCallNames,
+                                                                             sourceProfiles[i],
+                                                                             sourceProfiles,
+                                                                             sourceExprLayer,
+                                                                             err):
             err = v3ParserConcat4("v3 parser: ", sourceProfiles[i].sourcePath, ": ", err)
             return false
         v3NormalizedExprLayerAdd(exprLayer, sourceExprLayer)
