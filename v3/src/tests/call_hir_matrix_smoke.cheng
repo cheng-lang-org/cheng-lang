@@ -1,0 +1,354 @@
+import std/result
+import std/os
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/lang/parser
+
+fn buildCsg(workspaceRoot: str,
+            packageRoot: str,
+            sourcePath: str,
+            outputPath: str,
+            emitKind: int32): ccsg.V3CompilerCsg =
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        emitKind,
+        ""
+    )
+    var linkPlan: slplan.V3SystemLinkPlanStub
+    var err = ""
+    assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 call hir matrix: link plan")
+    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
+    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
+    assert(IsOk(csgRes), "v3 call hir matrix: build csg")
+    return ccsg.v3CompilerCsgClone(Value(csgRes))
+
+fn findCallExpr(layer: parser.V3NormalizedExprLayer,
+                sourcePath: str,
+                lineNumber: int32): parser.V3NormalizedExpr =
+    for i in 0..<layer.exprs.len:
+        if layer.exprs[i].kind != parser.v3NormalizedExprCall:
+            continue
+        if layer.exprs[i].sourcePath != sourcePath:
+            continue
+        if layer.exprs[i].lineNumber != lineNumber:
+            continue
+        return parser.v3NormalizedExprClone(layer.exprs[i])
+    var missing: parser.V3NormalizedExpr
+    return missing
+
+fn countCallExprs(layer: parser.V3NormalizedExprLayer,
+                  sourcePath: str,
+                  lineNumber: int32): int32 =
+    var count: int32 = 0
+    for i in 0..<layer.exprs.len:
+        if layer.exprs[i].kind != parser.v3NormalizedExprCall:
+            continue
+        if layer.exprs[i].sourcePath != sourcePath:
+            continue
+        if layer.exprs[i].lineNumber != lineNumber:
+            continue
+        count = count + 1
+    return count
+
+fn factHasLineAndLower(facts: ccsg.V3TypedExprFact[],
+                       sourcePath: str,
+                       lineNumber: int32,
+                       loweringMode: str,
+                       returnKind: str): bool =
+    for i in 0..<facts.len:
+        if facts[i].sourcePath != sourcePath:
+            continue
+        if facts[i].lineNumber != lineNumber:
+            continue
+        if ccsg.v3TypedExprLoweringModeText(facts[i].loweringMode) != loweringMode:
+            continue
+        if ccsg.v3TypedExprReturnKindText(facts[i].returnKind) != returnKind:
+            continue
+        return true
+    return false
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
+    let smokeLabel = os.GetEnvDefault("CHENG_V3_SMOKE_LABEL", "host")
+    let outDir = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_call_hir_matrix/" + smokeLabel)
+    assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 call hir matrix: mkdir")
+
+    let parserFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/parser_normalized_expr_fixture.cheng")
+    let reasonFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_reason_fixture.cheng")
+    let aliasVisibilityFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_alias_visibility_fixture.cheng")
+    let localShadowFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_local_shadow_fixture.cheng")
+    let qualifiedLocalShadowFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_local_shadow_fixture.cheng")
+    let qualifiedAmbiguousFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_ambiguous_fixture.cheng")
+    let closureVisibleFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_closure_visible_fixture.cheng")
+    let closureVisibleLeafPath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_closure_visible_leaf.cheng")
+    let qualifiedClosureVisibleFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_closure_visible_fixture.cheng")
+    let qualifiedClosureVisibleLeafPath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_closure_visible_leaf.cheng")
+    let helperBPath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_reason_helper_b.cheng")
+    var parserLayer = parser.v3NormalizedExprLayerZero()
+    var err = ""
+    assert(parser.v3ParserReadNormalizedExprLayerFromPath(parserFixturePath, parserLayer, err),
+           "v3 call hir matrix: parser fixture layer")
+    let parserImportc = findCallExpr(parserLayer, parserFixturePath, 16)
+    let parserLocal = findCallExpr(parserLayer, parserFixturePath, 17)
+    let parserUnknownMember = findCallExpr(parserLayer, parserFixturePath, 18)
+    assert(parserImportc.exprId != "", "v3 call hir matrix: parser importc call")
+    assert(parserLocal.exprId != "", "v3 call hir matrix: parser local call")
+    assert(parserUnknownMember.exprId != "", "v3 call hir matrix: parser member fallback")
+    assert(parser.v3ParserCallExprDetailKind(parserImportc.detail) == "importc_call",
+           "v3 call hir matrix: parser importc kind")
+    assert(parser.v3ParserCallExprDetailResolved(parserImportc.detail),
+           "v3 call hir matrix: parser importc resolved")
+    assert(parser.v3ParserCallExprDetailTargetImportc(parserImportc.detail),
+           "v3 call hir matrix: parser importc flag")
+    assert(parser.v3ParserCallExprDetailKind(parserLocal.detail) == "local_call",
+           "v3 call hir matrix: parser local kind")
+    assert(parser.v3ParserCallExprDetailResolved(parserLocal.detail),
+           "v3 call hir matrix: parser local resolved")
+    assert(parser.v3ParserCallExprDetailKind(parserUnknownMember.detail) == "member_call",
+           "v3 call hir matrix: parser member kind")
+    assert(!parser.v3ParserCallExprDetailResolved(parserUnknownMember.detail),
+           "v3 call hir matrix: parser member unresolved")
+    assert(parser.v3ParserCallExprDetailReason(parserUnknownMember.detail) == "unknown_qualified_target",
+           "v3 call hir matrix: parser member reason")
+
+    var reasonLayer = parser.v3NormalizedExprLayerZero()
+    var reasonParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, reasonFixturePath, reasonParsed, err),
+           "v3 call hir matrix: reason fixture stub")
+    reasonLayer = parser.v3NormalizedExprLayerClone(reasonParsed.normalizedExprLayer)
+    let qualifiedExternalA = findCallExpr(reasonLayer, reasonFixturePath, 5)
+    let qualifiedExternalB = findCallExpr(reasonLayer, reasonFixturePath, 6)
+    let ambiguousExternal = findCallExpr(reasonLayer, reasonFixturePath, 7)
+    assert(qualifiedExternalA.exprId != "", "v3 call hir matrix: qualified external a")
+    assert(qualifiedExternalB.exprId != "", "v3 call hir matrix: qualified external b")
+    assert(ambiguousExternal.exprId != "", "v3 call hir matrix: ambiguous external call")
+    assert(parser.v3ParserCallExprDetailKind(qualifiedExternalA.detail) == "external_call",
+           "v3 call hir matrix: qualified external a kind")
+    assert(parser.v3ParserCallExprDetailKind(qualifiedExternalB.detail) == "external_call",
+           "v3 call hir matrix: qualified external b kind")
+    assert(parser.v3ParserCallExprDetailResolved(qualifiedExternalA.detail),
+           "v3 call hir matrix: qualified external a resolved")
+    assert(parser.v3ParserCallExprDetailResolved(qualifiedExternalB.detail),
+           "v3 call hir matrix: qualified external b resolved")
+    assert(parser.v3ParserCallExprDetailKind(ambiguousExternal.detail) == "external_call",
+           "v3 call hir matrix: ambiguous external kind")
+    assert(!parser.v3ParserCallExprDetailResolved(ambiguousExternal.detail),
+           "v3 call hir matrix: ambiguous external unresolved")
+    assert(parser.v3ParserCallExprDetailReason(ambiguousExternal.detail) == "ambiguous_external_target",
+           "v3 call hir matrix: ambiguous external reason")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(ambiguousExternal.detail) == "",
+           "v3 call hir matrix: ambiguous external target empty")
+
+    var aliasVisibilityParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, aliasVisibilityFixturePath, aliasVisibilityParsed, err),
+           "v3 call hir matrix: alias visibility stub")
+    let aliasVisibleExternal = findCallExpr(aliasVisibilityParsed.normalizedExprLayer, aliasVisibilityFixturePath, 5)
+    assert(aliasVisibleExternal.exprId != "", "v3 call hir matrix: alias visibility external call")
+    assert(parser.v3ParserCallExprDetailKind(aliasVisibleExternal.detail) == "external_call",
+           "v3 call hir matrix: alias visibility kind")
+    assert(parser.v3ParserCallExprDetailResolved(aliasVisibleExternal.detail),
+           "v3 call hir matrix: alias visibility resolved")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(aliasVisibleExternal.detail) == helperBPath,
+           "v3 call hir matrix: alias visibility target source")
+
+    var localShadowParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, localShadowFixturePath, localShadowParsed, err),
+           "v3 call hir matrix: local shadow stub")
+    let localShadowCall = findCallExpr(localShadowParsed.normalizedExprLayer, localShadowFixturePath, 7)
+    assert(localShadowCall.exprId != "", "v3 call hir matrix: local shadow call")
+    assert(countCallExprs(localShadowParsed.normalizedExprLayer, localShadowFixturePath, 7) == 1,
+           "v3 call hir matrix: local shadow single call expr")
+    assert(parser.v3ParserCallExprDetailKind(localShadowCall.detail) == "local_call",
+           "v3 call hir matrix: local shadow kind")
+    assert(parser.v3ParserCallExprDetailResolved(localShadowCall.detail),
+           "v3 call hir matrix: local shadow resolved")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(localShadowCall.detail) == localShadowFixturePath,
+           "v3 call hir matrix: local shadow target source")
+
+    var qualifiedLocalShadowParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, qualifiedLocalShadowFixturePath, qualifiedLocalShadowParsed, err),
+           "v3 call hir matrix: qualified local shadow stub")
+    let paramShadowCall = findCallExpr(qualifiedLocalShadowParsed.normalizedExprLayer, qualifiedLocalShadowFixturePath, 4)
+    let localQualifiedShadowCall = findCallExpr(qualifiedLocalShadowParsed.normalizedExprLayer, qualifiedLocalShadowFixturePath, 8)
+    assert(paramShadowCall.exprId != "", "v3 call hir matrix: qualified param shadow call")
+    assert(localQualifiedShadowCall.exprId != "", "v3 call hir matrix: qualified local shadow call")
+    assert(countCallExprs(qualifiedLocalShadowParsed.normalizedExprLayer, qualifiedLocalShadowFixturePath, 4) == 1,
+           "v3 call hir matrix: qualified param shadow single call expr")
+    assert(countCallExprs(qualifiedLocalShadowParsed.normalizedExprLayer, qualifiedLocalShadowFixturePath, 8) == 1,
+           "v3 call hir matrix: qualified local shadow single call expr")
+    assert(parser.v3ParserCallExprDetailKind(paramShadowCall.detail) == "member_call",
+           "v3 call hir matrix: qualified param shadow kind")
+    assert(parser.v3ParserCallExprDetailKind(localQualifiedShadowCall.detail) == "member_call",
+           "v3 call hir matrix: qualified local shadow kind")
+    assert(!parser.v3ParserCallExprDetailResolved(paramShadowCall.detail),
+           "v3 call hir matrix: qualified param shadow unresolved")
+    assert(!parser.v3ParserCallExprDetailResolved(localQualifiedShadowCall.detail),
+           "v3 call hir matrix: qualified local shadow unresolved")
+    assert(parser.v3ParserCallExprDetailReason(paramShadowCall.detail) == "shadowed_qualified_target",
+           "v3 call hir matrix: qualified param shadow reason")
+    assert(parser.v3ParserCallExprDetailReason(localQualifiedShadowCall.detail) == "shadowed_qualified_target",
+           "v3 call hir matrix: qualified local shadow reason")
+
+    var qualifiedAmbiguousParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, qualifiedAmbiguousFixturePath, qualifiedAmbiguousParsed, err),
+           "v3 call hir matrix: qualified ambiguous stub")
+    let qualifiedAmbiguousExternal = findCallExpr(qualifiedAmbiguousParsed.normalizedExprLayer, qualifiedAmbiguousFixturePath, 5)
+    assert(qualifiedAmbiguousExternal.exprId != "", "v3 call hir matrix: qualified ambiguous external call")
+    assert(parser.v3ParserCallExprDetailKind(qualifiedAmbiguousExternal.detail) == "external_call",
+           "v3 call hir matrix: qualified ambiguous kind")
+    assert(!parser.v3ParserCallExprDetailResolved(qualifiedAmbiguousExternal.detail),
+           "v3 call hir matrix: qualified ambiguous unresolved")
+    assert(parser.v3ParserCallExprDetailReason(qualifiedAmbiguousExternal.detail) == "ambiguous_qualified_target",
+           "v3 call hir matrix: qualified ambiguous reason")
+
+    var qualifiedClosureVisibleParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, qualifiedClosureVisibleFixturePath, qualifiedClosureVisibleParsed, err),
+           "v3 call hir matrix: qualified closure visible stub")
+    let qualifiedClosureVisibleLocal = findCallExpr(qualifiedClosureVisibleParsed.normalizedExprLayer, qualifiedClosureVisibleFixturePath, 5)
+    let qualifiedClosureVisibleImportc = findCallExpr(qualifiedClosureVisibleParsed.normalizedExprLayer, qualifiedClosureVisibleFixturePath, 6)
+    assert(qualifiedClosureVisibleLocal.exprId != "", "v3 call hir matrix: qualified closure visible local call")
+    assert(qualifiedClosureVisibleImportc.exprId != "", "v3 call hir matrix: qualified closure visible importc call")
+    assert(parser.v3ParserCallExprDetailKind(qualifiedClosureVisibleLocal.detail) == "external_call",
+           "v3 call hir matrix: qualified closure visible local kind")
+    assert(parser.v3ParserCallExprDetailKind(qualifiedClosureVisibleImportc.detail) == "external_call",
+           "v3 call hir matrix: qualified closure visible importc kind")
+    assert(parser.v3ParserCallExprDetailResolved(qualifiedClosureVisibleLocal.detail),
+           "v3 call hir matrix: qualified closure visible local resolved")
+    assert(parser.v3ParserCallExprDetailResolved(qualifiedClosureVisibleImportc.detail),
+           "v3 call hir matrix: qualified closure visible importc resolved")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(qualifiedClosureVisibleLocal.detail) == qualifiedClosureVisibleLeafPath,
+           "v3 call hir matrix: qualified closure visible local target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(qualifiedClosureVisibleImportc.detail) == qualifiedClosureVisibleLeafPath,
+           "v3 call hir matrix: qualified closure visible importc target")
+    assert(!parser.v3ParserCallExprDetailTargetImportc(qualifiedClosureVisibleLocal.detail),
+           "v3 call hir matrix: qualified closure visible local importc flag")
+    assert(parser.v3ParserCallExprDetailTargetImportc(qualifiedClosureVisibleImportc.detail),
+           "v3 call hir matrix: qualified closure visible importc flag")
+
+    var closureVisibleParsed: parser.V3ParsedSourceStub
+    err = ""
+    assert(parser.v3ParseOrdinarySourceStub(packageRoot, closureVisibleFixturePath, closureVisibleParsed, err),
+           "v3 call hir matrix: closure visible stub")
+    let closureVisibleLocal = findCallExpr(closureVisibleParsed.normalizedExprLayer, closureVisibleFixturePath, 5)
+    let closureVisibleImportc = findCallExpr(closureVisibleParsed.normalizedExprLayer, closureVisibleFixturePath, 6)
+    assert(closureVisibleLocal.exprId != "", "v3 call hir matrix: closure visible local call")
+    assert(closureVisibleImportc.exprId != "", "v3 call hir matrix: closure visible importc call")
+    assert(parser.v3ParserCallExprDetailKind(closureVisibleLocal.detail) == "external_call",
+           "v3 call hir matrix: closure visible local kind")
+    assert(parser.v3ParserCallExprDetailKind(closureVisibleImportc.detail) == "external_call",
+           "v3 call hir matrix: closure visible importc kind")
+    assert(parser.v3ParserCallExprDetailResolved(closureVisibleLocal.detail),
+           "v3 call hir matrix: closure visible local resolved")
+    assert(parser.v3ParserCallExprDetailResolved(closureVisibleImportc.detail),
+           "v3 call hir matrix: closure visible importc resolved")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(closureVisibleLocal.detail) == closureVisibleLeafPath,
+           "v3 call hir matrix: closure visible local target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(closureVisibleImportc.detail) == closureVisibleLeafPath,
+           "v3 call hir matrix: closure visible importc target")
+    assert(!parser.v3ParserCallExprDetailTargetImportc(closureVisibleLocal.detail),
+           "v3 call hir matrix: closure visible local importc flag")
+    assert(parser.v3ParserCallExprDetailTargetImportc(closureVisibleImportc.detail),
+           "v3 call hir matrix: closure visible importc flag")
+
+    let typedFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
+    let typedOutputPath = v3path.V3PathJoin(outDir, "typed_expr_fact_fixture")
+    let typedCsg = buildCsg(workspaceRoot, packageRoot, typedFixturePath, typedOutputPath, creq.v3EmitShared)
+    let typedFacts = ccsg.v3TypedExprFactsForSource(typedCsg.typedExprFacts, typedFixturePath)
+    assert(typedFacts.len > 0, "v3 call hir matrix: typed facts slice")
+    let closureVisibleOutputPath = v3path.V3PathJoin(outDir, "call_hir_closure_visible_fixture")
+    let closureVisibleCsg = buildCsg(workspaceRoot, packageRoot, closureVisibleFixturePath, closureVisibleOutputPath, creq.v3EmitExe)
+    let closureVisibleFacts = ccsg.v3TypedExprFactsForSource(closureVisibleCsg.typedExprFacts, closureVisibleFixturePath)
+    assert(closureVisibleFacts.len > 0, "v3 call hir matrix: closure visible facts slice")
+    let qualifiedClosureVisibleOutputPath = v3path.V3PathJoin(outDir, "call_hir_qualified_closure_visible_fixture")
+    let qualifiedClosureVisibleCsg = buildCsg(workspaceRoot, packageRoot, qualifiedClosureVisibleFixturePath, qualifiedClosureVisibleOutputPath, creq.v3EmitExe)
+    let qualifiedClosureVisibleFacts = ccsg.v3TypedExprFactsForSource(qualifiedClosureVisibleCsg.typedExprFacts, qualifiedClosureVisibleFixturePath)
+    assert(qualifiedClosureVisibleFacts.len > 0, "v3 call hir matrix: qualified closure visible facts slice")
+
+    let helperPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_helper.cheng")
+    let helperPlainPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_helper_plain.cheng")
+    let helperImportcPath = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_importc_helper.cheng")
+
+    let localImportc = findCallExpr(typedCsg.exprLayer, typedFixturePath, 26)
+    let localCall = findCallExpr(typedCsg.exprLayer, typedFixturePath, 27)
+    let aliasExternal = findCallExpr(typedCsg.exprLayer, typedFixturePath, 28)
+    let moduleStemExternal = findCallExpr(typedCsg.exprLayer, typedFixturePath, 29)
+    let nestedExternal = findCallExpr(typedCsg.exprLayer, typedFixturePath, 30)
+    let aliasImportcExternal = findCallExpr(typedCsg.exprLayer, typedFixturePath, 32)
+    let nestedImportcExternal = findCallExpr(typedCsg.exprLayer, typedFixturePath, 33)
+
+    assert(parser.v3ParserCallExprDetailResolved(localImportc.detail),
+           "v3 call hir matrix: local importc resolved")
+    assert(parser.v3ParserCallExprDetailTargetImportc(localImportc.detail),
+           "v3 call hir matrix: local importc flag")
+    assert(parser.v3ParserCallExprDetailResolved(localCall.detail),
+           "v3 call hir matrix: local function resolved")
+    assert(parser.v3ParserCallExprDetailResolved(aliasExternal.detail),
+           "v3 call hir matrix: alias external resolved")
+    assert(parser.v3ParserCallExprDetailResolved(moduleStemExternal.detail),
+           "v3 call hir matrix: module stem external resolved")
+    assert(parser.v3ParserCallExprDetailResolved(nestedExternal.detail),
+           "v3 call hir matrix: nested external resolved")
+    assert(parser.v3ParserCallExprDetailResolved(aliasImportcExternal.detail),
+           "v3 call hir matrix: alias importc external resolved")
+    assert(parser.v3ParserCallExprDetailResolved(nestedImportcExternal.detail),
+           "v3 call hir matrix: nested importc external resolved")
+
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(aliasExternal.detail) == helperPath,
+           "v3 call hir matrix: alias external target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(moduleStemExternal.detail) == helperPlainPath,
+           "v3 call hir matrix: module stem external target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(nestedExternal.detail) == helperPlainPath,
+           "v3 call hir matrix: nested external target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(aliasImportcExternal.detail) == helperImportcPath,
+           "v3 call hir matrix: alias importc target")
+    assert(parser.v3ParserCallExprDetailTargetSourcePath(nestedImportcExternal.detail) == helperImportcPath,
+           "v3 call hir matrix: nested importc target")
+    assert(parser.v3ParserCallExprDetailTargetImportc(aliasImportcExternal.detail),
+           "v3 call hir matrix: alias importc flag")
+    assert(parser.v3ParserCallExprDetailTargetImportc(nestedImportcExternal.detail),
+           "v3 call hir matrix: nested importc flag")
+
+    assert(factHasLineAndLower(typedFacts, typedFixturePath, 26, "import_buffer", "import_buffer"),
+           "v3 call hir matrix: local importc import buffer")
+    assert(factHasLineAndLower(typedFacts, typedFixturePath, 27, "local_address", "composite_local"),
+           "v3 call hir matrix: local composite call")
+    assert(factHasLineAndLower(typedFacts, typedFixturePath, 32, "import_buffer", "import_buffer"),
+           "v3 call hir matrix: alias importc external import buffer")
+    assert(factHasLineAndLower(typedFacts, typedFixturePath, 33, "import_buffer", "import_buffer"),
+           "v3 call hir matrix: nested importc external import buffer")
+    assert(ccsg.v3TypedExprAbiPolymorphicCount(typedFacts) == 0,
+           "v3 call hir matrix: no abi polymorphic")
+    assert(ccsg.v3TypedExprLowerDeferredCount(typedFacts) == 0,
+           "v3 call hir matrix: no deferred lowering")
+    assert(factHasLineAndLower(closureVisibleFacts, closureVisibleFixturePath, 5, "reg", "reg"),
+           "v3 call hir matrix: closure visible local lowering")
+    assert(factHasLineAndLower(closureVisibleFacts, closureVisibleFixturePath, 6, "import_buffer", "import_buffer"),
+           "v3 call hir matrix: closure visible importc lowering")
+    assert(ccsg.v3TypedExprAbiPolymorphicCount(closureVisibleFacts) == 0,
+           "v3 call hir matrix: closure visible no abi polymorphic")
+    assert(ccsg.v3TypedExprLowerDeferredCount(closureVisibleFacts) == 0,
+           "v3 call hir matrix: closure visible no deferred lowering")
+    assert(factHasLineAndLower(qualifiedClosureVisibleFacts, qualifiedClosureVisibleFixturePath, 5, "reg", "reg"),
+           "v3 call hir matrix: qualified closure visible local lowering")
+    assert(factHasLineAndLower(qualifiedClosureVisibleFacts, qualifiedClosureVisibleFixturePath, 6, "import_buffer", "import_buffer"),
+           "v3 call hir matrix: qualified closure visible importc lowering")
+    assert(ccsg.v3TypedExprAbiPolymorphicCount(qualifiedClosureVisibleFacts) == 0,
+           "v3 call hir matrix: qualified closure visible no abi polymorphic")
+    assert(ccsg.v3TypedExprLowerDeferredCount(qualifiedClosureVisibleFacts) == 0,
+           "v3 call hir matrix: qualified closure visible no deferred lowering")
+
+    echo("v3 call_hir_matrix_smoke ok")
+    return 0

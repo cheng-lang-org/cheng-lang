@@ -8,6 +8,24 @@ import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
 import cheng/v3/lang/parser
 
+fn reportFieldValue(report: str, key: str): str =
+    let prefix = key + "="
+    var lineStart: int32 = 0
+    while lineStart < report.len:
+        var lineEnd = lineStart
+        while lineEnd < report.len && report[lineEnd] != '\n':
+            lineEnd = lineEnd + 1
+        let lineLen = lineEnd - lineStart
+        if lineLen >= prefix.len &&
+           v3path.V3TextSlice(report, lineStart, prefix.len) == prefix:
+            return v3path.V3TextSlice(report, lineStart + prefix.len, lineLen - prefix.len)
+        lineStart = lineEnd + 1
+    return ""
+
+fn reportFieldPositive(report: str, key: str): bool =
+    let value = reportFieldValue(report, key)
+    return value != "" && value != "0"
+
 fn main(): int32 =
     let workspaceRoot: str = v3path.V3PathCurrentDir()
     let packageRoot: str = v3path.V3PathJoin(workspaceRoot, "v3")
@@ -29,7 +47,8 @@ fn main(): int32 =
     assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 lowering plan: build link plan")
     assert(linkPlan.missingReasons.len == 0, "v3 lowering plan: link plan ready")
     var plan: lower.V3LoweringPlanStub
-    assert(lower.v3BuildLoweringPlanStub(linkPlan, plan, err), "v3 lowering plan: build lowering plan")
+    let builtPlan = lower.v3BuildLoweringPlanStub(linkPlan, plan, err)
+    assert(builtPlan, "v3 lowering plan: build lowering plan")
     assert(plan.functionNames.len >= 1, "v3 lowering plan: function count")
     assert(plan.functionNameIds[0] >= 0, "v3 lowering plan: intern id")
     assert(plan.functionCallConvs[0] == lower.v3LoweringCallConvInternal(), "v3 lowering plan: callconv")
@@ -54,7 +73,7 @@ fn main(): int32 =
     assert(ccsg.v3TypedExprLowerLocalAddressCount(plan.typedExprFacts) > 0,
            "v3 lowering plan: typed lowering mode")
     assert(plan.missingReasons.len == 0, "v3 lowering plan: no lowering blockers")
-    assert(lower.v3LoweringPlanPipelineStage(plan) == "canonical_csg_to_lowering_plan_stub",
+    assert(lower.v3LoweringPlanPipelineStage(plan) == "canonical_csg_to_lowering_plan",
            "v3 lowering plan: report stage")
 
     let typedFixturePath: str = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
@@ -73,8 +92,8 @@ fn main(): int32 =
            "v3 lowering plan: typed build link plan")
     var typedPlan: lower.V3LoweringPlanStub
     err = ""
-    assert(lower.v3BuildLoweringPlanStub(typedLinkPlan, typedPlan, err),
-           "v3 lowering plan: typed fixture plan")
+    let builtTypedPlan = lower.v3BuildLoweringPlanStub(typedLinkPlan, typedPlan, err)
+    assert(builtTypedPlan, "v3 lowering plan: typed fixture plan")
     let typedSourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(typedLinkPlan.packageId, typedLinkPlan.sourceClosurePaths)
     let typedCsgRes = ccsg.v3BuildCompilerCsg(typedLinkPlan, typedSourceBundleCid)
     assert(IsOk(typedCsgRes), "v3 lowering plan: typed fixture csg")
@@ -93,12 +112,13 @@ fn main(): int32 =
            "v3 lowering plan: typed plan lowering rules validate")
     assert(ccsg.v3TypedExprLoweringRulesEqual(typedCsgRules, typedPlan.loweringRules),
            "v3 lowering plan: lowering rules match compiler csg")
+    let typedPlanReport = lower.v3LoweringPlanStubReport(typedPlan)
     let typedFixtureFacts = ccsg.v3TypedExprFactsForSource(typedPlan.typedExprFacts, typedFixturePath)
     assert(typedFixtureFacts.len > 0, "v3 lowering plan: typed fixture fact slice")
     assert(plan.loweringRules.len == plan.typedExprFacts.len,
            "v3 lowering plan: typed lowering rule count")
-    assert(ccsg.v3TypedExprLoweringRuleUniqueKeyCount(typedCsgRules) > 0,
-           "v3 lowering plan: typed lowering rule key count")
+    assert(ccsg.v3TypedExprLoweringRuleUniqueShapeCount(typedCsgRules) > 0,
+           "v3 lowering plan: typed lowering rule shape count")
     assert(ccsg.v3TypedExprAbiPolymorphicCount(typedFixtureFacts) == 0,
            "v3 lowering plan: typed fixture no abi polymorphic")
     assert(ccsg.v3TypedExprLowerDeferredCount(typedFixtureFacts) == 0,
@@ -146,17 +166,17 @@ fn main(): int32 =
            "v3 lowering plan: typed fixture sret return kind")
     assert(ccsg.v3TypedExprReturnImportBufferCount(typedFixtureFacts) > 0,
            "v3 lowering plan: typed fixture import buffer return kind")
-    assert(ccsg.v3TypedExprLoweringRuleCountArgPassKind(typedCsgRules, "address") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_arg_address_count"),
            "v3 lowering plan: typed address arg rule")
-    assert(ccsg.v3TypedExprLoweringRuleCountResultPassKind(typedCsgRules, "sret") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_result_sret_count"),
            "v3 lowering plan: typed sret result rule")
-    assert(ccsg.v3TypedExprLoweringRuleCountMaterializeKind(typedCsgRules, "dest_address") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_materialize_dest_address_count"),
            "v3 lowering plan: typed dest address materialize rule")
-    assert(ccsg.v3TypedExprLoweringRuleCountCopyKind(typedCsgRules, "region_copy") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_copy_region_copy_count"),
            "v3 lowering plan: typed region copy rule")
-    assert(ccsg.v3TypedExprLoweringRuleCountImportKind(typedCsgRules, "builtin_address_slot") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_import_builtin_address_slot_count"),
            "v3 lowering plan: typed builtin address import rule")
-    assert(ccsg.v3TypedExprLoweringRuleCountImportKind(typedCsgRules, "import_buffer") > 0,
+    assert(reportFieldPositive(typedPlanReport, "lowering_rule_import_import_buffer_count"),
            "v3 lowering plan: typed import buffer import rule")
 
     echo("v3 lowering_plan_smoke ok")

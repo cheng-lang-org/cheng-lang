@@ -1,90 +1,38 @@
 # 进度
 
-| 时间 | 状态 | 事项 |
-|---|---|---|
-| `2026-04-19` | 已完成 | 顶层声明规范化、表达式规范化层、`V3TypedExprFact`、`V3TypedExprLoweringRule` 已经落在 `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng`、`/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng`、`/Users/lbcheng/cheng-lang/v3/src/tooling/compiler_csg.cheng`、`/Users/lbcheng/cheng-lang/v3/src/backend/lowering_plan.cheng`。 |
-| `2026-04-19` | 已完成 | browser bridge 这条线已经 formalize 到编译器 artifact，不再是业务模块手写 helper。 |
-| `2026-04-19` | 已完成 | `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 新增 `V3CallArgPassKind`、`V3ExprMaterializeKind`、`v3_call_arg_pass_kind`、`v3_expr_materialize_kind`，开始把 seed 热路径从文本 `composite` 判定收回共享 rule helper。 |
-| `2026-04-19` | 已完成 | `v3_emit_direct_composite_call_arg_address`、`v3_emit_address_call_arg_spill`、`v3_wasm_call_arg_prefers_address`、`v3_wasm_prepare_call_arg_state`、`v3_wasm_emit_call_arg_value` 已改走共享 helper。 |
-| `2026-04-19` | 已完成 | `native builtin add/setLen`、`wasm builtin add`、`wasm analyze/emit statement`、`wasm local/frame init` 这批 `seq/local/field/materialize` 热路径，已经开始共用 `v3_expr_materializes_to_address(...)`。 |
-| `2026-04-19` | 已完成 | `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage0` 已重新编绿，`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge` 也已通过。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2` no-handoff 重新编出了 `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule`，运行输出 `v3 lowering_matrix_smoke ok`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule` 与 `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule` 已运行通过，分别输出 `v3 str_concat_lowering_smoke ok` 和 `v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule2`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule2`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule2` 已重新通过，说明第二刀 `seq/local/field/materialize` 收口没有把主链打坏。 |
-| `2026-04-19` | 已完成 | native `result intrinsic`、native/wasm `str ==/!= str`、wasm `Result.Ok(...)`、wasm constructor field 写入已经改走 `v3_expr_materializes_to_address(...)`，第三刀开始把 `result intrinsic / equality / constructor field` 也收回共享语义面。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule3`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule3`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule3` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | `v3_emit_result_field_address(...)`、`v3_materialize_composite_expr_into_address(...)` 里的 result/global/member copy，和 wasm fixed-array/seq list literal 元素物化，已经改走 `v3_expr_materializes_to_address(...)`，第四刀把 `result field/global/member/list elem` 也收回共享语义面。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule4`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule4`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule4` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | x64 external call target 的按地址参数判定、`Result[...]` 推断面的地址判定，以及 native/wasm `panic/echo` 的字符串 bridge，已经改走 `v3_call_arg_passes_by_address(...)` 和 `v3_expr_materializes_to_address(...)`，第五刀把 `param ABI / builtin str bridge` 也收回共享语义面。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule5`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule5`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule5` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `v3_abi_class_is_composite(...)`，把常量扫描、wasm frame/local、wasm field access 这些只拿到 ABI class 的尾巴也收回统一入口；功能热路径里的裸 `strcmp("composite")` 命中已经清空。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule6`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule6`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule6` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `v3_call_target_param_prefers_address(...)`、`v3_call_target_return_prefers_address(...)`，把 `v3_call_arg_load_abi(...)`、call arg temp prepare、native scalar call、call-into-address、wasm composite call return reject 这几条更高层 dispatch 口一起接回统一 helper。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule7`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule7`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule7` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | `v3_prepare_composite_call_arg_temp(...)`、`v3_prepare_composite_expr_temp(...)`、`v3_prepare_expr_call_state_impl(...)`、`v3_emit_result_intrinsic_address(...)`、`v3_wasm_prepare_composite_call_arg_temp(...)` 已改走 `v3_call_arg_passes_by_address(...)` 和 `v3_expr_materializes_to_address(...)`，临时槽与 `Result.Ok(...)` 物化不再裸看 ABI。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule8`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule8`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule8` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | `v3_emit_field_default_into_address(...)`、`v3_emit_constructor_into_address(...)`、`v3_codegen_expr_scalar(...)` 里的 field/default 分发、`v3_materialize_composite_expr_into_address(...)` 里的 local/index copy、以及 `[]=` 写值路径，已经改走 `v3_expr_materializes_to_address(...)`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule9`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule9`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule9` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | `v3_codegen_expr_scalar(...)` 里的 `Result.Value(...)` 标量提取、native 语句发码里的 local binding/local assignment/lvalue assignment、module global init，以及 local index-address 判定，也已经改走 `v3_expr_materializes_to_address(...)`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule10`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule10`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule10` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | `v3_add_local_slot_for_type(...)`、scalar global load、`seq add` 元素写入、expr statement prepare/codegen、param-slot `indirect_value` 这批低层 `type+abi` 入口，也已经统一改走 `v3_expr_materializes_to_address(...)`。 |
-| `2026-04-19` | 已完成 | 新增 `V3ReturnPassKind`、`v3_function_return_pass_kind(...)`、`v3_call_target_return_pass_kind(...)`，把 function/call-target 的 return dispatch 收成共享 helper，不再让高层直接猜 `return prefers address`。 |
-| `2026-04-19` | 已完成 | 新增 `V3CopyKind`、`v3_type_copy_kind(...)`、`v3_result_intrinsic_projection_copy_kind(...)`，把 wasm `Result intrinsic / projection region-copy` 这批热路径也收成显式规则名。 |
-| `2026-04-19` | 已完成 | 新增 `V3CallResultKind`、`v3_function_call_result_kind(...)`、`v3_call_target_result_kind(...)`，并把 `v3_codegen_call_into_address(...)`、composite call-result、wasm composite call return reject 改走显式 `call result kind`。 |
-| `2026-04-19` | 已完成 | 新增 `v3_wasm_prepare_static_return_slot(...)`、`v3_wasm_emit_static_return_address(...)`，把 wasm `return` 和 implicit return 的 static return slot 逻辑收成统一 helper。 |
-| `2026-04-19` | 已完成 | 新增 `v3_wasm_materialize_pointer_result_into_local_address(...)`、`v3_wasm_emit_pointer_result_expr_into_local_address(...)`、`v3_wasm_emit_composite_call_result_into_local_address(...)`，把 wasm pointer-result fallback/call-result 统一收成单一入口。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule15`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule15`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule15` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `V3WasmBuiltinMessagePtrKind`、`v3_wasm_builtin_message_ptr_kind(...)`、`v3_wasm_register_str_to_cstring_bridge_import(...)`、`v3_wasm_pick_builtin_message_ptr_temp_local(...)`、`v3_wasm_emit_str_to_cstring_bridge_call(...)`，把 wasm `panic/echo/assert` 的 `builtin message ptr` analyze/emit 三叉分发收成单一规则面。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule16`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule16`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule16` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | native `ffi_handle` 参数链补了共享 `arg kind`：新增 `V3CallTargetArgKind`、`v3_call_target_arg_kind(...)`，把 `var / ffi_handle resolve / ffi_handle consume / value / address` 从散着 if 收成单一分发面。 |
-| `2026-04-19` | 已完成 | `v3_call_arg_load_abi(...)`、`v3_prepare_expr_call_state_impl(...)`、`[]=` 预备链、`v3_codegen_call_scalar_resolved(...)`、`v3_codegen_call_into_address(...)` 都已经切到 `arg kind`；之前复合返回 `call-into-address` 漏掉的 `ffi_handle resolve/consume` 也已经补上。 |
-| `2026-04-19` | 已完成 | `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage0 build-ffi-handle` 重新通过，输出 `v3 ffi_handle_smoke ok`，并继续稳定报出 stale trap 的 `ffi_handle invalid: op=resolve_ptr detail=released handle=...`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule18`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule18`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule18` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | importc 返回链补了共享 `return kind`：新增 `V3CallTargetReturnKind`、`v3_call_target_return_kind(...)`，把 `value / address / ffi_handle_register` 收成单一返回规则面。 |
-| `2026-04-19` | 已完成 | `v3_call_target_return_prefers_address(...)`、`v3_call_target_return_pass_kind(...)`、`v3_call_target_result_kind(...)`、`v3_emit_scalar_call_ffi_handle_return_fixups(...)` 已切到 `return kind`；`ffi_handle register` 不再是裸布尔特判。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule19`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule19`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule19` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | wasm call/import 链补了共享 `slot kind`：新增 `V3WasmSlotKind`、`V3WasmCallArgSlotKind`、`V3WasmCallReturnSlotKind`，把 `i32 param slot / i32 return slot / void / address-value` 收成单一规则面。 |
-| `2026-04-19` | 已完成 | `v3_wasm_signature_type_index(...)`、`v3_wasm_function_return_supported(...)`、`v3_wasm_signature_has_result(...)`、`v3_wasm_prepare_call_arg_state(...)`、`v3_wasm_emit_call_arg_value(...)`、`v3_wasm_analyze_call(...)`、`v3_wasm_emit_call_expr(...)`、`v3_wasm_analyze_call_statement(...)`、`v3_wasm_emit_call_statement(...)` 已切到 `slot kind`；`v3_wasm_abi_uses_i32_return_slot(...)` 已退场。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule20`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule20`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule20` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | wasm import/callee 分发表补了共享 helper：新增 `v3_wasm_call_target_type_index(...)`、`v3_wasm_resolve_call_target_callee_index(...)`，把 `type_index / import_index / local callee index` 从散装手抄块收回单一点。 |
-| `2026-04-19` | 已完成 | `v3_wasm_register_import(...)`、`v3_wasm_emit_call_target(...)`、`v3_wasm_collect_imports(...)` 的 `return_call_noarg_i32 / return_call_arg0_i32 / return_call_params_i32`，以及 `v3_wasm_encode_function_body(...)` 这三条编码路径，都已经切回共享 import/callee helper。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule21`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule21`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule21` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `v3_wasm_function_type_index(...)`、`v3_wasm_function_signature_supported(...)`，把 function-side `signature/type_index` 也收回共享 helper。 |
-| `2026-04-19` | 已完成 | `v3_wasm_context_init(...)`、`v3_wasm_collect_imports(...)` 顶部 function 签名校验、`v3_materialize_wasm_module(...)` 的 section-3 type index 生成，已经全部切到 function-side helper。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule22`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule22`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule22` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `V3WasmCompositeCopyKind` 和 `v3_wasm_emit_composite_copy_into_local_address(...)`，把 wasm composite copy 的数据搬运语义收成显式共享入口。 |
-| `2026-04-19` | 已完成 | `v3_wasm_emit_str_literal_into_local_address(...)`、`v3_wasm_materialize_pointer_result_into_local_address(...)`、builtin `seq add`、member/index lvalue composite copy、implicit return static return slot，已经全部切到这套 composite copy helper。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule23`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule23`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule23` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `v3_wasm_emit_composite_return_into_static_slot(...)`，把地址返回值写入 wasm static return slot 收成单一 helper。 |
-| `2026-04-19` | 已完成 | 显式 `return x` 和 implicit return 的地址返回路径，都改成直接物化进 static return slot，不再保留“先 emit_expr 再 copy”的第二条分支。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule24`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule24`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule24` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `V3WasmCallResultKind`、`v3_wasm_call_target_result_kind(...)`，把 wasm `call expr / call statement / composite call-result` 这三条返回分发表接到同一套结果规则，不再各自看 `return_slot_kind`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule25`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule25`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule25` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-19` | 已完成 | 新增 `V3WasmImportKind`、`v3_wasm_call_target_import_kind(...)`，把 wasm external call 的 `void / i32 value slot / i32 address slot` 收成显式 import 规则面。 |
-| `2026-04-19` | 已完成 | `v3_wasm_call_target_type_index(...)` 已改成直接按 `import kind` 选 import signature，不再从 `return_slot_kind` 侧面拼 `has_result`。 |
-| `2026-04-19` | 已完成 | fresh `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/lowering_matrix_smoke.stage2_rule26`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/str_concat_lowering_smoke.stage2_rule26`、`/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/strformat_fmt_lowering_smoke.stage2_rule26` 已重新通过，分别输出 `v3 lowering_matrix_smoke ok`、`v3 str_concat_lowering_smoke ok`、`v3 strformat_fmt_lowering_smoke ok`。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 新增 `v3NormalizedExprCall`，先只收同文件 `importc fn` 的 call expr，避免把整个调用面一起炸开。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 新增 importc 返回类型上下文，composite importc call 现在会真落成 `v3TypedExprLowerImportBuffer / v3TypedExprReturnImportBuffer`，不再只是枚举和报表口。 |
-| `2026-04-20` | 已完成 | importc `CallExpr` 的 parser 扫描已收回 importc-only 的 token 线性扫描，不再按所有名字逐行切片匹配；同时把会触发负索引的短路边界判断改回显式分支。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer_parser` 和 `typed_import_buffer_csg` 标签下重新通过。 |
-| `2026-04-20` | 已完成 | `CallExpr` 已继续安全扩到“同文件 importc + 同文件 local function”；parser 仍然只按 per-source token 扫描识别 call，typed 则开始读取同文件函数返回类型。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer6` 标签下再次通过，证明 local call 扩面没有把 typed/lowering 链拉坏。 |
-| `2026-04-20` | 已完成 | `CallExpr` 已继续扩到同包跨文件已知函数，`v3ParserCollectExternalCallNames(...)` 也改成“本地快照 + while”以避开复合字段嵌套索引的 `idx=len` 真越界。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer7` 标签下重新通过，说明 cross-file call HIR 和 typed import_buffer 这条主链已经重新站稳。 |
-| `2026-04-20` | 已完成 | `CallExpr` 已继续扩到 direct import 的 alias/module-stem qualified call；parser call profile 现在带 import alias，external call 只按当前 source 的 direct import qualifier 收集，不再扫整包 closure。 |
-| `2026-04-20` | 已完成 | `typed_expr` 已补 imported-module context，qualified external call 会按 qualifier 精确落到目标 source，再读取 local/importc 返回类型；`parser_path_smoke`、`parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `typed_import_buffer8` 标签下重新通过。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 现在会把 grouped import 展成多条 direct import edge；`prefix/[a, b]` 不再被 `FirstToken` 截断，qualified module-stem external call 已经能走真实 grouped import。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/bootstrap/cheng_v3_seed.c` 的 `v3_materialize_provider_objects(...)` 已把超大 `suppressed_export_symbols` 从栈搬到堆，fresh `stage2` 可以稳定编出并运行 grouped import 版 `parser_path_smoke`，`parser_path_smoke`、`parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 在 `typed_import_buffer_grouped_stage2` 下重新通过。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 现在支持未知 dotted `member_call`，但 fallback 已从 `local/external/importc` 三路扫描里拆出，改成最后按全量已知 call 名单单独补，qualified external call 不会再双记成 `external_call + member_call`。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke`、`parser_path_smoke` 已在 `call_hir_member_stage2_full2` 标签下重新通过；`typed_expr_cross_file_probe.member2` 也已验证 cross-file qualified call 不再出现 `abi=polymorphic`。 |
-| `2026-04-20` | 已完成 | nested qualified external call 现在已经接通：`/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 会按当前源码真实出现的 dotted call 深度裁剪 external call 递归展开，不再把整条 import 闭包和 std 依赖树一起跑爆。 |
-| `2026-04-20` | 已完成 | `parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `call_hir_nested_stage2_fix2` 标签下重新通过；fresh no-handoff 产物 `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/typed_expr_cross_file_probe.member_nested` 运行输出 line 27 已稳定落成 `type=int32 abi=scalar lower=reg ret=reg`。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 的 `member_call` fallback 现在显式带 `reason=unknown_qualified_target`，unknown dotted call 不再只是 `resolved=0` 的模糊状态。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 新增 `V3TypedExprResolvedCallTarget`，qualified external lookup 不再只返回类型字符串，而是把 `importc` 语义一起带回 typed fact。 |
-| `2026-04-20` | 已完成 | direct import 和 nested qualified 的 imported `importc fn ... -> str` 已在 typed fact 中真落成 `lower=import_buffer / ret=import_buffer`；`parser_normalized_expr_smoke`、`parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `call_hir_importc_reason2` 标签下重新通过，fresh probe `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/typed_expr_cross_file_probe.importc_reason_probe2` 的 line 32/33 也已验证为 `import_buffer`。 |
-| `2026-04-20` | 已完成 | `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 已新增 call resolution 强校验：resolved call 如果还落成 `abi=polymorphic / lower=deferred / ret=deferred`，会直接带 source site、target、type、abi、lower、ret 爆出来。 |
-| `2026-04-20` | 已完成 | local/importc 空返回现在会显式记成 `void`，不再和“没找到返回类型”共用空串；`ErrorOkInto(...)` 这类 resolved void call 已不再误掉到 `call_expr/deferred`。 |
-| `2026-04-20` | 已完成 | unqualified imported return type 现在会先切到 callee source context，再按“当前 source 声明 + 无 alias 的 direct import”解析；`std/os.getLastModificationTime(...): DateTime` 这类路径已经不再误判成 `abi=polymorphic`。 |
-| `2026-04-20` | 已完成 | `T/refT` 这类显式泛型占位符返回已从强 gate 的“无解释回退”里剥离，generic wrapper 不再把 `program_selfhost` 和 `compiler_csg_smoke` 整体打红。 |
-| `2026-04-20` | 已完成 | `parser_normalized_expr_smoke`、`parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke` 已在 `call_hir_gate3` 标签下重新通过；fresh no-handoff 产物 `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/typed_expr_cross_file_probe.call_gate3` 也再次验证了 line 32/33 仍是 `import_buffer`。 |
-| `2026-04-19` | 已完成 | `git -C /Users/lbcheng/cheng-lang diff --check` 通过。 |
+- `CallExpr` 已覆盖：
+  - 同文件 `importc`
+  - 同文件 local function
+  - direct import 的 alias/module-stem qualified call
+  - direct import 的 unqualified external call
+  - alias import 不贡献 unqualified external
+  - 本地函数会遮蔽 aliasless direct import 的 unqualified external
+  - 参数和局部 `let/var/const` 会遮蔽 qualified target，并显式落成 `shadowed_qualified_target`
+  - grouped import 展开的 direct import
+  - nested qualified external call
+  - imported `importc` external call
+  - ambiguous external target
+  - ambiguous qualified target
+  - unknown dotted `member_call` fallback
+- `compiler_csg` 和 `lowering_plan` 现在共用同一份 call resolution gate；resolved call 必须带 target，unresolved call 必须带 reason。
+- aliasless direct import closure 上的 closure-visible unqualified external call 已打通：
+  - parser 能收集 closure-visible external 名
+  - resolve 能沿同一条 direct import closure 精确落到目标 source
+  - imported `importc` 仍会继续落成 `lower=import_buffer / ret=import_buffer`
+- qualified target 的 closure-visible 归因也已经打通：
+  - `module.Func(...)` 不再只认 module 直接声明
+  - module 自己 aliasless direct-import closure 里可见的 local/importc 目标也能真解析
+  - imported `importc` 在这条 qualified 路径上仍会继续落成 `lower=import_buffer / ret=import_buffer`
+- expr layer 的真实入口已经统一回 `CallAndMember` 主链；旧的分裂 call 扫描路径不再参与 profile-aware expr 读取。
+- lowering rule 计数 smoke 已收回 report 真源：
+  - `compiler_csg_smoke` 直接读 `v3CompilerCsgReport(...)`
+  - `lowering_plan_smoke` 直接读 `v3LoweringPlanStubReport(...)`
+  - `lowering_rule_import_import_buffer_count` 已补进两边 report
+- named composite type 归因已经接进 typed：
+  - `std/buffer::NewByteBuffer() -> ByteBuffer`
+  - `parser::v3NormalizedExprClone(...) -> V3NormalizedExpr`
+  这类 resolved local call 不再回落 deferred。
+- 本轮验收已通过：
+  - `CHENG_V3_SMOKE_LABEL=call_hir_closure_visible_clean ... parser_path_smoke parser_normalized_expr_smoke compiler_csg_smoke lowering_plan_smoke call_hir_matrix_smoke`
+  - `CHENG_V3_SMOKE_LABEL=call_hir_qualified_closure ... call_hir_matrix_smoke`
+  - `git -C /Users/lbcheng/cheng-lang diff --check`

@@ -53236,13 +53236,13 @@ static char *v3_system_link_plan_report(const V3BootstrapContract *contract,
     snprintf(line, sizeof(line), "entry_symbol=%s", plan->entry_symbol[0] != '\0' ? plan->entry_symbol : "-");
     v3_report_append(&out, &cap, &used, line);
     v3_report_append_csv_reasons(&out, &cap, &used, "missing_reasons", plan->missing_reasons, plan->missing_reason_count);
-    v3_report_append(&out, &cap, &used, "parser_syntax=v3_source_stub_v1");
+    v3_report_append(&out, &cap, &used, "parser_syntax=v3_source_v1");
     v3_report_append(&out, &cap, &used, "parser_source_kind=ordinary_cheng_source");
     snprintf(line, sizeof(line), "build_entry=%s", compiler_entry);
     v3_report_append(&out, &cap, &used, line);
     v3_report_append(&out, &cap, &used, "build_source_unit_count=22");
     v3_report_append(&out, &cap, &used, "link_mode=system_link");
-    v3_report_append(&out, &cap, &used, "pipeline_stage=parser_stub_to_system_link_plan_stub");
+    v3_report_append(&out, &cap, &used, "pipeline_stage=parser_to_system_link_plan");
     return out;
 }
 
@@ -53596,6 +53596,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     const char *keys[] = {
         NULL,
         "compiler_runtime_source",
+        "compiler_support_matrix_source",
         "compiler_request_source",
         NULL,
         NULL,
@@ -53617,6 +53618,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     const char *labels[] = {
         "backend_driver_entry_source",
         "compiler_runtime_source",
+        "compiler_support_matrix_source",
         "compiler_request_source",
         "tooling_source",
         "tooling_source",
@@ -53638,6 +53640,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
     const char *manual_paths[] = {
         "v3/src/tooling/backend_driver_main.cheng",
         NULL,
+        "v3/src/tooling/support_matrix.cheng",
         NULL,
         "v3/src/tooling/compiler_world.cheng",
         "v3/src/tooling/compiler_csg.cheng",
@@ -63979,7 +63982,7 @@ static int v3_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv) {
     static const char *DEFAULT_SMOKES[] = {
         "fixed256_curve25519_smoke",
         "compiler_runtime_smoke",
-        "compiler_pipeline_stub_smoke",
+        "compiler_pipeline_smoke",
         "lowering_plan_smoke",
         "lowering_matrix_smoke",
         "compiler_equivalence_smoke",

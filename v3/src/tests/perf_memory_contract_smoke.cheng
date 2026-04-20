@@ -1,0 +1,89 @@
+import std/system
+import std/os
+import std/monotimes
+import cheng/v3/lang/intern as langintern
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/perf_gate as perfgate
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/backend/system_link_plan as slplan
+import cheng/v3/libp2p/core/resources
+
+fn perfMemoryDataset(sample: perfgate.V3BenchSample): perfgate.V3BenchDataset =
+    var samples: perfgate.V3BenchSample[] = []
+    add(samples, sample)
+    var out: perfgate.V3BenchDataset
+    out.samples.len = samples.len
+    out.samples.cap = samples.cap
+    out.samples.buffer = samples.buffer
+    return out
+
+fn perfMemoryMeasurePlanNsPerOp(workspaceRoot: str,
+                                packageRoot: str,
+                                sourcePath: str,
+                                outputPath: str,
+                                iters: int32): int64 =
+    let req = creq.v3CompilerRequestNew(
+        packageRoot,
+        sourcePath,
+        outputPath,
+        "arm64-apple-darwin",
+        creq.v3EmitExe,
+        ""
+    )
+    var sink: int64 = int64(0)
+    let started = monotimes.GetMonoTime()
+    for i in 0..<iters:
+        var plan: slplan.V3SystemLinkPlanStub
+        var err = ""
+        assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, plan, err),
+               "v3 perf memory: build system link plan")
+        assert(plan.missingReasons.len == 0,
+               "v3 perf memory: ready system link plan")
+        assert(plan.pipelineStage == "parser_to_system_link_plan",
+               "v3 perf memory: pipeline stage")
+        assert(plan.parserSyntaxTag == "v3_normalized_source_v3",
+               "v3 perf memory: parser syntax")
+        sink = sink + int64(plan.buildSourceUnitCount) + int64(plan.sourceClosurePaths.len)
+    assert(sink > int64(0), "v3 perf memory: non-zero sink")
+    let elapsedNs = monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(started)
+    if elapsedNs <= int64(0):
+        return int64(1)
+    return (elapsedNs * int64(1000)) / int64(iters)
+
+fn main(): int32 =
+    let workspaceRoot = v3path.V3PathCurrentDir()
+    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
+    let smokeLabel: str = os.GetEnvDefault("CHENG_V3_SMOKE_LABEL", "host")
+    let outDir = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_perf_memory_contract/" + smokeLabel)
+    assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 perf memory: mkdir")
+    let sourcePath = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
+    let outputPath = v3path.V3PathJoin(outDir, "program_selfhost_smoke")
+    let before = resources.v3Libp2pNodeResourceCollectLocal()
+    assert(before.cpuLogicalCores > 0, "v3 perf memory: cpu cores")
+    assert(before.memoryTotalBytes > int64(0), "v3 perf memory: memory total")
+    assert(before.memoryAvailableBytes > int64(0), "v3 perf memory: memory available")
+    assert(before.memoryAvailableBytes <= before.memoryTotalBytes, "v3 perf memory: memory range")
+    let baseNsPerOpMilli = perfMemoryMeasurePlanNsPerOp(workspaceRoot,
+                                                        packageRoot,
+                                                        sourcePath,
+                                                        outputPath,
+                                                        4)
+    let candidateNsPerOpMilli = perfMemoryMeasurePlanNsPerOp(workspaceRoot,
+                                                             packageRoot,
+                                                             sourcePath,
+                                                             outputPath,
+                                                             4)
+    let after = resources.v3Libp2pNodeResourceCollectLocal()
+    assert(after.memoryTotalBytes == before.memoryTotalBytes, "v3 perf memory: stable memory total")
+    assert(after.memoryAvailableBytes > int64(0), "v3 perf memory: memory available after")
+    assert(after.memoryAvailableBytes <= after.memoryTotalBytes, "v3 perf memory: memory range after")
+    let pool = langintern.v3InternPoolNew()
+    let benchId = langintern.v3Intern(pool, "system_link_plan")
+    let baseData = perfMemoryDataset(perfgate.V3BenchSample(benchId: benchId, nsPerOpMilli: baseNsPerOpMilli))
+    let candidateData = perfMemoryDataset(perfgate.V3BenchSample(benchId: benchId, nsPerOpMilli: candidateNsPerOpMilli))
+    let compare = perfgate.v3BenchCompare(baseData, candidateData, int64(4000))
+    assert(compare.ok, "v3 perf memory: perf compare")
+    let report = perfgate.v3BenchCompareReport(pool, compare)
+    assert(report != "", "v3 perf memory: perf report")
+    echo("v3 perf_memory_contract_smoke ok")
+    return 0

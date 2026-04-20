@@ -63,14 +63,28 @@
 - qualified external call 的真源应该是“当前 source 的 direct import edge + alias/module-stem qualifier + 目标 source decl”，不是“整包 closure 里所有函数名”。只看最后那个函数名会把 alias/模块前缀信息丢掉，也很容易在同名函数上误归因。
 - nested qualified external call 也不能按“整条 import 闭包”无上限展开；external call name 递归必须按当前源码里真实出现的 dotted call 深度裁剪，不然普通 source 会把 std/import 闭包整棵跑进 parser。
 - grouped import 不能走 `FirstToken` 这种按空白截断的老路；`prefix/[a, b]` 必须先 strip comment，再显式展开成多条 direct import edge，不然 direct import qualifier 这条真源到了 grouped import 就会断掉。
+- direct import 的 external call 名不能只收 qualified 形态；qualified 和 unqualified 两种入口都要进同一份外部调用名集合，不然 alias/module-stem call 能认，`SharedEcho(...)` 这种 direct import unqualified call 会直接漏出 `external_call`。
+- alias import 不能贡献 unqualified external 名；`import foo as bar` 只能产生 `bar.Func(...)` 这类 qualified 入口，不能把 `Func(...)` 也偷偷塞进 external call 名集合。
+- aliasless direct import 的 unqualified external 名也不能压过当前 source 的同名本地函数；本地声明必须先遮蔽，不能在同一调用点并存 `local_call` 和 `external_call`。
+- qualified target 也要先过当前函数的局部可见性 gate；根 qualifier 只要被参数或局部 `let/var/const` 占用，就必须退回 `member_call + shadowed_qualified_target`，不能因为 dotted name 恰好命中 external call 名就硬解 import。
+- direct import 的 unqualified external 名要先收，再过 qualified 深度门；`maxQualifiedCallDepth` 只该限制递归 qualified 展开，不能把没有 dotted call 的 source 的 direct external 名一起挡掉。
+- qualified target 的 qualifier 解析不能静默取第一条 import edge；只要同一个 qualifier 映射到多个 direct import target，就必须显式落成 `ambiguous_qualified_target`。
 - unknown dotted call 的 `member_call` fallback 不能混在 `local/external/importc` 三路扫描里补；必须最后按全量已知 call 名单单独跑一遍，不然 qualified external/importc/local 会被双记，typed fact 会平白长出 `call_expr / abi=polymorphic`。
 - unknown dotted call 不能只留 `resolved=0`；`CallExpr.detail` 至少要显式带 `reason`，不然后面的 typed/report 只能看到“没解析”，看不到“为什么没解析”。
+- unresolved call 的强校验不能只盯 `member_call`；所有 unresolved call 都必须带 reason，不然 ambiguous external 和别的 known-but-unresolved target 还是会漏成“无解释 polymorphic”。
 - qualified external lookup 不能只回传“返回类型字符串”；只要目标可能是 imported `importc`，就必须把“目标是否 importc”一起带回来，否则 composite imported importc call 会被误压成 `local_address/composite_local`，进不了 `import_buffer`。
 - resolved call 的硬 gate 不能只盯 parser；local/importc 空返回如果继续和“没找到返回类型”共用空串，第一时间就会把 resolved void call 误炸成 `call_expr/deferred`。
 - 处理返回类型 ABI 时，`preferredSourcePath` 不能当成硬覆盖；正确形状是“先切到 callee source context，再按当前 source 声明和无 alias direct import 解析 unqualified type”。像 `DateTime` 这种 imported return type，不这么做一定会回退成 `abi=polymorphic`。
 - `T/refT` 这类显式泛型占位符和真正的“无解释回退”不是一回事；resolved call gate 要拦的是漏归因，不是把 generic wrapper 一起打红。
+- resolved call 的类型归因不能只认内建复合类型；当前 source 和 direct import source 里显式声明过的 named `type` 也必须进 typed 真源，不然 `ByteBuffer`、`V3NormalizedExpr` 这类本地命名复合返回值还是会掉回 deferred。
+- 扫 `type` 块时空行不能当断块；很多 Cheng 源文件会在同一个 `type` 块里用空行分隔多个声明。
 - parser 里任何带索引的边界判断都不要依赖短路，像 `i > 0 && line[i - 1]`、`pos < len && line[pos]` 这种写法都必须拆成显式分支；这类坑已经多次重演成 `idx=-1`。
 - parser 里也不要长期保留 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引；一旦热路径里既要取 `.len` 又要按相同索引取元素，最稳的形状是先快照到本地 seq，再用显式 `while` 走索引，不要赌 compiler 一定能把这类组合安全 lowering。
+- `v3ParserReadNormalizedExprLayerFromPath(...)` 只适合本地文本级 expr 统计，不适合拿来验 external/qualified/imported call 归因；这类回归必须走 `v3ParseOrdinarySourceStub(...)` 或 profile-aware reader，才能带上 import edge 和 target source。
+- call HIR 扩面时，`CollectExternalCallNames`、`ResolveUnqualifiedExternalCallTarget`、`ReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles` 三个真入口必须一起走同一条 `CallAndMember` 主链；只修名字收集或只修 resolve 都会留下半通不通的 closure-visible 调用。
+- qualified target 不能只看 target source 的直接声明；如果 unqualified target 已经能看见 aliasless direct-import closure，`ResolveQualifiedCallTarget` 和 qualified external name 收集也必须补上同一层 closure-visible 语义，不然 `Foo(...)` 和 `mid.Foo(...)` 会分叉成两套真相。
+- parser 里任何 `nextPos >= len || line[nextPos] == ...` 这种短路边界判断都不要再留；profile-aware call 读取和 import 行扫描尤其容易被这类写法炸成 `idx=len`。
+- `compiler_csg_smoke / lowering_plan_smoke` 这类规则矩阵回归，不要在测试里直接 import lowering rule 枚举再自己解释一遍；最稳的是直接读 `compiler_csg report / lowering plan report` 里的计数字段，不然 ordinary compile 很容易被测试闭包自己拖到超时。
 - 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。
 - seed 里任何 `8192 * PATH_MAX` 这类 plan 数组都不能再上栈；像 `v3_materialize_provider_objects(...)` 这种 provider 编译热口，必须直接用堆分配并在所有返回路径显式释放，不要等到 fresh stage2/provider compile 时再炸栈。
 

@@ -101,23 +101,17 @@ type
         lineNumber: int32
         columnNumber: int32
         typeText: str
-        abiClassText: str
-        valueKindText: str
-        placeKindText: str
-        loweringModeText: str
-        callKindText: str
-        returnKindText: str
+        abiClass: V3TypedExprAbiClass
+        valueKind: V3TypedExprValueKind
+        placeKind: V3TypedExprPlaceKind
+        loweringMode: V3TypedExprLoweringMode
+        callKind: V3TypedExprCallKind
+        returnKind: V3TypedExprReturnKind
         argPassKind: V3TypedExprArgPassKind
         resultPassKind: V3TypedExprResultPassKind
         materializeKind: V3TypedExprMaterializeKind
         copyKind: V3TypedExprCopyKind
         importKind: V3TypedExprImportKind
-        argPassKindText: str
-        resultPassKindText: str
-        materializeKindText: str
-        copyKindText: str
-        importKindText: str
-        ruleKey: str
 
     V3TypedExprSourceText =
         workspaceRoot: str
@@ -156,6 +150,7 @@ type
         bindings: V3TypedExprBinding[]
         importcFunctions: V3TypedExprImportcFunction[]
         importedModules: V3TypedExprImportedModule[]
+        declaredTypes: str[]
 
     V3TypedExprSinkInfo =
         sinkType: str
@@ -482,12 +477,13 @@ fn v3TypedExprTypeIsGenericPlaceholder(typeRaw: str): bool =
     let typeText = v3TypedExprNormalizeTypeText(typeRaw)
     if typeText.len == 1 && typeText[0] >= 'A' && typeText[0] <= 'Z':
         return true
-    if typeText.len == 4 &&
-       v3path.V3TextSlice(typeText, 0, 3) == "ref" &&
-       typeText[3] >= 'A' &&
-       typeText[3] <= 'Z':
-        return true
-    return false
+    if typeText.len != 4:
+        return false
+    if v3path.V3TextSlice(typeText, 0, 3) != "ref":
+        return false
+    if typeText[3] < 'A' || typeText[3] > 'Z':
+        return false
+    return true
 
 fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLayer,
                                           facts: V3TypedExprFact[],
@@ -510,74 +506,38 @@ fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLaye
         let reason = parser.v3ParserCallExprDetailReason(expr.detail)
         if resolved:
             if reason != "":
-                err = "v3 typed expr: resolved call keeps unknown reason"
+                err = "v3 typed expr: resolved call keeps unknown reason at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             if parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) == "":
-                err = "v3 typed expr: resolved call missing target source"
+                err = "v3 typed expr: resolved call missing target source at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             if fact.typeText == "" || fact.typeText == "unknown" || fact.typeText == "call_expr":
-                err = "v3 typed expr: resolved call missing concrete type"
+                err = "v3 typed expr: resolved call missing concrete type at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             if !v3TypedExprTypeIsGenericPlaceholder(fact.typeText) &&
                (fact.abiClass == v3TypedExprAbiPolymorphic ||
                 fact.loweringMode == v3TypedExprLowerDeferred ||
                 fact.returnKind == v3TypedExprReturnDeferred):
-                err = "v3 typed expr: resolved call fell back to deferred"
+                err = "v3 typed expr: resolved call fell back to deferred at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             if parser.v3ParserCallExprDetailTargetImportc(expr.detail) &&
                fact.abiClass == v3TypedExprAbiComposite &&
                (fact.loweringMode != v3TypedExprLowerImportBuffer ||
                 fact.returnKind != v3TypedExprReturnImportBuffer):
-                err = "v3 typed expr: imported composite call missing import buffer"
+                err = "v3 typed expr: imported composite call missing import buffer at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             continue
-        if parser.v3ParserCallExprDetailKind(expr.detail) == "member_call" && reason == "":
-            err = "v3 typed expr: unknown qualified call missing reason"
+        if reason == "":
+            err = "v3 typed expr: unresolved call missing reason at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            return false
+        if parser.v3ParserCallExprDetailTargetSourcePath(expr.detail) != "":
+            err = "v3 typed expr: unresolved call keeps target source at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            return false
+        if parser.v3ParserCallExprDetailTargetImportc(expr.detail):
+            err = "v3 typed expr: unresolved call keeps importc target at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
             return false
     err = ""
     return true
-
-fn v3TypedExprLoweringRuleKeyFromRule(rule: V3TypedExprLoweringRule): str =
-    var out = v3TypedExprNormalizeTypeText(rule.typeText)
-    out = out + "|abi=" + rule.abiClassText
-    out = out + "|value=" + rule.valueKindText
-    out = out + "|place=" + rule.placeKindText
-    out = out + "|lower=" + rule.loweringModeText
-    out = out + "|call=" + rule.callKindText
-    out = out + "|return=" + rule.returnKindText
-    out = out + "|arg=" + rule.argPassKindText
-    out = out + "|result=" + rule.resultPassKindText
-    out = out + "|materialize=" + rule.materializeKindText
-    out = out + "|copy=" + rule.copyKindText
-    out = out + "|import=" + rule.importKindText
-    return out
-
-fn v3TypedExprLoweringRuleKey(typeTextRaw: str,
-                              abiClass: V3TypedExprAbiClass,
-                              valueKind: V3TypedExprValueKind,
-                              placeKind: V3TypedExprPlaceKind,
-                              loweringMode: V3TypedExprLoweringMode,
-                              callKind: V3TypedExprCallKind,
-                              returnKind: V3TypedExprReturnKind,
-                              argPassKind: V3TypedExprArgPassKind,
-                              resultPassKind: V3TypedExprResultPassKind,
-                              materializeKind: V3TypedExprMaterializeKind,
-                              copyKind: V3TypedExprCopyKind,
-                              importKind: V3TypedExprImportKind): str =
-    let typeText = v3TypedExprNormalizeTypeText(typeTextRaw)
-    var out = typeText
-    out = out + "|abi=" + v3TypedExprAbiClassText(abiClass)
-    out = out + "|value=" + v3TypedExprValueKindText(valueKind)
-    out = out + "|place=" + v3TypedExprPlaceKindText(placeKind)
-    out = out + "|lower=" + v3TypedExprLoweringModeText(loweringMode)
-    out = out + "|call=" + v3TypedExprCallKindText(callKind)
-    out = out + "|return=" + v3TypedExprReturnKindText(returnKind)
-    out = out + "|arg=" + v3TypedExprArgPassKindText(argPassKind)
-    out = out + "|result=" + v3TypedExprResultPassKindText(resultPassKind)
-    out = out + "|materialize=" + v3TypedExprMaterializeKindText(materializeKind)
-    out = out + "|copy=" + v3TypedExprCopyKindText(copyKind)
-    out = out + "|import=" + v3TypedExprImportKindText(importKind)
-    return out
 
 fn v3TypedExprLoweringRuleFromFact(fact: V3TypedExprFact): V3TypedExprLoweringRule =
     var out: V3TypedExprLoweringRule
@@ -591,34 +551,17 @@ fn v3TypedExprLoweringRuleFromFact(fact: V3TypedExprFact): V3TypedExprLoweringRu
     out.lineNumber = fact.lineNumber
     out.columnNumber = fact.columnNumber
     out.typeText = v3TypedExprNormalizeTypeText(fact.typeText)
-    out.abiClassText = v3TypedExprAbiClassText(fact.abiClass)
-    out.valueKindText = v3TypedExprValueKindText(fact.valueKind)
-    out.placeKindText = v3TypedExprPlaceKindText(fact.placeKind)
-    out.loweringModeText = v3TypedExprLoweringModeText(fact.loweringMode)
-    out.callKindText = v3TypedExprCallKindText(fact.callKind)
-    out.returnKindText = v3TypedExprReturnKindText(fact.returnKind)
+    out.abiClass = fact.abiClass
+    out.valueKind = fact.valueKind
+    out.placeKind = fact.placeKind
+    out.loweringMode = fact.loweringMode
+    out.callKind = fact.callKind
+    out.returnKind = fact.returnKind
     out.argPassKind = argPassKind
     out.resultPassKind = resultPassKind
     out.materializeKind = materializeKind
     out.copyKind = copyKind
     out.importKind = importKind
-    out.argPassKindText = v3TypedExprArgPassKindText(argPassKind)
-    out.resultPassKindText = v3TypedExprResultPassKindText(resultPassKind)
-    out.materializeKindText = v3TypedExprMaterializeKindText(materializeKind)
-    out.copyKindText = v3TypedExprCopyKindText(copyKind)
-    out.importKindText = v3TypedExprImportKindText(importKind)
-    out.ruleKey = v3TypedExprLoweringRuleKey(fact.typeText,
-                                             fact.abiClass,
-                                             fact.valueKind,
-                                             fact.placeKind,
-                                             fact.loweringMode,
-                                             fact.callKind,
-                                             fact.returnKind,
-                                             argPassKind,
-                                             resultPassKind,
-                                             materializeKind,
-                                             copyKind,
-                                             importKind)
     return out
 
 fn v3TypedExprLoweringRuleClone(rule: V3TypedExprLoweringRule): V3TypedExprLoweringRule =
@@ -628,23 +571,17 @@ fn v3TypedExprLoweringRuleClone(rule: V3TypedExprLoweringRule): V3TypedExprLower
     out.lineNumber = rule.lineNumber
     out.columnNumber = rule.columnNumber
     out.typeText = rule.typeText
-    out.abiClassText = rule.abiClassText
-    out.valueKindText = rule.valueKindText
-    out.placeKindText = rule.placeKindText
-    out.loweringModeText = rule.loweringModeText
-    out.callKindText = rule.callKindText
-    out.returnKindText = rule.returnKindText
+    out.abiClass = rule.abiClass
+    out.valueKind = rule.valueKind
+    out.placeKind = rule.placeKind
+    out.loweringMode = rule.loweringMode
+    out.callKind = rule.callKind
+    out.returnKind = rule.returnKind
     out.argPassKind = rule.argPassKind
     out.resultPassKind = rule.resultPassKind
     out.materializeKind = rule.materializeKind
     out.copyKind = rule.copyKind
     out.importKind = rule.importKind
-    out.argPassKindText = rule.argPassKindText
-    out.resultPassKindText = rule.resultPassKindText
-    out.materializeKindText = rule.materializeKindText
-    out.copyKindText = rule.copyKindText
-    out.importKindText = rule.importKindText
-    out.ruleKey = rule.ruleKey
     return out
 
 fn v3TypedExprLoweringRulesClone(rules: V3TypedExprLoweringRule[]): V3TypedExprLoweringRule[] =
@@ -665,17 +602,17 @@ fn v3TypedExprLoweringRuleEqual(lhs: V3TypedExprLoweringRule,
         return false
     if lhs.typeText != rhs.typeText:
         return false
-    if lhs.abiClassText != rhs.abiClassText:
+    if lhs.abiClass != rhs.abiClass:
         return false
-    if lhs.valueKindText != rhs.valueKindText:
+    if lhs.valueKind != rhs.valueKind:
         return false
-    if lhs.placeKindText != rhs.placeKindText:
+    if lhs.placeKind != rhs.placeKind:
         return false
-    if lhs.loweringModeText != rhs.loweringModeText:
+    if lhs.loweringMode != rhs.loweringMode:
         return false
-    if lhs.callKindText != rhs.callKindText:
+    if lhs.callKind != rhs.callKind:
         return false
-    if lhs.returnKindText != rhs.returnKindText:
+    if lhs.returnKind != rhs.returnKind:
         return false
     if lhs.argPassKind != rhs.argPassKind:
         return false
@@ -687,17 +624,33 @@ fn v3TypedExprLoweringRuleEqual(lhs: V3TypedExprLoweringRule,
         return false
     if lhs.importKind != rhs.importKind:
         return false
-    if lhs.argPassKindText != rhs.argPassKindText:
+    return true
+
+fn v3TypedExprLoweringRuleShapeEqual(lhs: V3TypedExprLoweringRule,
+                                     rhs: V3TypedExprLoweringRule): bool =
+    if lhs.typeText != rhs.typeText:
         return false
-    if lhs.resultPassKindText != rhs.resultPassKindText:
+    if lhs.abiClass != rhs.abiClass:
         return false
-    if lhs.materializeKindText != rhs.materializeKindText:
+    if lhs.valueKind != rhs.valueKind:
         return false
-    if lhs.copyKindText != rhs.copyKindText:
+    if lhs.placeKind != rhs.placeKind:
         return false
-    if lhs.importKindText != rhs.importKindText:
+    if lhs.loweringMode != rhs.loweringMode:
         return false
-    return lhs.ruleKey == rhs.ruleKey
+    if lhs.callKind != rhs.callKind:
+        return false
+    if lhs.returnKind != rhs.returnKind:
+        return false
+    if lhs.argPassKind != rhs.argPassKind:
+        return false
+    if lhs.resultPassKind != rhs.resultPassKind:
+        return false
+    if lhs.materializeKind != rhs.materializeKind:
+        return false
+    if lhs.copyKind != rhs.copyKind:
+        return false
+    return lhs.importKind == rhs.importKind
 
 fn v3TypedExprLoweringRulesEqual(lhs: V3TypedExprLoweringRule[],
                                  rhs: V3TypedExprLoweringRule[]): bool =
@@ -714,17 +667,18 @@ fn v3TypedExprLoweringRulesFromFacts(facts: V3TypedExprFact[]): V3TypedExprLower
         add(out, v3TypedExprLoweringRuleFromFact(facts[i]))
     return out
 
-fn v3TypedExprLoweringRuleUniqueKeyCount(rules: V3TypedExprLoweringRule[]): int32 =
+fn v3TypedExprLoweringRuleUniqueShapeCount(rules: V3TypedExprLoweringRule[]): int32 =
     var count: int32 = 0
-    var keys: str[] = []
+    var uniqueRules: V3TypedExprLoweringRule[] = []
     for i in 0..<rules.len:
         var seen = false
-        for j in 0..<keys.len:
-            if keys[j] == rules[i].ruleKey:
+        for j in 0..<uniqueRules.len:
+            if v3TypedExprLoweringRuleShapeEqual(uniqueRules[j], rules[i]):
                 seen = true
+                break
         if seen:
             continue
-        add(keys, rules[i].ruleKey)
+        add(uniqueRules, v3TypedExprLoweringRuleClone(rules[i]))
         count = count + 1
     return count
 
@@ -736,27 +690,11 @@ fn v3TypedExprLoweringRuleCountArgPassKind(rules: V3TypedExprLoweringRule[],
             count = count + 1
     return count
 
-fn v3TypedExprLoweringRuleCountArgPassKindText(rules: V3TypedExprLoweringRule[],
-                                               kindText: str): int32 =
-    var count: int32 = 0
-    for i in 0..<rules.len:
-        if rules[i].argPassKindText == kindText:
-            count = count + 1
-    return count
-
 fn v3TypedExprLoweringRuleCountResultPassKind(rules: V3TypedExprLoweringRule[],
                                               kind: V3TypedExprResultPassKind): int32 =
     var count: int32 = 0
     for i in 0..<rules.len:
         if rules[i].resultPassKind == kind:
-            count = count + 1
-    return count
-
-fn v3TypedExprLoweringRuleCountResultPassKindText(rules: V3TypedExprLoweringRule[],
-                                                  kindText: str): int32 =
-    var count: int32 = 0
-    for i in 0..<rules.len:
-        if rules[i].resultPassKindText == kindText:
             count = count + 1
     return count
 
@@ -768,27 +706,11 @@ fn v3TypedExprLoweringRuleCountMaterializeKind(rules: V3TypedExprLoweringRule[],
             count = count + 1
     return count
 
-fn v3TypedExprLoweringRuleCountMaterializeKindText(rules: V3TypedExprLoweringRule[],
-                                                   kindText: str): int32 =
-    var count: int32 = 0
-    for i in 0..<rules.len:
-        if rules[i].materializeKindText == kindText:
-            count = count + 1
-    return count
-
 fn v3TypedExprLoweringRuleCountCopyKind(rules: V3TypedExprLoweringRule[],
                                         kind: V3TypedExprCopyKind): int32 =
     var count: int32 = 0
     for i in 0..<rules.len:
         if rules[i].copyKind == kind:
-            count = count + 1
-    return count
-
-fn v3TypedExprLoweringRuleCountCopyKindText(rules: V3TypedExprLoweringRule[],
-                                            kindText: str): int32 =
-    var count: int32 = 0
-    for i in 0..<rules.len:
-        if rules[i].copyKindText == kindText:
             count = count + 1
     return count
 
@@ -800,14 +722,6 @@ fn v3TypedExprLoweringRuleCountImportKind(rules: V3TypedExprLoweringRule[],
             count = count + 1
     return count
 
-fn v3TypedExprLoweringRuleCountImportKindText(rules: V3TypedExprLoweringRule[],
-                                              kindText: str): int32 =
-    var count: int32 = 0
-    for i in 0..<rules.len:
-        if rules[i].importKindText == kindText:
-            count = count + 1
-    return count
-
 fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                                     err: var str): bool =
     for i in 0..<rules.len:
@@ -815,25 +729,8 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
         if rule.exprId == "" || rule.sourcePath == "":
             err = "v3 typed expr: lowering rule missing owner"
             return false
-        if rule.argPassKindText != v3TypedExprArgPassKindText(rule.argPassKind):
-            err = "v3 typed expr: lowering rule arg text mismatch"
-            return false
-        if rule.resultPassKindText != v3TypedExprResultPassKindText(rule.resultPassKind):
-            err = "v3 typed expr: lowering rule result text mismatch"
-            return false
-        if rule.materializeKindText != v3TypedExprMaterializeKindText(rule.materializeKind):
-            err = "v3 typed expr: lowering rule materialize text mismatch"
-            return false
-        if rule.copyKindText != v3TypedExprCopyKindText(rule.copyKind):
-            err = "v3 typed expr: lowering rule copy text mismatch"
-            return false
-        if rule.importKindText != v3TypedExprImportKindText(rule.importKind):
-            err = "v3 typed expr: lowering rule import text mismatch"
-            return false
-        if rule.ruleKey != v3TypedExprLoweringRuleKeyFromRule(rule):
-            err = "v3 typed expr: lowering rule key mismatch"
-            return false
-        if (rule.abiClassText == "polymorphic" || rule.loweringModeText == "deferred") &&
+        if (rule.abiClass == v3TypedExprAbiPolymorphic ||
+            rule.loweringMode == v3TypedExprLowerDeferred) &&
            (rule.argPassKind != v3TypedExprArgPassDeferred ||
             rule.resultPassKind != v3TypedExprResultPassDeferred ||
             rule.materializeKind != v3TypedExprMaterializeDeferred ||
@@ -842,11 +739,12 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
             err = "v3 typed expr: deferred rule leaked concrete lowering"
             return false
         if rule.importKind == v3TypedExprImportImportBuffer &&
-           rule.loweringModeText != "import_buffer" &&
-           rule.returnKindText != "import_buffer":
+           rule.loweringMode != v3TypedExprLowerImportBuffer &&
+           rule.returnKind != v3TypedExprReturnImportBuffer:
             err = "v3 typed expr: import buffer rule missing import buffer return"
             return false
-        if rule.copyKind == v3TypedExprCopyRegionCopy && rule.valueKindText != "composite":
+        if rule.copyKind == v3TypedExprCopyRegionCopy &&
+           rule.valueKind != v3TypedExprValueComposite:
             err = "v3 typed expr: region copy rule must stay composite"
             return false
     err = ""
@@ -1079,6 +977,20 @@ fn v3TypedExprParseFunctionReturnType(lineRaw: str): str =
     if eqPos >= 0:
         return v3TypedExprNormalizeTypeText(v3path.V3TextSlice(tail, 0, eqPos))
     return v3TypedExprNormalizeTypeText(tail)
+
+fn v3TypedExprParseTypeDeclName(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if line == "":
+        return ""
+    let eqPos = v3TypedExprFindTopLevelToken(line, "=")
+    if eqPos <= 0:
+        return ""
+    let headRaw = v3path.V3PathTrim(v3path.V3TextSlice(line, 0, eqPos))
+    let genericPos = v3TypedExprFindTopLevelToken(headRaw, "[")
+    var head = headRaw
+    if genericPos > 0:
+        head = v3path.V3PathTrim(v3path.V3TextSlice(headRaw, 0, genericPos))
+    return parser.v3ParserIdentPrefix(parser.v3ParserFirstToken(head))
 
 fn v3TypedExprSplitTopLevelCsv(itemsRaw: str): str[] =
     var out: str[] = []
@@ -1349,6 +1261,68 @@ fn v3TypedExprLookupQualifiedModuleSourcePath(currentCtx: V3TypedExprSourceConte
         ctx = sourceContexts[targetIndex]
     return targetSourcePath
 
+fn v3TypedExprSourceHasDeclaredType(ctx: V3TypedExprSourceContext,
+                                    typeNameRaw: str): bool =
+    let typeName = v3TypedExprNormalizeTypeText(typeNameRaw)
+    if typeName == "":
+        return false
+    for i in 0..<ctx.declaredTypes.len:
+        if ctx.declaredTypes[i] == typeName:
+            return true
+    return false
+
+fn v3TypedExprQualifiedTypeDot(typeRaw: str): int32 =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    var dotPos: int32 = -1
+    for i in 0..<typeText.len:
+        if typeText[i] == '.':
+            dotPos = i
+    return dotPos
+
+fn v3TypedExprTypeIsNamedCompositeInContext(currentCtx: V3TypedExprSourceContext,
+                                            sourceContexts: V3TypedExprSourceContext[],
+                                            typeRaw: str): bool =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return false
+    let dotPos = v3TypedExprQualifiedTypeDot(typeText)
+    if dotPos > 0:
+        let qualifier = v3path.V3PathTrim(v3path.V3TextSlice(typeText, 0, dotPos))
+        let leaf = v3path.V3PathTrim(v3path.V3TextSlice(typeText, dotPos + 1, typeText.len - dotPos - 1))
+        if qualifier == "" || leaf == "":
+            return false
+        let targetSourcePath = v3TypedExprLookupQualifiedModuleSourcePath(currentCtx, sourceContexts, qualifier)
+        let targetIndex = v3TypedExprSourceContextLookup(sourceContexts, targetSourcePath)
+        if targetIndex < 0:
+            return false
+        return v3TypedExprSourceHasDeclaredType(sourceContexts[targetIndex], leaf)
+    if v3TypedExprSourceHasDeclaredType(currentCtx, typeText):
+        return true
+    var resolvedSourcePath = ""
+    for i in 0..<currentCtx.importedModules.len:
+        let importedSourcePath = parser.v3ParserNormalizePath(currentCtx.importedModules[i].targetSourcePath)
+        let importedIndex = v3TypedExprSourceContextLookup(sourceContexts, importedSourcePath)
+        if importedIndex < 0:
+            continue
+        if !v3TypedExprSourceHasDeclaredType(sourceContexts[importedIndex], typeText):
+            continue
+        if resolvedSourcePath == "":
+            resolvedSourcePath = importedSourcePath
+            continue
+        if resolvedSourcePath != importedSourcePath:
+            return false
+    return resolvedSourcePath != ""
+
+fn v3TypedExprAbiClassForTypeInContext(currentCtx: V3TypedExprSourceContext,
+                                       sourceContexts: V3TypedExprSourceContext[],
+                                       typeRaw: str): V3TypedExprAbiClass =
+    let abiClass = v3TypedExprAbiClassForType(typeRaw)
+    if abiClass != v3TypedExprAbiPolymorphic:
+        return abiClass
+    if v3TypedExprTypeIsNamedCompositeInContext(currentCtx, sourceContexts, typeRaw):
+        return v3TypedExprAbiComposite
+    return v3TypedExprAbiPolymorphic
+
 fn v3TypedExprLookupQualifiedExternalReturnType(currentCtx: V3TypedExprSourceContext,
                                                 sourceContexts: V3TypedExprSourceContext[],
                                                 nameRaw: str): str =
@@ -1552,6 +1526,8 @@ fn v3TypedExprSinkForExpr(ctx: V3TypedExprSourceContext,
     return sink
 
 fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
+                                currentCtx: V3TypedExprSourceContext,
+                                sourceContexts: V3TypedExprSourceContext[],
                                 typeRaw: str,
                                 sink: V3TypedExprSinkInfo,
                                 forceCallResult: bool) =
@@ -1559,7 +1535,7 @@ fn v3TypedExprApplyResolvedType(fact: var V3TypedExprFact,
     if typeText == "":
         return
     fact.typeText = typeText
-    fact.abiClass = v3TypedExprAbiClassForType(typeText)
+    fact.abiClass = v3TypedExprAbiClassForTypeInContext(currentCtx, sourceContexts, typeText)
     fact.valueKind = v3TypedExprValueKindForAbiClass(fact.abiClass)
     if forceCallResult:
         fact.placeKind = v3TypedExprPlaceCallResult
@@ -1605,40 +1581,40 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
     let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
     let sourceResultType = v3TypedExprInferredResultInputType(ctx, scopeIndex, expr)
     if expr.kind == parser.v3NormalizedExprRange:
-        v3TypedExprApplyResolvedType(fact, "range", sink, false)
+        v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "range", sink, false)
         return fact
     if expr.kind == parser.v3NormalizedExprComprehension:
         let sinkType = sink.sinkType
         if parser.v3ParserStartsWith(sinkType, "seq[") || (sinkType.len >= 2 && v3path.V3TextSlice(sinkType, sinkType.len - 2, 2) == "[]"):
-            v3TypedExprApplyResolvedType(fact, sinkType, sink, false)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sinkType, sink, false)
             return fact
-        v3TypedExprApplyResolvedType(fact, "seq[unknown]", sink, false)
+        v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "seq[unknown]", sink, false)
         return fact
     if expr.kind == parser.v3NormalizedExprStrFormat:
-        v3TypedExprApplyResolvedType(fact, "str", sink, false)
+        v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "str", sink, false)
         return fact
     if expr.kind == parser.v3NormalizedExprIf:
         if sink.hasSink && sink.sinkType != "":
-            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, false)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.sinkType, sink, false)
             return fact
         let lineRaw = v3TypedExprSourceLine(ctx, expr.lineNumber)
         let trimmed = v3path.V3PathTrim(lineRaw)
         if parser.v3ParserStartsWith(trimmed, "if ") || v3TypedExprComprehensionFilterIf(lineRaw, expr):
-            v3TypedExprApplyResolvedType(fact, "bool", sink, false)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "bool", sink, false)
             return fact
         fact.typeText = "branch_join"
         return fact
     if expr.kind == parser.v3NormalizedExprTry:
         let innerType = v3TypedExprResultSuccessType(sourceResultType)
         if innerType != "":
-            v3TypedExprApplyResolvedType(fact, innerType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, innerType, sink, true)
             return fact
         let returnInnerType = v3TypedExprResultSuccessType(sink.functionReturnType)
         if returnInnerType != "":
-            v3TypedExprApplyResolvedType(fact, returnInnerType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, returnInnerType, sink, true)
             return fact
         if sink.hasSink && sink.sinkType != "":
-            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.sinkType, sink, true)
             return fact
         fact.typeText = "result_projection"
         fact.placeKind = v3TypedExprPlaceCallResult
@@ -1648,36 +1624,36 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         if expr.detail == "ok" || expr.detail == "err":
             let genericInner = v3TypedExprExtractGenericArg(lineRaw, expr.columnNumber, expr.surfaceText)
             if genericInner != "":
-                v3TypedExprApplyResolvedType(fact, v3TypedExprResultType(genericInner), sink, false)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, v3TypedExprResultType(genericInner), sink, false)
                 return fact
             if sink.hasSink && parser.v3ParserStartsWith(sink.sinkType, "Result["):
-                v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, false)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.sinkType, sink, false)
                 return fact
             let returnResult = sink.functionReturnType
             if parser.v3ParserStartsWith(returnResult, "Result["):
-                v3TypedExprApplyResolvedType(fact, returnResult, sink, false)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, returnResult, sink, false)
                 return fact
-            v3TypedExprApplyResolvedType(fact, "Result[unknown]", sink, false)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "Result[unknown]", sink, false)
             return fact
         if expr.detail == "is_ok" || expr.detail == "is_err":
-            v3TypedExprApplyResolvedType(fact, "bool", sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "bool", sink, true)
             return fact
         if expr.detail == "error":
-            v3TypedExprApplyResolvedType(fact, "str", sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "str", sink, true)
             return fact
         if expr.detail == "error_info_of":
-            v3TypedExprApplyResolvedType(fact, "ErrorInfo", sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "ErrorInfo", sink, true)
             return fact
         let genericInner = v3TypedExprExtractGenericArg(lineRaw, expr.columnNumber, expr.surfaceText)
         if genericInner != "":
-            v3TypedExprApplyResolvedType(fact, genericInner, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, genericInner, sink, true)
             return fact
         let innerType = v3TypedExprResultSuccessType(sourceResultType)
         if innerType != "":
-            v3TypedExprApplyResolvedType(fact, innerType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, innerType, sink, true)
             return fact
         if sink.hasSink && sink.sinkType != "":
-            v3TypedExprApplyResolvedType(fact, sink.sinkType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.sinkType, sink, true)
             return fact
         fact.typeText = "result_projection"
         fact.placeKind = v3TypedExprPlaceCallResult
@@ -1688,7 +1664,7 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         let detailReturnType = v3TypedExprLookupCallTargetReturnTypeFromDetail(sourceContexts, expr)
         let detailTargetImportc = parser.v3ParserCallExprDetailTargetImportc(expr.detail)
         if detailReturnType != "":
-            v3TypedExprApplyResolvedType(fact, detailReturnType, sink, true)
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, detailReturnType, sink, true)
             if detailTargetImportc && fact.abiClass == v3TypedExprAbiComposite:
                 fact.loweringMode = v3TypedExprLowerImportBuffer
                 fact.returnKind = v3TypedExprReturnImportBuffer
@@ -1696,7 +1672,7 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         if callKind == "importc_call":
             let importReturnType = v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts, callTarget)
             if importReturnType != "":
-                v3TypedExprApplyResolvedType(fact, importReturnType, sink, true)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, importReturnType, sink, true)
                 if fact.abiClass == v3TypedExprAbiComposite:
                     fact.loweringMode = v3TypedExprLowerImportBuffer
                     fact.returnKind = v3TypedExprReturnImportBuffer
@@ -1704,23 +1680,23 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         elif callKind == "local_call":
             let localReturnType = v3TypedExprLookupLocalFunctionReturnType(ctx, callTarget)
             if localReturnType != "":
-                v3TypedExprApplyResolvedType(fact, localReturnType, sink, true)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, localReturnType, sink, true)
                 return fact
         elif callKind == "external_call":
             let externalReturnType = v3TypedExprLookupExternalFunctionReturnTypeFromContexts(ctx,
                                                                                              sourceContexts,
                                                                                              callTarget)
             if externalReturnType != "":
-                v3TypedExprApplyResolvedType(fact, externalReturnType, sink, true)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, externalReturnType, sink, true)
                 return fact
         else:
             let localReturnType = v3TypedExprLookupLocalFunctionReturnType(ctx, callTarget)
             if localReturnType != "":
-                v3TypedExprApplyResolvedType(fact, localReturnType, sink, true)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, localReturnType, sink, true)
                 return fact
             let importReturnType = v3TypedExprLookupImportcReturnTypeFromContexts(sourceContexts, callTarget)
             if importReturnType != "":
-                v3TypedExprApplyResolvedType(fact, importReturnType, sink, true)
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, importReturnType, sink, true)
                 if fact.abiClass == v3TypedExprAbiComposite:
                     fact.loweringMode = v3TypedExprLowerImportBuffer
                     fact.returnKind = v3TypedExprReturnImportBuffer
@@ -1739,6 +1715,7 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
     ctx.bindings = []
     ctx.importcFunctions = []
     ctx.importedModules = []
+    ctx.declaredTypes = []
     var decls: parser.V3NormalizedFunctionDecl[] = []
     if !parser.v3ParserReadNormalizedFunctionDecls(source.text, decls, err):
         return false
@@ -1789,6 +1766,23 @@ fn v3TypedExprBuildSourceContext(source: V3TypedExprSourceText,
                                        lineNumber,
                                        bindingName,
                                        bindingType)
+    var inTypeBlock = false
+    for i in 0..<ctx.lines.len:
+        let rawLine = ctx.lines[i]
+        let trimmed = v3path.V3PathTrim(parser.v3ParserStripLineComment(rawLine))
+        if !parser.v3ParserHasLeadingIndent(rawLine):
+            if trimmed == "":
+                continue
+            inTypeBlock = trimmed == "type"
+            continue
+        if !inTypeBlock:
+            continue
+        let declaredType = v3TypedExprParseTypeDeclName(trimmed)
+        if declaredType == "":
+            continue
+        if parser.v3ParserStringSeqContainsExact(ctx.declaredTypes, declaredType):
+            continue
+        add(ctx.declaredTypes, declaredType)
     if source.workspaceRoot != "" && source.packageRoot != "":
         let ownerModulePath = parser.v3ParserSourcePathToModulePath(source.workspaceRoot,
                                                                     source.packageRoot,

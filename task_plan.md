@@ -1,10 +1,24 @@
 # 当前任务
 
-| 项目 | 内容 |
-|---|---|
-| 目标 | 把 `CallExpr -> typed fact -> lowering rule` 这条链收成真 gate：已解析调用不能再无解释掉回 `abi=polymorphic / lower=deferred / ret=deferred`。 |
-| 当前状态 | `compiler_csg` 和 `lowering_plan` 已经强校验 call resolution；imported `importc` 继续真落成 `import_buffer`；本轮又补上了“resolved void call”“返回 imported unqualified type 的 call”“显式泛型占位符返回”这三类边角，所以 `program_selfhost`、`compiler_csg_smoke`、`lowering_plan_smoke`、`typed_expr_cross_file_probe` 这一圈都已经重新站稳。 |
-| 本轮真修复 | 1. `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 新增硬 gate：resolved call 如果还掉到 `polymorphic/deferred` 会直接报 source site、target、type、abi、lower、ret。2. local/importc 的空返回现在会显式记成 `void`，不再和“没找到返回类型”共用空串。3. 类型归属不再被 `preferredSourcePath` 硬覆盖；现在会先切到 callee context，再按“当前 source 声明 + 无 alias 的 direct import”解析 unqualified type，所以 `DateTime` 这类 imported return type 已经能真落 ABI。4. `T/refT` 这类显式泛型占位符保留 deferred，但不再和真正的无解释回退混在一起。 |
-| 关键产物 | `parser_normalized_expr_smoke` `parser_path_smoke` `compiler_csg_smoke` `lowering_plan_smoke` `typed_expr_cross_file_probe.call_gate3` |
-| 已验收 | `CHENG_V3_SMOKE_LABEL=call_hir_gate3 /Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage3 run-host-smokes --compiler:/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage3 parser_normalized_expr_smoke parser_path_smoke compiler_csg_smoke lowering_plan_smoke` `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 /Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 system-link-exec --root:/Users/lbcheng/cheng-lang --in:/Users/lbcheng/cheng-lang/v3/src/tests/typed_expr_cross_file_probe.cheng --emit:exe --target:arm64-apple-darwin --out:/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/typed_expr_cross_file_probe.call_gate3` `/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/typed_expr_cross_file_probe.call_gate3` `git -C /Users/lbcheng/cheng-lang diff --check` |
-| 下一步 | 继续把 `CallExpr` 扩到更一般的 qualified target 和更宽的 closure 可见函数，但仍然坚持 per-source token 扫描、direct import qualifier、按源码真实 dotted 深度裁剪 external call 展开、未知 dotted call 后补这一条真源；不要回到按整包 closure 猜名。 |
+- 目标：把 `CallExpr -> typed fact -> lowering plan` 这条链收成真 gate；已解析调用必须有 target，未解析调用必须有明确 reason。
+- 当前状态：`parser_normalized_expr_smoke`、`parser_path_smoke`、`compiler_csg_smoke`、`lowering_plan_smoke`、`call_hir_matrix_smoke` 已重新跑绿；同文件、本地函数、direct import、grouped import、nested qualified、imported `importc`、ambiguous external、ambiguous qualified、alias 可见性、本地遮蔽、unknown member fallback 都已经进同一条事实链。
+- 本轮真修复：
+  - `/Users/lbcheng/cheng-lang/v3/src/lang/parser.cheng` 现在会给 unresolved known call 写入明确 `reason`，direct import 的 external call 同时收 qualified 和 unqualified 名。
+  - unqualified external resolve 不再扫描整个 closure，只认当前 source 的无 alias direct import。
+  - direct import 的 unqualified external 名现在先收，再过 qualified 深度门；纯 `SharedEcho(...)` 这类 source 不会再被 `maxQualifiedCallDepth=0` 直接挡掉。
+  - 同名本地函数现在会正确遮蔽 aliasless direct import 的 unqualified external 名，不会再在同一行长出 `local_call + external_call` 两条重复 `CallExpr`。
+  - qualified target 的根 qualifier 现在会检查当前函数可见的参数和局部 `let/var/const`；被局部绑定遮蔽时，不再误解成 imported module，而是显式落成 `member_call + reason=shadowed_qualified_target`。
+  - qualified qualifier 现在会显式检查冲突；同名 module-stem/qualifier 不再静默选第一条，而是落成 `ambiguous_qualified_target`。
+  - `/Users/lbcheng/cheng-lang/v3/src/lang/typed_expr.cheng` 现在强校验所有 unresolved call 都带 reason，不再只盯 `member_call`。
+  - 新增 `call_hir_reason_fixture`，把 ambiguous external target 收进正式矩阵。
+  - 新增 `call_hir_alias_visibility_fixture`，把 alias import 不污染 unqualified external 这条语义收进正式矩阵。
+  - 新增 `call_hir_local_shadow_fixture`，把本地函数遮蔽 direct import unqualified external 这条语义收进正式矩阵。
+  - 新增 `call_hir_qualified_local_shadow_fixture`，把参数/局部绑定遮蔽 qualified target 这条语义收进正式矩阵。
+  - 新增 `call_hir_qualified_ambiguous_fixture`，把 qualified qualifier 冲突收进正式矩阵。
+  - aliasless direct import closure 可见的 unqualified external call 现在也能被真解析：会沿 direct import closure 收集可见 external 名，并在 resolve 时按同一条 direct import closure 精确落到目标 source。
+  - `v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(...)` 已切回统一 `CallAndMember` 主链，不再保留旧的 `local/external/importc/member` 分裂扫描路径。
+  - qualified target 现在也会看见自己 aliasless direct-import closure 里的可见函数：`mid.Foo(...)` 不再只认 `mid` 本地声明，也能继续落到 `mid` 闭包里可见的 leaf local/importc target。
+  - 新增 `call_hir_qualified_closure_visible_*` fixture，把 qualified closure-visible local/importc 两条路径一起钉进 call 矩阵。
+  - `compiler_csg_smoke` 和 `lowering_plan_smoke` 不再自己直接 import/解释 lowering rule 枚举；改成直接读 `compiler_csg report / lowering plan report` 里的规则计数真源，并补齐 `lowering_rule_import_import_buffer_count`。
+  - `call_hir_matrix_smoke` 已接进默认 host smoke 列表。
+- 下一步：继续把 `CallExpr` 扩到更一般的 qualified target 和更宽的 closure 可见函数，但保持 `per-source token scan + direct import edge + qualifier 精确归属 + unknown reason + 统一 CallAndMember 主链` 这条真源。

@@ -17,7 +17,15 @@
 #endif
 
 int32_t v3_core_runtime_stub_trace(void) {
-  return 0;
+  static const char msg[] = "v3 core runtime trace\n";
+  ssize_t wrote = write(2, msg, sizeof(msg) - 1);
+  if (wrote <= 0) {
+    return 0;
+  }
+  if (wrote > INT32_MAX) {
+    return INT32_MAX;
+  }
+  return (int32_t)wrote;
 }
 
 int32_t cheng_v3_native_errno_code_bridge(void) {
