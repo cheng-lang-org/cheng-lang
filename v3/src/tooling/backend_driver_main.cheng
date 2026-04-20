@@ -1123,30 +1123,11 @@ fn v3BackendDriverRunVpnGui(rootDir: str,
 
 fn v3BackendDriverRunMobileShell(rootDir: str,
                                  count: int32): int32 =
-    let outDirRel: str = "artifacts/v3_mobile_shell"
-    let outDir: str = v3path.V3PathAbsolute(rootDir, outDirRel)
-    let toolPath: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver_tools/mobile_shell_tool/mobile_shell_tool")
-    if !v3path.V3FileExistsNonEmpty(rootDir, toolPath):
-        v3BackendDriverPrintErr("v3 mobile-shell: missing tool binary: " + toolPath)
-        return 2
-    let logPath: str = os.JoinPath(outDir, "mobile_shell.forward.log")
-    var forwardArgs: str[] = []
-    var i: int32 = 2
-    while i <= count:
-        let arg: str = cmdline.ParamStr(i)
-        if len(arg) > 0:
-            add(forwardArgs, arg)
-        i = i + 1
-    let run: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
-                                                            "v3 mobile-shell",
-                                                            toolPath,
-                                                            forwardArgs,
-                                                            120,
-                                                            logPath)
-    v3BackendDriverMaybePrintRunOutput(run)
-    if v3BackendDriverRunFailed("v3 mobile-shell", run):
-        return run.exitCode
-    return 0
+    let args: str[] = v3BackendDriverCollectArgsFrom(2, count)
+    return v3BackendDriverRunToolFromSource(rootDir,
+                                            "mobile_shell_tool",
+                                            "v3/src/tooling/mobile_shell_tool_main.cheng",
+                                            args)
 
 fn v3BackendDriverRunGateTool(rootDir: str,
                               count: int32): int32 =
@@ -1155,6 +1136,116 @@ fn v3BackendDriverRunGateTool(rootDir: str,
                                             "gate_tool",
                                             "v3/src/tooling/gate_main.cheng",
                                             args)
+
+fn v3BackendDriverBuildFfiHandle(rootDir: str): int32 =
+    var compilerPath: str = ""
+    if !v3BackendDriverResolveToolCompiler(rootDir, "build-ffi-handle", compilerPath):
+        return 1
+    let outDir: str = v3path.V3PathAbsolute(rootDir, "artifacts/v3_ffi_handle")
+    if !v3path.V3MkdirP(rootDir, outDir):
+        v3BackendDriverPrintErr("v3 ffi-handle: failed to create out dir")
+        return 1
+    let targetTriple: str = v3BackendDriverToolTarget()
+    if len(targetTriple) <= 0:
+        v3BackendDriverPrintErr("v3 ffi-handle: unsupported host target")
+        return 2
+    let okSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/ffi_handle_smoke.cheng")
+    let reuseSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/ffi_handle_generation_reuse_smoke.cheng")
+    let trapSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/ffi_handle_stale_trap_smoke.cheng")
+    let staleReuseSrc: str = v3path.V3PathAbsolute(rootDir, "v3/src/tests/ffi_handle_generation_stale_trap_smoke.cheng")
+    let okBin: str = os.JoinPath(outDir, "ffi_handle_smoke")
+    let reuseBin: str = os.JoinPath(outDir, "ffi_handle_generation_reuse_smoke")
+    let trapBin: str = os.JoinPath(outDir, "ffi_handle_stale_trap_smoke")
+    let staleReuseBin: str = os.JoinPath(outDir, "ffi_handle_generation_stale_trap_smoke")
+    let okCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                   "build_ffi_handle_ok",
+                                                                   compilerPath,
+                                                                   okSrc,
+                                                                   okBin,
+                                                                   targetTriple,
+                                                                   okBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 ffi-handle compile ok", okCompile):
+        return okCompile.exitCode
+    let reuseCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                      "build_ffi_handle_generation_reuse",
+                                                                      compilerPath,
+                                                                      reuseSrc,
+                                                                      reuseBin,
+                                                                      targetTriple,
+                                                                      reuseBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 ffi-handle compile generation reuse", reuseCompile):
+        return reuseCompile.exitCode
+    let trapCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                     "build_ffi_handle_trap",
+                                                                     compilerPath,
+                                                                     trapSrc,
+                                                                     trapBin,
+                                                                     targetTriple,
+                                                                     trapBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 ffi-handle compile trap", trapCompile):
+        return trapCompile.exitCode
+    let staleReuseCompile: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
+                                                                           "build_ffi_handle_stale_reuse_trap",
+                                                                           compilerPath,
+                                                                           staleReuseSrc,
+                                                                           staleReuseBin,
+                                                                           targetTriple,
+                                                                           staleReuseBin + ".compile.log")
+    if v3BackendDriverRunFailed("v3 ffi-handle compile stale reuse trap", staleReuseCompile):
+        return staleReuseCompile.exitCode
+    if !os.FileExists(okBin + ".v3.map") || !os.FileExists(reuseBin + ".v3.map") ||
+       !os.FileExists(trapBin + ".v3.map") ||
+       !os.FileExists(staleReuseBin + ".v3.map"):
+        v3BackendDriverPrintErr("v3 ffi-handle: missing line-map sidecar")
+        return 1
+    let okRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                              "build_ffi_handle_ok_run",
+                                                              okBin,
+                                                              [],
+                                                              20,
+                                                              okBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(okRun)
+    if v3BackendDriverRunFailed("v3 ffi-handle ok run", okRun):
+        return okRun.exitCode
+    let reuseRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                 "build_ffi_handle_generation_reuse_run",
+                                                                 reuseBin,
+                                                                 [],
+                                                                 20,
+                                                                 reuseBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(reuseRun)
+    if v3BackendDriverRunFailed("v3 ffi-handle generation reuse run", reuseRun):
+        return reuseRun.exitCode
+    let trapRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                "build_ffi_handle_trap_run",
+                                                                trapBin,
+                                                                [],
+                                                                20,
+                                                                trapBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(trapRun)
+    if trapRun.exitCode == 0:
+        v3BackendDriverPrintErr("v3 ffi-handle: stale trap unexpectedly exited 0")
+        return 1
+    if !v3BackendDriverRequireOutput(trapRun, "ffi handle invalid", "v3 ffi-handle") ||
+       !v3BackendDriverRequireOutput(trapRun, "reason=ffi_handle", "v3 ffi-handle") ||
+       !v3BackendDriverRequireOutput(trapRun, "ffi_handle_stale_trap_smoke.cheng:", "v3 ffi-handle"):
+        return 1
+    let staleReuseRun: hostops.V3LoggedRun = v3BackendDriverRunBinary(rootDir,
+                                                                      "build_ffi_handle_stale_reuse_trap_run",
+                                                                      staleReuseBin,
+                                                                      [],
+                                                                      20,
+                                                                      staleReuseBin + ".run.log")
+    v3BackendDriverMaybePrintRunOutput(staleReuseRun)
+    if staleReuseRun.exitCode == 0:
+        v3BackendDriverPrintErr("v3 ffi-handle: stale reuse trap unexpectedly exited 0")
+        return 1
+    if !v3BackendDriverRequireOutput(staleReuseRun, "ffi handle invalid", "v3 ffi-handle") ||
+       !v3BackendDriverRequireOutput(staleReuseRun, "detail=stale", "v3 ffi-handle") ||
+       !v3BackendDriverRequireOutput(staleReuseRun, "reason=ffi_handle", "v3 ffi-handle") ||
+       !v3BackendDriverRequireOutput(staleReuseRun, "ffi_handle_generation_stale_trap_smoke.cheng:", "v3 ffi-handle"):
+        return 1
+    return 0
 
 fn v3BackendDriverRunHostSmokes(rootDir: str,
                                 count: int32): int32 =
@@ -1320,6 +1411,7 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "export_visibility_smoke")
     add(out, "export_visibility_negative_smoke")
     add(out, "strformat_export_negative_smoke")
+    add(out, "cheng_skill_consistency_smoke")
     add(out, "json_bracket_assign_smoke")
     add(out, "strings_char_to_str_smoke")
     add(out, "vpn_proxy_cli_smoke")
@@ -1374,6 +1466,18 @@ fn v3BackendDriverDefaultHostSmokes(): str[] =
     add(out, "bft_three_replica_smoke")
     add(out, "primary_object_plan_smoke")
     add(out, "object_native_link_plan_smoke")
+    add(out, "bytebuf_view_smoke")
+    add(out, "bytebuf_len_probe_smoke")
+    add(out, "bytes_layout_copy_smoke")
+    add(out, "bytes_view_orc_registry_smoke")
+    add(out, "bytes_param_helper_smoke")
+    add(out, "bytes_buffer_handle_copy_smoke")
+    add(out, "bytes_buffer_handle_snapshot_smoke")
+    add(out, "bytes_parent_copy_orc_smoke")
+    add(out, "bytes_overwrite_orc_smoke")
+    add(out, "ffi_handle_generation_reuse_smoke")
+    add(out, "wrapper_result_forward_varparam_smoke")
+    add(out, "wrapper_rebuild_result_forward_varparam_smoke")
     add(out, "ffi_handle_smoke")
     add(out, "program_selfhost_smoke")
     add(out, "csg_smoke")
@@ -2735,12 +2839,12 @@ fn v3BackendDriverBuildChainNodeBinary(rootDir: str,
                                        outDir: str,
                                        label: str,
                                        outBin: var str): int32 =
-    let sourcePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/project/chain_node_main.cheng")
-    outBin = os.JoinPath(outDir, "chain_node")
+    let sourcePath: str = v3path.V3PathAbsolute(rootDir, "v3/src/project/cheng_node_main.cheng")
+    outBin = os.JoinPath(outDir, "cheng_node_main")
     var targetTriple: str = v3BackendDriverHostTarget()
     if len(targetTriple) <= 0:
         targetTriple = contracts.v3BootstrapDefaultTarget()
-    let compileLog: str = os.JoinPath(outDir, "chain_node.compile.log")
+    let compileLog: str = os.JoinPath(outDir, "cheng_node_main.compile.log")
     let compileRun: hostops.V3LoggedRun = v3BackendDriverCompileExe(rootDir,
                                                                     label,
                                                                     compilerPath,
@@ -2751,7 +2855,7 @@ fn v3BackendDriverBuildChainNodeBinary(rootDir: str,
     if v3BackendDriverRunFailed("v3 chain_node resilience compile", compileRun):
         return compileRun.exitCode
     if !os.FileExists(outBin):
-        v3BackendDriverPrintErr("v3 chain_node resilience smoke: missing chain_node binary: " + outBin)
+        v3BackendDriverPrintErr("v3 chain_node resilience smoke: missing cheng_node_main binary: " + outBin)
         return 1
     return 0
 
@@ -2796,7 +2900,7 @@ fn v3BackendDriverRunChainNodeServeAndSync(rootDir: str,
     let syncLog: str = os.JoinPath(outDir, syncLogName)
     let _ = os.RemoveFile(readyPath)
     var serveArgs: str[] = []
-    add(serveArgs, "daemon-serve")
+    add(serveArgs, "chain-daemon-serve")
     add(serveArgs, "--state:" + serverState)
     add(serveArgs, "--port:0")
     add(serveArgs, "--ready-path:" + readyPath)
@@ -2816,7 +2920,7 @@ fn v3BackendDriverRunChainNodeServeAndSync(rootDir: str,
         v3BackendDriverMaybePrintRunOutput(serverRun)
         return 1
     var syncArgs: str[] = []
-    add(syncArgs, "daemon-sync")
+    add(syncArgs, "chain-daemon-sync")
     add(syncArgs, "--state:" + clientState)
     if len(clientNodeId) > 0:
         add(syncArgs, "--node-id:" + clientNodeId)
@@ -2873,7 +2977,7 @@ fn v3BackendDriverChainNodeInitRun(rootDir: str,
                                    logStem: str,
                                    label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "init")
+    add(args, "chain-init")
     add(args, "--state:" + statePath)
     add(args, "--node-id:" + nodeId)
     add(args, "--address-seed:" + addressSeed)
@@ -2894,7 +2998,7 @@ fn v3BackendDriverChainNodeMintRun(rootDir: str,
                                    logStem: str,
                                    label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "mint")
+    add(args, "chain-mint")
     add(args, "--state:" + statePath)
     add(args, "--asset:7")
     add(args, "--account:" + account)
@@ -2917,7 +3021,7 @@ fn v3BackendDriverChainNodeTransferRun(rootDir: str,
                                        logStem: str,
                                        label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "transfer")
+    add(args, "chain-transfer")
     add(args, "--state:" + statePath)
     add(args, "--asset:7")
     add(args, "--from:" + fromAccount)
@@ -2939,7 +3043,7 @@ fn v3BackendDriverChainNodeBalanceRun(rootDir: str,
                                       logStem: str,
                                       label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "balance")
+    add(args, "chain-balance")
     add(args, "--state:" + statePath)
     add(args, "--asset:7")
     add(args, "--account:" + account)
@@ -2958,7 +3062,7 @@ fn v3BackendDriverChainNodeShowRun(rootDir: str,
                                    logStem: str,
                                    label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "show-state")
+    add(args, "chain-show-state")
     add(args, "--state:" + statePath)
     return v3BackendDriverChainNodeRun(rootDir,
                                        "v3 chain_node show-state " + label + " " + logStem,
@@ -2975,7 +3079,7 @@ fn v3BackendDriverChainNodeDumpSnapshotRun(rootDir: str,
                                            logStem: str,
                                            label: str): hostops.V3LoggedRun =
     var args: str[] = []
-    add(args, "dump-snapshot")
+    add(args, "chain-dump-snapshot")
     add(args, "--state:" + statePath)
     return v3BackendDriverChainNodeRun(rootDir,
                                        "v3 chain_node dump-snapshot " + label + " " + logStem,
@@ -5291,6 +5395,8 @@ fn main(argc: int32, argv: str*): int32 =
         return v3BackendDriverVerifyExportVisibilityParallel(rootDir)
     if cmd == "verify-debug-tools":
         return v3BackendDriverVerifyDebugTools(rootDir, count)
+    if cmd == "build-ffi-handle":
+        return v3BackendDriverBuildFfiHandle(rootDir)
     if cmd == "status-bft-validator-three-node" ||
        cmd == "stop-bft-validator-three-node" ||
        cmd == "build-bft-state-machine" ||

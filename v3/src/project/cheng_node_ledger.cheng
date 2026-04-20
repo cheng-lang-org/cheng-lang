@@ -1,6 +1,7 @@
 import std/result
 import std/system as system
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/lsmr_types as lt
 
 type
@@ -63,6 +64,10 @@ fn v3ChengNodeLedgerAppendText(buf: var layout.ByteBuf, text: str) =
 fn v3ChengNodeLedgerAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
     lt.v3AppendFixed32(buf, value)
 
+fn v3ChengNodeLedgerBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let data = layout.byteBufToBytes(buf)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
+
 fn v3ChengNodeLedgerEventCid(event: V3ChengNodeEventRecord): layout.FixedBytes32 =
     var buf = layout.byteBufInit(256)
     v3ChengNodeLedgerAppendText(buf, "cheng_node.event")
@@ -74,7 +79,7 @@ fn v3ChengNodeLedgerEventCid(event: V3ChengNodeEventRecord): layout.FixedBytes32
     v3ChengNodeLedgerAppendText(buf, event.keyText)
     v3ChengNodeLedgerAppendFixed32(buf, event.payloadCid)
     v3ChengNodeLedgerAppendFixed32(buf, event.prevEventCid)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3ChengNodeLedgerBufCid(buf)
 
 fn v3ChengNodeLedgerSegmentCid(segment: V3ChengNodeSnapshotSegment,
                                headEventCid: layout.FixedBytes32): layout.FixedBytes32 =
@@ -85,9 +90,17 @@ fn v3ChengNodeLedgerSegmentCid(segment: V3ChengNodeSnapshotSegment,
     lt.v3AppendU32BE(buf, segment.endSeq)
     v3ChengNodeLedgerAppendFixed32(buf, segment.snapshotCid)
     v3ChengNodeLedgerAppendFixed32(buf, headEventCid)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3ChengNodeLedgerBufCid(buf)
 
 fn v3ChengNodeLedgerRefreshManifestHead(manifest: var V3ChengNodeManifest) =
+    if manifest.segmentSnapshotVersions.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest snapshot version count mismatch"
+    if manifest.segmentStartSeqs.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest segment start count mismatch"
+    if manifest.segmentEndSeqs.len != manifest.segmentCids.len:
+        panic "cheng_node ledger: manifest segment end count mismatch"
+    if manifest.segmentCids.len > 4096:
+        panic "cheng_node ledger: manifest segment count overflow"
     var buf = layout.byteBufInit(256)
     v3ChengNodeLedgerAppendText(buf, "cheng_node.manifest")
     lt.v3AppendU32BE(buf, manifest.version)
@@ -101,7 +114,9 @@ fn v3ChengNodeLedgerRefreshManifestHead(manifest: var V3ChengNodeManifest) =
         lt.v3AppendU32BE(buf, manifest.segmentStartSeqs[i])
         lt.v3AppendU32BE(buf, manifest.segmentEndSeqs[i])
         v3ChengNodeLedgerAppendFixed32(buf, manifest.segmentCids[i])
-    manifest.headCid = lt.v3FixedCidFromBuf(buf)
+    if layout.byteBufLen(buf) > 4096:
+        panic "cheng_node ledger: manifest head wire overflow"
+    manifest.headCid = v3ChengNodeLedgerBufCid(buf)
 
 fn V3ChengNodeLedgerInit(): V3ChengNodeLedger =
     var out: V3ChengNodeLedger
@@ -198,6 +213,6 @@ fn V3ChengNodeLedgerBuildProof(ledger: var V3ChengNodeLedger,
     v3ChengNodeLedgerAppendFixed32(buf, proof.manifestHeadCid)
     lt.v3AppendU32BE(buf, proof.snapshotVersion)
     v3ChengNodeLedgerAppendFixed32(buf, proof.snapshotCid)
-    proof.proofCid = lt.v3FixedCidFromBuf(buf)
+    proof.proofCid = v3ChengNodeLedgerBufCid(buf)
     add(ledger.proofs, proof)
     return Ok[V3ChengNodeProofBundle](proof)

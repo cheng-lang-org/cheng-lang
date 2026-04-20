@@ -57,6 +57,22 @@ Cheng 不是 tracing GC 语言。
 - 值的所有权流向在源码里是可见的。
 - 不依赖隐藏拷贝来“碰运气”维持程序正确性。
 - 编译器可以把所有权信息直接下发给后端做优化。
+- 运行时性能口径看的是 ORC retain/release 与 alloc/free/live，不是 tracing GC 停顿。
+
+当前公开的运行时计数器已经包括：
+
+- `memRetainCount`
+- `memReleaseCount`
+- `memAllocCount`
+- `memFreeCount`
+- `memLiveCount`
+- `memDiagReset()`
+
+默认公开表面是内存安全优先，不是“全域自动安全”：
+
+- 用户源码默认走 no-pointer + borrow/Send/Sync 检查
+- FFI、句柄边界和环引用仍需显式管理
+- 所以不能把 Cheng 说成“已经没有任何 unsafe boundary”
 
 ### 3. 并发建立在所有权规则上
 
@@ -313,7 +329,9 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `artifacts/v3_bootstrap/cheng.stage3`
 - `artifacts/v3_backend_driver/cheng`
 - `artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge / build-backend-driver`
+- `artifacts/v3_bootstrap/cheng.stage3 profile-run / profile-report`
 - `artifacts/v3_backend_driver/cheng status / run-host-smokes`
+- `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
 - `artifacts/v3_backend_driver/cheng system-link-exec`
 
 `v3/tooling/cheng_v3.sh` 现在只该视为兼容壳，不再是 README 主入口。
@@ -334,6 +352,8 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 ./artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge
 ./artifacts/v3_bootstrap/cheng.stage3 build-backend-driver
 ./artifacts/v3_backend_driver/cheng status
+./artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke
+./artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke
 ```
 
 可以把它们理解成三类入口：
@@ -341,6 +361,22 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 - `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
 - `build-backend-driver` / `system-link-exec`：生成并使用当前 v3 编译器
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
+
+调试和性能入口也已经固定：
+
+- `artifacts/v3_bootstrap/cheng.stage3 profile-run --in:/abs/path/file.cheng --target:arm64-apple-darwin --out:/tmp/app`
+- `artifacts/v3_bootstrap/cheng.stage3 profile-report --in:/tmp/app.v3.profile.raw.txt --out:/tmp/app.profile.txt`
+- `artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+- `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+
+`perf_memory_contract_smoke` 的报告默认落在 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
+
+这份报告现在同时给两类事实：
+
+- `orc_perf_contract`：ORC runtime retain/release 和 alloc/free/live 闭环
+- `*_compile_exec_phase_summary`：正式 `system-link-exec` 编译报告里的 phase 下界摘要
+
+当前严格可引用的编译理论下界稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`。口径只认满足 `planner_total_ms <= compile_elapsed_ms` 的正式 `system-link-exec` 报告样本。
 
 ## Cheng 适合什么
 

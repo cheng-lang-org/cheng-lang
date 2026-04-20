@@ -299,26 +299,53 @@ fn cheng_seq_grow_inst_export(seqPtr: ptr, minCap: int32, elemSize: int32)
 var
     probe_slots: ChengFfiHandleSlotPtr
     probe_slots_len: int32
+    probe_slots_len_pad: int32
     probe_slots_cap: int32
+    probe_slots_cap_pad: int32
+    cheng_mem_registry_slots: VoidPtrPtr
+    cheng_mem_registry_cap: int32
+    cheng_mem_registry_cap_pad: int32
+    cheng_mem_registry_len: int32
+    cheng_mem_registry_len_pad: int32
+    cheng_mem_registry_dead: int32
+    cheng_mem_registry_dead_pad: int32
+    cheng_mm_retain_total: int64
+    cheng_mm_release_total: int64
+    cheng_mm_alloc_total: int64
+    cheng_mm_free_total: int64
+    cheng_mm_live_total: int64
     cheng_exec_cmd_last_exit_code_runtime: int64
     cheng_pty_spawn_last_master_fd_runtime: int32
+    cheng_pty_spawn_last_master_fd_runtime_pad: int32
     cheng_pty_spawn_last_pid_runtime: int64
     cheng_pipe_spawn_last_read_fd_runtime: int32
+    cheng_pipe_spawn_last_read_fd_runtime_pad: int32
     cheng_pipe_spawn_last_write_fd_runtime: int32
+    cheng_pipe_spawn_last_write_fd_runtime_pad: int32
     cheng_pipe_spawn_last_pid_runtime: int64
     cheng_exec_file_pipe_spawn_last_read_fd_runtime: int32
+    cheng_exec_file_pipe_spawn_last_read_fd_runtime_pad: int32
     cheng_exec_file_pipe_spawn_last_write_fd_runtime: int32
+    cheng_exec_file_pipe_spawn_last_write_fd_runtime_pad: int32
     cheng_exec_file_pipe_spawn_last_pid_runtime: int64
     cheng_pty_read_last_eof_runtime: int32
+    cheng_pty_read_last_eof_runtime_pad: int32
     cheng_fd_read_last_eof_runtime: int32
+    cheng_fd_read_last_eof_runtime_pad: int32
     cheng_fd_read_wait_last_eof_runtime: int32
+    cheng_fd_read_wait_last_eof_runtime_pad: int32
     cheng_pty_wait_last_exit_code_runtime: int32
+    cheng_pty_wait_last_exit_code_runtime_pad: int32
     cheng_tailnet_provider_active_count: int32
+    cheng_tailnet_provider_active_count_pad: int32
     cheng_tailnet_provider_command_count: int32
+    cheng_tailnet_provider_command_count_pad: int32
     cheng_webrtc_browser_session_active_count: int32
+    cheng_webrtc_browser_session_active_count_pad: int32
     cheng_tcp_bridge_last_error: str
     cheng_webrtc_bridge_last_error: str
     cheng_saved_argc: int32
+    cheng_saved_argc_pad: int32
     cheng_saved_argv: ptr
     cheng_stdio_in: ptr
     cheng_stdio_out: ptr
@@ -352,8 +379,155 @@ fn cheng_msg_waitall(): int32 =
 fn cheng_sockaddr_use_len_field(): bool =
     return native_cheng_v3_sockaddr_use_len_field_runtime() != 0
 
+fn cheng_mem_registry_tombstone(): ptr =
+    return ptr(uint64(1))
+
+fn cheng_mem_registry_slot_at(idx: int32): VoidPtrPtr =
+    return VoidPtrPtr(cheng_ptr_plus(ptr(cheng_mem_registry_slots), idx * int32(sizeof ptr)))
+
+fn cheng_mem_registry_slot_get(idx: int32): ptr =
+    return *(cheng_mem_registry_slot_at(idx))
+
+fn cheng_mem_registry_slot_set(idx: int32, value: ptr) =
+    *(cheng_mem_registry_slot_at(idx)) = value
+
+fn cheng_mem_registry_hash(value: ptr): uint64 =
+    var bits: uint64 = uint64(value) >> uint64(4)
+    bits = bits ^ (bits >> uint64(17))
+    bits = bits * uint64(1315423911)
+    bits = bits ^ (bits >> uint64(11))
+    return bits
+
+fn cheng_mem_registry_probe_start(value: ptr, cap: int32): int32 =
+    if cap <= 0:
+        return 0
+    return int32(cheng_mem_registry_hash(value) % uint64(cap))
+
+fn cheng_mem_registry_insert_into(slots: VoidPtrPtr, cap: int32, value: ptr): bool =
+    if slots == nil || cap <= 0 || value == nil:
+        return false
+    var idx: int32 = cheng_mem_registry_probe_start(value, cap)
+    var steps: int32 = 0
+    while steps < cap:
+        let slot = VoidPtrPtr(cheng_ptr_plus(ptr(slots), idx * int32(sizeof ptr)))
+        let current = *slot
+        if current == nil:
+            *slot = value
+            return true
+        idx = idx + 1
+        if idx >= cap:
+            idx = 0
+        steps = steps + 1
+    return false
+
+fn cheng_mem_registry_grow(minLive: int32): bool =
+    var needed: int32 = minLive
+    if needed <= 0:
+        needed = 1
+    var newCap: int32 = 8
+    while newCap < 8 || (newCap * 7) / 10 < needed:
+        newCap = newCap * 2
+    let bytes: int64 = int64(newCap) * int64(sizeof ptr)
+    let mem: ptr = c_malloc(bytes)
+    if mem == nil:
+        return false
+    cheng_bytes_set(mem, 0, int32(bytes))
+    var i: int32 = 0
+    while i < cheng_mem_registry_cap:
+        let current = cheng_mem_registry_slot_get(i)
+        if current != nil && current != cheng_mem_registry_tombstone():
+            if !cheng_mem_registry_insert_into(VoidPtrPtr(mem), newCap, current):
+                c_free(mem)
+                return false
+        i = i + 1
+    if cheng_mem_registry_slots != nil:
+        c_free(ptr(cheng_mem_registry_slots))
+    cheng_mem_registry_slots = VoidPtrPtr(mem)
+    cheng_mem_registry_cap = newCap
+    cheng_mem_registry_dead = 0
+    return true
+
+fn cheng_mem_registry_ensure_capacity(extraLive: int32): bool =
+    let needed: int32 = cheng_mem_registry_len + extraLive
+    if cheng_mem_registry_cap <= 0:
+        return cheng_mem_registry_grow(needed)
+    if (cheng_mem_registry_len + cheng_mem_registry_dead + extraLive) * 10 >= cheng_mem_registry_cap * 7:
+        return cheng_mem_registry_grow(needed)
+    return true
+
+fn cheng_mem_registry_contains(value: ptr): bool =
+    if value == nil || cheng_mem_registry_cap <= 0 || cheng_mem_registry_slots == nil:
+        return false
+    var idx: int32 = cheng_mem_registry_probe_start(value, cheng_mem_registry_cap)
+    var steps: int32 = 0
+    while steps < cheng_mem_registry_cap:
+        let current = cheng_mem_registry_slot_get(idx)
+        if current == nil:
+            return false
+        if current == value:
+            return true
+        idx = idx + 1
+        if idx >= cheng_mem_registry_cap:
+            idx = 0
+        steps = steps + 1
+    return false
+
+fn cheng_mem_registry_insert(value: ptr): bool =
+    if value == nil:
+        return true
+    if !cheng_mem_registry_ensure_capacity(1):
+        return false
+    let tomb: ptr = cheng_mem_registry_tombstone()
+    var idx: int32 = cheng_mem_registry_probe_start(value, cheng_mem_registry_cap)
+    var steps: int32 = 0
+    var firstDead: int32 = -1
+    while steps < cheng_mem_registry_cap:
+        let current = cheng_mem_registry_slot_get(idx)
+        if current == value:
+            return true
+        if current == tomb && firstDead < 0:
+            firstDead = idx
+        if current == nil:
+            let target: int32 = firstDead >= 0 ? firstDead : idx
+            cheng_mem_registry_slot_set(target, value)
+            cheng_mem_registry_len = cheng_mem_registry_len + 1
+            if firstDead >= 0 && cheng_mem_registry_dead > 0:
+                cheng_mem_registry_dead = cheng_mem_registry_dead - 1
+            return true
+        idx = idx + 1
+        if idx >= cheng_mem_registry_cap:
+            idx = 0
+        steps = steps + 1
+    if firstDead >= 0:
+        cheng_mem_registry_slot_set(firstDead, value)
+        cheng_mem_registry_len = cheng_mem_registry_len + 1
+        if cheng_mem_registry_dead > 0:
+            cheng_mem_registry_dead = cheng_mem_registry_dead - 1
+        return true
+    return false
+
+fn cheng_mem_registry_remove(value: ptr) =
+    if value == nil || cheng_mem_registry_cap <= 0 || cheng_mem_registry_slots == nil:
+        return
+    var idx: int32 = cheng_mem_registry_probe_start(value, cheng_mem_registry_cap)
+    var steps: int32 = 0
+    while steps < cheng_mem_registry_cap:
+        let current = cheng_mem_registry_slot_get(idx)
+        if current == nil:
+            return
+        if current == value:
+            cheng_mem_registry_slot_set(idx, cheng_mem_registry_tombstone())
+            if cheng_mem_registry_len > 0:
+                cheng_mem_registry_len = cheng_mem_registry_len - 1
+            cheng_mem_registry_dead = cheng_mem_registry_dead + 1
+            return
+        idx = idx + 1
+        if idx >= cheng_mem_registry_cap:
+            idx = 0
+        steps = steps + 1
+
 fn cheng_mem_header(p: ptr): ChengMemHeaderPtr =
-    if p == nil:
+    if p == nil || !cheng_mem_registry_contains(p):
         return nil
     return ChengMemHeaderPtr(ptr(uint64(p) - uint64(sizeof ChengMemHeader)))
 
@@ -1678,7 +1852,13 @@ fn cheng_malloc_export(size0: int32): ptr =
     header->rc = 1
     header->size = size
     let payload: ptr = cheng_payload_ptr(raw)
+    let insertOk = cheng_mem_registry_insert(payload)
+    if !insertOk:
+        c_free(raw)
+        return nil
     cheng_bytes_set(payload, 0, size)
+    cheng_mm_alloc_total = cheng_mm_alloc_total + 1
+    cheng_mm_live_total = cheng_mm_live_total + 1
     return payload
 
 @exportc("cheng_free")
@@ -1686,7 +1866,11 @@ fn cheng_free_export(p: ptr) =
     let header: ChengMemHeaderPtr = cheng_mem_header(p)
     if header == nil:
         return
+    cheng_mem_registry_remove(p)
     c_free(ptr(header))
+    cheng_mm_free_total = cheng_mm_free_total + 1
+    if cheng_mm_live_total > 0:
+        cheng_mm_live_total = cheng_mm_live_total - 1
 
 @exportc("cheng_realloc")
 fn cheng_realloc_export(p: ptr, size0: int32): ptr =
@@ -1718,7 +1902,13 @@ fn cheng_realloc_export(p: ptr, size0: int32): ptr =
         let payload: ptr = cheng_payload_ptr(raw)
         cheng_bytes_set(cheng_ptr_plus(payload, nextHeader->size), 0, size - nextHeader->size)
     nextHeader->size = size
-    return cheng_payload_ptr(raw)
+    let nextPayload: ptr = cheng_payload_ptr(raw)
+    if nextPayload != p:
+        cheng_mem_registry_remove(p)
+        let insertOk = cheng_mem_registry_insert(nextPayload)
+        if !insertOk:
+            return nil
+    return nextPayload
 
 @exportc("cheng_mem_retain")
 fn cheng_mem_retain_export(p: ptr) =
@@ -1726,6 +1916,7 @@ fn cheng_mem_retain_export(p: ptr) =
     if header == nil:
         return
     header->rc = header->rc + 1
+    cheng_mm_retain_total = cheng_mm_retain_total + 1
 
 @exportc("cheng_mem_release")
 fn cheng_mem_release_export(p: ptr) =
@@ -1734,8 +1925,13 @@ fn cheng_mem_release_export(p: ptr) =
         return
     if header->rc > 0:
         header->rc = header->rc - 1
+    cheng_mm_release_total = cheng_mm_release_total + 1
     if header->rc <= 0:
+        cheng_mem_registry_remove(p)
         c_free(ptr(header))
+        cheng_mm_free_total = cheng_mm_free_total + 1
+        if cheng_mm_live_total > 0:
+            cheng_mm_live_total = cheng_mm_live_total - 1
 
 @exportc("cheng_mem_scope_escape")
 fn cheng_mem_scope_escape_export(p: ptr) =
@@ -1763,6 +1959,31 @@ fn cheng_mem_release_atomic_export(p: ptr) =
 @exportc("cheng_mem_refcount_atomic")
 fn cheng_mem_refcount_atomic_export(p: ptr): int32 =
     return cheng_mem_refcount_export(p)
+
+@exportc("cheng_mm_retain_count")
+fn cheng_mm_retain_count_export(): int64 =
+    return cheng_mm_retain_total
+
+@exportc("cheng_mm_release_count")
+fn cheng_mm_release_count_export(): int64 =
+    return cheng_mm_release_total
+
+@exportc("cheng_mm_alloc_count")
+fn cheng_mm_alloc_count_export(): int64 =
+    return cheng_mm_alloc_total
+
+@exportc("cheng_mm_free_count")
+fn cheng_mm_free_count_export(): int64 =
+    return cheng_mm_free_total
+
+@exportc("cheng_mm_live_count")
+fn cheng_mm_live_count_export(): int64 =
+    return cheng_mm_live_total
+
+@exportc("cheng_mm_diag_reset")
+fn cheng_mm_diag_reset_export() =
+    cheng_mm_retain_total = 0
+    cheng_mm_release_total = 0
 
 @exportc("alloc")
 fn alloc_export(size: int32): ptr =
@@ -5221,6 +5442,11 @@ fn get_stdout_export(): ptr =
 @exportc("get_stderr")
 fn get_stderr_export(): ptr =
     return get_stderr()
+
+@exportc("cheng_mobile_host_emit_log")
+fn cheng_mobile_host_emit_log_export(message: str) =
+    message
+    return
 
 @exportc("driver_c_get_current_dir_bridge")
 fn driver_c_get_current_dir_bridge_export(): str =

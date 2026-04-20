@@ -2,6 +2,7 @@ import std/result
 import std/system as system
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/lsmr_types as lt
 import cheng/v3/tooling/path as v3path
 
@@ -70,6 +71,10 @@ fn v3CompilerWorldAppendText(buf: var layout.ByteBuf, text: str) =
 fn v3CompilerWorldAppendFixed32(buf: var layout.ByteBuf, value: layout.FixedBytes32) =
     lt.v3AppendFixed32(buf, value)
 
+fn v3CompilerWorldBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let data = layout.byteBufToBytes(buf)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
+
 fn v3CompilerWorldStrLess(left: str,
                           right: str): bool =
     if left == right:
@@ -104,7 +109,7 @@ fn v3CompilerWorldHashText(tag: str, values: str[]): layout.FixedBytes32 =
     lt.v3AppendU32BE(buf, values.len)
     for i in 0..<values.len:
         v3CompilerWorldAppendText(buf, values[i])
-    return lt.v3FixedCidFromBuf(buf)
+    return v3CompilerWorldBufCid(buf)
 
 fn v3CompilerWorldHashPackageSnapshot(packageId: str,
                                       channel: str,
@@ -120,7 +125,7 @@ fn v3CompilerWorldHashPackageSnapshot(packageId: str,
     v3CompilerWorldAppendFixed32(buf, csgRootCid)
     v3CompilerWorldAppendFixed32(buf, exportSurfaceCid)
     v3CompilerWorldAppendText(buf, signature)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3CompilerWorldBufCid(buf)
 
 fn v3CompilerWorldManifestRootCid(compilerPkgCid: layout.FixedBytes32,
                                   stdPkgCid: layout.FixedBytes32,
@@ -130,7 +135,7 @@ fn v3CompilerWorldManifestRootCid(compilerPkgCid: layout.FixedBytes32,
     v3CompilerWorldAppendFixed32(buf, compilerPkgCid)
     v3CompilerWorldAppendFixed32(buf, stdPkgCid)
     v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3CompilerWorldBufCid(buf)
 
 fn v3CompilerWorldHashHead(universeId: str,
                            channel: str,
@@ -154,7 +159,7 @@ fn v3CompilerWorldHashHead(universeId: str,
     v3CompilerWorldAppendFixed32(buf, stdPkgCid)
     v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
     v3CompilerWorldAppendText(buf, signature)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3CompilerWorldBufCid(buf)
 
 fn v3CompilerWorldOwnedBytesFromText(text: str): Bytes =
     var buf: layout.ByteBuf = layout.byteBufInit(len(text) + 16)
@@ -177,7 +182,7 @@ fn v3CompilerWorldSourceBundleCid(packageId: str,
         v3CompilerWorldAppendText(buf, sourcePath)
         let text = v3path.V3ReadTextFile("", sourcePath)
         v3CompilerWorldAppendText(buf, text)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3CompilerWorldBufCid(buf)
 
 fn v3CompilerWorldSourceBundleCidFromTexts(packageId: str,
                                            sourcePaths: str[],
@@ -211,7 +216,7 @@ fn v3CompilerWorldSourceBundleCidFromTexts(packageId: str,
     for i in 0..<orderedPaths.len:
         v3CompilerWorldAppendText(buf, orderedPaths[i])
         v3CompilerWorldAppendText(buf, orderedTexts[i])
-    return Ok[layout.FixedBytes32](lt.v3FixedCidFromBuf(buf))
+    return Ok[layout.FixedBytes32](v3CompilerWorldBufCid(buf))
 
 fn v3CompilerPackageSnapshotMake(packageId: str,
                                  channel: str,
@@ -238,7 +243,7 @@ fn v3CompilerPackageSnapshotMake(packageId: str,
     v3CompilerWorldAppendFixed32(buf, csgRootCid)
     v3CompilerWorldAppendFixed32(buf, exportSurfaceCid)
     v3CompilerWorldAppendText(buf, signatureOwned)
-    out.snapshotCid = lt.v3FixedCidFromBuf(buf)
+    out.snapshotCid = v3CompilerWorldBufCid(buf)
     return out
 
 fn v3CompilerWorldHeadMake(channel: str,
@@ -277,7 +282,7 @@ fn v3CompilerWorldHeadMake(channel: str,
     v3CompilerWorldAppendFixed32(buf, stdPkgCid)
     v3CompilerWorldAppendFixed32(buf, runtimePkgCid)
     v3CompilerWorldAppendText(buf, signatureOwned)
-    out.headCid = lt.v3FixedCidFromBuf(buf)
+    out.headCid = v3CompilerWorldBufCid(buf)
     return out
 
 fn v3CompilerLocalUniverseBuildForChannel(channelRaw: str,
@@ -443,6 +448,37 @@ fn v3CompilerPackageSnapshotReport(snapshot: V3CompilerPackageSnapshot): str =
     out = out + "signature=" + snapshot.signature + "\n"
     out = out + "snapshot_cid=" + layout.fixedBytes32Hex(snapshot.snapshotCid)
     return out
+
+fn v3CompilerPackageSnapshotFromReportText(text: str,
+                                           out: var V3CompilerPackageSnapshot): Result[bool] =
+    let packageId = v3CompilerWorldLineValue(text, "package_id")
+    if len(packageId) <= 0:
+        return Err[bool]("v3 compiler world: report package_id missing")
+    let channelRes = v3CompilerWorldNormalizeChannel(v3CompilerWorldLineValue(text, "channel"))
+    if IsErr(channelRes):
+        return Err[bool](Error(channelRes))
+    let sourceRes = v3CompilerWorldFixed32Value(text, "source_bundle_cid")
+    if IsErr(sourceRes):
+        return Err[bool](Error(sourceRes))
+    let csgRes = v3CompilerWorldFixed32Value(text, "csg_root_cid")
+    if IsErr(csgRes):
+        return Err[bool](Error(csgRes))
+    let exportRes = v3CompilerWorldFixed32Value(text, "export_surface_cid")
+    if IsErr(exportRes):
+        return Err[bool](Error(exportRes))
+    let snapshotCidRes = v3CompilerWorldFixed32Value(text, "snapshot_cid")
+    if IsErr(snapshotCidRes):
+        return Err[bool](Error(snapshotCidRes))
+    let snapshot = v3CompilerPackageSnapshotMake(packageId,
+                                                Value(channelRes),
+                                                Value(sourceRes),
+                                                Value(csgRes),
+                                                Value(exportRes),
+                                                v3CompilerWorldLineValue(text, "signature"))
+    if !layout.fixedBytes32Equal(snapshot.snapshotCid, Value(snapshotCidRes)):
+        return Err[bool]("v3 compiler world: package snapshot cid mismatch")
+    out = snapshot
+    return Ok[bool](true)
 
 fn v3CompilerWorldHeadReport(head: V3CompilerWorldHead): str =
     var out = ""

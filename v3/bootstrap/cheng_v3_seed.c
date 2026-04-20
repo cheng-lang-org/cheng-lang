@@ -2454,6 +2454,11 @@ static const char *v3_flag_value(int argc, char **argv, const char *flag) {
 #define CHENG_V3_MAX_PLAN_FUNCTIONS 8192
 #define CHENG_V3_MAX_SOURCE_LINES 16384
 #define CHENG_V3_MAX_IMPORT_ALIASES 128
+#define CHENG_V3_MAX_EXPR_SURFACE_CACHE 512
+#define CHENG_V3_MAX_EXPR_TYPE_CACHE 1024
+#define CHENG_V3_MAX_IMPORT_ALIAS_CACHE 512
+#define CHENG_V3_MAX_TOP_LEVEL_VAR_CACHE 512
+#define CHENG_V3_MAX_IMPORTC_TARGET_CACHE 2048
 #define CHENG_V3_MAX_CALLEES 64
 #define CHENG_V3_CONST_MAX_FIELDS 64
 #define CHENG_V3_CONST_MAX_BINDINGS 64
@@ -2471,10 +2476,20 @@ static void v3_plan_path_add_unique(V3PlanPath *items,
                                     size_t *len,
                                     size_t cap,
                                     const char *text);
+static bool v3_startswith(const char *text, const char *prefix);
 static bool v3_load_source_lines(const char *source_path,
                                  char ***lines_out,
                                  char **owned_out,
                                  size_t *line_count_out);
+static int32_t v3_line_indent(const char *line);
+static bool v3_parse_top_level_var_binding_text(const char *statement,
+                                                char *name_out,
+                                                size_t name_cap,
+                                                char *type_out,
+                                                size_t type_cap,
+                                                bool *has_init_out,
+                                                char *expr_out,
+                                                size_t expr_cap);
 
 typedef struct {
     char owner_module_path[PATH_MAX];
@@ -2487,6 +2502,30 @@ typedef struct {
     char alias_text[128];
     char module_path[PATH_MAX];
 } V3ImportAlias;
+
+static void v3_parse_import_aliases_from_lines(char **lines,
+                                               size_t line_count,
+                                               V3ImportAlias *aliases,
+                                               size_t *alias_count,
+                                               size_t alias_cap);
+
+typedef struct {
+    char source_path[PATH_MAX];
+    size_t alias_count;
+    V3ImportAlias *aliases;
+} V3ImportAliasCacheEntry;
+
+typedef struct {
+    char name[128];
+    char raw_type[256];
+    bool has_init;
+} V3TopLevelVarDecl;
+
+typedef struct {
+    char source_path[PATH_MAX];
+    size_t decl_count;
+    V3TopLevelVarDecl *decls;
+} V3TopLevelVarDeclCacheEntry;
 
 typedef struct {
     char workspace_root[PATH_MAX];
@@ -2641,6 +2680,7 @@ static bool v3_emit_slot_address(char *out,
                                  size_t cap,
                                  const V3AsmLocalSlot *slot,
                                  int reg_index);
+
 static bool v3_emit_local_value_address(char *out,
                                         size_t cap,
                                         const V3AsmLocalSlot *slot,
@@ -2845,6 +2885,19 @@ typedef struct {
     char *world_report;
     char *receipt_report;
     char *lock_text;
+    long long exec_phase_system_link_plan_ms;
+    long long exec_phase_source_bundle_ms;
+    long long exec_phase_compiler_csg_ms;
+    long long exec_phase_world_ms;
+    long long exec_phase_lock_ms;
+    long long exec_phase_baseline_ms;
+    long long exec_phase_lowering_plan_ms;
+    long long exec_phase_primary_object_plan_ms;
+    long long exec_phase_provider_sources_ms;
+    long long exec_phase_object_plan_ms;
+    long long exec_phase_native_link_plan_ms;
+    long long exec_phase_compile_receipt_ms;
+    long long exec_phase_total_ms;
 } V3CompilerWorldArtifacts;
 
 typedef struct {
@@ -2901,6 +2954,15 @@ typedef struct {
 
 static bool v3_target_is_darwin_arm64(const char *target_triple) {
     return target_triple != NULL && strcmp(target_triple, "arm64-apple-darwin") == 0;
+}
+
+static long long v3_bft_monotime_ms(void);
+
+static long long v3_phase_elapsed_ms(long long start_ms, long long end_ms) {
+    if (start_ms <= 0LL || end_ms <= 0LL || end_ms < start_ms) {
+        return 0LL;
+    }
+    return end_ms - start_ms;
 }
 
 static bool v3_target_is_android_aarch64(const char *target_triple) {
@@ -3232,6 +3294,330 @@ typedef struct {
     char ffi_handle_invalidate_symbol_name[PATH_MAX];
 } V3AsmCallTarget;
 
+typedef struct {
+    char source_path[PATH_MAX];
+    char callee[128];
+    bool found;
+    V3AsmCallTarget *target;
+} V3ImportcTargetCacheEntry;
+
+static V3ImportAliasCacheEntry g_v3_import_alias_cache[CHENG_V3_MAX_IMPORT_ALIAS_CACHE];
+static size_t g_v3_import_alias_cache_count = 0U;
+static V3TopLevelVarDeclCacheEntry g_v3_top_level_var_cache[CHENG_V3_MAX_TOP_LEVEL_VAR_CACHE];
+static size_t g_v3_top_level_var_cache_count = 0U;
+static V3ImportcTargetCacheEntry g_v3_importc_target_cache[CHENG_V3_MAX_IMPORTC_TARGET_CACHE];
+static size_t g_v3_importc_target_cache_count = 0U;
+
+static bool v3_copy_import_aliases(V3ImportAlias *aliases_out,
+                                   size_t *alias_count_out,
+                                   size_t alias_cap,
+                                   const V3ImportAlias *aliases,
+                                   size_t alias_count) {
+    if (alias_count_out != NULL) {
+        *alias_count_out = 0U;
+    }
+    if (alias_count > alias_cap) {
+        return false;
+    }
+    if (alias_count > 0U && aliases_out == NULL) {
+        return false;
+    }
+    if (alias_count > 0U) {
+        memcpy(aliases_out, aliases, sizeof(*aliases_out) * alias_count);
+    }
+    if (alias_count_out != NULL) {
+        *alias_count_out = alias_count;
+    }
+    return true;
+}
+
+static bool v3_import_alias_cache_get(const char *source_path,
+                                      V3ImportAlias *aliases_out,
+                                      size_t *alias_count_out,
+                                      size_t alias_cap) {
+    size_t i;
+    if (source_path == NULL || source_path[0] == '\0') {
+        return false;
+    }
+    for (i = 0U; i < g_v3_import_alias_cache_count; ++i) {
+        if (strcmp(g_v3_import_alias_cache[i].source_path, source_path) != 0) {
+            continue;
+        }
+        return v3_copy_import_aliases(aliases_out,
+                                      alias_count_out,
+                                      alias_cap,
+                                      g_v3_import_alias_cache[i].aliases,
+                                      g_v3_import_alias_cache[i].alias_count);
+    }
+    return false;
+}
+
+static void v3_import_alias_cache_store(const char *source_path,
+                                        const V3ImportAlias *aliases,
+                                        size_t alias_count) {
+    V3ImportAlias *copy = NULL;
+    V3ImportAliasCacheEntry *entry = NULL;
+    size_t i;
+    if (source_path == NULL || source_path[0] == '\0') {
+        return;
+    }
+    for (i = 0U; i < g_v3_import_alias_cache_count; ++i) {
+        if (strcmp(g_v3_import_alias_cache[i].source_path, source_path) == 0) {
+            return;
+        }
+    }
+    if (g_v3_import_alias_cache_count >= CHENG_V3_MAX_IMPORT_ALIAS_CACHE) {
+        return;
+    }
+    if (alias_count > 0U) {
+        copy = (V3ImportAlias *)malloc(sizeof(*copy) * alias_count);
+        if (copy == NULL) {
+            return;
+        }
+        memcpy(copy, aliases, sizeof(*copy) * alias_count);
+    }
+    entry = &g_v3_import_alias_cache[g_v3_import_alias_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->source_path, sizeof(entry->source_path), "%s", source_path);
+    entry->alias_count = alias_count;
+    entry->aliases = copy;
+}
+
+static bool v3_top_level_var_cache_get(const char *source_path,
+                                       const V3TopLevelVarDecl **decls_out,
+                                       size_t *decl_count_out) {
+    size_t i;
+    if (decls_out != NULL) {
+        *decls_out = NULL;
+    }
+    if (decl_count_out != NULL) {
+        *decl_count_out = 0U;
+    }
+    if (source_path == NULL || source_path[0] == '\0') {
+        return false;
+    }
+    for (i = 0U; i < g_v3_top_level_var_cache_count; ++i) {
+        if (strcmp(g_v3_top_level_var_cache[i].source_path, source_path) != 0) {
+            continue;
+        }
+        if (decls_out != NULL) {
+            *decls_out = g_v3_top_level_var_cache[i].decls;
+        }
+        if (decl_count_out != NULL) {
+            *decl_count_out = g_v3_top_level_var_cache[i].decl_count;
+        }
+        return true;
+    }
+    return false;
+}
+
+static void v3_top_level_var_cache_store(const char *source_path,
+                                         V3TopLevelVarDecl *decls,
+                                         size_t decl_count) {
+    V3TopLevelVarDeclCacheEntry *entry = NULL;
+    size_t i;
+    if (source_path == NULL || source_path[0] == '\0') {
+        free(decls);
+        return;
+    }
+    for (i = 0U; i < g_v3_top_level_var_cache_count; ++i) {
+        if (strcmp(g_v3_top_level_var_cache[i].source_path, source_path) == 0) {
+            free(decls);
+            return;
+        }
+    }
+    if (g_v3_top_level_var_cache_count >= CHENG_V3_MAX_TOP_LEVEL_VAR_CACHE) {
+        free(decls);
+        return;
+    }
+    entry = &g_v3_top_level_var_cache[g_v3_top_level_var_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->source_path, sizeof(entry->source_path), "%s", source_path);
+    entry->decl_count = decl_count;
+    entry->decls = decls;
+}
+
+static bool v3_collect_top_level_var_decls_from_lines(char **lines,
+                                                      size_t line_count,
+                                                      V3TopLevelVarDecl **decls_out,
+                                                      size_t *decl_count_out) {
+    V3TopLevelVarDecl *decls = NULL;
+    size_t decl_count = 0U;
+    size_t decl_cap = 0U;
+    bool in_var_block = false;
+    size_t i;
+    if (decls_out == NULL || decl_count_out == NULL) {
+        return false;
+    }
+    *decls_out = NULL;
+    *decl_count_out = 0U;
+    for (i = 0U; i < line_count; ++i) {
+        char line_copy[4096];
+        char name[128];
+        char raw_type[256];
+        char expr[4096];
+        bool has_init = false;
+        int32_t indent;
+        char *trimmed;
+        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
+        indent = v3_line_indent(line_copy);
+        trimmed = v3_trim_inplace(line_copy);
+        if (*trimmed == '\0' || *trimmed == '#') {
+            continue;
+        }
+        if (indent <= 0 && strcmp(trimmed, "var") == 0) {
+            in_var_block = true;
+            continue;
+        }
+        if (indent <= 0 && !v3_startswith(trimmed, "var ")) {
+            in_var_block = false;
+        }
+        if (indent <= 0 && v3_startswith(trimmed, "var ")) {
+            trimmed += 4;
+        } else if (!in_var_block || indent <= 0) {
+            continue;
+        }
+        if (!v3_parse_top_level_var_binding_text(trimmed,
+                                                 name,
+                                                 sizeof(name),
+                                                 raw_type,
+                                                 sizeof(raw_type),
+                                                 &has_init,
+                                                 expr,
+                                                 sizeof(expr))) {
+            continue;
+        }
+        if (decl_count >= decl_cap) {
+            size_t next_cap = decl_cap <= 0U ? 16U : decl_cap * 2U;
+            V3TopLevelVarDecl *grown =
+                (V3TopLevelVarDecl *)realloc(decls, sizeof(*grown) * next_cap);
+            if (grown == NULL) {
+                free(decls);
+                return false;
+            }
+            decls = grown;
+            decl_cap = next_cap;
+        }
+        memset(&decls[decl_count], 0, sizeof(decls[decl_count]));
+        snprintf(decls[decl_count].name, sizeof(decls[decl_count].name), "%s", name);
+        snprintf(decls[decl_count].raw_type, sizeof(decls[decl_count].raw_type), "%s", raw_type);
+        decls[decl_count].has_init = has_init;
+        decl_count += 1U;
+    }
+    *decls_out = decls;
+    *decl_count_out = decl_count;
+    return true;
+}
+
+static bool v3_load_top_level_var_decls_from_source_path(const char *source_path,
+                                                         const V3TopLevelVarDecl **decls_out,
+                                                         size_t *decl_count_out) {
+    char **lines = NULL;
+    char *owned = NULL;
+    size_t line_count = 0U;
+    V3TopLevelVarDecl *decls = NULL;
+    size_t decl_count = 0U;
+    V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
+    size_t alias_count = 0U;
+    if (decls_out != NULL) {
+        *decls_out = NULL;
+    }
+    if (decl_count_out != NULL) {
+        *decl_count_out = 0U;
+    }
+    if (source_path == NULL || source_path[0] == '\0' ||
+        decls_out == NULL || decl_count_out == NULL) {
+        return false;
+    }
+    if (v3_top_level_var_cache_get(source_path, decls_out, decl_count_out)) {
+        return true;
+    }
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
+        return false;
+    }
+    if (!v3_collect_top_level_var_decls_from_lines(lines, line_count, &decls, &decl_count)) {
+        free(lines);
+        free(owned);
+        return false;
+    }
+    v3_parse_import_aliases_from_lines(lines,
+                                       line_count,
+                                       aliases,
+                                       &alias_count,
+                                       CHENG_V3_MAX_IMPORT_ALIASES);
+    v3_import_alias_cache_store(source_path, aliases, alias_count);
+    free(lines);
+    free(owned);
+    v3_top_level_var_cache_store(source_path, decls, decl_count);
+    return v3_top_level_var_cache_get(source_path, decls_out, decl_count_out);
+}
+
+static bool v3_importc_target_cache_lookup(const char *source_path,
+                                           const char *callee,
+                                           V3AsmCallTarget *target_out,
+                                           bool *found_out) {
+    size_t i;
+    if (found_out != NULL) {
+        *found_out = false;
+    }
+    if (source_path == NULL || source_path[0] == '\0' ||
+        callee == NULL || callee[0] == '\0') {
+        return false;
+    }
+    for (i = 0U; i < g_v3_importc_target_cache_count; ++i) {
+        if (strcmp(g_v3_importc_target_cache[i].source_path, source_path) != 0 ||
+            strcmp(g_v3_importc_target_cache[i].callee, callee) != 0) {
+            continue;
+        }
+        if (found_out != NULL) {
+            *found_out = g_v3_importc_target_cache[i].found;
+        }
+        if (g_v3_importc_target_cache[i].found &&
+            target_out != NULL &&
+            g_v3_importc_target_cache[i].target != NULL) {
+            memcpy(target_out,
+                   g_v3_importc_target_cache[i].target,
+                   sizeof(*target_out));
+        }
+        return true;
+    }
+    return false;
+}
+
+static void v3_importc_target_cache_store(const char *source_path,
+                                          const char *callee,
+                                          const V3AsmCallTarget *target,
+                                          bool found) {
+    V3ImportcTargetCacheEntry *entry = NULL;
+    size_t i;
+    if (source_path == NULL || source_path[0] == '\0' ||
+        callee == NULL || callee[0] == '\0') {
+        return;
+    }
+    for (i = 0U; i < g_v3_importc_target_cache_count; ++i) {
+        if (strcmp(g_v3_importc_target_cache[i].source_path, source_path) == 0 &&
+            strcmp(g_v3_importc_target_cache[i].callee, callee) == 0) {
+            return;
+        }
+    }
+    if (g_v3_importc_target_cache_count >= CHENG_V3_MAX_IMPORTC_TARGET_CACHE) {
+        return;
+    }
+    entry = &g_v3_importc_target_cache[g_v3_importc_target_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->source_path, sizeof(entry->source_path), "%s", source_path);
+    snprintf(entry->callee, sizeof(entry->callee), "%s", callee);
+    entry->found = found;
+    if (found && target != NULL) {
+        entry->target = (V3AsmCallTarget *)malloc(sizeof(*entry->target));
+        if (entry->target == NULL) {
+            entry->found = false;
+            return;
+        }
+        memcpy(entry->target, target, sizeof(*entry->target));
+    }
+}
+
 typedef enum {
     V3_RESULT_INTRINSIC_NONE = 0,
     V3_RESULT_INTRINSIC_IS_OK,
@@ -3258,12 +3644,33 @@ typedef struct {
     V3ExprSurfaceKind kind;
     bool rewritten;
     bool range_end_inclusive;
+    bool call_prefix_style;
     V3ResultIntrinsicKind result_hint;
+    size_t call_arg_count;
     char text[8192];
     char cond[4096];
     char when_true[4096];
     char when_false[4096];
+    char call_callee[PATH_MAX];
+    char call_args_text[8192];
 } V3ExprSurface;
+
+typedef struct {
+    uint64_t key_hash;
+    char expr_text[8192];
+    V3ExprSurface surface;
+} V3ExprSurfaceCacheEntry;
+
+typedef struct {
+    bool occupied;
+    uint64_t key_hash;
+    size_t source_line;
+    size_t local_count;
+    char function_symbol[PATH_MAX];
+    char expr_text[8192];
+    char type_text[256];
+    char abi_class[32];
+} V3ExprTypeCacheEntry;
 
 typedef enum {
     V3_ABI_VALUE_VOID = 0,
@@ -3374,6 +3781,12 @@ typedef struct {
 } V3WasmCallLoweringRule;
 
 typedef struct {
+    V3WasmCallReturnSlotKind return_slot_kind;
+    V3WasmCallResultKind result_kind;
+    bool supported;
+} V3WasmFunctionLoweringRule;
+
+typedef struct {
     size_t param_count;
     V3CallTargetArgKind arg_kinds[CHENG_V3_MAX_CALL_ARGS];
     V3CallTargetReturnKind return_kind;
@@ -3382,6 +3795,12 @@ typedef struct {
     V3NativeImportKind import_kind;
     bool supported;
 } V3NativeCallLoweringRule;
+
+typedef struct {
+    V3ReturnPassKind return_pass_kind;
+    V3CallResultKind result_kind;
+    bool supported;
+} V3NativeFunctionLoweringRule;
 
 typedef enum {
     V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED = 0,
@@ -3700,13 +4119,27 @@ static void v3_const_env_free(V3ConstEnv *env) {
 }
 
 static void v3_trim_copy_text(const char *src, char *dst, size_t cap) {
-    char temp[8192];
-    if (strlen(src) >= sizeof(temp)) {
-        v3_copy_text(dst, cap, src);
+    const char *start = src;
+    const char *end;
+    size_t copy_len;
+    if (cap == 0U) {
         return;
     }
-    snprintf(temp, sizeof(temp), "%s", src);
-    v3_copy_text(dst, cap, v3_trim_inplace(temp));
+    while (*start != '\0' && isspace((unsigned char)*start)) {
+        start++;
+    }
+    end = start + strlen(start);
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    copy_len = (size_t)(end - start);
+    if (copy_len + 1U > cap) {
+        copy_len = cap - 1U;
+    }
+    if (copy_len > 0U) {
+        memmove(dst, start, copy_len);
+    }
+    dst[copy_len] = '\0';
 }
 
 static int32_t v3_find_top_level_binary_op(const char *text, const char *op) {
@@ -3986,19 +4419,17 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
                                             char *arg_text,
                                             size_t arg_cap);
 
-static bool v3_parse_call_text(const char *text,
-                               char *callee,
-                               size_t callee_cap,
-                               char args[][4096],
-                               size_t *arg_count,
-                               size_t arg_cap) {
+static bool v3_parse_call_text_parts(const char *text,
+                                     char *callee,
+                                     size_t callee_cap,
+                                     char *inner_out,
+                                     size_t inner_cap) {
     char trimmed[8192];
     const char *open_paren = NULL;
     const char *close_paren = NULL;
     bool in_string = false;
     int32_t bracket_depth = 0;
     int32_t paren_depth = 0;
-    char inner[8192];
     size_t i;
     v3_trim_copy_text(text, trimmed, sizeof(trimmed));
     for (i = 0; trimmed[i] != '\0'; ++i) {
@@ -4071,7 +4502,24 @@ static bool v3_parse_call_text(const char *text,
             return false;
         }
     }
-    snprintf(inner, sizeof(inner), "%.*s", (int)(close_paren - open_paren - 1), open_paren + 1);
+    snprintf(inner_out, inner_cap, "%.*s", (int)(close_paren - open_paren - 1), open_paren + 1);
+    return true;
+}
+
+static bool v3_parse_call_text(const char *text,
+                               char *callee,
+                               size_t callee_cap,
+                               char args[][4096],
+                               size_t *arg_count,
+                               size_t arg_cap) {
+    char inner[8192];
+    if (!v3_parse_call_text_parts(text,
+                                  callee,
+                                  callee_cap,
+                                  inner,
+                                  sizeof(inner))) {
+        return false;
+    }
     return v3_split_top_level_args(inner, args, arg_count, arg_cap);
 }
 
@@ -4326,11 +4774,166 @@ static void v3_expr_surface_init(V3ExprSurface *surface) {
     surface->result_hint = V3_RESULT_INTRINSIC_NONE;
 }
 
+static V3ExprSurfaceCacheEntry g_v3_expr_surface_cache[CHENG_V3_MAX_EXPR_SURFACE_CACHE];
+static size_t g_v3_expr_surface_cache_count = 0U;
+static V3ExprTypeCacheEntry g_v3_expr_type_cache[CHENG_V3_MAX_EXPR_TYPE_CACHE];
+
+static uint64_t v3_hash_combine64(uint64_t hash, uint64_t value) {
+    return hash ^ (value + 0x9e3779b97f4a7c15ULL + (hash << 6) + (hash >> 2));
+}
+
+static uint64_t v3_expr_type_cache_key_hash(const V3LoweredFunctionStub *current_function,
+                                            size_t source_line,
+                                            size_t local_count,
+                                            const char *expr_text) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    if (current_function == NULL || expr_text == NULL || expr_text[0] == '\0') {
+        return 0ULL;
+    }
+    hash = v3_hash_combine64(hash, v3_fnv1a64(current_function->symbol_text));
+    hash = v3_hash_combine64(hash, v3_fnv1a64(expr_text));
+    hash = v3_hash_combine64(hash, (uint64_t)source_line);
+    hash = v3_hash_combine64(hash, (uint64_t)local_count);
+    return hash;
+}
+
+static bool v3_expr_type_cache_get(const V3LoweredFunctionStub *current_function,
+                                   size_t source_line,
+                                   size_t local_count,
+                                   const char *expr_text,
+                                   char *type_out,
+                                   size_t type_cap,
+                                   char *abi_out,
+                                   size_t abi_cap) {
+    uint64_t hash;
+    size_t probe;
+    size_t mask = CHENG_V3_MAX_EXPR_TYPE_CACHE - 1U;
+    if (current_function == NULL ||
+        expr_text == NULL || expr_text[0] == '\0' ||
+        type_out == NULL || abi_out == NULL) {
+        return false;
+    }
+    hash = v3_expr_type_cache_key_hash(current_function, source_line, local_count, expr_text);
+    if (hash == 0ULL) {
+        return false;
+    }
+    for (probe = 0U; probe < CHENG_V3_MAX_EXPR_TYPE_CACHE; ++probe) {
+        size_t index = ((size_t)hash + probe) & mask;
+        const V3ExprTypeCacheEntry *entry = &g_v3_expr_type_cache[index];
+        if (!entry->occupied) {
+            return false;
+        }
+        if (entry->key_hash != hash ||
+            entry->source_line != source_line ||
+            entry->local_count != local_count ||
+            strcmp(entry->function_symbol, current_function->symbol_text) != 0 ||
+            strcmp(entry->expr_text, expr_text) != 0) {
+            continue;
+        }
+        snprintf(type_out, type_cap, "%s", entry->type_text);
+        snprintf(abi_out, abi_cap, "%s", entry->abi_class);
+        return true;
+    }
+    return false;
+}
+
+static void v3_expr_type_cache_store(const V3LoweredFunctionStub *current_function,
+                                     size_t source_line,
+                                     size_t local_count,
+                                     const char *expr_text,
+                                     const char *type_text,
+                                     const char *abi_class) {
+    uint64_t hash;
+    size_t probe;
+    size_t mask = CHENG_V3_MAX_EXPR_TYPE_CACHE - 1U;
+    size_t replace_index;
+    V3ExprTypeCacheEntry *entry = NULL;
+    if (current_function == NULL ||
+        expr_text == NULL || expr_text[0] == '\0' ||
+        type_text == NULL || type_text[0] == '\0' ||
+        abi_class == NULL || abi_class[0] == '\0') {
+        return;
+    }
+    hash = v3_expr_type_cache_key_hash(current_function, source_line, local_count, expr_text);
+    if (hash == 0ULL) {
+        return;
+    }
+    replace_index = (size_t)hash & mask;
+    for (probe = 0U; probe < CHENG_V3_MAX_EXPR_TYPE_CACHE; ++probe) {
+        size_t index = ((size_t)hash + probe) & mask;
+        entry = &g_v3_expr_type_cache[index];
+        if (!entry->occupied ||
+            (entry->key_hash == hash &&
+             entry->source_line == source_line &&
+             entry->local_count == local_count &&
+             strcmp(entry->function_symbol, current_function->symbol_text) == 0 &&
+             strcmp(entry->expr_text, expr_text) == 0)) {
+            replace_index = index;
+            break;
+        }
+    }
+    entry = &g_v3_expr_type_cache[replace_index];
+    memset(entry, 0, sizeof(*entry));
+    entry->occupied = true;
+    entry->key_hash = hash;
+    entry->source_line = source_line;
+    entry->local_count = local_count;
+    snprintf(entry->function_symbol, sizeof(entry->function_symbol), "%s", current_function->symbol_text);
+    snprintf(entry->expr_text, sizeof(entry->expr_text), "%s", expr_text);
+    snprintf(entry->type_text, sizeof(entry->type_text), "%s", type_text);
+    snprintf(entry->abi_class, sizeof(entry->abi_class), "%s", abi_class);
+}
+
+static bool v3_expr_surface_cache_get(const char *expr_text,
+                                      V3ExprSurface *surface_out) {
+    uint64_t hash;
+    size_t i;
+    if (expr_text == NULL || expr_text[0] == '\0' || surface_out == NULL) {
+        return false;
+    }
+    hash = v3_fnv1a64(expr_text);
+    for (i = 0U; i < g_v3_expr_surface_cache_count; ++i) {
+        if (g_v3_expr_surface_cache[i].key_hash != hash ||
+            strcmp(g_v3_expr_surface_cache[i].expr_text, expr_text) != 0) {
+            continue;
+        }
+        memcpy(surface_out, &g_v3_expr_surface_cache[i].surface, sizeof(*surface_out));
+        return true;
+    }
+    return false;
+}
+
+static void v3_expr_surface_cache_store(const char *expr_text,
+                                        const V3ExprSurface *surface) {
+    V3ExprSurfaceCacheEntry *entry = NULL;
+    uint64_t hash;
+    size_t i;
+    if (expr_text == NULL || expr_text[0] == '\0' || surface == NULL) {
+        return;
+    }
+    hash = v3_fnv1a64(expr_text);
+    for (i = 0U; i < g_v3_expr_surface_cache_count; ++i) {
+        if (g_v3_expr_surface_cache[i].key_hash == hash &&
+            strcmp(g_v3_expr_surface_cache[i].expr_text, expr_text) == 0) {
+            return;
+        }
+    }
+    if (g_v3_expr_surface_cache_count >= CHENG_V3_MAX_EXPR_SURFACE_CACHE) {
+        return;
+    }
+    entry = &g_v3_expr_surface_cache[g_v3_expr_surface_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->key_hash = hash;
+    snprintf(entry->expr_text, sizeof(entry->expr_text), "%s", expr_text);
+    memcpy(&entry->surface, surface, sizeof(entry->surface));
+}
+
 static bool v3_classify_expr_surface(const char *expr_text,
                                      V3ExprSurface *surface,
                                      char *error_out,
                                      size_t error_cap) {
     char current[8192];
+    char cache_key[8192];
     char rewritten[32768];
     char outer[8192];
     char fmt_error[256];
@@ -4338,8 +4941,6 @@ static bool v3_classify_expr_surface(const char *expr_text,
     char end_expr[4096];
     char callee[PATH_MAX];
     char arg_text[4096] = {0};
-    char (*args)[4096] = NULL;
-    size_t arg_count = 0U;
     bool fmt_changed = false;
     size_t i;
     if (surface == NULL) {
@@ -4362,6 +4963,10 @@ static bool v3_classify_expr_surface(const char *expr_text,
         }
         return false;
     }
+    if (v3_expr_surface_cache_get(current, surface)) {
+        return true;
+    }
+    snprintf(cache_key, sizeof(cache_key), "%s", current);
     for (i = 0U; i < 16U; ++i) {
         if (!v3_expand_strformat_fmt_expr(current,
                                           rewritten,
@@ -4395,6 +5000,7 @@ static bool v3_classify_expr_surface(const char *expr_text,
                          surface->when_false,
                          sizeof(surface->when_false))) {
         surface->kind = V3_EXPR_SURFACE_IF;
+        v3_expr_surface_cache_store(cache_key, surface);
         return true;
     }
     if (v3_parse_ternary_expr(surface->text,
@@ -4405,6 +5011,7 @@ static bool v3_classify_expr_surface(const char *expr_text,
                               surface->when_false,
                               sizeof(surface->when_false))) {
         surface->kind = V3_EXPR_SURFACE_TERNARY;
+        v3_expr_surface_cache_store(cache_key, surface);
         return true;
     }
     if (v3_parse_range_expr(surface->text,
@@ -4416,20 +5023,28 @@ static bool v3_classify_expr_surface(const char *expr_text,
         surface->kind = V3_EXPR_SURFACE_RANGE;
         snprintf(surface->when_true, sizeof(surface->when_true), "%s", start_expr);
         snprintf(surface->when_false, sizeof(surface->when_false), "%s", end_expr);
+        v3_expr_surface_cache_store(cache_key, surface);
         return true;
     }
-    args = v3_alloc_call_arg_scratch();
-    if (v3_parse_call_text(surface->text,
-                           callee,
-                           sizeof(callee),
-                           args,
-                           &arg_count,
-                           CHENG_V3_MAX_CALL_ARGS) ||
-        v3_parse_prefix_single_arg_call(surface->text,
-                                        callee,
-                                        sizeof(callee),
-                                        arg_text,
-                                        sizeof(arg_text))) {
+    if (v3_parse_call_text_parts(surface->text,
+                                 callee,
+                                 sizeof(callee),
+                                 surface->call_args_text,
+                                 sizeof(surface->call_args_text))) {
+        if (!v3_count_top_level_args(surface->call_args_text, &surface->call_arg_count)) {
+            if (error_out && error_cap > 0U) {
+                snprintf(error_out, error_cap, "%s", "call_args_invalid");
+            }
+            return false;
+        }
+        snprintf(surface->call_callee, sizeof(surface->call_callee), "%s", callee);
+        surface->call_prefix_style = false;
+        surface->kind = V3_EXPR_SURFACE_CALL;
+    } else if (v3_parse_prefix_single_arg_call(surface->text,
+                                               callee,
+                                               sizeof(callee),
+                                               arg_text,
+                                               sizeof(arg_text))) {
         const char *base = strrchr(callee, '.');
         if (base != NULL) {
             base += 1;
@@ -4442,13 +5057,59 @@ static bool v3_classify_expr_surface(const char *expr_text,
                 }
             }
         }
+        snprintf(surface->call_callee, sizeof(surface->call_callee), "%s", callee);
+        snprintf(surface->call_args_text, sizeof(surface->call_args_text), "%s", arg_text);
+        surface->call_prefix_style = true;
+        surface->call_arg_count = 1U;
         surface->kind = V3_EXPR_SURFACE_CALL;
         surface->result_hint = v3_result_intrinsic_kind_from_name(base);
-        free(args);
+        v3_expr_surface_cache_store(cache_key, surface);
         return true;
     }
-    free(args);
+    if (surface->kind == V3_EXPR_SURFACE_CALL) {
+        const char *base = strrchr(surface->call_callee, '.');
+        if (base != NULL) {
+            base += 1;
+        } else {
+            base = surface->call_callee;
+            {
+                const char *scope = strrchr(base, ':');
+                if (scope && scope != base && scope[-1] == ':') {
+                    base = scope + 1;
+                }
+            }
+        }
+        surface->result_hint = v3_result_intrinsic_kind_from_name(base);
+        v3_expr_surface_cache_store(cache_key, surface);
+        return true;
+    }
+    v3_expr_surface_cache_store(cache_key, surface);
     return true;
+}
+
+static bool v3_split_expr_surface_call_args(const V3ExprSurface *surface,
+                                            char args[][4096],
+                                            size_t *arg_count,
+                                            size_t arg_cap) {
+    if (arg_count != NULL) {
+        *arg_count = 0U;
+    }
+    if (surface == NULL || surface->kind != V3_EXPR_SURFACE_CALL ||
+        args == NULL || arg_count == NULL) {
+        return false;
+    }
+    if (surface->call_arg_count == 0U) {
+        return surface->call_args_text[0] == '\0';
+    }
+    if (arg_cap < surface->call_arg_count) {
+        return false;
+    }
+    if (surface->call_prefix_style || surface->call_arg_count == 1U) {
+        snprintf(args[0], sizeof(args[0]), "%s", surface->call_args_text);
+        *arg_count = 1U;
+        return true;
+    }
+    return v3_split_top_level_args(surface->call_args_text, args, arg_count, arg_cap);
 }
 
 static bool v3_statement_has_incomplete_if_expr(const char *statement) {
@@ -5439,6 +6100,77 @@ static bool v3_resolve_call_target_with_args(const V3SystemLinkPlanStub *plan,
                                              const char args[][4096],
                                              size_t arg_count,
                                              V3AsmCallTarget *target);
+static bool v3_canonicalize_static_str_join_call(const char *owner_module_path,
+                                                 const V3ImportAlias *aliases,
+                                                 size_t alias_count,
+                                                 char *callee,
+                                                 size_t callee_cap,
+                                                 const char args[][4096],
+                                                 size_t *arg_count_io,
+                                                 bool *changed_out);
+static bool v3_build_native_str_eq_target(const V3SystemLinkPlanStub *plan,
+                                          V3AsmCallTarget *target);
+static bool v3_build_native_str_to_cstring_target(const V3SystemLinkPlanStub *plan,
+                                                  V3AsmCallTarget *target);
+static bool v3_build_native_copy_mem_target(const V3SystemLinkPlanStub *plan,
+                                            V3AsmCallTarget *target);
+static bool v3_build_native_strcmp_target(const V3SystemLinkPlanStub *plan,
+                                          V3AsmCallTarget *target);
+static bool v3_build_native_bounds_check_target(const V3SystemLinkPlanStub *plan,
+                                                V3AsmCallTarget *target);
+static bool v3_emit_native_bounds_check_call(const V3SystemLinkPlanStub *plan,
+                                             char *out,
+                                             size_t cap);
+static bool v3_emit_native_bounds_check_call_i32_i32(const V3SystemLinkPlanStub *plan,
+                                                     int len_reg,
+                                                     int index_reg,
+                                                     char *out,
+                                                     size_t cap);
+static bool v3_emit_native_copy_mem_call(const V3SystemLinkPlanStub *plan,
+                                         char *out,
+                                         size_t cap);
+static bool v3_emit_native_strcmp_call(const V3SystemLinkPlanStub *plan,
+                                       char *out,
+                                       size_t cap);
+static bool v3_emit_native_puts_reg0_call(const V3SystemLinkPlanStub *plan,
+                                          char *out,
+                                          size_t cap);
+static bool v3_emit_native_panic_cstring_reg0_call(const V3SystemLinkPlanStub *plan,
+                                                   char *out,
+                                                   size_t cap);
+static bool v3_resolve_index_expr_meta_common(const V3SystemLinkPlanStub *plan,
+                                              const V3LoweringPlanStub *lowering,
+                                              const V3LoweredFunctionStub *function,
+                                              const V3ImportAlias *aliases,
+                                              size_t alias_count,
+                                              const V3AsmLocalSlot *locals,
+                                              size_t local_count,
+                                              const char *expr_text,
+                                              char *base_expr_out,
+                                              size_t base_expr_cap,
+                                              char *index_expr_out,
+                                              size_t index_expr_cap,
+                                              char *base_type_out,
+                                              size_t base_type_cap,
+                                              char *base_abi_out,
+                                              size_t base_abi_cap,
+                                              char *normalized_base_type_out,
+                                              size_t normalized_base_type_cap,
+                                              char *elem_type_out,
+                                              size_t elem_type_cap,
+                                              char *elem_abi_out,
+                                              size_t elem_abi_cap,
+                                              int32_t *elem_size_out,
+                                              int32_t *data_field_offset_out,
+                                              int32_t *len_field_offset_out,
+                                              int32_t *fixed_len_out,
+                                              bool *base_is_fixed_array_out);
+static bool v3_build_native_puts_target(const V3SystemLinkPlanStub *plan,
+                                        V3AsmCallTarget *target);
+static bool v3_build_native_panic_cstring_target(const V3SystemLinkPlanStub *plan,
+                                                 V3AsmCallTarget *target);
+static bool v3_wasm_build_seq_set_grow_target(const V3SystemLinkPlanStub *plan,
+                                              V3AsmCallTarget *target);
 
 static V3CopyKind v3_result_intrinsic_projection_copy_kind(const V3LoweringPlanStub *lowering,
                                                            V3ResultIntrinsicKind kind,
@@ -5544,8 +6276,29 @@ static V3CallResultKind v3_function_call_result_kind(const V3LoweredFunctionStub
         : V3_CALL_RESULT_VALUE;
 }
 
-static bool v3_function_call_result_uses_address(const V3LoweredFunctionStub *function) {
-    return v3_function_call_result_kind(function) == V3_CALL_RESULT_ADDRESS;
+static void v3_native_function_lowering_rule_init(V3NativeFunctionLoweringRule *rule) {
+    if (rule == NULL) {
+        return;
+    }
+    memset(rule, 0, sizeof(*rule));
+    rule->supported = false;
+}
+
+static bool v3_build_native_function_lowering_rule(const V3LoweredFunctionStub *function,
+                                                   V3NativeFunctionLoweringRule *rule) {
+    if (function == NULL || rule == NULL) {
+        return false;
+    }
+    v3_native_function_lowering_rule_init(rule);
+    rule->return_pass_kind = v3_function_return_pass_kind(function);
+    rule->result_kind = v3_function_call_result_kind(function);
+    rule->supported = true;
+    return true;
+}
+
+static bool v3_native_function_rule_result_uses_address(const V3NativeFunctionLoweringRule *rule) {
+    return rule != NULL && rule->supported &&
+           rule->result_kind == V3_CALL_RESULT_ADDRESS;
 }
 
 static V3CallTargetReturnKind v3_call_target_return_kind(const V3AsmCallTarget *target) {
@@ -5584,10 +6337,6 @@ static V3CallResultKind v3_call_target_result_kind(const V3AsmCallTarget *target
         : V3_CALL_RESULT_VALUE;
 }
 
-static bool v3_call_target_result_uses_address(const V3AsmCallTarget *target) {
-    return v3_call_target_result_kind(target) == V3_CALL_RESULT_ADDRESS;
-}
-
 static void v3_native_call_lowering_rule_init(V3NativeCallLoweringRule *rule) {
     if (rule == NULL) {
         return;
@@ -5597,10 +6346,12 @@ static void v3_native_call_lowering_rule_init(V3NativeCallLoweringRule *rule) {
 }
 
 static V3NativeImportKind v3_native_call_target_import_kind(const V3AsmCallTarget *target) {
+    V3CallResultKind result_kind;
     if (target == NULL || !target->external || !target->c_abi) {
         return V3_NATIVE_IMPORT_NONE;
     }
-    return v3_call_target_result_uses_address(target)
+    result_kind = v3_call_target_result_kind(target);
+    return result_kind == V3_CALL_RESULT_ADDRESS
         ? V3_NATIVE_IMPORT_C_ABI_ADDRESS
         : V3_NATIVE_IMPORT_C_ABI_VALUE;
 }
@@ -5680,52 +6431,104 @@ static const char *v3_native_call_rule_arg_load_abi(const V3AsmCallTarget *targe
     return target->param_abi_classes[arg_index];
 }
 
-static bool v3_resolve_native_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+static bool v3_prepare_native_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
                                                            const V3LoweringPlanStub *lowering,
                                                            const V3LoweredFunctionStub *current_function,
                                                            const V3ImportAlias *aliases,
                                                            size_t alias_count,
                                                            const V3AsmLocalSlot *locals,
                                                            size_t local_count,
-                                                           const char *callee,
-                                                           const char args[][4096],
-                                                           size_t arg_count,
+                                                           char *callee,
+                                                           size_t callee_cap,
+                                                           char args[][4096],
+                                                           size_t *arg_count_io,
+                                                           const V3AsmCallTarget *preferred_target,
                                                            V3AsmCallTarget *target,
-                                                           V3NativeCallLoweringRule *rule) {
-    if (target == NULL || rule == NULL) {
+                                                           V3NativeCallLoweringRule *rule,
+                                                           bool *resolved_out) {
+    size_t arg_count = 0U;
+    bool call_rewritten = false;
+    if (plan == NULL || lowering == NULL || current_function == NULL ||
+        callee == NULL || callee_cap == 0U || arg_count_io == NULL ||
+        target == NULL || rule == NULL) {
         return false;
     }
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          current_function,
-                                          aliases,
-                                          alias_count,
-                                          locals,
-                                          local_count,
-                                          callee,
-                                          args,
-                                          arg_count,
-                                          target)) {
+    if (resolved_out != NULL) {
+        *resolved_out = false;
+    }
+    memset(target, 0, sizeof(*target));
+    memset(rule, 0, sizeof(*rule));
+    arg_count = *arg_count_io;
+    if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              callee,
+                                              callee_cap,
+                                              (const char (*)[4096])args,
+                                              &arg_count,
+                                              &call_rewritten)) {
         return false;
     }
-    return v3_build_native_call_lowering_rule(target, rule);
+    *arg_count_io = arg_count;
+    if (preferred_target != NULL && !call_rewritten) {
+        memcpy(target, preferred_target, sizeof(*target));
+    } else if (!v3_resolve_call_target_with_args(plan,
+                                                 lowering,
+                                                 current_function,
+                                                 aliases,
+                                                 alias_count,
+                                                 locals,
+                                                 local_count,
+                                                 callee,
+                                                 (const char (*)[4096])args,
+                                                 arg_count,
+                                                 target)) {
+        return resolved_out != NULL;
+    }
+    if (!v3_build_native_call_lowering_rule(target, rule)) {
+        return false;
+    }
+    if (resolved_out != NULL) {
+        *resolved_out = true;
+    }
+    return true;
 }
 
-static bool v3_resolve_native_composite_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+static bool v3_prepare_native_composite_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
                                                                      const V3LoweringPlanStub *lowering,
                                                                      const V3LoweredFunctionStub *current_function,
                                                                      const V3ImportAlias *aliases,
                                                                      size_t alias_count,
                                                                      const V3AsmLocalSlot *locals,
                                                                      size_t local_count,
-                                                                     const char *callee,
-                                                                     const char args[][4096],
-                                                                     size_t arg_count,
+                                                                     char *callee,
+                                                                     size_t callee_cap,
+                                                                     char args[][4096],
+                                                                     size_t *arg_count_io,
                                                                      V3AsmCallTarget *target,
-                                                                     V3NativeCompositeCallLoweringRule *rule) {
-    if (target == NULL || rule == NULL) {
+                                                                     V3NativeCompositeCallLoweringRule *rule,
+                                                                     bool *resolved_out) {
+    size_t arg_count = 0U;
+    if (plan == NULL || lowering == NULL || current_function == NULL ||
+        callee == NULL || callee_cap == 0U || arg_count_io == NULL ||
+        target == NULL || rule == NULL || resolved_out == NULL) {
         return false;
     }
+    *resolved_out = false;
+    arg_count = *arg_count_io;
+    if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              callee,
+                                              callee_cap,
+                                              (const char (*)[4096])args,
+                                              &arg_count,
+                                              NULL)) {
+        return false;
+    }
+    *arg_count_io = arg_count;
+    memset(target, 0, sizeof(*target));
+    memset(rule, 0, sizeof(*rule));
     if (!v3_resolve_call_target_with_args(plan,
                                           lowering,
                                           current_function,
@@ -5734,12 +6537,16 @@ static bool v3_resolve_native_composite_call_lowering_rule_with_args(const V3Sys
                                           locals,
                                           local_count,
                                           callee,
-                                          args,
+                                          (const char (*)[4096])args,
                                           arg_count,
                                           target)) {
+        return true;
+    }
+    if (!v3_build_native_composite_call_lowering_rule(target, rule)) {
         return false;
     }
-    return v3_build_native_composite_call_lowering_rule(target, rule);
+    *resolved_out = true;
+    return true;
 }
 
 static bool v3_is_internal_ref_type(const char *type_text) {
@@ -6588,6 +7395,12 @@ static bool v3_load_import_aliases_from_source_path(const char *source_path,
                                                     V3ImportAlias *aliases,
                                                     size_t *alias_count,
                                                     size_t alias_cap);
+static bool v3_load_import_aliases_from_loaded_lines(const char *source_path,
+                                                     char **lines,
+                                                     size_t line_count,
+                                                     V3ImportAlias *aliases,
+                                                     size_t *alias_count,
+                                                     size_t alias_cap);
 static bool v3_is_bare_identifier_text(const char *text);
 static int32_t v3_find_top_level_assignment_eq(const char *text);
 static bool v3_normalize_type_text_with_params(const V3LoweringPlanStub *lowering,
@@ -7616,11 +8429,16 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
     if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
     }
-    v3_parse_import_aliases_from_lines(lines,
-                                       line_count,
-                                       aliases,
-                                       &alias_count,
-                                       CHENG_V3_MAX_IMPORT_ALIASES);
+    if (!v3_load_import_aliases_from_loaded_lines(source_path,
+                                                  lines,
+                                                  line_count,
+                                                  aliases,
+                                                  &alias_count,
+                                                  CHENG_V3_MAX_IMPORT_ALIASES)) {
+        free(lines);
+        free(owned);
+        return false;
+    }
     while (i < line_count) {
         char line_copy[4096];
         char head_text[256];
@@ -12434,6 +13252,32 @@ static void v3_parse_import_aliases_from_lines(char **lines,
     }
 }
 
+static bool v3_load_import_aliases_from_loaded_lines(const char *source_path,
+                                                     char **lines,
+                                                     size_t line_count,
+                                                     V3ImportAlias *aliases,
+                                                     size_t *alias_count,
+                                                     size_t alias_cap) {
+    if (alias_count != NULL) {
+        *alias_count = 0U;
+    }
+    if (source_path == NULL || source_path[0] == '\0' ||
+        lines == NULL ||
+        aliases == NULL || alias_count == NULL) {
+        return false;
+    }
+    if (v3_import_alias_cache_get(source_path, aliases, alias_count, alias_cap)) {
+        return true;
+    }
+    v3_parse_import_aliases_from_lines(lines,
+                                       line_count,
+                                       aliases,
+                                       alias_count,
+                                       alias_cap);
+    v3_import_alias_cache_store(source_path, aliases, *alias_count);
+    return true;
+}
+
 static bool v3_load_import_aliases_from_source_path(const char *source_path,
                                                     V3ImportAlias *aliases,
                                                     size_t *alias_count,
@@ -12441,13 +13285,29 @@ static bool v3_load_import_aliases_from_source_path(const char *source_path,
     char *owned;
     char **lines;
     size_t line_count = 0U;
+    bool ok;
+    if (alias_count != NULL) {
+        *alias_count = 0U;
+    }
+    if (source_path == NULL || source_path[0] == '\0' ||
+        aliases == NULL || alias_count == NULL) {
+        return false;
+    }
+    if (v3_import_alias_cache_get(source_path, aliases, alias_count, alias_cap)) {
+        return true;
+    }
     if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
     }
-    v3_parse_import_aliases_from_lines(lines, line_count, aliases, alias_count, alias_cap);
+    ok = v3_load_import_aliases_from_loaded_lines(source_path,
+                                                  lines,
+                                                  line_count,
+                                                  aliases,
+                                                  alias_count,
+                                                  alias_cap);
     free(lines);
     free(owned);
-    return true;
+    return ok;
 }
 
 static const char *v3_alias_module_path(const V3ImportAlias *aliases,
@@ -14152,10 +15012,14 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
     char pending_symbol[PATH_MAX];
     bool pending_ffi_handle = false;
     int32_t pending_ffi_handle_consume_index = -1;
+    bool cached_found = false;
     if (source_path == NULL || source_path[0] == '\0' ||
         callee == NULL || callee[0] == '\0' ||
         target == NULL) {
         return false;
+    }
+    if (v3_importc_target_cache_lookup(source_path, callee, target, &cached_found)) {
+        return cached_found;
     }
     owned = v3_read_file(source_path);
     if (owned == NULL) {
@@ -14321,11 +15185,13 @@ static bool v3_resolve_importc_call_target_from_source_path(const V3SystemLinkPl
                          "cheng_ffi_handle_invalidate");
             }
             free(owned);
+            v3_importc_target_cache_store(source_path, callee, target, true);
             return true;
         }
         }
     }
     free(owned);
+    v3_importc_target_cache_store(source_path, callee, NULL, false);
     return false;
 }
 
@@ -15232,11 +16098,16 @@ static bool v3_refresh_function_callees(const V3LoweringPlanStub *lowering,
     }
     (void)param_names;
     (void)param_count;
-    v3_parse_import_aliases_from_lines(lines,
-                                       line_count,
-                                       aliases,
-                                       &alias_count,
-                                       CHENG_V3_MAX_IMPORT_ALIASES);
+    if (!v3_load_import_aliases_from_loaded_lines(owned_path,
+                                                  lines,
+                                                  line_count,
+                                                  aliases,
+                                                  &alias_count,
+                                                  CHENG_V3_MAX_IMPORT_ALIASES)) {
+        free(lines);
+        free(owned_lines);
+        return false;
+    }
     function->callee_count = 0U;
     {
         char signature_copy[8192];
@@ -15328,11 +16199,16 @@ static bool v3_seed_reachable_from_module_inits(const V3SystemLinkPlanStub *plan
                                       source_path,
                                       owner_module_path,
                                       sizeof(owner_module_path));
-        v3_parse_import_aliases_from_lines(lines,
-                                           line_count,
-                                           aliases,
-                                           &alias_count,
-                                           CHENG_V3_MAX_IMPORT_ALIASES);
+        if (!v3_load_import_aliases_from_loaded_lines(source_path,
+                                                      lines,
+                                                      line_count,
+                                                      aliases,
+                                                      &alias_count,
+                                                      CHENG_V3_MAX_IMPORT_ALIASES)) {
+            free(lines);
+            free(owned);
+            return false;
+        }
         memset(&synthetic_function, 0, sizeof(synthetic_function));
         snprintf(synthetic_function.source_path, sizeof(synthetic_function.source_path), "%s", source_path);
         snprintf(synthetic_function.owner_module_path,
@@ -16079,12 +16955,10 @@ static void v3_emit_x64_prepare_rdi_esi_q_d(char *out,
                         "  movq %s, %%rdi\n",
                         v3_x64_qreg_name(rdi_src_reg));
     }
-    if (safe_esi_src_reg != 15) {
-        v3_text_appendf(out,
-                        cap,
-                        "  movl %s, %%esi\n",
-                        v3_x64_dreg_name(safe_esi_src_reg));
-    }
+    v3_text_appendf(out,
+                    cap,
+                    "  movl %s, %%esi\n",
+                    v3_x64_dreg_name(safe_esi_src_reg));
 }
 
 static void v3_emit_x64_prepare_edi_esi_d_d(char *out,
@@ -16101,17 +16975,89 @@ static void v3_emit_x64_prepare_edi_esi_d_d(char *out,
                         v3_x64_qreg_name(scratch_reg));
         safe_esi_src_reg = scratch_reg;
     }
-    if (edi_src_reg != 14) {
-        v3_text_appendf(out,
-                        cap,
-                        "  movl %s, %%edi\n",
-                        v3_x64_dreg_name(edi_src_reg));
+    v3_text_appendf(out,
+                    cap,
+                    "  movl %s, %%edi\n",
+                    v3_x64_dreg_name(edi_src_reg));
+    v3_text_appendf(out,
+                    cap,
+                    "  movl %s, %%esi\n",
+                    v3_x64_dreg_name(safe_esi_src_reg));
+}
+
+static void v3_emit_arm64_prepare_x0_x1_q_q(char *out,
+                                            size_t cap,
+                                            int x0_src_reg,
+                                            int x1_src_reg) {
+    if (x0_src_reg != 0) {
+        v3_text_appendf(out, cap, "  mov x0, x%d\n", x0_src_reg);
     }
-    if (safe_esi_src_reg != 15) {
-        v3_text_appendf(out,
-                        cap,
-                        "  movl %s, %%esi\n",
-                        v3_x64_dreg_name(safe_esi_src_reg));
+    if (x1_src_reg != 1) {
+        v3_text_appendf(out, cap, "  mov x1, x%d\n", x1_src_reg);
+    }
+}
+
+static void v3_emit_arm64_prepare_x0_w1_q_d(char *out,
+                                            size_t cap,
+                                            int x0_src_reg,
+                                            int w1_src_reg) {
+    if (x0_src_reg != 0) {
+        v3_text_appendf(out, cap, "  mov x0, x%d\n", x0_src_reg);
+    }
+    if (w1_src_reg != 1) {
+        v3_text_appendf(out, cap, "  mov w1, w%d\n", w1_src_reg);
+    }
+}
+
+static void v3_emit_arm64_prepare_w0_w1_d_d(char *out,
+                                            size_t cap,
+                                            int w0_src_reg,
+                                            int w1_src_reg) {
+    if (w0_src_reg != 0) {
+        v3_text_appendf(out, cap, "  mov w0, w%d\n", w0_src_reg);
+    }
+    if (w1_src_reg != 1) {
+        v3_text_appendf(out, cap, "  mov w1, w%d\n", w1_src_reg);
+    }
+}
+
+static void v3_emit_arm64_prepare_x0_w1_w2_q_d_d(char *out,
+                                                  size_t cap,
+                                                  int x0_src_reg,
+                                                  int w1_src_reg,
+                                                  int w2_src_reg) {
+    if (x0_src_reg != 0) {
+        v3_text_appendf(out, cap, "  mov x0, x%d\n", x0_src_reg);
+    }
+    if (w1_src_reg != 1) {
+        v3_text_appendf(out, cap, "  mov w1, w%d\n", w1_src_reg);
+    }
+    if (w2_src_reg != 2) {
+        v3_text_appendf(out, cap, "  mov w2, w%d\n", w2_src_reg);
+    }
+}
+
+static void v3_emit_arm64_prepare_x0_w1_w2_w3_w4_q_d_d_d_d(char *out,
+                                                            size_t cap,
+                                                            int x0_src_reg,
+                                                            int w1_src_reg,
+                                                            int w2_src_reg,
+                                                            int w3_src_reg,
+                                                            int w4_src_reg) {
+    if (x0_src_reg != 0) {
+        v3_text_appendf(out, cap, "  mov x0, x%d\n", x0_src_reg);
+    }
+    if (w1_src_reg != 1) {
+        v3_text_appendf(out, cap, "  mov w1, w%d\n", w1_src_reg);
+    }
+    if (w2_src_reg != 2) {
+        v3_text_appendf(out, cap, "  mov w2, w%d\n", w2_src_reg);
+    }
+    if (w3_src_reg != 3) {
+        v3_text_appendf(out, cap, "  mov w3, w%d\n", w3_src_reg);
+    }
+    if (w4_src_reg != 4) {
+        v3_text_appendf(out, cap, "  mov w4, w%d\n", w4_src_reg);
     }
 }
 
@@ -17495,13 +18441,11 @@ static bool v3_find_top_level_var_decl(const V3SystemLinkPlanStub *plan,
                                        char *abi_out,
                                        size_t abi_cap) {
     char source_path[PATH_MAX];
-    char **lines = NULL;
-    char *owned = NULL;
-    size_t line_count = 0U;
+    const V3TopLevelVarDecl *decls = NULL;
+    size_t decl_count = 0U;
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     size_t i;
-    bool in_var_block = false;
     if (!plan || !lowering || !owner_module_path || !type_out || !abi_out ||
         !v3_is_bare_identifier_text(var_name)) {
         return false;
@@ -17514,95 +18458,29 @@ static bool v3_find_top_level_var_decl(const V3SystemLinkPlanStub *plan,
                                   sizeof(source_path));
     if (source_path[0] == '\0' ||
         !v3_path_exists_nonempty(source_path) ||
-        !v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
+        !v3_load_top_level_var_decls_from_source_path(source_path, &decls, &decl_count) ||
+        !v3_load_import_aliases_from_source_path(source_path,
+                                                aliases,
+                                                &alias_count,
+                                                CHENG_V3_MAX_IMPORT_ALIASES)) {
         return false;
     }
-    v3_parse_import_aliases_from_lines(lines,
-                                       line_count,
-                                       aliases,
-                                       &alias_count,
-                                       CHENG_V3_MAX_IMPORT_ALIASES);
-    for (i = 0; i < line_count; ++i) {
-        char line_copy[4096];
-        char name[128];
-        char raw_type[256];
-        char expr[4096];
+    for (i = 0U; i < decl_count; ++i) {
         char normalized_type[256];
-        bool has_init = false;
-        int32_t indent;
-        char *trimmed;
-        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
-        indent = v3_line_indent(line_copy);
-        trimmed = v3_trim_inplace(line_copy);
-        if (*trimmed == '\0' || *trimmed == '#') {
-            continue;
-        }
-        if (indent <= 0 &&
-            v3_startswith(trimmed, "var ") &&
-            v3_parse_top_level_var_binding_text(trimmed + 4,
-                                                name,
-                                                sizeof(name),
-                                                raw_type,
-                                                sizeof(raw_type),
-                                                &has_init,
-                                                expr,
-                                                sizeof(expr))) {
-            if (strcmp(name, var_name) == 0 &&
-                raw_type[0] != '\0' &&
-                v3_normalize_type_text(lowering,
-                                       owner_module_path,
-                                       aliases,
-                                       alias_count,
-                                       raw_type,
-                                       normalized_type,
-                                       sizeof(normalized_type))) {
-                snprintf(type_out, type_cap, "%s", normalized_type);
-                snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_type));
-                free(lines);
-                free(owned);
-                return true;
-            }
-            continue;
-        }
-        if (indent <= 0 && strcmp(trimmed, "var") == 0) {
-            in_var_block = true;
-            continue;
-        }
-        if (!in_var_block) {
-            continue;
-        }
-        if (indent <= 0) {
-            in_var_block = false;
-            continue;
-        }
-        if (!v3_parse_top_level_var_binding_text(trimmed,
-                                                 name,
-                                                 sizeof(name),
-                                                 raw_type,
-                                                 sizeof(raw_type),
-                                                 &has_init,
-                                                 expr,
-                                                 sizeof(expr))) {
-            continue;
-        }
-        if (strcmp(name, var_name) == 0 &&
-            raw_type[0] != '\0' &&
+        if (strcmp(decls[i].name, var_name) == 0 &&
+            decls[i].raw_type[0] != '\0' &&
             v3_normalize_type_text(lowering,
                                    owner_module_path,
                                    aliases,
                                    alias_count,
-                                   raw_type,
+                                   decls[i].raw_type,
                                    normalized_type,
                                    sizeof(normalized_type))) {
             snprintf(type_out, type_cap, "%s", normalized_type);
             snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_type));
-            free(lines);
-            free(owned);
             return true;
         }
     }
-    free(lines);
-    free(owned);
     return false;
 }
 
@@ -17642,13 +18520,11 @@ static bool v3_append_module_global_storage(const V3SystemLinkPlanStub *plan,
                                             char *out,
                                             size_t cap) {
     char owner_module_path[PATH_MAX];
-    char **lines = NULL;
-    char *owned = NULL;
-    size_t line_count = 0U;
+    const V3TopLevelVarDecl *decls = NULL;
+    size_t decl_count = 0U;
     V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
     size_t alias_count = 0U;
     size_t i;
-    bool in_var_block = false;
     bool emitted_any = false;
     v3_source_path_to_module_path(plan->workspace_root,
                                   plan->package_root,
@@ -17657,58 +18533,24 @@ static bool v3_append_module_global_storage(const V3SystemLinkPlanStub *plan,
                                   owner_module_path,
                                   sizeof(owner_module_path));
     if (!v3_path_exists_nonempty(source_path) ||
-        !v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
+        !v3_load_top_level_var_decls_from_source_path(source_path, &decls, &decl_count) ||
+        !v3_load_import_aliases_from_source_path(source_path,
+                                                aliases,
+                                                &alias_count,
+                                                CHENG_V3_MAX_IMPORT_ALIASES)) {
         return false;
     }
-    v3_parse_import_aliases_from_lines(lines,
-                                       line_count,
-                                       aliases,
-                                       &alias_count,
-                                       CHENG_V3_MAX_IMPORT_ALIASES);
-    for (i = 0; i < line_count; ++i) {
-        char line_copy[4096];
-        char name[128];
-        char raw_type[256];
-        char expr[4096];
+    for (i = 0U; i < decl_count; ++i) {
         char normalized_type[256];
         char symbol_name[PATH_MAX];
         V3TypeLayoutStub layout;
-        bool has_init = false;
-        int32_t indent;
         int32_t align_log2 = 0;
-        char *trimmed;
-        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
-        indent = v3_line_indent(line_copy);
-        trimmed = v3_trim_inplace(line_copy);
-        if (*trimmed == '\0' || *trimmed == '#') {
-            continue;
-        }
-        if (indent <= 0 && strcmp(trimmed, "var") == 0) {
-            in_var_block = true;
-            continue;
-        }
-        if (indent <= 0 && !v3_startswith(trimmed, "var ")) {
-            in_var_block = false;
-        }
-        if (indent <= 0 && v3_startswith(trimmed, "var ")) {
-            trimmed += 4;
-        } else if (!in_var_block || indent <= 0) {
-            continue;
-        }
-        if (!v3_parse_top_level_var_binding_text(trimmed,
-                                                 name,
-                                                 sizeof(name),
-                                                 raw_type,
-                                                 sizeof(raw_type),
-                                                 &has_init,
-                                                 expr,
-                                                 sizeof(expr)) ||
-            raw_type[0] == '\0' ||
+        if (decls[i].raw_type[0] == '\0' ||
             !v3_normalize_type_text(lowering,
                                     owner_module_path,
                                     aliases,
                                     alias_count,
-                                    raw_type,
+                                    decls[i].raw_type,
                                     normalized_type,
                                     sizeof(normalized_type)) ||
             !v3_compute_type_layout_impl(lowering, normalized_type, &layout, 0U)) {
@@ -17717,7 +18559,11 @@ static bool v3_append_module_global_storage(const V3SystemLinkPlanStub *plan,
         while ((1 << align_log2) < layout.align && align_log2 < 15) {
             align_log2 += 1;
         }
-        v3_global_var_symbol_name(plan, owner_module_path, name, symbol_name, sizeof(symbol_name));
+        v3_global_var_symbol_name(plan,
+                                  owner_module_path,
+                                  decls[i].name,
+                                  symbol_name,
+                                  sizeof(symbol_name));
         if (!emitted_any) {
             strncat(out, ".data\n", cap - strlen(out) - 1U);
             emitted_any = true;
@@ -17733,8 +18579,6 @@ static bool v3_append_module_global_storage(const V3SystemLinkPlanStub *plan,
                         symbol_name,
                         layout.size > 0 ? layout.size : 1);
     }
-    free(lines);
-    free(owned);
     return true;
 }
 
@@ -19043,6 +19887,84 @@ static bool v3_prepare_composite_call_arg_temp(const V3SystemLinkPlanStub *plan,
     return true;
 }
 
+static bool v3_prepare_composite_expr_temp_known(const V3SystemLinkPlanStub *plan,
+                                                 const V3LoweringPlanStub *lowering,
+                                                 const V3LoweredFunctionStub *current_function,
+                                                 const V3ImportAlias *aliases,
+                                                 size_t alias_count,
+                                                 V3AsmLocalSlot *locals,
+                                                 size_t *local_count,
+                                                 size_t local_cap,
+                                                 int32_t *next_offset_io,
+                                                 const char *expr_text,
+                                                 const char *known_type,
+                                                 const char *known_abi,
+                                                 char *canonical_expr_out,
+                                                 size_t canonical_expr_cap,
+                                                 char *temp_name_out,
+                                                 size_t temp_name_cap) {
+    char canonical_expr[8192];
+    char temp_name[128];
+    char inferred_type[256];
+    char inferred_abi[32];
+    const char *resolved_type = known_type;
+    const char *resolved_abi = known_abi;
+    char *canonical_expr_ptr = canonical_expr_out ? canonical_expr_out : canonical_expr;
+    size_t canonical_expr_ptr_cap =
+        canonical_expr_out && canonical_expr_cap > 0U ? canonical_expr_cap : sizeof(canonical_expr);
+    char *temp_name_ptr = temp_name_out ? temp_name_out : temp_name;
+    size_t temp_name_ptr_cap =
+        temp_name_out && temp_name_cap > 0U ? temp_name_cap : sizeof(temp_name);
+    if (expr_text == NULL || expr_text[0] == '\0' ||
+        current_function == NULL || lowering == NULL ||
+        locals == NULL || local_count == NULL ||
+        canonical_expr_ptr_cap == 0U || temp_name_ptr_cap == 0U) {
+        return false;
+    }
+    v3_copy_expr_temp_key_text(expr_text, canonical_expr_ptr, canonical_expr_ptr_cap);
+    if (v3_find_local_slot(locals, *local_count, canonical_expr_ptr) >= 0) {
+        return true;
+    }
+    v3_expr_temp_name(current_function, canonical_expr_ptr, temp_name_ptr, temp_name_ptr_cap);
+    if (v3_find_local_slot(locals, *local_count, temp_name_ptr) >= 0) {
+        return true;
+    }
+    if (resolved_type == NULL || resolved_type[0] == '\0' ||
+        resolved_abi == NULL || resolved_abi[0] == '\0') {
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                *local_count,
+                                canonical_expr_ptr,
+                                inferred_type,
+                                sizeof(inferred_type),
+                                inferred_abi,
+                                sizeof(inferred_abi))) {
+            return false;
+        }
+        resolved_type = inferred_type;
+        resolved_abi = inferred_abi;
+    }
+    if (!v3_expr_materializes_to_address(resolved_type, resolved_abi)) {
+        return true;
+    }
+    return v3_add_local_slot_for_type(lowering,
+                                      current_function->owner_module_path,
+                                      aliases,
+                                      alias_count,
+                                      locals,
+                                      local_count,
+                                      local_cap,
+                                      temp_name_ptr,
+                                      resolved_type,
+                                      resolved_abi,
+                                      false,
+                                      next_offset_io);
+}
+
 static bool v3_prepare_composite_expr_temp(const V3SystemLinkPlanStub *plan,
                                            const V3LoweringPlanStub *lowering,
                                            const V3LoweredFunctionStub *current_function,
@@ -19053,47 +19975,32 @@ static bool v3_prepare_composite_expr_temp(const V3SystemLinkPlanStub *plan,
                                            size_t local_cap,
                                            int32_t *next_offset_io,
                                            const char *expr_text) {
-    char canonical_expr[8192];
-    char temp_name[128];
-    char inferred_type[256];
-    char inferred_abi[32];
-    v3_copy_expr_temp_key_text(expr_text, canonical_expr, sizeof(canonical_expr));
-    if (v3_find_local_slot(locals, *local_count, canonical_expr) >= 0) {
-        return true;
-    }
-    v3_expr_temp_name(current_function, canonical_expr, temp_name, sizeof(temp_name));
-    if (v3_find_local_slot(locals, *local_count, temp_name) >= 0) {
-        return true;
-    }
-    if (!v3_infer_expr_type(plan,
-                            lowering,
-                            current_function,
-                            aliases,
-                            alias_count,
-                            locals,
-                            *local_count,
-                            canonical_expr,
-                            inferred_type,
-                            sizeof(inferred_type),
-                            inferred_abi,
-                            sizeof(inferred_abi))) {
+    return v3_prepare_composite_expr_temp_known(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                local_cap,
+                                                next_offset_io,
+                                                expr_text,
+                                                NULL,
+                                                NULL,
+                                                NULL,
+                                                0U,
+                                                NULL,
+                                                0U);
+}
+
+static bool v3_expr_surface_never_lvalue(const V3ExprSurface *surface) {
+    if (surface == NULL) {
         return false;
     }
-    if (!v3_expr_materializes_to_address(inferred_type, inferred_abi)) {
-        return true;
-    }
-    return v3_add_local_slot_for_type(lowering,
-                                      current_function->owner_module_path,
-                                      aliases,
-                                      alias_count,
-                                      locals,
-                                      local_count,
-                                      local_cap,
-                                      temp_name,
-                                      inferred_type,
-                                      inferred_abi,
-                                      false,
-                                      next_offset_io);
+    return surface->kind == V3_EXPR_SURFACE_IF ||
+           surface->kind == V3_EXPR_SURFACE_TERNARY ||
+           surface->kind == V3_EXPR_SURFACE_RANGE ||
+           surface->kind == V3_EXPR_SURFACE_CALL;
 }
 
 static bool v3_emit_direct_composite_call_arg_address(const V3SystemLinkPlanStub *plan,
@@ -19563,6 +20470,11 @@ static bool v3_add_local_slot_for_type(const V3LoweringPlanStub *lowering,
 }
 
 static bool v3_emit_sp_offset_address(char *out, size_t cap, int dst_reg, int32_t offset);
+static bool v3_emit_add_address_offset(char *out,
+                                       size_t cap,
+                                       int dst_reg,
+                                       int src_reg,
+                                       int32_t offset);
 static bool v3_emit_slot_address(char *out,
                                  size_t cap,
                                  const V3AsmLocalSlot *slot,
@@ -19603,6 +20515,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                      size_t alias_count,
                                      const V3AsmCallTarget *target,
                                      const V3NativeCallLoweringRule *rule,
+                                     V3NativeCompositeResultKind composite_result_kind,
                                      int32_t call_arg_base,
                                      int call_depth,
                                      char *out,
@@ -19613,150 +20526,100 @@ static bool v3_emit_local_value_address(char *out,
                                         size_t cap,
                                         const V3AsmLocalSlot *slot,
                                         int reg_index);
+static bool v3_emit_slot_address(char *out,
+                                 size_t cap,
+                                 const V3AsmLocalSlot *slot,
+                                 int reg_index);
+static bool v3_emit_mov_imm(char *out, size_t cap, int reg_index, int64_t value);
+
+static bool g_v3_current_frame_base_valid = false;
+static int32_t g_v3_current_frame_fp_to_base_offset = 0;
+
+static bool v3_emit_frame_base_address(char *out,
+                                       size_t cap,
+                                       int reg_index) {
+    if (!g_v3_current_frame_base_valid) {
+        return v3_emit_sp_offset_address(out, cap, reg_index, 0);
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        if (reg_index != 29) {
+            v3_text_appendf(out, cap,
+                            "  movq %%rbp, %s\n",
+                            v3_x64_qreg_name(reg_index));
+        }
+        return true;
+    }
+    if (g_v3_current_frame_fp_to_base_offset == 0) {
+        if (reg_index != 29) {
+            v3_text_appendf(out, cap, "  mov x%d, x29\n", reg_index);
+        }
+        return true;
+    }
+    if (reg_index == 29) {
+        return false;
+    }
+    if (g_v3_current_frame_fp_to_base_offset <= 4095) {
+        v3_text_appendf(out, cap,
+                        "  sub x%d, x29, #%d\n",
+                        reg_index,
+                        g_v3_current_frame_fp_to_base_offset);
+        return true;
+    }
+    {
+        int scratch_reg = reg_index == 17 ? 16 : 17;
+        if (!v3_emit_mov_imm(out, cap, scratch_reg, g_v3_current_frame_fp_to_base_offset)) {
+            return false;
+        }
+        v3_text_appendf(out, cap,
+                        "  sub x%d, x29, x%d\n",
+                        reg_index,
+                        scratch_reg);
+    }
+    return true;
+}
+
+static bool v3_emit_local_stack_address(char *out,
+                                        size_t cap,
+                                        const V3AsmLocalSlot *slot,
+                                        int reg_index) {
+    if (slot == NULL || slot->stack_offset < 0 ||
+        !v3_emit_frame_base_address(out, cap, reg_index)) {
+        return false;
+    }
+    if (slot->stack_offset == 0) {
+        return true;
+    }
+    return v3_emit_add_address_offset(out, cap, reg_index, reg_index, slot->stack_offset);
+}
 
 static void v3_emit_load_slot(char *out,
                               size_t cap,
                               const V3AsmLocalSlot *slot,
                               int reg_index) {
-    if (v3_active_target_is_linux_x86_64()) {
-        if (!slot || slot->stack_offset < 0) {
-            abort();
-        }
-        if (slot->indirect_value) {
-            v3_text_appendf(out, cap,
-                            "  movq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(16));
-            v3_emit_load_scalar_from_address(out, cap, 16, 0, slot->abi_class, reg_index);
-        } else if (strcmp(slot->abi_class, "ptr") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
-        } else if (strcmp(slot->abi_class, "i8") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movsbq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
-        } else if (strcmp(slot->abi_class, "u8") == 0 ||
-                   strcmp(slot->abi_class, "bool") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movzbl %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_dreg_name(reg_index));
-        } else if (strcmp(slot->abi_class, "i16") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movswq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
-        } else if (strcmp(slot->abi_class, "u16") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movzwl %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_dreg_name(reg_index));
-        } else if (strcmp(slot->abi_class, "i32") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movslq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
-        } else {
-            v3_text_appendf(out, cap,
-                            "  movq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
-        }
-        return;
-    }
-    if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
+    int addr_reg = reg_index == 16 ? 17 : 16;
+    if (!slot || slot->stack_offset < 0 ||
+        !v3_emit_local_stack_address(out, cap, slot, addr_reg)) {
         abort();
     }
     if (slot->indirect_value) {
-        v3_text_appendf(out, cap, "  ldr x16, [x16]\n");
-        v3_emit_load_scalar_from_address(out, cap, 16, 0, slot->abi_class, reg_index);
-    } else if (strcmp(slot->abi_class, "ptr") == 0) {
-        v3_text_appendf(out, cap, "  ldr x%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i8") == 0) {
-        v3_text_appendf(out, cap, "  ldrsb x%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "u8") == 0) {
-        v3_text_appendf(out, cap, "  ldrb w%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i16") == 0) {
-        v3_text_appendf(out, cap, "  ldrsh x%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "u16") == 0) {
-        v3_text_appendf(out, cap, "  ldrh w%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i32") == 0) {
-        v3_text_appendf(out, cap, "  ldrsw x%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "bool") == 0) {
-        v3_text_appendf(out, cap, "  ldrb w%d, [x16]\n", reg_index);
-    } else {
-        v3_text_appendf(out, cap, "  ldr x%d, [x16]\n", reg_index);
+        v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", addr_reg);
     }
+    v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, slot->abi_class, reg_index);
 }
 
 static void v3_emit_store_slot(char *out,
                                size_t cap,
                                const V3AsmLocalSlot *slot,
                                int reg_index) {
-    if (v3_active_target_is_linux_x86_64()) {
-        if (!slot || slot->stack_offset < 0) {
-            abort();
-        }
-        if (slot->indirect_value) {
-            v3_text_appendf(out, cap,
-                            "  movq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(16));
-            v3_emit_store_scalar_to_address(out, cap, 16, 0, slot->abi_class, reg_index);
-        } else if (strcmp(slot->abi_class, "ptr") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movq %s, %d(%%rsp)\n",
-                            v3_x64_qreg_name(reg_index),
-                            slot->stack_offset);
-        } else if (strcmp(slot->abi_class, "i8") == 0 ||
-                   strcmp(slot->abi_class, "u8") == 0 ||
-                   strcmp(slot->abi_class, "bool") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movb %s, %d(%%rsp)\n",
-                            v3_x64_breg_name(reg_index),
-                            slot->stack_offset);
-        } else if (strcmp(slot->abi_class, "i16") == 0 ||
-                   strcmp(slot->abi_class, "u16") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movw %s, %d(%%rsp)\n",
-                            v3_x64_hreg_name(reg_index),
-                            slot->stack_offset);
-        } else if (strcmp(slot->abi_class, "i32") == 0) {
-            v3_text_appendf(out, cap,
-                            "  movl %s, %d(%%rsp)\n",
-                            v3_x64_dreg_name(reg_index),
-                            slot->stack_offset);
-        } else {
-            v3_text_appendf(out, cap,
-                            "  movq %s, %d(%%rsp)\n",
-                            v3_x64_qreg_name(reg_index),
-                            slot->stack_offset);
-        }
-        return;
-    }
-    if (!slot || slot->stack_offset < 0 || !v3_emit_sp_offset_address(out, cap, 16, slot->stack_offset)) {
+    int addr_reg = reg_index == 16 ? 17 : 16;
+    if (!slot || slot->stack_offset < 0 ||
+        !v3_emit_local_stack_address(out, cap, slot, addr_reg)) {
         abort();
     }
     if (slot->indirect_value) {
-        v3_text_appendf(out, cap, "  ldr x16, [x16]\n");
-        v3_emit_store_scalar_to_address(out, cap, 16, 0, slot->abi_class, reg_index);
-    } else if (strcmp(slot->abi_class, "ptr") == 0) {
-        v3_text_appendf(out, cap, "  str x%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i8") == 0 ||
-               strcmp(slot->abi_class, "u8") == 0 ||
-               strcmp(slot->abi_class, "bool") == 0) {
-        v3_text_appendf(out, cap, "  strb w%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i16") == 0 ||
-               strcmp(slot->abi_class, "u16") == 0) {
-        v3_text_appendf(out, cap, "  strh w%d, [x16]\n", reg_index);
-    } else if (strcmp(slot->abi_class, "i32") == 0) {
-        v3_text_appendf(out, cap, "  str w%d, [x16]\n", reg_index);
-    } else {
-        v3_text_appendf(out, cap, "  str x%d, [x16]\n", reg_index);
+        v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", addr_reg);
     }
+    v3_emit_store_scalar_to_address(out, cap, addr_reg, 0, slot->abi_class, reg_index);
 }
 
 static bool v3_emit_local_value_address(char *out,
@@ -19766,21 +20629,56 @@ static bool v3_emit_local_value_address(char *out,
     if (slot == NULL) {
         return false;
     }
-    if (slot->indirect_value) {
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap,
-                            "  movq %d(%%rsp), %s\n",
-                            slot->stack_offset,
-                            v3_x64_qreg_name(reg_index));
+    return v3_emit_slot_address(out, cap, slot, reg_index);
+}
+
+static bool v3_emit_local_value_address_from_base(char *out,
+                                                  size_t cap,
+                                                  const V3AsmLocalSlot *slot,
+                                                  int base_reg,
+                                                  int reg_index) {
+    if (slot == NULL || slot->stack_offset < 0) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        if (slot->indirect_value) {
+            if (slot->stack_offset == 0) {
+                v3_text_appendf(out, cap,
+                                "  movq (%s), %s\n",
+                                v3_x64_qreg_name(base_reg),
+                                v3_x64_qreg_name(reg_index));
+            } else {
+                v3_text_appendf(out, cap,
+                                "  movq %d(%s), %s\n",
+                                slot->stack_offset,
+                                v3_x64_qreg_name(base_reg),
+                                v3_x64_qreg_name(reg_index));
+            }
             return true;
         }
-        if (!v3_emit_sp_offset_address(out, cap, reg_index, slot->stack_offset)) {
-            return false;
+        if (slot->stack_offset == 0) {
+            if (reg_index != base_reg) {
+                v3_text_appendf(out, cap,
+                                "  movq %s, %s\n",
+                                v3_x64_qreg_name(base_reg),
+                                v3_x64_qreg_name(reg_index));
+            }
+            return true;
         }
-        v3_text_appendf(out, cap, "  ldr x%d, [x%d]\n", reg_index, reg_index);
+        v3_text_appendf(out, cap,
+                        "  leaq %d(%s), %s\n",
+                        slot->stack_offset,
+                        v3_x64_qreg_name(base_reg),
+                        v3_x64_qreg_name(reg_index));
         return true;
     }
-    return v3_emit_slot_address(out, cap, slot, reg_index);
+    if (!v3_emit_add_address_offset(out, cap, reg_index, base_reg, slot->stack_offset)) {
+        return false;
+    }
+    if (slot->indirect_value) {
+        v3_text_appendf(out, cap, "  ldr x%d, [x%d]\n", reg_index, reg_index);
+    }
+    return true;
 }
 
 static const char *v3_param_pass_abi_class(const V3AsmLocalSlot *slot,
@@ -22082,7 +22980,9 @@ static bool v3_emit_copy_address_to_address(const V3SystemLinkPlanStub *plan,
         }
         v3_emit_x64_prepare_rdi_rsi_q_q(out, cap, dst_reg, src_reg);
         v3_text_appendf(out, cap, "  movl $%d, %%edx\n", size);
-        v3_emit_call_named_symbol(plan, out, cap, "copyMem");
+        if (!v3_emit_native_copy_mem_call(plan, out, cap)) {
+            return false;
+        }
         if (preserved_src_reg >= 0) {
             v3_text_appendf(out, cap,
                             "  movq %s, %s\n",
@@ -22097,17 +22997,70 @@ static bool v3_emit_copy_address_to_address(const V3SystemLinkPlanStub *plan,
         }
         return true;
     }
-    v3_text_appendf(out, cap,
-                    "  mov x0, x%d\n"
-                    "  mov x1, x%d\n",
-                    dst_reg,
-                    src_reg);
+    v3_emit_arm64_prepare_x0_x1_q_q(out, cap, dst_reg, src_reg);
     if (!v3_emit_mov_imm(out, cap, 2, size)) {
         return false;
     }
-    v3_emit_call_named_symbol(plan, out, cap, "copyMem");
+    if (!v3_emit_native_copy_mem_call(plan, out, cap)) {
+        return false;
+    }
     return true;
 }
+
+static bool v3_emit_bytes_orc_mem_call(const V3SystemLinkPlanStub *plan,
+                                       const char *symbol,
+                                       int ptr_reg,
+                                       char *out,
+                                       size_t cap) {
+    if (plan == NULL || symbol == NULL || symbol[0] == '\0' || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(ptr_reg));
+    } else if (ptr_reg != 0) {
+        v3_text_appendf(out, cap, "  mov x0, x%d\n", ptr_reg);
+    }
+    v3_emit_call_named_symbol(plan, out, cap, symbol);
+    return true;
+}
+
+static bool v3_emit_bytes_orc_ptr_call_if_non_nil(const V3SystemLinkPlanStub *plan,
+                                                  const char *symbol,
+                                                  int ptr_reg,
+                                                  char *out,
+                                                  size_t cap) {
+    int32_t label_id = v3_next_expr_label_id();
+    char skip_label[128];
+    snprintf(skip_label, sizeof(skip_label), "L_v3_bytes_orc_skip_%d", label_id);
+    v3_emit_branch_zero(out, cap, ptr_reg, true, skip_label);
+    if (!v3_emit_bytes_orc_mem_call(plan, symbol, ptr_reg, out, cap)) {
+        return false;
+    }
+    v3_text_appendf(out, cap, "%s:\n", skip_label);
+    return true;
+}
+
+static bool v3_type_needs_bytes_orc_lifecycle(const V3LoweringPlanStub *lowering,
+                                              const V3ImportAlias *aliases,
+                                              size_t alias_count,
+                                              const char *type_owner_module_path,
+                                              const char *type_text,
+                                              unsigned depth);
+static bool v3_emit_sp_adjust(char *out, size_t cap, bool subtract, int32_t amount);
+static bool v3_emit_bytes_orc_lifecycle_at_address(const V3SystemLinkPlanStub *plan,
+                                                   const V3LoweringPlanStub *lowering,
+                                                   const V3LoweredFunctionStub *current_function,
+                                                   const V3ImportAlias *aliases,
+                                                   size_t alias_count,
+                                                   const char *type_owner_module_path,
+                                                   const char *type_text,
+                                                   int addr_reg,
+                                                   int32_t call_arg_base,
+                                                   int call_depth,
+                                                   bool retain,
+                                                   char *out,
+                                                   size_t cap,
+                                                   unsigned depth);
 
 static bool v3_x64_external_memory_arg_stack_bytes(const V3LoweringPlanStub *lowering,
                                                    const V3LoweredFunctionStub *current_function,
@@ -22181,6 +23134,7 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
                                      size_t alias_count,
                                      const V3AsmCallTarget *target,
                                      const V3NativeCallLoweringRule *rule,
+                                     V3NativeCompositeResultKind composite_result_kind,
                                      int32_t call_arg_base,
                                      int call_depth,
                                      char *out,
@@ -22191,7 +23145,13 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
         rule->param_count != target->param_count) {
         return false;
     }
-    composite_return = v3_native_call_rule_result_uses_address(rule);
+    if (composite_result_kind != V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED &&
+        rule->result_kind != V3_CALL_RESULT_ADDRESS) {
+        return false;
+    }
+    composite_return =
+        composite_result_kind != V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED ||
+        rule->result_kind == V3_CALL_RESULT_ADDRESS;
     if (v3_active_target_is_linux_x86_64() &&
         rule->import_kind != V3_NATIVE_IMPORT_NONE) {
         int call_reg_count = v3_call_arg_reg_count_for_target(plan, composite_return);
@@ -22401,6 +23361,11 @@ static bool v3_emit_call_from_spills(const V3SystemLinkPlanStub *plan,
 
 static bool v3_emit_copy_slot_to_address(const V3SystemLinkPlanStub *plan,
                                          const V3LoweringPlanStub *lowering,
+                                         const V3LoweredFunctionStub *current_function,
+                                         const V3ImportAlias *aliases,
+                                         size_t alias_count,
+                                         int32_t call_arg_base,
+                                         int call_depth,
                                          char *out,
                                          size_t cap,
                                          const V3AsmLocalSlot *src_slot,
@@ -22431,6 +23396,115 @@ static bool v3_emit_copy_slot_to_address(const V3SystemLinkPlanStub *plan,
     src_reg = dst_reg == 14 ? 15 : 14;
     if (!v3_emit_local_value_address(out, cap, src_slot, src_reg)) {
         return false;
+    }
+    return v3_emit_copy_address_to_address(plan, out, cap, dst_reg, src_reg, copy_size);
+}
+
+static bool v3_emit_clone_slot_to_address_for_assignment(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         const V3LoweredFunctionStub *current_function,
+                                                         const V3ImportAlias *aliases,
+                                                         size_t alias_count,
+                                                         int32_t call_arg_base,
+                                                         int call_depth,
+                                                         char *out,
+                                                         size_t cap,
+                                                         const V3AsmLocalSlot *src_slot,
+                                                         int frame_base_reg,
+                                                         int dst_reg) {
+    V3TypeLayoutStub layout;
+    char value_type[256];
+    int32_t copy_size;
+    int src_reg;
+    if (!src_slot || src_slot->stack_size < 0 || !lowering || !current_function) {
+        return false;
+    }
+    if (src_slot->indirect_value) {
+        v3_strip_var_type_text(src_slot->type_text, value_type, sizeof(value_type));
+        if (!v3_compute_type_layout_impl(lowering, value_type, &layout, 0U)) {
+            return false;
+        }
+        copy_size = layout.size;
+        src_reg = dst_reg == 14 ? 15 : 14;
+        if (!((frame_base_reg >= 0) ?
+                  v3_emit_local_value_address_from_base(out,
+                                                        cap,
+                                                        src_slot,
+                                                        frame_base_reg,
+                                                        src_reg) :
+                  v3_emit_local_value_address(out, cap, src_slot, src_reg))) {
+            return false;
+        }
+        if (v3_type_needs_bytes_orc_lifecycle(lowering,
+                                              aliases,
+                                              alias_count,
+                                              current_function->owner_module_path,
+                                              value_type,
+                                              0U)) {
+            if (!v3_emit_sp_adjust(out, cap, true, 16) ||
+                !v3_emit_sp_store_reg(out, cap, 0, "ptr", src_reg) ||
+                !v3_emit_sp_store_reg(out, cap, 8, "ptr", dst_reg) ||
+                !v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                        lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        current_function->owner_module_path,
+                                                        value_type,
+                                                        src_reg,
+                                                        call_arg_base + 32,
+                                                        call_depth,
+                                                        true,
+                                                        out,
+                                                        cap,
+                                                        0U) ||
+                !v3_emit_sp_load_reg(out, cap, 0, "ptr", src_reg) ||
+                !v3_emit_sp_load_reg(out, cap, 8, "ptr", dst_reg) ||
+                !v3_emit_sp_adjust(out, cap, false, 16)) {
+                return false;
+            }
+        }
+        return v3_emit_copy_address_to_address(plan, out, cap, dst_reg, src_reg, copy_size);
+    }
+    copy_size = src_slot->stack_size;
+    src_reg = dst_reg == 14 ? 15 : 14;
+    if (!((frame_base_reg >= 0) ?
+              v3_emit_local_value_address_from_base(out,
+                                                    cap,
+                                                    src_slot,
+                                                    frame_base_reg,
+                                                    src_reg) :
+              v3_emit_local_value_address(out, cap, src_slot, src_reg))) {
+        return false;
+    }
+    if (v3_type_needs_bytes_orc_lifecycle(lowering,
+                                          aliases,
+                                          alias_count,
+                                          current_function->owner_module_path,
+                                          src_slot->type_text,
+                                          0U)) {
+        if (!v3_emit_sp_adjust(out, cap, true, 16) ||
+            !v3_emit_sp_store_reg(out, cap, 0, "ptr", src_reg) ||
+            !v3_emit_sp_store_reg(out, cap, 8, "ptr", dst_reg) ||
+            !v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                    lowering,
+                                                    current_function,
+                                                    aliases,
+                                                    alias_count,
+                                                    current_function->owner_module_path,
+                                                    src_slot->type_text,
+                                                    src_reg,
+                                                    call_arg_base + 32,
+                                                    call_depth,
+                                                    true,
+                                                    out,
+                                                    cap,
+                                                    0U) ||
+            !v3_emit_sp_load_reg(out, cap, 0, "ptr", src_reg) ||
+            !v3_emit_sp_load_reg(out, cap, 8, "ptr", dst_reg) ||
+            !v3_emit_sp_adjust(out, cap, false, 16)) {
+            return false;
+        }
     }
     return v3_emit_copy_address_to_address(plan, out, cap, dst_reg, src_reg, copy_size);
 }
@@ -23525,11 +24599,11 @@ static bool v3_emit_index_access_address(const V3SystemLinkPlanStub *plan,
     char normalized_base_type[256];
     char elem_type[256];
     char elem_abi[32];
-    V3TypeLayoutStub elem_layout;
     int32_t fixed_len = 0;
     int32_t local_index;
     int32_t elem_size = 0;
-    int data_offset = -1;
+    int32_t data_offset = -1;
+    int32_t len_field_offset = 0;
     bool base_is_fixed_array = false;
     const bool target_is_linux_x86_64 =
         plan != NULL && v3_target_is_linux_x86_64(plan->target_triple);
@@ -23567,59 +24641,33 @@ static bool v3_emit_index_access_address(const V3SystemLinkPlanStub *plan,
         }
     }
     v3_trim_copy_text(expr_text, expr, sizeof(expr));
-    if (!v3_parse_index_access_expr(expr, base_expr, sizeof(base_expr), index_expr, sizeof(index_expr)) ||
-        !v3_infer_expr_type(plan,
-                            lowering,
-                            current_function,
-                            aliases,
-                            alias_count,
-                            locals,
-                            local_count,
-                            base_expr,
-                            base_type,
-                            sizeof(base_type),
-                            base_abi,
-                            sizeof(base_abi)) ||
-        !v3_normalize_type_text(lowering,
-                                current_function->owner_module_path,
-                                aliases,
-                                alias_count,
-                                base_type,
-                                normalized_base_type,
-                                sizeof(normalized_base_type))) {
-        return false;
-    }
-    if (strcmp(normalized_base_type, "Bytes") == 0) {
-        snprintf(elem_type, sizeof(elem_type), "%s", "int32");
-        snprintf(elem_abi, sizeof(elem_abi), "%s", "i32");
-        elem_size = 1;
-        data_offset = 0;
-    } else if (strcmp(normalized_base_type, "str") == 0) {
-        snprintf(elem_type, sizeof(elem_type), "%s", "char");
-        snprintf(elem_abi, sizeof(elem_abi), "%s", "i32");
-        elem_size = 1;
-        data_offset = 0;
-    } else if (strlen(normalized_base_type) > 2U &&
-               strcmp(normalized_base_type + strlen(normalized_base_type) - 2U, "[]") == 0) {
-        snprintf(elem_type,
-                 sizeof(elem_type),
-                 "%.*s",
-                 (int)(strlen(normalized_base_type) - 2U),
-                 normalized_base_type);
-        snprintf(elem_abi, sizeof(elem_abi), "%s", v3_type_abi_class(elem_type));
-        if (!v3_compute_type_layout_impl(lowering, elem_type, &elem_layout, 0U)) {
-            return false;
-        }
-        elem_size = elem_layout.size;
-        data_offset = 8;
-    } else if (v3_parse_fixed_array_type(normalized_base_type, elem_type, sizeof(elem_type), &fixed_len)) {
-        base_is_fixed_array = true;
-        snprintf(elem_abi, sizeof(elem_abi), "%s", v3_type_abi_class(elem_type));
-        if (!v3_compute_type_layout_impl(lowering, elem_type, &elem_layout, 0U)) {
-            return false;
-        }
-        elem_size = elem_layout.size;
-    } else {
+    if (!v3_resolve_index_expr_meta_common(plan,
+                                           lowering,
+                                           current_function,
+                                           aliases,
+                                           alias_count,
+                                           locals,
+                                           local_count,
+                                           expr,
+                                           base_expr,
+                                           sizeof(base_expr),
+                                           index_expr,
+                                           sizeof(index_expr),
+                                           base_type,
+                                           sizeof(base_type),
+                                           base_abi,
+                                           sizeof(base_abi),
+                                           normalized_base_type,
+                                           sizeof(normalized_base_type),
+                                           elem_type,
+                                           sizeof(elem_type),
+                                           elem_abi,
+                                           sizeof(elem_abi),
+                                           &elem_size,
+                                           &data_offset,
+                                           &len_field_offset,
+                                           &fixed_len,
+                                           &base_is_fixed_array)) {
         return false;
     }
     local_index = v3_find_local_slot(locals, local_count, base_expr);
@@ -23723,27 +24771,23 @@ static bool v3_emit_index_access_address(const V3SystemLinkPlanStub *plan,
     if (elem_size <= 0) {
         return false;
     }
-    if (base_is_fixed_array || strcmp(normalized_base_type, "Bytes") == 0 || strcmp(normalized_base_type, "str") == 0 ||
-        (strlen(normalized_base_type) > 2U &&
-         strcmp(normalized_base_type + strlen(normalized_base_type) - 2U, "[]") == 0)) {
+    if (base_is_fixed_array || data_offset >= 0) {
         if (base_is_fixed_array) {
             if (!v3_emit_mov_imm(out, cap, size_reg, fixed_len)) {
                 return false;
             }
-        } else if (strcmp(normalized_base_type, "Bytes") == 0 || strcmp(normalized_base_type, "str") == 0) {
-            v3_emit_load_scalar_from_address(out, cap, base_reg, 8, "i32", size_reg);
         } else {
-            v3_emit_load_scalar_from_address(out, cap, base_reg, 0, "i32", size_reg);
+            v3_emit_load_scalar_from_address(out, cap, base_reg, len_field_offset, "i32", size_reg);
         }
         v3_emit_address_spill_store(out, cap, call_arg_base, call_depth, base_reg);
         v3_emit_index_spill_store(out, cap, call_arg_base, call_depth, index_reg);
-        if (target_is_linux_x86_64) {
-            v3_emit_x64_prepare_edi_esi_d_d(out, cap, size_reg, index_reg);
-        } else {
-            v3_text_appendf(out, cap, "  mov w0, w%d\n", size_reg);
-            v3_text_appendf(out, cap, "  mov w1, w%d\n", index_reg);
+        if (!v3_emit_native_bounds_check_call_i32_i32(plan,
+                                                      size_reg,
+                                                      index_reg,
+                                                      out,
+                                                      cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_bounds_check");
         v3_emit_address_spill_load(out, cap, call_arg_base, call_depth, base_reg);
         v3_emit_index_spill_load(out, cap, call_arg_base, call_depth, index_reg);
     }
@@ -24091,23 +25135,88 @@ static bool v3_emit_lvalue_address(const V3SystemLinkPlanStub *plan,
 
 typedef struct {
     char expr[8192];
-    char outer[8192];
     char base_name[256];
     char field_name[128];
     char index_expr[4096];
-    char if_cond[4096];
-    char if_true[4096];
-    char if_false[4096];
-    char ternary_cond[4096];
-    char ternary_true[4096];
-    char ternary_false[4096];
     char named_field[128];
     char named_expr[4096];
     char callee[PATH_MAX];
-    char arg_text[4096];
-    char args[CHENG_V3_MAX_CALL_ARGS][4096];
+    char (*args)[4096];
     V3ExprSurface surface;
 } V3ExprPrepScratch;
+
+typedef struct V3ExprPrepScratchNode {
+    V3ExprPrepScratch scratch;
+    struct V3ExprPrepScratchNode *next;
+} V3ExprPrepScratchNode;
+
+typedef struct V3ExprPrepArgsNode {
+    char args[CHENG_V3_MAX_CALL_ARGS][4096];
+    struct V3ExprPrepArgsNode *next;
+} V3ExprPrepArgsNode;
+
+static _Thread_local V3ExprPrepScratchNode *g_v3_expr_prep_scratch_free_list = NULL;
+static _Thread_local V3ExprPrepArgsNode *g_v3_expr_prep_args_free_list = NULL;
+
+static V3ExprPrepScratch *v3_acquire_expr_prep_scratch(void) {
+    V3ExprPrepScratchNode *node = g_v3_expr_prep_scratch_free_list;
+    if (node != NULL) {
+        g_v3_expr_prep_scratch_free_list = node->next;
+        node->next = NULL;
+        node->scratch.args = NULL;
+        return &node->scratch;
+    }
+    node = (V3ExprPrepScratchNode *)v3_xmalloc(sizeof(V3ExprPrepScratchNode));
+    node->next = NULL;
+    node->scratch.args = NULL;
+    return &node->scratch;
+}
+
+static char (*v3_acquire_expr_prep_args(void))[4096] {
+    V3ExprPrepArgsNode *node = g_v3_expr_prep_args_free_list;
+    if (node != NULL) {
+        g_v3_expr_prep_args_free_list = node->next;
+        node->next = NULL;
+        return node->args;
+    }
+    node = (V3ExprPrepArgsNode *)v3_xmalloc(sizeof(V3ExprPrepArgsNode));
+    node->next = NULL;
+    return node->args;
+}
+
+static void v3_release_expr_prep_args(char (*args)[4096]) {
+    V3ExprPrepArgsNode *node;
+    if (args == NULL) {
+        return;
+    }
+    node = (V3ExprPrepArgsNode *)args;
+    node->next = g_v3_expr_prep_args_free_list;
+    g_v3_expr_prep_args_free_list = node;
+}
+
+static char (*v3_ensure_expr_prep_args(V3ExprPrepScratch *scratch))[4096] {
+    if (scratch == NULL) {
+        return NULL;
+    }
+    if (scratch->args == NULL) {
+        scratch->args = v3_acquire_expr_prep_args();
+    }
+    return scratch->args;
+}
+
+static void v3_release_expr_prep_scratch(V3ExprPrepScratch *scratch) {
+    V3ExprPrepScratchNode *node;
+    if (scratch == NULL) {
+        return;
+    }
+    if (scratch->args != NULL) {
+        v3_release_expr_prep_args(scratch->args);
+        scratch->args = NULL;
+    }
+    node = (V3ExprPrepScratchNode *)scratch;
+    node->next = g_v3_expr_prep_scratch_free_list;
+    g_v3_expr_prep_scratch_free_list = node;
+}
 
 static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
                                        const V3LoweringPlanStub *lowering,
@@ -24139,20 +25248,12 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "xor", "&", "+", "-", "*", "/", "%"
     };
 #define expr (scratch->expr)
-#define outer (scratch->outer)
 #define base_name (scratch->base_name)
 #define field_name (scratch->field_name)
 #define index_expr (scratch->index_expr)
-#define if_cond (scratch->if_cond)
-#define if_true (scratch->if_true)
-#define if_false (scratch->if_false)
-#define ternary_cond (scratch->ternary_cond)
-#define ternary_true (scratch->ternary_true)
-#define ternary_false (scratch->ternary_false)
 #define named_field (scratch->named_field)
 #define named_expr (scratch->named_expr)
 #define callee (scratch->callee)
-#define arg_text (scratch->arg_text)
 #define args (scratch->args)
 #define surface (scratch->surface)
     if (call_depth > 128) {
@@ -24163,11 +25264,10 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                 expr_text ? expr_text : "-");
         return false;
     }
-    char surface_error[256];
     size_t arg_count = 0U;
     size_t i;
     bool parsed_call_expr = false;
-    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    snprintf(expr, sizeof(expr), "%s", expr_text ? expr_text : "");
     if (expr[0] == '\0') {
         return true;
     }
@@ -24192,10 +25292,6 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                           call_depth,
                                           max_call_depth_io);
     }
-    if (!v3_classify_expr_surface(expr, &surface, surface_error, sizeof(surface_error))) {
-        return false;
-    }
-    snprintf(expr, sizeof(expr), "%s", surface.text);
     if (surface.kind == V3_EXPR_SURFACE_IF || surface.kind == V3_EXPR_SURFACE_TERNARY) {
         return v3_prepare_expr_call_state(plan,
                                           lowering,
@@ -24379,9 +25475,16 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                      expr) != NULL) {
         return true;
     }
-    if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
-        v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
-        parsed_call_expr = true;
+    if (surface.kind == V3_EXPR_SURFACE_CALL) {
+        snprintf(callee, sizeof(callee), "%s", surface.call_callee);
+        if (v3_ensure_expr_prep_args(scratch) == NULL) {
+            return false;
+        }
+        parsed_call_expr =
+            v3_split_expr_surface_call_args(&surface, args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
+        if (!parsed_call_expr) {
+            return false;
+        }
     }
     if (!parsed_call_expr &&
         v3_parse_member_access_expr(expr, base_name, sizeof(base_name), field_name, sizeof(field_name))) {
@@ -24456,9 +25559,7 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
             return true;
         }
     }
-    if (parsed_call_expr ||
-        v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
-        v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+    if (parsed_call_expr) {
         V3AsmCallTarget target;
         V3NativeCallLoweringRule rule;
         bool has_target = false;
@@ -24466,10 +25567,6 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         V3ResultIntrinsicKind result_kind;
         const char *callee_base = NULL;
         int next_call_depth = call_depth + 1;
-        if (arg_count == 0U && arg_text[0] != '\0') {
-            snprintf(args[0], sizeof(args[0]), "%s", arg_text);
-            arg_count = 1U;
-        }
         if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
                                                   aliases,
                                                   alias_count,
@@ -24580,18 +25677,21 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                        callee);
         callee_base = strrchr(callee, '.');
         callee_base = callee_base ? callee_base + 1 : callee;
-        has_target = v3_resolve_call_target_with_args(plan,
-                                                      lowering,
-                                                      current_function,
-                                                      aliases,
-                                                      alias_count,
-                                                      locals,
-                                                      *local_count,
-                                                      callee,
-                                                      (const char (*)[4096])args,
-                                                      arg_count,
-                                                      &target);
-        if (has_target && !v3_build_native_call_lowering_rule(&target, &rule)) {
+        if (!v3_prepare_native_call_lowering_rule_with_args(plan,
+                                                            lowering,
+                                                            current_function,
+                                                            aliases,
+                                                            alias_count,
+                                                            locals,
+                                                            *local_count,
+                                                            callee,
+                                                            sizeof(callee),
+                                                            args,
+                                                            &arg_count,
+                                                            NULL,
+                                                            &target,
+                                                            &rule,
+                                                            &has_target)) {
             fprintf(stderr,
                     "[cheng_v3_seed] prepare call lowering rule failed caller=%s callee=%s\n",
                     current_function->symbol_text,
@@ -24695,20 +25795,12 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         }
     }
 #undef expr
-#undef outer
 #undef base_name
 #undef field_name
 #undef index_expr
-#undef if_cond
-#undef if_true
-#undef if_false
-#undef ternary_cond
-#undef ternary_true
-#undef ternary_false
 #undef named_field
 #undef named_expr
 #undef callee
-#undef arg_text
 #undef args
 #undef surface
     return true;
@@ -24728,12 +25820,21 @@ static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
                                        int32_t *max_call_depth_io) {
     char surface_error[256];
     char trimmed_expr[8192];
+    char temp_name[128];
     char expr_type[256];
     char expr_abi[32];
     char lvalue_type[256];
     char lvalue_abi[32];
-    V3ExprSurface surface;
-    if (!v3_classify_expr_surface(expr_text, &surface, surface_error, sizeof(surface_error))) {
+    V3ExprPrepScratch *scratch;
+    V3ExprSurface *surface;
+    v3_trim_copy_text(expr_text, trimmed_expr, sizeof(trimmed_expr));
+    if (trimmed_expr[0] == '\0') {
+        return true;
+    }
+    scratch = v3_acquire_expr_prep_scratch();
+    surface = &scratch->surface;
+    if (!v3_classify_expr_surface(trimmed_expr, surface, surface_error, sizeof(surface_error))) {
+        v3_release_expr_prep_scratch(scratch);
         fprintf(stderr,
                 "[cheng_v3_seed] expr surface classify failed function=%s expr=%s reason=%s\n",
                 current_function ? current_function->symbol_text : "-",
@@ -24741,8 +25842,6 @@ static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
                 surface_error[0] != '\0' ? surface_error : "invalid expr");
         return false;
     }
-    V3ExprPrepScratch *scratch = (V3ExprPrepScratch *)v3_xmalloc(sizeof(V3ExprPrepScratch));
-    memset(scratch, 0, sizeof(V3ExprPrepScratch));
     bool ok = v3_prepare_expr_call_state_impl(plan,
                                               lowering,
                                               current_function,
@@ -24752,32 +25851,38 @@ static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
                                               local_count,
                                               local_cap,
                                               next_offset_io,
-                                              surface.text,
+                                              surface->text,
                                               call_depth,
                                               max_call_depth_io,
                                               scratch);
-    free(scratch);
     if (!ok) {
+        v3_release_expr_prep_scratch(scratch);
         return false;
     }
-    if (surface.text[0] == '\0') {
+    if (surface->text[0] == '\0') {
+        v3_release_expr_prep_scratch(scratch);
         return true;
     }
-    v3_trim_copy_text(surface.text, trimmed_expr, sizeof(trimmed_expr));
-    if (trimmed_expr[0] == '\0' ||
-        v3_find_local_slot(locals, *local_count, trimmed_expr) >= 0 ||
-        v3_infer_lvalue_expr_type(plan,
-                                  lowering,
-                                  current_function,
-                                  aliases,
-                                  alias_count,
-                                  locals,
-                                  *local_count,
-                                  trimmed_expr,
-                                  lvalue_type,
-                                  sizeof(lvalue_type),
-                                  lvalue_abi,
-                                  sizeof(lvalue_abi))) {
+    snprintf(trimmed_expr, sizeof(trimmed_expr), "%s", surface->text);
+    if (trimmed_expr[0] == '\0') {
+        v3_release_expr_prep_scratch(scratch);
+        return true;
+    }
+    if (!v3_expr_surface_never_lvalue(surface) &&
+        (v3_find_local_slot(locals, *local_count, trimmed_expr) >= 0 ||
+         v3_infer_lvalue_expr_type(plan,
+                                   lowering,
+                                   current_function,
+                                   aliases,
+                                   alias_count,
+                                   locals,
+                                   *local_count,
+                                   trimmed_expr,
+                                   lvalue_type,
+                                   sizeof(lvalue_type),
+                                   lvalue_abi,
+                                   sizeof(lvalue_abi)))) {
+        v3_release_expr_prep_scratch(scratch);
         return true;
     }
     if (!v3_infer_expr_type(plan,
@@ -24793,20 +25898,29 @@ static bool v3_prepare_expr_call_state(const V3SystemLinkPlanStub *plan,
                             expr_abi,
                             sizeof(expr_abi)) ||
         !v3_expr_materializes_to_address(expr_type, expr_abi)) {
+        v3_release_expr_prep_scratch(scratch);
         return true;
     }
-    if (!v3_prepare_composite_expr_temp(plan,
-                                        lowering,
-                                        current_function,
-                                        aliases,
-                                        alias_count,
-                                        locals,
-                                        local_count,
-                                        local_cap,
-                                        next_offset_io,
-                                        trimmed_expr)) {
+    if (!v3_prepare_composite_expr_temp_known(plan,
+                                              lowering,
+                                              current_function,
+                                              aliases,
+                                              alias_count,
+                                              locals,
+                                              local_count,
+                                              local_cap,
+                                              next_offset_io,
+                                              trimmed_expr,
+                                              expr_type,
+                                              expr_abi,
+                                              trimmed_expr,
+                                              sizeof(trimmed_expr),
+                                              temp_name,
+                                              sizeof(temp_name))) {
+        v3_release_expr_prep_scratch(scratch);
         return true;
     }
+    v3_release_expr_prep_scratch(scratch);
     return true;
 }
 
@@ -25204,6 +26318,26 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                          int call_depth,
                                          char *out,
                                          size_t cap);
+static bool v3_codegen_call_into_address_resolved(const V3SystemLinkPlanStub *plan,
+                                                  const V3LoweringPlanStub *lowering,
+                                                  const V3LoweredFunctionStub *current_function,
+                                                  const V3ImportAlias *aliases,
+                                                  size_t alias_count,
+                                                  const V3AsmLocalSlot *locals,
+                                                  size_t local_count,
+                                                  const char *callee,
+                                                  char args[][4096],
+                                                  size_t arg_count,
+                                                  const V3AsmCallTarget *target,
+                                                  const V3NativeCompositeCallLoweringRule *composite_rule,
+                                                  int dest_addr_reg,
+                                                  int32_t call_arg_base,
+                                                  int32_t string_temp_base,
+                                                  int32_t string_temp_stride,
+                                                  int32_t *string_label_index_io,
+                                                  int call_depth,
+                                                  char *out,
+                                                  size_t cap);
 static bool v3_materialize_composite_expr_into_slot(const V3SystemLinkPlanStub *plan,
                                                     const V3LoweringPlanStub *lowering,
                                                     const V3LoweredFunctionStub *current_function,
@@ -25244,6 +26378,19 @@ static bool v3_emit_slot_address(char *out,
                                  const V3AsmLocalSlot *slot,
                                  int reg_index);
 
+static bool v3_infer_expr_type_impl(const V3SystemLinkPlanStub *plan,
+                                    const V3LoweringPlanStub *lowering,
+                                    const V3LoweredFunctionStub *current_function,
+                                    const V3ImportAlias *aliases,
+                                    size_t alias_count,
+                                    const V3AsmLocalSlot *locals,
+                                    size_t local_count,
+                                    const char *expr_text,
+                                    char *type_out,
+                                    size_t type_cap,
+                                    char *abi_out,
+                                    size_t abi_cap);
+
 static bool v3_infer_expr_type(const V3SystemLinkPlanStub *plan,
                                const V3LoweringPlanStub *lowering,
                                const V3LoweredFunctionStub *current_function,
@@ -25256,12 +26403,442 @@ static bool v3_infer_expr_type(const V3SystemLinkPlanStub *plan,
                                size_t type_cap,
                                char *abi_out,
                                size_t abi_cap) {
+    char trimmed_expr[8192];
+    size_t source_line = v3_current_source_line();
+    if (expr_text == NULL) {
+        return false;
+    }
+    v3_trim_copy_text(expr_text, trimmed_expr, sizeof(trimmed_expr));
+    if (trimmed_expr[0] == '\0') {
+        return false;
+    }
+    if (v3_expr_type_cache_get(current_function,
+                               source_line,
+                               local_count,
+                               trimmed_expr,
+                               type_out,
+                               type_cap,
+                               abi_out,
+                               abi_cap)) {
+        return true;
+    }
+    if (!v3_infer_expr_type_impl(plan,
+                                 lowering,
+                                 current_function,
+                                 aliases,
+                                 alias_count,
+                                 locals,
+                                 local_count,
+                                 trimmed_expr,
+                                 type_out,
+                                 type_cap,
+                                 abi_out,
+                                 abi_cap)) {
+        return false;
+    }
+    v3_expr_type_cache_store(current_function,
+                             source_line,
+                             local_count,
+                             trimmed_expr,
+                             type_out,
+                             abi_out);
+    return true;
+}
+
+static bool v3_infer_call_expr_type_from_args(const V3SystemLinkPlanStub *plan,
+                                              const V3LoweringPlanStub *lowering,
+                                              const V3LoweredFunctionStub *current_function,
+                                              const V3ImportAlias *aliases,
+                                              size_t alias_count,
+                                              const V3AsmLocalSlot *locals,
+                                              size_t local_count,
+                                              const char *expr_text,
+                                              const char *callee_text,
+                                              const char args[][4096],
+                                              size_t arg_count,
+                                              char *type_out,
+                                              size_t type_cap,
+                                              char *abi_out,
+                                              size_t abi_cap) {
+    V3AsmCallTarget target;
+    V3ResultIntrinsicKind result_kind;
+    char callee[PATH_MAX];
+    size_t i;
+    int32_t elem_size_value = 0;
+    bool has_named_fields = false;
+    if (callee_text == NULL || callee_text[0] == '\0') {
+        return false;
+    }
+    snprintf(callee, sizeof(callee), "%s", callee_text);
+    if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              callee,
+                                              sizeof(callee),
+                                              args,
+                                              &arg_count,
+                                              NULL)) {
+        return false;
+    }
+    result_kind =
+        v3_resolve_result_intrinsic_kind(lowering,
+                                         current_function->owner_module_path,
+                                         aliases,
+                                         alias_count,
+                                         callee);
+    if (arg_count == 0U &&
+        v3_resolve_bound_elem_size_value(lowering,
+                                         current_function,
+                                         aliases,
+                                         alias_count,
+                                         callee,
+                                         &elem_size_value)) {
+        snprintf(type_out, type_cap, "%s", "int32");
+        snprintf(abi_out, abi_cap, "%s", "i32");
+        return true;
+    }
+    for (i = 0; i < arg_count; ++i) {
+        if (v3_find_top_level_binary_op(args[i], ":") > 0) {
+            has_named_fields = true;
+            break;
+        }
+    }
+    if (has_named_fields) {
+        char duplicate_field[128];
+        bool named_fields_valid = true;
+        if (v3_find_duplicate_named_arg_field(args,
+                                              arg_count,
+                                              duplicate_field,
+                                              sizeof(duplicate_field),
+                                              &named_fields_valid)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] duplicate constructor field function=%s callee=%s field=%s expr=%s\n",
+                    current_function->symbol_text,
+                    callee,
+                    duplicate_field,
+                    expr_text ? expr_text : "-");
+            return false;
+        }
+        if (!named_fields_valid || !v3_named_arg_fields_unique(args, arg_count)) {
+            return false;
+        }
+    }
+    if (v3_is_tuple_type_text(callee) &&
+        !v3_tuple_args_cover_all_items(callee, args, arg_count)) {
+        fprintf(stderr,
+                "[cheng_v3_seed] tuple literal omission unsupported function=%s type=%s expr=%s\n",
+                current_function->symbol_text,
+                callee,
+                expr_text ? expr_text : "-");
+        return false;
+    }
+    if ((result_kind == V3_RESULT_INTRINSIC_IS_ERR ||
+         result_kind == V3_RESULT_INTRINSIC_IS_OK) && arg_count == 1U) {
+        char arg_type[256];
+        char arg_abi[32];
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                local_count,
+                                args[0],
+                                arg_type,
+                                sizeof(arg_type),
+                                arg_abi,
+                                sizeof(arg_abi)) ||
+            !v3_expr_materializes_to_address(arg_type, arg_abi) ||
+            !v3_startswith(arg_type, "Result[")) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", "bool");
+        snprintf(abi_out, abi_cap, "%s", "bool");
+        return true;
+    }
+    if ((result_kind == V3_RESULT_INTRINSIC_VALUE ||
+         result_kind == V3_RESULT_INTRINSIC_ERROR ||
+         result_kind == V3_RESULT_INTRINSIC_ERROR_TEXT ||
+         result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) && arg_count == 1U) {
+        char arg_type[256];
+        char arg_abi[32];
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                local_count,
+                                args[0],
+                                arg_type,
+                                sizeof(arg_type),
+                                arg_abi,
+                                sizeof(arg_abi)) ||
+            !v3_expr_materializes_to_address(arg_type, arg_abi) ||
+            !v3_startswith(arg_type, "Result[")) {
+            return false;
+        }
+        if (result_kind == V3_RESULT_INTRINSIC_VALUE) {
+            char inner_type[256];
+            if (!v3_parse_result_inner_type(arg_type, inner_type, sizeof(inner_type))) {
+                return false;
+            }
+            snprintf(type_out, type_cap, "%s", inner_type);
+            snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(inner_type));
+            return true;
+        }
+        if (result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) {
+            snprintf(type_out, type_cap, "%s", "std/result::ErrorInfo");
+            snprintf(abi_out, abi_cap, "%s", "composite");
+            return true;
+        }
+        snprintf(type_out, type_cap, "%s", "str");
+        snprintf(abi_out, abi_cap, "%s", "composite");
+        return true;
+    }
+    if (result_kind == V3_RESULT_INTRINSIC_OK && arg_count == 1U) {
+        char value_type[256];
+        char value_abi[32];
+        char normalized_value_type[256];
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                local_count,
+                                args[0],
+                                value_type,
+                                sizeof(value_type),
+                                value_abi,
+                                sizeof(value_abi)) ||
+            !v3_normalize_type_text(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    value_type,
+                                    normalized_value_type,
+                                    sizeof(normalized_value_type))) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "Result[%s]", normalized_value_type);
+        snprintf(abi_out, abi_cap, "%s", "composite");
+        return true;
+    }
+    if ((result_kind == V3_RESULT_INTRINSIC_ERR && arg_count == 1U) ||
+        (result_kind == V3_RESULT_INTRINSIC_ERR_CODE && arg_count == 2U) ||
+        (result_kind == V3_RESULT_INTRINSIC_ERR_INFO && arg_count == 1U)) {
+        char explicit_inner_type[256];
+        char normalized_inner_type[256];
+        if (!v3_extract_trailing_type_arg_text(callee,
+                                               explicit_inner_type,
+                                               sizeof(explicit_inner_type)) ||
+            !v3_normalize_type_text(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    explicit_inner_type,
+                                    normalized_inner_type,
+                                    sizeof(normalized_inner_type))) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "Result[%s]", normalized_inner_type);
+        snprintf(abi_out, abi_cap, "%s", "composite");
+        return true;
+    }
+    if (strcmp(callee, "len") == 0 && arg_count == 1U) {
+        char arg_type[256];
+        char arg_abi[32];
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                local_count,
+                                args[0],
+                                arg_type,
+                                sizeof(arg_type),
+                                arg_abi,
+                                sizeof(arg_abi))) {
+            return false;
+        }
+        if (strcmp(arg_type, "str") != 0 &&
+            strcmp(arg_type, "Bytes") != 0 &&
+            !(strlen(arg_type) > 2U && strcmp(arg_type + strlen(arg_type) - 2U, "[]") == 0)) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", "int32");
+        snprintf(abi_out, abi_cap, "%s", "i32");
+        return true;
+    }
+    if (strcmp(callee, "sizeof") == 0 && arg_count == 1U) {
+        int32_t sizeof_value = 0;
+        if (!v3_resolve_sizeof_expr_value(lowering,
+                                          current_function->owner_module_path,
+                                          aliases,
+                                          alias_count,
+                                          args[0],
+                                          &sizeof_value)) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", "int32");
+        snprintf(abi_out, abi_cap, "%s", "i32");
+        return true;
+    }
+    if (strcmp(callee, "new") == 0 && arg_count == 1U) {
+        char alloc_type[256];
+        if (!v3_normalize_type_text(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    args[0],
+                                    alloc_type,
+                                    sizeof(alloc_type)) ||
+            !v3_is_internal_ref_type(alloc_type)) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", alloc_type);
+        snprintf(abi_out, abi_cap, "%s", "ptr");
+        return true;
+    }
+    if (v3_is_strformat_join_name(callee) && arg_count == 1U) {
+        char arg_type[256];
+        char arg_abi[32];
+        char normalized_arg_type[256];
+        if (!v3_infer_expr_type(plan,
+                                lowering,
+                                current_function,
+                                aliases,
+                                alias_count,
+                                locals,
+                                local_count,
+                                args[0],
+                                arg_type,
+                                sizeof(arg_type),
+                                arg_abi,
+                                sizeof(arg_abi)) ||
+            !v3_normalize_type_text(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    arg_type,
+                                    normalized_arg_type,
+                                    sizeof(normalized_arg_type)) ||
+            strcmp(normalized_arg_type, "str[]") != 0) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", "str");
+        snprintf(abi_out, abi_cap, "%s", "composite");
+        return true;
+    }
+    {
+        char cast_target_type[256];
+        char cast_target_abi[32];
+        if (arg_count == 1U &&
+            v3_resolve_scalar_or_pointer_cast_target(lowering,
+                                                     current_function->owner_module_path,
+                                                     aliases,
+                                                     alias_count,
+                                                     callee,
+                                                     cast_target_type,
+                                                     sizeof(cast_target_type),
+                                                     cast_target_abi,
+                                                     sizeof(cast_target_abi))) {
+            snprintf(type_out, type_cap, "%s", cast_target_type);
+            snprintf(abi_out, abi_cap, "%s", cast_target_abi);
+            return true;
+        }
+    }
+    if ((strcmp(callee, "int") == 0 ||
+         strcmp(callee, "int64") == 0 ||
+         strcmp(callee, "int32") == 0 ||
+         strcmp(callee, "uint32") == 0 ||
+         strcmp(callee, "uint64") == 0 ||
+         strcmp(callee, "ptr") == 0 ||
+         strcmp(callee, "cstring") == 0 ||
+         strcmp(callee, "bool") == 0) && arg_count == 1U) {
+        if (strcmp(callee, "int") == 0 || strcmp(callee, "int32") == 0) {
+            snprintf(type_out, type_cap, "%s", "int32");
+            snprintf(abi_out, abi_cap, "%s", "i32");
+        } else if (strcmp(callee, "uint32") == 0) {
+            snprintf(type_out, type_cap, "%s", "uint32");
+            snprintf(abi_out, abi_cap, "%s", "i32");
+        } else if (strcmp(callee, "int64") == 0) {
+            snprintf(type_out, type_cap, "%s", "int64");
+            snprintf(abi_out, abi_cap, "%s", "i64");
+        } else if (strcmp(callee, "uint64") == 0) {
+            snprintf(type_out, type_cap, "%s", "uint64");
+            snprintf(abi_out, abi_cap, "%s", "i64");
+        } else if (strcmp(callee, "bool") == 0) {
+            snprintf(type_out, type_cap, "%s", "bool");
+            snprintf(abi_out, abi_cap, "%s", "bool");
+        } else {
+            snprintf(type_out, type_cap, "%s", strcmp(callee, "cstring") == 0 ? "cstring" : "ptr");
+            snprintf(abi_out, abi_cap, "%s", "ptr");
+        }
+        return true;
+    }
+    if (v3_resolve_call_target_with_args(plan,
+                                         lowering,
+                                         current_function,
+                                         aliases,
+                                         alias_count,
+                                         locals,
+                                         local_count,
+                                         callee,
+                                         args,
+                                         arg_count,
+                                         &target)) {
+        if (target.return_abi_class[0] == '\0' || strcmp(target.return_abi_class, "void") == 0) {
+            return false;
+        }
+        if (target.return_type[0] != '\0') {
+            snprintf(type_out, type_cap, "%s", target.return_type);
+        } else {
+            v3_type_text_from_abi_class(target.return_abi_class, type_out, type_cap);
+        }
+        snprintf(abi_out, abi_cap, "%s", target.return_abi_class);
+        return type_out[0] != '\0';
+    }
+    if (v3_callee_is_constructor_like(lowering,
+                                      current_function->owner_module_path,
+                                      aliases,
+                                      alias_count,
+                                      callee)) {
+        char normalized_ctor[256];
+        if (!v3_normalize_type_text(lowering,
+                                    current_function->owner_module_path,
+                                    aliases,
+                                    alias_count,
+                                    callee,
+                                    normalized_ctor,
+                                    sizeof(normalized_ctor))) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", normalized_ctor);
+        snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_ctor));
+        return true;
+    }
+    return false;
+}
+
+static bool v3_infer_expr_type_impl(const V3SystemLinkPlanStub *plan,
+                                    const V3LoweringPlanStub *lowering,
+                                    const V3LoweredFunctionStub *current_function,
+                                    const V3ImportAlias *aliases,
+                                    size_t alias_count,
+                                    const V3AsmLocalSlot *locals,
+                                    size_t local_count,
+                                    const char *expr_text,
+                                    char *type_out,
+                                    size_t type_cap,
+                                    char *abi_out,
+                                    size_t abi_cap) {
     static const char *OPS[] = {
         "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "xor", "&", "+", "-", "*", "/", "%"
     };
     char expr[8192];
-    char callee[PATH_MAX];
-    char arg_text[4096] = {0};
     char base_expr[4096];
     char index_expr[4096];
     char field_name[128];
@@ -25273,50 +26850,15 @@ static bool v3_infer_expr_type(const V3SystemLinkPlanStub *plan,
     int32_t char_value = 0;
     int64_t literal_value;
     V3ExprSurface surface;
-    v3_trim_copy_text(expr_text, expr, sizeof(expr));
-    if (expr[0] == '\0') {
+    if (expr_text == NULL || expr_text[0] == '\0') {
         return false;
     }
-    {
-        char fmt_callee[PATH_MAX];
-        char fmt_arg_text[4096];
-        char fmt_literal[4096];
-        const char *fmt_base = NULL;
-        char (*fmt_args)[4096] = v3_alloc_call_arg_scratch();
-        size_t fmt_arg_count = 0U;
-        bool fmt_invocation = false;
-        if (v3_parse_call_text(expr,
-                               fmt_callee,
-                               sizeof(fmt_callee),
-                               fmt_args,
-                               &fmt_arg_count,
-                               CHENG_V3_MAX_CALL_ARGS) &&
-            fmt_arg_count == 1U &&
-            v3_parse_string_literal_text(fmt_args[0], fmt_literal, sizeof(fmt_literal))) {
-            fmt_invocation = true;
-        } else if (v3_parse_prefix_single_arg_call(expr,
-                                                   fmt_callee,
-                                                   sizeof(fmt_callee),
-                                                   fmt_arg_text,
-                                                   sizeof(fmt_arg_text)) &&
-                   v3_parse_string_literal_text(fmt_arg_text, fmt_literal, sizeof(fmt_literal))) {
-            fmt_invocation = true;
-        }
-        fmt_base = strrchr(fmt_callee, '.');
-        fmt_base = fmt_base ? fmt_base + 1 : fmt_callee;
-        if (fmt_invocation && v3_is_strformat_fmt_name(fmt_base)) {
-            free(fmt_args);
-            snprintf(type_out, type_cap, "%s", "str");
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-        }
-        free(fmt_args);
-    }
+    snprintf(expr, sizeof(expr), "%s", expr_text);
     if (!v3_classify_expr_surface(expr, &surface, surface_error, sizeof(surface_error))) {
         fprintf(stderr,
                 "[cheng_v3_seed] expr surface classify failed function=%s expr=%s reason=%s\n",
                 current_function ? current_function->symbol_text : "-",
-                expr,
+                expr_text ? expr_text : "-",
                 surface_error[0] != '\0' ? surface_error : "invalid expr");
         return false;
     }
@@ -25875,681 +27417,32 @@ static bool v3_infer_expr_type(const V3SystemLinkPlanStub *plan,
                                    abi_cap)) {
         return true;
     }
-    {
+    if (surface.kind == V3_EXPR_SURFACE_CALL) {
         size_t arg_count = 0U;
+        bool ok = false;
         char (*args)[4096] = v3_alloc_call_arg_scratch();
-        if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
-            V3AsmCallTarget target;
-            V3ResultIntrinsicKind result_kind;
-            bool has_named_fields = false;
-            int32_t elem_size_value = 0;
-            if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
-                                                      aliases,
-                                                      alias_count,
-                                                      callee,
-                                                      sizeof(callee),
-                                                      (const char (*)[4096])args,
-                                                      &arg_count,
-                                                      NULL)) {
-                free(args);
-                return false;
-            }
-            result_kind =
-                v3_resolve_result_intrinsic_kind(lowering,
-                                                 current_function->owner_module_path,
-                                                 aliases,
-                                                 alias_count,
-                                                 callee);
-            if (arg_count == 0U &&
-                v3_resolve_bound_elem_size_value(lowering,
-                                                 current_function,
-                                                 aliases,
-                                                 alias_count,
-                                                 callee,
-                                                 &elem_size_value)) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "int32");
-                snprintf(abi_out, abi_cap, "%s", "i32");
-                return true;
-            }
-            for (i = 0; i < arg_count; ++i) {
-                if (v3_find_top_level_binary_op(args[i], ":") > 0) {
-                    has_named_fields = true;
-                    break;
-                }
-            }
-            if (has_named_fields) {
-                char duplicate_field[128];
-                bool named_fields_valid = true;
-                if (v3_find_duplicate_named_arg_field(args,
-                                                      arg_count,
-                                                      duplicate_field,
-                                                      sizeof(duplicate_field),
-                                                      &named_fields_valid)) {
-                    fprintf(stderr,
-                            "[cheng_v3_seed] duplicate constructor field function=%s callee=%s field=%s expr=%s\n",
-                            current_function->symbol_text,
-                            callee,
-                            duplicate_field,
-                            expr);
-                    free(args);
-                    return false;
-                }
-                if (!named_fields_valid || !v3_named_arg_fields_unique(args, arg_count)) {
-                    free(args);
-                    return false;
-                }
-            }
-            if (v3_is_tuple_type_text(callee) &&
-                !v3_tuple_args_cover_all_items(callee, args, arg_count)) {
-                fprintf(stderr,
-                        "[cheng_v3_seed] tuple literal omission unsupported function=%s type=%s expr=%s\n",
-                        current_function->symbol_text,
-                        callee,
-                        expr);
-                free(args);
-                return false;
-            }
-            if ((result_kind == V3_RESULT_INTRINSIC_IS_ERR ||
-                 result_kind == V3_RESULT_INTRINSIC_IS_OK) && arg_count == 1U) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    args[0],
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_expr_materializes_to_address(arg_type, arg_abi) ||
-                !v3_startswith(arg_type, "Result[")) {
-                free(args);
-                return false;
-            }
+        if (!v3_split_expr_surface_call_args(&surface, args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
             free(args);
-            snprintf(type_out, type_cap, "%s", "bool");
-            snprintf(abi_out, abi_cap, "%s", "bool");
-            return true;
-            }
-            if ((result_kind == V3_RESULT_INTRINSIC_VALUE ||
-                 result_kind == V3_RESULT_INTRINSIC_ERROR ||
-                 result_kind == V3_RESULT_INTRINSIC_ERROR_TEXT ||
-                 result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) && arg_count == 1U) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    args[0],
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_expr_materializes_to_address(arg_type, arg_abi) ||
-                !v3_startswith(arg_type, "Result[")) {
-                free(args);
-                return false;
-            }
-            if (result_kind == V3_RESULT_INTRINSIC_VALUE) {
-                char inner_type[256];
-                if (!v3_parse_result_inner_type(arg_type, inner_type, sizeof(inner_type))) {
-                    free(args);
-                    return false;
-                }
-                free(args);
-                snprintf(type_out, type_cap, "%s", inner_type);
-                snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(inner_type));
-                return true;
-            }
-            if (result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "std/result::ErrorInfo");
-                snprintf(abi_out, abi_cap, "%s", "composite");
-                return true;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "%s", "str");
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-            }
-            if (result_kind == V3_RESULT_INTRINSIC_OK && arg_count == 1U) {
-            char value_type[256];
-            char value_abi[32];
-            char normalized_value_type[256];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    args[0],
-                                    value_type,
-                                    sizeof(value_type),
-                                    value_abi,
-                                    sizeof(value_abi)) ||
-                !v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        value_type,
-                                        normalized_value_type,
-                                        sizeof(normalized_value_type))) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "Result[%s]", normalized_value_type);
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-            }
-            if ((result_kind == V3_RESULT_INTRINSIC_ERR && arg_count == 1U) ||
-                (result_kind == V3_RESULT_INTRINSIC_ERR_CODE && arg_count == 2U) ||
-                (result_kind == V3_RESULT_INTRINSIC_ERR_INFO && arg_count == 1U)) {
-            char explicit_inner_type[256];
-            char normalized_inner_type[256];
-            if (!v3_extract_trailing_type_arg_text(callee,
-                                                   explicit_inner_type,
-                                                   sizeof(explicit_inner_type)) ||
-                !v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        explicit_inner_type,
-                                        normalized_inner_type,
-                                        sizeof(normalized_inner_type))) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "Result[%s]", normalized_inner_type);
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-            }
-            if (strcmp(callee, "len") == 0 && arg_count == 1U) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    args[0],
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi))) {
-                free(args);
-                return false;
-            }
-            if (strcmp(arg_type, "str") != 0 &&
-                strcmp(arg_type, "Bytes") != 0 &&
-                !(strlen(arg_type) > 2U && strcmp(arg_type + strlen(arg_type) - 2U, "[]") == 0)) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "%s", "int32");
-            snprintf(abi_out, abi_cap, "%s", "i32");
-            return true;
-            }
-            if (strcmp(callee, "sizeof") == 0 && arg_count == 1U) {
-            int32_t sizeof_value = 0;
-            if (!v3_resolve_sizeof_expr_value(lowering,
-                                              current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              args[0],
-                                              &sizeof_value)) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "%s", "int32");
-            snprintf(abi_out, abi_cap, "%s", "i32");
-            return true;
-            }
-            if (strcmp(callee, "new") == 0 && arg_count == 1U) {
-            char alloc_type[256];
-            if (!v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        args[0],
-                                        alloc_type,
-                                        sizeof(alloc_type)) ||
-                !v3_is_internal_ref_type(alloc_type)) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "%s", alloc_type);
-            snprintf(abi_out, abi_cap, "%s", "ptr");
-            return true;
-            }
-            if (v3_is_strformat_join_name(callee) && arg_count == 1U) {
-            char arg_type[256];
-            char arg_abi[32];
-            char normalized_arg_type[256];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    args[0],
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        arg_type,
-                                        normalized_arg_type,
-                                        sizeof(normalized_arg_type)) ||
-                strcmp(normalized_arg_type, "str[]") != 0) {
-                free(args);
-                return false;
-            }
-            free(args);
-            snprintf(type_out, type_cap, "%s", "str");
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-            }
-            {
-            char cast_target_type[256];
-            char cast_target_abi[32];
-            if (arg_count == 1U &&
-                v3_resolve_scalar_or_pointer_cast_target(lowering,
-                                                         current_function->owner_module_path,
-                                                         aliases,
-                                                         alias_count,
-                                                         callee,
-                                                         cast_target_type,
-                                                         sizeof(cast_target_type),
-                                                         cast_target_abi,
-                                                         sizeof(cast_target_abi))) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", cast_target_type);
-                snprintf(abi_out, abi_cap, "%s", cast_target_abi);
-                return true;
-            }
-            }
-            if ((strcmp(callee, "int") == 0 ||
-                 strcmp(callee, "int64") == 0 ||
-                 strcmp(callee, "int32") == 0 ||
-                 strcmp(callee, "uint32") == 0 ||
-                 strcmp(callee, "uint64") == 0 ||
-                 strcmp(callee, "ptr") == 0 ||
-                 strcmp(callee, "cstring") == 0 ||
-                 strcmp(callee, "bool") == 0) && arg_count == 1U) {
-            if (strcmp(callee, "int") == 0 || strcmp(callee, "int32") == 0) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "int32");
-                snprintf(abi_out, abi_cap, "%s", "i32");
-            } else if (strcmp(callee, "uint32") == 0) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "uint32");
-                snprintf(abi_out, abi_cap, "%s", "i32");
-            } else if (strcmp(callee, "int64") == 0) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "int64");
-                snprintf(abi_out, abi_cap, "%s", "i64");
-            } else if (strcmp(callee, "uint64") == 0) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "uint64");
-                snprintf(abi_out, abi_cap, "%s", "i64");
-            } else if (strcmp(callee, "bool") == 0) {
-                free(args);
-                snprintf(type_out, type_cap, "%s", "bool");
-                snprintf(abi_out, abi_cap, "%s", "bool");
-            } else {
-                free(args);
-                snprintf(type_out, type_cap, "%s", strcmp(callee, "cstring") == 0 ? "cstring" : "ptr");
-                snprintf(abi_out, abi_cap, "%s", "ptr");
-            }
-            return true;
-            }
-            if (v3_resolve_call_target_with_args(plan,
-                                                 lowering,
-                                                 current_function,
-                                                 aliases,
-                                                 alias_count,
-                                                 locals,
-                                                 local_count,
-                                                 callee,
-                                                 args,
-                                                 arg_count,
-                                                 &target)) {
-            if (target.return_abi_class[0] == '\0' || strcmp(target.return_abi_class, "void") == 0) {
-                free(args);
-                return false;
-            }
-            if (target.return_type[0] != '\0') {
-                snprintf(type_out, type_cap, "%s", target.return_type);
-            } else {
-                v3_type_text_from_abi_class(target.return_abi_class, type_out, type_cap);
-            }
-            free(args);
-            snprintf(abi_out, abi_cap, "%s", target.return_abi_class);
-            return type_out[0] != '\0';
-            }
-            if (v3_callee_is_constructor_like(lowering,
-                                              current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              callee)) {
-                char normalized_ctor[256];
-                if (!v3_normalize_type_text(lowering,
-                                            current_function->owner_module_path,
-                                            aliases,
-                                            alias_count,
-                                            callee,
-                                            normalized_ctor,
-                                            sizeof(normalized_ctor))) {
-                    free(args);
-                    return false;
-                }
-                free(args);
-                snprintf(type_out, type_cap, "%s", normalized_ctor);
-                snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_ctor));
-                return true;
-            }
+            return false;
         }
+        ok = v3_infer_call_expr_type_from_args(plan,
+                                               lowering,
+                                               current_function,
+                                               aliases,
+                                               alias_count,
+                                               locals,
+                                               local_count,
+                                               expr,
+                                               surface.call_callee,
+                                               (const char (*)[4096])args,
+                                               arg_count,
+                                               type_out,
+                                               type_cap,
+                                               abi_out,
+                                               abi_cap);
         free(args);
-    }
-    if (v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
-        V3AsmCallTarget target;
-        size_t canonical_arg_count = 1U;
-        V3ResultIntrinsicKind result_kind;
-        char canonical_args[CHENG_V3_MAX_CALL_ARGS][4096];
-        snprintf(canonical_args[0], sizeof(canonical_args[0]), "%s", arg_text);
-        if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
-                                                  aliases,
-                                                  alias_count,
-                                                  callee,
-                                                  sizeof(callee),
-                                                  (const char (*)[4096])canonical_args,
-                                                  &canonical_arg_count,
-                                                  NULL)) {
-            return false;
-        }
-        if (canonical_arg_count != 1U) {
-            return false;
-        }
-        snprintf(arg_text, sizeof(arg_text), "%s", canonical_args[0]);
-        result_kind =
-            v3_resolve_result_intrinsic_kind(lowering,
-                                             current_function->owner_module_path,
-                                             aliases,
-                                             alias_count,
-                                             callee);
-        if (result_kind == V3_RESULT_INTRINSIC_IS_ERR ||
-            result_kind == V3_RESULT_INTRINSIC_IS_OK) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    arg_text,
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_expr_materializes_to_address(arg_type, arg_abi) ||
-                !v3_startswith(arg_type, "Result[")) {
-                return false;
-            }
-            snprintf(type_out, type_cap, "%s", "bool");
-            snprintf(abi_out, abi_cap, "%s", "bool");
+        if (ok) {
             return true;
-        }
-        if (result_kind == V3_RESULT_INTRINSIC_VALUE ||
-            result_kind == V3_RESULT_INTRINSIC_ERROR ||
-            result_kind == V3_RESULT_INTRINSIC_ERROR_TEXT ||
-            result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    arg_text,
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_expr_materializes_to_address(arg_type, arg_abi) ||
-                !v3_startswith(arg_type, "Result[")) {
-                return false;
-            }
-            if (result_kind == V3_RESULT_INTRINSIC_VALUE) {
-                char inner_type[256];
-                if (!v3_parse_result_inner_type(arg_type, inner_type, sizeof(inner_type))) {
-                    return false;
-                }
-                snprintf(type_out, type_cap, "%s", inner_type);
-                snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(inner_type));
-                return true;
-            }
-            if (result_kind == V3_RESULT_INTRINSIC_ERROR_INFO_OF) {
-                snprintf(type_out, type_cap, "%s", "std/result::ErrorInfo");
-                snprintf(abi_out, abi_cap, "%s", "composite");
-                return true;
-            }
-            snprintf(type_out, type_cap, "%s", "str");
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-        }
-        if (result_kind == V3_RESULT_INTRINSIC_OK) {
-            char value_type[256];
-            char value_abi[32];
-            char normalized_value_type[256];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    arg_text,
-                                    value_type,
-                                    sizeof(value_type),
-                                    value_abi,
-                                    sizeof(value_abi)) ||
-                !v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        value_type,
-                                        normalized_value_type,
-                                        sizeof(normalized_value_type))) {
-                return false;
-            }
-            snprintf(type_out, type_cap, "Result[%s]", normalized_value_type);
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-        }
-        if ((result_kind == V3_RESULT_INTRINSIC_ERR ||
-             result_kind == V3_RESULT_INTRINSIC_ERR_INFO) &&
-            v3_extract_trailing_type_arg_text(callee, type_out, type_cap) &&
-            v3_normalize_type_text(lowering,
-                                   current_function->owner_module_path,
-                                   aliases,
-                                   alias_count,
-                                   type_out,
-                                   type_out,
-                                   type_cap)) {
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            {
-                char normalized_inner_type[256];
-                snprintf(normalized_inner_type, sizeof(normalized_inner_type), "%s", type_out);
-                snprintf(type_out, type_cap, "Result[%s]", normalized_inner_type);
-            }
-            return true;
-        }
-        if (strcmp(callee, "len") == 0) {
-            char arg_type[256];
-            char arg_abi[32];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    arg_text,
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi))) {
-                return false;
-            }
-            if (strcmp(arg_type, "str") != 0 &&
-                strcmp(arg_type, "Bytes") != 0 &&
-                !(strlen(arg_type) > 2U && strcmp(arg_type + strlen(arg_type) - 2U, "[]") == 0)) {
-                return false;
-            }
-            snprintf(type_out, type_cap, "%s", "int32");
-            snprintf(abi_out, abi_cap, "%s", "i32");
-            return true;
-        }
-        if (strcmp(callee, "sizeof") == 0) {
-            int32_t sizeof_value = 0;
-            if (!v3_resolve_sizeof_expr_value(lowering,
-                                              current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              arg_text,
-                                              &sizeof_value)) {
-                return false;
-            }
-            snprintf(type_out, type_cap, "%s", "int32");
-            snprintf(abi_out, abi_cap, "%s", "i32");
-            return true;
-        }
-        if (v3_is_strformat_join_name(callee)) {
-            char arg_type[256];
-            char arg_abi[32];
-            char normalized_arg_type[256];
-            if (!v3_infer_expr_type(plan,
-                                    lowering,
-                                    current_function,
-                                    aliases,
-                                    alias_count,
-                                    locals,
-                                    local_count,
-                                    arg_text,
-                                    arg_type,
-                                    sizeof(arg_type),
-                                    arg_abi,
-                                    sizeof(arg_abi)) ||
-                !v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        arg_type,
-                                        normalized_arg_type,
-                                        sizeof(normalized_arg_type)) ||
-                strcmp(normalized_arg_type, "str[]") != 0) {
-                return false;
-            }
-            snprintf(type_out, type_cap, "%s", "str");
-            snprintf(abi_out, abi_cap, "%s", "composite");
-            return true;
-        }
-        {
-            char cast_target_type[256];
-            char cast_target_abi[32];
-            if (v3_resolve_scalar_or_pointer_cast_target(lowering,
-                                                         current_function->owner_module_path,
-                                                         aliases,
-                                                         alias_count,
-                                                         callee,
-                                                         cast_target_type,
-                                                         sizeof(cast_target_type),
-                                                         cast_target_abi,
-                                                         sizeof(cast_target_abi))) {
-                snprintf(type_out, type_cap, "%s", cast_target_type);
-                snprintf(abi_out, abi_cap, "%s", cast_target_abi);
-                return true;
-            }
-        }
-        if ((strcmp(callee, "int") == 0 ||
-             strcmp(callee, "int32") == 0 ||
-             strcmp(callee, "uint32") == 0 ||
-             strcmp(callee, "int64") == 0 ||
-             strcmp(callee, "uint64") == 0 ||
-             strcmp(callee, "ptr") == 0 ||
-             strcmp(callee, "cstring") == 0 ||
-             strcmp(callee, "bool") == 0)) {
-            if (strcmp(callee, "int") == 0 || strcmp(callee, "int32") == 0) {
-                snprintf(type_out, type_cap, "%s", "int32");
-                snprintf(abi_out, abi_cap, "%s", "i32");
-            } else if (strcmp(callee, "uint32") == 0) {
-                snprintf(type_out, type_cap, "%s", "uint32");
-                snprintf(abi_out, abi_cap, "%s", "i32");
-            } else if (strcmp(callee, "int64") == 0) {
-                snprintf(type_out, type_cap, "%s", "int64");
-                snprintf(abi_out, abi_cap, "%s", "i64");
-            } else if (strcmp(callee, "uint64") == 0) {
-                snprintf(type_out, type_cap, "%s", "uint64");
-                snprintf(abi_out, abi_cap, "%s", "i64");
-            } else if (strcmp(callee, "bool") == 0) {
-                snprintf(type_out, type_cap, "%s", "bool");
-                snprintf(abi_out, abi_cap, "%s", "bool");
-            } else {
-                snprintf(type_out, type_cap, "%s", strcmp(callee, "cstring") == 0 ? "cstring" : "ptr");
-                snprintf(abi_out, abi_cap, "%s", "ptr");
-            }
-            return true;
-        }
-        {
-            char single_arg[1][4096];
-            snprintf(single_arg[0], sizeof(single_arg[0]), "%s", arg_text);
-            if (v3_resolve_call_target_with_args(plan,
-                                                 lowering,
-                                                 current_function,
-                                                 aliases,
-                                                 alias_count,
-                                                 locals,
-                                                 local_count,
-                                                 callee,
-                                                 single_arg,
-                                                 1U,
-                                                 &target)) {
-            if (target.return_abi_class[0] == '\0' || strcmp(target.return_abi_class, "void") == 0) {
-                return false;
-            }
-            if (target.return_type[0] != '\0') {
-                snprintf(type_out, type_cap, "%s", target.return_type);
-            } else {
-                v3_type_text_from_abi_class(target.return_abi_class, type_out, type_cap);
-            }
-            snprintf(abi_out, abi_cap, "%s", target.return_abi_class);
-            return type_out[0] != '\0';
-            }
         }
     }
     {
@@ -26596,6 +27489,8 @@ static bool v3_try_prepare_index_assignment_call_state(const V3SystemLinkPlanStu
     size_t i;
     int next_call_depth = call_depth + 1;
     bool has_target = false;
+    size_t call_arg_count = 3U;
+    char callee[PATH_MAX];
     if (handled_out != NULL) {
         *handled_out = false;
     }
@@ -26655,23 +27550,26 @@ static bool v3_try_prepare_index_assignment_call_state(const V3SystemLinkPlanStu
             return false;
         }
     }
-    has_target =
-        v3_resolve_call_target_with_args(plan,
-                                         lowering,
-                                         current_function,
-                                         aliases,
-                                         alias_count,
-                                         locals,
-                                         *local_count,
-                                         "[]=",
-                                         (const char (*)[4096])args,
-                                         3U,
-                                         &target);
-    if (!has_target) {
-        return true;
-    }
-    if (!v3_build_native_call_lowering_rule(&target, &rule)) {
+    snprintf(callee, sizeof(callee), "%s", "[]=");
+    if (!v3_prepare_native_call_lowering_rule_with_args(plan,
+                                                        lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        locals,
+                                                        *local_count,
+                                                        callee,
+                                                        sizeof(callee),
+                                                        args,
+                                                        &call_arg_count,
+                                                        NULL,
+                                                        &target,
+                                                        &rule,
+                                                        &has_target)) {
         return false;
+    }
+    if (!has_target || call_arg_count != 3U) {
+        return true;
     }
     for (i = 0U; i < 3U; ++i) {
         if (i < rule.param_count) {
@@ -26728,41 +27626,31 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
     V3AsmCallTarget target;
     V3NativeCallLoweringRule rule;
     char canonical_callee[PATH_MAX];
-    bool call_rewritten = false;
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
-    if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              canonical_callee,
-                                              sizeof(canonical_callee),
-                                              (const char (*)[4096])args,
-                                              &arg_count,
-                                              &call_rewritten)) {
-        return false;
-    }
-    callee = canonical_callee;
-    if (resolved_target != NULL && !call_rewritten) {
-        memcpy(&target, resolved_target, sizeof(target));
-    } else if (!v3_resolve_native_call_lowering_rule_with_args(plan,
-                                                               lowering,
-                                                               current_function,
-                                                               aliases,
-                                                               alias_count,
-                                                               locals,
-                                                               local_count,
-                                                               callee,
-                                                               (const char (*)[4096])args,
-                                                               arg_count,
-                                                               &target,
-                                                               &rule)) {
+    if (!v3_prepare_native_call_lowering_rule_with_args(plan,
+                                                        lowering,
+                                                        current_function,
+                                                        aliases,
+                                                        alias_count,
+                                                        locals,
+                                                        local_count,
+                                                        canonical_callee,
+                                                        sizeof(canonical_callee),
+                                                        args,
+                                                        &arg_count,
+                                                        resolved_target,
+                                                        &target,
+                                                        &rule,
+                                                        NULL)) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call resolve failed caller=%s callee=%s\n",
                 current_function->symbol_text,
-                callee);
+                canonical_callee);
         return false;
     }
-    if (v3_native_call_rule_result_uses_address(&rule)) {
+    callee = canonical_callee;
+    if (rule.result_kind != V3_CALL_RESULT_VALUE) {
         fprintf(stderr,
                 "[cheng_v3_seed] scalar call non-scalar return caller=%s callee=%s ret_abi=%s\n",
                 current_function->symbol_text,
@@ -26919,6 +27807,7 @@ static bool v3_codegen_call_scalar_resolved(const V3SystemLinkPlanStub *plan,
                                       alias_count,
                                       &target,
                                       &rule,
+                                      V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED,
                                       call_arg_base,
                                       call_depth,
                                       out,
@@ -27777,20 +28666,9 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
         if (strcmp(op, "==") == 0 || strcmp(op, "!=") == 0) {
             V3AsmCallTarget str_eq_target;
             V3NativeCallLoweringRule str_eq_rule;
-            memset(&str_eq_target, 0, sizeof(str_eq_target));
-            str_eq_target.external = true;
-            str_eq_target.param_count = 2U;
-            snprintf(str_eq_target.callee_name, sizeof(str_eq_target.callee_name), "%s", "driver_c_str_eq_bridge");
-            v3_copy_target_symbol_name(plan,
-                                       "driver_c_str_eq_bridge",
-                                       str_eq_target.symbol_name,
-                                       sizeof(str_eq_target.symbol_name));
-            snprintf(str_eq_target.return_type, sizeof(str_eq_target.return_type), "%s", "int32");
-            snprintf(str_eq_target.return_abi_class, sizeof(str_eq_target.return_abi_class), "%s", "i32");
-            snprintf(str_eq_target.param_types[0], sizeof(str_eq_target.param_types[0]), "%s", "str");
-            snprintf(str_eq_target.param_types[1], sizeof(str_eq_target.param_types[1]), "%s", "str");
-            snprintf(str_eq_target.param_abi_classes[0], sizeof(str_eq_target.param_abi_classes[0]), "%s", "composite");
-            snprintf(str_eq_target.param_abi_classes[1], sizeof(str_eq_target.param_abi_classes[1]), "%s", "composite");
+            if (!v3_build_native_str_eq_target(plan, &str_eq_target)) {
+                return false;
+            }
             if (!v3_emit_local_value_address(out, cap, &left_scratch_slot, 15) ||
                 !v3_emit_local_value_address(out, cap, &right_scratch_slot, 9)) {
                 return false;
@@ -27819,6 +28697,7 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
                                           alias_count,
                                           &str_eq_target,
                                           &str_eq_rule,
+                                          V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED,
                                           call_arg_base,
                                           call_depth,
                                           out,
@@ -27869,7 +28748,9 @@ static bool v3_codegen_compare_expr_scalar(const V3SystemLinkPlanStub *plan,
                             "  ldr x0, [x0, #0]\n"
                             "  ldr x1, [x1, #0]\n");
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_strcmp");
+        if (!v3_emit_native_strcmp_call(plan, out, cap)) {
+            return false;
+        }
         if (v3_active_target_is_linux_x86_64()) {
             v3_emit_x64_cmp_zero_set_bool(out, cap, 0, target_reg, false, cond);
         } else {
@@ -29559,12 +30440,14 @@ static bool v3_emit_slot_address(char *out,
         return false;
     }
     if (slot->indirect_value) {
-        if (!v3_emit_sp_load_reg(out, cap, slot->stack_offset, "ptr", reg_index)) {
+        int addr_reg = reg_index == 16 ? 17 : 16;
+        if (!v3_emit_local_stack_address(out, cap, slot, addr_reg)) {
             return false;
         }
+        v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", reg_index);
         return true;
     }
-    return v3_emit_sp_offset_address(out, cap, reg_index, slot->stack_offset);
+    return v3_emit_local_stack_address(out, cap, slot, reg_index);
 }
 
 static bool v3_parse_named_arg_meta(const char *arg_text,
@@ -30932,57 +31815,31 @@ static bool v3_emit_constructor_into_address(const V3SystemLinkPlanStub *plan,
                                              char *out,
                                              size_t cap);
 
-static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
-                                         const V3LoweringPlanStub *lowering,
-                                         const V3LoweredFunctionStub *current_function,
-                                         const V3ImportAlias *aliases,
-                                         size_t alias_count,
-                                         const V3AsmLocalSlot *locals,
-                                         size_t local_count,
-                                         const char *callee,
-                                         char args[][4096],
-                                         size_t arg_count,
-                                         int dest_addr_reg,
-                                         int32_t call_arg_base,
-                                         int32_t string_temp_base,
-                                         int32_t string_temp_stride,
-                                         int32_t *string_label_index_io,
-                                         int call_depth,
-                                         char *out,
-                                         size_t cap) {
-    V3AsmCallTarget target;
-    V3NativeCompositeCallLoweringRule composite_rule;
-    const V3NativeCallLoweringRule *rule = &composite_rule.call_rule;
-    char canonical_callee[PATH_MAX];
+static bool v3_codegen_call_into_address_resolved(const V3SystemLinkPlanStub *plan,
+                                                  const V3LoweringPlanStub *lowering,
+                                                  const V3LoweredFunctionStub *current_function,
+                                                  const V3ImportAlias *aliases,
+                                                  size_t alias_count,
+                                                  const V3AsmLocalSlot *locals,
+                                                  size_t local_count,
+                                                  const char *callee,
+                                                  char args[][4096],
+                                                  size_t arg_count,
+                                                  const V3AsmCallTarget *target,
+                                                  const V3NativeCompositeCallLoweringRule *composite_rule,
+                                                  int dest_addr_reg,
+                                                  int32_t call_arg_base,
+                                                  int32_t string_temp_base,
+                                                  int32_t string_temp_stride,
+                                                  int32_t *string_label_index_io,
+                                                  int call_depth,
+                                                  char *out,
+                                                  size_t cap) {
+    const V3NativeCallLoweringRule *rule =
+        composite_rule != NULL ? &composite_rule->call_rule : NULL;
     size_t i;
-    snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
-    if (!v3_canonicalize_static_str_join_call(current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              canonical_callee,
-                                              sizeof(canonical_callee),
-                                              (const char (*)[4096])args,
-                                              &arg_count,
-                                              NULL)) {
-        return false;
-    }
-    callee = canonical_callee;
-    if (!v3_resolve_native_composite_call_lowering_rule_with_args(plan,
-                                                                  lowering,
-                                                                  current_function,
-                                                                  aliases,
-                                                                  alias_count,
-                                                                  locals,
-                                                                  local_count,
-                                                                  callee,
-                                                                  (const char (*)[4096])args,
-                                                                  arg_count,
-                                                                  &target,
-                                                                  &composite_rule)) {
-        return false;
-    }
-    if (!composite_rule.supported ||
-        rule->param_count != arg_count ||
+    if (target == NULL || composite_rule == NULL || !composite_rule->supported ||
+        rule == NULL || rule->param_count != arg_count ||
         rule->param_count > CHENG_V3_MAX_CALL_ARGS) {
         return false;
     }
@@ -31042,7 +31899,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                                     local_count,
                                                     callee,
                                                     args[i],
-                                                    &target,
+                                                    target,
                                                     i,
                                                     call_arg_base,
                                                     string_temp_base,
@@ -31063,7 +31920,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                         locals,
                                         local_count,
                                         args[i],
-                                        target.param_abi_classes[i],
+                                        target->param_abi_classes[i],
                                         9,
                                         call_arg_base,
                                         string_temp_base,
@@ -31078,7 +31935,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                          call_arg_base,
                                          call_depth,
                                          i,
-                                         target.param_abi_classes[i],
+                                         target->param_abi_classes[i],
                                          9);
             continue;
         }
@@ -31092,7 +31949,7 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                             "composite call-into-address",
                                             callee,
                                             args,
-                                            &target,
+                                            target,
                                             i,
                                             call_arg_base,
                                             string_temp_base,
@@ -31109,12 +31966,204 @@ static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
                                     current_function,
                                     aliases,
                                     alias_count,
-                                    &target,
+                                    target,
                                     rule,
+                                    composite_rule->composite_result_kind,
                                     call_arg_base,
                                     call_depth,
                                     out,
                                     cap);
+}
+
+static bool v3_codegen_call_into_address(const V3SystemLinkPlanStub *plan,
+                                         const V3LoweringPlanStub *lowering,
+                                         const V3LoweredFunctionStub *current_function,
+                                         const V3ImportAlias *aliases,
+                                         size_t alias_count,
+                                         const V3AsmLocalSlot *locals,
+                                         size_t local_count,
+                                         const char *callee,
+                                         char args[][4096],
+                                         size_t arg_count,
+                                         int dest_addr_reg,
+                                         int32_t call_arg_base,
+                                         int32_t string_temp_base,
+                                         int32_t string_temp_stride,
+                                         int32_t *string_label_index_io,
+                                         int call_depth,
+                                         char *out,
+                                         size_t cap) {
+    V3AsmCallTarget target;
+    V3NativeCompositeCallLoweringRule composite_rule;
+    bool resolved = false;
+    char canonical_callee[PATH_MAX];
+    snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
+    if (!v3_prepare_native_composite_call_lowering_rule_with_args(plan,
+                                                                  lowering,
+                                                                  current_function,
+                                                                  aliases,
+                                                                  alias_count,
+                                                                  locals,
+                                                                  local_count,
+                                                                  canonical_callee,
+                                                                  sizeof(canonical_callee),
+                                                                  args,
+                                                                  &arg_count,
+                                                                  &target,
+                                                                  &composite_rule,
+                                                                  &resolved) ||
+        !resolved) {
+        return false;
+    }
+    return v3_codegen_call_into_address_resolved(plan,
+                                                 lowering,
+                                                 current_function,
+                                                 aliases,
+                                                 alias_count,
+                                                 locals,
+                                                 local_count,
+                                                 canonical_callee,
+                                                 args,
+                                                 arg_count,
+                                                 &target,
+                                                 &composite_rule,
+                                                 dest_addr_reg,
+                                                 call_arg_base,
+                                                 string_temp_base,
+                                                 string_temp_stride,
+                                                 string_label_index_io,
+                                                 call_depth,
+                                                 out,
+                                                 cap);
+}
+
+static bool v3_materialize_composite_call_expr_into_address(const V3SystemLinkPlanStub *plan,
+                                                            const V3LoweringPlanStub *lowering,
+                                                            const V3LoweredFunctionStub *current_function,
+                                                            const V3ImportAlias *aliases,
+                                                            size_t alias_count,
+                                                            const V3AsmLocalSlot *locals,
+                                                            size_t local_count,
+                                                            char *callee,
+                                                            size_t callee_cap,
+                                                            char args[][4096],
+                                                            size_t *arg_count_io,
+                                                            const char *normalized_dest_type,
+                                                            int dest_addr_reg,
+                                                            int32_t call_arg_base,
+                                                            int32_t string_temp_base,
+                                                            int32_t string_temp_stride,
+                                                            int32_t *string_label_index_io,
+                                                            int call_depth,
+                                                            char *out,
+                                                            size_t cap) {
+    V3AsmCallTarget target;
+    V3NativeCompositeCallLoweringRule composite_rule;
+    V3ResultIntrinsicKind result_kind;
+    size_t arg_count = 0U;
+    bool resolved = false;
+    if (plan == NULL || lowering == NULL || current_function == NULL ||
+        callee == NULL || arg_count_io == NULL || normalized_dest_type == NULL ||
+        out == NULL) {
+        return false;
+    }
+    arg_count = *arg_count_io;
+    if (!v3_prepare_native_composite_call_lowering_rule_with_args(plan,
+                                                                  lowering,
+                                                                  current_function,
+                                                                  aliases,
+                                                                  alias_count,
+                                                                  locals,
+                                                                  local_count,
+                                                                  callee,
+                                                                  callee_cap,
+                                                                  args,
+                                                                  &arg_count,
+                                                                  &target,
+                                                                  &composite_rule,
+                                                                  &resolved)) {
+        return false;
+    }
+    *arg_count_io = arg_count;
+    result_kind = v3_resolve_result_intrinsic_kind(lowering,
+                                                   current_function->owner_module_path,
+                                                   aliases,
+                                                   alias_count,
+                                                   callee);
+    if (((result_kind == V3_RESULT_INTRINSIC_OK ||
+          result_kind == V3_RESULT_INTRINSIC_ERR ||
+          result_kind == V3_RESULT_INTRINSIC_ERR_INFO) &&
+         arg_count == 1U) ||
+        (result_kind == V3_RESULT_INTRINSIC_ERR_CODE && arg_count == 2U)) {
+        return v3_emit_result_constructor_into_address(plan,
+                                                       lowering,
+                                                       current_function,
+                                                       aliases,
+                                                       alias_count,
+                                                       locals,
+                                                       local_count,
+                                                       result_kind,
+                                                       callee,
+                                                       args,
+                                                       arg_count,
+                                                       normalized_dest_type,
+                                                       dest_addr_reg,
+                                                       call_arg_base,
+                                                       string_temp_base,
+                                                       string_temp_stride,
+                                                       string_label_index_io,
+                                                       call_depth,
+                                                       out,
+                                                       cap);
+    }
+    if (resolved) {
+        return v3_codegen_call_into_address_resolved(plan,
+                                                     lowering,
+                                                     current_function,
+                                                     aliases,
+                                                     alias_count,
+                                                     locals,
+                                                     local_count,
+                                                     callee,
+                                                     args,
+                                                     arg_count,
+                                                     &target,
+                                                     &composite_rule,
+                                                     dest_addr_reg,
+                                                     call_arg_base,
+                                                     string_temp_base,
+                                                     string_temp_stride,
+                                                     string_label_index_io,
+                                                     call_depth,
+                                                     out,
+                                                     cap);
+    }
+    if (v3_callee_is_constructor_like(lowering,
+                                      current_function->owner_module_path,
+                                      aliases,
+                                      alias_count,
+                                      callee)) {
+        return v3_emit_constructor_into_address(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                callee,
+                                                args,
+                                                arg_count,
+                                                normalized_dest_type,
+                                                dest_addr_reg,
+                                                call_arg_base,
+                                                string_temp_base,
+                                                string_temp_stride,
+                                                string_label_index_io,
+                                                call_depth,
+                                                out,
+                                                cap);
+    }
+    return false;
 }
 
 static bool v3_try_codegen_index_assignment_call(const V3SystemLinkPlanStub *plan,
@@ -31360,6 +32409,485 @@ static bool v3_emit_constructor_into_address(const V3SystemLinkPlanStub *plan,
                                                         cap)) {
             return false;
         }
+    }
+    return true;
+}
+
+static bool v3_type_needs_bytes_orc_lifecycle(const V3LoweringPlanStub *lowering,
+                                              const V3ImportAlias *aliases,
+                                              size_t alias_count,
+                                              const char *type_owner_module_path,
+                                              const char *type_text,
+                                              unsigned depth) {
+    char normalized_type[CHENG_V3_MAX_TYPE_TEXT];
+    int32_t type_index = -1;
+    if (depth > 32U ||
+        !v3_normalize_type_text(lowering,
+                                type_owner_module_path,
+                                aliases,
+                                alias_count,
+                                type_text,
+                                normalized_type,
+                                sizeof(normalized_type))) {
+        return false;
+    }
+    if (strcmp(normalized_type, "Bytes") == 0) {
+        /* Runtime-side owning-block registry makes borrowed Bytes views a
+         * no-op at retain/release time while still closing the ORC loop for
+         * bytesAlloc-owned payloads. */
+        return true;
+    }
+    if (v3_find_type_def_by_normalized(lowering, normalized_type, &type_index)) {
+        const V3TypeDefStub *type_def = &lowering->type_defs[type_index];
+        V3ImportAlias *type_aliases = NULL;
+        size_t type_alias_count = 0U;
+        char stripped[PATH_MAX];
+        char owner_module[PATH_MAX];
+        char type_instance_name[128];
+        char type_name[128];
+        char type_args[CHENG_V3_MAX_TYPE_PARAMS][256];
+        size_t type_arg_count = 0U;
+        size_t i;
+        type_aliases = (V3ImportAlias *)v3_xmalloc(sizeof(*type_aliases) * CHENG_V3_MAX_IMPORT_ALIASES);
+        v3_strip_internal_ref_type(normalized_type, stripped, sizeof(stripped));
+        if (type_aliases == NULL ||
+            !v3_split_qualified_type_text(stripped,
+                                          owner_module,
+                                          sizeof(owner_module),
+                                          type_instance_name,
+                                          sizeof(type_instance_name)) ||
+            !v3_parse_type_instance_text(type_instance_name,
+                                         type_name,
+                                         sizeof(type_name),
+                                         type_args,
+                                         &type_arg_count,
+                                         CHENG_V3_MAX_TYPE_PARAMS) ||
+            !v3_load_import_aliases_from_source_path(type_def->source_path,
+                                                     type_aliases,
+                                                     &type_alias_count,
+                                                     CHENG_V3_MAX_IMPORT_ALIASES)) {
+            free(type_aliases);
+            return false;
+        }
+        if (type_def->kind == V3_TYPE_DEF_ALIAS) {
+            char alias_target[CHENG_V3_MAX_TYPE_TEXT];
+            bool need_lifecycle = false;
+            if (type_def->generic_param_count > 0U) {
+                if (type_def->generic_param_count == type_arg_count &&
+                    v3_normalize_type_text_with_params(lowering,
+                                                       type_def->owner_module_path,
+                                                       type_aliases,
+                                                       type_alias_count,
+                                                       type_def->generic_param_names,
+                                                       type_args,
+                                                       type_arg_count,
+                                                       type_def->alias_target,
+                                                       alias_target,
+                                                       sizeof(alias_target))) {
+                    need_lifecycle = v3_type_needs_bytes_orc_lifecycle(lowering,
+                                                                       type_aliases,
+                                                                       type_alias_count,
+                                                                       type_def->owner_module_path,
+                                                                       alias_target,
+                                                                       depth + 1U);
+                }
+            } else {
+                snprintf(alias_target, sizeof(alias_target), "%s", type_def->alias_target);
+                need_lifecycle = v3_type_needs_bytes_orc_lifecycle(lowering,
+                                                                   type_aliases,
+                                                                   type_alias_count,
+                                                                   type_def->owner_module_path,
+                                                                   alias_target,
+                                                                   depth + 1U);
+            }
+            free(type_aliases);
+            return need_lifecycle;
+        }
+        if (type_def->kind == V3_TYPE_DEF_RECORD) {
+            bool need_lifecycle = false;
+            for (i = 0U; i < type_def->field_count; ++i) {
+                char resolved_field_type[CHENG_V3_MAX_TYPE_TEXT];
+                if (type_def->generic_param_count > 0U) {
+                    if (type_def->generic_param_count != type_arg_count ||
+                        !v3_normalize_type_text_with_params(lowering,
+                                                            type_def->owner_module_path,
+                                                            type_aliases,
+                                                            type_alias_count,
+                                                            type_def->generic_param_names,
+                                                            type_args,
+                                                            type_arg_count,
+                                                            type_def->fields[i].type_text,
+                                                            resolved_field_type,
+                                                            sizeof(resolved_field_type))) {
+                        continue;
+                    }
+                } else {
+                    snprintf(resolved_field_type,
+                             sizeof(resolved_field_type),
+                             "%s",
+                             type_def->fields[i].type_text);
+                }
+                if (v3_type_needs_bytes_orc_lifecycle(lowering,
+                                                      type_aliases,
+                                                      type_alias_count,
+                                                      type_def->owner_module_path,
+                                                      resolved_field_type,
+                                                      depth + 1U)) {
+                    need_lifecycle = true;
+                    break;
+                }
+            }
+            free(type_aliases);
+            return need_lifecycle;
+        }
+        free(type_aliases);
+    }
+    return false;
+}
+
+static bool v3_emit_bytes_orc_lifecycle_at_address(const V3SystemLinkPlanStub *plan,
+                                                   const V3LoweringPlanStub *lowering,
+                                                   const V3LoweredFunctionStub *current_function,
+                                                   const V3ImportAlias *aliases,
+                                                   size_t alias_count,
+                                                   const char *type_owner_module_path,
+                                                   const char *type_text,
+                                                   int addr_reg,
+                                                   int32_t call_arg_base,
+                                                   int call_depth,
+                                                   bool retain,
+                                                   char *out,
+                                                   size_t cap,
+                                                   unsigned depth) {
+    char normalized_type[CHENG_V3_MAX_TYPE_TEXT];
+    int32_t type_index = -1;
+    if (depth > 32U ||
+        !v3_normalize_type_text(lowering,
+                                type_owner_module_path,
+                                aliases,
+                                alias_count,
+                                type_text,
+                                normalized_type,
+                                sizeof(normalized_type))) {
+        return false;
+    }
+    if (strcmp(normalized_type, "Bytes") == 0) {
+        v3_emit_load_scalar_from_address(out, cap, addr_reg, 0, "ptr", 9);
+        return v3_emit_bytes_orc_ptr_call_if_non_nil(plan,
+                                                     retain ? "cheng_mem_retain" : "cheng_mem_release",
+                                                     9,
+                                                     out,
+                                                     cap);
+    }
+    if (v3_find_type_def_by_normalized(lowering, normalized_type, &type_index)) {
+        const V3TypeDefStub *type_def = &lowering->type_defs[type_index];
+        V3ImportAlias *type_aliases = NULL;
+        size_t type_alias_count = 0U;
+        char stripped[PATH_MAX];
+        char owner_module[PATH_MAX];
+        char type_instance_name[128];
+        char type_name[128];
+        char type_args[CHENG_V3_MAX_TYPE_PARAMS][256];
+        size_t type_arg_count = 0U;
+        size_t i;
+        type_aliases = (V3ImportAlias *)v3_xmalloc(sizeof(*type_aliases) * CHENG_V3_MAX_IMPORT_ALIASES);
+        v3_strip_internal_ref_type(normalized_type, stripped, sizeof(stripped));
+        if (type_aliases == NULL ||
+            !v3_split_qualified_type_text(stripped,
+                                          owner_module,
+                                          sizeof(owner_module),
+                                          type_instance_name,
+                                          sizeof(type_instance_name)) ||
+            !v3_parse_type_instance_text(type_instance_name,
+                                         type_name,
+                                         sizeof(type_name),
+                                         type_args,
+                                         &type_arg_count,
+                                         CHENG_V3_MAX_TYPE_PARAMS) ||
+            !v3_load_import_aliases_from_source_path(type_def->source_path,
+                                                     type_aliases,
+                                                     &type_alias_count,
+                                                     CHENG_V3_MAX_IMPORT_ALIASES)) {
+            free(type_aliases);
+            return false;
+        }
+        if (type_def->kind == V3_TYPE_DEF_ALIAS) {
+            char alias_target[CHENG_V3_MAX_TYPE_TEXT];
+            bool ok = false;
+            if (type_def->generic_param_count > 0U) {
+                if (type_def->generic_param_count == type_arg_count &&
+                    v3_normalize_type_text_with_params(lowering,
+                                                       type_def->owner_module_path,
+                                                       type_aliases,
+                                                       type_alias_count,
+                                                       type_def->generic_param_names,
+                                                       type_args,
+                                                       type_arg_count,
+                                                       type_def->alias_target,
+                                                       alias_target,
+                                                       sizeof(alias_target))) {
+                    ok = v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                                lowering,
+                                                                current_function,
+                                                                type_aliases,
+                                                                type_alias_count,
+                                                                type_def->owner_module_path,
+                                                                alias_target,
+                                                                addr_reg,
+                                                                call_arg_base,
+                                                                call_depth,
+                                                                retain,
+                                                                out,
+                                                                cap,
+                                                                depth + 1U);
+                }
+            } else {
+                snprintf(alias_target, sizeof(alias_target), "%s", type_def->alias_target);
+                ok = v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                            lowering,
+                                                            current_function,
+                                                            type_aliases,
+                                                            type_alias_count,
+                                                            type_def->owner_module_path,
+                                                            alias_target,
+                                                            addr_reg,
+                                                            call_arg_base,
+                                                            call_depth,
+                                                            retain,
+                                                            out,
+                                                            cap,
+                                                            depth + 1U);
+            }
+            free(type_aliases);
+            return ok;
+        }
+        if (type_def->kind == V3_TYPE_DEF_RECORD) {
+            bool ok = true;
+            for (i = 0U; i < type_def->field_count; ++i) {
+                char resolved_field_type[CHENG_V3_MAX_TYPE_TEXT];
+                char field_abi[32];
+                int32_t field_offset = 0;
+                int field_addr_reg = addr_reg == 14 ? 15 : 14;
+                if (type_def->generic_param_count > 0U) {
+                    if (type_def->generic_param_count != type_arg_count ||
+                        !v3_normalize_type_text_with_params(lowering,
+                                                            type_def->owner_module_path,
+                                                            type_aliases,
+                                                            type_alias_count,
+                                                            type_def->generic_param_names,
+                                                            type_args,
+                                                            type_arg_count,
+                                                            type_def->fields[i].type_text,
+                                                            resolved_field_type,
+                                                            sizeof(resolved_field_type))) {
+                        ok = false;
+                        break;
+                    }
+                } else {
+                    snprintf(resolved_field_type,
+                             sizeof(resolved_field_type),
+                             "%s",
+                             type_def->fields[i].type_text);
+                }
+                snprintf(field_abi, sizeof(field_abi), "%s", v3_type_abi_class(resolved_field_type));
+                if (!v3_resolve_field_meta(lowering,
+                                           normalized_type,
+                                           type_def->fields[i].name,
+                                           resolved_field_type,
+                                           sizeof(resolved_field_type),
+                                           field_abi,
+                                           sizeof(field_abi),
+                                           &field_offset)) {
+                    ok = false;
+                    break;
+                }
+                v3_emit_address_spill_store(out, cap, call_arg_base, call_depth, addr_reg);
+                v3_emit_address_spill_load(out, cap, call_arg_base, call_depth, field_addr_reg);
+                if (field_offset != 0 &&
+                    !v3_emit_add_address_offset(out, cap, field_addr_reg, field_addr_reg, field_offset)) {
+                    ok = false;
+                    break;
+                }
+                if (v3_type_needs_bytes_orc_lifecycle(lowering,
+                                                      type_aliases,
+                                                      type_alias_count,
+                                                      type_def->owner_module_path,
+                                                      resolved_field_type,
+                                                      depth + 1U) &&
+                    !v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                            lowering,
+                                                            current_function,
+                                                            type_aliases,
+                                                            type_alias_count,
+                                                            type_def->owner_module_path,
+                                                            resolved_field_type,
+                                                            field_addr_reg,
+                                                            call_arg_base,
+                                                            call_depth + 1,
+                                                            retain,
+                                                            out,
+                                                            cap,
+                                                            depth + 1U)) {
+                    ok = false;
+                    break;
+                }
+            }
+            free(type_aliases);
+            return ok;
+        }
+        free(type_aliases);
+    }
+    return true;
+}
+
+static bool v3_emit_clone_composite_address_to_address(const V3SystemLinkPlanStub *plan,
+                                                       const V3LoweringPlanStub *lowering,
+                                                       const V3LoweredFunctionStub *current_function,
+                                                       const V3ImportAlias *aliases,
+                                                       size_t alias_count,
+                                                       const char *type_text,
+                                                       int dest_addr_reg,
+                                                       int src_addr_reg,
+                                                       int32_t call_arg_base,
+                                                       int call_depth,
+                                                       char *out,
+                                                       size_t cap) {
+    V3TypeLayoutStub layout;
+    if (!v3_compute_type_layout_impl(lowering, type_text, &layout, 0U)) {
+        return false;
+    }
+    return v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+}
+
+static bool v3_emit_orc_safe_composite_assignment_to_address(const V3SystemLinkPlanStub *plan,
+                                                             const V3LoweringPlanStub *lowering,
+                                                             const V3LoweredFunctionStub *current_function,
+                                                             const V3ImportAlias *aliases,
+                                                             size_t alias_count,
+                                                             const V3AsmLocalSlot *locals,
+                                                             size_t local_count,
+                                                             const char *expr_text,
+                                                             const char *dest_type_text,
+                                                             int dest_addr_reg,
+                                                             int32_t call_arg_base,
+                                                             int32_t string_temp_base,
+                                                             int32_t string_temp_stride,
+                                                             int32_t *string_label_index_io,
+                                                             int call_depth,
+                                                             char *out,
+                                                             size_t cap) {
+    char normalized_type[CHENG_V3_MAX_TYPE_TEXT];
+    V3TypeLayoutStub layout;
+    int32_t temp_bytes;
+    int32_t adjusted_call_arg_base;
+    int32_t source_slot_index;
+    int source_base_reg;
+    int temp_addr_reg;
+    if (!v3_normalize_type_text(lowering,
+                                current_function->owner_module_path,
+                                aliases,
+                                alias_count,
+                                dest_type_text,
+                                normalized_type,
+                                sizeof(normalized_type)) ||
+        !v3_compute_type_layout_impl(lowering, normalized_type, &layout, 0U)) {
+        return false;
+    }
+    if (!v3_type_needs_bytes_orc_lifecycle(lowering,
+                                           aliases,
+                                           alias_count,
+                                           current_function->owner_module_path,
+                                           normalized_type,
+                                           0U)) {
+        return v3_materialize_composite_expr_into_address(plan,
+                                                          lowering,
+                                                          current_function,
+                                                          aliases,
+                                                          alias_count,
+                                                          locals,
+                                                          local_count,
+                                                          expr_text,
+                                                          normalized_type,
+                                                          dest_addr_reg,
+                                                          call_arg_base,
+                                                          string_temp_base,
+                                                          string_temp_stride,
+                                                          string_label_index_io,
+                                                          call_depth,
+                                                          out,
+                                                          cap);
+    }
+    temp_bytes = v3_align_up_i32(layout.size, 16);
+    if (temp_bytes <= 0 ||
+        !v3_emit_sp_adjust(out, cap, true, temp_bytes)) {
+        return false;
+    }
+    adjusted_call_arg_base = call_arg_base + temp_bytes;
+    temp_addr_reg = dest_addr_reg == 14 ? 15 : 14;
+    source_slot_index = v3_find_local_slot(locals, local_count, expr_text);
+    source_base_reg = ((dest_addr_reg == 13 || temp_addr_reg == 13) ? 12 : 13);
+    v3_emit_address_spill_store(out, cap, adjusted_call_arg_base, call_depth, dest_addr_reg);
+    if (!v3_emit_sp_offset_address(out, cap, temp_addr_reg, 0) ||
+        !((source_slot_index >= 0) ?
+              v3_emit_sp_offset_address(out, cap, source_base_reg, temp_bytes) :
+              true) ||
+        !((source_slot_index >= 0) ?
+              v3_emit_clone_slot_to_address_for_assignment(plan,
+                                                           lowering,
+                                                           current_function,
+                                                           aliases,
+                                                           alias_count,
+                                                           adjusted_call_arg_base,
+                                                           call_depth,
+                                                           out,
+                                                           cap,
+                                                           &locals[source_slot_index],
+                                                           source_base_reg,
+                                                           temp_addr_reg) :
+              v3_materialize_composite_expr_into_address(plan,
+                                                         lowering,
+                                                         current_function,
+                                                         aliases,
+                                                         alias_count,
+                                                         locals,
+                                                         local_count,
+                                                         expr_text,
+                                                         normalized_type,
+                                                         temp_addr_reg,
+                                                         adjusted_call_arg_base,
+                                                         string_temp_base,
+                                                         string_temp_stride,
+                                                         string_label_index_io,
+                                                         call_depth,
+                                                         out,
+                                                         cap))) {
+        v3_emit_sp_adjust(out, cap, false, temp_bytes);
+        return false;
+    }
+    v3_emit_address_spill_load(out, cap, adjusted_call_arg_base, call_depth, dest_addr_reg);
+    v3_emit_address_spill_store(out, cap, adjusted_call_arg_base, call_depth, dest_addr_reg);
+    if (!v3_emit_bytes_orc_lifecycle_at_address(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                current_function->owner_module_path,
+                                                normalized_type,
+                                                dest_addr_reg,
+                                                adjusted_call_arg_base,
+                                                call_depth,
+                                                false,
+                                                out,
+                                                cap,
+                                                0U)) {
+        v3_emit_sp_adjust(out, cap, false, temp_bytes);
+        return false;
+    }
+    v3_emit_address_spill_load(out, cap, adjusted_call_arg_base, call_depth, dest_addr_reg);
+    if (!v3_emit_sp_offset_address(out, cap, temp_addr_reg, 0) ||
+        !v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, temp_addr_reg, layout.size) ||
+        !v3_emit_sp_adjust(out, cap, false, temp_bytes)) {
+        return false;
     }
     return true;
 }
@@ -32033,7 +33561,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                     free(args);
                     return false;
                 }
-                ok = v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+                ok = v3_emit_clone_composite_address_to_address(plan,
+                                                                lowering,
+                                                                current_function,
+                                                                aliases,
+                                                                alias_count,
+                                                                field_type,
+                                                                dest_addr_reg,
+                                                                src_addr_reg,
+                                                                call_arg_base,
+                                                                call_depth,
+                                                                out,
+                                                                cap);
                 free(args);
                 return ok;
             }
@@ -32065,7 +33604,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                     free(args);
                     return false;
                 }
-                ok = v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+                ok = v3_emit_clone_composite_address_to_address(plan,
+                                                                lowering,
+                                                                current_function,
+                                                                aliases,
+                                                                alias_count,
+                                                                field_type,
+                                                                dest_addr_reg,
+                                                                src_addr_reg,
+                                                                call_arg_base,
+                                                                call_depth,
+                                                                out,
+                                                                cap);
                 free(args);
                 return ok;
             }
@@ -32111,7 +33661,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                     free(args);
                     return false;
                 }
-                ok = v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+                ok = v3_emit_clone_composite_address_to_address(plan,
+                                                                lowering,
+                                                                current_function,
+                                                                aliases,
+                                                                alias_count,
+                                                                field_type,
+                                                                dest_addr_reg,
+                                                                src_addr_reg,
+                                                                call_arg_base,
+                                                                call_depth,
+                                                                out,
+                                                                cap);
                 free(args);
                 return ok;
             }
@@ -32122,7 +33683,17 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
     if (local_index >= 0 &&
         v3_expr_materializes_to_address(locals[local_index].type_text,
                                         locals[local_index].abi_class)) {
-        return v3_emit_copy_slot_to_address(plan, lowering, out, cap, &locals[local_index], dest_addr_reg);
+        return v3_emit_copy_slot_to_address(plan,
+                                            lowering,
+                                            current_function,
+                                            aliases,
+                                            alias_count,
+                                            call_arg_base,
+                                            call_depth,
+                                            out,
+                                            cap,
+                                            &locals[local_index],
+                                            dest_addr_reg);
     }
     {
         const V3TopLevelConstStub *top_level_const =
@@ -32167,7 +33738,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                 !v3_compute_type_layout_impl(lowering, global_type, &layout, 0U)) {
                 return false;
             }
-            return v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+            return v3_emit_clone_composite_address_to_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              global_type,
+                                                              dest_addr_reg,
+                                                              src_addr_reg,
+                                                              call_arg_base,
+                                                              call_depth,
+                                                              out,
+                                                              cap);
         }
     }
     {
@@ -32207,7 +33789,18 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                          call_arg_base,
                                          call_depth,
                                          dest_addr_reg);
-            return v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+            return v3_emit_clone_composite_address_to_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              field_type,
+                                                              dest_addr_reg,
+                                                              src_addr_reg,
+                                                              call_arg_base,
+                                                              call_depth,
+                                                              out,
+                                                              cap);
         }
         if (v3_parse_index_access_expr(expr,
                                        base_expr,
@@ -32288,151 +33881,25 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                          call_arg_base,
                                          call_depth,
                                          dest_addr_reg);
-            return v3_emit_copy_address_to_address(plan, out, cap, dest_addr_reg, src_addr_reg, layout.size);
+            return v3_emit_clone_composite_address_to_address(plan,
+                                                              lowering,
+                                                              current_function,
+                                                              aliases,
+                                                              alias_count,
+                                                              field_type,
+                                                              dest_addr_reg,
+                                                              src_addr_reg,
+                                                              call_arg_base,
+                                                              call_depth,
+                                                              out,
+                                                              cap);
         }
     }
     {
         size_t arg_count = 0U;
         char (*args)[4096] = v3_alloc_call_arg_scratch();
         if (v3_parse_call_text(expr, inner_callee, sizeof(inner_callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS)) {
-            V3AsmCallTarget target;
-            V3NativeCompositeCallLoweringRule composite_rule;
-            V3ResultIntrinsicKind result_kind =
-                v3_resolve_result_intrinsic_kind(lowering,
-                                                 current_function->owner_module_path,
-                                                 aliases,
-                                                 alias_count,
-                                                 inner_callee);
-            if (result_kind == V3_RESULT_INTRINSIC_ERR_CODE) {
-                bool ok = v3_emit_result_constructor_into_address(plan,
-                                                                  lowering,
-                                                                  current_function,
-                                                                  aliases,
-                                                                  alias_count,
-                                                                  locals,
-                                                                  local_count,
-                                                                  result_kind,
-                                                                  inner_callee,
-                                                                  args,
-                                                                  arg_count,
-                                                                  normalized_dest_type,
-                                                                  dest_addr_reg,
-                                                                  call_arg_base,
-                                                                  string_temp_base,
-                                                                  string_temp_stride,
-                                                                  string_label_index_io,
-                                                                  call_depth,
-                                                                  out,
-                                                                  cap);
-                free(args);
-                return ok;
-            }
-            if (v3_resolve_native_composite_call_lowering_rule_with_args(plan,
-                                                                         lowering,
-                                                                         current_function,
-                                                                         aliases,
-                                                                         alias_count,
-                                                                         locals,
-                                                                         local_count,
-                                                                         inner_callee,
-                                                                         args,
-                                                                         arg_count,
-                                                                         &target,
-                                                                         &composite_rule)) {
-                if (!v3_codegen_call_into_address(plan,
-                                                  lowering,
-                                                  current_function,
-                                                  aliases,
-                                                  alias_count,
-                                                  locals,
-                                                  local_count,
-                                                  inner_callee,
-                                                  args,
-                                                  arg_count,
-                                                  dest_addr_reg,
-                                                  call_arg_base,
-                                                  string_temp_base,
-                                                  string_temp_stride,
-                                                  string_label_index_io,
-                                                  call_depth,
-                                                  out,
-                                                  cap)) {
-                    free(args);
-                    return false;
-                }
-                free(args);
-                return true;
-            }
-            if (v3_callee_is_constructor_like(lowering,
-                                              current_function->owner_module_path,
-                                              aliases,
-                                              alias_count,
-                                              inner_callee)) {
-                bool ok = v3_emit_constructor_into_address(plan,
-                                                           lowering,
-                                                           current_function,
-                                                           aliases,
-                                                           alias_count,
-                                                           locals,
-                                                           local_count,
-                                                           inner_callee,
-                                                           args,
-                                                           arg_count,
-                                                           normalized_dest_type,
-                                                           dest_addr_reg,
-                                                           call_arg_base,
-                                                           string_temp_base,
-                                                           string_temp_stride,
-                                                           string_label_index_io,
-                                                           call_depth,
-                                                           out,
-                                                           cap);
-                free(args);
-                return ok;
-            }
-            free(args);
-            return false;
-        }
-        free(args);
-    }
-    if (v3_parse_prefix_single_arg_call(expr, inner_callee, sizeof(inner_callee), arg_text, sizeof(arg_text))) {
-        V3AsmCallTarget target;
-        V3NativeCompositeCallLoweringRule composite_rule;
-        V3ResultIntrinsicKind result_kind =
-            v3_resolve_result_intrinsic_kind(lowering,
-                                             current_function->owner_module_path,
-                                             aliases,
-                                             alias_count,
-                                             inner_callee);
-        char (*args)[4096] = v3_alloc_call_arg_scratch();
-        snprintf(args[0], sizeof(args[0]), "%s", arg_text);
-        if (result_kind == V3_RESULT_INTRINSIC_OK ||
-            result_kind == V3_RESULT_INTRINSIC_ERR ||
-            result_kind == V3_RESULT_INTRINSIC_ERR_INFO) {
-            bool ok = v3_emit_result_constructor_into_address(plan,
-                                                              lowering,
-                                                              current_function,
-                                                              aliases,
-                                                              alias_count,
-                                                              locals,
-                                                              local_count,
-                                                              result_kind,
-                                                              inner_callee,
-                                                              args,
-                                                              1U,
-                                                              normalized_dest_type,
-                                                              dest_addr_reg,
-                                                              call_arg_base,
-                                                              string_temp_base,
-                                                              string_temp_stride,
-                                                              string_label_index_io,
-                                                              call_depth,
-                                                              out,
-                                                              cap);
-            free(args);
-            return ok;
-        }
-        if (!v3_resolve_native_composite_call_lowering_rule_with_args(plan,
+            bool ok = v3_materialize_composite_call_expr_into_address(plan,
                                                                       lowering,
                                                                       current_function,
                                                                       aliases,
@@ -32440,32 +33907,48 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                                       locals,
                                                                       local_count,
                                                                       inner_callee,
-                                                                      (const char (*)[4096])args,
-                                                                      1U,
-                                                                      &target,
-                                                                      &composite_rule)) {
+                                                                      sizeof(inner_callee),
+                                                                      args,
+                                                                      &arg_count,
+                                                                      normalized_dest_type,
+                                                                      dest_addr_reg,
+                                                                      call_arg_base,
+                                                                      string_temp_base,
+                                                                      string_temp_stride,
+                                                                      string_label_index_io,
+                                                                      call_depth,
+                                                                      out,
+                                                                      cap);
             free(args);
-            return false;
+            return ok;
         }
+        free(args);
+    }
+    if (v3_parse_prefix_single_arg_call(expr, inner_callee, sizeof(inner_callee), arg_text, sizeof(arg_text))) {
+        char (*args)[4096] = v3_alloc_call_arg_scratch();
+        size_t arg_count = 1U;
+        snprintf(args[0], sizeof(args[0]), "%s", arg_text);
         {
-            bool ok = v3_codegen_call_into_address(plan,
-                                                   lowering,
-                                                   current_function,
-                                                   aliases,
-                                                   alias_count,
-                                                   locals,
-                                                   local_count,
-                                                   inner_callee,
-                                                   args,
-                                                   1U,
-                                                   dest_addr_reg,
-                                                   call_arg_base,
-                                                   string_temp_base,
-                                                   string_temp_stride,
-                                                   string_label_index_io,
-                                                   call_depth,
-                                                   out,
-                                                   cap);
+            bool ok = v3_materialize_composite_call_expr_into_address(plan,
+                                                                      lowering,
+                                                                      current_function,
+                                                                      aliases,
+                                                                      alias_count,
+                                                                      locals,
+                                                                      local_count,
+                                                                      inner_callee,
+                                                                      sizeof(inner_callee),
+                                                                      args,
+                                                                      &arg_count,
+                                                                      normalized_dest_type,
+                                                                      dest_addr_reg,
+                                                                      call_arg_base,
+                                                                      string_temp_base,
+                                                                      string_temp_stride,
+                                                                      string_label_index_io,
+                                                                      call_depth,
+                                                                      out,
+                                                                      cap);
             free(args);
             return ok;
         }
@@ -32562,6 +34045,446 @@ static bool v3_codegen_binary_expr_into_address(const V3SystemLinkPlanStub *plan
                                         call_depth,
                                         out,
                                         cap);
+}
+
+static bool v3_build_native_str_eq_target(const V3SystemLinkPlanStub *plan,
+                                          V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 2U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "driver_c_str_eq_bridge");
+    v3_copy_target_symbol_name(plan,
+                               "driver_c_str_eq_bridge",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "i32");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "str");
+    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "str");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "composite");
+    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "composite");
+    return true;
+}
+
+static bool v3_build_native_str_to_cstring_target(const V3SystemLinkPlanStub *plan,
+                                                  V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 1U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_str_to_cstring_temp_bridge");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_str_to_cstring_temp_bridge",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "ptr");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "ptr");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "str");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "composite");
+    return true;
+}
+
+static bool v3_build_native_copy_mem_target(const V3SystemLinkPlanStub *plan,
+                                            V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 3U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "copyMem");
+    v3_copy_target_symbol_name(plan,
+                               "copyMem",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "ptr");
+    snprintf(target->param_types[2], sizeof(target->param_types[2]), "%s", "int32");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "ptr");
+    snprintf(target->param_abi_classes[2], sizeof(target->param_abi_classes[2]), "%s", "i32");
+    return true;
+}
+
+static bool v3_build_native_strcmp_target(const V3SystemLinkPlanStub *plan,
+                                          V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 2U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_strcmp");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_strcmp",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "i32");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "ptr");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "ptr");
+    return true;
+}
+
+static bool v3_build_native_bounds_check_target(const V3SystemLinkPlanStub *plan,
+                                                V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 2U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_bounds_check");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_bounds_check",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "int32");
+    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "i32");
+    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+    return true;
+}
+
+static bool v3_build_native_puts_target(const V3SystemLinkPlanStub *plan,
+                                        V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 1U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "puts");
+    v3_copy_target_symbol_name(plan,
+                               "puts",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "i32");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+    return true;
+}
+
+static bool v3_build_native_panic_cstring_target(const V3SystemLinkPlanStub *plan,
+                                                 V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 1U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_v3_panic_cstring_and_exit");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_v3_panic_cstring_and_exit",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+    return true;
+}
+
+typedef enum V3NativeSeqRuntimeKind {
+    V3_NATIVE_SEQ_RUNTIME_INVALID = 0,
+    V3_NATIVE_SEQ_RUNTIME_LEN_GET = 1,
+    V3_NATIVE_SEQ_RUNTIME_GROW_INST = 2,
+    V3_NATIVE_SEQ_RUNTIME_BUFFER_GET = 3,
+    V3_NATIVE_SEQ_RUNTIME_ZERO_TAIL_RAW = 4,
+    V3_NATIVE_SEQ_RUNTIME_LEN_SET = 5,
+    V3_NATIVE_SEQ_RUNTIME_SET_GROW = 6
+} V3NativeSeqRuntimeKind;
+
+static bool v3_build_native_seq_runtime_target(const V3SystemLinkPlanStub *plan,
+                                               V3NativeSeqRuntimeKind kind,
+                                               V3AsmCallTarget *target) {
+    const char *symbol = NULL;
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    switch (kind) {
+        case V3_NATIVE_SEQ_RUNTIME_LEN_GET:
+            symbol = "cheng_seq_header_len_get";
+            target->param_count = 1U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "int32");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "i32");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            break;
+        case V3_NATIVE_SEQ_RUNTIME_GROW_INST:
+            symbol = "cheng_seq_grow_inst";
+            target->param_count = 3U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+            snprintf(target->param_types[2], sizeof(target->param_types[2]), "%s", "int32");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+            snprintf(target->param_abi_classes[2], sizeof(target->param_abi_classes[2]), "%s", "i32");
+            break;
+        case V3_NATIVE_SEQ_RUNTIME_BUFFER_GET:
+            symbol = "cheng_seq_header_buffer_get";
+            target->param_count = 1U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "ptr");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "ptr");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            break;
+        case V3_NATIVE_SEQ_RUNTIME_ZERO_TAIL_RAW:
+            symbol = "cheng_seq_zero_tail_raw";
+            target->param_count = 5U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+            snprintf(target->param_types[2], sizeof(target->param_types[2]), "%s", "int32");
+            snprintf(target->param_types[3], sizeof(target->param_types[3]), "%s", "int32");
+            snprintf(target->param_types[4], sizeof(target->param_types[4]), "%s", "int32");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+            snprintf(target->param_abi_classes[2], sizeof(target->param_abi_classes[2]), "%s", "i32");
+            snprintf(target->param_abi_classes[3], sizeof(target->param_abi_classes[3]), "%s", "i32");
+            snprintf(target->param_abi_classes[4], sizeof(target->param_abi_classes[4]), "%s", "i32");
+            break;
+        case V3_NATIVE_SEQ_RUNTIME_LEN_SET:
+            symbol = "cheng_seq_header_len_set";
+            target->param_count = 2U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+            break;
+        case V3_NATIVE_SEQ_RUNTIME_SET_GROW:
+            symbol = "cheng_seq_set_grow";
+            target->param_count = 3U;
+            snprintf(target->return_type, sizeof(target->return_type), "%s", "ptr");
+            snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "ptr");
+            snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+            snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+            snprintf(target->param_types[2], sizeof(target->param_types[2]), "%s", "int32");
+            snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+            snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+            snprintf(target->param_abi_classes[2], sizeof(target->param_abi_classes[2]), "%s", "i32");
+            break;
+        default:
+            return false;
+    }
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", symbol);
+    v3_copy_target_symbol_name(plan, symbol, target->symbol_name, sizeof(target->symbol_name));
+    return true;
+}
+
+static bool v3_emit_native_builtin_reg0_ptr_call(const V3SystemLinkPlanStub *plan,
+                                                 const V3AsmCallTarget *target,
+                                                 char *out,
+                                                 size_t cap) {
+    if (plan == NULL || target == NULL || out == NULL || target->symbol_name[0] == '\0') {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_append(out, cap, "  movq %rax, %rdi\n");
+    }
+    v3_emit_call_target_symbol_text(plan, out, cap, target->symbol_name);
+    return true;
+}
+
+static bool v3_emit_native_bounds_check_call(const V3SystemLinkPlanStub *plan,
+                                             char *out,
+                                             size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_bounds_check_target(plan, &target)) {
+        return false;
+    }
+    v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+    return true;
+}
+
+static bool v3_emit_native_bounds_check_call_i32_i32(const V3SystemLinkPlanStub *plan,
+                                                     int len_reg,
+                                                     int index_reg,
+                                                     char *out,
+                                                     size_t cap) {
+    if (plan == NULL || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_emit_x64_prepare_edi_esi_d_d(out, cap, len_reg, index_reg);
+    } else {
+        v3_emit_arm64_prepare_w0_w1_d_d(out, cap, len_reg, index_reg);
+    }
+    return v3_emit_native_bounds_check_call(plan, out, cap);
+}
+
+static bool v3_emit_native_copy_mem_call(const V3SystemLinkPlanStub *plan,
+                                         char *out,
+                                         size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_copy_mem_target(plan, &target)) {
+        return false;
+    }
+    v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+    return true;
+}
+
+static bool v3_emit_native_strcmp_call(const V3SystemLinkPlanStub *plan,
+                                       char *out,
+                                       size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_strcmp_target(plan, &target)) {
+        return false;
+    }
+    v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+    return true;
+}
+
+static bool v3_emit_native_puts_reg0_call(const V3SystemLinkPlanStub *plan,
+                                          char *out,
+                                          size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_puts_target(plan, &target)) {
+        return false;
+    }
+    return v3_emit_native_builtin_reg0_ptr_call(plan, &target, out, cap);
+}
+
+static bool v3_emit_native_panic_cstring_reg0_call(const V3SystemLinkPlanStub *plan,
+                                                   char *out,
+                                                   size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_panic_cstring_target(plan, &target)) {
+        return false;
+    }
+    return v3_emit_native_builtin_reg0_ptr_call(plan, &target, out, cap);
+}
+
+static bool v3_emit_native_seq_runtime_call(const V3SystemLinkPlanStub *plan,
+                                            V3NativeSeqRuntimeKind kind,
+                                            char *out,
+                                            size_t cap) {
+    V3AsmCallTarget target;
+    if (plan == NULL || out == NULL ||
+        !v3_build_native_seq_runtime_target(plan, kind, &target)) {
+        return false;
+    }
+    v3_emit_call_target_symbol_text(plan, out, cap, target.symbol_name);
+    return true;
+}
+
+static bool v3_emit_native_seq_runtime_call_ptr(const V3SystemLinkPlanStub *plan,
+                                                V3NativeSeqRuntimeKind kind,
+                                                int ptr_reg,
+                                                char *out,
+                                                size_t cap) {
+    if (plan == NULL || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(ptr_reg));
+    } else {
+        v3_emit_arm64_prepare_x0_w1_q_d(out, cap, ptr_reg, 1);
+    }
+    return v3_emit_native_seq_runtime_call(plan, kind, out, cap);
+}
+
+static bool v3_emit_native_seq_runtime_call_ptr_i32(const V3SystemLinkPlanStub *plan,
+                                                    V3NativeSeqRuntimeKind kind,
+                                                    int ptr_reg,
+                                                    int value_reg,
+                                                    char *out,
+                                                    size_t cap) {
+    if (plan == NULL || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_emit_x64_prepare_rdi_esi_q_d(out, cap, ptr_reg, value_reg);
+    } else {
+        v3_emit_arm64_prepare_x0_w1_q_d(out, cap, ptr_reg, value_reg);
+    }
+    return v3_emit_native_seq_runtime_call(plan, kind, out, cap);
+}
+
+static bool v3_emit_native_seq_runtime_call_ptr_i32_i32(const V3SystemLinkPlanStub *plan,
+                                                        V3NativeSeqRuntimeKind kind,
+                                                        int ptr_reg,
+                                                        int value0_reg,
+                                                        int value1_reg,
+                                                        char *out,
+                                                        size_t cap) {
+    if (plan == NULL || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %%rdi\n"
+                        "  movl %s, %%esi\n"
+                        "  movl %s, %%edx\n",
+                        v3_x64_qreg_name(ptr_reg),
+                        v3_x64_dreg_name(value0_reg),
+                        v3_x64_dreg_name(value1_reg));
+    } else {
+        v3_emit_arm64_prepare_x0_w1_w2_q_d_d(out, cap, ptr_reg, value0_reg, value1_reg);
+    }
+    return v3_emit_native_seq_runtime_call(plan, kind, out, cap);
+}
+
+static bool v3_emit_native_seq_runtime_call_ptr_i32_i32_i32_i32(const V3SystemLinkPlanStub *plan,
+                                                                V3NativeSeqRuntimeKind kind,
+                                                                int ptr_reg,
+                                                                int value0_reg,
+                                                                int value1_reg,
+                                                                int value2_reg,
+                                                                int value3_reg,
+                                                                char *out,
+                                                                size_t cap) {
+    if (plan == NULL || out == NULL) {
+        return false;
+    }
+    if (v3_active_target_is_linux_x86_64()) {
+        v3_text_appendf(out,
+                        cap,
+                        "  movq %s, %%rdi\n"
+                        "  movl %s, %%esi\n"
+                        "  movl %s, %%edx\n"
+                        "  movl %s, %%ecx\n"
+                        "  movl %s, %%r8d\n",
+                        v3_x64_qreg_name(ptr_reg),
+                        v3_x64_dreg_name(value0_reg),
+                        v3_x64_dreg_name(value1_reg),
+                        v3_x64_dreg_name(value2_reg),
+                        v3_x64_dreg_name(value3_reg));
+    } else {
+        v3_emit_arm64_prepare_x0_w1_w2_w3_w4_q_d_d_d_d(out,
+                                                        cap,
+                                                        ptr_reg,
+                                                        value0_reg,
+                                                        value1_reg,
+                                                        value2_reg,
+                                                        value3_reg);
+    }
+    return v3_emit_native_seq_runtime_call(plan, kind, out, cap);
 }
 
 static bool v3_emit_builtin_str_expr_address(const V3SystemLinkPlanStub *plan,
@@ -32669,18 +34592,9 @@ static bool v3_emit_builtin_str_to_cstring_bridge(const V3SystemLinkPlanStub *pl
                                                   size_t cap) {
     V3AsmCallTarget target;
     V3NativeCallLoweringRule rule;
-    memset(&target, 0, sizeof(target));
-    target.external = true;
-    target.param_count = 1U;
-    snprintf(target.callee_name, sizeof(target.callee_name), "%s", "cheng_str_to_cstring_temp_bridge");
-    v3_copy_target_symbol_name(plan,
-                               "cheng_str_to_cstring_temp_bridge",
-                               target.symbol_name,
-                               sizeof(target.symbol_name));
-    snprintf(target.return_type, sizeof(target.return_type), "%s", "ptr");
-    snprintf(target.return_abi_class, sizeof(target.return_abi_class), "%s", "ptr");
-    snprintf(target.param_types[0], sizeof(target.param_types[0]), "%s", "str");
-    snprintf(target.param_abi_classes[0], sizeof(target.param_abi_classes[0]), "%s", "composite");
+    if (!v3_build_native_str_to_cstring_target(plan, &target)) {
+        return false;
+    }
     v3_emit_call_arg_spill_store(out,
                                  cap,
                                  call_arg_base,
@@ -32698,6 +34612,7 @@ static bool v3_emit_builtin_str_to_cstring_bridge(const V3SystemLinkPlanStub *pl
                                     alias_count,
                                     &target,
                                     &rule,
+                                    V3_NATIVE_COMPOSITE_RESULT_UNSUPPORTED,
                                     call_arg_base,
                                     call_depth,
                                     out,
@@ -32869,17 +34784,21 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
         }
         if (v3_active_target_is_linux_x86_64()) {
             v3_emit_load_scalar_from_address(out, cap, 15, 0, "i32", 10);
-            v3_emit_x64_prepare_rdi_esi_q_d(out, cap, 15, 10);
         } else {
-            v3_text_appendf(out, cap,
-                            "  ldrsw x10, [x15, #0]\n"
-                            "  mov x0, x15\n"
-                            "  mov x1, x10\n");
+            v3_text_appendf(out, cap, "  ldrsw x10, [x15, #0]\n");
         }
         if (!v3_emit_mov_imm(out, cap, 2, elem_size)) {
             return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_set_grow");
+        if (!v3_emit_native_seq_runtime_call_ptr_i32_i32(plan,
+                                                         V3_NATIVE_SEQ_RUNTIME_SET_GROW,
+                                                         15,
+                                                         10,
+                                                         2,
+                                                         out,
+                                                         cap)) {
+            return false;
+        }
         v3_emit_address_spill_store(out, cap, call_arg_base, 0, 0);
         if (!v3_expr_materializes_to_address(elem_type, elem_abi)) {
             if (!v3_codegen_expr_scalar(plan,
@@ -33033,12 +34952,13 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
         v3_emit_call_arg_spill_store(out, cap, call_arg_base, 0, 1U, "i32", 10);
 
         v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(15));
-        } else {
-            v3_text_appendf(out, cap, "  mov x0, x15\n");
+        if (!v3_emit_native_seq_runtime_call_ptr(plan,
+                                                 V3_NATIVE_SEQ_RUNTIME_LEN_GET,
+                                                 15,
+                                                 out,
+                                                 cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_header_len_get");
         v3_emit_call_arg_spill_store(out, cap, call_arg_base, 0, 2U, "i32", 0);
 
         v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
@@ -33046,29 +34966,24 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
         if (!v3_emit_mov_imm(out, cap, 11, elem_size)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap,
-                            "  movq %s, %%rdi\n"
-                            "  movl %s, %%esi\n"
-                            "  movl %s, %%edx\n",
-                            v3_x64_qreg_name(15),
-                            v3_x64_dreg_name(10),
-                            v3_x64_dreg_name(11));
-        } else {
-            v3_text_appendf(out, cap,
-                            "  mov x0, x15\n"
-                            "  mov w1, w10\n"
-                            "  mov w2, w11\n");
+        if (!v3_emit_native_seq_runtime_call_ptr_i32_i32(plan,
+                                                         V3_NATIVE_SEQ_RUNTIME_GROW_INST,
+                                                         15,
+                                                         10,
+                                                         11,
+                                                         out,
+                                                         cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_grow_inst");
 
         v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap, "  movq %s, %%rdi\n", v3_x64_qreg_name(15));
-        } else {
-            v3_text_appendf(out, cap, "  mov x0, x15\n");
+        if (!v3_emit_native_seq_runtime_call_ptr(plan,
+                                                 V3_NATIVE_SEQ_RUNTIME_BUFFER_GET,
+                                                 15,
+                                                 out,
+                                                 cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_header_buffer_get");
         v3_emit_address_spill_store(out, cap, call_arg_base, 1, 0);
 
         v3_emit_address_spill_load(out, cap, call_arg_base, 1, 15);
@@ -33078,42 +34993,28 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
             !v3_emit_mov_imm(out, cap, 9, 0)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap,
-                            "  movq %s, %%rdi\n"
-                            "  movl %s, %%esi\n"
-                            "  movl %s, %%edx\n"
-                            "  movl %s, %%ecx\n"
-                            "  movl %s, %%r8d\n",
-                            v3_x64_qreg_name(15),
-                            v3_x64_dreg_name(9),
-                            v3_x64_dreg_name(10),
-                            v3_x64_dreg_name(11),
-                            v3_x64_dreg_name(12));
-        } else {
-            v3_text_appendf(out, cap,
-                            "  mov x0, x15\n"
-                            "  mov w1, w9\n"
-                            "  mov w2, w10\n"
-                            "  mov w3, w11\n"
-                            "  mov w4, w12\n");
+        if (!v3_emit_native_seq_runtime_call_ptr_i32_i32_i32_i32(plan,
+                                                                 V3_NATIVE_SEQ_RUNTIME_ZERO_TAIL_RAW,
+                                                                 15,
+                                                                 9,
+                                                                 10,
+                                                                 11,
+                                                                 12,
+                                                                 out,
+                                                                 cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_zero_tail_raw");
 
         v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
         v3_emit_call_arg_spill_load(out, cap, call_arg_base, 0, 1U, 10, "i32");
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_appendf(out, cap,
-                            "  movq %s, %%rdi\n"
-                            "  movl %s, %%esi\n",
-                            v3_x64_qreg_name(15),
-                            v3_x64_dreg_name(10));
-        } else {
-            v3_text_appendf(out, cap,
-                            "  mov x0, x15\n"
-                            "  mov w1, w10\n");
+        if (!v3_emit_native_seq_runtime_call_ptr_i32(plan,
+                                                     V3_NATIVE_SEQ_RUNTIME_LEN_SET,
+                                                     15,
+                                                     10,
+                                                     out,
+                                                     cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_seq_header_len_set");
         return true;
     }
     if ((strcmp(callee, "panic") == 0 || strcmp(callee, "system.panic") == 0) && arg_count == 1U) {
@@ -33136,11 +35037,7 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
             if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
                 return false;
             }
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_append(out, cap, "  movq %rax, %rdi\n");
-            }
-            v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
-            return true;
+            return v3_emit_native_panic_cstring_reg0_call(plan, out, cap);
         }
         if (!v3_infer_expr_type(plan,
                                 lowering,
@@ -33175,11 +35072,7 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
                                         cap)) {
                 return false;
             }
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_append(out, cap, "  movq %rax, %rdi\n");
-            }
-            v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
-            return true;
+            return v3_emit_native_panic_cstring_reg0_call(plan, out, cap);
         }
         if (strcmp(arg_type, "str") != 0 ||
             !v3_expr_materializes_to_address(arg_type, arg_abi)) {
@@ -33214,11 +35107,7 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
                                                    cap)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_append(out, cap, "  movq %rax, %rdi\n");
-        }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
-        return true;
+        return v3_emit_native_panic_cstring_reg0_call(plan, out, cap);
     }
     if (strcmp(callee, "echo") == 0) {
         char literal[4096];
@@ -33243,11 +35132,7 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
             if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
                 return false;
             }
-            if (v3_active_target_is_linux_x86_64()) {
-                v3_text_append(out, cap, "  movq %rax, %rdi\n");
-            }
-            v3_emit_call_named_symbol(plan, out, cap, "puts");
-            return true;
+            return v3_emit_native_puts_reg0_call(plan, out, cap);
         }
         if (!v3_infer_expr_type(plan,
                                 lowering,
@@ -33294,17 +35179,15 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
                                                    cap)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_append(out, cap, "  movq %rax, %rdi\n");
-        }
-        v3_emit_call_named_symbol(plan, out, cap, "puts");
-        return true;
+        return v3_emit_native_puts_reg0_call(plan, out, cap);
     }
     if (strcmp(callee, "assert") == 0) {
         char ok_label[128];
         int32_t label_id = v3_next_expr_label_id();
         char literal[4096];
         char label[128];
+        char arg_type[256];
+        char arg_abi[32];
         *handled_out = true;
         if ((arg_count != 1U && arg_count != 2U) ||
             !v3_codegen_expr_scalar(plan,
@@ -33329,7 +35212,77 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
         v3_emit_branch_nonzero(out, cap, 9, false, ok_label);
         if (arg_count == 2U) {
             if (!v3_parse_string_literal_text(args[1], literal, sizeof(literal))) {
-                return false;
+                if (!v3_infer_expr_type(plan,
+                                        lowering,
+                                        current_function,
+                                        aliases,
+                                        alias_count,
+                                        locals,
+                                        local_count,
+                                        args[1],
+                                        arg_type,
+                                        sizeof(arg_type),
+                                        arg_abi,
+                                        sizeof(arg_abi))) {
+                    return false;
+                }
+                if (strcmp(arg_abi, "ptr") == 0) {
+                    if (!v3_codegen_expr_scalar(plan,
+                                                lowering,
+                                                current_function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                args[1],
+                                                "ptr",
+                                                0,
+                                                call_arg_base,
+                                                string_temp_base,
+                                                string_temp_stride,
+                                                0,
+                                                out,
+                                                cap) ||
+                        !v3_emit_native_panic_cstring_reg0_call(plan, out, cap)) {
+                        return false;
+                    }
+                    v3_text_appendf(out, cap, "%s:\n", ok_label);
+                    return true;
+                }
+                if (strcmp(arg_type, "str") != 0 ||
+                    !v3_expr_materializes_to_address(arg_type, arg_abi) ||
+                    !v3_emit_builtin_str_expr_address(plan,
+                                                      lowering,
+                                                      current_function,
+                                                      aliases,
+                                                      alias_count,
+                                                      locals,
+                                                      local_count,
+                                                      args[1],
+                                                      "__v3_assert_str_tmp",
+                                                      15,
+                                                      call_arg_base,
+                                                      string_temp_base,
+                                                      string_temp_stride,
+                                                      string_label_index_io,
+                                                      0,
+                                                      out,
+                                                      cap) ||
+                    !v3_emit_builtin_str_to_cstring_bridge(plan,
+                                                           lowering,
+                                                           current_function,
+                                                           aliases,
+                                                           alias_count,
+                                                           15,
+                                                           call_arg_base,
+                                                           0,
+                                                           out,
+                                                           cap) ||
+                    !v3_emit_native_panic_cstring_reg0_call(plan, out, cap)) {
+                    return false;
+                }
+                v3_text_appendf(out, cap, "%s:\n", ok_label);
+                return true;
             }
         } else {
             snprintf(literal, sizeof(literal), "%s", "assert failed");
@@ -33347,10 +35300,9 @@ static bool v3_try_emit_builtin_statement_impl(const V3SystemLinkPlanStub *plan,
         if (!v3_emit_symbol_address_for_target(plan, out, cap, 0, label)) {
             return false;
         }
-        if (v3_active_target_is_linux_x86_64()) {
-            v3_text_append(out, cap, "  movq %rax, %rdi\n");
+        if (!v3_emit_native_panic_cstring_reg0_call(plan, out, cap)) {
+            return false;
         }
-        v3_emit_call_named_symbol(plan, out, cap, "cheng_v3_panic_cstring_and_exit");
         v3_text_appendf(out, cap, "%s:\n", ok_label);
         return true;
     }
@@ -35280,6 +37232,62 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
             return true;
         }
         if (local_index >= 0) {
+            if (locals[local_index].indirect_value) {
+                const char *value_type = locals[local_index].type_text;
+                const char *value_abi = locals[local_index].abi_class;
+                if (!v3_expr_materializes_to_address(value_type, value_abi)) {
+                    if (!v3_emit_local_value_address(out, cap, &locals[local_index], 15)) {
+                        return false;
+                    }
+                    v3_emit_address_spill_store(out, cap, call_arg_base, 0, 15);
+                    if (!v3_codegen_expr_scalar(plan,
+                                                lowering,
+                                                function,
+                                                aliases,
+                                                alias_count,
+                                                locals,
+                                                local_count,
+                                                expr,
+                                                value_abi,
+                                                9,
+                                                call_arg_base,
+                                                string_temp_base,
+                                                string_temp_stride,
+                                                0,
+                                                out,
+                                                cap)) {
+                        return false;
+                    }
+                    v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
+                    v3_emit_store_scalar_to_address(out, cap, 15, 0, value_abi, 9);
+                    return true;
+                }
+                if (!v3_emit_local_value_address(out, cap, &locals[local_index], 15)) {
+                    return false;
+                }
+                v3_emit_address_spill_store(out, cap, call_arg_base, 0, 15);
+                if (!v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                      lowering,
+                                                                      function,
+                                                                      aliases,
+                                                                      alias_count,
+                                                                      locals,
+                                                                      local_count,
+                                                                      expr,
+                                                                      value_type,
+                                                                      15,
+                                                                      call_arg_base,
+                                                                      string_temp_base,
+                                                                      string_temp_stride,
+                                                                      string_label_index_io,
+                                                                      0,
+                                                                      out,
+                                                                      cap)) {
+                    return false;
+                }
+                v3_emit_address_spill_load(out, cap, call_arg_base, 0, 15);
+                return true;
+            }
             const char *abi_class = locals[local_index].abi_class;
             if (!v3_expr_materializes_to_address(locals[local_index].type_text, abi_class)) {
                 if (!v3_codegen_expr_scalar(plan,
@@ -35303,24 +37311,26 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
                 v3_emit_store_slot(out, cap, &locals[local_index], 9);
                 return true;
             }
-            return v3_materialize_composite_expr_into_slot(plan,
-                                                           lowering,
-                                                           function,
-                                                           aliases,
-                                                           alias_count,
-                                                           locals,
-                                                           local_count,
-                                                           name,
-                                                           0U,
-                                                           expr,
-                                                           &locals[local_index],
-                                                           call_arg_base,
-                                                           string_temp_base,
-                                                           string_temp_stride,
-                                                           string_label_index_io,
-                                                           0,
-                                                           out,
-                                                           cap);
+            if (!v3_emit_slot_address(out, cap, &locals[local_index], 15)) {
+                return false;
+            }
+            return v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                    lowering,
+                                                                    function,
+                                                                    aliases,
+                                                                    alias_count,
+                                                                    locals,
+                                                                    local_count,
+                                                                    expr,
+                                                                    locals[local_index].type_text,
+                                                                    15,
+                                                                    call_arg_base,
+                                                                    string_temp_base,
+                                                                    string_temp_stride,
+                                                                    string_label_index_io,
+                                                                    0,
+                                                                    out,
+                                                                    cap);
         }
         if (v3_infer_lvalue_expr_type(plan,
                                       lowering,
@@ -35400,23 +37410,23 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
                                         cap)) {
                 return false;
             }
-            return v3_materialize_composite_expr_into_address(plan,
-                                                              lowering,
-                                                              function,
-                                                              aliases,
-                                                              alias_count,
-                                                              locals,
-                                                              local_count,
-                                                              expr,
-                                                              field_type,
-                                                              15,
-                                                              call_arg_base,
-                                                              string_temp_base,
-                                                              string_temp_stride,
-                                                              string_label_index_io,
-                                                              0,
-                                                              out,
-                                                              cap);
+            return v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                    lowering,
+                                                                    function,
+                                                                    aliases,
+                                                                    alias_count,
+                                                                    locals,
+                                                                    local_count,
+                                                                    expr,
+                                                                    field_type,
+                                                                    15,
+                                                                    call_arg_base,
+                                                                    string_temp_base,
+                                                                    string_temp_stride,
+                                                                    string_label_index_io,
+                                                                    0,
+                                                                    out,
+                                                                    cap);
         }
         return false;
     }
@@ -35457,7 +37467,11 @@ static bool v3_emit_non_if_statement(const V3SystemLinkPlanStub *plan,
         return true;
     }
     if (v3_startswith(statement, "return ")) {
-        if (v3_function_call_result_uses_address(function)) {
+        V3NativeFunctionLoweringRule rule;
+        if (!v3_build_native_function_lowering_rule(function, &rule)) {
+            return false;
+        }
+        if (v3_native_function_rule_result_uses_address(&rule)) {
             if (sret_local_index < 0 ||
                 !v3_emit_slot_address(out, cap, &locals[sret_local_index], 15) ||
                 !v3_materialize_composite_expr_into_address(plan,
@@ -37495,6 +39509,9 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
         char symbol_name[PATH_MAX];
         v3_primary_symbol_name(plan, function, symbol_name, sizeof(symbol_name));
         int32_t save_offset = frame_size - 16;
+        g_v3_current_frame_base_valid = true;
+        g_v3_current_frame_fp_to_base_offset =
+            v3_active_target_is_linux_x86_64() ? 0 : save_offset;
         out[0] = '\0';
         v3_emit_named_symbol_header(out,
                                     cap,
@@ -37513,6 +39530,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                 free(owned_lines);
                 return false;
             }
+            v3_text_append(out, cap, "  movq %rsp, %rbp\n");
         } else {
             if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
                 free(lines);
@@ -38131,23 +40149,23 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                         return false;
                     }
                     v3_emit_address_spill_store(out, cap, call_arg_base, 0, 15);
-                    if (!v3_materialize_composite_expr_into_address(plan,
-                                                                    lowering,
-                                                                    function,
-                                                                    aliases,
-                                                                    alias_count,
-                                                                    locals,
-                                                                    local_count,
-                                                                    expr,
-                                                                    value_type,
-                                                                    15,
-                                                                    call_arg_base,
-                                                                    string_temp_base,
-                                                                    string_temp_stride,
-                                                                    &string_label_index,
-                                                                    0,
-                                                                    out,
-                                                                    cap)) {
+                    if (!v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                          lowering,
+                                                                          function,
+                                                                          aliases,
+                                                                          alias_count,
+                                                                          locals,
+                                                                          local_count,
+                                                                          expr,
+                                                                          value_type,
+                                                                          15,
+                                                                          call_arg_base,
+                                                                          string_temp_base,
+                                                                          string_temp_stride,
+                                                                          &string_label_index,
+                                                                          0,
+                                                                          out,
+                                                                          cap)) {
                         fprintf(stderr,
                                 "[cheng_v3_seed] emit indirect local composite assignment failed function=%s target=%s expr=%s type=%s stmt=%s\n",
                                 function->symbol_text,
@@ -38194,24 +40212,24 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                     v3_emit_store_slot(out, cap, &locals[local_index], 9);
                     continue;
                 }
-                if (!v3_materialize_composite_expr_into_slot(plan,
-                                                             lowering,
-                                                             function,
-                                                             aliases,
-                                                             alias_count,
-                                                             locals,
-                                                             local_count,
-                                                             name,
-                                                             0U,
-                                                             expr,
-                                                             &locals[local_index],
-                                                             call_arg_base,
-                                                             string_temp_base,
-                                                             string_temp_stride,
-                                                             &string_label_index,
-                                                             0,
-                                                             out,
-                                                             cap)) {
+                if (!v3_emit_slot_address(out, cap, &locals[local_index], 15) ||
+                    !v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                      lowering,
+                                                                      function,
+                                                                      aliases,
+                                                                      alias_count,
+                                                                      locals,
+                                                                      local_count,
+                                                                      expr,
+                                                                      locals[local_index].type_text,
+                                                                      15,
+                                                                      call_arg_base,
+                                                                      string_temp_base,
+                                                                      string_temp_stride,
+                                                                      &string_label_index,
+                                                                      0,
+                                                                      out,
+                                                                      cap)) {
                     fprintf(stderr,
                             "[cheng_v3_seed] emit local composite assignment failed function=%s target=%s expr=%s stmt=%s\n",
                             function->symbol_text,
@@ -38329,23 +40347,23 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                     free(owned_lines);
                     return false;
                 }
-                if (!v3_materialize_composite_expr_into_address(plan,
-                                                                lowering,
-                                                                function,
-                                                                aliases,
-                                                                alias_count,
-                                                                locals,
-                                                                local_count,
-                                                                expr,
-                                                                field_type,
-                                                                15,
-                                                                call_arg_base,
-                                                                string_temp_base,
-                                                                string_temp_stride,
-                                                                &string_label_index,
-                                                                0,
-                                                                out,
-                                                                cap)) {
+                if (!v3_emit_orc_safe_composite_assignment_to_address(plan,
+                                                                      lowering,
+                                                                      function,
+                                                                      aliases,
+                                                                      alias_count,
+                                                                      locals,
+                                                                      local_count,
+                                                                      expr,
+                                                                      field_type,
+                                                                      15,
+                                                                      call_arg_base,
+                                                                      string_temp_base,
+                                                                      string_temp_stride,
+                                                                      &string_label_index,
+                                                                      0,
+                                                                      out,
+                                                                      cap)) {
                     fprintf(stderr,
                             "[cheng_v3_seed] emit lvalue composite materialize failed function=%s target=%s expr=%s type=%s stmt=%s\n",
                             function->symbol_text,
@@ -38521,38 +40539,38 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
             continue;
         }
         {
-        bool handled = false;
-        char callee[PATH_MAX];
-        char arg_text[4096];
-        char (*args)[4096] = v3_alloc_call_arg_scratch();
-        size_t arg_count = 0U;
-        bool parsed_call = false;
-        callee[0] = '\0';
-        arg_text[0] = '\0';
-        parsed_call = v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
-        if (!parsed_call &&
-            v3_parse_prefix_single_arg_call(statement, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
-            snprintf(args[0], sizeof(args[0]), "%s", arg_text);
-            arg_count = 1U;
-            parsed_call = true;
-        }
-        if (parsed_call &&
-            !v3_try_emit_builtin_statement(plan,
-                                           lowering,
-                                           function,
-                                           aliases,
-                                           alias_count,
-                                           locals,
-                                           local_count,
-                                           statement,
-                                           call_arg_base,
-                                           string_temp_base,
-                                           string_temp_stride,
-                                           &string_label_index,
-                                           &control_label_index,
-                                           out,
-                                           cap,
-                                           &handled)) {
+            bool handled = false;
+            char callee[PATH_MAX];
+            char arg_text[4096];
+            char (*args)[4096] = v3_alloc_call_arg_scratch();
+            size_t arg_count = 0U;
+            bool parsed_call = false;
+            callee[0] = '\0';
+            arg_text[0] = '\0';
+            parsed_call = v3_parse_call_text(statement, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS);
+            if (!parsed_call &&
+                v3_parse_prefix_single_arg_call(statement, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+                snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+                arg_count = 1U;
+                parsed_call = true;
+            }
+            if (parsed_call &&
+                !v3_try_emit_builtin_statement(plan,
+                                               lowering,
+                                               function,
+                                               aliases,
+                                               alias_count,
+                                               locals,
+                                               local_count,
+                                               statement,
+                                               call_arg_base,
+                                               string_temp_base,
+                                               string_temp_stride,
+                                               &string_label_index,
+                                               &control_label_index,
+                                               out,
+                                               cap,
+                                               &handled)) {
                 fprintf(stderr,
                         "[cheng_v3_seed] emit builtin statement failed function=%s stmt=%s\n",
                         function->symbol_text,
@@ -38726,11 +40744,16 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
         !v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
         return false;
     }
-    v3_parse_import_aliases_from_lines(lines,
-                                       line_count,
-                                       aliases,
-                                       &alias_count,
-                                       CHENG_V3_MAX_IMPORT_ALIASES);
+    if (!v3_load_import_aliases_from_loaded_lines(source_path,
+                                                  lines,
+                                                  line_count,
+                                                  aliases,
+                                                  &alias_count,
+                                                  CHENG_V3_MAX_IMPORT_ALIASES)) {
+        free(lines);
+        free(owned);
+        return false;
+    }
     memset(&synthetic_function, 0, sizeof(synthetic_function));
     snprintf(synthetic_function.source_path, sizeof(synthetic_function.source_path), "%s", source_path);
     snprintf(synthetic_function.owner_module_path,
@@ -38873,6 +40896,9 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
                                 symbol_name);
     {
         int32_t save_offset = frame_size - 16;
+        g_v3_current_frame_base_valid = true;
+        g_v3_current_frame_fp_to_base_offset =
+            v3_active_target_is_linux_x86_64() ? 0 : save_offset;
         if (v3_active_target_is_linux_x86_64()) {
             v3_text_append(out, cap,
                            "  pushq %rbp\n"
@@ -38886,6 +40912,7 @@ static bool v3_append_module_global_init_function(const V3SystemLinkPlanStub *pl
                 free(owned);
                 return false;
             }
+            v3_text_append(out, cap, "  movq %rsp, %rbp\n");
         } else {
             if (!v3_emit_sp_adjust(out, cap, true, frame_size)) {
                 free(lines);
@@ -39422,8 +41449,11 @@ static bool v3_build_primary_object_plan_stub(const V3SystemLinkPlanStub *plan,
 static bool v3_build_object_plan_stub(const V3SystemLinkPlanStub *plan,
                                       const V3LoweringPlanStub *lowering,
                                       const V3PrimaryObjectPlanStub *primary,
-                                      V3ObjectPlanStub *object_plan) {
+                                      V3ObjectPlanStub *object_plan,
+                                      long long *provider_sources_ms_out) {
     size_t i;
+    long long provider_start_ms = 0LL;
+    long long provider_end_ms = 0LL;
     bool consteval_builtin_direct = v3_streq(plan->emit_kind, "exe") &&
                                     v3_target_uses_consteval_builtin_executable(plan->target_triple) &&
                                     primary->consteval_entry_ready;
@@ -39483,6 +41513,7 @@ static bool v3_build_object_plan_stub(const V3SystemLinkPlanStub *plan,
                          CHENG_V3_MAX_PLAN_PATHS,
                          object_plan->linux_nolibc_runtime_object_path);
     }
+    provider_start_ms = v3_bft_monotime_ms();
     for (i = 0; i < plan->provider_module_count; ++i) {
         char safe[PATH_MAX];
         char provider_source_path[PATH_MAX];
@@ -39511,6 +41542,10 @@ static bool v3_build_object_plan_stub(const V3SystemLinkPlanStub *plan,
                          &object_plan->link_input_count,
                          CHENG_V3_MAX_PLAN_PATHS,
                          provider_object_path);
+    }
+    provider_end_ms = v3_bft_monotime_ms();
+    if (provider_sources_ms_out != NULL) {
+        *provider_sources_ms_out = v3_phase_elapsed_ms(provider_start_ms, provider_end_ms);
     }
     if (plan->missing_reason_count > 0U) {
         v3_object_add_reason(object_plan, "system_link_plan_not_ready_for_object_plan");
@@ -40400,6 +42435,48 @@ static bool v3_wasm_signature_has_result(const char *return_abi_class) {
     return v3_wasm_return_slot_kind(return_abi_class) != V3_WASM_SLOT_VOID;
 }
 
+static void v3_wasm_function_lowering_rule_init(V3WasmFunctionLoweringRule *rule) {
+    if (rule == NULL) {
+        return;
+    }
+    memset(rule, 0, sizeof(*rule));
+    rule->return_slot_kind = V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED;
+    rule->result_kind = V3_WASM_CALL_RESULT_UNSUPPORTED;
+    rule->supported = false;
+}
+
+static bool v3_build_wasm_function_lowering_rule(const V3LoweredFunctionStub *function,
+                                                 V3WasmFunctionLoweringRule *rule) {
+    V3WasmSlotKind slot_kind;
+    if (function == NULL || rule == NULL) {
+        return false;
+    }
+    v3_wasm_function_lowering_rule_init(rule);
+    slot_kind = v3_wasm_return_slot_kind(function->return_abi_class);
+    if (slot_kind == V3_WASM_SLOT_VOID) {
+        rule->return_slot_kind = V3_WASM_CALL_RETURN_SLOT_VOID;
+        rule->result_kind = V3_WASM_CALL_RESULT_VOID;
+        rule->supported = true;
+        return true;
+    }
+    if (slot_kind != V3_WASM_SLOT_I32) {
+        return false;
+    }
+    rule->return_slot_kind = v3_function_call_result_kind(function) == V3_CALL_RESULT_ADDRESS
+        ? V3_WASM_CALL_RETURN_SLOT_ADDRESS
+        : V3_WASM_CALL_RETURN_SLOT_VALUE;
+    rule->result_kind = rule->return_slot_kind == V3_WASM_CALL_RETURN_SLOT_ADDRESS
+        ? V3_WASM_CALL_RESULT_I32_ADDRESS
+        : V3_WASM_CALL_RESULT_I32_VALUE;
+    rule->supported = true;
+    return true;
+}
+
+static bool v3_wasm_function_rule_uses_static_return_slot(const V3WasmFunctionLoweringRule *rule) {
+    return rule != NULL && rule->supported &&
+           rule->result_kind == V3_WASM_CALL_RESULT_I32_ADDRESS;
+}
+
 static uint32_t v3_wasm_signature_type_slot(size_t param_count,
                                             bool has_result) {
     return (uint32_t)(param_count * 2U + (has_result ? 1U : 0U));
@@ -40851,6 +42928,70 @@ static bool v3_wasm_emit_composite_copy_into_local_address(const V3WasmFunctionC
                                                    copy_size);
 }
 
+static bool v3_wasm_emit_expr(const V3SystemLinkPlanStub *plan,
+                              const V3LoweringPlanStub *lowering,
+                              const V3LoweredFunctionStub *function,
+                              const V3WasmFunctionContext *ctx,
+                              const char *expr_text,
+                              const V3WasmImportStub *imports,
+                              size_t import_count,
+                              V3WasmBuffer *body);
+
+static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                           const V3LoweringPlanStub *lowering,
+                                                           const V3LoweredFunctionStub *function,
+                                                           const V3WasmFunctionContext *ctx,
+                                                           const char *expr_text,
+                                                           const char *dest_type_text,
+                                                           uint32_t dest_addr_local_index,
+                                                           const V3WasmImportStub *imports,
+                                                           size_t import_count,
+                                                           V3WasmBuffer *body);
+
+static bool v3_wasm_emit_call_target(const V3LoweringPlanStub *lowering,
+                                     const V3AsmCallTarget *target,
+                                     const V3WasmImportStub *imports,
+                                     size_t import_count,
+                                     V3WasmBuffer *body);
+
+static bool v3_wasm_emit_field_access_from_base(V3WasmBuffer *body,
+                                                const char *field_abi,
+                                                int32_t field_offset);
+
+static bool v3_wasm_emit_value_expr_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                       const V3LoweringPlanStub *lowering,
+                                                       const V3LoweredFunctionStub *function,
+                                                       const V3WasmFunctionContext *ctx,
+                                                       const char *expr_text,
+                                                       const char *value_type_text,
+                                                       const char *value_abi,
+                                                       uint32_t dest_addr_local_index,
+                                                       const V3WasmImportStub *imports,
+                                                       size_t import_count,
+                                                       V3WasmBuffer *body) {
+    if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
+        expr_text == NULL || value_type_text == NULL || value_abi == NULL ||
+        dest_addr_local_index == 0U || body == NULL) {
+        return false;
+    }
+    if (v3_expr_materializes_to_address(value_type_text, value_abi)) {
+        return v3_wasm_emit_composite_expr_into_local_address(plan,
+                                                              lowering,
+                                                              function,
+                                                              ctx,
+                                                              expr_text,
+                                                              value_type_text,
+                                                              dest_addr_local_index,
+                                                              imports,
+                                                              import_count,
+                                                              body);
+    }
+    return v3_wasm_abi_uses_i32_param_slot(value_abi) &&
+           v3_wasm_emit_local_get(body, dest_addr_local_index) &&
+           v3_wasm_emit_expr(plan, lowering, function, ctx, expr_text, imports, import_count, body) &&
+           v3_wasm_emit_store_scalar_to_top_address(body, value_abi);
+}
+
 static bool CHENG_V3_UNUSED v3_wasm_emit_i32_store_at_local_offset(V3WasmBuffer *body,
                                                                    uint32_t local_index,
                                                                    int32_t offset,
@@ -40958,12 +43099,80 @@ static bool v3_wasm_build_panic_cstring_target(const V3SystemLinkPlanStub *plan,
     return true;
 }
 
+static bool v3_wasm_build_seq_set_grow_target(const V3SystemLinkPlanStub *plan,
+                                              V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
+        return false;
+    }
+    memset(target, 0, sizeof(*target));
+    target->external = true;
+    target->param_count = 3U;
+    snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_seq_set_grow");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_seq_set_grow",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
+    snprintf(target->return_type, sizeof(target->return_type), "%s", "ptr");
+    snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "ptr");
+    snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "ptr");
+    snprintf(target->param_types[1], sizeof(target->param_types[1]), "%s", "int32");
+    snprintf(target->param_types[2], sizeof(target->param_types[2]), "%s", "int32");
+    snprintf(target->param_abi_classes[0], sizeof(target->param_abi_classes[0]), "%s", "ptr");
+    snprintf(target->param_abi_classes[1], sizeof(target->param_abi_classes[1]), "%s", "i32");
+    snprintf(target->param_abi_classes[2], sizeof(target->param_abi_classes[2]), "%s", "i32");
+    return true;
+}
+
+static bool v3_wasm_emit_seq_set_grow_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         uint32_t seq_addr_local_index,
+                                                         bool index_from_seq_len,
+                                                         int32_t seq_len_field_offset,
+                                                         int32_t seq_index,
+                                                         int32_t elem_size,
+                                                         uint32_t dest_addr_local_index,
+                                                         const V3WasmImportStub *imports,
+                                                         size_t import_count,
+                                                         V3WasmBuffer *body) {
+    V3AsmCallTarget target;
+    if (plan == NULL || lowering == NULL || seq_addr_local_index == 0U ||
+        elem_size <= 0 || dest_addr_local_index == 0U || body == NULL ||
+        !v3_wasm_build_seq_set_grow_target(plan, &target) ||
+        !v3_wasm_emit_local_get(body, seq_addr_local_index)) {
+        return false;
+    }
+    if (index_from_seq_len) {
+        if (seq_len_field_offset < 0 ||
+            !v3_wasm_emit_local_get(body, seq_addr_local_index) ||
+            !v3_wasm_emit_field_access_from_base(body, "i32", seq_len_field_offset)) {
+            return false;
+        }
+    } else if (!v3_wasm_emit_i32_const(body, seq_index)) {
+        return false;
+    }
+    return v3_wasm_emit_i32_const(body, elem_size) &&
+           v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) &&
+           v3_wasm_emit_local_set(body, dest_addr_local_index);
+}
+
 typedef enum V3WasmBuiltinMessagePtrKind {
     V3_WASM_BUILTIN_MESSAGE_PTR_INVALID = 0,
     V3_WASM_BUILTIN_MESSAGE_PTR_LITERAL_BRIDGE = 1,
     V3_WASM_BUILTIN_MESSAGE_PTR_POINTER_VALUE = 2,
     V3_WASM_BUILTIN_MESSAGE_PTR_STR_ADDRESS_BRIDGE = 3
 } V3WasmBuiltinMessagePtrKind;
+
+typedef enum V3WasmBuiltinMessageSinkKind {
+    V3_WASM_BUILTIN_MESSAGE_SINK_INVALID = 0,
+    V3_WASM_BUILTIN_MESSAGE_SINK_PUTS = 1,
+    V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING = 2
+} V3WasmBuiltinMessageSinkKind;
+
+typedef enum V3WasmBridgeKind {
+    V3_WASM_BRIDGE_INVALID = 0,
+    V3_WASM_BRIDGE_STR_EQ = 1,
+    V3_WASM_BRIDGE_STR_TO_CSTRING = 2
+} V3WasmBridgeKind;
 
 static bool v3_wasm_prepare_composite_expr(const V3SystemLinkPlanStub *plan,
                                            const V3LoweringPlanStub *lowering,
@@ -41008,6 +43217,30 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                                            size_t import_count,
                                                            V3WasmBuffer *body);
 
+static bool v3_wasm_emit_value_expr_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                       const V3LoweringPlanStub *lowering,
+                                                       const V3LoweredFunctionStub *function,
+                                                       const V3WasmFunctionContext *ctx,
+                                                       const char *expr_text,
+                                                       const char *value_type_text,
+                                                       const char *value_abi,
+                                                       uint32_t dest_addr_local_index,
+                                                       const V3WasmImportStub *imports,
+                                                       size_t import_count,
+                                                       V3WasmBuffer *body);
+
+static bool v3_wasm_emit_seq_set_grow_into_local_address(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         uint32_t seq_addr_local_index,
+                                                         bool index_from_seq_len,
+                                                         int32_t seq_len_field_offset,
+                                                         int32_t seq_index,
+                                                         int32_t elem_size,
+                                                         uint32_t dest_addr_local_index,
+                                                         const V3WasmImportStub *imports,
+                                                         size_t import_count,
+                                                         V3WasmBuffer *body);
+
 static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanStub *plan,
                                                          const V3LoweringPlanStub *lowering,
                                                          const V3LoweredFunctionStub *function,
@@ -41036,6 +43269,17 @@ static V3WasmImportKind v3_wasm_call_target_import_kind(const V3AsmCallTarget *t
 
 static bool v3_wasm_build_call_lowering_rule(const V3AsmCallTarget *target,
                                              V3WasmCallLoweringRule *rule);
+
+static bool v3_resolve_wasm_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         const V3LoweredFunctionStub *function,
+                                                         const V3WasmFunctionContext *ctx,
+                                                         char *callee,
+                                                         size_t callee_cap,
+                                                         char args[][4096],
+                                                         size_t *arg_count_io,
+                                                         V3AsmCallTarget *target,
+                                                         V3WasmCallLoweringRule *rule);
 
 static bool v3_wasm_call_target_type_index(const V3AsmCallTarget *target,
                                            uint32_t *type_index_out);
@@ -41094,17 +43338,82 @@ static V3WasmBuiltinMessagePtrKind v3_wasm_builtin_message_ptr_kind(const V3Syst
     return V3_WASM_BUILTIN_MESSAGE_PTR_INVALID;
 }
 
+static bool v3_wasm_build_bridge_target(const V3SystemLinkPlanStub *plan,
+                                        V3WasmBridgeKind kind,
+                                        V3AsmCallTarget *target);
+static bool v3_wasm_register_bridge_import(const V3SystemLinkPlanStub *plan,
+                                           const V3LoweredFunctionStub *function,
+                                           V3WasmBridgeKind kind,
+                                           V3WasmImportStub *imports,
+                                           size_t *import_count);
+static bool v3_wasm_emit_bridge_call(const V3SystemLinkPlanStub *plan,
+                                     const V3LoweringPlanStub *lowering,
+                                     V3WasmBridgeKind kind,
+                                     const V3WasmImportStub *imports,
+                                     size_t import_count,
+                                     V3WasmBuffer *body);
+
 static bool v3_wasm_register_str_to_cstring_bridge_import(const V3SystemLinkPlanStub *plan,
                                                           const V3LoweredFunctionStub *function,
                                                           V3WasmImportStub *imports,
                                                           size_t *import_count) {
-    V3AsmCallTarget bridge_target;
+    return v3_wasm_register_bridge_import(plan,
+                                          function,
+                                          V3_WASM_BRIDGE_STR_TO_CSTRING,
+                                          imports,
+                                          import_count);
+}
+
+static bool v3_wasm_build_bridge_target(const V3SystemLinkPlanStub *plan,
+                                        V3WasmBridgeKind kind,
+                                        V3AsmCallTarget *target) {
+    if (kind == V3_WASM_BRIDGE_STR_EQ) {
+        return v3_wasm_build_str_eq_target(plan, target);
+    }
+    if (kind == V3_WASM_BRIDGE_STR_TO_CSTRING) {
+        return v3_wasm_build_str_to_cstring_target(plan, target);
+    }
+    return false;
+}
+
+static bool v3_wasm_register_bridge_import(const V3SystemLinkPlanStub *plan,
+                                           const V3LoweredFunctionStub *function,
+                                           V3WasmBridgeKind kind,
+                                           V3WasmImportStub *imports,
+                                           size_t *import_count) {
+    V3AsmCallTarget target;
     return plan != NULL &&
            function != NULL &&
            imports != NULL &&
            import_count != NULL &&
-           v3_wasm_build_str_to_cstring_target(plan, &bridge_target) &&
-           v3_wasm_register_import(function->symbol_text, &bridge_target, imports, import_count);
+           v3_wasm_build_bridge_target(plan, kind, &target) &&
+           v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+}
+
+static bool v3_wasm_build_builtin_message_sink_target(const V3SystemLinkPlanStub *plan,
+                                                      V3WasmBuiltinMessageSinkKind kind,
+                                                      V3AsmCallTarget *target) {
+    if (kind == V3_WASM_BUILTIN_MESSAGE_SINK_PUTS) {
+        return v3_wasm_build_puts_target(plan, target);
+    }
+    if (kind == V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING) {
+        return v3_wasm_build_panic_cstring_target(plan, target);
+    }
+    return false;
+}
+
+static bool v3_wasm_register_builtin_message_sink_import(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweredFunctionStub *function,
+                                                         V3WasmBuiltinMessageSinkKind kind,
+                                                         V3WasmImportStub *imports,
+                                                         size_t *import_count) {
+    V3AsmCallTarget target;
+    return plan != NULL &&
+           function != NULL &&
+           imports != NULL &&
+           import_count != NULL &&
+           v3_wasm_build_builtin_message_sink_target(plan, kind, &target) &&
+           v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
 }
 
 static uint32_t v3_wasm_pick_builtin_message_ptr_temp_local(const V3WasmFunctionContext *ctx) {
@@ -41123,14 +43432,50 @@ static bool v3_wasm_emit_str_to_cstring_bridge_call(const V3SystemLinkPlanStub *
                                                     const V3WasmImportStub *imports,
                                                     size_t import_count,
                                                     V3WasmBuffer *body) {
-    V3AsmCallTarget bridge_target;
     return plan != NULL &&
            lowering != NULL &&
            temp_local_index != 0U &&
            body != NULL &&
-           v3_wasm_build_str_to_cstring_target(plan, &bridge_target) &&
            v3_wasm_emit_local_get(body, temp_local_index) &&
-           v3_wasm_emit_call_target(lowering, &bridge_target, imports, import_count, body);
+           v3_wasm_emit_bridge_call(plan,
+                                    lowering,
+                                    V3_WASM_BRIDGE_STR_TO_CSTRING,
+                                    imports,
+                                    import_count,
+                                    body);
+}
+
+static bool v3_wasm_emit_bridge_call(const V3SystemLinkPlanStub *plan,
+                                     const V3LoweringPlanStub *lowering,
+                                     V3WasmBridgeKind kind,
+                                     const V3WasmImportStub *imports,
+                                     size_t import_count,
+                                     V3WasmBuffer *body) {
+    V3AsmCallTarget target;
+    return plan != NULL &&
+           lowering != NULL &&
+           body != NULL &&
+           v3_wasm_build_bridge_target(plan, kind, &target) &&
+           v3_wasm_emit_call_target(lowering, &target, imports, import_count, body);
+}
+
+static bool v3_wasm_emit_builtin_message_sink_call(const V3SystemLinkPlanStub *plan,
+                                                   const V3LoweringPlanStub *lowering,
+                                                   V3WasmBuiltinMessageSinkKind kind,
+                                                   bool drop_result,
+                                                   const V3WasmImportStub *imports,
+                                                   size_t import_count,
+                                                   V3WasmBuffer *body) {
+    V3AsmCallTarget target;
+    if (plan == NULL || lowering == NULL || body == NULL ||
+        !v3_wasm_build_builtin_message_sink_target(plan, kind, &target) ||
+        !v3_wasm_emit_call_target(lowering, &target, imports, import_count, body)) {
+        return false;
+    }
+    if (drop_result && kind == V3_WASM_BUILTIN_MESSAGE_SINK_PUTS) {
+        return v3_wasm_append_u8(body, 0x1aU);
+    }
+    return true;
 }
 
 static bool v3_wasm_analyze_builtin_message_ptr(const V3SystemLinkPlanStub *plan,
@@ -41377,7 +43722,11 @@ static bool v3_wasm_compute_static_return_slot_offset(const V3LoweringPlanStub *
     }
     for (i = 0U; i < lowering->function_count; ++i) {
         const V3LoweredFunctionStub *it = &lowering->functions[i];
-        if (v3_function_call_result_uses_address(it)) {
+        V3WasmFunctionLoweringRule rule;
+        if (!v3_build_wasm_function_lowering_rule(it, &rule)) {
+            return false;
+        }
+        if (v3_wasm_function_rule_uses_static_return_slot(&rule)) {
             V3TypeLayoutStub layout;
             if (!v3_compute_type_layout_impl(lowering, it->return_type, &layout, 0U)) {
                 return false;
@@ -41402,7 +43751,11 @@ static int32_t v3_wasm_total_static_return_bytes(const V3LoweringPlanStub *lower
     }
     for (i = 0U; i < lowering->function_count; ++i) {
         const V3LoweredFunctionStub *it = &lowering->functions[i];
-        if (v3_function_call_result_uses_address(it)) {
+        V3WasmFunctionLoweringRule rule;
+        if (!v3_build_wasm_function_lowering_rule(it, &rule)) {
+            return 0;
+        }
+        if (v3_wasm_function_rule_uses_static_return_slot(&rule)) {
             V3TypeLayoutStub layout;
             if (!v3_compute_type_layout_impl(lowering, it->return_type, &layout, 0U)) {
                 return 0;
@@ -41420,9 +43773,11 @@ static bool v3_wasm_prepare_static_return_slot(const V3LoweringPlanStub *lowerin
                                                int32_t *return_slot_size_out) {
     int32_t return_slot_offset = 0;
     int32_t return_slot_size = 0;
+    V3WasmFunctionLoweringRule rule;
     if (lowering == NULL || function == NULL ||
         return_slot_addr_out == NULL || return_slot_size_out == NULL ||
-        !v3_function_call_result_uses_address(function) ||
+        !v3_build_wasm_function_lowering_rule(function, &rule) ||
+        !v3_wasm_function_rule_uses_static_return_slot(&rule) ||
         !v3_wasm_compute_static_return_slot_offset(lowering,
                                                    function,
                                                    &return_slot_offset,
@@ -41666,15 +44021,19 @@ static bool v3_wasm_seq_elem_size(const V3LoweringPlanStub *lowering,
                                   size_t elem_abi_cap,
                                   int32_t *elem_size_out);
 
-static bool v3_wasm_build_bounds_check_target(V3AsmCallTarget *target) {
-    if (target == NULL) {
+static bool v3_wasm_build_bounds_check_target(const V3SystemLinkPlanStub *plan,
+                                              V3AsmCallTarget *target) {
+    if (plan == NULL || target == NULL) {
         return false;
     }
     memset(target, 0, sizeof(*target));
     target->external = true;
     target->param_count = 2U;
     snprintf(target->callee_name, sizeof(target->callee_name), "%s", "cheng_bounds_check");
-    snprintf(target->symbol_name, sizeof(target->symbol_name), "%s", "cheng_bounds_check");
+    v3_copy_target_symbol_name(plan,
+                               "cheng_bounds_check",
+                               target->symbol_name,
+                               sizeof(target->symbol_name));
     snprintf(target->return_type, sizeof(target->return_type), "%s", "void");
     snprintf(target->return_abi_class, sizeof(target->return_abi_class), "%s", "void");
     snprintf(target->param_types[0], sizeof(target->param_types[0]), "%s", "int32");
@@ -41684,36 +44043,65 @@ static bool v3_wasm_build_bounds_check_target(V3AsmCallTarget *target) {
     return true;
 }
 
-static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
-                                            const V3LoweringPlanStub *lowering,
-                                            const V3LoweredFunctionStub *function,
-                                            const V3WasmFunctionContext *ctx,
-                                            const char *expr_text,
-                                            char *base_expr_out,
-                                            size_t base_expr_cap,
-                                            char *index_expr_out,
-                                            size_t index_expr_cap,
-                                            char *base_type_out,
-                                            size_t base_type_cap,
-                                            char *base_abi_out,
-                                            size_t base_abi_cap,
-                                            char *normalized_base_type_out,
-                                            size_t normalized_base_type_cap,
-                                            char *elem_type_out,
-                                            size_t elem_type_cap,
-                                            char *elem_abi_out,
-                                            size_t elem_abi_cap,
-                                            int32_t *elem_size_out,
-                                            int32_t *data_field_offset_out,
-                                            int32_t *len_field_offset_out,
-                                            int32_t *fixed_len_out,
-                                            bool *base_is_fixed_array_out) {
+static bool v3_wasm_register_bounds_check_import(const V3SystemLinkPlanStub *plan,
+                                                 const V3LoweredFunctionStub *function,
+                                                 V3WasmImportStub *imports,
+                                                 size_t *import_count) {
+    V3AsmCallTarget target;
+    return plan != NULL &&
+           function != NULL &&
+           imports != NULL &&
+           import_count != NULL &&
+           v3_wasm_build_bounds_check_target(plan, &target) &&
+           v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+}
+
+static bool v3_wasm_emit_bounds_check_call(const V3SystemLinkPlanStub *plan,
+                                           const V3LoweringPlanStub *lowering,
+                                           const V3WasmImportStub *imports,
+                                           size_t import_count,
+                                           V3WasmBuffer *body) {
+    V3AsmCallTarget target;
+    return plan != NULL &&
+           lowering != NULL &&
+           body != NULL &&
+           v3_wasm_build_bounds_check_target(plan, &target) &&
+           v3_wasm_emit_call_target(lowering, &target, imports, import_count, body);
+}
+
+static bool v3_resolve_index_expr_meta_common(const V3SystemLinkPlanStub *plan,
+                                              const V3LoweringPlanStub *lowering,
+                                              const V3LoweredFunctionStub *function,
+                                              const V3ImportAlias *aliases,
+                                              size_t alias_count,
+                                              const V3AsmLocalSlot *locals,
+                                              size_t local_count,
+                                              const char *expr_text,
+                                              char *base_expr_out,
+                                              size_t base_expr_cap,
+                                              char *index_expr_out,
+                                              size_t index_expr_cap,
+                                              char *base_type_out,
+                                              size_t base_type_cap,
+                                              char *base_abi_out,
+                                              size_t base_abi_cap,
+                                              char *normalized_base_type_out,
+                                              size_t normalized_base_type_cap,
+                                              char *elem_type_out,
+                                              size_t elem_type_cap,
+                                              char *elem_abi_out,
+                                              size_t elem_abi_cap,
+                                              int32_t *elem_size_out,
+                                              int32_t *data_field_offset_out,
+                                              int32_t *len_field_offset_out,
+                                              int32_t *fixed_len_out,
+                                              bool *base_is_fixed_array_out) {
     char data_field_type[256];
     char data_field_abi[32];
     char len_field_type[256];
     char len_field_abi[32];
     V3TypeLayoutStub elem_layout;
-    if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL || expr_text == NULL ||
+    if (plan == NULL || lowering == NULL || function == NULL || expr_text == NULL ||
         base_expr_out == NULL || index_expr_out == NULL || base_type_out == NULL || base_abi_out == NULL ||
         normalized_base_type_out == NULL || elem_type_out == NULL || elem_abi_out == NULL ||
         elem_size_out == NULL || data_field_offset_out == NULL || len_field_offset_out == NULL ||
@@ -41721,7 +44109,7 @@ static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
         return false;
     }
     *elem_size_out = 0;
-    *data_field_offset_out = 0;
+    *data_field_offset_out = -1;
     *len_field_offset_out = 0;
     *fixed_len_out = 0;
     *base_is_fixed_array_out = false;
@@ -41733,10 +44121,10 @@ static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
         !v3_infer_expr_type(plan,
                             lowering,
                             function,
-                            ctx->aliases,
-                            ctx->alias_count,
-                            ctx->locals,
-                            ctx->local_count,
+                            aliases,
+                            alias_count,
+                            locals,
+                            local_count,
                             base_expr_out,
                             base_type_out,
                             base_type_cap,
@@ -41744,8 +44132,8 @@ static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
                             base_abi_cap) ||
         !v3_normalize_type_text(lowering,
                                 function->owner_module_path,
-                                ctx->aliases,
-                                ctx->alias_count,
+                                aliases,
+                                alias_count,
                                 base_type_out,
                                 normalized_base_type_out,
                                 normalized_base_type_cap)) {
@@ -41856,6 +44244,60 @@ static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
     return v3_compute_type_layout_impl(lowering, elem_type_out, &elem_layout, 0U) &&
            elem_layout.size > 0 &&
            ((*elem_size_out = elem_layout.size), true);
+}
+
+static bool v3_wasm_resolve_index_expr_meta(const V3SystemLinkPlanStub *plan,
+                                            const V3LoweringPlanStub *lowering,
+                                            const V3LoweredFunctionStub *function,
+                                            const V3WasmFunctionContext *ctx,
+                                            const char *expr_text,
+                                            char *base_expr_out,
+                                            size_t base_expr_cap,
+                                            char *index_expr_out,
+                                            size_t index_expr_cap,
+                                            char *base_type_out,
+                                            size_t base_type_cap,
+                                            char *base_abi_out,
+                                            size_t base_abi_cap,
+                                            char *normalized_base_type_out,
+                                            size_t normalized_base_type_cap,
+                                            char *elem_type_out,
+                                            size_t elem_type_cap,
+                                            char *elem_abi_out,
+                                            size_t elem_abi_cap,
+                                            int32_t *elem_size_out,
+                                            int32_t *data_field_offset_out,
+                                            int32_t *len_field_offset_out,
+                                            int32_t *fixed_len_out,
+                                            bool *base_is_fixed_array_out) {
+    return ctx != NULL &&
+           v3_resolve_index_expr_meta_common(plan,
+                                             lowering,
+                                             function,
+                                             ctx->aliases,
+                                             ctx->alias_count,
+                                             ctx->locals,
+                                             ctx->local_count,
+                                             expr_text,
+                                             base_expr_out,
+                                             base_expr_cap,
+                                             index_expr_out,
+                                             index_expr_cap,
+                                             base_type_out,
+                                             base_type_cap,
+                                             base_abi_out,
+                                             base_abi_cap,
+                                             normalized_base_type_out,
+                                             normalized_base_type_cap,
+                                             elem_type_out,
+                                             elem_type_cap,
+                                             elem_abi_out,
+                                             elem_abi_cap,
+                                             elem_size_out,
+                                             data_field_offset_out,
+                                             len_field_offset_out,
+                                             fixed_len_out,
+                                             base_is_fixed_array_out);
 }
 
 static bool v3_wasm_emit_i32_cast(V3WasmBuffer *body,
@@ -42476,15 +44918,16 @@ static bool v3_wasm_emit_composite_call_result_into_local_address(const V3System
                                                                   const V3LoweringPlanStub *lowering,
                                                                   const V3LoweredFunctionStub *function,
                                                                   const V3WasmFunctionContext *ctx,
-                                                                  const V3AsmCallTarget *target,
+                                                                  const V3WasmCallLoweringRule *rule,
                                                                   const char *expr_text,
                                                                   uint32_t dest_addr_local_index,
                                                                   int32_t copy_size,
                                                                   const V3WasmImportStub *imports,
                                                                   size_t import_count,
                                                                   V3WasmBuffer *body) {
-    return target != NULL &&
-           v3_wasm_call_target_result_kind(target) == V3_WASM_CALL_RESULT_I32_ADDRESS &&
+    return rule != NULL &&
+           rule->supported &&
+           rule->result_kind == V3_WASM_CALL_RESULT_I32_ADDRESS &&
            v3_wasm_emit_pointer_result_expr_into_local_address(plan,
                                                                lowering,
                                                                function,
@@ -42735,21 +45178,13 @@ static bool v3_wasm_ensure_composite_call_arg_local(const V3SystemLinkPlanStub *
 static bool v3_wasm_call_arg_prefers_address(const char *param_type,
                                              const char *param_abi);
 
-static bool v3_wasm_register_builtin_add_import(V3WasmImportStub *imports,
+static bool v3_wasm_register_builtin_add_import(const V3SystemLinkPlanStub *plan,
+                                                V3WasmImportStub *imports,
                                                 size_t *import_count) {
     V3AsmCallTarget target;
-    memset(&target, 0, sizeof(target));
-    target.external = true;
-    target.param_count = 3U;
-    snprintf(target.symbol_name, sizeof(target.symbol_name), "%s", "cheng_seq_set_grow");
-    snprintf(target.return_type, sizeof(target.return_type), "%s", "ptr");
-    snprintf(target.return_abi_class, sizeof(target.return_abi_class), "%s", "ptr");
-    snprintf(target.param_types[0], sizeof(target.param_types[0]), "%s", "ptr");
-    snprintf(target.param_types[1], sizeof(target.param_types[1]), "%s", "int32");
-    snprintf(target.param_types[2], sizeof(target.param_types[2]), "%s", "int32");
-    snprintf(target.param_abi_classes[0], sizeof(target.param_abi_classes[0]), "%s", "ptr");
-    snprintf(target.param_abi_classes[1], sizeof(target.param_abi_classes[1]), "%s", "i32");
-    snprintf(target.param_abi_classes[2], sizeof(target.param_abi_classes[2]), "%s", "i32");
+    if (!v3_wasm_build_seq_set_grow_target(plan, &target)) {
+        return false;
+    }
     return v3_wasm_register_import("wasm_builtin_add", &target, imports, import_count);
 }
 
@@ -42799,7 +45234,7 @@ static bool v3_wasm_prepare_list_literal_expr(const V3SystemLinkPlanStub *plan,
                  "%.*s",
                  (int)(strlen(normalized_dest_type) - 2U),
                  normalized_dest_type);
-        if (!v3_wasm_register_builtin_add_import(imports, import_count)) {
+        if (!v3_wasm_register_builtin_add_import(plan, imports, import_count)) {
             free(args);
             return false;
         }
@@ -42846,7 +45281,6 @@ static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanS
                                                          V3WasmBuffer *body) {
     V3TypeLayoutStub layout;
     V3TypeLayoutStub elem_layout;
-    V3AsmCallTarget grow_target;
     char normalized_dest_type[CHENG_V3_MAX_TYPE_TEXT];
     char elem_type[256];
     char elem_abi[32];
@@ -42936,27 +45370,17 @@ static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanS
                 free(args);
                 return false;
             }
-            ok = v3_expr_materializes_to_address(elem_type, elem_abi)
-                 ? v3_wasm_emit_composite_expr_into_local_address(plan,
-                                                                  lowering,
-                                                                  function,
-                                                                  ctx,
-                                                                  args[i],
-                                                                  elem_type,
-                                                                  elem_addr_local_index,
-                                                                  imports,
-                                                                  import_count,
-                                                                  body)
-                 : (v3_wasm_emit_local_get(body, elem_addr_local_index) &&
-                    v3_wasm_emit_expr(plan,
-                                      lowering,
-                                      function,
-                                      ctx,
-                                      args[i],
-                                      imports,
-                                      import_count,
-                                      body) &&
-                    v3_wasm_emit_store_scalar_to_top_address(body, elem_abi));
+            ok = v3_wasm_emit_value_expr_into_local_address(plan,
+                                                            lowering,
+                                                            function,
+                                                            ctx,
+                                                            args[i],
+                                                            elem_type,
+                                                            elem_abi,
+                                                            elem_addr_local_index,
+                                                            imports,
+                                                            import_count,
+                                                            body);
             if (!ok) {
                 free(args);
                 return false;
@@ -42965,46 +45389,33 @@ static bool v3_wasm_emit_list_literal_into_local_address(const V3SystemLinkPlanS
         free(args);
         return true;
     }
-    memset(&grow_target, 0, sizeof(grow_target));
-    grow_target.external = true;
-    grow_target.param_count = 3U;
-    snprintf(grow_target.symbol_name, sizeof(grow_target.symbol_name), "%s", "cheng_seq_set_grow");
-    snprintf(grow_target.return_type, sizeof(grow_target.return_type), "%s", "ptr");
-    snprintf(grow_target.return_abi_class, sizeof(grow_target.return_abi_class), "%s", "ptr");
-    snprintf(grow_target.param_abi_classes[0], sizeof(grow_target.param_abi_classes[0]), "%s", "ptr");
-    snprintf(grow_target.param_abi_classes[1], sizeof(grow_target.param_abi_classes[1]), "%s", "i32");
-    snprintf(grow_target.param_abi_classes[2], sizeof(grow_target.param_abi_classes[2]), "%s", "i32");
     for (i = 0U; i < arg_count; ++i) {
         bool ok = false;
-        if (!v3_wasm_emit_local_get(body, dest_addr_local_index) ||
-            !v3_wasm_emit_i32_const(body, (int32_t)i) ||
-            !v3_wasm_emit_i32_const(body, elem_size) ||
-            !v3_wasm_emit_call_target(lowering, &grow_target, imports, import_count, body) ||
-            !v3_wasm_emit_local_set(body, elem_addr_local_index)) {
+        if (!v3_wasm_emit_seq_set_grow_into_local_address(plan,
+                                                          lowering,
+                                                          dest_addr_local_index,
+                                                          false,
+                                                          0,
+                                                          (int32_t)i,
+                                                          elem_size,
+                                                          elem_addr_local_index,
+                                                          imports,
+                                                          import_count,
+                                                          body)) {
             free(args);
             return false;
         }
-        ok = v3_expr_materializes_to_address(elem_type, elem_abi)
-             ? v3_wasm_emit_composite_expr_into_local_address(plan,
-                                                              lowering,
-                                                              function,
-                                                              ctx,
-                                                              args[i],
-                                                              elem_type,
-                                                              elem_addr_local_index,
-                                                              imports,
-                                                              import_count,
-                                                              body)
-             : (v3_wasm_emit_local_get(body, elem_addr_local_index) &&
-                v3_wasm_emit_expr(plan,
-                                  lowering,
-                                  function,
-                                  ctx,
-                                  args[i],
-                                  imports,
-                                  import_count,
-                                  body) &&
-                v3_wasm_emit_store_scalar_to_top_address(body, elem_abi));
+        ok = v3_wasm_emit_value_expr_into_local_address(plan,
+                                                        lowering,
+                                                        function,
+                                                        ctx,
+                                                        args[i],
+                                                        elem_type,
+                                                        elem_abi,
+                                                        elem_addr_local_index,
+                                                        imports,
+                                                        import_count,
+                                                        body);
         if (!ok) {
             free(args);
             return false;
@@ -43024,7 +45435,6 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                               V3WasmImportStub *imports,
                                               size_t *import_count,
                                               bool *handled_out) {
-    V3AsmCallTarget target;
     const char *assert_message_expr = "\"assert failed\"";
     char seq_type[256];
     char seq_abi[32];
@@ -43044,8 +45454,11 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                    args[0],
                                                    imports,
                                                    import_count) &&
-               v3_wasm_build_panic_cstring_target(plan, &target) &&
-               v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+               v3_wasm_register_builtin_message_sink_import(plan,
+                                                            function,
+                                                            V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING,
+                                                            imports,
+                                                            import_count);
     }
     if (strcmp(callee, "echo") == 0 && arg_count == 1U) {
         *handled_out = true;
@@ -43056,8 +45469,11 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                    args[0],
                                                    imports,
                                                    import_count) &&
-               v3_wasm_build_puts_target(plan, &target) &&
-               v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+               v3_wasm_register_builtin_message_sink_import(plan,
+                                                            function,
+                                                            V3_WASM_BUILTIN_MESSAGE_SINK_PUTS,
+                                                            imports,
+                                                            import_count);
     }
     if (strcmp(callee, "assert") == 0 && (arg_count == 1U || arg_count == 2U)) {
         char cond_type[256];
@@ -43092,8 +45508,11 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                  import_count)) {
             return false;
         }
-        return v3_wasm_build_panic_cstring_target(plan, &target) &&
-               v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+        return v3_wasm_register_builtin_message_sink_import(plan,
+                                                            function,
+                                                            V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING,
+                                                            imports,
+                                                            import_count);
     }
     if (strcmp(callee, "add") != 0 || arg_count != 2U) {
         return true;
@@ -43121,7 +45540,7 @@ static bool v3_wasm_analyze_builtin_statement(const V3SystemLinkPlanStub *plan,
                                &elem_size) ||
         elem_size <= 0 ||
         !v3_wasm_analyze_expr(plan, lowering, function, ctx, args[0], imports, import_count) ||
-        !v3_wasm_register_builtin_add_import(imports, import_count)) {
+        !v3_wasm_register_builtin_add_import(plan, imports, import_count)) {
         return false;
     }
     if (v3_wasm_call_arg_prefers_address(elem_type, elem_abi)) {
@@ -43169,7 +45588,6 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
     char len_field_abi[32];
     int32_t len_field_offset = 0;
     int32_t elem_size = 0;
-    V3AsmCallTarget target;
     if (handled_out == NULL || plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
         callee == NULL || args == NULL || body == NULL || !ctx->has_scratch_locals) {
         return false;
@@ -43185,8 +45603,13 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                 imports,
                                                 import_count,
                                                 body) &&
-               v3_wasm_build_panic_cstring_target(plan, &target) &&
-               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body);
+               v3_wasm_emit_builtin_message_sink_call(plan,
+                                                      lowering,
+                                                      V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING,
+                                                      false,
+                                                      imports,
+                                                      import_count,
+                                                      body);
     }
     if (strcmp(callee, "echo") == 0 && arg_count == 1U) {
         *handled_out = true;
@@ -43198,9 +45621,13 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                 imports,
                                                 import_count,
                                                 body) &&
-               v3_wasm_build_puts_target(plan, &target) &&
-               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) &&
-               v3_wasm_append_u8(body, 0x1aU);
+               v3_wasm_emit_builtin_message_sink_call(plan,
+                                                      lowering,
+                                                      V3_WASM_BUILTIN_MESSAGE_SINK_PUTS,
+                                                      true,
+                                                      imports,
+                                                      import_count,
+                                                      body);
     }
     if (strcmp(callee, "assert") == 0 && (arg_count == 1U || arg_count == 2U)) {
         *handled_out = true;
@@ -43226,8 +45653,13 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                 imports,
                                                 import_count,
                                                 body) &&
-               v3_wasm_build_panic_cstring_target(plan, &target) &&
-               v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) &&
+               v3_wasm_emit_builtin_message_sink_call(plan,
+                                                      lowering,
+                                                      V3_WASM_BUILTIN_MESSAGE_SINK_PANIC_CSTRING,
+                                                      false,
+                                                      imports,
+                                                      import_count,
+                                                      body) &&
                v3_wasm_append_u8(body, 0x0bU);
     }
     if (strcmp(callee, "add") != 0 || arg_count != 2U) {
@@ -43271,24 +45703,20 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                      imports,
                                      import_count,
                                      body) ||
-        !v3_wasm_emit_local_set(body, ctx->scratch_local_index) ||
-        !v3_wasm_emit_local_get(body, ctx->scratch_local_index) ||
-        !v3_wasm_emit_local_get(body, ctx->scratch_local_index) ||
-        !v3_wasm_emit_field_access_from_base(body, len_field_abi, len_field_offset) ||
-        !v3_wasm_emit_i32_const(body, elem_size)) {
+        !v3_wasm_emit_local_set(body, ctx->scratch_local_index)) {
         return false;
     }
-    memset(&target, 0, sizeof(target));
-    target.external = true;
-    target.param_count = 3U;
-    snprintf(target.symbol_name, sizeof(target.symbol_name), "%s", "cheng_seq_set_grow");
-    snprintf(target.return_type, sizeof(target.return_type), "%s", "ptr");
-    snprintf(target.return_abi_class, sizeof(target.return_abi_class), "%s", "ptr");
-    snprintf(target.param_abi_classes[0], sizeof(target.param_abi_classes[0]), "%s", "ptr");
-    snprintf(target.param_abi_classes[1], sizeof(target.param_abi_classes[1]), "%s", "i32");
-    snprintf(target.param_abi_classes[2], sizeof(target.param_abi_classes[2]), "%s", "i32");
-    if (!v3_wasm_emit_call_target(lowering, &target, imports, import_count, body) ||
-        !v3_wasm_emit_local_set(body, ctx->scratch2_local_index) ||
+    if (!v3_wasm_emit_seq_set_grow_into_local_address(plan,
+                                                      lowering,
+                                                      ctx->scratch_local_index,
+                                                      true,
+                                                      len_field_offset,
+                                                      0,
+                                                      elem_size,
+                                                      ctx->scratch2_local_index,
+                                                      imports,
+                                                      import_count,
+                                                      body) ||
         !v3_wasm_emit_local_get(body, ctx->scratch2_local_index) ||
         !v3_wasm_emit_local_set(body, ctx->scratch5_local_index)) {
         return false;
@@ -43374,12 +45802,17 @@ static bool v3_wasm_emit_builtin_statement(const V3SystemLinkPlanStub *plan,
                                                               elem_size,
                                                               body);
     }
-    if (!v3_wasm_abi_uses_i32_param_slot(elem_abi)) {
-        return false;
-    }
-    return v3_wasm_emit_local_get(body, ctx->scratch5_local_index) &&
-           v3_wasm_emit_expr(plan, lowering, function, ctx, args[1], imports, import_count, body) &&
-           v3_wasm_emit_store_scalar_to_top_address(body, elem_abi);
+    return v3_wasm_emit_value_expr_into_local_address(plan,
+                                                      lowering,
+                                                      function,
+                                                      ctx,
+                                                      args[1],
+                                                      elem_type,
+                                                      elem_abi,
+                                                      ctx->scratch5_local_index,
+                                                      imports,
+                                                      import_count,
+                                                      body);
 }
 
 static bool v3_wasm_ensure_composite_call_arg_local(const V3SystemLinkPlanStub *plan,
@@ -43492,6 +45925,7 @@ static V3WasmCallArgSlotKind v3_wasm_call_arg_slot_kind(const char *param_type,
 
 static V3WasmCallReturnSlotKind v3_wasm_call_target_return_slot_kind(const V3AsmCallTarget *target) {
     V3WasmSlotKind slot_kind;
+    V3CallResultKind result_kind;
     if (target == NULL) {
         return V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED;
     }
@@ -43502,7 +45936,8 @@ static V3WasmCallReturnSlotKind v3_wasm_call_target_return_slot_kind(const V3Asm
     if (slot_kind != V3_WASM_SLOT_I32) {
         return V3_WASM_CALL_RETURN_SLOT_UNSUPPORTED;
     }
-    return v3_call_target_result_uses_address(target)
+    result_kind = v3_call_target_result_kind(target);
+    return result_kind == V3_CALL_RESULT_ADDRESS
         ? V3_WASM_CALL_RETURN_SLOT_ADDRESS
         : V3_WASM_CALL_RETURN_SLOT_VALUE;
 }
@@ -43567,6 +46002,50 @@ static bool v3_wasm_build_call_lowering_rule(const V3AsmCallTarget *target,
     }
     rule->supported = true;
     return true;
+}
+
+static bool v3_resolve_wasm_call_lowering_rule_with_args(const V3SystemLinkPlanStub *plan,
+                                                         const V3LoweringPlanStub *lowering,
+                                                         const V3LoweredFunctionStub *function,
+                                                         const V3WasmFunctionContext *ctx,
+                                                         char *callee,
+                                                         size_t callee_cap,
+                                                         char args[][4096],
+                                                         size_t *arg_count_io,
+                                                         V3AsmCallTarget *target,
+                                                         V3WasmCallLoweringRule *rule) {
+    size_t arg_count = 0U;
+    if (plan == NULL || lowering == NULL || function == NULL || ctx == NULL ||
+        callee == NULL || callee_cap == 0U || arg_count_io == NULL ||
+        target == NULL || rule == NULL) {
+        return false;
+    }
+    arg_count = *arg_count_io;
+    if (!v3_canonicalize_static_str_join_call(function->owner_module_path,
+                                              ctx->aliases,
+                                              ctx->alias_count,
+                                              callee,
+                                              callee_cap,
+                                              (const char (*)[4096])args,
+                                              &arg_count,
+                                              NULL)) {
+        return false;
+    }
+    *arg_count_io = arg_count;
+    if (!v3_resolve_call_target_with_args(plan,
+                                          lowering,
+                                          function,
+                                          ctx->aliases,
+                                          ctx->alias_count,
+                                          ctx->locals,
+                                          ctx->local_count,
+                                          callee,
+                                          args,
+                                          arg_count,
+                                          target)) {
+        return false;
+    }
+    return v3_wasm_build_call_lowering_rule(target, rule);
 }
 
 static bool v3_wasm_prepare_call_arg_state(const V3SystemLinkPlanStub *plan,
@@ -43727,36 +46206,24 @@ static bool v3_wasm_analyze_call(const V3SystemLinkPlanStub *plan,
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
-    if (!v3_canonicalize_static_str_join_call(function->owner_module_path,
-                                              ctx->aliases,
-                                              ctx->alias_count,
-                                              canonical_callee,
-                                              sizeof(canonical_callee),
-                                              (const char (*)[4096])args,
-                                              &arg_count,
-                                              NULL)) {
-        return false;
-    }
-    callee = canonical_callee;
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          function,
-                                          ctx->aliases,
-                                          ctx->alias_count,
-                                          ctx->locals,
-                                          ctx->local_count,
-                                          callee,
-                                          args,
-                                          arg_count,
-                                          &target)) {
+    if (!v3_resolve_wasm_call_lowering_rule_with_args(plan,
+                                                      lowering,
+                                                      function,
+                                                      ctx,
+                                                      canonical_callee,
+                                                      sizeof(canonical_callee),
+                                                      args,
+                                                      &arg_count,
+                                                      &target,
+                                                      &rule)) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm call target resolve failed function=%s callee=%s\n",
                 function->symbol_text,
-                callee);
+                canonical_callee);
         return false;
     }
-    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
-        !rule.supported ||
+    callee = canonical_callee;
+    if (!rule.supported ||
         rule.result_kind == V3_WASM_CALL_RESULT_VOID ||
         target.param_count != arg_count) {
         fprintf(stderr,
@@ -43830,24 +46297,24 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
     if (handled) {
         return true;
     }
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          function,
-                                          ctx->aliases,
-                                          ctx->alias_count,
-                                          ctx->locals,
-                                          ctx->local_count,
-                                          callee,
-                                          args,
-                                          arg_count,
-                                          &target)) {
+    if (!v3_resolve_wasm_call_lowering_rule_with_args(plan,
+                                                      lowering,
+                                                      function,
+                                                      ctx,
+                                                      canonical_callee,
+                                                      sizeof(canonical_callee),
+                                                      args,
+                                                      &arg_count,
+                                                      &target,
+                                                      &rule)) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm statement call target resolve failed function=%s callee=%s argc=%zu\n",
                 function->symbol_text,
-                callee,
+                canonical_callee,
                 arg_count);
         return false;
     }
+    callee = canonical_callee;
     if (target.param_count != arg_count) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm statement call argc mismatch function=%s callee=%s got=%zu expected=%zu\n",
@@ -43857,8 +46324,7 @@ static bool v3_wasm_analyze_call_statement(const V3SystemLinkPlanStub *plan,
                 target.param_count);
         return false;
     }
-    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
-        !rule.supported) {
+    if (!rule.supported) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm statement call ret reject function=%s callee=%s ret=%s\n",
                 function->symbol_text,
@@ -44013,7 +46479,6 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
                 strcmp(right_type, "str") == 0 &&
                 v3_expr_materializes_to_address(left_type, left_abi) &&
                 v3_expr_materializes_to_address(right_type, right_abi)) {
-                V3AsmCallTarget target;
                 ctx->needs_str_temps = true;
                 return v3_wasm_prepare_composite_expr(plan,
                                                       lowering,
@@ -44031,8 +46496,11 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
                                                       "str",
                                                       imports,
                                                       import_count) &&
-                       v3_wasm_build_str_eq_target(plan, &target) &&
-                       v3_wasm_register_import(function->symbol_text, &target, imports, import_count);
+                       v3_wasm_register_bridge_import(plan,
+                                                      function,
+                                                      V3_WASM_BRIDGE_STR_EQ,
+                                                      imports,
+                                                      import_count);
             }
             return v3_wasm_analyze_expr(plan, lowering, function, ctx, left, imports, import_count) &&
                    v3_wasm_analyze_expr(plan, lowering, function, ctx, right, imports, import_count);
@@ -44053,7 +46521,6 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
         int32_t len_field_offset = 0;
         int32_t fixed_len = 0;
         bool base_is_fixed_array = false;
-        V3AsmCallTarget bounds_target;
         if (!v3_wasm_resolve_index_expr_meta(plan,
                                              lowering,
                                              function,
@@ -44100,8 +46567,7 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
                     elem_abi);
             return false;
         }
-        if (!v3_wasm_build_bounds_check_target(&bounds_target) ||
-            !v3_wasm_register_import(function->symbol_text, &bounds_target, imports, import_count)) {
+        if (!v3_wasm_register_bounds_check_import(plan, function, imports, import_count)) {
             fprintf(stderr,
                     "[cheng_v3_seed] wasm index bounds import failed function=%s expr=%s\n",
                     function->symbol_text,
@@ -44600,7 +47066,11 @@ static bool v3_wasm_prepare_statement(const V3SystemLinkPlanStub *plan,
         return v3_wasm_abi_is_void(function->return_abi_class);
     }
     if (v3_startswith(statement, "return ")) {
-        if (v3_function_call_result_uses_address(function)) {
+        V3WasmFunctionLoweringRule rule;
+        if (!v3_build_wasm_function_lowering_rule(function, &rule)) {
+            return false;
+        }
+        if (v3_wasm_function_rule_uses_static_return_slot(&rule)) {
             return v3_wasm_prepare_composite_expr(plan,
                                                   lowering,
                                                   function,
@@ -45029,37 +47499,25 @@ static bool v3_wasm_emit_call_expr(const V3SystemLinkPlanStub *plan,
     char canonical_callee[PATH_MAX];
     size_t i;
     snprintf(canonical_callee, sizeof(canonical_callee), "%s", callee);
-    if (!v3_canonicalize_static_str_join_call(function->owner_module_path,
-                                              ctx->aliases,
-                                              ctx->alias_count,
-                                              canonical_callee,
-                                              sizeof(canonical_callee),
-                                              (const char (*)[4096])args,
-                                              &arg_count,
-                                              NULL)) {
-        return false;
-    }
-    callee = canonical_callee;
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          function,
-                                          ctx->aliases,
-                                          ctx->alias_count,
-                                          ctx->locals,
-                                          ctx->local_count,
-                                          callee,
-                                          args,
-                                          arg_count,
-                                          &target)) {
+    if (!v3_resolve_wasm_call_lowering_rule_with_args(plan,
+                                                      lowering,
+                                                      function,
+                                                      ctx,
+                                                      canonical_callee,
+                                                      sizeof(canonical_callee),
+                                                      args,
+                                                      &arg_count,
+                                                      &target,
+                                                      &rule)) {
         fprintf(stderr,
                 "[cheng_v3_seed] wasm emit call resolve failed function=%s callee=%s argc=%zu\n",
                 function->symbol_text,
-                callee,
+                canonical_callee,
                 arg_count);
         return false;
     }
-    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
-        !rule.supported ||
+    callee = canonical_callee;
+    if (!rule.supported ||
         rule.result_kind == V3_WASM_CALL_RESULT_VOID ||
         target.param_count != arg_count) {
         fprintf(stderr,
@@ -45141,22 +47599,21 @@ static bool v3_wasm_emit_call_statement(const V3SystemLinkPlanStub *plan,
     if (handled) {
         return true;
     }
-    if (!v3_resolve_call_target_with_args(plan,
-                                          lowering,
-                                          function,
-                                          ctx->aliases,
-                                          ctx->alias_count,
-                                          ctx->locals,
-                                          ctx->local_count,
-                                          callee,
-                                          args,
-                                          arg_count,
-                                          &target) ||
+    if (!v3_resolve_wasm_call_lowering_rule_with_args(plan,
+                                                      lowering,
+                                                      function,
+                                                      ctx,
+                                                      canonical_callee,
+                                                      sizeof(canonical_callee),
+                                                      args,
+                                                      &arg_count,
+                                                      &target,
+                                                      &rule) ||
         target.param_count != arg_count) {
         return false;
     }
-    if (!v3_wasm_build_call_lowering_rule(&target, &rule) ||
-        !rule.supported) {
+    callee = canonical_callee;
+    if (!rule.supported) {
         return false;
     }
     for (i = 0U; i < arg_count; ++i) {
@@ -45340,13 +47797,11 @@ static bool v3_wasm_emit_expr(const V3SystemLinkPlanStub *plan,
                 strcmp(right_type, "str") == 0 &&
                 v3_expr_materializes_to_address(left_type, left_abi) &&
                 v3_expr_materializes_to_address(right_type, right_abi)) {
-                V3AsmCallTarget target;
                 uint32_t left_addr_local_index = ctx->scratch3_local_index;
                 uint32_t right_addr_local_index = ctx->scratch4_local_index;
                 if (!ctx->has_frame_base_local ||
                     ctx->str_temp0_offset < 0 ||
                     ctx->str_temp1_offset < 0 ||
-                    !v3_wasm_build_str_eq_target(plan, &target) ||
                     !v3_wasm_emit_frame_temp_address(ctx,
                                                      body,
                                                      left_addr_local_index,
@@ -45385,7 +47840,12 @@ static bool v3_wasm_emit_expr(const V3SystemLinkPlanStub *plan,
                                                      ctx->str_temp1_offset) ||
                     !v3_wasm_emit_local_get(body, left_addr_local_index) ||
                     !v3_wasm_emit_local_get(body, right_addr_local_index) ||
-                    !v3_wasm_emit_call_target(lowering, &target, imports, import_count, body)) {
+                    !v3_wasm_emit_bridge_call(plan,
+                                              lowering,
+                                              V3_WASM_BRIDGE_STR_EQ,
+                                              imports,
+                                              import_count,
+                                              body)) {
                     return false;
                 }
                 if (strcmp(OPS[i], "!=") == 0) {
@@ -45875,7 +48335,6 @@ static bool v3_wasm_emit_lvalue_address(const V3SystemLinkPlanStub *plan,
         int32_t len_field_offset = 0;
         int32_t fixed_len = 0;
         bool base_is_fixed_array = false;
-        V3AsmCallTarget bounds_target;
         if (body == NULL || !ctx->has_scratch_locals ||
             !v3_wasm_resolve_index_expr_meta(plan,
                                              lowering,
@@ -45902,7 +48361,6 @@ static bool v3_wasm_emit_lvalue_address(const V3SystemLinkPlanStub *plan,
                                              &fixed_len,
                                              &base_is_fixed_array) ||
             elem_size <= 0 ||
-            !v3_wasm_build_bounds_check_target(&bounds_target) ||
             !v3_wasm_emit_expr(plan, lowering, function, ctx, base_expr, imports, import_count, body) ||
             !v3_wasm_emit_local_set(body, ctx->scratch_local_index) ||
             !v3_wasm_emit_expr(plan, lowering, function, ctx, index_expr, imports, import_count, body) ||
@@ -45918,7 +48376,7 @@ static bool v3_wasm_emit_lvalue_address(const V3SystemLinkPlanStub *plan,
             return false;
         }
         if (!v3_wasm_emit_local_get(body, ctx->scratch2_local_index) ||
-            !v3_wasm_emit_call_target(lowering, &bounds_target, imports, import_count, body) ||
+            !v3_wasm_emit_bounds_check_call(plan, lowering, imports, import_count, body) ||
             !v3_wasm_emit_local_get(body, ctx->scratch_local_index) ||
             (!base_is_fixed_array &&
              !v3_wasm_emit_field_access_from_base(body, "ptr", data_field_offset))) {
@@ -46182,18 +48640,19 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
             }
             {
                 V3AsmCallTarget target;
-                if (v3_resolve_call_target_with_args(plan,
-                                                     lowering,
-                                                     function,
-                                                     ctx->aliases,
-                                                     ctx->alias_count,
-                                                     ctx->locals,
-                                                     ctx->local_count,
-                                                     inner_callee,
-                                                     args,
-                                                     arg_count,
-                                                     &target)) {
-                    if (!v3_call_target_result_uses_address(&target)) {
+                V3WasmCallLoweringRule rule;
+                if (v3_resolve_wasm_call_lowering_rule_with_args(plan,
+                                                                 lowering,
+                                                                 function,
+                                                                 ctx,
+                                                                 inner_callee,
+                                                                 sizeof(inner_callee),
+                                                                 args,
+                                                                 &arg_count,
+                                                                 &target,
+                                                                 &rule)) {
+                    if (!rule.supported ||
+                        rule.result_kind != V3_WASM_CALL_RESULT_I32_ADDRESS) {
                         fprintf(stderr,
                                 "[cheng_v3_seed] wasm composite call return reject function=%s callee=%s ret=%s expr=%s\n",
                                 function->symbol_text,
@@ -46207,7 +48666,7 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                                                                lowering,
                                                                                function,
                                                                                ctx,
-                                                                               &target,
+                                                                               &rule,
                                                                                expr,
                                                                                dest_addr_local_index,
                                                                                layout.size,
@@ -46836,7 +49295,11 @@ static bool v3_wasm_emit_statement(const V3SystemLinkPlanStub *plan,
     }
     if (v3_startswith(statement, "return ")) {
         *terminated_out = true;
-        if (v3_function_call_result_uses_address(function)) {
+        V3WasmFunctionLoweringRule rule;
+        if (!v3_build_wasm_function_lowering_rule(function, &rule)) {
+            return false;
+        }
+        if (v3_wasm_function_rule_uses_static_return_slot(&rule)) {
             return v3_wasm_emit_composite_return_into_static_slot(plan,
                                                                   lowering,
                                                                   function,
@@ -46976,15 +49439,21 @@ static bool v3_wasm_emit_statement(const V3SystemLinkPlanStub *plan,
             return true;
         }
         *terminated_out = true;
-        if (v3_function_call_result_uses_address(function)) {
-            return v3_wasm_emit_composite_return_into_static_slot(plan,
-                                                                  lowering,
-                                                                  function,
-                                                                  ctx,
-                                                                  statement,
-                                                                  imports,
-                                                                  import_count,
-                                                                  body);
+        {
+            V3WasmFunctionLoweringRule rule;
+            if (!v3_build_wasm_function_lowering_rule(function, &rule)) {
+                return false;
+            }
+            if (v3_wasm_function_rule_uses_static_return_slot(&rule)) {
+                return v3_wasm_emit_composite_return_into_static_slot(plan,
+                                                                      lowering,
+                                                                      function,
+                                                                      ctx,
+                                                                      statement,
+                                                                      imports,
+                                                                      import_count,
+                                                                      body);
+            }
         }
     }
     if (!v3_wasm_emit_expr(plan, lowering, function, ctx, statement, imports, import_count, body)) {
@@ -48154,7 +50623,11 @@ static bool v3_materialize_primary_object_internal(const V3SystemLinkPlanStub *p
                 free(module_init_symbols);
                 return false;
             }
-            v3_emit_call_named_symbol(plan, text, cap, "puts");
+            if (!v3_emit_native_puts_reg0_call(plan, text, cap)) {
+                free(text);
+                free(module_init_symbols);
+                return false;
+            }
         }
         {
             char chunk[256];
@@ -52675,6 +55148,8 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                                                              const V3CompilerSourceOverride *overrides,
                                                              size_t override_count,
                                                              V3CompilerWorldArtifacts *out) {
+    long long phase_start_ms;
+    long long phase_end_ms;
     V3PlanPath *modules = (V3PlanPath *)v3_xmalloc(sizeof(V3PlanPath) * CHENG_V3_MAX_PLAN_PATHS);
     size_t module_count = 0U;
     size_t function_count = 0U;
@@ -52709,12 +55184,16 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
                                    plan->entry_path,
                                    entry_module_path,
                                    sizeof(entry_module_path));
+    phase_start_ms = v3_bft_monotime_ms();
     if (!v3_compiler_source_bundle_cid_with_overrides(plan, overrides, override_count, &out->source_bundle_cid)) {
         free(modules);
         free(node_report);
         free(edge_report);
         return false;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    out->exec_phase_source_bundle_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
     for (i = 0U; i < plan->source_closure_count; ++i) {
         char module_path[PATH_MAX];
         char *owned = NULL;
@@ -53281,6 +55760,9 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
         out->surface_report = report;
         v3_bytebuf_free(&surface_buf);
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    out->exec_phase_compiler_csg_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
     out->compiler_pkg_cid = v3_compiler_package_snapshot_cid("cheng/v3/compiler",
                                                              out->channel,
                                                              out->source_bundle_cid,
@@ -53366,6 +55848,9 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
     out->lock_verified = false;
     out->baseline_surface_checked = false;
     out->baseline_surface_compatible = false;
+    phase_end_ms = v3_bft_monotime_ms();
+    out->exec_phase_world_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
     if (requested_world_head && *requested_world_head != '\0') {
         char requested_copy[128];
         v3_trim_copy_text(requested_world_head, requested_copy, sizeof(requested_copy));
@@ -53398,6 +55883,9 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
         }
         out->lock_verified = true;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    out->exec_phase_lock_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
     if (baseline_surface_path && *baseline_surface_path != '\0') {
         v3_copy_text(out->baseline_surface_path, sizeof(out->baseline_surface_path), baseline_surface_path);
         out->baseline_surface_checked = true;
@@ -53414,6 +55902,8 @@ static bool v3_build_compiler_world_artifacts_with_overrides(const V3SystemLinkP
         }
         out->baseline_surface_compatible = true;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    out->exec_phase_baseline_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     v3_bytebuf_free(&graph_buf);
     v3_bytebuf_free(&canonical_buf);
     v3_bytebuf_free(&edge_buf);
@@ -53575,6 +56065,32 @@ static char *v3_system_link_exec_report(const V3BootstrapContract *contract,
         snprintf(line, sizeof(line), "compile_canonical_output_digest=%s", world->canonical_output_digest_cid.hex);
         v3_report_append(&out, &cap, &used, line);
         v3_report_append(&out, &cap, &used, "compile_bootstrap_stage=stage3_local");
+        snprintf(line, sizeof(line), "exec_phase_system_link_plan_ms=%lld", world->exec_phase_system_link_plan_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_source_bundle_ms=%lld", world->exec_phase_source_bundle_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_compiler_csg_ms=%lld", world->exec_phase_compiler_csg_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_world_ms=%lld", world->exec_phase_world_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_lock_ms=%lld", world->exec_phase_lock_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_baseline_ms=%lld", world->exec_phase_baseline_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_lowering_plan_ms=%lld", world->exec_phase_lowering_plan_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_primary_object_plan_ms=%lld", world->exec_phase_primary_object_plan_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_provider_sources_ms=%lld", world->exec_phase_provider_sources_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_object_plan_ms=%lld", world->exec_phase_object_plan_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_native_link_plan_ms=%lld", world->exec_phase_native_link_plan_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_compile_receipt_ms=%lld", world->exec_phase_compile_receipt_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_total_ms=%lld", world->exec_phase_total_ms);
+        v3_report_append(&out, &cap, &used, line);
     }
     snprintf(line, sizeof(line), "lowering_function_count=%zu", lowering->function_count);
     v3_report_append(&out, &cap, &used, line);
@@ -60218,8 +62734,8 @@ static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
         target = "arm64-apple-darwin";
     }
     v3_copy_text(target_buf, sizeof(target_buf), target);
-    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/chain_node_main.cheng");
-    v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/cheng_node_main.cheng");
+    v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_cheng_node_main");
     if (!v3_streq(target_buf, "arm64-apple-darwin")) {
         v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
     }
@@ -60231,10 +62747,10 @@ static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
     if (out_bin_env != NULL && out_bin_env[0] != '\0') {
         v3_copy_text(out_bin, sizeof(out_bin), out_bin_env);
     } else {
-        v3_join_path(out_bin, sizeof(out_bin), out_dir, "chain_node");
+        v3_join_path(out_bin, sizeof(out_bin), out_dir, "cheng_node_main");
     }
-    v3_join_path(compile_log, sizeof(compile_log), out_dir, "chain_node.compile.log");
-    v3_join_path(run_log, sizeof(run_log), out_dir, "chain_node.self-test.log");
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, "cheng_node_main.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "cheng_node_main.self-test.log");
     if (!v3_mkdir_p(out_dir) ||
         !v3_compile_fixture_with_backend_driver_target(paths.backend_driver_out, root_v3, src, target_buf, out_bin, compile_log) ||
         access(out_bin, X_OK) != 0) {
@@ -60251,7 +62767,7 @@ static int v3_cmd_build_chain_node_impl(int argc, char **argv) {
         return 0;
     }
     run_argv[0] = out_bin;
-    run_argv[1] = "self-test";
+    run_argv[1] = "chain-self-test";
     run_argv[2] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
         !v3_status_is_exit_code(status, 0)) {
@@ -60445,12 +62961,12 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
             return 1;
         }
     }
-    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/chain_node_main.cheng");
+    v3_join_path(src, sizeof(src), paths.root, "v3/src/project/cheng_node_main.cheng");
     if (want_exe) {
-        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_cheng_node_main");
         v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
     } else {
-        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_chain_node_obj");
+        v3_join_path(default_out_dir, sizeof(default_out_dir), paths.root, "artifacts/v3_cheng_node_main_obj");
         v3_join_path(default_out_dir, sizeof(default_out_dir), default_out_dir, target_buf);
     }
     if (out_dir_env != NULL && out_dir_env[0] != '\0') {
@@ -60461,10 +62977,10 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
     if (out_bin_env != NULL && out_bin_env[0] != '\0') {
         v3_copy_text(out_path, sizeof(out_path), out_bin_env);
     } else {
-        v3_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "chain_node" : "chain_node.o");
+        v3_join_path(out_path, sizeof(out_path), out_dir, want_exe ? "cheng_node_main" : "cheng_node_main.o");
     }
-    v3_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "chain_node.compile.log" : "chain_node.obj.compile.log");
-    v3_join_path(run_log, sizeof(run_log), out_dir, "chain_node.self-test.log");
+    v3_join_path(compile_log, sizeof(compile_log), out_dir, want_exe ? "cheng_node_main.compile.log" : "cheng_node_main.obj.compile.log");
+    v3_join_path(run_log, sizeof(run_log), out_dir, "cheng_node_main.self-test.log");
     if (!v3_mkdir_p(out_dir) ||
         !v3_compile_fixture_with_backend_driver_emit_target(compiler_bin,
                                                             root_v3,
@@ -60497,7 +63013,7 @@ static int v3_cmd_build_chain_node_linux_impl(int argc, char **argv) {
         return 0;
     }
     run_argv[0] = out_path;
-    run_argv[1] = "self-test";
+    run_argv[1] = "chain-self-test";
     run_argv[2] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
         !v3_status_is_exit_code(status, 0)) {
@@ -60720,13 +63236,13 @@ static int v3_cmd_run_linux_object_smokes_impl(int argc, char **argv) {
     if (!v3_leaf_prepare_backend_driver(&paths, root_v3, sizeof(root_v3))) {
         return 1;
     }
-    v3_join_path(chain_src, sizeof(chain_src), paths.root, "v3/src/project/chain_node_main.cheng");
+    v3_join_path(chain_src, sizeof(chain_src), paths.root, "v3/src/project/cheng_node_main.cheng");
     v3_join_path(rwad_src, sizeof(rwad_src), paths.root, "v3/src/project/rwad_bft_state_machine_main.cheng");
-    v3_join_path(chain_out_dir, sizeof(chain_out_dir), paths.root, "artifacts/v3_chain_node_obj/aarch64-unknown-linux-gnu");
+    v3_join_path(chain_out_dir, sizeof(chain_out_dir), paths.root, "artifacts/v3_cheng_node_main_obj/aarch64-unknown-linux-gnu");
     v3_join_path(rwad_out_dir, sizeof(rwad_out_dir), paths.root, "artifacts/v3_rwad_bft_state_machine_obj/aarch64-unknown-linux-gnu");
-    v3_join_path(chain_obj, sizeof(chain_obj), chain_out_dir, "chain_node.o");
+    v3_join_path(chain_obj, sizeof(chain_obj), chain_out_dir, "cheng_node_main.o");
     v3_join_path(rwad_obj, sizeof(rwad_obj), rwad_out_dir, "rwad_bft_state_machine.o");
-    v3_join_path(chain_log, sizeof(chain_log), chain_out_dir, "chain_node.compile.log");
+    v3_join_path(chain_log, sizeof(chain_log), chain_out_dir, "cheng_node_main.compile.log");
     v3_join_path(rwad_log, sizeof(rwad_log), rwad_out_dir, "rwad_bft_state_machine.compile.log");
     if (!v3_mkdir_p(chain_out_dir) ||
         !v3_mkdir_p(rwad_out_dir) ||
@@ -61799,8 +64315,8 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
     if (!v3_mkdir_p(out_root)) {
         return 1;
     }
-    v3_join_path(bin, sizeof(bin), out_root, "chain_node");
-    v3_join_path(build_log, sizeof(build_log), out_root, "chain_node.compile.log");
+    v3_join_path(bin, sizeof(bin), out_root, "cheng_node_main");
+    v3_join_path(build_log, sizeof(build_log), out_root, "cheng_node_main.compile.log");
     v3_save_env_value("CHENG_V3_CHAIN_NODE_COMPILER", saved_compiler, sizeof(saved_compiler), &had_compiler);
     v3_save_env_value("CHAIN_NODE_OUT_DIR", saved_out_dir, sizeof(saved_out_dir), &had_out_dir);
     v3_save_env_value("CHAIN_NODE_RUN_SELF_TEST", saved_self_test, sizeof(saved_self_test), &had_self_test);
@@ -61844,33 +64360,33 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
         char state_arg[PATH_MAX + 16];
         snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
         if (!v3_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "init", state_arg, "--node-id:node-a", "--address-seed:chain-node-a" },
+                                        (const char *[5]){ bin, "chain-init", state_arg, "--node-id:node-a", "--address-seed:chain-node-a" },
                                         init_log,
                                         "run-chain-node-cli-smoke init") ||
             !v3_run_command_logged_argv(6U,
-                                        (const char *[6]){ bin, "mint", state_arg, "--asset:7", "--account:1001", "--amount:100" },
+                                        (const char *[6]){ bin, "chain-mint", state_arg, "--asset:7", "--account:1001", "--amount:100" },
                                         mint_log,
                                         "run-chain-node-cli-smoke mint") ||
             !v3_run_command_logged_argv(7U,
-                                        (const char *[7]){ bin, "transfer", state_arg, "--asset:7", "--from:1001", "--to:2002", "--amount:40" },
+                                        (const char *[7]){ bin, "chain-transfer", state_arg, "--asset:7", "--from:1001", "--to:2002", "--amount:40" },
                                         transfer_log,
                                         "run-chain-node-cli-smoke transfer")) {
             return 1;
         }
         if (!v3_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:1001" },
+                                        (const char *[5]){ bin, "chain-balance", state_arg, "--asset:7", "--account:1001" },
                                         balance_a_log,
                                         "run-chain-node-cli-smoke balance-a") ||
             !v3_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:2002" },
+                                        (const char *[5]){ bin, "chain-balance", state_arg, "--asset:7", "--account:2002" },
                                         balance_b_log,
                                         "run-chain-node-cli-smoke balance-b") ||
             !v3_run_command_logged_argv(3U,
-                                        (const char *[3]){ bin, "show-state", state_arg },
+                                        (const char *[3]){ bin, "chain-show-state", state_arg },
                                         show_log,
                                         "run-chain-node-cli-smoke show") ||
             !v3_run_command_logged_argv(3U,
-                                        (const char *[3]){ bin, "dump-snapshot", state_arg },
+                                        (const char *[3]){ bin, "chain-dump-snapshot", state_arg },
                                         snapshot_log,
                                         "run-chain-node-cli-smoke snapshot")) {
             return 1;
@@ -61882,7 +64398,7 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
         snprintf(state_arg, sizeof(state_arg), "--state:%s", server_state);
         snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
         daemon_argv[0] = bin;
-        daemon_argv[1] = "daemon-serve";
+        daemon_argv[1] = "chain-daemon-serve";
         daemon_argv[2] = state_arg;
         daemon_argv[3] = "--port:0";
         daemon_argv[4] = ready_arg;
@@ -61901,7 +64417,7 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
         snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
         snprintf(port_arg, sizeof(port_arg), "--port:%s", server_port);
         sync_argv[0] = bin;
-        sync_argv[1] = "daemon-sync";
+        sync_argv[1] = "chain-daemon-sync";
         sync_argv[2] = state_arg;
         sync_argv[3] = "--node-id:node-b";
         sync_argv[4] = "--address-seed:chain-node-b";
@@ -61921,15 +64437,15 @@ static int v3_cmd_run_chain_node_cli_smoke_impl(int argc, char **argv) {
         char state_arg[PATH_MAX + 16];
         snprintf(state_arg, sizeof(state_arg), "--state:%s", client_state);
         if (!v3_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:1001" },
+                                        (const char *[5]){ bin, "chain-balance", state_arg, "--asset:7", "--account:1001" },
                                         client_balance_a_log,
                                         "run-chain-node-cli-smoke client-balance-a") ||
             !v3_run_command_logged_argv(5U,
-                                        (const char *[5]){ bin, "balance", state_arg, "--asset:7", "--account:2002" },
+                                        (const char *[5]){ bin, "chain-balance", state_arg, "--asset:7", "--account:2002" },
                                         client_balance_b_log,
                                         "run-chain-node-cli-smoke client-balance-b") ||
             !v3_run_command_logged_argv(3U,
-                                        (const char *[3]){ bin, "show-state", state_arg },
+                                        (const char *[3]){ bin, "chain-show-state", state_arg },
                                         client_show_log,
                                         "run-chain-node-cli-smoke client-show")) {
             return 1;
@@ -64544,6 +67060,10 @@ static bool v3_build_exec_context(const V3BootstrapContract *contract,
                                   V3PrimaryObjectPlanStub *primary,
                                   V3ObjectPlanStub *object_plan,
                                   V3NativeLinkPlanStub *native_link) {
+    long long total_start_ms = v3_bft_monotime_ms();
+    long long phase_start_ms;
+    long long phase_end_ms;
+    long long provider_sources_ms = 0LL;
     const char *channel = v3_flag_value(argc, argv, "--channel");
     const char *requested_world_head = v3_flag_value(argc, argv, "--world-head");
     const char *lock_path = v3_flag_value(argc, argv, "--lock");
@@ -64551,9 +67071,12 @@ static bool v3_build_exec_context(const V3BootstrapContract *contract,
                                             v3_flag_value(argc, argv, "--baseline-surface") :
                                             NULL;
     V3LoweringPlanStub *lowering = NULL;
+    phase_start_ms = v3_bft_monotime_ms();
     if (!v3_build_system_link_plan_stub(contract, argc, argv, require_output, plan)) {
         return false;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    world->exec_phase_system_link_plan_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     if (!require_output && plan->output_path[0] == '\0') {
         v3_default_debug_output_path(plan, plan->output_path, sizeof(plan->output_path));
     }
@@ -64566,27 +67089,42 @@ static bool v3_build_exec_context(const V3BootstrapContract *contract,
         return false;
     }
     lowering = (V3LoweringPlanStub *)v3_xmalloc(sizeof(V3LoweringPlanStub));
+    phase_start_ms = v3_bft_monotime_ms();
     if (!v3_build_lowering_plan_stub(plan, lowering)) {
         free(lowering);
         v3_compiler_world_artifacts_free(world);
         return false;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    world->exec_phase_lowering_plan_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     v3_sync_lowering_exports_from_world(world, lowering);
+    phase_start_ms = v3_bft_monotime_ms();
     if (!v3_build_primary_object_plan_stub(plan, lowering, primary)) {
         free(lowering);
         v3_compiler_world_artifacts_free(world);
         return false;
     }
-    if (!v3_build_object_plan_stub(plan, lowering, primary, object_plan)) {
+    phase_end_ms = v3_bft_monotime_ms();
+    world->exec_phase_primary_object_plan_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
+    if (!v3_build_object_plan_stub(plan, lowering, primary, object_plan, &provider_sources_ms)) {
         free(lowering);
         v3_compiler_world_artifacts_free(world);
         return false;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    world->exec_phase_provider_sources_ms = provider_sources_ms;
+    world->exec_phase_object_plan_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    phase_start_ms = v3_bft_monotime_ms();
     if (!v3_build_native_link_plan_stub(plan, primary, object_plan, native_link)) {
         free(lowering);
         v3_compiler_world_artifacts_free(world);
         return false;
     }
+    phase_end_ms = v3_bft_monotime_ms();
+    world->exec_phase_native_link_plan_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+    world->exec_phase_compile_receipt_ms = 0LL;
+    world->exec_phase_total_ms = v3_phase_elapsed_ms(total_start_ms, v3_bft_monotime_ms());
     *lowering_out = lowering;
     return true;
 }

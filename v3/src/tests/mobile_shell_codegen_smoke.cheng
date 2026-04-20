@@ -2,36 +2,68 @@ import std/monotimes
 import std/os
 import std/strings
 import cheng/v3/tooling/mobile_shell_codegen as mshell
+import cheng/v3/tooling/path as v3path
 
 fn main(): int32 =
     let root: str = os.GetCurrentDir()
     let stamp: str = int64ToStr(monotimes.MonoTimeNs(monotimes.GetMonoTime()))
     let outDir: str = "/tmp/v3_mobile_shell_codegen_smoke_" + stamp
-    let args: str[] = [
-        "export",
-        "--platform", "all",
-        "--out-dir", outDir,
-        "--app-id", "org.cheng.smoke",
-        "--app-name", "ChengSmoke",
-        "--lib-name", "cheng_smoke_app"
-    ]
-    var outputText: str = ""
+    let madeOutDir: bool = v3path.V3MkdirP(root, outDir)
+    assert(madeOutDir, "mobile shell smoke: out dir")
+    let runtimeInputDir: str = os.JoinPath(outDir, "runtime_inputs")
+    let madeRuntimeInputDir: bool = v3path.V3MkdirP(root, runtimeInputDir)
+    assert(madeRuntimeInputDir, "mobile shell smoke: runtime input dir")
+    let runtimeContractInput: str = os.JoinPath(runtimeInputDir, "native_gui_runtime_contract_v1.json")
+    let runtimeBundleInput: str = os.JoinPath(runtimeInputDir, "native_gui_bundle_v1.json")
+    os.WriteFile(runtimeContractInput, "{\n  \"format\": \"native_gui_runtime_contract_v1\"\n}\n")
+    os.WriteFile(runtimeBundleInput, "{\n  \"format\": \"native_gui_bundle_v1\"\n}\n")
+    var opts = mshell.v3MobileShellDefaultOptions(root)
+    opts.outDir = outDir
+    opts.appId = "org.cheng.smoke"
+    opts.appName = "ChengSmoke"
+    opts.libName = "cheng_smoke_app"
+    opts.runtimeMode = "r2c_native_gui_v1"
+    opts.runtimeContractPath = runtimeContractInput
+    opts.runtimeBundlePath = runtimeBundleInput
+    opts.routeState = "home_default"
+    opts.emitAndroid = true
+    opts.emitIos = true
+    opts.emitHarmony = true
+    var manifestPath: str = ""
     var errorText: str = ""
-    let rc: int32 = mshell.v3MobileShellRun(root, args, outputText, errorText)
+    let exportOk: bool = mshell.v3MobileShellExportResolved(opts,
+                                                            manifestPath,
+                                                            errorText)
     let errorPath: str = os.JoinPath(outDir, "mobile_shell_error.txt")
-    if rc != 0:
+    if !exportOk:
         os.WriteFile(errorPath, errorText)
         echo("mobile shell smoke: export failed")
         return 1
     assert(len(errorText) == 0, "mobile shell smoke: export empty error")
 
     let manifest: str = os.JoinPath(outDir, "mobile_shell_manifest_v1.json")
+    let runtimeManifest: str = os.JoinPath(outDir, "mobile_shell_runtime_contract_v1.json")
+    let runtimeContractPayload: str = os.JoinPath(outDir, "runtime/runtime_contract_payload.json")
+    let runtimeBundlePayload: str = os.JoinPath(outDir, "runtime/runtime_bundle_payload.json")
+    let launchArgsKv: str = os.JoinPath(outDir, "runtime/mobile_shell_launch_args.kv")
+    let launchArgsJson: str = os.JoinPath(outDir, "runtime/mobile_shell_launch_args.json")
     let androidGradleProperties: str = os.JoinPath(outDir, "android/gradle.properties")
     let androidHost: str = os.JoinPath(outDir, "android/app/src/main/cpp/cheng_generated_android_host.c")
     let androidActivity: str = os.JoinPath(outDir, "android/app/src/main/kotlin/org/cheng/smoke/ChengMainActivity.kt")
     let androidStrings: str = os.JoinPath(outDir, "android/app/src/main/res/values/strings.xml")
+    let androidRuntimeManifestAsset: str = os.JoinPath(outDir, "android/app/src/main/assets/mobile_shell_runtime_contract_v1.json")
+    let androidRuntimeContractAsset: str = os.JoinPath(outDir, "android/app/src/main/assets/runtime/mobile_shell_runtime_contract_payload.json")
+    let androidRuntimeBundleAsset: str = os.JoinPath(outDir, "android/app/src/main/assets/runtime/mobile_shell_runtime_bundle_payload.json")
+    let androidLaunchArgsKvAsset: str = os.JoinPath(outDir, "android/app/src/main/assets/runtime/mobile_shell_launch_args.kv")
+    let androidLaunchArgsJsonAsset: str = os.JoinPath(outDir, "android/app/src/main/assets/runtime/mobile_shell_launch_args.json")
+    let iosInfoPlist: str = os.JoinPath(outDir, "ios/Info.plist")
     let iosViewController: str = os.JoinPath(outDir, "ios/ChengGeneratedMetalViewController.m")
     let iosProject: str = os.JoinPath(outDir, "ios/ChengGeneratedApp.xcodeproj/project.pbxproj")
+    let iosRuntimeManifest: str = os.JoinPath(outDir, "ios/runtime/mobile_shell_runtime_contract_v1.json")
+    let iosRuntimeContractPayload: str = os.JoinPath(outDir, "ios/runtime/mobile_shell_runtime_contract_payload.json")
+    let iosRuntimeBundlePayload: str = os.JoinPath(outDir, "ios/runtime/mobile_shell_runtime_bundle_payload.json")
+    let iosLaunchArgsKv: str = os.JoinPath(outDir, "ios/runtime/mobile_shell_launch_args.kv")
+    let iosLaunchArgsJson: str = os.JoinPath(outDir, "ios/runtime/mobile_shell_launch_args.json")
     let harmonyHvigorFile: str = os.JoinPath(outDir, "harmony/hvigorfile.ts")
     let harmonyHvigorConfig: str = os.JoinPath(outDir, "harmony/hvigor/hvigor-config.json5")
     let harmonyEntryHvigorFile: str = os.JoinPath(outDir, "harmony/entry/hvigorfile.ts")
@@ -39,17 +71,38 @@ fn main(): int32 =
     let harmonyStringJson: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/base/element/string.json")
     let harmonyColorJson: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/base/element/color.json")
     let harmonyAppIcon: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/base/media/app_icon.svg")
+    let harmonyRuntimeManifest: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/rawfile/mobile_shell_runtime_contract_v1.json")
+    let harmonyRuntimeContractPayload: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/rawfile/mobile_shell_runtime_contract_payload.json")
+    let harmonyRuntimeBundlePayload: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/rawfile/mobile_shell_runtime_bundle_payload.json")
+    let harmonyLaunchArgsKv: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/rawfile/mobile_shell_launch_args.kv")
+    let harmonyLaunchArgsJson: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/rawfile/mobile_shell_launch_args.json")
     let harmonyHost: str = os.JoinPath(outDir, "harmony/entry/src/main/cpp/cheng_generated_harmony_host.cpp")
     let harmonyEntryAbility: str = os.JoinPath(outDir, "harmony/entry/src/main/ets/entryability/EntryAbility.ets")
     let harmonyMainPages: str = os.JoinPath(outDir, "harmony/entry/src/main/resources/base/profile/main_pages.json")
 
     assert(os.FileExists(manifest), "mobile shell smoke: manifest exists")
+    assert(os.FileExists(runtimeManifest), "mobile shell smoke: runtime manifest exists")
+    assert(os.FileExists(runtimeContractPayload), "mobile shell smoke: runtime contract payload exists")
+    assert(os.FileExists(runtimeBundlePayload), "mobile shell smoke: runtime bundle payload exists")
+    assert(os.FileExists(launchArgsKv), "mobile shell smoke: launch args kv exists")
+    assert(os.FileExists(launchArgsJson), "mobile shell smoke: launch args json exists")
     assert(os.FileExists(androidGradleProperties), "mobile shell smoke: android gradle properties exists")
     assert(os.FileExists(androidHost), "mobile shell smoke: android host exists")
     assert(os.FileExists(androidActivity), "mobile shell smoke: android activity exists")
     assert(os.FileExists(androidStrings), "mobile shell smoke: android strings exists")
+    assert(os.FileExists(androidRuntimeManifestAsset), "mobile shell smoke: android runtime manifest asset exists")
+    assert(os.FileExists(androidRuntimeContractAsset), "mobile shell smoke: android runtime contract asset exists")
+    assert(os.FileExists(androidRuntimeBundleAsset), "mobile shell smoke: android runtime bundle asset exists")
+    assert(os.FileExists(androidLaunchArgsKvAsset), "mobile shell smoke: android launch args kv asset exists")
+    assert(os.FileExists(androidLaunchArgsJsonAsset), "mobile shell smoke: android launch args json asset exists")
+    assert(os.FileExists(iosInfoPlist), "mobile shell smoke: ios info plist exists")
     assert(os.FileExists(iosViewController), "mobile shell smoke: ios controller exists")
     assert(os.FileExists(iosProject), "mobile shell smoke: ios project exists")
+    assert(os.FileExists(iosRuntimeManifest), "mobile shell smoke: ios runtime manifest exists")
+    assert(os.FileExists(iosRuntimeContractPayload), "mobile shell smoke: ios runtime contract payload exists")
+    assert(os.FileExists(iosRuntimeBundlePayload), "mobile shell smoke: ios runtime bundle payload exists")
+    assert(os.FileExists(iosLaunchArgsKv), "mobile shell smoke: ios launch args kv exists")
+    assert(os.FileExists(iosLaunchArgsJson), "mobile shell smoke: ios launch args json exists")
     assert(os.FileExists(harmonyHvigorFile), "mobile shell smoke: harmony hvigor exists")
     assert(os.FileExists(harmonyHvigorConfig), "mobile shell smoke: harmony hvigor config exists")
     assert(os.FileExists(harmonyEntryHvigorFile), "mobile shell smoke: harmony entry hvigor exists")
@@ -57,16 +110,37 @@ fn main(): int32 =
     assert(os.FileExists(harmonyStringJson), "mobile shell smoke: harmony string json exists")
     assert(os.FileExists(harmonyColorJson), "mobile shell smoke: harmony color json exists")
     assert(os.FileExists(harmonyAppIcon), "mobile shell smoke: harmony app icon exists")
+    assert(os.FileExists(harmonyRuntimeManifest), "mobile shell smoke: harmony runtime manifest exists")
+    assert(os.FileExists(harmonyRuntimeContractPayload), "mobile shell smoke: harmony runtime contract payload exists")
+    assert(os.FileExists(harmonyRuntimeBundlePayload), "mobile shell smoke: harmony runtime bundle payload exists")
+    assert(os.FileExists(harmonyLaunchArgsKv), "mobile shell smoke: harmony launch args kv exists")
+    assert(os.FileExists(harmonyLaunchArgsJson), "mobile shell smoke: harmony launch args json exists")
     assert(os.FileExists(harmonyHost), "mobile shell smoke: harmony host exists")
     assert(os.FileExists(harmonyEntryAbility), "mobile shell smoke: harmony entry ability exists")
     assert(os.FileExists(harmonyMainPages), "mobile shell smoke: harmony main pages exists")
 
     let manifestText: str = os.ReadFile(manifest)
+    let runtimeManifestText: str = os.ReadFile(runtimeManifest)
+    let runtimeContractPayloadText: str = os.ReadFile(runtimeContractPayload)
+    let runtimeBundlePayloadText: str = os.ReadFile(runtimeBundlePayload)
+    let launchArgsKvText: str = os.ReadFile(launchArgsKv)
+    let launchArgsJsonText: str = os.ReadFile(launchArgsJson)
     let androidGradlePropertiesText: str = os.ReadFile(androidGradleProperties)
     let androidHostText: str = os.ReadFile(androidHost)
     let androidStringsText: str = os.ReadFile(androidStrings)
+    let androidRuntimeManifestAssetText: str = os.ReadFile(androidRuntimeManifestAsset)
+    let androidRuntimeContractAssetText: str = os.ReadFile(androidRuntimeContractAsset)
+    let androidRuntimeBundleAssetText: str = os.ReadFile(androidRuntimeBundleAsset)
+    let androidLaunchArgsKvAssetText: str = os.ReadFile(androidLaunchArgsKvAsset)
+    let androidLaunchArgsJsonAssetText: str = os.ReadFile(androidLaunchArgsJsonAsset)
+    let iosInfoPlistText: str = os.ReadFile(iosInfoPlist)
     let iosViewControllerText: str = os.ReadFile(iosViewController)
     let iosProjectText: str = os.ReadFile(iosProject)
+    let iosRuntimeManifestText: str = os.ReadFile(iosRuntimeManifest)
+    let iosRuntimeContractPayloadText: str = os.ReadFile(iosRuntimeContractPayload)
+    let iosRuntimeBundlePayloadText: str = os.ReadFile(iosRuntimeBundlePayload)
+    let iosLaunchArgsKvText: str = os.ReadFile(iosLaunchArgsKv)
+    let iosLaunchArgsJsonText: str = os.ReadFile(iosLaunchArgsJson)
     let harmonyHvigorFileText: str = os.ReadFile(harmonyHvigorFile)
     let harmonyHvigorConfigText: str = os.ReadFile(harmonyHvigorConfig)
     let harmonyEntryHvigorFileText: str = os.ReadFile(harmonyEntryHvigorFile)
@@ -74,6 +148,11 @@ fn main(): int32 =
     let harmonyStringJsonText: str = os.ReadFile(harmonyStringJson)
     let harmonyColorJsonText: str = os.ReadFile(harmonyColorJson)
     let harmonyAppIconText: str = os.ReadFile(harmonyAppIcon)
+    let harmonyRuntimeManifestText: str = os.ReadFile(harmonyRuntimeManifest)
+    let harmonyRuntimeContractPayloadText: str = os.ReadFile(harmonyRuntimeContractPayload)
+    let harmonyRuntimeBundlePayloadText: str = os.ReadFile(harmonyRuntimeBundlePayload)
+    let harmonyLaunchArgsKvText: str = os.ReadFile(harmonyLaunchArgsKv)
+    let harmonyLaunchArgsJsonText: str = os.ReadFile(harmonyLaunchArgsJson)
     let harmonyHostText: str = os.ReadFile(harmonyHost)
     let harmonyEntryAbilityText: str = os.ReadFile(harmonyEntryAbility)
     let harmonyMainPagesText: str = os.ReadFile(harmonyMainPages)
@@ -82,18 +161,88 @@ fn main(): int32 =
            "mobile shell smoke: manifest format")
     assert(strings.StrContains(manifestText, "\"app_id\": \"org.cheng.smoke\""),
            "mobile shell smoke: manifest app id")
+    assert(strings.StrContains(manifestText, "\"runtime_mode\": \"r2c_native_gui_v1\""),
+           "mobile shell smoke: manifest runtime mode")
+    assert(strings.StrContains(manifestText, "\"runtime_manifest\": \"mobile_shell_runtime_contract_v1.json\""),
+           "mobile shell smoke: manifest runtime manifest")
+    assert(strings.StrContains(manifestText, "\"launch_args_kv\": \"runtime/mobile_shell_launch_args.kv\""),
+           "mobile shell smoke: manifest launch args kv")
+    assert(strings.StrContains(manifestText, "\"launch_args_json\": \"runtime/mobile_shell_launch_args.json\""),
+           "mobile shell smoke: manifest launch args json")
+    assert(strings.StrContains(manifestText, "\"initial_route_state\": \"home_default\""),
+           "mobile shell smoke: manifest route state")
+    assert(strings.StrContains(runtimeManifestText, "\"format\": \"mobile_shell_runtime_contract_v1\""),
+           "mobile shell smoke: runtime manifest format")
+    assert(strings.StrContains(runtimeManifestText, "\"runtime_contract_payload\": \"runtime/runtime_contract_payload.json\""),
+           "mobile shell smoke: runtime manifest contract payload")
+    assert(strings.StrContains(runtimeManifestText, "\"runtime_bundle_payload\": \"runtime/runtime_bundle_payload.json\""),
+           "mobile shell smoke: runtime manifest bundle payload")
+    assert(strings.StrContains(runtimeManifestText, "\"launch_args_kv\": \"runtime/mobile_shell_launch_args.kv\""),
+           "mobile shell smoke: runtime manifest launch args kv")
+    assert(strings.StrContains(runtimeManifestText, "\"launch_args_json\": \"runtime/mobile_shell_launch_args.json\""),
+           "mobile shell smoke: runtime manifest launch args json")
+    assert(strings.StrContains(runtimeContractPayloadText, "\"format\": \"native_gui_runtime_contract_v1\""),
+           "mobile shell smoke: copied runtime contract payload")
+    assert(strings.StrContains(runtimeBundlePayloadText, "\"format\": \"native_gui_bundle_v1\""),
+           "mobile shell smoke: copied runtime bundle payload")
+    assert(strings.StrContains(launchArgsKvText, "route_state=home_default"),
+           "mobile shell smoke: launch args kv route")
+    assert(strings.StrContains(launchArgsJsonText, "\"format\": \"mobile_shell_launch_args_v1\""),
+           "mobile shell smoke: launch args json format")
+    assert(strings.StrContains(launchArgsJsonText, "\"route_state\": \"home_default\""),
+           "mobile shell smoke: launch args json route")
     assert(strings.StrContains(androidGradlePropertiesText, "android.useAndroidX=true"),
            "mobile shell smoke: android gradle properties content")
     assert(strings.StrContains(androidHostText, "ANativeWindow_fromSurface"),
            "mobile shell smoke: android surface glue")
+    assert(strings.StrContains(androidHostText, "kChengRuntimeManifest = \"mobile_shell_runtime_contract_v1.json\""),
+           "mobile shell smoke: android runtime manifest constant")
+    assert(strings.StrContains(androidHostText, "kChengLaunchArgsKvRel = \"runtime/mobile_shell_launch_args.kv\""),
+           "mobile shell smoke: android launch args kv rel constant")
+    assert(strings.StrContains(androidHostText, "kChengLaunchArgsJsonRel = \"runtime/mobile_shell_launch_args.json\""),
+           "mobile shell smoke: android launch args json rel constant")
     assert(strings.StrContains(androidStringsText, "<string name=\"app_name\">ChengSmoke</string>"),
            "mobile shell smoke: android app name string")
+    assert(strings.StrContains(androidRuntimeManifestAssetText, "\"format\": \"mobile_shell_runtime_contract_v1\""),
+           "mobile shell smoke: android runtime manifest asset content")
+    assert(strings.StrContains(androidRuntimeContractAssetText, "\"format\": \"native_gui_runtime_contract_v1\""),
+           "mobile shell smoke: android runtime contract asset content")
+    assert(strings.StrContains(androidRuntimeBundleAssetText, "\"format\": \"native_gui_bundle_v1\""),
+           "mobile shell smoke: android runtime bundle asset content")
+    assert(strings.StrContains(androidLaunchArgsKvAssetText, "route_state=home_default"),
+           "mobile shell smoke: android launch args kv asset content")
+    assert(strings.StrContains(androidLaunchArgsJsonAssetText, "\"route_state\": \"home_default\""),
+           "mobile shell smoke: android launch args json asset content")
+    assert(strings.StrContains(iosInfoPlistText, "<key>CFBundleIdentifier</key>"),
+           "mobile shell smoke: ios info plist content")
     assert(strings.StrContains(iosViewControllerText, "CAMetalLayer"),
            "mobile shell smoke: ios metal glue")
+    assert(strings.StrContains(iosViewControllerText, "kChengRuntimeManifest = \"runtime/mobile_shell_runtime_contract_v1.json\""),
+           "mobile shell smoke: ios runtime manifest constant")
+    assert(strings.StrContains(iosViewControllerText, "kChengLaunchArgsKvRel = \"runtime/mobile_shell_launch_args.kv\""),
+           "mobile shell smoke: ios launch args kv rel constant")
+    assert(strings.StrContains(iosViewControllerText, "kChengLaunchArgsJsonRel = \"runtime/mobile_shell_launch_args.json\""),
+           "mobile shell smoke: ios launch args json rel constant")
     assert(strings.StrContains(iosProjectText, "PBXProject"),
            "mobile shell smoke: ios project syntax")
     assert(strings.StrContains(iosProjectText, "PRODUCT_BUNDLE_IDENTIFIER = \"org.cheng.smoke\";"),
            "mobile shell smoke: ios bundle id")
+    assert(strings.StrContains(iosProjectText, "mobile_shell_runtime_contract_v1.json in Resources"),
+           "mobile shell smoke: ios runtime manifest project resource")
+    assert(strings.StrContains(iosProjectText, "mobile_shell_launch_args.kv in Resources"),
+           "mobile shell smoke: ios launch args kv project resource")
+    assert(strings.StrContains(iosProjectText, "mobile_shell_launch_args.json in Resources"),
+           "mobile shell smoke: ios launch args json project resource")
+    assert(strings.StrContains(iosRuntimeManifestText, "\"format\": \"mobile_shell_runtime_contract_v1\""),
+           "mobile shell smoke: ios runtime manifest content")
+    assert(strings.StrContains(iosRuntimeContractPayloadText, "\"format\": \"native_gui_runtime_contract_v1\""),
+           "mobile shell smoke: ios runtime contract payload content")
+    assert(strings.StrContains(iosRuntimeBundlePayloadText, "\"format\": \"native_gui_bundle_v1\""),
+           "mobile shell smoke: ios runtime bundle payload content")
+    assert(strings.StrContains(iosLaunchArgsKvText, "route_state=home_default"),
+           "mobile shell smoke: ios launch args kv content")
+    assert(strings.StrContains(iosLaunchArgsJsonText, "\"route_state\": \"home_default\""),
+           "mobile shell smoke: ios launch args json content")
     assert(strings.StrContains(harmonyHvigorFileText, "appTasks"),
            "mobile shell smoke: harmony hvigor content")
     assert(strings.StrContains(harmonyHvigorConfigText, "\"modelVersion\": \"5.0.0\""),
@@ -108,8 +257,24 @@ fn main(): int32 =
            "mobile shell smoke: harmony color json content")
     assert(strings.StrContains(harmonyAppIconText, "<svg"),
            "mobile shell smoke: harmony app icon svg content")
+    assert(strings.StrContains(harmonyRuntimeManifestText, "\"format\": \"mobile_shell_runtime_contract_v1\""),
+           "mobile shell smoke: harmony runtime manifest content")
+    assert(strings.StrContains(harmonyRuntimeContractPayloadText, "\"format\": \"native_gui_runtime_contract_v1\""),
+           "mobile shell smoke: harmony runtime contract payload content")
+    assert(strings.StrContains(harmonyRuntimeBundlePayloadText, "\"format\": \"native_gui_bundle_v1\""),
+           "mobile shell smoke: harmony runtime bundle payload content")
+    assert(strings.StrContains(harmonyLaunchArgsKvText, "route_state=home_default"),
+           "mobile shell smoke: harmony launch args kv content")
+    assert(strings.StrContains(harmonyLaunchArgsJsonText, "\"route_state\": \"home_default\""),
+           "mobile shell smoke: harmony launch args json content")
     assert(strings.StrContains(harmonyHostText, "OHNativeWindow"),
            "mobile shell smoke: harmony native window glue")
+    assert(strings.StrContains(harmonyHostText, "kChengRuntimeManifest = \"rawfile/mobile_shell_runtime_contract_v1.json\""),
+           "mobile shell smoke: harmony runtime manifest constant")
+    assert(strings.StrContains(harmonyHostText, "kChengLaunchArgsKvRel = \"rawfile/mobile_shell_launch_args.kv\""),
+           "mobile shell smoke: harmony launch args kv rel constant")
+    assert(strings.StrContains(harmonyHostText, "kChengLaunchArgsJsonRel = \"rawfile/mobile_shell_launch_args.json\""),
+           "mobile shell smoke: harmony launch args json rel constant")
     assert(strings.StrContains(harmonyEntryAbilityText, "windowStage.loadContent('pages/Index'"),
            "mobile shell smoke: harmony entry ability content")
     assert(strings.StrContains(harmonyMainPagesText, "\"pages/Index\""),

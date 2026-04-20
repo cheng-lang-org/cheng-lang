@@ -2,23 +2,33 @@ import std/result
 import std/rawbytes
 import std/strings as strings
 import std/strutils as strutil
+import std/times as times
 import cheng/v3/std/bytes_layout as layout
+import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/consensus as consensus
 import cheng/v3/chain/lsmr_types as lt
+import cheng/v3/chain/oracle_types as oracle_types
 import cheng/v3/project/cheng_node_identity as identity
 import cheng/v3/project/cheng_node_index as cindex
 import cheng/v3/project/cheng_node_object as cobject
 import cheng/v3/project/cheng_node_ledger as ledger
 import cheng/v3/project/cheng_node_actor as actor
 import cheng/v3/project/cheng_node_transport as ctransport
+import cheng/v3/project/cheng_node_domains as cdomain
 import cheng/v3/project/chain_node as chain
+import cheng/v3/project/oracle_bft_state_machine as oracle_bft
+import cheng/v3/DiLoCo/core/diloco as diloco
+import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/vpn_proxy_config as vpncfg
 import cheng/v3/tooling/vpn_proxy_routing as vpnrouting
 import cheng/v3/libp2p/core/types as libtypes
+import cheng/v3/libp2p/core/peer_id
 import cheng/v3/libp2p/host/host as libhost
 import cheng/v3/libp2p/transports/tailnet_transport as tsnet
 import cheng/v3/libp2p/content/moq_fountain as moq
+import cheng/v3/project/unimaker_edge_types as evotypes
+import cheng/v3/project/unimaker_evomap_protocol as evo
 
 const
     v3ChengNodeDidBundleAssetId: int32 = 930001
@@ -36,17 +46,24 @@ type
         chainState: chain.V3ChainNode
         transport: ctransport.V3ChengNodeTransportState
         vpn: ctransport.V3ChengNodeVpnState
+        oracle: cdomain.V3ChengNodeOracleDomain
+        diloco: cdomain.V3ChengNodeDilocoDomain
+        evomap: cdomain.V3ChengNodeEvoMapDomain
 
 fn v3ChengNodeAppendText(buf: var layout.ByteBuf, text: str) =
     lt.v3AppendU32BE(buf, len(text))
     for i in 0..<len(text):
         layout.byteBufAppendByte(buf, int32(text[i]) & 255)
 
+fn v3ChengNodeBufCid(buf: var layout.ByteBuf): layout.FixedBytes32 =
+    let data = layout.byteBufToBytes(buf)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
+
 fn v3ChengNodeHashTextCid(tag: str, text: str): layout.FixedBytes32 =
     var buf = layout.byteBufInit(128)
     v3ChengNodeAppendText(buf, tag)
     v3ChengNodeAppendText(buf, text)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3ChengNodeBufCid(buf)
 
 fn v3ChengNodeSyntheticSnapshotCid(event: ledger.V3ChengNodeEventRecord,
                                    nextSnapshotVersion: int32): layout.FixedBytes32 =
@@ -60,7 +77,7 @@ fn v3ChengNodeSyntheticSnapshotCid(event: ledger.V3ChengNodeEventRecord,
     lt.v3AppendU32BE(buf, event.seq)
     lt.v3AppendFixed32(buf, event.payloadCid)
     lt.v3AppendFixed32(buf, event.eventCid)
-    return lt.v3FixedCidFromBuf(buf)
+    return v3ChengNodeBufCid(buf)
 
 fn v3ChengNodeDispatchForEvent(node: var V3ChengNode,
                                actorName: str,
@@ -295,6 +312,17 @@ fn v3ChengNodeCompilerBuildReceiptText(receiptKey: str,
     out = out + "receipt_cid=" + layout.fixedBytes32Hex(receiptCid)
     return out
 
+fn v3ChengNodeCompilerTargetReceiptText(receiptKey: str,
+                                        receipt: ccsg.V3CompileReceipt): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "target=" + receipt.targetTriple + "\n"
+    out = out + "receipt_key=" + receiptKey + "\n"
+    out = out + "receipt_cid=" + layout.fixedBytes32Hex(receipt.receiptCid) + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(receipt.worldHeadCid) + "\n"
+    out = out + "bootstrap_stage=" + receipt.bootstrapStage
+    return out
+
 fn v3ChengNodeMoqBuildText(build: moq.V3Libp2pMoqBuildResult): str =
     var out = ""
     out = out + "version=1\n"
@@ -351,6 +379,22 @@ fn v3ChengNodeApplyRuntimeObject(node: var V3ChengNode,
         return ctransport.V3ChengNodeVpnApplyOverlayRouteText(node.vpn, objectText)
     if objectKind == "vpn_exit_route":
         return ctransport.V3ChengNodeVpnApplyExitRouteText(node.vpn, objectText)
+    if objectKind == "oracle_machine_state":
+        return cdomain.V3ChengNodeOracleApplyMachineText(node.oracle, objectText)
+    if objectKind == "oracle_pair_state":
+        return cdomain.V3ChengNodeOracleApplyPairText(node.oracle, objectText)
+    if objectKind == "diloco_job_state":
+        return cdomain.V3ChengNodeDilocoApplyJobText(node.diloco, objectText)
+    if objectKind == "diloco_cohort_state":
+        return cdomain.V3ChengNodeDilocoApplyCohortText(node.diloco, objectText)
+    if objectKind == "diloco_lease_state":
+        return cdomain.V3ChengNodeDilocoApplyLeaseText(node.diloco, objectText)
+    if objectKind == "evomap_agent_hello":
+        return cdomain.V3ChengNodeEvoMapApplyAgentText(node.evomap, objectText)
+    if objectKind == "evomap_task":
+        return cdomain.V3ChengNodeEvoMapApplyTaskText(node.evomap, objectText)
+    if objectKind == "evomap_capsule":
+        return cdomain.V3ChengNodeEvoMapApplyCapsuleText(node.evomap, objectText)
     return Ok[bool](false)
 
 fn v3ChengNodeAnnounceDiscoveryText(node: var V3ChengNode,
@@ -401,6 +445,9 @@ fn V3ChengNodeInit(rootSeed: str): Result[V3ChengNode] =
     out.transport = ctransport.V3ChengNodeTransportStateInit(layout.fixedBytes32Hex(out.identity.libp2pKey))
     out.vpn = ctransport.V3ChengNodeVpnStateInit(layout.fixedBytes32Hex(out.identity.vpnKey),
                                                  ctransport.V3ChengNodeTransportPeerIdText(out.transport))
+    out.oracle = cdomain.V3ChengNodeOracleDomainInit()
+    out.diloco = cdomain.V3ChengNodeDilocoDomainInit()
+    out.evomap = cdomain.V3ChengNodeEvoMapDomainInit()
     return Ok[V3ChengNode](out)
 
 fn V3ChengNodeAnchorIndexedObject(node: var V3ChengNode,
@@ -676,6 +723,11 @@ fn V3ChengNodeImportChainSnapshot(node: var V3ChengNode,
         changed = true
     return Ok[bool](changed)
 
+fn V3ChengNodeImportOracleState(node: var V3ChengNode,
+                                machine: oracle_bft.V3OracleBftStateMachine): Result[bool] =
+    node.oracle.machine = machine
+    return v3ChengNodeOracleSyncIndexes(node)
+
 fn V3ChengNodeReplayStoredEvent(node: var V3ChengNode,
                                 actorName: str,
                                 objectKind: str,
@@ -684,23 +736,111 @@ fn V3ChengNodeReplayStoredEvent(node: var V3ChengNode,
                                 keyText: str,
                                 payloadCid: layout.FixedBytes32): Result[bool] =
     if objectKind == "index_tombstone":
-        let proofRes = V3ChengNodeTombstoneIndexedObject(node,
-                                                         actorName,
-                                                         indexGroup,
-                                                         lookupKind,
-                                                         keyText)
+        let zeroCid = layout.fixedBytes32Zero()
+        let eventRes = ledger.V3ChengNodeLedgerAppend(node.ledger,
+                                                      actorName,
+                                                      "index_tombstone",
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      zeroCid)
+        if IsErr(eventRes):
+            return Err[bool](Error(eventRes))
+        let event = Value(eventRes)
+        let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+        let snapshotCid = v3ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+        let snapshotRes = ledger.V3ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+        if IsErr(snapshotRes):
+            return Err[bool](Error(snapshotRes))
+        let proofRes = ledger.V3ChengNodeLedgerBuildProof(node.ledger,
+                                                          indexGroup,
+                                                          lookupKind,
+                                                          keyText,
+                                                          zeroCid,
+                                                          event.eventCid)
         if IsErr(proofRes):
             return Err[bool](Error(proofRes))
+        let proof = Value(proofRes)
+        let removeRes = cindex.V3ChengNodeIndexRemove(node.indices,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      event.seq,
+                                                      proof.proofCid)
+        if IsErr(removeRes):
+            return Err[bool](Error(removeRes))
+        let snapshotHeadKey = layout.fixedBytes32Hex(node.ledger.manifest.headCid)
+        let snapshotHeadUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                                  "snapshot",
+                                                                  "head",
+                                                                  snapshotHeadKey,
+                                                                  snapshotCid,
+                                                                  event.seq,
+                                                                  proof.proofCid)
+        if IsErr(snapshotHeadUpsertRes):
+            return Err[bool](Error(snapshotHeadUpsertRes))
+        let snapshotVersionUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                                     "snapshot",
+                                                                     "version",
+                                                                     intToStr(snapshotVersion),
+                                                                     snapshotCid,
+                                                                     event.seq,
+                                                                     proof.proofCid)
+        if IsErr(snapshotVersionUpsertRes):
+            return Err[bool](Error(snapshotVersionUpsertRes))
         return Ok[bool](true)
-    let proofRes = v3ChengNodeAnchorIndexedCid(node,
-                                               actorName,
-                                               indexGroup,
-                                               lookupKind,
-                                               keyText,
-                                               objectKind,
-                                               payloadCid)
+    let eventRes = ledger.V3ChengNodeLedgerAppend(node.ledger,
+                                                  actorName,
+                                                  objectKind,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid)
+    if IsErr(eventRes):
+        return Err[bool](Error(eventRes))
+    let event = Value(eventRes)
+    let snapshotVersion = node.ledger.manifest.snapshotVersion + 1
+    let snapshotCid = v3ChengNodeSyntheticSnapshotCid(event, snapshotVersion)
+    let snapshotRes = ledger.V3ChengNodeLedgerSealSnapshot(node.ledger, snapshotVersion, snapshotCid)
+    if IsErr(snapshotRes):
+        return Err[bool](Error(snapshotRes))
+    let proofRes = ledger.V3ChengNodeLedgerBuildProof(node.ledger,
+                                                      indexGroup,
+                                                      lookupKind,
+                                                      keyText,
+                                                      payloadCid,
+                                                      event.eventCid)
     if IsErr(proofRes):
         return Err[bool](Error(proofRes))
+    let proof = Value(proofRes)
+    let upsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                  indexGroup,
+                                                  lookupKind,
+                                                  keyText,
+                                                  payloadCid,
+                                                  event.seq,
+                                                  proof.proofCid)
+    if IsErr(upsertRes):
+        return Err[bool](Error(upsertRes))
+    let snapshotHeadKey = layout.fixedBytes32Hex(node.ledger.manifest.headCid)
+    let snapshotHeadUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                              "snapshot",
+                                                              "head",
+                                                              snapshotHeadKey,
+                                                              snapshotCid,
+                                                              event.seq,
+                                                              proof.proofCid)
+    if IsErr(snapshotHeadUpsertRes):
+        return Err[bool](Error(snapshotHeadUpsertRes))
+    let snapshotVersionUpsertRes = cindex.V3ChengNodeIndexUpsert(node.indices,
+                                                                 "snapshot",
+                                                                 "version",
+                                                                 intToStr(snapshotVersion),
+                                                                 snapshotCid,
+                                                                 event.seq,
+                                                                 proof.proofCid)
+    if IsErr(snapshotVersionUpsertRes):
+        return Err[bool](Error(snapshotVersionUpsertRes))
     let runtimeRes = v3ChengNodeApplyRuntimeObject(node, objectKind, keyText, payloadCid)
     if IsErr(runtimeRes):
         return Err[bool](Error(runtimeRes))
@@ -849,6 +989,465 @@ fn V3ChengNodeVpnUpsertExitRoute(node: var V3ChengNode,
 fn V3ChengNodeVpnStatusReportText(node: V3ChengNode): str =
     return ctransport.V3ChengNodeVpnStatusText(node.vpn)
 
+fn v3ChengNodeOracleSyncIndexes(node: var V3ChengNode): Result[bool] =
+    if !node.oracle.machine.hasFinalized:
+        return Ok[bool](false)
+    var changed = false
+    let machineText = cdomain.V3ChengNodeOracleMachineStateText(node.oracle)
+    let machineUpsertRes = V3ChengNodeUpsertIndexedText(node,
+                                                        "oracle",
+                                                        "oracle",
+                                                        "pair",
+                                                        "__machine__",
+                                                        "oracle_machine_state",
+                                                        machineText)
+    if IsErr(machineUpsertRes):
+        return Err[bool](Error(machineUpsertRes))
+    if Value(machineUpsertRes):
+        changed = true
+    var pairId = 1
+    while pairId <= oracle_types.v3OraclePairCount:
+        let pairKey = cdomain.V3ChengNodeOraclePairKeyFromPairId(pairId)
+        if len(pairKey) <= 0:
+            return Err[bool]("cheng_node oracle: pair key missing")
+        let pairTextRes = cdomain.V3ChengNodeOraclePairStateText(node.oracle, pairId)
+        if IsErr(pairTextRes):
+            return Err[bool](Error(pairTextRes))
+        let pairUpsertRes = V3ChengNodeUpsertIndexedText(node,
+                                                         "oracle",
+                                                         "oracle",
+                                                         "pair",
+                                                         pairKey,
+                                                         "oracle_pair_state",
+                                                         Value(pairTextRes))
+        if IsErr(pairUpsertRes):
+            return Err[bool](Error(pairUpsertRes))
+        if Value(pairUpsertRes):
+            changed = true
+        pairId = pairId + 1
+    return Ok[bool](changed)
+
+fn V3ChengNodeOracleSubmitFixtureRound(node: var V3ChengNode,
+                                       roundId: int64): Result[bool] =
+    let finalizeRes = cdomain.V3ChengNodeOracleFinalizeFixtureRound(node.oracle, roundId)
+    if IsErr(finalizeRes):
+        return Err[bool](Error(finalizeRes))
+    return v3ChengNodeOracleSyncIndexes(node)
+
+fn V3ChengNodeOracleQueryText(node: V3ChengNode,
+                              pairText: str,
+                              withDelta: bool): Result[str] =
+    var pairId = 0
+    var pairKey = ""
+    let resolveRes = cdomain.V3ChengNodeOracleResolvePair(pairText, pairId, pairKey)
+    if IsErr(resolveRes):
+        return Err[str](Error(resolveRes))
+    let queryRes = V3ChengNodeKeyedQueryText(node,
+                                             "oracle",
+                                             "pair",
+                                             pairKey,
+                                             withDelta)
+    if IsErr(queryRes):
+        return Err[str](Error(queryRes))
+    var out = ""
+    let latestRes = cdomain.V3ChengNodeOracleLatestReportText(node.oracle, pairId)
+    if IsOk(latestRes):
+        out = out + Value(latestRes) + "\n"
+    out = out + Value(queryRes)
+    return Ok[str](out)
+
+fn v3ChengNodeDilocoArtifactRef(jobBundleCid: layout.FixedBytes32,
+                                tag: str): Result[diloco.V3DiLoCoArtifactRef] =
+    var out = diloco.V3DiLoCoArtifactRefZero()
+    let payloadText = "cheng_node.diloco.artifact|" + tag
+    let refRes = diloco.V3DiLoCoArtifactRefFromBytesFill(out,
+                                                         jobBundleCid,
+                                                         bytesFromString(payloadText),
+                                                         256,
+                                                         tag)
+    if IsErr(refRes):
+        return Err[diloco.V3DiLoCoArtifactRef](Error(refRes))
+    return Ok[diloco.V3DiLoCoArtifactRef](out)
+
+fn v3ChengNodeDilocoLeaseKey(jobKey: str,
+                             peerText: str): str =
+    return jobKey + "/" + peerText
+
+fn v3ChengNodeDilocoSyncJobText(node: var V3ChengNode,
+                                jobKey: str,
+                                jobBundleCid: layout.FixedBytes32): Result[bool] =
+    let jobTextRes = cdomain.V3ChengNodeDilocoJobStateText(node.diloco,
+                                                           jobKey,
+                                                           jobBundleCid)
+    if IsErr(jobTextRes):
+        return Err[bool](Error(jobTextRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_job",
+                                        "job",
+                                        jobKey,
+                                        "diloco_job_state",
+                                        Value(jobTextRes))
+
+fn v3ChengNodeDilocoSyncCohortText(node: var V3ChengNode,
+                                   jobKey: str,
+                                   jobBundleCid: layout.FixedBytes32): Result[bool] =
+    let cohortPos = diloco.V3DiLoCoCohortPos(node.diloco.state, jobBundleCid)
+    if cohortPos < 0:
+        return Err[bool]("cheng_node diloco: cohort missing")
+    let cohortText = cdomain.V3ChengNodeDilocoCohortStateText(jobKey,
+                                                              node.diloco.state.cohorts[cohortPos])
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_cohort",
+                                        "cohort",
+                                        jobKey,
+                                        "diloco_cohort_state",
+                                        cohortText)
+
+fn v3ChengNodeDilocoSyncLeaseText(node: var V3ChengNode,
+                                  jobKey: str,
+                                  lease: diloco.V3DiLoCoLease): Result[bool] =
+    let peerText = peer_id.v3Libp2pPeerIdText(lease.peerId)
+    let leaseKey = v3ChengNodeDilocoLeaseKey(jobKey, peerText)
+    let leaseText = cdomain.V3ChengNodeDilocoLeaseStateText(jobKey, leaseKey, lease)
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "diloco",
+                                        "diloco_lease",
+                                        "lease",
+                                        leaseKey,
+                                        "diloco_lease_state",
+                                        leaseText)
+
+fn v3ChengNodeDilocoSyncAllLeases(node: var V3ChengNode,
+                                  jobKey: str,
+                                  jobBundleCid: layout.FixedBytes32): Result[bool] =
+    var changed = false
+    for i in 0..<node.diloco.state.leases.len:
+        let lease = node.diloco.state.leases[i]
+        if !layout.fixedBytes32Equal(lease.jobBundleCid, jobBundleCid):
+            continue
+        let leaseSyncRes = v3ChengNodeDilocoSyncLeaseText(node, jobKey, lease)
+        if IsErr(leaseSyncRes):
+            return Err[bool](Error(leaseSyncRes))
+        if Value(leaseSyncRes):
+            changed = true
+    return Ok[bool](changed)
+
+fn V3ChengNodeDilocoOpenJob(node: var V3ChengNode,
+                            jobKey: str,
+                            requestedWorkerCount: int32,
+                            innerStepBudget: int32,
+                            outerStepTimeoutSeconds: int32): Result[bool] =
+    if len(jobKey) <= 0:
+        return Err[bool]("cheng_node diloco: job key missing")
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let modelRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid, jobKey + "|model.genesis")
+    if IsErr(modelRefRes):
+        return Err[bool](Error(modelRefRes))
+    let optimizerRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid, jobKey + "|optimizer.genesis")
+    if IsErr(optimizerRefRes):
+        return Err[bool](Error(optimizerRefRes))
+    var job = diloco.V3DiLoCoJobZero()
+    var version = diloco.V3DiLoCoGlobalVersionZero()
+    let openRes = diloco.V3DiLoCoOpenJobFill(job,
+                                             version,
+                                             node.diloco.state,
+                                             jobBundleCid,
+                                             requestedWorkerCount,
+                                             innerStepBudget,
+                                             outerStepTimeoutSeconds,
+                                             Value(modelRefRes),
+                                             Value(optimizerRefRes))
+    if IsErr(openRes):
+        return Err[bool](Error(openRes))
+    return v3ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn V3ChengNodeDilocoJoinCohort(node: var V3ChengNode,
+                               jobKey: str,
+                               peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.V3ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var cohort = diloco.V3DiLoCoCohortZero()
+    let joinRes = diloco.V3DiLoCoJoinCohortFill(cohort,
+                                                node.diloco.state,
+                                                jobBundleCid,
+                                                peerId)
+    if IsErr(joinRes):
+        return Err[bool](Error(joinRes))
+    let cohortSyncRes = v3ChengNodeDilocoSyncCohortText(node, jobKey, jobBundleCid)
+    if IsErr(cohortSyncRes):
+        return Err[bool](Error(cohortSyncRes))
+    let jobSyncRes = v3ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+    if IsErr(jobSyncRes):
+        return Err[bool](Error(jobSyncRes))
+    return Ok[bool](Value(cohortSyncRes) || Value(jobSyncRes))
+
+fn V3ChengNodeDilocoFetchLease(node: var V3ChengNode,
+                               jobKey: str,
+                               peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.V3ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var lease = diloco.V3DiLoCoLeaseZero()
+    let leaseRes = diloco.V3DiLoCoFetchLeaseFill(lease,
+                                                 node.diloco.state,
+                                                 jobBundleCid,
+                                                 peerId)
+    if IsErr(leaseRes):
+        return Err[bool](Error(leaseRes))
+    return v3ChengNodeDilocoSyncLeaseText(node, jobKey, lease)
+
+fn V3ChengNodeDilocoReportBarrier(node: var V3ChengNode,
+                                  jobKey: str,
+                                  peerSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let peerId = cdomain.V3ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    var barrier = diloco.V3DiLoCoBarrierZero()
+    let barrierRes = diloco.V3DiLoCoReportInnerStepDoneFill(barrier,
+                                                            node.diloco.state,
+                                                            jobBundleCid,
+                                                            peerId)
+    if IsErr(barrierRes):
+        return Err[bool](Error(barrierRes))
+    return v3ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn V3ChengNodeDilocoSubmitOuterDelta(node: var V3ChengNode,
+                                     jobKey: str,
+                                     peerSeed: str,
+                                     sampleCount: int32,
+                                     tokenCount: int32,
+                                     innerStepCount: int32,
+                                     weightNumerator: int32,
+                                     weightDenominator: int32): Result[bool] =
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let jobPos = diloco.V3DiLoCoJobPos(node.diloco.state, jobBundleCid)
+    if jobPos < 0:
+        return Err[bool]("cheng_node diloco: job missing")
+    let job = node.diloco.state.jobs[jobPos]
+    let peerId = cdomain.V3ChengNodeDilocoPeerIdFromSeed(peerSeed)
+    let peerText = peer_id.v3Libp2pPeerIdText(peerId)
+    let modelTag = jobKey + "|model_delta|" + peerText + "|" + intToStr(job.currentOuterStep)
+    let optimizerTag = jobKey + "|optimizer_delta|" + peerText + "|" + intToStr(job.currentOuterStep)
+    let modelRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid, modelTag)
+    if IsErr(modelRefRes):
+        return Err[bool](Error(modelRefRes))
+    let optimizerRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid, optimizerTag)
+    if IsErr(optimizerRefRes):
+        return Err[bool](Error(optimizerRefRes))
+    var delta = diloco.V3DiLoCoOuterDeltaZero()
+    let deltaRes = diloco.V3DiLoCoSubmitOuterDeltaFill(delta,
+                                                       node.diloco.state,
+                                                       jobBundleCid,
+                                                       job.currentGlobalVersionCid,
+                                                       job.currentOuterStep,
+                                                       peerId,
+                                                       Value(modelRefRes),
+                                                       Value(optimizerRefRes),
+                                                       sampleCount,
+                                                       tokenCount,
+                                                       innerStepCount,
+                                                       weightNumerator,
+                                                       weightDenominator)
+    if IsErr(deltaRes):
+        return Err[bool](Error(deltaRes))
+    return v3ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+
+fn V3ChengNodeDilocoPublishMerge(node: var V3ChengNode,
+                                 jobKey: str,
+                                 leaderSeed: str): Result[bool] =
+    let jobBundleCid = cdomain.V3ChengNodeDilocoJobBundleCid(jobKey)
+    let jobPos = diloco.V3DiLoCoJobPos(node.diloco.state, jobBundleCid)
+    if jobPos < 0:
+        return Err[bool]("cheng_node diloco: job missing")
+    let job = node.diloco.state.jobs[jobPos]
+    let leaderPeerId = cdomain.V3ChengNodeDilocoPeerIdFromSeed(leaderSeed)
+    let leaderPeerText = peer_id.v3Libp2pPeerIdText(leaderPeerId)
+    let modelRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid,
+                                                   jobKey + "|merge_model|" + leaderPeerText + "|" + intToStr(job.currentOuterStep))
+    if IsErr(modelRefRes):
+        return Err[bool](Error(modelRefRes))
+    let optimizerRefRes = v3ChengNodeDilocoArtifactRef(jobBundleCid,
+                                                       jobKey + "|merge_optimizer|" + leaderPeerText + "|" + intToStr(job.currentOuterStep))
+    if IsErr(optimizerRefRes):
+        return Err[bool](Error(optimizerRefRes))
+    var commit = diloco.V3DiLoCoMergeCommitZero()
+    var version = diloco.V3DiLoCoGlobalVersionZero()
+    let mergeRes = diloco.V3DiLoCoPublishMergeCommitFill(commit,
+                                                         version,
+                                                         node.diloco.state,
+                                                         jobBundleCid,
+                                                         leaderPeerId,
+                                                         Value(modelRefRes),
+                                                         Value(optimizerRefRes))
+    if IsErr(mergeRes):
+        return Err[bool](Error(mergeRes))
+    let jobSyncRes = v3ChengNodeDilocoSyncJobText(node, jobKey, jobBundleCid)
+    if IsErr(jobSyncRes):
+        return Err[bool](Error(jobSyncRes))
+    let leaseSyncRes = v3ChengNodeDilocoSyncAllLeases(node, jobKey, jobBundleCid)
+    if IsErr(leaseSyncRes):
+        return Err[bool](Error(leaseSyncRes))
+    return Ok[bool](Value(jobSyncRes) || Value(leaseSyncRes))
+
+fn V3ChengNodeDilocoStatusText(node: V3ChengNode,
+                               jobKey: str): Result[str] =
+    return cdomain.V3ChengNodeDilocoStatusReportText(node.diloco, jobKey)
+
+fn v3ChengNodeEvoMapNextSequence(node: V3ChengNode): int32 =
+    var out = 1
+    for i in 0..<node.evomap.capsules.len:
+        if node.evomap.capsules[i].sequence >= out:
+            out = node.evomap.capsules[i].sequence + 1
+    return out
+
+fn v3ChengNodeEvoMapIdentity(node: V3ChengNode,
+                             didText: str,
+                             peerText: str,
+                             deviceLabel: str): evotypes.V3AgentIdentity =
+    var out = evotypes.v3UnimakerAgentIdentityZero()
+    out.didText = didText
+    out.peerIdText = peerText
+    out.deviceLabel = deviceLabel
+    let keyHex = layout.fixedBytes32Hex(node.identity.evomapKey)
+    out.signatureCid = evotypes.v3UnimakerHashText("v3.cheng_node.evomap.signature",
+                                                   [keyHex,
+                                                    out.didText,
+                                                    out.peerIdText,
+                                                    out.deviceLabel])
+    out.identityCid = evotypes.v3UnimakerHashText("v3.unimaker.identity",
+                                                  [out.didText,
+                                                   out.peerIdText,
+                                                   out.deviceLabel,
+                                                   layout.fixedBytes32Hex(out.signatureCid)])
+    return out
+
+fn v3ChengNodeEvoMapResolveGene(capsuleKind: str,
+                                capability: str,
+                                strategy: str,
+                                condition: str): Result[evotypes.V3EvoGene] =
+    let capabilitySet = len(capability) > 0
+    let strategySet = len(strategy) > 0
+    let conditionSet = len(condition) > 0
+    if capabilitySet || strategySet || conditionSet:
+        if !capabilitySet || !strategySet || !conditionSet:
+            return Err[evotypes.V3EvoGene]("cheng_node evomap: incomplete gene fields")
+        return Ok[evotypes.V3EvoGene](evotypes.v3UnimakerGeneMake(capability,
+                                                                  strategy,
+                                                                  condition))
+    let defaults = evotypes.v3UnimakerDefaultGenes()
+    if defaults.len <= 0:
+        return Err[evotypes.V3EvoGene]("cheng_node evomap: default gene missing")
+    for i in 0..<defaults.len:
+        if defaults[i].capability == "event_ingest":
+            return Ok[evotypes.V3EvoGene](defaults[i])
+    return Ok[evotypes.V3EvoGene](defaults[0])
+
+fn V3ChengNodeEvoMapUpsertAgent(node: var V3ChengNode,
+                                didText: str,
+                                peerText: str,
+                                deviceLabel: str): Result[bool] =
+    if len(didText) <= 0 || len(peerText) <= 0 || len(deviceLabel) <= 0:
+        return Err[bool]("cheng_node evomap: identity fields missing")
+    var hello = evo.v3UnimakerProtocolHelloZero()
+    hello.identity = v3ChengNodeEvoMapIdentity(node, didText, peerText, deviceLabel)
+    hello.cursor = evotypes.v3UnimakerCursorMake(node.evomap.capsules.len,
+                                                 evotypes.v3UnimakerGraphHeadCid(node.evomap.capsules))
+    hello.genes = evotypes.v3UnimakerDefaultGenes()
+    let objectText = cdomain.V3ChengNodeEvoMapAgentText(hello)
+    let applyRes = cdomain.V3ChengNodeEvoMapApplyAgentText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "agent",
+                                        peerText,
+                                        "evomap_agent_hello",
+                                        objectText)
+
+fn V3ChengNodeEvoMapAnchorTask(node: var V3ChengNode,
+                               requesterPeerIdText: str,
+                               taskId: str,
+                               promptText: str,
+                               keywords: str[],
+                               contextCapsuleCids: layout.FixedBytes32[]): Result[bool] =
+    if len(requesterPeerIdText) <= 0 || len(taskId) <= 0 || len(promptText) <= 0:
+        return Err[bool]("cheng_node evomap: task fields missing")
+    var taskValue = evo.v3UnimakerProtocolTaskZero()
+    taskValue.requesterPeerIdText = requesterPeerIdText
+    taskValue.task.taskId = taskId
+    taskValue.task.promptText = promptText
+    taskValue.task.keywords = keywords
+    taskValue.contextCapsuleCids = contextCapsuleCids
+    let objectText = cdomain.V3ChengNodeEvoMapTaskText(taskValue)
+    let applyRes = cdomain.V3ChengNodeEvoMapApplyTaskText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "task",
+                                        taskId,
+                                        "evomap_task",
+                                        objectText)
+
+fn V3ChengNodeEvoMapAnchorCapsule(node: var V3ChengNode,
+                                  didText: str,
+                                  peerText: str,
+                                  deviceLabel: str,
+                                  capsuleKind: str,
+                                  taskId: str,
+                                  contentText: str,
+                                  keywords: str[],
+                                  parentCids: layout.FixedBytes32[],
+                                  relationKind: str,
+                                  createdAtEpochSeconds: int64,
+                                  geneCapability: str,
+                                  geneStrategy: str,
+                                  geneCondition: str): Result[bool] =
+    if len(didText) <= 0 || len(peerText) <= 0 || len(deviceLabel) <= 0:
+        return Err[bool]("cheng_node evomap: capsule identity missing")
+    if len(taskId) <= 0 || len(contentText) <= 0:
+        return Err[bool]("cheng_node evomap: capsule fields missing")
+    if !evotypes.v3UnimakerCapsuleKindValid(capsuleKind):
+        return Err[bool]("cheng_node evomap: invalid capsule kind")
+    let relationText = len(relationKind) > 0 ? relationKind : evotypes.v3UnimakerEdgeKindCausedBy
+    if !evotypes.v3UnimakerEdgeKindValid(relationText):
+        return Err[bool]("cheng_node evomap: invalid relation kind")
+    let geneRes = v3ChengNodeEvoMapResolveGene(capsuleKind,
+                                               geneCapability,
+                                               geneStrategy,
+                                               geneCondition)
+    if IsErr(geneRes):
+        return Err[bool](Error(geneRes))
+    let identityValue = v3ChengNodeEvoMapIdentity(node, didText, peerText, deviceLabel)
+    let createdAt = createdAtEpochSeconds > int64(0) ? createdAtEpochSeconds : times.EpochTimeSeconds()
+    let eventValue = evotypes.v3UnimakerEventMake(capsuleKind,
+                                                  taskId,
+                                                  contentText,
+                                                  keywords,
+                                                  parentCids,
+                                                  relationText,
+                                                  createdAt)
+    let capsule = evotypes.v3UnimakerCapsuleMake(v3ChengNodeEvoMapNextSequence(node),
+                                                 identityValue,
+                                                 eventValue,
+                                                 Value(geneRes))
+    let objectText = cdomain.V3ChengNodeEvoMapCapsuleText(capsule)
+    let applyRes = cdomain.V3ChengNodeEvoMapApplyCapsuleText(node.evomap, objectText)
+    if IsErr(applyRes):
+        return Err[bool](Error(applyRes))
+    return V3ChengNodeUpsertIndexedText(node,
+                                        "evomap",
+                                        "evomap",
+                                        "capsule",
+                                        layout.fixedBytes32Hex(capsule.capsuleCid),
+                                        "evomap_capsule",
+                                        objectText)
+
+fn V3ChengNodeEvoMapStatusText(node: V3ChengNode): str =
+    return cdomain.V3ChengNodeEvoMapStatusReportText(node.evomap)
+
 fn V3ChengNodeAnchorCompilerPackage(node: var V3ChengNode,
                                     snapshot: cworld.V3CompilerPackageSnapshot): Result[ledger.V3ChengNodeProofBundle] =
     return V3ChengNodeAnchorIndexedText(node,
@@ -879,6 +1478,22 @@ fn V3ChengNodeAnchorCompilerBuildReceipt(node: var V3ChengNode,
                                         receiptKey,
                                         "compiler_build_receipt",
                                         v3ChengNodeCompilerBuildReceiptText(receiptKey, receiptCid))
+
+fn V3ChengNodeAnchorCompilerBuildReceiptReport(node: var V3ChengNode,
+                                               receiptKey: str,
+                                               receipt: ccsg.V3CompileReceipt): Result[ledger.V3ChengNodeProofBundle] =
+    let targetProofRes = V3ChengNodeAnchorIndexedText(node,
+                                                      "compiler",
+                                                      "compiler",
+                                                      "target",
+                                                      receipt.targetTriple,
+                                                      "compiler_target_receipt",
+                                                      v3ChengNodeCompilerTargetReceiptText(receiptKey, receipt))
+    if IsErr(targetProofRes):
+        return Err[ledger.V3ChengNodeProofBundle](Error(targetProofRes))
+    return V3ChengNodeAnchorCompilerBuildReceipt(node,
+                                                 receiptKey,
+                                                 receipt.receiptCid)
 
 fn v3ChengNodeBundleCidFromMoqBuild(build: moq.V3Libp2pMoqBuildResult): layout.FixedBytes32 =
     let bundleCidRes = layout.fixedBytes32FromHex(build.bundleCid)
@@ -1044,6 +1659,11 @@ fn V3ChengNodeBootstrapSummaryText(node: V3ChengNode): str =
     out = out + "did_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did")) + "\n"
     out = out + "did_operator_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "did_operator")) + "\n"
     out = out + "discovery_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "discovery")) + "\n"
+    out = out + "oracle_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "oracle")) + "\n"
+    out = out + "diloco_job_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "diloco_job")) + "\n"
+    out = out + "diloco_cohort_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "diloco_cohort")) + "\n"
+    out = out + "diloco_lease_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "diloco_lease")) + "\n"
+    out = out + "evomap_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "evomap")) + "\n"
     out = out + "vpn_peer_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "vpn_peer")) + "\n"
     out = out + "vpn_route_index_count=" + intToStr(V3ChengNodeActiveIndexCount(node, "vpn_route")) + "\n"
     out = out + "manifest_head_seq=" + intToStr(node.ledger.manifest.headSeq) + "\n"

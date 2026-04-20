@@ -1,89 +1,225 @@
 import std/system
 import std/os
-import std/monotimes
-import cheng/v3/lang/intern as langintern
+import std/strings
+import std/strutils as strutil
+import std/strformat
 import cheng/v3/tooling/path as v3path
-import cheng/v3/tooling/perf_gate as perfgate
-import cheng/v3/tooling/compiler_request as creq
-import cheng/v3/backend/system_link_plan as slplan
-import cheng/v3/libp2p/core/resources
+import cheng/v3/tooling/perf_memory_gate as perfgate
+import cheng/v3/tooling/bootstrap_contracts as boot
 
-fn perfMemoryDataset(sample: perfgate.V3BenchSample): perfgate.V3BenchDataset =
-    var samples: perfgate.V3BenchSample[] = []
-    add(samples, sample)
-    var out: perfgate.V3BenchDataset
-    out.samples.len = samples.len
-    out.samples.cap = samples.cap
-    out.samples.buffer = samples.buffer
-    return out
-
-fn perfMemoryMeasurePlanNsPerOp(workspaceRoot: str,
-                                packageRoot: str,
-                                sourcePath: str,
-                                outputPath: str,
-                                iters: int32): int64 =
-    let req = creq.v3CompilerRequestNew(
-        packageRoot,
-        sourcePath,
-        outputPath,
-        "arm64-apple-darwin",
-        creq.v3EmitExe,
-        ""
-    )
-    var sink: int64 = int64(0)
-    let started = monotimes.GetMonoTime()
-    for i in 0..<iters:
-        var plan: slplan.V3SystemLinkPlanStub
-        var err = ""
-        assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, plan, err),
-               "v3 perf memory: build system link plan")
-        assert(plan.missingReasons.len == 0,
-               "v3 perf memory: ready system link plan")
-        assert(plan.pipelineStage == "parser_to_system_link_plan",
-               "v3 perf memory: pipeline stage")
-        assert(plan.parserSyntaxTag == "v3_normalized_source_v3",
-               "v3 perf memory: parser syntax")
-        sink = sink + int64(plan.buildSourceUnitCount) + int64(plan.sourceClosurePaths.len)
-    assert(sink > int64(0), "v3 perf memory: non-zero sink")
-    let elapsedNs = monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(started)
-    if elapsedNs <= int64(0):
-        return int64(1)
-    return (elapsedNs * int64(1000)) / int64(iters)
+fn perfMemoryDeleteFileIfExists(path: str) =
+    if os.FileExists(path):
+        os.RemoveFile(path)
 
 fn main(): int32 =
     let workspaceRoot = v3path.V3PathCurrentDir()
-    let packageRoot = v3path.V3PathJoin(workspaceRoot, "v3")
     let smokeLabel: str = os.GetEnvDefault("CHENG_V3_SMOKE_LABEL", "host")
-    let outDir = v3path.V3PathJoin(workspaceRoot, "artifacts/v3_perf_memory_contract/" + smokeLabel)
+    let outDir = v3path.V3PathJoin(workspaceRoot, Fmt(["artifacts/v3_perf_memory_contract/", smokeLabel]))
     assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 perf memory: mkdir")
-    let sourcePath = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
-    let outputPath = v3path.V3PathJoin(outDir, "program_selfhost_smoke")
-    let before = resources.v3Libp2pNodeResourceCollectLocal()
-    assert(before.cpuLogicalCores > 0, "v3 perf memory: cpu cores")
-    assert(before.memoryTotalBytes > int64(0), "v3 perf memory: memory total")
-    assert(before.memoryAvailableBytes > int64(0), "v3 perf memory: memory available")
-    assert(before.memoryAvailableBytes <= before.memoryTotalBytes, "v3 perf memory: memory range")
-    let baseNsPerOpMilli = perfMemoryMeasurePlanNsPerOp(workspaceRoot,
-                                                        packageRoot,
-                                                        sourcePath,
-                                                        outputPath,
-                                                        4)
-    let candidateNsPerOpMilli = perfMemoryMeasurePlanNsPerOp(workspaceRoot,
-                                                             packageRoot,
-                                                             sourcePath,
-                                                             outputPath,
-                                                             4)
-    let after = resources.v3Libp2pNodeResourceCollectLocal()
-    assert(after.memoryTotalBytes == before.memoryTotalBytes, "v3 perf memory: stable memory total")
-    assert(after.memoryAvailableBytes > int64(0), "v3 perf memory: memory available after")
-    assert(after.memoryAvailableBytes <= after.memoryTotalBytes, "v3 perf memory: memory range after")
-    let pool = langintern.v3InternPoolNew()
-    let benchId = langintern.v3Intern(pool, "system_link_plan")
-    let baseData = perfMemoryDataset(perfgate.V3BenchSample(benchId: benchId, nsPerOpMilli: baseNsPerOpMilli))
-    let candidateData = perfMemoryDataset(perfgate.V3BenchSample(benchId: benchId, nsPerOpMilli: candidateNsPerOpMilli))
-    let compare = perfgate.v3BenchCompare(baseData, candidateData, int64(4000))
-    assert(compare.ok, "v3 perf memory: perf compare")
-    let report = perfgate.v3BenchCompareReport(pool, compare)
-    assert(report != "", "v3 perf memory: perf report")
+    let compilerPath: str = perfgate.v3PerfMemoryResolveCompiler(workspaceRoot)
+    assert(os.FileExists(compilerPath), "v3 perf memory: compiler exists")
+    let target: str = os.GetEnvDefault("CHENG_V3_RUNTIME_LINK_TARGET", boot.v3BootstrapDefaultTarget())
+    let compileTimeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_PERF_COMPILE_TIMEOUT_SEC", "300")))
+    let runTimeoutSec: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_PERF_RUN_TIMEOUT_SEC", "120")))
+    let objectCompileThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_OBJECT_COMPILE_MAX_MS", "13000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_OBJECT_COMPILE_MAX_RSS_BYTES", "3200000000"))
+    )
+    let objectRunThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_OBJECT_RUN_MAX_MS", "13000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_OBJECT_RUN_MAX_RSS_BYTES", "600000000"))
+    )
+    let chainCompileThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_CHAIN_COMPILE_MAX_MS", "10000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_CHAIN_COMPILE_MAX_RSS_BYTES", "3200000000"))
+    )
+    let contentCompileThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_CONTENT_COMPILE_MAX_MS", "16000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_CONTENT_COMPILE_MAX_RSS_BYTES", "3200000000"))
+    )
+    let orcCompileThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_ORC_COMPILE_MAX_MS", "10000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_ORC_COMPILE_MAX_RSS_BYTES", "3200000000"))
+    )
+    let orcRunThreshold = perfgate.v3PerfMemoryThresholdNew(
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_ORC_RUN_MAX_MS", "4000")),
+        perfgate.v3PerfMemoryParseUnsignedInt64(os.GetEnvDefault("CHENG_V3_PERF_ORC_RUN_MAX_RSS_BYTES", "200000000"))
+    )
+    assert(objectCompileThreshold.maxElapsedMs > int64(0), "v3 perf memory: object compile max ms")
+    assert(objectCompileThreshold.maxRssBytes > int64(0), "v3 perf memory: object compile max rss")
+    assert(objectRunThreshold.maxElapsedMs > int64(0), "v3 perf memory: object run max ms")
+    assert(objectRunThreshold.maxRssBytes > int64(0), "v3 perf memory: object run max rss")
+    assert(chainCompileThreshold.maxElapsedMs > int64(0), "v3 perf memory: chain compile max ms")
+    assert(chainCompileThreshold.maxRssBytes > int64(0), "v3 perf memory: chain compile max rss")
+    assert(contentCompileThreshold.maxElapsedMs > int64(0), "v3 perf memory: content compile max ms")
+    assert(contentCompileThreshold.maxRssBytes > int64(0), "v3 perf memory: content compile max rss")
+    assert(orcCompileThreshold.maxElapsedMs > int64(0), "v3 perf memory: orc compile max ms")
+    assert(orcCompileThreshold.maxRssBytes > int64(0), "v3 perf memory: orc compile max rss")
+    assert(orcRunThreshold.maxElapsedMs > int64(0), "v3 perf memory: orc run max ms")
+    assert(orcRunThreshold.maxRssBytes > int64(0), "v3 perf memory: orc run max rss")
+    var reportRows: str[] = []
+    let objectSourcePath = v3path.V3PathJoin(workspaceRoot, "v3/src/tests/object_native_link_plan_smoke.cheng")
+    let objectOutputPath = v3path.V3PathJoin(outDir, "object_native_link_plan_smoke")
+    perfMemoryDeleteFileIfExists(objectOutputPath)
+    perfMemoryDeleteFileIfExists(perfgate.v3PerfMemoryCompileReportPath(objectOutputPath))
+    let objectCompileLog = Fmt([objectOutputPath, ".compile.log"])
+    perfMemoryDeleteFileIfExists(objectCompileLog)
+    let objectCompile = perfgate.v3PerfMemoryCompileExe(workspaceRoot,
+                                                        "object_native_link_plan_compile",
+                                                        compilerPath,
+                                                        target,
+                                                        objectSourcePath,
+                                                        objectOutputPath,
+                                                        compileTimeoutSec,
+                                                        objectCompileLog)
+    assert(objectCompile.exitCode == 0, "v3 perf memory: object compile rc")
+    assert(objectCompile.elapsedMs > int64(0), "v3 perf memory: object compile elapsed")
+    assert(objectCompile.maxRssBytes > int64(0), "v3 perf memory: object compile rss")
+    assert(objectCompile.elapsedMs <= objectCompileThreshold.maxElapsedMs, "v3 perf memory: object compile max ms")
+    assert(objectCompile.maxRssBytes <= objectCompileThreshold.maxRssBytes, "v3 perf memory: object compile max rss")
+    assert(os.FileExists(objectOutputPath), "v3 perf memory: object compile output")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(objectCompile, objectCompileThreshold))
+    let objectCompilePhases = perfgate.v3PerfMemoryCompileExecPhaseSummary(workspaceRoot, objectOutputPath, "")
+    if perfgate.v3PerfMemoryExecPhaseSummaryReady(objectCompilePhases) &&
+       objectCompilePhases.totalMs <= objectCompile.elapsedMs:
+        add(reportRows, perfgate.v3PerfMemoryExecPhaseReportRow(objectCompile, objectCompilePhases))
+    let objectRunLog = Fmt([objectOutputPath, ".run.log"])
+    perfMemoryDeleteFileIfExists(objectRunLog)
+    let objectRun = perfgate.v3PerfMemoryRunBinary(workspaceRoot,
+                                                   "object_native_link_plan_run",
+                                                   objectOutputPath,
+                                                   [],
+                                                   [],
+                                                   workspaceRoot,
+                                                   runTimeoutSec,
+                                                   objectRunLog)
+    assert(objectRun.exitCode == 0, "v3 perf memory: object run rc")
+    assert(strings.StrContains(objectRun.output, "v3 object_native_link_plan_smoke ok"),
+           "v3 perf memory: object run output")
+    assert(objectRun.elapsedMs > int64(0), "v3 perf memory: object run elapsed")
+    assert(objectRun.maxRssBytes > int64(0), "v3 perf memory: object run rss")
+    assert(objectRun.elapsedMs <= objectRunThreshold.maxElapsedMs, "v3 perf memory: object run max ms")
+    assert(objectRun.maxRssBytes <= objectRunThreshold.maxRssBytes, "v3 perf memory: object run max rss")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(objectRun, objectRunThreshold))
+    let chainSourcePath = v3path.V3PathJoin(workspaceRoot, "v3/src/tests/chain_node_smoke.cheng")
+    let chainOutputPath = v3path.V3PathJoin(outDir, "chain_node_smoke")
+    perfMemoryDeleteFileIfExists(chainOutputPath)
+    perfMemoryDeleteFileIfExists(perfgate.v3PerfMemoryCompileReportPath(chainOutputPath))
+    let chainCompileLog = Fmt([chainOutputPath, ".compile.log"])
+    perfMemoryDeleteFileIfExists(chainCompileLog)
+    let chainCompile = perfgate.v3PerfMemoryCompileExe(workspaceRoot,
+                                                       "chain_node_compile",
+                                                       compilerPath,
+                                                       target,
+                                                       chainSourcePath,
+                                                       chainOutputPath,
+                                                       compileTimeoutSec,
+                                                       chainCompileLog)
+    assert(chainCompile.exitCode == 0, "v3 perf memory: chain compile rc")
+    assert(chainCompile.elapsedMs > int64(0), "v3 perf memory: chain compile elapsed")
+    assert(chainCompile.maxRssBytes > int64(0), "v3 perf memory: chain compile rss")
+    assert(chainCompile.elapsedMs <= chainCompileThreshold.maxElapsedMs, "v3 perf memory: chain compile max ms")
+    assert(chainCompile.maxRssBytes <= chainCompileThreshold.maxRssBytes, "v3 perf memory: chain compile max rss")
+    assert(os.FileExists(chainOutputPath), "v3 perf memory: chain compile output")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(chainCompile, chainCompileThreshold))
+    let chainCompilePhases = perfgate.v3PerfMemoryCompileExecPhaseSummary(workspaceRoot, chainOutputPath, "")
+    if perfgate.v3PerfMemoryExecPhaseSummaryReady(chainCompilePhases) &&
+       chainCompilePhases.totalMs <= chainCompile.elapsedMs:
+        add(reportRows, perfgate.v3PerfMemoryExecPhaseReportRow(chainCompile, chainCompilePhases))
+    let contentSourcePath = v3path.V3PathJoin(workspaceRoot, "v3/src/tests/content_stub_smoke.cheng")
+    let contentOutputPath = v3path.V3PathJoin(outDir, "content_stub_smoke")
+    perfMemoryDeleteFileIfExists(contentOutputPath)
+    perfMemoryDeleteFileIfExists(perfgate.v3PerfMemoryCompileReportPath(contentOutputPath))
+    let contentCompileLog = Fmt([contentOutputPath, ".compile.log"])
+    perfMemoryDeleteFileIfExists(contentCompileLog)
+    let contentCompile = perfgate.v3PerfMemoryCompileExe(workspaceRoot,
+                                                         "content_stub_compile",
+                                                         compilerPath,
+                                                         target,
+                                                         contentSourcePath,
+                                                         contentOutputPath,
+                                                         compileTimeoutSec,
+                                                         contentCompileLog)
+    assert(contentCompile.exitCode == 0, "v3 perf memory: content compile rc")
+    assert(contentCompile.elapsedMs > int64(0), "v3 perf memory: content compile elapsed")
+    assert(contentCompile.maxRssBytes > int64(0), "v3 perf memory: content compile rss")
+    assert(contentCompile.elapsedMs <= contentCompileThreshold.maxElapsedMs, "v3 perf memory: content compile max ms")
+    assert(contentCompile.maxRssBytes <= contentCompileThreshold.maxRssBytes, "v3 perf memory: content compile max rss")
+    assert(os.FileExists(contentOutputPath), "v3 perf memory: content compile output")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(contentCompile, contentCompileThreshold))
+    let contentCompilePhases = perfgate.v3PerfMemoryCompileExecPhaseSummary(workspaceRoot, contentOutputPath, "")
+    if perfgate.v3PerfMemoryExecPhaseSummaryReady(contentCompilePhases) &&
+       contentCompilePhases.totalMs <= contentCompile.elapsedMs:
+        add(reportRows, perfgate.v3PerfMemoryExecPhaseReportRow(contentCompile, contentCompilePhases))
+    let orcSourcePath = v3path.V3PathJoin(workspaceRoot, "v3/src/tests/orc_perf_contract_smoke.cheng")
+    let orcOutputPath = v3path.V3PathJoin(outDir, "orc_perf_contract_smoke")
+    perfMemoryDeleteFileIfExists(orcOutputPath)
+    perfMemoryDeleteFileIfExists(perfgate.v3PerfMemoryCompileReportPath(orcOutputPath))
+    let orcCompileLog = Fmt([orcOutputPath, ".compile.log"])
+    perfMemoryDeleteFileIfExists(orcCompileLog)
+    let orcCompile = perfgate.v3PerfMemoryCompileExe(workspaceRoot,
+                                                     "orc_perf_compile",
+                                                     compilerPath,
+                                                     target,
+                                                     orcSourcePath,
+                                                     orcOutputPath,
+                                                     compileTimeoutSec,
+                                                     orcCompileLog)
+    assert(orcCompile.exitCode == 0, "v3 perf memory: orc compile rc")
+    assert(orcCompile.elapsedMs > int64(0), "v3 perf memory: orc compile elapsed")
+    assert(orcCompile.maxRssBytes > int64(0), "v3 perf memory: orc compile rss")
+    assert(orcCompile.elapsedMs <= orcCompileThreshold.maxElapsedMs, "v3 perf memory: orc compile max ms")
+    assert(orcCompile.maxRssBytes <= orcCompileThreshold.maxRssBytes, "v3 perf memory: orc compile max rss")
+    assert(os.FileExists(orcOutputPath), "v3 perf memory: orc compile output")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(orcCompile, orcCompileThreshold))
+    let orcCompilePhases = perfgate.v3PerfMemoryCompileExecPhaseSummary(workspaceRoot, orcOutputPath, "")
+    if perfgate.v3PerfMemoryExecPhaseSummaryReady(orcCompilePhases) &&
+       orcCompilePhases.totalMs <= orcCompile.elapsedMs:
+        add(reportRows, perfgate.v3PerfMemoryExecPhaseReportRow(orcCompile, orcCompilePhases))
+    let orcIterations: int32 = int32(strutil.ParseInt(os.GetEnvDefault("CHENG_V3_ORC_PERF_ITERS", "200000")))
+    let orcRunLog = Fmt([orcOutputPath, ".run.log"])
+    perfMemoryDeleteFileIfExists(orcRunLog)
+    let orcRun = perfgate.v3PerfMemoryRunBinary(workspaceRoot,
+                                                "orc_perf_run",
+                                                orcOutputPath,
+                                                [],
+                                                ["CHENG_V3_ORC_PERF_ITERS=" + intToStr(orcIterations)],
+                                                workspaceRoot,
+                                                runTimeoutSec,
+                                                orcRunLog)
+    assert(orcRun.exitCode == 0, "v3 perf memory: orc run rc")
+    assert(strings.StrContains(orcRun.output, "v3 orc_perf_contract_smoke ok"),
+           "v3 perf memory: orc run output")
+    assert(orcRun.elapsedMs > int64(0), "v3 perf memory: orc run elapsed")
+    assert(orcRun.maxRssBytes > int64(0), "v3 perf memory: orc run rss")
+    assert(orcRun.elapsedMs <= orcRunThreshold.maxElapsedMs, "v3 perf memory: orc run max ms")
+    assert(orcRun.maxRssBytes <= orcRunThreshold.maxRssBytes, "v3 perf memory: orc run max rss")
+    add(reportRows, perfgate.v3PerfMemoryReportRow(orcRun, orcRunThreshold))
+    let orcRetainCount: int64 = perfgate.v3PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_retain_count")
+    let orcReleaseCount: int64 = perfgate.v3PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_release_count")
+    let orcAllocDelta: int64 = perfgate.v3PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_alloc_delta")
+    let orcFreeDelta: int64 = perfgate.v3PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_free_delta")
+    let orcLiveDelta: int64 = perfgate.v3PerfMemoryParseOutputInt64(orcRun.output, "orc_perf_live_delta")
+    assert(orcRetainCount >= int64(0), "v3 perf memory: missing orc retain count")
+    assert(orcReleaseCount >= int64(0), "v3 perf memory: missing orc release count")
+    assert(orcAllocDelta >= int64(0), "v3 perf memory: missing orc alloc delta")
+    assert(orcFreeDelta >= int64(0), "v3 perf memory: missing orc free delta")
+    assert(orcLiveDelta >= int64(0), "v3 perf memory: missing orc live delta")
+    assert(orcRetainCount == int64(orcIterations), "v3 perf memory: orc retain count")
+    assert(orcReleaseCount == int64(orcIterations), "v3 perf memory: orc release count")
+    assert(orcAllocDelta == int64(1), "v3 perf memory: orc alloc delta")
+    assert(orcFreeDelta == int64(1), "v3 perf memory: orc free delta")
+    assert(orcLiveDelta == int64(0), "v3 perf memory: orc live delta")
+    add(reportRows,
+        "orc_perf_contract iterations=" + intToStr(orcIterations) +
+        " retain_count=" + int64ToStr(orcRetainCount) +
+        " release_count=" + int64ToStr(orcReleaseCount) +
+        " alloc_delta=" + int64ToStr(orcAllocDelta) +
+        " free_delta=" + int64ToStr(orcFreeDelta) +
+        " live_delta=" + int64ToStr(orcLiveDelta))
+    let reportPath = v3path.V3PathJoin(outDir, "perf_memory_contract.report.txt")
+    add(reportRows, "v3 perf memory: ok")
+    assert(v3path.V3WriteTextFile(workspaceRoot, reportPath, strutil.Join(reportRows, "\n") + "\n"),
+           "v3 perf memory: write report")
     echo("v3 perf_memory_contract_smoke ok")
     return 0

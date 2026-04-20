@@ -1,6 +1,7 @@
 import std/result
 import std/strings
 import std/os
+import std/monotimes
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
@@ -17,6 +18,21 @@ import cheng/v3/runtime/debug_runtime_v3 as debrun
 import cheng/v3/runtime/program_support_v3 as prun
 
 type
+    V3SystemLinkExecPhaseProfile =
+        systemLinkPlanNs: int64
+        sourceBundleNs: int64
+        compilerCsgNs: int64
+        worldNs: int64
+        lockNs: int64
+        baselineNs: int64
+        loweringPlanNs: int64
+        primaryObjectPlanNs: int64
+        providerSourcesNs: int64
+        objectPlanNs: int64
+        nativeLinkPlanNs: int64
+        compileReceiptNs: int64
+        totalNs: int64
+
     V3SystemLinkExecPlan =
         compilerEntrySource: str
         sourceBundleCid: layout.FixedBytes32
@@ -32,10 +48,19 @@ type
         baselineSurfaceCompatible: bool
         lockPath: str
         baselineSurfacePath: str
+        phaseProfile: V3SystemLinkExecPhaseProfile
         loweringPlan: lower.V3LoweringPlanStub
         primaryObjectPlan: pobj.V3PrimaryObjectPlan
         objectPlan: objplan.V3ObjectPlanStub
         nativeLinkPlan: nplan.V3NativeLinkPlanStub
+
+fn v3SystemLinkExecNowNs(): int64 =
+    return monotimes.MonoTimeNs(monotimes.GetMonoTime())
+
+fn v3SystemLinkExecPhaseMsText(ns: int64): str =
+    if ns <= 0:
+        return "0"
+    return int64ToStr(ns / 1000000)
 
 fn v3SystemLinkExecBrowserBridgeArtifactBasePath(outputPath: str): str =
     if len(outputPath) <= 0:
@@ -176,17 +201,26 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                 lockPath: str,
                                                 baselineSurfacePath: str,
                                                 channelRaw: str): Result[V3SystemLinkExecPlan] =
+    var phaseProfile: V3SystemLinkExecPhaseProfile
+    let totalStartNs: int64 = v3SystemLinkExecNowNs()
+    let systemLinkPlanStartNs: int64 = totalStartNs
     var linkPlan: slplan.V3SystemLinkPlanStub
     var err = ""
     if !slplan.v3BuildSystemLinkPlanStub(rootDir, req, linkPlan, err):
         return Err[V3SystemLinkExecPlan](err)
+    phaseProfile.systemLinkPlanNs = v3SystemLinkExecNowNs() - systemLinkPlanStartNs
+    let sourceBundleStartNs: int64 = v3SystemLinkExecNowNs()
     let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId,
                                                                 linkPlan.sourceClosurePaths)
+    phaseProfile.sourceBundleNs = v3SystemLinkExecNowNs() - sourceBundleStartNs
+    let compilerCsgStartNs: int64 = v3SystemLinkExecNowNs()
     let compilerCsgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
     if IsErr(compilerCsgRes):
         return Err[V3SystemLinkExecPlan](Error(compilerCsgRes))
     let compilerCsg = ccsg.v3CompilerCsgClone(Value(compilerCsgRes))
+    phaseProfile.compilerCsgNs = v3SystemLinkExecNowNs() - compilerCsgStartNs
     let exportSurface = ccsg.v3CompilerExportSurfaceFromCsg(compilerCsg)
+    let worldStartNs: int64 = v3SystemLinkExecNowNs()
     let universeRes = cworld.v3CompilerLocalUniverseBuildForChannel(channelRaw,
                                                                     sourceBundleCid,
                                                                     compilerCsg.graphCid,
@@ -199,8 +233,10 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         let pinRes = cworld.v3CompilerWorldHeadMatchesHex(localUniverse.worldHead, requestedWorldHead)
         if IsErr(pinRes):
             return Err[V3SystemLinkExecPlan](Error(pinRes))
+    phaseProfile.worldNs = v3SystemLinkExecNowNs() - worldStartNs
     let lockCheckEnabled = len(lockPath) > 0
     var lockVerified = false
+    let lockStartNs: int64 = v3SystemLinkExecNowNs()
     if lockCheckEnabled:
         let lockRes = cworld.v3CompilerLockSnapshotRead(rootDir, lockPath)
         if IsErr(lockRes):
@@ -209,8 +245,10 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         if IsErr(verifyLockRes):
             return Err[V3SystemLinkExecPlan](Error(verifyLockRes))
         lockVerified = true
+    phaseProfile.lockNs = v3SystemLinkExecNowNs() - lockStartNs
     let baselineSurfaceChecked = len(baselineSurfacePath) > 0
     var baselineSurfaceCompatible = false
+    let baselineStartNs: int64 = v3SystemLinkExecNowNs()
     if baselineSurfaceChecked:
         let baselinePath = v3path.V3PathAbsolute(rootDir, baselineSurfacePath)
         if !v3path.V3PathFileExists(baselinePath):
@@ -223,15 +261,22 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         if !ccsg.v3CompilerExportSurfaceCompatible(baselineSurface, exportSurface):
             return Err[V3SystemLinkExecPlan]("v3 compiler world: baseline export surface incompatible")
         baselineSurfaceCompatible = true
+    phaseProfile.baselineNs = v3SystemLinkExecNowNs() - baselineStartNs
+    let loweringStartNs: int64 = v3SystemLinkExecNowNs()
     var loweringPlan: lower.V3LoweringPlanStub
     if !lower.v3BuildLoweringPlanStubFromCompilerCsg(linkPlan, compilerCsg, loweringPlan, err):
         return Err[V3SystemLinkExecPlan](err)
+    phaseProfile.loweringPlanNs = v3SystemLinkExecNowNs() - loweringStartNs
+    let primaryObjectStartNs: int64 = v3SystemLinkExecNowNs()
     let primaryRes = pobj.v3BuildPrimaryObjectPlan(linkPlan, loweringPlan)
     if IsErr(primaryRes):
         return Err[V3SystemLinkExecPlan](Error(primaryRes))
+    phaseProfile.primaryObjectPlanNs = v3SystemLinkExecNowNs() - primaryObjectStartNs
+    let providerSourcesStartNs: int64 = v3SystemLinkExecNowNs()
     let providerSourcesRes = v3ProviderSourcesForPlan(rootDir, linkPlan)
     if IsErr(providerSourcesRes):
         return Err[V3SystemLinkExecPlan](Error(providerSourcesRes))
+    phaseProfile.providerSourcesNs = v3SystemLinkExecNowNs() - providerSourcesStartNs
     var providerObjectPaths: str[]
     var linkInputs: str[]
     var objectMissing: str[]
@@ -302,6 +347,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
             add(objectMissing, "linux_nolibc_runtime_object_path_missing")
         if len(linuxNolibcStartupObjectPath) <= 0:
             add(objectMissing, "linux_nolibc_startup_object_path_missing")
+    let objectPlanStartNs: int64 = v3SystemLinkExecNowNs()
     var objectPlan: objplan.V3ObjectPlanStub
     objectPlan.workspaceRoot = linkPlan.workspaceRoot
     objectPlan.packageRoot = linkPlan.packageRoot
@@ -324,6 +370,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     objectPlan.entrySymbol = linkPlan.entrySymbol
     objectPlan.missingReasons = objectMissing
     objectPlan.pipelineStage = "lowering_plan_to_object_plan"
+    phaseProfile.objectPlanNs = v3SystemLinkExecNowNs() - objectPlanStartNs
     if linkPlan.missingReasons.len > 0:
         add(nativeMissing, "system_link_plan_not_ready_for_native_link")
     if objectPlan.missingReasons.len > 0:
@@ -339,6 +386,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     var outputKind = nplan.v3NativeOutputArtifact
     if linkPlan.emitKind == creq.v3EmitExe:
         outputKind = nplan.v3NativeOutputExecutable
+    let nativeLinkStartNs: int64 = v3SystemLinkExecNowNs()
     var nativePlan: nplan.V3NativeLinkPlanStub
     nativePlan.targetTriple = linkPlan.targetTriple
     nativePlan.emitKind = linkPlan.emitKind
@@ -352,6 +400,8 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     nativePlan.linkInputPaths = objectPlan.linkInputPaths
     nativePlan.missingReasons = nativeMissing
     nativePlan.pipelineStage = "object_plan_to_native_link_plan"
+    phaseProfile.nativeLinkPlanNs = v3SystemLinkExecNowNs() - nativeLinkStartNs
+    let compileReceiptStartNs: int64 = v3SystemLinkExecNowNs()
     let outputDigest = ccsg.v3CompileOutputDigest(linkPlan.outputPath,
                                                   linkPlan.targetTriple,
                                                   linkPlan.providerModules,
@@ -368,6 +418,8 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                    canonicalOutputDigest,
                                                    "stage3_local",
                                                    linkPlan.providerModules)
+    phaseProfile.compileReceiptNs = v3SystemLinkExecNowNs() - compileReceiptStartNs
+    phaseProfile.totalNs = v3SystemLinkExecNowNs() - totalStartNs
     var execPlan: V3SystemLinkExecPlan
     execPlan.compilerEntrySource = linkPlan.buildEntryPath
     execPlan.sourceBundleCid = sourceBundleCid
@@ -383,6 +435,7 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
     execPlan.baselineSurfaceCompatible = baselineSurfaceCompatible
     execPlan.lockPath = lockPath
     execPlan.baselineSurfacePath = baselineSurfacePath
+    execPlan.phaseProfile = phaseProfile
     execPlan.loweringPlan = loweringPlan
     execPlan.primaryObjectPlan = primaryPlan
     execPlan.objectPlan = objectPlan
@@ -549,6 +602,19 @@ fn v3SystemLinkExecPlanReport(plan: V3SystemLinkExecPlan): str =
     out = out + "compile_canonical_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.canonicalOutputDigest) + "\n"
     out = out + "compile_output_digest=" + layout.fixedBytes32Hex(plan.compileReceipt.outputDigest) + "\n"
     out = out + "compile_bootstrap_stage=" + plan.compileReceipt.bootstrapStage + "\n"
+    out = out + "exec_phase_system_link_plan_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.systemLinkPlanNs) + "\n"
+    out = out + "exec_phase_source_bundle_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.sourceBundleNs) + "\n"
+    out = out + "exec_phase_compiler_csg_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.compilerCsgNs) + "\n"
+    out = out + "exec_phase_world_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.worldNs) + "\n"
+    out = out + "exec_phase_lock_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.lockNs) + "\n"
+    out = out + "exec_phase_baseline_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.baselineNs) + "\n"
+    out = out + "exec_phase_lowering_plan_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.loweringPlanNs) + "\n"
+    out = out + "exec_phase_primary_object_plan_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.primaryObjectPlanNs) + "\n"
+    out = out + "exec_phase_provider_sources_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.providerSourcesNs) + "\n"
+    out = out + "exec_phase_object_plan_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.objectPlanNs) + "\n"
+    out = out + "exec_phase_native_link_plan_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.nativeLinkPlanNs) + "\n"
+    out = out + "exec_phase_compile_receipt_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.compileReceiptNs) + "\n"
+    out = out + "exec_phase_total_ms=" + v3SystemLinkExecPhaseMsText(plan.phaseProfile.totalNs) + "\n"
     out = out + slplan.v3SystemLinkPlanStubReport(plan.systemLinkPlan) + "\n"
     out = out + lower.v3LoweringPlanStubReport(plan.loweringPlan) + "\n"
     out = out + browserBridgeReport

@@ -58,6 +58,8 @@ artifacts/v3_bootstrap/cheng.stage3 run-stage23-libp2p-smokes
 
 ```sh
 artifacts/v3_backend_driver/cheng status
+artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke
+artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke
 artifacts/v3_backend_driver/cheng print-build-plan --target:arm64-apple-darwin
 artifacts/v3_backend_driver/cheng system-link-exec --root:/abs/root/v3 --in:/abs/path/file.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/app
 artifacts/v3_backend_driver/cheng emit-csg --root:/abs/root/v3 --in:/abs/path/file.cheng --out:/tmp/csg
@@ -78,6 +80,10 @@ artifacts/v3_backend_driver/cheng r2c-react-v3-fresh-clean-gate --repo /Users/lb
 
 - `verify-orphan-guard` 现在会直接拒绝 `v3/tooling` 顶层任何 `.sh` 文件。零脚本是结构约束，不是约定。
 - `debug-report / print-symbols / print-line-map / print-object / print-asm / profile-run / profile-report / crash-report` 都由 Cheng 本体提供，不再依赖 `lldb / nm / otool / sample`。
+- `perf_memory_contract_smoke` 现在是 v3 正式性能/内存门禁；报告默认写到 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
+- `perf_memory_contract_smoke` 报告里的 `orc_perf_contract` 记录 ORC runtime retain/release 与 alloc/free/live 闭环，`*_compile_exec_phase_summary` 记录正式 `system-link-exec` 编译报告里的 phase 摘要。
+- 当前可以严格当作编译理论下界引用的稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`；前提仍然是 `planner_total_ms <= compile_elapsed_ms`。
+- `cheng_skill_consistency_smoke` 现在是文档与技能镜像的一致性门禁；会核对 formal spec、repo skill、README、`v3/tooling/README`，并在本地存在 `$HOME/.codex/skills/cheng语言/SKILL.md` 时要求它与 repo 镜像完全一致。
 - Linux `aarch64` 默认已经能真产 `ELF relocatable object` 和 `nolibc exe`。
 - Windows `COFF/PE` 和 `riscv64 ELF` 现在通过 `verify-windows-builtin / verify-riscv64-builtin / run-cross-target-smokes` 统一验收。
 - `bootstrap-bridge` 和 `build-backend-driver` 都已经在 Cheng 主链里实现；外层脚本已退役。

@@ -1,6 +1,7 @@
 import std/result
 import std/rawbytes
 import std/system
+import std/rawmem_support
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/std/crypto/hash256
 import cheng/v3/chain/binary_types as types
@@ -223,25 +224,24 @@ fn v3AppendPrefix(buf: var layout.ByteBuf, prefix: V3PrefixRef) =
     for i in 0..<types.v3LsmrMaxDepth:
         layout.byteBufAppendByte(buf, prefix.prefixDigits[i] & 255)
 
-fn v3BytesFromText(text: str): Bytes =
-    var out: Bytes
-    out.data = strDataPtr(text)
-    out.len = len(text)
+fn v3OwnedBytesFromBuf(buf: layout.ByteBuf): Bytes =
+    if buf.len <= 0:
+        return emptyBytes()
+    var out = bytesAlloc(buf.len)
+    rawmem_support.RawmemCopy(out.data, buf.storage.data, buf.len)
     return out
 
 fn v3FixedCidFromBuf(buf: layout.ByteBuf): layout.FixedBytes32 =
-    var span: layout.ByteSpan
-    span = layout.byteBufView(buf)
-    var out: layout.FixedBytes32
-    out = hash256.sha256Fixed(span)
-    return out
+    let data = v3OwnedBytesFromBuf(buf)
+    return hash256.sha256Fixed(layout.byteSpanFromBytes(data))
 
 fn v3HashInts(tag: str, values: int32[]): layout.FixedBytes32 =
     var buf: layout.ByteBuf
     buf = layout.byteBufInit(64)
-    var tagBytes: Bytes
-    tagBytes = v3BytesFromText(tag)
-    layout.byteBufAppendBytes(buf, tagBytes)
+    var tagIndex: int32 = 0
+    while tagIndex < len(tag):
+        layout.byteBufAppendByte(buf, int32(tag[tagIndex]) & 255)
+        tagIndex = tagIndex + 1
     v3AppendU32BE(buf, values.len)
     for i in 0..<values.len:
         v3AppendU32BE(buf, values[i])
@@ -252,9 +252,10 @@ fn v3HashInts(tag: str, values: int32[]): layout.FixedBytes32 =
 fn v3HashPrefix(tag: str, prefix: V3PrefixRef): layout.FixedBytes32 =
     var buf: layout.ByteBuf
     buf = layout.byteBufInit(64)
-    var tagBytes: Bytes
-    tagBytes = v3BytesFromText(tag)
-    layout.byteBufAppendBytes(buf, tagBytes)
+    var tagIndex: int32 = 0
+    while tagIndex < len(tag):
+        layout.byteBufAppendByte(buf, int32(tag[tagIndex]) & 255)
+        tagIndex = tagIndex + 1
     v3AppendPrefix(buf, prefix)
     var out: layout.FixedBytes32
     out = v3FixedCidFromBuf(buf)

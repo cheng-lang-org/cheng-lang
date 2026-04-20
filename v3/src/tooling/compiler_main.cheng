@@ -332,12 +332,18 @@ fn v3CompilerMergeBridgeReport(sourceReport: str,
     let artifactLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_artifact")
     let sourceLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_source")
     let objectLines = v3CompilerLinesWithPrefix(sourceReport, "browser_bridge_object")
+    let execPhaseLines = v3CompilerLinesWithPrefix(sourceReport, "exec_phase_")
+    let bridgeExecPhaseLines = v3CompilerLinesWithPrefix(bridgeReport, "exec_phase_")
     if browserLines.len <= 0:
         if artifactLines.len <= 0:
             if sourceLines.len <= 0:
                 if objectLines.len <= 0:
-                    return bridgeReport
+                    if execPhaseLines.len <= 0:
+                        return bridgeReport
     var merged = bridgeReport
+    if bridgeExecPhaseLines.len <= 0:
+        for i in 0..<execPhaseLines.len:
+            v3CompilerAppendReportLine(merged, execPhaseLines[i])
     for i in 0..<artifactLines.len:
         v3CompilerAppendReportLine(merged, artifactLines[i])
     for i in 0..<sourceLines.len:
@@ -347,6 +353,31 @@ fn v3CompilerMergeBridgeReport(sourceReport: str,
     for i in 0..<browserLines.len:
         v3CompilerAppendReportLine(merged, browserLines[i])
     return merged
+
+fn v3CompilerSystemLinkExecPhaseMsText(ns: int64): str =
+    if ns < int64(0):
+        return "-1"
+    return strings.Int64ToStr(ns / int64(1000000))
+
+fn v3CompilerAppendSystemLinkExecPhaseLines(report: str,
+                                            plan: sexec.V3SystemLinkExecPlan): str =
+    if strutil.Contains(report, "exec_phase_total_ms="):
+        return report
+    var out = report
+    v3CompilerAppendReportLine(out, "exec_phase_system_link_plan_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.systemLinkPlanNs))
+    v3CompilerAppendReportLine(out, "exec_phase_source_bundle_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.sourceBundleNs))
+    v3CompilerAppendReportLine(out, "exec_phase_compiler_csg_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.compilerCsgNs))
+    v3CompilerAppendReportLine(out, "exec_phase_world_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.worldNs))
+    v3CompilerAppendReportLine(out, "exec_phase_lock_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.lockNs))
+    v3CompilerAppendReportLine(out, "exec_phase_baseline_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.baselineNs))
+    v3CompilerAppendReportLine(out, "exec_phase_lowering_plan_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.loweringPlanNs))
+    v3CompilerAppendReportLine(out, "exec_phase_primary_object_plan_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.primaryObjectPlanNs))
+    v3CompilerAppendReportLine(out, "exec_phase_provider_sources_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.providerSourcesNs))
+    v3CompilerAppendReportLine(out, "exec_phase_object_plan_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.objectPlanNs))
+    v3CompilerAppendReportLine(out, "exec_phase_native_link_plan_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.nativeLinkPlanNs))
+    v3CompilerAppendReportLine(out, "exec_phase_compile_receipt_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.compileReceiptNs))
+    v3CompilerAppendReportLine(out, "exec_phase_total_ms=" + v3CompilerSystemLinkExecPhaseMsText(plan.phaseProfile.totalNs))
+    return out
 
 fn v3CompilerBrowserBridgeCompilerPath(rootDir: str,
                                        plan: sexec.V3SystemLinkExecPlan): str =
@@ -1047,12 +1078,12 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
                                            summaryText: var str): bool =
     let remotePackageRoot = remoteRoot + "/v3"
     let remoteBackend = remoteRoot + "/artifacts/v3_backend_driver/cheng"
-    let remoteOut = remoteRoot + "/artifacts/v3_backend_driver/chain_node.remote_selftest"
+    let remoteOut = remoteRoot + "/artifacts/v3_backend_driver/cheng_node_main.remote_selftest"
     let compileLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, "chain_node_self_test.compile")
     let runLogPath = v3CompilerRemoteLogPath(outDir, hostLabel, "chain_node_self_test.run")
     let reportPath = remoteOut + ".report.txt"
     var remoteSource = remotePackageRoot
-    remoteSource = remoteSource + "/src/project/chain_node_main.cheng"
+    remoteSource = remoteSource + "/src/project/cheng_node_main.cheng"
     let remoteEnvRoot = "CHENG_V3_ROOT=" + remoteRoot
     var compileArgv: str[] = []
     add(compileArgv, "env")
@@ -1077,7 +1108,7 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
         v3CompilerAppendKeyValueLine(summaryText, "chain_node_self_test_run_log", runLogPath)
         v3CompilerAppendKeyValueLine(summaryText, "chain_node_self_test_ok", "false")
         return false
-    let runArgv = [remoteOut, "self-test"]
+    let runArgv = [remoteOut, "chain-self-test"]
     var runOut = ""
     if !v3CompilerRunRemoteCommand(rootDir,
                                    sshTarget,
@@ -1987,7 +2018,7 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -1995,14 +2026,15 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
         v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
         return 2
     let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
-    let forwardArgsRes = v3CompilerArgsWithBrowserBridgeObject(args, browserBridgeObjectPath)
-    if IsErr(forwardArgsRes):
-        v3CompilerPrintErr(Error(forwardArgsRes))
-        return 2
-    let forwardArgs = Value(forwardArgsRes)
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
-        let rc = v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", forwardArgs)
+        let rc = v3CompilerForwardBootstrapBridge(rootDir,
+                                                  bridgeCompiler,
+                                                  "system-link-exec",
+                                                  req,
+                                                  args,
+                                                  report,
+                                                  browserBridgeObjectPath)
         if rc != 0:
             return rc
         if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
@@ -2016,7 +2048,7 @@ fn v3CompilerRunSystemLinkExec(rootDir: str,
                                                       bootstrapBridge,
                                                       "system-link-exec",
                                                       req,
-                                                      forwardArgs,
+                                                      args,
                                                       report,
                                                       browserBridgeObjectPath)
             if rc != 0:
@@ -2051,7 +2083,7 @@ fn v3CompilerRunLegacyCompatSystemLinkExec(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -2059,14 +2091,15 @@ fn v3CompilerRunLegacyCompatSystemLinkExec(rootDir: str,
         v3CompilerPrintErr("v3 compiler: failed to materialize browser bridge outputs")
         return 2
     let browserBridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
-    let compatArgsRes = v3CompilerArgsWithBrowserBridgeObject(compatArgs, browserBridgeObjectPath)
-    if IsErr(compatArgsRes):
-        v3CompilerPrintErr(Error(compatArgsRes))
-        return 2
-    let forwardCompatArgs = Value(compatArgsRes)
     let bridgeCompiler = v3CompilerBridgeCompilerPath(rootDir)
     if len(bridgeCompiler) > 0:
-        let rc = v3CompilerForwardToBridge(rootDir, bridgeCompiler, "system-link-exec", forwardCompatArgs)
+        let rc = v3CompilerForwardBootstrapBridge(rootDir,
+                                                  bridgeCompiler,
+                                                  "system-link-exec",
+                                                  req,
+                                                  compatArgs,
+                                                  report,
+                                                  browserBridgeObjectPath)
         if rc != 0:
             return rc
         if !v3CompilerMaterializeBrowserBridgeOutputs(rootDir, plan):
@@ -3849,7 +3882,7 @@ fn v3CompilerVerifyWorld(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4172,7 +4205,7 @@ fn v3CompilerSelfhostBuild(rootDir: str,
         v3CompilerPrintErr(Error(planRes))
         return 2
     let plan = Value(planRes)
-    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    let report = v3CompilerAppendSystemLinkExecPhaseLines(sexec.v3SystemLinkExecPlanReport(plan), plan)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, report):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2

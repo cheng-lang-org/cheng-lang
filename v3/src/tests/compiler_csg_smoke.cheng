@@ -1,8 +1,8 @@
 import std/os
 import std/result
+import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
-import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/lang/parser
@@ -25,11 +25,48 @@ fn reportFieldPositive(report: str, key: str): bool =
     let value = reportFieldValue(report, key)
     return value != "" && value != "0"
 
-fn buildCsg(workspaceRoot: str,
-            packageRoot: str,
-            sourcePath: str,
-            outputPath: str,
-            emitKind: int32): ccsg.V3CompilerCsg =
+fn assertTypedCallFactsMatchLayer(facts: ccsg.V3TypedExprFact[],
+                                  layer: parser.V3NormalizedExprLayer,
+                                  label: str) =
+    assert(ccsg.v3TypedExprFactCountCallResolved(facts) ==
+           parser.v3NormalizedExprLayerCallResolvedCount(layer),
+           label + " typed resolved call count")
+    assert(ccsg.v3TypedExprFactCountCallUnresolved(facts) ==
+           parser.v3NormalizedExprLayerCallUnresolvedCount(layer),
+           label + " typed unresolved call count")
+    assert(ccsg.v3TypedExprSurfaceCallLocalCount(facts) ==
+           parser.v3NormalizedExprLayerCallKindCount(layer, "local_call"),
+           label + " typed local call kind count")
+    assert(ccsg.v3TypedExprSurfaceCallExternalCount(facts) ==
+           parser.v3NormalizedExprLayerCallKindCount(layer, "external_call"),
+           label + " typed external call kind count")
+    assert(ccsg.v3TypedExprSurfaceCallImportcCount(facts) ==
+           parser.v3NormalizedExprLayerCallKindCount(layer, "importc_call"),
+           label + " typed importc call kind count")
+    assert(ccsg.v3TypedExprSurfaceCallMemberCount(facts) ==
+           parser.v3NormalizedExprLayerCallKindCount(layer, "member_call"),
+           label + " typed member call kind count")
+    assert(ccsg.v3TypedExprFactCountCallTargetImportc(facts) ==
+           parser.v3NormalizedExprLayerCallTargetImportcCount(layer),
+           label + " typed importc target count")
+    assert(ccsg.v3TypedExprCallReasonUnknownQualifiedTargetCount(facts) ==
+           parser.v3NormalizedExprLayerCallReasonCount(layer, "unknown_qualified_target"),
+           label + " typed unknown qualified target count")
+    assert(ccsg.v3TypedExprCallReasonShadowedQualifiedTargetCount(facts) ==
+           parser.v3NormalizedExprLayerCallReasonCount(layer, "shadowed_qualified_target"),
+           label + " typed shadowed qualified target count")
+    assert(ccsg.v3TypedExprCallReasonAmbiguousExternalTargetCount(facts) ==
+           parser.v3NormalizedExprLayerCallReasonCount(layer, "ambiguous_external_target"),
+           label + " typed ambiguous external target count")
+    assert(ccsg.v3TypedExprCallReasonAmbiguousQualifiedTargetCount(facts) ==
+           parser.v3NormalizedExprLayerCallReasonCount(layer, "ambiguous_qualified_target"),
+           label + " typed ambiguous qualified target count")
+
+fn buildLinkPlan(workspaceRoot: str,
+                 packageRoot: str,
+                 sourcePath: str,
+                 outputPath: str,
+                 emitKind: int32): slplan.V3SystemLinkPlanStub =
     let req = creq.v3CompilerRequestNew(
         packageRoot,
         sourcePath,
@@ -41,10 +78,143 @@ fn buildCsg(workspaceRoot: str,
     var linkPlan: slplan.V3SystemLinkPlanStub
     var err = ""
     assert(slplan.v3BuildSystemLinkPlanStub(workspaceRoot, req, linkPlan, err), "v3 compiler csg: link plan")
-    let sourceBundleCid = cworld.v3CompilerWorldSourceBundleCid(linkPlan.packageId, linkPlan.sourceClosurePaths)
-    let csgRes = ccsg.v3BuildCompilerCsg(linkPlan, sourceBundleCid)
-    assert(IsOk(csgRes), "v3 compiler csg: build")
-    return ccsg.v3CompilerCsgClone(Value(csgRes))
+    return linkPlan
+
+fn buildFullCsg(workspaceRoot: str,
+                packageRoot: str,
+                sourcePath: str,
+                outputPath: str,
+                emitKind: int32): ccsg.V3CompilerCsg =
+    let linkPlan = buildLinkPlan(workspaceRoot, packageRoot, sourcePath, outputPath, emitKind)
+    var sourceTexts: ccsg.V3TypedExprSourceText[] = []
+    for i in 0..<linkPlan.sourceClosurePaths.len:
+        let currentSourcePath = linkPlan.sourceClosurePaths[i]
+        let text = v3path.V3ReadTextFile("", currentSourcePath)
+        add(sourceTexts, ccsg.v3CompilerCsgTypedSourceText(workspaceRoot,
+                                                          packageRoot,
+                                                          currentSourcePath,
+                                                          text))
+    var typedFacts: ccsg.V3TypedExprFact[] = []
+    var err = ""
+    assert(ccsg.v3CompilerCsgBuildTypedExprFacts(sourceTexts, linkPlan.exprLayer, typedFacts, err),
+           "v3 compiler csg: build typed facts")
+    var nodes: ccsg.V3CompilerCsgNode[] = []
+    for i in 0..<linkPlan.sourceClosurePaths.len:
+        let currentSourcePath = linkPlan.sourceClosurePaths[i]
+        let text = v3path.V3ReadTextFile("", currentSourcePath)
+        let ownerModulePath = parser.v3ParserSourcePathToModulePath(workspaceRoot, packageRoot, currentSourcePath)
+        var decls: parser.V3NormalizedFunctionDecl[] = []
+        err = ""
+        assert(parser.v3ParserReadNormalizedFunctionDecls(text, decls, err),
+               "v3 compiler csg: decls")
+        var entryHasExplicitExports = false
+        if currentSourcePath == linkPlan.entryPath &&
+           (linkPlan.emitKind == creq.v3EmitShared || linkPlan.emitKind == creq.v3EmitObj):
+            for declIndex in 0..<decls.len:
+                if decls[declIndex].importc:
+                    continue
+                if decls[declIndex].explicitExportName != "":
+                    entryHasExplicitExports = true
+                    break
+        for declIndex in 0..<decls.len:
+            let decl = decls[declIndex]
+            if decl.importc:
+                continue
+            let symbolText = ownerModulePath + "::" + decl.name
+            var entryFlag = 0
+            if currentSourcePath == linkPlan.entryPath && decl.name == linkPlan.entrySymbol:
+                entryFlag = 1
+            var resultLayoutKind = 0
+            if decl.name == "main":
+                resultLayoutKind = 5
+            var effectKind = ccsg.v3CompilerCsgEffectPure
+            if entryFlag != 0:
+                effectKind = ccsg.v3CompilerCsgEffectProgramEntry
+            var capabilityKind = ccsg.v3CompilerCsgCapabilityInternal
+            if entryFlag != 0:
+                capabilityKind = ccsg.v3CompilerCsgCapabilityEntrypoint
+            var exportedFlag = 0
+            if ccsg.v3CompilerCsgShouldExportSymbol(linkPlan.emitKind,
+                                                    currentSourcePath == linkPlan.entryPath,
+                                                    entryHasExplicitExports,
+                                                    decl.explicitExportName,
+                                                    decl.name,
+                                                    entryFlag):
+                exportedFlag = 1
+            var node: ccsg.V3CompilerCsgNode
+            node.nodeId = nodes.len + 1
+            node.nodeKind = ccsg.v3CompilerCsgNodeKindSymbol
+            node.ownerNodeId = 0
+            node.modulePath = ownerModulePath
+            node.symbolText = symbolText
+            node.factText = decl.name
+            node.resultLayoutKind = resultLayoutKind
+            node.effectKind = effectKind
+            node.capabilityKind = capabilityKind
+            node.callConv = 1
+            node.entryFlag = entryFlag
+            node.exportedFlag = exportedFlag
+            node.exportSymbolName = ""
+            if exportedFlag != 0:
+                node.exportSymbolName = ccsg.v3CompilerCsgTargetExportName(symbolText,
+                                                                           decl.explicitExportName,
+                                                                           decl.name)
+            node.factCid = layout.fixedBytes32Zero()
+            add(nodes, node)
+    var edges: ccsg.V3CompilerCsgEdge[] = []
+    if nodes.len > 0:
+        var edge: ccsg.V3CompilerCsgEdge
+        edge.edgeId = 1
+        edge.fromNodeId = nodes[0].nodeId
+        edge.toNodeId = nodes[0].nodeId
+        edge.edgeKind = ccsg.v3CompilerCsgEdgeKindContains
+        edge.edgeCid = layout.fixedBytes32Zero()
+        add(edges, edge)
+    var csg: ccsg.V3CompilerCsg
+    csg.version = 1
+    csg.packageId = linkPlan.packageId
+    csg.sourceBundleCid = layout.fixedBytes32Zero()
+    csg.exprLayer = parser.v3NormalizedExprLayerClone(linkPlan.exprLayer)
+    csg.typedExprFacts = ccsg.v3CompilerCsgCloneTypedExprFacts(typedFacts)
+    csg.nodeCount = nodes.len
+    csg.edgeCount = edges.len
+    csg.nodes = nodes
+    csg.edges = edges
+    csg.canonicalGraphCid = layout.fixedBytes32Zero()
+    csg.graphCid = layout.fixedBytes32Zero()
+    return csg
+
+fn buildMinimalCsg(workspaceRoot: str,
+                   packageRoot: str,
+                   sourcePath: str,
+                   outputPath: str,
+                   emitKind: int32): ccsg.V3CompilerCsg =
+    let linkPlan = buildLinkPlan(workspaceRoot, packageRoot, sourcePath, outputPath, emitKind)
+    var sourceTexts: ccsg.V3TypedExprSourceText[] = []
+    for i in 0..<linkPlan.sourceClosurePaths.len:
+        let currentSourcePath = linkPlan.sourceClosurePaths[i]
+        let text = v3path.V3ReadTextFile("", currentSourcePath)
+        add(sourceTexts, ccsg.v3CompilerCsgTypedSourceText(workspaceRoot,
+                                                          packageRoot,
+                                                          currentSourcePath,
+                                                          text))
+    var typedFacts: ccsg.V3TypedExprFact[] = []
+    var err = ""
+    assert(ccsg.v3CompilerCsgBuildTypedExprFacts(sourceTexts, linkPlan.exprLayer, typedFacts, err),
+           "v3 compiler csg: build typed facts")
+    var csg: ccsg.V3CompilerCsg
+    csg.version = 1
+    csg.packageId = linkPlan.packageId
+    csg.sourceBundleCid = layout.fixedBytes32Zero()
+    csg.exprLayer = parser.v3NormalizedExprLayerClone(linkPlan.exprLayer)
+    csg.typedExprFacts = ccsg.v3CompilerCsgCloneTypedExprFacts(typedFacts)
+    csg.nodeCount = 0
+    csg.edgeCount = 0
+    csg.nodes = []
+    csg.edges = []
+    csg.canonicalGraphCid = layout.fixedBytes32Zero()
+    csg.graphCid = layout.fixedBytes32Zero()
+    return csg
 
 fn main(): int32 =
     let workspaceRoot: str = v3path.V3PathCurrentDir()
@@ -54,11 +224,11 @@ fn main(): int32 =
     assert(v3path.V3MkdirP(workspaceRoot, outDir), "v3 compiler csg: mkdir")
     let sourcePath: str = v3path.V3PathJoin(packageRoot, "src/tests/program_selfhost_smoke.cheng")
     let outputPath: str = v3path.V3PathJoin(outDir, "program_selfhost_smoke")
-    let csg = buildCsg(workspaceRoot,
-                       packageRoot,
-                       sourcePath,
-                       outputPath,
-                       creq.v3EmitExe)
+    let csg = buildFullCsg(workspaceRoot,
+                           packageRoot,
+                           sourcePath,
+                           outputPath,
+                           creq.v3EmitExe)
     assert(csg.nodeCount > 0, "v3 compiler csg: node count")
     assert(csg.edgeCount > 0, "v3 compiler csg: edge count")
     assert(csg.typedExprFacts.len == parser.v3NormalizedExprLayerExprCount(csg.exprLayer),
@@ -74,16 +244,17 @@ fn main(): int32 =
 
     let typedFixturePath: str = v3path.V3PathJoin(packageRoot, "src/tests/typed_expr_fact_fixture.cheng")
     let typedOutputPath: str = v3path.V3PathJoin(outDir, "typed_expr_fact_fixture")
-    let typedCsg = buildCsg(workspaceRoot,
-                            packageRoot,
-                            typedFixturePath,
-                            typedOutputPath,
-                            creq.v3EmitShared)
+    let typedCsg = buildMinimalCsg(workspaceRoot,
+                                   packageRoot,
+                                   typedFixturePath,
+                                   typedOutputPath,
+                                   creq.v3EmitShared)
     let typedFixtureFacts = ccsg.v3TypedExprFactsForSource(typedCsg.typedExprFacts, typedFixturePath)
     let typedFixtureRules = ccsg.v3TypedExprLoweringRulesFromFacts(typedFixtureFacts)
     let typedReport = ccsg.v3CompilerCsgReport(typedCsg)
     var loweringErr = ""
     assert(typedFixtureFacts.len > 0, "v3 compiler csg: typed fixture fact slice")
+    assertTypedCallFactsMatchLayer(typedCsg.typedExprFacts, typedCsg.exprLayer, "v3 compiler csg: typed fixture")
     assert(ccsg.v3TypedExprFactsValidateCallResolution(typedCsg.exprLayer, typedCsg.typedExprFacts, loweringErr),
            "v3 compiler csg: typed fixture call resolution validate")
     assert(ccsg.v3TypedExprLoweringRulesValidate(typedFixtureRules, loweringErr),
@@ -142,6 +313,42 @@ fn main(): int32 =
            "v3 compiler csg: typed fixture sret return kind")
     assert(ccsg.v3TypedExprReturnImportBufferCount(typedFixtureFacts) > 0,
            "v3 compiler csg: typed fixture import buffer return kind")
+    assert(reportFieldValue(typedReport, "expr_surface_call_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report call count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_resolved_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallResolvedCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report resolved call count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_unresolved_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallUnresolvedCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report unresolved call count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_local_kind_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallKindCount(typedCsg.exprLayer, "local_call")),
+           "v3 compiler csg: typed fixture report local call kind count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_external_kind_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallKindCount(typedCsg.exprLayer, "external_call")),
+           "v3 compiler csg: typed fixture report external call kind count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_importc_kind_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallKindCount(typedCsg.exprLayer, "importc_call")),
+           "v3 compiler csg: typed fixture report importc call kind count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_member_kind_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallKindCount(typedCsg.exprLayer, "member_call")),
+           "v3 compiler csg: typed fixture report member call kind count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_target_importc_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallTargetImportcCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report importc target count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_reason_unknown_qualified_target_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallReasonCount(typedCsg.exprLayer, "unknown_qualified_target")),
+           "v3 compiler csg: typed fixture report unknown qualified target count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_reason_shadowed_qualified_target_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallReasonCount(typedCsg.exprLayer, "shadowed_qualified_target")),
+           "v3 compiler csg: typed fixture report shadowed qualified target count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_reason_ambiguous_external_target_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallReasonCount(typedCsg.exprLayer, "ambiguous_external_target")),
+           "v3 compiler csg: typed fixture report ambiguous external target count")
+    assert(reportFieldValue(typedReport, "expr_surface_call_reason_ambiguous_qualified_target_count") ==
+           intToStr(parser.v3NormalizedExprLayerCallReasonCount(typedCsg.exprLayer, "ambiguous_qualified_target")),
+           "v3 compiler csg: typed fixture report ambiguous qualified target count")
     assert(reportFieldPositive(typedReport, "lowering_rule_arg_address_count"),
            "v3 compiler csg: typed fixture address arg rule")
     assert(reportFieldPositive(typedReport, "lowering_rule_result_sret_count"),

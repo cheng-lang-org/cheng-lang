@@ -1,60 +1,669 @@
 # 进度
 
-- `CallExpr` 已覆盖：
-  - 同文件 `importc`
-  - 同文件 local function
-  - direct import 的 alias/module-stem qualified call
-  - direct import 的 unqualified external call
-  - alias import 不贡献 unqualified external
-  - 本地函数会遮蔽 aliasless direct import 的 unqualified external
-  - 参数和局部 `let/var/const` 会遮蔽 qualified target，并显式落成 `shadowed_qualified_target`
-  - grouped import 展开的 direct import
-  - nested qualified external call
-  - imported `importc` external call
-  - ambiguous external target
-  - ambiguous qualified target
-  - unknown dotted `member_call` fallback
-- `compiler_csg` 和 `lowering_plan` 现在共用同一份 call resolution gate；resolved call 必须带 target，unresolved call 必须带 reason。
-- aliasless direct import closure 上的 closure-visible unqualified external call 已打通：
-  - parser 能收集 closure-visible external 名
-  - resolve 能沿同一条 direct import closure 精确落到目标 source
-  - imported `importc` 仍会继续落成 `lower=import_buffer / ret=import_buffer`
-- qualified target 的 closure-visible 归因也已经打通：
-  - `module.Func(...)` 不再只认 module 直接声明
-  - module 自己 aliasless direct-import closure 里可见的 local/importc 目标也能真解析
-  - imported `importc` 在这条 qualified 路径上仍会继续落成 `lower=import_buffer / ret=import_buffer`
-- expr layer 的真实入口已经统一回 `CallAndMember` 主链；旧的分裂 call 扫描路径不再参与 profile-aware expr 读取。
-- `typed lowering rule` 现在有稳定文本真源了：
-  - `v3TypedExprLoweringRuleKey(...)` 会把 `type/abi/value/place/lower/call/return/arg/result/materialize/copy/import` 收成 canonical key
-  - `v3TypedExprLoweringRuleEntryText(...)` 会把 `source/line/column/expr/key` 收成逐条 entry
-  - `compiler_csg report` 和 `lowering_plan report` 都会产出 `lowering_rule_unique_key_count` 与 `lowering_rule_entry[i]`
-- seed 里的 wasm call 高层分发也开始真接这条 rule 面了：
-  - 新增 `V3WasmCallLoweringRule`
-  - `register_import / type_index / analyze_call / analyze_call_statement / emit_call_expr / emit_call_statement` 现在会共用同一份 `arg slot / return slot / result / import` 规则
-  - 这条链不再各处临时重算 `v3_wasm_call_arg_slot_kind(...)` 和 `v3_wasm_call_target_result_kind(...)`
-- seed 里的 native/importc caller-side 分发也开始真接这条 rule 面了：
-  - 新增 `V3NativeCallLoweringRule`
-  - `v3_prepare_expr_call_state_impl(...)`、`v3_try_prepare_index_assignment_call_state(...)`、`v3_codegen_call_scalar_resolved(...)`、`v3_codegen_call_into_address(...)`、`v3_emit_call_from_spills(...)`、`v3_emit_scalar_call_ffi_handle_return_fixups(...)` 现在会共用同一份 `arg/return/result` 规则
-  - `call_from_spills` 的 load ABI 也已经改成直接读 rule，不再自己重算 `var/address/ffi_handle/value`
-- native composite return caller 入口也开始真接这条 rule 面了：
-  - 新增 `V3NativeCompositeCallLoweringRule`
-  - `v3_codegen_call_into_address(...)`、`v3_materialize_composite_expr_into_address(...)` 里普通 call 和 prefix call 的复合返回路径，都会先把 `dest_address / import_buffer` 收成同一份 composite-result rule，再决定 caller 侧怎么落位
-  - 这条链不再是“先 resolve target/rule，再各处只看一个 `result_uses_address` 布尔值”
-- lowering rule 计数 smoke 已收回 report 真源：
-  - `compiler_csg_smoke` 直接读 `v3CompilerCsgReport(...)`
-  - `lowering_plan_smoke` 直接读 `v3LoweringPlanStubReport(...)`
-  - `lowering_rule_import_import_buffer_count` 已补进两边 report
-- named composite type 归因已经接进 typed：
-  - `std/buffer::NewByteBuffer() -> ByteBuffer`
-  - `parser::v3NormalizedExprClone(...) -> V3NormalizedExpr`
-  这类 resolved local call 不再回落 deferred。
-- 本轮验收已通过：
-  - `CHENG_V3_SMOKE_LABEL=call_hir_closure_visible_clean ... parser_path_smoke parser_normalized_expr_smoke compiler_csg_smoke lowering_plan_smoke call_hir_matrix_smoke`
-  - `CHENG_V3_SMOKE_LABEL=call_hir_qualified_closure ... call_hir_matrix_smoke`
-  - `CHENG_V3_SMOKE_LABEL=typed_rule_key ... compiler_csg_smoke lowering_plan_smoke lowering_matrix_smoke call_hir_matrix_smoke`
-  - `cc .../cheng_v3_seed.c -> .../cheng.stage0`
-  - `.../cheng.stage0 bootstrap-bridge`
-  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_wasm_call_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
-  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_native_call_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
-  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 .../cheng.stage2 run-host-smokes --label:seed_native_composite_rule lowering_matrix_smoke str_concat_lowering_smoke strformat_fmt_lowering_smoke`
-  - `git -C /Users/lbcheng/cheng-lang diff --check`
+- 本轮把 parser 里的 call identity 也从旧 `detail` 真源上拆下来了：
+  - `v3/src/lang/parser.cheng`
+    - call expr 去重不再拿 `detail` 当主键，改成直接比 `callSurfaceKind/resolved/reason/qualifier/callee/target/target_source/importc/prefix_style/arg_count/args_text`。
+    - call expr 的 `exprId` 也改成从这组结构字段生成，不再信任传进来的 `detail` 文本。
+    - 新增 `v3NormalizedExprCompatDetail(...)`，兼容文本改成现算，CSG 侧不再盲信 `expr.detail`。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - expr layer append/hash 对 call 改成吃 `v3NormalizedExprCompatDetail(...)`。
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+    - 新增合成回归：同结构不同 `detail` 不得重复入 layer；同位置但结构事实不同必须保留两条，而且 `exprId` 必须不同。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - 新增强回归：把 parser layer 里所有 call `detail` 清空后重建 typed facts，结果必须和原始 typed facts 完全一致。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `parser_path_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮把剩余主 smoke / probe 里的 call `detail` 读取继续清掉了：
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+  - `v3/src/tests/parser_path_smoke.cheng`
+  - `v3/src/tests/typed_expr_call_validate_probe.cheng`
+    - call 断言和 probe 输出现在直接看 `expr.call*` 结构字段，不再回扫 `detail`。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `parser_path_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+
+- 本轮已把 parser call 归因主干也从 `detail` 文本里拆出来了：
+  - `v3/src/lang/parser.cheng`
+    - `V3NormalizedExpr` 新增 `callSurfaceKind / callResolved / callReason / callQualifier / callCallee / callTarget / callTargetSourcePath / callTargetImportc`。
+    - `v3NormalizedExprLayerCall*Count(...)` 和 `v3NormalizedExprLayerHasExpr(...)` 现在直接吃结构字段，不再回扫 `detail`。
+  - `v3/src/lang/typed_expr.cheng`
+    - call fact 构建和 `v3TypedExprFactsValidateCallResolution(...)` 现在直接对 `expr.call*` 字段，不再走 `detail -> accessor -> fact`。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - expr layer append/hash 也已带上这组结构字段。
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+  - `v3/src/tests/parser_path_smoke.cheng`
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - 主 smoke 的关键断言已经改成直接看结构字段，不再只看 `detail`。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `parser_path_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮已把 call 剩余三项表面真源收进主链：
+  - `v3/src/lang/parser.cheng`
+    - `V3NormalizedExpr` 新增 `callPrefixStyle / callArgCount / callArgsText`，call expr 不再只能靠 `detail + surfaceText` 半猜。
+    - call expr 追加时直接从源码行提取参数文本和参数个数，并把 `endColumnNumber` 收到右括号。
+  - `v3/src/lang/typed_expr.cheng`
+    - `V3TypedExprFact/V3TypedExprLoweringRule` 新增同名字段，typed fact 直接吃 parser 结构化字段。
+    - `v3TypedExprFactsValidateCallResolution(...)` 顺手修掉了那条把 call 校验整体短路掉的死 `continue`，现在真的会逐条对表 parser/typed。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - expr layer 和 typed fact 的 append/hash 都已带上 `prefix_style / arg_count / args_text`。
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/call_hir_args_fixture.cheng`
+    - 已补零参、多参、嵌套实参三种形状，直接验 parser expr 和 typed fact 的 `prefix_style / arg_count / args_text`。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮又把 call typed 真源往前推了一层：
+  - `v3/src/lang/typed_expr.cheng`
+    - `V3TypedExprFact/V3TypedExprLoweringRule` 新增 `callQualifier`。
+    - qualified external return lookup 现在直接吃 `callQualifier + callCallee`，不再把 `callTarget` 当原始字符串反复切点号。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - `callQualifier` 已进入 typed fact append/hash。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - 现在已经直接验 typed `callQualifier/callCallee/callTarget/callTargetSourcePath/callTargetImportc` 和 parser 真源一致。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮继续把 call typed 真源往前推了一层：
+  - `v3/src/lang/typed_expr.cheng`
+    - `V3TypedExprFact/V3TypedExprLoweringRule` 新增 `callCallee / callTarget`。
+    - call 返回类型推断现在直接吃 fact 上的 `callCallee/callTarget/callTargetSourcePath/callTargetImportc`，不再在推断阶段重复回 parser detail。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - typed fact 新字段已经进入 CSG append/hash 真源，不是只存在内存结构里。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - 现已直接钉住几条真实 call 的 typed `callCallee/callTarget/callTargetSourcePath/callTargetImportc`，确保新字段不是空壳。
+  - 这轮中途确认了一个 ordinary 发射边界：
+    - `if ... else` 直接塞进复合实参会把 `compiler_csg append` 这类函数拉红。
+    - 已改成局部字符串后通过，不影响 typed 真源方向。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮把 call 归因正式前移进 typed 真源了：
+  - `v3/src/lang/typed_expr.cheng`
+    - `V3TypedExprFact/V3TypedExprLoweringRule` 新增 `surfaceCallKind / callResolved / callReason / callTargetSourcePath / callTargetImportc`。
+    - `v3TypedExprFactsValidateCallResolution(...)` 现在先校验 typed fact 和 parser detail 一致，再只按 typed 字段判断 resolved/unresolved/import buffer 约束。
+  - `v3/src/tooling/compiler_csg.cheng`
+  - `v3/src/backend/lowering_plan.cheng`
+    - `expr_surface_call_*` report 现在直接从 typed facts 统计，不再在 report 侧回扫 `exprLayer.detail`。
+    - 为避开 ordinary 当前“枚举实参 helper call”红面，统计函数已收成专用单参计数函数，没有退回文本猜测。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+  - `v3/src/tests/lowering_plan_smoke.cheng`
+    - 新增 typed fact 对表：resolved/unresolved、四种 surface kind、四种 unresolved reason、target importc 都必须和 parser expr layer 一致。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- `Bytes` 这轮没有新的编译器 blocker：
+  - `bytes_parent_copy_orc_smoke` 那个旧红点已经确认是测试里“手工 release + ORC 赋值”叠在一起造成的假红，不是当前 parent-copy lowering 还没修完。
+  - `bytes_view_orc_registry_smoke / bytes_buffer_handle_copy_smoke / bytes_parent_copy_orc_smoke / bytes_overwrite_orc_smoke` 现在都已经是默认成功型 gate。
+
+- 本轮已把 call HIR 的 unresolved reason 正式接进验收，但收在现有 `call_hir_matrix_smoke` 里，没有再新增独立 smoke 或 fixture：
+  - `v3/src/lang/parser.cheng`
+    - `v3NormalizedExprLayerCallResolvedCount/CallUnresolvedCount/CallKindCount/CallReasonCount/CallTargetImportcCount` 已可直接给 report/smoke 复用。
+  - `v3/src/tooling/compiler_csg.cheng`
+  - `v3/src/backend/lowering_plan.cheng`
+    - `expr_surface_call_*` 已进入正式 report。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - 现有四个 reason fixture 已分别通过 `compiler_csg report` 或 `lowering_plan report` 强校验：
+      - `unknown_qualified_target`
+      - `ambiguous_external_target`
+      - `shadowed_qualified_target`
+      - `ambiguous_qualified_target`
+  - 旧 `stage2` 直接运行时：
+    - `call_hir_matrix_smoke` 单跑通过。
+    - `parser_path_smoke / parser_normalized_expr_smoke / call_hir_matrix_smoke` 串跑通过。
+
+- 这轮把 `Bytes` 生命周期边界正式钉成了单独回归：
+  - 新增 `v3/src/tests/bytes_view_orc_registry_smoke.cheng`
+    - `bytesFromString(...)` 生成的借用视图，`memRetain/memRelease` 必须保持 no-op。
+    - `bytesAlloc(...)` 生成的托管块，`memRetain/memRelease` 必须真实改变 refcount。
+  - 这条 smoke 的意义不是补业务功能，而是把 `Bytes` 的真实 ABI/ORC 语义写成 gate：同一 `Bytes` 表面下，是否托管由 runtime registry 决定，不允许以后再被文档或实现说反。
+  - fresh 验证：
+    - `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`
+    - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`
+    - fresh `stage2` 下 `bytes_view_orc_registry_smoke` 通过
+    - fresh `stage2` 下 `parser_path_smoke` 通过
+  - 这批回归现在已经都能默认通过，不再是当前 blocker。
+
+- 本轮已完成 call HIR report 收口：
+  - `v3/src/lang/parser.cheng`
+    - 新增 `v3NormalizedExprLayerCallResolvedCount/CallUnresolvedCount/CallKindCount/CallReasonCount/CallTargetImportcCount`。
+  - `v3/src/tooling/compiler_csg.cheng`
+  - `v3/src/backend/lowering_plan.cheng`
+    - `expr_surface_call_*` 统计正式进 report，不再只有 `call_hir_matrix_smoke` 才看得到。
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+  - `v3/src/tests/lowering_plan_smoke.cheng`
+    - 现在会把 report 字段和 parser 真源逐项对表。
+  - fresh 验证已通过：
+    - `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`
+    - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`
+    - `parser_path_smoke`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 ... perf_memory_contract_smoke`
+
+- 本轮已确认并收住两件事：
+  - 保留：
+    - `v3_emit_non_if_statement(...)` 现在已经补齐 `indirect_value` 局部赋值路径。
+    - builtin `assert(...)` 现在支持运行时 `str/ptr` 消息，不再只认字符串字面量。
+  - 已撤回：
+    - 顶层 `scalar function` 的 `return/call/scalar stmt` 机械并线到 `v3_emit_non_if_statement(...)`。
+    - 这刀会让 `perf_memory_contract_smoke` 在正式 `host_ops -> os_host_process -> /usr/bin/time` 链路上回归，已回退，不保留。
+  - fresh 验证已经重新通过：
+    - `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`
+    - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`
+    - `parser_path_smoke`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 ... perf_memory_contract_smoke`
+
+- 这轮已经把“理论下界、ORC perf、内存安全边界”补成正式口径：
+  - `README.md`
+  - `docs/cheng-language-introduction.md`
+  - `docs/cheng-formal-spec.md`
+  - `v3/tooling/README.md`
+  - `docs/cheng-skill/SKILL.md`
+  - `docs/cheng-skill/references/ownership.md`
+  - `$HOME/.codex/skills/cheng语言/SKILL.md`
+  - `$HOME/.codex/skills/cheng语言/references/ownership.md`
+  - 统一后的结论是：
+    - Cheng 不是 tracing GC，`GC perf` 这条线不成立。
+    - 当前 runtime perf 看 ORC retain/release 与 alloc/free/live。
+    - 当前默认公开表面是 no-pointer + borrow/`Send/Sync` 检查，但 FFI/handle/环引用仍是显式边界。
+    - 编译理论下界现在直接引用 `perf_memory_contract_smoke` 里满足 `planner_total_ms <= compile_elapsed_ms` 的正式 `*.compile.report.txt` phase 摘要；当前稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`。
+
+- 这轮把 `system-link-exec` phase 真源也收正了：
+  - `v3/bootstrap/cheng_v3_seed.c`
+    - seed/C 命令路径的 `system-link-exec` 报告现在正式带 `exec_phase_*`，不再只有 Cheng 侧 planner 能看见 phase。
+  - `v3/src/tests/perf_memory_contract_smoke.cheng`
+    - 已删掉专用 phase probe，改成直接读取各样本自己的 `*.compile.report.txt`。
+    - 现在报告会稳定写出：
+      - `object_native_link_plan_compile_exec_phase_summary`
+      - `chain_node_compile_exec_phase_summary`
+      - `content_stub_compile_exec_phase_summary`
+      - `orc_perf_compile_exec_phase_summary`
+  - fresh 验证已通过：
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+
+- 本轮把 `prepare scratch` 这条线基本收干净了，而且两轮 fresh 都继续往下走：
+  - `v3/bootstrap/cheng_v3_seed.c`
+    - `V3ExprPrepScratch.args` 已从内嵌 `args[32][4096]` 改成 lazy slab，非 call 路径不再常驻背这块巨内存。
+    - 新增 `g_v3_expr_prep_args_free_list`、`v3_acquire_expr_prep_args(...)`、`v3_release_expr_prep_args(...)`、`v3_ensure_expr_prep_args(...)`，call args slab 直接复用，不再每层递归反复申请。
+    - `v3_prepare_expr_call_state(...)` 已删掉本地 `V3ExprSurface surface`，`v3_classify_expr_surface(...)` 现在直接写进 `scratch->surface`，不再做大对象拷贝。
+  - 这次 fresh 正式验证结果：
+    - fresh `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`
+    - fresh `stage0 -> bootstrap-bridge -> stage2 no-handoff`
+    - `parser_path_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `object_native_link_plan_smoke`
+    - 两次 `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 ... run-host-smokes perf_memory_contract_smoke`
+  - 当前正式 perf gate：
+    - 第一次：`object_native_link_plan_compile elapsed_ms=4530`
+    - 第一次：`object_native_link_plan_run elapsed_ms=6420`
+    - 第一次：`chain_node_compile elapsed_ms=3380`
+    - 第一次：`content_stub_compile elapsed_ms=7300`
+    - 第二次：`object_native_link_plan_compile elapsed_ms=4430`
+    - 第二次：`object_native_link_plan_run elapsed_ms=6610`
+    - 第二次：`chain_node_compile elapsed_ms=3320`
+    - 第二次：`content_stub_compile elapsed_ms=7340`
+  - 当前结论：
+    - compile-only 已经压到 `4430ms`，`chain_node_compile` 压到 `3320ms`，`content_stub_compile` 维持在 `7300ms` 档。
+    - run 端维持在 `6420-6610ms`，明显优于更早的稳定档。
+    - `prepare scratch` 这条线先停，下一步该回 fresh 采样找新的第一热点，不再继续围着 scratch 抠。
+
+- 这一轮已经把 call/parser 热路径连续收了四刀，并且都走了 fresh `stage0 -> bootstrap-bridge -> stage2 no-handoff` 正式闭环。
+
+- 已完成
+  - `v3/bootstrap/cheng_v3_seed.c`
+    - `V3ExprSurface` 已带结构化 call 真源：`call_callee / call_args_text / call_arg_count / call_prefix_style`。
+    - `prepare/infer` 已统一消费这份 call fact，不再各自重扫源码文本。
+  - `v3/src/lang/parser.cheng`
+    - `AppendCallExprsLine / AppendMemberCallExprsLine` 已改成先判 `hasCallParen`，再切 `callName/qualifier/dotted`，并用 `v3ParserPreviousTokenIsDeclKeyword(...)` 取代 `PreviousToken(...)` 字符串切片。
+    - `ReadNormalizedFunctionDeclsLines` 已改成单次 trim、exact prefix 判定、直接取函数名，不再反复 `V3PathTrim/StartsWith/FirstToken/IdentPrefix`。
+    - qualified shadow 已改成 range 路径：不再切 `rootQualifier` 子串，也不再在热循环里按值复制 `decl`。
+    - `ReadImportEdgesLines` 已改成“去注释 + trim + import tail/alias/grouped item”原位 slice；`ModulePathTail` 也补了 exact 版，避免 `split/trim/join` 连环复制。
+
+- 正式验证
+  - `cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`
+  - `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`
+  - `parser_path_smoke`
+  - `parser_normalized_expr_smoke`
+  - `call_hir_matrix_smoke`
+  - `compiler_csg_smoke`
+  - `lowering_plan_smoke`
+  - `object_native_link_plan_smoke`
+  - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 ... perf_memory_contract_smoke`
+
+- 当前正式数字
+  - 最新 perf gate：
+    - `object_native_link_plan_compile elapsed_ms=4430`
+    - `object_native_link_plan_run elapsed_ms=6380`
+    - `chain_node_compile elapsed_ms=3330`
+    - `content_stub_compile elapsed_ms=7160`
+  - 最新 `/usr/bin/time -l artifacts/v3_perf_memory_contract/host/object_native_link_plan_smoke`
+    - `6.22 real`
+    - `378224640 max rss`
+    - `377651824 peak footprint`
+  - 本轮起点对比：
+    - 起点运行面曾在 `8.30s` 左右，RSS 约 `434MB`
+    - 当前运行面已稳定到 `6.3s` 档，RSS 约 `376MB-378MB`
+
+- 当前结论
+  - HIR/call 真源这条主线是对的，收益已经不只是 compile-only，运行面也一起下来了。
+  - 现在最大的剩余热面已经不是 seed 里那批早期重复推断，而是 parser 里剩余的文本处理：
+    - `v3ParserReadImportEdgesLines(...)`
+    - `v3ParserReadNormalizedFunctionDeclsLines(...)`
+    - `v3ParserAppendCallExprsLine(...) -> ResolveUnqualifiedExternalCallTarget / CallExprDetailExact`
+
+- `cheng_node` 第三阶段这一轮已经真收口：
+  - `v3/src/project/cheng_node_transport.cheng`
+    - 统一 transport/vpn runtime 已接进节点。
+    - discovery publish payload 已改成 owning `Bytes`，修掉 host store 悬空 payload。
+  - `v3/src/project/cheng_node.cheng`
+    - `announce / discover / stream / vpn-peer / vpn-route / vpn-status` 路径已接进统一节点内核。
+  - `v3/src/project/cheng_node_ctl_main.cheng`
+    - 命令面三节点发现、流同步、VPN 控制面都已可直接验收。
+  - `v3/src/tests/cheng_node_transport_vpn_smoke.cheng`
+    - 三节点 `tcp/webrtc/quic` 发现、`identify/content` 流、VPN peer/overlay/exit、状态回放都已全绿。
+  - 这轮还顺手把 ordinary 编译红点一起清掉：
+    - `src/std/crypto/sha384.cheng`
+    - `src/std/crypto/minasn1.cheng`
+    - `src/std/net/transports/udp_syscall.cheng`
+    - `v3/src/quic/platform/datapath_udp.cheng`
+    - `v3/src/libp2p/host/host.cheng`
+  - fresh 验收结果：
+    - `/usr/bin/time -p ... cheng_node_transport_vpn_smoke -> real 26.69s`
+    - `/usr/bin/time -p ... cheng_node_main -> real 28.42s`
+    - `/tmp/cheng_node_transport_vpn_smoke`
+    - `/tmp/cheng_node_main_stage3 ctl required-surface`
+    - `/tmp/cheng_node_main_stage3 ctl head`
+    - `/tmp/cheng_node_main_stage3 ctl announce/discover/stream`
+    - `/tmp/cheng_node_main_stage3 ctl vpn-peer/vpn-route/vpn-status`
+    - `git diff --check`
+  - 当前结论：
+    - 第三阶段的统一接入面已经不是空壳，`cheng_node` 自己就是 discovery/sync/VPN 控制入口。
+    - `MoQ + Fountain` 也已作为 `content_moq_fountain` actor 留在统一面里，不再挂外部主程序。
+
+- 本轮又收了两刀 parser 热路径：
+  - `v3/src/lang/parser.cheng`
+    - `ReadImportEdgesLines` 不再对每一行先造 `trimmedLineWithoutComment`；先用 `v3ParserImportLineTailRange(...)` 做范围判定，只有真 `import` 行才切字符串。
+    - `ReadNormalizedFunctionDeclsLines` 不再每行 `V3PathTrim`；先取 `trimmed range`，只有注解行和真顶层函数声明才切字符串。
+  - 正式验证：
+    - fresh `stage0 -> bootstrap-bridge -> stage2 no-handoff`
+    - `parser_path_smoke`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+  - 最近一次成功的正式 perf 结果：
+    - `object_native_link_plan_compile elapsed_ms=4780`
+    - `object_native_link_plan_run elapsed_ms=6260`
+    - `chain_node_compile elapsed_ms=3560`
+    - `content_stub_compile elapsed_ms=7730`
+    - `/usr/bin/time -l artifacts/v3_perf_memory_contract/host/object_native_link_plan_smoke`
+    - `6.04 real`
+    - `363577344 max rss`
+    - `363004528 peak footprint`
+  - 已试过但已撤回：
+    - 把 `MaxQualifiedCallDepth` 改成直接扫原始行并绕开 `PrepareCodeLines`。
+    - 这刀 sample 看起来能挪热点，但正式 gate 回弹，已经撤回，不保留。
+  - 当前新卡点：
+    - 重新 bootstrap 后，`perf_memory_contract_smoke` 现在会在 `perfMemoryRequiredOutputInt64` 这条 `let value: int64 = perfgate.v3PerfMemoryParseOutputInt64(output, key)` 上触发 `primary object body semantics missing`。
+    - `parser_path_smoke / parser_normalized_expr_smoke / call_hir_matrix_smoke / compiler_csg_smoke / lowering_plan_smoke / object_native_link_plan_smoke` 仍然全绿。
+
+- `cheng_node` 第四五阶段这一轮已经收口：
+  - `v3/src/project/cheng_node.cheng`
+    - Oracle、DiLoCo、EvoMap 三个 domain 已接入统一节点内核。
+    - `oracle_pair_state / diloco_job_state / diloco_cohort_state / diloco_lease_state / evomap_agent_hello / evomap_task / evomap_capsule` 都能进统一事件账本、索引和 keyed query。
+  - `v3/src/project/cheng_node_ctl_main.cheng`
+    - `oracle-submit/oracle`
+    - `diloco-open/join/lease/barrier/delta/merge/status`
+    - `evomap-agent/task/capsule/status`
+    - 全部已经落进单一 `cheng_node ctl` 控制入口。
+  - `v3/src/project/cheng_node_identity.cheng`
+    - 根身份派生已扩成 10 域，新增 `evomap`。
+  - `v3/src/project/cheng_node_index.cheng`
+    - 索引组已扩到 13 组，补齐 `evomap(agent/task/capsule)`。
+  - `v3/src/runtime/program_support_backend_v3.cheng`
+    - host runtime 现已带 `cheng_mobile_host_emit_log` stub，`moq_fountain` 不再把普通主机链接炸红。
+  - `v3/src/tests/cheng_node_oracle_diloco_evomap_smoke.cheng`
+    - Oracle fixture round、DiLoCo lease/barrier/delta/merge、EvoMap agent/task/capsule、state reload 全绿。
+  - `v3/src/tests/cheng_node_core_smoke.cheng`
+    - 核心 smoke 在最终 runtime 形态下重新编译运行通过。
+  - `v3/src/DiLoCo`
+    - 已并进统一 `cheng/v3` 包路径，`cheng_node_main` 不再依赖外部独立包入口。
+
+- 本轮最终验收结果
+  - `/tmp/cheng_node_oracle_diloco_evomap_smoke`
+    - `v3 cheng_node_oracle_diloco_evomap_smoke ok`
+  - `/tmp/cheng_node_core_smoke_stage4`
+    - `v3 cheng_node_core_smoke ok`
+  - `/tmp/cheng_node_main_final`
+    - `ctl oracle` 验收到：
+      - `pair_key=BTC/USD`
+      - `round_id=22`
+      - `delta_count=1`
+    - `ctl diloco-merge --peer-seed:peer-alpha` 验收到：
+      - `job_current_outer_step=2`
+      - `lineage_count=2`
+      - `lease_count=2`
+    - `ctl evomap-status` 验收到：
+      - `agent_count=1`
+      - `task_count=1`
+      - `capsule_count=2`
+
+- 本轮最终编译时间
+  - `/usr/bin/time -p ... cheng_node_oracle_diloco_evomap_smoke -> real 17.51s`
+  - `/usr/bin/time -p ... cheng_node_core_smoke -> real 10.88s`
+  - `/usr/bin/time -p ... cheng_node_main -> real 41.79s`
+
+- `cheng_node` 第六阶段这轮已经真正开始收切换面，不再只是口头计划：
+  - `v3/src/project/cheng_node_ctl_main.cheng`
+    - 新增：
+      - `import-legacy-oracle`
+      - `import-compiler-package`
+      - `import-compiler-world`
+      - `import-compiler-receipt`
+    - 这些入口都已经接进主分发，不是只停在库函数。
+  - `v3/src/project/cheng_node.cheng`
+    - 新增 `V3ChengNodeImportOracleState(...)`。
+    - compiler receipt 锚定现已同步写 `compiler/target`，`target` 查询面正式落地。
+  - `v3/src/tooling/compiler_world.cheng`
+    - 新增 package snapshot report 反解析，旧 world/package 文本现在可直接迁入节点。
+  - `v3/src/project/oracle_bft_state_host.cheng`
+    - 旧 oracle state writer 改成 ordinary 可编译形状，迁移闭包不再被旧模块卡死。
+  - `v3/src/tests/cheng_node_migration_smoke.cheng`
+    - 新增真迁移 smoke：
+      - 旧 chain snapshot -> 新节点
+      - 旧 oracle state -> 新节点
+      - compiler package/world/receipt report -> 新节点
+      - 最后直接验证 `balance/oracle/compiler package/world/build_receipt/target`
+
+- 本轮最终验收结果
+  - `/usr/bin/time -p ... cheng_node_migration_smoke -> real 54.76s`
+    - `v3 cheng_node_migration_smoke ok`
+  - `/usr/bin/time -p ... cheng_node_core_smoke -> real 14.66s`
+    - `v3 cheng_node_core_smoke ok`
+  - `/usr/bin/time -p ... cheng_node_oracle_diloco_evomap_smoke -> real 64.72s`
+    - `v3 cheng_node_oracle_diloco_evomap_smoke ok`
+  - `/usr/bin/time -p ... cheng_node_main -> real 52.78s`
+    - 主程序正式编译通过
+
+- 本轮二进制入口实测
+  - `/tmp/cheng_node_main_stage6 ctl import-legacy-chain`
+    - 成功写出统一 state，`balance_index_count=2`
+  - `/tmp/cheng_node_main_stage6 ctl import-legacy-oracle`
+    - 验到 `oracle_last_round_id=22`
+  - `/tmp/cheng_node_main_stage6 ctl import-compiler-package`
+    - 验到 `package_id=pkg://cheng/migration-demo`
+  - `/tmp/cheng_node_main_stage6 ctl import-compiler-world`
+    - 验到 `world_channel=stable`
+  - `/tmp/cheng_node_main_stage6 ctl import-compiler-receipt`
+    - 验到 `target=arm64-apple-darwin`
+  - `/tmp/cheng_node_main_stage6 ctl query --group:compiler --kind:target`
+    - `found=1`
+    - `payload_kind=compiler_target_receipt`
+  - `/tmp/cheng_node_main_stage6 ctl oracle --pair:BTC/USD`
+    - `round_id=22`
+    - `payload_kind=oracle_pair_state`
+
+- v3 ORC / backend driver 续推
+  - `v3/src/runtime/program_support_backend_v3.cheng`
+    - 给 owning payload 补上 runtime registry，`Bytes` 现在能同时容纳 `bytesAlloc(...)` 的托管块和 `bytesFromString(...)` 的借用视图，retain/release 按 registry 判定，不再把借用视图误当 owning block。
+  - `v3/bootstrap/cheng_v3_seed.c`
+    - `slot = rhs` 这种父对象复制现在走 assignment 专用 clone，不再把普通 local copy/return 全部误提成 retain。
+    - 局部源地址改成基址寄存器寻址，修掉减临时栈后 `sp + offset` 漂移 16 字节的问题。
+    - 只要发射期临时 `sub sp` 去物化 composite call result / assignment clone，局部槽和 `var` 字段现在都会回到稳定 frame base，不再继续跟着当前 `sp` 漂。
+    - assignment clone 的 ORC lifecycle spill 改成独立槽位，不再踩掉调用者保存的目标地址；之前这个踩槽会让 `retain/release` 都落到 `rhs`，旧 payload 一直留着 `rc=1`。
+  - `v3/src/tooling/backend_driver_main.cheng`
+    - 默认 `run-host-smokes` 已纳入 `bytebuf_view_smoke`、`bytebuf_len_probe_smoke`、`bytes_layout_copy_smoke`、`bytes_view_orc_registry_smoke`、`bytes_param_helper_smoke`、`bytes_buffer_handle_copy_smoke`、`bytes_buffer_handle_snapshot_smoke`、`bytes_parent_copy_orc_smoke`、`bytes_overwrite_orc_smoke`、`ffi_handle_generation_reuse_smoke`、`wrapper_result_forward_varparam_smoke`、`wrapper_rebuild_result_forward_varparam_smoke`。
+    - `ffi_handle_stale_trap_smoke` 没有硬塞进默认成功路径，继续由 `build-ffi-handle` 专用 trap gate 负责。
+    - `build-ffi-handle` 现在由 backend driver 本地 helper 直接编译/运行 fixture，不再 forward 给旧 `stage3`。
+    - `build-ffi-handle` 这轮又补进 `ffi_handle_generation_reuse_smoke`，现在会一次跑完普通成功、generation reuse 成功、released trap、stale trap。
+  - `v3/src/tests/ffi_handle_generation_reuse_smoke.cheng`
+    - 新增成功型 regression，直接钉住 `release_raw_bridge` 之后同槽复用必须 bump generation。
+  - `v3/src/tests/ffi_handle_generation_stale_trap_smoke.cheng`
+    - 新增 trap regression，直接钉住旧 handle 在同槽复用后必须命中 `detail=stale`。
+  - `v3/src/tests/bytes_buffer_handle_snapshot_smoke.cheng`
+    - 新增最小 regression，直接钉住同一源缓冲先后注册两个 handle 时，snapshot 时机必须在 handle 注册点。
+    - 第一份 decode 必须保留旧值，第二份 decode 必须拿到改写后的新值，而且两份返回 `Bytes` 彼此不能 alias。
+  - `v3/src/tests/bytes_layout_copy_smoke.cheng`
+    - 新增最小 regression，直接钉住 `layout.byteBufToBytes(...)` 和 `layout.byteSpanToBytes(...)` 都必须返回 owning copy。
+    - 源 `ByteBuf` / source `Bytes` 在 copy 后即使改写并 release，副本内容也必须保持初值。
+  - `v3/src/tests/bytebuf_len_probe_smoke.cheng`
+    - 新增最小 regression，直接钉住 `buf.len`、`byteBufLen(buf)`、raw `bytesView(...)`、`byteBufView(buf)` 在同一条主链上都必须稳定。
+  - `v3/src/tests/bytes_buffer_handle_copy_smoke.cheng`
+    - `Bytes -> buffer handle` 现在有单独 host smoke。
+    - 这条样本直接钉住 `cheng_v3_buffer_handle_from_raw_bridge(...)` 是复制语义：源 `Bytes` 就算立刻改写并 release，handle 读回的内容也必须还是桥接时那份快照。
+  - 已试过但撤回：
+    - `bytes_fixed_array_overwrite_orc_smoke`
+    - fresh 结果表明 `grid.items[i].payload = bytesAlloc(...)` 这类 fixed-array composite `Bytes` lvalue materialize 现在还不在 ordinary 主链支持面上，不能硬塞进默认 gate。
+  - `v3/src/tests/bytes_overwrite_orc_smoke.cheng`
+    - parent object copy 的收尾改成纯 ORC 赋值风格；共享 `Bytes` owner 不再手工 `memRelease` 后再 `= emptyBytes()` 双重释放。
+  - 本轮验收
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_buffer_handle_copy_smoke`
+      - `v3 bytes_buffer_handle_copy_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_view_orc_registry_smoke`
+      - `v3 bytes_view_orc_registry_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_parent_copy_orc_smoke`
+      - `v3 bytes_parent_copy_orc_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_overwrite_orc_smoke`
+      - `v3 bytes_overwrite_orc_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytebuf_view_smoke`
+      - `v3 bytebuf_view_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytebuf_len_probe_smoke`
+      - `v3 bytebuf_len_probe_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_layout_copy_smoke`
+      - `v3 bytes_layout_copy_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_buffer_handle_snapshot_smoke`
+      - `v3 bytes_buffer_handle_snapshot_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes ffi_handle_generation_reuse_smoke`
+      - `v3 ffi_handle_generation_reuse_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes bytes_param_helper_smoke`
+      - `v3 bytes_param_helper_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes wrapper_result_forward_varparam_smoke wrapper_rebuild_result_forward_varparam_smoke`
+      - `v3 wrapper_result_forward_varparam_smoke ok`
+      - `v3 wrapper_rebuild_result_forward_varparam_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes ffi_handle_stale_trap_smoke`
+      - 预期 trap，默认 host smoke runner 记失败；不进默认成功列表。
+    - `artifacts/v3_backend_driver/cheng build-ffi-handle`
+      - 普通 success + generation reuse success + released stale trap + generation stale trap 一起通过专用 gate
+    - `artifacts/v3_bootstrap/cheng.stage3 build-backend-driver`
+      - `v3 backend driver ok: /Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/cheng`
+    - `artifacts/v3_backend_driver/cheng status`
+      - `compiler_entry=/Users/lbcheng/cheng-lang/v3/src/tooling/backend_driver_main.cheng`
+      - `ordinary_pipeline=canonical_csg_verified_primary_object_codegen_missing`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+      - `v3 perf_memory_contract_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+      - `v3 cheng_skill_consistency_smoke ok`
+
+- mobile-shell / r2c 续推
+  - `v3/src/tooling/mobile_shell_codegen.cheng`
+    - 继续保留 runtime contract 导出面：
+      - `mobile_shell_runtime_contract_v1.json`
+      - `runtime/runtime_contract_payload.json`
+      - `runtime/runtime_bundle_payload.json`
+      - `runtime/mobile_shell_launch_args.kv`
+      - `runtime/mobile_shell_launch_args.json`
+    - runtime contract / payload / bundle payload 现在会同步镜像进三端真实工程资源目录：
+      - Android `app/src/main/assets`
+      - iOS `ios/runtime`
+      - Harmony `entry/src/main/resources/rawfile`
+    - launch args sidecar 现在也会同步镜像进三端真实工程资源目录：
+      - Android `app/src/main/assets/runtime`
+      - iOS `ios/runtime`
+      - Harmony `entry/src/main/resources/rawfile`
+    - 三端宿主源码现在都显式带有 launch args sidecar 相对路径常量，后续读取 sidecar 时不需要再猜路径。
+    - Android `ChengMainActivity` 现在会在 `surfaceCreated(...)` 里直接读取 `assets/runtime/mobile_shell_launch_args.kv/json`，并把文本传进 `nativeCreate(...)`。
+    - Android `cheng_generated_android_host.c` 现在会在 `native_create(...)` 里解析两个 `jstring`，然后调用 runtime 的 `cheng_mobile_host_runtime_set_launch_args(...)`。
+    - iOS `ChengGeneratedMetalViewController.m` 现在会在 `initWithFrame:` 时从 bundle 读取 `runtime/mobile_shell_launch_args.kv/json`，并调用 runtime 的 `cheng_mobile_host_runtime_set_launch_args(...)`。
+    - iOS `project.pbxproj` 现在把这三份 runtime 资源都加入 `Resources` build phase。
+    - iOS `project.pbxproj` 现在也把 `mobile_shell_launch_args.kv/json` 加入 `Resources` build phase。
+    - 默认导出没带显式 runtime payload 输入时，平台资源目录会写入稳定 stub JSON，避免 `xcodebuild` 因复制缺文件直接失败。
+    - iOS 写文件形状继续收平：
+      - 普通 iOS 源文件改成 `rootDir + relPath` 稳定落盘，不再先把绝对路径和大文本一起传递。
+      - `project.pbxproj` / `contents.xcworkspacedata` 改成“先定目标路径，再生成内容，再写文件”的形状。
+      - `project.pbxproj` / workspace 写句柄改成 `os.openImplWrite(...)`，避开当前 ordinary 对 `os.Open(full, os.FmWrite)` 的 lowering 红点。
+    - 结果上已经消掉仓库根下误写的路径串台：
+      - 之前错误产物是 `/Users/lbcheng/cheng-lang/</string>/ios/...`
+      - 以及 `/Users/lbcheng/cheng-lang/\";/ios/...`
+  - `v3/src/tests/mobile_shell_codegen_smoke.cheng`
+    - 继续直接走 `v3MobileShellExportResolved(...)`，验证 runtime manifest / payload / Android / iOS / Harmony 三端导出物和平台资源镜像。
+    - 这轮最终已重新跑绿。
+  - `v3/src/tests/mobile_shell_launch_args_probe.cheng`
+    - 已新增最小 probe，直接验证 launch args 文本和三端宿主变体文本本身是稳定的。
+  - `v3/src/tests/mobile_shell_launch_args_shape_probe.cheng`
+    - 已新增 old-shape probe，直接验证“launch args 文本 + `v3MobileShellWriteFile` + 三端 old-shape 组合”本身也是稳定的。
+  - 仓库清理
+    - 已删除仓库根下误生成的 `<` 和 `\";` 目录。
+  - 本轮验收
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_codegen_smoke`
+      - `v3 mobile_shell_codegen_smoke ok`
+      - `v3 host smokes: ok`
+    - `artifacts/v3_backend_driver/cheng mobile-shell export --platform ios --out-dir /tmp/v3_mobile_shell_export_check --app-id org.cheng.exportcheck --app-name ChengExportCheck --lib-name cheng_export_check_app`
+      - `mobile-shell export ok`
+      - 导出结果正常落到 `/tmp/v3_mobile_shell_export_check/ios/Info.plist`
+      - 仓库根下未再生成 `</string>` / `<` 脏目录
+    - `artifacts/v3_backend_driver/cheng mobile-shell build-probe --platform ios --out-dir /tmp/v3_mobile_shell_probe_final6 --app-id org.cheng.final6 --app-name ChengFinal6 --lib-name cheng_final6_app`
+      - `mobile-shell build-probe ok`
+    - `artifacts/v3_backend_driver/cheng mobile-shell build-probe --platform all --out-dir /tmp/v3_mobile_shell_probe_runtime_assets --app-id org.cheng.runtimeassets --app-name ChengRuntimeAssets --lib-name cheng_runtime_assets_app`
+      - `mobile-shell build-probe ok`
+    - `artifacts/v3_backend_driver/cheng mobile-shell build-probe --platform all --out-dir /tmp/v3_mobile_shell_probe_launch_sidecar --app-id org.cheng.launchsidecar --app-name ChengLaunchSidecar --lib-name cheng_launch_sidecar_app`
+      - `mobile-shell build-probe ok`
+    - `artifacts/v3_backend_driver/cheng mobile-shell build-probe --platform all --out-dir /tmp/v3_mobile_shell_probe_launch_read --app-id org.cheng.launchread --app-name ChengLaunchRead --lib-name cheng_launch_read_app`
+      - `mobile-shell build-probe ok`
+      - `/tmp/v3_mobile_shell_probe_launch_read/mobile_shell_build_probe.summary.env`
+        - `android_exit_code=0`
+        - `ios_exit_code=0`
+        - `harmony_exit_code=0`
+    - `artifacts/v3_backend_driver/cheng verify-mobile-shell-build-probe`
+      - `mobile-shell build-probe ok`
+      - `verify-mobile-shell-build-probe: ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_build_probe_smoke`
+      - `v3 mobile_shell_build_probe_smoke ok`
+      - `v3 host smokes: ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_launch_args_probe mobile_shell_launch_args_shape_probe`
+      - `v3 mobile_shell_launch_args_probe ok`
+      - `v3 mobile_shell_launch_args_shape_probe ok`
+      - `v3 host smokes: ok`
+
+- cheng_node_main 统一入口收口
+  - `v3/src/project/cheng_node_main.cheng`
+    - 主入口已统一成一份：
+      - `cheng_node_main <subcmd>`
+      - `cheng_node_main ctl <subcmd>`
+    - `required-surface` 和 `bootstrap` 都已直接从 `cheng_node_main` 二进制跑通。
+  - `v3/src/std/bytes_layout.cheng`
+    - `byteBufToBytes(...)` 和 `byteSpanToBytes(...)` 已改成 raw copy owning bytes。
+    - 这次实锤修掉了旧链快照 `payload_hex=` 为空、以及 fixed32 解码拿不到 32 字节的问题。
+  - `v3/src/chain/codec_binary.cheng`
+    - `v3ReadFixed32(...)` 已改成直接从 `ByteSpan` 逐字节读 32 字节，不再依赖中间 `Bytes` 切片。
+  - `v3/src/chain/lsmr_types.cheng`
+    - `v3FixedCidFromBuf(...)` 已改成 owning copy 后再哈希，旧链 `lsmr` 状态树重建不再在 `ByteBuf` by-value 路径上挂死。
+  - `v3/src/project/cheng_node.cheng`
+    - payload/hash CID helper 已切回 owning bytes。
+    - `V3ChengNodeReplayStoredEvent(...)` 已改成恢复态 replay，不再在 state reload 里重放 actor dispatch。
+  - `v3/src/project/cheng_node_ledger.cheng`
+    - ledger CID helper 已切回 owning bytes。
+  - `v3/src/tooling/compiler_world.cheng`
+    - compiler world hash / text-bytes helper 已切回 owning bytes。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - compiler CSG hash helper 已切回 owning bytes。
+  - `v3/src/project/cheng_node_actor.cheng`
+    - actor dispatch 错误字串现在会带真实 actor 名，恢复期排障不再只有泛化报错。
+  - 验收
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_identity_smoke`
+      - `v3 cheng_node_identity_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_core_smoke`
+      - `v3 cheng_node_core_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_migration_smoke`
+      - `v3 cheng_node_migration_smoke ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_oracle_diloco_evomap_smoke`
+      - `v3 cheng_node_oracle_diloco_evomap_smoke ok`
+    - `/tmp/cheng_node_main_unified6 required-surface`
+      - `required_indexes=13`
+      - `actors=12`
+    - `/tmp/cheng_node_main_unified6 ctl required-surface`
+      - `required_indexes=13`
+      - `actors=12`
+    - `/tmp/cheng_node_main_unified6 bootstrap --root:cheng-node-main-unified-root`
+      - `required_index_count=13`
+      - `actor_count=12`
+    - `cheng_node_main` 这轮 fresh 编译时间：
+      - `real 60.71s`
+
+- cheng_node_main 入口去旧壳
+  - `v3/src/project/cheng_node_ctl_main.cheng`
+    - 帮助文本默认口径已切到 `cheng_node_main <command> [flags]`。
+    - `ctl` 现在只作为兼容前缀显示，不再当默认入口名。
+    - 未使用的旧 `V3ChengNodeCtlCommandAt(...)`、`V3ChengNodeCtlCommand()` 包装已经删除。
+  - `v3/src/tests/cheng_node_core_smoke.cheng`
+    - smoke 现在显式断言：
+      - `usage: cheng_node_main <command> [flags]`
+      - `compat: cheng_node_main ctl <command> [flags]`
+  - 验收
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_core_smoke`
+      - `v3 cheng_node_core_smoke ok`
+    - `/tmp/cheng_node_main_unified7 required-surface`
+      - `required_indexes=13`
+      - `actors=12`
+    - `/tmp/cheng_node_main_unified7 ctl required-surface`
+      - `required_indexes=13`
+      - `actors=12`
+    - `/tmp/cheng_node_main_unified7 bootstrap --root:cheng-node-main-unified-root-7`
+      - `required_index_count=13`
+      - `actor_count=12`
+    - `cheng_node_main` 这轮 fresh 编译时间：
+      - `real 55.01s`

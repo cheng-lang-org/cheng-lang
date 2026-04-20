@@ -2,99 +2,113 @@
 
 ## 总原则
 
-- 从单一真源往下推，不要在 parser、CSG、lowering、seed、wasm 各层各猜一份。
-- 发现未知就显式标未知，不要假装类型或 ABI 已经确定。
-- 复合值统一按地址语义思考；不要在热路径上混用“按值/按句柄/按临时槽”。
-- 验收优先用矩阵和正式 smoke，不靠一次性日志或临时手工命令。
+- 单一真源优先：同一事实不要在 parser、typed、lowering、seed、wasm 各猜一份。
+- 能显式 unknown 就显式 unknown，不要拿空串、布尔值或文本猜测冒充已知语义。
+- 复合值优先按地址语义思考，不要在热路径上混用按值/按句柄/按临时槽。
+- 验收看 fresh 闭环和正式 smoke，不看一次性现场。
 
-## 前端与 lowering
+## 当前稳定经验
 
-- 语法糖必须在前端一次吃掉，后端不再识别 `Fmt/?:/range/result intrinsic` 这类表面。
-- 表达式一旦跨层流动，第一刀先补 `exprId + source span`。
-- `compiler_csg` 和 `lowering_plan` 必须共用同一份 typed fact 与 lowering rule，不要双份统计。
-- lowering 真规则至少要显式带 `arg/result/materialize/copy/import` 五类字段。
-- 局部槽查找不能再用 flat table 的 first-match；必须至少带 `source line` 可见区间，并在 `dedent / elif / else` 时收紧块内局部。
-- native 和 wasm 共用 `V3AsmLocalSlot` 时，新增字段必须两边一起初始化、一起消费；只修一边等于没修。
+- `call expr` 最稳的真源是结构化 fact：`callee + args_text + arg_count + prefix_style`。
+- 这组 call 表面事实如果要跨 parser -> CSG -> lowering 传递，优先直接挂 `V3NormalizedExpr` 结构字段，不要继续塞进 `detail` 的 `key=value` 文本。
+- 当 parser 节点已经有 `callSurfaceKind/resolved/reason/target_source/importc` 这类结构字段时，layer 统计、typed 构建、CSG hash 要一起切过去；不能留一半结构字段、一半 `detail` 回扫。
+- parser 自己的 call 去重键、`exprId`、兼容 detail 也都要从结构字段现算，不要继续把存储里的 `expr.detail` 当 identity。
+- 验收这条线最稳的强回归是：把 parser layer 里的所有 call `detail` 清空后再建 typed facts，结果必须完全不变。
+- 同理，smoke/probe 也要跟着切到结构字段；否则主链已经单一真源，验收却还在喂旧真源。
+- 校验函数里的 fast path 一定要看清 `continue` 落点；只要把 call 主体误短路掉，整条“typed 对表 parser”就会变成假 gate。
+- `infer_expr_type` 不能做纯文本 cache；key 至少要带当前函数、源码行、local 数量。
+- `V3ExprPrepScratch` 这类大对象不能直接搬栈；只能做 lazy/pool/拆分。
+- `Bytes` 不能按类型直接判成 owning 或 borrowed；`bytesAlloc(...)` 和 `bytesFromString(...)` 共用同一表面，真正的 retain/release 语义现在由 runtime registry 判是不是托管块。
+- 遇到 `Bytes` 生命周期问题时，要先分清“runtime registry 边界”和“owner 赋值路径”到底是哪一层在红；`bytes_parent_copy_orc_smoke` 这轮证明过，手工 `memRelease(...)` 再接 ORC 赋值会制造双释放假红点，不能把测试误用当编译器 bug。
+- `cheng_v3_buffer_handle_from_raw_bridge(...)` 是复制语义，不是借用视图；源 `Bytes` 可以立刻 overwrite/release，这条边界现在要靠 `bytes_buffer_handle_copy_smoke` 钉住。
+- 同一份源缓冲连续注册多个 `buffer handle` 时，快照时机在“注册 handle 当下”，不是后面的 decode；早注册的 handle 必须看到旧值，晚注册的 handle 必须看到新值，而且两次 decode 出来的 `Bytes` 也必须彼此独立。
+- FFI/raw-handle 这层还要单独钉 generation：同槽复用后，新 handle 必须拿到 `generation + 1`，旧 handle 必须进 `detail=stale` trap，不能只停在“released”。
+- `layout.byteBufToBytes(...)` 和 `layout.byteSpanToBytes(...)` 也必须维持 owning copy；要测这条边界时，`byteSpan` 侧要直接喂 borrowed `bytesSliceView(...)`，不要先 `byteSpanFromBytes(owningBytes)` 再把“中间持有者多 retain 一次”误判成 copy 语义回归。
+- `build-ffi-handle` 这类需要最新 fixture 语义的命令，不能继续无脑 forward 给旧 `stage3`；当前稳定口径是在 `backend_driver_main` 本地直接编译/运行 fixture，而且要同时覆盖普通成功、generation reuse 成功、released trap、stale trap 四条边界。
+- 只要发射期会临时 `sub sp` 去物化调用结果或 assignment clone，局部槽、`var` 字段、参数 helper 取址就必须走稳定 frame base，不能直接拿当前 `sp` 当真源；这条现在由 `bytebuf_view_smoke`、`bytebuf_len_probe_smoke`、`bytes_param_helper_smoke`、`wrapper_*_varparam_smoke` 钉住。
+- fixed array 里的 `grid.items[i].payload = bytesAlloc(...)` 这种 `Bytes` lvalue materialize 现在还不在 ordinary 主链支持面上；容器写边界先别往这条形状硬推。
+- seed/selfhost 现在不要写 `discard foo()`；这条写法会直接炸 seed lowering。
+- parser 热循环里不要按值复制复合结构；直接按字段读。
+- parser 里所有只依赖文本的判断，优先 exact/range，不要 `trim -> firstToken -> slice` 连环调用。
+- call 行扫描必须先过硬条件，再切字符串；`hasCallParen` 前不要急着造 `callName/qualifier/dotted`。
+- report 和 smoke 里的 call 统计不要再手写第二套枚举；直接复用 parser 的结构字段，不要回扫 `detail`。
+- 但 `compiler_csg/lowering_plan` 不该长期直接回扫 `expr.detail`；`resolved/reason/target_source/target_importc` 这组 call 归因要前移进 typed fact，再由 report 从 typed fact 出数。
+- 同一条原则继续往前推时，`call callee/target` 也应该进 typed fact；typed return inference 直接吃 fact 字段，比在各处再拆 `expr.detail` 稳。
+- 再往前一步时，`qualifier` 也该进 typed fact；qualified external/member 的 typed 推断优先吃 `qualifier + callee`，不要继续把 `target` 当原始字符串来回切。
+- 顶层函数声明、import 行、grouped import 这类固定语法，优先单次 trim 后原位判定。
+- 非 import / 非 top-level fn 这种绝大多数行，不要先造整条 trimmed 字符串；先用 range 判定，命中后再切。
+- qualified shadow 这类逻辑优先比较 range，不要先切 `rootQualifier` 子串。
+- module path 这类路径文本，不要走 `split/trim/join`；exact builder 更稳。
+- parser 里任何索引边界都不要赌短路；显式拆开判断。
+- `V3ExprPrepScratch` 里像 `args[32][4096]` 这种 call-only 巨块，不要继续常驻内嵌；按需 slab + 线程本地 free-list 是稳定收益。
+- wrapper 外层如果最终还是要把大对象放进 `scratch`，就直接写进 `scratch` 本体，不要先放一份局部再整份复制。
+- 当 `prepare scratch` 已经把二次 infer、死字段、整块清零、allocator 抖动、call-only 巨块都收掉后，就该停；继续围着这条线磨，通常已经不是理论上的最大头。
+- 正式 `system-link-exec` 的 phase 真源在 seed/C 命令路径，不在 Cheng `compiler_main` 旁路。
+- 编译理论下界只能引用 `planner_total_ms <= compile_elapsed_ms` 的正式 `system-link-exec` phase 样本；当前稳定可引用的是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`。
+- ORC alloc/free/live 计数如果在 `echo` 前还继续做字符串格式化，数字会被噪声污染；先冻结 delta，再输出。
 
-## ABI 与复合值
+## 验证口径
 
-- `str/rawbytes/seq/result` 当前统一按“显式地址优先 + region copy”收。
-- 分片重组这类热路径不要直接依赖 `Result[复合]` 再 `Value(...).field` 继续往下跑；先补 `Fill(out)` 主实现，再让包装函数复用它。
-- `Bytes[] add/setLen` 这种序列能力缺口要直接修进编译器，不要再在 host/browser 业务代码里兜桥或换数据结构绕过去。
-- `xor` 这种关键字二元运算要成套收进 `const/infer/prepare/native/wasm`，不能只在某一层临时认一下。
-- `len(str/Bytes/seq)` 不要只为局部变量写特判；统一走 lvalue/global 地址再按 ABI 布局取长度槽更稳。
-- browser wasm ABI 不要长期手写 `input_len/copy/raw_handle/text_handle`；先抽 schema/helper，再走自动生成。
-- browser bridge 的最终验收必须看 fresh compiler no-handoff 的真实编译产物，同时确认 `.browser_bridge_plan.txt`、`.browser_bridge.generated.cheng` 和最终可执行都在。
-- compiler-generated internal Cheng object 不能沿用默认 public 符号面；bridge source 单独编 object 时，closure 引进来的 `std_*` helper 也会一起外泄，显式 `symbol_visibility=internal` 才是正解。
-- `--link-input` smoke 不能把 compiler-generated bridge source 再手工编一次陪跑；这只会稳定制造 duplicate symbol，正确做法是单独准备不重名的 manual fixture object。
-- hand-built browser ABI / system-link plan smoke 必须显式补 `entryPath`，不然 fresh no-handoff 下的规则收集会和真实命令面分叉。
-- seed 后端里剩下的 `composite` 文本判定，优先从 `call arg pass/materialize` 这种横跨 native+wasm 的热路径收；先抽共享 helper，再逐步往 `call result/field/local temp` 扩。
-- `call arg pass kind` 和 `expr materialize kind` 这种规则，必须直接映射 typed lowering 的语义面；不要再让 native/wasm 各自用自己的布尔猜测。
-- `call arg` 收完后，不要停在一半；紧跟着把 `seq/local/field/materialize` 这批同构分支一起接到同一个 helper，不然 wasm builtin、binding、assignment、frame init 很快又会长回第二套 `composite` 判断。
-- `seq/local/field/materialize` 收完后，下一批最值的是 `result intrinsic / str equality / constructor field`；它们表面不同，但本质都在复用“复合值是否必须地址物化”这一条规则，不一起扫完，native compare、wasm result、constructor write 会继续平行残留第二套 `composite` 判定。
-- `result intrinsic / equality / constructor field` 收完后，不要停；`result field/global/member/list elem copy` 还是同一条规则面，只是换成投影、复制和 literal 落位。如果这里不顺手一起收，materialize 主链和 wasm list/fixed-array 很快又会保留一排平行的 ABI 文本判断。
-- `result field/global/member/list elem copy` 收完后，下一批最值的是 `param ABI / builtin str bridge`；它们看起来像 ABI 特判或消息桥，实质还是“这个参数是不是必须按地址传/物化”。不收，native external call 和 native/wasm `panic/echo` 仍会挂着一截平行文本规则。
-- 当功能热路径里的裸 `composite` 文本判定已经清空、只剩 descriptor/helper 自身一两处定义分支时，就别再沉迷清尾巴；下一步收益更大的方向是把同一套 lowering rule 往更高层 dispatch 真接进去。
-- 往更高层 dispatch 推时，优先收 `call target` 级 helper：参数 load ABI、参数 temp prepare、scalar call、call-into-address、wasm composite call return 这些口必须共用同一套 `target param/return prefers address`，不要让它们继续各自用 `scalar_or_ptr` 或 `return_abi` 猜。
-- `call target` 级 dispatch 收完后，不要停；`call arg temp / expr temp / Result.Ok(...) / wasm call arg temp` 这层临时槽和结果物化入口也必须紧跟着切到 `v3_call_arg_passes_by_address(...)` 与 `v3_expr_materializes_to_address(...)`，不然高层很快又会重新长出一层裸 ABI 判断。
-- 临时槽和结果物化入口收完后，下一批最值的是 `field/global/default/setitem` 这种已经拿到了完整 `type + abi` 的高层分发口；这里如果还只看 ABI class，字段默认值、构造器字段写入、local/global copy、`[]=` 写值很快又会平行长出第二套判断。
-- `field/global/default/setitem` 收完后，不要停；`Result.Value(...)`、local binding/local assignment、module global init 这批入口也同样拿到了完整 `type + abi`，必须继续一起切到 `v3_expr_materializes_to_address(...)`，不然 native 语句发码层会残留第二套 `abi_class` 判断。
-- `Result.Value(...)` 和 native 语句发码入口收完后，别漏掉 `v3_add_local_slot_for_type(...)`、scalar global load、`seq add` 元素写入、expr statement prepare/codegen、param-slot `indirect_value` 这批低层同构入口；只要它们还挂着 `scalar_or_ptr`，lowering 漂移就还没真正收干净。
-- 当低层 `scalar_or_ptr` 也退回纯标量语义检查后，就不要再沉迷清这条尾巴；下一步更值的是把 return dispatch 也补成显式 `return pass kind` helper，让 function/call-target 的返回路径和 arg/materialize 共用同一套规则名。
-- return dispatch 收完后，不要停；`Result projection / wasm region-copy` 这批热路径也要补成显式 `copy kind` helper，不然 `prefers_region_copy` 仍然只是散装布尔判断，`copy/materialize/import` 这条线就还没真正收口。
-- `copy kind` 收完后，也不要停；`call-into-address / composite call-result / wasm static return slot` 这批入口还要继续补成显式 `call result kind` 和统一 helper，不然返回地址、静态返回槽和 composite call fallback 很快又会重新长出平行的布尔分支。
-- `call result kind` 和 static return slot 收完后，还要继续把 wasm pointer-result fallback 收成单一入口；只要 result intrinsic、call-result 和 generic fallback 还各自手写 `emit expr -> local_set -> copy`，这条链就还会漂。
-- pointer-result fallback 收完后，不要立刻跳去别的面；wasm `builtin message ptr` 这条 import/emit 热链也要紧跟着补成显式 mode 和共享 bridge helper。`panic/echo/assert` 如果继续在 analyze/emit 两边各写一份 `literal / ptr / str-address bridge` 三叉分支，import 规则很快又会重新漂成第二份真源。
-- wasm `builtin message ptr` 收完后，native importc `ffi_handle` 参数链不要只补 scalar call；`arg load abi`、prepare、scalar call、`call-into-address` 必须一起切到同一个显式 `arg kind`，否则复合返回那条主链会继续把 handle 参数当普通标量过。
-- importc `ffi_handle` 这类规则化入口，最稳的形状不是再堆布尔 helper，而是直接补显式枚举：`var / ffi_handle resolve / ffi_handle consume / value / address`。这样 `call_arg_load_abi`、spill、prepare、`call-into-address` 才不会各自重新长一套分支。
-- 参数链收完后，不要让 importc 返回继续停在裸布尔特判；`ffi_handle register` 也必须补成显式 `return kind`，让 `return pass / call result / return fixup` 共吃同一条规则。
-- importc `ffi_handle` arg/return 收完后，不要马上跳去别的面；wasm call/import 这层 `i32 param slot / i32 return slot / void` 也必须补成显式 `slot kind`，并一起切掉 `signature/analyze/emit` 三条主链上的平行 slot 布尔判断。
-- wasm `slot kind` 收完后，还要继续把 `type_index / import_index / local callee index` 收回共享 helper；只要 `register_import / emit_call_target / collect_imports / encode return_call_*` 还各自手抄签名解析和索引查找，import 这一列就还没真正只有一份真源。
-- `type_index / import_index / local callee index` 收完后，不要只停在 call target 这一半；function-side 的 `signature/type_index` 也必须立刻一起收回共享 helper。只修 target 不修 function，`context_init / collect_imports / module type section` 还是会继续各抄一份 slot/signature 规则。
-- `signature/type_index` 收完后，就不要继续在签名层打转；下一步最值的是把 wasm composite copy 的数据搬运入口也收成单一 helper。`pointer-result / seq add / lvalue copy / static return slot` 如果继续各写一份 `local_set + copy_region_between_locals`，import/copy-materialize 这条线还是会在更低层留第二份真源。
-- composite copy 收完后，紧跟着就该把“地址返回值写进 static return slot”压成单一 helper。显式 `return x` 和 implicit return 如果一条直接物化、一条先 `emit_expr` 再 copy，caller-side 的 import buffer 语义还是会残留双轨。
-- static return slot 收完后，不要让 wasm `call expr / call statement / composite call-result materialize` 继续各自解释 `return_slot_kind`；它们共享的是更高一层的“call result 到底是 `void / i32 value / i32 address`”语义，直接补显式 `wasm call result kind` 更稳。
-- `wasm call result kind` 收完后，external import 这一列也要立刻补显式 `import kind`，不要继续让 `type_index` 靠 `return_slot_kind != void` 这种影子语义选签名。
-- 如果 typed/lowering 里已经暴露了 `import_buffer` 这样的枚举和报表字段，但 fact builder 从来不赋值，就必须明确记成“还没接通”，不要把报表口当成真能力。
-- `import_buffer` 这类调用归因要真落地，前提是 expr 层先有最小 `CallExpr`；没有 call 节点，就不要假装 typed builder 能凭空推导调用返回语义。
-- 补 `CallExpr` 时先走最小闭环最稳：先只抓“同文件 importc fn 的 call”，把 builder 和 smoke 跑通，再扩到通用 call HIR。
-- call 规范化绝不能回到“名字表 × 行文本”的切片扫描；正确形状是逐行 token 扫描，看到 `ident(` 再查名表，不然 `compiler_csg` 这类 closure 级 smoke 会被字符串复制直接拖死。
-- `CallExpr` 真扩面时，也不要立刻把 closure 里所有函数名灌成全局名表；先坚持 per-source 名表最稳，先收“同文件 importc + local function”，再扩同包/跨文件。
-- qualified external call 的真源应该是“当前 source 的 direct import edge + alias/module-stem qualifier + 目标 source decl”，不是“整包 closure 里所有函数名”。只看最后那个函数名会把 alias/模块前缀信息丢掉，也很容易在同名函数上误归因。
-- nested qualified external call 也不能按“整条 import 闭包”无上限展开；external call name 递归必须按当前源码里真实出现的 dotted call 深度裁剪，不然普通 source 会把 std/import 闭包整棵跑进 parser。
-- grouped import 不能走 `FirstToken` 这种按空白截断的老路；`prefix/[a, b]` 必须先 strip comment，再显式展开成多条 direct import edge，不然 direct import qualifier 这条真源到了 grouped import 就会断掉。
-- direct import 的 external call 名不能只收 qualified 形态；qualified 和 unqualified 两种入口都要进同一份外部调用名集合，不然 alias/module-stem call 能认，`SharedEcho(...)` 这种 direct import unqualified call 会直接漏出 `external_call`。
-- alias import 不能贡献 unqualified external 名；`import foo as bar` 只能产生 `bar.Func(...)` 这类 qualified 入口，不能把 `Func(...)` 也偷偷塞进 external call 名集合。
-- aliasless direct import 的 unqualified external 名也不能压过当前 source 的同名本地函数；本地声明必须先遮蔽，不能在同一调用点并存 `local_call` 和 `external_call`。
-- qualified target 也要先过当前函数的局部可见性 gate；根 qualifier 只要被参数或局部 `let/var/const` 占用，就必须退回 `member_call + shadowed_qualified_target`，不能因为 dotted name 恰好命中 external call 名就硬解 import。
-- direct import 的 unqualified external 名要先收，再过 qualified 深度门；`maxQualifiedCallDepth` 只该限制递归 qualified 展开，不能把没有 dotted call 的 source 的 direct external 名一起挡掉。
-- qualified target 的 qualifier 解析不能静默取第一条 import edge；只要同一个 qualifier 映射到多个 direct import target，就必须显式落成 `ambiguous_qualified_target`。
-- unknown dotted call 的 `member_call` fallback 不能混在 `local/external/importc` 三路扫描里补；必须最后按全量已知 call 名单单独跑一遍，不然 qualified external/importc/local 会被双记，typed fact 会平白长出 `call_expr / abi=polymorphic`。
-- unknown dotted call 不能只留 `resolved=0`；`CallExpr.detail` 至少要显式带 `reason`，不然后面的 typed/report 只能看到“没解析”，看不到“为什么没解析”。
-- unresolved call 的强校验不能只盯 `member_call`；所有 unresolved call 都必须带 reason，不然 ambiguous external 和别的 known-but-unresolved target 还是会漏成“无解释 polymorphic”。
-- qualified external lookup 不能只回传“返回类型字符串”；只要目标可能是 imported `importc`，就必须把“目标是否 importc”一起带回来，否则 composite imported importc call 会被误压成 `local_address/composite_local`，进不了 `import_buffer`。
-- resolved call 的硬 gate 不能只盯 parser；local/importc 空返回如果继续和“没找到返回类型”共用空串，第一时间就会把 resolved void call 误炸成 `call_expr/deferred`。
-- 处理返回类型 ABI 时，`preferredSourcePath` 不能当成硬覆盖；正确形状是“先切到 callee source context，再按当前 source 声明和无 alias direct import 解析 unqualified type”。像 `DateTime` 这种 imported return type，不这么做一定会回退成 `abi=polymorphic`。
-- `T/refT` 这类显式泛型占位符和真正的“无解释回退”不是一回事；resolved call gate 要拦的是漏归因，不是把 generic wrapper 一起打红。
-- resolved call 的类型归因不能只认内建复合类型；当前 source 和 direct import source 里显式声明过的 named `type` 也必须进 typed 真源，不然 `ByteBuffer`、`V3NormalizedExpr` 这类本地命名复合返回值还是会掉回 deferred。
-- 扫 `type` 块时空行不能当断块；很多 Cheng 源文件会在同一个 `type` 块里用空行分隔多个声明。
-- parser 里任何带索引的边界判断都不要依赖短路，像 `i > 0 && line[i - 1]`、`pos < len && line[pos]` 这种写法都必须拆成显式分支；这类坑已经多次重演成 `idx=-1`。
-- parser 里也不要长期保留 `profiles[otherIndex].localCallNames[callIndex]` 这种复合字段嵌套索引；一旦热路径里既要取 `.len` 又要按相同索引取元素，最稳的形状是先快照到本地 seq，再用显式 `while` 走索引，不要赌 compiler 一定能把这类组合安全 lowering。
-- `v3ParserReadNormalizedExprLayerFromPath(...)` 只适合本地文本级 expr 统计，不适合拿来验 external/qualified/imported call 归因；这类回归必须走 `v3ParseOrdinarySourceStub(...)` 或 profile-aware reader，才能带上 import edge 和 target source。
-- call HIR 扩面时，`CollectExternalCallNames`、`ResolveUnqualifiedExternalCallTarget`、`ReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles` 三个真入口必须一起走同一条 `CallAndMember` 主链；只修名字收集或只修 resolve 都会留下半通不通的 closure-visible 调用。
-- qualified target 不能只看 target source 的直接声明；如果 unqualified target 已经能看见 aliasless direct-import closure，`ResolveQualifiedCallTarget` 和 qualified external name 收集也必须补上同一层 closure-visible 语义，不然 `Foo(...)` 和 `mid.Foo(...)` 会分叉成两套真相。
-- `typed lowering rule` 不能只停在计数字段；一旦要把规则继续往 seed/后端真接线，必须先给它稳定 `key/entry text`，让 `compiler_csg`、`lowering_plan`、smoke 和后端消费侧都对着同一串规则名工作，而不是各自再解释结构体。
-- seed 真接线时，不要再让 `register_import / type_index / analyze / emit` 各自重算一遍 wasm call 语义；最稳的是先补一份显式 `call lowering rule struct`，把 `arg slot / return slot / result / import` 一次算好，再让这些高层入口共用它。
-- wasm call rule 收完后，native/importc caller-side 也要立刻补同样的显式 rule struct；`prepare / scalar call / call-into-address / call-from-spills / ffi_handle return fixup` 必须共吃同一份 `arg/return/result`，不能继续靠入口各自重算。
-- native/importc caller-side rule 收完后，不要停在“一个 `result_uses_address` 布尔值”这一层；composite return caller 入口也必须立刻补显式 composite-result rule，把普通复合返回和 import-buffer 式复合返回先命名，再让 `call_into_address` 和复合值物化入口共吃。
-- parser 里任何 `nextPos >= len || line[nextPos] == ...` 这种短路边界判断都不要再留；profile-aware call 读取和 import 行扫描尤其容易被这类写法炸成 `idx=len`。
-- `compiler_csg_smoke / lowering_plan_smoke` 这类规则矩阵回归，不要在测试里直接 import lowering rule 枚举再自己解释一遍；最稳的是直接读 `compiler_csg report / lowering plan report` 里的计数字段，不然 ordinary compile 很容易被测试闭包自己拖到超时。
-- 验 C bootstrap codegen 改动时，stage0 本体不能直接当 ordinary smoke compiler；最稳流程是先 `bootstrap-bridge`，再拿 fresh `stage2` 配 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 跑回归。
-- seed 里任何 `8192 * PATH_MAX` 这类 plan 数组都不能再上栈；像 `v3_materialize_provider_objects(...)` 这种 provider 编译热口，必须直接用堆分配并在所有返回路径显式释放，不要等到 fresh stage2/provider compile 时再炸栈。
+- 改 seed/backend 后，固定流程是：
+  - `stage0 compile`
+  - `bootstrap-bridge`
+  - fresh `stage2 no-handoff` host smokes
+- 跑 `perf_memory_contract_smoke` 时，当前主线必须显式钉：
+  - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2`
+- 文档或本地 skill 镜像一旦改了，必须立刻跑：
+  - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
+- 需要定热点时直接用真实可执行的 `/usr/bin/time -l` 和 `sample`，不要靠感觉猜。
+- sample 挪走热点不等于正式 gate 就一定更好；只要 perf gate 回弹，实验必须立即撤回。
+- 顶层 `scalar function` 发射和 `v3_emit_non_if_statement(...)` 不能机械并线；哪怕核心 smoke 过了，`perf_memory_contract_smoke` 也会在 `host_ops/os_host_process` 这条正式链路上把回归炸出来。先补齐逐类 parity，再谈收口。
+- analysis smoke 如果只验 `exprLayer/typedExprFacts/export surface`，就直接构最小 CSG；不要在 smoke helper 里重复做 source bundle hash 和整图 CID。
+- ordinary 当前对“`if ... else` 直接作为复合实参传给函数”这类形状还不稳；像 CSG append/hash 这种热路径，先拆成局部字符串再传，别把发射红点误判成模型设计问题。
 
-## 记录与流程
+## 当前不要碰
 
-- 账本只写当前有效信息；旧历史压缩，不要让长文档遮住当前决策。
-- 开新任务前先看 `lessons.md`，避免把已经踩实的坑重新踩一遍。
-- `backend_driver_command_surface_smoke` 这类会在命令面里再触发 `stage3 system-link-exec` 的长链验收，在 macOS 上很容易把 `cheng.stage3 system-link-exec` 卡住。正式收口要先把当前任务对应的命令直接跑绿。
-- bootstrap freshness 必须跟真实 bridge 选路一致；如果 no-handoff 实际优先吃 `stage2`，freshness 也必须同时检查 `stage2/stage3`，不能只看 `stage3`。
+- `Bytes[] add/setLen` 高风险支线
+- 大对象上栈
+- parser probe 级微调
+- 任何降级、兜底、启发式补丁
+
+## cheng_node / libp2p / VPN
+
+- `bytesFromString(...)` 是借用视图，不是 owning copy；只要 payload 要进 host store、跨 actor、跨函数或跨事件账本存活，就必须立刻复制成真正的 `Bytes`。
+- `identify` 这种基础接入协议不要再绑 `trustedView`；trust 只影响可见地址和高权限面，不该把公开接入节点自己的基础资源导出封死。
+- ordinary 当前对 `while` 和显式局部变量更稳；`for` 变量出循环后继续用、或者 `Err(...)` 里内联长串拼接，都会更容易踩 primary object 红面。
+- 验收 `cheng_node ctl` 这种会写 state 的命令时，不能并发打同一个 state 文件；必须串行，不然结果只是在测最后一个写入者。
+- `cheng_node ctl` 里可选 flag 别名优先走 `readFlagOrDefault(...) + 空串判定`；不要把 `Result + IsOk/Value` 分支塞进同一个局部初始化，ordinary lowering 在这类形状上不稳。
+- 共享模块一旦 `@importc` 到移动宿主符号，host runtime 也必须同步补导出 stub；否则不是运行时才炸，而是普通主机链接直接失败。
+- DiLoCo wire/status 的字段名口径是下划线展开，不是点号路径；写 smoke 和 keyed query 断言时必须按真实 wire 名称来。
+- 旧独立模块并进 `cheng_node` 普通主闭包时，要先确认它自己也能走 ordinary 编译；如果 closure 因旧模块红掉，直接修旧模块，不要把它继续当“外部黑盒”。
+- `V3ChengNodeKeyedQueryText(...)` 用来验 `found/proof/payload_present` 很合适，但它返回的是 `payload_text_hex`；要核对 payload 正文时，直接用 index entry 的 `valueCid` 去读 object store。
+- `mobile_shell_codegen` 里只要文本内容本身含有 `</string>`、`<group>`、`\";` 这类片段，就不能再把“目标路径 + 大文本”一起交给通用写文件 helper；当前 ordinary 下很容易把路径串成文本片段目录。
+- iOS `project.pbxproj` / workspace 这类大文本文件，稳定做法是：
+  - 固定 `rootDir + relPath`
+  - 先建父目录
+  - 再生成文本并写入
+  - 不要先拼绝对路径再把它和大字符串一起传递。
+- `Info.plist` 这种 XML 文本也一样；只要正文里有 `</string>`，就必须和 `project.pbxproj` 一样走绝对路径直写，不能回到 `V3WriteTextFile(rootDir, relPath, payload)` 这条通用 helper。
+- 当前 ordinary 对 `os.Open(full, os.FmWrite)` 仍有 lowering 缺口；同语义场景优先用已经验证稳定的 `os.openImplWrite(full)`。
+- `mobile_shell_codegen_smoke` 如果看到“iOS 文件不存在”，先查 `/Users/lbcheng/cheng-lang` 根下有没有新冒出来的 `<`、`\";` 之类目录；这通常不是导出没跑，而是路径串台了。
+- `mobile-shell build-probe` 如果先报 rc=139，不要先怀疑平台构建器；先把失败路径里的 summary 拼接/写文件拿掉，不然 runtime 自己先炸，真实的 xcodebuild/gradle/hvigor 错误会被完全盖住。
+- `mobile_shell_runtime_contract_v1.json` 不能只留在导出根目录；平台宿主真正消费时，必须同步镜像进 Android `assets`、iOS `runtime/Resources`、Harmony `rawfile` 这三处真实打包目录。
+- iOS 只要把 runtime payload / bundle payload 写进 `Resources` build phase，就必须保证默认导出也有对应文件；没有外部输入时直接落 stub JSON，别把缺文件留给 `xcodebuild` 复制阶段才炸。
+- smoke 里校验 runtime manifest 常量时，必须按平台真实相对路径断言；iOS 是 `runtime/mobile_shell_runtime_contract_v1.json`，Harmony 是 `rawfile/mobile_shell_runtime_contract_v1.json`，不能再偷用导出根目录那份名字。
+- `mobile_shell_codegen` 主线里不要顺手塞“大段 launch-args 常量 + JSON 拼装”这种新字符串形状；这轮会把 `mobile_shell_tool` 自己打成 `cheng seq_set_grow: corrupt header`。要查这条，必须先拆成独立最小 probe，不要拿正式 `export/build-probe` 当试验场。
+- launch args 这条先走 sidecar 文件是稳定面：先生成 `runtime/mobile_shell_launch_args.kv/json`，再镜像进 Android `assets`、iOS `runtime/Resources`、Harmony `rawfile`，不要急着直接内联进宿主源码。
+- 如果下一步要接宿主读取 launch args，先把 sidecar 相对路径常量单独写进宿主源码；这条是稳定的，也不会像内联大段 launch args 文本那样把 `mobile_shell_tool` 打红。
+- launch args probe 如果已经证明“文本本身”“`v3MobileShellWriteFile(...)`”“三端 old-shape 组合”都稳定，那剩下就不是 launch args 内容问题，而是原 `mobile_shell_codegen` 模块的具体组合形状问题。
+- Android / iOS 宿主接 launch args 时，稳定形状是“宿主自己从打包资源读 sidecar 文本，再调用 `cheng_mobile_host_runtime_set_launch_args(...)`”；不要把 launch args 正文重新拼回导出期大字符串里。
+- Android 这条稳定口径已经是：
+  - Kotlin `assets.open(...).bufferedReader().use { it.readText() }`
+  - `nativeCreate(..., launchArgsKv, launchArgsJson)`
+  - C host 里 `GetStringUTFChars / ReleaseStringUTFChars`
+- iOS 这条稳定口径已经是：
+  - `NSBundle mainBundle` + `pathForResource:ofType:inDirectory:`
+  - `NSString stringWithContentsOfFile`
+  - 然后把 UTF-8 文本直接交给 `cheng_mobile_host_runtime_set_launch_args(...)`
+- 同一个 host smoke 不要并行跑两份；它们会抢同一个 `artifacts/v3_hostrun/<smoke>` 目录，能制造 `primary.o is empty` 这种假红。
+- `byteBufToBytes(...)` / `byteSpanToBytes(...)` 这种公共 copy helper 不能偷懒走切片视图；只要后面要写文件、做 CID、做 fixed32/fixed64 解码，就必须是 raw copy owning bytes，不然很容易出现 `payload_hex=` 空、空串哈希、`need 32 bytes` 这类假象。
+- 固定宽度二进制读取优先直接填目标结构；像 `v3ReadFixed32(...)` 这种路径，逐字节写 `FixedBytes32` 比 `ByteSpan -> Bytes -> FixedBytes32` 多一道中转稳得多。
+- state reload / migration replay 不是 live event dispatch；恢复路径只负责重建账本、proof、索引和 runtime 状态，不该再触发 actor dispatch、副作用发布或实时控制面逻辑。
+- 入口收口时，默认帮助和 smoke 口径也必须一起切到正式宿主；现在应该固定成 `cheng_node_main <subcmd>`，`ctl` 只保留兼容，不要继续把双入口写成主设计。

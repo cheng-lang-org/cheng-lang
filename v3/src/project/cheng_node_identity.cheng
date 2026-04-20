@@ -6,7 +6,18 @@ import cheng/v3/std/bytes_layout as layout
 
 const
     v3ChengNodeIdentityVersion: int32 = 1
-    v3ChengNodeIdentityDomainTotal: int32 = 9
+    v3ChengNodeIdentityDomainTotal: int32 = 10
+    v3ChengNodeIdentityTagRootId: int32 = 1
+    v3ChengNodeIdentityTagChain: int32 = 2
+    v3ChengNodeIdentityTagDid: int32 = 3
+    v3ChengNodeIdentityTagLibp2p: int32 = 4
+    v3ChengNodeIdentityTagDiscovery: int32 = 5
+    v3ChengNodeIdentityTagOracle: int32 = 6
+    v3ChengNodeIdentityTagDiloco: int32 = 7
+    v3ChengNodeIdentityTagEvoMap: int32 = 8
+    v3ChengNodeIdentityTagVpn: int32 = 9
+    v3ChengNodeIdentityTagCompiler: int32 = 10
+    v3ChengNodeIdentityTagAdmin: int32 = 11
 
 type
     V3ChengNodeIdentity =
@@ -19,6 +30,7 @@ type
         discoveryKey: layout.FixedBytes32
         oracleKey: layout.FixedBytes32
         dilocoKey: layout.FixedBytes32
+        evomapKey: layout.FixedBytes32
         vpnKey: layout.FixedBytes32
         compilerKey: layout.FixedBytes32
         adminKey: layout.FixedBytes32
@@ -26,41 +38,72 @@ type
 fn v3ChengNodeIdentityOwnText(text: str): str =
     return system.SystemToStringStr(text)
 
+fn v3ChengNodeIdentityOwnBytes(text: str): Bytes =
+    let owned = v3ChengNodeIdentityOwnText(text)
+    return bytesSlice(bytesFromString(owned), 0, len(owned))
+
 fn v3ChengNodeIdentitySaltBytes(): Bytes =
-    return bytesFromString("cheng_node.identity.salt.v1")
+    return v3ChengNodeIdentityOwnBytes("cheng_node.identity.salt.v1")
 
-fn v3ChengNodeIdentityInfoBytes(info: str): Bytes =
-    return bytesFromString(info)
+fn v3ChengNodeIdentityTaggedBytes(rootKey: layout.FixedBytes32,
+                                  tagId: int32): Bytes =
+    var out = bytesAlloc(layout.fixedBytes32Size + 4)
+    for i in 0..<layout.fixedBytes32Size:
+        bytesSet(out, i, int32(rootKey.data[i]) & 255)
+    bytesSet(out, layout.fixedBytes32Size + 0, (tagId >> 24) & 255)
+    bytesSet(out, layout.fixedBytes32Size + 1, (tagId >> 16) & 255)
+    bytesSet(out, layout.fixedBytes32Size + 2, (tagId >> 8) & 255)
+    bytesSet(out, layout.fixedBytes32Size + 3, tagId & 255)
+    return out
 
-fn v3ChengNodeIdentityBytes32FromResult(source: Result[Bytes]): Result[layout.FixedBytes32] =
-    if IsErr(source):
-        return Err[layout.FixedBytes32](Error(source))
-    return layout.fixedBytes32FromBytes(Value(source))
+fn v3ChengNodeIdentityDomainTag(label: str): Result[int32] =
+    if label == "chain":
+        return Ok[int32](v3ChengNodeIdentityTagChain)
+    if label == "did":
+        return Ok[int32](v3ChengNodeIdentityTagDid)
+    if label == "libp2p":
+        return Ok[int32](v3ChengNodeIdentityTagLibp2p)
+    if label == "discovery":
+        return Ok[int32](v3ChengNodeIdentityTagDiscovery)
+    if label == "oracle":
+        return Ok[int32](v3ChengNodeIdentityTagOracle)
+    if label == "diloco":
+        return Ok[int32](v3ChengNodeIdentityTagDiloco)
+    if label == "evomap":
+        return Ok[int32](v3ChengNodeIdentityTagEvoMap)
+    if label == "vpn":
+        return Ok[int32](v3ChengNodeIdentityTagVpn)
+    if label == "compiler":
+        return Ok[int32](v3ChengNodeIdentityTagCompiler)
+    if label == "admin":
+        return Ok[int32](v3ChengNodeIdentityTagAdmin)
+    return Err[int32]("cheng_node identity: unknown domain label")
 
 fn v3ChengNodeIdentityDeriveRootKey(rootSeed: str): Result[layout.FixedBytes32] =
     if len(rootSeed) <= 0:
         return Err[layout.FixedBytes32]("cheng_node identity: empty root seed")
-    let seedBytes = bytesFromString(rootSeed)
-    let rootBytesRes = hkdf.hkdfSha256(seedBytes,
-                                       v3ChengNodeIdentitySaltBytes(),
-                                       v3ChengNodeIdentityInfoBytes("cheng_node.identity.root"),
-                                       layout.fixedBytes32Size)
-    return v3ChengNodeIdentityBytes32FromResult(rootBytesRes)
+    let seedBytes = v3ChengNodeIdentityOwnBytes(rootSeed)
+    let saltBytes = v3ChengNodeIdentitySaltBytes()
+    let rootBytes = hkdf.hkdfExtractSha256(seedBytes, saltBytes)
+    return layout.fixedBytes32FromBytes(rootBytes)
 
 fn v3ChengNodeIdentityDeriveFromRootKey(rootKey: layout.FixedBytes32,
                                         label: str): Result[layout.FixedBytes32] =
-    let rootBytes = layout.fixedBytes32ToBytes(rootKey)
-    let keyBytesRes = hkdf.hkdfExpandSha256(rootBytes,
-                                            v3ChengNodeIdentityInfoBytes("cheng_node.domain." + label),
-                                            layout.fixedBytes32Size)
-    return v3ChengNodeIdentityBytes32FromResult(keyBytesRes)
+    if len(label) <= 0:
+        return Err[layout.FixedBytes32]("cheng_node identity: empty domain label")
+    let tagRes = v3ChengNodeIdentityDomainTag(label)
+    if IsErr(tagRes):
+        return Err[layout.FixedBytes32](Error(tagRes))
+    let combined = v3ChengNodeIdentityTaggedBytes(rootKey, Value(tagRes))
+    let saltBytes = v3ChengNodeIdentitySaltBytes()
+    let derivedBytes = hkdf.hkdfExtractSha256(combined, saltBytes)
+    return layout.fixedBytes32FromBytes(derivedBytes)
 
 fn v3ChengNodeIdentityDeriveRootId(rootKey: layout.FixedBytes32): Result[layout.FixedBytes32] =
-    let rootBytes = layout.fixedBytes32ToBytes(rootKey)
-    let rootIdRes = hkdf.hkdfExpandSha256(rootBytes,
-                                          v3ChengNodeIdentityInfoBytes("cheng_node.identity.root_id"),
-                                          layout.fixedBytes32Size)
-    return v3ChengNodeIdentityBytes32FromResult(rootIdRes)
+    let combined = v3ChengNodeIdentityTaggedBytes(rootKey, v3ChengNodeIdentityTagRootId)
+    let saltBytes = v3ChengNodeIdentitySaltBytes()
+    let derivedBytes = hkdf.hkdfExtractSha256(combined, saltBytes)
+    return layout.fixedBytes32FromBytes(derivedBytes)
 
 fn v3ChengNodeIdentityDomainCount(): int32 =
     return v3ChengNodeIdentityDomainTotal
@@ -74,6 +117,7 @@ fn v3ChengNodeIdentityDomainNames(): str[] =
     add(out, "discovery")
     add(out, "oracle")
     add(out, "diloco")
+    add(out, "evomap")
     add(out, "vpn")
     add(out, "compiler")
     add(out, "admin")
@@ -93,6 +137,8 @@ fn v3ChengNodeIdentityDomainKey(identity: V3ChengNodeIdentity,
         return Ok[layout.FixedBytes32](identity.oracleKey)
     if domain == "diloco":
         return Ok[layout.FixedBytes32](identity.dilocoKey)
+    if domain == "evomap":
+        return Ok[layout.FixedBytes32](identity.evomapKey)
     if domain == "vpn":
         return Ok[layout.FixedBytes32](identity.vpnKey)
     if domain == "compiler":
@@ -127,6 +173,9 @@ fn V3ChengNodeIdentityDerive(rootSeed: str): Result[V3ChengNodeIdentity] =
     let dilocoKeyRes = v3ChengNodeIdentityDeriveFromRootKey(rootKey, "diloco")
     if IsErr(dilocoKeyRes):
         return Err[V3ChengNodeIdentity](Error(dilocoKeyRes))
+    let evomapKeyRes = v3ChengNodeIdentityDeriveFromRootKey(rootKey, "evomap")
+    if IsErr(evomapKeyRes):
+        return Err[V3ChengNodeIdentity](Error(evomapKeyRes))
     let vpnKeyRes = v3ChengNodeIdentityDeriveFromRootKey(rootKey, "vpn")
     if IsErr(vpnKeyRes):
         return Err[V3ChengNodeIdentity](Error(vpnKeyRes))
@@ -146,6 +195,7 @@ fn V3ChengNodeIdentityDerive(rootSeed: str): Result[V3ChengNodeIdentity] =
     out.discoveryKey = Value(discoveryKeyRes)
     out.oracleKey = Value(oracleKeyRes)
     out.dilocoKey = Value(dilocoKeyRes)
+    out.evomapKey = Value(evomapKeyRes)
     out.vpnKey = Value(vpnKeyRes)
     out.compilerKey = Value(compilerKeyRes)
     out.adminKey = Value(adminKeyRes)

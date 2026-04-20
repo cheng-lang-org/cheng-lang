@@ -84,7 +84,7 @@ artifacts/v3_bootstrap/cheng.stage3 crash-report --in:/tmp/app.crash.raw.txt --o
 - `v3/src/tooling/*`：`bootstrap contract / build plan / hotpath scan / gate / compiler control-plane`
 - `v3/src/backend/system_link_exec.cheng`：ordinary compile 主入口
 - `v3/src/tests/*`：固定布局、链路、debug、ordinary smoke
-- `v3/src/project/chain_node_main.cheng`：`chain_node` 真 artifact 入口
+- `v3/src/project/cheng_node_main.cheng`：统一节点真 artifact 入口
 
 ## 当前规则
 
