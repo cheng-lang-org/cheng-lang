@@ -442,35 +442,13 @@ fn msquicNativeResetServerEndpointState() =
     msquicNativeServerMaxDataSent = false
     msquicNativeServerMaxStreamDataSent = false
 
-fn msquicNativeAppRecvChunkZero(): MsQuicNativeAppRecvChunk =
-    var out: MsQuicNativeAppRecvChunk
-    out.used = false
-    out.offset = 0
-    out.data = emptyBytes()
-    return out
-
-fn msquicNativeAppStreamSlotZero(): MsQuicNativeAppStreamSlot =
-    var out: MsQuicNativeAppStreamSlot
-    out.used = false
-    out.streamId = 0
-    out.sendOffset = 0
-    out.writeClosed = false
-    out.ready = emptyBytes()
-    out.nextOffset = 0
-    out.peerClosed = false
-    out.peerFinalOffset = 0
-    out.pendingCount = 0
-    for i in 0..<msquicNativeAppRecvMaxChunks:
-        out.pending[i] = msquicNativeAppRecvChunkZero()
-    return out
-
 fn msquicNativeResetClientAppStreams() =
     for i in 0..<msquicNativeAppStreamSlotCount:
-        msquicNativeClientAppStreams[i] = msquicNativeAppStreamSlotZero()
+        msquicNativeClientAppStreams[i] = MsQuicNativeAppStreamSlot()
 
 fn msquicNativeResetServerAppStreams() =
     for i in 0..<msquicNativeAppStreamSlotCount:
-        msquicNativeServerAppStreams[i] = msquicNativeAppStreamSlotZero()
+        msquicNativeServerAppStreams[i] = MsQuicNativeAppStreamSlot()
 
 fn msquicNativeResetClientEndpoint(
     settings: var MsQuicSettings,
@@ -599,7 +577,7 @@ fn msquicNativeEnsureAppStreamSlot(side: int32, streamId: int64): Result[int32] 
     if side == msquicNativeClientSide:
         for i in 0..<msquicNativeAppStreamSlotCount:
             if ! msquicNativeClientAppStreams[i].used:
-                msquicNativeClientAppStreams[i] = msquicNativeAppStreamSlotZero()
+                msquicNativeClientAppStreams[i] = MsQuicNativeAppStreamSlot()
                 msquicNativeClientAppStreams[i].used = true
                 msquicNativeClientAppStreams[i].streamId = streamId
                 return Ok[int32](i)
@@ -607,7 +585,7 @@ fn msquicNativeEnsureAppStreamSlot(side: int32, streamId: int64): Result[int32] 
     if side == msquicNativeServerSide:
         for i in 0..<msquicNativeAppStreamSlotCount:
             if ! msquicNativeServerAppStreams[i].used:
-                msquicNativeServerAppStreams[i] = msquicNativeAppStreamSlotZero()
+                msquicNativeServerAppStreams[i] = MsQuicNativeAppStreamSlot()
                 msquicNativeServerAppStreams[i].used = true
                 msquicNativeServerAppStreams[i].streamId = streamId
                 return Ok[int32](i)
@@ -663,7 +641,7 @@ fn msquicNativeAppStreamNormalize(slot: var MsQuicNativeAppStreamSlot) =
         if slot.pending[i].used && slot.pending[i].offset < slot.nextOffset:
             let trim64: int64 = slot.nextOffset - slot.pending[i].offset
             if trim64 >= int64(bytesLen(slot.pending[i].data)):
-                slot.pending[i] = msquicNativeAppRecvChunkZero()
+                slot.pending[i] = MsQuicNativeAppRecvChunk()
                 slot.pendingCount = slot.pendingCount - 1
             else:
                 let trim: int32 = int32(trim64)
@@ -682,7 +660,7 @@ fn msquicNativeAppStreamDrain(slot: var MsQuicNativeAppStreamSlot) =
                 let data: Bytes = slot.pending[i].data
                 msquicNativeBytesAppend(slot.ready, data)
                 slot.nextOffset = slot.nextOffset + int64(bytesLen(data))
-                slot.pending[i] = msquicNativeAppRecvChunkZero()
+                slot.pending[i] = MsQuicNativeAppRecvChunk()
                 slot.pendingCount = slot.pendingCount - 1
                 advanced = true
                 break
@@ -1090,20 +1068,37 @@ fn msquicNativeResetClientPolicyCache() =
     msquicNativeClientCert3Cache = emptyBytes()
     msquicNativeClientPrivateKeyCache = emptyBytes()
 
+fn msquicNativeCopyTlsPolicy(policy: MsQuicTlsPolicy): MsQuicTlsPolicy =
+    var out: MsQuicTlsPolicy = policy
+    out.crl0 = msquicNativeCopyBytes(policy.crl0)
+    out.crl1 = msquicNativeCopyBytes(policy.crl1)
+    out.crl2 = msquicNativeCopyBytes(policy.crl2)
+    out.crl3 = msquicNativeCopyBytes(policy.crl3)
+    out.certChain0 = msquicNativeCopyBytes(policy.certChain0)
+    out.certChain1 = msquicNativeCopyBytes(policy.certChain1)
+    out.certChain2 = msquicNativeCopyBytes(policy.certChain2)
+    out.certChain3 = msquicNativeCopyBytes(policy.certChain3)
+    out.certPrivateKey = msquicNativeCopyBytes(policy.certPrivateKey)
+    out.trustRoot0 = msquicNativeCopyBytes(policy.trustRoot0)
+    out.trustRoot1 = msquicNativeCopyBytes(policy.trustRoot1)
+    out.trustRoot2 = msquicNativeCopyBytes(policy.trustRoot2)
+    out.trustRoot3 = msquicNativeCopyBytes(policy.trustRoot3)
+    return out
+
 fn msquicNativeSetClientPolicyCache(policy: MsQuicTlsPolicy) =
     msquicNativeClientServerNameCache = policy.serverName
     msquicNativeClientTrustRootsCountCache = policy.trustRootsCount
-    msquicNativeClientTrustRoot0Cache = policy.trustRoot0
-    msquicNativeClientTrustRoot1Cache = policy.trustRoot1
-    msquicNativeClientTrustRoot2Cache = policy.trustRoot2
-    msquicNativeClientTrustRoot3Cache = policy.trustRoot3
+    msquicNativeClientTrustRoot0Cache = msquicNativeCopyBytes(policy.trustRoot0)
+    msquicNativeClientTrustRoot1Cache = msquicNativeCopyBytes(policy.trustRoot1)
+    msquicNativeClientTrustRoot2Cache = msquicNativeCopyBytes(policy.trustRoot2)
+    msquicNativeClientTrustRoot3Cache = msquicNativeCopyBytes(policy.trustRoot3)
     msquicNativeClientCertChainCountCache = policy.certChainCount
-    msquicNativeClientCert0Cache = policy.certChain0
-    msquicNativeClientCert1Cache = policy.certChain1
-    msquicNativeClientCert2Cache = policy.certChain2
-    msquicNativeClientCert3Cache = policy.certChain3
+    msquicNativeClientCert0Cache = msquicNativeCopyBytes(policy.certChain0)
+    msquicNativeClientCert1Cache = msquicNativeCopyBytes(policy.certChain1)
+    msquicNativeClientCert2Cache = msquicNativeCopyBytes(policy.certChain2)
+    msquicNativeClientCert3Cache = msquicNativeCopyBytes(policy.certChain3)
     msquicNativeClientLeafKeyKindCache = policy.certLeafKeyKind
-    msquicNativeClientPrivateKeyCache = policy.certPrivateKey
+    msquicNativeClientPrivateKeyCache = msquicNativeCopyBytes(policy.certPrivateKey)
 
 fn msquicNativeClientTrustRootAtCache(idx: int32): Bytes =
     if idx == 0:
@@ -1143,19 +1138,19 @@ fn msquicNativeResetServerPolicyCache() =
 fn msquicNativeSetServerPolicyCache(policy: MsQuicTlsPolicy) =
     msquicNativeServerCertChainCountCache = policy.certChainCount
     msquicNativeServerLeafKeyKindCache = policy.certLeafKeyKind
-    msquicNativeServerPrivateKeyCache = policy.certPrivateKey
+    msquicNativeServerPrivateKeyCache = msquicNativeCopyBytes(policy.certPrivateKey)
     msquicNativeServerTrustRootsCountCache = policy.trustRootsCount
-    msquicNativeServerTrustRoot0Cache = policy.trustRoot0
-    msquicNativeServerTrustRoot1Cache = policy.trustRoot1
-    msquicNativeServerTrustRoot2Cache = policy.trustRoot2
-    msquicNativeServerTrustRoot3Cache = policy.trustRoot3
+    msquicNativeServerTrustRoot0Cache = msquicNativeCopyBytes(policy.trustRoot0)
+    msquicNativeServerTrustRoot1Cache = msquicNativeCopyBytes(policy.trustRoot1)
+    msquicNativeServerTrustRoot2Cache = msquicNativeCopyBytes(policy.trustRoot2)
+    msquicNativeServerTrustRoot3Cache = msquicNativeCopyBytes(policy.trustRoot3)
     if policy.certChainCount > 0:
-        msquicNativeServerLeafDerCache = policy.certChain0
+        msquicNativeServerLeafDerCache = msquicNativeCopyBytes(policy.certChain0)
     else:
         msquicNativeServerLeafDerCache = emptyBytes()
-    msquicNativeServerCert1Cache = policy.certChain1
-    msquicNativeServerCert2Cache = policy.certChain2
-    msquicNativeServerCert3Cache = policy.certChain3
+    msquicNativeServerCert1Cache = msquicNativeCopyBytes(policy.certChain1)
+    msquicNativeServerCert2Cache = msquicNativeCopyBytes(policy.certChain2)
+    msquicNativeServerCert3Cache = msquicNativeCopyBytes(policy.certChain3)
 
 fn msquicNativeServerCertAtCache(idx: int32): Bytes =
     if idx == 0:
@@ -1199,6 +1194,7 @@ fn msquicNativeConnId(tag: int32): Bytes =
 fn msquicNativeEnsureInit() =
     if msquicNativeReady:
         return
+    msquicNativeDebugTls13 = os.GetEnvDefault("CHENG_MSQUIC_DEBUG_TLS13", "") == "1"
     datapath_runtime.initMsQuicDatapathRuntimeInto(msquicNativeDatapathRt)
     msquicNativeListenerSettings = initMsQuicSettings()
     msquicNativeListenAddr = msquicNativeEmptyAddr()
@@ -2251,12 +2247,30 @@ fn msquicNativeProcessPacketFill(
     let packetTypeCode: int32 = msquicNativePacketTypeCode(headerDec.header.packetType)
     if recvSide == msquicNativeServerSide:
         if packetTypeCode == msquicNativePacketInitialCode:
-            if !msquicNativeSession.active || msquicNativeSession.closed || !msquicNativeSession.serverBound:
+            let needInit: bool = !msquicNativeSession.active ||
+                                 msquicNativeSession.closed ||
+                                 !msquicNativeSession.serverBound
+            let replaceRemote: bool = !needInit &&
+                                      len(msquicNativeSession.clientAddrText) > 0 &&
+                                      fromAddr != msquicNativeSession.clientAddrText
+            if replaceRemote:
+                if msquicNativeDebugTls13:
+                    let debugText: str = "msquic_native_debug replace_server_session old=" +
+                                         msquicNativeSession.clientAddrText +
+                                         " new=" +
+                                         fromAddr
+                    msquicNativeDebugWriteLine(debugText)
+                msquicNativeSession.closed = true
+                msquicNativeRecycleClosedSession()
+            if needInit || replaceRemote:
                 let initRes: Result[bool] = msquicNativeInitServerSession(fromAddr, headerDec.header)
                 if IsErr(initRes):
                     msquicNativeResultErrorScratch = ErrorText(initRes)
                     return false
         elif !msquicNativeSession.active || msquicNativeSession.closed || !msquicNativeSession.serverBound:
+            return true
+        elif len(msquicNativeSession.clientAddrText) > 0 &&
+             fromAddr != msquicNativeSession.clientAddrText:
             return true
     let payloadOffset: int32 = headerDec.next
     let wireLen: int32 = bytesLen(wire)
@@ -2583,7 +2597,7 @@ fn msquicNativeStartListener(addr: MultiAddress, settings: MsQuicSettings, tlsPo
     msquicNativeListenerDatapathId = id
     msquicNativeListenerRunning = true
     msquicNativeListenerSettings = settings
-    msquicNativeListenerTlsPolicy = tlsPolicy
+    msquicNativeListenerTlsPolicy = msquicNativeCopyTlsPolicy(tlsPolicy)
     let boundText: str = datapath_runtime.msquicDatapathUdpAddr(msquicNativeDatapathRt, id)
     msquicNativeListenAddr = msquicNativeAddrFromDatapathText(boundText, addr)
     return Ok[int32](id)

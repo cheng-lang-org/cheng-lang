@@ -22,6 +22,9 @@
 key = value
 ```
 
+这份 `stage1_bootstrap.cheng` 是 bootstrap 合同清单，不是 lowering/codegen helper 真源码。
+真正的 helper 逻辑仍分别收在 `v3/bootstrap/cheng_v3_seed.c` 和 ordinary `v3/src/**` 里。
+
 规则：
 
 - 空行忽略

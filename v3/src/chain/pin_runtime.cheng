@@ -31,7 +31,7 @@ type
         lastChallengeCid: layout.FixedBytes32
         lastProofCid: layout.FixedBytes32
         lastSettlementCid: layout.FixedBytes32
-        lastSettledEpoch: int32
+        lastSettledEpoch: int32 = -1
         lastStatus: int32
         closed: bool
 
@@ -55,49 +55,8 @@ type
         proofs: pin.V3PinProof[]
         settlements: pin.V3PinSettlement[]
 
-fn v3PinRuntimeShardEntryZero(): V3PinRuntimeShardEntry =
-    return V3PinRuntimeShardEntry(
-        manifestCid: layout.fixedBytes32Zero(),
-        shardIndex: 0,
-        shardCid: layout.fixedBytes32Zero(),
-        payloadLen: 0,
-        payload: emptyBytes()
-    )
-
-fn v3PinRuntimeScheduleZero(): V3PinRuntimeSchedule =
-    var out: V3PinRuntimeSchedule
-    out.offerCid = layout.fixedBytes32Zero()
-    out.acceptCid = layout.fixedBytes32Zero()
-    out.manifestCid = layout.fixedBytes32Zero()
-    out.nextChallengeEpoch = 0
-    out.challengeTimeoutEpochs = 0
-    out.maxRetryCount = 0
-    out.retryCount = 0
-    out.pendingChallengeCid = layout.fixedBytes32Zero()
-    out.pendingChallengeEpoch = 0
-    out.pendingDeadlineEpoch = 0
-    out.lastChallengeCid = layout.fixedBytes32Zero()
-    out.lastProofCid = layout.fixedBytes32Zero()
-    out.lastSettlementCid = layout.fixedBytes32Zero()
-    out.lastSettledEpoch = -1
-    out.lastStatus = 0
-    out.closed = false
-    return out
-
-fn v3PinRuntimeStepResultZero(): V3PinRuntimeStepResult =
-    var out: V3PinRuntimeStepResult
-    out.acceptCid = layout.fixedBytes32Zero()
-    out.challengeCid = layout.fixedBytes32Zero()
-    out.proofCid = layout.fixedBytes32Zero()
-    out.settlementCid = layout.fixedBytes32Zero()
-    out.outcomeKind = 0
-    out.retryCount = 0
-    out.nextChallengeEpoch = 0
-    out.closed = false
-    return out
-
 fn v3PinRuntimeSchedulePending(schedule: V3PinRuntimeSchedule): bool =
-    return !layout.fixedBytes32Equal(schedule.pendingChallengeCid, layout.fixedBytes32Zero())
+    return !layout.fixedBytes32Equal(schedule.pendingChallengeCid, layout.FixedBytes32())
 
 fn v3PinRuntimeInit(): V3PinRuntime =
     var out: V3PinRuntime
@@ -228,7 +187,7 @@ fn v3PinRuntimeStoreShardResponse(runtime: var V3PinRuntime,
                                    response.manifestCid,
                                    response.shardIndex,
                                    response.shardCid)
-    var entry = v3PinRuntimeShardEntryZero()
+    var entry = V3PinRuntimeShardEntry()
     entry.manifestCid = response.manifestCid
     entry.shardIndex = response.shardIndex
     entry.shardCid = response.shardCid
@@ -351,7 +310,7 @@ fn v3PinRuntimeStoreChallengerState(runtime: var V3PinRuntime,
     if firstChallengeEpoch > accept.retainedUntilEpoch:
         return Err[bool]("v3 pin runtime: first challenge after retained epoch")
     let pos = v3PinRuntimeSchedulePos(runtime, accept.acceptCid)
-    var schedule = v3PinRuntimeScheduleZero()
+    var schedule = V3PinRuntimeSchedule()
     schedule.offerCid = offer.offerCid
     schedule.acceptCid = accept.acceptCid
     schedule.manifestCid = manifest.manifestCid
@@ -416,7 +375,7 @@ fn v3PinRuntimeShardPayload(runtime: V3PinRuntime,
     return Ok[Bytes](runtime.shards[pos].payload)
 
 fn v3PinRuntimeTimeoutProof(challenge: pin.V3PinChallenge): pin.V3PinProof =
-    var proof = pin.v3PinProofZero()
+    var proof = pin.V3PinProof()
     proof.challengeCid = challenge.challengeCid
     proof.acceptCid = challenge.acceptCid
     proof.manifestCid = challenge.manifestCid
@@ -524,7 +483,7 @@ fn v3PinRuntimeCompleteChallenge(runtime: var V3PinRuntime,
                                                          proof)
     if IsErr(settlementStoreRes):
         return Err[V3PinRuntimeStepResult](Error(settlementStoreRes))
-    schedule.pendingChallengeCid = layout.fixedBytes32Zero()
+    schedule.pendingChallengeCid = layout.FixedBytes32()
     schedule.pendingChallengeEpoch = 0
     schedule.pendingDeadlineEpoch = 0
     schedule.retryCount = 0
@@ -539,7 +498,7 @@ fn v3PinRuntimeCompleteChallenge(runtime: var V3PinRuntime,
         if schedule.nextChallengeEpoch > accept.retainedUntilEpoch:
             schedule.closed = true
     runtime.schedules[schedulePos] = schedule
-    var out = v3PinRuntimeStepResultZero()
+    var out = V3PinRuntimeStepResult()
     out.acceptCid = acceptCid
     out.challengeCid = challenge.challengeCid
     out.proofCid = proof.proofCid
@@ -581,7 +540,7 @@ fn v3PinRuntimeNoteChallengeFailure(runtime: var V3PinRuntime,
     schedule.retryCount = schedule.retryCount + 1
     if schedule.retryCount <= schedule.maxRetryCount && nowEpoch < schedule.pendingDeadlineEpoch:
         runtime.schedules[schedulePos] = schedule
-        var retry = v3PinRuntimeStepResultZero()
+        var retry = V3PinRuntimeStepResult()
         retry.acceptCid = acceptCid
         retry.challengeCid = challenge.challengeCid
         retry.retryCount = schedule.retryCount
@@ -611,7 +570,7 @@ fn v3PinRuntimeNoteChallengeFailure(runtime: var V3PinRuntime,
                                                          timeoutProof)
     if IsErr(settlementStoreRes):
         return Err[V3PinRuntimeStepResult](Error(settlementStoreRes))
-    schedule.pendingChallengeCid = layout.fixedBytes32Zero()
+    schedule.pendingChallengeCid = layout.FixedBytes32()
     schedule.pendingChallengeEpoch = 0
     schedule.pendingDeadlineEpoch = 0
     schedule.lastProofCid = timeoutProof.proofCid
@@ -620,7 +579,7 @@ fn v3PinRuntimeNoteChallengeFailure(runtime: var V3PinRuntime,
     schedule.lastStatus = settlement.status
     schedule.closed = true
     runtime.schedules[schedulePos] = schedule
-    var out = v3PinRuntimeStepResultZero()
+    var out = V3PinRuntimeStepResult()
     out.acceptCid = acceptCid
     out.challengeCid = challenge.challengeCid
     out.proofCid = timeoutProof.proofCid

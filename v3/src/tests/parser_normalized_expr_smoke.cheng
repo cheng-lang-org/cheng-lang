@@ -6,13 +6,13 @@ import cheng/v3/tooling/path as v3path
 fn main(): int32 =
     let root = os.GetCurrentDir()
     let fixturePath = v3path.V3PathJoin(root, "v3/src/tests/parser_normalized_expr_fixture.cheng")
-    var layer = parser.v3NormalizedExprLayerZero()
+    var layer = parser.V3NormalizedExprLayer()
     var err = ""
     assert(parser.v3ParserReadNormalizedExprLayerFromPath(fixturePath, layer, err),
            "v3 parser normalized expr: read layer")
     let fixtureLines = strutil.Split(os.ReadFile(fixturePath), '\n')
     assert(layer.sourceCount == 1, "v3 parser normalized expr: source count")
-    assert(parser.v3NormalizedExprLayerExprCount(layer) == 17, "v3 parser normalized expr: expr count")
+    assert(parser.v3NormalizedExprLayerExprCount(layer) == 21, "v3 parser normalized expr: expr count")
     assert(parser.v3NormalizedExprLayerIfCount(layer) == 4, "v3 parser normalized expr: if count")
     assert(parser.v3NormalizedExprLayerRangeCount(layer) == 2, "v3 parser normalized expr: range count")
     assert(parser.v3NormalizedExprLayerComprehensionCount(layer) == 1, "v3 parser normalized expr: comprehension count")
@@ -20,6 +20,8 @@ fn main(): int32 =
     assert(parser.v3NormalizedExprLayerResultIntrinsicCount(layer) == 3, "v3 parser normalized expr: result intrinsic count")
     assert(parser.v3NormalizedExprLayerCallCount(layer) == 3, "v3 parser normalized expr: call count")
     assert(parser.v3NormalizedExprLayerTryCount(layer) == 1, "v3 parser normalized expr: try count")
+    assert(parser.v3NormalizedExprLayerDefaultInitCount(layer) == 2, "v3 parser normalized expr: default init count")
+    assert(parser.v3NormalizedExprLayerConstructorCount(layer) == 2, "v3 parser normalized expr: constructor count")
     assert(layer.questionResidualCount == 0, "v3 parser normalized expr: question normalized")
     assert(layer.exprs[0].exprId != "", "v3 parser normalized expr: expr id")
     assert(layer.exprs[0].endLineNumber == layer.exprs[0].lineNumber, "v3 parser normalized expr: same line span")
@@ -55,6 +57,20 @@ fn main(): int32 =
            "v3 parser normalized expr: local call")
     assert(parser.v3NormalizedExprLayerHasCallExpr(layer, parser.v3NormalizedExprSurfaceCallMember, 18),
            "v3 parser normalized expr: member call")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprDefaultInit,
+                                                    parser.v3NormalizedExprDetailNone,
+                                                    30),
+           "v3 parser normalized expr: object default init")
+    assert(parser.v3NormalizedExprLayerHasExprExact(layer,
+                                                    parser.v3NormalizedExprDefaultInit,
+                                                    parser.v3NormalizedExprDetailNone,
+                                                    31),
+           "v3 parser normalized expr: tuple default init")
+    assert(parser.v3NormalizedExprLayerHasConstructorExpr(layer, 34),
+           "v3 parser normalized expr: object constructor")
+    assert(parser.v3NormalizedExprLayerHasConstructorExpr(layer, 35),
+           "v3 parser normalized expr: tuple constructor")
     var sawImportcCallSurface = false
     var sawLocalCallSurface = false
     var sawMemberReason = false
@@ -64,6 +80,10 @@ fn main(): int32 =
     var sawFmtArrayCallShape = false
     var sawFmtPrefixCallShape = false
     var sawComprehensionShape = false
+    var sawObjectDefaultInit = false
+    var sawTupleDefaultInit = false
+    var sawObjectConstructor = false
+    var sawTupleConstructor = false
     for i in 0..<layer.exprs.len:
         let expr = layer.exprs[i]
         var lineRaw = ""
@@ -173,6 +193,26 @@ fn main(): int32 =
             assert(mode == "fmt_call", "v3 parser normalized expr: fmt prefix mode")
             assert(args == "filtered", "v3 parser normalized expr: fmt prefix args")
             sawFmtPrefixCallShape = true
+        if expr.kind == parser.v3NormalizedExprDefaultInit && expr.lineNumber == 30:
+            assert(parser.v3NormalizedExprDefaultInitType(expr) == "SurfaceWrap",
+                   "v3 parser normalized expr: object default init type")
+            sawObjectDefaultInit = true
+        if expr.kind == parser.v3NormalizedExprDefaultInit && expr.lineNumber == 31:
+            assert(parser.v3NormalizedExprDefaultInitType(expr) == "SurfacePair",
+                   "v3 parser normalized expr: tuple default init type")
+            sawTupleDefaultInit = true
+        if expr.kind == parser.v3NormalizedExprConstructor && expr.lineNumber == 34:
+            assert(parser.v3NormalizedExprConstructorType(expr) == "SurfaceWrap",
+                   "v3 parser normalized expr: object constructor type")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: object constructor arg count")
+            assert(expr.callArgsText == "count: localCount", "v3 parser normalized expr: object constructor args")
+            sawObjectConstructor = true
+        if expr.kind == parser.v3NormalizedExprConstructor && expr.lineNumber == 35:
+            assert(parser.v3NormalizedExprConstructorType(expr) == "SurfacePair",
+                   "v3 parser normalized expr: tuple constructor type")
+            assert(expr.callArgCount == 1, "v3 parser normalized expr: tuple constructor arg count")
+            assert(expr.callArgsText == "a: localPair", "v3 parser normalized expr: tuple constructor args")
+            sawTupleConstructor = true
         if expr.kind != parser.v3NormalizedExprCall:
             continue
         assert(expr.detailKind == parser.v3NormalizedExprDetailNone,
@@ -206,11 +246,15 @@ fn main(): int32 =
     assert(sawFmtArrayCallShape, "v3 parser normalized expr: saw fmt array call shape")
     assert(sawFmtPrefixCallShape, "v3 parser normalized expr: saw fmt prefix call shape")
     assert(sawComprehensionShape, "v3 parser normalized expr: saw comprehension shape")
+    assert(sawObjectDefaultInit, "v3 parser normalized expr: saw object default init")
+    assert(sawTupleDefaultInit, "v3 parser normalized expr: saw tuple default init")
+    assert(sawObjectConstructor, "v3 parser normalized expr: saw object constructor")
+    assert(sawTupleConstructor, "v3 parser normalized expr: saw tuple constructor")
     assert(sawImportcCallSurface, "v3 parser normalized expr: saw importc call surface")
     assert(sawLocalCallSurface, "v3 parser normalized expr: saw local call surface")
     assert(sawMemberReason, "v3 parser normalized expr: saw member call reason")
 
-    var syntheticCallLayer = parser.v3NormalizedExprLayerZero()
+    var syntheticCallLayer = parser.V3NormalizedExprLayer()
     parser.v3NormalizedExprLayerAppendCall(syntheticCallLayer,
                                            fixturePath,
                                            99,
@@ -272,6 +316,28 @@ fn main(): int32 =
            "v3 parser normalized expr: synthetic call detail empty second")
     assert(syntheticCallLayer.exprs[0].exprId != syntheticCallLayer.exprs[1].exprId,
            "v3 parser normalized expr: call expr id uses structured facts")
+
+    var syntheticConstructorLayer = parser.V3NormalizedExprLayer()
+    parser.v3NormalizedExprLayerAppendConstructor(syntheticConstructorLayer,
+                                                  fixturePath,
+                                                  120,
+                                                  9,
+                                                  "SurfaceWrap",
+                                                  "count: 7",
+                                                  1,
+                                                  false,
+                                                  27)
+    parser.v3NormalizedExprLayerAppendConstructor(syntheticConstructorLayer,
+                                                  fixturePath,
+                                                  120,
+                                                  9,
+                                                  "SurfaceWrap",
+                                                  "count: 7",
+                                                  1,
+                                                  false,
+                                                  27)
+    assert(parser.v3NormalizedExprLayerExprCount(syntheticConstructorLayer) == 1,
+           "v3 parser normalized expr: constructor dedup")
 
     var emptyProfile: parser.V3NormalizedExprCallProfile
     var emptyProfiles: parser.V3NormalizedExprCallProfile[]

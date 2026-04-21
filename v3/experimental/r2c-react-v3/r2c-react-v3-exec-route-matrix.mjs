@@ -778,7 +778,7 @@ function main() {
       throw new Error('unsupported route catalog format');
     }
   }
-  if (!routeCatalog || !codegenManifestPath) {
+  if (!routeCatalog) {
     if (!args.tsxAstPath) {
       throw new Error('missing --tsx-ast for route derivation');
     }

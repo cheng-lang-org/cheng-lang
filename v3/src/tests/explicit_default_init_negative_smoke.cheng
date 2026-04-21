@@ -1,0 +1,87 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/strings as strings
+
+fn ensureDir(path: str) =
+    if !os.DirExists(path):
+        os.CreateDir(path)
+
+fn currentExecutablePath(root: str): str =
+    let raw = cmdline.ProgramName()
+    if len(raw) <= 0:
+        return ""
+    if os.IsAbsolute(raw):
+        return raw
+    return os.JoinPath(root, raw)
+
+fn compileNegativeFixture(compiler: str,
+                          root: str,
+                          inputPath: str,
+                          outputPath: str,
+                          logPath: str): os.ExecCmdResult =
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    var compileArgv: str[]
+    add(compileArgv, "system-link-exec")
+    add(compileArgv, "--root")
+    add(compileArgv, root)
+    add(compileArgv, "--in")
+    add(compileArgv, inputPath)
+    add(compileArgv, "--emit")
+    add(compileArgv, "exe")
+    add(compileArgv, "--target")
+    add(compileArgv, target)
+    add(compileArgv, "--out")
+    add(compileArgv, outputPath)
+    var compileEnv: str[]
+    let compileRes = hostos.ExecFileCapture(compiler, compileArgv, compileEnv, root, true, 60)
+    os.WriteFile(logPath, os.ExecCmdResultOutput(compileRes))
+    return compileRes
+
+fn expectRejected(compiler: str,
+                  root: str,
+                  outDir: str,
+                  fixtureName: str) =
+    let stem = fixtureName
+    let logPath = os.JoinPath(outDir, stem + ".compile.log")
+    let inputPath = os.JoinPath(root, "v3/src/tests/" + fixtureName)
+    let outputPath = os.JoinPath(outDir, stem)
+    let res = compileNegativeFixture(compiler, root, inputPath, outputPath, logPath)
+    let output = os.ExecCmdResultOutput(res)
+    assert(os.ExecCmdResultExitCode(res) != 0,
+           "v3 explicit default init negative: expected rejection " + fixtureName)
+    assert(strings.StrContains(output, "redundant explicit default init; omit initializer"),
+           "v3 explicit default init negative: diagnostic " + fixtureName + "\n" + output)
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let exePath = currentExecutablePath(root)
+    assert(len(exePath) > 0 && os.FileExists(exePath),
+           "v3 explicit default init negative: executable path")
+    let exeParts = os.SplitFile(exePath)
+    let outDir = os.JoinPath(exeParts.dir, exeParts.name + ".workspace")
+    ensureDir(outDir)
+    assert(os.DirExists(outDir), "v3 explicit default init negative: mkdir")
+
+    let compilerEnv = os.GetEnv("CHENG_V3_SMOKE_COMPILER")
+    var compilerRaw = "artifacts/v3_backend_driver/cheng"
+    if len(compilerEnv) > 0:
+        compilerRaw = compilerEnv
+    var compiler = compilerRaw
+    if !os.IsAbsolute(compilerRaw):
+        compiler = os.JoinPath(root, compilerRaw)
+    assert(os.FileExists(compiler),
+           "v3 explicit default init negative: compiler exists")
+
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_bool_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_int_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_str_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_seq_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_fixed_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_object_binding.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_field_bool.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_field_seq.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_field_object.cheng")
+    expectRejected(compiler, root, outDir, "explicit_default_init_negative_tuple_elem.cheng")
+    echo("v3 explicit_default_init_negative_smoke ok")
+    return 0

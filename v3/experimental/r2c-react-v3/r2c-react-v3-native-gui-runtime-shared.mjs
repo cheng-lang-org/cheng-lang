@@ -360,7 +360,7 @@ fn r2cNativeGuiResizeObserverHostReady(): bool =
     return ${chengBool(Boolean(theme?.resize_observer_host_ready))}
 
 fn r2cNativeGuiReadFlag(key: str, defaultValue: str): str =
-    var out: str = ""
+    var out: str
     if r2cNativeGuiReadFlagValueBridge(key, out):
         return out
     return defaultValue
@@ -450,7 +450,7 @@ fn r2cNativeGuiMeasureContentHeight(state: R2cNativeGuiState): int32 =
     return maxBottom
 
 fn r2cNativeGuiVisibleItemCount(state: R2cNativeGuiState): int32 =
-    var count: int32 = 0
+    var count: int32
     let items = r2cNativeGuiItems()
     for i in 0..<items.len:
         if r2cNativeGuiItemVisible(state, items[i]):
@@ -735,7 +735,7 @@ fn r2cNativeGuiEmitStateJson(state: R2cNativeGuiState) =
 
 fn r2cNativeGuiEmitRenderPlanJson(state: R2cNativeGuiState) =
     let items = r2cNativeGuiItems()
-    var commandCount: int32 = 0
+    var commandCount: int32
     exec_io.r2cWriteStdout("{\\"format\\": \\"native_render_plan_v1\\"")
     exec_io.r2cWriteStdout(", \\"ready\\": true")
     exec_io.r2cWriteStdout(", \\"window_title\\": ")

@@ -1,0 +1,96 @@
+import std/system
+import std/os
+import std/strutils as strutil
+import std/rawbytes
+import std/monotimes
+import std/result
+import std/crypto/sha256
+import std/crypto/curve25519
+import std/crypto/ecnist
+import cheng/v3/std/crypto/fixed256
+import cheng/v3/std/bytes_layout as layout
+
+fn cryptoPerfEnvInt(name: str, defaultValue: int32): int32 =
+    let raw: str = os.GetEnvDefault(name, "")
+    if len(raw) <= 0:
+        return defaultValue
+    let parsed: int32 = int32(strutil.ParseInt(raw))
+    if parsed <= 0:
+        return defaultValue
+    return parsed
+
+fn cryptoPerfElapsedNs(start: monotimes.MonoTime): int64 =
+    return monotimes.MonoTimeNs(monotimes.GetMonoTime()) - monotimes.MonoTimeNs(start)
+
+fn cryptoPerfNsPerOp(elapsedNs: int64, iterations: int32): int64 =
+    if iterations <= 0:
+        return int64(-1)
+    return elapsedNs / int64(iterations)
+
+fn cryptoPerfEmit(name: str, elapsedNs: int64, iterations: int32) =
+    let nsPerOp: int64 = cryptoPerfNsPerOp(elapsedNs, iterations)
+    echo(name + " ns_per_op=" + int64ToStr(nsPerOp) + " iterations=" + intToStr(iterations))
+    echo(name + "_ns_per_op=" + int64ToStr(nsPerOp))
+
+fn main(): int32 =
+    let shaIters: int32 = cryptoPerfEnvInt("CHENG_V3_CRYPTO_PERF_SHA256_ITERS", 200)
+    let x25519Iters: int32 = cryptoPerfEnvInt("CHENG_V3_CRYPTO_PERF_X25519_ITERS", 2)
+    let p256PubIters: int32 = cryptoPerfEnvInt("CHENG_V3_CRYPTO_PERF_P256_PUB_ITERS", 1)
+    let p256SignIters: int32 = cryptoPerfEnvInt("CHENG_V3_CRYPTO_PERF_P256_SIGN_ITERS", 1)
+    let shaInput: Bytes = bytesFromString("cheng-v3-crypto-hot-kernel-sha256-input")
+    let alicePriv: Bytes = bytesFromString("12345678901234567890123456789012")
+    let p256PrivRes: Result[fixed256.Scalar256] = fixed256.scalar256FromHex(
+        "0000000000000000000000000000000000000000000000000000000000000001")
+    assert(IsOk(p256PrivRes), "v3 crypto perf: p256 private scalar")
+    let p256Priv: fixed256.Scalar256 = Value(p256PrivRes)
+    let p256Msg: Bytes = bytesFromString("cheng-v3-crypto-hot-kernel-p256-message")
+    var sink: int32
+
+    var shaStart = monotimes.GetMonoTime()
+    for i in 0..<shaIters:
+        let digest: Bytes = sha256.sha256Digest(shaInput)
+        assert(bytesLen(digest) == 32, "v3 crypto perf: sha256 digest len")
+        sink = sink + bytesGet(digest, i % 32)
+    let shaElapsedNs: int64 = cryptoPerfElapsedNs(shaStart)
+    cryptoPerfEmit("crypto_sha256", shaElapsedNs, shaIters)
+
+    var xStart = monotimes.GetMonoTime()
+    for i in 0..<x25519Iters:
+        let pubRes: Result[Bytes] = curve25519.curve25519PublicFromPrivate(alicePriv)
+        assert(IsOk(pubRes), "v3 crypto perf: x25519 pubkey")
+        let pub: Bytes = Value(pubRes)
+        assert(bytesLen(pub) == 32, "v3 crypto perf: x25519 pubkey len")
+        sink = sink + bytesGet(pub, i % 32)
+    let xElapsedNs: int64 = cryptoPerfElapsedNs(xStart)
+    cryptoPerfEmit("crypto_x25519_pubkey", xElapsedNs, x25519Iters)
+
+    var pPubStart = monotimes.GetMonoTime()
+    for i in 0..<p256PubIters:
+        let pubRes: Result[layout.FixedBytes65] = fixed256.p256PublicKey65FromPrivateScalar(p256Priv)
+        assert(IsOk(pubRes), "v3 crypto perf: p256 pubkey")
+        let pubBytes: Bytes = layout.fixedBytes65ToBytes(Value(pubRes))
+        assert(bytesLen(pubBytes) == 65, "v3 crypto perf: p256 pubkey len")
+        sink = sink + bytesGet(pubBytes, i % 65)
+    let pPubElapsedNs: int64 = cryptoPerfElapsedNs(pPubStart)
+    cryptoPerfEmit("crypto_p256_pubkey", pPubElapsedNs, p256PubIters)
+
+    let verifyPubRes: Result[layout.FixedBytes65] = fixed256.p256PublicKey65FromPrivateScalar(p256Priv)
+    assert(IsOk(verifyPubRes), "v3 crypto perf: p256 verify pubkey")
+    let verifyPubBytes: Bytes = layout.fixedBytes65ToBytes(Value(verifyPubRes))
+    var lastSig: Bytes
+    var pSignStart = monotimes.GetMonoTime()
+    for i in 0..<p256SignIters:
+        let sigRes: Result[layout.FixedBytes64] = fixed256.p256SignMessageFixed64(p256Priv, p256Msg)
+        assert(IsOk(sigRes), "v3 crypto perf: p256 sign")
+        let sigBytes: Bytes = layout.fixedBytes64ToBytes(Value(sigRes))
+        assert(bytesLen(sigBytes) == 64, "v3 crypto perf: p256 sign len")
+        lastSig = sigBytes
+        sink = sink + bytesGet(sigBytes, i % 64)
+    let pSignElapsedNs: int64 = cryptoPerfElapsedNs(pSignStart)
+    cryptoPerfEmit("crypto_p256_sign", pSignElapsedNs, p256SignIters)
+    assert(ecnist.ecdsaVerifyTrustedBytes(verifyPubBytes, p256Msg, lastSig),
+           "v3 crypto perf: p256 sign verify")
+
+    echo("sink=" + intToStr(sink))
+    echo("v3 crypto_hot_kernel_perf_smoke ok")
+    return 0

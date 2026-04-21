@@ -1,205 +1,83 @@
 # Lessons
 
-## 总原则
+- 热核优化先找跨样本共享的字节搬运边界；已有 `RawmemCopy/RawmemSet` 时，不要新增 C bridge，不要调松阈值，也不要继续让固定长度 copy 走逐字节 `bytesGet/bytesSet`。
 
-- 如果当前 seed/ordinary 对“模块 enum 常量直接出现在 test main 的 `let` 或 call arg”不稳，就不要在 smoke 里硬写常量；把判断收进模块 helper，让 smoke 只消费布尔事实。
-- 对真实 surface 上很冷、很难自然命中的枚举分支，直接补最小直探针比硬造大 fixture 更稳；像 `v3ParserResolveCallTarget(...)->unknown_external_target/unknown_call_target` 这类就该单点直钉。
-- 单一真源优先：同一事实不要在 parser、typed、lowering、seed、wasm 各猜一份。
-- 能显式 unknown 就显式 unknown，不要拿空串、布尔值或文本猜测冒充已知语义。
-- 复合值优先按地址语义思考，不要在热路径上混用按值/按句柄/按临时槽。
-- 验收看 fresh 闭环和正式 smoke，不看一次性现场。
+- 低层 bulk-copy helper 不能静默失败；nil、负 offset、越界必须断言暴露，否则 perf 修复会把真实内存错误藏起来。
 
-## 当前稳定经验
+- perf/memory 报告要把口径分开：编译理论下界看 `planner_total_ms`，运行时内存看 ORC retain/release 与 alloc/free/live，crypto 热核看 `crypto_hot_kernel_contract` 的 ns/op；Cheng 没有 tracing GC，别再写 GC perf。
 
-- 中间层如果只是把 `typed_expr` 的 clone/equal/validate/filter/count 再转发一遍，就直接删；保留这种 convenience helper，等于主动把真源再复制一层。
-- 像 `system_link_plan -> target_matrix` 这种同文件私有转发壳，只要没有新增语义，就不要写；正式热路径直接问真模块更稳，也更不容易把 ordinary/seed 的调用解析面放大。
-- `typed_expr` 已经持有 finite-domain 的 generic count/text 真语义时，一格一个 convenience helper 也要优先放回 `typed_expr`，不要再挂在 `compiler_csg` 这种中间层；否则 smoke/report 会继续绑第二套 API 面。
-- 如果 `lowering_plan` 或 `compiler_csg` 里的某组 browser ABI API 只是把 `rules/specs/plans` 再包成 manifest/source/slice 之类的派生视图，就直接删；收集留在 `compiler_csg`，过滤和格式化回 `browser_abi_rule` 真模块。
-- `system_link_exec` 这种正式消费 browser bridge plan 的热路径，只该向 `compiler_csg` 要 `rules/specs/plans` 集合；plan 的 manifest/source/emit line/unique key/format 一律直接问 `browser_abi_rule`，不要再保留 `compiler_csg` 薄壳。
-- `browser_abi_rule` 这种 schema/rule/plan 天生就是有限域矩阵的模块，不要先把 kind/stage/schema 存成文本再在 helper/codegen/smoke 里到处 strcmp；结构体里直接存 enum，文本只在 key/manifest/emit line 边界现算。
-- 如果某组有限域计数 helper 只是 `compiler_csg -> browser_abi_rule` 纯转发，就直接删掉，让 smoke 直接问真模块；这种薄壳虽然不改语义，但会继续扩散重复 API 面。
-- 像 `browser_abi_rule_smoke` 这种要验完整 schema 的 smoke，必须把目标 schema 源文件显式设成 `entryPath`；不然编译器会走“按外部触发裁剪”逻辑，测到的不是完整矩阵。
-- 对有限域事实，除了“字符串兼容口”要删，`compiler_csg` 这种中间层里那种“一格一个 count helper”的平行 API 也要删；统一成“单一 enum 计数入口”以后，report 和 smoke 才不会继续绑第二套表面。
-- 有限域一旦已经没有任何调用者在走“字符串 -> 枚举”，就直接删定义，不要留着当“也许以后有用”的兼容口；这类死 API 最容易把第二真源重新引回主链。
-- 一旦 parser 已经把某类 detail 真源改成 enum/结构字段，旧 smoke 里那种“手工改写历史文本字段再证明下游不受影响”的回归要直接删掉；继续维护它只会把旧存储形状重新绑回主线。
-- 验 parser 自己的枚举化收口时，先跑 parser smoke；如果 full host smoke 被已知 `typed_expr/ordinary` 红点拦住，不要把 unrelated 编译失败误判成这次 parser 改动的问题。
-- 不要把 `compiler_main` 这种还带旧闭包问题的控制面 main 直接 import 进正式产品节点；如果目的是统一宿主，先把真正稳定的 `system_link_exec / compiler_world_libp2p / compiler_equivalence / compiler_csg` 收成节点内 domain。
-- `libp2p host` 的 handler 面真相是 `supportedProtocols.len`；看到 surface 统计先回真实宿主结构核对，不要凭旧心智写假字段。
-- 要验 compiler equivalence/publish gate，最稳的闭环是让节点自己先产 `csg / surface / receipt`，再把这些报告反喂回 `prove-equivalence / publish-check`；不要再依赖外部脚本拼第二套证明输入。
-- parser/typed 之间只要是有限域事实，就直接用 enum；文本 helper 只留给 compat/report 边界，别在主链里做“文本 -> 枚举 -> 文本”往返。
-- parser 基础 helper 的参数类型必须和真实语义一一对应；括号匹配这种底座一旦拿 `str` 壳包住 `char` 语义，上层 `Fmt(...)`、comprehension 这类语法会静默整片掉节点。
-- parser 任何索引边界都不要赌短路；`i > 0`、`rightPos < len` 先拆成显式布尔，再访问左右邻居。
-- Harmony mobile-shell 启动不要赌 ArkUI 和 XComponent 生命周期先后；正式顺序是 `Index.ets aboutToAppear()` 先把 `getContext(this).resourceManager` 传进 native，native 先读 `rawfile/mobile_shell_launch_args.{kv,json}` 并调用 `cheng_mobile_host_runtime_set_launch_args(...)`，再让 `cheng_app_init()` 发生。
-- Harmony rawfile 路径常量可以保留 `rawfile/...` 形状做生成真源，但 `OH_ResourceManager_OpenRawFile(...)` 前必须剥掉 `rawfile/` 前缀，不然宿主拿不到资源。
-- `call expr` 最稳的真源是结构化 fact：`callee + args_text + arg_count + prefix_style`。
-- 这组 call 表面事实如果要跨 parser -> CSG -> lowering 传递，优先直接挂 `V3NormalizedExpr` 结构字段，不要继续塞进 `detail` 的 `key=value` 文本。
-- 当 parser 节点已经有 `callSurfaceKind/resolved/reason/target_source/importc` 这类结构字段时，layer 统计、typed 构建、CSG hash 要一起切过去；不能留一半结构字段、一半 `detail` 回扫。
-- parser 自己的 call 去重键、`exprId`、兼容 detail 也都要从结构字段现算，不要继续把存储里的 `expr.detail` 当 identity。
-- 这条线再往前收时，parser 真实产物里的 call `detail` 就直接留空；历史 compat 文本只在显式输出点现算，不要在行扫描时白造。
-- 一旦 compat 字段已经不再是主链输入，就把对应 append API 形参一起删掉；不然迟早又有人把旧真源塞回来。
-- 如果 compat 文本最终只是为了写进 `ByteBuf`，就直接流式写老协议，不要先造整条 `str` 再拷一遍。
-- 这类“实现换了但协议不变”的优化，必须补“新旧字节完全一致”的回归，不能只靠更高层 smoke 兜。
-- 验收这条线最稳的强回归是：把 parser layer 里的所有 call `detail` 清空后再建 typed facts，结果必须完全不变。
-- 同理，smoke/probe 也要跟着切到结构字段；否则主链已经单一真源，验收却还在喂旧真源。
-- 校验函数里的 fast path 一定要看清 `continue` 落点；只要把 call 主体误短路掉，整条“typed 对表 parser”就会变成假 gate。
-- `infer_expr_type` 不能做纯文本 cache；key 至少要带当前函数、源码行、local 数量。
-- `V3ExprPrepScratch` 这类大对象不能直接搬栈；只能做 lazy/pool/拆分。
-- `Bytes` 不能按类型直接判成 owning 或 borrowed；`bytesAlloc(...)` 和 `bytesFromString(...)` 共用同一表面，真正的 retain/release 语义现在由 runtime registry 判是不是托管块。
-- 遇到 `Bytes` 生命周期问题时，要先分清“runtime registry 边界”和“owner 赋值路径”到底是哪一层在红；`bytes_parent_copy_orc_smoke` 这轮证明过，手工 `memRelease(...)` 再接 ORC 赋值会制造双释放假红点，不能把测试误用当编译器 bug。
-- `cheng_v3_buffer_handle_from_raw_bridge(...)` 是复制语义，不是借用视图；源 `Bytes` 可以立刻 overwrite/release，这条边界现在要靠 `bytes_buffer_handle_copy_smoke` 钉住。
-- 同一份源缓冲连续注册多个 `buffer handle` 时，快照时机在“注册 handle 当下”，不是后面的 decode；早注册的 handle 必须看到旧值，晚注册的 handle 必须看到新值，而且两次 decode 出来的 `Bytes` 也必须彼此独立。
-- FFI/raw-handle 这层还要单独钉 generation：同槽复用后，新 handle 必须拿到 `generation + 1`，旧 handle 必须进 `detail=stale` trap，不能只停在“released”。
-- `layout.byteBufToBytes(...)` 和 `layout.byteSpanToBytes(...)` 也必须维持 owning copy；要测这条边界时，`byteSpan` 侧要直接喂 borrowed `bytesSliceView(...)`，不要先 `byteSpanFromBytes(owningBytes)` 再把“中间持有者多 retain 一次”误判成 copy 语义回归。
-- `build-ffi-handle` 这类需要最新 fixture 语义的命令，不能继续无脑 forward 给旧 `stage3`；当前稳定口径是在 `backend_driver_main` 本地直接编译/运行 fixture，而且要同时覆盖普通成功、generation reuse 成功、released trap、stale trap 四条边界。
-- 只要发射期会临时 `sub sp` 去物化调用结果或 assignment clone，局部槽、`var` 字段、参数 helper 取址就必须走稳定 frame base，不能直接拿当前 `sp` 当真源；这条现在由 `bytebuf_view_smoke`、`bytebuf_len_probe_smoke`、`bytes_param_helper_smoke`、`wrapper_*_varparam_smoke` 钉住。
-- 一旦重载解析已经选中了具体函数，后面的 prepare/codegen 就不能再退回 `symbol_text` 二次找目标；`[]/[]=`、`JsonNode` 这类共享表面名必须带着 `selected_function_index` 和参数签名快照一路传下去。
-- 带 `\0` 分隔的 argv / host-process wire 是二进制协议；分隔符必须直接写 raw byte，不能绕 `str` helper、`CharToStr` 或“先拼字符串再转 bytes”这类路径。
-- ORC record 生命周期里，父对象地址不是跨 `cheng_mem_retain/release` 稳定的寄存器值；helper 调用之后只能从稳定 spill/frame reload，不能把 call-clobbered 的 `addr_reg` 重新写回 spill。
-- fixed array 里的 `grid.items[i].payload = bytesAlloc(...)` 这种 `Bytes` lvalue materialize 现在还不在 ordinary 主链支持面上；容器写边界先别往这条形状硬推。
-- seed/selfhost 现在不要写 `discard foo()`；这条写法会直接炸 seed lowering。
-- parser 热循环里不要按值复制复合结构；直接按字段读。
-- parser 里所有只依赖文本的判断，优先 exact/range，不要 `trim -> firstToken -> slice` 连环调用。
-- call 行扫描必须先过硬条件，再切字符串；`hasCallParen` 前不要急着造 `callName/qualifier/dotted`。
-- report 和 smoke 里的 call 统计不要再手写第二套枚举；直接复用 parser 的结构字段，不要回扫 `detail`。
-- 但 `compiler_csg/lowering_plan` 不该长期直接回扫 `expr.detail`；`resolved/reason/target_source/target_importc` 这组 call 归因要前移进 typed fact，再由 report 从 typed fact 出数。
-- 同一条原则继续往前推时，`call callee/target` 也应该进 typed fact；typed return inference 直接吃 fact 字段，比在各处再拆 `expr.detail` 稳。
-- 再往前一步时，`qualifier` 也该进 typed fact；qualified external/member 的 typed 推断优先吃 `qualifier + callee`，不要继续把 `target` 当原始字符串来回切。
-- 顶层函数声明、import 行、grouped import 这类固定语法，优先单次 trim 后原位判定。
-- 非 import / 非 top-level fn 这种绝大多数行，不要先造整条 trimmed 字符串；先用 range 判定，命中后再切。
-- qualified shadow 这类逻辑优先比较 range，不要先切 `rootQualifier` 子串。
-- module path 这类路径文本，不要走 `split/trim/join`；exact builder 更稳。
-- parser 里任何索引边界都不要赌短路；显式拆开判断。
-- `V3ExprPrepScratch` 里像 `args[32][4096]` 这种 call-only 巨块，不要继续常驻内嵌；按需 slab + 线程本地 free-list 是稳定收益。
-- wrapper 外层如果最终还是要把大对象放进 `scratch`，就直接写进 `scratch` 本体，不要先放一份局部再整份复制。
-- 当 `prepare scratch` 已经把二次 infer、死字段、整块清零、allocator 抖动、call-only 巨块都收掉后，就该停；继续围着这条线磨，通常已经不是理论上的最大头。
-- 正式 `system-link-exec` 的 phase 真源在 seed/C 命令路径，不在 Cheng `compiler_main` 旁路。
-- 编译理论下界只能引用 `planner_total_ms <= compile_elapsed_ms` 的正式 `system-link-exec` phase 样本；当前稳定可引用的是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`。
-- ORC alloc/free/live 计数如果在 `echo` 前还继续做字符串格式化，数字会被噪声污染；先冻结 delta，再输出。
+- `lower generic function` 的排除不能只靠原始文本启发式；必须在规格化后先确认“这不是已知类型面”，否则会把 `elemSize[T]()` 误杀成 `seq/fixed-array T()`，或者反过来把真实 `T[]()/T[N]()` 放走。
 
-## 验证口径
+- ordinary parser 里会被 seed no-handoff 直编的 helper，尽量写成单次 trim + 线性循环；不要堆重复 `Trim/FindFirst/IdentPrefix` 大表达式，否则很容易炸在 `prepare binding infer type failed`。
 
-- 改 seed/backend 后，固定流程是：
-  - `stage0 compile`
-  - `bootstrap-bridge`
-  - fresh `stage2 no-handoff` host smokes
-- 跑 `perf_memory_contract_smoke` 时，当前主线必须显式钉：
-  - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2`
-- 文档或本地 skill 镜像一旦改了，必须立刻跑：
-  - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
-- 需要定热点时直接用真实可执行的 `/usr/bin/time -l` 和 `sample`，不要靠感觉猜。
-- sample 挪走热点不等于正式 gate 就一定更好；只要 perf gate 回弹，实验必须立即撤回。
-- 顶层 `scalar function` 发射和 `v3_emit_non_if_statement(...)` 不能机械并线；哪怕核心 smoke 过了，`perf_memory_contract_smoke` 也会在 `host_ops/os_host_process` 这条正式链路上把回归炸出来。先补齐逐类 parity，再谈收口。
-- analysis smoke 如果只验 `exprLayer/typedExprFacts/export surface`，就直接构最小 CSG；不要在 smoke helper 里重复做 source bundle hash 和整图 CID。
-- ordinary 当前对“`if ... else` 直接作为复合实参传给函数”这类形状还不稳；像 CSG append/hash 这种热路径，先拆成局部字符串再传，别把发射红点误判成模型设计问题。
+- parser normalized layer 可能覆盖整个 source closure；写针对单个 fixture 的断言时，用 `sourcePath + lineNumber` 过滤，不要用全局 count 判断某一行没有被误分类。
 
-## 当前不要碰
+- 会检查 backend-driver handoff 的 smoke 必须同时传 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=0` 和 `CHENG_V3_BACKEND_DRIVER_FORWARD_LOG`，写独立 artifact；不要再读全局 `artifacts/v3_forward/backend_driver.forward.log` 来证明路由。
 
-- `Bytes[] add/setLen` 高风险支线
-- 大对象上栈
-- parser probe 级微调
-- 任何降级、兜底、启发式补丁
+- seed 里如果需要从表达式文本认 `default-init/constructor/ref-object/scalar-type-call`，只能保留一条 `expr -> type-call surface` 入口；不要再长出 `parse_default_expr_text_with_context(...)` 这种 default-init 专用薄壳。
 
-## cheng_node / libp2p / VPN
+- `v3/bootstrap/stage1_bootstrap.cheng` 只是 bootstrap 合同清单，不是 helper 源码；需要固定 seed 行为时，应重编 `cheng.stage0` / `bootstrap-bridge`，不要误改 manifest 期待同步逻辑。
 
-- `bytesFromString(...)` 是借用视图，不是 owning copy；只要 payload 要进 host store、跨 actor、跨函数或跨事件账本存活，就必须立刻复制成真正的 `Bytes`。
-- `identify` 这种基础接入协议不要再绑 `trustedView`；trust 只影响可见地址和高权限面，不该把公开接入节点自己的基础资源导出封死。
-- ordinary 当前对 `while` 和显式局部变量更稳；`for` 变量出循环后继续用、或者 `Err(...)` 里内联长串拼接，都会更容易踩 primary object 红面。
-- 验收 `cheng_node ctl` 这种会写 state 的命令时，不能并发打同一个 state 文件；必须串行，不然结果只是在测最后一个写入者。
-- `cheng_node ctl` 里可选 flag 别名优先走 `readFlagOrDefault(...) + 空串判定`；不要把 `Result + IsOk/Value` 分支塞进同一个局部初始化，ordinary lowering 在这类形状上不稳。
-- 共享模块一旦 `@importc` 到移动宿主符号，host runtime 也必须同步补导出 stub；否则不是运行时才炸，而是普通主机链接直接失败。
-- DiLoCo wire/status 的字段名口径是下划线展开，不是点号路径；写 smoke 和 keyed query 断言时必须按真实 wire 名称来。
-- 旧独立模块并进 `cheng_node` 普通主闭包时，要先确认它自己也能走 ordinary 编译；如果 closure 因旧模块红掉，直接修旧模块，不要把它继续当“外部黑盒”。
-- `V3ChengNodeKeyedQueryText(...)` 用来验 `found/proof/payload_present` 很合适，但它返回的是 `payload_text_hex`；要核对 payload 正文时，直接用 index entry 的 `valueCid` 去读 object store。
-- `mobile_shell_codegen` 里只要文本内容本身含有 `</string>`、`<group>`、`\";` 这类片段，就不能再把“目标路径 + 大文本”一起交给通用写文件 helper；当前 ordinary 下很容易把路径串成文本片段目录。
-- iOS `project.pbxproj` / workspace 这类大文本文件，稳定做法是：
-  - 固定 `rootDir + relPath`
-  - 先建父目录
-  - 再生成文本并写入
-  - 不要先拼绝对路径再把它和大字符串一起传递。
-- `Info.plist` 这种 XML 文本也一样；只要正文里有 `</string>`，就必须和 `project.pbxproj` 一样走绝对路径直写，不能回到 `V3WriteTextFile(rootDir, relPath, payload)` 这条通用 helper。
-- 当前 ordinary 对 `os.Open(full, os.FmWrite)` 仍有 lowering 缺口；同语义场景优先用已经验证稳定的 `os.openImplWrite(full)`。
-- `mobile_shell_codegen_smoke` 如果看到“iOS 文件不存在”，先查 `/Users/lbcheng/cheng-lang` 根下有没有新冒出来的 `<`、`\";` 之类目录；这通常不是导出没跑，而是路径串台了。
-- `mobile-shell build-probe` 如果先报 rc=139，不要先怀疑平台构建器；先把失败路径里的 summary 拼接/写文件拿掉，不然 runtime 自己先炸，真实的 xcodebuild/gradle/hvigor 错误会被完全盖住。
-- `mobile_shell_runtime_contract_v1.json` 不能只留在导出根目录；平台宿主真正消费时，必须同步镜像进 Android `assets`、iOS `runtime/Resources`、Harmony `rawfile` 这三处真实打包目录。
-- iOS 只要把 runtime payload / bundle payload 写进 `Resources` build phase，就必须保证默认导出也有对应文件；没有外部输入时直接落 stub JSON，别把缺文件留给 `xcodebuild` 复制阶段才炸。
-- smoke 里校验 runtime manifest 常量时，必须按平台真实相对路径断言；iOS 是 `runtime/mobile_shell_runtime_contract_v1.json`，Harmony 是 `rawfile/mobile_shell_runtime_contract_v1.json`，不能再偷用导出根目录那份名字。
-- `mobile_shell_codegen` 主线里不要顺手塞“大段 launch-args 常量 + JSON 拼装”这种新字符串形状；这轮会把 `mobile_shell_tool` 自己打成 `cheng seq_set_grow: corrupt header`。要查这条，必须先拆成独立最小 probe，不要拿正式 `export/build-probe` 当试验场。
-- launch args 这条先走 sidecar 文件是稳定面：先生成 `runtime/mobile_shell_launch_args.kv/json`，再镜像进 Android `assets`、iOS `runtime/Resources`、Harmony `rawfile`，不要急着直接内联进宿主源码。
-- 如果下一步要接宿主读取 launch args，先把 sidecar 相对路径常量单独写进宿主源码；这条是稳定的，也不会像内联大段 launch args 文本那样把 `mobile_shell_tool` 打红。
-- launch args probe 如果已经证明“文本本身”“`v3MobileShellWriteFile(...)`”“三端 old-shape 组合”都稳定，那剩下就不是 launch args 内容问题，而是原 `mobile_shell_codegen` 模块的具体组合形状问题。
-- Android / iOS 宿主接 launch args 时，稳定形状是“宿主自己从打包资源读 sidecar 文本，再调用 `cheng_mobile_host_runtime_set_launch_args(...)`”；不要把 launch args 正文重新拼回导出期大字符串里。
-- Android 这条稳定口径已经是：
-  - Kotlin `assets.open(...).bufferedReader().use { it.readText() }`
-  - `nativeCreate(..., launchArgsKv, launchArgsJson)`
-  - C host 里 `GetStringUTFChars / ReleaseStringUTFChars`
-- iOS 这条稳定口径已经是：
-  - `NSBundle mainBundle` + `pathForResource:ofType:inDirectory:`
-  - `NSString stringWithContentsOfFile`
-  - 然后把 UTF-8 文本直接交给 `cheng_mobile_host_runtime_set_launch_args(...)`
-- 同一个 host smoke 不要并行跑两份；它们会抢同一个 `artifacts/v3_hostrun/<smoke>` 目录，能制造 `primary.o is empty` 这种假红。
-- `byteBufToBytes(...)` / `byteSpanToBytes(...)` 这种公共 copy helper 不能偷懒走切片视图；只要后面要写文件、做 CID、做 fixed32/fixed64 解码，就必须是 raw copy owning bytes，不然很容易出现 `payload_hex=` 空、空串哈希、`need 32 bytes` 这类假象。
-- 固定宽度二进制读取优先直接填目标结构；像 `v3ReadFixed32(...)` 这种路径，逐字节写 `FixedBytes32` 比 `ByteSpan -> Bytes -> FixedBytes32` 多一道中转稳得多。
-- state reload / migration replay 不是 live event dispatch；恢复路径只负责重建账本、proof、索引和 runtime 状态，不该再触发 actor dispatch、副作用发布或实时控制面逻辑。
-- 入口收口时，默认帮助和 smoke 口径也必须一起切到正式宿主；现在应该固定成 `cheng_node_main <subcmd>`，`ctl` 只保留兼容，不要继续把双入口写成主设计。
-- 旧连字符命令改多级子命令时，最稳的收口顺序是：
-  - 先在正式主程序里加 `chain <subcmd...>` 新分发
-  - 再把帮助文本和核心 smoke 切过去
-  - 旧 `chain-...` 先留成隐藏迁移别名，等大批量 gate 脚本一次性清掉
-  - 不要反过来先全仓替换脚本；那样一旦主分发有细节漏口，整片验收会同时炸
-- `bio_did_chain_node` 现在不能直接并进 `cheng_node_ctl_main` 主闭包；这条导入会把 ordinary fresh compile 打成 `bio_reed_solomon` duplicate type head。遇到这种模块冲突，先隔离旧能力，不要为了“一个命令也要统一”把正式宿主打红。
-- runtime manifest / contract payload / bundle payload 这条稳定口径已经明确：
-  - 三端宿主都应该自己从打包资源读取文本
-  - 然后在 `cheng_app_init()` 前统一调用 `cheng_mobile_host_runtime_set_manifest_payloads(...)`
-  - 不要再把 runtime manifest 当成只留在导出目录里的静态说明文件
-- runtime payload 接到宿主之后，正式闭环还差一步：`cheng_mobile_exports_shared.c` 必须自己解析并认账。
-  - 稳定口径是：
-    - 显式校验 `native_gui_bundle_v1` / `native_gui_runtime_contract_v1`
-    - 把 `route_state`、route/semantic/layout/render command/viewport/interactive 计数直接收进 runtime ctx
-    - 没有 launch args 路由时优先采用 bundle route
-    - frame stopped reason 直接带 runtime payload 摘要，别再靠外部日志猜 runtime 到底有没有吃进去
-- 如果控制面已经有 `cheng_mobile_host_runtime_state_json()`，就不要只暴露“payload 文本是否存在”。
-  - 稳定口径是把 runtime 真正解析后的 `runtime_bundle_ready/runtime_contract_ready` 和各项 bundle/contract 计数一起吐出去。
-  - 否则控制面只能看到“宿主注入成功”，看不到“runtime 消费成功”。
-- mobile-shell 的 truth / semantic 资源复制，稳定做法是递归 `os.ListDir(...)` + raw copy；不要再回到 `WalkDirRec + RelativePath` 去反推相对路径。
-- `.rgba` / wasm / 音频 / 任何二进制 fixture 都不能走会补换行的文本写 helper；要按字节对拍，就必须 raw read + raw write。
-- 回答“编译理论下界”时，统一引用 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt` 里的 `*_compile_exec_phase_summary`，核心数字是 `planner_total_ms`，不是整次 `elapsed_ms`。
-- 回答 Cheng 内存性能时不要说 GC perf；稳定合同是 `perf_memory_contract_smoke` 里的 ORC retain/release 与 alloc/free/live，当前运行约束要看到 `alloc_delta=1 free_delta=1 live_delta=0`。
-- `artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke` 这条正式 perf 门禁，默认被测编译器也必须优先指向 `artifacts/v3_backend_driver/cheng`；如果 smoke 内部又偷偷退回 `artifacts/v3_bootstrap/cheng.stage3`，测的就是错轨。
-- Darwin 上 `"/usr/bin/time -l"` 的 `maximum resident set size` 不能直接当正式 perf 合同比较值；当前稳定口径要优先用 `peak memory footprint`，否则编译器子进程树会把 RSS 假性放大。
-- 回答 “100ms 编译 + 二进制原地更新” 时，要先把轨道说清：这两条都属于 dev host-only `self-link + direct-exe + host runner hotpatch` 口径；`release-compile` 是发布轨，不承诺 100ms，也不是原地热补丁面。
-- 只要用户质疑某个 gate/ABI 名是不是过时，先用现行 v3 二进制直接试命令面；不要拿旧 backend-only 文档里的 `backend_prod_closure`、`verify_backend_abi_v2_noptr`、`verify_backend_selfhost_100ms_host` 当现行命令。
-- 只要改了 repo 里的 `docs/cheng-skill/*`，就要同步本地 `$HOME/.codex/skills/cheng语言/*` 和 `references/*`；`cheng_skill_consistency_smoke` 会把 home mirror drift 直接打红，不只检查 `SKILL.md`。
+- `DefaultInitExpr/ConstructorExpr` 进了 typed 层以后，还要补一条显式 `typeCallKind`；只靠 `kind` 不够，因为 lowering rule key、CSG 序列化和 report 统计都会重新分叉。
 
-- `cheng_node_compiler_domain` 这种统一节点主闭包里的编译器运行时，只能 import 真正运行时会用到的最小模块；像 `bootstrap_contracts` 这种带 parser/bootstrap 重依赖的工具模块，哪怕只是想拿几个路径常量，也会把 fresh ordinary 编译重新打红。要桥接现有编译器产物时，优先直接拼固定 artifact 路径。
-- `compiler system-link-exec` 并入节点后，正式验收口径要同时钉三件事：
-  - `compiler surface` 有 `system_link_exec_command=1`
-  - 新节点自己能跑 `compiler system-link-exec`
-  - 产出的 ordinary fixture 真能执行退出 0
-- `cheng_node_main` fresh compile 即使成功，也要顺手看 report 里的 `primary_object_unsupported_function_count` 和 seed 诊断；现在 `parser::v3NormalizedExprLayerAppendSpan` 这条还会冒头，后续继续扩编译器闭包时别把这类 warning 当不存在。
-- 有限域一旦决定 enum 化，smoke 也要直接比 enum；不要为了断言方便再绕回 helper 文本。那样既会把文本边界重新扩散，也容易踩当前 seed 的 `str ==` 红面。
-- `r2c` 的 bundle 输出目录如果和 `codegen manifest` 不在同一处，显式 `--codegen-manifest` 就必须是绝对真源；不要再让“`outDir/cheng_codegen` 恰好存在”这种残留目录抢走 package root / route catalog。
-- `r2c_react_v3_surface_main` 这类静态面模块，文件输出一律优先 `v3path.V3WriteTextFile(...)`；`os.Open(path, os.FmWrite)` 在当前 ordinary 主链还是会把 `module_inventory / tailwind_manifest / asset_manifest` 这类路径直接打红。
-- `native_gui_run.mjs` 不能只把 `native_gui_run_report_v1` 打到 stdout；页面级 smoke 和产物目录都要吃同一份落盘 report。
-- 页面级 native GUI smoke 不要再借旧 `fresh clean gate`；当前稳定真源已经是 `codegen_surface -> static_surface -> native_gui_bundle -> native_gui_run` 这条主线，legacy wrapper / Python compile 只会把验收拉偏。
-- `r2c_react_v3_surface_smoke`、`r2c_react_v3_publish_selector_bundle_smoke`、`verify-r2c-react-v3-surface` 也不能并行跑；它们会共用 `artifacts/v3_r2c_surface_smoke` / `artifacts/v3_r2c_publish_selector_smoke` 这组固定目录，必须串行验收。
-- `r2c` controller fresh compile 也是正式主线，不是外围脚手架；只要 `r2c_process` 还保留第二套 raw capture/importc 桥，ordinary fresh compile 就会在 controller 这层直接炸。
-- `r2c_process.cheng` 这条线优先复用 `std/os_host_process.ExecFileCapture(...)`，不要再维护平行的自定义 capture 桥。
-- `r2c_react_v3_surface_main.cheng` 里凡是文本/JSON 写文件出口，都统一用 `v3path.V3WriteTextFile(...)`；不要留 `r2cSurfaceWriteRsg(...)`、`r2cSurfaceWriteBlockerReport(...)` 这种剩余 `os.Open(path, os.FmWrite)` 红点。
-- `run-native-gui` 的 controller smoke 不要直接调 `stage3 r2c-react-v3 ...`；源码 mtime 一漂就会把 `bootstrap-bridge` 噪音重新带进验收。
-- controller smoke 最稳的形状是：
-  - 先 fresh compile controller 可执行
-  - 外部显式跑完 `codegen_surface -> static_surface -> native_gui_bundle`
-  - 再把 `--bundle-path / --session-path` 显式喂给 `run-native-gui`
-  - 不要让 smoke 继续依赖 controller 内部隐式 bundle 路径
-- `r2c_react_v3_run_native_gui_controller_smoke` 也不能和另外两条 route smoke 并行；它会共用 `artifacts/v3_r2c_run_native_gui_controller_smoke`，而且还会叠 controller 编译和 host runtime 状态。
-- `compare-truth` 这条页面级对拍主线，不能只停在 `exec_snapshot vs truth_trace` 的老字段；native gui runtime 已经有正式 `runtime_bundle_* / runtime_contract_*` 真值后，就该直接并入 `truth_compare_v1` 和 controller report。
-- `compare-truth` 接 native gui 时，稳定口径是：
-  - 新增可选 `--native-gui-summary <file>`
-  - 显式传入就严格校验存在
-  - 不显式传入时，再尝试同目录 `native_gui_run.summary.env`
-  - 不要靠猜测别的文件名或扫目录做启发式补丁
-- `r2c_react_v3_truth_compare_controller_smoke` 这种 compare smoke 应该用最小 `exec_snapshot + truth_trace + native_gui_run.summary.env` 直接钉 compare 文档；没必要每次都拉整条浏览器 truth/runtime 大链条。
-- `render_compare` 这条页面级像素对拍也一样要分清“重型产物生成”和“文档合同验证”：
-  - 如果目的是钉 `render_compare_report_v1.json / render_compare.summary.env` 字段合同，就直接走显式 direct mode
-  - direct mode 口径固定成 `--native-summary --truth-summary --native-screenshot --truth-screenshot` 四个都传
-  - 不要做半自动产物发现，更不要为了测 report 文档每次都重拉整条 native/truth 大链
+- seed 里的 `default-init` 和 `constructor-like` 不能分两套 helper；duplicate-field、infer/materialize、wasm analyze/emit、removed-default 诊断都要复用同一个 type-call 分类结果。
+
+- bootstrap 阶段如果还必须保留 `default[T]` / 标量 `T()` / `ref object T()` 的文本前置拒绝，只能保留一处 source 级校验；不要再散回 lowering function collect 里逐函数兜底。
+
+- 用户可见的 `artifacts/v3_bootstrap/cheng.stage3 system-link-exec` 只要 backend driver 已 fresh/ready，就应该先 handoff 到 `artifacts/v3_backend_driver/cheng` 做 parser 真源判定；seed 里的同类 source 校验只保留给 `CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1` 或 backend driver 未就绪的内部路径。
+
+- 这类命令路由修复不能只靠口头约定；要像 `stage3_system_link_exec_handoff_smoke` 一样拿实际 forward log 和唯一输出路径做门禁，防止后面有人改分发表时悄悄回退。
+
+- `cheng语言` home skill mirror 改了，仓内 `docs/cheng-skill/SKILL.md` 必须同句同步；否则 `cheng_skill_consistency_smoke` 会直接红。
+
+- `ConstructorExpr` 只认 composite `T(args)`；`Ok[T]` / `Err[T]` 继续属于 result intrinsic，不能混进 constructor 统计。
+
+- fixed-array 识别不能把任意 `Foo[Bar]` 都当成数组；只认顶层尾部数字下标这类真 fixed-array 后缀。
+
+- 同一组 typed/call/lowering 报告字段只能有一个生成出口；现在出口放在 `typed_expr`，消费者只能追加 `v3TypedExprReportText(...)`。
+
+- CSG 和 lowering plan 只负责自己的图、计划和缺失原因；不要在这两层重新展开 typed finite-domain 统计。
+
+- full smoke 如果红在 primary-object 复合值语义，不能改测试绕过。`str`、`ByteBuffer`、`seq`、`result` 这类复合值必须走显式地址语义。
+
+- 当前 primary-object 红点的稳定形状是：复合返回绑定、复合局部槽、`NewByteBuffer()` 局部物化、typed report entry 里的字符串规范化 helper。
+
+- ordinary 热路径里不要保留“字段取值到局部再单次消费”的形状；能直接内联到唯一消费点就直接内联。
+
+- 中间层薄壳只要没有新增语义就删；真源模块已经有 helper 时，不要在 CSG、lowering、gate、system-link 里再包一层 convenience API。
+
+- `Bytes` 不能只按类型判断 owning/borrowed；`Bytes[] add/setLen` 暂时不要混入当前主线。
+
+- 改完文档或代码后固定先跑 `git diff --check`，再跑对应 smoke；失败要记录首个真实缺口，不要把 unrelated 红点写成当前改动回归。
+
+- “禁用显式默认值初始化”指的是禁用把类型零值再手写一遍（`= []` / `= false` / `= 0` / `= ""`），不是移除字段默认值语法本身；有真实业务语义的 `field: T = expr` 要保留。
+
+- `T[]()` / `T[N]()` 不是合法默认值构造表面；序列和定长数组只能走带类型标注的省略初始化或字面量，不能塞进 `T()` 口径。
+
+- `r2c_react_v3_*` 这类会串多次生成和原生编译的 GUI smoke 不能套默认 60 秒宿主时限；backend driver 必须给长时预算。
+
+- seed 里的 `parse for header` 这类普通语法回退不是错误，不能往 stderr 打 `[cheng_v3_seed] ...` 调试行；否则所有 selftest 编译日志都会被误判成内部故障。
+
+- 如果 `Codex app-server` 留下旧的 `cheng/cheng.stage3` 会话，先杀掉这些旧 top-level 任务再跑当前重 smoke；不清现场就会出现 `rc=137`、空日志和无意义的高内存并发。
+
+- 如果 smoke 形状突然漂成“源码不支持但 fresh seed 又能过”，先怀疑 `artifacts/v3_backend_driver/cheng` 过期；先重建当前 backend driver，再判断是不是源码真实回归。
+
+- 测试里不要留 `V3WriteTextFile(...)` 这类临时调试副作用；它会把 smoke 从真实语义断言拖偏到 seed 的局部推断缺口。
+
+- bootstrap-bridge 选 live compiler 不能只看“谁存在”；必须先过 bootstrap 输入新鲜度。源码已经升级 contract 时，旧 `stage3` 会把 `stage0_self_check` 伪造成 primary-object 回归。
+
+- `verify-export-visibility-parallel` 这类会落固定 run-host-smokes 目录的命令，label 不能共享；重复执行或残留并发会把 provider object 踩成空文件。
+
+- Cheng 里带下标/切片的条件判断不要依赖 `&&` / `||` 短路；像 `i > 0 && line[i-1]` 这种写法会把 `-1` 真读出去，必须拆成显式分支。
+
+- 如果 smoke 为了喂 JSON 给 `V3WriteTextFile(...)` 直接塞超长 `\"...\" + \"...\"` 实参，seed 现阶段可能把它炸成 `prepare call arg state failed`；先改成普通局部变量分步拼接，不要把测试写成 primary-object 的已知缺口。
+
+- `r2c-react-v3` 的 controller 帮助文案如果允许 `--route-catalog` 单独成立，Node helper 就必须同样允许；这种契约不一致要直接修 helper，不能靠测试额外补 `--tsx-ast` 绕过去。
+
+- `default[T]` 这类已移除语法不能只在 parser smoke 里前端拒绝就算完；只要真实编译链路还会绕过那层，seed 就必须在 lowering 收集入口同步前置报错，但不要把同类兜底散落回 lowering/codegen 晚期。
+
+- ordinary body 如果现有真实 smoke 已经能稳定覆盖 `stmt_let` / `stmt_if` / 复合 `var/out` 写回，就先把这些 witness 挂进默认 gate；不要还没查清就重复造 probe 或重写 `body_kind` 判断。
+
+- 聚合回归入口一旦在 README 里列成正式合同，gate 代码就不能再手写另一套漂移列表；像 `verify-r2c-react-v3-surface` 这种已有正式 verify 命令的集合，命令分发和 `run-production-regression` 应该共用同一个 helper。
+
+- `cheng.stage3` 这种用户可见子命令先看 seed C 真入口，不要只改 ordinary `gate_main` 就以为主线收完；像 `verify-r2c-react-v3-surface` 这类命令，seed 壳如果还停在旧 smoke 集合，就会把正式回归伪造成假绿。

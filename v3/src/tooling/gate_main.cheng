@@ -312,9 +312,6 @@ fn v3GateMaybePrintRunOutput(run: hostops.V3LoggedRun) =
     if len(outputText) > 0:
         v3GatePrintLine(outputText)
 
-fn v3GateBootstrapOutDir(root: str): str =
-    return contracts.v3BootstrapOutDir(root)
-
 fn v3GateBootstrapLog(root: str, name: str): str =
     return v3path.V3PathAbsolute(root, "artifacts/v3_bootstrap/" + name)
 
@@ -327,7 +324,7 @@ fn v3GateBootstrapTarget(): str =
 
 fn v3GateBootstrapEnvText(root: str,
                           snapshot: contracts.V3BootstrapSnapshot): str =
-    let outDir = v3GateBootstrapOutDir(root)
+    let outDir = contracts.v3BootstrapOutDir(root)
     var out = ""
     out = out + "V3_ROOT=" + root + "\n"
     out = out + "V3_TARGET=" + v3GateBootstrapTarget() + "\n"
@@ -349,7 +346,7 @@ fn v3GateBootstrapEnvText(root: str,
 
 fn v3GateBootstrapSnapshotText(root: str,
                                snapshot: contracts.V3BootstrapSnapshot): str =
-    let outDir = v3GateBootstrapOutDir(root)
+    let outDir = contracts.v3BootstrapOutDir(root)
     var out = ""
     var freshErr = ""
     let freshInputPaths = contracts.v3BootstrapFreshInputPathsCsv(root, freshErr)
@@ -445,7 +442,7 @@ fn v3GateBootstrapMaterializeStage0(root: str,
 
 fn v3GateBootstrapBridge(root: str): int32 =
     let snapshot: contracts.V3BootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(root)
-    let outDir: str = v3GateBootstrapOutDir(root)
+    let outDir: str = contracts.v3BootstrapOutDir(root)
     let bootstrapCompiler: str = v3GateBootstrapCompilerPath(root, snapshot)
     if !v3path.V3MkdirP(root, outDir):
         v3GatePrintErr("v3 gate: failed to create bootstrap dir")
@@ -844,8 +841,14 @@ fn v3GateRunProductionRegression(root: str): int32 =
                                "build_backend_driver_report_smoke",
                                "perf_memory_gate_contract_smoke",
                                "perf_memory_contract_smoke",
-                               "cheng_skill_consistency_smoke"
+                               "cheng_skill_consistency_smoke",
+                               "explicit_default_init_negative_smoke",
+                               "explicit_default_init_gate_smoke",
+                               "composite_zero_helper_gate_smoke"
                            ]) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] production regression: r2c-react-v3 surface")
+    if v3GateVerifyR2cReactV3Surface(root) != 0:
         return 1
     v3GatePrintLine("[v3 gate] production regression: cross-target smokes")
     if v3GateRunStage3Command(root,
@@ -880,6 +883,20 @@ fn v3GateEnsureBackendDriverReady(root: str, outCompiler: var str): int32 =
     if contracts.v3BootstrapArtifactReady(snapshot.backendDriverOut):
         return 0
     return v3GateBuildBackendDriver(root)
+
+fn v3GateVerifyR2cReactV3Surface(root: str): int32 =
+    return v3GateRunHostSmokes(root,
+                               [
+                                   "r2c_react_v3_surface_smoke",
+                                   "r2c_react_v3_publish_selector_bundle_smoke",
+                                   "r2c_react_v3_run_native_gui_controller_smoke",
+                                   "r2c_react_v3_discover_truth_routes_controller_smoke",
+                                   "r2c_react_v3_truth_compare_controller_smoke",
+                                   "r2c_react_v3_exec_route_matrix_controller_smoke",
+                                   "r2c_react_v3_render_compare_direct_smoke",
+                                   "r2c_react_v3_render_compare_controller_smoke",
+                                   "r2c_react_v3_render_compare_matrix_controller_smoke"
+                               ])
 
 fn v3GateVerifyX86LinuxRemote(root: str): int32 =
     var compiler = ""
@@ -3351,6 +3368,7 @@ fn v3GateDefaultHostSmokes(): str[] =
         "fixed256_curve25519_smoke",
         "fixedbytes32_seq_index_smoke",
         "compiler_runtime_smoke",
+        "stage3_system_link_exec_handoff_smoke",
         "artifact_isolation_audit_smoke",
         "backend_driver_command_surface_smoke",
         "build_backend_driver_report_smoke",
@@ -3360,6 +3378,14 @@ fn v3GateDefaultHostSmokes(): str[] =
         "runtime_zero_c_surface_smoke",
         "composite_default_init_smoke",
         "composite_default_init_negative_smoke",
+        "if_enum_composite_return_smoke",
+        "out_param_writeback_smoke",
+        "nested_out_param_writeback_smoke",
+        "out_param_direct_call_writeback_smoke",
+        "var_out_param_writeback_probe",
+        "consensus_event_varparam_roundtrip_smoke",
+        "wrapper_result_forward_varparam_smoke",
+        "wrapper_rebuild_result_forward_varparam_smoke",
         "chain_node_snapshot_return_boundary_smoke",
         "chain_node_snapshot_write_return_boundary_smoke",
         "chain_node_snapshot_print_return_boundary_smoke",
@@ -3368,6 +3394,9 @@ fn v3GateDefaultHostSmokes(): str[] =
         "export_visibility_negative_smoke",
         "strformat_export_negative_smoke",
         "cheng_skill_consistency_smoke",
+        "explicit_default_init_negative_smoke",
+        "explicit_default_init_gate_smoke",
+        "composite_zero_helper_gate_smoke",
         "json_bracket_assign_smoke",
         "strings_char_to_str_smoke",
         "vpn_proxy_cli_smoke",
@@ -3884,6 +3913,7 @@ fn v3GateVerifyDiLoCoStage(root: str,
                            stageName: str,
                            packageRoot: str,
                            envOverrides: str[]): int32 =
+    v3GatePrintLine("v3 verify-diloco stage begin (" + stageName + ")")
     let singleSmokes = ["diloco_state_smoke", "diloco_wire_smoke"]
     for i in 0..<singleSmokes.len:
         let smokeName = singleSmokes[i]
@@ -3894,11 +3924,14 @@ fn v3GateVerifyDiLoCoStage(root: str,
                                       smokeName,
                                       envOverrides) != 0:
             return 1
-    return v3GateRunDiLoCoQuicTwoprocSmoke(root,
-                                           compilerPath,
-                                           stageName,
-                                           packageRoot,
-                                           envOverrides)
+    if v3GateRunDiLoCoQuicTwoprocSmoke(root,
+                                       compilerPath,
+                                       stageName,
+                                       packageRoot,
+                                       envOverrides) != 0:
+        return 1
+    v3GatePrintLine("v3 verify-diloco stage ok (" + stageName + ")")
+    return 0
 
 fn v3GateVerifyDiLoCo(root: str): int32 =
     if v3GateEnsureBootstrapBridge(root) != 0:
@@ -3958,7 +3991,8 @@ fn v3GateRunWasmSmokes(root: str,
         "wasm_zero_smoke",
         "wasm_internal_call_smoke",
         "wasm_importc_noarg_i32_smoke",
-        "wasm_shadowed_local_scope_smoke"
+        "wasm_shadowed_local_scope_smoke",
+        "wasm_composite_field_smoke"
     ]
     var jobs: hostops.V3ParallelJob[]
     for i in 0..<names.len:
@@ -4013,6 +4047,29 @@ fn v3GateRunWasmSmokes(root: str,
                                expectedExports,
                                ["env.cheng_test_zero"],
                                1):
+        return 1
+    if !v3GateRequireWasmAudit("v3 wasm audit shadowed",
+                               os.JoinPath(outDir, "wasm_shadowed_local_scope_smoke." + label + ".wasm"),
+                               expectedExports,
+                               [],
+                               1):
+        return 1
+    var compositeExports: str[]
+    add(compositeExports, "main")
+    add(compositeExports, "bytesLen")
+    add(compositeExports, "textLen")
+    add(compositeExports, "seqLen")
+    add(compositeExports, "resultOk")
+    add(compositeExports, "resultValue")
+    add(compositeExports, "echoBytes")
+    add(compositeExports, "echoText")
+    add(compositeExports, "echoSeq")
+    add(compositeExports, "echoResult")
+    if !v3GateRequireWasmAudit("v3 wasm audit composite",
+                               os.JoinPath(outDir, "wasm_composite_field_smoke." + label + ".wasm"),
+                               compositeExports,
+                               [],
+                               compositeExports.len):
         return 1
     let hostTarget = v3GateHostTarget(root)
     if len(hostTarget) <= 0:
@@ -7694,15 +7751,7 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
     if cmd == "verify-oracle-bft-three-node":
         return v3GateVerifyOracleBftThreeNode(root)
     if cmd == "verify-r2c-react-v3-surface":
-        return v3GateRunHostSmokes(root,
-                                   [
-                                       "r2c_react_v3_surface_smoke",
-                                       "r2c_react_v3_publish_selector_bundle_smoke",
-                                       "r2c_react_v3_run_native_gui_controller_smoke",
-                                       "r2c_react_v3_truth_compare_controller_smoke",
-                                       "r2c_react_v3_render_compare_direct_smoke",
-                                       "r2c_react_v3_render_compare_controller_smoke"
-                                   ])
+        return v3GateVerifyR2cReactV3Surface(root)
     if cmd == "verify-debug-tools":
         return v3GateRunStage3Command(root, "verify_debug_tools", cmd, args, "verify-debug-tools.log", false)
     if cmd == "verify-debug-runtime":

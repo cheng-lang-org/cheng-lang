@@ -148,6 +148,7 @@ static bool v3_backend_driver_handoff_enabled(void);
 static int v3_cmd_verify_export_visibility_impl(int argc, char **argv);
 static int v3_cmd_verify_backend_driver_command_surface_impl(int argc, char **argv);
 static int v3_cmd_verify_mobile_shell_build_probe_impl(int argc, char **argv);
+static int v3_cmd_verify_r2c_react_v3_surface_impl(int argc, char **argv);
 static const char *v3_host_target_triple(void);
 static bool v3_path_last_component_is(const char *path, const char *name);
 static bool v3_path_exists_nonempty(const char *path);
@@ -163,6 +164,7 @@ static bool v3_run_command_logged_argv(size_t arg_count,
                                        const char **args,
                                        const char *log_path,
                                        const char *label);
+static bool v3_type_is_forbidden_scalar_default_call(const char *type_text);
 
 static const char *V3_REQUIRED_KEYS[] = {
     "syntax",
@@ -1018,7 +1020,7 @@ static bool v3_validate_contract(const V3BootstrapContract *contract) {
         return false;
     }
     if (!v3_streq(v3_contract_get(contract, "ordinary_pipeline_state"),
-                  "canonical_csg_verified_primary_object_codegen_missing")) {
+                  "canonical_csg_verified_primary_object_codegen_ready")) {
         fprintf(stderr, "[cheng_v3_seed] ordinary_pipeline_state drift\n");
         return false;
     }
@@ -2274,8 +2276,26 @@ static bool v3_run_command_logged_argv(size_t arg_count,
     if (!v3_waitpid_nointr(pid, &status)) {
         return false;
     }
-    if (status != 0) {
-        fprintf(stderr, "[cheng_v3_seed] %s failed rc=%d log=%s\n", label, status, log_path);
+    if (!v3_status_is_exit_code(status, 0)) {
+        if (WIFEXITED(status)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] %s failed exit=%d log=%s\n",
+                    label,
+                    WEXITSTATUS(status),
+                    log_path);
+        } else if (WIFSIGNALED(status)) {
+            fprintf(stderr,
+                    "[cheng_v3_seed] %s failed signal=%d log=%s\n",
+                    label,
+                    WTERMSIG(status),
+                    log_path);
+        } else {
+            fprintf(stderr,
+                    "[cheng_v3_seed] %s failed status=%d log=%s\n",
+                    label,
+                    status,
+                    log_path);
+        }
         return false;
     }
     return true;
@@ -2902,6 +2922,11 @@ typedef struct {
     long long exec_phase_native_link_plan_ms;
     long long exec_phase_compile_receipt_ms;
     long long exec_phase_total_ms;
+    long long exec_phase_linux_nolibc_objects_ms;
+    long long exec_phase_provider_objects_ms;
+    long long exec_phase_primary_object_emit_ms;
+    long long exec_phase_native_link_ms;
+    long long exec_phase_line_map_ms;
 } V3CompilerWorldArtifacts;
 
 typedef struct {
@@ -3644,6 +3669,12 @@ typedef enum {
     V3_EXPR_SURFACE_CALL
 } V3ExprSurfaceKind;
 
+typedef enum {
+    V3_TYPE_CALL_NONE = 0,
+    V3_TYPE_CALL_DEFAULT_INIT,
+    V3_TYPE_CALL_CONSTRUCTOR
+} V3TypeCallKind;
+
 typedef struct {
     V3ExprSurfaceKind kind;
     bool rewritten;
@@ -3658,6 +3689,15 @@ typedef struct {
     char call_callee[PATH_MAX];
     char call_args_text[8192];
 } V3ExprSurface;
+
+typedef struct {
+    V3TypeCallKind kind;
+    bool normalized;
+    bool forbidden_scalar_default;
+    bool forbidden_seq_or_fixed_default;
+    bool ref_object_default;
+    char normalized_type[CHENG_V3_MAX_TYPE_TEXT];
+} V3TypeCallSurface;
 
 typedef struct {
     uint64_t key_hash;
@@ -5313,6 +5353,11 @@ static bool v3_parse_assignment_meta(const char *statement,
                                      size_t lhs_cap,
                                      char *rhs_out,
                                      size_t rhs_cap);
+static bool v3_parse_member_access_expr(const char *expr_text,
+                                        char *base_out,
+                                        size_t base_cap,
+                                        char *field_out,
+                                        size_t field_cap);
 static bool v3_parse_index_assignment_operands(const char *lhs_text,
                                                const char *rhs_text,
                                                char *base_out,
@@ -7640,7 +7685,11 @@ static bool v3_parse_type_field_spec(const char *field_text,
     return field_out->type_text[0] != '\0';
 }
 
-static bool v3_validate_type_field_defaults(const char *source_path,
+static bool v3_validate_type_field_defaults(const V3LoweringPlanStub *lowering,
+                                            const char *owner_module_path,
+                                            const V3ImportAlias *aliases,
+                                            size_t alias_count,
+                                            const char *source_path,
                                             const char *type_text,
                                             const V3TypeFieldDef *fields,
                                             size_t field_count);
@@ -7857,17 +7906,76 @@ static bool v3_normalize_type_text(const V3LoweringPlanStub *lowering,
                                               cap);
 }
 
-static bool v3_callee_is_constructor_like(const V3LoweringPlanStub *lowering,
+static void v3_type_call_surface_init(V3TypeCallSurface *surface) {
+    if (surface == NULL) {
+        return;
+    }
+    memset(surface, 0, sizeof(*surface));
+    surface->kind = V3_TYPE_CALL_NONE;
+}
+
+static bool v3_type_call_kind_is_materialize(V3TypeCallKind kind) {
+    return kind == V3_TYPE_CALL_DEFAULT_INIT ||
+           kind == V3_TYPE_CALL_CONSTRUCTOR;
+}
+
+static bool v3_type_call_surface_should_skip_lower_generic_function(const char *normalized_type,
+                                                                    int32_t type_index) {
+    const char *bracket;
+    const char *scan;
+    char fixed_elem_type[CHENG_V3_MAX_TYPE_TEXT];
+    int32_t fixed_len = 0;
+    if (type_index >= 0 ||
+        normalized_type == NULL ||
+        normalized_type[0] == '\0' ||
+        strcmp(normalized_type, "Bytes") == 0 ||
+        v3_is_tuple_type_text(normalized_type) ||
+        v3_is_seq_type_text(normalized_type) ||
+        v3_startswith(normalized_type, "Result[") ||
+        v3_is_internal_ref_type(normalized_type) ||
+        v3_parse_fixed_array_type(normalized_type,
+                                  fixed_elem_type,
+                                  sizeof(fixed_elem_type),
+                                  &fixed_len) ||
+        v3_type_is_forbidden_scalar_default_call(normalized_type)) {
+        return false;
+    }
+    bracket = strchr(normalized_type, '[');
+    if (bracket == NULL || bracket == normalized_type || bracket[1] == '\0') {
+        return false;
+    }
+    scan = bracket;
+    while (scan > normalized_type &&
+           scan[-1] != ':' &&
+           scan[-1] != '.' &&
+           scan[-1] != '/' &&
+           scan[-1] != ' ' &&
+           scan[-1] != '\t') {
+        scan--;
+    }
+    return scan[0] >= 'a' && scan[0] <= 'z';
+}
+
+static bool v3_classify_type_call_surface(const V3LoweringPlanStub *lowering,
                                           const char *owner_module_path,
                                           const V3ImportAlias *aliases,
                                           size_t alias_count,
-                                          const char *callee) {
-    char normalized[CHENG_V3_MAX_TYPE_TEXT];
+                                          const char *callee,
+                                          size_t arg_count,
+                                          V3TypeCallSurface *surface_out) {
+    V3TypeCallSurface surface;
+    char fixed_elem_type[CHENG_V3_MAX_TYPE_TEXT];
+    int32_t fixed_len = 0;
     int32_t type_index = -1;
-    if (callee == NULL || callee[0] == '\0') {
+    v3_type_call_surface_init(&surface);
+    if (surface_out == NULL) {
         return false;
     }
-    if (v3_is_tuple_type_text(callee)) {
+    if (lowering == NULL ||
+        owner_module_path == NULL ||
+        callee == NULL ||
+        callee[0] == '\0') {
+        *surface_out = surface;
         return true;
     }
     if (!v3_normalize_type_text(lowering,
@@ -7875,14 +7983,120 @@ static bool v3_callee_is_constructor_like(const V3LoweringPlanStub *lowering,
                                 aliases,
                                 alias_count,
                                 callee,
-                                normalized,
-                                sizeof(normalized))) {
-        return false;
-    }
-    if (strcmp(normalized, "Bytes") == 0) {
+                                surface.normalized_type,
+                                sizeof(surface.normalized_type))) {
+        *surface_out = surface;
         return true;
     }
-    return v3_find_type_def_by_normalized(lowering, normalized, &type_index);
+    surface.normalized = true;
+    if (arg_count == 0U &&
+        v3_type_is_forbidden_scalar_default_call(surface.normalized_type)) {
+        surface.forbidden_scalar_default = true;
+        *surface_out = surface;
+        return true;
+    }
+    if (strcmp(surface.normalized_type, "Bytes") == 0 ||
+        v3_is_tuple_type_text(surface.normalized_type)) {
+        surface.kind = arg_count == 0U
+            ? V3_TYPE_CALL_DEFAULT_INIT
+            : V3_TYPE_CALL_CONSTRUCTOR;
+        *surface_out = surface;
+        return true;
+    }
+    if (!v3_find_type_def_by_normalized(lowering,
+                                        surface.normalized_type,
+                                        &type_index)) {
+        type_index = -1;
+    }
+    if (v3_type_call_surface_should_skip_lower_generic_function(surface.normalized_type,
+                                                                type_index)) {
+        *surface_out = surface;
+        return true;
+    }
+    if (arg_count == 0U &&
+        (v3_is_seq_type_text(surface.normalized_type) ||
+         v3_parse_fixed_array_type(surface.normalized_type,
+                                   fixed_elem_type,
+                                   sizeof(fixed_elem_type),
+                                   &fixed_len))) {
+        surface.forbidden_seq_or_fixed_default = true;
+        *surface_out = surface;
+        return true;
+    }
+    if (v3_is_seq_type_text(surface.normalized_type) ||
+        v3_parse_fixed_array_type(surface.normalized_type,
+                                  fixed_elem_type,
+                                  sizeof(fixed_elem_type),
+                                  &fixed_len)) {
+        surface.kind = arg_count == 0U
+            ? V3_TYPE_CALL_DEFAULT_INIT
+            : V3_TYPE_CALL_CONSTRUCTOR;
+        *surface_out = surface;
+        return true;
+    }
+    if (type_index < 0) {
+        *surface_out = surface;
+        return true;
+    }
+    if (lowering->type_defs[type_index].ref_object) {
+        if (arg_count == 0U) {
+            surface.ref_object_default = true;
+        }
+        *surface_out = surface;
+        return true;
+    }
+    surface.kind = arg_count == 0U
+        ? V3_TYPE_CALL_DEFAULT_INIT
+        : V3_TYPE_CALL_CONSTRUCTOR;
+    *surface_out = surface;
+    return true;
+}
+
+static bool v3_classify_expr_type_call_surface(const V3LoweringPlanStub *lowering,
+                                               const char *owner_module_path,
+                                               const V3ImportAlias *aliases,
+                                               size_t alias_count,
+                                               const char *expr_text,
+                                               V3TypeCallSurface *surface_out) {
+    char expr[4096];
+    char inner[4096];
+    char callee[CHENG_V3_MAX_TYPE_TEXT];
+    size_t arg_count = 0U;
+    char (*args)[4096] = NULL;
+    bool ok = false;
+    if (surface_out == NULL ||
+        lowering == NULL ||
+        owner_module_path == NULL ||
+        expr_text == NULL) {
+        return false;
+    }
+    v3_type_call_surface_init(surface_out);
+    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    if (expr[0] == '\0') {
+        return false;
+    }
+    while (v3_trim_outer_parens(expr, inner, sizeof(inner))) {
+        snprintf(expr, sizeof(expr), "%s", inner);
+    }
+    args = v3_alloc_call_arg_scratch();
+    if (!v3_parse_call_text(expr,
+                            callee,
+                            sizeof(callee),
+                            args,
+                            &arg_count,
+                            CHENG_V3_MAX_CALL_ARGS)) {
+        free(args);
+        return false;
+    }
+    ok = v3_classify_type_call_surface(lowering,
+                                       owner_module_path,
+                                       aliases,
+                                       alias_count,
+                                       callee,
+                                       arg_count,
+                                       surface_out);
+    free(args);
+    return ok;
 }
 
 static bool v3_normalize_type_text_with_params(const V3LoweringPlanStub *lowering,
@@ -8754,7 +8968,11 @@ static bool v3_collect_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                 type_def->field_count += 1U;
                 i += 1U;
             }
-            if (!v3_validate_type_field_defaults(source_path,
+            if (!v3_validate_type_field_defaults(lowering,
+                                                 owner_module_path,
+                                                 aliases,
+                                                 alias_count,
+                                                 source_path,
                                                  type_def->type_name,
                                                  type_def->fields,
                                                  type_def->field_count)) {
@@ -9017,7 +9235,11 @@ static bool v3_refresh_type_defs_from_source(const V3SystemLinkPlanStub *plan,
                 type_def->field_count += 1U;
                 i += 1U;
             }
-            if (!v3_validate_type_field_defaults(source_path,
+            if (!v3_validate_type_field_defaults(lowering,
+                                                 owner_module_path,
+                                                 aliases,
+                                                 alias_count,
+                                                 source_path,
                                                  type_def->type_name,
                                                  type_def->fields,
                                                  type_def->field_count)) {
@@ -9981,12 +10203,19 @@ static void v3_init_default_eval_function(const V3LoweredFunctionStub *current_f
                                           const char *owner_module_path,
                                           const char *source_path,
                                           V3LoweredFunctionStub *out);
-static bool v3_expr_is_stable_field_default(const char *expr_text,
+static bool v3_expr_is_stable_field_default(const V3LoweringPlanStub *lowering,
+                                            const char *owner_module_path,
+                                            const V3ImportAlias *aliases,
+                                            size_t alias_count,
+                                            const char *expr_text,
                                             const V3TypeFieldDef *fields,
                                             size_t field_count);
-static bool v3_parse_default_expr_text(const char *expr_text,
-                                       char *type_out,
-                                       size_t type_cap);
+static bool v3_classify_expr_type_call_surface(const V3LoweringPlanStub *lowering,
+                                               const char *owner_module_path,
+                                               const V3ImportAlias *aliases,
+                                               size_t alias_count,
+                                               const char *expr_text,
+                                               V3TypeCallSurface *surface_out);
 static bool v3_parse_named_arg_meta(const char *arg_text,
                                     char *field_out,
                                     size_t field_cap,
@@ -10038,6 +10267,329 @@ static bool v3_const_record_set_field_value(V3ConstValue *record_value,
         }
     }
     return false;
+}
+
+static bool v3_try_format_removed_default_expr_error(const V3LoweringPlanStub *lowering,
+                                                     const char *owner_module_path,
+                                                     const V3ImportAlias *aliases,
+                                                     size_t alias_count,
+                                                     const char *expr_text,
+                                                     char *message_out,
+                                                     size_t message_cap) {
+    char expr[4096];
+    char callee[CHENG_V3_MAX_TYPE_TEXT];
+    char base_leaf[128];
+    char fixed_elem_type[CHENG_V3_MAX_TYPE_TEXT];
+    char fixed_len_expr[64];
+    V3TypeCallSurface type_call_surface;
+    size_t expr_len;
+    if (lowering == NULL ||
+        owner_module_path == NULL ||
+        expr_text == NULL ||
+        message_out == NULL ||
+        message_cap == 0U) {
+        return false;
+    }
+    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    expr_len = strlen(expr);
+    if (expr_len > 9U &&
+        strncmp(expr, "default[", 8U) == 0 &&
+        expr[expr_len - 1U] == ']') {
+        snprintf(message_out,
+                 message_cap,
+                 "[cheng_v3_seed] default[T] removed expr=%s; use T() for object/tuple, typed implicit init or literals for T[]/T[N], and new(T) for ref object\n",
+                 expr);
+        return true;
+    }
+    if (expr_len > 2U &&
+        expr[expr_len - 2U] == '(' &&
+        expr[expr_len - 1U] == ')') {
+        const char *leaf = NULL;
+        const char *dot = NULL;
+        size_t base_len = 0U;
+        bool base_looks_like_type = false;
+        snprintf(callee, sizeof(callee), "%.*s", (int)(expr_len - 2U), expr);
+        v3_trim_copy_text(callee, callee, sizeof(callee));
+        dot = strrchr(callee, '.');
+        leaf = dot != NULL ? dot + 1 : callee;
+        while (leaf[base_len] != '\0' &&
+               leaf[base_len] != '[' &&
+               base_len + 1U < sizeof(base_leaf)) {
+            base_leaf[base_len] = leaf[base_len];
+            base_len += 1U;
+        }
+        base_leaf[base_len] = '\0';
+        if (base_leaf[0] != '\0' &&
+            (((unsigned char)base_leaf[0] >= 'A' && (unsigned char)base_leaf[0] <= 'Z') ||
+             strcmp(base_leaf, "int8") == 0 ||
+             strcmp(base_leaf, "uint8") == 0 ||
+             strcmp(base_leaf, "int16") == 0 ||
+             strcmp(base_leaf, "uint16") == 0 ||
+             strcmp(base_leaf, "int32") == 0 ||
+             strcmp(base_leaf, "int") == 0 ||
+             strcmp(base_leaf, "uint32") == 0 ||
+             strcmp(base_leaf, "uint") == 0 ||
+             strcmp(base_leaf, "int64") == 0 ||
+             strcmp(base_leaf, "uint64") == 0 ||
+             strcmp(base_leaf, "float") == 0 ||
+             strcmp(base_leaf, "float32") == 0 ||
+             strcmp(base_leaf, "float64") == 0 ||
+             strcmp(base_leaf, "str") == 0 ||
+             strcmp(base_leaf, "cstring") == 0 ||
+             strcmp(base_leaf, "Bytes") == 0)) {
+            base_looks_like_type = true;
+        }
+        if (base_looks_like_type &&
+            (v3_is_seq_type_text(callee) ||
+             v3_parse_fixed_array_type_meta(callee,
+                                           fixed_elem_type,
+                                           sizeof(fixed_elem_type),
+                                           fixed_len_expr,
+                                           sizeof(fixed_len_expr)))) {
+            snprintf(message_out,
+                     message_cap,
+                     "[cheng_v3_seed] seq/fixed-array T() unsupported expr=%s; use typed implicit init or literals\n",
+                     expr);
+            return true;
+        }
+    }
+    if (!v3_classify_expr_type_call_surface(lowering,
+                                            owner_module_path,
+                                            aliases,
+                                            alias_count,
+                                            expr,
+                                            &type_call_surface) ||
+        type_call_surface.kind != V3_TYPE_CALL_NONE) {
+        return false;
+    }
+    if (type_call_surface.forbidden_scalar_default) {
+        snprintf(message_out,
+                 message_cap,
+                 "[cheng_v3_seed] simple type T() unsupported expr=%s; simple types use typed implicit init\n",
+                 expr);
+        return true;
+    }
+    if (type_call_surface.forbidden_seq_or_fixed_default) {
+        snprintf(message_out,
+                 message_cap,
+                 "[cheng_v3_seed] seq/fixed-array T() unsupported expr=%s; use typed implicit init or literals\n",
+                 expr);
+        return true;
+    }
+    if (type_call_surface.ref_object_default) {
+        snprintf(message_out,
+                 message_cap,
+                 "[cheng_v3_seed] ref object T() unsupported expr=%s; use new(T)\n",
+                 expr);
+        return true;
+    }
+    return false;
+}
+
+static void v3_compact_copy_text(const char *src, char *dst, size_t cap) {
+    size_t used = 0U;
+    if (dst == NULL || cap == 0U) {
+        return;
+    }
+    dst[0] = '\0';
+    if (src == NULL) {
+        return;
+    }
+    while (*src != '\0') {
+        if (!isspace((unsigned char)*src)) {
+            if (used + 1U >= cap) {
+                break;
+            }
+            dst[used++] = *src;
+        }
+        src++;
+    }
+    dst[used] = '\0';
+}
+
+static bool v3_type_text_is_bool_default_type(const char *type_text) {
+    return type_text != NULL && strcmp(type_text, "bool") == 0;
+}
+
+static bool v3_type_text_is_int_default_type(const char *type_text) {
+    return type_text != NULL &&
+           (strcmp(type_text, "int8") == 0 ||
+            strcmp(type_text, "uint8") == 0 ||
+            strcmp(type_text, "int16") == 0 ||
+            strcmp(type_text, "uint16") == 0 ||
+            strcmp(type_text, "int32") == 0 ||
+            strcmp(type_text, "int") == 0 ||
+            strcmp(type_text, "uint32") == 0 ||
+            strcmp(type_text, "uint") == 0 ||
+            strcmp(type_text, "int64") == 0 ||
+            strcmp(type_text, "uint64") == 0);
+}
+
+static bool v3_type_text_is_float_default_type(const char *type_text) {
+    return type_text != NULL &&
+           (strcmp(type_text, "float") == 0 ||
+            strcmp(type_text, "float32") == 0 ||
+            strcmp(type_text, "float64") == 0);
+}
+
+static bool v3_type_text_is_string_default_type(const char *type_text) {
+    return type_text != NULL &&
+           (strcmp(type_text, "str") == 0 ||
+            strcmp(type_text, "cstring") == 0);
+}
+
+static bool v3_type_text_is_char_default_type(const char *type_text) {
+    return type_text != NULL && strcmp(type_text, "char") == 0;
+}
+
+static bool v3_redundant_default_expr_matches_type_basic(const char *type_text,
+                                                         const char *expr_text) {
+    char type_trimmed[CHENG_V3_MAX_TYPE_TEXT];
+    char expr_trimmed[4096];
+    char fixed_elem_type[CHENG_V3_MAX_TYPE_TEXT];
+    char fixed_len_expr[64];
+    char compact_type[CHENG_V3_MAX_TYPE_TEXT];
+    char compact_expr[4096];
+    char type_call[CHENG_V3_MAX_TYPE_TEXT + 3U];
+    v3_trim_copy_text(type_text, type_trimmed, sizeof(type_trimmed));
+    v3_trim_copy_text(expr_text, expr_trimmed, sizeof(expr_trimmed));
+    if (type_trimmed[0] == '\0' || expr_trimmed[0] == '\0') {
+        return false;
+    }
+    if (v3_type_text_is_bool_default_type(type_trimmed)) {
+        return strcmp(expr_trimmed, "false") == 0;
+    }
+    if (v3_type_text_is_int_default_type(type_trimmed)) {
+        return strcmp(expr_trimmed, "0") == 0;
+    }
+    if (v3_type_text_is_float_default_type(type_trimmed)) {
+        return strcmp(expr_trimmed, "0") == 0 || strcmp(expr_trimmed, "0.0") == 0;
+    }
+    if (v3_type_text_is_string_default_type(type_trimmed)) {
+        return strcmp(expr_trimmed, "\"\"") == 0;
+    }
+    if (v3_type_text_is_char_default_type(type_trimmed)) {
+        return strcmp(expr_trimmed, "'\\0'") == 0;
+    }
+    if (strcmp(expr_trimmed, "[]") == 0 &&
+        (v3_is_seq_type_text(type_trimmed) ||
+         v3_parse_fixed_array_type_meta(type_trimmed,
+                                        fixed_elem_type,
+                                        sizeof(fixed_elem_type),
+                                        fixed_len_expr,
+                                        sizeof(fixed_len_expr)))) {
+        return true;
+    }
+    if (v3_type_is_forbidden_scalar_default_call(type_trimmed) ||
+        v3_is_internal_ref_type(type_trimmed) ||
+        v3_is_seq_type_text(type_trimmed) ||
+        v3_parse_fixed_array_type_meta(type_trimmed,
+                                       fixed_elem_type,
+                                       sizeof(fixed_elem_type),
+                                       fixed_len_expr,
+                                       sizeof(fixed_len_expr))) {
+        return false;
+    }
+    v3_compact_copy_text(type_trimmed, compact_type, sizeof(compact_type));
+    v3_compact_copy_text(expr_trimmed, compact_expr, sizeof(compact_expr));
+    if (compact_type[0] == '\0') {
+        return false;
+    }
+    snprintf(type_call, sizeof(type_call), "%s()", compact_type);
+    return strcmp(compact_expr, type_call) == 0;
+}
+
+static bool v3_redundant_default_expr_matches_type(const V3LoweringPlanStub *lowering,
+                                                   const char *owner_module_path,
+                                                   const V3ImportAlias *aliases,
+                                                   size_t alias_count,
+                                                   const char *type_text,
+                                                   const char *expr_text) {
+    char normalized_type[CHENG_V3_MAX_TYPE_TEXT];
+    char expr[4096];
+    V3TypeCallSurface type_call_surface;
+    normalized_type[0] = '\0';
+    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    if (expr[0] == '\0') {
+        return false;
+    }
+    if (lowering != NULL &&
+        owner_module_path != NULL &&
+        v3_normalize_type_text(lowering,
+                               owner_module_path,
+                               aliases,
+                               alias_count,
+                               type_text,
+                               normalized_type,
+                               sizeof(normalized_type)) &&
+        v3_redundant_default_expr_matches_type_basic(normalized_type, expr)) {
+        return true;
+    }
+    if (v3_redundant_default_expr_matches_type_basic(type_text, expr)) {
+        return true;
+    }
+    if (lowering == NULL || owner_module_path == NULL) {
+        return false;
+    }
+    v3_type_call_surface_init(&type_call_surface);
+    if (!v3_classify_expr_type_call_surface(lowering,
+                                            owner_module_path,
+                                            aliases,
+                                            alias_count,
+                                            expr,
+                                            &type_call_surface) ||
+        type_call_surface.kind != V3_TYPE_CALL_DEFAULT_INIT ||
+        type_call_surface.normalized_type[0] == '\0') {
+        return false;
+    }
+    if (normalized_type[0] == '\0' &&
+        !v3_normalize_type_text(lowering,
+                                owner_module_path,
+                                aliases,
+                                alias_count,
+                                type_text,
+                                normalized_type,
+                                sizeof(normalized_type))) {
+        return false;
+    }
+    return strcmp(normalized_type, type_call_surface.normalized_type) == 0;
+}
+
+static void v3_format_redundant_explicit_default_init_error(const char *type_text,
+                                                            const char *expr_text,
+                                                            char *message_out,
+                                                            size_t message_cap) {
+    char type_trimmed[CHENG_V3_MAX_TYPE_TEXT];
+    char expr_trimmed[4096];
+    if (message_out == NULL || message_cap == 0U) {
+        return;
+    }
+    v3_trim_copy_text(type_text, type_trimmed, sizeof(type_trimmed));
+    v3_trim_copy_text(expr_text, expr_trimmed, sizeof(expr_trimmed));
+    snprintf(message_out,
+             message_cap,
+             "[cheng_v3_seed] redundant explicit default init; omit initializer type=%s expr=%s\n",
+             type_trimmed,
+             expr_trimmed);
+}
+
+static void v3_report_redundant_explicit_default_init(const char *source_path,
+                                                      const char *type_text,
+                                                      const char *name_kind,
+                                                      const char *name_text,
+                                                      const char *expr_text) {
+    const char *safe_source = source_path != NULL && source_path[0] != '\0' ? source_path : "<unknown>";
+    const char *safe_type = type_text != NULL && type_text[0] != '\0' ? type_text : "<unknown>";
+    const char *safe_kind = name_kind != NULL && name_kind[0] != '\0' ? name_kind : "name";
+    const char *safe_name = name_text != NULL && name_text[0] != '\0' ? name_text : "<unnamed>";
+    const char *safe_expr = expr_text != NULL ? expr_text : "";
+    fprintf(stderr,
+            "[cheng_v3_seed] redundant explicit default init; omit initializer source=%s type=%s %s=%s expr=%s\n",
+            safe_source,
+            safe_type,
+            safe_kind,
+            safe_name,
+            safe_expr);
 }
 
 static bool v3_const_record_set_indexed_value(V3ConstRecord *record,
@@ -10256,7 +10808,13 @@ static bool v3_const_value_set_implicit_default(const V3LoweringPlanStub *loweri
                 goto const_tuple_cleanup;
             }
             if (fields[i].has_default_expr) {
-                if (!v3_expr_is_stable_field_default(fields[i].default_expr, fields, item_count)) {
+                if (!v3_expr_is_stable_field_default(lowering,
+                                                     owner_module,
+                                                     aliases,
+                                                     alias_count,
+                                                     fields[i].default_expr,
+                                                     fields,
+                                                     item_count)) {
                     v3_const_value_free(&field_value);
                     goto const_tuple_cleanup;
                 }
@@ -10423,7 +10981,11 @@ const_tuple_cleanup:
                     return false;
                 }
                 if (type_def->fields[i].has_default_expr) {
-                    if (!v3_expr_is_stable_field_default(type_def->fields[i].default_expr,
+                    if (!v3_expr_is_stable_field_default(lowering,
+                                                         type_def->owner_module_path,
+                                                         type_aliases,
+                                                         type_alias_count,
+                                                         type_def->fields[i].default_expr,
                                                          type_def->fields,
                                                          type_def->field_count)) {
                         free(type_aliases);
@@ -11229,7 +11791,6 @@ static bool v3_const_eval_expr(const V3LoweringPlanStub *lowering,
     char left[4096];
     char right[4096];
     char surface_error[256];
-    char inner_type[CHENG_V3_MAX_TYPE_TEXT];
     char binary_op[4];
     int32_t literal_i32 = 0;
     double literal_f64 = 0.0;
@@ -11285,20 +11846,26 @@ static bool v3_const_eval_expr(const V3LoweringPlanStub *lowering,
     if (strcmp(expr, "[]") == 0) {
         return v3_const_value_set_empty_seq(out);
     }
-    if (v3_parse_default_expr_text(expr, inner_type, sizeof(inner_type))) {
-        if (current_function == NULL) {
-            return false;
+    if (current_function != NULL) {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               current_function->owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
+            return v3_const_value_set_implicit_default(lowering,
+                                                       current_function,
+                                                       aliases,
+                                                       alias_count,
+                                                       current_function->owner_module_path,
+                                                       current_function->source_path,
+                                                       type_call_surface.normalized_type,
+                                                       env,
+                                                       out,
+                                                       depth + 1U);
         }
-        return v3_const_value_set_implicit_default(lowering,
-                                                   current_function,
-                                                   aliases,
-                                                   alias_count,
-                                                   current_function->owner_module_path,
-                                                   current_function->source_path,
-                                                   inner_type,
-                                                   env,
-                                                   out,
-                                                   depth + 1U);
     }
     if (v3_const_parse_i32_literal_text(expr, &literal_i32)) {
         return v3_const_value_set_i32(out, literal_i32);
@@ -14586,22 +15153,25 @@ static bool v3_extract_trailing_type_arg_text(const char *text, char *out, size_
     return out[0] != '\0';
 }
 
-static bool v3_parse_default_expr_text(const char *expr_text,
-                                       char *type_out,
-                                       size_t type_cap) {
-    char base[128];
-    if (!expr_text || !type_out || type_cap == 0U) {
-        return false;
-    }
-    v3_strip_trailing_type_args_text(expr_text, base, sizeof(base));
-    if (strcmp(base, "default") != 0) {
-        return false;
-    }
-    if (!v3_extract_trailing_type_arg_text(expr_text, type_out, type_cap)) {
-        return false;
-    }
-    v3_trim_copy_text(type_out, type_out, type_cap);
-    return type_out[0] != '\0';
+static bool v3_type_is_forbidden_scalar_default_call(const char *type_text) {
+    return type_text != NULL &&
+           (strcmp(type_text, "bool") == 0 ||
+            strcmp(type_text, "int8") == 0 ||
+            strcmp(type_text, "uint8") == 0 ||
+            strcmp(type_text, "int16") == 0 ||
+            strcmp(type_text, "uint16") == 0 ||
+            strcmp(type_text, "int32") == 0 ||
+            strcmp(type_text, "int") == 0 ||
+            strcmp(type_text, "uint32") == 0 ||
+            strcmp(type_text, "int64") == 0 ||
+            strcmp(type_text, "uint64") == 0 ||
+            strcmp(type_text, "float") == 0 ||
+            strcmp(type_text, "float32") == 0 ||
+            strcmp(type_text, "float64") == 0 ||
+            strcmp(type_text, "char") == 0 ||
+            strcmp(type_text, "str") == 0 ||
+            strcmp(type_text, "cstring") == 0 ||
+            strcmp(type_text, "ptr") == 0);
 }
 
 static V3ResultIntrinsicKind v3_result_intrinsic_kind_from_name(const char *function_name) {
@@ -16214,6 +16784,7 @@ static bool v3_statement_has_duplicate_constructor_field(const V3LoweringPlanStu
     char type_text[CHENG_V3_MAX_TYPE_TEXT];
     char callee[PATH_MAX];
     char (*args)[4096] = v3_alloc_call_arg_scratch();
+    V3TypeCallSurface type_call_surface;
     size_t arg_count = 0U;
     bool valid = true;
     bool duplicate = false;
@@ -16247,11 +16818,14 @@ static bool v3_statement_has_duplicate_constructor_field(const V3LoweringPlanStu
         free(args);
         return false;
     }
-    if (!v3_callee_is_constructor_like(lowering,
+    if (!v3_classify_type_call_surface(lowering,
                                        owner_module_path,
                                        aliases,
                                        alias_count,
-                                       callee)) {
+                                       callee,
+                                       arg_count,
+                                       &type_call_surface) ||
+        type_call_surface.kind != V3_TYPE_CALL_CONSTRUCTOR) {
         free(args);
         return false;
     }
@@ -16307,6 +16881,519 @@ static bool v3_function_body_has_duplicate_constructor_field(const V3LoweringPla
         }
     }
     return false;
+}
+
+static bool v3_expr_find_removed_default_error_recursive(const V3LoweringPlanStub *lowering,
+                                                         const char *owner_module_path,
+                                                         const V3ImportAlias *aliases,
+                                                         size_t alias_count,
+                                                         const char *expr_text,
+                                                         char *message_out,
+                                                         size_t message_cap,
+                                                         unsigned depth) {
+    static const char *OPS[] = {
+        "||", "&&", "==", "!=", "<=", ">=", "<<", ">>", "<", ">", "|", "^", "xor", "&", "+", "-", "*", "/", "%"
+    };
+    char expr[8192];
+    char left[4096];
+    char right[4096];
+    char inner[4096];
+    char arg_text[4096];
+    char callee[PATH_MAX];
+    char (*args)[4096] = NULL;
+    size_t arg_count = 0U;
+    size_t i;
+    if (message_out && message_cap > 0U) {
+        message_out[0] = '\0';
+    }
+    if (lowering == NULL ||
+        owner_module_path == NULL ||
+        expr_text == NULL ||
+        message_out == NULL ||
+        message_cap == 0U ||
+        depth > 64U) {
+        return false;
+    }
+    v3_trim_copy_text(expr_text, expr, sizeof(expr));
+    if (expr[0] == '\0') {
+        return false;
+    }
+    if (v3_try_format_removed_default_expr_error(lowering,
+                                                 owner_module_path,
+                                                 aliases,
+                                                 alias_count,
+                                                 expr,
+                                                 message_out,
+                                                 message_cap)) {
+        return true;
+    }
+    if (v3_parse_named_arg_meta(expr, left, sizeof(left), inner, sizeof(inner))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            inner,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if (v3_parse_if_expr(expr,
+                         left,
+                         sizeof(left),
+                         right,
+                         sizeof(right),
+                         inner,
+                         sizeof(inner))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            left,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            right,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            inner,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if (v3_parse_ternary_expr(expr,
+                              left,
+                              sizeof(left),
+                              right,
+                              sizeof(right),
+                              inner,
+                              sizeof(inner))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            left,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            right,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            inner,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if ((expr[0] == '!' || expr[0] == '~') ||
+        (expr[0] == '-' && expr[1] != '\0' && !v3_parse_int_literal_text(expr, NULL))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            expr + 1,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    for (i = 0U; i < sizeof(OPS) / sizeof(OPS[0]); ++i) {
+        int32_t op_index = v3_find_top_level_binary_op_last(expr, OPS[i]);
+        if (op_index <= 0) {
+            continue;
+        }
+        snprintf(left, sizeof(left), "%.*s", op_index, expr);
+        snprintf(right, sizeof(right), "%s", expr + op_index + strlen(OPS[i]));
+        v3_trim_copy_text(left, left, sizeof(left));
+        v3_trim_copy_text(right, right, sizeof(right));
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            left,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            right,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if (v3_parse_member_access_expr(expr, left, sizeof(left), right, sizeof(right))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            left,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if (v3_parse_index_access_expr(expr, left, sizeof(left), right, sizeof(right))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            left,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            right,
+                                                            message_out,
+                                                            message_cap,
+                                                            depth + 1U);
+    }
+    if (v3_parse_list_literal_text_alloc(expr, &args, &arg_count)) {
+        for (i = 0U; i < arg_count; ++i) {
+            if (v3_expr_find_removed_default_error_recursive(lowering,
+                                                             owner_module_path,
+                                                             aliases,
+                                                             alias_count,
+                                                             args[i],
+                                                             message_out,
+                                                             message_cap,
+                                                             depth + 1U)) {
+                free(args);
+                return true;
+            }
+        }
+        free(args);
+        return false;
+    }
+    free(args);
+    args = v3_alloc_call_arg_scratch();
+    arg_count = 0U;
+    if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
+        v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
+        if (arg_count == 0U && arg_text[0] != '\0') {
+            snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+            arg_count = 1U;
+        }
+        for (i = 0U; i < arg_count; ++i) {
+            const char *arg_expr = args[i];
+            char named_field[128];
+            char named_expr[4096];
+            if (v3_parse_named_arg_meta(args[i],
+                                        named_field,
+                                        sizeof(named_field),
+                                        named_expr,
+                                        sizeof(named_expr))) {
+                arg_expr = named_expr;
+            }
+            if (v3_expr_find_removed_default_error_recursive(lowering,
+                                                             owner_module_path,
+                                                             aliases,
+                                                             alias_count,
+                                                             arg_expr,
+                                                             message_out,
+                                                             message_cap,
+                                                             depth + 1U)) {
+                free(args);
+                return true;
+            }
+        }
+    }
+    free(args);
+    return false;
+}
+
+static bool v3_statement_find_removed_default_error(const V3LoweringPlanStub *lowering,
+                                                    const char *owner_module_path,
+                                                    const V3ImportAlias *aliases,
+                                                    size_t alias_count,
+                                                    const char *statement,
+                                                    char *message_out,
+                                                    size_t message_cap) {
+    char expr[8192];
+    char name[128];
+    char type_text[CHENG_V3_MAX_TYPE_TEXT];
+    char lhs[4096];
+    char rhs[4096];
+    char cond[4096];
+    char inline_stmt[8192];
+    char iter_name[128];
+    char start_expr[4096];
+    char end_expr[4096];
+    bool end_inclusive = false;
+    if (message_out && message_cap > 0U) {
+        message_out[0] = '\0';
+    }
+    if (statement == NULL || statement[0] == '\0') {
+        return false;
+    }
+    if ((v3_startswith(statement, "let ") || v3_startswith(statement, "var ")) &&
+        v3_parse_binding_meta(statement,
+                              v3_startswith(statement, "let ") ? "let " : "var ",
+                              name,
+                              sizeof(name),
+                              type_text,
+                              sizeof(type_text),
+                              expr,
+                              sizeof(expr))) {
+        if (type_text[0] != '\0' &&
+            v3_redundant_default_expr_matches_type(lowering,
+                                                   owner_module_path,
+                                                   aliases,
+                                                   alias_count,
+                                                   type_text,
+                                                   expr)) {
+            v3_format_redundant_explicit_default_init_error(type_text,
+                                                            expr,
+                                                            message_out,
+                                                            message_cap);
+            return true;
+        }
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            expr,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U);
+    }
+    if (v3_startswith(statement, "return ")) {
+        snprintf(expr, sizeof(expr), "%s", statement + 7);
+        v3_trim_copy_text(expr, expr, sizeof(expr));
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            expr,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U);
+    }
+    if (v3_startswith(statement, "panic ")) {
+        snprintf(expr, sizeof(expr), "%s", statement + 6);
+        v3_trim_copy_text(expr, expr, sizeof(expr));
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            expr,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U);
+    }
+    if (v3_parse_if_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+        v3_parse_elif_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt)) ||
+        v3_parse_while_header(statement, cond, sizeof(cond), inline_stmt, sizeof(inline_stmt))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            cond,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U) ||
+               (inline_stmt[0] != '\0' &&
+                v3_statement_find_removed_default_error(lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       inline_stmt,
+                                                       message_out,
+                                                       message_cap));
+    }
+    if (v3_parse_else_header(statement, inline_stmt, sizeof(inline_stmt))) {
+        return inline_stmt[0] != '\0' &&
+               v3_statement_find_removed_default_error(lowering,
+                                                      owner_module_path,
+                                                      aliases,
+                                                      alias_count,
+                                                      inline_stmt,
+                                                      message_out,
+                                                      message_cap);
+    }
+    if (v3_parse_for_header(statement,
+                            iter_name,
+                            sizeof(iter_name),
+                            start_expr,
+                            sizeof(start_expr),
+                            end_expr,
+                            sizeof(end_expr),
+                            &end_inclusive,
+                            inline_stmt,
+                            sizeof(inline_stmt))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            start_expr,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U) ||
+               v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            end_expr,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U) ||
+               (inline_stmt[0] != '\0' &&
+                v3_statement_find_removed_default_error(lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       inline_stmt,
+                                                       message_out,
+                                                       message_cap));
+    }
+    if (v3_parse_assignment_meta(statement, lhs, sizeof(lhs), rhs, sizeof(rhs))) {
+        return v3_expr_find_removed_default_error_recursive(lowering,
+                                                            owner_module_path,
+                                                            aliases,
+                                                            alias_count,
+                                                            rhs,
+                                                            message_out,
+                                                            message_cap,
+                                                            0U);
+    }
+    return v3_expr_find_removed_default_error_recursive(lowering,
+                                                        owner_module_path,
+                                                        aliases,
+                                                        alias_count,
+                                                        statement,
+                                                        message_out,
+                                                        message_cap,
+                                                        0U);
+}
+
+static bool v3_function_body_has_removed_default_error(const V3LoweringPlanStub *lowering,
+                                                       const char *owner_module_path,
+                                                       const V3ImportAlias *aliases,
+                                                       size_t alias_count,
+                                                       char **lines,
+                                                       size_t line_count,
+                                                       size_t signature_end_index,
+                                                       char *statement_out,
+                                                       size_t statement_cap,
+                                                       char *message_out,
+                                                       size_t message_cap) {
+    size_t index = signature_end_index + 1U;
+    while (index < line_count) {
+        char raw_copy[4096];
+        char statement[8192];
+        char *trimmed;
+        snprintf(raw_copy, sizeof(raw_copy), "%s", lines[index]);
+        trimmed = v3_trim_inplace(raw_copy);
+        if (*trimmed == '\0') {
+            index += 1U;
+            continue;
+        }
+        if (v3_line_indent(lines[index]) <= 0 && v3_is_top_level_decl_start(trimmed)) {
+            break;
+        }
+        if (!v3_collect_statement_from_lines(lines, line_count, &index, statement, sizeof(statement))) {
+            break;
+        }
+        if (v3_statement_find_removed_default_error(lowering,
+                                                    owner_module_path,
+                                                    aliases,
+                                                    alias_count,
+                                                    statement,
+                                                    message_out,
+                                                    message_cap)) {
+            snprintf(statement_out, statement_cap, "%s", statement);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool v3_validate_source_removed_default_usage(const V3SystemLinkPlanStub *plan,
+                                                     const char *source_path,
+                                                     const V3LoweringPlanStub *lowering) {
+    char owner_module_path[PATH_MAX];
+    V3ImportAlias aliases[CHENG_V3_MAX_IMPORT_ALIASES];
+    size_t alias_count = 0U;
+    char *owned;
+    char **lines;
+    size_t line_count = 0U;
+    size_t i;
+    if (plan == NULL || source_path == NULL || lowering == NULL) {
+        return false;
+    }
+    v3_source_path_to_module_path(plan->workspace_root,
+                                  plan->package_root,
+                                  plan->package_id,
+                                  source_path,
+                                  owner_module_path,
+                                  sizeof(owner_module_path));
+    if (!v3_load_source_lines(source_path, &lines, &owned, &line_count)) {
+        return false;
+    }
+    v3_parse_import_aliases_from_lines(lines,
+                                       line_count,
+                                       aliases,
+                                       &alias_count,
+                                       CHENG_V3_MAX_IMPORT_ALIASES);
+    for (i = 0U; i < line_count; ++i) {
+        char function_name[128];
+        char signature_text[8192];
+        char line_copy[4096];
+        char bad_statement[8192];
+        char removed_default_message[4096];
+        size_t signature_end_index = 0U;
+        char *trimmed;
+        snprintf(line_copy, sizeof(line_copy), "%s", lines[i]);
+        trimmed = v3_trim_inplace(line_copy);
+        if (!v3_lowering_function_name_from_line(trimmed, function_name, sizeof(function_name))) {
+            continue;
+        }
+        if (!v3_collect_function_signature(lines,
+                                           line_count,
+                                           i,
+                                           signature_text,
+                                           sizeof(signature_text),
+                                           &signature_end_index)) {
+            continue;
+        }
+        if (v3_function_body_has_removed_default_error(lowering,
+                                                       owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       lines,
+                                                       line_count,
+                                                       signature_end_index,
+                                                       bad_statement,
+                                                       sizeof(bad_statement),
+                                                       removed_default_message,
+                                                       sizeof(removed_default_message))) {
+            fprintf(stderr, "%s", removed_default_message);
+            free(lines);
+            free(owned);
+            return false;
+        }
+    }
+    free(lines);
+    free(owned);
+    return true;
 }
 
 static bool v3_collect_lowering_functions_from_source(const V3SystemLinkPlanStub *plan,
@@ -17126,6 +18213,16 @@ static bool v3_build_lowering_plan_stub(const V3SystemLinkPlanStub *plan,
         if (!v3_refresh_type_defs_from_source(plan,
                                               plan->source_closure_paths[i].text,
                                               lowering)) {
+            return false;
+        }
+    }
+    for (i = 0; i < plan->source_closure_count; ++i) {
+        if (v3_source_closure_seen_before(plan, i, plan->source_closure_paths[i].text)) {
+            continue;
+        }
+        if (!v3_validate_source_removed_default_usage(plan,
+                                                      plan->source_closure_paths[i].text,
+                                                      lowering)) {
             return false;
         }
     }
@@ -18564,24 +19661,6 @@ static bool v3_parse_prefix_single_arg_call(const char *expr_text,
         }
     }
     return false;
-}
-
-static bool v3_parse_discard_statement(const char *statement,
-                                       char *expr_out,
-                                       size_t expr_cap) {
-    char trimmed[8192];
-    if (expr_out != NULL && expr_cap > 0U) {
-        expr_out[0] = '\0';
-    }
-    if (statement == NULL) {
-        return false;
-    }
-    v3_trim_copy_text(statement, trimmed, sizeof(trimmed));
-    if (!v3_startswith(trimmed, "discard ")) {
-        return false;
-    }
-    v3_trim_copy_text(trimmed + 8, expr_out, expr_cap);
-    return expr_out != NULL && expr_out[0] != '\0';
 }
 
 static bool v3_parse_address_of_expr(const char *expr_text,
@@ -24186,6 +25265,11 @@ static bool v3_emit_copy_slot_to_address(const V3SystemLinkPlanStub *plan,
     char value_type[256];
     int32_t copy_size;
     int src_reg;
+    (void)current_function;
+    (void)aliases;
+    (void)alias_count;
+    (void)call_arg_base;
+    (void)call_depth;
     if (!src_slot || src_slot->stack_size < 0) {
         return false;
     }
@@ -25368,7 +26452,11 @@ static bool v3_named_arg_fields_unique(const char args[][4096], size_t arg_count
 static bool v3_tuple_args_cover_all_items(const char *tuple_type_text,
                                           const char args[][4096],
                                           size_t arg_count);
-static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_text,
+static V3FieldDefaultExprKind v3_classify_field_default_expr(const V3LoweringPlanStub *lowering,
+                                                             const char *owner_module_path,
+                                                             const V3ImportAlias *aliases,
+                                                             size_t alias_count,
+                                                             const char *expr_text,
                                                              const V3TypeFieldDef *fields,
                                                              size_t field_count,
                                                              char *detail_out,
@@ -25379,7 +26467,11 @@ static void v3_report_invalid_field_default(const char *source_path,
                                             const char *expr_text,
                                             V3FieldDefaultExprKind kind,
                                             const char *detail);
-static bool v3_validate_type_field_defaults(const char *source_path,
+static bool v3_validate_type_field_defaults(const V3LoweringPlanStub *lowering,
+                                            const char *owner_module_path,
+                                            const V3ImportAlias *aliases,
+                                            size_t alias_count,
+                                            const char *source_path,
                                             const char *type_text,
                                             const V3TypeFieldDef *fields,
                                             size_t field_count);
@@ -26400,19 +27492,26 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         }
     }
     {
-        char default_type[CHENG_V3_MAX_TYPE_TEXT];
-        if (v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               current_function->owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
             return true;
         }
     }
     if (parsed_call_expr) {
         V3AsmCallTarget target;
         V3NativeCallLoweringRule rule;
+        V3TypeCallSurface type_call_surface;
         char target_param_types[CHENG_V3_MAX_CALL_ARGS][256];
         char target_param_abis[CHENG_V3_MAX_CALL_ARGS][32];
         bool has_target = false;
-        bool is_constructor_call = false;
-        bool pure_constructor_call = false;
+        bool is_type_materialize_call = false;
+        bool pure_type_materialize_call = false;
         V3ResultIntrinsicKind result_kind;
         const char *callee_base = NULL;
         int next_call_depth = call_depth + 1;
@@ -26426,12 +27525,17 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                                                   NULL)) {
             return false;
         }
-        is_constructor_call = v3_callee_is_constructor_like(lowering,
-                                                            current_function->owner_module_path,
-                                                            aliases,
-                                                            alias_count,
-                                                            callee);
-        if (is_constructor_call && has_target == false) {
+        if (!v3_classify_type_call_surface(lowering,
+                                           current_function->owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           callee,
+                                           arg_count,
+                                           &type_call_surface)) {
+            return false;
+        }
+        is_type_materialize_call = v3_type_call_kind_is_materialize(type_call_surface.kind);
+        if (type_call_surface.kind == V3_TYPE_CALL_CONSTRUCTOR && has_target == false) {
             bool has_named_fields = false;
             for (i = 0; i < arg_count; ++i) {
                 if (v3_find_top_level_binary_op(args[i], ":") > 0) {
@@ -26550,7 +27654,7 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
         v3_snapshot_call_target_param_signature(&target,
                                                 target_param_types,
                                                 target_param_abis);
-        pure_constructor_call = is_constructor_call && !has_target;
+        pure_type_materialize_call = is_type_materialize_call && !has_target;
         for (i = 0; i < arg_count; ++i) {
             V3CallTargetArgKind arg_kind =
                 has_target && i < rule.param_count
@@ -26579,10 +27683,10 @@ static bool v3_prepare_expr_call_state_impl(const V3SystemLinkPlanStub *plan,
                         current_function->symbol_text,
                         callee,
                         i,
-                        args[i]);
+                                            args[i]);
                 return false;
             }
-            if (pure_constructor_call) {
+            if (pure_type_materialize_call) {
                 continue;
             }
             if ((result_kind == V3_RESULT_INTRINSIC_OK && arg_count == 1U) ||
@@ -27660,26 +28764,24 @@ static bool v3_infer_call_expr_type_from_args(const V3SystemLinkPlanStub *plan,
         snprintf(abi_out, abi_cap, "%s", target.return_abi_class);
         return type_out[0] != '\0';
     }
-    if (v3_callee_is_constructor_like(lowering,
-                                      current_function->owner_module_path,
-                                      aliases,
-                                      alias_count,
-                                      callee)) {
-        char normalized_ctor[256];
-        if (!v3_normalize_type_text(lowering,
-                                    current_function->owner_module_path,
-                                    aliases,
-                                    alias_count,
-                                    callee,
-                                    normalized_ctor,
-                                    sizeof(normalized_ctor))) {
+    {
+        V3TypeCallSurface type_call_surface;
+        if (!v3_classify_type_call_surface(lowering,
+                                           current_function->owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           callee,
+                                           arg_count,
+                                           &type_call_surface)) {
             return false;
         }
-        snprintf(type_out, type_cap, "%s", normalized_ctor);
-        snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_ctor));
+        if (!v3_type_call_kind_is_materialize(type_call_surface.kind)) {
+            return false;
+        }
+        snprintf(type_out, type_cap, "%s", type_call_surface.normalized_type);
+        snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(type_call_surface.normalized_type));
         return true;
     }
-    return false;
 }
 
 static bool v3_infer_expr_type_impl(const V3SystemLinkPlanStub *plan,
@@ -28125,6 +29227,20 @@ static bool v3_infer_expr_type_impl(const V3SystemLinkPlanStub *plan,
         }
         free(args);
     }
+    {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               current_function->owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
+            snprintf(type_out, type_cap, "%s", type_call_surface.normalized_type);
+            snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(type_out));
+            return true;
+        }
+    }
     if (v3_parse_index_access_expr(expr, base_expr, sizeof(base_expr), index_expr, sizeof(index_expr))) {
         char base_type[256];
         char base_abi[32];
@@ -28230,21 +29346,6 @@ static bool v3_infer_expr_type_impl(const V3SystemLinkPlanStub *plan,
                                    abi_out,
                                    abi_cap,
                                    NULL)) {
-        return true;
-    }
-    if (v3_parse_default_expr_text(expr, type_out, type_cap)) {
-        char normalized_default_type[CHENG_V3_MAX_TYPE_TEXT];
-        if (!v3_normalize_type_text(lowering,
-                                    current_function->owner_module_path,
-                                    aliases,
-                                    alias_count,
-                                    type_out,
-                                    normalized_default_type,
-                                    sizeof(normalized_default_type))) {
-            return false;
-        }
-        snprintf(type_out, type_cap, "%s", normalized_default_type);
-        snprintf(abi_out, abi_cap, "%s", v3_type_abi_class(normalized_default_type));
         return true;
     }
     local_index = v3_find_local_slot(locals, local_count, expr);
@@ -30730,21 +31831,17 @@ static bool v3_codegen_expr_scalar(const V3SystemLinkPlanStub *plan,
         }
     }
     {
-        char default_type[CHENG_V3_MAX_TYPE_TEXT];
-        char normalized_default_type[CHENG_V3_MAX_TYPE_TEXT];
+        V3TypeCallSurface type_call_surface;
         const char *default_abi;
-        if (v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
-            if (!v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        default_type,
-                                        normalized_default_type,
-                                        sizeof(normalized_default_type))) {
-                return false;
-            }
-            default_abi = v3_type_abi_class(normalized_default_type);
-            if (v3_expr_materializes_to_address(normalized_default_type, default_abi)) {
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               current_function->owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
+            default_abi = v3_type_abi_class(type_call_surface.normalized_type);
+            if (v3_expr_materializes_to_address(type_call_surface.normalized_type, default_abi)) {
                 return false;
             }
             return v3_emit_mov_imm(out, cap, target_reg, 0);
@@ -31867,7 +32964,11 @@ static bool v3_find_default_field_name_in_expr(const char *expr_text,
     return false;
 }
 
-static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_text,
+static V3FieldDefaultExprKind v3_classify_field_default_expr(const V3LoweringPlanStub *lowering,
+                                                             const char *owner_module_path,
+                                                             const V3ImportAlias *aliases,
+                                                             size_t alias_count,
+                                                             const char *expr_text,
                                                              const V3TypeFieldDef *fields,
                                                              size_t field_count,
                                                              char *detail_out,
@@ -31907,8 +33008,26 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
         v3_const_parse_f64_literal_text(expr, NULL)) {
         return V3_FIELD_DEFAULT_EXPR_STABLE;
     }
-    if (v3_parse_default_expr_text(expr, inner, sizeof(inner))) {
-        return V3_FIELD_DEFAULT_EXPR_STABLE;
+    {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface)) {
+            if (v3_type_call_kind_is_materialize(type_call_surface.kind)) {
+                return V3_FIELD_DEFAULT_EXPR_STABLE;
+            }
+            if (type_call_surface.forbidden_scalar_default ||
+                type_call_surface.forbidden_seq_or_fixed_default ||
+                type_call_surface.ref_object_default) {
+                if (detail_out && detail_cap > 0U) {
+                    snprintf(detail_out, detail_cap, "%s", expr);
+                }
+                return V3_FIELD_DEFAULT_EXPR_UNSUPPORTED;
+            }
+        }
     }
     {
         char (*items)[4096] = NULL;
@@ -31916,7 +33035,15 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
         if (v3_parse_list_literal_text_alloc(expr, &items, &item_count)) {
             for (i = 0U; i < item_count; ++i) {
                 V3FieldDefaultExprKind item_kind =
-                    v3_classify_field_default_expr(items[i], fields, field_count, detail_out, detail_cap);
+                    v3_classify_field_default_expr(lowering,
+                                                   owner_module_path,
+                                                   aliases,
+                                                   alias_count,
+                                                   items[i],
+                                                   fields,
+                                                   field_count,
+                                                   detail_out,
+                                                   detail_cap);
                 if (item_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
                     free(items);
                     return item_kind;
@@ -31935,16 +33062,40 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
                          inner,
                          sizeof(inner))) {
         V3FieldDefaultExprKind branch_kind =
-            v3_classify_field_default_expr(left, fields, field_count, detail_out, detail_cap);
+            v3_classify_field_default_expr(lowering,
+                                           owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           left,
+                                           fields,
+                                           field_count,
+                                           detail_out,
+                                           detail_cap);
         if (branch_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
             return branch_kind;
         }
         branch_kind =
-            v3_classify_field_default_expr(right, fields, field_count, detail_out, detail_cap);
+            v3_classify_field_default_expr(lowering,
+                                           owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           right,
+                                           fields,
+                                           field_count,
+                                           detail_out,
+                                           detail_cap);
         if (branch_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
             return branch_kind;
         }
-        return v3_classify_field_default_expr(inner, fields, field_count, detail_out, detail_cap);
+        return v3_classify_field_default_expr(lowering,
+                                              owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              inner,
+                                              fields,
+                                              field_count,
+                                              detail_out,
+                                              detail_cap);
     }
     if (v3_parse_ternary_expr(expr,
                               left,
@@ -31952,21 +33103,53 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
                               right,
                               sizeof(right),
                               inner,
-                              sizeof(inner))) {
+                         sizeof(inner))) {
         V3FieldDefaultExprKind branch_kind =
-            v3_classify_field_default_expr(left, fields, field_count, detail_out, detail_cap);
+            v3_classify_field_default_expr(lowering,
+                                           owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           left,
+                                           fields,
+                                           field_count,
+                                           detail_out,
+                                           detail_cap);
         if (branch_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
             return branch_kind;
         }
         branch_kind =
-            v3_classify_field_default_expr(right, fields, field_count, detail_out, detail_cap);
+            v3_classify_field_default_expr(lowering,
+                                           owner_module_path,
+                                           aliases,
+                                           alias_count,
+                                           right,
+                                           fields,
+                                           field_count,
+                                           detail_out,
+                                           detail_cap);
         if (branch_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
             return branch_kind;
         }
-        return v3_classify_field_default_expr(inner, fields, field_count, detail_out, detail_cap);
+        return v3_classify_field_default_expr(lowering,
+                                              owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              inner,
+                                              fields,
+                                              field_count,
+                                              detail_out,
+                                              detail_cap);
     }
     if (expr[0] == '!' || expr[0] == '-' || expr[0] == '~') {
-        return v3_classify_field_default_expr(expr + 1, fields, field_count, detail_out, detail_cap);
+        return v3_classify_field_default_expr(lowering,
+                                              owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              expr + 1,
+                                              fields,
+                                              field_count,
+                                              detail_out,
+                                              detail_cap);
     }
     for (i = 0; i < sizeof(OPS) / sizeof(OPS[0]); ++i) {
         int32_t op_index = v3_find_top_level_binary_op_last(expr, OPS[i]);
@@ -31977,11 +33160,27 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
             v3_trim_copy_text(right, right, sizeof(right));
             {
                 V3FieldDefaultExprKind side_kind =
-                    v3_classify_field_default_expr(left, fields, field_count, detail_out, detail_cap);
+                    v3_classify_field_default_expr(lowering,
+                                                   owner_module_path,
+                                                   aliases,
+                                                   alias_count,
+                                                   left,
+                                                   fields,
+                                                   field_count,
+                                                   detail_out,
+                                                   detail_cap);
                 if (side_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
                     return side_kind;
                 }
-                return v3_classify_field_default_expr(right, fields, field_count, detail_out, detail_cap);
+                return v3_classify_field_default_expr(lowering,
+                                                      owner_module_path,
+                                                      aliases,
+                                                      alias_count,
+                                                      right,
+                                                      fields,
+                                                      field_count,
+                                                      detail_out,
+                                                      detail_cap);
             }
         }
     }
@@ -31998,9 +33197,11 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
     {
         char (*args)[4096] = v3_alloc_call_arg_scratch();
         size_t arg_count = 0U;
+        arg_text[0] = '\0';
         if (v3_parse_call_text(expr, callee, sizeof(callee), args, &arg_count, CHENG_V3_MAX_CALL_ARGS) ||
             v3_parse_prefix_single_arg_call(expr, callee, sizeof(callee), arg_text, sizeof(arg_text))) {
             const char *base = v3_callee_base_name(callee);
+            V3TypeCallSurface call_surface;
             bool allowed =
                 strcmp(callee, "new") == 0 ||
                 strcmp(base, "int") == 0 ||
@@ -32019,18 +33220,37 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
                 strcmp(base, "float64") == 0 ||
                 strcmp(base, "str") == 0 ||
                 strcmp(base, "cstring") == 0 ||
-                strcmp(base, "ptr") == 0 ||
-                (base[0] >= 'A' && base[0] <= 'Z');
+                strcmp(base, "ptr") == 0;
+            if (arg_count == 0U && arg_text[0] != '\0') {
+                snprintf(args[0], sizeof(args[0]), "%s", arg_text);
+                arg_count = 1U;
+            }
+            if (!allowed &&
+                v3_classify_type_call_surface(lowering,
+                                              owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              callee,
+                                              arg_count,
+                                              &call_surface)) {
+                if (v3_type_call_kind_is_materialize(call_surface.kind)) {
+                    allowed = true;
+                } else if (call_surface.forbidden_scalar_default ||
+                           call_surface.forbidden_seq_or_fixed_default ||
+                           call_surface.ref_object_default) {
+                    if (detail_out && detail_cap > 0U) {
+                        snprintf(detail_out, detail_cap, "%s", callee);
+                    }
+                    free(args);
+                    return V3_FIELD_DEFAULT_EXPR_CALL_UNSUPPORTED;
+                }
+            }
             if (!allowed) {
                 if (detail_out && detail_cap > 0U) {
                     snprintf(detail_out, detail_cap, "%s", callee);
                 }
                 free(args);
                 return V3_FIELD_DEFAULT_EXPR_CALL_UNSUPPORTED;
-            }
-            if (arg_count == 0U && arg_text[0] != '\0') {
-                snprintf(args[0], sizeof(args[0]), "%s", arg_text);
-                arg_count = 1U;
             }
             for (i = 0; i < arg_count; ++i) {
                 char named_field[128];
@@ -32044,7 +33264,15 @@ static V3FieldDefaultExprKind v3_classify_field_default_expr(const char *expr_te
                                             sizeof(named_expr))) {
                     arg_expr = named_expr;
                 }
-                arg_kind = v3_classify_field_default_expr(arg_expr, fields, field_count, detail_out, detail_cap);
+                arg_kind = v3_classify_field_default_expr(lowering,
+                                                          owner_module_path,
+                                                          aliases,
+                                                          alias_count,
+                                                          arg_expr,
+                                                          fields,
+                                                          field_count,
+                                                          detail_out,
+                                                          detail_cap);
                 if (arg_kind != V3_FIELD_DEFAULT_EXPR_STABLE) {
                     free(args);
                     return arg_kind;
@@ -32110,7 +33338,11 @@ static void v3_report_invalid_field_default(const char *source_path,
     }
 }
 
-static bool v3_validate_type_field_defaults(const char *source_path,
+static bool v3_validate_type_field_defaults(const V3LoweringPlanStub *lowering,
+                                            const char *owner_module_path,
+                                            const V3ImportAlias *aliases,
+                                            size_t alias_count,
+                                            const char *source_path,
                                             const char *type_text,
                                             const V3TypeFieldDef *fields,
                                             size_t field_count) {
@@ -32118,6 +33350,7 @@ static bool v3_validate_type_field_defaults(const char *source_path,
     for (i = 0U; i < field_count; ++i) {
         char detail[256];
         char field_name[128];
+        char removed_default_error[512];
         V3FieldDefaultExprKind kind;
         if (!fields[i].has_default_expr) {
             continue;
@@ -32127,7 +33360,34 @@ static bool v3_validate_type_field_defaults(const char *source_path,
         } else {
             v3_tuple_field_synthetic_name(i, field_name, sizeof(field_name));
         }
-        kind = v3_classify_field_default_expr(fields[i].default_expr,
+        if (v3_redundant_default_expr_matches_type(lowering,
+                                                   owner_module_path,
+                                                   aliases,
+                                                   alias_count,
+                                                   fields[i].type_text,
+                                                   fields[i].default_expr)) {
+            v3_report_redundant_explicit_default_init(source_path,
+                                                      fields[i].type_text,
+                                                      "field",
+                                                      field_name,
+                                                      fields[i].default_expr);
+            return false;
+        }
+        if (v3_try_format_removed_default_expr_error(lowering,
+                                                     owner_module_path,
+                                                     aliases,
+                                                     alias_count,
+                                                     fields[i].default_expr,
+                                                     removed_default_error,
+                                                     sizeof(removed_default_error))) {
+            fputs(removed_default_error, stderr);
+            return false;
+        }
+        kind = v3_classify_field_default_expr(lowering,
+                                              owner_module_path,
+                                              aliases,
+                                              alias_count,
+                                              fields[i].default_expr,
                                               fields,
                                               field_count,
                                               detail,
@@ -32146,10 +33406,18 @@ static bool v3_validate_type_field_defaults(const char *source_path,
     return true;
 }
 
-static bool v3_expr_is_stable_field_default(const char *expr_text,
+static bool v3_expr_is_stable_field_default(const V3LoweringPlanStub *lowering,
+                                            const char *owner_module_path,
+                                            const V3ImportAlias *aliases,
+                                            size_t alias_count,
+                                            const char *expr_text,
                                             const V3TypeFieldDef *fields,
                                             size_t field_count) {
-    return v3_classify_field_default_expr(expr_text,
+    return v3_classify_field_default_expr(lowering,
+                                          owner_module_path,
+                                          aliases,
+                                          alias_count,
+                                          expr_text,
                                           fields,
                                           field_count,
                                           NULL,
@@ -32346,10 +33614,35 @@ static bool v3_emit_field_default_expr_into_address(const V3SystemLinkPlanStub *
                                                     size_t cap) {
     V3LoweredFunctionStub eval_function;
     const char *field_abi = v3_type_abi_class(field_type);
-    if (!v3_expr_is_stable_field_default(field_expr, fields, field_count)) {
+    char removed_default_error[512];
+    if (v3_try_format_removed_default_expr_error(lowering,
+                                                 type_owner_module_path,
+                                                 type_aliases,
+                                                 type_alias_count,
+                                                 field_expr,
+                                                 removed_default_error,
+                                                 sizeof(removed_default_error))) {
+        fputs(removed_default_error, stderr);
+        return false;
+    }
+    if (!v3_expr_is_stable_field_default(lowering,
+                                         type_owner_module_path,
+                                         type_aliases,
+                                         type_alias_count,
+                                         field_expr,
+                                         fields,
+                                         field_count)) {
         char detail[256];
         V3FieldDefaultExprKind kind =
-            v3_classify_field_default_expr(field_expr, fields, field_count, detail, sizeof(detail));
+            v3_classify_field_default_expr(lowering,
+                                           type_owner_module_path,
+                                           type_aliases,
+                                           type_alias_count,
+                                           field_expr,
+                                           fields,
+                                           field_count,
+                                           detail,
+                                           sizeof(detail));
         v3_report_invalid_field_default(type_source_path,
                                         container_type_text,
                                         field_name,
@@ -32546,7 +33839,11 @@ static bool v3_emit_implicit_default_into_address(const V3SystemLinkPlanStub *pl
                 v3_tuple_field_synthetic_name(i, fields[i].name, sizeof(fields[i].name));
             }
         }
-        if (!v3_validate_type_field_defaults(type_source_path,
+        if (!v3_validate_type_field_defaults(lowering,
+                                             type_owner_module_path,
+                                             aliases,
+                                             alias_count,
+                                             type_source_path,
                                              normalized_type,
                                              fields,
                                              item_count)) {
@@ -33087,6 +34384,7 @@ static bool v3_materialize_composite_call_expr_into_address(const V3SystemLinkPl
                                                             size_t cap) {
     V3AsmCallTarget target;
     V3NativeCompositeCallLoweringRule composite_rule;
+    V3TypeCallSurface type_call_surface;
     V3ResultIntrinsicKind result_kind;
     size_t arg_count = 0U;
     bool resolved = false;
@@ -33166,11 +34464,16 @@ static bool v3_materialize_composite_call_expr_into_address(const V3SystemLinkPl
                                                      out,
                                                      cap);
     }
-    if (v3_callee_is_constructor_like(lowering,
-                                      current_function->owner_module_path,
-                                      aliases,
-                                      alias_count,
-                                      callee)) {
+    if (!v3_classify_type_call_surface(lowering,
+                                       current_function->owner_module_path,
+                                       aliases,
+                                       alias_count,
+                                       callee,
+                                       arg_count,
+                                       &type_call_surface)) {
+        return false;
+    }
+    if (v3_type_call_kind_is_materialize(type_call_surface.kind)) {
         return v3_emit_constructor_into_address(plan,
                                                 lowering,
                                                 current_function,
@@ -33781,6 +35084,11 @@ static bool v3_emit_clone_composite_address_to_address(const V3SystemLinkPlanStu
                                                        char *out,
                                                        size_t cap) {
     V3TypeLayoutStub layout;
+    (void)current_function;
+    (void)aliases;
+    (void)alias_count;
+    (void)call_arg_base;
+    (void)call_depth;
     if (!v3_compute_type_layout_impl(lowering, type_text, &layout, 0U)) {
         return false;
     }
@@ -33978,17 +35286,15 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
         return false;
     }
     {
-        char default_type[CHENG_V3_MAX_TYPE_TEXT];
-        char normalized_default_type[CHENG_V3_MAX_TYPE_TEXT];
-        if (v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
-            if (!v3_normalize_type_text(lowering,
-                                        current_function->owner_module_path,
-                                        aliases,
-                                        alias_count,
-                                        default_type,
-                                        normalized_default_type,
-                                        sizeof(normalized_default_type)) ||
-                strcmp(normalized_default_type, normalized_dest_type) != 0) {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               current_function->owner_module_path,
+                                               aliases,
+                                               alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
+            if (strcmp(type_call_surface.normalized_type, normalized_dest_type) != 0) {
                 return false;
             }
             return v3_emit_implicit_default_into_address(plan,
@@ -33998,7 +35304,7 @@ static bool v3_materialize_composite_expr_into_address(const V3SystemLinkPlanStu
                                                          alias_count,
                                                          current_function->owner_module_path,
                                                          current_function->source_path,
-                                                         normalized_dest_type,
+                                                         type_call_surface.normalized_type,
                                                          dest_addr_reg,
                                                          call_arg_base,
                                                          string_temp_base,
@@ -36616,24 +37922,17 @@ static bool v3_parse_for_header(const char *statement,
     char *in_sep;
     char *range_text;
     if (!v3_startswith(statement, "for ")) {
-        fprintf(stderr, "[cheng_v3_seed] parse for header reject prefix stmt=%s\n", statement);
         return false;
     }
     v3_trim_copy_text(statement, trimmed, sizeof(trimmed));
     colon = v3_find_top_level_colon(trimmed);
     if (colon < 0) {
-        fprintf(stderr, "[cheng_v3_seed] parse for header missing colon stmt=%s trimmed=%s\n",
-                statement,
-                trimmed);
         return false;
     }
     snprintf(header, sizeof(header), "%.*s", colon - 4, trimmed + 4);
     v3_trim_copy_text(header, header, sizeof(header));
     in_sep = strstr(header, " in ");
     if (!in_sep) {
-        fprintf(stderr, "[cheng_v3_seed] parse for header missing in-sep stmt=%s header=%s\n",
-                statement,
-                header);
         return false;
     }
     *in_sep = '\0';
@@ -36645,20 +37944,11 @@ static bool v3_parse_for_header(const char *statement,
                              end_expr_out,
                              end_expr_cap,
                              end_inclusive_out)) {
-        fprintf(stderr, "[cheng_v3_seed] parse for header missing range-sep stmt=%s range=%s\n",
-                statement,
-                range_text);
         return false;
     }
     snprintf(inline_stmt_out, inline_stmt_cap, "%s", trimmed + colon + 1);
     v3_trim_copy_text(inline_stmt_out, inline_stmt_out, inline_stmt_cap);
     if (iter_name_out[0] == '\0' || start_expr_out[0] == '\0' || end_expr_out[0] == '\0') {
-        fprintf(stderr,
-                "[cheng_v3_seed] parse for header empty part stmt=%s iter=%s start=%s end=%s\n",
-                statement,
-                iter_name_out,
-                start_expr_out,
-                end_expr_out);
         return false;
     }
     return true;
@@ -40120,6 +41410,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
             char inferred_abi[32];
             char normalized_type[256];
             char prepared_expr[8192];
+            bool had_explicit_type = type_text[0] != '\0';
             if (type_text[0] == '\0') {
                 if (!v3_infer_expr_type(plan,
                                         lowering,
@@ -40133,6 +41424,16 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                                         sizeof(inferred_type),
                                         inferred_abi,
                                         sizeof(inferred_abi))) {
+                    char removed_default_error[512];
+                    if (v3_try_format_removed_default_expr_error(lowering,
+                                                                 function->owner_module_path,
+                                                                 aliases,
+                                                                 alias_count,
+                                                                 expr,
+                                                                 removed_default_error,
+                                                                 sizeof(removed_default_error))) {
+                        fputs(removed_default_error, stderr);
+                    }
                     fprintf(stderr,
                             "[cheng_v3_seed] prepare binding infer type failed function=%s local=%s expr=%s\n",
                             function->symbol_text,
@@ -40143,6 +41444,22 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                     return false;
                 }
                 snprintf(type_text, sizeof(type_text), "%s", inferred_type);
+            }
+            if (had_explicit_type &&
+                v3_redundant_default_expr_matches_type(lowering,
+                                                       function->owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       type_text,
+                                                       expr)) {
+                v3_report_redundant_explicit_default_init(function->source_path,
+                                                          type_text,
+                                                          "local",
+                                                          name,
+                                                          expr);
+                free(lines);
+                free(owned_lines);
+                return false;
             }
             if (!v3_tuple_binding_expr_complete(type_text, expr)) {
                 fprintf(stderr,
@@ -40962,6 +42279,7 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
             char inferred_type[CHENG_V3_MAX_TYPE_TEXT];
             char inferred_abi[32];
             char normalized_type[256];
+            bool had_explicit_type = type_text[0] != '\0';
             if (type_text[0] == '\0') {
                 if (!v3_infer_expr_type(plan,
                                         lowering,
@@ -40975,6 +42293,16 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                                         sizeof(inferred_type),
                                         inferred_abi,
                                         sizeof(inferred_abi))) {
+                    char removed_default_error[512];
+                    if (v3_try_format_removed_default_expr_error(lowering,
+                                                                 function->owner_module_path,
+                                                                 aliases,
+                                                                 alias_count,
+                                                                 expr,
+                                                                 removed_default_error,
+                                                                 sizeof(removed_default_error))) {
+                        fputs(removed_default_error, stderr);
+                    }
                     fprintf(stderr,
                             "[cheng_v3_seed] emit binding infer type failed function=%s local=%s expr=%s\n",
                             function->symbol_text,
@@ -40985,6 +42313,22 @@ static bool v3_try_emit_scalar_function(const V3SystemLinkPlanStub *plan,
                     return false;
                 }
                 snprintf(type_text, sizeof(type_text), "%s", inferred_type);
+            }
+            if (had_explicit_type &&
+                v3_redundant_default_expr_matches_type(lowering,
+                                                       function->owner_module_path,
+                                                       aliases,
+                                                       alias_count,
+                                                       type_text,
+                                                       expr)) {
+                v3_report_redundant_explicit_default_init(function->source_path,
+                                                          type_text,
+                                                          "local",
+                                                          name,
+                                                          expr);
+                free(lines);
+                free(owned_lines);
+                return false;
             }
             if (!v3_tuple_binding_expr_complete(type_text, expr)) {
                 fprintf(stderr,
@@ -42668,26 +44012,42 @@ static bool v3_resolve_self_path(char *out, size_t cap) {
 static bool v3_bootstrap_current_compiler_path(const V3BootstrapPaths *paths,
                                                char *out,
                                                size_t cap) {
+    const char *inputs[6];
+    char self_path[PATH_MAX];
     if (paths == NULL || out == NULL || cap == 0U) {
         return false;
     }
     out[0] = '\0';
-    if (v3_resolve_self_path(out, cap) && v3_path_is_executable(out)) {
+    inputs[0] = paths->seed_source;
+    inputs[1] = paths->stage1_source;
+    inputs[2] = paths->compiler_entry_source;
+    inputs[3] = paths->compiler_runtime_source;
+    inputs[4] = paths->compiler_request_source;
+    inputs[5] = paths->tooling_gate_source;
+    self_path[0] = '\0';
+    if (v3_resolve_self_path(self_path, sizeof(self_path)) &&
+        v3_path_is_executable(self_path) &&
+        v3_output_is_fresh_against_inputs(self_path, inputs, 6U)) {
+        snprintf(out, cap, "%s", self_path);
         return true;
     }
-    if (v3_path_is_executable(paths->stage3)) {
+    if (v3_path_is_executable(paths->stage3) &&
+        v3_output_is_fresh_against_inputs(paths->stage3, inputs, 6U)) {
         snprintf(out, cap, "%s", paths->stage3);
         return true;
     }
-    if (v3_path_is_executable(paths->stage2)) {
+    if (v3_path_is_executable(paths->stage2) &&
+        v3_output_is_fresh_against_inputs(paths->stage2, inputs, 6U)) {
         snprintf(out, cap, "%s", paths->stage2);
         return true;
     }
-    if (v3_path_is_executable(paths->stage1)) {
+    if (v3_path_is_executable(paths->stage1) &&
+        v3_output_is_fresh_against_inputs(paths->stage1, inputs, 6U)) {
         snprintf(out, cap, "%s", paths->stage1);
         return true;
     }
-    if (v3_path_is_executable(paths->stage0)) {
+    if (v3_path_is_executable(paths->stage0) &&
+        v3_output_is_fresh_against_inputs(paths->stage0, inputs, 6U)) {
         snprintf(out, cap, "%s", paths->stage0);
         return true;
     }
@@ -46099,9 +47459,8 @@ static bool v3_wasm_expr_matches_composite_default(const V3LoweringPlanStub *low
                                                    const char *expr_text,
                                                    const char *target_type_text) {
     char expr[4096];
-    char default_type[CHENG_V3_MAX_TYPE_TEXT];
     char normalized_target_type[CHENG_V3_MAX_TYPE_TEXT];
-    char normalized_default_type[CHENG_V3_MAX_TYPE_TEXT];
+    V3TypeCallSurface type_call_surface;
     if (lowering == NULL || function == NULL || ctx == NULL || expr_text == NULL || target_type_text == NULL) {
         return false;
     }
@@ -46119,17 +47478,16 @@ static bool v3_wasm_expr_matches_composite_default(const V3LoweringPlanStub *low
         (strcmp(expr, "\"\"") == 0 && strcmp(normalized_target_type, "str") == 0)) {
         return true;
     }
-    if (!v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
+    if (!v3_classify_expr_type_call_surface(lowering,
+                                            function->owner_module_path,
+                                            ctx->aliases,
+                                            ctx->alias_count,
+                                            expr,
+                                            &type_call_surface) ||
+        type_call_surface.kind != V3_TYPE_CALL_DEFAULT_INIT) {
         return false;
     }
-    return v3_normalize_type_text(lowering,
-                                  function->owner_module_path,
-                                  ctx->aliases,
-                                  ctx->alias_count,
-                                  default_type,
-                                  normalized_default_type,
-                                  sizeof(normalized_default_type)) &&
-           strcmp(normalized_default_type, normalized_target_type) == 0;
+    return strcmp(type_call_surface.normalized_type, normalized_target_type) == 0;
 }
 
 static bool v3_wasm_seq_elem_size(const V3LoweringPlanStub *lowering,
@@ -47615,12 +48973,20 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
                                                  ctx->aliases,
                                                  ctx->alias_count,
                                                  callee);
-            bool is_constructor_call = false;
-            is_constructor_call = v3_callee_is_constructor_like(lowering,
-                                                                function->owner_module_path,
-                                                                ctx->aliases,
-                                                                ctx->alias_count,
-                                                                callee);
+            V3TypeCallSurface type_call_surface;
+            bool is_type_materialize_call = false;
+            if (!v3_classify_type_call_surface(lowering,
+                                               function->owner_module_path,
+                                               ctx->aliases,
+                                               ctx->alias_count,
+                                               callee,
+                                               arg_count,
+                                               &type_call_surface)) {
+                free(args);
+                return false;
+            }
+            is_type_materialize_call =
+                v3_type_call_kind_is_materialize(type_call_surface.kind);
             if ((result_kind == V3_RESULT_INTRINSIC_IS_OK ||
                  result_kind == V3_RESULT_INTRINSIC_IS_ERR ||
                  result_kind == V3_RESULT_INTRINSIC_VALUE ||
@@ -47661,7 +49027,7 @@ static bool v3_wasm_analyze_expr(const V3SystemLinkPlanStub *plan,
                 return ok;
             }
             if (v3_expr_materializes_to_address(inferred_type, inferred_abi) &&
-                is_constructor_call) {
+                is_type_materialize_call) {
                 size_t arg_index;
                 bool ok = true;
                 for (arg_index = 0U; arg_index < arg_count; ++arg_index) {
@@ -49442,9 +50808,7 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                                            V3WasmBuffer *body) {
     V3TypeLayoutStub layout;
     char expr[4096];
-    char default_type[CHENG_V3_MAX_TYPE_TEXT];
     char normalized_dest_type[CHENG_V3_MAX_TYPE_TEXT];
-    char normalized_default_type[CHENG_V3_MAX_TYPE_TEXT];
     if (!v3_compute_type_layout_impl(lowering, dest_type_text, &layout, 0U)) {
         return false;
     }
@@ -49530,18 +50894,20 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                                                                   body);
         }
     }
-    if (v3_parse_default_expr_text(expr, default_type, sizeof(default_type))) {
-        if (!v3_normalize_type_text(lowering,
-                                    function->owner_module_path,
-                                    ctx->aliases,
-                                    ctx->alias_count,
-                                    default_type,
-                                    normalized_default_type,
-                                    sizeof(normalized_default_type)) ||
-            strcmp(normalized_default_type, normalized_dest_type) != 0) {
-            return false;
+    {
+        V3TypeCallSurface type_call_surface;
+        if (v3_classify_expr_type_call_surface(lowering,
+                                               function->owner_module_path,
+                                               ctx->aliases,
+                                               ctx->alias_count,
+                                               expr,
+                                               &type_call_surface) &&
+            type_call_surface.kind == V3_TYPE_CALL_DEFAULT_INIT) {
+            if (strcmp(type_call_surface.normalized_type, normalized_dest_type) != 0) {
+                return false;
+            }
+            return v3_wasm_emit_zero_region_from_local(body, dest_addr_local_index, layout.size);
         }
-        return v3_wasm_emit_zero_region_from_local(body, dest_addr_local_index, layout.size);
     }
     {
         char base_expr[4096];
@@ -49712,32 +51078,41 @@ static bool v3_wasm_emit_composite_expr_into_local_address(const V3SystemLinkPla
                     free(args);
                     return true;
                 }
-                if (v3_callee_is_constructor_like(lowering,
-                                                  function->owner_module_path,
-                                                  ctx->aliases,
-                                                  ctx->alias_count,
-                                                  inner_callee)) {
-                    bool ok = v3_wasm_emit_constructor_into_local_address(plan,
-                                                                          lowering,
-                                                                          function,
-                                                                          ctx,
-                                                                          inner_callee,
-                                                                          args,
-                                                                          arg_count,
-                                                                          normalized_dest_type,
-                                                                          dest_addr_local_index,
-                                                                          imports,
-                                                                          import_count,
-                                                                          body);
-                    if (!ok) {
-                        fprintf(stderr,
-                                "[cheng_v3_seed] wasm composite constructor emit failed function=%s callee=%s expr=%s\n",
-                                function->symbol_text,
-                                inner_callee,
-                                expr);
+                {
+                    V3TypeCallSurface type_call_surface;
+                    if (!v3_classify_type_call_surface(lowering,
+                                                       function->owner_module_path,
+                                                       ctx->aliases,
+                                                       ctx->alias_count,
+                                                       inner_callee,
+                                                       arg_count,
+                                                       &type_call_surface)) {
+                        free(args);
+                        return false;
                     }
-                    free(args);
-                    return ok;
+                    if (v3_type_call_kind_is_materialize(type_call_surface.kind)) {
+                        bool ok = v3_wasm_emit_constructor_into_local_address(plan,
+                                                                              lowering,
+                                                                              function,
+                                                                              ctx,
+                                                                              inner_callee,
+                                                                              args,
+                                                                              arg_count,
+                                                                              normalized_dest_type,
+                                                                              dest_addr_local_index,
+                                                                              imports,
+                                                                              import_count,
+                                                                              body);
+                        if (!ok) {
+                            fprintf(stderr,
+                                    "[cheng_v3_seed] wasm composite constructor emit failed function=%s callee=%s expr=%s\n",
+                                    function->symbol_text,
+                                    inner_callee,
+                                    expr);
+                        }
+                        free(args);
+                        return ok;
+                    }
                 }
             }
         }
@@ -50507,6 +51882,7 @@ static bool v3_wasm_encode_function_body_generic(const V3SystemLinkPlanStub *pla
                                                  V3WasmBuffer *code_section) {
     V3WasmFunctionContext ctx;
     V3WasmBuffer body;
+    size_t prepare_import_count = import_count;
     char **lines = NULL;
     char *owned_lines = NULL;
     size_t line_count = 0U;
@@ -50517,7 +51893,12 @@ static bool v3_wasm_encode_function_body_generic(const V3SystemLinkPlanStub *pla
     char inline_signature_body[8192];
     bool has_inline_signature_body = false;
     bool terminated = false;
-    if (!v3_wasm_prepare_function_context(plan, lowering, function, &ctx, NULL, NULL) ||
+    if (!v3_wasm_prepare_function_context(plan,
+                                          lowering,
+                                          function,
+                                          &ctx,
+                                          (V3WasmImportStub *)imports,
+                                          &prepare_import_count) ||
         !v3_load_function_source_lines(function,
                                        &lines,
                                        &owned_lines,
@@ -57119,6 +58500,33 @@ static char *v3_system_link_exec_report(const V3BootstrapContract *contract,
         v3_report_append(&out, &cap, &used, line);
         snprintf(line, sizeof(line), "exec_phase_total_ms=%lld", world->exec_phase_total_ms);
         v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_linux_nolibc_objects_ms=%lld", world->exec_phase_linux_nolibc_objects_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_provider_objects_ms=%lld", world->exec_phase_provider_objects_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_primary_object_emit_ms=%lld", world->exec_phase_primary_object_emit_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_native_link_ms=%lld", world->exec_phase_native_link_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_line_map_ms=%lld", world->exec_phase_line_map_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line,
+                 sizeof(line),
+                 "exec_phase_materialize_total_ms=%lld",
+                 world->exec_phase_linux_nolibc_objects_ms +
+                     world->exec_phase_provider_objects_ms +
+                     world->exec_phase_primary_object_emit_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line,
+                 sizeof(line),
+                 "exec_phase_backend_total_ms=%lld",
+                 world->exec_phase_total_ms +
+                     world->exec_phase_linux_nolibc_objects_ms +
+                     world->exec_phase_provider_objects_ms +
+                     world->exec_phase_primary_object_emit_ms +
+                     world->exec_phase_native_link_ms +
+                     world->exec_phase_line_map_ms);
+        v3_report_append(&out, &cap, &used, line);
     }
     snprintf(line, sizeof(line), "lowering_function_count=%zu", lowering->function_count);
     v3_report_append(&out, &cap, &used, line);
@@ -57589,7 +58997,8 @@ static int v3_cmd_bootstrap_bridge(int argc, char **argv) {
         goto done;
     }
     if (!v3_bootstrap_current_compiler_path(&paths, bootstrap_compiler, sizeof(bootstrap_compiler))) {
-        fprintf(stderr, "[cheng_v3_seed] bootstrap-bridge missing live bootstrap compiler\n");
+        fprintf(stderr,
+                "[cheng_v3_seed] bootstrap-bridge bootstrap inputs newer than live bootstrap compiler; rebuild stage0 and rerun bootstrap-bridge\n");
         goto done;
     }
     if (!v3_bootstrap_materialize_stage0(&paths, bootstrap_compiler, stage0_candidate)) {
@@ -59130,7 +60539,6 @@ static bool v3_command_prefers_backend_driver_passthrough(const char *cmd) {
         v3_streq(cmd, "bootstrap-bridge") ||
         v3_streq(cmd, "build-backend-driver") ||
         v3_streq(cmd, "run-production-regression") ||
-        v3_streq(cmd, "system-link-exec") ||
         v3_streq(cmd, "compile-bootstrap")) {
         return false;
     }
@@ -64623,11 +66031,13 @@ static bool v3_run_diloco_fixture_direct(const char *suite_label,
     unlink(run_log);
     unlink(line_map);
     printf("[%s] compile %s\n", suite_label, compile_label);
+    fflush(stdout);
     if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, src, out_bin, compile_log)) {
         fprintf(stderr, "%s: compile failed: %s\n", suite_label, compile_label);
         return false;
     }
     printf("[%s] run %s\n", suite_label, compile_label);
+    fflush(stdout);
     run_argv[0] = (char *)out_bin;
     run_argv[1] = NULL;
     if (!v3_run_binary_capture_output(run_argv, run_log, &status) ||
@@ -64647,6 +66057,8 @@ static int v3_run_diloco_quic_twoproc_direct(const char *compiler_bin,
     char client_src[PATH_MAX];
     char server_bin[PATH_MAX];
     char client_bin[PATH_MAX];
+    char server_compile_log[PATH_MAX];
+    char client_compile_log[PATH_MAX];
     char server_log[PATH_MAX];
     char client_log[PATH_MAX];
     char ready_path[PATH_MAX];
@@ -64665,12 +66077,28 @@ static int v3_run_diloco_quic_twoproc_direct(const char *compiler_bin,
     }
     snprintf(server_bin, sizeof(server_bin), "%s/diloco_quic_twoproc_server.%s", out_dir, label);
     snprintf(client_bin, sizeof(client_bin), "%s/diloco_quic_twoproc_client.%s", out_dir, label);
+    snprintf(server_compile_log, sizeof(server_compile_log), "%s/diloco_quic_twoproc_server.%s.compile.log", out_dir, label);
+    snprintf(client_compile_log, sizeof(client_compile_log), "%s/diloco_quic_twoproc_client.%s.compile.log", out_dir, label);
     snprintf(server_log, sizeof(server_log), "%s/diloco_quic_twoproc_server.%s.run.log", out_dir, label);
     snprintf(client_log, sizeof(client_log), "%s/diloco_quic_twoproc_client.%s.run.log", out_dir, label);
     snprintf(ready_path, sizeof(ready_path), "%s/diloco_quic_twoproc_server.%s.ready", out_dir, label);
+    unlink(server_compile_log);
+    unlink(client_compile_log);
     unlink(ready_path);
-    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, server_src, server_bin, server_log) ||
-        !v3_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, client_src, client_bin, client_log)) {
+    unlink(server_log);
+    unlink(client_log);
+    printf("[v3 verify-diloco] compile diloco_quic_twoproc_server.%s\n", label);
+    fflush(stdout);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, server_src, server_bin, server_compile_log)) {
+        fprintf(stderr, "v3 verify-diloco: compile failed: diloco_quic_twoproc_server.%s\n", label);
+        v3_dump_file_stdout(server_compile_log);
+        return 1;
+    }
+    printf("[v3 verify-diloco] compile diloco_quic_twoproc_client.%s\n", label);
+    fflush(stdout);
+    if (!v3_compile_host_fixture_with_backend_driver(compiler_bin, root_diloco, client_src, client_bin, client_compile_log)) {
+        fprintf(stderr, "v3 verify-diloco: compile failed: diloco_quic_twoproc_client.%s\n", label);
+        v3_dump_file_stdout(client_compile_log);
         return 1;
     }
     snprintf(ready_arg, sizeof(ready_arg), "--ready-path:%s", ready_path);
@@ -64678,9 +66106,12 @@ static int v3_run_diloco_quic_twoproc_direct(const char *compiler_bin,
     server_argv[1] = "--port:0";
     server_argv[2] = ready_arg;
     server_argv[3] = NULL;
+    printf("[v3 verify-diloco] run diloco_quic_twoproc_server.%s\n", label);
+    fflush(stdout);
     if (!v3_spawn_binary_capture_output(server_argv, server_log, &server_pid) ||
         !v3_wait_ready_port_file("verify-diloco server", ready_path, server_pid, 20000, port_text, sizeof(port_text)) ||
         !v3_text_is_decimal_digits(port_text)) {
+        v3_dump_file_stdout(server_log);
         v3_kill_and_wait_pid(&server_pid);
         return 1;
     }
@@ -64688,9 +66119,13 @@ static int v3_run_diloco_quic_twoproc_direct(const char *compiler_bin,
     client_argv[0] = client_bin;
     client_argv[1] = port_arg;
     client_argv[2] = NULL;
+    printf("[v3 verify-diloco] run diloco_quic_twoproc_client.%s\n", label);
+    fflush(stdout);
     if (!v3_run_binary_capture_output(client_argv, client_log, &status) ||
         !v3_status_is_exit_code(status, 0) ||
         !v3_wait_pid_success(&server_pid, "verify-diloco server", server_log)) {
+        v3_dump_file_stdout(server_log);
+        v3_dump_file_stdout(client_log);
         v3_kill_and_wait_pid(&server_pid);
         return 1;
     }
@@ -64722,6 +66157,8 @@ static int v3_verify_diloco_stage(const char *compiler_bin,
     snprintf(wire_bin, sizeof(wire_bin), "%s/diloco_wire_smoke.%s", out_dir, label);
     snprintf(state_label, sizeof(state_label), "diloco_state_smoke.%s", label);
     snprintf(wire_label, sizeof(wire_label), "diloco_wire_smoke.%s", label);
+    printf("[v3 verify-diloco] stage begin (%s)\n", label);
+    fflush(stdout);
     if (!v3_run_diloco_fixture_direct("v3 verify-diloco",
                                       state_label,
                                       compiler_bin,
@@ -64738,7 +66175,12 @@ static int v3_verify_diloco_stage(const char *compiler_bin,
                                       wire_bin)) {
         return 1;
     }
-    return v3_run_diloco_quic_twoproc_direct(compiler_bin, label, root, root_diloco);
+    if (v3_run_diloco_quic_twoproc_direct(compiler_bin, label, root, root_diloco) != 0) {
+        return 1;
+    }
+    printf("[v3 verify-diloco] stage ok (%s)\n", label);
+    fflush(stdout);
+    return 0;
 }
 
 static int v3_cmd_verify_diloco_impl(int argc, char **argv) {
@@ -67731,7 +69173,7 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
 }
 
 static int v3_cmd_run_production_regression_impl(int argc, char **argv) {
-    char *surface_argv[6];
+    char *surface_argv[12];
     const char *argv0 = "cheng_v3_seed";
     int rc;
     (void)argc;
@@ -67746,9 +69188,19 @@ static int v3_cmd_run_production_regression_impl(int argc, char **argv) {
     surface_argv[1] = (char *)"run-host-smokes";
     surface_argv[2] = (char *)"stage3_command_surface_smoke";
     surface_argv[3] = (char *)"backend_driver_command_surface_smoke";
-    surface_argv[4] = (char *)"perf_memory_contract_smoke";
-    surface_argv[5] = (char *)"cheng_skill_consistency_smoke";
-    rc = v3_cmd_run_host_smokes_impl(6, surface_argv);
+    surface_argv[4] = (char *)"build_backend_driver_report_smoke";
+    surface_argv[5] = (char *)"perf_memory_gate_contract_smoke";
+    surface_argv[6] = (char *)"perf_memory_contract_smoke";
+    surface_argv[7] = (char *)"cheng_skill_consistency_smoke";
+    surface_argv[8] = (char *)"dev_hotpatch_100ms_scope_contract_smoke";
+    surface_argv[9] = (char *)"explicit_default_init_negative_smoke";
+    surface_argv[10] = (char *)"explicit_default_init_gate_smoke";
+    surface_argv[11] = (char *)"composite_zero_helper_gate_smoke";
+    rc = v3_cmd_run_host_smokes_impl(12, surface_argv);
+    if (rc != 0) {
+        return rc;
+    }
+    rc = v3_cmd_verify_r2c_react_v3_surface_impl(argc, argv);
     if (rc != 0) {
         return rc;
     }
@@ -67825,16 +69277,7 @@ static int v3_cmd_verify_export_visibility_parallel_impl(int argc, char **argv) 
 }
 
 static int v3_cmd_verify_r2c_react_v3_surface_impl(int argc, char **argv) {
-    char *surface_argv[3];
-    const char *argv0 = "cheng_v3_seed";
-    (void)argc;
-    if (argv != NULL && argv[0] != NULL && argv[0][0] != '\0') {
-        argv0 = argv[0];
-    }
-    surface_argv[0] = (char *)argv0;
-    surface_argv[1] = (char *)"run-host-smokes";
-    surface_argv[2] = (char *)"r2c_react_v3_surface_smoke";
-    return v3_cmd_run_host_smokes_impl(3, surface_argv);
+    return v3_require_backend_driver_cli_passthrough("verify-r2c-react-v3-surface", argc, argv);
 }
 
 static int v3_cmd_run_stage23_libp2p_smokes_impl(int argc, char **argv) {
@@ -69006,6 +70449,7 @@ static bool v3_seed_debug_exec_context_build(V3SeedDebugExecContext *ctx,
                                              bool require_output,
                                              bool enable_baseline_surface_check,
                                              bool include_native_link) {
+    (void)include_native_link;
     v3_seed_debug_exec_context_init(ctx);
     ctx->contract = (V3BootstrapContract *)v3_xmalloc(sizeof(*ctx->contract));
     ctx->plan = (V3SystemLinkPlanStub *)v3_xmalloc(sizeof(*ctx->plan));
@@ -70136,27 +71580,48 @@ static int v3_cmd_selfhost_build(int argc, char **argv) {
     char *report;
     int rc = 2;
     bool pipeline_ready;
+    long long phase_start_ms;
+    long long phase_end_ms;
+    bool link_ok;
     if (!v3_seed_debug_exec_context_build(&ctx, argc, argv, true, true, true)) {
         return 1;
     }
     if (!v3_streq(ctx.plan->emit_kind, "obj") &&
         ctx.object_plan->missing_reason_count <= 0U &&
-        ctx.object_plan->linux_nolibc_support_enabled &&
-        !v3_materialize_linux_nolibc_support_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
-        v3_seed_debug_exec_context_release(&ctx);
-        return 1;
+        ctx.object_plan->linux_nolibc_support_enabled) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_linux_nolibc_support_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            ctx.world->exec_phase_linux_nolibc_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            v3_seed_debug_exec_context_release(&ctx);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        ctx.world->exec_phase_linux_nolibc_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
     if (!v3_streq(ctx.plan->emit_kind, "obj") &&
         ctx.native_link->missing_reason_count <= 0U &&
-        ctx.object_plan->provider_source_count > 0U &&
-        !v3_materialize_provider_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
-        v3_seed_debug_exec_context_release(&ctx);
-        return 1;
+        ctx.object_plan->provider_source_count > 0U) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_provider_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            ctx.world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            v3_seed_debug_exec_context_release(&ctx);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        ctx.world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
-    if (ctx.primary->missing_reason_count <= 0U &&
-        !v3_materialize_primary_object(ctx.plan, ctx.lowering, ctx.primary)) {
-        v3_seed_debug_exec_context_release(&ctx);
-        return 1;
+    if (ctx.primary->missing_reason_count <= 0U) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_primary_object(ctx.plan, ctx.lowering, ctx.primary)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            ctx.world->exec_phase_primary_object_emit_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            v3_seed_debug_exec_context_release(&ctx);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        ctx.world->exec_phase_primary_object_emit_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
     report = v3_system_link_exec_report(ctx.contract,
                                         ctx.plan,
@@ -70193,19 +71658,49 @@ static int v3_cmd_selfhost_build(int argc, char **argv) {
         fprintf(stderr, "v3 compiler: selfhost primary object machine code not emitted\n");
     } else if (!pipeline_ready) {
         fprintf(stderr, "v3 compiler: selfhost build blocked\n");
-    } else if (v3_streq(ctx.plan->emit_kind, "shared") ?
-                   !v3_link_native_shared_library(ctx.native_link, ctx.plan->output_path) :
-                   !v3_link_native_executable(ctx.native_link, ctx.plan->output_path)) {
-        free(report);
-        v3_seed_debug_exec_context_release(&ctx);
-        return 1;
-    } else if (v3_streq(ctx.plan->emit_kind, "exe") &&
-               !v3_write_executable_line_map(ctx.plan, ctx.lowering)) {
-        free(report);
-        v3_seed_debug_exec_context_release(&ctx);
-        return 1;
     } else {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (v3_streq(ctx.plan->emit_kind, "shared")) {
+            link_ok = v3_link_native_shared_library(ctx.native_link, ctx.plan->output_path);
+        } else {
+            link_ok = v3_link_native_executable(ctx.native_link, ctx.plan->output_path);
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        ctx.world->exec_phase_native_link_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+        if (!link_ok) {
+            free(report);
+            v3_seed_debug_exec_context_release(&ctx);
+            return 1;
+        }
+        if (v3_streq(ctx.plan->emit_kind, "exe")) {
+            phase_start_ms = v3_bft_monotime_ms();
+            if (!v3_write_executable_line_map(ctx.plan, ctx.lowering)) {
+                phase_end_ms = v3_bft_monotime_ms();
+                ctx.world->exec_phase_line_map_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+                free(report);
+                v3_seed_debug_exec_context_release(&ctx);
+                return 1;
+            }
+            phase_end_ms = v3_bft_monotime_ms();
+            ctx.world->exec_phase_line_map_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+        }
         rc = 0;
+    }
+    if (rc == 0) {
+        free(report);
+        report = v3_system_link_exec_report(ctx.contract,
+                                            ctx.plan,
+                                            ctx.world,
+                                            ctx.lowering,
+                                            ctx.primary,
+                                            ctx.object_plan,
+                                            ctx.native_link);
+        if (!v3_write_optional_report_text(report_path, report)) {
+            fprintf(stderr, "v3 compiler: failed to write report: %s\n", report_path);
+            free(report);
+            v3_seed_debug_exec_context_release(&ctx);
+            return 1;
+        }
     }
     fputs(report, stderr);
     free(report);
@@ -70225,6 +71720,9 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
     char *report = NULL;
     int rc = 2;
     bool pipeline_ready;
+    long long phase_start_ms;
+    long long phase_end_ms;
+    bool link_ok;
     plan = (V3SystemLinkPlanStub *)calloc(1U, sizeof(V3SystemLinkPlanStub));
     world = (V3CompilerWorldArtifacts *)calloc(1U, sizeof(V3CompilerWorldArtifacts));
     primary = (V3PrimaryObjectPlanStub *)calloc(1U, sizeof(V3PrimaryObjectPlanStub));
@@ -70277,43 +71775,61 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
     }
     if (!v3_streq(plan->emit_kind, "obj") &&
         object_plan->missing_reason_count <= 0U &&
-        object_plan->linux_nolibc_support_enabled &&
-        !v3_materialize_linux_nolibc_support_objects(&contract, plan, object_plan)) {
-        free(lowering);
-        v3_compiler_world_artifacts_free(world);
-        v3_contract_free(&contract);
-        free(plan);
-        free(world);
-        free(primary);
-        free(object_plan);
-        free(native_link);
-        return 1;
+        object_plan->linux_nolibc_support_enabled) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_linux_nolibc_support_objects(&contract, plan, object_plan)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            world->exec_phase_linux_nolibc_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            free(lowering);
+            v3_compiler_world_artifacts_free(world);
+            v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        world->exec_phase_linux_nolibc_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
     if (!v3_streq(plan->emit_kind, "obj") &&
         native_link->missing_reason_count <= 0U &&
-        object_plan->provider_source_count > 0U &&
-        !v3_materialize_provider_objects(&contract, plan, object_plan)) {
-        free(lowering);
-        v3_compiler_world_artifacts_free(world);
-        v3_contract_free(&contract);
-        free(plan);
-        free(world);
-        free(primary);
-        free(object_plan);
-        free(native_link);
-        return 1;
+        object_plan->provider_source_count > 0U) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_provider_objects(&contract, plan, object_plan)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            free(lowering);
+            v3_compiler_world_artifacts_free(world);
+            v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
-    if (primary->missing_reason_count <= 0U &&
-        !v3_materialize_primary_object(plan, lowering, primary)) {
-        free(lowering);
-        v3_compiler_world_artifacts_free(world);
-        v3_contract_free(&contract);
-        free(plan);
-        free(world);
-        free(primary);
-        free(object_plan);
-        free(native_link);
-        return 1;
+    if (primary->missing_reason_count <= 0U) {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (!v3_materialize_primary_object(plan, lowering, primary)) {
+            phase_end_ms = v3_bft_monotime_ms();
+            world->exec_phase_primary_object_emit_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+            free(lowering);
+            v3_compiler_world_artifacts_free(world);
+            v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
+            return 1;
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        world->exec_phase_primary_object_emit_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
     }
     report = v3_system_link_exec_report(&contract, plan, world, lowering, primary, object_plan, native_link);
     if (report_path && *report_path != '\0') {
@@ -70395,33 +71911,65 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
         }
     } else if (!pipeline_ready) {
         fprintf(stderr, "v3 compiler: ordinary pipeline blocked\n");
-    } else if (v3_streq(plan->emit_kind, "shared") ?
-                   !v3_link_native_shared_library(native_link, plan->output_path) :
-                   !v3_link_native_executable(native_link, plan->output_path)) {
-        free(report);
-        free(lowering);
-        v3_compiler_world_artifacts_free(world);
-        v3_contract_free(&contract);
-        free(plan);
-        free(world);
-        free(primary);
-        free(object_plan);
-        free(native_link);
-        return 1;
-    } else if (v3_streq(plan->emit_kind, "exe") &&
-               !v3_write_executable_line_map(plan, lowering)) {
-        free(report);
-        free(lowering);
-        v3_compiler_world_artifacts_free(world);
-        v3_contract_free(&contract);
-        free(plan);
-        free(world);
-        free(primary);
-        free(object_plan);
-        free(native_link);
-        return 1;
     } else {
+        phase_start_ms = v3_bft_monotime_ms();
+        if (v3_streq(plan->emit_kind, "shared")) {
+            link_ok = v3_link_native_shared_library(native_link, plan->output_path);
+        } else {
+            link_ok = v3_link_native_executable(native_link, plan->output_path);
+        }
+        phase_end_ms = v3_bft_monotime_ms();
+        world->exec_phase_native_link_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+        if (!link_ok) {
+            free(report);
+            free(lowering);
+            v3_compiler_world_artifacts_free(world);
+            v3_contract_free(&contract);
+            free(plan);
+            free(world);
+            free(primary);
+            free(object_plan);
+            free(native_link);
+            return 1;
+        }
+        if (v3_streq(plan->emit_kind, "exe")) {
+            phase_start_ms = v3_bft_monotime_ms();
+            if (!v3_write_executable_line_map(plan, lowering)) {
+                phase_end_ms = v3_bft_monotime_ms();
+                world->exec_phase_line_map_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+                free(report);
+                free(lowering);
+                v3_compiler_world_artifacts_free(world);
+                v3_contract_free(&contract);
+                free(plan);
+                free(world);
+                free(primary);
+                free(object_plan);
+                free(native_link);
+                return 1;
+            }
+            phase_end_ms = v3_bft_monotime_ms();
+            world->exec_phase_line_map_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
+        }
         rc = 0;
+    }
+    if (rc == 0) {
+        free(report);
+        report = v3_system_link_exec_report(&contract, plan, world, lowering, primary, object_plan, native_link);
+        if (report_path && *report_path != '\0') {
+            if (!v3_ensure_parent_dir(report_path) || !v3_write_text_file(report_path, report)) {
+                free(report);
+                free(lowering);
+                v3_compiler_world_artifacts_free(world);
+                v3_contract_free(&contract);
+                free(plan);
+                free(world);
+                free(primary);
+                free(object_plan);
+                free(native_link);
+                return 1;
+            }
+        }
     }
     fputs(report, stderr);
     free(report);

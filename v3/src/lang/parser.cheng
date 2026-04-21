@@ -32,6 +32,8 @@ type
         v3NormalizedExprResultIntrinsic
         v3NormalizedExprCall
         v3NormalizedExprTry
+        v3NormalizedExprDefaultInit
+        v3NormalizedExprConstructor
 
     V3NormalizedExprDetailKind = enum
         v3NormalizedExprDetailNone
@@ -136,12 +138,17 @@ type
         explicitExportName: str
         surfaceKeyword: str
 
+    V3NormalizedTypeDecl =
+        name: str
+        refObject: bool
+
     V3NormalizedExprCallProfile =
         sourcePath: str
         ownerModulePath: str
         text: str
         lines: str[]
         decls: V3NormalizedFunctionDecl[]
+        typeDecls: V3NormalizedTypeDecl[]
         importcCallNames: str[]
         localCallNames: str[]
         importEdges: V3ImportEdge[]
@@ -229,6 +236,10 @@ fn v3NormalizedExprKindText(kind: V3NormalizedExprKind): str =
         return "CallExpr"
     if kind == v3NormalizedExprTry:
         return "TryExpr"
+    if kind == v3NormalizedExprDefaultInit:
+        return "DefaultInitExpr"
+    if kind == v3NormalizedExprConstructor:
+        return "ConstructorExpr"
     return "UnknownExpr"
 
 fn v3NormalizedExprDetailKindCode(detailKind: V3NormalizedExprDetailKind): int32 =
@@ -335,6 +346,10 @@ fn v3NormalizedExprKindCode(kind: V3NormalizedExprKind): int32 =
         return 6
     if kind == v3NormalizedExprTry:
         return 7
+    if kind == v3NormalizedExprDefaultInit:
+        return 8
+    if kind == v3NormalizedExprConstructor:
+        return 9
     return 0
 
 fn v3NormalizedExprLookupTextFirstCode(text: str): int32 =
@@ -777,25 +792,26 @@ fn v3NormalizedExprMakeId(sourcePath: str,
     v3ParserWriteTextFast(outPtr, writePos, detailCodeText)
     return out
 
-fn v3NormalizedExprMakeCallId(sourcePath: str,
-                              lineNumber: int32,
-                              columnNumber: int32,
-                              callSurfaceKind: V3NormalizedExprSurfaceCallKind,
-                              callResolved: bool,
-                              callReason: V3NormalizedExprCallReason,
-                              callQualifier: str,
-                              callCallee: str,
-                              callTarget: str,
-                              callTargetSourcePath: str,
-                              callTargetImportc: bool,
-                              callPrefixStyle: bool,
-                              callArgCount: int32,
-                              callArgsText: str): str =
+fn v3NormalizedExprMakeCallLikeId(sourcePath: str,
+                                  lineNumber: int32,
+                                  columnNumber: int32,
+                                  kind: V3NormalizedExprKind,
+                                  callSurfaceKind: V3NormalizedExprSurfaceCallKind,
+                                  callResolved: bool,
+                                  callReason: V3NormalizedExprCallReason,
+                                  callQualifier: str,
+                                  callCallee: str,
+                                  callTarget: str,
+                                  callTargetSourcePath: str,
+                                  callTargetImportc: bool,
+                                  callPrefixStyle: bool,
+                                  callArgCount: int32,
+                                  callArgsText: str): str =
     let callSurfaceKindText = v3ParserCallSurfaceKindText(callSurfaceKind)
     let callReasonText = v3ParserCallReasonText(callReason)
     let lineText: str = intToStr(lineNumber)
     let columnText: str = intToStr(columnNumber)
-    let kindText: str = intToStr(v3NormalizedExprKindCode(v3NormalizedExprCall))
+    let kindText: str = intToStr(v3NormalizedExprKindCode(kind))
     let resolvedText = if callResolved: "1" else: "0"
     let targetImportcText = if callTargetImportc: "1" else: "0"
     let prefixStyleText = if callPrefixStyle: "1" else: "0"
@@ -864,14 +880,6 @@ fn v3NormalizedExprLayerClone(layer: V3NormalizedExprLayer): V3NormalizedExprLay
     out.sourceCount = layer.sourceCount
     for i in 0..<layer.exprs.len:
         v3NormalizedExprLayerAppendExisting(out, v3NormalizedExprClone(layer.exprs[i]))
-    return out
-
-fn v3NormalizedExprLayerZero(): V3NormalizedExprLayer =
-    var out: V3NormalizedExprLayer
-    out.sourceCount = 0
-    out.exprs = []
-    out.questionResidualCount = 0
-    out.exprLookup = v3NormalizedExprLookupInit(32)
     return out
 
 fn v3NormalizedExprLayerAppend(layer: var V3NormalizedExprLayer,
@@ -981,20 +989,21 @@ fn v3NormalizedExprLayerAppendCall(layer: var V3NormalizedExprLayer,
                                           callArgsText):
         return
     var expr: V3NormalizedExpr
-    expr.exprId = v3NormalizedExprMakeCallId(sourcePath,
-                                             lineNumber,
-                                             columnNumber,
-                                             callSurfaceKind,
-                                             callResolved,
-                                             callReason,
-                                             callQualifier,
-                                             callCallee,
-                                             callTarget,
-                                             normalizedTargetSourcePath,
-                                             callTargetImportc,
-                                             callPrefixStyle,
-                                             callArgCount,
-                                             callArgsText)
+    expr.exprId = v3NormalizedExprMakeCallLikeId(sourcePath,
+                                                 lineNumber,
+                                                 columnNumber,
+                                                 v3NormalizedExprCall,
+                                                 callSurfaceKind,
+                                                 callResolved,
+                                                 callReason,
+                                                 callQualifier,
+                                                 callCallee,
+                                                 callTarget,
+                                                 normalizedTargetSourcePath,
+                                                 callTargetImportc,
+                                                 callPrefixStyle,
+                                                 callArgCount,
+                                                 callArgsText)
     expr.sourcePath = sourcePath
     expr.lineNumber = lineNumber
     expr.columnNumber = columnNumber
@@ -1013,6 +1022,74 @@ fn v3NormalizedExprLayerAppendCall(layer: var V3NormalizedExprLayer,
     expr.callTarget = callTarget
     expr.callTargetSourcePath = normalizedTargetSourcePath
     expr.callTargetImportc = callTargetImportc
+    expr.callPrefixStyle = callPrefixStyle
+    expr.callArgCount = callArgCount
+    expr.callArgsText = callArgsText
+    add(layer.exprs, expr)
+    v3NormalizedExprLayerRememberExpr(layer, layer.exprs.len - 1)
+
+fn v3NormalizedExprLayerAppendConstructor(layer: var V3NormalizedExprLayer,
+                                          sourcePath: str,
+                                          lineNumber: int32,
+                                          columnNumber: int32,
+                                          typeText: str,
+                                          callArgsText: str,
+                                          callArgCount: int32,
+                                          callPrefixStyle: bool,
+                                          endColumnNumberRaw: int32) =
+    if v3NormalizedExprLayerContainsExact(layer,
+                                          sourcePath,
+                                          lineNumber,
+                                          columnNumber,
+                                          v3NormalizedExprConstructor,
+                                          v3NormalizedExprDetailNone,
+                                          typeText,
+                                          v3NormalizedExprSurfaceCallNone,
+                                          false,
+                                          v3NormalizedExprCallReasonNone,
+                                          "",
+                                          "",
+                                          "",
+                                          "",
+                                          false,
+                                          callPrefixStyle,
+                                          callArgCount,
+                                          callArgsText):
+        return
+    var expr: V3NormalizedExpr
+    expr.exprId = v3NormalizedExprMakeCallLikeId(sourcePath,
+                                                 lineNumber,
+                                                 columnNumber,
+                                                 v3NormalizedExprConstructor,
+                                                 v3NormalizedExprSurfaceCallNone,
+                                                 false,
+                                                 v3NormalizedExprCallReasonNone,
+                                                 "",
+                                                 "",
+                                                 "",
+                                                 "",
+                                                 false,
+                                                 callPrefixStyle,
+                                                 callArgCount,
+                                                 callArgsText)
+    expr.sourcePath = sourcePath
+    expr.lineNumber = lineNumber
+    expr.columnNumber = columnNumber
+    expr.endLineNumber = lineNumber
+    expr.endColumnNumber = v3NormalizedExprEndColumn(columnNumber, typeText)
+    if endColumnNumberRaw >= expr.endColumnNumber:
+        expr.endColumnNumber = endColumnNumberRaw
+    expr.kind = v3NormalizedExprConstructor
+    expr.detailKind = v3NormalizedExprDetailNone
+    expr.surfaceText = typeText
+    expr.callSurfaceKind = v3NormalizedExprSurfaceCallNone
+    expr.callResolved = false
+    expr.callReason = v3NormalizedExprCallReasonNone
+    expr.callQualifier = ""
+    expr.callCallee = ""
+    expr.callTarget = ""
+    expr.callTargetSourcePath = ""
+    expr.callTargetImportc = false
     expr.callPrefixStyle = callPrefixStyle
     expr.callArgCount = callArgCount
     expr.callArgsText = callArgsText
@@ -1055,8 +1132,24 @@ fn v3NormalizedExprLayerResultIntrinsicCount(layer: V3NormalizedExprLayer): int3
 fn v3NormalizedExprLayerTryCount(layer: V3NormalizedExprLayer): int32 =
     return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprTry)
 
+fn v3NormalizedExprLayerDefaultInitCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprDefaultInit)
+
+fn v3NormalizedExprLayerConstructorCount(layer: V3NormalizedExprLayer): int32 =
+    return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprConstructor)
+
 fn v3NormalizedExprLayerCallCount(layer: V3NormalizedExprLayer): int32 =
     return v3NormalizedExprLayerCountKind(layer, v3NormalizedExprCall)
+
+fn v3NormalizedExprDefaultInitType(expr: V3NormalizedExpr): str =
+    if expr.kind != v3NormalizedExprDefaultInit:
+        return ""
+    return expr.surfaceText
+
+fn v3NormalizedExprConstructorType(expr: V3NormalizedExpr): str =
+    if expr.kind != v3NormalizedExprConstructor:
+        return ""
+    return expr.surfaceText
 
 fn v3NormalizedExprCallSurfaceKind(expr: V3NormalizedExpr): V3NormalizedExprSurfaceCallKind =
     if expr.kind != v3NormalizedExprCall:
@@ -1179,6 +1272,17 @@ fn v3NormalizedExprLayerHasCallExpr(layer: V3NormalizedExprLayer,
         if expr.kind != v3NormalizedExprCall:
             continue
         if expr.callSurfaceKind != callKind:
+            continue
+        if expr.lineNumber != lineNumber:
+            continue
+        return true
+    return false
+
+fn v3NormalizedExprLayerHasConstructorExpr(layer: V3NormalizedExprLayer,
+                                           lineNumber: int32): bool =
+    for i in 0..<layer.exprs.len:
+        let expr = layer.exprs[i]
+        if expr.kind != v3NormalizedExprConstructor:
             continue
         if expr.lineNumber != lineNumber:
             continue
@@ -2030,6 +2134,678 @@ fn v3ParserCallExprUsesDedicatedNormalization(callNameRaw: str): bool =
     if v3ParserTextEqualsExact(callName, "ErrorInfoOf"):
         return true
     return false
+
+fn v3ParserTypeExprIsScalarDefaultForbidden(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return typeText == "bool" ||
+           typeText == "int8" ||
+           typeText == "uint8" ||
+           typeText == "int16" ||
+           typeText == "uint16" ||
+           typeText == "int32" ||
+           typeText == "int" ||
+           typeText == "uint32" ||
+           typeText == "int64" ||
+           typeText == "uint64" ||
+           typeText == "float" ||
+           typeText == "float32" ||
+           typeText == "float64" ||
+           typeText == "char" ||
+           typeText == "str" ||
+           typeText == "cstring" ||
+           typeText == "ptr" ||
+           v3ParserStartsWithExact(typeText, "ptr[") ||
+           v3ParserStartsWithExact(typeText, "Pointer[")
+
+fn v3ParserTypeExprIsTuple(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    if !v3ParserStartsWithExact(typeText, "tuple["):
+        return false
+    if typeText.len <= len("tuple["):
+        return false
+    return typeText[typeText.len - 1] == ']'
+
+fn v3ParserTypeExprIsSeq(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return typeText.len >= 2 &&
+           v3path.V3TextSlice(typeText, typeText.len - 2, 2) == "[]"
+
+fn v3ParserTypeExprIsFixedArray(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    if typeText.len < 4:
+        return false
+    if v3ParserTypeExprIsSeq(typeText):
+        return false
+    if typeText[typeText.len - 1] != ']':
+        return false
+    var depth: int32
+    var openPos: int32 = -1
+    var closePos: int32 = -1
+    for i in 0..<typeText.len:
+        if typeText[i] == '[':
+            if depth == 0:
+                openPos = i
+            depth = depth + 1
+            continue
+        if typeText[i] == ']':
+            depth = depth - 1
+            if depth < 0:
+                return false
+            if depth == 0:
+                closePos = i
+    if depth != 0 || openPos <= 0 || closePos != typeText.len - 1:
+        return false
+    let sizeText = v3path.V3PathTrim(v3path.V3TextSlice(typeText, openPos + 1, closePos - openPos - 1))
+    if sizeText == "":
+        return false
+    for i in 0..<sizeText.len:
+        let ch = sizeText[i]
+        if v3ParserIsInlineSpace(ch):
+            continue
+        if ch < '0' || ch > '9':
+            return false
+    return true
+
+fn v3ParserTypeExprDot(typeRaw: str): int32 =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    var dotPos: int32 = -1
+    for i in 0..<typeText.len:
+        if typeText[i] == '.':
+            dotPos = i
+    return dotPos
+
+fn v3ParserTypeExprQualifier(typeRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    let dotPos = v3ParserTypeExprDot(typeText)
+    if dotPos <= 0:
+        return ""
+    return v3path.V3PathTrim(v3path.V3TextSlice(typeText, 0, dotPos))
+
+fn v3ParserTypeExprLeaf(typeRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    let dotPos = v3ParserTypeExprDot(typeText)
+    if dotPos < 0:
+        return v3ParserIdentPrefix(typeText)
+    if dotPos + 1 >= typeText.len:
+        return ""
+    return v3ParserIdentPrefix(v3path.V3TextSlice(typeText, dotPos + 1, typeText.len - dotPos - 1))
+
+fn v3ParserTypeDeclNameFromTrimmedLine(lineRaw: str): str =
+    let line = v3path.V3PathTrim(lineRaw)
+    if line == "":
+        return ""
+    let eqPos = v3ParserFindTopLevelToken(line, "=")
+    if eqPos <= 0:
+        return ""
+    let headRaw = v3path.V3PathTrim(v3path.V3TextSlice(line, 0, eqPos))
+    let genericPos = v3ParserFindTopLevelToken(headRaw, "[")
+    var head = headRaw
+    if genericPos > 0:
+        head = v3path.V3PathTrim(v3path.V3TextSlice(headRaw, 0, genericPos))
+    return v3ParserIdentPrefix(v3ParserFirstToken(head))
+
+fn v3ParserTypeDeclIsRefObjectFromTrimmedLine(lineRaw: str): bool =
+    let line = v3path.V3PathTrim(lineRaw)
+    let eqPos = v3ParserFindTopLevelToken(line, "=")
+    if eqPos <= 0:
+        return false
+    let tail = v3path.V3PathTrim(v3path.V3TextSlice(line, eqPos + 1, line.len - eqPos - 1))
+    return v3ParserStartsWithExact(tail, "ref object")
+
+fn v3ParserAddUniqueTypeDecl(out: var V3NormalizedTypeDecl[],
+                             nameRaw: str,
+                             refObject: bool) =
+    let name = v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return
+    for i in 0..<out.len:
+        if out[i].name != name:
+            continue
+        if refObject:
+            out[i].refObject = true
+        return
+    var decl: V3NormalizedTypeDecl
+    decl.name = name
+    decl.refObject = refObject
+    add(out, decl)
+
+fn v3ParserReadNormalizedTypeDeclsLines(lines: str[],
+                                        decls: var V3NormalizedTypeDecl[]) =
+    decls = []
+    var inTypeBlock = false
+    for i in 0..<lines.len:
+        let rawLine = lines[i]
+        let trimmed = v3path.V3PathTrim(v3ParserStripLineComment(rawLine))
+        if !v3ParserHasLeadingIndent(rawLine):
+            if trimmed == "":
+                continue
+            inTypeBlock = trimmed == "type"
+            continue
+        if !inTypeBlock:
+            continue
+        let declName = v3ParserTypeDeclNameFromTrimmedLine(trimmed)
+        if declName == "":
+            continue
+        v3ParserAddUniqueTypeDecl(decls, declName, v3ParserTypeDeclIsRefObjectFromTrimmedLine(trimmed))
+
+fn v3ParserProfileHasDeclaredType(profile: V3NormalizedExprCallProfile,
+                                  nameRaw: str): bool =
+    let name = v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return false
+    for i in 0..<profile.typeDecls.len:
+        if profile.typeDecls[i].name == name:
+            return true
+    return false
+
+fn v3ParserProfileHasRefObjectType(profile: V3NormalizedExprCallProfile,
+                                   nameRaw: str): bool =
+    let name = v3ParserIdentPrefix(v3path.V3PathTrim(nameRaw))
+    if name == "":
+        return false
+    for i in 0..<profile.typeDecls.len:
+        if profile.typeDecls[i].name == name:
+            return profile.typeDecls[i].refObject
+    return false
+
+fn v3ParserProfileImportTargetIndexForQualifier(profile: V3NormalizedExprCallProfile,
+                                                qualifierRaw: str): int32 =
+    let qualifier = v3ParserIdentPrefix(v3path.V3PathTrim(qualifierRaw))
+    if qualifier == "":
+        return -1
+    var targetIndex = -1
+    for i in 0..<profile.importEdges.len:
+        let edge = profile.importEdges[i]
+        if !edge.resolved || edge.targetProfileIndex < 0 || edge.qualifier != qualifier:
+            continue
+        if targetIndex < 0:
+            targetIndex = edge.targetProfileIndex
+            continue
+        if targetIndex != edge.targetProfileIndex:
+            return -1
+    return targetIndex
+
+fn v3ParserResolveQualifiedTypeProfileIndex(currentProfile: V3NormalizedExprCallProfile,
+                                            profiles: V3NormalizedExprCallProfile[],
+                                            qualifierChainRaw: str): int32 =
+    let qualifierChain = v3path.V3PathTrim(qualifierChainRaw)
+    if qualifierChain == "":
+        return -1
+    let parts = v3ParserSplitChar(qualifierChain, '.')
+    var profile = currentProfile
+    var targetIndex = -1
+    for i in 0..<parts.len:
+        targetIndex = v3ParserProfileImportTargetIndexForQualifier(profile, parts[i])
+        if targetIndex < 0 || targetIndex >= profiles.len:
+            return -1
+        profile = profiles[targetIndex]
+    return targetIndex
+
+fn v3ParserResolveUnqualifiedTypeProfileIndex(currentProfile: V3NormalizedExprCallProfile,
+                                              profiles: V3NormalizedExprCallProfile[],
+                                              typeNameRaw: str): int32 =
+    let typeName = v3ParserIdentPrefix(v3path.V3PathTrim(typeNameRaw))
+    if typeName == "":
+        return -1
+    if v3ParserProfileHasDeclaredType(currentProfile, typeName):
+        return -2
+    var targetIndex = -1
+    for i in 0..<currentProfile.importEdges.len:
+        let edge = currentProfile.importEdges[i]
+        if !edge.resolved || edge.targetProfileIndex < 0 || edge.targetProfileIndex >= profiles.len:
+            continue
+        if !v3ParserProfileHasDeclaredType(profiles[edge.targetProfileIndex], typeName):
+            continue
+        if targetIndex < 0:
+            targetIndex = edge.targetProfileIndex
+            continue
+        if targetIndex != edge.targetProfileIndex:
+            return -1
+    return targetIndex
+
+fn v3ParserDefaultInitRemovedDefaultError(exprRaw: str): str =
+    let expr = v3path.V3PathTrim(exprRaw)
+    return "[cheng_v3_seed] default[T] removed expr=" + expr + "; use T() for object/tuple, typed implicit init or literals for T[]/T[N], and new(T) for ref object"
+
+fn v3ParserDefaultInitScalarError(typeRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return "[cheng_v3_seed] simple type T() unsupported expr=" + typeText + "(); simple types use typed implicit init"
+
+fn v3ParserDefaultInitSeqOrFixedError(typeRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return "[cheng_v3_seed] seq/fixed-array T() unsupported expr=" + typeText + "(); use typed implicit init or literals"
+
+fn v3ParserDefaultInitRefObjectError(typeRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return "[cheng_v3_seed] ref object T() unsupported expr=" + typeText + "(); use new(T)"
+
+fn v3ParserRedundantExplicitDefaultError(typeRaw: str,
+                                         exprRaw: str): str =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    let exprText = v3path.V3PathTrim(exprRaw)
+    return "[cheng_v3_seed] redundant explicit default init; omit initializer type=" + typeText + " expr=" + exprText
+
+fn v3ParserCompactText(textRaw: str): str =
+    var out = ""
+    for i in 0..<textRaw.len:
+        let ch = textRaw[i]
+        if v3ParserIsInlineSpace(ch):
+            continue
+        out = out + v3path.V3TextSlice(textRaw, i, 1)
+    return out
+
+fn v3ParserFindTopLevelAssignmentEq(textRaw: str): int32 =
+    var inString = false
+    var inChar = false
+    var parenDepth: int32
+    var bracketDepth: int32
+    var braceDepth: int32
+    for i in 0..<textRaw.len:
+        let ch = textRaw[i]
+        if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(textRaw, i):
+            inString = !inString
+            continue
+        if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(textRaw, i):
+            inChar = !inChar
+            continue
+        if inString || inChar:
+            continue
+        if ch == '(':
+            parenDepth = parenDepth + 1
+            continue
+        if ch == ')':
+            parenDepth = parenDepth - 1
+            continue
+        if ch == '[':
+            bracketDepth = bracketDepth + 1
+            continue
+        if ch == ']':
+            bracketDepth = bracketDepth - 1
+            continue
+        if ch == '{':
+            braceDepth = braceDepth + 1
+            continue
+        if ch == '}':
+            braceDepth = braceDepth - 1
+            continue
+        if parenDepth == 0 &&
+           bracketDepth == 0 &&
+           braceDepth == 0 &&
+           ch == '=':
+            var prev: char
+            var next: char
+            if i > 0:
+                prev = textRaw[i - 1]
+            if i + 1 < textRaw.len:
+                next = textRaw[i + 1]
+            if prev == '=' || prev == '!' || prev == '<' || prev == '>' || next == '=':
+                continue
+            return i
+    return -1
+
+fn v3ParserLineIndent(lineRaw: str): int32 =
+    var indent: int32
+    while indent < lineRaw.len:
+        let ch = lineRaw[indent]
+        if ch != ' ' && ch != '\t':
+            break
+        indent = indent + 1
+    return indent
+
+fn v3ParserTypeExprIsIntDefaultType(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return typeText == "int8" ||
+           typeText == "uint8" ||
+           typeText == "int16" ||
+           typeText == "uint16" ||
+           typeText == "int32" ||
+           typeText == "int" ||
+           typeText == "uint32" ||
+           typeText == "uint" ||
+           typeText == "int64" ||
+           typeText == "uint64"
+
+fn v3ParserTypeExprIsFloatDefaultType(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return typeText == "float" || typeText == "float32" || typeText == "float64"
+
+fn v3ParserTypeExprIsStringDefaultType(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    return typeText == "str" || typeText == "cstring"
+
+fn v3ParserTypeExprLooksLikeLowerGenericFunction(typeRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    if typeText == "" ||
+       typeText == "Bytes" ||
+       v3ParserTypeExprIsTuple(typeText) ||
+       v3ParserTypeExprIsSeq(typeText) ||
+       v3ParserTypeExprIsFixedArray(typeText) ||
+       v3ParserStartsWithExact(typeText, "Result["):
+        return false
+    var bracketPos: int32 = -1
+    for i in 0..<typeText.len:
+        if typeText[i] == '[':
+            bracketPos = i
+            break
+    if bracketPos <= 0 || bracketPos + 1 >= typeText.len:
+        return false
+    let base = v3ParserTypeExprLeaf(typeText)
+    if base == "":
+        return false
+    return base[0] >= 'a' && base[0] <= 'z'
+
+fn v3ParserDefaultInitTypeStatus(currentProfile: V3NormalizedExprCallProfile,
+                                 profiles: V3NormalizedExprCallProfile[],
+                                 typeRaw: str,
+                                 err: var str): int32 =
+    err = ""
+    let typeText = v3path.V3PathTrim(typeRaw)
+    if typeText == "":
+        return 0
+    if v3ParserTypeExprIsScalarDefaultForbidden(typeText):
+        err = v3ParserDefaultInitScalarError(typeText)
+        return -1
+    if v3ParserTypeExprIsSeq(typeText) || v3ParserTypeExprIsFixedArray(typeText):
+        err = v3ParserDefaultInitSeqOrFixedError(typeText)
+        return -1
+    if typeText == "Bytes" || v3ParserTypeExprIsTuple(typeText):
+        return 1
+    let qualifier = v3ParserTypeExprQualifier(typeText)
+    let leaf = v3ParserTypeExprLeaf(typeText)
+    if leaf == "":
+        return 0
+    if qualifier != "":
+        let targetIndex = v3ParserResolveQualifiedTypeProfileIndex(currentProfile, profiles, qualifier)
+        if targetIndex < 0:
+            return 0
+        if !v3ParserProfileHasDeclaredType(profiles[targetIndex], leaf):
+            return 0
+        if v3ParserProfileHasRefObjectType(profiles[targetIndex], leaf):
+            err = v3ParserDefaultInitRefObjectError(typeText)
+            return -1
+        return 1
+    let localType = v3ParserResolveUnqualifiedTypeProfileIndex(currentProfile, profiles, leaf)
+    if localType == -2:
+        if v3ParserProfileHasRefObjectType(currentProfile, leaf):
+            err = v3ParserDefaultInitRefObjectError(typeText)
+            return -1
+        return 1
+    if localType < 0:
+        return 0
+    if v3ParserProfileHasRefObjectType(profiles[localType], leaf):
+        err = v3ParserDefaultInitRefObjectError(typeText)
+        return -1
+    return 1
+
+fn v3ParserConstructorTypeStatus(currentProfile: V3NormalizedExprCallProfile,
+                                 profiles: V3NormalizedExprCallProfile[],
+                                 typeRaw: str): int32 =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    if typeText == "":
+        return 0
+    if typeText == "Bytes" || v3ParserTypeExprIsTuple(typeText) ||
+       v3ParserTypeExprIsSeq(typeText) || v3ParserTypeExprIsFixedArray(typeText):
+        return 1
+    let qualifier = v3ParserTypeExprQualifier(typeText)
+    let leaf = v3ParserTypeExprLeaf(typeText)
+    if leaf == "":
+        return 0
+    if qualifier != "":
+        let targetIndex = v3ParserResolveQualifiedTypeProfileIndex(currentProfile, profiles, qualifier)
+        if targetIndex < 0:
+            return 0
+        if !v3ParserProfileHasDeclaredType(profiles[targetIndex], leaf):
+            return 0
+        if v3ParserProfileHasRefObjectType(profiles[targetIndex], leaf):
+            return 0
+        return 1
+    let localType = v3ParserResolveUnqualifiedTypeProfileIndex(currentProfile, profiles, leaf)
+    if localType == -2:
+        if v3ParserProfileHasRefObjectType(currentProfile, leaf):
+            return 0
+        return 1
+    if localType < 0:
+        return 0
+    if v3ParserProfileHasRefObjectType(profiles[localType], leaf):
+        return 0
+    return 1
+
+fn v3ParserExprMatchesImplicitDefault(currentProfile: V3NormalizedExprCallProfile,
+                                      profiles: V3NormalizedExprCallProfile[],
+                                      typeRaw: str,
+                                      exprRaw: str): bool =
+    let typeText = v3path.V3PathTrim(typeRaw)
+    let exprText = v3path.V3PathTrim(exprRaw)
+    if typeText == "" || exprText == "":
+        return false
+    if typeText == "bool" && exprText == "false":
+        return true
+    if v3ParserTypeExprIsIntDefaultType(typeText) && exprText == "0":
+        return true
+    if v3ParserTypeExprIsFloatDefaultType(typeText) && (exprText == "0" || exprText == "0.0"):
+        return true
+    if v3ParserTypeExprIsStringDefaultType(typeText) && exprText == "\"\"":
+        return true
+    if typeText == "char" && exprText == "'\\0'":
+        return true
+    if (v3ParserTypeExprIsSeq(typeText) || v3ParserTypeExprIsFixedArray(typeText)) && exprText == "[]":
+        return true
+    let compactType = v3ParserCompactText(typeText)
+    let compactExpr = v3ParserCompactText(exprText)
+    if compactType != "" && compactExpr == compactType + "()":
+        var typeErr = ""
+        return v3ParserDefaultInitTypeStatus(currentProfile, profiles, typeText, typeErr) > 0
+    return false
+
+fn v3ParserParseTypedInitializerLine(lineRaw: str,
+                                     prefixRaw: str,
+                                     typeOut: var str,
+                                     exprOut: var str): bool =
+    typeOut = ""
+    exprOut = ""
+    let line = v3path.V3PathTrim(lineRaw)
+    if prefixRaw != "" && !v3ParserStartsWithExact(line, prefixRaw):
+        return false
+    var tail = line
+    if prefixRaw != "":
+        tail = v3path.V3TextSlice(line, prefixRaw.len, line.len - prefixRaw.len)
+    let eqPos = v3ParserFindTopLevelAssignmentEq(tail)
+    if eqPos <= 0:
+        return false
+    let left = v3path.V3PathTrim(v3path.V3TextSlice(tail, 0, eqPos))
+    let colonPos = v3ParserFindTopLevelToken(left, ":")
+    if colonPos <= 0:
+        return false
+    typeOut = v3path.V3PathTrim(v3path.V3TextSlice(left, colonPos + 1, left.len - colonPos - 1))
+    exprOut = v3path.V3PathTrim(v3path.V3TextSlice(tail, eqPos + 1, tail.len - eqPos - 1))
+    return typeOut != "" && exprOut != ""
+
+fn v3ParserFindRedundantExplicitDefaultLine(lineRaw: str,
+                                            inTypeBlock: bool,
+                                            currentProfile: V3NormalizedExprCallProfile,
+                                            profiles: V3NormalizedExprCallProfile[],
+                                            typeOut: var str,
+                                            exprOut: var str): bool =
+    typeOut = ""
+    exprOut = ""
+    if v3ParserParseTypedInitializerLine(lineRaw, "let ", typeOut, exprOut) ||
+       v3ParserParseTypedInitializerLine(lineRaw, "var ", typeOut, exprOut):
+        return v3ParserExprMatchesImplicitDefault(currentProfile, profiles, typeOut, exprOut)
+    if inTypeBlock && v3ParserParseTypedInitializerLine(lineRaw, "", typeOut, exprOut):
+        return v3ParserExprMatchesImplicitDefault(currentProfile, profiles, typeOut, exprOut)
+    return false
+
+fn v3ParserIsTypeExprChar(ch: char): bool =
+    return v3ParserIsIdentChar(ch) || ch == '.' || ch == '[' || ch == ']'
+
+fn v3ParserFindRemovedDefaultExprLine(lineRaw: str,
+                                      exprTextOut: var str,
+                                      columnNumberOut: var int32): bool =
+    exprTextOut = ""
+    columnNumberOut = -1
+    var inString = false
+    var inChar = false
+    var i: int32
+    while i + len("default[") <= lineRaw.len:
+        let ch = lineRaw[i]
+        if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar:
+            i = i + 1
+            continue
+        if i > 0:
+            if v3ParserIsIdentChar(lineRaw[i - 1]):
+                i = i + 1
+                continue
+        if !v3ParserTextEqualsAt(lineRaw, i, "default["):
+            i = i + 1
+            continue
+        let closePos = v3ParserFindMatchingBracket(lineRaw, i + len("default"))
+        if closePos < 0:
+            return false
+        exprTextOut = v3ParserTextSliceFast(lineRaw, i, closePos - i + 1)
+        columnNumberOut = i + 1
+        return true
+    return false
+
+fn v3ParserAppendDefaultInitExprsLine(sourcePath: str,
+                                      lineNumber: int32,
+                                      lineRaw: str,
+                                      currentProfile: V3NormalizedExprCallProfile,
+                                      profiles: V3NormalizedExprCallProfile[],
+                                      layer: var V3NormalizedExprLayer,
+                                      err: var str): bool =
+    err = ""
+    var removedExpr = ""
+    var removedColumn = -1
+    if v3ParserFindRemovedDefaultExprLine(lineRaw, removedExpr, removedColumn):
+        let _ = removedColumn
+        err = v3ParserDefaultInitRemovedDefaultError(removedExpr)
+        return false
+    var inString = false
+    var inChar = false
+    var i: int32
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar || ch != '(':
+            i = i + 1
+            continue
+        let closePos = v3ParserFindMatchingParen(lineRaw, i)
+        if closePos < 0:
+            i = i + 1
+            continue
+        let argText = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, i + 1, closePos - i - 1))
+        if argText != "":
+            i = closePos + 1
+            continue
+        var calleeStop = i - 1
+        while calleeStop >= 0:
+            if !v3ParserIsInlineSpace(lineRaw[calleeStop]):
+                break
+            calleeStop = calleeStop - 1
+        if calleeStop < 0:
+            i = closePos + 1
+            continue
+        var calleeStart = calleeStop
+        while calleeStart >= 0:
+            if !v3ParserIsTypeExprChar(lineRaw[calleeStart]):
+                break
+            calleeStart = calleeStart - 1
+        calleeStart = calleeStart + 1
+        if calleeStart > calleeStop || v3ParserPreviousTokenIsDeclKeyword(lineRaw, calleeStart):
+            i = closePos + 1
+            continue
+        let typeText = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, calleeStart, calleeStop - calleeStart + 1))
+        var typeErr = ""
+        let status = v3ParserDefaultInitTypeStatus(currentProfile, profiles, typeText, typeErr)
+        if status < 0:
+            err = typeErr
+            return false
+        if status > 0:
+            v3NormalizedExprLayerAppendSpan(layer,
+                                            sourcePath,
+                                            lineNumber,
+                                            calleeStart + 1,
+                                            v3NormalizedExprDefaultInit,
+                                            v3NormalizedExprDetailNone,
+                                            typeText,
+                                            closePos + 1)
+        i = closePos + 1
+    return true
+
+fn v3ParserAppendConstructorExprsLine(sourcePath: str,
+                                      lineNumber: int32,
+                                      lineRaw: str,
+                                      currentProfile: V3NormalizedExprCallProfile,
+                                      profiles: V3NormalizedExprCallProfile[],
+                                      layer: var V3NormalizedExprLayer) =
+    var inString = false
+    var inChar = false
+    var i: int32
+    while i < lineRaw.len:
+        let ch = lineRaw[i]
+        if !inChar && ch == '"' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inString = !inString
+            i = i + 1
+            continue
+        if !inString && ch == '\'' && !v3ParserQuoteIsEscaped(lineRaw, i):
+            inChar = !inChar
+            i = i + 1
+            continue
+        if inString || inChar || ch != '(':
+            i = i + 1
+            continue
+        let closePos = v3ParserFindMatchingParen(lineRaw, i)
+        if closePos < 0:
+            i = i + 1
+            continue
+        let argsText = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, i + 1, closePos - i - 1))
+        if argsText == "":
+            i = closePos + 1
+            continue
+        var calleeStop = i - 1
+        while calleeStop >= 0:
+            if !v3ParserIsInlineSpace(lineRaw[calleeStop]):
+                break
+            calleeStop = calleeStop - 1
+        if calleeStop < 0:
+            i = closePos + 1
+            continue
+        var calleeStart = calleeStop
+        while calleeStart >= 0:
+            if !v3ParserIsTypeExprChar(lineRaw[calleeStart]):
+                break
+            calleeStart = calleeStart - 1
+        calleeStart = calleeStart + 1
+        if calleeStart > calleeStop || v3ParserPreviousTokenIsDeclKeyword(lineRaw, calleeStart):
+            i = closePos + 1
+            continue
+        let typeText = v3path.V3PathTrim(v3ParserTextSliceFast(lineRaw, calleeStart, calleeStop - calleeStart + 1))
+        if v3ParserConstructorTypeStatus(currentProfile, profiles, typeText) > 0:
+            v3NormalizedExprLayerAppendConstructor(layer,
+                                                   sourcePath,
+                                                   lineNumber,
+                                                   calleeStart + 1,
+                                                   typeText,
+                                                   argsText,
+                                                   v3ParserCountTopLevelArgs(argsText),
+                                                   false,
+                                                   closePos + 1)
+        i = closePos + 1
 
 fn v3ParserCallExprFirstDotExact(text: str): int32 =
     for i in 0..<text.len:
@@ -3116,6 +3892,7 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
     profile.text = text
     profile.lines = []
     profile.decls = []
+    profile.typeDecls = []
     profile.importcCallNames = []
     profile.localCallNames = []
     profile.importEdges = []
@@ -3125,6 +3902,7 @@ fn v3ParserBuildExprCallProfile(workspaceRootRaw: str,
     let codeLines = v3ParserPrepareCodeLines(lines)
     if !v3ParserReadNormalizedFunctionDeclsLines(lines, profile.decls, err):
         return false
+    v3ParserReadNormalizedTypeDeclsLines(lines, profile.typeDecls)
     if workspaceRoot != "" && packageRoot != "":
         if !v3ParserReadImportEdgesLines(workspaceRoot,
                                          packageRoot,
@@ -3792,7 +4570,7 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
     if sourcePath == "":
         err = "missing source path"
         return false
-    layer = v3NormalizedExprLayerZero()
+    layer = V3NormalizedExprLayer()
     layer.sourceCount = 1
     let localCallLookup = v3ParserTextLookupBuildExact(localCallNames)
     let externalCallLookup = v3ParserTextLookupBuildExact(externalCallNames)
@@ -3805,11 +4583,31 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
     v3ParserTextLookupAddAllExact(knownCallLookup, importcCallNames)
     var profileCallLookupCache = v3ParserBuildProfileCallLookupCache(profiles)
     let codeLines = v3ParserPrepareCodeLines(v3ParserSplitChar(text, '\n'))
+    var inTypeBlock = false
+    var typeBlockIndent: int32 = -1
     for i in 0..<codeLines.len:
         let line = codeLines[i]
         if !v3ParserHasNonTrimChar(line):
             continue
         let lineNumber = i + 1
+        let trimmedLine = v3path.V3PathTrim(line)
+        let lineIndent: int32 = v3ParserLineIndent(line)
+        if inTypeBlock && lineIndent <= typeBlockIndent:
+            inTypeBlock = false
+        if !v3ParserHasLeadingIndent(line):
+            inTypeBlock = trimmedLine == "type"
+            if inTypeBlock:
+                typeBlockIndent = lineIndent
+        var redundantType = ""
+        var redundantExpr = ""
+        if v3ParserFindRedundantExplicitDefaultLine(line,
+                                                    inTypeBlock,
+                                                    currentProfile,
+                                                    profiles,
+                                                    redundantType,
+                                                    redundantExpr):
+            err = v3ParserRedundantExplicitDefaultError(redundantType, redundantExpr)
+            return false
         v3ParserAppendSimpleSurfaceExprsLine(sourcePath,
                                              lineNumber,
                                              line,
@@ -3820,6 +4618,20 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRa
         v3ParserAppendRangeExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendComprehensionExprsLine(sourcePath, lineNumber, line, layer)
         v3ParserAppendFmtExprsLine(sourcePath, lineNumber, line, layer)
+        if !v3ParserAppendDefaultInitExprsLine(sourcePath,
+                                               lineNumber,
+                                               line,
+                                               currentProfile,
+                                               profiles,
+                                               layer,
+                                               err):
+            return false
+        v3ParserAppendConstructorExprsLine(sourcePath,
+                                           lineNumber,
+                                           line,
+                                           currentProfile,
+                                           profiles,
+                                           layer)
         v3ParserAppendCallExprsLine(sourcePath,
                                     lineNumber,
                                     line,
@@ -3873,11 +4685,13 @@ fn v3ParserReadNormalizedExprLayerFromTextWithKnownCalls(sourcePathRaw: str,
     currentProfile.text = text
     currentProfile.lines = v3ParserSplitChar(text, '\n')
     currentProfile.decls = []
+    currentProfile.typeDecls = []
     currentProfile.importcCallNames = v3ParserCloneTextSeq(importcCallNames)
     currentProfile.localCallNames = v3ParserCloneTextSeq(localCallNames)
     currentProfile.importEdges = []
     currentProfile.maxQualifiedCallDepth = v3ParserMaxQualifiedCallDepthLines(
         v3ParserPrepareCodeLines(currentProfile.lines))
+    v3ParserReadNormalizedTypeDeclsLines(currentProfile.lines, currentProfile.typeDecls)
     var profiles: V3NormalizedExprCallProfile[]
     let profileIndexLookup = v3ParserSourcePathIndexLookupBuild(profiles)
     return v3ParserReadNormalizedExprLayerFromTextWithKnownCallsAndProfiles(sourcePathRaw,
@@ -5346,7 +6160,7 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     var seen: str[]
     var ordered: str[]
     var importEdges: V3ImportEdge[]
-    var exprLayer = v3NormalizedExprLayerZero()
+    var exprLayer = V3NormalizedExprLayer()
     var unresolved: int32
     if !v3ParserCollectClosure(workspaceRoot, packageRoot, sourcePath, seen, ordered, importEdges, unresolved, err):
         return false
@@ -5362,7 +6176,7 @@ fn v3ParseOrdinarySourceStub(packageRootRaw: str,
     let profileIndexLookup = v3ParserSourcePathIndexLookupBuild(sourceProfiles)
     v3ParserBindImportEdgeTargetProfileIndices(sourceProfiles, profileIndexLookup)
     for i in 0..<sourceProfiles.len:
-        var sourceExprLayer = v3NormalizedExprLayerZero()
+        var sourceExprLayer = V3NormalizedExprLayer()
         var sourceExternalCallNames: str[]
         v3ParserCollectExternalCallNames(sourceProfiles,
                                          profileIndexLookup,

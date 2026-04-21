@@ -9,18 +9,17 @@ import cheng/v3/lang/parser
 import cheng/v3/lang/typed_expr as texpr
 
 fn reportFieldValue(report: str, key: str): str =
-    let prefix = key + "="
-    var lineStart: int32
-    while lineStart < report.len:
-        var lineEnd = lineStart
-        while lineEnd < report.len && report[lineEnd] != '\n':
-            lineEnd = lineEnd + 1
-        let lineLen = lineEnd - lineStart
-        if lineLen >= prefix.len &&
-           v3path.V3TextSlice(report, lineStart, prefix.len) == prefix:
-            return v3path.V3TextSlice(report, lineStart + prefix.len, lineLen - prefix.len)
-        lineStart = lineEnd + 1
-    return ""
+    let taggedReport = "\n" + report
+    let needle = "\n" + key + "="
+    let fieldPos = parser.v3ParserFindText(taggedReport, needle)
+    if fieldPos < 0:
+        return ""
+    let valueStart = fieldPos + needle.len
+    let tail = v3path.V3TextSlice(taggedReport, valueStart, taggedReport.len - valueStart)
+    let newlinePos = parser.v3ParserFindText(tail, "\n")
+    if newlinePos < 0:
+        return tail
+    return v3path.V3TextSlice(tail, 0, newlinePos)
 
 fn reportFieldPositive(report: str, key: str): bool =
     let value = reportFieldValue(report, key)
@@ -39,6 +38,12 @@ fn assertCallReasonReportField(report: str,
 fn assertTypedCallFactsMatchLayer(facts: ccsg.V3TypedExprFact[],
                                   layer: parser.V3NormalizedExprLayer,
                                   label: str) =
+    assert(texpr.v3TypedExprTypeCallDefaultInitCount(facts) ==
+           parser.v3NormalizedExprLayerDefaultInitCount(layer),
+           label + " typed default init count")
+    assert(texpr.v3TypedExprTypeCallConstructorCount(facts) ==
+           parser.v3NormalizedExprLayerConstructorCount(layer),
+           label + " typed constructor count")
     assert(texpr.v3TypedExprFactCountCallResolved(facts) ==
            parser.v3NormalizedExprLayerCallResolvedCount(layer),
            label + " typed resolved call count")
@@ -176,7 +181,7 @@ fn buildFullCsg(workspaceRoot: str,
                 node.exportSymbolName = ccsg.v3CompilerCsgTargetExportName(symbolText,
                                                                            decl.explicitExportName,
                                                                            decl.name)
-            node.factCid = layout.fixedBytes32Zero()
+            node.factCid = layout.FixedBytes32()
             add(nodes, node)
     var edges: ccsg.V3CompilerCsgEdge[]
     if nodes.len > 0:
@@ -185,20 +190,20 @@ fn buildFullCsg(workspaceRoot: str,
         edge.fromNodeId = nodes[0].nodeId
         edge.toNodeId = nodes[0].nodeId
         edge.edgeKind = ccsg.v3CompilerCsgEdgeKindContains
-        edge.edgeCid = layout.fixedBytes32Zero()
+        edge.edgeCid = layout.FixedBytes32()
         add(edges, edge)
     var csg: ccsg.V3CompilerCsg
     csg.version = 1
     csg.packageId = linkPlan.packageId
-    csg.sourceBundleCid = layout.fixedBytes32Zero()
+    csg.sourceBundleCid = layout.FixedBytes32()
     csg.exprLayer = parser.v3NormalizedExprLayerClone(linkPlan.exprLayer)
     csg.typedExprFacts = texpr.v3TypedExprFactsClone(typedFacts)
     csg.nodeCount = nodes.len
     csg.edgeCount = edges.len
     csg.nodes = nodes
     csg.edges = edges
-    csg.canonicalGraphCid = layout.fixedBytes32Zero()
-    csg.graphCid = layout.fixedBytes32Zero()
+    csg.canonicalGraphCid = layout.FixedBytes32()
+    csg.graphCid = layout.FixedBytes32()
     return csg
 
 fn buildMinimalCsg(workspaceRoot: str,
@@ -222,15 +227,15 @@ fn buildMinimalCsg(workspaceRoot: str,
     var csg: ccsg.V3CompilerCsg
     csg.version = 1
     csg.packageId = linkPlan.packageId
-    csg.sourceBundleCid = layout.fixedBytes32Zero()
+    csg.sourceBundleCid = layout.FixedBytes32()
     csg.exprLayer = parser.v3NormalizedExprLayerClone(linkPlan.exprLayer)
     csg.typedExprFacts = texpr.v3TypedExprFactsClone(typedFacts)
     csg.nodeCount = 0
     csg.edgeCount = 0
     csg.nodes = []
     csg.edges = []
-    csg.canonicalGraphCid = layout.fixedBytes32Zero()
-    csg.graphCid = layout.fixedBytes32Zero()
+    csg.canonicalGraphCid = layout.FixedBytes32()
+    csg.graphCid = layout.FixedBytes32()
     return csg
 
 fn byteBufBytesEqual(lhs: layout.ByteBuf,
@@ -256,6 +261,18 @@ fn findCallExpr(layer: parser.V3NormalizedExprLayer,
             continue
         return parser.v3NormalizedExprClone(layer.exprs[i])
     var missing: parser.V3NormalizedExpr
+    return missing
+
+fn findTypedFact(facts: ccsg.V3TypedExprFact[],
+                 sourcePath: str,
+                 lineNumber: int32): ccsg.V3TypedExprFact =
+    for i in 0..<facts.len:
+        if facts[i].sourcePath != sourcePath:
+            continue
+        if facts[i].lineNumber != lineNumber:
+            continue
+        return texpr.v3TypedExprFactClone(facts[i])
+    var missing: ccsg.V3TypedExprFact
     return missing
 
 fn main(): int32 =
@@ -330,6 +347,15 @@ fn main(): int32 =
            "v3 compiler csg: typed fixture result intrinsic call kind")
     assert(texpr.v3TypedExprCallProjectionCount(typedFixtureFacts) > 0,
            "v3 compiler csg: typed fixture projection call kind")
+    assert(parser.v3NormalizedExprLayerHasConstructorExpr(typedCsg.exprLayer, 60),
+           "v3 compiler csg: typed fixture constructor expr")
+    let constructorFact = findTypedFact(typedFixtureFacts, typedFixturePath, 60)
+    assert(constructorFact.kind == parser.v3NormalizedExprConstructor,
+           "v3 compiler csg: typed fixture constructor fact kind")
+    assert(constructorFact.typeCallKind == texpr.v3TypedExprTypeCallConstructor,
+           "v3 compiler csg: typed fixture constructor type call kind")
+    assert(constructorFact.typeText == "TypedDefaultWrap",
+           "v3 compiler csg: typed fixture constructor fact type")
     assert(parser.v3NormalizedExprLayerHasCallExpr(typedCsg.exprLayer, parser.v3NormalizedExprSurfaceCallExternal, 28),
            "v3 compiler csg: typed fixture alias external call")
     assert(parser.v3NormalizedExprLayerHasCallExpr(typedCsg.exprLayer, parser.v3NormalizedExprSurfaceCallExternal, 29),
@@ -342,6 +368,7 @@ fn main(): int32 =
            "v3 compiler csg: typed fixture nested importc external call")
     var sawAliasImportBuffer = false
     var sawNestedImportBuffer = false
+    var sawDefaultInitFact = false
     for i in 0..<typedFixtureFacts.len:
         if typedFixtureFacts[i].lineNumber == 32 &&
            texpr.v3TypedExprFactUsesImportBuffer(typedFixtureFacts[i]):
@@ -349,8 +376,22 @@ fn main(): int32 =
         if typedFixtureFacts[i].lineNumber == 33 &&
            texpr.v3TypedExprFactUsesImportBuffer(typedFixtureFacts[i]):
             sawNestedImportBuffer = true
+        if typedFixtureFacts[i].lineNumber == 56 &&
+           typedFixtureFacts[i].kind == parser.v3NormalizedExprDefaultInit:
+            assert(typedFixtureFacts[i].typeCallKind == texpr.v3TypedExprTypeCallDefaultInit,
+                   "v3 compiler csg: typed fixture default init type call kind")
+            assert(typedFixtureFacts[i].abiClass == texpr.v3TypedExprAbiComposite,
+                   "v3 compiler csg: typed fixture default init abi")
+            assert(typedFixtureFacts[i].placeKind != texpr.v3TypedExprPlaceCallResult,
+                   "v3 compiler csg: typed fixture default init place")
+            assert(typedFixtureFacts[i].loweringMode == texpr.v3TypedExprLowerLocalAddress,
+                   "v3 compiler csg: typed fixture default init lowering")
+            assert(typedFixtureFacts[i].returnKind == texpr.v3TypedExprReturnCompositeLocal,
+                   "v3 compiler csg: typed fixture default init return")
+            sawDefaultInitFact = true
     assert(sawAliasImportBuffer, "v3 compiler csg: typed fixture alias importc uses import buffer")
     assert(sawNestedImportBuffer, "v3 compiler csg: typed fixture nested importc uses import buffer")
+    assert(sawDefaultInitFact, "v3 compiler csg: typed fixture saw default init fact")
     assert(texpr.v3TypedExprLowerImportBufferCount(typedFixtureFacts) > 0,
            "v3 compiler csg: typed fixture import buffer lowering")
     assert(texpr.v3TypedExprReturnRegCount(typedFixtureFacts) > 0,
@@ -364,6 +405,9 @@ fn main(): int32 =
     assert(reportFieldValue(typedReport, "expr_surface_call_count") ==
            intToStr(parser.v3NormalizedExprLayerCallCount(typedCsg.exprLayer)),
            "v3 compiler csg: typed fixture report call count")
+    assert(reportFieldValue(typedReport, "expr_surface_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report default init count")
     assert(reportFieldValue(typedReport, "expr_surface_call_resolved_count") ==
            intToStr(parser.v3NormalizedExprLayerCallResolvedCount(typedCsg.exprLayer)),
            "v3 compiler csg: typed fixture report resolved call count")
@@ -385,6 +429,21 @@ fn main(): int32 =
     assert(reportFieldValue(typedReport, "expr_surface_call_target_importc_count") ==
            intToStr(parser.v3NormalizedExprLayerCallTargetImportcCount(typedCsg.exprLayer)),
            "v3 compiler csg: typed fixture report importc target count")
+    assert(reportFieldValue(typedReport, "expr_surface_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report constructor count")
+    assert(reportFieldValue(typedReport, "typed_expr_type_call_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report typed default init count")
+    assert(reportFieldValue(typedReport, "typed_expr_type_call_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report typed constructor count")
+    assert(reportFieldValue(typedReport, "lowering_rule_type_call_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report lowering default init count")
+    assert(reportFieldValue(typedReport, "lowering_rule_type_call_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(typedCsg.exprLayer)),
+           "v3 compiler csg: typed fixture report lowering constructor count")
     assertCallReasonReportField(typedReport,
                                 typedCsg.exprLayer,
                                 parser.v3NormalizedExprCallReasonUnknownQualifiedTarget,

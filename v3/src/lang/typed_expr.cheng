@@ -36,6 +36,11 @@ type
         v3TypedExprCallResultIntrinsic
         v3TypedExprCallProjection
 
+    V3TypedExprTypeCallKind = enum
+        v3TypedExprTypeCallNone
+        v3TypedExprTypeCallDefaultInit
+        v3TypedExprTypeCallConstructor
+
     V3TypedExprSurfaceCallKind = enum
         v3TypedExprSurfaceCallNone
         v3TypedExprSurfaceCallLocal
@@ -120,6 +125,7 @@ type
         placeKind: V3TypedExprPlaceKind
         loweringMode: V3TypedExprLoweringMode
         callKind: V3TypedExprCallKind
+        typeCallKind: V3TypedExprTypeCallKind
         returnKind: V3TypedExprReturnKind
 
     V3TypedExprLoweringRule =
@@ -144,6 +150,7 @@ type
         placeKind: V3TypedExprPlaceKind
         loweringMode: V3TypedExprLoweringMode
         callKind: V3TypedExprCallKind
+        typeCallKind: V3TypedExprTypeCallKind
         returnKind: V3TypedExprReturnKind
         argPassKind: V3TypedExprArgPassKind
         resultPassKind: V3TypedExprResultPassKind
@@ -244,6 +251,13 @@ fn v3TypedExprCallKindText(callKind: V3TypedExprCallKind): str =
         return "result_intrinsic"
     if callKind == v3TypedExprCallProjection:
         return "projection"
+    return "none"
+
+fn v3TypedExprTypeCallKindText(typeCallKind: V3TypedExprTypeCallKind): str =
+    if typeCallKind == v3TypedExprTypeCallDefaultInit:
+        return "default_init"
+    if typeCallKind == v3TypedExprTypeCallConstructor:
+        return "constructor"
     return "none"
 
 fn v3TypedExprSurfaceCallKindText(kind: V3TypedExprSurfaceCallKind): str =
@@ -440,6 +454,13 @@ fn v3TypedExprCallKindForExpr(expr: parser.V3NormalizedExpr): V3TypedExprCallKin
         return v3TypedExprCallProjection
     return v3TypedExprCallNone
 
+fn v3TypedExprTypeCallKindForExpr(expr: parser.V3NormalizedExpr): V3TypedExprTypeCallKind =
+    if expr.kind == parser.v3NormalizedExprDefaultInit:
+        return v3TypedExprTypeCallDefaultInit
+    if expr.kind == parser.v3NormalizedExprConstructor:
+        return v3TypedExprTypeCallConstructor
+    return v3TypedExprTypeCallNone
+
 fn v3TypedExprReturnKindForResolved(abiClass: V3TypedExprAbiClass,
                                     loweringMode: V3TypedExprLoweringMode): V3TypedExprReturnKind =
     if loweringMode == v3TypedExprLowerSret:
@@ -478,6 +499,7 @@ fn v3TypedExprFactClone(fact: V3TypedExprFact): V3TypedExprFact =
     out.placeKind = fact.placeKind
     out.loweringMode = fact.loweringMode
     out.callKind = fact.callKind
+    out.typeCallKind = fact.typeCallKind
     out.returnKind = fact.returnKind
     return out
 
@@ -537,6 +559,8 @@ fn v3TypedExprFactEqual(lhs: V3TypedExprFact,
         return false
     if lhs.callKind != rhs.callKind:
         return false
+    if lhs.typeCallKind != rhs.typeCallKind:
+        return false
     return lhs.returnKind == rhs.returnKind
 
 fn v3TypedExprFactsEqual(lhs: V3TypedExprFact[],
@@ -585,6 +609,14 @@ fn v3TypedExprFactCountCallKind(facts: V3TypedExprFact[],
     var count: int32
     for i in 0..<facts.len:
         if facts[i].callKind == callKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprFactCountTypeCallKind(facts: V3TypedExprFact[],
+                                    typeCallKind: V3TypedExprTypeCallKind): int32 =
+    var count: int32
+    for i in 0..<facts.len:
+        if facts[i].typeCallKind == typeCallKind:
             count = count + 1
     return count
 
@@ -704,6 +736,15 @@ fn v3TypedExprCallResultIntrinsicCount(facts: V3TypedExprFact[]): int32 =
 fn v3TypedExprCallProjectionCount(facts: V3TypedExprFact[]): int32 =
     return v3TypedExprFactCountCallKind(facts, v3TypedExprCallProjection)
 
+fn v3TypedExprTypeCallNoneCount(facts: V3TypedExprFact[]): int32 =
+    return v3TypedExprFactCountTypeCallKind(facts, v3TypedExprTypeCallNone)
+
+fn v3TypedExprTypeCallDefaultInitCount(facts: V3TypedExprFact[]): int32 =
+    return v3TypedExprFactCountTypeCallKind(facts, v3TypedExprTypeCallDefaultInit)
+
+fn v3TypedExprTypeCallConstructorCount(facts: V3TypedExprFact[]): int32 =
+    return v3TypedExprFactCountTypeCallKind(facts, v3TypedExprTypeCallConstructor)
+
 fn v3TypedExprReturnRegCount(facts: V3TypedExprFact[]): int32 =
     return v3TypedExprFactCountReturnKind(facts, v3TypedExprReturnReg)
 
@@ -755,6 +796,10 @@ fn v3TypedExprFactUsesLocalAddressCompositeLocal(fact: V3TypedExprFact): bool =
 fn v3TypedExprFactUsesRegReturnReg(fact: V3TypedExprFact): bool =
     return fact.loweringMode == v3TypedExprLowerReg &&
            fact.returnKind == v3TypedExprReturnReg
+
+fn v3TypedExprFactUsesTypeCallMaterialize(fact: V3TypedExprFact): bool =
+    return fact.typeCallKind == v3TypedExprTypeCallDefaultInit ||
+           fact.typeCallKind == v3TypedExprTypeCallConstructor
 
 fn v3TypedExprFactAbiIsPolymorphic(fact: V3TypedExprFact): bool =
     return fact.abiClass == v3TypedExprAbiPolymorphic
@@ -813,6 +858,7 @@ fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLaye
     for i in 0..<facts.len:
         let expr = exprLayer.exprs[i]
         let fact = facts[i]
+        let expectedTypeCallKind = v3TypedExprTypeCallKindForExpr(expr)
         if expr.exprId != fact.exprId:
             err = "v3 typed expr: expr id mismatch"
             return false
@@ -833,7 +879,13 @@ fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLaye
                fact.callArgsText != "":
                 err = "v3 typed expr: non-call fact leaked call resolution at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
+            if fact.typeCallKind != expectedTypeCallKind:
+                err = "v3 typed expr: non-call fact leaked type-call drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                return false
             continue
+        if fact.typeCallKind != v3TypedExprTypeCallNone:
+            err = "v3 typed expr: call fact leaked type-call kind at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+            return false
         let surfaceKind = v3TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind)
         let resolved = expr.callResolved
         let reason = v3TypedExprCallReasonFromParser(expr.callReason)
@@ -938,6 +990,7 @@ fn v3TypedExprLoweringRuleFromFact(fact: V3TypedExprFact): V3TypedExprLoweringRu
     out.placeKind = fact.placeKind
     out.loweringMode = fact.loweringMode
     out.callKind = fact.callKind
+    out.typeCallKind = fact.typeCallKind
     out.returnKind = fact.returnKind
     out.argPassKind = argPassKind
     out.resultPassKind = resultPassKind
@@ -969,6 +1022,7 @@ fn v3TypedExprLoweringRuleClone(rule: V3TypedExprLoweringRule): V3TypedExprLower
     out.placeKind = rule.placeKind
     out.loweringMode = rule.loweringMode
     out.callKind = rule.callKind
+    out.typeCallKind = rule.typeCallKind
     out.returnKind = rule.returnKind
     out.argPassKind = rule.argPassKind
     out.resultPassKind = rule.resultPassKind
@@ -1027,6 +1081,8 @@ fn v3TypedExprLoweringRuleEqual(lhs: V3TypedExprLoweringRule,
         return false
     if lhs.callKind != rhs.callKind:
         return false
+    if lhs.typeCallKind != rhs.typeCallKind:
+        return false
     if lhs.returnKind != rhs.returnKind:
         return false
     if lhs.argPassKind != rhs.argPassKind:
@@ -1055,6 +1111,8 @@ fn v3TypedExprLoweringRuleShapeEqual(lhs: V3TypedExprLoweringRule,
         return false
     if lhs.callKind != rhs.callKind:
         return false
+    if lhs.typeCallKind != rhs.typeCallKind:
+        return false
     if lhs.returnKind != rhs.returnKind:
         return false
     if lhs.argPassKind != rhs.argPassKind:
@@ -1075,6 +1133,7 @@ fn v3TypedExprLoweringRuleKey(rule: V3TypedExprLoweringRule): str =
     out = out + ";place=" + v3TypedExprPlaceKindText(rule.placeKind)
     out = out + ";lower=" + v3TypedExprLoweringModeText(rule.loweringMode)
     out = out + ";call=" + v3TypedExprCallKindText(rule.callKind)
+    out = out + ";type_call=" + v3TypedExprTypeCallKindText(rule.typeCallKind)
     out = out + ";return=" + v3TypedExprReturnKindText(rule.returnKind)
     out = out + ";arg=" + v3TypedExprArgPassKindText(rule.argPassKind)
     out = out + ";result=" + v3TypedExprResultPassKindText(rule.resultPassKind)
@@ -1091,6 +1150,7 @@ fn v3TypedExprLoweringRuleEntryText(rule: V3TypedExprLoweringRule): str =
     out = out + ";column=" + intToStr(rule.columnNumber)
     out = out + ";expr=" + rule.exprId
     out = out + ";surface_call=" + v3TypedExprSurfaceCallKindText(rule.surfaceCallKind)
+    out = out + ";type_call=" + v3TypedExprTypeCallKindText(rule.typeCallKind)
     out = out + ";resolved=" + (if rule.callResolved: "1" else: "0")
     if callReasonText != "":
         out = out + ";reason=" + callReasonText
@@ -1192,6 +1252,101 @@ fn v3TypedExprLoweringRuleCountImportKind(rules: V3TypedExprLoweringRule[],
             count = count + 1
     return count
 
+fn v3TypedExprLoweringRuleCountTypeCallKind(rules: V3TypedExprLoweringRule[],
+                                            typeCallKind: V3TypedExprTypeCallKind): int32 =
+    var count: int32
+    for i in 0..<rules.len:
+        if rules[i].typeCallKind == typeCallKind:
+            count = count + 1
+    return count
+
+fn v3TypedExprReportAppendLine(out: var str,
+                               key: str,
+                               value: str) =
+    out = out + key + "=" + value + "\n"
+
+fn v3TypedExprFactsReportText(facts: V3TypedExprFact[]): str =
+    var out = ""
+    v3TypedExprReportAppendLine(out, "expr_surface_call_count", intToStr(v3TypedExprSurfaceCallCount(facts)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_resolved_count", intToStr(v3TypedExprFactCountCallResolved(facts)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_unresolved_count", intToStr(v3TypedExprFactCountCallUnresolved(facts)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_local_kind_count", intToStr(v3TypedExprFactCountSurfaceCallKindFromParser(facts, parser.v3NormalizedExprSurfaceCallLocal)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_external_kind_count", intToStr(v3TypedExprFactCountSurfaceCallKindFromParser(facts, parser.v3NormalizedExprSurfaceCallExternal)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_importc_kind_count", intToStr(v3TypedExprFactCountSurfaceCallKindFromParser(facts, parser.v3NormalizedExprSurfaceCallImportc)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_member_kind_count", intToStr(v3TypedExprFactCountSurfaceCallKindFromParser(facts, parser.v3NormalizedExprSurfaceCallMember)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_target_importc_count", intToStr(v3TypedExprFactCountCallTargetImportc(facts)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_unknown_qualified_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonUnknownQualifiedTarget)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_shadowed_qualified_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonShadowedQualifiedTarget)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_ambiguous_external_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonAmbiguousExternalTarget)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_ambiguous_qualified_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonAmbiguousQualifiedTarget)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_unknown_external_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonUnknownExternalTarget)))
+    v3TypedExprReportAppendLine(out, "expr_surface_call_reason_unknown_call_target_count", intToStr(v3TypedExprFactCountCallReasonFromParser(facts, parser.v3NormalizedExprCallReasonUnknownCallTarget)))
+    v3TypedExprReportAppendLine(out, "typed_expr_fact_count", intToStr(facts.len))
+    v3TypedExprReportAppendLine(out, "typed_expr_abi_scalar_count", intToStr(v3TypedExprAbiScalarCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_abi_composite_count", intToStr(v3TypedExprAbiCompositeCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_abi_pointer_like_count", intToStr(v3TypedExprAbiPointerLikeCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_abi_polymorphic_count", intToStr(v3TypedExprAbiPolymorphicCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_value_scalar_count", intToStr(v3TypedExprValueScalarCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_value_composite_count", intToStr(v3TypedExprValueCompositeCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_value_pointer_like_count", intToStr(v3TypedExprValuePointerLikeCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_value_polymorphic_count", intToStr(v3TypedExprValuePolymorphicCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_place_local_count", intToStr(v3TypedExprPlaceLocalCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_place_global_count", intToStr(v3TypedExprPlaceGlobalCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_place_field_count", intToStr(v3TypedExprPlaceFieldCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_place_temporary_count", intToStr(v3TypedExprPlaceTemporaryCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_place_call_result_count", intToStr(v3TypedExprPlaceCallResultCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_lower_reg_count", intToStr(v3TypedExprLowerRegCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_lower_local_address_count", intToStr(v3TypedExprLowerLocalAddressCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_lower_sret_count", intToStr(v3TypedExprLowerSretCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_lower_import_buffer_count", intToStr(v3TypedExprLowerImportBufferCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_lower_deferred_count", intToStr(v3TypedExprLowerDeferredCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_call_none_count", intToStr(v3TypedExprCallNoneCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_call_builtin_count", intToStr(v3TypedExprCallBuiltinCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_call_result_intrinsic_count", intToStr(v3TypedExprCallResultIntrinsicCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_call_projection_count", intToStr(v3TypedExprCallProjectionCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_type_call_none_count", intToStr(v3TypedExprTypeCallNoneCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_type_call_default_init_count", intToStr(v3TypedExprTypeCallDefaultInitCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_type_call_constructor_count", intToStr(v3TypedExprTypeCallConstructorCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_return_reg_count", intToStr(v3TypedExprReturnRegCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_return_composite_local_count", intToStr(v3TypedExprReturnCompositeLocalCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_return_sret_count", intToStr(v3TypedExprReturnSretCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_return_import_buffer_count", intToStr(v3TypedExprReturnImportBufferCount(facts)))
+    v3TypedExprReportAppendLine(out, "typed_expr_return_deferred_count", intToStr(v3TypedExprReturnDeferredCount(facts)))
+    return out
+
+fn v3TypedExprLoweringRulesReportText(rules: V3TypedExprLoweringRule[]): str =
+    var out = ""
+    v3TypedExprReportAppendLine(out, "lowering_rule_count", intToStr(rules.len))
+    v3TypedExprReportAppendLine(out, "lowering_rule_unique_shape_count", intToStr(v3TypedExprLoweringRuleUniqueShapeCount(rules)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_unique_key_count", intToStr(v3TypedExprLoweringRuleUniqueKeyCount(rules)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_arg_value_count", intToStr(v3TypedExprLoweringRuleCountArgPassKind(rules, v3TypedExprArgPassValue)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_arg_address_count", intToStr(v3TypedExprLoweringRuleCountArgPassKind(rules, v3TypedExprArgPassAddress)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_arg_call_result_address_count", intToStr(v3TypedExprLoweringRuleCountArgPassKind(rules, v3TypedExprArgPassCallResultAddress)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_result_reg_count", intToStr(v3TypedExprLoweringRuleCountResultPassKind(rules, v3TypedExprResultPassReg)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_result_local_address_count", intToStr(v3TypedExprLoweringRuleCountResultPassKind(rules, v3TypedExprResultPassLocalAddress)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_result_sret_count", intToStr(v3TypedExprLoweringRuleCountResultPassKind(rules, v3TypedExprResultPassSret)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_materialize_register_count", intToStr(v3TypedExprLoweringRuleCountMaterializeKind(rules, v3TypedExprMaterializeRegister)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_materialize_local_slot_count", intToStr(v3TypedExprLoweringRuleCountMaterializeKind(rules, v3TypedExprMaterializeLocalSlot)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_materialize_call_result_local_count", intToStr(v3TypedExprLoweringRuleCountMaterializeKind(rules, v3TypedExprMaterializeCallResultLocal)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_materialize_dest_address_count", intToStr(v3TypedExprLoweringRuleCountMaterializeKind(rules, v3TypedExprMaterializeDestAddress)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_copy_scalar_store_count", intToStr(v3TypedExprLoweringRuleCountCopyKind(rules, v3TypedExprCopyScalarStore)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_copy_region_copy_count", intToStr(v3TypedExprLoweringRuleCountCopyKind(rules, v3TypedExprCopyRegionCopy)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_import_import_buffer_count", intToStr(v3TypedExprLoweringRuleCountImportKind(rules, v3TypedExprImportImportBuffer)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_import_builtin_address_slot_count", intToStr(v3TypedExprLoweringRuleCountImportKind(rules, v3TypedExprImportBuiltinAddressSlot)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_import_i32_value_slot_count", intToStr(v3TypedExprLoweringRuleCountImportKind(rules, v3TypedExprImportI32ValueSlot)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_import_i32_address_slot_count", intToStr(v3TypedExprLoweringRuleCountImportKind(rules, v3TypedExprImportI32AddressSlot)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_type_call_none_count", intToStr(v3TypedExprLoweringRuleCountTypeCallKind(rules, v3TypedExprTypeCallNone)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_type_call_default_init_count", intToStr(v3TypedExprLoweringRuleCountTypeCallKind(rules, v3TypedExprTypeCallDefaultInit)))
+    v3TypedExprReportAppendLine(out, "lowering_rule_type_call_constructor_count", intToStr(v3TypedExprLoweringRuleCountTypeCallKind(rules, v3TypedExprTypeCallConstructor)))
+    for i in 0..<rules.len:
+        v3TypedExprReportAppendLine(out, "lowering_rule_entry[" + intToStr(i) + "]", v3TypedExprLoweringRuleEntryText(rules[i]))
+    return out
+
+fn v3TypedExprReportText(facts: V3TypedExprFact[],
+                         rules: V3TypedExprLoweringRule[]): str =
+    return v3TypedExprFactsReportText(facts) +
+           v3TypedExprLoweringRulesReportText(rules)
+
 fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                                     err: var str): bool =
     for i in 0..<rules.len:
@@ -1213,6 +1368,9 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                 err = "v3 typed expr: non-call rule leaked call resolution"
                 return false
         else:
+            if rule.typeCallKind != v3TypedExprTypeCallNone:
+                err = "v3 typed expr: call rule leaked type-call kind"
+                return false
             if rule.callQualifier == "" &&
                (rule.surfaceCallKind == v3TypedExprSurfaceCallExternal ||
                 rule.surfaceCallKind == v3TypedExprSurfaceCallMember):
@@ -1237,6 +1395,10 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
             if !rule.callResolved && rule.callTargetImportc:
                 err = "v3 typed expr: unresolved rule keeps importc target"
                 return false
+        if rule.typeCallKind != v3TypedExprTypeCallNone &&
+           rule.surfaceCallKind != v3TypedExprSurfaceCallNone:
+            err = "v3 typed expr: type-call rule leaked call surface"
+            return false
         if (rule.abiClass == v3TypedExprAbiPolymorphic ||
             rule.loweringMode == v3TypedExprLowerDeferred) &&
            (rule.argPassKind != v3TypedExprArgPassDeferred ||
@@ -1969,6 +2131,16 @@ fn v3TypedExprExtractGenericArg(lineRaw: str,
         return ""
     return v3TypedExprNormalizeTypeText(v3path.V3TextSlice(lineRaw, cursor + 1, closePos - cursor - 1))
 
+fn v3TypedExprExtractTypeGenericArg(typeRaw: str): str =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    let openPos = v3TypedExprFindTopLevelToken(typeText, "[")
+    if openPos < 0 || openPos + 1 >= typeText.len:
+        return ""
+    let closePos = v3TypedExprFindMatchingBracket(typeText, openPos)
+    if closePos <= openPos || closePos + 1 != typeText.len:
+        return ""
+    return v3TypedExprNormalizeTypeText(v3path.V3TextSlice(typeText, openPos + 1, closePos - openPos - 1))
+
 fn v3TypedExprExtractFirstArg(lineRaw: str,
                               columnNumber: int32,
                               callName: str): str =
@@ -2111,6 +2283,7 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
     fact.placeKind = v3TypedExprPlaceTemporary
     fact.loweringMode = v3TypedExprLowerDeferred
     fact.callKind = v3TypedExprCallKindForExpr(expr)
+    fact.typeCallKind = v3TypedExprTypeCallKindForExpr(expr)
     fact.returnKind = v3TypedExprReturnDeferred
     let sink = v3TypedExprSinkForExpr(ctx, expr, exprLayer)
     let scopeIndex = v3TypedExprScopeIndexForLine(ctx.scopes, expr.lineNumber)
@@ -2194,6 +2367,34 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
             return fact
         fact.typeText = "result_projection"
         fact.placeKind = v3TypedExprPlaceCallResult
+        return fact
+    if expr.kind == parser.v3NormalizedExprDefaultInit:
+        let defaultInitType = parser.v3NormalizedExprDefaultInitType(expr)
+        if defaultInitType != "":
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, defaultInitType, sink, false)
+            return fact
+        fact.typeText = "default_init_expr"
+        return fact
+    if expr.kind == parser.v3NormalizedExprConstructor:
+        let constructorType = parser.v3NormalizedExprConstructorType(expr)
+        let constructorName = parser.v3ParserIdentPrefix(constructorType)
+        if constructorName == "Ok" || constructorName == "Err":
+            let genericInner = v3TypedExprExtractTypeGenericArg(constructorType)
+            if genericInner != "":
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, v3TypedExprResultType(genericInner), sink, false)
+                return fact
+            if sink.hasSink && parser.v3ParserStartsWith(sink.sinkType, "Result["):
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.sinkType, sink, false)
+                return fact
+            if parser.v3ParserStartsWith(sink.functionReturnType, "Result["):
+                v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, sink.functionReturnType, sink, false)
+                return fact
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, "Result[unknown]", sink, false)
+            return fact
+        if constructorType != "":
+            v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, constructorType, sink, false)
+            return fact
+        fact.typeText = "constructor_expr"
         return fact
     if expr.kind == parser.v3NormalizedExprCall:
         fact.surfaceCallKind = v3TypedExprSurfaceCallKindFromParser(expr.callSurfaceKind)

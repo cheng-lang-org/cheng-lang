@@ -10,18 +10,17 @@ import cheng/v3/lang/parser
 import cheng/v3/lang/typed_expr as texpr
 
 fn reportFieldValue(report: str, key: str): str =
-    let prefix = key + "="
-    var lineStart: int32
-    while lineStart < report.len:
-        var lineEnd = lineStart
-        while lineEnd < report.len && report[lineEnd] != '\n':
-            lineEnd = lineEnd + 1
-        let lineLen = lineEnd - lineStart
-        if lineLen >= prefix.len &&
-           v3path.V3TextSlice(report, lineStart, prefix.len) == prefix:
-            return v3path.V3TextSlice(report, lineStart + prefix.len, lineLen - prefix.len)
-        lineStart = lineEnd + 1
-    return ""
+    let taggedReport = "\n" + report
+    let needle = "\n" + key + "="
+    let fieldPos = parser.v3ParserFindText(taggedReport, needle)
+    if fieldPos < 0:
+        return ""
+    let valueStart = fieldPos + needle.len
+    let tail = v3path.V3TextSlice(taggedReport, valueStart, taggedReport.len - valueStart)
+    let newlinePos = parser.v3ParserFindText(tail, "\n")
+    if newlinePos < 0:
+        return tail
+    return v3path.V3TextSlice(tail, 0, newlinePos)
 
 fn reportFieldPositive(report: str, key: str): bool =
     let value = reportFieldValue(report, key)
@@ -30,6 +29,24 @@ fn reportFieldPositive(report: str, key: str): bool =
 fn assertCallReportMatches(report: str,
                            layer: parser.V3NormalizedExprLayer,
                            label: str) =
+    assert(reportFieldValue(report, "expr_surface_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(layer)),
+           label + " report expr default init count")
+    assert(reportFieldValue(report, "expr_surface_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(layer)),
+           label + " report expr constructor count")
+    assert(reportFieldValue(report, "typed_expr_type_call_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(layer)),
+           label + " report default init count")
+    assert(reportFieldValue(report, "typed_expr_type_call_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(layer)),
+           label + " report constructor count")
+    assert(reportFieldValue(report, "lowering_rule_type_call_default_init_count") ==
+           intToStr(parser.v3NormalizedExprLayerDefaultInitCount(layer)),
+           label + " report lowering default init count")
+    assert(reportFieldValue(report, "lowering_rule_type_call_constructor_count") ==
+           intToStr(parser.v3NormalizedExprLayerConstructorCount(layer)),
+           label + " report lowering constructor count")
     assert(reportFieldValue(report, "expr_surface_call_count") ==
            intToStr(parser.v3NormalizedExprLayerCallCount(layer)),
            label + " report call count")
@@ -76,6 +93,12 @@ fn assertCallReportMatches(report: str,
 fn assertTypedCallFactsMatchLayer(facts: ccsg.V3TypedExprFact[],
                                   layer: parser.V3NormalizedExprLayer,
                                   label: str) =
+    assert(texpr.v3TypedExprTypeCallDefaultInitCount(facts) ==
+           parser.v3NormalizedExprLayerDefaultInitCount(layer),
+           label + " typed default init count")
+    assert(texpr.v3TypedExprTypeCallConstructorCount(facts) ==
+           parser.v3NormalizedExprLayerConstructorCount(layer),
+           label + " typed constructor count")
     assert(texpr.v3TypedExprFactCountCallResolved(facts) ==
            parser.v3NormalizedExprLayerCallResolvedCount(layer),
            label + " typed resolved call count")
@@ -158,15 +181,15 @@ fn buildMinimalCsg(workspaceRoot: str,
     var csg: ccsg.V3CompilerCsg
     csg.version = 1
     csg.packageId = linkPlan.packageId
-    csg.sourceBundleCid = layout.fixedBytes32Zero()
+    csg.sourceBundleCid = layout.FixedBytes32()
     csg.exprLayer = parser.v3NormalizedExprLayerClone(linkPlan.exprLayer)
     csg.typedExprFacts = texpr.v3TypedExprFactsClone(typedFacts)
     csg.nodeCount = 0
     csg.edgeCount = 0
     csg.nodes = []
     csg.edges = []
-    csg.canonicalGraphCid = layout.fixedBytes32Zero()
-    csg.graphCid = layout.fixedBytes32Zero()
+    csg.canonicalGraphCid = layout.FixedBytes32()
+    csg.graphCid = layout.FixedBytes32()
     return csg
 
 fn buildSourceTexts(workspaceRoot: str,
@@ -271,7 +294,7 @@ fn main(): int32 =
     let qualifiedClosureVisibleFixturePath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_closure_visible_fixture.cheng")
     let qualifiedClosureVisibleLeafPath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_qualified_closure_visible_leaf.cheng")
     let helperBPath = v3path.V3PathJoin(packageRoot, "src/tests/call_hir_reason_helper_b.cheng")
-    var parserLayer = parser.v3NormalizedExprLayerZero()
+    var parserLayer = parser.V3NormalizedExprLayer()
     var err = ""
     assert(parser.v3ParserReadNormalizedExprLayerFromPath(parserFixturePath, parserLayer, err),
            "v3 call hir matrix: parser fixture layer")
@@ -298,7 +321,7 @@ fn main(): int32 =
     assert(parserUnknownMember.callReason == parser.v3NormalizedExprCallReasonUnknownQualifiedTarget,
            "v3 call hir matrix: parser member reason")
 
-    var reasonLayer = parser.v3NormalizedExprLayerZero()
+    var reasonLayer = parser.V3NormalizedExprLayer()
     var reasonParsed: parser.V3ParsedSourceStub
     err = ""
     assert(parser.v3ParseOrdinarySourceStub(packageRoot, reasonFixturePath, reasonParsed, err),

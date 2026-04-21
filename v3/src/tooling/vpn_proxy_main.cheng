@@ -331,12 +331,6 @@ fn v3VpnProxyUdpBoundSocketOpen(host: str,
     out.bindTarget = v3VpnProxyUdpTargetFromSockAddr(sockName)
     return Ok[V3VpnProxyUdpBoundSocket](out)
 
-fn v3VpnProxyUdpSocketPairZero(): V3VpnProxyUdpSocketPair =
-    var out: V3VpnProxyUdpSocketPair
-    out.v4Open = false
-    out.v6Open = false
-    return out
-
 fn v3VpnProxyUdpSocketPairClose(pair: var V3VpnProxyUdpSocketPair) =
     if pair.v4Open:
         udp.UdpSocketClose(pair.v4.fd)
@@ -436,11 +430,6 @@ fn v3VpnProxyLoadLeafKeyKind(certDer: Bytes): Result[x509.X509PublicKeyKind] =
         return Err[x509.X509PublicKeyKind]("vpn proxy: certificate public key kind missing")
     return Ok[x509.X509PublicKeyKind](cert.publicKey.kind)
 
-fn v3VpnProxyLoadedIdentityZero(): V3VpnProxyLoadedIdentity =
-    var out: V3VpnProxyLoadedIdentity
-    out.leafKeyKind = x509.X509KeyUnknown
-    return out
-
 fn v3VpnProxyLoadIdentity(baseDir: str,
                           cfg: V3VpnProxyIdentityConfig,
                           requireListen: bool): Result[V3VpnProxyLoadedIdentity] =
@@ -448,7 +437,7 @@ fn v3VpnProxyLoadIdentity(baseDir: str,
         return Err[V3VpnProxyLoadedIdentity]("vpn proxy config: listen missing")
     if len(cfg.certDer) <= 0 || len(cfg.keyPk8Der) <= 0 || len(cfg.trustRootDer) <= 0:
         return Err[V3VpnProxyLoadedIdentity]("vpn proxy config: cert_der/key_pk8_der/trust_root_der required")
-    var out = v3VpnProxyLoadedIdentityZero()
+    var out = V3VpnProxyLoadedIdentity()
     let leafPath: str = v3VpnProxyResolvePath(baseDir, cfg.certDer)
     let leafRes: Result[Bytes] = v3VpnProxyLoadBytesFile(leafPath)
     if IsErr(leafRes):
@@ -509,7 +498,7 @@ fn v3VpnProxyCloseQuicLink(link: var V3VpnProxyQuicLink) =
         hy2sess.V3VpnProxyHy2TcpStreamClose(link.stream)
         link.streamOpen = false
     if link.conn.open:
-        qconn.connClose(link.conn)
+        qconn.ConnClose(link.conn)
     link.exitIndex = -1
 
 fn v3VpnProxyDialExit(exitCfg: V3VpnProxyExitConfig,
@@ -524,7 +513,7 @@ fn v3VpnProxyDialExit(exitCfg: V3VpnProxyExitConfig,
         return Err[V3VpnProxyQuicLink](ErrorText(policyRes))
     var settings = qruntime.initMsQuicSettings()
     settings.handshakeIdleTimeoutMs = int64(handshakeTimeoutMs)
-    var transport = qtransport.initMsQuicTransport()
+    var transport = qtransport.InitMsQuicTransport()
     let settingsRes: Result[bool] = qtransport.setMsQuicTransportSettings(transport, settings)
     if IsErr(settingsRes):
         return Err[V3VpnProxyQuicLink](ErrorText(settingsRes))
@@ -537,7 +526,7 @@ fn v3VpnProxyDialExit(exitCfg: V3VpnProxyExitConfig,
     var conn = Value(dialRes)
     let selectRes = quic_transport.v3Libp2pQuicClientSelectProtocol(transport, conn, v3VpnProxyProtocolId())
     if IsErr(selectRes):
-        qconn.connClose(conn)
+        qconn.ConnClose(conn)
         return Err[V3VpnProxyQuicLink](ErrorText(selectRes))
     var out: V3VpnProxyQuicLink
     out.transport = transport
@@ -1466,7 +1455,7 @@ fn v3VpnProxyHandleExitUdpConnCore(listener: var qtransport.MsQuicTransport,
 fn v3VpnProxyHandleExitUdpConn(listener: var qtransport.MsQuicTransport,
                                conn: var qconn.Connection,
                                firstMsg: V3Hysteria2UdpMessage): Result[bool] =
-    var sockets: V3VpnProxyUdpSocketPair = v3VpnProxyUdpSocketPairZero()
+    var sockets: V3VpnProxyUdpSocketPair
     let relayRes: Result[bool] = v3VpnProxyHandleExitUdpConnCore(listener, conn, firstMsg, sockets)
     v3VpnProxyUdpSocketPairClose(sockets)
     return relayRes
@@ -1474,7 +1463,7 @@ fn v3VpnProxyHandleExitUdpConn(listener: var qtransport.MsQuicTransport,
 fn v3VpnProxyHandleExitConn(listener: var qtransport.MsQuicTransport,
                             conn: var qconn.Connection,
                             serverCfg: V3VpnProxyIdentityConfig): Result[bool] =
-    let selectRes = quic_transport.v3Libp2pQuicServerSelectProtocol(listener, conn, v3VpnProxyProtocolId())
+    let selectRes = quic_transport.V3Libp2pQuicServerSelectProtocol(listener, conn, v3VpnProxyProtocolId())
     if IsErr(selectRes):
         return Err[bool](ErrorText(selectRes))
     let authRes: Result[bool] = v3VpnProxyHy2ServerAuth(conn, serverCfg)
@@ -1557,7 +1546,7 @@ fn v3VpnProxyExit(rootDir: str, args: str[]): int32 =
     if IsErr(addrRes):
         v3VpnProxyPrintErr(ErrorText(addrRes))
         return 1
-    var listener = qtransport.initMsQuicTransport()
+    var listener = qtransport.InitMsQuicTransport()
     let tlsRes = qtransport.setMsQuicTransportTlsPolicy(listener, Value(policyRes))
     if IsErr(tlsRes):
         v3VpnProxyPrintErr(ErrorText(tlsRes))
@@ -1569,12 +1558,12 @@ fn v3VpnProxyExit(rootDir: str, args: str[]): int32 =
     let boundPort: int32 = quic_transport.v3Libp2pQuicBoundPort(listener.listenAddr)
     if !v3VpnProxyWriteReadyPort(opts.readyPath, boundPort):
         v3VpnProxyPrintErr("vpn proxy: failed to write ready path")
-        qtransport.stop(listener)
+        qtransport.Stop(listener)
         return 1
     v3VpnProxyPrintLine("vpn-proxy exit listening " + listenHost + ":" + intToStr(boundPort))
     var served: int32
     while opts.acceptCount <= 0 || served < opts.acceptCount:
-        let acceptRes = qtransport.acceptTimed(listener, 1000)
+        let acceptRes = qtransport.AcceptTimed(listener, 1000)
         if IsErr(acceptRes):
             let err: str = ErrorText(acceptRes)
             if err == "msquic: accept timeout" ||
@@ -1584,15 +1573,15 @@ fn v3VpnProxyExit(rootDir: str, args: str[]): int32 =
                strutil.StartsWith(err, "msquic native: pipe read timeout"):
                 continue
             v3VpnProxyPrintErr(err)
-            qtransport.stop(listener)
+            qtransport.Stop(listener)
             return 1
         var conn = Value(acceptRes)
         let handleRes = v3VpnProxyHandleExitConn(listener, conn, config.server)
-        qconn.connClose(conn)
+        qconn.ConnClose(conn)
         if IsErr(handleRes):
             v3VpnProxyPrintErr(ErrorText(handleRes))
         served = served + 1
-    qtransport.stop(listener)
+    qtransport.Stop(listener)
     return 0
 
 fn v3VpnProxyStatus(rootDir: str, args: str[]): int32 =

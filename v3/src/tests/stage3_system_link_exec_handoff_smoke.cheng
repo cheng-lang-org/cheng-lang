@@ -1,0 +1,47 @@
+import std/os
+import std/strings
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/host_ops as hostops
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let stage3 = os.JoinPath(root, "artifacts/v3_bootstrap/cheng.stage3")
+    let source = os.JoinPath(root, "v3/src/tests/ordinary_zero_exit_fixture.cheng")
+    let target = os.GetEnvDefault("CHENG_V3_BOOTSTRAP_TARGET", "arm64-apple-darwin")
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_stage3_system_link_exec_handoff_smoke")
+    let outBin = os.JoinPath(outDir, "ordinary_zero_exit_fixture")
+    let compileLog = os.JoinPath(outDir, "ordinary_zero_exit_fixture.compile.log")
+    let forwardLog = os.JoinPath(outDir, "backend_driver.forward.log")
+    assert(v3path.V3MkdirP(root, outDir), "v3 stage3 system-link-exec handoff: mkdir")
+    if v3path.V3PathFileExists(outBin):
+        os.RemoveFile(outBin)
+    if v3path.V3PathFileExists(compileLog):
+        os.RemoveFile(compileLog)
+    if v3path.V3PathFileExists(forwardLog):
+        os.RemoveFile(forwardLog)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + root)
+    add(compileArgs, "--in:" + source)
+    add(compileArgs, "--emit:exe")
+    add(compileArgs, "--target:" + target)
+    add(compileArgs, "--out:" + outBin)
+    let compileRun = hostops.v3RunFileLogged(root,
+                                             "stage3_system_link_exec_handoff_build",
+                                             stage3,
+                                             compileArgs,
+                                             [
+                                                 "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=0",
+                                                 "CHENG_V3_BACKEND_DRIVER_FORWARD_LOG=" + forwardLog
+                                             ],
+                                             root,
+                                             0,
+                                             compileLog)
+    assert(compileRun.exitCode == 0, "v3 stage3 system-link-exec handoff: compile rc")
+    assert(os.FileExists(outBin), "v3 stage3 system-link-exec handoff: output exists")
+    assert(os.FileExists(forwardLog), "v3 stage3 system-link-exec handoff: backend driver forward log exists")
+    let forwardText = os.ReadFile(forwardLog)
+    assert(strings.StrContains(forwardText, "output=" + outBin),
+           "v3 stage3 system-link-exec handoff: forward log mentions output")
+    echo("v3 stage3_system_link_exec_handoff_smoke ok")
+    return 0

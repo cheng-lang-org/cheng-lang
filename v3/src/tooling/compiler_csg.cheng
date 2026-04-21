@@ -489,6 +489,7 @@ fn v3CompilerCsgAppendTypedExprFacts(buf: var layout.ByteBuf,
         v3CompilerCsgAppendText(buf, texpr.v3TypedExprPlaceKindText(fact.placeKind))
         v3CompilerCsgAppendText(buf, texpr.v3TypedExprLoweringModeText(fact.loweringMode))
         v3CompilerCsgAppendText(buf, texpr.v3TypedExprCallKindText(fact.callKind))
+        v3CompilerCsgAppendText(buf, texpr.v3TypedExprTypeCallKindText(fact.typeCallKind))
         v3CompilerCsgAppendText(buf, texpr.v3TypedExprReturnKindText(fact.returnKind))
 
 fn v3CompilerCsgHashNode(nodeKind: int32,
@@ -1364,6 +1365,8 @@ fn v3CompilerCsgExprLayerForText(sourcePath: str,
                                                                                 profileIndexLookup,
                                                                                 layer,
                                                                                 err):
+        if err != "":
+            return Err[bool](err)
         return Err[bool]("v3 compiler csg: expr layer read failed")
     return Ok[bool](true)
 
@@ -1385,7 +1388,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
     v3CompilerCsgSortImportPairs(importPairs)
     var nodes: V3CompilerCsgNode[]
     var edges: V3CompilerCsgEdge[]
-    var exprLayer = parser.v3NormalizedExprLayerZero()
+    var exprLayer = parser.V3NormalizedExprLayer()
     var packageNode: V3CompilerCsgNode
     packageNode.nodeId = nodes.len + 1
     packageNode.nodeKind = v3CompilerCsgNodeKindPackage
@@ -1448,8 +1451,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
         v3CompilerCsgAppendText(moduleBuf, moduleNode.exportSymbolName)
         moduleNode.factCid = v3CompilerCsgBufCid(moduleBuf)
         add(nodes, moduleNode)
-        let moduleNodeId = moduleNode.nodeId
-        v3CompilerCsgAddEdge(edges, packageNodeId, moduleNodeId, v3CompilerCsgEdgeKindContains)
+        v3CompilerCsgAddEdge(edges, packageNodeId, moduleNode.nodeId, v3CompilerCsgEdgeKindContains)
     for i in 0..<importPairs.len:
         let pair = importPairs[i]
         let fromNodeId = v3CompilerCsgModuleNodeId(nodes, pair.ownerModulePath)
@@ -1508,7 +1510,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
                                                 profileIndexLookup,
                                                 sourceIndex,
                                                 sourceExternalCalls)
-        var sourceExprLayer = parser.v3NormalizedExprLayerZero()
+        var sourceExprLayer = parser.V3NormalizedExprLayer()
         let sourceExprRes = v3CompilerCsgExprLayerForText(sourcePath,
                                                           text,
                                                           profile.importcCallNames,
@@ -1625,8 +1627,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             v3CompilerCsgAppendText(layoutBuf, layoutNode.exportSymbolName)
             layoutNode.factCid = v3CompilerCsgBufCid(layoutBuf)
             add(nodes, layoutNode)
-            let layoutNodeId = layoutNode.nodeId
-            v3CompilerCsgAddEdge(edges, symbolNodeId, layoutNodeId, v3CompilerCsgEdgeKindHasLayout)
+            v3CompilerCsgAddEdge(edges, symbolNodeId, layoutNode.nodeId, v3CompilerCsgEdgeKindHasLayout)
             var effectNode: V3CompilerCsgNode
             effectNode.nodeId = nodes.len + 1
             effectNode.nodeKind = v3CompilerCsgNodeKindEffect
@@ -1657,8 +1658,7 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             v3CompilerCsgAppendText(effectBuf, effectNode.exportSymbolName)
             effectNode.factCid = v3CompilerCsgBufCid(effectBuf)
             add(nodes, effectNode)
-            let effectNodeId = effectNode.nodeId
-            v3CompilerCsgAddEdge(edges, symbolNodeId, effectNodeId, v3CompilerCsgEdgeKindHasEffect)
+            v3CompilerCsgAddEdge(edges, symbolNodeId, effectNode.nodeId, v3CompilerCsgEdgeKindHasEffect)
             var capabilityNode: V3CompilerCsgNode
             capabilityNode.nodeId = nodes.len + 1
             capabilityNode.nodeKind = v3CompilerCsgNodeKindCapability
@@ -1689,11 +1689,12 @@ fn v3BuildCompilerCsgWithOverrides(linkPlan: slplan.V3SystemLinkPlanStub,
             v3CompilerCsgAppendText(capabilityBuf, capabilityNode.exportSymbolName)
             capabilityNode.factCid = v3CompilerCsgBufCid(capabilityBuf)
             add(nodes, capabilityNode)
-    let capabilityNodeId = capabilityNode.nodeId
-            v3CompilerCsgAddEdge(edges, symbolNodeId, capabilityNodeId, v3CompilerCsgEdgeKindHasCapability)
+            v3CompilerCsgAddEdge(edges, symbolNodeId, capabilityNode.nodeId, v3CompilerCsgEdgeKindHasCapability)
     var typedExprFacts: V3TypedExprFact[]
     var typedErr = ""
     if !texpr.v3TypedExprBuildFacts(typedSourceTexts, exprLayer, typedExprFacts, typedErr):
+        if typedErr != "":
+            return Err[V3CompilerCsg](typedErr)
         return Err[V3CompilerCsg]("v3 compiler csg: typed expr build failed")
     var out: V3CompilerCsg
     out.version = 1
@@ -1830,70 +1831,10 @@ fn v3CompilerCsgReport(csg: V3CompilerCsg): str =
     out = out + "expr_surface_fmt_count=" + intToStr(parser.v3NormalizedExprLayerStrFormatCount(csg.exprLayer)) + "\n"
     out = out + "expr_surface_result_intrinsic_count=" + intToStr(parser.v3NormalizedExprLayerResultIntrinsicCount(csg.exprLayer)) + "\n"
     out = out + "expr_surface_try_count=" + intToStr(parser.v3NormalizedExprLayerTryCount(csg.exprLayer)) + "\n"
-    out = out + "expr_surface_call_count=" + intToStr(texpr.v3TypedExprSurfaceCallCount(typedExprFacts)) + "\n"
-    out = out + "expr_surface_call_resolved_count=" + intToStr(texpr.v3TypedExprFactCountCallResolved(typedExprFacts)) + "\n"
-    out = out + "expr_surface_call_unresolved_count=" + intToStr(texpr.v3TypedExprFactCountCallUnresolved(typedExprFacts)) + "\n"
-    out = out + "expr_surface_call_local_kind_count=" + intToStr(texpr.v3TypedExprFactCountSurfaceCallKindFromParser(typedExprFacts, parser.v3NormalizedExprSurfaceCallLocal)) + "\n"
-    out = out + "expr_surface_call_external_kind_count=" + intToStr(texpr.v3TypedExprFactCountSurfaceCallKindFromParser(typedExprFacts, parser.v3NormalizedExprSurfaceCallExternal)) + "\n"
-    out = out + "expr_surface_call_importc_kind_count=" + intToStr(texpr.v3TypedExprFactCountSurfaceCallKindFromParser(typedExprFacts, parser.v3NormalizedExprSurfaceCallImportc)) + "\n"
-    out = out + "expr_surface_call_member_kind_count=" + intToStr(texpr.v3TypedExprFactCountSurfaceCallKindFromParser(typedExprFacts, parser.v3NormalizedExprSurfaceCallMember)) + "\n"
-    out = out + "expr_surface_call_target_importc_count=" + intToStr(texpr.v3TypedExprFactCountCallTargetImportc(typedExprFacts)) + "\n"
-    out = out + "expr_surface_call_reason_unknown_qualified_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonUnknownQualifiedTarget)) + "\n"
-    out = out + "expr_surface_call_reason_shadowed_qualified_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonShadowedQualifiedTarget)) + "\n"
-    out = out + "expr_surface_call_reason_ambiguous_external_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonAmbiguousExternalTarget)) + "\n"
-    out = out + "expr_surface_call_reason_ambiguous_qualified_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonAmbiguousQualifiedTarget)) + "\n"
-    out = out + "expr_surface_call_reason_unknown_external_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonUnknownExternalTarget)) + "\n"
-    out = out + "expr_surface_call_reason_unknown_call_target_count=" + intToStr(texpr.v3TypedExprFactCountCallReasonFromParser(typedExprFacts, parser.v3NormalizedExprCallReasonUnknownCallTarget)) + "\n"
+    out = out + "expr_surface_default_init_count=" + intToStr(parser.v3NormalizedExprLayerDefaultInitCount(csg.exprLayer)) + "\n"
+    out = out + "expr_surface_constructor_count=" + intToStr(parser.v3NormalizedExprLayerConstructorCount(csg.exprLayer)) + "\n"
     out = out + "expr_surface_question_residual_count=" + intToStr(csg.exprLayer.questionResidualCount) + "\n"
-    out = out + "typed_expr_fact_count=" + intToStr(typedExprFacts.len) + "\n"
-    out = out + "typed_expr_abi_scalar_count=" + intToStr(texpr.v3TypedExprAbiScalarCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_abi_composite_count=" + intToStr(texpr.v3TypedExprAbiCompositeCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_abi_pointer_like_count=" + intToStr(texpr.v3TypedExprAbiPointerLikeCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_abi_polymorphic_count=" + intToStr(texpr.v3TypedExprAbiPolymorphicCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_value_scalar_count=" + intToStr(texpr.v3TypedExprValueScalarCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_value_composite_count=" + intToStr(texpr.v3TypedExprValueCompositeCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_value_pointer_like_count=" + intToStr(texpr.v3TypedExprValuePointerLikeCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_value_polymorphic_count=" + intToStr(texpr.v3TypedExprValuePolymorphicCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_place_local_count=" + intToStr(texpr.v3TypedExprPlaceLocalCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_place_global_count=" + intToStr(texpr.v3TypedExprPlaceGlobalCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_place_field_count=" + intToStr(texpr.v3TypedExprPlaceFieldCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_place_temporary_count=" + intToStr(texpr.v3TypedExprPlaceTemporaryCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_place_call_result_count=" + intToStr(texpr.v3TypedExprPlaceCallResultCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_lower_reg_count=" + intToStr(texpr.v3TypedExprLowerRegCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_lower_local_address_count=" + intToStr(texpr.v3TypedExprLowerLocalAddressCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_lower_sret_count=" + intToStr(texpr.v3TypedExprLowerSretCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_lower_import_buffer_count=" + intToStr(texpr.v3TypedExprLowerImportBufferCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_lower_deferred_count=" + intToStr(texpr.v3TypedExprLowerDeferredCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_call_none_count=" + intToStr(texpr.v3TypedExprCallNoneCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_call_builtin_count=" + intToStr(texpr.v3TypedExprCallBuiltinCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_call_result_intrinsic_count=" + intToStr(texpr.v3TypedExprCallResultIntrinsicCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_call_projection_count=" + intToStr(texpr.v3TypedExprCallProjectionCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_return_reg_count=" + intToStr(texpr.v3TypedExprReturnRegCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_return_composite_local_count=" + intToStr(texpr.v3TypedExprReturnCompositeLocalCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_return_sret_count=" + intToStr(texpr.v3TypedExprReturnSretCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_return_import_buffer_count=" + intToStr(texpr.v3TypedExprReturnImportBufferCount(typedExprFacts)) + "\n"
-    out = out + "typed_expr_return_deferred_count=" + intToStr(texpr.v3TypedExprReturnDeferredCount(typedExprFacts)) + "\n"
-    out = out + "lowering_rule_count=" + intToStr(loweringRules.len) + "\n"
-    out = out + "lowering_rule_unique_shape_count=" + intToStr(texpr.v3TypedExprLoweringRuleUniqueShapeCount(loweringRules)) + "\n"
-    out = out + "lowering_rule_unique_key_count=" + intToStr(texpr.v3TypedExprLoweringRuleUniqueKeyCount(loweringRules)) + "\n"
-    out = out + "lowering_rule_arg_value_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountArgPassKind(loweringRules, v3TypedExprArgPassValue)) + "\n"
-    out = out + "lowering_rule_arg_address_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountArgPassKind(loweringRules, v3TypedExprArgPassAddress)) + "\n"
-    out = out + "lowering_rule_arg_call_result_address_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountArgPassKind(loweringRules, v3TypedExprArgPassCallResultAddress)) + "\n"
-    out = out + "lowering_rule_result_reg_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountResultPassKind(loweringRules, v3TypedExprResultPassReg)) + "\n"
-    out = out + "lowering_rule_result_local_address_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountResultPassKind(loweringRules, v3TypedExprResultPassLocalAddress)) + "\n"
-    out = out + "lowering_rule_result_sret_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountResultPassKind(loweringRules, v3TypedExprResultPassSret)) + "\n"
-    out = out + "lowering_rule_materialize_register_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountMaterializeKind(loweringRules, v3TypedExprMaterializeRegister)) + "\n"
-    out = out + "lowering_rule_materialize_local_slot_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountMaterializeKind(loweringRules, v3TypedExprMaterializeLocalSlot)) + "\n"
-    out = out + "lowering_rule_materialize_call_result_local_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountMaterializeKind(loweringRules, v3TypedExprMaterializeCallResultLocal)) + "\n"
-    out = out + "lowering_rule_materialize_dest_address_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountMaterializeKind(loweringRules, v3TypedExprMaterializeDestAddress)) + "\n"
-    out = out + "lowering_rule_copy_scalar_store_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountCopyKind(loweringRules, v3TypedExprCopyScalarStore)) + "\n"
-    out = out + "lowering_rule_copy_region_copy_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountCopyKind(loweringRules, v3TypedExprCopyRegionCopy)) + "\n"
-    out = out + "lowering_rule_import_import_buffer_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountImportKind(loweringRules, v3TypedExprImportImportBuffer)) + "\n"
-    out = out + "lowering_rule_import_builtin_address_slot_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountImportKind(loweringRules, v3TypedExprImportBuiltinAddressSlot)) + "\n"
-    out = out + "lowering_rule_import_i32_value_slot_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountImportKind(loweringRules, v3TypedExprImportI32ValueSlot)) + "\n"
-    out = out + "lowering_rule_import_i32_address_slot_count=" + intToStr(texpr.v3TypedExprLoweringRuleCountImportKind(loweringRules, v3TypedExprImportI32AddressSlot)) + "\n"
-    for i in 0..<loweringRules.len:
-        out = out + "lowering_rule_entry[" + intToStr(i) + "]=" + texpr.v3TypedExprLoweringRuleEntryText(loweringRules[i]) + "\n"
+    out = out + texpr.v3TypedExprReportText(typedExprFacts, loweringRules)
     out = out + "canonical_graph_cid=" + layout.fixedBytes32Hex(csg.canonicalGraphCid) + "\n"
     out = out + "graph_cid=" + layout.fixedBytes32Hex(csg.graphCid) + "\n"
     out = out + "node_count=" + intToStr(csg.nodeCount) + "\n"

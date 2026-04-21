@@ -109,6 +109,29 @@ function parseNumberField(fields, key, fallback = null) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function hasOwnField(value, key) {
+  return Boolean(value) && Object.prototype.hasOwnProperty.call(Object(value), key);
+}
+
+function boolRuntimeOrSummary(runtimeDoc, runtimeKey, summary, summaryKey) {
+  if (hasOwnField(runtimeDoc, runtimeKey)) return Boolean(runtimeDoc[runtimeKey]);
+  return String(summary?.[summaryKey] || '').trim() === 'true';
+}
+
+function numberRuntimeOrSummary(runtimeDoc, runtimeKey, summary, summaryKey) {
+  if (hasOwnField(runtimeDoc, runtimeKey)) {
+    const value = Number(runtimeDoc[runtimeKey]);
+    return Number.isFinite(value) ? value : 0;
+  }
+  const value = Number(String(summary?.[summaryKey] || '').trim());
+  return Number.isFinite(value) ? value : 0;
+}
+
+function stringRuntimeOrSummary(runtimeDoc, runtimeKey, summary, summaryKey) {
+  if (hasOwnField(runtimeDoc, runtimeKey)) return String(runtimeDoc[runtimeKey] || '');
+  return String(summary?.[summaryKey] || '');
+}
+
 function parseJsonText(value, fallback) {
   const text = String(value ?? '').trim();
   if (!text) return fallback;
@@ -486,20 +509,20 @@ function main() {
     native_gui_runtime_exe_path: bundleSummary.native_gui_runtime_exe_path || '',
     native_gui_runtime_compiled_exe_path: bundleSummary.native_gui_runtime_compiled_exe_path || '',
     native_gui_runtime_contract_path: bundleSummary.native_gui_runtime_contract_path || '',
-    native_gui_runtime_manifest_ready: Boolean(runtimeStateDoc?.runtime_manifest_ready),
-    native_gui_runtime_contract_payload_ready: Boolean(runtimeStateDoc?.runtime_contract_payload_ready),
-    native_gui_runtime_bundle_payload_ready: Boolean(runtimeStateDoc?.runtime_bundle_payload_ready),
-    native_gui_runtime_bundle_ready: Boolean(runtimeStateDoc?.runtime_bundle_ready),
-    native_gui_runtime_contract_ready: Boolean(runtimeStateDoc?.runtime_contract_ready),
-    native_gui_runtime_bundle_route_state: String(runtimeStateDoc?.bundle_route_state || ''),
-    native_gui_runtime_bundle_route_count: Number(runtimeStateDoc?.bundle_route_count || 0),
-    native_gui_runtime_bundle_supported_count: Number(runtimeStateDoc?.bundle_supported_count || 0),
-    native_gui_runtime_bundle_semantic_nodes_count: Number(runtimeStateDoc?.bundle_semantic_nodes_count || 0),
-    native_gui_runtime_bundle_layout_item_count: Number(runtimeStateDoc?.bundle_layout_item_count || 0),
-    native_gui_runtime_bundle_render_command_count: Number(runtimeStateDoc?.bundle_render_command_count || 0),
-    native_gui_runtime_contract_layout_item_count: Number(runtimeStateDoc?.contract_layout_item_count || 0),
-    native_gui_runtime_contract_viewport_item_count: Number(runtimeStateDoc?.contract_viewport_item_count || 0),
-    native_gui_runtime_contract_interactive_item_count: Number(runtimeStateDoc?.contract_interactive_item_count || 0),
+    native_gui_runtime_manifest_ready: boolRuntimeOrSummary(runtimeStateDoc, 'runtime_manifest_ready', bundleSummary, 'native_gui_runtime_manifest_ready'),
+    native_gui_runtime_contract_payload_ready: boolRuntimeOrSummary(runtimeStateDoc, 'runtime_contract_payload_ready', bundleSummary, 'native_gui_runtime_contract_payload_ready'),
+    native_gui_runtime_bundle_payload_ready: boolRuntimeOrSummary(runtimeStateDoc, 'runtime_bundle_payload_ready', bundleSummary, 'native_gui_runtime_bundle_payload_ready'),
+    native_gui_runtime_bundle_ready: boolRuntimeOrSummary(runtimeStateDoc, 'runtime_bundle_ready', bundleSummary, 'native_gui_runtime_bundle_ready'),
+    native_gui_runtime_contract_ready: boolRuntimeOrSummary(runtimeStateDoc, 'runtime_contract_ready', bundleSummary, 'native_gui_runtime_contract_ready'),
+    native_gui_runtime_bundle_route_state: stringRuntimeOrSummary(runtimeStateDoc, 'bundle_route_state', bundleSummary, 'native_gui_runtime_bundle_route_state'),
+    native_gui_runtime_bundle_route_count: numberRuntimeOrSummary(runtimeStateDoc, 'bundle_route_count', bundleSummary, 'native_gui_runtime_bundle_route_count'),
+    native_gui_runtime_bundle_supported_count: numberRuntimeOrSummary(runtimeStateDoc, 'bundle_supported_count', bundleSummary, 'native_gui_runtime_bundle_supported_count'),
+    native_gui_runtime_bundle_semantic_nodes_count: numberRuntimeOrSummary(runtimeStateDoc, 'bundle_semantic_nodes_count', bundleSummary, 'native_gui_runtime_bundle_semantic_nodes_count'),
+    native_gui_runtime_bundle_layout_item_count: numberRuntimeOrSummary(runtimeStateDoc, 'bundle_layout_item_count', bundleSummary, 'native_gui_runtime_bundle_layout_item_count'),
+    native_gui_runtime_bundle_render_command_count: numberRuntimeOrSummary(runtimeStateDoc, 'bundle_render_command_count', bundleSummary, 'native_gui_runtime_bundle_render_command_count'),
+    native_gui_runtime_contract_layout_item_count: numberRuntimeOrSummary(runtimeStateDoc, 'contract_layout_item_count', bundleSummary, 'native_gui_runtime_contract_layout_item_count'),
+    native_gui_runtime_contract_viewport_item_count: numberRuntimeOrSummary(runtimeStateDoc, 'contract_viewport_item_count', bundleSummary, 'native_gui_runtime_contract_viewport_item_count'),
+    native_gui_runtime_contract_interactive_item_count: numberRuntimeOrSummary(runtimeStateDoc, 'contract_interactive_item_count', bundleSummary, 'native_gui_runtime_contract_interactive_item_count'),
     native_gui_route_state_requested: String(args.routeState || ''),
     native_gui_host_abi_feature_hits: String(runtimeStateDoc?.host_abi_feature_hits_csv || bundleSummary.native_gui_host_abi_feature_hits || ''),
     native_gui_host_abi_first_batch_ready: Boolean(runtimeStateDoc?.host_abi_first_batch_ready ?? (String(bundleSummary.native_gui_host_abi_first_batch_ready || '') === 'true')),

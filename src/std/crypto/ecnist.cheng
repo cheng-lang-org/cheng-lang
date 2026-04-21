@@ -2,6 +2,7 @@
 
 import std/result
 import std/rawbytes
+import std/rawmem_support
 import std/system
 import std/crypto/rand
 import std/crypto/sha256
@@ -216,7 +217,7 @@ fn p256GeneratorWindow4NegPoint(idx: int32): EcPointFixed =
     if idx == 0:
         return pointInfinityFixed()
     let point: EcPointFixed = p256GeneratorWindow4Point(idx)
-    let yNeg: pfix.P256Fixed = p256FieldFixedSubCrash(p256FieldFixedZero(), point.y)
+    let yNeg: pfix.P256Fixed = p256FieldFixedSubCrash(pfix.P256Fixed(), point.y)
     return EcPointFixed(x: point.x, y: yNeg, inf: false)
 
 fn p256GeneratorComb6Point(idx: int32): EcPointFixed =
@@ -812,9 +813,6 @@ fn nModAdd(a: BigInt, b: BigInt): Result[BigInt] =
 fn nModInv(a: BigInt): Result[BigInt] =
     return p256FixedPrimeModInv(a, p256N, p256NMinus2Fixed, p256NCtxFixed)
 
-fn p256FieldFixedZero(): pfix.P256Fixed =
-    return pfix.p256FixedZero()
-
 fn p256FieldFixedOne(): pfix.P256Fixed =
     return p256PCtxFixed.oneMont
 
@@ -926,15 +924,15 @@ fn p256FieldFixedEightCrash(a: pfix.P256Fixed): pfix.P256Fixed =
     return p256FieldFixedDoubleCrash(p256FieldFixedQuadCrash(a))
 
 fn pointInfinityFixed(): EcPointFixed =
-    EcPointFixed(x: p256FieldFixedZero(), y: p256FieldFixedZero(), inf: true)
+    EcPointFixed(x: pfix.P256Fixed(), y: pfix.P256Fixed(), inf: true)
 
 fn pointJacobianInfinityFixed(): EcPointJacobianFixed =
-    EcPointJacobianFixed(x: p256FieldFixedZero(), y: p256FieldFixedZero(), z: p256FieldFixedZero(), inf: true)
+    EcPointJacobianFixed(x: pfix.P256Fixed(), y: pfix.P256Fixed(), z: pfix.P256Fixed(), inf: true)
 
 fn pointJacobianSetInfinityFixed(p: var EcPointJacobianFixed) =
-    p.x = p256FieldFixedZero()
-    p.y = p256FieldFixedZero()
-    p.z = p256FieldFixedZero()
+    p.x = pfix.P256Fixed()
+    p.y = pfix.P256Fixed()
+    p.z = pfix.P256Fixed()
     p.inf = true
 
 fn pointJacobianSetFromAffineFixed(p: var EcPointJacobianFixed, q: EcPointFixed) =
@@ -1330,7 +1328,7 @@ fn pointAffineNegateFixed(p: EcPointFixed): Result[EcPointFixed] =
     if p.inf:
         let outInf: EcPointFixed = p
         return Ok[EcPointFixed](outInf)
-    let yNegRes: Result[pfix.P256Fixed] = p256FieldFixedSub(p256FieldFixedZero(), p.y)
+    let yNegRes: Result[pfix.P256Fixed] = p256FieldFixedSub(pfix.P256Fixed(), p.y)
     if IsErr(yNegRes):
         return Err[EcPointFixed](Error(yNegRes))
     let out: EcPointFixed = EcPointFixed(x: p.x, y: Value(yNegRes), inf: false)
@@ -2213,33 +2211,18 @@ fn p256DeterministicConcat4(a: Bytes, b: Bytes, c: Bytes, d: Bytes): Bytes =
     let total: int32 = bytesLen(a) + bytesLen(b) + bytesLen(c) + bytesLen(d)
     var out: Bytes = bytesAlloc(total)
     var offset: int32
-    var i: int32
-    while i < bytesLen(a):
-        bytesSet(out, offset + i, bytesGet(a, i))
-        i = i + 1
+    bytesCopyInto(out, offset, a)
     offset = offset + bytesLen(a)
-    i = 0
-    while i < bytesLen(b):
-        bytesSet(out, offset + i, bytesGet(b, i))
-        i = i + 1
+    bytesCopyInto(out, offset, b)
     offset = offset + bytesLen(b)
-    i = 0
-    while i < bytesLen(c):
-        bytesSet(out, offset + i, bytesGet(c, i))
-        i = i + 1
+    bytesCopyInto(out, offset, c)
     offset = offset + bytesLen(c)
-    i = 0
-    while i < bytesLen(d):
-        bytesSet(out, offset + i, bytesGet(d, i))
-        i = i + 1
+    bytesCopyInto(out, offset, d)
     return out
 
 fn p256DeterministicFilledBytes(fill: int32): Bytes =
     var out: Bytes = bytesAlloc(sha256Size)
-    var i: int32
-    while i < sha256Size:
-        bytesSet(out, i, fill)
-        i = i + 1
+    rawmem_support.RawmemSet(out.data, fill, sha256Size)
     return out
 
 fn p256DeterministicK(priv: BigInt, msg: Bytes): Result[BigInt] =
@@ -2488,10 +2471,8 @@ fn ecdsaPublicPointToBytes(point: EcPoint): Bytes =
     bytesSet(out, 0, 0x04)
     let xBytes: Bytes = bigToBytes(point.x, p256ScalarSize)
     let yBytes: Bytes = bigToBytes(point.y, p256ScalarSize)
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, 1 + i, bytesGet(xBytes, i))
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, 1 + p256ScalarSize + i, bytesGet(yBytes, i))
+    bytesCopyInto(out, 1, xBytes)
+    bytesCopyInto(out, 1 + p256ScalarSize, yBytes)
     return out
 
 fn ecdsaPublicPointFixedToBytes(point: EcPointFixed): Bytes =
@@ -2508,20 +2489,16 @@ fn ecdsaPublicPointFixedToBytes(point: EcPointFixed): Bytes =
     bytesSet(out, 0, 0x04)
     let xBytes: Bytes = bigToBytes(xBig, p256ScalarSize)
     let yBytes: Bytes = bigToBytes(yBig, p256ScalarSize)
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, 1 + i, bytesGet(xBytes, i))
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, 1 + p256ScalarSize + i, bytesGet(yBytes, i))
+    bytesCopyInto(out, 1, xBytes)
+    bytesCopyInto(out, 1 + p256ScalarSize, yBytes)
     return out
 
 fn ecdsaSignatureScalarsToBytes(r: BigInt, s: BigInt): Bytes =
     let out: Bytes = bytesAlloc(p256SignatureSize)
     let rBytes: Bytes = bigToBytes(r, p256ScalarSize)
     let sBytes: Bytes = bigToBytes(s, p256ScalarSize)
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, i, bytesGet(rBytes, i))
-    for i in 0..<p256ScalarSize:
-        bytesSet(out, p256ScalarSize + i, bytesGet(sBytes, i))
+    bytesCopyInto(out, 0, rBytes)
+    bytesCopyInto(out, p256ScalarSize, sBytes)
     return out
 
 fn ecdsaVerifyTrustedPublicKeyBytes(pubBytes: Bytes, msg: Bytes, sig: EcSignature): Result[bool] =

@@ -25,6 +25,13 @@ type
         nativeLinkPlanMs: int64
         compileReceiptMs: int64
         totalMs: int64
+        linuxNolibcObjectsMs: int64
+        providerObjectsMs: int64
+        primaryObjectEmitMs: int64
+        nativeLinkMs: int64
+        lineMapMs: int64
+        materializeTotalMs: int64
+        backendTotalMs: int64
 
     V3PerfMemoryRun =
         label: str
@@ -52,7 +59,14 @@ fn v3PerfMemoryExecPhaseSummaryEmpty(): V3PerfMemoryExecPhaseSummary =
                                         objectPlanMs: int64(-1),
                                         nativeLinkPlanMs: int64(-1),
                                         compileReceiptMs: int64(-1),
-                                        totalMs: int64(-1))
+                                        totalMs: int64(-1),
+                                        linuxNolibcObjectsMs: int64(-1),
+                                        providerObjectsMs: int64(-1),
+                                        primaryObjectEmitMs: int64(-1),
+                                        nativeLinkMs: int64(-1),
+                                        lineMapMs: int64(-1),
+                                        materializeTotalMs: int64(-1),
+                                        backendTotalMs: int64(-1))
 
 fn v3PerfMemoryRunNew(label: str,
                       logPath: str,
@@ -258,6 +272,13 @@ fn v3PerfMemoryExecPhaseSummaryFromOutput(text: str): V3PerfMemoryExecPhaseSumma
     out.nativeLinkPlanMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_native_link_plan_ms")
     out.compileReceiptMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_compile_receipt_ms")
     out.totalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_total_ms")
+    out.linuxNolibcObjectsMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_linux_nolibc_objects_ms")
+    out.providerObjectsMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_provider_objects_ms")
+    out.primaryObjectEmitMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_primary_object_emit_ms")
+    out.nativeLinkMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_native_link_ms")
+    out.lineMapMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_line_map_ms")
+    out.materializeTotalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_materialize_total_ms")
+    out.backendTotalMs = v3PerfMemoryParseOutputInt64(text, "exec_phase_backend_total_ms")
     return out
 
 fn v3PerfMemoryExecPhaseSummaryReady(summary: V3PerfMemoryExecPhaseSummary): bool =
@@ -279,6 +300,36 @@ fn v3PerfMemoryExecPhaseGapMs(sample: V3PerfMemoryRun,
     if sample.elapsedMs < int64(0) || summary.totalMs < int64(0):
         return int64(-1)
     return sample.elapsedMs - summary.totalMs
+
+fn v3PerfMemoryExecPhaseMaterializeMs(summary: V3PerfMemoryExecPhaseSummary): int64 =
+    if summary.materializeTotalMs >= int64(0):
+        return summary.materializeTotalMs
+    if summary.linuxNolibcObjectsMs < int64(0) ||
+       summary.providerObjectsMs < int64(0) ||
+       summary.primaryObjectEmitMs < int64(0):
+        return int64(-1)
+    return summary.linuxNolibcObjectsMs + summary.providerObjectsMs + summary.primaryObjectEmitMs
+
+fn v3PerfMemoryExecPhaseAttributedMs(summary: V3PerfMemoryExecPhaseSummary): int64 =
+    if summary.backendTotalMs >= int64(0):
+        return summary.backendTotalMs
+    let materializeMs: int64 = v3PerfMemoryExecPhaseMaterializeMs(summary)
+    if summary.totalMs < int64(0) ||
+       materializeMs < int64(0) ||
+       summary.nativeLinkMs < int64(0) ||
+       summary.lineMapMs < int64(0):
+        return int64(-1)
+    return summary.totalMs + materializeMs + summary.nativeLinkMs + summary.lineMapMs
+
+fn v3PerfMemoryCompileGapBreakdownReady(summary: V3PerfMemoryExecPhaseSummary): bool =
+    return v3PerfMemoryExecPhaseAttributedMs(summary) >= int64(0)
+
+fn v3PerfMemoryCompileGapBreakdownMs(sample: V3PerfMemoryRun,
+                                     summary: V3PerfMemoryExecPhaseSummary): int64 =
+    let attributedMs: int64 = v3PerfMemoryExecPhaseAttributedMs(summary)
+    if sample.elapsedMs < int64(0) || attributedMs < int64(0):
+        return int64(-1)
+    return sample.elapsedMs - attributedMs
 
 fn v3PerfMemoryExecPhaseReportRow(sample: V3PerfMemoryRun,
                                   summary: V3PerfMemoryExecPhaseSummary): str =
@@ -312,6 +363,31 @@ fn v3PerfMemoryExecPhaseReportRow(sample: V3PerfMemoryRun,
                 strings.Int64ToStr(summary.totalMs),
                 " compile_gap_ms=",
                 strings.Int64ToStr(v3PerfMemoryExecPhaseGapMs(sample, summary))])
+
+fn v3PerfMemoryCompileGapBreakdownRow(sample: V3PerfMemoryRun,
+                                      summary: V3PerfMemoryExecPhaseSummary): str =
+    let materializeMs: int64 = v3PerfMemoryExecPhaseMaterializeMs(summary)
+    let attributedMs: int64 = v3PerfMemoryExecPhaseAttributedMs(summary)
+    return Fmt([sample.label,
+                "_gap_breakdown",
+                " planner_total_ms=",
+                strings.Int64ToStr(summary.totalMs),
+                " linux_nolibc_objects_ms=",
+                strings.Int64ToStr(summary.linuxNolibcObjectsMs),
+                " provider_objects_ms=",
+                strings.Int64ToStr(summary.providerObjectsMs),
+                " primary_object_emit_ms=",
+                strings.Int64ToStr(summary.primaryObjectEmitMs),
+                " materialize_total_ms=",
+                strings.Int64ToStr(materializeMs),
+                " native_link_ms=",
+                strings.Int64ToStr(summary.nativeLinkMs),
+                " line_map_ms=",
+                strings.Int64ToStr(summary.lineMapMs),
+                " attributed_ms=",
+                strings.Int64ToStr(attributedMs),
+                " unattributed_gap_ms=",
+                strings.Int64ToStr(v3PerfMemoryCompileGapBreakdownMs(sample, summary))])
 
 fn v3PerfMemoryMeasureFileRun(root: str,
                               label: str,
