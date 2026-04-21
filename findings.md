@@ -1,6 +1,118 @@
 # 当前发现
 
 - 新确认
+  - `compiler_csg` 里凡是只是 `typed_expr` 的 clone/equal/validate/filter/count 纯转发 helper，都该直接删。
+  - 这类 helper 看起来只是方便，实际会把 `typed_expr` 真源重新复制成第二套 API 面；report、smoke、plan 很快又会绑回中间层。
+
+- 新确认
+  - `system_link_plan` 这类正式热路径不要再包 `target_matrix` 的一层本地转发壳。
+  - target triple 判定真源已经在 `target_matrix`，本地再包一层既重复，又会平白扩大 ordinary/seed 的调用解析面。
+
+- 新确认
+  - `render_compare` 这条页面级对拍链路也不能靠“缺参数时猜目录里有什么产物”来凑闭环。
+  - 稳定口径是两条显式模式并存：
+    - 正常全链模式继续自己产 `native/truth` 产物
+    - 直接对拍模式必须显式传 `--native-summary --truth-summary --native-screenshot --truth-screenshot`
+  - 只要进入直接模式，就四个参数全必填；不要混搭半自动发现。
+
+- 新确认
+  - 页面级像素对拍 smoke 不需要每次都把浏览器 truth/native runtime 全链重跑一遍；最稳的回归是最小 summary + screenshot 直接钉 report/summary 文档。
+  - 这样能把 `render_compare` 自己的字段合同和真正的运行链路问题拆开，不会再让重型链条噪音盖住 report 漏口。
+
+- 新确认
+  - `typed_expr` 这种 typed truth-source 模块里已经有 generic count/text helper 时，`compiler_csg` 不该再平行包一套 `v3TypedExprAbiClassText / FactCountAbiClass / AbiScalarCount` 这种 API。
+  - 稳定分层是：
+    - `typed_expr` 持有 text/count 真语义
+    - `compiler_csg` 只保留 parser -> typed 的桥接 helper 和 CSG 自己的领域逻辑
+    - `lowering_plan` / smoke / probe 直接问 `typed_expr`
+  - 如果测试侧担心“模块 enum 常量直接出现在 main 里”不稳，就把一格一个 helper 收进 `typed_expr` 真模块，不要继续把这层 convenience helper 留在 `compiler_csg`。
+
+- 新确认
+  - `lowering_plan` 不该保存 browser ABI 的派生视图层；如果它只是把 `linkPlan -> compiler_csg 收集 -> browser_abi_rule 过滤/格式化` 再包一遍，就该直接删。
+  - `compiler_csg` 里同理也只该保留“从 linkPlan 收集 rules/specs/plans”这层；`manifest/source artifact` 这种纯派生文本应该直接回真模块现算。
+
+- 新确认
+  - `system_link_exec` 这种消费 browser bridge plan 的正式热路径，不该继续挂 `compiler_csg` 的 manifest/source/format/unique_key 薄壳。
+  - 正确分层是：
+    - `compiler_csg` 负责从 `linkPlan` 收集 `rules/specs/plans`
+    - `browser_abi_rule` 负责 plan 的 key/manifest/source/emit/count 真语义
+    - `system_link_exec` 只消费 plan，不再替 browser ABI 保第二套 helper 面
+
+- 新确认
+  - `browser_abi_rule` 这条线之前虽然已经有 schema/rule/plan 结构，但真语义仍然挂在 `inputKindText/outputKindText/...` 这些文本字段上；这会让 rule、codegen、smoke 各自再长一套字符串判断。
+  - 这条线收口以后，稳定形状应该是：
+    - 结构体里只存 enum
+    - key/manifest/emit line 只在边界现算文本
+    - schema 构造器直接产 enum
+    - smoke 直接比 enum
+    - `compiler_csg` 不要再额外包一层 browser ABI count helper；这类纯转发 wrapper 也是重复表面。
+
+- 新确认
+  - `browser_abi_rule_smoke` 这种要验完整 codec schema 的测试，必须显式把 `entryPath` 钉到 codec 源文件；不然编译器侧会走“按外部触发裁剪”分支，结果测到的是裁剪行为，不是完整规则矩阵。
+
+- 新确认
+  - `compiler_csg` 这类中间层最容易自己长出第二套有限域表面，不是靠字符串，而是靠“一格一个薄壳 helper”。
+  - 如果同一事实已经能用“统一 enum 计数”表达，就不要再保留 `LocalCount / ExternalCount / ...`、`UnknownQualifiedTargetCount / ...` 这种固定格子 API。
+  - 这类 helper 不删，主 smoke 很快又会跟着绑死一套平行接口。
+
+- 新确认
+  - 对已经完全切到 enum 真源的有限域，最容易留下的脏尾巴不是主逻辑，而是“没人再调的字符串兼容入口”；这轮 parser 里的 `CallKindCount(str)`、`HasExpr(str)`、`SurfaceCallKindFromText(...)`、`CallReasonFromText(...)` 就属于这类死口。
+  - 这类口子不删，后面很容易又有人顺手把字符串喂回主链。
+
+- 新确认
+  - parser 既然已经把普通 expr detail 收成 `detailKind`、compat 文本改成现算，就不要再保留“手工清空 call detail 文本再比 typed facts”这种旧回归；那不是在验证真语义，只是在绑旧存储形状。
+  - 这轮 `call_hir_matrix_smoke` 的 `blankCallDetails(...)` 就属于这类过期回归，继续留着只会把不存在的旧字段重新变成维护负担。
+  - 当前 full host smoke 上真正拦路的还是既有 ordinary 红点：
+    - `cheng/v3/lang/typed_expr::v3TypedExprComprehensionFilterIf`
+    - `cheng/v3/lang/typed_expr::v3TypedExprBuildFact`
+    - 以及由此牵出的 `compiler_csg_smoke / call_hir_matrix_smoke` 主发射失败
+  - 所以这轮 parser 枚举化的正确验收口径要先看 parser smoke，不要把 unrelated typed_expr 红点误记成这次改动回归。
+
+- 新确认
+  - `call reason` 内部已经 enum 化，但只要 report 少吐两格，矩阵验收仍然是不完整的；这轮补上 `unknown_external_target` 和 `unknown_call_target` 后，CSG/lowering plan 的 call reason surface 才算真正闭环。
+  - 当前 seed/ordinary 对“模块 enum 常量直接出现在 smoke main 的 `let` 绑定或函数实参里”仍有真实缺口。
+    - 这不是 typed rule 设计问题。
+    - 稳定修法是把枚举判断收进模块 helper，再让 smoke 问布尔事实，不要在 test main 里直接传模块 enum 常量。
+  - `unknown_external_target/unknown_call_target` 目前在真实 parser surface 上基本是冷分支，所以这轮额外用 `v3ParserResolveCallTarget(...)` 的直探针把它们钉住，避免 report 字段虽然补了但枚举值本身没人验。
+
+- 新确认
+  - `compiler_main` 现在不适合直接并进正式节点主闭包；它自己仍会在 ordinary 编译链上撞闭包问题。统一节点里正确路径是直接收编稳定可库化模块，不是把旧 main 当库拖进来。
+  - `libp2p surface` 的 handler 真相在 `host.supportedProtocols.len`，不是不存在的 `host.handlers`；surface 字段必须从 runtime 真结构取。
+  - compiler 这条线现在已经能在节点内自产：
+    - `CSG`
+    - `export surface`
+    - `compile receipt`
+    - `world-sync`
+    - `fresh-node-selfhost`
+    - `equivalence proof`
+    - `publish decision`
+  - 当前还没闭的是 ordinary 后段真发射，不是节点统一入口；`compiler print-build-plan` 已把这个边界稳定暴露成 `primary_object_machine_words_missing / object_plan_not_ready_for_native_link`。
+
+- 新确认
+  - `callSurfaceKind` 这类有限域事实一旦还以字符串挂在 parser 节点上，typed/CSG/report 就会继续各自做一次文本解码；最稳的口径是 parser/typed 内部直接用 enum，文本只留给 compat 和报告出口。
+  - 基础 parser helper 的签名漂移会把上层语法整片吞掉；这轮 `v3ParserFindMatchingPair(str,str)` 和 wrapper `char/char` 不一致，直接让 `Fmt(...)` 和列表生成式从 normalized expr layer 消失。
+  - parser 索引边界不能赌短路求值；`i == 0 || text[i - 1] ...` 这类写法在热路径上会真实越界，必须拆成显式 `leftOk/rightOk`。
+
+- 新确认
+  - Harmony 这条线不能只靠 XComponent callback 自己猜资源入口；正式链路必须由 ArkTS 显式把 `getContext(this).resourceManager` 注入 native。
+  - `route_state` 这类启动参数必须在 `cheng_app_init()` 前注入 runtime；只要错过初始化时刻，后补就是错误语义，不是等价实现。
+  - `rawfile/mobile_shell_launch_args.{kv,json}` 可以保留为宿主常量真源，但真正 `OH_ResourceManager_OpenRawFile(...)` 前必须先剥掉 `rawfile/` 前缀。
+  - Harmony 目前最小正确闭环已经固定：
+    - ArkTS `aboutToAppear()`
+    - `setResourceManager(...)`
+    - native rawfile 读 sidecar
+    - `cheng_mobile_host_runtime_set_launch_args(...)`
+    - `cheng_app_init()`
+
+- 新确认
+  - compat 文本如果只是历史协议输出，不必继续先造 `str` 再写 `ByteBuf`；直接流式写出老字节协议更稳，也更省。
+  - 这种“协议不变、实现换成流式”的改动必须补字节完全一致回归，不能只看最终 smoke 过不过。
+
+- 新确认
+  - 真要把 call `detail` 退出热路径，只改 parser append 还不够；`exprId` 也必须直接按结构字段生成，不然还是会在热路径里绕回 `CallExprDetailExact(...)`。
+  - 当 call `detail` 已经退成兼容层后，最干净的口径就是 parser 产物里直接存空串，compat 文本只在显式输出点现算。
+
+- 新确认
   - call `detail` 真要退成兼容层，不能只改 typed/report；parser 自己的去重键、`exprId`、CSG 兼容输出也都要从结构字段现算。
   - 最稳的强回归不是“字段有值”，而是“把 parser layer 里的所有 call `detail` 清空后，typed facts 仍然完全一致”。
   - 同一位置的 call 是否重复，应该由结构化 call fact 决定，不该继续由 `detail` 文本决定。
@@ -179,3 +291,98 @@
 - cheng_node_main 入口口径这轮新确认：
   - 现在正式默认入口应该写成 `cheng_node_main <subcmd>`；`ctl` 只是兼容前缀，不该继续在帮助文本和默认 smoke 里当主口径。
   - `cheng_node_ctl_main` 里旧的 `V3ChengNodeCtlCommand*` 包装已经没有真实调用价值；保留它们只会让入口面继续双轨。
+
+- cheng_node_main chain 多级子命令这轮新发现：
+  - `cheng_node_ctl_main` 如果直接 import `bio_did_chain_node`，fresh ordinary 编译会立刻报：
+    - `invalid or duplicate type head: .../v3/src/project/bio_reed_solomon.cheng`
+  - 所以 `bio-did operator-lookup` 这条旧命令不能靠“直接拖回主闭包”解决；那样会把统一节点主程序重新打红。
+  - `v3/src/tooling/gate_main.cheng` 里现在还保留大量 `chain-...` 旧形状脚本调用；这轮主程序已经有隐藏迁移别名，所以功能没断，但仓库口径还没完全改净。
+  - 直接用当前 ordinary fresh 编译 `v3/src/tooling/backend_driver_main.cheng`，会落到一串历史遗留的 private import / primary object 缺口；这和本轮 `chain` 命令改动不是同一条问题线。
+
+- mobile-shell runtime manifest / truth 资源这轮新发现：
+  - `WalkDirRec + RelativePath` 在 truth 目录复制这条绝对路径组合上不稳。
+  - 实际症状有两种：
+    - 把整条绝对路径塞进 `runtime/truth/...`
+    - rel suffix 直接丢空，truth 文件完全不落盘
+  - 正式修法不是补条件，而是改成递归 `os.ListDir(...)`，直接沿目录树构造相对路径。
+  - `.rgba` 这类 binary fixture 绝不能再走会补换行的文本镜像 helper。
+  - Android / iOS / Harmony 三端宿主已经全部接上 `cheng_mobile_host_runtime_set_manifest_payloads(...)`，runtime manifest 不再只是导出副产物。
+  - 现在新的主线缺口已经从“宿主没注入 payload”切到“runtime 已注入也要自己认账”。
+  - `src/runtime/mobile/cheng_mobile_exports_shared.c` 这轮已经补上这条真源：
+    - bundle 必须真的是 `native_gui_bundle_v1`
+    - contract 必须真的是 `native_gui_runtime_contract_v1`
+    - route / semantic / layout / render command / viewport / interactive 这些核心计数会直接进 runtime 上下文
+    - runtime 没拿到 launch args 路由时，会先吃 bundle route，再考虑 semantic default
+  - 这让后面的页面 1:1 对拍不再依赖“宿主写没写对文件”这种外围迹象，而能直接从 runtime frame reason 和 side effect 看 payload 是否真的被消费。
+  - 但如果控制面还只盯 `runtime_contract_payload_ready=true`，那仍然只能证明“文本被注入”，不能证明“runtime 真认账”。
+  - 所以 `cheng_mobile_host_runtime_state_json()` 也必须同步升级，把 runtime 解析出来的 bundle/contract ready 和计数显式吐出去。
+
+- cheng_node_main compiler `system-link-exec` 这轮新发现：
+  - `bootstrap_contracts` 不能直接并进 `cheng_node_compiler_domain` 主闭包；它会把 parser/bootstrap 重依赖链一起拖进 unified node，fresh ordinary 编译马上从“可过”退化成大面积 seed 语义缺口。
+  - 这条线上真正需要的只有 bridge compiler 路径，不是 bootstrap 全能力；正式修法就是节点域里自己做纯路径探测，不要 import 整个 bootstrap contract 模块。
+  - 当前 `cheng_node_main` fresh 编译虽然已经重新恢复通过，但 report 里仍会吐一条 seed 诊断：
+    - `cheng/v3/lang/parser::v3NormalizedExprLayerAppendSpan`
+  - 这条没有阻断产物生成，`/tmp/cheng_node_main_fullstack4` 和节点内 `compiler system-link-exec` 都已实跑通过；但它说明 parser 这块 ordinary 发码边界还没有彻底干净，后面如果继续把更多编译器内部能力并进主闭包，优先盯这条函数形状。
+- `callReason` 这种有限域只要继续用 `str` 穿 parser -> typed -> csg，仓库里就会天然再长一份“文本真源”。
+  - 这轮把内部口径改成 enum 后，`call reason drift` 终于只剩一份事实。
+  - 同时也实锤一个现有实现边界：seed 对“返回 `str` 的 helper 直接参与 `==`”还不稳，所以 smoke 内部断言也应该直接比 enum，文本只留给 report/日志输出。
+
+- `debug-report / print-symbols / print-line-map / print-asm` 之前失败的真根因已经钉死：
+  - 不是 `cheng_node` 转发链，也不是 backend_driver 参数拼接。
+  - 是 `v3/bootstrap/cheng_v3_seed.c` 里这四个命令把 `V3BootstrapContract / V3SystemLinkPlanStub / V3CompilerWorldArtifacts / V3PrimaryObjectPlanStub / V3ObjectPlanStub / V3NativeLinkPlanStub` 全压在栈上，Darwin 直接在 `___chkstk_darwin` 崩掉。
+  - lldb 回溯已经实锤：
+    - `v3_cmd_debug_report + 48`
+    - `v3_cmd_print_symbols + 48`
+    - `v3_cmd_print_line_map + 48`
+    - `v3_cmd_print_asm + 48`
+  - 正式修法就是 heap exec context；修完后：
+    - `artifacts/v3_backend_driver/cheng run-host-smokes debug_tools_surface_smoke` 通过
+    - `artifacts/v3_backend_driver/cheng debug-report ...` 直接恢复
+    - `cheng_node_main compiler debug-report / print-symbols / print-line-map / print-asm / print-object / profile-report` 全部恢复
+
+- `r2c` 页面级 native GUI 这轮新发现：
+  - 只要 `bundle outDir` 和 `codegen manifest` 不在同一个目录，`bundle helper` 就必须把显式 `--codegen-manifest` 当真源；不能因为 `outDir/cheng_codegen` 或 `outDir/cheng_codegen_route_catalog_v1.json` 恰好存在就优先吃旧残留。
+  - `static_surface` 这条 ordinary 红点的真根因不是语义层，而是写文件形状：
+    - `r2cSurfaceWriteModuleInventory`
+    - `r2cSurfaceWriteTailwindManifest`
+    - `r2cSurfaceWriteAssetManifest`
+    - 只要继续走 `os.Open(path, os.FmWrite)`，ordinary fresh compile 就会直接炸在 `stmt_let`
+    - 改成 `v3path.V3WriteTextFile(...)` 后立刻恢复
+  - `native_gui_run.mjs` 之前只把 `native_gui_run_report_v1` 打到 stdout，不写文件；这会让 smoke 和产物目录口径长期分叉。
+  - 旧 `r2c-react-v3-fresh-clean-gate` 现在仍然绑着 legacy wrapper / Python compile 轨，不适合作为当前页面级 native GUI 主线 smoke 的验收真源。
+  - 正式主线 smoke 口径已经明确：
+    - `codegen_surface -> static_surface -> native_gui_bundle -> native_gui_run`
+    - extra route 先用 fresh bundle 覆盖
+    - 不再借道 legacy `fresh clean gate`
+  - 当前 host smoke 时长边界也已经量出来：
+    - `home_default run + content_detail bundle` 可过
+    - 再叠 `publish_selector` 第三路 fresh bundle 会把默认 host smoke 顶到超时
+
+- `r2c` 页面级 native GUI 这轮继续确认：
+  - `publish_selector` 这种额外 route 不该继续往重型 smoke 里叠。
+  - 正式修法是拆成独立轻量 bundle smoke，再由 `verify-r2c-react-v3-surface` 顺序串起来。
+  - `verify-r2c-react-v3-surface` 这种多 route 验收，不适合继续复用“单 smoke helper 自动打印成功”那层壳。
+    - 最稳口径是显式顺序跑完每条 smoke，最后只打一条总 `ok`。
+
+- `r2c` 页面级 native GUI 这轮新确认：
+  - controller fresh compile 不是“外层 wrapper 小问题”，而是正式主线 gate。
+    - 只要 `v3/src/tooling/r2c_process.cheng` 继续保留第二套 raw capture/importc 路径，fresh compile 就会直接在 `r2cProcessCapture / r2cProcessRunProgramLogged` 上炸。
+  - `r2c_react_v3_surface_main.cheng` 前面三个 manifest writer 改完还不够，`r2cSurfaceWriteRsg(...)` 和 `r2cSurfaceWriteBlockerReport(...)` 也必须一起退出 `os.Open(path, os.FmWrite)`。
+    - 不然 `static_surface` 的 fresh compile 还是会被剩余写文件红点拦住。
+  - `run-native-gui` controller smoke 不能直接调用 `artifacts/v3_bootstrap/cheng.stage3 r2c-react-v3 ...`。
+    - 只要源码 mtime 漂了，这条路就会重新触发 `bootstrap-bridge` 噪音，把 smoke 结果和 controller 真问题混在一起。
+  - 即使已经 fresh compile 出了 controller 可执行，当前 smoke 也不该继续走它内部隐式 `native-gui-bundle` 路径。
+    - 最稳口径是外部先明确产出：
+      - `codegen_surface`
+      - `static_surface`
+      - `native_gui_bundle_v1.json`
+      - `native_gui_session_v1.json`
+    - 再把 `--bundle-path / --session-path` 显式喂给 controller。
+  - `verify-r2c-react-v3-surface` 现在已经不只是“页面 bundle smoke 集合”。
+    - 它还正式覆盖了 controller report 面，开始验 runtime payload 被 native GUI runtime 真正消费后的字段。
+
+- `r2c` 页面级 compare 这轮新确认：
+  - `compare-truth` 之前虽然已经有 `truth_compare_v1`，但还只盯 `route/render_ready/semantic_nodes_count`。
+  - 真正页面级 native gui 对拍要能看到 runtime 已经认账的 bundle/contract 真值，不然 compare 产物只能说明“exec snapshot 对上了”，说明不了“native gui runtime 真的吃进去了”。
+  - 这条线最稳的补法不是重做第二套 compare 命令，而是在现有 `truth_compare_v1` / `compare_truth_report_v1` 上直接并入 `native_gui_run.summary.env` 真值字段。
+  - `--native-gui-summary` 必须是显式硬输入；传了但文件不存在就直接失败。未显式传时，再自动尝试同目录 `native_gui_run.summary.env`。

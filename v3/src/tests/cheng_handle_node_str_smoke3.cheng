@@ -1,0 +1,87 @@
+import std/rawmem_support
+
+@importc("malloc")
+fn c_malloc(size: int64): ptr
+@importc("realloc")
+fn c_realloc(p: ptr, size: int64): ptr
+@importc("free")
+fn c_free(p: ptr)
+
+type
+    ProbeHandleSlot =
+        ptr: ptr
+        generation: uint32
+    ProbeHandleSlotPtr = ProbeHandleSlot *
+
+    Node =
+        name: str
+        count: int32
+    NodePtr = Node *
+
+var
+    probe_slots: ProbeHandleSlotPtr
+    probe_slots_len: int32
+    probe_slots_cap: int32
+
+fn probe_slot_at(idx: int32): ProbeHandleSlotPtr =
+    return ProbeHandleSlotPtr(rawmem_support.RawmemPtrAdd(ptr(probe_slots), idx * int32(sizeof ProbeHandleSlot)))
+
+fn probe_ensure_capacity(minCap: int32): bool =
+    if minCap <= probe_slots_cap:
+        return true
+    var newCap: int32 = probe_slots_cap
+    if newCap < 16:
+        newCap = 16
+    while newCap < minCap:
+        if newCap > 1073741823:
+            return false
+        newCap = newCap * 2
+    let bytes: int64 = int64(newCap) * int64(sizeof ProbeHandleSlot)
+    let mem: ptr = c_realloc(ptr(probe_slots), bytes)
+    if mem == nil:
+        return false
+    probe_slots = ProbeHandleSlotPtr(mem)
+    for i in probe_slots_cap..<newCap:
+        let slot: ProbeHandleSlotPtr = probe_slot_at(i)
+        slot->ptr = nil
+        slot->generation = uint32(1)
+    probe_slots_cap = newCap
+    return true
+
+fn probe_register_node_ptr(p: ptr): uint64 =
+    if p == nil:
+        return uint64(0)
+    var idx: int32 = -1
+    for i in 0..<probe_slots_len:
+        let slot: ProbeHandleSlotPtr = probe_slot_at(i)
+        if slot->ptr == nil:
+            idx = i
+            break
+    if idx < 0:
+        idx = probe_slots_len
+        if !probe_ensure_capacity(idx + 1):
+            return uint64(0)
+        probe_slots_len = idx + 1
+    let slot: ProbeHandleSlotPtr = probe_slot_at(idx)
+    slot->ptr = p
+    if slot->generation == uint32(0):
+        slot->generation = uint32(1)
+    return uint64(slot->generation) * uint64(4294967296) + uint64(idx + 1)
+
+fn main(): int32 =
+    let raw: ptr = c_malloc(int64(sizeof Node))
+    if raw == nil:
+        return 1
+    let node: NodePtr = NodePtr(raw)
+    node->name = "abc"
+    node->count = 7
+    let h: uint64 = probe_register_node_ptr(raw)
+    if h == uint64(0):
+        c_free(raw)
+        return 2
+    let slot0: ProbeHandleSlotPtr = probe_slot_at(0)
+    let ok: bool = slot0 != nil && slot0->ptr == raw && len(node->name) == 3 && node->count == 7
+    c_free(raw)
+    if ok:
+        return 0
+    return 3

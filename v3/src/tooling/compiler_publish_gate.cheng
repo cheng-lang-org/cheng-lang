@@ -1,0 +1,63 @@
+import std/result
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/tooling/compiler_world as cworld
+import cheng/v3/tooling/compiler_equivalence as ceq
+
+fn v3CompilerPublishDecisionProofPassed(proof: ceq.V3CompilerEquivalenceProof): bool =
+    return proof.graphEquivalent != 0 &&
+           proof.exportSurfaceCompatible != 0 &&
+           proof.compileReceiptEquivalent != 0 &&
+           proof.equivalenceLabel == "canonical_semantic_identity"
+
+fn v3CompilerPublishDecisionEvaluate(channelRaw: str,
+                                     worldHeadCid: layout.FixedBytes32,
+                                     equivalenceChecked: bool,
+                                     proof: ceq.V3CompilerEquivalenceProof,
+                                     outChannel: var str,
+                                     outStableGateRequired: var int32,
+                                     outEquivalenceChecked: var int32,
+                                     outEquivalencePassed: var int32,
+                                     outPublishAllowed: var int32,
+                                     outProofCid: var layout.FixedBytes32): Result[bool] =
+    let channelRes = cworld.v3CompilerWorldNormalizeChannel(channelRaw)
+    if IsErr(channelRes):
+        return Err[bool](Error(channelRes))
+    let channel = Value(channelRes)
+    let stableGateRequired = channel == "stable" ? 1 : 0
+    let equivalenceCheckedFlag = equivalenceChecked ? 1 : 0
+    var equivalencePassed = 0
+    if equivalenceChecked:
+        if v3CompilerPublishDecisionProofPassed(proof):
+            equivalencePassed = 1
+    var publishAllowed = 1
+    if stableGateRequired != 0:
+        publishAllowed = equivalencePassed
+    outChannel = channel
+    outStableGateRequired = stableGateRequired
+    outEquivalenceChecked = equivalenceCheckedFlag
+    outEquivalencePassed = equivalencePassed
+    outPublishAllowed = publishAllowed
+    worldHeadCid
+    if equivalenceChecked:
+        outProofCid = proof.proofCid
+    else:
+        outProofCid = layout.fixedBytes32Zero()
+    return Ok[bool](true)
+
+fn v3CompilerPublishDecisionReport(channel: str,
+                                   stableGateRequired: int32,
+                                   equivalenceChecked: int32,
+                                   equivalencePassed: int32,
+                                   publishAllowed: int32,
+                                   worldHeadCid: layout.FixedBytes32,
+                                   proofCid: layout.FixedBytes32): str =
+    var out = ""
+    out = out + "version=1\n"
+    out = out + "channel=" + channel + "\n"
+    out = out + "stable_gate_required=" + intToStr(stableGateRequired) + "\n"
+    out = out + "equivalence_checked=" + intToStr(equivalenceChecked) + "\n"
+    out = out + "equivalence_passed=" + intToStr(equivalencePassed) + "\n"
+    out = out + "publish_allowed=" + intToStr(publishAllowed) + "\n"
+    out = out + "world_head_cid=" + layout.fixedBytes32Hex(worldHeadCid) + "\n"
+    out = out + "proof_cid=" + layout.fixedBytes32Hex(proofCid)
+    return out

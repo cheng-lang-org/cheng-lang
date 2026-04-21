@@ -1,0 +1,792 @@
+import std/cmdline as cmdline
+import std/os as os
+import std/os_host_process as hostos
+import std/result
+import std/strutils as strutil
+import cheng/v3/std/bytes_layout as layout
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_request as creq
+import cheng/v3/tooling/compiler_world_libp2p as cwlp
+import cheng/v3/tooling/compiler_equivalence as ceq
+import cheng/v3/tooling/compiler_publish_gate as cpub
+import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/backend/system_link_exec as sexec
+
+fn v3ChengNodeCompilerRoot(): str =
+    let envRoot = os.GetEnv("CHENG_V3_ROOT")
+    if len(envRoot) > 0:
+        return envRoot
+    return os.GetCurrentDir()
+
+fn v3ChengNodeCompilerReadText(pathRaw: str): Result[str] =
+    let path = strutil.Strip(pathRaw)
+    if len(path) <= 0:
+        return Err[str]("cheng_node compiler: missing path")
+    let fullPath = v3path.V3PathAbsolute(v3ChengNodeCompilerRoot(), path)
+    if !os.FileExists(fullPath):
+        return Err[str]("cheng_node compiler: missing file " + fullPath)
+    return Ok[str](v3path.V3ReadTextFile("", fullPath))
+
+fn v3ChengNodeCompilerRequireFlag(flagName: str): Result[str] =
+    let value = strutil.Strip(cmdline.readFlagOrDefault(flagName, ""))
+    if len(value) <= 0:
+        return Err[str]("cheng_node compiler: missing " + flagName)
+    return Ok[str](value)
+
+fn v3ChengNodeCompilerEmitKind(emitTextRaw: str): Result[creq.V3CompilerEmit] =
+    let emitText = strutil.Strip(emitTextRaw)
+    if len(emitText) <= 0 || emitText == "exe":
+        return Ok[creq.V3CompilerEmit](creq.v3EmitExe)
+    if emitText == "obj":
+        return Ok[creq.V3CompilerEmit](creq.v3EmitObj)
+    if emitText == "shared":
+        return Ok[creq.V3CompilerEmit](creq.v3EmitShared)
+    return Err[creq.V3CompilerEmit]("cheng_node compiler: unsupported emit kind")
+
+fn v3ChengNodeCompilerRequest(): Result[creq.V3CompilerRequest] =
+    let sourcePathRes = v3ChengNodeCompilerRequireFlag("--in")
+    if IsErr(sourcePathRes):
+        return Err[creq.V3CompilerRequest](Error(sourcePathRes))
+    let outputPathRes = v3ChengNodeCompilerRequireFlag("--out")
+    if IsErr(outputPathRes):
+        return Err[creq.V3CompilerRequest](Error(outputPathRes))
+    let emitRes = v3ChengNodeCompilerEmitKind(cmdline.readFlagOrDefault("--emit", "exe"))
+    if IsErr(emitRes):
+        return Err[creq.V3CompilerRequest](Error(emitRes))
+    let targetTriple = strutil.Strip(cmdline.readFlagOrDefault("--target",
+                                                               "arm64-apple-darwin"))
+    let reportPath = strutil.Strip(cmdline.readFlagOrDefault("--report-out", ""))
+    var req = creq.v3CompilerRequestNew(v3ChengNodeCompilerRoot(),
+                                        Value(sourcePathRes),
+                                        Value(outputPathRes),
+                                        targetTriple,
+                                        Value(emitRes),
+                                        reportPath)
+    let visibilityRaw = strutil.Strip(cmdline.readFlagOrDefault("--symbol-visibility", ""))
+    if len(visibilityRaw) > 0:
+        let visibilityRes = creq.v3CompilerSymbolVisibilityFromText(visibilityRaw)
+        if IsErr(visibilityRes):
+            return Err[creq.V3CompilerRequest](Error(visibilityRes))
+        req = creq.v3CompilerRequestWithSymbolVisibility(req, Value(visibilityRes))
+    let browserBridgeObjectPath = strutil.Strip(cmdline.readFlagOrDefault("--browser-bridge-object",
+                                                                          ""))
+    if len(browserBridgeObjectPath) > 0:
+        req = creq.v3CompilerRequestWithBrowserBridgeObject(req, browserBridgeObjectPath)
+    return Ok[creq.V3CompilerRequest](req)
+
+fn v3ChengNodeCompilerAppendReportLine(out: var str,
+                                       line: str) =
+    if len(line) <= 0:
+        return
+    if len(out) > 0 && out[len(out) - 1] != '\n':
+        out = out + "\n"
+    out = out + line
+
+fn v3ChengNodeCompilerWriteOptionalReport(rootDir: str,
+                                          rawPath: str,
+                                          report: str): bool =
+    if len(rawPath) <= 0:
+        return true
+    var text = report
+    text = text + "\n"
+    return v3path.V3WriteTextFile(rootDir, rawPath, text)
+
+fn v3ChengNodeCompilerArgsWithoutBrowserBridgeObject(args: str[]): str[] =
+    var out: str[]
+    var i: int32
+    while i < args.len:
+        let arg = strutil.Strip(args[i])
+        if arg == "--browser-bridge-object":
+            i = i + 2
+            continue
+        if strutil.StartsWith(arg, "--browser-bridge-object:") || strutil.StartsWith(arg, "--browser-bridge-object="):
+            i = i + 1
+            continue
+        add(out, args[i])
+        i = i + 1
+    return out
+
+fn v3ChengNodeCompilerArgsWithBrowserBridgeObject(args: str[],
+                                                  browserBridgeObjectPath: str): Result[str[]] =
+    let explicitBrowserBridgeObject = creq.v3CompilerReadFlagOrDefault(args, "--browser-bridge-object", "")
+    let explicitLinkInput = creq.v3CompilerReadFlagOrDefault(args, "--link-input", "")
+    if len(browserBridgeObjectPath) > 0 && explicitLinkInput == browserBridgeObjectPath:
+        return Err[str[]]("cheng_node compiler: explicit --link-input conflicts with compiler-owned browser bridge object")
+    if len(explicitBrowserBridgeObject) > 0 &&
+       len(browserBridgeObjectPath) > 0 &&
+       explicitBrowserBridgeObject != browserBridgeObjectPath:
+        return Err[str[]]("cheng_node compiler: explicit --browser-bridge-object conflicts with compiler-owned browser bridge object")
+    var out = v3ChengNodeCompilerArgsWithoutBrowserBridgeObject(args)
+    if len(explicitBrowserBridgeObject) > 0:
+        add(out, "--browser-bridge-object:" + explicitBrowserBridgeObject)
+    elif len(browserBridgeObjectPath) > 0:
+        add(out, "--browser-bridge-object:" + browserBridgeObjectPath)
+    return Ok[str[]](out)
+
+fn v3ChengNodeBackendDriverHandoffDisabled(): bool =
+    let noHandoffText = strutil.Strip(os.GetEnv("CHENG_V3_NO_BACKEND_DRIVER_HANDOFF"))
+    return len(noHandoffText) > 0 && noHandoffText != "0"
+
+fn v3ChengNodeCompilerCurrentExecutablePath(rootDir: str): str =
+    let raw = strutil.Strip(cmdline.ProgramName())
+    if len(raw) <= 0:
+        return ""
+    return v3path.V3PathAbsolute(rootDir, raw)
+
+fn v3ChengNodeCompilerBridgeCandidateReady(rootDir: str,
+                                           candidatePath: str,
+                                           currentPath: str): bool =
+    if !v3path.V3FileExistsNonEmpty(rootDir, candidatePath):
+        return false
+    if len(currentPath) > 0 && currentPath == candidatePath:
+        return false
+    return true
+
+fn v3ChengNodeCompilerBridgeCompilerPathSelect(rootDir: str,
+                                               disableBackendDriverHandoff: bool,
+                                               currentPath: str): str =
+    let stage3Path = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
+    if v3ChengNodeCompilerBridgeCandidateReady(rootDir, stage3Path, currentPath):
+        return stage3Path
+    if !disableBackendDriverHandoff:
+        let backendDriverPath = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
+        if v3ChengNodeCompilerBridgeCandidateReady(rootDir, backendDriverPath, currentPath):
+            return backendDriverPath
+    let stage2Path = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage2")
+    if v3ChengNodeCompilerBridgeCandidateReady(rootDir, stage2Path, currentPath):
+        return stage2Path
+    let stage1Path = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage1")
+    if v3ChengNodeCompilerBridgeCandidateReady(rootDir, stage1Path, currentPath):
+        return stage1Path
+    return ""
+
+fn v3ChengNodeCompilerBridgeCompilerPath(rootDir: str): str =
+    return v3ChengNodeCompilerBridgeCompilerPathSelect(rootDir,
+                                                       v3ChengNodeBackendDriverHandoffDisabled(),
+                                                       v3ChengNodeCompilerCurrentExecutablePath(rootDir))
+
+fn V3ChengNodeCompilerBridgeCompilerPath(rootDir: str): str =
+    return v3ChengNodeCompilerBridgeCompilerPath(rootDir)
+
+fn V3ChengNodeCompilerBridgeCompilerPathNoHandoff(rootDir: str): str =
+    return v3ChengNodeCompilerBridgeCompilerPathSelect(rootDir, true, "")
+
+fn v3ChengNodeCompilerRunBridgeCapture(rootDir: str,
+                                       bridgeCompiler: str,
+                                       argv: str[],
+                                       envOverrides: str[],
+                                       outOutput: var str): int32 =
+    if !v3path.V3FileExistsNonEmpty(rootDir, bridgeCompiler):
+        outOutput = "cheng_node compiler: missing bridge compiler " + bridgeCompiler
+        return 127
+    let runRes = hostos.ExecFileCapture(bridgeCompiler,
+                                        argv,
+                                        envOverrides,
+                                        rootDir,
+                                        true,
+                                        0)
+    outOutput = strutil.Strip(os.ExecCmdResultOutput(runRes))
+    return os.ExecCmdResultExitCode(runRes)
+
+fn v3ChengNodeCompilerCollectArgsFrom(startIndex: int32): str[] =
+    var out: str[]
+    out = []
+    let count = cmdline.ParamCount()
+    if count < startIndex:
+        return out
+    var i = startIndex
+    while i <= count:
+        let arg = cmdline.ParamStr(i)
+        if len(arg) > 0:
+            add(out, arg)
+        i = i + 1
+    return out
+
+fn v3ChengNodeCompilerForwardSubcommandText(subcmd: str,
+                                            commandIndex: int32): Result[str] =
+    let rootDir = v3ChengNodeCompilerRoot()
+    let bridgeCompiler = v3ChengNodeCompilerBridgeCompilerPath(rootDir)
+    if len(bridgeCompiler) <= 0:
+        return Err[str]("cheng_node compiler: missing bridge compiler for " + subcmd)
+    var argv: str[]
+    argv = []
+    add(argv, subcmd)
+    let rawArgs = v3ChengNodeCompilerCollectArgsFrom(commandIndex + 1)
+    for i in 0..<rawArgs.len:
+        add(argv, rawArgs[i])
+    var output = ""
+    let rc = v3ChengNodeCompilerRunBridgeCapture(rootDir,
+                                                 bridgeCompiler,
+                                                 argv,
+                                                 ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                                 output)
+    if rc != 0:
+        if len(output) > 0:
+            return Err[str](output)
+        return Err[str]("cheng_node compiler: bridge compiler failed for " + subcmd)
+    return Ok[str](output)
+
+fn v3ChengNodeCompilerMaterializeBrowserBridgeObject(rootDir: str,
+                                                     plan: sexec.V3SystemLinkExecPlan,
+                                                     outErr: var str): bool =
+    outErr = ""
+    let bridgeObjectPath = sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan)
+    let bridgeObjectBasePath = sexec.v3SystemLinkExecBrowserBridgeObjectBasePath(plan.systemLinkPlan.outputPath)
+    if len(bridgeObjectBasePath) > 0 && len(bridgeObjectPath) <= 0:
+        let stalePath = v3path.V3PathAbsolute(rootDir, bridgeObjectBasePath)
+        if os.FileExists(stalePath):
+            let _ = os.RemoveFile(stalePath)
+        return true
+    if len(bridgeObjectPath) <= 0:
+        return true
+    let bridgeSourcePath = sexec.v3SystemLinkExecBrowserBridgeSourcePath(plan)
+    if len(bridgeSourcePath) <= 0 || !v3path.V3FileExistsNonEmpty(rootDir, bridgeSourcePath):
+        outErr = "cheng_node compiler: missing browser bridge source " + bridgeSourcePath
+        return false
+    let compilerPath = v3ChengNodeCompilerBridgeCompilerPath(rootDir)
+    if len(compilerPath) <= 0:
+        outErr = "cheng_node compiler: missing browser bridge compiler"
+        return false
+    let absoluteBridgeObjectPath = v3path.V3PathAbsolute(rootDir, bridgeObjectPath)
+    if os.FileExists(absoluteBridgeObjectPath):
+        let _ = os.RemoveFile(absoluteBridgeObjectPath)
+    var compileArgs: str[]
+    add(compileArgs, "system-link-exec")
+    add(compileArgs, "--root:" + plan.systemLinkPlan.packageRoot)
+    add(compileArgs, "--in:" + bridgeSourcePath)
+    add(compileArgs, "--emit:obj")
+    add(compileArgs, "--target:" + plan.systemLinkPlan.targetTriple)
+    add(compileArgs, "--symbol-visibility:" + creq.v3CompilerSymbolVisibilityInternal())
+    add(compileArgs, "--out:" + bridgeObjectPath)
+    var compileOutput = ""
+    let compileRc = v3ChengNodeCompilerRunBridgeCapture(rootDir,
+                                                        compilerPath,
+                                                        compileArgs,
+                                                        ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                                        compileOutput)
+    if compileRc != 0:
+        if len(compileOutput) > 0:
+            outErr = compileOutput
+        else:
+            outErr = "cheng_node compiler: browser bridge object compile failed"
+        return false
+    if !v3path.V3FileExistsNonEmpty(rootDir, bridgeObjectPath):
+        outErr = "cheng_node compiler: browser bridge object missing " + bridgeObjectPath
+        return false
+    return true
+
+fn v3ChengNodeCompilerMaterializeBrowserBridgeOutputs(rootDir: str,
+                                                      plan: sexec.V3SystemLinkExecPlan,
+                                                      outErr: var str): bool =
+    outErr = ""
+    if !sexec.v3SystemLinkExecWriteBrowserBridgeArtifact(rootDir, plan):
+        outErr = "cheng_node compiler: failed to write browser bridge artifact"
+        return false
+    if !sexec.v3SystemLinkExecWriteBrowserBridgeSource(rootDir, plan):
+        outErr = "cheng_node compiler: failed to write browser bridge source"
+        return false
+    return v3ChengNodeCompilerMaterializeBrowserBridgeObject(rootDir, plan, outErr)
+
+fn v3ChengNodeCompilerSystemLinkExecArgs(req: creq.V3CompilerRequest,
+                                         plan: sexec.V3SystemLinkExecPlan): Result[str[]] =
+    var out = creq.v3CompilerSystemLinkCompatArgs(req)
+    let worldHead = strutil.Strip(cmdline.readFlagOrDefault("--world-head", ""))
+    if len(worldHead) > 0:
+        add(out, "--world-head:" + worldHead)
+    let lockPath = strutil.Strip(cmdline.readFlagOrDefault("--lock", ""))
+    if len(lockPath) > 0:
+        add(out, "--lock:" + lockPath)
+    let baselineSurfacePath = strutil.Strip(cmdline.readFlagOrDefault("--baseline-surface", ""))
+    if len(baselineSurfacePath) > 0:
+        add(out, "--baseline-surface:" + baselineSurfacePath)
+    let channelRaw = strutil.Strip(cmdline.readFlagOrDefault("--channel", "stable"))
+    if len(channelRaw) > 0:
+        add(out, "--channel:" + channelRaw)
+    return v3ChengNodeCompilerArgsWithBrowserBridgeObject(out,
+                                                          sexec.v3SystemLinkExecBrowserBridgeObjectPath(plan))
+
+fn v3ChengNodeCompilerUsageText(): str =
+    var out = ""
+    out = out + "compiler commands:\n"
+    out = out + "  compiler surface\n"
+    out = out + "  compiler status\n"
+    out = out + "  compiler system-link-exec --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--report-out:<path>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--channel:<stable|edge>] [--browser-bridge-object:<path>]\n"
+    out = out + "  compiler debug-report [seed-flags...]\n"
+    out = out + "  compiler print-symbols [seed-flags...]\n"
+    out = out + "  compiler print-line-map [seed-flags...]\n"
+    out = out + "  compiler print-object --object:<path> [--report-out:<path>]\n"
+    out = out + "  compiler print-elf --object:<path> [--report-out:<path>]\n"
+    out = out + "  compiler print-asm [seed-flags...]\n"
+    out = out + "  compiler profile-run [seed-flags...]\n"
+    out = out + "  compiler profile-report --in:<raw-log> [--out:<final-report>]\n"
+    out = out + "  compiler crash-report --in:<raw-log> [--out:<final-report>]\n"
+    out = out + "  compiler print-build-plan --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--report-out:<path>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--channel:<stable|edge>]\n"
+    out = out + "  compiler emit-csg --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--channel:<stable|edge>]\n"
+    out = out + "  compiler migrate-csg --legacy-in:<path> --in:<path> --out:<bundle-prefix> [--report-out:<path>]\n"
+    out = out + "  compiler emit-surface --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--channel:<stable|edge>]\n"
+    out = out + "  compiler emit-receipt --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--channel:<stable|edge>]\n"
+    out = out + "  compiler verify-world --in:<path> [--target:<triple>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]\n"
+    out = out + "  compiler world-sync --in:<path> --out:<path>\n"
+    out = out + "  compiler prove-migration --legacy-in:<path> --in:<path> --out:<bundle-prefix> [--target:<triple>] [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]\n"
+    out = out + "  compiler publish-world --in:<path> --out:<bundle-prefix> --target:<triple> [--channel:<stable|edge>] [--legacy-in:<path>] [--baseline-csg:<path>] [--baseline-surface:<path>] [--baseline-receipt:<path>] [--world-head:<cid>] [--lock:<path>] [--report-out:<path>]\n"
+    out = out + "  compiler fresh-node-selfhost --in:<path> --out:<path> [--emit:<exe|obj|shared>] [--target:<triple>] [--world-head:<cid>] [--channel:<stable|edge>]\n"
+    out = out + "  compiler selfhost-build --in:<path> --out:<path> --target:<triple> [--channel:<stable|edge>] [--world-head:<cid>] [--lock:<path>] [--baseline-surface:<path>] [--report-out:<path>]\n"
+    out = out + "  compiler prove-equivalence --package:<id> [--channel:<stable|edge>] --baseline-csg:<path> --migrated-csg:<path> --baseline-surface:<path> --migrated-surface:<path> --baseline-receipt:<path> --migrated-receipt:<path>\n"
+    out = out + "  compiler publish-check --world-head-cid:<hex> [--channel:<stable|edge>] --package:<id> --baseline-csg:<path> --migrated-csg:<path> --baseline-surface:<path> --migrated-surface:<path> --baseline-receipt:<path> --migrated-receipt:<path>"
+    return out
+
+fn V3ChengNodeCompilerSurfaceText(): str =
+    var out = ""
+    out = out + "domain=compiler\n"
+    out = out + "status_command=1\n"
+    out = out + "system_link_exec_command=1\n"
+    out = out + "debug_report_command=1\n"
+    out = out + "print_symbols_command=1\n"
+    out = out + "print_line_map_command=1\n"
+    out = out + "print_object_command=1\n"
+    out = out + "print_elf_command=1\n"
+    out = out + "print_asm_command=1\n"
+    out = out + "profile_run_command=1\n"
+    out = out + "profile_report_command=1\n"
+    out = out + "crash_report_command=1\n"
+    out = out + "build_plan_command=1\n"
+    out = out + "emit_csg_command=1\n"
+    out = out + "migrate_csg_command=1\n"
+    out = out + "emit_surface_command=1\n"
+    out = out + "emit_receipt_command=1\n"
+    out = out + "verify_world_command=1\n"
+    out = out + "world_sync_command=1\n"
+    out = out + "prove_migration_command=1\n"
+    out = out + "publish_world_command=1\n"
+    out = out + "fresh_node_selfhost_command=1\n"
+    out = out + "selfhost_build_command=1\n"
+    out = out + "prove_equivalence_command=1\n"
+    out = out + "publish_check_command=1\n"
+    out = out + "compiler_index_kinds=package,world_head,build_receipt,target_receipt"
+    return out
+
+fn V3ChengNodeCompilerStatusText(): str =
+    var out = ""
+    out = out + "cheng_node.compiler_domain\n"
+    out = out + "version=v3.compiler_runtime.v1\n"
+    out = out + "execution=argv_control_plane\n"
+    out = out + "bootstrap_mode=v3_selfhost\n"
+    out = out + "ordinary_command=system-link-exec\n"
+    out = out + "ordinary_pipeline=node_control_plane_bridge_handoff_until_selfhost_native_codegen\n"
+    out = out + "root=" + v3ChengNodeCompilerRoot()
+    return out
+
+fn v3ChengNodeCompilerBuildPlan(): Result[sexec.V3SystemLinkExecPlan] =
+    let reqRes = v3ChengNodeCompilerRequest()
+    if IsErr(reqRes):
+        return Err[sexec.V3SystemLinkExecPlan](Error(reqRes))
+    let requestedWorldHead = strutil.Strip(cmdline.readFlagOrDefault("--world-head", ""))
+    let lockPath = strutil.Strip(cmdline.readFlagOrDefault("--lock", ""))
+    let baselineSurfacePath = strutil.Strip(cmdline.readFlagOrDefault("--baseline-surface", ""))
+    let channelRaw = strutil.Strip(cmdline.readFlagOrDefault("--channel", "stable"))
+    return sexec.v3BuildSystemLinkExecPlanWithWorldAndChannel(v3ChengNodeCompilerRoot(),
+                                                              Value(reqRes),
+                                                              requestedWorldHead,
+                                                              lockPath,
+                                                              baselineSurfacePath,
+                                                              channelRaw)
+
+fn V3ChengNodeCompilerBuildPlanText(): Result[str] =
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return Ok[str](sexec.v3SystemLinkExecPlanReport(Value(planRes)))
+
+fn V3ChengNodeCompilerSystemLinkExecText(): Result[str] =
+    let reqRes = v3ChengNodeCompilerRequest()
+    if IsErr(reqRes):
+        return Err[str](Error(reqRes))
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    let req = Value(reqRes)
+    let plan = Value(planRes)
+    let rootDir = v3ChengNodeCompilerRoot()
+    let report = sexec.v3SystemLinkExecPlanReport(plan)
+    if !v3ChengNodeCompilerWriteOptionalReport(rootDir, req.reportPath, report):
+        return Err[str]("cheng_node compiler: failed to write report: " + req.reportPath)
+    var bridgeMaterializeErr = ""
+    if !v3ChengNodeCompilerMaterializeBrowserBridgeOutputs(rootDir, plan, bridgeMaterializeErr):
+        if len(bridgeMaterializeErr) > 0:
+            return Err[str](bridgeMaterializeErr)
+        return Err[str]("cheng_node compiler: failed to materialize browser bridge outputs")
+    let bridgeCompiler = v3ChengNodeCompilerBridgeCompilerPath(rootDir)
+    if len(bridgeCompiler) > 0:
+        let bridgeArgsRes = v3ChengNodeCompilerSystemLinkExecArgs(req, plan)
+        if IsErr(bridgeArgsRes):
+            return Err[str](Error(bridgeArgsRes))
+        var forwardArgv: str[]
+        add(forwardArgv, "system-link-exec")
+        let bridgeArgs = Value(bridgeArgsRes)
+        for i in 0..<bridgeArgs.len:
+            add(forwardArgv, bridgeArgs[i])
+        var bridgeOutput = ""
+        let bridgeRc = v3ChengNodeCompilerRunBridgeCapture(rootDir,
+                                                           bridgeCompiler,
+                                                           forwardArgv,
+                                                           ["CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1"],
+                                                           bridgeOutput)
+        if bridgeRc != 0:
+            var err = "cheng_node compiler: bridge compiler failed"
+            if len(bridgeOutput) > 0:
+                err = bridgeOutput
+            if len(report) > 0:
+                err = err + "\n" + report
+            return Err[str](err)
+        bridgeMaterializeErr = ""
+        if !v3ChengNodeCompilerMaterializeBrowserBridgeOutputs(rootDir, plan, bridgeMaterializeErr):
+            if len(bridgeMaterializeErr) > 0:
+                return Err[str](bridgeMaterializeErr)
+            return Err[str]("cheng_node compiler: failed to restore browser bridge outputs")
+        if len(req.reportPath) > 0 && v3path.V3PathFileExists(v3path.V3PathAbsolute(rootDir, req.reportPath)):
+            return Ok[str](strutil.Strip(v3path.V3ReadTextFile(rootDir, req.reportPath)))
+        if len(bridgeOutput) > 0:
+            return Ok[str](bridgeOutput)
+        return Ok[str](report)
+    if sexec.v3SystemLinkExecPlanReady(plan):
+        return Err[str]("cheng_node compiler: missing live Cheng bridge for system-link-exec\n" + report)
+    if plan.primaryObjectPlan.missingReasons.len > 0:
+        return Err[str]("cheng_node compiler: primary object machine code not emitted\n" + report)
+    return Err[str]("cheng_node compiler: ordinary pipeline blocked\n" + report)
+
+fn V3ChengNodeCompilerCsgText(): Result[str] =
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return Ok[str](ccsg.v3CompilerCsgReport(Value(planRes).compilerCsg))
+
+fn V3ChengNodeCompilerSurfaceReportText(): Result[str] =
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return Ok[str](ccsg.v3CompilerExportSurfaceReport(Value(planRes).exportSurface))
+
+fn V3ChengNodeCompilerReceiptText(): Result[str] =
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return Ok[str](ccsg.v3CompileReceiptReport(Value(planRes).compileReceipt))
+
+fn V3ChengNodeCompilerWorldSyncText(): Result[str] =
+    let sourcePathRes = v3ChengNodeCompilerRequireFlag("--in")
+    if IsErr(sourcePathRes):
+        return Err[str](Error(sourcePathRes))
+    let outputPathRes = v3ChengNodeCompilerRequireFlag("--out")
+    if IsErr(outputPathRes):
+        return Err[str](Error(outputPathRes))
+    return cwlp.v3CompilerWorldSyncSmokeReport(v3ChengNodeCompilerRoot(),
+                                               Value(sourcePathRes),
+                                               Value(outputPathRes))
+
+fn V3ChengNodeCompilerFreshNodeSelfhostText(): Result[str] =
+    let reqRes = v3ChengNodeCompilerRequest()
+    if IsErr(reqRes):
+        return Err[str](Error(reqRes))
+    let planRes = v3ChengNodeCompilerBuildPlan()
+    if IsErr(planRes):
+        return Err[str](Error(planRes))
+    return cwlp.v3CompilerWorldFreshNodeSelfhostReport(v3ChengNodeCompilerRoot(),
+                                                       Value(reqRes),
+                                                       Value(planRes))
+
+fn v3ChengNodeCompilerEquivalenceProofText(): Result[str] =
+    let baselineCsgRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-csg", ""))
+    if IsErr(baselineCsgRes):
+        return Err[str](Error(baselineCsgRes))
+    let migratedCsgRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-csg", ""))
+    if IsErr(migratedCsgRes):
+        return Err[str](Error(migratedCsgRes))
+    let baselineSurfaceRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-surface", ""))
+    if IsErr(baselineSurfaceRes):
+        return Err[str](Error(baselineSurfaceRes))
+    let migratedSurfaceRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-surface", ""))
+    if IsErr(migratedSurfaceRes):
+        return Err[str](Error(migratedSurfaceRes))
+    let baselineReceiptRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-receipt", ""))
+    if IsErr(baselineReceiptRes):
+        return Err[str](Error(baselineReceiptRes))
+    let migratedReceiptRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-receipt", ""))
+    if IsErr(migratedReceiptRes):
+        return Err[str](Error(migratedReceiptRes))
+    let packageIdRes = v3ChengNodeCompilerRequireFlag("--package")
+    if IsErr(packageIdRes):
+        return Err[str](Error(packageIdRes))
+    let channelRaw = strutil.Strip(cmdline.readFlagOrDefault("--channel", "stable"))
+    var baselineGraphCid = layout.fixedBytes32Zero()
+    var migratedGraphCid = layout.fixedBytes32Zero()
+    var baselineSurfaceCid = layout.fixedBytes32Zero()
+    var migratedSurfaceCid = layout.fixedBytes32Zero()
+    var baselineReceiptCid = layout.fixedBytes32Zero()
+    var migratedReceiptCid = layout.fixedBytes32Zero()
+    var graphEquivalent = 0
+    var exportSurfaceCompatible = 0
+    var compileReceiptEquivalent = 0
+    var targetTriple = ""
+    let graphRes = ceq.v3CompilerEquivalenceGraphCompareTexts(Value(baselineCsgRes),
+                                                              Value(migratedCsgRes),
+                                                              baselineGraphCid,
+                                                              migratedGraphCid,
+                                                              graphEquivalent)
+    if IsErr(graphRes):
+        return Err[str](Error(graphRes))
+    let surfaceRes = ceq.v3CompilerEquivalenceSurfaceCompareTexts(Value(baselineSurfaceRes),
+                                                                  Value(migratedSurfaceRes),
+                                                                  baselineSurfaceCid,
+                                                                  migratedSurfaceCid,
+                                                                  exportSurfaceCompatible)
+    if IsErr(surfaceRes):
+        return Err[str](Error(surfaceRes))
+    let receiptRes = ceq.v3CompilerEquivalenceReceiptCompareTexts(Value(baselineReceiptRes),
+                                                                  Value(migratedReceiptRes),
+                                                                  baselineReceiptCid,
+                                                                  migratedReceiptCid,
+                                                                  targetTriple,
+                                                                  compileReceiptEquivalent)
+    if IsErr(receiptRes):
+        return Err[str](Error(receiptRes))
+    var proof: ceq.V3CompilerEquivalenceProof
+    let proofRes = ceq.v3CompilerEquivalenceProofMake(Value(packageIdRes),
+                                                      channelRaw,
+                                                      baselineGraphCid,
+                                                      migratedGraphCid,
+                                                      baselineSurfaceCid,
+                                                      migratedSurfaceCid,
+                                                      baselineReceiptCid,
+                                                      migratedReceiptCid,
+                                                      targetTriple,
+                                                      graphEquivalent,
+                                                      exportSurfaceCompatible,
+                                                      compileReceiptEquivalent,
+                                                      proof)
+    if IsErr(proofRes):
+        return Err[str](Error(proofRes))
+    return Ok[str](ceq.v3CompilerEquivalenceProofReport(proof))
+
+fn V3ChengNodeCompilerPublishCheckText(): Result[str] =
+    let proofTextRes = v3ChengNodeCompilerEquivalenceProofText()
+    if IsErr(proofTextRes):
+        return Err[str](Error(proofTextRes))
+    proofTextRes
+    let worldHeadCidRes = layout.fixedBytes32FromHex(cmdline.readFlagOrDefault("--world-head-cid", ""))
+    if IsErr(worldHeadCidRes):
+        return Err[str]("cheng_node compiler: invalid --world-head-cid")
+    let baselineCsgRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-csg", ""))
+    if IsErr(baselineCsgRes):
+        return Err[str](Error(baselineCsgRes))
+    let migratedCsgRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-csg", ""))
+    if IsErr(migratedCsgRes):
+        return Err[str](Error(migratedCsgRes))
+    let baselineSurfaceRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-surface", ""))
+    if IsErr(baselineSurfaceRes):
+        return Err[str](Error(baselineSurfaceRes))
+    let migratedSurfaceRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-surface", ""))
+    if IsErr(migratedSurfaceRes):
+        return Err[str](Error(migratedSurfaceRes))
+    let baselineReceiptRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--baseline-receipt", ""))
+    if IsErr(baselineReceiptRes):
+        return Err[str](Error(baselineReceiptRes))
+    let migratedReceiptRes = v3ChengNodeCompilerReadText(cmdline.readFlagOrDefault("--migrated-receipt", ""))
+    if IsErr(migratedReceiptRes):
+        return Err[str](Error(migratedReceiptRes))
+    let packageIdRes = v3ChengNodeCompilerRequireFlag("--package")
+    if IsErr(packageIdRes):
+        return Err[str](Error(packageIdRes))
+    let channelRaw = strutil.Strip(cmdline.readFlagOrDefault("--channel", "stable"))
+    var baselineGraphCid = layout.fixedBytes32Zero()
+    var migratedGraphCid = layout.fixedBytes32Zero()
+    var baselineSurfaceCid = layout.fixedBytes32Zero()
+    var migratedSurfaceCid = layout.fixedBytes32Zero()
+    var baselineReceiptCid = layout.fixedBytes32Zero()
+    var migratedReceiptCid = layout.fixedBytes32Zero()
+    var graphEquivalent = 0
+    var exportSurfaceCompatible = 0
+    var compileReceiptEquivalent = 0
+    var targetTriple = ""
+    let graphRes = ceq.v3CompilerEquivalenceGraphCompareTexts(Value(baselineCsgRes),
+                                                              Value(migratedCsgRes),
+                                                              baselineGraphCid,
+                                                              migratedGraphCid,
+                                                              graphEquivalent)
+    if IsErr(graphRes):
+        return Err[str](Error(graphRes))
+    let surfaceRes = ceq.v3CompilerEquivalenceSurfaceCompareTexts(Value(baselineSurfaceRes),
+                                                                  Value(migratedSurfaceRes),
+                                                                  baselineSurfaceCid,
+                                                                  migratedSurfaceCid,
+                                                                  exportSurfaceCompatible)
+    if IsErr(surfaceRes):
+        return Err[str](Error(surfaceRes))
+    let receiptRes = ceq.v3CompilerEquivalenceReceiptCompareTexts(Value(baselineReceiptRes),
+                                                                  Value(migratedReceiptRes),
+                                                                  baselineReceiptCid,
+                                                                  migratedReceiptCid,
+                                                                  targetTriple,
+                                                                  compileReceiptEquivalent)
+    if IsErr(receiptRes):
+        return Err[str](Error(receiptRes))
+    var proof: ceq.V3CompilerEquivalenceProof
+    let proofRes = ceq.v3CompilerEquivalenceProofMake(Value(packageIdRes),
+                                                      channelRaw,
+                                                      baselineGraphCid,
+                                                      migratedGraphCid,
+                                                      baselineSurfaceCid,
+                                                      migratedSurfaceCid,
+                                                      baselineReceiptCid,
+                                                      migratedReceiptCid,
+                                                      targetTriple,
+                                                      graphEquivalent,
+                                                      exportSurfaceCompatible,
+                                                      compileReceiptEquivalent,
+                                                      proof)
+    if IsErr(proofRes):
+        return Err[str](Error(proofRes))
+    var channel = ""
+    var stableGateRequired = 0
+    var equivalenceCheckedFlag = 0
+    var equivalencePassed = 0
+    var publishAllowed = 0
+    var proofCid = layout.fixedBytes32Zero()
+    let decisionRes = cpub.v3CompilerPublishDecisionEvaluate(channelRaw,
+                                                             Value(worldHeadCidRes),
+                                                             true,
+                                                             proof,
+                                                             channel,
+                                                             stableGateRequired,
+                                                             equivalenceCheckedFlag,
+                                                             equivalencePassed,
+                                                             publishAllowed,
+                                                             proofCid)
+    if IsErr(decisionRes):
+        return Err[str](Error(decisionRes))
+    return Ok[str](cpub.v3CompilerPublishDecisionReport(channel,
+                                                        stableGateRequired,
+                                                        equivalenceCheckedFlag,
+                                                        equivalencePassed,
+                                                        publishAllowed,
+                                                        Value(worldHeadCidRes),
+                                                        proofCid))
+
+fn v3ChengNodeCompilerPrintForwardResult(subcmd: str,
+                                         commandIndex: int32): int32 =
+    let textRes = v3ChengNodeCompilerForwardSubcommandText(subcmd, commandIndex)
+    if IsErr(textRes):
+        echo(Error(textRes))
+        return 1
+    let text = Value(textRes)
+    if len(text) > 0:
+        echo(text)
+    return 0
+
+fn V3ChengNodeCompilerCommandAt(commandIndex: int32): int32 =
+    let count = cmdline.ParamCount()
+    if count < commandIndex:
+        echo(v3ChengNodeCompilerUsageText())
+        return 0
+    let subcmd = cmdline.ParamStr(commandIndex)
+    if subcmd == "--help" || subcmd == "-h" || subcmd == "help":
+        echo(v3ChengNodeCompilerUsageText())
+        return 0
+    if subcmd == "surface":
+        echo(V3ChengNodeCompilerSurfaceText())
+        return 0
+    if subcmd == "status":
+        echo(V3ChengNodeCompilerStatusText())
+        return 0
+    if subcmd == "system-link-exec":
+        let textRes = V3ChengNodeCompilerSystemLinkExecText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "debug-report":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-symbols":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-line-map":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-object":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-elf":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-asm":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "profile-run":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "profile-report":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "crash-report":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "print-build-plan":
+        let textRes = V3ChengNodeCompilerBuildPlanText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "emit-csg":
+        let textRes = V3ChengNodeCompilerCsgText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "migrate-csg":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "emit-surface":
+        let textRes = V3ChengNodeCompilerSurfaceReportText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "emit-receipt":
+        let textRes = V3ChengNodeCompilerReceiptText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "verify-world":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "world-sync":
+        let textRes = V3ChengNodeCompilerWorldSyncText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "prove-migration":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "publish-world":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "fresh-node-selfhost":
+        let textRes = V3ChengNodeCompilerFreshNodeSelfhostText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "selfhost-build":
+        return v3ChengNodeCompilerPrintForwardResult(subcmd, commandIndex)
+    if subcmd == "prove-equivalence":
+        let textRes = v3ChengNodeCompilerEquivalenceProofText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    if subcmd == "publish-check":
+        let textRes = V3ChengNodeCompilerPublishCheckText()
+        if IsErr(textRes):
+            echo(Error(textRes))
+            return 1
+        echo(Value(textRes))
+        return 0
+    echo(v3ChengNodeCompilerUsageText())
+    return 2

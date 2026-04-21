@@ -1,5 +1,302 @@
 # 进度
 
+- 本轮把 `typed_expr -> compiler_csg` 剩余纯转发层清干净了：
+  - `v3/src/tooling/compiler_csg.cheng`
+    - 删除剩余 `typed expr fact/rule clone/equal/validate/filter/count` 薄壳。
+    - `compiler_csg clone/report` 现在直接问 `typed_expr`，不再保留第二套 parser-typed 便利面。
+  - `v3/src/backend/system_link_plan.cheng`
+    - 删除整组 `target_matrix` 转发壳；调用点直接问 `tmat.v3TargetRequiresNativeProviderModules(...)`。
+    - 顺手打掉了 seed 在 `system_link_plan` 上暴露的标量外部调用 resolve 红点。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes compiler_csg_smoke lowering_plan_smoke call_hir_matrix_smoke lowering_matrix_smoke typed_expr_call_validate_probe typed_expr_cross_file_probe`
+
+- 本轮把 `render_compare` 正式推进到可直接收页面级 native GUI 对拍产物了：
+  - `v3/experimental/r2c-react-v3/r2c-react-v3-render-compare.mjs`
+    - 新增显式直接对拍入口：
+      - `--native-summary`
+      - `--truth-summary`
+      - `--native-screenshot`
+      - `--truth-screenshot`
+    - 直接模式下不再跑 `tsx_frontend / codegen_surface / native_gui_bundle/run / truth_runtime`，而是严格消费现成产物。
+    - `render_compare_report_v1.json` 和 `render_compare.summary.env` 现在都会带上：
+      - `direct_mode`
+      - `route_state_match`
+      - 顶层 `native_gui_*` runtime 真值
+      - 顶层 `truth_*` trace/runtime/dom/screenshot 真值
+      - `semantic_nodes_count_delta`
+  - 新增 `v3/src/tests/r2c_react_v3_render_compare_direct_smoke.cheng`
+    - 用最小 `native_gui_run.summary.env + truth.summary.env + 两张相同 1x1 PNG` 直接钉住 `render_compare` 产物。
+  - `verify-r2c-react-v3-surface` 现在顺序跑 5 条 smoke：
+    - `r2c_react_v3_surface_smoke`
+    - `r2c_react_v3_publish_selector_bundle_smoke`
+    - `r2c_react_v3_run_native_gui_controller_smoke`
+    - `r2c_react_v3_truth_compare_controller_smoke`
+    - `r2c_react_v3_render_compare_direct_smoke`
+  - 本轮确认通过：
+    - `node --check /Users/lbcheng/cheng-lang/v3/experimental/r2c-react-v3/r2c-react-v3-render-compare.mjs`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_render_compare_direct_smoke`
+    - `artifacts/v3_backend_driver/cheng verify-r2c-react-v3-surface`
+    - `git diff --check`
+
+- 本轮把 `typed_expr` 这组有限域 text/count helper 从 `compiler_csg` 重复表面收回真源了：
+  - `v3/src/lang/typed_expr.cheng`
+    - 新增 `v3TypedExprAbiScalarCount / ... / v3TypedExprReturnDeferredCount` 这批一格一个 helper。
+    - 这批 helper 现在只在 truth-source 模块里存在，测试和 report 不再经 `compiler_csg` 转一手。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - 删除 `v3TypedExprAbiClassText / ValueKindText / PlaceKindText / LoweringModeText / CallKindText / SurfaceCallKindText / CallReasonText / ReturnKindText`
+    - 删除 `v3TypedExprLoweringRuleEntryText / CountArgPassKind / CountResultPassKind / CountMaterializeKind / CountCopyKind / CountImportKind`
+    - 删除 `v3TypedExprFactCountAbiClass / ... / FactCountCallTargetImportc`
+    - 删除 `v3TypedExprAbiScalarCount / ... / v3TypedExprReturnDeferredCount`
+    - CSG 内部序列化和 report 改成直接调用 `typed_expr`。
+  - `v3/src/backend/lowering_plan.cheng`
+    - lowering report 里 typed fact / lowering rule 统计全部直接问 `typed_expr`，不再借 `compiler_csg` 包装层。
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+  - `v3/src/tests/lowering_plan_smoke.cheng`
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/typed_expr_call_validate_probe.cheng`
+  - `v3/src/tests/typed_expr_cross_file_probe.cheng`
+    - smoke/probe 直接改问 `typed_expr` 文本/计数 helper；`compiler_csg` 只保留 parser-typed 桥接 helper。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes compiler_csg_smoke lowering_plan_smoke call_hir_matrix_smoke typed_expr_call_validate_probe typed_expr_cross_file_probe`
+
+- 本轮继续把 browser ABI 的重复表面往里收：
+  - `v3/src/backend/lowering_plan.cheng`
+    - 删除整组 `v3LoweringPlanBrowserAbi*` 薄壳；这层不再替 `compiler_csg + browser_abi_rule` 包第二套 rules/specs/plans/manifest/source API。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - 删除 `v3CompilerBrowserAbiBridgeManifest* / BridgePlanManifest* / BridgeArtifactManifest / BridgeSourceArtifact` 这批只做格式拼接的薄壳。
+  - `v3/src/tests/browser_abi_rule_smoke.cheng`
+  - `v3/src/tests/browser_host_probe_abi_rule_smoke.cheng`
+    - 改成直接用 `ccsg` 收集 bridge rules/specs/plans，再用 `barule` 做 source slice / manifest / source artifact 断言，不再借 `lowering_plan` 或 `compiler_csg` 的派生包装面。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes browser_content_codec_rule_schema_smoke browser_host_probe_rule_schema_smoke browser_abi_rule_smoke browser_host_probe_abi_rule_smoke browser_bridge_plan_report_smoke browser_host_probe_bridge_plan_report_smoke lowering_plan_smoke compiler_csg_smoke`
+
+- 本轮把 `system_link_exec` 里 browser bridge 这条最后一层旧壳也收掉了：
+  - `v3/src/backend/system_link_exec.cheng`
+    - 新增 `import cheng/v3/lang/browser_abi_rule as barule`
+    - `v3SystemLinkExecBrowserBridgePlans(...)` 直接返回 `barule.V3BrowserAbiBridgePlan[]`
+    - browser bridge artifact/source/report 里的 manifest/source/format/unique_key 统计全部直接问 `barule`
+    - `system_link_exec` 现在只保留“向编译器收集 bridge plan”这一个职责，不再自己挂 `compiler_csg` 的 browser ABI 文本/格式薄壳
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes browser_content_codec_rule_schema_smoke browser_host_probe_rule_schema_smoke browser_abi_rule_smoke browser_host_probe_abi_rule_smoke browser_bridge_plan_report_smoke browser_host_probe_bridge_plan_report_smoke`
+
+- 本轮把 `browser_abi_rule` 这条 browser ABI 真源从文本字段收成 enum 了：
+  - `v3/src/lang/browser_abi_rule.cheng`
+    - 新增 `input/output/error/result/out_buffer/bridge_stage/output_schema` 这些 enum。
+    - `V3BrowserAbiRule / V3BrowserAbiBridgeSpec / V3BrowserAbiBridgePlan` 不再存 `*Text: str`，改成 enum 字段。
+    - rule/bridge key、helper name、emit line、manifest/source artifact 只在边界用 `...Text(...)` helper 渲染文本。
+    - rule/spec/plan 的 count API 全改成 enum 入参，主链不再靠字符串比较有限域。
+  - `v3/src/libp2p/browser/browser_content_codec_rule_schema.cheng`
+  - `v3/src/libp2p/browser/browser_host_probe_rule_schema.cheng`
+    - schema 构造器已切到 enum 常量，不再把 `"bytes_required" / "scalar_i32_2"` 这类文本塞进 rule 真源。
+  - `v3/src/libp2p/browser/browser_content_codec_codegen.cheng`
+  - `v3/src/libp2p/browser/browser_host_probe_codegen.cheng`
+    - emit line 改成直接复用 `v3BrowserAbiBridgeEmitLine(...)`，不再各自拼第二套文本协议。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - browser ABI count wrapper 已同步切到 enum 签名。
+    - 随后又把这批 `v3BrowserAbiRuleCount* / BridgeSpecCount* / BridgePlanCount*` 薄壳直接删掉，browser ABI smoke 改成直接问 `browser_abi_rule`，不再让 `compiler_csg` 多长一层重复表面。
+  - `v3/src/tests/browser_content_codec_rule_schema_smoke.cheng`
+  - `v3/src/tests/browser_host_probe_rule_schema_smoke.cheng`
+  - `v3/src/tests/browser_abi_rule_smoke.cheng`
+  - `v3/src/tests/browser_host_probe_abi_rule_smoke.cheng`
+    - 全部改成直接比 enum，不再比 kind/stage/schema 文本。
+    - `browser_abi_rule_smoke` 额外把 `entryPath` 显式钉到 `browser_content_codec_abi.cheng`，避免误走“按外部触发裁剪”分支。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes browser_content_codec_rule_schema_smoke browser_host_probe_rule_schema_smoke browser_abi_rule_smoke browser_host_probe_abi_rule_smoke`
+
+- 本轮把 `compiler_csg` 里 `call kind / call reason` 那批“一格一个函数”的 typed count helper 收掉了：
+  - `v3/src/tooling/compiler_csg.cheng`
+    - 新增统一入口：
+      - `v3TypedExprFactCountSurfaceCallKindFromParser(...)`
+      - `v3TypedExprFactCountCallReasonFromParser(...)`
+    - 删除旧的 10 个薄壳 helper：
+      - `v3TypedExprSurfaceCallLocalCount / ExternalCount / ImportcCount / MemberCount`
+      - `v3TypedExprCallReasonUnknownQualifiedTargetCount / ShadowedQualifiedTargetCount / AmbiguousExternalTargetCount / AmbiguousQualifiedTargetCount / UnknownExternalTargetCount / UnknownCallTargetCount`
+    - `compiler_csg report` 现在直接从 parser enum 统一计数，不再靠 10 个固定格子 helper。
+  - `v3/src/backend/lowering_plan.cheng`
+    - 同步切到统一 parser-enum 计数 helper。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+  - `v3/src/tests/lowering_plan_smoke.cheng`
+    - typed fact 对表断言全部改成走统一 helper，不再各自绑那 10 个格子函数。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes call_hir_matrix_smoke compiler_csg_smoke lowering_plan_smoke parser_normalized_expr_smoke parser_path_smoke`
+
+- 本轮把 parser 里已经无调用者的字符串兼容入口继续删掉了：
+  - `v3/src/lang/parser.cheng`
+    - 删除 `v3NormalizedExprLayerCallKindCount(layer, detailKind: str)`
+    - 删除 `v3NormalizedExprLayerHasExpr(layer, kind, detail: str, lineNumber)`
+    - 删除 `v3NormalizedExprSurfaceCallKindFromText(...)`
+    - 删除 `v3NormalizedExprCallReasonFromText(...)`
+  - 现在 parser 这一段只保留 enum 真源和正向文本出口，不再保留“字符串 -> 枚举”的回退入口。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes parser_normalized_expr_smoke parser_path_smoke call_hir_matrix_smoke compiler_csg_smoke lowering_plan_smoke`
+
+- 本轮把 `call reason` 的最后一段字符串旁路也收掉了：
+  - `v3/src/lang/parser.cheng`
+    - 新增 `v3NormalizedExprCallReasonReportKey(...)`，report key 现在由 enum 直出。
+    - 旧的 `v3NormalizedExprLayerCallReasonCount(layer, reason: str)` 已删，不再保留 `reason: str -> enum` 这条回退口。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+    - `assertCallReasonReport(...)` 改成直接吃 `V3NormalizedExprCallReason enum`，不再维护本地 `callReasonReportKey(reason: str)`。
+    - 旧的 `blankCallDetails(...)` 回归已去掉；当前 parser 已经走 `detailKind + compat 现算`，继续改写不存在的旧文本字段只会制造假红。
+  - 本轮确认通过：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes parser_normalized_expr_smoke parser_path_smoke`
+  - 本轮遇到的现存阻塞：
+    - `call_hir_matrix_smoke / compiler_csg_smoke` 走 full host smoke 时会被当前工作树里的 `typed_expr` ordinary 红点拦住，现状是 `v3TypedExprComprehensionFilterIf / v3TypedExprBuildFact` 仍会在 seed 主发射期炸，不是这次 `call reason` 收口引入的新问题。
+
+- call reason 报表矩阵这轮已经补全到完整 6 格：
+  - `unknown_qualified_target`
+  - `shadowed_qualified_target`
+  - `ambiguous_external_target`
+  - `ambiguous_qualified_target`
+  - `unknown_external_target`
+  - `unknown_call_target`
+  - `v3/src/tooling/compiler_csg.cheng` 和 `v3/src/backend/lowering_plan.cheng` 现在都会稳定吐出这 6 条计数，不再少两格。
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+  - `v3/src/tests/lowering_plan_smoke.cheng`
+    - 已同步改成完整矩阵校验。
+  - 同时把 smoke 里剩下的 lowering shape 文本断言收掉了：
+    - import buffer / reg / local_address+composite_local 现在走 `ccsg` 里的 typed helper
+    - 不再在主 smoke 里自己拼 `LoweringModeText/ReturnKindText`
+  - `parser_normalized_expr_smoke` 这轮还补了两条直探针：
+    - `v3ParserResolveCallTarget(... external, "", "") -> unknown_external_target`
+    - `v3ParserResolveCallTarget(... member, "", "") -> unknown_call_target`
+  - 本轮验收：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes call_hir_matrix_smoke compiler_csg_smoke lowering_plan_smoke parser_normalized_expr_smoke parser_path_smoke object_native_link_plan_smoke`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+
+- 本轮把 `cheng_node_main` 收口成统一全栈节点了：
+  - `libp2p surface`
+  - `libp2p announce`
+  - `libp2p discover`
+  - `libp2p stream`
+  - `compiler status`
+  - `compiler surface`
+  - `compiler print-build-plan`
+  - `compiler emit-csg`
+  - `compiler emit-surface`
+  - `compiler emit-receipt`
+  - `compiler world-sync`
+  - `compiler fresh-node-selfhost`
+  - `compiler prove-equivalence`
+  - `compiler publish-check`
+  都已经并进同一个 `cheng_node_main` 二进制命令面。
+
+- 本轮硬修
+  - `v3/src/project/cheng_node_transport.cheng`
+    - `libp2p surface` 的 handler 统计改成真实宿主字段 `host.supportedProtocols.len`。
+  - `v3/src/project/cheng_node_compiler_domain.cheng`
+    - 新增节点内建 compiler domain。
+    - 不再 import 整块 `compiler_main`，改成直接调用 `system_link_exec / compiler_world_libp2p / compiler_equivalence / compiler_csg`。
+  - `v3/src/project/cheng_node_ctl_main.cheng`
+    - 正式入口新增 `compiler <subcommand>`。
+  - `v3/src/tests/cheng_node_core_smoke.cheng`
+    - 核心 smoke 补了 `compiler <subcommand>` 命令面断言。
+
+- 本轮验收
+  - fresh `cheng_node_main`
+  - `/tmp/cheng_node_main_fullstack3 libp2p surface`
+  - `/tmp/cheng_node_main_fullstack3 libp2p announce`
+  - `/tmp/cheng_node_main_fullstack3 libp2p discover`
+  - `/tmp/cheng_node_main_fullstack3 libp2p stream`
+  - `/tmp/cheng_node_main_fullstack3 compiler status`
+  - `/tmp/cheng_node_main_fullstack3 compiler surface`
+  - `/tmp/cheng_node_main_fullstack3 compiler print-build-plan`
+  - `/tmp/cheng_node_main_fullstack3 compiler world-sync`
+  - `/tmp/cheng_node_main_fullstack3 compiler fresh-node-selfhost`
+  - `/tmp/cheng_node_main_fullstack3 compiler prove-equivalence`
+  - `/tmp/cheng_node_main_fullstack3 compiler publish-check`
+  - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_core_smoke`
+  - `git diff --check`
+
+- 编译时间
+  - `cheng_node_main real 71.56s`
+
+- 当前真实边界
+  - 节点统一入口已经收口。
+  - compiler domain 的计划、world、equivalence、publish gate 已能在节点内闭环。
+  - 但 ordinary 真发射缺口仍在 compiler 自己后段；`print-build-plan` 已明确显示 `primary_object_machine_words_missing / object_plan_not_ready_for_native_link`。
+
+- 本轮把 parser `callSurfaceKind` 的最后一层文本真源收掉了：
+  - `v3/src/lang/parser.cheng`
+    - `V3NormalizedExpr.callSurfaceKind` 已从 `str` 改成 `V3NormalizedExprSurfaceCallKind enum`。
+    - `v3NormalizedExprLayerAppendCall(...)`、去重键、`exprId`、`LayerHasExpr/CallKindCount`、call resolve 流程现在都直接吃 enum，不再在 parser/typed 主链里做 `"local_call"/"external_call"` 再解码。
+    - `v3ParserFindMatchingPair(...)` 已收回 `char/char` 真签名；`Paren/Bracket/Brace` wrapper 不再拿字符串壳转一层。
+    - `v3ParserParseRangeExprAt(...)` 和 `v3ParserFindTopLevelKeyword(...)` 的索引边界判断改成显式 `leftOk/rightOk`，不再赌 `||`/`&&` 的短路顺序。
+  - `v3/src/lang/typed_expr.cheng`
+    - typed call fact 现在直接从 parser enum 映射 `surfaceCallKind`，不再先把文本解回枚举。
+  - `v3/src/tooling/compiler_csg.cheng`
+    - compat/report 输出只在边界用 `v3NormalizedExprSurfaceCallKindText(...)` 渲染文本，不再把字符串当内部真源。
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+  - `v3/src/tests/call_hir_matrix_smoke.cheng`
+  - `v3/src/tests/typed_expr_call_validate_probe.cheng`
+    - 相关断言和 probe 已切到 enum 真源或边界 helper，不再直接读写 parser 内部字符串字段。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `parser_path_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮把 Harmony mobile-shell 启动闭环补齐了：
+  - `v3/src/tooling/mobile_shell_codegen.cheng`
+    - `v3MobileShellHarmonyIndexEts(...)` 现在生成 NAPI 导入，并在 `aboutToAppear()` 里调用 `harmonyHost.setResourceManager(getContext(this).resourceManager)`。
+    - `v3MobileShellHarmonyCmake()` 现在链接 `rawfile.z`。
+    - `v3MobileShellHarmonyHostSource(...)` 现在新增 `setResourceManager(...)`、rawfile 读取、`cheng_harmony_apply_launch_args(...)`，并保证 `cheng_mobile_host_runtime_set_launch_args(...)` 发生在 `cheng_app_init()` 前。
+  - `v3/src/tests/mobile_shell_codegen_smoke.cheng`
+    - 新增 Harmony `Index.ets`、`CMakeLists.txt`、rawfile include、resource manager、launch args loader 断言。
+  - fresh 验证已通过：
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_codegen_smoke`
+    - `artifacts/v3_backend_driver/cheng mobile-shell build-probe --platform all --out-dir /tmp/v3_mobile_shell_probe_harmony_launch_read --app-id org.cheng.harmonylaunchread --app-name ChengHarmonyLaunchRead --lib-name cheng_harmony_launch_read_app`
+    - `artifacts/v3_backend_driver/cheng verify-mobile-shell-build-probe`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_build_probe_smoke`
+
+- 本轮把 CSG 侧最后那次 compat detail 整串分配也拿掉了：
+  - `v3/src/tooling/compiler_csg.cheng`
+    - 新增 `v3CompilerCsgAppendExprCompatDetail(...)`，call compat detail 改成直接流式写入 `ByteBuf`，不再先走 `parser.v3NormalizedExprCompatDetail(...)` 造整条字符串。
+    - 输出字节协议保持不变，仍然是 `kind/callee/qualifier?/target/resolved?/reason?/target_source_path?/target_importc?` 这套老顺序。
+  - `v3/src/tests/compiler_csg_smoke.cheng`
+    - 新增字节一致性回归：新流式写法产出的 `ByteBuf` 必须和旧 `parser.v3NormalizedExprCompatDetail(...) + v3CompilerCsgAppendText(...)` 完全一致。
+  - 验证已通过：
+    - `git diff --check`
+    - `compiler_csg_smoke`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `parser_path_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
+- 本轮把 parser 热路径里剩下的 call `detail` 生成也拿掉了：
+  - `v3/src/lang/parser.cheng`
+    - `v3ParserAppendCallExprsLine(...)` 和 `v3ParserAppendMemberCallExprsLine(...)` 不再在行扫描里调用 `v3ParserCallExprDetailExact(...)`。
+    - `V3NormalizedExpr.detail` 对 call 现在固定留空，compat 文本只在 `v3NormalizedExprCompatDetail(...)` 这类显式兼容出口现算。
+    - `v3NormalizedExprMakeCallId(...)` 改成直接按结构字段写 `exprId`，不再借道 `CallExprDetailExact`。
+    - `v3NormalizedExprLayerAppendCall(...)` 也已去掉死 `detail` 形参，避免后面再把旧文本塞回主链。
+  - `v3/src/tests/parser_normalized_expr_smoke.cheng`
+    - 新增正式断言：parser 真实解析出来的 call expr 以及合成 call expr 都必须 `detail == ""`。
+  - 验证已通过：
+    - `git diff --check`
+    - `parser_normalized_expr_smoke`
+    - `call_hir_matrix_smoke`
+    - `parser_path_smoke`
+    - `compiler_csg_smoke`
+    - `lowering_plan_smoke`
+    - `object_native_link_plan_smoke`
+    - `perf_memory_contract_smoke`
+
 - 本轮把 parser 里的 call identity 也从旧 `detail` 真源上拆下来了：
   - `v3/src/lang/parser.cheng`
     - call expr 去重不再拿 `detail` 当主键，改成直接比 `callSurfaceKind/resolved/reason/qualifier/callee/target/target_source/importc/prefix_style/arg_count/args_text`。
@@ -667,3 +964,275 @@
       - `actor_count=12`
     - `cheng_node_main` 这轮 fresh 编译时间：
       - `real 55.01s`
+
+- cheng_node_main chain 多级子命令这轮新确认：
+  - 旧 `chain_node_main` 原来的链/libp2p 命令面其实只有：
+    - `init/mint/transfer/balance/show-state/dump-snapshot`
+    - `daemon-serve/daemon-sync`
+    - `self-test`
+    - 外加一个 `bio-did-operator-lookup` 包装
+  - 所以“没集成完整 libp2p”这个判断对旧 `chain_node_main` 是对的；它本来就只是链快照 serve/sync 包装，不是统一节点现在的完整 `announce/discover/stream` 面。
+  - `v3/src/project/cheng_node_ctl_main.cheng` 现在已经有正式多级链命令：
+    - `chain init`
+    - `chain mint`
+    - `chain transfer`
+    - `chain balance`
+    - `chain state show`
+    - `chain snapshot dump`
+    - `chain daemon serve`
+    - `chain daemon sync`
+    - `chain self test`
+  - 同一份二进制里，旧 `chain-init` / `chain-daemon-sync` / `chain-self-test` 仍保留隐藏迁移别名；这不是正式口径，只是为了让还没改完的 gate 先不断。
+  - `cheng_node_main` fresh 编译通过：
+    - `real 60.97s`
+  - 新层级命令已实跑：
+    - `required-surface`
+    - `chain self test`
+    - `chain init/mint/transfer/balance/state show/snapshot dump`
+  - 相关 smoke 继续全绿：
+    - `cheng_node_core_smoke`
+    - `chain_node_bio_did_operator_lookup_command_smoke`
+  - `v3/src/tooling/backend_driver_main.cheng` 和 `v3/bootstrap/cheng_v3_seed.c` 的核心链命令调用点这轮也开始切到 `chain ...` 新形状。
+  - 但 `v3/src/tooling/gate_main.cheng` 里还残着一大批 `chain-...` 旧形状；下一轮整批替换，不在这轮把验收脚本面炸开。
+  - 这轮试图把 `bio-did operator-lookup` 也直接并进 `cheng_node_main`，结果立刻实锤：
+    - 只要 `cheng_node_ctl_main` 直接 import `bio_did_chain_node`
+    - ordinary fresh compile 就会报 `bio_reed_solomon` duplicate type head
+    - 所以这条不能硬塞回统一主闭包，只能先留在旧独立 smoke/工具层，后面单独拆模块。
+  - 这轮还顺手确认一个现实边界：
+    - 直接用当前 ordinary 去 fresh 编译 `v3/src/tooling/backend_driver_main.cheng`
+    - 仍然会撞一串老的 private import / primary object 缺口
+    - 这不是本轮 `chain` 子命令改坏的新问题，所以没有在这轮顺手扩成另一条重构线
+
+- mobile-shell runtime manifest / truth 资源这轮新进展：
+  - `cheng_mobile_host_runtime_set_manifest_payloads(...)` 已经从 runtime 侧孤立导出，推进到三端宿主正式消费。
+  - Android / iOS / Harmony 现在都会在 `cheng_app_init()` 前把 runtime manifest / contract payload / bundle payload 文本注入 runtime。
+  - semantic / truth 资源复制链已经统一改成 raw copy，`.rgba` 不再经过文本 helper。
+  - truth 目录复制这轮正式收口成递归 `os.ListDir(...)`，不再依赖 `WalkDirRec + RelativePath`。
+  - 重新验收通过：
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_codegen_smoke`
+    - `artifacts/v3_backend_driver/cheng verify-mobile-shell-build-probe`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_launch_args_probe`
+  - `src/runtime/mobile/cheng_mobile_exports_shared.c` 这轮继续前推了一步：
+    - runtime 不再只是“被动收到 payload 文本”
+    - 现在会一次性解析 bundle/contract
+    - 读取 `route_state`、`route_count`、`supported_count`、`semantic_nodes_count`、`item_count`、`command_count`、`viewport_item_count`、`interactive_item_count`
+    - 只有格式和关键计数成立才把 payload 标成 ready
+    - 没有 launch args 路由时，runtime 会优先采用 bundle route，而不是直接掉回 `home_default`
+    - `cheng_mobile_host_runtime_mark_stopped(...)` 的 frame reason 也已经带上 bundle/contract 就绪和计数摘要，后面做页面级对拍时可以直接看 runtime 真值
+  - `src/runtime/mobile/cheng_mobile_host_api_shared.c` 这轮也补上了 snapshot 输出：
+    - `cheng_mobile_host_runtime_state_json()` 现在会直接暴露 `runtime_bundle_ready`、`runtime_contract_ready`
+    - 也会暴露 `bundle_route_state`、route/support/semantic/layout/render/viewport/interactive 各项计数
+    - 外部 controller 不需要再手拆 stopped reason 字符串就能看见 runtime 是否真的消费了 payload
+  - 这轮新增验收：
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_codegen_smoke`
+      - `v3 mobile_shell_codegen_smoke ok`
+    - `artifacts/v3_backend_driver/cheng verify-mobile-shell-build-probe`
+      - `mobile-shell build-probe ok`
+      - `verify-mobile-shell-build-probe: ok`
+
+- `cheng_node_main` compiler `system-link-exec` 这轮已正式并入：
+  - `v3/src/project/cheng_node_compiler_domain.cheng`
+    - 新增 `compiler system-link-exec`
+    - 新增 browser bridge artifact/source/object 物化
+    - 新增 bridge handoff 到 `stage3/backend_driver/stage2/stage1`
+    - `compiler surface` 现在会回 `system_link_exec_command=1`
+    - `compiler status` 已明确成 `node_control_plane_bridge_handoff_until_selfhost_native_codegen`
+  - `v3/src/tests/cheng_node_core_smoke.cheng`
+    - 新增 `compiler system-link-exec` 帮助文本断言
+    - 新增 `system_link_exec_command=1` surface 断言
+  - 这轮真实踩到的根因也已经收掉：
+    - 一开始把 `bootstrap_contracts` import 进 compiler domain
+    - 结果把 parser/bootstrap 重依赖链拖进统一节点闭包
+    - fresh `cheng_node_main` ordinary 编译立刻红
+    - 改回纯路径探测 bridge compiler 后恢复
+  - fresh `cheng_node_main` 重新编译通过：
+    - `/usr/bin/time -p artifacts/v3_backend_driver/cheng system-link-exec --in:v3/src/project/cheng_node_main.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/cheng_node_main_fullstack4 --report-out:/tmp/cheng_node_main_fullstack4.report.txt`
+    - `real 73.62s`
+  - 新节点产物已实跑：
+    - `/tmp/cheng_node_main_fullstack4 compiler surface`
+      - `system_link_exec_command=1`
+    - `/tmp/cheng_node_main_fullstack4 compiler status`
+      - `ordinary_pipeline=node_control_plane_bridge_handoff_until_selfhost_native_codegen`
+    - `/tmp/cheng_node_main_fullstack4 compiler system-link-exec --in:v3/src/tests/ordinary_zero_exit_fixture.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/cheng_node_system_link_probe --report-out:/tmp/cheng_node_system_link_probe.report.txt`
+      - ordinary fixture 编译成功
+    - `/tmp/cheng_node_system_link_probe`
+      - 退出码 0
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_core_smoke`
+      - `v3 cheng_node_core_smoke ok`
+      - `v3 host smokes: ok`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes mobile_shell_launch_args_probe`
+      - `v3 mobile_shell_launch_args_probe ok`
+    - `git diff --check`
+    - `artifacts/v3_backend_driver/cheng verify-mobile-shell-build-probe`
+      - `mobile-shell build-probe ok`
+      - `verify-mobile-shell-build-probe: ok`
+- callReason 这轮已正式收口到单一枚举真源：
+  - `v3/src/lang/parser.cheng`
+  - `v3/src/lang/typed_expr.cheng`
+  - `v3/src/tooling/compiler_csg.cheng`
+  - `callReason` 不再在 parser/typed/csg 内部以字符串流转；文本只留给 compat detail、report、probe 输出。
+  - `parser_normalized_expr_smoke` 和 `call_hir_matrix_smoke` 的内部断言也已改成直接比 enum，不再靠 helper 文本兜一层。
+  - 本轮验收：
+    - `git diff --check`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes parser_normalized_expr_smoke call_hir_matrix_smoke compiler_csg_smoke lowering_plan_smoke parser_path_smoke object_native_link_plan_smoke`
+    - `CHENG_V3_SMOKE_COMPILER=/Users/lbcheng/cheng-lang/artifacts/v3_bootstrap/cheng.stage2 CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`
+
+- cheng_node / backend_driver 编译诊断链这轮已收口：
+  - `v3/bootstrap/cheng_v3_seed.c`
+    - `debug-report / print-symbols / print-line-map / print-asm` 统一改成 heap exec context，直接修掉 Darwin 下 `___chkstk_darwin` 栈爆。
+  - 根因不是 `cheng_node` 转发错，而是 `artifacts/v3_bootstrap/cheng.stage3` 这四个 seed 命令本体会静默崩成 `139`，所以 backend_driver 和节点侧入口一起假死。
+  - 本轮重建与验收：
+    - `artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge`
+    - `artifacts/v3_bootstrap/cheng.stage3 build-backend-driver`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes debug_tools_surface_smoke`
+      - `v3 debug_tools_surface_smoke ok`
+      - `v3 host smokes: ok`
+    - `artifacts/v3_backend_driver/cheng debug-report --root:/Users/lbcheng/cheng-lang/v3 --in:/Users/lbcheng/cheng-lang/v3/src/tests/ordinary_zero_exit_fixture.cheng --target:arm64-apple-darwin --emit:obj`
+      - 现在直接输出 `v3_debug_report_v1`
+    - `/tmp/cheng_node_main_fullstack5 compiler debug-report / print-symbols / print-line-map / print-asm / print-object / profile-report`
+      - 节点侧诊断入口全部实跑通过
+    - `/usr/bin/time -p artifacts/v3_backend_driver/cheng system-link-exec --in:v3/src/project/cheng_node_main.cheng --emit:exe --target:arm64-apple-darwin --out:/tmp/cheng_node_main_fullstack6 --report-out:/tmp/cheng_node_main_fullstack6.report.txt`
+      - `real 69.19s`
+    - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_node_core_smoke`
+      - `v3 cheng_node_core_smoke ok`
+      - `v3 host smokes: ok`
+    - `git diff --check`
+
+- `r2c` 页面级 native GUI 这轮已经把 runtime 真值字段正式接到 smoke：
+  - `r2c-react-v3-native-gui-bundle.mjs`
+    - 新增 `--tsx-ast`
+    - 显式 `--codegen-manifest` 现在会优先吃显式输入根，不再被旧 `outDir/cheng_codegen` / route catalog 残留目录劫持
+    - bundle summary / report 已经带上 `runtime_bundle_ready / runtime_contract_ready / bundle_route_state / route|semantic|layout|render|viewport|interactive` 这组真值
+  - `r2c-react-v3-native-gui-run.mjs`
+    - 正式落 `native_gui_run_report_v1.json`
+    - run report / summary 也已经带同一组 runtime 真值字段
+  - `r2c_react_v3_surface_main.cheng`
+    - `module_inventory / tailwind_manifest / asset_manifest` 三个出口已经改成 `v3path.V3WriteTextFile(...)`
+    - `static_surface` 这条 ordinary 编译缺口已经收掉
+  - `r2c_react_v3_surface_smoke.cheng`
+    - 当前正式主线验收已经改成：
+      - `codegen_surface`
+      - `static_surface`
+      - `home_default` bundle
+      - `home_default` run
+      - `content_detail` bundle
+    - 旧 `fresh clean gate` 已从这条 smoke 退出，不再借道 legacy wrapper / Python compile 支线
+  - `r2c_react_v3_status_support.cheng`
+    - `remaining_non_cheng_blockers` 口径已经和当前 wrapper status 对齐，`legacy_shell_wrapper` 明确算入 remaining blocker
+  - `v3/experimental/r2c-react-v3/r2c-react-v3`
+    - status JSON 已补齐 `optional_non_cheng_helper_count / optional_non_cheng_helpers`
+
+- 本轮实跑结果
+  - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_surface_smoke`
+    - `v3 r2c_react_v3_surface_smoke ok`
+    - `v3 host smokes: ok`
+  - `node --check v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-bundle.mjs`
+    - 通过
+  - `node --check v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-run.mjs`
+    - 通过
+  - `git diff --check`
+    - 通过
+
+- `r2c` 页面级 native GUI 验收这轮继续收口：
+  - `publish_selector` 已从重型 `r2c_react_v3_surface_smoke` 拆成独立轻量 smoke：
+    - `v3/src/tests/r2c_react_v3_publish_selector_bundle_smoke.cheng`
+  - 新 smoke 只跑：
+    - `codegen_surface`
+    - `static_surface`
+    - `publish_selector` bundle
+  - `verify-r2c-react-v3-surface` 现在已经正式代表两条 route 验收：
+    - `r2c_react_v3_surface_smoke`
+    - `r2c_react_v3_publish_selector_bundle_smoke`
+  - `compiler_runtime` 帮助文案也已切到当前 route smoke 主线，不再写旧 `fresh-clean surface`
+
+- 本轮实跑结果
+  - `artifacts/v3_backend_driver/cheng run-host-smokes compiler_runtime_smoke`
+    - `v3 compiler_runtime_smoke ok`
+    - `v3 host smokes: ok`
+  - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_surface_smoke r2c_react_v3_publish_selector_bundle_smoke`
+    - `v3 r2c_react_v3_surface_smoke ok`
+    - `v3 r2c_react_v3_publish_selector_bundle_smoke ok`
+    - `v3 host smokes: ok`
+  - `artifacts/v3_backend_driver/cheng verify-r2c-react-v3-surface`
+    - `verify-r2c-react-v3-surface: ok`
+  - `git diff --check`
+    - 通过
+
+- `r2c` 页面级 native GUI 这轮又往前推进了一步：controller fresh compile 也正式并进主线验收了
+  - `v3/src/tooling/r2c_process.cheng`
+    - `r2cProcessCapture(...)` 已切到 `std/os_host_process.ExecFileCapture(...)`
+    - 原来那条 raw capture/importc 桥已经退出主线，fresh compile 不再炸：
+      - `cheng/v3/tooling/r2c_process::r2cProcessCapture`
+      - `cheng/v3/tooling/r2c_process::r2cProcessRunProgramLogged`
+  - `v3/src/tooling/r2c_react_v3_surface_main.cheng`
+    - 剩余两个 ordinary 红点也已收掉：
+      - `r2cSurfaceWriteRsg(...)`
+      - `r2cSurfaceWriteBlockerReport(...)`
+    - 现在和前面的 manifest 写出口一样，统一走 `v3path.V3WriteTextFile(...)`
+  - `v3/src/tests/r2c_react_v3_run_native_gui_controller_smoke.cheng`
+    - 新增正式 controller smoke
+    - 先 fresh compile `v3/src/tooling/r2c_react_v3.cheng`
+    - 再显式喂给它稳定生成的：
+      - `native_gui_bundle_v1.json`
+      - `native_gui_session_v1.json`
+    - 最终正式断言：
+      - `native_gui_run_report_v1.json`
+      - `native_gui_run.summary.env`
+      - `native_gui_runtime_bundle_ready`
+      - `native_gui_runtime_contract_ready`
+      - `native_gui_runtime_bundle_route_state`
+      - `native_gui_runtime_bundle_route_count`
+      - `native_gui_runtime_bundle_supported_count`
+      - `native_gui_runtime_bundle_semantic_nodes_count`
+      - `native_gui_runtime_bundle_layout_item_count`
+      - `native_gui_runtime_bundle_render_command_count`
+      - `native_gui_runtime_contract_layout_item_count`
+      - `native_gui_runtime_contract_viewport_item_count`
+      - `native_gui_runtime_contract_interactive_item_count`
+  - `v3/src/tooling/gate_main.cheng`
+  - `v3/src/tooling/backend_driver_main.cheng`
+  - `v3/src/tooling/compiler_main.cheng`
+    - `verify-r2c-react-v3-surface` 现在已经正式代表三条 smoke：
+      - `r2c_react_v3_surface_smoke`
+      - `r2c_react_v3_publish_selector_bundle_smoke`
+      - `r2c_react_v3_run_native_gui_controller_smoke`
+
+- 本轮实跑结果
+  - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_run_native_gui_controller_smoke`
+    - `v3 r2c_react_v3_run_native_gui_controller_smoke ok`
+    - `v3 host smokes: ok`
+  - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_surface_smoke r2c_react_v3_publish_selector_bundle_smoke r2c_react_v3_run_native_gui_controller_smoke`
+    - `v3 r2c_react_v3_surface_smoke ok`
+    - `v3 r2c_react_v3_publish_selector_bundle_smoke ok`
+    - `v3 r2c_react_v3_run_native_gui_controller_smoke ok`
+    - `v3 host smokes: ok`
+  - `artifacts/v3_backend_driver/cheng verify-r2c-react-v3-surface`
+    - `verify-r2c-react-v3-surface: ok`
+
+- `r2c` 页面级对拍这轮把 native gui runtime 真值正式接进 compare 产物了
+  - `v3/src/tooling/r2c_react_v3_controller_main.cheng`
+    - `compare-truth` / `truth-compare` 新增 `--native-gui-summary`
+    - 不传时会自动尝试同目录 `native_gui_run.summary.env`
+    - 现在 `truth_compare_v1.json`、`truth_compare.summary.env`、`compare_truth_report_v1.json` 都会同步携带：
+      - `native_gui_summary_ready/path`
+      - `native_gui_route_state`
+      - `native_gui_screenshot_path`
+      - `native_gui_runtime_bundle_ready / contract_ready`
+      - `native_gui_runtime_bundle_route_count / supported_count / semantic_nodes_count / layout_item_count / render_command_count`
+      - `native_gui_runtime_contract_layout_item_count / viewport_item_count / interactive_item_count`
+      - `native_gui_native_layout_plan_item_count`
+      - `native_gui_render_plan_command_count`
+  - `v3/src/tests/r2c_react_v3_truth_compare_controller_smoke.cheng`
+    - 新增 controller compare smoke
+    - 用最小 `exec_snapshot + truth_trace + native_gui_run.summary.env` 直接钉 compare 文档和 controller report
+  - `v3/src/tooling/gate_main.cheng`
+  - `v3/src/tooling/backend_driver_main.cheng`
+  - `v3/src/tooling/compiler_main.cheng`
+    - `verify-r2c-react-v3-surface` 现在已经正式代表四条 smoke
+
+- 本轮实跑结果
+  - `artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_truth_compare_controller_smoke`
+    - `v3 r2c_react_v3_truth_compare_controller_smoke ok`
+    - `v3 host smokes: ok`
+  - `artifacts/v3_backend_driver/cheng verify-r2c-react-v3-surface`
+    - `verify-r2c-react-v3-surface: ok`

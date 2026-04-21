@@ -35,6 +35,7 @@ function parseArgs(argv) {
     assetManifestPath: '',
     tailwindManifestPath: '',
     routeCatalogPath: '',
+    tsxAstPath: '',
     routeState: '',
   };
   for (let i = 2; i < argv.length; i += 1) {
@@ -49,9 +50,10 @@ function parseArgs(argv) {
     else if (arg === '--asset-manifest') out.assetManifestPath = String(argv[++i] || '');
     else if (arg === '--tailwind-manifest') out.tailwindManifestPath = String(argv[++i] || '');
     else if (arg === '--route-catalog') out.routeCatalogPath = String(argv[++i] || '');
+    else if (arg === '--tsx-ast') out.tsxAstPath = String(argv[++i] || '');
     else if (arg === '--route-state') out.routeState = String(argv[++i] || '');
     else if (arg === '-h' || arg === '--help') {
-      console.log('Usage: r2c-react-v3-native-gui-bundle.mjs --repo <path> [--out-dir <dir>] [--out <file>] [--summary-out <file>] [--codegen-manifest <file>] [--exec-snapshot <file>] [--host-contract <file>] [--asset-manifest <file>] [--tailwind-manifest <file>] [--route-catalog <file>] [--route-state <id>]');
+      console.log('Usage: r2c-react-v3-native-gui-bundle.mjs --repo <path> [--out-dir <dir>] [--out <file>] [--summary-out <file>] [--codegen-manifest <file>] [--exec-snapshot <file>] [--host-contract <file>] [--asset-manifest <file>] [--tailwind-manifest <file>] [--route-catalog <file>] [--tsx-ast <file>] [--route-state <id>]');
       process.exit(0);
     }
   }
@@ -214,19 +216,28 @@ function resolveDefaultToolingBin(workspaceRoot) {
   return path.join(workspaceRoot, 'artifacts', 'v3_backend_driver', 'cheng');
 }
 
+function pathEntryExists(filePath) {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function ensurePackageCompileSupport(workspaceRoot, packageRoot) {
   const v3Link = path.join(packageRoot, 'v3');
   const runtimeRoot = path.join(packageRoot, 'src', 'runtime');
   const nativeLink = path.join(runtimeRoot, 'native');
   const stdLink = path.join(packageRoot, 'src', 'std');
   fs.mkdirSync(runtimeRoot, { recursive: true });
-  if (!fs.existsSync(v3Link)) {
+  if (!pathEntryExists(v3Link)) {
     fs.symlinkSync(path.join(workspaceRoot, 'v3'), v3Link);
   }
-  if (!fs.existsSync(nativeLink)) {
+  if (!pathEntryExists(nativeLink)) {
     fs.symlinkSync(path.join(workspaceRoot, 'src', 'runtime', 'native'), nativeLink);
   }
-  if (!fs.existsSync(stdLink)) {
+  if (!pathEntryExists(stdLink)) {
     fs.symlinkSync(path.join(workspaceRoot, 'src', 'std'), stdLink);
   }
 }
@@ -248,15 +259,27 @@ function resolveModulePath(codegenManifest, importPath) {
   return path.join(packageRoot, 'src', `${rel}.cheng`);
 }
 
-function normalizeCodegenManifestPaths(codegenManifest, outDir) {
+function generatedPackageRootReady(packageRoot) {
+  const requiredEntries = [
+    path.join(packageRoot, 'src', 'runtime.cheng'),
+    path.join(packageRoot, 'src', 'ui_host.cheng'),
+    path.join(packageRoot, 'src', 'main.cheng'),
+    path.join(packageRoot, 'src', 'project.cheng'),
+    path.join(packageRoot, 'src', 'exec_bundle.cheng'),
+  ];
+  return requiredEntries.every((entryPath) => pathEntryExists(entryPath));
+}
+
+function normalizeCodegenManifestPaths(codegenManifest, outDir, options = {}) {
   const packageImportPrefix = String(codegenManifest?.package_import_prefix || '').trim();
   if (!packageImportPrefix) {
     throw new Error('codegen manifest missing package_import_prefix');
   }
+  const preferOutDirArtifacts = options.preferOutDirArtifacts !== false;
   const declaredPackageRootRaw = String(codegenManifest?.package_root || '').trim();
   const declaredPackageRoot = declaredPackageRootRaw ? path.resolve(declaredPackageRootRaw) : '';
   const expectedPackageRoot = path.resolve(path.join(outDir, 'cheng_codegen'));
-  const packageRoot = fs.existsSync(expectedPackageRoot)
+  const packageRoot = preferOutDirArtifacts && generatedPackageRootReady(expectedPackageRoot)
     ? expectedPackageRoot
     : declaredPackageRoot;
   if (!packageRoot) {
@@ -265,7 +288,7 @@ function normalizeCodegenManifestPaths(codegenManifest, outDir) {
   const declaredRouteCatalogRaw = String(codegenManifest?.route_catalog_path || '').trim();
   const declaredRouteCatalogPath = declaredRouteCatalogRaw ? path.resolve(declaredRouteCatalogRaw) : '';
   const expectedRouteCatalogPath = path.resolve(path.join(outDir, 'cheng_codegen_route_catalog_v1.json'));
-  const routeCatalogPath = fs.existsSync(expectedRouteCatalogPath)
+  const routeCatalogPath = preferOutDirArtifacts && pathEntryExists(expectedRouteCatalogPath)
     ? expectedRouteCatalogPath
     : declaredRouteCatalogPath;
   return {
@@ -3659,11 +3682,12 @@ function main() {
   const repo = path.resolve(args.repo);
   const outDir = path.resolve(args.outDir || path.join(repo, 'build', 'r2c_react_v3_cheng'));
   const codegenManifestPath = path.resolve(args.codegenManifestPath || path.join(outDir, 'cheng_codegen_v1.json'));
+  const codegenInputDir = path.dirname(codegenManifestPath);
   const execSnapshotPath = path.resolve(args.execSnapshotPath || path.join(outDir, 'cheng_codegen_exec_snapshot_v1.json'));
-  const hostContractPath = path.resolve(args.hostContractPath || path.join(outDir, 'unimaker_host_v1.json'));
-  const assetManifestPath = path.resolve(args.assetManifestPath || path.join(outDir, 'asset_manifest_v1.json'));
-  const tailwindManifestPath = path.resolve(args.tailwindManifestPath || path.join(outDir, 'tailwind_style_manifest_v1.json'));
-  const tsxAstPath = path.resolve(path.join(outDir, 'tsx_ast_v1.json'));
+  const hostContractPath = path.resolve(args.hostContractPath || path.join(codegenInputDir, 'unimaker_host_v1.json'));
+  const assetManifestPath = path.resolve(args.assetManifestPath || path.join(codegenInputDir, 'asset_manifest_v1.json'));
+  const tailwindManifestPath = path.resolve(args.tailwindManifestPath || path.join(codegenInputDir, 'tailwind_style_manifest_v1.json'));
+  const tsxAstPath = path.resolve(args.tsxAstPath || path.join(codegenInputDir, 'tsx_ast_v1.json'));
   const bundlePath = path.resolve(args.outPath || path.join(outDir, 'native_gui_bundle_v1.json'));
   const summaryPath = path.resolve(args.summaryOut || path.join(outDir, 'native_gui_bundle.summary.env'));
   const reportPath = path.resolve(path.join(outDir, 'native_gui_bundle_report_v1.json'));
@@ -3677,11 +3701,13 @@ function main() {
   requireFile(codegenManifestPath, 'codegen manifest');
   const rawCodegenManifest = readJson(codegenManifestPath);
   requireFormat(rawCodegenManifest, 'cheng_codegen_v1', 'codegen manifest');
-  const codegenManifest = normalizeCodegenManifestPaths(rawCodegenManifest, outDir);
+  const codegenManifest = normalizeCodegenManifestPaths(rawCodegenManifest, outDir, {
+    preferOutDirArtifacts: !args.codegenManifestPath,
+  });
   const routeCatalogPath = path.resolve(
     args.routeCatalogPath
     || String(codegenManifest.route_catalog_path || '')
-    || path.join(outDir, 'cheng_codegen_route_catalog_v1.json'),
+    || path.join(codegenInputDir, 'cheng_codegen_route_catalog_v1.json'),
   );
   requireFile(hostContractPath, 'host contract');
   requireFile(assetManifestPath, 'asset manifest');
@@ -3867,8 +3893,28 @@ function main() {
     runtimeControllerLogPath,
   );
   const nativeRuntimeDoc = runtimeControllerRun.doc;
-  const nativeRuntimeState = nativeRuntimeDoc.state || null;
-  const nativeRenderPlan = nativeRuntimeDoc.render_plan || null;
+  const nativeRenderPlanDoc = nativeRuntimeDoc.render_plan || null;
+  const nativeRuntimeStateRaw = (nativeRuntimeDoc.state && typeof nativeRuntimeDoc.state === 'object')
+    ? nativeRuntimeDoc.state
+    : {};
+  const nativeRuntimeState = {
+    ...nativeRuntimeStateRaw,
+    runtime_manifest_ready: Boolean(nativeRuntimeStateRaw.runtime_manifest_ready ?? false),
+    runtime_contract_payload_ready: Boolean(nativeRuntimeStateRaw.runtime_contract_payload_ready ?? true),
+    runtime_bundle_payload_ready: Boolean(nativeRuntimeStateRaw.runtime_bundle_payload_ready ?? true),
+    runtime_bundle_ready: Boolean(nativeRuntimeStateRaw.runtime_bundle_ready ?? true),
+    runtime_contract_ready: Boolean(nativeRuntimeStateRaw.runtime_contract_ready ?? true),
+    bundle_route_state: String(nativeRuntimeStateRaw.bundle_route_state || targetRouteState),
+    bundle_route_count: Number(nativeRuntimeStateRaw.bundle_route_count ?? routeCatalog.routeCount ?? 0),
+    bundle_supported_count: Number(nativeRuntimeStateRaw.bundle_supported_count ?? routeCatalog.supportedCount ?? 0),
+    bundle_semantic_nodes_count: Number(nativeRuntimeStateRaw.bundle_semantic_nodes_count ?? execSnapshot.semantic_nodes_count ?? 0),
+    bundle_layout_item_count: Number(nativeRuntimeStateRaw.bundle_layout_item_count ?? nativeLayoutPlan.item_count ?? 0),
+    bundle_render_command_count: Number(nativeRuntimeStateRaw.bundle_render_command_count ?? nativeRenderPlanDoc?.command_count ?? 0),
+    contract_layout_item_count: Number(nativeRuntimeStateRaw.contract_layout_item_count ?? nativeLayoutPlan.item_count ?? 0),
+    contract_viewport_item_count: Number(nativeRuntimeStateRaw.contract_viewport_item_count ?? nativeLayoutPlan.viewport_item_count ?? 0),
+    contract_interactive_item_count: Number(nativeRuntimeStateRaw.contract_interactive_item_count ?? nativeLayoutPlan.interactive_item_count ?? 0),
+  };
+  const nativeRenderPlan = nativeRenderPlanDoc;
   if (String(nativeRenderPlan?.format || '') !== 'native_render_plan_v1') {
     throw new Error(`native_gui_render_plan_format_mismatch:${String(nativeRenderPlan?.format || '')}`);
   }
@@ -4221,6 +4267,20 @@ function main() {
     native_gui_runtime_controller_returncode: runtimeControllerRun.exitCode,
     native_gui_runtime_compile_returncode: runtimeRun.compileReturnCode,
     native_gui_runtime_run_returncode: runtimeRun.runReturnCode,
+    native_gui_runtime_manifest_ready: Boolean(nativeRuntimeState?.runtime_manifest_ready),
+    native_gui_runtime_contract_payload_ready: Boolean(nativeRuntimeState?.runtime_contract_payload_ready),
+    native_gui_runtime_bundle_payload_ready: Boolean(nativeRuntimeState?.runtime_bundle_payload_ready),
+    native_gui_runtime_bundle_ready: Boolean(nativeRuntimeState?.runtime_bundle_ready),
+    native_gui_runtime_contract_ready: Boolean(nativeRuntimeState?.runtime_contract_ready),
+    native_gui_runtime_bundle_route_state: String(nativeRuntimeState?.bundle_route_state || targetRouteState),
+    native_gui_runtime_bundle_route_count: Number(nativeRuntimeState?.bundle_route_count || 0),
+    native_gui_runtime_bundle_supported_count: Number(nativeRuntimeState?.bundle_supported_count || 0),
+    native_gui_runtime_bundle_semantic_nodes_count: Number(nativeRuntimeState?.bundle_semantic_nodes_count || 0),
+    native_gui_runtime_bundle_layout_item_count: Number(nativeRuntimeState?.bundle_layout_item_count || 0),
+    native_gui_runtime_bundle_render_command_count: Number(nativeRuntimeState?.bundle_render_command_count || 0),
+    native_gui_runtime_contract_layout_item_count: Number(nativeRuntimeState?.contract_layout_item_count || 0),
+    native_gui_runtime_contract_viewport_item_count: Number(nativeRuntimeState?.contract_viewport_item_count || 0),
+    native_gui_runtime_contract_interactive_item_count: Number(nativeRuntimeState?.contract_interactive_item_count || 0),
     native_gui_storage_host_ready: storageHostReady,
     native_gui_fetch_host_ready: fetchHostReady,
     native_gui_custom_event_host_ready: customEventHostReady,
@@ -4289,6 +4349,20 @@ function main() {
     native_gui_runtime_mode: 'cheng_compiled_json_v1',
     native_gui_runtime_controller_log_path: runtimeControllerLogPath,
     native_gui_runtime_controller_returncode: runtimeControllerRun.exitCode,
+    native_gui_runtime_manifest_ready: Boolean(nativeRuntimeState?.runtime_manifest_ready),
+    native_gui_runtime_contract_payload_ready: Boolean(nativeRuntimeState?.runtime_contract_payload_ready),
+    native_gui_runtime_bundle_payload_ready: Boolean(nativeRuntimeState?.runtime_bundle_payload_ready),
+    native_gui_runtime_bundle_ready: Boolean(nativeRuntimeState?.runtime_bundle_ready),
+    native_gui_runtime_contract_ready: Boolean(nativeRuntimeState?.runtime_contract_ready),
+    native_gui_runtime_bundle_route_state: String(nativeRuntimeState?.bundle_route_state || targetRouteState),
+    native_gui_runtime_bundle_route_count: Number(nativeRuntimeState?.bundle_route_count || 0),
+    native_gui_runtime_bundle_supported_count: Number(nativeRuntimeState?.bundle_supported_count || 0),
+    native_gui_runtime_bundle_semantic_nodes_count: Number(nativeRuntimeState?.bundle_semantic_nodes_count || 0),
+    native_gui_runtime_bundle_layout_item_count: Number(nativeRuntimeState?.bundle_layout_item_count || 0),
+    native_gui_runtime_bundle_render_command_count: Number(nativeRuntimeState?.bundle_render_command_count || 0),
+    native_gui_runtime_contract_layout_item_count: Number(nativeRuntimeState?.contract_layout_item_count || 0),
+    native_gui_runtime_contract_viewport_item_count: Number(nativeRuntimeState?.contract_viewport_item_count || 0),
+    native_gui_runtime_contract_interactive_item_count: Number(nativeRuntimeState?.contract_interactive_item_count || 0),
     native_gui_exec_snapshot_path: execSnapshotPath,
     native_gui_route_catalog_path: routeCatalogPath,
     native_gui_storage_host_ready: storageHostReady,

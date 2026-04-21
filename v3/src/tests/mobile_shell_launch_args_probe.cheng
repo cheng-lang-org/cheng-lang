@@ -1,0 +1,105 @@
+import std/monotimes
+import std/os
+import std/strings
+import cheng/v3/tooling/mobile_shell_codegen as mshell
+import cheng/v3/tooling/path as v3path
+
+fn probeQuote(text: str): str =
+    return "\"" + text + "\""
+
+fn probeLaunchArgsKv(routeState: str): str =
+    var text: str
+    text = text + "gate_mode=android-semantic-visual-1to1"
+    text = text + ";truth_mode=strict"
+    text = text + ";route_state=" + routeState
+    text = text + ";route_lock=1"
+    text = text + ";runtime_mode=r2c_native_gui_v1"
+    text = text + ";runtime_manifest=runtime/mobile_shell_runtime_contract_v1.json"
+    text = text + ";runtime_contract_payload=runtime/mobile_shell_runtime_contract_payload.json"
+    text = text + ";runtime_bundle_payload=runtime/mobile_shell_runtime_bundle_payload.json"
+    return text
+
+fn probeLaunchArgsJson(routeState: str): str =
+    var text: str = "{\n"
+    text = text + "  \"format\": \"mobile_shell_launch_args_v1\",\n"
+    text = text + "  \"gate_mode\": \"android-semantic-visual-1to1\",\n"
+    text = text + "  \"truth_mode\": \"strict\",\n"
+    text = text + "  \"route_state\": \"" + routeState + "\",\n"
+    text = text + "  \"route_lock\": true,\n"
+    text = text + "  \"runtime_mode\": \"r2c_native_gui_v1\",\n"
+    text = text + "  \"runtime_manifest\": \"runtime/mobile_shell_runtime_contract_v1.json\",\n"
+    text = text + "  \"runtime_contract_payload\": \"runtime/mobile_shell_runtime_contract_payload.json\",\n"
+    text = text + "  \"runtime_bundle_payload\": \"runtime/mobile_shell_runtime_bundle_payload.json\"\n"
+    text = text + "}\n"
+    return text
+
+fn probeAndroidAugmentedHostSource(opts: var mshell.V3MobileShellOptions,
+                                   kv: str,
+                                   json: str): str =
+    var text: str = mshell.v3MobileShellAndroidHostSource(opts)
+    text = text + "\n/* probe launch args begin */\n"
+    text = text + "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"
+    text = text + "static const char* kChengLaunchArgsKv = " + probeQuote(kv) + ";\n"
+    text = text + "static const char* kChengLaunchArgsJson = " + probeQuote(json) + ";\n"
+    text = text + "/* probe launch args end */\n"
+    return text
+
+fn probeIosAugmentedHostSource(opts: var mshell.V3MobileShellOptions,
+                               kv: str,
+                               json: str): str =
+    var text: str = mshell.v3MobileShellIosViewControllerImpl(opts)
+    text = text + "\n/* probe launch args begin */\n"
+    text = text + "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"
+    text = text + "static const char* kChengLaunchArgsKv = " + probeQuote(kv) + ";\n"
+    text = text + "static const char* kChengLaunchArgsJson = " + probeQuote(json) + ";\n"
+    text = text + "/* probe launch args end */\n"
+    return text
+
+fn probeHarmonyAugmentedHostSource(opts: var mshell.V3MobileShellOptions,
+                                   kv: str,
+                                   json: str): str =
+    var text: str = mshell.v3MobileShellHarmonyHostSource(opts)
+    text = text + "\n/* probe launch args begin */\n"
+    text = text + "typedef void (*cheng_mobile_host_runtime_set_launch_args_fn)(const char*, const char*);\n"
+    text = text + "static const char* kChengLaunchArgsKv = " + probeQuote(kv) + ";\n"
+    text = text + "static const char* kChengLaunchArgsJson = " + probeQuote(json) + ";\n"
+    text = text + "/* probe launch args end */\n"
+    return text
+
+fn writeProbeFile(path: str, text: str) =
+    os.WriteFile(path, text)
+
+fn main(): int32 =
+    let root: str = os.GetCurrentDir()
+    let stamp: str = int64ToStr(monotimes.MonoTimeNs(monotimes.GetMonoTime()))
+    let outDir: str = "/tmp/v3_mobile_shell_launch_args_probe_" + stamp
+    assert(v3path.V3MkdirP(root, outDir), "mobile shell launch args probe: mkdir")
+    var opts: mshell.V3MobileShellOptions = mshell.v3MobileShellDefaultOptions(root)
+    opts.outDir = outDir
+    opts.appId = "org.cheng.launchargs.probe"
+    opts.appName = "ChengLaunchArgsProbe"
+    opts.libName = "cheng_launch_args_probe_app"
+    opts.runtimeMode = "r2c_native_gui_v1"
+    opts.routeState = "home_default"
+    let kv: str = probeLaunchArgsKv(opts.routeState)
+    let json: str = probeLaunchArgsJson(opts.routeState)
+    assert(strings.StrContains(kv, "route_state=home_default"),
+           "mobile shell launch args probe: kv route")
+    assert(strings.StrContains(json, "\"route_state\": \"home_default\""),
+           "mobile shell launch args probe: json route")
+    let androidText: str = probeAndroidAugmentedHostSource(opts, kv, json)
+    let iosText: str = probeIosAugmentedHostSource(opts, kv, json)
+    let harmonyText: str = probeHarmonyAugmentedHostSource(opts, kv, json)
+    assert(strings.StrContains(androidText, "kChengLaunchArgsKv"),
+           "mobile shell launch args probe: android launch args symbol")
+    assert(strings.StrContains(iosText, "kChengLaunchArgsJson"),
+           "mobile shell launch args probe: ios launch args symbol")
+    assert(strings.StrContains(harmonyText, "route_state=home_default"),
+           "mobile shell launch args probe: harmony route text")
+    writeProbeFile(os.JoinPath(outDir, "launch_args.kv.txt"), kv)
+    writeProbeFile(os.JoinPath(outDir, "launch_args.json"), json)
+    writeProbeFile(os.JoinPath(outDir, "android_host_with_launch_args.c"), androidText)
+    writeProbeFile(os.JoinPath(outDir, "ios_host_with_launch_args.m"), iosText)
+    writeProbeFile(os.JoinPath(outDir, "harmony_host_with_launch_args.cpp"), harmonyText)
+    echo("v3 mobile_shell_launch_args_probe ok")
+    return 0

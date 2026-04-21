@@ -6,6 +6,7 @@ import std/strings as strings
 import std/strutils as strutil
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/project/cheng_node as node
+import cheng/v3/project/cheng_node_compiler_domain as compiler_domain
 import cheng/v3/project/cheng_node_identity as identity
 import cheng/v3/project/cheng_node_index as cindex
 import cheng/v3/project/cheng_node_object as cobject
@@ -65,6 +66,17 @@ fn v3ChengNodeCtlRequireInt64Flag(flagName: str): Result[int64] =
 fn v3ChengNodeCtlFlagOrDefault(flagName: str,
                                defaultValue: str): str =
     return cmdline.readFlagOrDefault(flagName, defaultValue)
+
+fn v3ChengNodeCtlWordAt(index: int32): str =
+    let count = cmdline.ParamCount()
+    if count < index:
+        return ""
+    let text = cmdline.ParamStr(index)
+    if len(text) <= 0:
+        return ""
+    if text[0] == '-':
+        return ""
+    return text
 
 fn v3ChengNodeCtlCsvValues(text: str): str[] =
     let raw = strutil.Strip(text)
@@ -162,7 +174,7 @@ fn v3ChengNodeCtlChainBytesFromHex(text: str): Result[Bytes] =
         return Err[Bytes]("cheng_node: invalid chain state hex length")
     var out: Bytes
     out = bytesAlloc(len(text) / 2)
-    var i: int32 = 0
+    var i: int32
     while i < len(text):
         let hi = v3ChengNodeCtlChainHexValue(text[i])
         let lo = v3ChengNodeCtlChainHexValue(text[i + 1])
@@ -202,9 +214,9 @@ fn v3ChengNodeCtlChainExtractStateText(text: str,
                                        outPayloadHex: var str): bool =
     outNodeId = ""
     outPayloadHex = ""
-    var phase: int32 = 0
-    var start: int32 = 0
-    var i: int32 = 0
+    var phase: int32
+    var start: int32
+    var i: int32
     while i < len(text):
         if text[i] != '\n':
             i = i + 1
@@ -568,6 +580,30 @@ fn v3ChengNodeCtlCompilerTargetReceiptText(receiptKey: str,
     out = out + "bootstrap_stage=" + receipt.bootstrapStage
     return out
 
+fn v3ChengNodeCtlChainUsageText(): str =
+    var out = ""
+    out = out + "chain commands:\n"
+    out = out + "  chain init --state:<file> --node-id:<id> --address-seed:<seed>\n"
+    out = out + "  chain mint --state:<file> --asset:<id> --account:<id> --amount:<n>\n"
+    out = out + "  chain transfer --state:<file> --asset:<id> --from:<id> --to:<id> --amount:<n>\n"
+    out = out + "  chain balance --state:<file> --asset:<id> --account:<id>\n"
+    out = out + "  chain state show --state:<file>\n"
+    out = out + "  chain snapshot dump --state:<file>\n"
+    out = out + "  chain daemon serve --state:<file> [--host:<ip>] [--port:<n>] [--ready-path:<file>]\n"
+    out = out + "  chain daemon sync --state:<file> --node-id:<id> --address-seed:<seed> --host:<ip> --port:<n>\n"
+    out = out + "  chain self test"
+    return out
+
+fn v3ChengNodeCtlLibp2pUsageText(): str =
+    var out = ""
+    out = out + "libp2p commands:\n"
+    out = out + "  libp2p surface --root:<seed> --state:<path>\n"
+    out = out + "  libp2p head --root:<seed> --state:<path>\n"
+    out = out + "  libp2p announce --root:<seed> --state:<path> --transport:<tcp|quic|webrtc> --host:<text> --port:<int> [--topic:<text>] [--capability:<text>]\n"
+    out = out + "  libp2p discover --root:<seed> --state:<path> [--peer:<id>|--topic:<text>|--capability:<text>] [--remote-state:<path>] [--remote-root:<seed>] [--with-delta]\n"
+    out = out + "  libp2p stream --root:<seed> --state:<path> --remote-state:<path> [--remote-root:<seed>] --protocol:<identify|sync|store|content|proxy_tcp>"
+    return out
+
 fn v3ChengNodeCtlUsageText(): str =
     var out = ""
     out = out + "usage: cheng_node_main <command> [flags]\n"
@@ -576,6 +612,11 @@ fn v3ChengNodeCtlUsageText(): str =
     out = out + "  identity --root:<seed>\n"
     out = out + "  bootstrap --root:<seed>\n"
     out = out + "  required-surface\n"
+    out = out + "  libp2p surface --root:<seed> --state:<path>\n"
+    out = out + "  libp2p head --root:<seed> --state:<path>\n"
+    out = out + "  libp2p announce --root:<seed> --state:<path> --transport:<tcp|quic|webrtc> --host:<text> --port:<int> [--topic:<text>] [--capability:<text>]\n"
+    out = out + "  libp2p discover --root:<seed> --state:<path> [--peer:<id>|--topic:<text>|--capability:<text>] [--remote-state:<path>] [--remote-root:<seed>] [--with-delta]\n"
+    out = out + "  libp2p stream --root:<seed> --state:<path> --remote-state:<path> [--remote-root:<seed>] --protocol:<identify|sync|store|content|proxy_tcp>\n"
     out = out + "  head --root:<seed> --state:<path>\n"
     out = out + "  announce --root:<seed> --state:<path> --transport:<tcp|quic|webrtc> --host:<text> --port:<int> [--topic:<text>] [--capability:<text>]\n"
     out = out + "  discover --root:<seed> --state:<path> [--peer:<id>|--topic:<text>|--capability:<text>] [--remote-state:<path>] [--remote-root:<seed>] [--with-delta]\n"
@@ -613,17 +654,11 @@ fn v3ChengNodeCtlUsageText(): str =
     out = out + "  verify-compiler-package --root:<seed> --state:<path> --report:<path>\n"
     out = out + "  verify-compiler-world --root:<seed> --state:<path> --report:<path>\n"
     out = out + "  verify-compiler-receipt --root:<seed> --state:<path> --report:<path> --receipt-key:<text>\n"
+    out = out + "  compiler <subcommand> [args]\n"
     out = out + "\n"
-    out = out + "chain compatibility:\n"
-    out = out + "  chain-init --state:<file> --node-id:<id> --address-seed:<seed>\n"
-    out = out + "  chain-mint --state:<file> --asset:<id> --account:<id> --amount:<n>\n"
-    out = out + "  chain-transfer --state:<file> --asset:<id> --from:<id> --to:<id> --amount:<n>\n"
-    out = out + "  chain-balance --state:<file> --asset:<id> --account:<id>\n"
-    out = out + "  chain-show-state --state:<file>\n"
-    out = out + "  chain-dump-snapshot --state:<file>\n"
-    out = out + "  chain-daemon-serve --state:<file> [--host:<ip>] [--port:<n>] [--ready-path:<file>]\n"
-    out = out + "  chain-daemon-sync --state:<file> --node-id:<id> --address-seed:<seed> --host:<ip> --port:<n>\n"
-    out = out + "  chain-self-test\n"
+    out = out + "\n"
+    out = out + v3ChengNodeCtlLibp2pUsageText() + "\n\n"
+    out = out + v3ChengNodeCtlChainUsageText()
     return out
 
 fn v3ChengNodeCtlIdentityText(rootSeed: str): Result[str] =
@@ -666,6 +701,20 @@ fn v3ChengNodeCtlHeadText(rootSeed: str,
     var out = ""
     out = out + "state_path=" + v3ChengNodeCtlAbsolutePath(statePath) + "\n"
     out = out + node.V3ChengNodeHeadManifestText(core)
+    return Ok[str](out)
+
+fn v3ChengNodeCtlLibp2pSurfaceText(rootSeed: str,
+                                   statePath: str): Result[str] =
+    var core: node.V3ChengNode
+    let loadRes = state.V3ChengNodeLoadOrInitInto(core, statePath, rootSeed)
+    if IsErr(loadRes):
+        return Err[str](Error(loadRes))
+    let writeRes = state.V3ChengNodeWriteState(statePath, core)
+    if IsErr(writeRes):
+        return Err[str](Error(writeRes))
+    var out = ""
+    out = out + "state_path=" + Value(writeRes) + "\n"
+    out = out + node.V3ChengNodeLibp2pSurfaceText(core)
     return Ok[str](out)
 
 fn v3ChengNodeCtlQueryText(rootSeed: str,
@@ -1790,6 +1839,78 @@ fn v3ChengNodeCtlPrintUsageAndReturn(code: int32): int32 =
     echo(v3ChengNodeCtlUsageText())
     return code
 
+fn v3ChengNodeCtlChainPrintUsageAndReturn(code: int32): int32 =
+    echo(v3ChengNodeCtlChainUsageText())
+    return code
+
+fn v3ChengNodeCtlLibp2pPrintUsageAndReturn(code: int32): int32 =
+    echo(v3ChengNodeCtlLibp2pUsageText())
+    return code
+
+fn v3ChengNodeCtlPrintResultAndReturn(textRes: Result[str]): int32 =
+    if IsErr(textRes):
+        echo(Error(textRes))
+        return 1
+    echo(Value(textRes))
+    return 0
+
+fn v3ChengNodeCtlChainCommandAt(commandIndex: int32): int32 =
+    let subcmd = v3ChengNodeCtlWordAt(commandIndex)
+    if subcmd == "" || subcmd == "--help" || subcmd == "-h" || subcmd == "help":
+        return v3ChengNodeCtlChainPrintUsageAndReturn(0)
+    if subcmd == "init":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainInitText())
+    if subcmd == "mint":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainMintText())
+    if subcmd == "transfer":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainTransferText())
+    if subcmd == "balance":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainBalanceText())
+    if subcmd == "state":
+        let stateSubcmd = v3ChengNodeCtlWordAt(commandIndex + 1)
+        if stateSubcmd == "show":
+            return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainShowStateText())
+        return v3ChengNodeCtlChainPrintUsageAndReturn(2)
+    if subcmd == "snapshot":
+        let snapshotSubcmd = v3ChengNodeCtlWordAt(commandIndex + 1)
+        if snapshotSubcmd == "dump":
+            return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainDumpSnapshotText())
+        return v3ChengNodeCtlChainPrintUsageAndReturn(2)
+    if subcmd == "daemon":
+        let daemonSubcmd = v3ChengNodeCtlWordAt(commandIndex + 1)
+        if daemonSubcmd == "serve":
+            return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainServeText())
+        if daemonSubcmd == "sync":
+            return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainSyncText())
+        return v3ChengNodeCtlChainPrintUsageAndReturn(2)
+    if subcmd == "self":
+        let selfSubcmd = v3ChengNodeCtlWordAt(commandIndex + 1)
+        if selfSubcmd == "test":
+            return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlChainSelfTestText())
+        return v3ChengNodeCtlChainPrintUsageAndReturn(2)
+    return v3ChengNodeCtlChainPrintUsageAndReturn(2)
+
+fn v3ChengNodeCtlLibp2pCommandAt(commandIndex: int32): int32 =
+    let subcmd = v3ChengNodeCtlWordAt(commandIndex)
+    if subcmd == "" || subcmd == "--help" || subcmd == "-h" || subcmd == "help":
+        return v3ChengNodeCtlLibp2pPrintUsageAndReturn(0)
+    if subcmd == "surface":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlLibp2pSurfaceText(v3ChengNodeCtlRootSeed(),
+                                                                                   v3ChengNodeCtlStatePath()))
+    if subcmd == "head":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlHeadText(v3ChengNodeCtlRootSeed(),
+                                                                          v3ChengNodeCtlStatePath()))
+    if subcmd == "announce":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlAnnounceText(v3ChengNodeCtlRootSeed(),
+                                                                              v3ChengNodeCtlStatePath()))
+    if subcmd == "discover":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlDiscoverText(v3ChengNodeCtlRootSeed(),
+                                                                              v3ChengNodeCtlStatePath()))
+    if subcmd == "stream":
+        return v3ChengNodeCtlPrintResultAndReturn(v3ChengNodeCtlStreamText(v3ChengNodeCtlRootSeed(),
+                                                                            v3ChengNodeCtlStatePath()))
+    return v3ChengNodeCtlLibp2pPrintUsageAndReturn(2)
+
 fn V3ChengNodeCommandAt(commandIndex: int32): int32 =
     let count = cmdline.ParamCount()
     if count < commandIndex:
@@ -1818,6 +1939,12 @@ fn V3ChengNodeCommandAt(commandIndex: int32): int32 =
             return 1
         echo(Value(textRes))
         return 0
+    if subcmd == "compiler":
+        return compiler_domain.V3ChengNodeCompilerCommandAt(commandIndex + 1)
+    if subcmd == "libp2p":
+        return v3ChengNodeCtlLibp2pCommandAt(commandIndex + 1)
+    if subcmd == "chain":
+        return v3ChengNodeCtlChainCommandAt(commandIndex + 1)
     if subcmd == "chain-init":
         let textRes = v3ChengNodeCtlChainInitText()
         if IsErr(textRes):

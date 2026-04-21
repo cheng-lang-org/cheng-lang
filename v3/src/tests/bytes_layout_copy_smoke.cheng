@@ -1,0 +1,83 @@
+import std/system
+import std/rawbytes
+import cheng/v3/std/bytes_layout as layout
+
+fn clearBytes(data: var Bytes) =
+    data = emptyBytes()
+
+fn clearByteBuf(buf: var layout.ByteBuf) =
+    buf.storage = emptyBytes()
+    buf.len = 0
+    buf.cap = 0
+
+fn smokeByteBufToBytesCopy() =
+    var buf = layout.byteBufInit(16)
+    layout.byteBufAppendByte(buf, int32('a'))
+    layout.byteBufAppendByte(buf, int32('b'))
+    layout.byteBufAppendByte(buf, int32('c'))
+    layout.byteBufAppendByte(buf, int32('d'))
+    let storagePtr = buf.storage.data
+    assert(memRefCount(storagePtr) == 1, "v3 bytes layout copy: bytebuf storage rc before copy")
+
+    var copied = layout.byteBufToBytes(buf)
+    let copyPtr = copied.data
+    assert(bytesLen(copied) == 4, "v3 bytes layout copy: bytebuf copy len")
+    assert(memRefCount(storagePtr) == 1, "v3 bytes layout copy: bytebuf copy does not retain storage")
+    assert(memRefCount(copyPtr) == 1, "v3 bytes layout copy: bytebuf copy owns payload")
+
+    bytesSet(buf.storage, 0, int32('z'))
+    bytesSet(buf.storage, 1, int32('y'))
+    bytesSet(buf.storage, 2, int32('x'))
+    bytesSet(buf.storage, 3, int32('w'))
+    clearByteBuf(buf)
+    assert(memRefCount(storagePtr) == 0, "v3 bytes layout copy: bytebuf storage released")
+    assert(bytesGet(copied, 0) == int32('a'), "v3 bytes layout copy: bytebuf copy byte 0")
+    assert(bytesGet(copied, 1) == int32('b'), "v3 bytes layout copy: bytebuf copy byte 1")
+    assert(bytesGet(copied, 2) == int32('c'), "v3 bytes layout copy: bytebuf copy byte 2")
+    assert(bytesGet(copied, 3) == int32('d'), "v3 bytes layout copy: bytebuf copy byte 3")
+
+    clearBytes(copied)
+    assert(memRefCount(copyPtr) == 0, "v3 bytes layout copy: bytebuf copy released")
+
+fn smokeByteSpanToBytesCopy() =
+    var source = bytesAlloc(4)
+    bytesSet(source, 0, int32('a'))
+    bytesSet(source, 1, int32('b'))
+    bytesSet(source, 2, int32('c'))
+    bytesSet(source, 3, int32('d'))
+    let sourcePtr = source.data
+    assert(memRefCount(sourcePtr) == 1, "v3 bytes layout copy: source rc before span copy")
+
+    let span = layout.byteSpanFromBytes(bytesSliceView(source, 1, 2))
+    var copied = layout.byteSpanToBytes(span)
+    let copyPtr = copied.data
+    assert(bytesLen(copied) == 2, "v3 bytes layout copy: span copy len")
+    assert(memRefCount(sourcePtr) == 1, "v3 bytes layout copy: span copy does not retain source")
+    assert(memRefCount(copyPtr) == 1, "v3 bytes layout copy: span copy owns payload")
+
+    bytesSet(source, 1, int32('y'))
+    bytesSet(source, 2, int32('x'))
+    clearBytes(source)
+    assert(memRefCount(sourcePtr) == 0, "v3 bytes layout copy: source released")
+    assert(bytesGet(copied, 0) == int32('b'), "v3 bytes layout copy: span copy byte 0")
+    assert(bytesGet(copied, 1) == int32('c'), "v3 bytes layout copy: span copy byte 1")
+
+    clearBytes(copied)
+    assert(memRefCount(copyPtr) == 0, "v3 bytes layout copy: span copy released")
+
+fn main(): int32 =
+    let allocBefore: int64 = memAllocCount()
+    let freeBefore: int64 = memFreeCount()
+    let liveBefore: int64 = memLiveCount()
+
+    smokeByteBufToBytesCopy()
+    smokeByteSpanToBytesCopy()
+
+    let allocDelta: int64 = memAllocCount() - allocBefore
+    let freeDelta: int64 = memFreeCount() - freeBefore
+    let liveDelta: int64 = memLiveCount() - liveBefore
+    assert(allocDelta == freeDelta, "v3 bytes layout copy: alloc/free balanced")
+    assert(liveDelta == 0, "v3 bytes layout copy: live delta zero")
+
+    echo("v3 bytes_layout_copy_smoke ok")
+    return 0

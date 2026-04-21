@@ -1,0 +1,211 @@
+import std/os
+import std/strutils as strutil
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/r2c_react_v3_surface_main as r2csurface
+
+fn containsText(text: str, needle: str): bool =
+    return strutil.Contains(text, needle)
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_r2c_run_native_gui_controller_smoke")
+    assert(v3path.V3MkdirP(root, outDir), "v3 r2c run-native-gui controller smoke: mkdir")
+    let driver = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/cheng")
+    let stage3 = v3path.V3PathAbsolute(root, "artifacts/v3_bootstrap/cheng.stage3")
+    let bundleScript = v3path.V3PathAbsolute(root, "v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-bundle.mjs")
+    assert(v3path.V3FileExistsNonEmpty(root, driver), "v3 r2c run-native-gui controller smoke: backend_driver exists")
+    assert(v3path.V3FileExistsNonEmpty(root, stage3), "v3 r2c run-native-gui controller smoke: stage3 exists")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleScript), "v3 r2c run-native-gui controller smoke: bundle script exists")
+    let packageRoot = v3path.V3PathAbsolute(root, "v3")
+    let controllerSource = v3path.V3PathAbsolute(root, "v3/src/tooling/r2c_react_v3.cheng")
+    let repoEnv = os.GetEnv("R2C_REACT_V3_REPO")
+    var repo = "/Users/lbcheng/UniMaker/React.js"
+    if len(repoEnv) > 0:
+        repo = repoEnv
+    assert(os.DirExists(repo), "v3 r2c run-native-gui controller smoke: React.js repo exists")
+    let readyEnv = ["CHENG_V3_BACKEND_DRIVER_READY=1"]
+    var nativeEnv: str[]
+    add(nativeEnv, "R2C_REACT_V3_TOOLING_BIN=" + stage3)
+    add(nativeEnv, "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1")
+
+    let controllerExe = os.JoinPath(outDir, "r2c_react_v3_controller_smoke")
+    let controllerCompileReport = controllerExe + ".report.txt"
+    let controllerCompileLog = controllerExe + ".compile.log"
+    if v3path.V3PathFileExists(controllerExe):
+        os.RemoveFile(controllerExe)
+    if v3path.V3PathFileExists(controllerCompileReport):
+        os.RemoveFile(controllerCompileReport)
+    let controllerCompileRun = hostops.v3RunFileLogged(root,
+                                                       "r2c_run_native_gui_controller_compile",
+                                                       driver,
+                                                       [
+                                                           "system-link-exec",
+                                                           "--root:" + packageRoot,
+                                                           "--in:" + controllerSource,
+                                                           "--emit:exe",
+                                                           "--target:arm64-apple-darwin",
+                                                           "--out:" + controllerExe,
+                                                           "--report-out:" + controllerCompileReport
+                                                       ],
+                                                       [],
+                                                       root,
+                                                       0,
+                                                       controllerCompileLog)
+    assert(hostops.v3LoggedRunOk(controllerCompileRun), "v3 r2c run-native-gui controller smoke: controller compile rc")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerExe), "v3 r2c run-native-gui controller smoke: controller exe")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerCompileReport), "v3 r2c run-native-gui controller smoke: controller compile report")
+
+    let codegenOutDir = v3path.V3PathJoin(outDir, "codegen_surface")
+    let codegenLog = v3path.V3PathJoin(outDir, "r2c_codegen_surface.log")
+    if v3path.V3PathFileExists(codegenLog):
+        os.RemoveFile(codegenLog)
+    let codegenRun = hostops.v3RunFileLogged(root,
+                                             "r2c_codegen_surface_controller_smoke",
+                                             driver,
+                                             [
+                                                 "r2c-react-v3-codegen-surface-smoke",
+                                                 "--repo", repo,
+                                                 "--out-dir", codegenOutDir
+                                             ],
+                                             readyEnv,
+                                             root,
+                                             0,
+                                             codegenLog)
+    assert(hostops.v3LoggedRunOk(codegenRun), "v3 r2c run-native-gui controller smoke: codegen rc")
+    let codegenManifestPath = os.JoinPath(codegenOutDir, "cheng_codegen_v1.json")
+    let codegenRouteCatalogPath = os.JoinPath(codegenOutDir, "cheng_codegen_route_catalog_v1.json")
+    let codegenTsxAstPath = os.JoinPath(codegenOutDir, "tsx_ast_v1.json")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenManifestPath), "v3 r2c run-native-gui controller smoke: codegen manifest")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenRouteCatalogPath), "v3 r2c run-native-gui controller smoke: codegen route catalog")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenTsxAstPath), "v3 r2c run-native-gui controller smoke: codegen tsx ast")
+
+    let staticSummaryPath = os.JoinPath(outDir, "static_surface.summary.env")
+    let bundleHostContractPath = os.JoinPath(outDir, "unimaker_host_v1.json")
+    let bundleAssetManifestPath = os.JoinPath(outDir, "asset_manifest_v1.json")
+    let bundleTailwindManifestPath = os.JoinPath(outDir, "tailwind_style_manifest_v1.json")
+    var staticAssetRoots: str[]
+    var staticSurface: r2csurface.R2cStaticSurfaceRunResult
+    assert(r2csurface.r2cRunStaticSurface(repo, outDir, codegenTsxAstPath, staticSummaryPath, staticAssetRoots, staticSurface),
+           "v3 r2c run-native-gui controller smoke: static surface rc")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleHostContractPath),
+           "v3 r2c run-native-gui controller smoke: host contract")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleAssetManifestPath),
+           "v3 r2c run-native-gui controller smoke: asset manifest")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleTailwindManifestPath),
+           "v3 r2c run-native-gui controller smoke: tailwind manifest")
+
+    let bundlePath = os.JoinPath(outDir, "native_gui_bundle_v1.json")
+    let sessionPath = os.JoinPath(outDir, "native_gui_session_v1.json")
+    let bundleSummaryPath = os.JoinPath(outDir, "native_gui_bundle.summary.env")
+    let bundleLog = os.JoinPath(outDir, "native_gui_bundle.log")
+    if v3path.V3PathFileExists(bundleLog):
+        os.RemoveFile(bundleLog)
+    let bundleRun = hostops.v3RunProgramLogged(root,
+                                               "r2c_native_gui_bundle_controller_smoke",
+                                               "node",
+                                               [
+                                                   bundleScript,
+                                                   "--repo", repo,
+                                                   "--route-state", "home_default",
+                                                   "--out-dir", outDir,
+                                                   "--codegen-manifest", codegenManifestPath,
+                                                   "--host-contract", bundleHostContractPath,
+                                                   "--asset-manifest", bundleAssetManifestPath,
+                                                   "--tailwind-manifest", bundleTailwindManifestPath,
+                                                   "--route-catalog", codegenRouteCatalogPath,
+                                                   "--tsx-ast", codegenTsxAstPath,
+                                                   "--summary-out", bundleSummaryPath
+                                               ],
+                                               nativeEnv,
+                                               root,
+                                               0,
+                                               bundleLog)
+    assert(hostops.v3LoggedRunOk(bundleRun), "v3 r2c run-native-gui controller smoke: bundle rc")
+    assert(v3path.V3FileExistsNonEmpty(root, bundlePath), "v3 r2c run-native-gui controller smoke: bundle")
+    assert(v3path.V3FileExistsNonEmpty(root, sessionPath), "v3 r2c run-native-gui controller smoke: session")
+
+    let controllerLog = v3path.V3PathJoin(outDir, "run_native_gui_controller.log")
+    if v3path.V3PathFileExists(controllerLog):
+        os.RemoveFile(controllerLog)
+    let controllerRun = hostops.v3RunFileLogged(root,
+                                                "r2c_run_native_gui_controller_smoke",
+                                                controllerExe,
+                                                [
+                                                    "run-native-gui",
+                                                    "--repo", repo,
+                                                    "--out-dir", outDir,
+                                                    "--bundle-path", bundlePath,
+                                                    "--session-path", sessionPath,
+                                                    "--route-state", "home_default",
+                                                    "--auto-close-ms", "600"
+                                                ],
+                                                [],
+                                                root,
+                                                0,
+                                                controllerLog)
+    assert(hostops.v3LoggedRunOk(controllerRun), "v3 r2c run-native-gui controller smoke: controller rc")
+    assert(v3path.V3PathFileExists(controllerLog), "v3 r2c run-native-gui controller smoke: controller log")
+
+    let reportPath = os.JoinPath(outDir, "native_gui_run_report_v1.json")
+    let summaryPath = os.JoinPath(outDir, "native_gui_run.summary.env")
+    let screenshotPath = os.JoinPath(outDir, "native_gui_session.png")
+    let bundlePath = os.JoinPath(outDir, "native_gui_bundle_v1.json")
+    let sessionPath = os.JoinPath(outDir, "native_gui_session_v1.json")
+    assert(v3path.V3FileExistsNonEmpty(root, reportPath), "v3 r2c run-native-gui controller smoke: report")
+    assert(v3path.V3FileExistsNonEmpty(root, summaryPath), "v3 r2c run-native-gui controller smoke: summary")
+    assert(v3path.V3FileExistsNonEmpty(root, screenshotPath), "v3 r2c run-native-gui controller smoke: screenshot")
+    assert(v3path.V3FileExistsNonEmpty(root, bundlePath), "v3 r2c run-native-gui controller smoke: bundle")
+    assert(v3path.V3FileExistsNonEmpty(root, sessionPath), "v3 r2c run-native-gui controller smoke: session")
+
+    let reportText = v3path.V3ReadTextFile("", reportPath)
+    let summaryText = v3path.V3ReadTextFile("", summaryPath)
+    assert(containsText(reportText, "\"command\": \"run-native-gui\""),
+           "v3 r2c run-native-gui controller smoke: report command")
+    assert(containsText(reportText, "\"ok\": true"),
+           "v3 r2c run-native-gui controller smoke: report ok")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_ready\": true"),
+           "v3 r2c run-native-gui controller smoke: runtime bundle ready")
+    assert(containsText(reportText, "\"native_gui_runtime_contract_ready\": true"),
+           "v3 r2c run-native-gui controller smoke: runtime contract ready")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_route_state\": \"home_default\""),
+           "v3 r2c run-native-gui controller smoke: runtime bundle route state")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_route_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime bundle route count")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_supported_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime bundle supported count")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_semantic_nodes_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime bundle semantic nodes")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_layout_item_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime bundle layout count")
+    assert(containsText(reportText, "\"native_gui_runtime_bundle_render_command_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime bundle render count")
+    assert(containsText(reportText, "\"native_gui_runtime_contract_layout_item_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime contract layout count")
+    assert(containsText(reportText, "\"native_gui_runtime_contract_viewport_item_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime contract viewport count")
+    assert(containsText(reportText, "\"native_gui_runtime_contract_interactive_item_count\": "),
+           "v3 r2c run-native-gui controller smoke: runtime contract interactive count")
+    assert(containsText(reportText, "\"native_gui_native_layout_plan_item_count\": "),
+           "v3 r2c run-native-gui controller smoke: native layout plan count")
+    assert(containsText(reportText, "\"native_gui_render_plan_command_count\": "),
+           "v3 r2c run-native-gui controller smoke: render plan count")
+    assert(containsText(reportText, "\"native_gui_screenshot_path\": "),
+           "v3 r2c run-native-gui controller smoke: screenshot path")
+    assert(containsText(summaryText, "native_gui_runtime_bundle_ready=true"),
+           "v3 r2c run-native-gui controller smoke: summary runtime bundle ready")
+    assert(containsText(summaryText, "native_gui_runtime_contract_ready=true"),
+           "v3 r2c run-native-gui controller smoke: summary runtime contract ready")
+    assert(containsText(summaryText, "native_gui_runtime_bundle_route_state=home_default"),
+           "v3 r2c run-native-gui controller smoke: summary runtime bundle route state")
+    assert(containsText(summaryText, "native_gui_runtime_bundle_layout_item_count="),
+           "v3 r2c run-native-gui controller smoke: summary runtime bundle layout count")
+    assert(containsText(summaryText, "native_gui_runtime_bundle_render_command_count="),
+           "v3 r2c run-native-gui controller smoke: summary runtime bundle render count")
+    assert(containsText(summaryText, "native_gui_runtime_contract_viewport_item_count="),
+           "v3 r2c run-native-gui controller smoke: summary runtime contract viewport count")
+    assert(containsText(summaryText, "native_gui_runtime_contract_interactive_item_count="),
+           "v3 r2c run-native-gui controller smoke: summary runtime contract interactive count")
+
+    echo("v3 r2c_react_v3_run_native_gui_controller_smoke ok")
+    return 0

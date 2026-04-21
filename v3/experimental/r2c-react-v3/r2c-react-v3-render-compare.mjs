@@ -19,6 +19,10 @@ function parseArgs(argv) {
     browserHeight: '',
     summaryOut: '',
     outPath: '',
+    nativeSummary: '',
+    truthSummary: '',
+    nativeScreenshot: '',
+    truthScreenshot: '',
   };
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -35,12 +39,17 @@ function parseArgs(argv) {
     else if (arg === '--browser-height') out.browserHeight = String(argv[++i] || '');
     else if (arg === '--summary-out') out.summaryOut = String(argv[++i] || '');
     else if (arg === '--out') out.outPath = String(argv[++i] || '');
+    else if (arg === '--native-summary') out.nativeSummary = String(argv[++i] || '');
+    else if (arg === '--truth-summary') out.truthSummary = String(argv[++i] || '');
+    else if (arg === '--native-screenshot') out.nativeScreenshot = String(argv[++i] || '');
+    else if (arg === '--truth-screenshot') out.truthScreenshot = String(argv[++i] || '');
     else if (arg === '--help' || arg === '-h') {
       console.log(
         'Usage: r2c-react-v3-render-compare.mjs --repo <path> --route <state> ' +
         '[--out-dir <dir>] [--base-url <url>] [--tooling-bin <cheng.stage3>] ' +
         '[--auto-close-ms <n>] [--resize WxH] [--wait-ms <n>] ' +
-        '[--browser-width <n>] [--browser-height <n>] [--summary-out <file>] [--out <file>]'
+        '[--browser-width <n>] [--browser-height <n>] [--summary-out <file>] [--out <file>] ' +
+        '[--native-summary <file> --truth-summary <file> --native-screenshot <file> --truth-screenshot <file>]'
       );
       process.exit(0);
     }
@@ -454,12 +463,179 @@ function requireFile(filePath, label) {
   }
 }
 
+function parseIntField(value, fallback = 0) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function boolFieldText(value) {
+  return String(value ?? '').trim().toLowerCase() === 'true';
+}
+
+function directCompareEnabled(args) {
+  return Boolean(
+    String(args.nativeSummary || '').trim() ||
+    String(args.truthSummary || '').trim() ||
+    String(args.nativeScreenshot || '').trim() ||
+    String(args.truthScreenshot || '').trim()
+  );
+}
+
+function assertDirectCompareArgs(args) {
+  const missing = [];
+  if (!String(args.nativeSummary || '').trim()) missing.push('--native-summary');
+  if (!String(args.truthSummary || '').trim()) missing.push('--truth-summary');
+  if (!String(args.nativeScreenshot || '').trim()) missing.push('--native-screenshot');
+  if (!String(args.truthScreenshot || '').trim()) missing.push('--truth-screenshot');
+  if (missing.length > 0) {
+    throw new Error(`direct_compare_missing:${missing.join(',')}`);
+  }
+}
+
+function buildRenderCompareReport({
+  directMode,
+  route,
+  repo,
+  workspaceRoot,
+  stage3,
+  outDir,
+  tsFrontendLogPath,
+  codegenSurfaceLogPath,
+  nativeBundleLogPath,
+  nativeRunLogPath,
+  truthRunLogPath,
+  nativeSummaryPath,
+  truthSummaryPath,
+  nativeResolvedScreenshotPath,
+  truthScreenshotPath,
+  nativeWidth,
+  nativeHeight,
+  nativePng,
+  truthPng,
+  compare,
+  nativeSummary,
+  truthSummary,
+}) {
+  const nativeRuntimeBundleSemanticNodesCount = parseIntField(nativeSummary.native_gui_runtime_bundle_semantic_nodes_count, 0);
+  const truthSemanticNodesCount = parseIntField(truthSummary.semantic_nodes_count, 0);
+  return {
+    format: 'render_compare_v1',
+    ok: Boolean(compare.ok),
+    reason: String(compare.reason || ''),
+    direct_mode: Boolean(directMode),
+    repo_root: repo,
+    workspace_root: workspaceRoot,
+    route_state: route,
+    stage3_path: String(stage3 || ''),
+    out_dir: outDir,
+    tsx_frontend_log_path: tsFrontendLogPath,
+    codegen_surface_log_path: codegenSurfaceLogPath,
+    native_gui_bundle_log_path: nativeBundleLogPath,
+    native_gui_run_log_path: nativeRunLogPath,
+    truth_capture_log_path: truthRunLogPath,
+    native_gui_summary_ready: true,
+    native_gui_summary_path: nativeSummaryPath,
+    truth_summary_path: truthSummaryPath,
+    native_gui_route_state: String(nativeSummary.native_gui_route_state || ''),
+    native_gui_screenshot_path: String(nativeSummary.native_gui_screenshot_path || nativeResolvedScreenshotPath),
+    native_gui_runtime_manifest_ready: boolFieldText(nativeSummary.native_gui_runtime_manifest_ready),
+    native_gui_runtime_contract_payload_ready: boolFieldText(nativeSummary.native_gui_runtime_contract_payload_ready),
+    native_gui_runtime_bundle_payload_ready: boolFieldText(nativeSummary.native_gui_runtime_bundle_payload_ready),
+    native_gui_runtime_bundle_ready: boolFieldText(nativeSummary.native_gui_runtime_bundle_ready),
+    native_gui_runtime_contract_ready: boolFieldText(nativeSummary.native_gui_runtime_contract_ready),
+    native_gui_runtime_bundle_route_state: String(nativeSummary.native_gui_runtime_bundle_route_state || ''),
+    native_gui_runtime_bundle_route_count: parseIntField(nativeSummary.native_gui_runtime_bundle_route_count, 0),
+    native_gui_runtime_bundle_supported_count: parseIntField(nativeSummary.native_gui_runtime_bundle_supported_count, 0),
+    native_gui_runtime_bundle_semantic_nodes_count: nativeRuntimeBundleSemanticNodesCount,
+    native_gui_runtime_bundle_layout_item_count: parseIntField(nativeSummary.native_gui_runtime_bundle_layout_item_count, 0),
+    native_gui_runtime_bundle_render_command_count: parseIntField(nativeSummary.native_gui_runtime_bundle_render_command_count, 0),
+    native_gui_runtime_contract_layout_item_count: parseIntField(nativeSummary.native_gui_runtime_contract_layout_item_count, 0),
+    native_gui_runtime_contract_viewport_item_count: parseIntField(nativeSummary.native_gui_runtime_contract_viewport_item_count, 0),
+    native_gui_runtime_contract_interactive_item_count: parseIntField(nativeSummary.native_gui_runtime_contract_interactive_item_count, 0),
+    native_gui_native_layout_plan_item_count: parseIntField(nativeSummary.native_gui_native_layout_plan_item_count, 0),
+    native_gui_render_plan_command_count: parseIntField(nativeSummary.native_gui_render_plan_command_count, 0),
+    native_gui_storage_host_ready: boolFieldText(nativeSummary.native_gui_storage_host_ready),
+    native_gui_fetch_host_ready: boolFieldText(nativeSummary.native_gui_fetch_host_ready),
+    native_gui_custom_event_host_ready: boolFieldText(nativeSummary.native_gui_custom_event_host_ready),
+    native_gui_resize_observer_host_ready: boolFieldText(nativeSummary.native_gui_resize_observer_host_ready),
+    truth_trace_path: String(truthSummary.truth_trace_path || ''),
+    truth_trace_format: String(truthSummary.truth_trace_format || ''),
+    truth_runtime_state_path: String(truthSummary.runtime_state_path || ''),
+    truth_dom_path: String(truthSummary.dom_path || ''),
+    truth_semantic_nodes_path: String(truthSummary.semantic_nodes_path || ''),
+    truth_runtime_meta_path: String(truthSummary.runtime_meta_path || ''),
+    truth_screenshot_path: String(truthSummary.screenshot_path || truthScreenshotPath),
+    truth_semantic_nodes_count: truthSemanticNodesCount,
+    truth_document_nodes_count: parseIntField(truthSummary.document_nodes_count, 0),
+    truth_dom_hash: String(truthSummary.dom_hash || ''),
+    truth_screenshot_sha256: String(truthSummary.screenshot_sha256 || ''),
+    truth_pathname: String(truthSummary.pathname || ''),
+    truth_search: String(truthSummary.search || ''),
+    truth_hash: String(truthSummary.hash || ''),
+    route_state_match: String(nativeSummary.native_gui_route_state || '') === route,
+    semantic_nodes_count_delta: nativeRuntimeBundleSemanticNodesCount - truthSemanticNodesCount,
+    native_window_width: nativeWidth,
+    native_window_height: nativeHeight,
+    truth_window_width: truthPng.width,
+    truth_window_height: truthPng.height,
+    native_screenshot_path: nativeResolvedScreenshotPath,
+    truth_screenshot_path: truthScreenshotPath,
+    native_file_sha256: nativePng.file_sha256,
+    truth_file_sha256: truthPng.file_sha256,
+    native_pixel_sha256: nativePng.pixel_sha256,
+    truth_pixel_sha256: truthPng.pixel_sha256,
+    pixel_count: compare.pixel_count,
+    diff_pixel_count: compare.diff_pixel_count,
+    diff_ratio: compare.diff_ratio,
+    max_channel_delta: compare.max_channel_delta,
+    total_abs_delta: compare.total_abs_delta,
+    first_diff: compare.first_diff,
+    native_summary: {
+      native_gui_route_state: String(nativeSummary.native_gui_route_state || ''),
+      native_gui_screenshot_path: String(nativeSummary.native_gui_screenshot_path || ''),
+      native_gui_layout_item_count: String(nativeSummary.native_gui_layout_item_count || ''),
+      native_gui_render_plan_command_count: String(nativeSummary.native_gui_render_plan_command_count || ''),
+      native_gui_native_layout_plan_item_count: String(nativeSummary.native_gui_native_layout_plan_item_count || ''),
+      native_gui_runtime_manifest_ready: String(nativeSummary.native_gui_runtime_manifest_ready || ''),
+      native_gui_runtime_contract_payload_ready: String(nativeSummary.native_gui_runtime_contract_payload_ready || ''),
+      native_gui_runtime_bundle_payload_ready: String(nativeSummary.native_gui_runtime_bundle_payload_ready || ''),
+      native_gui_runtime_bundle_ready: String(nativeSummary.native_gui_runtime_bundle_ready || ''),
+      native_gui_runtime_contract_ready: String(nativeSummary.native_gui_runtime_contract_ready || ''),
+      native_gui_runtime_bundle_route_state: String(nativeSummary.native_gui_runtime_bundle_route_state || ''),
+      native_gui_runtime_bundle_route_count: String(nativeSummary.native_gui_runtime_bundle_route_count || ''),
+      native_gui_runtime_bundle_supported_count: String(nativeSummary.native_gui_runtime_bundle_supported_count || ''),
+      native_gui_runtime_bundle_semantic_nodes_count: String(nativeSummary.native_gui_runtime_bundle_semantic_nodes_count || ''),
+      native_gui_runtime_bundle_layout_item_count: String(nativeSummary.native_gui_runtime_bundle_layout_item_count || ''),
+      native_gui_runtime_bundle_render_command_count: String(nativeSummary.native_gui_runtime_bundle_render_command_count || ''),
+      native_gui_runtime_contract_layout_item_count: String(nativeSummary.native_gui_runtime_contract_layout_item_count || ''),
+      native_gui_runtime_contract_viewport_item_count: String(nativeSummary.native_gui_runtime_contract_viewport_item_count || ''),
+      native_gui_runtime_contract_interactive_item_count: String(nativeSummary.native_gui_runtime_contract_interactive_item_count || ''),
+    },
+    truth_summary: {
+      truth_trace_path: String(truthSummary.truth_trace_path || ''),
+      truth_trace_format: String(truthSummary.truth_trace_format || ''),
+      runtime_state_path: String(truthSummary.runtime_state_path || ''),
+      semantic_nodes_path: String(truthSummary.semantic_nodes_path || ''),
+      semantic_nodes_count: String(truthSummary.semantic_nodes_count || ''),
+      document_nodes_count: String(truthSummary.document_nodes_count || ''),
+      dom_hash: String(truthSummary.dom_hash || ''),
+      screenshot_sha256: String(truthSummary.screenshot_sha256 || ''),
+    },
+  };
+}
+
 function main() {
   const args = parseArgs(process.argv);
   const repo = path.resolve(args.repo);
   const route = String(args.route || '').trim();
   const workspaceRoot = resolveWorkspaceRoot();
-  const stage3 = resolveStage3(workspaceRoot, args.toolingBin);
+  const directMode = directCompareEnabled(args);
+  if (directMode) {
+    assertDirectCompareArgs(args);
+  }
+  const stage3 = directMode ? '' : resolveStage3(workspaceRoot, args.toolingBin);
   const scriptDir = path.dirname(path.resolve(process.argv[1]));
   const tsFrontendHelper = path.join(scriptDir, 'r2c-react-v3-ts-frontend.mjs');
   const codegenSurfaceHelper = path.join(scriptDir, 'r2c-react-v3-codegen-surface.mjs');
@@ -483,172 +659,195 @@ function main() {
 
   fs.mkdirSync(outDir, { recursive: true });
 
-  const tsFrontendArgs = [
-    process.execPath,
-    tsFrontendHelper,
-    '--repo', repo,
-    '--out', tsxAstPath,
-    '--summary-out', path.join(nativeOutDir, 'tsx_frontend.summary.env'),
-  ];
-  const tsFrontendRun = run(tsFrontendArgs[0], tsFrontendArgs.slice(1), {
-    cwd: workspaceRoot,
-  });
-  writeText(tsFrontendLogPath, [tsFrontendRun.stdout || '', tsFrontendRun.stderr || '', tsFrontendRun.error ? String(tsFrontendRun.error.stack || tsFrontendRun.error.message || tsFrontendRun.error) : ''].filter(Boolean).join('\n'));
-  const tsFrontendExitCode = exitCodeOf(tsFrontendRun);
-  if (tsFrontendExitCode !== 0) {
-    throw new Error(`tsx_frontend_failed:${tsFrontendExitCode}`);
-  }
-  const tsxAstDoc = readJson(tsxAstPath);
-  writeJson(hostContractPath, buildSyntheticHostContractDoc(tsxAstDoc, repo, route));
-  writeJson(assetManifestPath, buildSyntheticAssetManifestDoc(tsxAstDoc, repo));
-  writeJson(tailwindManifestPath, buildSyntheticTailwindManifestDoc(tsxAstDoc, repo));
+  let nativeSummaryPath = '';
+  let truthSummaryPath = '';
+  let nativeSummary = {};
+  let truthSummary = {};
+  let nativeResolvedScreenshotPath = '';
+  let truthScreenshotPath = '';
+  let nativeWidth = 0;
+  let nativeHeight = 0;
 
-  const codegenArgs = [
-    process.execPath,
-    codegenSurfaceHelper,
-    '--repo', repo,
-    '--out-dir', nativeOutDir,
-  ];
-  const codegenRun = run(codegenArgs[0], codegenArgs.slice(1), {
-    cwd: workspaceRoot,
-    env: {
-      ...process.env,
-      R2C_REACT_V3_TOOLING_BIN: stage3,
-    },
-  });
-  writeText(codegenSurfaceLogPath, [codegenRun.stdout || '', codegenRun.stderr || '', codegenRun.error ? String(codegenRun.error.stack || codegenRun.error.message || codegenRun.error) : ''].filter(Boolean).join('\n'));
-  const codegenExitCode = exitCodeOf(codegenRun);
-  if (codegenExitCode !== 0) {
-    throw new Error(`codegen_surface_failed:${codegenExitCode}`);
-  }
+  if (directMode) {
+    nativeSummaryPath = path.resolve(args.nativeSummary);
+    truthSummaryPath = path.resolve(args.truthSummary);
+    nativeResolvedScreenshotPath = path.resolve(args.nativeScreenshot);
+    truthScreenshotPath = path.resolve(args.truthScreenshot);
+    requireFile(nativeSummaryPath, 'native gui summary');
+    requireFile(truthSummaryPath, 'truth summary');
+    requireFile(nativeResolvedScreenshotPath, 'native gui screenshot');
+    requireFile(truthScreenshotPath, 'truth screenshot');
+    nativeSummary = parseSummaryEnv(nativeSummaryPath);
+    truthSummary = parseSummaryEnv(truthSummaryPath);
+    nativeWidth = parsePositiveInt(args.browserWidth, parsePositiveInt(nativeSummary.native_gui_window_width, 393));
+    nativeHeight = parsePositiveInt(args.browserHeight, parsePositiveInt(nativeSummary.native_gui_window_height, 852));
+  } else {
+    const tsFrontendArgs = [
+      process.execPath,
+      tsFrontendHelper,
+      '--repo', repo,
+      '--out', tsxAstPath,
+      '--summary-out', path.join(nativeOutDir, 'tsx_frontend.summary.env'),
+    ];
+    const tsFrontendRun = run(tsFrontendArgs[0], tsFrontendArgs.slice(1), {
+      cwd: workspaceRoot,
+    });
+    writeText(tsFrontendLogPath, [tsFrontendRun.stdout || '', tsFrontendRun.stderr || '', tsFrontendRun.error ? String(tsFrontendRun.error.stack || tsFrontendRun.error.message || tsFrontendRun.error) : ''].filter(Boolean).join('\n'));
+    const tsFrontendExitCode = exitCodeOf(tsFrontendRun);
+    if (tsFrontendExitCode !== 0) {
+      throw new Error(`tsx_frontend_failed:${tsFrontendExitCode}`);
+    }
+    const tsxAstDoc = readJson(tsxAstPath);
+    writeJson(hostContractPath, buildSyntheticHostContractDoc(tsxAstDoc, repo, route));
+    writeJson(assetManifestPath, buildSyntheticAssetManifestDoc(tsxAstDoc, repo));
+    writeJson(tailwindManifestPath, buildSyntheticTailwindManifestDoc(tsxAstDoc, repo));
 
-  const nativeBundleLogPath = path.join(outDir, 'native_gui_bundle.log');
-  const nativeArgs = [
-    process.execPath,
-    nativeGuiBundleHelper,
-    '--repo', repo,
-    '--route-state', route,
-    '--out-dir', nativeOutDir,
-    '--host-contract', hostContractPath,
-    '--asset-manifest', assetManifestPath,
-    '--tailwind-manifest', tailwindManifestPath,
-  ];
-  const nativeBundleRun = run(nativeArgs[0], nativeArgs.slice(1), {
-    cwd: workspaceRoot,
-    env: {
-      ...process.env,
-      R2C_REACT_V3_TOOLING_BIN: stage3,
-    },
-  });
-  writeText(nativeBundleLogPath, [nativeBundleRun.stdout || '', nativeBundleRun.stderr || '', nativeBundleRun.error ? String(nativeBundleRun.error.stack || nativeBundleRun.error.message || nativeBundleRun.error) : ''].filter(Boolean).join('\n'));
-  const nativeBundleExitCode = exitCodeOf(nativeBundleRun);
-  if (nativeBundleExitCode !== 0) {
-    throw new Error(`native_gui_bundle_failed:${nativeBundleExitCode}`);
-  }
-  const nativeRunArgs = [
-    process.execPath,
-    nativeGuiRunHelper,
-    '--repo', repo,
-    '--route-state', route,
-    '--out-dir', nativeOutDir,
-    '--screenshot-out', nativeScreenshotPath,
-    '--auto-close-ms', String(args.autoCloseMs || '1200'),
-  ];
-  if (String(args.resize || '').trim()) {
-    nativeRunArgs.push('--resize', String(args.resize).trim());
-  }
-  const nativeRun = run(nativeRunArgs[0], nativeRunArgs.slice(1), { cwd: workspaceRoot });
-  writeText(nativeRunLogPath, [nativeRun.stdout || '', nativeRun.stderr || '', nativeRun.error ? String(nativeRun.error.stack || nativeRun.error.message || nativeRun.error) : ''].filter(Boolean).join('\n'));
-  const nativeExitCode = exitCodeOf(nativeRun);
-  if (nativeExitCode !== 0) {
-    throw new Error(`native_gui_run_failed:${nativeExitCode}`);
-  }
-  const nativeSummaryPath = path.join(nativeOutDir, 'native_gui_run.summary.env');
-  requireFile(nativeSummaryPath, 'native gui summary');
-  const nativeSummary = parseSummaryEnv(nativeSummaryPath);
-  const nativeWidth = parsePositiveInt(args.browserWidth, parsePositiveInt(nativeSummary.native_gui_window_width, 393));
-  const nativeHeight = parsePositiveInt(args.browserHeight, parsePositiveInt(nativeSummary.native_gui_window_height, 852));
-  const nativeResolvedScreenshotPath = path.resolve(String(nativeSummary.native_gui_screenshot_path || nativeScreenshotPath));
-  requireFile(nativeResolvedScreenshotPath, 'native gui screenshot');
+    const codegenArgs = [
+      process.execPath,
+      codegenSurfaceHelper,
+      '--repo', repo,
+      '--out-dir', nativeOutDir,
+    ];
+    const codegenRun = run(codegenArgs[0], codegenArgs.slice(1), {
+      cwd: workspaceRoot,
+      env: {
+        ...process.env,
+        R2C_REACT_V3_TOOLING_BIN: stage3,
+      },
+    });
+    writeText(codegenSurfaceLogPath, [codegenRun.stdout || '', codegenRun.stderr || '', codegenRun.error ? String(codegenRun.error.stack || codegenRun.error.message || codegenRun.error) : ''].filter(Boolean).join('\n'));
+    const codegenExitCode = exitCodeOf(codegenRun);
+    if (codegenExitCode !== 0) {
+      throw new Error(`codegen_surface_failed:${codegenExitCode}`);
+    }
 
-  const truthSummaryPath = path.join(truthOutDir, `${route}.summary.env`);
-  const truthArgs = [
-    process.execPath,
-    truthRuntimeHelper,
-    '--route', route,
-    '--out-dir', truthOutDir,
-    '--summary-out', truthSummaryPath,
-    '--base-url', String(args.baseUrl || 'http://127.0.0.1:4173/'),
-    '--width', String(nativeWidth),
-    '--height', String(nativeHeight),
-    '--wait-ms', String(args.waitMs || '30000'),
-  ];
-  const truthRun = run(truthArgs[0], truthArgs.slice(1), { cwd: workspaceRoot });
-  writeText(truthRunLogPath, [truthRun.stdout || '', truthRun.stderr || '', truthRun.error ? String(truthRun.error.stack || truthRun.error.message || truthRun.error) : ''].filter(Boolean).join('\n'));
-  const truthExitCode = exitCodeOf(truthRun);
-  if (truthExitCode !== 0) {
-    throw new Error(`truth_capture_failed:${truthExitCode}`);
+    const nativeBundleLogPath = path.join(outDir, 'native_gui_bundle.log');
+    const nativeArgs = [
+      process.execPath,
+      nativeGuiBundleHelper,
+      '--repo', repo,
+      '--route-state', route,
+      '--out-dir', nativeOutDir,
+      '--host-contract', hostContractPath,
+      '--asset-manifest', assetManifestPath,
+      '--tailwind-manifest', tailwindManifestPath,
+    ];
+    const nativeBundleRun = run(nativeArgs[0], nativeArgs.slice(1), {
+      cwd: workspaceRoot,
+      env: {
+        ...process.env,
+        R2C_REACT_V3_TOOLING_BIN: stage3,
+      },
+    });
+    writeText(nativeBundleLogPath, [nativeBundleRun.stdout || '', nativeBundleRun.stderr || '', nativeBundleRun.error ? String(nativeBundleRun.error.stack || nativeBundleRun.error.message || nativeBundleRun.error) : ''].filter(Boolean).join('\n'));
+    const nativeBundleExitCode = exitCodeOf(nativeBundleRun);
+    if (nativeBundleExitCode !== 0) {
+      throw new Error(`native_gui_bundle_failed:${nativeBundleExitCode}`);
+    }
+    const nativeRunArgs = [
+      process.execPath,
+      nativeGuiRunHelper,
+      '--repo', repo,
+      '--route-state', route,
+      '--out-dir', nativeOutDir,
+      '--screenshot-out', nativeScreenshotPath,
+      '--auto-close-ms', String(args.autoCloseMs || '1200'),
+    ];
+    if (String(args.resize || '').trim()) {
+      nativeRunArgs.push('--resize', String(args.resize).trim());
+    }
+    const nativeRun = run(nativeRunArgs[0], nativeRunArgs.slice(1), { cwd: workspaceRoot });
+    writeText(nativeRunLogPath, [nativeRun.stdout || '', nativeRun.stderr || '', nativeRun.error ? String(nativeRun.error.stack || nativeRun.error.message || nativeRun.error) : ''].filter(Boolean).join('\n'));
+    const nativeExitCode = exitCodeOf(nativeRun);
+    if (nativeExitCode !== 0) {
+      throw new Error(`native_gui_run_failed:${nativeExitCode}`);
+    }
+    nativeSummaryPath = path.join(nativeOutDir, 'native_gui_run.summary.env');
+    requireFile(nativeSummaryPath, 'native gui summary');
+    nativeSummary = parseSummaryEnv(nativeSummaryPath);
+    nativeWidth = parsePositiveInt(args.browserWidth, parsePositiveInt(nativeSummary.native_gui_window_width, 393));
+    nativeHeight = parsePositiveInt(args.browserHeight, parsePositiveInt(nativeSummary.native_gui_window_height, 852));
+    nativeResolvedScreenshotPath = path.resolve(String(nativeSummary.native_gui_screenshot_path || nativeScreenshotPath));
+    requireFile(nativeResolvedScreenshotPath, 'native gui screenshot');
+
+    truthSummaryPath = path.join(truthOutDir, `${route}.summary.env`);
+    const truthArgs = [
+      process.execPath,
+      truthRuntimeHelper,
+      '--route', route,
+      '--out-dir', truthOutDir,
+      '--summary-out', truthSummaryPath,
+      '--base-url', String(args.baseUrl || 'http://127.0.0.1:4173/'),
+      '--width', String(nativeWidth),
+      '--height', String(nativeHeight),
+      '--wait-ms', String(args.waitMs || '30000'),
+    ];
+    const truthRun = run(truthArgs[0], truthArgs.slice(1), { cwd: workspaceRoot });
+    writeText(truthRunLogPath, [truthRun.stdout || '', truthRun.stderr || '', truthRun.error ? String(truthRun.error.stack || truthRun.error.message || truthRun.error) : ''].filter(Boolean).join('\n'));
+    const truthExitCode = exitCodeOf(truthRun);
+    if (truthExitCode !== 0) {
+      throw new Error(`truth_capture_failed:${truthExitCode}`);
+    }
+    requireFile(truthSummaryPath, 'truth summary');
+    truthSummary = parseSummaryEnv(truthSummaryPath);
+    truthScreenshotPath = path.resolve(String(truthSummary.screenshot_path || path.join(truthOutDir, `${route}.screenshot.png`)));
+    requireFile(truthScreenshotPath, 'truth screenshot');
   }
-  requireFile(truthSummaryPath, 'truth summary');
-  const truthSummary = parseSummaryEnv(truthSummaryPath);
-  const truthScreenshotPath = path.resolve(String(truthSummary.screenshot_path || path.join(truthOutDir, `${route}.screenshot.png`)));
-  requireFile(truthScreenshotPath, 'truth screenshot');
 
   const nativePng = decodePng(nativeResolvedScreenshotPath);
   const truthPng = decodePng(truthScreenshotPath);
   const compare = compareDecodedPng(nativePng, truthPng);
-  const report = {
-    format: 'render_compare_v1',
-    ok: Boolean(compare.ok),
-    reason: String(compare.reason || ''),
-    repo_root: repo,
-    workspace_root: workspaceRoot,
-    route_state: route,
-    stage3_path: stage3,
-    out_dir: outDir,
-    tsx_frontend_log_path: tsFrontendLogPath,
-    codegen_surface_log_path: codegenSurfaceLogPath,
-    native_gui_bundle_log_path: nativeBundleLogPath,
-    native_gui_run_log_path: nativeRunLogPath,
-    truth_capture_log_path: truthRunLogPath,
-    native_gui_summary_path: nativeSummaryPath,
-    truth_summary_path: truthSummaryPath,
-    native_screenshot_path: nativeResolvedScreenshotPath,
-    truth_screenshot_path: truthScreenshotPath,
-    native_window_width: nativeWidth,
-    native_window_height: nativeHeight,
-    truth_window_width: truthPng.width,
-    truth_window_height: truthPng.height,
-    native_file_sha256: nativePng.file_sha256,
-    truth_file_sha256: truthPng.file_sha256,
-    native_pixel_sha256: nativePng.pixel_sha256,
-    truth_pixel_sha256: truthPng.pixel_sha256,
-    pixel_count: compare.pixel_count,
-    diff_pixel_count: compare.diff_pixel_count,
-    diff_ratio: compare.diff_ratio,
-    max_channel_delta: compare.max_channel_delta,
-    total_abs_delta: compare.total_abs_delta,
-    first_diff: compare.first_diff,
-    native_summary: {
-      native_gui_route_state: String(nativeSummary.native_gui_route_state || ''),
-      native_gui_layout_item_count: String(nativeSummary.native_gui_layout_item_count || ''),
-      native_gui_render_plan_command_count: String(nativeSummary.native_gui_render_plan_command_count || ''),
-      native_gui_native_layout_plan_item_count: String(nativeSummary.native_gui_native_layout_plan_item_count || ''),
-    },
-    truth_summary: {
-      semantic_nodes_count: String(truthSummary.semantic_nodes_count || ''),
-      document_nodes_count: String(truthSummary.document_nodes_count || ''),
-      dom_hash: String(truthSummary.dom_hash || ''),
-      screenshot_sha256: String(truthSummary.screenshot_sha256 || ''),
-    },
-  };
+  const report = buildRenderCompareReport({
+    directMode,
+    route,
+    repo,
+    workspaceRoot,
+    stage3,
+    outDir,
+    tsFrontendLogPath,
+    codegenSurfaceLogPath,
+    nativeBundleLogPath: directMode ? '' : path.join(outDir, 'native_gui_bundle.log'),
+    nativeRunLogPath,
+    truthRunLogPath,
+    nativeSummaryPath,
+    truthSummaryPath,
+    nativeResolvedScreenshotPath,
+    truthScreenshotPath,
+    nativeWidth,
+    nativeHeight,
+    nativePng,
+    truthPng,
+    compare,
+    nativeSummary,
+    truthSummary,
+  });
   writeJson(reportPath, report);
   writeSummary(summaryPath, {
     ok: report.ok,
     reason: report.reason,
+    direct_mode: report.direct_mode,
     route_state: route,
+    route_state_match: report.route_state_match,
+    native_gui_summary_path: nativeSummaryPath,
+    truth_summary_path: truthSummaryPath,
     native_screenshot_path: nativeResolvedScreenshotPath,
     truth_screenshot_path: truthScreenshotPath,
+    native_gui_runtime_bundle_ready: report.native_gui_runtime_bundle_ready,
+    native_gui_runtime_contract_ready: report.native_gui_runtime_contract_ready,
+    native_gui_runtime_bundle_route_state: report.native_gui_runtime_bundle_route_state,
+    native_gui_runtime_bundle_semantic_nodes_count: report.native_gui_runtime_bundle_semantic_nodes_count,
+    native_gui_runtime_bundle_layout_item_count: report.native_gui_runtime_bundle_layout_item_count,
+    native_gui_runtime_bundle_render_command_count: report.native_gui_runtime_bundle_render_command_count,
+    native_gui_runtime_contract_interactive_item_count: report.native_gui_runtime_contract_interactive_item_count,
+    native_gui_native_layout_plan_item_count: report.native_gui_native_layout_plan_item_count,
+    native_gui_render_plan_command_count: report.native_gui_render_plan_command_count,
+    truth_trace_path: report.truth_trace_path,
+    truth_trace_format: report.truth_trace_format,
+    truth_semantic_nodes_count: report.truth_semantic_nodes_count,
+    truth_document_nodes_count: report.truth_document_nodes_count,
+    truth_dom_hash: report.truth_dom_hash,
+    truth_screenshot_sha256: report.truth_screenshot_sha256,
+    semantic_nodes_count_delta: report.semantic_nodes_count_delta,
     native_window_width: nativeWidth,
     native_window_height: nativeHeight,
     pixel_count: report.pixel_count,

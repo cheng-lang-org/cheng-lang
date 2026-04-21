@@ -146,24 +146,7 @@ fn v3BrowserCodecBridgeHelperNameForRuleName(ruleName: str): str =
 fn v3BrowserCodecBridgeEmitLineForSourceRuleName(sourcePath: str,
                                                  ruleName: str): str =
     let spec = v3BrowserCodecBridgeSpecForSourceRuleName(sourcePath, ruleName)
-    return Fmt(["source=",
-                sourcePath,
-                "|rule=",
-                ruleName,
-                "|stage=",
-                spec.bridgeStageText,
-                "|helper=",
-                barule.v3BrowserAbiBridgeHelperName(spec),
-                "|input_schema=",
-                spec.inputSchemaKindText,
-                "|output_schema=",
-                spec.outputSchemaKindText,
-                "|error_schema=",
-                spec.errorSchemaKindText,
-                "|result=",
-                spec.resultKindText,
-                "|out_buffer=",
-                spec.outBufferKindText])
+    return barule.v3BrowserAbiBridgeEmitLine(spec)
 
 fn v3BrowserCodecBridgeEmitLineForRuleName(ruleName: str): str =
     let spec = v3BrowserCodecBridgeSpecForRuleName(ruleName)
@@ -275,15 +258,12 @@ fn v3BrowserCodecErrorSchemaKindFromBridgePlan(plan: V3BrowserAbiBridgePlan): in
 fn v3BrowserCodecInputSchemaForRuleName(ruleName: str,
                                         missingError: str,
                                         copyError: str): V3BrowserCodecInputSchema =
-    let rule = browsercodec.v3BrowserContentCodecRuleByName(browsercodec.v3BrowserContentCodecModulePath(),
-                                                            ruleName)
-    let kindText = barule.v3BrowserAbiInputSchemaKindForRule(rule)
-    var kind: int32 = 0
-    if kindText == "bytes_required":
+    var kind: int32
+    if ruleName == "input_bytes_required":
         kind = v3BrowserCodecInputBytesRequired
-    elif kindText == "text_required":
+    elif ruleName == "input_text_required":
         kind = v3BrowserCodecInputTextRequired
-    elif kindText == "text_optional":
+    elif ruleName == "input_text_optional":
         kind = v3BrowserCodecInputTextOptional
     return v3BrowserCodecInputSchema(kind,
                                      missingError,
@@ -291,25 +271,28 @@ fn v3BrowserCodecInputSchemaForRuleName(ruleName: str,
 
 fn v3BrowserCodecOutputSchemaForRuleName(ruleName: str,
                                          handleError: str): V3BrowserCodecOutputSchema =
-    let rule = browsercodec.v3BrowserContentCodecRuleByName(browsercodec.v3BrowserContentCodecModulePath(),
-                                                            ruleName)
-    let kindText = barule.v3BrowserAbiOutputSchemaKindForRule(rule)
-    var kind: int32 = 0
-    if kindText == "bytes_handle":
+    var kind: int32
+    if ruleName == "output_bytes_handle" ||
+       ruleName == "export_moq_fountain_bytes_result":
         kind = v3BrowserCodecOutputBytesHandle
-    elif kindText == "text_handle":
+    elif ruleName == "output_text_handle" ||
+         ruleName == "export_moq_fountain_text_result" ||
+         ruleName == "moq_fountain_last_error_handle":
         kind = v3BrowserCodecOutputTextHandle
     return v3BrowserCodecOutputSchema(kind,
                                       handleError)
 
 fn v3BrowserCodecErrorSchemaForRuleName(ruleName: str): V3BrowserCodecErrorSchema =
-    let rule = browsercodec.v3BrowserContentCodecRuleByName(browsercodec.v3BrowserContentCodecModulePath(),
-                                                            ruleName)
-    let kindText = barule.v3BrowserAbiErrorSchemaKindForRule(rule)
-    var kind: int32 = 0
-    if kindText == "moq_fountain_last_error":
+    var kind: int32
+    if ruleName == "export_moq_fountain_bytes_result" ||
+       ruleName == "export_moq_fountain_text_result" ||
+       ruleName == "moq_fountain_last_error_handle":
         kind = v3BrowserCodecErrorMoqFountainLastError
-    elif kindText == "inline_result_error":
+    elif ruleName == "input_bytes_required" ||
+         ruleName == "input_text_required" ||
+         ruleName == "input_text_optional" ||
+         ruleName == "output_bytes_handle" ||
+         ruleName == "output_text_handle":
         kind = v3BrowserCodecErrorInlineResultError
     return v3BrowserCodecErrorSchema(kind)
 
@@ -397,49 +380,70 @@ fn v3BrowserCodecExportBytesResult(bytesRes: Result[Bytes],
 fn v3BrowserCodecReadInputBytesRequired(handle: int32,
                                         missingError: str,
                                         copyError: str): Result[Bytes] =
-    let schema = v3BrowserCodecInputSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleInputBytesRequiredName(),
-                                                      missingError,
-                                                      copyError)
+    var schema: V3BrowserCodecInputSchema
+    schema.kind = v3BrowserCodecInputBytesRequired
+    schema.missingError = missingError
+    schema.copyError = copyError
     return v3BrowserCodecReadInputBytes(handle, schema)
 
 fn v3BrowserCodecReadInputTextRequired(handle: int32,
                                        missingError: str,
                                        copyError: str): Result[str] =
-    let schema = v3BrowserCodecInputSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleInputTextRequiredName(),
-                                                      missingError,
-                                                      copyError)
+    var schema: V3BrowserCodecInputSchema
+    schema.kind = v3BrowserCodecInputTextRequired
+    schema.missingError = missingError
+    schema.copyError = copyError
     return v3BrowserCodecReadInputText(handle, schema)
 
 fn v3BrowserCodecReadInputTextOptional(handle: int32,
                                        copyError: str): Result[str] =
-    let schema = v3BrowserCodecInputSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleInputTextOptionalName(),
-                                                      "",
-                                                      copyError)
+    var schema: V3BrowserCodecInputSchema
+    schema.kind = v3BrowserCodecInputTextOptional
+    schema.missingError = ""
+    schema.copyError = copyError
     return v3BrowserCodecReadInputText(handle, schema)
 
 fn v3BrowserCodecWriteOutputBytesHandleRequired(payload: Bytes,
                                                 handleError: str): Result[int32] =
-    let schema = v3BrowserCodecOutputSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleOutputBytesHandleName(),
-                                                       handleError)
+    var schema: V3BrowserCodecOutputSchema
+    schema.kind = v3BrowserCodecOutputBytesHandle
+    schema.handleError = handleError
     return v3BrowserCodecWriteOutputBytesHandle(payload, schema)
 
 fn v3BrowserCodecWriteOutputTextHandleRequired(text: str,
                                                handleError: str): Result[int32] =
-    let schema = v3BrowserCodecOutputSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleOutputTextHandleName(),
-                                                       handleError)
+    var schema: V3BrowserCodecOutputSchema
+    schema.kind = v3BrowserCodecOutputTextHandle
+    schema.handleError = handleError
     return v3BrowserCodecWriteOutputTextHandle(text, schema)
 
 fn v3BrowserCodecExportMoqFountainTextResult(textRes: Result[str],
                                              handleError: str): int32 =
-    let schema = v3BrowserCodecExportSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleExportMoqFountainTextResultName(),
-                                                       handleError)
-    return v3BrowserCodecExportTextResult(textRes, schema)
+    var output: V3BrowserCodecOutputSchema
+    output.kind = v3BrowserCodecOutputTextHandle
+    output.handleError = handleError
+    var err: V3BrowserCodecErrorSchema
+    err.kind = v3BrowserCodecErrorMoqFountainLastError
+    v3BrowserCodecClearError(err)
+    let handleRes = v3BrowserCodecLiftTextHandle(textRes, output)
+    if IsErr(handleRes):
+        v3BrowserCodecPublishError(Error(handleRes), err)
+        return 0
+    return Value(handleRes)
 
 fn v3BrowserCodecExportMoqFountainBytesResult(bytesRes: Result[Bytes],
                                               handleError: str): int32 =
-    let schema = v3BrowserCodecExportSchemaForRuleName(browsercodec.v3BrowserContentCodecRuleExportMoqFountainBytesResultName(),
-                                                       handleError)
-    return v3BrowserCodecExportBytesResult(bytesRes, schema)
+    var output: V3BrowserCodecOutputSchema
+    output.kind = v3BrowserCodecOutputBytesHandle
+    output.handleError = handleError
+    var err: V3BrowserCodecErrorSchema
+    err.kind = v3BrowserCodecErrorMoqFountainLastError
+    v3BrowserCodecClearError(err)
+    let handleRes = v3BrowserCodecLiftBytesHandle(bytesRes, output)
+    if IsErr(handleRes):
+        v3BrowserCodecPublishError(Error(handleRes), err)
+        return 0
+    return Value(handleRes)
 
 fn v3BrowserCodecMoqFountainLastErrorHandle(): int32 =
     return cheng_v3_browser_moq_fountain_last_error_handle_bridge()

@@ -64,7 +64,13 @@ void cheng_mobile_host_runtime_mark_started(void);
 void cheng_mobile_host_runtime_mark_stopped(const char* reason);
 const char* cheng_mobile_host_runtime_state_json(void);
 void cheng_mobile_host_runtime_set_launch_args(const char* argsKv, const char* argsJson);
+void cheng_mobile_host_runtime_set_manifest_payloads(const char* manifestJson,
+                                                     const char* contractPayloadJson,
+                                                     const char* bundlePayloadJson);
 const char* cheng_mobile_host_runtime_launch_args_kv(void);
 const char* cheng_mobile_host_runtime_launch_args_json(void);
+const char* cheng_mobile_host_runtime_manifest_json(void);
+const char* cheng_mobile_host_runtime_contract_payload_json(void);
+const char* cheng_mobile_host_runtime_bundle_payload_json(void);
 
 #endif

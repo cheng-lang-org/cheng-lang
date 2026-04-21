@@ -1,18 +1,8 @@
 import std/os
 import std/strings
 import std/strutils as strutil
+import std/os_host_process as hostos
 import cheng/v3/tooling/path as v3path
-
-importc fn cheng_v3_exec_program_capture_bridge(programName: cstring, argvWire: str, workingDir: cstring, exitCode: var int64): cstring
-importc fn cheng_v3_exec_program_capture_bridge_dispose(raw: cstring)
-
-fn r2cProcessEncodeArgvWire(argv: str[]): str =
-    var out = ""
-    let sep = strings.CharToStr('\0')
-    for i in 0..<argv.len:
-        out = out + argv[i]
-        out = out + sep
-    return out
 
 fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
     let name: str = strutil.Strip(nameRaw)
@@ -25,8 +15,8 @@ fn r2cProcessResolveProgram(root: str, nameRaw: str): str =
         return ""
     let pathEnv: str = os.GetEnv("PATH")
     let total: int32 = strings.Len(pathEnv)
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= total:
         var endHit = false
         if i == total:
@@ -53,19 +43,17 @@ fn r2cProcessCapture(filePath: str,
                      workingDir: str,
                      timeoutSec: int32,
                      outputOut: var str): int32 =
-    let _ = timeoutSec
-    os.OsSetEmpty(outputOut)
+    outputOut = ""
     if strings.Len(filePath) <= 0:
         return -1
-    var exitCode64: int64 = -1
-    let argvWire = r2cProcessEncodeArgvWire(argv)
-    let rawOutput: cstring = cheng_v3_exec_program_capture_bridge(strToCStringTemp(filePath),
-                                                                  argvWire,
-                                                                  strToCStringTemp(workingDir),
-                                                                  exitCode64)
-    outputOut = strFromCStringCopy(rawOutput)
-    cheng_v3_exec_program_capture_bridge_dispose(rawOutput)
-    return int32(exitCode64)
+    let res: os.ExecCmdResult = hostos.ExecFileCapture(filePath,
+                                                       argv,
+                                                       [],
+                                                       workingDir,
+                                                       true,
+                                                       timeoutSec)
+    outputOut = os.ExecCmdResultOutput(res)
+    return os.ExecCmdResultExitCode(res)
 
 fn r2cProcessRunFileLogged(root: str,
                            label: str,
@@ -97,7 +85,7 @@ fn r2cProcessRunProgramLogged(root: str,
     let programPath: str = r2cProcessResolveProgram(root, programName)
     if !v3path.V3PathNonEmpty(programPath):
         exitCodeOut = -1
-        os.OsSetStr(outputOut, "missing executable: " + programName)
+        outputOut = "missing executable: " + programName
         let logPath: str = v3path.V3PathAbsolute(root, logPathRaw)
         let _logged: bool = v3path.V3WriteTextFile(root, logPath, outputOut)
         let _ = label

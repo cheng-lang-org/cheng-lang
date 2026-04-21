@@ -92,7 +92,7 @@ Cheng 不是“先把共享做出来，再去补线程安全规则”。
 Cheng 的一个非常鲜明的方向是：**当前默认公开编译口径下，用户源码表面不把裸指针当成主要编程模型。**
 
 也就是说，`cheng`、`release-compile` 与默认 `chengc` 都按 no-pointer 生产策略检查用户源码；旧的
-`ABI=v2_noptr`、`STAGE1_NO_POINTERS_NON_C_ABI=*` 这组名字只保留给内部实现/兼容 gate，不再是新的用户编译开关。
+旧兼容名 `ABI=v2_noptr`、`STAGE1_NO_POINTERS_NON_C_ABI=*` 只保留给内部实现/兼容 gate，不再是新的用户编译开关。
 
 下面这些能力默认不属于推荐用户表面：
 
@@ -329,6 +329,7 @@ Cheng 当前最有辨识度的编译器特性包括：
 - `artifacts/v3_bootstrap/cheng.stage3`
 - `artifacts/v3_backend_driver/cheng`
 - `artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge / build-backend-driver`
+- `artifacts/v3_bootstrap/cheng.stage3 run-production-regression`
 - `artifacts/v3_bootstrap/cheng.stage3 profile-run / profile-report`
 - `artifacts/v3_backend_driver/cheng status / run-host-smokes`
 - `artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke`
@@ -351,6 +352,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 ```sh
 ./artifacts/v3_bootstrap/cheng.stage3 bootstrap-bridge
 ./artifacts/v3_bootstrap/cheng.stage3 build-backend-driver
+./artifacts/v3_bootstrap/cheng.stage3 run-production-regression
 ./artifacts/v3_backend_driver/cheng status
 ./artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke
 ./artifacts/v3_backend_driver/cheng run-host-smokes cheng_skill_consistency_smoke
@@ -359,7 +361,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 可以把它们理解成三类入口：
 
 - `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
-- `build-backend-driver` / `system-link-exec`：生成并使用当前 v3 编译器
+- `build-backend-driver` / `run-production-regression` / `system-link-exec`：生成并验证当前 v3 编译器主线
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
 
 调试和性能入口也已经固定：

@@ -86,8 +86,8 @@ fn v3GatePrintErr(text: str) =
     os.WriteLine(os.Get_stderr(), text)
 
 fn v3GatePrintBlock(text: str) =
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= text.len:
         let atEnd: bool = i == text.len
         if atEnd:
@@ -152,13 +152,14 @@ fn v3GateUsage() =
         v3GatePrintLine(lines[i])
 
 fn v3GateUsageLines(): str[] =
-    var out: str[] = []
+    var out: str[]
     add(out, "usage: cheng_v3 <command> [args]")
     add(out, "")
     add(out, "commands:")
     add(out, "  scan-hotpath")
     add(out, "  bootstrap-bridge")
     add(out, "  build-backend-driver")
+    add(out, "  run-production-regression")
     add(out, "  run-smokes")
     add(out, "  print-bootstrap")
     add(out, "  support-matrix")
@@ -241,7 +242,7 @@ fn v3GateReadFlag(args: str[], key: str, defaultValue: str): str =
     return defaultValue
 
 fn v3GateCollectArgsFrom(startIndex: int32, count: int32): str[] =
-    var out: str[] = []
+    var out: str[]
     if startIndex > count:
         return out
     for i in startIndex..count:
@@ -556,7 +557,7 @@ fn v3GateEnsureBootstrapBridge(root: str): int32 =
     return v3GateBootstrapBridge(root)
 
 fn v3GateBootstrapFreshInputsReady(root: str, stage3Mtime: int64): bool =
-    var freshInputs: str[] = []
+    var freshInputs: str[]
     if contracts.v3BootstrapCachedFreshInputPaths(root, freshInputs):
         for i in 0..<freshInputs.len:
             if os.FileMtime(freshInputs[i]) > stage3Mtime:
@@ -741,7 +742,7 @@ fn v3GateRunStage3Command(root: str,
     if !os.FileExists(stage3):
         v3GatePrintErr("v3 gate: missing stage3 compiler: " + stage3)
         return 1
-    var stageArgs: str[] = []
+    var stageArgs: str[]
     add(stageArgs, cmd)
     if injectContract && !v3GateArgsContainFlag(args, "--contract-in"):
         add(stageArgs, "--contract-in:" + contracts.v3BootstrapStage1SourcePath(root))
@@ -773,7 +774,7 @@ fn v3GateRunStage3CommandWithEnv(root: str,
     if !os.FileExists(stage3):
         v3GatePrintErr("v3 gate: missing stage3 compiler: " + stage3)
         return 1
-    var stageArgs: str[] = []
+    var stageArgs: str[]
     add(stageArgs, cmd)
     if injectContract && !v3GateArgsContainFlag(args, "--contract-in"):
         add(stageArgs, "--contract-in:" + contracts.v3BootstrapStage1SourcePath(root))
@@ -799,7 +800,7 @@ fn v3GateRunSmokes(root: str): int32 =
     if v3GateEnsureBootstrapBridge(root) != 0:
         return 1
     let stage1Source: str = contracts.v3BootstrapStage1SourcePath(root)
-    var bins: str[] = []
+    var bins: str[]
     add(bins, contracts.v3BootstrapStage0Path(root))
     add(bins, contracts.v3BootstrapStage1Path(root))
     add(bins, contracts.v3BootstrapStage2Path(root))
@@ -812,7 +813,7 @@ fn v3GateRunSmokes(root: str): int32 =
         let binParts: os.SplitFileResult = os.SplitFile(binPath)
         let logRelPath: str = v3GateJoin3("artifacts/v3_gate/", binParts.name, ".self-check.log")
         let logPath: str = v3path.V3PathAbsolute(root, logRelPath)
-        var args: str[] = []
+        var args: str[]
         add(args, "self-check")
         add(args, "--in:" + stage1Source)
         let run: hostops.V3LoggedRun = hostops.v3RunFileLogged(root,
@@ -829,6 +830,35 @@ fn v3GateRunSmokes(root: str): int32 =
         if !hostops.v3LoggedRunOk(run):
             v3GatePrintErr(hostops.v3LoggedRunSummary(run))
             return run.exitCode
+    return 0
+
+fn v3GateRunProductionRegression(root: str): int32 =
+    v3GatePrintLine("[v3 gate] production regression: build-backend-driver")
+    if v3GateBuildBackendDriver(root) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] production regression: command-surface/perf/skill smokes")
+    if v3GateRunHostSmokes(root,
+                           [
+                               "stage3_command_surface_smoke",
+                               "backend_driver_command_surface_smoke",
+                               "build_backend_driver_report_smoke",
+                               "perf_memory_gate_contract_smoke",
+                               "perf_memory_contract_smoke",
+                               "cheng_skill_consistency_smoke"
+                           ]) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] production regression: cross-target smokes")
+    if v3GateRunStage3Command(root,
+                              "run_production_regression_cross_target",
+                              "run-cross-target-smokes",
+                              [],
+                              "run-production-regression.cross-target.log",
+                              false) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] production regression: stage2/stage3 libp2p smokes")
+    if v3GateRunStage23Libp2pSmokes(root, []) != 0:
+        return 1
+    v3GatePrintLine("[v3 gate] production regression: ok")
     return 0
 
 fn v3GateVerifyTcpBioLinuxRegression(root: str): int32 =
@@ -895,7 +925,7 @@ fn v3GateCompileEmitEnv(root: str,
                         logRelPath: str,
                         envOverrides: str[]): hostops.V3LoggedRun =
     let packageRoot = v3path.V3PathAbsolute(root, "v3")
-    var compilerAbs: str = ""
+    var compilerAbs: str
     let outParts: os.SplitFileResult = os.SplitFile(outPath)
     if len(outParts.dir) > 0:
         let _ = v3path.V3MkdirP(root, outParts.dir)
@@ -969,7 +999,7 @@ fn v3GateCompileExeEnvAtRoot(root: str,
                              target: str,
                              logRelPath: str,
                              envOverrides: str[]): hostops.V3LoggedRun =
-    var compilerAbs: str = ""
+    var compilerAbs: str
     let outParts: os.SplitFileResult = os.SplitFile(outPath)
     if len(outParts.dir) > 0:
         let _ = v3path.V3MkdirP(root, outParts.dir)
@@ -1098,8 +1128,8 @@ fn v3GateOutputContains(text: str, needle: str): bool =
 
 fn v3GateOutputLineValue(text: str, key: str): str =
     let prefix = key + "="
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= text.len:
         var lineEnd = false
         if i == text.len:
@@ -1124,8 +1154,8 @@ fn v3GateBuildPlanLineRelevant(line: str): bool =
 
 fn v3GateBuildPlanComparableText(text: str): str =
     var out = ""
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= text.len:
         var lineEnd = false
         if i == text.len:
@@ -1152,7 +1182,7 @@ fn v3GateRequireOutput(run: hostops.V3LoggedRun,
     return false
 
 fn v3GateCollectPositionals(args: str[]): str[] =
-    var out: str[] = []
+    var out: str[]
     for i in 0..<args.len:
         let arg: str = args[i]
         if !strutil.StartsWith(arg, "--"):
@@ -2881,10 +2911,10 @@ fn v3GateBenchBftValidatorThreeNode(root: str,
             v3GatePrintErr("v3 bft bench: topup did not converge")
             return 1
     let benchStart = monotimes.GetMonoTime()
-    var waveElapsedMs: int64[] = []
-    var waveTpsMilli: int64[] = []
-    var waveBlockCounts: int64[] = []
-    var waveRestarted: bool[] = []
+    var waveElapsedMs: int64[]
+    var waveTpsMilli: int64[]
+    var waveBlockCounts: int64[]
+    var waveRestarted: bool[]
     var totalQueuedCount = int64(0)
     var totalQueuedBytes = int64(0)
     var txWireBytes = int64(0)
@@ -3174,7 +3204,7 @@ fn v3GateOrphanSnapshotKey(lineRaw: str): str =
     return pidText + "|" + commandText
 
 fn v3GateNormalizeOrphanSnapshot(text: str): str[] =
-    var out: str[] = []
+    var out: str[]
     let lines = strutil.Split(text, '\n')
     for i in 0..<lines.len:
         let key = v3GateOrphanSnapshotKey(lines[i])
@@ -3189,7 +3219,7 @@ fn v3GateSeqContainsStr(items: str[], value: str): bool =
     return false
 
 fn v3GateCollectNewOrphanKeys(before: str[], after: str[]): str[] =
-    var out: str[] = []
+    var out: str[]
     for i in 0..<after.len:
         let key = after[i]
         if !v3GateSeqContainsStr(before, key) && !v3GateSeqContainsStr(out, key):
@@ -3290,7 +3320,7 @@ fn v3GateVerifyOrphanGuard(root: str): int32 =
         if v3GateTextContainsAny(text, bannedEntries):
             v3GatePrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
             return 1
-    var orphanBefore: str[] = []
+    var orphanBefore: str[]
     if v3GateReadChengOrphanSnapshot(root,
                                      "orphan_guard_before",
                                      "artifacts/v3_gate/orphan_guard_before.log",
@@ -3300,7 +3330,7 @@ fn v3GateVerifyOrphanGuard(root: str): int32 =
         return 1
     if v3GateBuildBackendDriver(root) != 0:
         return 1
-    var orphanAfter: str[] = []
+    var orphanAfter: str[]
     if v3GateReadChengOrphanSnapshot(root,
                                      "orphan_guard_after",
                                      "artifacts/v3_gate/orphan_guard_after.log",
@@ -3323,7 +3353,9 @@ fn v3GateDefaultHostSmokes(): str[] =
         "compiler_runtime_smoke",
         "artifact_isolation_audit_smoke",
         "backend_driver_command_surface_smoke",
+        "build_backend_driver_report_smoke",
         "backend_driver_candidate_output_smoke",
+        "perf_memory_gate_contract_smoke",
         "runtime_link_input_surface_smoke",
         "runtime_zero_c_surface_smoke",
         "composite_default_init_smoke",
@@ -3389,6 +3421,8 @@ fn v3GateDefaultHostSmokes(): str[] =
         "bft_three_replica_smoke",
         "primary_object_plan_smoke",
         "object_native_link_plan_smoke",
+        "build_backend_driver_report_smoke",
+        "perf_memory_gate_contract_smoke",
         "ffi_handle_smoke",
         "program_selfhost_smoke",
         "csg_smoke",
@@ -3561,6 +3595,8 @@ fn v3GateSmokeRunTimeoutSec(): int32 =
     return 60
 
 fn v3GateSmokeRunTimeoutSecFor(smokeName: str): int32 =
+    if smokeName == "build_backend_driver_report_smoke":
+        return 240
     if smokeName == "runtime_zero_c_surface_smoke":
         return 180
     return v3GateSmokeRunTimeoutSec()
@@ -3924,7 +3960,7 @@ fn v3GateRunWasmSmokes(root: str,
         "wasm_importc_noarg_i32_smoke",
         "wasm_shadowed_local_scope_smoke"
     ]
-    var jobs: hostops.V3ParallelJob[] = []
+    var jobs: hostops.V3ParallelJob[]
     for i in 0..<names.len:
         let smokeName: str = names[i]
         let src: str = v3path.V3PathAbsolute(root, "v3/src/tests/" + smokeName + ".cheng")
@@ -3958,7 +3994,7 @@ fn v3GateRunWasmSmokes(root: str,
         if !os.FileExists(outWasm):
             v3GatePrintErr("v3 wasm smokes: missing wasm output: " + outWasm)
             return 1
-    var expectedExports: str[] = []
+    var expectedExports: str[]
     add(expectedExports, "main")
     if !v3GateRequireWasmAudit("v3 wasm audit zero",
                                os.JoinPath(outDir, "wasm_zero_smoke." + label + ".wasm"),
@@ -4018,7 +4054,7 @@ fn v3GateRunBrowserHostWasmSmoke(root: str,
                                  label: str,
                                  envOverrides: str[]): int32 =
     let outDir: str = v3path.V3PathAbsolute(root, "artifacts/v3_browser_host_wasm")
-    let src: str = v3path.V3PathAbsolute(root, "v3/src/libp2p/browser/browser_host_wasm_probe.cheng")
+    let src: str = v3path.V3PathAbsolute(root, "v3/src/libp2p/browser/browser_host_wasm_surface_probe.cheng")
     let outWasm: str = os.JoinPath(outDir, "cheng_browser_host_abi." + label + ".wasm")
     let compileRun = v3GateCompileEmitEnv(root,
                                           "v3 browser host wasm compile " + label,
@@ -4034,7 +4070,7 @@ fn v3GateRunBrowserHostWasmSmoke(root: str,
     if !os.FileExists(outWasm):
         v3GatePrintErr("v3 browser host wasm smoke: missing wasm output: " + outWasm)
         return 1
-    var expectedExports: str[] = []
+    var expectedExports: str[]
     add(expectedExports, "main")
     add(expectedExports, "browserNowMs")
     add(expectedExports, "browserEchoI32")
@@ -4046,7 +4082,7 @@ fn v3GateRunBrowserHostWasmSmoke(root: str,
     add(expectedExports, "browserMoqFountainRebuild")
     add(expectedExports, "browserMoqBuildLongBlobComputedBundleCidLenProbe")
     add(expectedExports, "browserMoqPeerCsvCountProbe")
-    var expectedImports: str[] = []
+    var expectedImports: str[]
     add(expectedImports, "env.cheng_v3_browser_now_ms_bridge")
     add(expectedImports, "env.cheng_v3_browser_echo_i32_bridge")
     add(expectedImports, "env.cheng_v3_browser_peer_handle_bridge")
@@ -4071,21 +4107,21 @@ fn v3GateRunBrowserHostWasmSmoke(root: str,
                                outWasm,
                                expectedExports,
                                expectedImports,
-                               40):
+                               expectedExports.len):
         return 1
     let hostTarget = v3GateHostTarget(root)
     if len(hostTarget) <= 0:
         v3GatePrintErr("v3 browser host wasm smoke: unsupported host target")
         return 1
-    let hostSrc = v3path.V3PathAbsolute(root, "v3/src/tests/browser_host_native_contract_smoke.cheng")
-    let hostBin = os.JoinPath(outDir, "browser_host_native_contract_smoke." + label)
+    let hostSrc = v3path.V3PathAbsolute(root, "v3/src/tests/browser_host_native_runtime_smoke.cheng")
+    let hostBin = os.JoinPath(outDir, "browser_host_native_runtime_smoke." + label)
     let hostCompile = v3GateCompileExeEnv(root,
                                           "v3 browser host native compile " + label,
                                           compilerPath,
                                           hostSrc,
                                           hostBin,
                                           hostTarget,
-                                          os.JoinPath(outDir, "browser_host_native_contract_smoke." + label + ".compile.log"),
+                                          os.JoinPath(outDir, "browser_host_native_runtime_smoke." + label + ".compile.log"),
                                           envOverrides)
     if v3GateRunFailed(hostCompile):
         return hostCompile.exitCode
@@ -4198,6 +4234,86 @@ fn v3GateChainNodeRequireStateParity(authorRun: hostops.V3LoggedRun,
         return false
     return true
 
+fn v3GateChainInitArgs(statePath: str,
+                       nodeId: str,
+                       addressSeed: str): str[] =
+    return ["chain",
+            "init",
+            "--state:" + statePath,
+            "--node-id:" + nodeId,
+            "--address-seed:" + addressSeed]
+
+fn v3GateChainMintArgs(statePath: str,
+                       accountId: str,
+                       amountText: str): str[] =
+    return ["chain",
+            "mint",
+            "--state:" + statePath,
+            "--asset:7",
+            "--account:" + accountId,
+            "--amount:" + amountText]
+
+fn v3GateChainTransferArgs(statePath: str,
+                           fromAccountId: str,
+                           toAccountId: str,
+                           amountText: str): str[] =
+    return ["chain",
+            "transfer",
+            "--state:" + statePath,
+            "--asset:7",
+            "--from:" + fromAccountId,
+            "--to:" + toAccountId,
+            "--amount:" + amountText]
+
+fn v3GateChainBalanceArgs(statePath: str,
+                          accountId: str): str[] =
+    return ["chain",
+            "balance",
+            "--state:" + statePath,
+            "--asset:7",
+            "--account:" + accountId]
+
+fn v3GateChainShowStateArgs(statePath: str): str[] =
+    return ["chain",
+            "state",
+            "show",
+            "--state:" + statePath]
+
+fn v3GateChainSnapshotDumpArgs(statePath: str): str[] =
+    return ["chain",
+            "snapshot",
+            "dump",
+            "--state:" + statePath]
+
+fn v3GateChainDaemonServeArgs(statePath: str,
+                              readyPath: str): str[] =
+    return ["chain",
+            "daemon",
+            "serve",
+            "--state:" + statePath,
+            "--port:0",
+            "--ready-path:" + readyPath]
+
+fn v3GateChainDaemonSyncArgs(statePath: str,
+                             nodeId: str,
+                             addressSeed: str,
+                             serverPort: str): str[] =
+    var out: str[]
+    add(out, "chain")
+    add(out, "daemon")
+    add(out, "sync")
+    add(out, "--state:" + statePath)
+    if len(nodeId) > 0:
+        add(out, "--node-id:" + nodeId)
+    if len(addressSeed) > 0:
+        add(out, "--address-seed:" + addressSeed)
+    add(out, "--host:127.0.0.1")
+    add(out, "--port:" + serverPort)
+    return out
+
+fn v3GateChainSelfTestArgs(): str[] =
+    return ["chain", "self", "test"]
+
 fn v3GateRunChainNodeServeAndSync(root: str,
                                   label: str,
                                   chainNodeBin: str,
@@ -4233,7 +4349,7 @@ fn v3GateRunChainNodeServeAndSync(root: str,
         v3GateMaybePrintRunOutput(serverRun)
         hostops.v3SpawnedProcessKill(serverProc)
         return 1
-    var syncArgs: str[] = []
+    var syncArgs: str[]
     add(syncArgs, "chain-daemon-sync")
     add(syncArgs, "--state:" + clientState)
     if len(clientNodeId) > 0:
@@ -7404,6 +7520,7 @@ fn v3GateHandlesCommandBase(cmd: str): bool =
     return cmd == "scan-hotpath" ||
            cmd == "bootstrap-bridge" ||
            cmd == "build-backend-driver" ||
+           cmd == "run-production-regression" ||
            cmd == "run-smokes" ||
            cmd == "print-bootstrap" ||
            cmd == "support-matrix" ||
@@ -7508,6 +7625,8 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
         return v3GateBootstrapBridge(root)
     if cmd == "build-backend-driver":
         return v3GateBuildBackendDriver(root)
+    if cmd == "run-production-regression":
+        return v3GateRunProductionRegression(root)
     if cmd == "run-smokes":
         return v3GateRunSmokes(root)
     if cmd == "print-bootstrap":
@@ -7575,7 +7694,15 @@ fn v3GateMain(argc: int32, argv: str*): int32 =
     if cmd == "verify-oracle-bft-three-node":
         return v3GateVerifyOracleBftThreeNode(root)
     if cmd == "verify-r2c-react-v3-surface":
-        return v3GateRunHostSmokes(root, ["r2c_react_v3_surface_smoke"])
+        return v3GateRunHostSmokes(root,
+                                   [
+                                       "r2c_react_v3_surface_smoke",
+                                       "r2c_react_v3_publish_selector_bundle_smoke",
+                                       "r2c_react_v3_run_native_gui_controller_smoke",
+                                       "r2c_react_v3_truth_compare_controller_smoke",
+                                       "r2c_react_v3_render_compare_direct_smoke",
+                                       "r2c_react_v3_render_compare_controller_smoke"
+                                   ])
     if cmd == "verify-debug-tools":
         return v3GateRunStage3Command(root, "verify_debug_tools", cmd, args, "verify-debug-tools.log", false)
     if cmd == "verify-debug-runtime":

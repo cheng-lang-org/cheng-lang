@@ -30,6 +30,7 @@ double cheng_mobile_host_android_density_scale(void);
 #define BUS_ENVELOPE_CAP 8192u
 #define RUNTIME_ERROR_CAP 256
 #define RUNTIME_LAUNCH_ARGS_CAP 4096
+#define RUNTIME_MANIFEST_JSON_CAP 262144
 #define SHM_SLOT_CAP 128u
 #define CBOR_BUILDER_SLOT_CAP 16
 #define CBOR_BUILDER_ITEM_CAP 64
@@ -85,6 +86,9 @@ typedef struct {
   char lastError[RUNTIME_ERROR_CAP];
   char launchArgsKv[RUNTIME_LAUNCH_ARGS_CAP];
   char launchArgsJson[RUNTIME_LAUNCH_ARGS_CAP];
+  char manifestJson[RUNTIME_MANIFEST_JSON_CAP];
+  char contractPayloadJson[RUNTIME_MANIFEST_JSON_CAP];
+  char bundlePayloadJson[RUNTIME_MANIFEST_JSON_CAP];
 } ChengRuntimeState;
 
 static ChengRuntimeState s_runtime = {
@@ -92,6 +96,9 @@ static ChengRuntimeState s_runtime = {
     .lastError = "",
     .launchArgsKv = "",
     .launchArgsJson = "",
+    .manifestJson = "",
+    .contractPayloadJson = "",
+    .bundlePayloadJson = "",
 };
 
 static __thread ChengCborBuilder s_cbor_builder_slots[CBOR_BUILDER_SLOT_CAP];
@@ -223,6 +230,19 @@ static int cheng_runtime_token_truthy(const char* token) {
     return v != 0ul ? 1 : 0;
   }
   return 0;
+}
+
+static void cheng_runtime_copy_text(char* dst, size_t cap, const char* src) {
+  if (dst == NULL || cap == 0u) {
+    return;
+  }
+  if (src == NULL || src[0] == '\0') {
+    dst[0] = '\0';
+    return;
+  }
+  size_t n = strnlen(src, cap - 1u);
+  memcpy(dst, src, n);
+  dst[n] = '\0';
 }
 
 typedef struct {
@@ -1802,11 +1822,14 @@ void cheng_mobile_host_runtime_mark_stopped(const char* reason) {
 }
 
 const char* cheng_mobile_host_runtime_state_json(void) {
-  static __thread char out[RUNTIME_ERROR_CAP + RUNTIME_LAUNCH_ARGS_CAP + 1024];
+  static __thread char out[RUNTIME_ERROR_CAP + RUNTIME_LAUNCH_ARGS_CAP + 1200];
   int started = 0;
   char error[RUNTIME_ERROR_CAP];
   char launchKv[RUNTIME_LAUNCH_ARGS_CAP];
   char launchJson[RUNTIME_LAUNCH_ARGS_CAP];
+  int manifestReady = 0;
+  int contractPayloadReady = 0;
+  int bundlePayloadReady = 0;
   char sanitized[RUNTIME_ERROR_CAP];
   char sanitizedKv[RUNTIME_LAUNCH_ARGS_CAP];
   char sanitizedJson[RUNTIME_LAUNCH_ARGS_CAP];
@@ -1815,12 +1838,24 @@ const char* cheng_mobile_host_runtime_state_json(void) {
   char semanticAppliedHash[64];
   char token[64];
   char sanitizedRouteState[256];
+  char bundleRouteState[128];
+  char sanitizedBundleRouteState[256];
   uint32_t surfaceWidth = 0u;
   uint32_t surfaceHeight = 0u;
   uint32_t surfaceScaleMilli = 0u;
   uint32_t semanticNodesLoaded = 0u;
   uint32_t semanticNodesAppliedCount = 0u;
+  uint32_t bundleRouteCount = 0u;
+  uint32_t bundleSupportedCount = 0u;
+  uint32_t bundleSemanticNodesCount = 0u;
+  uint32_t bundleLayoutItemCount = 0u;
+  uint32_t bundleRenderCommandCount = 0u;
+  uint32_t contractLayoutItemCount = 0u;
+  uint32_t contractViewportItemCount = 0u;
+  uint32_t contractInteractiveItemCount = 0u;
   int renderReady = 0;
+  int runtimeBundleReady = 0;
+  int runtimeContractReady = 0;
   error[0] = '\0';
   launchKv[0] = '\0';
   launchJson[0] = '\0';
@@ -1828,10 +1863,12 @@ const char* cheng_mobile_host_runtime_state_json(void) {
   sanitizedKv[0] = '\0';
   sanitizedJson[0] = '\0';
   routeState[0] = '\0';
+  bundleRouteState[0] = '\0';
   frameHash[0] = '\0';
   semanticAppliedHash[0] = '\0';
   token[0] = '\0';
   sanitizedRouteState[0] = '\0';
+  sanitizedBundleRouteState[0] = '\0';
 
   pthread_mutex_lock(&s_runtime_mutex);
   started = s_runtime.started;
@@ -1844,6 +1881,9 @@ const char* cheng_mobile_host_runtime_state_json(void) {
   size_t js_n = strnlen(s_runtime.launchArgsJson, RUNTIME_LAUNCH_ARGS_CAP - 1u);
   memcpy(launchJson, s_runtime.launchArgsJson, js_n);
   launchJson[js_n] = '\0';
+  manifestReady = s_runtime.manifestJson[0] != '\0';
+  contractPayloadReady = s_runtime.contractPayloadJson[0] != '\0';
+  bundlePayloadReady = s_runtime.bundlePayloadJson[0] != '\0';
   pthread_mutex_unlock(&s_runtime_mutex);
 
   (void)n;
@@ -1881,6 +1921,47 @@ const char* cheng_mobile_host_runtime_state_json(void) {
     uint32_t parsed = 0u;
     if (cheng_runtime_token_to_u32(token, &parsed)) surfaceScaleMilli = parsed;
   }
+  if (cheng_runtime_reason_get_token(error, "rb", token, sizeof(token))) {
+    runtimeBundleReady = cheng_runtime_token_truthy(token) ? 1 : 0;
+  }
+  if (cheng_runtime_reason_get_token(error, "rc", token, sizeof(token))) {
+    runtimeContractReady = cheng_runtime_token_truthy(token) ? 1 : 0;
+  }
+  if (cheng_runtime_reason_get_token(error, "rr", bundleRouteState, sizeof(bundleRouteState))) {
+    /* bundleRouteState already set */
+  }
+  if (cheng_runtime_reason_get_token(error, "br", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) bundleRouteCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "bs", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) bundleSupportedCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "bn", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) bundleSemanticNodesCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "bi", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) bundleLayoutItemCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "bc", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) bundleRenderCommandCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "ci", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) contractLayoutItemCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "cv", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) contractViewportItemCount = parsed;
+  }
+  if (cheng_runtime_reason_get_token(error, "cx", token, sizeof(token))) {
+    uint32_t parsed = 0u;
+    if (cheng_runtime_token_to_u32(token, &parsed)) contractInteractiveItemCount = parsed;
+  }
 #ifdef __ANDROID__
   if (surfaceWidth == 0u) {
     int w = cheng_mobile_host_android_width();
@@ -1903,6 +1984,7 @@ const char* cheng_mobile_host_runtime_state_json(void) {
   cheng_json_escape_copy(launchKv, sanitizedKv, sizeof(sanitizedKv));
   cheng_json_escape_copy(launchJson, sanitizedJson, sizeof(sanitizedJson));
   cheng_json_escape_copy(routeState, sanitizedRouteState, sizeof(sanitizedRouteState));
+  cheng_json_escape_copy(bundleRouteState, sanitizedBundleRouteState, sizeof(sanitizedBundleRouteState));
 
   if (error[0] == '\0') {
     snprintf(
@@ -1910,20 +1992,41 @@ const char* cheng_mobile_host_runtime_state_json(void) {
         sizeof(out),
         "{\"abi_version\":%d,\"native_ready\":true,\"started\":%s,\"last_error\":\"\","
         "\"launch_args_kv\":\"%s\",\"launch_args_json\":\"%s\","
+        "\"runtime_manifest_ready\":%s,\"runtime_contract_payload_ready\":%s,"
+        "\"runtime_bundle_payload_ready\":%s,"
+        "\"runtime_bundle_ready\":%s,\"runtime_contract_ready\":%s,"
         "\"semantic_nodes_loaded\":%s,\"semantic_nodes_applied_count\":%u,"
         "\"semantic_nodes_applied_hash\":\"%s\",\"last_frame_hash\":\"%s\","
         "\"route_state\":\"%s\",\"render_ready\":%s,"
+        "\"bundle_route_state\":\"%s\",\"bundle_route_count\":%u,\"bundle_supported_count\":%u,"
+        "\"bundle_semantic_nodes_count\":%u,\"bundle_layout_item_count\":%u,"
+        "\"bundle_render_command_count\":%u,\"contract_layout_item_count\":%u,"
+        "\"contract_viewport_item_count\":%u,\"contract_interactive_item_count\":%u,"
         "\"surface_width\":%u,\"surface_height\":%u,\"surface_scale_milli\":%u}",
         CHENG_MOBILE_ABI_VERSION,
         started ? "true" : "false",
         sanitizedKv,
         sanitizedJson,
+        manifestReady ? "true" : "false",
+        contractPayloadReady ? "true" : "false",
+        bundlePayloadReady ? "true" : "false",
+        runtimeBundleReady ? "true" : "false",
+        runtimeContractReady ? "true" : "false",
         semanticNodesLoaded ? "true" : "false",
         semanticNodesAppliedCount,
         semanticAppliedHash,
         frameHash,
         sanitizedRouteState,
         renderReady ? "true" : "false",
+        sanitizedBundleRouteState,
+        bundleRouteCount,
+        bundleSupportedCount,
+        bundleSemanticNodesCount,
+        bundleLayoutItemCount,
+        bundleRenderCommandCount,
+        contractLayoutItemCount,
+        contractViewportItemCount,
+        contractInteractiveItemCount,
         surfaceWidth,
         surfaceHeight,
         surfaceScaleMilli);
@@ -1933,21 +2036,42 @@ const char* cheng_mobile_host_runtime_state_json(void) {
         sizeof(out),
         "{\"abi_version\":%d,\"native_ready\":true,\"started\":%s,\"last_error\":\"%s\","
         "\"launch_args_kv\":\"%s\",\"launch_args_json\":\"%s\","
+        "\"runtime_manifest_ready\":%s,\"runtime_contract_payload_ready\":%s,"
+        "\"runtime_bundle_payload_ready\":%s,"
+        "\"runtime_bundle_ready\":%s,\"runtime_contract_ready\":%s,"
         "\"semantic_nodes_loaded\":%s,\"semantic_nodes_applied_count\":%u,"
         "\"semantic_nodes_applied_hash\":\"%s\",\"last_frame_hash\":\"%s\","
         "\"route_state\":\"%s\",\"render_ready\":%s,"
+        "\"bundle_route_state\":\"%s\",\"bundle_route_count\":%u,\"bundle_supported_count\":%u,"
+        "\"bundle_semantic_nodes_count\":%u,\"bundle_layout_item_count\":%u,"
+        "\"bundle_render_command_count\":%u,\"contract_layout_item_count\":%u,"
+        "\"contract_viewport_item_count\":%u,\"contract_interactive_item_count\":%u,"
         "\"surface_width\":%u,\"surface_height\":%u,\"surface_scale_milli\":%u}",
         CHENG_MOBILE_ABI_VERSION,
         started ? "true" : "false",
         sanitized,
         sanitizedKv,
         sanitizedJson,
+        manifestReady ? "true" : "false",
+        contractPayloadReady ? "true" : "false",
+        bundlePayloadReady ? "true" : "false",
+        runtimeBundleReady ? "true" : "false",
+        runtimeContractReady ? "true" : "false",
         semanticNodesLoaded ? "true" : "false",
         semanticNodesAppliedCount,
         semanticAppliedHash,
         frameHash,
         sanitizedRouteState,
         renderReady ? "true" : "false",
+        sanitizedBundleRouteState,
+        bundleRouteCount,
+        bundleSupportedCount,
+        bundleSemanticNodesCount,
+        bundleLayoutItemCount,
+        bundleRenderCommandCount,
+        contractLayoutItemCount,
+        contractViewportItemCount,
+        contractInteractiveItemCount,
         surfaceWidth,
         surfaceHeight,
         surfaceScaleMilli);
@@ -1957,20 +2081,18 @@ const char* cheng_mobile_host_runtime_state_json(void) {
 
 void cheng_mobile_host_runtime_set_launch_args(const char* argsKv, const char* argsJson) {
   pthread_mutex_lock(&s_runtime_mutex);
-  if (argsKv != NULL && argsKv[0] != '\0') {
-    size_t n = strnlen(argsKv, RUNTIME_LAUNCH_ARGS_CAP - 1u);
-    memcpy(s_runtime.launchArgsKv, argsKv, n);
-    s_runtime.launchArgsKv[n] = '\0';
-  } else {
-    s_runtime.launchArgsKv[0] = '\0';
-  }
-  if (argsJson != NULL && argsJson[0] != '\0') {
-    size_t n = strnlen(argsJson, RUNTIME_LAUNCH_ARGS_CAP - 1u);
-    memcpy(s_runtime.launchArgsJson, argsJson, n);
-    s_runtime.launchArgsJson[n] = '\0';
-  } else {
-    s_runtime.launchArgsJson[0] = '\0';
-  }
+  cheng_runtime_copy_text(s_runtime.launchArgsKv, RUNTIME_LAUNCH_ARGS_CAP, argsKv);
+  cheng_runtime_copy_text(s_runtime.launchArgsJson, RUNTIME_LAUNCH_ARGS_CAP, argsJson);
+  pthread_mutex_unlock(&s_runtime_mutex);
+}
+
+void cheng_mobile_host_runtime_set_manifest_payloads(const char* manifestJson,
+                                                     const char* contractPayloadJson,
+                                                     const char* bundlePayloadJson) {
+  pthread_mutex_lock(&s_runtime_mutex);
+  cheng_runtime_copy_text(s_runtime.manifestJson, RUNTIME_MANIFEST_JSON_CAP, manifestJson);
+  cheng_runtime_copy_text(s_runtime.contractPayloadJson, RUNTIME_MANIFEST_JSON_CAP, contractPayloadJson);
+  cheng_runtime_copy_text(s_runtime.bundlePayloadJson, RUNTIME_MANIFEST_JSON_CAP, bundlePayloadJson);
   pthread_mutex_unlock(&s_runtime_mutex);
 }
 
@@ -1989,6 +2111,36 @@ const char* cheng_mobile_host_runtime_launch_args_json(void) {
   pthread_mutex_lock(&s_runtime_mutex);
   size_t n = strnlen(s_runtime.launchArgsJson, RUNTIME_LAUNCH_ARGS_CAP - 1u);
   memcpy(out, s_runtime.launchArgsJson, n);
+  out[n] = '\0';
+  pthread_mutex_unlock(&s_runtime_mutex);
+  return out;
+}
+
+const char* cheng_mobile_host_runtime_manifest_json(void) {
+  static __thread char out[RUNTIME_MANIFEST_JSON_CAP];
+  pthread_mutex_lock(&s_runtime_mutex);
+  size_t n = strnlen(s_runtime.manifestJson, RUNTIME_MANIFEST_JSON_CAP - 1u);
+  memcpy(out, s_runtime.manifestJson, n);
+  out[n] = '\0';
+  pthread_mutex_unlock(&s_runtime_mutex);
+  return out;
+}
+
+const char* cheng_mobile_host_runtime_contract_payload_json(void) {
+  static __thread char out[RUNTIME_MANIFEST_JSON_CAP];
+  pthread_mutex_lock(&s_runtime_mutex);
+  size_t n = strnlen(s_runtime.contractPayloadJson, RUNTIME_MANIFEST_JSON_CAP - 1u);
+  memcpy(out, s_runtime.contractPayloadJson, n);
+  out[n] = '\0';
+  pthread_mutex_unlock(&s_runtime_mutex);
+  return out;
+}
+
+const char* cheng_mobile_host_runtime_bundle_payload_json(void) {
+  static __thread char out[RUNTIME_MANIFEST_JSON_CAP];
+  pthread_mutex_lock(&s_runtime_mutex);
+  size_t n = strnlen(s_runtime.bundlePayloadJson, RUNTIME_MANIFEST_JSON_CAP - 1u);
+  memcpy(out, s_runtime.bundlePayloadJson, n);
   out[n] = '\0';
   pthread_mutex_unlock(&s_runtime_mutex);
   return out;

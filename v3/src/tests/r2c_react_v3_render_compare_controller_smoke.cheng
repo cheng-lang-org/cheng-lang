@@ -1,0 +1,235 @@
+import std/os
+import cheng/v3/tooling/host_ops as hostops
+import cheng/v3/tooling/path as v3path
+
+fn main(): int32 =
+    let root = os.GetCurrentDir()
+    let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_r2c_render_compare_controller_smoke")
+    assert(v3path.V3MkdirP(root, outDir), "v3 r2c render compare controller smoke: mkdir")
+    let driver = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/cheng")
+    let packageRoot = v3path.V3PathAbsolute(root, "v3")
+    let controllerSource = v3path.V3PathAbsolute(root, "v3/src/tooling/r2c_react_v3.cheng")
+    assert(v3path.V3FileExistsNonEmpty(root, driver), "v3 r2c render compare controller smoke: backend_driver exists")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerSource), "v3 r2c render compare controller smoke: controller source exists")
+
+    let repoEnv = os.GetEnv("R2C_REACT_V3_REPO")
+    var repo = "/Users/lbcheng/UniMaker/React.js"
+    if len(repoEnv) > 0:
+        repo = repoEnv
+    assert(os.DirExists(repo), "v3 r2c render compare controller smoke: React.js repo exists")
+
+    let controllerExe = os.JoinPath(outDir, "r2c_react_v3_render_compare_controller_smoke")
+    let controllerCompileReport = controllerExe + ".report.txt"
+    let controllerCompileLog = controllerExe + ".compile.log"
+    if v3path.V3PathFileExists(controllerExe):
+        os.RemoveFile(controllerExe)
+    if v3path.V3PathFileExists(controllerCompileReport):
+        os.RemoveFile(controllerCompileReport)
+    let controllerCompileRun = hostops.v3RunFileLogged(root,
+                                                       "r2c_render_compare_controller_compile",
+                                                       driver,
+                                                       [
+                                                           "system-link-exec",
+                                                           "--root:" + packageRoot,
+                                                           "--in:" + controllerSource,
+                                                           "--emit:exe",
+                                                           "--target:arm64-apple-darwin",
+                                                           "--out:" + controllerExe,
+                                                           "--report-out:" + controllerCompileReport
+                                                       ],
+                                                       ["CHENG_V3_BACKEND_DRIVER_READY=1"],
+                                                       root,
+                                                       0,
+                                                       controllerCompileLog)
+    assert(hostops.v3LoggedRunOk(controllerCompileRun), "v3 r2c render compare controller smoke: controller compile rc")
+    assert(v3path.V3FileExistsNonEmpty(root, controllerExe), "v3 r2c render compare controller smoke: controller exe")
+
+    let nativePngPath = os.JoinPath(outDir, "native_gui_session.png")
+    let truthPngPath = os.JoinPath(outDir, "truth_session.png")
+    let nativeSummaryPath = os.JoinPath(outDir, "native_gui_run.summary.env")
+    let truthSummaryPath = os.JoinPath(outDir, "truth.summary.env")
+    let truthTracePath = os.JoinPath(outDir, "truth_trace_v2.json")
+    let truthRuntimeStatePath = os.JoinPath(outDir, "truth_runtime_state_v1.json")
+    let truthDomPath = os.JoinPath(outDir, "truth_dom_v1.json")
+    let truthSemanticNodesPath = os.JoinPath(outDir, "truth_semantic_nodes_v1.json")
+    let truthRuntimeMetaPath = os.JoinPath(outDir, "truth_runtime_meta_v1.json")
+    let renderComparePath = os.JoinPath(outDir, "render_compare_report_v1.json")
+    let renderCompareSummaryPath = os.JoinPath(outDir, "render_compare.summary.env")
+
+    let pngBase64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aXfsAAAAASUVORK5CYII="
+    let pngWriterScript = "const fs=require('node:fs');" +
+                          "const png=Buffer.from(process.argv[1],'base64');" +
+                          "fs.writeFileSync(process.argv[2],png);" +
+                          "fs.writeFileSync(process.argv[3],png);"
+    let pngWriterLog = os.JoinPath(outDir, "write_png.log")
+    if v3path.V3PathFileExists(pngWriterLog):
+        os.RemoveFile(pngWriterLog)
+    let pngWriterRun = hostops.v3RunProgramLogged(root,
+                                                  "r2c_render_compare_controller_write_png",
+                                                  "node",
+                                                  ["-e", pngWriterScript, pngBase64, nativePngPath, truthPngPath],
+                                                  [],
+                                                  root,
+                                                  0,
+                                                  pngWriterLog)
+    assert(hostops.v3LoggedRunOk(pngWriterRun), "v3 r2c render compare controller smoke: write png rc")
+    assert(v3path.V3FileExistsNonEmpty(root, nativePngPath), "v3 r2c render compare controller smoke: native png")
+    assert(v3path.V3FileExistsNonEmpty(root, truthPngPath), "v3 r2c render compare controller smoke: truth png")
+
+    assert(v3path.V3WriteTextFile("", truthTracePath,
+                                  "{\n" +
+                                  "  \"format\": \"truth_trace_v2\",\n" +
+                                  "  \"snapshots\": [\n" +
+                                  "    {\n" +
+                                  "      \"stateId\": \"publish_selector\",\n" +
+                                  "      \"route\": {\n" +
+                                  "        \"routeId\": \"publish_selector\"\n" +
+                                  "      },\n" +
+                                  "      \"semanticNodesCount\": 67,\n" +
+                                  "      \"renderReady\": true\n" +
+                                  "    }\n" +
+                                  "  ]\n" +
+                                  "}\n"),
+           "v3 r2c render compare controller smoke: write truth trace")
+    assert(v3path.V3WriteTextFile("", truthRuntimeStatePath,
+                                  "{\n" +
+                                  "  \"format\": \"truth_runtime_state_v1\",\n" +
+                                  "  \"route_state\": \"publish_selector\"\n" +
+                                  "}\n"),
+           "v3 r2c render compare controller smoke: write truth runtime state")
+    assert(v3path.V3WriteTextFile("", truthDomPath,
+                                  "{\n" +
+                                  "  \"format\": \"truth_dom_v1\",\n" +
+                                  "  \"route_state\": \"publish_selector\"\n" +
+                                  "}\n"),
+           "v3 r2c render compare controller smoke: write truth dom")
+    assert(v3path.V3WriteTextFile("", truthSemanticNodesPath,
+                                  "{\n" +
+                                  "  \"format\": \"truth_semantic_nodes_v1\",\n" +
+                                  "  \"count\": 67\n" +
+                                  "}\n"),
+           "v3 r2c render compare controller smoke: write truth semantic nodes")
+    assert(v3path.V3WriteTextFile("", truthRuntimeMetaPath,
+                                  "{\n" +
+                                  "  \"format\": \"truth_runtime_meta_v1\",\n" +
+                                  "  \"browser_width\": 1,\n" +
+                                  "  \"browser_height\": 1\n" +
+                                  "}\n"),
+           "v3 r2c render compare controller smoke: write truth runtime meta")
+
+    assert(v3path.V3WriteTextFile("", nativeSummaryPath,
+                                  "native_gui_route_state=publish_selector\n" +
+                                  "native_gui_screenshot_path=" + nativePngPath + "\n" +
+                                  "native_gui_window_width=1\n" +
+                                  "native_gui_window_height=1\n" +
+                                  "native_gui_layout_item_count=24\n" +
+                                  "native_gui_runtime_manifest_ready=true\n" +
+                                  "native_gui_runtime_contract_payload_ready=true\n" +
+                                  "native_gui_runtime_bundle_payload_ready=true\n" +
+                                  "native_gui_runtime_bundle_ready=true\n" +
+                                  "native_gui_runtime_contract_ready=true\n" +
+                                  "native_gui_runtime_bundle_route_state=publish_selector\n" +
+                                  "native_gui_runtime_bundle_route_count=1\n" +
+                                  "native_gui_runtime_bundle_supported_count=4\n" +
+                                  "native_gui_runtime_bundle_semantic_nodes_count=67\n" +
+                                  "native_gui_runtime_bundle_layout_item_count=24\n" +
+                                  "native_gui_runtime_bundle_render_command_count=35\n" +
+                                  "native_gui_runtime_contract_layout_item_count=24\n" +
+                                  "native_gui_runtime_contract_viewport_item_count=12\n" +
+                                  "native_gui_runtime_contract_interactive_item_count=5\n" +
+                                  "native_gui_native_layout_plan_item_count=24\n" +
+                                  "native_gui_render_plan_command_count=35\n" +
+                                  "native_gui_storage_host_ready=true\n" +
+                                  "native_gui_fetch_host_ready=true\n" +
+                                  "native_gui_custom_event_host_ready=false\n" +
+                                  "native_gui_resize_observer_host_ready=true\n"),
+           "v3 r2c render compare controller smoke: write native summary")
+    assert(v3path.V3WriteTextFile("", truthSummaryPath,
+                                  "truth_trace_path=" + truthTracePath + "\n" +
+                                  "truth_trace_format=truth_trace_v2\n" +
+                                  "runtime_state_path=" + truthRuntimeStatePath + "\n" +
+                                  "dom_path=" + truthDomPath + "\n" +
+                                  "semantic_nodes_path=" + truthSemanticNodesPath + "\n" +
+                                  "runtime_meta_path=" + truthRuntimeMetaPath + "\n" +
+                                  "screenshot_path=" + truthPngPath + "\n" +
+                                  "semantic_nodes_count=67\n" +
+                                  "document_nodes_count=19\n" +
+                                  "dom_hash=truth_dom_hash_publish_selector\n" +
+                                  "screenshot_sha256=truth_screenshot_sha256_publish_selector\n" +
+                                  "pathname=/publish\n" +
+                                  "search=?route=publish_selector\n" +
+                                  "hash=#selector\n"),
+           "v3 r2c render compare controller smoke: write truth summary")
+
+    let controllerLog = os.JoinPath(outDir, "render_compare_controller.log")
+    if v3path.V3PathFileExists(controllerLog):
+        os.RemoveFile(controllerLog)
+    let controllerRun = hostops.v3RunFileLogged(root,
+                                                "r2c_render_compare_controller_smoke",
+                                                controllerExe,
+                                                [
+                                                    "render-compare",
+                                                    "--repo", repo,
+                                                    "--route", "publish_selector",
+                                                    "--out-dir", outDir,
+                                                    "--native-summary", nativeSummaryPath,
+                                                    "--truth-summary", truthSummaryPath,
+                                                    "--native-screenshot", nativePngPath,
+                                                    "--truth-screenshot", truthPngPath
+                                                ],
+                                                [],
+                                                root,
+                                                0,
+                                                controllerLog)
+    assert(hostops.v3LoggedRunOk(controllerRun), "v3 r2c render compare controller smoke: controller rc")
+    assert(v3path.V3FileExistsNonEmpty(root, renderComparePath), "v3 r2c render compare controller smoke: report")
+    assert(v3path.V3FileExistsNonEmpty(root, renderCompareSummaryPath), "v3 r2c render compare controller smoke: summary")
+
+    let reportText = v3path.V3ReadTextFile("", renderComparePath)
+    let summaryText = v3path.V3ReadTextFile("", renderCompareSummaryPath)
+    assert(v3path.V3TextContains(reportText, "\"command\": \"render-compare\""),
+           "v3 r2c render compare controller smoke: report command")
+    assert(v3path.V3TextContains(reportText, "\"ok\": true"),
+           "v3 r2c render compare controller smoke: report ok")
+    assert(v3path.V3TextContains(reportText, "\"primary_artifact_format\": \"render_compare_v1\""),
+           "v3 r2c render compare controller smoke: report artifact format")
+    assert(v3path.V3TextContains(reportText, "\"helper_script\": "),
+           "v3 r2c render compare controller smoke: report helper script")
+    assert(v3path.V3TextContains(reportText, "\"direct_mode\": true"),
+           "v3 r2c render compare controller smoke: report direct mode")
+    assert(v3path.V3TextContains(reportText, "\"route_state\": \"publish_selector\""),
+           "v3 r2c render compare controller smoke: report route state")
+    assert(v3path.V3TextContains(reportText, "\"route_state_match\": true"),
+           "v3 r2c render compare controller smoke: report route state match")
+    assert(v3path.V3TextContains(reportText, "\"native_gui_runtime_bundle_ready\": true"),
+           "v3 r2c render compare controller smoke: report runtime bundle ready")
+    assert(v3path.V3TextContains(reportText, "\"native_gui_runtime_contract_ready\": true"),
+           "v3 r2c render compare controller smoke: report runtime contract ready")
+    assert(v3path.V3TextContains(reportText, "\"truth_trace_format\": \"truth_trace_v2\""),
+           "v3 r2c render compare controller smoke: report truth trace format")
+    assert(v3path.V3TextContains(reportText, "\"semantic_nodes_count_delta\": 0"),
+           "v3 r2c render compare controller smoke: report semantic nodes delta")
+    assert(v3path.V3TextContains(reportText, "\"diff_pixel_count\": 0"),
+           "v3 r2c render compare controller smoke: report diff pixel count")
+
+    assert(v3path.V3TextContains(summaryText, "ok=true"),
+           "v3 r2c render compare controller smoke: summary ok")
+    assert(v3path.V3TextContains(summaryText, "direct_mode=true"),
+           "v3 r2c render compare controller smoke: summary direct mode")
+    assert(v3path.V3TextContains(summaryText, "route_state=publish_selector"),
+           "v3 r2c render compare controller smoke: summary route state")
+    assert(v3path.V3TextContains(summaryText, "route_state_match=true"),
+           "v3 r2c render compare controller smoke: summary route state match")
+    assert(v3path.V3TextContains(summaryText, "native_gui_runtime_bundle_ready=true"),
+           "v3 r2c render compare controller smoke: summary runtime bundle ready")
+    assert(v3path.V3TextContains(summaryText, "native_gui_runtime_contract_ready=true"),
+           "v3 r2c render compare controller smoke: summary runtime contract ready")
+    assert(v3path.V3TextContains(summaryText, "truth_trace_format=truth_trace_v2"),
+           "v3 r2c render compare controller smoke: summary truth trace format")
+    assert(v3path.V3TextContains(summaryText, "semantic_nodes_count_delta=0"),
+           "v3 r2c render compare controller smoke: summary semantic nodes delta")
+    assert(v3path.V3TextContains(summaryText, "diff_pixel_count=0"),
+           "v3 r2c render compare controller smoke: summary diff pixel count")
+
+    echo("v3 r2c_react_v3_render_compare_controller_smoke ok")
+    return 0

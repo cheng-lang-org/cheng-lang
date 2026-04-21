@@ -49,6 +49,7 @@ artifacts/v3_bootstrap/cheng.stage3 build-rwad-bft-linux
 artifacts/v3_bootstrap/cheng.stage3 build-linux-nolibc-exe
 artifacts/v3_bootstrap/cheng.stage3 verify-windows-builtin
 artifacts/v3_bootstrap/cheng.stage3 verify-riscv64-builtin
+artifacts/v3_bootstrap/cheng.stage3 run-production-regression
 artifacts/v3_bootstrap/cheng.stage3 run-cross-target-smokes
 artifacts/v3_bootstrap/cheng.stage3 run-host-smokes
 artifacts/v3_bootstrap/cheng.stage3 run-stage23-libp2p-smokes
@@ -79,6 +80,7 @@ artifacts/v3_backend_driver/cheng r2c-react-v3-fresh-clean-gate --repo /Users/lb
 ## 当前规则
 
 - `verify-orphan-guard` 现在会直接拒绝 `v3/tooling` 顶层任何 `.sh` 文件。零脚本是结构约束，不是约定。
+- `run-production-regression` 是当前 v3 聚合回归入口；它固定串起 `build-backend-driver`、`run-host-smokes stage3_command_surface_smoke backend_driver_command_surface_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke`、`run-cross-target-smokes` 和 `run-stage23-libp2p-smokes`。
 - `debug-report / print-symbols / print-line-map / print-object / print-asm / profile-run / profile-report / crash-report` 都由 Cheng 本体提供，不再依赖 `lldb / nm / otool / sample`。
 - `perf_memory_contract_smoke` 现在是 v3 正式性能/内存门禁；报告默认写到 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
 - `perf_memory_contract_smoke` 报告里的 `orc_perf_contract` 记录 ORC runtime retain/release 与 alloc/free/live 闭环，`*_compile_exec_phase_summary` 记录正式 `system-link-exec` 编译报告里的 phase 摘要。
@@ -87,3 +89,24 @@ artifacts/v3_backend_driver/cheng r2c-react-v3-fresh-clean-gate --repo /Users/lb
 - Linux `aarch64` 默认已经能真产 `ELF relocatable object` 和 `nolibc exe`。
 - Windows `COFF/PE` 和 `riscv64 ELF` 现在通过 `verify-windows-builtin / verify-riscv64-builtin / run-cross-target-smokes` 统一验收。
 - `bootstrap-bridge` 和 `build-backend-driver` 都已经在 Cheng 主链里实现；外层脚本已退役。
+
+## Dev / Release 能力矩阵
+
+| 项 | `cheng` dev 轨 | `release-compile` release 轨 |
+| --- | --- | --- |
+| 主目标 | 开发态快速迭代 | 发布态稳定产物 |
+| 链接口径 | host-only `self-link` | `system-link` |
+| 解析模式 | `outline` | `full` |
+| 函数调度 | `ws` | `ws` |
+| 可执行输出 | `BACKEND_DIRECT_EXE=1` + `BACKEND_LINKERLESS_INMEM=1` | `BACKEND_DIRECT_EXE=0` + `BACKEND_LINKERLESS_INMEM=0` |
+| 100ms 承诺面 | 只在专用机 selfhost / compile-stage1 的 dedicated witness 口径下成立，不是泛化到任意项目冷编译，也不是当前 v3 单独公开命令 | 不承诺 100ms |
+| 默认运行态 | `cheng --run` 进入 host runner | 不走 host runner 热更主线 |
+| 二进制原地更新 | 支持 host runner `trampoline + append-only code pool` 热补丁 | 不支持 |
+| 布局变化时 | `BACKEND_HOTPATCH_ON_LAYOUT_CHANGE=restart`，直接重启，不继续硬补丁 | 不适用 |
+| 用户该怎么理解 | “开发态热迭代面” | “正式发布面” |
+
+补一句硬边界：
+
+- Cheng 当前说得最硬的是 dev host-only 这条线：`self-link + direct-exe + host runner hotpatch`。
+- 不要把这条 dedicated 100ms witness 口径理解成“所有源码、所有机器、所有模式都 100ms”。
+- 不要把 dev 热补丁理解成 release 二进制也支持原地更新；release 主线仍然是 `system-link` 产物。

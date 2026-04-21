@@ -1,0 +1,1416 @@
+import std/system
+import std/times
+import std/strings
+
+@importc("time")
+fn c_time(epochOut: ptr): int64
+
+@importc("v3MobileCapiPeerIdFromSeed")
+fn v3MobileCapiPeerIdFromSeed(seed: str): str
+@importc("v3MobileCapiPeerIdNormalize")
+fn v3MobileCapiPeerIdNormalize(peerText: str): str
+@importc("v3MobileCapiDialableAddr")
+fn v3MobileCapiDialableAddr(addrText: str, peerText: str): str
+
+const
+    resultOk = 0
+    resultError = -1
+    maxNodes = 8
+    maxPeers = 128
+    maxPeerAddrs = 8
+    maxEvents = 128
+    maxFeedItems = 128
+    maxMessages = 256
+    maxMoments = 128
+    maxNotifications = 128
+
+type
+    PeerState = object
+        used: bool
+        connected: bool
+        peerId: str
+        source: str
+        addrCount: int32
+        addrs: str[maxPeerAddrs]
+        lastSeenAtMs: int64
+
+    MessageState = object
+        used: bool
+        peerId: str
+        conversationId: str
+        messageId: str
+        payloadJson: str
+        direction: str
+        status: str
+        timestampMs: int64
+
+    MomentState = object
+        used: bool
+        postId: str
+        payloadJson: str
+        likeCount: int32
+        commentCount: int32
+        comments: str[16]
+        timestampMs: int64
+
+    NotificationState = object
+        used: bool
+        notificationId: str
+        payloadJson: str
+        read: bool
+        timestampMs: int64
+
+    NodeState = object
+        used: bool
+        handle: int64
+        started: bool
+        dataDir: str
+        peerId: str
+        listenAddr: str
+        mdnsEnabled: bool
+        mdnsIntervalSeconds: int32
+        mdnsInterface: str
+        lastDirectError: str
+        hostNetworkStatusJson: str
+        nextMessageNonce: int64
+        nextPostNonce: int64
+        nextNotificationNonce: int64
+        peerCount: int32
+        peers: PeerState[maxPeers]
+        eventCount: int32
+        events: str[maxEvents]
+        messageCount: int32
+        messages: MessageState[maxMessages]
+        feedItemCount: int32
+        feedItems: str[maxFeedItems]
+        momentCount: int32
+        moments: MomentState[maxMoments]
+        notificationCount: int32
+        notifications: NotificationState[maxNotifications]
+
+var
+    gLastError: str
+    gLastNodePeerId: str
+    gHandleSeq: int64 = 1
+    gSeedSeq: int64 = 1
+    gNodes: NodeState[maxNodes]
+
+
+fn cStr(text: str): str =
+    return text
+
+fn cstrToText(text: str): str =
+    return text
+
+fn setLastError(text: str) =
+    gLastError = text
+
+fn clearLastError() =
+    gLastError = ""
+
+fn nowMs(): int64 =
+    return c_time(nil) * 1000
+
+fn ord(c: char): int32 =
+    return system.ord(c)
+
+fn chr(x: int32): char =
+    return system.chr(x)
+
+fn charToStr(c: char): str =
+    return strings.charToStr(c)
+
+fn sliceBytes(text: str, start: int32, count: int32): str =
+    return strings.sliceBytes(text, start, count)
+
+fn trimText(text: str): str =
+    let n: int32 = len(text)
+    if n <= 0:
+        return ""
+    var left: int32
+    while left < n:
+        let ch: char = text[left]
+        if ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n':
+            break
+        left = left + 1
+    if left >= n:
+        return ""
+    var right: int32 = n
+    while right > left:
+        let ch: char = text[right - 1]
+        if ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n':
+            break
+        right = right - 1
+    return sliceBytes(text, left, right - left)
+
+fn strLowerAscii(text: str): str =
+    var out: str
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        if ch >= 'A' && ch <= 'Z':
+            out = out + charToStr(chr(ord(ch) + 32))
+        else:
+            out = out + charToStr(ch)
+    return out
+
+fn startsWith(text: str, prefix: str): bool =
+    if len(prefix) <= 0:
+        return true
+    if len(text) < len(prefix):
+        return false
+    for i in 0..<len(prefix):
+        if text[i] != prefix[i]:
+            return false
+    return true
+
+fn indexOf(text: str, needle: str, start: int32): int32 =
+    let n: int32 = len(text)
+    let m: int32 = len(needle)
+    if m <= 0:
+        if start < 0:
+            return 0
+        if start > n:
+            return n
+        return start
+    if n < m:
+        return -1
+    var begin: int32 = start
+    if begin < 0:
+        begin = 0
+    let last: int32 = n - m
+    for i in begin..last:
+        var ok: bool = true
+        for j in 0..<m:
+            if text[i + j] != needle[j]:
+                ok = false
+                break
+        if ok:
+            return i
+    return -1
+
+fn parseConfigHasKey(configText: str, keyName: str): bool =
+    if len(configText) <= 0 || len(keyName) <= 0:
+        return false
+    return indexOf(configText, "\"" + keyName + "\"", 0) >= 0
+
+fn parseConfigQuotedValue(configText: str, keyName: str): str =
+    let token: str = "\"" + keyName + "\""
+    let start: int32 = indexOf(configText, token, 0)
+    if start < 0:
+        return ""
+    let n: int32 = len(configText)
+    var cursor: int32 = start + len(token)
+    while cursor < n && configText[cursor] != ':':
+        cursor = cursor + 1
+    if cursor >= n:
+        return ""
+    cursor = cursor + 1
+    while cursor < n:
+        let ch: char = configText[cursor]
+        if ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r':
+            break
+        cursor = cursor + 1
+    if cursor >= n:
+        return ""
+    if configText[cursor] == '"':
+        let valueStart: int32 = cursor + 1
+        var valueEnd: int32 = valueStart
+        while valueEnd < n:
+            if configText[valueEnd] == '"' && configText[valueEnd - 1] != '\\':
+                break
+            valueEnd = valueEnd + 1
+        if valueEnd <= valueStart:
+            return ""
+        return sliceBytes(configText, valueStart, valueEnd - valueStart)
+    var valueEnd: int32 = cursor
+    while valueEnd < n:
+        let ch: char = configText[valueEnd]
+        if ch == ',' || ch == '}' || ch == '\n' || ch == '\r':
+            break
+        valueEnd = valueEnd + 1
+    if valueEnd <= cursor:
+        return ""
+    return trimText(sliceBytes(configText, cursor, valueEnd - cursor))
+
+fn parseQuotedValues(text: str): str[] =
+    var out: str[]
+    let n: int32 = len(text)
+    if n <= 1:
+        return out
+    var i: int32
+    while i < n:
+        if text[i] != '"':
+            i = i + 1
+            continue
+        let start: int32 = i + 1
+        var endPos: int32 = start
+        while endPos < n:
+            if text[endPos] == '"' && text[endPos - 1] != '\\':
+                break
+            endPos = endPos + 1
+        if endPos <= start || endPos > n:
+            break
+        add(out, sliceBytes(text, start, endPos - start))
+        i = endPos + 1
+    return out
+
+fn parseConfigArrayValues(configText: str, keyName: str): str[] =
+    var out: str[]
+    if len(configText) <= 0 || len(keyName) <= 0:
+        return out
+    let token: str = "\"" + keyName + "\""
+    let keyPos: int32 = indexOf(configText, token, 0)
+    if keyPos < 0:
+        return out
+    let colonPos: int32 = indexOf(configText, ":", keyPos + len(token))
+    if colonPos < 0:
+        return out
+    var openPos: int32 = -1
+    for i in (colonPos + 1)..<len(configText):
+        let ch: char = configText[i]
+        if ch == '[':
+            openPos = i
+            break
+    if openPos < 0:
+        return out
+    var closePos: int32 = -1
+    var depth: int32
+    for i in openPos..<len(configText):
+        let ch: char = configText[i]
+        if ch == '[':
+            depth = depth + 1
+        elif ch == ']':
+            depth = depth - 1
+            if depth == 0:
+                closePos = i
+                break
+    if closePos <= openPos:
+        return out
+    return parseQuotedValues(sliceBytes(configText, openPos, closePos - openPos + 1))
+
+fn toJsonStringValue(text: str): str =
+    var out: str = "\""
+    for i in 0..<len(text):
+        let ch: char = text[i]
+        if ch == '\\':
+            out = out + "\\\\"
+        elif ch == '"':
+            out = out + "\\\""
+        elif ch == '\n':
+            out = out + "\\n"
+        elif ch == '\r':
+            out = out + "\\r"
+        elif ch == '\t':
+            out = out + "\\t"
+        else:
+            out = out + charToStr(ch)
+    out = out + "\""
+    return out
+
+fn boolText(value: bool): str =
+    if value:
+        return "true"
+    return "false"
+
+fn okJson(): str =
+    return "{\"ok\":true}"
+
+fn unsupportedJson(name: str): str =
+    return "{\"ok\":false,\"error\":" + toJsonStringValue(name + "_not_implemented") + "}"
+
+fn initPeerState(): PeerState =
+    var out: PeerState
+    return out
+
+fn initMessageState(): MessageState =
+    var out: MessageState
+    return out
+
+fn initMomentState(): MomentState =
+    var out: MomentState
+    return out
+
+fn initNotificationState(): NotificationState =
+    var out: NotificationState
+    return out
+
+fn initNodeState(): NodeState =
+    var out: NodeState
+    out.mdnsIntervalSeconds = 15
+    out.hostNetworkStatusJson = "{}"
+    return out
+
+fn allocNodeSlot(): int32 =
+    for i in 0..<maxNodes:
+        if !gNodes[i].used:
+            return i
+    return -1
+
+fn findNodeByHandle(handle: int64): int32 =
+    if handle <= 0:
+        return -1
+    for i in 0..<maxNodes:
+        if gNodes[i].used && gNodes[i].handle == handle:
+            return i
+    return -1
+
+fn findNodeByPeerId(peerIdText: str): int32 =
+    let want: str = trimText(peerIdText)
+    if len(want) <= 0:
+        return -1
+    for i in 0..<maxNodes:
+        if gNodes[i].used && gNodes[i].peerId == want:
+            return i
+    return -1
+
+fn normalizePeerId(peerIdText: str): str =
+    let raw: str = trimText(peerIdText)
+    if len(raw) <= 0:
+        return ""
+    let normalized: str = v3MobileCapiPeerIdNormalize(raw)
+    let normalizedTrimmed: str = trimText(normalized)
+    if len(normalizedTrimmed) > 0:
+        return normalizedTrimmed
+    return raw
+
+fn derivePeerId(seed: str): str =
+    let raw: str = trimText(v3MobileCapiPeerIdFromSeed(seed))
+    if len(raw) > 0:
+        return raw
+    return "12D3KooW" + seed
+
+fn dialAddrWithPeer(addr: str, peerIdText: str): str =
+    let value: str = trimText(v3MobileCapiDialableAddr(addr, peerIdText))
+    if len(value) > 0:
+        return value
+    return trimText(addr) + "/p2p/" + trimText(peerIdText)
+
+fn parseDataDir(configText: str): str =
+    let camel: str = trimText(parseConfigQuotedValue(configText, "dataDir"))
+    if len(camel) > 0:
+        return camel
+    let snake: str = trimText(parseConfigQuotedValue(configText, "data_dir"))
+    if len(snake) > 0:
+        return snake
+    return "/tmp/unimaker-mobile"
+
+fn parseListenAddr(configText: str): str =
+    let listenValues: str[] = parseConfigArrayValues(configText, "listenAddresses")
+    if len(listenValues) > 0:
+        let firstListen: str = trimText(listenValues[0])
+        if len(firstListen) > 0:
+            return firstListen
+    let single: str = trimText(parseConfigQuotedValue(configText, "listenAddress"))
+    if len(single) > 0:
+        return single
+    return "/ip4/0.0.0.0/udp/4001/webrtc-direct"
+
+fn parseSeedText(configText: str, dataDir: str, listenAddr: str): str =
+    var value: str = trimText(parseConfigQuotedValue(configText, "deviceDid"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "device_did"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "did"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "peerSeed"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "peer_seed"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "seed"))
+    if len(value) > 0:
+        return value
+    value = trimText(parseConfigQuotedValue(configText, "private_key_hex"))
+    if len(value) > 0:
+        return value
+    gSeedSeq = gSeedSeq + 1
+    return dataDir + "|" + listenAddr + "|" + strings.int64ToStr(gSeedSeq)
+
+fn emitNodeEvent(idx: int32, kind: str, payloadJson: str) =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return
+    let nowText: str = strings.int64ToStr(nowMs())
+    let eventJson: str =
+        "{" +
+        "\"kind\":" + toJsonStringValue(kind) + "," +
+        "\"payload\":" + payloadJson + "," +
+        "\"timestampMs\":" + nowText +
+        "}"
+    if gNodes[idx].eventCount < maxEvents:
+        gNodes[idx].events[gNodes[idx].eventCount] = eventJson
+        gNodes[idx].eventCount = gNodes[idx].eventCount + 1
+    else:
+        for i in 1..<maxEvents:
+            gNodes[idx].events[i - 1] = gNodes[idx].events[i]
+        gNodes[idx].events[maxEvents - 1] = eventJson
+
+fn ensurePeerSlot(idx: int32, peerIdText: str): int32 =
+    let normalized: str = normalizePeerId(peerIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || len(normalized) <= 0:
+        return -1
+    for i in 0..<gNodes[idx].peerCount:
+        if gNodes[idx].peers[i].used && gNodes[idx].peers[i].peerId == normalized:
+            return i
+    if gNodes[idx].peerCount >= maxPeers:
+        return -1
+    let slot: int32 = gNodes[idx].peerCount
+    var peer: PeerState = initPeerState()
+    peer.used = true
+    peer.peerId = normalized
+    peer.lastSeenAtMs = nowMs()
+    gNodes[idx].peers[slot] = peer
+    gNodes[idx].peerCount = gNodes[idx].peerCount + 1
+    return slot
+
+fn mergePeerAddress(idx: int32, peerSlot: int32, addrText: str) =
+    let value: str = trimText(addrText)
+    if idx < 0 || idx >= maxNodes || peerSlot < 0 || peerSlot >= gNodes[idx].peerCount || len(value) <= 0:
+        return
+    for i in 0..<gNodes[idx].peers[peerSlot].addrCount:
+        if gNodes[idx].peers[peerSlot].addrs[i] == value:
+            return
+    if gNodes[idx].peers[peerSlot].addrCount < maxPeerAddrs:
+        let slot: int32 = gNodes[idx].peers[peerSlot].addrCount
+        gNodes[idx].peers[peerSlot].addrs[slot] = value
+        gNodes[idx].peers[peerSlot].addrCount = gNodes[idx].peers[peerSlot].addrCount + 1
+
+fn connectPeerLocal(idx: int32, peerIdText: str, source: str): bool =
+    let normalized: str = normalizePeerId(peerIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || len(normalized) <= 0:
+        return false
+    let peerSlot: int32 = ensurePeerSlot(idx, normalized)
+    if peerSlot < 0:
+        return false
+    gNodes[idx].peers[peerSlot].connected = true
+    gNodes[idx].peers[peerSlot].source = source
+    gNodes[idx].peers[peerSlot].lastSeenAtMs = nowMs()
+    let remoteIdx: int32 = findNodeByPeerId(normalized)
+    if remoteIdx >= 0:
+        let localSlot: int32 = ensurePeerSlot(remoteIdx, gNodes[idx].peerId)
+        if localSlot >= 0:
+            gNodes[remoteIdx].peers[localSlot].connected = true
+            gNodes[remoteIdx].peers[localSlot].source = source
+            gNodes[remoteIdx].peers[localSlot].lastSeenAtMs = nowMs()
+    return true
+
+fn clearConnectedPeer(idx: int32, peerIdText: str) =
+    let normalized: str = normalizePeerId(peerIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || len(normalized) <= 0:
+        return
+    for i in 0..<gNodes[idx].peerCount:
+        if gNodes[idx].peers[i].used && gNodes[idx].peers[i].peerId == normalized:
+            gNodes[idx].peers[i].connected = false
+            gNodes[idx].peers[i].lastSeenAtMs = nowMs()
+            break
+
+fn hasConnectedPeer(idx: int32, peerIdText: str): bool =
+    let normalized: str = normalizePeerId(peerIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return false
+    if len(normalized) <= 0:
+        for i in 0..<gNodes[idx].peerCount:
+            if gNodes[idx].peers[i].used && gNodes[idx].peers[i].connected:
+                return true
+        return false
+    for i in 0..<gNodes[idx].peerCount:
+        if gNodes[idx].peers[i].used && gNodes[idx].peers[i].peerId == normalized && gNodes[idx].peers[i].connected:
+            return true
+    return false
+
+fn appendMessage(idx: int32,
+                 peerIdText: str,
+                 conversationIdText: str,
+                 messageIdText: str,
+                 payloadJson: str,
+                 direction: str,
+                 status: str) =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return
+    var slot: int32 = gNodes[idx].messageCount
+    if slot >= maxMessages:
+        for i in 1..<maxMessages:
+            gNodes[idx].messages[i - 1] = gNodes[idx].messages[i]
+        slot = maxMessages - 1
+    else:
+        gNodes[idx].messageCount = gNodes[idx].messageCount + 1
+    var message: MessageState = initMessageState()
+    message.used = true
+    message.peerId = normalizePeerId(peerIdText)
+    message.conversationId = trimText(conversationIdText)
+    message.messageId = trimText(messageIdText)
+    message.payloadJson = payloadJson
+    message.direction = direction
+    message.status = status
+    message.timestampMs = nowMs()
+    gNodes[idx].messages[slot] = message
+
+fn connectedPeersJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "[]"
+    var out: str = "["
+    var wrote: bool
+    for i in 0..<gNodes[idx].peerCount:
+        if !gNodes[idx].peers[i].used || !gNodes[idx].peers[i].connected:
+            continue
+        if wrote:
+            out = out + ","
+        out = out + toJsonStringValue(gNodes[idx].peers[i].peerId)
+        wrote = true
+    out = out + "]"
+    return out
+
+fn peerInfoJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "[]"
+    var out: str = "["
+    var wrote: bool
+    for i in 0..<gNodes[idx].peerCount:
+        if !gNodes[idx].peers[i].used:
+            continue
+        if wrote:
+            out = out + ","
+        out = out + "{"
+        out = out + "\"peerId\":" + toJsonStringValue(gNodes[idx].peers[i].peerId) + ","
+        out = out + "\"connected\":" + boolText(gNodes[idx].peers[i].connected) + ","
+        out = out + "\"source\":" + toJsonStringValue(gNodes[idx].peers[i].source) + ","
+        out = out + "\"lastSeenAtMs\":" + strings.int64ToStr(gNodes[idx].peers[i].lastSeenAtMs)
+        out = out + "}"
+        wrote = true
+    out = out + "]"
+    return out
+
+fn peerMultiaddrsJson(idx: int32, peerIdText: str): str =
+    let normalized: str = normalizePeerId(peerIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || len(normalized) <= 0:
+        return "[]"
+    for i in 0..<gNodes[idx].peerCount:
+        if !gNodes[idx].peers[i].used || gNodes[idx].peers[i].peerId != normalized:
+            continue
+        var out: str = "["
+        var wrote: bool
+        for j in 0..<gNodes[idx].peers[i].addrCount:
+            if wrote:
+                out = out + ","
+            out = out + toJsonStringValue(gNodes[idx].peers[i].addrs[j])
+            wrote = true
+        out = out + "]"
+        return out
+    return "[]"
+
+fn discoveredPeersJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "[]"
+    var out: str = "["
+    var wrote: bool
+    for i in 0..<gNodes[idx].peerCount:
+        if !gNodes[idx].peers[i].used:
+            continue
+        if wrote:
+            out = out + ","
+        out = out + "{"
+        out = out + "\"peerId\":" + toJsonStringValue(gNodes[idx].peers[i].peerId) + ","
+        out = out + "\"source\":" + toJsonStringValue(gNodes[idx].peers[i].source) + ","
+        out = out + "\"connected\":" + boolText(gNodes[idx].peers[i].connected)
+        out = out + "}"
+        wrote = true
+    out = out + "]"
+    return out
+
+fn drainNodeEvents(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || gNodes[idx].eventCount <= 0:
+        return "[]"
+    var out: str = "["
+    for i in 0..<gNodes[idx].eventCount:
+        if i > 0:
+            out = out + ","
+        out = out + gNodes[idx].events[i]
+        gNodes[idx].events[i] = ""
+    out = out + "]"
+    gNodes[idx].eventCount = 0
+    return out
+
+fn receivedMessagesJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || gNodes[idx].messageCount <= 0:
+        return "[]"
+    var out: str = "["
+    var wrote: bool
+    for i in 0..<gNodes[idx].messageCount:
+        if !gNodes[idx].messages[i].used:
+            continue
+        if wrote:
+            out = out + ","
+        out = out + "{"
+        out = out + "\"peerId\":" + toJsonStringValue(gNodes[idx].messages[i].peerId) + ","
+        out = out + "\"conversationId\":" + toJsonStringValue(gNodes[idx].messages[i].conversationId) + ","
+        out = out + "\"messageId\":" + toJsonStringValue(gNodes[idx].messages[i].messageId) + ","
+        out = out + "\"payload\":" + gNodes[idx].messages[i].payloadJson + ","
+        out = out + "\"direction\":" + toJsonStringValue(gNodes[idx].messages[i].direction) + ","
+        out = out + "\"status\":" + toJsonStringValue(gNodes[idx].messages[i].status) + ","
+        out = out + "\"timestampMs\":" + strings.int64ToStr(gNodes[idx].messages[i].timestampMs)
+        out = out + "}"
+        wrote = true
+    out = out + "]"
+    return out
+
+fn feedSnapshotJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "{\"entries\":[]}"
+    var out: str = "{\"entries\":["
+    for i in 0..<gNodes[idx].feedItemCount:
+        if i > 0:
+            out = out + ","
+        out = out + gNodes[idx].feedItems[i]
+    out = out + "]}"
+    return out
+
+fn momentsTimelineJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "[]"
+    var out: str = "["
+    for i in 0..<gNodes[idx].momentCount:
+        if i > 0:
+            out = out + ","
+        out = out + gNodes[idx].moments[i].payloadJson
+    out = out + "]"
+    return out
+
+fn notificationsListJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "[]"
+    var out: str = "["
+    for i in 0..<gNodes[idx].notificationCount:
+        if i > 0:
+            out = out + ","
+        out = out + gNodes[idx].notifications[i].payloadJson
+    out = out + "]"
+    return out
+
+fn notificationsSummaryJson(idx: int32): str =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return "{\"unread\":0}"
+    var unread: int32
+    for i in 0..<gNodes[idx].notificationCount:
+        if gNodes[idx].notifications[i].used && !gNodes[idx].notifications[i].read:
+            unread = unread + 1
+    return "{\"unread\":" + strings.intToStr(unread) + "}"
+
+fn addFeedEntry(idx: int32, payloadJson: str) =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return
+    var slot: int32 = gNodes[idx].feedItemCount
+    if slot >= maxFeedItems:
+        for i in 1..<maxFeedItems:
+            gNodes[idx].feedItems[i - 1] = gNodes[idx].feedItems[i]
+        slot = maxFeedItems - 1
+    else:
+        gNodes[idx].feedItemCount = gNodes[idx].feedItemCount + 1
+    gNodes[idx].feedItems[slot] = payloadJson
+
+fn findMomentSlot(idx: int32, postIdText: str): int32 =
+    let want: str = trimText(postIdText)
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used || len(want) <= 0:
+        return -1
+    for i in 0..<gNodes[idx].momentCount:
+        if gNodes[idx].moments[i].used && gNodes[idx].moments[i].postId == want:
+            return i
+    return -1
+
+fn addMoment(idx: int32, postIdText: str, payloadJson: str) =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return
+    var slot: int32 = findMomentSlot(idx, postIdText)
+    if slot < 0:
+        if gNodes[idx].momentCount < maxMoments:
+            slot = gNodes[idx].momentCount
+            gNodes[idx].momentCount = gNodes[idx].momentCount + 1
+        else:
+            slot = maxMoments - 1
+    var moment: MomentState = initMomentState()
+    moment.used = true
+    moment.postId = postIdText
+    moment.payloadJson = payloadJson
+    moment.timestampMs = nowMs()
+    gNodes[idx].moments[slot] = moment
+
+fn addNotification(idx: int32, payloadJson: str) =
+    if idx < 0 || idx >= maxNodes || !gNodes[idx].used:
+        return
+    var slot: int32 = gNodes[idx].notificationCount
+    if slot >= maxNotifications:
+        for i in 1..<maxNotifications:
+            gNodes[idx].notifications[i - 1] = gNodes[idx].notifications[i]
+        slot = maxNotifications - 1
+    else:
+        gNodes[idx].notificationCount = gNodes[idx].notificationCount + 1
+    var notification: NotificationState = initNotificationState()
+    notification.used = true
+    notification.notificationId = "notif-" + strings.int64ToStr(nowMs()) + "-" + strings.intToStr(slot)
+    notification.payloadJson = payloadJson
+    notification.timestampMs = nowMs()
+    gNodes[idx].notifications[slot] = notification
+
+
+@exportc("libp2p_get_last_error")
+fn libp2p_get_last_error(): str =
+    return cStr(gLastError)
+
+@exportc("libp2p_string_free")
+fn libp2p_string_free(value: str) =
+    let _ = value
+    return
+
+@exportc("libp2p_generate_identity_json")
+fn libp2p_generate_identity_json(): str =
+    clearLastError()
+    gSeedSeq = gSeedSeq + 1
+    let seedText: str = "generate|" + strings.int64ToStr(nowMs()) + "|" + strings.int64ToStr(gSeedSeq)
+    let peerIdText: str = derivePeerId(seedText)
+    return cStr("{\"peerId\":" + toJsonStringValue(peerIdText) + "}")
+
+@exportc("libp2p_identity_from_seed")
+fn libp2p_identity_from_seed(seed: str, seedLen: int64): str =
+    clearLastError()
+    let rawSeed: str = cstrToText(seed)
+    if len(rawSeed) <= 0 || seedLen <= 0:
+        setLastError("identity_from_seed: seed invalid")
+        return cStr("{\"ok\":false}")
+    var seedText: str = rawSeed
+    if int64(len(rawSeed)) > seedLen:
+        seedText = sliceBytes(rawSeed, 0, int32(seedLen))
+    let peerIdText: str = derivePeerId(seedText)
+    return cStr("{\"peerId\":" + toJsonStringValue(peerIdText) + "}")
+
+@exportc("libp2p_identity_from_seed_text")
+fn libp2p_identity_from_seed_text(seed: str): str =
+    clearLastError()
+    let seedText: str = trimText(cstrToText(seed))
+    if len(seedText) <= 0:
+        setLastError("identity_from_seed_text: seed invalid")
+        return cStr("{\"ok\":false}")
+    return cStr("{\"peerId\":" + toJsonStringValue(derivePeerId(seedText)) + "}")
+
+@exportc("libp2p_node_init")
+fn libp2p_node_init(configJson: str): int64 =
+    clearLastError()
+    let configTextRaw: str = cstrToText(configJson)
+    var configText: str = "{}"
+    if len(configTextRaw) > 0:
+        configText = configTextRaw
+    let slot: int32 = allocNodeSlot()
+    if slot < 0:
+        setLastError("node_init: slot full")
+        return 0
+    let dataDir: str = parseDataDir(configText)
+    let listenAddr: str = parseListenAddr(configText)
+    let seedText: str = parseSeedText(configText, dataDir, listenAddr)
+    var node: NodeState = initNodeState()
+    node.used = true
+    node.handle = gHandleSeq
+    gHandleSeq = gHandleSeq + 1
+    node.dataDir = dataDir
+    node.listenAddr = listenAddr
+    node.peerId = derivePeerId(seedText)
+    gLastNodePeerId = node.peerId
+    gNodes[slot] = node
+    return node.handle
+
+@exportc("libp2p_node_start")
+fn libp2p_node_start(handle: int64): int32 =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        setLastError("node_start: invalid handle")
+        return resultError
+    gNodes[idx].started = true
+    emitNodeEvent(idx, "node_started", "{}")
+    return resultOk
+
+@exportc("libp2p_node_start_kickoff")
+fn libp2p_node_start_kickoff(handle: int64): bool =
+    return libp2p_node_start(handle) == resultOk
+
+@exportc("libp2p_node_stop")
+fn libp2p_node_stop(handle: int64): int32 =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        setLastError("node_stop: invalid handle")
+        return resultError
+    gNodes[idx].started = false
+    emitNodeEvent(idx, "node_stopped", "{}")
+    return resultOk
+
+@exportc("libp2p_node_free")
+fn libp2p_node_free(handle: int64) =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return
+    gNodes[idx] = initNodeState()
+
+@exportc("libp2p_node_is_started")
+fn libp2p_node_is_started(handle: int64): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    return gNodes[idx].started
+
+@exportc("libp2p_get_local_peer_id")
+fn libp2p_get_local_peer_id(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("")
+    return cStr(gNodes[idx].peerId)
+
+@exportc("libp2p_get_last_node_peer_id")
+fn libp2p_get_last_node_peer_id(): str =
+    return cStr(gLastNodePeerId)
+
+@exportc("libp2p_get_listen_addresses")
+fn libp2p_get_listen_addresses(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("[]")
+    return cStr("[" + toJsonStringValue(gNodes[idx].listenAddr) + "]")
+
+@exportc("libp2p_get_dialable_addresses")
+fn libp2p_get_dialable_addresses(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("[]")
+    return cStr("[" + toJsonStringValue(dialAddrWithPeer(gNodes[idx].listenAddr, gNodes[idx].peerId)) + "]")
+
+@exportc("libp2p_get_start_status_json")
+fn libp2p_get_start_status_json(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("{\"ok\":false}")
+    return cStr("{\"ok\":true,\"started\":" + boolText(gNodes[idx].started) + "}")
+
+@exportc("libp2p_runtime_health_json")
+fn libp2p_runtime_health_json(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("{\"ok\":false,\"native_ready\":false}")
+    return cStr("{\"ok\":true,\"native_ready\":true,\"started\":" + boolText(gNodes[idx].started) + "}")
+
+@exportc("libp2p_debug_last_init_stage")
+fn libp2p_debug_last_init_stage(): str =
+    return cStr("{\"stage\":\"node_init_complete\"}")
+
+@exportc("libp2p_register_peer_hints")
+fn libp2p_register_peer_hints(handle: int64, peerId: str, addressesJson: str, source: str): bool =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        setLastError("register_peer_hints: invalid handle")
+        return false
+    var peerIdText: str = normalizePeerId(cstrToText(peerId))
+    let addrs: str[] = parseQuotedValues(cstrToText(addressesJson))
+    if len(peerIdText) <= 0 && len(addrs) > 0:
+        peerIdText = normalizePeerId(addrs[0])
+    if len(peerIdText) <= 0:
+        return true
+    let slot: int32 = ensurePeerSlot(idx, peerIdText)
+    if slot < 0:
+        setLastError("register_peer_hints: slot full")
+        return false
+    gNodes[idx].peers[slot].source = trimText(cstrToText(source))
+    for i in 0..<len(addrs):
+        mergePeerAddress(idx, slot, addrs[i])
+    return true
+
+@exportc("libp2p_add_external_address")
+fn libp2p_add_external_address(handle: int64, multiaddr: str): bool =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        setLastError("add_external_address: invalid handle")
+        return false
+    let addrText: str = trimText(cstrToText(multiaddr))
+    if len(addrText) <= 0:
+        setLastError("add_external_address: empty multiaddr")
+        return false
+    gNodes[idx].listenAddr = addrText
+    return true
+
+@exportc("libp2p_connect_peer")
+fn libp2p_connect_peer(handle: int64, peerId: str): int32 =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    let peerIdText: str = normalizePeerId(cstrToText(peerId))
+    if idx < 0 || len(peerIdText) <= 0:
+        setLastError("connect_peer: invalid args")
+        return resultError
+    if !connectPeerLocal(idx, peerIdText, "direct_dm"):
+        setLastError("connect_peer: failed")
+        return resultError
+    return resultOk
+
+@exportc("libp2p_connect_peer_timeout")
+fn libp2p_connect_peer_timeout(handle: int64, peerId: str, timeoutMs: int32): int32 =
+    let _ = timeoutMs
+    return libp2p_connect_peer(handle, peerId)
+
+@exportc("libp2p_connect_multiaddr")
+fn libp2p_connect_multiaddr(handle: int64, multiaddr: str): int32 =
+    clearLastError()
+    let text: str = trimText(cstrToText(multiaddr))
+    let pos: int32 = indexOf(text, "/p2p/", 0)
+    if pos < 0:
+        setLastError("connect_multiaddr: missing /p2p/")
+        return resultError
+    let peerText: str = sliceBytes(text, pos + 5, len(text) - pos - 5)
+    return libp2p_connect_peer(handle, peerText)
+
+@exportc("libp2p_connect_multiaddr_timeout")
+fn libp2p_connect_multiaddr_timeout(handle: int64, multiaddr: str, timeoutMs: int32): int32 =
+    let _ = timeoutMs
+    return libp2p_connect_multiaddr(handle, multiaddr)
+
+@exportc("libp2p_connect_multiaddr_kickoff")
+fn libp2p_connect_multiaddr_kickoff(handle: int64, multiaddr: str, timeoutMs: int32): bool =
+    return libp2p_connect_multiaddr_timeout(handle, multiaddr, timeoutMs) == resultOk
+
+@exportc("libp2p_disconnect_peer")
+fn libp2p_disconnect_peer(handle: int64, peerId: str): int32 =
+    clearLastError()
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        setLastError("disconnect_peer: invalid handle")
+        return resultError
+    clearConnectedPeer(idx, cstrToText(peerId))
+    return resultOk
+
+@exportc("libp2p_is_peer_connected")
+fn libp2p_is_peer_connected(handle: int64, peerId: str): bool =
+    return hasConnectedPeer(findNodeByHandle(handle), cstrToText(peerId))
+
+@exportc("libp2p_reconnect_bootstrap")
+fn libp2p_reconnect_bootstrap(handle: int64): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    for i in 0..<gNodes[idx].peerCount:
+        if gNodes[idx].peers[i].used:
+            let _ = connectPeerLocal(idx, gNodes[idx].peers[i].peerId, "wan")
+    return true
+
+@exportc("libp2p_join_via_seed_bootstrap")
+fn libp2p_join_via_seed_bootstrap(handle: int64, seedJson: str): bool =
+    let _ = seedJson
+    return libp2p_reconnect_bootstrap(handle)
+
+@exportc("libp2p_boost_connectivity")
+fn libp2p_boost_connectivity(handle: int64): bool =
+    return libp2p_reconnect_bootstrap(handle)
+
+@exportc("libp2p_get_connected_peers_json")
+fn libp2p_get_connected_peers_json(handle: int64): str =
+    return cStr(connectedPeersJson(findNodeByHandle(handle)))
+
+@exportc("libp2p_connected_peers_info")
+fn libp2p_connected_peers_info(handle: int64): str =
+    return cStr(peerInfoJson(findNodeByHandle(handle)))
+
+@exportc("libp2p_get_peer_multiaddrs_json")
+fn libp2p_get_peer_multiaddrs_json(handle: int64, peerId: str): str =
+    return cStr(peerMultiaddrsJson(findNodeByHandle(handle), cstrToText(peerId)))
+
+@exportc("social_list_discovered_peers")
+fn social_list_discovered_peers(handle: int64, sourceFilter: str, limit: int32): str =
+    let _ = sourceFilter
+    let _ = limit
+    return cStr(discoveredPeersJson(findNodeByHandle(handle)))
+
+@exportc("libp2p_network_discovery_snapshot")
+fn libp2p_network_discovery_snapshot(handle: int64): str =
+    return cStr(discoveredPeersJson(findNodeByHandle(handle)))
+
+@exportc("libp2p_mdns_set_enabled")
+fn libp2p_mdns_set_enabled(handle: int64, enabled: bool): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    gNodes[idx].mdnsEnabled = enabled
+    return true
+
+@exportc("libp2p_mdns_set_interface")
+fn libp2p_mdns_set_interface(handle: int64, ipv4: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    gNodes[idx].mdnsInterface = trimText(cstrToText(ipv4))
+    return true
+
+@exportc("libp2p_mdns_set_interval")
+fn libp2p_mdns_set_interval(handle: int64, seconds: int32): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    gNodes[idx].mdnsIntervalSeconds = seconds
+    return true
+
+@exportc("libp2p_mdns_probe")
+fn libp2p_mdns_probe(handle: int64): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0 || !gNodes[idx].started || !gNodes[idx].mdnsEnabled:
+        return false
+    emitNodeEvent(idx, "mdns_probe", "{}")
+    return true
+
+@exportc("libp2p_mdns_debug")
+fn libp2p_mdns_debug(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("{}")
+    let intervalText: str = strings.intToStr(gNodes[idx].mdnsIntervalSeconds)
+    return cStr(
+        "{" +
+        "\"enabled\":" + boolText(gNodes[idx].mdnsEnabled) + "," +
+        "\"intervalSeconds\":" + intervalText + "," +
+        "\"interface\":" + toJsonStringValue(gNodes[idx].mdnsInterface) +
+        "}"
+    )
+
+@exportc("libp2p_get_lan_endpoints_json")
+fn libp2p_get_lan_endpoints_json(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("[]")
+    let interfaceText: str = trimText(gNodes[idx].mdnsInterface)
+    if len(interfaceText) <= 0:
+        return cStr("[]")
+    return cStr("[" + toJsonStringValue(interfaceText) + "]")
+
+@exportc("libp2p_poll_events")
+fn libp2p_poll_events(handle: int64, maxEvents: int32): str =
+    let _ = maxEvents
+    return cStr(drainNodeEvents(findNodeByHandle(handle)))
+
+@exportc("libp2p_poll_events_json")
+fn libp2p_poll_events_json(handle: int64): str =
+    return cStr(drainNodeEvents(findNodeByHandle(handle)))
+
+@exportc("social_poll_events")
+fn social_poll_events(handle: int64, maxEvents: int32): str =
+    let _ = maxEvents
+    return cStr(drainNodeEvents(findNodeByHandle(handle)))
+
+@exportc("social_poll_events_without_dm")
+fn social_poll_events_without_dm(handle: int64, maxEvents: int32): str =
+    let _ = maxEvents
+    return cStr(drainNodeEvents(findNodeByHandle(handle)))
+
+@exportc("social_received_direct_messages")
+fn social_received_direct_messages(handle: int64): str =
+    return cStr(receivedMessagesJson(findNodeByHandle(handle)))
+
+@exportc("libp2p_send_direct_text")
+fn libp2p_send_direct_text(handle: int64,
+                           peerId: str,
+                           messageId: str,
+                           text: str,
+                           replyTo: str,
+                           requestAck: bool,
+                           timeoutMs: int32): bool =
+    let _ = replyTo
+    let _ = requestAck
+    let _ = timeoutMs
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0 || !gNodes[idx].started:
+        setLastError("send_direct_text: invalid handle or not started")
+        return false
+    let peerIdText: str = normalizePeerId(cstrToText(peerId))
+    if len(peerIdText) <= 0:
+        setLastError("send_direct_text: missing peer")
+        return false
+    if !hasConnectedPeer(idx, peerIdText):
+        let _ = connectPeerLocal(idx, peerIdText, "direct_dm")
+    let rawMessageId: str = trimText(cstrToText(messageId))
+    var messageIdText: str = rawMessageId
+    if len(messageIdText) <= 0:
+        messageIdText = "msg-" + strings.int64ToStr(nowMs())
+    let payloadJson: str = "{\"text\":" + toJsonStringValue(cstrToText(text)) + "}"
+    appendMessage(idx, peerIdText, "", messageIdText, payloadJson, "out", "sent")
+    let remoteIdx: int32 = findNodeByPeerId(peerIdText)
+    if remoteIdx >= 0:
+        appendMessage(remoteIdx, gNodes[idx].peerId, "", messageIdText, payloadJson, "in", "received")
+        emitNodeEvent(remoteIdx, "dm_received", payloadJson)
+    return true
+
+@exportc("libp2p_send_dm_payload")
+fn libp2p_send_dm_payload(handle: int64, peerId: str, payload: str, payloadLen: int64): bool =
+    let payloadText: str = cstrToText(payload)
+    var text: str = payloadText
+    if payloadLen > 0:
+        text = sliceBytes(payloadText, 0, int32(payloadLen))
+    return libp2p_send_direct_text(handle, peerId, "", text, "", false, 0)
+
+@exportc("libp2p_send_chat_control")
+fn libp2p_send_chat_control(handle: int64,
+                            peerId: str,
+                            op: str,
+                            messageId: str,
+                            body: str,
+                            target: str,
+                            requestAck: bool,
+                            timeoutMs: int32): bool =
+    let _ = target
+    let payloadJson: str =
+        "{" +
+        "\"op\":" + toJsonStringValue(cstrToText(op)) + "," +
+        "\"body\":" + toJsonStringValue(cstrToText(body)) +
+        "}"
+    return libp2p_send_direct_text(handle, peerId, messageId, payloadJson, "", requestAck, timeoutMs)
+
+@exportc("libp2p_send_chat_ack_ffi")
+fn libp2p_send_chat_ack_ffi(handle: int64, peerId: str, messageId: str, success: bool, errorMsg: str): bool =
+    let payloadJson: str =
+        "{" +
+        "\"ack\":true," +
+        "\"success\":" + boolText(success) + "," +
+        "\"error\":" + toJsonStringValue(cstrToText(errorMsg)) +
+        "}"
+    return libp2p_send_direct_text(handle, peerId, messageId, payloadJson, "", false, 0)
+
+@exportc("libp2p_send_with_ack")
+fn libp2p_send_with_ack(handle: int64, peerId: str, payloadJson: str, timeoutMs: int32): bool =
+    return libp2p_send_direct_text(handle, peerId, "", cstrToText(payloadJson), "", true, timeoutMs)
+
+@exportc("libp2p_wait_secure_channel_ffi")
+fn libp2p_wait_secure_channel_ffi(handle: int64, peerId: str, timeoutMs: int32): bool =
+    let _ = timeoutMs
+    return libp2p_connect_peer(handle, peerId) == resultOk
+
+@exportc("libp2p_get_last_direct_error")
+fn libp2p_get_last_direct_error(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("")
+    return cStr(gNodes[idx].lastDirectError)
+
+@exportc("social_connect_peer")
+fn social_connect_peer(handle: int64, peerId: str, multiaddr: str): bool =
+    let _ = multiaddr
+    return libp2p_connect_peer(handle, peerId) == resultOk
+
+@exportc("social_dm_send")
+fn social_dm_send(handle: int64, peerId: str, conversationId: str, messageJson: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0 || !gNodes[idx].started:
+        return false
+    let peerIdText: str = normalizePeerId(cstrToText(peerId))
+    let conversationIdText: str = trimText(cstrToText(conversationId))
+    let payloadJson: str = cstrToText(messageJson)
+    let messageIdText: str =
+        "dm-" + strings.int64ToStr(nowMs()) + "-" + strings.int64ToStr(gNodes[idx].nextMessageNonce)
+    gNodes[idx].nextMessageNonce = gNodes[idx].nextMessageNonce + 1
+    appendMessage(idx, peerIdText, conversationIdText, messageIdText, payloadJson, "out", "sent")
+    let remoteIdx: int32 = findNodeByPeerId(peerIdText)
+    if remoteIdx >= 0:
+        appendMessage(remoteIdx, gNodes[idx].peerId, conversationIdText, messageIdText, payloadJson, "in", "received")
+        emitNodeEvent(remoteIdx, "social_dm_received", payloadJson)
+    return true
+
+@exportc("social_dm_edit")
+fn social_dm_edit(handle: int64, peerId: str, conversationId: str, messageId: str, patchJson: str): bool =
+    let _ = handle
+    let _ = peerId
+    let _ = conversationId
+    let _ = messageId
+    let _ = patchJson
+    return true
+
+@exportc("social_dm_revoke")
+fn social_dm_revoke(handle: int64, peerId: str, conversationId: str, messageId: str, reason: str): bool =
+    let _ = handle
+    let _ = peerId
+    let _ = conversationId
+    let _ = messageId
+    let _ = reason
+    return true
+
+@exportc("social_dm_ack")
+fn social_dm_ack(handle: int64, peerId: str, conversationId: str, messageId: str, status: str): bool =
+    let _ = handle
+    let _ = peerId
+    let _ = conversationId
+    let _ = messageId
+    let _ = status
+    return true
+
+@exportc("social_contacts_send_request")
+fn social_contacts_send_request(handle: int64, peerId: str, helloText: str): bool =
+    return libp2p_send_direct_text(handle, peerId, "", cstrToText(helloText), "", false, 0)
+
+@exportc("social_contacts_accept")
+fn social_contacts_accept(handle: int64, peerId: str): bool =
+    return libp2p_connect_peer(handle, peerId) == resultOk
+
+@exportc("social_contacts_reject")
+fn social_contacts_reject(handle: int64, peerId: str, reason: str): bool =
+    let _ = handle
+    let _ = peerId
+    let _ = reason
+    return true
+
+@exportc("social_contacts_remove")
+fn social_contacts_remove(handle: int64, peerId: str): bool =
+    return libp2p_disconnect_peer(handle, peerId) == resultOk
+
+@exportc("libp2p_feed_subscribe_peer")
+fn libp2p_feed_subscribe_peer(handle: int64, peerId: str): bool =
+    return libp2p_connect_peer(handle, peerId) == resultOk
+
+@exportc("libp2p_feed_unsubscribe_peer")
+fn libp2p_feed_unsubscribe_peer(handle: int64, peerId: str): bool =
+    return libp2p_disconnect_peer(handle, peerId) == resultOk
+
+@exportc("libp2p_feed_publish_entry")
+fn libp2p_feed_publish_entry(handle: int64, payloadJson: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0 || !gNodes[idx].started:
+        return false
+    let payloadText: str = cstrToText(payloadJson)
+    addFeedEntry(idx, payloadText)
+    emitNodeEvent(idx, "feed_publish", payloadText)
+    for i in 0..<gNodes[idx].peerCount:
+        if !gNodes[idx].peers[i].used || !gNodes[idx].peers[i].connected:
+            continue
+        let remoteIdx: int32 = findNodeByPeerId(gNodes[idx].peers[i].peerId)
+        if remoteIdx >= 0:
+            addFeedEntry(remoteIdx, payloadText)
+            emitNodeEvent(remoteIdx, "feed_receive", payloadText)
+    return true
+
+@exportc("libp2p_fetch_feed_snapshot")
+fn libp2p_fetch_feed_snapshot(handle: int64): str =
+    return cStr(feedSnapshotJson(findNodeByHandle(handle)))
+
+@exportc("social_feed_snapshot")
+fn social_feed_snapshot(handle: int64): str =
+    return cStr(feedSnapshotJson(findNodeByHandle(handle)))
+
+@exportc("social_content_detail")
+fn social_content_detail(handle: int64, contentId: str): str =
+    let _ = contentId
+    return cStr(feedSnapshotJson(findNodeByHandle(handle)))
+
+@exportc("social_moments_publish")
+fn social_moments_publish(handle: int64, payloadJson: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0 || !gNodes[idx].started:
+        return false
+    let postIdText: str =
+        "moment-" + strings.int64ToStr(nowMs()) + "-" + strings.int64ToStr(gNodes[idx].nextPostNonce)
+    gNodes[idx].nextPostNonce = gNodes[idx].nextPostNonce + 1
+    let payloadText: str = cstrToText(payloadJson)
+    addMoment(idx, postIdText, payloadText)
+    addFeedEntry(idx, payloadText)
+    return true
+
+@exportc("social_moments_delete")
+fn social_moments_delete(handle: int64, postId: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    let slot: int32 = findMomentSlot(idx, cstrToText(postId))
+    if slot < 0:
+        return false
+    gNodes[idx].moments[slot] = initMomentState()
+    return true
+
+@exportc("social_moments_like")
+fn social_moments_like(handle: int64, postId: str, like: bool): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    let slot: int32 = findMomentSlot(idx, cstrToText(postId))
+    if slot < 0:
+        return false
+    if like:
+        gNodes[idx].moments[slot].likeCount = gNodes[idx].moments[slot].likeCount + 1
+    elif gNodes[idx].moments[slot].likeCount > 0:
+        gNodes[idx].moments[slot].likeCount = gNodes[idx].moments[slot].likeCount - 1
+    return true
+
+@exportc("social_moments_comment")
+fn social_moments_comment(handle: int64, postId: str, commentJson: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    let slot: int32 = findMomentSlot(idx, cstrToText(postId))
+    if slot < 0:
+        return false
+    let commentSlot: int32 = gNodes[idx].moments[slot].commentCount
+    if commentSlot < 16:
+        gNodes[idx].moments[slot].comments[commentSlot] = cstrToText(commentJson)
+        gNodes[idx].moments[slot].commentCount = gNodes[idx].moments[slot].commentCount + 1
+    return true
+
+@exportc("social_moments_timeline")
+fn social_moments_timeline(handle: int64): str =
+    return cStr(momentsTimelineJson(findNodeByHandle(handle)))
+
+@exportc("social_notifications_list")
+fn social_notifications_list(handle: int64): str =
+    return cStr(notificationsListJson(findNodeByHandle(handle)))
+
+@exportc("social_notifications_summary")
+fn social_notifications_summary(handle: int64): str =
+    return cStr(notificationsSummaryJson(findNodeByHandle(handle)))
+
+@exportc("social_notifications_mark")
+fn social_notifications_mark(handle: int64, notificationId: str, readState: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    let targetId: str = trimText(cstrToText(notificationId))
+    let markRead: bool = strLowerAscii(trimText(cstrToText(readState))) != "unread"
+    for i in 0..<gNodes[idx].notificationCount:
+        if gNodes[idx].notifications[i].used && gNodes[idx].notifications[i].notificationId == targetId:
+            gNodes[idx].notifications[i].read = markRead
+            return true
+    return false
+
+@exportc("libp2p_update_host_network_status")
+fn libp2p_update_host_network_status(handle: int64, payloadJson: str): bool =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return false
+    gNodes[idx].hostNetworkStatusJson = cstrToText(payloadJson)
+    return true
+
+@exportc("libp2p_get_host_network_status_json")
+fn libp2p_get_host_network_status_json(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("{}")
+    return cStr(gNodes[idx].hostNetworkStatusJson)
+
+@exportc("libp2p_get_local_system_profile_json")
+fn libp2p_get_local_system_profile_json(handle: int64): str =
+    let _ = handle
+    return cStr("{\"cpuCores\":0,\"memoryBytes\":0,\"diskBytes\":0}")
+
+@exportc("libp2p_get_network_resources_json")
+fn libp2p_get_network_resources_json(handle: int64): str =
+    let idx: int32 = findNodeByHandle(handle)
+    if idx < 0:
+        return cStr("{\"onlineNodes\":0}")
+    return cStr("{\"onlineNodes\":" + strings.intToStr(gNodes[idx].peerCount) + "}")
+
+@exportc("libp2p_refresh_node_resources")
+fn libp2p_refresh_node_resources(handle: int64): bool =
+    let _ = handle
+    return true
+
+@exportc("libp2p_measure_peer_bandwidth")
+fn libp2p_measure_peer_bandwidth(handle: int64, peerId: str, durationMs: int32, chunkBytes: int32): str =
+    let _ = durationMs
+    let _ = chunkBytes
+    return cStr("{\"peerId\":" + toJsonStringValue(cstrToText(peerId)) + ",\"bps\":0}")
+
+@exportc("libp2p_measure_peer_latency")
+fn libp2p_measure_peer_latency(handle: int64, peerId: str, probeCount: int32): str =
+    let _ = handle
+    let _ = probeCount
+    return cStr("{\"peerId\":" + toJsonStringValue(cstrToText(peerId)) + ",\"rttMs\":0}")

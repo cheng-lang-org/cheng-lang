@@ -76,6 +76,18 @@ typedef struct ChengAppRuntimeCtx {
   char route_state[96];
   int route_seeded;
   int route_arg_lock;
+  int runtime_payloads_loaded;
+  int runtime_bundle_ready;
+  int runtime_contract_ready;
+  int runtime_bundle_route_count;
+  int runtime_bundle_supported_count;
+  int runtime_bundle_semantic_nodes_count;
+  int runtime_bundle_layout_item_count;
+  int runtime_bundle_render_command_count;
+  int runtime_contract_layout_item_count;
+  int runtime_contract_viewport_item_count;
+  int runtime_contract_interactive_item_count;
+  char runtime_bundle_route_state[CHENG_SEMANTIC_ROUTE_CAP];
   uint64_t last_frame_hash;
   uint64_t expected_frame_hash;
   int has_expected_frame_hash;
@@ -205,6 +217,7 @@ extern int chengGuiNativeDrawTextBgra(
     const char* text) __attribute__((weak));
 
 static void cheng_side_effect_push(ChengAppRuntimeCtx* ctx, const char* kind, const char* payload);
+static void cheng_safe_copy(char* dst, uint32_t cap, const char* src);
 
 static uint32_t cheng_pack_rgba(uint32_t r, uint32_t g, uint32_t b) {
   return 0xFF000000u | ((r & 0xFFu) << 16) | ((g & 0xFFu) << 8) | (b & 0xFFu);
@@ -1181,6 +1194,203 @@ static int cheng_truth_parse_meta_dims(const char* meta_path, int* out_w, int* o
   return 1;
 }
 
+static int cheng_parse_json_string_value(const char* doc, const char* key, char* out, uint32_t out_cap) {
+  if (doc == NULL || key == NULL || key[0] == '\0' || out == NULL || out_cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  char pat[96];
+  pat[0] = '\0';
+  (void)snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char* hit = strstr(doc, pat);
+  if (hit == NULL) {
+    return 0;
+  }
+  const char* colon = strchr(hit + strlen(pat), ':');
+  if (colon == NULL) {
+    return 0;
+  }
+  const char* p = colon + 1;
+  while (*p != '\0' && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+    p += 1;
+  }
+  if (*p != '"') {
+    return 0;
+  }
+  p += 1;
+  uint32_t w = 0u;
+  while (*p != '\0' && *p != '"' && w + 1u < out_cap) {
+    char ch = *p;
+    if (ch == '\\' && p[1] != '\0') {
+      p += 1;
+      ch = *p;
+      if (ch == 'n') {
+        ch = '\n';
+      } else if (ch == 'r') {
+        ch = '\r';
+      } else if (ch == 't') {
+        ch = '\t';
+      }
+    }
+    out[w++] = ch;
+    p += 1;
+  }
+  out[w] = '\0';
+  return w > 0u;
+}
+
+static int cheng_parse_json_bool_true(const char* doc, const char* key) {
+  if (doc == NULL || key == NULL || key[0] == '\0') {
+    return 0;
+  }
+  char pat[96];
+  pat[0] = '\0';
+  (void)snprintf(pat, sizeof(pat), "\"%s\"", key);
+  const char* hit = strstr(doc, pat);
+  if (hit == NULL) {
+    return 0;
+  }
+  const char* colon = strchr(hit + strlen(pat), ':');
+  if (colon == NULL) {
+    return 0;
+  }
+  const char* p = colon + 1;
+  while (*p != '\0' && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+    p += 1;
+  }
+  return strncmp(p, "true", 4u) == 0;
+}
+
+static void cheng_runtime_payload_refresh(ChengAppRuntimeCtx* ctx) {
+  if (ctx == NULL || ctx->runtime_payloads_loaded) {
+    return;
+  }
+  ctx->runtime_payloads_loaded = 1;
+  ctx->runtime_bundle_ready = 0;
+  ctx->runtime_contract_ready = 0;
+  ctx->runtime_bundle_route_count = 0;
+  ctx->runtime_bundle_supported_count = 0;
+  ctx->runtime_bundle_semantic_nodes_count = 0;
+  ctx->runtime_bundle_layout_item_count = 0;
+  ctx->runtime_bundle_render_command_count = 0;
+  ctx->runtime_contract_layout_item_count = 0;
+  ctx->runtime_contract_viewport_item_count = 0;
+  ctx->runtime_contract_interactive_item_count = 0;
+  ctx->runtime_bundle_route_state[0] = '\0';
+
+  const char* bundle_json = cheng_mobile_host_runtime_bundle_payload_json();
+  const char* contract_json = cheng_mobile_host_runtime_contract_payload_json();
+  char format[64];
+  format[0] = '\0';
+  if (cheng_parse_json_string_value(bundle_json, "format", format, (uint32_t)sizeof(format)) &&
+      strcmp(format, "native_gui_bundle_v1") == 0) {
+    int route_count = 0;
+    int supported_count = 0;
+    int semantic_nodes_count = 0;
+    int layout_item_count = 0;
+    int render_command_count = 0;
+    (void)cheng_parse_json_string_value(bundle_json,
+                                        "route_state",
+                                        ctx->runtime_bundle_route_state,
+                                        (uint32_t)sizeof(ctx->runtime_bundle_route_state));
+    (void)cheng_truth_parse_json_positive_int(bundle_json, "route_count", &route_count);
+    (void)cheng_truth_parse_json_positive_int(bundle_json, "supported_count", &supported_count);
+    (void)cheng_truth_parse_json_positive_int(bundle_json, "semantic_nodes_count", &semantic_nodes_count);
+    (void)cheng_truth_parse_json_positive_int(bundle_json, "item_count", &layout_item_count);
+    (void)cheng_truth_parse_json_positive_int(bundle_json, "command_count", &render_command_count);
+    ctx->runtime_bundle_route_count = route_count;
+    ctx->runtime_bundle_supported_count = supported_count;
+    ctx->runtime_bundle_semantic_nodes_count = semantic_nodes_count;
+    ctx->runtime_bundle_layout_item_count = layout_item_count;
+    ctx->runtime_bundle_render_command_count = render_command_count;
+    if (cheng_parse_json_bool_true(bundle_json, "bundle_ready") &&
+        ctx->runtime_bundle_route_state[0] != '\0' &&
+        route_count > 0 &&
+        semantic_nodes_count > 0) {
+      ctx->runtime_bundle_ready = 1;
+    }
+  }
+
+  format[0] = '\0';
+  if (cheng_parse_json_string_value(contract_json, "format", format, (uint32_t)sizeof(format)) &&
+      strcmp(format, "native_gui_runtime_contract_v1") == 0) {
+    int layout_item_count = 0;
+    int viewport_item_count = 0;
+    int interactive_item_count = 0;
+    (void)cheng_truth_parse_json_positive_int(contract_json, "item_count", &layout_item_count);
+    (void)cheng_truth_parse_json_positive_int(contract_json, "viewport_item_count", &viewport_item_count);
+    (void)cheng_truth_parse_json_positive_int(contract_json, "interactive_item_count", &interactive_item_count);
+    ctx->runtime_contract_layout_item_count = layout_item_count;
+    ctx->runtime_contract_viewport_item_count = viewport_item_count;
+    ctx->runtime_contract_interactive_item_count = interactive_item_count;
+    if (layout_item_count > 0) {
+      ctx->runtime_contract_ready = 1;
+    }
+  }
+
+  if (ctx->runtime_bundle_ready || ctx->runtime_contract_ready) {
+    char payload[256];
+    payload[0] = '\0';
+    (void)snprintf(payload,
+                   sizeof(payload),
+                   "bundle=%d contract=%d route=%s routes=%d supported=%d semantic=%d layout=%d commands=%d viewport=%d interactive=%d",
+                   ctx->runtime_bundle_ready,
+                   ctx->runtime_contract_ready,
+                   ctx->runtime_bundle_route_state[0] != '\0' ? ctx->runtime_bundle_route_state : "-",
+                   ctx->runtime_bundle_route_count,
+                   ctx->runtime_bundle_supported_count,
+                   ctx->runtime_bundle_semantic_nodes_count,
+                   ctx->runtime_contract_layout_item_count,
+                   ctx->runtime_bundle_render_command_count,
+                   ctx->runtime_contract_viewport_item_count,
+                   ctx->runtime_contract_interactive_item_count);
+    cheng_side_effect_push(ctx, "runtime-payloads", payload);
+  }
+}
+
+static int cheng_runtime_manifest_rel_or_default(const char* key,
+                                                 const char* fallback,
+                                                 char* out,
+                                                 uint32_t out_cap) {
+  if (out == NULL || out_cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  const char* manifestJson = cheng_mobile_host_runtime_manifest_json();
+  if (cheng_parse_json_string_value(manifestJson, key, out, out_cap) && out[0] != '\0') {
+    return 1;
+  }
+  if (fallback == NULL || fallback[0] == '\0') {
+    return 0;
+  }
+  cheng_safe_copy(out, out_cap, fallback);
+  return out[0] != '\0';
+}
+
+static int cheng_runtime_resolve_manifest_path(const char* key,
+                                               const char* fallbackRel,
+                                               char* out,
+                                               uint32_t out_cap) {
+  if (out == NULL || out_cap == 0u) {
+    return 0;
+  }
+  out[0] = '\0';
+  const char* root = cheng_runtime_resource_root();
+  if (root == NULL || root[0] == '\0') {
+    return 0;
+  }
+  char rel[CHENG_TRUTH_PATH_CAP];
+  rel[0] = '\0';
+  if (!cheng_runtime_manifest_rel_or_default(key, fallbackRel, rel, (uint32_t)sizeof(rel))) {
+    return 0;
+  }
+  if (rel[0] == '\0') {
+    return 0;
+  }
+  (void)snprintf(out, out_cap, "%s/%s", root, rel);
+  return out[0] != '\0';
+}
+
 static int cheng_truth_resolve_dims(ChengAppRuntimeCtx* ctx, size_t rgba_len, const char* meta_path, int* out_w, int* out_h) {
   if (ctx == NULL || out_w == NULL || out_h == NULL || rgba_len == 0u || (rgba_len % 4u) != 0u) {
     return 0;
@@ -1279,6 +1489,11 @@ static int cheng_truth_load_route(ChengAppRuntimeCtx* ctx, const char* route) {
     ctx->truth_rgba_path[0] = '\0';
   }
 
+  char truth_root_rel[CHENG_TRUTH_PATH_CAP];
+  truth_root_rel[0] = '\0';
+  if (!cheng_runtime_manifest_rel_or_default("truth_root_path", "truth", truth_root_rel, (uint32_t)sizeof(truth_root_rel))) {
+    return 0;
+  }
   const char* root = cheng_runtime_resource_root();
   if (root == NULL || root[0] == '\0') {
     return 0;
@@ -1287,8 +1502,8 @@ static int cheng_truth_load_route(ChengAppRuntimeCtx* ctx, const char* route) {
   char meta_path[CHENG_TRUTH_PATH_CAP];
   rgba_path[0] = '\0';
   meta_path[0] = '\0';
-  (void)snprintf(rgba_path, sizeof(rgba_path), "%s/truth/%s.rgba", root, route);
-  (void)snprintf(meta_path, sizeof(meta_path), "%s/truth/%s.meta.json", root, route);
+  (void)snprintf(rgba_path, sizeof(rgba_path), "%s/%s/%s.rgba", root, truth_root_rel, route);
+  (void)snprintf(meta_path, sizeof(meta_path), "%s/%s/%s.meta.json", root, truth_root_rel, route);
   FILE* fp = fopen(rgba_path, "rb");
   if (fp == NULL) {
     return 0;
@@ -1379,8 +1594,12 @@ static int cheng_semantic_load_nodes(ChengAppRuntimeCtx* ctx) {
   if (ctx == NULL) {
     return 0;
   }
-  const char* root = cheng_runtime_resource_root();
-  if (root == NULL || root[0] == '\0') {
+  char path[CHENG_SEMANTIC_PATH_CAP * 2u];
+  path[0] = '\0';
+  if (!cheng_runtime_resolve_manifest_path("semantic_nodes_path",
+                                           "r2c_semantic_render_nodes.tsv",
+                                           path,
+                                           (uint32_t)sizeof(path))) {
     ctx->semantic_nodes_loaded = 1;
     ctx->semantic_nodes_ready = 0;
     ctx->semantic_nodes_count = 0u;
@@ -1390,10 +1609,6 @@ static int cheng_semantic_load_nodes(ChengAppRuntimeCtx* ctx) {
     ctx->semantic_nodes_path[0] = '\0';
     return 0;
   }
-
-  char path[CHENG_SEMANTIC_PATH_CAP * 2u];
-  path[0] = '\0';
-  (void)snprintf(path, sizeof(path), "%s/r2c_semantic_render_nodes.tsv", root);
   if (ctx->semantic_nodes_loaded && strcmp(ctx->semantic_nodes_path, path) == 0) {
     return ctx->semantic_nodes_ready ? 1 : 0;
   }
@@ -1636,6 +1851,7 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
   if (ctx == NULL) {
     return;
   }
+  cheng_runtime_payload_refresh(ctx);
   const char* kv = cheng_mobile_host_runtime_launch_args_kv();
   /* Default policy: truth-first 1:1 visual runtime. */
   ctx->strict_truth_mode = 1;
@@ -1707,6 +1923,10 @@ static void cheng_refresh_route_state(ChengAppRuntimeCtx* ctx) {
   }
   if (route[0] == '\0') {
     if (ctx->route_state[0] == '\0') {
+      if (ctx->runtime_bundle_ready && ctx->runtime_bundle_route_state[0] != '\0') {
+        cheng_set_route_state(ctx, ctx->runtime_bundle_route_state, "runtime-bundle-route");
+        return;
+      }
       char auto_route[sizeof(ctx->route_state)];
       auto_route[0] = '\0';
       if (cheng_semantic_load_nodes(ctx)) {
@@ -1873,9 +2093,20 @@ static void cheng_fill_frame(ChengAppRuntimeCtx* ctx) {
   (void)snprintf(
       reason + strlen(reason),
       sizeof(reason) - strlen(reason),
-      " td=%d ls=%d",
+      " td=%d ls=%d rb=%d rc=%d rr=%s br=%d bs=%d bn=%d bi=%d bc=%d ci=%d cv=%d cx=%d",
       ctx->touch_dispatch_count,
-      ctx->touch_last_slot);
+      ctx->touch_last_slot,
+      ctx->runtime_bundle_ready,
+      ctx->runtime_contract_ready,
+      ctx->runtime_bundle_route_state[0] != '\0' ? ctx->runtime_bundle_route_state : "-",
+      ctx->runtime_bundle_route_count,
+      ctx->runtime_bundle_supported_count,
+      ctx->runtime_bundle_semantic_nodes_count,
+      ctx->runtime_bundle_layout_item_count,
+      ctx->runtime_bundle_render_command_count,
+      ctx->runtime_contract_layout_item_count,
+      ctx->runtime_contract_viewport_item_count,
+      ctx->runtime_contract_interactive_item_count);
   cheng_mobile_host_runtime_mark_stopped(reason);
   cheng_mobile_host_runtime_mark_started();
   if (ctx->has_expected_frame_hash && ctx->expected_frame_hash != ctx->last_frame_hash) {
@@ -2001,6 +2232,18 @@ uint64_t cheng_app_init(void) {
   ctx->route_state[0] = '\0';
   ctx->route_seeded = 0;
   ctx->route_arg_lock = 0;
+  ctx->runtime_payloads_loaded = 0;
+  ctx->runtime_bundle_ready = 0;
+  ctx->runtime_contract_ready = 0;
+  ctx->runtime_bundle_route_count = 0;
+  ctx->runtime_bundle_supported_count = 0;
+  ctx->runtime_bundle_semantic_nodes_count = 0;
+  ctx->runtime_bundle_layout_item_count = 0;
+  ctx->runtime_bundle_render_command_count = 0;
+  ctx->runtime_contract_layout_item_count = 0;
+  ctx->runtime_contract_viewport_item_count = 0;
+  ctx->runtime_contract_interactive_item_count = 0;
+  ctx->runtime_bundle_route_state[0] = '\0';
   ctx->expected_frame_hash = 0u;
   ctx->has_expected_frame_hash = 0;
   ctx->frame_dump_file[0] = '\0';

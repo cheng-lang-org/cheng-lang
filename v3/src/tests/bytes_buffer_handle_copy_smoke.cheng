@@ -1,0 +1,46 @@
+import std/system
+import cheng/v3/runtime/tcp_bridge_abi as bridge
+import cheng/v3/libp2p/transports/tcp_transport as tcp
+
+fn main(): int32 =
+    let allocBefore: int64 = memAllocCount()
+    let freeBefore: int64 = memFreeCount()
+    let liveBefore: int64 = memLiveCount()
+
+    var source: Bytes = bytesAlloc(4)
+    bytesSet(source, 0, int32('a'))
+    bytesSet(source, 1, int32('b'))
+    bytesSet(source, 2, int32('c'))
+    bytesSet(source, 3, int32('d'))
+    let sourcePtr = source.data
+    assert(memRefCount(sourcePtr) == 1, "v3 bytes buffer handle copy: source rc before bridge")
+
+    let handle = bridge.cheng_v3_buffer_handle_from_raw_bridge(source.data, source.len)
+    assert(handle != uint64(0), "v3 bytes buffer handle copy: handle create")
+    assert(memRefCount(sourcePtr) == 1, "v3 bytes buffer handle copy: bridge does not retain source")
+
+    bytesSet(source, 0, int32('z'))
+    bytesSet(source, 1, int32('y'))
+    bytesSet(source, 2, int32('x'))
+    bytesSet(source, 3, int32('w'))
+    source = emptyBytes()
+    assert(memRefCount(sourcePtr) == 0, "v3 bytes buffer handle copy: source release")
+
+    let copiedRes = tcp.v3Libp2pTcpBytesFromHandle(handle)
+    assert(IsOk(copiedRes), "v3 bytes buffer handle copy: handle decode")
+    var copied: Bytes = Value(copiedRes)
+    assert(copied.len == 4, "v3 bytes buffer handle copy: copied len")
+    assert(bytesGet(copied, 0) == int32('a'), "v3 bytes buffer handle copy: copied byte 0")
+    assert(bytesGet(copied, 1) == int32('b'), "v3 bytes buffer handle copy: copied byte 1")
+    assert(bytesGet(copied, 2) == int32('c'), "v3 bytes buffer handle copy: copied byte 2")
+    assert(bytesGet(copied, 3) == int32('d'), "v3 bytes buffer handle copy: copied byte 3")
+    copied = emptyBytes()
+
+    let allocDelta: int64 = memAllocCount() - allocBefore
+    let freeDelta: int64 = memFreeCount() - freeBefore
+    let liveDelta: int64 = memLiveCount() - liveBefore
+    assert(allocDelta == freeDelta, "v3 bytes buffer handle copy: alloc/free balanced")
+    assert(liveDelta == 0, "v3 bytes buffer handle copy: live delta zero")
+
+    echo("v3 bytes_buffer_handle_copy_smoke ok")
+    return 0

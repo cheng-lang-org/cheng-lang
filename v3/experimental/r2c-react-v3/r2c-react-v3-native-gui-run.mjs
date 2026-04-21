@@ -10,6 +10,7 @@ function parseArgs(argv) {
     bundlePath: '',
     sessionPath: '',
     summaryOut: '',
+    reportOut: '',
     autoCloseMs: '',
     screenshotOut: '',
     click: '',
@@ -32,6 +33,7 @@ function parseArgs(argv) {
     else if (arg === '--bundle-path') out.bundlePath = String(argv[++i] || '');
     else if (arg === '--session-path') out.sessionPath = String(argv[++i] || '');
     else if (arg === '--summary-out') out.summaryOut = String(argv[++i] || '');
+    else if (arg === '--report-out') out.reportOut = String(argv[++i] || '');
     else if (arg === '--auto-close-ms') out.autoCloseMs = String(argv[++i] || '');
     else if (arg === '--screenshot-out') out.screenshotOut = String(argv[++i] || '');
     else if (arg === '--click') out.click = String(argv[++i] || '');
@@ -47,7 +49,7 @@ function parseArgs(argv) {
     else if (arg === '--inspector-state-out') out.inspectorStateOut = String(argv[++i] || '');
     else if (arg === '--open-source-on-click') out.openSourceOnClick = true;
     else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: r2c-react-v3-native-gui-run.mjs --repo <path> [--out-dir <dir>] [--bundle-path <file>] [--session-path <file>] [--summary-out <file>] [--auto-close-ms <n>] [--screenshot-out <file>] [--click x,y] [--resize WxH] [--scroll-y <n>] [--wait-after-click-ms <n>] [--focus-item-id <id>] [--type-text <text>] [--send-key <key>] [--route-state <id>] [--inspector-state-out <file>] [--open-source-on-click] [--host-source <file>] [--host-exe <file>]');
+      console.log('Usage: r2c-react-v3-native-gui-run.mjs --repo <path> [--out-dir <dir>] [--bundle-path <file>] [--session-path <file>] [--summary-out <file>] [--report-out <file>] [--auto-close-ms <n>] [--screenshot-out <file>] [--click x,y] [--resize WxH] [--scroll-y <n>] [--wait-after-click-ms <n>] [--focus-item-id <id>] [--type-text <text>] [--send-key <key>] [--route-state <id>] [--inspector-state-out <file>] [--open-source-on-click] [--host-source <file>] [--host-exe <file>]');
       process.exit(0);
     }
   }
@@ -354,6 +356,7 @@ function main() {
   const bundleSummaryPath = path.join(outDir, 'native_gui_bundle.summary.env');
   const sessionPath = path.resolve(args.sessionPath || path.join(outDir, 'native_gui_session_v1.json'));
   const summaryPath = path.resolve(args.summaryOut || path.join(outDir, 'native_gui_run.summary.env'));
+  const reportPath = path.resolve(args.reportOut || path.join(outDir, 'native_gui_run_report_v1.json'));
   const screenshotPath = path.resolve(args.screenshotOut || path.join(outDir, 'native_gui_session.png'));
   const hitInspectorPath = path.resolve(path.join(outDir, 'native_gui_hit_inspector_v1.json'));
   const inspectorStatePath = path.resolve(args.inspectorStateOut || path.join(outDir, 'native_gui_inspector_state_v1.json'));
@@ -483,6 +486,20 @@ function main() {
     native_gui_runtime_exe_path: bundleSummary.native_gui_runtime_exe_path || '',
     native_gui_runtime_compiled_exe_path: bundleSummary.native_gui_runtime_compiled_exe_path || '',
     native_gui_runtime_contract_path: bundleSummary.native_gui_runtime_contract_path || '',
+    native_gui_runtime_manifest_ready: Boolean(runtimeStateDoc?.runtime_manifest_ready),
+    native_gui_runtime_contract_payload_ready: Boolean(runtimeStateDoc?.runtime_contract_payload_ready),
+    native_gui_runtime_bundle_payload_ready: Boolean(runtimeStateDoc?.runtime_bundle_payload_ready),
+    native_gui_runtime_bundle_ready: Boolean(runtimeStateDoc?.runtime_bundle_ready),
+    native_gui_runtime_contract_ready: Boolean(runtimeStateDoc?.runtime_contract_ready),
+    native_gui_runtime_bundle_route_state: String(runtimeStateDoc?.bundle_route_state || ''),
+    native_gui_runtime_bundle_route_count: Number(runtimeStateDoc?.bundle_route_count || 0),
+    native_gui_runtime_bundle_supported_count: Number(runtimeStateDoc?.bundle_supported_count || 0),
+    native_gui_runtime_bundle_semantic_nodes_count: Number(runtimeStateDoc?.bundle_semantic_nodes_count || 0),
+    native_gui_runtime_bundle_layout_item_count: Number(runtimeStateDoc?.bundle_layout_item_count || 0),
+    native_gui_runtime_bundle_render_command_count: Number(runtimeStateDoc?.bundle_render_command_count || 0),
+    native_gui_runtime_contract_layout_item_count: Number(runtimeStateDoc?.contract_layout_item_count || 0),
+    native_gui_runtime_contract_viewport_item_count: Number(runtimeStateDoc?.contract_viewport_item_count || 0),
+    native_gui_runtime_contract_interactive_item_count: Number(runtimeStateDoc?.contract_interactive_item_count || 0),
     native_gui_route_state_requested: String(args.routeState || ''),
     native_gui_host_abi_feature_hits: String(runtimeStateDoc?.host_abi_feature_hits_csv || bundleSummary.native_gui_host_abi_feature_hits || ''),
     native_gui_host_abi_first_batch_ready: Boolean(runtimeStateDoc?.host_abi_first_batch_ready ?? (String(bundleSummary.native_gui_host_abi_first_batch_ready || '') === 'true')),
@@ -556,7 +573,7 @@ function main() {
   if (args.openSourceOnClick && summary.native_gui_click_count > 0 && !summary.native_gui_source_jump_ok) {
     throw new Error(`native_gui_source_jump_failed:${summary.native_gui_source_jump_error || 'unknown'}`);
   }
-  console.log(JSON.stringify({
+  const report = {
     format: 'native_gui_run_report_v1',
     ok: true,
     reason: 'ok',
@@ -592,6 +609,20 @@ function main() {
     runtime_exe_path: summary.native_gui_runtime_exe_path,
     runtime_compiled_exe_path: summary.native_gui_runtime_compiled_exe_path,
     runtime_contract_path: summary.native_gui_runtime_contract_path,
+    runtime_manifest_ready: summary.native_gui_runtime_manifest_ready,
+    runtime_contract_payload_ready: summary.native_gui_runtime_contract_payload_ready,
+    runtime_bundle_payload_ready: summary.native_gui_runtime_bundle_payload_ready,
+    runtime_bundle_ready: summary.native_gui_runtime_bundle_ready,
+    runtime_contract_ready: summary.native_gui_runtime_contract_ready,
+    runtime_bundle_route_state: summary.native_gui_runtime_bundle_route_state,
+    runtime_bundle_route_count: summary.native_gui_runtime_bundle_route_count,
+    runtime_bundle_supported_count: summary.native_gui_runtime_bundle_supported_count,
+    runtime_bundle_semantic_nodes_count: summary.native_gui_runtime_bundle_semantic_nodes_count,
+    runtime_bundle_layout_item_count: summary.native_gui_runtime_bundle_layout_item_count,
+    runtime_bundle_render_command_count: summary.native_gui_runtime_bundle_render_command_count,
+    runtime_contract_layout_item_count: summary.native_gui_runtime_contract_layout_item_count,
+    runtime_contract_viewport_item_count: summary.native_gui_runtime_contract_viewport_item_count,
+    runtime_contract_interactive_item_count: summary.native_gui_runtime_contract_interactive_item_count,
     route_state_requested: summary.native_gui_route_state_requested,
     host_abi_first_batch_ready: summary.native_gui_host_abi_first_batch_ready,
     host_abi_first_batch_features: String(summary.native_gui_host_abi_first_batch_features || '').split(',').filter(Boolean),
@@ -633,7 +664,9 @@ function main() {
     source_jump_error: summary.native_gui_source_jump_error,
     window_width: summary.native_gui_window_width,
     window_height: summary.native_gui_window_height,
-  }, null, 2));
+  };
+  writeJson(reportPath, report);
+  console.log(JSON.stringify(report, null, 2));
 }
 
 main();

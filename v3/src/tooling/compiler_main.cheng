@@ -12,6 +12,7 @@ import cheng/v3/tooling/support_matrix as smatrix
 import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/tooling/compiler_equivalence as ceq
+import cheng/v3/tooling/compiler_publish_gate as cpub
 import cheng/v3/tooling/compiler_world_libp2p as cwlp
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/mobile_shell_codegen as mshell
@@ -21,6 +22,7 @@ import cheng/v3/lang/parser
 import cheng/v3/backend/build_plan as buildplan
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/backend/target_matrix as tmat
 
 @importc("get_stdout")
 fn v3CompilerStdoutBridge(): os.File
@@ -41,8 +43,8 @@ fn v3CompilerConcat3(left: str, middle: str, right: str): str =
     return out
 
 fn v3CompilerPrintBlock(text: str) =
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= text.len:
         let atEnd: bool = i == text.len
         if atEnd:
@@ -70,17 +72,18 @@ fn v3CompilerUsage(rootDir: str) =
 
 fn v3CompilerR2cReactV3Help() =
     v3CompilerPrintLine("usage: cheng r2c-react-v3 <subcommand> [args]")
-    v3CompilerPrintLine("subcommands: help, status, frontend, static-surface, semantic-surface, codegen-surface, discover-truth-routes, capture-truth, truth-compare, compare-truth, exec-route-matrix, compare-truth-matrix, native-gui-bundle, native-gui-runtime, run-native-gui, replay-hit-inspector, compile")
+    v3CompilerPrintLine("subcommands: help, status, frontend, static-surface, semantic-surface, codegen-surface, discover-truth-routes, capture-truth, truth-compare, compare-truth, exec-route-matrix, compare-truth-matrix, native-gui-bundle, native-gui-runtime, run-native-gui, render-compare, replay-hit-inspector, compile")
     v3CompilerPrintLine("frontend flags: --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]")
     v3CompilerPrintLine("static-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...] [--asset-root <dir> ...]")
     v3CompilerPrintLine("semantic-surface flags: --repo <path> [--tsx-ast <file>] [--out-dir <dir>] [--runtime-root <dir> ...]")
     v3CompilerPrintLine("discover-truth-routes flags: --repo <path> [--out-dir <dir>] [--runtime-root <dir> ...]")
     v3CompilerPrintLine("capture-truth flags: --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--chrome <bin>] [--width <n>] [--height <n>] [--truth-flag <0|1>] [--debug-port <n>] [--wait-ms <n>]")
-    v3CompilerPrintLine("compare-truth flags: --exec-snapshot <file> --truth-trace <file> [--codegen-manifest <file>] [--truth-state <state>] [--out <file>]")
+    v3CompilerPrintLine("compare-truth flags: --exec-snapshot <file> --truth-trace <file> [--codegen-manifest <file>] [--truth-state <state>] [--native-gui-summary <file>] [--out <file>]")
     v3CompilerPrintLine("exec-route-matrix flags: (--route-catalog <file> | --tsx-ast <file>) --exec-snapshot <file> --truth-routes-file <file> [--codegen-manifest <file>] [--truth-trace <file>] [--out <file>]")
     v3CompilerPrintLine("compare-truth-matrix flags: --exec-route-matrix <file> --truth-trace <file> [--codegen-manifest <file>] [--out <file>]")
     v3CompilerPrintLine("native-gui-runtime flags: --runtime-contract <file> [--state-* ...] [--event-* ...]")
     v3CompilerPrintLine("run-native-gui flags: --click x,y --resize WxH --scroll-y <n> --wait-after-click-ms <n> --focus-item-id <id> --type-text <text> --send-key <key> --inspector-state-out <file> --open-source-on-click")
+    v3CompilerPrintLine("render-compare flags: --repo <path> --route <state> [--out-dir <dir>] [--base-url <url>] [--tooling-bin <file>] [--auto-close-ms <n>] [--resize WxH] [--wait-ms <n>] [--browser-width <n>] [--browser-height <n>] [--summary-out <file>] [--out <file>] [--native-summary <file>] [--truth-summary <file>] [--native-screenshot <file>] [--truth-screenshot <file>]")
     v3CompilerPrintLine("replay-hit-inspector flags: --inspector-state <file> --out <file> --open-source")
 
 fn v3CompilerStatus(rootDir: str) =
@@ -189,24 +192,35 @@ fn v3CompilerWriteOptionalReport(rootDir: str,
     text = text + "\n"
     return v3path.V3WriteTextFile(rootDir, rawPath, text)
 
-fn v3CompilerBridgeCompilerPath(rootDir: str): str =
+fn v3CompilerBackendDriverHandoffDisabled(): bool =
     let noHandoffText = strutil.Strip(os.GetEnv("CHENG_V3_NO_BACKEND_DRIVER_HANDOFF"))
-    if len(noHandoffText) > 0 && noHandoffText != "0":
-        return ""
+    return len(noHandoffText) > 0 && noHandoffText != "0"
+
+fn v3CompilerBridgeCandidateReady(rootDir: str,
+                                  candidatePath: str): bool =
+    if !v3path.V3FileExistsNonEmpty(rootDir, candidatePath):
+        return false
+    let currentPath = v3CompilerCurrentExecutablePath(rootDir)
+    if len(currentPath) > 0 && currentPath == candidatePath:
+        return false
+    return true
+
+fn v3CompilerBridgeCompilerPath(rootDir: str): str =
     let stage3 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage3")
-    if v3path.V3FileExistsNonEmpty(rootDir, stage3):
+    if v3CompilerBridgeCandidateReady(rootDir, stage3):
         return stage3
-    let backendDriver = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
-    if v3path.V3FileExistsNonEmpty(rootDir, backendDriver):
-        return backendDriver
+    if !v3CompilerBackendDriverHandoffDisabled():
+        let backendDriver = v3path.V3PathAbsolute(rootDir, "artifacts/v3_backend_driver/cheng")
+        if v3CompilerBridgeCandidateReady(rootDir, backendDriver):
+            return backendDriver
     let stage2 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage2")
-    if v3path.V3FileExistsNonEmpty(rootDir, stage2):
+    if v3CompilerBridgeCandidateReady(rootDir, stage2):
         return stage2
     let stage1 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage1")
-    if v3path.V3FileExistsNonEmpty(rootDir, stage1):
+    if v3CompilerBridgeCandidateReady(rootDir, stage1):
         return stage1
     let stage0 = v3path.V3PathAbsolute(rootDir, "artifacts/v3_bootstrap/cheng.stage0")
-    if v3path.V3FileExistsNonEmpty(rootDir, stage0):
+    if v3CompilerBridgeCandidateReady(rootDir, stage0):
         return stage0
     return ""
 
@@ -231,8 +245,8 @@ fn v3CompilerBootstrapBridgePath(rootDir: str,
     return ""
 
 fn v3CompilerArgsWithoutReportOut(args: str[]): str[] =
-    var out: str[] = []
-    var i: int32 = 0
+    var out: str[]
+    var i: int32
     while i < args.len:
         let arg = strutil.Strip(args[i])
         if arg == "--report-out":
@@ -260,8 +274,8 @@ fn v3CompilerArgsWithReportOut(args: str[],
     return out
 
 fn v3CompilerArgsWithoutBrowserBridgeObject(args: str[]): str[] =
-    var out: str[] = []
-    var i: int32 = 0
+    var out: str[]
+    var i: int32
     while i < args.len:
         let arg = strutil.Strip(args[i])
         if arg == "--browser-bridge-object":
@@ -307,9 +321,9 @@ fn v3CompilerAppendReportLine(out: var str,
 
 fn v3CompilerLinesWithPrefix(text: str,
                              prefix: str): str[] =
-    var lines: str[] = []
-    var start: int32 = 0
-    var i: int32 = 0
+    var lines: str[]
+    var start: int32
+    var i: int32
     while i <= text.len:
         var lineEnd = false
         if i == text.len:
@@ -552,7 +566,7 @@ fn v3CompilerBootstrapFreshInputsReady(rootDir: str,
         let snapshotText = v3path.V3ReadTextFile(rootDir, snapshotPath)
         let raw = strutil.Strip(contracts.v3BootstrapLineValue(snapshotText, "fresh_input_paths"))
         if len(raw) > 0:
-            var start: int32 = 0
+            var start: int32
             for i in 0..len(raw):
                 var itemEnd = false
                 if i == len(raw):
@@ -584,7 +598,7 @@ fn v3CompilerBootstrapFreshInputsReady(rootDir: str,
 fn v3CompilerForwardsToStage3(cmd: str): bool =
     if cmd == "scan-hotpath":
         return true
-    if cmd == "run-smokes" || cmd == "print-bootstrap" ||
+    if cmd == "run-smokes" || cmd == "run-production-regression" || cmd == "print-bootstrap" ||
        cmd == "bootstrap-bridge" || cmd == "build-backend-driver" || cmd == "compile-exe":
         return true
     if cmd == "debug-report" || cmd == "print-symbols" || cmd == "print-line-map":
@@ -676,11 +690,11 @@ fn v3CompilerForwardToBridgeEnv(rootDir: str,
     logName = logName + cmd
     logName = logName + ".log"
     let logPath = os.JoinPath(logDir, logName)
-    var forwardArgs: str[] = []
+    var forwardArgs: str[]
     add(forwardArgs, cmd)
     for i in 0..<args.len:
         add(forwardArgs, args[i])
-    var forwardEnv: str[] = []
+    var forwardEnv: str[]
     add(forwardEnv, "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1")
     for i in 0..<envOverrides.len:
         add(forwardEnv, envOverrides[i])
@@ -727,8 +741,8 @@ fn v3CompilerFileCommand(filePath: str,
 
 fn v3CompilerEnvLineValue(text: str, key: str): str =
     let prefix = key + "="
-    var start: int32 = 0
-    var i: int32 = 0
+    var start: int32
+    var i: int32
     while i <= text.len:
         var lineEnd = false
         if i == text.len:
@@ -833,7 +847,7 @@ fn v3CompilerRemoteLogPath(outDir: str,
 fn v3CompilerRemoteOrdinarySmokeNames(): str[] =
     let singleRaw = cmdline.ReadFlagOrDefault("--smoke-name", "")
     let singleSmoke = strutil.Strip(singleRaw)
-    var out: str[] = []
+    var out: str[]
     if len(singleSmoke) > 0:
         add(out, singleSmoke)
         return out
@@ -924,7 +938,7 @@ fn v3CompilerRunRemoteCommand(rootDir: str,
                               logPath: str,
                               context: str,
                               outputOut: var str): bool =
-    var argv: str[] = []
+    var argv: str[]
     add(argv, "-n")
     add(argv, "-o")
     add(argv, "BatchMode=yes")
@@ -1011,7 +1025,7 @@ fn v3CompilerVerifyRemoteExeSmoke(rootDir: str,
     runLabel = runLabel + "_"
     runLabel = runLabel + smokeName
     runLabel = runLabel + "_run"
-    var compileArgv: str[] = []
+    var compileArgv: str[]
     add(compileArgv, "env")
     add(compileArgv, remoteEnvRoot)
     add(compileArgv, remoteBackend)
@@ -1085,7 +1099,7 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
     var remoteSource = remotePackageRoot
     remoteSource = remoteSource + "/src/project/cheng_node_main.cheng"
     let remoteEnvRoot = "CHENG_V3_ROOT=" + remoteRoot
-    var compileArgv: str[] = []
+    var compileArgv: str[]
     add(compileArgv, "env")
     add(compileArgv, remoteEnvRoot)
     add(compileArgv, remoteBackend)
@@ -1108,7 +1122,7 @@ fn v3CompilerVerifyRemoteChainNodeSelfTest(rootDir: str,
         v3CompilerAppendKeyValueLine(summaryText, "chain_node_self_test_run_log", runLogPath)
         v3CompilerAppendKeyValueLine(summaryText, "chain_node_self_test_ok", "false")
         return false
-    let runArgv = [remoteOut, "chain-self-test"]
+    let runArgv = [remoteOut, "chain", "self", "test"]
     var runOut = ""
     if !v3CompilerRunRemoteCommand(rootDir,
                                    sshTarget,
@@ -1490,14 +1504,14 @@ fn v3CompilerRunProgramLogged(rootDir: str,
     return false
 
 fn v3CompilerSharedEmitExtension(targetTriple: str): str =
-    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+    if tmat.v3TargetIsWindows(targetTriple):
         return ".dll"
     if targetTriple == "arm64-apple-darwin":
         return ".dylib"
     return ".so"
 
 fn v3CompilerSharedEmitFileHint(targetTriple: str): str =
-    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
+    if tmat.v3TargetIsWindows(targetTriple):
         return "PE32+"
     if targetTriple == "arm64-apple-darwin":
         return "shared library"
@@ -1991,7 +2005,7 @@ fn v3CompilerBuildSystemPlanForEquivalenceFromRuntimeFlags(rootDir: str,
 
 fn v3CompilerCollectArgsFrom(startIndex: int32,
                              count: int32): str[] =
-    var out: str[] = []
+    var out: str[]
     if startIndex > count:
         return out
     for i in startIndex..count:
@@ -2337,7 +2351,7 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
     let driftText = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest output drifted")
     let missingOutputPrefix = v3CompilerConcat3("v3 compiler: backend driver ", stem, " selftest missing output: ")
     let missingOutputText = missingOutputPrefix + outBin
-    var compileArgs: str[] = []
+    var compileArgs: str[]
     add(compileArgs, "system-link-exec")
     add(compileArgs, "--root:" + packageRoot)
     add(compileArgs, "--in:" + sourcePath)
@@ -2358,7 +2372,7 @@ fn v3CompilerRunBackendDriverSelftest(rootDir: str,
     if !v3path.V3PathFileExists(outBin) || !v3path.V3PathFileExists(outBin + ".v3.map"):
         v3CompilerPrintErr(missingOutputText)
         return false
-    let runArgs: str[] = []
+    let runArgs: str[]
     if !v3CompilerRunFileLogged(rootDir,
                                 outBin,
                                 runArgs,
@@ -2495,49 +2509,56 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
                                 "build-backend-driver plan"):
         return 2
     let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
-    var referenceCompiler = currentCompiler
+    let backendDriverReference = v3CompilerBackendDriverPath(rootDir)
+    var referenceCompiler = ""
+    if len(backendDriverReference) > 0 &&
+       (v3CompilerBackendDriverFresh(rootDir, backendDriverReference) ||
+        v3CompilerBackendDriverReadyOverride(rootDir, backendDriverReference)):
+        referenceCompiler = backendDriverReference
     let referencePlanArgs = ["print-build-plan", "--target:" + targetTriple]
-    if !v3CompilerRunFileLogged(rootDir,
-                                referenceCompiler,
-                                referencePlanArgs,
-                                referencePlanLogPath,
-                                "build-backend-driver reference-plan"):
-        return 2
-    let currentPlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
-    if !v3CompilerTextContainsAll(currentPlanText, ["target=" + targetTriple]):
-        let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
-        if len(bootstrapReference) > 0 && bootstrapReference != currentCompiler:
-            referenceCompiler = bootstrapReference
-            if !v3CompilerRunFileLogged(rootDir,
-                                        referenceCompiler,
-                                        referencePlanArgs,
-                                        referencePlanLogPath,
-                                        "build-backend-driver reference-plan"):
-                return 2
-    let referencePlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
-    var referencePlanCheck = "skip_target_mismatch"
-    if v3CompilerTextContainsAll(referencePlanText, ["target=" + targetTriple]):
-        let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
-        var planCompareCommand = "grep -E "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
-        planCompareCommand = planCompareCommand + " > "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-        planCompareCommand = planCompareCommand + " && grep -E "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
-        planCompareCommand = planCompareCommand + " > "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-        planCompareCommand = planCompareCommand + " && cmp -s "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-        planCompareCommand = planCompareCommand + " "
-        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-        if os.ExecCmdStatus(planCompareCommand, rootDir) != 0:
-            v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
+    var referencePlanCheck = "skip_stale_backend_driver"
+    if len(referenceCompiler) > 0:
+        if !v3CompilerRunFileLogged(rootDir,
+                                    referenceCompiler,
+                                    referencePlanArgs,
+                                    referencePlanLogPath,
+                                    "build-backend-driver reference-plan"):
             return 2
-        referencePlanCheck = "ok"
+        let referencePlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
+        if !v3CompilerTextContainsAll(referencePlanText, ["target=" + targetTriple]):
+            let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
+            if len(bootstrapReference) > 0 && bootstrapReference != currentCompiler:
+                referenceCompiler = bootstrapReference
+                if !v3CompilerRunFileLogged(rootDir,
+                                            referenceCompiler,
+                                            referencePlanArgs,
+                                            referencePlanLogPath,
+                                            "build-backend-driver reference-plan"):
+                    return 2
+        let resolvedReferencePlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
+        referencePlanCheck = "skip_target_mismatch"
+        if v3CompilerTextContainsAll(resolvedReferencePlanText, ["target=" + targetTriple]):
+            let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
+            var planCompareCommand = "grep -E "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+            planCompareCommand = planCompareCommand + " "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
+            planCompareCommand = planCompareCommand + " > "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+            planCompareCommand = planCompareCommand + " && grep -E "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+            planCompareCommand = planCompareCommand + " "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
+            planCompareCommand = planCompareCommand + " > "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+            planCompareCommand = planCompareCommand + " && cmp -s "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+            planCompareCommand = planCompareCommand + " "
+            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+            if os.ExecCmdStatus(planCompareCommand, rootDir) != 0:
+                v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
+                return 2
+            referencePlanCheck = "ok"
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
                                            backendDriverCandidateOut,
@@ -3766,9 +3787,11 @@ fn v3CompilerPublishSummary(prefix: str,
                             plan: sexec.V3SystemLinkExecPlan,
                             proofMode: str,
                             equivalenceChecked: bool,
-                            decision: ceq.V3CompilerPublishDecision): str =
+                            equivalencePassed: int32,
+                            publishAllowed: int32,
+                            proofCid: layout.FixedBytes32): str =
     var checked = "0"
-    var passed = intToStr(decision.equivalencePassed)
+    var passed = intToStr(equivalencePassed)
     var proofModeText = "-"
     if equivalenceChecked:
         checked = "1"
@@ -3784,8 +3807,8 @@ fn v3CompilerPublishSummary(prefix: str,
     out = out + "proof_mode=" + proofModeText + "\n"
     out = out + "equivalence_checked=" + checked + "\n"
     out = out + "equivalence_passed=" + passed + "\n"
-    out = out + "publish_allowed=" + intToStr(decision.publishAllowed) + "\n"
-    out = out + "proof_cid=" + layout.fixedBytes32Hex(decision.proofCid)
+    out = out + "publish_allowed=" + intToStr(publishAllowed) + "\n"
+    out = out + "proof_cid=" + layout.fixedBytes32Hex(proofCid)
     return out
 
 fn v3CompilerEmitCsg(rootDir: str,
@@ -4053,17 +4076,33 @@ fn v3CompilerPublishWorld(rootDir: str,
         equivalenceChecked = true
     else:
         proof.proofCid = layout.fixedBytes32Zero()
-    var decision: ceq.V3CompilerPublishDecision
-    let decisionRes = ceq.v3CompilerPublishDecisionMake(channel,
-                                                        plan.localUniverse.worldHead.headCid,
-                                                        equivalenceChecked,
-                                                        proof,
-                                                        decision)
+    var publishChannel = ""
+    var stableGateRequired = 0
+    var equivalenceCheckedFlag = 0
+    var equivalencePassed = 0
+    var publishAllowed = 0
+    var proofCid = layout.fixedBytes32Zero()
+    let decisionRes = cpub.v3CompilerPublishDecisionEvaluate(channel,
+                                                             plan.localUniverse.worldHead.headCid,
+                                                             equivalenceChecked,
+                                                             proof,
+                                                             publishChannel,
+                                                             stableGateRequired,
+                                                             equivalenceCheckedFlag,
+                                                             equivalencePassed,
+                                                             publishAllowed,
+                                                             proofCid)
     if IsErr(decisionRes):
         v3CompilerPrintErr(Error(decisionRes))
         return 2
-    let decisionReport = ceq.v3CompilerPublishDecisionReport(decision)
-    if decision.publishAllowed == 0:
+    let decisionReport = cpub.v3CompilerPublishDecisionReport(publishChannel,
+                                                              stableGateRequired,
+                                                              equivalenceCheckedFlag,
+                                                              equivalencePassed,
+                                                              publishAllowed,
+                                                              plan.localUniverse.worldHead.headCid,
+                                                              proofCid)
+    if publishAllowed == 0:
         if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, decisionReport):
             v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
             return 2
@@ -4089,7 +4128,9 @@ fn v3CompilerPublishWorld(rootDir: str,
                                            plan,
                                            proofMode,
                                            equivalenceChecked,
-                                           decision)
+                                           equivalencePassed,
+                                           publishAllowed,
+                                           proofCid)
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4142,17 +4183,33 @@ fn v3CompilerFreshNodeSelfhost(rootDir: str,
         equivalenceChecked = true
     else:
         proof.proofCid = layout.fixedBytes32Zero()
-    var decision: ceq.V3CompilerPublishDecision
-    let decisionRes = ceq.v3CompilerPublishDecisionMake(channel,
-                                                        plan.localUniverse.worldHead.headCid,
-                                                        equivalenceChecked,
-                                                        proof,
-                                                        decision)
+    var publishChannel = ""
+    var stableGateRequired = 0
+    var equivalenceCheckedFlag = 0
+    var equivalencePassed = 0
+    var publishAllowed = 0
+    var proofCid = layout.fixedBytes32Zero()
+    let decisionRes = cpub.v3CompilerPublishDecisionEvaluate(channel,
+                                                             plan.localUniverse.worldHead.headCid,
+                                                             equivalenceChecked,
+                                                             proof,
+                                                             publishChannel,
+                                                             stableGateRequired,
+                                                             equivalenceCheckedFlag,
+                                                             equivalencePassed,
+                                                             publishAllowed,
+                                                             proofCid)
     if IsErr(decisionRes):
         v3CompilerPrintErr(Error(decisionRes))
         return 2
-    let decisionReport = ceq.v3CompilerPublishDecisionReport(decision)
-    if decision.publishAllowed == 0:
+    let decisionReport = cpub.v3CompilerPublishDecisionReport(publishChannel,
+                                                              stableGateRequired,
+                                                              equivalenceCheckedFlag,
+                                                              equivalencePassed,
+                                                              publishAllowed,
+                                                              plan.localUniverse.worldHead.headCid,
+                                                              proofCid)
+    if publishAllowed == 0:
         if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, decisionReport):
             v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
             return 2
@@ -4186,7 +4243,9 @@ fn v3CompilerFreshNodeSelfhost(rootDir: str,
                                            plan,
                                            proofMode,
                                            equivalenceChecked,
-                                           decision) + "\n" + freshReport
+                                           equivalencePassed,
+                                           publishAllowed,
+                                           proofCid) + "\n" + freshReport
     if !v3CompilerWriteOptionalReport(rootDir, req.reportPath, summary):
         v3CompilerPrintErr("v3 compiler: failed to write report: " + req.reportPath)
         return 2
@@ -4651,7 +4710,7 @@ fn v3CompilerVerifyDebugRuntime(rootDir: str): int32 =
     let expectedProgramSupportHostSource = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/program_support_host_runtime_v3.cheng")
     let expectedProgramArgvSource = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng")
     let expectedToolingArgvSource = v3path.V3PathAbsolute(rootDir, "v3/src/runtime/compiler_runtime_tooling_entry_provider_v3.cheng")
-    var ordinarySources: str[] = []
+    var ordinarySources: str[]
     add(ordinarySources, expectedProgramArgvSource)
     add(ordinarySources, expectedCoreSource)
     add(ordinarySources, expectedDebugSource)
@@ -4664,7 +4723,7 @@ fn v3CompilerVerifyDebugRuntime(rootDir: str): int32 =
                                               hostTarget,
                                               ordinarySources):
         return 1
-    var toolingSources: str[] = []
+    var toolingSources: str[]
     add(toolingSources, expectedToolingArgvSource)
     add(toolingSources, expectedCoreSource)
     add(toolingSources, expectedDebugSource)
@@ -4828,12 +4887,121 @@ fn v3CompilerVerifyMobileShellBuildProbe(rootDir: str): int32 =
     return 0
 
 fn v3CompilerVerifyR2cReactV3Surface(rootDir: str): int32 =
-    let smokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_surface_smoke.cheng")
-    return v3CompilerVerifyLiveBackendDriverSmoke(rootDir,
-                                                  smokeSource,
-                                                  "r2c_react_v3_surface_smoke",
-                                                  "v3 r2c_react_v3_surface_smoke ok",
-                                                  "verify-r2c-react-v3-surface: ok")
+    if v3CompilerRequestedTarget() != contracts.v3BootstrapDefaultTarget():
+        v3CompilerPrintErr("v3 compiler: verify command only supports host backend_driver target")
+        return 1
+    var compiler = ""
+    if !v3CompilerEnsureBackendDriverPath(rootDir, "verify-r2c-react-v3-surface", compiler):
+        return 1
+    let packageRoot = v3path.V3PathAbsolute(rootDir, "v3")
+    let hostTarget = v3CompilerHostTarget()
+    var targetTriple = contracts.v3BootstrapDefaultTarget()
+    if len(hostTarget) > 0:
+        targetTriple = hostTarget
+    let surfaceSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_surface_smoke.cheng")
+    var surfaceSmokeOut = ""
+    var surfaceSmokeCompileReportPath = ""
+    var surfaceSmokeCompileLogPath = ""
+    var surfaceSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           surfaceSmokeSource,
+                                           "r2c_react_v3_surface_smoke",
+                                           "v3 r2c_react_v3_surface_smoke ok",
+                                           surfaceSmokeOut,
+                                           surfaceSmokeCompileReportPath,
+                                           surfaceSmokeCompileLogPath,
+                                           surfaceSmokeRunLogPath):
+        return 1
+    let publishSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_publish_selector_bundle_smoke.cheng")
+    var publishSmokeOut = ""
+    var publishSmokeCompileReportPath = ""
+    var publishSmokeCompileLogPath = ""
+    var publishSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           publishSmokeSource,
+                                           "r2c_react_v3_publish_selector_bundle_smoke",
+                                           "v3 r2c_react_v3_publish_selector_bundle_smoke ok",
+                                           publishSmokeOut,
+                                           publishSmokeCompileReportPath,
+                                           publishSmokeCompileLogPath,
+                                           publishSmokeRunLogPath):
+        return 1
+    let runNativeGuiControllerSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_run_native_gui_controller_smoke.cheng")
+    var runNativeGuiControllerSmokeOut = ""
+    var runNativeGuiControllerSmokeCompileReportPath = ""
+    var runNativeGuiControllerSmokeCompileLogPath = ""
+    var runNativeGuiControllerSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           runNativeGuiControllerSmokeSource,
+                                           "r2c_react_v3_run_native_gui_controller_smoke",
+                                           "v3 r2c_react_v3_run_native_gui_controller_smoke ok",
+                                           runNativeGuiControllerSmokeOut,
+                                           runNativeGuiControllerSmokeCompileReportPath,
+                                           runNativeGuiControllerSmokeCompileLogPath,
+                                           runNativeGuiControllerSmokeRunLogPath):
+        return 1
+    let truthCompareControllerSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_truth_compare_controller_smoke.cheng")
+    var truthCompareControllerSmokeOut = ""
+    var truthCompareControllerSmokeCompileReportPath = ""
+    var truthCompareControllerSmokeCompileLogPath = ""
+    var truthCompareControllerSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           truthCompareControllerSmokeSource,
+                                           "r2c_react_v3_truth_compare_controller_smoke",
+                                           "v3 r2c_react_v3_truth_compare_controller_smoke ok",
+                                           truthCompareControllerSmokeOut,
+                                           truthCompareControllerSmokeCompileReportPath,
+                                           truthCompareControllerSmokeCompileLogPath,
+                                           truthCompareControllerSmokeRunLogPath):
+        return 1
+    let renderCompareDirectSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_render_compare_direct_smoke.cheng")
+    var renderCompareDirectSmokeOut = ""
+    var renderCompareDirectSmokeCompileReportPath = ""
+    var renderCompareDirectSmokeCompileLogPath = ""
+    var renderCompareDirectSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           renderCompareDirectSmokeSource,
+                                           "r2c_react_v3_render_compare_direct_smoke",
+                                           "v3 r2c_react_v3_render_compare_direct_smoke ok",
+                                           renderCompareDirectSmokeOut,
+                                           renderCompareDirectSmokeCompileReportPath,
+                                           renderCompareDirectSmokeCompileLogPath,
+                                           renderCompareDirectSmokeRunLogPath):
+        return 1
+    let renderCompareControllerSmokeSource = v3path.V3PathAbsolute(rootDir, "v3/src/tests/r2c_react_v3_render_compare_controller_smoke.cheng")
+    var renderCompareControllerSmokeOut = ""
+    var renderCompareControllerSmokeCompileReportPath = ""
+    var renderCompareControllerSmokeCompileLogPath = ""
+    var renderCompareControllerSmokeRunLogPath = ""
+    if !v3CompilerRunBackendDriverSelftest(rootDir,
+                                           packageRoot,
+                                           compiler,
+                                           targetTriple,
+                                           renderCompareControllerSmokeSource,
+                                           "r2c_react_v3_render_compare_controller_smoke",
+                                           "v3 r2c_react_v3_render_compare_controller_smoke ok",
+                                           renderCompareControllerSmokeOut,
+                                           renderCompareControllerSmokeCompileReportPath,
+                                           renderCompareControllerSmokeCompileLogPath,
+                                           renderCompareControllerSmokeRunLogPath):
+        return 1
+    v3CompilerPrintLine("verify-r2c-react-v3-surface: ok")
+    return 0
 
 fn v3CompilerAsciiSpace(ch: char): bool =
     let code = int32(ch)
@@ -4888,7 +5056,7 @@ fn v3CompilerOrphanSnapshotKey(lineRaw: str): str =
     return pidText + "|" + commandText
 
 fn v3CompilerNormalizeOrphanSnapshot(text: str): str[] =
-    var out: str[] = []
+    var out: str[]
     var start = 0
     var i = 0
     while i <= len(text):
@@ -4921,7 +5089,7 @@ fn v3CompilerSeqContainsStr(items: str[], value: str): bool =
     return false
 
 fn v3CompilerCollectNewOrphanKeys(before: str[], after: str[]): str[] =
-    var out: str[] = []
+    var out: str[]
     for i in 0..<after.len:
         let key = after[i]
         if !v3CompilerSeqContainsStr(before, key) && !v3CompilerSeqContainsStr(out, key):
@@ -5138,7 +5306,7 @@ fn v3CompilerVerifyOrphanGuard(rootDir: str): int32 =
                 v3CompilerPrintErr("verify_orphan_guard_v3: banned direct process guard ref in " + path)
                 return 1
         pathStart = i + 1
-    var orphanBefore: str[] = []
+    var orphanBefore: str[]
     if v3CompilerReadChengOrphanSnapshot(rootDir,
                                          "orphan_guard_before",
                                          "artifacts/v3_gate/orphan_guard_before.log",
@@ -5148,7 +5316,7 @@ fn v3CompilerVerifyOrphanGuard(rootDir: str): int32 =
         return 1
     if v3CompilerBuildBackendDriver(rootDir) != 0:
         return 1
-    var orphanAfter: str[] = []
+    var orphanAfter: str[]
     if v3CompilerReadChengOrphanSnapshot(rootDir,
                                          "orphan_guard_after",
                                          "artifacts/v3_gate/orphan_guard_after.log",
@@ -5194,8 +5362,8 @@ fn main(argc: int32, argv: str*): int32 =
     if cmd == "host-bridge-audit":
         return v3CompilerHostBridgeAudit(rootDir)
     if cmd == "mobile-shell":
-        var outputText: str = ""
-        var errorText: str = ""
+        var outputText: str
+        var errorText: str
         let mobileCode: int32 = mshell.v3MobileShellRun(rootDir, args, outputText, errorText)
         let outputTrimmed = strutil.Strip(outputText)
         if len(outputTrimmed) > 0:

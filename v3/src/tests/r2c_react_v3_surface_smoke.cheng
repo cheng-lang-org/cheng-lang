@@ -1,14 +1,24 @@
 import std/os
 import cheng/v3/tooling/host_ops as hostops
 import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/r2c_react_v3_surface_main as r2csurface
 
 fn main(): int32 =
     let root = os.GetCurrentDir()
     let outDir = v3path.V3PathAbsolute(root, "artifacts/v3_r2c_surface_smoke")
     assert(v3path.V3MkdirP(root, outDir), "v3 r2c surface smoke: mkdir")
     let driver = v3path.V3PathAbsolute(root, "artifacts/v3_backend_driver/cheng")
+    let stage3 = v3path.V3PathAbsolute(root, "artifacts/v3_bootstrap/cheng.stage3")
+    let bundleScript = v3path.V3PathAbsolute(root, "v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-bundle.mjs")
+    let runScript = v3path.V3PathAbsolute(root, "v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-run.mjs")
     assert(v3path.V3FileExistsNonEmpty(root, driver), "v3 r2c surface smoke: backend_driver exists")
+    assert(v3path.V3FileExistsNonEmpty(root, stage3), "v3 r2c surface smoke: stage3 exists")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleScript), "v3 r2c surface smoke: bundle script exists")
+    assert(v3path.V3FileExistsNonEmpty(root, runScript), "v3 r2c surface smoke: run script exists")
     let readyEnv = ["CHENG_V3_BACKEND_DRIVER_READY=1"]
+    var nativeEnv: str[]
+    add(nativeEnv, "R2C_REACT_V3_TOOLING_BIN=" + stage3)
+    add(nativeEnv, "CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1")
     let repoEnv = os.GetEnv("R2C_REACT_V3_REPO")
     var repo = "/Users/lbcheng/UniMaker/React.js"
     if len(repoEnv) > 0:
@@ -37,75 +47,181 @@ fn main(): int32 =
            "v3 r2c surface smoke: codegen surface ok")
     let codegenReportPath = os.JoinPath(codegenOutDir, "codegen_surface_report_v1.json")
     let codegenSummaryPath = os.JoinPath(codegenOutDir, "codegen_surface.summary.env")
+    let codegenManifestPath = os.JoinPath(codegenOutDir, "cheng_codegen_v1.json")
+    let codegenRouteCatalogPath = os.JoinPath(codegenOutDir, "cheng_codegen_route_catalog_v1.json")
+    let codegenTsxAstPath = os.JoinPath(codegenOutDir, "tsx_ast_v1.json")
     assert(v3path.V3FileExistsNonEmpty(root, codegenReportPath),
            "v3 r2c surface smoke: codegen report")
     assert(v3path.V3FileExistsNonEmpty(root, codegenSummaryPath),
            "v3 r2c surface smoke: codegen summary")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenManifestPath),
+           "v3 r2c surface smoke: codegen manifest")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenRouteCatalogPath),
+           "v3 r2c surface smoke: codegen route catalog")
+    assert(v3path.V3FileExistsNonEmpty(root, codegenTsxAstPath),
+           "v3 r2c surface smoke: codegen tsx ast")
 
     let bundleOutDir = v3path.V3PathJoin(outDir, "native_gui_bundle_home_default")
     let bundleLog = v3path.V3PathJoin(outDir, "r2c_native_gui_bundle.log")
     if v3path.V3PathFileExists(bundleLog):
         os.RemoveFile(bundleLog)
-    let bundleRun = hostops.v3RunFileLogged(root,
-                                            "r2c_native_gui_bundle_smoke",
-                                            driver,
-                                            ["r2c-react-v3-native-gui-bundle-smoke",
-                                             "--repo", repo,
-                                             "--route-state", "home_default",
-                                             "--out-dir", bundleOutDir],
-                                            readyEnv,
-                                            root,
-                                            0,
-                                            bundleLog)
+    assert(v3path.V3MkdirP(root, bundleOutDir), "v3 r2c surface smoke: bundle mkdir")
+    let staticSummaryPath = os.JoinPath(bundleOutDir, "static_surface.summary.env")
+    let bundleHostContractPath = os.JoinPath(bundleOutDir, "unimaker_host_v1.json")
+    let bundleAssetManifestPath = os.JoinPath(bundleOutDir, "asset_manifest_v1.json")
+    let bundleTailwindManifestPath = os.JoinPath(bundleOutDir, "tailwind_style_manifest_v1.json")
+    var staticAssetRoots: str[]
+    var staticSurface: r2csurface.R2cStaticSurfaceRunResult
+    assert(r2csurface.r2cRunStaticSurface(repo, bundleOutDir, codegenTsxAstPath, staticSummaryPath, staticAssetRoots, staticSurface),
+           "v3 r2c surface smoke: static surface rc")
+    assert(v3path.V3FileExistsNonEmpty(root, staticSummaryPath),
+           "v3 r2c surface smoke: static surface summary")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleHostContractPath),
+           "v3 r2c surface smoke: bundle host contract")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleAssetManifestPath),
+           "v3 r2c surface smoke: bundle asset manifest")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleTailwindManifestPath),
+           "v3 r2c surface smoke: bundle tailwind manifest")
+    let bundleRun = hostops.v3RunProgramLogged(root,
+                                               "r2c_native_gui_bundle_smoke",
+                                               "node",
+                                               [bundleScript,
+                                                "--repo", repo,
+                                                "--route-state", "home_default",
+                                                "--out-dir", bundleOutDir,
+                                                "--codegen-manifest", codegenManifestPath,
+                                                "--host-contract", bundleHostContractPath,
+                                                "--asset-manifest", bundleAssetManifestPath,
+                                                "--tailwind-manifest", bundleTailwindManifestPath,
+                                                "--route-catalog", codegenRouteCatalogPath,
+                                                "--tsx-ast", codegenTsxAstPath,
+                                                "--summary-out", os.JoinPath(bundleOutDir, "native_gui_bundle.summary.env")],
+                                               nativeEnv,
+                                               root,
+                                               0,
+                                               bundleLog)
     let bundleOutputRaw = bundleRun.output
     let bundleOutput = bundleOutputRaw
     assert(hostops.v3LoggedRunOk(bundleRun), "v3 r2c surface smoke: native gui bundle rc")
     assert(v3path.V3PathFileExists(bundleLog), "v3 r2c surface smoke: native gui bundle log")
-    assert(v3path.V3TextContains(bundleOutput, "r2c-react-v3 native gui bundle smoke: ok"),
-           "v3 r2c surface smoke: native gui bundle ok")
     let bundleReportPath = os.JoinPath(bundleOutDir, "native_gui_bundle_report_v1.json")
     let bundleSummaryPath = os.JoinPath(bundleOutDir, "native_gui_bundle.summary.env")
     let bundleJsonPath = os.JoinPath(bundleOutDir, "native_gui_bundle_v1.json")
+    let bundleSessionPath = os.JoinPath(bundleOutDir, "native_gui_session_v1.json")
     assert(v3path.V3FileExistsNonEmpty(root, bundleReportPath),
            "v3 r2c surface smoke: native gui report")
     assert(v3path.V3FileExistsNonEmpty(root, bundleSummaryPath),
            "v3 r2c surface smoke: native gui summary")
     assert(v3path.V3FileExistsNonEmpty(root, bundleJsonPath),
            "v3 r2c surface smoke: native gui bundle json")
+    assert(v3path.V3FileExistsNonEmpty(root, bundleSessionPath),
+           "v3 r2c surface smoke: native gui session json")
+    assert(v3path.V3TextContains(bundleOutput, "\"ok\": true"),
+           "v3 r2c surface smoke: native gui bundle ok")
+    let bundleSummaryText = v3path.V3ReadTextFile("", bundleSummaryPath)
+    assert(v3path.V3TextContains(bundleSummaryText, "native_gui_runtime_bundle_ready=true"),
+           "v3 r2c surface smoke: bundle runtime bundle ready")
+    assert(v3path.V3TextContains(bundleSummaryText, "native_gui_runtime_contract_ready=true"),
+           "v3 r2c surface smoke: bundle runtime contract ready")
 
-    let freshLog = v3path.V3PathJoin(outDir, "r2c_fresh_clean_gate.log")
-    if v3path.V3PathFileExists(freshLog):
-        os.RemoveFile(freshLog)
-    let freshRun = hostops.v3RunFileLogged(root,
-                                           "r2c_fresh_clean_gate",
-                                           driver,
-                                           ["r2c-react-v3-fresh-clean-gate",
-                                            "--repo", repo],
-                                           readyEnv,
-                                           root,
-                                           0,
-                                           freshLog)
-    let freshOutputRaw = freshRun.output
-    let freshOutput = freshOutputRaw
-    assert(hostops.v3LoggedRunOk(freshRun), "v3 r2c surface smoke: fresh clean gate rc")
-    assert(v3path.V3PathFileExists(freshLog), "v3 r2c surface smoke: fresh clean gate log")
-    assert(v3path.V3TextContains(freshOutput, "r2c-react-v3 fresh clean gate: ok"),
-           "v3 r2c surface smoke: fresh clean gate ok")
-    let freshStatusPath = "/tmp/r2c-status-fresh-clean-gate.json"
-    let freshHomeReportPath = "/tmp/r2c-native-gui-fresh-clean-gate-home_default/" +
-        "native_gui_bundle_report_v1.json"
-    let freshContentReportPath = "/tmp/r2c-native-gui-fresh-clean-gate-content_detail/" +
-        "native_gui_bundle_report_v1.json"
-    let freshPublishReportPath = "/tmp/r2c-native-gui-fresh-clean-gate-publish_selector/" +
-        "native_gui_bundle_report_v1.json"
-    assert(v3path.V3FileExistsNonEmpty(root, freshStatusPath),
-           "v3 r2c surface smoke: fresh clean status")
-    assert(v3path.V3FileExistsNonEmpty(root, freshHomeReportPath),
-           "v3 r2c surface smoke: fresh clean home report")
-    assert(v3path.V3FileExistsNonEmpty(root, freshContentReportPath),
-           "v3 r2c surface smoke: fresh clean content report")
-    assert(v3path.V3FileExistsNonEmpty(root, freshPublishReportPath),
-           "v3 r2c surface smoke: fresh clean publish report")
+    let runOutDir = v3path.V3PathJoin(outDir, "native_gui_run_home_default")
+    let runLog = v3path.V3PathJoin(outDir, "r2c_native_gui_run.log")
+    if v3path.V3PathFileExists(runLog):
+        os.RemoveFile(runLog)
+    let runReportPath = os.JoinPath(runOutDir, "native_gui_run_report_v1.json")
+    let runSummaryPath = os.JoinPath(runOutDir, "native_gui_run.summary.env")
+    let runScreenshotPath = os.JoinPath(runOutDir, "native_gui_session.png")
+    assert(v3path.V3MkdirP(root, runOutDir), "v3 r2c surface smoke: run mkdir")
+    let runRun = hostops.v3RunProgramLogged(root,
+                                            "r2c_native_gui_run_smoke",
+                                            "node",
+                                            [runScript,
+                                             "--repo", repo,
+                                             "--out-dir", runOutDir,
+                                             "--bundle-path", bundleJsonPath,
+                                             "--session-path", bundleSessionPath,
+                                             "--route-state", "home_default",
+                                             "--auto-close-ms", "600",
+                                             "--summary-out", runSummaryPath],
+                                            [],
+                                            root,
+                                            0,
+                                            runLog)
+    let runOutputRaw = runRun.output
+    let runOutput = runOutputRaw
+    assert(hostops.v3LoggedRunOk(runRun), "v3 r2c surface smoke: native gui run rc")
+    assert(v3path.V3PathFileExists(runLog), "v3 r2c surface smoke: native gui run log")
+    assert(v3path.V3FileExistsNonEmpty(root, runReportPath),
+           "v3 r2c surface smoke: native gui run report")
+    assert(v3path.V3FileExistsNonEmpty(root, runSummaryPath),
+           "v3 r2c surface smoke: native gui run summary")
+    assert(v3path.V3FileExistsNonEmpty(root, runScreenshotPath),
+           "v3 r2c surface smoke: native gui run screenshot")
+    assert(v3path.V3TextContains(runOutput, "\"ok\": true"),
+           "v3 r2c surface smoke: native gui run output path")
+    let runSummaryText = v3path.V3ReadTextFile("", runSummaryPath)
+    assert(v3path.V3TextContains(runSummaryText, "native_gui_runtime_bundle_ready=true"),
+           "v3 r2c surface smoke: runtime bundle ready")
+    assert(v3path.V3TextContains(runSummaryText, "native_gui_runtime_contract_ready=true"),
+           "v3 r2c surface smoke: runtime contract ready")
+    assert(v3path.V3TextContains(runSummaryText, "native_gui_runtime_bundle_route_state=home_default"),
+           "v3 r2c surface smoke: runtime bundle route state")
+    assert(v3path.V3TextContains(runSummaryText, "native_gui_runtime_contract_layout_item_count="),
+           "v3 r2c surface smoke: runtime contract layout count")
+    assert(v3path.V3TextContains(runSummaryText, "native_gui_runtime_bundle_render_command_count="),
+           "v3 r2c surface smoke: runtime bundle render count")
+
+    let contentBundleOutDir = v3path.V3PathJoin(outDir, "native_gui_bundle_content_detail")
+    let contentBundleLog = v3path.V3PathJoin(outDir, "r2c_native_gui_bundle_content_detail.log")
+    if v3path.V3PathFileExists(contentBundleLog):
+        os.RemoveFile(contentBundleLog)
+    assert(v3path.V3MkdirP(root, contentBundleOutDir), "v3 r2c surface smoke: content bundle mkdir")
+    let contentStaticSummaryPath = os.JoinPath(contentBundleOutDir, "static_surface.summary.env")
+    let contentHostContractPath = os.JoinPath(contentBundleOutDir, "unimaker_host_v1.json")
+    let contentAssetManifestPath = os.JoinPath(contentBundleOutDir, "asset_manifest_v1.json")
+    let contentTailwindManifestPath = os.JoinPath(contentBundleOutDir, "tailwind_style_manifest_v1.json")
+    var contentAssetRoots: str[]
+    var contentStaticSurface: r2csurface.R2cStaticSurfaceRunResult
+    assert(r2csurface.r2cRunStaticSurface(repo, contentBundleOutDir, codegenTsxAstPath, contentStaticSummaryPath, contentAssetRoots, contentStaticSurface),
+           "v3 r2c surface smoke: content static surface rc")
+    assert(v3path.V3FileExistsNonEmpty(root, contentHostContractPath),
+           "v3 r2c surface smoke: content host contract")
+    assert(v3path.V3FileExistsNonEmpty(root, contentAssetManifestPath),
+           "v3 r2c surface smoke: content asset manifest")
+    assert(v3path.V3FileExistsNonEmpty(root, contentTailwindManifestPath),
+           "v3 r2c surface smoke: content tailwind manifest")
+    let contentBundleSummaryPath = os.JoinPath(contentBundleOutDir, "native_gui_bundle.summary.env")
+    let contentBundleRun = hostops.v3RunProgramLogged(root,
+                                                      "r2c_native_gui_bundle_content_detail",
+                                                      "node",
+                                                      [bundleScript,
+                                                       "--repo", repo,
+                                                       "--route-state", "content_detail",
+                                                       "--out-dir", contentBundleOutDir,
+                                                       "--codegen-manifest", codegenManifestPath,
+                                                       "--host-contract", contentHostContractPath,
+                                                       "--asset-manifest", contentAssetManifestPath,
+                                                       "--tailwind-manifest", contentTailwindManifestPath,
+                                                       "--route-catalog", codegenRouteCatalogPath,
+                                                       "--tsx-ast", codegenTsxAstPath,
+                                                       "--summary-out", contentBundleSummaryPath],
+                                                      nativeEnv,
+                                                      root,
+                                                      0,
+                                                      contentBundleLog)
+    assert(hostops.v3LoggedRunOk(contentBundleRun), "v3 r2c surface smoke: content bundle rc")
+    assert(v3path.V3PathFileExists(contentBundleLog), "v3 r2c surface smoke: content bundle log")
+    assert(v3path.V3FileExistsNonEmpty(root, os.JoinPath(contentBundleOutDir, "native_gui_bundle_report_v1.json")),
+           "v3 r2c surface smoke: content bundle report")
+    assert(v3path.V3FileExistsNonEmpty(root, contentBundleSummaryPath),
+           "v3 r2c surface smoke: content bundle summary")
+    assert(v3path.V3FileExistsNonEmpty(root, os.JoinPath(contentBundleOutDir, "native_gui_bundle_v1.json")),
+           "v3 r2c surface smoke: content bundle json")
+    let contentBundleSummaryText = v3path.V3ReadTextFile("", contentBundleSummaryPath)
+    assert(v3path.V3TextContains(contentBundleSummaryText, "native_gui_route_state=content_detail"),
+           "v3 r2c surface smoke: content route state")
+    assert(v3path.V3TextContains(contentBundleSummaryText, "native_gui_runtime_bundle_ready=true"),
+           "v3 r2c surface smoke: content runtime bundle ready")
 
     echo("v3 r2c_react_v3_surface_smoke ok")
     return 0

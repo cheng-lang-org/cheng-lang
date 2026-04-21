@@ -1,13 +1,14 @@
-import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
-import cheng/v3/backend/system_link_plan as slplan
-import cheng/v3/backend/primary_object_plan as pobj
+import cheng/v3/tooling/compiler_runtime as crun
 import cheng/v3/backend/object_plan as objplan
-import cheng/v3/backend/native_link_plan as nplan
-import cheng/v3/backend/system_link_exec as sexec
+import cheng/v3/backend/target_matrix as tmat
+import cheng/v3/runtime/core_runtime_v3 as corun
+import cheng/v3/runtime/compiler_runtime_v3 as comprun
+import cheng/v3/runtime/debug_runtime_v3 as debrun
+import cheng/v3/runtime/program_support_v3 as prun
 
 fn containsText(items: str[], value: str): bool =
-    var i: int32 = 0
+    var i: int32
     while i < items.len:
         if items[i] == value:
             return true
@@ -18,13 +19,10 @@ fn main(): int32 =
     let workspaceRoot = "/tmp/cheng-lang"
     let outputPath = workspaceRoot + "/artifacts/v3_program_selfhost/program_selfhost_smoke"
     let primaryObjectPath = outputPath + ".primary.o"
-    let providerModules = [
-        "runtime/compiler_runtime_v3",
-        "runtime/core_runtime_v3",
-        "runtime/debug_runtime_v3",
-        "runtime/program_support_v3",
-        "runtime/program_support_host_v3"
-    ]
+    var providerModules: str[]
+    crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackProgram, providerModules)
+    var toolingProviderModules: str[]
+    crun.v3RuntimeProviderModulesForTrack(crun.v3CompilerTrackTooling, toolingProviderModules)
     let providerObjectPaths = [
         outputPath + ".provider.runtime_compiler_runtime_v3.o",
         outputPath + ".provider.runtime_core_runtime_v3.o",
@@ -62,59 +60,46 @@ fn main(): int32 =
     objectPlan.entrySymbol = "main"
     objectPlan.missingReasons = []
     objectPlan.pipelineStage = "lowering_plan_to_object_plan"
-    var nativePlan: nplan.V3NativeLinkPlanStub
-    nativePlan.targetTriple = "arm64-apple-darwin"
-    nativePlan.emitKind = creq.v3EmitExe
-    nativePlan.outputPath = outputPath
-    nativePlan.linkerProgram = "cc"
-    nativePlan.linkerFlavor = "ld64"
-    nativePlan.outputKind = nplan.v3NativeOutputExecutable
-    nativePlan.entrySymbol = "main"
-    nativePlan.primaryObjectPath = objectPlan.primaryObjectPath
-    nativePlan.linkInputPaths = objectPlan.linkInputPaths
-    nativePlan.missingReasons = []
-    nativePlan.pipelineStage = "object_plan_to_native_link_plan"
     assert(objectPlan.primaryObjectPath == primaryObjectPath,
            "v3 object plan: primary object path")
     assert(objectPlan.providerObjectPaths.len == 5, "v3 object plan: provider count")
     assert(objectPlan.providerSourcePaths.len == 5, "v3 object plan: provider sources")
-    assert(nativePlan.linkInputPaths.len == 6, "v3 native link plan: link input count")
-    assert(nativePlan.linkerProgram == "cc", "v3 native link plan: linker program")
-    assert(nativePlan.linkerFlavor == "ld64", "v3 native link plan: linker flavor")
-    assert(nativePlan.outputKind == nplan.v3NativeOutputExecutable, "v3 native link plan: output kind")
-    assert(nativePlan.primaryObjectPath == primaryObjectPath,
+    assert(objectPlan.linkInputPaths.len == 6, "v3 native link plan: link input count")
+    assert(tmat.v3TargetLinkerProgram("arm64-apple-darwin") == "cc",
+           "v3 native link plan: linker program")
+    assert(tmat.v3TargetLinkerFlavor("arm64-apple-darwin") == "ld64",
+           "v3 native link plan: linker flavor")
+    assert(tmat.v3TargetLinkerProgram("aarch64-unknown-linux-gnu") == "internal_elf_linker",
+           "v3 native link plan: aarch64 nolibc linker program")
+    assert(tmat.v3TargetLinkerFlavor("riscv64-unknown-linux-gnu") == "elf_riscv64_builtin",
+           "v3 native link plan: riscv64 linker flavor")
+    assert(tmat.v3TargetLinkerProgram("aarch64-pc-windows-msvc") == "builtin_coff_linker",
+           "v3 native link plan: windows linker program")
+    assert(objectPlan.primaryObjectPath == primaryObjectPath,
            "v3 native link plan: primary object path")
     let realWorkspaceRoot = v3path.V3PathCurrentDir()
-    let realPackageRoot = v3path.V3PathJoin(realWorkspaceRoot, "v3")
-    var ordinaryLinkPlan: slplan.V3SystemLinkPlanStub
-    var toolingLinkPlan: slplan.V3SystemLinkPlanStub
-    var err = ""
-    let ordinaryReq = creq.v3CompilerRequestNew(
-        realPackageRoot,
-        v3path.V3PathJoin(realPackageRoot, "src/tests/program_selfhost_smoke.cheng"),
-        v3path.V3PathJoin(realWorkspaceRoot, "artifacts/v3_program_selfhost/program_selfhost_smoke"),
-        "arm64-apple-darwin",
-        creq.v3EmitExe,
-        ""
-    )
-    let toolingReq = creq.v3CompilerRequestNew(
-        realPackageRoot,
-        v3path.V3PathJoin(realPackageRoot, "src/tooling/compiler_main.cheng"),
-        v3path.V3PathJoin(realWorkspaceRoot, "artifacts/v3_backend_driver/cheng"),
-        "arm64-apple-darwin",
-        creq.v3EmitExe,
-        ""
-    )
-    assert(slplan.v3BuildSystemLinkPlanStub(realWorkspaceRoot, ordinaryReq, ordinaryLinkPlan, err),
-           "v3 object plan: ordinary link plan")
-    assert(slplan.v3BuildSystemLinkPlanStub(realWorkspaceRoot, toolingReq, toolingLinkPlan, err),
-           "v3 object plan: tooling link plan")
-    let ordinaryProvidersRes = sexec.v3ProviderSourcesForPlan(realWorkspaceRoot, ordinaryLinkPlan)
-    let toolingProvidersRes = sexec.v3ProviderSourcesForPlan(realWorkspaceRoot, toolingLinkPlan)
-    assert(IsOk(ordinaryProvidersRes), "v3 object plan: ordinary providers")
-    assert(IsOk(toolingProvidersRes), "v3 object plan: tooling providers")
-    let ordinaryProviders = Value(ordinaryProvidersRes)
-    let toolingProviders = Value(toolingProvidersRes)
+    let ordinaryProviders = [
+        comprun.v3CompilerRuntimeProviderSourcePath(realWorkspaceRoot, comprun.v3CompilerRuntimeTrackProgram),
+        corun.v3CoreRuntimeProviderSourcePath(realWorkspaceRoot, "arm64-apple-darwin"),
+        debrun.v3DebugRuntimeProviderSourcePath(realWorkspaceRoot),
+        prun.v3ProgramSupportProviderSourcePath(realWorkspaceRoot),
+        prun.v3ProgramSupportHostProviderSourcePath(realWorkspaceRoot)
+    ]
+    let toolingProviders = [
+        comprun.v3CompilerRuntimeProviderSourcePath(realWorkspaceRoot, comprun.v3CompilerRuntimeTrackTooling),
+        corun.v3CoreRuntimeProviderSourcePath(realWorkspaceRoot, "arm64-apple-darwin"),
+        debrun.v3DebugRuntimeProviderSourcePath(realWorkspaceRoot),
+        prun.v3ProgramSupportProviderSourcePath(realWorkspaceRoot),
+        prun.v3ProgramSupportHostProviderSourcePath(realWorkspaceRoot)
+    ]
+    assert(providerModules.len == 5, "v3 object plan: provider module count")
+    assert(toolingProviderModules.len == 5, "v3 object plan: tooling provider module count")
+    assert(providerModules[0] == "runtime/compiler_runtime_v3", "v3 object plan: ordinary compiler runtime module")
+    assert(toolingProviderModules[0] == "runtime/compiler_runtime_v3", "v3 object plan: tooling compiler runtime module")
+    assert(crun.v3CompilerProgramArgvRuntimeTarget() == "runtime/compiler.program_argv_entry",
+           "v3 object plan: ordinary argv target")
+    assert(crun.v3CompilerToolingArgvRuntimeTarget() == "runtime/compiler.tooling_argv_entry",
+           "v3 object plan: tooling argv target")
     assert(containsText(ordinaryProviders,
                         v3path.V3PathJoin(realWorkspaceRoot,
                                           "v3/src/runtime/compiler_runtime_program_entry_provider_v3.cheng")),
@@ -147,25 +132,29 @@ fn main(): int32 =
     assert(containsText(toolingProviders,
                         v3path.V3PathJoin(realWorkspaceRoot, "v3/src/runtime/core_runtime_provider_darwin_v3.cheng")),
            "v3 object plan: tooling core provider")
-    assert(slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("aarch64-unknown-linux-gnu"),
+    assert(tmat.v3TargetRequiresNativeProviderModules("arm64-apple-darwin"),
+           "v3 target matrix: darwin native providers")
+    assert(!tmat.v3TargetRequiresNativeProviderModules("wasm32-unknown-unknown"),
+           "v3 target matrix: wasm no native providers")
+    assert(tmat.v3TargetUsesLinuxNolibcRuntime("aarch64-unknown-linux-gnu"),
            "v3 target matrix: linux aarch64 nolibc")
-    assert(!slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime("riscv64-unknown-linux-gnu"),
+    assert(!tmat.v3TargetUsesLinuxNolibcRuntime("riscv64-unknown-linux-gnu"),
            "v3 target matrix: riscv64 not nolibc")
-    assert(slplan.v3SystemLinkPlanTargetIsElfObject("riscv64-unknown-linux-gnu"),
+    assert(tmat.v3TargetIsElfObject("riscv64-unknown-linux-gnu"),
            "v3 target matrix: riscv64 elf")
-    assert(slplan.v3SystemLinkPlanTargetIsElfObject("x86_64-unknown-linux-gnu"),
+    assert(tmat.v3TargetIsElfObject("x86_64-unknown-linux-gnu"),
            "v3 target matrix: linux x86_64 elf")
-    assert(slplan.v3SystemLinkPlanTargetIsCoffObject("aarch64-pc-windows-msvc"),
+    assert(tmat.v3TargetIsCoffObject("aarch64-pc-windows-msvc"),
            "v3 target matrix: windows aarch64 coff")
-    assert(slplan.v3SystemLinkPlanTargetIsCoffObject("x86_64-pc-windows-msvc"),
+    assert(tmat.v3TargetIsCoffObject("x86_64-pc-windows-msvc"),
            "v3 target matrix: windows x86_64 coff")
-    assert(pobj.v3PrimaryObjectFormat("aarch64-unknown-linux-gnu") == "elf",
+    assert(tmat.v3TargetPrimaryObjectFormat("aarch64-unknown-linux-gnu") == "elf",
            "v3 primary object format: linux aarch64")
-    assert(pobj.v3PrimaryObjectFormat("riscv64-unknown-linux-gnu") == "elf",
+    assert(tmat.v3TargetPrimaryObjectFormat("riscv64-unknown-linux-gnu") == "elf",
            "v3 primary object format: linux riscv64")
-    assert(pobj.v3PrimaryObjectFormat("aarch64-pc-windows-msvc") == "coff",
+    assert(tmat.v3TargetPrimaryObjectFormat("aarch64-pc-windows-msvc") == "coff",
            "v3 primary object format: windows aarch64")
-    assert(pobj.v3PrimaryObjectFormat("x86_64-pc-windows-msvc") == "coff",
+    assert(tmat.v3TargetPrimaryObjectFormat("x86_64-pc-windows-msvc") == "coff",
            "v3 primary object format: windows x86_64")
     echo("v3 object_native_link_plan_smoke ok")
     return 0

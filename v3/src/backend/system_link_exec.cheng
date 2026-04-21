@@ -1,21 +1,25 @@
 import std/result
 import std/strings
 import std/os
-import std/monotimes
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
 import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
+import cheng/v3/lang/browser_abi_rule as barule
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/backend/lowering_plan as lower
 import cheng/v3/backend/primary_object_plan as pobj
 import cheng/v3/backend/object_plan as objplan
 import cheng/v3/backend/native_link_plan as nplan
+import cheng/v3/backend/target_matrix as tmat
 import cheng/v3/runtime/core_runtime_v3 as corun
 import cheng/v3/runtime/compiler_runtime_v3 as comprun
 import cheng/v3/runtime/debug_runtime_v3 as debrun
 import cheng/v3/runtime/program_support_v3 as prun
+
+@importc("cheng_monotime_ns")
+fn v3SystemLinkExecMonoTimeNsBridge(): int64
 
 type
     V3SystemLinkExecPhaseProfile =
@@ -55,7 +59,7 @@ type
         nativeLinkPlan: nplan.V3NativeLinkPlanStub
 
 fn v3SystemLinkExecNowNs(): int64 =
-    return monotimes.MonoTimeNs(monotimes.GetMonoTime())
+    return v3SystemLinkExecMonoTimeNsBridge()
 
 fn v3SystemLinkExecPhaseMsText(ns: int64): str =
     if ns <= 0:
@@ -77,9 +81,6 @@ fn v3SystemLinkExecBrowserBridgeObjectBasePath(outputPath: str): str =
         return ""
     return outputPath + ".browser_bridge.generated.o"
 
-fn v3SystemLinkExecBrowserBridgePlans(plan: V3SystemLinkExecPlan): ccsg.V3BrowserAbiBridgePlan[] =
-    return ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
-
 fn v3SystemLinkExecBrowserBridgeObjectPathForLinkPlan(linkPlan: slplan.V3SystemLinkPlanStub): str =
     let explicitPath = slplan.v3SystemLinkPlanBrowserBridgeObjectPath(linkPlan)
     if len(explicitPath) > 0:
@@ -90,30 +91,30 @@ fn v3SystemLinkExecBrowserBridgeObjectPathForLinkPlan(linkPlan: slplan.V3SystemL
     return v3SystemLinkExecBrowserBridgeObjectBasePath(linkPlan.outputPath)
 
 fn v3SystemLinkExecBrowserBridgeArtifactPath(plan: V3SystemLinkExecPlan): str =
-    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    let plans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
     if plans.len <= 0:
         return ""
     return v3SystemLinkExecBrowserBridgeArtifactBasePath(plan.systemLinkPlan.outputPath)
 
 fn v3SystemLinkExecBrowserBridgeArtifactText(plan: V3SystemLinkExecPlan): str =
-    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
-    return ccsg.v3BrowserAbiBridgePlanManifestText(plans)
+    let plans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
+    return barule.v3BrowserAbiBridgePlanManifestText(plans)
 
 fn v3SystemLinkExecBrowserBridgeSourcePath(plan: V3SystemLinkExecPlan): str =
-    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    let plans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
     if plans.len <= 0:
         return ""
     return v3SystemLinkExecBrowserBridgeSourceBasePath(plan.systemLinkPlan.outputPath)
 
 fn v3SystemLinkExecBrowserBridgeObjectPath(plan: V3SystemLinkExecPlan): str =
-    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
+    let plans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
     if plans.len <= 0:
         return ""
     return v3SystemLinkExecBrowserBridgeObjectBasePath(plan.systemLinkPlan.outputPath)
 
 fn v3SystemLinkExecBrowserBridgeSourceText(plan: V3SystemLinkExecPlan): str =
-    let plans = v3SystemLinkExecBrowserBridgePlans(plan)
-    return ccsg.v3BrowserAbiBridgeSourceText(plans)
+    let plans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
+    return barule.v3BrowserAbiBridgeSourceText(plans)
 
 fn v3SystemLinkExecWriteBrowserBridgeArtifact(rootDir: str,
                                               plan: V3SystemLinkExecPlan): bool =
@@ -174,26 +175,6 @@ fn v3ProviderSourcesForPlan(rootDir: str, linkPlan: slplan.V3SystemLinkPlanStub)
         else:
             return Err[str[]]("v3 provider source: unsupported module " + modulePath)
     return Ok[str[]](out)
-
-fn v3SystemLinkExecLinkerFlavor(targetTriple: str): str =
-    if targetTriple == "arm64-apple-darwin":
-        return "ld64"
-    if slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple):
-        return "elf_aarch64_nolibc_internal"
-    if slplan.v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple):
-        return "elf_riscv64_builtin"
-    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
-        return "coff_pe_builtin"
-    return "system_linker"
-
-fn v3SystemLinkExecLinkerProgram(targetTriple: str): str =
-    if slplan.v3SystemLinkPlanTargetUsesLinuxNolibcRuntime(targetTriple):
-        return "internal_elf_linker"
-    if slplan.v3SystemLinkPlanTargetIsLinuxRiscv64(targetTriple):
-        return "builtin_elf_linker_riscv64"
-    if slplan.v3SystemLinkPlanTargetIsWindows(targetTriple):
-        return "builtin_coff_linker"
-    return "cc"
 
 fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
                                                 req: creq.V3CompilerRequest,
@@ -381,8 +362,8 @@ fn v3BuildSystemLinkExecPlanWithWorldAndChannel(rootDir: str,
         add(nativeMissing, "native_link_output_missing")
     if linkPlan.emitKind == creq.v3EmitExe && len(linkPlan.entrySymbol) <= 0:
         add(nativeMissing, "native_link_entry_symbol_missing")
-    let linkerFlavor = v3SystemLinkExecLinkerFlavor(linkPlan.targetTriple)
-    let linkerProgram = v3SystemLinkExecLinkerProgram(linkPlan.targetTriple)
+    let linkerFlavor = tmat.v3TargetLinkerFlavor(linkPlan.targetTriple)
+    let linkerProgram = tmat.v3TargetLinkerProgram(linkPlan.targetTriple)
     var outputKind = nplan.v3NativeOutputArtifact
     if linkPlan.emitKind == creq.v3EmitExe:
         outputKind = nplan.v3NativeOutputExecutable
@@ -488,14 +469,14 @@ fn v3SystemLinkExecPlanReady(plan: V3SystemLinkExecPlan): bool =
            plan.nativeLinkPlan.missingReasons.len <= 0
 
 fn v3SystemLinkExecBrowserBridgeReport(plan: V3SystemLinkExecPlan): str =
-    let bridgePlans = v3SystemLinkExecBrowserBridgePlans(plan)
+    let bridgePlans = ccsg.v3CompilerBrowserAbiBridgePlansForLinkPlan(plan.systemLinkPlan)
     let bridgeArtifactPath = v3SystemLinkExecBrowserBridgeArtifactPath(plan)
     let bridgeSourcePath = v3SystemLinkExecBrowserBridgeSourcePath(plan)
     let bridgeObjectPath = v3SystemLinkExecBrowserBridgeObjectPath(plan)
     var bridgeArtifactPathText = "-"
     var bridgeSourcePathText = "-"
     var bridgeObjectPathText = "-"
-    var bridgeObjectCount: int32 = 0
+    var bridgeObjectCount: int32
     if len(bridgeArtifactPath) > 0:
         bridgeArtifactPathText = bridgeArtifactPath
     if len(bridgeSourcePath) > 0:
@@ -508,20 +489,20 @@ fn v3SystemLinkExecBrowserBridgeReport(plan: V3SystemLinkExecPlan): str =
         lines = lines + "browser_bridge_plan["
         lines = lines + intToStr(i)
         lines = lines + "]="
-        lines = lines + ccsg.v3BrowserAbiBridgePlanEmitLine(bridgePlans[i])
+        lines = lines + bridgePlans[i].emitLine
         lines = lines + "\n"
     var out = ""
     out = out + "browser_bridge_artifact_path=" + bridgeArtifactPathText + "\n"
-    out = out + "browser_bridge_artifact_format=" + ccsg.v3BrowserAbiBridgePlanManifestFormat() + "\n"
+    out = out + "browser_bridge_artifact_format=" + barule.v3BrowserAbiBridgePlanManifestFormat() + "\n"
     out = out + "browser_bridge_artifact_count=" + intToStr(bridgePlans.len) + "\n"
-    out = out + "browser_bridge_artifact_unique_key_count=" + intToStr(ccsg.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
+    out = out + "browser_bridge_artifact_unique_key_count=" + intToStr(barule.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
     out = out + "browser_bridge_source_path=" + bridgeSourcePathText + "\n"
-    out = out + "browser_bridge_source_format=" + ccsg.v3BrowserAbiBridgeSourceFormat() + "\n"
+    out = out + "browser_bridge_source_format=" + barule.v3BrowserAbiBridgeSourceFormat() + "\n"
     out = out + "browser_bridge_source_count=" + intToStr(bridgePlans.len) + "\n"
     out = out + "browser_bridge_object_path=" + bridgeObjectPathText + "\n"
     out = out + "browser_bridge_object_count=" + intToStr(bridgeObjectCount) + "\n"
     out = out + "browser_bridge_plan_count=" + intToStr(bridgePlans.len) + "\n"
-    out = out + "browser_bridge_plan_unique_key_count=" + intToStr(ccsg.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
+    out = out + "browser_bridge_plan_unique_key_count=" + intToStr(barule.v3BrowserAbiBridgePlanUniqueKeyCount(bridgePlans)) + "\n"
     out = out + lines
     return out
 
