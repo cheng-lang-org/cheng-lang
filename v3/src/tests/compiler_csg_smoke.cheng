@@ -3,6 +3,7 @@ import std/result
 import cheng/v3/std/bytes_layout as layout
 import cheng/v3/tooling/compiler_request as creq
 import cheng/v3/tooling/path as v3path
+import cheng/v3/tooling/compiler_world as cworld
 import cheng/v3/tooling/compiler_csg as ccsg
 import cheng/v3/backend/system_link_plan as slplan
 import cheng/v3/lang/parser
@@ -313,6 +314,23 @@ fn main(): int32 =
     let typedReport = ccsg.v3CompilerCsgReport(typedCsg)
     let aliasExternalExpr = findCallExpr(typedCsg.exprLayer, typedFixturePath, 28)
     var loweringErr = ""
+    let actualTypedLinkPlan = buildLinkPlan(workspaceRoot,
+                                            packageRoot,
+                                            typedFixturePath,
+                                            typedOutputPath,
+                                            creq.v3EmitShared)
+    let actualTypedBundleCid = cworld.v3CompilerWorldSourceBundleCid(actualTypedLinkPlan.packageId,
+                                                                     actualTypedLinkPlan.sourceClosurePaths)
+    let actualTypedCsgRes = ccsg.v3BuildCompilerCsg(actualTypedLinkPlan, actualTypedBundleCid)
+    assert(IsOk(actualTypedCsgRes), "v3 compiler csg: actual typed fixture csg")
+    let actualTypedCsg = ccsg.v3CompilerCsgClone(Value(actualTypedCsgRes))
+    assert(texpr.v3TypedExprFactsValidateCallResolution(actualTypedCsg.exprLayer,
+                                                        actualTypedCsg.typedExprFacts,
+                                                        loweringErr),
+           "v3 compiler csg: actual typed fixture call resolution validate")
+    let actualTypedRules = texpr.v3TypedExprLoweringRulesFromFacts(actualTypedCsg.typedExprFacts)
+    assert(texpr.v3TypedExprLoweringRulesValidate(actualTypedRules, loweringErr),
+           "v3 compiler csg: actual typed fixture lowering rules validate")
     assert(typedFixtureFacts.len > 0, "v3 compiler csg: typed fixture fact slice")
     assert(aliasExternalExpr.exprId != "", "v3 compiler csg: typed fixture alias external expr")
     var legacyCompatBuf = layout.byteBufInit(128)
@@ -356,6 +374,55 @@ fn main(): int32 =
            "v3 compiler csg: typed fixture constructor type call kind")
     assert(constructorFact.typeText == "TypedDefaultWrap",
            "v3 compiler csg: typed fixture constructor fact type")
+    assert(!constructorFact.callPrefixStyle,
+           "v3 compiler csg: typed fixture constructor call prefix")
+    assert(constructorFact.callArgCount == 1,
+           "v3 compiler csg: typed fixture constructor arg count")
+    assert(constructorFact.callArgsText == "count: payload.len",
+           "v3 compiler csg: typed fixture constructor args text")
+    let constructorRules = texpr.v3TypedExprLoweringRulesFromFacts(typedCsg.typedExprFacts)
+    var sawConstructorRule = false
+    for i in 0..<constructorRules.len:
+        if constructorRules[i].sourcePath == typedFixturePath &&
+           constructorRules[i].lineNumber == 60 &&
+           constructorRules[i].typeCallKind == texpr.v3TypedExprTypeCallConstructor:
+            assert(constructorRules[i].callArgCount == 1,
+                   "v3 compiler csg: typed fixture constructor rule arg count")
+            assert(constructorRules[i].callArgsText == "count: payload.len",
+                   "v3 compiler csg: typed fixture constructor rule args text")
+            sawConstructorRule = true
+    assert(sawConstructorRule, "v3 compiler csg: typed fixture constructor lowering rule")
+    var badTypeCallFacts = texpr.v3TypedExprFactsClone(typedCsg.typedExprFacts)
+    var corruptedTypeCallFact = false
+    for i in 0..<badTypeCallFacts.len:
+        if badTypeCallFacts[i].sourcePath == typedFixturePath &&
+           badTypeCallFacts[i].lineNumber == 60 &&
+           badTypeCallFacts[i].kind == parser.v3NormalizedExprConstructor:
+            badTypeCallFacts[i].abiClass = texpr.v3TypedExprAbiPolymorphic
+            badTypeCallFacts[i].valueKind = texpr.v3TypedExprValuePolymorphic
+            badTypeCallFacts[i].loweringMode = texpr.v3TypedExprLowerDeferred
+            badTypeCallFacts[i].returnKind = texpr.v3TypedExprReturnDeferred
+            corruptedTypeCallFact = true
+    assert(corruptedTypeCallFact, "v3 compiler csg: corrupt constructor fact")
+    loweringErr = ""
+    assert(!texpr.v3TypedExprFactsValidateCallResolution(typedCsg.exprLayer, badTypeCallFacts, loweringErr),
+           "v3 compiler csg: reject invalid constructor fact lowering")
+    assert(v3path.V3TextContains(loweringErr, "type-call fact"),
+           "v3 compiler csg: invalid constructor fact error")
+    var badTypeCallRules = texpr.v3TypedExprLoweringRulesClone(constructorRules)
+    var corruptedTypeCallRule = false
+    for i in 0..<badTypeCallRules.len:
+        if badTypeCallRules[i].sourcePath == typedFixturePath &&
+           badTypeCallRules[i].lineNumber == 60 &&
+           badTypeCallRules[i].typeCallKind == texpr.v3TypedExprTypeCallConstructor:
+            badTypeCallRules[i].copyKind = texpr.v3TypedExprCopyScalarStore
+            corruptedTypeCallRule = true
+    assert(corruptedTypeCallRule, "v3 compiler csg: corrupt constructor rule")
+    loweringErr = ""
+    assert(!texpr.v3TypedExprLoweringRulesValidate(badTypeCallRules, loweringErr),
+           "v3 compiler csg: reject invalid constructor lowering rule")
+    assert(v3path.V3TextContains(loweringErr, "type-call rule"),
+           "v3 compiler csg: invalid constructor rule error")
     assert(parser.v3NormalizedExprLayerHasCallExpr(typedCsg.exprLayer, parser.v3NormalizedExprSurfaceCallExternal, 28),
            "v3 compiler csg: typed fixture alias external call")
     assert(parser.v3NormalizedExprLayerHasCallExpr(typedCsg.exprLayer, parser.v3NormalizedExprSurfaceCallExternal, 29),

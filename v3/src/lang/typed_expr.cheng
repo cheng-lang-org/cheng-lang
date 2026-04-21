@@ -804,6 +804,55 @@ fn v3TypedExprFactUsesTypeCallMaterialize(fact: V3TypedExprFact): bool =
 fn v3TypedExprFactAbiIsPolymorphic(fact: V3TypedExprFact): bool =
     return fact.abiClass == v3TypedExprAbiPolymorphic
 
+fn v3TypedExprTypeTextIsConcrete(typeRaw: str): bool =
+    let typeText = v3TypedExprNormalizeTypeText(typeRaw)
+    if typeText == "":
+        return false
+    if typeText == "unknown" ||
+       typeText == "default_init_expr" ||
+       typeText == "constructor_expr" ||
+       typeText == "call_expr" ||
+       typeText == "branch_join" ||
+       typeText == "result_projection":
+        return false
+    return parser.v3ParserFindText(typeText, "unknown") < 0
+
+fn v3TypedExprFactValidateTypeCallMaterialize(fact: V3TypedExprFact,
+                                              err: var str): bool =
+    if fact.typeCallKind == v3TypedExprTypeCallNone:
+        return true
+    if fact.kind != parser.v3NormalizedExprDefaultInit &&
+       fact.kind != parser.v3NormalizedExprConstructor:
+        err = "v3 typed expr: type-call fact kind drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.callKind != v3TypedExprCallNone:
+        err = "v3 typed expr: type-call fact leaked ordinary call kind at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if !v3TypedExprTypeTextIsConcrete(fact.typeText):
+        err = "v3 typed expr: type-call fact missing concrete type at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.abiClass != v3TypedExprAbiComposite ||
+       fact.valueKind != v3TypedExprValueComposite:
+        err = "v3 typed expr: type-call fact must materialize composite at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.placeKind == v3TypedExprPlaceCallResult:
+        err = "v3 typed expr: type-call fact cannot use call-result place at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.loweringMode != v3TypedExprLowerLocalAddress &&
+       fact.loweringMode != v3TypedExprLowerSret:
+        err = "v3 typed expr: type-call fact missing address lowering at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.loweringMode == v3TypedExprLowerLocalAddress &&
+       fact.returnKind != v3TypedExprReturnCompositeLocal:
+        err = "v3 typed expr: type-call fact local-address return drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    if fact.loweringMode == v3TypedExprLowerSret &&
+       fact.returnKind != v3TypedExprReturnSret:
+        err = "v3 typed expr: type-call fact sret return drift at " + fact.sourcePath + ":" + intToStr(fact.lineNumber)
+        return false
+    err = ""
+    return true
+
 fn v3TypedExprFactsHasLineUsingImportBuffer(facts: V3TypedExprFact[],
                                             sourcePathRaw: str,
                                             lineNumber: int32): bool =
@@ -873,14 +922,24 @@ fn v3TypedExprFactsValidateCallResolution(exprLayer: parser.V3NormalizedExprLaye
                fact.callCallee != "" ||
                fact.callTarget != "" ||
                fact.callTargetSourcePath != "" ||
-               fact.callTargetImportc ||
-               fact.callPrefixStyle ||
-               fact.callArgCount != 0 ||
-               fact.callArgsText != "":
+               fact.callTargetImportc:
                 err = "v3 typed expr: non-call fact leaked call resolution at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             if fact.typeCallKind != expectedTypeCallKind:
                 err = "v3 typed expr: non-call fact leaked type-call drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                return false
+            if expectedTypeCallKind != v3TypedExprTypeCallNone:
+                if fact.callPrefixStyle != expr.callPrefixStyle ||
+                   fact.callArgCount != expr.callArgCount ||
+                   fact.callArgsText != expr.callArgsText:
+                    err = "v3 typed expr: type-call fact args drift at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
+                    return false
+                if !v3TypedExprFactValidateTypeCallMaterialize(fact, err):
+                    return false
+            elif fact.callPrefixStyle ||
+                 fact.callArgCount != 0 ||
+                 fact.callArgsText != "":
+                err = "v3 typed expr: non-call fact leaked call args at " + expr.sourcePath + ":" + intToStr(expr.lineNumber)
                 return false
             continue
         if fact.typeCallKind != v3TypedExprTypeCallNone:
@@ -1347,6 +1406,48 @@ fn v3TypedExprReportText(facts: V3TypedExprFact[],
     return v3TypedExprFactsReportText(facts) +
            v3TypedExprLoweringRulesReportText(rules)
 
+fn v3TypedExprLoweringRuleValidateTypeCallMaterialize(rule: V3TypedExprLoweringRule,
+                                                      err: var str): bool =
+    if rule.typeCallKind == v3TypedExprTypeCallNone:
+        return true
+    if !v3TypedExprTypeTextIsConcrete(rule.typeText):
+        err = "v3 typed expr: type-call rule missing concrete type"
+        return false
+    if rule.callKind != v3TypedExprCallNone:
+        err = "v3 typed expr: type-call rule leaked ordinary call kind"
+        return false
+    if rule.abiClass != v3TypedExprAbiComposite ||
+       rule.valueKind != v3TypedExprValueComposite:
+        err = "v3 typed expr: type-call rule must materialize composite"
+        return false
+    if rule.placeKind == v3TypedExprPlaceCallResult:
+        err = "v3 typed expr: type-call rule cannot use call-result place"
+        return false
+    if rule.argPassKind != v3TypedExprArgPassAddress:
+        err = "v3 typed expr: type-call rule must pass address"
+        return false
+    if rule.copyKind != v3TypedExprCopyRegionCopy:
+        err = "v3 typed expr: type-call rule must copy region"
+        return false
+    if rule.loweringMode == v3TypedExprLowerLocalAddress:
+        if rule.returnKind != v3TypedExprReturnCompositeLocal ||
+           rule.resultPassKind != v3TypedExprResultPassLocalAddress ||
+           rule.materializeKind != v3TypedExprMaterializeLocalSlot:
+            err = "v3 typed expr: type-call rule local-address lowering drift"
+            return false
+        err = ""
+        return true
+    if rule.loweringMode == v3TypedExprLowerSret:
+        if rule.returnKind != v3TypedExprReturnSret ||
+           rule.resultPassKind != v3TypedExprResultPassSret ||
+           rule.materializeKind != v3TypedExprMaterializeDestAddress:
+            err = "v3 typed expr: type-call rule sret lowering drift"
+            return false
+        err = ""
+        return true
+    err = "v3 typed expr: type-call rule missing address lowering"
+    return false
+
 fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                                     err: var str): bool =
     for i in 0..<rules.len:
@@ -1361,11 +1462,16 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
                rule.callCallee != "" ||
                rule.callTarget != "" ||
                rule.callTargetSourcePath != "" ||
-               rule.callTargetImportc ||
-               rule.callPrefixStyle ||
-               rule.callArgCount != 0 ||
-               rule.callArgsText != "":
+               rule.callTargetImportc:
                 err = "v3 typed expr: non-call rule leaked call resolution"
+                return false
+            if rule.typeCallKind != v3TypedExprTypeCallNone:
+                if !v3TypedExprLoweringRuleValidateTypeCallMaterialize(rule, err):
+                    return false
+            elif rule.callPrefixStyle ||
+                 rule.callArgCount != 0 ||
+                 rule.callArgsText != "":
+                err = "v3 typed expr: non-call rule leaked call args"
                 return false
         else:
             if rule.typeCallKind != v3TypedExprTypeCallNone:
@@ -1417,6 +1523,15 @@ fn v3TypedExprLoweringRulesValidate(rules: V3TypedExprLoweringRule[],
            rule.valueKind != v3TypedExprValueComposite:
             err = "v3 typed expr: region copy rule must stay composite"
             return false
+    err = ""
+    return true
+
+fn v3TypedExprBuildLoweringRules(facts: V3TypedExprFact[],
+                                 rules: var V3TypedExprLoweringRule[],
+                                 err: var str): bool =
+    rules = v3TypedExprLoweringRulesFromFacts(facts)
+    if !v3TypedExprLoweringRulesValidate(rules, err):
+        return false
     err = ""
     return true
 
@@ -2115,7 +2230,10 @@ fn v3TypedExprComprehensionFilterIf(lineRaw: str,
 fn v3TypedExprExtractGenericArg(lineRaw: str,
                                 columnNumber: int32,
                                 callName: str): str =
-    let start = columnNumber - 1
+    if columnNumber <= 0:
+        return ""
+    var start = columnNumber
+    start = start - 1
     if start < 0 || start + len(callName) > lineRaw.len:
         return ""
     if v3path.V3TextSlice(lineRaw, start, len(callName)) != callName:
@@ -2144,7 +2262,10 @@ fn v3TypedExprExtractTypeGenericArg(typeRaw: str): str =
 fn v3TypedExprExtractFirstArg(lineRaw: str,
                               columnNumber: int32,
                               callName: str): str =
-    let start = columnNumber - 1
+    if columnNumber <= 0:
+        return ""
+    var start = columnNumber
+    start = start - 1
     if start < 0 || start + len(callName) > lineRaw.len:
         return ""
     if v3path.V3TextSlice(lineRaw, start, len(callName)) != callName:
@@ -2369,6 +2490,9 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         fact.placeKind = v3TypedExprPlaceCallResult
         return fact
     if expr.kind == parser.v3NormalizedExprDefaultInit:
+        fact.callPrefixStyle = expr.callPrefixStyle
+        fact.callArgCount = expr.callArgCount
+        fact.callArgsText = expr.callArgsText
         let defaultInitType = parser.v3NormalizedExprDefaultInitType(expr)
         if defaultInitType != "":
             v3TypedExprApplyResolvedType(fact, ctx, sourceContexts, defaultInitType, sink, false)
@@ -2376,6 +2500,9 @@ fn v3TypedExprBuildFact(ctx: V3TypedExprSourceContext,
         fact.typeText = "default_init_expr"
         return fact
     if expr.kind == parser.v3NormalizedExprConstructor:
+        fact.callPrefixStyle = expr.callPrefixStyle
+        fact.callArgCount = expr.callArgCount
+        fact.callArgsText = expr.callArgsText
         let constructorType = parser.v3NormalizedExprConstructorType(expr)
         let constructorName = parser.v3ParserIdentPrefix(constructorType)
         if constructorName == "Ok" || constructorName == "Err":
@@ -2575,5 +2702,9 @@ fn v3TypedExprBuildFacts(sourceTexts: V3TypedExprSourceText[],
             err = "v3 typed expr: missing source context"
             return false
         add(facts, v3TypedExprBuildFact(contexts[ctxIndex], contexts, exprLayer, expr))
+    var validateErr = ""
+    if !v3TypedExprFactsValidateCallResolution(exprLayer, facts, validateErr):
+        err = validateErr
+        return false
     err = ""
     return true

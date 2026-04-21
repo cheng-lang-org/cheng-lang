@@ -2512,13 +2512,19 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
     let bootstrapSnapshot = contracts.v3BootstrapSnapshotDefault(rootDir)
     let backendDriverReference = v3CompilerBackendDriverPath(rootDir)
     var referenceCompiler = ""
+    let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
     if len(backendDriverReference) > 0 &&
        (v3CompilerBackendDriverFresh(rootDir, backendDriverReference) ||
         v3CompilerBackendDriverReadyOverride(rootDir, backendDriverReference)):
         referenceCompiler = backendDriverReference
+    elif len(bootstrapReference) > 0:
+        referenceCompiler = bootstrapReference
     let referencePlanArgs = ["print-build-plan", "--target:" + targetTriple]
-    var referencePlanCheck = "skip_stale_backend_driver"
-    if len(referenceCompiler) > 0:
+    var referencePlanCheck = "missing_reference_compiler"
+    if len(referenceCompiler) <= 0:
+        v3CompilerPrintErr("v3 compiler: missing reference compiler for build-backend-driver plan")
+        return 2
+    else:
         if !v3CompilerRunFileLogged(rootDir,
                                     referenceCompiler,
                                     referencePlanArgs,
@@ -2527,7 +2533,6 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
             return 2
         let referencePlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
         if !v3CompilerTextContainsAll(referencePlanText, ["target=" + targetTriple]):
-            let bootstrapReference = v3CompilerBootstrapCompilerPath(rootDir, bootstrapSnapshot)
             if len(bootstrapReference) > 0 && bootstrapReference != currentCompiler:
                 referenceCompiler = bootstrapReference
                 if !v3CompilerRunFileLogged(rootDir,
@@ -2537,29 +2542,30 @@ fn v3CompilerBuildBackendDriver(rootDir: str): int32 =
                                             "build-backend-driver reference-plan"):
                     return 2
         let resolvedReferencePlanText = v3path.V3ReadTextFile("", referencePlanLogPath)
-        referencePlanCheck = "skip_target_mismatch"
-        if v3CompilerTextContainsAll(resolvedReferencePlanText, ["target=" + targetTriple]):
-            let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
-            var planCompareCommand = "grep -E "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-            planCompareCommand = planCompareCommand + " "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
-            planCompareCommand = planCompareCommand + " > "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-            planCompareCommand = planCompareCommand + " && grep -E "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
-            planCompareCommand = planCompareCommand + " "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
-            planCompareCommand = planCompareCommand + " > "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-            planCompareCommand = planCompareCommand + " && cmp -s "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
-            planCompareCommand = planCompareCommand + " "
-            planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
-            if os.ExecCmdStatus(planCompareCommand, rootDir) != 0:
-                v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
-                return 2
-            referencePlanCheck = "ok"
+        if !v3CompilerTextContainsAll(resolvedReferencePlanText, ["target=" + targetTriple]):
+            v3CompilerPrintErr("v3 compiler: reference build plan target mismatch")
+            return 2
+        let planCorePattern = "^(target=|linker=|stage2_compiler=|entry=|output=|source\\[)"
+        var planCompareCommand = "grep -E "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planLogPath)
+        planCompareCommand = planCompareCommand + " > "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+        planCompareCommand = planCompareCommand + " && grep -E "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePattern)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanLogPath)
+        planCompareCommand = planCompareCommand + " > "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+        planCompareCommand = planCompareCommand + " && cmp -s "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(planCorePath)
+        planCompareCommand = planCompareCommand + " "
+        planCompareCommand = planCompareCommand + v3CompilerQuoteShell(referencePlanCorePath)
+        if os.ExecCmdStatus(planCompareCommand, rootDir) != 0:
+            v3CompilerPrintErr("v3 compiler: backend driver build plan drift vs current compiler")
+            return 2
+        referencePlanCheck = "ok"
     if !v3CompilerRunBackendDriverSelftest(rootDir,
                                            packageRoot,
                                            backendDriverCandidateOut,

@@ -362,7 +362,7 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 - `bootstrap-bridge`：刷新 `stage0 -> stage3` 自举链
 - `build-backend-driver` / `run-production-regression` / `system-link-exec`：生成并验证当前 v3 编译器主线
-  其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-v3-surface`
+  其中 `run-production-regression` 现在固定包含 `dev_hotpatch_100ms_scope_contract_smoke`、`explicit_default_init_positive_smoke`、`explicit_default_init_negative_smoke`、`explicit_default_init_gate_smoke`、`composite_zero_helper_gate_smoke` 和 `verify-r2c-react-v3-surface`
 - `run-host-smokes` / `status`：校验闭环和查看当前主线状态
 
 其中 `system-link-exec` 的正式入口仍然优先认 `artifacts/v3_backend_driver/cheng`。如果你直接跑 `artifacts/v3_bootstrap/cheng.stage3 system-link-exec`，在 backend driver fresh/ready 时它现在也会先 handoff 到 backend driver，前端语义口径保持 parser 真源一致。
@@ -383,12 +383,12 @@ Cheng 不把“先自举成功，性能以后再补”当成正确路线。
 
 - `orc_perf_contract`：ORC runtime retain/release 和 alloc/free/live 闭环
 - `*_compile_exec_phase_summary`：正式 `system-link-exec` 编译报告里的 phase 下界摘要
-- `*_compile_gap_breakdown`：planner 之外的 object materialize、native link、line-map 真耗时
+- `*_compile_gap_breakdown`：planner 之外的 object materialize、provider cache、native link、line-map 真耗时
 - `crypto_hot_kernel_contract`：SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign 的热核 ns/op
 
 `100ms` 编译与二进制原地更新都只属于 dev host-only `self-link + direct-exe + host runner hotpatch` 的 dedicated witness 口径；release 主线仍然是 `system-link`。
 
-当前严格可引用的编译理论下界稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`。口径只认满足 `planner_total_ms <= compile_elapsed_ms` 的正式 `system-link-exec` 报告样本。
+当前严格可引用的编译理论下界稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`、`crypto_hot_kernel_perf_smoke`。provider object 热路径有独立 cache 字段和 hit/miss 计数；口径只认满足 `planner_total_ms <= compile_elapsed_ms` 的正式 `system-link-exec` 报告样本。
 
 ## Cheng 适合什么
 

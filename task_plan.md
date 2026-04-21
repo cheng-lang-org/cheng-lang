@@ -1,13 +1,32 @@
 # 当前任务
 
+- 当前目标：把 provider object 秒级物化成本收成严格缓存，并把 cache 命中/未命中挂进 perf/memory gate。
+
+- 已完成。
+  - seed `system-link-exec` 已在 provider object 物化入口加缓存；命中直接复制缓存 object，未命中才编译并写入缓存。
+  - cache key 包含 cache version、source CID、workspace/package/root/target/emit/symbol visibility、真实 C compiler 路径、codegen CID 和 suppressed exports。
+  - 编译报告和 `*_compile_gap_breakdown` 已输出 provider cache lookup/copy/store、Cheng/C provider compile、hit/miss 计数。
+  - `perf_memory_gate_contract_smoke` 已验证字段解析，`perf_memory_contract_smoke` 已验证真实样本里 provider cache 统计存在且有观测。
+  - 最新 gate：`provider_objects_ms=13/14/14/14/14ms`，`provider_cache_hits=5 provider_cache_misses=0`。
+
+- 补充目标：修掉 no-handoff 核心 smoke 暴露的 parser/typed 边界漂移。
+
+- 已完成。
+  - `cstring(x)` 这类标量/指针 cast 已从 parser constructor 分类入口排除，不再误进 `ConstructorExpr`。
+  - type-call 复合物化校验保持硬失败；真正修的是 parser 归类边界，不是放宽 typed validation。
+  - `typed_expr` 的 seed 不友好 helper 形状已压平，`lowering_plan_smoke` 的空字段读取也已修掉。
+  - 新 backend driver 已重建，parser/no-handoff/perf/skill 相关 gate 已重新过绿。
+
 - 当前目标：把 baseline、编译理论下界、内存/ORC、crypto 热核和热路径字节搬运收进同一轮正式验收。
 
 - 已完成。
   - `perf_memory_contract_smoke` 现在同时覆盖 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke` 和 `crypto_hot_kernel_perf_smoke`。
-  - 编译理论下界只看 `*_compile_exec_phase_summary.planner_total_ms`；当前四个稳定样本分别是 `462ms / 800ms / 1869ms / 584ms`。
+  - 编译理论下界只看 `*_compile_exec_phase_summary.planner_total_ms`；当前稳定样本分别是 `421ms / 692ms / 1699ms / 352ms / 1522ms`。
+  - `*_compile_gap_breakdown` 已把 planner 外耗时拆成 provider object/cache、primary object emit、native link 和 line-map；当前未归因缝隙只剩几十毫秒。
   - `Bytes` 拼接、SHA-256 padding copy、P-256 deterministic concat/fill、公钥/签名字节打包已改成 rawmem bulk copy/set，去掉逐字节 helper 边界。
   - ORC 合同继续按 retain/release 与 alloc/free/live 验收，当前 `live_delta=0`；没有 tracing GC 口径。
   - 新增 crypto 热核合同：SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign，P-256 sign 产物会真实验签。
+  - `dev_hotpatch_100ms_scope_contract_smoke` 已接入默认 host smoke 和 production regression smoke contract，防止 100ms/热补丁口径漂到 release `system-link`。
 
 - 当前目标：把 `lower generic function` 和 `type-call` 的最后一处串味收干净，并让 ordinary parser 的同类 helper 也能走通 seed no-handoff。
 
@@ -97,6 +116,10 @@
   - 状态报告把真正阻塞纯 Cheng 的 active Node helper 和仅剩薄壳的 route/truth helper 分开统计，避免 blocker 口径漂移。
   - `discover-truth-routes` / `exec-route-matrix` 新增 controller smoke，并接入 `verify-r2c-react-v3-surface`。
   - `exec-route-matrix` 现有 helper 契约要和 controller 保持一致；给了 `--route-catalog` 就不能再暗中要求 `--tsx-ast`。
+  - `native-gui-bundle` 现在由 Cheng controller 最终写回 `native_gui_bundle_v1.json`、`native_gui_bundle.summary.env`、`native_gui_bundle_report_v1.json`，并用 `cheng_controller_native_gui_bundle_finalizer_v1` 固定可验证边界；重 layout/runtime payload 仍在 Node helper 内，不能把 blocker 口径提前清零。
+  - `native-gui-bundle` 的 layout/style/native-layout 发布边界已继续加上 Cheng controller sidecar：`style_layout_surface_controller_v1.json`、`native_layout_plan_controller_v1.json`，并用 `cheng_controller_layout_payload_finalizer_v1` 写入 bundle/summary/report/status；原 Node payload 文件暂不覆盖，避免破坏现有 GUI 运行数据。
+  - `native_layout_plan_controller_v1.json` 已改成 `cheng_controller_items_source_checked_v1`：Cheng controller 会硬校验 `native_layout_plan_v1.json` 存在且包含 `items[]` / `viewport_items[]`，发布 item/viewport 计数、source path 和 layout policy；不再把大数组在 Cheng 字符串里内联拼接。
+  - `native_gui_runtime` 与 truth compare 共享生成模板已去掉显式默认初始化，避免当前 Cheng 编译器用 `redundant explicit default init` 硬失败。
 
 - 当前目标：把 `r2c-react-v3` surface 和 composite-zero guard 正式挂进 `run-production-regression`，消掉 gate 代码和 README 的回归口径漂移。
 

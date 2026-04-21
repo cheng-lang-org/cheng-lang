@@ -80,16 +80,16 @@ artifacts/v3_backend_driver/cheng r2c-react-v3-fresh-clean-gate --repo /Users/lb
 ## 当前规则
 
 - `verify-orphan-guard` 现在会直接拒绝 `v3/tooling` 顶层任何 `.sh` 文件。零脚本是结构约束，不是约定。
-- `run-production-regression` 是当前 v3 聚合回归入口；它固定串起 `build-backend-driver`、`run-host-smokes stage3_command_surface_smoke backend_driver_command_surface_smoke build_backend_driver_report_smoke perf_memory_gate_contract_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke dev_hotpatch_100ms_scope_contract_smoke explicit_default_init_negative_smoke explicit_default_init_gate_smoke composite_zero_helper_gate_smoke`、`verify-r2c-react-v3-surface`、`run-cross-target-smokes` 和 `run-stage23-libp2p-smokes`。
+- `run-production-regression` 是当前 v3 聚合回归入口；它固定串起 `build-backend-driver`、`run-host-smokes stage3_command_surface_smoke backend_driver_command_surface_smoke build_backend_driver_report_smoke perf_memory_gate_contract_smoke perf_memory_contract_smoke cheng_skill_consistency_smoke dev_hotpatch_100ms_scope_contract_smoke explicit_default_init_positive_smoke explicit_default_init_negative_smoke explicit_default_init_gate_smoke composite_zero_helper_gate_smoke`、`verify-r2c-react-v3-surface`、`run-cross-target-smokes` 和 `run-stage23-libp2p-smokes`。
 - `debug-report / print-symbols / print-line-map / print-object / print-asm / profile-run / profile-report / crash-report` 都由 Cheng 本体提供，不再依赖 `lldb / nm / otool / sample`。
 - `system-link-exec` 的正式入口优先是 `backend_driver/cheng`；直接跑 `cheng.stage3 system-link-exec` 时，只要 backend driver fresh/ready，也会先 handoff 到 backend driver 做 parser/source 真源判定。
 - `perf_memory_contract_smoke` 现在是 v3 正式性能/内存门禁；报告默认写到 `artifacts/v3_perf_memory_contract/<label>/perf_memory_contract.report.txt`。
 - `perf_memory_contract_smoke` 默认优先测 `artifacts/v3_backend_driver/cheng`；只有显式 `CHENG_V3_SMOKE_COMPILER` 才覆盖。
 - Darwin 正式内存比较值优先用 `peak memory footprint`；`maximum resident set size` 只保留原始观测，不作为稳定合同阈值。
-- `perf_memory_contract_smoke` 报告里的 `orc_perf_contract` 记录 ORC runtime retain/release 与 alloc/free/live 闭环，`*_compile_exec_phase_summary` 记录正式 `system-link-exec` 编译报告里的 phase 摘要，`*_compile_gap_breakdown` 记录 planner 之外的 object materialize/native link/line-map 真耗时，`crypto_hot_kernel_contract` 记录 SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign 的热核 ns/op。
-- 当前可以严格当作编译理论下界引用的稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`；前提仍然是 `planner_total_ms <= compile_elapsed_ms`。
+- `perf_memory_contract_smoke` 报告里的 `orc_perf_contract` 记录 ORC runtime retain/release 与 alloc/free/live 闭环，`*_compile_exec_phase_summary` 记录正式 `system-link-exec` 编译报告里的 phase 摘要，`*_compile_gap_breakdown` 记录 planner 之外的 object materialize/provider cache/native link/line-map 真耗时，`crypto_hot_kernel_contract` 记录 SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign 的热核 ns/op。
+- 当前可以严格当作编译理论下界引用的稳定样本是 `object_native_link_plan_smoke`、`chain_node_smoke`、`content_stub_smoke`、`orc_perf_contract_smoke`、`crypto_hot_kernel_perf_smoke`；provider object cache 有独立 hit/miss 和 compile/copy 子阶段，前提仍然是 `planner_total_ms <= compile_elapsed_ms`。
 - `cheng_skill_consistency_smoke` 现在是文档与技能镜像的一致性门禁；会核对 formal spec、repo skill、README、`v3/tooling/README`，并在本地存在 `$HOME/.codex/skills/cheng语言/SKILL.md` 时要求它与 repo 镜像完全一致。
-- `explicit_default_init_negative_smoke` 负责验证编译器硬错误，`explicit_default_init_gate_smoke` 负责防回潮扫描；它们拦截“把类型默认值再手写一遍”的冗余初始化，例如 `var x: Foo = Foo()`、`let xs: T[] = []`、`flag: bool = false`。这类位置统一改成省略初始化，只保留真正改变默认语义的值。
+- `explicit_default_init_positive_smoke` 负责防误杀，`explicit_default_init_negative_smoke` 负责验证编译器硬错误，`explicit_default_init_gate_smoke` 负责防回潮扫描；它们拦截“把类型默认值再手写一遍”的冗余初始化，例如 `var x: Foo = Foo()`、`let xs: T[] = []`、`flag: bool = false`。这类位置统一改成省略初始化，只保留真正改变默认语义的值。
 - `composite_zero_helper_gate_smoke` 现在负责拦截新的无参 `FooZero(): Foo` 一类镜像 helper；仓内只保留显式 allowlist 的历史特例，复合类型默认值统一走隐式初始化、`T()` 或 `new(T)`。
 - Linux `aarch64` 默认已经能真产 `ELF relocatable object` 和 `nolibc exe`。
 - Windows `COFF/PE` 和 `riscv64 ELF` 现在通过 `verify-windows-builtin / verify-riscv64-builtin / run-cross-target-smokes` 统一验收。

@@ -1,12 +1,28 @@
 # 进度
 
+- provider object 缓存这轮已收进正式 perf/memory gate。
+  - 缓存 key 包含 cache version、source 内容 CID、workspace/package/root/target/emit/symbol visibility、真实 C compiler 路径、seed/codegen 源 CID、suppressed export symbols；不能只按 object path 复用。
+  - `system-link-exec` 报告新增 `exec_phase_provider_cache_lookup_ms`、`exec_phase_provider_cache_copy_ms`、`exec_phase_provider_cache_store_ms`、`exec_phase_cheng_provider_compile_ms`、`exec_phase_c_provider_compile_ms`、`provider_object_cache_hit_count`、`provider_object_cache_miss_count` 和 `provider_object_cache_version`。
+  - 最新 `perf_memory_contract_smoke` 样本命中缓存后，`provider_objects_ms` 已从约 5-6 秒降到 `13/14/14/14/14ms`，五个样本均为 `provider_cache_hits=5 provider_cache_misses=0`。
+  - 最新编译理论下界样本是 `planner_total_ms=421/692/1699/352/1522ms`；当前未归因缝隙是 `55/73/73/55/80ms`。
+  - 已通过 `git diff --check`、`cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed.check`、`cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o artifacts/v3_bootstrap/cheng.stage0`、`artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`、`artifacts/v3_bootstrap/cheng.stage3 build-backend-driver`、`artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_gate_contract_smoke cheng_skill_consistency_smoke`、`artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`。
+
+- no-handoff 核心 smoke 的补充红点已经收掉。
+  - `cstring(dataPtr0)` 这类标量/指针 cast 不再被 parser 误归成 `ConstructorExpr`；唯一排除口在 `v3ParserConstructorTypeStatus(...)`。
+  - `type-call fact must materialize composite` 校验没有放宽，继续只允许真正复合 `DefaultInitExpr/ConstructorExpr` 走地址物化。
+  - `typed_expr` 里 seed 不友好的 helper 形状已改成显式分支和 `var` 更新，未使用的 unknown-token helper 已删除。
+  - `lowering_plan_smoke` 的报告字段读取已能处理空字段值，不再用 smoke helper panic 遮住真实编译错误。
+  - 新 backend driver 已重建；`parser_path_smoke`、`parser_normalized_expr_smoke`、核心 no-handoff smoke、`perf_memory_contract_smoke` 已通过。
+
 - perf/memory 这轮把 1-5 收到同一个正式 gate 里。
-  - baseline 样本已固定在 `perf_memory_contract_smoke` 报告：`object_native_link_plan` planner 下界 `462ms`、`chain_node` `800ms`、`content_stub` `1869ms`、`orc_perf` `584ms`；这些才是当前可引用的编译理论下界，外层 `elapsed_ms` 仍主要被执行/链接缝隙吃掉。
+  - baseline 样本已固定在 `perf_memory_contract_smoke` 报告：当前 `planner_total_ms` 为 `object_native_link_plan=421ms`、`chain_node=692ms`、`content_stub=1699ms`、`orc_perf=352ms`、`crypto_hot_kernel=1522ms`；这些才是当前可引用的编译理论下界。
+  - `*_compile_gap_breakdown`：外层 `elapsed_ms` 的主要缝隙现在能直接落到 `provider_objects_ms`、`provider_cache_*`、`primary_object_emit_ms`、`native_link_ms`、`line_map_ms`。当前 `unattributed_gap_ms` 只剩 `55/73/73/55/80ms`，不再把 provider object 物化/link 当成理论下界的一部分。
   - 热路径先收最短公共缺口：`bytesConcat/bytesConcat3`、SHA-256 输入 padding copy、P-256 deterministic 拼接和公钥/签名字节打包已从逐字节 `bytesGet/bytesSet` 改成 `RawmemCopy/RawmemSet`；`bytesCopyInto` 越界/nil 直接断言，不静默吞错。
   - 新增 `crypto_hot_kernel_perf_smoke`，同一份 gate 现在会测 SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign，并在 P-256 sign 后做验签。
-  - 当前报告值：`sha256_ns_per_op=29595`、`x25519_pubkey_ns_per_op=2201500`、`p256_pubkey_ns_per_op=275000`、`p256_sign_ns_per_op=22419000`。
+  - 当前报告值：`sha256_ns_per_op=29455`、`x25519_pubkey_ns_per_op=2139000`、`p256_pubkey_ns_per_op=271000`、`p256_sign_ns_per_op=21626000`。
   - ORC 合同仍闭合：`iterations=200000 retain_count=200000 release_count=200000 alloc_delta=1 free_delta=1 live_delta=0`；这不是 GC perf，Cheng 当前没有 tracing GC。
-  - 已通过 `git diff --check`、`artifacts/v3_backend_driver/cheng run-host-smokes crypto_hot_kernel_perf_smoke`、`artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`、`artifacts/v3_backend_driver/cheng run-host-smokes fixed_surface_smoke fixed256_sha256_smoke fixed256_curve25519_smoke quic_tls_transport_ecdsa_smoke`。
+  - `100ms` 编译/二进制原地更新已用 `dev_hotpatch_100ms_scope_contract_smoke` 锁成 dev host-only dedicated witness 口径；release `system-link` 不跟着承诺。
+  - 已通过 `git diff --check`、`cc -std=c11 -O2 -Wall -Wextra -pedantic v3/bootstrap/cheng_v3_seed.c -o /tmp/cheng_v3_seed.check`、`artifacts/v3_bootstrap/cheng.stage0 bootstrap-bridge`、`artifacts/v3_bootstrap/cheng.stage3 build-backend-driver`、`artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_gate_contract_smoke dev_hotpatch_100ms_scope_contract_smoke cheng_skill_consistency_smoke`、`artifacts/v3_backend_driver/cheng run-host-smokes perf_memory_contract_smoke`。
 
 - seed `type-call` 分类这轮又补了一次真正收口。
   - `v3/bootstrap/cheng_v3_seed.c` 现在会在规格化后先区分“真实类型”与“lower generic function”，不会再把 `elemSize[T]()` 误判成 `seq/fixed-array T()`，也不会把 `Pair()`、`int32[]()` 重新带坏。
@@ -97,6 +113,25 @@
   - `v3/experimental/r2c-react-v3/r2c-react-v3-exec-route-matrix.mjs` 已修正：已有 `--route-catalog` 时不再错误强制 `--tsx-ast`。
   - 新 backend driver candidate 已重编，`CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 artifacts/v3_backend_driver/cheng_candidate verify-r2c-react-v3-surface` 通过。
   - candidate 已覆盖回 `artifacts/v3_backend_driver/cheng`，两者当前字节级一致。
+
+- `native-gui-bundle` 已推进到 Cheng finalizer 主控。
+  - `v3/src/tooling/r2c_react_v3_controller_main.cheng` 现在在 Node payload helper 返回后，由 Cheng controller 重写最终 `native_gui_bundle_v1.json`、追加 summary finalizer 标记，并生成带 `native_gui_bundle_finalizer` 的 controller report。
+  - `v3/src/tooling/r2c_react_v3_status_support.cheng` 已新增 `native_gui_bundle_finalizer=cheng_controller_native_gui_bundle_finalizer_v1`；`native_gui_bundle_helper` 仍保留在真实 blocker 里，因为 layout/runtime payload 还没 Cheng 化。
+  - `v3/src/tests/r2c_react_v3_run_native_gui_controller_smoke.cheng` 改为通过 controller 调 `native-gui-bundle`，并断言 bundle/report/summary 三处 finalizer 标记。
+  - `v3/experimental/r2c-react-v3/r2c-react-v3-native-gui-runtime-shared.mjs` 和 `r2c-react-v3-truth-compare-engine-shared.mjs` 已清掉生成 Cheng 里的显式默认初始化。
+  - 已通过：`git diff --check`、`run-host-smokes r2c_react_v3_run_native_gui_controller_smoke`、`run-host-smokes r2c_react_v3_truth_compare_controller_smoke`，新 `cheng_candidate` 也通过同一 GUI controller smoke 并覆盖回标准 backend driver。
+
+- `native-gui-bundle` 的 layout payload 发布边界继续往 Cheng 收了一层。
+  - `v3/src/tooling/r2c_react_v3_controller_main.cheng` 现在会生成 `style_layout_surface_controller_v1.json` 和 `native_layout_plan_controller_v1.json`，用 `cheng_controller_layout_payload_finalizer_v1` 记录 style/native-layout 的 Cheng controller 发布视图。
+  - 最终 bundle、summary、controller report、status report 都已登记 `native_gui_layout_payload_finalizer`，并保留 `remaining_non_cheng_blocker_count=7`；这次没有假装 Node layout/runtime payload 已经被 Cheng 完整替换。
+  - `v3/src/tests/r2c_react_v3_run_native_gui_controller_smoke.cheng` 已新增 sidecar 文件存在性和 finalizer 内容断言。
+  - 已通过：`git diff --check`、`CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_V3_ROOT=/Users/lbcheng/cheng-lang artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_run_native_gui_controller_smoke`、重建标准 `artifacts/v3_backend_driver/cheng`、`artifacts/v3_backend_driver/cheng r2c-react-v3 status --root /Users/lbcheng/cheng-lang --out artifacts/r2c_react_v3_status_report_v1.json`。
+  - `artifacts/v3_backend_driver/cheng_candidate verify-r2c-react-v3-surface` 暴露出候选可执行在自测过程中丢失的问题，首个失败日志是 `missing executable: /Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/cheng_candidate`；本轮没有把它算作 layout finalizer 回归。
+
+- `native_layout_plan_controller` 这轮改成 source-checked 发布模式。
+  - 直接内联 `items[]` / `viewport_items[]` 的 Cheng 字符串循环拼接会把当前 primary-object 生成打到不稳定边界；已经撤掉这条路线。
+  - 当前 controller 会硬校验 `native_layout_plan_v1.json`、`items[]`、`viewport_items[]`，并发布 `cheng_controller_items_source_checked_v1`、item/viewport 计数、source path 和 layout policy。
+  - 已通过：`git diff --check`、`CHENG_V3_NO_BACKEND_DRIVER_HANDOFF=1 CHENG_V3_ROOT=/Users/lbcheng/cheng-lang artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_run_native_gui_controller_smoke`、重建标准 `artifacts/v3_backend_driver/cheng`、`CHENG_V3_ROOT=/Users/lbcheng/cheng-lang artifacts/v3_backend_driver/cheng run-host-smokes r2c_react_v3_run_native_gui_controller_smoke`、`artifacts/v3_backend_driver/cheng r2c-react-v3 status --root /Users/lbcheng/cheng-lang --out artifacts/r2c_react_v3_status_report_v1.json`。
 
 - `run-production-regression` 这轮把聚合回归口径重新对齐了。
   - `v3/src/tooling/gate_main.cheng` 里 `verify-r2c-react-v3-surface` 已提成单一 helper，命令分发和聚合回归不再各自维护一套 `r2c` smoke 列表。

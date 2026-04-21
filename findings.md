@@ -1,14 +1,29 @@
 # 当前发现
 
+- provider object 物化之前是真实编译缝隙，不是 planner 理论下界。
+  - 当前已经用 provider object cache 收掉热路径秒级成本，最新 gate 中五个样本均为 `provider_cache_hits=5 provider_cache_misses=0`。
+  - 命中后 `provider_objects_ms` 稳定在 `13-19ms`；`cheng_provider_compile_ms/c_provider_compile_ms` 为 `0` 时表示这轮没有重新编 provider object。
+  - cache key 必须吃 source CID、target、package/root、compiler path、codegen CID 和 suppressed exports；不能只靠输出 object 路径。
+
+- no-handoff 核心 smoke 暴露的 `cstring(dataPtr0)` 失败属实，根因是 parser constructor 分类过宽。
+  - `cstring(x)` 这类标量/指针 cast 不是复合构造，不能进入 `ConstructorExpr`。
+  - 正确处理是让 `v3ParserConstructorTypeStatus(...)` 在入口排除标量/指针类型；typed 的 `type-call fact must materialize composite` 校验必须保留硬失败。
+  - `lowering_plan_smoke` 的空字段读取也要修，否则 smoke helper panic 会遮住真正的 typed/parser 缺口。
+
 - 这轮真实热路径缺口不是先调阈值，而是通用字节搬运还在逐字节跨 helper。
   - `bytesConcat/bytesConcat3`、SHA-256 输入拷贝、P-256 deterministic concat/fill、公钥/签名字节组装都会反复走 `bytesGet/bytesSet`。
   - 当前正确修法是复用已有 `RawmemCopy/RawmemSet` 做固定长度 bulk copy/set；不要新增 C bridge、不要靠放宽 perf 阈值掩盖。
   - `bytesCopyInto` 这种低层 helper 必须 let-it-crash：nil 或越界直接断言，不能静默 return。
 
-- `perf_memory_contract_smoke` 现在能同时回答三件事。
+- `perf_memory_contract_smoke` 现在能同时回答四件事。
   - 编译理论下界看 `*_compile_exec_phase_summary.planner_total_ms`。
+  - planner 外编译缝隙看 `*_compile_gap_breakdown`，当前 provider object 热路径已由 cache 命中压到十几毫秒，剩余主耗时是真实 primary object emit，不再混进理论下界。
   - 内存/生命周期看 `orc_perf_contract` 的 retain/release 与 alloc/free/live。
   - crypto 热核看 `crypto_hot_kernel_contract` 的 SHA-256、X25519 pubkey、P-256 pubkey、P-256 sign 单次 ns。
+
+- `100ms` 编译和二进制原地更新不能按 release/system-link 口径解释。
+  - 当前只允许说 dev host-only `self-link + direct-exe + host runner hotpatch` 的 dedicated witness。
+  - `dev_hotpatch_100ms_scope_contract_smoke` 已把 formal spec、README、tooling README、repo skill、home skill 里的这句话固定成门禁。
 
 - `lower generic function` 不能只按原始文本或首字母跳过。
   - `normalize_type_text` 之后，像 `elemSize[T]()` 这类 generic function 可能长得像 bracketed type；如果不先看“是不是已知类型”，就会被误打成 `seq/fixed-array T()`。
@@ -80,6 +95,27 @@
 - `r2c` 状态报告之前把薄壳 helper 和真实 blocker 混在一起。
   - `exec_route_matrix_helper` / `truth_route_helper` 仍然是 Node 薄壳，但它们不在 `remaining_non_cheng_blockers` 里；继续塞进 `active_node_helpers` 会让状态读起来前后矛盾。
   - 现在已经拆出 `thin_node_helpers`，剩余纯 Cheng 阻塞口径更清楚。
+
+- `native_gui_bundle_helper` 不是纯打包 helper，不能直接宣称已薄壳化。
+  - 它还负责 layout surface、style layout、native layout plan、render plan、compiled runtime launcher/session payload。
+  - 当前正确切口是 Cheng controller 接管最终 bundle/summary/report 发布物，显式打 `cheng_controller_native_gui_bundle_finalizer_v1`；下一步再把重 payload 逐块搬进 Cheng。
+
+- layout payload 这轮只能先做 Cheng 发布 sidecar，不能直接覆盖 Node 生成的真实 payload。
+  - `native_gui_session` 和后续 run-native-gui 仍消费 Node helper 生成的 layout/native-layout 细节；如果现在把 `native_layout_plan_v1.json` 直接改成空 `items` 或机械摘要，会把 GUI 运行数据打坏。
+  - 当前正确切口是 sidecar finalizer：Cheng 写 `style_layout_surface_controller_v1.json` / `native_layout_plan_controller_v1.json`，bundle/summary/report/status 记录 `cheng_controller_layout_payload_finalizer_v1`，但 `native_gui_bundle_helper` 继续留在 blocker 里。
+
+- `native_layout_plan_controller` 不能靠 Cheng 字符串循环内联大数组推进。
+  - 尝试把 `items[]` / `viewport_items[]` 全量或预览在 Cheng controller 内用循环拼接发布，会把当前 primary-object 生成推到不稳定边界。
+  - 已改成 `cheng_controller_items_source_checked_v1`：Cheng controller 只硬校验原始 native layout plan 与两个数组字段存在，发布 source path、item/viewport 计数和 layout policy。
+  - 这保持了 GUI 运行 payload 不被破坏，也避免重新引入大内存/空 object 风险；真正替换 `items[]` 的下一步应改成 Cheng typed layout item 生成器，不是继续拼 raw JSON 字符串。
+
+- `cheng_candidate` 不能作为长串自测的稳定可执行路径假设。
+  - 本轮 `artifacts/v3_backend_driver/cheng_candidate verify-r2c-react-v3-surface` 在第二个 selftest 前失败，日志为 `missing executable: /Users/lbcheng/cheng-lang/artifacts/v3_backend_driver/cheng_candidate`。
+  - 这不是 layout finalizer 的语义失败；同一源码重建到标准 `artifacts/v3_backend_driver/cheng` 后，status 和 GUI controller smoke 都通过。后续要单独排查 candidate 自测过程中为什么会丢当前可执行。
+
+- 生成 Cheng 的模板不能再写显式零值初始化。
+  - `native_gui_runtime` 生成出的 `var out: str = ""`、`var count: int32 = 0` 会被当前编译器按 `redundant explicit default init` 硬失败。
+  - truth compare 共享模板也有同类 `int32 = 0`，已经同步清掉，避免后续 controller smoke 再踩同类坑。
 
 - `run-production-regression` 之前和 README 口径已经漂了。
   - 文档声称它会跑 `composite_zero_helper_gate_smoke`，但 gate 实现里漏掉了。

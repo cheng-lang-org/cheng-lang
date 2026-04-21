@@ -1,5 +1,11 @@
 # Lessons
 
+- provider object cache key 必须包含 source 内容、target、package/root、compiler path、codegen 版本和 suppressed exports；不要只按 object 输出路径缓存。
+
+- 编译理论下界只能引用 planner phase；provider object 物化、primary object emit、native link、line-map 必须单独进 `*_compile_gap_breakdown`，不要把这些真实后端执行成本混成 planner 下界。
+
+- `100ms` 编译和二进制原地更新只能按 dev host-only dedicated witness 写进合同；要用 smoke 扫文档/skill 固定口径，不能用未实现的 release/system-link 热更新假装达成。
+
 - 热核优化先找跨样本共享的字节搬运边界；已有 `RawmemCopy/RawmemSet` 时，不要新增 C bridge，不要调松阈值，也不要继续让固定长度 copy 走逐字节 `bytesGet/bytesSet`。
 
 - 低层 bulk-copy helper 不能静默失败；nil、负 offset、越界必须断言暴露，否则 perf 修复会把真实内存错误藏起来。
@@ -81,3 +87,19 @@
 - 聚合回归入口一旦在 README 里列成正式合同，gate 代码就不能再手写另一套漂移列表；像 `verify-r2c-react-v3-surface` 这种已有正式 verify 命令的集合，命令分发和 `run-production-regression` 应该共用同一个 helper。
 
 - `cheng.stage3` 这种用户可见子命令先看 seed C 真入口，不要只改 ordinary `gate_main` 就以为主线收完；像 `verify-r2c-react-v3-surface` 这类命令，seed 壳如果还停在旧 smoke 集合，就会把正式回归伪造成假绿。
+
+- 清理旧 `cheng` 进程时不要把 `pkill -f ...` 和新的验证命令写进同一个 shell；匹配串会命中当前 shell 命令行，直接把刚启动的 smoke 一起误杀。
+
+- `native-gui-bundle` 这类 helper 如果还在生成 layout/runtime payload，就只能标成 Cheng finalizer 主控，不能把它提前从 `remaining_non_cheng_blockers` 里移除。
+
+- 任何会生成 Cheng 源的 Node helper 都必须遵守当前语言规则：不要生成 `= ""`、`= 0`、`= false` 这种显式默认初始化；生成器层一次清干净，比让每个 smoke 分别炸更稳。
+
+- `native-gui-bundle` 的 layout/native-layout 真实 payload 还被 session/runtime 消费时，不要直接覆盖原 payload 文件；先用 Cheng controller sidecar 登记 finalizer，等 Cheng 能生成完整 items/commands 后再替换主 payload。
+
+- `artifacts/v3_backend_driver/cheng_candidate` 在自测链路里可能丢失；不要把 candidate 长串自测失败直接算成业务回归。先记录首个 `missing executable`，必要时重建到标准 `artifacts/v3_backend_driver/cheng` 再验证同一源码。
+
+- `ConstructorExpr` 只能从复合物化入口产生；`cstring(x)`、`ptr(x)` 这类标量/指针 cast 必须在 parser constructor 分类入口排除，不能放松 typed type-call 校验来兜底。
+
+- seed no-handoff 会编译 ordinary helper 本身；`typed_expr` 这种核心 helper 不要留下未使用薄壳，也不要用算术 `let` 开头触发旧 seed 形状缺口，优先写成显式分支和 `var` 更新。
+
+- `native_layout_plan_v1.json` 这种 100KB 级 raw JSON 数组不要在 Cheng controller 里用循环字符串拼接内联发布；当前会把 primary-object 推到不稳定/空 object 边界。先做 source-checked sidecar，真正替换 items 时走 typed layout item 生成器。

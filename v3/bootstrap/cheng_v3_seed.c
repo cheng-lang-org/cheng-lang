@@ -1421,6 +1421,7 @@ typedef struct {
     char compiler_csg_source[PATH_MAX];
     char compiler_world_libp2p_source[PATH_MAX];
     char compiler_equivalence_source[PATH_MAX];
+    char compiler_publish_gate_source[PATH_MAX];
     char lang_parser_source[PATH_MAX];
     char backend_system_link_plan_source[PATH_MAX];
     char backend_lowering_plan_source[PATH_MAX];
@@ -1535,6 +1536,7 @@ static void v3_bootstrap_paths_init(V3BootstrapPaths *paths) {
     v3_join_path(paths->compiler_csg_source, sizeof(paths->compiler_csg_source), paths->root, "v3/src/tooling/compiler_csg.cheng");
     v3_join_path(paths->compiler_world_libp2p_source, sizeof(paths->compiler_world_libp2p_source), paths->root, "v3/src/tooling/compiler_world_libp2p.cheng");
     v3_join_path(paths->compiler_equivalence_source, sizeof(paths->compiler_equivalence_source), paths->root, "v3/src/tooling/compiler_equivalence.cheng");
+    v3_join_path(paths->compiler_publish_gate_source, sizeof(paths->compiler_publish_gate_source), paths->root, "v3/src/tooling/compiler_publish_gate.cheng");
     v3_join_path(paths->lang_parser_source, sizeof(paths->lang_parser_source), paths->root, "v3/src/lang/parser.cheng");
     v3_join_path(paths->backend_system_link_plan_source, sizeof(paths->backend_system_link_plan_source), paths->root, "v3/src/backend/system_link_plan.cheng");
     v3_join_path(paths->backend_lowering_plan_source, sizeof(paths->backend_lowering_plan_source), paths->root, "v3/src/backend/lowering_plan.cheng");
@@ -1650,7 +1652,7 @@ static bool v3_bootstrap_artifacts_fresh(const V3BootstrapPaths *paths) {
 }
 
 static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
-    const char *inputs[28];
+    const char *inputs[29];
     if (paths == NULL || access(paths->backend_driver_out, X_OK) != 0) {
         return false;
     }
@@ -1667,25 +1669,26 @@ static bool v3_backend_driver_ready(const V3BootstrapPaths *paths) {
     inputs[7] = paths->compiler_csg_source;
     inputs[8] = paths->compiler_world_libp2p_source;
     inputs[9] = paths->compiler_equivalence_source;
-    inputs[10] = paths->lang_parser_source;
-    inputs[11] = paths->backend_system_link_plan_source;
-    inputs[12] = paths->backend_lowering_plan_source;
-    inputs[13] = paths->backend_primary_object_plan_source;
-    inputs[14] = paths->backend_object_plan_source;
-    inputs[15] = paths->backend_native_link_plan_source;
-    inputs[16] = paths->backend_system_link_exec_source;
-    inputs[17] = paths->runtime_core_runtime_source;
-    inputs[18] = paths->runtime_compiler_runtime_source;
-    inputs[19] = paths->runtime_debug_runtime_source;
-    inputs[20] = paths->tooling_bootstrap_contract_source;
-    inputs[21] = paths->backend_build_plan_source;
-    inputs[22] = paths->runtime_core_provider_source;
-    inputs[23] = paths->runtime_compiler_tooling_provider_source;
-    inputs[24] = paths->runtime_program_support_provider_source;
-    inputs[25] = paths->runtime_debug_provider_source;
-    inputs[26] = paths->tooling_host_ops_source;
-    inputs[27] = paths->tooling_path_source;
-    return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 28U);
+    inputs[10] = paths->compiler_publish_gate_source;
+    inputs[11] = paths->lang_parser_source;
+    inputs[12] = paths->backend_system_link_plan_source;
+    inputs[13] = paths->backend_lowering_plan_source;
+    inputs[14] = paths->backend_primary_object_plan_source;
+    inputs[15] = paths->backend_object_plan_source;
+    inputs[16] = paths->backend_native_link_plan_source;
+    inputs[17] = paths->backend_system_link_exec_source;
+    inputs[18] = paths->runtime_core_runtime_source;
+    inputs[19] = paths->runtime_compiler_runtime_source;
+    inputs[20] = paths->runtime_debug_runtime_source;
+    inputs[21] = paths->tooling_bootstrap_contract_source;
+    inputs[22] = paths->backend_build_plan_source;
+    inputs[23] = paths->runtime_core_provider_source;
+    inputs[24] = paths->runtime_compiler_tooling_provider_source;
+    inputs[25] = paths->runtime_program_support_provider_source;
+    inputs[26] = paths->runtime_debug_provider_source;
+    inputs[27] = paths->tooling_host_ops_source;
+    inputs[28] = paths->tooling_path_source;
+    return v3_output_is_fresh_against_inputs(paths->backend_driver_out, inputs, 29U);
 }
 
 static bool v3_backend_driver_present(const V3BootstrapPaths *paths) {
@@ -2491,6 +2494,7 @@ static const char *v3_flag_value(int argc, char **argv, const char *flag) {
 #define CHENG_V3_MAX_ASM_LOCALS 1024
 #define CHENG_V3_MAX_TYPE_TEXT 512
 #define CHENG_V3_MAX_DEFAULT_EXPR 4096
+#define CHENG_V3_PROVIDER_OBJECT_CACHE_VERSION "provider-object-cache-v2"
 
 typedef struct {
     char text[PATH_MAX];
@@ -2924,6 +2928,13 @@ typedef struct {
     long long exec_phase_total_ms;
     long long exec_phase_linux_nolibc_objects_ms;
     long long exec_phase_provider_objects_ms;
+    long long exec_phase_provider_cache_lookup_ms;
+    long long exec_phase_provider_cache_copy_ms;
+    long long exec_phase_provider_cache_store_ms;
+    long long exec_phase_cheng_provider_compile_ms;
+    long long exec_phase_c_provider_compile_ms;
+    long long provider_object_cache_hit_count;
+    long long provider_object_cache_miss_count;
     long long exec_phase_primary_object_emit_ms;
     long long exec_phase_native_link_ms;
     long long exec_phase_line_map_ms;
@@ -53285,9 +53296,225 @@ static bool v3_materialize_primary_asm_only(const V3SystemLinkPlanStub *plan,
     return v3_materialize_primary_object_internal(plan, lowering, primary, false);
 }
 
+static bool v3_materialize_cheng_object(const V3BootstrapContract *contract,
+                                        const char *package_root,
+                                        const char *source_path,
+                                        const char *target_triple,
+                                        const char *out_path,
+                                        const V3PlanPath *suppressed_export_symbols,
+                                        size_t suppressed_export_symbol_count);
+
+static void v3_add_phase_ms(long long *field, long long elapsed_ms) {
+    if (field != NULL && elapsed_ms >= 0LL) {
+        *field += elapsed_ms;
+    }
+}
+
+static bool v3_source_file_cid(const char *path, V3Cid32 *out) {
+    char *text;
+    if (out == NULL || path == NULL || path[0] == '\0') {
+        return false;
+    }
+    text = v3_read_file(path);
+    if (text == NULL) {
+        return false;
+    }
+    *out = v3_cid_from_bytes((const uint8_t *)text, strlen(text));
+    free(text);
+    return true;
+}
+
+static bool v3_provider_codegen_cid(V3Cid32 *out) {
+    static bool ready = false;
+    static bool ok = false;
+    static V3Cid32 cid;
+    if (out == NULL) {
+        return false;
+    }
+    if (!ready) {
+        ok = v3_source_file_cid(CHENG_V3_IMPL_SOURCE_PATH, &cid);
+        ready = true;
+    }
+    if (!ok) {
+        return false;
+    }
+    *out = cid;
+    return true;
+}
+
+static bool v3_provider_object_cache_key(const V3SystemLinkPlanStub *plan,
+                                         const char *source_path,
+                                         const V3PlanPath *suppressed_export_symbols,
+                                         size_t suppressed_export_symbol_count,
+                                         char *key_out,
+                                         size_t key_cap) {
+    V3Cid32 source_cid;
+    V3Cid32 codegen_cid;
+    V3Cid32 key_cid;
+    V3ByteBuf buf;
+    char cc[PATH_MAX];
+    size_t i;
+    if (plan == NULL || source_path == NULL || source_path[0] == '\0' ||
+        key_out == NULL || key_cap < CHENG_V3_CID_HEX_CAP) {
+        return false;
+    }
+    if (!v3_source_file_cid(source_path, &source_cid)) {
+        return false;
+    }
+    if (!v3_provider_codegen_cid(&codegen_cid)) {
+        return false;
+    }
+    if (!v3_resolve_target_cc_program(plan->target_triple, cc, sizeof(cc))) {
+        return false;
+    }
+    v3_bytebuf_init(&buf, 1024U);
+    v3_bytebuf_append_text(&buf, CHENG_V3_PROVIDER_OBJECT_CACHE_VERSION);
+    v3_bytebuf_append_text(&buf, source_path);
+    v3_bytebuf_append_text(&buf, plan->workspace_root);
+    v3_bytebuf_append_text(&buf, plan->package_root);
+    v3_bytebuf_append_text(&buf, plan->package_id);
+    v3_bytebuf_append_text(&buf, plan->target_triple);
+    v3_bytebuf_append_text(&buf, plan->emit_kind);
+    v3_bytebuf_append_text(&buf, plan->symbol_visibility);
+    v3_bytebuf_append_text(&buf, cc);
+    v3_bytebuf_append_cid(&buf, source_cid);
+    v3_bytebuf_append_cid(&buf, codegen_cid);
+    v3_bytebuf_append_u32_be(&buf, (uint32_t)suppressed_export_symbol_count);
+    for (i = 0U; i < suppressed_export_symbol_count; ++i) {
+        v3_bytebuf_append_text(&buf, suppressed_export_symbols[i].text);
+    }
+    key_cid = v3_cid_from_bytebuf(&buf);
+    v3_copy_text(key_out, key_cap, key_cid.hex);
+    v3_bytebuf_free(&buf);
+    return true;
+}
+
+static bool v3_provider_object_cache_path(const V3SystemLinkPlanStub *plan,
+                                          const char *source_path,
+                                          const V3PlanPath *suppressed_export_symbols,
+                                          size_t suppressed_export_symbol_count,
+                                          char *key_out,
+                                          size_t key_cap,
+                                          char *path_out,
+                                          size_t path_cap) {
+    char target_safe[PATH_MAX];
+    int written;
+    if (!v3_provider_object_cache_key(plan,
+                                      source_path,
+                                      suppressed_export_symbols,
+                                      suppressed_export_symbol_count,
+                                      key_out,
+                                      key_cap)) {
+        return false;
+    }
+    v3_sanitize_path_part(plan->target_triple, target_safe, sizeof(target_safe));
+    written = snprintf(path_out,
+                       path_cap,
+                       "%s/artifacts/v3_provider_object_cache/%s/%s.o",
+                       plan->workspace_root,
+                       target_safe,
+                       key_out);
+    return written > 0 && (size_t)written < path_cap;
+}
+
+static bool v3_materialize_provider_object_cached(const V3BootstrapContract *contract,
+                                                  const V3SystemLinkPlanStub *plan,
+                                                  const char *source_path,
+                                                  const char *out_path,
+                                                  const V3PlanPath *suppressed_export_symbols,
+                                                  size_t suppressed_export_symbol_count,
+                                                  V3CompilerWorldArtifacts *world) {
+    char cache_key[CHENG_V3_CID_HEX_CAP];
+    char cache_path[PATH_MAX];
+    const char *ext = strrchr(source_path != NULL ? source_path : "", '.');
+    bool is_cheng = ext != NULL && strcmp(ext, ".cheng") == 0;
+    bool ok = false;
+    long long phase_start_ms;
+    long long phase_end_ms;
+    if (source_path == NULL || source_path[0] == '\0' ||
+        out_path == NULL || out_path[0] == '\0') {
+        return false;
+    }
+    phase_start_ms = v3_bft_monotime_ms();
+    if (!v3_provider_object_cache_path(plan,
+                                       source_path,
+                                       suppressed_export_symbols,
+                                       suppressed_export_symbol_count,
+                                       cache_key,
+                                       sizeof(cache_key),
+                                       cache_path,
+                                       sizeof(cache_path))) {
+        phase_end_ms = v3_bft_monotime_ms();
+        if (world != NULL) {
+            v3_add_phase_ms(&world->exec_phase_provider_cache_lookup_ms,
+                            v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+        }
+        return false;
+    }
+    if (v3_path_exists_nonempty(cache_path)) {
+        phase_end_ms = v3_bft_monotime_ms();
+        if (world != NULL) {
+            v3_add_phase_ms(&world->exec_phase_provider_cache_lookup_ms,
+                            v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+            world->provider_object_cache_hit_count += 1LL;
+        }
+        phase_start_ms = v3_bft_monotime_ms();
+        ok = v3_copy_file_bytes(cache_path, out_path);
+        phase_end_ms = v3_bft_monotime_ms();
+        if (world != NULL) {
+            v3_add_phase_ms(&world->exec_phase_provider_cache_copy_ms,
+                            v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+        }
+        return ok;
+    }
+    phase_end_ms = v3_bft_monotime_ms();
+    if (world != NULL) {
+        v3_add_phase_ms(&world->exec_phase_provider_cache_lookup_ms,
+                        v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+        world->provider_object_cache_miss_count += 1LL;
+    }
+    phase_start_ms = v3_bft_monotime_ms();
+    if (is_cheng) {
+        ok = v3_materialize_cheng_object(contract,
+                                         plan->package_root,
+                                         source_path,
+                                         plan->target_triple,
+                                         out_path,
+                                         suppressed_export_symbols,
+                                         suppressed_export_symbol_count);
+    } else {
+        ok = v3_compile_c_object(plan->target_triple,
+                                 plan->emit_kind,
+                                 source_path,
+                                 out_path);
+    }
+    phase_end_ms = v3_bft_monotime_ms();
+    if (world != NULL) {
+        if (is_cheng) {
+            v3_add_phase_ms(&world->exec_phase_cheng_provider_compile_ms,
+                            v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+        } else {
+            v3_add_phase_ms(&world->exec_phase_c_provider_compile_ms,
+                            v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+        }
+    }
+    if (!ok) {
+        return false;
+    }
+    phase_start_ms = v3_bft_monotime_ms();
+    ok = v3_copy_file_bytes(out_path, cache_path);
+    phase_end_ms = v3_bft_monotime_ms();
+    if (world != NULL) {
+        v3_add_phase_ms(&world->exec_phase_provider_cache_store_ms,
+                        v3_phase_elapsed_ms(phase_start_ms, phase_end_ms));
+    }
+    return ok;
+}
+
 static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
                                             const V3SystemLinkPlanStub *plan,
-                                            const V3ObjectPlanStub *object_plan) {
+                                            const V3ObjectPlanStub *object_plan,
+                                            V3CompilerWorldArtifacts *world) {
     V3PlanPath *suppressed_export_symbols = NULL;
     size_t suppressed_export_symbol_count = 0U;
     size_t i;
@@ -53309,26 +53536,15 @@ static bool v3_materialize_provider_objects(const V3BootstrapContract *contract,
     }
     for (i = 0; i < object_plan->provider_source_count; ++i) {
         const char *source_path = object_plan->provider_source_paths[i].text;
-        const char *ext = strrchr(source_path != NULL ? source_path : "", '.');
-        if (ext != NULL && strcmp(ext, ".cheng") == 0) {
-            if (!v3_materialize_cheng_object(contract,
-                                             plan->package_root,
-                                             source_path,
-                                             plan->target_triple,
-                                             object_plan->provider_object_paths[i].text,
-                                             suppressed_export_symbols,
-                                             suppressed_export_symbol_count)) {
-                free(suppressed_export_symbols);
-                return false;
-            }
-        } else {
-            if (!v3_compile_c_object(plan->target_triple,
-                                     plan->emit_kind,
-                                     source_path,
-                                     object_plan->provider_object_paths[i].text)) {
-                free(suppressed_export_symbols);
-                return false;
-            }
+        if (!v3_materialize_provider_object_cached(contract,
+                                                   plan,
+                                                   source_path,
+                                                   object_plan->provider_object_paths[i].text,
+                                                   suppressed_export_symbols,
+                                                   suppressed_export_symbol_count,
+                                                   world)) {
+            free(suppressed_export_symbols);
+            return false;
         }
     }
     free(suppressed_export_symbols);
@@ -58504,6 +58720,22 @@ static char *v3_system_link_exec_report(const V3BootstrapContract *contract,
         v3_report_append(&out, &cap, &used, line);
         snprintf(line, sizeof(line), "exec_phase_provider_objects_ms=%lld", world->exec_phase_provider_objects_ms);
         v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_provider_cache_lookup_ms=%lld", world->exec_phase_provider_cache_lookup_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_provider_cache_copy_ms=%lld", world->exec_phase_provider_cache_copy_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_provider_cache_store_ms=%lld", world->exec_phase_provider_cache_store_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_cheng_provider_compile_ms=%lld", world->exec_phase_cheng_provider_compile_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "exec_phase_c_provider_compile_ms=%lld", world->exec_phase_c_provider_compile_ms);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "provider_object_cache_hit_count=%lld", world->provider_object_cache_hit_count);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "provider_object_cache_miss_count=%lld", world->provider_object_cache_miss_count);
+        v3_report_append(&out, &cap, &used, line);
+        snprintf(line, sizeof(line), "provider_object_cache_version=%s", CHENG_V3_PROVIDER_OBJECT_CACHE_VERSION);
+        v3_report_append(&out, &cap, &used, line);
         snprintf(line, sizeof(line), "exec_phase_primary_object_emit_ms=%lld", world->exec_phase_primary_object_emit_ms);
         v3_report_append(&out, &cap, &used, line);
         snprintf(line, sizeof(line), "exec_phase_native_link_ms=%lld", world->exec_phase_native_link_ms);
@@ -58821,6 +59053,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         NULL,
         NULL,
         NULL,
+        NULL,
         "lang_parser_source",
         "backend_system_link_plan_source",
         "backend_lowering_plan_source",
@@ -58839,6 +59072,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "compiler_runtime_source",
         "compiler_support_matrix_source",
         "compiler_request_source",
+        "tooling_source",
         "tooling_source",
         "tooling_source",
         "tooling_source",
@@ -58865,6 +59099,7 @@ static int v3_cmd_print_build_plan(int argc, char **argv) {
         "v3/src/tooling/compiler_csg.cheng",
         "v3/src/tooling/compiler_world_libp2p.cheng",
         "v3/src/tooling/compiler_equivalence.cheng",
+        "v3/src/tooling/compiler_publish_gate.cheng",
         NULL,
         NULL,
         NULL,
@@ -59206,10 +59441,12 @@ static int v3_cmd_build_backend_driver(int argc, char **argv) {
                  "artifacts/v3_backend_driver/cheng_candidate");
     unlink(candidate_out);
     unlink(candidate_build_out);
-    if (!default_target_request && v3_backend_driver_ready(&paths)) {
+    reference_compiler = paths.stage3;
+    reference_plan_step = "build-backend-driver reference-stage3";
+    reference_plan_check = true;
+    if (v3_backend_driver_ready(&paths)) {
         reference_compiler = paths.backend_driver_out;
         reference_plan_step = "build-backend-driver reference-backend-driver";
-        reference_plan_check = true;
     }
 
     snprintf(root_flag, sizeof(root_flag), "--root:%s", package_root);
@@ -61750,6 +61987,38 @@ static bool v3_dump_file_stdout(const char *path) {
     fputs(text, stdout);
     free(text);
     return true;
+}
+
+static int v3_run_backend_driver_cli_child(int argc,
+                                           char **argv,
+                                           const char *label,
+                                           const char *log_rel_path) {
+    V3BootstrapPaths paths;
+    const char **args;
+    char saved_controller[256];
+    bool had_controller = false;
+    bool ok;
+    int i;
+    (void)log_rel_path;
+    v3_bootstrap_paths_init(&paths);
+    if (argc < 2 || argv == NULL) {
+        fprintf(stderr, "[cheng_v3_seed] %s missing backend driver argv\n", label);
+        return 1;
+    }
+    if (!v3_ensure_backend_driver_ready(&paths, label)) {
+        return 1;
+    }
+    args = (const char **)v3_xmalloc(sizeof(char *) * (size_t)argc);
+    args[0] = paths.backend_driver_out;
+    for (i = 1; i < argc; ++i) {
+        args[i] = argv[i] != NULL ? argv[i] : "";
+    }
+    v3_save_env_value("CHENG_V3_CONTROLLER", saved_controller, sizeof(saved_controller), &had_controller);
+    setenv("CHENG_V3_CONTROLLER", "cheng.backend_driver", 1);
+    ok = v3_run_command_status_argv((size_t)argc, args, false, label);
+    v3_restore_env_value("CHENG_V3_CONTROLLER", saved_controller, had_controller);
+    free(args);
+    return ok ? 0 : 1;
 }
 
 static bool v3_expect_line_map_text(const char *label,
@@ -69173,7 +69442,7 @@ static int v3_cmd_run_host_smokes_impl(int argc, char **argv) {
 }
 
 static int v3_cmd_run_production_regression_impl(int argc, char **argv) {
-    char *surface_argv[12];
+    char *surface_argv[13];
     const char *argv0 = "cheng_v3_seed";
     int rc;
     (void)argc;
@@ -69193,14 +69462,23 @@ static int v3_cmd_run_production_regression_impl(int argc, char **argv) {
     surface_argv[6] = (char *)"perf_memory_contract_smoke";
     surface_argv[7] = (char *)"cheng_skill_consistency_smoke";
     surface_argv[8] = (char *)"dev_hotpatch_100ms_scope_contract_smoke";
-    surface_argv[9] = (char *)"explicit_default_init_negative_smoke";
-    surface_argv[10] = (char *)"explicit_default_init_gate_smoke";
-    surface_argv[11] = (char *)"composite_zero_helper_gate_smoke";
-    rc = v3_cmd_run_host_smokes_impl(12, surface_argv);
+    surface_argv[9] = (char *)"explicit_default_init_positive_smoke";
+    surface_argv[10] = (char *)"explicit_default_init_negative_smoke";
+    surface_argv[11] = (char *)"explicit_default_init_gate_smoke";
+    surface_argv[12] = (char *)"composite_zero_helper_gate_smoke";
+    rc = v3_run_backend_driver_cli_child(13,
+                                         surface_argv,
+                                         "run-production-regression host smokes",
+                                         "artifacts/v3_backend_driver/run_production_regression.host_smokes.log");
     if (rc != 0) {
         return rc;
     }
-    rc = v3_cmd_verify_r2c_react_v3_surface_impl(argc, argv);
+    surface_argv[0] = (char *)argv0;
+    surface_argv[1] = (char *)"verify-r2c-react-v3-surface";
+    rc = v3_run_backend_driver_cli_child(2,
+                                         surface_argv,
+                                         "run-production-regression r2c-react-v3 surface",
+                                         "artifacts/v3_backend_driver/run_production_regression.r2c_react_v3_surface.log");
     if (rc != 0) {
         return rc;
     }
@@ -71603,7 +71881,7 @@ static int v3_cmd_selfhost_build(int argc, char **argv) {
         ctx.native_link->missing_reason_count <= 0U &&
         ctx.object_plan->provider_source_count > 0U) {
         phase_start_ms = v3_bft_monotime_ms();
-        if (!v3_materialize_provider_objects(ctx.contract, ctx.plan, ctx.object_plan)) {
+        if (!v3_materialize_provider_objects(ctx.contract, ctx.plan, ctx.object_plan, ctx.world)) {
             phase_end_ms = v3_bft_monotime_ms();
             ctx.world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
             v3_seed_debug_exec_context_release(&ctx);
@@ -71797,7 +72075,7 @@ static int v3_cmd_system_link_exec(int argc, char **argv) {
         native_link->missing_reason_count <= 0U &&
         object_plan->provider_source_count > 0U) {
         phase_start_ms = v3_bft_monotime_ms();
-        if (!v3_materialize_provider_objects(&contract, plan, object_plan)) {
+        if (!v3_materialize_provider_objects(&contract, plan, object_plan, world)) {
             phase_end_ms = v3_bft_monotime_ms();
             world->exec_phase_provider_objects_ms = v3_phase_elapsed_ms(phase_start_ms, phase_end_ms);
             free(lowering);
